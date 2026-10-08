@@ -149,9 +149,15 @@ struct Flow {
     force_preflight: bool,
     upload_assigned: bool,
     starting: bool,
+    internal_response: bool,
+    resource_policy: Option<ResourcePolicy>,
     plan: Plan,
     done: Option<Done>,
 }
+
+/// User-agent resource policy, checked before each network hop. The Boolean
+/// indicates that a redirect has already occurred.
+pub type ResourcePolicy = Rc<dyn Fn(&mut Ctx, &str, bool) -> bool>;
 
 type Shared = Rc<RefCell<Flow>>;
 
@@ -162,13 +168,63 @@ pub fn start(
     spec: RequestSpec,
     done: impl FnOnce(&mut Ctx, Result<Response, Failure>) + 'static,
 ) -> RequestControl {
+    start_internal(ctx,spec,None,false,None,done)
+}
+
+/// Fetch a user-agent resource without exposing an opaque response to script.
+/// Normal CORS, credentials and redirect rules still apply. Only this internal
+/// consumer receives the response bytes after a successful no-cors request.
+pub fn start_resource(ctx:&mut Ctx,document_url:&str,spec:RequestSpec,policy:ResourcePolicy,
+    done:impl FnOnce(&mut Ctx,Result<Response,Failure>)+'static)->RequestControl {
+    let origin=Transport::current(ctx).and_then(|transport|transport.native_origin(ctx))
+        .or_else(||lumen_common::url::parse_url(document_url,None).map(|url|url.origin()));
+    let Some(origin)=origin else {
+        defer(ctx,move|ctx|done(ctx,Err(type_error("Invalid resource client URL"))));
+        return RequestControl::default();
+    };
+    start_internal(ctx,spec,Some((origin,false)),true,Some(policy),done)
+}
+
+/// Send a fixed user-agent CSP report through the same asynchronous request driver.
+/// Origin comes from the protected document URL, never from an author base element.
+pub fn start_policy_report(ctx: &mut Ctx, document_url: &str, url: &str, body: Vec<u8>,
+    done: impl FnOnce(&mut Ctx, Result<Response, Failure>) + 'static) -> RequestControl {
+    let origin=lumen_common::url::parse_url(document_url,None).map(|url|url.origin());
+    if origin.is_none() || body.len()>65_536 {
+        defer(ctx,move|ctx|done(ctx,Err(type_error("Invalid or oversized CSP report"))));
+        return RequestControl::default();
+    }
+    let spec=RequestSpec {method:"POST".into(),url:url.into(),headers:Vec::new(),body:Some(body),
+        mode:Mode::NoCors,credentials:Credentials::SameOrigin,redirect:Redirect::Error,
+        observe_upload:false,force_preflight:false};
+    start_internal(ctx,spec,origin.map(|origin|(origin,true)),false,None,done)
+}
+
+/// Reporting API delivery uses normal CORS and same-origin credentials, with
+/// the protected response origin captured before author globals can change.
+pub fn start_reporting_report(ctx:&mut Ctx,document_url:&str,url:&str,body:Vec<u8>,
+    done:impl FnOnce(&mut Ctx,Result<Response,Failure>)+'static)->RequestControl {
+    let origin=lumen_common::url::parse_url(document_url,None).map(|url|url.origin());
+    if origin.is_none()||body.len()>65_536 {
+        defer(ctx,move|ctx|done(ctx,Err(type_error("Invalid or oversized Reporting report"))));return RequestControl::default();
+    }
+    let spec=RequestSpec{method:"POST".into(),url:url.into(),headers:vec![("content-type".into(),"application/reports+json".into())],body:Some(body),
+        mode:Mode::Cors,credentials:Credentials::SameOrigin,redirect:Redirect::Follow,observe_upload:false,force_preflight:true};
+    start_internal(ctx,spec,origin.map(|origin|(origin,false)),false,None,done)
+}
+
+fn start_internal(ctx:&mut Ctx,spec:RequestSpec,report_origin:Option<(String,bool)>,internal_response:bool,resource_policy:Option<ResourcePolicy>,
+    done:impl FnOnce(&mut Ctx,Result<Response,Failure>)+'static)->RequestControl {
     let control = RequestControl::default();
     let Some(transport) = Transport::current(ctx) else {
         let failure = Failure::network("HTTP transport is unavailable");
         defer(ctx, move |ctx| done(ctx, Err(failure)));
         return control;
     };
-    let plan = match transport.browser_origin(ctx) {
+    let plan = if let Some((origin,legacy))=report_origin {
+        let policy=if legacy {FetchPolicy::new_policy_report(&origin,&spec.url,spec.body.clone().unwrap_or_default()).map_err(policy_failure)}else{browser_policy(&origin,&spec)};
+        match policy {Ok(policy)=>Plan::Browser(policy),Err(error)=>{defer(ctx,move|ctx|done(ctx,Err(error)));return control;}}
+    } else { match transport.browser_origin(ctx) {
         Some(origin) => match browser_policy(&origin, &spec) {
             Ok(policy) => Plan::Browser(policy),
             Err(failure) => {
@@ -182,7 +238,7 @@ pub fn start(
             headers: spec.headers.clone(),
             body: spec.body.clone(),
         },
-    };
+    }};
     let flow: Shared = Rc::new(RefCell::new(Flow {
         transport,
         control: control.clone(),
@@ -193,6 +249,8 @@ pub fn start(
         force_preflight: spec.force_preflight,
         upload_assigned: false,
         starting: true,
+        internal_response,
+        resource_policy,
         plan,
         done: Some(Box::new(done)),
     }));
@@ -247,23 +305,39 @@ fn policy_failure(error: PolicyError) -> Failure {
 }
 
 fn begin(ctx: &mut Ctx, flow: &Shared) {
+    let check = {
+        let state=flow.borrow();
+        state.resource_policy.clone().map(|check| {
+            let (url,redirected)=match &state.plan {
+                Plan::Browser(policy)=>(policy.actual_request_head().url,policy.is_redirected()),
+                Plan::Direct{url,..}=>(url.clone(),false),
+            };
+            (check,url,redirected)
+        })
+    };
+    if let Some((check,url,redirected))=check {
+        if !check(ctx,&url,redirected) {
+            finish(ctx,flow,Err(Failure::network("Resource blocked by document policy")));
+            return;
+        }
+    }
     let preflight = match &flow.borrow().plan {
         Plan::Browser(policy) => Some(policy.preflight_request()),
         Plan::Direct { .. } => None,
     };
     match preflight {
-        Some(Some(head)) => send(ctx, flow, head.method, head.url, head.headers, None, true, on_preflight),
+        Some(Some(head)) => send(ctx, flow, head.method, head.url, head.headers, None, true, false, on_preflight),
         Some(None) => send_actual(ctx, flow),
         None => send_direct(ctx, flow),
     }
 }
 
 fn send_actual(ctx: &mut Ctx, flow: &Shared) {
-    let (head, body) = match &flow.borrow().plan {
-        Plan::Browser(policy) => (policy.actual_request_head(), policy.actual_body().map(<[u8]>::to_vec)),
+    let (head, body, cookies_allowed) = match &flow.borrow().plan {
+        Plan::Browser(policy) => (policy.actual_request_head(), policy.actual_body().map(<[u8]>::to_vec), policy.credentials_allowed()),
         Plan::Direct { .. } => return,
     };
-    send(ctx, flow, head.method, head.url, head.headers, body, true, on_actual);
+    send(ctx, flow, head.method, head.url, head.headers, body, true, cookies_allowed, on_actual);
 }
 
 fn send_direct(ctx: &mut Ctx, flow: &Shared) {
@@ -286,7 +360,8 @@ fn send_direct(ctx: &mut Ctx, flow: &Shared) {
             state.redirect != Redirect::Follow,
         )
     };
-    send(ctx, flow, method, url, headers, body, manual, on_direct);
+    let cookies_allowed = flow.borrow().credentials != Credentials::Omit;
+    send(ctx, flow, method, url, headers, body, manual, cookies_allowed, on_direct);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,6 +373,7 @@ fn send(
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
     manual_redirect: bool,
+    cookies_allowed: bool,
     next: fn(&mut Ctx, &Shared, Raw),
 ) {
     let (transport, control, options, observe) = {
@@ -307,6 +383,7 @@ fn send(
             state.upload_assigned = true;
         }
         let options = SendOptions {
+            cookies_allowed,
             mode: state.mode,
             credentials: state.credentials,
             redirect: state.redirect,
@@ -464,7 +541,8 @@ fn on_actual(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
                 raw.body.cancel(ctx);
                 return finish(ctx, flow, Ok(opaque(ResponseType::OpaqueRedirect)));
             }
-            if filtered.kind == ResponseType::Opaque {
+            let internal_response=flow.borrow().internal_response;
+            if filtered.kind == ResponseType::Opaque && !internal_response {
                 raw.body.cancel(ctx);
                 return finish(ctx, flow, Ok(opaque(ResponseType::Opaque)));
             }
@@ -478,7 +556,7 @@ fn on_actual(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
                     status_text: raw.status_text,
                     url,
                     redirected: raw.redirected.unwrap_or(redirected),
-                    headers: filtered.headers,
+                    headers: if internal_response {raw.headers} else {filtered.headers},
                     body: raw.body,
                 }),
             );

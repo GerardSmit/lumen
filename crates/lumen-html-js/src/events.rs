@@ -12,6 +12,16 @@ use std::rc::Weak;
 
 pub(crate) use lumen_host::events::{Event as DomEvent, EventTarget as DomEventTarget, TargetData};
 
+/// HTML's nullable callback attribute conversion preserves every object and
+/// clears primitive values, without invoking any author conversion hooks.
+pub(crate) struct EventHandler(pub(crate) Option<Value>);
+impl<'a> lumen_bind::FromArg<'a, JsHost> for EventHandler {
+    fn from_arg(_: &'a lumen::embed::ArgCx<'_>, value: &'a Value, _: lumen::embed::Slot) -> Result<Self, Value> {
+        Ok(Self((matches!(value, Value::Obj(_)) || value.is_callable()).then(|| value.clone())))
+    }
+}
+
+
 #[lumen_bind::module(name = "__dom_event_targets")]
 pub(crate) mod target_bindings {
     use super::*;
@@ -102,6 +112,17 @@ impl TargetHooks for HtmlTarget {
         self
     }
 
+    fn activation_behavior(&self, ctx: &mut Ctx, receiver: &Value, event: &Value) -> OpResult<Option<lumen_host::events::PreparedActivation>> {
+        if let Some(action) = super::forms::activation_behavior(ctx, receiver, event)? { return Ok(Some(action)); }
+        super::hyperlinks::activation_behavior(ctx, receiver, event)
+    }
+
+    fn handle_html_return(&self, ctx: &mut Ctx, kind: &str, event: &Value, result: &Value) -> OpResult<bool> {
+        if kind != "beforeunload" { return Ok(false); }
+        super::navigation_lifecycle::apply_beforeunload_return(ctx, event, result)?;
+        Ok(true)
+    }
+
     fn event_path(
         &self,
         ctx: &mut Ctx,
@@ -110,8 +131,25 @@ impl TargetHooks for HtmlTarget {
         event: &DomEvent,
         initial_target: &Value,
     ) -> OpResult<Option<EventPath>> {
-        let (Some(realm), Some(mut node)) = (self.realm.borrow().upgrade(), self.node.get()) else {
+        let Some(realm) = self.realm.borrow().upgrade() else {
             return Ok(None);
+        };
+        let Some(mut node) = self.node.get() else {
+            // Window's global backing object and its published WindowProxy
+            // share one event target. The event path exposes the WindowProxy,
+            // including when an unqualified global dispatch used the backing
+            // object as its receiver. Independent targets have no such alias.
+            let is_window = realm.window_target.borrow().as_ref()
+                .is_some_and(|window| Rc::ptr_eq(window, data));
+            if !is_window { return Ok(None); }
+            let Some(window) = realm.window_wrapper.borrow().as_ref().and_then(lumen::embed::WeakValue::upgrade) else {
+                return Ok(None);
+            };
+            let adjusted = if same(initial_target, receiver) { window.clone() } else { initial_target.clone() };
+            return Ok(Some(EventPath { entries: vec![PathEntry {
+                value: window, target: data.clone(), adjusted,
+                closed: Vec::new(), related: event.related_original(),
+            }], clear_target: false }));
         };
         let related = event.related_original();
         let related_node = ctx
@@ -250,14 +288,13 @@ pub(crate) trait HtmlTargetExt: Sized {
     fn independent(realm: &Rc<DomRealm>) -> Self;
     fn associated_realm(&self) -> Option<Rc<DomRealm>>;
     fn rebind_node(&self, realm: &Rc<DomRealm>, node: NodeId);
+    fn rebind_window(&self, realm: &Rc<DomRealm>);
     fn try_begin_click(&self) -> bool;
     fn end_click(&self);
     fn trace_callback_values(&self, visit: &mut dyn FnMut(&Value));
     fn erase_listeners(&self, ctx: &mut Ctx, owner: Option<&Value>);
-    fn handler(&self, kind: &str) -> Option<JsFunction>;
-    fn has_handler(&self, kind: &str) -> bool;
     fn handler_value(&self, ctx: &mut Ctx, owner: &Value, kind: &str) -> OpResult<Value>;
-    fn set_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: Option<JsFunction>);
+    fn set_event_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: EventHandler);
     fn set_content_handler(
         &self,
         ctx: &mut Ctx,
@@ -287,6 +324,13 @@ impl HtmlTargetExt for DomEventTarget {
 
     fn associated_realm(&self) -> Option<Rc<DomRealm>> {
         HtmlTarget::of(self.data())?.realm.borrow().upgrade()
+    }
+
+    fn rebind_window(&self, realm: &Rc<DomRealm>) {
+        if let Some(html) = HtmlTarget::of(self.data()) {
+            *html.realm.borrow_mut() = Rc::downgrade(realm);
+            html.node.set(None);
+        }
     }
 
     fn rebind_node(&self, realm: &Rc<DomRealm>, node: NodeId) {
@@ -338,16 +382,6 @@ impl HtmlTargetExt for DomEventTarget {
         }
     }
 
-    fn handler(&self, kind: &str) -> Option<JsFunction> {
-        let cell = self.data().handler_cell(kind)?;
-        let function = cell.borrow().function();
-        function
-    }
-
-    fn has_handler(&self, kind: &str) -> bool {
-        self.data().handler_cell(kind).is_some()
-    }
-
     fn handler_value(&self, ctx: &mut Ctx, _owner: &Value, kind: &str) -> OpResult<Value> {
         let Some(cell) = self.data().handler_cell(kind) else {
             return Ok(Value::Null);
@@ -358,14 +392,23 @@ impl HtmlTargetExt for DomEventTarget {
                 compiled: Some(function),
                 ..
             } => function.value().clone(),
+            Callback::Object(object) => object,
             _ => Value::Null,
         })
     }
 
-    fn set_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: Option<JsFunction>) {
+    fn set_event_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: EventHandler) {
         let _html_allocations = enter_html_allocation_category();
-        self.data()
-            .set_handler(kind, callback.map(Callback::Function), HandlerKind::Html);
+        if let Some(html)=HtmlTarget::of(self.data()) {
+            if let (Some(realm),Some(node))=(html.realm.borrow().upgrade(),html.node.get()) {
+                event_content_handlers::mark_idl_handler(&realm,node,kind);
+            }
+        }
+        let callback = callback.0.map(|value| match JsFunction::from_value(value.clone()) {
+            Some(function) => Callback::Function(function),
+            None => Callback::Object(value),
+        });
+        self.data().set_handler(kind, callback, HandlerKind::Html);
         DomEventTarget::update_retention(ctx, self.data(), owner);
     }
 

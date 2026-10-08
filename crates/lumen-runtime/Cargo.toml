@@ -21,6 +21,8 @@ lumen-timers = { path = "../lumen-timers" }
 lumen-web = { path = "../lumen-web", default-features = false }
 lumen-webstreams = { path = "../lumen-webstreams", default-features = false }
 lumen-html-js = { path = "../lumen-html-js" }
+lumen-html = { path = "../lumen-html" }
+lumen-html-text = { path = "../lumen-html-text" }
 
 # Build-only: build.rs precompiles the embedded JS (no runtime dep).
 [build-dependencies]

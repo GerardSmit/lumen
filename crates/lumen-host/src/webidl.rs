@@ -112,6 +112,21 @@ pub fn usv_string(ctx: &mut Ctx, value: &Value) -> Result<String, Value> {
 /// A `USVString` parameter.
 pub struct Usv(pub String);
 
+/// WebIDL `LegacyNullToEmptyString`: null becomes empty, while undefined and all
+/// other values use ordinary string conversion. Converted storage belongs to the
+/// binding argument context, so setters need not copy large input strings.
+pub struct LegacyNullToEmptyString<'a>(pub &'a str);
+
+impl<'a> FromArg<'a, JsHost> for LegacyNullToEmptyString<'a> {
+    fn from_arg(cx: &'a ArgCx<'_>, value: &'a Value, at: Slot) -> Result<Self, Value> {
+        if matches!(value, Value::Null) {
+            Ok(Self(""))
+        } else {
+            <&'a str as FromArg<'a, JsHost>>::from_arg(cx, value, at).map(Self)
+        }
+    }
+}
+
 impl<'a> FromArg<'a, JsHost> for Usv {
     fn from_arg(cx: &'a ArgCx<'_>, value: &'a Value, _: Slot) -> Result<Self, Value> {
         cx.before_js();

@@ -76,7 +76,7 @@ fn number_to_signed(number: f64, bits: u32) -> i32 {
     }
 }
 
-fn dictionary_unsigned(
+pub(crate) fn dictionary_unsigned(
     ctx: &mut Ctx,
     dictionary: &Option<Value>,
     name: &str,
@@ -365,6 +365,12 @@ pub(crate) struct DomMouseEvent {
     button: Cell<i16>,
     buttons: Cell<u16>,
     related_target: RefCell<Value>,
+}
+
+impl DomMouseEvent {
+    pub(crate) fn activation_coordinates(&self) -> (i32, i32) {
+        (self.client_x.get(), self.client_y.get())
+    }
 }
 
 fn mouse_event(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<DomMouseEvent> {

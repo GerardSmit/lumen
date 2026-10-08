@@ -10,6 +10,25 @@ use crate::builtins::collection_data::{CollectionData, CollectionKind};
 use crate::interpreter::{abrupt_value, Interp};
 use crate::value::{Exotic, Gc, Object, TaInfo, TaKind, Value};
 
+/// Native Web IDL DOMString setlike storage. It shares JS Set's canonical
+/// ordered table and logical cursors, without a script-visible backing Set or
+/// a second membership/index store. Keys cannot contain GC object edges.
+pub struct DomStringSet { data:CollectionData }
+impl Default for DomStringSet {
+    fn default()->Self {Self{data:CollectionData::new(CollectionKind::Set)}}
+}
+impl DomStringSet {
+    pub fn len(&self)->usize {self.data.len()}
+    pub fn contains(&self,key:&str)->bool {self.data.contains_string(key)}
+    pub fn insert(&mut self,key:String)->bool {
+        if self.contains(&key){return false;}
+        let key=Value::from_string(key);self.data.insert(key.clone(),key);true
+    }
+    pub fn remove(&mut self,key:String)->bool {self.data.remove(&Value::from_string(key))}
+    pub fn clear(&mut self){self.data.clear();}
+    pub fn next(&self,cursor:&mut usize)->Option<Value>{self.data.next(cursor).map(|(key,_)|key.unpack())}
+}
+
 /// What an object is, for `StructuredSerializeInternal`.
 #[derive(Clone)]
 pub enum CloneBrand {
@@ -387,5 +406,24 @@ pub fn object_identity(value: &Value) -> usize {
     match value {
         Value::Obj(object) => Gc::as_ptr(object) as usize,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod dom_string_set_tests {
+    use super::DomStringSet;
+    fn string(value:super::Value)->String {let super::Value::Str(value)=value else{panic!("string key")};value.as_str().to_owned()}
+    #[test]
+    fn dom_string_set_shares_live_ordered_cursors_and_borrowed_string_membership() {
+        let mut set=DomStringSet::default();
+        for key in ["", "a", "b", "c"] {assert!(set.insert(key.into()));assert!(set.contains(key));}
+        assert!(!set.contains("missing"));assert!(!set.insert("a".into()));
+        let mut cursor=0;
+        assert_eq!(string(set.next(&mut cursor).unwrap()),"");
+        assert!(set.remove("a".into()));assert_eq!(string(set.next(&mut cursor).unwrap()),"b");
+        assert!(set.insert("a".into()));assert_eq!(string(set.next(&mut cursor).unwrap()),"c");
+        assert_eq!(string(set.next(&mut cursor).unwrap()),"a");
+        set.clear();assert!(set.next(&mut cursor).is_none());
+        assert!(set.insert("later".into()));assert_eq!(string(set.next(&mut cursor).unwrap()),"later");
     }
 }

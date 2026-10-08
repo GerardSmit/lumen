@@ -1,4 +1,5 @@
 use super::{composite, Raster};
+use lumen_common::color::{Color, ColorSpace, HueInterpolation, InterpolationMethod, PreparedPair};
 use lumen_html::paint::{
     Gradient, GradientKind, GradientPosition, RadialShape, RadialSize, Rect, Rgba,
 };
@@ -23,9 +24,60 @@ enum Geometry {
         from: f32,
     },
 }
+fn prepare_conic_hints(offsets: &mut [f32; 32], count: usize, metadata: impl Iterator<Item=(usize,f32)>) -> [f32; 32] {
+    // Stop and hint order is one component sequence. An intervening hint
+    // terminates a run of adjacent unpositioned color stops.
+    let mut hints = [f32::NAN; 32];
+    for (after, position) in metadata { hints[after + 1] = position; }
+    let mut sequence = [f32::NAN; 63];
+    let mut color_indices = [0usize; 32];
+    let mut hint_indices = [usize::MAX; 32];
+    let mut sequence_length = 0;
+    for index in 0..count {
+        color_indices[index] = sequence_length;
+        sequence[sequence_length] = offsets[index];
+        sequence_length += 1;
+        if index + 1 < count && hints[index + 1].is_finite() {
+            hint_indices[index + 1] = sequence_length;
+            sequence[sequence_length] = hints[index + 1];
+            sequence_length += 1;
+        }
+    }
+    let mut anchor = 0;
+    for end in 1..sequence_length {
+        if sequence[end].is_nan() { continue; }
+        sequence[end] = sequence[end].max(sequence[anchor]);
+        for index in anchor + 1..end {
+            sequence[index] = sequence[anchor]
+                + (sequence[end] - sequence[anchor]) * (index - anchor) as f32
+                    / (end - anchor) as f32;
+        }
+        anchor = end;
+    }
+    for index in 0..count {
+        offsets[index] = sequence[color_indices[index]];
+        if hint_indices[index] != usize::MAX { hints[index] = sequence[hint_indices[index]]; }
+    }
+    for end in 1..count {
+        if hints[end].is_finite() {
+            let span = offsets[end] - offsets[end - 1];
+            let midpoint = if span > 0.0 {
+                ((hints[end] - offsets[end - 1]) / span).clamp(0.0, 1.0)
+            } else { 0.5 };
+            // Store the exponent once, not a logarithm per painted pixel.
+            hints[end] = if midpoint == 0.0 { 0.0 }
+                else if midpoint == 1.0 { f32::INFINITY }
+                else { 0.5f32.ln() / midpoint.ln() };
+        }
+    }
+    hints
+}
+
 pub(super) struct Prepared<'a> {
     gradient: &'a Gradient,
     offsets: [f32; 32],
+    hints: [f32; 32],
+    pairs: [Option<PreparedPair>; 32],
     geometry: Geometry,
     solid: Option<Rgba>,
 }
@@ -162,26 +214,52 @@ impl<'a> Prepared<'a> {
         if offsets[count - 1].is_nan() {
             offsets[count - 1] = 1.0;
         }
-        let mut anchor = 0;
-        for end in 1..count {
-            if offsets[end].is_nan() {
-                continue;
+        let hints = if let Some(metadata) = gradient.angular.as_ref().filter(|metadata| metadata.hints().next().is_some()) {
+            prepare_conic_hints(&mut offsets, count, metadata.hints())
+        } else if let Some(metadata)=gradient.color.as_ref().filter(|metadata|!metadata.hints.is_empty()) {
+            prepare_conic_hints(&mut offsets,count,metadata.hints.iter().map(|(after,position)| {
+                let position=match position {
+                    GradientPosition::Fraction(value)=>*value,
+                    GradientPosition::Pixels(value)=>*value/length.max(f32::MIN_POSITIVE),
+                    GradientPosition::Mixed(value)=>value.resolve(length)/length.max(f32::MIN_POSITIVE),
+                };(*after,position)
+            }))
+        } else {
+            let mut anchor = 0;
+            for end in 1..count {
+                if offsets[end].is_nan() {
+                    continue;
+                }
+                offsets[end] = offsets[end].max(offsets[anchor]);
+                for index in anchor + 1..end {
+                    offsets[index] = offsets[anchor]
+                        + (offsets[end] - offsets[anchor]) * (index - anchor) as f32
+                            / (end - anchor) as f32;
+                }
+                anchor = end;
             }
-            offsets[end] = offsets[end].max(offsets[anchor]);
-            for index in anchor + 1..end {
-                offsets[index] = offsets[anchor]
-                    + (offsets[end] - offsets[anchor]) * (index - anchor) as f32
-                        / (end - anchor) as f32;
-            }
-            anchor = end;
-        }
+            [f32::NAN; 32]
+        };
         let degenerate = match geometry {
             Geometry::Radial { rx, ry, .. } => rx == 0.0 || ry == 0.0,
             _ => length == 0.0,
         };
+        let method=gradient.color.as_ref().map_or(InterpolationMethod{space:ColorSpace::Srgb,hue:HueInterpolation::Shorter},|metadata|metadata.method);
+        let endpoint=|index:usize|gradient.color.as_ref().and_then(|metadata|metadata.colors.get(index)).copied()
+            .unwrap_or_else(|| {let color=gradient.stops[index].color;Color::rgba8([color.r,color.g,color.b,color.a])});
+        let mut pairs=[None;32];
+        let exact_srgb=method.space==ColorSpace::Srgb && gradient.color.as_ref().is_none_or(|metadata|metadata.colors.is_empty());
+        if !exact_srgb { for end in 1..count {
+            let left=endpoint(end-1);let right=endpoint(end);
+            let same=left==right && !(method.space.hue().is_some() && method.hue==HueInterpolation::Longer);
+            if !exact_srgb && !same {pairs[end]=Some(PreparedPair::new(left,right,method));}
+        }
+        }
         let mut result = Self {
             gradient,
             offsets,
+            hints,
+            pairs,
             geometry,
             solid: None,
         };
@@ -193,6 +271,21 @@ impl<'a> Prepared<'a> {
         Some(result)
     }
     fn average(&self) -> Rgba {
+        if let Some(colors)=self.gradient.color.as_ref().map(|metadata|&metadata.colors).filter(|colors|!colors.is_empty()) {
+            // CSS Images' degenerate-repeat average is premultiplied sRGBA,
+            // independently of the interpolation method of a visible segment.
+            let total=self.offsets[colors.len()-1]-self.offsets[0];let mut sum=[0.0;4];
+            for end in 1..colors.len() {
+                let weight=if total>0.0 {(self.offsets[end]-self.offsets[end-1])/total*0.5}else {0.5/(colors.len()-1) as f32};
+                for color in [colors[end-1],colors[end]] {
+                    let color=color.to(ColorSpace::Srgb);let alpha=if color.missing&8==0 {color.alpha}else {0.0};
+                    sum[3]+=alpha*weight;
+                    for i in 0..3 {sum[i]+=color.components[i]*alpha*weight;}
+                }
+            }
+            if sum[3]>0.0 {for i in 0..3 {sum[i]/=sum[3];}}
+            let [r,g,b,a]=Color::new(ColorSpace::Srgb,[sum[0],sum[1],sum[2]],sum[3],0).to_rgba8();return Rgba{r,g,b,a};
+        }
         let count = self.gradient.stops.len();
         let total = self.offsets[count - 1] - self.offsets[0];
         let mut sum = [0.0; 4];
@@ -269,12 +362,17 @@ impl<'a> Prepared<'a> {
         } else if end == count {
             self.gradient.stops[count - 1].color
         } else {
-            interpolate(
-                self.gradient.stops[end - 1].color,
-                self.gradient.stops[end].color,
-                ((position - self.offsets[end - 1]) / (self.offsets[end] - self.offsets[end - 1]))
-                    .clamp(0.0, 1.0),
-            )
+            let mut mix = ((position - self.offsets[end - 1])
+                / (self.offsets[end] - self.offsets[end - 1])).clamp(0.0, 1.0);
+            let exponent = self.hints[end];
+            if !exponent.is_nan() && exponent != 1.0 {
+                mix = if exponent == 0.0 { 1.0 }
+                    else if exponent.is_infinite() { 0.0 }
+                    else { mix.powf(exponent) };
+            }
+            if let Some(pair)=self.pairs[end] {
+                let [r,g,b,a]=pair.sample(mix).to_rgba8();Rgba{r,g,b,a}
+            } else {interpolate(self.gradient.stops[end-1].color,self.gradient.stops[end].color,mix)}
         }
     }
 }
@@ -380,6 +478,49 @@ mod tests {
     }
 
     #[test]
+    fn specification_gradient_color_spaces_paint_real_midpoints_alpha_missing_and_longer_hue() {
+        let font=lumen_html_text::FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let render=|source:&str| {
+            let html=format!("<style>html,body{{margin:0;background:white}}div{{width:1px;height:1px;background:{source}}}</style><div></div>");
+            crate::render_html_with_font(&html,1,1,1.0,&font).unwrap().pixels
+        };
+        // Independent CSS Color 4 sample conversions: linear-light half gray,
+        // and Oklab red/blue midpoint (not an expected value from our converter).
+        for (source,expected) in [
+            ("linear-gradient(to right in srgb-linear,black,white)",[188u8,188,188,255]),
+            ("linear-gradient(to right in oklab,red,blue)",[140,83,162,255]),
+            ("linear-gradient(to right,color(srgb 1 0 0),color(srgb 0 0 1))",[140,83,162,255]),
+            ("linear-gradient(to right,red,blue)",[128,0,128,255]),
+            ("conic-gradient(from 270deg at left center in hsl longer hue,red)",[0,255,255,255]),
+            ("linear-gradient(to right in srgb,rgb(none 0 0),blue)",[0,0,128,255]),
+        ] {
+            let actual=render(source);
+            for (a,b) in actual.iter().copied().zip(expected) {assert!((i16::from(a)-i16::from(b)).abs()<=1,"{source}: {actual:?}");}
+        }
+        // A transparent endpoint cannot bleed its red into the blue endpoint.
+        let image=render("linear-gradient(to right in srgb,rgb(255 0 0 / 0),blue)");
+        // The normal HTML canvas is white: half-transparent blue composites to
+        // (127,127,255), preserving the real shared raster/compositor path.
+        assert!(image[0].abs_diff(127)<=1 && image[1].abs_diff(127)<=1 && image[2]==255 && image[3]==255,"{image:?}");
+    }
+
+    #[test]
+    fn specification_conic_hints_use_fixed_capacity_stop_fixup_and_exponential_weighting() {
+        let font = lumen_html_text::FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let html = "<style>html,body{margin:0}div{width:100px;height:100px;background:conic-gradient(in srgb,red 0deg,90deg,blue 360deg)}</style><div></div>";
+        let image = crate::render_html_with_font(html, 100, 100, 1.0, &font).unwrap();
+        let offset = (49 * 100 + 99) * 4;
+        let pixel = &image.pixels[offset..offset+4];
+        assert!((i16::from(pixel[0])-128).abs() <= 2 && (i16::from(pixel[2])-128).abs() <= 2, "hint midpoint: {pixel:?}");
+        assert_eq!(pixel[1], 0);
+        assert_eq!(pixel[3], 255);
+        // A later hint raises a subsequent explicit stop during ordered fixup.
+        let html = "<style>html,body{margin:0}div{width:100px;height:100px;background:conic-gradient(red 0deg,270deg,blue 90deg)}</style><div></div>";
+        let image = crate::render_html_with_font(html, 100, 100, 1.0, &font).unwrap();
+        assert_eq!(&image.pixels[offset..offset+4], &[255,0,0,255]);
+    }
+
+    #[test]
     fn conic_gradient_sweeps_clockwise_from_the_top() {
         let red = Rgba {
             r: 255,
@@ -394,6 +535,8 @@ mod tests {
             a: 255,
         };
         let gradient = Arc::new(Gradient {
+            angular: None,
+            color: None,
             kind: GradientKind::Conic {
                 from: 0.0,
                 center: [
@@ -457,6 +600,8 @@ mod tests {
             a: 255,
         };
         let gradient = Arc::new(Gradient {
+            angular: None,
+            color: None,
             kind: GradientKind::Linear {
                 angle: 90.0,
                 corner: None,
@@ -514,6 +659,8 @@ mod tests {
     #[test]
     fn gradient_sprite_fallback_matches_fractional_clipped_raster() {
         let gradient = Arc::new(Gradient {
+            angular: None,
+            color: None,
             kind: GradientKind::Linear {
                 angle: 135.0,
                 corner: None,

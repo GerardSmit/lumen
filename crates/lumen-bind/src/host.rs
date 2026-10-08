@@ -80,6 +80,20 @@ pub trait Host: Sized + 'static {
     /// Runs `f` with the engine context (the `&mut Ctx` parameter). Borrowed arguments stay
     /// valid while `f` runs script code.
     fn with_ctx<R>(cx: &Self::Cx<'_>, f: impl FnOnce(&mut Self::Ctx) -> R) -> R;
+    /// Begin an embedder-defined operation scope after argument and receiver
+    /// conversion. Hosts without operation scopes need no extra state.
+    #[inline(always)]
+    fn begin_operation(cx: &Self::Cx<'_>) -> Result<(), Self::Error> {
+        let _ = cx;
+        Ok(())
+    }
+    /// Validate a Web IDL receiver before converting arguments, without
+    /// retaining the native borrow while conversions invoke author code.
+    #[inline(always)]
+    fn validate_receiver<T: Class>(cx: &Self::Cx<'_>, value: &Self::Value) -> Result<(), Self::Error> {
+        let _ = (cx, value);
+        Ok(())
+    }
     /// Converts the fn's result.
     fn ret<R: IntoRet<Self>>(cx: &Self::Cx<'_>, r: R) -> Result<Self::Value, Self::Error>;
     /// Converts the result of a `next` protocol method.

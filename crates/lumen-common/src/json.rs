@@ -767,18 +767,34 @@ impl Value {
 
 /// Parse a JSON document.
 pub fn parse(text: &str) -> Result<Value, Error> {
-    Parser::new(text, Options::JSON).document(&mut TreeSink { depth: 0 })
+    parse_with_spelling(text, Spelling::Plain)
+}
+
+/// Parse JSON with the caller's existing language string spelling.
+pub fn parse_with_spelling(text: &str, spelling: Spelling) -> Result<Value, Error> {
+    Parser::new(text, Options { spelling, ..Options::JSON })
+        .document(&mut TreeSink { depth: 0, spelling })
 }
 
 /// Parse JSONC: JSON plus comments, trailing commas and byte-order marks.
 pub fn parse_jsonc(text: &str) -> Result<Value, Error> {
-    Parser::new(text, Options::JSONC).document(&mut TreeSink { depth: 0 })
+    Parser::new(text, Options::JSONC).document(&mut TreeSink { depth: 0, spelling:Spelling::Plain })
 }
 
 const TREE_DEPTH: usize = 512;
 
 struct TreeSink {
     depth: usize,
+    spelling:Spelling,
+}
+
+impl TreeSink {
+    fn text(&self,s:Str<'_>)->String {
+        let text=s.text.into_owned();
+        if self.spelling==Spelling::Utf16 && s.lone_surrogate {
+            crate::smuggle::canonicalize_utf16(&text).unwrap_or(text)
+        } else {text}
+    }
 }
 
 impl<'a> Sink<'a> for TreeSink {
@@ -814,7 +830,7 @@ impl<'a> Sink<'a> for TreeSink {
         Ok(Value::Num(n.to_f64()))
     }
     fn string(&mut self, s: Str<'a>) -> Result<Value, Error> {
-        Ok(Value::Str(s.text.into_owned()))
+        Ok(Value::Str(self.text(s)))
     }
     fn constant(&mut self, c: Constant) -> Result<Value, Error> {
         Ok(Value::Num(match c {
@@ -827,7 +843,7 @@ impl<'a> Sink<'a> for TreeSink {
         Ok(Vec::new())
     }
     fn key(&mut self, s: Str<'a>) -> Result<String, Error> {
-        Ok(s.text.into_owned())
+        Ok(self.text(s))
     }
     fn member(&mut self, obj: &mut Self::Object, key: String, v: Value) -> Result<(), Error> {
         obj.push((key, v));

@@ -605,6 +605,7 @@ pub struct CanvasPattern {
     pixmap: Rc<Pixmap>,
     transform: Rc<RefCell<Transform>>,
     repetition: CanvasPatternRepetition,
+    source_transform: Transform,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -620,10 +621,18 @@ impl CanvasPattern {
         image: &Rgba8Image,
         repetition: CanvasPatternRepetition,
     ) -> Result<Self, ImageError> {
+        Self::with_natural_size(image,repetition,f64::from(image.width),f64::from(image.height))
+    }
+    /// CSS pixel coordinates can differ from the original decoded pixel grid.
+    /// Keep this source mapping separate from the mutable pattern transform.
+    pub fn with_natural_size(image:&Rgba8Image,repetition:CanvasPatternRepetition,width:f64,height:f64)
+        ->Result<Self,ImageError> {
+        if width<=0.0 || height<=0.0 || !width.is_finite() || !height.is_finite(){return Err(ImageError::InvalidViewport);}
         Ok(Self {
             pixmap: Rc::new(premultiplied_pixmap(image)?),
             transform: Rc::new(RefCell::new(Transform::identity())),
             repetition,
+            source_transform:Transform::from_scale((width/f64::from(image.width)) as f32,(height/f64::from(image.height)) as f32),
         })
     }
     pub fn set_transform(&self, transform: Transform) {
@@ -632,6 +641,7 @@ impl CanvasPattern {
     pub fn transform(&self) -> Transform {
         *self.transform.borrow()
     }
+    fn source_transform(&self)->Transform {self.transform().pre_concat(self.source_transform)}
     pub fn repetition(&self) -> CanvasPatternRepetition {
         self.repetition
     }
@@ -1338,6 +1348,23 @@ fn localized_text_transform(
     ))
 }
 
+/// One bounded current bitmap, shared with the placeholder document owner.
+/// It contains no language values, realm handles or drawing-context state.
+#[derive(Default)]
+pub struct CanvasPublication {
+    pub generation: u64,
+    pub image: Option<Rgba8Image>,
+}
+/// Transfer data for a context-free offscreen surface. A rendering context
+/// cannot be transferred, so the receiving owner creates a fresh blank surface.
+pub struct OffscreenCanvasTransfer {
+    pub width: u64,
+    pub height: u64,
+    pub rtl: bool,
+    pub origin_clean: bool,
+    pub publication: Option<std::sync::Arc<std::sync::Mutex<CanvasPublication>>>,
+}
+
 pub struct CanvasSurface {
     width: u32,
     height: u32,
@@ -1345,6 +1372,13 @@ pub struct CanvasSurface {
     state: DrawingState,
     saved: Vec<DrawingState>,
     generation: u64,
+    layers: Vec<CanvasLayer>,
+}
+
+struct CanvasLayer {
+    bitmap: Option<Pixmap>,
+    state: DrawingState,
+    saved_depth: usize,
 }
 
 impl CanvasSurface {
@@ -1356,6 +1390,7 @@ impl CanvasSurface {
             state: DrawingState::default(),
             saved: Vec::new(),
             generation: 0,
+            layers: Vec::new(),
         })
     }
 
@@ -1381,6 +1416,7 @@ impl CanvasSurface {
         self.bitmap = bitmap;
         self.state = DrawingState::default();
         self.saved.clear();
+        self.layers.clear();
         self.changed();
         Ok(())
     }
@@ -1388,10 +1424,55 @@ impl CanvasSurface {
     pub fn save(&mut self) {
         self.saved.push(self.state.clone());
     }
-    pub fn restore(&mut self) {
+    pub fn restore(&mut self) -> bool {
+        if self.layers.last().is_some_and(|layer| self.saved.len() <= layer.saved_depth) {
+            return false;
+        }
         if let Some(state) = self.saved.pop() {
             self.state = state;
+            return true;
         }
+        false
+    }
+
+    /// Isolate drawing in a bounded transparent bitmap. Open layers never
+    /// become visible through the canvas's published bitmap.
+    pub fn begin_layer(&mut self) -> Result<(), ImageError> {
+        let bytes = pixel_bytes(self.width, self.height)?;
+        if self.layers.len() >= 64 || bytes.checked_mul(self.layers.len() + 2)
+            .is_none_or(|bytes| bytes > MAX_IMAGE_BYTES) {
+            return Err(ImageError::TooLarge);
+        }
+        let bitmap = allocate(self.width, self.height)?;
+        self.layers.push(CanvasLayer {
+            bitmap: std::mem::replace(&mut self.bitmap, bitmap),
+            state: self.state.clone(),
+            saved_depth: self.saved.len(),
+        });
+        self.state.alpha = 1.0;
+        self.state.blend = BlendMode::SourceOver;
+        self.state.shadow_color = [0, 0, 0, 0];
+        Ok(())
+    }
+
+    /// Composite a completed layer once with its entry alpha and blend mode,
+    /// restoring entry state and discarding unmatched inner save calls.
+    pub fn end_layer(&mut self) -> Option<usize> {
+        let layer = self.layers.pop()?;
+        let source = std::mem::replace(&mut self.bitmap, layer.bitmap);
+        self.saved.truncate(layer.saved_depth);
+        self.state = layer.state;
+        if let (Some(target), Some(source)) = (&mut self.bitmap, source) {
+            let paint = tiny_skia::PixmapPaint {
+                opacity: self.state.alpha,
+                blend_mode: self.state.blend,
+                quality: FilterQuality::Nearest,
+            };
+            target.draw_pixmap(0, 0, source.as_ref(), &paint,
+                Transform::identity(), self.state.clip.as_ref());
+        }
+        self.changed();
+        Some(layer.saved_depth)
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) -> Result<(), ImageError> {
@@ -2281,8 +2362,12 @@ impl CanvasSurface {
     /// Snapshot in the straight-alpha format used by ImageData and HTML images.
     pub fn snapshot(&self) -> Rgba8Image {
         let mut pixels = Vec::new();
-        if let Some(bitmap) = &self.bitmap {
-            pixels.reserve(bitmap.data().len());
+        let published = self.layers.first().map_or(&self.bitmap, |layer| &layer.bitmap);
+        if let Some(bitmap) = published {
+            // Snapshots are bounded owned raster payloads. Reserve precisely
+            // their RGBA storage, including sub-eight-byte images, so a caller's
+            // admitted pixel lease also covers the actual Vec capacity.
+            pixels.reserve_exact(bitmap.data().len());
             for pixel in bitmap.pixels() {
                 let c = pixel.demultiply();
                 pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
@@ -2462,7 +2547,7 @@ impl CanvasSurface {
                 SpreadMode::Repeat,
                 FilterQuality::Bilinear,
                 alpha,
-                canvas_transform.pre_concat(pattern.transform()),
+                canvas_transform.pre_concat(pattern.source_transform()),
             );
         } else {
             paint.set_color_rgba8(
@@ -2480,7 +2565,7 @@ impl CanvasSurface {
         if pattern.repetition == CanvasPatternRepetition::Repeat {
             return None;
         }
-        let transform = self.state.transform.pre_concat(pattern.transform());
+        let transform = self.state.transform.pre_concat(pattern.source_transform());
         let inverse = transform.invert()?;
         let mut viewport = [
             Point::from_xy(0.0, 0.0),
@@ -2604,6 +2689,23 @@ mod tests {
     use tiny_skia::{LineCap, LineJoin, PathBuilder};
 
     #[test]
+    fn specification_pattern_natural_size_survives_user_transform_replacement() {
+        let image=Rgba8Image{width:2,height:2,pixels:vec![0,128,0,255].repeat(4)};
+        let pattern=CanvasPattern::with_natural_size(&image,CanvasPatternRepetition::NoRepeat,1.0,1.0).unwrap();
+        assert_eq!(pattern.transform(),Transform::identity());
+        let mut canvas=CanvasSurface::new(4,2).unwrap();
+        canvas.state_mut().fill_pattern=Some(pattern.clone());
+        canvas.fill_rect(0.0,0.0,4.0,2.0).unwrap();
+        let pixels=canvas.snapshot().pixels;
+        assert_eq!(&pixels[..4],&[0,128,0,255]);assert_eq!(&pixels[4..8],&[0,0,0,0]);
+        pattern.set_transform(Transform::from_translate(2.0,0.0));
+        canvas.clear_rect(0.0,0.0,4.0,2.0);
+        canvas.fill_rect(0.0,0.0,4.0,2.0).unwrap();
+        let pixels=canvas.snapshot().pixels;
+        assert_eq!(&pixels[..4],&[0,0,0,0]);assert_eq!(&pixels[8..12],&[0,128,0,255]);assert_eq!(&pixels[12..16],&[0,0,0,0]);
+    }
+
+    #[test]
     fn state_clip_transform_clear_and_resize_affect_real_pixels() {
         let mut canvas = CanvasSurface::new(4, 2).unwrap();
         canvas.state_mut().fill = [255, 0, 0, 255];
@@ -2643,6 +2745,34 @@ mod tests {
             canvas.read_pixels(-1, 0, 3, 1).unwrap().pixels,
             [0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn canvas_layers_isolate_nested_drawing_and_restore_state() {
+        let mut canvas = CanvasSurface::new(2, 1).unwrap();
+        canvas.state_mut().fill = [128, 0, 128, 255];
+        canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
+        canvas.state_mut().alpha = 0.5;
+        canvas.begin_layer().unwrap();
+        canvas.state_mut().fill = [255, 0, 0, 255];
+        canvas.fill_rect(1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 0, 0, 0]);
+        assert!(!canvas.restore(), "restore must not cross a layer boundary");
+        canvas.begin_layer().unwrap();
+        canvas.state_mut().fill = [0, 255, 0, 255];
+        canvas.fill_rect(1.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(canvas.end_layer(), Some(0));
+        assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 0, 0, 0]);
+        assert_eq!(canvas.end_layer(), Some(0));
+        assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 255, 0, 128]);
+        assert_eq!(canvas.state().fill, [128, 0, 128, 255]);
+        assert_eq!(canvas.state().alpha, 0.5);
+        assert_eq!(canvas.end_layer(), None);
+        for _ in 0..64 { canvas.begin_layer().unwrap(); }
+        assert!(canvas.begin_layer().is_err());
+        canvas.resize(2, 1).unwrap();
+        assert_eq!(canvas.end_layer(), None);
+        assert_eq!(canvas.snapshot().pixels, [0; 8]);
     }
 
     #[test]

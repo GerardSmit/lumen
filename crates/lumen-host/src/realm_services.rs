@@ -7,6 +7,18 @@
 use lumen::embed::{Ctx, Value, WeakValue};
 use std::{collections::HashMap, rc::Rc};
 
+/// Capture a realm intrinsic or callback without making the service an
+/// independent GC root. The actual realm global owns the exact original Value
+/// in a private traced slot; native metadata keeps only its weak identity.
+pub fn capture_realm_value(ctx: &mut Ctx, value: Value) -> lumen::embed::OpResult<WeakValue> {
+    let weak = ctx.weak_value(&value)
+        .ok_or_else(|| lumen::embed::OpError::type_error("realm capture requires an object"))?;
+    let global = ctx.global_object();
+    let slot = ctx.allocate_native_private_slot_name();
+    ctx.define_native_private_value_slot(&global, &slot, value).map_err(lumen::embed::OpError::thrown)?;
+    Ok(weak)
+}
+
 struct Entry<T> {
     // Do not make the realm global a hidden host root. The pointer key remains unique while the
     // global is alive; stale entries are pruned before lookup/replacement, so a reused address

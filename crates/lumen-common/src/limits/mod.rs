@@ -8,6 +8,7 @@ mod alloc;
 #[cfg(not(target_arch = "wasm32"))]
 mod deadline;
 mod heap;
+mod resource;
 pub mod size;
 mod stop;
 
@@ -16,3 +17,5 @@ pub use alloc::CappedAlloc;
 pub use deadline::Deadline;
 pub use heap::{HeapBudget, HeapScope};
 pub use stop::{Abort, InterruptHandle, InterruptSubscription, StopFlags};
+
+pub use resource::{ByteBudget, ByteLease};

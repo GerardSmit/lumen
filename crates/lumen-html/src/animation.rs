@@ -1,9 +1,62 @@
 //! Shared Web Animations effect timing and CSS-value interpolation.
-use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+pub mod transition_values;
+
+use alloc::{borrow::ToOwned, boxed::Box, format, string::String, vec, vec::Vec};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProgressRangeName { Cover, Contain, Entry, Exit, EntryCrossing, ExitCrossing }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressRange {
+    pub start: (ProgressRangeName, f64),
+    pub end: (ProgressRangeName, f64),
+    offsets:[crate::css::DecorationLength;2],
+}
+
+impl ProgressRange {
+    pub fn parse(value: &str) -> Option<Self> {
+        let [(start,start_offset),(end,end_offset)]=crate::css::animation_controls::progress_range_parts(value)?;
+        let fraction=|offset:&crate::css::DecorationLength|match offset {
+            crate::css::DecorationLength::Length(value)=>f64::from(value.percent)/100.0,_=>0.0,
+        };
+        Some(Self{start:(start,fraction(&start_offset)),end:(end,fraction(&end_offset)),offsets:[start_offset,end_offset]})
+    }
+
+    pub fn checked_retained_bytes(&self)->Option<usize>{crate::css::checked_progress_offset_bytes(&self.offsets)}
+
+    pub fn scroll_bounds(&self,start:f64,end:f64)->Option<(f64,f64)> {
+        let size=end-start;
+        if !start.is_finite()||!size.is_finite()||size<=0.0{return None;}
+        Some((start+f64::from(self.offsets[0].used(size as f32)?),start+f64::from(self.offsets[1].used(size as f32)?)))
+    }
+
+    /// View ranges in the scroll container's untransformed CSS-pixel coordinate space.
+    pub fn view_bounds(&self, subject_start: f64, subject_size: f64, viewport_size: f64) -> Option<(f64,f64)> {
+        if !subject_start.is_finite() || !subject_size.is_finite() || !viewport_size.is_finite()
+            || subject_size <= 0.0 || viewport_size <= 0.0 { return None; }
+        let cover=(subject_start-viewport_size,subject_start+subject_size);
+        let a=subject_start;let b=subject_start+subject_size-viewport_size;
+        let contain=(a.min(b),a.max(b));
+        let bounds=|name|match name {
+            ProgressRangeName::Cover=>cover,ProgressRangeName::Contain=>contain,
+            ProgressRangeName::Entry=>(cover.0,contain.0),ProgressRangeName::Exit=>(contain.1,cover.1),
+            ProgressRangeName::EntryCrossing=>(cover.0,b),ProgressRangeName::ExitCrossing=>(a,cover.1),
+        };
+        let position=|name,offset:&crate::css::DecorationLength|{let(start,end)=bounds(name);Some(start+f64::from(offset.used((end-start) as f32)?))};
+        Some((position(self.start.0,&self.offsets[0])?,position(self.end.0,&self.offsets[1])?))
+    }
+}
+
+pub fn progress_fraction(offset: f64, start: f64, end: f64) -> Option<f64> {
+    (offset.is_finite() && start.is_finite() && end.is_finite() && end>start)
+        .then(|| (offset-start)/(end-start))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keyframe {
     pub offset: f64,
+    /// Authored nullable offset; `offset` always holds the sampling coordinate.
+    pub offset_is_specified: bool,
     pub declarations: Vec<(String, String)>,
     /// Timing function for the interval beginning at this frame.
     pub easing: Option<String>,
@@ -66,7 +119,22 @@ impl Default for Timing {
 }
 
 impl Timing {
+    /// Web Animations 2 proportional timing on a finite progress timeline.
+    /// The caller retains specified timing separately for getTiming().
+    pub fn normalized_for_progress(mut self,auto:bool,timeline_duration:f64)->Self{
+        if auto{
+            self.delay_ms=0.0;self.end_delay_ms=0.0;
+            self.duration_ms=if self.iterations.is_finite()&&self.iterations>0.0{timeline_duration/self.iterations}else{0.0};
+        }else{
+            let total=self.end_time();
+            let scale=if total.is_finite()&&total>0.0{timeline_duration/total}else{0.0};
+            self.delay_ms*=scale;self.duration_ms*=scale;self.end_delay_ms*=scale;
+        }
+        self
+    }
+
     pub fn active_duration(self) -> f64 {
+
         // IEEE infinity * zero is NaN, but an empty active interval is zero.
         if self.duration_ms == 0.0 || self.iterations == 0.0 {
             0.0
@@ -220,6 +288,132 @@ pub struct CssEvent {
     pub elapsed_ms: f64,
 }
 
+/// CSS Transitions retain logical reversal endpoints independently of the
+/// currently sampled value. Hosts reuse their existing Animation timing record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransitionState<T> {
+    pub start_value: T,
+    pub end_value: T,
+    pub reversing_adjusted_start_value: T,
+    pub reversing_shortening_factor: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransitionParameters {
+    pub duration_ms: f64,
+    pub delay_ms: f64,
+}
+
+impl TransitionParameters {
+    pub fn combined_duration(self) -> f64 { self.duration_ms.max(0.0) + self.delay_ms }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransitionAction<T> {
+    Keep,
+    Cancel,
+    Start { state: TransitionState<T>, parameters: TransitionParameters },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransitionUpdate<T> {
+    pub remove_completed: bool,
+    pub action: TransitionAction<T>,
+}
+
+/// CSS Transitions 1 §3. Endpoint transitionability is supplied by the shared
+/// property/value algorithm; timing cannot make a non-animatable pair eligible.
+/// `eased_progress` is the old effect's transformed progress, including overshoot.
+pub fn transition_update<T: Clone + PartialEq>(
+    before: &T, after: &T, current: &T, running: Option<&TransitionState<T>>,
+    completed_end: Option<&T>, parameters: Option<TransitionParameters>,
+    initial_transitionable: bool, retarget_transitionable: bool, eased_progress: f64,
+) -> TransitionUpdate<T> {
+    transition_update_with(before, after, current, running, completed_end, parameters,
+        |retarget| if retarget { retarget_transitionable } else { initial_transitionable }, eased_progress)
+}
+
+/// Resolve endpoint transitionability only when the canonical lifecycle branch
+/// needs it. Unchanged properties and completed endpoints do not parse compound
+/// interpolation values during each unrelated style change.
+pub fn transition_update_with<T: Clone + PartialEq>(
+    before: &T, after: &T, current: &T, running: Option<&TransitionState<T>>,
+    completed_end: Option<&T>, parameters: Option<TransitionParameters>,
+    mut transitionable: impl FnMut(bool) -> bool, eased_progress: f64,
+) -> TransitionUpdate<T> {
+    let remove_completed = completed_end.is_some_and(|end| end != after || parameters.is_none());
+    let fresh = |start: &T, parameters| TransitionAction::Start {
+        state: TransitionState { start_value: start.clone(), end_value: after.clone(),
+            reversing_adjusted_start_value: start.clone(), reversing_shortening_factor: 1.0 },
+        parameters,
+    };
+    let action = match running {
+        None => match parameters {
+            Some(parameters) if before != after
+                && completed_end.is_none_or(|end| end != after)
+                && parameters.combined_duration() > 0.0 && transitionable(false) => fresh(before, parameters),
+            _ => TransitionAction::Keep,
+        },
+        Some(old) => match parameters {
+            None => TransitionAction::Cancel,
+            Some(_) if old.end_value == *after => TransitionAction::Keep,
+            Some(parameters) if current == after || parameters.combined_duration() <= 0.0
+                || !transitionable(true) => TransitionAction::Cancel,
+            Some(parameters) if old.reversing_adjusted_start_value == *after => {
+                let factor = (eased_progress * old.reversing_shortening_factor
+                    + 1.0 - old.reversing_shortening_factor).abs().clamp(0.0,1.0);
+                TransitionAction::Start {
+                    state: TransitionState { start_value: current.clone(), end_value: after.clone(),
+                        reversing_adjusted_start_value: old.end_value.clone(), reversing_shortening_factor: factor },
+                    parameters: TransitionParameters { duration_ms: parameters.duration_ms.max(0.0) * factor,
+                        delay_ms: if parameters.delay_ms < 0.0 { parameters.delay_ms * factor } else { parameters.delay_ms } },
+                }
+            }
+            Some(parameters) => fresh(current, parameters),
+        },
+    };
+    TransitionUpdate { remove_completed, action }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionPhase { Idle, Pending, Before, Active, After }
+
+/// Pending play/pause is a separate CSS transition phase only before its first
+/// resolved frame; seeking and negative playback use the ordinary effect phase.
+pub fn transition_phase(timing: Timing, current_time: Option<f64>, rate: f64,
+    pending: bool, previous: TransitionPhase, has_effect: bool) -> TransitionPhase {
+    use TransitionPhase::*;
+    if !has_effect { return match current_time { None => Idle, Some(time) if time < 0.0 => Before, Some(_) => After }; }
+    if pending && matches!(previous, Idle | Pending) { return Pending; }
+    match current_time.and_then(|time| effect_phase(timing,time,rate)) {
+        None => Idle, Some(EffectPhase::Before) => Before,
+        Some(EffectPhase::Active) => Active, Some(EffectPhase::After) => After,
+    }
+}
+
+/// CSS Transitions 2 phase table. The fixed batch preserves skipped-boundary
+/// ordering without allocating or replaying an unbounded series of frames.
+pub fn transition_events(timing: Timing, previous: TransitionPhase,
+    current: TransitionPhase, cancellation_elapsed_ms: f64) -> [Option<CssEvent>;3] {
+    use TransitionPhase::*;
+    let start = (-timing.delay_ms).min(timing.active_duration()).max(0.0);
+    let end = (timing.end_time()-timing.delay_ms).min(timing.active_duration()).max(0.0);
+    let event = |kind,elapsed_ms| Some(CssEvent { kind, elapsed_ms });
+    match (previous,current) {
+        (Idle,Pending | Before) => [event("transitionrun",start),None,None],
+        (Idle,Active) => [event("transitionrun",start),event("transitionstart",start),None],
+        (Idle,After) => [event("transitionrun",start),event("transitionstart",start),event("transitionend",end)],
+        (Pending | Before,Active) => [event("transitionstart",start),None,None],
+        (Pending | Before,After) => [event("transitionstart",start),event("transitionend",end),None],
+        (Active,After) => [event("transitionend",end),None,None],
+        (Active,Before) => [event("transitionend",start),None,None],
+        (After,Active) => [event("transitionstart",end),None,None],
+        (After,Before) => [event("transitionstart",end),event("transitionend",start),None],
+        (Pending | Before | Active,Idle) => [event("transitioncancel",cancellation_elapsed_ms),None,None],
+        _ => [None,None,None],
+    }
+}
+
 /// CSS Animations 2 event dispatch. A skipped frame emits a single iteration
 /// event at the newly sampled boundary, never an unbounded historical loop.
 pub fn css_events(
@@ -309,6 +503,15 @@ pub fn ease_with_before(name: &str, progress: f64, before: bool) -> Option<f64> 
         "step-end" => "steps(1, end)",
         name => name,
     };
+    if let Some(points) = linear_easing_points(name) {
+        if points.len()==1 {return Some(points[0].1);}
+        if before && points[0].0==progress {return Some(points[0].1);}
+        if let Some(point)=points.iter().rev().find(|point|point.0==progress) {return Some(point.1);}
+        let index=points.iter().rposition(|point|point.0<progress).unwrap_or(0).min(points.len()-2);
+        let (a,b)=(points[index],points[index+1]);
+        return Some(if a.0==b.0 {if progress<a.0 {a.1}else{b.1}}
+            else {a.1+(progress-a.0)/(b.0-a.0)*(b.1-a.1)});
+    }
     if let Some(body) = name
         .strip_prefix("cubic-bezier(")
         .and_then(|s| s.strip_suffix(')'))
@@ -376,6 +579,79 @@ pub fn ease_with_before(name: &str, progress: f64, before: bool) -> Option<f64> 
     None
 }
 
+/// CSS Easing 2 linear stop fixup, shared by declaration validation,
+/// serialization and evaluation. Numeric tokens reuse the CSS tokenizer.
+fn specified_linear_easing_points(input: &str) -> Option<Vec<(Option<f64>,f64)>> {
+    use crate::css::typed_numeric::{parse_numeric_value, NumericUnit};
+    let body = input.trim().strip_prefix("linear(")?.strip_suffix(')')?;
+    let stops = crate::css::css_list_items(body);
+    if stops.len()<2 { return None; }
+    let mut points: Vec<(Option<f64>,f64)> = Vec::new();
+    let mut largest = f64::NEG_INFINITY;
+    for (index,stop) in stops.iter().enumerate() {
+        let mut output = None;
+        let mut positions = [0.0;2];
+        let mut count = 0;
+        for token in stop.split_ascii_whitespace() {
+            let numeric = parse_numeric_value(token)?;
+            if !numeric.value.is_finite() { return None; }
+            match numeric.unit {
+                NumericUnit::Number if output.is_none() => output=Some(numeric.value),
+                NumericUnit::Percent if count < 2 => { positions[count]=numeric.value/100.0; count+=1; }
+                _ => return None,
+            }
+        }
+        let output=output?;
+        if count > 0 {
+            for position in &positions[..count] {
+                largest=largest.max(*position);
+                points.push((Some(largest),output));
+            }
+        } else {
+            if index == 0 {largest=0.0;}
+            points.push((None,output));
+        }
+    }
+    Some(points)
+}
+
+pub fn linear_easing_points(input:&str)->Option<Vec<(f64,f64)>> {
+    let mut points=specified_linear_easing_points(input)?;
+    if points[0].0.is_none() {points[0].0=Some(0.0);}
+    let last=points.len()-1;
+    if points[last].0.is_none() {points[last].0=Some(1.0);}
+    let mut largest=f64::NEG_INFINITY;
+    for point in &mut points {if let Some(input)=point.0 {largest=largest.max(input);point.0=Some(largest);}}
+    let mut index=1;
+    while index < points.len() {
+        if points[index].0.is_some() { index+=1; continue; }
+        let start=index-1;
+        while points[index].0.is_none() { index+=1; }
+        let lower=points[start].0?;
+        let upper=points[index].0?;
+        let distance=(index-start) as f64;
+        for position in start+1..index {
+            points[position].0=Some(lower+(upper-lower)*(position-start) as f64/distance);
+        }
+    }
+    Some(points.into_iter().map(|(input,output)|(input.expect("fixed linear input"),output)).collect())
+}
+
+pub fn serialize_linear_easing(input: &str) -> Option<String> {
+    use crate::css::typed_numeric::{serialize_numeric_value, NumericUnit};
+    let points=specified_linear_easing_points(input)?;
+    let mut result=String::from("linear(");
+    for (index,(input,output)) in points.into_iter().enumerate() {
+        if index != 0 { result.push_str(", "); }
+        result.push_str(&serialize_numeric_value(output,NumericUnit::Number));
+        if let Some(input)=input {
+            result.push(' ');
+            result.push_str(&serialize_numeric_value(input*100.0,NumericUnit::Percent));
+        }
+    }
+    result.push(')'); Some(result)
+}
+
 fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
     if progress < 0.0 {
         return if x1 > 0.0 {
@@ -416,20 +692,54 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
 /// Interpolate finite numeric CSS values only when units are compatible.
 /// Unsupported CSS syntax can use discrete keyframe sampling in the adapter.
 pub fn interpolate_numeric(from: &str, to: &str, progress: f64) -> Option<String> {
-    let (a, unit_a) = numeric_unit(from)?;
-    let (b, unit_b) = numeric_unit(to)?;
-    if unit_a != unit_b || !progress.is_finite() {
-        return None;
+    if !progress.is_finite() {return None;}
+    if let (Some((a,unit_a)),Some((b,unit_b)))=(numeric_unit(from),numeric_unit(to)) {
+        if unit_a==unit_b {
+            if progress==0.0{return Some(from.to_owned());}
+            if progress==1.0{return Some(to.to_owned());}
+            return serialize_numeric(a+(b-a)*progress,unit_a);
+        }
     }
-    let mut value = format!("{:.6}", a + (b - a) * progress);
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
+    // Validate dimensional compatibility before preserving exact endpoints.
+    // This also avoids constructing a zero-weight mixed calculation tree.
+    if progress==0.0 || progress==1.0 {
+        use crate::css::typed_numeric::{NumericExpression as E,parse_numeric_expression};
+        E::Sum(vec![parse_numeric_expression(from)?,parse_numeric_expression(to)?]).numeric_type()?;
+        return Some(if progress==0.0{from}else{to}.to_owned());
     }
-    if value.ends_with('.') {
-        value.pop();
+    combine_numeric_values(&[(from,1.0-progress),(to,progress)])
+}
+
+fn serialize_numeric(value:f64,unit:&str)->Option<String> {
+    if !value.is_finite(){return None;}
+    let mut result=format!("{value:.6}");
+    while result.contains('.') && result.ends_with('0'){result.pop();}
+    if result.ends_with('.'){result.pop();}
+    result.push_str(unit);Some(result)
+}
+
+/// Combine computed scalar expressions without resolving their percentage
+/// basis. The canonical CSS math tree owns dimensional checking, simplification
+/// and bounded serialization; interpolation and composition share this path.
+pub fn combine_numeric_values(values:&[(&str,f64)])->Option<String> {
+    use crate::css::typed_numeric::{NumericExpression as E,NumericValue,NumericUnit,parse_numeric_expression};
+    if values.is_empty() || values.len()>3{return None;}
+    let mut terms=Vec::new();terms.try_reserve_exact(values.len()).ok()?;
+    for &(value,weight) in values {
+        if !weight.is_finite(){return None;}
+        let expression=parse_numeric_expression(value)?;
+        terms.push(if weight==1.0{expression}else{
+            E::Product(vec![E::Value(NumericValue{value:weight,unit:NumericUnit::Number}),expression])
+        });
     }
-    value.push_str(unit_a);
-    Some(value)
+    let mut expression=E::Sum(terms);
+    expression.numeric_type()?;
+    if !expression.within_limits(){return None;}
+    expression.simplify_absolute_units();
+    if let Some(value)=expression.computed_percentage_dimension_mix(){expression=E::Value(value);}
+    if expression.single_numeric_value().is_none(){expression=E::Calc(Box::new(expression));}
+    if !expression.within_limits(){return None;}
+    expression.serialize()
 }
 
 /// Serialize computed transform functions without prematurely resolving percentages.
@@ -494,119 +804,29 @@ fn combine_transforms(
     height: f32,
     accumulate: bool,
 ) -> Option<String> {
-    use crate::css::{Transform, TransformLength};
-    use crate::paint::Affine;
-    if !progress.is_finite() {
-        return None;
-    }
-    let lerp = |a: f32, b: f32| {
-        if accumulate {
-            a + b
-        } else {
-            (a as f64 + (b as f64 - a as f64) * progress) as f32
-        }
-    };
-    let len = |a: TransformLength, b: TransformLength| TransformLength {
-        pixels: lerp(a.pixels, b.pixels),
-        percent: lerp(a.percent, b.percent),
-    };
-    let zero = TransformLength {
-        pixels: 0.0,
-        percent: 0.0,
-    };
-    let identity = |v: Transform| match v {
-        Transform::Matrix(_) => Transform::Matrix(Affine::IDENTITY),
-        Transform::Translate(_, _) => Transform::Translate(zero, zero),
-        Transform::Scale(_, _) => Transform::Scale(1.0, 1.0),
-        Transform::Rotate(_) => Transform::Rotate(0.0),
-        Transform::Skew(_, _) => Transform::Skew(0.0, 0.0),
-    };
-    let matrix = |list: &[Transform]| {
-        list.iter()
-            .fold(Affine::IDENTITY, |m, t| m.then(t.matrix(width, height)))
-    };
-    let coefficients = |m: Affine| [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::from);
-    let mut result = Vec::new();
-    for index in 0..from.len().max(to.len()) {
-        let a = from
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| identity(to[index]));
-        let b = to
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| identity(from[index]));
-        let primitive = match (a, b) {
-            (Transform::Translate(ax, ay), Transform::Translate(bx, by)) => {
-                Some(Transform::Translate(len(ax, bx), len(ay, by)))
-            }
-            (Transform::Scale(ax, ay), Transform::Scale(bx, by)) => Some(Transform::Scale(
-                lerp(ax, bx) - if accumulate { 1.0 } else { 0.0 },
-                lerp(ay, by) - if accumulate { 1.0 } else { 0.0 },
-            )),
-            (Transform::Rotate(a), Transform::Rotate(b)) => Some(Transform::Rotate(lerp(a, b))),
-            (Transform::Skew(ax, ay), Transform::Skew(bx, by)) => {
-                Some(Transform::Skew(lerp(ax, bx), lerp(ay, by)))
-            }
-            _ => None,
-        };
-        if let Some(v) = primitive {
-            result.push(v);
-            continue;
-        }
-        let a = matrix(from.get(index..).unwrap_or(&[]));
-        let b = matrix(to.get(index..).unwrap_or(&[]));
-        let [a, b, c, d, e, f] = if accumulate {
-            lumen_common::affine::accumulate(coefficients(a), coefficients(b))?
-        } else {
-            lumen_common::affine::interpolate(coefficients(a), coefficients(b), progress)?
-        };
-        let values = [a, b, c, d, e, f].map(|v| v as f32);
-        if !values.iter().all(|v| v.is_finite()) {
-            return None;
-        }
-        let [a, b, c, d, e, f] = values;
-        result.push(Transform::Matrix(Affine { a, b, c, d, e, f }));
-        break;
-    }
-    // A finite progress can still overflow the renderer's finite coefficients.
-    if result.iter().any(|t| {
-        !coefficients(t.matrix(width, height))
-            .iter()
-            .all(|v| v.is_finite())
-    }) {
-        return None;
-    }
-    Some(serialize_transforms(&result))
+    use crate::css::registered_properties::ComputedValueOperation as Op;
+    crate::css::typed_transforms::combine_resolved(from,to,
+        if accumulate {Op::Accumulate(1.0)}else{Op::Interpolate(progress)},width,height)
 }
 
 /// Add compatible computed CSS numeric values, optionally repeating `delta`
 /// for an accumulated effect iteration. Unit conversion is intentionally left
 /// to CSS computed-value resolution; incompatible units are not composable.
 pub fn add_numeric_values(base: &str, value: &str, delta: Option<(&str, u64)>) -> Option<String> {
-    let (base, base_unit) = numeric_unit(base)?;
-    let (value, value_unit) = numeric_unit(value)?;
-    if base_unit != value_unit {
-        return None;
-    }
-    let accumulated = if let Some((delta, iterations)) = delta {
-        let (delta, delta_unit) = numeric_unit(delta)?;
-        if delta_unit != base_unit {
-            return None;
+    if let (Some((a,unit_a)),Some((b,unit_b)))=(numeric_unit(base),numeric_unit(value)) {
+        if unit_a==unit_b {
+            let extra=if let Some((delta,count))=delta {
+                let (amount,unit)=numeric_unit(delta)?;
+                if unit!=unit_a{return combine_numeric_values(&[(base,1.0),(value,1.0),(delta,count as f64)]);}
+                amount*count as f64
+            }else{0.0};
+            return serialize_numeric(a+b+extra,unit_a);
         }
-        delta * iterations as f64
-    } else {
-        0.0
-    };
-    let mut result = format!("{:.6}", base + value + accumulated);
-    while result.contains('.') && result.ends_with('0') {
-        result.pop();
     }
-    if result.ends_with('.') {
-        result.pop();
+    match delta {
+        Some((delta,count))=>combine_numeric_values(&[(base,1.0),(value,1.0),(delta,count as f64)]),
+        None=>combine_numeric_values(&[(base,1.0),(value,1.0)]),
     }
-    result.push_str(base_unit);
-    Some(result)
 }
 
 fn numeric_unit(value: &str) -> Option<(f64, &str)> {
@@ -679,13 +899,33 @@ pub fn sample_keyframes_composed_with_property(
 /// Filtering precedes interval selection and composition, so excluded properties
 /// allocate no tracks and never reach the property callbacks.
 pub fn sample_keyframes_composed_with_property_filter(
-    keyframes: &[Keyframe],
-    progress: f64,
-    before: bool,
-    mut include: impl FnMut(&str) -> bool,
-    mut compose: impl FnMut(&str, &Keyframe, &str) -> Option<String>,
-    mut interpolate: impl FnMut(&str, &str, &str, f64) -> Option<String>,
-) -> Vec<(String, String)> {
+    keyframes: &[Keyframe],progress:f64,before:bool,
+    include:impl FnMut(&str)->bool,
+    mut compose:impl FnMut(&str,&Keyframe,&str)->Option<String>,
+    interpolate:impl FnMut(&str,&str,&str,f64)->Option<String>,
+)->Vec<(String,String)> {
+    sample_keyframes_intervals(keyframes,progress,before,false,include,
+        |property,frame,value|compose(property,frame?,value?),interpolate)
+}
+
+/// Web Animations' implicit boundary keyframes have a neutral value, which is
+/// resolved against the lower effect stack at sampling time. They are not
+/// authored frames and must never be inserted into the source keyframe array.
+pub fn sample_keyframes_composed_with_neutral_property_filter(
+    keyframes: &[Keyframe],progress:f64,before:bool,
+    include:impl FnMut(&str)->bool,
+    compose:impl FnMut(&str,Option<&Keyframe>,Option<&str>)->Option<String>,
+    interpolate:impl FnMut(&str,&str,&str,f64)->Option<String>,
+)->Vec<(String,String)> {
+    sample_keyframes_intervals(keyframes,progress,before,true,include,compose,interpolate)
+}
+
+fn sample_keyframes_intervals(
+    keyframes:&[Keyframe],progress:f64,before:bool,neutral:bool,
+    mut include:impl FnMut(&str)->bool,
+    mut compose:impl FnMut(&str,Option<&Keyframe>,Option<&str>)->Option<String>,
+    mut interpolate:impl FnMut(&str,&str,&str,f64)->Option<String>,
+)->Vec<(String,String)> {
     if keyframes.is_empty() || !progress.is_finite() {
         return Vec::new();
     }
@@ -700,7 +940,7 @@ pub fn sample_keyframes_composed_with_property_filter(
     properties
         .into_iter()
         .filter_map(|property| {
-            let indexes = keyframes
+            let mut indexes = keyframes
                 .iter()
                 .enumerate()
                 .filter_map(|(index, frame)| {
@@ -711,17 +951,23 @@ pub fn sample_keyframes_composed_with_property_filter(
                         .then_some(index)
                 })
                 .collect::<Vec<_>>();
+            if neutral {
+                if keyframes[*indexes.first()?].offset>0.0{indexes.insert(0,keyframes.len());}
+                if keyframes[indexes.iter().copied().rfind(|index|*index<keyframes.len())?].offset<1.0{indexes.push(keyframes.len()+1);}
+            }
+            let offset=|index:usize|if index==keyframes.len(){0.0}else if index==keyframes.len()+1{1.0}else{keyframes[index].offset};
             let first = *indexes.first()?;
+
             let last = *indexes.last()?;
             let left_index = indexes
                 .iter()
                 .copied()
-                .take_while(|index| keyframes[*index].offset <= progress)
+                .take_while(|index| offset(*index) <= progress)
                 .last();
             let right_index = indexes
                 .iter()
                 .copied()
-                .find(|index| keyframes[*index].offset > progress);
+                .find(|index| offset(*index) > progress);
             let (left_index, right_index) = match (left_index, right_index) {
                 (Some(left), Some(right)) => (left, right),
                 (None, Some(_)) if indexes.len() > 1 => (first, indexes[1]),
@@ -731,30 +977,20 @@ pub fn sample_keyframes_composed_with_property_filter(
                 (None, None) => (first, last),
             };
             let value_at = |index: usize| {
-                keyframes[index]
-                    .declarations
+                keyframes.get(index)?.declarations
                     .iter()
                     .find(|(name, _)| name == property)
                     .map(|(_, value)| value)
             };
-            let left_value = compose(property, &keyframes[left_index], value_at(left_index)?)?;
-            let right_value = compose(property, &keyframes[right_index], value_at(right_index)?)?;
+            let left_value = compose(property, keyframes.get(left_index), value_at(left_index).map(String::as_str))?;
+            let right_value = compose(property, keyframes.get(right_index), value_at(right_index).map(String::as_str))?;
             if left_index == right_index {
                 return Some((property.to_owned(), right_value));
             }
-            let left = &keyframes[left_index];
-            let right = &keyframes[right_index];
-            let span = right.offset - left.offset;
-            let local = if span > 0.0 {
-                (progress - left.offset) / span
-            } else {
-                1.0
-            };
-            let local = left
-                .easing
-                .as_deref()
-                .and_then(|easing| ease_with_before(easing, local, before))
-                .unwrap_or(local);
+            let span = offset(right_index)-offset(left_index);
+            let local=if span>0.0{(progress-offset(left_index))/span}else{1.0};
+            let local=keyframes.get(left_index).and_then(|frame|frame.easing.as_deref())
+                .and_then(|easing|ease_with_before(easing,local,before)).unwrap_or(local);
             let value =
                 interpolate(property, &left_value, &right_value, local).unwrap_or_else(|| {
                     if property == "display" && local > 0.0 && local < 1.0 {
@@ -786,12 +1022,81 @@ pub fn sample_keyframes_composed_with_property_filter(
 
 #[cfg(test)]
 mod tests {
+#[test]
+fn specification_animation_context_numeric_math_preserves_percentage_basis_and_accumulation_order() {
+    use crate::css::typed_numeric::{parse_numeric_expression,NumericDimension,NumericType,NumericUnit};
+    assert_eq!(interpolate_numeric("calc(15% + 24px)","calc(7% + 13px)",0.0).as_deref(),Some("calc(15% + 24px)"));
+    assert_eq!(interpolate_numeric("calc(15% + 24px)","calc(7% + 13px)",1.0).as_deref(),Some("calc(7% + 13px)"));
+    let value=interpolate_numeric("10%","30px",0.5).expect("computed length-percentage interpolation");
+    let expression=parse_numeric_expression(&value).expect("canonical serialized math");
+    assert_eq!(expression.numeric_type(),Some(NumericType {percent_hint:Some(NumericDimension::Length),..NumericType::from_unit(NumericUnit::Px)}));
+    assert!(expression.within_limits());
+    assert_eq!(interpolate_numeric("1px","3px",0.5).as_deref(),Some("2px"));
+    assert_eq!(interpolate_numeric("1s","3px",0.5),None,"unrelated dimensions remain incompatible");
+    assert_eq!(add_numeric_values("10px","20px",Some(("30px",2))).as_deref(),Some("90px"));
+    let accumulated=combine_numeric_values(&[("max(20px, 15%)",2.0),("min(10px, 5%)",1.0)]).unwrap();
+    assert!(accumulated.find("max(").unwrap()<accumulated.find("min(").unwrap(),"V_A must precede V_B in nonsimplifiable math: {accumulated}");
+    assert!(parse_numeric_expression(&accumulated).unwrap().within_limits());
+    assert_eq!(combine_numeric_values(&[("10px",f64::INFINITY)]),None);
+}
+
+    #[test]
+    fn specification_animation_neutral_boundaries_use_live_underlying_without_mutating_authored_frames() {
+        let frames=vec![Keyframe { offset_is_specified: true,offset:0.0,declarations:vec![(String::from("left"),String::from("-50"))],easing:Some(String::from("linear")),composite:Some(CompositeMode::Add)}];
+        let authored=frames.clone();
+        let sample=|underlying:f64,progress:f64|sample_keyframes_composed_with_neutral_property_filter(&frames,progress,false,|_|true,
+            |_,frame,value|Some(match (frame,value) {
+                (Some(frame),Some(value)) if frame.composite==Some(CompositeMode::Add)=>format!("{}",underlying+value.parse::<f64>().unwrap()),
+                (_,Some(value))=>String::from(value),
+                _=>format!("{underlying}"),
+            }),|_,left,right,progress|Some(format!("{}",left.parse::<f64>().unwrap()+(right.parse::<f64>().unwrap()-left.parse::<f64>().unwrap())*progress)));
+        assert_eq!(sample(200.0,0.5),vec![(String::from("left"),String::from("175"))]);
+        assert_eq!(sample(300.0,0.5),vec![(String::from("left"),String::from("275"))]);
+        assert_eq!(sample(200.0,1.0),vec![(String::from("left"),String::from("200"))]);
+        assert_eq!(frames,authored,"implicit neutral frames never become authored keyframes");
+        let middle=vec![Keyframe{ offset_is_specified: true,offset:0.5,declarations:vec![(String::from("opacity"),String::from("1"))],easing:None,composite:None}];
+        for (progress,expected) in [(0.0,"0"),(0.25,"0.5"),(0.5,"1"),(0.75,"0.5"),(1.0,"0")] {
+            let sampled=sample_keyframes_composed_with_neutral_property_filter(&middle,progress,false,|_|true,
+                |_,_,value|Some(String::from(value.unwrap_or("0"))),
+                |_,left,right,progress|Some(format!("{}",left.parse::<f64>().unwrap()+(right.parse::<f64>().unwrap()-left.parse::<f64>().unwrap())*progress)));
+            assert_eq!(sampled,vec![(String::from("opacity"),String::from(expected))]);
+        }
+    }
+
+    #[test]
+    fn specification_animation_progress_timing_normalizes_specified_delays_and_auto_duration(){
+        let specified=super::Timing{duration_ms:2000.0,delay_ms:500.0,end_delay_ms:1500.0,iterations:2.0,..super::Timing::default()};
+        let sampled=specified.normalized_for_progress(false,1000.0);
+        assert_eq!(sampled.delay_ms,500.0/6.0);
+        assert_eq!(sampled.duration_ms,2000.0/6.0);
+        assert_eq!(sampled.end_delay_ms,250.0);
+        assert_eq!(sampled.end_time(),1000.0);
+        let auto=specified.normalized_for_progress(true,1000.0);
+        assert_eq!(auto.delay_ms,0.0);assert_eq!(auto.end_delay_ms,0.0);
+        assert_eq!(auto.duration_ms,500.0);
+        assert_eq!(specified.delay_ms,500.0);assert_eq!(specified.end_delay_ms,1500.0);
+    }
+
+    #[test]
+    fn view_progress_ranges_follow_subject_bounds_and_reject_inactive_ranges() {
+
+        let range=super::ProgressRange::parse("exit").unwrap();
+        assert_eq!(range.view_bounds(700.0,200.0,200.0),Some((700.0,900.0)));
+        assert_eq!(range.view_bounds(800.0,100.0,200.0),Some((800.0,900.0)));
+        assert_eq!(super::progress_fraction(800.0,700.0,900.0),Some(0.5));
+        assert_eq!(super::progress_fraction(800.0,800.0,900.0),Some(0.0));
+        let partial=super::ProgressRange::parse("entry 25% exit 75%").unwrap();
+        assert_eq!(partial.view_bounds(700.0,200.0,200.0),Some((550.0,850.0)));
+        assert!(super::ProgressRange::parse("exit nonsense").is_none());
+        assert!(super::progress_fraction(10.0,0.0,0.0).is_none());
+        assert!(super::progress_fraction(f64::NAN,0.0,100.0).is_none());
+    }
     use super::*;
     use alloc::vec;
 
     #[test]
     fn filtered_keyframes_preserve_intervals_metadata_and_original_frames() {
-        let frames = [0.0, 0.5, 0.5, 1.0].into_iter().enumerate().map(|(index, offset)| Keyframe {
+        let frames = [0.0, 0.5, 0.5, 1.0].into_iter().enumerate().map(|(index, offset)| Keyframe { offset_is_specified: true,
             offset,
             declarations: vec![("width".into(), format!("{}px",index * 10)),
                 ("transform".into(), "unsupported additive transform".into())],
@@ -820,6 +1125,106 @@ mod tests {
                 assert_eq!(selected.len(),1);
             }
         }
+    }
+
+    #[test]
+    fn specification_linear_easing_fixes_stops_and_extrapolates_shared_samples() {
+        assert_eq!(linear_easing_points("linear(0, .25, 1)"), Some(vec![(0.0,0.0),(0.5,0.25),(1.0,1.0)]));
+        assert_eq!(linear_easing_points("linear(0 20%, .5 10%, 1)"), Some(vec![(0.2,0.0),(0.2,0.5),(1.0,1.0)]));
+        assert_eq!(ease("linear(0, .25 25% 75%, 1)",0.5),Some(0.25));
+        assert_eq!(ease("linear(0, .25 25% 75%, 1)",1.5),Some(2.5));
+        assert_eq!(ease("linear(0 50%, 1 50%)",0.5),Some(1.0));
+        assert_eq!(ease("linear(0, 1 100% 100%)",2.0),Some(1.0));
+        assert!(ease("linear(0)",0.5).is_none());
+        assert!(linear_easing_points("linear(0 0% 100%)").is_none());
+        assert!(serialize_linear_easing("linear(0 0% 100%)").is_none());
+        assert_eq!(ease("linear(0 0% 100%, 1)",0.5),Some(0.0));
+        assert_eq!(serialize_linear_easing("linear(0, .25, 1)").as_deref(),Some("linear(0, 0.25, 1)"));
+        assert_eq!(ease_with_before("linear(0 50%, 1 50%)",0.5,true),Some(0.0));
+        assert!(ease("linear(0, 1px)",0.5).is_none());
+        assert!(ease("linear(0, 1 10% 20% 30%)",0.5).is_none());
+    }
+
+    #[test]
+    fn specification_css_transitions_retarget_reverse_and_preserve_running_timing() {
+        let parameters = TransitionParameters { duration_ms: 1000.0, delay_ms: -100.0 };
+        let TransitionAction::Start { state, .. } = transition_update(&0, &100, &0, None,
+            None, Some(parameters), true, true, 0.0).action else { panic!("initial transition missing") };
+        let TransitionAction::Start { state: reversed, parameters: reverse_timing } =
+            transition_update(&100, &0, &25, Some(&state), None, Some(parameters), true, true, 0.25).action
+            else { panic!("reverse transition missing") };
+        assert_eq!(reverse_timing, TransitionParameters { duration_ms: 250.0, delay_ms: -25.0 });
+        assert_eq!(reversed.reversing_adjusted_start_value, 100);
+        let TransitionAction::Start { state: again, parameters: again_timing } =
+            transition_update(&0, &100, &15, Some(&reversed), None, Some(parameters), true, true, 0.4).action
+            else { panic!("second reverse missing") };
+        assert!((again_timing.duration_ms-850.0).abs() <= 850.0*f64::EPSILON*2.0,
+            "second reversal duration: {}",again_timing.duration_ms);
+        assert!((again_timing.delay_ms+85.0).abs() <= 85.0*f64::EPSILON*2.0,
+            "second reversal delay: {}",again_timing.delay_ms);
+        assert_eq!(again.reversing_adjusted_start_value, 0);
+        assert_eq!(transition_update(&0, &100, &25, Some(&state), None,
+            Some(TransitionParameters { duration_ms: 0.0, delay_ms: 0.0 }), true, true, 0.25).action,
+            TransitionAction::Keep);
+        assert_eq!(transition_update(&0, &100, &25, Some(&state), None, None, true, true, 0.25).action,
+            TransitionAction::Cancel);
+    }
+
+    #[test]
+    fn specification_css_transitions_lazy_transitionability_preserves_lifecycle_and_unchanged_admission() {
+        let parameters=TransitionParameters{duration_ms:1000.0,delay_ms:-100.0};
+        let state=TransitionState{start_value:0,end_value:100,reversing_adjusted_start_value:0,reversing_shortening_factor:1.0};
+        for (before,after,current,running,completed,timing) in [
+            (10,10,10,None,None,Some(parameters)),
+            (10,10,10,None,Some(20),Some(parameters)),
+            (10,10,10,None,Some(10),None),
+            (0,100,50,Some(&state),None,Some(parameters)),
+            (50,100,50,None,Some(100),Some(parameters)),
+            (0,100,0,None,None,Some(TransitionParameters{duration_ms:0.0,delay_ms:0.0})),
+            (0,0,0,Some(&state),None,Some(parameters)),
+            (0,50,25,Some(&state),None,None),
+        ] {
+            let lazy=transition_update_with(&before,&after,&current,running,completed.as_ref(),timing,
+                |_|panic!("endpoint parsing was requested for a lifecycle-only branch"),0.25);
+            let eager=transition_update(&before,&after,&current,running,completed.as_ref(),timing,true,true,0.25);
+            assert_eq!(lazy.action,eager.action);assert_eq!(lazy.remove_completed,eager.remove_completed);
+        }
+        for retarget in [false,true] {
+            for accepted in [false,true] {
+                let mut requests=alloc::vec::Vec::new();
+                let (before,after,current,running)=if retarget{(100,0,25,Some(&state))}else{(0,100,0,None)};
+                let lazy=transition_update_with(&before,&after,&current,running,None,Some(parameters),
+                    |requested|{requests.push(requested);accepted},0.25);
+                let eager=transition_update(&before,&after,&current,running,None,Some(parameters),accepted,accepted,0.25);
+                assert_eq!(requests,[retarget]);assert_eq!(lazy.action,eager.action);
+            }
+        }
+    }
+
+    #[test]
+    fn specification_css_transitions_completed_state_and_delayed_zero_duration() {
+        let parameters = TransitionParameters { duration_ms: 0.0, delay_ms: 100.0 };
+        assert!(matches!(transition_update(&0, &100, &0, None, None, Some(parameters), true, true, 0.0).action,
+            TransitionAction::Start { .. }));
+        assert_eq!(transition_update(&50, &100, &50, None, Some(&100), Some(parameters), true, true, 0.0).action,
+            TransitionAction::Keep);
+        assert!(transition_update(&100, &100, &100, None, Some(&100), None, true, true, 0.0).remove_completed);
+        let timing = Timing { duration_ms: 0.0, delay_ms: 100.0, fill: FillMode::Both, ..Timing::default() };
+        assert_eq!(transition_phase(timing, Some(0.0), 1.0, false, TransitionPhase::Idle, true), TransitionPhase::Before);
+        assert_eq!(transition_events(timing, TransitionPhase::Before, TransitionPhase::After, 0.0),
+            [Some(CssEvent { kind: "transitionstart", elapsed_ms: 0.0 }), Some(CssEvent { kind: "transitionend", elapsed_ms: 0.0 }), None]);
+    }
+
+    #[test]
+    fn specification_css_transition_events_preserve_skipped_boundaries_and_cancel_elapsed() {
+        let timing = Timing { delay_ms: -400.0, duration_ms: 1000.0, fill: FillMode::Both, ..Timing::default() };
+        assert_eq!(transition_events(timing, TransitionPhase::Idle, TransitionPhase::After, 0.0),
+            [Some(CssEvent { kind: "transitionrun", elapsed_ms: 400.0 }), Some(CssEvent { kind: "transitionstart", elapsed_ms: 400.0 }), Some(CssEvent { kind: "transitionend", elapsed_ms: 1000.0 })]);
+        assert_eq!(transition_events(timing, TransitionPhase::After, TransitionPhase::Before, 0.0),
+            [Some(CssEvent { kind: "transitionstart", elapsed_ms: 1000.0 }), Some(CssEvent { kind: "transitionend", elapsed_ms: 400.0 }), None]);
+        assert_eq!(transition_events(timing, TransitionPhase::Active, TransitionPhase::Idle, 700.0),
+            [Some(CssEvent { kind: "transitioncancel", elapsed_ms: 700.0 }), None, None]);
+        assert_eq!(transition_events(timing, TransitionPhase::After, TransitionPhase::Idle, 700.0), [None, None, None]);
     }
 
     #[test]
@@ -946,7 +1351,7 @@ mod tests {
     #[test]
     fn keyframe_sampler_interpolates_numeric_values_and_steps_keywords() {
         let frames = vec![
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 0.0,
                 declarations: vec![
                     ("opacity".into(), "0".into()),
@@ -955,7 +1360,7 @@ mod tests {
                 easing: None,
                 composite: None,
             },
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 1.0,
                 declarations: vec![
                     ("opacity".into(), "1".into()),
@@ -982,7 +1387,7 @@ mod tests {
     #[test]
     fn discrete_animation_keeps_display_and_visibility_during_active_interval() {
         let frames = vec![
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 0.0,
                 declarations: vec![
                     ("display".into(), "none".into()),
@@ -992,7 +1397,7 @@ mod tests {
                 easing: None,
                 composite: None,
             },
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 1.0,
                 declarations: vec![
                     ("display".into(), "block".into()),
@@ -1055,13 +1460,13 @@ mod tests {
         assert!((ease("cubic-bezier(0.5, 0.2, 0.8, 1.4)", -0.5).unwrap() + 0.2).abs() < 1e-9);
         assert!(ease("cubic-bezier(0.5, 0.2, 0.8, 1.4)", 1.5).unwrap().abs() < 1e-9);
         let frames = vec![
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 0.0,
                 declarations: vec![("width".into(), "0px".into())],
                 easing: Some("linear".into()),
                 composite: None,
             },
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 1.0,
                 declarations: vec![("width".into(), "10px".into())],
                 easing: None,
@@ -1081,13 +1486,13 @@ mod tests {
     #[test]
     fn keyframe_endpoint_composition_precedes_interpolation() {
         let frames = vec![
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 0.0,
                 declarations: vec![("width".into(), "2px".into())],
                 easing: None,
                 composite: Some(CompositeMode::Add),
             },
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 1.0,
                 declarations: vec![("width".into(), "30px".into())],
                 easing: None,
@@ -1315,13 +1720,13 @@ mod tests {
         let bezier = ease("cubic-bezier(0.25, 0.1, 0.25, 1)", 0.5).unwrap();
         assert!((bezier - 0.8024).abs() < 0.002);
         let frames = vec![
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 0.0,
                 declarations: vec![("opacity".into(), "0".into())],
                 easing: Some("ease-in".into()),
                 composite: None,
             },
-            Keyframe {
+            Keyframe { offset_is_specified: true,
                 offset: 1.0,
                 declarations: vec![("opacity".into(), "1".into())],
                 easing: None,

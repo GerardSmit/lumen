@@ -14,6 +14,7 @@ pub enum DisplayPhase {
 #[derive(Clone, Debug)]
 pub struct DisplayTimeline {
     started: u64,
+    display:FontDisplay,
     block_ms: u64,
     failure_ms: Option<u64>,
     phase: DisplayPhase,
@@ -29,6 +30,7 @@ impl DisplayTimeline {
         };
         Self {
             started: now_ms,
+            display,
             block_ms,
             failure_ms,
             phase: if block_ms == 0 {
@@ -39,6 +41,20 @@ impl DisplayTimeline {
         }
     }
 
+    /// Descriptor changes use the original first-use clock. Resource failure
+    /// is independent of a policy deadline and cannot be revived by a new policy.
+    pub fn configure(&mut self,display:FontDisplay,now_ms:u64,loaded_at:Option<u64>,failed:bool)->bool {
+        if self.display==display {return false;}
+        let before=self.phase;
+        let configured=Self::new(display,self.started);
+        self.display=display;
+        self.block_ms=configured.block_ms;
+        self.failure_ms=configured.failure_ms;
+        self.phase=configured.phase;
+        self.update_with_completion(now_ms,loaded_at,failed);
+        before!=self.phase
+    }
+
     pub fn phase(&self) -> DisplayPhase {
         self.phase
     }
@@ -46,15 +62,25 @@ impl DisplayTimeline {
     /// Loading after the failure deadline does not swap this face into the page.
     /// A previously loaded face remains usable after all deadlines pass.
     pub fn update(&mut self, now_ms: u64, loaded: bool, failed: bool) -> bool {
+        self.update_with_completion(now_ms,loaded.then_some(now_ms),failed)
+    }
+
+    /// Embedders record the actual completion clock, not the next rendering
+    /// opportunity: a timely load remains usable even when painting is delayed.
+    pub fn update_with_completion(&mut self,now_ms:u64,loaded_at:Option<u64>,failed:bool)->bool {
         let before = self.phase;
         if matches!(before, DisplayPhase::Loaded | DisplayPhase::Failure) {
             return false;
         }
         let elapsed = now_ms.saturating_sub(self.started);
-        self.phase = if failed || self.failure_ms.is_some_and(|end| elapsed >= end) {
+        let timely=loaded_at.is_some_and(|loaded|self.failure_ms.is_none_or(|end|
+            loaded.saturating_sub(self.started)<end));
+        self.phase = if failed {
             DisplayPhase::Failure
-        } else if loaded {
+        } else if timely {
             DisplayPhase::Loaded
+        } else if self.failure_ms.is_some_and(|end|elapsed>=end) {
+            DisplayPhase::Failure
         } else if elapsed < self.block_ms {
             DisplayPhase::Block
         } else {
@@ -78,6 +104,20 @@ mod tests {
     use super::*;
     #[test]
     fn font_display_deadlines_and_late_loads() {
+        let mut changed=DisplayTimeline::new(FontDisplay::Optional,0);
+        changed.update(100,false,false);
+        assert_eq!(changed.phase(),DisplayPhase::Failure);
+        assert!(changed.configure(FontDisplay::Block,200,None,false));
+        assert_eq!(changed.phase(),DisplayPhase::Block);
+        assert_eq!(changed.next_delay_ms(200),Some(2800));
+        assert!(changed.configure(FontDisplay::Swap,200,None,false));
+        assert_eq!(changed.phase(),DisplayPhase::Swap);
+        let mut delayed=DisplayTimeline::new(FontDisplay::Optional,10);
+        assert!(delayed.update_with_completion(500,Some(109),false));
+        assert_eq!(delayed.phase(),DisplayPhase::Loaded);
+        let mut late=DisplayTimeline::new(FontDisplay::Optional,10);
+        assert!(late.update_with_completion(500,Some(110),false));
+        assert_eq!(late.phase(),DisplayPhase::Failure);
         let mut block = DisplayTimeline::new(FontDisplay::Block, 10);
         assert_eq!(block.next_delay_ms(10), Some(3000));
         assert!(!block.update(3009, false, false));

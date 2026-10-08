@@ -50,7 +50,7 @@ impl DomAttr {
         Ok(self.attribute()?.2)
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_value(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         set_attr_value(ctx, &self.base.realm, self.base.id, value)
     }
@@ -89,7 +89,7 @@ impl DomAttr {
         self.value()
     }
 
-    #[setter(name = "nodeValue", coerce)]
+    #[setter(name = "nodeValue", coerce, hint(js(ce_reactions)))]
     fn set_node_value(&self, ctx: &mut Ctx, value: Option<&str>) -> OpResult<()> {
         set_attr_value(ctx, &self.base.realm, self.base.id, value.unwrap_or(""))
     }
@@ -99,7 +99,7 @@ impl DomAttr {
         self.value()
     }
 
-    #[setter(name = "textContent", coerce)]
+    #[setter(name = "textContent", coerce, hint(js(ce_reactions)))]
     fn set_text_content(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         set_attr_value(ctx, &self.base.realm, self.base.id, value)
     }
@@ -231,17 +231,17 @@ impl DomNamedNodeMap {
         Ok(attribute.map_or(Value::Null, |attribute| self.realm.wrap(ctx, attribute)))
     }
 
-    #[method(name = "setNamedItem")]
+    #[method(name = "setNamedItem", hint(js(ce_reactions)))]
     fn set_named_item(&self, ctx: &mut Ctx, attribute: &DomAttr) -> OpResult<Value> {
         self.set_attribute_node(ctx, attribute, false)
     }
 
-    #[method(name = "setNamedItemNS")]
+    #[method(name = "setNamedItemNS", hint(js(ce_reactions)))]
     fn set_named_item_ns(&self, ctx: &mut Ctx, attribute: &DomAttr) -> OpResult<Value> {
         self.set_attribute_node(ctx, attribute, true)
     }
 
-    #[method(name = "removeNamedItem", coerce)]
+    #[method(name = "removeNamedItem", coerce, hint(js(ce_reactions)))]
     fn remove_named_item(&self, ctx: &mut Ctx, qualified_name: &str) -> OpResult<Value> {
         let attribute = self
             .realm
@@ -254,7 +254,7 @@ impl DomNamedNodeMap {
         self.remove_attribute_node(ctx, attribute)
     }
 
-    #[method(name = "removeNamedItemNS", coerce)]
+    #[method(name = "removeNamedItemNS", coerce, hint(js(ce_reactions)))]
     fn remove_named_item_ns(
         &self,
         ctx: &mut Ctx,
@@ -274,6 +274,11 @@ impl DomNamedNodeMap {
 }
 
 impl DomNamedNodeMap {
+    pub(crate) fn adopt_node(&mut self, realm: Rc<DomRealm>, element: NodeId) {
+        self.realm = realm;
+        self.element = element;
+    }
+
     fn set_attribute_node(
         &self,
         ctx: &mut Ctx,
@@ -520,9 +525,8 @@ pub(crate) fn create_attribute_ns(
     namespace_uri: Option<&str>,
     qualified_name: &str,
 ) -> OpResult<Value> {
-    // Keep the XML namespace/QName validation in the same shared DOM helper used by
-    // createElementNS and Element.setAttributeNS.
-    let _ = super::namespace_for_qname(ctx, namespace_uri, qualified_name)?;
+    // Attribute and element local names have different DOM validation rules.
+    let _ = super::namespace_for_qname(ctx, namespace_uri, qualified_name, lumen_html::xml::DomNameContext::Attribute)?;
     let namespace_uri = namespace_uri.filter(|namespace| !namespace.is_empty());
     let id = realm
         .session

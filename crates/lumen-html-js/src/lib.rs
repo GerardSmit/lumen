@@ -23,18 +23,24 @@ use collections::{
 mod style;
 use style::DomStyle;
 pub(crate) mod animations;
+mod animation_worklet;
+mod paint_worklet;
 mod browser_services;
 mod browsing_context;
 mod realm_services;
 pub use browser_services::{ClipboardHost, ClipboardOperation, ClipboardPermission};
 pub use browsing_context::{
-    FrameCommitResult, FrameContext, FrameInstallError, FrameNavigationRequest, FrameSource,
-    FrameUnsupportedReason, Origin, PreparedFrameResponse, WeakFrameIdentity,
+    FrameCommitResult, FrameContext, FrameInstallError, FrameNavigationRequest, FrameSource, NavigationPostResource, NavigationMetadata, UserNavigationInvolvement,
+    FrameUnsupportedReason, FrameResourceLimits, Origin, PreparedFrameResponse, WeakFrameIdentity,
 };
 mod presentation;
+mod rendering_capture;
+mod view_transition;
+pub use rendering_capture::{RenderCaptureProvider, RenderCaptureRequest, RenderCaptureTarget};
 pub use presentation::PresentationHost;
 mod notifications;
 pub mod object_urls;
+pub mod indexed_db;
 pub use notifications::{
     NotificationHost, NotificationHostEvent, NotificationPayload, NotificationPermission,
     NotificationPermissionRequest,
@@ -45,14 +51,20 @@ pub use canvas::{
     set_webgl_canvas_context_factory, CanvasGpuTarget,
 };
 mod cookies;
-pub(crate) mod dialog_popover;
 mod cssom;
 mod custom_elements;
+pub use custom_elements::effective_aria_attribute;
+pub(crate) mod dialog_popover;
 pub use cookies::CookieHost;
 mod document_utilities;
 mod editing;
+mod focus;
+pub use focus::ScriptBlockingStylesheet;
 mod editing_history;
 mod font_loading;
+mod font_preload;
+mod form_data_bridge;
+pub mod forms;
 #[cfg(test)]
 #[path = "forms_batch68_tests.rs"]
 mod forms_batch68_tests;
@@ -65,22 +77,43 @@ mod forms_batch70_tests;
 #[cfg(test)]
 #[path = "forms_batch71_tests.rs"]
 mod forms_batch71_tests;
-mod form_data_bridge;
-pub mod forms;
+#[cfg(test)]
+#[path = "forms_batch72_tests.rs"]
+mod forms_batch72_tests;
 mod geometry;
+mod history;
+mod fragment;
+pub mod navigation_lifecycle;
 mod html_interfaces;
 mod hyperlinks;
-mod labels;
+mod referrer;
+mod csp;
+mod csp_reports;
+mod reporting;
+#[cfg(test)]
+mod csp_image_tests;
+mod browser_timers;
+mod tables;
+mod invokers;
+mod command_events;
+mod element_reflection;
 mod image_loading;
+pub mod stylesheet_loading;
+pub mod object_loading;
 pub mod keyboard_automation;
+mod labels;
 mod media;
 mod media_capture;
 mod option_factory;
 pub(crate) mod scrolling;
+mod svg_interfaces;
 pub mod testdriver;
 mod webaudio;
 mod webrtc;
-pub use font_loading::{FontFaceStatus, FontResourceLoader, ManualFontFace};
+pub use font_loading::{
+    install_worker_fonts, poll_worker_fonts, FontFaceStatus, FontResourceLoader, ManualFontFace,
+    WorkerFontContext,
+};
 pub use media::{MediaSnapshot, ReadyState as MediaReadyState, VideoFrameSnapshot};
 pub use media_capture::{
     MediaCapturePermission, MediaCaptureVideoSource, MediaDeviceDescription, MediaDeviceKind,
@@ -92,10 +125,19 @@ pub use webaudio::{
 };
 pub use webrtc::{WebRtcHost, WebRtcHostEvent};
 mod script_loading;
+mod import_maps;
+mod template_graph;
 #[derive(Default)]
 struct ScriptCapabilities {
     modules: Cell<bool>,
 }
+/// Host parser progress distinguishes a real resource pause from EOF.
+pub enum DocumentParserStep {
+    Script(ScriptDescriptor),
+    BlockedOnStylesheets,
+    Complete,
+}
+
 pub use script_loading::{
     DeclaredScriptType as ScriptType, ScriptDescriptor, UnhandledScriptActivation,
     UnhandledScriptReason,
@@ -104,6 +146,7 @@ mod jsx;
 pub mod layout_observers;
 mod observers;
 mod range;
+mod highlight;
 mod reactive;
 mod rejection_delivery;
 pub use rejection_delivery::{
@@ -116,6 +159,7 @@ pub mod scheduling;
 mod shadow;
 mod templates;
 mod window_globals;
+mod window_messaging;
 use editing_history::EditingState;
 use shadow::{DomShadowRoot, DomSlotElement};
 
@@ -136,10 +180,21 @@ pub fn install_css_typed_om(ctx: &mut Ctx) -> OpResult<()> {
     cssom::install_typed_numeric(ctx)
 }
 
+/// Create HTML's genuine CSS module default export in the current settings
+/// realm, using the shared constructed stylesheet and replacement algorithms.
+pub fn create_css_module_stylesheet(ctx: &mut Ctx, source: &str) -> OpResult<Value> {
+    cssom::create_module_stylesheet(ctx, source)
+}
+
 /// Install the OffscreenCanvas interfaces and worker-safe canvas helpers in a
 /// browser worker realm without exposing Window's CanvasRenderingContext2D.
 pub fn install_worker_canvas(ctx: &mut Ctx) -> OpResult<()> {
     canvas::install_worker(ctx)
+}
+
+/// Install the shared native geometry interfaces and clone codecs in a worker.
+pub fn install_worker_geometry(ctx: &mut Ctx) -> OpResult<()> {
+    geometry::install_worker(ctx)
 }
 
 #[inline(always)]
@@ -208,6 +263,283 @@ impl DocumentReadyState {
 
 struct ValueWriteJournal {
     entries: [Option<(u64, NodeId)>; VALUE_WRITE_JOURNAL_LEN],
+}
+
+// Detached nodes stay in the document arena while a JavaScript wrapper or a
+// native task can still reach any member of their shadow-including identity
+// component. Keep only roots that are pending reclamation here. The hash maps
+// make enqueue/dedup constant-time; queue storage is therefore proportional
+// to pending roots (and bounded by the document's node budget), rather than
+// scanning every older retained root after each removal.
+const DETACHED_REAP_ROOTS_PER_EPOCH: usize = 32;
+const DETACHED_REAP_ROOTS_PER_CALL: usize = 128;
+const DETACHED_REAP_DIRTY_ROOTS_PER_CALL: usize = 64;
+const DETACHED_SIDECAR_REAP_FLOOR: usize = 64;
+const DETACHED_QUEUE_COMPACT_SLACK: usize = 64;
+
+#[derive(Clone, Copy)]
+struct DetachedCandidate {
+    root: NodeId,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct DetachedRootReaper {
+    candidates: VecDeque<DetachedCandidate>,
+    candidate_generations: HashMap<NodeId, u64>,
+    dirty: VecDeque<NodeId>,
+    dirty_roots: HashSet<NodeId>,
+    next_generation: u64,
+    observed_gc_epoch: u64,
+    gc_roots_remaining: usize,
+    destroyed_since_sidecar_sweep: usize,
+}
+
+impl DetachedRootReaper {
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.next_generation
+    }
+
+    fn register(&mut self, root: NodeId) -> DetachedCandidate {
+        let generation = self.next_generation();
+        self.candidate_generations.insert(root, generation);
+        DetachedCandidate { root, generation }
+    }
+
+    fn enqueue_candidate(&mut self, candidate: DetachedCandidate) {
+        self.candidates.push_back(candidate);
+    }
+
+    fn is_current(&self, candidate: DetachedCandidate) -> bool {
+        self.candidate_generations.get(&candidate.root) == Some(&candidate.generation)
+    }
+
+    fn enqueue_dirty(&mut self, root: NodeId) {
+        if self.dirty_roots.insert(root) {
+            self.dirty.push_back(root);
+        }
+    }
+
+    fn has_scheduled_work(&self, gc_epoch: u64) -> bool {
+        !self.dirty.is_empty()
+            || self.gc_roots_remaining != 0
+            || (!self.candidate_generations.is_empty() && self.observed_gc_epoch != gc_epoch)
+    }
+
+    fn compact_queues(&mut self) {
+        let candidate_limit = self
+            .candidate_generations
+            .len()
+            .saturating_mul(2)
+            .saturating_add(DETACHED_QUEUE_COMPACT_SLACK);
+        if self.candidates.len() > candidate_limit {
+            let current = &self.candidate_generations;
+            self.candidates
+                .retain(|candidate| current.get(&candidate.root) == Some(&candidate.generation));
+        }
+
+        let dirty_limit = self
+            .dirty_roots
+            .len()
+            .saturating_mul(2)
+            .saturating_add(DETACHED_QUEUE_COMPACT_SLACK);
+        if self.dirty.len() > dirty_limit {
+            let current = &self.dirty_roots;
+            self.dirty.retain(|root| current.contains(root));
+        }
+    }
+}
+
+#[derive(Default)]
+struct DetachedReapStats {
+    did_reap: bool,
+    #[cfg(test)]
+    roots_examined: usize,
+    #[cfg(test)]
+    nodes_examined: usize,
+}
+
+impl DetachedReapStats {
+    fn root_examined(&mut self) {
+        self.did_reap = true;
+        #[cfg(test)]
+        {
+            self.roots_examined = self.roots_examined.saturating_add(1);
+        }
+    }
+
+    fn node_examined(&mut self) {
+        #[cfg(test)]
+        {
+            self.nodes_examined = self.nodes_examined.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DetachedRootCheck {
+    Connected,
+    Retained,
+    Destroyed(usize),
+    Deferred,
+}
+
+fn detached_identity_root(document: &lumen_html::Document, node: NodeId) -> Option<NodeId> {
+    let root = selector::native_identity_root(document, node).ok()?;
+    if root == document.root()
+        || selector::native_identity_parent(document, root)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return None;
+    }
+    Some(root)
+}
+
+fn recheck_dirty_detached_root(
+    reaper: &mut DetachedRootReaper,
+    document: &mut lumen_html::Document,
+    root: NodeId,
+    wrappers: &HashMap<NodeId, WeakValue>,
+    retained_nodes: &HashMap<NodeId, usize>,
+    current_script_root: Option<NodeId>,
+    stats: &mut DetachedReapStats,
+) {
+    let Some(detached_root) = detached_identity_root(document, root) else {
+        reaper.candidate_generations.remove(&root);
+        return;
+    };
+    if detached_root != root {
+        reaper.candidate_generations.remove(&root);
+    }
+    let candidate = reaper.register(detached_root);
+    process_detached_candidate(
+        reaper,
+        document,
+        candidate,
+        wrappers,
+        retained_nodes,
+        current_script_root,
+        stats,
+    );
+}
+
+fn process_detached_candidate(
+    reaper: &mut DetachedRootReaper,
+    document: &mut lumen_html::Document,
+    candidate: DetachedCandidate,
+    wrappers: &HashMap<NodeId, WeakValue>,
+    retained_nodes: &HashMap<NodeId, usize>,
+    current_script_root: Option<NodeId>,
+    stats: &mut DetachedReapStats,
+) {
+    if !reaper.is_current(candidate) {
+        return;
+    }
+    stats.root_examined();
+    match inspect_detached_component(
+        document,
+        candidate.root,
+        wrappers,
+        retained_nodes,
+        current_script_root,
+        stats,
+    ) {
+        DetachedRootCheck::Connected => {
+            reaper.candidate_generations.remove(&candidate.root);
+        }
+        DetachedRootCheck::Retained | DetachedRootCheck::Deferred => {
+            reaper.enqueue_candidate(candidate);
+        }
+        DetachedRootCheck::Destroyed(count) => {
+            reaper.candidate_generations.remove(&candidate.root);
+            reaper.destroyed_since_sidecar_sweep =
+                reaper.destroyed_since_sidecar_sweep.saturating_add(count);
+        }
+    }
+}
+
+fn inspect_detached_component(
+    document: &mut lumen_html::Document,
+    root: NodeId,
+    wrappers: &HashMap<NodeId, WeakValue>,
+    retained_nodes: &HashMap<NodeId, usize>,
+    current_script_root: Option<NodeId>,
+    stats: &mut DetachedReapStats,
+) -> DetachedRootCheck {
+    if document.kind(root).is_err() {
+        return DetachedRootCheck::Connected;
+    }
+    if root == document.root() {
+        return DetachedRootCheck::Connected;
+    }
+    match selector::native_identity_parent(document, root) {
+        Ok(None) => {}
+        Ok(Some(_)) => return DetachedRootCheck::Connected,
+        Err(_) => return DetachedRootCheck::Deferred,
+    }
+
+    if current_script_root == Some(root)
+        || native_identity_is_live(root, document, wrappers, retained_nodes, stats)
+    {
+        return DetachedRootCheck::Retained;
+    }
+
+    let mut cursor = Some(root);
+    let mut steps = 0usize;
+    while let Some(node) = cursor {
+        if steps >= document.node_count() {
+            return DetachedRootCheck::Deferred;
+        }
+        steps += 1;
+        stats.node_examined();
+        if node != root && native_identity_is_live(node, document, wrappers, retained_nodes, stats)
+        {
+            return DetachedRootCheck::Retained;
+        }
+        cursor = match selector::next_native_identity_descendant(document, root, node) {
+            Ok(next) => next,
+            Err(_) => return DetachedRootCheck::Deferred,
+        };
+    }
+
+    let before = document.node_count();
+    if document.destroy_subtree(root).is_err() {
+        return DetachedRootCheck::Deferred;
+    }
+    DetachedRootCheck::Destroyed(before.saturating_sub(document.node_count()))
+}
+
+fn native_identity_is_live(
+    node: NodeId,
+    document: &lumen_html::Document,
+    wrappers: &HashMap<NodeId, WeakValue>,
+    retained_nodes: &HashMap<NodeId, usize>,
+    stats: &mut DetachedReapStats,
+) -> bool {
+    if wrappers
+        .get(&node)
+        .is_some_and(|wrapper| wrapper.upgrade().is_some())
+        || retained_nodes.contains_key(&node)
+    {
+        return true;
+    }
+    let Some(attributes) = document.materialized_attribute_nodes(node) else {
+        return false;
+    };
+    for &(_, attribute) in attributes {
+        stats.node_examined();
+        if wrappers
+            .get(&attribute)
+            .is_some_and(|wrapper| wrapper.upgrade().is_some())
+            || retained_nodes.contains_key(&attribute)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The one base element currently governing this document, together with the
@@ -359,8 +691,11 @@ fn mutation_contains_node(
             added.iter().chain(removed).any(|root| contains(*root))
         }
         lumen_html::observe::ObservedKind::Attribute { .. }
+        | lumen_html::observe::ObservedKind::ChildListReplacement { .. }
         | lumen_html::observe::ObservedKind::CharacterData { .. }
-        | lumen_html::observe::ObservedKind::SlotAssignment => false,
+        | lumen_html::observe::ObservedKind::TextSplit { .. }
+            | lumen_html::observe::ObservedKind::TextMerge { .. }
+            | lumen_html::observe::ObservedKind::SlotAssignment => false,
     }
 }
 
@@ -420,6 +755,7 @@ impl ValueWriteJournal {
 struct DocumentIdentity {
     origin: RefCell<Option<browsing_context::Origin>>,
     url: RefCell<Option<String>>,
+    creation_global: RefCell<Option<WeakValue>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,8 +764,27 @@ enum DocumentInterface {
     XmlDocument,
 }
 
+#[derive(Clone, Copy)]
+struct MovingNode {
+    root: NodeId,
+    old_index: usize,
+}
+
+struct MoveScope<'a> {
+    state: &'a Cell<Option<MovingNode>>,
+    previous: Option<MovingNode>,
+}
+
+impl Drop for MoveScope<'_> {
+    fn drop(&mut self) {
+        self.state.set(self.previous);
+    }
+}
+
 pub struct DomRealm {
+    lifecycle: navigation_lifecycle::DocumentLifecycle,
     details_controller: RefCell<std::rc::Weak<dialog_popover::DetailsController>>,
+    autofocus: RefCell<focus::AutofocusState>,
     /// Last rendering-opportunity sample, shared by all document timelines.
     /// Keep this on the document so foreign-realm getters use its own clock.
     timeline_sample: Cell<f64>,
@@ -440,8 +795,17 @@ pub struct DomRealm {
     /// creating global's origin here.
     document_identity: Rc<DocumentIdentity>,
     about_base_url: RefCell<Option<String>>,
+    referrer_policy: Cell<lumen_common::referrer::ReferrerPolicy>,
+    csp: RefCell<csp::State>,
+    csp_report_budget: RefCell<csp_reports::DeliveryBudget>,
+    reporting: Rc<reporting::State>,
+    csp_overflow: Cell<bool>,
+    reflected_elements: RefCell<element_reflection::ReflectedElements>,
+    dialog_requests: RefCell<HashMap<NodeId, Rc<dialog_popover::DialogRequest>>>,
+    document_referrer: RefCell<String>,
     document_base_url: RefCell<DocumentBaseUrlCache>,
     cookie_host: RefCell<Option<Rc<dyn CookieHost>>>,
+    cookie_source_url: RefCell<Option<String>>,
     document_interface: DocumentInterface,
     content_type: String,
     document_encoding: Cell<&'static str>,
@@ -453,61 +817,109 @@ pub struct DomRealm {
     canvases: canvas::CanvasRegistry,
     forms: Rc<RefCell<forms::FormState>>,
     ranges: Rc<range::RangeRegistry>,
+    highlights: RefCell<std::rc::Weak<highlight::RegistryState>>,
     iterators: Rc<document_utilities::IteratorRegistry>,
     tree_walkers: Rc<document_utilities::TreeWalkerRegistry>,
-    selection: RefCell<Option<Rc<range::SelectionData>>>,
+    selection: RefCell<std::rc::Weak<range::SelectionData>>,
     selection_wrapper: RefCell<Option<WeakValue>>,
     ready_state: Cell<DocumentReadyState>,
     current_script: Cell<Option<NodeId>>,
     document_parser: RefCell<Option<html::HtmlDocumentParser>>,
+    xml_document_parser: RefCell<Option<lumen_html::xml::XmlDocumentParser>>,
+    document_parser_retention: RefCell<Vec<ParserRetention>>,
+    pending_parser_source: RefCell<Option<String>>,
     parser_generation: Cell<u64>,
+    dynamic_markup_insertion_counter: Cell<usize>,
     scripts: RefCell<script_loading::ScriptLoader>,
     module_activations_enabled: Cell<bool>,
     script_capabilities: Rc<ScriptCapabilities>,
     classic_resource_activations_enabled: Cell<bool>,
     module_activations: RefCell<VecDeque<PendingScriptActivation>>,
     dataset_intrinsics: RefCell<Option<dataset::ProxyIntrinsics>>,
-    layout_flusher: RefCell<Option<Rc<dyn Fn(&mut RenderSession) -> Result<(), String>>>>,
+    layout_flusher: RefCell<Option<LayoutFlusher>>,
+    device_pixel_ratio: Cell<f64>,
     font_loading: font_loading::FontLoading,
+    font_preloads: font_preload::State,
     images: image_loading::ImageLoader,
+    stylesheet_links: stylesheet_loading::StylesheetLinks,
+    object_resources: object_loading::ObjectResources,
     pub(crate) media: RefCell<media::MediaController>,
     pub(crate) web_audio: RefCell<webaudio::WebAudioController>,
-    image_request_roots: RefCell<HashMap<NodeId, ImageRequestRoot>>,
+    image_request_roots: RefCell<HashMap<NodeId, ResourceRequestRoot>>,
     mutation_sinks:
+        RefCell<Vec<Rc<dyn Fn(&lumen_html::Document, &lumen_html::observe::ObservedMutation)>>>,
+    observer_registrations: RefCell<HashMap<NodeId, Vec<std::rc::Weak<observers::ObserverData>>>>,
+    mutation_observer_sinks:
         RefCell<Vec<Rc<dyn Fn(&lumen_html::Document, &lumen_html::observe::ObservedMutation)>>>,
     session: Rc<RefCell<RenderSession>>,
     wrappers: RefCell<HashMap<NodeId, WeakValue>>,
     identity_trace_epoch: Cell<u64>,
     identity_trace_nodes: RefCell<HashSet<NodeId>>,
-    adopted_nodes: RefCell<HashMap<NodeId, (std::rc::Weak<DomRealm>, NodeId)>>,
+    adopted_nodes: RefCell<HashMap<NodeId, Rc<RefCell<(std::rc::Weak<DomRealm>, NodeId)>>>>,
+    template_graph_owners: RefCell<HashMap<u64, std::rc::Weak<DomRealm>>>,
     document_wrapper: RefCell<Option<WeakValue>>,
     implementation_wrapper: RefCell<Option<WeakValue>>,
-    detached: RefCell<Vec<NodeId>>,
+    detached: RefCell<DetachedRootReaper>,
     sweep_at: Cell<usize>,
     targets: RefCell<HashMap<NodeId, std::rc::Weak<TargetData>>>,
+    initialized_content_handlers: RefCell<HashMap<NodeId, u128>>,
     retained_nodes: RefCell<HashMap<NodeId, usize>>,
-    script_retentions:
-        RefCell<HashMap<NodeId, Vec<std::rc::Weak<RefCell<CurrentScriptRetention>>>>>,
+    node_retentions:
+        RefCell<HashMap<NodeId, Vec<std::rc::Weak<RefCell<RetainedIdentity>>>>>,
     window_target: RefCell<Option<Rc<TargetData>>>,
     window_wrapper: RefCell<Option<WeakValue>>,
     location_wrapper: RefCell<Option<WeakValue>>,
+    history_data: RefCell<Option<Rc<history::HistoryData>>>,
+    fragment_state: RefCell<Option<fragment::FragmentState>>,
+    history_wrapper: RefCell<Option<WeakValue>>,
+    moving_node: Cell<Option<MovingNode>>,
     browsing_context: RefCell<std::rc::Weak<browsing_context::BrowsingContext>>,
     frame_contexts: RefCell<HashMap<NodeId, std::rc::Weak<browsing_context::BrowsingContext>>>,
     pending_frame_contexts: RefCell<HashMap<NodeId, Rc<browsing_context::BrowsingContext>>>,
     pending_frame_realms: RefCell<Vec<lumen::embed::RealmHandle>>,
     pending_iframe_post_connections: RefCell<VecDeque<NodeId>>,
+    pending_inserted_content_handlers: RefCell<Vec<NodeId>>,
     focused: Cell<Option<NodeId>>,
     focus_visible: Cell<Option<NodeId>>,
+    rendered_focus_epoch: Cell<Option<(NodeId, u64, u64, u64)>>,
     hover_target: Cell<Option<NodeId>>,
     active_targets: Cell<[Option<NodeId>; 2]>,
     keyboard_modality: Cell<bool>,
+    custom_shadow_policy: RefCell<Option<Rc<custom_elements::ShadowPolicy>>>,
+    cssom_registry: RefCell<std::rc::Weak<cssom::MediaQueryRegistry>>,
+    custom_element_registry: RefCell<Option<WeakValue>>,
+    custom_element_hub: RefCell<std::rc::Weak<custom_elements::CustomElementHub>>,
     selections: RefCell<HashMap<NodeId, (usize, usize, String)>>,
     editing: RefCell<EditingState>,
     programmatic_value_epoch: Cell<u64>,
     programmatic_value_writes: RefCell<ValueWriteJournal>,
 }
 
+#[derive(Clone)]
+enum LayoutFlusher {
+    Direct(Rc<dyn Fn(&mut RenderSession)->Result<(),String>>),
+    PreparedViewport {
+        prepare:Rc<dyn Fn()->Result<(u32,u32),String>>,
+        flush:Rc<dyn Fn(&mut RenderSession,(u32,u32))->Result<(),String>>,
+    },
+}
+
 impl DomRealm {
+    fn note_creation_global(&self, ctx: &mut Ctx) {
+        if self.document_identity.creation_global.borrow().is_none() {
+            let global = ctx.global_object();
+            *self.document_identity.creation_global.borrow_mut() = ctx.weak_value(&global);
+        }
+    }
+
+    pub(crate) fn relevant_host_realm(&self, ctx: &mut Ctx) -> Option<lumen::embed::RealmHandle> {
+        if let Some(context) = self.browsing_context() {
+            return Some(browsing_context::context_realm_handle(&context));
+        }
+        let global = self.document_identity.creation_global.borrow().as_ref()?.upgrade()?;
+        ctx.host_realm_for_global(&global)
+    }
+
     pub(crate) fn set_document_origin(&self, origin: browsing_context::Origin) {
         *self.document_identity.origin.borrow_mut() = Some(origin);
     }
@@ -540,6 +952,12 @@ impl DomRealm {
 
     /// Record a parser script whose turn was considered but did not execute
     /// (for example, an empty script or a data block).
+    fn finish_parser_preparation_without_starting(&self, node: NodeId) {
+        let has_async_attribute = self.session.borrow().document()
+            .get_attribute_ns_ref(node, None, "async").ok().flatten().is_some();
+        self.scripts.borrow_mut().mark_parser_prepared(node, has_async_attribute);
+    }
+
     pub fn mark_parser_script_prepared(&self, node: NodeId) {
         let suppressed = matches!(
             script_loading::prepare_kind(
@@ -552,7 +970,7 @@ impl DomRealm {
         if suppressed {
             self.scripts.borrow_mut().mark_started(node);
         } else {
-            self.scripts.borrow_mut().mark_parser_prepared(node);
+            self.finish_parser_preparation_without_starting(node);
         }
     }
 
@@ -588,6 +1006,170 @@ impl DomRealm {
                 )
             })
             .collect()
+    }
+
+    /// Supply a document's network input before its live parser starts. The
+    /// host must install the empty Document and its mutation hooks first.
+    pub fn set_document_parser_source(self: &Rc<Self>, source: String) -> OpResult<()> {
+        browsing_context::admit_parser_source(self, source.len())?;
+        *self.pending_parser_source.borrow_mut() = Some(source);
+        Ok(())
+    }
+
+    pub fn has_live_document_parser(&self) -> bool {
+        self.pending_parser_source.borrow().is_some() || self.document_parser.borrow().is_some()
+            || self.xml_document_parser.borrow().is_some()
+    }
+
+    pub fn next_document_parser_step(self:&Rc<Self>,ctx:&mut Ctx)->OpResult<DocumentParserStep> {
+        let script=self.next_document_parser_script(ctx)?;
+        Ok(match script {
+            Some(script)=>DocumentParserStep::Script(script),
+            None if self.stylesheet_links.parser_script.get().is_some()=>DocumentParserStep::BlockedOnStylesheets,
+            None=>DocumentParserStep::Complete,
+        })
+    }
+
+    fn parser_script_waits_for_stylesheet(self:&Rc<Self>,node:NodeId)->bool {
+        let (owner,node)=self.current_parser_identity(node);
+        if !Rc::ptr_eq(&owner,self) {return false;}
+        let mut scripts=self.scripts.borrow_mut();scripts.register_parser_script(node);
+        let session=self.session.borrow();
+        if session.document().node_document(node).ok()!=Some(session.document().root()) {return false;}
+        script_loading::descriptor(session.document(),node,self.is_html_document,scripts.force_async(node),scripts.parser_inserted(node))
+            .is_some_and(|script|script.kind==ScriptType::Classic && !script.is_async && !script.defer)
+    }
+
+    fn resume_stylesheet_blocked_parser(self:&Rc<Self>,ctx:&mut Ctx)->OpResult<()> {
+        if self.script_blocking_stylesheets_pending() {return Ok(())}
+        let Some(pending)=self.stylesheet_links.parser_script.get() else {return Ok(())};
+        if pending.generation!=self.parser_generation.get() {self.stylesheet_links.parser_script.set(None);return Ok(())}
+        if pending.document_write {
+            self.stylesheet_links.parser_script.set(None);
+            if let Some(parent)=pending.insertion_parent {self.run_inserted_parser_scripts(ctx,parent,Some(pending.node))?;}
+            else {self.run_document_parser_scripts(ctx,Some(pending.node))?;}
+        }
+        Ok(())
+    }
+
+    /// Advance the actual tree builder to the next parser script or EOF.
+    /// No Document/session borrow survives the returned author-script turn.
+    pub fn next_document_parser_script(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<Option<ScriptDescriptor>> {
+        loop {
+        if let Some(pending)=self.stylesheet_links.parser_script.get() {
+            if pending.generation!=self.parser_generation.get() {self.stylesheet_links.parser_script.set(None);}
+            else if self.script_blocking_stylesheets_pending() {return Ok(None)}
+            else if !pending.document_write {
+                self.stylesheet_links.parser_script.set(None);
+                let (owner,node)=self.current_parser_identity(pending.node);
+                let original_document=Rc::ptr_eq(&owner,self) && {
+                    let session=owner.session.borrow();let document=session.document();
+                    document.node_document(node).map_err(dom_error)?==document.root()
+                };
+                if !original_document {
+                    if script_loading::is_connected(owner.session.borrow().document(),node) {
+                        owner.scripts.borrow_mut().mark_started(node);
+                    } else {
+                        owner.finish_parser_preparation_without_starting(node);
+                    }
+                    continue;
+                }
+                let session=self.session.borrow();let scripts=self.scripts.borrow();
+                return Ok(script_loading::descriptor(session.document(),node,self.is_html_document,
+                    scripts.force_async(node),scripts.parser_inserted(node)));
+            }else{return Ok(None)}
+        }
+        // A completed author-script turn can leave unreachable native wrappers
+        // at the admission boundary. EOF itself allocates nothing, so let the
+        // core parser report any quota that remains after collection.
+        if let Err(error) = self.prepare_allocation(ctx, 3) {
+            if error.class() != "QuotaExceededError" { return Err(error); }
+        }
+        let generation = self.parser_generation.get();
+        let source = self.pending_parser_source.borrow_mut().take();
+        let node = if !self.is_html_document {
+            if let Some(source) = source {
+                let mut session = self.session.borrow_mut();
+                let (parser, script) = lumen_html::xml::XmlDocumentParser::start(session.document_mut(), &source)
+                    .map_err(xml_dom_error)?;
+                *self.xml_document_parser.borrow_mut() = Some(parser);
+                script
+            } else {
+                if self.xml_document_parser.borrow().is_none() {return Ok(None);}
+                self.with_xml_parser_documents(ctx,|parser,documents|parser.resume(documents))?
+            }
+        } else if let Some(source) = source {
+            let options = html::ParseOptions {
+                allow_declarative_shadow_roots: true,
+                scripting_enabled: true,
+            };
+            let mut session = self.session.borrow_mut();
+            let (mut parser, removed) = html::HtmlDocumentParser::open(session.document_mut(), options)
+                .map_err(html_parser_error)?;
+            debug_assert!(removed.is_empty(), "network parser requires an empty Document");
+            let node = parser.write_final_until_script(session.document_mut(), &source).map_err(html_parser_error)?;
+            *self.document_parser.borrow_mut() = Some(parser);
+            node
+        } else {
+            {
+                let parsers=self.document_parser.borrow();
+                let Some(parser)=parsers.as_ref() else {return Ok(None);};
+                if parser.is_closed() || !parser.is_paused_for_script() {return Ok(None);}
+            }
+            self.with_html_parser_documents(ctx,|parser,documents|parser.resume_until_script(documents))?
+        };
+        let node = self.complete_parser_element_creations(ctx, node, true)?;
+        if self.parser_generation.get() != generation { continue; }
+        self.retain_document_parser_nodes()?;
+        let Some(node) = node else {
+            self.queue_object_tasks(ctx)?;
+            fragment::checkpoint(ctx,self,true)?;
+            self.document_parser.borrow_mut().take();
+            self.xml_document_parser.borrow_mut().take();
+            self.document_parser_retention.borrow_mut().clear();
+            return Ok(None);
+        };
+        let (script_owner,node)=self.current_parser_identity(node);
+        script_owner.scripts.borrow_mut().register_parser_script(node);
+        // HTML script preparation step 7 returns for a disconnected script
+        // before step 15 sets already-started or step 17 compares documents.
+        // Parser-created template content therefore stays eligible when cloned
+        // or extracted into a connected document later.
+        if !script_loading::is_connected(script_owner.session.borrow().document(),node) {
+            script_owner.finish_parser_preparation_without_starting(node);
+            continue;
+        }
+        // Preparation retains the parser's original Document. A script whose
+        // node document changed before preparation is already started but is
+        // not executed in either the old or new settings object (HTML step17).
+        let original_document=Rc::ptr_eq(&script_owner,self) && {
+            let session=script_owner.session.borrow();let document=session.document();
+            document.node_document(node).map_err(dom_error)?==document.root()
+        };
+        if !original_document {
+            script_owner.scripts.borrow_mut().mark_started(node);
+            continue;
+        }
+        self.process_initial_iframe_post_connections(ctx);
+        self.queue_object_tasks(ctx)?;
+        fragment::checkpoint(ctx,self,false)?;
+        ctx.drain_microtasks_for_host();
+        let descriptor = {
+            let session = self.session.borrow();
+            let scripts = self.scripts.borrow();
+            script_loading::descriptor(session.document(), node, self.is_html_document,
+                scripts.force_async(node), scripts.parser_inserted(node))
+        };
+        if descriptor.as_ref().is_some_and(|script|script.kind==ScriptType::Classic && !script.is_async && !script.defer) {
+            self.queue_stylesheet_tasks(ctx)?;
+            if self.script_blocking_stylesheets_pending() {
+                self.stylesheet_links.parser_script.set(Some(stylesheet_loading::PendingParserScript{node,generation,document_write:false,insertion_parent:None}));
+                return Ok(None);
+            }
+        }
+        if descriptor.is_some() { return Ok(descriptor); }
+
+        }
     }
 
     /// Resource-backed script preparations which the host has not executed.
@@ -635,6 +1217,7 @@ impl DomRealm {
         let (owner, node) = self.resolve_adopted_node(pending.script.node);
         let wrapper = owner.wrap(ctx, node);
         ScriptActivation {
+            classic_context: pending.classic_context,
             script: pending.script,
             base_url: pending.base_url,
             _retention: pending.retention,
@@ -665,6 +1248,7 @@ impl DomRealm {
         }
         .ok_or_else(|| OpError::type_error("script target required"))?;
         let pending = PendingScriptActivation {
+            classic_context: self.classic_script_context(node, None),
             script,
             base_url: self.base_url(),
             target: DomEventTarget::node(self, node).data_handle(),
@@ -676,19 +1260,42 @@ impl DomRealm {
     /// Invalid external sources fail during preparation, before any resource
     /// activation. The actual target lease survives detachment and GC until
     /// the normal asynchronous HTML error task runs.
-    fn queue_script_preparation_error(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> OpResult<()> {
+    fn queue_script_preparation_error(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: NodeId,
+    ) -> OpResult<()> {
         let lease = self.retain_script_target(ctx, node)?;
         self.scripts.borrow_mut().mark_started(node);
-        let context = self.browsing_context()
+        let context = self
+            .browsing_context()
             .filter(|context| browsing_context::is_active_document(context, self));
-        let Some(context) = context else { return Ok(()); };
+        let Some(context) = context else {
+            return Ok(());
+        };
         let owner = browsing_context::context_realm_handle(&context);
-        ctx.with_host_realm(&owner, |ctx| scheduling::queue_task(ctx, move |ctx| {
-            lease.dispatch_terminal(ctx, "error").map(|_| ())
-        })).map_err(browsing_context::host_realm_error)?
+        ctx.with_host_realm(&owner, |ctx| {
+            scheduling::queue_task(ctx, move |ctx| {
+                lease.dispatch_terminal(ctx, "error").map(|_| ())
+            })
+        })
+        .map_err(browsing_context::host_realm_error)?
+    }
+
+    fn flush_inserted_content_handlers(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<()> {
+        let nodes = std::mem::take(&mut *self.pending_inserted_content_handlers.borrow_mut());
+        for node in nodes {
+            let (owner, node) = self.resolve_adopted_node(node);
+            if owner.session.borrow().document().kind(node).is_ok() {
+                event_content_handlers::initialize_subtree(ctx, &owner, node)?;
+            }
+        }
+        Ok(())
     }
 
     fn flush_script_activations(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<()> {
+        self.flush_inline_stylesheet_updates(ctx)?;
+        self.flush_inserted_content_handlers(ctx)?;
         if !self.has_browsing_context {
             return Ok(());
         }
@@ -741,6 +1348,7 @@ impl DomRealm {
                         if let Some(script) = script {
                             self.module_activations.borrow_mut().push_back(
                                 PendingScriptActivation {
+                                    classic_context: self.classic_script_context(node, None),
                                     script,
                                     base_url: self.base_url(),
                                     target: DomEventTarget::node(self, node).data_handle(),
@@ -756,14 +1364,15 @@ impl DomRealm {
                         .borrow_mut()
                         .record_unhandled(node, reason, src);
                 }
+                script_loading::ScriptKind::ImportMapInline(source) => { self.execute_prepared_import_map(ctx,node,source)?; }
                 script_loading::ScriptKind::ClassicInline(source) => {
+                    if !self.prepare_script_csp(ctx,node,&source,None,false)? {self.scripts.borrow_mut().mark_started(node);continue;}
                     // Set the flag before evaluating: the script may re-enter DOM
                     // insertion APIs or remove and reinsert its own element.
                     self.scripts.borrow_mut().mark_started(node);
                     let completion = {
                         let _current_script = self.enter_script(Some(node));
-                        let global = ctx.global_object();
-                        ctx.eval_in_realm(&global, &source)
+                        ctx.run_classic_script(&source, self.classic_script_context(node, None))
                     };
                     if let Err(exception) = completion {
                         Self::report_exception(ctx, lumen::embed::abrupt_value(exception));
@@ -856,6 +1465,12 @@ impl DomRealm {
         error_reporting::report_exception(ctx, exception);
     }
 
+    /// Report once through the HTML global's native ErrorEvent dispatcher.
+    /// A result consumes browser reporting independently of cancellation.
+    pub fn report_browser_exception(ctx:&mut Ctx,exception:Value)->Option<bool> {
+        error_reporting::report_browser_exception(ctx,exception)
+    }
+
     /// Mark a classic script as the document's current script while its source is evaluated.
     /// The returned guard restores the previous value on every exit path, including throws and
     /// nested script execution. Pass `None` while evaluating a module script.
@@ -864,12 +1479,12 @@ impl DomRealm {
         let retention = current.map(|node| {
             let (owner, node) = self.resolve_adopted_node(node);
             *owner.retained_nodes.borrow_mut().entry(node).or_default() += 1;
-            let retention = Rc::new(RefCell::new(CurrentScriptRetention {
-                owner: owner.clone(),
+            let retention = Rc::new(RefCell::new(RetainedIdentity {
+                owner: RetentionOwner::Strong(owner.clone()),
                 node,
             }));
             owner
-                .script_retentions
+                .node_retentions
                 .borrow_mut()
                 .entry(node)
                 .or_default()
@@ -887,14 +1502,24 @@ impl DomRealm {
     /// URL parsing in the browser/network owner while form submissions retain
     /// the correct base document context.
     pub fn set_document_url(&self, url: impl Into<String>) {
-        let url = url.into();
+        self.set_document_url_internal(url.into(), true);
+        fragment::url_changed(self,true);
+    }
+
+    fn set_same_document_url(&self, url: String) {
+        self.set_document_url_internal(url, false);
+        fragment::url_changed(self,false);
+    }
+
+    fn set_document_url_internal(&self, url: String, update_origin: bool) {
         let previous_url = self.document_url();
         if previous_url.as_deref() == Some(url.as_str()) {
             return;
         }
-        let previous_base = self.effective_base_url_from_cache();
         let first_assignment = previous_url.is_none();
         *self.document_identity.url.borrow_mut() = Some(url.clone());
+        let fragment=lumen_common::url::parse(&url,None).ok().and_then(|url|url.fragment);
+        let _ = self.session.borrow_mut().set_svg_fragment(fragment.as_deref());
 
         // During install the host supplies the response URL just after the
         // native document is created. If a getter ran before then, discard
@@ -905,28 +1530,10 @@ impl DomRealm {
         }
         if let Some(context) = self
             .browsing_context()
-            .filter(|context| browsing_context::is_active_document(context, self))
+            .filter(|context| update_origin && browsing_context::is_active_document(context, self))
         {
             browsing_context::update_document_origin(&context, &url);
             self.set_document_origin(browsing_context::context_origin(&context));
-        }
-        self.invalidate_frame_requests_if_base_changed(previous_base, first_assignment);
-    }
-
-    /// Compare the effective base only when a previous one was observed. Computing it here
-    /// for an uninitialized cache would freeze a `<base href>` against a provisional fallback
-    /// before the embedder has finished supplying the document URL and about base URL.
-    fn invalidate_frame_requests_if_base_changed(
-        &self,
-        previous_base: Option<String>,
-        force: bool,
-    ) {
-        let changed = match previous_base {
-            Some(previous) if !force => previous != self.base_url(),
-            _ => true,
-        };
-        if changed {
-            self.invalidate_frame_navigation_requests();
         }
     }
 
@@ -942,9 +1549,7 @@ impl DomRealm {
         if *self.about_base_url.borrow() == url {
             return;
         }
-        let previous_base = self.effective_base_url_from_cache();
         *self.about_base_url.borrow_mut() = url;
-        self.invalidate_frame_requests_if_base_changed(previous_base, false);
     }
 
     pub fn document_url(&self) -> Option<String> {
@@ -1094,6 +1699,9 @@ impl DomRealm {
             }
             lumen_html::observe::ObservedKind::Attribute { .. }
             | lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::ChildListReplacement { .. }
+            | lumen_html::observe::ObservedKind::TextSplit { .. }
+            | lumen_html::observe::ObservedKind::TextMerge { .. }
             | lumen_html::observe::ObservedKind::SlotAssignment => (false, false),
         };
         if relevant {
@@ -1109,11 +1717,9 @@ impl DomRealm {
         &self,
         document: &lumen_html::Document,
         mutation: &lumen_html::observe::ObservedMutation,
-        base_changed: bool,
+        _base_changed: bool,
     ) {
-        if base_changed {
-            self.invalidate_frame_navigation_requests();
-        }
+        fragment::mutation_checkpoint(self);
         match &mutation.kind {
             lumen_html::observe::ObservedKind::Attribute {
                 name,
@@ -1129,7 +1735,11 @@ impl DomRealm {
                     .get(&mutation.target)
                     .and_then(std::rc::Weak::upgrade)
                 {
-                    context.invalidate_owner_navigation_request();
+                    // Attribute processing captures this document's source
+                    // snapshot now. Later base changes do not navigate it.
+                    self.recompute_document_base_url(document, false);
+                    context.invalidate_owner_navigation_request(self.base_url(),
+                        browsing_context::NavigationMetadata::from_frame_owner(self, document, mutation.target));
                 }
             }
             lumen_html::observe::ObservedKind::ChildList { added, removed, .. } => {
@@ -1144,6 +1754,9 @@ impl DomRealm {
             }
             lumen_html::observe::ObservedKind::Attribute { .. }
             | lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::ChildListReplacement { .. }
+            | lumen_html::observe::ObservedKind::TextSplit { .. }
+            | lumen_html::observe::ObservedKind::TextMerge { .. }
             | lumen_html::observe::ObservedKind::SlotAssignment => {}
         }
     }
@@ -1190,14 +1803,6 @@ impl DomRealm {
         }
     }
 
-    fn invalidate_frame_navigation_requests(&self) {
-        for weak in self.frame_contexts.borrow().values() {
-            if let Some(context) = weak.upgrade() {
-                context.invalidate_navigation_request();
-            }
-        }
-    }
-
     /// Advance the parsed document through the browser's ready-state lifecycle.
     /// Each forward transition dispatches one non-bubbling `readystatechange`
     /// event at the Document target.
@@ -1206,23 +1811,29 @@ impl DomRealm {
         ctx: &mut Ctx,
         state: DocumentReadyState,
     ) -> OpResult<()> {
+        if state==DocumentReadyState::Complete && (self.stylesheet_links.defer_complete() || self.object_resources.defer_complete()) {return Ok(())}
         let current = self.ready_state.get();
         if state <= current {
             return Ok(());
         }
         self.ready_state.set(state);
+        fragment::checkpoint(ctx,self,state==DocumentReadyState::Complete)?;
         let root = self.session.borrow().document().root();
         self.dispatch(ctx, root, "readystatechange", false, false, &[])
             .map(|_| ())
     }
 
     fn open_document_stream(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<()> {
+        if self.dynamic_markup_insertion_counter.get() != 0 {
+            return Err(OpError::new("InvalidStateError", "document.open() during parser element construction"));
+        }
         if !self.is_html_document {
             return Err(OpError::new(
                 "InvalidStateError",
                 "document.open() requires an HTML document",
             ));
         }
+        if self.lifecycle.unload_counter.get() != 0 { return Ok(()); }
         if self.current_script.get().is_some()
             && self
                 .document_parser
@@ -1235,12 +1846,16 @@ impl DomRealm {
             return Ok(());
         }
         self.erase_document_open_listeners(ctx)?;
+        self.stylesheet_links.retire();
+        self.object_resources.retire();
+        font_preload::retire(ctx,self);
         // A permitted new stream supersedes any prior parser and its buffered
         // source. The parser-script nesting guard above preserves the active
         // stream when document.open() is called from a parser-inserted script.
         self.parser_generation
             .set(self.parser_generation.get().wrapping_add(1));
         self.document_parser.borrow_mut().take();
+        self.document_parser_retention.borrow_mut().clear();
 
         let options = {
             let session = self.session.borrow();
@@ -1310,12 +1925,16 @@ impl DomRealm {
         chunks: &[String],
         append_newline: bool,
     ) -> OpResult<()> {
+        if self.dynamic_markup_insertion_counter.get() != 0 {
+            return Err(OpError::new("InvalidStateError", "document.write() during parser element construction"));
+        }
         if !self.is_html_document {
             return Err(OpError::new(
                 "InvalidStateError",
                 "document.write() requires an HTML document",
             ));
         }
+        if self.lifecycle.unload_counter.get() != 0 { return Ok(()); }
         if self.document_parser.borrow().is_none() {
             self.open_document_stream(ctx)?;
         }
@@ -1326,34 +1945,14 @@ impl DomRealm {
             .as_ref()
             .is_some_and(html::HtmlDocumentParser::is_paused_for_script);
         if let (Some(parent_script), true) = (active_script, paused_for_script) {
-            let script = {
-                let mut parser = self.document_parser.borrow_mut();
-                let parser = parser.as_mut().ok_or_else(|| {
-                    OpError::new("InvalidStateError", "document parser is unavailable")
-                })?;
-                let mut session = self.session.borrow_mut();
-                parser
-                    .write_at_script_position_until_script(
-                        session.document_mut(),
-                        parent_script,
-                        chunks,
-                        append_newline,
-                    )
-                    .map_err(html_parser_error)?
-            };
+            let (_,parent_script)=self.current_parser_identity(parent_script);
+            let script=self.with_html_parser_documents(ctx,|parser,documents| {
+                parser.write_at_script_position_until_script(documents,parent_script,chunks,append_newline)
+            })?;
             return self.run_inserted_parser_scripts(ctx, parent_script, script);
         }
 
-        let script = {
-            let mut parser = self.document_parser.borrow_mut();
-            let parser = parser.as_mut().ok_or_else(|| {
-                OpError::new("InvalidStateError", "document parser is unavailable")
-            })?;
-            let mut session = self.session.borrow_mut();
-            parser
-                .write_parts_until_script(session.document_mut(), chunks, append_newline)
-                .map_err(html_parser_error)?
-        };
+        let script=self.with_html_parser_documents(ctx,|parser,documents|parser.write_parts_until_script(documents,chunks,append_newline))?;
         self.run_document_parser_scripts(ctx, script)
     }
 
@@ -1361,17 +1960,9 @@ impl DomRealm {
         if self.document_parser.borrow().is_none() {
             return Ok(());
         }
-        let (script, paused) = {
-            let mut parser = self.document_parser.borrow_mut();
-            let parser = parser.as_mut().ok_or_else(|| {
-                OpError::new("InvalidStateError", "document parser is unavailable")
-            })?;
-            let mut session = self.session.borrow_mut();
-            let script = parser
-                .finish_until_script(session.document_mut())
-                .map_err(html_parser_error)?;
-            (script, parser.is_paused_for_script())
-        };
+        let (script,paused)=self.with_html_parser_documents(ctx,|parser,documents| {
+            let script=parser.finish_until_script(documents)?;Ok((script,parser.is_paused_for_script()))
+        })?;
         if paused && script.is_none() {
             // document.close() called by the currently executing parser script
             // records EOF. The outer parser pump resumes only after evaluation
@@ -1391,24 +1982,23 @@ impl DomRealm {
             if self.parser_generation.get() != generation {
                 return Ok(());
             }
+            script = self.complete_parser_element_creations(ctx, script, false)?;
+            if self.parser_generation.get() != generation { return Ok(()); }
             let Some(node) = script else {
                 return self.finish_document_stream_if_closed(ctx, generation);
             };
+            self.queue_stylesheet_tasks(ctx)?;
+            if self.parser_script_waits_for_stylesheet(node) && self.script_blocking_stylesheets_pending() {
+                self.stylesheet_links.parser_script.set(Some(stylesheet_loading::PendingParserScript{node,generation,document_write:true,insertion_parent:None}));
+                return Ok(());
+            }
             self.execute_document_parser_script(ctx, node)?;
+
 
             if self.parser_generation.get() != generation {
                 return Ok(());
             }
-            script = {
-                let mut parser = self.document_parser.borrow_mut();
-                let parser = parser.as_mut().ok_or_else(|| {
-                    OpError::new("InvalidStateError", "document parser is unavailable")
-                })?;
-                let mut session = self.session.borrow_mut();
-                parser
-                    .resume_until_script(session.document_mut())
-                    .map_err(html_parser_error)?
-            };
+            script=self.with_html_parser_documents(ctx,|parser,documents|parser.resume_until_script(documents))?;
         }
     }
 
@@ -1419,25 +2009,309 @@ impl DomRealm {
         mut script: Option<NodeId>,
     ) -> OpResult<()> {
         let generation = self.parser_generation.get();
-        while let Some(node) = script {
+        loop {
+            script = self.complete_parser_element_creations(ctx, script, false)?;
+            let Some(node) = script else { break; };
             if self.parser_generation.get() != generation {
+                return Ok(());
+            }
+            self.queue_stylesheet_tasks(ctx)?;
+            if self.parser_script_waits_for_stylesheet(node) && self.script_blocking_stylesheets_pending() {
+                self.stylesheet_links.parser_script.set(Some(stylesheet_loading::PendingParserScript{node,generation,document_write:true,insertion_parent:Some(parent_script)}));
                 return Ok(());
             }
             self.execute_document_parser_script(ctx, node)?;
             if self.parser_generation.get() != generation {
                 return Ok(());
             }
-            script = {
-                let mut parser = self.document_parser.borrow_mut();
-                let parser = parser.as_mut().ok_or_else(|| {
-                    OpError::new("InvalidStateError", "document parser is unavailable")
-                })?;
-                let mut session = self.session.borrow_mut();
-                parser
-                    .resume_insertion_until_script(session.document_mut(), node, parent_script)
-                    .map_err(html_parser_error)?
+            let (_,node)=self.current_parser_identity(node);
+            let (_,parent)=self.current_parser_identity(parent_script);
+            script=self.with_html_parser_documents(ctx,|parser,documents|parser.resume_insertion_until_script(documents,node,parent))?;
+        }
+        Ok(())
+    }
+
+    fn current_parser_identity(self:&Rc<Self>,node:NodeId)->(Rc<Self>,NodeId) {
+        for retention in self.document_parser_retention.borrow().iter() {
+            if let Some((owner,current))=retention.current() {
+                if retention.origin==node || current==node {return (owner,current);}
+                if current.document_id()==node.document_id() {return owner.resolve_adopted_node(node);}
+            }
+        }
+        self.resolve_adopted_node(node)
+    }
+
+    fn complete_parser_element_creations(
+        self: &Rc<Self>, ctx: &mut Ctx, mut script: Option<NodeId>,
+        checkpoint_before_construction: bool,
+    ) -> OpResult<Option<NodeId>> {
+        loop {
+            self.flush_inserted_content_handlers(ctx)?;
+            let generation = self.parser_generation.get();
+            let pending = if self.is_html_document {
+                self.document_parser.borrow().as_ref().and_then(|parser| {
+                    parser.pending_element().zip(parser.pending_element_context())
+                })
+            } else {
+                self.xml_document_parser.borrow().as_ref().and_then(|parser| {
+                    parser.pending_element().zip(parser.pending_element_context())
+                })
+            };
+            let Some((node, context)) = pending else { return Ok(script); };
+            self.retain_document_parser_nodes()?;
+            let (owner,node)=self.current_parser_identity(node);
+            let (_,context)=self.current_parser_identity(context);
+            custom_elements::associate_parsed_subtree(&owner,node,context)?;
+            struct CounterScope<'a>(&'a Cell<usize>);
+            impl Drop for CounterScope<'_> {
+                fn drop(&mut self) { self.0.set(self.0.get() - 1); }
+            }
+            owner.dynamic_markup_insertion_counter.set(owner.dynamic_markup_insertion_counter.get() + 1);
+            let counter_scope = CounterScope(&owner.dynamic_markup_insertion_counter);
+            if checkpoint_before_construction {
+                self.process_initial_iframe_post_connections(ctx);
+                ctx.drain_microtasks_for_host();
+            }
+            let construct=|ctx:&mut Ctx| custom_elements::construct_parser_created_element(ctx, &owner, node, |ctx, chosen| {
+                {
+                let session = owner.session.borrow();
+                if self.is_html_document {
+                    let mut parsers = self.document_parser.borrow_mut();
+                    let parser = parsers.as_mut().ok_or_else(|| OpError::new("InvalidStateError", "parser creation was superseded"))?;
+                    parser.replace_pending_element(chosen);
+                } else {
+                    let mut parsers = self.xml_document_parser.borrow_mut();
+                    let parser = parsers.as_mut().ok_or_else(|| OpError::new("InvalidStateError", "XML parser creation was superseded"))?;
+                    parser.replace_pending_element(session.document(), chosen).map_err(xml_dom_error)?;
+                }
+                }
+                self.retain_document_parser_nodes()?;
+                if self.is_html_document {
+                    let mut session=owner.session.borrow_mut();
+                    self.document_parser.borrow_mut().as_mut().ok_or_else(|| OpError::new("InvalidStateError", "parser creation was superseded"))?
+                        .append_pending_element_attributes(session.document_mut()).map_err(html_parser_error)?;
+                } else {
+                    self.with_xml_parser_documents(ctx,|parser,documents|parser.append_pending_element_attributes(documents))?;
+                }
+                Ok(())
+            });
+            let chosen=if let Some(handle)=owner.relevant_host_realm(ctx) {
+                ctx.with_host_realm(&handle,construct).map_err(browsing_context::host_realm_error)??
+            } else {construct(ctx)?};
+            drop(counter_scope);
+            // Attribute reactions can adopt the constructed result before the
+            // helper returns. Route content handlers and failed-object cleanup
+            // through actual current identities, preserving the chosen object.
+            let (chosen_owner,chosen)=self.current_parser_identity(chosen);
+            event_content_handlers::initialize_subtree(ctx, &chosen_owner, chosen)?;
+            let (original_owner,original)=owner.resolve_adopted_node(node);
+            if !Rc::ptr_eq(&chosen_owner,&original_owner) || chosen!=original {
+                original_owner.defer_detached_root(original);
+            }
+            self.retain_document_parser_nodes()?;
+            custom_elements::begin_reaction_scope(ctx).map_err(OpError::thrown)?;
+            let inserted=if self.is_html_document {
+                self.with_html_parser_documents(ctx,|parser,documents|parser.insert_pending_element(documents))
+            } else {
+                self.with_xml_parser_documents(ctx,|parser,documents|parser.insert_pending_element(documents))
+            };
+            custom_elements::end_reaction_scope(ctx);
+            inserted?;
+            if self.parser_generation.get() != generation { return Ok(None); }
+            script=if self.is_html_document {
+                self.with_html_parser_documents(ctx,|parser,documents|parser.resume_after_pending_element(documents))?
+            } else {
+                self.with_xml_parser_documents(ctx,|parser,documents|parser.resume_after_pending_element(documents))?
             };
         }
+    }
+
+    /// One tree-construction feed borrows every actual open-element arena.
+    /// Native identity/state migration happens only after all arena borrows end.
+    fn with_html_parser_documents<R>(
+        self:&Rc<Self>,ctx:&mut Ctx,
+        feed:impl FnOnce(&mut html::HtmlDocumentParser,&mut lumen_html::parser_documents::ParserDocuments<'_>)->Result<R,html::ParseError>,
+    )->OpResult<R> {
+        self.with_parser_documents(ctx,|documents| {
+            let mut parser=self.document_parser.borrow_mut();
+            let parser=parser.as_mut().ok_or_else(||OpError::new("InvalidStateError","document parser is unavailable"))?;
+            feed(parser,documents).map_err(html_parser_error)
+        })
+    }
+
+    fn with_xml_parser_documents<R>(
+        self:&Rc<Self>,ctx:&mut Ctx,
+        feed:impl FnOnce(&mut lumen_html::xml::XmlDocumentParser,&mut lumen_html::parser_documents::ParserDocuments<'_>)->Result<R,lumen_html::xml::ParseError>,
+    )->OpResult<R> {
+        self.with_parser_documents(ctx,|documents| {
+            let mut parser=self.xml_document_parser.borrow_mut();
+            let parser=parser.as_mut().ok_or_else(||OpError::new("InvalidStateError","XML document parser is unavailable"))?;
+            feed(parser,documents).map_err(xml_dom_error)
+        })
+    }
+
+    // Both existing tokenizers share one arena/publication/retention algorithm.
+    fn with_parser_documents<R>(
+        self:&Rc<Self>,ctx:&mut Ctx,
+        feed:impl FnOnce(&mut lumen_html::parser_documents::ParserDocuments<'_>)->OpResult<R>,
+    )->OpResult<R> {
+        let quota=||OpError::new("QuotaExceededError","parser owner view capacity exceeded");
+        let retained_count=self.document_parser_retention.borrow().len();
+        let mut temporary_bytes=retained_count.checked_mul(core::mem::size_of::<(NodeId,NodeId)>()*2+4*core::mem::size_of::<usize>()+core::mem::size_of::<Value>()).ok_or_else(quota)?;
+        if temporary_bytes>html::MAX_HTML_BYTES {return Err(quota());}
+        fn push_owner(owners:&mut Vec<Rc<DomRealm>>,seen:&mut HashSet<usize>,bytes:&mut usize,owner:Rc<DomRealm>)->OpResult<()> {
+            let identity=Rc::as_ptr(&owner) as usize;
+            if seen.contains(&identity) {return Ok(());}
+            // Charge the owner frontier, address index, borrowed Sessions and
+            // Documents, and the publication root index with conservative
+            // hash capacity/headroom before growing any of those structures.
+            *bytes=bytes.checked_add(24*core::mem::size_of::<usize>()).ok_or_else(||OpError::new("QuotaExceededError","parser owner view capacity exceeded"))?;
+            if *bytes>html::MAX_HTML_BYTES {return Err(OpError::new("QuotaExceededError","parser owner view capacity exceeded"));}
+            owners.try_reserve(1).map_err(|_|OpError::new("QuotaExceededError","parser owner allocation failed"))?;
+            seen.try_reserve(1).map_err(|_|OpError::new("QuotaExceededError","parser owner allocation failed"))?;
+            seen.insert(identity);owners.push(owner);Ok(())
+        }
+        let mut owners=Vec::new();let mut owner_addresses=HashSet::new();
+        push_owner(&mut owners,&mut owner_addresses,&mut temporary_bytes,self.clone())?;
+        let mut projection=HashMap::new();projection.try_reserve(retained_count).map_err(|_|quota())?;
+        for retention in self.document_parser_retention.borrow().iter() {
+            let (owner,node)=retention.current().ok_or_else(||OpError::new("InvalidStateError","open parser identity owner was reclaimed"))?;
+            projection.insert(retention.origin,node);
+            push_owner(&mut owners,&mut owner_addresses,&mut temporary_bytes,owner)?;
+        }
+        // Associated inert template arenas use the existing weak owner graph.
+        // Stream the actual dependencies instead of allocating a temporary
+        // sibling list or scanning all previous owners for every node.
+        let mut cursor=0;
+        while cursor<owners.len() {
+            let current=owners[cursor].clone();
+            for owner in current.template_graph_owners.borrow().values().filter_map(std::rc::Weak::upgrade) {
+                push_owner(&mut owners,&mut owner_addresses,&mut temporary_bytes,owner)?;
+            }
+            cursor+=1;
+        }
+        // Observer installation needs Session access, so it precedes all arena
+        // borrows. The subsequent publication phase is plain state only.
+        custom_elements::prepare_parser_adoption_publication(&owners)?;
+        let mut publication_owners=HashMap::new();publication_owners.try_reserve(owners.len()).map_err(|_|quota())?;
+        for owner in &owners {publication_owners.insert(owner.session.borrow().document().root(),owner.clone());}
+        let mut pins=Vec::new();pins.try_reserve_exact(retained_count).map_err(|_|quota())?;
+        for retention in self.document_parser_retention.borrow().iter() {
+            if let Some((owner,node))=retention.current() {
+                if let Some(handle)=owner.relevant_host_realm(ctx) {
+                    pins.push(ctx.with_host_realm(&handle,|ctx|owner.wrap(ctx,node)).map_err(browsing_context::host_realm_error)?);
+                } else {pins.push(owner.wrap(ctx,node));}
+            }
+        }
+        let (result,adoptions)={
+            if let Some(parser)=self.document_parser.borrow_mut().as_mut() {
+                parser.project_retained_nodes(|node|projection.get(&node).copied().unwrap_or(node));
+            }
+            if let Some(parser)=self.xml_document_parser.borrow_mut().as_mut() {
+                parser.project_retained_nodes(|node|projection.get(&node).copied().unwrap_or(node));
+            }
+            let mut sessions=owners.iter().map(|owner|owner.session.borrow_mut()).collect::<Vec<_>>();
+            let documents=sessions.iter_mut().map(|session|session.document_mut()).collect::<Vec<_>>();
+            let mut documents=lumen_html::parser_documents::ParserDocuments::new(documents).map_err(dom_error)?;
+            documents.set_adoption_publication(Box::new(move |source_document,target_document,adoption| {
+                let source=publication_owners.get(&adoption.source_document).ok_or(lumen_html::Error::InvalidNode)?;
+                let target=publication_owners.get(&adoption.target_document).ok_or(lumen_html::Error::InvalidNode)?;
+                custom_elements::publish_adopted_nodes(source,target,source_document,target_document,&adoption.mapping,&adoption.documents)?;
+                forms::adopt_nodes_into(&mut source.forms.borrow_mut(),&mut target.forms.borrow_mut(),&adoption.mapping);
+                Ok(())
+            }));
+            let result=feed(&mut documents);
+            if lumen_html::parser_documents::ParserDocument::identity_revision(&documents)!=0 {
+                let project=|node|lumen_html::parser_documents::ParserDocument::current_node(&documents,node);
+                if let Some(parser)=self.document_parser.borrow_mut().as_mut() {parser.project_retained_nodes(project);}
+                if let Some(parser)=self.xml_document_parser.borrow_mut().as_mut() {parser.project_retained_nodes(project);}
+            }
+            (result,documents.take_adoptions())
+        };
+        for adoption in adoptions {
+            let source=owners.iter().find(|owner|owner.session.borrow().document().root()==adoption.source_document).ok_or_else(||OpError::new("InvalidStateError","parser adoption source unavailable"))?;
+            let target=owners.iter().find(|owner|owner.session.borrow().document().root()==adoption.target_document).ok_or_else(||OpError::new("InvalidStateError","parser adoption target unavailable"))?;
+            source.migrate_adopted_state(ctx,target,&adoption.mapping)?;
+            if adoption.publication_complete {custom_elements::complete_adopted_nodes(ctx,target)?;}
+            else {custom_elements::adopt_nodes_with_documents(ctx,source,target,&adoption.mapping,&adoption.documents)?;}
+            presentation::adopt_nodes(ctx,source,&adoption.mapping)?;
+            template_graph::readopt_contents(ctx,target,&adoption.mapping)?;
+        }
+        self.retain_document_parser_nodes()?;
+        // A source parser can now create children in another active Document.
+        // Drain that Document's real connection queues in its relevant realm;
+        // no Session borrow survives handler installation or initial-frame
+        // post-connection callbacks. The source's normal yield driver continues
+        // to own its own queues and stylesheet/script scheduling.
+        for owner in &owners {
+            if Rc::ptr_eq(owner,self) {continue;}
+            let drain=|ctx:&mut Ctx|->OpResult<()> {
+                owner.flush_inserted_content_handlers(ctx)?;
+                owner.process_initial_iframe_post_connections(ctx);
+                Ok(())
+            };
+            if let Some(handle)=owner.relevant_host_realm(ctx) {
+                ctx.with_host_realm(&handle,drain).map_err(browsing_context::host_realm_error)??;
+            }else {drain(ctx)?;}
+        }
+        drop(pins);
+        result
+    }
+
+    fn retain_document_parser_nodes(self: &Rc<Self>)->OpResult<()> {
+        let mut count=Some(0usize);
+        let mut visit=|_| {count=count.and_then(|count|count.checked_add(1));};
+        if let Some(parser)=self.document_parser.borrow().as_ref() {parser.visit_retained_nodes(&mut visit);}
+        if let Some(parser)=self.xml_document_parser.borrow().as_ref() {parser.visit_retained_nodes(&mut visit);}
+        let count=count.ok_or_else(||OpError::new("QuotaExceededError","parser retention capacity exceeded"))?;
+        // Include operation-local indexes, result capacity, the rare identity
+        // token, and minimum weak-ledger allocations before refreshing leases.
+        let per_identity=core::mem::size_of::<ParserRetention>()*2
+            +core::mem::size_of::<RetainedIdentity>()+2*core::mem::size_of::<usize>()
+            +core::mem::size_of::<(NodeId,ParserRetention)>()+4*core::mem::size_of::<usize>()
+            +core::mem::size_of::<NodeId>()+4*core::mem::size_of::<std::rc::Weak<RefCell<RetainedIdentity>>>();
+        let bytes=count.checked_mul(per_identity).and_then(|bytes| {
+            let old=self.document_parser_retention.borrow();
+            bytes.checked_add(old.capacity().checked_mul(core::mem::size_of::<ParserRetention>())?)?
+                .checked_add(old.len().checked_mul(core::mem::size_of::<(NodeId,ParserRetention)>()+4*core::mem::size_of::<usize>())?)
+        });
+        if bytes.is_none_or(|bytes|bytes>html::MAX_HTML_BYTES) {return Err(OpError::new("QuotaExceededError","parser retention capacity exceeded"));}
+        let mut owners=HashMap::new();
+        owners.insert(self.session.borrow().document().root().document_id(),self.clone());
+        for retention in self.document_parser_retention.borrow().iter() {
+            if let Some((owner,node))=retention.current() {owners.insert(node.document_id(),owner);}
+        }
+        let mut dependencies=owners.values().cloned().collect::<Vec<_>>();
+        let mut cursor=0;
+        while cursor<dependencies.len() {
+            let remote=dependencies[cursor].template_graph_owners.borrow().values().filter_map(std::rc::Weak::upgrade).collect::<Vec<_>>();
+            for owner in remote {
+                let id=owner.session.borrow().document().root().document_id();
+                if let std::collections::hash_map::Entry::Vacant(entry)=owners.entry(id) {entry.insert(owner.clone());dependencies.push(owner);}
+            }
+            cursor+=1;
+        }
+        let quota=||OpError::new("QuotaExceededError","parser retention allocation failed");
+        let mut retained=Vec::new();retained.try_reserve_exact(count).map_err(|_|quota())?;
+        let mut previous=HashMap::new();previous.try_reserve(count.max(self.document_parser_retention.borrow().len())).map_err(|_|quota())?;
+        let mut seen=HashSet::new();seen.try_reserve(count).map_err(|_|quota())?;
+        for retention in core::mem::take(&mut *self.document_parser_retention.borrow_mut()) {
+            let current=retention.identity.borrow().node;
+            previous.insert(current,retention);
+        }
+        let mut retain=|origin:NodeId| {
+            let (owner,node)=owners.get(&origin.document_id()).unwrap_or(self).resolve_adopted_node(origin);
+            if !seen.insert(node) {return;}
+            // Native wrappers and source state are unchanged on the normal feed
+            // path. Reuse their exact weak lease instead of allocating one Rc
+            // token and shifting its owner ledger at each parser pause.
+            if let Some(mut retention)=previous.remove(&node) {
+                retention.origin=origin;retained.push(retention);
+            } else {retained.push(ParserRetention::new(&owner,origin,node));}
+        };
+        if let Some(parser)=self.document_parser.borrow().as_ref() {parser.visit_retained_nodes(&mut retain);}
+        if let Some(parser)=self.xml_document_parser.borrow().as_ref() {parser.visit_retained_nodes(&mut retain);}
+        *self.document_parser_retention.borrow_mut()=retained;
         Ok(())
     }
 
@@ -1446,7 +2320,18 @@ impl DomRealm {
         ctx: &mut Ctx,
         node: NodeId,
     ) -> OpResult<()> {
-        self.scripts.borrow_mut().register_parser_script(node);
+        let (owner,node)=self.current_parser_identity(node);
+        owner.scripts.borrow_mut().register_parser_script(node);
+        if !script_loading::is_connected(owner.session.borrow().document(),node) {
+            owner.finish_parser_preparation_without_starting(node);
+            return Ok(());
+        }
+        if !Rc::ptr_eq(&owner,self) {
+            owner.scripts.borrow_mut().mark_started(node);
+            return Ok(());
+        }
+        self.retain_document_parser_nodes()?;
+        ctx.drain_microtasks_for_host();
         let (scripting_enabled, kind) = {
             let session = self.session.borrow();
             let document = session.document();
@@ -1466,14 +2351,15 @@ impl DomRealm {
             Some(script_loading::ScriptKind::InvalidSource) => {
                 self.queue_script_preparation_error(ctx, node)?;
             }
+            Some(script_loading::ScriptKind::ImportMapInline(source)) => { self.execute_prepared_import_map(ctx,node,source)?; }
             Some(script_loading::ScriptKind::ClassicInline(source)) => {
+                if !self.prepare_script_csp(ctx,node,&source,None,true)? {self.scripts.borrow_mut().mark_started(node);return Ok(());}
                 self.scripts.borrow_mut().mark_started(node);
                 let active_context = active_context.expect("active context checked above");
                 let handle = browsing_context::context_realm_handle(&active_context);
                 ctx.with_host_realm(&handle, |ctx| {
                     let _current_script = self.enter_script(Some(node));
-                    let global = ctx.global_object();
-                    if let Err(exception) = ctx.eval_in_realm(&global, &source) {
+                    if let Err(exception) = ctx.run_classic_script(&source, self.classic_script_context(node, None)) {
                         Self::report_exception(ctx, lumen::embed::abrupt_value(exception));
                     }
                 })
@@ -1493,7 +2379,7 @@ impl DomRealm {
                     .record_unhandled(node, reason, src);
             }
             Some(script_loading::ScriptKind::DataBlock) | None => {
-                self.scripts.borrow_mut().mark_parser_prepared(node);
+                self.finish_parser_preparation_without_starting(node);
             }
         }
         Ok(())
@@ -1516,6 +2402,7 @@ impl DomRealm {
             return Ok(());
         }
         self.document_parser.borrow_mut().take();
+        self.document_parser_retention.borrow_mut().clear();
         self.set_document_ready_state(ctx, DocumentReadyState::Interactive)?;
         if self.parser_generation.get() != generation {
             return Ok(());
@@ -1609,9 +2496,8 @@ impl DomRealm {
         // to the node's current owning document.
         for _ in 0..64 {
             let next = realm.adopted_nodes.borrow().get(&id).cloned();
-            let Some((next_realm, next_id)) = next else {
-                break;
-            };
+            let Some(next) = next else { break; };
+            let (next_realm, next_id) = next.borrow().clone();
             let Some(next_realm) = next_realm.upgrade() else {
                 break;
             };
@@ -1624,11 +2510,41 @@ impl DomRealm {
         (realm, id)
     }
 
+    /// Physical display pixels per CSS pixel, supplied by the rendering host.
+    pub fn set_device_pixel_ratio(&self, ratio: f64) -> OpResult<()> {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > f64::from(f32::MAX) {
+            return Err(OpError::new("RangeError", "device pixel ratio must be finite and positive"));
+        }
+        if self.device_pixel_ratio.get()!=ratio {
+            let mut session=self.session.borrow_mut();let mut environment=session.media_environment();environment.resolution=ratio as f32;
+            session.set_media_environment(environment).map_err(|_|OpError::new("InvalidStateError","could not update rendering device resolution"))?;
+            self.device_pixel_ratio.set(ratio);self.images.invalidate_environment();
+        }
+        Ok(())
+    }
+
+    pub fn set_canvas_snapshot_provider(&self, provider: Rc<dyn Fn(&mut RenderSession,NodeId,u32,u32)->Result<lumen_html_image::Rgba8Image,String>>) {
+        self.canvases.set_snapshot_provider(provider);
+    }
+
+    pub fn canvas_paint_pending(&self) -> bool { self.canvases.paint_pending(self) }
+
     pub fn set_layout_flusher(
         &self,
         callback: Rc<dyn Fn(&mut RenderSession) -> Result<(), String>>,
     ) {
-        *self.layout_flusher.borrow_mut() = Some(callback);
+        *self.layout_flusher.borrow_mut() = Some(LayoutFlusher::Direct(callback));
+    }
+
+    /// Prepare owner geometry before acquiring this document's render session.
+    /// Child viewports may need their parent layout, which in turn reads this
+    /// document's intrinsic inputs. No session borrow crosses that preparation.
+    pub fn set_layout_flusher_with_viewport(
+        &self,
+        prepare:Rc<dyn Fn()->Result<(u32,u32),String>>,
+        flush:Rc<dyn Fn(&mut RenderSession,(u32,u32))->Result<(),String>>,
+    ) {
+        *self.layout_flusher.borrow_mut()=Some(LayoutFlusher::PreparedViewport{prepare,flush});
     }
 
     /// Supply the embedder's bounded resource resolver for HTML image
@@ -1748,8 +2664,13 @@ impl DomRealm {
     }
 
     fn media_default_muted(&self, node: NodeId) -> bool {
-        self.session.borrow().document().get_attribute_ns_ref(node, None, "muted")
-            .ok().flatten().is_some()
+        self.session
+            .borrow()
+            .document()
+            .get_attribute_ns_ref(node, None, "muted")
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub(crate) fn media_set_muted(&self, node: NodeId, value: bool) {
@@ -1891,19 +2812,70 @@ impl DomRealm {
 
     /// Supply the embedder's font fetcher and decoder. The same decoded face
     /// can then be used by both FontFaceSet and the render provider.
-    pub fn set_font_resource_loader(&self, loader: Rc<dyn FontResourceLoader>) {
+    pub fn set_font_resource_loader(self:&Rc<Self>, loader: Rc<dyn FontResourceLoader>) {
+        loader.set_request_policy(font_preload::provider_policy(self));
+        loader.set_preload_reader(font_preload::preload_reader(self));
         self.font_loading.set_provider(loader);
+    }
+
+    /// Return the canonical owner-aware font provider for native rendering.
+    /// Matching records bounded intents; the regular font task pump performs I/O.
+    /// Remaining time until a presentation deadline, for embedders driving
+    /// the existing font task pump without Runtime's canonical timer heap.
+    pub fn next_font_display_deadline(&self)->Option<std::time::Duration> {
+        self.font_loading.next_display_deadline()
+    }
+
+    pub fn render_font_source_from_snapshot(self:&Rc<Self>,fallback:std::sync::Arc<lumen_html_text::FontSet>,
+        rules:&[lumen_html::css::FontFaceRule],document_base:&str,query:lumen_html::css::ContainerUnitContext)
+        ->OpResult<impl lumen_html_text::FontProvider> {
+        canvas::render_font_source_from_snapshot(self,fallback,rules,document_base,query)
+    }
+
+    pub fn render_font_source(self:&Rc<Self>)->OpResult<impl lumen_html_text::FontProvider> {
+        canvas::realm_font_source(self)
     }
 
     /// Fetch and decode CSS-connected font faces queued by FontFaceSet.load.
     /// The embedder calls this from its existing user-agent task pump.
     pub fn queue_font_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
+        if self.is_document_destroyed() {
+            self.font_loading.discard_metric_requests();
+        }
+        if self.font_loading.has_metric_requests() || self.font_loading.needs_display_owner_context() || self.font_preloads.needs_pump() {
+            if let Some(owner)=self.relevant_host_realm(ctx) {
+                return ctx.with_host_realm(&owner,|ctx|self.queue_font_tasks_in_context(ctx))
+                    .map_err(browsing_context::host_realm_error)?;
+            }
+        }
+        self.queue_font_tasks_in_context(ctx)
+    }
+
+    fn queue_font_tasks_in_context(self:&Rc<Self>,ctx:&mut Ctx)->OpResult<usize> {
+        if self.is_document_destroyed() {
+            self.font_loading.discard_metric_requests();
+            self.font_loading.discard_display_deadlines(ctx);
+            font_preload::retire(ctx,self);
+        }
+        if self.font_loading.has_metric_requests() {
+            let document=self.document_value(ctx);
+            let native=ctx.instance_data::<DomDocument>(&document)
+                .ok_or_else(||OpError::new("InvalidStateError","font demand document wrapper"))?;
+            let value=native.borrow().fonts(ctx);
+            let set=ctx.instance_data::<font_loading::DomFontFaceSet>(&value)
+                .ok_or_else(||OpError::new("InvalidStateError","font demand set wrapper"))?;
+            self.font_loading.queue_metric_requests(ctx,&set.borrow())?;
+        }
+        if self.font_loading.update_display_clock() {self.session.borrow_mut().invalidate_fonts();}
         let base = self.base_url();
+        let preloads=if self.is_document_destroyed(){0}else{font_preload::pump(ctx,self)?};
         let count = self.font_loading.pump(ctx, &base);
+        self.font_loading.schedule_display_deadline(ctx)?;
+        font_preload::drain_violations(ctx,self)?;
         if count != 0 {
             self.session.borrow_mut().invalidate_fonts();
         }
-        Ok(count)
+        Ok(count+preloads)
     }
 
     /// Complete font-set lifecycle only after the embedder has updated layout
@@ -1920,10 +2892,14 @@ impl DomRealm {
     /// when the host runs the existing scheduling task queue.
     pub fn queue_image_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
         let base = self.base_url();
+        self.prepare_image_selection(&base)?;
         let completions = {
             let session = self.session.borrow();
             self.images.queue_completions(session.document(), &base)
         };
+        for violation in self.images.take_policy_violations().map_err(|_|OpError::new("QuotaExceededError","image CSP reporting budget exhausted"))? {
+            self.queue_csp_violation(ctx,violation,None)?;
+        }
         let mut event_roots = Vec::with_capacity(completions.len());
         {
             let mut roots = self.image_request_roots.borrow_mut();
@@ -1935,13 +2911,13 @@ impl DomRealm {
             }
             let missing = self.images.take_unknown_pending(&roots);
             for &node in &missing {
-                roots.insert(node, self.retain_image_request(ctx, node));
+                roots.insert(node, self.retain_resource_request(ctx, node));
             }
             self.images.return_pending_scratch(missing);
             for completion in &completions {
                 let retained = roots
                     .remove(&completion.node)
-                    .unwrap_or_else(|| self.retain_image_request(ctx, completion.node));
+                    .unwrap_or_else(|| self.retain_resource_request(ctx, completion.node));
                 event_roots.push(self.retain_image_event(ctx, completion.node, retained));
             }
         }
@@ -1997,13 +2973,13 @@ impl DomRealm {
         let Ok(mut roots) = self.image_request_roots.try_borrow_mut() else {
             return;
         };
-        roots.entry(node).or_insert_with(|| ImageRequestRoot {
+        roots.entry(node).or_insert_with(|| ResourceRequestRoot {
             target,
             retention: NodeRetention::new(self, node),
         });
     }
 
-    fn retain_image_request(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> ImageRequestRoot {
+    fn retain_resource_request(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> ResourceRequestRoot {
         let wrapper = self.wrap(ctx, node);
         let target = self
             .targets
@@ -2012,7 +2988,7 @@ impl DomRealm {
             .and_then(std::rc::Weak::upgrade)
             .expect("wrapped image node has an event target");
         drop(wrapper);
-        ImageRequestRoot {
+        ResourceRequestRoot {
             target,
             retention: NodeRetention::new(self, node),
         }
@@ -2022,7 +2998,7 @@ impl DomRealm {
         self: &Rc<Self>,
         ctx: &mut Ctx,
         node: NodeId,
-        retained: ImageRequestRoot,
+        retained: ResourceRequestRoot,
     ) -> ImageEventRoot {
         ImageEventRoot {
             _wrapper: self.wrap(ctx, node),
@@ -2031,9 +3007,20 @@ impl DomRealm {
         }
     }
 
+    fn prepare_image_selection(&self,base:&str)->OpResult<()> {
+        if self.images.needs_auto_layout(&self.session.borrow(),base) {
+            // Invoke only the existing layout provider here; image publication
+            // calls this method itself, so recursively flushing it is invalid.
+            self.flush_layout_frame()?;
+        }
+        self.images.configure_selection(&mut self.session.borrow_mut(),self.device_pixel_ratio.get(),base);
+        Ok(())
+    }
+
     fn sync_image_bitmaps(&self) -> OpResult<()> {
+        let base=self.base_url();
+        self.prepare_image_selection(&base)?;
         if self.images.has_dirty_requests() {
-            let base = self.base_url();
             self.images
                 .synchronize_dirty(self.session.borrow().document(), &base);
         }
@@ -2042,11 +3029,11 @@ impl DomRealm {
             return Ok(());
         }
         let mut session = self.session.borrow_mut();
-        for (node, image) in updates {
+        for (node, image, metadata) in updates {
             if session.document().kind(node).is_err() {
                 continue;
             }
-            session.set_node_bitmap(node, image).map_err(|_| {
+            session.set_node_bitmap_with_metadata(node, image, metadata).map_err(|_| {
                 OpError::new(
                     "InvalidStateError",
                     "could not publish the current image bitmap",
@@ -2057,12 +3044,23 @@ impl DomRealm {
     }
 
     pub(crate) fn flush_layout(&self) -> OpResult<()> {
+        self.refresh_embedded_intrinsic_sizes()?;
         self.sync_image_bitmaps()?;
         self.sync_canvas()?;
+        self.flush_layout_frame()
+    }
+
+    fn flush_layout_frame(&self)->OpResult<()> {
         let callback = self.layout_flusher.borrow().clone();
         if let Some(callback) = callback {
-            callback(&mut self.session.borrow_mut())
-                .map_err(|message| OpError::new("InvalidStateError", message))?;
+            let result=match callback {
+                LayoutFlusher::Direct(callback)=>callback(&mut self.session.borrow_mut()),
+                LayoutFlusher::PreparedViewport{prepare,flush}=>{
+                    let viewport=prepare().map_err(|message|OpError::new("InvalidStateError",message))?;
+                    flush(&mut self.session.borrow_mut(),viewport)
+                },
+            };
+            result.map_err(|message| OpError::new("InvalidStateError", message))?;
         } else if self.session.borrow().viewport_size().is_none() {
             return Err(OpError::new(
                 "InvalidStateError",
@@ -2074,6 +3072,7 @@ impl DomRealm {
 
     /// Publish bitmap changes queued by DOM mutations before borrowing the render session.
     pub fn sync_canvas(&self) -> OpResult<()> {
+        highlight::synchronize(self);
         self.canvases.sync(self)
     }
     pub(crate) fn add_mutation_sink(
@@ -2165,9 +3164,10 @@ impl DomRealm {
             .hover_target
             .get()
             .and_then(|node| self.interaction_element(node));
-        let active = self.active_targets.get().map(|node| {
-            node.and_then(|node| self.interaction_element(node))
-        });
+        let active = self
+            .active_targets
+            .get()
+            .map(|node| node.and_then(|node| self.interaction_element(node)));
         self.session
             .borrow_mut()
             .document_mut()
@@ -2241,7 +3241,13 @@ impl DomRealm {
     fn focus_always_visible(&self, node: NodeId) -> bool {
         let session = self.session.borrow();
         let document = session.document();
-        if !matches!(document.kind(node), Ok(NodeKind::Element { namespace: lumen_html::Namespace::Html, .. })) {
+        if !matches!(
+            document.kind(node),
+            Ok(NodeKind::Element {
+                namespace: lumen_html::Namespace::Html,
+                ..
+            })
+        ) {
             return false;
         }
         match lumen_html::forms::html_element_local_name(document, node) {
@@ -2253,26 +3259,57 @@ impl DomRealm {
                     .flatten()
                     .unwrap_or("text");
                 ![
-                    "hidden", "button", "reset", "submit", "image", "checkbox", "radio",
-                    "file", "range", "color",
+                    "hidden", "button", "reset", "submit", "image", "checkbox", "radio", "file",
+                    "range", "color",
                 ]
                 .iter()
                 .any(|kind| input_type.eq_ignore_ascii_case(kind))
             }
-            _ => document
-                .get_attribute_ns_ref(node, None, "contenteditable")
-                .ok()
-                .flatten()
-                .is_some_and(|value| {
-                    value.is_empty()
-                        || value.eq_ignore_ascii_case("true")
-                        || value.eq_ignore_ascii_case("plaintext-only")
-                }),
+            _ => lumen_html::element_metadata::is_content_editable(document,node),
         }
     }
 
     pub fn focus(self: &Rc<Self>, ctx: &mut Ctx, node: Option<NodeId>) -> OpResult<()> {
         self.focus_with_cause(ctx, node, false)
+    }
+
+    /// The HTML fragment algorithm's starting point for a native sequential
+    /// focus request. It is independent of the currently focused area.
+    pub fn sequential_focus_start(&self) -> Option<NodeId> {
+        fragment::sequential_focus_start(self)
+    }
+
+    /// HTML rendering-update focus fixup. A state-preserving move keeps focus
+    /// during linking; rendering can subsequently make its area unfocusable.
+    pub fn update_rendered_focus(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<()> {
+        self.queue_object_tasks(ctx)?;
+        fragment::checkpoint(ctx,self,false)?;
+        focus::flush_autofocus(ctx,self)?;
+        // The first rendering opportunity must publish layout as well. A
+        // provider alone does not render inert or retired documents: require
+        // their own active browsing context before initializing the viewport.
+        let active_provider = self.layout_flusher.borrow().is_some()
+            && self.has_browsing_context
+            && self.browsing_context().is_some_and(|context| {
+                browsing_context::is_active_document(&context, self)
+            });
+        if self.session.borrow().viewport_size().is_some() || active_provider {
+            self.flush_layout()?;
+        }
+        if self.session.borrow().viewport_size().is_some() {
+            layout_observers::rendering_checkpoint(ctx,self)?;
+        }
+        paint_worklet::update(ctx,self)?;
+        self.canvases.update_drawable_paint(ctx,self)?;
+        scrolling::queue_normalized_scroll_events(ctx,self)?;
+        view_transition::rendering_checkpoint(ctx, self)?;
+        if let Some(node) = self.focused.get() {
+            let epoch = |session: &RenderSession| (node, session.document().version(), session.document().interaction_generation(), session.paint_revision());
+            if self.rendered_focus_epoch.get() == Some(epoch(&self.session.borrow())) { return Ok(()); }
+            if !self.focusable_node(node)? { self.focus(ctx, None)?; }
+            self.rendered_focus_epoch.set(self.focused.get().map(|_| epoch(&self.session.borrow())));
+        }
+        Ok(())
     }
 
     pub(crate) fn focus_from_pointer(
@@ -2293,41 +3330,10 @@ impl DomRealm {
         }
         let session = self.session.borrow();
         let document = session.document();
-        let NodeKind::Element {
-            namespace,
-            name,
-            attributes,
-        } = document.kind(node).map_err(dom_error)?
-        else {
+        if !matches!(document.kind(node).map_err(dom_error)?,NodeKind::Element { .. }) {
             return Err(OpError::new("TypeError", "focus target must be an element"));
-        };
-        if *namespace != lumen_html::Namespace::Html {
-            return Ok(false);
         }
-        let local_name = lumen_html::forms::html_element_local_name(document, node).unwrap_or(name);
-        let focusable = matches!(
-            local_name,
-            "input" | "button" | "textarea" | "select" | "summary"
-        ) || attributes.iter().any(|(attribute, _)| attribute == "tabindex")
-            || (local_name == "dialog"
-                && document
-                    .get_attribute_ns_ref(node, None, "open")
-                    .map_err(dom_error)?
-                    .is_some())
-            || (local_name == "a" || local_name == "area")
-                && document
-                    .get_attribute_ns_ref(node, None, "href")
-                    .map_err(dom_error)?
-                    .is_some()
-            || document
-                .get_attribute_ns_ref(node, None, "contenteditable")
-                .map_err(dom_error)?
-                .is_some_and(|value| {
-                    value.is_empty()
-                        || value.eq_ignore_ascii_case("true")
-                        || value.eq_ignore_ascii_case("plaintext-only")
-                });
-        if !focusable {
+        if !lumen_html::focus::focusable(document,node) {
             return Ok(false);
         }
         let mut ancestor = node;
@@ -2349,11 +3355,14 @@ impl DomRealm {
         node: Option<NodeId>,
         pointer_cause: bool,
     ) -> OpResult<()> {
-        if let Some(node) = node {
-            if !self.focusable_node(node)? {
-                return Ok(());
-            }
-        }
+        let node=match node {
+            Some(node) => match focus::resolve_focus_target(self,node,pointer_cause)? {
+                Some(node)=> if node==self.session.borrow().document().root() {None} else {Some(node)},
+                None=>return Ok(()),
+            },
+            None=>None,
+        };
+        if node.is_some() { focus::focus_parent_chain(ctx,self)?; }
         let old = self.focused_node();
         let old_was_visible = old.is_some_and(|old| self.focus_visible.get() == Some(old));
         if old == node {
@@ -2363,6 +3372,7 @@ impl DomRealm {
                         .set(self.focus_always_visible(node).then_some(node));
                     self.publish_interaction_state();
                 }
+                focus::focus_content_navigable(ctx,self,node)?;
             }
             return Ok(());
         }
@@ -2421,6 +3431,7 @@ impl DomRealm {
                     &[("relatedTarget", previous)],
                 )?;
             }
+            focus::focus_content_navigable(ctx,self,node)?;
         }
         Ok(())
     }
@@ -2590,9 +3601,20 @@ impl DomRealm {
                 ctx.set_member(&options, name, property.clone())
                     .map_err(|error| OpError::thrown(lumen::embed::abrupt_value(error)))?;
             }
-            if let Some(event) = ui_events::host_pointer_or_mouse_event(ctx, kind, options.clone())? {
+            if let Some(event) = ui_events::host_pointer_or_mouse_event(ctx, kind, options.clone())?
+            {
                 return self.dispatch_event_to_target(ctx, node, value, event, trusted);
             }
+        }
+        if kind == "paint" {
+            let elements=properties.iter().find(|(name,_)|*name=="changedElements").map(|(_,value)|value.clone());
+            let mut values=Vec::new();
+            if let Some(array)=elements {
+                let length=ctx.member_get(&array,"length").map_err(OpError::thrown)?;
+                if let Value::Num(length)=length {for index in 0..(length as usize).min(128) {values.push(ctx.member_get(&array,&index.to_string()).map_err(OpError::thrown)?);}}
+            }
+            let event=canvas::paint_event(ctx,values)?;
+            return self.dispatch_event_to_target(ctx,node,value,event,trusted);
         }
         let event = DomEvent::new(ctx, kind, Some(options))?;
         if let Some((_, related)) = properties.iter().find(|(name, _)| *name == "relatedTarget") {
@@ -2665,6 +3687,7 @@ impl DomRealm {
         bubbles: bool,
         cancelable: bool,
     ) -> OpResult<bool> {
+        if kind=="load" && (self.stylesheet_links.defer_window_load() || self.object_resources.defer_window_load()) {return Ok(true)}
         let window = self
             .window_wrapper
             .borrow()
@@ -2679,14 +3702,17 @@ impl DomRealm {
         let event = DomEvent::new(ctx, kind, Some(options))?;
         let event = lumen::embed::JsObject::from_value(ctx.new_instance(event))
             .expect("native Event object");
-        if kind == "load" {
+        if matches!(kind, "load" | "unload") {
+            if kind == "load" { self.lifecycle.page_showing.set(true); }
             let document = self.document_value(ctx);
-            events::dispatch_user_agent_event_with_target(
+            let result = events::dispatch_user_agent_event_with_target(
                 ctx,
                 lumen_bind::This(window),
                 event,
                 document,
-            )
+            )?;
+            if kind == "load" { history::restore_form_state_before_pageshow(ctx,self)?;navigation_lifecycle::page_transition(ctx, self, "pageshow")?; }
+            Ok(result)
         } else {
             events::dispatch_user_agent_event(ctx, lumen_bind::This(window), event)
         }
@@ -2714,13 +3740,19 @@ impl DomRealm {
         let event = lumen_host::messaging::PromiseRejectionEvent::for_user_agent(
             ctx, kind, promise, reason,
         )?;
-        let event = lumen::embed::JsObject::from_value(event)
-            .expect("native PromiseRejectionEvent object");
+        let event =
+            lumen::embed::JsObject::from_value(event).expect("native PromiseRejectionEvent object");
         events::dispatch_user_agent_event(ctx, lumen_bind::This(window), event)
     }
 
     pub fn with_session<R>(&self, work: impl FnOnce(&mut RenderSession) -> R) -> R {
-        if !self.detached.borrow().is_empty() {
+        highlight::synchronize(self);
+        let has_reap_work = {
+            self.detached
+                .borrow()
+                .has_scheduled_work(self.identity_trace_epoch.get())
+        };
+        if has_reap_work {
             self.reap_detached(std::iter::empty());
         }
         let mut session = self.session.borrow_mut();
@@ -2770,11 +3802,14 @@ impl DomRealm {
         let session = self.session.borrow();
         let document = session.document();
         let document_root = document.root();
+        let mut foreign = Vec::new();
         let mut cursor = root;
         for _ in 0..=document.node_count() {
             if cursor != document_root {
                 self.trace_cached_native_wrapper(epoch, cursor, visit);
             }
+            observers::trace_node_observers(self, cursor, visit);
+            custom_elements::trace_registry_for_node(self, cursor, visit);
             // Attr nodes are sparse sidecar entries rather than tree children.
             // Visit only already-materialized identities; GC must not create a
             // wrapper or materialize an attribute.
@@ -2782,8 +3817,12 @@ impl DomRealm {
                 if let Some(attributes) = document.materialized_attribute_nodes(cursor) {
                     for &(_, attribute) in attributes {
                         self.trace_cached_native_wrapper(epoch, attribute, visit);
+                        observers::trace_node_observers(self, attribute, visit);
                     }
                 }
+            }
+            for remote in [document.template_content(cursor).ok().flatten(), document.template_host(cursor).ok().flatten()].into_iter().flatten() {
+                if remote.document_id() != root.document_id() { foreign.push(remote); }
             }
             match selector::next_native_identity_descendant(document, root, cursor) {
                 Ok(Some(next)) => cursor = next,
@@ -2794,19 +3833,22 @@ impl DomRealm {
         // root too, so later callbacks from nodes in this component skip the
         // parent walk before the next collection starts.
         self.mark_native_identity(epoch, root);
+        // Native Range/record/collection owners can start this walk before a
+        // node's own wrapper callback. Preserve ownerDocument even when that
+        // callback then takes the shared seen-node shortcut.
+        drop(session);
+        for remote in foreign {
+            let owner = self.template_graph_owners.borrow().get(&remote.document_id()).and_then(std::rc::Weak::upgrade);
+            if let Some(owner) = owner {
+                let remote_root = { let session = owner.session.borrow(); selector::native_identity_root(session.document(), remote).ok() };
+                if let Some(remote_root) = remote_root { owner.trace_native_identity_component(epoch, remote_root, visit); }
+            }
+        }
+        if root != document_root { self.trace_document_wrapper(epoch, visit); }
     }
 
-    fn trace_cached_native_wrapper(
-        &self,
-        epoch: u64,
-        id: NodeId,
-        visit: &mut dyn FnMut(&Value),
-    ) {
-        let value = self
-            .wrappers
-            .borrow()
-            .get(&id)
-            .and_then(WeakValue::upgrade);
+    fn trace_cached_native_wrapper(&self, epoch: u64, id: NodeId, visit: &mut dyn FnMut(&Value)) {
+        let value = self.wrappers.borrow().get(&id).and_then(WeakValue::upgrade);
         if let Some(value) = value {
             if self.mark_native_identity(epoch, id) {
                 visit(&value);
@@ -2842,114 +3884,333 @@ impl DomRealm {
             .is_some_and(|wrapper| wrapper.upgrade().is_some())
     }
 
-    fn reap_detached(&self, added: impl IntoIterator<Item = NodeId>) {
+    fn note_detached_releases(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        let session = self.session.try_borrow().ok();
+        let mut reaper = self.detached.borrow_mut();
+        for node in nodes {
+            if let Some(session) = session.as_ref() {
+                if let Some(root) = detached_identity_root(session.document(), node) {
+                    reaper.enqueue_dirty(root);
+                }
+            } else {
+                // A mutation can cancel a resource lease while owning the
+                // Session. The bounded dirty processor resolves this actual
+                // identity to its current component at the next safe boundary.
+                reaper.enqueue_dirty(node);
+            }
+        }
+        reaper.compact_queues();
+    }
+
+    /// Share the release path between native leases and reactive node groups:
+    /// mark the containing detached components dirty, then give the bounded
+    /// reaper its ordinary per-call work budget.
+    fn release_detached_nodes(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        self.note_detached_releases(nodes);
+        let has_dirty_roots = !self.detached.borrow().dirty.is_empty();
+        // A native lease can be released while a caller still reads the
+        // document. Mark its component now and reclaim at the next available
+        // mutation boundary, without re-entering that session borrow.
+        if has_dirty_roots && self.session.try_borrow_mut().is_ok() {
+            self.reap_detached(std::iter::empty());
+        }
+    }
+
+    fn note_detached_mutation(
+        &self,
+        document: &lumen_html::Document,
+        mutation: &lumen_html::observe::ObservedMutation,
+    ) {
+        if !matches!(
+            &mutation.kind,
+            lumen_html::observe::ObservedKind::ChildList { .. }
+                | lumen_html::observe::ObservedKind::ChildListMany { .. }
+        ) {
+            return;
+        }
+        if let Some(root) = detached_identity_root(document, mutation.target) {
+            let mut reaper = self.detached.borrow_mut();
+            // Only already-pending components need their incremental state
+            // restarted. New detached roots arrive through `reap_detached`.
+            if reaper.candidate_generations.contains_key(&root) {
+                reaper.enqueue_dirty(root);
+            }
+        }
+    }
+
+    fn reap_detached(&self, added: impl IntoIterator<Item = NodeId>) -> DetachedReapStats {
+        self.reap_detached_inner(added, false)
+    }
+
+    /// Register a detached component for later reclamation without inspecting
+    /// it in the factory/drop call that produced the candidate. This matters
+    /// for nodes that are still being returned to a caller or are about to be
+    /// protected by a native lease: only a later GC epoch or capacity-pressure
+    /// pass may decide whether the component is actually dead.
+    fn defer_detached_root(&self, root: NodeId) {
+        let mut reaper = self.detached.borrow_mut();
+        if !reaper.candidate_generations.contains_key(&root) {
+            let candidate = reaper.register(root);
+            reaper.enqueue_candidate(candidate);
+        }
+        reaper.compact_queues();
+    }
+
+    /// Run ordinary bounded work before node creation. If the arena is under
+    /// pressure, synchronously finish one fair pass over pending roots so dead
+    /// detached components can return slots before the core factory reports
+    /// its normal QuotaExceededError.
+    /// Collect only under actual native admission pressure, with no Session
+    /// borrow held across GC. The unchanged shared budget is retried once.
+    pub(crate) fn prepare_allocation(&self, ctx: &mut Ctx, required: usize) -> OpResult<()> {
+        if required == 0 { return Ok(()); }
+        self.reap_detached_for_capacity(required);
+        let admission = self.session.borrow().document().ensure_clone_capacity(required);
+        if admission == Err(Error::LimitExceeded) {
+            ctx.collect_garbage();
+            self.reap_detached_inner(std::iter::empty(), true);
+            return self.session.borrow().document().ensure_clone_capacity(required).map_err(dom_error);
+        }
+        admission.map_err(dom_error)
+    }
+
+    fn reap_detached_for_capacity(&self, required: usize) {
+        if required == 0 {
+            return;
+        }
+        let remaining = self.session.borrow().document().remaining_node_capacity();
+        if remaining < required {
+            self.reap_detached_inner(std::iter::empty(), true);
+        } else {
+            let has_reap_work = {
+                self.detached
+                    .borrow()
+                    .has_scheduled_work(self.identity_trace_epoch.get())
+            };
+            if has_reap_work {
+                self.reap_detached(std::iter::empty());
+            }
+        }
+    }
+
+    fn reap_detached_inner(
+        &self,
+        added: impl IntoIterator<Item = NodeId>,
+        force: bool,
+    ) -> DetachedReapStats {
         let _html_allocations = enter_html_allocation_category();
-        let mut pending = self.detached.borrow_mut();
-        pending.extend(added);
+        let mut stats = DetachedReapStats::default();
+        let mut reaper = self.detached.borrow_mut();
         let mut session = self.session.borrow_mut();
         let document = session.document_mut();
         let wrappers = self.wrappers.borrow();
-        let current_script = self.current_script.get();
-        pending.retain(|&root| {
-            if document.kind(root).is_err() || document.parent(root).ok().flatten().is_some() {
-                return false;
-            }
-            let mut ancestor = current_script;
-            while let Some(id) = ancestor {
-                if id == root {
-                    // A parser may execute a script before its wrapper has ever been requested.
-                    // Keep a detached currentScript alive until script evaluation finishes.
-                    return true;
-                }
-                ancestor = document.parent(id).ok().flatten();
-            }
-            let mut cursor = Some(root);
-            let mut tree_root = root;
-            let mut contents = Vec::new();
-            let mut live = false;
-            while let Some(id) = cursor {
-                if wrappers
-                    .get(&id)
-                    .is_some_and(|value| value.upgrade().is_some())
-                    || self.retained_nodes.borrow().contains_key(&id)
-                {
-                    live = true;
-                    break;
-                }
-                // Attr nodes are lazily materialized in the owner's sidecar, not
-                // linked into the ordinary child tree. A retained Attr therefore
-                // keeps a detached owner Element alive just like a descendant Node.
-                if document
-                    .materialized_attribute_nodes(id)
-                    .is_some_and(|attributes| {
-                        attributes.iter().any(|&(_, attribute)| {
-                            wrappers
-                                .get(&attribute)
-                                .is_some_and(|value| value.upgrade().is_some())
-                                || self.retained_nodes.borrow().contains_key(&attribute)
-                        })
-                    })
-                {
-                    live = true;
-                    break;
-                }
-                if let Ok(Some(content)) = document.template_content(id) {
-                    contents.push(content);
-                }
-                if let Ok(Some(content)) = document.shadow_root(id) {
-                    contents.push(content);
-                }
-                cursor = next_descendant(document, tree_root, id).ok().flatten();
-                if cursor.is_none() {
-                    if let Some(content) = contents.pop() {
-                        tree_root = content;
-                        cursor = Some(content);
-                    }
-                }
-            }
-            if live {
-                true
-            } else {
-                let _ = document.destroy_subtree(root);
-                false
-            }
-        });
-        self.targets
-            .borrow_mut()
-            .retain(|id, target| document.kind(*id).is_ok() && target.strong_count() > 0);
-        self.selections
-            .borrow_mut()
-            .retain(|id, _| document.kind(*id).is_ok());
-        forms::reap(&mut self.forms.borrow_mut(), document);
+        let retained_nodes = self.retained_nodes.borrow();
+        let current_script_root = self
+            .current_script
+            .get()
+            .and_then(|script| selector::native_identity_root(document, script).ok());
 
-        // The shared document clears interaction anchors when a subtree is
-        // detached. Keep the realm's sparse publisher in sync as well, so a
-        // retained node that is later reinserted does not regain old state.
-        let focused = self
-            .focused
-            .get()
-            .filter(|node| connected_interaction_element(document, *node));
-        let focus_visible = self
-            .focus_visible
-            .get()
-            .filter(|node| Some(*node) == focused);
-        let hover = self
-            .hover_target
-            .get()
-            .filter(|node| connected_interaction_element(document, *node));
-        let active_targets = self.active_targets.get().map(|node| {
-            node.filter(|node| connected_interaction_element(document, *node))
-        });
-        self.focused.set(focused);
-        self.focus_visible.set(focus_visible);
-        self.hover_target.set(hover);
-        self.active_targets.set(active_targets);
-        document.set_interaction_state(lumen_html::interaction::InteractionState {
-            focused,
-            focus_visible,
-            hover,
-            active: active_targets,
-        });
+        let gc_epoch = self.identity_trace_epoch.get();
+        if reaper.observed_gc_epoch != gc_epoch {
+            reaper.observed_gc_epoch = gc_epoch;
+            reaper.gc_roots_remaining = reaper
+                .candidate_generations
+                .len()
+                .min(DETACHED_REAP_ROOTS_PER_EPOCH);
+        }
+
+        if force {
+            let dirty_count = reaper.dirty.len();
+            for _ in 0..dirty_count {
+                let Some(root) = reaper.dirty.pop_front() else {
+                    break;
+                };
+                if !reaper.dirty_roots.remove(&root) {
+                    continue;
+                }
+                recheck_dirty_detached_root(
+                    &mut reaper,
+                    document,
+                    root,
+                    &wrappers,
+                    &retained_nodes,
+                    current_script_root,
+                    &mut stats,
+                );
+            }
+        }
+
+        // Ordinary GC work advances a rotating root cursor and is capped per
+        // collection epoch. Repeated session access in the same epoch never
+        // revisits every older retained root.
+        let root_budget = if force {
+            reaper.candidates.len()
+        } else {
+            reaper.gc_roots_remaining.min(DETACHED_REAP_ROOTS_PER_CALL)
+        };
+        let mut checked_roots = 0;
+        let mut queue_entries = 0;
+        let max_queue_entries = root_budget
+            .saturating_add(DETACHED_QUEUE_COMPACT_SLACK)
+            .max(root_budget);
+        while checked_roots < root_budget && queue_entries < max_queue_entries {
+            let Some(candidate) = reaper.candidates.pop_front() else {
+                break;
+            };
+            queue_entries += 1;
+            if !reaper.is_current(candidate) {
+                continue;
+            }
+            checked_roots += 1;
+            process_detached_candidate(
+                &mut reaper,
+                document,
+                candidate,
+                &wrappers,
+                &retained_nodes,
+                current_script_root,
+                &mut stats,
+            );
+        }
+        if force {
+            reaper.gc_roots_remaining = 0;
+        } else {
+            reaper.gc_roots_remaining = reaper.gc_roots_remaining.saturating_sub(checked_roots);
+        }
+
+        let dirty_budget = if force {
+            usize::MAX
+        } else {
+            DETACHED_REAP_DIRTY_ROOTS_PER_CALL
+        };
+        let mut checked_dirty = 0;
+        while checked_dirty < dirty_budget {
+            let Some(root) = reaper.dirty.pop_front() else {
+                break;
+            };
+            if !reaper.dirty_roots.remove(&root) {
+                continue;
+            }
+            checked_dirty += 1;
+            recheck_dirty_detached_root(
+                &mut reaper,
+                document,
+                root,
+                &wrappers,
+                &retained_nodes,
+                current_script_root,
+                &mut stats,
+            );
+        }
+
+        // A mutation passes only the roots it actually removed. Check each
+        // previously-unseen component once; existing live roots are dirtied
+        // once instead of being rescanned with the whole pending set.
+        for node in added {
+            let Some(root) = detached_identity_root(document, node) else {
+                reaper.candidate_generations.remove(&node);
+                continue;
+            };
+            if reaper.candidate_generations.contains_key(&root) {
+                reaper.enqueue_dirty(root);
+                continue;
+            }
+            let candidate = reaper.register(root);
+            process_detached_candidate(
+                &mut reaper,
+                document,
+                candidate,
+                &wrappers,
+                &retained_nodes,
+                current_script_root,
+                &mut stats,
+            );
+        }
+
+        // Process the dirty roots caused by the just-observed mutation in this
+        // same call, coalescing repeated releases/child-list changes.
+        let added_dirty_budget = if force {
+            usize::MAX
+        } else {
+            DETACHED_REAP_DIRTY_ROOTS_PER_CALL
+        };
+        let mut added_dirty = 0;
+        while added_dirty < added_dirty_budget {
+            let Some(root) = reaper.dirty.pop_front() else {
+                break;
+            };
+            if !reaper.dirty_roots.remove(&root) {
+                continue;
+            }
+            added_dirty += 1;
+            recheck_dirty_detached_root(
+                &mut reaper,
+                document,
+                root,
+                &wrappers,
+                &retained_nodes,
+                current_script_root,
+                &mut stats,
+            );
+        }
+
+        let node_count = document.node_count();
+        let prune_threshold = node_count.max(DETACHED_SIDECAR_REAP_FLOOR);
+        if force || reaper.destroyed_since_sidecar_sweep >= prune_threshold {
+            // These sparse adapter tables are keyed by generation-bearing
+            // NodeIds. Pruning at a node-count debt threshold keeps stale state
+            // bounded while amortizing the full-map retains over reclamation.
+            self.targets
+                .borrow_mut()
+                .retain(|id, target| document.kind(*id).is_ok() && target.strong_count() > 0);
+            self.initialized_content_handlers.borrow_mut().retain(|id,_|document.kind(*id).is_ok());
+            self.stylesheet_links.reclaim_nodes(document);
+            self.selections
+                .borrow_mut()
+                .retain(|id, _| document.kind(*id).is_ok());
+            forms::reap(&mut self.forms.borrow_mut(), document);
+            self.reflected_elements.borrow_mut().reap(document);
+            self.dialog_requests.borrow_mut().retain(|id, _| document.kind(*id).is_ok());
+            observers::reap_registrations(self, document);
+            self.template_graph_owners.borrow_mut().retain(|id, owner| {
+                owner.strong_count() > 0 && document.foreign_template_links().iter().any(|(_, remote)| remote.document_id() == *id)
+            });
+            reaper.destroyed_since_sidecar_sweep = 0;
+        }
+
+        if stats.did_reap {
+            // Keep the realm's sparse publisher in sync with Document's
+            // detached-anchor cleanup, including live roots retained by JS.
+            let focused = self
+                .focused
+                .get()
+                .filter(|node| connected_interaction_element(document, *node));
+            let focus_visible = self
+                .focus_visible
+                .get()
+                .filter(|node| Some(*node) == focused);
+            let hover = self
+                .hover_target
+                .get()
+                .filter(|node| connected_interaction_element(document, *node));
+            let active_targets = self
+                .active_targets
+                .get()
+                .map(|node| node.filter(|node| connected_interaction_element(document, *node)));
+            self.focused.set(focused);
+            self.focus_visible.set(focus_visible);
+            self.hover_target.set(hover);
+            self.active_targets.set(active_targets);
+            document.set_interaction_state(lumen_html::interaction::InteractionState {
+                focused,
+                focus_visible,
+                hover,
+                active: active_targets,
+            });
+        }
+
+        reaper.compact_queues();
+        stats
     }
 
     fn migrate_adopted_state(
@@ -2958,7 +4219,21 @@ impl DomRealm {
         target: &Rc<DomRealm>,
         mapping: &[(NodeId, NodeId)],
     ) -> OpResult<()> {
+        if Rc::ptr_eq(self, target) { self.reflected_elements.borrow_mut().remap_nodes(mapping)?; }
+        else { self.reflected_elements.borrow_mut().move_nodes(&mut target.reflected_elements.borrow_mut(), mapping)?; }
+        self.stylesheet_links.adopt_nodes(&target.stylesheet_links,mapping)?;
+        self.adopt_object_nodes(ctx,target,mapping)?;
+        let request_count = self.dialog_requests.borrow().keys().filter(|node| mapping.iter().any(|(old,_)| old == *node)).count();
+        target.dialog_requests.borrow_mut().try_reserve(request_count).map_err(|_| OpError::new("QuotaExceededError", "dialog request adoption"))?;
+        let handler_count=mapping.iter().filter(|(old,_)|self.initialized_content_handlers.borrow().contains_key(old)).count();
+        target.initialized_content_handlers.borrow_mut().try_reserve(handler_count).map_err(|_|OpError::new("QuotaExceededError","event handler state adoption"))?;
         for &(old, new) in mapping {
+            let initialized=self.initialized_content_handlers.borrow_mut().remove(&old);
+            if let Some(initialized)=initialized {
+                target.initialized_content_handlers.borrow_mut().insert(new,initialized);
+            }
+            let request = self.dialog_requests.borrow_mut().remove(&old);
+            if let Some(request) = request { request.adopted(); target.dialog_requests.borrow_mut().insert(new, request); }
             let wrapper = self
                 .wrappers
                 .borrow_mut()
@@ -2971,11 +4246,25 @@ impl DomRealm {
                     node.id = new;
                     core::mem::take(&mut *node.collections.borrow_mut())
                 })?;
-                ctx.set_native_identity_owner::<DomNode>(&wrapper)?;
+                register_node_identity_owner(ctx, &wrapper)?;
+                cssom::retarget_adopted_stylesheets(ctx, &wrapper)?;
                 for weak in collections.values() {
                     let Some(collection) = weak.upgrade() else {
                         continue;
                     };
+                    if ctx.with_instance_mut::<attributes::DomNamedNodeMap, _>(
+                        &collection, |map| map.adopt_node(target.clone(), new),
+                    ).is_ok() {
+                        continue;
+                    }
+                    if ctx
+                        .with_instance_mut::<DomHtmlCollection, _>(&collection, |list| {
+                            list.base.adopt_nodes(target.clone(), mapping)
+                        })
+                        .is_ok()
+                    {
+                        continue;
+                    }
                     if ctx
                         .with_instance_mut::<DomNodeList, _>(&collection, |list| {
                             list.adopt_nodes(target.clone(), mapping)
@@ -3020,30 +4309,34 @@ impl DomRealm {
             if let Some(count) = self.retained_nodes.borrow_mut().remove(&old) {
                 *target.retained_nodes.borrow_mut().entry(new).or_default() += count;
             }
-            let script_retentions = self
-                .script_retentions
+            let node_retentions = self
+                .node_retentions
                 .borrow_mut()
                 .remove(&old)
                 .unwrap_or_default();
-            for weak in script_retentions {
+            for weak in node_retentions {
                 let Some(retention) = weak.upgrade() else {
                     continue;
                 };
                 {
                     let mut retention = retention.borrow_mut();
-                    retention.owner = target.clone();
+                    retention.owner.retarget(target);
                     retention.node = new;
                 }
                 target
-                    .script_retentions
+                    .node_retentions
                     .borrow_mut()
                     .entry(new)
                     .or_default()
                     .push(Rc::downgrade(&retention));
             }
-            self.adopted_nodes
-                .borrow_mut()
-                .insert(old, (Rc::downgrade(target), new));
+            // Sparse identity forwarding survives reclamation of intermediate
+            // documents: every retained alias shares one weak-owner token.
+            let forwarding = self.adopted_nodes.borrow_mut().entry(old)
+                .or_insert_with(|| Rc::new(RefCell::new((Rc::downgrade(self), old))))
+                .clone();
+            *forwarding.borrow_mut() = (Rc::downgrade(target), new);
+            target.adopted_nodes.borrow_mut().insert(new, forwarding);
             if let Some(selection) = self.selections.borrow_mut().remove(&old) {
                 target.selections.borrow_mut().insert(new, selection);
             }
@@ -3058,20 +4351,23 @@ impl DomRealm {
         );
         self.ranges
             .adopt_nodes(self, &target.ranges, target, mapping);
-        if let Some(selection) = self.selection.borrow().as_ref() {
+        if let Some(selection) = self.selection.borrow().upgrade() {
             selection.adopt_nodes(mapping);
         }
         animations::adopt_nodes(ctx, self, target, mapping)?;
         self.canvases
             .adopt_nodes_into(ctx, &target.canvases, target, mapping)?;
         self.images.adopt_nodes_into(&target.images, mapping);
-        self.media.borrow_mut().adopt_nodes_into(&mut target.media.borrow_mut(), mapping);
+        self.media
+            .borrow_mut()
+            .adopt_nodes_into(&mut target.media.borrow_mut(), mapping);
         self.iterators
             .adopt_nodes(self, target, &target.iterators, mapping);
         self.tree_walkers
             .adopt_nodes(self, target, &target.tree_walkers, mapping);
         observers::adopt_nodes(ctx, self, target, mapping);
         dialog_popover::adopt_details_tasks(ctx, self, target, mapping)?;
+        template_graph::migrate_edges(ctx, self, target, mapping)?;
         Ok(())
     }
 
@@ -3089,6 +4385,14 @@ impl DomRealm {
         ctx: &mut Ctx,
         source: &Rc<Self>,
         source_id: NodeId,
+        validate: impl FnOnce(&lumen_html::Document, &lumen_html::Document) -> Result<(), Error>,
+    ) -> OpResult<NodeId> {
+        let owner = target.session.borrow().document().root();
+        Self::adopt_node_from_to_owner(target, ctx, source, source_id, owner, validate)
+    }
+
+    fn adopt_node_from_to_owner(
+        target: &Rc<Self>, ctx: &mut Ctx, source: &Rc<Self>, source_id: NodeId, owner: NodeId,
         validate: impl FnOnce(&lumen_html::Document, &lumen_html::Document) -> Result<(), Error>,
     ) -> OpResult<NodeId> {
         {
@@ -3151,6 +4455,10 @@ impl DomRealm {
             validate(target_session.document(), source_session.document()).map_err(dom_error)?;
         }
 
+        let old_documents = source.session.borrow().document().adoption_node_documents(source_id).map_err(dom_error)?;
+        if !source.template_graph_owners.borrow().is_empty() {
+            template_graph::preflight_adoption(ctx, source, source_id, target)?;
+        }
         if Rc::ptr_eq(source, target) {
             source
                 .session
@@ -3158,8 +4466,19 @@ impl DomRealm {
                 .document_mut()
                 .remove(source_id)
                 .map_err(dom_error)?;
+            target.session.borrow_mut().document_mut().set_node_document(source_id, owner).map_err(dom_error)?;
+            let mapping = old_documents.iter().map(|(node, _)| (*node, *node)).collect::<Vec<_>>();
+            let documents = {
+                let session = target.session.borrow();
+                old_documents.iter().map(|(node, old)| session.document().node_document(*node).map(|new| (*node, *old, new))).collect::<Result<Vec<_>, _>>().map_err(dom_error)?
+            };
+            custom_elements::adopt_nodes_with_documents(ctx, source, target, &mapping, &documents)?;
+            template_graph::readopt_contents(ctx, target, &mapping)?;
             return Ok(source_id);
         }
+
+        let required = target.session.borrow().document().adoption_allocation_count_from(source.session.borrow().document(), source_id).map_err(dom_error)?;
+        target.prepare_allocation(ctx, required)?;
 
         let (adopted_root, mapping) = {
             let mut source_session = source.session.borrow_mut();
@@ -3169,11 +4488,21 @@ impl DomRealm {
                 .adopt_subtree_from(source_session.document_mut(), source_id)
                 .map_err(dom_error)?
         };
+        target.session.borrow_mut().document_mut().set_node_document(adopted_root, owner).map_err(dom_error)?;
+        let documents = {
+            let session = target.session.borrow();
+            mapping.iter().zip(old_documents.iter()).map(|((old, new), (captured, old_owner))| {
+                if old != captured { return Err(Error::InvalidNode); }
+                let old_owner = *old_owner;
+                Ok((*old, old_owner, session.document().node_document(*new)?))
+            }).collect::<Result<Vec<_>, Error>>().map_err(dom_error)?
+        };
         source.migrate_adopted_state(ctx, target, &mapping)?;
-        custom_elements::adopt_nodes(ctx, source, target, &mapping)?;
+        custom_elements::adopt_nodes_with_documents(ctx, source, target, &mapping, &documents)?;
         presentation::adopt_nodes(ctx, source, &mapping)?;
         animations::adopt_nodes(ctx, source, target, &mapping)?;
         event_content_handlers::initialize_subtree(ctx, target, adopted_root)?;
+        template_graph::readopt_contents(ctx, target, &mapping)?;
         Ok(adopted_root)
     }
 
@@ -3185,307 +4514,39 @@ impl DomRealm {
         if let Some(value) = self.wrappers.borrow().get(&id).and_then(WeakValue::upgrade) {
             return value;
         }
+        {
+            let session = self.session.borrow();
+            self.object_resources.record_birth(session.document(), id, false);
+        }
         let node = DomNode {
             base: DomEventTarget::node(self, id),
             realm: self.clone(),
             id,
             collections: RefCell::new(HashMap::new()),
         };
-        let value = match self.session.borrow().document().kind(id) {
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "html" => {
-                ctx.cached_instance(id, || DomHtmlHtmlElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "div" => {
-                ctx.cached_instance(id, || DomHtmlDivElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "br" => {
-                ctx.cached_instance(id, || DomHtmlBrElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "head" => {
-                ctx.cached_instance(id, || DomHtmlHeadElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "a" => {
-                ctx.cached_instance(id, || hyperlinks::DomAnchorElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "area" => {
-                ctx.cached_instance(id, || hyperlinks::DomAreaElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "body" => {
-                ctx.cached_instance(id, || DomHtmlBodyElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "title" => {
-                ctx.cached_instance(id, || DomHtmlTitleElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::xml::split_qname(name.as_str())
-                .is_some_and(|(_, local_name)| local_name == "base") =>
-            {
-                ctx.cached_instance(id, || DomHtmlBaseElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "link" => {
-                ctx.cached_instance(id, || DomHtmlLinkElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::xml::split_qname(name.as_str())
-                .is_some_and(|(_, local)| local == "script") =>
-            {
-                ctx.cached_instance(id, || DomHtmlScriptElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "img" => {
-                ctx.cached_instance(id, || DomHtmlImageElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "audio" => {
-                self.media.borrow_mut().register_detached(id);
-                ctx.cached_instance(id, || media::DomHtmlAudioElement {
-                    base: media::DomHtmlMediaElement {
-                        base: DomHtmlElement {
-                            base: DomElement { base: node },
-                        },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "video" => {
-                self.media.borrow_mut().register_detached(id);
-                ctx.cached_instance(id, || media::DomHtmlVideoElement {
-                    base: media::DomHtmlMediaElement {
-                        base: DomHtmlElement {
-                            base: DomElement { base: node },
-                        },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "canvas" => ctx.cached_instance(id, || {
-                canvas::DomCanvasElement::from_node(DomHtmlElement {
-                    base: DomElement { base: node },
-                })
-            }),
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "form" => {
-                ctx.cached_instance(id, || DomFormElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "details" => {
-                ctx.cached_instance(id, || DomDetailsElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "style" => {
-                ctx.cached_instance(id, || DomStyleElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "template" => {
-                ctx.cached_instance(id, || DomTemplateElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "iframe" => {
-                ctx.cached_instance(id, || DomIFrameElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "input" => {
-                ctx.cached_instance(id, || DomInputElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "select" => {
-                ctx.cached_instance(id, || DomSelectElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "option" => {
-                ctx.cached_instance(id, || DomOptionElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "textarea" => {
-                ctx.cached_instance(id, || DomTextAreaElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) if lumen_html::svg::local_name(name) == "slot" => {
-                ctx.cached_instance(id, || DomSlotElement {
-                    base: DomHtmlElement {
-                        base: DomElement { base: node },
-                    },
-                })
-            }
-            Ok(NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                ..
-            }) => {
-                match html_interfaces::wrap_known(ctx, id, node, lumen_html::svg::local_name(name))
-                {
+        let value = {
+            let session = self.session.borrow();
+            let document = session.document();
+            let local = document
+                .element_name_parts(id)
+                .ok()
+                .map_or("", |(_, local)| local);
+            match document.kind(id) {
+                Ok(NodeKind::Document) => ctx.cached_instance(id, || DomDocument {
+                    base: node,
+                    realm: self.clone(),
+                    fonts: RefCell::new(None),
+                }),
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    ..
+                }) if custom_elements::is_fresh_custom_element_failure(self,id) => html_interfaces::wrap_unknown(ctx,id,node),
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    ..
+                }) => match html_interfaces::wrap_known(ctx, id, node, local) {
                     Ok(value) => value,
-                    Err(node) => match lumen_html::html::classify_html_element_name(
-                        lumen_html::svg::local_name(name),
-                    ) {
+                    Err(node) => match lumen_html::html::classify_html_element_name(local) {
                         lumen_html::html::HtmlElementNameKind::BuiltIn
                         | lumen_html::html::HtmlElementNameKind::Custom => {
                             ctx.cached_instance(id, || DomHtmlElement {
@@ -3496,51 +4557,56 @@ impl DomRealm {
                             html_interfaces::wrap_unknown(ctx, id, node)
                         }
                     },
-                }
-            }
-            Ok(NodeKind::Element { .. }) => ctx.cached_instance(id, || DomElement { base: node }),
-            Ok(NodeKind::Text(_)) => ctx.cached_instance(id, || DomText {
-                base: DomCharacterData { base: node },
-            }),
-            Ok(NodeKind::CData(_)) => ctx.cached_instance(id, || DomCDataSection {
-                base: DomText {
-                    base: DomCharacterData { base: node },
                 },
-            }),
-            Ok(NodeKind::Attribute { .. }) => {
-                ctx.cached_instance(id, || attributes::DomAttr { base: node })
-            }
-            Ok(NodeKind::ProcessingInstruction { .. }) => {
-                ctx.cached_instance(id, || DomProcessingInstruction {
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Svg,
+                    ..
+                }) => svg_interfaces::wrap(ctx, id, node, local),
+                Ok(NodeKind::Element {
+                    namespace: Namespace::MathMl,
+                    ..
+                }) => ctx.cached_instance(id, || DomMathMlElement {
+                    base: DomElement { base: node },
+                }),
+                Ok(NodeKind::Element { .. }) => {
+                    ctx.cached_instance(id, || DomElement { base: node })
+                }
+                Ok(NodeKind::Text(_)) => ctx.cached_instance(id, || DomText {
                     base: DomCharacterData { base: node },
-                })
+                }),
+                Ok(NodeKind::CData(_)) => ctx.cached_instance(id, || DomCDataSection {
+                    base: DomText {
+                        base: DomCharacterData { base: node },
+                    },
+                }),
+                Ok(NodeKind::Attribute { .. }) => {
+                    ctx.cached_instance(id, || attributes::DomAttr { base: node })
+                }
+                Ok(NodeKind::ProcessingInstruction { .. }) => {
+                    ctx.cached_instance(id, || DomProcessingInstruction {
+                        base: DomCharacterData { base: node },
+                    })
+                }
+                Ok(NodeKind::DocumentType(_)) => {
+                    ctx.cached_instance(id, || DomDocumentType { base: node })
+                }
+                Ok(NodeKind::Comment(_)) => ctx.cached_instance(id, || DomComment {
+                    base: DomCharacterData { base: node },
+                }),
+                Ok(NodeKind::DocumentFragment)
+                    if document.shadow_host(id).ok().flatten().is_some() =>
+                {
+                    ctx.cached_instance(id, || DomShadowRoot {
+                        base: DomDocumentFragment { base: node },
+                    })
+                }
+                Ok(NodeKind::DocumentFragment) => {
+                    ctx.cached_instance(id, || DomDocumentFragment { base: node })
+                }
+                _ => ctx.cached_instance(id, || node),
             }
-            Ok(NodeKind::DocumentType(_)) => {
-                ctx.cached_instance(id, || DomDocumentType { base: node })
-            }
-            Ok(NodeKind::Comment(_)) => ctx.cached_instance(id, || DomComment {
-                base: DomCharacterData { base: node },
-            }),
-            Ok(NodeKind::DocumentFragment)
-                if self
-                    .session
-                    .borrow()
-                    .document()
-                    .shadow_host(id)
-                    .ok()
-                    .flatten()
-                    .is_some() =>
-            {
-                ctx.cached_instance(id, || DomShadowRoot {
-                    base: DomDocumentFragment { base: node },
-                })
-            }
-            Ok(NodeKind::DocumentFragment) => {
-                ctx.cached_instance(id, || DomDocumentFragment { base: node })
-            }
-            _ => ctx.cached_instance(id, || node),
         };
-        ctx.set_native_identity_owner::<DomNode>(&value)
+        register_node_identity_owner(ctx, &value)
             .ok()
             .expect("DOM node wrapper has its native identity owner");
         let weak = ctx.weak_value(&value).expect("native node is an object");
@@ -3580,7 +4646,13 @@ fn html_parser_error(error: html::ParseError) -> OpError {
     } else {
         "InvalidStateError"
     };
-    OpError::new(name, error.message)
+    OpError::new(name, format!("{} at byte {}", error.message, error.offset))
+}
+
+fn xml_dom_error(error: lumen_html::xml::ParseError) -> OpError {
+    OpError::new(if error.message.contains("limit") || error.message.contains("too large") {
+        "QuotaExceededError"
+    } else { "SyntaxError" }, format!("{} at byte {}", error.message, error.offset))
 }
 
 fn adjacent_dom_insertion_point(
@@ -3618,7 +4690,8 @@ fn parse_dom_markup_fragment(
     context: NodeId,
     value: &str,
 ) -> OpResult<NodeId> {
-    if document.is_html_document() {
+    if document.is_html_document()
+    {
         html::parse_fragment_in(document, context, value).map_err(html_parser_error)
     } else {
         lumen_html::xml::parse_fragment_in(document, context, value).map_err(|error| {
@@ -3642,6 +4715,53 @@ fn dom_markup_error(ctx: &mut Ctx, error: OpError) -> OpError {
     }
 }
 
+fn capture_inserted_roots(realm: &DomRealm, roots: &[NodeId]) -> OpResult<Option<Vec<NodeId>>> {
+    let session = realm.session.borrow();
+    let document = session.document();
+    let mut has_fragment = false;
+    for &root in roots {
+        has_fragment |= matches!(
+            document.kind(root).map_err(dom_error)?,
+            NodeKind::DocumentFragment
+        );
+    }
+    if !has_fragment {
+        return Ok(None);
+    }
+    document.insertion_roots(roots).map(Some).map_err(dom_error)
+}
+
+fn upgrade_inserted_roots(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    roots: &[NodeId],
+    snapshot: Option<Vec<NodeId>>,
+) -> OpResult<()> {
+    let inserted = snapshot.as_deref().unwrap_or(roots);
+    for (index, &node) in inserted.iter().enumerate() {
+        if snapshot.is_none() && inserted[index + 1..].contains(&node) {
+            continue;
+        }
+        if realm.session.borrow().document().kind(node).is_ok() {
+            custom_elements::upgrade_cloned_or_parsed_subtree(ctx, realm, node)?;
+        }
+    }
+    Ok(())
+}
+
+fn option_roots_have_select_owner(
+    realm: &Rc<DomRealm>,
+    roots: &[NodeId],
+    select: NodeId,
+) -> OpResult<bool> {
+    for &root in roots {
+        if forms::option_subtree_has_select_owner(realm, root, select)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn insert_dom_node(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
@@ -3658,27 +4778,43 @@ fn insert_dom_node(
     } else {
         Some(ctx.with_instance::<DomNode, _>(&before, |node| node.id)?)
     };
-    let (source_has_options, preferred_source_option) =
-        forms::option_subtree_selection(&source, source_id)?;
-    let (source_select, source_is_fragment) = {
+    let different_owner = source.session.borrow().document().node_document(source_id).map_err(dom_error)? != realm.session.borrow().document().node_document(parent).map_err(dom_error)?;
+    if (!Rc::ptr_eq(realm, &source) || different_owner) && matches!(source.session.borrow().document().kind(source_id), Ok(NodeKind::DocumentFragment)) {
+        {
+            let target = realm.session.borrow();
+            let donor = source.session.borrow();
+            target.document().validate_insert_from(donor.document(), parent, source_id, reference).map_err(dom_error)?;
+        }
+        let (roots, _leases) = adopt_fragment_children(ctx, realm, parent, &source, source_id)?;
+        if roots.is_empty() { return Ok(child); }
+        let selectedness = capture_select_mutation(realm, parent, &roots, &[])?;
+        realm.session.borrow_mut().document_mut().insert_fragment_roots(parent, roots.clone(), reference).map_err(dom_error)?;
+        apply_select_mutation(realm, selectedness)?;
+        realm.invalidate_textarea_ancestor(parent);
+        upgrade_inserted_roots(ctx, realm, &roots, None)?;
+        realm.flush_script_activations(ctx)?;
+        return Ok(child);
+    }
+    let source_select = {
         let session = source.session.borrow();
         let document = session.document();
-        let old_select = if source_has_options {
-            match document.parent(source_id).map_err(dom_error)? {
-                Some(parent) => lumen_html::forms::select_ancestor(document, parent)
-                    .map_err(dom_error)?,
-                None => None,
+        match document.parent(source_id).map_err(dom_error)? {
+            Some(parent) => {
+                lumen_html::forms::select_ancestor(document, parent).map_err(dom_error)?
             }
-        } else {
-            None
-        };
-        let is_fragment = matches!(document.kind(source_id).map_err(dom_error)?, NodeKind::DocumentFragment);
-        (old_select, is_fragment)
+            None => None,
+        }
     };
+    let (
+        source_has_options,
+        source_has_unowned_options,
+        preferred_source_option,
+    ) =
+        forms::capture_option_subtree_selectedness(&source, source_id, source_select)?;
     let target_select = {
         let session = realm.session.borrow();
         let document = session.document();
-        if source_has_options {
+        if source_has_options || source_has_unowned_options {
             lumen_html::forms::select_ancestor(document, parent).map_err(dom_error)?
         } else {
             None
@@ -3687,7 +4823,9 @@ fn insert_dom_node(
 
     // Pre-insertion validity must precede adoption, preserving the donor
     // document and ownerDocument on a hierarchy/reference failure.
-    let id = if Rc::ptr_eq(realm, &source) {
+    let destination_owner = realm.session.borrow().document().node_document(parent).map_err(dom_error)?;
+    let source_owner = source.session.borrow().document().node_document(source_id).map_err(dom_error)?;
+    let id = if Rc::ptr_eq(realm, &source) && source_owner == destination_owner {
         // The ordinary insertion already validates before mutation. Avoid
         // an extra fragment walk/allocation on this common path.
         source_id
@@ -3700,41 +4838,248 @@ fn insert_dom_node(
                 .validate_insert_from(source_session.document(), parent, source_id, reference)
                 .map_err(dom_error)?;
         }
-        DomRealm::adopt_node_from_with_validation(
+        DomRealm::adopt_node_from_to_owner(
             realm,
             ctx,
             &source,
             source_id,
+            destination_owner,
             |target, donor| target.validate_insert_from(donor, parent, source_id, reference),
         )?
     };
+    // A fragment is drained by insertion; retain only its moved roots for
+    // upgrade reactions. Ordinary insertion needs no temporary collection.
+    let inserted = capture_inserted_roots(realm, &[id])?;
     realm
         .session
         .borrow_mut()
         .document_mut()
         .insert_before(parent, id, reference)
         .map_err(dom_error)?;
-    if let Some(select) = source_select {
-        forms::select_option_list_changed(&source, select)?;
+    if source_has_options && (!Rc::ptr_eq(realm, &source) || source_select != target_select) {
+        if let Some(select) = source_select {
+            forms::select_option_list_changed(&source, select)?;
+        }
     }
     if let Some(select) = target_select {
-        if !Rc::ptr_eq(realm, &source) || source_select != Some(select) {
+        let inserted_roots = inserted
+            .as_deref()
+            .unwrap_or_else(|| core::slice::from_ref(&id));
+        let target_has_options = option_roots_have_select_owner(realm, inserted_roots, select)?;
+        if target_has_options
+            && (!Rc::ptr_eq(realm, &source)
+                || source_select != Some(select)
+                || source_has_unowned_options)
+        {
             let preferred = if Rc::ptr_eq(realm, &source) {
                 preferred_source_option
-            } else if preferred_source_option == Some(source_id) {
-                Some(id)
-            } else if source_has_options && !source_is_fragment {
-                forms::selected_option_in_subtree(realm, id)?
             } else {
-                None
+                forms::selected_option_in_roots(realm, inserted_roots)?
             };
             forms::select_option_list_changed_with_preferred(realm, select, preferred)?;
+        } else if Rc::ptr_eq(realm, &source)
+            && target_select == source_select
+            && source_has_options
+            && !target_has_options
+        {
+            forms::select_option_list_changed(&source, select)?;
         }
     }
     realm.invalidate_textarea_ancestor(parent);
+    upgrade_inserted_roots(ctx, realm, &[id], inserted)?;
     realm.flush_script_activations(ctx)?;
     Ok(child)
 }
+
+/// DOM insert adopts the children, never the exclusive fragment itself.
+/// Shared leases protect all children across removal and adoption callbacks.
+fn adopt_fragment_children(ctx: &mut Ctx, target: &Rc<DomRealm>, parent: NodeId, source: &Rc<DomRealm>, fragment: NodeId) -> OpResult<(Vec<NodeId>, Vec<NodeRetention>)> {
+    let roots = source.session.borrow().document().insertion_roots(&[fragment]).map_err(dom_error)?;
+    let leases = roots.iter().map(|&id| NodeRetention::new(source, id)).collect();
+    let required = if Rc::ptr_eq(target, source) { 0 } else {
+        let donor = source.session.borrow();
+        roots.iter().try_fold(0usize, |total, &id| {
+            target.session.borrow().document().adoption_allocation_count_from(donor.document(), id)
+                .and_then(|count| total.checked_add(count).ok_or(Error::LimitExceeded))
+        }).map_err(dom_error)?
+    };
+    if source.template_graph_owners.borrow().is_empty() {
+        target.prepare_allocation(ctx, required)?;
+    } else {
+        template_graph::preflight_adoption_roots(ctx, source, &roots, target)?;
+    }
+    source.session.borrow_mut().document_mut().remove_fragment_children(fragment).map_err(dom_error)?;
+    let mut adopted = Vec::with_capacity(roots.len());
+    let owner = target.session.borrow().document().node_document(parent).map_err(dom_error)?;
+    for root in roots { adopted.push(DomRealm::adopt_node_from_to_owner(target, ctx, source, root, owner, |_, _| Ok(()))?); }
+    Ok((adopted, leases))
+}
+
+fn remove_dom_node(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<()> {
+        let _html_allocations = enter_html_allocation_category();
+        let parent = realm
+            .session
+            .borrow()
+            .document()
+            .parent(node)
+            .map_err(dom_error)?;
+        let affected_select = select_for_removed_option_subtree(&realm, node, parent)?;
+        realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .remove(node)
+            .map_err(dom_error)?;
+        if let Some(select) = affected_select {
+            forms::select_option_list_changed(&realm, select)?;
+        }
+        if let Some(parent) = parent {
+            realm.invalidate_textarea_ancestor(parent);
+        }
+        realm.reap_detached([node]);
+        Ok(())
+    }
+
+fn replace_dom_node(ctx: &mut Ctx, realm: &Rc<DomRealm>, parent: NodeId, new_child: Value, old_child: Value) -> OpResult<Value> {
+        let _html_allocations = enter_html_allocation_category();
+        // Extract only native identity here. Cross-document replacement can
+        // rebind the original wrapper in place during adoption, so no typed
+        // projection may stay borrowed across that operation.
+        let (new_realm, new_id) =
+            ctx.with_instance::<DomNode, _>(&new_child, |node| (node.realm.clone(), node.id))?;
+        let (old_realm, old_id) =
+            ctx.with_instance::<DomNode, _>(&old_child, |node| (node.realm.clone(), node.id))?;
+        if !Rc::ptr_eq(&old_realm, &realm)
+            || realm
+                .session
+                .borrow()
+                .document()
+                .parent(old_id)
+                .map_err(dom_error)?
+                != Some(parent)
+        {
+            return Err(OpError::new("NotFoundError", "node is not a child"));
+        }
+        let different_owner = new_realm.session.borrow().document().node_document(new_id).map_err(dom_error)? != realm.session.borrow().document().node_document(parent).map_err(dom_error)?;
+        if (!Rc::ptr_eq(realm, &new_realm) || different_owner) && matches!(new_realm.session.borrow().document().kind(new_id), Ok(NodeKind::DocumentFragment)) {
+            {
+                let target = realm.session.borrow();
+                let donor = new_realm.session.borrow();
+                target.document().validate_replace_from(donor.document(), old_id, new_id).map_err(dom_error)?;
+            }
+            let old_lease = NodeRetention::new(realm, old_id);
+            let old_selectedness = capture_select_mutation(realm, parent, &[], &[old_id])?;
+            let (roots, leases) = adopt_fragment_children(ctx, realm, parent, &new_realm, new_id)?;
+            let mut selectedness = capture_select_mutation(realm, parent, &roots, &[])?;
+            selectedness.normalize_target |= old_selectedness.normalize_target;
+            if selectedness.target_select.is_none() { selectedness.target_select = old_selectedness.target_select; }
+            for select in old_selectedness.source_selects {
+                if !selectedness.source_selects.contains(&select) { selectedness.source_selects.push(select); }
+            }
+            realm.session.borrow_mut().document_mut().replace_fragment_roots(old_id, roots.clone()).map_err(dom_error)?;
+            apply_select_mutation(realm, selectedness)?;
+            realm.invalidate_textarea_ancestor(parent);
+            realm.reap_detached([old_id]);
+            upgrade_inserted_roots(ctx, realm, &roots, None)?;
+            realm.flush_script_activations(ctx)?;
+            drop(leases);
+            drop(old_lease);
+            return Ok(old_child);
+        }
+        let source_select = {
+            let session = new_realm.session.borrow();
+            let document = session.document();
+            match document.parent(new_id).map_err(dom_error)? {
+                Some(parent) => {
+                    lumen_html::forms::select_ancestor(document, parent).map_err(dom_error)?
+                }
+                None => None,
+            }
+        };
+        let target_select = {
+            let session = realm.session.borrow();
+            lumen_html::forms::select_ancestor(session.document(), parent).map_err(dom_error)?
+        };
+
+        // Validate the complete replacement against both source and target
+        // documents before adoption detaches anything from the source tree.
+        if Rc::ptr_eq(&realm, &new_realm) {
+            let target = realm.session.borrow();
+            target
+                .document()
+                .validate_replace_from(target.document(), old_id, new_id)
+                .map_err(dom_error)?;
+        } else {
+            let target = realm.session.borrow();
+            let source = new_realm.session.borrow();
+            target
+                .document()
+                .validate_replace_from(source.document(), old_id, new_id)
+                .map_err(dom_error)?;
+        }
+
+        let (new_has_options, new_has_unowned_options, preferred_source_option) =
+            forms::capture_option_subtree_selectedness(
+                &new_realm,
+                new_id,
+                source_select,
+            )?;
+        let old_source_select =
+            select_for_removed_option_subtree(&realm, old_id, Some(parent))?;
+
+        let destination_owner = realm.session.borrow().document().node_document(parent).map_err(dom_error)?;
+        let source_owner = new_realm.session.borrow().document().node_document(new_id).map_err(dom_error)?;
+        let replacement_id = if Rc::ptr_eq(&realm, &new_realm) && source_owner == destination_owner {
+            new_id
+        } else {
+            DomRealm::adopt_node_from_to_owner(realm, ctx, &new_realm, new_id, destination_owner,
+                |target, donor| target.validate_replace_from(donor, old_id, new_id))?
+        };
+        let inserted = capture_inserted_roots(&realm, &[replacement_id])?;
+        realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .replace(old_id, replacement_id)
+            .map_err(dom_error)?;
+        if new_has_options
+            && (!Rc::ptr_eq(&realm, &new_realm) || source_select != target_select)
+        {
+            if let Some(select) = source_select {
+                forms::select_option_list_changed(&new_realm, select)?;
+            }
+        }
+        if let Some(select) = target_select {
+            let inserted_roots = inserted
+                .as_deref()
+                .unwrap_or_else(|| core::slice::from_ref(&replacement_id));
+            let new_options_entered_target =
+                option_roots_have_select_owner(&realm, inserted_roots, select)?;
+            let old_options_left_target = old_source_select == Some(select);
+            let new_options_changed_owner = new_options_entered_target
+                && (!Rc::ptr_eq(&realm, &new_realm)
+                    || source_select != Some(select)
+                    || new_has_unowned_options);
+            if old_options_left_target || new_options_changed_owner {
+                let preferred = if new_options_changed_owner {
+                    if Rc::ptr_eq(&realm, &new_realm) {
+                        preferred_source_option
+                    } else {
+                        forms::selected_option_in_roots(&realm, inserted_roots)?
+                    }
+                } else {
+                    None
+                };
+                forms::select_option_list_changed_with_preferred(&realm, select, preferred)?;
+            }
+        }
+        realm.invalidate_textarea_ancestor(parent);
+        upgrade_inserted_roots(ctx, &realm, &[replacement_id], inserted)?;
+        realm.flush_script_activations(ctx)?;
+        let removed = realm.wrap(ctx, old_id);
+        realm.reap_detached([old_id]);
+        Ok(removed)
+    }
 
 fn select_for_removed_option_subtree(
     realm: &DomRealm,
@@ -3746,17 +5091,21 @@ fn select_for_removed_option_subtree(
     };
     let session = realm.session.borrow();
     let document = session.document();
-    if !lumen_html::forms::subtree_contains_select_option(document, subtree).map_err(dom_error)? {
+    let source_select = lumen_html::forms::select_ancestor(document, parent).map_err(dom_error)?;
+    drop(session);
+    let Some(source_select) = source_select else {
         return Ok(None);
-    }
-    lumen_html::forms::select_ancestor(document, parent)
-        .map_err(dom_error)
+    };
+    let (contains_source_options, _, _) =
+        forms::capture_option_subtree_selectedness(realm, subtree, Some(source_select))?;
+    Ok(contains_source_options.then_some(source_select))
 }
 
 #[derive(Default)]
 struct SelectMutationSnapshot {
     source_selects: Vec<NodeId>,
     target_select: Option<NodeId>,
+    normalize_target: bool,
     preferred_option: Option<NodeId>,
 }
 
@@ -3766,74 +5115,96 @@ fn capture_select_mutation(
     inserted: &[NodeId],
     removed: &[NodeId],
 ) -> OpResult<SelectMutationSnapshot> {
-    let mut affected = false;
+    let target_select = {
+        let session = realm.session.borrow();
+        lumen_html::forms::select_ancestor(session.document(), parent).map_err(dom_error)?
+    };
     let mut source_selects = Vec::new();
+    let mut normalize_target = false;
     let mut preferred_option = None;
     for root in inserted.iter().copied() {
-        let (has_options, selected) = forms::option_subtree_selection(realm, root)?;
-        if !has_options {
-            continue;
-        }
-        affected = true;
-        if selected.is_some() {
-            preferred_option = selected;
-        }
         let source_select = {
             let session = realm.session.borrow();
             let document = session.document();
             document
                 .parent(root)
                 .map_err(dom_error)?
-                .map(|source_parent| {
-                    lumen_html::forms::select_ancestor(document, source_parent)
-                })
+                .map(|source_parent| lumen_html::forms::select_ancestor(document, source_parent))
                 .transpose()
                 .map_err(dom_error)?
                 .flatten()
         };
+        let (contains_source_options, contains_unowned_options, selected) =
+            forms::capture_option_subtree_selectedness(realm, root, source_select)?;
+        if !contains_source_options && !contains_unowned_options {
+            continue;
+        }
+        if target_select.is_some()
+            && (source_select != target_select || contains_unowned_options)
+        {
+            normalize_target = true;
+            if let Some(selected) = selected {
+                preferred_option = Some(selected);
+            }
+        }
+        if contains_source_options {
+            if let Some(source_select) = source_select {
+                if !source_selects.contains(&source_select) {
+                    source_selects.push(source_select);
+                }
+            }
+        }
+    }
+    for root in removed.iter().copied() {
+        let source_select = {
+            let session = realm.session.borrow();
+            let document = session.document();
+            document
+                .parent(root)
+                .map_err(dom_error)?
+                .map(|source_parent| lumen_html::forms::select_ancestor(document, source_parent))
+                .transpose()
+                .map_err(dom_error)?
+                .flatten()
+        };
+        let (contains_source_options, _, _) =
+            forms::capture_option_subtree_selectedness(realm, root, source_select)?;
+        if !contains_source_options {
+            continue;
+        }
+        if source_select == target_select && target_select.is_some() {
+            normalize_target = true;
+        }
         if let Some(source_select) = source_select {
             if !source_selects.contains(&source_select) {
                 source_selects.push(source_select);
             }
         }
     }
-    for root in removed.iter().copied() {
-        let session = realm.session.borrow();
-        if lumen_html::forms::subtree_contains_select_option(session.document(), root)
-            .map_err(dom_error)?
-        {
-            affected = true;
-            break;
-        }
-    }
-    if !affected {
+    if source_selects.is_empty() && !normalize_target {
         return Ok(SelectMutationSnapshot::default());
     }
-    let target_select = {
-        let session = realm.session.borrow();
-        lumen_html::forms::select_ancestor(session.document(), parent).map_err(dom_error)?
-    };
     source_selects.retain(|select| Some(*select) != target_select);
     Ok(SelectMutationSnapshot {
         source_selects,
         target_select,
+        normalize_target,
         preferred_option,
     })
 }
 
-fn apply_select_mutation(
-    realm: &Rc<DomRealm>,
-    mutation: SelectMutationSnapshot,
-) -> OpResult<()> {
+fn apply_select_mutation(realm: &Rc<DomRealm>, mutation: SelectMutationSnapshot) -> OpResult<()> {
     for select in mutation.source_selects {
         forms::select_option_list_changed(realm, select)?;
     }
-    if let Some(select) = mutation.target_select {
-        forms::select_option_list_changed_with_preferred(
-            realm,
-            select,
-            mutation.preferred_option,
-        )?;
+    if mutation.normalize_target {
+        if let Some(select) = mutation.target_select {
+            forms::select_option_list_changed_with_preferred(
+                realm,
+                select,
+                mutation.preferred_option,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3858,11 +5229,13 @@ fn tag_ns_collection_key(namespace_uri: Option<&str>, local_name: &str) -> Strin
 fn named_child(
     document: &lumen_html::Document,
     parent: NodeId,
-    wanted: &str,
+    wanted: &[&str],
 ) -> Result<Option<NodeId>, Error> {
     let mut child = document.first_child(parent)?;
     while let Some(id) = child {
-        if matches!(document.kind(id)?, NodeKind::Element { name, .. } if name == wanted) {
+        if lumen_html::forms::html_element_local_name(document, id)
+            .is_some_and(|local| wanted.contains(&local))
+        {
             return Ok(Some(id));
         }
         child = document.next_sibling(id)?;
@@ -3884,27 +5257,13 @@ fn namespace_for_qname(
     ctx: &mut Ctx,
     namespace_uri: Option<&str>,
     qualified_name: &str,
+    context: lumen_html::xml::DomNameContext,
 ) -> OpResult<Namespace> {
-    let Some((prefix, _local_name)) = lumen_html::xml::split_qname(qualified_name) else {
-        return Err(error_reporting::dom_exception(
-            ctx,
-            "InvalidCharacterError",
-            "qualified name is not a valid XML QName",
-        ));
-    };
-    let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
-    let xml_uri = "http://www.w3.org/XML/1998/namespace";
-    let xmlns_uri = "http://www.w3.org/2000/xmlns/";
-    if (!prefix.is_empty() && namespace_uri.is_none())
-        || (prefix == "xml" && namespace_uri != Some(xml_uri))
-        || ((qualified_name == "xmlns" || prefix == "xmlns") != (namespace_uri == Some(xmlns_uri)))
-    {
-        return Err(error_reporting::dom_exception(
-            ctx,
-            "NamespaceError",
-            "qualified name prefix and namespace URI do not match",
-        ));
-    }
+    lumen_html::xml::validate_dom_qualified_name(namespace_uri, qualified_name, context)
+        .map_err(|error| match error {
+            lumen_html::xml::DomNameError::InvalidCharacter => error_reporting::dom_exception(ctx, "InvalidCharacterError", "invalid qualified name"),
+            lumen_html::xml::DomNameError::Namespace => error_reporting::dom_exception(ctx, "NamespaceError", "qualified name prefix and namespace URI do not match"),
+        })?;
     Ok(namespace_from_uri(namespace_uri))
 }
 
@@ -3916,66 +5275,116 @@ fn html_element(document: &mut lumen_html::Document, name: &str) -> Result<NodeI
     })
 }
 
-fn converted_dom_nodes(
-    ctx: &mut Ctx,
-    realm: &Rc<DomRealm>,
-    values: Vec<Value>,
-) -> OpResult<(Vec<NodeId>, Vec<NodeId>)> {
-    enum Pending {
-        Node(NodeId),
-        Text(String),
-    }
-    let mut pending = Vec::with_capacity(values.len());
-    for value in values {
-        // `instance_data` only finds an exact native type. DOM nodes are
-        // almost always stored as a derived facade (Element, Text, ...), so
-        // inspect the projected Node base instead or WebIDL Node-or-DOMString
-        // methods silently stringify those nodes.
-        let node = ctx.with_instance::<DomNode, _>(&value, |node| (node.realm.clone(), node.id));
-        if let Ok((node_realm, id)) = node {
-            if !Rc::ptr_eq(realm, &node_realm) {
-                return Err(OpError::new(
-                    "WrongDocumentError",
-                    "nodes belong to different documents",
-                ));
-            }
-            pending.push(Pending::Node(id));
-        } else {
-            pending.push(Pending::Text(
-                ctx.coerce_string(&value)
-                    .map_err(OpError::thrown)?
-                    .to_string(),
-            ));
-        }
-    }
-    let mut nodes = Vec::with_capacity(pending.len());
-    let mut generated = Vec::new();
-    let mut session = realm.session.borrow_mut();
-    for pending in pending {
-        match pending {
-            Pending::Node(id) => nodes.push(id),
-            Pending::Text(text) => match session.document_mut().create(NodeKind::Text(text)) {
-                Ok(id) => {
-                    nodes.push(id);
-                    generated.push(id);
-                }
-                Err(error) => {
-                    for id in generated {
-                        let _ = session.document_mut().destroy_subtree(id);
-                    }
-                    return Err(dom_error(error));
-                }
-            },
-        }
-    }
-    Ok((nodes, generated))
+struct DomNodeIdentity {
+    value: Value,
+    _keep: NodeRetention,
+    // Transient conversion owner keeps the existing weak lease resolvable
+    // through a later argument's adoption/GC; it drops after the lease.
+    _source: Rc<DomRealm>,
 }
 
-fn discard_generated_dom_nodes(realm: &Rc<DomRealm>, nodes: &[NodeId]) {
-    let mut session = realm.session.borrow_mut();
-    for &id in nodes {
-        let _ = session.document_mut().destroy_subtree(id);
+struct ImportNodeOptions {
+    deep: bool,
+    registry: Option<Value>,
+}
+
+impl<'a> lumen_bind::FromArg<'a, lumen::embed::JsHost> for ImportNodeOptions {
+    fn from_arg(cx: &'a lumen::embed::ArgCx<'_>, value: &'a Value, _: lumen_bind::Slot) -> Result<Self, Value> {
+        cx.with_ctx(|ctx| {
+            if !matches!(value, Value::Obj(_) | Value::Null) {
+                return Ok(Self { deep: ctx.to_boolean(value), registry: None });
+            }
+            let registry = if matches!(value, Value::Null) { Value::Undefined } else { ctx.member_get(value, "customElementRegistry")? };
+            let registry = if matches!(registry, Value::Undefined) { None } else {
+                ctx.with_instance::<custom_elements::DomCustomElementRegistry, _>(&registry, |_| ()).map_err(|error| error.to_value(ctx))?;
+                Some(registry)
+            };
+            let self_only = if matches!(value, Value::Null) { Value::Undefined } else { ctx.member_get(value, "selfOnly")? };
+            Ok(Self { deep: !ctx.to_boolean(&self_only), registry })
+        })
     }
+}
+
+impl<'a> lumen_bind::FromArg<'a, lumen::embed::JsHost> for DomNodeIdentity {
+    fn from_arg(cx: &'a lumen::embed::ArgCx<'_>, value: &'a Value, _: lumen_bind::Slot) -> Result<Self, Value> {
+        cx.with_ctx(|ctx| {
+            let (realm, id) = ctx.with_instance::<DomNode, _>(value, |node| (node.realm.clone(), node.id)).map_err(|error| error.to_value(ctx))?;
+            Ok(Self { value: value.clone(), _keep: NodeRetention::new(&realm, id), _source: realm })
+        })
+    }
+}
+
+/// Owned Web IDL union conversion, completed before the CEReactions scope.
+/// A node's native payload can migrate during a later argument's ToString.
+/// Keep the actual wrapper and a shared lease, then project its current identity.
+enum NodeOrDOMString {
+    Node(DomNodeIdentity),
+    String(String),
+}
+
+impl lumen_bind::Elem for NodeOrDOMString {}
+
+impl<'a> lumen_bind::FromArg<'a, lumen::embed::JsHost> for NodeOrDOMString {
+    fn from_arg(cx: &'a lumen::embed::ArgCx<'_>, value: &'a Value, _: lumen_bind::Slot) -> Result<Self, Value> {
+        cx.with_ctx(|ctx| {
+            if let Ok((realm, id)) = ctx.with_instance::<DomNode, _>(value, |node| (node.realm.clone(), node.id)) {
+                Ok(Self::Node(DomNodeIdentity { value: value.clone(), _keep: NodeRetention::new(&realm, id), _source: realm }))
+            } else {
+                ctx.coerce_string(value).map(|text| Self::String(text.to_string()))
+            }
+        })
+    }
+}
+
+type ConvertedDomNode = DomNodeIdentity;
+
+/// DOM's convert-nodes-into-a-node algorithm. All strings become Text before
+/// any input node is moved; multiple inputs are appended sequentially to a
+/// real fragment, preserving intermediate removals/adoptions on later failure.
+fn converted_dom_node(ctx: &mut Ctx, owner: &DomNode, mut values: Vec<NodeOrDOMString>) -> OpResult<ConvertedDomNode> {
+    let _html_allocations = enter_html_allocation_category();
+    let text_count = values.iter().filter(|value| matches!(value, NodeOrDOMString::String(_))).count();
+    owner.realm.prepare_allocation(ctx, text_count + usize::from(values.len() != 1))?;
+    let node_document = owner.realm.session.borrow().document().node_document(owner.id).map_err(dom_error)?;
+    // Reuse the binding's argument allocation rather than build a second list.
+    for value in &mut values {
+        if let NodeOrDOMString::String(text) = value {
+            let id = {
+                let mut session = owner.realm.session.borrow_mut();
+                let document = session.document_mut();
+                let id = document.create(NodeKind::Text(core::mem::take(text))).map_err(dom_error)?;
+                document.set_node_document(id, node_document).map_err(dom_error)?;
+                id
+            };
+            *value = NodeOrDOMString::Node(DomNodeIdentity { value: owner.realm.wrap(ctx, id), _keep: NodeRetention::new(&owner.realm, id), _source: owner.realm.clone() });
+        }
+    }
+    if values.len() == 1 {
+        let NodeOrDOMString::Node(node) = values.pop().expect("singleton") else { unreachable!("converted strings") };
+        return Ok(node);
+    }
+    let fragment = {
+        let mut session = owner.realm.session.borrow_mut();
+        let document = session.document_mut();
+        let id = document.create(NodeKind::DocumentFragment).map_err(dom_error)?;
+        document.set_node_document(id, node_document).map_err(dom_error)?;
+        id
+    };
+    let converted = ConvertedDomNode { value: owner.realm.wrap(ctx, fragment), _keep: NodeRetention::new(&owner.realm, fragment), _source: owner.realm.clone() };
+    for node in values {
+        let NodeOrDOMString::Node(node) = node else { unreachable!("converted strings") };
+        insert_dom_node(ctx, &owner.realm, fragment, node.value.clone(), Value::Null)?;
+    }
+    Ok(converted)
+}
+
+fn variadic_contains_node(ctx: &mut Ctx, values: &[NodeOrDOMString], realm: &Rc<DomRealm>, id: NodeId) -> OpResult<bool> {
+    for value in values {
+        if let NodeOrDOMString::Node(node) = value {
+            if ctx.with_instance::<DomNode, _>(&node.value, |node| Rc::ptr_eq(&node.realm, realm) && node.id == id)? { return Ok(true); }
+        }
+    }
+    Ok(false)
 }
 
 #[lumen_bind::class(name = "DOMImplementation", hint(js(webidl)))]
@@ -4045,10 +5454,11 @@ impl DomImplementation {
         public_id: &str,
         system_id: &str,
     ) -> OpResult<Value> {
-        if !lumen_html::xml::is_xml_name(qualified_name) {
-            return Err(OpError::new(
+        if !lumen_html::xml::is_valid_doctype_name(qualified_name) {
+            return Err(error_reporting::dom_exception(
+                ctx,
                 "InvalidCharacterError",
-                "document type name is not a valid XML Name",
+                "invalid document type name",
             ));
         }
         let mut session = self.realm.session.borrow_mut();
@@ -4083,7 +5493,7 @@ impl DomImplementation {
         };
         let element_namespace = match qualified_name.as_deref() {
             None | Some("") => None,
-            Some(name) => Some(namespace_for_qname(ctx, namespace_uri, name)?),
+            Some(name) => Some(namespace_for_qname(ctx, namespace_uri, name, lumen_html::xml::DomNameContext::Element)?),
         };
         let content_type = match namespace_uri {
             Some("http://www.w3.org/1999/xhtml") => "application/xhtml+xml",
@@ -4253,41 +5663,272 @@ fn element_scroll(
     }
 }
 
+impl DomElement {
+    fn offset_left(&self) -> OpResult<f64> {
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.offset_left)),
+        )
+    }
+
+    fn offset_top(&self) -> OpResult<f64> {
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.offset_top)),
+        )
+    }
+
+    fn offset_width(&self) -> OpResult<f64> {
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.offset_width)),
+        )
+    }
+
+    fn offset_height(&self) -> OpResult<f64> {
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.offset_height)),
+        )
+    }
+
+    fn offset_parent(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.realm.flush_layout()?;
+        let parent = geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+            .and_then(|geometry| geometry.offset_parent);
+        Ok(self.base.realm.wrap_option(ctx, parent))
+    }
+}
+
+#[lumen_bind::class(name = "MathMLElement", extends = DomElement, hint(js(webidl)))]
+pub(crate) struct DomMathMlElement {
+    base: DomElement,
+}
+event_content_handlers::bind_namespace_handlers! { DomMathMlElement {
+    #[getter]
+    fn dataset(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        dataset::for_element(ctx, &self.base.base)
+    }
+
+    #[getter]
+    fn nonce(&self)->OpResult<String> {self.base.base.cryptographic_nonce()}
+    #[setter(coerce)]
+    fn set_nonce(&self,value:&str)->OpResult<()> {self.base.base.set_cryptographic_nonce(value)}
+
+
+    #[getter]
+    fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.base.style(ctx, this)
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_style(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_style(value)
+    }
+} }
+
 #[lumen_bind::class(name = "Element", extends = DomNode, hint(js(webidl)))]
 pub struct DomElement {
     base: DomNode,
 }
-#[lumen_bind::methods]
-impl DomElement {
+custom_elements::bind_element_aria! {
     #[getter]
-    fn ontoggle(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.handler_value(ctx, &this.0, "toggle")
-    }
-
-    #[setter]
-    fn set_ontoggle(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base.base.set_handler(ctx, &this.0, "toggle", callback);
+    fn custom_element_registry(&self, ctx: &mut Ctx) -> Value {
+        custom_elements::registry_value_for_node(ctx,&self.base.realm,self.base.id)
     }
 
     #[getter]
-    fn onclick(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.handler_value(ctx, &this.0, "click")
+    fn assigned_slot(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.assigned_slot(ctx)
     }
 
-    #[setter]
-    fn set_onclick(
+    #[getter]
+    fn previous_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.previous_element_sibling(ctx)
+    }
+
+    #[getter]
+    fn next_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.next_element_sibling(ctx)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn before(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.before(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn after(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.after(ctx, nodes)
+    }
+
+    #[method(name = "replaceWith", hint(js(ce_reactions)))]
+    fn replace_with(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_with(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn remove(&self) -> OpResult<()> {
+        self.base.remove()
+    }
+
+    #[getter]
+    fn children(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.children(ctx, this)
+    }
+
+    #[getter]
+    fn first_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.first_element_child(ctx)
+    }
+
+    #[getter]
+    fn last_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.last_element_child(ctx)
+    }
+
+    #[getter]
+    fn child_element_count(&self) -> OpResult<u32> {
+        self.base.child_element_count()
+    }
+
+    #[method(coerce)]
+    fn query_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        self.base.query_selector(ctx, query)
+    }
+
+    #[method(coerce)]
+    fn query_selector_all(
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base.base.set_handler(ctx, &this.0, "click", callback);
+        query: &str,
+    ) -> OpResult<DomNodeList> {
+        self.base.query_selector_all(ctx, this, query)
     }
+
+    #[method(hint(js(ce_reactions)))]
+    fn append(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.append(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn prepend(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.prepend(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn replace_children(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_children(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn move_before(&self, ctx: &mut Ctx, node: Value, child: Value) -> OpResult<()> {
+        self.base.move_before(ctx, node, child)
+    }
+
+    #[getter(name = "namespaceURI")]
+    fn namespace_uri(&self) -> OpResult<Nullable<String>> {
+        self.base.namespace_uri()
+    }
+
+    #[getter]
+    fn local_name(&self) -> OpResult<String> {
+        self.base.local_name().map(|name| name.unwrap_or_default())
+    }
+
+    #[getter]
+    fn prefix(&self) -> OpResult<Nullable<String>> {
+        self.base.prefix()
+    }
+
+    #[getter]
+    fn tag_name(&self) -> OpResult<String> {
+        self.base.tag_name()
+    }
+
+    #[getter]
+    fn id(&self) -> OpResult<String> {
+        self.base.id()
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_id(&self, value: &str) -> OpResult<()> {
+        self.base.set_id(value)
+    }
+
+    #[getter]
+    fn class_name(&self) -> OpResult<String> {
+        self.base.class_name()
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_class_name(&self, value: &str) -> OpResult<()> {
+        self.base.set_class_name(value)
+    }
+
+    #[getter]
+    fn class_list(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.class_list(ctx, this)
+    }
+
+    #[setter]
+    fn set_class_list(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        // Web IDL PutForwards=value reads the live property, including an author override,
+        // then lets the target's value setter perform any conversion and CE reactions.
+        let target = ctx.member_get(&this.0, "classList").map_err(OpError::thrown)?;
+        if ctx.object_addr(&target).is_none() {
+            return Err(OpError::type_error("classList forwarding target must be an object"));
+        }
+        ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
+        Ok(())
+    }
+
+    #[getter(name = "innerHTML")]
+    fn inner_html(&self, ctx: &mut Ctx) -> OpResult<String> {
+        self.base.inner_html(ctx)
+    }
+
+    #[setter(name = "innerHTML", coerce, hint(js(ce_reactions)))]
+    fn set_inner_html(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
+        self.base.set_inner_html(ctx, value)
+    }
+
+    #[method(coerce)]
+    fn matches(&self, ctx: &mut Ctx, query: &str) -> OpResult<bool> {
+        self.base.matches(ctx, query)
+    }
+
+    #[method(name = "webkitMatchesSelector", coerce)]
+    fn webkit_matches_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<bool> {
+        self.base.webkit_matches_selector(ctx, query)
+    }
+
+    #[method(coerce)]
+    fn closest(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        self.base.closest(ctx, query)
+    }
+
+    #[method(name = "getHTML")]
+    fn get_html(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<String> {
+        shadow::get_html(ctx, &self.base, options)
+    }
+
+    #[method(name = "setHTMLUnsafe", coerce, hint(js(ce_reactions)))]
+    fn set_html_unsafe(&self, ctx: &mut Ctx, value: &str, options: Option<Value>) -> OpResult<()> {
+        let run_scripts = shadow::html_unsafe_options(ctx, options, true)?;
+        self.base.replace_markup(ctx, value, true, run_scripts)
+    }
+
+
+
+
+
+
 
     #[method(name = "getElementsByTagName", coerce)]
     fn get_elements_by_tag_name(
@@ -4337,6 +5978,63 @@ impl DomElement {
             .descendant_collection(ctx, this.0, key, DescendantFilter::Class(names))
     }
 
+    #[method(coerce)]
+    fn get_attribute(&self, name: &str) -> OpResult<Nullable<String>> {
+        self.base.get_attribute(name)
+    }
+
+    #[method(coerce)]
+    fn has_attribute(&self, name: &str) -> OpResult<bool> {
+        self.base.has_attribute(name)
+    }
+
+    #[method(coerce, hint(js(ce_reactions)))]
+    fn set_attribute(&self, ctx: &mut Ctx, name: &str, value: &str) -> OpResult<()> {
+        self.base.set_attribute(ctx, name, value)
+    }
+
+    #[method(coerce, hint(js(ce_reactions)))]
+    fn remove_attribute(&self, ctx: &mut Ctx, name: &str) -> OpResult<()> {
+        self.base.remove_attribute(ctx, name)
+    }
+
+    #[method(name = "getAttributeNS", coerce)]
+    fn get_attribute_ns(
+        &self,
+        namespace_uri: Option<&str>,
+        local_name: &str,
+    ) -> OpResult<Nullable<String>> {
+        self.base.get_attribute_ns(namespace_uri, local_name)
+    }
+
+    #[method(name = "hasAttributeNS", coerce)]
+    fn has_attribute_ns(&self, namespace_uri: Option<&str>, local_name: &str) -> OpResult<bool> {
+        self.base.has_attribute_ns(namespace_uri, local_name)
+    }
+
+    #[method(name = "setAttributeNS", coerce, hint(js(ce_reactions)))]
+    fn set_attribute_ns(
+        &self,
+        ctx: &mut Ctx,
+        namespace_uri: Option<&str>,
+        qualified_name: &str,
+        value: &str,
+    ) -> OpResult<()> {
+        self.base
+            .set_attribute_ns(ctx, namespace_uri, qualified_name, value)
+    }
+
+    #[method(name = "removeAttributeNS", coerce, hint(js(ce_reactions)))]
+    fn remove_attribute_ns(
+        &self,
+        ctx: &mut Ctx,
+        namespace_uri: Option<&str>,
+        local_name: &str,
+    ) -> OpResult<()> {
+        self.base
+            .remove_attribute_ns(ctx, namespace_uri, local_name)
+    }
+
     #[method(name = "getAttributeNames")]
     fn get_attribute_names(&self) -> OpResult<Vec<String>> {
         let session = self.base.realm.session.borrow();
@@ -4351,7 +6049,7 @@ impl DomElement {
             .collect())
     }
 
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn toggle_attribute(&self, ctx: &mut Ctx, name: &str, force: Option<bool>) -> OpResult<bool> {
         let name = self.base.normalized_attribute_name(name);
         if !lumen_html::xml::is_valid_attribute_local_name(name.as_ref()) {
@@ -4433,7 +6131,7 @@ impl DomElement {
         attributes::get_attribute_node_ns(ctx, &self.base, namespace_uri, local_name)
     }
 
-    #[method(name = "setAttributeNode")]
+    #[method(name = "setAttributeNode", hint(js(ce_reactions)))]
     fn set_attribute_node(
         &self,
         ctx: &mut Ctx,
@@ -4442,7 +6140,7 @@ impl DomElement {
         attributes::set_attribute_node(ctx, &self.base, attribute, false)
     }
 
-    #[method(name = "setAttributeNodeNS")]
+    #[method(name = "setAttributeNodeNS", hint(js(ce_reactions)))]
     fn set_attribute_node_ns(
         &self,
         ctx: &mut Ctx,
@@ -4451,7 +6149,7 @@ impl DomElement {
         attributes::set_attribute_node(ctx, &self.base, attribute, true)
     }
 
-    #[method(name = "removeAttributeNode")]
+    #[method(name = "removeAttributeNode", hint(js(ce_reactions)))]
     fn remove_attribute_node(
         &self,
         ctx: &mut Ctx,
@@ -4527,42 +6225,6 @@ impl DomElement {
     }
 
     #[getter]
-    fn offset_left(&self) -> OpResult<f64> {
-        self.base.realm.flush_layout()?;
-        Ok(
-            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
-                .map_or(0.0, |geometry| f64::from(geometry.offset_left)),
-        )
-    }
-
-    #[getter]
-    fn offset_top(&self) -> OpResult<f64> {
-        self.base.realm.flush_layout()?;
-        Ok(
-            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
-                .map_or(0.0, |geometry| f64::from(geometry.offset_top)),
-        )
-    }
-
-    #[getter]
-    fn offset_width(&self) -> OpResult<f64> {
-        self.base.realm.flush_layout()?;
-        Ok(
-            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
-                .map_or(0.0, |geometry| f64::from(geometry.offset_width)),
-        )
-    }
-
-    #[getter]
-    fn offset_height(&self) -> OpResult<f64> {
-        self.base.realm.flush_layout()?;
-        Ok(
-            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
-                .map_or(0.0, |geometry| f64::from(geometry.offset_height)),
-        )
-    }
-
-    #[getter]
     fn client_width(&self) -> OpResult<f64> {
         self.base.realm.flush_layout()?;
         Ok(
@@ -4624,15 +6286,7 @@ impl DomElement {
         scrolling::position(&self.base.realm, node).map(|position| position.1)
     }
 
-    #[getter]
-    fn offset_parent(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        self.base.realm.flush_layout()?;
-        let parent = geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
-            .and_then(|geometry| geometry.offset_parent);
-        Ok(self.base.realm.wrap_option(ctx, parent))
-    }
-
-    #[setter]
+    #[setter(coerce)]
     fn set_scroll_left(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> {
         let Some(node) = scrolling::element_scroll_target(
             &self.base.realm,
@@ -4653,7 +6307,7 @@ impl DomElement {
         )
     }
 
-    #[setter]
+    #[setter(coerce)]
     fn set_scroll_top(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> {
         let Some(node) = scrolling::element_scroll_target(
             &self.base.realm,
@@ -4703,6 +6357,8 @@ impl DomElement {
 
     fn attach_shadow(&self, ctx: &mut Ctx, options: Value) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
+        let owner=self.base.realm.session.borrow().document().node_document(self.base.id).map_err(dom_error)?;
+        let registry=custom_elements::registry_option(ctx,&self.base.realm,owner,Some(&options))?;
         let mode = match ctx
             .get_member(&options, "mode")
             .map_err(|_| OpError::new("TypeError", "shadow mode is required"))?
@@ -4744,6 +6400,7 @@ impl DomElement {
             clonable: boolean_option(ctx, "clonable")?,
             serializable: boolean_option(ctx, "serializable")?,
             declarative: false,
+            keep_custom_element_registry_null: false,
         };
         let root = self
             .base
@@ -4759,6 +6416,8 @@ impl DomElement {
                     dom_error(error)
                 }
             })?;
+        custom_elements::associate_created(&self.base.realm,root,registry)?;
+        custom_elements::note_shadow_attachment(&self.base.realm, self.base.id, root)?;
         Ok(self.base.realm.wrap(ctx, root))
     }
     #[getter]
@@ -4779,7 +6438,7 @@ impl DomElement {
     fn slot(&self) -> OpResult<String> {
         Ok(self.base.get_null_attribute("slot")?.unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_slot(&self, value: &str) -> OpResult<()> {
         self.base.set_attribute_core("slot", value)
     }
@@ -4789,21 +6448,21 @@ impl DomElement {
         self.base.outer_html()
     }
 
-    #[setter(name = "outerHTML", coerce)]
-    fn set_outer_html(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    #[setter(name = "outerHTML", coerce, hint(js(ce_reactions)))]
+    fn set_outer_html(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
         self.base
-            .replace_outer_html(ctx, value)
+            .replace_outer_html(ctx, value.0)
             .map_err(|error| dom_markup_error(ctx, error))
     }
 
-    #[method(name = "insertAdjacentHTML", coerce)]
+    #[method(name = "insertAdjacentHTML", coerce, hint(js(ce_reactions)))]
     fn insert_adjacent_html(&self, ctx: &mut Ctx, position: &str, value: &str) -> OpResult<()> {
         self.base
             .insert_adjacent_markup(ctx, position, value)
             .map_err(|error| dom_markup_error(ctx, error))
     }
 
-    #[method(name = "insertAdjacentElement", coerce)]
+    #[method(name = "insertAdjacentElement", coerce, hint(js(ce_reactions)))]
     fn insert_adjacent_element(
         &self,
         ctx: &mut Ctx,
@@ -4824,7 +6483,7 @@ impl DomElement {
         insert_dom_node(ctx, &self.base.realm, parent, element, before)
     }
 
-    #[method(name = "insertAdjacentText", coerce)]
+    #[method(name = "insertAdjacentText", coerce, hint(js(ce_reactions)))]
     fn insert_adjacent_text(&self, ctx: &mut Ctx, position: &str, value: &str) -> OpResult<()> {
         let _html_allocations = enter_html_allocation_category();
         let point = {
@@ -4835,6 +6494,7 @@ impl DomElement {
         let Some((parent, before)) = point else {
             return Ok(());
         };
+        self.base.realm.prepare_allocation(ctx, 1)?;
         let mut session = self.base.realm.session.borrow_mut();
         let document = session.document_mut();
         let text = document
@@ -4848,11 +6508,27 @@ impl DomElement {
         self.base.realm.invalidate_textarea_ancestor(parent);
         self.base.realm.flush_script_activations(ctx)
     }
+
 }
 
 #[lumen_bind::class(name = "HTMLElement", extends = DomElement, hint(js(webidl)))]
 pub struct DomHtmlElement {
     base: DomElement,
+}
+
+/// Web IDL HTMLElement conversion without retaining a native borrow across
+/// adoption, which must be able to rebind the original wrapper in place.
+struct HtmlElementIdentity {
+    realm: Rc<DomRealm>,
+    id: NodeId,
+}
+
+impl<'a> lumen_bind::FromArg<'a, lumen::embed::JsHost> for HtmlElementIdentity {
+    fn from_arg(cx: &'a lumen::embed::ArgCx<'_>, value: &'a Value, _: lumen_bind::Slot) -> Result<Self, Value> {
+        cx.with_ctx(|ctx| ctx.with_instance::<DomHtmlElement, _>(value, |element| Self {
+            realm: element.base.base.realm.clone(), id: element.base.base.id,
+        }).map_err(|error| error.to_value(ctx)))
+    }
 }
 #[lumen_bind::class(name = "DOMStringMap", hint(js(webidl)))]
 pub struct DomDomStringMap {}
@@ -4864,19 +6540,43 @@ pub struct DomHtmlHtmlElement {
     base: DomHtmlElement,
 }
 #[lumen_bind::methods]
-impl DomHtmlHtmlElement {}
+impl DomHtmlHtmlElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+}
 #[lumen_bind::class(name = "HTMLHeadElement", extends = DomHtmlElement, hint(js(webidl)))]
 pub struct DomHtmlHeadElement {
     base: DomHtmlElement,
 }
 #[lumen_bind::methods]
-impl DomHtmlHeadElement {}
+impl DomHtmlHeadElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+}
 #[lumen_bind::class(name = "HTMLDivElement", extends = DomHtmlElement, hint(js(webidl)))]
 pub struct DomHtmlDivElement {
     base: DomHtmlElement,
 }
 #[lumen_bind::methods]
 impl DomHtmlDivElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
     #[getter]
     fn align(&self) -> OpResult<String> {
         Ok(self
@@ -4887,7 +6587,7 @@ impl DomHtmlDivElement {
             .0
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_align(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("align", value)
     }
@@ -4898,6 +6598,14 @@ pub struct DomHtmlBrElement {
 }
 #[lumen_bind::methods]
 impl DomHtmlBrElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
     #[getter]
     fn clear(&self) -> OpResult<String> {
         Ok(self
@@ -4908,7 +6616,7 @@ impl DomHtmlBrElement {
             .0
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_clear(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("clear", value)
     }
@@ -4917,50 +6625,47 @@ impl DomHtmlBrElement {
 pub struct DomHtmlBodyElement {
     base: DomHtmlElement,
 }
-#[lumen_bind::methods]
-impl DomHtmlBodyElement {
-    #[getter]
-    fn onload(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        event_content_handlers::window_handler_value(ctx, &self.base.base.base.realm, "load")
+event_content_handlers::bind_body_handlers! { DomHtmlBodyElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
-    #[setter]
-    fn set_onload(&self, ctx: &mut Ctx, callback: Option<lumen::embed::JsFunction>) {
-        event_content_handlers::set_window_handler(
-            ctx,
-            &self.base.base.base.realm,
-            "load",
-            callback,
-        );
-    }
 
-    #[getter]
-    fn onerror(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        event_content_handlers::window_handler_value(ctx, &self.base.base.base.realm, "error")
-    }
 
-    #[setter]
-    fn set_onerror(&self, ctx: &mut Ctx, callback: Option<lumen::embed::JsFunction>) {
-        event_content_handlers::set_window_handler(
-            ctx,
-            &self.base.base.base.realm,
-            "error",
-            callback,
-        );
-    }
-}
+
+} }
 #[lumen_bind::class(name = "HTMLTitleElement", extends = DomHtmlElement, hint(js(webidl)))]
 pub struct DomHtmlTitleElement {
     base: DomHtmlElement,
 }
 #[lumen_bind::methods]
-impl DomHtmlTitleElement {}
+impl DomHtmlTitleElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+}
 #[lumen_bind::class(name = "HTMLBaseElement", extends = DomHtmlElement, hint(js(webidl)))]
 pub struct DomHtmlBaseElement {
     base: DomHtmlElement,
 }
 #[lumen_bind::methods]
 impl DomHtmlBaseElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
     #[getter]
     fn href(&self) -> OpResult<String> {
         let node = &self.base.base.base;
@@ -4975,7 +6680,7 @@ impl DomHtmlBaseElement {
             .unwrap_or(href))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_href(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("href", value)
     }
@@ -4990,7 +6695,7 @@ impl DomHtmlBaseElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_target(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("target", value)
     }
@@ -5001,19 +6706,116 @@ pub struct DomHtmlLinkElement {
 }
 #[lumen_bind::methods]
 impl DomHtmlLinkElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
+    #[getter(name="relList")]
+    fn rel_list(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->Value {
+        self.base.base.base.token_list(ctx,this.0,"relList","rel",Some(&["stylesheet"]))
+    }
+    #[setter(name="relList",coerce,hint(js(ce_reactions)))]
+    fn set_rel_list(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("rel",value)}
+    #[getter]
+    fn blocking(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->Value {
+        self.base.base.base.token_list(ctx,this.0,"blocking","blocking",Some(&["render"]))
+    }
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_blocking(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("blocking",value)}
+    #[getter]
+    fn sheet(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value> {
+        let node=&self.base.base.base;
+        crate::cssom::style_element_sheet(ctx,&node.realm,node.id,this.0)
+    }
+
+    #[getter(name = "rel")]
+    fn rel(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("rel")?.unwrap_or_default()) }
+    #[setter(name = "rel", coerce, hint(js(ce_reactions)))]
+    fn set_rel(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("rel", value) }
+    #[getter(name="as")]
+    fn as_(&self)->OpResult<String> {
+        let value=self.base.base.base.get_null_attribute("as")?.unwrap_or_default().to_ascii_lowercase();
+        Ok(if matches!(value.as_str(),"audio"|"document"|"embed"|"fetch"|"font"|"image"|"object"|"script"|"style"|"track"|"video"|"worker") {value}else{String::new()})
+    }
+    #[setter(name="as",coerce,hint(js(ce_reactions)))]
+    fn set_as(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("as",value)}
+    #[getter(name = "media")]
+    fn media(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("media")?.unwrap_or_default()) }
+    #[setter(name = "media", coerce, hint(js(ce_reactions)))]
+    fn set_media(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("media", value) }
+    #[getter(name = "type")]
+    fn type_(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default()) }
+    #[setter(name = "type", coerce, hint(js(ce_reactions)))]
+    fn set_type_(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("type", value) }
+    #[getter(name = "charset")]
+    fn charset(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("charset")?.unwrap_or_default()) }
+    #[setter(name = "charset", coerce, hint(js(ce_reactions)))]
+    fn set_charset(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("charset", value) }
+    #[getter(name = "integrity")]
+    fn integrity(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("integrity")?.unwrap_or_default()) }
+    #[setter(name = "integrity", coerce, hint(js(ce_reactions)))]
+    fn set_integrity(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("integrity", value) }
+    #[getter(name = "hreflang")]
+    fn hreflang(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("hreflang")?.unwrap_or_default()) }
+    #[setter(name = "hreflang", coerce, hint(js(ce_reactions)))]
+    fn set_hreflang(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("hreflang", value) }
+    #[getter]
+    fn disabled(&self) -> OpResult<bool> { Ok(self.base.base.base.get_null_attribute("disabled")?.is_some()) }
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_disabled(&self, disabled: bool) -> OpResult<()> {
+        let node=&self.base.base.base;
+        if disabled { node.set_attribute_core("disabled", "") }
+        else {
+            let (owner,id)=node.realm.resolve_adopted_node(node.id);
+            owner.stylesheet_links.explicitly_enable(id)?;
+            node.remove_attribute_core("disabled")?;
+            let loaded=owner.session.borrow().link_stylesheet_state(id);
+            if let Some(state)=loaded {owner.update_stylesheet_applicability(id,state.origin_clean)?;}
+            Ok(())
+        }
+    }
+    #[getter(name = "crossOrigin")]
+    fn cross_origin(&self) -> OpResult<Nullable<String>> {
+        Ok(Nullable(self.base.base.base.get_null_attribute("crossorigin")?.map(|value|
+            if value.eq_ignore_ascii_case("use-credentials") {"use-credentials".into()} else {"anonymous".into()})))
+    }
+    #[setter(name = "crossOrigin", coerce, hint(js(ce_reactions)))]
+    fn set_cross_origin(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("crossorigin",value) }
+    #[getter(name = "referrerPolicy")]
+    fn referrer_policy(&self)->OpResult<String> {
+        Ok(self.base.base.base.get_null_attribute("referrerpolicy")?
+            .and_then(|value|lumen_common::referrer::ReferrerPolicy::parse(&value)).map_or(String::new(),|value|value.name().into()))
+    }
+    #[setter(name = "referrerPolicy", coerce, hint(js(ce_reactions)))]
+    fn set_referrer_policy(&self,value:&str)->OpResult<()> { self.base.base.base.set_attribute_core("referrerpolicy",value) }
+    #[getter(name = "fetchPriority")]
+    fn fetch_priority(&self)->OpResult<String> {
+        Ok(match self.base.base.base.get_null_attribute("fetchpriority")?.as_deref() {
+            Some(value) if value.eq_ignore_ascii_case("high")=>"high",
+            Some(value) if value.eq_ignore_ascii_case("low")=>"low",
+            _=>"auto",
+        }.into())
+    }
+    #[setter(name = "fetchPriority", coerce, hint(js(ce_reactions)))]
+    fn set_fetch_priority(&self,value:&str)->OpResult<()> { self.base.base.base.set_attribute_core("fetchpriority",value) }
     #[getter]
     fn href(&self) -> OpResult<String> {
         let node = &self.base.base.base;
         let Some(href) = node.get_null_attribute("href")? else {
             return Ok(String::new());
         };
-        let base = node.realm.base_url();
+        let (owner,_) = node.realm.resolve_adopted_node(node.id);
+        let base = owner.base_url();
         Ok(lumen_common::url::parse(&href, Some(&base))
             .map(|url| url.href())
             .unwrap_or(href))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_href(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("href", value)
     }
@@ -5024,14 +6826,22 @@ pub struct DomHtmlScriptElement {
 }
 #[lumen_bind::methods]
 impl DomHtmlScriptElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
     #[method(coerce)]
     fn supports(ctx: &mut Ctx, script_type: &str) -> bool {
         match script_type {
             "classic" => true,
             "module" => realm_services::RealmServices::<ScriptCapabilities>::current(ctx)
                 .is_some_and(|capabilities| capabilities.modules.get()),
-            // Import-map preparation is incomplete and speculation-rule execution
-            // is absent. Recognizing their type attributes is not support.
+            "importmap" => true,
+            // Speculation-rule execution is not implemented.
             _ => false,
         }
     }
@@ -5042,7 +6852,7 @@ impl DomHtmlScriptElement {
         Ok(node.realm.scripts.borrow().force_async(node.id) || node.has_null_attribute("async")?)
     }
 
-    #[setter(name = "async", coerce)]
+    #[setter(name = "async", coerce, hint(js(ce_reactions)))]
     fn set_async(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         node.realm.scripts.borrow_mut().clear_force_async(node.id);
@@ -5058,7 +6868,7 @@ impl DomHtmlScriptElement {
         self.base.base.base.has_null_attribute("defer")
     }
 
-    #[setter(name = "defer", coerce)]
+    #[setter(name = "defer", coerce, hint(js(ce_reactions)))]
     fn set_defer(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if value {
@@ -5073,7 +6883,7 @@ impl DomHtmlScriptElement {
         self.base.base.base.has_null_attribute("nomodule")
     }
 
-    #[setter(name = "noModule", coerce)]
+    #[setter(name = "noModule", coerce, hint(js(ce_reactions)))]
     fn set_no_module(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if value {
@@ -5093,7 +6903,7 @@ impl DomHtmlScriptElement {
             .unwrap_or_default())
     }
 
-    #[setter(name = "type", coerce)]
+    #[setter(name = "type", coerce, hint(js(ce_reactions)))]
     fn set_type(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("type", value)?;
         self.base.base.base.realm.flush_script_activations(ctx)
@@ -5111,7 +6921,7 @@ impl DomHtmlScriptElement {
             .unwrap_or(source))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_src(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("src", value)?;
         self.base.base.base.realm.flush_script_activations(ctx)
@@ -5126,7 +6936,7 @@ impl DomHtmlScriptElement {
         ))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_text(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         self.base.base.base.set_text_content(ctx, value)
     }
@@ -5145,71 +6955,65 @@ impl DomHtmlImageElement {
     fn image_snapshot(&self) -> image_loading::ImageSnapshot {
         let node = self.image_node();
         let base = node.realm.base_url();
+        let _=node.realm.prepare_image_selection(&base);
+        let scheme=node.realm.embedding_color_scheme(node.id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
         let snapshot = {
             let session = node.realm.session.borrow();
-            node.realm
-                .images
-                .snapshot(session.document(), node.id, &base)
+            node.realm.images.snapshot(session.document(),node.id,&base,scheme)
         };
         let _ = node.realm.sync_image_bitmaps();
         snapshot
     }
 }
 
-#[lumen_bind::methods]
-impl DomHtmlImageElement {
-    /// The legacy `Image(width, height)` factory uses the same native class as
-    /// queried and `createElement("img")` elements, preserving node identity.
-    #[constructor]
-    fn new(
-        ctx: &mut Ctx,
-        #[default(0)] width: u32,
-        #[default(0)] height: u32,
-    ) -> OpResult<NodeConstructorResult<Self>> {
-        let global = ctx.global_object();
-        let document_value = ctx
-            .get_member(&global, "document")
-            .map_err(|_| OpError::new("TypeError", "Image has no active document"))?;
-        let realm = ctx
-            .with_instance::<DomDocument, _>(&document_value, |document| document.realm.clone())
-            .map_err(|_| OpError::new("TypeError", "Image has no active document"))?;
-        let id = realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .create(NodeKind::Element {
-                namespace: Namespace::Html,
-                name: "img".into(),
-                attributes: Vec::new(),
-            })
-            .map_err(dom_error)?;
-        if width != 0 {
-            realm
-                .session
-                .borrow_mut()
-                .document_mut()
-                .set_attribute(id, "width", &width.to_string())
-                .map_err(dom_error)?;
-        }
-        if height != 0 {
-            realm
-                .session
-                .borrow_mut()
-                .document_mut()
-                .set_attribute(id, "height", &height.to_string())
-                .map_err(dom_error)?;
-        }
-        let node = DomNode {
-            base: DomEventTarget::node(&realm, id),
-            realm: realm.clone(),
-            id,
-            collections: RefCell::new(HashMap::new()),
-        };
-        Ok(NodeConstructorResult::new(node, |base| Self {
+fn legacy_image_factory(
+    ctx: &mut Ctx,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> OpResult<NodeConstructorResult<DomHtmlImageElement>> {
+    let realm = window_globals::current_dom_realm(ctx)
+        .ok_or_else(|| OpError::new("TypeError", "Image has no active document"))?;
+    realm.prepare_allocation(ctx, 1)?;
+    let mut attributes = Vec::new();
+    if let Some(width) = width {
+        attributes.push(("width".into(), width.to_string()));
+    }
+    if let Some(height) = height {
+        attributes.push(("height".into(), height.to_string()));
+    }
+    let id = realm
+        .session
+        .borrow_mut()
+        .document_mut()
+        .create(NodeKind::Element {
+            namespace: Namespace::Html,
+            name: "img".into(),
+            attributes,
+        })
+        .map_err(dom_error)?;
+    let node = DomNode {
+        base: DomEventTarget::node(&realm, id),
+        realm: realm.clone(),
+        id,
+        collections: RefCell::new(HashMap::new()),
+    };
+    Ok(NodeConstructorResult::new(node, |base| {
+        DomHtmlImageElement {
             base: DomHtmlElement {
                 base: DomElement { base },
             },
-        }))
+        }
+    }))
+}
+
+#[lumen_bind::methods]
+impl DomHtmlImageElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
     #[getter]
@@ -5227,7 +7031,7 @@ impl DomHtmlImageElement {
         })
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_src(&self, source: &str) -> OpResult<()> {
         self.image_node().set_attribute_core("src", source)
     }
@@ -5244,7 +7048,7 @@ impl DomHtmlImageElement {
         })))
     }
 
-    #[setter(rename(js = "crossOrigin"), coerce)]
+    #[setter(rename(js = "crossOrigin"), coerce, hint(js(ce_reactions)))]
     fn set_cross_origin(&self, value: &str) -> OpResult<()> {
         self.image_node().set_attribute_core("crossorigin", value)
     }
@@ -5278,7 +7082,7 @@ impl DomHtmlImageElement {
         }
     }
 
-    #[setter]
+    #[setter(hint(js(ce_reactions)))]
     fn set_width(&self, width: u32) -> OpResult<()> {
         self.image_node()
             .set_attribute_core("width", &width.to_string())
@@ -5293,7 +7097,7 @@ impl DomHtmlImageElement {
         }
     }
 
-    #[setter]
+    #[setter(hint(js(ce_reactions)))]
     fn set_height(&self, height: u32) -> OpResult<()> {
         self.image_node()
             .set_attribute_core("height", &height.to_string())
@@ -5309,11 +7113,11 @@ impl DomHtmlImageElement {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
         self.image_node()
             .base
-            .set_handler(ctx, &this.0, "load", callback);
+            .set_event_handler(ctx, &this.0, "load", callback);
     }
 
     #[getter]
@@ -5326,11 +7130,11 @@ impl DomHtmlImageElement {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
         self.image_node()
             .base
-            .set_handler(ctx, &this.0, "error", callback);
+            .set_event_handler(ctx, &this.0, "error", callback);
     }
 }
 #[lumen_bind::class(name = "HTMLIFrameElement", extends = DomHtmlElement, hint(js(webidl)))]
@@ -5357,7 +7161,7 @@ impl DomIFrameElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }
@@ -5374,7 +7178,7 @@ impl DomIFrameElement {
             .unwrap_or(source))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_src(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("src", value)
     }
@@ -5389,7 +7193,18 @@ impl DomIFrameElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[getter(rename(js = "referrerPolicy"))]
+    fn referrer_policy(&self) -> OpResult<String> {
+        Ok(self.base.base.base.get_null_attribute("referrerpolicy")?
+            .and_then(|value| lumen_common::referrer::ReferrerPolicy::parse(&value))
+            .map_or(String::new(), |policy| policy.name().to_owned()))
+    }
+    #[setter(coerce, rename(js = "referrerPolicy"), hint(js(ce_reactions)))]
+    fn set_referrer_policy(&self, value: &str) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("referrerpolicy", value)
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_srcdoc(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("srcdoc", value)
     }
@@ -5446,6 +7261,34 @@ impl DomStyleElement {
         custom_elements::construct_customized_element(ctx, this.0, "style")
     }
     #[getter]
+    fn media(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("media")?.unwrap_or_default())}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_media(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("media",value)}
+    #[getter(name="type")]
+    fn type_(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())}
+    #[setter(name="type",coerce,hint(js(ce_reactions)))]
+    fn set_type_(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("type",value)}
+    #[getter]
+    fn blocking(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->Value {
+        self.base.base.base.token_list(ctx,this.0,"blocking","blocking",Some(&["render"]))
+    }
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_blocking(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("blocking",value)}
+    #[getter]
+    fn disabled(&self,ctx:&mut Ctx)->OpResult<bool> {
+        let node=&self.base.base.base;let (owner,id)=node.realm.resolve_adopted_node(node.id);
+        if !owner.ensure_inline_stylesheet(ctx,id)? {return Ok(false)}
+        let disabled=owner.session.borrow().stylesheet_disabled(id);Ok(disabled)
+    }
+    #[setter(coerce)]
+    fn set_disabled(&self,ctx:&mut Ctx,value:bool)->OpResult<()> {
+        let node=&self.base.base.base;let (owner,id)=node.realm.resolve_adopted_node(node.id);
+        if !owner.ensure_inline_stylesheet(ctx,id)? {return Ok(())}
+        owner.stylesheet_links.set_sheet_disabled(id,value)?;
+        let result=owner.session.borrow_mut().set_stylesheet_disabled(id,value)
+            .map_err(|error|OpError::new("InvalidStateError",format!("inline stylesheet disable: {error:?}")));result
+    }
+    #[getter]
     fn sheet(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
         cssom::style_element_sheet(
             ctx,
@@ -5477,12 +7320,20 @@ impl DomFormElement {
 
     #[getter(name = "acceptCharset")]
     fn accept_charset(&self) -> OpResult<String> {
-        Ok(self.base.base.base.get_null_attribute("accept-charset")?.unwrap_or_default())
+        Ok(self
+            .base
+            .base
+            .base
+            .get_null_attribute("accept-charset")?
+            .unwrap_or_default())
     }
 
-    #[setter(name = "acceptCharset", coerce)]
+    #[setter(name = "acceptCharset", coerce, hint(js(ce_reactions)))]
     fn set_accept_charset(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("accept-charset", value)
+        self.base
+            .base
+            .base
+            .set_attribute_core("accept-charset", value)
     }
 
     #[getter]
@@ -5490,29 +7341,39 @@ impl DomFormElement {
         html_interfaces::action_attribute_value(&self.base.base.base, "action")
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_action(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("action", value)
     }
 
     #[getter]
     fn method(&self) -> OpResult<String> {
-        let value = self.base.base.base.get_null_attribute("method")?.unwrap_or_default();
+        let value = self
+            .base
+            .base
+            .base
+            .get_null_attribute("method")?
+            .unwrap_or_default();
         Ok(lumen_html::forms::normalized_form_method(&value).into())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_method(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("method", value)
     }
 
     #[getter]
     fn enctype(&self) -> OpResult<String> {
-        let value = self.base.base.base.get_null_attribute("enctype")?.unwrap_or_default();
+        let value = self
+            .base
+            .base
+            .base
+            .get_null_attribute("enctype")?
+            .unwrap_or_default();
         Ok(lumen_html::forms::normalized_form_enctype(&value).into())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_enctype(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("enctype", value)
     }
@@ -5522,17 +7383,22 @@ impl DomFormElement {
         self.enctype()
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_encoding(&self, value: &str) -> OpResult<()> {
         self.set_enctype(value)
     }
 
     #[getter]
     fn target(&self) -> OpResult<String> {
-        Ok(self.base.base.base.get_null_attribute("target")?.unwrap_or_default())
+        Ok(self
+            .base
+            .base
+            .base
+            .get_null_attribute("target")?
+            .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_target(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("target", value)
     }
@@ -5542,7 +7408,7 @@ impl DomFormElement {
         self.base.base.base.has_null_attribute("novalidate")
     }
 
-    #[setter(name = "noValidate", coerce)]
+    #[setter(name = "noValidate", coerce, hint(js(ce_reactions)))]
     fn set_no_validate(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if value {
@@ -5554,13 +7420,26 @@ impl DomFormElement {
 
     #[getter]
     fn autocomplete(&self) -> OpResult<String> {
-        let value = self.base.base.base.get_null_attribute("autocomplete")?.unwrap_or_default();
-        Ok(if value.eq_ignore_ascii_case("off") { "off" } else { "on" }.into())
+        let value = self
+            .base
+            .base
+            .base
+            .get_null_attribute("autocomplete")?
+            .unwrap_or_default();
+        Ok(if value.eq_ignore_ascii_case("off") {
+            "off"
+        } else {
+            "on"
+        }
+        .into())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_autocomplete(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("autocomplete", value)
+        self.base
+            .base
+            .base
+            .set_attribute_core("autocomplete", value)
     }
 
     #[getter]
@@ -5573,7 +7452,7 @@ impl DomFormElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }
@@ -5638,6 +7517,7 @@ impl DomFormElement {
                 base: DomNodeList::form_elements(node.realm.clone(), node.id, this.0.clone()),
             },
         });
+        ctx.set_native_identity_owner::<DomHtmlCollection>(&value).ok().expect("form collection identity owner");
         node.collections.borrow_mut().insert(
             "elements".into(),
             ctx.weak_value(&value).expect("form elements collection"),
@@ -5658,13 +7538,13 @@ impl DomFormElement {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
         self.base
             .base
             .base
             .base
-            .set_handler(ctx, &this.0, "submit", callback);
+            .set_event_handler(ctx, &this.0, "submit", callback);
     }
 
     #[getter]
@@ -5681,13 +7561,13 @@ impl DomFormElement {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
         self.base
             .base
             .base
             .base
-            .set_handler(ctx, &this.0, "reset", callback);
+            .set_event_handler(ctx, &this.0, "reset", callback);
     }
 
     fn submit(&self, ctx: &mut Ctx) -> OpResult<()> {
@@ -5728,6 +7608,7 @@ impl DomFormElement {
         Ok(())
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn reset(&self, ctx: &mut Ctx) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::reset_form(ctx, &node.realm, node.id, &node.realm.forms)?;
@@ -5752,12 +7633,21 @@ pub struct DomDetailsElement {
 
 #[lumen_bind::methods]
 impl DomDetailsElement {
+    #[constructor]
+    fn new(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+    ) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+
     #[getter]
+    #[method(hint(js(ce_reactions)))]
     fn open(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("open")
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_open(&self, open: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if open {
@@ -5773,23 +7663,7 @@ pub struct DomInputElement {
     base: DomHtmlElement,
 }
 
-/// Web IDL's `[LegacyNullToEmptyString]` conversion for form-control values.
-struct LegacyNullToEmptyString(String);
-
-impl<'a> lumen_bind::FromArg<'a, lumen::embed::JsHost> for LegacyNullToEmptyString {
-    fn from_arg(
-        cx: &'a <lumen::embed::JsHost as lumen_bind::Host>::Cx<'_>,
-        value: &'a Value,
-        at: lumen_bind::Slot,
-    ) -> Result<Self, Value> {
-        if matches!(value, Value::Null) {
-            Ok(Self(String::new()))
-        } else {
-            <String as lumen_bind::FromArg<'a, lumen::embed::JsHost>>::from_arg(cx, value, at)
-                .map(Self)
-        }
-    }
-}
+use lumen_host::webidl::LegacyNullToEmptyString;
 
 #[lumen_bind::class(name = "HTMLSelectElement", extends = DomHtmlElement, hint(js(webidl)))]
 pub struct DomSelectElement {
@@ -5861,7 +7735,7 @@ impl DomHtmlOptionsCollection {
         forms::select_option_named_item(ctx, &self.realm, self.select, name)
     }
 
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn add(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
@@ -5885,7 +7759,7 @@ impl DomHtmlOptionsCollection {
         lumen_html::forms::select_option_count(session.document(), select).map_err(dom_error)
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_length(&self, length: u32) -> OpResult<()> {
         forms::set_select_options_length(&self.realm, self.select, length)
     }
@@ -5901,7 +7775,7 @@ impl DomHtmlOptionsCollection {
         Ok(option.map_or(Value::Undefined, |id| realm.wrap(ctx, id)))
     }
 
-    #[proto(setitem)]
+    #[proto(setitem, hint(js(ce_reactions)))]
     fn set_index(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
@@ -5911,13 +7785,7 @@ impl DomHtmlOptionsCollection {
         let (realm, select) = ctx.with_instance::<Self, _>(&this.0, |collection| {
             (collection.realm.clone(), collection.select)
         })?;
-        forms::set_select_option_at(
-            ctx,
-            &realm,
-            select,
-            index,
-            option.map(JsObject::into_value),
-        )
+        forms::set_select_option_at(ctx, &realm, select, index, option.map(JsObject::into_value))
     }
 
     #[getter]
@@ -5925,7 +7793,7 @@ impl DomHtmlOptionsCollection {
         Ok(forms::selected_index(&self.realm, self.select)? as i32)
     }
 
-    #[setter]
+    #[setter(hint(js(ce_reactions)))]
     fn set_selected_index(&self, index: i32) -> OpResult<()> {
         forms::set_select_selected_index(
             &self.realm,
@@ -5938,6 +7806,19 @@ impl DomHtmlOptionsCollection {
 
 #[lumen_bind::methods]
 impl DomSelectElement {
+    #[getter]
+    fn size(&self) -> OpResult<u32> {
+        Ok(lumen_html::forms::reflected_unsigned_long(
+            self.base.base.base.get_null_attribute("size")?.as_deref(), 0,
+        ))
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_size(&self, value: u32) -> OpResult<()> {
+        let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, 0);
+        self.base.base.base.set_attribute_core("size", &value.to_string())
+    }
+
     #[getter]
     fn labels(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
         let node = &self.base.base.base;
@@ -5953,7 +7834,7 @@ impl DomSelectElement {
             .get_null_attribute("name")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }
@@ -5983,6 +7864,7 @@ impl DomSelectElement {
             realm: node.realm.clone(),
             select: node.id,
         });
+        ctx.set_native_identity_owner::<DomHtmlCollection>(&collection).ok().expect("options collection identity owner");
         node.collections.borrow_mut().insert(
             "options".into(),
             ctx.weak_value(&collection).expect("options collection"),
@@ -5996,7 +7878,7 @@ impl DomSelectElement {
         let session = realm.session.borrow();
         lumen_html::forms::select_option_count(session.document(), select).map_err(dom_error)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_length(&self, length: u32) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::set_select_options_length(&node.realm, node.id, length)
@@ -6032,7 +7914,7 @@ impl DomSelectElement {
     fn multiple(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("multiple")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_multiple(&self, multiple: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if multiple {
@@ -6045,7 +7927,7 @@ impl DomSelectElement {
     fn required(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("required")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_required(&self, required: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if required {
@@ -6065,9 +7947,7 @@ impl DomSelectElement {
         {
             return value;
         }
-        let collection = ctx.new_instance(DomHtmlCollection {
-            base: DomNodeList::selected_options(node.realm.clone(), node.id, this.0),
-        });
+        let collection = DomHtmlCollection::create(ctx, DomNodeList::selected_options(node.realm.clone(), node.id, this.0));
         node.collections.borrow_mut().insert(
             "selectedOptions".into(),
             ctx.weak_value(&collection)
@@ -6079,7 +7959,7 @@ impl DomSelectElement {
     fn value(&self) -> OpResult<String> {
         forms::control_value(&self.base.base.base.realm, self.base.base.base.id)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_value(&self, value: &str) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::set_control_value(
@@ -6098,7 +7978,7 @@ impl DomSelectElement {
     fn selected_index(&self) -> OpResult<i32> {
         Ok(forms::selected_index(&self.base.base.base.realm, self.base.base.base.id)? as i32)
     }
-    #[setter]
+    #[setter(hint(js(ce_reactions)))]
     fn set_selected_index(&self, index: i32) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::set_select_selected_index(
@@ -6109,7 +7989,7 @@ impl DomSelectElement {
         )
     }
 
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn add(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
@@ -6143,7 +8023,7 @@ impl DomOptionElement {
         lumen_html::forms::option_text(node.realm.session.borrow().document(), node.id)
             .map_err(dom_error)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_text(ctx: &mut Ctx, this: lumen_bind::This<Value>, text: &str) -> OpResult<()> {
         let (realm, id) = ctx.with_instance::<Self, _>(&this.0, |option| {
             let node = &option.base.base.base;
@@ -6158,7 +8038,7 @@ impl DomOptionElement {
             None => self.text(),
         }
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_label(&self, label: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("label", label)
     }
@@ -6189,7 +8069,7 @@ impl DomOptionElement {
         )
         .ok_or_else(|| OpError::new("TypeError", "option value is unavailable"))
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_value(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("value", value)
     }
@@ -6197,7 +8077,7 @@ impl DomOptionElement {
     fn selected(&self) -> bool {
         forms::option_selected(&self.base.base.base.realm, self.base.base.base.id)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_selected(&self, selected: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::set_option_selected(
@@ -6211,7 +8091,7 @@ impl DomOptionElement {
     fn default_selected(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("selected")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_default_selected(&self, selected: bool) -> OpResult<()> {
         if selected {
             self.base.base.base.set_attribute_core("selected", "")
@@ -6226,7 +8106,7 @@ pub struct DomTextAreaElement {
     base: DomHtmlElement,
 }
 
-fn textarea_length_attribute(node: &DomNode, name: &str) -> OpResult<i32> {
+fn text_control_length_attribute(node: &DomNode, name: &str) -> OpResult<i32> {
     let Some(value) = node.get_null_attribute(name)? else {
         return Ok(-1);
     };
@@ -6235,7 +8115,7 @@ fn textarea_length_attribute(node: &DomNode, name: &str) -> OpResult<i32> {
         .unwrap_or(-1))
 }
 
-fn set_textarea_length_attribute(
+fn set_text_control_length_attribute(
     ctx: &mut Ctx,
     node: &DomNode,
     name: &str,
@@ -6245,7 +8125,7 @@ fn set_textarea_length_attribute(
         return Err(error_reporting::dom_exception(
             ctx,
             "IndexSizeError",
-            "textarea length constraints cannot be negative",
+            "text control length constraints cannot be negative",
         ));
     }
     node.set_attribute_core(name, &value.to_string())
@@ -6277,7 +8157,7 @@ impl DomTextAreaElement {
             .get_null_attribute("name")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }
@@ -6292,7 +8172,7 @@ impl DomTextAreaElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_dir_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("dirname", value)
     }
@@ -6309,17 +8189,17 @@ impl DomTextAreaElement {
         let node = &self.base.base.base;
         forms::control_value(&node.realm, node.id)
     }
-    #[setter(coerce)]
-    fn set_value(&self, value: LegacyNullToEmptyString) -> OpResult<()> {
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_value(&self, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
         let node = &self.base.base.base;
         node.realm
-            .set_control_value_and_selection(node.id, &value.0, true)
+            .set_control_value_and_selection(node.id, value.0, true)
     }
     #[getter]
     fn required(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("required")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_required(&self, required: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if required {
@@ -6340,19 +8220,19 @@ impl DomTextAreaElement {
     }
     #[getter(name = "maxLength")]
     fn max_length(&self) -> OpResult<i32> {
-        textarea_length_attribute(&self.base.base.base, "maxlength")
+        text_control_length_attribute(&self.base.base.base, "maxlength")
     }
-    #[setter(name = "maxLength", coerce)]
+    #[setter(name = "maxLength", coerce, hint(js(ce_reactions)))]
     fn set_max_length(&self, ctx: &mut Ctx, value: i32) -> OpResult<()> {
-        set_textarea_length_attribute(ctx, &self.base.base.base, "maxlength", value)
+        set_text_control_length_attribute(ctx, &self.base.base.base, "maxlength", value)
     }
     #[getter(name = "minLength")]
     fn min_length(&self) -> OpResult<i32> {
-        textarea_length_attribute(&self.base.base.base, "minlength")
+        text_control_length_attribute(&self.base.base.base, "minlength")
     }
-    #[setter(name = "minLength", coerce)]
+    #[setter(name = "minLength", coerce, hint(js(ce_reactions)))]
     fn set_min_length(&self, ctx: &mut Ctx, value: i32) -> OpResult<()> {
-        set_textarea_length_attribute(ctx, &self.base.base.base, "minlength", value)
+        set_text_control_length_attribute(ctx, &self.base.base.base, "minlength", value)
     }
     #[getter]
     fn placeholder(&self) -> OpResult<String> {
@@ -6363,7 +8243,7 @@ impl DomTextAreaElement {
             .get_null_attribute("placeholder")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_placeholder(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("placeholder", value)
     }
@@ -6371,7 +8251,7 @@ impl DomTextAreaElement {
     fn read_only(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("readonly")
     }
-    #[setter(name = "readOnly", coerce)]
+    #[setter(name = "readOnly", coerce, hint(js(ce_reactions)))]
     fn set_read_only(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if value {
@@ -6384,28 +8264,36 @@ impl DomTextAreaElement {
     fn rows(&self) -> OpResult<u32> {
         textarea_size_attribute(&self.base.base.base, "rows", 2)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_rows(&self, value: u32) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("rows", &value.to_string())
+        self.base
+            .base
+            .base
+            .set_attribute_core("rows", &value.to_string())
     }
     #[getter]
     fn cols(&self) -> OpResult<u32> {
         textarea_size_attribute(&self.base.base.base, "cols", 20)
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_cols(&self, value: u32) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("cols", &value.to_string())
+        self.base
+            .base
+            .base
+            .set_attribute_core("cols", &value.to_string())
     }
     #[getter]
     fn wrap(&self) -> OpResult<&'static str> {
         let value = self.base.base.base.get_null_attribute("wrap")?;
-        Ok(if value.is_some_and(|value| value.eq_ignore_ascii_case("hard")) {
-            "hard"
-        } else {
-            "soft"
-        })
+        Ok(
+            if value.is_some_and(|value| value.eq_ignore_ascii_case("hard")) {
+                "hard"
+            } else {
+                "soft"
+            },
+        )
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_wrap(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("wrap", value)
     }
@@ -6417,7 +8305,7 @@ impl DomTextAreaElement {
         )
         .ok_or_else(|| OpError::new("TypeError", "textarea defaultValue is unavailable"))
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_default_value(&self, value: &str) -> OpResult<()> {
         let node = &self.base.base.base;
         forms::set_textarea_default_value(
@@ -6435,11 +8323,36 @@ impl DomTextAreaElement {
 }
 #[lumen_bind::methods]
 impl DomInputElement {
+    #[getter(name = "popoverTargetElement")]
+    fn popover_target_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get(ctx, this.0, "popovertarget") }
+    #[setter(name = "popoverTargetElement", hint(js(ce_reactions)))]
+    fn set_popover_target_element(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> { element_reflection::set(ctx, this.0, "popovertarget", value) }
+    #[getter(name = "popoverTargetAction")]
+    fn popover_target_action(&self) -> OpResult<String> { invokers::reflected_popover_action(&self.base.base.base) }
+    #[setter(name = "popoverTargetAction", coerce, hint(js(ce_reactions)))]
+    fn set_popover_target_action(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("popovertargetaction", value) }
+    #[getter(name = "maxLength")]
+    fn max_length(&self) -> OpResult<i32> {
+        text_control_length_attribute(&self.base.base.base, "maxlength")
+    }
+    #[setter(name = "maxLength", coerce, hint(js(ce_reactions)))]
+    fn set_max_length(&self, ctx: &mut Ctx, value: i32) -> OpResult<()> {
+        set_text_control_length_attribute(ctx, &self.base.base.base, "maxlength", value)
+    }
+    #[getter(name = "minLength")]
+    fn min_length(&self) -> OpResult<i32> {
+        text_control_length_attribute(&self.base.base.base, "minlength")
+    }
+    #[setter(name = "minLength", coerce, hint(js(ce_reactions)))]
+    fn set_min_length(&self, ctx: &mut Ctx, value: i32) -> OpResult<()> {
+        set_text_control_length_attribute(ctx, &self.base.base.base, "minlength", value)
+    }
+
     #[getter]
     fn read_only(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("readonly")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_read_only(&self, read_only: bool) -> OpResult<()> {
         if read_only {
             self.base.base.base.set_attribute_core("readonly", "")
@@ -6474,7 +8387,7 @@ impl DomInputElement {
             .unwrap_or_default())
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_dir_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("dirname", value)
     }
@@ -6495,7 +8408,7 @@ impl DomInputElement {
             .get_null_attribute("type")?
             .unwrap_or_else(|| "text".into()))
     }
-    #[setter(name = "type", coerce)]
+    #[setter(name = "type", coerce, hint(js(ce_reactions)))]
     fn set_input_type(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("type", value)
     }
@@ -6508,7 +8421,7 @@ impl DomInputElement {
             .get_null_attribute("name")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }
@@ -6516,7 +8429,7 @@ impl DomInputElement {
     fn required(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("required")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_required(&self, required: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if required {
@@ -6534,7 +8447,7 @@ impl DomInputElement {
             .get_null_attribute("pattern")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_pattern(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("pattern", value)
     }
@@ -6547,7 +8460,7 @@ impl DomInputElement {
             .get_null_attribute("placeholder")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_placeholder(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("placeholder", value)
     }
@@ -6555,7 +8468,7 @@ impl DomInputElement {
     fn default_checked(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("checked")
     }
-    #[setter(name = "defaultChecked", coerce)]
+    #[setter(name = "defaultChecked", coerce, hint(js(ce_reactions)))]
     fn set_default_checked(&self, checked: bool) -> OpResult<()> {
         if checked {
             self.base.base.base.set_attribute_core("checked", "")
@@ -6572,7 +8485,7 @@ impl DomInputElement {
             .get_null_attribute("value")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_default_value(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("value", value)
     }
@@ -6585,7 +8498,7 @@ impl DomInputElement {
             .get_null_attribute("min")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_min(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("min", value)
     }
@@ -6598,7 +8511,7 @@ impl DomInputElement {
             .get_null_attribute("max")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_max(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("max", value)
     }
@@ -6611,7 +8524,7 @@ impl DomInputElement {
             .get_null_attribute("step")?
             .unwrap_or_default())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_step(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("step", value)
     }
@@ -6619,9 +8532,9 @@ impl DomInputElement {
     fn value(&self) -> OpResult<String> {
         forms::control_value(&self.base.base.base.realm, self.base.base.base.id)
     }
-    #[setter(coerce)]
-    fn set_value(&self, value: LegacyNullToEmptyString) -> OpResult<()> {
-        self.base.set_value(&value.0)
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_value(&self, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
+        self.base.set_value(value.0)
     }
     #[getter]
     fn value_as_number(&self) -> OpResult<f64> {
@@ -6646,9 +8559,7 @@ impl DomInputElement {
                 None
             }
         };
-        Ok(milliseconds.map_or(Value::Null, |milliseconds| {
-            ctx.new_date_value(milliseconds)
-        }))
+        Ok(milliseconds.map_or(Value::Null, |milliseconds| ctx.new_date_value(milliseconds)))
     }
     #[setter(coerce)]
     fn set_value_as_date(&self, ctx: &mut Ctx, value: Option<JsObject>) -> OpResult<()> {
@@ -6741,7 +8652,7 @@ impl DomInputElement {
     fn form_action(&self) -> OpResult<String> {
         html_interfaces::form_action_value(&self.base.base.base)
     }
-    #[setter(name = "formAction", coerce)]
+    #[setter(name = "formAction", coerce, hint(js(ce_reactions)))]
     fn set_form_action(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("formaction", value)
     }
@@ -6749,7 +8660,7 @@ impl DomInputElement {
     fn form_enctype(&self) -> OpResult<String> {
         html_interfaces::form_enctype_value(&self.base.base.base)
     }
-    #[setter(name = "formEnctype", coerce)]
+    #[setter(name = "formEnctype", coerce, hint(js(ce_reactions)))]
     fn set_form_enctype(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("formenctype", value)
     }
@@ -6757,7 +8668,7 @@ impl DomInputElement {
     fn form_method(&self) -> OpResult<String> {
         html_interfaces::form_method_value(&self.base.base.base)
     }
-    #[setter(name = "formMethod", coerce)]
+    #[setter(name = "formMethod", coerce, hint(js(ce_reactions)))]
     fn set_form_method(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("formmethod", value)
     }
@@ -6765,7 +8676,7 @@ impl DomInputElement {
     fn form_no_validate(&self) -> OpResult<bool> {
         self.base.base.base.has_null_attribute("formnovalidate")
     }
-    #[setter(name = "formNoValidate", coerce)]
+    #[setter(name = "formNoValidate", coerce, hint(js(ce_reactions)))]
     fn set_form_no_validate(&self, value: bool) -> OpResult<()> {
         let node = &self.base.base.base;
         if value {
@@ -6783,7 +8694,7 @@ impl DomInputElement {
             .get_null_attribute("formtarget")?
             .unwrap_or_default())
     }
-    #[setter(name = "formTarget", coerce)]
+    #[setter(name = "formTarget", coerce, hint(js(ce_reactions)))]
     fn set_form_target(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("formtarget", value)
     }
@@ -6816,11 +8727,95 @@ impl DomTemplateElement {
             .template_content(node.id)
             .map_err(dom_error)?
             .unwrap();
-        Ok(node.realm.wrap(ctx, content))
+        if content.document_id() == node.id.document_id() { return Ok(node.realm.wrap(ctx, content)); }
+        let graph = template_graph::ArenaGraph::new(&node.realm)?;
+        Ok(graph.owner(content)?.wrap(ctx, content))
     }
 }
-#[lumen_bind::methods]
-impl DomHtmlElement {
+event_content_handlers::bind_node_handlers! { DomHtmlElement {
+    fn attach_internals(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        custom_elements::attach_internals(ctx, &self.base.base.realm, self.base.base.id, this.0)
+    }
+
+    #[getter]
+    fn inner_text(&self) -> OpResult<String> { self.rendered_text() }
+
+    #[getter]
+    fn outer_text(&self) -> OpResult<String> { self.rendered_text() }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_inner_text(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
+        let node = &self.base.base;
+        let fragment = rendered_text_fragment_value(ctx, &node.realm, node.id, value.0, false)?;
+        let identity = DomNodeIdentity { _keep: NodeRetention::new(&node.realm, fragment.0), _source: node.realm.clone(), value: fragment.1 };
+        node.replace_children(ctx, vec![NodeOrDOMString::Node(identity)])
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_outer_text(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>, this: lumen_bind::This<Value>) -> OpResult<()> {
+        let node = &self.base.base;
+        let (parent, previous, next) = {
+            let session = node.realm.session.borrow();
+            let document = session.document();
+            let parent = document.parent(node.id).map_err(dom_error)?.ok_or_else(|| OpError::new("NoModificationAllowedError", "outerText requires a parent"))?;
+            (parent, document.previous_sibling(node.id).map_err(dom_error)?, document.next_sibling(node.id).map_err(dom_error)?)
+        };
+        let fragment = rendered_text_fragment_value(ctx, &node.realm, node.id, value.0, true)?;
+        let _keep = NodeRetention::new(&node.realm, fragment.0);
+        replace_dom_node(ctx, &node.realm, parent, fragment.1, this.0)?;
+        let mut removed = Vec::new();
+        {
+            let mut session = node.realm.session.borrow_mut();
+            let document = session.document_mut();
+            if let Some(next) = next {
+                if let Some(previous_of_next) = document.previous_sibling(next).map_err(dom_error)? {
+                    if let Some(merged) = document.merge_with_next_text(previous_of_next).map_err(dom_error)? { removed.push(merged); }
+                }
+            }
+            if let Some(previous) = previous {
+                if let Some(merged) = document.merge_with_next_text(previous).map_err(dom_error)? { removed.push(merged); }
+            }
+        }
+        node.realm.invalidate_textarea_ancestor(parent);
+        node.realm.reap_detached(removed);
+        Ok(())
+    }
+
+    #[getter]
+    fn offset_left(&self) -> OpResult<f64> {
+        self.base.offset_left()
+    }
+
+    #[getter]
+    fn offset_top(&self) -> OpResult<f64> {
+        self.base.offset_top()
+    }
+
+    #[getter]
+    fn offset_width(&self) -> OpResult<f64> {
+        self.base.offset_width()
+    }
+
+    #[getter]
+    fn offset_height(&self) -> OpResult<f64> {
+        self.base.offset_height()
+    }
+
+    #[getter]
+    fn offset_parent(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.offset_parent(ctx)
+    }
+
+    #[getter]
+    fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.base.style(ctx, this)
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_style(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_style(value)
+    }
+
     #[getter]
     fn dir(&self) -> String {
         let node = &self.base.base;
@@ -6831,9 +8826,109 @@ impl DomHtmlElement {
             .to_owned()
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_dir(&self, value: &str) -> OpResult<()> {
         self.base.base.set_attribute_core("dir", value)
+    }
+
+    #[getter]
+    fn title(&self) -> OpResult<String> {
+        Ok(self.base.base.get_null_attribute("title")?.unwrap_or_default())
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_title(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_attribute_core("title", value)
+    }
+
+    #[getter(name = "accessKey")]
+    fn access_key(&self) -> OpResult<String> {
+        Ok(self.base.base.get_null_attribute("accesskey")?.unwrap_or_default())
+    }
+
+    #[setter(name = "accessKey", coerce, hint(js(ce_reactions)))]
+    fn set_access_key(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_attribute_core("accesskey", value)
+    }
+
+    #[getter(name = "accessKeyLabel")]
+    fn access_key_label(&self) -> String {
+        // This host assigns no platform access-key combinations.
+        String::new()
+    }
+
+    #[getter]
+    fn lang(&self) -> OpResult<String> {
+        Ok(self.base.base.get_null_attribute("lang")?.unwrap_or_default())
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_lang(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_attribute_core("lang", value)
+    }
+
+    #[getter]
+    fn translate(&self)->bool {read_element_metadata(&self.base.base,lumen_html::element_metadata::translation_enabled)}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_translate(&self,value:bool)->OpResult<()> {self.base.base.set_attribute_core("translate",if value {"yes"}else{"no"})}
+    #[getter]
+    fn spellcheck(&self)->bool {read_element_metadata(&self.base.base,lumen_html::element_metadata::spellcheck_enabled)}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_spellcheck(&self,value:bool)->OpResult<()> {self.base.base.set_attribute_core("spellcheck",if value {"true"}else{"false"})}
+    #[getter(name="contentEditable")]
+    fn content_editable(&self)->String {read_element_metadata(&self.base.base,|document,node|lumen_html::element_metadata::content_editable_state(document,node).keyword().to_owned())}
+    #[setter(name="contentEditable",coerce,hint(js(ce_reactions)))]
+    fn set_content_editable(&self,ctx:&mut Ctx,value:&str)->OpResult<()> {
+        use lumen_html::element_metadata::{content_editable_setter_state,ContentEditableState};
+        let state=content_editable_setter_state(value).ok_or_else(||error_reporting::dom_exception(ctx,"SyntaxError","invalid contentEditable state"))?;
+        if state==ContentEditableState::Inherit {self.base.base.remove_attribute_core("contenteditable")}
+        else {self.base.base.set_attribute_core("contenteditable",state.keyword())}
+    }
+    #[getter(name="isContentEditable")]
+    fn is_content_editable(&self)->bool {read_element_metadata(&self.base.base,lumen_html::element_metadata::is_content_editable)}
+    #[getter]
+    fn draggable(&self)->bool {
+        // The current object renderer uses fallback DOM; it has no image
+        // representation request. Pass that actual state to the shared HTML
+        // algorithm. An eventual object loader must supply its real state.
+        read_element_metadata(&self.base.base,|document,node|
+            lumen_html::element_metadata::draggable_enabled(document,node,false))
+    }
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_draggable(&self,value:bool)->OpResult<()> {self.base.base.set_attribute_core("draggable",if value {"true"}else{"false"})}
+
+    #[getter]
+    fn nonce(&self)->OpResult<String> {self.base.base.cryptographic_nonce()}
+    #[setter(coerce)]
+    fn set_nonce(&self,value:&str)->OpResult<()> {self.base.base.set_cryptographic_nonce(value)}
+
+    #[getter]
+    fn inert(&self) -> OpResult<bool> {
+        Ok(self.base.base.get_null_attribute("inert")?.is_some())
+    }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_inert(&self, value: bool) -> OpResult<()> {
+        if value { self.base.base.set_attribute_core("inert", "") }
+        else { self.base.base.remove_attribute_core("inert") }
+    }
+
+    #[getter]
+    fn hidden(&self) -> OpResult<Value> {
+        Ok(match self.base.base.get_null_attribute("hidden")? {
+            Some(value) if value.eq_ignore_ascii_case("until-found") => Value::Str("until-found".into()),
+            Some(_) => Value::Bool(true),
+            None => Value::Bool(false),
+        })
+    }
+
+    #[setter(hint(js(ce_reactions)))]
+    fn set_hidden(&self, value: html_interfaces::HiddenAttribute) -> OpResult<()> {
+        match value {
+            html_interfaces::HiddenAttribute::Absent => self.base.base.remove_attribute_core("hidden"),
+            html_interfaces::HiddenAttribute::Hidden => self.base.base.set_attribute_core("hidden", ""),
+            html_interfaces::HiddenAttribute::UntilFound => self.base.base.set_attribute_core("hidden", "until-found"),
+        }
     }
 
     #[getter]
@@ -6842,7 +8937,7 @@ impl DomHtmlElement {
         dialog_popover::popover_value(&node.realm, node.id)
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_popover(&self, value: &str) -> OpResult<()> {
         let node = &self.base.base;
         dialog_popover::set_popover_value(&node.realm, node.id, value)
@@ -6884,89 +8979,11 @@ impl DomHtmlElement {
         forms::click_element(ctx, &node.realm, &node.base, node.id)
     }
 
-    #[getter]
-    fn onvolumechange(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        event_content_handlers::element_handler_value(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "volumechange",
-        )
-    }
 
-    #[setter]
-    fn set_onvolumechange(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        event_content_handlers::set_element_handler(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "volumechange",
-            callback,
-        );
-    }
 
-    #[getter]
-    fn onload(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        event_content_handlers::element_handler_value(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "load",
-        )
-    }
 
-    #[setter]
-    fn set_onload(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        event_content_handlers::set_element_handler(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "load",
-            callback,
-        );
-    }
 
-    #[getter]
-    fn onerror(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        event_content_handlers::element_handler_value(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "error",
-        )
-    }
 
-    #[setter]
-    fn set_onerror(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        event_content_handlers::set_element_handler(
-            ctx,
-            &self.base.base.realm,
-            self.base.base.id,
-            &this.0,
-            "error",
-            callback,
-        );
-    }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -7026,607 +9043,56 @@ impl DomHtmlElement {
         forms::report_validity(ctx, &node.realm, node.id, &node.realm.forms)
     }
     #[getter]
-    fn onkeydown(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "keydown")
-    }
-    #[setter]
-    fn set_onkeydown(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "keydown", callback);
-    }
-    #[getter]
-    fn onkeyup(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "keyup")
-    }
-    #[setter]
-    fn set_onkeyup(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "keyup", callback);
-    }
-    #[getter]
-    fn onkeypress(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "keypress")
-    }
-    #[setter]
-    fn set_onkeypress(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "keypress", callback);
-    }
-    #[getter]
-    fn onbeforeinput(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "beforeinput")
-    }
-    #[setter]
-    fn set_onbeforeinput(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "beforeinput", callback);
-    }
-    #[getter]
-    fn oninvalid(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "invalid")
-    }
-    #[setter]
-    fn set_oninvalid(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "invalid", callback);
-    }
-    #[getter]
-    fn onchange(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "change")
-    }
-    #[setter]
-    fn set_onchange(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "change", callback);
-    }
-    #[getter]
-    fn onfocus(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "focus")
-    }
-    #[setter]
-    fn set_onfocus(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "focus", callback);
-    }
-    #[getter]
-    fn onblur(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "blur")
-    }
-    #[setter]
-    fn set_onblur(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "blur", callback);
-    }
-    #[getter]
-    fn onfocusin(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "focusin")
-    }
-    #[setter]
-    fn set_onfocusin(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "focusin", callback);
-    }
-    #[getter]
-    fn onfocusout(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "focusout")
-    }
-    #[setter]
-    fn set_onfocusout(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "focusout", callback);
-    }
-    #[getter]
-    fn ondblclick(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "dblclick")
-    }
-    #[setter]
-    fn set_ondblclick(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "dblclick", callback);
-    }
-    #[getter]
-    fn onpointerdown(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "pointerdown")
-    }
-    #[setter]
-    fn set_onpointerdown(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "pointerdown", callback);
-    }
-    #[getter]
-    fn onpointerup(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "pointerup")
-    }
-    #[setter]
-    fn set_onpointerup(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "pointerup", callback);
-    }
-    #[getter]
-    fn onpointermove(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "pointermove")
-    }
-    #[setter]
-    fn set_onpointermove(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "pointermove", callback);
-    }
-    #[getter]
-    fn onpointercancel(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "pointercancel")
-    }
-    #[setter]
-    fn set_onpointercancel(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "pointercancel", callback);
-    }
-    #[getter]
-    fn onmousedown(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "mousedown")
-    }
-    #[setter]
-    fn set_onmousedown(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mousedown", callback);
-    }
-    #[getter]
-    fn onmouseup(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "mouseup")
-    }
-    #[setter]
-    fn set_onmouseup(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mouseup", callback);
-    }
-    #[getter]
-    fn onmousemove(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "mousemove")
-    }
-    #[setter]
-    fn set_onmousemove(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mousemove", callback);
-    }
-    #[getter]
-    fn onmouseover(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "mouseover")
-    }
-    #[setter]
-    fn set_onmouseover(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mouseover", callback);
-    }
-    #[getter]
-    fn onmouseout(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "mouseout")
-    }
-    #[setter]
-    fn set_onmouseout(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mouseout", callback);
-    }
-    #[getter]
-    fn onmouseenter(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "mouseenter")
-    }
-    #[setter]
-    fn set_onmouseenter(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mouseenter", callback);
-    }
-    #[getter]
-    fn onmouseleave(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "mouseleave")
-    }
-    #[setter]
-    fn set_onmouseleave(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "mouseleave", callback);
-    }
-    #[getter]
-    fn onwheel(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "wheel")
-    }
-    #[setter]
-    fn set_onwheel(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "wheel", callback);
-    }
-    #[getter]
-    fn onscroll(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "scroll")
-    }
-    #[setter]
-    fn set_onscroll(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "scroll", callback);
-    }
-    #[getter]
-    fn oncompositionstart(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "compositionstart")
-    }
-    #[setter]
-    fn set_oncompositionstart(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "compositionstart", callback);
-    }
-    #[getter]
-    fn oncompositionupdate(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "compositionupdate")
-    }
-    #[setter]
-    fn set_oncompositionupdate(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "compositionupdate", callback);
-    }
-    #[getter]
-    fn oncompositionend(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "compositionend")
-    }
-    #[setter]
-    fn set_oncompositionend(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "compositionend", callback);
-    }
-    #[getter]
-    fn ontouchstart(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "touchstart")
-    }
-    #[setter]
-    fn set_ontouchstart(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "touchstart", callback);
-    }
-    #[getter]
-    fn ontouchend(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "touchend")
-    }
-    #[setter]
-    fn set_ontouchend(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "touchend", callback);
-    }
-    #[getter]
-    fn ontouchmove(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "touchmove")
-    }
-    #[setter]
-    fn set_ontouchmove(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "touchmove", callback);
-    }
-    #[getter]
-    fn ontouchcancel(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base
-            .base
-            .base
-            .handler_value(ctx, &this.0, "touchcancel")
-    }
-    #[setter]
-    fn set_ontouchcancel(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "touchcancel", callback);
-    }
-    #[getter]
-    fn oninput(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "input")
-    }
-    #[setter]
-    fn set_oninput(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "input", callback);
-    }
-    #[getter]
-    fn onclick(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
-        self.base.base.base.handler_value(ctx, &this.0, "click")
-    }
-    #[setter]
-    fn set_onclick(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base
-            .base
-            .base
-            .set_handler(ctx, &this.0, "click", callback);
-    }
-    #[getter]
     fn tab_index(&self) -> OpResult<i32> {
-        if let Some(value) = self.base.base.get_null_attribute("tabindex")? {
-            if let Ok(value) = value.parse() {
-                return Ok(value);
-            }
-        }
-        let name = self.base.base.local_name()?.unwrap_or_default();
-        Ok(
-            if matches!(
-                name.as_str(),
-                "input" | "button" | "textarea" | "select" | "summary"
-            ) || (matches!(name.as_str(), "a" | "area")
-                && self.base.base.has_null_attribute("href")?)
-            {
-                0
-            } else {
-                -1
-            },
-        )
+        let (realm,node)=self.base.base.realm.resolve_adopted_node(self.base.base.id);
+        let index = lumen_html::focus::idl_tabindex(realm.session.borrow().document(),node);
+        Ok(index)
     }
-    #[setter]
+    #[getter(name = "headingOffset")]
+    fn heading_offset(&self) -> OpResult<u32> {
+        Ok(lumen_html::forms::reflected_clamped_unsigned_long(
+            self.base.base.get_null_attribute("headingoffset")?.as_deref(), 0, 8, 0))
+    }
+    #[setter(name = "headingOffset", hint(js(ce_reactions)))]
+    fn set_heading_offset(&self, value: u32) -> OpResult<()> {
+        let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, 0);
+        self.base.base.set_attribute_core("headingoffset", &value.to_string())
+    }
+    #[getter(name = "headingReset")]
+    fn heading_reset(&self) -> OpResult<bool> {
+        self.base.base.has_null_attribute("headingreset")
+    }
+    #[setter(name = "headingReset", coerce, hint(js(ce_reactions)))]
+    fn set_heading_reset(&self, value: bool) -> OpResult<()> {
+        if value { self.base.base.set_attribute_core("headingreset", "") }
+        else { self.base.base.remove_attribute_core("headingreset") }
+    }
+    #[getter]
+    fn autofocus(&self) -> OpResult<bool> {
+        Ok(self.base.base.get_null_attribute("autofocus")?.is_some())
+    }
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autofocus(&self, value: bool) -> OpResult<()> {
+        if value { self.base.base.set_attribute_core("autofocus", "") }
+        else { self.base.base.remove_attribute_core("autofocus") }
+    }
+    #[setter(hint(js(ce_reactions)))]
     fn set_tab_index(&self, index: i32) -> OpResult<()> {
         self.base
             .base
             .set_attribute_core("tabindex", &index.to_string())
     }
-    fn focus(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<()> {
+    fn focus(ctx: &mut Ctx, this: lumen_bind::This<Value>, options: Option<focus::FocusOptions>) -> OpResult<()> {
         let (realm, node) = ctx.with_instance::<DomHtmlElement, _>(&this.0, |element| {
             (element.base.base.realm.clone(), element.base.base.id)
         })?;
-        realm.focus(ctx, Some(node))
+        focus::focus_element(ctx, &realm, node, options.unwrap_or_default())
     }
     fn blur(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<()> {
         let (realm, node) = ctx.with_instance::<DomHtmlElement, _>(&this.0, |element| {
             (element.base.base.realm.clone(), element.base.base.id)
         })?;
-        if realm.focused_node() == Some(node) {
-            realm.focus(ctx, None)?;
-        }
-        Ok(())
+        focus::blur_element(ctx, &realm, node)
     }
     #[getter]
     fn value(&self) -> OpResult<String> {
@@ -7638,7 +9104,7 @@ impl DomHtmlElement {
         }
         Ok(String::new())
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_value(&self, value: &str) -> OpResult<()> {
         let node = &self.base.base;
         let local_name = node.local_name()?;
@@ -7790,7 +9256,7 @@ impl DomHtmlElement {
     fn disabled(&self) -> OpResult<bool> {
         self.base.base.has_null_attribute("disabled")
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_disabled(&self, disabled: bool) -> OpResult<()> {
         if disabled {
             self.base.base.set_attribute_core("disabled", "")
@@ -7798,6 +9264,30 @@ impl DomHtmlElement {
             self.base.base.remove_attribute_core("disabled")
         }
     }
+} }
+
+impl DomHtmlElement {
+    fn rendered_text(&self) -> OpResult<String> {
+        let node = &self.base.base;
+        let (realm, id) = node.realm.resolve_adopted_node(node.id);
+        realm.session.borrow_mut().request_rendered_text_boxes();
+        let result = (|| {
+            if realm.layout_flusher.borrow().is_some() || realm.session.borrow().viewport_size().is_some() { realm.flush_layout()?; }
+            lumen_html::rendered_text::get(&mut realm.session.borrow_mut(), id)
+                .map_err(|error| OpError::new("InvalidStateError", format!("{error:?}")))
+        })();
+        realm.session.borrow_mut().finish_rendered_text_boxes();
+        result
+    }
+}
+
+fn rendered_text_fragment_value(ctx: &mut Ctx, realm: &Rc<DomRealm>, element: NodeId, value: &str, ensure_text: bool) -> OpResult<(NodeId, Value)> {
+    let required = lumen_html::Document::rendered_text_fragment_allocation_count(value, ensure_text);
+    realm.prepare_allocation(ctx, required)?;
+    let owner = realm.session.borrow().document().node_document(element).map_err(dom_error)?;
+    let fragment = realm.session.borrow_mut().document_mut().rendered_text_fragment(owner, value, ensure_text).map_err(dom_error)?;
+    realm.defer_detached_root(fragment);
+    Ok((fragment, realm.wrap(ctx, fragment)))
 }
 
 #[lumen_bind::class(name = "CharacterData", extends = DomNode, hint(js(webidl)))]
@@ -7806,6 +9296,36 @@ pub struct DomCharacterData {
 }
 #[lumen_bind::methods]
 impl DomCharacterData {
+    #[getter]
+    fn previous_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.previous_element_sibling(ctx)
+    }
+
+    #[getter]
+    fn next_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.next_element_sibling(ctx)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn before(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.before(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn after(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.after(ctx, nodes)
+    }
+
+    #[method(name = "replaceWith", hint(js(ce_reactions)))]
+    fn replace_with(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_with(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn remove(&self) -> OpResult<()> {
+        self.base.remove()
+    }
+
     #[getter]
     fn data(&self) -> OpResult<String> {
         Ok(self.base.node_value()?.0.unwrap_or_default())
@@ -7884,6 +9404,41 @@ pub struct DomText {
 }
 #[lumen_bind::methods]
 impl DomText {
+    #[method(coerce)]
+    fn split_text(&self, ctx: &mut Ctx, offset: u32) -> OpResult<Value> {
+        let node = &self.base.base;
+        let split = node.realm.session.borrow_mut().document_mut().split_text(node.id, offset as usize).map_err(dom_error)?;
+        node.realm.invalidate_textarea_ancestor(node.id);
+        Ok(node.realm.wrap(ctx, split))
+    }
+
+    #[getter]
+    fn whole_text(&self) -> OpResult<String> {
+        let node = &self.base.base;
+        let session = node.realm.session.borrow();
+        let document = session.document();
+        let mut first = node.id;
+        while let Some(previous) = document.previous_sibling(first).map_err(dom_error)? {
+            if !matches!(document.kind(previous).map_err(dom_error)?, NodeKind::Text(_) | NodeKind::CData(_)) { break; }
+            first = previous;
+        }
+        let mut value = String::new();
+        let mut cursor = Some(first);
+        while let Some(id) = cursor {
+            match document.kind(id).map_err(dom_error)? {
+                NodeKind::Text(text) | NodeKind::CData(text) => value.push_str(text),
+                _ => break,
+            }
+            cursor = document.next_sibling(id).map_err(dom_error)?;
+        }
+        Ok(value)
+    }
+
+    #[getter]
+    fn assigned_slot(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.base.assigned_slot(ctx)
+    }
+
     #[constructor(coerce)]
     fn new(ctx: &mut Ctx, #[default("")] data: &str) -> OpResult<NodeConstructorResult<Self>> {
         let node = construct_document_node(ctx, NodeKind::Text(data.into()))?;
@@ -7922,6 +9477,11 @@ pub struct DomProcessingInstruction {
 #[lumen_bind::methods]
 impl DomProcessingInstruction {
     #[getter]
+    fn sheet(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value> {
+        if !lumen_html::xml_stylesheet::is_candidate(self.base.base.realm.session.borrow().document(),self.base.base.id) {return Ok(Value::Null);}
+        cssom::style_element_sheet(ctx,&self.base.base.realm,self.base.base.id,this.0)
+    }
+    #[getter]
     fn target(&self) -> OpResult<String> {
         let session = self.base.base.realm.session.borrow();
         match session
@@ -7944,6 +9504,26 @@ pub struct DomDocumentType {
 }
 #[lumen_bind::methods]
 impl DomDocumentType {
+    #[method(hint(js(ce_reactions)))]
+    fn before(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.before(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn after(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.after(ctx, nodes)
+    }
+
+    #[method(name = "replaceWith", hint(js(ce_reactions)))]
+    fn replace_with(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_with(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn remove(&self) -> OpResult<()> {
+        self.base.remove()
+    }
+
     #[getter]
     fn name(&self) -> OpResult<String> {
         let session = self.base.realm.session.borrow();
@@ -7990,6 +9570,7 @@ fn construct_document_node(ctx: &mut Ctx, kind: NodeKind) -> OpResult<DomNode> {
     let _html_allocations = enter_html_allocation_category();
     let realm = window_globals::current_dom_realm(ctx)
         .ok_or_else(|| OpError::new("TypeError", "node constructor has no associated document"))?;
+    realm.prepare_allocation(ctx, 1)?;
     let id = realm
         .session
         .borrow_mut()
@@ -8024,6 +9605,124 @@ impl<T> NodeConstructorResult<T> {
     }
 }
 
+impl<T: lumen_bind::Methods<lumen::embed::JsHost>> NodeConstructorResult<T> {
+    /// Legacy HTML factories return a real element with the new target's
+    /// prototype, while sharing its native brand and DOM identity cache.
+    pub(crate) fn into_factory(self, ctx: &mut Ctx, this: Value) -> Result<Value, Value> {
+        let result = (|| {
+            // Native super() already supplies the derived instance. Attach to
+            // it so the engine never grafts properties onto a different object
+            // without the native brand or the DOM identity cache.
+            let value = if ctx.is_constructing() && matches!(this, Value::Obj(_)) {
+                this
+            } else {
+                let constructor = ctx.class_constructor::<T>();
+                let fallback = ctx.member_get(&constructor, "prototype")?;
+                let target = if ctx.is_constructing() {
+                    ctx.current_new_target()
+                } else {
+                    Value::Undefined
+                };
+                let prototype = if matches!(target, Value::Obj(_)) {
+                    let prototype = ctx.member_get(&target, "prototype")?;
+                    if matches!(prototype, Value::Obj(_)) {
+                        prototype
+                    } else {
+                        let function =
+                            lumen::embed::JsFunction::from_value(target).ok_or_else(|| {
+                                ctx.make_error("TypeError", "new.target is not a constructor")
+                            })?;
+                        let realm = ctx.function_host_realm(&function)?;
+                        ctx.with_host_realm(&realm, |ctx| {
+                            let constructor = ctx.class_constructor::<T>();
+                            ctx.member_get(&constructor, "prototype")
+                        })
+                        .map_err(|_| {
+                            ctx.make_error("TypeError", "constructor realm is unavailable")
+                        })??
+                    }
+                } else {
+                    fallback
+                };
+                ctx.new_object_with_proto(&prototype)
+            };
+            ctx.attach_native_data(&value, self.native)
+                .map_err(|error| error.to_value(ctx))?;
+            remember_constructed_node(ctx, &self.realm, self.id, &value)?;
+            Ok(value)
+        })();
+        if result.is_err() {
+            let _ = self
+                .realm
+                .session
+                .borrow_mut()
+                .document_mut()
+                .destroy_subtree(self.id);
+        }
+        result
+    }
+}
+
+fn remember_constructed_node(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    id: NodeId,
+    value: &Value,
+) -> Result<(), Value> {
+    register_node_identity_owner(ctx, value)
+        .map_err(|error| error.to_value(ctx))?;
+    if let Some(weak) = ctx.weak_value(value) {
+        if id == realm.session.borrow().document().root() {
+            realm.note_creation_global(ctx);
+            *realm.document_wrapper.borrow_mut() = Some(weak);
+        } else {
+            realm.wrappers.borrow_mut().insert(id, weak);
+            realm.defer_detached_root(id);
+        }
+    }
+    Ok(())
+}
+
+#[lumen_bind::op(name = "Image", coerce)]
+fn construct_legacy_image(
+    ctx: &mut Ctx,
+    this: lumen_bind::This<Value>,
+    width: lumen_bind::Passed<u32>,
+    height: lumen_bind::Passed<u32>,
+) -> OpResult<Value> {
+    legacy_image_factory(ctx, width.0, height.0)?
+        .into_factory(ctx, this.0)
+        .map_err(OpError::thrown)
+}
+
+#[lumen_bind::op(name = "Audio", coerce)]
+fn construct_legacy_audio(
+    ctx: &mut Ctx,
+    this: lumen_bind::This<Value>,
+    source: lumen_bind::Passed<&str>,
+) -> OpResult<Value> {
+    media::legacy_audio_factory(ctx, source.0)?
+        .into_factory(ctx, this.0)
+        .map_err(OpError::thrown)
+}
+
+fn install_legacy_element_factory(
+    ctx: &mut Ctx,
+    global: &Value,
+    name: &str,
+    interface: Value,
+    constructor: Value,
+) -> Result<(), Value> {
+    let prototype = ctx.member_get(&interface, "prototype")?;
+    // A legacy factory shares the interface prototype, whose constructor
+    // must remain the HTML interface rather than the legacy alias.
+    let descriptor = ctx.new_object_with_proto(&Value::Null);
+    ctx.set_member(&descriptor, "value", prototype)
+        .map_err(lumen::embed::abrupt_value)?;
+    ctx.define_property_value(&constructor, Value::str("prototype"), &descriptor)?;
+    crate::install_interface(ctx, global, name, constructor)
+}
+
 impl<T: lumen_bind::Class> lumen_bind::CtorRet<lumen::embed::JsHost, T>
     for NodeConstructorResult<T>
 {
@@ -8048,12 +9747,7 @@ impl<T: lumen_bind::Class> lumen_bind::CtorRet<lumen::embed::JsHost, T>
         // typed constructor returns. Cache that object, including subclass
         // prototypes, rather than the provisional constructor receiver.
         <lumen::embed::JsHost as lumen_bind::Host>::with_ctx(cx, |ctx: &mut Ctx| {
-            ctx.set_native_identity_owner::<DomNode>(&value)
-                .map_err(|error| error.to_value(ctx))?;
-            if let Some(weak) = ctx.weak_value(&value) {
-                self.realm.wrappers.borrow_mut().insert(self.id, weak);
-            }
-            Ok(())
+            remember_constructed_node(ctx, &self.realm, self.id, &value)
         })?;
         Ok(value)
     }
@@ -8061,6 +9755,61 @@ impl<T: lumen_bind::Class> lumen_bind::CtorRet<lumen::embed::JsHost, T>
 
 #[lumen_bind::methods]
 impl DomDocumentFragment {
+    #[getter]
+    fn children(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.children(ctx, this)
+    }
+
+    #[getter]
+    fn first_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.first_element_child(ctx)
+    }
+
+    #[getter]
+    fn last_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.last_element_child(ctx)
+    }
+
+    #[getter]
+    fn child_element_count(&self) -> OpResult<u32> {
+        self.base.child_element_count()
+    }
+
+    #[method(coerce)]
+    fn query_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        self.base.query_selector(ctx, query)
+    }
+
+    #[method(coerce)]
+    fn query_selector_all(
+        &self,
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        query: &str,
+    ) -> OpResult<DomNodeList> {
+        self.base.query_selector_all(ctx, this, query)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn append(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.append(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn prepend(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.prepend(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn replace_children(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_children(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn move_before(&self, ctx: &mut Ctx, node: Value, child: Value) -> OpResult<()> {
+        self.base.move_before(ctx, node, child)
+    }
+
     #[constructor]
     fn new(ctx: &mut Ctx) -> OpResult<NodeConstructorResult<Self>> {
         let node = construct_document_node(ctx, NodeKind::DocumentFragment)?;
@@ -8079,11 +9828,35 @@ impl DomDocumentFragment {
     }
 }
 
+fn read_element_metadata<T>(node:&DomNode,read:impl FnOnce(&lumen_html::Document,NodeId)->T)->T {
+    let (realm,id)=node.realm.resolve_adopted_node(node.id);
+    let session=realm.session.borrow();read(session.document(),id)
+}
+
 #[lumen_bind::class(name = "Document", extends = DomNode, hint(js(webidl)))]
 pub struct DomDocument {
     base: DomNode,
     realm: Rc<DomRealm>,
     fonts: RefCell<Option<Value>>,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomDocument {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, epoch:u64, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_identities(&self.base,epoch,visit);
+    }
+    fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_values(&self.base,visit);
+        if let Some(fonts)=self.fonts.borrow().as_ref() {visit(fonts);}
+    }
+}
+
+fn register_node_identity_owner(ctx:&mut Ctx,value:&Value)->OpResult<()> {
+    if ctx.instance_data::<DomDocument>(value).is_some() {
+        ctx.set_native_identity_owner::<DomDocument>(value)
+    } else {
+        ctx.set_native_identity_owner::<DomNode>(value)
+    }
 }
 
 #[lumen_bind::class(name = "XMLDocument", extends = DomDocument, hint(js(webidl)))]
@@ -8093,8 +9866,124 @@ pub struct DomXmlDocument {
 #[lumen_bind::methods]
 impl DomXmlDocument {}
 
-#[lumen_bind::methods]
 impl DomDocument {
+    fn prepare_node_ownership(&self, ctx: &mut Ctx) -> OpResult<()> {
+        self.realm.prepare_allocation(ctx, 1)?;
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .reserve_node_document(self.base.id)
+            .map_err(dom_error)
+    }
+    fn is_inert_template_document(&self) -> bool {
+        self.realm
+            .session
+            .borrow()
+            .document()
+            .is_template_owner_document(self.base.id)
+    }
+
+    fn own_created_node(&self, node: NodeId) -> OpResult<()> {
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .set_node_document(node, self.base.id)
+            .map_err(dom_error)?;
+        self.realm.defer_detached_root(node);
+        Ok(())
+    }
+
+    fn own_created_value(&self, ctx: &mut Ctx, value: Value) -> OpResult<Value> {
+        let node = ctx.with_instance::<DomNode, _>(&value, |node| node.id)?;
+        self.own_created_node(node)?;
+        Ok(value)
+    }
+}
+
+event_content_handlers::bind_node_handlers! { DomDocument {
+
+
+    #[getter]
+    fn custom_element_registry(&self, ctx: &mut Ctx) -> Value {
+        custom_elements::registry_value_for_node(ctx, &self.realm, self.base.id)
+    }
+
+
+    #[getter]
+    fn children(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.children(ctx, this)
+    }
+
+    #[getter]
+    fn first_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.first_element_child(ctx)
+    }
+
+    #[getter]
+    fn last_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.base.last_element_child(ctx)
+    }
+
+    #[getter]
+    fn child_element_count(&self) -> OpResult<u32> {
+        self.base.child_element_count()
+    }
+
+    #[method(coerce)]
+    fn query_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        self.base.query_selector(ctx, query)
+    }
+
+    #[method(coerce)]
+    fn query_selector_all(
+        &self,
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        query: &str,
+    ) -> OpResult<DomNodeList> {
+        self.base.query_selector_all(ctx, this, query)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn append(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.append(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn prepend(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.prepend(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn replace_children(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.base.replace_children(ctx, nodes)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn move_before(&self, ctx: &mut Ctx, node: Value, child: Value) -> OpResult<()> {
+        self.base.move_before(ctx, node, child)
+    }
+
+    #[classmethod(name = "parseHTMLUnsafe", coerce)]
+    fn parse_html_unsafe(
+        ctx: &mut Ctx,
+        _class: lumen_bind::This<Value>,
+        input: &str,
+        options: Option<Value>,
+    ) -> OpResult<Value> {
+        document_utilities::parse_html_unsafe(ctx, input, options)
+    }
+
+    #[method]
+    fn start_view_transition(&self, ctx: &mut Ctx, callback: Option<lumen::embed::JsFunction>) -> OpResult<Value> {
+        let handle = self.realm.relevant_host_realm(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "Document relevant realm is unavailable"))?;
+        ctx.with_host_realm(&handle, |ctx| view_transition::start(ctx, &self.realm, callback))
+            .map_err(|error| OpError::new("InvalidStateError", error.to_string()))?
+    }
+
     #[method(name = "elementFromPoint", coerce)]
     fn element_from_point(&self, ctx: &mut Ctx, x: f64, y: f64) -> OpResult<Value> {
         let node = geometry::element_from_point_in_tree(&self.realm, None, x, y)?;
@@ -8111,7 +10000,7 @@ impl DomDocument {
     }
 
     #[constructor]
-    fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Self> {
+    fn new(ctx: &mut Ctx) -> OpResult<NodeConstructorResult<Self>> {
         let document = lumen_html::Document::new(100_000);
         let realm =
             DomRealm::realm_from_document_with_metadata(document, "application/xml", false, false);
@@ -8121,26 +10010,31 @@ impl DomDocument {
                 .unwrap_or_else(browsing_context::Origin::opaque),
         );
         let root = realm.session.borrow().document().root();
-        let value = this.0;
-        if let Some(wrapper) = ctx.weak_value(&value) {
-            *realm.document_wrapper.borrow_mut() = Some(wrapper);
-        }
-        Ok(Self {
+        let native = Self {
             base: DomNode {
                 base: DomEventTarget::node(&realm, root),
                 realm: realm.clone(),
                 id: root,
                 collections: RefCell::new(HashMap::new()),
             },
-            realm,
+            realm: realm.clone(),
             fonts: RefCell::new(None),
-        })
+        };
+        Ok(NodeConstructorResult::from_native(native, realm, root))
     }
 
     #[getter]
     fn cookie(&self) -> OpResult<String> {
         self.cookie_value()
     }
+
+    #[getter(name = "visibilityState")]
+    fn visibility_state(&self) -> &'static str {
+        if self.realm.lifecycle.hidden.get() { "hidden" } else { "visible" }
+    }
+
+    #[getter]
+    fn hidden(&self) -> bool { self.realm.lifecycle.hidden.get() }
 
     #[getter]
     fn forms(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
@@ -8175,9 +10069,9 @@ impl DomDocument {
     fn head(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let session = self.base.realm.session.borrow();
         let document = session.document();
-        let html = named_child(document, document.root(), "html").map_err(dom_error)?;
+        let html = named_child(document, self.base.id, &["html"]).map_err(dom_error)?;
         let id = html
-            .map(|html| named_child(document, html, "head"))
+            .map(|html| named_child(document, html, &["head"]))
             .transpose()
             .map_err(dom_error)?
             .flatten();
@@ -8192,11 +10086,11 @@ impl DomDocument {
             .session
             .borrow()
             .document()
-            .title()
+            .title_at(self.base.id)
             .map_err(dom_error)
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_title(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         let title = self
             .base
@@ -8204,7 +10098,7 @@ impl DomDocument {
             .session
             .borrow_mut()
             .document_mut()
-            .ensure_title_element()
+            .ensure_title_element_at(self.base.id)
             .map_err(dom_error)?;
         if let Some(title) = title {
             DomNode::replace_text_content(ctx, &self.base.realm, title, value)?;
@@ -8212,29 +10106,56 @@ impl DomDocument {
         Ok(())
     }
 
-    #[method(name = "open")]
+    #[method(name = "open", hint(js(ce_reactions)))]
     fn open(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        if self.is_inert_template_document() {
+            return Err(OpError::new(
+                "NotSupportedError",
+                "template owner document streaming is not implemented",
+            ));
+        }
         self.realm.open_document_stream(ctx)?;
         Ok(this.0)
     }
 
-    #[method(name = "write", coerce)]
+    #[method(name = "write", coerce, hint(js(ce_reactions)))]
     fn write(&self, ctx: &mut Ctx, #[varargs] chunks: Vec<String>) -> OpResult<()> {
+        if self.is_inert_template_document() {
+            return Err(OpError::new(
+                "NotSupportedError",
+                "template owner document streaming is not implemented",
+            ));
+        }
         self.realm.write_document_stream(ctx, &chunks, false)
     }
 
-    #[method(name = "writeln", coerce)]
+    #[method(name = "writeln", coerce, hint(js(ce_reactions)))]
     fn writeln(&self, ctx: &mut Ctx, #[varargs] chunks: Vec<String>) -> OpResult<()> {
+        if self.is_inert_template_document() {
+            return Err(OpError::new(
+                "NotSupportedError",
+                "template owner document streaming is not implemented",
+            ));
+        }
         self.realm.write_document_stream(ctx, &chunks, true)
     }
 
-    #[method(name = "close")]
+    #[method(name = "close", hint(js(ce_reactions)))]
     fn close(&self, ctx: &mut Ctx) -> OpResult<()> {
+        if self.is_inert_template_document() {
+            return Err(OpError::new(
+                "NotSupportedError",
+                "template owner document streaming is not implemented",
+            ));
+        }
         self.realm.close_document_stream(ctx)
     }
 
     #[getter(rename(js = "URL"))]
     fn document_url(&self) -> String {
+        if self.is_inert_template_document() {
+            return "about:blank".into();
+        }
         self.base
             .realm
             .document_url()
@@ -8243,6 +10164,23 @@ impl DomDocument {
     #[getter(rename(js = "documentURI"))]
     fn document_uri(&self) -> String {
         self.document_url()
+    }
+
+    #[getter]
+    fn referrer(&self) -> String {
+        if self.is_inert_template_document() { String::new() }
+        else { self.realm.document_referrer.borrow().clone() }
+    }
+
+    #[getter]
+    fn domain(&self) -> String {
+        if self.is_inert_template_document() {
+            return String::new();
+        }
+        match self.realm.document_origin() {
+            Some(browsing_context::Origin::Tuple { host, .. }) => host,
+            _ => String::new(),
+        }
     }
     #[method(name = "getElementsByTagName", coerce)]
     fn get_elements_by_tag_name(
@@ -8309,6 +10247,9 @@ impl DomDocument {
 
     #[getter(name = "defaultView")]
     fn default_view(&self) -> Value {
+        if self.is_inert_template_document() || self.realm.lifecycle.destroyed.get() {
+            return Value::Null;
+        }
         self.realm
             .window_wrapper
             .borrow()
@@ -8319,11 +10260,17 @@ impl DomDocument {
 
     #[getter(name = "readyState")]
     fn ready_state(&self) -> &'static str {
+        if self.is_inert_template_document() {
+            return "loading";
+        }
         self.realm.ready_state.get().as_str()
     }
 
     #[getter(name = "currentScript")]
     fn current_script(&self, ctx: &mut Ctx) -> Value {
+        if self.is_inert_template_document() {
+            return Value::Null;
+        }
         self.realm
             .current_script
             .get()
@@ -8336,6 +10283,9 @@ impl DomDocument {
 
     #[getter(name = "compatMode")]
     fn compat_mode(&self) -> &'static str {
+        if self.is_inert_template_document() {
+            return "CSS1Compat";
+        }
         self.realm.session.borrow().document().compat_mode()
     }
 
@@ -8346,7 +10296,7 @@ impl DomDocument {
             .session
             .borrow()
             .document()
-            .doctype()
+            .doctype_at(self.base.id)
             .map_err(dom_error)?;
         Ok(self.realm.wrap_option(ctx, doctype))
     }
@@ -8371,26 +10321,35 @@ impl DomDocument {
 
     #[getter(name = "contentType")]
     fn content_type(&self) -> String {
+        if self.is_inert_template_document() {
+            return if self.realm.is_html_document { "text/html" } else { "application/xml" }.into();
+        }
         self.realm.content_type.clone()
     }
 
     #[getter(name = "characterSet")]
     fn character_set(&self) -> &'static str {
+        if self.is_inert_template_document() {
+            return "UTF-8";
+        }
         self.realm.document_encoding()
     }
 
     #[getter]
     fn charset(&self) -> &'static str {
-        self.realm.document_encoding()
+        self.character_set()
     }
 
     #[getter(name = "inputEncoding")]
     fn input_encoding(&self) -> &'static str {
-        self.realm.document_encoding()
+        self.character_set()
     }
 
     #[getter]
     fn location(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        if self.is_inert_template_document() {
+            return Ok(Value::Null);
+        }
         let Some(context) = self.realm.browsing_context() else {
             return Ok(Value::Null);
         };
@@ -8410,6 +10369,12 @@ impl DomDocument {
 
     #[setter(coerce)]
     fn set_location(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        if self.is_inert_template_document() {
+            return Err(OpError::new(
+                "InvalidStateError",
+                "Document has no active browsing context",
+            ));
+        }
         let Some(context) = self.realm.browsing_context() else {
             return Err(OpError::new(
                 "InvalidStateError",
@@ -8425,7 +10390,7 @@ impl DomDocument {
             ));
         }
         let entry_base = window_globals::entry_base_url(ctx, &context);
-        context.request_location_navigation_from(value, &entry_base)
+        context.request_location_navigation_with_caller(ctx, value, &entry_base)
     }
 
     #[getter]
@@ -8452,40 +10417,22 @@ impl DomDocument {
         presentation::exit_pointer_lock(ctx, &self.realm)
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn import_node(
         &self,
         ctx: &mut Ctx,
-        node: &DomNode,
-        options: Option<Value>,
+        node: DomNodeIdentity,
+        options: lumen_bind::Passed<ImportNodeOptions>,
     ) -> OpResult<Value> {
-        let deep = match options {
-            None | Some(Value::Undefined) => false,
-            Some(Value::Obj(value)) => {
-                let options = Value::Obj(value);
-                let registry = ctx
-                    .member_get(&options, "customElementRegistry")
-                    .map_err(OpError::thrown)?;
-                if !matches!(registry, Value::Undefined) {
-                    return Err(OpError::new(
-                        "NotSupportedError",
-                        "importing with an explicit custom element registry is not implemented",
-                    ));
-                }
-                let self_only = ctx
-                    .member_get(&options, "selfOnly")
-                    .map_err(OpError::thrown)?;
-                !ctx.to_boolean(&self_only)
-            }
-            Some(Value::Null) => true,
-            Some(value) => ctx.to_boolean(&value),
-        };
+        let deep = options.0.as_ref().is_some_and(|options| options.deep);
+        let (source_realm, source_id) = ctx.with_instance::<DomNode, _>(&node.value, |node| (node.realm.clone(), node.id))?;
         {
-            let source = node.realm.session.borrow();
+            let source = source_realm.session.borrow();
             let document = source.document();
             if matches!(
-                document.kind(node.id).map_err(dom_error)?,
+                document.kind(source_id).map_err(dom_error)?,
                 NodeKind::Document
-            ) || document.shadow_host(node.id).map_err(dom_error)?.is_some()
+            ) || document.shadow_host(source_id).map_err(dom_error)?.is_some()
             {
                 return Err(OpError::new(
                     "NotSupportedError",
@@ -8493,27 +10440,45 @@ impl DomDocument {
                 ));
             }
         }
-        let id = if Rc::ptr_eq(&self.realm, &node.realm) {
+        if let Some(registry) = options.0.as_ref().and_then(|options| options.registry.as_ref()) {
+            custom_elements::validate_registry_for_document(ctx, &self.realm,self.base.id, registry)?;
+        }
+        if !source_realm.template_graph_owners.borrow().is_empty() {
+            self.prepare_node_ownership(ctx)?;
+            let fallback = if let Some(registry) = options.0.as_ref().and_then(|options| options.registry.as_ref()) {
+                Some(ctx.with_instance::<custom_elements::DomCustomElementRegistry, _>(registry, |registry| registry.hub_for_import())?)
+            } else { custom_elements::registry_hub(&self.realm, self.base.id) };
+            return template_graph::clone_into(ctx, &source_realm, source_id, &self.realm, self.base.id, deep, fallback);
+        }
+        let required = self.realm.session.borrow().document().clone_allocation_count_from(source_realm.session.borrow().document(), source_id, deep).map_err(dom_error)?;
+        self.realm.prepare_allocation(ctx, required)?;
+        self.prepare_node_ownership(ctx)?;
+        let id = if Rc::ptr_eq(&self.realm, &source_realm) {
             let mut target = self.realm.session.borrow_mut();
             target
                 .document_mut()
-                .clone_node(node.id, deep)
+                .clone_node(source_id, deep)
                 .map_err(dom_error)?
         } else {
-            let source = node.realm.session.borrow();
+            let source = source_realm.session.borrow();
             self.realm
                 .session
                 .borrow_mut()
                 .document_mut()
-                .clone_subtree_from(source.document(), node.id, deep)
+                .clone_subtree_from(source.document(), source_id, deep)
                 .map_err(dom_error)?
         };
+        self.own_created_node(id)?;
         let script_pairs = {
-            let source = node.realm.session.borrow();
+            let source = source_realm.session.borrow();
             let target = self.realm.session.borrow();
-            script_loading::paired_subtree_nodes(source.document(), target.document(), node.id, id)
+            script_loading::paired_subtree_nodes(source.document(), target.document(), source_id, id)
         };
-        let form_state = node.realm.forms.borrow().clone();
+        let fallback=if let Some(registry)=options.0.as_ref().and_then(|options|options.registry.as_ref()) {
+            Some(ctx.with_instance::<custom_elements::DomCustomElementRegistry,_>(registry,|registry|registry.hub_for_import())?)
+        } else {custom_elements::registry_hub(&self.realm,self.base.id)};
+        custom_elements::clone_registry_associations(ctx,&source_realm,&self.realm,&script_pairs,fallback)?;
+        let form_state = forms::clone_state_snapshot(&source_realm.forms.borrow(), &script_pairs);
         let target_session = self.realm.session.borrow();
         forms::clone_live_values_into(
             &form_state,
@@ -8522,26 +10487,46 @@ impl DomDocument {
             &script_pairs,
         );
         drop(target_session);
-        if Rc::ptr_eq(&self.realm, &node.realm) {
+        if Rc::ptr_eq(&self.realm, &source_realm) {
             self.realm.scripts.borrow_mut().clone_states(&script_pairs);
         } else {
-            let source_scripts = node.realm.scripts.borrow();
+            let source_scripts = source_realm.scripts.borrow();
             self.realm
                 .scripts
                 .borrow_mut()
                 .clone_states_from(&source_scripts, &script_pairs);
         }
         event_content_handlers::initialize_subtree(ctx, &self.realm, id)?;
+        custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, id)?;
         Ok(self.realm.wrap(ctx, id))
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn adopt_node(&self, ctx: &mut Ctx, node: Value) -> OpResult<Value> {
         // Do not keep lumen-bind's borrowed `&DomNode` argument projection alive
         // while migrating the native wrapper: adoption mutates that very object
         // in place so it can preserve JavaScript identity.
         let (source_realm, source_id) =
             ctx.with_instance::<DomNode, _>(&node, |node| (node.realm.clone(), node.id))?;
-        let adopted = DomRealm::adopt_node_from(&self.realm, ctx, &source_realm, source_id)?;
+        if source_realm.session.borrow().document().shadow_host(source_id).map_err(dom_error)?.is_some() {
+            return Err(OpError::new("HierarchyRequestError", "shadow roots cannot be adopted"));
+        }
+        // `adopt_node_from` removes the node from its old parent internally;
+        // preserve the donor select's option-list reset around that step.
+        let source_parent = source_realm
+            .session
+            .borrow()
+            .document()
+            .parent(source_id)
+            .map_err(dom_error)?;
+        let affected_select =
+            select_for_removed_option_subtree(&source_realm, source_id, source_parent)?;
+        self.prepare_node_ownership(ctx)?;
+        let adopted = DomRealm::adopt_node_from_to_owner(&self.realm, ctx, &source_realm, source_id, self.base.id, |_, _| Ok(()))?;
+        if let Some(select) = affected_select {
+            forms::select_option_list_changed(&source_realm, select)?;
+        }
+        self.own_created_node(adopted)?;
         Ok(self.realm.wrap(ctx, adopted))
     }
 
@@ -8565,10 +10550,11 @@ impl DomDocument {
         animations::for_tree_root(ctx, &self.realm, self.base.id)
     }
     fn create_range(&self, ctx: &mut Ctx) -> Value {
-        ctx.new_instance(range::DomRange::new(
+        range::DomRange::new_at(
             self.realm.clone(),
             self.realm.ranges.clone(),
-        ))
+            self.base.id,
+        ).into_value(ctx)
     }
 
     fn get_selection(&self, ctx: &mut Ctx) -> Value {
@@ -8619,20 +10605,10 @@ impl DomDocument {
     }
 
     #[getter]
-    fn oninput(&self) -> Nullable<lumen::embed::JsFunction> {
-        Nullable(self.base.base.handler("input"))
-    }
-    #[setter]
-    fn set_oninput(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
-    ) {
-        self.base.base.set_handler(ctx, &this.0, "input", callback);
-    }
-    #[getter]
     fn active_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        if self.is_inert_template_document() {
+            return self.body(ctx);
+        }
         if let Some(node) = self.realm.focused_node() {
             let target = self
                 .realm
@@ -8648,14 +10624,52 @@ impl DomDocument {
 
     #[method(name = "hasFocus")]
     fn has_focus(&self) -> bool {
+        if self.is_inert_template_document() {
+            return false;
+        }
         self.realm
             .browsing_context()
             .is_some_and(|context| browsing_context::is_active_document(&context, &self.realm))
     }
 
+    #[getter(name="designMode")]
+    fn design_mode(&self)->&'static str {
+        if self.realm.session.borrow().document().design_mode_enabled(self.base.id) {"on"}else{"off"}
+    }
+    #[setter(name="designMode",coerce)]
+    fn set_design_mode(&self,ctx:&mut Ctx,value:&str)->OpResult<()> {
+        let enabled=if value.eq_ignore_ascii_case("on") {true}else if value.eq_ignore_ascii_case("off") {false}else{return Ok(());};
+        let changed=self.realm.session.borrow_mut().document_mut().set_design_mode_enabled(self.base.id,enabled).map_err(dom_error)?;
+        if changed && enabled {
+            if let Some(selection)=self.realm.selection.borrow().upgrade() {selection.reset_active_range_to_document(&self.realm,self.base.id)?;}
+            let element=self.realm.session.borrow().document().document_element_at(self.base.id).map_err(dom_error)?;
+            if let Some(element)=element {self.realm.focus(ctx,Some(element))?;}
+        }
+        Ok(())
+    }
+
     #[getter]
     fn document_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let id = selector::document_element(self.realm.session.borrow().document());
+        let id = self
+            .realm
+            .session
+            .borrow()
+            .document()
+            .document_element_at(self.base.id)
+            .map_err(dom_error)?;
+        Ok(self.realm.wrap_option(ctx, id))
+    }
+
+    #[getter]
+    fn root_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let id = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            document
+                .document_element_at(self.base.id)
+                .map_err(dom_error)?
+                .filter(|id| lumen_html::svg_dom::is_svg_root(document, *id))
+        };
         Ok(self.realm.wrap_option(ctx, id))
     }
 
@@ -8663,21 +10677,27 @@ impl DomDocument {
     fn dir(&self) -> String {
         let session = self.realm.session.borrow();
         let document = session.document();
-        selector::document_element(document)
+        document
+            .document_element_at(self.base.id)
+            .ok()
+            .flatten()
             .filter(|id| lumen_html::forms::html_element_local_name(document, *id) == Some("html"))
             .and_then(|id| lumen_html::directionality::dir_attribute_state(document, id))
             .map_or("", lumen_html::directionality::DirAttributeState::keyword)
             .to_owned()
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_dir(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         let id = {
             let session = self.realm.session.borrow();
             let document = session.document();
-            selector::document_element(document).filter(|id| {
-                lumen_html::forms::html_element_local_name(document, *id) == Some("html")
-            })
+            document
+                .document_element_at(self.base.id)
+                .map_err(dom_error)?
+                .filter(|id| {
+                    lumen_html::forms::html_element_local_name(document, *id) == Some("html")
+                })
         };
         let Some(id) = id else {
             return Ok(());
@@ -8688,6 +10708,9 @@ impl DomDocument {
 
     #[getter]
     fn scrolling_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        if self.is_inert_template_document() {
+            return Ok(Value::Null);
+        }
         let id = scrolling::document_scrolling_element(&self.realm)?;
         Ok(self.realm.wrap_option(ctx, id))
     }
@@ -8696,9 +10719,9 @@ impl DomDocument {
     fn body(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let session = self.realm.session.borrow();
         let document = session.document();
-        let html = named_child(document, document.root(), "html").map_err(dom_error)?;
+        let html = named_child(document, self.base.id, &["html"]).map_err(dom_error)?;
         let body = if let Some(html) = html {
-            named_child(document, html, "body").map_err(dom_error)?
+            named_child(document, html, &["body", "frameset"]).map_err(dom_error)?
         } else {
             None
         };
@@ -8706,17 +10729,59 @@ impl DomDocument {
         Ok(self.realm.wrap_option(ctx, body))
     }
 
-    #[method(coerce)]
+    #[setter(hint(js(ce_reactions)))]
+    fn set_body(&self, ctx: &mut Ctx, value: Option<HtmlElementIdentity>) -> OpResult<()> {
+        let Some(value) = value else {
+            return Err(error_reporting::dom_exception(ctx, "HierarchyRequestError", "body must be an HTML body or frameset"));
+        };
+        let node = value;
+        let valid = {
+            let session = node.realm.session.borrow();
+            matches!(lumen_html::forms::html_element_local_name(session.document(), node.id), Some("body" | "frameset"))
+        };
+        if !valid {
+            return Err(error_reporting::dom_exception(ctx, "HierarchyRequestError", "body must be an HTML body or frameset"));
+        }
+        let (html, body) = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            let html = document.document_element_at(self.base.id).map_err(dom_error)?
+                .filter(|root| matches!(document.kind(*root), Ok(NodeKind::Element { namespace: lumen_html::Namespace::Html, .. })));
+            let body = html.map(|html| named_child(document, html, &["body", "frameset"]))
+                .transpose().map_err(dom_error)?.flatten();
+            (html, body)
+        };
+        let Some(html) = html else {
+            return Err(error_reporting::dom_exception(ctx, "HierarchyRequestError", "document has no HTML root"));
+        };
+        if body == Some(node.id) && Rc::ptr_eq(&node.realm, &self.realm) { return Ok(()); }
+        let parent = DomNode {base: DomEventTarget::node(&self.realm, html), realm: self.realm.clone(),
+            id: html, collections: RefCell::new(HashMap::new())};
+        let replacement = node.realm.wrap(ctx, node.id);
+        if let Some(body) = body {
+            let old = self.realm.wrap(ctx, body);
+            parent.replace_child(ctx, replacement, old)?;
+        } else {
+            parent.append_child(ctx, replacement)?;
+        }
+        Ok(())
+    }
+
+    #[method(coerce, hint(js(ce_reactions)))]
     fn create_element(&self, ctx: &mut Ctx, name: &str, options: Option<Value>) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
-        if !lumen_html::xml::is_xml_name(name) {
-            return Err(OpError::new(
+        if !lumen_html::xml::is_valid_element_local_name(name) {
+            return Err(error_reporting::dom_exception(
+                ctx,
                 "InvalidCharacterError",
                 "invalid element name",
             ));
         }
+        let registry=custom_elements::registry_option(ctx,&self.realm,self.base.id,options.as_ref())?;
         let is = custom_elements::custom_element_is(ctx, options)?;
-        let (namespace, name) = if self.realm.is_html_document {
+        self.prepare_node_ownership(ctx)?;
+        let (namespace, name) = if self.realm.is_html_document
+        {
             (Namespace::Html, name.to_ascii_lowercase())
         } else if self.realm.content_type == "application/xhtml+xml" {
             // XHTML is parsed as XML, so element names remain case-sensitive,
@@ -8725,51 +10790,69 @@ impl DomDocument {
         } else {
             (Namespace::Other(Rc::from("")), name.to_owned())
         };
+        let required = self.realm.session.borrow().document().element_creation_allocation_count(&namespace, &name, true);
+        self.realm.prepare_allocation(ctx, required)?;
         let id = self
             .realm
             .session
             .borrow_mut()
             .document_mut()
-            .create(NodeKind::Element {
+            .create_unprefixed_element_with_is_value(
                 namespace,
-                name: name.into(),
-                attributes: is
-                    .map(|value| vec![("is".into(), value)])
-                    .unwrap_or_default(),
-            })
+                name.into(),
+                Vec::new(),
+                is.as_deref(),
+            )
             .map_err(dom_error)?;
-        custom_elements::upgrade_created_element(ctx, &self.realm, id)?;
-        Ok(self.realm.wrap(ctx, id))
+        self.own_created_node(id)?;
+        custom_elements::associate_created(&self.realm,id,registry)?;
+        let chosen=custom_elements::construct_parser_created_element(ctx,&self.realm,id,|_,_|Ok(()))?;
+        if chosen!=id {self.own_created_node(chosen)?;self.realm.defer_detached_root(id);}
+        Ok(self.realm.wrap(ctx, chosen))
     }
 
-    #[method(name = "createElementNS", coerce)]
+    #[method(name = "createElementNS", coerce, hint(js(ce_reactions)))]
     fn create_element_ns(
         &self,
         ctx: &mut Ctx,
         namespace_uri: Option<&str>,
         name: &str,
+        options: Option<Value>,
     ) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
-        let namespace = namespace_for_qname(ctx, namespace_uri, name)?;
+        let namespace = namespace_for_qname(ctx, namespace_uri, name, lumen_html::xml::DomNameContext::Element)?;
+        let registry=custom_elements::registry_option(ctx,&self.realm,self.base.id,options.as_ref())?;
+        let is = custom_elements::custom_element_is(ctx, options)?;
+        self.prepare_node_ownership(ctx)?;
+        let required = self.realm.session.borrow().document().element_creation_allocation_count(&namespace, name, false);
+        self.realm.prepare_allocation(ctx, required)?;
         let name: lumen_html::Name = name.into();
         let id = self
             .realm
             .session
             .borrow_mut()
             .document_mut()
-            .create(NodeKind::Element {
-                namespace,
-                name,
-                attributes: Vec::new(),
-            })
+            .create_with_is_value(
+                NodeKind::Element {
+                    namespace,
+                    name,
+                    attributes: Vec::new(),
+                },
+                is.as_deref(),
+            )
             .map_err(dom_error)?;
-        custom_elements::upgrade_created_element(ctx, &self.realm, id)?;
-        Ok(self.realm.wrap(ctx, id))
+        self.own_created_node(id)?;
+        custom_elements::associate_created(&self.realm,id,registry)?;
+        let chosen=custom_elements::construct_parser_created_element(ctx,&self.realm,id,|_,_|Ok(()))?;
+        if chosen!=id {self.own_created_node(chosen)?;self.realm.defer_detached_root(id);}
+        Ok(self.realm.wrap(ctx, chosen))
     }
 
     #[method(name = "createAttribute", coerce)]
     fn create_attribute(&self, ctx: &mut Ctx, qualified_name: &str) -> OpResult<Value> {
-        attributes::create_attribute(ctx, &self.realm, qualified_name)
+        self.prepare_node_ownership(ctx)?;
+        let value = attributes::create_attribute(ctx, &self.realm, qualified_name)?;
+        self.own_created_value(ctx, value)
     }
 
     #[method(name = "createAttributeNS", coerce)]
@@ -8779,12 +10862,16 @@ impl DomDocument {
         namespace_uri: Option<&str>,
         qualified_name: &str,
     ) -> OpResult<Value> {
-        attributes::create_attribute_ns(ctx, &self.realm, namespace_uri, qualified_name)
+        self.prepare_node_ownership(ctx)?;
+        let value =
+            attributes::create_attribute_ns(ctx, &self.realm, namespace_uri, qualified_name)?;
+        self.own_created_value(ctx, value)
     }
 
     #[method(coerce)]
     fn create_text_node(&self, ctx: &mut Ctx, text: &str) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
+        self.prepare_node_ownership(ctx)?;
         let id = self
             .realm
             .session
@@ -8792,6 +10879,7 @@ impl DomDocument {
             .document_mut()
             .create(NodeKind::Text(text.to_owned()))
             .map_err(dom_error)?;
+        self.own_created_node(id)?;
         Ok(self.realm.wrap(ctx, id))
     }
 
@@ -8809,6 +10897,7 @@ impl DomDocument {
                 "CDATA data cannot contain ]]>",
             ));
         }
+        self.prepare_node_ownership(ctx)?;
         let id = self
             .realm
             .session
@@ -8816,12 +10905,14 @@ impl DomDocument {
             .document_mut()
             .create(NodeKind::CData(data.to_owned()))
             .map_err(dom_error)?;
+        self.own_created_node(id)?;
         Ok(self.realm.wrap(ctx, id))
     }
 
     #[method(coerce)]
     fn create_comment(&self, ctx: &mut Ctx, text: &str) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
+        self.prepare_node_ownership(ctx)?;
         let id = self
             .realm
             .session
@@ -8829,6 +10920,7 @@ impl DomDocument {
             .document_mut()
             .create(NodeKind::Comment(text.to_owned()))
             .map_err(dom_error)?;
+        self.own_created_node(id)?;
         Ok(self.realm.wrap(ctx, id))
     }
 
@@ -8856,6 +10948,7 @@ impl DomDocument {
                 "processing instruction data cannot contain ?>",
             ));
         }
+        self.prepare_node_ownership(ctx)?;
         let id = self
             .realm
             .session
@@ -8866,19 +10959,41 @@ impl DomDocument {
                 data: data.into(),
             })
             .map_err(dom_error)?;
+        self.own_created_node(id)?;
         Ok(self.realm.wrap(ctx, id))
     }
 
     #[method(coerce)]
     fn get_element_by_id(&self, ctx: &mut Ctx, id: &str) -> OpResult<Value> {
         let session = self.realm.session.borrow();
-        let found = element_by_id(session.document(), id).map_err(dom_error)?;
+        let document = session.document();
+        let found = if self.base.id == document.root() {
+            element_by_id(document, id).map_err(dom_error)?
+        } else {
+            let mut cursor = document.first_child(self.base.id).map_err(dom_error)?;
+            let mut found = None;
+            while let Some(node) = cursor {
+                if document
+                    .get_attribute_ns_ref(node, None, "id")
+                    .ok()
+                    .flatten()
+                    == Some(id)
+                {
+                    found = Some(node);
+                    break;
+                }
+                cursor =
+                    selector::next_descendant(document, self.base.id, node).map_err(dom_error)?;
+            }
+            found
+        };
         drop(session);
         Ok(self.realm.wrap_option(ctx, found))
     }
 
     fn create_document_fragment(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
+        self.prepare_node_ownership(ctx)?;
         let id = self
             .realm
             .session
@@ -8886,18 +11001,10 @@ impl DomDocument {
             .document_mut()
             .create(NodeKind::DocumentFragment)
             .map_err(dom_error)?;
+        self.own_created_node(id)?;
         Ok(self.realm.wrap(ctx, id))
     }
-
-    #[method(coerce)]
-    fn query_selector(&self, ctx: &mut Ctx, selector: &str) -> OpResult<Value> {
-        let session = self.realm.session.borrow();
-        let id = selector::query_selector(session.document(), session.document().root(), selector)
-            .map_err(|error| selector_error(ctx, error))?;
-        drop(session);
-        Ok(self.realm.wrap_option(ctx, id))
-    }
-}
+} }
 
 #[lumen_bind::class(name = "Node", extends = DomEventTarget, hint(js(webidl)))]
 pub struct DomNode {
@@ -8912,6 +11019,10 @@ impl lumen::embed::NativeIdentityOwner for DomNode {
 
     fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
         self.base.trace_callback_values(visit);
+        if let Some(data)=self.realm.fragment_state.borrow().as_ref() { data.trace_values(visit); }
+        if let Some(value) = self.realm.selection_wrapper.borrow().as_ref().and_then(WeakValue::upgrade) { visit(&value); }
+        if let Some(selection) = self.realm.selection.borrow().upgrade() { selection.trace_values(visit); }
+
     }
 
     fn trace_native_identities(&self, epoch: u64, visit: &mut dyn FnMut(&Value)) {
@@ -8927,6 +11038,14 @@ impl lumen::embed::NativeIdentityOwner for DomNode {
                 if let Some(root) = root {
                     realm.trace_native_identity_component(epoch, root, visit);
                 }
+            }
+        }
+        if self.id==realm.session.borrow().document().root() {
+            for retention in realm.document_parser_retention.borrow().iter() {
+                let Some((owner,node))=retention.current() else {continue;};
+                if Rc::ptr_eq(&owner,realm) {continue;}
+                let root={let session=owner.session.borrow();selector::native_identity_root(session.document(),node).ok()};
+                if let Some(root)=root {owner.trace_native_identity_component(epoch,root,visit);owner.trace_document_wrapper(epoch,visit);}
             }
         }
         // Every cached wrapper in a completed component is recorded, so most
@@ -8958,6 +11077,601 @@ impl lumen::embed::NativeIdentityOwner for DomNode {
 }
 
 impl DomNode {
+    fn cryptographic_nonce(&self)->OpResult<String> {
+        self.realm.session.borrow().document().cryptographic_nonce(self.id).map(str::to_owned).map_err(dom_error)
+    }
+    fn set_cryptographic_nonce(&self,value:&str)->OpResult<()> {
+        self.realm.session.borrow_mut().document_mut().set_cryptographic_nonce(self.id,value).map_err(dom_error)
+    }
+
+    fn assigned_slot(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let slot = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            document
+                .assigned_slot(self.id)
+                .map_err(dom_error)?
+                .filter(|slot| {
+                    document
+                        .root_node(*slot, false)
+                        .ok()
+                        .and_then(|root| document.shadow_mode(root).ok().flatten())
+                        == Some(lumen_html::ShadowMode::Open)
+                })
+        };
+        Ok(self.realm.wrap_option(ctx, slot))
+    }
+
+    fn previous_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let sibling = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            let mut sibling = document.previous_sibling(self.id).map_err(dom_error)?;
+            while let Some(id) = sibling {
+                if matches!(
+                    document.kind(id).map_err(dom_error)?,
+                    NodeKind::Element { .. }
+                ) {
+                    break;
+                }
+                sibling = document.previous_sibling(id).map_err(dom_error)?;
+            }
+            sibling
+        };
+        Ok(self.realm.wrap_option(ctx, sibling))
+    }
+
+    fn next_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let sibling = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            let mut sibling = document.next_sibling(self.id).map_err(dom_error)?;
+            while let Some(id) = sibling {
+                if matches!(
+                    document.kind(id).map_err(dom_error)?,
+                    NodeKind::Element { .. }
+                ) {
+                    break;
+                }
+                sibling = document.next_sibling(id).map_err(dom_error)?;
+            }
+            sibling
+        };
+        Ok(self.realm.wrap_option(ctx, sibling))
+    }
+
+    fn before(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.insert_sibling_values(ctx, nodes, false)
+    }
+
+    fn after(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.insert_sibling_values(ctx, nodes, true)
+    }
+
+    fn replace_with(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        self.replace_with_values(ctx, nodes)
+    }
+
+    fn remove(&self) -> OpResult<()> {
+        remove_dom_node(&self.realm, self.id)
+    }
+
+    fn children(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        if let Some(value) = self
+            .collections
+            .borrow()
+            .get("children")
+            .and_then(WeakValue::upgrade)
+        {
+            return value;
+        }
+        let value = DomHtmlCollection::create(ctx, DomNodeList::children(self.realm.clone(), self.id, true, this.0));
+        self.collections.borrow_mut().insert(
+            "children".into(),
+            ctx.weak_value(&value).expect("collection object"),
+        );
+        value
+    }
+
+    fn first_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let child = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            let mut child = document.first_child(self.id).map_err(dom_error)?;
+            while let Some(id) = child {
+                if matches!(
+                    document.kind(id).map_err(dom_error)?,
+                    NodeKind::Element { .. }
+                ) {
+                    break;
+                }
+                child = document.next_sibling(id).map_err(dom_error)?;
+            }
+            child
+        };
+        Ok(self.realm.wrap_option(ctx, child))
+    }
+
+    fn last_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let child = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            let mut child = document.last_child(self.id).map_err(dom_error)?;
+            while let Some(id) = child {
+                if matches!(
+                    document.kind(id).map_err(dom_error)?,
+                    NodeKind::Element { .. }
+                ) {
+                    break;
+                }
+                child = document.previous_sibling(id).map_err(dom_error)?;
+            }
+            child
+        };
+        Ok(self.realm.wrap_option(ctx, child))
+    }
+
+    fn child_element_count(&self) -> OpResult<u32> {
+        let session = self.realm.session.borrow();
+        let document = session.document();
+        let mut child = document.first_child(self.id).map_err(dom_error)?;
+        let mut count = 0;
+        while let Some(id) = child {
+            if matches!(
+                document.kind(id).map_err(dom_error)?,
+                NodeKind::Element { .. }
+            ) {
+                count += 1;
+            }
+            child = document.next_sibling(id).map_err(dom_error)?;
+        }
+        Ok(count)
+    }
+
+    fn query_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        let session = self.realm.session.borrow();
+        let id = selector::query_selector(session.document(), self.id, query)
+            .map_err(|error| selector_error(ctx, error))?;
+        drop(session);
+        Ok(self.realm.wrap_option(ctx, id))
+    }
+
+    fn query_selector_all(
+        &self,
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        query: &str,
+    ) -> OpResult<DomNodeList> {
+        let nodes =
+            selector::query_selector_all(self.realm.session.borrow().document(), self.id, query)
+                .map_err(|error| selector_error(ctx, error))?;
+        Ok(DomNodeList::snapshot(self.realm.clone(), nodes, this.0))
+    }
+
+    fn append(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        let node = converted_dom_node(ctx, self, nodes)?;
+        insert_dom_node(ctx, &self.realm, self.id, node.value, Value::Null)?;
+        Ok(())
+    }
+
+    fn prepend(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        let node = converted_dom_node(ctx, self, nodes)?;
+        let before = self.realm.session.borrow().document().first_child(self.id).map_err(dom_error)?;
+        let before = self.realm.wrap_option(ctx, before);
+        insert_dom_node(ctx, &self.realm, self.id, node.value, before)?;
+        Ok(())
+    }
+
+    fn replace_children(&self, ctx: &mut Ctx, nodes: Vec<NodeOrDOMString>) -> OpResult<()> {
+        let node = converted_dom_node(ctx, self, nodes)?;
+        let (source, source_id) = ctx.with_instance::<DomNode, _>(&node.value, |node| (node.realm.clone(), node.id))?;
+        let source_parent = source.session.borrow().document().parent(source_id).map_err(dom_error)?;
+        let source_select = select_for_removed_option_subtree(&source, source_id, source_parent)?;
+        {
+            let target = self.realm.session.borrow();
+            let donor = source.session.borrow();
+            target.document().validate_replace_children_from(donor.document(), self.id, source_id).map_err(dom_error)?;
+        }
+        let different_owner = source.session.borrow().document().node_document(source_id).map_err(dom_error)? != self.realm.session.borrow().document().node_document(self.id).map_err(dom_error)?;
+        if (!Rc::ptr_eq(&self.realm, &source) || different_owner) && matches!(source.session.borrow().document().kind(source_id), Ok(NodeKind::DocumentFragment)) {
+            let old = children(self.realm.session.borrow().document(), self.id).map_err(dom_error)?;
+            let old_selectedness = capture_select_mutation(&self.realm, self.id, &[], &old)?;
+            let _old_leases: Vec<_> = old.iter().map(|&id| NodeRetention::new(&self.realm, id)).collect();
+            let incoming = source.session.borrow().document().insertion_roots(&[source_id]).map_err(dom_error)?;
+            template_graph::preflight_adoption_roots(ctx, &source, &incoming, &self.realm)?;
+            self.realm.session.borrow_mut().document_mut().remove_children_for_replacement(self.id).map_err(dom_error)?;
+            let (roots, _leases) = adopt_fragment_children(ctx, &self.realm, self.id, &source, source_id)?;
+            let mut select_mutation = capture_select_mutation(&self.realm, self.id, &roots, &[])?;
+            select_mutation.normalize_target |= old_selectedness.normalize_target;
+            if select_mutation.target_select.is_none() { select_mutation.target_select = old_selectedness.target_select; }
+            for select in old_selectedness.source_selects {
+                if !select_mutation.source_selects.contains(&select) { select_mutation.source_selects.push(select); }
+            }
+            self.realm.session.borrow_mut().document_mut().insert_replacement_roots(self.id, roots.clone(), old.clone()).map_err(dom_error)?;
+            apply_select_mutation(&self.realm, select_mutation)?;
+            self.realm.invalidate_textarea_ancestor(self.id);
+            self.realm.reap_detached(old);
+            upgrade_inserted_roots(ctx, &self.realm, &roots, None)?;
+            self.realm.flush_script_activations(ctx)?;
+            return Ok(());
+        }
+        let destination_owner = self.realm.session.borrow().document().node_document(self.id).map_err(dom_error)?;
+        let source_owner = source.session.borrow().document().node_document(source_id).map_err(dom_error)?;
+        let id = if Rc::ptr_eq(&self.realm, &source) && source_owner == destination_owner { source_id } else {
+            DomRealm::adopt_node_from_to_owner(&self.realm, ctx, &source, source_id, destination_owner,
+                |target, donor| target.validate_replace_children_from(donor, self.id, source_id))?
+        };
+        let old = children(self.realm.session.borrow().document(), self.id).map_err(dom_error)?;
+        let select_mutation = capture_select_mutation(&self.realm, self.id, &[id], &old)?;
+        let inserted = capture_inserted_roots(&self.realm, &[id])?;
+        self.realm.session.borrow_mut().document_mut().replace_children(self.id, id).map_err(dom_error)?;
+        if !Rc::ptr_eq(&source, &self.realm) {
+            if let Some(select) = source_select { forms::select_option_list_changed(&source, select)?; }
+        }
+        apply_select_mutation(&self.realm, select_mutation)?;
+        self.realm.invalidate_textarea_ancestor(self.id);
+        self.realm.reap_detached(old);
+        upgrade_inserted_roots(ctx, &self.realm, &[id], inserted)?;
+        self.realm.flush_script_activations(ctx)?;
+        Ok(())
+    }
+
+    fn namespace_uri(&self) -> OpResult<Nullable<String>> {
+        let session = self.realm.session.borrow();
+        Ok(Nullable(
+            match session.document().kind(self.id).map_err(dom_error)? {
+                NodeKind::Element {
+                    namespace: Namespace::Other(value),
+                    ..
+                } if value.is_empty() => None,
+                NodeKind::Element { namespace, .. } => Some(
+                    match namespace {
+                        Namespace::Html => "http://www.w3.org/1999/xhtml",
+                        Namespace::Svg => "http://www.w3.org/2000/svg",
+                        Namespace::MathMl => "http://www.w3.org/1998/Math/MathML",
+                        Namespace::Other(value) => value,
+                    }
+                    .into(),
+                ),
+                _ => None,
+            },
+        ))
+    }
+
+    fn local_name(&self) -> OpResult<Option<String>> {
+        let session = self.realm.session.borrow();
+        let document = session.document();
+        Ok(match document.kind(self.id).map_err(dom_error)? {
+            NodeKind::Element { .. } => Some(String::from(
+                document.element_name_parts(self.id).map_err(dom_error)?.1,
+            )),
+            _ => None,
+        })
+    }
+
+    fn prefix(&self) -> OpResult<Nullable<String>> {
+        let session = self.realm.session.borrow();
+        let document = session.document();
+        Ok(Nullable(
+            match document.kind(self.id).map_err(dom_error)? {
+                NodeKind::Element { .. } => document
+                    .element_name_parts(self.id)
+                    .map_err(dom_error)?
+                    .0
+                    .map(str::to_owned),
+                _ => None,
+            },
+        ))
+    }
+
+    fn tag_name(&self) -> OpResult<String> {
+        self.node_name()
+    }
+
+    fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        if let Some(value) = self
+            .collections
+            .borrow()
+            .get("style")
+            .and_then(WeakValue::upgrade)
+        {
+            return value;
+        }
+        let value = ctx.new_instance(DomStyle {
+            realm: self.realm.clone(),
+            node: self.id,
+            computed: false,
+            pseudo: None,
+            invalid_pseudo: false,
+            _owner: this.0,
+        });
+        self.collections.borrow_mut().insert(
+            "style".into(),
+            ctx.weak_value(&value).expect("style object"),
+        );
+        value
+    }
+
+    fn set_style(&self, value: &str) -> OpResult<()> {
+        let serialized = lumen_html::css::cssom_declaration_text(value);
+        let block = lumen_html::css::DeclarationBlock::parse(&serialized).map_err(style::css_error)?;
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .set_inline_cssom_style(self.id, block)
+            .map_err(dom_error)
+    }
+
+    fn id(&self) -> OpResult<String> {
+        Ok(self.get_null_attribute("id")?.unwrap_or_default())
+    }
+
+    fn set_id(&self, value: &str) -> OpResult<()> {
+        self.set_attribute_core("id", value)
+    }
+
+    fn class_name(&self) -> OpResult<String> {
+        Ok(self.get_null_attribute("class")?.unwrap_or_default())
+    }
+
+    fn set_class_name(&self, value: &str) -> OpResult<()> {
+        self.set_attribute_core("class", value)
+    }
+
+    fn class_list(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.token_list(ctx,this.0,"classList","class",None)
+    }
+
+    fn token_list(&self,ctx:&mut Ctx,owner:Value,key:&'static str,attribute:&'static str,supported:Option<&'static [&'static str]>)->Value {
+        if let Some(value) = self
+            .collections
+            .borrow()
+            .get(key)
+            .and_then(WeakValue::upgrade)
+        {
+            return value;
+        }
+        let value = ctx.new_instance(DomTokenList {
+            realm: self.realm.clone(),
+            node: self.id,
+            owner,
+            attribute,
+            supported,
+        });
+        ctx.set_native_identity_owner::<DomTokenList>(&value).ok().expect("token list native identity owner");
+        self.collections.borrow_mut().insert(
+            key.into(),
+            ctx.weak_value(&value).expect("collection object"),
+        );
+        value
+    }
+
+    fn inner_html(&self, ctx: &mut Ctx) -> OpResult<String> {
+        let graph = if self.realm.template_graph_owners.borrow().is_empty() { None } else { Some(template_graph::ArenaGraph::new(&self.realm)?) };
+        let result = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            if document.is_html_document()
+            {
+                match &graph { Some(graph) => html::inner_html_with_graph(graph, self.id), None => html::inner_html(document, self.id) }
+            } else {
+                match &graph { Some(graph) => lumen_html::xml::inner_html_with_graph(graph, self.id), None => lumen_html::xml::inner_html(document, self.id) }
+            }
+        };
+        result.map_err(|error| {
+            if error == Error::WrongKind {
+                error_reporting::dom_exception(
+                    ctx,
+                    "InvalidStateError",
+                    "XML innerHTML serialization would not be well-formed",
+                )
+            } else {
+                dom_error(error)
+            }
+        })
+    }
+
+    fn set_inner_html(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> {
+        self.replace_markup(ctx, value.0, false, false)
+    }
+
+    fn matches(&self, ctx: &mut Ctx, query: &str) -> OpResult<bool> {
+        let session = self.realm.session.borrow();
+        selector::matches(session.document(), self.id, query)
+            .map_err(|error| selector_error(ctx, error))
+    }
+
+    fn webkit_matches_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<bool> {
+        self.matches(ctx, query)
+    }
+
+    fn closest(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        let session = self.realm.session.borrow();
+        let id = selector::closest(session.document(), self.id, query)
+            .map_err(|error| selector_error(ctx, error))?;
+        drop(session);
+        Ok(self.realm.wrap_option(ctx, id))
+    }
+
+    fn has_attribute(&self, name: &str) -> OpResult<bool> {
+        Ok(self.get_attribute(name)?.0.is_some())
+    }
+
+    fn set_attribute(&self, ctx: &mut Ctx, name: &str, value: &str) -> OpResult<()> {
+        let name = self.normalized_attribute_name(name);
+        if !lumen_html::xml::is_valid_attribute_local_name(name.as_ref()) {
+            return Err(error_reporting::dom_exception(
+                ctx,
+                "InvalidCharacterError",
+                "attribute name is not a valid attribute local name",
+            ));
+        }
+        let namespace_uri = self
+            .realm
+            .session
+            .borrow()
+            .document()
+            .attribute_namespace_uri(self.id, name.as_ref())
+            .map_err(dom_error)?;
+        self.set_attribute_by_name_core(name.as_ref(), value)?;
+        event_content_handlers::attribute_changed(
+            ctx,
+            &self.realm,
+            self.id,
+            namespace_uri.as_deref(),
+            name.as_ref(),
+            Some(value),
+        )?;
+        self.realm.flush_script_activations(ctx)
+    }
+
+    fn remove_attribute(&self, ctx: &mut Ctx, name: &str) -> OpResult<()> {
+        let name = self.normalized_attribute_name(name);
+        let existed = self.get_attribute(name.as_ref())?.0.is_some();
+        let namespace_uri = self
+            .realm
+            .session
+            .borrow()
+            .document()
+            .attribute_namespace_uri(self.id, name.as_ref())
+            .map_err(dom_error)?;
+        self.remove_attribute_by_name_core(name.as_ref())?;
+        if existed {
+            event_content_handlers::attribute_changed(
+                ctx,
+                &self.realm,
+                self.id,
+                namespace_uri.as_deref(),
+                name.as_ref(),
+                None,
+            )?;
+        }
+        self.realm.flush_script_activations(ctx)
+    }
+
+    fn get_attribute_ns(
+        &self,
+        namespace_uri: Option<&str>,
+        local_name: &str,
+    ) -> OpResult<Nullable<String>> {
+        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
+        self.realm
+            .session
+            .borrow()
+            .document()
+            .get_attribute_ns(self.id, namespace_uri, local_name)
+            .map(Nullable)
+            .map_err(dom_error)
+    }
+
+    fn has_attribute_ns(&self, namespace_uri: Option<&str>, local_name: &str) -> OpResult<bool> {
+        Ok(self
+            .get_attribute_ns(namespace_uri, local_name)?
+            .0
+            .is_some())
+    }
+
+    fn set_attribute_ns(
+        &self,
+        ctx: &mut Ctx,
+        namespace_uri: Option<&str>,
+        qualified_name: &str,
+        value: &str,
+    ) -> OpResult<()> {
+        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
+        namespace_for_qname(ctx, namespace_uri, qualified_name, lumen_html::xml::DomNameContext::Attribute)?;
+        let _html_allocations = enter_html_allocation_category();
+        if namespace_uri.is_none() {
+            forms::prepare_input_attribute_change(&self.realm, self.id, qualified_name)?;
+        }
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .set_attribute_ns(self.id, namespace_uri, qualified_name, value)
+            .map_err(dom_error)?;
+        if namespace_uri.is_none() {
+            forms::resanitize_input_after_attribute_change(&self.realm, self.id, qualified_name)?;
+        }
+        self.after_attribute_write(qualified_name, namespace_uri.is_some())?;
+        event_content_handlers::attribute_changed(
+            ctx,
+            &self.realm,
+            self.id,
+            namespace_uri,
+            qualified_name,
+            Some(value),
+        )?;
+        self.realm.flush_script_activations(ctx)
+    }
+
+    fn remove_attribute_ns(
+        &self,
+        ctx: &mut Ctx,
+        namespace_uri: Option<&str>,
+        local_name: &str,
+    ) -> OpResult<()> {
+        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
+        let _html_allocations = enter_html_allocation_category();
+        let materialized = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            materialized_attribute_by_ns(document, self.id, namespace_uri, local_name)
+        };
+        let existed = self
+            .realm
+            .session
+            .borrow()
+            .document()
+            .get_attribute_ns(self.id, namespace_uri, local_name)
+            .map_err(dom_error)?
+            .is_some();
+        if namespace_uri.is_none() && existed {
+            forms::prepare_input_attribute_change(&self.realm, self.id, local_name)?;
+        }
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .remove_attribute_ns(self.id, namespace_uri, local_name)
+            .map_err(dom_error)?;
+        if namespace_uri.is_none() {
+            forms::resanitize_input_after_attribute_change(&self.realm, self.id, local_name)?;
+        }
+        if let Some(attribute) = materialized {
+            self.realm.reap_detached([attribute]);
+        }
+        self.after_attribute_removal(local_name, namespace_uri.is_some())?;
+        if existed {
+            event_content_handlers::attribute_changed(
+                ctx,
+                &self.realm,
+                self.id,
+                namespace_uri,
+                local_name,
+                None,
+            )?;
+        }
+        self.realm.flush_script_activations(ctx)
+    }
+
+    fn get_attribute(&self, name: &str) -> OpResult<Nullable<String>> {
+        let name = self.normalized_attribute_name(name);
+        let session = self.realm.session.borrow();
+        let NodeKind::Element { attributes, .. } =
+            session.document().kind(self.id).map_err(dom_error)?
+        else {
+            return Err(OpError::new("TypeError", "attributes require an element"));
+        };
+        Ok(Nullable(
+            attributes
+                .iter()
+                .find(|(key, _)| key.as_str() == name.as_ref())
+                .map(|(_, value)| value.clone()),
+        ))
+    }
+
     fn replace_text_content(
         ctx: &mut Ctx,
         realm: &Rc<DomRealm>,
@@ -9073,99 +11787,62 @@ impl DomNode {
         {
             return value;
         }
-        let value = ctx.new_instance(DomHtmlCollection {
-            base: DomNodeList::descendants(self.realm.clone(), self.id, filter, owner),
-        });
+        let value = DomHtmlCollection::create(ctx, DomNodeList::descendants(self.realm.clone(), self.id, filter, owner));
         self.collections
             .borrow_mut()
             .insert(key, ctx.weak_value(&value).expect("collection object"));
         value
     }
 
-    fn insert_sibling_values(
-        &self,
-        ctx: &mut Ctx,
-        values: Vec<Value>,
-        after: bool,
-    ) -> OpResult<()> {
-        let (nodes, generated) = converted_dom_nodes(ctx, &self.realm, values)?;
-        let (parent, before) = {
+    fn viable_sibling(&self, ctx: &mut Ctx, values: &[NodeOrDOMString], after: bool) -> OpResult<Option<NodeId>> {
+        let mut sibling = {
             let session = self.realm.session.borrow();
-            let document = session.document();
-            let parent = document.parent(self.id).map_err(dom_error)?;
-            let before = match (parent, after) {
-                (Some(_), true) => document.next_sibling(self.id).map_err(dom_error)?,
-                (Some(_), false) => Some(self.id),
-                (None, _) => None,
-            };
-            (parent, before)
+            if after { session.document().next_sibling(self.id) } else { session.document().previous_sibling(self.id) }.map_err(dom_error)?
         };
-        let Some(parent) = parent else {
-            discard_generated_dom_nodes(&self.realm, &generated);
-            return Ok(());
-        };
-        let select_mutation = capture_select_mutation(&self.realm, parent, &nodes, &[])?;
-        let result = self
-            .realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .insert_many_before(parent, &nodes, before)
-            .map_err(dom_error);
-        if result.is_err() {
-            discard_generated_dom_nodes(&self.realm, &generated);
+        while let Some(id) = sibling {
+            if !variadic_contains_node(ctx, values, &self.realm, id)? { break; }
+            let session = self.realm.session.borrow();
+            sibling = if after { session.document().next_sibling(id) } else { session.document().previous_sibling(id) }.map_err(dom_error)?;
         }
-        result?;
-        apply_select_mutation(&self.realm, select_mutation)?;
-        self.realm.invalidate_textarea_ancestor(parent);
-        self.realm.flush_script_activations(ctx)?;
+        Ok(sibling)
+    }
+
+    fn insert_sibling_values(&self, ctx: &mut Ctx, values: Vec<NodeOrDOMString>, after: bool) -> OpResult<()> {
+        let Some(parent) = self.realm.session.borrow().document().parent(self.id).map_err(dom_error)? else { return Ok(()); };
+        let viable = self.viable_sibling(ctx, &values, after)?;
+        let node = converted_dom_node(ctx, self, values)?;
+        let before = if after { viable } else {
+            let session = self.realm.session.borrow();
+            match viable { Some(previous) => session.document().next_sibling(previous), None => session.document().first_child(parent) }.map_err(dom_error)?
+        };
+        let before = self.realm.wrap_option(ctx, before);
+        insert_dom_node(ctx, &self.realm, parent, node.value, before)?;
         Ok(())
     }
 
-    fn replace_with_values(&self, ctx: &mut Ctx, values: Vec<Value>) -> OpResult<()> {
-        let (nodes, generated) = converted_dom_nodes(ctx, &self.realm, values)?;
-        let (parent, before) = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            (
-                document.parent(self.id).map_err(dom_error)?,
-                document.next_sibling(self.id).map_err(dom_error)?,
-            )
-        };
-        let Some(parent) = parent else {
-            discard_generated_dom_nodes(&self.realm, &generated);
-            return Ok(());
-        };
-        let select_mutation = capture_select_mutation(&self.realm, parent, &nodes, &[self.id])?;
-        let result = {
-            let mut session = self.realm.session.borrow_mut();
-            let document = session.document_mut();
-            if nodes.contains(&self.id) {
-                document.insert_many_before(parent, &nodes, before)
-            } else {
-                document
-                    .remove(self.id)
-                    .and_then(|()| document.insert_many_before(parent, &nodes, before))
-            }
-            .map_err(dom_error)
-        };
-        if result.is_err() {
-            discard_generated_dom_nodes(&self.realm, &generated);
+    fn replace_with_values(&self, ctx: &mut Ctx, values: Vec<NodeOrDOMString>) -> OpResult<()> {
+        let Some(parent) = self.realm.session.borrow().document().parent(self.id).map_err(dom_error)? else { return Ok(()); };
+        let viable = self.viable_sibling(ctx, &values, true)?;
+        let node = converted_dom_node(ctx, self, values)?;
+        let remains = self.realm.session.borrow().document().parent(self.id).map_err(dom_error)? == Some(parent);
+        if remains {
+            let old = self.realm.wrap(ctx, self.id);
+            replace_dom_node(ctx, &self.realm, parent, node.value, old)?;
+        } else {
+            let before = self.realm.wrap_option(ctx, viable);
+            insert_dom_node(ctx, &self.realm, parent, node.value, before)?;
         }
-        result?;
-        apply_select_mutation(&self.realm, select_mutation)?;
-        self.realm.invalidate_textarea_ancestor(parent);
-        self.realm.flush_script_activations(ctx)?;
         Ok(())
     }
 
     fn outer_html(&self) -> OpResult<String> {
+        let graph = if self.realm.template_graph_owners.borrow().is_empty() { None } else { Some(template_graph::ArenaGraph::new(&self.realm)?) };
         let session = self.realm.session.borrow();
         let document = session.document();
         if document.is_html_document() {
-            html::outer_html(document, self.id).map_err(dom_error)
+            match &graph { Some(graph) => html::outer_html_with_graph(graph, self.id), None => html::outer_html(document, self.id) }.map_err(dom_error)
         } else {
-            lumen_html::xml::outer_html(document, self.id).map_err(|error| {
+            match &graph { Some(graph) => lumen_html::xml::outer_html_with_graph(graph, self.id), None => lumen_html::xml::outer_html(document, self.id) }.map_err(|error| {
                 if error == Error::WrongKind {
                     OpError::new(
                         "InvalidStateError",
@@ -9232,6 +11909,7 @@ impl DomNode {
         let inserted = children(document, fragment).map_err(dom_error)?;
         let inert_scripts = script_loading::scripts_in_subtree(document, fragment);
         drop(session);
+        for &node in &inserted {custom_elements::associate_parsed_subtree(&self.realm,node,parent)?;}
         let select_mutation = match capture_select_mutation(&self.realm, parent, &inserted, &[]) {
             Ok(mutation) => mutation,
             Err(error) => {
@@ -9312,23 +11990,20 @@ impl DomNode {
             self.realm.scripts.borrow_mut().mark_started(node);
         }
         drop(session);
-        let select_mutation = match capture_select_mutation(
-            &self.realm,
-            parent,
-            &inserted,
-            &[self.id],
-        ) {
-            Ok(mutation) => mutation,
-            Err(error) => {
-                self.realm
-                    .session
-                    .borrow_mut()
-                    .document_mut()
-                    .destroy_subtree(fragment)
-                    .map_err(dom_error)?;
-                return Err(error);
-            }
-        };
+        for &node in &inserted {custom_elements::associate_parsed_subtree(&self.realm,node,parent)?;}
+        let select_mutation =
+            match capture_select_mutation(&self.realm, parent, &inserted, &[self.id]) {
+                Ok(mutation) => mutation,
+                Err(error) => {
+                    self.realm
+                        .session
+                        .borrow_mut()
+                        .document_mut()
+                        .destroy_subtree(fragment)
+                        .map_err(dom_error)?;
+                    return Err(error);
+                }
+            };
         let mut session = self.realm.session.borrow_mut();
         let document = session.document_mut();
         let result = document.replace(self.id, fragment).map_err(dom_error);
@@ -9353,8 +12028,25 @@ impl DomNode {
 
 #[lumen_bind::methods]
 impl DomNode {
+    fn normalize(&self) -> OpResult<()> {
+        self.realm.session.borrow_mut().document_mut().normalize(self.id).map_err(dom_error)?;
+        self.realm.invalidate_textarea_ancestor(self.id);
+        Ok(())
+    }
+
     #[getter(rename(js = "baseURI"))]
     fn base_uri(&self) -> String {
+        {
+            let session = self.realm.session.borrow();
+            if session
+                .document()
+                .node_document(self.id)
+                .ok()
+                .is_some_and(|owner| session.document().is_template_owner_document(owner))
+            {
+                return "about:blank".into();
+            }
+        }
         self.realm.base_url()
     }
     fn has_child_nodes(&self) -> OpResult<bool> {
@@ -9366,16 +12058,6 @@ impl DomNode {
             .first_child(self.id)
             .map_err(dom_error)?
             .is_some())
-    }
-    fn before(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        self.insert_sibling_values(ctx, nodes, false)
-    }
-    fn after(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        self.insert_sibling_values(ctx, nodes, true)
-    }
-    #[method(name = "replaceWith")]
-    fn replace_with(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        self.replace_with_values(ctx, nodes)
     }
     fn get_root_node(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
         let composed = match options {
@@ -9396,168 +12078,34 @@ impl DomNode {
         Ok(self.realm.wrap(ctx, root))
     }
     #[getter]
-    fn assigned_slot(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let slot = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            document
-                .assigned_slot(self.id)
-                .map_err(dom_error)?
-                .filter(|slot| {
-                    document
-                        .root_node(*slot, false)
-                        .ok()
-                        .and_then(|root| document.shadow_mode(root).ok().flatten())
-                        == Some(lumen_html::ShadowMode::Open)
-                })
-        };
-        Ok(self.realm.wrap_option(ctx, slot))
-    }
-    fn append(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        let (ids, generated) = converted_dom_nodes(ctx, &self.realm, nodes)?;
-        let select_mutation = capture_select_mutation(&self.realm, self.id, &ids, &[])?;
-        let result = self
-            .realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .append_many(self.id, &ids)
-            .map_err(dom_error);
-        if result.is_err() {
-            discard_generated_dom_nodes(&self.realm, &generated);
-        }
-        result?;
-        apply_select_mutation(&self.realm, select_mutation)?;
-        self.realm.invalidate_textarea_ancestor(self.id);
-        self.realm.flush_script_activations(ctx)?;
-        Ok(())
-    }
-    fn prepend(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        let (ids, generated) = converted_dom_nodes(ctx, &self.realm, nodes)?;
-        let before = self
-            .realm
-            .session
-            .borrow()
-            .document()
-            .first_child(self.id)
-            .map_err(dom_error)?;
-        let select_mutation = capture_select_mutation(&self.realm, self.id, &ids, &[])?;
-        let result = self
-            .realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .insert_many_before(self.id, &ids, before)
-            .map_err(dom_error);
-        if result.is_err() {
-            discard_generated_dom_nodes(&self.realm, &generated);
-        }
-        result?;
-        apply_select_mutation(&self.realm, select_mutation)?;
-        self.realm.invalidate_textarea_ancestor(self.id);
-        self.realm.flush_script_activations(ctx)?;
-        Ok(())
-    }
-    fn replace_children(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
-        let (ids, generated) = converted_dom_nodes(ctx, &self.realm, nodes)?;
-        let session = self.realm.session.borrow_mut();
-        let old = children(session.document(), self.id).map_err(dom_error)?;
-        drop(session);
-        let select_mutation = capture_select_mutation(&self.realm, self.id, &ids, &old)?;
-        let mut session = self.realm.session.borrow_mut();
-        let result = session
-            .document_mut()
-            .replace_children_many(self.id, &ids)
-            .map_err(dom_error);
-        if result.is_err() {
-            for id in generated {
-                let _ = session.document_mut().destroy_subtree(id);
-            }
-        }
-        result?;
-        drop(session);
-        apply_select_mutation(&self.realm, select_mutation)?;
-        self.realm.invalidate_textarea_ancestor(self.id);
-        self.realm.reap_detached(old);
-        self.realm.flush_script_activations(ctx)?;
-        Ok(())
-    }
-    #[getter(name = "namespaceURI")]
-    fn namespace_uri(&self) -> OpResult<Nullable<String>> {
-        let session = self.realm.session.borrow();
-        Ok(Nullable(match session.document().kind(self.id).map_err(dom_error)? {
-            NodeKind::Element {
-                namespace: Namespace::Other(value),
-                ..
-            } if value.is_empty() => None,
-            NodeKind::Element { namespace, .. } => Some(
-                match namespace {
-                    Namespace::Html => "http://www.w3.org/1999/xhtml",
-                    Namespace::Svg => "http://www.w3.org/2000/svg",
-                    Namespace::MathMl => "http://www.w3.org/1998/Math/MathML",
-                    Namespace::Other(value) => value,
-                }
-                .into(),
-            ),
-            _ => None,
-        }))
-    }
-    #[getter]
-    fn local_name(&self) -> OpResult<Option<String>> {
-        Ok(
-            match self
-                .realm
-                .session
-                .borrow()
-                .document()
-                .kind(self.id)
-                .map_err(dom_error)?
-            {
-                NodeKind::Element { name, .. } => Some(String::from(
-                    name.as_str()
-                        .rsplit_once(':')
-                        .map_or(name.as_str(), |(_, local)| local),
-                )),
-                _ => None,
-            },
-        )
-    }
-    #[getter]
-    fn prefix(&self) -> OpResult<Nullable<String>> {
-        Ok(Nullable(
-            match self
-                .realm
-                .session
-                .borrow()
-                .document()
-                .kind(self.id)
-                .map_err(dom_error)?
-            {
-                NodeKind::Element { name, .. } => name
-                    .as_str()
-                    .split_once(':')
-                    .map(|(prefix, _)| prefix.to_owned()),
-                _ => None,
-            },
-        ))
-    }
-    #[getter]
-    fn tag_name(&self) -> OpResult<String> {
-        self.node_name()
-    }
-    #[getter]
     fn is_connected(&self) -> OpResult<bool> {
         let session = self.realm.session.borrow();
         let document = session.document();
         let mut current = Some(self.id);
         while let Some(node) = current {
-            if node == document.root() {
+            if matches!(document.kind(node), Ok(NodeKind::Document)) {
                 return Ok(true);
             }
             current = document.shadow_including_parent(node).map_err(dom_error)?;
         }
         Ok(false)
     }
+    fn is_equal_node(&self, other: Option<&DomNode>) -> OpResult<bool> {
+        let Some(other) = other else {
+            return Ok(false);
+        };
+        let left = self.realm.session.borrow();
+        let right = other.realm.session.borrow();
+        lumen_html::equality::is_equal_node(left.document(), self.id, right.document(), other.id)
+            .map_err(dom_error)
+    }
+    #[method]
+    fn compare_document_position(&self, other: &DomNode) -> OpResult<u16> {
+        let left = self.realm.session.borrow();
+        let right = other.realm.session.borrow();
+        lumen_html::ranges::document_position(left.document(), self.id, right.document(), other.id).map_err(dom_error)
+    }
+
     fn contains(&self, other: Option<&DomNode>) -> OpResult<bool> {
         let Some(other) = other else {
             return Ok(false);
@@ -9574,56 +12122,6 @@ impl DomNode {
             current = session.document().parent(node).map_err(dom_error)?;
         }
         Ok(false)
-    }
-    #[method(coerce)]
-    fn has_attribute(&self, name: &str) -> OpResult<bool> {
-        Ok(self.get_attribute(name)?.0.is_some())
-    }
-    #[getter]
-    fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
-        if let Some(value) = self
-            .collections
-            .borrow()
-            .get("style")
-            .and_then(WeakValue::upgrade)
-        {
-            return value;
-        }
-        let value = ctx.new_instance(DomStyle {
-            realm: self.realm.clone(),
-            node: self.id,
-            computed: false,
-            _owner: this.0,
-        });
-        self.collections.borrow_mut().insert(
-            "style".into(),
-            ctx.weak_value(&value).expect("style object"),
-        );
-        value
-    }
-
-    #[setter(coerce)]
-    fn set_style(&self, value: &str) -> OpResult<()> {
-        let serialized = lumen_html::css::cssom_declaration_text(value);
-        self.realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .set_attribute_ns(self.id, None, "style", &serialized)
-            .map_err(dom_error)
-    }
-
-    #[method(coerce)]
-    fn query_selector_all(
-        &self,
-        ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
-        query: &str,
-    ) -> OpResult<DomNodeList> {
-        let nodes =
-            selector::query_selector_all(self.realm.session.borrow().document(), self.id, query)
-                .map_err(|error| selector_error(ctx, error))?;
-        Ok(DomNodeList::snapshot(self.realm.clone(), nodes, this.0))
     }
 
     #[getter]
@@ -9648,69 +12146,38 @@ impl DomNode {
         );
         value
     }
-    #[getter]
-    fn children(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
-        if let Some(value) = self
-            .collections
-            .borrow()
-            .get("children")
-            .and_then(WeakValue::upgrade)
-        {
-            return value;
-        }
-        let value = ctx.new_instance(DomHtmlCollection {
-            base: DomNodeList::children(self.realm.clone(), self.id, true, this.0),
-        });
-        self.collections.borrow_mut().insert(
-            "children".into(),
-            ctx.weak_value(&value).expect("collection object"),
-        );
-        value
-    }
-    #[getter]
-    fn class_list(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
-        if let Some(value) = self
-            .collections
-            .borrow()
-            .get("classList")
-            .and_then(WeakValue::upgrade)
-        {
-            return value;
-        }
-        let value = ctx.new_instance(DomTokenList {
-            realm: self.realm.clone(),
-            node: self.id,
-            owner: this.0,
-        });
-        self.collections.borrow_mut().insert(
-            "classList".into(),
-            ctx.weak_value(&value).expect("collection object"),
-        );
-        value
-    }
 
     #[getter]
     fn owner_document(&self, ctx: &mut Ctx) -> Value {
-        let root = self.realm.session.borrow().document().root();
-        if self.id == root {
-            Value::Null
+        let owner = {
+            let session = self.realm.session.borrow();
+            if matches!(session.document().kind(self.id), Ok(NodeKind::Document)) {
+                None
+            } else {
+                session.document().node_document(self.id).ok()
+            }
+        };
+        if let Some(owner) = owner {
+            self.realm.wrap(ctx, owner)
         } else {
-            self.realm.wrap(ctx, root)
+            Value::Null
         }
     }
 
     #[getter]
     fn node_value(&self) -> OpResult<Nullable<String>> {
         let session = self.realm.session.borrow();
-        Ok(Nullable(match session.document().kind(self.id).map_err(dom_error)? {
-            NodeKind::Text(value) | NodeKind::Comment(value) => Some(value.clone()),
-            NodeKind::CData(value) => Some(value.clone()),
-            NodeKind::ProcessingInstruction { data, .. } => Some(data.clone()),
-            _ => None,
-        }))
+        Ok(Nullable(
+            match session.document().kind(self.id).map_err(dom_error)? {
+                NodeKind::Text(value) | NodeKind::Comment(value) => Some(value.clone()),
+                NodeKind::CData(value) => Some(value.clone()),
+                NodeKind::ProcessingInstruction { data, .. } => Some(data.clone()),
+                _ => None,
+            },
+        ))
     }
 
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_node_value(&self, value: Option<&str>) -> OpResult<()> {
         let _html_allocations = enter_html_allocation_category();
         let mut session = self.realm.session.borrow_mut();
@@ -9798,64 +12265,6 @@ impl DomNode {
     }
 
     #[getter]
-    fn first_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let child = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            let mut child = document.first_child(self.id).map_err(dom_error)?;
-            while let Some(id) = child {
-                if matches!(
-                    document.kind(id).map_err(dom_error)?,
-                    NodeKind::Element { .. }
-                ) {
-                    break;
-                }
-                child = document.next_sibling(id).map_err(dom_error)?;
-            }
-            child
-        };
-        Ok(self.realm.wrap_option(ctx, child))
-    }
-
-    #[getter]
-    fn last_element_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let child = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            let mut child = document.last_child(self.id).map_err(dom_error)?;
-            while let Some(id) = child {
-                if matches!(
-                    document.kind(id).map_err(dom_error)?,
-                    NodeKind::Element { .. }
-                ) {
-                    break;
-                }
-                child = document.previous_sibling(id).map_err(dom_error)?;
-            }
-            child
-        };
-        Ok(self.realm.wrap_option(ctx, child))
-    }
-
-    #[getter]
-    fn child_element_count(&self) -> OpResult<u32> {
-        let session = self.realm.session.borrow();
-        let document = session.document();
-        let mut child = document.first_child(self.id).map_err(dom_error)?;
-        let mut count = 0;
-        while let Some(id) = child {
-            if matches!(
-                document.kind(id).map_err(dom_error)?,
-                NodeKind::Element { .. }
-            ) {
-                count += 1;
-            }
-            child = document.next_sibling(id).map_err(dom_error)?;
-        }
-        Ok(count)
-    }
-
-    #[getter]
     fn first_child(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let child = self
             .realm
@@ -9903,167 +12312,24 @@ impl DomNode {
         Ok(self.realm.wrap_option(ctx, sibling))
     }
 
-    #[getter]
-    fn previous_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let sibling = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            let mut sibling = document.previous_sibling(self.id).map_err(dom_error)?;
-            while let Some(id) = sibling {
-                if matches!(
-                    document.kind(id).map_err(dom_error)?,
-                    NodeKind::Element { .. }
-                ) {
-                    break;
-                }
-                sibling = document.previous_sibling(id).map_err(dom_error)?;
-            }
-            sibling
-        };
-        Ok(self.realm.wrap_option(ctx, sibling))
-    }
-
-    #[getter]
-    fn next_element_sibling(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let sibling = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            let mut sibling = document.next_sibling(self.id).map_err(dom_error)?;
-            while let Some(id) = sibling {
-                if matches!(
-                    document.kind(id).map_err(dom_error)?,
-                    NodeKind::Element { .. }
-                ) {
-                    break;
-                }
-                sibling = document.next_sibling(id).map_err(dom_error)?;
-            }
-            sibling
-        };
-        Ok(self.realm.wrap_option(ctx, sibling))
-    }
-
+    #[method(hint(js(ce_reactions)))]
     fn append_child(&self, ctx: &mut Ctx, child: Value) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
         insert_dom_node(ctx, &self.realm, self.id, child, Value::Null)
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn replace_child(&self, ctx: &mut Ctx, new_child: Value, old_child: Value) -> OpResult<Value> {
-        let _html_allocations = enter_html_allocation_category();
-        // Extract only native identity here. Cross-document replacement can
-        // rebind the original wrapper in place during adoption, so no typed
-        // projection may stay borrowed across that operation.
-        let (new_realm, new_id) =
-            ctx.with_instance::<DomNode, _>(&new_child, |node| (node.realm.clone(), node.id))?;
-        let (old_realm, old_id) =
-            ctx.with_instance::<DomNode, _>(&old_child, |node| (node.realm.clone(), node.id))?;
-        if !Rc::ptr_eq(&old_realm, &self.realm)
-            || self
-                .realm
-                .session
-                .borrow()
-                .document()
-                .parent(old_id)
-                .map_err(dom_error)?
-                != Some(self.id)
-        {
-            return Err(OpError::new("NotFoundError", "node is not a child"));
-        }
-        if Rc::ptr_eq(&self.realm, &new_realm) && old_id == new_id {
-            return Ok(self.realm.wrap(ctx, old_id));
-        }
-
-        let (new_has_options, source_select) = {
-            let session = new_realm.session.borrow();
-            let document = session.document();
-            let has_options =
-                lumen_html::forms::subtree_contains_select_option(document, new_id)
-                    .map_err(dom_error)?;
-            let source_select = if has_options {
-                document
-                    .parent(new_id)
-                    .map_err(dom_error)?
-                    .map(|parent| lumen_html::forms::select_ancestor(document, parent))
-                    .transpose()
-                    .map_err(dom_error)?
-                    .flatten()
-            } else {
-                None
-            };
-            (has_options, source_select)
-        };
-        let target_select = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            let old_has_options =
-                lumen_html::forms::subtree_contains_select_option(document, old_id)
-                    .map_err(dom_error)?;
-            if old_has_options || new_has_options {
-                lumen_html::forms::select_ancestor(document, self.id).map_err(dom_error)?
-            } else {
-                None
-            }
-        };
-
-        // Validate the complete replacement against both source and target
-        // documents before adoption detaches anything from the source tree.
-        if Rc::ptr_eq(&self.realm, &new_realm) {
-            let target = self.realm.session.borrow();
-            target
-                .document()
-                .validate_replace_from(target.document(), old_id, new_id)
-                .map_err(dom_error)?;
-        } else {
-            let target = self.realm.session.borrow();
-            let source = new_realm.session.borrow();
-            target
-                .document()
-                .validate_replace_from(source.document(), old_id, new_id)
-                .map_err(dom_error)?;
-        }
-
-        let replacement_id = if Rc::ptr_eq(&self.realm, &new_realm) {
-            new_id
-        } else {
-            DomRealm::adopt_node_from(&self.realm, ctx, &new_realm, new_id)?
-        };
-        self.realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .replace(old_id, replacement_id)
-            .map_err(dom_error)?;
-        if let Some(select) = source_select {
-            if !Rc::ptr_eq(&self.realm, &new_realm)
-                || target_select != Some(select)
-            {
-                forms::select_option_list_changed(&new_realm, select)?;
-            }
-        }
-        if let Some(select) = target_select {
-            let preferred = if new_has_options {
-                forms::selected_option_in_subtree(&self.realm, replacement_id)?
-            } else {
-                None
-            };
-            forms::select_option_list_changed_with_preferred(
-                &self.realm,
-                select,
-                preferred,
-            )?;
-        }
-        self.realm.invalidate_textarea_ancestor(self.id);
-        self.realm.flush_script_activations(ctx)?;
-        let removed = self.realm.wrap(ctx, old_id);
-        self.realm.reap_detached([old_id]);
-        Ok(removed)
+        replace_dom_node(ctx, &self.realm, self.id, new_child, old_child)
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn insert_before(&self, ctx: &mut Ctx, child: Value, before: Value) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
         insert_dom_node(ctx, &self.realm, self.id, child, before)
     }
 
+    #[method(hint(js(ce_reactions)))]
     fn remove_child(&self, ctx: &mut Ctx, child: &DomNode) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
         if !Rc::ptr_eq(&self.realm, &child.realm)
@@ -10078,11 +12344,8 @@ impl DomNode {
         {
             return Err(OpError::new("NotFoundError", "node is not a child"));
         }
-        let affected_select = select_for_removed_option_subtree(
-            &self.realm,
-            child.id,
-            Some(self.id),
-        )?;
+        let affected_select =
+            select_for_removed_option_subtree(&self.realm, child.id, Some(self.id))?;
         self.realm
             .session
             .borrow_mut()
@@ -10098,96 +12361,87 @@ impl DomNode {
         Ok(value)
     }
 
-    fn remove(&self) -> OpResult<()> {
-        let _html_allocations = enter_html_allocation_category();
-        let parent = self
-            .realm
-            .session
-            .borrow()
-            .document()
-            .parent(self.id)
-            .map_err(dom_error)?;
-        let affected_select =
-            select_for_removed_option_subtree(&self.realm, self.id, parent)?;
-        self.realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .remove(self.id)
-            .map_err(dom_error)?;
-        if let Some(select) = affected_select {
-            forms::select_option_list_changed(&self.realm, select)?;
-        }
-        if let Some(parent) = parent {
-            self.realm.invalidate_textarea_ancestor(parent);
-        }
-        self.realm.reap_detached([self.id]);
-        Ok(())
-    }
-
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn clone_node(&self, ctx: &mut Ctx, deep: Option<bool>) -> OpResult<Value> {
         let _html_allocations = enter_html_allocation_category();
         let deep = deep.unwrap_or(false);
+        if self.realm.session.borrow().document().shadow_host(self.id).map_err(dom_error)?.is_some() {
+            return Err(OpError::new("NotSupportedError", "shadow roots cannot be cloned"));
+        }
         let is_document = {
             let session = self.realm.session.borrow();
-            self.id == session.document().root()
+            matches!(session.document().kind(self.id), Ok(NodeKind::Document))
         };
+        let graph = if self.realm.template_graph_owners.borrow().is_empty() { None } else { Some(template_graph::ArenaGraph::new(&self.realm)?) };
         if is_document {
+            let inert_document = self
+                .realm
+                .session
+                .borrow()
+                .document()
+                .is_template_owner_document(self.id);
             let document = self
                 .realm
                 .session
                 .borrow()
                 .document()
-                .clone_document(deep)
+                .clone_node_document(self.id, deep && graph.is_none())
                 .map_err(dom_error)?;
             let clone_realm = DomRealm::realm_from_document_with_interface(
                 document,
-                &self.realm.content_type,
+                if inert_document && self.realm.is_html_document {
+                    "text/html"
+                } else if inert_document {
+                    "application/xml"
+                } else {
+                    &self.realm.content_type
+                },
                 self.realm.is_html_document,
                 false,
-                self.realm.document_interface,
+                if inert_document {
+                    DocumentInterface::Document
+                } else {
+                    self.realm.document_interface
+                },
             );
-            clone_realm.set_about_base_url(self.realm.about_base_url.borrow().clone());
-            if let Some(url) = self.realm.document_url() {
-                clone_realm.set_document_url(url);
-            }
-            if let Some(origin) = self.realm.document_origin() {
-                clone_realm.set_document_origin(origin);
+            clone_realm.document_encoding.set(self.realm.document_encoding());
+            if inert_document {
+                clone_realm.set_document_url("about:blank");
+            } else {
+                clone_realm.set_about_base_url(self.realm.about_base_url.borrow().clone());
+                if let Some(url) = self.realm.document_url() {
+                    clone_realm.set_document_url(url);
+                }
+                if let Some(origin) = self.realm.document_origin() {
+                    clone_realm.set_document_origin(origin);
+                }
             }
             let clone_root = clone_realm.session.borrow().document().root();
-            let script_pairs = {
+            let script_pairs = if let Some(graph) = &graph {
+                let plan = lumen_html::graph::clone_plan(graph, self.id, deep).map_err(dom_error)?;
+                clone_realm.session.borrow_mut().document_mut().clone_graph_plan(graph, &plan, clone_root, true).map_err(dom_error)?.1
+            } else {
                 let source = self.realm.session.borrow();
                 let copy = clone_realm.session.borrow();
-                script_loading::paired_subtree_nodes(
-                    source.document(),
-                    copy.document(),
-                    self.id,
-                    clone_root,
-                )
+                script_loading::paired_subtree_nodes(source.document(), copy.document(), self.id, clone_root)
             };
-            {
-                let session = clone_realm.session.borrow();
-                let source_form_state = self.realm.forms.borrow();
-                let mut target_form_state = clone_realm.forms.borrow_mut();
-                forms::clone_live_values_into(
-                    &source_form_state,
-                    &mut target_form_state,
-                    session.document(),
-                    &script_pairs,
-                );
-            }
-            {
-                let source_scripts = self.realm.scripts.borrow();
-                clone_realm
-                    .scripts
-                    .borrow_mut()
-                    .clone_states_from(&source_scripts, &script_pairs);
-            }
+            let state_graph = match graph { Some(graph) => graph, None => template_graph::ArenaGraph::new(&self.realm)? };
+            template_graph::copy_clone_state(ctx, &state_graph, &clone_realm, &script_pairs, None)?;
             event_content_handlers::initialize_subtree(ctx, &clone_realm, clone_root)?;
+            custom_elements::upgrade_cloned_or_parsed_subtree(ctx,&clone_realm,clone_root)?;
             return Ok(clone_realm.document_value(ctx));
         }
 
+        if graph.is_some() {
+            let owner = self.realm.session.borrow().document().node_document(self.id).map_err(dom_error)?;
+            return template_graph::clone_into(ctx, &self.realm, self.id, &self.realm, owner, deep, None);
+        }
+
+        let required = {
+            let session = self.realm.session.borrow();
+            session.document().clone_allocation_count_from(session.document(), self.id, deep).map_err(dom_error)?
+        };
+        self.realm.prepare_allocation(ctx, required)?;
         let mut session = self.realm.session.borrow_mut();
         let doc = session.document_mut();
         let id = doc.clone_node(self.id, deep).map_err(dom_error)?;
@@ -10197,7 +12451,7 @@ impl DomNode {
             self.id,
             id,
         );
-        let form_state = self.realm.forms.borrow().clone();
+        let form_state = forms::clone_state_snapshot(&self.realm.forms.borrow(), &script_pairs);
         forms::clone_live_values_into(
             &form_state,
             &mut self.realm.forms.borrow_mut(),
@@ -10205,38 +12459,12 @@ impl DomNode {
             &script_pairs,
         );
         drop(session);
+        custom_elements::clone_registry_associations(ctx,&self.realm,&self.realm,&script_pairs,None)?;
         self.realm.scripts.borrow_mut().clone_states(&script_pairs);
+        self.realm.defer_detached_root(id);
         event_content_handlers::initialize_subtree(ctx, &self.realm, id)?;
+        custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, id)?;
         Ok(self.realm.wrap(ctx, id))
-    }
-
-    #[method(coerce)]
-    fn set_attribute(&self, ctx: &mut Ctx, name: &str, value: &str) -> OpResult<()> {
-        let name = self.normalized_attribute_name(name);
-        if !lumen_html::xml::is_valid_attribute_local_name(name.as_ref()) {
-            return Err(error_reporting::dom_exception(
-                ctx,
-                "InvalidCharacterError",
-                "attribute name is not a valid attribute local name",
-            ));
-        }
-        let namespace_uri = self
-            .realm
-            .session
-            .borrow()
-            .document()
-            .attribute_namespace_uri(self.id, name.as_ref())
-            .map_err(dom_error)?;
-        self.set_attribute_by_name_core(name.as_ref(), value)?;
-        event_content_handlers::attribute_changed(
-            ctx,
-            &self.realm,
-            self.id,
-            namespace_uri.as_deref(),
-            name.as_ref(),
-            Some(value),
-        )?;
-        self.realm.flush_script_activations(ctx)
     }
 
     /// `setAttribute` matches the first existing qualified name and preserves its namespace.
@@ -10279,6 +12507,7 @@ impl DomNode {
     }
 
     fn after_attribute_write(&self, name: &str, namespaced: bool) -> OpResult<()> {
+        if !namespaced { self.realm.reflected_elements.borrow_mut().attribute_changed(self.id, None, name); }
         if !namespaced && matches!(name, "width" | "height") {
             self.realm.sync_canvas()?;
         }
@@ -10293,175 +12522,6 @@ impl DomNode {
         }
         self.realm.sync_image_bitmaps()?;
         Ok(())
-    }
-
-    #[method(coerce)]
-    fn get_attribute(&self, name: &str) -> OpResult<Nullable<String>> {
-        let name = self.normalized_attribute_name(name);
-        let session = self.realm.session.borrow();
-        let NodeKind::Element { attributes, .. } =
-            session.document().kind(self.id).map_err(dom_error)?
-        else {
-            return Err(OpError::new("TypeError", "attributes require an element"));
-        };
-        Ok(Nullable(
-            attributes
-                .iter()
-                .find(|(key, _)| key.as_str() == name.as_ref())
-                .map(|(_, value)| value.clone()),
-        ))
-    }
-
-    #[method(name = "getAttributeNS", coerce)]
-    fn get_attribute_ns(
-        &self,
-        namespace_uri: Option<&str>,
-        local_name: &str,
-    ) -> OpResult<Nullable<String>> {
-        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
-        self.realm
-            .session
-            .borrow()
-            .document()
-            .get_attribute_ns(self.id, namespace_uri, local_name)
-            .map(Nullable)
-            .map_err(dom_error)
-    }
-
-    #[method(name = "hasAttributeNS", coerce)]
-    fn has_attribute_ns(&self, namespace_uri: Option<&str>, local_name: &str) -> OpResult<bool> {
-        Ok(self.get_attribute_ns(namespace_uri, local_name)?.0.is_some())
-    }
-
-    #[method(name = "setAttributeNS", coerce)]
-    fn set_attribute_ns(
-        &self,
-        ctx: &mut Ctx,
-        namespace_uri: Option<&str>,
-        qualified_name: &str,
-        value: &str,
-    ) -> OpResult<()> {
-        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
-        namespace_for_qname(ctx, namespace_uri, qualified_name)?;
-        let _html_allocations = enter_html_allocation_category();
-        if namespace_uri.is_none() {
-            forms::prepare_input_attribute_change(&self.realm, self.id, qualified_name)?;
-        }
-        self.realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .set_attribute_ns(self.id, namespace_uri, qualified_name, value)
-            .map_err(dom_error)?;
-        if namespace_uri.is_none() {
-            forms::resanitize_input_after_attribute_change(&self.realm, self.id, qualified_name)?;
-        }
-        self.after_attribute_write(qualified_name, namespace_uri.is_some())?;
-        event_content_handlers::attribute_changed(
-            ctx,
-            &self.realm,
-            self.id,
-            namespace_uri,
-            qualified_name,
-            Some(value),
-        )?;
-        self.realm.flush_script_activations(ctx)
-    }
-
-    #[method(name = "removeAttributeNS", coerce)]
-    fn remove_attribute_ns(
-        &self,
-        ctx: &mut Ctx,
-        namespace_uri: Option<&str>,
-        local_name: &str,
-    ) -> OpResult<()> {
-        let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
-        let _html_allocations = enter_html_allocation_category();
-        let materialized = {
-            let session = self.realm.session.borrow();
-            let document = session.document();
-            materialized_attribute_by_ns(document, self.id, namespace_uri, local_name)
-        };
-        let existed = self
-            .realm
-            .session
-            .borrow()
-            .document()
-            .get_attribute_ns(self.id, namespace_uri, local_name)
-            .map_err(dom_error)?
-            .is_some();
-        if namespace_uri.is_none() && existed {
-            forms::prepare_input_attribute_change(&self.realm, self.id, local_name)?;
-        }
-        self.realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .remove_attribute_ns(self.id, namespace_uri, local_name)
-            .map_err(dom_error)?;
-        if namespace_uri.is_none() {
-            forms::resanitize_input_after_attribute_change(&self.realm, self.id, local_name)?;
-        }
-        if let Some(attribute) = materialized {
-            self.realm.reap_detached([attribute]);
-        }
-        self.after_attribute_removal(local_name, namespace_uri.is_some())?;
-        if existed {
-            event_content_handlers::attribute_changed(
-                ctx,
-                &self.realm,
-                self.id,
-                namespace_uri,
-                local_name,
-                None,
-            )?;
-        }
-        self.realm.flush_script_activations(ctx)
-    }
-
-    #[getter]
-    fn id(&self) -> OpResult<String> {
-        Ok(self.get_null_attribute("id")?.unwrap_or_default())
-    }
-
-    #[setter(coerce)]
-    fn set_id(&self, value: &str) -> OpResult<()> {
-        self.set_attribute_core("id", value)
-    }
-
-    #[getter]
-    fn class_name(&self) -> OpResult<String> {
-        Ok(self.get_null_attribute("class")?.unwrap_or_default())
-    }
-
-    #[setter(coerce)]
-    fn set_class_name(&self, value: &str) -> OpResult<()> {
-        self.set_attribute_core("class", value)
-    }
-
-    #[method(coerce)]
-    fn remove_attribute(&self, ctx: &mut Ctx, name: &str) -> OpResult<()> {
-        let name = self.normalized_attribute_name(name);
-        let existed = self.get_attribute(name.as_ref())?.0.is_some();
-        let namespace_uri = self
-            .realm
-            .session
-            .borrow()
-            .document()
-            .attribute_namespace_uri(self.id, name.as_ref())
-            .map_err(dom_error)?;
-        self.remove_attribute_by_name_core(name.as_ref())?;
-        if existed {
-            event_content_handlers::attribute_changed(
-                ctx,
-                &self.realm,
-                self.id,
-                namespace_uri.as_deref(),
-                name.as_ref(),
-                None,
-            )?;
-        }
-        self.realm.flush_script_activations(ctx)
     }
 
     fn remove_attribute_by_name_core(&self, name: &str) -> OpResult<()> {
@@ -10517,6 +12577,7 @@ impl DomNode {
     }
 
     fn after_attribute_removal(&self, name: &str, namespaced: bool) -> OpResult<()> {
+        if !namespaced { self.realm.reflected_elements.borrow_mut().attribute_changed(self.id, None, name); }
         if !namespaced && matches!(name, "width" | "height") {
             self.realm.sync_canvas()?;
         }
@@ -10554,41 +12615,179 @@ impl DomNode {
         Ok(Nullable(Some(out)))
     }
 
-    #[setter(name = "textContent", coerce)]
+    #[setter(name = "textContent", coerce, hint(js(ce_reactions)))]
     fn set_text_content(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         Self::replace_text_content(ctx, &self.realm, self.id, value)
     }
+}
 
-    #[getter(name = "innerHTML")]
-    fn inner_html(&self) -> OpResult<String> {
-        let session = self.realm.session.borrow();
-        html::inner_html(session.document(), self.id).map_err(dom_error)
+impl DomNode {
+    fn move_before(&self, ctx: &mut Ctx, child: Value, before: Value) -> OpResult<()> {
+        let _html_allocations = enter_html_allocation_category();
+        let (source, id) =
+            ctx.with_instance::<DomNode, _>(&child, |node| (node.realm.clone(), node.id))?;
+        let reference = if matches!(before, Value::Null | Value::Undefined) {
+            None
+        } else {
+            Some(ctx.with_instance::<DomNode, _>(&before, |node| node.id)?)
+        };
+        if !Rc::ptr_eq(&self.realm, &source) {
+            return Err(error_reporting::dom_exception(
+                ctx,
+                "HierarchyRequestError",
+                "moveBefore requires one shadow-including tree",
+            ));
+        }
+        let (old_index, old_parent, source_select, target_select) = {
+            let session = self.realm.session.borrow();
+            let document = session.document();
+            document
+                .validate_move_before(self.id, id, reference)
+                .map_err(|failure| {
+                    let (name, message) = match failure {
+                        Error::NotFound => ("NotFoundError", "reference is not a child"),
+                        _ => ("HierarchyRequestError", "invalid state-preserving move"),
+                    };
+                    error_reporting::dom_exception(ctx, name, message)
+                })?;
+            let old_parent = document
+                .parent(id)
+                .map_err(dom_error)?
+                .expect("validated move has parent");
+            (
+                range::child_index(document, id)?,
+                old_parent,
+                lumen_html::forms::select_ancestor(document, old_parent).map_err(dom_error)?,
+                lumen_html::forms::select_ancestor(document, self.id).map_err(dom_error)?,
+            )
+        };
+        let (source_has_options, source_has_unowned_options, preferred_option) =
+            forms::capture_option_subtree_selectedness(&self.realm, id, source_select)?;
+        let previous = self.realm.moving_node.replace(Some(MovingNode {
+            root: id,
+            old_index,
+        }));
+        let scope = MoveScope {
+            state: &self.realm.moving_node,
+            previous,
+        };
+        self.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .move_before(self.id, id, reference)
+            .map_err(dom_error)?;
+        drop(scope);
+        if source_has_options && source_select != target_select {
+            if let Some(select) = source_select {
+                forms::select_option_list_changed(&self.realm, select)?;
+            }
+        }
+        if let Some(select) = target_select {
+            let target_has_options =
+                forms::option_subtree_has_select_owner(&self.realm, id, select)?;
+            if target_has_options
+                && (source_select != Some(select) || source_has_unowned_options)
+            {
+                forms::select_option_list_changed_with_preferred(
+                    &self.realm,
+                    select,
+                    preferred_option,
+                )?;
+            } else if source_select == Some(select)
+                && source_has_options
+                && !target_has_options
+            {
+                forms::select_option_list_changed(&self.realm, select)?;
+            }
+        }
+        self.realm.invalidate_textarea_ancestor(old_parent);
+        self.realm.invalidate_textarea_ancestor(self.id);
+        Ok(())
     }
 
-    #[setter(name = "innerHTML", coerce)]
-    fn set_inner_html(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    fn replace_markup(
+        &self,
+        ctx: &mut Ctx,
+        value: &str,
+        html_unsafe: bool,
+        run_scripts: bool,
+    ) -> OpResult<()> {
         let _html_allocations = enter_html_allocation_category();
-        let (fragment, target, inserted, old) = {
+        if let Err(error) = self.realm.prepare_allocation(ctx, 3) {
+            if error.class() != "QuotaExceededError" { return Err(error); }
+        }
+        let foreign_target = {
+            let content = self.realm.session.borrow().document().template_content(self.id).map_err(dom_error)?;
+            match content {
+                Some(content) if content.document_id() != self.id.document_id() => Some((template_graph::ArenaGraph::new(&self.realm)?.owner(content)?, content)),
+                _ => None,
+            }
+        };
+        let (fragment, target, inserted, old, target_is_template, new_shadow) = {
             let mut session = self.realm.session.borrow_mut();
             let document = session.document_mut();
             let context = document
                 .shadow_host(self.id)
                 .map_err(dom_error)?
                 .unwrap_or(self.id);
-            let fragment = parse_dom_markup_fragment(document, context, value)
-                .map_err(|error| dom_markup_error(ctx, error))?;
-            let inert_scripts = script_loading::scripts_in_subtree(document, fragment);
-            for node in inert_scripts {
-                self.realm.scripts.borrow_mut().mark_started(node);
+            let previous_shadow = document.shadow_root(context).map_err(dom_error)?;
+            let fragment = (if html_unsafe || document.is_html_document() {
+                html::parse_fragment_for_target(
+                    document, context, self.id, value, html_unsafe,
+                )
+                .map_err(html_parser_error)
+            } else {
+                parse_dom_markup_fragment(document, context, value)
+            })
+            .map_err(|error| dom_markup_error(ctx, error))?;
+            let inert_scripts = script_loading::markup_scripts(document, fragment);
+            let target_is_template = document
+                .template_content(self.id)
+                .map_err(dom_error)?
+                .is_some();
+            for (node, in_template) in inert_scripts {
+                if !run_scripts || in_template || target_is_template {
+                    self.realm.scripts.borrow_mut().mark_started(node);
+                } else {
+                    // Queue in parsed tree order before connection observers
+                    // enqueue light-tree scripts; execution waits for insertion.
+                    self.realm.scripts.borrow_mut().queue(node);
+                }
             }
             let target = document
                 .template_content(self.id)
                 .map_err(dom_error)?
                 .unwrap_or(self.id);
             let inserted = children(document, fragment).map_err(dom_error)?;
-            let old = children(document, target).map_err(dom_error)?;
-            (fragment, target, inserted, old)
+            let old = if foreign_target.is_some() { Vec::new() } else { children(document, target).map_err(dom_error)? };
+            let new_shadow = if html_unsafe && previous_shadow.is_none() {
+                document.shadow_root(context).map_err(dom_error)?.map(|root| (context, root))
+            } else { None };
+            (fragment, target, inserted, old, target_is_template, new_shadow)
         };
+        if let Some((host, root)) = new_shadow {
+            custom_elements::associate_parsed_subtree(&self.realm, root, host)?;
+            event_content_handlers::initialize_subtree(ctx, &self.realm, root)?;
+            custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, root)?;
+        }
+        for &node in &inserted {custom_elements::associate_parsed_subtree(&self.realm,node,self.id)?;}
+        if let Some((owner, content)) = foreign_target {
+            let old = children(owner.session.borrow().document(), content).map_err(dom_error)?;
+            let old_leases: Vec<_> = old.iter().map(|&node| NodeRetention::new(&owner, node)).collect();
+            let selectedness = capture_select_mutation(&owner, content, &[], &old)?;
+            template_graph::preflight_adoption_roots(ctx, &self.realm, &inserted, &owner)?;
+            owner.session.borrow_mut().document_mut().remove_children_for_replacement(content).map_err(dom_error)?;
+            let (roots, leases) = adopt_fragment_children(ctx, &owner, content, &self.realm, fragment)?;
+            owner.session.borrow_mut().document_mut().insert_replacement_roots(content, roots.clone(), old.clone()).map_err(dom_error)?;
+            apply_select_mutation(&owner, selectedness)?;
+            owner.reap_detached(old);
+            self.realm.session.borrow_mut().document_mut().destroy_subtree(fragment).map_err(dom_error)?;
+            for node in roots { event_content_handlers::initialize_subtree(ctx, &owner, node)?; }
+            drop(leases);
+            drop(old_leases);
+            return owner.flush_script_activations(ctx);
+        }
         let select_mutation = capture_select_mutation(&self.realm, target, &[fragment], &old)?;
         let result = {
             let mut session = self.realm.session.borrow_mut();
@@ -10605,35 +12804,13 @@ impl DomNode {
             self.realm.reap_detached(old);
             for node in inserted {
                 event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
+                if !target_is_template {
+                    custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, node)?;
+                }
             }
         }
         result?;
         self.realm.flush_script_activations(ctx)
-    }
-
-    #[method(coerce)]
-    fn query_selector(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
-        let session = self.realm.session.borrow();
-        let id = selector::query_selector(session.document(), self.id, query)
-            .map_err(|error| selector_error(ctx, error))?;
-        drop(session);
-        Ok(self.realm.wrap_option(ctx, id))
-    }
-
-    #[method(coerce)]
-    fn matches(&self, ctx: &mut Ctx, query: &str) -> OpResult<bool> {
-        let session = self.realm.session.borrow();
-        selector::matches(session.document(), self.id, query)
-            .map_err(|error| selector_error(ctx, error))
-    }
-
-    #[method(coerce)]
-    fn closest(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
-        let session = self.realm.session.borrow();
-        let id = selector::closest(session.document(), self.id, query)
-            .map_err(|error| selector_error(ctx, error))?;
-        drop(session);
-        Ok(self.realm.wrap_option(ctx, id))
     }
 }
 
@@ -10647,15 +12824,13 @@ impl DomRealm {
         {
             return value;
         }
-        let data = self
-            .selection
-            .borrow_mut()
-            .get_or_insert_with(|| range::SelectionData::new(self.ranges.clone()))
-            .clone();
+        let data = self.selection.borrow().upgrade().unwrap_or_else(|| range::SelectionData::new(self.ranges.clone()));
+        *self.selection.borrow_mut() = Rc::downgrade(&data);
         let value = ctx.new_instance(range::DomSelection {
             realm: self.clone(),
             data,
         });
+        ctx.set_native_identity_owner::<range::DomSelection>(&value).expect("Selection has its native brand");
         *self.selection_wrapper.borrow_mut() = ctx.weak_value(&value);
         value
     }
@@ -10704,11 +12879,19 @@ impl DomRealm {
                     .map_or(0, |state| state.borrow().validity_generation())
             }),
         );
+        let live_value_state = Rc::downgrade(&forms);
+        document.set_form_value_resolver(Rc::new(move |node, read| {
+            if let Some(state) = live_value_state.upgrade() {
+                let state = state.borrow();
+                read(forms::presentation_value(&state, node));
+            } else { read(None); }
+        }));
         let selector_state = Rc::downgrade(&forms);
         document.set_form_selector_state_resolver(Rc::new(move |document, node| {
             let state = selector_state.upgrade()?;
             let state = state.borrow();
             Some(lumen_html::forms::FormSelectorState {
+                form_associated_custom_element: state.is_custom_form_control(node),
                 checkedness: lumen_html::forms::ValidityStateView::checkedness(&*state, node),
                 selectedness: lumen_html::forms::ValidityStateView::selectedness(&*state, node),
                 single_select_option: state.single_select_option(document, node),
@@ -10716,7 +12899,7 @@ impl DomRealm {
                 placeholder_shown: Some(lumen_html::forms::placeholder_shown(
                     document,
                     node,
-                    lumen_html::forms::ValidityStateView::value_override(&*state, node),
+                    forms::presentation_value(&state, node),
                 )),
                 auto_value_directionality:
                     lumen_html::directionality::is_auto_directionality_form_associated(
@@ -10729,6 +12912,12 @@ impl DomRealm {
                     .flatten(),
             })
         }));
+let custom_states=Rc::downgrade(&forms);
+document.set_custom_state_resolver(Rc::new(move |node,name| {
+    let Some(forms)=custom_states.upgrade() else{return false;};
+    let forms=forms.borrow();
+    forms.custom_elements.get(&node).is_some_and(|form|form.borrow().states.as_ref().is_some_and(|states|states.borrow().contains(name)))
+}));
         if !has_browsing_context {
             // A cloned or otherwise detached document has no browsing
             // context, so its scripting mode is disabled even when the source
@@ -10747,11 +12936,20 @@ impl DomRealm {
         };
         let realm = Rc::new(DomRealm {
             details_controller: RefCell::new(std::rc::Weak::new()),
+            autofocus: RefCell::new(focus::AutofocusState::default()),
             timeline_sample: Cell::new(lumen_host::perf::web_now_ms()),
             media_capture: media_capture::RealmMediaCapture::default(),
             browser_services: browser_services::RealmBrowserServices::default(),
             document_identity: Rc::new(DocumentIdentity::default()),
             about_base_url: RefCell::new(None),
+            referrer_policy: Cell::new(lumen_common::referrer::ReferrerPolicy::default()),
+            csp: RefCell::new(csp::State::default()),
+            csp_report_budget: RefCell::new(csp_reports::DeliveryBudget::default()),
+            reporting: Rc::new(reporting::State::default()),
+            csp_overflow: Cell::new(false),
+            reflected_elements: RefCell::new(element_reflection::ReflectedElements::default()),
+            dialog_requests: RefCell::new(HashMap::new()),
+            document_referrer: RefCell::new(String::new()),
             document_base_url: RefCell::new(DocumentBaseUrlCache::default()),
             document_interface,
             content_type: content_type.to_owned(),
@@ -10763,10 +12961,12 @@ impl DomRealm {
             canvases: canvas::CanvasRegistry::default(),
             forms,
             ranges: range::RangeRegistry::new(),
+            highlights: RefCell::new(std::rc::Weak::new()),
             iterators: document_utilities::IteratorRegistry::new(),
             tree_walkers: document_utilities::TreeWalkerRegistry::new(),
-            selection: RefCell::new(None),
+            selection: RefCell::new(std::rc::Weak::new()),
             selection_wrapper: RefCell::new(None),
+            lifecycle: navigation_lifecycle::DocumentLifecycle::default(),
             ready_state: Cell::new(if has_browsing_context {
                 DocumentReadyState::Loading
             } else {
@@ -10774,7 +12974,11 @@ impl DomRealm {
             }),
             current_script: Cell::new(None),
             document_parser: RefCell::new(None),
+            xml_document_parser: RefCell::new(None),
+            document_parser_retention: RefCell::new(Vec::new()),
+            pending_parser_source: RefCell::new(None),
             parser_generation: Cell::new(0),
+            dynamic_markup_insertion_counter: Cell::new(0),
             scripts: RefCell::new(script_loading::ScriptLoader::default()),
             module_activations_enabled: Cell::new(false),
             script_capabilities: Rc::new(ScriptCapabilities::default()),
@@ -10782,45 +12986,66 @@ impl DomRealm {
             module_activations: RefCell::new(VecDeque::new()),
             dataset_intrinsics: RefCell::new(None),
             layout_flusher: RefCell::new(None),
+            device_pixel_ratio: Cell::new(1.0),
             cookie_host: RefCell::new(None),
+            cookie_source_url: RefCell::new(None),
             font_loading: font_loading::FontLoading::default(),
+            font_preloads: font_preload::State::default(),
             images: image_loading::ImageLoader::default(),
+            stylesheet_links: stylesheet_loading::StylesheetLinks::default(),
+            object_resources: object_loading::ObjectResources::default(),
             media: RefCell::new(media::MediaController::default()),
             web_audio: RefCell::new(webaudio::WebAudioController::default()),
             image_request_roots: RefCell::new(HashMap::new()),
             mutation_sinks: RefCell::new(Vec::new()),
+            observer_registrations: RefCell::new(HashMap::new()),
+            mutation_observer_sinks: RefCell::new(Vec::new()),
             session: Rc::new(RefCell::new(RenderSession::new(document))),
             wrappers: RefCell::new(HashMap::new()),
             identity_trace_epoch: Cell::new(0),
             identity_trace_nodes: RefCell::new(HashSet::new()),
             adopted_nodes: RefCell::new(HashMap::new()),
+            template_graph_owners: RefCell::new(HashMap::new()),
             document_wrapper: RefCell::new(None),
             implementation_wrapper: RefCell::new(None),
-            detached: RefCell::new(Vec::new()),
+            detached: RefCell::new(DetachedRootReaper::default()),
             sweep_at: Cell::new(256),
             targets: RefCell::new(HashMap::new()),
+            initialized_content_handlers: RefCell::new(HashMap::new()),
             retained_nodes: RefCell::new(HashMap::new()),
-            script_retentions: RefCell::new(HashMap::new()),
+            node_retentions: RefCell::new(HashMap::new()),
             window_target: RefCell::new(None),
             window_wrapper: RefCell::new(None),
             location_wrapper: RefCell::new(None),
+            history_data: RefCell::new(None),
+            fragment_state: RefCell::new(None),
+            history_wrapper: RefCell::new(None),
+            moving_node: Cell::new(None),
             browsing_context: RefCell::new(std::rc::Weak::new()),
             frame_contexts: RefCell::new(HashMap::new()),
             pending_frame_contexts: RefCell::new(HashMap::new()),
             pending_frame_realms: RefCell::new(Vec::new()),
             pending_iframe_post_connections: RefCell::new(VecDeque::new()),
+            pending_inserted_content_handlers: RefCell::new(Vec::new()),
             focused: Cell::new(None),
             focus_visible: Cell::new(None),
+            rendered_focus_epoch: Cell::new(None),
             hover_target: Cell::new(None),
             active_targets: Cell::new([None, None]),
             // Before a pointing-device interaction, programmatic focus follows
             // the keyboard-visible default used by the focus-visible heuristic.
             keyboard_modality: Cell::new(true),
+            custom_shadow_policy: RefCell::new(None),
+            cssom_registry: RefCell::new(std::rc::Weak::new()),
+            custom_element_registry: RefCell::new(None),
+            custom_element_hub: RefCell::new(std::rc::Weak::new()),
             selections: RefCell::new(HashMap::new()),
             editing: RefCell::new(EditingState::default()),
             programmatic_value_epoch: Cell::new(0),
             programmatic_value_writes: RefCell::new(ValueWriteJournal::default()),
         });
+        referrer::install(&realm);
+        element_reflection::install(&realm);
         let weak = Rc::downgrade(&realm);
         realm
             .session
@@ -10828,20 +13053,47 @@ impl DomRealm {
             .document_mut()
             .set_mutation_sink(Some(Rc::new(move |document, mutation| {
                 if let Some(realm) = weak.upgrade() {
+                    event_content_handlers::queue_inserted_handlers(document, mutation, realm.is_html_document, &realm.pending_inserted_content_handlers);
+                    focus::observe_insertion(&realm,document,mutation);
+                    realm.note_detached_mutation(document, mutation);
                     let base_changed = realm.observe_base_url_mutation(document, mutation);
-                    realm.observe_frame_navigation_mutation(document, mutation, base_changed);
-                    realm.canvases.on_mutation(document, mutation);
-                    realm.images.on_mutation(document, mutation);
-                    realm.retain_dirty_image_request(mutation.target);
-                    realm.scripts.borrow_mut().on_mutation(
+                    let moving = realm.moving_node.get();
+                    if moving.is_none() {
+                        if let Some(focused) = realm.focused.get() {
+                            let mut ancestor = Some(focused);
+                            while let Some(node) = ancestor {
+                                if mutation.kind.removed_nodes().any(|removed| removed == node) {
+                                    realm.focused.set(None);
+                                    realm.focus_visible.set(None);
+                                    break;
+                                }
+                                ancestor = document.shadow_including_parent(node).ok().flatten();
+                            }
+                        }
+                        realm.observe_frame_navigation_mutation(document, mutation, base_changed);
+                        realm.canvases.on_mutation(document, mutation);
+                        realm.images.on_mutation(document, mutation);
+                        realm.stylesheet_links.mutation(document,mutation);
+                        if realm.object_resources.observe(document, mutation).is_err() {
+                            realm.object_resources.processing_failed.set(true);
+                        }
+                        realm.capture_inline_stylesheet_mutation(document,mutation);
+                        realm.retain_dirty_image_request(mutation.target);
+                        realm.scripts.borrow_mut().on_mutation(
+                            document,
+                            mutation,
+                            realm.is_html_document,
+                        );
+                    }
+                    range::adjust_ranges(
+                        &realm.ranges,
                         document,
                         mutation,
-                        realm.is_html_document,
+                        moving.map(|node| (node.root, node.old_index)),
                     );
-                    range::adjust_ranges(&realm.ranges, document, mutation);
                     document_utilities::adjust_iterators(&realm.iterators, document, mutation);
-                    if let Some(selection) = realm.selection.borrow().as_ref() {
-                        range::sync_selection(selection);
+                    if let Some(selection) = realm.selection.borrow().upgrade() {
+                        range::sync_selection(&selection);
                     }
                     let mut index = 0;
                     loop {
@@ -10853,6 +13105,17 @@ impl DomRealm {
                     }
                 }
             })));
+        let weak = Rc::downgrade(&realm);
+        realm.session.borrow_mut().document_mut().set_mutation_observer_sink(Some(Rc::new(move |document, mutation| {
+            if let Some(realm) = weak.upgrade() {
+                let mut index = 0;
+                loop {
+                    let Some(sink) = realm.mutation_observer_sinks.borrow().get(index).cloned() else { break; };
+                    sink(document, mutation);
+                    index += 1;
+                }
+            }
+        })));
         for node in inert_parser_scripts {
             realm.scripts.borrow_mut().mark_started(node);
         }
@@ -10860,6 +13123,7 @@ impl DomRealm {
     }
 
     pub(crate) fn document_value(self: &Rc<Self>, ctx: &mut Ctx) -> Value {
+        self.note_creation_global(ctx);
         if let Some(value) = self
             .document_wrapper
             .borrow()
@@ -10882,7 +13146,7 @@ impl DomRealm {
             DocumentInterface::Document => ctx.new_instance(document),
             DocumentInterface::XmlDocument => ctx.new_instance(DomXmlDocument { base: document }),
         };
-        ctx.set_native_identity_owner::<DomNode>(&document)
+        register_node_identity_owner(ctx, &document)
             .ok()
             .expect("Document wrapper has its native identity owner");
         *self.document_wrapper.borrow_mut() = ctx.weak_value(&document);
@@ -10890,12 +13154,57 @@ impl DomRealm {
     }
 }
 
-struct CurrentScriptRetention {
-    owner: Rc<DomRealm>,
+enum RetentionOwner {
+    Strong(Rc<DomRealm>),
+    Weak(std::rc::Weak<DomRealm>),
+}
+impl RetentionOwner {
+    fn upgrade(&self)->Option<Rc<DomRealm>> {
+        match self {Self::Strong(owner)=>Some(owner.clone()),Self::Weak(owner)=>owner.upgrade()}
+    }
+    fn retarget(&mut self,target:&Rc<DomRealm>) {
+        *self=match self {Self::Strong(_)=>Self::Strong(target.clone()),Self::Weak(_)=>Self::Weak(Rc::downgrade(target))};
+    }
+}
+struct RetainedIdentity {
+    owner: RetentionOwner,
     node: NodeId,
 }
+impl RetainedIdentity {
+    fn release(retention:&Rc<RefCell<Self>>) {
+        let (owner,node)={let data=retention.borrow();(data.owner.upgrade(),data.node)};
+        let Some(owner)=owner else {return;};
+        let token=Rc::downgrade(retention);
+        let mut ledger=owner.node_retentions.borrow_mut();
+        let empty=ledger.get_mut(&node).is_some_and(|active| {
+            active.retain(|candidate|!candidate.ptr_eq(&token));active.is_empty()
+        });
+        if empty {ledger.remove(&node);}
+        drop(ledger);
+        let mut counts=owner.retained_nodes.borrow_mut();
+        if let Some(count)=counts.get_mut(&node) {*count-=1;if *count==0 {counts.remove(&node);}}
+        drop(counts);owner.release_detached_nodes([node]);
+    }
+}
+struct ParserRetention {
+    origin:NodeId,
+    identity:Rc<RefCell<RetainedIdentity>>,
+}
+impl ParserRetention {
+    fn new(owner:&Rc<DomRealm>,origin:NodeId,node:NodeId)->Self {
+        let owner=owner.clone();
+        *owner.retained_nodes.borrow_mut().entry(node).or_default()+=1;
+        let identity=Rc::new(RefCell::new(RetainedIdentity {owner:RetentionOwner::Weak(Rc::downgrade(&owner)),node}));
+        owner.node_retentions.borrow_mut().entry(node).or_default().push(Rc::downgrade(&identity));
+        Self {origin,identity}
+    }
+    fn current(&self)->Option<(Rc<DomRealm>,NodeId)> {
+        let identity=self.identity.borrow();identity.owner.upgrade().map(|owner|(owner,identity.node))
+    }
+}
+impl Drop for ParserRetention {fn drop(&mut self) {RetainedIdentity::release(&self.identity);}}
 
-struct ImageRequestRoot {
+struct ResourceRequestRoot {
     // TargetData points back to its realm weakly, so storing it here preserves
     // listeners without making a realm -> wrapper -> realm strong cycle.
     target: Rc<TargetData>,
@@ -10903,6 +13212,7 @@ struct ImageRequestRoot {
 }
 
 struct PendingScriptActivation {
+    classic_context: Rc<lumen::ClassicScriptContext>,
     script: ScriptDescriptor,
     base_url: String,
     target: Rc<TargetData>,
@@ -10912,6 +13222,7 @@ struct PendingScriptActivation {
 /// A module preparation snapshot and lease on its native event target. The host
 /// owns evaluation and scheduling; this object does not evaluate JavaScript.
 pub struct ScriptActivation {
+    pub classic_context: Rc<lumen::ClassicScriptContext>,
     pub script: ScriptDescriptor,
     pub base_url: String,
     // Drop the node retention while the original realm is still alive, so
@@ -10956,6 +13267,29 @@ struct NodeRetention {
 }
 
 impl NodeRetention {
+    /// Change a native endpoint while a core mutation already owns the session.
+    /// Queue reclamation using its document, without re-entering the session.
+    fn replace_in_document(&mut self, realm: &Rc<DomRealm>, node: NodeId, document: &lumen_html::Document) {
+        if self.node == node && self.realm.upgrade().is_some_and(|old| Rc::ptr_eq(&old, realm)) { return; }
+        *realm.retained_nodes.borrow_mut().entry(node).or_default() += 1;
+        if let Some(owner) = self.realm.upgrade() {
+            let (owner, old) = owner.resolve_adopted_node(self.node);
+            let mut retained = owner.retained_nodes.borrow_mut();
+            if let Some(count) = retained.get_mut(&old) {
+                *count -= 1;
+                if *count == 0 { retained.remove(&old); }
+            }
+            drop(retained);
+            if Rc::ptr_eq(&owner, realm) {
+                if let Some(root) = detached_identity_root(document, old) {
+                    owner.detached.borrow_mut().enqueue_dirty(root);
+                }
+            }
+        }
+        self.realm = Rc::downgrade(realm);
+        self.node = node;
+    }
+
     fn new(realm: &Rc<DomRealm>, node: NodeId) -> Self {
         *realm.retained_nodes.borrow_mut().entry(node).or_default() += 1;
         Self {
@@ -10964,25 +13298,17 @@ impl NodeRetention {
         }
     }
 
-    fn adopt_nodes(
-        &mut self,
-        source: &Rc<DomRealm>,
-        target: &Rc<DomRealm>,
-        mapping: &[(NodeId, NodeId)],
-    ) {
-        if self
-            .realm
-            .upgrade()
-            .is_some_and(|realm| Rc::ptr_eq(&realm, source))
-        {
-            if let Some((_, node)) = mapping.iter().find(|(old, _)| *old == self.node) {
-                // migrate_adopted_state already moved this retained count into
-                // the target document. Move only the token's owner/identity.
-                self.realm = Rc::downgrade(target);
-                self.node = *node;
+    fn adopt_nodes(&mut self, source:&Rc<DomRealm>, target:&Rc<DomRealm>, mapping:&[(NodeId,NodeId)]) {
+        if self.realm.upgrade().is_some_and(|realm|Rc::ptr_eq(&realm,source)) {
+            if let Some((_,node))=mapping.iter().find(|(old,_)|*old==self.node) {
+                // The realm migration already moved its counted root. These
+                // resource/range leases only follow the actual native identity.
+                self.realm=Rc::downgrade(target);
+                self.node=*node;
             }
         }
     }
+
 }
 
 impl Drop for NodeRetention {
@@ -11000,16 +13326,10 @@ impl Drop for NodeRetention {
         }
         drop(retained);
 
-        let detached = {
-            let session = realm.session.borrow();
-            let document = session.document();
-            node != document.root()
-                && document.kind(node).is_ok()
-                && document.parent(node).ok().flatten().is_none()
-        };
-        if detached {
-            realm.reap_detached([node]);
-        }
+        // Resolve the native identity root rather than requiring the retained
+        // node itself to be parentless: a token can be a descendant (including
+        // a shadow/Attr identity) inside a pending detached component.
+        realm.release_detached_nodes([node]);
     }
 }
 
@@ -11017,47 +13337,53 @@ impl Drop for NodeRetention {
 pub struct CurrentScriptGuard {
     realm: Rc<DomRealm>,
     previous: Option<NodeId>,
-    retention: Option<Rc<RefCell<CurrentScriptRetention>>>,
+    retention: Option<Rc<RefCell<RetainedIdentity>>>,
 }
 
 impl Drop for CurrentScriptGuard {
     fn drop(&mut self) {
         self.realm.current_script.set(self.previous);
-        if let Some(retention) = self.retention.take() {
-            let (realm, node) = {
-                let retention = retention.borrow();
-                (retention.owner.clone(), retention.node)
-            };
-            let token = Rc::downgrade(&retention);
-            let mut script_retentions = realm.script_retentions.borrow_mut();
-            let remove_entry = script_retentions.get_mut(&node).is_some_and(|active| {
-                active.retain(|candidate| !candidate.ptr_eq(&token));
-                active.is_empty()
-            });
-            if remove_entry {
-                script_retentions.remove(&node);
-            }
-            drop(script_retentions);
-            let mut retained = realm.retained_nodes.borrow_mut();
-            if let Some(count) = retained.get_mut(&node) {
-                *count -= 1;
-                if *count == 0 {
-                    retained.remove(&node);
-                }
-            }
-            drop(retained);
-            let detached = {
-                let session = realm.session.borrow();
-                let document = session.document();
-                node != document.root()
-                    && document.kind(node).is_ok()
-                    && document.parent(node).ok().flatten().is_none()
-            };
-            if detached {
-                realm.detached.borrow_mut().push(node);
-            }
-        }
+        if let Some(retention)=self.retention.take() {RetainedIdentity::release(&retention);}
     }
+}
+
+/// Install an active HTML document before network tokens are consumed. The
+/// host drives `next_document_parser_script` with its ordinary resource loader.
+pub fn install_live_html(
+    ctx: &mut Ctx,
+    source: &str,
+    max_nodes: usize,
+) -> Result<Rc<DomRealm>, InstallError> {
+    let _html_allocations = enter_html_allocation_category();
+    let controller = dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
+    let mut document = lumen_html::Document::new(max_nodes);
+    document.set_html_document(true);
+    document.set_scripting_enabled(true);
+    document.set_allow_declarative_shadow_roots(true);
+    controller.attach(&mut document);
+    let context = browsing_context::root_context(ctx).map_err(|_| InstallError::Global)?;
+    let realm = install_document_with_context_metadata(ctx, document, "text/html", true, true,
+        Some(context), None, None, None, true, Some(controller), false)?;
+    realm.set_document_parser_source(source.to_owned()).map_err(|_| InstallError::Global)?;
+    Ok(realm)
+}
+
+pub fn install_live_xml(
+    ctx: &mut Ctx,
+    source: &str,
+    max_nodes: usize,
+    document_type: XmlDocumentType,
+) -> Result<Rc<DomRealm>, InstallError> {
+    let _html_allocations = enter_html_allocation_category();
+    let controller = dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
+    let mut document = lumen_html::Document::new(max_nodes);
+    document.set_scripting_enabled(true);
+    controller.attach(&mut document);
+    let context = browsing_context::root_context(ctx).map_err(|_| InstallError::Global)?;
+    let realm = install_document_with_context_metadata(ctx, document, document_type.content_type(), false, true,
+        Some(context), None, None, None, true, Some(controller), false)?;
+    realm.set_document_parser_source(source.to_owned()).map_err(|_| InstallError::Global)?;
+    Ok(realm)
 }
 
 pub fn install(
@@ -11066,7 +13392,8 @@ pub fn install(
     max_nodes: usize,
 ) -> Result<Rc<DomRealm>, InstallError> {
     let _html_allocations = enter_html_allocation_category();
-    let controller = dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
+    let controller =
+        dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
     let document = html::parse_with_options_initialized(
         source,
         max_nodes,
@@ -11090,6 +13417,7 @@ pub fn install(
         None,
         true,
         Some(controller),
+        false,
     )
 }
 
@@ -11116,9 +13444,12 @@ pub fn install_xml(
     document_type: XmlDocumentType,
 ) -> Result<Rc<DomRealm>, InstallError> {
     let _html_allocations = enter_html_allocation_category();
-    let controller = dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
-    let document = lumen_html::xml::parse_initialized(source, max_nodes, |document| controller.attach(document))
-        .map_err(InstallError::XmlParse)?;
+    let controller =
+        dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
+    let document = lumen_html::xml::parse_initialized(source, max_nodes, |document| {
+        controller.attach(document)
+    })
+    .map_err(InstallError::XmlParse)?;
     let context = browsing_context::root_context(ctx).map_err(|_| InstallError::Global)?;
     install_document_with_context_metadata(
         ctx,
@@ -11132,6 +13463,7 @@ pub fn install_xml(
         None,
         true,
         Some(controller),
+        false,
     )
 }
 
@@ -11145,6 +13477,7 @@ pub(crate) fn install_document_staged(
     document_url: String,
     about_base_url: Option<String>,
     details_controller: Rc<dialog_popover::DetailsController>,
+    reuse_window: bool,
 ) -> Result<Rc<DomRealm>, InstallError> {
     install_document_with_context_metadata(
         ctx,
@@ -11158,6 +13491,7 @@ pub(crate) fn install_document_staged(
         Some(metadata),
         false,
         Some(details_controller),
+        reuse_window,
     )
 }
 
@@ -11173,13 +13507,17 @@ fn install_document_with_context_metadata(
     context_metadata: Option<Rc<browsing_context::RealmMetadata>>,
     publish_global_this: bool,
     prepared_details: Option<Rc<dialog_popover::DetailsController>>,
+    reuse_window: bool,
 ) -> Result<Rc<DomRealm>, InstallError> {
     let controller = match prepared_details {
         Some(controller) => controller,
-        None => dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?,
+        None => {
+            dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?
+        }
     };
     controller.attach(&mut document);
     document.set_html_document(is_html_document);
+    if has_browsing_context { ctx.ensure_import_map_for_host(); }
     let target_module = ctx
         .module_object::<events::target_bindings::Module>()
         .map_err(|_| InstallError::Global)?;
@@ -11192,6 +13530,10 @@ fn install_document_with_context_metadata(
         is_html_document,
         has_browsing_context,
     );
+    if has_browsing_context {
+        let weak=Rc::downgrade(&realm);
+        ctx.install_module_api_base_for_host(Rc::new(move||weak.upgrade().map_or_else(||"about:blank".into(),|realm|realm.base_url())));
+    }
     realm_services::RealmServices::replace_shared_current(ctx, realm.script_capabilities.clone());
     if let Some(origin) = context_metadata
         .as_ref()
@@ -11241,26 +13583,56 @@ fn install_document_with_context_metadata(
             let session = realm.session.borrow();
             script_loading::parser_scripts(session.document())
         };
-        let template_scripts = {
-            let session = realm.session.borrow();
-            script_loading::template_scripts(session.document())
-        };
         let mut scripts = realm.scripts.borrow_mut();
         for node in parser_scripts {
             scripts.register_parser_script(node);
         }
-        for node in template_scripts {
-            scripts.mark_started(node);
-        }
     }
     let global = ctx.global_object();
+    if reuse_window {
+        let interface_mode = Rc::new(Cell::new(global.object_identity()));
+        ctx.op_state().put(ReusedWindowInterfaces(interface_mode.clone()));
+        let _interface_scope = ReusedWindowInterfaceScope(interface_mode);
+        // Reuse the Window's listeners, expandos, intrinsics and named-properties
+        // object. New Document wrappers and native services belong to the new arena.
+        window_globals::rebind_document(ctx, &realm).map_err(|_| InstallError::Global)?;
+        scheduling::rebind_document(ctx);
+        realm.font_loading.capture_dom_exception(ctx);
+        let document = realm.document_value(ctx);
+        ctx.set_member(&global, "document", document).map_err(|_| InstallError::Global)?;
+        observers::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        layout_observers::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        cssom::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        csp::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        browser_timers::install(ctx).map_err(|_| InstallError::Global)?;
+        animations::install(ctx, &realm);
+        animation_worklet::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        paint_worklet::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        dataset::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        custom_elements::install(ctx, realm.clone()).map_err(|_| InstallError::Global)?;
+        error_reporting::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        event_content_handlers::initialize_document(ctx, &realm).map_err(|_| InstallError::Global)?;
+        controller.bind(ctx, &realm);
+        focus::initial_candidates(&realm);
+        stylesheet_loading::register_document(ctx,&realm);
+        object_loading::register_document(ctx,&realm);
+        return Ok(realm);
+    }
     // Materialize a host's lazy event unit before the DOM publishes its classes, so a failing
     // host getter surfaces as an install error instead of being overwritten.
-    if ctx.has_own_property_value(&global, &Value::str("EventTarget"))
-        .map_err(|_| InstallError::Global)? {
+    if ctx
+        .has_own_property_value(&global, &Value::str("EventTarget"))
+        .map_err(|_| InstallError::Global)?
+    {
         ctx.get_member(&global, "EventTarget")
             .map_err(|_| InstallError::Global)?;
     }
+    // Publish the canonical host Web IDL interface before DOM services capture
+    // their exception factory. Plain HTML embeddings need the same native class
+    // as hosts which materialize the lazy event module.
+    let exception_constructor = ctx.class_constructor::<lumen_host::events::DomException>();
+    crate::install_interface(ctx, &global, "DOMException", exception_constructor)
+        .map_err(|_| InstallError::Global)?;
     let window_target = DomEventTarget::window(&realm);
     *realm.window_target.borrow_mut() = Some(window_target.data_handle());
     realm.font_loading.capture_dom_exception(ctx);
@@ -11269,6 +13641,8 @@ fn install_document_with_context_metadata(
         window_globals::DomWindow::from_target(window_target),
     )
     .map_err(|_| InstallError::Global)?;
+    ctx.set_native_identity_owner::<window_globals::DomWindow>(&global)
+        .map_err(|_| InstallError::Global)?;
     let node = ctx.class_constructor::<DomNode>();
     install_node_constants(ctx, &node)?;
     let document_class = ctx.class_constructor::<DomDocument>();
@@ -11285,7 +13659,16 @@ fn install_document_with_context_metadata(
             "Location",
             ctx.class_constructor::<window_globals::DomLocation>(),
         ),
+        ("History", ctx.class_constructor::<history::DomHistory>()),
+        ("ViewTransition", ctx.class_constructor::<view_transition::DomViewTransition>()),
+        ("ElementInternals", ctx.class_constructor::<custom_elements::DomElementInternals>()),
+        ("CustomStateSet", ctx.class_constructor::<custom_elements::DomCustomStateSet>()),
         ("Event", ctx.class_constructor::<DomEvent>()),
+        ("BeforeUnloadEvent", ctx.class_constructor::<navigation_lifecycle::DomBeforeUnloadEvent>()),
+        ("PageTransitionEvent", ctx.class_constructor::<navigation_lifecycle::DomPageTransitionEvent>()),
+        ("PageRevealEvent", ctx.class_constructor::<navigation_lifecycle::DomPageRevealEvent>()),
+        ("PopStateEvent", ctx.class_constructor::<navigation_lifecycle::DomPopStateEvent>()),
+        ("HashChangeEvent", ctx.class_constructor::<navigation_lifecycle::DomHashChangeEvent>()),
         ("UIEvent", ctx.class_constructor::<ui_events::DomUIEvent>()),
         (
             "FocusEvent",
@@ -11377,92 +13760,12 @@ fn install_document_with_context_metadata(
         ("CSSStyleDeclaration", ctx.class_constructor::<DomStyle>()),
         ("Element", ctx.class_constructor::<DomElement>()),
         ("HTMLElement", ctx.class_constructor::<DomHtmlElement>()),
-        (
-            "HTMLAnchorElement",
-            ctx.class_constructor::<hyperlinks::DomAnchorElement>(),
-        ),
-        (
-            "HTMLAreaElement",
-            ctx.class_constructor::<hyperlinks::DomAreaElement>(),
-        ),
-        (
-            "HTMLHtmlElement",
-            ctx.class_constructor::<DomHtmlHtmlElement>(),
-        ),
-        (
-            "HTMLHeadElement",
-            ctx.class_constructor::<DomHtmlHeadElement>(),
-        ),
-        (
-            "HTMLBodyElement",
-            ctx.class_constructor::<DomHtmlBodyElement>(),
-        ),
-        (
-            "HTMLTitleElement",
-            ctx.class_constructor::<DomHtmlTitleElement>(),
-        ),
-        (
-            "HTMLBaseElement",
-            ctx.class_constructor::<DomHtmlBaseElement>(),
-        ),
-        (
-            "HTMLLinkElement",
-            ctx.class_constructor::<DomHtmlLinkElement>(),
-        ),
-        (
-            "HTMLScriptElement",
-            ctx.class_constructor::<DomHtmlScriptElement>(),
-        ),
-        (
-            "HTMLImageElement",
-            ctx.class_constructor::<DomHtmlImageElement>(),
-        ),
+        ("MathMLElement", ctx.class_constructor::<DomMathMlElement>()),
         (
             "HTMLMediaElement",
             ctx.class_constructor::<media::DomHtmlMediaElement>(),
         ),
-        (
-            "HTMLAudioElement",
-            ctx.class_constructor::<media::DomHtmlAudioElement>(),
-        ),
-        (
-            "HTMLVideoElement",
-            ctx.class_constructor::<media::DomHtmlVideoElement>(),
-        ),
         ("DOMStringMap", ctx.class_constructor::<DomDomStringMap>()),
-        (
-            "HTMLCanvasElement",
-            ctx.class_constructor::<canvas::DomCanvasElement>(),
-        ),
-        (
-            "HTMLStyleElement",
-            ctx.class_constructor::<DomStyleElement>(),
-        ),
-        ("HTMLFormElement", ctx.class_constructor::<DomFormElement>()),
-        (
-            "HTMLDetailsElement",
-            ctx.class_constructor::<DomDetailsElement>(),
-        ),
-        (
-            "HTMLIFrameElement",
-            ctx.class_constructor::<DomIFrameElement>(),
-        ),
-        (
-            "HTMLInputElement",
-            ctx.class_constructor::<DomInputElement>(),
-        ),
-        (
-            "HTMLSelectElement",
-            ctx.class_constructor::<DomSelectElement>(),
-        ),
-        (
-            "HTMLOptionElement",
-            ctx.class_constructor::<DomOptionElement>(),
-        ),
-        (
-            "HTMLTextAreaElement",
-            ctx.class_constructor::<DomTextAreaElement>(),
-        ),
         (
             "Animation",
             ctx.class_constructor::<animations::DomAnimation>(),
@@ -11471,6 +13774,7 @@ fn install_document_with_context_metadata(
             "CSSAnimation",
             ctx.class_constructor::<animations::DomCssAnimation>(),
         ),
+        ("CSSTransition",ctx.class_constructor::<animations::DomCssTransition>()),
         (
             "KeyframeEffect",
             ctx.class_constructor::<animations::DomKeyframeEffect>(),
@@ -11480,12 +13784,7 @@ fn install_document_with_context_metadata(
             ctx.class_constructor::<animations::DomDocumentTimeline>(),
         ),
         ("FileList", ctx.class_constructor::<forms::DomFileList>()),
-        ("HTMLSlotElement", ctx.class_constructor::<DomSlotElement>()),
         ("ShadowRoot", ctx.class_constructor::<DomShadowRoot>()),
-        (
-            "HTMLTemplateElement",
-            ctx.class_constructor::<DomTemplateElement>(),
-        ),
         ("CharacterData", ctx.class_constructor::<DomCharacterData>()),
         ("Text", ctx.class_constructor::<DomText>()),
         ("CDATASection", ctx.class_constructor::<DomCDataSection>()),
@@ -11504,6 +13803,11 @@ fn install_document_with_context_metadata(
         crate::install_interface(ctx, &global, name, ctor).map_err(|_| InstallError::Global)?;
     }
     for (name, constructor) in html_interfaces::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| InstallError::Global)?;
+    }
+    install_dom_unscopables(ctx)?;
+    for (name, constructor) in svg_interfaces::constructors(ctx) {
         crate::install_interface(ctx, &global, name, constructor)
             .map_err(|_| InstallError::Global)?;
     }
@@ -11559,8 +13863,12 @@ fn install_document_with_context_metadata(
     geometry::install(ctx).map_err(|_| InstallError::Global)?;
     layout_observers::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     cssom::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        csp::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        browser_timers::install(ctx).map_err(|_| InstallError::Global)?;
     forms::install(ctx).map_err(|_| InstallError::Global)?;
     animations::install(ctx, &realm);
+        animation_worklet::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+        paint_worklet::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     webaudio::install(ctx);
     form_data_bridge::install(ctx).map_err(|_| InstallError::Global)?;
     scheduling::install(ctx).map_err(|_| InstallError::Global)?;
@@ -11571,14 +13879,17 @@ fn install_document_with_context_metadata(
     webrtc::install(ctx).map_err(|_| InstallError::Global)?;
     notifications::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     object_urls::install(ctx).map_err(|_| InstallError::Global)?;
+    indexed_db::install(ctx).map_err(|_| InstallError::Global)?;
     custom_elements::install(ctx, realm.clone()).map_err(|_| InstallError::Global)?;
     canvas::install(ctx).map_err(|_| InstallError::Global)?;
     crate::install_interface(ctx, &global, "Node", node).map_err(|_| InstallError::Global)?;
     let image_constructor = ctx.class_constructor::<DomHtmlImageElement>();
-    crate::install_interface(ctx, &global, "Image", image_constructor)
+    let image_factory = ctx.op_function::<construct_legacy_image::Op>();
+    install_legacy_element_factory(ctx, &global, "Image", image_constructor, image_factory)
         .map_err(|_| InstallError::Global)?;
     let audio_constructor = ctx.class_constructor::<media::DomHtmlAudioElement>();
-    crate::install_interface(ctx, &global, "Audio", audio_constructor)
+    let audio_factory = ctx.op_function::<construct_legacy_audio::Op>();
+    install_legacy_element_factory(ctx, &global, "Audio", audio_constructor, audio_factory)
         .map_err(|_| InstallError::Global)?;
     crate::install_interface(ctx, &global, "Document", document_class)
         .map_err(|_| InstallError::Global)?;
@@ -11587,8 +13898,7 @@ fn install_document_with_context_metadata(
     if let Some(window_proxy) = window_proxy {
         ctx.set_member(&global, "window", window_proxy.clone())
             .map_err(|_| InstallError::Global)?;
-        ctx.set_member(&global, "self", window_proxy)
-            .map_err(|_| InstallError::Global)?;
+
     }
     error_reporting::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     event_content_handlers::initialize_document(ctx, &realm).map_err(|_| InstallError::Global)?;
@@ -11598,6 +13908,9 @@ fn install_document_with_context_metadata(
         }
     }
     controller.bind(ctx, &realm);
+    focus::initial_candidates(&realm);
+    stylesheet_loading::register_document(ctx,&realm);
+        object_loading::register_document(ctx,&realm);
     Ok(realm)
 }
 
@@ -11614,6 +13927,10 @@ pub(crate) fn install_interface(
     name: &str,
     constructor: Value,
 ) -> Result<(), Value> {
+    if ctx.op_state().get::<ReusedWindowInterfaces>().is_some_and(|mode| mode.0.get().is_some_and(|identity| global.object_identity() == Some(identity)))
+        && ctx.has_own_property_value(global, &Value::str(name))? {
+        return Ok(());
+    }
     let descriptor = ctx.new_object_with_proto(&Value::Null);
     for (key, value) in [
         ("value", constructor),
@@ -11624,6 +13941,52 @@ pub(crate) fn install_interface(
         ctx.member_set(&descriptor, key, value)?;
     }
     ctx.define_property_value(global, Value::str(name), &descriptor)
+}
+
+struct ReusedWindowInterfaces(Rc<Cell<Option<usize>>>);
+struct ReusedWindowInterfaceScope(Rc<Cell<Option<usize>>>);
+impl Drop for ReusedWindowInterfaceScope { fn drop(&mut self) { self.0.set(None); } }
+
+fn install_dom_unscopables(ctx: &mut Ctx) -> Result<(), InstallError> {
+    const PARENT: &[&str] = &["prepend", "append", "replaceChildren"];
+    const CHILD: &[&str] = &["before", "after", "replaceWith", "remove"];
+    let key = ctx
+        .well_known_symbol("unscopables")
+        .ok_or(InstallError::Global)?;
+    let interfaces = [
+        (ctx.class_constructor::<DomElement>(), true, true),
+        (ctx.class_constructor::<DomDocument>(), true, false),
+        (ctx.class_constructor::<DomDocumentFragment>(), true, false),
+        (ctx.class_constructor::<DomCharacterData>(), false, true),
+        (ctx.class_constructor::<DomDocumentType>(), false, true),
+    ];
+    for (constructor, parent, child) in interfaces {
+        let prototype = ctx
+            .member_get(&constructor, "prototype")
+            .map_err(|_| InstallError::Global)?;
+        let unscopables = ctx.new_object_with_proto(&Value::Null);
+        for name in PARENT
+            .iter()
+            .filter(|_| parent)
+            .chain(CHILD.iter().filter(|_| child))
+        {
+            ctx.set_member(&unscopables, name, Value::Bool(true))
+                .map_err(|_| InstallError::Global)?;
+        }
+        let descriptor = ctx.new_object_with_proto(&Value::Null);
+        for (name, value) in [
+            ("value", unscopables),
+            ("writable", Value::Bool(false)),
+            ("enumerable", Value::Bool(false)),
+            ("configurable", Value::Bool(true)),
+        ] {
+            ctx.set_member(&descriptor, name, value)
+                .map_err(|_| InstallError::Global)?;
+        }
+        ctx.define_property_value(&prototype, key.clone(), &descriptor)
+            .map_err(|_| InstallError::Global)?;
+    }
+    Ok(())
 }
 
 fn install_node_constants(ctx: &mut Ctx, constructor: &Value) -> Result<(), InstallError> {
@@ -11672,11 +14035,720 @@ fn install_node_constants(ctx: &mut Ctx, constructor: &Value) -> Result<(), Inst
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_number_control_native_live_numeric_state_font_and_constraints_keep_real_paint()
+    {
+        use lumen_html::paint::{FontFamily, FontSpec, GenericFontFamily, TextShaper};
+        let fonts = crate::canvas::canvas_fallback_fonts();
+        let spec = FontSpec {
+            families: Some(Arc::from([FontFamily::Generic(
+                GenericFontFamily::Monospace,
+            )])),
+            ..FontSpec::default()
+        };
+        let metrics = fonts
+            .primary_character_widths_styled(10., &spec)
+            .expect("actual preferred font");
+        let preferred = 19. * metrics.average + metrics.maximum;
+        let number = fonts
+            .measure_styled("12345.5", 10., &spec)
+            .expect("actual displayed number");
+        let stepped = fonts
+            .measure_styled("12346", 10., &spec)
+            .expect("canonical step display");
+        let hint = fonts
+            .measure_styled("12345", 10., &spec)
+            .expect("actual numeric hint");
+        let mut engine = Engine::new();
+        let realm=install(engine.ctx(),r#"<!doctype html><style>input{display:block;appearance:none;font:10px/20px monospace;border:0;padding:0}#entry,#hint{field-sizing:content}</style><input id=fixed type=number size=1 value=123><input id=entry type=number value=123><input id=hint type=number placeholder=12345>"#,128).unwrap();
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(600, 200, crate::canvas::canvas_fallback_fonts())
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        let result=engine.eval_value(&format!(r#"(() => {{
+            const fixed=document.getElementById('fixed'),entry=document.getElementById('entry'),hint=document.getElementById('hint');
+            const near=(a,b)=>{{if(Math.abs(a-b)>0.0001)throw Error(a+' != '+b);}};
+            const width=e=>parseFloat(getComputedStyle(e).width);
+            near(width(fixed),{preferred});near(width(hint),{hint});
+            entry.valueAsNumber=12345.5;near(width(entry),{number});
+            if(entry.value!=='12345.5'||entry.getAttribute('value')!=='123')throw Error('canonical numeric dirty state');
+            entry.step='0.5';entry.stepUp();if(entry.value!=='12346')throw Error('canonical numeric stepping');near(width(entry),{stepped});
+            entry.style.fontSize='20px';near(width(entry),{doubled});
+            entry.style.maxWidth='30px';near(width(entry),30);entry.style.maxWidth='none';
+            entry.style.width='25px';near(width(entry),25);entry.style.width='auto';near(width(entry),{doubled});
+            entry.value='invalid';if(entry.value!=='')throw Error('number sanitization');entry.placeholder='12345';near(width(entry),{double_hint});
+            fixed.min='0';fixed.max='999';fixed.step='1';if(width(fixed)>={preferred})throw Error('bounded domain remains guessed default');
+            fixed.max='9999999999';const wide=width(fixed);fixed.max='9';if(width(fixed)>=wide)throw Error('numeric domain mutation did not invalidate preferred width');
+            return true;
+        }})()"#,doubled=stepped*2.,double_hint=hint*2.)).unwrap();
+        let value = result.unwrap_or_else(|error| {
+            panic!(
+                "real number rendering: {}",
+                engine
+                    .ctx()
+                    .coerce_string(&error)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )
+        });
+        assert!(matches!(value, Value::Bool(true)));
+        realm.flush_layout().unwrap();
+        realm.with_session(|session| {
+            let cached = session.display_list(600, 200, fonts).unwrap().clone();
+            let fresh =
+                lumen_html::layout::display_list(session.document(), 600, 200, fonts).unwrap();
+            assert_eq!(cached.0, fresh.0);
+            let a =
+                lumen_html_image::render_with_font(&cached, 600, 200, 1.0, true, fonts).unwrap();
+            let b = lumen_html_image::render_with_font(&fresh, 600, 200, 1.0, true, fonts).unwrap();
+            assert_eq!(a.pixels, b.pixels);
+        });
+    }
+    #[test]
+    fn specification_field_sizing_native_dirty_values_selectedness_and_live_font_keep_real_boxes() {
+        use lumen_html::paint::{FontFamily, FontSpec, GenericFontFamily, TextShaper};
+        let fonts = crate::canvas::canvas_fallback_fonts();
+        let spec = FontSpec {
+            families: Some(Arc::from([FontFamily::Generic(
+                GenericFontFamily::Monospace,
+            )])),
+            ..FontSpec::default()
+        };
+        let short = fonts
+            .measure_styled("abc", 10., &spec)
+            .expect("actual shown text");
+        let long = fonts
+            .measure_styled("abcdef", 10., &spec)
+            .expect("actual changed text");
+        let masked = fonts.measure_styled("••••••", 10., &spec).expect("actual password glyphs");
+        let mut engine = Engine::new();
+        let realm=install(engine.ctx(),r#"<!doctype html><style>
+            input,textarea,select{display:block;appearance:none;font:10px/20px monospace;border:0;padding:0;field-sizing:content}
+            textarea{width:30px}#list{width:auto}
+            </style><input id=entry size=99 value=abc><input id=hint placeholder=abc>
+            <textarea id=area rows=9 cols=99>abc</textarea>
+            <select id=choice><option selected>abc</option><option>abcdef</option></select>
+            <select id=list multiple size=99><optgroup label=Group><option>abc</option><option>abcdef</option></optgroup></select>"#,256).unwrap();
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(600, 400, crate::canvas::canvas_fallback_fonts())
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        let result=engine.eval_value(&format!(r#"(() => {{
+            const entry=document.getElementById('entry'),hint=document.getElementById('hint'),area=document.getElementById('area'),choice=document.getElementById('choice'),list=document.getElementById('list');
+            const near=(a,b)=>{{if(Math.abs(a-b)>0.0001)throw Error(a+' != '+b);}};
+            const width=e=>parseFloat(getComputedStyle(e).width),height=e=>parseFloat(getComputedStyle(e).height);
+            if(getComputedStyle(entry).fieldSizing!=='content'||getComputedStyle(document.body).fieldSizing!=='fixed')throw Error('canonical noninherited field-sizing');
+            near(width(entry),{short});near(width(hint),{short});near(width(choice),{short});near(height(area),20);near(height(list),60);
+            entry.value='abcdef';hint.value='abcdef';choice.selectedIndex=1;area.value='a\nb\nc';
+            near(width(entry),{long});near(width(hint),{long});near(width(choice),{long});near(height(area),60);
+            for(const type of ['text','search','tel','url','email']){{entry.type=type;near(width(entry),{long});}}
+            entry.type='password';near(width(entry),{masked});entry.type='text';
+            if(entry.getAttribute('value')!=='abc'||hint.getAttribute('placeholder')!=='abc'||area.textContent!=='abc')throw Error('dirty source must not rewrite authored content');
+            entry.style.fontSize='20px';near(width(entry),{doubled});
+            entry.style.width='30px';near(width(entry),30);entry.style.width='auto';near(width(entry),{doubled});
+            const option=document.createElement('option');option.textContent='abc';list.appendChild(option);near(height(list),80);
+            entry.style.fieldSizing='fixed';if(width(entry)<{doubled})throw Error('fixed restores size attribute preferred width');
+            entry.style.fieldSizing='content';near(width(entry),{doubled});
+            entry.style.setProperty('all','initial');if(getComputedStyle(entry).fieldSizing!=='fixed')throw Error('all reset');
+            entry.style.removeProperty('all');entry.style.fieldSizing='inherit';if(getComputedStyle(entry).fieldSizing!=='fixed')throw Error('explicit inheritance');
+            entry.style.fieldSizing='content';return true;
+        }})()"#,doubled=long*2.,masked=masked)).unwrap();
+        let value = result.unwrap_or_else(|error| {
+            panic!(
+                "real field-sizing: {}",
+                engine
+                    .ctx()
+                    .coerce_string(&error)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )
+        });
+        assert!(matches!(value, Value::Bool(true)));
+        realm.flush_layout().unwrap();
+        realm.with_session(|session| {
+            let cached = session
+                .display_list(600, 400, crate::canvas::canvas_fallback_fonts())
+                .unwrap()
+                .clone();
+            let repeated = session
+                .display_list(600, 400, crate::canvas::canvas_fallback_fonts())
+                .unwrap()
+                .clone();
+            let fresh = lumen_html::layout::display_list(
+                session.document(),
+                600,
+                400,
+                crate::canvas::canvas_fallback_fonts(),
+            )
+            .unwrap();
+            assert_eq!(cached.0, repeated.0);
+            assert_eq!(cached.0, fresh.0);
+            let cached_pixels = lumen_html_image::render_with_font(&cached,600,400,1.0,true,crate::canvas::canvas_fallback_fonts()).unwrap().pixels;
+            let fresh_pixels = lumen_html_image::render_with_font(&fresh,600,400,1.0,true,crate::canvas::canvas_fallback_fonts()).unwrap().pixels;
+            assert_eq!(cached_pixels,fresh_pixels);
+        });
+    }
+    #[test]
+    fn specification_primary_font_control_native_live_font_and_dirty_value_keep_real_intrinsics() {
+        use lumen_html::paint::{FontFamily, FontSpec, GenericFontFamily, TextShaper};
+        let fonts=crate::canvas::canvas_fallback_fonts();
+        let spec=FontSpec{families:Some(Arc::from([FontFamily::Generic(GenericFontFamily::Monospace)])),..FontSpec::default()};
+        let metrics=fonts.primary_character_widths_styled(10.,&spec).expect("real primary font metadata");
+        let width=metrics.average*3.+metrics.maximum;
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<!doctype html><style>input,textarea{display:block;font:10px/20px monospace;appearance:none;border:0;padding:0;letter-spacing:50px}</style><input id=entry size=4 value=authored><textarea id=area cols=3 rows=2>authored</textarea>",128).unwrap();
+        realm.set_layout_flusher(Rc::new(|session|session.display_list(600,200,crate::canvas::canvas_fallback_fonts())
+            .map(|_|()).map_err(|error|format!("{error:?}"))));
+        let result=engine.eval_value(&format!(r#"(() => {{
+            const entry=document.getElementById('entry'),area=document.getElementById('area');
+            const near=(a,b)=>{{if(Math.abs(a-b)>0.0001)throw Error(a+' != '+b);}};
+            near(parseFloat(getComputedStyle(entry).width),{width});
+            near(parseFloat(getComputedStyle(area).width),{area_width});
+            near(parseFloat(getComputedStyle(area).height),40);
+            entry.value='a very long dirty value';area.value='dirty\nvalue\nextra';
+            near(parseFloat(getComputedStyle(entry).width),{width});
+            near(parseFloat(getComputedStyle(area).height),40);
+            if(entry.getAttribute('value')!=='authored'||area.textContent!=='authored')throw Error('dirty state reflected');
+            entry.style.fontSize='20px';entry.style.letterSpacing='0';
+            near(parseFloat(getComputedStyle(entry).width),{doubled});
+            entry.style.width='30px';near(parseFloat(getComputedStyle(entry).width),30);
+            entry.style.width='auto';near(parseFloat(getComputedStyle(entry).width),{doubled});
+            entry.value='authored';area.value='authored';
+            return true;
+        }})()"#,area_width=metrics.average*3.,doubled=width*2.)).unwrap();
+        let result=result.unwrap_or_else(|error|panic!("actual control font/default sizes: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(result,Value::Bool(true)));
+        realm.flush_layout().unwrap();
+        realm.with_session(|session| {
+            let cached=session.display_list(600,200,crate::canvas::canvas_fallback_fonts()).unwrap().clone();
+            let fresh=lumen_html::layout::display_list(session.document(),600,200,crate::canvas::canvas_fallback_fonts()).unwrap();
+            assert_eq!(cached.0,fresh.0);
+        });
+    }
+
+    #[test]
+    fn specification_replacement_fragment_scripts_live_parser_host_execution_keeps_template_activation() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(), r#"<!doctype html><script>globalThis.templateRuns=0;</script><div id=container><div id=target></div><b></b></div><template><span>New </span><script>globalThis.templateRuns++;document.querySelector('b').remove();</script><span>content</span></template><script>target.replaceWith(document.querySelector('template').content.cloneNode(true));container.querySelector('script').remove();globalThis.templateResult=container.innerHTML;</script>"#,256).unwrap();
+        realm.enable_resource_script_activations();
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("actual live network parser") {
+            realm.mark_script_started(descriptor.node);
+            let context=realm.classic_script_context(descriptor.node,None);
+            let _current_script=realm.enter_script(Some(descriptor.node));
+            if let Err(error)=engine.ctx().run_classic_script(&descriptor.text,context) {
+                let error=lumen::embed::abrupt_value(error);
+                panic!("host classic execution: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default());
+            }
+        }
+        assert!(matches!(script(&mut engine,"templateRuns===1 && templateResult==='<span>New </span><span>content</span>'"),Value::Bool(true)),
+            "parser-created template clones execute synchronously in the real host script turn");
+    }
+
+    #[test]
+    fn specification_replacement_fragment_scripts_run_after_atomic_insertion_and_keep_identity() {
+        let mut engine=lumen::Engine::new();
+        let _realm=install(engine.ctx(),r#"<div id=container><div id=target></div><b></b></div><template id=source><span>New </span><script>globalThis.executions=(globalThis.executions||0)+1;globalThis.executedScript=document.currentScript;globalThis.atomicTail=document.currentScript.nextSibling.textContent;document.querySelector("b").remove();</script><span>content</span></template>"#,256).unwrap();
+        let result=engine.eval_value(r#"(() => {
+            const source=document.getElementById('source');
+            const fragment=source.content.cloneNode(true),script=fragment.querySelector('script');
+            if(script.ownerDocument===document)throw Error('associated template owner was not retained');
+            document.getElementById('target').replaceWith(fragment);
+            if(executions!==1||executedScript!==script||atomicTail!=='content'||script.ownerDocument!==document)throw Error('replacement post-connection identity or atomic insertion');
+            script.remove();
+            if(container.innerHTML!=='<span>New </span><span>content</span>')throw Error('script did not remove the actual next sibling');
+            container.appendChild(script);if(executions!==1)throw Error('already-started script reran');
+            const inert=document.createElement('template');inert.innerHTML='<script>globalThis.inertReplacementExecuted=true;<\/script>';
+            container.replaceChildren(inert.content.cloneNode(true));
+            if(globalThis.inertReplacementExecuted!==undefined)throw Error('innerHTML already-started clone must stay inert');
+            return true;
+        })()"#).unwrap();
+        let value=result.unwrap_or_else(|error|panic!("replacement script: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(value,Value::Bool(true)));
+    }
+    #[test]
+    fn specification_element_metadata_native_reflection_coercion_reactions_and_adoption() {
+        let mut engine=lumen::Engine::new();let _realm=install(engine.ctx(),"<div id=parent translate=no spellcheck=false contenteditable><span id=child></span></div>",256).unwrap();
+        let result=engine.eval_value(r#"(() => {
+            const check=(ok,message)=>{if(!ok)throw Error(message)};
+            const parent=document.getElementById('parent'),child=document.getElementById('child');
+            check(child.translate===false && child.spellcheck===false && child.isContentEditable,'actual inherited metadata');
+            check(parent.contentEditable==='true' && child.contentEditable==='inherit','enumeration getter states');
+            child.contentEditable='PLAINTEXT-ONLY';check(child.contentEditable==='plaintext-only' && child.isContentEditable,'canonical plaintext setter');
+            child.contentEditable='FALSE';check(!child.isContentEditable,'false terminates inherited editability');
+            let failure;try{child.contentEditable=''}catch(error){failure=error}
+            check(failure instanceof DOMException && failure.name==='SyntaxError' && child.contentEditable==='false','invalid IDL setter preserves old attribute');
+            child.contentEditable='InHeRiT';check(!child.hasAttribute('contenteditable') && child.isContentEditable,'inherit removes attribute');
+            child.translate=true;child.spellcheck=true;child.draggable=true;
+            check(child.getAttribute('translate')==='yes' && child.getAttribute('spellcheck')==='true' && child.getAttribute('draggable')==='true','typed boolean setters canonicalize');
+            const host=document.createElement('div'),light=document.createElement('span');host.contentEditable='false';host.translate=false;host.spellcheck=false;host.appendChild(light);parent.appendChild(host);
+            const shadow=host.attachShadow({mode:'open'});shadow.innerHTML='<div contenteditable translate=yes spellcheck=true><slot></slot><span id=s></span></div>';
+            check(!light.isContentEditable && !light.translate && !light.spellcheck,'DOM inheritance ignores assigned slot');
+            const shadowChild=shadow.getElementById('s');check(shadowChild.isContentEditable && shadowChild.translate && shadowChild.spellcheck,'shadow owns ordinary DOM inheritance');
+            const boundary=document.createElement('span');shadow.appendChild(boundary);check(!boundary.isContentEditable && boundary.translate && boundary.spellcheck,'shadow root is not a parent element inheritance bridge');
+            host.contentEditable='true';check(light.isContentEditable,'dynamic light DOM owner');
+            const donor=document.implementation.createHTMLDocument('donor');donor.body.translate=false;donor.body.spellcheck=false;donor.body.contentEditable='true';
+            const moved=donor.createElement('span');donor.body.appendChild(moved);check(!moved.translate && !moved.spellcheck && moved.isContentEditable,'donor metadata');
+            parent.contentEditable='false';parent.translate=true;parent.spellcheck=true;parent.appendChild(moved);
+            check(moved.ownerDocument===document && moved.translate && moved.spellcheck && !moved.isContentEditable,'held native identity reads destination owner');
+            moved.contentEditable={toString(){donor.body.appendChild(moved);return 'TRUE'}};
+            check(moved.ownerDocument===donor && moved.contentEditable==='true','converted setter reprojects owner after authored adoption');
+            const changes=[];customElements.define('x-meta',class extends HTMLElement {
+                static get observedAttributes(){return ['translate','spellcheck','draggable','contenteditable']}
+                attributeChangedCallback(name,old,value){changes.push(name+':'+value)}
+            });const custom=document.createElement('x-meta');custom.translate=false;custom.spellcheck=false;custom.draggable=false;custom.contentEditable='true';custom.contentEditable='inherit';
+            check(changes.join(',')==='translate:no,spellcheck:false,draggable:false,contenteditable:true,contenteditable:null','shared CE mutation phases');
+            const a=document.createElement('a'),img=document.createElement('img');check(!a.draggable && img.draggable,'Auto intrinsic tags');a.href='';check(a.draggable,'href presence drives Auto');a.setAttribute('draggable','');check(a.draggable,'empty is Auto');a.draggable=false;check(!a.draggable,'explicit False');
+            const object=document.createElement('object');object.type='image/png';object.data='image.png';object.innerHTML='<span>fallback</span>';check(object.draggable===false,'fallback object is not an image representation merely from MIME or URL');object.draggable=true;check(object.draggable,'explicit object True');object.draggable=false;check(!object.draggable,'explicit object False');
+            globalThis.heldMetadata=moved;
+            return true;
+        })()"#).unwrap();
+        let result=result.unwrap_or_else(|error|panic!("metadata reflection: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(result,Value::Bool(true)));
+        engine.ctx().collect_garbage();
+        let result=engine.eval_value("heldMetadata.isContentEditable && !heldMetadata.translate && !heldMetadata.spellcheck && heldMetadata.contentEditable==='true'").unwrap();
+        let result=result.unwrap_or_else(|error|panic!("retained metadata owner: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(result,Value::Bool(true)),"held adopted node keeps actual destination metadata owner after wrapper/realm GC");
+    }
+
+    #[test]
+    fn specification_editability_design_mode_resets_active_range_once_and_preserves_ownership() {
+        let mut engine=lumen::Engine::new();let _realm=install(engine.ctx(),"<p id=t>text</p><div id=f contenteditable=false><b id=c>locked</b></div><div id=h contenteditable=plaintext-only></div>",128).unwrap();
+        let result=engine.eval_value(r#"(() => {
+            const check=(ok,message)=>{if(!ok)throw Error(message)};
+            const p=document.getElementById('t'),text=p.firstChild,selection=document.getSelection();selection.setBaseAndExtent(text,1,text,3);const range=selection.getRangeAt(0);
+            const observer=new MutationObserver(()=>{});observer.observe(document,{attributes:true,childList:true,subtree:true});
+            check(document.designMode==='off' && !p.isContentEditable,'initial mode');document.designMode='ON';
+            check(document.designMode==='on' && p.isContentEditable && p.matches(':read-write'),'mode changes actual editability and selectors');
+            check(!document.getElementById('c').isContentEditable && document.getElementById('h').isContentEditable,'false barrier and explicit host');
+            check(selection.getRangeAt(0)===range && range.startContainer===document && range.startOffset===0 && range.collapsed,'existing active range reset in place');
+            range.setStart(text,1);range.setEnd(text,2);document.designMode='on';check(range.startContainer===text && range.startOffset===1,'already on does not reset');
+            document.designMode='invalid';check(document.designMode==='on','invalid setter ignored');
+            const donor=document.implementation.createHTMLDocument('donor');check(donor.designMode==='off','new owner mode default');donor.adoptNode(p);donor.body.appendChild(p);check(!p.isContentEditable,'adoption uses actual destination mode');donor.designMode='on';check(p.isContentEditable,'independent destination mode');
+            document.designMode='OFF';check(document.designMode==='off' && donor.designMode==='on','independent logical Document state');
+            const template=document.createElement('template');const inert=template.content.ownerDocument;check(inert.designMode==='off','associated inert owner default');inert.designMode='on';check(inert.designMode==='on' && document.designMode==='off','associated logical document independent');
+            const detached=document.createTextNode('detached');range.setStart(detached,1);range.setEnd(detached,2);document.designMode='on';check(range.startContainer===detached && range.startOffset===1,'invisible range is not an active document range');document.designMode='off';
+            const records=observer.takeRecords();check(records.every(record=>record.type==='childList'),'mode transitions do not author attribute records');observer.disconnect();
+            return true;
+        })()"#).unwrap();
+        let result=result.unwrap_or_else(|error|panic!("designMode: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(result,Value::Bool(true)));
+    }
+
     use super::*;
     use lumen::Engine;
     use lumen_html_image::render_with_font;
     use lumen_html_text::{FontFace, DEFAULT_FONT_BYTES};
     use std::sync::Arc;
+
+    #[test]
+    fn specification_svg_view_document_url_updates_active_view_without_replacing_document() {
+        let mut engine=Engine::new();
+        let realm=install_xml(engine.ctx(),"<svg xmlns='http://www.w3.org/2000/svg' width='100' viewBox='0 0 2 1'><view id='selected' viewBox='0 0 1 1'/></svg>",64,XmlDocumentType::Svg).unwrap();
+        let root=realm.session.borrow().document().root();
+        realm.set_document_url("https://example.test/image.svg#selected");
+        let natural=realm.session.borrow_mut().embedded_document_intrinsic_size(false,None).unwrap().unwrap();
+        assert_eq!(natural.default_dimensions(),(100.0,100.0));
+        realm.set_document_url("https://example.test/image.svg#svgView(viewBox(0,0,4,1))");
+        let natural=realm.session.borrow_mut().embedded_document_intrinsic_size(false,None).unwrap().unwrap();
+        assert_eq!(natural.default_dimensions(),(100.0,25.0));
+        assert_eq!(realm.session.borrow().document().root(),root);
+        realm.set_document_url("https://example.test/image.svg#missing");
+        assert_eq!(realm.session.borrow_mut().embedded_document_intrinsic_size(false,None).unwrap().unwrap().default_dimensions(),(100.0,50.0));
+    }
+
+    #[test]
+    fn specification_heading_reflection_mutates_shared_levels_and_live_selectors() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<article id=scope headingoffset=2><h1 id=heading>A</h1></article>", 64).unwrap();
+        let value = script(&mut engine, r#"(() => {
+            const scope=document.getElementById('scope'), heading=document.getElementById('heading');
+            const check=(condition,message)=>{if(!condition)throw new Error(message)};
+            check(scope.headingOffset===2 && heading.matches(':heading(3)'),'initial reflected offset');
+            heading.headingOffset=1;
+            check(heading.getAttribute('headingoffset')==='1' && heading.matches(':heading(4)') && scope.matches(':has(:heading(4))'),'IDL mutation invalidates selectors');
+            heading.headingReset=true;
+            check(heading.hasAttribute('headingreset') && heading.matches(':heading(2)'),'boolean reset');
+            heading.headingReset=false;
+            check(!heading.hasAttribute('headingreset') && heading.matches(':heading(4)'),'reset removal');
+            heading.headingOffset=9;
+            check(heading.getAttribute('headingoffset')==='9' && heading.headingOffset===8 && heading.matches(':heading(9)'),'getter range does not constrain content setter');
+            heading.headingOffset=-1;
+            check(heading.getAttribute('headingoffset')==='0' && heading.headingOffset===0,'unsigned conversion and setter fallback');
+            heading.setAttribute('headingoffset',' +999999999999999999999999 trailing');
+            check(heading.headingOffset===8,'bounded nonnegative parsing');
+            heading.setAttribute('headingoffset','-1');
+            check(heading.headingOffset===0 && heading.matches(':heading(3)'),'invalid offset fallback');
+            const foreign=new DOMParser().parseFromString('<div></div>','text/html');
+            foreign.body.appendChild(heading);
+            check(heading.headingOffset===0 && heading.matches(':heading(1)'),'adopted heading uses current owner ancestry');
+            return true;
+        })()"#);
+        assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_live_parser_adjusted_insertion_and_reaction_boundary() {
+        let mut engine = Engine::new();
+        let realm = install_live_html(engine.ctx(), r#"<script>
+            globalThis.connectedBeforeChildren=false;
+            customElements.define('x-parented',class extends HTMLElement{
+                static get observedAttributes(){return ['x']}
+                attributeChangedCallback(){if(!this.parentNode)document.head.appendChild(this)}
+                connectedCallback(){connectedBeforeChildren=this.id==='parented' && !this.firstChild}
+            });
+        </script><body><x-parented x="1" id="parented"><p>following</p></x-parented><script>
+            const element=document.getElementById('parented');
+            if(element.parentNode!==document.head || document.body.querySelector('x-parented') || element.firstChild.localName!=='p')throw new Error('adjusted insertion reparenting');
+        </script>"#, 128).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("adjusted insertion feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("adjusted insertion script");
+        }
+        assert!(matches!(script(&mut engine, "connectedBeforeChildren"), Value::Bool(true)));
+
+        let mut engine = Engine::new();
+        let realm = install_live_html(engine.ctx(), r#"<script>
+            customElements.define('x-reset',class extends HTMLElement{
+                connectedCallback(){document.open();globalThis.parserReset=true}
+            });
+        </script><x-reset></x-reset><script>throw new Error('superseded parser continued')</script>"#, 128).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("reset parser feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("reset parser script");
+        }
+        assert!(matches!(script(&mut engine, "parserReset&&document.documentElement===null"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_parser_observers_preserve_html_script_batches_and_xml_insertions() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><body><script id=first>
+            globalThis.batches=[];
+            globalThis.observer=new MutationObserver(records=>batches.push(records.map(r=>[r.target.id||r.target.nodeName,Array.from(r.addedNodes,n=>n.id||n.nodeName),Array.from(r.removedNodes,n=>n.id||n.nodeName)])));
+            observer.observe(document,{childList:true,subtree:true});
+        </script><p id=parent></p><script id=second>
+            globalThis.inserted=document.createElement('span');inserted.id='inserted';
+            const script=document.createElement('script');script.id='dynamic';
+            script.textContent='document.body.append(inserted)';document.getElementById('parent').append(script);
+        </script><script id=third>observer.disconnect();</script><div id=removed><script id=fourth>
+            globalThis.removals=[];globalThis.removalObserver=new MutationObserver(records=>removals.push(records.map(r=>[r.target.id||r.target.nodeName,Array.from(r.addedNodes,n=>n.id||n.nodeName),Array.from(r.removedNodes,n=>n.id||n.nodeName)])));
+            removalObserver.observe(document,{childList:true,subtree:true});document.getElementById('removed').remove();
+        </script><p>ignored detached parser subtree</p></div><script id=fifth>removalObserver.disconnect();</script></body>"#,256).unwrap();
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).unwrap() {realm.execute_document_parser_script(engine.ctx(),descriptor.node).unwrap();engine.ctx().drain_microtasks_for_host();}
+        let actual=script(&mut engine,"JSON.stringify(batches)");
+        assert!(matches!(actual,Value::Str(ref text) if text.as_ref()==r##"[[["BODY",["parent"],[]],["BODY",["second"],[]],["second",["#text"],[]]],[["parent",["dynamic"],[]],["BODY",["inserted"],[]]],[["BODY",["third"],[]],["third",["#text"],[]]]]"##),"actual HTML record targets and source-node batches");
+        let actual=script(&mut engine,"JSON.stringify(removals)");
+        assert!(matches!(actual,Value::Str(ref text) if text.as_ref()==r##"[[["BODY",[],["removed"]]],[["BODY",["fifth"],[]],["fifth",["#text"],[]]]]"##),"detached parser insertions stay outside the document observer after its removal checkpoint");
+        assert_eq!(realm.dynamic_markup_insertion_counter.get(),0);
+
+        let mut engine=Engine::new();
+        let realm=install_live_xml(engine.ctx(),r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><script id="first"><![CDATA[
+            globalThis.records=[];globalThis.observer=new MutationObserver(list=>records.push(...list));observer.observe(document,{childList:true,subtree:true});
+        ]]></script><div id="a"><p id="b"><span id="c">text</span></p></div><script id="second"><![CDATA[
+            records.push(...observer.takeRecords());observer.disconnect();globalThis.xmlRecords=records.map(r=>[r.target.id||r.target.nodeName,Array.from(r.addedNodes,n=>n.id||n.nodeName)]);
+        ]]></script></body></html>"#,128,XmlDocumentType::Xhtml).unwrap();
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).unwrap() {realm.execute_document_parser_script(engine.ctx(),descriptor.node).unwrap();engine.ctx().drain_microtasks_for_host();}
+        let actual=script(&mut engine,"JSON.stringify(xmlRecords)");
+        assert!(matches!(actual,Value::Str(ref text) if text.as_ref()==r##"[["body",["a"]],["a",["b"]],["b",["c"]],["c",["#text"]],["body",["second"]],["second",["#cdata-section"]]]"##),"XML inserted-node provenance distinguishes parser records from unrelated task mutations");
+        assert_eq!(realm.dynamic_markup_insertion_counter.get(),0);
+    }
+
+    #[test]
+    fn specification_live_parser_constructor_phases_and_reentrant_write() {
+        let mut engine = Engine::new();
+        let realm = install_live_html(engine.ctx(), r#"<script>
+            globalThis.phases=[]; globalThis.checkpoint=false;
+            customElements.define('x-phase',class extends HTMLElement {
+                constructor(){super();
+                    phases.push(checkpoint && this.parentNode===null && !this.hasAttribute('data-token') && !this.firstChild);
+                    let rejected=false;try{document.write('forbidden')}catch(e){rejected=e.name==='InvalidStateError'}
+                    phases.push(rejected);
+                }
+                connectedCallback(){phases.push(this.getAttribute('data-token')==='network' && !this.firstChild)}
+            });
+            Promise.resolve().then(()=>checkpoint=true);
+        </script><x-phase data-token="network"><span>child</span></x-phase><script>
+            if(phases.length!==3||phases.some(x=>!x))throw new Error('parser constructor phases');
+            customElements.define('x-written',class extends HTMLElement{
+                constructor(){super();phases.push(document.getElementById('tail')===null)}
+            });
+            document.write('<x-written id="written">inserted</x-written>');
+            if(!document.getElementById('written')||document.getElementById('tail'))throw new Error('write consumed outer tail');
+        </script><i id="tail">tail</i>"#, 256).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("live constructor feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("constructor phase script");
+        }
+        assert!(matches!(script(&mut engine, "phases.length===4&&phases.every(Boolean)&&document.getElementById('tail')!==null"), Value::Bool(true)));
+        assert_eq!(realm.dynamic_markup_insertion_counter.get(), 0);
+
+        let mut engine = Engine::new();
+        let realm = install_live_xml(engine.ctx(), r#"<html xmlns="http://www.w3.org/1999/xhtml"><script>
+            globalThis.phases=[];globalThis.checkpoint=false;
+            customElements.define('x-phase',class extends HTMLElement{
+                constructor(){super();phases.push(checkpoint &amp;&amp; !this.parentNode &amp;&amp; !this.firstChild &amp;&amp; !this.hasAttribute('data-token'))}
+                connectedCallback(){phases.push(this.getAttribute('data-token')==='xml' &amp;&amp; !this.firstChild)}
+            });
+            Promise.resolve().then(()=>checkpoint=true);
+        </script><x-phase data-token="xml"><span>child</span></x-phase><script>
+            if(phases.length!==2||phases.some(x=>!x))throw new Error('XML constructor phases');
+        </script></html>"#, 128, XmlDocumentType::Xhtml).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("live XML constructor feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("XML constructor phase script");
+        }
+        assert!(matches!(script(&mut engine, "phases.length===2&&phases.every(Boolean)"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_live_parser_html_xml_mutations_and_script_checkpoint() {
+        let mut engine = Engine::new();
+        let realm = install_live_html(engine.ctx(), r#"<!doctype html><html><head><script>
+            globalThis.log=[];
+            if(document.body!==null)throw new Error('premature body');
+            new MutationObserver(records=>log.push(...records.map(r=>r.type+':'+r.target.nodeName)))
+                .observe(document.documentElement,{childList:true,subtree:true,characterData:true});
+        </script></head>
+        <!-- between head and body -->
+        <script>if(document.body!==null)throw new Error('after-head whitespace inserted premature body');</script>
+        <body><p>a<!--split-->b</p><script>
+            if(!log.includes('childList:HTML')||!log.includes('childList:P'))throw new Error('missing parser delivery');
+            document.write('<span id="written">written</span>');
+        </script><i id="tail">tail</i></body></html>"#, 256).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("live HTML feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("parser script");
+        }
+        assert!(matches!(script(&mut engine, "document.querySelector('#written').nextElementSibling.id==='tail'"), Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+
+        let mut engine = Engine::new();
+        let realm = install_live_xml(engine.ctx(), r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><script>
+            globalThis.log=[];
+            new MutationObserver(records=>log.push(...records.map(r=>r.target.nodeName)))
+                .observe(document.documentElement,{childList:true,subtree:true});
+        </script><style><![CDATA[#xml-target{border-spacing:0em 3em;border-style:solid}]]></style></head><body onload="globalThis.xmlAuthoredLoad=true"><p id="xml-target" onclick="globalThis.xmlAuthoredClick=true">text</p><script>
+            if(!log.includes('html')||!log.includes('p'))throw new Error('missing XML parser delivery');
+            if(typeof window.onload!=='function'||typeof document.getElementById('xml-target').onclick!=='function')throw new Error('missing XML parser content handlers');
+            document.getElementById('xml-target').click();window.onload();
+            if(!xmlAuthoredLoad||!xmlAuthoredClick)throw new Error('XML authored content handler execution');
+            if(getComputedStyle(document.getElementById('xml-target')).borderTopStyle!=='solid')throw new Error('XML CDATA stylesheet cascade');
+        </script></body></html>"#, 128, XmlDocumentType::Xhtml).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("live XML feed") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("XML parser script");
+        }
+        assert!(matches!(script(&mut engine, "document.body.firstElementChild.textContent==='text' && typeof window.onload==='function' && typeof document.getElementById('xml-target').onclick==='function' && getComputedStyle(document.getElementById('xml-target')).borderTopStyle==='solid'"), Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_fieldset_live_parser_rendering_scroll_and_body_removal_boundary() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><html><head><style>.c2{transform:rotate3d(0,1,0,45deg);column-width:100px}.c19{overflow:auto;padding-left:65536px;column-count:3}q{position:absolute;column-width:1px}body{column-count:3}</style><script>document.documentElement.appendChild(document.createElement('body'));</script></head></html>"#,256).unwrap();
+        realm.set_layout_flusher(Rc::new(|session|session.display_list(800,600,crate::canvas::canvas_fallback_fonts())
+            .map(|_|()).map_err(|error|format!("fieldset real font formatting: {error:?}"))));
+        let descriptor=realm.next_document_parser_script(engine.ctx()).expect("head parser yield").expect("authored head script");
+        realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("actual body insertion before parser EOF");
+        realm.flush_layout().expect("body insertion real layout");
+        realm.update_rendered_focus(engine.ctx()).expect("body insertion rendering focus boundary");
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("actual parser EOF continuation") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("remaining parser script");
+        }
+        for (phase,source) in [
+            ("fieldset insertion and window scrolling", "document.body.innerHTML='<fieldset class=c2><q>q</q></fieldset>';window.scrollBy(28,71);"),
+            ("anonymous overflow and multicol mutation", "document.querySelector('fieldset').setAttribute('class','c19');"),
+            ("body removal with stale scroll", "document.body.remove();"),
+        ] {
+            let result=engine.eval_value(source).expect("authored source evaluation");
+            if let Err(error)=result {panic!("{phase}: author {}",engine.ctx().coerce_string(&error).unwrap().to_string());}
+            realm.update_rendered_focus(engine.ctx()).unwrap_or_else(|error|panic!("{phase}: rendering focus {error:?}"));
+            realm.flush_layout().unwrap_or_else(|error|panic!("{phase}: real layout {error:?}"));
+            realm.update_rendered_focus(engine.ctx()).unwrap_or_else(|error|panic!("{phase}: next rendering opportunity {error:?}"));
+        }
+    }
+
+    #[test]
+    fn specification_live_parser_open_elements_follow_actual_iframe_adoption() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><iframe id=destination></iframe><canvas id=moved><object id=inside><script>
+            globalThis.childDocument=document.getElementById('destination').contentDocument;
+            globalThis.canvas=document.getElementById('moved');
+            childDocument.body.appendChild(canvas);
+        </script><span id=foreign-text>after adoption</span></object></canvas><p id=source-tail>source</p><script>
+            if(canvas.ownerDocument!==childDocument||childDocument.getElementById('foreign-text').textContent!=='after adoption'||document.getElementById('moved')!==null||document.getElementById('source-tail').textContent!=='source')throw new Error('iframe open-element continuation');
+        </script>"#,256).unwrap();
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("iframe open-element feed") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("iframe open-element authored script");
+        }
+        engine.ctx().collect_garbage();
+        assert!(matches!(script(&mut engine,"canvas.ownerDocument===childDocument&&childDocument.getElementById('foreign-text').textContent==='after adoption'"),Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_live_parser_foreign_open_elements_callbacks_gc_and_eof() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><script>
+            globalThis.destination=document.implementation.createHTMLDocument();
+            globalThis.foreignExecuted=false;globalThis.phases=[];
+            customElements.define('x-adopted-pending',class extends HTMLElement {
+                static observedAttributes=['data-token'];
+                attributeChangedCallback(){phases.push('attribute');destination.adoptNode(this);parserCollect();}
+                adoptedCallback(oldDocument,newDocument){phases.push(newDocument===destination?'away':'back');}
+                connectedCallback(){phases.push('connected');if(this.ownerDocument!==document)throw new Error('wrong connected owner');}
+            });
+        </script><x-adopted-pending data-token=value></x-adopted-pending><section id=moved><b><script>
+            globalThis.moved=document.getElementById('moved');
+            destination.body.append(destination.adoptNode(moved));parserCollect();
+        </script>foreign</b><i id=foreign-tail>tail</i><script>foreignExecuted=true;</script></section>
+        <p id=source-tail>source</p><script>
+            if(phases.join(',')!=='attribute,away,back,connected')throw new Error('parser adoption reaction order '+phases);
+            if(foreignExecuted||moved.ownerDocument!==destination||destination.getElementById('foreign-tail').textContent!=='tail'||document.getElementById('moved')!==null||document.getElementById('source-tail').textContent!=='source')throw new Error('open-element owner continuation');
+        </script>"#,256).unwrap();
+        let collect=engine.ctx().new_native_fn("parserCollect",0,Rc::new(|ctx,_,_| {ctx.collect_garbage();Ok(Value::Undefined)}));
+        let global=engine.ctx().global_object();
+        engine.ctx().set_member(&global,"parserCollect",collect).ok().expect("parser collection hook");
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("foreign open-element feed") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("foreign open-element authored script");
+        }
+        engine.ctx().collect_garbage();
+        assert!(matches!(script(&mut engine,"phases.join(',')==='attribute,away,back,connected' && moved.ownerDocument===destination && !foreignExecuted && destination.getElementById('foreign-tail').textContent==='tail'"),Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_live_parser_removed_iframe_open_stack_is_a_native_gc_mark_edge() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><iframe id=destination></iframe><section id=moved><script>
+            {const frame=document.getElementById('destination');const foreign=frame.contentDocument;
+             foreign.body.appendChild(document.getElementById('moved'));frame.remove();}
+            parserCollect();
+        </script><b id=foreign-tail>retained by parser</b></section><p id=source-tail>source</p>"#,256).unwrap();
+        let collect=engine.ctx().new_native_fn("parserCollect",0,Rc::new(|ctx,_,_| {ctx.collect_garbage();Ok(Value::Undefined)}));
+        let global=engine.ctx().global_object();engine.ctx().set_member(&global,"parserCollect",collect).ok().expect("parser collection hook");
+        let descriptor=realm.next_document_parser_script(engine.ctx()).expect("first parser feed").expect("adoption script");
+        let foreign_document=script(&mut engine,"document.getElementById('destination').contentDocument");
+        let owner=engine.ctx().with_instance::<DomDocument,_>(&foreign_document,|document|document.realm.clone()).expect("actual iframe Document");
+        let foreign=Rc::downgrade(&owner);let inserted=Rc::new(Cell::new(false));let observed=inserted.clone();
+        owner.add_mutation_sink(Rc::new(move|document,mutation| {
+            if mutation.kind.added_nodes().any(|node|matches!(document.kind(node),Ok(NodeKind::Text(text)) if text=="retained by parser")) {observed.set(true);}
+        }));
+        drop(owner);drop(foreign_document);
+        realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("removed iframe adoption script");
+        engine.ctx().collect_garbage();assert!(foreign.upgrade().is_some(),"source Document traces the actual foreign owner wrapper");
+        assert!(realm.next_document_parser_script(engine.ctx()).expect("removed iframe EOF continuation").is_none());
+        assert!(inserted.get(),"shared mutation hooks receive actual foreign character data before parser roots are released");
+        assert!(realm.document_parser_retention.borrow().is_empty());
+        assert!(matches!(script(&mut engine,"document.getElementById('source-tail').textContent==='source'&&document.getElementById('moved')===null&&document.getElementById('destination')===null"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_live_xml_parser_fatal_foreign_owner_stops_and_releases_stack() {
+        let mut engine=Engine::new();
+        let realm=install_live_xml(engine.ctx(),r#"<html xmlns="http://www.w3.org/1999/xhtml"><section id="moved"><script>
+            globalThis.destination=document.implementation.createHTMLDocument();destination.body.appendChild(document.getElementById('moved'));
+        </script><style>p{color:red}</wrong></section></html>"#,128,XmlDocumentType::Xhtml).unwrap();
+        let descriptor=realm.next_document_parser_script(engine.ctx()).expect("XML first feed").expect("XML adoption script");
+        realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("XML adoption");
+        let error=match realm.next_document_parser_script(engine.ctx()) {Err(error)=>error,Ok(_)=>panic!("malformed XML must remain a fatal error")};
+        assert_eq!(error.class(),"SyntaxError");assert!(realm.document_parser_retention.borrow().is_empty());
+        assert!(realm.next_document_parser_script(engine.ctx()).expect("closed XML parser").is_none());
+        assert!(matches!(script(&mut engine,"destination.getElementById('moved').lastChild.textContent==='p{color:red}'"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_live_xml_parser_associated_owner_aborts_preparation_in_same_arena() {
+        let mut engine=Engine::new();
+        let realm=install_live_xml(engine.ctx(),r#"<html xmlns="http://www.w3.org/1999/xhtml"><section id="moved"><script>
+            globalThis.storage=document.createElementNS('http://www.w3.org/1999/xhtml','template');
+            globalThis.executed=false;storage.content.appendChild(document.getElementById('moved'));
+        </script><b>stored</b><script>executed=true;</script></section><p id="tail">source</p></html>"#,128,XmlDocumentType::Xhtml).unwrap();
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("XML associated owner continuation") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("XML associated owner script");
+        }
+        assert!(matches!(script(&mut engine,"!executed&&storage.content.firstChild.ownerDocument===storage.content.ownerDocument&&storage.content.firstChild.getElementsByTagName('b')[0].textContent==='stored'&&document.getElementById('tail').textContent==='source'"),Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_live_xml_parser_foreign_owner_prefix_callbacks_and_eof() {
+        let mut engine=Engine::new();
+        let realm=install_live_xml(engine.ctx(),r#"<h:html xmlns:h="http://www.w3.org/1999/xhtml" xmlns:p="urn:original"><h:head><h:script><![CDATA[
+            globalThis.destination=document.implementation.createHTMLDocument();globalThis.phases=[];globalThis.foreignExecuted=false;
+            customElements.define('x-xml-pending',class extends HTMLElement {
+                static observedAttributes=['data-token'];
+                constructor(){super();globalThis.created=this;}
+                attributeChangedCallback(){if(this.prefix!=='h'||this.localName!=='x-xml-pending')throw new Error('XML constructor prefix before attributes');phases.push('attribute');destination.adoptNode(this);parserCollect();}
+                adoptedCallback(oldDocument,newDocument){phases.push(newDocument===destination?'away':'back');}
+                connectedCallback(){phases.push('connected');}
+            });
+        ]]></h:script></h:head><h:body><h:x-xml-pending data-token="value"/><h:section id="moved"><h:script><![CDATA[
+            globalThis.moved=document.getElementById('moved');destination.body.appendChild(moved);moved.setAttributeNS('http://www.w3.org/2000/xmlns/','xmlns:p','urn:mutated');parserCollect();
+        ]]></h:script>text<![CDATA[cdata]]><?instruction data?><!--comment--><p:item p:attribute="value"/><h:script>foreignExecuted=true;</h:script></h:section><h:p id="tail">source</h:p><h:script><![CDATA[
+            if(phases.join(',')!=='attribute,away,back,connected'||created.ownerDocument!==document||created.prefix!=='h')throw new Error('XML pending adoption publication '+phases);
+            const nodes=moved.childNodes;
+            if(moved.ownerDocument!==destination||nodes.length!==7||nodes[1].nodeType!==3||nodes[1].data!=='text'||nodes[2].nodeType!==4||nodes[2].data!=='cdata'||nodes[3].nodeType!==7||nodes[4].nodeType!==8)throw new Error('XML foreign character data');
+            if(nodes[5].prefix!=='p'||nodes[5].namespaceURI!=='urn:original'||nodes[5].getAttributeNS('urn:original','attribute')!=='value'||foreignExecuted||document.getElementById('tail').textContent!=='source')throw new Error('XML lexical namespace or script owner');
+        ]]></h:script></h:body></h:html>"#,256,XmlDocumentType::Xhtml).unwrap();
+        let collect=engine.ctx().new_native_fn("parserCollect",0,Rc::new(|ctx,_,_| {ctx.collect_garbage();Ok(Value::Undefined)}));
+        let global=engine.ctx().global_object();engine.ctx().set_member(&global,"parserCollect",collect).ok().expect("XML collection hook");
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("XML foreign owner feed") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("XML authored script");
+        }
+        engine.ctx().collect_garbage();
+        assert!(matches!(script(&mut engine,"created.ownerDocument===document&&created.prefix==='h'&&moved.ownerDocument===destination&&!foreignExecuted"),Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_live_parser_foreign_template_adoption_before_eof() {
+        let mut engine = Engine::new();
+        let realm = install_live_html(engine.ctx(), r#"<!doctype html><div><template id=host><select><option selected>stored</option></select></template></div><script>
+            globalThis.host=document.getElementById('host');globalThis.content=host.content;
+            globalThis.owner=document.implementation.createHTMLDocument();
+            if(owner.adoptNode(content)!==content||host.content!==content||content.ownerDocument!==owner)throw new Error('associated content identity during adoption');
+        </script><select id=live><option selected>live</option></select><script>
+            if(host.content!==content||content.ownerDocument!==owner||content.firstChild.options[0].text!=='stored'||document.getElementById('live').selectedIndex!==0)throw new Error('resumed owner-local control state');
+        </script>"#, 256).unwrap();
+        while let Some(descriptor) = realm.next_document_parser_script(engine.ctx()).expect("foreign-content parser completion") {
+            realm.execute_document_parser_script(engine.ctx(), descriptor.node).expect("authored associated content adoption");
+        }
+        engine.ctx().collect_garbage();
+        assert!(matches!(script(&mut engine, "host.content===content&&content.ownerDocument===owner&&document.getElementById('live').selectedIndex===0"), Value::Bool(true)));
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
+
+    #[test]
+    fn specification_live_parser_alternate_constructor_is_pinned_before_callbacks() {
+        let mut engine=Engine::new();
+        let realm=install_live_html(engine.ctx(),r#"<!doctype html><script>
+            globalThis.inside=false;globalThis.phases=[];
+            class Returned extends HTMLElement {
+                static observedAttributes=['data-token'];
+                constructor(){super();if(!inside){inside=true;const alternate=new Returned();inside=false;alternate.proof=91;return alternate}}
+                attributeChangedCallback(){parserCollect();phases.push(this.proof===91&&!this.parentNode)}
+                connectedCallback(){phases.push(this.proof===91&&this.getAttribute('data-token')==='value')}
+            }
+            customElements.define('x-returned',Returned);
+        </script><x-returned data-token=value></x-returned><script>
+            if(phases.length!==2||phases.some(value=>!value)||document.querySelector('x-returned').proof!==91)throw new Error('alternate constructor identity');
+        </script>"#,256).unwrap();
+        let pinned=Rc::new(Cell::new(false));
+        let result=pinned.clone();let owner=Rc::downgrade(&realm);
+        let collect=engine.ctx().new_native_fn("parserCollect",0,Rc::new(move|ctx,_,_|{
+            if let Some(owner)=owner.upgrade() {
+                let pending=owner.document_parser.borrow().as_ref().and_then(|parser|parser.pending_element());
+                result.set(pending.is_some_and(|node|owner.retained_nodes.borrow().contains_key(&node)));
+            }
+            ctx.collect_garbage();Ok(Value::Undefined)
+        }));
+        let global=engine.ctx().global_object();
+        engine.ctx().set_member(&global,"parserCollect",collect).ok().expect("parser GC callback");
+        while let Some(descriptor)=realm.next_document_parser_script(engine.ctx()).expect("alternate parser feed") {
+            realm.execute_document_parser_script(engine.ctx(),descriptor.node).expect("alternate parser script");
+        }
+        assert!(pinned.get(),"the actual chosen pending identity is leased before authored callbacks");
+        assert!(realm.document_parser_retention.borrow().is_empty());
+    }
 
     fn script(engine: &mut Engine, source: &str) -> Value {
         match engine.eval_value(source).expect("valid script") {
@@ -12743,17 +15815,124 @@ mod tests {
     }
 
     #[test]
+    fn specification_nonce_slots_initial_markup_response_policy_precedes_author_access() {
+        let mut engine=Engine::new();let realm=install(engine.ctx(),"<body><span id=initial nonce=initial></span></body>",128).unwrap();
+        realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(),"script-src 'nonce-initial'".into())]).unwrap();
+        let value=script(&mut engine,r#"(() => {
+            const element=document.getElementById('initial');
+            return element.nonce==='initial' && element.getAttribute('nonce')==='' && element.matches('[nonce=""]') && !element.matches('[nonce="initial"]');
+        })()"#);
+        assert!(matches!(value,Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_nonce_slots_bindings_hiding_clone_adoption_and_attribute_records() {
+        let mut engine=Engine::new();let realm=install(engine.ctx(),"<body></body>",256).unwrap();
+        realm.set_content_security_policy_headers(&[("Content-Security-Policy-Report-Only".into(),"script-src 'nonce-good'".into())]).unwrap();
+        let value=script(&mut engine,r#"(() => {
+            function check(value,message){if(!value)throw new Error(message)}
+            const element=document.createElement('span');
+            check(element.nonce==='', 'default');element.setAttribute('nonce','first');
+            check(element.nonce==='first','attribute slot');element.nonce='good';
+            check(element.getAttribute('nonce')==='first','IDL does not change attribute');
+            const observer=new MutationObserver(()=>{});observer.observe(element,{attributes:true,attributeOldValue:true});
+            document.body.append(element);
+            check(element.nonce==='good' && element.getAttribute('nonce')==='','connection hides content preserving slot');
+            const records=observer.takeRecords();check(records.length===1 && records[0].attributeName==='nonce' && records[0].oldValue==='first','real hidden attribute record');
+            const clone=element.cloneNode(true);check(clone.nonce==='good' && clone.getAttribute('nonce')==='','clone internal slot');
+            const other=new DOMParser().parseFromString('<body></body>','text/html');other.adoptNode(clone);check(clone.nonce==='good','adoption retains slot');
+            clone.setAttribute('nonce','next');check(clone.nonce==='next','detached change');
+            clone.nonce='override';clone.setAttribute('nonce','next');check(clone.nonce==='next','equal replacement still changes slot');
+            clone.removeAttribute('nonce');check(clone.nonce==='','removal clears slot');
+            const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.nonce='svg';check(svg.nonce==='svg' && !svg.hasAttribute('nonce'),'SVG mixin');
+            const math=document.createElementNS('http://www.w3.org/1998/Math/MathML','math');math.nonce='math';check(math.nonce==='math' && !math.hasAttribute('nonce'),'MathML mixin');
+            observer.disconnect();return true;
+        })()"#);
+        assert!(matches!(value,Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_import_maps_csp_external_errors_and_independent_window_settings() {
+        let mut engine=Engine::new();let realm=install(engine.ctx(),"<body></body>",256).unwrap();
+        realm.set_document_url("https://example.test/page");
+        realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(),"script-src 'nonce-good'".into())]).unwrap();
+        let value=script(&mut engine,r#"(() => {
+            const denied=document.createElement('script');denied.type='importmap';denied.text='{"imports":{"denied":"./denied.js"}}';document.body.append(denied);
+            denied.nonce='good';denied.remove();document.body.append(denied);
+            const admitted=document.createElement('script');admitted.type='importmap';admitted.nonce='good';admitted.text='{"imports":{"allowed":"./allowed.js"}}';document.body.append(admitted);
+            const external=document.createElement('script');external.type='importmap';external.nonce='good';external.src='./map.json';external.text='{"imports":{"external":"./external.js"}}';document.body.append(external);
+            return true;
+        })()"#);
+        assert!(matches!(value,Value::Bool(true)));
+        let map=engine.ctx().import_map_for_host().unwrap();
+        assert!(map.lock().unwrap().resolve("denied","https://example.test/page").is_err());
+        assert!(map.lock().unwrap().resolve("external","https://example.test/page").is_err());
+        assert_eq!(map.lock().unwrap().resolve("allowed","https://example.test/page").unwrap().url,"https://example.test/allowed.js");
+        let child=engine.ctx().create_host_realm();
+        let child_map=engine.ctx().with_host_realm(&child,|ctx| {
+            let child_realm=install(ctx,"<body></body>",64).unwrap();child_realm.set_document_url("https://example.test/child");
+            ctx.import_map_for_host().unwrap()
+        }).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&map,&child_map));
+        assert!(child_map.lock().unwrap().resolve("allowed","https://example.test/child").is_err());
+    }
+
+    #[test]
+    fn specification_import_maps_real_script_registration_typed_modules_and_meta_resolve() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<body></body>",256).unwrap();
+        realm.set_document_url("https://example.test/app/page.html");
+        let value=script(&mut engine,r#"(() => {
+            const errors=[];
+            addEventListener('error',event=>{errors.push(event.error.name);event.preventDefault();});
+            function map(text){const element=document.createElement('script');element.type='importmap';element.text=text;document.body.append(element);return element;}
+            map('{');
+            map('{"imports":{"x":"./module.js","pkg/":"./pkg/"},"integrity":{"./module.js":"sha256-test"}}');
+            const mapped=map('{"imports":{"x":"./ignored.js","new":"./new.js"}}');
+            mapped.remove();document.body.append(mapped);
+            globalThis.importMapErrors=errors;
+            return HTMLScriptElement.supports('importmap') && errors.length===1 && errors[0]==='SyntaxError';
+        })()"#);
+        assert!(matches!(value,Value::Bool(true)),"malformed maps report exceptions and later maps still register");
+        let requests=Rc::new(RefCell::new(Vec::new()));let captured=requests.clone();
+        engine.ctx().install_module_fetch_loader(Rc::new(move|request|{
+            let resolution=request.resolution.as_ref()?;
+            captured.borrow_mut().push((resolution.url.clone(),resolution.integrity.clone()));
+            Some(lumen::ModuleFetchResult {key:resolution.url.clone(),source:"export const value=9;".into(),script_context:None})
+        }));
+        let context=Rc::new(lumen::ClassicScriptContext {base_url:"https://example.test/app/page.html".into(),nonce:String::new(),credentials_mode:"same-origin".into(),referrer_policy:String::new()});
+        let result=engine.ctx().run_prepared_module_for_host("import {value} from 'x';export {value};export const resolved=import.meta.resolve('pkg/sub.js');",
+            "inline-import-map-test","https://example.test/document.html","https://example.test/app/page.html",Some(context)).ok().expect("actual typed module graph");
+        assert!(matches!(engine.ctx().get_member(result.namespace(),"value"),Ok(Value::Num(9.0))));
+        assert!(matches!(engine.ctx().get_member(result.namespace(),"resolved"),Ok(Value::Str(value)) if value.as_str()=="https://example.test/app/pkg/sub.js"));
+        assert_eq!(requests.borrow().as_slice(),&[("https://example.test/app/module.js".into(),"sha256-test".into())]);
+        let state=engine.ctx().import_map_for_host().expect("Window map");
+        let retained=state.lock().unwrap().resolve("new","https://example.test/app/page.html").unwrap();
+        assert_eq!(retained.url,"https://example.test/app/new.js");
+        script(&mut engine,"const base=document.createElement('base');base.href='/live-base/';document.head.append(base);");
+        let asynchronous=Rc::new(RefCell::new(Vec::new()));let queue=asynchronous.clone();
+        engine.ctx().install_async_module_import_handler(Rc::new(move|request|queue.borrow_mut().push(request)));
+        let _pending=script(&mut engine,"import('./late.js')");
+        let request=asynchronous.borrow_mut().pop().expect("actual asynchronous typed request");
+        assert_eq!(request.referrer,"https://example.test/live-base/");
+        assert_eq!(request.resolution.unwrap().url,"https://example.test/live-base/late.js","scriptless resolution uses the settings' live API base, not Node import_base or the map's preparation base");
+    }
+
+    #[test]
     fn script_supports_reports_real_realm_capabilities_and_webidl_coercion() {
         let mut engine = Engine::new();
         let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
         realm.enable_resource_script_activations();
-        assert!(matches!(script(&mut engine, r#"
+        assert!(matches!(
+            script(
+                &mut engine,
+                r#"
             (() => {
                 const supports = HTMLScriptElement.supports;
                 const d = Object.getOwnPropertyDescriptor(HTMLScriptElement, 'supports');
                 if (supports.length !== 1 || !d.enumerable || !d.writable || !d.configurable ||
                     'supports' in HTMLScriptElement.prototype || !supports('classic') ||
-                    supports('module') || supports('importmap') || supports('speculationrules')) return false;
+                    supports('module') || !supports('importmap') || supports('speculationrules')) return false;
                 for (const type of ['', ' ', 'Classic', 'classic ', ' classic', 'Module',
                     'module ', ' module', 'text/javascript', 'application/javascript', null, undefined]) {
                     if (supports(type)) return false;
@@ -12764,34 +15943,61 @@ mod tests {
                 try { supports(Symbol()); } catch (e) { symbol = e instanceof TypeError; }
                 return missing && symbol;
             })()
-        "#), Value::Bool(true)));
+        "#
+            ),
+            Value::Bool(true)
+        ));
         realm.set_module_script_support(true);
-        assert!(matches!(script(&mut engine, "HTMLScriptElement.supports('module')"), Value::Bool(true)));
+        assert!(matches!(
+            script(&mut engine, "HTMLScriptElement.supports('module')"),
+            Value::Bool(true)
+        ));
         let parent_supports = script(&mut engine, "HTMLScriptElement.supports");
         let child = engine.ctx().create_host_realm();
-        let (child_realm, child_supports) = engine.ctx().with_host_realm(&child, |ctx| {
-            let child_realm = install(ctx, "<body></body>", 64).unwrap();
-            assert!(!DomHtmlScriptElement::supports(ctx, "module"));
-            child_realm.enable_resource_script_activations();
-            assert!(!DomHtmlScriptElement::supports(ctx, "module"));
-            let global = ctx.global_object();
-            ctx.member_set(&global, "borrowedParentSupports", parent_supports).ok().expect("publish parent operation");
-            let constructor = ctx.get_member(&global, "HTMLScriptElement").ok().expect("child constructor");
-            let supports = ctx.get_member(&constructor, "supports").ok().expect("child operation");
-            (child_realm, supports)
-        }).unwrap();
+        let (child_realm, child_supports) = engine
+            .ctx()
+            .with_host_realm(&child, |ctx| {
+                let child_realm = install(ctx, "<body></body>", 64).unwrap();
+                assert!(!DomHtmlScriptElement::supports(ctx, "module"));
+                child_realm.enable_resource_script_activations();
+                assert!(!DomHtmlScriptElement::supports(ctx, "module"));
+                let global = ctx.global_object();
+                ctx.member_set(&global, "borrowedParentSupports", parent_supports)
+                    .ok()
+                    .expect("publish parent operation");
+                let constructor = ctx
+                    .get_member(&global, "HTMLScriptElement")
+                    .ok()
+                    .expect("child constructor");
+                let supports = ctx
+                    .get_member(&constructor, "supports")
+                    .ok()
+                    .expect("child operation");
+                (child_realm, supports)
+            })
+            .unwrap();
         assert!(DomHtmlScriptElement::supports(engine.ctx(), "module"));
         let global = engine.ctx().global_object();
-        engine.ctx().member_set(&global, "borrowedChildSupports", child_supports).ok().expect("publish child operation");
-        assert!(matches!(script(&mut engine, "borrowedChildSupports('module') === false"), Value::Bool(true)));
+        engine
+            .ctx()
+            .member_set(&global, "borrowedChildSupports", child_supports)
+            .ok()
+            .expect("publish child operation");
+        assert!(matches!(
+            script(&mut engine, "borrowedChildSupports('module') === false"),
+            Value::Bool(true)
+        ));
         let value = engine.eval_value_in_host_realm(&child,
             "borrowedParentSupports('module') === true && HTMLScriptElement.supports('module') === false", false)
             .unwrap().ok().expect("borrowed parent operation");
         assert!(matches!(value, Value::Bool(true)));
         child_realm.set_module_script_support(true);
-        engine.ctx().with_host_realm(&child, |ctx| {
-            assert!(DomHtmlScriptElement::supports(ctx, "module"));
-        }).unwrap();
+        engine
+            .ctx()
+            .with_host_realm(&child, |ctx| {
+                assert!(DomHtmlScriptElement::supports(ctx, "module"));
+            })
+            .unwrap();
         realm.set_module_script_support(false);
         assert!(!DomHtmlScriptElement::supports(engine.ctx(), "module"));
     }
@@ -12916,7 +16122,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_created_scripts_stay_inert_after_adoption_and_template_extraction() {
+    fn specification_clone_parser_inertness_and_active_template_extraction() {
         let mut engine = Engine::new();
         let realm = install(
             engine.ctx(),
@@ -12933,10 +16139,11 @@ mod tests {
                     'text/html');
                 const parsedScript = parsed.querySelector('script');
                 document.body.appendChild(document.adoptNode(parsedScript));
+                if(inertRuns !== 0) throw new Error('DOMParser script must stay inert');
                 const template = document.getElementById('source');
                 const templateScript = template.content.firstChild;
                 document.body.appendChild(template.content.removeChild(templateScript));
-                inertRuns === 0
+                inertRuns === 1
             "#,
         );
         assert!(matches!(value, Value::Bool(true)));
@@ -13384,6 +16591,53 @@ mod tests {
             Value::Bool(true)
         ));
         assert!(scheduling::run_tasks(&mut engine, 8).is_empty());
+    }
+
+    #[test]
+    fn specification_image_request_svg_metadata_reaches_natural_idl_and_resolverless_layout() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<!doctype html><style>body{margin:0}img{display:block}</style><img id=actual>",128).unwrap();
+        let images=Rc::new(lumen_html_image::FileImages::new("."));
+        realm.set_image_resolver(images);
+        let font=crate::canvas::canvas_fallback_fonts();
+        realm.set_layout_flusher(Rc::new(move |session|session.display_list(400,200,font).map(|_|()).map_err(|error|format!("image layout: {error:?}"))));
+        let source=br#"<svg xmlns="http://www.w3.org/2000/svg"><view id="square" viewBox="0 0 80 80"/><rect width="100" height="80" fill="green"/></svg>"#;
+        let url=format!("data:image/svg+xml,{}#svgView(viewBox(0,0,100,80))",lumen_common::codec::percent_encode(source,|byte|!byte.is_ascii_alphanumeric()));
+        let global=engine.ctx().global_object();
+        engine.ctx().set_member(&global,"selectedSvgSource",Value::from_string(url)).ok().expect("actual selected source");
+        assert!(matches!(script(&mut engine,"actual.src=selectedSvgSource;!actual.complete"),Value::Bool(true)));
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(),1);
+        assert!(scheduling::run_tasks(&mut engine,8).is_empty());
+        assert!(matches!(script(&mut engine,"actual.complete && actual.naturalWidth===187 && actual.naturalHeight===150 && actual.getBoundingClientRect().width===187.5 && actual.getBoundingClientRect().height===150"),Value::Bool(true)),"unrounded resource dimensions survive native publication without the URL resolver in the layout callback");
+        assert!(matches!(script(&mut engine,"actual.src=actual.src.split('#')[0]+'#square';!actual.complete"),Value::Bool(true)));
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(),1);
+        assert!(scheduling::run_tasks(&mut engine,8).is_empty());
+        assert!(matches!(script(&mut engine,"actual.naturalWidth===150 && actual.naturalHeight===150 && actual.getBoundingClientRect().width===150 && actual.getBoundingClientRect().height===150"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_responsive_current_request_retains_density_and_reuses_same_resource() {
+        let mut engine=Engine::new();
+        let realm=install(engine.ctx(),"<!doctype html><body><img id=responsive src=actual.png srcset='actual.png 400w' sizes=200px></body>",64).unwrap();
+        realm.set_document_url("https://images.test/page.html");
+        let calls=Rc::new(Cell::new(0usize));let seen=calls.clone();
+        let decoded=Arc::new(lumen_html::paint::ImageData{width:4,height:2,pixels:vec![0;4*2*4]});
+        realm.set_image_resolver(Rc::new(move |source:&str|{seen.set(seen.get()+1);if source.ends_with("/actual.png"){lumen_html::layout::ImageState::Ready(decoded.clone())}else{lumen_html::layout::ImageState::Failed}}));
+        script(&mut engine,"globalThis.responsive=document.getElementById('responsive');globalThis.events=[];responsive.onload=()=>events.push('load');");
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(),1);
+        assert!(scheduling::run_tasks(&mut engine,8).is_empty());
+        assert!(matches!(script(&mut engine,"responsive.currentSrc==='https://images.test/actual.png'&&responsive.naturalWidth===2&&responsive.naturalHeight===1&&events.length===1"),Value::Bool(true)));
+        let first_calls=calls.get();
+        assert!(matches!(script(&mut engine,"responsive.naturalWidth===2&&responsive.complete"),Value::Bool(true)));
+        assert_eq!(calls.get(),first_calls,"warm snapshot does not resolve the selected resource");
+        script(&mut engine,"responsive.sizes='400px';");
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(),1);
+        assert!(scheduling::run_tasks(&mut engine,8).is_empty());
+        assert!(matches!(script(&mut engine,"responsive.naturalWidth===4&&responsive.naturalHeight===2&&events.length===2"),Value::Bool(true)));
+        assert_eq!(calls.get(),first_calls,"same URL with a new normalized density reuses decoded pixels");
+        realm.set_device_pixel_ratio(2.0).unwrap();
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(),0,"unchanged source and density produce no load event");
+        assert_eq!(calls.get(),first_calls);
     }
 
     #[test]
@@ -14039,7 +17293,7 @@ mod tests {
         );
         assert_eq!(
             target_realm
-                .script_retentions
+                .node_retentions
                 .borrow()
                 .get(&adopted_node)
                 .map(Vec::len),
@@ -14052,7 +17306,7 @@ mod tests {
             .borrow()
             .contains_key(&adopted_node));
         assert!(!target_realm
-            .script_retentions
+            .node_retentions
             .borrow()
             .contains_key(&adopted_node));
         assert!(matches!(
@@ -14533,7 +17787,9 @@ mod tests {
         let mut engine = Engine::new();
         let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
         realm.enable_resource_script_activations();
-        let synchronous = script(&mut engine, r#"
+        let synchronous = script(
+            &mut engine,
+            r#"
             globalThis.preparationEvents = [];
             for (const src of ['', ' ', '\t', '\n', '\f', '\r', ' \t\n\f\r ']) {
                 const element = document.createElement('script');
@@ -14545,7 +17801,8 @@ mod tests {
                 element.remove();
             }
             preparationEvents.length === 0;
-        "#);
+        "#,
+        );
         assert!(matches!(synchronous, Value::Bool(true)));
         assert!(realm.drain_script_activations(engine.ctx()).is_empty());
         assert_eq!(realm.retained_nodes.borrow().len(), 7);
@@ -14931,6 +18188,267 @@ mod tests {
     }
 
     #[test]
+    fn get_attribute_is_element_only_and_layout_walk_skips_text_nodes() {
+        let mut engine = Engine::new();
+        install(
+            engine.ctx(),
+            "<main data-expected-width='20'>lead<!--comment--><b></b>tail</main>",
+            64,
+        )
+        .unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            const main = document.querySelector('main');
+            const nonElements = [document, document.createDocumentFragment(),
+                document.createTextNode('text'), document.createComment('comment')];
+            const methods = ['getAttribute', 'hasAttribute', 'setAttribute', 'removeAttribute',
+                'getAttributeNS', 'hasAttributeNS', 'setAttributeNS', 'removeAttributeNS'];
+            const absent = methods.every(name => !(name in Node.prototype)
+                && nonElements.every(node => !(name in node))
+                && typeof Element.prototype[name] === 'function');
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('DATA-Case', 'value');
+            svg.setAttributeNS('urn:guard', 'g:attr', 'namespaced');
+            const attributes = svg.hasAttribute('DATA-Case')
+                && !svg.hasAttribute('data-case')
+                && svg.getAttributeNS('urn:guard', 'attr') === 'namespaced'
+                && svg.hasAttributeNS('urn:guard', 'attr');
+            svg.removeAttribute('DATA-Case');
+            svg.removeAttributeNS('urn:guard', 'attr');
+            const removed = !svg.hasAttribute('DATA-Case')
+                && !svg.hasAttributeNS('urn:guard', 'attr');
+            let rejected = false;
+            try { Element.prototype.getAttribute.call(main.firstChild, 'id'); }
+            catch (error) { rejected = error instanceof TypeError; }
+            const values = [];
+            function walk(node) {
+                const value = node.getAttribute && node.getAttribute('data-expected-width');
+                if (value) values.push(value);
+                Array.prototype.forEach.call(node.childNodes, walk);
+            }
+            walk(main);
+            absent && rejected && attributes && removed && values.join(',') === '20'
+                && main.getAttribute('DATA-EXPECTED-WIDTH') === '20'
+                && main.getAttribute('missing') === null
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn element_markup_and_selector_interfaces_keep_shadow_and_template_lifecycles() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<main></main><template></template>", 128).unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            const main = document.querySelector('main');
+            const names = ['id', 'className', 'classList', 'innerHTML', 'outerHTML',
+                'matches', 'webkitMatchesSelector', 'closest', 'namespaceURI', 'localName', 'prefix', 'tagName'];
+            const nonElements = [document, document.createDocumentFragment(),
+                document.createTextNode('text'), document.createComment('comment')];
+            const absent = names.every(name => !(name in Node.prototype)
+                && nonElements.every(node => !(name in node)));
+            const attr = document.createAttributeNS('urn:attribute', 'p:attr');
+            const foreign = document.createElementNS('urn:element', 'q:element');
+            const namespaces = attr.localName === 'attr' && attr.prefix === 'p'
+                && attr.namespaceURI === 'urn:attribute' && foreign.localName === 'element'
+                && foreign.tagName === 'q:element' && foreign.prefix === 'q'
+                && foreign.namespaceURI === 'urn:element';
+            let rejected = false;
+            try {
+                Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML')
+                    .get.call(nonElements[1]);
+            } catch (error) { rejected = error instanceof TypeError; }
+            main.innerHTML = '<div id="child" class="one"><b>text</b></div>';
+            const child = main.firstElementChild;
+            const tokens = child.classList;
+            const selectors = child.matches('.one') && child.webkitMatchesSelector('#child')
+                && child.firstElementChild.closest('.one') === child;
+            child.remove();
+            tokens.add('two');
+            const retained = child.classList === tokens && child.className === 'one two';
+            const template = document.querySelector('template');
+            template.innerHTML = '<span id="inside">template</span>';
+            const context = template.content.querySelector('#inside');
+            const templateOk = template.childNodes.length === 0
+                && context.textContent === 'template'
+                && template.innerHTML === '<span id="inside">template</span>';
+            const host = document.createElement('div');
+            const shadow = host.attachShadow({mode: 'closed'});
+            globalThis.markupScriptRan = false;
+            shadow.innerHTML = '<p class="shadow">content</p><script>markupScriptRan=true</' + 'script>';
+            const shadowOk = !markupScriptRan && !('matches' in shadow)
+                && !('id' in shadow) && shadow.querySelector('.shadow').textContent === 'content'
+                && shadow.innerHTML.startsWith('<p class="shadow">content</p>');
+            main.innerHTML = null;
+            shadow.innerHTML = null;
+            absent && namespaces && rejected && selectors && retained && templateOk && shadowOk
+                && main.innerHTML === '' && shadow.innerHTML === ''
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn inline_style_interfaces_preserve_identity_and_brand_across_html_svg_mathml() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "", 128).unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            const nodes = [document.createElement('span'),
+                document.createElementNS('http://www.w3.org/2000/svg', 'rect'),
+                document.createElementNS('http://www.w3.org/1998/Math/MathML', 'mi')];
+            const plain = [document, document.createDocumentFragment(),
+                document.createTextNode('text'), document.createComment('comment'),
+                document.createElementNS('urn:foreign', 'element')];
+            const absent = !('style' in Node.prototype) && !('style' in Element.prototype)
+                && plain.every(node => !('style' in node));
+            const brands = nodes[0] instanceof HTMLElement && nodes[1] instanceof SVGElement
+                && nodes[2] instanceof MathMLElement;
+            const offsets = ['offsetParent', 'offsetTop', 'offsetLeft', 'offsetWidth', 'offsetHeight'];
+            const offsetBrands = offsets.every(name => !(name in Element.prototype)
+                && name in HTMLElement.prototype && !(name in nodes[1]) && !(name in nodes[2]));
+            const styles = nodes.every((node, index) => {
+                const style = node.style;
+                node.style = 'width:' + (index + 3) + 'px';
+                style.setProperty('height', '7px');
+                return node.style === style && style.width === (index + 3) + 'px'
+                    && style.height === '7px' && node.getAttribute('style').includes('7px');
+            });
+            let rejected = 0;
+            for (const constructor of [HTMLElement, SVGElement, MathMLElement]) {
+                try { Object.getOwnPropertyDescriptor(constructor.prototype, 'style').get.call(plain[2]); }
+                catch (error) { if (error instanceof TypeError) ++rejected; }
+            }
+            absent && brands && offsetBrands && styles && rejected === 3
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn parent_node_interfaces_share_live_collections_queries_and_variadic_mutation() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<!doctype html><main></main>", 128).unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            const names = ['children', 'firstElementChild', 'lastElementChild',
+                'childElementCount', 'querySelector', 'querySelectorAll',
+                'append', 'prepend', 'replaceChildren'];
+            const nonParents = [document.createTextNode('text'),
+                document.createComment('comment'), document.createAttribute('attr'), document.doctype];
+            const absent = names.every(name => !(name in Node.prototype)
+                && nonParents.every(node => !(name in node)));
+            const host = document.createElement('div');
+            const parents = [document.querySelector('main'), document.createDocumentFragment(),
+                host.attachShadow({mode: 'open'})];
+            const mutations = parents.every(parent => {
+                const live = parent.children;
+                const b = document.createElement('b');
+                const i = document.createElement('i');
+                parent.append('tail', b, document.createComment('comment'));
+                parent.prepend('lead', i);
+                const before = parent.children === live && live.length === 2
+                    && parent.firstElementChild === i && parent.lastElementChild === b
+                    && parent.childElementCount === 2 && parent.querySelector('b') === b;
+                const snapshot = parent.querySelectorAll('b');
+                const u = document.createElement('u');
+                parent.replaceChildren('replacement', u);
+                return before && live.length === 1 && live[0] === u
+                    && parent.firstElementChild === u && parent.lastElementChild === u
+                    && parent.childElementCount === 1 && snapshot.length === 1 && snapshot[0] === b
+                    && parent.textContent === 'replacement' && b.parentNode === null;
+            });
+            const isolated = new DOMParser().parseFromString('<html></html>', 'text/html');
+            const root = isolated.firstElementChild;
+            const documentLive = isolated.children;
+            isolated.replaceChildren(root);
+            const documentOk = isolated.children === documentLive && documentLive.length === 1
+                && isolated.childElementCount === 1 && isolated.lastElementChild === root
+                && isolated.querySelector('html') === root
+                && isolated.querySelectorAll('html')[0] === root;
+            let rejected = false;
+            try { Element.prototype.append.call(nonParents[0], 'forbidden'); }
+            catch (error) { rejected = error instanceof TypeError; }
+            absent && mutations && documentOk && rejected
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn child_node_interfaces_preserve_character_data_doctype_and_unscopables() {
+        let mut engine = Engine::new();
+        install(
+            engine.ctx(),
+            "<!doctype html><main><b>left</b>middle<i>right</i></main>",
+            128,
+        )
+        .unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            const names = ['before', 'after', 'replaceWith', 'remove'];
+            const nonChildren = [document, document.createDocumentFragment(), document.createAttribute('attr')];
+            const absent = names.every(name => !(name in Node.prototype)
+                && nonChildren.every(node => !(name in node)));
+            const main = document.querySelector('main');
+            const text = main.firstElementChild.nextSibling;
+            const siblings = text.previousElementSibling === main.firstElementChild
+                && text.nextElementSibling === main.lastElementChild;
+            const u = document.createElement('u');
+            text.before('before');
+            text.after(u);
+            const em = document.createElement('em');
+            text.replaceWith('replaced', em);
+            const comment = document.createComment('comment');
+            main.append(comment);
+            comment.remove();
+            const mutationOk = text.parentNode === null && comment.parentNode === null
+                && main.querySelector('em') === em && em.nextElementSibling === u
+                && main.childElementCount === 4 && main.textContent === 'leftbeforereplacedright';
+            const doctype = document.doctype;
+            const doctypeOk = !('previousElementSibling' in doctype)
+                && !('nextElementSibling' in doctype) && names.every(name => typeof doctype[name] === 'function');
+            const slotHost = document.createElement('div');
+            slotHost.append(text);
+            const shadow = slotHost.attachShadow({mode: 'open'});
+            shadow.innerHTML = '<slot></slot>';
+            const slottable = text.assignedSlot === shadow.firstElementChild
+                && slotHost.assignedSlot === null && !('assignedSlot' in CharacterData.prototype)
+                && !('assignedSlot' in comment) && !('assignedSlot' in doctype);
+            doctype.remove();
+            const scopes = [
+                [Element, ['before', 'after', 'replaceWith', 'remove', 'prepend', 'append', 'replaceChildren']],
+                [CharacterData, names], [DocumentType, names],
+                [Document, ['prepend', 'append', 'replaceChildren']],
+                [DocumentFragment, ['prepend', 'append', 'replaceChildren']],
+            ];
+            const unscopables = scopes.every(([constructor, members]) => {
+                const descriptor = Object.getOwnPropertyDescriptor(constructor.prototype, Symbol.unscopables);
+                return descriptor && !descriptor.writable && !descriptor.enumerable && descriptor.configurable
+                    && Object.getPrototypeOf(descriptor.value) === null
+                    && members.every(name => descriptor.value[name] === true);
+            }) && Node.prototype[Symbol.unscopables] === undefined;
+            let rejected = false;
+            try { Element.prototype.remove.call(text); }
+            catch (error) { rejected = error instanceof TypeError; }
+            globalThis.append = 'outside';
+            main.setAttribute('onclick', 'globalThis.unscopedAppend=append; globalThis.memberAppend=this.append');
+            main.dispatchEvent(new Event('click'));
+            const eventScopeOk = unscopedAppend === 'outside' && typeof memberAppend === 'function';
+            absent && siblings && mutationOk && doctypeOk && document.doctype === null
+                && unscopables && rejected && slottable && eventScopeOk
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
     fn element_traversal_skips_non_elements_and_tracks_moves() {
         let mut engine = Engine::new();
         install(
@@ -15038,10 +18556,16 @@ mod tests {
     fn event_target_install_accepts_bare_host_without_runtime_web_unit() {
         let mut engine = Engine::new();
         let global = engine.ctx().global_object();
-        assert!(matches!(engine.ctx()
-            .has_own_property_value(&global, &Value::str("EventTarget")), Ok(false)));
+        assert!(matches!(
+            engine
+                .ctx()
+                .has_own_property_value(&global, &Value::str("EventTarget")),
+            Ok(false)
+        ));
         install(engine.ctx(), "<main></main>", 64).unwrap();
-        let value = script(&mut engine, r#"
+        let value = script(
+            &mut engine,
+            r#"
             const main = document.querySelector('main');
             let received;
             main.addEventListener('probe', event => received = event);
@@ -15049,14 +18573,17 @@ mod tests {
             main.dispatchEvent(event);
             main instanceof EventTarget && received === event &&
                 event.target === main && event instanceof Event
-        "#);
+        "#,
+        );
         assert!(matches!(value, Value::Bool(true)));
     }
 
     #[test]
     fn event_target_install_propagates_existing_getter_reference_error() {
         let mut engine = Engine::new();
-        script(&mut engine, r#"
+        script(
+            &mut engine,
+            r#"
             globalThis.eventTargetGetterCalls = 0;
             Object.defineProperty(globalThis, 'EventTarget', {
                 configurable: true,
@@ -15065,16 +18592,26 @@ mod tests {
                     throw new ReferenceError('existing EventTarget getter failure');
                 }
             });
-        "#);
-        assert!(matches!(install(engine.ctx(), "<main></main>", 64), Err(InstallError::Global)));
-        assert!(matches!(script(&mut engine, "eventTargetGetterCalls"), Value::Num(1.0)));
+        "#,
+        );
+        assert!(matches!(
+            install(engine.ctx(), "<main></main>", 64),
+            Err(InstallError::Global)
+        ));
+        assert!(matches!(
+            script(&mut engine, "eventTargetGetterCalls"),
+            Value::Num(1.0)
+        ));
         // The failed getter must not be replaced by successful DOM installation.
-        let value = script(&mut engine, r#"
+        let value = script(
+            &mut engine,
+            r#"
             let error;
             try { globalThis.EventTarget; } catch (caught) { error = caught; }
             eventTargetGetterCalls === 2 && error instanceof ReferenceError &&
                 error.message === 'existing EventTarget getter failure'
-        "#);
+        "#,
+        );
         assert!(matches!(value, Value::Bool(true)));
     }
 
@@ -15411,8 +18948,10 @@ mod tests {
                 "textarea.value === '\\na' && textarea.selectionStart === 1 && textarea.selectionEnd === 1"),
             Value::Bool(true)
         ));
-        script(&mut engine,
-            "textarea.setSelectionRange(textarea.value.length,textarea.value.length);");
+        script(
+            &mut engine,
+            "textarea.setSelectionRange(textarea.value.length,textarea.value.length);",
+        );
         realm
             .dispatch(
                 engine.ctx(),
@@ -15433,8 +18972,10 @@ mod tests {
                 &[("key", Value::str("c")), ("ctrlKey", Value::Bool(true))],
             )
             .unwrap();
-        let diagnostic = script(&mut engine,
-            "JSON.stringify([textarea.value,textarea.selectionStart,textarea.selectionEnd])");
+        let diagnostic = script(
+            &mut engine,
+            "JSON.stringify([textarea.value,textarea.selectionStart,textarea.selectionEnd])",
+        );
         if let Value::Str(actual) = diagnostic {
             assert_eq!(actual.as_str(), "[\"\\na\\n\",3,3]");
         } else {
@@ -15646,7 +19187,9 @@ mod tests {
         assert!(matches(&realm, "#target:focus-visible"));
 
         realm.note_pointer_modality();
-        realm.focus_from_pointer(engine.ctx(), Some(target)).unwrap();
+        realm
+            .focus_from_pointer(engine.ctx(), Some(target))
+            .unwrap();
         assert!(matches(&realm, "#target:focus"));
         assert!(!matches(&realm, "#target:focus-visible"));
         realm.note_keyboard_modality();
@@ -15747,7 +19290,9 @@ mod tests {
     #[test]
     fn web_targets_capture_bubble_and_preserve_abort_signals() {
         let mut engine = Engine::new();
-        assert!(lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok());
+        assert!(
+            lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok()
+        );
         install(engine.ctx(), "<main></main>", 64).unwrap();
         let value = script(
             &mut engine,
@@ -16082,6 +19627,60 @@ mod tests {
     }
 
     #[test]
+    fn detached_reaper_bounds_retained_root_work_and_recovers_capacity_after_gc() {
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<html><body></body></html>", 128).unwrap();
+        let capacity = realm.session.borrow().document().remaining_node_capacity();
+        assert!(capacity > 0);
+
+        let mut roots = Vec::with_capacity(capacity);
+        let mut wrappers = Vec::with_capacity(capacity);
+        let mut roots_examined = 0usize;
+        let mut nodes_examined = 0usize;
+        for _ in 0..capacity {
+            let node = realm
+                .session
+                .borrow_mut()
+                .document_mut()
+                .create(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    name: "div".into(),
+                    attributes: Vec::new(),
+                })
+                .unwrap();
+            wrappers.push(realm.wrap(engine.ctx(), node));
+            let stats = realm.reap_detached([node]);
+            roots_examined += stats.roots_examined;
+            nodes_examined += stats.nodes_examined;
+            roots.push(node);
+        }
+
+        assert_eq!(roots_examined, roots.len());
+        assert_eq!(
+            nodes_examined, 0,
+            "new roots must not walk older components"
+        );
+        assert_eq!(
+            realm.detached.borrow().candidate_generations.len(),
+            roots.len(),
+            "live wrappers keep each detached component pending"
+        );
+        assert_eq!(
+            realm.session.borrow().document().remaining_node_capacity(),
+            0
+        );
+
+        drop(wrappers);
+        engine.collect_garbage();
+        realm.reap_detached_for_capacity(1);
+        assert!(
+            realm.session.borrow().document().remaining_node_capacity() >= roots.len(),
+            "capacity pressure must finish pending dead-root cleanup synchronously"
+        );
+        assert!(realm.detached.borrow().candidate_generations.is_empty());
+    }
+
+    #[test]
     fn document_title_is_live_contextual_and_survives_document_cloning() {
         let mut engine = Engine::new();
         install(
@@ -16362,7 +19961,9 @@ mod tests {
     #[test]
     fn node_insertion_adopts_foreign_nodes_and_preserves_identity_and_failure_atomicity() {
         let mut engine = Engine::new();
-        assert!(lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok());
+        assert!(
+            lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok()
+        );
         install(engine.ctx(), "<main></main>", 128).unwrap();
         script(&mut engine, "const NativeEvent = Event;");
         let result = script(
@@ -16581,13 +20182,13 @@ mod tests {
             var range = source.createRange();
             range.setStart(text, 1);
             range.setEnd(text, 4);
-            var selection = source.getSelection();
+            var selection = document.getSelection();
             selection.setBaseAndExtent(text, 1, text, 4);
             target.adoptNode(section);
             var cloned = range.cloneRange();
             range.startContainer === text && range.toString() === 'ell' &&
-              cloned.toString() === 'ell' && selection.anchorNode === text &&
-              selection.toString() === 'ell' && (range.deleteContents(), text.data === 'ho')
+              cloned.toString() === 'ell' && cloned.startContainer === text &&
+              selection.anchorNode === null && selection.rangeCount === 0 && selection.toString() === '' && (range.deleteContents(), text.data === 'ho')
         "#,
         );
         assert!(matches!(result, Value::Bool(true)));

@@ -1,0 +1,25 @@
+[package]
+name = "parse-srcset"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.74"
+description = "Parse an HTML img srcset attribute into image candidates (url + density/width/height). A faithful port of the WHATWG-based parse-srcset npm package. Zero dependencies, no_std."
+documentation = "https://docs.rs/parse-srcset"
+repository = "https://github.com/trananhtung/parse-srcset"
+homepage = "https://github.com/trananhtung/parse-srcset"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["srcset", "html", "responsive", "image", "parser"]
+categories = ["parser-implementations", "web-programming", "no-std"]
+authors = ["trananhtung"]
+exclude = ["/.github", "/.gitignore"]
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

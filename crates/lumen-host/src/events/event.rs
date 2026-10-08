@@ -150,6 +150,8 @@ impl Event {
         self.kind.borrow().clone()
     }
 
+    pub fn trusted_dispatch(&self) -> bool { self.trusted.get() }
+
     pub fn prevent_default(&self) {
         if self.cancelable.get() && !self.passive.get() {
             self.canceled.set(true);

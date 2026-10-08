@@ -26,6 +26,14 @@ pub enum Origin {
 }
 
 impl Origin {
+    /// The HTML origin algorithm uses the captured source origin for inherited
+    /// about documents, rather than a parent's mutable active document.
+    fn for_document(url: &str, source: Option<&Self>) -> Self {
+        if is_about_blank_url(url) || lumen_common::url::parse(url, None).is_ok_and(|url| url.scheme == "about" && url.path == "srcdoc") {
+            if let Some(source) = source { return source.clone(); }
+        }
+        Self::from_url(url)
+    }
     pub fn opaque() -> Self {
         Self::Opaque(NEXT_OPAQUE_ORIGIN.fetch_add(1, Ordering::Relaxed))
     }
@@ -103,12 +111,22 @@ pub enum FrameUnsupportedReason {
 pub enum FrameSource {
     /// A present `srcdoc` attribute, including the empty string.
     SrcDoc(String),
+    /// Actual javascript: string completion, retaining the target document URL.
+    JavaScriptDocument { source:String, url:String },
     /// A present `src` attribute resolved against the effective document base.
     Url(String),
     /// Neither source attribute is present; the initial document is `about:blank`.
     Blank,
     /// A present `src` could not be parsed by the shared URL implementation.
     InvalidUrl(String),
+    /// Attribute processing suppressed a URL equal to an inclusive ancestor's URL.
+    Suppressed,
+}
+
+impl FrameSource {
+    pub(crate) fn retained_inline_bytes(&self)->usize {
+        match self {Self::SrcDoc(source)=>source.len(),Self::JavaScriptDocument{source,url}=>source.len().saturating_add(url.len()),_=>0}
+    }
 }
 
 /// A host-observable snapshot for starting or validating one iframe navigation.
@@ -119,6 +137,96 @@ pub struct FrameNavigationRequest {
     pub base_url: String,
     pub generation: u64,
     pub unsupported: Option<FrameUnsupportedReason>,
+    pub initiator_origin: Origin,
+    pub post_resource: Option<Rc<NavigationPostResource>>,
+    pub metadata: NavigationMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UserNavigationInvolvement { #[default] None, Activation, BrowserUi }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavigationMetadata {
+    pub(crate) policy_container: crate::csp::PolicyContainer,
+    pub cookie_source_url: Option<String>,
+    pub referrer: lumen_common::referrer::Referrer,
+    pub inherited_referrer_policy: lumen_common::referrer::ReferrerPolicy,
+    pub source_element: Option<NodeId>,
+    pub user_involvement: UserNavigationInvolvement,
+}
+
+fn local_policy_url(url: &str) -> bool {
+    lumen_common::url::parse_url(url, None).is_some_and(|url| matches!(url.scheme.as_str(), "about" | "data" | "blob"))
+}
+
+impl NavigationMetadata {
+    pub(crate) fn from_document(document: &DomRealm) -> Self {
+        Self { policy_container: document.policy_container(), cookie_source_url: document.cookie_source_url(), referrer: document.navigation_referrer(), source_element: None,
+            inherited_referrer_policy: document.referrer_policy.get(),
+            user_involvement: UserNavigationInvolvement::None }
+    }
+
+    pub(crate) fn from_frame_owner(document: &DomRealm, tree: &lumen_html::Document, owner: NodeId) -> Self {
+        let mut metadata = Self::from_document(document);
+        metadata.source_element = Some(owner);
+        if let Some(policy) = tree.get_attribute_ns_ref(owner, None, "referrerpolicy").ok().flatten()
+            .and_then(lumen_common::referrer::ReferrerPolicy::parse) {
+            metadata.referrer.policy = policy;
+        }
+        metadata
+    }
+}
+
+/// The immutable form resource associated with one history document state.
+/// Encoding is performed by the existing form submission algorithm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavigationPostResource {
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Bounds shared by every child and staged response in a browsing-context group.
+/// Admission measures live documents rather than reserving a full document cap
+/// for each small iframe. Hosts can select tighter budgets before author script.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameResourceLimits {
+    pub max_realms: usize,
+    pub max_document_nodes: usize,
+    pub max_total_nodes: usize,
+    pub max_document_source_bytes: usize,
+    pub max_total_source_bytes: usize,
+}
+
+impl Default for FrameResourceLimits {
+    fn default() -> Self {
+        Self { max_realms: 64, max_document_nodes: 65_536, max_total_nodes: 262_144,
+            max_document_source_bytes: 8 * 1024 * 1024, max_total_source_bytes: 32 * 1024 * 1024 }
+    }
+}
+
+struct FrameReservation {
+    group: std::rc::Weak<ContextGroup>,
+    nodes: usize,
+    source_bytes: usize,
+}
+
+impl FrameReservation {
+    fn set_nodes(&mut self, nodes: usize) {
+        if let Some(group) = self.group.upgrade() {
+            group.staged_nodes.set(group.staged_nodes.get().saturating_sub(self.nodes).saturating_add(nodes));
+        }
+        self.nodes = nodes;
+    }
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.upgrade() {
+            group.staged_realms.set(group.staged_realms.get().saturating_sub(1));
+            group.staged_nodes.set(group.staged_nodes.get().saturating_sub(self.nodes));
+            group.staged_source_bytes.set(group.staged_source_bytes.get().saturating_sub(self.source_bytes));
+        }
+    }
 }
 
 /// An iframe response whose DOM and host realm are ready but whose stable
@@ -128,7 +236,9 @@ pub struct PreparedFrameResponse {
     context: Rc<BrowsingContext>,
     request: FrameNavigationRequest,
     realm: RealmHandle,
+    staging_realm: Option<RealmHandle>,
     parsed_document: Option<lumen_html::Document>,
+    parser_source: Option<String>,
     details_controller: Rc<super::dialog_popover::DetailsController>,
     document: Option<Rc<DomRealm>>,
     mime: String,
@@ -138,9 +248,12 @@ pub struct PreparedFrameResponse {
     metadata: Rc<RealmMetadata>,
     inherits_creator: bool,
     committed: bool,
+    reservation: Option<FrameReservation>,
+    source_bytes: usize,
 }
 
 impl PreparedFrameResponse {
+    pub fn reuses_window(&self) -> bool { self.staging_realm.is_some() }
     /// Realm that the trusted embedder should populate before commit.
     pub fn realm_handle(&self) -> RealmHandle {
         self.realm.clone()
@@ -157,6 +270,17 @@ impl PreparedFrameResponse {
     /// The response's trusted origin metadata, independent of its base URL.
     pub fn origin(&self) -> Origin {
         self.metadata.origin.borrow().clone()
+    }
+
+    /// Trusted transport metadata captured when a Blob fetch began. Capturing
+    /// this before byte reads preserves the origin if that URL is revoked later.
+    pub fn set_blob_origin(&mut self, origin: Origin) -> Result<(), FrameInstallError> {
+        if self.document.is_some() || self.committed
+            || !lumen_common::url::parse(&self.final_url, None).is_ok_and(|url| url.scheme == "blob") {
+            return Err(FrameInstallError::HostRealm);
+        }
+        self.metadata.origin.replace(origin);
+        Ok(())
     }
 
     /// Fallback base before any parsed `<base href>` is applied.
@@ -177,9 +301,16 @@ impl PreparedFrameResponse {
         }
         let mut retired = Vec::new();
         if let Some(document) = self.document {
+            super::navigation_lifecycle::destroy(ctx, &document);
             document.retire_all_frame_contexts(ctx, &mut retired);
         }
-        retired.push(self.realm);
+        let realm=if let Some(staging)=self.staging_realm {staging}else{self.realm};
+        // Preparation can register an owner before a Document exists. This
+        // realm is actually discarded, so its unqualified owners and tasks
+        // must retire along with document-qualified work.
+        super::scheduling::cancel_tasks_for_realm(ctx,&realm);
+        if let Some(timers)=ctx.host_mut::<lumen_timers::Timers>() {timers.cancel_realm(&realm);}
+        retired.push(realm);
         retired
     }
 }
@@ -202,6 +333,7 @@ pub enum FrameInstallError {
     Document(lumen_html::Error),
     Parse(InstallError),
     HostRealm,
+    ResourceLimit(String),
 }
 
 pub(crate) struct RealmMetadata {
@@ -249,23 +381,56 @@ impl RealmMetadataRegistry {
 }
 
 struct ContextGroup {
+    allocation_budget_group: Rc<()>,
+    embedded_pixels:std::sync::Arc<lumen_common::limits::ByteBudget>,
+    history: Rc<super::history::HistoryStore>,
     /// Strong ownership here is intentional: only active navigables belong to the host group.
     /// Detached/replaced contexts are removed and their realm handles are then released.
     contexts: RefCell<HashMap<usize, Rc<BrowsingContext>>>,
     metadata: Rc<RealmMetadataRegistry>,
     root_key: usize,
+    next_insertion: Cell<u64>,
+    transition_generation: Cell<u64>,
+    limits: Cell<FrameResourceLimits>,
+    staged_realms: Cell<usize>,
+    staged_nodes: Cell<usize>,
+    staged_source_bytes: Cell<usize>,
+    documents: RefCell<Vec<FrameDocumentRecord>>,
+    pending_retired: RefCell<Vec<RealmHandle>>,
+}
+
+struct FrameDocumentRecord {
+    document: std::rc::Weak<DomRealm>,
+    document_id: NodeId,
+    nodes: Rc<Cell<usize>>,
+    source_bytes: usize,
 }
 
 impl ContextGroup {
     fn new(root_key: usize) -> Rc<Self> {
         Rc::new(Self {
+            allocation_budget_group: Rc::new(()),
+            embedded_pixels:lumen_common::limits::ByteBudget::new(64*1024*1024),
+            history: Rc::new(super::history::HistoryStore::default()),
             contexts: RefCell::new(HashMap::new()),
             metadata: Rc::new(RealmMetadataRegistry::default()),
             root_key,
+            next_insertion: Cell::new(1),
+            transition_generation: Cell::new(0),
+            limits: Cell::new(FrameResourceLimits::default()),
+            staged_realms: Cell::new(0),
+            staged_nodes: Cell::new(0),
+            staged_source_bytes: Cell::new(0),
+            documents: RefCell::new(Vec::new()),
+            pending_retired: RefCell::new(Vec::new()),
         })
     }
 
     fn register(&self, context: &Rc<BrowsingContext>) {
+        let mut histories = self.history.contexts.borrow_mut();
+        histories.retain(|_, context| context.strong_count() != 0);
+        histories.insert(context.history_id(), Rc::downgrade(context));
+        drop(histories);
         let key = context.realm.borrow().global().object_identity();
         if let Some(key) = key {
             let metadata = context.metadata.borrow().clone();
@@ -273,6 +438,95 @@ impl ContextGroup {
             self.metadata.register(&metadata);
             self.contexts.borrow_mut().insert(key, context.clone());
         }
+    }
+
+    fn admit(self: &Rc<Self>, ctx: &mut Ctx, source_bytes: usize) -> OpResult<(FrameReservation, usize)> {
+        match self.admit_without_collection(source_bytes) {
+            Err(error) if error.class() == "QuotaExceededError"
+                && source_bytes <= self.limits.get().max_document_source_bytes => {
+                // Retired realms remain available to reachable author references. Reclaim only
+                // unreachable cycles before deciding the bounded profile really is exhausted.
+                // This is admission pressure, not a collection on every frame or navigation.
+                let has_retired = self.documents.borrow().iter().any(|record|
+                    record.document.upgrade().is_some_and(|document| document.lifecycle.destroyed.get()));
+                if !has_retired { return Err(error); }
+                ctx.collect_garbage();
+                self.admit_without_collection(source_bytes)
+            }
+            result => result,
+        }
+    }
+
+    fn admit_without_collection(self: &Rc<Self>, source_bytes: usize) -> OpResult<(FrameReservation, usize)> {
+        let limits = self.limits.get();
+        let contexts = self.contexts.borrow();
+        let mut nodes = self.staged_nodes.get();
+        let mut bytes = self.staged_source_bytes.get();
+        let mut counted_documents = HashSet::new();
+        let mut realms = self.staged_realms.get();
+        {
+            let mut documents = self.documents.borrow_mut();
+            documents.retain(|record| record.document.strong_count() != 0);
+            for record in documents.iter() {
+                let Some(document) = record.document.upgrade() else { continue; };
+                counted_documents.insert(Rc::as_ptr(&document) as usize);
+                let session = document.session.try_borrow()
+                    .map_err(|_| OpError::new("InvalidStateError", "Frame admission requires an available document"))?;
+                nodes = nodes.saturating_add(session.document().node_count());
+                bytes = bytes.saturating_add(record.source_bytes);
+                realms = realms.saturating_add(1);
+            }
+        }
+        for context in contexts.values() {
+            if let Some(document) = context.document() {
+                if !counted_documents.insert(Rc::as_ptr(&document) as usize) { continue; }
+                let session = document.session.try_borrow()
+                    .map_err(|_| OpError::new("InvalidStateError", "Frame admission requires an available document"))?;
+                nodes = nodes.saturating_add(session.document().node_count());
+            }
+            bytes = bytes.saturating_add(context.source_bytes.get());
+            realms = realms.saturating_add(1);
+        }
+        if realms >= limits.max_realms || source_bytes > limits.max_document_source_bytes
+            || bytes.saturating_add(source_bytes) > limits.max_total_source_bytes
+            || nodes >= limits.max_total_nodes {
+            return Err(OpError::new("QuotaExceededError", "Browsing-context group resource budget exceeded"));
+        }
+        let max_nodes = limits.max_document_nodes.min(limits.max_total_nodes - nodes);
+        self.staged_realms.set(self.staged_realms.get() + 1);
+        self.staged_source_bytes.set(self.staged_source_bytes.get() + source_bytes);
+        Ok((FrameReservation { group: Rc::downgrade(self), nodes: 0, source_bytes }, max_nodes))
+    }
+
+    fn track_document(self: &Rc<Self>, document: &Rc<DomRealm>, source_bytes: usize) {
+        let mut documents = self.documents.borrow_mut();
+        documents.retain(|record| record.document.strong_count() != 0);
+        let weak = Rc::downgrade(document);
+        if let Some(record) = documents.iter_mut().find(|record| record.document.ptr_eq(&weak)) { record.source_bytes = source_bytes; }
+        else {
+            let mut session = document.session.borrow_mut();
+            let nodes = Rc::new(Cell::new(session.document().node_count()));
+            session.document_mut().set_node_count_tracking(nodes.clone());
+            documents.push(FrameDocumentRecord { document: weak, document_id: session.document().root(), nodes, source_bytes });
+        }
+        drop(documents);
+        let group = Rc::downgrade(self);
+        document.session.borrow_mut().document_mut().set_allocation_budget_group(self.allocation_budget_group.clone());
+        document.session.borrow_mut().document_mut().set_allocation_budget(Some(Rc::new(move |current, required, aggregate_growth| {
+            let Some(group) = group.upgrade() else { return Ok(()); };
+            let limits = group.limits.get();
+            let local_count = current.node_count().checked_add(required).ok_or(lumen_html::Error::LimitExceeded)?;
+            if local_count > limits.max_document_nodes { return Err(lumen_html::Error::LimitExceeded); }
+            let mut count = current.node_count().checked_add(aggregate_growth).ok_or(lumen_html::Error::LimitExceeded)?;
+            count = count.saturating_add(group.staged_nodes.get());
+            let records = group.documents.try_borrow().map_err(|_| lumen_html::Error::LimitExceeded)?;
+            for record in records.iter() {
+                if record.document_id == current.root() { continue; }
+                if record.document.strong_count() != 0 { count = count.saturating_add(record.nodes.get()); }
+            }
+            if count > limits.max_total_nodes { return Err(lumen_html::Error::LimitExceeded); }
+            Ok(())
+        })));
     }
 
     fn unregister_active(&self, realm: &RealmHandle) {
@@ -318,6 +572,11 @@ fn remove_group(ctx: &mut Ctx, root_key: usize) {
 /// Per-navigable browser state. The document points back weakly, while this
 /// object retains the active document and its host realm for child contexts.
 pub(crate) struct BrowsingContext {
+    pub(crate) history: RefCell<Option<Rc<super::history::NavigableHistory>>>,
+    history_navigation: RefCell<Option<Rc<super::history::Entry>>>,
+    committed_history_entry: RefCell<Option<Rc<super::history::Entry>>>,
+    pending_post_resource: RefCell<Option<Rc<NavigationPostResource>>>,
+    replace_navigation: Cell<bool>,
     group: std::rc::Weak<ContextGroup>,
     metadata: RefCell<Rc<RealmMetadata>>,
     proxy_metadata: Rc<RefCell<Rc<RealmMetadata>>>,
@@ -325,15 +584,25 @@ pub(crate) struct BrowsingContext {
     window_proxy: RefCell<Option<WeakValue>>,
     document: RefCell<Option<Rc<DomRealm>>>,
     parent: Option<std::rc::Weak<BrowsingContext>>,
+    opener: RefCell<Option<std::rc::Weak<BrowsingContext>>>,
     owner_realm: Option<std::rc::Weak<DomRealm>>,
     owner_node: Option<NodeId>,
     inherit_about_origin: Cell<bool>,
     /// A Location API navigation takes precedence over reflected `src`/`srcdoc`
     /// until one of those author-controlled iframe inputs changes.
     location_navigation: RefCell<Option<String>>,
+    javascript_document: RefCell<Option<(String,String)>>,
+    navigation_initiator: RefCell<Option<Origin>>,
+    navigation_initiator_base: RefCell<Option<String>>,
+    navigation_metadata: RefCell<Option<NavigationMetadata>>,
     active: Cell<bool>,
     navigation_generation: Cell<u64>,
+    beforeunload_generation: Cell<Option<u64>>,
+    ignored_attribute_navigation: Cell<Option<u64>>,
     initial_blank_load_dispatched: Cell<bool>,
+    insertion_order: u64,
+    target_name: RefCell<String>,
+    source_bytes: Cell<usize>,
 }
 
 struct BrowsingContextService {
@@ -360,19 +629,75 @@ impl WeakFrameIdentity {
     pub fn matches(&self, frame: &FrameContext) -> bool {
         self.inner.ptr_eq(&Rc::downgrade(&frame.inner))
     }
+
+    /// Live providers measure the owner without retaining a context/document cycle.
+    pub fn content_viewport_size(&self) -> OpResult<Option<(u32, u32)>> {
+        self.inner.upgrade().filter(|context| context.active.get())
+            .map(|inner| FrameContext { inner }.content_viewport_size()).transpose()
+    }
 }
 
 impl FrameContext {
+    pub fn context_identity(&self)->usize {Rc::as_ptr(&self.inner) as usize}
+    pub fn set_navigation_post_resource(&self, request: &FrameNavigationRequest, headers: Vec<(String, String)>, body: Vec<u8>) -> OpResult<()> {
+        if !self.request_is_current(request) { return Err(OpError::new("InvalidStateError", "superseded POST navigation")); }
+        let resource = Rc::new(NavigationPostResource { headers, body });
+        super::history::preflight_post_resource(&self.inner, &resource)?;
+        *self.inner.pending_post_resource.borrow_mut() = Some(resource);
+        Ok(())
+    }
+    pub fn prepare_document_deactivation(&self, ctx: &mut Ctx) -> OpResult<()> { super::history::before_deactivation(ctx, &self.inner) }
+    pub fn is_top_level(&self) -> bool { self.inner.parent.is_none() }
+    pub fn is_primary_top_level(&self)->bool {self.is_top_level() && self.inner.insertion_order==0}
+
+    /// Complete a traversal fetch that produced no document (HTTP 204/205).
+    /// The target entry becomes current while its predecessor remains active.
+    pub fn finish_navigation_without_document(&self, ctx: &mut Ctx) -> OpResult<()> {
+        let target = self.inner.history_navigation.borrow_mut().take();
+        *self.inner.committed_history_entry.borrow_mut() = target.clone();
+        super::history::navigation_finished(ctx, &self.inner, target, None, self.navigation_request().source, false)
+    }
+    pub(crate) fn lifecycle_documents(&self, ctx: &mut Ctx) -> OpResult<Vec<(Rc<DomRealm>, RealmHandle)>> {
+        let mut contexts = std::collections::VecDeque::from([self.clone()]);
+        let mut documents = Vec::new();
+        while let Some(frame) = contexts.pop_front() {
+            let Some(document) = frame.current_document() else { continue; };
+            if !is_active_document(&frame.inner, &document) { continue; }
+            contexts.extend(document.frame_contexts(ctx)?);
+            documents.push((document, frame.realm_handle()));
+        }
+        Ok(documents)
+    }
+
+    pub fn queue_beforeunload(&self, ctx: &mut Ctx) -> OpResult<super::navigation_lifecycle::NavigationPhase> {
+        let generation = self.navigation_generation();
+        if self.inner.beforeunload_generation.replace(Some(generation)) == Some(generation) {
+            return super::navigation_lifecycle::queue_phase(ctx, Vec::new(), false);
+        }
+        let documents = self.lifecycle_documents(ctx)?;
+        super::navigation_lifecycle::queue_phase(ctx, documents, false)
+    }
+
+    pub fn queue_document_unload(&self, ctx: &mut Ctx) -> OpResult<super::navigation_lifecycle::NavigationPhase> {
+        let mut documents = self.lifecycle_documents(ctx)?;
+        documents.reverse();
+        super::navigation_lifecycle::queue_phase(ctx, documents, true)
+    }
     pub fn weak_identity(&self) -> WeakFrameIdentity {
         WeakFrameIdentity {
             inner: Rc::downgrade(&self.inner),
         }
     }
 
+    pub(crate) fn embedded_pixel_budget(&self)->OpResult<std::sync::Arc<lumen_common::limits::ByteBudget>> {
+        self.inner.group.upgrade().map(|group|group.embedded_pixels.clone())
+            .ok_or_else(||OpError::new("InvalidStateError","Embedded browsing-context group is retired"))
+    }
+
     pub fn owner_node(&self) -> NodeId {
         self.inner
             .owner_node
-            .expect("frame browsing contexts have an owner iframe")
+            .unwrap_or_else(|| self.inner.document().expect("active top-level document").session.borrow().document().root())
     }
 
     /// Measure the iframe's current content-box viewport after refreshing its
@@ -385,7 +710,15 @@ impl FrameContext {
             .as_ref()
             .and_then(std::rc::Weak::upgrade)
             .ok_or_else(|| OpError::new("InvalidStateError", "iframe owner document is gone"))?;
+        synchronize_frame_media_environment(&owner)?;
         owner.flush_layout()?;
+        self.content_viewport_size_after_layout()
+    }
+
+    /// The renderer has committed owner layout and holds no Session borrow.
+    pub(crate) fn content_viewport_size_after_layout(&self)->OpResult<(u32,u32)> {
+        let owner=self.inner.owner_realm.as_ref().and_then(std::rc::Weak::upgrade)
+            .ok_or_else(||OpError::new("InvalidStateError","iframe owner document is gone"))?;
         let session_handle = owner.session_handle();
         let size = {
             let mut session = session_handle.borrow_mut();
@@ -416,10 +749,19 @@ impl FrameContext {
         self.inner.realm.borrow().clone()
     }
 
+    /// The container's document qualifies NodeId for host lifecycle bookkeeping.
+    pub fn owner_document(&self) -> Option<Rc<DomRealm>> {
+        if self.is_top_level() { self.current_document() } else { self.inner.owner_realm.as_ref()?.upgrade() }
+    }
+
+    pub fn target_name(&self) -> String { self.inner.target_name() }
+
+    pub fn top_document(&self) -> Option<Rc<DomRealm>> { self.inner.top_context().document() }
+    pub fn parent_navigation_context(&self) -> Option<FrameContext> { self.inner.parent_context().map(|inner| FrameContext { inner }) }
+
     pub fn current_document(&self) -> Option<Rc<DomRealm>> {
         self.inner
-            .active
-            .get()
+            .is_active()
             .then(|| self.inner.document.borrow().clone())
             .flatten()
     }
@@ -441,6 +783,7 @@ impl FrameContext {
     /// the new generation so a host can reject a response after later source,
     /// base, or ownership mutations.
     pub fn request_host_navigation(&self, input: &str) -> OpResult<FrameNavigationRequest> {
+        self.inner.replace_navigation.set(false);
         let entry_base_url = self
             .inner
             .document()
@@ -451,11 +794,47 @@ impl FrameContext {
         Ok(self.navigation_request())
     }
 
+    /// Capture the active submitting document's origin and base before the
+    /// host begins an asynchronous navigation of a different target context.
+    pub fn request_host_navigation_from(&self, input: &str, source: &Rc<DomRealm>) -> OpResult<FrameNavigationRequest> {
+        let source_context = source.browsing_context()
+            .filter(|context| is_active_document(context, source) && context.group.ptr_eq(&self.inner.group))
+            .ok_or_else(|| OpError::new("InvalidStateError", "navigation source document is not fully active"))?;
+        let origin = source_context.root_or_child_origin();
+        let base_url = source.base_url();
+        self.inner.replace_navigation.set(false);
+        self.inner.request_location_navigation_from(input, &base_url)?;
+        *self.inner.navigation_initiator.borrow_mut() = Some(origin);
+        *self.inner.navigation_metadata.borrow_mut() = Some(NavigationMetadata::from_document(source));
+        Ok(self.navigation_request())
+    }
+
+    /// The object algorithm has already fetched this response. Capture its
+    /// source settings and replacement history handling before installation.
+    pub fn request_object_response(&self, url: &str, source: &Rc<DomRealm>) -> OpResult<FrameNavigationRequest> {
+        let request = self.request_host_navigation_from(url, source)?;
+        self.inner.replace_navigation.set(true);
+        let mut metadata = request.metadata;
+        metadata.source_element = self.inner.owner_node;
+        *self.inner.navigation_metadata.borrow_mut() = Some(metadata);
+        Ok(self.navigation_request())
+    }
+
     /// Check a captured fetch request before installing its response. A later
-    /// source/base mutation invalidates an older request without retargeting the
+    /// source or ownership mutation invalidates an older request without retargeting the
     /// WindowProxy until a current response is ready.
     pub fn request_is_current(&self, request: &FrameNavigationRequest) -> bool {
-        self.inner.active.get() && request == &self.navigation_request()
+        self.inner.is_active() && (request == &self.navigation_request()
+            || (self.inner.ignored_attribute_navigation.get() == Some(request.generation)
+                && self.navigation_generation() == request.generation))
+    }
+
+    /// Install an immutable source snapshot captured during form submission,
+    /// rather than reading the source document again when the host starts it.
+    pub fn set_navigation_metadata(&self, request: &FrameNavigationRequest, metadata: NavigationMetadata) -> OpResult<FrameNavigationRequest> {
+        if !self.request_is_current(request) { return Err(OpError::new("InvalidStateError", "navigation request is stale")); }
+        *self.inner.navigation_metadata.borrow_mut() = Some(metadata);
+        Ok(self.navigation_request())
     }
 
     pub fn navigation_generation(&self) -> u64 {
@@ -476,8 +855,13 @@ impl FrameContext {
         if !self.inner.active.get() || self.navigation_generation() != 0 {
             return false;
         }
-        if !matches!(self.navigation_request().source, FrameSource::Blank) {
+        let request = self.navigation_request();
+        if !matches!(&request.source, FrameSource::Blank)
+            && !matches!(&request.source, FrameSource::Url(url) if is_about_blank_url(url)) {
             return false;
+        }
+        if let FrameSource::Url(url) = request.source {
+            if let Some(document) = self.current_document() { document.set_same_document_url(url); }
         }
         !self.inner.initial_blank_load_dispatched.replace(true)
     }
@@ -517,6 +901,15 @@ impl FrameContext {
         for realm in committed.retired_realms {
             dispose_compat_realm(ctx, &realm);
         }
+        // This compatibility entry point installs a parsed DOM, without a
+        // resource/script host. Browser embedders use the staged transaction
+        // and drive each parser yield with their real resource continuation.
+        ctx.with_host_realm(&self.realm_handle(), |ctx| {
+            while committed.document.has_live_document_parser() {
+                committed.document.next_document_parser_script(ctx).map_err(|_| FrameInstallError::HostRealm)?;
+            }
+            Ok::<_, FrameInstallError>(())
+        }).map_err(|_| FrameInstallError::HostRealm)??;
         Ok(committed.document)
     }
 
@@ -532,28 +925,59 @@ impl FrameContext {
         source: impl Into<String>,
         max_nodes: usize,
     ) -> Result<PreparedFrameResponse, FrameInstallError> {
+        self.prepare_response_for_request_inner(ctx, request, final_url, content_type, source, max_nodes, false)
+    }
+
+    /// Failed navigation installs a fresh opaque error document. It follows
+    /// ordinary parser completion and container load steps without fetching
+    /// the denied target or reusing an initial same-origin Window.
+    pub fn prepare_failed_response_for_request(
+        &self, ctx: &mut Ctx, request: &FrameNavigationRequest,
+        final_url: &str, max_nodes: usize,
+    ) -> Result<PreparedFrameResponse, FrameInstallError> {
+        self.prepare_response_for_request_inner(ctx, request, final_url, "text/html",
+            "<!doctype html><body></body>", max_nodes, true)
+    }
+
+    fn prepare_response_for_request_inner(
+        &self,
+        ctx: &mut Ctx,
+        request: &FrameNavigationRequest,
+        final_url: &str,
+        content_type: &str,
+        source: impl Into<String>,
+        max_nodes: usize,
+        failed_navigation: bool,
+    ) -> Result<PreparedFrameResponse, FrameInstallError> {
         if !self.inner.active.get() || !self.request_is_current(request) {
             return Err(FrameInstallError::StaleRequest);
         }
         if let Some(reason) = &request.unsupported {
             return Err(FrameInstallError::Unsupported(reason.clone()));
         }
+        super::history::navigable(&self.inner).map_err(|_| FrameInstallError::HostRealm)?;
+        super::history::preflight_navigation(&self.inner, final_url, &request.source, self.inner.replace_navigation.get())
+            .map_err(|error| FrameInstallError::ResourceLimit(format!("{error:?}")))?;
 
-        let _group = self
+        let group = self
             .inner
             .group
             .upgrade()
             .ok_or(FrameInstallError::HostRealm)?;
         let _proxy = self.window_proxy().ok_or(FrameInstallError::HostRealm)?;
-        let new_realm = ctx.create_host_realm();
         let source = source.into();
+        let source_bytes = source.len();
+        let (mut reservation, admitted_nodes) = group.admit(ctx, source.len())
+            .map_err(|error| FrameInstallError::ResourceLimit(format!("{error:?}")))?;
+        let max_nodes = max_nodes.min(admitted_nodes);
+        let new_realm = ctx.create_host_realm();
         let parsed = ctx.with_host_realm(&new_realm, |ctx| {
             let controller = super::dialog_popover::DetailsController::prepare(ctx)
                 .map_err(|_| FrameInstallError::HostRealm)?;
             let document = parse_frame_document(source, content_type, final_url, max_nodes, &controller)?;
             Ok::<_, FrameInstallError>((document, controller))
         });
-        let ((mime, document, is_html), details_controller) = match parsed {
+        let ((mime, document, is_html, parser_source), details_controller) = match parsed {
             Ok(Ok(parsed)) => parsed,
             Ok(Err(error)) => {
                 dispose_compat_realm(ctx, &new_realm);
@@ -564,35 +988,43 @@ impl FrameContext {
                 return Err(FrameInstallError::HostRealm);
             }
         };
+        reservation.set_nodes(document.node_count());
         let explicit_about_blank = matches!(
             &request.source,
             FrameSource::Url(source_url)
                 if is_about_blank_url(source_url) && is_about_blank_url(final_url)
         );
         let inherits_creator =
-            matches!(request.source, FrameSource::Blank | FrameSource::SrcDoc(_))
+            matches!(request.source, FrameSource::Blank | FrameSource::SrcDoc(_) | FrameSource::JavaScriptDocument {..})
                 || explicit_about_blank;
-        let origin = if inherits_creator {
-            self.inner
-                .parent_context()
-                .map(|parent| parent.root_or_child_origin())
-                .unwrap_or_else(Origin::opaque)
+        let historical = self.inner.history_navigation.borrow().clone();
+        let origin = if failed_navigation {
+            Origin::opaque()
+        } else if inherits_creator {
+            let source = historical.as_ref().map_or_else(|| request.initiator_origin.clone(), |entry| entry.document_state().origin.borrow().clone());
+            Origin::for_document(final_url, Some(&source))
         } else {
-            Origin::from_url(final_url)
+            crate::object_urls::origin(ctx, final_url).unwrap_or_else(|| Origin::from_url(final_url))
         };
         let new_metadata = self.inner.new_realm_metadata(ctx, &new_realm, origin);
+        let reuse_window = self.current_document().is_some_and(|document| document.lifecycle.initial_about_blank.get())
+            && self.inner.root_or_child_origin().same_origin(&metadata_origin(&new_metadata));
+        let (new_realm, staging_realm, new_metadata) = if reuse_window {
+            let active = self.realm_handle();
+            let metadata = self.inner.new_realm_metadata(ctx, &active, metadata_origin(&new_metadata));
+            (active, Some(new_realm), metadata)
+        } else { (new_realm, None, new_metadata) };
         let inherited_base = inherits_creator.then(|| {
-            self.inner
-                .parent_context()
-                .and_then(|parent| parent.document())
-                .map(|document| document.base_url())
-                .unwrap_or_else(|| "about:blank".to_owned())
+            if let Some(entry) = &historical { return entry.document_state().base_url.clone(); }
+            request.base_url.clone()
         });
         Ok(PreparedFrameResponse {
             context: self.inner.clone(),
             request: request.clone(),
             realm: new_realm,
+            staging_realm,
             parsed_document: Some(document),
+            parser_source,
             details_controller,
             document: None,
             mime,
@@ -602,6 +1034,8 @@ impl FrameContext {
             metadata: new_metadata,
             inherits_creator,
             committed: false,
+            reservation: Some(reservation),
+            source_bytes,
         })
     }
 
@@ -622,7 +1056,7 @@ impl FrameContext {
         if let Some(document) = &prepared.document {
             return Ok(document.clone());
         }
-        if !self.inner.active.get() || !self.request_is_current(&prepared.request) {
+        if !self.inner.is_active() || !self.request_is_current(&prepared.request) {
             return Err(FrameInstallError::StaleRequest);
         }
         let document = prepared
@@ -636,6 +1070,7 @@ impl FrameContext {
         let inherited_base = prepared.inherited_base.clone();
         let is_html = prepared.is_html;
         let details_controller = prepared.details_controller.clone();
+        let reuse_window = prepared.reuses_window();
         let result = ctx.with_host_realm(&prepared.realm, |ctx| {
             super::install_document_staged(
                 ctx,
@@ -647,13 +1082,42 @@ impl FrameContext {
                 final_url,
                 inherited_base,
                 details_controller,
+                reuse_window,
             )
         });
         let document = match result {
             Ok(Ok(document)) => document,
+            Ok(Err(error)) => return Err(FrameInstallError::Parse(error)),
             _ => return Err(FrameInstallError::HostRealm),
         };
+        if let (Some(parent),Some(node))=(self.inner.parent.as_ref().and_then(std::rc::Weak::upgrade),self.inner.owner_node) {
+            let owner=parent.document.borrow().clone();
+            if let Some(owner)=owner {document.inherit_embedding_color_scheme(&owner,node).map_err(|_|FrameInstallError::HostRealm)?;}
+        }
+        if let Some(container) = crate::object_urls::policy_container(ctx, &prepared.final_url) {
+            document.inherit_policy_container(&container);
+        } else if let Some(entry) = self.inner.history_navigation.borrow().as_ref() {
+            if local_policy_url(&prepared.final_url) {
+                document.inherit_policy_container(&entry.document_state().policy_container.borrow());
+            }
+        } else if matches!(prepared.request.source, FrameSource::SrcDoc(_) | FrameSource::Blank | FrameSource::JavaScriptDocument {..})
+            || local_policy_url(&prepared.final_url) {
+            document.inherit_policy_container(&prepared.request.metadata.policy_container);
+        }
+        if matches!(prepared.request.source, FrameSource::SrcDoc(_) | FrameSource::Blank | FrameSource::JavaScriptDocument {..})
+            || prepared.final_url == "about:blank" {
+            *document.cookie_source_url.borrow_mut() = prepared.request.metadata.cookie_source_url.clone();
+        }
         prepared.document = Some(document.clone());
+        if let Some(group) = self.inner.group.upgrade() {
+            group.track_document(&document, prepared.source_bytes);
+        }
+        // Native wrappers can retain an initialized document independently of
+        // this transaction. Its weak record now owns the admission accounting.
+        drop(prepared.reservation.take());
+        if let Some(source) = prepared.parser_source.take() {
+            document.set_document_parser_source(source).map_err(|_| FrameInstallError::HostRealm)?;
+        }
         Ok(document)
     }
 
@@ -679,12 +1143,24 @@ impl FrameContext {
             .ok_or(FrameInstallError::NotInitialized)?
             .clone();
 
+        // SVG 2 §3.10: embedded SVG preserves its opacity when composited
+        // into the parent; only a top-level SVG page uses the white backdrop.
+        // The parser is still live at commit; its documentElement may not exist
+        // yet. The prepared SVG response type already establishes the canvas.
+        if self.inner.parent.is_some()
+            && (prepared.mime == "image/svg+xml" || document.session.borrow().embedded_document_is_svg())
+        {
+            document.session.borrow_mut().set_canvas_background(None);
+        }
+
         let group = self
             .inner
             .group
             .upgrade()
             .ok_or(FrameInstallError::HostRealm)?;
         let proxy = self.window_proxy().ok_or(FrameInstallError::HostRealm)?;
+        super::history::preflight_navigation(&self.inner, &prepared.final_url, &prepared.request.source, self.inner.replace_navigation.get())
+            .map_err(|error| FrameInstallError::ResourceLimit(format!("{error:?}")))?;
         let old_realm = self.inner.realm.borrow().clone();
         let old_proxy_metadata = self.inner.proxy_metadata.borrow().clone();
 
@@ -703,6 +1179,12 @@ impl FrameContext {
         }
 
         group.unregister_active(&old_realm);
+        // HTML's cross-origin name reset applies only to top-level navigables.
+        if self.inner.parent.is_none()
+            && !self.inner.root_or_child_origin().same_origin(&metadata_origin(&prepared.metadata))
+        {
+            self.inner.target_name.borrow_mut().clear();
+        }
         *self.inner.realm.borrow_mut() = prepared.realm.clone();
         *self.inner.metadata.borrow_mut() = prepared.metadata.clone();
         *self.inner.proxy_metadata.borrow_mut() = prepared.metadata.clone();
@@ -711,15 +1193,24 @@ impl FrameContext {
             .inherit_about_origin
             .set(prepared.inherits_creator);
         let old_document = self.inner.document.replace(Some(document.clone()));
+        self.inner.javascript_document.borrow_mut().take();
+        self.inner.source_bytes.set(prepared.source_bytes);
         self.inner
             .navigation_generation
             .set(self.inner.navigation_generation.get().wrapping_add(1));
 
         let mut retired_realms = Vec::new();
         if let Some(old_document) = old_document {
+            let replace = self.inner.replace_navigation.replace(false) || old_document.lifecycle.initial_about_blank.get();
+            super::navigation_lifecycle::destroy(ctx, &old_document);
             old_document.retire_all_frame_contexts(ctx, &mut retired_realms);
+            let target = self.inner.history_navigation.borrow_mut().take();
+            *self.inner.committed_history_entry.borrow_mut() = target.clone();
+            super::history::navigation_finished(ctx, &self.inner, target, Some(&document), prepared.request.source.clone(), replace)
+                .map_err(|_| FrameInstallError::HostRealm)?;
         }
-        retired_realms.push(old_realm);
+        if let Some(staging) = prepared.staging_realm.take() { retired_realms.push(staging); }
+        else { retired_realms.push(old_realm); }
         prepared.committed = true;
         Ok(FrameCommitResult {
             document,
@@ -744,7 +1235,7 @@ fn parse_frame_document(
     final_url: &str,
     max_nodes: usize,
     controller: &Rc<super::dialog_popover::DetailsController>,
-) -> Result<(String, lumen_html::Document, bool), FrameInstallError> {
+) -> Result<(String, lumen_html::Document, bool, Option<String>), FrameInstallError> {
     let essence = content_type
         .split(';')
         .next()
@@ -753,23 +1244,26 @@ fn parse_frame_document(
         .to_ascii_lowercase();
     match essence.as_str() {
         "text/html" => {
-            let document = html::parse_with_options_initialized(&source, max_nodes,
-                html::ParseOptions { allow_declarative_shadow_roots: true, ..Default::default() },
-                |document| controller.attach(document))
-                .map_err(|error| FrameInstallError::Parse(InstallError::Parse(error)))?;
-            Ok((essence, document, true))
+            let mut document = lumen_html::Document::new(max_nodes);
+            document.set_html_document(true);
+            document.set_scripting_enabled(true);
+            document.set_allow_declarative_shadow_roots(true);
+            controller.attach(&mut document);
+            Ok((essence, document, true, Some(source)))
         }
         "application/xhtml+xml" => {
-            let document = lumen_html::xml::parse_initialized(&source, max_nodes, |document| controller.attach(document))
-                .map_err(|error| FrameInstallError::Parse(InstallError::XmlParse(error)))?;
-            Ok((essence, document, false))
+            let mut document = lumen_html::Document::new(max_nodes);
+            document.set_scripting_enabled(true);
+            controller.attach(&mut document);
+            Ok((essence, document, false, Some(source)))
         }
-        "application/xml" | "text/xml" | "image/svg+xml" => {
-            let document = lumen_html::xml::parse_initialized(&source, max_nodes, |document| controller.attach(document))
-                .map_err(|error| FrameInstallError::Parse(InstallError::XmlParse(error)))?;
-            Ok((essence, document, false))
+        mime if lumen_common::mime::is_xml_mime(Some(mime)) => {
+            let mut document = lumen_html::Document::new(max_nodes);
+            document.set_scripting_enabled(true);
+            controller.attach(&mut document);
+            Ok((essence, document, false, Some(source)))
         }
-        "text/plain" | "text/css" => {
+        mime if lumen_common::mime::is_text_document_mime(Some(mime)) => {
             let source = html::normalize_plaintext(source)
                 .map_err(|error| FrameInstallError::Parse(InstallError::Parse(error)))?;
             let mut document = lumen_html::Document::new(max_nodes);
@@ -800,7 +1294,7 @@ fn parse_frame_document(
                     .append(pre, text)
                     .map_err(FrameInstallError::Document)?;
             }
-            Ok((essence, document, true))
+            Ok((essence, document, true, None))
         }
         "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
         | "image/x-ms-bmp" => {
@@ -827,7 +1321,7 @@ fn parse_frame_document(
             document
                 .append(body, image)
                 .map_err(FrameInstallError::Document)?;
-            Ok((essence, document, true))
+            Ok((essence, document, true, None))
         }
         _ => Err(FrameInstallError::UnsupportedContentType(essence)),
     }
@@ -847,6 +1341,23 @@ fn create_html_element(
 }
 
 fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
+    if let Some((source,url))=context.javascript_document.borrow().clone() {
+        let document=context.document().expect("active navigable document");
+        return FrameNavigationRequest {owner:context.owner_node.unwrap_or_else(||document.session.borrow().document().root()),source:FrameSource::JavaScriptDocument{source,url},base_url:document.base_url(),generation:context.navigation_generation.get(),unsupported:None,post_resource:None,metadata:NavigationMetadata::from_document(&document),initiator_origin:context.root_or_child_origin()};
+    }
+    if context.parent.is_none() || context.history_navigation.borrow().is_some() || context.committed_history_entry.borrow().is_some() {
+        let document = context.document().expect("active navigable has a document");
+        let target = context.history_navigation.borrow().clone().or_else(|| context.committed_history_entry.borrow().clone());
+        let source = target.as_ref().map(|entry| match &entry.document_state().resource {
+            source @ (FrameSource::SrcDoc(_) | FrameSource::JavaScriptDocument {..}) => source.clone(), _ => FrameSource::Url(entry.url()),
+        }).unwrap_or_else(||
+            FrameSource::Url(context.location_navigation.borrow().clone().unwrap_or_else(|| context.current_document_url())));
+        return FrameNavigationRequest { owner: context.owner_node.unwrap_or_else(|| document.session.borrow().document().root()), source,
+            base_url: target.as_ref().map_or_else(|| context.navigation_initiator_base.borrow().clone().unwrap_or_else(|| document.base_url()), |entry| entry.document_state().base_url.clone()), generation: context.navigation_generation.get(), unsupported: None,
+            post_resource: target.as_ref().and_then(|entry| entry.document_state().post_resource.clone()),
+            metadata: context.navigation_metadata.borrow().clone().unwrap_or_else(|| NavigationMetadata::from_document(&document)),
+            initiator_origin: context.navigation_initiator.borrow().clone().unwrap_or_else(|| context.root_or_child_origin()) };
+    }
     let owner = context.owner_node.expect("frame context has an owner node");
     let owner_realm = context
         .owner_realm
@@ -859,39 +1370,56 @@ fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
             base_url: "about:blank".into(),
             generation: context.navigation_generation.get(),
             unsupported: Some(FrameUnsupportedReason::InvalidSourceUrl),
+            initiator_origin: context.root_or_child_origin(),
+            post_resource: None,
+            metadata: NavigationMetadata { policy_container: Default::default(), cookie_source_url: None, referrer: lumen_common::referrer::Referrer { source: "about:blank".into(), policy: Default::default() }, inherited_referrer_policy: Default::default(), source_element: None, user_involvement: UserNavigationInvolvement::None },
         };
     };
     let location_navigation = context.location_navigation.borrow().clone();
-    let base_url = location_navigation
-        .as_ref()
-        .map(|_| context.current_document_url())
+    let base_url = context.navigation_initiator_base.borrow().clone()
         .unwrap_or_else(|| owner_realm.base_url());
     let (srcdoc, src, sandbox) = {
         let session = owner_realm.session.borrow();
         let document = session.document();
-        let srcdoc = document
-            .get_attribute_ns(owner, None, "srcdoc")
-            .ok()
-            .flatten();
-        let src = document.get_attribute_ns(owner, None, "src").ok().flatten();
-        let sandbox = document
-            .get_attribute_ns(owner, None, "sandbox")
-            .ok()
-            .flatten();
+        let iframe = matches!(document.kind(owner),Ok(NodeKind::Element{namespace:Namespace::Html,name,..}) if name.as_str()=="iframe");
+        let srcdoc = iframe.then(|| document
+            .get_attribute_ns(owner, None, "srcdoc").ok().flatten()).flatten();
+        let src = iframe.then(|| document.get_attribute_ns(owner, None, "src").ok().flatten()).flatten();
+        let sandbox = iframe.then(|| document.get_attribute_ns(owner,None,"sandbox").ok().flatten()).flatten();
         (srcdoc, src, sandbox)
     };
-    let source = if let Some(url) = location_navigation {
+    let is_attribute_navigation = location_navigation.is_none() && srcdoc.is_none()
+        && !lumen_html::object::is_embedded(owner_realm.session.borrow().document(), owner);
+    let mut source = if let Some(url) = location_navigation {
         FrameSource::Url(url)
     } else if let Some(srcdoc) = srcdoc {
         FrameSource::SrcDoc(srcdoc)
     } else if let Some(src) = src.filter(|src| !src.is_empty()) {
         match lumen_common::url::parse(&src, Some(&base_url)) {
             Ok(url) => FrameSource::Url(url.href()),
-            Err(_) => FrameSource::InvalidUrl(src),
+            Err(_) => FrameSource::Blank,
         }
     } else {
         FrameSource::Blank
     };
+    if is_attribute_navigation {
+        let candidate = match &source {
+            FrameSource::Url(url) => url.as_str(),
+            FrameSource::Blank => "about:blank",
+            _ => "",
+        };
+        if let Ok(mut candidate) = lumen_common::url::parse(candidate, None) {
+            candidate.fragment = None;
+            let mut ancestor = context.parent_context();
+            while let Some(current) = ancestor {
+                if lumen_common::url::parse(&current.current_document_url(), None).is_ok_and(|mut url| {
+                    url.fragment = None;
+                    url.href() == candidate.href()
+                }) { source = FrameSource::Suppressed; break; }
+                ancestor = current.parent_context();
+            }
+        }
+    }
     let sandboxed = sandbox.is_some();
     let unsupported = if sandboxed {
         Some(FrameUnsupportedReason::SandboxPolicy)
@@ -906,10 +1434,77 @@ fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
         base_url,
         generation: context.navigation_generation.get(),
         unsupported,
+        initiator_origin: context.navigation_initiator.borrow().clone()
+            .unwrap_or_else(|| owner_realm.document_origin().unwrap_or_else(|| context.root_or_child_origin())),
+        post_resource: None,
+        metadata: context.navigation_metadata.borrow().clone().unwrap_or_else(|| NavigationMetadata::from_document(&owner_realm)),
     }
 }
 
 impl BrowsingContext {
+    pub(crate) fn lifecycle_documents(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<Vec<(Rc<DomRealm>, RealmHandle)>> {
+        FrameContext { inner: self.clone() }.lifecycle_documents(ctx)
+    }
+    pub(crate) fn request_history_navigation(&self, entry: Rc<super::history::Entry>) {
+        *self.navigation_metadata.borrow_mut() = Some(entry.document_state().metadata.clone());
+        *self.history_navigation.borrow_mut() = Some(entry);
+        self.navigation_generation.set(self.navigation_generation.get().wrapping_add(1));
+        self.beforeunload_generation.set(Some(self.navigation_generation.get()));
+    }
+    pub(crate) fn history_store(&self) -> Option<Rc<super::history::HistoryStore>> { self.group.upgrade().map(|group| group.history.clone()) }
+    pub(crate) fn history_id(&self) -> u64 { self.insertion_order }
+    pub(crate) fn next_transition_generation(&self) -> OpResult<u64> {
+        let group=self.group.upgrade().ok_or_else(||OpError::new("InvalidStateError","document browsing context no longer available"))?;
+        let next=group.transition_generation.get().checked_add(1).ok_or_else(||OpError::new("QuotaExceededError","transition generation exhausted"))?;
+        group.transition_generation.set(next);
+        Ok(next)
+    }
+    pub(crate) fn container_node(&self)->Option<NodeId> {self.owner_node}
+    pub(crate) fn container_document(&self) -> Option<Rc<DomRealm>> { self.owner_realm.as_ref().and_then(std::rc::Weak::upgrade) }
+    pub(crate) fn history_navigation_pending(&self) -> bool { self.history_navigation.borrow().is_some() }
+    pub(crate) fn take_post_resource(&self) -> Option<Rc<NavigationPostResource>> { self.pending_post_resource.borrow_mut().take() }
+    pub(crate) fn pending_post_resource(&self) -> Option<Rc<NavigationPostResource>> { self.pending_post_resource.borrow().clone() }
+    pub(crate) fn replaces_history_entry(&self) -> bool { self.replace_navigation.get() || self.document().is_some_and(|document| document.lifecycle.initial_about_blank.get()) }
+    pub(crate) fn allows_modals(&self) -> bool {
+        let (Some(owner), Some(node)) = (self.owner_realm.as_ref().and_then(std::rc::Weak::upgrade), self.owner_node) else { return true; };
+        let session = owner.session.borrow();
+        match session.document().get_attribute_ns_ref(node, None, "sandbox") {
+            Ok(Some(flags)) => flags.split_ascii_whitespace().any(|flag| flag.eq_ignore_ascii_case("allow-modals")),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+    pub(crate) fn is_active(&self) -> bool {
+        if !self.active.get() { return false; }
+        // Removing steps logically destroy the navigable synchronously. The
+        // existing pending set defers host-realm disposal until native borrows
+        // are released; it must not defer author-observable liveness or tasks.
+        if let (Some(owner), Some(node)) = (
+            self.owner_realm.as_ref().and_then(std::rc::Weak::upgrade), self.owner_node,
+        ) {
+            if owner.pending_frame_contexts.borrow().get(&node)
+                .is_some_and(|pending| std::ptr::eq(self, Rc::as_ptr(pending)))
+            { return false; }
+        }
+        self.parent_context().is_none_or(|parent| parent.is_active())
+    }
+
+    pub(crate) fn target_name(&self) -> String {
+        self.target_name.borrow().clone()
+    }
+
+    pub(crate) fn set_target_name(&self, name: String) {
+        if self.active.get() {
+            if let Some(history) = self.history.borrow().as_ref() { *history.active.borrow().document_state().target_name.borrow_mut() = name.clone(); }
+            *self.target_name.borrow_mut() = name;
+        }
+    }
+
+    pub(crate) fn restore_history_target_name(&self, name: String) { *self.target_name.borrow_mut() = name; }
+
+    pub(crate) fn is_active_realm(&self, realm: &RealmHandle) -> bool {
+        self.is_active() && self.realm.borrow().same_realm(realm)
+    }
     fn root(ctx: &mut Ctx) -> Result<Rc<Self>, Value> {
         if let Some(service) = RealmServices::<BrowsingContextService>::current(ctx) {
             if let Some(context) = service.context.upgrade() {
@@ -938,6 +1533,11 @@ impl BrowsingContext {
         });
         let proxy_metadata = Rc::new(RefCell::new(metadata.clone()));
         let context = Rc::new(Self {
+            history: RefCell::new(None),
+            history_navigation: RefCell::new(None),
+            committed_history_entry: RefCell::new(None),
+            pending_post_resource: RefCell::new(None),
+            replace_navigation: Cell::new(false),
             group: Rc::downgrade(&group),
             metadata: RefCell::new(metadata.clone()),
             proxy_metadata: proxy_metadata.clone(),
@@ -945,13 +1545,23 @@ impl BrowsingContext {
             window_proxy: RefCell::new(None),
             document: RefCell::new(None),
             parent: None,
+            opener: RefCell::new(None),
             owner_realm: None,
             owner_node: None,
             inherit_about_origin: Cell::new(false),
             location_navigation: RefCell::new(None),
+            javascript_document: RefCell::new(None),
+            navigation_initiator: RefCell::new(None),
+            navigation_initiator_base: RefCell::new(None),
+            navigation_metadata: RefCell::new(None),
             active: Cell::new(true),
             navigation_generation: Cell::new(0),
             initial_blank_load_dispatched: Cell::new(false),
+            beforeunload_generation: Cell::new(None),
+            ignored_attribute_navigation: Cell::new(None),
+            insertion_order: 0,
+            target_name: RefCell::new(String::new()),
+            source_bytes: Cell::new(0),
         });
         context
             .make_window_proxy(ctx)
@@ -989,7 +1599,7 @@ impl BrowsingContext {
         Ok(proxy)
     }
 
-    fn root_or_child_origin(&self) -> Origin {
+    pub(crate) fn root_or_child_origin(&self) -> Origin {
         self.metadata.borrow().origin.borrow().clone()
     }
 
@@ -1011,8 +1621,20 @@ impl BrowsingContext {
         }
     }
 
-    pub(crate) fn invalidate_owner_navigation_request(&self) {
+    pub(crate) fn invalidate_owner_navigation_request(&self, owner_base_url: String, metadata: NavigationMetadata) {
+        if self.document().is_some_and(|document| document.lifecycle.unload_counter.get() != 0) {
+            self.ignored_attribute_navigation.set(Some(self.navigation_generation.get()));
+            return;
+        }
+        self.ignored_attribute_navigation.set(None);
+        self.history_navigation.borrow_mut().take();
+        self.committed_history_entry.borrow_mut().take();
+        self.pending_post_resource.borrow_mut().take();
+        self.replace_navigation.set(false);
         self.location_navigation.borrow_mut().take();
+        *self.navigation_initiator.borrow_mut() = self.parent_context().map(|parent| parent.root_or_child_origin());
+        *self.navigation_initiator_base.borrow_mut() = Some(owner_base_url);
+        *self.navigation_metadata.borrow_mut() = Some(metadata);
         self.invalidate_navigation_request();
     }
 
@@ -1027,43 +1649,107 @@ impl BrowsingContext {
         input: &str,
         entry_base_url: &str,
     ) -> OpResult<()> {
+        if self.document().is_some_and(|document| document.lifecycle.unload_counter.get() != 0 || document.lifecycle.destroyed.get()) { return Ok(()); }
         if !self.active.get() {
             return Err(OpError::new(
                 "InvalidStateError",
                 "browsing context is no longer active",
             ));
         }
-        if self.parent.is_none() {
-            return Err(OpError::new(
-                "NotSupportedError",
-                "top-level navigation is not supported by this host",
-            ));
-        }
         let url = lumen_common::url::parse(input, Some(entry_base_url))
             .map_err(|_| OpError::new("SyntaxError", "invalid Location URL"))?;
+        self.history_navigation.borrow_mut().take();
+        self.committed_history_entry.borrow_mut().take();
+        self.pending_post_resource.borrow_mut().take();
         *self.location_navigation.borrow_mut() = Some(url.href());
+        *self.navigation_initiator.borrow_mut() = Some(self.root_or_child_origin());
+        *self.navigation_initiator_base.borrow_mut() = Some(entry_base_url.to_owned());
+        *self.navigation_metadata.borrow_mut() = self.document().map(|document| NavigationMetadata::from_document(&document));
         self.navigation_generation
             .set(self.navigation_generation.get().wrapping_add(1));
         Ok(())
     }
 
-    fn realm_handle(&self) -> RealmHandle {
+    pub(crate) fn request_location_navigation_with_caller(&self, ctx: &mut Ctx, input: &str, entry_base_url: &str) -> OpResult<()> {
+        self.request_location_navigation_with_handling(ctx, input, entry_base_url, false)
+    }
+
+    pub(crate) fn request_location_navigation_with_handling(&self, ctx: &mut Ctx, input: &str, entry_base_url: &str, replace: bool) -> OpResult<()> {
+        if self.document().is_some_and(|document| document.lifecycle.unload_counter.get() != 0 || document.lifecycle.destroyed.get()) { return Ok(()); }
+        let caller = ctx.invocation_host_realm();
+        let origin = metadata_for_realm(ctx, &caller).map(|metadata| metadata_origin(&metadata))
+            .ok_or_else(|| OpError::new("InvalidStateError", "Navigation has no initiating document"))?;
+        let parsed = lumen_common::url::parse(input, Some(entry_base_url)).map_err(|_| OpError::new("SyntaxError", "invalid Location URL"))?;
+        let context = self.history_store().and_then(|store| store.contexts.borrow().get(&self.history_id()).and_then(std::rc::Weak::upgrade));
+        if parsed.scheme=="javascript" {
+            if let Some(context)=context {
+                let source=ctx.with_host_realm(&caller,|ctx|super::window_globals::current_dom_realm(ctx)).map_err(host_realm_error)?;
+                if let Some(source)=source {context.queue_javascript_navigation(ctx,&parsed.href(),&source)?;}
+            }
+            return Ok(());
+        }
+        self.javascript_document.borrow_mut().take();
+        if let Some(context) = context {
+            if super::history::fragment_navigation(ctx, &context, &parsed.href(), replace)? { return Ok(()); }
+        }
+        self.history_navigation.borrow_mut().take();
+        self.committed_history_entry.borrow_mut().take();
+        self.replace_navigation.set(replace);
+        self.request_location_navigation_from(input, entry_base_url)?;
+        *self.navigation_initiator.borrow_mut() = Some(origin);
+        let metadata = ctx.with_host_realm(&caller, |ctx| super::window_globals::current_dom_realm(ctx))
+            .map_err(host_realm_error)?.map(|document| NavigationMetadata::from_document(&document));
+        *self.navigation_metadata.borrow_mut() = metadata;
+        Ok(())
+    }
+
+    pub(crate) fn realm_handle(&self) -> RealmHandle {
         self.realm.borrow().clone()
     }
 
-    fn document(&self) -> Option<Rc<DomRealm>> {
+    pub(crate) fn document(&self) -> Option<Rc<DomRealm>> {
         self.document.borrow().clone()
     }
 
-    fn proxy(&self) -> Option<Value> {
+    pub(crate) fn proxy(&self) -> Option<Value> {
         self.window_proxy
             .borrow()
             .as_ref()
             .and_then(WeakValue::upgrade)
     }
 
-    fn parent_context(&self) -> Option<Rc<BrowsingContext>> {
+    /// WindowProxy indexed properties sort the collected child navigables by
+    /// their container's insertion epoch (HTML [[GetOwnProperty]]), even after
+    /// an atomic DOM move changes the collection's tree order.
+    pub(crate) fn indexed_child_proxy(&self, ctx: &mut Ctx, index: u32) -> OpResult<Option<Value>> {
+        let Some(document) = self.document() else { return Ok(None); };
+        let mut children = document.frame_contexts(ctx)?;
+        children.sort_unstable_by_key(|frame| frame.inner.insertion_order);
+        Ok(children.get(index as usize).and_then(FrameContext::window_proxy))
+    }
+
+    pub(crate) fn named_child_proxy(&self, ctx: &mut Ctx, name: &str) -> OpResult<Option<Value>> {
+        let Some(document) = self.document() else { return Ok(None); };
+        Ok(document.named_child_windows(ctx)?.into_iter()
+            .find(|(_, candidate, _)| candidate == name).map(|(_, _, proxy)| proxy))
+    }
+
+    pub(crate) fn child_count(&self) -> usize { self.connected_iframe_nodes().len() }
+
+    pub(crate) fn parent_context(&self) -> Option<Rc<BrowsingContext>> {
         self.parent.as_ref()?.upgrade()
+    }
+
+    pub(crate) fn opener_proxy(&self) -> Option<Value> {
+        self.opener.borrow().as_ref().and_then(std::rc::Weak::upgrade).and_then(|context|context.proxy())
+    }
+
+    pub(crate) fn disown_opener(&self) {self.opener.borrow_mut().take();}
+
+    pub(crate) fn close_auxiliary(&self,ctx:&mut Ctx) {
+        if self.parent.is_some() || self.insertion_order==0 {return;}
+        let mut retired=Vec::new();self.retire(ctx,&mut retired);
+        if let Some(group)=self.group.upgrade(){group.pending_retired.borrow_mut().extend(retired);}
     }
 
     fn top_context(self: &Rc<Self>) -> Rc<Self> {
@@ -1072,6 +1758,93 @@ impl BrowsingContext {
             current = parent;
         }
         current
+    }
+
+    /// Select existing navigables first, admitting a real initial empty
+    /// auxiliary document through the same bounded group as iframe documents.
+    pub(crate) fn choose_navigation_target(self: &Rc<Self>, ctx: &mut Ctx, name: &str) -> OpResult<Option<Rc<Self>>> {
+        if name.is_empty() || name.eq_ignore_ascii_case("_self") { return Ok(Some(self.clone())); }
+        if name.eq_ignore_ascii_case("_parent") { return Ok(Some(self.parent_context().unwrap_or_else(|| self.clone()))); }
+        if name.eq_ignore_ascii_case("_top") { return Ok(Some(self.top_context())); }
+        if name.eq_ignore_ascii_case("_blank") {
+            if !self.auxiliary_creation_allowed(){return Ok(None);}
+            return self.document().map(|document|document.create_auxiliary_context(ctx,String::new())).transpose();
+        }
+        for root in [self.clone(), self.top_context()] {
+            let mut pending = vec![root];
+            while let Some(candidate) = pending.pop() {
+                if candidate.target_name() == name { return Ok(Some(candidate)); }
+                if let Some(document) = candidate.document() {
+                    let children = document.frame_contexts(ctx)?;
+                    pending.extend(children.into_iter().rev().map(|frame| frame.inner));
+                }
+            }
+        }
+        if let Some(group)=self.group.upgrade() {
+            let target=group.contexts.borrow().values().find(|context|context.is_active() && context.parent.is_none() && context.target_name()==name).cloned();
+            if target.is_some(){return Ok(target);}
+        }
+        if !self.auxiliary_creation_allowed(){return Ok(None);}
+        self.document().map(|document|document.create_auxiliary_context(ctx,name.to_owned())).transpose()
+    }
+
+    fn auxiliary_creation_allowed(&self)->bool {
+        let (Some(owner),Some(node))=(self.owner_realm.as_ref().and_then(std::rc::Weak::upgrade),self.owner_node) else{return true};
+        let session=owner.session.borrow();
+        session.document().get_attribute_ns_ref(node,None,"sandbox").ok().flatten().is_none_or(|flags|flags.split_ascii_whitespace().any(|flag|flag.eq_ignore_ascii_case("allow-popups")))
+    }
+
+    pub(crate) fn request_hyperlink_navigation(self: &Rc<Self>, ctx: &mut Ctx, url: &str, source: &Rc<DomRealm>, metadata: NavigationMetadata) -> OpResult<()> {
+        let Some(source_context) = source.browsing_context().filter(|context| is_active_document(context, source) && context.group.ptr_eq(&self.group)) else { return Ok(()); };
+        if lumen_common::url::parse(url,Some(&source.base_url())).is_ok_and(|url|url.scheme=="javascript") {return self.queue_javascript_navigation(ctx,url,source);}
+        self.javascript_document.borrow_mut().take();
+        if super::history::fragment_navigation(ctx, self, url, false)? { return Ok(()); }
+        self.replace_navigation.set(false);
+        self.request_location_navigation_from(url, &source.base_url())?;
+        *self.navigation_initiator.borrow_mut() = Some(source_context.root_or_child_origin());
+        *self.navigation_metadata.borrow_mut() = Some(metadata);
+        Ok(())
+    }
+
+    pub(crate) fn captured_navigation_metadata(&self) -> NavigationMetadata {
+        self.navigation_metadata.borrow().clone().unwrap_or_else(|| {
+            NavigationMetadata::from_document(&self.document().expect("active context document"))
+        })
+    }
+
+    fn queue_javascript_navigation(self:&Rc<Self>,ctx:&mut Ctx,url:&str,source:&Rc<DomRealm>)->OpResult<()> {
+        if !self.is_active() || !source.browsing_context().is_some_and(|context|is_active_document(&context,source) && context.same_origin_with(self)) {return Ok(());}
+        let parsed=lumen_common::url::parse(url,Some(&source.base_url())).map_err(|_|OpError::new("SyntaxError","invalid javascript URL"))?;
+        let href=parsed.href();
+        let target_document=self.document().ok_or_else(||OpError::new("InvalidStateError","navigation target has no document"))?;
+        if !Rc::ptr_eq(source,&target_document) && !source.prepare_navigation_script_csp(ctx,&href)? {return Ok(());}
+        let encoded=href.split_once(':').map(|(_,source)|source).unwrap_or("").split('#').next().unwrap_or("");
+        let script=String::from_utf8_lossy(&lumen_common::codec::percent_decode(encoded.as_bytes())).into_owned();
+        let context=Rc::downgrade(self);
+        let document=Rc::downgrade(&target_document);
+        let generation=self.navigation_generation.get();
+        let realm=self.realm_handle();
+        ctx.with_host_realm(&realm,|ctx|scheduling::queue_task(ctx,move|ctx| {
+            let (Some(context),Some(document))=(context.upgrade(),document.upgrade()) else{return Ok(())};
+            if !is_active_document(&context,&document) || context.navigation_generation.get()!=generation {return Ok(());}
+            if !document.prepare_navigation_script_csp(ctx,&href)? {return Ok(());}
+            let completion=match ctx.eval_value_in_host_realm_named(&context.realm_handle(),&script,false,Some(&href)) {
+                Ok(Ok(value))=>value,
+                Ok(Err(exception))=>return Err(OpError::thrown(exception)),
+                Err(lumen::embed::HostRealmEvalError::Parse(error))=>return Err(OpError::new("SyntaxError",error.message)),
+                Err(lumen::embed::HostRealmEvalError::Scope(error))=>return Err(host_realm_error(error)),
+            };
+            if let Value::Str(html)=completion {
+                if !is_active_document(&context,&document) || context.navigation_generation.get()!=generation {return Ok(());}
+                let limit=context.group.upgrade().map(|group|group.limits.get().max_document_source_bytes).unwrap_or(0);
+                if html.as_str().len()>limit {return Err(OpError::new("QuotaExceededError","javascript document source budget exhausted"));}
+                *context.javascript_document.borrow_mut()=Some((html.as_str().to_owned(),context.current_document_url()));
+                context.replace_navigation.set(true);
+                context.invalidate_navigation_request();
+            }
+            Ok(())
+        })).map_err(host_realm_error)??;
+        Ok(())
     }
 
     fn connected_iframe_nodes(&self) -> Vec<NodeId> {
@@ -1092,12 +1865,30 @@ impl BrowsingContext {
         if !self.active.replace(false) {
             return;
         }
+        if let Err(error) = super::history::child_removed(ctx, self) {
+            let exception = error.to_value(ctx);
+            super::error_reporting::report_exception(ctx, exception);
+        }
         self.navigation_generation
             .set(self.navigation_generation.get().wrapping_add(1));
-        if let Some(document) = self.document.borrow_mut().take() {
+        let retired_document=self.document.borrow_mut().take();
+        if let Some(document) = retired_document {
+            let realm=self.realm_handle();
+            match ctx.with_host_realm(&realm,|ctx|super::animations::retire_document(ctx,&document)) {
+                Ok(Ok(()))=>{},
+                Ok(Err(error))=>{let exception=error.to_value(ctx);super::error_reporting::report_exception(ctx,exception);},
+                Err(error)=>{let exception=OpError::new("InvalidStateError",error.to_string()).to_value(ctx);super::error_reporting::report_exception(ctx,exception);},
+            }
+            super::navigation_lifecycle::destroy(ctx, &document);
             document.retire_all_frame_contexts(ctx, retired);
         }
         let realm = self.realm_handle();
+        ctx.cancel_async_module_imports_for_realm(&realm);
+        // Unlike replacement of a Document in a reused Window, destroying
+        // this navigable retires the entire realm, including owners registered
+        // by parser preparation before document identity was available.
+        super::scheduling::cancel_tasks_for_realm(ctx,&realm);
+        if let Some(timers) = ctx.host_mut::<lumen_timers::Timers>() { timers.cancel_realm(&realm); }
         if let Some(group) = self.group.upgrade() {
             group.unregister_active(&realm);
         }
@@ -1110,7 +1901,7 @@ impl BrowsingContext {
         realm: &RealmHandle,
         origin: Origin,
     ) -> Rc<RealmMetadata> {
-        let parent_proxy = self.parent_context().and_then(|parent| parent.proxy());
+        let parent_proxy = self.parent_context().and_then(|parent| parent.proxy()).or_else(||self.proxy());
         let top_proxy = self.top_context().proxy();
         let metadata = Rc::new(RealmMetadata {
             key: Cell::new(realm.global().object_identity().unwrap_or_default()),
@@ -1175,17 +1966,24 @@ impl WindowProxyPolicy for ContextWindowProxyPolicy {
         ctx: &mut Ctx,
         caller: &RealmHandle,
         target: &RealmHandle,
-        _operation: &WindowProxyOperation,
+        operation: &WindowProxyOperation,
     ) -> WindowProxyDisposition {
-        let (Some(caller), Some(target)) =
+        let (Some(caller_metadata), Some(target_metadata)) =
             (self.metadata_for(caller), self.target_metadata(target))
         else {
             return WindowProxyDisposition::Denied(Self::denied(ctx));
         };
-        if caller.origin.borrow().same_origin(&target.origin.borrow()) {
+        if caller_metadata.origin.borrow().same_origin(&target_metadata.origin.borrow()) {
             WindowProxyDisposition::ForwardSameOrigin
         } else {
-            WindowProxyDisposition::Denied(Self::denied(ctx))
+            let context = self.group.upgrade().and_then(|group| group.for_realm(target));
+            match context {
+                Some(context) => match window_messaging::cross_origin_operation(ctx, &context, operation) {
+                    Ok(result) => WindowProxyDisposition::Handled(result),
+                    Err(error) => WindowProxyDisposition::Denied(error.to_value(ctx)),
+                },
+                None => WindowProxyDisposition::Denied(Self::denied(ctx)),
+            }
         }
     }
 
@@ -1223,31 +2021,15 @@ impl WindowProxyPolicy for ContextWindowProxyPolicy {
     fn child_window_at(
         &self,
         ctx: &mut Ctx,
-        caller: &RealmHandle,
+        _caller: &RealmHandle,
         target: &RealmHandle,
         index: u32,
     ) -> Option<Value> {
         let group = self.group.upgrade()?;
-        let caller_context = self.metadata_for(caller)?;
         let target_context = group.for_realm(target)?;
-        if !caller_context
-            .origin
-            .borrow()
-            .same_origin(&target_context.root_or_child_origin())
-        {
-            return None;
-        }
-        let owner_realm = target_context.document()?;
-        let node = target_context
-            .connected_iframe_nodes()
-            .get(index as usize)
-            .copied()?;
         let target_handle = target_context.realm_handle();
         ctx.with_host_realm(&target_handle, |ctx| {
-            owner_realm
-                .ensure_frame_context(ctx, node)
-                .ok()
-                .and_then(|frame| frame.window_proxy())
+            target_context.indexed_child_proxy(ctx, index).ok().flatten()
         })
         .ok()
         .flatten()
@@ -1255,6 +2037,55 @@ impl WindowProxyPolicy for ContextWindowProxyPolicy {
 }
 
 impl DomRealm {
+    /// The active document's navigable, including a host-controlled top level.
+    pub fn navigation_context(&self) -> Option<FrameContext> { self.browsing_context().map(|inner| FrameContext { inner }) }
+    /// Deduplicate child target names in document tree order before filtering
+    /// origins. A foreign first child hides a later same-origin namesake.
+    pub(crate) fn named_child_windows(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<Vec<(NodeId, String, Value)>> {
+        if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
+            return Ok(Vec::new());
+        }
+        let origin = self.document_origin().or_else(|| self.browsing_context().map(|context| context.root_or_child_origin()));
+        let mut seen = HashSet::new();
+        let mut windows = Vec::new();
+        for frame in self.frame_contexts(ctx)? {
+            let name = frame.inner.target_name();
+            if name.is_empty() || !seen.insert(name.clone()) { continue; }
+            if !origin.as_ref().is_some_and(|origin| origin.same_origin(&frame.origin())) { continue; }
+            if let Some(proxy) = frame.window_proxy() { windows.push((frame.owner_node(), name, proxy)); }
+        }
+        Ok(windows)
+    }
+
+    /// Once another named object contributes a supported name, navigables have
+    /// value priority even when their origin excluded that name from the set.
+    pub(crate) fn named_child_value(self: &Rc<Self>, ctx: &mut Ctx, name: &str) -> OpResult<Option<Value>> {
+        if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
+            return Ok(None);
+        }
+        Ok(self.frame_contexts(ctx)?.into_iter().find(|frame| frame.target_name() == name)
+            .and_then(|frame| frame.window_proxy()))
+    }
+
+    /// Configure aggregate iframe admission before author code can create child
+    /// contexts. Every synchronous insertion and staged navigation consults it.
+    pub fn set_frame_resource_limits(&self, limits: FrameResourceLimits) -> OpResult<()> {
+        if limits.max_realms == 0 || limits.max_document_nodes == 0 || limits.max_total_nodes == 0
+            || limits.max_document_source_bytes > limits.max_total_source_bytes {
+            return Err(OpError::type_error("Invalid frame resource limits"));
+        }
+        let group = self.browsing_context().and_then(|context| context.group.upgrade())
+            .ok_or_else(|| OpError::new("InvalidStateError", "Document has no browsing-context group"))?;
+        group.limits.set(limits);
+        Ok(())
+    }
+
+    pub(crate) fn render_capture_pixel_budget(&self) -> OpResult<std::sync::Arc<lumen_common::limits::ByteBudget>> {
+        let context = self.browsing_context()
+            .ok_or_else(|| OpError::new("InvalidStateError", "Render capture document has no browsing context"))?;
+        FrameContext { inner: context }.embedded_pixel_budget()
+    }
+
     pub(crate) fn browsing_context(&self) -> Option<Rc<BrowsingContext>> {
         self.browsing_context.borrow().upgrade()
     }
@@ -1276,7 +2107,8 @@ impl DomRealm {
                         name,
                         ..
                     }) if lumen_html::xml::split_qname(name.as_str())
-                        .is_some_and(|(_, local_name)| local_name == "iframe")
+                        .is_some_and(|(_, local_name)| local_name == "iframe" || matches!(local_name, "object" | "embed")
+                            && self.object_resources.representation(node).has_child_navigable())
                 )
             {
                 out.push(node);
@@ -1288,6 +2120,35 @@ impl DomRealm {
         out
     }
 
+    /// Existing active contexts only: rendering never creates navigables or requests.
+    pub(crate) fn embedded_paint_contexts(&self)->OpResult<Vec<(NodeId,FrameContext,Rc<DomRealm>)>> {
+        let contexts=self.frame_contexts.borrow();
+        let mut out=Vec::new();
+        out.try_reserve(contexts.len()).map_err(|_|OpError::new("QuotaExceededError","Embedded paint metadata exceeds available memory"))?;
+        let session=self.session.borrow();
+        for (node,weak) in contexts.iter() {
+            if !script_loading::is_connected(session.document(),*node) {continue;}
+            if lumen_html::object::is_embedded(session.document(),*node)
+                && !self.object_resources.representation(*node).has_child_navigable() {continue;}
+            let Some(context)=weak.upgrade().filter(|context|context.is_active()) else {continue;};
+            let Some(document)=context.document.borrow().clone().filter(|document|is_active_document(&context,document)) else {continue;};
+            out.push((*node,FrameContext{inner:context},document));
+        }
+        out.sort_unstable_by_key(|(node,_,_)|node.key());
+        Ok(out)
+    }
+
+    /// Only actual active embedded-document representations expose natural size
+    /// metadata to their owner; iframe dimensions never follow child content.
+    pub(crate) fn embedded_document(&self,node:NodeId)->Option<Rc<DomRealm>> {
+        if !lumen_html::object::is_embedded(self.session.borrow().document(),node)
+            || !self.object_resources.representation(node).has_child_navigable() { return None; }
+        let context=self.frame_contexts.borrow().get(&node)?.upgrade()?;
+        if !context.active.get() { return None; }
+        let document=context.document.borrow().clone()?;
+        is_active_document(&context,&document).then_some(document)
+    }
+
     pub(crate) fn ensure_frame_context(
         self: &Rc<Self>,
         ctx: &mut Ctx,
@@ -1296,6 +2157,7 @@ impl DomRealm {
         let connected = {
             let session = self.session.borrow();
             script_loading::is_connected(session.document(), node)
+                || lumen_html::object::kind(session.document(),node)==Some(lumen_html::object::Kind::Embed) && self.object_resources.embed_was_connected(node)
         };
         if !self.has_browsing_context || !connected {
             return Err(OpError::type_error("iframe has no active browsing context"));
@@ -1313,38 +2175,45 @@ impl DomRealm {
         let parent = self
             .browsing_context()
             .ok_or_else(|| OpError::type_error("document has no browsing context"))?;
-        let (sandboxed, sandbox_allows_same_origin, srcdoc) = {
+        let (sandboxed, sandbox_allows_same_origin) = {
             let session = self.session.borrow();
             let document = session.document();
-            let sandbox = document
-                .get_attribute_ns(node, None, "sandbox")
-                .map_err(super::dom_error)?;
-            let srcdoc = document
-                .get_attribute_ns(node, None, "srcdoc")
-                .map_err(super::dom_error)?;
+            let sandbox = if lumen_html::object::is_embedded(document,node) { None } else {
+                document.get_attribute_ns(node,None,"sandbox").map_err(super::dom_error)?
+            };
             let allow_same_origin = sandbox.as_deref().is_some_and(|value| {
                 super::html_space_tokens(value)
                     .any(|token| token.eq_ignore_ascii_case("allow-same-origin"))
             });
-            (sandbox.is_some(), allow_same_origin, srcdoc)
+            (sandbox.is_some(), allow_same_origin)
         };
-        let (source, url) = match srcdoc {
-            Some(source) => (source, "about:srcdoc"),
-            None => (String::new(), "about:blank"),
-        };
+        let name=self.session.borrow().document().get_attribute_ns(node,None,"name").map_err(super::dom_error)?.unwrap_or_default();
+        self.create_initial_context(ctx,parent,Some(node),sandboxed,sandbox_allows_same_origin,name)
+    }
+
+    fn create_initial_context(self:&Rc<Self>,ctx:&mut Ctx,parent:Rc<BrowsingContext>,node:Option<NodeId>,sandboxed:bool,sandbox_allows_same_origin:bool,target_name:String)->OpResult<FrameContext> {
+        // Creating the navigable always publishes its initial empty document.
+        // Attribute processing starts src/srcdoc navigation separately.
+        let source = String::new();
+        let url = "about:blank";
         let origin = if sandboxed && !sandbox_allows_same_origin {
             Origin::opaque()
         } else {
-            parent.root_or_child_origin()
+            Origin::for_document(url, Some(&parent.root_or_child_origin()))
         };
         let group = parent
             .group
             .upgrade()
             .ok_or_else(|| OpError::type_error("browsing context group has retired"))?;
+        let (mut reservation, max_nodes) = group.admit(ctx, source.len())?;
+        let insertion_order = group.next_insertion.get();
+        let next_insertion = insertion_order.checked_add(1)
+            .ok_or_else(|| OpError::new("QuotaExceededError", "Frame insertion sequence exhausted"))?;
+        group.next_insertion.set(next_insertion);
         let child_realm = ctx.create_host_realm();
         let parsed = ctx.with_host_realm(&child_realm, |ctx| {
             let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
-            let document = html::parse_with_options_initialized(&source, 65_536,
+            let document = html::parse_with_options_initialized(&source, max_nodes,
                 html::ParseOptions { allow_declarative_shadow_roots: true, ..Default::default() },
                 |document| controller.attach(document))
                 .map_err(|error| OpError::error(format!("{error:?}")))?;
@@ -1361,6 +2230,7 @@ impl DomRealm {
                 return Err(OpError::error("failed to parse iframe initial document"));
             }
         };
+        reservation.set_nodes(document.node_count());
         let parent_proxy = parent.proxy();
         let top_proxy = parent.top_context().proxy();
         let metadata = Rc::new(RealmMetadata {
@@ -1373,26 +2243,41 @@ impl DomRealm {
                     .and_then(|value| ctx.weak_value(value)),
             ),
             top_proxy: RefCell::new(top_proxy.as_ref().and_then(|value| ctx.weak_value(value))),
-            parent_metadata: Some(Rc::downgrade(&parent.metadata.borrow())),
-            owner_realm: Some(Rc::downgrade(self)),
-            owner_node: Some(node),
+            parent_metadata: node.map(|_|Rc::downgrade(&parent.metadata.borrow())),
+            owner_realm: node.map(|_|Rc::downgrade(self)),
+            owner_node: node,
         });
         let proxy_metadata = Rc::new(RefCell::new(metadata.clone()));
         let child = Rc::new(BrowsingContext {
+            history: RefCell::new(None),
+            history_navigation: RefCell::new(None),
+            committed_history_entry: RefCell::new(None),
+            pending_post_resource: RefCell::new(None),
+            replace_navigation: Cell::new(false),
             group: Rc::downgrade(&group),
             metadata: RefCell::new(metadata.clone()),
             proxy_metadata: proxy_metadata.clone(),
             realm: RefCell::new(child_realm.clone()),
             window_proxy: RefCell::new(None),
             document: RefCell::new(None),
-            parent: Some(Rc::downgrade(&parent)),
-            owner_realm: Some(Rc::downgrade(self)),
-            owner_node: Some(node),
+            parent: node.map(|_|Rc::downgrade(&parent)),
+            opener: RefCell::new(node.is_none().then(||Rc::downgrade(&parent))),
+            owner_realm: node.map(|_|Rc::downgrade(self)),
+            owner_node: node,
             inherit_about_origin: Cell::new(true),
             location_navigation: RefCell::new(None),
+            javascript_document: RefCell::new(None),
+            navigation_initiator: RefCell::new(Some(parent.root_or_child_origin())),
+            navigation_initiator_base: RefCell::new(Some(self.base_url())),
+            navigation_metadata: RefCell::new(Some(node.map_or_else(||NavigationMetadata::from_document(self),|node|NavigationMetadata::from_frame_owner(self,self.session.borrow().document(),node)))),
             active: Cell::new(true),
             navigation_generation: Cell::new(0),
             initial_blank_load_dispatched: Cell::new(false),
+            beforeunload_generation: Cell::new(None),
+            ignored_attribute_navigation: Cell::new(None),
+            insertion_order,
+            target_name: RefCell::new(target_name),
+            source_bytes: Cell::new(source.len()),
         });
         let proxy = match child.make_window_proxy(ctx) {
             Ok(proxy) => proxy,
@@ -1402,6 +2287,10 @@ impl DomRealm {
             }
         };
         *metadata.self_proxy.borrow_mut() = ctx.weak_value(&proxy);
+        if node.is_none() {
+            *metadata.parent_proxy.borrow_mut()=ctx.weak_value(&proxy);
+            *metadata.top_proxy.borrow_mut()=ctx.weak_value(&proxy);
+        }
         group.register(&child);
         let inherited_base = self.base_url();
         let install = ctx.with_host_realm(&child_realm, |ctx| {
@@ -1426,6 +2315,7 @@ impl DomRealm {
                 None,
                 true,
                 Some(details_controller),
+                false,
             )
             .map_err(|error| {
                 OpError::error(format!(
@@ -1435,10 +2325,22 @@ impl DomRealm {
         });
         match install {
             Ok(Ok(realm)) => {
+                if let Some(node)=node {realm.inherit_embedding_color_scheme(self,node)?;}
+                realm.inherit_policy_container(&self.policy_container());
+                realm.inherit_cookie_environment(self);
+                realm.referrer_policy.set(self.referrer_policy.get());
+                *realm.document_referrer.borrow_mut() = self.document_url().unwrap_or_else(|| "about:blank".into());
+                realm.lifecycle.initial_about_blank.set(true);
+                let automatic_features_blocked=self.lifecycle.sandboxed_automatic_features.get()
+                    || node.is_some_and(|node|!lumen_html::object::is_embedded(self.session.borrow().document(),node) && self.session.borrow().document().get_attribute_ns_ref(node,None,"sandbox").ok().flatten()
+                        .is_some_and(|flags|!flags.split_ascii_whitespace().any(|flag|flag.eq_ignore_ascii_case("allow-scripts"))));
+                realm.lifecycle.sandboxed_automatic_features.set(automatic_features_blocked);
+                ctx.with_host_realm(&child_realm, |ctx| realm.set_document_ready_state(ctx, super::DocumentReadyState::Complete))
+                    .map_err(|_| OpError::error("failed to initialize iframe readiness"))??;
+                group.track_document(&realm, source.len());
                 *child.document.borrow_mut() = Some(realm);
-                self.frame_contexts
-                    .borrow_mut()
-                    .insert(node, Rc::downgrade(&child));
+                drop(reservation);
+                if let Some(node)=node {self.frame_contexts.borrow_mut().insert(node,Rc::downgrade(&child));}
                 let frame = FrameContext {
                     inner: child.clone(),
                 };
@@ -1477,6 +2379,19 @@ impl DomRealm {
             .collect()
     }
 
+    pub fn auxiliary_contexts(&self) -> Vec<FrameContext> {
+        let Some(group)=self.browsing_context().and_then(|context|context.group.upgrade()) else{return Vec::new()};
+        let mut contexts=group.contexts.borrow().values().filter(|context|context.is_active() && context.parent.is_none() && context.insertion_order!=0)
+            .cloned().collect::<Vec<_>>();
+        contexts.sort_unstable_by_key(|context|context.insertion_order);
+        contexts.into_iter().map(|inner|FrameContext{inner}).collect()
+    }
+
+    pub(crate) fn create_auxiliary_context(self:&Rc<Self>,ctx:&mut Ctx,name:String)->OpResult<Rc<BrowsingContext>> {
+        let parent=self.browsing_context().filter(|context|is_active_document(context,self)).ok_or_else(||OpError::type_error("Document has no active browsing context"))?;
+        Ok(self.create_initial_context(ctx,parent,None,false,true,name)?.inner)
+    }
+
     /// Release host ownership of iframe navigables whose owner element has been detached.
     /// Compatibility helper for embedders without Runtime-owned tasks. Production
     /// hosts should use `take_detached_frame_realms` and cancel their own work first.
@@ -1492,7 +2407,9 @@ impl DomRealm {
     /// and return their realms for host task cancellation and disposal. The host
     /// should call this before `frame_contexts` in its lifecycle pump.
     pub fn take_detached_frame_realms(&self, ctx: &mut Ctx) -> Vec<RealmHandle> {
-        self.collect_detached_frame_realms(ctx).1
+        let mut retired=self.collect_detached_frame_realms(ctx).1;
+        if let Some(group)=self.browsing_context().and_then(|context|context.group.upgrade()) {retired.extend(core::mem::take(&mut *group.pending_retired.borrow_mut()));}
+        retired
     }
 
     fn collect_detached_frame_realms(&self, ctx: &mut Ctx) -> (usize, Vec<RealmHandle>) {
@@ -1526,6 +2443,23 @@ impl DomRealm {
         (count, realm_handles)
     }
 
+    pub(crate) fn represented_object_context(&self, node: NodeId) -> Option<FrameContext> {
+        if !self.object_resources.representation(node).has_child_navigable() { return None; }
+        self.frame_contexts.borrow().get(&node).and_then(std::rc::Weak::upgrade)
+            .filter(|context| context.active.get()).map(|inner| FrameContext { inner })
+    }
+
+    pub(crate) fn destroy_object_context(&self, ctx: &mut Ctx, node: NodeId) {
+        let context = self.frame_contexts.borrow_mut().remove(&node).and_then(|context| context.upgrade());
+        let pending = self.pending_frame_contexts.borrow_mut().remove(&node);
+        let mut retired = Vec::new();
+        if let Some(context) = context.as_ref() { context.retire(ctx, &mut retired); }
+        if let Some(pending) = pending.filter(|pending| context.as_ref().is_none_or(|context| !Rc::ptr_eq(context, pending))) {
+            pending.retire(ctx, &mut retired);
+        }
+        self.pending_frame_realms.borrow_mut().extend(retired);
+    }
+
     fn retire_pending_frame_context_for_node(&self, ctx: &mut Ctx, node: NodeId) {
         let context = self.pending_frame_contexts.borrow_mut().remove(&node);
         let Some(context) = context else {
@@ -1546,7 +2480,7 @@ impl DomRealm {
         self.pending_frame_realms.borrow_mut().extend(retired);
     }
 
-    fn retire_all_frame_contexts(&self, ctx: &mut Ctx, retired: &mut Vec<RealmHandle>) {
+    pub(crate) fn retire_all_frame_contexts(&self, ctx: &mut Ctx, retired: &mut Vec<RealmHandle>) {
         let contexts: Vec<Rc<BrowsingContext>> = self
             .frame_contexts
             .borrow_mut()
@@ -1610,6 +2544,26 @@ pub(crate) fn context_top(context: &Rc<BrowsingContext>) -> Rc<BrowsingContext> 
     context.top_context()
 }
 
+/// Style queries can run before the embedder's next frame pump. Refresh a
+/// child document's media viewport from its live iframe content box then.
+pub(crate) fn synchronize_frame_media_environment(realm: &DomRealm) -> OpResult<()> {
+    let Some(context) = realm.browsing_context() else { return Ok(()); };
+    let Some((_, owner, _)) = context_frame_element(&context) else { return Ok(()); };
+    if owner.layout_flusher.borrow().is_none() && owner.session.borrow().viewport_size().is_none() {
+        return Ok(());
+    }
+    let (width, height) = FrameContext { inner: context }.content_viewport_size()?;
+    let mut session = realm.session.borrow_mut();
+    let mut environment = session.media_environment();
+    if environment.width == width as f32 && environment.height == height as f32 {
+        return Ok(());
+    }
+    environment.width = width as f32;
+    environment.height = height as f32;
+    session.set_media_environment(environment)
+        .map_err(|error| OpError::new("InvalidStateError", format!("iframe media environment failed: {error:?}")))
+}
+
 pub(crate) fn context_frame_element(
     context: &BrowsingContext,
 ) -> Option<(Rc<BrowsingContext>, Rc<DomRealm>, NodeId)> {
@@ -1628,8 +2582,31 @@ pub(crate) fn metadata_origin(metadata: &RealmMetadata) -> Origin {
     metadata.origin.borrow().clone()
 }
 
+pub(crate) fn require_same_origin_context(ctx: &mut Ctx, context: &BrowsingContext) -> OpResult<()> {
+    let caller = ctx.invocation_host_realm();
+    if metadata_for_realm(ctx, &caller).is_some_and(|metadata| {
+        metadata.origin.borrow().same_origin(&context.root_or_child_origin())
+    }) { return Ok(()); }
+    Err(crate::error_reporting::dom_exception(ctx, "SecurityError", "Cross-origin Location access is forbidden"))
+}
+
+pub(crate) fn focus_window_context(ctx: &mut Ctx, context: &BrowsingContext, blur: bool) -> OpResult<()> {
+    if !context.active.get() { return Ok(()); }
+    if let (Some(parent), Some(owner)) = (context.parent_context(), context.owner_node) {
+        if let Some(parent_document) = parent.document() {
+            if blur {
+                if parent_document.focused_node() == Some(owner) { parent_document.focus(ctx, None)?; }
+            } else { parent_document.focus(ctx, Some(owner))?; }
+        }
+    }
+    if blur {
+        if let Some(document) = context.document() { document.focus(ctx, None)?; }
+    }
+    Ok(())
+}
+
 pub(crate) fn is_active_document(context: &BrowsingContext, document: &DomRealm) -> bool {
-    context.active.get()
+    context.is_active()
         && context
             .document
             .borrow()
@@ -1661,7 +2638,9 @@ pub(crate) fn active_child_realm_handle(
     context: &BrowsingContext,
     document: &DomRealm,
 ) -> OpResult<Option<RealmHandle>> {
-    if context.parent.is_none() {
+    if context.parent.is_none() && context.group.upgrade().is_some_and(|group| {
+        context.realm.borrow().global().object_identity() == Some(group.root_key)
+    }) {
         return Ok(None);
     }
     if !context.active.get() {
@@ -1691,6 +2670,23 @@ pub(crate) fn update_document_origin(context: &BrowsingContext, url: &str) {
 pub(crate) fn bind_context_document(context: &Rc<BrowsingContext>, realm: &Rc<DomRealm>) {
     *realm.browsing_context.borrow_mut() = Rc::downgrade(context);
     *context.document.borrow_mut() = Some(realm.clone());
+    if let Some(group) = context.group.upgrade() { group.track_document(realm, context.source_bytes.get()); }
+}
+
+pub(crate) fn admit_parser_source(realm: &Rc<DomRealm>, source_bytes: usize) -> OpResult<()> {
+    let Some(context) = realm.browsing_context() else { return Ok(()); };
+    let Some(group) = context.group.upgrade() else { return Ok(()); };
+    let limits = group.limits.get();
+    let weak = Rc::downgrade(realm);
+    let mut bytes = source_bytes.saturating_add(group.staged_source_bytes.get());
+    for record in group.documents.borrow().iter() {
+        if !record.document.ptr_eq(&weak) && record.document.strong_count() != 0 { bytes = bytes.saturating_add(record.source_bytes); }
+    }
+    if source_bytes > limits.max_document_source_bytes || bytes > limits.max_total_source_bytes {
+        return Err(OpError::new("QuotaExceededError", "Browsing-context parser source budget exceeded"));
+    }
+    group.track_document(realm, source_bytes);
+    Ok(())
 }
 
 pub(crate) fn register_context_service(ctx: &mut Ctx, context: Rc<BrowsingContext>) {
@@ -1728,6 +2724,23 @@ pub(crate) fn current_realm_context(ctx: &mut Ctx) -> Option<Rc<BrowsingContext>
 
 pub(crate) fn current_realm_metadata(ctx: &mut Ctx) -> Option<Rc<RealmMetadata>> {
     RealmServices::<BrowsingContextService>::current(ctx).map(|service| service.metadata.clone())
+}
+
+pub(crate) fn metadata_for_realm(ctx: &mut Ctx, realm: &RealmHandle) -> Option<Rc<RealmMetadata>> {
+    ctx.op_state().get::<ContextGroupRegistry>()?.groups.values()
+        .find_map(|group| group.metadata.for_realm(realm))
+}
+
+/// This dedicated Window operation is cross-origin callable. It never broadens
+/// the native receiver permission used by document, history or scrolling APIs.
+pub(crate) fn message_receiver_context(ctx: &mut Ctx, receiver: &Value) -> Option<Rc<BrowsingContext>> {
+    let identity = receiver.object_identity()?;
+    ctx.op_state().get::<ContextGroupRegistry>()?.groups.values().find_map(|group| {
+        group.contexts.borrow().values().find(|context| {
+            context.proxy().and_then(|proxy| proxy.object_identity()) == Some(identity)
+                || context.realm.borrow().global().object_identity() == Some(identity)
+        }).cloned()
+    })
 }
 
 pub(crate) fn window_parent_from_metadata(ctx: &mut Ctx, metadata: &RealmMetadata) -> Value {
@@ -1874,11 +2887,110 @@ mod tests {
     use lumen::Engine;
 
     fn eval(engine: &mut Engine, source: &str) -> Value {
-        engine
-            .eval_value(source)
-            .expect("valid browser test source")
-            .ok()
-            .expect("browser test script did not throw")
+        match engine.eval_value(source).expect("valid browser test source") {
+            Ok(value)=>value,
+            Err(exception)=> {
+                let message=engine.ctx().coerce_string(&exception).ok().map(|text|text.to_string()).unwrap_or_else(||"unprintable exception".into());
+                panic!("browser test script threw {message}; source: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_window_identity_names_close_and_async_javascript() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<head><base href='/assets/'></head><body></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        assert!(matches!(eval(&mut engine, r#"
+            globalThis.effects = 0;
+            globalThis.popup = open('', 'native-popup');
+            popup !== null && popup.opener === window && popup.parent === popup &&
+            popup.top === popup && popup.document.baseURI === 'https://parent.example.test/assets/' &&
+            open('', 'native-popup') === popup && window.length === 0 && !popup.closed
+        "#), Value::Bool(true)));
+        assert_eq!(parent.auxiliary_contexts().len(), 1);
+        assert!(matches!(eval(&mut engine, r#"
+            popup.location.href = 'javascript:opener.effects += 1'; effects === 0
+        "#), Value::Bool(true)));
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(eval(&mut engine, "effects === 1 && popup.document.URL === 'about:blank'"), Value::Bool(true)));
+        assert!(matches!(eval(&mut engine, "popup.opener = null; popup.close(); popup.closed && popup.opener === null"), Value::Bool(true)));
+        assert!(parent.auxiliary_contexts().is_empty());
+        assert!(matches!(eval(&mut engine, "window.close(); !window.closed && open('', '_blank', 'noopener') === null"), Value::Bool(true)));
+        assert_eq!(parent.auxiliary_contexts().len(), 1);
+    }
+
+    #[test]
+    fn auxiliary_javascript_navigation_checks_actual_target_policy() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<body></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        assert!(matches!(eval(&mut engine, "globalThis.effects = 0; globalThis.popup = open('', 'policy-popup'); true"), Value::Bool(true)));
+        let frame = parent.auxiliary_contexts().remove(0);
+        let request = frame.request_host_navigation("https://parent.example.test/strict").unwrap();
+        frame.install_response_for_request(engine.ctx(), &request,
+            "https://parent.example.test/strict", "text/html",
+            "<head><meta http-equiv='Content-Security-Policy' content=\"script-src 'none'\"></head><body></body>", 128).unwrap();
+        let result = engine.eval_value_in_host_realm(&frame.realm_handle(),
+            "globalThis.violations=[]; addEventListener('securitypolicyviolation', e => violations.push([e.violatedDirective,e.blockedURI,e.isTrusted])); true", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        assert!(matches!(eval(&mut engine, "popup.location.href = 'javascript:opener.effects += 1'; true"), Value::Bool(true)));
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(eval(&mut engine, "effects === 0"), Value::Bool(true)));
+        let result = engine.eval_value_in_host_realm(&frame.realm_handle(),
+            "violations.length === 1 && violations[0][0] === 'script-src-elem' && violations[0][1] === 'inline' && violations[0][2]", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+    }
+
+    #[test]
+    fn auxiliary_javascript_navigation_unsafe_hashes_executes_or_reports() {
+        for (policy, allowed) in [
+            ("script-src 'unsafe-hashes' 'sha256-IIiAJ8UuliU8o1qAv6CV4P3R8DeTf/v3MrsCwXW171Y='", true),
+            ("script-src 'sha256-IIiAJ8UuliU8o1qAv6CV4P3R8DeTf/v3MrsCwXW171Y='", false),
+            ("script-src 'unsafe-hashes' 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='", false),
+        ] {
+            let mut runtime = lumen_runtime::Runtime::new_browser();
+            let mut engine = runtime.engine();
+            let html = format!("<head><meta http-equiv='Content-Security-Policy' content=\"{policy}\"></head><body></body>");
+            let parent = crate::install(engine.ctx(), &html, 128).unwrap();
+            parent.set_document_url("https://parent.example.test/page");
+            assert!(matches!(eval(&mut engine, r#"
+                globalThis.messages=[]; globalThis.violations=[];
+                addEventListener('message', e => messages.push([e.data,e.source===popup,e.origin]));
+                addEventListener('securitypolicyviolation', e => violations.push([e.violatedDirective,e.blockedURI,e.isTrusted]));
+                globalThis.popup=open("javascript:opener.postMessage('pass', '*')");
+                messages.length===0
+            "#), Value::Bool(true)));
+            for _ in 0..3 { assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty()); }
+            let expression = if allowed {
+                "messages.length===1 && messages[0][0]==='pass' && messages[0][1] && messages[0][2]==='https://parent.example.test' && violations.length===0"
+            } else {
+                "messages.length===0 && violations.length===1 && violations[0][0]==='script-src-elem' && violations[0][1]==='inline' && violations[0][2]"
+            };
+            assert!(matches!(eval(&mut engine, expression), Value::Bool(true)), "policy: {policy}");
+        }
+    }
+
+    #[test]
+    fn auxiliary_javascript_string_completion_commits_real_document() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<body></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        assert!(matches!(eval(&mut engine,
+            "globalThis.popup=open('', 'replacement'); popup.location.href=\"javascript:'<body><p id=result>actual replacement</p></body>'\"; popup.document.querySelector('#result')===null"), Value::Bool(true)));
+        let frame = parent.auxiliary_contexts().remove(0);
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        let request = frame.navigation_request();
+        let FrameSource::JavaScriptDocument {source,url} = &request.source else {panic!("actual string completion must request a document")};
+        assert_eq!(url, "about:blank");
+        assert_eq!(source, "<body><p id=result>actual replacement</p></body>");
+        frame.install_response_for_request(engine.ctx(), &request, url, "text/html", source, 128).unwrap();
+        assert!(matches!(eval(&mut engine,
+            "popup===open('', 'replacement') && popup.document.querySelector('#result').textContent==='actual replacement' && popup.document.URL==='about:blank' && popup.parent===popup && popup.opener===window"), Value::Bool(true)));
     }
 
     fn set_attribute(realm: &Rc<DomRealm>, node: NodeId, name: &str, value: &str) {
@@ -2044,6 +3156,37 @@ mod tests {
     }
 
     #[test]
+    fn specification_window_discard_retires_unqualified_task_owner_only_for_staging_realm() {
+        let mut engine=Engine::new();
+        // Establish the creator's tuple origin before the iframe is born. A
+        // pending same-origin network navigation leaves initial about:blank
+        // active without a src mutation that would mature an about navigation.
+        let parent=crate::install(engine.ctx(),"<body></body>",128).unwrap();
+        parent.set_document_url("https://pending.test/parent");
+        assert!(matches!(eval(&mut engine,"const pendingFrame=document.createElement('iframe');pendingFrame.src='https://pending.test/unloaded';document.body.append(pendingFrame);true"),Value::Bool(true)));
+        let frame=parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let request=frame.navigation_request();
+        let prepared=frame.prepare_response_for_request(engine.ctx(),&request,"https://pending.test/unloaded","text/html","<details></details>",128).unwrap();
+        assert!(prepared.reuses_window());
+        let staging=prepared.staging_realm.as_ref().unwrap().clone();
+        let sender=engine.ctx().with_host_realm(&staging,super::super::scheduling::task_sender).unwrap().unwrap();
+        let called=Rc::new(Cell::new(false));
+        let retired_called=called.clone();
+        assert!(sender.queue(move |_|{retired_called.set(true);Ok(())}).is_ok());
+        super::super::scheduling::queue_task(engine.ctx(),|ctx|{
+            let global=ctx.global_object();
+            ctx.member_set(&global,"survivingParentTask",Value::Bool(true)).map_err(OpError::thrown)
+        }).unwrap();
+        let retired=prepared.discard(engine.ctx());
+        assert!(!sender.is_live());
+        assert!(super::super::scheduling::run_tasks(&mut engine,16).is_empty());
+        assert!(!called.get());
+        assert!(matches!(eval(&mut engine,"survivingParentTask===true"),Value::Bool(true)));
+        assert!(frame.current_document().is_some());
+        for realm in retired { engine.ctx().dispose_host_realm(&realm).expect("dispose discarded staging realm"); }
+    }
+
+    #[test]
     fn origins_use_tuple_identity_and_distinct_opaque_tokens() {
         assert_eq!(
             Origin::from_url("https://example.test/a"),
@@ -2058,6 +3201,34 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.serialize(), "null");
         assert_eq!(second.serialize(), "null");
+    }
+
+    #[test]
+    fn local_navigation_captures_policy_and_pageshow_without_inheriting_tuple_origin() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<iframe></iframe>", 128).unwrap();
+        parent.set_document_url("https://creator.test/page");
+        parent.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "img-src 'self'".into())]).unwrap();
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        assert!(!frame.current_document().unwrap().module_fetch_policy_snapshot().unwrap().check("https://creator.test/image", "about:blank", lumen_common::csp::Destination::Image).unwrap().blocked);
+        set_attribute(&parent, frame.owner_node(), "src", "data:text/html,child");
+        let request = frame.navigation_request();
+        // A change after ingress cannot silently change the request snapshot.
+        parent.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "img-src 'none'".into())]).unwrap();
+        let child = frame.install_response_for_request(engine.ctx(), &request,
+            "data:text/html,child", "text/html", "<body></body>", 128).unwrap();
+        assert_eq!(frame.origin().serialize(), "null");
+        assert!(!frame.origin().same_origin(&Origin::from_url("https://creator.test/")));
+        let policies = child.module_fetch_policy_snapshot().unwrap();
+        assert!(!policies.check("https://creator.test/image", "data:text/html,child", lumen_common::csp::Destination::Image).unwrap().blocked);
+        assert!(policies.check("https://foreign.test/image", "data:text/html,child", lumen_common::csp::Destination::Image).unwrap().blocked);
+        let handle = frame.realm_handle();
+        let result = engine.eval_value_in_host_realm(&handle, "globalThis.shows=[];addEventListener('pageshow', e=>shows.push(e.isTrusted && !e.persisted));true", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        engine.ctx().with_host_realm(&handle, |ctx| child.dispatch_window_user_agent(ctx, "load", false, false)).unwrap().unwrap();
+        let result = engine.eval_value_in_host_realm(&handle, "shows.length===1 && shows[0]", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
     }
 
     #[test]
@@ -2082,7 +3253,12 @@ mod tests {
         let request = frame.navigation_request();
         assert!(matches!(request.source, FrameSource::SrcDoc(_)));
         assert_eq!(frame.origin(), parent_origin);
-        let child = frame.current_document().expect("initial srcdoc document");
+        let initial = frame.current_document().expect("initial empty document");
+        assert_eq!(initial.document_url().as_deref(), Some("about:blank"));
+        assert_eq!(initial.base_url(), expected_base);
+        let child = frame.install_response_for_request(engine.ctx(), &request,
+            "about:srcdoc", "text/html", "child", 128).unwrap();
+        assert!(!Rc::ptr_eq(&initial, &child));
         assert_eq!(child.document_url().as_deref(), Some("about:srcdoc"));
         assert_eq!(child.base_url(), expected_base);
 
@@ -2178,6 +3354,54 @@ mod tests {
             Err(_) => panic!("child bootstrap did not throw"),
         };
         assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn captured_blank_window_proxy_survives_cross_origin_navigation_and_message_relay() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<body><iframe id=child></iframe></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        assert!(matches!(eval(&mut engine, r#"
+            window.savedChild = document.getElementById('child').contentWindow;
+            window.received = [];
+            addEventListener('message', event => {
+                received.push([event.source === savedChild, event.origin, event.data]);
+                if (event.data === 'ready') event.source.postMessage('reply', '*');
+            });
+            true
+        "#), Value::Bool(true)));
+        set_attribute(&parent, frame.owner_node(), "src", "https://guest.example.test/child");
+        let request = frame.navigation_request();
+        let child = frame.install_response_for_request(engine.ctx(), &request,
+            "https://guest.example.test/child", "text/html", "<body>guest</body>", 128).unwrap();
+        assert!(matches!(eval(&mut engine,
+            "savedChild === document.getElementById('child').contentWindow"), Value::Bool(true)));
+        let handle = active_child_handle(&child);
+        let result = engine.eval_value_in_host_realm(&handle, r#"
+            addEventListener('message', event => {
+                if (event.source === parent && event.origin === 'https://parent.example.test')
+                    parent.postMessage(event.data, '*');
+            });
+            parent.postMessage('ready', '*');
+            true
+        "#, false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(eval(&mut engine, "received.length === 1 && received[0][0] && received[0][2] === 'ready'"), Value::Bool(true)));
+        // The queue deliberately snapshots one turn; each posted message is a
+        // further task, rather than recursively draining tasks created by it.
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        let received = eval(&mut engine, "JSON.stringify(received)");
+        let received = engine.ctx().coerce_string(&received).ok().expect("relay JSON is a string");
+        assert!(matches!(eval(&mut engine, r#"
+            received.length === 2 && received[0][0] && received[1][0] &&
+            received[0][1] === 'https://guest.example.test' &&
+            received[1][1] === 'https://guest.example.test' &&
+            received[0][2] === 'ready' && received[1][2] === 'reply'
+        "#), Value::Bool(true)), "actual Window relay: {received}");
     }
 
     #[test]
@@ -2469,6 +3693,43 @@ mod tests {
     }
 
     #[test]
+    fn frame_admission_collects_unreachable_retired_realms_under_budget_pressure() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(), "<body></body>", 512).unwrap();
+        parent.set_document_url("https://example.test/");
+        parent.set_frame_resource_limits(FrameResourceLimits { max_realms: 4, ..FrameResourceLimits::default() }).unwrap();
+        for index in 0..32 {
+            assert!(matches!(eval(&mut engine, "globalThis.frame=document.createElement('iframe');document.body.append(frame);true"), Value::Bool(true)));
+            let contexts = parent.frame_contexts(engine.ctx()).unwrap_or_else(|error| panic!("frame {index}: {error:?}"));
+            assert_eq!(contexts.len(), 1);
+            drop(contexts);
+            assert!(matches!(eval(&mut engine, "frame.remove();frame=null;true"), Value::Bool(true)));
+            assert_eq!(parent.retire_detached_frame_contexts(engine.ctx()), 1);
+        }
+        assert!(parent.frame_contexts(engine.ctx()).unwrap().is_empty());
+        assert_eq!(parent.browsing_context().unwrap().group.upgrade().unwrap().limits.get().max_realms, 4);
+    }
+
+    #[test]
+    fn frame_admission_still_charges_author_retained_detached_documents() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(), "<body></body>", 512).unwrap();
+        parent.set_document_url("https://example.test/");
+        parent.set_frame_resource_limits(FrameResourceLimits { max_realms: 4, ..FrameResourceLimits::default() }).unwrap();
+        eval(&mut engine, "globalThis.saved=[];true");
+        for _ in 0..3 {
+            eval(&mut engine, "globalThis.frame=document.createElement('iframe');document.body.append(frame);saved.push(frame.contentDocument);true");
+            drop(parent.frame_contexts(engine.ctx()).unwrap());
+            eval(&mut engine, "frame.remove();frame=null;true");
+            assert_eq!(parent.retire_detached_frame_contexts(engine.ctx()), 1);
+        }
+        eval(&mut engine, "globalThis.frame=document.createElement('iframe');document.body.append(frame);true");
+        let error = parent.frame_contexts(engine.ctx()).err().expect("retained documents still exhaust the configured budget");
+        assert_eq!(error.class(), "QuotaExceededError");
+        assert!(matches!(eval(&mut engine, "saved.length===3 && saved[0].body!==null"), Value::Bool(true)));
+    }
+
+    #[test]
     fn host_cleanup_before_reinserted_frame_materialization_preserves_the_live_context() {
         let mut engine = Engine::new();
         let parent = crate::install(
@@ -2694,7 +3955,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_base_and_detach_reinsert_mutations_advance_frame_request_epoch() {
+    fn specification_window_attribute_source_snapshots_and_detach_epochs() {
         let mut engine = Engine::new();
         let parent = crate::install(
             engine.ctx(),
@@ -2712,12 +3973,16 @@ mod tests {
         let original = frame.navigation_request();
 
         set_attribute(&parent, node_by_id(&parent, "active"), "href", "/two/");
-        assert!(!frame.request_is_current(&original));
+        assert!(frame.request_is_current(&original));
+        assert_eq!(frame.navigation_request(), original);
+        set_attribute(&parent, frame.owner_node(), "src", "page.html?next");
         let second_base = frame.navigation_request();
+        assert_eq!(second_base.source, FrameSource::Url("https://parent.example.test/two/page.html?next".into()));
+        assert!(!frame.request_is_current(&original));
         set_attribute(&parent, node_by_id(&parent, "active"), "href", "/one/");
-        assert!(!frame.request_is_current(&second_base));
+        assert!(frame.request_is_current(&second_base));
         let back_to_original = frame.navigation_request();
-        assert_eq!(back_to_original.source, original.source);
+        assert_eq!(back_to_original.source, second_base.source);
         assert_ne!(back_to_original.generation, original.generation);
 
         parent.set_document_url("https://parent.example.test/new-location/document.html");
@@ -2742,6 +4007,25 @@ mod tests {
         });
         assert!(!frame.request_is_current(&detached_request));
         assert_eq!(frame.navigation_request().source, detached_request.source);
+    }
+
+    #[test]
+    fn specification_window_text_document_navigation_preserves_mime_and_literal_source() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(), "<iframe></iframe>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/index.html");
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let source = "<script>globalThis.executed=true</script>\r\n{\"value\":42}";
+        for mime in ["application/json", "application/problem+json", "text/javascript1.2", "text/vtt"] {
+            let request = frame.request_host_navigation("https://parent.example.test/resource").unwrap();
+            let document = frame.install_response_for_request(engine.ctx(), &request,
+                "https://parent.example.test/resource", mime, source, 128).unwrap();
+            assert_eq!(document.content_type,mime);
+            let result = engine.eval_value_in_host_realm(&frame.realm_handle(),
+                r#"document.compatMode==='CSS1Compat' && document.querySelector('script')===null && typeof executed==='undefined' && document.querySelector('pre').textContent==="<script>globalThis.executed=true</script>\n{\"value\":42}""#,false)
+                .unwrap().ok().expect("inspect actual text document");
+            assert!(matches!(result,Value::Bool(true)),"{mime}");
+        }
     }
 
     #[test]

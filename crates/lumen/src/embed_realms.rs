@@ -370,6 +370,7 @@ struct HostRealmOwner {
     /// intrinsics active. Native Window receiver checks use the top entry instead of mistaking
     /// the callee's function realm for the caller.
     invocation_callers: Rc<RefCell<Vec<RealmHandle>>>,
+    temporary_scopes: Rc<std::cell::Cell<usize>>,
 }
 
 fn owner_token(interp: &mut Interp) -> Rc<()> {
@@ -380,6 +381,7 @@ fn owner_token(interp: &mut Interp) -> Rc<()> {
     interp.host_state.put(HostRealmOwner {
         token: owner.clone(),
         invocation_callers: Rc::new(RefCell::new(Vec::new())),
+        temporary_scopes: Rc::new(std::cell::Cell::new(0)),
     });
     owner
 }
@@ -619,6 +621,32 @@ impl Interp {
         Ok(())
     }
 
+    /// Replace the interpreter's root between host turns. Existing functions
+    /// and retained objects still keep their original realm alive; the old root
+    /// becomes eligible for the same retirement path as other host realms.
+    pub fn replace_root_host_realm(&mut self, realm: &RealmHandle) -> Result<RealmHandle, HostRealmDisposeError> {
+        if !realm.belongs_to(self) { return Err(HostRealmDisposeError::DifferentInterpreter); }
+        if !realm.is_registered_in(self) { return Err(HostRealmDisposeError::UnknownRealm); }
+        let owner = self.host_state.get::<HostRealmOwner>().expect("registered host realm owner");
+        if owner.temporary_scopes.get() != 0 || !owner.invocation_callers.borrow().is_empty()
+            || !self.fn_frames.is_empty() || self.jit_frames != 0 || self.native_top != 0 || self.depth != 0 {
+            return Err(HostRealmDisposeError::ActiveRealm);
+        }
+        let previous = self.active_realm_handle();
+        if previous.same_realm(realm) { return Ok(previous); }
+        let mut target = self.realms.get(&realm.key).ok_or(HostRealmDisposeError::UnknownRealm)?.snapshot_clone();
+        if !target.host_managed { return Err(HostRealmDisposeError::NotHostManaged); }
+        let mut old = self.snapshot_realm();
+        old.host_managed = true;
+        old.collectable = true;
+        target.host_managed = false;
+        target.collectable = false;
+        self.realms.insert(previous.key, old);
+        self.realms.insert(realm.key, target.snapshot_clone());
+        self.restore_realm(&target);
+        Ok(previous)
+    }
+
     /// Run a native host callback with `realm`'s intrinsics and global installed as the
     /// active interpreter realm.
     ///
@@ -664,10 +692,13 @@ impl Interp {
 
         let caller = self.snapshot_realm();
         self.restore_realm(&target);
+        let scopes = self.host_state.get::<HostRealmOwner>().expect("host realm owner").temporary_scopes.clone();
+        scopes.set(scopes.get() + 1);
         let restore = RestoreRealmOnDrop {
             interp: self as *mut Interp,
             active_key: realm.key,
             caller: Some(caller),
+            scopes,
         };
 
         // `restore` contains a raw pointer so it does not borrow `self` while the callback runs.
@@ -1220,6 +1251,7 @@ struct RestoreRealmOnDrop {
     interp: *mut Interp,
     active_key: usize,
     caller: Option<RealmState>,
+    scopes: Rc<std::cell::Cell<usize>>,
 }
 
 impl Drop for RestoreRealmOnDrop {
@@ -1237,6 +1269,7 @@ impl Drop for RestoreRealmOnDrop {
         if let Some(caller) = self.caller.take() {
             interp.restore_realm(&caller);
         }
+        self.scopes.set(self.scopes.get() - 1);
     }
 }
 
@@ -1247,6 +1280,113 @@ mod tests {
     use crate::value::WeakGc;
     use crate::Engine;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn specification_module_settings_own_graphs_pending_completions_and_retained_namespaces() {
+        let mut engine = Engine::new();
+        let child = engine.ctx().create_host_realm();
+        let weak = engine.ctx().weak_value(&child.global()).expect("child global");
+        let queue = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let request_queue = queue.clone();
+        engine.ctx().with_host_realm(&child, |ctx| {
+            ctx.install_module_fetch_loader(Rc::new(|request| Some(crate::ModuleFetchResult {
+                key: request.specifier,
+                source: if request.attribute_type.as_deref()==Some("text") { "captured text".into() }
+                    else { "export const value = 17; export const global = globalThis;".into() },
+                script_context: request.script_context,
+            })));
+            ctx.install_async_module_import_handler(Rc::new(move |request| request_queue.borrow_mut().push(request)));
+            let css=ctx.dynamic_import("https://example.test/not-exposed.css",Some("css"),false,None);
+            ctx.observe_promise_for_host(&css);
+            assert!(matches!(crate::eval::promise_fast::promise_state(&css),Some((crate::eval::promise_fast::REJECTED,_))),"settings without CSSOM exposure reject before fetching");
+            ctx.dynamic_import("https://example.test/module.js",None,false,None)
+        }).expect("child import");
+        let request = queue.borrow_mut().pop().expect("actual asynchronous request");
+        let handle = engine.ctx().complete_prepared_module_import_for_host(request.id).expect("completion enters origin while parent active");
+        assert!(matches!(engine.ctx().get_member(&handle.namespace,"value"),Ok(Value::Num(17.0))));
+        let global = engine.ctx().get_member(&handle.namespace,"global").ok().expect("origin export");
+        assert_eq!(global.object_identity(),child.global().object_identity());
+        drop(global);
+        let parent = engine.ctx().run_prepared_module_for_host("export const value = 29;","https://example.test/module.js","https://example.test/module.js","https://example.test/module.js",None).expect("parent graph");
+        assert!(matches!(engine.ctx().get_member(&parent.namespace,"value"),Ok(Value::Num(29.0))));
+        assert_ne!(parent.namespace.object_identity(),handle.namespace.object_identity());
+        let context = Rc::new(crate::ClassicScriptContext { base_url:"https://cdn.test/async.js".into(),
+            nonce:"captured".into(),credentials_mode:"include".into(),referrer_policy:"origin".into() });
+        let asynchronous = engine.ctx().with_host_realm(&child,|ctx|
+            ctx.run_prepared_module_for_host("await Promise.resolve(); export const global = globalThis; export const pending = import('./late.txt', {with:{type:'text'}});",
+                "https://example.test/async.js","https://cdn.test/async.js","https://cdn.test/async.js",Some(context)))
+            .expect("child async entry").expect("async module parses");
+        engine.run_microtasks();
+        let resumed_global = engine.ctx().get_member(&asynchronous.namespace,"global").ok().expect("resumed module export");
+        assert_eq!(resumed_global.object_identity(),child.global().object_identity());
+        drop(resumed_global);
+        let resumed = queue.borrow_mut().pop().expect("import after top-level await");
+        assert_eq!(resumed.settings_key,child.key());
+        assert_eq!(resumed.attribute_type.as_deref(),Some("text"));
+        assert_eq!(resumed.referrer,"https://cdn.test/async.js");
+        assert_eq!(resumed.script_context.as_ref().expect("captured source options").nonce,"captured");
+        let text = engine.ctx().complete_prepared_module_import_for_host(resumed.id).expect("resumed import completion");
+        assert!(matches!(engine.ctx().get_member(&text.namespace,"default"),Ok(Value::Str(value)) if value.as_str()=="captured text"));
+        drop(text);
+        drop((asynchronous,resumed));
+        engine.run_microtasks();
+        engine.ctx().with_host_realm(&child, |ctx|ctx.dynamic_import("https://example.test/later.js",None,false,None)).expect("second import");
+        let cancelled = queue.borrow_mut().pop().expect("pending request");
+        engine.ctx().cancel_async_module_imports_for_realm(&child);
+        assert!(!engine.ctx().has_pending_module_import_for_host(cancelled.id));
+        assert!(engine.ctx().complete_prepared_module_import_for_host(cancelled.id).is_err());
+        let legacy_calls = Rc::new(std::cell::Cell::new(0));
+        let calls = legacy_calls.clone();
+        engine.set_module_loader_attrs(move |_,_,_| { calls.set(calls.get()+1); Some(("legacy".into(),"export {};".into())) });
+        let rejected = engine.ctx().with_host_realm(&child,|ctx| {
+            let promise = ctx.dynamic_import("https://example.test/retired.js",None,false,None);
+            ctx.observe_promise_for_host(&promise);
+            promise
+        }).expect("retained retired settings entry");
+        assert!(matches!(crate::eval::promise_fast::promise_state(&rejected),Some((crate::eval::promise_fast::REJECTED,_))));
+        assert_eq!(legacy_calls.get(),0,"retired browser settings cannot become Node loader requests");
+        drop(rejected);
+        engine.ctx().dispose_host_realm(&child).expect("retire child");
+        drop((child,request,cancelled,queue));
+        engine.collect_garbage();
+        assert!(weak.upgrade().is_some(),"retained namespace preserves its actual source settings");
+        drop(handle);
+        engine.run_microtasks();
+        engine.collect_garbage();
+        assert!(weak.upgrade().is_none(),"released namespace and cancelled requests cannot pin retired settings");
+    }
+
+    #[test]
+    fn specification_window_root_realm_replacement_preserves_retained_realms_and_rejects_scopes() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        let old = ctx.current_host_realm();
+        let old_global = old.global();
+        let weak_old = Gc::downgrade(old_global.as_obj().unwrap());
+        let retained = ctx.eval_in_realm(&old_global, "globalThis.marker='old';()=>marker")
+            .unwrap_or_else(|_| panic!("old root closure"));
+        let next = ctx.create_host_realm();
+        let next_global = next.global();
+        ctx.eval_in_realm(&next_global, "globalThis.marker='new'").unwrap_or_else(|_| panic!("new root initialization"));
+        assert!(matches!(ctx.with_host_realm(&next, |ctx| ctx.replace_root_host_realm(&next)),
+            Ok(Err(HostRealmDisposeError::ActiveRealm))));
+        assert!(ctx.current_host_realm().same_realm(&old));
+        let retired = ctx.replace_root_host_realm(&next).expect("replace inactive root between turns");
+        assert!(retired.same_realm(&old));
+        assert!(ctx.current_host_realm().same_realm(&next));
+        let marker = ctx.eval_in_realm(&next_global, "marker").unwrap_or_else(|_| panic!("new root lookup"));
+        assert!(matches!(marker, Value::Str(value) if value.as_str()=="new"));
+        ctx.dispose_host_realm(&retired).expect("retire previous default root");
+        let result = ctx.call(retained.clone(), Value::Undefined, &[]).unwrap_or_else(|_| panic!("retained old root closure"));
+        assert!(matches!(result, Value::Str(value) if value.as_str()=="old"));
+        drop(old); drop(old_global); drop(retired);
+        ctx.collect_garbage();
+        assert!(weak_old.upgrade().is_some(), "retained function must keep its original realm");
+        drop(retained);
+        ctx.collect_garbage();
+        assert!(weak_old.upgrade().is_none(), "an unreferenced former root must be collectible");
+        assert!(ctx.current_host_realm().same_realm(&next));
+    }
 
     #[lumen_bind::class(name = "HostRealmBase", hint(js(webidl)))]
     struct HostRealmBase {
@@ -1632,6 +1772,37 @@ mod tests {
     }
 
     #[test]
+    fn promise_intrinsic_cache_collects_retired_realms_and_preserves_inflight_bundles() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        let realm = ctx.create_host_realm();
+        let global = realm.global();
+        let weak_global = ctx.weak_value(&global).expect("realm global");
+        let bundle = ctx.with_host_realm(&realm, |ctx| {
+            ctx.eval_in_realm(&global, "Promise.resolve(1); undefined")
+                .unwrap_or_else(|_| panic!("initialize promise fast path"));
+            ctx.promise_intr().expect("installed promise intrinsics")
+        }).expect("enter child realm");
+        let weak_then = ctx.weak_value(&Value::Obj(bundle.then.clone())).expect("original then");
+        drop(bundle);
+        ctx.eval_in_realm(&global, "Promise.prototype.then = null; Promise.resolve = null")
+            .unwrap_or_else(|_| panic!("replace public promise properties"));
+        ctx.collect_garbage();
+        assert!(weak_then.upgrade().is_some(), "live cached realm retains its original methods");
+        let bundle = ctx.with_host_realm(&realm, |ctx| ctx.promise_intr().expect("live cached intrinsics"))
+            .expect("enter live child realm");
+        ctx.dispose_host_realm(&realm).expect("retire child realm");
+        drop(global);
+        drop(realm);
+        ctx.collect_garbage();
+        assert!(weak_global.upgrade().is_some(), "an executing intrinsic bundle owns its realm");
+        drop(bundle);
+        ctx.collect_garbage();
+        assert!(weak_global.upgrade().is_none(), "cache bookkeeping does not pin a retired realm");
+        assert!(weak_then.upgrade().is_none(), "unreachable original methods are released");
+    }
+
+    #[test]
     fn retired_host_realm_survives_through_proxy_and_closure_then_collects() {
         let mut engine = Engine::new();
         let ctx = engine.ctx();
@@ -1680,6 +1851,8 @@ mod tests {
         let old_array = member(ctx, &still_live, "oldArray");
         let window_array = member(ctx, &still_live, "windowArray");
         assert_eq!(object_id(ctx, &old_array), object_id(ctx, &window_array));
+        drop(old_array);
+        drop(window_array);
         assert!(matches!(
             member(ctx, &still_live, "sloppyThisTargetsNewRealm"),
             Value::Bool(false)
@@ -1716,6 +1889,8 @@ mod tests {
         let old_array = member(ctx, &after_navigation, "oldArray");
         let window_array = member(ctx, &after_navigation, "windowArray");
         assert_ne!(object_id(ctx, &old_array), object_id(ctx, &window_array));
+        drop(old_array);
+        drop(window_array);
         drop(after_navigation);
         drop(retained_function);
         drop(proxy);
@@ -2441,6 +2616,86 @@ mod tests {
         };
         assert_eq!(object_id(ctx, &returned_thrown), thrown_id);
         assert_eq!(object_id(ctx, &ctx.global_object()), parent_id);
+    }
+
+    #[test]
+    fn specification_function_templates_keep_realm_neutral_metadata_and_live_closure_owners() {
+        let mut engine=Engine::new();
+        let ctx=engine.ctx();
+        let child=ctx.create_host_realm();
+        let weak=ctx.weak_value(&child.global()).expect("child global");
+        let function=ctx.eval_value_in_host_realm(&child,"(function held(){return 7})",false)
+            .expect("enter child").ok().expect("child function");
+        let ast={
+            let object=function.as_obj().expect("function object").borrow();
+            let crate::value::Callable::User(user)=&object.call else {panic!("user function")};
+            user.func.clone()
+        };
+        let getter_id=|function:&Value| {
+            let object=function.as_obj().expect("function object").borrow();
+            object.props.get("arguments").expect("legacy arguments descriptor")
+                .getter().and_then(Value::object_identity).expect("realm getter")
+        };
+        let child_getter=getter_id(&function);
+        let parent=ctx.make_function(ast.clone(),ctx.global_env.clone());
+        let parent_getter=getter_id(&parent);
+        assert_ne!(child_getter,parent_getter,"shared AST must instantiate the closure's actual realm descriptors");
+        assert_eq!(Some(parent_getter),ctx.extra_protos.get(crate::bytecode::reflect::ARGUMENTS_GETTER).map(|getter|crate::value::Gc::as_ptr(getter) as usize));
+        let maps=ast.fn_maps.get().expect("cached maps");
+        let mut edges=0;
+        maps.fn_map.visit_object_refs(0,usize::MAX,&mut |_|edges+=1);
+        if let Some(map)=&maps.eager_map {map.visit_object_refs(0,usize::MAX,&mut |_|edges+=1);}
+        if let Some(map)=&maps.proto_map {map.visit_object_refs(0,usize::MAX,&mut |_|edges+=1);}
+        if let Some(map)=maps.named.get() {map.1.visit_object_refs(0,usize::MAX,&mut |_|edges+=1);}
+        assert_eq!(edges,0,"AST templates own only neutral metadata, never realm JS Values");
+        ctx.dispose_host_realm(&child).expect("dispose inactive realm");
+        drop(child);
+        ctx.collect_garbage_for_host();
+        assert!(weak.upgrade().is_some(),"an actual retained child closure preserves its origin realm");
+        assert!(matches!(ctx.invoke(function.clone(),Value::Undefined,&[]),Ok(Value::Num(7.0))));
+        drop(function);
+        ctx.collect_garbage_for_host();
+        assert!(weak.upgrade().is_none(),"external AST and parent closures cannot retain the retired child realm through cached descriptors");
+        let again=ctx.make_function(ast.clone(),ctx.global_env.clone());
+        assert_eq!(getter_id(&again),parent_getter,"externally retained AST remains reusable after its first realm is collected");
+        assert!(matches!(ctx.invoke(again,Value::Undefined,&[]),Ok(Value::Num(7.0))));
+        assert!(matches!(ctx.invoke(parent,Value::Undefined,&[]),Ok(Value::Num(7.0))));
+    }
+
+    #[test]
+    fn specification_pending_task_exceptions_preserve_callback_global_until_delivery() {
+        let mut engine = Engine::new();
+        engine.report_task_errors();
+        let child = engine.ctx().create_host_realm();
+        let weak = engine.ctx().weak_value(&child.global()).expect("child global");
+        let callback = engine.eval_value_in_host_realm(&child, "() => { throw 'primitive'; }", false)
+            .expect("callback parses").unwrap_or_else(|error| match engine.describe_throw(error) {
+                crate::Completion::Throw { name, message } => panic!("callback evaluation: {name}: {message}"),
+                crate::Completion::Value(_) => panic!("callback evaluation failed without a thrown description"),
+            });
+        // queueMicrotask is a Runtime-installed global, not an ECMAScript
+        // Engine intrinsic. Use the same canonical queue entry that it calls.
+        engine.ctx().queue_microtask(callback.clone());
+        engine.run_microtasks();
+        engine.ctx().dispose_host_realm(&child).expect("retire inactive child realm");
+        drop((child, callback));
+        engine.collect_garbage();
+        assert!(weak.upgrade().is_some(), "pending primitive exceptions retain their actual reporting global");
+        let errors = engine.take_task_errors_with_globals();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].1.object_identity(), weak.upgrade().and_then(|global| global.object_identity()));
+        assert!(matches!(&errors[0].0, Value::Str(value) if value.as_str() == "primitive"));
+        drop(errors);
+        engine.collect_garbage();
+        assert!(weak.upgrade().is_none(), "draining pending reports releases their transient source ownership");
+        let legacy = engine.eval_value("() => { throw 7; }").expect("legacy callback parses")
+            .unwrap_or_else(|error| match engine.describe_throw(error) {
+                crate::Completion::Throw { name, message } => panic!("legacy callback evaluation: {name}: {message}"),
+                crate::Completion::Value(_) => panic!("legacy callback evaluation failed without a thrown description"),
+            });
+        engine.ctx().queue_microtask(legacy);
+        engine.run_microtasks();
+        assert!(matches!(engine.take_task_errors().as_slice(), [Value::Num(7.0)]));
     }
 
     #[test]

@@ -484,7 +484,7 @@ pub fn post_owned(ctx: &mut Ctx, id: u64, bytes: Vec<u8>) -> Result<Posted, OpEr
                 .iter()
                 .filter_map(|a| match a {
                     CloneAttachment::Shared(h) => Some(CloneAttachment::Shared(h.clone())),
-                    CloneAttachment::Port(_) => None,
+                    CloneAttachment::Port(_) | CloneAttachment::Native { .. } => None,
                 })
                 .collect();
             let _ = member.mail.queue.push(CloneMessage {

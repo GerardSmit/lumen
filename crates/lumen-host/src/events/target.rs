@@ -149,6 +149,25 @@ pub enum DeferredCompile {
 pub trait TargetHooks: Any {
     fn as_any(&self) -> &dyn Any;
 
+    /// Notify a platform target before reporting a thrown listener exception.
+    /// IndexedDB aborts the associated transaction after the dispatch finishes;
+    /// this hook never replaces the realm's normal exception reporting.
+    fn listener_exception(&self) {}
+
+    /// Select a platform activation behavior while the dispatch path is stable.
+    /// The returned continuation runs after dispatch state has been cleared.
+    fn activation_behavior(&self, ctx: &mut Ctx, receiver: &Value, event: &Value) -> OpResult<Option<PreparedActivation>> {
+        let _ = (ctx, receiver, event);
+        Ok(None)
+    }
+
+    /// Apply a platform-specific HTML event-handler return convention.
+    /// The shared dispatcher remains independent of DOM event subclasses.
+    fn handle_html_return(&self, ctx: &mut Ctx, kind: &str, event: &Value, result: &Value) -> OpResult<bool> {
+        let _ = (ctx, kind, event, result);
+        Ok(false)
+    }
+
     /// The full propagation path for a dispatch to `receiver`; `None` is the target alone.
     fn event_path(
         &self,
@@ -174,6 +193,17 @@ pub trait TargetHooks: Any {
         false
     }
 }
+
+pub trait ActivationBehavior {
+    fn pre_activate(&mut self, _ctx: &mut Ctx) -> OpResult<()> { Ok(()) }
+    fn finish(self: Box<Self>, ctx: &mut Ctx, accepted: bool) -> OpResult<()>;
+}
+
+impl<F: FnOnce(&mut Ctx, bool) -> OpResult<()>> ActivationBehavior for F {
+    fn finish(self: Box<Self>, ctx: &mut Ctx, accepted: bool) -> OpResult<()> { (*self)(ctx, accepted) }
+}
+
+pub type PreparedActivation = Box<dyn ActivationBehavior>;
 
 /// The native state of an `EventTarget`: its listener list and optional host hooks.
 pub struct TargetData {
@@ -328,10 +358,11 @@ impl TargetData {
     pub fn for_each_deferred(&self, mut visit: impl FnMut(&Rc<dyn Any>) -> Option<Rc<dyn Any>>) {
         for listener in self.listeners.borrow().iter() {
             let mut callback = listener.callback.borrow_mut();
-            if let Callback::Deferred { source, compiled } = &mut *callback {
+            if let Callback::Deferred { source, .. } = &mut *callback {
                 if let Some(replacement) = visit(source) {
                     *source = replacement;
-                    *compiled = None;
+                    // Moving the source's native identity does not change an
+                    // already compiled callback or its originating realm.
                 }
             }
         }
@@ -958,7 +989,7 @@ fn dispatch_event(
     }
     // Native dispatch state owns observable target Values after dispatch. Make them edges of
     // this event wrapper rather than opaque external GC roots.
-    ctx.set_native_identity_owner::<Event>(event_value)?;
+    ctx.ensure_native_identity_owner::<Event>(event_value)?;
     event.dispatching.set(true);
     event.trusted.set(trusted);
     event.stopped.set(false);
@@ -969,6 +1000,7 @@ fn dispatch_event(
         event: event.clone(),
         value: event_value.clone(),
     };
+    let mut activation = None;
     let result = (|| {
         let path = match data.hooks.clone() {
             Some(hooks) => hooks.event_path(ctx, &data, &receiver, &event, &initial_target)?,
@@ -987,11 +1019,21 @@ fn dispatch_event(
                 clear_target: false,
             },
         };
+        for (index, entry) in path.entries.iter().enumerate() {
+            // A retargeted shadow boundary can supply an activation target
+            // even when the event does not bubble (DOM dispatch step 6.9.8).
+            if index != 0 && !event.bubbles.get() && !same(&entry.value, &entry.adjusted) { continue; }
+            if let Some(hooks) = entry.target.hooks() {
+                activation = hooks.activation_behavior(ctx, &entry.value, event_value)?;
+                if activation.is_some() { break; }
+            }
+        }
         *event.path.borrow_mut() = path
             .entries
             .iter()
             .map(|entry| (entry.value.clone(), entry.closed.clone()))
             .collect();
+        if let Some(activation) = activation.as_mut() { activation.pre_activate(ctx)?; }
         let enter = |event: &Event, entry: &PathEntry| {
             *event.target.borrow_mut() = entry.adjusted.clone();
             *event.related.borrow_mut() = entry.related.clone();
@@ -1007,12 +1049,12 @@ fn dispatch_event(
         }
         let own = &path.entries[0];
         if !event.stopped.get() {
-            *event.target.borrow_mut() = initial_target.clone();
+            *event.target.borrow_mut() = own.adjusted.clone();
             *event.related.borrow_mut() = own.related.clone();
             *event.visibility.borrow_mut() = own.closed.clone();
-            invoke(ctx, &mut source, &receiver, &data, true, 2)?;
+            invoke(ctx, &mut source, &own.value, &own.target, true, 2)?;
             if !event.immediate.get() {
-                invoke(ctx, &mut source, &receiver, &data, false, 2)?;
+                invoke(ctx, &mut source, &own.value, &own.target, false, 2)?;
             }
         }
         if !event.stopped.get() {
@@ -1045,6 +1087,12 @@ fn dispatch_event(
     *event.current.borrow_mut() = Value::Null;
     event.path.borrow_mut().clear();
     event.visibility.borrow_mut().clear();
+    if let Some(activation) = activation {
+        let accepted = result.as_ref().is_ok_and(|accepted| *accepted);
+        if let Err(error) = activation.finish(ctx, accepted) {
+            if result.is_ok() { return Err(error); }
+        }
+    }
     result
 }
 
@@ -1135,6 +1183,17 @@ fn invoke(
             }
             Ok(None) => {}
             Err(error) => {
+                if let Some(hooks) = &data.hooks { hooks.listener_exception(); }
+                // An ancestor listener can also throw while processing a
+                // platform operation rooted at the original event target.
+                if let Some(event) = source.event() {
+                    let original = event.target.borrow().clone();
+                    if let Ok((original_data, _)) = EventTarget::of_receiver(ctx, &original) {
+                        if !Rc::ptr_eq(data, &original_data) {
+                            if let Some(hooks) = &original_data.hooks { hooks.listener_exception(); }
+                        }
+                    }
+                }
                 let exception = error.to_value(ctx);
                 report_exception(ctx, exception);
             }
@@ -1186,7 +1245,14 @@ fn call_listener(
             }
             return Ok(None);
         }
-        let result = function.call(ctx, current.clone(), &[event_value])?;
+        let result = function.call(ctx, current.clone(), &[event_value.clone()])?;
+        if listener.handler == HandlerKind::Html {
+            if let Some(hooks) = data.hooks.clone() {
+                if hooks.handle_html_return(ctx, &listener.kind, &event_value, &result)? {
+                    return Ok(None);
+                }
+            }
+        }
         if listener.handler == HandlerKind::Html && matches!(result, Value::Bool(false)) {
             event.prevent_default();
         }
@@ -1271,4 +1337,88 @@ pub fn report_exception(ctx: &mut Ctx, exception: Value) {
         }
     }
     ctx.queue_microtask(rethrow);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct AliasPath(RefCell<Option<WeakValue>>);
+    impl TargetHooks for AliasPath {
+        fn as_any(&self) -> &dyn Any { self }
+        fn event_path(&self,_:&mut Ctx,data:&Rc<TargetData>,_:&Value,event:&Event,_:&Value) -> OpResult<Option<EventPath>> {
+            let alias=self.0.borrow().as_ref().and_then(WeakValue::upgrade)
+                .expect("published platform alias");
+            Ok(Some(EventPath { entries:vec![PathEntry {
+                value:alias.clone(),target:data.clone(),adjusted:alias,
+                closed:Vec::new(),related:event.related_original(),
+            }],clear_target:false }))
+        }
+    }
+
+    #[test]
+    fn specification_window_platform_path_alias_controls_at_target_identity_and_callback_receiver() {
+        let mut engine=lumen::Engine::new();
+        crate::globals::<super::super::bindings::Module>(engine.ctx()).ok().expect("event globals");
+        let hooks=Rc::new(AliasPath(RefCell::new(None)));
+        let data=TargetData::new(Some(hooks.clone()));
+        let source=engine.ctx().new_instance(EventTarget::from_data(data.clone()));
+        let alias=engine.ctx().new_instance(EventTarget::from_data(data));
+        *hooks.0.borrow_mut()=engine.ctx().weak_value(&alias);
+        let global=engine.ctx().global_this_value();
+        engine.ctx().set_member(&global,"source",source).ok().expect("source target");
+        engine.ctx().set_member(&global,"alias",alias).ok().expect("published alias");
+        let result=engine.eval_value(r#"(() => {
+            const calls=[];
+            const listener=function(event){calls.push([this===alias,event.target===alias,event.currentTarget===alias,event.eventPhase]);};
+            source.addEventListener('probe',listener,true);
+            source.addEventListener('probe',listener,false);
+            const event=new Event('probe');
+            const accepted=source.dispatchEvent(event);
+            return accepted && JSON.stringify(calls)==='[[true,true,true,2],[true,true,true,2]]' && event.target===alias && event.currentTarget===null;
+        })()"#).expect("script parses").ok().expect("platform alias dispatch");
+        assert!(matches!(result,Value::Bool(true)));
+    }
+
+    struct PhaseHooks;
+    struct PhaseAction { receiver: Value, event: Value }
+    impl ActivationBehavior for PhaseAction {
+        fn pre_activate(&mut self, ctx: &mut Ctx) -> OpResult<()> {
+            let path = ctx.with_instance::<Event, _>(&self.event,
+                |event| event.path.borrow().len())?;
+            if path == 0 { return Err(OpError::type_error("preactivation must see the constructed event path")); }
+            ctx.member_set(&self.receiver, "preactivated", Value::Bool(true)).map_err(OpError::thrown)?;
+            Ok(())
+        }
+        fn finish(self: Box<Self>, ctx: &mut Ctx, accepted: bool) -> OpResult<()> {
+            let clean = ctx.with_instance::<Event, _>(&self.event,
+                |event| !event.dispatching.get() && matches!(*event.current.borrow(), Value::Null) && event.path.borrow().is_empty())?;
+            ctx.member_set(&self.receiver, "finished", Value::Bool(clean)).map_err(OpError::thrown)?;
+            ctx.member_set(&self.receiver, "accepted", Value::Bool(accepted)).map_err(OpError::thrown)?;
+            Ok(())
+        }
+    }
+    impl TargetHooks for PhaseHooks {
+        fn as_any(&self) -> &dyn Any { self }
+        fn activation_behavior(&self, _: &mut Ctx, receiver: &Value, event: &Value) -> OpResult<Option<PreparedActivation>> {
+            Ok(Some(Box::new(PhaseAction { receiver: receiver.clone(), event: event.clone() })))
+        }
+    }
+    #[test]
+    fn specification_window_shared_activation_phases_surround_dispatch_and_reset_event_state() {
+        let mut engine=lumen::Engine::new();
+        crate::globals::<super::super::bindings::Module>(engine.ctx()).ok().expect("event globals");
+        let target=engine.ctx().new_instance(EventTarget::from_data(TargetData::new(Some(Rc::new(PhaseHooks)))));
+        let global=engine.ctx().global_this_value();
+        engine.ctx().set_member(&global,"target",target).ok().expect("activation target");
+        let result=engine.eval_value(r#"(() => {
+            target.addEventListener('click',event=>{
+                if(!target.preactivated || target.finished)throw new Error('activation ordering');
+                event.preventDefault();
+            });
+            const event=new Event('click',{cancelable:true});
+            return !target.dispatchEvent(event) && target.finished && target.accepted===false;
+        })()"#).unwrap().ok().expect("shared activation script");
+        assert!(matches!(result,Value::Bool(true)));
+    }
 }

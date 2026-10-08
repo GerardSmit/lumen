@@ -41,6 +41,10 @@ use lumen_host::{
 mod child_realm;
 mod console;
 mod esm;
+#[cfg(not(target_arch = "wasm32"))]
+mod stylesheet_loading;
+#[cfg(not(target_arch="wasm32"))]
+mod object_loading;
 #[cfg(all(feature = "parallel", not(target_os = "none")))]
 mod parallel;
 mod process;
@@ -48,14 +52,20 @@ mod process_env;
 pub mod tsconfig;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
+#[cfg(not(target_arch = "wasm32"))]
+mod worker_fonts;
+#[cfg(not(target_arch = "wasm32"))]
+pub use worker_fonts::FontResourceRequests;
 #[cfg(target_arch = "wasm32")]
 #[path = "worker_browser.rs"]
 mod worker;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use esm::fetch_network_module_resource;
+#[cfg(not(target_arch = "wasm32"))]
+pub use esm::{BrowserModuleClient, BrowserModuleFetch, fetch_browser_module_resource, prepare_browser_module_graph, BrowserModuleGraph, BrowserModuleGraphRequest, BrowserModuleGraphResource, fetch_browser_module_graph_resource};
 pub use esm::{
-    resolve_network_module_request, PrefetchedModuleResource, PrefetchedModuleResources,
+    resolve_network_module_request, resolve_browser_module_request, PrefetchedModuleResource, PrefetchedModuleResources,
 };
 
 /// js/error_shim.js, precompiled by build.rs.
@@ -90,6 +100,15 @@ fn install_queue_microtask(ctx: &mut Ctx) {
             _ => Err(interp.make_error("TypeError", "queueMicrotask expects a function")),
         },
     );
+}
+
+fn install_browser_timers(ctx: &mut Ctx) -> Result<(), Value> {
+    lumen_timers::install_browser(ctx, lumen_timers::BrowserHooks {
+        capture: |ctx, _, _| Ok(ctx.current_classic_script_context().unwrap_or_else(|| ctx.default_classic_script_context())),
+        eligible: |_| true,
+        script: |ctx, source, context| ctx.run_classic_script(source, context).map(|_| ()).map_err(lumen::embed::abrupt_value),
+        report: |ctx, error| lumen_html_js::DomRealm::report_browser_exception(ctx, error).is_some(),
+    }).map_err(|error| error.to_value(ctx))
 }
 
 pub use console::{describe_error, render_value, ConsoleOut};
@@ -279,6 +298,7 @@ pub struct Runtime {
     /// Browser embedders collect these and dispatch real Window tasks. Node keeps its fatal
     /// rejection policy unless this is explicitly enabled.
     browser_rejections: lumen_html_js::BrowserRejectionPolicy,
+    browser_stylesheet_documents: Rc<RefCell<Vec<std::rc::Weak<lumen_html_js::DomRealm>>>>,
     /// Worker globals admit rejection notifications as tasks of their own loop.
     worker_rejection_tasks: Rc<RefCell<VecDeque<lumen_html_js::BrowserRejectionTask>>>,
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
@@ -604,14 +624,17 @@ impl Runtime {
             );
         } else {
             install(&mut engine, &browser_extensions());
+            install_browser_timers(engine.ctx()).unwrap_or_else(|_| panic!("browser timer globals install"));
             // Preserve the existing genuine root Worker/SharedWorker service.
             install(&mut engine, &[worker::extension()]);
         }
         let browser_extensions: Rc<[Extension]> = browser_extensions().into();
         let browser_installer: HostRealmInstaller = Rc::new(move |ctx, realm| {
             lumen_host::install_realm_in_ctx(ctx, realm, &browser_extensions)?;
-            ctx.with_host_realm(realm, install_queue_microtask)
-                .map_err(|error| error.to_string())
+            ctx.with_host_realm(realm, |ctx| {
+                install_queue_microtask(ctx);
+                install_browser_timers(ctx).map_err(|_| "browser timer globals installation failed".to_owned())
+            }).map_err(|error| error.to_string())?
         });
         lumen_host::register_host_realm_installer(engine.ctx(), browser_installer);
         lumen_host::perf::mark(lumen_host::perf::Milestone::Environment);
@@ -680,6 +703,24 @@ impl Runtime {
         let interrupt_wake = interrupt
             .as_ref()
             .map(|handle| handle.subscribe(loop_wake(&tx)));
+        let browser_stylesheet_documents=Rc::new(RefCell::new(Vec::new()));
+        #[cfg(not(target_arch="wasm32"))]
+        {
+            let stylesheet_pool=pool.handle();
+            let stylesheet_wake=RuntimeWaker{wake:tx.clone()};
+            engine.ctx().op_state().put(lumen_html_js::stylesheet_loading::StylesheetEnvironment::new(move |ctx| {
+                let config=ctx.op_state().get::<lumen_web::FetchConfig>().cloned().unwrap_or_default();
+                Rc::new(stylesheet_loading::Provider::new(stylesheet_pool.clone(),stylesheet_wake.clone(),config))
+            },browser_stylesheet_documents.clone()));
+            let object_pool = pool.handle();
+            let object_wake = RuntimeWaker { wake: tx.clone() };
+            let object_bytes = lumen_common::limits::ByteBudget::new(32 * 1024 * 1024);
+            engine.ctx().op_state().put(lumen_html_js::object_loading::ObjectEnvironment::new(move |ctx| {
+                let config = ctx.op_state().get::<lumen_web::FetchConfig>().cloned().unwrap_or_default();
+                Rc::new(object_loading::Provider::new(object_pool.clone(), object_wake.clone(), config, object_bytes.clone()))
+            }, browser_stylesheet_documents.clone()));
+
+        }
         Runtime {
             engine,
             root_providers: providers,
@@ -701,6 +742,7 @@ impl Runtime {
             fire_rejection,
             fire_handled,
             browser_rejections: lumen_html_js::BrowserRejectionPolicy::default(),
+            browser_stylesheet_documents,
             worker_rejection_tasks: Rc::new(RefCell::new(VecDeque::new())),
             fatal_exit: None,
             fatal_error: None,
@@ -726,6 +768,12 @@ impl Runtime {
         realm: &lumen::embed::RealmHandle,
     ) -> Result<(), String> {
         lumen_host::install_registered_host_realm(self.engine.ctx(), realm)
+    }
+
+    /// Commit a browser's top-level realm between owner-loop turns.
+    pub fn replace_browser_root_realm(&mut self, realm: &lumen::embed::RealmHandle) -> Result<(), String> {
+        if self.root_providers != RootProviders::Browser { return Err("root realm replacement requires browser providers".into()); }
+        self.engine.ctx().replace_root_host_realm(realm).map(|_| ()).map_err(|error| error.to_string())
     }
 
     /// Cancel timers owned by a browser realm that is being navigated or discarded.
@@ -773,6 +821,15 @@ impl Runtime {
     pub fn register_browser_rejection_document(
         &mut self, realm: &Rc<lumen_html_js::DomRealm>,
     ) -> Result<(), String> {
+        #[cfg(not(target_arch="wasm32"))]
+        if !realm.has_stylesheet_resource_loader() {
+            let config=self.engine.ctx().op_state().get::<lumen_web::FetchConfig>().cloned().unwrap_or_default();
+            realm.set_stylesheet_resource_loader(Rc::new(stylesheet_loading::Provider::new(self.pool.handle(),self.waker(),config)));
+        }
+        self.browser_stylesheet_documents.borrow_mut().retain(|entry|entry.strong_count()!=0);
+        if !self.browser_stylesheet_documents.borrow().iter().any(|entry|entry.upgrade().is_some_and(|entry|Rc::ptr_eq(&entry,realm))) {
+            self.browser_stylesheet_documents.borrow_mut().push(Rc::downgrade(realm));
+        }
         lumen_html_js::register_document_rejection_sink(&mut self.browser_rejections, &mut self.engine, realm)
     }
 
@@ -883,6 +940,19 @@ impl Runtime {
         resolution_url: &str,
         prefetched: PrefetchedModuleResources,
     ) -> Result<lumen::ModuleEvaluationHandle, lumen::ParseError> {
+        self.eval_module_pending_with_prefetched_resources_and_context(source, record_key, module_url, resolution_url, prefetched, None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn eval_module_pending_with_prefetched_resources_and_context(
+        &mut self,
+        source: &str,
+        record_key: &str,
+        module_url: &str,
+        resolution_url: &str,
+        prefetched: PrefetchedModuleResources,
+        context: Option<std::rc::Rc<lumen::ClassicScriptContext>>,
+    ) -> Result<lumen::ModuleEvaluationHandle, lumen::ParseError> {
         let builtins = self.builtin_modules();
         let fetch_config = self
             .engine
@@ -896,15 +966,55 @@ impl Runtime {
             fetch_config,
             prefetched,
         );
-        let result = self.engine.eval_module_attrs_pending_with_base(
-            source,
-            record_key,
-            module_url,
-            resolution_url,
-            loader,
+        let evaluate = |engine: &mut lumen::Engine| engine.eval_module_attrs_pending_with_base(
+            source, record_key, module_url, resolution_url, loader,
         );
+        let result = match context {
+            Some(context) => self.engine.with_classic_script_context(context, evaluate),
+            None => evaluate(&mut self.engine),
+        };
         cache.forget_sources();
         result
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn install_browser_module_loader(
+        &mut self, client: BrowserModuleClient, prefetched: PrefetchedModuleResources,
+        violations: std::sync::Arc<std::sync::Mutex<Vec<lumen_common::csp::Violation>>>,
+    ) {
+        let loader = self.prepare_browser_module_loader(client, prefetched, violations);
+        self.engine.set_module_fetch_loader(move |request|loader(request));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_browser_module_loader(&mut self, client: BrowserModuleClient, prefetched: PrefetchedModuleResources,
+        violations: std::sync::Arc<std::sync::Mutex<Vec<lumen_common::csp::Violation>>>)
+        -> std::rc::Rc<dyn Fn(lumen::ModuleFetchRequest) -> Option<lumen::ModuleFetchResult>> {
+        self.prepare_browser_module_loader_with_client(move ||Some(client.clone()), prefetched, violations)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_browser_module_loader_with_client(&mut self, client: impl Fn() -> Option<BrowserModuleClient> + 'static,
+        prefetched: PrefetchedModuleResources, violations: std::sync::Arc<std::sync::Mutex<Vec<lumen_common::csp::Violation>>>)
+        -> std::rc::Rc<dyn Fn(lumen::ModuleFetchRequest) -> Option<lumen::ModuleFetchResult>> {
+        let config = self.engine.ctx().op_state().get::<lumen_web::FetchConfig>().cloned().unwrap_or_default();
+        let captured_map=self.engine.ctx().import_map_for_host();
+        std::rc::Rc::new(esm::make_browser_module_loader(move|| {
+            let mut client=client()?;
+            if client.import_map.is_none() {client.import_map=captured_map.clone();}
+            Some(client)
+        }, config, prefetched, violations))
+    }
+
+    /// Dispatch only resource I/O and ECMAScript request parsing. Deliver the plain completion
+    /// through the embedder's existing task transport, then call BrowserModuleGraph::complete
+    /// on its settings thread before dispatching children. Workers never wait on engine tasks.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn dispatch_browser_module_graph_resource(&self,request:BrowserModuleGraphRequest,
+        config:lumen_web::FetchConfig,resources:PrefetchedModuleResources,
+        complete:impl FnOnce(BrowserModuleGraphResource,Vec<lumen_common::csp::Violation>)+Send+'static) {
+        self.spawn_blocking_detached(move|| {
+            let (resource,reports)=esm::fetch_browser_module_graph_resource(request,&config,&resources);
+            complete(resource,reports);
+        });
     }
 
     /// Schedule blocking resource work on the process scheduler's shared blocking pool. The job
@@ -1274,9 +1384,17 @@ impl Runtime {
         self.engine.set_import_base(base);
         let result = if is_module {
             let loader = self.make_module_loader();
-            self.engine.eval_module_attrs(source, base, loader)
+            let context = Rc::new(lumen::ClassicScriptContext { base_url: base.to_owned(),
+                credentials_mode: "same-origin".into(), ..Default::default() });
+            self.engine.with_classic_script_context(context, |engine| engine.eval_module_attrs(source, base, loader))
         } else {
-            self.engine.eval(source, false)
+            let context = Rc::new(lumen::ClassicScriptContext { base_url: base.to_owned(),
+                credentials_mode: "same-origin".into(), ..Default::default() });
+            let result = self.engine.ctx().run_classic_script(source, context);
+            Ok(match result {
+                Ok(_) => Completion::Value(String::new()),
+                Err(error) => self.engine.describe_throw(lumen::embed::abrupt_value(error)),
+            })
         };
         // Drain the checkpoint from top-level code, but not the macrotask loop.
         self.checkpoint();
@@ -1322,14 +1440,15 @@ impl Runtime {
                     self.run_worker_rejection_task(task);
                 }
                 let now = Instant::now();
-                while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
+                while let Some(firing) = self.take_next_due_timer(now) {
                     progressed = true;
-                    self.fire_timer(&cb, &args, &owner);
+                    self.fire_timer_ticket(firing);
                 }
                 while let Ok(done) = self.completions.try_recv() {
                     progressed = true;
                     self.dispatch(done);
                 }
+                progressed |= self.drain_browser_tasks();
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1461,6 +1580,20 @@ impl Runtime {
         }
     }
 
+    /// Apply native document focus fixup at an embedder-supplied rendering
+    /// opportunity, before animation callbacks observe the rendered state.
+    pub fn update_html_rendering(
+        &mut self,
+        document: &Rc<lumen_html_js::DomRealm>,
+    ) -> Result<(), String> {
+        if document.rendering_blocked() {return Ok(())}
+        let owner = document.child_realm_handle().map_err(|error| format!("{error:?}"))?
+            .unwrap_or_else(|| self.engine.ctx().current_host_realm());
+        self.engine.ctx().with_host_realm(&owner, |ctx| document.update_rendered_focus(ctx))
+            .map_err(|error| format!("rendering realm failed: {error}"))?
+            .map_err(|error| format!("rendered focus update failed: {error:?}"))
+    }
+
     /// Run every turn that is ready now (microtasks, queued callbacks, due timers, delivered
     /// completions) and return without blocking, so a host that owns the thread (a browser tab)
     /// can hand control back and resume when [`LoopStatus::next_timer_ms`] elapses or a
@@ -1478,15 +1611,16 @@ impl Runtime {
                 self.fire(&cb, &args);
             }
             let now = Instant::now();
-            while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
+            while let Some(firing) = self.take_next_due_timer(now) {
                 if self.halted() {
                     break;
                 }
                 progressed = true;
-                self.fire_timer(&cb, &args, &owner);
+                self.fire_timer_ticket(firing);
             }
             self.reactor.poll();
             progressed |= self.drain_completions() > 0;
+            progressed |= self.drain_browser_tasks();
             if self.halted() || !(progressed || self.ticks_pending()) {
                 break;
             }
@@ -1557,14 +1691,15 @@ impl Runtime {
                     self.report_unhandled_rejections();
                 }
                 let now = Instant::now();
-                while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
+                while let Some(firing) = self.take_next_due_timer(now) {
                     if self.halted() {
                         return;
                     }
                     progressed = true;
-                    self.fire_timer(&cb, &args, &owner);
+                    self.fire_timer_ticket(firing);
                 }
                 progressed |= self.drain_completions() > 0;
+                progressed |= self.drain_browser_tasks();
                 if !progressed || self.halted() {
                     break;
                 }
@@ -1891,6 +2026,44 @@ impl Runtime {
         code(self)
     }
 
+    fn drain_browser_tasks(&mut self) -> bool {
+        let resources_progressed=self.drain_browser_stylesheets();
+        if self.root_providers != RootProviders::Browser
+            || !lumen_html_js::scheduling::task_pending(self.engine.ctx())
+        {
+            return resources_progressed;
+        }
+        for navigation_only in [true,false] {
+            for failure in lumen_html_js::scheduling::run_tasks_with_reporting(&mut self.engine,64,navigation_only) {
+                if !failure.reported {self.report_uncaught(&failure.value);}
+            }
+        }
+        true
+    }
+
+    fn drain_browser_stylesheets(&mut self)->bool {
+        self.browser_stylesheet_documents.borrow_mut().retain(|entry|entry.strong_count()!=0);
+        let mut progressed=false;
+        let document_count=self.browser_stylesheet_documents.borrow().len();
+        for index in 0..document_count {
+            let Some(document)=self.browser_stylesheet_documents.borrow()[index].upgrade() else {continue};
+            if document.is_document_destroyed() {continue}
+            let Ok(owner)=document.child_realm_handle() else {continue};
+            let owner=owner.unwrap_or_else(||self.engine.ctx().current_host_realm());
+            let result=self.engine.ctx().with_host_realm(&owner,|ctx| {
+                let count = document.queue_stylesheet_tasks(ctx).map_err(|error|error.to_value(ctx))?;
+                let objects = document.queue_object_tasks(ctx).map_err(|error|error.to_value(ctx))?;
+                Ok::<_,Value>(count + objects)
+            });
+            match result {
+                Ok(Ok(count))=>progressed|=count!=0,
+                Ok(Err(error))=>self.report_uncaught_in_realm(&error,&owner),
+                Err(_)=>{},
+            }
+        }
+        progressed
+    }
+
     fn ticks_pending(&mut self) -> bool {
         self.engine
             .ctx()
@@ -1900,6 +2073,12 @@ impl Runtime {
     }
 
     fn idle(&mut self) -> bool {
+        if self.browser_stylesheet_documents.borrow().iter().any(|entry|entry.upgrade().is_some_and(|document|!document.is_document_destroyed() && (document.stylesheet_resources_pending() || document.object_resources_pending()))) {return false}
+        if self.root_providers == RootProviders::Browser
+            && lumen_html_js::scheduling::task_pending(self.engine.ctx())
+        {
+            return false;
+        }
         if self.engine.has_pending_jobs() {
             return false;
         }
@@ -1935,11 +2114,11 @@ impl Runtime {
     fn take_next_due_timer(
         &mut self,
         now: Instant,
-    ) -> Option<(Value, Vec<Value>, lumen::embed::RealmHandle)> {
+    ) -> Option<lumen_timers::TimerFiring> {
         self.engine
             .ctx()
             .host_mut::<lumen_timers::Timers>()?
-            .take_next_due(now)
+            .take_next_firing(now)
     }
 
     fn next_timer_deadline(&mut self) -> Option<Instant> {
@@ -1967,8 +2146,12 @@ impl Runtime {
             return; // cancelled while in flight
         };
         match &settled.outcome {
+            owner_loop::Outcome::Complete => {},
             owner_loop::Outcome::Call { callback, args } => self.fire(callback, args),
-            owner_loop::Outcome::Uncaught(error) => self.report_uncaught(error),
+            owner_loop::Outcome::Uncaught(error) => match settled.owner.as_ref() {
+                Some(owner)=>self.report_uncaught_in_realm(error,owner),
+                None=>self.report_uncaught(error),
+            },
         }
         settled.finish(self.engine.ctx());
         self.checkpoint();
@@ -2057,6 +2240,7 @@ impl Runtime {
                 .get::<process::TickQueue>()
                 .is_some_and(|q| !q.queue.is_empty());
             if !more {
+                lumen_host::indexed_db::end_task(self.engine.ctx());
                 return;
             }
         }
@@ -2067,15 +2251,19 @@ impl Runtime {
     fn run_microtasks(&mut self) {
         loop {
             self.engine.run_microtasks();
-            let errors = self.engine.take_task_errors();
+            let errors = self.engine.take_task_errors_with_globals();
             if errors.is_empty() {
                 return;
             }
-            for e in errors {
+            for (e,global) in errors {
                 if self.halted() {
                     return;
                 }
-                self.report_uncaught(&e);
+                let owner=self.engine.ctx().host_realm_for_global(&global);
+                match owner {
+                    Some(owner)=>self.report_uncaught_in_realm(&e,&owner),
+                    None=>self.report_uncaught(&e),
+                }
             }
         }
     }
@@ -2096,23 +2284,55 @@ impl Runtime {
         self.fire_with_this(callback, this, args);
     }
 
-    fn fire_with_this(&mut self, callback: &Value, this: Value, args: &[Value]) {
-        if std::mem::take(&mut self.tick_recovery) {
-            self.checkpoint();
+    fn fire_timer_ticket(&mut self, firing: lumen_timers::TimerFiring) {
+        if !firing.is_browser() {
+            self.fire_timer(&firing.callback, &firing.args, &firing.owner);
+            return;
         }
-        if let Err(e) = self.engine.call_function(callback, this, args) {
-            self.report_uncaught(&e);
+        if let Some((error, owner)) = lumen_timers::run_browser_firing(self.engine.ctx(), firing) {
+            self.report_uncaught_in_realm(&error, &owner);
         }
         self.checkpoint();
         self.report_unhandled_rejections();
     }
 
-    /// An exception escaped the entry script or a loop-fired callback. A
-    /// `process.on('uncaughtException')` listener (or the HTML `onerror` returning `true`) owns
-    /// it and the loop continues; otherwise, as in Node, the error is printed and the process is
-    /// done: the loop stops and the exit code is 1.
+    fn fire_with_this(&mut self, callback: &Value, this: Value, args: &[Value]) {
+        if std::mem::take(&mut self.tick_recovery) {
+            self.checkpoint();
+        }
+        let owner=if self.root_providers==RootProviders::Browser {
+            lumen::embed::JsFunction::from_value(callback.clone())
+                .and_then(|function|self.engine.ctx().function_host_realm(&function).ok())
+                .or_else(||Some(self.engine.ctx().current_host_realm()))
+        } else {None};
+        if let Err(e) = self.engine.call_function(callback, this, args) {
+            match owner {
+                Some(owner)=>self.report_uncaught_in_realm(&e,&owner),
+                None=>self.report_uncaught(&e),
+            }
+        }
+        self.checkpoint();
+        self.report_unhandled_rejections();
+    }
+
+    /// An exception escaped a loop-fired callback. Native HTML globals report
+    /// through ErrorEvent and continue after default console reporting. Other
+    /// globals preserve the existing process/worker fatal-error policy.
     fn report_uncaught(&mut self, error: &Value) {
+        if self.root_providers==RootProviders::Browser
+            && lumen_html_js::DomRealm::report_browser_exception(self.engine.ctx(),error.clone()).is_some() {
+            return;
+        }
         self.report_fatal(error, "Uncaught", "uncaughtException");
+    }
+
+    fn report_uncaught_in_realm(&mut self,error:&Value,owner:&lumen::embed::RealmHandle) {
+        if self.root_providers==RootProviders::Browser {
+            let reported=self.engine.ctx().with_host_realm(owner,|ctx|
+                lumen_html_js::DomRealm::report_browser_exception(ctx,error.clone()));
+            if matches!(reported,Ok(Some(_))) {return;}
+        }
+        self.report_fatal(error,"Uncaught","uncaughtException");
     }
 
     fn report_fatal(&mut self, error: &Value, prefix: &str, origin: &str) {

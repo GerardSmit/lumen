@@ -201,7 +201,7 @@ impl ManualFontRegistry {
             }
         };
         let additional_bytes = match &source {
-                ManualFontSource::Binary(bytes)
+            ManualFontSource::Binary(bytes)
                 if !usage
                     .font_allocations
                     .contains(&(bytes.as_ptr() as *const () as usize)) =>
@@ -242,10 +242,7 @@ impl ManualFontRegistry {
 
     /// Add a live face to this context's `FontFaceSet`. Repeated addition is
     /// idempotent and preserves the original insertion order.
-    pub fn add_manual_face(
-        &mut self,
-        face: &ManualFontFaceState,
-    ) -> Result<bool, &'static str> {
+    pub fn add_manual_face(&mut self, face: &ManualFontFaceState) -> Result<bool, &'static str> {
         let identity = self.ensure_owned(face)?;
         if self.members.contains(&identity) {
             return Ok(false);
@@ -261,10 +258,7 @@ impl ManualFontRegistry {
         Ok(true)
     }
 
-    pub fn delete_manual_face(
-        &mut self,
-        face: &ManualFontFaceState,
-    ) -> Result<bool, &'static str> {
+    pub fn delete_manual_face(&mut self, face: &ManualFontFaceState) -> Result<bool, &'static str> {
         let identity = self.ensure_owned(face)?;
         let before = self.members.len();
         self.members.retain(|member| member != &identity);
@@ -400,10 +394,7 @@ impl ManualFontRegistry {
                         .checked_add(additional)
                         .is_none_or(|total| total > MAX_MANUAL_FONT_BYTES)
                 {
-                    (
-                        None,
-                        Some(Arc::from("manual font byte budget exceeded")),
-                    )
+                    (None, Some(Arc::from("manual font byte budget exceeded")))
                 } else {
                     (Some(decoded), None)
                 }
@@ -464,8 +455,11 @@ impl ManualFontRegistry {
             return Err("document CSS font face is missing its CSS identity");
         }
         let mut metadata_bytes = 0usize;
-        for rule in faces {
-            let bytes = rule_metadata_bytes(rule).ok_or("font metadata size overflow")?;
+        for (index,rule) in faces.iter().enumerate() {
+            if !rule.family_display.is_empty() && !faces[..index].iter().any(|old|Arc::ptr_eq(&old.family_display,&rule.family_display)) {
+                metadata_bytes=metadata_bytes.checked_add(shared_feature_metadata_bytes(&rule.family_display).ok_or("font metadata size overflow")?).ok_or("font metadata size overflow")?;
+            }
+            let bytes = rule_owned_metadata_bytes(rule).ok_or("font metadata size overflow")?;
             metadata_bytes = metadata_bytes
                 .checked_add(bytes)
                 .ok_or("font metadata size overflow")?;
@@ -541,10 +535,13 @@ impl ManualFontRegistry {
     }
 
     fn find_face(&self, identity: &FontFaceIdentity) -> Option<ManualFontFaceState> {
-        self.faces.iter().filter_map(Weak::upgrade).find_map(|data| {
-            let matches = data.borrow().identity == *identity;
-            matches.then_some(ManualFontFaceState { data })
-        })
+        self.faces
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|data| {
+                let matches = data.borrow().identity == *identity;
+                matches.then_some(ManualFontFaceState { data })
+            })
     }
 
     fn prune_dead_faces(&mut self) {
@@ -574,7 +571,8 @@ impl ManualFontRegistry {
                 .faces
                 .checked_add(1)
                 .ok_or("font registry size overflow")?;
-            let rule_bytes = rule_metadata_bytes(&data.rule).ok_or("font metadata size overflow")?;
+            let rule_bytes =
+                rule_metadata_bytes(&data.rule).ok_or("font metadata size overflow")?;
             usage.metadata_bytes = usage
                 .metadata_bytes
                 .checked_add(rule_bytes)
@@ -624,7 +622,10 @@ fn bounded_error(error: Arc<str>) -> Arc<str> {
     Arc::from(&error[..end])
 }
 
-fn rule_metadata_bytes(rule: &FontFaceRule) -> Option<usize> {
+fn rule_metadata_bytes(rule:&FontFaceRule)->Option<usize> {
+    rule_owned_metadata_bytes(rule)?.checked_add(shared_feature_metadata_bytes(&rule.family_display)?)
+}
+fn rule_owned_metadata_bytes(rule: &FontFaceRule) -> Option<usize> {
     let descriptors = &rule.descriptors;
     let mut bytes = 0usize;
     let mut add = |length: usize| -> Option<()> {
@@ -632,7 +633,10 @@ fn rule_metadata_bytes(rule: &FontFaceRule) -> Option<usize> {
         Some(())
     };
     add(descriptors.family.len())?;
-    add(descriptors.sources.len().checked_mul(core::mem::size_of::<FontFaceSource>())?)?;
+    add(descriptors
+        .sources
+        .len()
+        .checked_mul(core::mem::size_of::<FontFaceSource>())?)?;
     for source in descriptors.sources.iter() {
         add(match source {
             FontFaceSource::Url(value) | FontFaceSource::Local(value) => value.len(),
@@ -642,7 +646,6 @@ fn rule_metadata_bytes(rule: &FontFaceRule) -> Option<usize> {
         descriptors.weight_keyword.as_deref(),
         descriptors.stretch_keyword.as_deref(),
         descriptors.unicode_range.as_deref(),
-        Some(descriptors.feature_settings.as_ref()),
         Some(descriptors.variation_settings.as_ref()),
         rule.source_url.as_deref(),
     ]
@@ -651,16 +654,47 @@ fn rule_metadata_bytes(rule: &FontFaceRule) -> Option<usize> {
     {
         add(value.len())?;
     }
-    add(rule.import_path.len().checked_mul(core::mem::size_of::<usize>())?)?;
-    add(rule.media.len().checked_mul(core::mem::size_of::<Arc<str>>())?)?;
+    if let Some(settings) = descriptors.feature_settings.as_ref() {
+        add(2 * core::mem::size_of::<usize>() + core::mem::size_of_val(settings.as_ref()))?;
+        add(settings.retained_bytes())?;
+    }
+    if let Some(expressions) = descriptors.stretch_expressions.as_ref() {
+        add(2 * core::mem::size_of::<usize>() + core::mem::size_of_val(expressions.as_ref()))?;
+        for expression in expressions.iter() { add(expression.retained_bytes())?; }
+    }
+    add(rule
+        .import_path
+        .len()
+        .checked_mul(core::mem::size_of::<usize>())?)?;
+    add(rule
+        .media
+        .len()
+        .checked_mul(core::mem::size_of::<Arc<str>>())?)?;
     for value in rule.media.iter().chain(rule.supports.iter()) {
         add(value.len())?;
     }
-    add(rule.supports.len().checked_mul(core::mem::size_of::<Arc<str>>())?)?;
+    add(rule
+        .supports
+        .len()
+        .checked_mul(core::mem::size_of::<Arc<str>>())?)?;
     for value in rule.layers.iter() {
         add(value.len())?;
     }
-    add(rule.layers.len().checked_mul(core::mem::size_of::<String>())?)?;
+    add(rule
+        .layers
+        .len()
+        .checked_mul(core::mem::size_of::<String>())?)?;
+    if let Some(scope)=&rule.family_scope {add(core::mem::size_of_val(scope.as_ref()))?;}
+    Some(bytes)
+}
+fn shared_feature_metadata_bytes(rules:&[lumen_html::css::FontFamilyDisplayRule])->Option<usize> {
+    let mut bytes=core::mem::size_of_val(rules);
+    for rule in rules {
+        bytes=bytes.checked_add(core::mem::size_of_val(rule.families.as_ref()))?.checked_add(core::mem::size_of_val(rule.aliases.as_ref()))?;
+        for family in rule.families.iter() {bytes=bytes.checked_add(family.len())?;}
+        for alias in rule.aliases.iter() {bytes=bytes.checked_add(alias.name.len())?.checked_add(core::mem::size_of_val(alias.indices.as_ref()))?;}
+        for condition in rule.media.iter().chain(rule.supports.iter()) {bytes=bytes.checked_add(condition.len())?;}
+    }
     Some(bytes)
 }
 
@@ -694,9 +728,7 @@ mod tests {
         let before_completion = registry.generation();
         let decoded = Arc::new(FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap());
         assert_eq!(
-            registry
-                .complete_load(&face, Ok(decoded))
-                .unwrap(),
+            registry.complete_load(&face, Ok(decoded)).unwrap(),
             FontFaceStatus::Loaded
         );
         assert!(registry.generation() > before_completion);
@@ -761,9 +793,7 @@ mod tests {
         assert!(registry.update_manual_rule(&face, changed).unwrap());
         assert_eq!(face.rule().descriptors.family.as_ref(), "after");
         let long_error = Arc::<str>::from("é".repeat(MAX_FONT_ERROR_BYTES));
-        registry
-            .fail_manual_face(&face, long_error)
-            .unwrap();
+        registry.fail_manual_face(&face, long_error).unwrap();
         let snapshot = registry.snapshot().unwrap();
         assert_eq!(snapshot.manual_faces[0].status, FontFaceStatus::Error);
         let error = face.error().unwrap();

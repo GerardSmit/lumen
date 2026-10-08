@@ -14,6 +14,7 @@ const MAX_NESTED_FRAMES: usize = 32;
 pub enum CloneAttachment {
     Shared(SharedBufferHandle),
     Port(crate::ports::PortTransfer),
+    Native { kind: &'static str, payload: Option<Box<dyn std::any::Any + Send>> },
 }
 
 pub struct CloneMessage {
@@ -185,4 +186,103 @@ pub fn extension() -> Extension {
         js_init_snapshot: None,
         lazy_globals: &[],
     }
+}
+
+/// A realm-local native codec. Only the exported Rust capability crosses realms;
+/// matching and validation never consult author-controlled JS properties.
+#[derive(Clone, Copy)]
+pub struct NativeTransferCodec {
+    pub kind: &'static str,
+    pub matches: fn(&mut Ctx, &Value) -> bool,
+    pub validate: fn(&mut Ctx, &Value) -> Result<(), OpError>,
+    pub export: fn(&mut Ctx, &Value) -> Result<Box<dyn std::any::Any + Send>, OpError>,
+    pub detach: fn(&mut Ctx, &Value, &(dyn std::any::Any + Send)),
+    pub import: fn(&mut Ctx, Box<dyn std::any::Any + Send>) -> Result<Value, OpError>,
+}
+#[derive(Default)]
+struct NativeTransferCodecs(Vec<NativeTransferCodec>);
+pub fn register_native_codec(ctx: &mut Ctx, codec: NativeTransferCodec) {
+    if !ctx.op_state().has::<NativeTransferCodecs>() { ctx.op_state().put(NativeTransferCodecs::default()); }
+    let codecs = ctx.host_mut::<NativeTransferCodecs>().expect("native transfer registry");
+    if let Some(old) = codecs.0.iter_mut().find(|old| old.kind == codec.kind) { *old = codec; }
+    else { codecs.0.push(codec); }
+}
+pub(crate) fn native_codec(ctx: &mut Ctx, value: &Value) -> Option<NativeTransferCodec> {
+    let codecs = ctx.host_mut::<NativeTransferCodecs>().map(|codecs| codecs.0.clone()).unwrap_or_default();
+    codecs.into_iter().find(|codec| (codec.matches)(ctx, value))
+}
+pub(crate) fn reserve_native(ctx: &mut Ctx, kind: &'static str) -> Result<usize, OpError> {
+    stage(ctx, CloneAttachment::Native { kind, payload: None })
+}
+pub(crate) fn fill_native(ctx: &mut Ctx, index: usize, payload: Box<dyn std::any::Any + Send>) {
+    if let Some(CloneAttachment::Native { payload: slot, .. }) = state(ctx).outgoing.last_mut().and_then(|frame| frame.get_mut(index)) {
+        *slot = Some(payload);
+    }
+}
+pub(crate) fn import_native(ctx: &mut Ctx, index: usize) -> Result<Value, OpError> {
+    let attachment = state(ctx).incoming.get_mut(index).and_then(Option::take)
+        .ok_or_else(|| OpError::new("DataCloneError", "Native attachment absent or consumed"))?;
+    let CloneAttachment::Native { kind, payload: Some(payload) } = attachment else {
+        return Err(OpError::new("DataCloneError", "Invalid native attachment"));
+    };
+    let codec = ctx.host_mut::<NativeTransferCodecs>().and_then(|codecs| codecs.0.iter().find(|codec| codec.kind == kind).copied())
+        .ok_or_else(|| OpError::new("DataCloneError", "Native transfer interface unavailable"))?;
+    (codec.import)(ctx, payload)
+}
+
+/// Trusted byte-only native values also work in persistent storage. Codecs
+/// validate their private payload and may not invoke author clone hooks.
+#[derive(Clone, Copy)]
+pub struct NativeValueCodec {
+    pub kind: &'static str,
+    pub max_bytes: usize,
+    pub matches: fn(&mut Ctx, &Value) -> bool,
+    pub serialize: fn(&mut Ctx, &Value) -> Result<Vec<u8>, OpError>,
+    pub deserialize: fn(&mut Ctx, &[u8]) -> Result<Value, OpError>,
+}
+#[derive(Default)]
+struct NativeValueCodecs(Vec<NativeValueCodec>);
+pub fn register_native_value_codec(ctx: &mut Ctx, codec: NativeValueCodec) {
+    assert!(codec.kind.len() <= 256 && codec.max_bytes <= 64 * 1024 * 1024, "native codec budget");
+    if !ctx.op_state().has::<NativeValueCodecs>() { ctx.op_state().put(NativeValueCodecs::default()); }
+    let codecs = ctx.host_mut::<NativeValueCodecs>().expect("native value registry");
+    if let Some(old) = codecs.0.iter_mut().find(|old| old.kind == codec.kind) { *old = codec; }
+    else { codecs.0.push(codec); }
+}
+pub(crate) fn native_value_codec(ctx: &mut Ctx, value: &Value) -> Option<NativeValueCodec> {
+    let codecs = ctx.host_mut::<NativeValueCodecs>().map(|codecs| codecs.0.clone()).unwrap_or_default();
+    codecs.into_iter().find(|codec| (codec.matches)(ctx, value))
+}
+pub(crate) fn value_codec_for_kind(ctx: &mut Ctx, kind: &str) -> Option<NativeValueCodec> {
+    ctx.host_mut::<NativeValueCodecs>().and_then(|codecs| codecs.0.iter().find(|codec| codec.kind == kind).copied())
+}
+
+/// Native values with private sub-values use the normal clone graph, preserving
+/// aliases and back-references. Creation precedes reading children; population
+/// is a native operation and never invokes author setters.
+#[derive(Clone, Copy)]
+pub struct NativeGraphValueCodec {
+    pub kind: &'static str,
+    pub max_bytes: usize,
+    pub max_children: usize,
+    pub matches: fn(&mut Ctx, &Value) -> bool,
+    pub serialize: fn(&mut Ctx, &Value) -> Result<(Vec<u8>, Vec<Value>), OpError>,
+    pub create: fn(&mut Ctx, &[u8]) -> Result<Value, OpError>,
+    pub populate: fn(&mut Ctx, &Value, Vec<Value>) -> Result<(), OpError>,
+}
+#[derive(Default)]
+struct NativeGraphValueCodecs(Vec<NativeGraphValueCodec>);
+pub fn register_native_graph_value_codec(ctx: &mut Ctx, codec: NativeGraphValueCodec) {
+    assert!(codec.kind.len() <= 256 && codec.max_bytes <= 64 * 1024 * 1024 && codec.max_children <= 1024, "native graph codec budget");
+    if !ctx.op_state().has::<NativeGraphValueCodecs>() { ctx.op_state().put(NativeGraphValueCodecs::default()); }
+    let codecs = ctx.host_mut::<NativeGraphValueCodecs>().expect("native graph value registry");
+    if let Some(old) = codecs.0.iter_mut().find(|old| old.kind == codec.kind) { *old = codec; }
+    else { codecs.0.push(codec); }
+}
+pub(crate) fn native_graph_value_codec(ctx: &mut Ctx, value: &Value) -> Option<NativeGraphValueCodec> {
+    let codecs = ctx.host_mut::<NativeGraphValueCodecs>().map(|codecs| codecs.0.clone()).unwrap_or_default();
+    codecs.into_iter().find(|codec| (codec.matches)(ctx, value))
+}
+pub(crate) fn graph_value_codec_for_kind(ctx: &mut Ctx, kind: &str) -> Option<NativeGraphValueCodec> {
+    ctx.host_mut::<NativeGraphValueCodecs>().and_then(|codecs| codecs.0.iter().find(|codec| codec.kind == kind).copied())
 }

@@ -72,9 +72,11 @@ pub(super) struct Writer<'a> {
     bridge: &'a Bridge,
     transport: bool,
     port_indices: Vec<(Value, u32)>,
+    native_indices: Vec<(Value, u32)>,
     locals: &'a [Value],
     local: bool,
     transfer_clone: Value,
+    storage: bool,
 }
 
 impl<'a> Writer<'a> {
@@ -93,10 +95,18 @@ impl<'a> Writer<'a> {
             bridge,
             transport,
             port_indices: Vec::new(),
+            native_indices: Vec::new(),
             locals,
             local,
             transfer_clone: ctx.symbol_for(TRANSFER_CLONE),
+            storage: false,
         }
+    }
+
+    pub fn for_storage(ctx: &mut Ctx, bridge: &'a Bridge, limit: usize) -> Self {
+        let mut writer = Self::new(ctx, bridge, false, &[], false, limit);
+        writer.storage = true;
+        writer
     }
 
     /// The error of a message that passed the ceiling.
@@ -107,6 +117,8 @@ impl<'a> Writer<'a> {
     pub fn add_port(&mut self, port: Value, index: u32) {
         self.port_indices.push((port, index));
     }
+
+    pub fn add_native(&mut self, value: Value, index: u32) { self.native_indices.push((value, index)); }
 
     pub fn write_ports_header(&mut self) {
         if self.port_indices.is_empty() {
@@ -167,6 +179,39 @@ impl<'a> Writer<'a> {
             self.register(value);
             self.sink.u8(T_LOCAL);
             self.sink.u32(index as u32);
+            return Ok(());
+        }
+        if let Some(index) = self.native_indices.iter().find(|(native, _)| same_object(native, value)).map(|(_, index)| *index) {
+            self.register(value);
+            self.sink.u8(T_NATIVE_TRANSFER);
+            self.sink.u32(index);
+            return Ok(());
+        }
+        if clone_transfer::native_codec(ctx, value).is_some() {
+            return Err(clone_error("Native transferable requires its transfer-list entry"));
+        }
+        if let Some(codec) = clone_transfer::native_graph_value_codec(ctx, value) {
+            let (bytes, children) = (codec.serialize)(ctx, value)?;
+            if bytes.len() > codec.max_bytes || children.len() > codec.max_children {
+                return Err(clone_error("Native clone payload exceeds its budget"));
+            }
+            self.register(value);
+            self.sink.u8(T_NATIVE_GRAPH_VALUE);
+            self.sink.str(codec.kind);
+            self.sink.u32(bytes.len() as u32);
+            self.sink.raw(&bytes);
+            self.sink.u32(children.len() as u32);
+            for child in children { self.write(ctx, &child)?; }
+            return Ok(());
+        }
+        if let Some(codec) = clone_transfer::native_value_codec(ctx, value) {
+            let bytes = (codec.serialize)(ctx, value)?;
+            if bytes.len() > codec.max_bytes { return Err(clone_error("Native clone payload exceeds its byte budget")); }
+            self.register(value);
+            self.sink.u8(T_NATIVE_VALUE);
+            self.sink.str(codec.kind);
+            self.sink.u32(bytes.len() as u32);
+            self.sink.raw(&bytes);
             return Ok(());
         }
         let brand = ctx.clone_brand(value);
@@ -329,9 +374,12 @@ impl<'a> Writer<'a> {
             self.sink.raw(&snapshot.bytes);
             return Ok(());
         }
-        let method = ctx
-            .reflect_get(value, &self.transfer_clone, value)
-            .map_err(OpError::thrown)?;
+        let method = if self.storage {
+            Value::Undefined
+        } else {
+            ctx.reflect_get(value, &self.transfer_clone, value)
+                .map_err(OpError::thrown)?
+        };
         if method.is_callable() {
             self.register(value);
             let cloned = ctx

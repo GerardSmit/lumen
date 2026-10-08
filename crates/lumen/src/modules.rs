@@ -20,6 +20,114 @@ use crate::value::{Object, Property, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// The module map belongs to an environment settings object, not to the VM.
+/// Graph operations use the explicitly entered realm; delayed entry points must
+/// enter their captured settings before accessing this map.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct ModuleKey { url: Rc<str>, module_type: Option<Rc<str>> }
+impl ModuleKey {
+    pub(crate) fn module_type(&self) -> Option<&str> { self.module_type.as_deref() }
+    fn typed(url: String, module_type: Option<&str>) -> Self {
+        Self { url: url.into(), module_type: module_type.map(Rc::from) }
+    }
+}
+impl From<String> for ModuleKey { fn from(url: String) -> Self { Self::typed(url, None) } }
+impl From<&str> for ModuleKey { fn from(url: &str) -> Self { Self::from(url.to_owned()) } }
+impl std::ops::Deref for ModuleKey { type Target = str; fn deref(&self)->&str { &self.url } }
+impl std::fmt::Display for ModuleKey { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { std::fmt::Display::fmt(self.url.as_ref(),f) } }
+impl PartialEq<str> for ModuleKey { fn eq(&self,other:&str)->bool { self.module_type.is_none() && self.url.as_ref()==other } }
+impl PartialEq<&str> for ModuleKey { fn eq(&self,other:&&str)->bool { self.module_type.is_none() && self.url.as_ref()==*other } }
+pub(crate) trait ModuleLookup {
+    fn url(&self) -> &str;
+    fn module_type(&self) -> Option<&str> { None }
+}
+impl ModuleLookup for str { fn url(&self)->&str { self } }
+impl ModuleLookup for String { fn url(&self)->&str { self } }
+impl ModuleLookup for Rc<str> { fn url(&self)->&str { self } }
+impl<K:ModuleLookup+?Sized> ModuleLookup for &K {
+    fn url(&self)->&str { (*self).url() }
+    fn module_type(&self)->Option<&str> { (*self).module_type() }
+}
+impl ModuleLookup for ModuleKey {
+    fn url(&self)->&str { &self.url }
+    fn module_type(&self)->Option<&str> { ModuleKey::module_type(self) }
+}
+pub(crate) struct ModuleBucket<T> {
+    javascript: Option<(ModuleKey,T)>,
+    typed: HashMap<String,(ModuleKey,T)>,
+}
+impl<T> Default for ModuleBucket<T> {
+    fn default()->Self { Self { javascript:None,typed:HashMap::new() } }
+}
+impl<T> ModuleBucket<T> {
+    fn entries(&self)->impl Iterator<Item=&(ModuleKey,T)> { self.javascript.iter().chain(self.typed.values()) }
+    fn get(&self,kind:Option<&str>)->Option<&T> {
+        match kind { None=>self.javascript.as_ref(),Some(kind)=>self.typed.get(kind) }.map(|(_,value)|value)
+    }
+    fn get_mut(&mut self,kind:Option<&str>)->Option<&mut T> {
+        match kind { None=>self.javascript.as_mut(),Some(kind)=>self.typed.get_mut(kind) }.map(|(_,value)|value)
+    }
+}
+type ModuleEntries<T> = HashMap<Rc<str>, ModuleBucket<T>>;
+pub(crate) struct SettingsModuleMap<T> { settings: usize, maps: HashMap<usize, ModuleEntries<T>> }
+
+impl<T> Default for SettingsModuleMap<T> {
+    fn default() -> Self {
+        Self { settings: 0, maps: HashMap::new() }
+    }
+}
+
+impl<T> SettingsModuleMap<T> {
+    pub(crate) fn select(&mut self, settings: usize) { self.settings = settings; }
+    pub(crate) fn for_settings(&self, settings: usize) -> impl Iterator<Item = &T> {
+        self.maps.get(&settings).into_iter().flat_map(|urls|urls.values()).flat_map(ModuleBucket::entries).map(|(_,value)|value)
+    }
+    pub(crate) fn all_values(&self) -> impl Iterator<Item = &T> {
+        self.maps.values().flat_map(|urls|urls.values()).flat_map(ModuleBucket::entries).map(|(_,value)|value)
+    }
+    pub(crate) fn remove_settings(&mut self, settings: usize) -> Option<ModuleEntries<T>> {
+        self.maps.remove(&settings)
+    }
+    pub(crate) fn get<K: ModuleLookup + ?Sized>(&self, key:&K)->Option<&T> {
+        self.maps.get(&self.settings)?.get(key.url())?.get(key.module_type())
+    }
+    pub(crate) fn get_mut<K: ModuleLookup + ?Sized>(&mut self,key:&K)->Option<&mut T> {
+        self.maps.get_mut(&self.settings)?.get_mut(key.url())?.get_mut(key.module_type())
+    }
+    pub(crate) fn contains_key<K: ModuleLookup + ?Sized>(&self,key:&K)->bool { self.get(key).is_some() }
+    pub(crate) fn insert(&mut self,key:impl Into<ModuleKey>,value:T)->Option<T> {
+        let key=key.into();
+        let bucket = self.maps.entry(self.settings).or_default().entry(key.url.clone()).or_default();
+        match key.module_type.clone() {
+            None=>bucket.javascript.replace((key,value)),
+            Some(kind)=>bucket.typed.insert(kind.to_string(),(key,value)),
+        }.map(|(_,value)|value)
+    }
+    pub(crate) fn remove<K: ModuleLookup + ?Sized>(&mut self,key:&K)->Option<T> {
+        let bucket = self.maps.get_mut(&self.settings)?.get_mut(key.url())?;
+        match key.module_type() { None=>bucket.javascript.take(),Some(kind)=>bucket.typed.remove(kind) }.map(|(_,value)|value)
+    }
+    pub(crate) fn values(&self)->impl Iterator<Item=&T> { self.for_settings(self.settings) }
+    #[cfg(feature = "compiler")]
+    pub(crate) fn iter(&self)->impl Iterator<Item=(&ModuleKey,&T)> {
+        self.maps.get(&self.settings).into_iter().flat_map(|urls|urls.values()).flat_map(ModuleBucket::entries).map(|(key,value)|(key,value))
+    }
+    pub(crate) fn len(&self)->usize { self.values().count() }
+    #[cfg(test)]
+    pub(crate) fn clear(&mut self) { self.maps.remove(&self.settings); }
+}
+impl<T,K:ModuleLookup+?Sized> std::ops::Index<&K> for SettingsModuleMap<T> {
+    type Output=T;
+    fn index(&self,key:&K)->&T { self.get(key).expect("registered module") }
+}
+
+#[derive(Clone)]
+pub(crate) struct DeferredModuleKey {
+    pub(crate) settings: usize,
+    pub(crate) key: ModuleKey,
+}
+pub(crate) type ModuleSyntheticFactory = Rc<dyn Fn(&mut Interp,&str)->Result<Value,Value>>;
+
 /// How a module-namespace property reads its current value.
 #[derive(Clone)]
 pub enum NsBinding {
@@ -35,35 +143,35 @@ pub(crate) struct ModuleRec {
     body: Rc<Vec<Stmt>>,
     /// Evaluation metadata survives retirement of the one-shot initialization AST.
     has_tla: bool,
-    retired_eager_named: Option<Vec<String>>,
-    retired_eager_order: Option<Vec<String>>,
+    retired_eager_named: Option<Vec<ModuleKey>>,
+    retired_eager_order: Option<Vec<ModuleKey>>,
     /// The source the body was parsed from, for its stack-trace frame (see `stack_trace`).
     src: Option<Rc<str>>,
     env: Env,
     pub ns: Value,
     meta: Value,
     /// Dependency keys in source order (drives depth-first evaluation).
-    dep_keys: Vec<String>,
+    dep_keys: Vec<ModuleKey>,
     /// Specifier → resolved canonical key, for this module's own import/export-from clauses.
-    resolved: HashMap<String, String>,
+    resolved: HashMap<ModuleKey, ModuleKey>,
     /// `export name → local name` for names declared/defined in this module.
     local_exports: HashMap<String, String>,
     /// Local names that are themselves imports, so a re-export resolves through to the origin
     /// binding (spec: `import * as x; export {x}` resolves to the imported module's namespace).
     imports: HashMap<String, ImportOrigin>,
     /// `export name → (dependency key, imported name)` for `export { x } from 'dep'`.
-    indirect: HashMap<String, (String, String)>,
+    indirect: HashMap<String, (ModuleKey, String)>,
     /// `export name → dependency key` for `export * as name from 'dep'`.
-    star_as: HashMap<String, String>,
+    star_as: HashMap<String, ModuleKey>,
     /// Dependency keys of `export * from 'dep'` clauses.
-    stars: Vec<String>,
+    stars: Vec<ModuleKey>,
     linked: bool,
     evaluated: bool,
     evaluating: bool,
     eval_error: Option<Value>,
     /// Dependency keys imported *only* via `import defer` — skipped during this module's
     /// evaluation phase (they evaluate on first namespace access instead).
-    deferred_deps: Vec<String>,
+    deferred_deps: Vec<ModuleKey>,
     /// For a dynamically-imported module evaluating in a coroutine (top-level await): the promise
     /// that settles when the body finishes.
     top_promise: Option<Value>,
@@ -74,13 +182,23 @@ pub(crate) struct ModuleRec {
     /// Position in the async execution queue ([[AsyncEvaluationOrder]]).
     async_order: Option<u64>,
     /// Importers waiting on this module ([[AsyncParentModules]]).
-    async_parents: Vec<String>,
+    async_parents: Vec<ModuleKey>,
     /// Tarjan bookkeeping for the evaluation DFS ([[DFSIndex]] / [[DFSAncestorIndex]]).
     dfs_index: Option<usize>,
     dfs_anc: usize,
     on_stack: bool,
     /// The root of this module's strongly-connected component ([[CycleRoot]]).
-    cycle_root: Option<String>,
+    cycle_root: Option<ModuleKey>,
+}
+
+impl ModuleRec {
+    pub(crate) fn visit_values(&self, mut visit: impl FnMut(&Value)) {
+        visit(&self.ns);
+        visit(&self.meta);
+        if let Some(value) = &self.eval_error { visit(value); }
+        if let Some(value) = &self.top_promise { visit(value); }
+    }
+    pub(crate) fn environment(&self) -> &Env { &self.env }
 }
 
 #[cfg(feature = "compiler")]
@@ -96,11 +214,11 @@ impl ModuleRec {
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).
 enum ImportOrigin {
     /// `import * as x from 'dep'` — resolves to `dep`'s namespace object.
-    Namespace(String),
+    Namespace(ModuleKey),
     /// `import defer * as x from 'dep'` — resolves to `dep`'s DEFERRED namespace object.
-    DeferNamespace(String),
+    DeferNamespace(ModuleKey),
     /// `import { y as x } from 'dep'` / `import x from 'dep'` — resolves to `dep`'s export `y`.
-    Named(String, String),
+    Named(ModuleKey, String),
 }
 
 /// The result of resolving an export name (spec ResolveExport).
@@ -108,7 +226,7 @@ enum Resolution {
     /// A concrete binding: `local` in the given module scope.
     Local(Env, String),
     /// A re-exported `import defer * as ns` binding: the dep's DEFERRED namespace.
-    DeferNs(String),
+    DeferNs(ModuleKey),
     /// A namespace object (a star-as re-export target).
     Ns(Value),
     /// Two star re-exports provide the name with different bindings.
@@ -125,6 +243,95 @@ enum EsmHook {
 }
 
 impl Interp {
+    pub fn install_module_api_base_for_host(&mut self,base:Rc<dyn Fn()->String>) {
+        self.module_api_bases.insert(Gc::as_ptr(&self.global) as usize,base);
+    }
+    fn module_api_base_for_host(&self)->String {
+        self.module_api_bases.get(&(Gc::as_ptr(&self.global) as usize))
+            .map_or_else(||self.import_base.clone(),|base|base())
+    }
+    /// Import maps belong to the Window's settings, including retained module functions.
+    pub fn ensure_import_map_for_host(&mut self) -> lumen_common::import_maps::SharedImportMap {
+        self.import_maps.entry(Gc::as_ptr(&self.global) as usize)
+            .or_insert_with(lumen_common::import_maps::ImportMapState::shared).clone()
+    }
+    pub fn import_map_for_host(&self) -> Option<lumen_common::import_maps::SharedImportMap> {
+        self.import_maps.get(&(Gc::as_ptr(&self.global) as usize)).cloned()
+    }
+    pub fn resolve_module_specifier_for_host(&mut self, specifier: &str, base: &str)
+        -> Result<Option<lumen_common::import_maps::Resolution>, Abrupt> {
+        let Some(map)=self.import_map_for_host() else { return Ok(None); };
+        let result=map.lock().map_err(|_| "import-map state is unavailable".to_owned())
+            .and_then(|mut map|map.resolve(specifier,base).map_err(|error|error.to_string()));
+        result.map(Some).map_err(|error|self.throw("TypeError",error))
+    }
+    /// Install a plain host loader on the actually entered settings object.
+    pub fn install_module_fetch_loader(&mut self,
+        loader: Rc<dyn Fn(crate::ModuleFetchRequest) -> Option<crate::ModuleFetchResult>>) {
+        self.module_fetch_loaders.insert(Gc::as_ptr(&self.global) as usize, loader);
+    }
+    /// Capture the entered settings object's host fetch service. Worklets can
+    /// reuse the embedder's policy, routing and response decoding in an isolated
+    /// realm without inheriting Window globals or the Window's module map.
+    pub fn module_fetch_loader_for_host(&self)
+        -> Option<Rc<dyn Fn(crate::ModuleFetchRequest) -> Option<crate::ModuleFetchResult>>> {
+        self.module_fetch_loaders.get(&(Gc::as_ptr(&self.global) as usize)).cloned()
+    }
+    pub fn install_module_synthetic_factory(&mut self,kind:&str,
+        factory:Rc<dyn Fn(&mut Interp,&str)->Result<Value,Value>>) {
+        self.module_synthetic_factories.entry(Gc::as_ptr(&self.global) as usize).or_default().insert(kind.into(),factory);
+    }
+    #[cfg(feature = "embed")]
+    pub fn install_async_module_import_handler(&mut self, handler: Rc<dyn Fn(crate::AsyncModuleImportRequest)>) {
+        self.async_module_import_handlers.insert(Gc::as_ptr(&self.global) as usize, handler);
+    }
+    #[cfg(feature = "embed")]
+    pub fn cancel_async_module_imports_for_realm(&mut self, realm: &crate::embed::RealmHandle) {
+        let key = realm.key();
+        self.pending_async_module_imports.retain(|_, (request, _, _)|request.settings_key != key);
+        self.async_module_import_handlers.remove(&key);
+        self.import_maps.remove(&key);
+        self.module_api_bases.remove(&key);
+        self.module_synthetic_factories.remove(&key);
+        // Retained author functions may still name this retired settings
+        // object. Keep a root-free rejecting host registration so they cannot
+        // fall through to the process's unrelated legacy Node loader.
+        self.module_fetch_loaders.insert(key,Rc::new(|_|None));
+    }
+    #[cfg(feature = "embed")]
+    pub fn complete_prepared_module_import_for_host(&mut self, id: u64) -> Result<crate::ModuleEvaluationHandle, String> {
+        let (namespace, promise) = self.complete_async_module_import(id, |_,_,_|None)?;
+        Ok(crate::ModuleEvaluationHandle { namespace, promise })
+    }
+    #[cfg(feature = "embed")]
+    pub fn reject_prepared_module_import_for_host(&mut self, id: u64, reason: &str) -> Result<(), String> {
+        self.reject_async_module_import(id, reason)
+    }
+    #[cfg(feature = "embed")]
+    pub fn has_pending_module_import_for_host(&self, id: u64) -> bool {
+        self.pending_async_module_imports.contains_key(&id)
+    }
+    #[cfg(feature = "embed")]
+    pub fn run_prepared_module_for_host(&mut self, source: &str, record_key: &str, module_url: &str,
+        resolution_url: &str, context: Option<Rc<crate::ClassicScriptContext>>)
+        -> Result<crate::ModuleEvaluationHandle, crate::ParseError> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(crate::ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+        }
+        let previous = std::mem::replace(&mut self.classic_script_context, context);
+        let result = self.start_module_with_base(record_key, source, module_url, resolution_url, true);
+        self.classic_script_context = previous;
+        let (namespace, promise) = match result {
+            Ok(pair) => pair,
+            Err(error) => {
+                let promise = self.new_promise();
+                self.observe_promise_for_host(&promise);
+                self.reject_promise(&promise, crate::interpreter::abrupt_value(error));
+                (Value::Undefined, promise)
+            }
+        };
+        Ok(crate::ModuleEvaluationHandle { promise, namespace })
+    }
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
@@ -164,6 +371,8 @@ impl Interp {
         resolution_url: &str,
         observe_for_host: bool,
     ) -> Result<(Value, Value), Abrupt> {
+        let identity = ModuleKey::from(record_key);
+        let record_key = &identity;
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first. A graph
         // that fails to parse or link registers nothing, so importing it again fails again.
@@ -173,6 +382,8 @@ impl Interp {
             module_url,
             resolution_url,
         )?;
+        // Parsed module failures retain their original exception. Incomplete
+        // linked graphs are pruned before another attempt.
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
         // evaluates through the async machinery (awaits interleave with the job queue, an async
         // module doesn't block siblings, ancestors run in [[AsyncEvaluationOrder]]); a fully
@@ -197,11 +408,11 @@ impl Interp {
     }
 
     /// Every module in `key`'s dependency graph (including itself), depth-first.
-    fn collect_graph(&self, key: &str, out: &mut Vec<String>) {
+    fn collect_graph(&self, key: &ModuleKey, out: &mut Vec<ModuleKey>) {
         if out.iter().any(|k| k == key) {
             return;
         }
-        out.push(key.to_string());
+        out.push(key.clone());
         if let Some(rec) = self.module_recs.get(key) {
             for d in rec.dep_keys.clone() {
                 self.collect_graph(&d, out);
@@ -213,11 +424,11 @@ impl Interp {
     /// batch Evaluate() will execute, and therefore the ones whose evaluation promises may be
     /// pre-created. A deferred-only member must NOT get an orphan pending promise, or a later
     /// dynamic import of it would wait forever instead of evaluating it.
-    fn collect_eager_graph(&self, key: &str, out: &mut Vec<String>) {
+    fn collect_eager_graph(&self, key: &ModuleKey, out: &mut Vec<ModuleKey>) {
         if out.iter().any(|k| k == key) {
             return;
         }
-        out.push(key.to_string());
+        out.push(key.clone());
         if let Some(rec) = self.module_recs.get(key) {
             let deferred = rec.deferred_deps.clone();
             let eager_named = self.eager_named_deps(key);
@@ -232,7 +443,7 @@ impl Interp {
     }
 
     /// Dependencies named by at least one non-defer import/export-from clause.
-    fn eager_named_deps(&self, key: &str) -> Vec<String> {
+    fn eager_named_deps(&self, key: &ModuleKey) -> Vec<ModuleKey> {
         let rec = match self.module_recs.get(key) {
             Some(r) => r,
             None => return Vec::new(),
@@ -240,7 +451,7 @@ impl Interp {
         if let Some(eager) = &rec.retired_eager_named {
             return eager.clone();
         }
-        let mut eager: Vec<String> = Vec::new();
+        let mut eager: Vec<ModuleKey> = Vec::new();
         for stmt in rec.body.iter() {
             let (spec, defers) = match stmt {
                 Stmt::Import(decl) => (
@@ -254,7 +465,7 @@ impl Interp {
                 Stmt::ExportNamed {
                     source: Some(src), ..
                 }
-                | Stmt::ExportAll { source: src, .. } => (src.to_string(), false),
+                | Stmt::ExportAll { source: src, .. } => (ModuleKey::from(src.as_ref()), false),
                 _ => continue,
             };
             if defers {
@@ -277,22 +488,21 @@ impl Interp {
     #[cfg(test)]
     fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
         let mut added = Vec::new();
-        let result = self.parse_and_register_graph(key, key, key, src, &mut added);
+        let result = self.parse_and_register_graph(&ModuleKey::from(key), key, key, src, &mut added);
+        let result = result.and_then(|()| match self.module_recs.get(key).and_then(|record|record.eval_error.clone()) {
+            Some(error)=>Err(Abrupt::Throw(error)),None=>Ok(()),
+        });
         if result.is_err() {
             self.discard_modules(added);
         }
         result
     }
 
-    /// Parse and link as one unit: a failure in either phase discards every record the call
-    /// registered, so none stays marked linked with imports that were never wired.
-    fn parse_and_link(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
-        self.parse_and_link_at(key, src, key)
-    }
-
+    /// Parse and link as one unit. Cache actual parse errors, but discard incomplete
+    /// graph records so no importer remains linked to bindings that were never wired.
     fn parse_and_link_at(
         &mut self,
-        key: &str,
+        key: &ModuleKey,
         src: Option<String>,
         module_url: &str,
     ) -> Result<(), Abrupt> {
@@ -301,7 +511,7 @@ impl Interp {
 
     fn parse_and_link_at_with_base(
         &mut self,
-        key: &str,
+        key: &ModuleKey,
         src: Option<String>,
         module_url: &str,
         resolution_url: &str,
@@ -319,8 +529,9 @@ impl Interp {
     /// A record is registered before its dependencies are parsed (so cycles resolve), so a
     /// failure deeper in the graph would otherwise leave records naming unregistered
     /// dependencies, and a later import of them would link against missing keys.
-    fn discard_modules(&mut self, keys: Vec<String>) {
+    fn discard_modules(&mut self, keys: Vec<ModuleKey>) {
         for k in keys {
+            if self.module_recs.get(&k).is_some_and(|record|record.eval_error.is_some()) { continue; }
             self.module_recs.remove(&k);
             self.modules.remove(&k);
         }
@@ -328,29 +539,41 @@ impl Interp {
 
     fn parse_and_register_graph(
         &mut self,
-        key: &str,
+        key: &ModuleKey,
         module_url: &str,
         resolution_url: &str,
         src: Option<String>,
-        added: &mut Vec<String>,
+        added: &mut Vec<ModuleKey>,
     ) -> Result<(), Abrupt> {
         if self.module_recs.contains_key(key) {
             return Ok(());
         }
-        let src = match src {
+        let mut src = match src {
             Some(s) => s,
             None => return Err(self.throw("TypeError", format!("module not found: {key}"))),
         };
         // A module from a loaded precompiled bundle decodes its AST instead of parsing.
         let t_parse = std::time::Instant::now();
-        let body = match crate::precompiled::module_body(self, key) {
+        let source_len=src.len();
+        let parsed = (|| -> Result<_,Abrupt> {
+        let synthetic_default = if key.module_type() == Some("text") {
+            Some(Value::from_string(std::mem::take(&mut src)))
+        } else if key.module_type() == Some("json") {
+            Some(crate::builtins::parse_json_module_default(self,&src).map_err(Abrupt::Throw)?)
+        } else if key.module_type() == Some("css") {
+            let factory = self.module_synthetic_factories.get(&(Gc::as_ptr(&self.global) as usize))
+                .and_then(|factories|factories.get("css")).cloned()
+                .ok_or_else(||self.throw("TypeError","CSS module factory is not installed in these settings"))?;
+            Some(factory(self,&src).map_err(Abrupt::Throw)?)
+        } else { None };
+        let body = if synthetic_default.is_some() { Vec::new() } else { match crate::precompiled::module_body(self, key) {
             Some(decoded) => decoded.map_err(|e| self.throw("SyntaxError", e))?,
             None if crate::parser::jsx_path(key).is_some()
-                || self.jsx_module_keys.contains_key(key) =>
+                || self.jsx_module_keys.contains_key(key.url.as_ref()) =>
             {
                 let ts = self
                     .jsx_module_keys
-                    .get(key)
+                    .get(key.url.as_ref())
                     .copied()
                     .or_else(|| crate::parser::jsx_path(key))
                     .unwrap_or(false);
@@ -382,27 +605,38 @@ impl Interp {
                 .map_err(|e| self.throw_ts_syntax(e, &file_url(key), &src))?,
             None => crate::parser::parse_module(&src)
                 .map_err(|e| self.throw("SyntaxError", e.message))?,
+        } };
+        Ok((synthetic_default,body))
+        })();
+        let (synthetic_default,body,parse_error)=match parsed {
+            Ok((default,body))=>(default,body,None),
+            Err(error)=>(None,Vec::new(),Some(crate::interpreter::abrupt_value(error))),
         };
-        load_stats::add(&load_stats::PARSE, t_parse, src.len());
-        let module_src = self.adopt_parsed_source(
+        load_stats::add(&load_stats::PARSE, t_parse, source_len);
+        let module_src = if synthetic_default.is_some() || parse_error.is_some() { None } else { self.adopt_parsed_source(
             Some(&crate::interpreter::stack_trace::module_display_name(
                 module_url,
             )),
             0,
-        );
+        ) };
+        if let (Some(source), Some(context)) = (&module_src, &self.classic_script_context) {
+            let mut context = context.as_ref().clone();
+            context.base_url = resolution_url.to_owned();
+            self.set_source_script_context(source, Rc::new(context));
+        }
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so
         // the export tables can name dependencies by key. Duplicate specifiers resolve once.
-        let mut resolved: HashMap<String, String> = HashMap::new();
-        let mut dep_keys: Vec<String> = Vec::new();
-        let mut dep_srcs: Vec<(String, String)> = Vec::new();
+        let mut resolved: HashMap<ModuleKey, ModuleKey> = HashMap::new();
+        let mut dep_keys: Vec<ModuleKey> = Vec::new();
+        let mut dep_srcs: Vec<(ModuleKey, String, Option<Rc<crate::ClassicScriptContext>>)> = Vec::new();
         // A dependency evaluates lazily only if *every* clause naming it is an `import defer`.
-        let mut defer_specs: HashMap<String, bool> = HashMap::new();
+        let mut defer_specs: HashMap<ModuleKey, bool> = HashMap::new();
         for stmt in body.iter() {
             let (spec, defers) = match stmt {
                 Stmt::Import(decl) => (
-                    decl.source.to_string(),
+                    dep_map_key(&decl.source, decl.attr_type.as_deref()),
                     !decl.specs.is_empty()
                         && decl
                             .specs
@@ -412,7 +646,7 @@ impl Interp {
                 Stmt::ExportNamed {
                     source: Some(src), ..
                 }
-                | Stmt::ExportAll { source: src, .. } => (src.to_string(), false),
+                | Stmt::ExportAll { source: src, .. } => (ModuleKey::from(src.as_ref()), false),
                 _ => continue,
             };
             let e = defer_specs.entry(spec).or_insert(true);
@@ -428,22 +662,21 @@ impl Interp {
             // The host-defined '<module source>' specifier resolves only in the source phase: it
             // gets a ModuleSource object but no module record.
             if spec == "<module source>" {
-                resolved.insert(map_key, spec);
+                resolved.insert(map_key, ModuleKey::from(spec));
                 continue;
             }
-            let (canon, dsrc) = self.fetch_module(&spec, resolution_url, attr_type.as_deref())?;
+            let fetched = self.fetch_module(&spec, resolution_url, attr_type.as_deref())?;
+            let canon = fetched.key;
+            let dsrc = fetched.source;
             // A `with { type: ... }` dependency synthesizes a wrapper module (JSON/text/bytes) —
             // keyed separately from any ordinary module of the same file.
-            let canon = match attr_type.as_deref() {
-                Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
-                _ => canon,
-            };
+            let canon = ModuleKey::typed(canon, attr_type.as_deref());
             let dsrc = typed_module_source(dsrc, attr_type.as_deref());
             resolved.insert(map_key, canon.clone());
             if !dep_keys.contains(&canon) {
                 dep_keys.push(canon.clone());
                 if !self.module_recs.contains_key(&canon) {
-                    dep_srcs.push((canon, dsrc));
+                    dep_srcs.push((canon, dsrc, fetched.script_context));
                 }
             }
         }
@@ -458,20 +691,25 @@ impl Interp {
         );
         let ns_obj = Object::new(None);
         let ns = Value::Obj(ns_obj.clone());
-        self.modules.insert(key.to_string(), ns.clone());
-        let meta = self.build_import_meta(module_url);
+        self.modules.insert(key.clone(), ns.clone());
+        let meta = self.build_import_meta_with_base(module_url, resolution_url);
         // `import.meta` resolves lexically: a function exported from this module keeps seeing
         // this module's object no matter who calls it.
         crate::eval::bind(&env, "%importmeta%", meta.clone());
 
-        let tables = build_export_tables(&body, &resolved);
-        let deferred_deps: Vec<String> = resolved
+        let mut tables = build_export_tables(&body, &resolved);
+        if let Some(value)=synthetic_default {
+            env.borrow_mut().vars.insert("*default*",Binding::data(value,false,true));
+            tables.local_exports.insert("default".into(),"*default*".into());
+        }
+        let deferred_deps: Vec<ModuleKey> = resolved
             .iter()
             .filter(|(spec, _)| defer_specs.get(*spec).copied().unwrap_or(false))
             .map(|(_, canon)| canon.clone())
             .collect();
+        let failed=parse_error.is_some();
         self.module_recs.insert(
-            key.to_string(),
+            key.clone(),
             ModuleRec {
                 body: body.clone(),
                 has_tla: body_has_tla(&body),
@@ -489,9 +727,9 @@ impl Interp {
                 star_as: tables.star_as,
                 stars: tables.stars,
                 linked: false,
-                evaluated: false,
+                evaluated: failed,
                 evaluating: false,
-                eval_error: None,
+                eval_error: parse_error,
                 deferred_deps,
                 top_promise: None,
                 started: false,
@@ -505,11 +743,15 @@ impl Interp {
             },
         );
 
-        added.push(key.to_string());
+        added.push(key.clone());
 
         // Recurse: parse each dependency (fetched during specifier resolution above).
-        for (canon, dsrc) in dep_srcs {
-            self.parse_and_register_graph(&canon, &canon, &canon, Some(dsrc), added)?;
+        for (canon, dsrc, context) in dep_srcs {
+            let module_url = context.as_ref().map_or_else(||canon.to_string(), |context|context.base_url.clone());
+            let previous = std::mem::replace(&mut self.classic_script_context, context);
+            let result = self.parse_and_register_graph(&canon, &module_url, &module_url, Some(dsrc), added);
+            self.classic_script_context = previous;
+            result?;
         }
         Ok(())
     }
@@ -519,10 +761,11 @@ impl Interp {
     /// Link `key` and its dependencies depth-first (once each): instantiate top-level bindings
     /// (functions initialized, lexicals in their temporal dead zone), wire imports to live cells,
     /// validate indirect exports, and build the namespace object.
-    fn link_module(&mut self, key: &str) -> Result<(), Abrupt> {
+    fn link_module(&mut self, key: &ModuleKey) -> Result<(), Abrupt> {
         if self.module_recs[key].linked {
             return Ok(());
         }
+        if let Some(error)=self.module_recs[key].eval_error.clone() { return Err(Abrupt::Throw(error)); }
         self.module_recs.get_mut(key).unwrap().linked = true;
         let result = self.link_module_graph(key);
         if result.is_err() {
@@ -533,7 +776,7 @@ impl Interp {
         result
     }
 
-    fn link_module_graph(&mut self, key: &str) -> Result<(), Abrupt> {
+    fn link_module_graph(&mut self, key: &ModuleKey) -> Result<(), Abrupt> {
         let (body, env, ns) = {
             let rec = &self.module_recs[key];
             (rec.body.clone(), rec.env.clone(), rec.ns.clone())
@@ -556,7 +799,7 @@ impl Interp {
 
     /// Every `export { x } from 'dep'` entry must resolve to a single binding (spec: unresolvable or
     /// ambiguous indirect exports are a link-time SyntaxError).
-    fn validate_indirect_exports(&mut self, key: &str) -> Result<(), Abrupt> {
+    fn validate_indirect_exports(&mut self, key: &ModuleKey) -> Result<(), Abrupt> {
         let names: Vec<String> = self.module_recs[key].indirect.keys().cloned().collect();
         for name in names {
             match self.resolve_export(key, &name, &mut Vec::new()) {
@@ -584,7 +827,24 @@ impl Interp {
         specifier: &str,
         referrer: &str,
         attr_type: Option<&str>,
-    ) -> Result<(String, String), Abrupt> {
+    ) -> Result<crate::ModuleFetchResult, Abrupt> {
+        let inherited = self.classic_script_context.clone();
+        let legacy = |key, source| crate::ModuleFetchResult { key, source, script_context: inherited.clone() };
+        let settings_key = Gc::as_ptr(&self.global) as usize;
+        if let Some(loader) = self.module_fetch_loaders.get(&settings_key).cloned() {
+            if attr_type==Some("css") && !self.module_synthetic_factories.get(&settings_key).is_some_and(|factories|factories.contains_key("css")) {
+                return Err(self.throw("TypeError","CSS modules are not exposed in these settings"));
+            }
+            let resolution=self.resolve_module_specifier_for_host(specifier,referrer)?;
+            let request = crate::ModuleFetchRequest {
+                resolution, settings_key, specifier: specifier.to_owned(), referrer: referrer.to_owned(),
+                attribute_type: attr_type.map(str::to_owned), script_context: inherited.clone(),
+            };
+            return loader(request).ok_or_else(|| self.throw("TypeError", format!("module fetch failed: {specifier} (imported from {referrer})")));
+        }
+        if self.import_maps.contains_key(&settings_key) {
+            return Err(self.throw("TypeError","no HTML module fetch loader is installed for these settings"));
+        }
         #[cfg(feature = "parallel")]
         if specifier == "lumen:parallel" {
             if !self.host_state.has::<crate::parallel::api::Realm>() {
@@ -596,7 +856,7 @@ impl Interp {
                     "lumen:parallel does not accept import attributes",
                 ));
             }
-            return Ok((
+            return Ok(legacy(
                 specifier.into(),
                 "export const run = Lumen.parallel.run; export const spawn = Lumen.parallel.spawn;"
                     .into(),
@@ -605,7 +865,7 @@ impl Interp {
         // A specifier naming a module of a loaded precompiled bundle resolves inside the bundle
         // (its AST is decoded in `parse_and_register`); no host loader is consulted.
         if let Some(key) = crate::precompiled::resolve(self, specifier, referrer, attr_type) {
-            return Ok((key, String::new()));
+            return Ok(legacy(key, String::new()));
         }
         let loader = match &self.module_loader {
             Some(l) => l.clone(),
@@ -617,13 +877,13 @@ impl Interp {
         match self.esm_hook(&specifier, referrer, attr_type)? {
             EsmHook::Default => {}
             EsmHook::Redirect(s) => specifier = s,
-            EsmHook::Module(key, source) => return Ok((key, source)),
+            EsmHook::Module(key, source) => return Ok(legacy(key, source)),
         }
         let t_fetch = std::time::Instant::now();
         let r = loader(&specifier, referrer, attr_type);
         load_stats::add(&load_stats::FETCH, t_fetch, 0);
         match r {
-            Some(pair) => Ok(pair),
+            Some((key, source)) => Ok(legacy(key, source)),
             None => Err(self.throw(
                 "TypeError",
                 format!("module not found: {specifier} (imported from {referrer})"),
@@ -674,7 +934,10 @@ impl Interp {
     /// prototype). For a file-backed module the `url` is a `file://` URL (as Node's is, so
     /// `new URL(rel, import.meta.url)` resolves), and `filename`/`dirname` (Node 20.11+) are the
     /// plain paths.
-    pub(crate) fn build_import_meta(&mut self, key: &str) -> Value {
+    pub(crate) fn build_import_meta(&mut self,key:&str)->Value {
+        self.build_import_meta_with_base(key,key)
+    }
+    fn build_import_meta_with_base(&mut self, key: &str, resolution_url: &str) -> Value {
         let meta = Object::new(None);
         let is_path = key.starts_with('/');
         let url = if is_path {
@@ -702,6 +965,19 @@ impl Interp {
                     Property::data(Value::from_string(dir), true, true, true),
                 );
             }
+        }
+        let map=self.import_map_for_host();
+        if map.is_some() || self.module_fetch_loaders.contains_key(&(Gc::as_ptr(&self.global) as usize)) {
+            let base=resolution_url.to_owned();
+            let resolve=self.new_native_fn("resolve",1,Rc::new(move |ctx,_,args| {
+                let specifier=ctx.to_string(args.first().unwrap_or(&Value::Undefined)).map_err(crate::interpreter::abrupt_value)?;
+                let result=if let Some(map)=&map {
+                    map.lock().map_err(|_| "import-map state is unavailable".to_owned())
+                        .and_then(|mut map|map.resolve(specifier.as_str(),&base).map_err(|error|error.to_string()))
+                } else { lumen_common::import_maps::resolve_without_map(specifier.as_str(),&base).map_err(|error|error.to_string()) };
+                result.map(|resolution|Value::from_string(resolution.url)).map_err(|error|crate::interpreter::abrupt_value(ctx.throw("TypeError",error)))
+            }));
+            meta.borrow_mut().props.insert("resolve",Property::data(resolve,true,true,true));
         }
         Value::Obj(meta)
     }
@@ -735,7 +1011,7 @@ impl Interp {
     }
 
     /// Wire every `import` binding in `body` to a live cell (or namespace object) of its dependency.
-    fn link_imports(&mut self, key: &str, body: &[Stmt], env: &Env) -> Result<(), Abrupt> {
+    fn link_imports(&mut self, key: &ModuleKey, body: &[Stmt], env: &Env) -> Result<(), Abrupt> {
         for stmt in body {
             let Stmt::Import(decl) = stmt else { continue };
             let dep = self.resolved_key(key, &dep_map_key(&decl.source, decl.attr_type.as_deref()));
@@ -775,7 +1051,7 @@ impl Interp {
 
     /// Wire `local` to the binding that `dep` exports as `name` (a link-time SyntaxError if the
     /// export is missing or ambiguous).
-    fn link_named(&mut self, env: &Env, local: &str, dep: &str, name: &str) -> Result<(), Abrupt> {
+    fn link_named(&mut self, env: &Env, local: &str, dep: &ModuleKey, name: &str) -> Result<(), Abrupt> {
         match self.resolve_export(dep, name, &mut Vec::new()) {
             Resolution::Local(src_env, src_local) => {
                 env.borrow_mut().link_import(local, src_env, src_local);
@@ -821,12 +1097,12 @@ impl Interp {
             .insert(local.to_string(), Binding::data(value, false, true));
     }
 
-    fn resolved_key(&self, referrer: &str, specifier: &str) -> String {
+    fn resolved_key(&self, referrer: &ModuleKey, specifier: &ModuleKey) -> ModuleKey {
         self.module_recs[referrer]
             .resolved
             .get(specifier)
             .cloned()
-            .unwrap_or_else(|| specifier.to_string())
+            .unwrap_or_else(|| specifier.clone())
     }
 
     // --- Export resolution (spec ResolveExport / GetExportedNames) -----------------------------
@@ -835,18 +1111,18 @@ impl Interp {
     /// re-exports. `seen` guards against cyclic re-export chains.
     fn resolve_export(
         &self,
-        key: &str,
+        key: &ModuleKey,
         name: &str,
-        seen: &mut Vec<(String, String)>,
+        seen: &mut Vec<(ModuleKey, String)>,
     ) -> Resolution {
-        let pair = (key.to_string(), name.to_string());
+        let pair = (key.clone(), name.to_string());
         if seen.contains(&pair) {
             return Resolution::NotFound;
         }
         seen.push(pair);
         // A source-phase re-export resolves to the requested module's ModuleSource object.
         if name == "~source~" {
-            return match self.module_source_objs.get(key) {
+            return match self.module_source_objs.get(key.url()) {
                 Some(v) => Resolution::Ns(v.clone()),
                 None => Resolution::NotFound,
             };
@@ -913,11 +1189,11 @@ impl Interp {
     }
 
     /// All names module `key` exports (spec GetExportedNames), excluding `default` from stars.
-    fn exported_names(&self, key: &str, seen: &mut Vec<String>) -> Vec<String> {
-        if seen.contains(&key.to_string()) {
+    fn exported_names(&self, key: &ModuleKey, seen: &mut Vec<ModuleKey>) -> Vec<String> {
+        if seen.contains(key) {
             return Vec::new();
         }
-        seen.push(key.to_string());
+        seen.push(key.clone());
         let rec = match self.module_recs.get(key) {
             Some(r) => r,
             None => return Vec::new(),
@@ -950,7 +1226,7 @@ impl Interp {
 
     /// Populate `ns` with one entry per unambiguously-resolvable export, sorted by name, and record
     /// how each reads its live value. Namespace objects are frozen and prototype-less.
-    fn build_namespace(&mut self, key: &str, ns: &crate::value::Gc) -> Result<(), Abrupt> {
+    fn build_namespace(&mut self, key: &ModuleKey, ns: &crate::value::Gc) -> Result<(), Abrupt> {
         let mut names = self.exported_names(key, &mut Vec::new());
         names.sort();
         let mut live: crate::fasthash::FastMap<String, NsBinding> = Default::default();
@@ -1005,7 +1281,7 @@ impl Interp {
     /// Build the distinct deferred-namespace object for `import defer * as ns`: same exports and
     /// live bindings as the module's ordinary namespace, but a separate identity, a
     /// "Deferred Module" @@toStringTag, and evaluation-on-first-string-keyed-access.
-    fn make_deferred_ns(&mut self, dep: &str) -> Value {
+    fn make_deferred_ns(&mut self, dep: &ModuleKey) -> Value {
         // One deferred namespace per module: every `import defer` of the same module (and every
         // re-export of such a binding) observes the same object.
         if let Some(v) = self.deferred_ns_objs.get(dep) {
@@ -1039,9 +1315,12 @@ impl Interp {
         }
         dns.borrow().ic_plain.set(false);
         self.deferred_ns
-            .insert(Gc::as_ptr(&dns) as usize, dep.to_string());
+            .insert(Gc::as_ptr(&dns) as usize, DeferredModuleKey {
+                settings: Gc::as_ptr(&self.global) as usize,
+                key: dep.clone(),
+            });
         self.deferred_ns_objs
-            .insert(dep.to_string(), Value::Obj(dns.clone()));
+            .insert(dep.clone(), Value::Obj(dns.clone()));
         Value::Obj(dns)
     }
 
@@ -1050,7 +1329,7 @@ impl Interp {
     /// Evaluate module `key` and its dependencies depth-first (each body runs at most once). A body
     /// that throws poisons the module so later imports observe the same error.
     /// Deferred-namespace trigger: evaluate a module on first access of its namespace.
-    pub(crate) fn evaluate_deferred(&mut self, key: &str) -> Result<(), Abrupt> {
+    pub(crate) fn evaluate_deferred(&mut self, key: &ModuleKey) -> Result<(), Abrupt> {
         if self.module_recs.contains_key(key) {
             // ReadyForSyncExecution: touching a deferred namespace while its module — or any
             // module in its dependency graph — is still evaluating is a TypeError.
@@ -1102,11 +1381,11 @@ impl Interp {
     }
 
     /// Whether `key`'s whole (non-deferred) dependency graph is free of mid-evaluation modules.
-    fn ready_for_sync(&self, key: &str, seen: &mut Vec<String>) -> bool {
+    fn ready_for_sync(&self, key: &ModuleKey, seen: &mut Vec<ModuleKey>) -> bool {
         if seen.iter().any(|k| k == key) {
             return true;
         }
-        seen.push(key.to_string());
+        seen.push(key.clone());
         let rec = match self.module_recs.get(key) {
             Some(r) => r,
             None => return true,
@@ -1127,7 +1406,7 @@ impl Interp {
         deps.iter().all(|d| self.ready_for_sync(d, seen))
     }
 
-    fn evaluate_module(&mut self, key: &str) -> Result<(), Abrupt> {
+    fn evaluate_module(&mut self, key: &ModuleKey) -> Result<(), Abrupt> {
         {
             let rec = &self.module_recs[key];
             if let Some(err) = &rec.eval_error {
@@ -1145,7 +1424,7 @@ impl Interp {
         // `import defer` earlier in the file must not pull the module's evaluation forward).
         let body_order = self.eager_dep_order(key);
         // Only deps in dep_keys evaluate here (source-phase pseudo-modules are excluded there).
-        let order: Vec<String> = if body_order.is_empty() {
+        let order: Vec<ModuleKey> = if body_order.is_empty() {
             dep_keys
                 .iter()
                 .filter(|d| !deferred.contains(*d))
@@ -1210,7 +1489,7 @@ impl Interp {
     /// Exports retain their own function/class nodes and environment. Completed module
     /// initialization statements cannot execute again, but graph metadata is still needed
     /// by subsequent imports, including deferred imports through an evaluated module.
-    fn retire_module_body(&mut self, key: &str) {
+    fn retire_module_body(&mut self, key: &ModuleKey) {
         let Some(rec) = self.module_recs.get(key) else {
             return;
         };
@@ -1229,7 +1508,7 @@ impl Interp {
     pub(crate) fn module_program_memory(&self) -> [usize; 7] {
         let mut result = [0; 7];
         let mut sources = std::collections::HashSet::new();
-        for rec in self.module_recs.values() {
+        for rec in self.module_recs.all_values() {
             if !rec.body.is_empty() {
                 result[0] += 1;
                 result[1] += usize::from(!rec.evaluated);
@@ -1249,7 +1528,7 @@ impl Interp {
 
     /// This module's dependencies in evaluation order: each dep at the position of its first
     /// non-defer import/export-from clause; defer-only deps at their first (defer) position.
-    fn eager_dep_order(&self, key: &str) -> Vec<String> {
+    fn eager_dep_order(&self, key: &ModuleKey) -> Vec<ModuleKey> {
         let rec = match self.module_recs.get(key) {
             Some(r) => r,
             None => return Vec::new(),
@@ -1259,11 +1538,11 @@ impl Interp {
         }
         let body = rec.body.clone();
         let resolved = rec.resolved.clone();
-        let mut eager: Vec<String> = Vec::new();
-        let mut defer_seen: Vec<String> = Vec::new();
-        let push = |list: &mut Vec<String>, k: &str| {
+        let mut eager: Vec<ModuleKey> = Vec::new();
+        let mut defer_seen: Vec<ModuleKey> = Vec::new();
+        let push = |list: &mut Vec<ModuleKey>, k: &ModuleKey| {
             if !list.iter().any(|x| x == k) {
-                list.push(k.to_string());
+                list.push(k.clone());
             }
         };
         for stmt in body.iter() {
@@ -1279,7 +1558,7 @@ impl Interp {
                 Stmt::ExportNamed {
                     source: Some(src), ..
                 }
-                | Stmt::ExportAll { source: src, .. } => (src.to_string(), false),
+                | Stmt::ExportAll { source: src, .. } => (ModuleKey::from(src.as_ref()), false),
                 _ => continue,
             };
             let Some(k) = resolved.get(&spec) else {
@@ -1294,7 +1573,7 @@ impl Interp {
         // A defer-only dep (never named eagerly) keeps its SOURCE position — its async
         // subgraph evaluates there. A dep imported both ways evaluates at its first EAGER
         // position (the defer clause never pulls it forward).
-        let mut merged: Vec<String> = Vec::new();
+        let mut merged: Vec<ModuleKey> = Vec::new();
         for stmt in body.iter() {
             let (spec, defers) = match stmt {
                 Stmt::Import(decl) => (
@@ -1308,7 +1587,7 @@ impl Interp {
                 Stmt::ExportNamed {
                     source: Some(src), ..
                 }
-                | Stmt::ExportAll { source: src, .. } => (src.to_string(), false),
+                | Stmt::ExportAll { source: src, .. } => (ModuleKey::from(src.as_ref()), false),
                 _ => continue,
             };
             if let Some(k) = resolved.get(&spec) {
@@ -1328,8 +1607,8 @@ impl Interp {
     /// otherwise. Completion cascades through [[AsyncParentModules]] in [[AsyncEvaluationOrder]].
     fn inner_module_evaluation_async(
         &mut self,
-        key: &str,
-        stack: &mut Vec<String>,
+        key: &ModuleKey,
+        stack: &mut Vec<ModuleKey>,
         index: &mut usize,
     ) {
         if self.module_recs[key].started || self.module_recs[key].evaluated {
@@ -1343,12 +1622,12 @@ impl Interp {
             rec.on_stack = true;
         }
         *index += 1;
-        stack.push(key.to_string());
+        stack.push(key.clone());
 
         let dep_keys = self.module_recs[key].dep_keys.clone();
         let deferred = self.module_recs[key].deferred_deps.clone();
         let body_order = self.eager_dep_order(key);
-        let order: Vec<String> = if body_order.is_empty() {
+        let order: Vec<ModuleKey> = if body_order.is_empty() {
             dep_keys
                 .iter()
                 .filter(|d| !deferred.contains(*d))
@@ -1366,33 +1645,33 @@ impl Interp {
                 continue;
             }
             self.inner_module_evaluation_async(dep, stack, index);
-            if self.module_recs[dep.as_str()].on_stack {
+            if self.module_recs[&dep].on_stack {
                 // Still on the DFS stack: same strongly-connected component. An in-cycle
                 // dependency that already parked at a top-level await still counts as pending.
-                let danc = self.module_recs[dep.as_str()].dfs_anc;
+                let danc = self.module_recs[&dep].dfs_anc;
                 {
                     let rec = self.module_recs.get_mut(key).unwrap();
                     rec.dfs_anc = rec.dfs_anc.min(danc);
                 }
                 let dep_parked = {
-                    let d = &self.module_recs[dep.as_str()];
+                    let d = &self.module_recs[&dep];
                     d.async_order.is_some() && !d.evaluated
                 };
                 if dep_parked {
                     self.module_recs.get_mut(key).unwrap().pending_async += 1;
                     self.module_recs
-                        .get_mut(dep.as_str())
+                        .get_mut(&dep)
                         .unwrap()
                         .async_parents
-                        .push(key.to_string());
+                        .push(key.clone());
                 }
                 continue;
             }
             // Completed (or async-parked) dependency: waiting attaches to its CYCLE ROOT.
-            let root = self.module_recs[dep.as_str()]
+            let root = self.module_recs[&dep]
                 .cycle_root
                 .clone()
-                .unwrap_or_else(|| dep.to_string());
+                .unwrap_or_else(|| dep.clone());
             let (dep_err, dep_done, dep_async) = {
                 let d = &self.module_recs[&root];
                 (d.eval_error.clone(), d.evaluated, d.async_order.is_some())
@@ -1408,7 +1687,7 @@ impl Interp {
                     .get_mut(&root)
                     .unwrap()
                     .async_parents
-                    .push(key.to_string());
+                    .push(key.clone());
             }
         }
         for dep in &dep_keys {
@@ -1432,9 +1711,9 @@ impl Interp {
     /// parent pends on each (so the later synchronous evaluation meets no pending async dep).
     fn defer_async_deps(
         &mut self,
-        parent: &str,
-        dep: &str,
-        stack: &mut Vec<String>,
+        parent: &ModuleKey,
+        dep: &ModuleKey,
+        stack: &mut Vec<ModuleKey>,
         index: &mut usize,
     ) {
         let mut graph = Vec::new();
@@ -1472,14 +1751,14 @@ impl Interp {
                     .get_mut(&root)
                     .unwrap()
                     .async_parents
-                    .push(parent.to_string());
+                    .push(parent.clone());
             }
         }
     }
 
     /// If `key` is its component's root, pop the SCC off the DFS stack and stamp each member's
     /// [[CycleRoot]].
-    fn finish_scc(&mut self, key: &str, stack: &mut Vec<String>) {
+    fn finish_scc(&mut self, key: &ModuleKey, stack: &mut Vec<ModuleKey>) {
         let (di, danc, on_stack) = {
             let r = &self.module_recs[key];
             (r.dfs_index, r.dfs_anc, r.on_stack)
@@ -1494,8 +1773,8 @@ impl Interp {
         while let Some(m) = stack.pop() {
             let rec = self.module_recs.get_mut(&m).unwrap();
             rec.on_stack = false;
-            rec.cycle_root = Some(key.to_string());
-            if m == key {
+            rec.cycle_root = Some(key.clone());
+            if &m == key {
                 break;
             }
         }
@@ -1503,7 +1782,7 @@ impl Interp {
 
     /// Execute `key`'s own body (all dependencies done): a TLA body parks in a coroutine whose
     /// completion runs the ancestor cascade; a synchronous body runs now.
-    fn module_execute_async(&mut self, key: &str) {
+    fn module_execute_async(&mut self, key: &ModuleKey) {
         let top = self.module_recs[key].top_promise.clone();
         let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
@@ -1515,8 +1794,10 @@ impl Interp {
             )
         };
         if body_has_tla(&body) {
+            let resume_src = src.clone();
             self.module_recs.get_mut(key).unwrap().evaluating = true;
-            let module_key = key.to_string();
+            let module_key = key.clone();
+            let module_settings = Gc::as_ptr(&self.global) as usize;
             let closure: Box<dyn FnOnce(&mut Interp) -> crate::coroutine::Suspend> =
                 Box::new(move |i| {
                     let saved_meta = i.import_meta.take();
@@ -1526,7 +1807,7 @@ impl Interp {
                     let result = i.run_stmt_list(&body, &env);
                     i.import_meta = saved_meta;
                     i.strict = saved_strict;
-                    match result {
+                    let completion = match result {
                         Ok(_) => {
                             i.finish_dynamic_module(&module_key, None);
                             crate::coroutine::Suspend::Done(Value::Undefined)
@@ -1536,7 +1817,8 @@ impl Interp {
                             i.finish_dynamic_module(&module_key, Some(v.clone()));
                             crate::coroutine::Suspend::Throw(v)
                         }
-                    }
+                    };
+                    completion
                 });
             let ptr = self as *mut Interp;
             let top = match top {
@@ -1554,7 +1836,7 @@ impl Interp {
                     }
                 };
             // Every step of the body, the first included, runs under the module's frame.
-            coro.set_frame(Interp::resume_frame_script(src));
+            coro.set_frame(Interp::resume_frame_script(resume_src,module_settings));
             self.park_async_coro(&top, coro);
             self.drive_async(top, crate::coroutine::Resume::Next(Value::Undefined));
             return;
@@ -1585,13 +1867,13 @@ impl Interp {
 
     /// AsyncModuleExecutionFulfilled: run every ancestor whose pending count reaches zero, in
     /// [[AsyncEvaluationOrder]] (ascending).
-    pub(crate) fn async_module_fulfilled(&mut self, key: &str) {
+    pub(crate) fn async_module_fulfilled(&mut self, key: &ModuleKey) {
         // Spec step 7: the fulfilled module's own capability resolves before any ancestor
         // executes — leaf-to-root fulfilment order is observable through dynamic import.
         if let Some(t) = self.module_recs[key].top_promise.clone() {
             self.resolve_promise(&t, Value::Undefined);
         }
-        let mut exec: Vec<(u64, String)> = Vec::new();
+        let mut exec: Vec<(u64, ModuleKey)> = Vec::new();
         self.gather_available_ancestors(key, &mut exec);
         exec.sort_by_key(|(o, _)| *o);
         for (_, m) in exec {
@@ -1602,7 +1884,7 @@ impl Interp {
         }
     }
 
-    fn gather_available_ancestors(&mut self, key: &str, out: &mut Vec<(u64, String)>) {
+    fn gather_available_ancestors(&mut self, key: &ModuleKey, out: &mut Vec<(u64, ModuleKey)>) {
         let parents = self.module_recs[key].async_parents.clone();
         for parent in parents {
             let (done, err, pending) = {
@@ -1627,7 +1909,7 @@ impl Interp {
     }
 
     /// AsyncModuleExecutionRejected: the error propagates to every waiting ancestor.
-    pub(crate) fn async_module_rejected(&mut self, key: &str, err: Value) {
+    pub(crate) fn async_module_rejected(&mut self, key: &ModuleKey, err: Value) {
         {
             let rec = self.module_recs.get_mut(key).unwrap();
             if rec.evaluated || rec.eval_error.is_some() {
@@ -1648,11 +1930,11 @@ impl Interp {
 
     /// Evaluate every module with top-level await (plus its own dependencies) in `key`'s graph —
     /// the eager part of an `import defer`.
-    fn evaluate_async_subgraph(&mut self, key: &str, seen: &mut Vec<String>) -> Result<(), Abrupt> {
+    fn evaluate_async_subgraph(&mut self, key: &ModuleKey, seen: &mut Vec<ModuleKey>) -> Result<(), Abrupt> {
         if seen.iter().any(|k| k == key) {
             return Ok(());
         }
-        seen.push(key.to_string());
+        seen.push(key.clone());
         let rec = match self.module_recs.get(key) {
             Some(r) => r,
             None => return Ok(()),
@@ -1722,42 +2004,60 @@ impl Interp {
         referrer: Option<Value>,
     ) -> Value {
         let promise = self.new_promise();
+        let settings_key=Gc::as_ptr(&self.global) as usize;
+        if attr_type==Some("css") && self.module_fetch_loaders.contains_key(&settings_key)
+            && !self.module_synthetic_factories.get(&settings_key).is_some_and(|factories|factories.contains_key("css")) {
+            let error=crate::interpreter::abrupt_value(self.throw("TypeError","CSS modules are not exposed in these settings"));
+            self.reject_promise(&promise,error);
+            return promise;
+        }
         // The referrer is the importing module's `import.meta.url`. Prefer the value captured
         // lexically at the call site (passed in) — it survives `await`, unlike `self.import_meta`,
         // which is only set during a module's synchronous body.
         let meta = referrer.or_else(|| self.import_meta.clone());
         let referrer = match meta {
             Some(m) => match self.get_member(&m, "url") {
-                Ok(Value::Str(s)) => s.to_string(),
-                _ => self.import_base.clone(),
+                Ok(Value::Str(s)) => self.current_classic_script_context().map_or_else(||s.to_string(),|context|context.base_url.clone()),
+                _ => self.current_classic_script_context().map_or_else(|| self.module_api_base_for_host(), |context| context.base_url.clone()),
             },
-            None => self.import_base.clone(),
+            None => self.current_classic_script_context().map_or_else(|| self.module_api_base_for_host(), |context| context.base_url.clone()),
         };
-        if let Some(handler) = self.async_module_import_handler.clone() {
+        let resolution = match self.resolve_module_specifier_for_host(specifier,&referrer) {
+            Ok(resolution)=>resolution,
+            Err(error)=>{ self.reject_promise(&promise,crate::interpreter::abrupt_value(error)); return promise; }
+        };
+        if let Some(handler) = self.async_module_import_handlers.get(&(Gc::as_ptr(&self.global) as usize)).cloned() {
             let id = self.next_async_module_import_id;
             self.next_async_module_import_id = id.wrapping_add(1).max(1);
             let request = crate::AsyncModuleImportRequest {
                 id,
+                resolution,
+                settings_key: Gc::as_ptr(&self.global) as usize,
                 specifier: specifier.to_owned(),
                 referrer,
                 attribute_type: attr_type.map(str::to_owned),
                 defer,
+                script_context: self.current_classic_script_context(),
             };
             self.pending_async_module_imports
-                .insert(id, (request.clone(), promise.clone()));
+                .insert(id, (request.clone(), promise.clone(), self.global.clone()));
             handler(request);
             return promise;
         }
+        let previous_context = self.classic_script_context.clone();
+        self.classic_script_context = self.current_classic_script_context();
         let result = (|| {
-            let (canon, src) = self.fetch_module(specifier, &referrer, attr_type)?;
-            let canon = match attr_type {
-                Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
-                _ => canon,
-            };
+            let fetched = self.fetch_module(specifier, &referrer, attr_type)?;
+            self.classic_script_context = fetched.script_context;
+            let canon = fetched.key;
+            let src = fetched.source;
+            let canon = ModuleKey::typed(canon, attr_type);
             let src = typed_module_source(src, attr_type);
-            self.parse_and_link(&canon, Some(src))?;
+            let module_url = self.classic_script_context.as_ref().map_or_else(||canon.to_string(), |context|context.base_url.clone());
+            self.parse_and_link_at(&canon, Some(src), &module_url)?;
             Ok(canon)
         })();
+        self.classic_script_context = previous_context;
         match result {
             Ok(canon) if defer => {
                 // import.defer: link only; resolve with the (shared) deferred namespace. The
@@ -1795,27 +2095,40 @@ impl Interp {
     /// Finish a dynamic import whose host fetch was completed asynchronously.
     /// The host loader is a prepared, in-memory graph reader, so linking still
     /// runs through the canonical module parser and graph cache here.
+    #[cfg(feature = "embed")]
     pub(crate) fn complete_async_module_import(
         &mut self,
         id: u64,
         loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
     ) -> Result<(Value, Value), String> {
-        let Some((request, import_promise)) = self.pending_async_module_imports.remove(&id) else {
+        let Some((request, import_promise, owner)) = self.pending_async_module_imports.remove(&id) else {
             return Err("unknown or already completed async module import".into());
         };
-        self.module_loader = Some(Rc::new(loader));
+        let saved = self.snapshot_realm();
+        if request.settings_key != Gc::as_ptr(&self.global) as usize {
+            let realm = self.realms.get(&request.settings_key)
+                .map(crate::interpreter::RealmState::snapshot_clone)
+                .ok_or_else(|| "async module import settings no longer exist".to_string())?;
+            self.restore_realm(&realm);
+        }
+        // Hold the actual owner throughout linking/evaluation, even if a host
+        // completion arrived while another document was active.
+        let _owner = owner;
+        let previous_loader = self.module_loader.replace(Rc::new(loader));
+        let previous_context = std::mem::replace(&mut self.classic_script_context, request.script_context.clone());
         let result = (|| -> Result<(Value, Value), Abrupt> {
-            let (canon, source) = self.fetch_module(
+            let fetched = self.fetch_module(
                 &request.specifier,
                 &request.referrer,
                 request.attribute_type.as_deref(),
             )?;
-            let canon = match request.attribute_type.as_deref() {
-                Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
-                _ => canon,
-            };
+            self.classic_script_context = fetched.script_context;
+            let canon = fetched.key;
+            let source = fetched.source;
+            let canon = ModuleKey::typed(canon, request.attribute_type.as_deref());
             let source = typed_module_source(source, request.attribute_type.as_deref());
-            self.parse_and_link(&canon, Some(source))?;
+            let module_url = self.classic_script_context.as_ref().map_or_else(||canon.to_string(), |context|context.base_url.clone());
+            self.parse_and_link_at(&canon, Some(source), &module_url)?;
             if request.defer {
                 self.evaluate_async_subgraph(&canon, &mut Vec::new())?;
                 let namespace = self.make_deferred_ns(&canon);
@@ -1839,43 +2152,56 @@ impl Interp {
             self.promise_then(&evaluation, on_f, on_r);
             Ok((namespace, evaluation))
         })();
-        match result {
+        self.classic_script_context = previous_context;
+        self.module_loader = previous_loader;
+        let result = match result {
             Ok(pair) => Ok(pair),
             Err(error) => {
                 let reason = crate::interpreter::abrupt_value(error);
                 self.reject_promise(&import_promise, reason);
                 Err("async dynamic module import failed to link".into())
             }
-        }
+        };
+        self.restore_realm(&saved);
+        result
     }
 
+    #[cfg(feature = "embed")]
     pub(crate) fn reject_async_module_import(
         &mut self,
         id: u64,
         message: &str,
     ) -> Result<(), String> {
-        let Some((_request, promise)) = self.pending_async_module_imports.remove(&id) else {
+        let Some((request, promise, _owner)) = self.pending_async_module_imports.remove(&id) else {
             return Err("unknown or already completed async module import".into());
         };
+        let saved = self.snapshot_realm();
+        if request.settings_key != Gc::as_ptr(&self.global) as usize {
+            let realm = self.realms.get(&request.settings_key)
+                .map(crate::interpreter::RealmState::snapshot_clone)
+                .ok_or_else(|| "async module import settings no longer exist".to_string())?;
+            self.restore_realm(&realm);
+        }
         let reason = crate::interpreter::abrupt_value(self.throw("TypeError", message));
         self.reject_promise(&promise, reason);
+        self.restore_realm(&saved);
         Ok(())
     }
 
     /// Evaluate a dynamically-imported module, returning a promise that settles when its body
     /// (which may use top-level await) completes. Dependencies evaluate synchronously first; the
     /// module's own body runs in a coroutine so a top-level await parks it.
-    fn evaluate_module_dynamic(&mut self, key: &str) -> Value {
+    fn evaluate_module_dynamic(&mut self, key: &ModuleKey) -> Value {
         // Evaluate() step: an evaluating-async or evaluated module defers to its [[CycleRoot]],
         // so a member that finished before its cycle failed reports the cycle's error.
         let key = {
             let rec = &self.module_recs[key];
             match &rec.cycle_root {
                 Some(root) if rec.evaluated || rec.async_order.is_some() => root.clone(),
-                _ => key.to_string(),
+                _ => key.clone(),
             }
         };
-        let key = key.as_str();
+        let key = &key;
         let (top, err, settled) = {
             let rec = &self.module_recs[key];
             (
@@ -1924,7 +2250,7 @@ impl Interp {
     }
 
     /// Record a dynamically-evaluated module's completion (run from inside its coroutine).
-    fn finish_dynamic_module(&mut self, key: &str, error: Option<Value>) {
+    fn finish_dynamic_module(&mut self, key: &ModuleKey, error: Option<Value>) {
         match error {
             None => {
                 if let Some(rec) = self.module_recs.get_mut(key) {
@@ -1959,12 +2285,10 @@ fn same_binding(a: &Resolution, b: &Resolution) -> bool {
 
 /// The `resolved`-map key for a dependency: the plain specifier, or — for an attribute import
 /// (`with { type: ... }`) — the specifier qualified by the type, so the same file imported both
-/// ways in one module resolves to two distinct records. NUL never appears in real specifiers.
-pub(crate) fn dep_map_key(spec: &str, attr: Option<&str>) -> String {
-    match attr {
-        Some(t @ ("json" | "text" | "bytes")) => format!("{spec}\u{0000}{t}"),
-        _ => spec.to_string(),
-    }
+/// ways in one module resolves to two distinct records, without encoding types
+/// into URL fragments or specifier strings.
+pub(crate) fn dep_map_key(spec: &str, attr: Option<&str>) -> ModuleKey {
+    ModuleKey::typed(spec.to_owned(), attr)
 }
 
 /// Every module specifier this body imports/re-exports from (with duplicates).
@@ -2001,35 +2325,11 @@ fn dynamic_import_reject(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Va
     Ok(Value::Undefined)
 }
 
-/// The source text as a JS string literal (escaped).
-fn js_string_literal(text: &str) -> String {
-    let mut lit = String::with_capacity(text.len() + 2);
-    lit.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => lit.push_str("\\\""),
-            '\\' => lit.push_str("\\\\"),
-            '\n' => lit.push_str("\\n"),
-            '\r' => lit.push_str("\\r"),
-            '\u{2028}' => lit.push_str("\\u2028"),
-            '\u{2029}' => lit.push_str("\\u2029"),
-            c if (c as u32) < 0x20 => {
-                lit.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => lit.push(c),
-        }
-    }
-    lit.push('"');
-    lit
-}
-
-/// Synthesize the module source for a `with { type: ... }` dependency: json parses the text, text
-/// exports it verbatim, bytes exports it as a Uint8Array of its UTF-8 bytes. An unknown type keeps
-/// the source as-is (an ordinary module).
+/// HTML synthetic defaults retain raw JSON/text/CSS until canonical record
+/// creation. Node's legacy byte module still uses its typed-array wrapper.
 pub(crate) fn typed_module_source(text: String, attr_type: Option<&str>) -> String {
     match attr_type {
-        Some("json") => format!("export default JSON.parse({});", js_string_literal(&text)),
-        Some("text") => format!("export default {};", js_string_literal(&text)),
+        Some("json" | "text") => text,
         Some("bytes") => {
             // The text was decoded latin-1 style (char == byte) when non-UTF-8; a UTF-8 source
             // re-encodes to its original bytes either way.
@@ -2176,29 +2476,29 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
 struct ExportTables {
     local_exports: HashMap<String, String>,
     imports: HashMap<String, ImportOrigin>,
-    indirect: HashMap<String, (String, String)>,
-    star_as: HashMap<String, String>,
-    stars: Vec<String>,
+    indirect: HashMap<String, (ModuleKey, String)>,
+    star_as: HashMap<String, ModuleKey>,
+    stars: Vec<ModuleKey>,
 }
 
 /// Build a module's export/import tables from its parsed body and resolved specifier→key map.
-fn build_export_tables(body: &[Stmt], resolved: &HashMap<String, String>) -> ExportTables {
+fn build_export_tables(body: &[Stmt], resolved: &HashMap<ModuleKey, ModuleKey>) -> ExportTables {
     let mut local_exports: HashMap<String, String> = HashMap::new();
     let mut imports: HashMap<String, ImportOrigin> = HashMap::new();
-    let mut indirect: HashMap<String, (String, String)> = HashMap::new();
-    let mut star_as: HashMap<String, String> = HashMap::new();
-    let mut stars: Vec<String> = Vec::new();
-    let key_of = |src: &str| {
+    let mut indirect: HashMap<String, (ModuleKey, String)> = HashMap::new();
+    let mut star_as: HashMap<String, ModuleKey> = HashMap::new();
+    let mut stars: Vec<ModuleKey> = Vec::new();
+    let key_of = |src: &ModuleKey| {
         resolved
             .get(src)
             .cloned()
-            .unwrap_or_else(|| src.to_string())
+            .unwrap_or_else(|| src.clone())
     };
 
     for stmt in body {
         match stmt {
             Stmt::Import(decl) => {
-                let dep = key_of(&decl.source);
+                let dep = key_of(&dep_map_key(&decl.source, decl.attr_type.as_deref()));
                 for spec in &decl.specs {
                     match spec {
                         ImportSpec::Namespace(local) => {
@@ -2247,7 +2547,7 @@ fn build_export_tables(body: &[Stmt], resolved: &HashMap<String, String>) -> Exp
                     match source {
                         Some(src) => {
                             indirect
-                                .insert(spec.exported.clone(), (key_of(src), spec.local.clone()));
+                                .insert(spec.exported.clone(), (key_of(&ModuleKey::from(src.as_ref())), spec.local.clone()));
                         }
                         None => {
                             local_exports.insert(spec.exported.clone(), spec.local.clone());
@@ -2257,9 +2557,9 @@ fn build_export_tables(body: &[Stmt], resolved: &HashMap<String, String>) -> Exp
             }
             Stmt::ExportAll { source, exported } => match exported {
                 Some(name) => {
-                    star_as.insert(name.clone(), key_of(source));
+                    star_as.insert(name.clone(), key_of(&ModuleKey::from(source.as_ref())));
                 }
-                None => stars.push(key_of(source)),
+                None => stars.push(key_of(&ModuleKey::from(source.as_ref()))),
             },
             _ => {}
         }
@@ -2332,6 +2632,87 @@ fn file_url(key: &str) -> String {
 mod body_retirement_tests {
     use super::*;
 
+    #[test]
+    fn specification_module_identity_keeps_settings_types_and_url_fragments_distinct() {
+        let mut map = SettingsModuleMap::default();
+        let plain = ModuleKey::from("https://example.test/data#json");
+        let json = ModuleKey::typed("https://example.test/data".into(), Some("json"));
+        let text = ModuleKey::typed("https://example.test/data".into(), Some("text"));
+        let bytes = ModuleKey::typed("https://example.test/data".into(), Some("bytes"));
+        map.select(1);
+        for (key,value) in [(plain.clone(),1),(json.clone(),2),(text.clone(),3),(bytes.clone(),4)] { map.insert(key,value); }
+        assert_eq!(map.get(&plain),Some(&1));
+        assert_eq!(map.get(&json),Some(&2));
+        assert_eq!(map.get(&text),Some(&3));
+        assert_eq!(map.get(&bytes),Some(&4));
+        let empty_type = ModuleKey::typed("https://example.test/data#json".into(),Some(""));
+        map.insert(empty_type.clone(),6);
+        assert_eq!(map.get(&empty_type),Some(&6));
+        assert_eq!(map.get(&plain),Some(&1),"even an unsupported empty type cannot alias JavaScript identity");
+        map.select(2);
+        assert!(map.get(&plain).is_none());
+        map.insert(plain.clone(),5);
+        map.select(1);
+        assert_eq!(map.get(&plain),Some(&1));
+        assert_eq!(map.remove_settings(2).expect("second settings").len(),1);
+
+        let mut interp = Interp::new();
+        let global=Value::Obj(interp.global.clone());
+        let json_object=interp.get_member(&global,"JSON").ok().expect("JSON intrinsic");
+        interp.set_member(&json_object,"parse",Value::Undefined).ok().expect("author replacement");
+        interp.module_loader = Some(Rc::new(|specifier,_,kind| {
+            let source = match (specifier,kind) {
+                ("data#json",None) => "export default 11;",
+                ("data",Some("json")) => "{\"value\":22}",
+                ("data",Some("text")) => "text payload",
+                ("data",Some("bytes")) => "ABC",
+                _ => return None,
+            };
+            Some((specifier.into(),source.into()))
+        }));
+        interp.parse_and_register("root",Some("import plain from 'data#json'; import json from 'data' with {type:'json'}; import text from 'data' with {type:'text'}; import bytes from 'data' with {type:'bytes'}; export const value = plain + json.value + text.length + bytes.length;".into())).ok().expect("typed graph parses");
+        let root = ModuleKey::from("root");
+        interp.link_module(&root).ok().expect("typed graph links");
+        interp.evaluate_module(&root).ok().expect("typed graph evaluates");
+        let namespace = interp.module_recs[&root].ns.clone();
+        assert_eq!(number(&mut interp,&namespace,"value"),48.0);
+        assert_eq!(interp.module_recs.len(),5);
+        let invalid=ModuleKey::typed("invalid.json".into(),Some("json"));
+        let first=interp.parse_and_link_at(&invalid,Some("{invalid}".into()),"invalid.json").err().map(crate::interpreter::abrupt_value).expect("invalid JSON parse error");
+        let second=interp.parse_and_link_at(&invalid,Some("{}".into()),"invalid.json").err().map(crate::interpreter::abrupt_value).expect("cached parse error");
+        assert_eq!(first.object_identity(),second.object_identity(),"module parse exceptions retain their original identity");
+        interp.module_loader = Some(Rc::new(|specifier,_,_| match specifier {
+            "cycle-a"=>Some((specifier.into(),"import {readA} from 'cycle-b'; export const value = 7; export function read() { return readA(); }".into())),
+            "cycle-b"=>Some((specifier.into(),"import {value} from 'cycle-a'; export function readA() { return value; }".into())),
+            _=>None,
+        }));
+        interp.parse_and_register("cycle-a",Some("import {readA} from 'cycle-b'; export const value = 7; export function read() { return readA(); }".into())).ok().expect("cyclic graph parses");
+        let cycle = ModuleKey::from("cycle-a");
+        interp.link_module(&cycle).ok().expect("cyclic graph links");
+        interp.evaluate_module(&cycle).ok().expect("cyclic graph evaluates");
+        let namespace = interp.module_recs[&cycle].ns.clone();
+        let read = interp.get_member(&namespace,"read").ok().expect("live cyclic export");
+        assert!(matches!(interp.call(read,Value::Undefined,&[]),Ok(Value::Num(7.0))));
+        assert_eq!(interp.module_recs.len(),8,"the back edge reuses the original graph identity, alongside the cached parse failure");
+        let creations = Rc::new(std::cell::Cell::new(0));
+        let calls = creations.clone();
+        interp.install_module_synthetic_factory("css",Rc::new(move |_,source| {
+            assert_eq!(source,"body { color: red; }");
+            calls.set(calls.get()+1);
+            Ok(Value::Num(41.0))
+        }));
+        interp.module_loader=Some(Rc::new(|specifier,_,kind| {
+            (specifier == "sheet.css" && kind == Some("css")).then(||(specifier.into(),"body { color: red; }".into()))
+        }));
+        interp.parse_and_register("css-root",Some("import sheet from 'sheet.css' with {type:'css'}; export const value = sheet;".into())).ok().expect("native synthetic graph parses");
+        let css_root=ModuleKey::from("css-root");
+        interp.link_module(&css_root).ok().expect("synthetic graph links");
+        interp.evaluate_module(&css_root).ok().expect("synthetic graph evaluates");
+        let namespace=interp.module_recs[&css_root].ns.clone();
+        assert_eq!(number(&mut interp,&namespace,"value"),41.0);
+        assert_eq!(creations.get(),1,"a default export factory runs once per actual URL/type record");
+    }
+
     fn number(interp: &mut Interp, namespace: &Value, name: &str) -> f64 {
         match interp.get_member(namespace, name).ok().expect("export") {
             Value::Num(value) => value,
@@ -2350,8 +2731,8 @@ mod body_retirement_tests {
             .ok()
             .unwrap();
         let body = Rc::downgrade(&interp.module_recs["counter"].body);
-        interp.link_module("counter").ok().unwrap();
-        interp.evaluate_module("counter").ok().unwrap();
+        interp.link_module(&ModuleKey::from("counter")).ok().unwrap();
+        interp.evaluate_module(&ModuleKey::from("counter")).ok().unwrap();
         assert!(
             body.upgrade().is_none(),
             "initialization AST is no longer needed"
@@ -2363,7 +2744,7 @@ mod body_retirement_tests {
             Some(Value::Num(4.0))
         ));
         assert_eq!(number(&mut interp, &namespace, "value"), 4.0);
-        interp.evaluate_module("counter").ok().unwrap();
+        interp.evaluate_module(&ModuleKey::from("counter")).ok().unwrap();
         assert_eq!(
             number(&mut interp, &namespace, "value"),
             4.0,
@@ -2407,11 +2788,11 @@ mod body_retirement_tests {
             .ok()
             .unwrap();
         let body = Rc::downgrade(&interp.module_recs["failed"].body);
-        interp.link_module("failed").ok().unwrap();
-        assert!(interp.evaluate_module("failed").is_err());
+        interp.link_module(&ModuleKey::from("failed")).ok().unwrap();
+        assert!(interp.evaluate_module(&ModuleKey::from("failed")).is_err());
         assert!(body.upgrade().is_none());
         let error = interp.module_recs["failed"].eval_error.clone().unwrap();
-        match interp.evaluate_module("failed") {
+        match interp.evaluate_module(&ModuleKey::from("failed")) {
             Err(Abrupt::Throw(second)) => assert!(interp.values_strict_equal(&error, &second)),
             _ => panic!("must return the same cached error"),
         }
@@ -2455,11 +2836,13 @@ mod body_retirement_tests {
         }));
         let namespace = interp.load_module("mixed", "import defer * as lazy from 'dep'; import { value, inc } from 'dep'; export { value, inc }; export function read() { return lazy.value; }").ok().unwrap();
         assert!(interp.module_recs["mixed"].body.is_empty());
-        assert_eq!(interp.eager_named_deps("mixed"), vec!["dep"]);
-        assert_eq!(interp.eager_dep_order("mixed"), vec!["dep"]);
+        let mixed_key = ModuleKey::from("mixed");
+        let dep_key = ModuleKey::from("dep");
+        assert_eq!(interp.eager_named_deps(&mixed_key), vec![dep_key.clone()]);
+        assert_eq!(interp.eager_dep_order(&mixed_key), vec![dep_key.clone()]);
         let mut graph = Vec::new();
-        interp.collect_eager_graph("mixed", &mut graph);
-        assert_eq!(graph, vec!["mixed", "dep"]);
+        interp.collect_eager_graph(&mixed_key, &mut graph);
+        assert_eq!(graph, vec![mixed_key, dep_key]);
         let inc = interp.get_member(&namespace, "inc").ok().unwrap();
         interp.invoke(inc, Value::Undefined, &[]).ok().unwrap();
         assert_eq!(number(&mut interp, &namespace, "value"), 4.0);
@@ -2482,7 +2865,7 @@ mod namespace_lifetime_tests {
             .parse_and_register("lifetime", Some("export const answer = 42;".into()))
             .ok()
             .expect("parse module");
-        interp.link_module("lifetime").ok().expect("link module");
+        interp.link_module(&ModuleKey::from("lifetime")).ok().expect("link module");
         let ns = interp.module_recs["lifetime"].ns.clone();
         let ptr = Gc::as_ptr(ns.as_obj().unwrap()) as usize;
         assert!(interp.is_namespace(ptr));

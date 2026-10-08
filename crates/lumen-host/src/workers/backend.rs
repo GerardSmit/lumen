@@ -109,6 +109,20 @@ pub trait WorkerScopeHost: 'static {
     }
 }
 
+/// The document embedding checks its policy before allocating ports or spawning a worker.
+pub trait WorkerRequestPolicy: 'static {
+    fn check(&self, ctx: &mut Ctx, url: &str, shared: bool) -> lumen::embed::OpResult<bool>;
+}
+struct RequestPolicySlot(Rc<dyn WorkerRequestPolicy>);
+pub fn set_request_policy(ctx: &mut Ctx, policy: Rc<dyn WorkerRequestPolicy>) {
+    ctx.op_state().put(RequestPolicySlot(policy));
+}
+pub(crate) fn check_request_policy(ctx: &mut Ctx, url: &str, shared: bool) -> lumen::embed::OpResult<bool> {
+    let policy = ctx.op_state().get::<RequestPolicySlot>().map(|slot|slot.0.clone());
+    if let Some(policy) = policy { return policy.check(ctx, url, shared); }
+    Ok(true)
+}
+
 struct BackendSlot(Rc<dyn WorkerBackend>);
 
 /// Make `backend` the implementation behind this realm's `Worker` and `SharedWorker`.

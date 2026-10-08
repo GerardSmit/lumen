@@ -14,54 +14,7 @@ fn null_attribute<'a>(
 }
 
 fn disabled_form_control(document: &lumen_html::Document, node: NodeId) -> OpResult<bool> {
-    let Some(name) = lumen_html::forms::html_element_local_name(document, node) else {
-        return Ok(false);
-    };
-    let disableable = matches!(
-        name,
-        "button" | "fieldset" | "input" | "optgroup" | "option" | "select" | "textarea"
-    );
-    if !disableable {
-        return Ok(false);
-    }
-    if null_attribute(document, node, "disabled").is_some() {
-        return Ok(true);
-    }
-
-    let mut ancestor = document.parent(node).map_err(dom_error)?;
-    while let Some(fieldset) = ancestor {
-        let disabled = lumen_html::forms::html_element_local_name(document, fieldset)
-            == Some("fieldset")
-            && null_attribute(document, fieldset, "disabled").is_some();
-        if disabled {
-            let mut first_legend = None;
-            let mut child = document.first_child(fieldset).map_err(dom_error)?;
-            while let Some(id) = child {
-                if lumen_html::forms::html_element_local_name(document, id) == Some("legend") {
-                    first_legend = Some(id);
-                    break;
-                }
-                child = document.next_sibling(id).map_err(dom_error)?;
-            }
-            let mut current = Some(node);
-            let mut exempt = false;
-            while let Some(id) = current {
-                if Some(id) == first_legend {
-                    exempt = true;
-                    break;
-                }
-                if id == fieldset {
-                    break;
-                }
-                current = document.parent(id).map_err(dom_error)?;
-            }
-            if !exempt {
-                return Ok(true);
-            }
-        }
-        ancestor = document.parent(fieldset).map_err(dom_error)?;
-    }
-    Ok(false)
+    Ok(lumen_html::forms::selector_disabled_state(document,node) == Some(true))
 }
 
 fn byte_offset(text: &str, offset: usize) -> usize {
@@ -146,9 +99,11 @@ impl DomRealm {
         };
         let previous = self.control_value(node)?;
         forms::set_control_value(self, &mut self.forms.borrow_mut(), node, value)?;
-        if self.supports_text_selection(node) {
+        if self.supports_text_selection(node)
+            || lumen_html::forms::input_type_state(self.session.borrow().document(), node) == "number" {
             let current = self.control_value(node)?;
-            if current != previous {
+            if current != previous
+                || lumen_html::forms::input_type_state(self.session.borrow().document(), node) == "number" {
                 let end = lumen_common::smuggle::utf16_unit_len(&current);
                 self.set_selection(node, end, end, "none")?;
             }
@@ -164,7 +119,7 @@ impl DomRealm {
     }
 
     fn edit_snapshot(&self, node: NodeId) -> OpResult<EditSnapshot> {
-        let value = self.control_value(node)?;
+        let value = self.control_edit_value(node)?;
         if value.len() > MAX_CONTROL_BYTES {
             return Err(OpError::new(
                 "RangeError",
@@ -188,7 +143,7 @@ impl DomRealm {
     ) -> Option<(String, usize, usize, bool, Option<(usize, usize)>)> {
         let live = {
             let state = self.forms.borrow();
-            match super::forms::live_value(&state, node) {
+            match super::forms::presentation_value(&state, node) {
                 Some(value) if value.len() > MAX_CONTROL_BYTES => return None,
                 Some(value) => Some(value.to_owned()),
                 None => None,
@@ -283,7 +238,7 @@ impl DomRealm {
         let session = self.session.borrow();
         let tag = lumen_html::forms::html_element_local_name(session.document(), node);
         let document = session.document();
-        let NodeKind::Element { .. } = document.kind(node).map_err(dom_error)? else {
+        let Ok(NodeKind::Element { .. }) = document.kind(node) else {
             return Ok(None);
         };
         let Some(tag) = tag else {
@@ -293,15 +248,16 @@ impl DomRealm {
         if !matches!(tag, "input" | "textarea")
             || (tag == "input"
                 && !matches!(
-                    attr("type").unwrap_or("text").to_ascii_lowercase().as_str(),
-                    "text" | "search" | "email" | "url" | "tel" | "password"
+                    lumen_html::forms::input_type_state(document, node),
+                    "text" | "search" | "email" | "url" | "tel" | "password" | "number"
                 ))
         {
             return Ok(None);
         }
         Ok(Some((
             tag == "textarea",
-            attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer),
+            (tag != "input" || lumen_html::forms::input_type_state(document, node) != "number")
+                .then(|| attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer)).flatten(),
             attr("readonly").is_some(),
         )))
     }
@@ -407,6 +363,8 @@ impl DomRealm {
         else {
             return Ok(false);
         };
+        if lumen_html::forms::input_type_state(self.session.borrow().document(), node) == "number"
+            && !lumen_html::forms::number_user_text_allowed(&replacement) { return Ok(false); }
         let data = data.map_or(Value::Null, Value::str);
         let properties = [
             ("inputType", Value::str(input_type)),
@@ -414,6 +372,7 @@ impl DomRealm {
             ("isComposing", Value::Bool(composing)),
         ];
         let epoch = self.value_epoch();
+        let input_state = lumen_html::forms::input_type_state(self.session.borrow().document(), node);
         let beforeinput_allowed = if trusted_input {
             self.dispatch_user_agent(ctx, node, "beforeinput", true, cancelable, &properties)?
         } else {
@@ -422,6 +381,8 @@ impl DomRealm {
         if !beforeinput_allowed {
             return Ok(false);
         }
+        if lumen_html::forms::input_type_state(self.session.borrow().document(), node) != input_state { return Ok(false); }
+        if !matches!(self.edit_control_info(node)?, Some((_, _, false))) { return Ok(false); }
         let after_beforeinput = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after_beforeinput.value != before.value {
             self.invalidate_editing_for_value_change(node);
@@ -439,6 +400,8 @@ impl DomRealm {
             {
                 return Ok(false);
             }
+            if !matches!(self.edit_control_info(node)?, Some((_, _, false))) { return Ok(false); }
+            if lumen_html::forms::input_type_state(self.session.borrow().document(), node) != input_state { return Ok(false); }
             let after_keypress = self.edit_snapshot(node)?;
             if self.value_changed_since(node, epoch) || after_keypress.value != before.value {
                 self.invalidate_editing_for_value_change(node);
@@ -464,6 +427,10 @@ impl DomRealm {
             self.dispatch_user_agent(ctx, node, "input", true, false, &properties)?;
         } else {
             self.dispatch(ctx, node, "input", true, false, &properties)?;
+        }
+        if !matches!(self.edit_control_info(node)?, Some((_, _, false))) {
+            self.invalidate_editing_for_value_change(node);
+            return Ok(true);
         }
         let after = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after.value != expected.value {
@@ -586,6 +553,7 @@ impl DomRealm {
         if !self.dispatch(ctx, node, "beforeinput", true, true, &properties)? {
             return Ok(false);
         }
+        if !matches!(self.edit_control_info(node)?, Some((_, _, false))) { return Ok(false); }
         let after_beforeinput = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after_beforeinput.value != before.value {
             self.invalidate_editing_for_value_change(node);
@@ -704,6 +672,7 @@ impl DomRealm {
             ("isComposing", Value::Bool(true)),
         ];
         self.dispatch(ctx, node, "beforeinput", true, false, &properties)?;
+        if !matches!(self.edit_control_info(node)?, Some((_, _, false))) { return Ok(false); }
         let after_beforeinput = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after_beforeinput.value != before.value {
             self.invalidate_editing_for_value_change(node);
@@ -803,25 +772,11 @@ impl DomRealm {
             }
             let Some(parent) = session
                 .document()
-                .composed_parent(current)
+                .flat_tree_parent(current)
                 .map_err(dom_error)?
             else {
                 return Ok(false);
             };
-            let mut children = session
-                .document()
-                .composed_children_iter(parent)
-                .map_err(dom_error)?;
-            let mut included = false;
-            while let Some(child) = children.next().map_err(dom_error)? {
-                if child == current {
-                    included = true;
-                    break;
-                }
-            }
-            if !included {
-                return Ok(false);
-            }
             current = parent;
         }
     }
@@ -836,6 +791,13 @@ impl DomRealm {
         } else {
             length
         }
+    }
+
+    fn control_edit_value(&self, node: NodeId) -> OpResult<String> {
+        if let Some(value) = forms::presentation_value(&self.forms.borrow(), node) {
+            return Ok(value.to_owned());
+        }
+        self.control_value(node)
     }
 
     pub fn control_value(&self, node: NodeId) -> OpResult<String> {
@@ -854,7 +816,7 @@ impl DomRealm {
 
     /// Selection offsets use UTF-16 code units, as in the DOM.
     pub fn selection(&self, node: NodeId) -> OpResult<(usize, usize, String)> {
-        let value = self.control_value(node)?;
+        let value = self.control_edit_value(node)?;
         let length = lumen_common::smuggle::utf16_unit_len(&value);
         let (start, end, direction) =
             self.selections
@@ -875,7 +837,7 @@ impl DomRealm {
         end: usize,
         direction: &str,
     ) -> OpResult<()> {
-        let value = self.control_value(node)?;
+        let value = self.control_edit_value(node)?;
         let length = lumen_common::smuggle::utf16_unit_len(&value);
         let end = end.min(length);
         self.selections.borrow_mut().insert(
@@ -1071,57 +1033,52 @@ impl DomRealm {
     }
 
     pub fn focus_next(self: &Rc<Self>, ctx: &mut Ctx, backwards: bool) -> OpResult<()> {
-        let mut order = Vec::new();
-        {
-            let session = self.session.borrow();
-            let document = session.document();
-            let root = document.root();
-            let mut pending = vec![root];
-            while let Some(node) = pending.pop() {
-                if let NodeKind::Element {
-                    name, attributes, ..
-                } = document.kind(node).map_err(dom_error)?
-                {
-                    let attr = |key: &str| {
-                        attributes
-                            .iter()
-                            .find(|(name, _)| name == key)
-                            .map(|(_, value)| value.as_str())
-                    };
-                    let natural = matches!(
-                        name.as_str(),
-                        "input" | "textarea" | "button" | "select" | "summary"
-                    ) || (matches!(name.as_str(), "a" | "area")
-                        && attr("href").is_some())
-                        || attr("contenteditable").is_some_and(|value| value != "false");
-                    let index = attr("tabindex")
-                        .and_then(|value| value.parse::<i32>().ok())
-                        .unwrap_or(if natural { 0 } else { -1 });
-                    if index >= 0 && !disabled_form_control(document, node)? {
-                        order.push((if index == 0 { i32::MAX } else { index }, node));
-                    }
-                }
-                let children = document.composed_children(node).map_err(dom_error)?;
-                pending
-                    .try_reserve(children.len())
-                    .map_err(|_| OpError::new("RangeError", "focus traversal allocation failed"))?;
-                pending.extend(children.into_iter().rev());
-            }
-        }
-        let mut rendered = Vec::new();
-        for entry in order {
-            if self.focus_rendered(entry.1)? {
-                rendered.push(entry);
-            }
-        }
-        let mut order = rendered;
-        order.sort_by_key(|entry| entry.0);
+        let order=super::focus::sequential_order(self)?;
         if order.is_empty() {
+            super::fragment::clear_sequential_focus_start(self);
             return self.focus(ctx, None);
+        }
+        let focused=super::focus::currently_focused(self);
+        let starting=self.sequential_focus_start().filter(|start| {
+            let session=self.session.borrow();
+            let document=session.document();
+            document.is_connected_element(*start) && focused.is_none_or(|focused|
+                document.is_host_including_inclusive_ancestor(focused,*start).unwrap_or(false))
+        });
+        if let Some(start)=starting.filter(|start|!order.iter().any(|(_,node)|node==start)) {
+            // A fragment target omitted from the tabindex order (including an
+            // unfocusable target) uses the standard's DOM selection mechanism.
+            // Search shadow-including tree order, not the positive-tabindex sort.
+            let mut suitable=HashSet::new();
+            suitable.try_reserve(order.len()).map_err(|_|OpError::new("QuotaExceededError","focus candidate allocation"))?;
+            suitable.extend(order.iter().map(|(_,node)|*node));
+            let candidate={
+                let session=self.session.borrow();
+                let document=session.document();
+                let root=document.root();
+                let mut cursor=Some(root);
+                let mut after=false;
+                let mut candidate=None;
+                while let Some(node)=cursor {
+                    if node==start {
+                        if backwards { break; }
+                        after=true;
+                    } else if suitable.contains(&node) {
+                        if backwards { candidate=Some(node); }
+                        else if after { candidate=Some(node);break; }
+                    }
+                    cursor=selector::next_shadow_including_descendant(document,root,node).map_err(dom_error)?;
+                }
+                candidate
+            };
+            if let Some(candidate)=candidate { return super::focus::focus_in_realm(ctx,self,candidate); }
+            super::fragment::clear_sequential_focus_start(self);
+            // This host has no browser controls: use the permitted kiosk
+            // restart at the traversable when the DOM search reaches an edge.
         }
         let current = order
             .iter()
-            .position(|(_, node)| Some(*node) == self.focused_node());
+            .position(|(_, node)| Some(*node) == starting.or(focused));
         let index = if backwards {
             current.map_or(order.len() - 1, |index| {
                 (index + order.len() - 1) % order.len()
@@ -1129,7 +1086,7 @@ impl DomRealm {
         } else {
             current.map_or(0, |index| (index + 1) % order.len())
         };
-        self.focus(ctx, Some(order[index].1))
+        super::focus::focus_in_realm(ctx,&order[index].0,order[index].1)
     }
 
     pub(super) fn edit_control_key(
@@ -1198,7 +1155,7 @@ impl DomRealm {
             }
             if tag == "input"
                 && !matches!(
-                    attr("type").unwrap_or("text"),
+                    lumen_html::forms::input_type_state(document, node),
                     "text" | "search" | "email" | "url" | "tel" | "password" | "number"
                 )
             {
@@ -1206,11 +1163,12 @@ impl DomRealm {
             }
             (
                 tag == "textarea",
-                attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer),
+                (tag != "input" || lumen_html::forms::input_type_state(document, node) != "number")
+                .then(|| attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer)).flatten(),
                 attr("readonly").is_some(),
             )
         };
-        let value = self.control_value(node)?;
+        let value = self.control_edit_value(node)?;
         if value.len() > 64 * 1024 {
             return Ok(());
         }
@@ -1333,6 +1291,254 @@ mod tests {
                 panic!("JavaScript threw while evaluating `{source}`: {message}");
             }
         }
+    }
+
+    #[test]
+    fn specification_number_user_editing_keeps_partial_text_api_validity_and_events() {
+        let mut engine = Engine::new();
+        let realm = install(
+            engine.ctx(),
+            "<form id=f><input id=n type=number required maxlength=1 value=7></form>",
+            128,
+        )
+        .unwrap();
+        let node = realm.with_session(|session| {
+            lumen_html::selector::get_element_by_id(
+                session.document(),
+                session.document().root(),
+                "n",
+            )
+            .unwrap()
+            .unwrap()
+        });
+        eval_value_or_panic(&mut engine, "var n=document.getElementById('n');var events=[];n.value='';n.addEventListener('beforeinput',e=>events.push([e.type,e.inputType,e.data,e.isTrusted,n.value]));n.addEventListener('input',e=>events.push([e.type,e.inputType,e.data,e.isTrusted,n.value]));");
+        for key in ["1", "."] {
+            realm
+                .edit_control_key_with_keypress(
+                    engine.ctx(),
+                    node,
+                    &[("key", Value::str(key))],
+                    true,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(realm.control_value(node).unwrap(), "1");
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.");
+        assert!(matches!(eval_value_or_panic(&mut engine, "n.selectionStart===null && n.selectionEnd===null && !n.validity.badInput && events.length===4 && events.every(e=>e[3]) && events[2][4]==='1'"), Value::Bool(true)));
+        realm
+            .edit_control_key_with_keypress(
+                engine.ctx(),
+                node,
+                &[("key", Value::str("e"))],
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.e");
+        eval_value_or_panic(&mut engine, "n.type='NUMBER';");
+        assert_eq!(
+            realm.host_text_input_state(node).unwrap().0,
+            "1.e",
+            "unchanged type state retains partial editing text"
+        );
+        assert!(matches!(eval_value_or_panic(&mut engine, "n.value==='' && Number.isNaN(n.valueAsNumber) && n.validity.badInput && n.validity.valueMissing && !n.validity.tooLong"), Value::Bool(true)));
+        assert!(realm.host_undo(engine.ctx(), node).unwrap());
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.");
+        assert_eq!(realm.control_value(node).unwrap(), "1");
+        assert!(realm.host_redo(engine.ctx(), node).unwrap());
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.e");
+        assert_eq!(realm.control_value(node).unwrap(), "");
+        realm
+            .edit_control_key_with_keypress(
+                engine.ctx(),
+                node,
+                &[("key", Value::str("Backspace"))],
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(realm.control_value(node).unwrap(), "1");
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.");
+        eval_value_or_panic(&mut engine, "n.value='';");
+        for key in ["1", "2", "3", "4"] {
+            realm
+                .edit_control_key_with_keypress(
+                    engine.ctx(),
+                    node,
+                    &[("key", Value::str(key))],
+                    true,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            realm.control_value(node).unwrap(),
+            "1234",
+            "maxlength is inapplicable to Number"
+        );
+        eval_value_or_panic(&mut engine, "n.value='1.e';");
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "");
+        assert!(matches!(
+            eval_value_or_panic(&mut engine, "!n.validity.badInput"),
+            Value::Bool(true)
+        ));
+        eval_value_or_panic(&mut engine, "document.getElementById('f').reset();");
+        assert_eq!(realm.control_value(node).unwrap(), "7");
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "7");
+    }
+
+    #[test]
+    fn specification_number_user_editing_cancellation_reentry_clone_and_adoption() {
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<input id=n type=number>", 128).unwrap();
+        let node = realm.with_session(|session| {
+            lumen_html::selector::get_element_by_id(
+                session.document(),
+                session.document().root(),
+                "n",
+            )
+            .unwrap()
+            .unwrap()
+        });
+        eval_value_or_panic(&mut engine, "var n=document.getElementById('n');var calls=0;function cancel(e){e.preventDefault()};n.addEventListener('beforeinput',cancel);n.addEventListener('input',()=>calls++);");
+        realm
+            .edit_control_key_with_keypress(
+                engine.ctx(),
+                node,
+                &[("key", Value::str("1"))],
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            eval_value_or_panic(
+                &mut engine,
+                "n.value==='' && !n.validity.badInput && calls===0"
+            ),
+            Value::Bool(true)
+        ));
+        eval_value_or_panic(&mut engine, "n.removeEventListener('beforeinput',cancel);n.addEventListener('beforeinput',()=>n.value='42',{once:true});");
+        realm
+            .edit_control_key_with_keypress(
+                engine.ctx(),
+                node,
+                &[("key", Value::str("1"))],
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            eval_value_or_panic(&mut engine, "n.value==='42' && calls===0"),
+            Value::Bool(true)
+        ));
+        eval_value_or_panic(&mut engine, "n.readOnly=true;");
+        realm
+            .edit_control_key_with_keypress(
+                engine.ctx(),
+                node,
+                &[("key", Value::str("9"))],
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            eval_value_or_panic(&mut engine, "n.value==='42' && calls===0"),
+            Value::Bool(true)
+        ));
+        eval_value_or_panic(&mut engine, "n.readOnly=false;n.value='';");
+        for key in ["1", ".", "e"] {
+            realm
+                .edit_control_key_with_keypress(
+                    engine.ctx(),
+                    node,
+                    &[("key", Value::str(key))],
+                    true,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(matches!(eval_value_or_panic(&mut engine, "var c=n.cloneNode();c.value==='' && !c.validity.badInput && n.validity.badInput"), Value::Bool(true)), "cloning copies API value, not UI interaction state");
+        assert!(matches!(eval_value_or_panic(&mut engine, "var other=document.implementation.createHTMLDocument('');other.adoptNode(n);n.value==='' && n.validity.badInput && n.ownerDocument===other"), Value::Bool(true)), "adoption preserves actual UI state");
+        assert!(
+            matches!(
+                eval_value_or_panic(
+                    &mut engine,
+                    "n.type='text';n.value==='' && !n.validity.badInput"
+                ),
+                Value::Bool(true)
+            ),
+            "type changes sanitize and discard the Number editing buffer"
+        );
+    }
+
+    #[test]
+    fn specification_number_user_editing_paints_partial_text_and_content_size_without_attribute_changes(
+    ) {
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<!doctype html><style>body{margin:0}input{display:block;appearance:none;field-sizing:content;font-size:20px;border:0;padding:0;margin:0;color:black;background:white}</style><input id=n type=number value=''>", 128).unwrap();
+        let fonts = crate::canvas::canvas_fallback_fonts();
+        let node = realm.with_session(|session| {
+            lumen_html::selector::get_element_by_id(
+                session.document(),
+                session.document().root(),
+                "n",
+            )
+            .unwrap()
+            .unwrap()
+        });
+        let (before, width, document_version) = realm.with_session(|session| {
+            let list = session.display_list(300, 100, fonts).unwrap().clone();
+            (
+                list,
+                session.layout_rect(node).unwrap().width,
+                session.document().version(),
+            )
+        });
+        for key in ["1", ".", "e"] {
+            realm
+                .edit_control_key_with_keypress(
+                    engine.ctx(),
+                    node,
+                    &[("key", Value::str(key))],
+                    true,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(realm.control_value(node).unwrap(), "");
+        assert_eq!(realm.host_text_input_state(node).unwrap().0, "1.e");
+        realm.with_session(|session| {
+            let after = session.display_list(300, 100, fonts).unwrap().clone();
+            assert_eq!(session.document().version(), document_version);
+            assert_eq!(
+                session
+                    .document()
+                    .get_attribute_ns_ref(node, None, "value")
+                    .unwrap(),
+                Some("")
+            );
+            assert!(
+                session.layout_rect(node).unwrap().width > width,
+                "field-sizing measures the visible buffer rather than empty API value"
+            );
+            let unchanged = session.display_list(300, 100, fonts).unwrap().clone();
+            assert_eq!(after, unchanged);
+            let mut fresh = lumen_html::RenderSession::new(session.document().clone());
+            let fresh_list = fresh.display_list(300, 100, fonts).unwrap().clone();
+            assert_eq!(
+                after, fresh_list,
+                "retained and fresh use the same borrowed actual form presentation state"
+            );
+            let first_pixels =
+                lumen_html_image::render_with_font(&before, 300, 100, 1.0, true, fonts).unwrap();
+            let last_pixels =
+                lumen_html_image::render_with_font(&after, 300, 100, 1.0, true, fonts).unwrap();
+            assert_ne!(
+                first_pixels.pixels, last_pixels.pixels,
+                "partial numeric entry is actually painted"
+            );
+        });
     }
 
     #[test]

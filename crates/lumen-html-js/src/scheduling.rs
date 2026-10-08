@@ -22,6 +22,7 @@ pub fn set_checkpoint_hook(
 
 fn checkpoint(engine: &mut lumen::Engine) -> Vec<Value> {
     while engine.run_one_job() {}
+    lumen_host::indexed_db::end_task(engine.ctx());
     let hook = engine.ctx().op_state().get::<CheckpointHook>().cloned();
     // Drain native producer diagnostics independently of the embedder's Promise
     // notification hook. Error materialization happens after releasing the queue.
@@ -33,6 +34,8 @@ fn checkpoint(engine: &mut lumen::Engine) -> Vec<Value> {
 struct HtmlTask {
     id: u64,
     realm: lumen::embed::RealmHandle,
+    document: Option<std::rc::Weak<DomRealm>>,
+    navigation: bool,
     callback: Option<HtmlTaskCallback>,
     ready: Option<Rc<Cell<bool>>>,
     eligible_this_turn: bool,
@@ -148,6 +151,7 @@ struct TaskQueue(Rc<RefCell<TaskQueueState>>);
 
 struct TaskOwner {
     realm: lumen::embed::RealmHandle,
+    document: Option<std::rc::Weak<DomRealm>>,
 }
 
 /// A document may capture task admission without retaining its Window/global.
@@ -179,9 +183,11 @@ fn task_queue(ctx: &mut Ctx) -> Rc<RefCell<TaskQueueState>> {
 pub(crate) fn task_sender(ctx: &mut Ctx) -> OpResult<TaskSender> {
     let queue = task_queue(ctx);
     let realm = ctx.current_host_realm();
+    let document = super::window_globals::current_dom_realm(ctx).map(|document| Rc::downgrade(&document));
     let owner = {
         let mut state = queue.borrow_mut();
-        if let Some(owner) = state.owners.iter().find(|owner| owner.realm.same_realm(&realm)) {
+        if let Some(owner) = state.owners.iter().find(|owner| owner.realm.same_realm(&realm)
+            && match (&owner.document, &document) { (Some(a), Some(b)) => a.ptr_eq(b), (None, None) => true, _ => false }) {
             owner.clone()
         } else {
             if state.owners.len() >= MAX_PENDING_HTML_TASKS {
@@ -189,7 +195,7 @@ pub(crate) fn task_sender(ctx: &mut Ctx) -> OpResult<TaskSender> {
             }
             state.owners.try_reserve(1)
                 .map_err(|_| OpError::new("QuotaExceededError", "HTML task owner allocation failed"))?;
-            let owner = Rc::new(TaskOwner { realm });
+            let owner = Rc::new(TaskOwner { realm, document });
             state.owners.push(owner.clone());
             owner
         }
@@ -200,6 +206,8 @@ pub(crate) fn task_sender(ctx: &mut Ctx) -> OpResult<TaskSender> {
 fn admit_task(
     queue: &Rc<RefCell<TaskQueueState>>,
     realm: lumen::embed::RealmHandle,
+    document: Option<std::rc::Weak<DomRealm>>,
+    navigation: bool,
     callback: HtmlTaskCallback,
     ready: Option<Rc<Cell<bool>>>,
 ) -> Result<u64, TaskAdmissionFailure> {
@@ -218,7 +226,7 @@ fn admit_task(
     let id = queue.next_id;
     queue.idle_scan_epoch.set(None);
     if ready.is_some() { queue.gated += 1; }
-    queue.tasks.push_back(HtmlTask { id, realm, callback: Some(callback), ready, eligible_this_turn: false });
+    queue.tasks.push_back(HtmlTask { id, realm, document, navigation, callback: Some(callback), ready, eligible_this_turn: false });
     Ok(id)
 }
 
@@ -241,6 +249,7 @@ impl TaskHandle {
         let index = queue.tasks.partition_point(|task| task.id < self.id);
         if let Some(task) = queue.tasks.get_mut(index).filter(|task| task.id == self.id) {
             task.realm = owner.realm.clone();
+            task.document = owner.document.clone();
         }
         Ok(())
     }
@@ -260,7 +269,6 @@ impl TaskSender {
         true
     }
 
-    #[cfg(test)]
     pub(crate) fn queue(
         &self, callback: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static,
     ) -> Result<(), TaskAdmissionFailure> {
@@ -297,7 +305,7 @@ impl TaskSender {
                 cause: TaskDiagnosticCause::OwnerRetired, callback,
             });
         };
-        admit_task(&queue, owner.realm.clone(), callback, ready)
+        admit_task(&queue, owner.realm.clone(), owner.document.clone(), false, callback, ready)
             .map(|id| TaskHandle { queue: Rc::downgrade(&queue), id })
     }
 }
@@ -352,7 +360,57 @@ pub fn queue_task(
     task: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static,
 ) -> OpResult<()> {
     let realm = ctx.current_host_realm();
-    admit_task(&task_queue(ctx), realm, Box::new(task), None).map(|_| ()).map_err(|failure| failure.error)
+    let document = super::window_globals::current_dom_realm(ctx).map(|document| Rc::downgrade(&document));
+    admit_task(&task_queue(ctx), realm, document, false, Box::new(task), None).map(|_| ()).map_err(|failure| failure.error)
+}
+
+pub(crate) fn queue_navigation_task(ctx: &mut Ctx, task: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static) -> OpResult<()> {
+    let realm = ctx.current_host_realm();
+    let document = super::window_globals::current_dom_realm(ctx).map(|document| Rc::downgrade(&document));
+    admit_task(&task_queue(ctx), realm, document, true, Box::new(task), None).map(|_| ()).map_err(|failure| failure.error)
+}
+
+pub(crate) fn queue_navigation_when_ready(ctx: &mut Ctx, ready: Rc<Cell<bool>>, task: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static) -> OpResult<()> {
+    let realm=ctx.current_host_realm();
+    let document=super::window_globals::current_dom_realm(ctx).map(|document|Rc::downgrade(&document));
+    admit_task(&task_queue(ctx),realm,document,true,Box::new(task),Some(ready))
+        .map(|_|()).map_err(|failure|failure.error)
+}
+
+/// Destroying a Document cancels its tasks even if its Window is reused.
+/// Callback leases are dropped only after releasing the queue borrow.
+pub(crate) fn cancel_tasks_for_document(ctx: &mut Ctx, document: &Rc<DomRealm>) -> usize {
+    let identity = Rc::downgrade(document);
+    let mut callbacks = Vec::new();
+    let mut removed = 0;
+    if let Some(queue) = ctx.op_state().get::<TaskQueue>().cloned() {
+        let mut queue = queue.0.borrow_mut();
+        queue.owners.retain(|owner| !owner.document.as_ref().is_some_and(|owner| owner.ptr_eq(&identity)));
+        let before = queue.tasks.len();
+        let mut gated = 0;
+        queue.tasks.retain_mut(|task| {
+            if task.document.as_ref().is_some_and(|owner| owner.ptr_eq(&identity)) {
+                if task.ready.is_some() { gated += 1; }
+                if let Some(callback) = task.callback.take() { callbacks.push(callback); }
+                false
+            } else { true }
+        });
+        removed = before - queue.tasks.len();
+        queue.gated -= gated;
+        queue.idle_scan_epoch.set(None);
+        queue.release_idle_capacity();
+    }
+    drop(callbacks);
+    if super::window_globals::current_dom_realm(ctx).is_some_and(|current| Rc::ptr_eq(&current, document)) {
+        let global = ctx.global_object();
+        if let Some(state) = super::realm_services::RealmServices::<RefCell<Scheduler>>::remove_for_global(ctx, &global) {
+            let mut state = state.borrow_mut();
+            removed += state.frames.len() + state.idle.len();
+            state.frames.clear(); state.frame_order.clear();
+            state.idle.clear(); state.idle_order.clear();
+        }
+    }
+    removed
 }
 
 pub fn task_pending(ctx: &mut Ctx) -> bool {
@@ -372,7 +430,26 @@ fn task_ready(task: &HtmlTask) -> bool {
 /// Run admitted tasks with checkpoints between callbacks. New tasks wait for
 /// a later host turn, and one callback's exception does not drop other tasks.
 pub fn run_tasks(engine: &mut lumen::Engine, budget: usize) -> Vec<Value> {
-    let mut errors = checkpoint(engine);
+    run_task_source(engine, budget, false,false).into_iter().map(|failure|failure.value).collect()
+}
+
+/// HTML task sources are independently ordered. A navigation transaction can
+/// drive its source without dispatching older posted-message/rendering work.
+pub fn run_navigation_tasks(engine: &mut lumen::Engine, budget: usize) -> Vec<Value> {
+    run_task_source(engine, budget, true,false).into_iter().map(|failure|failure.value).collect()
+}
+
+/// Reporting happens before the task's actual realm scope exits. Diagnostics
+/// remain available without making an embedder dispatch their error event twice.
+pub struct TaskFailure {pub value:Value,pub reported:bool}
+
+pub fn run_tasks_with_reporting(engine:&mut lumen::Engine,budget:usize,navigation_only:bool)->Vec<TaskFailure> {
+    run_task_source(engine,budget,navigation_only,true)
+}
+
+fn run_task_source(engine: &mut lumen::Engine, budget: usize, navigation_only: bool,report:bool) -> Vec<TaskFailure> {
+    let embed_errors=if navigation_only {Vec::new()} else {super::object_loading::checkpoint_embed_tasks(engine)};
+    let mut errors:Vec<_> = embed_errors.into_iter().chain(checkpoint(engine)).into_iter().map(|value|TaskFailure{value,reported:false}).collect();
     let queue = engine.ctx().op_state().get::<TaskQueue>().cloned();
     let (count, boundary) = queue.as_ref().map_or((0, None), |queue| {
         let mut queue = queue.0.borrow_mut();
@@ -381,14 +458,16 @@ pub fn run_tasks(engine: &mut lumen::Engine, budget: usize) -> Vec<Value> {
         let mut boundary = None;
         for task in queue.tasks.iter_mut() {
             if count >= budget { break; }
-            task.eligible_this_turn = task_ready(task);
+            task.eligible_this_turn = task_ready(task) && (!navigation_only || task.navigation);
             if task.eligible_this_turn {
                 count += 1;
                 boundary = Some(task.id);
             }
         }
         if boundary.is_none() {
-            queue.idle_scan_epoch.set(Some(readiness_epoch()));
+            // A source-specific scan says nothing about ready tasks in other
+            // sources. Only the complete scan can establish queue idleness.
+            if !navigation_only { queue.idle_scan_epoch.set(Some(readiness_epoch())); }
             queue.release_idle_capacity();
         }
         (count, boundary)
@@ -414,13 +493,17 @@ pub fn run_tasks(engine: &mut lumen::Engine, budget: usize) -> Vec<Value> {
         if let Some(mut task) = task {
             match engine.ctx().with_host_realm(&task.realm, |ctx| {
                 (task.callback.take().expect("admitted HTML task callback"))(ctx)
-                    .map_err(|error| error.to_value(ctx))
+                    .map_err(|error| {
+                        let value=error.to_value(ctx);
+                        let reported=report && super::DomRealm::report_browser_exception(ctx,value.clone()).is_some();
+                        TaskFailure{value,reported}
+                    })
             }) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => errors.push(error),
-                Err(error) => errors.push(engine.ctx().make_error("Error", error.to_string())),
+                Err(error) => errors.push(TaskFailure{value:engine.ctx().make_error("Error", error.to_string()),reported:false}),
             }
-            errors.extend(checkpoint(engine));
+            errors.extend(checkpoint(engine).into_iter().map(|value|TaskFailure{value,reported:false}));
         }
     }
     if let Some(queue) = queue.as_ref() {
@@ -551,6 +634,16 @@ mod globals {
 
 pub(crate) fn install(ctx: &mut Ctx) -> Result<(), Value> {
     lumen_host::perf::start_clock();
+    rebind_document(ctx);
+    let constructor = ctx.class_constructor::<IdleDeadline>();
+    let global = ctx.global_object();
+    crate::install_interface(ctx, &global, "IdleDeadline", constructor)
+        .map_err(|_| ctx.make_error("Error", "IdleDeadline install failed"))?;
+    ctx.install_module::<globals::Module>(&global)
+}
+
+pub(crate) fn rebind_document(ctx: &mut Ctx) {
+    super::scrolling::rebind_scroll_document(ctx);
     super::realm_services::RealmServices::replace_current(
         ctx,
         RefCell::new(Scheduler {
@@ -561,17 +654,17 @@ pub(crate) fn install(ctx: &mut Ctx) -> Result<(), Value> {
             idle_order: Vec::new(),
         }),
     );
-    let constructor = ctx.class_constructor::<IdleDeadline>();
-    let global = ctx.global_object();
-    crate::install_interface(ctx, &global, "IdleDeadline", constructor)
-        .map_err(|_| ctx.make_error("Error", "IdleDeadline install failed"))?;
-    ctx.install_module::<globals::Module>(&global)
 }
 
 /// Whether a rendering opportunity must wake this realm.
 pub fn animation_frame_pending(ctx: &mut Ctx) -> bool {
     scheduler(ctx).is_some_and(|state| !state.borrow().frames.is_empty())
         || super::animations::pending(ctx)
+        || super::animation_worklet::pending(ctx)
+        || super::scrolling::smooth_scroll_pending(ctx)
+        || super::scrolling::scroll_events_pending(ctx)
+        || super::navigation_lifecycle::reveal_pending(ctx)
+        || super::view_transition::pending(ctx)
 }
 
 /// Earliest idle timeout, or zero when an idle opportunity could do useful work.
@@ -655,18 +748,49 @@ pub fn run_animation_frame_in_realm(
     engine: &mut lumen::Engine,
     realm: &lumen::embed::RealmHandle,
 ) -> Vec<Value> {
-    let timestamp = lumen_host::perf::web_now_ms();
+    run_animation_frame_in_realm_at(engine,realm,lumen_host::perf::web_now_ms())
+}
+
+/// Supply one host rendering opportunity with its actual timeline timestamp.
+/// All rendering services and callbacks share this same opportunity time.
+pub(crate) fn run_animation_frame_in_realm_at(
+    engine:&mut lumen::Engine,realm:&lumen::embed::RealmHandle,timestamp:f64,
+)->Vec<Value> {
+    let blocked=engine.ctx().with_host_realm(realm,|ctx|super::window_globals::current_dom_realm(ctx)
+        .is_some_and(|document|document.rendering_blocked_at(timestamp)));
+    if matches!(blocked,Ok(true)) {return Vec::new()}
     let mut errors = Vec::new();
-    match engine.ctx().with_host_realm(realm, |ctx| {
-        super::animations::advance(ctx, timestamp).map_err(|error| {
-            let error = error.to_value(ctx);
-            super::DomRealm::report_exception(ctx, error.clone());
-            error
-        })
-    }) {
+
+    match engine.ctx().with_host_realm(realm, super::navigation_lifecycle::reveal) {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => errors.push(error),
+        Ok(Err(error)) => {
+            let error = error.to_value(engine.ctx());
+            super::DomRealm::report_exception(engine.ctx(), error.clone());
+            errors.push(error);
+        }
         Err(error) => errors.push(engine.ctx().make_error("Error", error.to_string())),
+    }
+    errors.extend(checkpoint(engine));
+
+    // A failing service must not strand another service's pending frame work.
+    for service in 0..4 {
+        match engine.ctx().with_host_realm(realm, |ctx| {
+            let result = match service {
+                0 => super::animations::advance(ctx, timestamp),
+                1 => super::scrolling::advance_smooth_scrolls(ctx, timestamp),
+                2 => super::scrolling::run_scroll_steps(ctx),
+                _ => super::view_transition::advance(ctx),
+            };
+            result.map_err(|error| {
+                let error = error.to_value(ctx);
+                super::DomRealm::report_exception(ctx, error.clone());
+                error
+            })
+        }) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(engine.ctx().make_error("Error", error.to_string())),
+        }
     }
     errors.extend(checkpoint(engine));
     let Some(state) = engine
@@ -766,6 +890,52 @@ pub fn run_idle_callbacks_in_realm(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_window_summary_toggle_coalesces_across_browser_navigation_source_pump() {
+        let mut runtime=lumen_runtime::Runtime::new_browser();
+        let _realm=crate::install(runtime.engine().ctx(),"<!doctype html><details id=d><summary id=s>toggle</summary></details>",64).unwrap();
+        let result=runtime.engine().eval_value(r#"globalThis.toggleCalls=[];
+            document.getElementById('d').addEventListener('toggle',event=>toggleCalls.push([event.oldState,event.newState]));
+            for(let i=0;i<4;i++)document.getElementById('s').click();
+            Promise.resolve().then(()=>document.getElementById('s').click());true"#).unwrap();
+        assert!(matches!(result,Ok(Value::Bool(true))));
+        let before=runtime.engine().eval_value("JSON.stringify({open:document.getElementById('d').open,connected:document.getElementById('d').isConnected,constructor:document.getElementById('s').constructor.name})").unwrap().ok()
+            .and_then(|value|runtime.engine().ctx().coerce_string(&value).ok()).map(|value|value.to_string()).unwrap_or_default();
+        let queued_before=runtime.engine().ctx().op_state().get::<TaskQueue>().map(|queue| {
+            let queue=queue.0.borrow();
+            (queue.tasks.len(),queue.gated,queue.owners.len(),queue.tasks.iter().filter(|task|task_ready(task)).count(),queue.scan_known_idle())
+        });
+        runtime.run_until_idle();
+        // The unit-test crate and Runtime's normal html-js dependency have
+        // distinct op-state TypeIds; adapter guards test the single-instance
+        // Runtime path. Pump this crate's actual source boundaries here.
+        for _ in 0..8 {
+            if !task_pending(runtime.engine().ctx()) { break; }
+            assert!(run_navigation_tasks(runtime.engine(),64).is_empty());
+            assert!(run_tasks(runtime.engine(),64).is_empty());
+        }
+        let observed=runtime.engine().eval_value("JSON.stringify(toggleCalls)").unwrap().ok()
+            .and_then(|value|runtime.engine().ctx().coerce_string(&value).ok()).map(|value|value.to_string()).unwrap_or_default();
+        let result=runtime.engine().eval_value("toggleCalls.length===1&&toggleCalls[0][0]==='closed'&&toggleCalls[0][1]==='open'").unwrap();
+        assert!(matches!(result,Ok(Value::Bool(true))),"real toggle task was skipped or failed to coalesce; calls={observed}, before={before}, queue={queued_before:?}");
+    }
+
+    #[test]
+    fn specification_window_navigation_source_scan_preserves_ready_gated_dom_tasks() {
+        let mut engine = lumen::Engine::new();
+        let sender = task_sender(engine.ctx()).unwrap();
+        let ready = Rc::new(Cell::new(true));
+        let calls = Rc::new(Cell::new(0));
+        let observed = calls.clone();
+        assert!(sender.queue_when_ready(ready, move |_| { observed.set(observed.get()+1); Ok(()) }).is_ok());
+        assert!(run_navigation_tasks(&mut engine, 16).is_empty());
+        assert_eq!(calls.get(), 0);
+        assert!(task_pending(engine.ctx()), "another task source remains runnable");
+        assert!(run_tasks(&mut engine, 16).is_empty());
+        assert_eq!(calls.get(), 1);
+        assert!(!task_pending(engine.ctx()));
+    }
+
     #[test]
     fn prepared_task_readiness_preserves_initial_turn_order() {
         let mut engine = lumen::Engine::new();

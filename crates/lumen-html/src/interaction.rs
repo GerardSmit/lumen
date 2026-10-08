@@ -24,15 +24,17 @@ pub enum InteractionPseudo {
     FocusVisible,
     Hover,
     Active,
+    Target,
 }
 
 impl InteractionPseudo {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Focus,
         Self::FocusWithin,
         Self::FocusVisible,
         Self::Hover,
         Self::Active,
+        Self::Target,
     ];
 
     const fn bit(self) -> u8 {
@@ -66,6 +68,7 @@ impl InteractionSet {
 pub(crate) fn matches(document: &Document, node: NodeId, pseudo: InteractionPseudo) -> bool {
     let state = document.interaction_state();
     match pseudo {
+        InteractionPseudo::Target => document.target_element() == Some(node),
         InteractionPseudo::Focus => state.focused == Some(node),
         InteractionPseudo::FocusVisible => state.focus_visible == Some(node),
         InteractionPseudo::FocusWithin => state

@@ -27,7 +27,7 @@ use crate::events::DomException;
 use lumen::embed::{Ctx, OpError, Value};
 
 pub use body::{extract_body, ExtractedBody};
-pub use flow::{start, RequestControl, RequestSpec, Response, ResponseKind};
+pub use flow::{start, start_policy_report, start_reporting_report, start_resource, ResourcePolicy, RequestControl, RequestSpec, Response, ResponseKind};
 pub use lumen_common::cors::{Credentials, Mode, Redirect};
 pub use transport::{
     cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, SyncResponse, Transport,
@@ -37,6 +37,31 @@ pub use fetch::{
     served_response, ServedResponse,
 };
 pub use xhr::bindings;
+
+/// Cancellation for a user-agent resource body still being consumed.
+pub struct ResourceBodyControl(std::rc::Rc<fetch_body::Drain>);
+impl ResourceBodyControl {
+    pub fn cancel(&self,ctx:&mut Ctx) {
+        let reason=OpError::new("AbortError","Resource body cancelled").to_value(ctx);
+        self.0.cancel(ctx,reason);
+    }
+}
+
+/// Consume a transport resource with the same reader and cancellation machinery
+/// as fetch, enforcing the user-agent resource's own byte budget while reading.
+pub fn consume_resource_body(ctx:&mut Ctx,body:ResponseBody,limit:usize,
+    done:impl FnOnce(&mut Ctx,Result<Vec<u8>,Value>)+'static)->Option<ResourceBodyControl> {
+    let body=match body {
+        ResponseBody::None=>fetch_body::Body::null(),
+        ResponseBody::Bytes(bytes)=>{
+            if bytes.len()>limit {let reason=OpError::type_error("Response body exceeds the resource byte budget").to_value(ctx);done(ctx,Err(reason));}
+            else {done(ctx,Ok(bytes));}
+            return None;
+        },
+        ResponseBody::Reader(reader)=>fetch_body::Body::net(fetch_body::NetBody::new(reader)),
+    }.cell();
+    Some(ResourceBodyControl(fetch_body::read_all_bounded(ctx,&body,limit,Box::new(done))))
+}
 
 /// A `DOMException` of the given name as an error to throw.
 pub fn dom_error(ctx: &mut Ctx, name: &str, message: impl AsRef<str>) -> OpError {

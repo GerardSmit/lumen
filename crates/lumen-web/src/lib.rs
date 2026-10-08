@@ -1,6 +1,7 @@
 //! lumen-web — the WinterTC "Minimum Common Web Platform API", incrementally.
 //!
-//! Every API is native `lumen_bind` Rust; the extension has no JS glue. Conformance checklist
+//! Native `lumen_bind` Rust APIs, with a shared facade for Performance entry prototypes
+//! and WebIDL conversion. Conformance checklist
 //! against the WinterTC minimum common API:
 //!
 //! - [x] `console`, timers, `queueMicrotask` (lumen-runtime/lumen-timers)
@@ -13,7 +14,9 @@
 //!   in `lumen_host::structured_clone`, published lazily
 //! - [x] `URL` / `URLSearchParams`: native classes in `lumen_host::url` over the WHATWG parser in
 //!   `lumen_common::url`, published lazily
-//! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`: native `Navigator` in
+//! - [x] `performance.now()` (+`timeOrigin`), user timing and `PerformanceObserver`:
+//!   realm-owned traced Rust timeline and observer queues, shared with node:perf_hooks.
+//!   `navigator.userAgent`: native `Navigator` in
 //!   `lumen_host::navigator`, published lazily
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
 //!   `lumen_os::proc::entropy`), `crypto.subtle.digest` (SHA-1/256/384/512): native classes in
@@ -189,6 +192,10 @@ mod http_policy {
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
+mod cookies;
+#[cfg(not(target_arch = "wasm32"))]
+pub use cookies::BrowserCookies;
+#[cfg(not(target_arch = "wasm32"))]
 mod http_body;
 #[cfg(target_arch = "wasm32")]
 #[path = "browser_body.rs"]
@@ -213,13 +220,49 @@ fn sync_http_desktop(
     request: &lumen_common::http_body::SyncHttpRequest,
     config: &FetchConfig,
 ) -> Result<lumen_common::http_body::SyncHttpResponse, http::SyncRequestError> {
+    sync_http_desktop_with_script(request, config, None)
+}
+
+/// Internal script fetch metadata is consumed before CORS response filtering.
+/// It never exposes non-safelisted headers to the public Fetch API.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct ScriptFetchMetadata {
+    pub destination: lumen_common::csp::Destination,
+    pub self_url: String,
+    pub nonce: String,
+    pub integrity: String,
+    pub parser_inserted: bool,
+    pub referrer: lumen_common::referrer::Referrer,
+    pub policies: std::sync::Arc<lumen_common::csp::PolicySet>,
+    pub violations: Vec<lumen_common::csp::Violation>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_http_desktop_with_script(
+    request: &lumen_common::http_body::SyncHttpRequest,
+    config: &FetchConfig,
+    script: Option<&mut ScriptFetchMetadata>,
+) -> Result<lumen_common::http_body::SyncHttpResponse, http::SyncRequestError> {
+    sync_http_desktop_with_metadata(request,config,script,None,None,None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_http_desktop_with_metadata(
+    request: &lumen_common::http_body::SyncHttpRequest,
+    config: &FetchConfig,
+    mut script: Option<&mut ScriptFetchMetadata>,
+    mut stylesheet_policy: Option<&mut StylesheetResponsePolicy>,
+    cancellation:Option<&lumen_os::net::TcpCancellation>,
+    mut response_redirects:Option<&mut u32>,
+) -> Result<lumen_common::http_body::SyncHttpResponse, http::SyncRequestError> {
     use lumen_common::cors::{Credentials, FetchPolicy, Mode, Redirect, ResponseType};
     use std::time::{Duration, Instant};
 
     let Some(origin) = request.origin.as_deref() else {
         let mut config = config.clone();
         config.manual_redirect = request.redirect != "follow";
-        let response = http::request_sync_with_timeout(
+        let mut response = http::request_sync_with_timeout(
             &request.method,
             &request.url,
             &request.headers,
@@ -238,6 +281,9 @@ fn sync_http_desktop(
                 "redirect mode is error".into(),
             ));
         }
+        response.body=lumen_common::http_body::decode_content_codings(&response.headers,response.body,
+            usize::try_from(config.response_body_limit()).unwrap_or(usize::MAX))
+            .map_err(|error|policy_transport(&format!("HTTP content decoding: {error}")))?;
         return Ok(lumen_common::http_body::SyncHttpResponse {
             status: response.status,
             status_text: response.status_text,
@@ -296,8 +342,17 @@ fn sync_http_desktop(
     let mut config = config.clone();
     config.manual_redirect = true;
 
+    let mut redirect_count = 0;
     loop {
+        if let Some(script) = script.as_deref_mut() {
+            let decision = script.policies.check_resource_redirect(&request.url, policy.current_url(),
+                &script.self_url, script.destination, &script.nonce, &script.integrity, script.parser_inserted, redirect_count)
+                .map_err(|error| policy_transport(&format!("invalid script policy request: {error:?}")))?;
+            script.violations.extend(decision.violations);
+            if decision.blocked { return Err(policy_transport("script request blocked by Content Security Policy")); }
+        }
         if let Some(preflight) = policy.preflight_request() {
+            config.cookies_disabled = true;
             let response = http::request_sync_with_timeout(
                 &preflight.method,
                 &preflight.url,
@@ -311,15 +366,21 @@ fn sync_http_desktop(
                 .map_err(|error| policy_transport(&format!("CORS preflight failed: {error:?}")))?;
         }
 
-        let head = policy.actual_request();
-        let response = http::request_sync_with_timeout(
-            &head.method,
-            &head.url,
-            &head.headers,
-            head.body.as_deref(),
-            &config,
-            remaining()?,
-        )?;
+        let mut head = policy.actual_request();
+        if let Some(script) = script.as_deref() {
+            let destination = lumen_common::url::parse(&head.url, None)
+                .map_err(|_| policy_transport("invalid script request URL"))?;
+            if let Some(referrer) = script.referrer.for_url(&destination) {
+                // Referer is a user-agent header, not an author CORS header.
+                head.headers.push(("Referer".into(), referrer));
+            }
+        }
+        config.cookies_disabled = !policy.credentials_allowed();
+        let mut response=if let Some(cancellation)=cancellation {
+            http::request_sync_with_timeout_cancellable(&head.method,&head.url,&head.headers,head.body.as_deref(),&config,remaining()?,cancellation)?
+        }else {
+            http::request_sync_with_timeout(&head.method,&head.url,&head.headers,head.body.as_deref(),&config,remaining()?)?
+        };
         let location = response
             .headers
             .iter()
@@ -334,19 +395,57 @@ fn sync_http_desktop(
         let next_ref = next
             .as_ref()
             .map(|(url, origin)| (url.as_str(), origin.as_str()));
+        if let Some(stylesheet)=stylesheet_policy.as_deref_mut() {
+            stylesheet.timing_allowed &= policy.timing_allow_response(&response.headers);
+        }
         let follow = policy
             .response_head(response.status, &response.headers, location, next_ref)
             .map_err(|error| {
                 policy_transport(&format!("response policy rejected response: {error:?}"))
             })?;
+        if let Some(script) = script.as_deref_mut() {
+            script.referrer.apply_redirect_policy(&response.headers);
+        }
         if follow {
+            redirect_count += 1;
             continue;
+        }
+        if let Some(count)=response_redirects.as_deref_mut(){*count=redirect_count;}
+        if let Some(script) = script.as_deref_mut() {
+            let decision = script.policies.check_resource_response(&request.url, &response.url,
+                &script.self_url, script.destination, &script.nonce, &script.integrity, script.parser_inserted, redirect_count)
+                .map_err(|error| policy_transport(&format!("invalid script response policy: {error:?}")))?;
+            script.violations.extend(decision.violations);
+            if decision.blocked { return Err(policy_transport("script response blocked by Content Security Policy")); }
         }
         let filtered = policy.filter_response(&response.headers);
         let opaque_redirect = location.is_some()
             && matches!(response.status, 301 | 302 | 303 | 307 | 308)
             && redirect == Redirect::Manual;
         let opaque = filtered.kind == ResponseType::Opaque || opaque_redirect;
+        let encoded_body_size=response.body.len() as u64;
+        response.body=lumen_common::http_body::decode_content_codings(&response.headers,response.body,
+            usize::try_from(config.response_body_limit()).unwrap_or(usize::MAX))
+            .map_err(|error|policy_transport(&format!("HTTP content decoding: {error}")))?;
+        if let Some(stylesheet)=stylesheet_policy.as_deref_mut() {
+            stylesheet.encoded_body_size=encoded_body_size;
+            stylesheet.decoded_body_size=response.body.len() as u64;
+        }
+        if let Some(script)=script.as_deref() {
+            if !script.integrity.is_empty()
+ && (opaque || !lumen_common::integrity::matches(&response.body,&script.integrity)) {
+                return Err(policy_transport("script response failed Subresource Integrity"));
+            }
+        }
+        // HTML stylesheet processing consumes the internal response even for
+        // no-CORS resources. Public Fetch still receives its filtered response.
+        if let Some(stylesheet)=stylesheet_policy.as_deref_mut() {
+            stylesheet.origin_clean=!opaque;
+            return Ok(lumen_common::http_body::SyncHttpResponse {
+                status:response.status,status_text:response.status_text,url:response.url,
+                headers:response.headers,body:response.body,
+            });
+        }
         return Ok(lumen_common::http_body::SyncHttpResponse {
             status: if opaque { 0 } else { response.status },
             status_text: if opaque {
@@ -372,6 +471,156 @@ mod sync_http_desktop_tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
+
+    #[test]
+    fn specification_image_response_retains_real_redirect_metadata_and_internal_body() {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{
+            for index in 0..2 {
+                let(mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut reader=BufReader::new(stream.try_clone().unwrap());
+                loop{let mut line=String::new();reader.read_line(&mut line).unwrap();if line=="\r\n"{break}}
+                let response=if index==0{b"HTTP/1.1 302 Found\r\nLocation: http://final.image.test/pixel\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()}
+                    else{b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".as_slice()};
+                stream.write_all(response).unwrap();
+            }
+        });
+        let mut config=FetchConfig::default();config.set_require_routes(true);config.set_route("initial.image.test",80,address).unwrap();config.set_route("final.image.test",80,address).unwrap();
+        let(response,redirects)=load_image_resource_with_config("http://initial.image.test/request","http://page.test",&config,1024,3000).unwrap();
+        assert_eq!(redirects,1);assert_eq!(response.url,"http://final.image.test/pixel");assert_eq!(response.body,b"abc");server.join().unwrap();
+    }
+
+    #[test]
+    fn specification_script_integrity_checks_final_cors_response_bytes() {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream,_)=listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut reader=BufReader::new(stream.try_clone().unwrap());
+                loop {let mut line=String::new();reader.read_line(&mut line).unwrap();if line=="\r\n" {break}}
+                stream.write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: http://page.api.test\r\nContent-Type: text/javascript\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc").unwrap();
+            }
+        });
+        let mut config=FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("integrity.api.test",80,address).unwrap();
+        let mut metadata=ScriptFetchMetadata {
+            destination:lumen_common::csp::Destination::Script,self_url:"http://page.api.test/".into(),nonce:String::new(),
+            integrity:"sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=".into(),parser_inserted:false,
+            referrer:lumen_common::referrer::Referrer {source:"http://page.api.test/".into(),policy:lumen_common::referrer::ReferrerPolicy::Origin},
+            policies:std::sync::Arc::new(lumen_common::csp::PolicySet::default()),violations:Vec::new(),
+        };
+        let response=load_script_resource_with_config("http://integrity.api.test/module.js","http://page.api.test","omit",&config,1024,3000,&mut metadata).unwrap();
+        assert_eq!(response.body,b"abc");
+        metadata.integrity.push_str(" sha512-mismatch");
+        assert!(load_script_resource_with_config("http://integrity.api.test/module.js","http://page.api.test","omit",&config,1024,3000,&mut metadata).is_err(),"integrity mismatch is a network failure before module decoding");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn specification_script_fetch_redirects_share_cors_credentials_referrer_and_response_policy() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_address = first.local_addr().unwrap();
+        let second_address = second.local_addr().unwrap();
+        let serve = |listener: TcpListener, response: &'static [u8]| std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let done = line == "\r\n";
+                headers.push_str(&line);
+                if done { break; }
+            }
+            stream.write_all(response).unwrap();
+            headers.to_ascii_lowercase()
+        });
+        let first_server = serve(first, b"HTTP/1.1 302 Found\r\nLocation: http://second.api.test/module.js\r\nAccess-Control-Allow-Origin: http://page.api.test\r\nAccess-Control-Allow-Credentials: true\r\nReferrer-Policy: no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let second_server = serve(second, b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Credentials: true\r\nContent-Type: text/javascript\r\nReferrer-Policy: origin\r\nX-Private: hidden\r\nContent-Length: 17\r\nConnection: close\r\n\r\nexport default 1;");
+        let mut config = FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("first.api.test",80,first_address).unwrap();
+        config.set_route("second.api.test",80,second_address).unwrap();
+        let url = lumen_common::url::parse_url("http://second.api.test/module.js",None).unwrap();
+        let cookie_context = lumen_common::cookies::Context::document(&url);
+        let cookies = BrowserCookies::default();
+        assert!(cookies.write(&url,"session=present; Path=/",&cookie_context,false));
+        config.set_browser_cookies(cookies,cookie_context);
+        let mut metadata = ScriptFetchMetadata {
+            destination:lumen_common::csp::Destination::Script,
+            self_url:"http://page.api.test/document".into(), nonce:"captured-nonce".into(), integrity:String::new(), parser_inserted:false,
+            referrer:lumen_common::referrer::Referrer {source:"http://page.api.test/source.js?private=1".into(),policy:lumen_common::referrer::ReferrerPolicy::Origin},
+            policies:std::sync::Arc::new(lumen_common::csp::PolicySet::default()), violations:Vec::new(),
+        };
+        let response = load_script_resource_with_config("http://first.api.test/start.js","http://page.api.test","include",&config,1024,3000,&mut metadata).unwrap();
+        let first_request = first_server.join().unwrap();
+        let second_request = second_server.join().unwrap();
+        assert!(first_request.starts_with("get "));
+        assert!(first_request.contains("\r\norigin: http://page.api.test\r\n"));
+        assert!(first_request.contains("\r\nreferer: http://page.api.test/\r\n"));
+        assert!(!first_request.contains("nonce"));
+        assert!(second_request.contains("\r\norigin: null\r\n"));
+        assert!(second_request.contains("\r\ncookie: session=present\r\n"));
+        assert!(!second_request.contains("\r\nreferer:"));
+        assert_eq!(response.url,"http://second.api.test/module.js");
+        assert_eq!(response.body,b"export default 1;");
+        assert_eq!(metadata.referrer.policy,lumen_common::referrer::ReferrerPolicy::Origin);
+        assert!(!response.headers.iter().any(|(name,_)|name.eq_ignore_ascii_case("referrer-policy") || name.eq_ignore_ascii_case("x-private")));
+        assert!(metadata.violations.is_empty());
+    }
+
+    #[test]
+    fn browser_cookies_obey_credentials_and_omit_preflight() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let done = line == "\r\n";
+                    headers.push_str(&line);
+                    if done { break; }
+                }
+                requests.push(headers);
+                stream.write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: http://page.api.test\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: GET\r\nSet-Cookie: response=stored; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+            requests
+        });
+        let mut config = FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("api.test", 80, address).unwrap();
+        let url = lumen_common::url::parse_url("http://api.test/resource", None).unwrap();
+        let context = lumen_common::cookies::Context::document(&url);
+        let cookies = BrowserCookies::default();
+        assert!(cookies.write(&url, "session=present; Path=/", &context, false));
+        config.set_browser_cookies(cookies.clone(), context.clone());
+        for credentials in ["omit", "same-origin", "include"] {
+            let request = lumen_common::http_body::SyncHttpRequest {
+                method: "GET".into(), url: url.href(), headers: Vec::new(), body: None,
+                mode: "cors".into(), credentials: credentials.into(), redirect: "follow".into(),
+                force_preflight: credentials == "include", timeout_ms: 3000,
+                origin: Some("http://page.api.test".into()),
+            };
+            sync_http_desktop(&request, &config).unwrap();
+            if credentials != "include" { assert_eq!(cookies.read(&url, &context, false), "session=present"); }
+        }
+        let requests = server.join().unwrap();
+        for request in &requests[..3] { assert!(!request.to_ascii_lowercase().contains("\r\ncookie:")); }
+        assert!(requests[2].starts_with("OPTIONS "));
+        assert!(requests[3].to_ascii_lowercase().contains("\r\ncookie: session=present\r\n"));
+        assert_eq!(cookies.read(&url, &context, false), "session=present; response=stored");
+    }
 
     #[test]
     fn synchronous_desktop_cors_forces_preflight_and_filters_response_headers() {
@@ -481,10 +730,15 @@ pub use http::HttpResponse as ResourceResponse;
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Default)]
 pub struct FetchConfig {
+    cookies: Option<BrowserCookies>,
+    cookie_context: Option<lumen_common::cookies::Context>,
+    cookies_disabled: bool,
     routes: std::sync::Arc<std::collections::HashMap<(String, u16), FetchRoute>>,
     require_routes: bool,
     /// Internal single-hop policy for the Fetch origin adapter.
     manual_redirect: bool,
+    /// A caller-specific cap, enforced by the streaming HTTP body reader.
+    response_body_limit: Option<u64>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -496,6 +750,24 @@ pub(crate) struct FetchRoute {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FetchConfig {
+    /// Attach the embedding browser's jar and trusted top-level browsing context.
+    pub fn set_browser_cookies(&mut self, cookies: BrowserCookies, context: lumen_common::cookies::Context) {
+        self.cookies = Some(cookies);
+        self.cookie_context = Some(context);
+    }
+    pub fn browser_cookies(&self) -> Option<(BrowserCookies, lumen_common::cookies::Context)> {
+        Some((self.cookies.clone()?, self.cookie_context.clone()?))
+    }
+
+    /// Restrict a resource request before allocating its response body. Clones retain the cap
+    /// across redirects; ordinary Fetch keeps its existing global limit.
+    pub fn set_response_body_limit(&mut self, limit: usize) {
+        self.response_body_limit = Some((limit as u64).min(http::MAX_BODY));
+    }
+
+    pub(crate) fn response_body_limit(&self) -> u64 {
+        self.response_body_limit.unwrap_or(http::MAX_BODY)
+    }
     /// Restrict requests, including redirected requests, to explicitly configured routes.
     /// Ordinary runtimes allow system DNS by default; fixture runtimes opt into this policy.
     pub fn set_require_routes(&mut self, required: bool) {
@@ -659,6 +931,97 @@ pub fn load_resource_with_config(
     http::request_with_config("GET", url, &[], None, config)
 }
 
+/// Load a bounded CORS resource using the existing Fetch policy, including redirect checks,
+/// fixture routing and verified TLS. Intended for host-managed font loads on an I/O thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_cors_resource_with_config(
+    url: &str,
+    origin: &str,
+    config: &FetchConfig,
+    body_limit: usize,
+    timeout_ms: u32,
+) -> Result<lumen_common::http_body::SyncHttpResponse, String> {
+    let mut config = config.clone();
+    config.set_response_body_limit(body_limit);
+    let request = lumen_common::http_body::SyncHttpRequest {
+        method: "GET".into(),
+        url: url.into(),
+        headers: Vec::new(),
+        body: None,
+        mode: "cors".into(),
+        credentials: "same-origin".into(),
+        redirect: "follow".into(),
+        force_preflight: false,
+        timeout_ms,
+        origin: Some(origin.into()),
+    };
+    sync_http_desktop(&request, &config).map_err(|error| format!("resource fetch: {error:?}"))
+}
+
+/// Module-script CORS fetch, sharing the normal Fetch redirect/credential path.
+/// Metadata remains available on failure so report-only/enforced CSP violations
+/// can be delivered in the captured client realm by the host.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_script_resource_with_config(
+    url: &str, origin: &str, credentials: &str, config: &FetchConfig,
+    body_limit: usize, timeout_ms: u32, metadata: &mut ScriptFetchMetadata,
+) -> Result<lumen_common::http_body::SyncHttpResponse, String> {
+    let mut config = config.clone();
+    config.set_response_body_limit(body_limit);
+    let request = lumen_common::http_body::SyncHttpRequest {
+        method: "GET".into(), url: url.into(), headers: Vec::new(), body: None,
+        mode: "cors".into(), credentials: credentials.into(), redirect: "follow".into(),
+        force_preflight: false, timeout_ms, origin: Some(origin.into()),
+    };
+    sync_http_desktop_with_script(&request, &config, Some(metadata))
+        .map_err(|error| format!("script resource fetch: {error:?}"))
+}
+
+/// Internal response policies remain independent: CORS cleanliness is not TAO.
+#[derive(Clone, Copy)]
+pub struct StylesheetResponsePolicy {
+    pub origin_clean:bool,
+    pub timing_allowed:bool,
+    pub encoded_body_size:u64,
+    pub decoded_body_size:u64,
+}
+
+/// Privileged HTML stylesheet consumer using the same potential-CORS,
+/// redirects, credentials, CSP, referrer and integrity controller as Fetch.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_stylesheet_resource_with_config(
+    url:&str,origin:&str,crossorigin:Option<bool>,config:&FetchConfig,
+    body_limit:usize,timeout_ms:u32,metadata:&mut ScriptFetchMetadata,cancellation:Option<&lumen_os::net::TcpCancellation>,
+)->Result<(lumen_common::http_body::SyncHttpResponse,StylesheetResponsePolicy),String> {
+    let mut config=config.clone();config.set_response_body_limit(body_limit);
+    let request=lumen_common::http_body::SyncHttpRequest {
+        method:"GET".into(),url:url.into(),headers:Vec::new(),body:None,
+        mode:if crossorigin.is_some(){"cors"}else{"no-cors"}.into(),
+        credentials:if crossorigin==Some(false){"same-origin"}else{"include"}.into(),
+        redirect:"follow".into(),force_preflight:false,timeout_ms,origin:Some(origin.into()),
+    };
+    let mut policy=StylesheetResponsePolicy {origin_clean:false,timing_allowed:true,encoded_body_size:0,decoded_body_size:0};
+    let response=sync_http_desktop_with_metadata(&request,&config,Some(metadata),Some(&mut policy),cancellation,None)
+        .map_err(|error|format!("stylesheet fetch: {error:?}"))?;
+    Ok((response,policy))
+}
+
+/// Load an internal image response with actual redirect metadata. The shared
+/// Fetch controller applies routing, credentials, redirects and body limits;
+/// the resource consumer receives the internal body before public filtering.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_image_resource_with_config(url:&str,origin:&str,config:&FetchConfig,body_limit:usize,timeout_ms:u32)
+    ->Result<(lumen_common::http_body::SyncHttpResponse,u32),String> {
+    let mut config=config.clone();config.set_response_body_limit(body_limit);
+    let request=lumen_common::http_body::SyncHttpRequest{method:"GET".into(),url:url.into(),headers:Vec::new(),body:None,
+        mode:"no-cors".into(),credentials:"include".into(),redirect:"follow".into(),force_preflight:false,timeout_ms,origin:Some(origin.into())};
+    let mut policy=StylesheetResponsePolicy{origin_clean:false,timing_allowed:true,encoded_body_size:0,decoded_body_size:0};
+    let mut redirects=0;
+    let response=sync_http_desktop_with_metadata(&request,&config,None,Some(&mut policy),None,Some(&mut redirects))
+        .map_err(|error|format!("image fetch: {error:?}"))?;
+    Ok((response,redirects))
+}
+
 /// Send a configured HTTP(S) request while requiring every redirect to stay
 /// on the initial origin. Retains status, headers, body and final URL for
 /// callers which install document responses after their own lifecycle checks.
@@ -671,6 +1034,49 @@ pub fn request_resource_same_origin_with_config(
     config: &FetchConfig,
 ) -> Result<ResourceResponse, String> {
     http::request_with_config_same_origin(method, url, headers, body, config)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct NavigationFetchState {
+    referrer: lumen_common::referrer::Referrer,
+    request_referrer: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct NavigationResponse {
+    pub response: ResourceResponse,
+    pub request_referrer: Option<String>,
+}
+
+/// Fetch a navigation using the shared redirect loop, recomputing the
+/// referrer after each response's Referrer-Policy has been processed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_navigation_resource_with_config(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &FetchConfig,
+    referrer: lumen_common::referrer::Referrer,
+) -> Result<NavigationResponse, String> {
+    http::request_navigation_with_config(method, url, headers, body, config, referrer)
+}
+
+/// HTML embedded-document navigation consumes the internal response through
+/// the ordinary navigation redirect controller, with each hop checked against
+/// the captured destination's CSP. No public Fetch response filtering applies.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_embedded_navigation_resource_with_config(
+    url: &str, config: &FetchConfig, body_limit: usize,
+    metadata: &mut ScriptFetchMetadata, cancellation: &lumen_os::net::TcpCancellation,
+) -> Result<NavigationResponse, String> {
+    let mut config = config.clone();
+    config.set_response_body_limit(body_limit);
+    let mut response = http::request_embedded_navigation_with_config(url, &config, metadata, cancellation)?;
+    response.response.body = lumen_common::http_body::decode_content_codings(
+        &response.response.headers, response.response.body, body_limit,
+    ).map_err(|error| format!("embedded resource content decoding: {error}"))?;
+    Ok(response)
 }
 
 /// Fetch a module resource using the supplied routing and trust snapshot, requiring the initial
@@ -751,6 +1157,7 @@ pub fn extension() -> Extension {
             lumen_host::lazy_globals::<lumen_host::structured_clone::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::structured_clone::internals::Module>,
             lumen_host::performance::install_globals,
+            lumen_host::namespace::<lumen_host::performance_timeline::bindings::Module>,
             lumen_host::namespace::<http_ops::Module>,
             install_transport,
             lumen_host::lazy_globals::<lumen_host::net::bindings::Module>,
@@ -770,8 +1177,8 @@ pub fn extension() -> Extension {
             }
             state.put(wasm_ops::WasmStore::default());
         }),
-        js_init: None,
-        js_init_snapshot: None,
+        js_init: Some(lumen_host::performance_timeline::SOURCE),
+        js_init_snapshot: Some(include_bytes!(concat!(env!("OUT_DIR"), "/performance_timeline.aot"))),
         lazy_globals: &[],
     }
 }
@@ -781,7 +1188,7 @@ fn install_transport(ctx: &mut Ctx) -> Result<(), Value> {
     let global = ctx.global_object();
     let http = ctx.member_get(&global, "__http")?;
     let policy = ctx.member_get(&global, "__http_policy")?;
-    lumen_host::net::Transport::install(ctx, http, policy.clone(), policy);
+    lumen_host::net::Transport::install(ctx, http, policy.clone(), policy).map_err(|error|error.to_value(ctx))?;
     ctx.delete_member(&global, "__http")?;
     Ok(())
 }
@@ -881,10 +1288,10 @@ mod http_ops {
             body.as_ref().map(|bytes| bytes.len() as u64),
         ));
         let report_upload_progress = match fetch_options.filter(|value| value.as_obj().is_some()) {
-            Some(options) => matches!(
-                ctx.get_member(&options, "uploadProgress"),
-                Ok(Value::Bool(true))
-            ),
+            Some(options) => {
+                fetch_config.cookies_disabled = !matches!(ctx.get_member(&options, "cookiesAllowed"), Ok(Value::Bool(true)));
+                matches!(ctx.get_member(&options, "uploadProgress"), Ok(Value::Bool(true)))
+            },
             None => false,
         };
         let worker_upload_progress = report_upload_progress.then(|| upload_progress.clone());

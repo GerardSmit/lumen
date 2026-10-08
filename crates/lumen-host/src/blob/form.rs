@@ -132,6 +132,35 @@ pub fn is_form_data(ctx: &mut Ctx, value: &Value) -> bool {
     matches!(value, Value::Obj(_)) && ctx.with_instance::<FormData, _>(value, |_| ()).is_ok()
 }
 
+/// Brand-check a File without inspecting author properties.
+pub fn is_file(ctx:&mut Ctx,value:&Value)->bool {
+    matches!(value,Value::Obj(_)) && ctx.with_instance::<File,_>(value,|_|()).is_ok()
+}
+
+/// Clone the actual entry list, preserving File object identities.
+pub fn clone_form_data(ctx:&mut Ctx,data:&Value)->OpResult<Value> {
+    let entries=entries_of(ctx,data)?;
+    let result=new_form_data(ctx);
+    for entry in entries.borrow().iter().cloned(){push_entry(ctx,&result,entry)?;}
+    Ok(result)
+}
+
+/// Append actual entry values without calling author-controlled methods.
+pub fn append_form_data(ctx:&mut Ctx,target:&Value,source:&Value)->OpResult<()> {
+    let source_entries=entries_of(ctx,source)?;let target_entries=entries_of(ctx,target)?;
+    if Rc::ptr_eq(&source_entries,&target_entries){
+        let entries=source_entries.borrow().clone();
+        for entry in entries{push_entry(ctx,target,entry)?;}
+    }else{
+        for entry in source_entries.borrow().iter().cloned(){push_entry(ctx,target,entry)?;}
+    }Ok(())
+}
+
+pub fn append_file_value(ctx:&mut Ctx,data:&Value,name:&str,file:Value)->OpResult<()> {
+    if !is_file(ctx,&file) {return Err(OpError::type_error("form entry requires File"));}
+    push_entry(ctx,data,Entry{name:name.to_owned(),value:EntryValue::File(file)})
+}
+
 pub fn append_text(ctx: &mut Ctx, data: &Value, name: &str, value: &str) -> OpResult<()> {
     push_entry(
         ctx,
@@ -170,23 +199,7 @@ pub fn form_data_entries(ctx: &mut Ctx, data: &Value) -> OpResult<Vec<FormEntry>
         let value = match entry.value {
             EntryValue::Text(text) => FormValue::Text(text),
             EntryValue::File(file) => {
-                let (name, last_modified, kind, source) = ctx.with_instance::<File, _>(
-                    &file,
-                    |file| {
-                        (
-                            file.name.clone(),
-                            file.last_modified,
-                            file.base.kind.clone(),
-                            file.base.source.clone(),
-                        )
-                    },
-                )?;
-                FormValue::File(FormFile {
-                    name,
-                    media_type: kind,
-                    last_modified,
-                    bytes: source.bytes(ctx)?,
-                })
+                FormValue::File(snapshot_file(ctx,&file)?)
             }
         };
         out.push(FormEntry {
@@ -195,6 +208,41 @@ pub fn form_data_entries(ctx: &mut Ctx, data: &Value) -> OpResult<Vec<FormEntry>
         });
     }
     Ok(out)
+}
+
+/// Attachment-free persisted state for a form-associated custom element.
+/// Files retain shared immutable bytes and metadata, never a script or document root.
+#[derive(Clone)]
+pub enum StoredFormValue {
+    Value(FormValue),
+    Entries(Vec<FormEntry>),
+}
+fn snapshot_file(ctx:&mut Ctx,value:&Value)->OpResult<FormFile> {
+    let (name,last_modified,media_type,source)=ctx.with_instance::<File,_>(value,|file|(file.name.clone(),file.last_modified,file.base.kind.clone(),file.base.source.clone()))?;
+    Ok(FormFile{name,last_modified,media_type,bytes:source.bytes(ctx)?})
+}
+impl StoredFormValue {
+    pub fn retained_bytes(&self)->usize {
+        fn value_bytes(value:&FormValue)->usize {match value{FormValue::Text(value)=>value.len(),FormValue::File(file)=>file.name.len().saturating_add(file.media_type.len()).saturating_add(file.bytes.len())}}
+        match self {Self::Value(value)=>value_bytes(value),Self::Entries(entries)=>entries.iter().fold(0usize,|size,entry|size.saturating_add(entry.name.len()).saturating_add(value_bytes(&entry.value)))}
+    }
+}
+pub fn snapshot_form_value(ctx:&mut Ctx,value:&Value)->OpResult<StoredFormValue> {
+    if is_form_data(ctx,value){return form_data_entries(ctx,value).map(StoredFormValue::Entries);}
+    if is_file(ctx,value){return snapshot_file(ctx,value).map(|value|StoredFormValue::Value(FormValue::File(value)));}
+    let Value::Str(value)=value else{return Err(OpError::type_error("invalid custom form state"));};
+    Ok(StoredFormValue::Value(FormValue::Text(value.as_str().to_owned())))
+}
+pub fn restore_form_value(ctx:&mut Ctx,value:&StoredFormValue)->OpResult<Value> {
+    match value {
+        StoredFormValue::Value(FormValue::Text(value))=>Ok(Value::from_string(value.clone())),
+        StoredFormValue::Value(FormValue::File(file))=>Ok(new_file(ctx,file.bytes.clone(),&file.name,&file.media_type,file.last_modified)),
+        StoredFormValue::Entries(entries)=>{
+            let data=new_form_data(ctx);
+            for entry in entries{match &entry.value{FormValue::Text(value)=>append_text(ctx,&data,&entry.name,value)?,FormValue::File(file)=>append_file(ctx,&data,&entry.name,file.clone())?}}
+            Ok(data)
+        }
+    }
 }
 
 /// Serializes `entries` as `multipart/form-data` with a fresh boundary.

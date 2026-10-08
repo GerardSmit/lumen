@@ -1,6 +1,6 @@
 //! Shadow trees keep ordinary DOM links intact; composition is derived on demand.
 use crate::{Dirty, Document, Error, MutationKind, Namespace, NodeId, NodeKind};
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShadowMode {
@@ -24,6 +24,7 @@ pub struct ShadowOptions {
     pub clonable: bool,
     pub serializable: bool,
     pub declarative: bool,
+    pub keep_custom_element_registry_null: bool,
 }
 
 impl ShadowOptions {
@@ -35,6 +36,7 @@ impl ShadowOptions {
             clonable: false,
             serializable: false,
             declarative: false,
+            keep_custom_element_registry_null: false,
         }
     }
 }
@@ -74,6 +76,63 @@ impl ComposedChildren<'_> {
 }
 
 impl Document {
+    pub(super) fn shadow_host_from_index(&self, root: NodeId) -> Option<NodeId> {
+        let index = self
+            .shadow_hosts_by_root
+            .binary_search_by_key(&root.key(), |(indexed_root, _)| indexed_root.key())
+            .ok()?;
+        let (indexed_root, host) = self.shadow_hosts_by_root[index];
+        (indexed_root == root).then_some(host)
+    }
+
+    pub(super) fn shadow_tree_for_root(&self, root: NodeId) -> Option<&ShadowTree> {
+        let host = self.shadow_host_from_index(root)?;
+        let index = self
+            .shadow_trees
+            .binary_search_by_key(&host.key(), |tree| tree.host.key())
+            .ok()?;
+        let tree = &self.shadow_trees[index];
+        (tree.host == host && tree.root == root).then_some(tree)
+    }
+
+    fn insert_shadow_host_index(&mut self, root: NodeId, host: NodeId) {
+        match self
+            .shadow_hosts_by_root
+            .binary_search_by_key(&root.key(), |(indexed_root, _)| indexed_root.key())
+        {
+            Ok(index) => self.shadow_hosts_by_root[index] = (root, host),
+            Err(index) => self.shadow_hosts_by_root.insert(index, (root, host)),
+        }
+    }
+
+    pub(super) fn remove_shadow_host_index(&mut self, root: NodeId) {
+        if let Ok(index) = self
+            .shadow_hosts_by_root
+            .binary_search_by_key(&root.key(), |(indexed_root, _)| indexed_root.key())
+        {
+            if self.shadow_hosts_by_root[index].0 == root {
+                self.shadow_hosts_by_root.remove(index);
+            }
+        }
+    }
+
+    pub(super) fn compact_shadow_host_index(&mut self) {
+        if self.shadow_hosts_by_root.is_empty() {
+            self.shadow_hosts_by_root = Vec::new();
+        } else if self.shadow_hosts_by_root.capacity() >= 1024
+            && self.shadow_hosts_by_root.len() < self.shadow_hosts_by_root.capacity() / 8
+        {
+            self.shadow_hosts_by_root
+                .shrink_to(self.shadow_hosts_by_root.len().max(256));
+        }
+    }
+
+    /// Share custom-element host eligibility between imperative attachment and
+    /// the declarative parser. The owner should capture its registry weakly.
+    pub fn set_shadow_host_policy(&mut self, policy: Option<Rc<dyn Fn(&Document, NodeId) -> bool>>) {
+        self.shadow_host_policy = policy;
+    }
+
     pub fn attach_shadow(&mut self, host: NodeId, mode: ShadowMode) -> Result<NodeId, Error> {
         self.attach_shadow_with_options(host, ShadowOptions::new(mode))
     }
@@ -85,15 +144,15 @@ impl Document {
     ) -> Result<NodeId, Error> {
         let NodeKind::Element {
             namespace: Namespace::Html,
-            name,
             ..
         } = self.kind(host)?
         else {
             return Err(Error::WrongKind);
         };
-        if !name.contains('-')
+        let (_, name) = self.element_name_parts(host)?;
+        if !crate::html::is_valid_custom_element_name(name)
             && !matches!(
-                name.as_str(),
+                name,
                 "article"
                     | "aside"
                     | "blockquote"
@@ -116,7 +175,10 @@ impl Document {
         {
             return Err(Error::WrongKind);
         }
-        if let Some(index) = self.shadow_trees.iter().position(|tree| tree.host == host) {
+        if self.shadow_host_policy.as_ref().is_some_and(|policy| !policy(self, host)) {
+            return Err(Error::WrongKind);
+        }
+        if let Ok(index) = self.shadow_trees.binary_search_by_key(&host.key(), |tree| tree.host.key()) {
             let existing = &self.shadow_trees[index];
             if !existing.options.declarative || existing.mode != options.mode {
                 return Err(Error::Hierarchy);
@@ -133,54 +195,71 @@ impl Document {
         self.shadow_trees
             .try_reserve(1)
             .map_err(|_| Error::LimitExceeded)?;
+        self.shadow_hosts_by_root
+            .try_reserve(1)
+            .map_err(|_| Error::LimitExceeded)?;
         let root = self.create(NodeKind::DocumentFragment)?;
-        self.shadow_trees.push(ShadowTree {
+        let index = self.shadow_trees
+            .binary_search_by_key(&host.key(), |tree| tree.host.key())
+            .unwrap_err();
+        self.shadow_trees.insert(index, ShadowTree {
             host,
             root,
             mode: options.mode,
             options,
         });
+        self.insert_shadow_host_index(root, host);
         self.mark_dirty(host, Dirty::STYLE, MutationKind::FullRebuild);
         Ok(root)
     }
 
-    pub fn shadow_root(&self, host: NodeId) -> Result<Option<NodeId>, Error> {
+    pub(crate) fn shadow_root_with_options(
+        &self,
+        host: NodeId,
+    ) -> Result<Option<(NodeId, ShadowOptions)>, Error> {
         self.kind(host)?;
-        Ok(self
-            .shadow_trees
-            .iter()
-            .find(|tree| tree.host == host)
-            .map(|tree| tree.root))
+        Ok(self.shadow_root_with_options_for_valid_node(host))
+    }
+
+    /// Fast path for callers that have already validated this arena identity.
+    pub(crate) fn shadow_root_with_options_for_valid_node(
+        &self,
+        host: NodeId,
+    ) -> Option<(NodeId, ShadowOptions)> {
+        self.shadow_trees
+            .binary_search_by_key(&host.key(), |tree| tree.host.key())
+            .ok()
+            .map(|index| {
+                let tree = &self.shadow_trees[index];
+                (tree.root, tree.options)
+            })
+    }
+
+    pub fn shadow_root(&self, host: NodeId) -> Result<Option<NodeId>, Error> {
+        Ok(self.shadow_root_with_options(host)?.map(|(root, _)| root))
     }
     pub fn shadow_host(&self, root: NodeId) -> Result<Option<NodeId>, Error> {
         self.kind(root)?;
-        Ok(self
-            .shadow_trees
-            .iter()
-            .find(|tree| tree.root == root)
-            .map(|tree| tree.host))
+        Ok(self.shadow_host_from_index(root))
     }
     pub fn shadow_mode(&self, root: NodeId) -> Result<Option<ShadowMode>, Error> {
         self.kind(root)?;
-        Ok(self
-            .shadow_trees
-            .iter()
-            .find(|tree| tree.root == root)
-            .map(|tree| tree.mode))
+        Ok(self.shadow_tree_for_root(root).map(|tree| tree.mode))
     }
 
     pub fn shadow_options(&self, root: NodeId) -> Result<Option<ShadowOptions>, Error> {
         self.kind(root)?;
-        Ok(self
-            .shadow_trees
-            .iter()
-            .find(|tree| tree.root == root)
-            .map(|tree| tree.options))
+        Ok(self.shadow_tree_for_root(root).map(|tree| tree.options))
     }
     pub fn shadow_roots(&self) -> impl Iterator<Item = (NodeId, NodeId, ShadowMode)> + '_ {
         self.shadow_trees
             .iter()
             .map(|tree| (tree.host, tree.root, tree.mode))
+    }
+
+    /// Borrow each shadow tree's host, root and serialization metadata.
+    pub fn shadow_roots_with_options(&self) -> impl Iterator<Item = (NodeId, NodeId, ShadowOptions)> + '_ {
+        self.shadow_trees.iter().map(|tree| (tree.host, tree.root, tree.options))
     }
     pub fn composed_parent(&self, node: NodeId) -> Result<Option<NodeId>, Error> {
         if let Some(slot) = self.assigned_slot(node)? {
@@ -190,6 +269,29 @@ impl Document {
             Some(parent) => Ok(self.shadow_host(parent)?.or(Some(parent))),
             None => self.shadow_host(node),
         }
+    }
+    /// The composed ancestry with children excluded by slot assignment removed.
+    /// Ordinary DOM edges need no child snapshot or sibling scan.
+    pub fn flat_tree_parent(&self, node: NodeId) -> Result<Option<NodeId>, Error> {
+        // Assignment already validates the current host and the actual slot.
+        // Re-scanning that slot's assigned siblings would make ancestry reads
+        // quadratic for a large slotted list.
+        if let Some(slot) = self.assigned_slot(node)? {
+            return Ok(Some(slot));
+        }
+        let Some(parent) = self.composed_parent(node)? else {
+            return Ok(None);
+        };
+        if self.composes(parent)? {
+            let mut children = self.composed_children_iter(parent)?;
+            while let Some(child) = children.next()? {
+                if child == node {
+                    return Ok(Some(parent));
+                }
+            }
+            return Ok(None);
+        }
+        Ok(Some(parent))
     }
     pub fn root_node(&self, mut node: NodeId, composed: bool) -> Result<NodeId, Error> {
         loop {
@@ -245,7 +347,7 @@ impl Document {
         let Some(root) = self.shadow_root(parent)? else {
             return Ok(None);
         };
-        if let Some(tree) = self.shadow_trees.iter().find(|tree| tree.root == root) {
+        if let Some(tree) = self.shadow_tree_for_root(root) {
             if tree.options.slot_assignment == SlotAssignmentMode::Manual {
                 for slot in self.slots_in_tree(root)? {
                     if self
@@ -278,7 +380,7 @@ impl Document {
         let Some(host) = self.shadow_host(root)? else {
             return Ok(Vec::new());
         };
-        if let Some(tree) = self.shadow_trees.iter().find(|tree| tree.root == root) {
+        if let Some(tree) = self.shadow_tree_for_root(root) {
             if tree.options.slot_assignment == SlotAssignmentMode::Manual {
                 let mut nodes = self
                     .manual_assignments
@@ -437,9 +539,7 @@ impl Document {
             }
             let root = self.root_node(changed_slot, false).ok();
             let host = root.and_then(|root| {
-                self.shadow_trees
-                    .iter()
-                    .find(|tree| tree.root == root)
+                self.shadow_tree_for_root(root)
                     .filter(|tree| tree.options.slot_assignment == SlotAssignmentMode::Manual)
                     .map(|tree| tree.host)
             });
@@ -474,7 +574,7 @@ impl Document {
     /// Whether a node's children compose: hosts with an attached shadow tree
     /// and slots inside shadow trees. Cheap gate for the composed walk.
     pub fn composes(&self, node: NodeId) -> Result<bool, Error> {
-        if self.shadow_trees.iter().any(|tree| tree.host == node) {
+        if self.shadow_root(node)?.is_some() {
             return Ok(true);
         }
         Ok(self.is_slot(node)? && self.shadow_host(self.root_node(node, false)?)?.is_some())
@@ -531,6 +631,107 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_host_policy_and_name_validation_are_shared_with_declarative_parsing() {
+        let mut document = crate::html::parse("<main></main>", 96).unwrap();
+        document.set_shadow_host_policy(Some(Rc::new(|document, host| {
+            document.element_name_parts(host).is_ok_and(|(_, local)| local != "x-blocked")
+        })));
+        let context = crate::selector::query_selector(&document, document.root(), "main").unwrap().unwrap();
+        let fragment = crate::html::parse_fragment_in_with_declarative_shadow_roots(
+            &mut document, context,
+            "<x-blocked><template shadowrootmode=open><b>fallback</b></template></x-blocked><x-allowed><template shadowrootmode=closed><i>shadow</i></template></x-allowed>", true,
+        ).unwrap();
+        let blocked = document.first_child(fragment).unwrap().unwrap();
+        let allowed = document.next_sibling(blocked).unwrap().unwrap();
+        assert!(document.shadow_root(blocked).unwrap().is_none());
+        assert_eq!(crate::html::inner_html(&document, blocked).unwrap(), "<template shadowrootmode=\"open\"><b>fallback</b></template>");
+        assert_eq!(document.attach_shadow(blocked, ShadowMode::Open), Err(Error::WrongKind));
+        assert!(document.shadow_root(allowed).unwrap().is_some());
+        for name in ["font-face", "annotation-xml", "Bad-name"] {
+            let host = document.create(NodeKind::Element { namespace: Namespace::Html, name: name.into(), attributes: Vec::new() }).unwrap();
+            assert_eq!(document.attach_shadow(host, ShadowMode::Open), Err(Error::WrongKind), "{name}");
+        }
+        let host = document.create(NodeKind::Element { namespace: Namespace::Html, name: "h:div".into(), attributes: Vec::new() }).unwrap();
+        assert!(document.attach_shadow(host, ShadowMode::Open).is_ok(), "eligibility uses the DOM local name");
+    }
+
+    #[test]
+    fn shadow_host_reverse_index_tracks_claim_clone_adoption_and_destroy_generations() {
+        let mut source = Document::new(64);
+        let host = source
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: "div".into(),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        source.append(source.root(), host).unwrap();
+        let options = ShadowOptions {
+            clonable: true,
+            declarative: true,
+            serializable: true,
+            ..ShadowOptions::new(ShadowMode::Closed)
+        };
+        let root = source.attach_shadow_with_options(host, options).unwrap();
+        assert_eq!(source.shadow_host(root), Ok(Some(host)));
+        assert_eq!(source.shadow_mode(root), Ok(Some(ShadowMode::Closed)));
+        assert_eq!(source.shadow_options(root), Ok(Some(options)));
+        assert_eq!(source.shadow_hosts_by_root.as_slice(), &[(root, host)]);
+
+        let claimed = source.attach_shadow(host, ShadowMode::Closed).unwrap();
+        assert_eq!(claimed, root);
+        assert_eq!(source.shadow_host(root), Ok(Some(host)));
+        let claimed_options = ShadowOptions {
+            declarative: false,
+            ..options
+        };
+        assert_eq!(source.shadow_options(root), Ok(Some(claimed_options)));
+
+        let clone = source.clone_node(host, false).unwrap();
+        let clone_root = source.shadow_root(clone).unwrap().unwrap();
+        assert_eq!(source.shadow_host(clone_root), Ok(Some(clone)));
+        assert_eq!(source.shadow_hosts_by_root.len(), 2);
+        assert!(source
+            .shadow_hosts_by_root
+            .windows(2)
+            .all(|pair| pair[0].0.key() < pair[1].0.key()));
+
+        let mut destination = Document::new(64);
+        let (adopted, _) = destination.adopt_subtree_from(&mut source, host).unwrap();
+        let adopted_root = destination.shadow_root(adopted).unwrap().unwrap();
+        assert_eq!(destination.shadow_host(adopted_root), Ok(Some(adopted)));
+        assert_eq!(
+            destination.shadow_options(adopted_root),
+            Ok(Some(claimed_options))
+        );
+        assert_eq!(source.shadow_host(root), Err(Error::InvalidNode));
+        assert_eq!(source.shadow_host(clone_root), Ok(Some(clone)));
+        assert_eq!(source.shadow_hosts_by_root.as_slice(), &[(clone_root, clone)]);
+        assert_eq!(
+            destination.shadow_hosts_by_root.as_slice(),
+            &[(adopted_root, adopted)]
+        );
+
+        destination.destroy_subtree(adopted).unwrap();
+        assert_eq!(destination.shadow_host(adopted_root), Err(Error::InvalidNode));
+        assert!(destination.shadow_hosts_by_root.is_empty());
+        let replacement = destination
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: "section".into(),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        let replacement_root = destination
+            .attach_shadow(replacement, ShadowMode::Open)
+            .unwrap();
+        assert_ne!(replacement_root, adopted_root);
+        assert_eq!(destination.shadow_host(replacement_root), Ok(Some(replacement)));
+        assert_eq!(destination.shadow_host(adopted_root), Err(Error::InvalidNode));
+    }
+
     use crate::{html, selector};
     fn find(document: &Document, root: NodeId, query: &str) -> NodeId {
         selector::query_selector(document, root, query)

@@ -8,7 +8,7 @@ pub(crate) struct Runtime {
     active: RefCell<Option<Rc<Effect>>>,
     owner: RefCell<Rc<Scope>>,
     pending: RefCell<VecDeque<Rc<Effect>>>,
-    scheduler: RefCell<Option<Value>>,
+    scheduler: RefCell<Option<WeakValue>>,
     scheduled: Cell<bool>,
     batching: Cell<usize>,
     flushing: Cell<bool>,
@@ -130,10 +130,8 @@ impl Drop for RetainedNodes {
                 }
             }
         }
-        self.realm
-            .detached
-            .borrow_mut()
-            .extend(self.ids.iter().copied());
+        drop(retained);
+        self.realm.release_detached_nodes(self.ids.iter().copied());
     }
 }
 
@@ -156,19 +154,110 @@ struct Region {
     kind: RegionKind,
 }
 
-fn collect_nodes(
+enum PendingNode {
+    Existing(NodeId),
+    Text(String),
+}
+
+const REACTIVE_CHILD_DEPTH_LIMIT: usize = 256;
+
+struct CollectLimits {
+    max_nodes: usize,
+    max_visits: usize,
+    visits: usize,
+    output_nodes: usize,
+    text_bytes: usize,
+}
+
+impl CollectLimits {
+    fn resource_error() -> OpError {
+        OpError::range_error("reactive child resource limit exceeded")
+    }
+
+    fn visit(&mut self) -> OpResult<()> {
+        if self.visits >= self.max_visits {
+            return Err(Self::resource_error());
+        }
+        self.visits += 1;
+        Ok(())
+    }
+
+    fn array_length(&self, length: f64) -> OpResult<usize> {
+        let remaining = self.max_visits.saturating_sub(self.visits);
+        if !length.is_finite() || length < 0.0 || length.fract() != 0.0
+            || length > remaining as f64
+        {
+            return Err(Self::resource_error());
+        }
+        Ok(length as usize)
+    }
+
+    fn push_existing(&mut self, out: &mut Vec<PendingNode>, node: NodeId) -> OpResult<()> {
+        if self.output_nodes >= self.max_nodes || out.try_reserve(1).is_err() {
+            return Err(Self::resource_error());
+        }
+        self.output_nodes += 1;
+        out.push(PendingNode::Existing(node));
+        Ok(())
+    }
+
+    fn extend_existing(
+        &mut self,
+        out: &mut Vec<PendingNode>,
+        nodes: impl IntoIterator<Item = NodeId>,
+        count: usize,
+    ) -> OpResult<()> {
+        if self
+            .output_nodes
+            .checked_add(count)
+            .is_none_or(|total| total > self.max_nodes)
+            || out.try_reserve(count).is_err()
+        {
+            return Err(Self::resource_error());
+        }
+        self.output_nodes += count;
+        out.extend(nodes.into_iter().map(PendingNode::Existing));
+        Ok(())
+    }
+
+    fn push_text(&mut self, out: &mut Vec<PendingNode>, text: &str) -> OpResult<()> {
+        if self.output_nodes >= self.max_nodes {
+            return Err(Self::resource_error());
+        }
+        let next_bytes = self
+            .text_bytes
+            .checked_add(text.len())
+            .filter(|bytes| *bytes <= html::MAX_HTML_BYTES)
+            .ok_or_else(Self::resource_error)?;
+        out.try_reserve(1).map_err(|_| Self::resource_error())?;
+        let mut owned = String::new();
+        owned
+            .try_reserve(text.len())
+            .map_err(|_| Self::resource_error())?;
+        owned.push_str(text);
+        self.text_bytes = next_bytes;
+        self.output_nodes += 1;
+        out.push(PendingNode::Text(owned));
+        Ok(())
+    }
+}
+
+fn collect_node_parts(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     value: Value,
-    out: &mut Vec<NodeId>,
+    out: &mut Vec<PendingNode>,
+    keepalive: &mut Vec<Value>,
+    limits: &mut CollectLimits,
     depth: usize,
 ) -> OpResult<()> {
-    if depth > 256 {
+    if depth > REACTIVE_CHILD_DEPTH_LIMIT {
         return Err(OpError::new(
             "RangeError",
             "reactive child nesting limit exceeded",
         ));
     }
+    limits.visit()?;
     if matches!(value, Value::Null | Value::Undefined | Value::Bool(_)) {
         return Ok(());
     }
@@ -179,22 +268,16 @@ fn collect_nodes(
         let Value::Num(length) = length else {
             return Err(OpError::new("TypeError", "invalid reactive children"));
         };
-        for index in 0..length as usize {
+        let length = limits.array_length(length)?;
+        for index in 0..length {
             let child = ctx
                 .get_member(&value, &index.to_string())
                 .map_err(|_| OpError::new("TypeError", "reactive child read failed"))?;
-            collect_nodes(ctx, realm, child, out, depth + 1)?;
+            collect_node_parts(ctx, realm, child, out, keepalive, limits, depth + 1)?;
         }
     } else if matches!(value, Value::Str(_) | Value::Num(_)) {
         let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
-        let node = realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .create(NodeKind::Text(text.to_string()))
-            .map_err(|error| OpError::from(dom_error(error)))?;
-        realm.detached.borrow_mut().push(node);
-        out.push(node);
+        limits.push_text(out, text.as_ref())?;
     } else {
         let (owner, node) =
             ctx.with_instance::<DomNode, _>(&value, |node| (node.realm.clone(), node.id))?;
@@ -204,20 +287,122 @@ fn collect_nodes(
                 "reactive child belongs to a different realm",
             ));
         }
-        let session = realm.session.borrow();
-        if matches!(
-            session.document().kind(node),
-            Ok(NodeKind::DocumentFragment)
-        ) {
-            out.extend(
-                children(session.document(), node)
-                    .map_err(|error| OpError::from(dom_error(error)))?,
-            );
+        let fragment_children = {
+            let session = realm.session.borrow();
+            if matches!(
+                session.document().kind(node),
+                Ok(NodeKind::DocumentFragment)
+            ) {
+                Some(children(session.document(), node).map_err(dom_error)?)
+            } else {
+                None
+            }
+        };
+        if let Some(children) = fragment_children {
+            // The fragment wrapper keeps its native identity component alive
+            // through capacity preflight and text-node construction.
+            if !children.is_empty() {
+                keepalive
+                    .try_reserve(1)
+                    .map_err(|_| CollectLimits::resource_error())?;
+                limits.extend_existing(out, children.iter().copied(), children.len())?;
+                keepalive.push(value);
+            }
         } else {
-            out.push(node);
+            keepalive
+                .try_reserve(1)
+                .map_err(|_| CollectLimits::resource_error())?;
+            limits.push_existing(out, node)?;
+            keepalive.push(value);
         }
     }
     Ok(())
+}
+
+fn collect_nodes(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    value: Value,
+    depth: usize,
+) -> OpResult<RetainedNodes> {
+    let max_nodes = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        document
+            .node_count()
+            .saturating_add(document.remaining_node_capacity())
+    };
+    let mut limits = CollectLimits {
+        max_nodes,
+        max_visits: max_nodes.saturating_mul(REACTIVE_CHILD_DEPTH_LIMIT + 1),
+        visits: 0,
+        output_nodes: 0,
+        text_bytes: 0,
+    };
+    let mut pending = Vec::new();
+    let mut keepalive = Vec::new();
+    collect_node_parts(
+        ctx,
+        realm,
+        value,
+        &mut pending,
+        &mut keepalive,
+        &mut limits,
+        depth,
+    )?;
+
+    // Convert every JS value before allocating nodes, then preflight the exact
+    // text-node count in one batch. No GC/capacity pass can reclaim an output
+    // between successive factory calls because those calls are performed
+    // under the same session borrow after this single preflight.
+    let text_nodes = pending
+        .iter()
+        .filter(|pending| matches!(pending, PendingNode::Text(_)))
+        .count();
+    realm.reap_detached_for_capacity(text_nodes);
+
+    let mut nodes = Vec::with_capacity(pending.len());
+    let mut generated = Vec::with_capacity(text_nodes);
+    let mut session = realm.session.borrow_mut();
+    let mut create_error = None;
+    for pending in pending {
+        match pending {
+            PendingNode::Existing(node) => nodes.push(node),
+            PendingNode::Text(text) => match session.document_mut().create(NodeKind::Text(text)) {
+                Ok(node) => {
+                    nodes.push(node);
+                    generated.push(node);
+                }
+                Err(error) => {
+                    create_error = Some(error);
+                    break;
+                }
+            },
+        }
+    }
+    if let Some(error) = create_error {
+        let mut cleanup_failed = Vec::new();
+        for node in generated {
+            if session.document_mut().destroy_subtree(node).is_err() {
+                cleanup_failed.push(node);
+            }
+        }
+        drop(session);
+        if !cleanup_failed.is_empty() {
+            // These outputs were never handed to a caller or leased. A direct
+            // retry is safe after releasing the session borrow.
+            realm.reap_detached(cleanup_failed);
+        }
+        return Err(OpError::from(dom_error(error)));
+    }
+    drop(session);
+
+    // Seal the lease before `keepalive` wrappers are dropped. If a later
+    // callback or capacity pass runs during this region update, every output
+    // remains protected by the shared native-retention count.
+    let retained = RetainedNodes::new(realm.clone(), nodes);
+    drop(keepalive);
+    Ok(retained)
 }
 
 fn truthy(value: &Value) -> bool {
@@ -324,11 +509,10 @@ impl Region {
                         return Err(error);
                     }
                 };
-                let mut nodes = Vec::new();
-                collect_nodes(ctx, &self.realm, rendered, &mut nodes, 0)?;
+                let nodes = collect_nodes(ctx, &self.realm, rendered, 0)?;
                 entries.push(Rc::new(Entry {
                     key: item,
-                    nodes: RetainedNodes::new(self.realm.clone(), nodes),
+                    nodes,
                     scope,
                     index,
                 }));
@@ -419,7 +603,6 @@ fn region(ctx: &mut Ctx, source: JsFunction, kind: RegionKind) -> OpResult<Value
         .append(fragment, marker)
         .map_err(|error| OpError::from(dom_error(error)))?;
     drop(session);
-    realm.detached.borrow_mut().push(fragment);
     let region = Rc::new(Region {
         realm: realm.clone(),
         marker,
@@ -432,13 +615,16 @@ fn region(ctx: &mut Ctx, source: JsFunction, kind: RegionKind) -> OpResult<Value
         let _ = effect.dispose(ctx);
         return Err(error);
     }
-    Ok(realm.wrap(ctx, fragment))
+    let wrapper = realm.wrap(ctx, fragment);
+    // The fragment is now protected by its live wrapper and marker lease.
+    // Register it only after construction has finished so a capacity-pressure
+    // pass cannot reclaim it while the region is still being assembled.
+    realm.defer_detached_root(fragment);
+    Ok(wrapper)
 }
 
 pub(crate) fn runtime(ctx: &mut Ctx) -> OpResult<Rc<Runtime>> {
-    ctx.op_state()
-        .get::<Rc<Runtime>>()
-        .cloned()
+    crate::realm_services::RealmServices::<Runtime>::current(ctx)
         .ok_or_else(|| OpError::new("Error", "DOM runtime is not installed"))
 }
 
@@ -472,8 +658,8 @@ impl Runtime {
             && !self.pending.borrow().is_empty()
             && !self.scheduled.replace(true)
         {
-            if let Some(callback) = self.scheduler.borrow().as_ref() {
-                ctx.queue_microtask(callback.clone());
+            if let Some(callback) = self.scheduler.borrow().as_ref().and_then(WeakValue::upgrade) {
+                ctx.queue_microtask(callback);
             }
         }
     }
@@ -1123,7 +1309,7 @@ pub mod api {
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Value> {
     let runtime = Runtime::new(realm);
-    ctx.op_state().put(runtime.clone());
+    crate::realm_services::RealmServices::replace_shared_current(ctx, runtime.clone());
     ctx.class_constructor::<Signal>();
     ctx.class_constructor::<Owner>();
     ctx.class_constructor::<EffectHandle>();
@@ -1135,6 +1321,39 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Value> {
     let flush = ctx
         .get_member(&module, "__flush")
         .map_err(|_| OpError::new("Error", "reactive scheduler missing"))?;
-    *runtime.scheduler.borrow_mut() = Some(flush);
+    *runtime.scheduler.borrow_mut() = Some(crate::realm_services::capture_realm_value(ctx, flush)?);
     Ok(module)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumen::Engine;
+
+    #[test]
+    fn specification_reactive_scheduler_uses_origin_realm_without_pinning_retired_globals() {
+        let mut engine=Engine::new();
+        let parent=crate::install(engine.ctx(),"<main></main>",128).unwrap();
+        let parent_runtime=runtime(engine.ctx()).expect("parent runtime");
+        let child=engine.ctx().create_host_realm();
+        let (child_runtime,weak_global,weak_document,retired)=engine.ctx().with_host_realm(&child,|ctx| {
+            let document=crate::install(ctx,"<main></main>",128).unwrap();
+            let selected=runtime(ctx).expect("child runtime");
+            assert!(Rc::ptr_eq(&selected.realm.upgrade().unwrap(),&document));
+            assert!(!Rc::ptr_eq(&selected,&parent_runtime));
+            let global=ctx.global_object();
+            let weak_global=ctx.weak_value(&global).expect("child global");
+            let retired=document.retire_browsing_context_group(ctx);
+            (selected,weak_global,Rc::downgrade(&document),retired)
+        }).expect("child installation");
+        assert!(Rc::ptr_eq(&runtime(engine.ctx()).unwrap(),&parent_runtime));
+        assert!(Rc::ptr_eq(&parent_runtime.realm.upgrade().unwrap(),&parent));
+        for handle in retired {engine.ctx().dispose_host_realm(&handle).expect("dispose retired browser realm");}
+        drop(child);
+        engine.collect_garbage();
+        engine.collect_garbage();
+        assert!(weak_global.upgrade().is_none(),"retained native scheduling metadata must not root the old global");
+        assert!(weak_document.upgrade().is_none(),"unused reactive scheduler must not pin its document");
+        assert!(child_runtime.scheduler.borrow().as_ref().and_then(WeakValue::upgrade).is_none());
+    }
 }

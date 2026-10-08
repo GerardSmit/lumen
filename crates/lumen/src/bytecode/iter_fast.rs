@@ -81,6 +81,40 @@ pub(crate) struct IterProof {
     push: RefCell<Option<Proof>>,
 }
 
+impl IterProof {
+    fn caches(&self) -> [&RefCell<Option<Proof>>; 4] {
+        [&self.arr, &self.coll[0], &self.coll[1], &self.push]
+    }
+
+    pub(crate) fn count_intrinsic_edges(&self, visit: &mut dyn FnMut(&Gc)) {
+        for cache in self.caches() {
+            if let Ok(proof) = cache.try_borrow_mut() {
+                if let Some(proof) = proof.as_ref() {
+                    for object in [&proof.proto, &proof.ip, &proof.iter_fn, &proof.next] { visit(object); }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
+        for cache in self.caches() {
+            if let Ok(proof) = cache.try_borrow() {
+                if let Some(proof) = proof.as_ref().filter(|proof| Gc::as_ptr(&proof.proto) as usize == pointer) {
+                    for object in [&proof.proto, &proof.ip, &proof.iter_fn, &proof.next] { visit(object); }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sweep_intrinsics(&self, garbage: &[Gc]) {
+        for cache in self.caches() {
+            if let Ok(mut proof) = cache.try_borrow_mut() {
+                if proof.as_ref().is_some_and(|proof| garbage.iter().any(|object| Gc::ptr_eq(object, &proof.proto))) { *proof = None; }
+            }
+        }
+    }
+}
+
 /// Whether `o` is a data property slot `slot` of `holder` holding exactly `f`.
 #[inline]
 fn holds_at(holder: &Gc, slot: usize, f: &Gc) -> bool {

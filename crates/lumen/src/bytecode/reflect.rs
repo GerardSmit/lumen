@@ -11,9 +11,9 @@
 //! invariant test262 checks (`built-ins/Object/internals/DefineOwnProperty/
 //! consistent-value-function-*`), so `Object.getOwnPropertyDescriptor` shows the accessor.
 //! Every other function inherits %Function.prototype%'s %ThrowTypeError% accessors. The two
-//! accessor boxes live in each function's map template (`ast::Function::fn_maps`), and a
-//! closure's copy shares them (`value::Accessors` is copy-on-write), so a sloppy closure pays
-//! two counter increments per accessor for them, no allocation.
+//! accessor boxes live on a realm intrinsic object, and each closure shares them
+//! (`value::Accessors` is copy-on-write). AST map templates retain only neutral
+//! descriptor placeholders, so a cached/shared AST cannot retain another realm.
 //!
 //! ## `f.caller`
 //! Computed from the frame stack on the read (the same walk a stack trace does, see
@@ -50,7 +50,7 @@
 use crate::ast::{Function, Pattern};
 use crate::interpreter::frames::{site_is_native, FnFrame, ReflectStash, SITE_NATIVE};
 use crate::interpreter::{Env, Interp};
-use crate::value::{Callable, Gc, Property, Value};
+use crate::value::{Callable, Gc, Object, Property, Value};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,6 +59,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// `extra_protos` keys of the two getter intrinsics.
 pub(crate) const ARGUMENTS_GETTER: &str = "%FunctionArgumentsGetter%";
 pub(crate) const CALLER_GETTER: &str = "%FunctionCallerGetter%";
+const OWN_PROPS: &str = "%FunctionLegacyOwnProps%";
 
 /// Whether activations record what a reflective `f.arguments` read needs.
 #[inline(always)]
@@ -308,26 +309,30 @@ pub(crate) fn install(i: &mut Interp) {
         Ok(read_arguments(i, &this))
     });
     let c = i.make_native("get caller", 0, |i, this, _| Ok(read_caller(i, &this)));
+    let properties=Object::new(None);
+    {
+        let mut properties=properties.borrow_mut();
+        properties.props.insert("arguments",Property::accessor_prop(Some(Value::Obj(a.clone())),None,false,false));
+        properties.props.insert("caller",Property::accessor_prop(Some(Value::Obj(c.clone())),None,false,false));
+    }
     i.extra_protos.insert(ARGUMENTS_GETTER, a);
     i.extra_protos.insert(CALLER_GETTER, c);
+    i.extra_protos.insert(OWN_PROPS,properties);
 }
 
 /// The own `arguments` / `caller` properties of a legacy function (see [`is_legacy`]), in
 /// V8's order (they go between `name` and `prototype`). `None` before [`install`] (a function
 /// made that early falls back to `Interp::get_member_recv`'s computed read).
 pub(crate) fn own_props(i: &Interp) -> Option<[(&'static str, Property); 2]> {
-    let a = i.extra_protos.get(ARGUMENTS_GETTER)?.clone();
-    let c = i.extra_protos.get(CALLER_GETTER)?.clone();
+    let properties=i.extra_protos.get(OWN_PROPS)?.borrow();
     Some([
-        (
-            "arguments",
-            Property::accessor_prop(Some(Value::Obj(a)), None, false, false),
-        ),
-        (
-            "caller",
-            Property::accessor_prop(Some(Value::Obj(c)), None, false, false),
-        ),
+        ("arguments", properties.props.get("arguments")?.clone()),
+        ("caller", properties.props.get("caller")?.clone()),
     ])
+}
+
+pub(crate) fn own_props_ready(i:&Interp)->bool {
+    i.extra_protos.contains_key(OWN_PROPS)
 }
 
 #[cfg(test)]

@@ -7,6 +7,37 @@ use crate::blob::{self, BlobSnapshot, Bytes};
 use crate::clone_transfer;
 use lumen::embed::{Ctx, OpError, OpResult, TaKind, Value};
 use lumen_common::bigint::BigInt;
+
+#[cfg(test)]
+mod signed_bigint_tests {
+    use super::*;
+    use super::super::{deserialize_for_storage,serialize_for_storage,structured_clone};
+
+    #[test]
+    fn signed_bigint_storage_and_transport_preserve_boxed_aliases_and_reject_malformed_signs() {
+        let mut engine=lumen::Engine::new();
+        let value=engine.eval_value("const boxed=Object(-12345678901234567890n);[-12345678901234567890n,-1n,0n,1n,12345678901234567890n,boxed,boxed]").unwrap().ok().expect("signed BigInt fixture");
+        let ctx=engine.ctx();
+        let stored=serialize_for_storage(ctx,&value,4096).ok().expect("storage serialization");
+        let storage=deserialize_for_storage(ctx,&stored).ok().expect("signed storage decoding");
+        let transport=structured_clone(ctx,&value,Vec::new()).ok().expect("signed transport decoding");
+        for clone in [storage,transport] {
+            for (index,expected) in ["-12345678901234567890","-1","0","1","12345678901234567890"].into_iter().enumerate() {
+                let number=ctx.member_get(&clone,&index.to_string()).ok().expect("cloned element");
+                assert!(matches!(number,Value::BigInt(ref number) if number.to_string_radix(10)==expected));
+            }
+            let boxed=ctx.member_get(&clone,"5").ok().expect("cloned box");let alias=ctx.member_get(&clone,"6").ok().expect("cloned alias");
+            assert_eq!(boxed.object_identity(),alias.object_identity());
+            assert!(matches!(ctx.clone_brand(&boxed),lumen::embed::CloneBrand::BigInt(Value::BigInt(ref number)) if number.to_string_radix(10)=="-12345678901234567890"));
+            assert_ne!(boxed.object_identity(),ctx.member_get(&value,"5").ok().expect("original box").object_identity());
+        }
+        for text in ["","-","--1","+1","-x"] {
+            let mut sink=Sink::with_limit(64);sink.u8(T_BIGINT);sink.str(text);
+            let error=match deserialize_for_storage(ctx,&sink.bytes) {Err(error)=>error,Ok(_)=>panic!("malformed signed BigInt admitted")};
+            assert_eq!(error.class(),"DataCloneError");
+        }
+    }
+}
 use std::collections::HashMap;
 
 const TRANSFER_DESERIALIZE: &str = "lumen.transferable.deserialize";
@@ -17,6 +48,7 @@ pub(super) struct Reader<'a> {
     transferred: HashMap<u32, Value>,
     bridge: &'a Bridge,
     locals: &'a [Value],
+    storage: bool,
 }
 
 fn define_hidden(ctx: &mut Ctx, target: &Value, key: &str, value: Value) -> OpResult<()> {
@@ -42,7 +74,14 @@ impl<'a> Reader<'a> {
             transferred: HashMap::new(),
             bridge,
             locals,
+            storage: false,
         }
+    }
+
+    pub fn for_storage(bytes: &'a [u8], bridge: &'a Bridge) -> Self {
+        let mut reader = Self::new(bytes, bridge, &[]);
+        reader.storage = true;
+        reader
     }
 
     pub fn run(&mut self, ctx: &mut Ctx) -> OpResult<Value> {
@@ -50,6 +89,7 @@ impl<'a> Reader<'a> {
             return Err(malformed());
         }
         if self.source.peek() == Some(T_PORTS) {
+            if self.storage { return Err(clone_error("Storage records cannot contain attachments")); }
             self.source.u8()?;
             for _ in 0..self.source.u32()? {
                 let index = self.source.u32()?;
@@ -125,17 +165,52 @@ impl<'a> Reader<'a> {
                 self.push(buffer)
             }
             T_SHARED => {
+                if self.storage { return Err(clone_error("Storage records cannot contain shared memory")); }
                 let index = self.source.u32()?;
                 let buffer = clone_transfer::import_shared(ctx, index as f64)?;
                 self.push(buffer)
             }
             T_PORT => {
+                if self.storage { return Err(clone_error("Storage records cannot contain attachments")); }
                 let index = self.source.u32()?;
                 let port = match self.transferred.get(&index) {
                     Some(port) => port.clone(),
                     None => self.import_port(ctx, index)?,
                 };
                 self.push(port)
+            }
+            T_NATIVE_GRAPH_VALUE => {
+                let kind = self.source.str()?;
+                if kind.len() > 256 { return Err(malformed()); }
+                let codec = clone_transfer::graph_value_codec_for_kind(ctx, kind)
+                    .ok_or_else(|| clone_error("Native clone interface unavailable"))?;
+                let length = self.source.u32()? as usize;
+                if length > codec.max_bytes { return Err(clone_error("Native clone payload exceeds its byte budget")); }
+                let bytes = self.source.take(length)?;
+                let value = (codec.create)(ctx, bytes)?;
+                self.push(value.clone());
+                let count = self.source.u32()? as usize;
+                if count > codec.max_children { return Err(clone_error("Native clone children exceed their budget")); }
+                let children = (0..count).map(|_| self.read(ctx)).collect::<OpResult<Vec<_>>>()?;
+                (codec.populate)(ctx, &value, children)?;
+                value
+            }
+            T_NATIVE_VALUE => {
+                let kind = self.source.str()?;
+                if kind.len() > 256 { return Err(malformed()); }
+                let codec = clone_transfer::value_codec_for_kind(ctx, kind)
+                    .ok_or_else(|| clone_error("Native clone interface unavailable"))?;
+                let length = self.source.u32()? as usize;
+                if length > codec.max_bytes { return Err(clone_error("Native clone payload exceeds its byte budget")); }
+                let bytes = self.source.take(length)?;
+                let value = (codec.deserialize)(ctx, bytes)?;
+                self.push(value)
+            }
+            T_NATIVE_TRANSFER => {
+                if self.storage { return Err(clone_error("Storage records cannot contain attachments")); }
+                let index = self.source.u32()? as usize;
+                let native = clone_transfer::import_native(ctx, index)?;
+                self.push(native)
             }
             T_LOCAL => {
                 let index = self.source.u32()? as usize;
@@ -210,13 +285,19 @@ impl<'a> Reader<'a> {
                 object
             }
             T_ERROR => self.read_error(ctx)?,
-            T_HOST => self.read_host(ctx)?,
+            T_HOST => {
+                if self.storage { return Err(clone_error("Storage records cannot contain custom host transfers")); }
+                self.read_host(ctx)?
+            }
             _ => return Err(malformed()),
         })
     }
 
     fn bigint(&mut self) -> OpResult<BigInt> {
-        BigInt::parse_dec(self.source.str()?).ok_or_else(malformed)
+        let text=self.source.str()?;
+        let (negative,digits)=match text.strip_prefix('-') {Some(digits)=>(true,digits),None=>(false,text)};
+        let magnitude=BigInt::parse_dec(digits).ok_or_else(malformed)?;
+        Ok(if negative {magnitude.neg()}else{magnitude})
     }
 
     fn read_array(&mut self, ctx: &mut Ctx) -> OpResult<Value> {
@@ -307,4 +388,3 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 }
-

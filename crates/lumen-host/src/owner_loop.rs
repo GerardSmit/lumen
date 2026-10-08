@@ -78,6 +78,8 @@ pub fn has_ready(ctx: &mut Ctx) -> bool {
 
 /// What a completion asks the loop to do once it is [`settle`]d.
 pub enum Outcome {
+    /// The host decoder settled the resource without a JavaScript callback.
+    Complete,
     /// Call `callback(...args)`.
     Call { callback: Value, args: Vec<Value> },
     /// The decoder failed and the task has no failure callback: report the value as uncaught.
@@ -88,6 +90,8 @@ pub enum Outcome {
 /// of the caller is restored.
 pub struct Settled {
     pub outcome: Outcome,
+    /// Admitting realm for decoder failures without a JavaScript callback.
+    pub owner: Option<lumen::embed::RealmHandle>,
     outer: Value,
 }
 
@@ -104,7 +108,13 @@ pub fn settle(ctx: &mut Ctx, done: TaskCompletion) -> Option<Settled> {
         .host_mut::<TaskRegistry>()
         .and_then(|registry| registry.take(done.task))?;
     let outer = ctx.set_async_context(entry.context);
-    let outcome = match (entry.decode)(ctx, done.result) {
+    let decoded=match entry.owner.as_ref() {
+        Some(owner)=>ctx.with_host_realm(owner,|ctx|(entry.decode)(ctx,done.result))
+            .unwrap_or_else(|error|Err(ctx.make_error("Error",error.to_string()))),
+        None=>(entry.decode)(ctx,done.result),
+    };
+    let outcome = match decoded {
+        Ok(_) if entry.native_only => Outcome::Complete,
         Ok(args) => Outcome::Call {
             callback: entry.on_ok,
             args,
@@ -117,7 +127,7 @@ pub fn settle(ctx: &mut Ctx, done: TaskCompletion) -> Option<Settled> {
             None => Outcome::Uncaught(error),
         },
     };
-    Some(Settled { outcome, outer })
+    Some(Settled { outcome, owner:entry.owner, outer })
 }
 
 /// Run up to `budget` completions, with a microtask checkpoint after each. Returns the values
@@ -144,6 +154,7 @@ pub fn pump(engine: &mut Engine, budget: usize) -> Vec<Value> {
         };
         if let Some(settled) = settle(engine.ctx(), done) {
             match &settled.outcome {
+                Outcome::Complete => {},
                 Outcome::Call { callback, args } => {
                     if let Err(error) = engine.call_function(callback, Value::Undefined, args) {
                         thrown.push(error);

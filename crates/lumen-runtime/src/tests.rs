@@ -140,6 +140,174 @@ fn eval_host_value(
 }
 
 #[test]
+fn specification_browser_reports_timer_microtask_and_task_exceptions_once_in_source_realms() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let parent_document = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("parent DOM installs"));
+    eval_ok(&mut runtime, "globalThis.parentErrors = []; addEventListener('error', e => { parentErrors.push(e.error); e.preventDefault(); });");
+    let child = runtime.engine().ctx().create_host_realm();
+    runtime.install_browser_realm(&child).expect("child runtime providers install");
+    let child_document = runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_html_js::install(ctx, "<!doctype html><body>", 1024)
+    }).expect("child realm exists").unwrap_or_else(|_| panic!("child DOM installs"));
+    eval_host_value(&mut runtime, &child,
+        "globalThis.childErrors = []; globalThis.childOnErrors = []; addEventListener('error', e => { childErrors.push(e.error); e.preventDefault(); }); onerror = function(message, source, line, column, error) { childOnErrors.push([arguments.length, error]); return true; }; true");
+    let timer = runtime.engine().eval_value("setTimeout").expect("timer lookup parses")
+        .unwrap_or_else(|_| panic!("timer lookup succeeds"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw 'child-timer'; }");
+    runtime.engine().call_function(&timer, Value::Undefined, &[child_callback, Value::Num(0.0)])
+        .unwrap_or_else(|_| panic!("parent timer accepts child callback"));
+    let microtask = runtime.engine().eval_value("queueMicrotask").expect("microtask lookup parses")
+        .unwrap_or_else(|_| panic!("microtask lookup succeeds"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw 'child-microtask'; }");
+    runtime.engine().call_function(&microtask, Value::Undefined, &[child_callback])
+        .unwrap_or_else(|_| panic!("parent microtask accepts child callback"));
+    let foreign_error = runtime.engine().eval_value("new Error('parent-error-object')")
+        .expect("parent error parses").ok().expect("parent error evaluates");
+    runtime.engine().ctx().member_set(&child.global(), "foreignError", foreign_error)
+        .unwrap_or_else(|_| panic!("child keeps foreign error identity"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw foreignError; }");
+    runtime.engine().call_function(&microtask, Value::Undefined, &[child_callback])
+        .unwrap_or_else(|_| panic!("cross-realm Error does not determine reporting source"));
+    runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_html_js::scheduling::queue_task(ctx, |_| Err(lumen::embed::OpError::new("Error", "child-task")))
+    }).expect("child task realm exists").unwrap_or_else(|_| panic!("child task admits"));
+    let native_task = runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_host::register_task(ctx, Value::Undefined, None, |ctx, _| Err(ctx.make_error("Error", "child-native")))
+    }).expect("child native task admits");
+    runtime.completion_sender().send(native_task, Box::new(()));
+    eval_ok(&mut runtime, "setTimeout(() => { globalThis.afterErrors = true; }, 0);");
+    runtime.run_until_idle();
+    assert!(matches!(eval_host_value(&mut runtime, &child,
+        "childErrors.length === 5 && childErrors.includes('child-timer') && childErrors.includes('child-microtask') && childErrors.filter(e => e === foreignError && !(e instanceof Error)).length === 1 && childErrors.filter(e => e instanceof Error && e.message === 'child-task').length === 1 && childErrors.filter(e => e instanceof Error && e.message === 'child-native').length === 1 && childOnErrors.length === 5 && childOnErrors.every(e => e[0] === 5)"), Value::Bool(true)));
+    eval_ok(&mut runtime, "if (parentErrors.length !== 0 || !afterErrors) throw Error('wrong reporting realm or stopped loop');");
+    assert!(stderr.lines().is_empty(), "canceled browser errors: {:?}", stderr.lines());
+    drop((parent_document, child_document));
+}
+
+#[test]
+fn specification_browser_uncanceled_and_recursive_errors_continue_without_duplicate_dispatch() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let document = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    eval_ok(&mut runtime, r#"
+        globalThis.reports = [];
+        addEventListener('error', event => {
+            reports.push(event.error);
+            if (event.error === 'recursive-outer') reportError('recursive-inner');
+        });
+        setTimeout(() => { throw 'uncanceled'; }, 0);
+        queueMicrotask(() => { throw 'recursive-outer'; });
+        setTimeout(() => { globalThis.continued = true; }, 0);
+    "#);
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (!continued || reports.length !== 2 || !reports.includes('uncanceled') || !reports.includes('recursive-outer')) throw Error('recursive or duplicate reporting');");
+    let lines = stderr.lines();
+    for error in ["uncanceled", "recursive-inner", "recursive-outer"] {
+        assert_eq!(lines.iter().filter(|line| line.contains(error)).count(), 1, "default console reporting: {lines:?}");
+    }
+    drop(document);
+}
+
+#[test]
+fn specification_browser_timer_conversion_classic_globals_repetition_and_error_phases() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    let context = Rc::new(lumen::ClassicScriptContext { base_url: "https://timer.test/origin/entry.js".into(),
+        nonce: "captured-nonce".into(), credentials_mode: "include".into(), referrer_policy: "no-referrer".into() });
+    runtime.engine().ctx().run_classic_script(r#"
+        globalThis.timerLog = [];
+        globalThis.timerErrors = [];
+        addEventListener('error', e => { timerErrors.push(e.error); e.preventDefault(); });
+        setTimeout({toString() {
+            timerLog.push('convert');
+            setTimeout("timerLog.push('ONE')", 0);
+            return "timerLog.push('TWO'); let timerLexical = 42; globalThis.stringThis = this === window; globalThis.scriptIsNull = document.currentScript === null;";
+        }}, {valueOf() { timerLog.push('delay'); return 0; }});
+        setTimeout("globalThis.lexicalResult = timerLexical", 0);
+        setTimeout(function(a, b) { globalThis.functionArgs = this === window && a === 4 && b === 9; }, 0, 4, 9);
+        globalThis.intervalCount = 0;
+        const interval = setInterval("if (++intervalCount === 3) clearTimeout(interval)", 0);
+        globalThis.registrationComplete = false;
+        setTimeout("const =", 0);
+        setTimeout("throw new Error('string-runtime')", 0);
+        setTimeout("'first directive'; 'use strict'; try { timerStrictLeak = 1; } catch (e) { globalThis.strictTimer = e instanceof ReferenceError; }", 0);
+        registrationComplete = true;
+        globalThis.retainedTimerSource = () => setTimeout('globalThis.sourceKept = true', 0);
+    "#, context.clone()).unwrap_or_else(|error| {
+        let error = lumen::embed::abrupt_value(error);
+        match runtime.engine().describe_throw(error) {
+            Completion::Throw { name, message } => panic!("timer registration: {name}: {message}"),
+            Completion::Value(_) => panic!("timer registration failed"),
+        }
+    });
+    runtime.run_to_completion();
+    eval_ok(&mut runtime, r#"
+        if (timerLog.join(',') !== 'convert,delay,ONE,TWO' || !stringThis || !scriptIsNull ||
+            lexicalResult !== 42 || !functionArgs || intervalCount !== 3 || !registrationComplete ||
+            !strictTimer || timerErrors.length !== 2 || !timerErrors.some(e => e instanceof SyntaxError) ||
+            !timerErrors.some(e => e instanceof Error && e.message === 'string-runtime')) throw Error('timer phase or global-script semantics');
+    "#);
+    let captured = runtime.engine().eval_value("retainedTimerSource")
+        .expect("callback parses").ok().expect("callback evaluates");
+    runtime.engine().call_function(&captured, Value::Undefined, &[]).ok().expect("callback runs");
+    let firing = runtime.take_next_due_timer(Instant::now() + Duration::from_secs(1)).expect("retained callback scheduled a timer");
+    assert_eq!(firing.script_context(), Some(context.as_ref()), "later callback preserves its real source metadata");
+    runtime.fire_timer_ticket(firing);
+    eval_ok(&mut runtime, "if (!sourceKept) throw Error('retained source timer did not execute');");
+    let module_url = "https://timer.test/modules/later.js";
+    let result = runtime.engine().with_classic_script_context(context.clone(), |engine| engine.eval_module_attrs(
+        "globalThis.retainedModuleTimer = () => setTimeout('globalThis.moduleSourceKept=true', 0);",
+        module_url,
+        |_, _, _| None,
+    ));
+    assert!(matches!(result, Ok(Completion::Value(_))), "module source evaluates");
+    let callback = runtime.engine().eval_value("retainedModuleTimer").expect("module callback parses").ok().expect("module callback evaluates");
+    runtime.engine().call_function(&callback, Value::Undefined, &[]).ok().expect("module callback runs");
+    let firing = runtime.take_next_due_timer(Instant::now() + Duration::from_secs(1)).expect("module callback timer");
+    let mut module_context = context.as_ref().clone();
+    module_context.base_url = module_url.into();
+    assert_eq!(firing.script_context(), Some(&module_context), "module functions retain actual module URL and captured fetch settings");
+    runtime.fire_timer_ticket(firing);
+    eval_ok(&mut runtime, "if (!moduleSourceKept) throw Error('module timer did not execute');");
+    assert!(stderr.lines().is_empty(), "canceled timer errors: {:?}", stderr.lines());
+    drop((realm, context));
+}
+
+#[test]
+fn specification_browser_timer_csp_is_checked_at_execution_and_trusted_sink_after_conversion() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy-Report-Only".into(),
+        "script-src 'none' 'report-sample'; require-trusted-types-for 'script'".into())]).unwrap_or_else(|_| panic!("report policy installs"));
+    runtime.engine().eval_value(r#"
+        globalThis.violations=[]; globalThis.errors=[]; globalThis.delayCalls=0;
+        addEventListener('securitypolicyviolation', e => violations.push([e.effectiveDirective,e.blockedURI,e.disposition]));
+        addEventListener('error', e => { errors.push(e.error); e.preventDefault(); });
+        setTimeout("globalThis.reportOnlyRan = 'ä'", 0);
+    "#).expect("report timer parses").ok().expect("report timer registers");
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (reportOnlyRan !== 'ä' || violations.length !== 2 || violations.some(e => e[2] !== 'report')) throw Error('report-only policy blocked or missed timer source');");
+    // Policy is checked when source is compiled, not frozen at registration.
+    runtime.engine().eval_value("setTimeout('globalThis.forbiddenRan=true', 0)").expect("pending timer parses").ok().expect("pending timer registers");
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "script-src 'none'".into())]).unwrap_or_else(|_| panic!("enforcement policy installs"));
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (typeof forbiddenRan !== 'undefined' || errors.length !== 1 || !(errors[0] instanceof EvalError)) throw Error('string compilation did not report its execution-time CSP failure');");
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "require-trusted-types-for 'script'".into())]).unwrap_or_else(|_| panic!("trusted sink policy installs"));
+    eval_ok(&mut runtime, r#"
+        let blocked=false;
+        try { setTimeout({toString(){return "globalThis.neverRuns=true"}}, {valueOf(){delayCalls++;return 0}}); }
+        catch(e) { blocked=e instanceof TypeError; }
+        if (!blocked || delayCalls !== 1) throw Error('trusted sink must enforce after WebIDL conversion');
+        setTimeout(() => { globalThis.functionStillRuns = true; }, 0);
+    "#);
+    eval_ok(&mut runtime, "if (!functionStillRuns || typeof trustedTypes !== 'undefined' || typeof TrustedScript !== 'undefined') throw Error('unsupported Trusted Types surface was fabricated or ordinary Function blocked');");
+    assert!(stderr.lines().is_empty(), "canceled compilation errors: {:?}", stderr.lines());
+}
+
+#[test]
 fn browser_timers_are_owned_by_their_realm_and_retained_callbacks_survive_cancel() {
     let (mut runtime, _, stderr) = test_runtime();
     let parent = runtime.engine().ctx().current_host_realm();
@@ -2716,6 +2884,29 @@ fn message_close_and_promise_rejection_events_read_their_init() {
 }
 
 #[test]
+fn specification_stylesheet_browser_resource_timeline_bootstrap_uses_original_native_publisher() {
+    let (mut runtime, out, _) = browser_test_runtime();
+    runtime.eval(r#"
+        globalThis.resourceEntries = performance.getEntriesByType.bind(performance);
+        performance.getEntriesByType = () => { throw new Error('replaced public reader'); };
+        globalThis.__performance_timeline.install_resource_publisher = () => {
+            throw new Error('replaced installation method');
+        };
+    "#).unwrap();
+    lumen_host::performance_timeline::record_resource(runtime.engine().ctx(),
+        "https://example.test/style.css", "link", 12.0, 18.0, 40, 80, true).unwrap();
+    runtime.eval(r#"
+        const entries = resourceEntries('resource');
+        const entry = entries[0];
+        console.log(entries.length === 1, entry instanceof PerformanceResourceTiming,
+            entry.name === 'https://example.test/style.css', entry.initiatorType === 'link',
+            entry.startTime === 12, entry.responseEnd === 18,
+            entry.encodedBodySize === 40, entry.decodedBodySize === 80);
+    "#).unwrap();
+    assert_eq!(out.lines(), ["true true true true true true true true"]);
+}
+
+#[test]
 fn performance_is_a_native_event_target_over_the_process_clock() {
     let (mut rt, out, _err) = test_runtime();
     rt.eval(
@@ -3332,6 +3523,76 @@ fn browser_worker_installs_shared_css_typed_om_interfaces() {
         "#,
     );
     assert_eq!(lines, ["function|true|calc(2 * 3s)|1|-1"]);
+}
+
+#[test]
+fn browser_worker_geometry_native_clone_and_indexed_db_storage() {
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        let (mut runtime, out, err) = browser_test_runtime();
+        runtime.set_deadline(Duration::from_secs(10));
+        let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body></body>", 1024).unwrap();
+        realm.set_document_url("https://geometry-worker.test/document.html");
+        runtime.eval(r#"
+            const url=URL.createObjectURL(new Blob([`
+                postMessage([typeof DOMMatrix,typeof DOMMatrixReadOnly,typeof DOMPoint,typeof DOMPointReadOnly,typeof DOMRect,typeof DOMRectReadOnly].join('|'));
+                const matrix=new DOMMatrix([2,0,0,3,4,5]);
+                const value={matrix,alias:matrix,readonly:new DOMMatrixReadOnly(),point:new DOMPoint(1,2,3,4),readonlyPoint:new DOMPointReadOnly(5,6,7,8),rect:new DOMRect(1,2,3,4),readonlyRect:new DOMRectReadOnly(5,6,7,8)};
+                const copy=structuredClone(value);
+                if(copy.matrix!==copy.alias || !(copy.matrix instanceof DOMMatrix) || copy.matrix.transformPoint(copy.point).x!==18)throw new Error('worker native clone');
+                let strings=false;try{new DOMMatrix('matrix(1,0,0,1,0,0)')}catch(e){strings=e.name==='TypeError'};
+                if(!strings)throw new Error('worker string restriction');
+                const opening=indexedDB.open('worker-geometry',1);
+                opening.onerror=()=>{postMessage('error:'+opening.error.name);close()};
+                opening.onupgradeneeded=()=>{
+                    const store=opening.result.createObjectStore('values');
+                    store.put(value,1).onsuccess=()=>store.get(1).onsuccess=e=>{
+                        const stored=e.target.result;
+                        if(stored.matrix!==stored.alias || !(stored.matrix instanceof DOMMatrix) || !(stored.readonly instanceof DOMMatrixReadOnly) || !(stored.point instanceof DOMPoint) || !(stored.readonlyPoint instanceof DOMPointReadOnly) || !(stored.rect instanceof DOMRect) || !(stored.readonlyRect instanceof DOMRectReadOnly))throw new Error('worker storage brands');
+                        postMessage('stored:'+stored.matrix.transformPoint(stored.point).x+':'+stored.readonlyPoint.w);
+                    };
+                };
+                opening.onsuccess=()=>{opening.result.close();close()};
+            `],{type:'text/javascript'}));
+            const worker=new Worker(url);worker.onmessage=e=>console.log(e.data);worker.onerror=e=>console.error(e.message);
+        "#).expect("actual worker geometry lifecycle reaches quiescence");
+        assert_eq!(out.lines(), ["function|function|function|function|function|function", "stored:18:8"]);
+        assert!(err.lines().is_empty(), "{:?}",err.lines());
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn browser_worker_indexed_db_shares_origin_profile_records() {
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        let (mut runtime, out, err) = browser_test_runtime();
+        runtime.set_deadline(Duration::from_secs(10));
+        let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body></body>", 1024).unwrap();
+        realm.set_document_url("https://db-worker.test/document.html");
+        runtime.eval(r#"
+            const opened = indexedDB.open('shared-records', 1);
+            opened.onupgradeneeded = () => opened.result.createObjectStore('items').put({answer:42}, 1);
+            opened.onerror = () => console.error('parent open failure', opened.error.name);
+            opened.onsuccess = () => {
+                opened.result.close();
+                const url = URL.createObjectURL(new Blob([`
+                    const opened = indexedDB.open('shared-records');
+                    opened.onupgradeneeded = () => {postMessage('unexpected upgrade');close();};
+                    opened.onerror = () => {postMessage('worker open failure:' + opened.error.name);close();};
+                    opened.onsuccess = () => {
+                        const db=opened.result,tx=db.transaction('items');
+                        tx.objectStore('items').get(1).onsuccess = event => {
+                            postMessage('stored:' + event.target.result.answer);
+                            db.close();close();
+                        };
+                    };
+                `], {type:'text/javascript'}));
+                const worker = new Worker(url);
+                worker.onmessage = event => console.log(event.data);
+                worker.onerror = event => console.error('worker failure', event.message);
+            };
+        "#).expect("browser IDB worker lifecycle must run to quiescence");
+        assert_eq!(out.lines(), ["stored:42"]);
+        assert!(err.lines().is_empty(), "{:?}", err.lines());
+    }).unwrap().join().unwrap();
 }
 
 #[test]

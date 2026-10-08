@@ -5,7 +5,7 @@
 
 use crate::events::HtmlTargetExt;
 use crate::{DomDocument, DomRealm};
-use lumen::embed::{Ctx, Deferred, JsFunction, JsObject, Nullable, OpError, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, Deferred, JsObject, Nullable, OpError, OpResult, Value, WeakValue};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,8 +1052,8 @@ pub struct DomAudioBufferSourceNode {
 #[lumen_bind::methods]
 impl DomAudioBufferSourceNode {
     #[getter]
-    fn onended(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("ended"))
+    fn onended(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "ended")
     }
 
     #[setter]
@@ -1061,9 +1061,9 @@ impl DomAudioBufferSourceNode {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
-        self.base.set_handler(ctx, &this.0, "ended", callback);
+        self.base.set_event_handler(ctx, &this.0, "ended", callback);
     }
 
     #[getter]
@@ -1344,8 +1344,8 @@ pub struct DomOscillatorNode {
 #[lumen_bind::methods]
 impl DomOscillatorNode {
     #[getter]
-    fn onended(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("ended"))
+    fn onended(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "ended")
     }
 
     #[setter]
@@ -1353,9 +1353,9 @@ impl DomOscillatorNode {
         &self,
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        callback: Option<JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
-        self.base.set_handler(ctx, &this.0, "ended", callback);
+        self.base.set_event_handler(ctx, &this.0, "ended", callback);
     }
 
     #[getter]

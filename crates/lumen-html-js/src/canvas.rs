@@ -5,7 +5,7 @@ use lumen_html::paint::{FontSpec, FontStyle, Rgba, TextShaper};
 use lumen_html_image::{
     canvas::{
         CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSurface,
-        ParsedSvgPath,
+        ParsedSvgPath, CanvasPublication, OffscreenCanvasTransfer,
     },
     Rgba8Image,
 };
@@ -33,9 +33,9 @@ const OFFSCREEN_CANVAS_OWNER_SLOT: &str = "#lumen_offscreen_canvas_owner\u{1}can
 static NEXT_GRADIENT_ID: AtomicU64 = AtomicU64::new(1);
 static CANVAS_FONTS: OnceLock<FontSet> = OnceLock::new();
 
-enum CanvasFontSource {
+pub(crate) enum CanvasFontSource {
     Static(&'static FontSet),
-    Realm(Rc<FontSet>),
+    Realm(Rc<FontSet>, Option<font_loading::WeakFontRealm>,RefCell<Rc<FontSet>>,RenderFontFallback),
 }
 
 impl Deref for CanvasFontSource {
@@ -44,8 +44,107 @@ impl Deref for CanvasFontSource {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Static(fonts) => fonts,
-            Self::Realm(fonts) => fonts,
+            Self::Realm(fonts, _,_,_) => fonts,
         }
+    }
+}
+
+pub(crate) enum RenderFontFallback {
+    Static(&'static FontSet),
+    Owned(Arc<FontSet>),
+}
+impl Deref for RenderFontFallback {
+    type Target=FontSet;
+    fn deref(&self)->&FontSet {match self {Self::Static(fonts)=>fonts,Self::Owned(fonts)=>fonts}}
+}
+
+impl CanvasFontSource {
+    fn realm(fonts:Rc<FontSet>,owner:font_loading::WeakFontRealm,fallback:RenderFontFallback)->Self {
+        owner.attach_display_owner();
+        Self::Realm(fonts.clone(),Some(owner),RefCell::new(fonts),fallback)
+    }
+
+    fn refresh_fonts(&self)->Result<(), &'static str> {
+        if let Self::Realm(_,Some(owner),current,fallback)=self {
+            if let Some(fonts)=owner.refresh_render_font_set(fallback)? {
+                if !Rc::ptr_eq(&fonts,&current.borrow()) {*current.borrow_mut()=fonts;}
+            }
+        }
+        Ok(())
+    }
+    fn visit_fonts<R>(&self,visit:impl FnOnce(&FontSet)->R)->R {
+        match self {Self::Static(fonts)=>visit(fonts),Self::Realm(_,_,current,_)=>visit(&current.borrow())}
+    }
+    fn with_fonts<R>(&self,visit:impl FnOnce(&FontSet)->R)->R {
+        let _=self.refresh_fonts();self.visit_fonts(visit)
+    }
+    fn with_fonts_checked<R>(&self,visit:impl FnOnce(&FontSet)->R)->Result<R,&'static str> {
+        self.refresh_fonts()?;Ok(self.visit_fonts(visit))
+    }
+
+    fn request_metric_font(&self,spec:&FontSpec) {
+        if let Self::Realm(_,Some(owner),_,_)=self {owner.request_metric_font(spec);}
+    }
+
+    fn queue_demand_task(&self,ctx:&mut Ctx)->OpResult<()> {
+        if let Self::Realm(_,Some(owner),_,_)=self {owner.queue_demand_task(ctx)?;}
+        Ok(())
+    }
+
+    fn request_rendered_font(&self,text:&str,size:f32,spec:&FontSpec)->Result<(), &'static str> {
+        if size.is_finite() && size>0.0 {
+            if let Self::Realm(_,Some(owner),_,_)=self {owner.request_rendered_font(spec,text)?;}
+        }
+        Ok(())
+    }
+
+}
+
+impl TextShaper for CanvasFontSource {
+    fn first_available_font_metric(&self, spec: &FontSpec, metric: lumen_html::paint::FontMetric) -> Option<Option<f32>> {
+        self.request_metric_font(spec);
+        self.with_fonts(|fonts| fonts.first_available_font_metric(spec, metric))
+    }
+    fn generation(&self)->u64 {self.with_fonts(|fonts|fonts.generation())}
+    fn glyph_ink_bounds(&self,glyph:&lumen_html::paint::Glyph,size:f32)->Option<lumen_html::paint::Rect> {self.with_fonts(|fonts|fonts.glyph_ink_bounds(glyph,size))}
+    fn shape(&self,text:&str,size:f32)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,&FontSpec::default()).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape(text,size)).map_err(|_|())?}
+    fn shape_directional(&self,text:&str,size:f32,rtl:bool)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,&FontSpec::default()).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_directional(text,size,rtl)).map_err(|_|())?}
+    fn shape_styled(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_styled(text,size,rtl,spec)).map_err(|_|())?}
+    fn shape_resolved(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_resolved(text,size,rtl,spec)).map_err(|_|())?}
+    fn shape_styled_with_cluster_advances(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec)->Result<Option<lumen_html::paint::ShapedRunWithClusterAdvances>,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_styled_with_cluster_advances(text,size,rtl,spec)).map_err(|_|())?}
+    fn shape_resolved_with_cluster_advances(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec)->Result<Option<lumen_html::paint::ShapedRunWithClusterAdvances>,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_resolved_with_cluster_advances(text,size,rtl,spec)).map_err(|_|())?}
+    fn shape_styled_context(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec,language:Option<&str>)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_styled_context(text,size,rtl,spec,language)).map_err(|_|())?}
+    fn shape_resolved_context(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec,language:Option<&str>)->Result<lumen_html::paint::ShapedRun,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_resolved_context(text,size,rtl,spec,language)).map_err(|_|())?}
+    fn shape_resolved_context_with_cluster_advances(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec,language:Option<&str>)->Result<Option<lumen_html::paint::ShapedRunWithClusterAdvances>,()> {self.request_rendered_font(text,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_resolved_context_with_cluster_advances(text,size,rtl,spec,language)).map_err(|_|())?}
+    fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:std::ops::Range<usize>,size:f32,rtl:bool,spec:&FontSpec,language:Option<&str>)->Result<Option<lumen_html::paint::ShapedRunWithClusterAdvances>,()> {let piece=text.get(source.clone()).ok_or(())?;self.request_rendered_font(piece,size,spec).map_err(|_|())?;self.with_fonts_checked(|fonts|fonts.shape_resolved_segment_with_cluster_advances(text,source,size,rtl,spec,language)).map_err(|_|())?}
+    fn ascent(&self,size:f32)->f32 {self.with_fonts(|fonts|fonts.ascent(size))}
+    fn line_height(&self,size:f32)->f32 {self.with_fonts(|fonts|fonts.line_height(size))}
+    fn underline_metrics(&self,size:f32)->(f32,f32) {self.with_fonts(|fonts|fonts.underline_metrics(size))}
+    fn strike_metrics(&self,size:f32)->(f32,f32) {self.with_fonts(|fonts|fonts.strike_metrics(size))}
+    fn ascent_styled(&self,size:f32,spec:&FontSpec)->f32 {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.ascent_styled(size,spec))}
+    fn line_height_styled(&self,size:f32,spec:&FontSpec)->f32 {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.line_height_styled(size,spec))}
+    fn underline_metrics_styled(&self,size:f32,spec:&FontSpec)->(f32,f32) {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.underline_metrics_styled(size,spec))}
+    fn strike_metrics_styled(&self,size:f32,spec:&FontSpec)->(f32,f32) {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.strike_metrics_styled(size,spec))}
+    fn primary_character_widths_styled(&self,size:f32,spec:&FontSpec)->Option<lumen_html::paint::PrimaryCharacterWidths> {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.primary_character_widths_styled(size,spec))}
+    fn font_unit_metrics_styled(&self,size:f32,spec:&FontSpec,vertical:bool,upright_zero:bool)->lumen_html::paint::FontUnitMetrics {
+        self.request_metric_font(spec);
+        self.with_fonts(|fonts|fonts.font_unit_metrics_styled(size,spec,vertical,upright_zero))
+    }
+    fn font_relative_metrics_styled(&self,size:f32,spec:&FontSpec)->lumen_html::paint::FontRelativeMetrics {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.font_relative_metrics_styled(size,spec))}
+}
+
+impl FontProvider for CanvasFontSource {
+    fn first_available_metric(&self,font:&FontSpec,metric:lumen_html::paint::FontMetric)->Option<f32> {
+        self.request_metric_font(font);self.with_fonts(|fonts|fonts.first_available_metric(font,metric))
+    }
+    fn registrations(&self)->Option<Vec<lumen_html_text::FontRegistration>> {self.with_fonts(|fonts|fonts.registrations())}
+    fn rasterize_glyph(&self,face:u64,id:u16,size:f32)->Result<lumen_html_text::GlyphCoverage, &'static str> {self.with_fonts_checked(|fonts|fonts.rasterize_glyph(face,id,size)).and_then(|result|result)}
+    fn outline_glyph(&self,face:u64,id:u16,size:f32)->Result<lumen_html_text::GlyphOutline, &'static str> {self.with_fonts_checked(|fonts|fonts.outline_glyph(face,id,size)).and_then(|result|result)}
+    fn face_key(&self,face:u64)->Result<u64, &'static str> {self.with_fonts_checked(|fonts|fonts.face_key(face)).and_then(|result|result)}
+    fn shape_cache_stats(&self)->lumen_html_text::ShapeCacheStats {self.with_fonts(|fonts|fonts.shape_cache_stats())}
+    fn shape_canvas_text(&self,text:&str,size:f32,rtl:bool,spec:&FontSpec,options:&CanvasTextOptions)->Result<lumen_html::paint::ShapedRun, &'static str> {
+        self.request_rendered_font(text,size,spec)?;
+        self.with_fonts_checked(|fonts|fonts.shape_canvas_text(text,size,rtl,spec,options)).and_then(|result|result)
     }
 }
 
@@ -102,7 +201,7 @@ impl Default for CanvasTextState {
             font: "10px sans-serif".into(),
             size: 10.0,
             spec: FontSpec {
-                families: Some(Arc::from([Arc::from("sans-serif")])),
+                families: Some(Arc::from([lumen_html::paint::FontFamily::Generic(lumen_html::paint::GenericFontFamily::SansSerif)])),
                 stretch: 100.0,
                 ..FontSpec::default()
             },
@@ -150,6 +249,12 @@ pub struct CanvasRegistry {
     surfaces: RefCell<HashMap<NodeId, Rc<RefCell<CanvasData>>>>,
     pending_publish: RefCell<Vec<NodeId>>,
     pending_detach: RefCell<Vec<NodeId>>,
+    paint_requests: RefCell<Vec<NodeId>>,
+    drawable_epochs: RefCell<HashMap<NodeId,u64>>,
+    drawable_discovery_version: Cell<Option<u64>>,
+    drawable_snapshots: RefCell<Vec<(NodeId, NodeId, Rgba8Image)>>,
+    snapshot_provider: RefCell<Option<Rc<dyn Fn(&mut lumen_html::session::RenderSession, NodeId, u32, u32) -> Result<Rgba8Image, String>>>>,
+
 }
 
 pub struct CanvasData {
@@ -158,6 +263,8 @@ pub struct CanvasData {
     logical_height: u64,
     bitmap_available: bool,
     context_mode: Option<&'static str>,
+    transferred: bool,
+    inherited_direction_rtl: bool,
     bitmap_output: Option<Rgba8Image>,
     gpu_generation: u64,
     gpu_snapshot_revision: u64,
@@ -182,6 +289,9 @@ pub struct CanvasData {
     origin_clean: bool,
     text: CanvasTextState,
     saved_text: Vec<CanvasTextState>,
+    remote_inbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
+    remote_outbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
+    remote_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -442,6 +552,8 @@ impl CanvasData {
             logical_height: u64::from(height),
             bitmap_available: true,
             context_mode: None,
+            transferred: false,
+            inherited_direction_rtl: false,
             bitmap_output: None,
             gpu_generation: 0,
             gpu_snapshot_revision: 0,
@@ -466,6 +578,9 @@ impl CanvasData {
             saved_stroke_styles: Vec::new(),
             text: CanvasTextState::default(),
             saved_text: Vec::new(),
+            remote_inbound: None,
+            remote_outbound: None,
+            remote_generation: 0,
         })
     }
 
@@ -549,6 +664,135 @@ impl CanvasData {
 }
 
 impl CanvasRegistry {
+    pub fn set_snapshot_provider(&self, provider: Rc<dyn Fn(&mut lumen_html::session::RenderSession,NodeId,u32,u32)->Result<Rgba8Image,String>>) {
+        *self.snapshot_provider.borrow_mut() = Some(provider);
+    }
+    pub fn paint_pending(&self, realm: &DomRealm) -> bool {
+        let version = realm.session.borrow().document().version();
+        (self.snapshot_provider.borrow().is_some() && self.drawable_discovery_version.get()!=Some(version)) || !self.paint_requests.borrow().is_empty()
+            || self.drawable_epochs.borrow().values().any(|epoch|*epoch!=version)
+    }
+
+    fn request_paint(&self, node: NodeId) -> OpResult<()> {
+        let mut requests = self.paint_requests.borrow_mut();
+        if !requests.contains(&node) {
+            if requests.len() >= 128 { return Err(OpError::new("QuotaExceededError", "Canvas paint request limit")); }
+            requests.push(node);
+        }
+        Ok(())
+    }
+
+    pub fn update_drawable_paint(&self, ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
+        let mut requests = core::mem::take(&mut *self.paint_requests.borrow_mut());
+        let forced_requests = requests.clone();
+        let version = realm.session.borrow().document().version();
+        if self.snapshot_provider.borrow().is_some() && self.drawable_discovery_version.get()!=Some(version) {
+            let session=realm.session.borrow();
+            let document=session.document();
+            let mut stack=vec![document.root()];
+            let mut canvases=0usize;
+            while let Some(node)=stack.pop() {
+                if matches!(document.kind(node),Ok(lumen_html::NodeKind::Element{name,..}) if name=="canvas")
+                    && document.get_attribute_ns(node,None,"content").ok().flatten().as_deref()==Some("drawable") {
+                    canvases+=1;
+                    if canvases>128 {return Err(OpError::new("QuotaExceededError","Drawable canvas count limit"));}
+                    if !self.drawable_epochs.borrow().contains_key(&node) && !requests.contains(&node) {requests.push(node);}
+                }
+                stack.extend(document.composed_children(node).map_err(dom_error)?.into_iter().rev());
+            }
+            self.drawable_discovery_version.set(Some(version));
+        }
+        self.drawable_epochs.borrow_mut().retain(|node,_|drawable_connected(realm.session.borrow().document(),*node));
+        self.drawable_snapshots.borrow_mut().retain(|(owner,node,_)|drawable_connected(realm.session.borrow().document(),*owner) && drawable_connected(realm.session.borrow().document(),*node));
+        for (&canvas,&epoch) in self.drawable_epochs.borrow().iter() {
+            if epoch!=version && !requests.contains(&canvas) {requests.push(canvas);}
+        }
+        if requests.is_empty() { return Ok(()); }
+        // Author request order is unrelated to rendering order. Walk the composed
+        // tree once, bounded by the document, then paint children before ancestors.
+        {
+            let session=realm.session.borrow();
+            let document=session.document();
+            let mut ordered=Vec::with_capacity(requests.len());
+            let mut stack=vec![document.root()];
+            while let Some(node)=stack.pop() {
+                if requests.contains(&node) {ordered.push(node);}
+                let children=document.composed_children(node).map_err(dom_error)?;
+                stack.extend(children.into_iter().rev());
+            }
+            requests=ordered;
+        }
+        let provider = self.snapshot_provider.borrow().clone().ok_or_else(|| OpError::new("NotSupportedError", "Host does not provide drawable rendering"))?;
+        // Complete a child canvas's actual snapshot/event before its ancestor consumes its pixels.
+        for canvas in requests.into_iter().rev() {
+            let (width, height, nodes) = {
+                let session = realm.session.borrow();
+                let document = session.document();
+                if !matches!(document.kind(canvas), Ok(lumen_html::NodeKind::Element {name, ..}) if name == "canvas") { continue; }
+                let drawable=document.get_attribute_ns(canvas,None,"content").ok().flatten().as_deref()==Some("drawable");
+                let width = lumen_html::layout::canvas_dimension(document.get_attribute_ns(canvas,None,"width").ok().flatten().as_deref(),DEFAULT_WIDTH);
+                let height = lumen_html::layout::canvas_dimension(document.get_attribute_ns(canvas,None,"height").ok().flatten().as_deref(),DEFAULT_HEIGHT);
+                let mut nodes = Vec::new();
+                let mut stack = if drawable {document.composed_children(canvas).map_err(dom_error)?} else {Vec::new()};
+                stack.reverse();
+                while let Some(node) = stack.pop() {
+                    let nested_canvas=matches!(document.kind(node),Ok(lumen_html::NodeKind::Element{name,..}) if name == "canvas");
+                    if nested_canvas {
+                        if self.surfaces.borrow().get(&node).is_some_and(|data|!data.borrow().origin_clean) {
+                            return Err(OpError::new("SecurityError","Drawable snapshot contains unreadable canvas pixels"));
+                        }
+                    }
+                    if document.get_attribute_ns(node,None,"drawable").ok().flatten().is_some() {
+                        if nodes.len() >= 128 { return Err(OpError::new("QuotaExceededError", "Drawable snapshot count limit")); }
+                        nodes.push(node);
+                    }
+                    // A drawable nested canvas contributes its real bitmap,
+                    // while its fallback subtree belongs to its own generation.
+                    if !nested_canvas {
+                        stack.extend(document.composed_children(node).map_err(dom_error)?.into_iter().rev());
+                    }
+                }
+                (width,height,nodes)
+            };
+            let mut changed_nodes = Vec::new();
+            let mut fresh = Vec::with_capacity(nodes.len());
+            let mut bytes = 0usize;
+            // Paint events also belong to ordinary canvases. Complete an actual
+            // host-rendered canvas snapshot before their author callback; only
+            // content=drawable canvases publish drawable descendant resources.
+            if nodes.is_empty() {
+                let painted_canvas=provider(&mut realm.session.borrow_mut(),canvas,width,height)
+                    .map_err(|error|OpError::new("OperationError",error))?;
+                if painted_canvas.pixels.len()>MAX_IMAGE_DATA_BYTES {return Err(OpError::new("QuotaExceededError","Canvas paint bitmap budget"));}
+            }
+            for node in nodes {
+                let image = provider(&mut realm.session.borrow_mut(),node,width,height).map_err(|error| OpError::new("OperationError",error))?;
+                bytes = bytes.checked_add(image.pixels.len()).filter(|bytes| *bytes <= MAX_IMAGE_DATA_BYTES).ok_or_else(|| OpError::new("QuotaExceededError", "Drawable snapshot bitmap budget"))?;
+                let changed = self.drawable_snapshots.borrow().iter().find(|(owner,element,_)|*owner==canvas && *element==node)
+                    .is_none_or(|(_,_,old)|old.width!=image.width || old.height!=image.height || old.pixels!=image.pixels);
+                if changed {changed_nodes.push(node);}
+                fresh.push((canvas,node,image));
+            }
+            {
+                let mut retained = self.drawable_snapshots.borrow_mut();
+                retained.retain(|(owner,_,_)| *owner != canvas);
+                let total = retained.iter().try_fold(bytes, |bytes,(_,_,image)|bytes.checked_add(image.pixels.len())).filter(|bytes|*bytes<=MAX_IMAGE_DATA_BYTES).ok_or_else(||OpError::new("QuotaExceededError","Drawable snapshot bitmap budget"))?;
+                let _ = total;
+                if retained.len()+fresh.len()>128 {return Err(OpError::new("QuotaExceededError","Drawable snapshot count limit"));}
+                retained.extend(fresh);
+            }
+            // All resources are retained before author callbacks run. DOM mutations in
+            // the callback therefore cannot alter this published rendering generation.
+            if self.drawable_epochs.borrow().len()>=128 && !self.drawable_epochs.borrow().contains_key(&canvas) {return Err(OpError::new("QuotaExceededError","Drawable canvas count limit"));}
+            self.drawable_epochs.borrow_mut().insert(canvas,realm.session.borrow().document().version());
+            if changed_nodes.is_empty() && !forced_requests.contains(&canvas) {continue;}
+            let elements=changed_nodes.into_iter().map(|node|realm.wrap(ctx,node)).collect::<Vec<_>>();
+            let array=<lumen::embed::JsHost as lumen_bind::Host>::from_list(ctx,elements);
+            realm.dispatch_user_agent(ctx,canvas,"paint",false,false,&[("changedElements",array)])?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn adopt_nodes_into(
         &self,
         ctx: &mut Ctx,
@@ -640,6 +884,9 @@ impl CanvasRegistry {
                 }
             }
             lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::ChildListReplacement { .. }
+            | lumen_html::observe::ObservedKind::TextSplit { .. }
+            | lumen_html::observe::ObservedKind::TextMerge { .. }
             | lumen_html::observe::ObservedKind::SlotAssignment => {}
         }
     }
@@ -657,6 +904,9 @@ impl CanvasRegistry {
             return;
         };
         let mut data = state.borrow_mut();
+        if data.transferred {
+            return;
+        }
         if data.suppress_dimension_mutation {
             data.suppress_dimension_mutation = false;
             return;
@@ -692,7 +942,19 @@ impl CanvasRegistry {
     /// Publish mutation-driven resizes once the session's mutation callback has
     /// returned. Embedders call this before building or exposing a new frame.
     pub fn sync(&self, realm: &DomRealm) -> OpResult<()> {
-        let pending = core::mem::take(&mut *self.pending_publish.borrow_mut());
+        let mut pending = core::mem::take(&mut *self.pending_publish.borrow_mut());
+        // Worker publication crosses only a bounded latest-bitmap mailbox. The
+        // document owner adopts it at its normal rendering boundary.
+        for (&node, state) in self.surfaces.borrow().iter() {
+            let mut data = state.borrow_mut();
+            let Some(mailbox) = data.remote_inbound.clone() else { continue; };
+            let publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
+            if publication.generation != data.remote_generation {
+                data.remote_generation = publication.generation;
+                data.bitmap_output = publication.image.clone();
+                if !pending.contains(&node) { pending.push(node); }
+            }
+        }
         let detached = core::mem::take(&mut *self.pending_detach.borrow_mut());
         if pending.is_empty() && detached.is_empty() {
             return Ok(());
@@ -730,10 +992,14 @@ impl CanvasRegistry {
                 if let Some(error) = &data.pending_error {
                     errors.push(error.clone());
                 }
-                updates.push((node, data.snapshot()));
+                updates.push((node, data.snapshot(), data.transferred));
             }
         }
-        for (node, image) in updates {
+        for (node, image, transferred) in updates {
+            if transferred {
+                session.document_mut().set_attribute(node, "width", &image.width.to_string()).map_err(super::dom_error)?;
+                session.document_mut().set_attribute(node, "height", &image.height.to_string()).map_err(super::dom_error)?;
+            }
             session
                 .set_node_bitmap(node, image_data(image))
                 .map_err(|error| {
@@ -767,6 +1033,15 @@ fn canvas_dimensions(document: &lumen_html::Document, node: NodeId) -> (u32, u32
         lumen_html::layout::canvas_dimension(attribute("width"), DEFAULT_WIDTH),
         lumen_html::layout::canvas_dimension(attribute("height"), DEFAULT_HEIGHT),
     )
+}
+
+fn drawable_connected(document:&lumen_html::Document,mut node:NodeId)->bool {
+    for _ in 0..512 {
+        if node==document.root() {return true;}
+        let Ok(Some(parent))=document.composed_parent(node) else {return false;};
+        node=parent;
+    }
+    false
 }
 
 fn is_attached(document: &lumen_html::Document, mut node: NodeId) -> bool {
@@ -855,7 +1130,7 @@ fn make_image_opaque(pixels: &mut [u8]) {
     }
 }
 
-fn webidl_unsigned_long(ctx: &mut Ctx, value: &Value) -> OpResult<u32> {
+pub(crate) fn webidl_unsigned_long(ctx: &mut Ctx, value: &Value) -> OpResult<u32> {
     let number = ctx.coerce_number(value).map_err(OpError::thrown)?;
     if !number.is_finite() || number == 0.0 {
         return Ok(0);
@@ -971,9 +1246,19 @@ fn image_data(image: Rgba8Image) -> Option<Arc<lumen_html::paint::ImageData>> {
 }
 
 fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &CanvasData) -> OpResult<()> {
+    if let Some(mailbox) = &data.remote_outbound {
+        let image = data.snapshot();
+        let mut publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
+        publication.image = Some(image);
+        publication.generation = publication.generation.wrapping_add(1);
+    }
     let (Some(realm), Some(node)) = (realm, node) else {
         return Ok(());
     };
+    if data.transferred {
+        realm.canvases.queue_publish(node);
+        return Ok(());
+    }
     let attached = {
         let session = realm.session.borrow();
         is_attached(session.document(), node)
@@ -1371,6 +1656,62 @@ fn append_ellipse_arc(
     ellipse_point(center, radii, rotation, start + sweep)
 }
 
+#[lumen_bind::class(name = "CanvasPaintEvent", extends = super::events::DomEvent, hint(js(webidl)))]
+pub(crate) struct DomCanvasPaintEvent { base: super::events::DomEvent, elements_slot: String }
+struct CanvasPaintEventConstructor { event: DomCanvasPaintEvent, elements: Vec<Value> }
+impl lumen_bind::CtorRet<lumen::embed::JsHost,DomCanvasPaintEvent> for CanvasPaintEventConstructor {
+    fn into_ctor(self, cx: &<lumen::embed::JsHost as lumen_bind::Host>::Cx<'_>) -> Result<Value,Value> {
+        let slot=self.event.elements_slot.clone();
+        let instance = <lumen::embed::JsHost as lumen_bind::Host>::construct(cx,self.event)?;
+        <lumen::embed::JsHost as lumen_bind::Host>::with_ctx(cx,|ctx:&mut Ctx| {
+            let array = <lumen::embed::JsHost as lumen_bind::Host>::from_list(ctx,self.elements);
+            ctx.freeze_native_object(&array);
+            ctx.define_native_private_value_slot(&instance,&slot,array)?;
+            Ok(())
+        })?;
+        Ok(instance)
+    }
+}
+#[lumen_bind::methods]
+impl DomCanvasPaintEvent {
+    #[constructor(coerce)]
+    fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<CanvasPaintEventConstructor> {
+        let base = super::events::DomEvent::new(ctx,kind,options.clone())?;
+        let mut elements=Vec::new();
+        if let Some(options)=options.filter(|value|matches!(value,Value::Obj(_))) {
+            let value=ctx.member_get(&options,"changedElements").map_err(OpError::thrown)?;
+            if !matches!(value,Value::Undefined|Value::Null) {
+                if !ctx.is_array_value(&value).map_err(OpError::thrown)? {return Err(OpError::type_error("changedElements must be a sequence"));}
+                let length=ctx.member_get(&value,"length").map_err(OpError::thrown)?;
+                let Value::Num(length)=length else {return Err(OpError::type_error("Invalid changedElements length"));};
+                if length<0.0 || length>128.0 || !length.is_finite() {return Err(OpError::new("QuotaExceededError","changedElements limit"));}
+                for index in 0..length as usize {
+                    let element=ctx.member_get(&value,&index.to_string()).map_err(OpError::thrown)?;
+                    ctx.with_instance::<super::DomElement,_>(&element,|_|())?;
+                    elements.push(element);
+                }
+            }
+        }
+        let elements_slot=ctx.allocate_native_private_slot_name();
+        Ok(CanvasPaintEventConstructor{event:Self{base,elements_slot},elements})
+    }
+    #[getter(name="changedElements")]
+    fn changed_elements(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value> {
+        Ok(ctx.native_private_value_slot(&this.0,&self.elements_slot).unwrap_or(Value::Undefined))
+    }
+}
+
+pub(crate) fn paint_event(ctx:&mut Ctx,elements:Vec<Value>)->OpResult<Value> {
+    let base=super::events::DomEvent::new(ctx,"paint",None)?;
+    let elements_slot=ctx.allocate_native_private_slot_name();
+    let slot=elements_slot.clone();
+    let event=ctx.new_instance(DomCanvasPaintEvent{base,elements_slot});
+    let array=<lumen::embed::JsHost as lumen_bind::Host>::from_list(ctx,elements);
+    ctx.freeze_native_object(&array);
+    ctx.define_native_private_value_slot(&event,&slot,array).map_err(OpError::thrown)?;
+    Ok(event)
+}
+
 #[lumen_bind::class(name = "HTMLCanvasElement", extends = super::DomHtmlElement, hint(js(webidl)))]
 pub struct DomCanvasElement {
     base: super::DomHtmlElement,
@@ -1392,6 +1733,51 @@ impl DomCanvasElement {
 
 #[lumen_bind::methods]
 impl DomCanvasElement {
+    #[constructor]
+    fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
+    }
+    #[getter]
+    fn content(&self) -> String {
+        let realm=&self.base.base.base.realm;
+        if realm.session.borrow().document().get_attribute_ns(self.base.base.base.id,None,"content").ok().flatten().as_deref()==Some("drawable") {"drawable".into()} else {"fallback".into()}
+    }
+
+    #[setter]
+    fn set_content(&self, value: String) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("content",&value)?;
+        if value=="drawable" {self.request_paint()?;}
+        Ok(())
+    }
+
+    #[method(name = "requestPaint")]
+    fn request_paint(&self) -> OpResult<()> {
+        self.base.base.base.realm.canvases.request_paint(self.base.base.base.id)
+    }
+
+    #[method(name = "captureElementImage")]
+    fn capture_element_image(&self, ctx: &mut Ctx, target: Value) -> OpResult<Value> {
+        let (realm,node)=ctx.with_instance::<super::DomElement,_>(&target,|element|(element.base.realm.clone(),element.base.id))?;
+        let owner=&self.base.base.base;
+        if !Rc::ptr_eq(&realm,&owner.realm) {return Err(OpError::new("InvalidStateError","Element belongs to another document"));}
+        let image=realm.canvases.drawable_snapshots.borrow().iter()
+            .find(|(canvas,element,_)|*canvas==owner.id && *element==node)
+            .map(|(_,_,image)|image.clone())
+            .ok_or_else(||OpError::new("InvalidStateError","Element has no published drawable snapshot for this canvas"))?;
+        Ok(ctx.new_instance(DomElementImage {image:RefCell::new(Some(element_image_pixels(image)?)),origin_clean:true}))
+    }
+
+    #[getter(name = "onpaint")]
+    fn onpaint(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        super::event_content_handlers::element_handler_value(ctx, &self.base.base.base.realm, self.base.base.base.id, &this.0, "paint")
+    }
+
+    #[setter(name = "onpaint")]
+    fn set_onpaint(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, handler: super::events::EventHandler) -> OpResult<()> {
+        super::event_content_handlers::set_element_handler(ctx, &self.base.base.base.realm, self.base.base.base.id, &this.0, "paint", handler);
+        self.request_paint()
+    }
+
     #[getter]
     fn width(&self) -> u32 {
         canvas_idl_dimension(&self.base.base.base, "width", DEFAULT_WIDTH)
@@ -1400,7 +1786,9 @@ impl DomCanvasElement {
     #[setter]
     fn set_width(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
         let value = webidl_unsigned_long(ctx, &value)?;
-        set_dom_dimension(ctx, &self.base.base.base, &self.data()?, "width", value)
+        let data = self.data()?;
+        if data.borrow().transferred { return Err(OpError::new("InvalidStateError", "canvas control was transferred")); }
+        set_dom_dimension(ctx, &self.base.base.base, &data, "width", value)
     }
 
     #[getter]
@@ -1437,7 +1825,24 @@ impl DomCanvasElement {
     #[setter]
     fn set_height(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
         let value = webidl_unsigned_long(ctx, &value)?;
-        set_dom_dimension(ctx, &self.base.base.base, &self.data()?, "height", value)
+        let data = self.data()?;
+        if data.borrow().transferred { return Err(OpError::new("InvalidStateError", "canvas control was transferred")); }
+        set_dom_dimension(ctx, &self.base.base.base, &data, "height", value)
+    }
+
+    fn transfer_control_to_offscreen(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let data = self.data()?;
+        let node = &self.base.base.base;
+        let inherited_direction_rtl = canvas_inherited_direction(Some(&node.realm), Some(node.id));
+        {
+            let mut state = data.borrow_mut();
+            if state.transferred || state.context_mode.is_some() {
+                return Err(OpError::new("InvalidStateError", "canvas already has a context or transferred control"));
+            }
+            state.transferred = true;
+            state.inherited_direction_rtl = inherited_direction_rtl;
+        }
+        Ok(ctx.new_instance(DomOffscreenCanvas { data, realm:Some(node.realm.clone()), placeholder:Some(node.id), detached: Cell::new(false) }))
     }
 
     fn get_context(
@@ -1456,6 +1861,7 @@ impl DomCanvasElement {
             return Ok(Value::Null);
         }
         let data = self.data()?;
+        if data.borrow().transferred { return Err(OpError::new("InvalidStateError", "canvas control was transferred")); }
         context_value(
             ctx,
             data,
@@ -1599,6 +2005,15 @@ fn node_height(node: &DomNode) -> u32 {
 #[lumen_bind::class(name = "OffscreenCanvas", hint(js(webidl)))]
 pub struct DomOffscreenCanvas {
     data: Rc<RefCell<CanvasData>>,
+    realm: Option<Rc<DomRealm>>,
+    placeholder: Option<NodeId>,
+    detached: Cell<bool>,
+}
+
+impl DomOffscreenCanvas {
+    fn ensure_attached(&self) -> OpResult<()> {
+        if self.detached.get() { Err(OpError::new("InvalidStateError", "OffscreenCanvas is detached")) } else { Ok(()) }
+    }
 }
 
 #[lumen_bind::methods]
@@ -1607,30 +2022,40 @@ impl DomOffscreenCanvas {
     fn new(ctx: &mut Ctx, width: Value, height: Value) -> OpResult<Self> {
         let width = webidl_enforce_range_unsigned_long_long(ctx, &width)?;
         let height = webidl_enforce_range_unsigned_long_long(ctx, &height)?;
+        let realm = window_globals::current_dom_realm(ctx);
+        let mut data = CanvasData::new_offscreen(width, height)?;
+        data.inherited_direction_rtl = canvas_inherited_direction(realm.as_ref(), None);
         Ok(Self {
-            data: Rc::new(RefCell::new(CanvasData::new_offscreen(width, height)?)),
+            data: Rc::new(RefCell::new(data)),
+            realm,
+            placeholder: None,
+            detached: Cell::new(false),
         })
     }
 
     #[getter]
     fn width(&self) -> f64 {
-        self.data.borrow().logical_width as f64
+        if self.detached.get() { 0.0 } else { self.data.borrow().logical_width as f64 }
     }
     #[setter]
     fn set_width(&self, ctx: &mut Ctx, width: Value) -> OpResult<()> {
         let width = webidl_enforce_range_unsigned_long_long(ctx, &width)?;
+        self.ensure_attached()?;
         let height = self.data.borrow().logical_height;
-        resize_offscreen(&self.data, width, height)
+        resize_offscreen(&self.data, width, height)?;
+        publish(self.realm.as_ref(), self.placeholder, &self.data.borrow())
     }
     #[getter]
     fn height(&self) -> f64 {
-        self.data.borrow().logical_height as f64
+        if self.detached.get() { 0.0 } else { self.data.borrow().logical_height as f64 }
     }
     #[setter]
     fn set_height(&self, ctx: &mut Ctx, height: Value) -> OpResult<()> {
         let height = webidl_enforce_range_unsigned_long_long(ctx, &height)?;
+        self.ensure_attached()?;
         let width = self.data.borrow().logical_width;
-        resize_offscreen(&self.data, width, height)
+        resize_offscreen(&self.data, width, height)?;
+        publish(self.realm.as_ref(), self.placeholder, &self.data.borrow())
     }
 
     fn get_context(
@@ -1640,6 +2065,7 @@ impl DomOffscreenCanvas {
         context_id: &str,
         options: Option<Value>,
     ) -> OpResult<Value> {
+        self.ensure_attached()?;
         if context_id != "2d"
             && context_id != "bitmaprenderer"
             && context_id != "webgpu"
@@ -1655,8 +2081,8 @@ impl DomOffscreenCanvas {
         context_value(
             ctx,
             self.data.clone(),
-            None,
-            None,
+            self.realm.clone(),
+            self.placeholder,
             Some(wrapper),
             context_id,
             options,
@@ -1665,6 +2091,7 @@ impl DomOffscreenCanvas {
 
     #[method(name = "transferToImageBitmap")]
     fn transfer_to_image_bitmap(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.ensure_attached()?;
         let image = CanvasData::snapshot_for_read(&self.data)?;
         let (image, origin_clean) = {
             let mut data = self.data.borrow_mut();
@@ -1682,7 +2109,7 @@ impl DomOffscreenCanvas {
     fn convert_to_blob(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
         let deferred = Deferred::new(ctx);
         let promise = deferred.promise();
-        if let Err(error) = ensure_origin_clean(&self.data.borrow()) {
+        if let Err(error) = self.ensure_attached().and_then(|_| ensure_origin_clean(&self.data.borrow())) {
             deferred.reject(ctx, error);
             return Ok(promise);
         }
@@ -1790,7 +2217,7 @@ fn context_value(
         data.borrow_mut().context_wrapper = ctx.weak_value(&value);
         return Ok(value);
     }
-    let is_offscreen = realm.is_none() && node.is_none();
+    let is_offscreen = node.is_none() || data.borrow().transferred;
     let value = if context_id == "bitmaprenderer" {
         if data.borrow().context_mode.is_none() {
             let alpha =
@@ -2043,6 +2470,57 @@ pub struct DomOffscreenCanvasRenderingContext2D {
     canvas_in_private_slot: bool,
 }
 
+#[lumen_bind::class(name = "PaintRenderingContext2D", hint(js(webidl)))]
+pub(crate) struct DomPaintRenderingContext2D {
+    data: Rc<RefCell<CanvasData>>,
+    realm: Option<Rc<DomRealm>>,
+    node: Option<NodeId>,
+    canvas_in_private_slot: bool,
+    _reservation: std::sync::Arc<lumen_common::limits::ByteLease>,
+}
+
+/// Install the independent Paint interface using the shared typed Canvas2D
+/// operations. Paint scopes exclude Canvas ownership, text and pixel-read APIs.
+pub(crate) fn install_paint_context(ctx: &mut Ctx) -> OpResult<()> {
+    let constructor=ctx.class_constructor::<DomPaintRenderingContext2D>();
+    let prototype=ctx.member_get(&constructor,"prototype").map_err(OpError::thrown)?;
+    let global=ctx.global_object();
+    let reflect=ctx.member_get(&global,"Reflect").map_err(OpError::thrown)?;
+    let delete=ctx.member_get(&reflect,"deleteProperty").map_err(OpError::thrown)?;
+    for name in ["canvas","font","textAlign","textBaseline","direction","fontKerning",
+        "fontStretch","fontVariantCaps","letterSpacing","wordSpacing","textRendering",
+        "fillText","strokeText","measureText","getImageData","putImageData","createImageData",
+        "drawImage","drawElementImage","reset","isContextLost","beginLayer","endLayer","isPointInPath","isPointInStroke"] {
+        ctx.call(delete.clone(),reflect.clone(),&[prototype.clone(),Value::from_string(name.into())])
+            .map_err(|error|OpError::thrown(lumen::embed::abrupt_value(error)))?;
+    }
+    crate::install_interface(ctx,&global,"PaintRenderingContext2D",constructor).map_err(OpError::thrown)
+}
+
+pub(crate) fn paint_context(ctx: &mut Ctx, width: u32, height: u32, alpha: bool,
+    budget: &std::sync::Arc<lumen_common::limits::ByteBudget>) -> OpResult<Value> {
+    let bytes=(width as usize).checked_mul(height as usize).and_then(|pixels|pixels.checked_mul(4))
+        .ok_or_else(||OpError::new("QuotaExceededError","paint surface dimensions exceed budget"))?;
+    let reservation=budget.reserve(bytes).ok_or_else(||OpError::new("QuotaExceededError","paint surface budget exhausted"))?;
+    let mut data=CanvasData::new(width,height)?;
+    data.context_mode=Some("2d");data.alpha=alpha;
+    if !alpha {data.surface.clear_bitmap();}
+    Ok(ctx.new_instance(DomPaintRenderingContext2D {data:Rc::new(RefCell::new(data)),realm:None,
+        node:None,canvas_in_private_slot:false,_reservation:std::sync::Arc::new(reservation)}))
+}
+
+pub(crate) fn paint_context_snapshot(ctx: &mut Ctx, value: &Value,
+    budget: &std::sync::Arc<lumen_common::limits::ByteBudget>) -> OpResult<std::sync::Arc<lumen_html::render_capture::ReservedImageData>> {
+    let data=ctx.with_instance::<DomPaintRenderingContext2D,_>(value,|context|context.data.clone())?;
+    let bytes=(data.borrow().logical_width as usize).checked_mul(data.borrow().logical_height as usize)
+        .and_then(|pixels|pixels.checked_mul(4)).ok_or_else(||OpError::new("QuotaExceededError","paint snapshot dimensions exceed budget"))?;
+    let reservation=budget.reserve(bytes).ok_or_else(||OpError::new("QuotaExceededError","paint snapshot budget exhausted"))?;
+    let image=data.borrow().snapshot();
+    lumen_html::render_capture::ReservedImageData::new(lumen_html::paint::ImageData {
+        width:image.width,height:image.height,pixels:image.pixels},reservation)
+        .ok_or_else(||OpError::new("QuotaExceededError","paint snapshot exceeded reservation"))
+}
+
 macro_rules! impl_canvas_2d_methods {
     ($context:ident) => {
         #[lumen_bind::methods]
@@ -2261,13 +2739,65 @@ macro_rules! impl_canvas_2d_methods {
                 self.data.borrow().text.font.clone()
             }
             #[setter]
-            fn set_font(&self, value: &str) {
-                if let Some((font, size, spec)) = parse_canvas_font(value) {
+            fn set_font(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+                let (font_owner,font_node)=match (self.realm.as_ref(),self.node) {
+                    (Some(realm),Some(node))=>{let (owner,node)=realm.resolve_adopted_node(node);(Some(owner),Some(node))},
+                    _=>(self.realm.clone(),self.node),
+                };
+                let font = lumen_html::css::resolve_font_shorthand_with_requirements(value, |requirements| {
+                    if let (Some(realm), Some(node)) = (font_owner.as_ref(), font_node) {
+                        if requirements.query_container { realm.flush_layout()?; }
+                        else {
+                            let pending = realm.with_session(|session| {
+                                let mut current = Some(node);
+                                for _ in 0..512 {
+                                    let Some(id) = current else { break; };
+                                    if matches!(session.document().kind(id), Ok(NodeKind::Element { .. }))
+                                        && session.computed_style(id).is_ok_and(|style| style.font_query_context_pending()) { return true; }
+                                    current = session.document().composed_parent(id).ok().flatten();
+                                }
+                                false
+                            });
+                            if pending { realm.flush_layout()?; }
+                        }
+                    }
+                    let inherited_node = if self.data.borrow().transferred { None } else { font_node };
+                    let (inherited_size, inherited_spec) = canvas_inherited_font(font_owner.as_ref(), inherited_node);
+                    let fonts = canvas_node_font_source(ctx,font_owner.as_ref(),font_node)?;
+                    let metrics = fonts.font_relative_metrics_styled(inherited_size, &inherited_spec);
+                    let (root_size,root_units)=canvas_root_font_units(font_owner.as_ref(),&fonts)?;
+                    fonts.queue_demand_task(ctx)?;
+                    Ok::<_, OpError>(lumen_html::css::FontShorthandContext {
+                        font_size: inherited_size, root_font_size: root_size,
+                        ex: metrics.ex, ch: metrics.ch,
+                        units: Some([font_owner.as_ref().and_then(|realm| inherited_node.and_then(|node| realm.with_session(|session|
+                            session.computed_style_with_text(node,Some(&fonts)).ok().map(|style| style.font_unit_context(&fonts)[0]))))
+                            .unwrap_or_else(|| lumen_html::css::font_unit_bases(Some(&fonts),inherited_size,&inherited_spec,lumen_html::css::LineHeight::Normal,false,false)),root_units]),
+                        weight: inherited_spec.weight,
+                        viewport: font_owner.as_ref().map(|realm| realm.with_session(|session| session.media_environment())),
+                        query: if requirements.query_container {
+                            font_owner.as_ref().map(|realm| realm.with_session(|session| {
+                                if let Some(node) = font_node {
+                                    session.query_container_context(node).map_err(|error| OpError::new("InvalidStateError", format!("font query context unavailable: {error:?}")))
+                                } else {
+                                    session.query_container_context(session.document().root()).map_err(|error| OpError::new("InvalidStateError", format!("font query context unavailable: {error:?}")))
+                                }
+                            })).transpose()?
+                        } else { None },
+                    })
+                })?;
+                if let Some(mut font) = font.filter(|font| font.size <= 512.0) {
+                    if let (Some(owner),Some(node))=(font_owner.as_ref(),font_node) {
+                        font.spec.family_scope=owner.with_session(|session|session.font_reference_scope(node))
+                            .map_err(|error|OpError::new("InvalidStateError",format!("canvas font reference scope: {error:?}")))?;
+                    }
                     let mut data = self.data.borrow_mut();
-                    data.text.font = font;
-                    data.text.size = size;
-                    data.text.spec = spec;
+                    data.text.font = font.serialized;
+                    data.text.size = font.size;
+                    data.text.font_variant_caps = font.spec.caps;
+                    data.text.spec = font.spec;
                 }
+                Ok(())
             }
             #[getter]
             fn font_stretch(&self) -> String {
@@ -2299,29 +2829,14 @@ macro_rules! impl_canvas_2d_methods {
             }
             #[getter]
             fn font_variant_caps(&self) -> &'static str {
-                match self.data.borrow().text.font_variant_caps {
-                    CanvasFontVariantCaps::Normal => "normal",
-                    CanvasFontVariantCaps::SmallCaps => "small-caps",
-                    CanvasFontVariantCaps::AllSmallCaps => "all-small-caps",
-                    CanvasFontVariantCaps::PetiteCaps => "petite-caps",
-                    CanvasFontVariantCaps::AllPetiteCaps => "all-petite-caps",
-                    CanvasFontVariantCaps::Unicase => "unicase",
-                    CanvasFontVariantCaps::TitlingCaps => "titling-caps",
-                }
+                self.data.borrow().text.font_variant_caps.as_str()
             }
             #[setter]
             fn set_font_variant_caps(&self, value: &str) {
-                let value = match value {
-                    "normal" => CanvasFontVariantCaps::Normal,
-                    "small-caps" => CanvasFontVariantCaps::SmallCaps,
-                    "all-small-caps" => CanvasFontVariantCaps::AllSmallCaps,
-                    "petite-caps" => CanvasFontVariantCaps::PetiteCaps,
-                    "all-petite-caps" => CanvasFontVariantCaps::AllPetiteCaps,
-                    "unicase" => CanvasFontVariantCaps::Unicase,
-                    "titling-caps" => CanvasFontVariantCaps::TitlingCaps,
-                    _ => return,
-                };
-                self.data.borrow_mut().text.font_variant_caps = value;
+                let Some(value) = CanvasFontVariantCaps::parse(value) else { return; };
+                let mut data = self.data.borrow_mut();
+                data.text.font_variant_caps = value;
+                data.text.spec.caps = value;
             }
             #[getter]
             fn text_rendering(&self) -> &'static str {
@@ -2348,32 +2863,34 @@ macro_rules! impl_canvas_2d_methods {
                 css_spacing_string(self.data.borrow().text.letter_spacing)
             }
             #[setter]
-            fn set_letter_spacing(&self, value: &str) {
+            fn set_letter_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
-                if let Some(value) = parse_css_spacing(
-                    value,
-                    text.size,
-                    &text.spec,
-                    canvas_root_font_size(self.realm.as_ref()),
-                ) {
+                let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
+                let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
+                let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
+                let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
+                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
                     self.data.borrow_mut().text.letter_spacing = value;
                 }
+                fonts.queue_demand_task(ctx)?;
+                Ok(())
             }
             #[getter]
             fn word_spacing(&self) -> String {
                 css_spacing_string(self.data.borrow().text.word_spacing)
             }
             #[setter]
-            fn set_word_spacing(&self, value: &str) {
+            fn set_word_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
-                if let Some(value) = parse_css_spacing(
-                    value,
-                    text.size,
-                    &text.spec,
-                    canvas_root_font_size(self.realm.as_ref()),
-                ) {
+                let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
+                let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
+                let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
+                let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
+                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
                     self.data.borrow_mut().text.word_spacing = value;
                 }
+                fonts.queue_demand_task(ctx)?;
+                Ok(())
             }
             #[getter]
             fn text_align(&self) -> String {
@@ -2415,29 +2932,31 @@ macro_rules! impl_canvas_2d_methods {
                     (
                         data.text.size,
                         data.text.spec.clone(),
-                        data.text.direction == "rtl",
+                        resolved_canvas_direction(&data, self.realm.as_ref(), self.node),
                         data.text.shaping_options(),
                     )
                 };
-                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let run = self
                     .data
                     .borrow()
                     .surface
-                    .measure_text(&*fonts, text, font_size, &spec, rtl, &options)
+                    .measure_text(&fonts, text, font_size, &spec, rtl, &options)
                     .map_err(|error| {
                         OpError::new(
                             "InvalidStateError",
                             format!("text shaping failed: {error:?}"),
                         )
                     })?;
-                let metrics = text_metrics(&*fonts, &run, font_size, &spec)?;
+                let metrics = text_metrics(&fonts, &run, font_size, &spec)?;
+                fonts.queue_demand_task(ctx)?;
                 let value = ctx.new_instance(DomTextMetrics { metrics });
                 Ok(value)
             }
             #[method(name = "fillText")]
             fn fill_text(
                 &self,
+                ctx: &mut Ctx,
                 text: &str,
                 x: f64,
                 y: f64,
@@ -2449,18 +2968,20 @@ macro_rules! impl_canvas_2d_methods {
                 {
                     return Ok(());
                 }
-                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
+                let rtl = resolved_canvas_direction(&self.data.borrow(), self.realm.as_ref(), self.node);
                 let mut data = self.data.borrow_mut();
                 if !data.fill_pattern_origin_clean {
                     data.origin_clean = false;
                 }
-                let text_state = data.text.clone();
+                let mut text_state = data.text.clone();
+                text_state.direction = if rtl { "rtl" } else { "ltr" }.into();
                 let options = text_state.shaping_options();
                 let (width, ascent, descent) = {
                     let run = data
                         .surface
                         .measure_text(
-                            &*fonts,
+                            &fonts,
                             text,
                             text_state.size,
                             &text_state.spec,
@@ -2485,7 +3006,7 @@ macro_rules! impl_canvas_2d_methods {
                 let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
                 data.surface
                     .fill_text(
-                        &*fonts,
+                        &fonts,
                         text,
                         text_state.size,
                         &text_state.spec,
@@ -2502,11 +3023,13 @@ macro_rules! impl_canvas_2d_methods {
                             format!("text drawing failed: {error:?}"),
                         )
                     })?;
+                fonts.queue_demand_task(ctx)?;
                 self.publish_data(&data)
             }
             #[method(name = "strokeText")]
             fn stroke_text(
                 &self,
+                ctx: &mut Ctx,
                 text: &str,
                 x: f64,
                 y: f64,
@@ -2518,18 +3041,20 @@ macro_rules! impl_canvas_2d_methods {
                 {
                     return Ok(());
                 }
-                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
+                let rtl = resolved_canvas_direction(&self.data.borrow(), self.realm.as_ref(), self.node);
                 let mut data = self.data.borrow_mut();
                 if !data.stroke_pattern_origin_clean {
                     data.origin_clean = false;
                 }
-                let text_state = data.text.clone();
+                let mut text_state = data.text.clone();
+                text_state.direction = if rtl { "rtl" } else { "ltr" }.into();
                 let options = text_state.shaping_options();
                 let (width, ascent, descent) = {
                     let run = data
                         .surface
                         .measure_text(
-                            &*fonts,
+                            &fonts,
                             text,
                             text_state.size,
                             &text_state.spec,
@@ -2555,7 +3080,7 @@ macro_rules! impl_canvas_2d_methods {
                 let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
                 data.surface
                     .stroke_text(
-                        &*fonts,
+                        &fonts,
                         text,
                         text_state.size,
                         &text_state.spec,
@@ -2572,6 +3097,7 @@ macro_rules! impl_canvas_2d_methods {
                             format!("text drawing failed: {error:?}"),
                         )
                     })?;
+                fonts.queue_demand_task(ctx)?;
                 self.publish_data(&data)
             }
 
@@ -2647,11 +3173,12 @@ macro_rules! impl_canvas_2d_methods {
                 source: Value,
                 repetition: Option<&str>,
             ) -> OpResult<Value> {
-                let source_clean = canvas_source_origin_clean(ctx, &source);
-                let image = match canvas_source_image(ctx, source)? {
+                let source_image = match canvas_source_image(ctx, source.clone())? {
                     Some(image) => image,
                     None => return Ok(Value::Null),
                 };
+                let source_clean = canvas_source_origin_clean(ctx, &source);
+                let image=source_image.pixels;
                 let repetition = match repetition.unwrap_or("repeat") {
                     "repeat" => CanvasPatternRepetition::Repeat,
                     "repeat-x" => CanvasPatternRepetition::RepeatX,
@@ -2664,10 +3191,10 @@ macro_rules! impl_canvas_2d_methods {
                         ));
                     }
                 };
-                if image.width == 0 || image.height == 0 {
+                if image.width == 0 || image.height == 0 || source_image.natural.0==0.0 || source_image.natural.1==0.0 {
                     return Ok(Value::Null);
                 }
-                let pattern = CanvasPattern::new(&image, repetition).map_err(|_| {
+                let pattern = CanvasPattern::with_natural_size(&image, repetition,source_image.natural.0,source_image.natural.1).map_err(|_| {
                     OpError::new(
                         "InvalidStateError",
                         "pattern source could not be rasterized",
@@ -2696,7 +3223,7 @@ macro_rules! impl_canvas_2d_methods {
             }
             fn restore(&self) {
                 let mut data = self.data.borrow_mut();
-                data.surface.restore();
+                if !data.surface.restore() { return; }
                 if let Some((gradient, pattern, pattern_clean)) = data.saved_fill_styles.pop() {
                     data.fill_gradient_value = gradient;
                     data.fill_pattern_value = pattern;
@@ -2710,6 +3237,37 @@ macro_rules! impl_canvas_2d_methods {
                 if let Some(text) = data.saved_text.pop() {
                     data.text = text;
                 }
+            }
+            fn begin_layer(&self) -> OpResult<()> {
+                // The entry save holds native state and traced JS style values.
+                self.save();
+                let result = self.data.borrow_mut().surface.begin_layer();
+                if result.is_err() {
+                    self.restore();
+                    return Err(OpError::new("QuotaExceededError", "Canvas layer budget exceeded"));
+                }
+                Ok(())
+            }
+            fn end_layer(&self) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                let depth = data.surface.end_layer().ok_or_else(|| {
+                    OpError::new("InvalidStateError", "No Canvas layer is open")
+                })?;
+                data.surface.restore();
+                while data.saved_fill_styles.len() >= depth {
+                    if let Some((gradient, pattern, clean)) = data.saved_fill_styles.pop() {
+                        data.fill_gradient_value = gradient;
+                        data.fill_pattern_value = pattern;
+                        data.fill_pattern_origin_clean = clean;
+                    }
+                    if let Some((gradient, pattern, clean)) = data.saved_stroke_styles.pop() {
+                        data.stroke_gradient_value = gradient;
+                        data.stroke_pattern_value = pattern;
+                        data.stroke_pattern_origin_clean = clean;
+                    }
+                    if let Some(text) = data.saved_text.pop() { data.text = text; }
+                }
+                self.publish_data(&data)
             }
             fn fill_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
@@ -3173,8 +3731,8 @@ macro_rules! impl_canvas_2d_methods {
                 self.publish_data(&data)
             }
 
-            #[method(name = "drawImage")]
-            fn draw_image(
+            #[method(name = "drawElementImage")]
+            fn draw_element_image(
                 &self,
                 ctx: &mut Ctx,
                 source: Value,
@@ -3187,17 +3745,22 @@ macro_rules! impl_canvas_2d_methods {
                 g: Option<f64>,
                 h: Option<f64>,
             ) -> OpResult<()> {
-                let source_origin_clean = canvas_source_origin_clean(ctx, &source);
-                let premultiply_alpha = ctx
-                    .instance_data::<DomImageBitmap>(&source)
-                    .map_or(true, |bitmap| bitmap.as_ref().borrow().premultiply_alpha);
-                let Some(image) = canvas_source_image(ctx, source)? else {
-                    return Ok(());
-                };
-                let mut data = self.data.borrow_mut();
-                if !source_origin_clean {
-                    data.origin_clean = false;
+                // Native canvas sources expose their current bitmap, including
+                // draws performed after the last element paint generation.
+                // Reuse the ordinary image path for taint and numeric geometry.
+                if ctx.with_instance::<DomCanvasElement,_>(&source,|_|()).is_ok()
+                    || ctx.with_instance::<DomElementImage,_>(&source,|_|()).is_ok() {
+                    return self.draw_image(ctx,source,a,b,c,d,e,f,g,h);
                 }
+                let (source_realm,node) = ctx.with_instance::<super::DomElement,_>(&source, |element| (element.base.realm.clone(),element.base.id))?;
+                let realm = self.realm.as_ref().ok_or_else(|| OpError::new("InvalidStateError","Element drawing requires the owning document"))?;
+                if !Rc::ptr_eq(realm,&source_realm) {return Err(OpError::new("InvalidStateError","Element belongs to another document"));}
+                let canvas = self.node.ok_or_else(||OpError::new("InvalidStateError","Element drawing requires the owning canvas"))?;
+                let image = realm.canvases.drawable_snapshots.borrow().iter()
+                    .find(|(owner,element,_)| *owner==canvas && *element==node).map(|(_,_,image)|image.clone())
+                    .ok_or_else(||OpError::new("InvalidStateError","Element has no published drawable snapshot for this canvas"))?;
+                let premultiply_alpha = true;
+                let mut data = self.data.borrow_mut();
                 match (c, d, e, f, g, h) {
                     (None, None, None, None, None, None) => {
                         data.surface.draw_image_with_alpha_behavior(
@@ -3218,6 +3781,9 @@ macro_rules! impl_canvas_2d_methods {
                             height as f32,
                             premultiply_alpha,
                         )
+                    }
+                    (Some(sw), Some(sh), Some(dx), Some(dy), None, None) => {
+                        data.surface.draw_image_crop_with_alpha_behavior(&image,a as f32,b as f32,sw as f32,sh as f32,dx as f32,dy as f32,sw as f32,sh as f32,premultiply_alpha)
                     }
                     (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => {
                         data.surface.draw_image_crop_with_alpha_behavior(
@@ -3248,12 +3814,94 @@ macro_rules! impl_canvas_2d_methods {
                 })?;
                 self.publish_data(&data)
             }
+
+            #[method(name = "drawImage")]
+            fn draw_image(
+                &self,
+                ctx: &mut Ctx,
+                source: Value,
+                a: f64,
+                b: f64,
+                c: Option<f64>,
+                d: Option<f64>,
+                e: Option<f64>,
+                f: Option<f64>,
+                g: Option<f64>,
+                h: Option<f64>,
+            ) -> OpResult<()> {
+                if [Some(a),Some(b),c,d,e,f,g,h].into_iter().flatten().any(|value|!value.is_finite()){return Ok(());}
+                let premultiply_alpha = ctx
+                    .instance_data::<DomImageBitmap>(&source)
+                    .map_or(true, |bitmap| bitmap.as_ref().borrow().premultiply_alpha);
+                let Some(source_image) = canvas_source_image(ctx, source.clone())? else {
+                    return Ok(());
+                };
+                let source_origin_clean = canvas_source_origin_clean(ctx, &source);
+                let image=source_image.pixels;
+                let natural=source_image.natural;
+                if natural.0<=0.0 || natural.1<=0.0 || !natural.0.is_finite() || !natural.1.is_finite(){return Ok(());}
+                if matches!((c,d,e,f,g,h),(Some(sw),Some(sh),Some(_),Some(_),Some(_),Some(_)) if sw==0.0 || sh==0.0){return Ok(());}
+                let mut data = self.data.borrow_mut();
+                if !source_origin_clean {
+                    data.origin_clean = false;
+                }
+                match (c, d, e, f, g, h) {
+                    (None, None, None, None, None, None) => {
+                        data.surface.draw_image_with_alpha_behavior(
+                            &image,
+                            a as f32,
+                            b as f32,
+                            natural.0 as f32,
+                            natural.1 as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    (Some(width), Some(height), None, None, None, None) => {
+                        data.surface.draw_image_with_alpha_behavior(
+                            &image,
+                            a as f32,
+                            b as f32,
+                            width as f32,
+                            height as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => {
+                        data.surface.draw_image_crop_with_alpha_behavior(
+                            &image,
+                            (a*f64::from(image.width)/natural.0) as f32,
+                            (b*f64::from(image.height)/natural.1) as f32,
+                            (sw*f64::from(image.width)/natural.0) as f32,
+                            (sh*f64::from(image.height)/natural.1) as f32,
+                            dx as f32,
+                            dy as f32,
+                            dw as f32,
+                            dh as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    _ => {
+                        return Err(OpError::new(
+                            "TypeError",
+                            "drawImage expects 3, 5, or 9 arguments",
+                        ));
+                    }
+                }
+                .map_err(|_| {
+                    OpError::new(
+                        "InvalidStateError",
+                        "drawImage could not rasterize the source",
+                    )
+                })?;
+                self.publish_data(&data)
+            }
         }
     };
 }
 
 impl_canvas_2d_methods!(DomCanvasRenderingContext2D);
 impl_canvas_2d_methods!(DomOffscreenCanvasRenderingContext2D);
+impl_canvas_2d_methods!(DomPaintRenderingContext2D);
 
 fn new_gradient(ctx: &mut Ctx, gradient: CanvasGradient) -> OpResult<Value> {
     let id = NEXT_GRADIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -3478,7 +4126,7 @@ fn create_image_bitmap(
         data.borrow().read_pixels(ctx)?
     } else {
         match canvas_source_image(ctx, source) {
-            Ok(Some(image)) => image,
+            Ok(Some(image)) => image.pixels,
             Ok(None) => {
                 return Ok(rejected_image_bitmap(
                     ctx,
@@ -3901,7 +4549,21 @@ fn rejected_image_bitmap(ctx: &mut Ctx, message: &str) -> Value {
     promise
 }
 
-fn canvas_source_image(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Image>> {
+/// Original decoded pixels and their coordinate-space dimensions are kept
+/// together only for this consumer operation, never as a second image cache.
+struct CanvasSourceImage {pixels:Rgba8Image,natural:(f64,f64)}
+fn canvas_source_image(ctx:&mut Ctx,source:Value)->OpResult<Option<CanvasSourceImage>> {
+    let natural=ctx.with_instance::<DomHtmlImageElement,_>(&source,|image|image.image_snapshot().natural_size).ok().flatten();
+    Ok(canvas_source_pixels(ctx,source)?.map(|pixels|{
+        let natural=natural.unwrap_or((f64::from(pixels.width),f64::from(pixels.height)));
+        CanvasSourceImage{pixels,natural}
+    }))
+}
+
+fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Image>> {
+    if let Ok(image)=ctx.with_instance::<DomElementImage,_>(&source,|image|image.image.borrow().clone()) {
+        return image.map(|image|Some(image.image.clone())).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
+    }
     if let Ok(image) = ctx.with_instance::<DomCanvasElement, _>(&source, |canvas| {
         canvas
             .data()
@@ -3910,6 +4572,7 @@ fn canvas_source_image(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Ima
         return nonempty_canvas_snapshot(image?);
     }
     if let Ok(image) = ctx.with_instance::<DomOffscreenCanvas, _>(&source, |canvas| {
+        canvas.ensure_attached()?;
         CanvasData::snapshot_for_read(&canvas.data)
     }) {
         return nonempty_canvas_snapshot(image?);
@@ -4040,6 +4703,7 @@ fn ensure_origin_clean(data: &CanvasData) -> OpResult<()> {
 }
 
 fn canvas_source_origin_clean(ctx: &mut Ctx, source: &Value) -> bool {
+    if let Ok(clean)=ctx.with_instance::<DomElementImage,_>(source,|image|image.origin_clean) {return clean;}
     if let Some(bitmap) = ctx.instance_data::<DomImageBitmap>(source) {
         return bitmap.borrow().origin_clean;
     }
@@ -4100,6 +4764,7 @@ macro_rules! impl_canvas_2d_helpers {
 
 impl_canvas_2d_helpers!(DomCanvasRenderingContext2D);
 impl_canvas_2d_helpers!(DomOffscreenCanvasRenderingContext2D);
+impl_canvas_2d_helpers!(DomPaintRenderingContext2D);
 
 #[derive(Clone, Copy, Default)]
 struct CanvasTextMetricsData {
@@ -4163,16 +4828,34 @@ impl DomTextMetrics {
     }
 }
 
-fn canvas_font_source(realm: Option<&Rc<DomRealm>>) -> OpResult<CanvasFontSource> {
+fn canvas_node_font_source(ctx:&mut Ctx,realm:Option<&Rc<DomRealm>>,node:Option<NodeId>)->OpResult<CanvasFontSource> {
+    if let (Some(realm),Some(node))=(realm,node) {
+        let (owner,_)=realm.resolve_adopted_node(node);
+        canvas_font_source(ctx,Some(&owner))
+    } else {canvas_font_source(ctx,realm)}
+}
+
+fn canvas_font_source(ctx: &mut Ctx, realm: Option<&Rc<DomRealm>>) -> OpResult<CanvasFontSource> {
     let Some(realm) = realm else {
+        if let Some(worker) = ctx.op_state().get::<Rc<font_loading::WorkerFontContext>>().cloned() {
+            let fonts = worker.canvas_font_set(canvas_fallback_fonts())
+                .map_err(|error| OpError::new("InvalidStateError", error))?;
+            return Ok(CanvasFontSource::realm(fonts,font_loading::WeakFontRealm::Worker(Rc::downgrade(&worker)),RenderFontFallback::Static(canvas_fallback_fonts())));
+        }
         return Ok(CanvasFontSource::Static(canvas_fallback_fonts()));
     };
+    realm_font_source(realm)
+}
+
+pub(crate) fn realm_font_source(realm: &Rc<DomRealm>) -> OpResult<CanvasFontSource> {
     if !realm
         .font_loading
         .has_canvas_font_source()
         .map_err(|error| OpError::new("InvalidStateError", error))?
     {
-        return Ok(CanvasFontSource::Static(canvas_fallback_fonts()));
+        let source=CanvasFontSource::Static(canvas_fallback_fonts());
+        realm.font_loading.canvas_font_source_initialized.set(true);
+        return Ok(source);
     }
     let key = {
         let mut session = realm.session.borrow_mut();
@@ -4195,14 +4878,44 @@ fn canvas_font_source(realm: Option<&Rc<DomRealm>>) -> OpResult<CanvasFontSource
         realm.font_loading.canvas_css_key.set(Some(key));
     }
     let document_base = realm.base_url();
+    let descriptor_query = {
+        let mut session = realm.session.borrow_mut();
+        let root = session.document().root();
+        session.query_container_context(root).map_err(|error| OpError::new("InvalidStateError", format!("font descriptor query context: {error:?}")))?
+    };
+    let installed=realm.font_loading.render_fallback.borrow().clone();
+    let fallback=match installed.as_deref() {
+        Some(fonts) => fonts,
+        None => canvas_fallback_fonts(),
+    };
     let fonts = realm
         .font_loading
-        .canvas_font_set(canvas_fallback_fonts(), &document_base)
+        .canvas_font_set_with_query(fallback, &document_base, descriptor_query)
         .map_err(|error| OpError::new("InvalidStateError", error))?;
-    Ok(CanvasFontSource::Realm(fonts))
+    realm.font_loading.canvas_font_source_initialized.set(true);
+    Ok(CanvasFontSource::realm(fonts,font_loading::WeakFontRealm::Document(Rc::downgrade(realm)),
+        installed.map_or_else(||RenderFontFallback::Static(canvas_fallback_fonts()),RenderFontFallback::Owned)))
 }
 
-fn canvas_fallback_fonts() -> &'static FontSet {
+/// Host renderers may supply their existing platform registry and an already
+/// captured document view without re-entering the Session during shaping.
+pub(crate) fn render_font_source_from_snapshot(realm:&Rc<DomRealm>,fallback:Arc<FontSet>,
+    rules:&[lumen_html::css::FontFaceRule],document_base:&str,query:lumen_html::css::ContainerUnitContext)->OpResult<CanvasFontSource> {
+    realm.font_loading.replace_document_css_faces(rules)?;
+    *realm.font_loading.render_fallback.borrow_mut()=Some(fallback.clone());
+    let fonts=realm.font_loading.canvas_font_set_with_query(&fallback,document_base,query)
+        .map_err(|error|OpError::new("InvalidStateError",error))?;
+    realm.font_loading.canvas_font_source_initialized.set(true);
+    Ok(CanvasFontSource::realm(fonts,font_loading::WeakFontRealm::Document(Rc::downgrade(realm)),
+        RenderFontFallback::Owned(fallback)))
+}
+
+pub(crate) fn initialized_realm_font_source(realm:&Rc<DomRealm>)->OpResult<Option<CanvasFontSource>> {
+    if realm.font_loading.canvas_font_source_initialized.get(){realm_font_source(realm).map(Some)}
+    else{Ok(None)}
+}
+
+pub(crate) fn canvas_fallback_fonts() -> &'static FontSet {
     CANVAS_FONTS.get_or_init(|| {
         let mono = Arc::new(
             FontFace::new(Arc::from(DEFAULT_FONT_BYTES))
@@ -4246,70 +4959,46 @@ fn canvas_fallback_fonts() -> &'static FontSet {
     })
 }
 
-fn canvas_fonts() -> &'static FontSet {
-    canvas_fallback_fonts()
+fn canvas_inherited_direction(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>) -> bool {
+    let Some(realm) = realm else { return false; };
+    realm.with_session(|session| {
+        let node = node.or_else(|| selector::query_selector(session.document(), session.document().root(), "html").ok().flatten());
+        node.and_then(|node| session.computed_style(node).ok())
+            .is_some_and(|style| style.direction == lumen_html::css::Direction::Rtl)
+    })
 }
 
-fn parse_canvas_font(value: &str) -> Option<(String, f32, FontSpec)> {
-    let value = value.trim();
-    let size_end = value.find("px")?;
-    if value[size_end + 2..]
-        .chars()
-        .next()
-        .is_some_and(|ch| !ch.is_ascii_whitespace())
-    {
-        return None;
+fn resolved_canvas_direction(data: &CanvasData, realm: Option<&Rc<DomRealm>>, node: Option<NodeId>) -> bool {
+    match data.text.direction.as_str() {
+        "rtl" => true,
+        "ltr" => false,
+        _ if data.transferred || node.is_none() => data.inherited_direction_rtl,
+        _ => canvas_inherited_direction(realm, node),
     }
-    let prefix = value[..size_end].trim();
-    let mut size = None;
-    let mut weight = 400;
-    let mut stretch = 100.0;
-    let mut style = FontStyle::Normal;
-    for token in prefix.split_ascii_whitespace() {
-        match token {
-            "normal" => {}
-            "italic" | "oblique" => style = FontStyle::Italic,
-            "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
-            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => {
-                stretch = parse_stretch(token)?;
-            }
-            "bold" => weight = 700,
-            "bolder" => weight = 700,
-            "lighter" => weight = 300,
-            numeric if size.is_none() => size = numeric.parse::<f32>().ok(),
-            _ => return None,
+}
+
+fn canvas_inherited_font(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>) -> (f32, FontSpec) {
+    if let (Some(realm), Some(node)) = (realm, node) {
+        if realm.has_browsing_context {
+            let style = realm.with_session(|session| {
+                if !script_loading::is_connected(session.document(), node) { return None; }
+                let mut current = node;
+                let source = session.computed_style(node).ok()?;
+                loop {
+                    if current == session.document().root() { return Some(source); }
+                    if matches!(session.document().kind(current), Ok(NodeKind::Element { .. }))
+                        && (session.computed_style(current).ok()?.display == lumen_html::css::Display::None
+                            || current == node && source.display == lumen_html::css::Display::Contents)
+                    { return None; }
+                    current = session.document().composed_parent(current).ok()??;
+                }
+            });
+            if let Some(style) = style { return (style.font_size, style.font.clone()); }
         }
     }
-    let size = size?;
-    if !size.is_finite() || size <= 0.0 || size > 512.0 {
-        return None;
-    }
-    let family = value[size_end + 2..].trim().trim_matches(['\'', '"']);
-    if family.is_empty()
-        || !matches!(
-            family.to_ascii_lowercase().as_str(),
-            "sans-serif" | "serif" | "monospace" | "inconsolata" | "liberation sans"
-        )
-    {
-        return None;
-    }
-    let normalized_family = family.to_ascii_lowercase();
-    let family = match normalized_family.as_str() {
-        "inconsolata" => "Inconsolata".to_owned(),
-        "liberation sans" => "Liberation Sans".to_owned(),
-        other => other.to_owned(),
-    };
-    Some((
-        value.into(),
-        size,
-        FontSpec {
-            families: Some(Arc::from([Arc::from(family)])),
-            weight,
-            stretch,
-            style,
-            size_adjust: None,
-        },
-    ))
+    // Disconnected/hidden elements and OffscreenCanvas use the initial font,
+    // even if a previous assignment selected a larger canvas font.
+    (10.0, FontSpec { families: Some(Arc::from([lumen_html::paint::FontFamily::Generic(lumen_html::paint::GenericFontFamily::SansSerif)])), ..FontSpec::default() })
 }
 
 fn parse_stretch(value: &str) -> Option<f32> {
@@ -4347,62 +5036,21 @@ fn stretch_value(stretch: f32) -> String {
     }
 }
 
-fn parse_css_spacing(value: &str, size: f32, spec: &FontSpec, root_font: f32) -> Option<f32> {
+fn parse_css_spacing(value: &str, size: f32, root_font: f32, units: [lumen_html::css::FontUnitBases;2]) -> Option<f32> {
     let value = value.trim();
-    if value.eq_ignore_ascii_case("normal") {
-        return Some(0.0);
-    }
-    let fonts = canvas_fonts();
-    let ch = fonts.measure_styled("0", size, spec).ok()?;
-    let ex = fonts
-        .shape_styled("x", size, false, spec)
-        .ok()?
-        .glyphs
-        .iter()
-        .filter_map(|glyph| {
-            fonts
-                .outline_glyph(glyph.face, glyph.id, size * glyph.size_scale)
-                .ok()
-                .map(|outline| outline.commands)
-        })
-        .flatten()
-        .filter_map(|command| match command {
-            lumen_html_text::GlyphOutlineCommand::MoveTo(_, y)
-            | lumen_html_text::GlyphOutlineCommand::LineTo(_, y) => Some(y),
-            lumen_html_text::GlyphOutlineCommand::QuadTo(_, y1, _, y2) => Some(y1.min(y2)),
-            lumen_html_text::GlyphOutlineCommand::CurveTo(_, y1, _, y2, _, y3) => {
-                Some(y1.min(y2).min(y3))
-            }
-            lumen_html_text::GlyphOutlineCommand::Close => None,
-        })
-        .fold(None, |bounds: Option<(f32, f32)>, y| {
-            Some(bounds.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
-        });
-    let ex = ex.map_or(size * 0.5, |(lo, hi)| hi - lo);
-    let value = lumen_html::css::parse_text_length(value, size, root_font, ex, ch)?;
+    if value.eq_ignore_ascii_case("normal") { return Some(0.0); }
+    let value = lumen_html::css::parse_text_length_with_font_units(value,size,root_font,units)?;
     (value.is_finite() && value.abs() <= 32_768.0).then_some(value)
 }
 
-fn canvas_root_font_size(realm: Option<&Rc<DomRealm>>) -> f32 {
-    let Some(realm) = realm else {
-        return 16.0;
-    };
+fn canvas_root_font_units(realm: Option<&Rc<DomRealm>>, fonts: &dyn TextShaper) -> OpResult<(f32,lumen_html::css::FontUnitBases)> {
+    let initial = || (16.0,lumen_html::css::font_unit_bases(Some(fonts),16.0,&FontSpec::default(),lumen_html::css::LineHeight::Normal,false,false));
+    let Some(realm) = realm else { return Ok(initial()); };
     realm.with_session(|session| {
-        let root = {
-            let document = session.document();
-            let mut child = document.first_child(document.root()).ok().flatten();
-            let mut html = None;
-            while let Some(id) = child {
-                if matches!(document.kind(id), Ok(NodeKind::Element { name, .. }) if name.eq_ignore_ascii_case("html")) {
-                    html = Some(id);
-                    break;
-                }
-                child = document.next_sibling(id).ok().flatten();
-            }
-            html
-        };
-        root.and_then(|node| session.computed_style(node).ok())
-            .map_or(16.0, |style| style.font_size)
+        let root=session.document().document_element_at(session.document().root()).map_err(dom_error)?;
+        let Some(root)=root else { return Ok(initial()); };
+        let style=session.computed_style_with_text(root,Some(fonts)).map_err(|error|OpError::new("InvalidStateError",format!("root font units unavailable: {error:?}")))?;
+        Ok((style.font_size,style.font_unit_context(fonts)[0]))
     })
 }
 
@@ -4757,16 +5405,9 @@ impl DomImageData {
         if let Some(value) = self.pixels.borrow().clone() {
             return Ok(value);
         }
-        let element_count = image_data_storage(self.width, self.height, self.pixel_format)?.0;
-        let constructor_name = match self.pixel_format {
-            ImageDataPixelFormat::RgbaUnorm8 => "Uint8ClampedArray",
-            ImageDataPixelFormat::RgbaFloat16 => "Float16Array",
-        };
-        let constructor = ctx
-            .get_member(&ctx.global_object(), constructor_name)
-            .map_err(|_| OpError::new("Error", "ImageData typed array is unavailable"))?;
-        let array = ctx
-            .construct_value(constructor, &[Value::Num(element_count as f64)])
+        let (element_count, byte_len) = image_data_storage(self.width, self.height, self.pixel_format)?;
+        let buffer = ctx.make_array_buffer_from(zeroed_bytes(byte_len, "ImageData data allocation failed")?);
+        let array = ctx.new_typed_array_view(self.pixel_format.typed_array_kind(), &buffer, 0, element_count)
             .map_err(OpError::thrown)?;
         if let Some(image) = self.image.as_ref() {
             match self.pixel_format {
@@ -4870,10 +5511,148 @@ fn parse_dom_matrix(ctx: &mut Ctx, value: &Value) -> OpResult<Transform> {
     ))
 }
 
+#[lumen_bind::class(name = "ElementImage", hint(js(webidl)))]
+pub struct DomElementImage {
+    image: RefCell<Option<Arc<ElementImagePixels>>>,
+    origin_clean: bool,
+}
+
+struct ElementImagePixels {
+    image: Rgba8Image,
+    _reservation: lumen_common::limits::ByteLease,
+}
+
+fn element_image_pixels(image:Rgba8Image) -> OpResult<Arc<ElementImagePixels>> {
+    static BUDGET:std::sync::OnceLock<Arc<lumen_common::limits::ByteBudget>>=std::sync::OnceLock::new();
+    if !image.is_valid() {return Err(OpError::new("InvalidStateError","ElementImage has invalid pixels"));}
+    let budget=BUDGET.get_or_init(||lumen_common::limits::ByteBudget::new(64*1024*1024));
+    let reservation=budget.reserve(image.pixels.len()).ok_or_else(||OpError::new("QuotaExceededError","ElementImage pixel budget exhausted"))?;
+    Ok(Arc::new(ElementImagePixels {image,_reservation:reservation}))
+}
+
+#[lumen_bind::methods]
+impl DomElementImage {
+    #[constructor]
+    fn new() -> OpResult<Self> {Err(OpError::new("TypeError","Illegal constructor"))}
+    #[getter]
+    fn width(&self) -> u32 {self.image.borrow().as_ref().map_or(0,|image|image.image.width)}
+    #[getter]
+    fn height(&self) -> u32 {self.image.borrow().as_ref().map_or(0,|image|image.image.height)}
+}
+
+fn element_image_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec {
+    lumen_host::clone_transfer::NativeTransferCodec {
+        kind:"ElementImage",
+        matches:|ctx,value|ctx.with_instance::<DomElementImage,_>(value,|_|()).is_ok(),
+        validate:|ctx,value|ctx.with_instance::<DomElementImage,_>(value,|image| {
+            if image.image.borrow().is_none() {Err(OpError::new("DataCloneError","ElementImage is detached"))} else {Ok(())}
+        })?,
+        export:|ctx,value|ctx.with_instance::<DomElementImage,_>(value,|image| {
+            Box::new((image.image.borrow().as_ref().expect("validated ElementImage").clone(),image.origin_clean)) as Box<dyn std::any::Any+Send>
+        }),
+        detach:|ctx,value,_| {let _=ctx.with_instance::<DomElementImage,_>(value,|image|{image.image.borrow_mut().take();});},
+        import:|ctx,payload| {
+            let payload=payload.downcast::<(Arc<ElementImagePixels>,bool)>().map_err(|_|OpError::new("DataCloneError","Invalid ElementImage attachment"))?;
+            let (image,origin_clean)=*payload;
+            Ok(ctx.new_instance(DomElementImage {image:RefCell::new(Some(image)),origin_clean}))
+        },
+    }
+}
+
+fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec {
+    use lumen_host::clone_transfer::NativeTransferCodec;
+    NativeTransferCodec {
+        kind: "OffscreenCanvas",
+        matches: |ctx, value| ctx.with_instance::<DomOffscreenCanvas, _>(value, |_| ()).is_ok(),
+        validate: |ctx, value| ctx.with_instance::<DomOffscreenCanvas, _>(value, |canvas| {
+            if canvas.detached.get() || canvas.data.borrow().context_mode.is_some() {
+                Err(OpError::new("DataCloneError", "OffscreenCanvas is detached or has a rendering context"))
+            } else { Ok(()) }
+        })?,
+        export: |ctx, value| ctx.with_instance::<DomOffscreenCanvas, _>(value, |canvas| {
+            let data = canvas.data.borrow();
+            let publication = data.remote_outbound.clone().or_else(|| canvas.placeholder.map(|_| Arc::new(std::sync::Mutex::new(CanvasPublication::default()))));
+            Box::new(OffscreenCanvasTransfer {
+                width: data.logical_width, height: data.logical_height,
+                rtl: data.inherited_direction_rtl, origin_clean: data.origin_clean, publication,
+            }) as Box<dyn std::any::Any + Send>
+        }),
+        detach: |ctx, value, payload| {
+            let payload = payload.downcast_ref::<OffscreenCanvasTransfer>().expect("native Canvas attachment type");
+            let _ = ctx.with_instance::<DomOffscreenCanvas, _>(value, |canvas| {
+                canvas.detached.set(true);
+                if canvas.placeholder.is_some() {
+                    canvas.data.borrow_mut().remote_inbound = payload.publication.clone();
+                }
+            });
+        },
+        import: |ctx, payload| {
+            let payload = payload.downcast::<OffscreenCanvasTransfer>().map_err(|_| OpError::new("DataCloneError", "Invalid Canvas attachment"))?;
+            let mut data = CanvasData::new_offscreen(payload.width, payload.height)?;
+            data.inherited_direction_rtl = payload.rtl;
+            data.origin_clean = payload.origin_clean;
+            data.remote_outbound = payload.publication;
+            let realm = window_globals::current_dom_realm(ctx);
+            Ok(ctx.new_instance(DomOffscreenCanvas {
+                data: Rc::new(RefCell::new(data)), realm,
+                placeholder: None, detached: Cell::new(false),
+            }))
+        },
+    }
+}
+
+fn image_data_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCodec {
+    use lumen_host::clone_transfer::NativeGraphValueCodec;
+    NativeGraphValueCodec {
+        kind: "ImageData", max_bytes: 10, max_children: 1,
+        matches: |ctx, value| ctx.with_instance::<DomImageData, _>(value, |_| ()).is_ok(),
+        serialize: |ctx, value| {
+            let image = ctx.instance_data::<DomImageData>(value).ok_or_else(|| OpError::new("DataCloneError", "Invalid ImageData"))?;
+            let image = image.borrow();
+            let pixels = image.data(ctx)?;
+            let expected = image_data_storage(image.width, image.height, image.pixel_format)?.1;
+            if ctx.typed_array_byte_len(&pixels) != Some(expected) {
+                return Err(OpError::new("DataCloneError", "ImageData pixel array is detached"));
+            }
+            let mut bytes = Vec::with_capacity(10);
+            bytes.extend_from_slice(&image.width.to_le_bytes());
+            bytes.extend_from_slice(&image.height.to_le_bytes());
+            bytes.push(match image.color_space { CanvasColorSpace::Srgb => 0, CanvasColorSpace::DisplayP3 => 1 });
+            bytes.push(match image.pixel_format { ImageDataPixelFormat::RgbaUnorm8 => 0, ImageDataPixelFormat::RgbaFloat16 => 1 });
+            Ok((bytes, vec![pixels]))
+        },
+        create: |ctx, bytes| {
+            if bytes.len() != 10 { return Err(OpError::new("DataCloneError", "Invalid ImageData metadata")); }
+            let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            let color_space = match bytes[8] { 0 => CanvasColorSpace::Srgb, 1 => CanvasColorSpace::DisplayP3, _ => return Err(OpError::new("DataCloneError", "Invalid ImageData color space")) };
+            let pixel_format = match bytes[9] { 0 => ImageDataPixelFormat::RgbaUnorm8, 1 => ImageDataPixelFormat::RgbaFloat16, _ => return Err(OpError::new("DataCloneError", "Invalid ImageData pixel format")) };
+            image_data_storage(width, height, pixel_format).map_err(|_| OpError::new("DataCloneError", "Invalid ImageData dimensions"))?;
+            Ok(ctx.new_instance(DomImageData { image: None, width, height, color_space, pixel_format, pixels: RefCell::new(None) }))
+        },
+        populate: |ctx, value, mut children| {
+            if children.len() != 1 { return Err(OpError::new("DataCloneError", "Invalid ImageData pixel array")); }
+            let pixels = children.pop().unwrap();
+            let (width, height, format) = ctx.with_instance::<DomImageData, _>(value, |image| (image.width, image.height, image.pixel_format))?;
+            let expected = image_data_storage(width, height, format)?.1;
+            if ctx.typed_array_kind(&pixels) != Some(format.typed_array_kind()) || ctx.typed_array_byte_len(&pixels) != Some(expected) {
+                return Err(OpError::new("DataCloneError", "Invalid ImageData pixel array"));
+            }
+            ctx.with_instance::<DomImageData, _>(value, |image| { *image.pixels.borrow_mut() = Some(pixels); })?;
+            Ok(())
+        },
+    }
+}
+
 fn install_canvas_apis(ctx: &mut Ctx, include_window_context: bool) -> OpResult<()> {
+    if include_window_context { let constructor=ctx.class_constructor::<DomCanvasPaintEvent>(); let global=ctx.global_object(); crate::install_interface(ctx,&global,"CanvasPaintEvent",constructor).map_err(OpError::thrown)?; }
+    lumen_host::clone_transfer::register_native_codec(ctx, offscreen_transfer_codec());
+    lumen_host::clone_transfer::register_native_codec(ctx, element_image_transfer_codec());
+    lumen_host::clone_transfer::register_native_graph_value_codec(ctx, image_data_value_codec());
     let global = ctx.global_object();
     let _bitmap_decode_job_constructor = ctx.class_constructor::<DomBitmapDecodeJob>();
     for (name, constructor) in [
+        ("ElementImage",ctx.class_constructor::<DomElementImage>()),
         (
             "OffscreenCanvas",
             ctx.class_constructor::<DomOffscreenCanvas>(),
@@ -4921,6 +5700,250 @@ pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_offscreen_text_captures_placeholder_direction() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<html dir='rtl'><body><canvas id='inherited' dir='rtl' width='100' height='40'></canvas><canvas id='explicit' width='100' height='40'></canvas><canvas id='ltr' width='100' height='40'></canvas></body></html>",128).unwrap();
+        assert!(eval_bool(&mut engine,r#"
+            var inherited=document.getElementById('inherited').transferControlToOffscreen();
+            var explicit=document.getElementById('explicit').transferControlToOffscreen();
+            var ltr=document.getElementById('ltr').transferControlToOffscreen();
+            document.getElementById('inherited').dir='ltr';
+            for(const [canvas,direction] of [[inherited,'inherit'],[explicit,'rtl'],[ltr,'ltr']]){
+                const context=canvas.getContext('2d');context.font='20px sans-serif';context.direction=direction;context.fillText('ABC!',60,25);
+            }
+            inherited.getContext('2d').direction==='inherit'
+        "#));
+        let pixels=|name:&str|{let node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),&format!("#{name}")).unwrap().unwrap());realm.canvases.data_for(&realm,node).unwrap().borrow().snapshot().pixels};
+        assert_eq!(pixels("inherited"),pixels("explicit"));
+        assert_ne!(pixels("inherited"),pixels("ltr"));
+        assert!(eval_bool(&mut engine,"var standalone=new OffscreenCanvas(100,40);standalone.getContext('2d').fillText('ABC!',60,25);true"));
+        let value=engine.eval_value("standalone").unwrap().unwrap_or_else(|_|panic!("standalone query threw"));
+        assert!(engine.ctx().with_instance::<DomOffscreenCanvas,_>(&value,|canvas|canvas.data.borrow().inherited_direction_rtl).unwrap());
+    }
+
+    #[test]
+    fn drawable_canvas_initial_render_publishes_without_author_paint_request() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<!doctype html><canvas id=c content=drawable width=8 height=6><div id=target drawable style='width:4px;height:3px;background:blue'></div></canvas>",64).unwrap();
+        realm.set_canvas_snapshot_provider(Rc::new(|session,node,width,height| {
+            let fonts=canvas_fallback_fonts();
+            let (list,rect)=session.element_snapshot_display_list(node,width,height,fonts,None).map_err(|error|format!("{error:?}"))?;
+            lumen_html_image::render_with_font(&list,rect.width.ceil() as u32,rect.height.ceil() as u32,1.0,false,fonts).map_err(|error|format!("{error:?}"))
+        }));
+        assert!(realm.canvas_paint_pending());
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(eval_bool(&mut engine,"document.getElementById('c').getContext('2d').drawElementImage(document.getElementById('target'),0,0);document.getElementById('c').getContext('2d').getImageData(0,0,1,1).data[2]===255"));
+        assert!(!realm.canvas_paint_pending());
+        assert!(eval_bool(&mut engine,"globalThis.retained=document.getElementById('c').captureElementImage(document.getElementById('target'));retained instanceof ElementImage && retained.width===4 && retained.height===3"));
+        assert!(eval_bool(&mut engine,"document.getElementById('target').style.background='red';true"));
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(eval_bool(&mut engine,"document.getElementById('c').getContext('2d').drawElementImage(document.getElementById('target'),0,0);document.getElementById('c').getContext('2d').getImageData(0,0,1,1).data[0]===255"));
+        assert!(eval_bool(&mut engine,"document.getElementById('c').getContext('2d').drawElementImage(retained,0,0);document.getElementById('c').getContext('2d').getImageData(0,0,1,1).data[2]===255"));
+    }
+
+    #[test]
+    fn canvas_paint_renders_ordinary_nested_and_slotted_resources() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<!doctype html><canvas id=plain width=4 height=3></canvas><canvas id=outer width=8 height=6 content=drawable><canvas id=nested drawable width=8 height=6></canvas><div id=host><div id=slotted slot=s drawable style='width:4px;height:3px;background:yellow'></div></div>",128).unwrap();
+        let rendered=Rc::new(RefCell::new(Vec::new()));
+        let observed=rendered.clone();
+        realm.set_canvas_snapshot_provider(Rc::new(move |session,node,width,height| {
+            let fonts=canvas_fallback_fonts();
+            let (list,rect)=session.element_snapshot_display_list(node,width,height,fonts,None).map_err(|error|format!("{error:?}"))?;
+            let image=lumen_html_image::render_with_font(&list,rect.width.ceil() as u32,rect.height.ceil() as u32,1.0,false,fonts).map_err(|error|format!("{error:?}"))?;
+            observed.borrow_mut().push((node,image.pixels.clone()));
+            Ok(image)
+        }));
+        assert!(eval_bool(&mut engine,r#"
+            globalThis.plain=document.getElementById('plain');globalThis.outer=document.getElementById('outer');
+            globalThis.nested=document.getElementById('nested');globalThis.host=document.getElementById('host');
+            globalThis.events=[];globalThis.plainValid=false;globalThis.px=plain.getContext('2d');globalThis.nx=nested.getContext('2d');globalThis.ox=outer.getContext('2d');
+            px.fillStyle='blue';px.fillRect(0,0,4,3);nx.fillStyle='red';nx.fillRect(0,0,8,6);
+            plain.onpaint=e=>{events.push('plain');plainValid=e instanceof CanvasPaintEvent && e.isTrusted && e.changedElements.length===0;};
+            nested.onpaint=()=>{events.push('nested');nx.fillStyle='green';nx.fillRect(0,0,8,6)};
+            outer.onpaint=e=>{events.push('outer');if(e.changedElements[0]!==nested)throw Error('nested publication');ox.drawElementImage(nested,0,0)};
+            host.attachShadow({mode:'open'}).innerHTML='<canvas id="sc" width="8" height="6" content="drawable"><slot name="s"></slot></canvas>';
+            globalThis.sc=host.shadowRoot.getElementById('sc');globalThis.sx=sc.getContext('2d');
+            sc.onpaint=e=>{events.push('slot');if(e.changedElements[0]!==document.getElementById('slotted'))throw Error('composed publication');sx.drawElementImage(e.changedElements[0],0,0)};
+            plain.requestPaint();outer.requestPaint();nested.requestPaint();sc.requestPaint();true
+        "#));
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(eval_bool(&mut engine,"plainValid && events.includes('plain') && events.indexOf('nested')<events.indexOf('outer') && ox.getImageData(0,0,1,1).data[1]===128 && sx.getImageData(0,0,1,1).data[0]===255 && sx.getImageData(0,0,1,1).data[1]===255"));
+        assert!(eval_bool(&mut engine,"nested.removeAttribute('drawable');nx.fillStyle='blue';nx.fillRect(0,0,8,6);ox.drawElementImage(nested,0,0,4,3);ox.getImageData(0,0,1,1).data[2]===255"),"native canvas source uses current pixels and numeric scaling without a drawable publication");
+        let plain=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#plain").unwrap().unwrap());
+        assert!(rendered.borrow().iter().any(|(node,pixels)|*node==plain && pixels.get(..4)==Some(&[0,0,255,255])));
+        let nested=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#nested").unwrap().unwrap());
+        realm.canvases.data_for(&realm,nested).unwrap().borrow_mut().origin_clean=false;
+        assert!(eval_bool(&mut engine,"(()=>{ox.drawElementImage(nested,0,0);try{ox.getImageData(0,0,1,1);return false}catch(e){return e.name==='SecurityError'}})()"),"native canvas drawing propagates origin taint through the shared image path");
+        assert!(eval_bool(&mut engine,"events=[];outer.requestPaint();true"));
+        let error=realm.update_rendered_focus(engine.ctx()).expect_err("tainted nested canvas must not publish readable pixels");
+        assert_eq!(error.class(),"SecurityError");
+        assert!(eval_bool(&mut engine,"!events.includes('outer')"));
+    }
+
+    #[test]
+    fn drawable_canvas_paint_publishes_real_pixels_and_retains_callback_generation() {
+        let mut engine = Engine::new();
+        let realm = super::super::install(engine.ctx(), "<!doctype html><canvas id=c width=30 height=20 content=drawable><div id=target drawable style='width:10px;height:5px;background:blue'></div></canvas>",128).unwrap();
+        let captures = Rc::new(Cell::new(0));
+        let observed = captures.clone();
+        realm.set_canvas_snapshot_provider(Rc::new(move |session,node,width,height| {
+            observed.set(observed.get()+1);
+            let fonts = canvas_fallback_fonts();
+            let (list,rect) = session.element_snapshot_display_list(node,width,height,fonts,None).map_err(|error|format!("{error:?}"))?;
+            lumen_html_image::render_with_font(&list,rect.width.ceil() as u32,rect.height.ceil() as u32,1.0,false,fonts).map_err(|error|format!("{error:?}"))
+        }));
+        assert!(eval_bool(&mut engine, "devicePixelRatio===1 && window.devicePixelRatio===1"));
+        realm.set_device_pixel_ratio(2.0).unwrap();
+        assert!(eval_bool(&mut engine, "devicePixelRatio===2"));
+        assert!(realm.set_device_pixel_ratio(f64::NAN).is_err());
+        realm.set_device_pixel_ratio(1.0).unwrap();
+        assert!(eval_bool(&mut engine, "var resized=document.getElementById('c');resized.width=30*devicePixelRatio;resized.height=20*devicePixelRatio;resized.width===30 && resized.height===20"));
+        assert!(eval_bool(&mut engine, r#"globalThis.c=document.getElementById('c');globalThis.target=document.getElementById('target');globalThis.x=c.getContext('2d');globalThis.paints=0;globalThis.trusted=false;c.onpaint=e=>{paints++;trusted=e.isTrusted && e instanceof CanvasPaintEvent && Object.isFrozen(e.changedElements) && e.changedElements[0]===target;x.drawElementImage(target,2,3);target.style.background='red'};c.requestPaint();c.requestPaint();(()=>{try{x.drawElementImage(target,0,0);return false}catch(e){return e.name==='InvalidStateError'}})()"#));
+        assert!(realm.canvas_paint_pending());
+        if let Err(error)=realm.update_rendered_focus(engine.ctx()) {
+            let value=error.to_value(engine.ctx());
+            let message=engine.ctx().to_string(&value).unwrap_or_else(|_| "unprintable paint exception".into());
+            panic!("real paint update failed: {message}");
+        }
+        assert_eq!(captures.get(),1);
+        assert!(eval_bool(&mut engine,"paints===1 && trusted && x.getImageData(2,3,1,1).data[2]===255"));
+        assert!(eval_bool(&mut engine,"x.clearRect(0,0,30,20);x.drawElementImage(target,0,0);x.getImageData(0,0,1,1).data[2]===255"));
+        assert!(eval_bool(&mut engine,"c.requestPaint();true"));
+        if let Err(error)=realm.update_rendered_focus(engine.ctx()) {
+            let value=error.to_value(engine.ctx());
+            let message=engine.ctx().to_string(&value).unwrap_or_else(|_| "unprintable paint exception".into());
+            panic!("real paint update failed: {message}");
+        }
+        assert_eq!(captures.get(),2);
+        assert!(eval_bool(&mut engine,"paints===2 && x.getImageData(2,3,1,1).data[0]===255"));
+    }
+
+    #[test]
+    fn image_data_native_storage_clone_preserves_pixels_aliases_and_intrinsics() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        let source = engine.eval_value(r#"var image=new ImageData(2,1,{colorSpace:'display-p3'});image.data[0]=137;var pixels=image.data;Uint8ClampedArray=function(){throw Error('author constructor called')};({image,pixels,again:image})"#).unwrap().unwrap_or_else(|_| panic!("canvas JavaScript evaluation threw"));
+        let bytes = lumen_host::structured_clone::serialize_for_storage(engine.ctx(), &source, 1024).unwrap();
+        let cloned = lumen_host::structured_clone::deserialize_for_storage(engine.ctx(), &bytes).unwrap();
+        let global=engine.ctx().global_object();
+        engine.ctx().create_data_property(&global,"cloned",cloned).unwrap_or_else(|_| panic!("clone publication threw"));
+        assert!(eval_bool(&mut engine,"cloned.image instanceof ImageData && cloned.image===cloned.again && cloned.image.data===cloned.pixels && cloned.image.data!==pixels && cloned.image.data[0]===137 && cloned.image.colorSpace==='display-p3'"));
+        engine.ctx().collect_garbage();
+        assert!(eval_bool(&mut engine,"cloned.image.data[0]===137"));
+    }
+
+    #[test]
+    fn element_image_native_transfer_preserves_snapshot_and_detaches_sender() {
+        let mut engine=Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        let image=engine.ctx().new_instance(DomElementImage {image:RefCell::new(Some(element_image_pixels(Rgba8Image {
+            width:2,height:1,pixels:vec![0,0,255,255,255,0,0,255],
+        }).unwrap())),origin_clean:true});
+        let global=engine.ctx().global_object();
+        engine.ctx().create_data_property(&global,"image",image.clone()).unwrap_or_else(|_|panic!("image publication"));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(),&image,&[],true,&Value::Null).is_err());
+        let bad=engine.eval_value("({image,uncloneable(){}})").unwrap().unwrap_or_else(|_|panic!("evaluation"));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(),&bad,&[image.clone()],true,&Value::Null).is_err());
+        assert!(eval_bool(&mut engine,"image.width===2 && image.height===1"));
+        let bytes=lumen_host::structured_clone::serialize(engine.ctx(),&image,&[image.clone()],true,&Value::Null).unwrap();
+        let message=lumen_host::clone_transfer::take_message(engine.ctx(),bytes);
+        assert!(eval_bool(&mut engine,"image.width===0 && image.height===0"));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(),&image,&[image.clone()],true,&Value::Null).is_err());
+        std::thread::spawn(move|| {
+            let mut worker=Engine::new();install_worker(worker.ctx()).unwrap();
+            let bytes=lumen_host::clone_transfer::install_message(worker.ctx(),message);
+            let image=lumen_host::structured_clone::deserialize(worker.ctx(),&bytes,&Value::Null).unwrap();
+            let global=worker.ctx().global_object();worker.ctx().create_data_property(&global,"image",image).unwrap_or_else(|_|panic!("worker publication"));
+            assert!(eval_bool(&mut worker,"image instanceof ElementImage && image.width===2 && (()=>{const x=new OffscreenCanvas(4,2).getContext('2d');x.drawElementImage(image,0,0,4,2);const p=x.getImageData(0,0,4,2).data;return p[2]===255 && p[12]===255 && p[14]===0})()"));
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn offscreen_native_transfer_detaches_sender_and_publishes_worker_pixels() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<canvas id='placeholder' width='2' height='1'></canvas>", 64).unwrap();
+        let source = engine.eval_value("var transferred=document.getElementById('placeholder').transferControlToOffscreen();transferred").unwrap().unwrap_or_else(|_| panic!("canvas JavaScript evaluation threw"));
+        let failure = lumen_host::structured_clone::serialize(engine.ctx(), &source, &[], true, &Value::Null);
+        assert!(failure.is_err(), "OffscreenCanvas requires its transfer-list entry");
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(), &source, &[source.clone(),source.clone()], true, &Value::Null).is_err());
+        let bad = engine.eval_value("({canvas:transferred, notCloneable(){}})").unwrap().unwrap_or_else(|_| panic!("canvas JavaScript evaluation threw"));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(), &bad, &[source.clone()], true, &Value::Null).is_err());
+        assert!(eval_bool(&mut engine, "transferred.width===2"));
+        let message_value = engine.eval_value("({canvas:transferred,get mutate(){transferred.width=3;return true}})").unwrap().unwrap_or_else(|_| panic!("canvas JavaScript evaluation threw"));
+        let bytes = lumen_host::structured_clone::serialize(engine.ctx(), &message_value, &[source.clone()], true, &Value::Null).unwrap();
+        let message = lumen_host::clone_transfer::take_message(engine.ctx(), bytes);
+        assert!(eval_bool(&mut engine, r#"(()=>{
+            if(transferred.width!==0 || transferred.height!==0) return false;
+            for(const operation of [()=>transferred.getContext('2d'),()=>{transferred.width=5},()=>transferred.transferToImageBitmap()]) {
+                let denied=false;try{operation()}catch(e){denied=e.name==='InvalidStateError'};
+                if(!denied)return false;
+            }
+            return true;
+        })()"#));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(), &source, &[source.clone()], true, &Value::Null).is_err());
+        std::thread::spawn(move || {
+            let mut worker = Engine::new();
+            install_worker(worker.ctx()).unwrap();
+            let bytes = lumen_host::clone_transfer::install_message(worker.ctx(), message);
+            let value = lumen_host::structured_clone::deserialize(worker.ctx(), &bytes, &Value::Null).unwrap();
+            let canvas = worker.ctx().member_get(&value, "canvas").unwrap_or_else(|_| panic!("worker canvas lookup threw"));
+            let global = worker.ctx().global_object();
+            worker.ctx().create_data_property(&global, "canvas", canvas).unwrap_or_else(|_| panic!("worker canvas publication threw"));
+            assert!(eval_bool(&mut worker, r#"(()=>{
+                if(canvas.width!==3 || canvas.height!==1)return false;
+                canvas.width=canvas.height=200;
+                const x=canvas.getContext('2d');x.fillStyle='purple';x.fillRect(60,60,75,50);
+                x.beginLayer();x.fillStyle='red';x.fillRect(40,40,75,50);
+                return true;
+            })()"#));
+        }).join().unwrap();
+        realm.sync_canvas().unwrap();
+        assert!(eval_bool(&mut engine,"document.getElementById('placeholder').width===200 && document.getElementById('placeholder').height===200"));
+        let node = realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#placeholder").unwrap().unwrap());
+        let data = realm.canvases.data_for(&realm,node).unwrap();
+        let image = data.borrow().snapshot();
+        let pixel = |x:usize,y:usize| &image.pixels[(y*200+x)*4..(y*200+x)*4+4];
+        assert_eq!(pixel(60,60),[128,0,128,255]);
+        assert_eq!(pixel(40,40),[0,0,0,0],"unclosed worker layer stays isolated");
+        let busy = engine.eval_value("var busy=new OffscreenCanvas(2,1);busy.getContext('2d');busy").unwrap().unwrap_or_else(|_| panic!("canvas JavaScript evaluation threw"));
+        assert!(lumen_host::structured_clone::serialize(engine.ctx(), &busy, &[busy.clone()], true, &Value::Null).is_err());
+        assert!(eval_bool(&mut engine,"busy.width===2 && busy.getContext('2d')!==null"));
+    }
+
+    #[test]
+    fn transferred_offscreen_canvas_presents_real_pixels_at_frame_boundary() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<canvas id='placeholder' width='2' height='1'></canvas><canvas id='busy'></canvas>", 64).unwrap();
+        let result = engine.eval_value(r#"(()=>{
+            const check=(v,m)=>{if(!v)throw Error(m)};
+            var placeholder=document.getElementById('placeholder');
+            globalThis.off=placeholder.transferControlToOffscreen();
+            const ctx=off.getContext('2d');
+            check(ctx instanceof OffscreenCanvasRenderingContext2D && ctx.canvas===off,'typed context owner');
+            off.width=3;off.height=2;
+            ctx.fillStyle='green';ctx.fillRect(0,0,3,2);
+            check(placeholder.width===2 && placeholder.height===1,'placeholder waits for rendering');
+            for(const action of [()=>placeholder.transferControlToOffscreen(),()=>placeholder.getContext('2d'),()=>{placeholder.width=4}]) {
+                let failed=false;try{action()}catch(e){failed=e.name==='InvalidStateError'};check(failed,'transfer state guard');
+            }
+            const busy=document.getElementById('busy');busy.getContext('2d');
+            let failed=false;try{busy.transferControlToOffscreen()}catch(e){failed=e.name==='InvalidStateError'};check(failed,'existing context guard');
+            return true;
+        })()"#).unwrap().unwrap_or_else(|_|panic!("transfer setup threw"));
+        assert!(matches!(result,Value::Bool(true)));
+        realm.sync_canvas().unwrap();
+        let node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#placeholder").unwrap().unwrap());
+        let data=realm.canvases.data_for(&realm,node).unwrap();
+        let snapshot=data.borrow().snapshot();
+        assert_eq!((snapshot.width,snapshot.height),(3,2));
+        assert!(snapshot.pixels.chunks_exact(4).all(|pixel|pixel==[0,128,0,255]));
+        assert!(eval_bool(&mut engine,"document.getElementById('placeholder').width===3 && document.getElementById('placeholder').height===2"));
+        engine.ctx().collect_garbage();
+        assert!(eval_bool(&mut engine,"off.getContext('2d').canvas===off"));
+    }
     use lumen::embed::WeakValue;
     use lumen::Engine;
 
@@ -5038,6 +6061,132 @@ mod tests {
                     shadow[2] === 255 && shadow[3] === 255 && reset;
             })()"#
         ));
+    }
+
+    #[test]
+    fn canvas_small_caps_reach_visible_pixels_and_share_font_reset_save_restore_state() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(&mut engine, r#"(() => {
+            const canvas=new OffscreenCanvas(240,64), ctx=canvas.getContext('2d');
+            ctx.font='small-caps italic 400 32px/2 "Unknown Font", sans-serif';
+            if(ctx.font!=='italic small-caps 32px "Unknown Font", sans-serif' || ctx.fontVariantCaps!=='small-caps') throw new Error('shared caps shorthand state');
+            ctx.font='small-caps 32px sans-serif';
+            const width=ctx.measureText('Hello World').width;
+            ctx.fillStyle='red'; ctx.fillText('Hello World',4,40);
+            const small=ctx.getImageData(0,0,240,64).data;
+            let smallInk=0; for(let i=3;i<small.length;i+=4) if(small[i]>0) smallInk++;
+            if(smallInk===0) throw new Error('small caps produced no visible ink');
+            ctx.save(); ctx.fontVariantCaps='all-small-caps'; ctx.restore();
+            if(ctx.fontVariantCaps!=='small-caps' || ctx.font!=='small-caps 32px sans-serif') throw new Error('caps save restore lost shared state');
+            ctx.font='32px sans-serif';
+            if(ctx.fontVariantCaps!=='normal') throw new Error('normal font did not reset caps');
+            if(ctx.measureText('Hello World').width===width) throw new Error('small caps did not change actual advances');
+            ctx.clearRect(0,0,240,64); ctx.fillText('Hello World',4,40);
+            const normal=ctx.getImageData(0,0,240,64).data;
+            let different=false, normalInk=0;
+            for(let i=3;i<normal.length;i+=4) { if(normal[i]>0) normalInk++; if(normal[i]!==small[i]) different=true; }
+            if(!different || normalInk===0) throw new Error('small caps pixels matched normal text');
+            ctx.fontVariantCaps='small-caps'; const direct=ctx.measureText('Hello World').width;
+            ctx.font='small-caps 32px sans-serif';
+            if(ctx.measureText('Hello World').width!==direct) throw new Error('caps property and shorthand use different shaping');
+            ctx.font='small-caps small-caps 60px serif';
+            return ctx.font==='small-caps 32px sans-serif' && ctx.fontVariantCaps==='small-caps';
+        })()"#));
+    }
+
+    #[test]
+    fn canvas_font_style_source_uses_rendered_eligibility_and_recovers_after_mutation() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<div id='parent' style='font-size:24px'><canvas id='source'></canvas></div>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"(() => {
+            const source = document.querySelector('#source');
+            const parent = document.querySelector('#parent');
+            const ctx = source.getContext('2d');
+            ctx.font = '1em sans-serif';
+            if (ctx.font !== '24px sans-serif') throw new Error('connected source lost CSS font');
+            source.remove();
+            ctx.font = '80px serif'; ctx.font = '1em sans-serif';
+            if (ctx.font !== '10px sans-serif') throw new Error('detached source used stale computed CSS');
+            const detachedWidth = ctx.measureText('iiii').width;
+            parent.append(source);
+            ctx.font = '1em sans-serif';
+            if (ctx.font !== '24px sans-serif') throw new Error('reconnected source did not restore CSS');
+            if (!(ctx.measureText('iiii').width > detachedWidth * 2)) throw new Error('reconnected CSS font did not reach shaping');
+            parent.style.display = 'none';
+            ctx.font = '1em sans-serif';
+            if (ctx.font !== '10px sans-serif') throw new Error('hidden ancestor still supplied CSS font');
+            parent.style.display = 'block'; source.style.display = 'none';
+            ctx.font = '1em sans-serif';
+            if (ctx.font !== '10px sans-serif') throw new Error('hidden source still supplied CSS font');
+            source.style.display = 'block'; source.style.visibility = 'hidden';
+            ctx.font = '1em sans-serif';
+            if (ctx.font !== '24px sans-serif') throw new Error('visibility-hidden box incorrectly lost its computed font');
+            const detached = document.createElement('canvas');
+            detached.style.fontSize = '99px';
+            const detachedCtx = detached.getContext('2d');
+            detachedCtx.font = '2em sans-serif';
+            if (detachedCtx.font !== '20px sans-serif') throw new Error('fresh detached canvas used its inline CSS font');
+            return detachedCtx.measureText('iiii').width > detachedWidth * 1.5;
+        })()"#));
+    }
+
+    #[test]
+    fn canvas_query_font_assignment_flushes_valid_dependencies_and_tracks_container_mutations() {
+        let mut engine = Engine::new();
+        let realm = super::super::install(engine.ctx(),
+            "<div id='container' style='container-type:size;width:200px;height:100px'><canvas id='canvas' style='font-size:24px'></canvas></div>", 128).unwrap();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        realm.set_layout_flusher(Rc::new(move |session| {
+            observed.set(observed.get() + 1);
+            session.display_list(800, 600, canvas_fallback_fonts()).map(|_| ()).map_err(|error| format!("{error:?}"))
+        }));
+        assert!(eval_bool(&mut engine, r#"(() => {
+            globalThis.context = document.querySelector('#canvas').getContext('2d');
+            context.font = '16px serif';
+            context.font = 'oblique 100deg 10cqw serif';
+            return context.font === '16px serif';
+        })()"#));
+        assert_eq!(calls.get(), 0);
+        assert!(eval_bool(&mut engine, r#"(() => {
+            context.font = 'oblique calc(30deg + sign(20cqw - 10px)*5deg) 10cqi serif';
+            if (context.font !== 'oblique 35deg 20px serif') throw new Error(context.font);
+            document.querySelector('#container').style.width = '10px';
+            context.font = 'oblique calc(30deg + sign(20cqw - 10px)*5deg) 10cqi serif';
+            return context.font === 'oblique 25deg 1px serif';
+        })()"#));
+        assert_eq!(calls.get(), 2);
+        assert!(eval_bool(&mut engine, r#"(() => {
+            document.querySelector('#canvas').style.fontSize = '10cqw';
+            context.font = '2em serif';
+            return context.font === '2px serif';
+        })()"#));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn canvas_font_context_resolves_relative_calc_and_canonicalizes_atomically() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<canvas id='canvas' style='font-size:24px'></canvas>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"(() => {
+            const off = new OffscreenCanvas(100, 40).getContext('2d');
+            off.font = '100px serif';
+            off.font = 'calc(2em + 5px)/2 \"Unknown Font\", SERIF';
+            if (off.font !== '25px \"Unknown Font\", serif') throw new Error('offscreen font inherited the previous assignment');
+            const before = off.measureText('iiii').width;
+            off.font = '12px serif';
+            if (!(off.measureText('iiii').width < before)) throw new Error('resolved font size did not reach shaping');
+            off.font = '20PX   SERIF';
+            if (off.font !== '20px serif') throw new Error('font shorthand was not canonicalized');
+            off.font = 'var(--font)';
+            if (off.font !== '20px serif') throw new Error('invalid font changed canvas state');
+            const element = document.querySelector('#canvas').getContext('2d');
+            element.font = '150% serif';
+            if (element.font !== '36px serif') throw new Error('percentage did not use element CSS font');
+            element.font = '2em serif';
+            return element.font === '48px serif' && off instanceof OffscreenCanvasRenderingContext2D;
+        })()"#));
     }
 
     #[test]
@@ -5385,7 +6534,7 @@ mod tests {
             "(()=>{const source=new OffscreenCanvas(2,1),x=source.getContext('2d');x.fillStyle='red';x.fillRect(0,0,2,1);document.querySelector('canvas').getContext('bitmaprenderer').transferFromImageBitmap(source.transferToImageBitmap());return true})()"
         ));
         let mut session = realm.session.borrow_mut();
-        let list = session.display_list(32, 32, canvas_fonts()).unwrap();
+        let list = session.display_list(32, 32, canvas_fallback_fonts()).unwrap();
         assert!(list.0.iter().any(|command| matches!(command, lumen_html::paint::Command::Image { image, .. } if image.width == 2 && image.height == 1 && image.pixels == [255,0,0,255,255,0,0,255])));
     }
 
@@ -5484,6 +6633,33 @@ mod tests {
             return denied && resizeDenied && propagated && c.toDataURL().startsWith('data:image/png');
         })()"#
         ));
+    }
+
+    #[test]
+    fn canvas_layers_restore_native_and_js_styles_for_dom_and_offscreen() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<canvas></canvas>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"(() => {
+            for (const c of [document.querySelector('canvas'), new OffscreenCanvas(2, 1)]) {
+                c.width=2; c.height=1;
+                const x=c.getContext('2d');
+                x.fillStyle='purple'; x.font='12px serif'; x.globalAlpha=.5;
+                const beforeStyle=x.fillStyle;
+                x.beginLayer(); x.fillStyle='red'; x.font='24px serif';
+                x.save(); x.fillRect(0,0,1,1);
+                x.beginLayer(); x.fillStyle='lime'; x.fillRect(1,0,1,1); x.endLayer();
+                x.endLayer();
+                if (x.fillStyle !== beforeStyle || x.font !== '12px serif' || x.globalAlpha !== .5) throw Error('layer entry styles not restored');
+                const pixels=x.getImageData(0,0,2,1).data;
+                if(pixels[0]!==255 || pixels[3]!==128 || pixels[5]!==255 || pixels[7]!==128) throw Error('layer pixels '+Array.from(pixels));
+                let denied=false; try{x.endLayer()}catch(e){denied=e.name==='InvalidStateError'}
+                if(!denied) return false;
+                x.beginLayer(); c.width=2;
+                denied=false; try{x.endLayer()}catch(e){denied=e.name==='InvalidStateError'}
+                if(!denied) return false;
+            }
+            return true;
+        })()"#));
     }
 
     #[test]
@@ -5632,7 +6808,7 @@ mod tests {
             .err()
             .expect("tainted canvas must reject readback");
         assert_eq!(error.class(), "SecurityError");
-        let offscreen = DomOffscreenCanvas { data };
+        let offscreen = DomOffscreenCanvas { data, realm: None, placeholder:None, detached: Cell::new(false) };
         assert!(offscreen.convert_to_blob(engine.ctx(), None).is_ok());
     }
 
@@ -5844,6 +7020,29 @@ mod tests {
         assert_eq!(values[7], "small-caps");
         assert_eq!(values[8], "condensed");
         assert_eq!(values[9], "condensed");
+    }
+
+    #[test]
+    fn specification_font_relative_units_canvas_use_unshaped_metrics_and_root_context() {
+        let mut engine=Engine::new();
+        let realm=super::super::install(engine.ctx(),"<!doctype html><style>html{font-size:20px;line-height:2}</style><canvas id=c></canvas>",64).unwrap();
+        let diagnostic=engine.eval_value(r#"(() => {
+            const context=document.getElementById('c').getContext('2d');
+            context.font='10px monospace';
+            context.letterSpacing='1rlh';
+            if(context.letterSpacing!=='40px')throw new Error('canvas rlh did not use the actual document root');
+            context.wordSpacing='calc(1cap + 2px)';
+            const cap=parseFloat(context.wordSpacing);
+            if(!(cap>2))throw new Error('canvas cap metric was rejected');
+            document.documentElement.style.lineHeight='3';
+            context.letterSpacing='1rlh';
+            if(context.letterSpacing!=='60px')throw new Error('canvas root line-height mutation was stale');
+            context.font='1rlh monospace';
+            if(!context.font.includes('60px'))throw new Error('canvas font shorthand did not resolve genuine rlh');
+            return true;
+        })()"#).unwrap().unwrap_or_else(|error|panic!("font-unit canvas guard: {}",engine.ctx().coerce_string(&error).map(|text|text.to_string()).unwrap_or_default()));
+        assert!(matches!(diagnostic,Value::Bool(true)));
+        let _=realm;
     }
 
     #[test]

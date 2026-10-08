@@ -39,7 +39,7 @@ pub fn interpolate_color(
     to: lumen_html::paint::Rgba,
     progress: f32,
 ) -> lumen_html::paint::Rgba {
-    gradient::interpolate(from, to, progress.clamp(0.0, 1.0))
+    gradient::interpolate(from, to, progress)
 }
 
 /// Geometry policies of the two image paths and the GPUI quad replay path.
@@ -99,7 +99,117 @@ pub fn render_with_mode_cached(
     }
 }
 
+/// Retains admitted vector source bytes and weak viewport rasters. The ordinary
+/// image resolver owns natural dimensions; resized views neither refetch nor
+/// alter that identity. Dead raster keys are reclaimed on admission.
+#[derive(Default)]
+pub struct SvgViewportImages {
+    sources:RefCell<HashMap<Arc<str>,SvgViewportSource>>,
+    natural_sources:RefCell<HashMap<usize,Arc<str>>>,
+    rasters:RefCell<HashMap<(u64,u32,u32,lumen_html::css::UsedColorScheme),std::sync::Weak<ImageData>>>,
+    next_id:Cell<u64>,
+}
+struct SvgViewportSource {id:u64,bytes:lumen_common::bytes::Bytes,fragment:Option<Arc<str>>,natural:std::sync::Weak<ImageData>,last:Option<(lumen_html::css::UsedColorScheme,Arc<ImageData>)>,metadata:[Option<SvgImageMetadata>;2]}
+#[derive(Clone,Copy)]
+struct SvgImageMetadata {intrinsic:lumen_html::object::IntrinsicSize,coordinates:Option<(Option<lumen_html::svg::ViewBox>,lumen_html::svg::AspectRatio)>}
+fn scheme_index(scheme:lumen_html::css::UsedColorScheme)->usize {usize::from(scheme==lumen_html::css::UsedColorScheme::Dark)}
+impl SvgViewportImages {
+    pub fn is_vector(bytes:&[u8])->bool {
+        bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(bytes).iter().copied().find(|byte|!byte.is_ascii_whitespace())==Some(b'<')
+    }
+    pub fn live_raster_bytes(&self)->Option<usize> {
+        let rasters=self.rasters.borrow();
+        let pixels=rasters.values().filter_map(std::sync::Weak::upgrade).try_fold(0usize,|size,image|size.checked_add(image.pixels.len()))?;
+        pixels.checked_add(rasters.capacity().checked_mul(std::mem::size_of::<((u64,u32,u32,lumen_html::css::UsedColorScheme),std::sync::Weak<ImageData>)>()+32)?)
+    }
+    pub fn source_cost(key:&str,bytes:usize,fragment:Option<&str>)->Option<usize> {key.len().checked_add(bytes).and_then(|size|size.checked_add(fragment.map_or(0,str::len))).and_then(|size|size.checked_add(4*(std::mem::size_of::<(Arc<str>,SvgViewportSource)>()+std::mem::size_of::<(usize,Arc<str>)>()+64)+128))}
+    pub fn remember(&self,key:&str,bytes:lumen_common::bytes::Bytes,fragment:Option<&str>,budget:usize)->Result<usize,ImageError> {
+        if !Self::is_vector(&bytes) || self.sources.borrow().contains_key(key) {return Ok(0);}
+        let charge=Self::source_cost(key,bytes.len(),fragment).ok_or(ImageError::TooLarge)?;
+        let budget=budget.checked_sub(self.live_raster_bytes().ok_or(ImageError::TooLarge)?).ok_or(ImageError::TooLarge)?;
+        if charge>budget || key.len()>8192 || fragment.is_some_and(|fragment|fragment.len()>8192) || self.sources.borrow().len()>=256 {return Err(ImageError::TooLarge);}
+        let mut sources=self.sources.borrow_mut();
+        sources.try_reserve(1).map_err(|_|ImageError::TooLarge)?;
+        self.natural_sources.borrow_mut().try_reserve(1).map_err(|_|ImageError::TooLarge)?;
+        let id=self.next_id.get().checked_add(1).ok_or(ImageError::TooLarge)?;
+        self.next_id.set(id);
+        sources.insert(key.into(),SvgViewportSource{id,bytes,fragment:fragment.map(Arc::from),natural:std::sync::Weak::new(),last:None,metadata:[None;2]});
+        Ok(charge)
+    }
+    pub fn attach_natural(&self,key:&str,image:&Arc<ImageData>) {
+        self.attach_natural_with_intrinsic(key,image,None);
+    }
+    pub fn attach_natural_with_intrinsic(&self,key:&str,image:&Arc<ImageData>,intrinsic:Option<lumen_html::object::IntrinsicSize>) {
+        let mut sources=self.sources.borrow_mut();
+        let key=sources.get_key_value(key).map(|(key,_)|key.clone());
+        if let Some(key)=key {
+            if let Some(source)=sources.get_mut(key.as_ref()) {
+                let mut index=self.natural_sources.borrow_mut();
+                index.remove(&(source.natural.as_ptr() as usize));
+                source.natural=Arc::downgrade(image);
+                source.metadata[0]=intrinsic.filter(|size|size.is_valid()).map(|intrinsic|SvgImageMetadata{intrinsic,coordinates:source.metadata[0].and_then(|metadata|metadata.coordinates)});
+                index.insert(Arc::as_ptr(image) as usize,key);
+            }
+        }
+    }
+    /// Metadata belongs to the exact decoded source/fragment image identity.
+    fn metadata(&self,image:&Arc<ImageData>,scheme:lumen_html::css::UsedColorScheme)->Option<SvgImageMetadata> {
+        let key=self.natural_sources.borrow().get(&(Arc::as_ptr(image) as usize))?.clone();
+        let (id,bytes,fragment)={let sources=self.sources.borrow();let source=sources.get(key.as_ref())?;
+            source.natural.upgrade().filter(|natural|Arc::ptr_eq(natural,image))?;
+            if let Some(metadata)=source.metadata[scheme_index(scheme)].filter(|metadata|metadata.coordinates.is_some()) {return Some(metadata);}
+            (source.id,source.bytes.clone(),source.fragment.clone())};
+        // Reuse the image document preparation/metric authority; no raster allocation,
+        // fetch or second parser. Never hold a source/raster RefCell borrow across it.
+        let (_,intrinsic,coordinates)=prepare_svg_image(&bytes,fragment.as_deref(),scheme).ok()?;
+        let metadata=SvgImageMetadata{intrinsic,coordinates:Some(coordinates)};
+        let mut sources=self.sources.borrow_mut();let source=sources.get_mut(key.as_ref())?;
+        if source.id!=id || !source.natural.upgrade().is_some_and(|natural|Arc::ptr_eq(&natural,image)) {return None;}
+        source.metadata[scheme_index(scheme)]=Some(metadata);
+        Some(metadata)
+    }
+    pub fn intrinsic_size(&self,image:&Arc<ImageData>,scheme:lumen_html::css::UsedColorScheme)->Option<lumen_html::object::IntrinsicSize> {
+        self.metadata(image,scheme).map(|metadata|metadata.intrinsic)
+    }
+    pub fn coordinate_scale(&self,image:&Arc<ImageData>,width:f32,height:f32,scheme:lumen_html::css::UsedColorScheme)->Option<[f32;2]> {
+        let (view_box,aspect)=self.metadata(image,scheme)?.coordinates?;
+        let (transform,_)=lumen_html::svg::view_box_transform_with_aspect(view_box,aspect,0.0,0.0,width,height);
+        Some([transform.a,transform.d])
+    }
+    pub fn render_image(&self,image:&Arc<ImageData>,width:f32,height:f32,scheme:lumen_html::css::UsedColorScheme,budget:usize)->Option<Result<Arc<ImageData>,ImageError>> {
+        let key=self.natural_sources.borrow().get(&(Arc::as_ptr(image) as usize))?.clone();
+        let matches=self.sources.borrow().get(key.as_ref()).and_then(|source|source.natural.upgrade()).is_some_and(|natural|Arc::ptr_eq(&natural,image));
+        if !matches{return None;}
+        self.render(&key,width,height,scheme,budget)
+    }
+    pub fn render(&self,key:&str,width:f32,height:f32,scheme:lumen_html::css::UsedColorScheme,budget:usize)->Option<Result<Arc<ImageData>,ImageError>> {
+        let (id,bytes,fragment)={let mut sources=self.sources.borrow_mut();let source=sources.get_mut(key)?;
+            if let Some((_,image))=source.last.as_ref().filter(|(sampled,image)|*sampled==scheme && image.width as f32==width.ceil() && image.height as f32==height.ceil()) {return Some(Ok(image.clone()));}
+            source.last=None;
+            (source.id,source.bytes.clone(),source.fragment.clone())};
+        Some((|| {
+            if !width.is_finite() || !height.is_finite() || width<=0.0 || height<=0.0 || f64::from(width.ceil())>f64::from(u32::MAX) || f64::from(height.ceil())>f64::from(u32::MAX) {return Err(ImageError::InvalidViewport);}
+            let (width,height)=(width.ceil() as u32,height.ceil() as u32);
+            let mut rasters=self.rasters.borrow_mut();
+            if let Some(image)=rasters.get(&(id,width,height,scheme)).and_then(std::sync::Weak::upgrade) {return Ok(image);}
+            rasters.retain(|_,image|image.strong_count()!=0);
+            let live=rasters.values().filter_map(std::sync::Weak::upgrade).try_fold(0usize,|size,image|size.checked_add(image.pixels.len())).ok_or(ImageError::TooLarge)?;
+            let workspace=rasters.capacity().max(rasters.len().checked_add(1).and_then(|count|count.checked_mul(2)).and_then(|count|count.checked_add(3)).ok_or(ImageError::TooLarge)?).checked_mul(std::mem::size_of::<((u64,u32,u32,lumen_html::css::UsedColorScheme),std::sync::Weak<ImageData>)>()+32).ok_or(ImageError::TooLarge)?;
+            let remaining=budget.checked_sub(live).and_then(|remaining|remaining.checked_sub(workspace)).ok_or(ImageError::TooLarge)?;
+            if rasters.len()>=256 {return Err(ImageError::TooLarge);}
+            rasters.try_reserve(1).map_err(|_|ImageError::TooLarge)?;
+            let (decoded,intrinsic,coordinates)=decode_svg_image_in_viewport_with_intrinsic(&bytes,fragment.as_deref(),Some((width,height)),scheme,remaining)?;
+            let image=Arc::new(ImageData{width:decoded.width,height:decoded.height,pixels:decoded.pixels});
+            rasters.insert((id,width,height,scheme),Arc::downgrade(&image));
+            let mut sources=self.sources.borrow_mut();let source=sources.get_mut(key).ok_or(ImageError::TooLarge)?;
+            source.last=Some((scheme,image.clone()));source.metadata[scheme_index(scheme)]=Some(SvgImageMetadata{intrinsic,coordinates:Some(coordinates)});
+            Ok(image)
+        })())
+    }
+}
+
 pub struct FileImages {
+    svg_viewports:SvgViewportImages,
     base: PathBuf,
     root: Option<PathBuf>,
     cache: RefCell<HashMap<String, Result<Arc<ImageData>, ImageFailure>>>,
@@ -133,6 +243,7 @@ impl FileImages {
 
     pub fn new(base: impl Into<PathBuf>) -> Self {
         Self {
+            svg_viewports:SvgViewportImages::default(),
             base: base.into(),
             root: None,
             cache: RefCell::new(HashMap::new()),
@@ -172,6 +283,7 @@ impl FileImages {
             .ok()?;
             (path.starts_with(root) && path.is_file()).then_some(path)
         } else {
+            let source=source.split(['?','#']).next()?;
             let path = std::path::Path::new(source);
             (!path.is_absolute()
                 && path
@@ -183,6 +295,13 @@ impl FileImages {
 }
 
 impl lumen_html::layout::ImageResolver for FileImages {
+    fn image_coordinate_scale(&self,image:&Arc<ImageData>,width:f32,height:f32,scheme:lumen_html::css::UsedColorScheme)->Option<[f32;2]> {self.svg_viewports.coordinate_scale(image,width,height,scheme)}
+    fn image_intrinsic_size(&self,image:&Arc<ImageData>,scheme:lumen_html::css::UsedColorScheme)->Option<lumen_html::object::IntrinsicSize> {
+        self.svg_viewports.intrinsic_size(image,scheme)
+    }
+    fn resolve_viewport(&self,_node:Option<lumen_html::NodeId>,_base:&str,_source:&str,natural:&Arc<lumen_html::paint::ImageData>,width:f32,height:f32,scheme:lumen_html::css::UsedColorScheme)->Option<ImageState> {
+        self.svg_viewports.render_image(natural,width,height,scheme,ASSET_CACHE_BYTES.saturating_sub(*self.cached_bytes.borrow())).map(|result|result.map_or(ImageState::Failed,ImageState::Ready))
+    }
     fn generation(&self) -> u64 {
         self.generation.get()
     }
@@ -204,7 +323,7 @@ impl lumen_html::layout::ImageResolver for FileImages {
             .filter(|prefix| prefix.eq_ignore_ascii_case("data:"))
             .map(|_| &source[5..])
         {
-            data.split_once(',').and_then(|(metadata, payload)| {
+            data.split('#').next().and_then(|data|data.split_once(',')).and_then(|(metadata, payload)| {
                 let payload = lumen_common::codec::percent_decode(payload.as_bytes());
                 if metadata
                     .split(';')
@@ -232,19 +351,30 @@ impl lumen_html::layout::ImageResolver for FileImages {
                 if bytes.len() as u64 > MAX_PNG_FILE_BYTES {
                     return Err(ImageFailure::Limit);
                 }
-                decode_image_with_limit(&bytes, remaining_bytes).map_err(|error| match error {
+                let fragment=lumen_common::url::parse(source,Some("file:///")).ok().and_then(|url|url.fragment);
+                let raster_budget=remaining_bytes.checked_sub(self.svg_viewports.live_raster_bytes().ok_or(ImageFailure::Limit)?).ok_or(ImageFailure::Limit)?;
+                let (decoded,intrinsic)=decode_image_with_fragment_and_intrinsic_limit(&bytes,fragment.as_deref(),raster_budget).map_err(|error| match error {
                     ImageError::TooLarge => ImageFailure::Limit,
                     ImageError::UnsupportedSvg(_) => ImageFailure::UnsupportedDrawing,
                     _ => ImageFailure::Decode,
-                })
+                })?;
+                if SvgViewportImages::is_vector(&bytes) {
+                    let budget=remaining_bytes.checked_sub(decoded.pixels.len()).ok_or(ImageFailure::Limit)?;
+                    let _charge=SvgViewportImages::source_cost(source,bytes.len(),fragment.as_deref()).filter(|charge|self.svg_viewports.live_raster_bytes().and_then(|live|charge.checked_add(live)).is_some_and(|total|total<=budget)).ok_or(ImageFailure::Limit)?;
+                    let actual=self.svg_viewports.remember(source,lumen_common::bytes::Bytes::owned(Arc::from(bytes)),fragment.as_deref(),budget).map_err(|_|ImageFailure::Limit)?;
+                    *self.cached_bytes.borrow_mut()+=actual;
+                }
+                Ok((decoded,intrinsic))
             })
-            .map(|image| {
-                Arc::new(ImageData {
+            .map(|(image,intrinsic)| {
+                (Arc::new(ImageData {
                     width: image.width,
                     height: image.height,
                     pixels: image.pixels,
-                })
+                }),intrinsic)
             });
+        if let Ok((image,intrinsic))=decoded.as_ref(){self.svg_viewports.attach_natural_with_intrinsic(source,image,*intrinsic);}
+        let decoded=decoded.map(|(image,_)|image);
         let bytes = source.len() + decoded.as_ref().map_or(0, |image| image.pixels.len());
         self.decoded_bytes.set(self.decoded_bytes.get().saturating_add(
             decoded.as_ref().map_or(0, |image| image.pixels.len() as u64),
@@ -262,12 +392,7 @@ impl lumen_html::layout::ImageResolver for FileImages {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Rgba8Image {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
+pub use lumen_common::raster::Rgba8Image;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageError {
@@ -455,6 +580,65 @@ impl Raster<'_> {
                 .min(self.image.height as f32) as u32,
         )
     }
+}
+
+fn apply_svg_clips(surface:&mut canvas::CanvasSurface,clips:&[lumen_html::paint::SvgClip],
+    transform:Affine,object_box:Affine,screen:Affine,reserved:Option<usize>)->Result<(),ImageError> {
+    for clip in clips {
+        if let Some(reserved)=reserved {
+            // PathBuilder growth, parsed point/verb storage and raster edge
+            // scratch are bounded by the admitted source text envelope.
+            let paths=clip.shapes.iter().try_fold(0usize,|bytes,shape|shape.data.len().checked_mul(64)
+                .and_then(|path|path.checked_add(256)).and_then(|path|bytes.checked_add(path)))
+                .and_then(|paths|paths.checked_add(reserved)).filter(|bytes|*bytes<=MAX_LAYER_BYTES)
+                .ok_or(ImageError::TooLarge)?;
+            let _=paths;
+        }
+            let unit_transform = match clip.units {
+                lumen_html::paint::SvgGradientUnits::ObjectBoundingBox => object_box,
+                lumen_html::paint::SvgGradientUnits::UserSpaceOnUse => {
+                    lumen_html::paint::Affine::IDENTITY
+                }
+            };
+            let mut parsed_shapes = Vec::with_capacity(clip.shapes.len());
+            for shape in clip.shapes.iter() {
+                let Ok(parsed_clip) = canvas::parse_svg_path(&shape.data) else {
+                    continue;
+                };
+                let Some(clip_path) = parsed_clip.path else {
+                    continue;
+                };
+                let clip_transform = screen
+                    .then(transform)
+                    .then(unit_transform)
+                    .then(clip.transform)
+                    .then(shape.transform);
+                parsed_shapes.push((
+                    clip_path,
+                    match shape.fill_rule {
+                        PaintSvgFillRule::NonZero => tiny_skia::FillRule::Winding,
+                        PaintSvgFillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
+                    },
+                    tiny_skia::Transform::from_row(
+                        clip_transform.a,
+                        clip_transform.b,
+                        clip_transform.c,
+                        clip_transform.d,
+                        clip_transform.e,
+                        clip_transform.f,
+                    ),
+                ));
+            }
+            let clip_paths = parsed_shapes
+                .iter()
+                .map(|(path, rule, transform)| (path, *rule, *transform))
+                .collect::<Vec<_>>();
+            if let Err(error) = surface.clip_paths_union(&clip_paths) {
+                return Err(error);
+            }
+        }
+
+    Ok(())
 }
 
 fn transformed_svg_path_bounds(
@@ -874,10 +1058,7 @@ impl ReplaySink for Raster<'_> {
                     .max(0.0) as u32)
                     .min(image.width - 1);
                 let left = if self.antialias {
-                    ((visible.x + visible.width).min((x as f32 + 1.0) / self.scale)
-                        - visible.x.max(x as f32 / self.scale))
-                    .clamp(0.0, 1.0 / self.scale)
-                        * self.scale
+                    pixel_axis_coverage(visible.x, visible.x + visible.width, x, self.scale)
                 } else {
                     1.0
                 };
@@ -890,10 +1071,7 @@ impl ReplaySink for Raster<'_> {
                 .max(0.0) as u32)
                 .min(image.height - 1);
             let top = if self.antialias {
-                ((visible.y + visible.height).min((y as f32 + 1.0) / self.scale)
-                    - visible.y.max(y as f32 / self.scale))
-                .clamp(0.0, 1.0 / self.scale)
-                    * self.scale
+                pixel_axis_coverage(visible.y, visible.y + visible.height, y, self.scale)
             } else {
                 1.0
             };
@@ -958,11 +1136,8 @@ impl ReplaySink for Raster<'_> {
         ) else {
             return;
         };
-        let Some(visible) = self
-            .clips
-            .last()
-            .copied()
-            .and_then(|clip| clip.intersection(bounds))
+        let Some(replay_clip) = self.clips.last().copied() else { return; };
+        let Some(visible) = replay_clip.intersection(bounds)
             .and_then(|visible| visible.intersection(path_bounds))
         else {
             return;
@@ -1021,50 +1196,8 @@ impl ReplaySink for Raster<'_> {
             e: -(x0 as f32),
             f: -(y0 as f32),
         };
-        for clip in clips {
-            let unit_transform = match clip.units {
-                lumen_html::paint::SvgGradientUnits::ObjectBoundingBox => object_box,
-                lumen_html::paint::SvgGradientUnits::UserSpaceOnUse => {
-                    lumen_html::paint::Affine::IDENTITY
-                }
-            };
-            let mut parsed_shapes = Vec::with_capacity(clip.shapes.len());
-            for shape in clip.shapes.iter() {
-                let Ok(parsed_clip) = canvas::parse_svg_path(&shape.data) else {
-                    continue;
-                };
-                let Some(clip_path) = parsed_clip.path else {
-                    continue;
-                };
-                let clip_transform = screen
-                    .then(transform)
-                    .then(unit_transform)
-                    .then(clip.transform)
-                    .then(shape.transform);
-                parsed_shapes.push((
-                    clip_path,
-                    match shape.fill_rule {
-                        PaintSvgFillRule::NonZero => tiny_skia::FillRule::Winding,
-                        PaintSvgFillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
-                    },
-                    tiny_skia::Transform::from_row(
-                        clip_transform.a,
-                        clip_transform.b,
-                        clip_transform.c,
-                        clip_transform.d,
-                        clip_transform.e,
-                        clip_transform.f,
-                    ),
-                ));
-            }
-            let clip_paths = parsed_shapes
-                .iter()
-                .map(|(path, rule, transform)| (path, *rule, *transform))
-                .collect::<Vec<_>>();
-            if let Err(error) = surface.clip_paths_union(&clip_paths) {
-                self.error = Some(error);
-                return;
-            }
+        if let Err(error)=apply_svg_clips(&mut surface,clips,transform,object_box,screen,None) {
+            self.error=Some(error);return;
         }
 
         let make_gradient = |paint: Option<&lumen_html::paint::SvgPaint>| {
@@ -1168,11 +1301,22 @@ impl ReplaySink for Raster<'_> {
                         b: output.pixels[source + 2],
                         a: output.pixels[source + 3],
                     },
-                    1.0,
+                    if self.antialias {
+                        pixel_axis_coverage(replay_clip.x, replay_clip.x + replay_clip.width, x0 + column as u32, self.scale)
+                            * pixel_axis_coverage(replay_clip.y, replay_clip.y + replay_clip.height, y0 + row as u32, self.scale)
+                    } else { 1.0 },
                 );
             }
         }
     }
+}
+
+// A rectangular replay clip has the same device-pixel coverage for vector
+// commands and the sprites produced by group compositing. SvgPath::bounds
+// limits the crop and is not another antialiased mask.
+fn pixel_axis_coverage(start: f32, end: f32, pixel: u32, scale: f32) -> f32 {
+    (end.min((pixel as f32 + 1.0) / scale) - start.max(pixel as f32 / scale))
+        .clamp(0.0, 1.0 / scale) * scale
 }
 
 fn composite(dst: &mut [u8], src: Rgba, coverage: f32) {
@@ -1365,17 +1509,235 @@ pub fn rasterize_for_gpui(
     Ok(resolved)
 }
 
-fn resolve_layers(
+/// Resolve a text/decorative ink mask using the shared glyph cache. Only the
+/// bounded coverage surface, alpha plane and blur scratch coexist; no second
+/// source/paint RGBA surface is allocated for a solid shadow color.
+fn resolve_text_ink_shadow(mask:&lumen_html::paint::MaskedBackground,scale:f32,
+    font:Option<&dyn FontProvider>,cache:&mut GlyphCache,bytes:&mut usize)
+    ->Result<Option<Command>,ImageError> {
+    let blur=mask.shadow_blur.ok_or(ImageError::InvalidViewport)?;
+    let Command::FillRect{color,..}=&*mask.paint else{return Err(ImageError::InvalidViewport);};
+    let color=*color;
+    if color.a==0||mask.mask.0.is_empty(){return Ok(None);}
+    let left=(mask.rect.x*scale).floor();let top=(mask.rect.y*scale).floor();
+    let width=((mask.rect.x+mask.rect.width)*scale).ceil()-left;
+    let height=((mask.rect.y+mask.rect.height)*scale).ceil()-top;
+    if width<=0.0||height<=0.0{return Ok(None);}
+    if !width.is_finite()||!height.is_finite()||width>u32::MAX as f32||height>u32::MAX as f32{return Err(ImageError::TooLarge);}
+    let(width,height)=(width as u32,height as u32);
+    let pixels=(width as usize).checked_mul(height as usize).ok_or(ImageError::TooLarge)?;
+    let output=pixels.checked_mul(4).ok_or(ImageError::TooLarge)?;
+    let output_bytes=bytes.checked_add(output).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    // Coverage RGBA and extracted alpha coexist briefly. Output is charged
+    // conservatively before sampling, while all earlier resolved images live.
+    pixels.checked_mul(5).and_then(|n|n.checked_add(output_bytes)).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    shadow::validate_blur_budget(width as usize,height as usize,blur,scale,output_bytes)?;
+    let(x,y)=(left/scale,top/scale);
+    let mut ink=mask.mask.0.clone();
+    for command in &mut ink {translate_command(command,mask.offset[0]-x,mask.offset[1]-y);}
+    let coverage=render_scaled_region(&DisplayList(ink),width,height,scale,font,cache)?;
+    let mut alpha=Vec::new();alpha.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
+    alpha.extend(coverage.pixels.chunks_exact(4).map(|pixel|pixel[3]));
+    drop(coverage);
+    shadow::blur_alpha_mask(&mut alpha,width as usize,height as usize,blur,scale,output_bytes)?;
+    let mut output=Vec::new();output.try_reserve_exact(pixels.checked_mul(4).ok_or(ImageError::TooLarge)?).map_err(|_|ImageError::TooLarge)?;
+    for alpha in alpha {output.extend_from_slice(&[color.r,color.g,color.b,((u16::from(color.a)*u16::from(alpha)+127)/255)as u8]);}
+    *bytes=output_bytes;
+    Ok(Some(Command::Image{rect:Rect{x,y,width:width as f32/scale,height:height as f32/scale},
+        image:Arc::new(ImageData{width,height,pixels:output})}))
+}
+
+fn filter_blur_padding(sigma: f32, scale: f32) -> Result<usize, ImageError> {
+    if !sigma.is_finite() || sigma < 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return Err(ImageError::InvalidViewport);
+    }
+    let operating=sigma*scale;
+    if !operating.is_finite() { return Err(ImageError::TooLarge); }
+    if operating==0.0 || !operating.is_normal() { return Ok(0); }
+    if operating>=2.0 { return shadow::blur_padding(operating*2.0); }
+    // The maintained Gaussian's small-sigma kernel is contained within this
+    // conservative support. Transparent padding makes its clamp edge zero.
+    Ok((operating*4.0).ceil() as usize)
+}
+
+fn filter_capture_bounds(mut bounds: Rect, filters: &[lumen_common::filter::FilterOperation], scale:f32)
+    -> Result<Rect,ImageError> {
+    use lumen_common::filter::FilterOperation as F;
+    for filter in filters {
+        let (padding,offset)=match filter {
+            F::Color(_) => continue,
+            F::Blur(sigma) => (filter_blur_padding(*sigma,scale)? as f32/scale,[0.0;2]),
+            F::DropShadow(shadow) => (filter_blur_padding(shadow.sigma,scale)? as f32/scale,shadow.offset),
+        };
+        let left=(padding-offset[0]).max(0.0);let top=(padding-offset[1]).max(0.0);
+        let right=(padding+offset[0]).max(0.0);let bottom=(padding+offset[1]).max(0.0);
+        bounds=Rect{x:bounds.x-left,y:bounds.y-top,width:bounds.width+left+right,height:bounds.height+top+bottom};
+        if ![bounds.x,bounds.y,bounds.width,bounds.height].iter().all(|v|v.is_finite()) {return Err(ImageError::TooLarge);}
+    }
+    Ok(bounds)
+}
+
+fn blur_filter_plane(mask:Vec<u8>,width:u32,height:u32,sigma:f32,scale:f32,reserved:usize)
+    -> Result<Vec<u8>,ImageError> {
+    filter_blur_padding(sigma,scale)?;
+    let operating=sigma*scale;
+    if operating==0.0 || !operating.is_normal() {return Ok(mask);}
+    if operating>=2.0 {
+        let mut mask=mask;shadow::blur_alpha_mask(&mut mask,width as usize,height as usize,sigma*2.0,scale,reserved)?;
+        return Ok(mask);
+    }
+    let pixels=(width as usize).checked_mul(height as usize).ok_or(ImageError::TooLarge)?;
+    if pixels!=mask.len() {return Err(ImageError::InvalidViewport);}
+    // Gray Gaussian: input/output planes, two f32 planes, optional convolution
+    // transient, bounded small-kernel ring/row buffers and kernel copies.
+    pixels.checked_mul(14).and_then(|n|n.checked_add((width as usize).checked_mul(128)?))
+        .and_then(|n|n.checked_add(4096)).and_then(|n|n.checked_add(reserved))
+        .filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    let source=image::GrayImage::from_raw(width,height,mask).ok_or(ImageError::InvalidViewport)?;
+    Ok(image::imageops::blur(&source,operating).into_raw())
+}
+
+fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter::FilterOperation],scale:f32,reserved:usize)
+    -> Result<(),ImageError> {
+    use lumen_common::{color::Color,filter::{FilterOperation as F,ColorMatrix}};
+    if filters.is_empty() || filters.len()>lumen_common::filter::MAX_COLOR_FILTERS
+        || filters.iter().any(|filter|!filter.is_valid()) {return Err(ImageError::InvalidViewport);}
+    let pixels=image.pixels.len()/4;
+    let mut index=0;
+    while index<filters.len() {
+        if matches!(filters[index],F::Color(_)) {
+            let mut matrices=[ColorMatrix::IDENTITY;lumen_common::filter::MAX_COLOR_FILTERS];let mut count=0;
+            while let Some(F::Color(filter))=filters.get(index) {
+                matrices[count]=filter.matrix();count+=1;index+=1;
+            }
+            for pixel in image.pixels.chunks_exact_mut(4) {
+                let mut color=Color::rgba8([pixel[0],pixel[1],pixel[2],pixel[3]]);
+                for matrix in &matrices[..count] {color=matrix.apply(color);}
+                let output=color.to_rgba8();pixel.copy_from_slice(&output);
+            }
+            continue;
+        }
+        if let F::Blur(sigma)=&filters[index] {
+            if filter_blur_padding(*sigma,scale)?==0 {index+=1;continue;}
+        }
+        reserved.checked_add(pixels).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+        let mut plane=Vec::new();plane.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
+        match &filters[index] {
+            F::Blur(sigma) => {
+                let sigma=*sigma;
+                // Filter primitives convolve premultiplied sRGB components;
+                // process one plane at a time instead of four f32 images.
+                for pixel in image.pixels.chunks_exact_mut(4) {
+                    for channel in 0..3 {pixel[channel]=((u16::from(pixel[channel])*u16::from(pixel[3])+127)/255) as u8;}
+                }
+                for channel in 0..4 {
+                    plane.clear();plane.extend(image.pixels.chunks_exact(4).map(|pixel|pixel[channel]));
+                    plane=blur_filter_plane(plane,image.width,image.height,sigma,scale,reserved)?;
+                    for (pixel,value) in image.pixels.chunks_exact_mut(4).zip(plane.iter()) {pixel[channel]=*value;}
+                }
+                for pixel in image.pixels.chunks_exact_mut(4) {
+                    if pixel[3]==0 {pixel.fill(0);continue;}
+                    for channel in 0..3 {pixel[channel]=((u32::from(pixel[channel])*255+u32::from(pixel[3])/2)/u32::from(pixel[3])).min(255) as u8;}
+                }
+            }
+            F::DropShadow(shadow) => {
+                let offset=shadow.offset;let sigma=shadow.sigma;let color=shadow.color;
+                plane.extend(image.pixels.chunks_exact(4).map(|pixel|pixel[3]));
+                plane=blur_filter_plane(plane,image.width,image.height,sigma,scale,reserved)?;
+                let color=color.to_rgba8();let rgba=Rgba{r:color[0],g:color[1],b:color[2],a:color[3]};
+                for y in 0..image.height {for x in 0..image.width {
+                    let mut alpha=0.0;
+                    transform::visit_bilinear_samples(image.width,image.height,f64::from(x)-f64::from(offset[0])*f64::from(scale),
+                        f64::from(y)-f64::from(offset[1])*f64::from(scale),|at,weight|alpha+=f64::from(plane[at])*weight);
+                    let at=(y as usize*image.width as usize+x as usize)*4;
+                    let pixel=&mut image.pixels[at..at+4];let source=Rgba{r:pixel[0],g:pixel[1],b:pixel[2],a:pixel[3]};
+                    pixel.fill(0);composite(pixel,rgba,(alpha/255.0) as f32);composite(pixel,source,1.0);
+                }}
+            }
+            F::Color(_) => unreachable!(),
+        }
+        index+=1;
+    }
+    Ok(())
+}
+
+fn svg_source_object_box(list:&[Command],owner:Affine,font:Option<&dyn FontProvider>,reserved:usize)->Result<Affine,ImageError> {
+    let Some(inverse)=owner.inverse() else{return Ok(Affine{a:0.0,d:0.0,..Affine::IDENTITY});};
+    let mut bounds:Option<Rect>=None;
+    let mut transforms=Vec::new();let mut current=Affine::IDENTITY;
+    let include=|bounds:&mut Option<Rect>,rect:Rect| {
+        *bounds=Some(bounds.map_or(rect,|old|Rect{x:old.x.min(rect.x),y:old.y.min(rect.y),width:(old.x+old.width).max(rect.x+rect.width)-old.x.min(rect.x),height:(old.y+old.height).max(rect.y+rect.height)-old.y.min(rect.y)}));
+    };
+    for command in list {match command {
+        Command::PushTransform(matrix)=>{
+            if transforms.len()==256{return Err(ImageError::DisplayList(ReplayError::ClipLimit));}
+            let required=transforms.len()+1;
+            let capacity=if required>transforms.capacity(){required.checked_mul(2).map(|capacity|capacity.max(4)).ok_or(ImageError::TooLarge)?}else{transforms.capacity()};
+            capacity.checked_mul(core::mem::size_of::<Affine>()).and_then(|stack|reserved.checked_add(stack))
+                .filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+            transforms.try_reserve(1).map_err(|_|ImageError::TooLarge)?;transforms.push(current);current=current.then(*matrix);
+        }
+        Command::PopTransform=>current=transforms.pop().ok_or(ImageError::DisplayList(ReplayError::UnbalancedClip))?,
+        Command::SvgPath{data,transform,..}=>{
+            // Admit transient parser/builder/transform workspace before parsing.
+            // Each path is consumed in turn; no retained geometry cache exists.
+            data.len().checked_mul(64).and_then(|path|path.checked_add(256))
+                .and_then(|path|transforms.capacity().checked_mul(core::mem::size_of::<Affine>()).and_then(|stack|path.checked_add(stack)))
+                .and_then(|workspace|reserved.checked_add(workspace)).filter(|bytes|*bytes<=MAX_LAYER_BYTES)
+                .ok_or(ImageError::TooLarge)?;
+            if let Ok(parsed)=canvas::parse_svg_path(data) {if let Some(path)=parsed.path {
+                let matrix=inverse.then(current).then(*transform);
+                let matrix=tiny_skia::Transform::from_row(matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f);
+                if let Some(path)=path.transform(matrix) {
+                    let rect=path.compute_tight_bounds().unwrap_or_else(||path.bounds());
+                    include(&mut bounds,Rect{x:rect.x(),y:rect.y(),width:rect.width(),height:rect.height()});
+                }
+            }}
+        }
+        Command::GlyphRun{origin_x,baseline_y,size,glyphs,..}=>{
+            let font=font.ok_or(ImageError::Font("font required for SVG object bounds"))?;
+            for glyph in glyphs.iter() {
+                let cell=font.glyph_cell_bounds(glyph.face,glyph.id,*size*glyph.size_scale)
+                    .ok_or(ImageError::Font("glyph cell metrics required for SVG object bounds"))?;
+                include(&mut bounds,inverse.then(current).bounds(Rect{
+                    x:origin_x+glyph.x+cell.x,y:baseline_y-glyph.y+cell.y,width:cell.width,height:cell.height}));
+            }
+        }
+        Command::FillRect{rect,..}|Command::FillRoundedRect{rect,..}|Command::FillGradient{rect,..}
+        |Command::StrokeBorder{rect,..}|Command::StrokePatternBorder{rect,..}|Command::Image{rect,..}
+        |Command::ReservedImage{rect,..}=>include(&mut bounds,inverse.then(current).bounds(*rect)),
+        Command::FillBackground(fill)=>include(&mut bounds,inverse.then(current).bounds(fill.rect)),
+        Command::StrokeBoxBorder(border)=>include(&mut bounds,inverse.then(current).bounds(border.rect)),
+        // Layer rectangles, clipping/masking and shadows describe effects;
+        // they cannot replace or expand their children's object geometry.
+        _=>{}
+    }}
+    if !transforms.is_empty(){return Err(ImageError::DisplayList(ReplayError::UnbalancedClip));}
+    let rect=bounds.unwrap_or(Rect{x:0.0,y:0.0,width:0.0,height:0.0});
+    Ok(Affine{a:rect.width,d:rect.height,e:rect.x,f:rect.y,..Affine::IDENTITY})
+}
+
+fn resolve_layers(list:&[Command],scale:f32,font:Option<&dyn FontProvider>,
+    cache:&mut GlyphCache,bytes:&mut usize)->Result<DisplayList,ImageError> {
+    resolve_layers_with_source(list,scale,font,cache,bytes,false)
+}
+
+fn resolve_layers_with_source(
     list: &[Command],
     scale: f32,
     font: Option<&dyn FontProvider>,
     cache: &mut GlyphCache,
     bytes: &mut usize,
+    spatial_source: bool,
 ) -> Result<DisplayList, ImageError> {
     let mut output = DisplayList(Vec::with_capacity(list.len()));
     let mut index = 0;
     while index < list.len() {
         if let Command::MaskedBackground(mask) = &list[index] {
+            if mask.shadow_blur.is_some() {
+                if let Some(command)=resolve_text_ink_shadow(mask,scale,font,cache,bytes)? {output.0.push(command);}
+                index+=1;continue;
+            }
             index += 1;
             let left = (mask.rect.x * scale).floor();
             let top = (mask.rect.y * scale).floor();
@@ -1470,23 +1832,35 @@ fn resolve_layers(
                 }
                 output
                     .0
-                    .extend(resolve_layers(&child, scale, font, cache, bytes)?.0);
+                    .extend(resolve_layers_with_source(&child, scale, font, cache, bytes,spatial_source)?.0);
                 continue;
             }
-            let mut child = resolve_layers(&list[start..end], scale, font, cache, bytes)?;
+            let mut child = resolve_layers_with_source(&list[start..end], scale, font, cache, bytes,spatial_source)?;
             if matrix.b == 0.0
                 && matrix.c == 0.0
                 && child.0.iter().all(|command| {
                     matches!(
                         command,
-                        Command::FillRect { .. } | Command::PushClip(_) | Command::PopClip
-                    )
+                        Command::FillRect { .. } | Command::PushClip(_) | Command::PushBoxClip(_) | Command::PopClip
+                    ) || matrix.a > 0.0 && matrix.d > 0.0 && match command {
+                        Command::Image { .. } => true,
+                        Command::FillBackground(fill) => fill.radius == 0.0 && fill.corners.is_none()
+                            && matches!(fill.image, lumen_html::paint::BackgroundPaint::Image(_)
+                                | lumen_html::paint::BackgroundPaint::Solid(_)),
+                        _ => false,
+                    }
                 })
             {
                 for command in &mut child.0 {
                     match command {
-                        Command::FillRect { rect, .. } | Command::PushClip(rect) => {
+                        Command::FillRect { rect, .. } | Command::Image { rect, .. } | Command::ReservedImage { rect, .. } | Command::PushClip(rect) | Command::PushBoxClip(rect) => {
                             *rect = matrix.bounds(*rect)
+                        }
+                        Command::FillBackground(fill) => {
+                            let fill=&mut **fill;
+                            for rect in [&mut fill.rect, &mut fill.positioning_rect, &mut fill.image_rect] {
+                                *rect = matrix.bounds(*rect);
+                            }
                         }
                         _ => {}
                     }
@@ -1546,6 +1920,8 @@ fn resolve_layers(
             continue;
         }
         let Command::PushLayer {
+            ref svg_clip,
+            ref filters,
             ref corners,
             rect,
             radius,
@@ -1553,7 +1929,24 @@ fn resolve_layers(
             clip,
         } = list[index]
         else {
-            output.0.push(list[index].clone());
+            let mut command=list[index].clone();
+            if spatial_source {
+                if let Command::SvgPath{bounds,data,transform,stroke,stroke_width,..}=&mut command {
+                    // SvgPath::bounds is a viewport-derived crop optimization.
+                    // The explicit SVG viewport clip remains in the ownership
+                    // tree; a descendant filter must capture outside source ink
+                    // before that ancestor clips its filtered result.
+                    if let Ok(parsed)=canvas::parse_svg_path(data) {
+                        if let Some(path)=parsed.path {
+                            if let Some(ink)=transformed_svg_path_bounds(&path,*transform,
+                                lumen_html::paint::svg_paint_has_ink(stroke.as_ref()),*stroke_width,scale) {
+                                *bounds=ink;
+                            }
+                        }
+                    }
+                }
+            }
+            output.0.push(command);
             index += 1;
             continue;
         };
@@ -1576,16 +1969,28 @@ fn resolve_layers(
         if (clip && (rect.width == 0.0 || rect.height == 0.0)) || opacity == 0.0 {
             continue;
         }
-        let mut child = resolve_layers(&list[start..end], scale, font, cache, bytes)?;
-        let Some(crop) = paint_bounds(&child.0, scale, font, cache)?.and_then(|bounds| {
-            if clip {
-                bounds.intersection(rect)
-            } else {
-                Some(bounds)
-            }
-        }) else {
+        let svg_object_box=svg_clip.as_ref().filter(|owner|owner.clip.units==lumen_html::paint::SvgGradientUnits::ObjectBoundingBox)
+            .map(|owner|svg_source_object_box(&list[start..end],owner.transform,font,*bytes)).transpose()?;
+        let capture=spatial_source || filters.as_ref().is_some_and(|filters|filters.iter().any(lumen_common::filter::FilterOperation::is_spatial));
+        let mut child = resolve_layers_with_source(&list[start..end], scale, font, cache, bytes,capture)?;
+        // An identity, square rectangle whose device edges are integral has
+        // binary coverage. Only then may clipping distribute through source-
+        // over without changing overlapping children's composited alpha.
+        if clip && opacity == 1.0 && filters.is_none() && svg_clip.is_none() && radius == 0.0 && corners.is_none()
+            && [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height]
+                .iter().all(|edge| (edge * scale).is_finite() && (edge * scale).fract() == 0.0)
+        {
+            output.0.push(Command::PushClip(rect));
+            output.0.extend(child.0);
+            output.0.push(Command::PopClip);
             continue;
-        };
+        }
+        let Some(source_bounds)=paint_bounds(&child.0,scale,font,cache)? else {continue;};
+        // Own layer clipping consumes the filtered result. Source ink outside
+        // that clip can contribute to pixels inside it through spatial filters.
+        let crop=if let Some(filters)=filters {filter_capture_bounds(source_bounds,filters,scale)?}
+            else if clip {let Some(crop)=source_bounds.intersection(rect) else {continue;};crop}
+            else {source_bounds};
         let left = (crop.x * scale).floor();
         let top = (crop.y * scale).floor();
         let width = ((crop.x + crop.width) * scale).ceil() - left;
@@ -1614,6 +2019,27 @@ fn resolve_layers(
         }
         let mut image =
             render_scaled_region(&child, width as u32, height as u32, scale, font, cache)?;
+        if let Some(filters)=filters {apply_filter_operations(&mut image,filters,scale,*bytes)?;}
+        if let Some(owner)=svg_clip {
+            // Source image + mask Canvas + its snapshot remain under one shared
+            // layer budget. Clip coverage is applied once, after all filters.
+            let pixels=len/4;
+            let peak=len.checked_mul(2).and_then(|rgba|pixels.checked_mul(3).and_then(|alpha|rgba.checked_add(alpha)))
+                .and_then(|scratch|bytes.checked_add(scratch)).filter(|bytes|*bytes<=MAX_LAYER_BYTES)
+                .ok_or(ImageError::TooLarge)?;
+            let path_bytes=owner.clip.shapes.iter().try_fold(0usize,|bytes,shape|shape.data.len().checked_mul(64)
+                .and_then(|path|path.checked_add(256)).and_then(|path|bytes.checked_add(path))).ok_or(ImageError::TooLarge)?;
+            peak.checked_add(path_bytes).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+            let mut mask=canvas::CanvasSurface::new(width as u32,height as u32)?;
+            let screen=Affine{a:scale,d:scale,e:-left,f:-top,..Affine::IDENTITY};
+            apply_svg_clips(&mut mask,core::slice::from_ref(owner.clip.as_ref()),owner.transform,
+                svg_object_box.unwrap_or(Affine::IDENTITY),screen,Some(peak))?;
+            mask.state_mut().fill=[255;4];mask.fill_rect(0.0,0.0,width,height)?;
+            let coverage=mask.snapshot();
+            for(pixel,mask)in image.pixels.chunks_exact_mut(4).zip(coverage.pixels.chunks_exact(4)) {
+                pixel[3]=((u16::from(pixel[3])*u16::from(mask[3])+127)/255)as u8;
+            }
+        }
         let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5) * scale;
         let clip_left = rect.x * scale - left;
         let clip_top = rect.y * scale - top;
@@ -1692,7 +2118,22 @@ fn paint_bounds(
     cache: &mut GlyphCache,
 ) -> Result<Option<Rect>, ImageError> {
     let mut bounds: Option<Rect> = None;
-    let mut include = |rect: Rect| {
+    let mut clips: Vec<Option<Rect>>=Vec::new();
+    let mut current_clip: Option<Rect>=None;
+    for command in list {
+        match command {
+            Command::PushClip(rect)|Command::PushBoxClip(rect) => {
+                if clips.len()==512 {return Err(ImageError::DisplayList(ReplayError::ClipLimit));}
+                clips.try_reserve(1).map_err(|_|ImageError::TooLarge)?;clips.push(current_clip);
+                current_clip=Some(current_clip.map_or(*rect,|clip|clip.intersection(*rect)
+                    .unwrap_or(Rect{x:rect.x,y:rect.y,width:0.0,height:0.0})));
+                continue;
+            }
+            Command::PopClip => {current_clip=clips.pop().ok_or(ImageError::DisplayList(ReplayError::UnbalancedClip))?;continue;}
+            _=>{}
+        }
+        let mut include = |rect: Rect| {
+        let rect=if let Some(clip)=current_clip {let Some(rect)=rect.intersection(clip) else{return;};rect}else{rect};
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
@@ -1706,8 +2147,7 @@ fn paint_bounds(
                 height: (old.y + old.height).max(rect.y + rect.height) - y,
             }
         }));
-    };
-    for command in list {
+        };
         match command {
             Command::FillRect { rect, color }
             | Command::FillRoundedRect { rect, color, .. }
@@ -1717,7 +2157,7 @@ fn paint_bounds(
             {
                 include(*rect)
             }
-            Command::Image { rect, .. } | Command::FillGradient { rect, .. } => include(*rect),
+            Command::Image { rect, .. } | Command::ReservedImage { rect, .. } | Command::FillGradient { rect, .. } => include(*rect),
             Command::SvgPath {
                 bounds,
                 data,
@@ -1798,6 +2238,7 @@ fn paint_bounds(
             _ => {}
         }
     }
+    if !clips.is_empty() {return Err(ImageError::DisplayList(ReplayError::UnbalancedClip));}
     Ok(bounds)
 }
 
@@ -1834,15 +2275,18 @@ fn translate_command(command: &mut Command, x: f32, y: f32) {
             transform.e += x;
             transform.f += y;
         }
-        Command::PushClip(rect)
-        | Command::PushLayer { rect, .. }
+        Command::PushLayer{rect,svg_clip,..}=>{
+            rect.x+=x;rect.y+=y;
+            if let Some(owner)=svg_clip {let owner=Arc::make_mut(owner);owner.transform.e+=x;owner.transform.f+=y;}
+        }
+        Command::PushClip(rect) | Command::PushBoxClip(rect)
         | Command::FillRect { rect, .. }
         | Command::FillRoundedRect { rect, .. }
         | Command::FillGradient { rect, .. }
         | Command::BoxShadow { rect, .. }
         | Command::StrokePatternBorder { rect, .. }
         | Command::StrokeBorder { rect, .. }
-        | Command::Image { rect, .. } => {
+        | Command::Image { rect, .. } | Command::ReservedImage { rect, .. } => {
             rect.x += x;
             rect.y += y;
         }
@@ -2132,16 +2576,18 @@ pub fn decode_raster_image_with_limit(
 /// Decode a still image, using the shared XML/cascade/vector renderer for SVG.
 /// The output allocation must fit both the caller's budget and the global ceiling.
 pub fn decode_image_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Rgba8Image, ImageError> {
-    let prefix = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    if prefix
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'<')
-    {
-        decode_svg_image_with_limit(bytes, max_bytes)
-    } else {
-        decode_raster_image_with_limit(bytes, max_bytes)
+    decode_image_with_fragment_and_limit(bytes,None,max_bytes)
+}
+
+pub fn decode_image_with_fragment_and_limit(bytes:&[u8],fragment:Option<&str>,max_bytes:usize)->Result<Rgba8Image,ImageError> {
+    decode_image_with_fragment_and_intrinsic_limit(bytes,fragment,max_bytes).map(|(image,_)|image)
+}
+/// Preserve actual SVG natural dimensions independently of the raster storage size.
+pub fn decode_image_with_fragment_and_intrinsic_limit(bytes:&[u8],fragment:Option<&str>,max_bytes:usize)->Result<(Rgba8Image,Option<lumen_html::object::IntrinsicSize>),ImageError> {
+    if SvgViewportImages::is_vector(bytes) {
+        decode_svg_image_in_viewport_with_intrinsic(bytes,fragment,None,lumen_html::css::UsedColorScheme::Light,max_bytes).map(|(image,natural,_)|(image,Some(natural)))
+    }else{
+        decode_raster_image_with_limit(bytes,max_bytes).map(|image|(image,None))
     }
 }
 
@@ -2152,6 +2598,17 @@ pub fn decode_svg_image_with_limit(
     bytes: &[u8],
     max_bytes: usize,
 ) -> Result<Rgba8Image, ImageError> {
+    decode_svg_image_with_fragment_and_limit(bytes,None,max_bytes)
+}
+
+pub fn decode_svg_image_with_fragment_and_limit(bytes:&[u8],fragment:Option<&str>,max_bytes:usize)->Result<Rgba8Image,ImageError> {
+    decode_svg_image_in_viewport(bytes,fragment,None,max_bytes)
+}
+
+pub fn decode_svg_image_in_viewport(bytes:&[u8],fragment:Option<&str>,viewport:Option<(u32,u32)>,max_bytes:usize)->Result<Rgba8Image,ImageError> {
+    decode_svg_image_in_viewport_with_intrinsic(bytes,fragment,viewport,lumen_html::css::UsedColorScheme::Light,max_bytes).map(|(image,_,_)|image)
+}
+fn prepare_svg_image(bytes:&[u8],fragment:Option<&str>,scheme:lumen_html::css::UsedColorScheme)->Result<(lumen_html::session::RenderSession,lumen_html::object::IntrinsicSize,(Option<lumen_html::svg::ViewBox>,lumen_html::svg::AspectRatio)),ImageError> {
     let source = std::str::from_utf8(bytes).map_err(|_| ImageError::Svg("SVG is not UTF-8"))?;
     let document = lumen_html::xml::parse(source, 16_384).map_err(|error| match error.message {
         "XML input too large"
@@ -2181,13 +2638,24 @@ pub fn decode_svg_image_with_limit(
     }
     let mut session = lumen_html::session::RenderSession::new(document);
     session.set_canvas_background(None);
-    let style = session.computed_style(root).map_err(ImageError::Layout)?;
-    let attributes = match session.document().kind(root) {
-        Ok(lumen_html::NodeKind::Element { attributes, .. }) => attributes,
-        _ => return Err(ImageError::Svg("invalid SVG root")),
+    session.set_color_scheme_preference(match scheme {lumen_html::css::UsedColorScheme::Light=>lumen_html::css::ColorSchemePreference::Light,lumen_html::css::UsedColorScheme::Dark=>lumen_html::css::ColorSchemePreference::Dark}).map_err(ImageError::Layout)?;
+    session.set_svg_fragment(fragment).map_err(ImageError::Layout)?;
+    let view=session.svg_fragment().and_then(|fragment|fragment.resolve(session.document()));
+    let coordinates=match session.document().kind(root) {
+        Ok(lumen_html::NodeKind::Element{attributes,..})=>(
+            view.and_then(|view|view.view_box).or_else(||lumen_html::svg::attribute(attributes,"viewBox").and_then(lumen_html::svg::parse_view_box)),
+            view.and_then(|view|view.aspect).or_else(||lumen_html::svg::attribute(attributes,"preserveAspectRatio").and_then(lumen_html::svg::parse_aspect_ratio)).unwrap_or_default()),
+        _=>return Err(ImageError::Svg("invalid SVG root")),
     };
-    let (width, height) =
-        lumen_html::svg::root_size(attributes, style.width, style.height, 300.0, Some(150.0));
+
+    let natural=session.embedded_document_intrinsic_size(false,None).map_err(ImageError::Layout)?
+        .ok_or(ImageError::Svg("missing SVG intrinsic metadata"))?;
+    Ok((session,natural,coordinates))
+}
+fn decode_svg_image_in_viewport_with_intrinsic(bytes:&[u8],fragment:Option<&str>,viewport:Option<(u32,u32)>,scheme:lumen_html::css::UsedColorScheme,max_bytes:usize)->Result<(Rgba8Image,lumen_html::object::IntrinsicSize,(Option<lumen_html::svg::ViewBox>,lumen_html::svg::AspectRatio)),ImageError> {
+    let (mut session,natural,coordinates)=prepare_svg_image(bytes,fragment,scheme)?;
+    let (width,height)=viewport.map(|(width,height)|(width as f32,height as f32)).unwrap_or_else(||natural.default_dimensions());
+    session.set_svg_image_viewport(viewport.map(|(width,height)|(width as f32,height as f32))).map_err(ImageError::Layout)?;
     let (width, height) = (f64::from(width).ceil(), f64::from(height).ceil());
     if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
         return Err(ImageError::InvalidViewport);
@@ -2214,7 +2682,7 @@ pub fn decode_svg_image_with_limit(
     let list = session
         .display_list(width, height, font)
         .map_err(ImageError::Layout)?;
-    render_with_font(list, width, height, 1.0, true, font)
+    render_with_font(list, width, height, 1.0, true, font).map(|image|(image,natural,coordinates))
 }
 
 pub fn decode_raster_image_with_orientation(
@@ -2359,14 +2827,7 @@ fn decode_raster_image_bounded(
         lumen_common::limits::size::repeat(width, height, max_bytes / 4)
             .map_err(|_| ImageError::TooLarge)?;
     }
-    if !matches!(
-        format,
-        image::ImageFormat::Png
-            | image::ImageFormat::Jpeg
-            | image::ImageFormat::WebP
-            | image::ImageFormat::Gif
-            | image::ImageFormat::Bmp
-    ) {
+    if !lumen_common::mime::image_type_supported(format.to_mime_type()) {
         return Err(ImageError::Png("unsupported raster image format"));
     }
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
@@ -2559,9 +3020,13 @@ fn settle_pass(
     images: &dyn lumen_html::layout::ImageResolver,
     pending: bool,
 ) -> Result<Option<Rgba8Image>, ImageError> {
+    let font_generation=font.generation();
     match session.display_list_with_images(width_css, height_css, font, images) {
         Err(lumen_html::layout::LayoutError::ImagePending) => Ok(None),
         Err(error) => Err(ImageError::Layout(error)),
+        // A shaping pass can record first-use font demand. Give the existing
+        // owner task pump another turn before committing that stale snapshot.
+        Ok(_) if font.generation()!=font_generation=>Ok(None),
         Ok(list) if !pending => render_with_mode_cached(
             list,
             width_css,
@@ -2579,6 +3044,269 @@ fn settle_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specification_svg_metadata_free_page_negotiates_default_but_root_uses_owner_preference() {
+        use lumen_html::css::{UsedColorScheme,ColorSchemePreference};
+        let source=b"<svg xmlns='http://www.w3.org/2000/svg' style='color-scheme:light dark'><style>svg{width:10px;height:5px}@media(prefers-color-scheme:dark){svg{width:20px}}</style></svg>";
+        let (mut session,natural,_)=prepare_svg_image(source,None,UsedColorScheme::Dark).unwrap();
+        let root=session.document().document_element_at(session.document().root()).unwrap().unwrap();
+        let environment=session.media_environment();
+        assert_eq!(environment.color_schemes.preference,ColorSchemePreference::Dark);
+        assert_eq!(environment.color_schemes.page(),lumen_html::css::UsedScheme{scheme:UsedColorScheme::Light,defaulted:true});
+        assert_eq!(session.computed_style(root).unwrap().used_color_scheme(environment).scheme,UsedColorScheme::Dark);
+        assert_eq!(natural.width,Some(10.0),"MQ5 queries negotiated page scheme, not unconditionally the user/owner preference");
+    }
+
+    #[test]
+    fn specification_svg_intrinsic_owner_scheme_metadata_reuses_source_without_rasterizing() {
+        use lumen_html::css::UsedColorScheme;
+        let source=b"<svg xmlns='http://www.w3.org/2000/svg'><meta xmlns='http://www.w3.org/1999/xhtml' name='color-scheme' content='light dark'/><style>svg{width:10px;height:5px}@media(prefers-color-scheme:dark){svg{width:20px;height:8px}}</style></svg>";
+        let cache=SvgViewportImages::default();
+        let natural=Arc::new(ImageData{width:10,height:5,pixels:vec![0;200]});
+        cache.remember("metrics",lumen_common::bytes::Bytes::owned(Arc::from(&source[..])),None,4096).unwrap();
+        cache.attach_natural("metrics",&natural);
+        for _ in 0..3 {
+            assert_eq!(cache.intrinsic_size(&natural,UsedColorScheme::Light).unwrap().width,Some(10.0));
+            let dark=cache.intrinsic_size(&natural,UsedColorScheme::Dark).unwrap();
+            assert_eq!((dark.width,dark.height),(Some(20.0),Some(8.0)));
+        }
+        assert!(cache.rasters.borrow().is_empty(),"intrinsic query uses shared SVG metric preparation, not pixel decode");
+        assert_eq!(cache.sources.borrow().len(),1,"light/dark share source/fragment ownership");
+        assert_eq!((natural.width,natural.height),(10,5),"owner sizing never mutates admitted natural pixels");
+    }
+
+    #[test]
+    fn specification_svg_raster_cache_discriminates_owner_used_color_scheme() {
+        use lumen_html::css::UsedColorScheme;
+        let source=b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2' style='color-scheme:light dark'><rect width='2' height='2' style='fill:light-dark(red,blue)'/></svg>";
+        let cache=SvgViewportImages::default();
+        let natural=Arc::new(ImageData{width:2,height:2,pixels:vec![0;16]});
+        cache.remember("scheme",lumen_common::bytes::Bytes::owned(Arc::from(&source[..])),None,4096).unwrap();
+        cache.attach_natural("scheme",&natural);
+        let light=cache.render("scheme",2.0,2.0,UsedColorScheme::Light,4096).unwrap().unwrap();
+        let dark=cache.render("scheme",2.0,2.0,UsedColorScheme::Dark,4096).unwrap().unwrap();
+        assert_eq!(&light.pixels[..4],&[255,0,0,255]);
+        assert_eq!(&dark.pixels[..4],&[0,0,255,255]);
+        assert!(!Arc::ptr_eq(&light,&dark));
+        assert!(Arc::ptr_eq(&dark,&cache.render("scheme",2.0,2.0,UsedColorScheme::Dark,4096).unwrap().unwrap()));
+        assert!(Arc::ptr_eq(&light,&cache.render("scheme",2.0,2.0,UsedColorScheme::Light,4096).unwrap().unwrap()));
+    }
+
+    #[test]
+    fn specification_text_shadow_color_extrapolation_reuses_premultiplied_interpolation() {
+        let gray = |value| Rgba { r: value, g: value, b: value, a: 255 };
+        assert_eq!(interpolate_color(gray(100),gray(200),-0.3),gray(70));
+        assert_eq!(interpolate_color(gray(100),gray(200),1.5),gray(250));
+        assert_eq!(interpolate_color(gray(100),gray(200),0.5),gray(150));
+        let transparent=Rgba {r:0,g:0,b:0,a:0};
+        let green=Rgba {r:0,g:128,b:0,a:255};
+        assert_eq!(interpolate_color(transparent,green,0.5),Rgba {r:0,g:128,b:0,a:128});
+        // Unpremultiply with the actual interpolated alpha; only conversion
+        // into the existing RGBA8 carrier clips the final alpha/channel range.
+        assert_eq!(interpolate_color(transparent,green,1.5),green);
+    }
+
+    #[test]
+    fn specification_image_set_vector_density_preserves_real_owner_dimensions_cold_and_warm() {
+        let svg=br#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="green"/></svg>"#;
+        let url=format!("data:image/svg+xml,{}",lumen_common::codec::percent_encode(svg,|byte|!byte.is_ascii_alphanumeric()));
+        let markup=format!("<!doctype html><style>body{{margin:0}}div{{width:100px;height:100px;background-repeat:no-repeat;background-image:image-set(url('{url}') 2x type('image/svg+xml'))}}</style><div></div>");
+        let document=lumen_html::html::parse(&markup,64).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        let images=FileImages::new(".");
+        for _ in 0..2 {
+            let list=session.display_list_with_images(100,100,default_font().unwrap(),&images).unwrap();
+            let fill=list.0.iter().find_map(|command|match command {lumen_html::paint::Command::FillBackground(fill)=>Some(fill),_=>None}).expect("typed vector background");
+            assert_eq!((fill.image_rect.width,fill.image_rect.height),(80.0,40.0));
+        }
+    }
+
+    #[test]
+    fn specification_cross_fade_natural_size_negotiates_real_svg_dimensions_in_context() {
+        let ratio_only=br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50"><rect width="100" height="50" fill="green"/></svg>"#;
+        let definite=br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="green"/></svg>"#;
+        let url=|source:&[u8]|format!("data:image/svg+xml,{}",lumen_common::codec::percent_encode(source,|byte|!byte.is_ascii_alphanumeric()));
+        let mut document=lumen_html::html::parse("<!doctype html><style>body{margin:0}</style><div id=background></div>",64).unwrap();
+        let node=lumen_html::selector::get_element_by_id(&document,document.root(),"background").unwrap().unwrap();
+        let style=format!("width:100px;height:80px;background-repeat:no-repeat;background-image:cross-fade(75% url('{}'),25% url('{}'))",url(ratio_only),url(definite));
+        document.set_attribute(node,"style",&style).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        session.set_canvas_background(None);
+        let images=FileImages::new(".");
+        let list=session.display_list_with_images(100,80,default_font().unwrap(),&images).unwrap();
+        let background=list.0.iter().find_map(|command|match command {lumen_html::paint::Command::FillBackground(background) if matches!(&background.image,lumen_html::paint::BackgroundPaint::CrossFade(_))=>Some(background),_=>None}).expect("actual typed cross-fade source");
+        assert_eq!((background.image_rect.width,background.image_rect.height),(85.0,47.5),"ratio-only operand negotiates 100x50 in this positioning area before weighted natural sizing");
+        let raster=render(list,100,80,1.0,true).unwrap();
+        assert_eq!(&raster.pixels[(20*100+20)*4..(20*100+21)*4],&[0,128,0,255],"actual viewport image carriers feed the shared weighted painter");
+    }
+
+    #[test]
+    fn specification_border_image_conic_zero_stops_fill_without_border_radius_clipping() {
+        let document=lumen_html::html::parse("<!doctype html><style>body{margin:0}#back{width:100px;height:100px;background:red}#target{width:100px;height:100px;background:conic-gradient(rgba(255,0,0,.5) 0 0),conic-gradient(red 0 0);border-radius:40px;border-image:conic-gradient(green 0 0) 1 fill / 10px}</style><div id=back><div id=target></div></div>",64).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        let list=session.display_list(100,100,default_font().unwrap()).unwrap();
+        assert!(list.0.iter().any(|command|matches!(command,lumen_html::paint::Command::FillBackground(fill) if matches!(&fill.image,lumen_html::paint::BackgroundPaint::Border(image) if image.fill))));
+        let raster=render(list,100,100,1.0,true).unwrap();
+        assert!(raster.pixels.chunks_exact(4).all(|pixel| pixel==[0,128,0,255]), "nine-slice fill covers the square, independently of the normal rounded background");
+    }
+
+    #[test]
+    fn specification_border_image_svg_vector_slices_paint_nine_regions_and_keep_source_identity() {
+        use lumen_html::paint::{BackgroundPaint,Command};
+        let source=br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3 3"><rect x="0" y="0" width="1" height="1" fill="green"/><rect x="1" y="0" width="1" height="1" fill="yellow"/><rect x="2" y="0" width="1" height="1" fill="blue"/><rect x="0" y="1" width="1" height="1" fill="cyan"/><rect x="1" y="1" width="1" height="1" fill="red"/><rect x="2" y="1" width="1" height="1" fill="magenta"/><rect x="0" y="2" width="1" height="1" fill="black"/><rect x="1" y="2" width="1" height="1" fill="white"/><rect x="2" y="2" width="1" height="1" fill="orange"/></svg>"#;
+        let url=format!("data:image/svg+xml,{}",lumen_common::codec::percent_encode(source,|byte|!byte.is_ascii_alphanumeric()));
+        let images=FileImages::new(".");let font=default_font().unwrap();
+        for fill in [false,true] {
+            let source=format!("<!doctype html><style>body{{margin:0}}div{{width:4px;height:4px;border:4px solid red;border-image:url('{}') 1 {} / 4px stretch}}</style><div></div>",url,if fill{"fill"}else{""});
+            let document=lumen_html::html::parse(&source,64).unwrap();let mut session=lumen_html::session::RenderSession::new(document);
+            session.set_canvas_background(None);
+            let list=session.display_list_with_images(12,12,font,&images).unwrap().clone();
+            let carriers=list.0.iter().filter_map(|command|match command {Command::FillBackground(background)=>match &background.image {BackgroundPaint::Border(image)=>Some(image),_=>None},_=>None}).collect::<Vec<_>>();
+            assert_eq!(carriers.len(),1,"one retained carrier represents every border tile");
+            assert_eq!(carriers[0].source_size,[12.0,12.0]);
+            assert_eq!(carriers[0].slices,[4.0;4],"SVG vector units use the actual active viewport scale");
+            let replay=session.display_list_with_images(12,12,font,&images).unwrap();
+            assert!(replay.0.iter().any(|command|matches!(command,Command::FillBackground(background) if matches!(&background.image,BackgroundPaint::Border(image) if Arc::ptr_eq(image,carriers[0])))));
+            let raster=render(&list,12,12,1.0,true).unwrap();
+            let pixel=|x:usize,y:usize|&raster.pixels[(y*12+x)*4..(y*12+x+1)*4];
+            assert_eq!(pixel(1,1),[0,128,0,255]);assert_eq!(pixel(6,1),[255,255,0,255]);assert_eq!(pixel(10,1),[0,0,255,255]);
+            assert_eq!(pixel(1,6),[0,255,255,255]);assert_eq!(pixel(10,6),[255,0,255,255]);
+            assert_eq!(pixel(6,6),if fill{[255,0,0,255]}else{[0,0,0,0]});
+        }
+    }
+
+    #[test]
+    fn specification_border_image_pending_procedural_source_uses_canonical_normal_border_fallback() {
+        use lumen_html::paint::{BackgroundFill,BackgroundPaint,BackgroundRepeat,BorderImagePaint,BoxBorder,PaintWorkletImage,PaintWorkletRequest};
+        let green=Rgba{r:0,g:128,b:0,a:255};
+        let border=BorderImagePaint {image:BackgroundPaint::Worklet(Arc::new(PaintWorkletImage{
+            request:PaintWorkletRequest{name:Arc::from("pending"),arguments:Arc::from([]),registration_revision:1,width:14.0,height:14.0,properties:Arc::from([])},input_properties:Arc::from([]),pixels:None})),
+            fallback:BoxBorder{rect:Rect{x:2.0,y:2.0,width:10.0,height:10.0},radius:0.0,widths:[2.0;4],colors:[green;4],pattern:None,side_patterns:None,corners:None},
+            source_size:[14.0;2],slices:[3.0;4],widths:[3.0;4],repeat:[lumen_html::css::BorderImageRepeat::Stretch;2],fill:true};
+        let rect=Rect{x:0.0,y:0.0,width:14.0,height:14.0};
+        let list=DisplayList(vec![Command::FillBackground(Box::new(BackgroundFill {rect,radius:0.0,corners:None,positioning_rect:rect,image_rect:rect,repeat:[BackgroundRepeat::NoRepeat;2],image:BackgroundPaint::Border(Arc::new(border))}))]);
+        let raster=render(&list,14,14,1.0,true).unwrap();
+        let pixel=|x:usize,y:usize|&raster.pixels[(y*14+x)*4..(y*14+x+1)*4];
+        assert_eq!(pixel(0,0),[0,0,0,0],"pending image does not paint its outset area");
+        assert_eq!(pixel(2,2),[0,128,0,255],"normal border is painted by the existing border rasterizer");
+        assert_eq!(pixel(7,7),[0,0,0,0],"pending fill does not replace fallback with a transparent border image");
+    }
+
+    #[test]
+    fn specification_svg_natural_background_size_keeps_dimensions_distinct_from_raster_storage() {
+        use lumen_html::layout::ImageResolver;
+        use lumen_html::object::IntrinsicSize;
+        let source=br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="100" height="80" fill="green"/></svg>"#;
+        let url=format!("data:image/svg+xml,{}#svgView(viewBox(0,0,100,80))",lumen_common::codec::percent_encode(source,|byte|!byte.is_ascii_alphanumeric()));
+        let images=FileImages::new(".");
+        let natural=match images.resolve(&url) {ImageState::Ready(image)=>image,_=>panic!("real SVG source")};
+        assert_eq!((natural.width,natural.height),(188,150),"default raster storage rounds a ratio-only SVG independently of its natural dimensions");
+        assert_eq!(images.image_intrinsic_size(&natural,lumen_html::css::UsedColorScheme::Light),Some(IntrinsicSize{width:None,height:None,ratio:Some(1.25)}));
+        let same=match images.resolve(&url) {ImageState::Ready(image)=>image,_=>panic!("cached source")};
+        assert!(Arc::ptr_eq(&natural,&same));
+        let font=default_font().unwrap();
+        for (size,expected) in [("auto auto",(100.0,80.0)),("contain",(100.0,80.0)),("cover",(100.0,80.0)),("50px auto",(50.0,40.0)),("auto 40px",(50.0,40.0))] {
+            let mut document=lumen_html::html::parse("<!doctype html><style>body{margin:0}</style><div id=background></div>",64).unwrap();
+            let node=lumen_html::selector::get_element_by_id(&document,document.root(),"background").unwrap().unwrap();
+            document.set_attribute(node,"style",&format!("width:100px;height:80px;background-image:url('{}');background-size:{};background-repeat:no-repeat",url,size)).unwrap();
+            let mut session=lumen_html::session::RenderSession::new(document);
+            session.set_canvas_background(None);
+            let list=session.display_list_with_images(100,80,font,&images).unwrap().clone();
+            let background=list.0.iter().find_map(|command|match command {lumen_html::paint::Command::FillBackground(background) if matches!(&background.image,lumen_html::paint::BackgroundPaint::Image(_))=>Some(background),_=>None}).expect("actual background image command");
+            assert_eq!((background.image_rect.width,background.image_rect.height),expected,"{size} resolves against natural metadata");
+            let raster=render(&list,100,80,1.0,true).unwrap();
+            for y in 0..expected.1 as usize {for x in 0..expected.0 as usize {
+                assert_eq!(&raster.pixels[(y*100+x)*4..(y*100+x+1)*4],&[0,128,0,255],"{size}: no fractional left-edge alpha from rounded decode dimensions");
+            }}
+            let replay=session.display_list_with_images(100,80,font,&images).unwrap();
+            let current=match &background.image {lumen_html::paint::BackgroundPaint::Image(image)=>image,_=>unreachable!()};
+            assert!(replay.0.iter().any(|command|matches!(command,lumen_html::paint::Command::FillBackground(background) if matches!(&background.image,lumen_html::paint::BackgroundPaint::Image(image) if Arc::ptr_eq(image,current)))));
+        }
+        let one_axis=br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" viewBox="0 0 100 80"/>"#;
+        let (_,intrinsic)=decode_image_with_fragment_and_intrinsic_limit(one_axis,None,1024*1024).unwrap();
+        assert_eq!(intrinsic,Some(IntrinsicSize{width:Some(40.0),height:None,ratio:Some(1.25)}));
+        assert_eq!(intrinsic.unwrap().default_dimensions_in((100.0,80.0)),(40.0,32.0));
+        let (_,intrinsic)=decode_image_with_fragment_and_intrinsic_limit(source,None,1024*1024).unwrap();
+        assert_eq!(intrinsic,Some(IntrinsicSize::default()),"unselected source does not inherit another fragment's ratio");
+    }
+
+    #[test]
+    fn specification_svg_viewport_concrete_image_box_preserves_meet_and_reuses_raster() {
+        let source=br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" viewBox="0 0 4 2"><rect width="2" height="2" fill="red"/><rect x="2" width="2" height="2" fill="blue"/></svg>"#;
+        let cache=SvgViewportImages::default();
+        let bytes=lumen_common::bytes::Bytes::owned(Arc::from(&source[..]));
+        let cost=SvgViewportImages::source_cost("actual",source.len(),Some("svgView(viewBox(2,0,2,2))")).unwrap();
+        assert!(cache.remember("actual",bytes.clone(),Some("svgView(viewBox(2,0,2,2))"),cost-1).is_err());
+        cache.remember("actual",bytes,Some("svgView(viewBox(2,0,2,2))"),cost).unwrap();
+        let first=cache.render("actual",8.0,4.0,lumen_html::css::UsedColorScheme::Light,4096).unwrap().unwrap();
+        assert_eq!((first.width,first.height),(8,4));
+        assert_eq!(&first.pixels[..4],&[255,0,0,255]);
+        assert_eq!(&first.pixels[8..12],&[0,0,255,255]);
+        assert_eq!(&first.pixels[28..32],&[0,0,0,0]);
+        let same=cache.render("actual",8.0,4.0,lumen_html::css::UsedColorScheme::Light,4096).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first,&same));
+        let square=cache.render("actual",4.0,4.0,lumen_html::css::UsedColorScheme::Light,4096).unwrap().unwrap();
+        assert!(square.pixels.chunks_exact(4).all(|pixel|pixel==[0,0,255,255]));
+        assert!(cache.render("actual",100.0,100.0,lumen_html::css::UsedColorScheme::Light,4096).unwrap().is_err());
+        let none=decode_svg_image_in_viewport(source,Some("svgView(viewBox(2,0,2,2);preserveAspectRatio(none))"),Some((8,4)),4096).unwrap();
+        assert!(none.pixels.chunks_exact(4).all(|pixel|pixel==[0,0,255,255]));
+
+        let images=FileImages::new(".");
+        let url=format!("data:image/svg+xml,{}#svgView(viewBox(2,0,2,2))",lumen_common::codec::percent_encode(source,|byte|!byte.is_ascii_alphanumeric()));
+        let mut document=lumen_html::html::parse("<!doctype html><style>body{margin:0}img{display:block;width:8px;height:4px}</style><img id=actual>",64).unwrap();
+        let node=lumen_html::selector::get_element_by_id(&document,document.root(),"actual").unwrap().unwrap();
+        document.set_attribute(node,"src",&url).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        session.set_canvas_background(None);
+        let font=default_font().unwrap();
+        let list=session.display_list_with_images(8,4,font,&images).unwrap();
+        let painted=list.0.iter().find_map(|command|match command {lumen_html::paint::Command::Image{rect,image} if rect.width==8.0 && rect.height==4.0=>Some(image.clone()),_=>None}).expect("actual replaced image viewport");
+        assert_eq!(painted.pixels,first.pixels);
+        let natural=match lumen_html::layout::ImageResolver::resolve(&images,&url) {ImageState::Ready(image)=>image,_=>panic!("actual loaded source")};
+        let stale_selected="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='8'%20height='4'%3E%3Crect%20width='8'%20height='4'%20fill='green'/%3E%3C/svg%3E";
+        assert!(matches!(lumen_html::layout::ImageResolver::resolve(&images,stale_selected),ImageState::Ready(_)));
+        let still_current=lumen_html::layout::ImageResolver::resolve_viewport(&images,Some(node),"",stale_selected,&natural,8.0,4.0,lumen_html::css::UsedColorScheme::Light).unwrap();
+        assert!(matches!(still_current,ImageState::Ready(image) if image.pixels==first.pixels));
+
+        let replay=session.display_list_with_images(8,4,font,&images).unwrap();
+        assert!(replay.0.iter().any(|command|matches!(command,lumen_html::paint::Command::Image{image,..} if Arc::ptr_eq(image,&painted))));
+        session.document_mut().set_attribute(node,"style","display:block;width:4px;height:4px").unwrap();
+        let resized=session.display_list_with_images(8,4,font,&images).unwrap();
+        let square_paint=resized.0.iter().find_map(|command|match command {lumen_html::paint::Command::Image{rect,image} if rect.width==4.0 && rect.height==4.0=>Some(image),_=>None}).unwrap();
+        assert!(square_paint.pixels.chunks_exact(4).all(|pixel|pixel==[0,0,255,255]));
+        let mut document=lumen_html::html::parse("<!doctype html><style>body{margin:0}</style><div id=background></div>",64).unwrap();
+        let node=lumen_html::selector::get_element_by_id(&document,document.root(),"background").unwrap().unwrap();
+        document.set_attribute(node,"style",&format!("width:8px;height:4px;background-image:url('{}');background-size:8px 4px;background-repeat:no-repeat",url)).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        session.set_canvas_background(None);
+        let list=session.display_list_with_images(8,4,font,&images).unwrap();
+        assert!(list.0.iter().any(|command|match command {
+            lumen_html::paint::Command::FillBackground(background)=>match &background.image {lumen_html::paint::BackgroundPaint::Image(image)=>image.width==8 && image.height==4 && image.pixels==first.pixels,_=>false},_=>false
+        }));
+
+
+    }
+
+    #[test]
+    fn specification_svg_view_raster_and_intrinsic_use_the_same_selected_view() {
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" viewBox="0 0 4 2"><view id="right" viewBox="2 0 2 2"/><rect width="2" height="2" fill="red"/><rect x="2" width="2" height="2" fill="blue"/></svg>"#;
+        let whole = decode_svg_image_with_fragment_and_limit(source, None, 128).unwrap();
+        assert_eq!((whole.width,whole.height),(4,2));
+        assert_eq!(&whole.pixels[..4], &[255,0,0,255]);
+        let named = decode_svg_image_with_fragment_and_limit(source, Some("right"), 128).unwrap();
+        let specified = decode_svg_image_with_fragment_and_limit(source, Some("svgView(viewBox(2,0,2,2))"), 128).unwrap();
+        assert_eq!((named.width,named.height),(4,4));
+        assert_eq!(named.pixels,specified.pixels);
+        assert!(named.pixels.chunks_exact(4).all(|pixel|pixel==[0,0,255,255]));
+        let escaped = decode_svg_image_with_fragment_and_limit(source, Some("svgView%28viewBox%282%2C0%2C2%2C2%29%29"), 128).unwrap();
+        assert_eq!(escaped.pixels,named.pixels);
+        let invalid = decode_svg_image_with_fragment_and_limit(source, Some("svgView(viewBox(2,0,2,2);viewBox(0,0,1,1))"), 128).unwrap();
+        assert_eq!(invalid.pixels,whole.pixels);
+        let disabled = decode_svg_image_with_fragment_and_limit(source, Some("svgView(viewBox(0,0,0,2))"), 4096).unwrap();
+        assert!(disabled.pixels.chunks_exact(4).all(|pixel|pixel==[0,0,0,0]));
+        assert!(matches!(decode_svg_image_with_fragment_and_limit(source,Some("right"), 63),Err(ImageError::TooLarge)));
+    }
 
     #[test]
     fn svg_image_decode_reuses_cascade_viewbox_and_preserves_transparency() {
@@ -2990,7 +3718,8 @@ mod tests {
             a: 255,
         };
         let list = DisplayList(vec![
-            Command::PushLayer {
+            Command::PushLayer { svg_clip: None,
+                filters: None,
                 corners: None,
                 rect: Rect {
                     x: 0.0,
@@ -3022,6 +3751,362 @@ mod tests {
                 .pixels
                 .chunks_exact(4)
                 .all(|pixel| pixel == [0, 0, 255, 128]));
+        }
+    }
+
+    #[test]
+    fn specification_svg_unfiltered_object_bounds_include_native_glyph_cells_and_geometry() {
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let run=lumen_html::paint::TextShaper::shape(&font," ",20.0).unwrap();assert_eq!(run.glyphs.len(),1);
+        let glyph=run.glyphs[0];let cell=font.glyph_cell_bounds(glyph.face,glyph.id,20.0*glyph.size_scale).unwrap();
+        assert!(cell.width>0.0&&cell.height>0.0,"spaces have object geometry despite no visible ink");
+        let owner=Affine{e:5.0,f:7.0,..Affine::IDENTITY};
+        let commands=[Command::PushTransform(Affine{e:3.0,f:2.0,..Affine::IDENTITY}),
+            Command::GlyphRun{origin_x:1.0,baseline_y:20.0,size:20.0,color:Rgba{r:0,g:0,b:0,a:0},glyphs:run.glyphs},Command::PopTransform];
+        let bounds=svg_source_object_box(&commands,owner,Some(&font),0).unwrap();
+        assert_eq!(bounds,Affine{a:cell.width,d:cell.height,e:-1.0+glyph.x+cell.x,f:15.0-glyph.y+cell.y,..Affine::IDENTITY},"native glyph cells remain in owner space through nested transforms");
+        let path=Command::SvgPath{bounds:Rect{x:0.0,y:0.0,width:1.0,height:1.0},data:Arc::from("M0 0Q10 20 20 0"),
+            transform:Affine::IDENTITY,fill:None,stroke:None,stroke_width:100.0,fill_rule:PaintSvgFillRule::NonZero,clips:Arc::from([])};
+        assert_eq!(svg_source_object_box(&[path.clone()],Affine::IDENTITY,None,0).unwrap(),Affine{a:20.0,d:10.0,..Affine::IDENTITY},"tight geometry excludes control-box excess, crop, stroke and absent paint");
+        assert_eq!(svg_source_object_box(&[path],Affine::IDENTITY,None,MAX_LAYER_BYTES),Err(ImageError::TooLarge),"source path workspace is admitted before parsing");
+        assert_eq!(svg_source_object_box(&[Command::PushTransform(Affine::IDENTITY)],Affine::IDENTITY,None,MAX_LAYER_BYTES),Err(ImageError::TooLarge),"transform stack is admitted before growth");
+    }
+
+    #[test]
+    fn specification_svg_css_owner_clip_is_a_single_composited_group() {
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let source="<style>body{margin:0}</style><svg width=30 height=20><defs><clipPath id=c clipPathUnits='objectBoundingBox'><rect width='.5' height='1'/></clipPath></defs><g clip-path='url(#c)'><rect x=4 y=4 width=2 height=2 fill='red'/><rect x=8 y=4 width=2 height=2 fill='none'/></g></svg>";
+        let reference="<style>body{margin:0}</style><svg width=30 height=20><rect x=4 y=4 width=2 height=2 fill='red'/></svg>";
+        assert_eq!(render_html_with_font(source,40,24,1.0,&font).unwrap(),render_html_with_font(reference,40,24,1.0,&font).unwrap(),"an unpainted child extends the container object box before clipping");
+        for transform in ["","transform='translate(.5 .25)'","transform='scale(2)'"] {
+            let source=format!("<style>body{{margin:0}}</style><svg width=20 height=12><defs><clipPath id=c><rect x=4.5 y=4 width=1.5 height=2/></clipPath></defs><g {transform} clip-path='url(#c)' filter='invert()'><rect x=4 y=4 width=2 height=2 fill='magenta'/><rect x=4 y=4 width=2 height=2 fill='cyan'/></g></svg>");
+            let reference=source.replace("filter='invert()'","filter='none'").replace("fill='magenta'","fill='lime'").replace("fill='cyan'","fill='red'");
+            for scale in [1.0,2.0] {
+                assert_eq!(render_html_with_font(&source,40,24,scale,&font).unwrap(),render_html_with_font(&reference,40,24,scale,&font).unwrap(),"SVG group owns filter then clip: {transform},scale={scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn specification_svg_owner_clip_filters_order_overlap_and_unfiltered_object_box() {
+        use lumen_common::filter::{FilterOperation as F,DropShadowFilter};
+        use lumen_common::color::Color;
+        use lumen_html::paint::{SvgClip,SvgClipShape,SvgLayerClip,SvgGradientUnits,SvgPaint};
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let viewport=Rect{x:0.0,y:0.0,width:10.0,height:10.0};
+        let clip=|data:&str,units,transform|Arc::new(SvgLayerClip{transform,clip:Arc::new(SvgClip{
+            units,transform:Affine::IDENTITY,shapes:Arc::from([SvgClipShape{data:Arc::from(data),transform:Affine::IDENTITY,fill_rule:PaintSvgFillRule::NonZero}])})});
+        let path=|data:&str,color|Command::SvgPath{bounds:viewport,data:Arc::from(data),transform:Affine::IDENTITY,
+            fill:Some(SvgPaint::Color(color)),stroke:None,stroke_width:0.0,fill_rule:PaintSvgFillRule::NonZero,clips:Arc::from([])};
+        let layer=|filters:Option<Arc<[F]>>,svg_clip|Command::PushLayer{svg_clip,filters,corners:None,rect:viewport,radius:0.0,opacity:1.0,clip:false};
+        let render=|commands| {
+            let resolved=rasterize_layers(&DisplayList(commands),1.0,&font,&mut GlyphCache::default()).unwrap();
+            render_scaled_region(&resolved,10,10,1.0,Some(&font),&mut GlyphCache::default()).unwrap()
+        };
+        let red=Rgba{r:255,g:0,b:0,a:255};let blue=Rgba{r:0,g:0,b:255,a:255};
+        for owner_clip in [false,true] {
+            let mask=Some(clip("M2 2H3V3H2Z",SvgGradientUnits::UserSpaceOnUse,Affine::IDENTITY));
+            let filter=Some(Arc::from([F::Blur(0.5)]));
+            let source=path("M3 2H4V3H3Z",red);
+            let commands=if owner_clip {vec![layer(filter,mask),source,Command::PopLayer]}
+                else {vec![layer(filter,None),layer(None,mask),source,Command::PopLayer,Command::PopLayer]};
+            let image=render(commands);
+            assert_eq!(&image.pixels[(2*10+2)*4..(2*10+2)*4+4],if owner_clip{&[255,0,0,21]}else{&[0,0,0,0]},
+                "an owner clip follows blur; a descendant clip belongs to SourceGraphic");
+        }
+        let image=render(vec![layer(None,Some(clip("M4.5 4H5V5H4.5Z",SvgGradientUnits::UserSpaceOnUse,Affine::IDENTITY))),
+            path("M4 4H5V5H4Z",red),path("M4 4H5V5H4Z",blue),Command::PopLayer]);
+        assert_eq!(&image.pixels[(4*10+4)*4..(4*10+4)*4+4],&[0,0,255,128],"fractional owner coverage applies once to composited overlap");
+        let shadow=F::DropShadow(Arc::new(DropShadowFilter{offset:[3.0,0.0],sigma:0.0,color:Color::rgba8([0,0,255,255])}));
+        let image=render(vec![layer(Some(Arc::from([shadow])),Some(clip("M0 0H.5V1H0Z",SvgGradientUnits::ObjectBoundingBox,Affine::IDENTITY))),
+            path("M4 4H6V6H4Z",red),Command::PopLayer]);
+        assert_eq!(&image.pixels[(4*10+4)*4..(4*10+4)*4+4],&[255,0,0,255]);
+        assert_eq!(&image.pixels[(4*10+5)*4..(4*10+5)*4+4],&[0,0,0,0],"object bounds exclude ordered filter outsets");
+        assert_eq!(&image.pixels[(4*10+7)*4..(4*10+7)*4+4],&[0,0,0,0],"owner clips consume the shadow result too");
+    }
+
+    #[test]
+    fn specification_spatial_filter_svg_viewport_crop_is_source_optimization_not_owner_clip() {
+        use lumen_common::filter::FilterOperation as F;
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let viewport=Rect{x:0.0,y:0.0,width:10.0,height:10.0};
+        let path=Command::SvgPath{bounds:viewport,data:Arc::from("M10 4H11V5H10Z"),
+            transform:Affine::IDENTITY,fill:Some(lumen_html::paint::SvgPaint::Color(Rgba{r:255,g:0,b:0,a:255})),
+            stroke:None,stroke_width:0.0,fill_rule:PaintSvgFillRule::NonZero,clips:Arc::from([])};
+        let layer=|filters:Option<Arc<[F]>>,clip:bool|Command::PushLayer{ svg_clip: None,filters,corners:None,rect:viewport,radius:0.0,opacity:1.0,clip};
+        let make=|root_filter:bool| {
+            let filter=layer(Some(Arc::from([F::Blur(0.5)])),false);
+            let clip=layer(None,true);
+            DisplayList(if root_filter {vec![filter,clip,path.clone(),Command::PopLayer,Command::PopLayer]}
+                else {vec![clip,filter,path.clone(),Command::PopLayer,Command::PopLayer]})
+        };
+        for root_filter in [false,true] {
+            let resolved=rasterize_layers(&make(root_filter),1.0,&font,&mut GlyphCache::default()).unwrap();
+            let image=render_scaled_region(&resolved,10,10,1.0,Some(&font),&mut GlyphCache::default()).unwrap();
+            assert_eq!(&image.pixels[(4*10+9)*4..(4*10+9)*4+4],if root_filter {&[0,0,0,0]}else{&[255,0,0,21]},
+                "descendant filter captures outside viewport ink; root filter captures viewport-clipped contents");
+        }
+        // Existing direct SVG paths continue to obey their crop optimization.
+        let direct=render_scaled_region(&DisplayList(vec![path]),10,10,1.0,Some(&font),&mut GlyphCache::default()).unwrap();
+        assert!(direct.pixels.iter().all(|byte|*byte==0));
+    }
+
+    #[test]
+    fn specification_spatial_filter_source_capture_gaussian_and_ordered_shadow() {
+        use lumen_common::{filter::{FilterOperation as F,ColorFilter as C,DropShadowFilter},color::Color};
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let resolve=|filters:Vec<F>,rect:Rect,scale:f32,color:Rgba| {
+            let list=DisplayList(vec![Command::PushLayer{ svg_clip: None,filters:Some(Arc::from(filters)),corners:None,
+                rect,radius:0.0,opacity:1.0,clip:false},Command::FillRect{rect,color},Command::PopLayer]);
+            let resolved=rasterize_layers(&list,scale,&font,&mut GlyphCache::default()).unwrap();
+            let Command::Image{rect,image}=&resolved.0[0] else {panic!("filtered sprite missing")};
+            (*rect,image.clone())
+        };
+        let red=Rgba{r:255,g:0,b:0,a:255};
+        let mut prior=None;
+        for scale in [1.0,2.0] {
+            let rect=Rect{x:4.0/scale,y:4.0/scale,width:1.0/scale,height:1.0/scale};
+            let (crop,image)=resolve(vec![F::Blur(0.5/scale)],rect,scale,red);
+            assert_eq!(crop,Rect{x:2.0/scale,y:2.0/scale,width:5.0/scale,height:5.0/scale});
+            let pixel=|x:usize,y:usize|&image.pixels[(y*5+x)*4..(y*5+x)*4+4];
+            assert_eq!(pixel(2,2),[255,0,0,158]);assert_eq!(pixel(1,2),[255,0,0,21]);
+            assert_eq!(pixel(1,2),pixel(3,2));assert_eq!(pixel(2,1),pixel(2,3));
+            if let Some(previous)=prior {assert_eq!(previous,image.pixels);}prior=Some(image.pixels.clone());
+        }
+        let rect=Rect{x:4.0,y:4.0,width:1.0,height:1.0};
+        let (_,identity)=resolve(vec![F::Blur(0.0)],rect,1.0,Rgba{a:128,..red});
+        assert_eq!(identity.pixels,[255,0,0,128],"zero sigma preserves bytes and alpha exactly");
+        let shadow=F::DropShadow(Arc::new(DropShadowFilter{offset:[3.0,0.0],sigma:0.0,color:Color::rgba8([0,0,255,255])}));
+        let (crop,plain)=resolve(vec![shadow.clone()],rect,1.0,red);
+        assert_eq!(crop,Rect{x:4.0,y:4.0,width:4.0,height:1.0});
+        assert_eq!(&plain.pixels[..4],[255,0,0,255]);assert_eq!(&plain.pixels[12..16],[0,0,255,255]);
+        let (_,before)=resolve(vec![F::Color(C::Invert(1.0)),shadow.clone()],rect,1.0,red);
+        let (_,after)=resolve(vec![shadow.clone(),F::Color(C::Invert(1.0))],rect,1.0,red);
+        assert_eq!(&before.pixels[..4],[0,255,255,255]);assert_eq!(&before.pixels[12..16],[0,0,255,255]);
+        assert_eq!(&after.pixels[..4],[0,255,255,255]);assert_eq!(&after.pixels[12..16],[255,255,0,255]);
+        let (_,fractional)=resolve(vec![F::DropShadow(Arc::new(DropShadowFilter{offset:[0.5,0.0],sigma:0.0,color:Color::rgba8([0,0,255,255])}))],rect,1.0,red);
+        assert_eq!(&fractional.pixels[..4],[255,0,0,255]);assert_eq!(&fractional.pixels[4..8],[0,0,255,128]);
+    }
+
+    #[test]
+    fn specification_spatial_filter_source_and_output_clips_have_distinct_order() {
+        use lumen_common::filter::FilterOperation as F;
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let clip=Rect{x:2.0,y:2.0,width:1.0,height:1.0};
+        let source=Rect{x:3.0,y:2.0,width:1.0,height:1.0};
+        let make=|source_clip:bool| {
+            let mut commands=vec![Command::PushLayer{ svg_clip: None,filters:Some(Arc::from([F::Blur(0.5)])),corners:None,
+                rect:clip,radius:0.0,opacity:1.0,clip:!source_clip}];
+            if source_clip {commands.push(Command::PushClip(clip));}
+            commands.push(Command::FillRect{rect:source,color:Rgba{r:255,g:0,b:0,a:255}});
+            if source_clip {commands.push(Command::PopClip);}
+            commands.push(Command::PopLayer);DisplayList(commands)
+        };
+        for source_clip in [false,true] {
+            let resolved=rasterize_layers(&make(source_clip),1.0,&font,&mut GlyphCache::default()).unwrap();
+            let output=render_scaled_region(&resolved,6,5,1.0,Some(&font),&mut GlyphCache::default()).unwrap();
+            let at=(2*6+2)*4;
+            assert_eq!(&output.pixels[at..at+4],if source_clip {&[0,0,0,0]}else{&[255,0,0,21]},
+                "source clipping removes outside ink before blur; an output clip retains its blurred contribution");
+        }
+    }
+
+    #[test]
+    fn specification_spatial_filter_source_clip_bounds_avoid_invisible_surface_allocation() {
+        use lumen_common::filter::FilterOperation as F;
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let clip=Rect{x:4.0,y:4.0,width:1.0,height:1.0};
+        let list=DisplayList(vec![Command::PushLayer{ svg_clip: None,filters:Some(Arc::from([F::Blur(0.5)])),corners:None,
+            rect:clip,radius:0.0,opacity:1.0,clip:false},Command::PushBoxClip(clip),
+            Command::FillRect{rect:Rect{x:0.0,y:0.0,width:100000.0,height:100000.0},color:Rgba{r:255,g:0,b:0,a:255}},
+            Command::PopClip,Command::PopLayer]);
+        let resolved=rasterize_layers(&list,1.0,&font,&mut GlyphCache::default()).unwrap();
+        let Command::Image{rect,image}=&resolved.0[0] else {panic!("filtered source missing")};
+        assert_eq!(*rect,Rect{x:2.0,y:2.0,width:5.0,height:5.0});
+        assert_eq!(image.pixels.len(),100,"only clipped SourceGraphic and Gaussian support allocate");
+        assert_eq!(&image.pixels[(2*5+2)*4..(2*5+2)*4+4],[255,0,0,158]);
+    }
+
+    #[test]
+    fn specification_spatial_filter_scratch_is_bounded_and_large_sigma_reuses_shadow_kernel() {
+        let mut source=vec![0;31*31];source[15*31+15]=255;
+        let actual=blur_filter_plane(source.clone(),31,31,2.5,1.0,0).unwrap();
+        let mut expected=source.clone();shadow::blur_alpha_mask(&mut expected,31,31,5.0,1.0,0).unwrap();
+        assert_eq!(actual,expected);assert_eq!(filter_blur_padding(2.5,1.0).unwrap(),shadow::blur_padding(5.0).unwrap());
+        assert_eq!(blur_filter_plane(source,31,31,0.5,1.0,MAX_LAYER_BYTES),Err(ImageError::TooLarge));
+        for sigma in [-1.0,f32::NAN,f32::INFINITY] {assert!(filter_blur_padding(sigma,1.0).is_err());}
+    }
+
+    #[test]
+    fn specification_color_filters_group_overlap_and_apply_before_opacity() {
+        use lumen_common::filter::ColorFilter as F;
+        let rect = Rect { x: 4.0, y: 4.0, width: 4.0, height: 4.0 };
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let list = DisplayList(vec![
+            Command::PushLayer { svg_clip: None, filters: Some(Arc::from([F::Invert(1.0).into(), F::Opacity(0.5).into()])), corners: None,
+                rect, radius: 0.0, opacity: 0.5, clip: false },
+            Command::FillRect { rect, color: Rgba { r: 255, g: 0, b: 0, a: 255 } },
+            Command::FillRect { rect, color: Rgba { r: 0, g: 0, b: 255, a: 255 } },
+            Command::PopLayer,
+        ]);
+        for scale in [1.0, 1.25, 2.0] {
+            let resolved = rasterize_layers(&list, scale, &font, &mut GlyphCache::default()).unwrap();
+            let Command::Image { image, .. } = &resolved.0[0] else { panic!("shared filter layer sprite missing") };
+            assert!(image.pixels.chunks_exact(4).all(|p| p == [255, 255, 0, 64]), "the top blue child is inverted once and the two alpha factors multiply");
+        }
+        let source = "<style>body{margin:0}#host{margin:10px;filter:invert();overflow:hidden;width:20px;height:20px}#fixed{position:fixed;left:0;top:0;width:40px;height:10px;background:linear-gradient(to right,magenta 50%,cyan 50%)}</style><div id=host><div id=fixed></div></div>";
+        let reference = "<style>body{margin:0}div{margin:10px;width:20px;height:10px;background:lime}</style><div></div>";
+        for scale in [1.0, 2.0] {
+            assert_eq!(render_html_with_font(source, 60, 50, scale, &font).unwrap(), render_html_with_font(reference, 60, 50, scale, &font).unwrap(), "the shared filter establishes the fixed CB and clips the inverted magenta half");
+        }
+    }
+
+    #[test]
+    fn specification_svg_replay_clips_share_vector_and_group_sprite_coverage() {
+        use lumen_html::paint::{SvgPaint, SvgFillRule};
+        let bounds = Rect { x: 0.0, y: 0.0, width: 8.0, height: 8.0 };
+        let lime = Rgba { r: 0, g: 255, b: 0, a: 255 };
+        for scale in [1.0, 1.25, 2.0] {
+            for offset in [0.25, 0.5, 0.75] {
+                for translated in [false, true] {
+                    let clip = Rect { x: offset, y: offset, width: 3.0, height: 3.0 };
+                    let matrix = if translated { Affine { e: offset, f: -offset, ..Affine::IDENTITY } } else { Affine::IDENTITY };
+                    let path = Command::SvgPath { bounds, data: Arc::from("M-4 -4H12V12H-4Z"), transform: matrix,
+                        fill: Some(SvgPaint::Color(lime)), stroke: None, stroke_width: 0.0,
+                        fill_rule: SvgFillRule::NonZero, clips: Arc::from([]) };
+                    let direct = DisplayList(vec![Command::PushClip(clip), path.clone(), Command::PopClip]);
+                    let grouped = DisplayList(vec![Command::PushClip(clip),
+                        Command::PushLayer { svg_clip: None, filters: Some(Arc::from([lumen_common::filter::ColorFilter::Invert(0.0).into()])),
+                            corners: None, rect: bounds, radius: 0.0, opacity: 1.0, clip: false },
+                        path, Command::PopLayer, Command::PopClip]);
+                    let reference = DisplayList(vec![Command::PushClip(clip), Command::FillRect { rect: bounds, color: lime }, Command::PopClip]);
+                    let expected = render(&reference, 8, 8, scale, true).unwrap();
+                    if (clip.x * scale).fract() != 0.0 || ((clip.x + clip.width) * scale).fract() != 0.0 {
+                        assert!(expected.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0 && pixel[3] < 255), "fixture has fractional clip coverage");
+                    }
+                    assert!(expected.pixels.chunks_exact(4).any(|pixel| pixel == [0, 255, 0, 255]), "fixture has opaque interior ink");
+                    assert_eq!(render(&direct, 8, 8, scale, true).unwrap(), expected, "vector clip: scale={scale}, offset={offset}, translated={translated}");
+                    assert_eq!(render(&grouped, 8, 8, scale, true).unwrap(), expected, "group sprite clip: scale={scale}, offset={offset}, translated={translated}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specification_integral_square_group_clip_preserves_bounded_direct_replay() {
+        let clip = Rect { x: 2.0, y: 2.0, width: 4.0, height: 4.0 };
+        let blue = Rgba { r: 0, g: 0, b: 255, a: 255 };
+        let list = DisplayList(vec![Command::PushLayer { svg_clip: None, filters: None, corners: None,
+            rect: clip, radius: 0.0, opacity: 1.0, clip: true },
+            Command::FillRect { rect: Rect { x: -1000.0, y: -1000.0, width: 10000.0, height: 10000.0 }, color: blue },
+            Command::PopLayer]);
+        for scale in [1.0, 1.5, 2.0] {
+            let mut bytes = 0;
+            let resolved = resolve_layers(&list.0, scale, None, &mut GlyphCache::default(), &mut bytes).unwrap();
+            assert_eq!(bytes, 0, "binary clip needs no offscreen payload for oversized ink");
+            assert!(!resolved.0.iter().any(|command| matches!(command, Command::Image { .. })));
+            let reference = DisplayList(vec![Command::FillRect { rect: clip, color: blue }]);
+            assert_eq!(render(&list, 8, 8, scale, true).unwrap(), render(&reference, 8, 8, scale, true).unwrap());
+        }
+    }
+
+    #[test]
+    fn specification_color_filter_inline_and_svg_groups_share_host_compositor() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let inline = "<style>body{margin:0;font-size:0;line-height:0}#host{filter:invert()}i{display:inline-block;width:20px;height:10px;background:magenta}i+i{margin-left:-10px;background:cyan}</style><span id=host><i></i><i></i></span>";
+        let reference = inline.replace("filter:invert()", "filter:none").replace("background:magenta", "background:lime").replace("background:cyan", "background:red");
+        for scale in [1.0, 2.0] {
+            for nested in [false, true] {
+                let source = if nested { inline.replace("<span id=host>", "<span><span id=host>").replace("</span>", "</span></span>") } else { inline.into() };
+                let expected = if nested { reference.replace("<span id=host>", "<span><span id=host>").replace("</span>", "</span></span>") } else { reference.clone() };
+                assert_eq!(render_html_with_font(&source, 40, 20, scale, &font).unwrap(), render_html_with_font(&expected, 40, 20, scale, &font).unwrap(), "ordinary inline filter owns its overlapping atomic children: nested={nested}, scale={scale}");
+            }
+        }
+        for declaration in ["filter='invert()'", "style='filter:invert()'"] {
+            let source = format!("<style>body{{margin:0}}</style><svg width=20 height=10><g {declaration}><rect width=20 height=10 fill='magenta'/><rect x=10 width=10 height=10 fill='cyan'/></g></svg>");
+            let reference = "<style>body{margin:0}</style><svg width=20 height=10><rect width=20 height=10 fill='lime'/><rect x=10 width=10 height=10 fill='red'/></svg>";
+            let document = lumen_html::html::parse(&source, 64).unwrap();
+            let mut session = lumen_html::session::RenderSession::new(document);
+            assert!(session.unsupported_svg_features().unwrap().is_empty(), "{declaration}: SVG capability");
+            let svg = lumen_html::selector::query_selector(session.document(), session.document().root(), "svg").unwrap().unwrap();
+            let group = lumen_html::selector::query_selector(session.document(), session.document().root(), "g").unwrap().unwrap();
+            let first_rect = lumen_html::selector::query_selector(session.document(), session.document().root(), "rect").unwrap().unwrap();
+            let group_style = session.computed_style(group).unwrap();
+            assert_eq!(group_style.filters.as_deref(), Some(&[lumen_common::filter::FilterOperation::Color(lumen_common::filter::ColorFilter::Invert(1.0))][..]), "{declaration}: computed group filter");
+            assert_eq!(session.computed_style(first_rect).unwrap().svg_fill, lumen_html::css::SvgPaint::Color(Rgba { r: 255, g: 0, b: 255, a: 255 }), "{declaration}: first rectangle fill");
+            let svg_style = session.computed_style(svg).unwrap();
+            assert_eq!((svg_style.width, svg_style.height), (Some(20.0), Some(10.0)), "{declaration}: SVG viewport");
+            let list = lumen_html::layout::display_list(session.document(), 40, 20, &font).unwrap();
+            assert!(list.0.iter().any(|command| matches!(command, Command::PushLayer { filters: Some(filters), .. } if filters.as_ref() == [lumen_common::filter::FilterOperation::Color(lumen_common::filter::ColorFilter::Invert(1.0))])), "{declaration}: filter group command: {list:?}");
+            assert!(list.0.iter().any(|command| matches!(command, Command::SvgPath { .. })), "{declaration}: SVG shape commands: {list:?}");
+            assert_eq!(render_html_with_font(&source, 40, 20, 1.0, &font).unwrap(), render_html_with_font(reference, 40, 20, 1.0, &font).unwrap(), "{declaration}: presentation and CSS filters use the same group/cascade");
+        }
+    }
+
+    #[test]
+    fn specification_root_color_filter_owns_canvas_background_and_content_once() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        for source in ["html", "body"] {
+            let filtered = format!("<style>html{{filter:invert()}}{source}{{background:magenta}}body{{margin:0}}#content{{width:20px;height:10px;background:cyan}}</style><div id=content></div>");
+            let reference = format!("<style>{source}{{background:lime}}body{{margin:0}}#content{{width:20px;height:10px;background:red}}</style><div id=content></div>");
+            for scale in [1.0, 1.25, 2.0] {
+                assert_eq!(render_html_with_font(&filtered, 40, 20, scale, &font).unwrap(), render_html_with_font(&reference, 40, 20, scale, &font).unwrap(), "{source}: root filter includes viewport canvas and root content once");
+            }
+        }
+        let filtered = "<style>html{filter:invert();transform:translateX(10px)}body{margin:0;background:magenta}div{width:10px;height:10px;background:cyan}</style><div></div>";
+        let reference = "<style>html{transform:translateX(10px)}body{margin:0;background:lime}div{width:10px;height:10px;background:red}</style><div></div>";
+        assert_eq!(render_html_with_font(filtered, 40, 20, 1.0, &font).unwrap(), render_html_with_font(reference, 40, 20, 1.0, &font).unwrap(), "canvas remains untransformed while content is translated before filtering");
+    }
+
+    #[test]
+    fn specification_positive_axis_image_transform_paints_viewport_without_oversized_surface() {
+        let image=Arc::new(ImageData {width:2,height:2,pixels:vec![
+            255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255]});
+        let source=Rect {x:-300.0,y:0.0,width:1600.0,height:1200.0};
+        let transformed=DisplayList(vec![
+            Command::PushTransform(lumen_html::paint::Affine {a:0.5,d:0.5,e:150.0,..Default::default()}),
+            Command::PushClip(source),Command::Image {rect:source,image:image.clone()},
+            Command::PopClip,Command::PopTransform]);
+        let expected=DisplayList(vec![Command::Image {
+            rect:Rect{x:0.0,y:0.0,width:800.0,height:600.0},image}]);
+        for scale in [1.0,1.25] {
+            let actual=render(&transformed,800,600,scale,true).expect("positive image scaling paints directly within viewport budget");
+            assert_eq!(actual,render(&expected,800,600,scale,true).unwrap(),"image sampling and alpha stay equivalent at each device scale");
+        }
+    }
+
+    #[test]
+    fn specification_positive_axis_background_transform_preserves_tiles_without_oversized_surface() {
+        use lumen_html::paint::{Affine,BackgroundFill,BackgroundPaint,BackgroundRepeat};
+        let image=Arc::new(ImageData {width:2,height:2,pixels:vec![
+            255,0,0,255, 0,255,0,128, 0,0,255,255, 255,255,255,128]});
+        for repeat in [BackgroundRepeat::Repeat,BackgroundRepeat::NoRepeat,BackgroundRepeat::Space,BackgroundRepeat::Round] {
+            for vertical_scale in [0.5,0.75] {
+                let matrix=Affine {a:0.5,d:vertical_scale,e:150.0,..Default::default()};
+                let source=BackgroundFill {
+                    corners:None,radius:0.0,
+                    rect:Rect{x:-300.0,y:0.0,width:1600.0,height:1200.0},
+                    positioning_rect:Rect{x:50.0,y:40.0,width:400.0,height:300.0},
+                    image_rect:Rect{x:-300.0,y:0.0,width:200.0,height:200.0},
+                    repeat:[repeat;2],image:BackgroundPaint::Image(image.clone()),
+                };
+                let expected=BackgroundFill {
+                    rect:Rect{x:0.0,y:0.0,width:800.0,height:1200.0*vertical_scale},
+                    positioning_rect:Rect{x:175.0,y:40.0*vertical_scale,width:200.0,height:300.0*vertical_scale},
+                    image_rect:Rect{x:0.0,y:0.0,width:100.0,height:200.0*vertical_scale},
+                    ..source.clone()
+                };
+                let transformed=DisplayList(vec![Command::PushTransform(matrix),
+                    Command::FillBackground(Box::new(source)),Command::PopTransform]);
+                let expected=DisplayList(vec![Command::FillBackground(Box::new(expected))]);
+                let mut bytes=0;
+                assert_eq!(resolve_layers(&transformed.0,1.0,None,&mut GlyphCache::default(),&mut bytes).unwrap(),expected);
+                assert_eq!(bytes,0,"tile coordinates transform without a raster plane or image copy");
+                for scale in [1.0,1.25] {
+                    assert_eq!(render(&transformed,800,600,scale,true).unwrap(),
+                        render(&expected,800,600,scale,true).unwrap(),"repeat, clipping and alpha at device scale {scale}");
+                }
+            }
         }
     }
 
@@ -3086,7 +4171,8 @@ mod tests {
                 e: -8.0,
                 ..Default::default()
             }),
-            Command::PushLayer {
+            Command::PushLayer { svg_clip: None,
+                filters: None,
                 corners: None,
                 rect,
                 radius: 0.0,
@@ -3121,7 +4207,8 @@ mod tests {
             height: 8.0,
         };
         let list = DisplayList(vec![
-            Command::PushLayer {
+            Command::PushLayer { svg_clip: None,
+                filters: None,
                 corners: None,
                 rect,
                 radius: 4.0,
@@ -3143,7 +4230,8 @@ mod tests {
         assert_eq!(image.pixels[3], 0);
         assert_eq!(image.pixels[(4 * 8 + 4) * 4 + 3], 255);
         let invalid = DisplayList(vec![
-            Command::PushLayer {
+            Command::PushLayer { svg_clip: None,
+                filters: None,
                 corners: None,
                 rect,
                 radius: 0.0,
@@ -3162,7 +4250,8 @@ mod tests {
             ..rect
         };
         let large = DisplayList(vec![
-            Command::PushLayer {
+            Command::PushLayer { svg_clip: None,
+                filters: None,
                 corners: None,
                 rect: huge,
                 radius: 0.0,
@@ -3320,6 +4409,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&page.pixels[page.pixels.len() - 4..], &[32, 48, 64, 255]);
+    }
+
+    #[test]
+    fn specification_background_text_masks_ignore_descendant_color_filter_compositing() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let source = "<style>body{margin:0;background:white}div{font-size:24px;width:60px;height:30px;background:lime;background-clip:text;color:transparent}</style><div><span style='filter:opacity(.5)'>A</span></div>";
+        let reference = source.replace("filter:opacity(.5)", "opacity:.5");
+        for scale in [1.0, 2.0] {
+            let expected = render_html_with_font(&reference, 60, 30, scale, &font).unwrap();
+            assert!(expected.pixels.chunks_exact(4).any(|p| p[1] > p[0]), "the actual glyph mask paints green ink");
+            assert_eq!(render_html_with_font(source, 60, 30, scale, &font).unwrap(), expected,
+                "child filter-opacity and child opacity affect foreground groups, not the parent's glyph-coverage mask");
+        }
     }
 
     #[test]
@@ -4146,6 +5248,120 @@ mod tests {
     }
 
     #[test]
+    fn specification_background_shorthand_actual_color_invalidation_and_multilayer_clip_raster() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
+        for shorthand in ["linear-gradient(transparent,transparent) 0/10px 20px no-repeat, none currentcolor","none content-box, none border-box currentcolor","rgb(from currentcolor r g b)"] {
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}#target{{width:30px;height:20px;padding:5px;border:3px solid transparent;background:{shorthand}}}</style><div id=target style='color:red'></div>");
+            let document=lumen_html::html::parse(&markup,64).unwrap();let node=lumen_html::selector::query_selector(&document,document.root(),"#target").unwrap().unwrap();
+            let mut session=lumen_html::session::RenderSession::new(document);
+            for color in ["red","blue"] {
+                session.document_mut().set_attribute(node,"style",&format!("color:{color}")).unwrap();
+                let actual=session.display_list(100,80,&font).unwrap().clone();
+                let reference=markup.replace("style='color:red'",&format!("style='color:{color}'")).replace("currentcolor",color);
+                let expected=lumen_html::layout::display_list(&lumen_html::html::parse(&reference,64).unwrap(),100,80,&font).unwrap();
+                assert_eq!(actual,expected,"actual currentColor source follows own color mutation: {shorthand} {color}");
+                assert_eq!(actual,*session.display_list(100,80,&font).unwrap(),"stable frame replay");
+                for scale in [1.0,1.25] {assert_eq!(render_with_font_cached(&actual,100,80,scale,true,&font,&mut cache).unwrap(),render_with_font_cached(&expected,100,80,scale,true,&font,&mut cache).unwrap());}
+            }
+        }
+        let source="<!doctype html><style>html,body{margin:0}div{width:30px;height:20px;padding:5px;border:3px solid transparent;background:none content-box, none border-box green}</style><div></div>";
+        let reference=source.replace("none content-box, none border-box green","green");
+        let actual=lumen_html::layout::display_list(&lumen_html::html::parse(source,64).unwrap(),100,80,&font).unwrap();
+        let expected=lumen_html::layout::display_list(&lumen_html::html::parse(&reference,64).unwrap(),100,80,&font).unwrap();
+        assert_eq!(render_with_font_cached(&actual,100,80,1.25,true,&font,&mut cache).unwrap(),render_with_font_cached(&expected,100,80,1.25,true,&font,&mut cache).unwrap(),"last none layer's border-box clip paints beneath the transparent border");
+    }
+
+    #[test]
+    fn specification_computed_inheritance_query_percentage_matches_real_declaring_container_raster() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
+        for (expression,computed) in [
+            ("calc(10cqw + 10%)","calc(30px + 10%)"),
+            ("min(calc(10cqw + 10%), 70px)","min(calc(30px + 10%), 70px)"),
+            ("clamp(20px, calc(10cqw + 10%), 60px)","clamp(20px, calc(30px + 10%), 60px)")] {
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}#outer{{width:300px;container-type:inline-size}}#parent{{width:200px;container-type:inline-size;margin:{expression};padding:{expression};background:blue}}#child{{width:50px;height:30px;margin:inherit;padding:inherit;background:green}}</style><div id=outer><div id=parent><div id=child></div></div></div>");
+            let reference=markup.replace("margin:inherit;padding:inherit",&format!("margin:{computed};padding:{computed}"));
+            let actual=lumen_html::layout::display_list(&lumen_html::html::parse(&markup,64).unwrap(),600,400,&font).unwrap();
+            let expected=lumen_html::layout::display_list(&lumen_html::html::parse(&reference,64).unwrap(),600,400,&font).unwrap();
+            assert_eq!(actual,expected,"parent query terms must not use the child query container: {expression}");
+            for scale in [1.0,1.25] {assert_eq!(render_with_font_cached(&actual,600,400,scale,true,&font,&mut cache).unwrap(),render_with_font_cached(&expected,600,400,scale,true,&font,&mut cache).unwrap());}
+        }
+    }
+
+    #[test]
+    fn specification_border_logical_pairs_match_actual_physical_edges_and_raster() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
+        for (mode,direction,physical) in [
+            ("horizontal-tb","ltr","border-top:3px double red;border-right:2px dashed green;border-bottom:4px dotted transparent;border-left:1px solid blue"),
+            ("vertical-rl","rtl","border-top:2px dashed green;border-right:3px double red;border-bottom:1px solid blue;border-left:4px dotted transparent"),
+            ("vertical-lr","ltr","border-top:1px solid blue;border-right:4px dotted transparent;border-bottom:2px dashed green;border-left:3px double red")] {
+            let pairs="border-inline-width:1px 2px;border-block-width:3px 4px;border-inline-style:solid dashed;border-block-style:double dotted;border-inline-color:blue green;border-block-color:red transparent";
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}div{{writing-mode:{mode};direction:{direction};width:30px;height:20px;{pairs}}}</style><div></div>");
+            let reference=markup.replace(pairs,physical);
+            let actual=lumen_html::layout::display_list(&lumen_html::html::parse(&markup,64).unwrap(),100,80,&font).unwrap();
+            let expected=lumen_html::layout::display_list(&lumen_html::html::parse(&reference,64).unwrap(),100,80,&font).unwrap();
+            assert_eq!(actual,expected,"{mode} {direction}");
+            for scale in [1.0,1.25] {assert_eq!(render_with_font_cached(&actual,100,80,scale,true,&font,&mut cache).unwrap(),render_with_font_cached(&expected,100,80,scale,true,&font,&mut cache).unwrap());}
+        }
+    }
+
+    #[test]
+    fn specification_border_inherited_computed_widths_match_actual_raster_and_layout() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
+        let mut cache=GlyphCache::default();
+        for style in ["none","hidden","solid"] {
+            for inherited in ["border-width:inherit","border-top-width:inherit;border-right-width:inherit;border-bottom-width:inherit;border-left-width:inherit",
+                "border-block-start-width:inherit;border-block-end-width:inherit;border-inline-start-width:inherit;border-inline-end-width:inherit"] {
+                let markup=format!("<!doctype html><style>html,body{{margin:0}}#parent{{font-size:10px;border:2em {style} transparent}}#child{{font-size:100px;width:30px;height:20px;border-style:solid;border-color:green;{inherited}}}</style><div id=parent><div id=child></div></div>");
+                let reference=markup.replace(inherited,"border-width:20px");
+                let document=lumen_html::html::parse(&markup,64).unwrap();
+                let reference=lumen_html::html::parse(&reference,64).unwrap();
+                let actual=lumen_html::layout::display_list(&document,160,120,&font).unwrap();
+                let expected=lumen_html::layout::display_list(&reference,160,120,&font).unwrap();
+                assert_eq!(actual,expected,"computed width controls actual box edges, not merely CSSOM: {style} {inherited}");
+                for scale in [1.0,1.25] {
+                    assert_eq!(render_with_font_cached(&actual,160,120,scale,true,&font,&mut cache).unwrap(),
+                        render_with_font_cached(&expected,160,120,scale,true,&font,&mut cache).unwrap(),"{style} {inherited} scale {scale}");
+                }
+            }
+        }
+        let source="<!doctype html><style>html,body{margin:0}div{width:20px;height:20px;font-size:10px;color:green;border-top:calc(1em + 5px) solid;border-right:THIN solid;border-bottom:2em double;border-left:3em dashed}</style><div></div>";
+        let reference=source.replace("calc(1em + 5px)","15px").replace("THIN","1px").replace("2em","20px").replace("3em","30px");
+        let document=lumen_html::html::parse(source,64).unwrap();let reference=lumen_html::html::parse(&reference,64).unwrap();
+        let actual=lumen_html::layout::display_list(&document,160,120,&font).unwrap();let expected=lumen_html::layout::display_list(&reference,160,120,&font).unwrap();
+        assert_eq!(actual,expected,"all side styles share actual font-relative computed lengths and border commands");
+        assert_eq!(render_with_font_cached(&actual,160,120,1.25,true,&font,&mut cache).unwrap(),render_with_font_cached(&expected,160,120,1.25,true,&font,&mut cache).unwrap());
+    }
+
+    #[test]
+    fn specification_text_shadow_raster_uses_real_cached_glyphs_and_decoration_masks() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
+        for decor in ["","text-decoration:underline line-through;text-decoration-color:transparent;"] {
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}div{{font-size:16px;color:transparent;{decor}text-shadow:3px 0 red}}</style><div>ABC</div>");
+            let source=lumen_html::html::parse(&markup,64).unwrap();let list=lumen_html::layout::display_list(&source,120,60,&font).unwrap();
+            let image=render_with_font_cached(&list,120,60,1.0,true,&font,&mut cache).unwrap();
+            let reference=markup.replace("text-shadow:3px 0 red","text-shadow:none;position:relative;left:3px").replace("color:transparent","color:red");
+            let reference=lumen_html::html::parse(&reference,64).unwrap();let reference=lumen_html::layout::display_list(&reference,120,60,&font).unwrap();
+            assert_eq!(image,render_with_font_cached(&reference,120,60,1.0,true,&font,&mut cache).unwrap(),"glyphs and decorations shadow their real coverage");
+        }
+        for fragment in ["", "div::first-line{color:lime}"] {
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}body{{color:blue;text-shadow:3px 0 currentcolor}}div{{color:red;font-size:16px}}{fragment}</style><div>ABC</div>");
+            let source=lumen_html::html::parse(&markup,64).unwrap();let list=lumen_html::layout::display_list(&source,120,60,&font).unwrap();
+            let reference=markup.replace("currentcolor",if fragment.is_empty(){"red"}else{"lime"});
+            let reference=lumen_html::html::parse(&reference,64).unwrap();let reference=lumen_html::layout::display_list(&reference,120,60,&font).unwrap();
+            assert_eq!(render_with_font_cached(&list,120,60,1.0,true,&font,&mut cache).unwrap(),render_with_font_cached(&reference,120,60,1.0,true,&font,&mut cache).unwrap(),"inherited currentcolor follows actual descendant and first-line ink");
+        }
+        let entries=cache.glyphs.len();assert!(entries>0&&cache.bytes()<=GLYPH_CACHE_BYTES);
+        let source=lumen_html::html::parse("<!doctype html><style>html,body{margin:0}div{font-size:16px;color:transparent;text-shadow:0 0 2px red,0 0 blue}</style><div>ABC</div>",64).unwrap();
+        let list=lumen_html::layout::display_list(&source,120,60,&font).unwrap();let first=render_with_font_cached(&list,120,60,1.0,true,&font,&mut cache).unwrap();
+        assert!(first.pixels.chunks_exact(4).any(|pixel|pixel[0]>pixel[1]&&pixel[1]>0&&pixel[1]<255),"Gaussian alpha blur actually paints surrounding ink");
+        assert_eq!(first,render_with_font_cached(&list,120,60,1.0,true,&font,&mut cache).unwrap());assert_eq!(entries,cache.glyphs.len());
+        let huge=Command::MaskedBackground(Box::new(lumen_html::paint::MaskedBackground{rect:Rect{x:0.0,y:0.0,width:4000.0,height:4000.0},text_clipped:false,shadow_blur:Some(20.0),
+            paint:Box::new(Command::FillRect{rect:Rect{x:0.0,y:0.0,width:4000.0,height:4000.0},color:Rgba{r:255,g:0,b:0,a:255}}),
+            mask:Arc::new(DisplayList(vec![Command::FillRect{rect:Rect{x:0.0,y:0.0,width:1.0,height:1.0},color:Rgba{r:255,g:255,b:255,a:255}}])),offset:[0.0,0.0]}));
+        assert_eq!(resolve_layers(&[huge],1.0,Some(&font),&mut cache,&mut 0),Err(ImageError::TooLarge),"peak shadow workspace is rejected before allocation");
+    }
+
+    #[test]
     fn glyph_cache_reuses_rasters_across_frames_and_separates_fonts() {
         let document = lumen_html::html::parse("<p>Hello</p>", 8).unwrap();
         let font = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
@@ -4160,5 +5376,50 @@ mod tests {
         let other = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
         render_with_font_cached(&list, 80, 30, 1.0, true, &other, &mut cache).unwrap();
         assert_eq!(cache.glyphs.len(), entries * 2);
+    }    #[test]
+    fn specification_background_size_math_actual_query_font_and_nonlinear_raster() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();let mut cache=GlyphCache::default();
+        for (area, width) in [(40,20),(100,50),(200,80)] {
+            let markup=format!("<!doctype html><style>html,body{{margin:0}}div{{width:{area}px;height:100px;background:linear-gradient(green,green) 0/min(50%, 80px) clamp(10px,25%,50px) no-repeat}}</style><div></div>");
+            let reference=markup.replace("min(50%, 80px)",&format!("{width}px")).replace("clamp(10px,25%,50px)","25px");
+            let actual=lumen_html::html::parse(&markup,64).unwrap();let expected=lumen_html::html::parse(&reference,64).unwrap();
+            let actual=lumen_html::layout::display_list(&actual,300,150,&font).unwrap();let expected=lumen_html::layout::display_list(&expected,300,150,&font).unwrap();
+            assert_eq!(actual,expected);
+            for scale in [1.0,1.25] {assert_eq!(render_with_font_cached(&actual,300,150,scale,true,&font,&mut cache).unwrap(),
+                render_with_font_cached(&expected,300,150,scale,true,&font,&mut cache).unwrap());}
+        }
+        let source="<!doctype html><style>html,body{margin:0}#container{width:300px;container-type:inline-size}#target{width:200px;height:100px;font-size:10cqw;background:linear-gradient(green,green) 0/min(50%, 2em) calc(25% + 10cqw) no-repeat}</style><div id=container><div id=target></div></div>";
+        let expected=source.replace("min(50%, 2em)","60px").replace("calc(25% + 10cqw)","55px");
+        let source=lumen_html::html::parse(source,64).unwrap();let expected=lumen_html::html::parse(&expected,64).unwrap();
+        let actual=lumen_html::layout::display_list(&source,400,150,&font).unwrap();let expected=lumen_html::layout::display_list(&expected,400,150,&font).unwrap();
+        assert_eq!(actual,expected,"original declaring container and final query font resolve before actual area math");
+        assert_eq!(render_with_font_cached(&actual,400,150,1.25,true,&font,&mut cache).unwrap(),
+            render_with_font_cached(&expected,400,150,1.25,true,&font,&mut cache).unwrap());
     }
+
+    #[test]
+    fn specification_appearance_paints_native_state_and_primitive_css_pixels() {
+        let font=FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
+        let mut cache=GlyphCache::default();
+        let source="<!doctype html><style>html,body{margin:0}input{all:unset;display:inline-block;width:20px;height:20px;vertical-align:top;color:black;background:white}</style><input type=checkbox checked style='appearance:auto'>";
+        let native=lumen_html::html::parse(source,64).unwrap();
+        let native=lumen_html::layout::display_list(&native,40,30,&font).unwrap();
+        let native=render_with_font_cached(&native,40,30,1.0,true,&font,&mut cache).unwrap();
+        let center=(10*40+10)*4;
+        assert_eq!(&native.pixels[center..center+4],&[0,0,0,255],"real native checked mark");
+        let primitive=lumen_html::html::parse(&source.replace("appearance:auto","appearance:none"),64).unwrap();
+        let primitive=lumen_html::layout::display_list(&primitive,40,30,&font).unwrap();
+        let primitive=render_with_font_cached(&primitive,40,30,1.0,true,&font,&mut cache).unwrap();
+        assert_eq!(&primitive.pixels[center..center+4],&[255,255,255,255],"decorative checked mark suppressed");
+        let reference=source.replace("input{","div{").replace("<input type=checkbox checked style='appearance:auto'>","<div></div>");
+        let reference=lumen_html::html::parse(&reference,64).unwrap();
+        let reference=lumen_html::layout::display_list(&reference,40,30,&font).unwrap();
+        assert_eq!(primitive,render_with_font_cached(&reference,40,30,1.0,true,&font,&mut cache).unwrap(),"primitive control uses genuine ordinary CSS paint");
+        let range=source.replace("type=checkbox checked","type=range min=0 max=100 value=50").replace("appearance:auto","appearance:none");
+        let range=lumen_html::html::parse(&range,64).unwrap();
+        let range=lumen_html::layout::display_list(&range,40,30,&font).unwrap();
+        let range=render_with_font_cached(&range,40,30,1.0,true,&font,&mut cache).unwrap();
+        assert!(range.pixels.chunks_exact(4).any(|pixel|pixel==[0,0,0,255]),"primitive range retains actual operating thumb");
+    }
+
 }

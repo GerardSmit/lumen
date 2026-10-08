@@ -215,6 +215,22 @@ mod tests {
 }
 
 impl Document {
+    /// The implicit details content slot contains every ordinary child except
+    /// the first HTML summary. Ancestor revealing shares that slot assignment.
+    pub fn details_content_parent(&self, node: NodeId) -> Option<NodeId> {
+        let parent = self.parent(node).ok()??;
+        if self.details_open_state(parent)? { return None; }
+        let mut child = self.first_child(parent).ok()?;
+        while let Some(candidate) = child {
+            if matches!(self.kind(candidate).ok(),Some(NodeKind::Element {
+                namespace:Namespace::Html,name,.. }) if svg::local_name(name)=="summary") {
+                return (candidate!=node).then_some(parent);
+            }
+            child=self.next_sibling(candidate).ok()?;
+        }
+        Some(parent)
+    }
+
     /// Resolve the nearest summary activation target in the ordinary tree.
     /// Interactive descendants own their interaction; only the first HTML
     /// summary child of an HTML details may activate that details element.
@@ -283,7 +299,7 @@ impl Document {
         self.details_sink = sink;
     }
 
-    pub(crate) fn details_open_state(&self, id: NodeId) -> Option<bool> {
+    pub fn details_open_state(&self, id: NodeId) -> Option<bool> {
         match self.kind(id).ok()? {
             NodeKind::Element { namespace: Namespace::Html, name, .. }
                 if svg::local_name(name) == "details" =>

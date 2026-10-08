@@ -1464,6 +1464,10 @@ impl Interp {
         if !itfn.is_callable() {
             return Err(self.throw("TypeError", "value is not iterable"));
         }
+        self.get_iterator_from_method(v,itfn)
+    }
+
+    pub(crate) fn get_iterator_from_method(&mut self,v:&Value,itfn:Value)->Result<(Value,Value),Abrupt> {
         let iter = self.call(itfn, v.clone(), &[])?;
         // GetIteratorFromMethod: the iterator must be an object.
         if !matches!(iter, Value::Obj(_)) {
@@ -3085,13 +3089,13 @@ impl Interp {
     }
 
     /// `super(...)` after its arguments evaluated: IsConstructor, Construct(parent, argv,
-    /// new.target) on `this`, BindThisValue (with the base-constructor return override) and the
+    /// new.target), BindThisValue and the
     /// instance field initializers. Returns the (possibly overridden) `this`.
     pub(crate) fn super_call_complete(
         &mut self,
         env: &Env,
         parent: Value,
-        this: Value,
+        _this: Value,
         argv: Vec<Value>,
     ) -> Result<Value, Abrupt> {
         let this_env = {
@@ -3117,8 +3121,8 @@ impl Interp {
         }
         // Construct(parent, args, GetNewTarget()): the parent runs with the derived
         // constructor's active newTarget.
-        self.pending_new_target = self.new_target.clone();
-        let returned = self.run_constructor_on(&parent, &this, &argv)?;
+        let new_target = self.new_target.clone();
+        let returned = self.construct_nt(parent, &argv, new_target)?;
         // BindThisValue: an already-initialized `this` (a second super()) is a
         // ReferenceError — but only after the arguments and parent construct ran.
         {
@@ -3131,30 +3135,9 @@ impl Interp {
         // A base constructor that returns an object overrides `this` for the derived
         // constructor (and everything downstream: field initializers, super.x accesses,
         // the implicit return).
-        let this = match (&returned, &this) {
-            (Value::Obj(r), Value::Obj(t)) if !Gc::ptr_eq(r, t) => {
-                let mut cur = Some(env.clone());
-                while let Some(scope) = cur {
-                    let done = {
-                        let mut b = scope.borrow_mut();
-                        if let Some(bd) = b.vars.get_mut("this") {
-                            bd.value = returned.clone();
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if done {
-                        break;
-                    }
-                    let parent_scope = scope.borrow().parent.clone();
-                    cur = parent_scope;
-                }
-                returned.clone()
-            }
-            _ => this,
-        };
+        let this = returned;
         if let Some(bd) = this_env.borrow_mut().vars.get_mut("this") {
+            bd.value = this.clone();
             bd.initialized = true;
         }
         let this_ctor = self.get_var("%thisctor%", env)?;
@@ -3593,7 +3576,9 @@ impl Interp {
         if let Some(target) = Self::promise_target(&v) {
             let tracked = {
                 let mut object = target.borrow_mut();
-                let Callable::Promise(slot) = &mut object.call else { unreachable!() };
+                let Callable::Promise(slot) = &mut object.call else {
+                    unreachable!()
+                };
                 slot.handled = true;
                 std::mem::replace(&mut slot.tracked, false)
             };
@@ -3623,9 +3608,8 @@ impl Interp {
     ) -> R {
         let obj = Object::new_bare(self.promise_proto());
         let realm_key = Gc::as_ptr(&self.global) as usize;
-        obj.borrow_mut().call = Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed(
-            realm_key,
-        ));
+        obj.borrow_mut().call =
+            Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed(realm_key));
         let p = Value::Obj(obj);
         let registered = register(self, p.clone());
         if self.promise_hooks.is_some() {
@@ -3661,14 +3645,19 @@ impl Interp {
     /// reaction, dependent promise, hook or late rejection-handled notification.
     /// Non-promises are ignored without thenable or property coercion.
     pub fn mark_promise_handled(&mut self, promise: &Value) -> bool {
-        let Some(target) = Self::promise_target(promise) else { return false };
+        let Some(target) = Self::promise_target(promise) else {
+            return false;
+        };
         {
             let mut object = target.borrow_mut();
-            let Callable::Promise(slot) = &mut object.call else { unreachable!() };
+            let Callable::Promise(slot) = &mut object.call else {
+                unreachable!()
+            };
             slot.handled = true;
             slot.tracked = false;
         }
-        self.unhandled_rejections.remove(&(Gc::as_ptr(&target) as usize));
+        self.unhandled_rejections
+            .remove(&(Gc::as_ptr(&target) as usize));
         true
     }
 
@@ -3967,12 +3956,18 @@ impl Interp {
     }
 
     fn run_task_job(&mut self, job: crate::interpreter::Job) {
+        // Throws need not be Error objects. Capture callback provenance before
+        // invocation, including a callable proxy which revokes itself.
+        let global=job.handler.as_obj().cloned().and_then(|object|
+            self.get_function_realm_global(&object).ok().flatten())
+            .and_then(|key|self.realms.get(&key).map(|realm|realm.global.clone()))
+            .unwrap_or_else(||self.global.clone());
         let outer = std::mem::replace(&mut self.async_context, job.context.into_value());
         let outcome = self.call(job.handler, Value::Undefined, &[]);
         self.async_context = outer;
         if let Err(Abrupt::Throw(e)) = outcome {
             if let Some(errors) = self.task_errors.as_mut() {
-                errors.push(e);
+                errors.push((e,Value::Obj(global)));
             } else {
                 let p = self.new_promise();
                 self.reject_promise(&p, e);
@@ -5410,8 +5405,7 @@ impl Interp {
                                 Callable::Promise(slot) => slot.realm_key,
                                 _ => Gc::as_ptr(&self.global) as usize,
                             };
-                            let mut fwd =
-                                crate::eval::promise_fast::PromiseSlot::boxed(realm_key);
+                            let mut fwd = crate::eval::promise_fast::PromiseSlot::boxed(realm_key);
                             fwd.status = crate::eval::promise_fast::FORWARDED;
                             fwd.value = this.clone();
                             let slot = std::mem::replace(
@@ -5433,7 +5427,8 @@ impl Interp {
                             }
                             if let Some(handled) = self.late_handled_rejections.as_mut() {
                                 for promise in handled {
-                                    if matches!(promise, Value::Obj(object) if Gc::ptr_eq(object, src)) {
+                                    if matches!(promise, Value::Obj(object) if Gc::ptr_eq(object, src))
+                                    {
                                         *promise = this.clone();
                                     }
                                 }
@@ -6013,9 +6008,8 @@ impl Interp {
                         let key_value = self
                             .sym_from_key(prop)
                             .unwrap_or_else(|| Value::from_string(prop.to_owned()));
-                        let operation = crate::embed_realms::WindowProxyOperation::Delete {
-                            key: key_value,
-                        };
+                        let operation =
+                            crate::embed_realms::WindowProxyOperation::Delete { key: key_value };
                         if let Some(decision) = self.window_proxy_decision(o, operation)? {
                             let success = match decision {
                                 crate::embed_realms::WindowProxyDecision::Handled(
@@ -6032,11 +6026,7 @@ impl Interp {
                                         !self.window_proxy_child_at(&forward, index)?.is_some()
                                     } else {
                                         matches!(
-                                            self.delete_prop_with(
-                                                forward.target,
-                                                prop,
-                                                strict,
-                                            )?,
+                                            self.delete_prop_with(forward.target, prop, strict,)?,
                                             Value::Bool(true)
                                         )
                                     }
@@ -7533,7 +7523,9 @@ impl Interp {
     }
 
     /// IsConstructor: whether `v` has a [[Construct]] internal method.
-    pub(crate) fn value_is_constructor(&self, v: &Value) -> bool {
+    /// ECMAScript IsConstructor, including bound functions and proxies, without
+    /// invoking author callbacks. Shared by the engine and native platform bindings.
+    pub fn value_is_constructor(&self, v: &Value) -> bool {
         let Value::Obj(o) = v else { return false };
         let b = o.borrow();
         // A proxy or bound function is a constructor exactly when its target is; both record

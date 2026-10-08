@@ -278,6 +278,9 @@ struct WorkerSpec {
     is_shared: bool,
     is_remote: bool,
     is_eval: bool,
+    /// Entry bytes captured from the creator's object-URL registry before the worker starts.
+    /// A failed lookup is reported asynchronously through the ordinary worker error channel.
+    blob_entry: Option<Result<String, String>>,
     /// Initial URL used to construct the web worker's immutable `WorkerLocation`.
     location_href: Option<String>,
     name: String,
@@ -287,6 +290,7 @@ struct WorkerSpec {
     /// The parent's embedding, when the parent realm runs inside a host process: a worker must
     /// not fall back to the host's own cwd, stdio and process.
     embedding: Option<crate::WorkerEmbedding>,
+    database_backend: Option<lumen_host::indexed_db::SharedBackend>,
     /// Immutable snapshot of the parent's per-runtime HTTP routes and trust roots.
     fetch_config: lumen_web::FetchConfig,
     origin: Option<String>,
@@ -400,9 +404,29 @@ struct ThreadBackend;
 
 impl WorkerBackend for ThreadBackend {
     fn spawn_dedicated(&self, ctx: &mut Ctx, spec: DedicatedSpec) -> NativeResult<u64> {
-        let (entry, is_remote, origin, location_href) = match &spec.owner_origin {
-            Some(owner) => prepare_web_worker_entry(&spec.url, owner)?,
-            None => (spec.url.clone(), false, None, None),
+        let is_blob = spec.url.starts_with("blob:");
+        let blob_entry = is_blob.then(|| {
+            lumen_host::blob::object_url_resource(ctx, &spec.url)
+                .ok_or_else(|| "cannot fetch worker script: Blob URL is unavailable".to_owned())
+                .and_then(|resource| {
+                    // Classic worker fetching only checks JavaScript MIME for HTTP(S).
+                    // Module fetching requires JavaScript MIME for every scheme.
+                    if spec.module && !lumen_web::is_javascript_module_mime(Some(&resource.content_type)) {
+                        return Err(format!("worker script has a non-JavaScript MIME type: {}", resource.content_type));
+                    }
+                    let text = String::from_utf8_lossy(&resource.bytes);
+                    Ok(crate::import_source_text(
+                        text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned(),
+                    ))
+                })
+        });
+        let (entry, is_remote, origin, location_href) = if is_blob {
+            (spec.url.clone(), false, spec.owner_origin.clone(), Some(spec.url.clone()))
+        } else {
+            match &spec.owner_origin {
+                Some(owner) => prepare_web_worker_entry(&spec.url, owner)?,
+                None => (spec.url.clone(), false, None, None),
+            }
         };
         let stop = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
@@ -415,11 +439,13 @@ impl WorkerBackend for ThreadBackend {
             is_shared: false,
             is_remote,
             is_eval: false,
+            blob_entry,
             location_href,
             name: spec.name,
             init: None,
             thread_id,
             embedding: ctx.op_state().get::<crate::WorkerEmbedding>().cloned(),
+            database_backend: Some(lumen_html_js::indexed_db::backend(ctx)),
             fetch_config: ctx
                 .op_state()
                 .get::<lumen_web::FetchConfig>()
@@ -542,11 +568,13 @@ fn get_or_start_shared_worker(
         is_shared: true,
         is_remote,
         is_eval: false,
+        blob_entry: None,
         location_href,
         name: key.name.clone(),
         init: None,
         thread_id,
         embedding: ctx.op_state().get::<crate::WorkerEmbedding>().cloned(),
+        database_backend: Some(lumen_html_js::indexed_db::backend(ctx)),
         fetch_config: ctx
             .op_state()
             .get::<lumen_web::FetchConfig>()
@@ -892,6 +920,10 @@ fn run_worker(
             parent.send(ToMain::Error("worker canvas installation failed".to_string()));
             return;
         }
+        if lumen_html_js::install_worker_geometry(rt.engine().ctx()).is_err() {
+            parent.send(ToMain::Error("worker geometry installation failed".to_string()));
+            return;
+        }
     }
     if spec.is_node {
         rt.engine().ctx().op_state().put(WorkerSelf {
@@ -939,6 +971,23 @@ fn run_worker(
         None
     };
 
+    if let Some(Err(error)) = &spec.blob_entry {
+        parent.send(ToMain::Error(error.clone()));
+        return;
+    }
+
+    if !spec.is_node {
+        let base_url = remote_entry.as_ref()
+            .map(|resource| resource.url.as_str())
+            .or(spec.location_href.as_deref())
+            .unwrap_or(&spec.entry);
+        let loader = Rc::new(crate::worker_fonts::WorkerFontLoader::new(spec.fetch_config.clone()));
+        if let Err(error) = lumen_html_js::install_worker_fonts(rt.engine().ctx(), base_url, loader) {
+            parent.send(ToMain::Error(format!("worker font installation failed: {error:?}")));
+            return;
+        }
+    }
+
     // The per-realm bootstrap: a DedicatedWorkerGlobalScope or SharedWorkerGlobalScope for web
     // workers, and worker_threads wiring (parentPort/workerData/threadId/process patches) for
     // node workers.
@@ -950,6 +999,15 @@ fn run_worker(
             .map(|resource| resource.url.clone())
             .or_else(|| spec.location_href.clone())
             .unwrap_or_else(|| spec.entry.clone());
+        let storage_key = spec.origin.clone().unwrap_or_else(|| {
+            lumen_common::url::parse(&location, None).map(|url| url.origin()).unwrap_or_else(|_| "null".into())
+        });
+        if let Some(backend) = spec.database_backend.take() {
+            if lumen_html_js::indexed_db::install_worker(rt.engine().ctx(), storage_key, backend).is_err() {
+                parent.send(ToMain::Error("worker IndexedDB installation failed".to_string()));
+                return;
+            }
+        }
         let host = Rc::new(ScopeHost {
             kind: if spec.is_shared {
                 ScopeKind::Shared
@@ -1008,7 +1066,12 @@ fn run_worker(
     }
 
     let is_module = spec.is_module;
-    let entry_result = if spec.is_eval {
+    let entry_result = if let Some(source) = &spec.blob_entry {
+        match source {
+            Ok(source) => rt.eval_worker_entry(source, &spec.entry, is_module),
+            Err(error) => Err(error.clone()),
+        }
+    } else if spec.is_eval {
         let cwd = match &spec.embedding {
             Some(embedding) => Ok(embedding.cwd.clone()),
             None => std::env::current_dir(),
@@ -1349,11 +1412,13 @@ mod worker_ops {
             is_shared: false,
             is_remote: false,
             is_eval,
+            blob_entry: None,
             location_href: None,
             name: String::new(),
             init,
             thread_id,
             embedding,
+            database_backend: None,
             fetch_config,
             origin: None,
             shared_key: None,

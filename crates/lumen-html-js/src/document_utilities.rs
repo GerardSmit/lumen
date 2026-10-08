@@ -25,6 +25,7 @@ impl DomParser {
                 Rc::new(DocumentIdentity {
                     origin: RefCell::new(browsing_context::invocation_origin(ctx)),
                     url: RefCell::new(None),
+                    creation_global: RefCell::new(None),
                 })
             });
         Self { document_identity }
@@ -33,21 +34,7 @@ impl DomParser {
     #[method(coerce)]
     fn parse_from_string(&self, ctx: &mut Ctx, input: &str, mime_type: &str) -> OpResult<Value> {
         if mime_type == "text/html" {
-            let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
-            let document = html::parse_with_options_initialized(
-                input, MAX_PARSED_NODES, html::ParseOptions::default(),
-                |document| controller.attach(document),
-            ).map_err(|error| {
-                OpError::new(
-                    "SyntaxError",
-                    format!("HTML parse error at {}: {}", error.offset, error.message),
-                )
-            })?;
-            let realm = DomRealm::realm_from_document(document);
-            self.set_parsed_document_identity(&realm);
-            super::observers::attach_parsed_realm(ctx, &realm)?;
-            controller.bind(ctx, &realm);
-            return Ok(realm.document_value(ctx));
+            return parse_html_document(ctx, input, false, |realm| self.set_parsed_document_identity(realm));
         }
         let xml_type = [
             "text/xml",
@@ -60,9 +47,12 @@ impl DomParser {
         if !xml_type {
             return Err(OpError::new("TypeError", "unsupported DOMParser MIME type"));
         }
+        // XML consumes Unicode scalar values. Keep ordinary input borrowed and
+        // repair only the WTF-8 lone surrogates admitted by JS DOMString.
+        let input = lumen::well_formed_utf8(input);
         let prepared = super::dialog_popover::DetailsController::prepare(ctx)?;
         let (document, controller) = match lumen_html::xml::parse_initialized(
-            input, MAX_PARSED_NODES, |document| prepared.attach(document),
+            &input, MAX_PARSED_NODES, |document| prepared.attach(document),
         ) {
             Ok(document) => (document, prepared),
             Err(error) => {
@@ -84,6 +74,41 @@ impl DomParser {
         // A document parsed this way never aliases the active page's NodeIds.
         Ok(realm.document_value(ctx))
     }
+}
+
+fn parse_html_document(
+    ctx: &mut Ctx,
+    input: &str,
+    allow_declarative_shadow_roots: bool,
+    configure: impl FnOnce(&DomRealm),
+) -> OpResult<Value> {
+    let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
+    let document = html::parse_with_options_initialized(
+        input,
+        MAX_PARSED_NODES,
+        html::ParseOptions { allow_declarative_shadow_roots, ..html::ParseOptions::default() },
+        |document| controller.attach(document),
+    ).map_err(|error| OpError::new(
+        "SyntaxError",
+        format!("HTML parse error at {}: {}", error.offset, error.message),
+    ))?;
+    let realm = DomRealm::realm_from_document(document);
+    configure(&realm);
+    super::observers::attach_parsed_realm(ctx, &realm)?;
+    controller.bind(ctx, &realm);
+    Ok(realm.document_value(ctx))
+}
+
+pub(crate) fn parse_html_unsafe(ctx: &mut Ctx, input: &str, options: Option<Value>) -> OpResult<Value> {
+    super::shadow::html_unsafe_options(ctx, options, false)?;
+    let origin = window_globals::current_dom_realm(ctx)
+        .and_then(|realm| realm.document_identity.origin.borrow().clone())
+        .or_else(|| browsing_context::invocation_origin(ctx))
+        .unwrap_or_else(browsing_context::Origin::opaque);
+    parse_html_document(ctx, input, true, |realm| {
+        realm.set_document_url("about:blank");
+        realm.set_document_origin(origin);
+    })
 }
 
 impl DomParser {
@@ -119,8 +144,13 @@ impl XmlSerializer {
 
     fn serialize_to_string(&self, ctx: &mut Ctx, root: &DomNode) -> OpResult<String> {
         let result = {
-            let session = root.realm.session.borrow();
-            lumen_html::xml::serialize_xml(session.document(), root.id, false)
+            if root.realm.template_graph_owners.borrow().is_empty() {
+                let session = root.realm.session.borrow();
+                lumen_html::xml::serialize_xml(session.document(), root.id, false)
+            } else {
+                let graph = super::template_graph::ArenaGraph::new(&root.realm)?;
+                lumen_html::xml::serialize_xml_with_graph(&graph, root.id, false)
+            }
         };
         result.map_err(|error| {
             if error == lumen_html::Error::WrongKind {
@@ -824,7 +854,7 @@ impl DomNodeIterator {
                 return Ok(Value::Null);
             };
             reference = candidate;
-            if self.filter.accept(ctx, &realm, candidate)? != FILTER_REJECT {
+            if self.filter.accept(ctx, &realm, candidate)? == FILTER_ACCEPT {
                 self.state.reference.set(reference);
                 self.state.before_reference.set(before);
                 return Ok(realm.wrap(ctx, candidate));
@@ -1000,6 +1030,43 @@ mod tests {
         engine.collect_garbage();
         assert!(crate::scheduling::run_tasks(&mut engine, 8).is_empty());
         assert!(eval_bool(&mut engine, "parsedDetailsEvents.length === 2 && parsedDetailsEvents.every(Boolean)"));
+    }
+
+    #[test]
+    fn parse_html_unsafe_shares_inert_document_lifecycle_with_explicit_shadow_permission() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<main>live</main>", 64).unwrap();
+        realm.set_document_url("https://parse.example.test/path");
+        realm.set_document_origin(browsing_context::Origin::from_url("https://parse.example.test/path"));
+        assert!(eval_bool(&mut engine, r#"
+            var source='<!doctype html><section id=host><template shadowrootmode=open shadowrootserializable><b>shadow</b></template><em>light</em></section><noscript><p>fallback</p></noscript><script>globalThis.parsedUnsafeScript=1</'+'script>';
+            var parsed=Document.parseHTMLUnsafe(source);
+            var host=parsed.getElementById('host');
+            var ordinary=new DOMParser().parseFromString(source,'text/html');
+            function requireParsed(condition,label){if(!condition)throw new Error('parseHTMLUnsafe: '+label)}
+            requireParsed(parsed instanceof Document && parsed!==document,'distinct Document identity');
+            requireParsed(parsed.contentType==='text/html','HTML contentType');
+            requireParsed(parsed.compatMode==='CSS1Compat','standards mode');
+            requireParsed(parsed.URL==='about:blank' && parsed.documentURI==='about:blank' && parsed.baseURI==='about:blank','URL/documentURI/baseURI');
+            requireParsed(parsed.domain===document.domain && parsed.domain==='parse.example.test','inherited domain');
+            requireParsed(parsed.characterSet==='UTF-8','UTF-8 encoding');
+            requireParsed(parsed.defaultView===null && parsed.location===null,'detached browsing context');
+            requireParsed(host.ownerDocument===parsed,'ownerDocument identity');
+            requireParsed(host.shadowRoot!==null && host.shadowRoot.firstChild.textContent==='shadow','declarative shadow tree');
+            requireParsed(host.shadowRoot.serializable && host.innerHTML==='<em>light</em>','shadow metadata/light tree');
+            requireParsed(host.getHTML({serializableShadowRoots:true})==='<template shadowrootmode="open" shadowrootserializable=""><b>shadow</b></template><em>light</em>','shadow serialization');
+            requireParsed(parsed.querySelector('noscript p').textContent==='fallback','inert noscript parsing');
+            requireParsed(parsed.querySelector('script')!==null && parsed.querySelector('script').textContent==='globalThis.parsedUnsafeScript=1' && globalThis.parsedUnsafeScript===undefined,'retained inert script');
+            requireParsed(ordinary.getElementById('host').shadowRoot===null && ordinary.getElementById('host').firstChild instanceof HTMLTemplateElement,'ordinary DOMParser opt-out');
+            requireParsed(ordinary.URL==='https://parse.example.test/path','DOMParser creator URL');
+            requireParsed(Document.parseHTMLUnsafe('',null).compatMode==='BackCompat','empty/null options quirks mode');
+            requireParsed(document.querySelector('main').textContent==='live','creator document unchanged');
+            true
+        "#));
+        engine.collect_garbage();
+        assert!(eval_bool(&mut engine, "parsed.getElementById('host')===host && host.shadowRoot.firstChild.textContent==='shadow' && parsed.querySelector('script').ownerDocument===parsed"));
+        realm.set_document_origin(browsing_context::Origin::opaque());
+        assert!(eval_bool(&mut engine, "document.domain==='' && Document.parseHTMLUnsafe('').domain==='' && parsed.domain==='parse.example.test'"));
     }
 
     #[test]
@@ -1263,7 +1330,7 @@ mod tests {
         super::super::install(engine.ctx(), "<main><b><i></i></b><u></u></main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
-            "const root=document.querySelector('main'); const it=document.createNodeIterator(root,1,n=>n.tagName==='B'?2:1); const first=it.nextNode()===root; const second=it.nextNode().tagName==='I'; const third=it.nextNode().tagName==='U'; const end=it.nextNode()===null; const back=it.previousNode().tagName==='U'; first&&second&&third&&end&&back&&it.root===root&&it.referenceNode.tagName==='U'&&it.pointerBeforeReferenceNode"
+            "const root=document.querySelector('main'); const it=document.createNodeIterator(root,1,n=>n.tagName==='B'?2:1); const first=it.nextNode()===root; const second=it.nextNode().tagName==='I'; const third=it.nextNode().tagName==='U'; const end=it.nextNode()===null; const back=it.previousNode().tagName==='U'; const skipped=document.createNodeIterator(root,1,n=>n.tagName==='B'?3:1); const skipOk=skipped.nextNode()===root&&skipped.nextNode().tagName==='I'&&skipped.nextNode().tagName==='U'&&skipped.nextNode()===null&&skipped.previousNode().tagName==='U'&&skipped.previousNode().tagName==='I'; first&&second&&third&&end&&back&&skipOk&&it.root===root&&it.referenceNode.tagName==='U'&&it.pointerBeforeReferenceNode"
         ));
     }
 

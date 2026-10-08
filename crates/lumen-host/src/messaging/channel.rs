@@ -198,7 +198,7 @@ fn on_wake(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) {
 
 /// Read a message that arrived with its attachments (the service-worker mailboxes carry whole
 /// `CloneMessage`s): the data or the `messageerror` reason, and the ports it brought.
-pub(crate) fn deserialize_message(
+pub fn deserialize_message(
     ctx: &mut Ctx,
     message: clone_transfer::CloneMessage,
 ) -> OpResult<(Result<Value, OpError>, Vec<Value>)> {
@@ -211,7 +211,7 @@ pub(crate) fn deserialize_message(
 
 /// `postMessage(message, transfer)` into a [`CloneMessage`] a host queues itself: the same
 /// transfer-list handling and limits as a port.
-pub(crate) fn serialize_message(
+pub fn serialize_message(
     ctx: &mut Ctx,
     message: Value,
     transfer: Value,

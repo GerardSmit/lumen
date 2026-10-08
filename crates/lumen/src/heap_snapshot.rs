@@ -123,6 +123,9 @@ impl crate::Engine {
         {
             return Err("snapshot module initialization is incomplete or failed".into());
         }
+        if i.modules.iter().any(|(key,_)|key.module_type().is_some()) {
+            return Err("snapshot format cannot represent typed module identities".into());
+        }
         let mut global_var_names: Vec<_> = i.global_var_names.iter().cloned().collect();
         global_var_names.sort();
         let mut capture = Capture {

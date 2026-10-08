@@ -122,6 +122,9 @@ impl ScopeCounts {
 
 #[derive(Default)]
 struct Tracer {
+    // Native callable dispatch identifies its realm through Function.prototype.
+    // Preserve that reverse edge only when the prototype is actually reached.
+    realm_function_prototypes: FastMap<usize, usize>,
     objects: Vec<*const ObjCell>,
     wide: Vec<(*const ObjCell, usize)>,
     scopes: Vec<ScopePtr>,
@@ -159,6 +162,11 @@ impl Interp {
     /// The scopes `o` refers to: a user function's closure environment, a mapped `arguments`
     /// object's aliased parameter scope, and a class constructor's field-initializer environment.
     fn visit_object_scopes(&self, o: &Gc, f: &mut impl FnMut(&Env)) {
+        if let Some(bindings) = self.module_ns.get(&(Gc::as_ptr(o) as usize)) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Live(environment, _) = binding { f(environment); }
+            }
+        }
         #[cfg(feature = "aot-native")]
         if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) {
             f(&class.env);
@@ -195,6 +203,9 @@ impl Interp {
     fn trace_object(&self, p: *const ObjCell, tr: &mut Tracer, weak_live: &mut Vec<usize>) {
         // SAFETY: a marked object is alive and nothing is released during marking.
         let o = ManuallyDrop::new(unsafe { Gc::from_raw(p) });
+        if let Some(realm) = tr.realm_function_prototypes.get(&(p as usize)).and_then(|key|self.realms.get(key)) {
+            tr.mark_obj(&realm.global);
+        }
         {
             let b = o.borrow();
             visit_object_head(&b, true, &mut |c| tr.mark_obj(c));
@@ -223,6 +234,23 @@ impl Interp {
             }
         }
         self.visit_object_scopes(&o, &mut |e| tr.mark_scope(Rc::as_ptr(e)));
+        for record in self.module_recs.for_settings(p as usize) {
+            tr.mark_scope(Rc::as_ptr(record.environment()));
+            record.visit_values(|value| {
+                if let Value::Obj(object) = value { tr.mark_obj(object); }
+            });
+        }
+        for value in self.deferred_ns_objs.for_settings(p as usize) {
+            if let Value::Obj(object) = value { tr.mark_obj(object); }
+        }
+        for value in self.modules.for_settings(p as usize) {
+            if let Value::Obj(object) = value { tr.mark_obj(object); }
+        }
+        if let Some(bindings) = self.module_ns.get(&(p as usize)) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Static(Value::Obj(object)) = binding { tr.mark_obj(object); }
+            }
+        }
         #[cfg(feature = "aot-native")]
         if let Some(class) = self.native_classes.get(&(p as usize)) {
             class.visit_values(|value| {
@@ -246,6 +274,9 @@ impl Interp {
                 tr.mark_obj(object);
             }
         });
+        #[cfg(feature = "embed")]
+        crate::embed_convert::trace_host_class_cache(self, p as usize, &mut |object| tr.mark_obj(object));
+        self.lang.trace_intrinsic_edges(p as usize, &mut |object| tr.mark_obj(object));
         #[cfg(feature = "embed")]
         if let Some(target) = self.window_proxy_target(p as usize) {
             if let Value::Obj(target) = target {
@@ -331,6 +362,31 @@ impl Interp {
         for o in self.gc_pins.values() {
             o.gc_add_ref();
         }
+        // These are physical handles in settings-owned maps, not external VM
+        // roots. A reached global traces its own map; a reached namespace traces
+        // its bindings through visit_object_scopes/trace_object above.
+        for record in self.module_recs.all_values() {
+            counts.add(Rc::as_ptr(record.environment()));
+            record.visit_values(|value| {
+                if let Value::Obj(object) = value { object.gc_add_ref(); }
+            });
+        }
+        for value in self.deferred_ns_objs.all_values() {
+            if let Value::Obj(object) = value { object.gc_add_ref(); }
+        }
+        for value in self.modules.all_values() {
+            if let Value::Obj(object) = value { object.gc_add_ref(); }
+        }
+        for bindings in self.module_ns.values() {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Static(Value::Obj(object)) = binding { object.gc_add_ref(); }
+            }
+        }
+        // The HTMLDDA identity list is branding bookkeeping, not an owner.
+        for object in &self.htmldda { object.gc_add_ref(); }
+        self.lang.count_intrinsic_edges(&mut |object| object.gc_add_ref());
+        #[cfg(feature = "embed")]
+        crate::embed_convert::count_host_class_cache_edges(self, &mut |object| object.gc_add_ref());
         #[cfg(feature = "embed")]
         crate::embed_convert::count_host_identity_owner_pins(self, &mut |value| {
             if let Value::Obj(object) = value {
@@ -391,6 +447,10 @@ impl Interp {
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
         // Interp's own fields, module/realm registries, coroutine threads).
         let mut tr = Tracer::default();
+        if vm_realms {
+            tr.realm_function_prototypes.extend(self.realms.iter().filter(|(_, realm)|realm.collectable)
+                .map(|(key, realm)|(Gc::as_ptr(&realm.function_proto) as usize,*key)));
+        }
         #[cfg(all(feature = "compiler", feature = "jit"))]
         if let Some(units) = &self.snapshot_cjs {
             for unit in units.borrow().iter().flatten() {
@@ -506,6 +566,9 @@ impl Interp {
         let marked = tr.marked;
         // Realms whose global died go with their objects (held until the sweep is over).
         let mut dead_realms = Vec::new();
+        let mut dead_module_maps = Vec::new();
+        let mut dead_deferred_maps = Vec::new();
+        let mut dead_namespaces = Vec::new();
         if vm_realms {
             let dead: Vec<usize> = self
                 .realms
@@ -514,6 +577,14 @@ impl Interp {
                 .map(|(k, _)| *k)
                 .collect();
             for k in dead {
+                self.module_fetch_loaders.remove(&k);
+                self.import_maps.remove(&k);
+                self.module_api_bases.remove(&k);
+                self.module_synthetic_factories.remove(&k);
+                self.async_module_import_handlers.remove(&k);
+                if let Some(map) = self.module_recs.remove_settings(k) { dead_module_maps.push(map); }
+                if let Some(map) = self.deferred_ns_objs.remove_settings(k) { dead_deferred_maps.push(map); }
+                if let Some(map) = self.modules.remove_settings(k) { dead_namespaces.push(map); }
                 if let Some(r) = self.realms.remove(&k) {
                     if let Some(ef) = &r.eval_fn {
                         self.eval_realm_fns.remove(&(Gc::as_ptr(ef) as usize));
@@ -541,6 +612,11 @@ impl Interp {
             }
         }
 
+        let mut dead_htmldda = Vec::new();
+        self.htmldda.retain(|object| {
+            if object.gc_marked() { true }
+            else { dead_htmldda.push(object.clone()); false }
+        });
         // Collect the garbage, holding it strongly, and reset the scratch of every node for the
         // next collection.
         let mut garbage: Vec<Gc> =
@@ -568,6 +644,9 @@ impl Interp {
         // tables so a future object reusing the address can't inherit stale metadata.
         #[cfg(not(target_arch = "wasm32"))]
         let garbage_count = garbage.len();
+        #[cfg(feature = "embed")]
+        crate::embed_convert::sweep_host_class_cache(self, &garbage);
+        self.lang.sweep_intrinsics(&garbage);
         for o in &garbage {
             let ptr = Gc::as_ptr(o) as usize;
             #[cfg(feature = "embed")]
@@ -633,6 +712,7 @@ impl Interp {
         drop(dead_scopes);
         drop(removed);
         drop(dead_realms);
+        drop(dead_htmldda);
         // FinalizationRegistry targets may have died: the next checkpoint scans for them.
         self.weak_note_collection();
         value::gc_trim_heap();
@@ -666,15 +746,18 @@ impl Interp {
     /// Debug: `LUMEN_GC_DUMP=1` prints each external-rooted node's shape (its first prop names)
     /// with strong/internal counts — the fastest way to see WHAT pins a leaked graph.
     fn gc_dump_roots(&self, counts: &ScopeCounts) {
+        let limit=std::env::var("LUMEN_GC_DUMP_LIMIT").ok()
+            .and_then(|value|value.parse::<usize>().ok()).unwrap_or(60).min(65_536);
         let mut shown = 0;
         value::gc_for_each_live(|o| {
-            if !o.gc_marked() || shown >= 60 {
+            if !o.gc_marked() || Gc::strong_count(o) <= o.gc_refs() as usize || shown >= limit {
                 return;
             }
             let b = o.borrow();
             let keys: Vec<Rc<str>> = b.props.iter().take(4).map(|(k, _)| k).collect();
             eprintln!(
-                "[gc-dump] root strong={} internal={} props={keys:?}",
+                "[gc-dump] root identity={:#x} strong={} internal={} props={keys:?}",
+                Gc::as_ptr(o) as usize,
                 Gc::strong_count(o),
                 o.gc_refs(),
             );
@@ -685,12 +768,12 @@ impl Interp {
             for w in reg {
                 let internal = counts.get(w.as_ptr());
                 let strong = w.strong_count();
-                if strong <= internal || shown >= 40 {
+                if strong <= internal || shown >= limit {
                     continue;
                 }
                 let b = unsafe { &*w.as_ptr() }.borrow();
                 let vars: Vec<&str> = b.vars.keys().take(6).map(|k| &**k).collect();
-                eprintln!("[gc-dump] scope-root strong={strong} internal={internal} vars={vars:?}");
+                eprintln!("[gc-dump] scope-root identity={:#x} strong={strong} internal={internal} vars={vars:?}",w.as_ptr() as usize);
                 shown += 1;
             }
         });

@@ -85,9 +85,7 @@ impl SharedBufferHandle {
         if max_len < len {
             return Err(());
         }
-        bytes
-            .try_reserve_exact(max_len - len)
-            .map_err(|_| ())?;
+        bytes.try_reserve_exact(max_len - len).map_err(|_| ())?;
         self.max_len = self.max_len.max(max_len);
         Ok(())
     }
@@ -302,9 +300,10 @@ impl Interp {
     /// checkpoint ends, as a throwing `queueMicrotask` callback is; `false` when the embedder
     /// does not collect such errors.
     pub fn report_task_error(&mut self, error: Value) -> bool {
+        let global=Value::Obj(self.global.clone());
         match self.task_errors.as_mut() {
             Some(errors) => {
-                errors.push(error);
+                errors.push((error,global));
                 true
             }
             None => false,
@@ -1061,15 +1060,16 @@ pub struct Interp {
     pub(crate) import_meta: Option<Value>,
     /// Default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub(crate) import_base: String,
+    pub(crate) classic_script_context: Option<Rc<crate::ClassicScriptContext>>,
     /// Loaded module namespace objects, keyed by canonical specifier (for `import()` + caching).
-    pub(crate) modules: std::collections::HashMap<String, Value>,
+    pub(crate) modules: crate::modules::SettingsModuleMap<Value>,
     /// Names explicitly supplied by the host's fingerprinted native module table.
     pub(crate) native_module_names: std::collections::HashSet<String>,
     /// Host native bindings, keyed by the manifest's module and exported name.
     pub(crate) native_bindings: std::collections::HashMap<(String, String), (u64, usize)>,
     /// Full module records (parsed body, environment, resolved export tables, evaluation status),
     /// keyed by canonical specifier. Drives the two-phase Instantiate/Evaluate module linking.
-    pub(crate) module_recs: std::collections::HashMap<String, crate::modules::ModuleRec>,
+    pub(crate) module_recs: crate::modules::SettingsModuleMap<crate::modules::ModuleRec>,
     /// Host module loader: `(specifier, referrer, attr_type)` → `(canonical_key, source)`.
     /// `attr_type` is the import's `with { type: ... }` attribute — an attribute-aware host
     /// returns RAW file contents for `json`/`text`/`bytes` (binary latin-1-decoded, one char per
@@ -1079,9 +1079,13 @@ pub struct Interp {
         Option<Rc<dyn Fn(&str, &str, Option<&str>) -> Option<(String, String)>>>,
     /// Optional asynchronous module request bridge used by browser embedders.
     #[allow(clippy::type_complexity)]
-    pub(crate) async_module_import_handler: Option<Rc<dyn Fn(crate::AsyncModuleImportRequest)>>,
+    pub(crate) async_module_import_handlers: std::collections::HashMap<usize, Rc<dyn Fn(crate::AsyncModuleImportRequest)>>,
+    pub(crate) module_api_bases: std::collections::HashMap<usize, Rc<dyn Fn() -> String>>,
+    pub(crate) import_maps: std::collections::HashMap<usize, lumen_common::import_maps::SharedImportMap>,
+    pub(crate) module_fetch_loaders: std::collections::HashMap<usize, Rc<dyn Fn(crate::ModuleFetchRequest) -> Option<crate::ModuleFetchResult>>>,
+    pub(crate) module_synthetic_factories: std::collections::HashMap<usize,std::collections::HashMap<String,crate::modules::ModuleSyntheticFactory>>,
     pub(crate) pending_async_module_imports:
-        std::collections::HashMap<u64, (crate::AsyncModuleImportRequest, Value)>,
+        std::collections::HashMap<u64, (crate::AsyncModuleImportRequest, Value, Gc)>,
     pub(crate) next_async_module_import_id: u64,
     pub(crate) jsx_options: crate::parser::JsxOptions,
     #[allow(clippy::type_complexity)]
@@ -1207,7 +1211,9 @@ pub struct Interp {
     pub(crate) late_handled_rejections: Option<Vec<Value>>,
     /// Errors thrown by `queueMicrotask` callbacks, when the embedder reports them as uncaught
     /// exceptions (see [`Interp::set_report_task_errors`]).
-    pub(crate) task_errors: Option<Vec<Value>>,
+    // The reporting global is transient ownership: primitive throws and foreign
+    // Error objects do not otherwise identify the source job's realm.
+    pub(crate) task_errors: Option<Vec<(Value, Value)>>,
     /// Called as `(type, promise, value)` when a promise's resolving function runs after it was
     /// already resolved (V8's kPromiseResolveAfterResolved / kPromiseRejectAfterResolved).
     pub(crate) multiple_resolves_hook: Option<Value>,
@@ -1331,9 +1337,9 @@ pub struct Interp {
     pub(crate) annexb_fn_sync: crate::fasthash::FastMap<usize, Rc<Function>>,
     /// `import defer` namespaces awaiting first access: namespace object ptr → module key.
     /// Accessing a property of one evaluates the module (then the entry is removed).
-    pub(crate) deferred_ns: crate::fasthash::FastMap<usize, String>,
+    pub(crate) deferred_ns: crate::fasthash::FastMap<usize, crate::modules::DeferredModuleKey>,
     /// module key → its (single) deferred namespace object.
-    pub(crate) deferred_ns_objs: crate::fasthash::FastMap<String, Value>,
+    pub(crate) deferred_ns_objs: crate::modules::SettingsModuleMap<Value>,
     /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
@@ -1561,6 +1567,10 @@ impl Interp {
 
     /// Install a realm's intrinsics as the active ones.
     pub(crate) fn restore_realm(&mut self, r: &RealmState) {
+        let settings = Gc::as_ptr(&r.global) as usize;
+        self.module_recs.select(settings);
+        self.modules.select(settings);
+        self.deferred_ns_objs.select(settings);
         self.global = r.global.clone();
         self.global_this = r.global_this.clone();
         self.global_env = r.global_env.clone();
@@ -1641,6 +1651,10 @@ impl Interp {
         self.boolean_proto = boolean_proto;
         self.symbol_proto = symbol_proto;
         self.global = global.clone();
+        let settings = Gc::as_ptr(&global) as usize;
+        self.module_recs.select(settings);
+        self.modules.select(settings);
+        self.deferred_ns_objs.select(settings);
         self.global_this = Value::Obj(global.clone());
         self.global_env = new_var_scope(None);
         self.error_protos = Default::default();
@@ -2012,12 +2026,17 @@ impl Interp {
             short_circuit: false,
             import_meta: None,
             import_base: String::new(),
+            classic_script_context: None,
             modules: Default::default(),
             native_module_names: Default::default(),
             native_bindings: Default::default(),
             module_recs: Default::default(),
             module_loader: None,
-            async_module_import_handler: None,
+            async_module_import_handlers: Default::default(),
+            module_synthetic_factories: Default::default(),
+            module_api_bases: Default::default(),
+            import_maps: Default::default(),
+            module_fetch_loaders: Default::default(),
             pending_async_module_imports: Default::default(),
             next_async_module_import_id: 1,
             jsx_options: Default::default(),
@@ -2159,6 +2178,10 @@ impl Interp {
         // Register the main realm so a call back into main-realm code from inside another realm
         // swaps the main intrinsics back in (see `callee_realm_global`).
         let main = interp.snapshot_realm();
+        let settings = Gc::as_ptr(&interp.global) as usize;
+        interp.module_recs.select(settings);
+        interp.modules.select(settings);
+        interp.deferred_ns_objs.select(settings);
         interp
             .realms
             .insert(Gc::as_ptr(&interp.global) as usize, main);
@@ -2516,6 +2539,30 @@ impl Interp {
         )
     }
 
+    /// Perform intrinsic `Reflect.defineProperty` without reading author-visible globals.
+    pub fn reflect_define_property(&mut self,target:&Value,key:&Value,descriptor:&Value)->Result<bool,Value> {
+        match crate::builtins::reflect::reflect_define(self,Value::Undefined,&[target.clone(),key.clone(),descriptor.clone()])? {
+            Value::Bool(success)=>Ok(success),
+            _=>unreachable!("intrinsic Reflect.defineProperty always returns a boolean"),
+        }
+    }
+
+    /// Perform intrinsic `Reflect.setPrototypeOf` without reading author-visible globals.
+    pub fn reflect_set_prototype_of(
+        &mut self,
+        target: &Value,
+        prototype: &Value,
+    ) -> Result<bool, Value> {
+        match crate::builtins::reflect::reflect_set_prototype_of(
+            self,
+            Value::Undefined,
+            &[target.clone(), prototype.clone()],
+        )? {
+            Value::Bool(success) => Ok(success),
+            _ => unreachable!("intrinsic Reflect.setPrototypeOf always returns a boolean"),
+        }
+    }
+
     /// Create an ordinary ECMAScript Proxy using the engine's intrinsic Proxy implementation,
     /// without reading the mutable `Proxy` binding from the current global object.
     pub fn create_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Value> {
@@ -2523,6 +2570,18 @@ impl Interp {
     }
 
     /// [[Set]] for embedders (see [`Self::member_get`]).
+    /// Returns the internal success flag without applying the caller's strict-mode policy.
+    /// A rejected write returns `false`; exceptions from getters, setters or proxies propagate.
+    pub fn member_try_set(&mut self, base: &Value, key: &str, value: Value) -> Result<bool, Value> {
+        // set_member_recv also implements PutValue paths; like intrinsic Reflect.set's
+        // forwarding path, suppress that policy while running the internal operation.
+        let saved = core::mem::replace(&mut self.strict, false);
+        let result = self.set_member_recv(base, key, value, base.clone());
+        self.strict = saved;
+        result.map_err(abrupt_value)
+    }
+
+    /// [[Set]] for embedders using the current script's strict-mode policy.
     pub fn member_set(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Value> {
         self.set_member(base, key, value).map_err(|a| match a {
             Abrupt::Throw(v) => v,
@@ -3161,11 +3220,7 @@ impl Interp {
     /// Read a live TypedArray's exact byte range without allocating a copy.
     /// The callback must not execute JavaScript or access the backing buffer again:
     /// ordinary buffers remain borrowed and shared buffers remain locked until it returns.
-    pub fn with_typed_array_bytes<R>(
-        &self,
-        v: &Value,
-        read: impl FnOnce(&[u8]) -> R,
-    ) -> Option<R> {
+    pub fn with_typed_array_bytes<R>(&self, v: &Value, read: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
@@ -3173,10 +3228,8 @@ impl Interp {
             .copied()?;
         let bytes = self.ta_len(&info)?.checked_mul(info.kind.elsize())?;
         let end = info.offset.checked_add(bytes)?;
-        self.with_buffer_bytes(info.buffer, |buffer| {
-            buffer.get(info.offset..end).map(read)
-        })
-        .flatten()
+        self.with_buffer_bytes(info.buffer, |buffer| buffer.get(info.offset..end).map(read))
+            .flatten()
     }
 
     /// Write a live TypedArray's exact byte range in place (a shared buffer stays locked while
@@ -3444,12 +3497,11 @@ impl Interp {
                 Property::data(Value::from_string(name), false, false, true),
             );
             // A sloppy ordinary function's own legacy `arguments` / `caller` (V8's order).
-            if crate::bytecode::reflect::is_legacy(&func) {
-                for (k, prop) in crate::bytecode::reflect::own_props(self)
-                    .into_iter()
-                    .flatten()
-                {
-                    p.insert(k, prop);
+            // AST templates contain no realm Values: closures fill these
+            // descriptor slots from their own realm after choosing the map.
+            if crate::bytecode::reflect::is_legacy(&func) && crate::bytecode::reflect::own_props_ready(self) {
+                for key in ["arguments","caller"] {
+                    p.insert(key,Property::accessor_prop(None,None,false,false));
                 }
             }
             let mut eager = None;
@@ -3515,6 +3567,12 @@ impl Interp {
                 _ => fn_map.clone(),
             },
         };
+        let mut props=props;
+        if crate::bytecode::reflect::is_legacy(&func) {
+            for (key,property) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
+                props.insert(key,property);
+            }
+        }
         let obj = Object::new_with_parts(Some(fn_proto), props, Exotic::None);
         obj.borrow_mut().call = Callable::user(func.clone(), env);
         if lazy {
@@ -4839,6 +4897,7 @@ impl Interp {
 
     /// Register a materializer for a lazily published global (`global` + `name`). Reflection on
     /// the global object runs it first, so the lazy accessor is never observable.
+    #[cfg(feature = "embed")]
     pub(crate) fn register_lazy_global(
         &mut self,
         global: &Gc,
@@ -4870,11 +4929,7 @@ impl Interp {
         }
         let ptr = Gc::as_ptr(o) as usize;
         let due: Vec<_> = match key {
-            Some(k) => hooks
-                .0
-                .remove(&(ptr, k.to_string()))
-                .into_iter()
-                .collect(),
+            Some(k) => hooks.0.remove(&(ptr, k.to_string())).into_iter().collect(),
             None => {
                 let names: Vec<_> = hooks.0.keys().filter(|(p, _)| *p == ptr).cloned().collect();
                 names.iter().filter_map(|n| hooks.0.remove(n)).collect()
@@ -4903,7 +4958,16 @@ impl Interp {
             Some(k) => k.clone(),
             None => return Ok(()),
         };
-        self.evaluate_deferred(&module_key)
+        let saved = self.snapshot_realm();
+        if module_key.settings != Gc::as_ptr(&self.global) as usize {
+            let realm = self.realms.get(&module_key.settings)
+                .map(RealmState::snapshot_clone)
+                .ok_or_else(|| self.throw("TypeError", "deferred module settings no longer exist"))?;
+            self.restore_realm(&realm);
+        }
+        let result = self.evaluate_deferred(&module_key.key);
+        self.restore_realm(&saved);
+        result
     }
 
     pub(crate) fn get_member_recv(
@@ -4914,6 +4978,7 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         #[cfg(feature = "embed")]
         if let Value::Obj(object) = base {
+          if self.is_window_proxy(object) {
             let proxy_key = Gc::as_ptr(object) as usize;
             let key_value = self
                 .sym_from_key(key)
@@ -4967,6 +5032,7 @@ impl Interp {
                 };
             }
         }
+          }
         // An `import defer` namespace evaluates its module on string-keyed access.
         if let Value::Obj(o) = base {
             self.defer_trigger(o, Some(key))?;
@@ -5065,6 +5131,12 @@ impl Interp {
                 // Proxy: invoke the `get` trap, or forward to the target.
                 if !self.proxies.is_empty() {
                     if let Some((target, handler)) = self.proxy_at(ptr) {
+                        #[cfg(feature="embed")]
+                        if let Some(result)=crate::embed_convert::indexed_wrapper_get(self,&o,&target,&handler,key,&receiver) {
+                            let result=result?;
+                            self.proxy_get_invariant(&target,key,&result)?;
+                            return Ok(result);
+                        }
                         let trap = self.proxy_trap(&handler, "get")?;
                         if matches!(trap, Value::Undefined | Value::Null) {
                             // Forward to the target's [[Get]], preserving the original Receiver.
@@ -5199,6 +5271,12 @@ impl Interp {
                 }
             }
             if let Some((target, handler)) = self.proxy_at(ptr) {
+                #[cfg(feature="embed")]
+                if let Some(result)=crate::embed_convert::indexed_wrapper_get(self,&obj,&target,&handler,key,receiver) {
+                    let result=result?;
+                    self.proxy_get_invariant(&target,key,&result)?;
+                    return Ok(result);
+                }
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
                 }
@@ -6735,6 +6813,38 @@ impl Interp {
             }
         }
 
+        // Small bound calls (including native platform property traps) need
+        // neither a cloned boxed callable nor a heap argument vector. Copy the
+        // immutable prefix while borrowing, then release the object before any
+        // target code can run. Keep the original heap representation and GC
+        // edges; only this invocation's argument storage is on the stack.
+        let small_bound = {
+            let object = obj.borrow();
+            match &object.call {
+                Callable::Bound(bound) if bound.args.len() + args.len() <= 8 => {
+                    let mut all = std::array::from_fn::<Value, 8, _>(|_| Value::Undefined);
+                    let count = bound.args.len() + args.len();
+                    for (slot, value) in all.iter_mut().zip(bound.args.iter().chain(args)) {
+                        *slot = value.clone();
+                    }
+                    Some((bound.target.clone(), bound.this.clone(), all, count))
+                }
+                _ => None,
+            }
+        };
+        if let Some((target, bound_this, all, count)) = small_bound {
+            // Preserve the outer bound [[Call]]'s constructor/new.target reset,
+            // including a bound arrow target. [[Construct]] uses its separate
+            // path and retains its new.target substitution rules.
+            let saved_ctor = self.constructing;
+            let saved_nt = self.new_target.clone();
+            self.constructing = false;
+            self.new_target = Value::Undefined;
+            let result = self.call(Value::Obj(target), bound_this, &all[..count]);
+            self.constructing = saved_ctor;
+            self.new_target = saved_nt;
+            return result;
+        }
         let call = obj.borrow().call.clone();
         // A plain call is never constructing (only `new` sets the flag). Clearing it here keeps a
         // wrapper constructor invoked as a function — `Number(x)` — from boxing. `new.target` is
@@ -8530,23 +8640,38 @@ impl Interp {
                 {
                     return Err(self.throw("TypeError", "this function is not a constructor"));
                 }
-                // OrdinaryCreateFromConstructor: the new instance's prototype comes from
+                let ctor_key = Gc::as_ptr(&obj) as usize;
+                let derived = self
+                    .class_info
+                    .get(&ctor_key)
+                    .is_some_and(|info| info.derived);
+                // Derived constructors bind the object returned by super(). Their
+                // uninitialized receiver must not observe new.target.prototype before
+                // the base constructor has performed its own validation.
+                // OrdinaryCreateFromConstructor: a base instance's prototype comes from
                 // new.target; a non-object `prototype` falls back to new.target's realm's
                 // %Object.prototype% (GetFunctionRealm).
-                let proto = match self.get_member(&new_target, "prototype")? {
-                    Value::Obj(p) => Some(p),
-                    _ => {
-                        let realm = match &new_target {
-                            Value::Obj(nt) => self.get_function_realm_global(nt)?,
-                            _ => None,
-                        };
-                        realm
-                            .and_then(|g| self.realms.get(&g).map(|rs| rs.object_proto.clone()))
-                            .or_else(|| Some(self.object_proto.clone()))
+                let proto = if derived {
+                    None
+                } else {
+                    match self.get_member(&new_target, "prototype")? {
+                        Value::Obj(p) => Some(p),
+                        _ => {
+                            let realm = match &new_target {
+                                Value::Obj(nt) => self.get_function_realm_global(nt)?,
+                                _ => None,
+                            };
+                            realm
+                                .and_then(|g| self.realms.get(&g).map(|rs| rs.object_proto.clone()))
+                                .or_else(|| Some(self.object_proto.clone()))
+                        }
                     }
                 };
-                let ctor_key = Gc::as_ptr(&obj) as usize;
-                let learned_capacity = self.learned_construct_capacity(&obj);
+                let learned_capacity = if derived {
+                    0
+                } else {
+                    self.learned_construct_capacity(&obj)
+                };
                 let this = Object::new_with_capacity(proto, learned_capacity);
                 let this_val = Value::Obj(this.clone());
                 self.pending_new_target = new_target.clone();
@@ -8568,7 +8693,12 @@ impl Interp {
                 // the small final named-map size after a successful call so its next instance has
                 // spare capacity for the property-creation caches. The hint changes only
                 // allocation size; all writes still perform their normal live semantic guards.
-                self.observe_construct_capacity(&obj, &this);
+                let observed = if derived {
+                    ret.as_obj().unwrap_or(&this)
+                } else {
+                    &this
+                };
+                self.observe_construct_capacity(&obj, observed);
                 // A constructor explicitly returning an object overrides the instance;
                 // derived-constructor return/`this` validation already happened in call_user.
                 Ok(match ret {

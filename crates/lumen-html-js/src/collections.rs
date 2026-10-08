@@ -5,6 +5,7 @@ use lumen_bind::This;
 enum Nodes {
     Children(NodeId, bool),
     Descendants(NodeId, DescendantFilter),
+    Table(NodeId, lumen_html::tables::CollectionKind),
     SelectOptions(NodeId),
     DatalistOptions(NodeId),
     SelectedOptions(NodeId),
@@ -103,12 +104,25 @@ pub(crate) fn html_space_tokens(value: &str) -> impl Iterator<Item = &str> {
         .filter(|token| !token.is_empty())
 }
 
-#[lumen_bind::class(name = "NodeList", hint(js(webidl)))]
+// Every supported indexed member is a node object; undefined denotes only a
+// missing index, allowing the host to avoid a second native length dispatch.
+#[lumen_bind::class(name = "NodeList", hint(js(webidl, indexed_missing_undefined)))]
 pub struct DomNodeList {
     realm: Rc<DomRealm>,
     nodes: Nodes,
     _owner: Value,
     cache: RefCell<Option<CollectionCache>>,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomNodeList {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) { visit(&self._owner); }
+    fn trace_native_identities(&self, epoch: u64, visit: &mut dyn FnMut(&Value)) {
+        let _ = self.visit_entries(|realm, document, node| {
+            if let Ok(root) = selector::native_identity_root(document, node) { realm.trace_native_identity_component(epoch, root, visit); }
+            true
+        });
+    }
 }
 
 struct CollectionCache {
@@ -118,6 +132,9 @@ struct CollectionCache {
 }
 
 impl DomNodeList {
+    pub(crate) fn table(realm: Rc<DomRealm>, root: NodeId, kind: lumen_html::tables::CollectionKind, owner: Value) -> Self {
+        Self { realm, nodes: Nodes::Table(root, kind), _owner: owner, cache: RefCell::new(None) }
+    }
     pub(crate) fn adopt_nodes(&mut self, realm: Rc<DomRealm>, mapping: &[(NodeId, NodeId)]) {
         self.realm = realm;
         let mapped = |node: NodeId| {
@@ -129,6 +146,7 @@ impl DomNodeList {
         match &mut self.nodes {
             Nodes::Children(root, _)
             | Nodes::Descendants(root, _)
+            | Nodes::Table(root, _)
             | Nodes::SelectOptions(root)
             | Nodes::DatalistOptions(root)
             | Nodes::SelectedOptions(root)
@@ -255,7 +273,7 @@ impl DomNodeList {
 
     fn cached_ids(&self) -> OpResult<Option<(Rc<DomRealm>, Rc<Vec<NodeId>>)>> {
         let root = match &self.nodes {
-            Nodes::Children(root, _) | Nodes::Descendants(root, _) => *root,
+            Nodes::Children(root, _) | Nodes::Descendants(root, _) | Nodes::Table(root, _) => *root,
             _ => return Ok(None),
         };
         let (realm, root) = self.realm.resolve_adopted_node(root);
@@ -269,6 +287,9 @@ impl DomNodeList {
         }
         let mut ids = Vec::new();
         match &self.nodes {
+            Nodes::Table(_, kind) => {
+                lumen_html::tables::visit(document, root, *kind, |id| { ids.push(id); true }).map_err(dom_error)?;
+            }
             Nodes::Children(_, elements) => {
                 let mut node = document.first_child(root).map_err(dom_error)?;
                 while let Some(id) = node {
@@ -301,7 +322,7 @@ impl DomNodeList {
         Ok(Some((realm, ids)))
     }
 
-    fn visit_entries(
+    pub(crate) fn visit_entries(
         &self,
         mut visit: impl FnMut(&Rc<DomRealm>, &lumen_html::Document, NodeId) -> bool,
     ) -> OpResult<()> {
@@ -323,6 +344,11 @@ impl DomNodeList {
                         break;
                     }
                 }
+            }
+            Nodes::Table(root, kind) => {
+                let (realm, root) = self.realm.resolve_adopted_node(*root);
+                let session = realm.session.borrow();
+                lumen_html::tables::visit(session.document(), root, *kind, |id| visit(&realm, session.document(), id)).map_err(dom_error)?;
             }
             Nodes::Children(root, elements) => {
                 let (realm, root) = self.realm.resolve_adopted_node(*root);
@@ -448,7 +474,8 @@ impl DomNodeList {
     }
     pub(crate) fn snapshot(realm: Rc<DomRealm>, nodes: Vec<NodeId>, owner: Value) -> Self {
         for id in &nodes {
-            *realm.retained_nodes.borrow_mut().entry(*id).or_default() += 1;
+            let (owner, id) = realm.resolve_adopted_node(*id);
+            *owner.retained_nodes.borrow_mut().entry(id).or_default() += 1;
         }
         Self {
             realm,
@@ -566,7 +593,7 @@ impl DomNodeList {
                 })?;
                 Ok(found)
             }
-            Nodes::Descendants(_, _) => {
+            Nodes::Descendants(_, _) | Nodes::Table(_, _) => {
                 let mut count = 0;
                 let mut found = None;
                 self.visit_entries(|realm, _, id| {
@@ -587,6 +614,11 @@ impl DomNodeList {
             return Ok(ids.iter().map(|id| (realm.clone(), *id)).collect());
         }
         match &self.nodes {
+            Nodes::Table(_, _) => {
+                let mut entries = Vec::new();
+                self.visit_entries(|realm, _, id| { entries.push((realm.clone(), id)); true })?;
+                Ok(entries)
+            }
             Nodes::Static(nodes) => Ok(nodes
                 .iter()
                 .copied()
@@ -861,8 +893,36 @@ impl Drop for DomNodeList {
 
 #[lumen_bind::methods]
 impl DomNodeList {
+    #[proto(indexof)]
+    fn native_index_of(&self, ctx: &mut Ctx, target: Value, from: usize, len: usize) -> OpResult<Value> {
+        let Nodes::Static(nodes) = &self.nodes else { return Ok(Value::Undefined); };
+        // A longer author length can expose inherited numeric properties. Let the ordinary
+        // HasProperty/Get walk handle those rather than treating them as native slots.
+        if len > nodes.len() { return Ok(Value::Undefined); }
+        if ctx.object_addr(&target).is_none() { return Ok(Value::Num(-1.0)); }
+        let Ok((target_realm, target_id)) = ctx.with_instance::<super::DomNode, _>(&target,
+            |node| node.realm.resolve_adopted_node(node.id)) else { return Ok(Value::Num(-1.0)); };
+        if self.realm.adopted_nodes.borrow().is_empty() {
+            if !Rc::ptr_eq(&self.realm, &target_realm) { return Ok(Value::Num(-1.0)); }
+            for index in from..len {
+                if index % 256 == 0 { ctx.poll_interrupt_for_host().map_err(OpError::thrown)?; }
+                if nodes[index] == target_id { return Ok(Value::Num(index as f64)); }
+            }
+            return Ok(Value::Num(-1.0));
+        }
+        for index in from..len {
+            if index % 256 == 0 { ctx.poll_interrupt_for_host().map_err(OpError::thrown)?; }
+            let (realm, id) = self.realm.resolve_adopted_node(nodes[index]);
+            if id == target_id && Rc::ptr_eq(&realm, &target_realm) { return Ok(Value::Num(index as f64)); }
+        }
+        Ok(Value::Num(-1.0))
+    }
+
     #[proto(len)]
     fn length(&self) -> OpResult<usize> {
+        // Static snapshots retain their membership across removal and adoption.
+        // Counting needs no node traversal, realm lookup or document borrow.
+        if let Nodes::Static(nodes) = &self.nodes { return Ok(nodes.len()); }
         if let Some((_, ids)) = self.cached_ids()? {
             return Ok(ids.len());
         }
@@ -946,6 +1006,24 @@ impl DomNodeList {
 #[lumen_bind::class(name = "HTMLCollection", hint(js(webidl, named_properties)))]
 pub struct DomHtmlCollection {
     pub(crate) base: DomNodeList,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomHtmlCollection {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_values(&self.base, visit);
+    }
+    fn trace_native_identities(&self, epoch: u64, visit: &mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_identities(&self.base, epoch, visit);
+    }
+}
+
+impl DomHtmlCollection {
+    pub(crate) fn create(ctx: &mut Ctx, base: DomNodeList) -> Value {
+        let value = ctx.new_instance(Self { base });
+        ctx.set_native_identity_owner::<Self>(&value).ok().expect("HTMLCollection identity owner");
+        value
+    }
 }
 
 #[lumen_bind::methods]
@@ -1405,6 +1483,19 @@ pub struct DomTokenList {
     pub(crate) realm: Rc<DomRealm>,
     pub(crate) node: NodeId,
     pub(crate) owner: Value,
+    pub(crate) attribute: &'static str,
+    pub(crate) supported: Option<&'static [&'static str]>,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomTokenList {
+    const TRACES_NATIVE_VALUES: bool=true;
+    fn trace_native_values(&self,visit:&mut dyn FnMut(&Value)) {visit(&self.owner)}
+    fn trace_native_identities(&self,epoch:u64,visit:&mut dyn FnMut(&Value)) {
+        let session=self.realm.session.borrow();
+        if let Ok(root)=selector::native_identity_root(session.document(),self.node) {
+            self.realm.trace_native_identity_component(epoch,root,visit);
+        }
+    }
 }
 
 impl DomTokenList {
@@ -1422,7 +1513,7 @@ impl DomTokenList {
         let mut tokens = Vec::new();
         let class_value = session
             .document()
-            .get_attribute_ns_ref(self.node, None, "class")
+            .get_attribute_ns_ref(self.node, None, self.attribute)
             .map_err(dom_error)?
             .unwrap_or("");
         for token in html_space_tokens(class_value) {
@@ -1452,13 +1543,18 @@ impl DomTokenList {
             .session
             .borrow_mut()
             .document_mut()
-            .set_attribute_ns(self.node, None, "class", &tokens.join(" "))
+            .set_attribute_ns(self.node, None, self.attribute, &tokens.join(" "))
             .map_err(dom_error)
     }
 }
 
 #[lumen_bind::methods]
 impl DomTokenList {
+    #[method(coerce)]
+    fn supports(&self,token:&str)->OpResult<bool> {
+        let supported=self.supported.ok_or_else(||OpError::type_error("this attribute has no supported token set"))?;
+        Ok(supported.iter().any(|supported|supported.eq_ignore_ascii_case(token)))
+    }
     #[proto(len)]
     fn length(&self) -> OpResult<usize> {
         Ok(self.tokens()?.len())
@@ -1475,7 +1571,7 @@ impl DomTokenList {
         Self::validate(token)?;
         Ok(self.tokens()?.iter().any(|old| old == token))
     }
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn add(&self, #[varargs] tokens: Vec<String>) -> OpResult<()> {
         for token in &tokens {
             Self::validate(token)?;
@@ -1488,7 +1584,7 @@ impl DomTokenList {
         }
         self.write(&current)
     }
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn remove(&self, #[varargs] tokens: Vec<String>) -> OpResult<()> {
         for token in &tokens {
             Self::validate(token)?;
@@ -1497,7 +1593,7 @@ impl DomTokenList {
         current.retain(|token| !tokens.contains(token));
         self.write(&current)
     }
-    #[method(coerce)]
+    #[method(coerce, hint(js(ce_reactions)))]
     fn toggle(&self, token: &str, force: Option<bool>) -> OpResult<bool> {
         Self::validate(token)?;
         let mut current = self.tokens()?;
@@ -1515,17 +1611,34 @@ impl DomTokenList {
         self.write(&current)?;
         Ok(add)
     }
+    #[method(coerce, hint(js(ce_reactions)))]
+    fn replace(&self, token: &str, new_token: &str) -> OpResult<bool> {
+        Self::validate(token)?;
+        Self::validate(new_token)?;
+        let mut current = self.tokens()?;
+        let Some(index) = current.iter().position(|old| old == token) else { return Ok(false); };
+        if let Some(existing) = current.iter().position(|old| old == new_token) {
+            if existing < index {
+                current.remove(index);
+            } else if existing > index {
+                current.remove(existing);
+                current[index] = new_token.into();
+            }
+        } else { current[index] = new_token.into(); }
+        self.write(&current)?;
+        Ok(true)
+    }
     #[getter]
     fn value(&self) -> OpResult<String> {
         Ok(self.tokens()?.join(" "))
     }
-    #[setter(coerce)]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_value(&self, value: &str) -> OpResult<()> {
         self.realm
             .session
             .borrow_mut()
             .document_mut()
-            .set_attribute_ns(self.node, None, "class", value)
+            .set_attribute_ns(self.node, None, self.attribute, value)
             .map_err(dom_error)
     }
     #[proto(iter)]

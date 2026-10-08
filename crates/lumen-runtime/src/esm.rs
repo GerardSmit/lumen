@@ -112,7 +112,7 @@ pub fn make_cached_loader_with_fetch_config_and_prefetched(
         if let Some(entry) = prefetched.get(url) {
             return entry
                 .ok()
-                .map(|resource| (resource.final_url, resource.content_type, resource.bytes));
+                .map(|resource| (resource.final_url, resource.content_type, resource.bytes.to_vec()));
         }
         let resource = lumen_web::load_module_resource_with_config(url, &fetch_config).ok()?;
         Some((resource.url, resource.content_type, resource.bytes))
@@ -130,13 +130,29 @@ const PREFETCHED_MODULE_ENTRIES: usize = 512;
 pub struct PrefetchedModuleResource {
     pub final_url: String,
     pub content_type: Option<String>,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
+    pub script_context: Option<lumen::ClassicScriptContext>,
 }
 
 #[derive(Default)]
 struct PrefetchedModuleState {
-    entries: HashMap<String, Result<PrefetchedModuleResource, String>>,
+    entries: HashMap<String, PrefetchedModuleTypes>,
+    count: usize,
+    pending: HashMap<(String,Option<String>),Arc<ModuleResourceFlight>>,
     bytes: usize,
+}
+#[derive(Default)]
+struct PrefetchedModuleTypes {
+    javascript: Option<Result<PrefetchedModuleResource,String>>,
+    typed: HashMap<String,Result<PrefetchedModuleResource,String>>,
+}
+impl PrefetchedModuleTypes {
+    fn get(&self,kind:Option<&str>)->Option<&Result<PrefetchedModuleResource,String>> {
+        match kind { None=>self.javascript.as_ref(),Some(kind)=>self.typed.get(kind) }
+    }
+    fn insert(&mut self,kind:Option<&str>,resource:Result<PrefetchedModuleResource,String>) {
+        match kind { None=>self.javascript=Some(resource),Some(kind)=>{self.typed.insert(kind.into(),resource);} }
+    }
 }
 
 /// Bounded, shareable resource snapshot populated by a browser's asynchronous module graph
@@ -145,43 +161,91 @@ struct PrefetchedModuleState {
 pub struct PrefetchedModuleResources {
     state: Arc<Mutex<PrefetchedModuleState>>,
 }
+#[derive(Default)]
+struct ModuleResourceFlight {
+    result: Mutex<Option<Result<PrefetchedModuleResource,String>>>,
+    changed: std::sync::Condvar,
+}
 
 impl PrefetchedModuleResources {
-    /// Record one request URL and its actual final response. The URL is the wire URL (without a
-    /// fragment); fragments remain part of each module-map key and are applied by the resolver.
+    /// Record one request URL/type and its actual final response. Browser request
+    /// fragments remain part of identity even though HTTP does not transmit them.
     pub fn insert(
         &self,
         request_url: String,
         result: Result<PrefetchedModuleResource, String>,
     ) -> Result<(), String> {
+        self.insert_for_type(request_url, None, result)
+    }
+    pub fn insert_for_type(&self, request_url: String, module_type: Option<&str>, result: Result<PrefetchedModuleResource, String>) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "prefetched module resource cache is poisoned".to_owned())?;
-        if state.entries.contains_key(&request_url) {
+        Self::insert_locked(&mut state, request_url, module_type, result)
+    }
+    fn insert_locked(state: &mut PrefetchedModuleState, request_url: String, module_type: Option<&str>, result: Result<PrefetchedModuleResource, String>) -> Result<(), String> {
+        if state.entries.get(&request_url).is_some_and(|types|types.get(module_type).is_some()) {
             return Ok(());
         }
-        if state.entries.len() >= PREFETCHED_MODULE_ENTRIES {
+        if state.count >= PREFETCHED_MODULE_ENTRIES {
             return Err("module graph exceeded the prefetched resource count limit".into());
         }
-        let weight = result.as_ref().map_or(0, |resource| {
-            request_url
-                .len()
-                .saturating_add(resource.final_url.len())
+        let weight = request_url.len().saturating_add(module_type.map_or(0,str::len)).saturating_add(result.as_ref().map_or_else(|error|error.len(), |resource| {
+            resource.final_url.len()
                 .saturating_add(resource.content_type.as_ref().map_or(0, String::len))
+                .saturating_add(resource.script_context.as_ref().map_or(0, |context| context.base_url.len() + context.nonce.len() + context.credentials_mode.len() + context.referrer_policy.len()))
                 .saturating_add(resource.bytes.len())
-        });
+        }));
         if state.bytes.saturating_add(weight) > PREFETCHED_MODULE_BYTES {
             return Err("module graph exceeded the prefetched resource byte limit".into());
         }
         state.bytes += weight;
-        state.entries.insert(request_url, result);
+        state.count += 1;
+        state.entries.entry(request_url).or_default().insert(module_type, result);
         Ok(())
+    }
+
+    /// First request wins for a URL/type. Only I/O workers wait; no engine or
+    /// document handle is held by this shared resource map.
+    pub fn fetch_once_for_type(&self, request_url: &str, module_type: Option<&str>,
+        fetch: impl FnOnce() -> Result<PrefetchedModuleResource, String>) -> Result<PrefetchedModuleResource, String> {
+        let key = (request_url.to_owned(), module_type.map(str::to_owned));
+        let mut state = self.state.lock().map_err(|_|"prefetched module resource cache is poisoned".to_owned())?;
+        if let Some(result) = state.entries.get(request_url).and_then(|types|types.get(module_type)) { return result.clone(); }
+        if let Some(flight)=state.pending.get(&key).cloned() {
+            drop(state);
+            let mut result=flight.result.lock().map_err(|_|"module resource flight is poisoned".to_owned())?;
+            while result.is_none() {
+                result=flight.changed.wait(result).map_err(|_|"module resource flight is poisoned".to_owned())?;
+            }
+            return result.as_ref().expect("completed flight").clone();
+        }
+        if state.count + state.pending.len() >= PREFETCHED_MODULE_ENTRIES { return Err("module graph exceeded the resource count limit".into()); }
+        let flight=Arc::new(ModuleResourceFlight::default());
+        state.pending.insert(key.clone(),flight.clone());
+        drop(state);
+        let result = fetch();
+        let mut state = self.state.lock().map_err(|_|"prefetched module resource cache is poisoned".to_owned())?;
+        state.pending.remove(&key);
+        // HTML removes failed module-map entries. Existing callers of insert()
+        // retain its explicit failure snapshot contract; browser flights retry.
+        let result=match result {
+            Ok(resource)=>Self::insert_locked(&mut state,request_url.to_owned(),module_type,Ok(resource.clone())).map(|_|resource),
+            Err(error)=>Err(error),
+        };
+        *flight.result.lock().map_err(|_|"module resource flight is poisoned".to_owned())?=Some(result.clone());
+        drop(state);
+        flight.changed.notify_all();
+        result
     }
 
     /// Read a cached response without changing its response URL or bytes.
     pub fn get(&self, request_url: &str) -> Option<Result<PrefetchedModuleResource, String>> {
-        self.state.lock().ok()?.entries.get(request_url).cloned()
+        self.get_for_type(request_url, None)
+    }
+    pub fn get_for_type(&self, request_url: &str, module_type: Option<&str>) -> Option<Result<PrefetchedModuleResource, String>> {
+        self.state.lock().ok()?.entries.get(request_url)?.get(module_type).cloned()
     }
 }
 
@@ -210,6 +274,296 @@ pub fn resolve_network_module_request(specifier: &str, referrer: &str) -> Option
     (url_origin(&requested_url)? == url_origin(referrer)?).then_some(requested_url)
 }
 
+/// Browser URL resolution permits cross-origin URLs; canonical Fetch enforces
+/// CORS rather than the Node loader's same-origin restriction.
+pub fn resolve_browser_module_request(specifier: &str, referrer: &str) -> Option<String> {
+    let target = match lumen_common::url::parse(specifier, None) {
+        Ok(target) => target,
+        Err(_) if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") =>
+            lumen_common::url::parse(specifier, Some(referrer)).ok()?,
+        _ => return None,
+    };
+    matches!(target.scheme.as_str(), "http" | "https").then(|| target.href())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct BrowserModuleClient {
+    pub self_url: String,
+    pub origin: String,
+    pub referrer_policy: lumen_common::referrer::ReferrerPolicy,
+    pub policies: Arc<lumen_common::csp::PolicySet>,
+    pub import_map: Option<lumen_common::import_maps::SharedImportMap>,
+}
+
+/// Plain captured data only: safe to move onto the host's existing I/O pool.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct BrowserModuleFetch {
+    pub client: BrowserModuleClient,
+    pub referrer: String,
+    pub nonce: String,
+    pub credentials: String,
+    pub referrer_policy: lumen_common::referrer::ReferrerPolicy,
+    pub integrity: String,
+    pub parser_inserted: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BrowserModuleFetch {
+    pub fn descendant(client: BrowserModuleClient, referrer: &str, context: Option<&lumen::ClassicScriptContext>) -> Self {
+        Self {
+            referrer: referrer.into(), nonce: context.map_or_else(String::new, |context|context.nonce.clone()),
+            credentials: context.map_or_else(|| "same-origin".into(), |context|context.credentials_mode.clone()),
+            referrer_policy: context.and_then(|context|lumen_common::referrer::ReferrerPolicy::parse(&context.referrer_policy))
+                .unwrap_or(client.referrer_policy),
+            integrity: String::new(), parser_inserted: false, client,
+        }
+    }
+    pub fn context_after_response(&self, resource: &PrefetchedModuleResource) -> std::rc::Rc<lumen::ClassicScriptContext> {
+        if let Some(context) = &resource.script_context { return std::rc::Rc::new(context.clone()); }
+        std::rc::Rc::new(lumen::ClassicScriptContext {
+            base_url: resource.final_url.clone(), nonce: self.nonce.clone(), credentials_mode: self.credentials.clone(),
+            referrer_policy: self.referrer_policy.name().into(),
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BrowserModuleClient {
+    pub fn resolve(&self, specifier:&str, base:&str) -> Result<lumen_common::import_maps::Resolution,String> {
+        if let Some(map)=&self.import_map {
+            return map.lock().map_err(|_|"import-map state is unavailable".to_owned())?
+                .resolve(specifier,base).map_err(|error|error.to_string());
+        }
+        lumen_common::import_maps::resolve_without_map(specifier,base).map_err(|error|error.to_string())
+    }
+    pub fn module_integrity(&self,url:&str)->String {
+        self.import_map.as_ref().and_then(|map|map.lock().ok().map(|map|map.integrity(url))).unwrap_or_default()
+    }
+}
+
+/// Fetch-policy failures retain their violation metadata for the client realm.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_browser_module_resource(url: &str, module_type:Option<&str>, fetch: &BrowserModuleFetch, config: &lumen_web::FetchConfig)
+    -> (Result<PrefetchedModuleResource, String>, Vec<lumen_common::csp::Violation>) {
+    let destination=match module_type {
+        None=>lumen_common::csp::Destination::Script,
+        Some("json")=>lumen_common::csp::Destination::Json,
+        Some("text")=>lumen_common::csp::Destination::Text,
+        Some("css")=>lumen_common::csp::Destination::Style,
+        _=>return (Err("module type is not supported by the HTML module loader".into()),Vec::new()),
+    };
+    let validate = |mut resource:PrefetchedModuleResource| {
+        if let (Ok(requested),Ok(mut response))=(lumen_common::url::parse(url,None),lumen_common::url::parse(&resource.final_url,None)) {
+            if response.fragment.is_none() {
+                response.fragment=requested.fragment;
+                resource.final_url=response.href();
+                if let Some(context)=&mut resource.script_context {context.base_url=resource.final_url.clone();}
+            }
+        }
+        let allowed=match module_type {
+            None=>lumen_common::mime::is_javascript_module_mime(resource.content_type.as_deref()),
+            Some("json")=>lumen_common::mime::is_json_mime(resource.content_type.as_deref()),
+            Some("text")=>true,
+            Some("css")=>lumen_common::mime::is_css_module_mime(resource.content_type.as_deref()),
+            _=>false,
+        };
+        if allowed {Ok(resource)}else {Err("module response has an unsupported MIME type".into())}
+    };
+    if lumen_common::url::parse(url,None).is_ok_and(|url|url.scheme == "data") {
+        let mut reports = Vec::new();
+        let result = (|| {
+            let decision = fetch.client.policies.check_resource_redirect(url,url,&fetch.client.self_url,destination,&fetch.nonce,&fetch.integrity,fetch.parser_inserted,0)
+                .map_err(|error|format!("data module policy: {error:?}"))?;
+            reports.extend(decision.violations);
+            if decision.blocked { return Err("data module blocked by Content Security Policy".into()); }
+            let mime = lumen_common::url::data_url_mime_essence(url).ok_or_else(||"invalid data module URL".to_owned())?;
+            let bytes = lumen_common::url::data_url_body_bounded(url,PREFETCHED_MODULE_BYTES)
+                .map_err(|error|format!("data module body: {error:?}"))?;
+            if !lumen_common::integrity::matches(&bytes,&fetch.integrity) {
+                return Err("data module body failed Subresource Integrity".into());
+            }
+            Ok(PrefetchedModuleResource { final_url:url.into(),content_type:Some(mime.into()),bytes:bytes.into(),
+                script_context:Some(lumen::ClassicScriptContext { base_url:url.into(),nonce:fetch.nonce.clone(),
+                    credentials_mode:fetch.credentials.clone(),referrer_policy:fetch.referrer_policy.name().into() }) })
+        })();
+        return (result.and_then(validate),reports);
+    }
+    let mut metadata = lumen_web::ScriptFetchMetadata {
+        destination,
+        self_url: fetch.client.self_url.clone(), nonce: fetch.nonce.clone(), integrity: fetch.integrity.clone(),
+        parser_inserted: fetch.parser_inserted,
+        referrer: lumen_common::referrer::Referrer { source: fetch.referrer.clone(), policy: fetch.referrer_policy },
+        policies: fetch.client.policies.clone(), violations: Vec::new(),
+    };
+    let wire_url=strip_url_fragment(url);
+    let result = lumen_web::load_script_resource_with_config(&wire_url, &fetch.client.origin, &fetch.credentials,
+        config, PREFETCHED_MODULE_BYTES, 30_000, &mut metadata).and_then(|response| {
+        if !(200..300).contains(&response.status) { return Err(format!("module response returned HTTP {}", response.status)); }
+        Ok(PrefetchedModuleResource { script_context: Some(lumen::ClassicScriptContext {
+                base_url: response.url.clone(), nonce: fetch.nonce.clone(), credentials_mode: fetch.credentials.clone(),
+                referrer_policy: metadata.referrer.policy.name().into() }), final_url: response.url,
+            content_type: response.headers.iter().find(|(name,_)|name.eq_ignore_ascii_case("content-type")).map(|(_,value)|value.clone()),
+            bytes: response.body.into() })
+    });
+    (result.and_then(validate), metadata.violations)
+}
+
+/// Reuse the existing resource snapshot and canonical decoding. The map key is
+/// the requested URL (including its fragment) and module type, not response URL
+/// or fetch options. The response URL is the source/import-resolution base.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn make_browser_module_loader(
+    client: impl Fn() -> Option<BrowserModuleClient> + 'static, config: lumen_web::FetchConfig,
+    prefetched: PrefetchedModuleResources,
+    violations: Arc<Mutex<Vec<lumen_common::csp::Violation>>>,
+) -> impl Fn(lumen::ModuleFetchRequest) -> Option<lumen::ModuleFetchResult> {
+    move |request| {
+        if !matches!(request.attribute_type.as_deref(), None | Some("json" | "text" | "css")) { return None; }
+        let client = client()?;
+        let resolution=request.resolution.clone().map(Ok).unwrap_or_else(||client.resolve(&request.specifier,&request.referrer)).ok()?;
+        let Some(_) = resolve_browser_module_request(&resolution.url, &request.referrer) else {
+            // Bare names require the document import-map algorithm. Never
+            // reinterpret them as Node packages or host filesystem paths.
+            let requested = lumen_common::url::parse(&resolution.url,None).ok()?;
+            if requested.scheme != "data" { return None; }
+            let key = requested.href();
+            let mut fetch = BrowserModuleFetch::descendant(client,&request.referrer,request.script_context.as_deref());
+            fetch.integrity=resolution.integrity;
+            let resource = prefetched.fetch_once_for_type(&key,request.attribute_type.as_deref(),|| {
+                let (result,reports)=fetch_browser_module_resource(&key,request.attribute_type.as_deref(),&fetch,&config);
+                if let Ok(mut pending)=violations.lock() { pending.extend(reports); }
+                result
+            }).ok()?;
+            let allowed = match request.attribute_type.as_deref() {
+                None=>lumen_common::mime::is_javascript_module_mime(resource.content_type.as_deref()),
+                Some("json")=>lumen_common::mime::is_json_mime(resource.content_type.as_deref()),
+                Some("text")=>true,
+                Some("css")=>lumen_common::mime::is_css_module_mime(resource.content_type.as_deref()),
+                _=>false,
+            };
+            if !allowed { return None; }
+            let context = fetch.context_after_response(&resource);
+            let text = String::from_utf8_lossy(&resource.bytes);
+            return Some(lumen::ModuleFetchResult { key:key.clone(),source:text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned(),
+                script_context:Some(std::rc::Rc::new(lumen::ClassicScriptContext { base_url:key,..context.as_ref().clone() })) });
+        };
+        let requested = lumen_common::url::parse(&resolution.url, None).ok()?;
+        let mut fetch = BrowserModuleFetch::descendant(client, &request.referrer, request.script_context.as_deref());
+        fetch.integrity=resolution.integrity;
+        let resource = prefetched.fetch_once_for_type(&requested.href(), request.attribute_type.as_deref(), || {
+                let (result, reports) = fetch_browser_module_resource(&requested.href(),request.attribute_type.as_deref(), &fetch, &config);
+                if let Ok(mut pending) = violations.lock() { pending.extend(reports); }
+                result
+        }).ok()?;
+        let allowed = match request.attribute_type.as_deref() {
+            None => lumen_common::mime::is_javascript_module_mime(resource.content_type.as_deref()),
+            Some("json") => lumen_common::mime::is_json_mime(resource.content_type.as_deref()),
+            Some("text") => true,
+            Some("css") => lumen_common::mime::is_css_module_mime(resource.content_type.as_deref()),
+            // The engine's non-HTML bytes module type remains available to
+            // Node's legacy loader; HTML only supports actual registered types.
+            _ => false,
+        };
+        if !allowed { return None; }
+        let mut response = lumen_common::url::parse(&resource.final_url, None).ok()?;
+        if response.fragment.is_none() { response.fragment = requested.fragment.clone(); }
+        let context = fetch.context_after_response(&resource);
+        let text = String::from_utf8_lossy(&resource.bytes);
+        Some(lumen::ModuleFetchResult { key: requested.href(),
+            source: text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned(),
+            script_context: Some(std::rc::Rc::new(lumen::ClassicScriptContext { base_url: response.href(), ..context.as_ref().clone() })) })
+    }
+}
+
+/// Prepare a browser graph on the existing host I/O pool. Parsing requests uses
+/// the engine's canonical module parser; no AST or JS handle crosses threads.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct BrowserModuleGraphRequest {
+    pub url:String,
+    pub module_type:Option<String>,
+    pub fetch:BrowserModuleFetch,
+}
+/// One I/O completion. Parsing discovers authored requests but never resolves them or touches
+/// the Window's resolved-module set. It contains no engine/realm handles or JavaScript values.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct BrowserModuleGraphResource {
+    request:BrowserModuleGraphRequest,
+    resource:Result<PrefetchedModuleResource,String>,
+    requests:Vec<lumen::ModuleRequest>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub struct BrowserModuleGraph {
+    seen:std::collections::HashSet<(String,Option<String>)>,
+    pending:usize,
+    error:Option<String>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl BrowserModuleGraph {
+    pub fn start(url:String,module_type:Option<String>,fetch:BrowserModuleFetch)->(Self,BrowserModuleGraphRequest) {
+        let graph=Self {seen:std::collections::HashSet::from([(url.clone(),module_type.clone())]),pending:1,error:None};
+        (graph,BrowserModuleGraphRequest {url,module_type,fetch})
+    }
+    /// Deliver on the captured settings thread, after author JavaScript's current turn. Real
+    /// resolution/registration precedes child fetch admission, including integrity capture.
+    pub fn complete(&mut self,completion:BrowserModuleGraphResource)->Vec<BrowserModuleGraphRequest> {
+        self.pending=self.pending.saturating_sub(1);
+        if self.error.is_some() {return Vec::new();}
+        let resource=match completion.resource {Ok(resource)=>resource,Err(error)=>{self.error=Some(error);return Vec::new();}};
+        let context=completion.request.fetch.context_after_response(&resource);
+        let mut children=Vec::new();
+        for request in completion.requests {
+            let resolved=match completion.request.fetch.client.resolve(&request.specifier,&resource.final_url) {
+                Ok(resolved)=>resolved,Err(error)=>{self.error=Some(error);return Vec::new();}
+            };
+            if !self.seen.insert((resolved.url.clone(),request.attribute_type.clone())) {continue;}
+            if self.seen.len()>PREFETCHED_MODULE_ENTRIES {self.error=Some("module graph exceeded the resource count limit".into());return Vec::new();}
+            let mut fetch=BrowserModuleFetch::descendant(completion.request.fetch.client.clone(),&resource.final_url,Some(context.as_ref()));
+            fetch.integrity=resolved.integrity;
+            children.push(BrowserModuleGraphRequest {url:resolved.url,module_type:request.attribute_type,fetch});
+        }
+        self.pending+=children.len();
+        children
+    }
+    pub fn outcome(&self)->Option<Result<(),String>> {
+        (self.pending==0).then(||self.error.clone().map_or(Ok(()),Err))
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_browser_module_graph_resource(request:BrowserModuleGraphRequest,config:&lumen_web::FetchConfig,
+    resources:&PrefetchedModuleResources)->(BrowserModuleGraphResource,Vec<lumen_common::csp::Violation>) {
+    let mut reports=Vec::new();
+    let mut requests=Vec::new();
+    let resource=(|| {
+        if !matches!(request.module_type.as_deref(),None|Some("json"|"text"|"css")) {return Err("module type is not supported by the HTML module loader".into());}
+        let resource=resources.fetch_once_for_type(&request.url,request.module_type.as_deref(),|| {
+            let (result,violations)=fetch_browser_module_resource(&request.url,request.module_type.as_deref(),&request.fetch,config);
+            reports.extend(violations);result
+        })?;
+        if request.module_type.is_none() {
+            if !lumen_common::mime::is_javascript_module_mime(resource.content_type.as_deref()) {return Err("module response has unsupported JavaScript MIME type".into());}
+            let text=String::from_utf8_lossy(&resource.bytes);
+            // Parse errors remain attached to the real module evaluation, not a host replacement.
+            if let Ok(parsed)=lumen::module_requests(text.strip_prefix('\u{feff}').unwrap_or(&text)) {requests=parsed;}
+        }
+        Ok(resource)
+    })();
+    (BrowserModuleGraphResource {request,resource,requests},reports)
+}
+/// Synchronous hosts use the same phased algorithm on their own settings thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_browser_module_graph(root:&str,module_type:Option<&str>,fetch:BrowserModuleFetch,
+    config:&lumen_web::FetchConfig,resources:&PrefetchedModuleResources)->(Result<(),String>,Vec<lumen_common::csp::Violation>) {
+    let (mut graph,request)=BrowserModuleGraph::start(root.to_owned(),module_type.map(str::to_owned),fetch);
+    let mut pending=vec![request];let mut reports=Vec::new();
+    while let Some(request)=pending.pop() {
+        let (completion,violations)=fetch_browser_module_graph_resource(request,config,resources);
+        reports.extend(violations);pending.extend(graph.complete(completion));
+    }
+    (graph.outcome().unwrap_or_else(||Err("module graph completion imbalance".into())),reports)
+}
+
 /// Fetch one static module graph resource using the same route and trust snapshot as the runtime.
 /// HTTP status and content type are retained here; the resolver applies module MIME and final
 /// origin rules after it reads the prefetched response.
@@ -229,7 +583,8 @@ pub fn fetch_network_module_resource(
     Ok(PrefetchedModuleResource {
         final_url: response.url,
         content_type,
-        bytes: response.body,
+        bytes: response.body.into(),
+        script_context: None,
     })
 }
 
@@ -1515,6 +1870,219 @@ fn normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn specification_browser_module_response_options_and_typed_resource_identity_survive_reuse() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let resources = PrefetchedModuleResources::default();
+        let fetches = AtomicUsize::new(0);
+        let response_context = lumen::ClassicScriptContext {
+            base_url:"https://cdn.test/final.js".into(), nonce:"first".into(),
+            credentials_mode:"include".into(), referrer_policy:"no-referrer".into(),
+        };
+        let resource = PrefetchedModuleResource {
+            final_url:response_context.base_url.clone(),content_type:Some("text/javascript".into()),
+            bytes:Arc::from(&b"export const value = 1;"[..]),script_context:Some(response_context.clone()),
+        };
+        resources.fetch_once_for_type("https://page.test/data#identity",None,|| {
+            fetches.fetch_add(1,Ordering::Relaxed); Ok(resource.clone())
+        }).unwrap();
+        resources.fetch_once_for_type("https://page.test/data#identity",None,|| {
+            panic!("a later graph cannot replace the first effective response options")
+        }).unwrap();
+        resources.insert_for_type("https://page.test/data#identity".into(),Some("json"),Ok(PrefetchedModuleResource {
+            final_url:"https://cdn.test/data.json".into(), content_type:Some("application/json".into()),
+            bytes:Arc::from(&b"{\"value\":2}"[..]),script_context:Some(response_context.clone()),
+        })).unwrap();
+        resources.insert_for_type("https://page.test/data#identity".into(),Some("text"),Ok(PrefetchedModuleResource {
+            final_url:"https://cdn.test/text".into(),content_type:Some("image/png".into()),
+            bytes:Arc::from(&b"text payload"[..]),script_context:Some(response_context.clone()),
+        })).unwrap();
+        let client = BrowserModuleClient {
+            self_url:"https://page.test/document".into(),origin:"https://page.test".into(),
+            referrer_policy:lumen_common::referrer::ReferrerPolicy::Origin,
+            policies:Arc::new(lumen_common::csp::PolicySet::default()),import_map:None,
+        };
+        let loader = make_browser_module_loader(move ||Some(client.clone()),lumen_web::FetchConfig::default(),resources.clone(),Arc::new(Mutex::new(Vec::new())));
+        let request = |kind:Option<&str>|lumen::ModuleFetchRequest {
+            settings_key:1,resolution:None,specifier:"https://page.test/data#identity".into(),referrer:"https://page.test/source.js".into(),
+            attribute_type:kind.map(str::to_owned),script_context:Some(std::rc::Rc::new(lumen::ClassicScriptContext {
+                base_url:"https://page.test/source.js".into(),nonce:"later".into(),credentials_mode:"omit".into(),referrer_policy:"origin".into(),
+            })),
+        };
+        let javascript = loader(request(None)).expect("JavaScript response");
+        assert_eq!(javascript.key,"https://page.test/data#identity");
+        let context = javascript.script_context.expect("response context");
+        assert_eq!(context.base_url,"https://cdn.test/final.js#identity");
+        assert_eq!(context.nonce,"first");
+        assert_eq!(context.credentials_mode,"include");
+        assert_eq!(context.referrer_policy,"no-referrer");
+        let json = loader(request(Some("json"))).expect("separate JSON response");
+        assert_eq!(json.key,javascript.key);
+        assert_eq!(json.source,"{\"value\":2}");
+        assert_eq!(loader(request(Some("text"))).expect("HTML text module ignores MIME type").source,"text payload");
+        assert!(loader(request(Some("bytes"))).is_none(),"Node byte modules are not an HTML module type");
+        let mut data_request = request(Some("json"));
+        data_request.specifier = "data:application/json,%7B%22value%22%3A3%7D#identity".into();
+        let data = loader(data_request).expect("canonical bounded data-URL JSON decoding");
+        assert_eq!(data.source,"{\"value\":3}");
+        assert!(data.key.ends_with("#identity"));
+        assert_eq!(fetches.load(Ordering::Relaxed),1);
+        assert!(resources.fetch_once_for_type("https://page.test/retry",None,||Err("network failure".into())).is_err());
+        assert!(resources.get("https://page.test/retry").is_none(),"failed browser flights are removed");
+        assert!(resources.fetch_once_for_type("https://page.test/retry",None,||Ok(resource.clone())).is_ok(),"later requests retry after a failed flight");
+        resources.insert_for_type("https://page.test/data#identity".into(),Some(""),Ok(PrefetchedModuleResource {
+            final_url:"https://page.test/empty-type".into(),content_type:None,bytes:Arc::from(&b"empty"[..]),script_context:None,
+        })).unwrap();
+        assert_eq!(resources.get_for_type("https://page.test/data#identity",Some("")).unwrap().unwrap().bytes.as_ref(),b"empty");
+        assert_eq!(resources.get("https://page.test/data#identity").unwrap().unwrap().bytes.as_ref(),resource.bytes.as_ref(),"absent and empty types are distinct without sentinels");
+        assert!(resources.get("https://page.test/data#other").is_none(),"fragments select distinct response-option identities");
+        let integrity_client=BrowserModuleClient {self_url:"https://page.test/".into(),origin:"https://page.test".into(),
+            referrer_policy:lumen_common::referrer::ReferrerPolicy::Origin,policies:Arc::new(lumen_common::csp::PolicySet::default()),import_map:None};
+        let mut integrity_fetch=BrowserModuleFetch::descendant(integrity_client,"https://page.test/main.js",None);
+        integrity_fetch.integrity="sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=".into();
+        assert!(fetch_browser_module_resource("data:text/plain,abc",Some("text"),&integrity_fetch,&lumen_web::FetchConfig::default()).0.is_ok());
+        assert!(fetch_browser_module_resource("data:text/plain,abcd",Some("text"),&integrity_fetch,&lumen_web::FetchConfig::default()).0.is_err());
+        assert!(resolve_browser_module_request("package","https://page.test/source.js").is_none());
+        assert_eq!(resolve_browser_module_request("https://other.test/module.js#fragment","https://page.test/source.js").as_deref(),Some("https://other.test/module.js#fragment"));
+    }
+
+    #[test]
+    fn specification_import_maps_graph_io_returns_requests_before_settings_thread_resolution() {
+        let map=lumen_common::import_maps::ImportMapState::shared();
+        let client=BrowserModuleClient {self_url:"https://page.test/document".into(),origin:"https://page.test".into(),
+            referrer_policy:lumen_common::referrer::ReferrerPolicy::Origin,policies:Arc::new(lumen_common::csp::PolicySet::default()),import_map:Some(map.clone())};
+        let root="data:text/javascript,import%20%27late%27%3B";
+        let resources=PrefetchedModuleResources::default();
+        let (mut graph,request)=BrowserModuleGraph::start(root.into(),None,BrowserModuleFetch::descendant(client,"https://page.test/document",None));
+        let worker_resources=resources.clone();
+        let (completion,_)=std::thread::spawn(move||fetch_browser_module_graph_resource(request,&lumen_web::FetchConfig::default(),&worker_resources)).join().unwrap();
+        // An author turn may register a map after the response arrives but before its task runs.
+        map.lock().unwrap().register(lumen_common::import_maps::ImportMap::parse(
+            r#"{"imports":{"late":"data:text/javascript,export%20const%20value%3D1%3B"}}"#,"https://page.test/document").unwrap()).unwrap();
+        let mut children=graph.complete(completion);
+        assert_eq!(children.len(),1);
+        assert_eq!(children[0].url,"data:text/javascript,export%20const%20value%3D1%3B");
+        assert!(graph.outcome().is_none());
+        let (completion,_)=fetch_browser_module_graph_resource(children.pop().unwrap(),&lumen_web::FetchConfig::default(),&resources);
+        assert!(graph.complete(completion).is_empty());
+        assert!(matches!(graph.outcome(),Some(Ok(()))));
+    }
+
+    #[test]
+    fn specification_import_maps_actual_async_graph_resolution_integrity_and_typed_cache() {
+        let state=lumen_common::import_maps::ImportMapState::shared();
+        state.lock().unwrap().register(lumen_common::import_maps::ImportMap::parse(
+            r#"{"imports":{"mapped":"data:text/javascript,export%20const%20value%3D9%3B","blocked":null}}"#,"https://page.test/document").unwrap()).unwrap();
+        let client=BrowserModuleClient {self_url:"https://page.test/document".into(),origin:"https://page.test".into(),
+            referrer_policy:lumen_common::referrer::ReferrerPolicy::Origin,
+            policies:Arc::new(lumen_common::csp::PolicySet::default()),import_map:Some(state.clone())};
+        let resources=PrefetchedModuleResources::default();
+        let root="data:text/javascript,import%20%27mapped%27%3B";
+        let fetch=BrowserModuleFetch::descendant(client.clone(),"https://page.test/document",None);
+        assert!(prepare_browser_module_graph(root,None,fetch,&lumen_web::FetchConfig::default(),&resources).0.is_ok());
+        let mapped=client.resolve("mapped",root).unwrap();
+        assert!(resources.get(&mapped.url).is_some(),"the real graph loader fetched mapped dependencies through canonical resource routing");
+        let loader=make_browser_module_loader(move||Some(client.clone()),lumen_web::FetchConfig::default(),resources.clone(),Arc::new(Mutex::new(Vec::new())));
+        let module=loader(lumen::ModuleFetchRequest {settings_key:1,resolution:Some(mapped.clone()),specifier:"mapped".into(),referrer:root.into(),attribute_type:None,script_context:None}).expect("same typed requested-URL module cache");
+        assert_eq!(module.key,mapped.url);
+        assert_eq!(module.source,"export const value=9;");
+        assert!(state.lock().unwrap().resolve("blocked",root).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn specification_browser_module_repeated_typed_imports_settle_and_retry_failed_mime() {
+        use super::*;
+        use std::io::{Read,Write};
+        use std::rc::Rc;
+        use std::cell::RefCell;
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").expect("module server");
+        let address=listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stopping=Arc::new(AtomicBool::new(false));let stop=stopping.clone();
+        let server=std::thread::spawn(move|| {
+            let mut requests=HashMap::<String,usize>::new();
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
+            while !stop.load(Ordering::Relaxed) && std::time::Instant::now()<deadline {
+                let (mut stream,_)=match listener.accept() {
+                    Ok(value)=>value,Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(std::time::Duration::from_millis(1));continue;},Err(error)=>panic!("accept: {error}"),
+                };
+                // Accepted sockets can inherit nonblocking mode on macOS.
+                // The bounded fixture reads use their actual blocking timeout.
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut request=Vec::new();let mut chunk=[0;1024];
+                while !request.windows(4).any(|window|window==b"\r\n\r\n") {
+                    let read=stream.read(&mut chunk).unwrap();assert_ne!(read,0);request.extend_from_slice(&chunk[..read]);
+                }
+                let text=String::from_utf8_lossy(&request);let path=text.split_ascii_whitespace().nth(1).expect("path").to_owned();
+                let count=requests.entry(path.clone()).or_default();
+                let javascript=match path.as_str() {"/retry"|"/firsttext"=>*count!=0,"/firstjs"=>*count==0,_=>false};
+                *count+=1;
+                let (mime,body)=if javascript {("text/javascript","export default 'world';")}else {("text/plain","hello")};
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+            requests
+        });
+        let origin=format!("http://{address}");
+        let client=BrowserModuleClient {self_url:format!("{origin}/document"),origin:origin.clone(),referrer_policy:lumen_common::referrer::ReferrerPolicy::Origin,
+            policies:Arc::new(lumen_common::csp::PolicySet::default()),import_map:None};
+        let resources=PrefetchedModuleResources::default();let config=lumen_web::FetchConfig::default();
+        let loader=make_browser_module_loader({let client=client.clone();move||Some(client.clone())},config.clone(),resources.clone(),Arc::new(Mutex::new(Vec::new())));
+        let mut engine=lumen::Engine::new();
+        engine.ctx().install_module_fetch_loader(Rc::new(loader));
+        engine.ctx().install_module_api_base_for_host(Rc::new(move||format!("{origin}/document")));
+        let queued=Rc::new(RefCell::new(Vec::new()));let queue=queued.clone();
+        engine.ctx().install_async_module_import_handler(Rc::new(move|request|queue.borrow_mut().push(request)));
+        let result=engine.eval(r#"
+            globalThis.repeatedDone=false;globalThis.repeatedError='';
+            (async()=>{
+                const rejected=async specifier=>{try {await import(specifier);throw new Error('accepted wrong MIME');}catch(error){if(!(error instanceof TypeError))throw error;}};
+                await rejected('./file');
+                if((await import('./file',{with:{type:'text'}})).default!=='hello')throw new Error('text after failure');
+                if((await import('./file#2',{with:{type:'text'}})).default!=='hello')throw new Error('fragment');
+                await rejected('./file#2');
+                const first=await import('./firsttext',{with:{type:'text'}});
+                if(first.default!=='hello'||(await import('./firsttext')).default!=='world')throw new Error('different type');
+                if(first!==(await import('./firsttext',{with:{type:'text'}})))throw new Error('text namespace identity');
+                await rejected('./retry');
+                if((await import('./retry')).default!=='world')throw new Error('retry after failed MIME');
+                const js=await import('./firstjs');
+                if(js.default!=='world'||(await import('./firstjs',{with:{type:'text'}})).default!=='hello')throw new Error('reverse type');
+                if(js!==(await import('./firstjs')))throw new Error('JavaScript namespace identity');
+                repeatedDone=true;
+            })().catch(error=>{repeatedError=String(error);});
+        "#,false).expect("authored repeated imports");
+        assert!(matches!(result,lumen::Completion::Value(_)),"authored imports must start without throwing");
+        let mut completed=0;
+        for _ in 0..32 {
+            let requests=std::mem::take(&mut *queued.borrow_mut());
+            if requests.is_empty() {break;}
+            for request in requests {
+                let resolved=request.resolution.clone().unwrap_or_else(||client.resolve(&request.specifier,&request.referrer).unwrap());
+                let mut fetch=BrowserModuleFetch::descendant(client.clone(),&request.referrer,request.script_context.as_deref());fetch.integrity=resolved.integrity;
+                let (outcome,_)=prepare_browser_module_graph(&resolved.url,request.attribute_type.as_deref(),fetch,&config,&resources);
+                match outcome {
+                    Ok(())=>{let _=engine.ctx().complete_prepared_module_import_for_host(request.id);},
+                    Err(error)=>engine.ctx().reject_prepared_module_import_for_host(request.id,&error).expect("real import rejection"),
+                }
+                completed+=1;
+            }
+            let _=engine.eval("void 0",false).expect("real Promise job checkpoint");
+        }
+        stopping.store(true,Ordering::Relaxed);
+        let requests=server.join().expect("module server completion");
+        assert_eq!(completed,12,"every authored dynamic import receives one real completion");
+        assert!(matches!(engine.eval("repeatedDone && repeatedError === ''",false),Ok(lumen::Completion::Value(ref result)) if result=="true"),"authored imports must finish; requests={requests:?}");
+        assert_eq!(requests.get("/retry"),Some(&2),"failed MIME admission must permit a later fetch");
+        assert_eq!(requests.get("/firsttext"),Some(&2),"type isolates cache and successful text reuse makes no request");
+        assert_eq!(requests.get("/firstjs"),Some(&2),"JavaScript reuse preserves its own namespace and response");
+        assert_eq!(requests.get("/file"),Some(&4),"fragment and type both contribute to real module identity");
+    }
+
     #[test]
     fn typescript_star_exports_are_followed_as_reexports() {
         use super::*;
@@ -1565,7 +2133,8 @@ const x = require("./not-a-reexport");"#;
                 Ok(PrefetchedModuleResource {
                     final_url: "http://example.test/final.js?x=1".into(),
                     content_type: Some("text/javascript".into()),
-                    bytes: b"export {};".to_vec(),
+                    bytes: b"export {};".to_vec().into(),
+                    script_context: None,
                 }),
             )
             .unwrap();
@@ -1594,7 +2163,8 @@ const x = require("./not-a-reexport");"#;
                 Ok(PrefetchedModuleResource {
                     final_url: "http://example.test/large.js".into(),
                     content_type: Some("text/javascript".into()),
-                    bytes: oversized.into_bytes(),
+                    bytes: oversized.into_bytes().into(),
+                    script_context: None,
                 }),
             )
             .is_err());
@@ -1618,7 +2188,8 @@ const x = require("./not-a-reexport");"#;
                 Ok(PrefetchedModuleResource {
                     final_url: "http://example.test:8000/final/dep.js?variant=one".into(),
                     content_type: Some("text/javascript".into()),
-                    bytes: b"export const answer = 42;".to_vec(),
+                    bytes: b"export const answer = 42;".to_vec().into(),
+                    script_context: None,
                 }),
             )
             .unwrap();

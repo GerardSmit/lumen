@@ -16,7 +16,7 @@ lumen = { path = "../lumen", default-features = false }
 lumen-bind = { path = "../lumen-bind" }
 lumen-host = { path = "../lumen-host", default-features = false, features = ["webcrypto"] }
 lumen-os = { path = "../lumen-os" }
-lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "cookies", "csp", "compress"] }
 lumen-codegen = { path = "../lumen-codegen" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -28,6 +28,10 @@ js-sys = "0.3"
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[build-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 [features]
 default = ["compiler", "jit", "aot-native", "intl", "typed"]

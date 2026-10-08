@@ -8,6 +8,8 @@
 //! turn.
 
 use std::time::Duration;
+use std::rc::Rc;
+use std::collections::HashMap;
 
 use lumen_common::deadline::DeadlineQueue;
 
@@ -60,6 +62,53 @@ struct Entry {
     /// Node's `timer.unref()`: an unref'd timer still fires if the loop is alive for another
     /// reason, but does not by itself keep it alive.
     refed: bool,
+    browser: Option<Box<BrowserEntry>>,
+}
+
+/// Browser adapters supply actual settings/policy and classic-script execution.
+/// These function pointers own no realm or JavaScript handles.
+pub struct BrowserHooks {
+    pub capture: fn(&mut Ctx, &str, bool) -> Result<Rc<lumen::ClassicScriptContext>, OpError>,
+    pub eligible: fn(&mut Ctx) -> bool,
+    pub script: fn(&mut Ctx, &str, Rc<lumen::ClassicScriptContext>) -> Result<(), Value>,
+    pub report: fn(&mut Ctx, Value) -> bool,
+}
+
+#[derive(Clone)]
+pub struct TimerScript {
+    pub source: String,
+    pub context: Rc<lumen::ClassicScriptContext>,
+}
+
+struct BrowserEntry {
+    public_id: i32,
+    script: Option<Rc<TimerScript>>,
+    hooks: Rc<BrowserHooks>,
+    nesting: u32,
+    generation: u64,
+    timeout: u32,
+}
+
+pub struct TimerFiring {
+    pub callback: Value,
+    pub args: Vec<Value>,
+    pub owner: RealmHandle,
+    browser: Option<BrowserFiring>,
+}
+
+struct BrowserFiring {
+    id: u64,
+    generation: u64,
+    nesting: u32,
+    script: Option<Rc<TimerScript>>,
+    hooks: Rc<BrowserHooks>,
+}
+
+impl TimerFiring {
+    pub fn is_browser(&self) -> bool { self.browser.is_some() }
+    pub fn script_context(&self) -> Option<&lumen::ClassicScriptContext> {
+        self.browser.as_ref()?.script.as_ref().map(|script| script.context.as_ref())
+    }
 }
 
 /// The timer heap. Cancellation is lazy: `clear*` removes the entry; stale heap nodes are
@@ -69,11 +118,20 @@ pub struct Timers {
     limit: Option<usize>,
     queue: DeadlineQueue<Instant, Entry>,
     unref_count: usize,
+    current_nesting: Option<u32>,
+    // HTML's ID map is realm-qualified; the deadline heap keeps its own unique
+    // handles. No JavaScript handles are retained by these lookup keys.
+    browser_ids: HashMap<(usize, i32), u64>,
+    next_browser_id: i32,
 }
 
 impl Timers {
     fn remove_entry(&mut self, id: u64) {
         if let Some(entry) = self.queue.remove(id) {
+            if let Some(browser) = &entry.browser {
+                self.browser_ids.remove(&(realm_key(&entry.owner), browser.public_id));
+                if self.browser_ids.is_empty() { self.browser_ids = HashMap::new(); }
+            }
             if !entry.refed {
                 self.unref_count -= 1;
             }
@@ -98,6 +156,7 @@ impl Timers {
                 delay,
                 repeat: repeat.then_some(delay),
                 refed: true,
+                browser: None,
             },
         )
     }
@@ -130,6 +189,9 @@ impl Timers {
             keep
         });
         self.unref_count -= unref_removed;
+        let key = realm_key(realm);
+        self.browser_ids.retain(|(owner, _), _| *owner != key);
+        if self.browser_ids.is_empty() { self.browser_ids = HashMap::new(); }
         let cancelled = before - self.queue.len();
         if cancelled != 0 {
             self.queue.compact();
@@ -202,13 +264,24 @@ impl Timers {
     /// Taking one at a time and running it before taking the next is what lets a timer callback
     /// cancel or refresh another timer that is due in the same turn, as in Node.
     pub fn take_next_due(&mut self, now: Instant) -> Option<(Value, Vec<Value>, RealmHandle)> {
+        let firing = self.take_next_firing(now)?;
+        // Legacy embeddings only install the callable timer globals. Browser
+        // adapters must run the firing ticket and complete its lifecycle.
+        assert!(!firing.is_browser(), "browser timer tickets require run_browser_firing");
+        Some((firing.callback, firing.args, firing.owner))
+    }
+
+    pub fn take_next_firing(&mut self, now: Instant) -> Option<TimerFiring> {
         let (id, deadline) = self.queue.pop_due(now)?;
         let entry = self.queue.get(id).expect("live entry");
-        let due = (
-            entry.callback.clone(),
-            entry.args.clone(),
-            entry.owner.clone(),
-        );
+        let due = TimerFiring {
+            callback: entry.callback.clone(), args: entry.args.clone(), owner: entry.owner.clone(),
+            browser: entry.browser.as_ref().map(|browser| BrowserFiring {
+                id, generation: browser.generation, nesting: browser.nesting,
+                script: browser.script.clone(), hooks: browser.hooks.clone(),
+            }),
+        };
+        if due.is_browser() { return Some(due); }
         match entry.repeat {
             Some(period) => {
                 // Keep the cadence, catching up on a short lag (the OS timer granularity makes
@@ -236,6 +309,70 @@ impl Timers {
         }
         Some(due)
     }
+
+    fn finish_browser_firing(&mut self, firing: &TimerFiring, now: Instant) {
+        let Some(ticket) = &firing.browser else { return; };
+        let Some(entry) = self.queue.get_mut(ticket.id) else { return; };
+        let Some(browser) = entry.browser.as_mut() else { return; };
+        if !entry.owner.same_realm(&firing.owner) || browser.generation != ticket.generation { return; }
+        if entry.repeat.is_none() {
+            self.remove_entry(ticket.id);
+        } else {
+            browser.nesting = ticket.nesting.saturating_add(1);
+            browser.generation = browser.generation.wrapping_add(1);
+            let delay = browser_delay(browser.timeout, ticket.nesting);
+            entry.delay = delay;
+            self.queue.rearm(ticket.id, now + delay);
+        }
+        self.queue.compact();
+        self.queue.release_idle_capacity();
+    }
+}
+
+fn realm_key(owner: &RealmHandle) -> usize {
+    owner.global().object_identity().expect("realm global identity")
+}
+
+fn browser_delay(timeout: u32, nesting: u32) -> Duration {
+    Duration::from_millis(if nesting > 5 { timeout.max(4) } else { timeout } as u64)
+}
+
+/// Execute one browser ticket and finish its timer task before a microtask
+/// checkpoint. Failure provenance follows the Function callback or script global.
+pub fn run_browser_firing(ctx: &mut Ctx, firing: TimerFiring) -> Option<(Value, RealmHandle)> {
+    let ticket = firing.browser.as_ref()?;
+    let valid = ctx.host_mut::<Timers>().and_then(|timers| timers.queue.get(ticket.id))
+        .is_some_and(|entry| entry.owner.same_realm(&firing.owner)
+            && entry.browser.as_ref().is_some_and(|entry| entry.generation == ticket.generation));
+    if !valid { return None; }
+    let old_nesting = ctx.host_mut::<Timers>().expect("timer heap").current_nesting.replace(ticket.nesting);
+    let owner = if ticket.script.is_some() { firing.owner.clone() } else {
+        lumen::embed::JsFunction::from_value(firing.callback.clone())
+            .and_then(|function| ctx.function_host_realm(&function).ok()).unwrap_or_else(|| firing.owner.clone())
+    };
+    let mut aborted = false;
+    let result = ctx.with_host_realm(&firing.owner, |ctx| {
+        if !(ticket.hooks.eligible)(ctx) { aborted = true; return Ok(()); }
+        match &ticket.script {
+            Some(script) => (ticket.hooks.script)(ctx, &script.source, script.context.clone()),
+            None => { let this = ctx.global_this(); ctx.invoke(firing.callback.clone(), this, &firing.args)
+                .map(|_| ()) },
+        }
+    });
+    let mut failure = match result {
+        Ok(Err(error)) => Some((error, owner)),
+        Err(error) => Some((ctx.make_error("Error", error.to_string()), firing.owner.clone())),
+        Ok(Ok(())) => None,
+    };
+    if let Some((error, owner)) = &failure {
+        let reported = ctx.with_host_realm(owner, |ctx| (ticket.hooks.report)(ctx, error.clone())).unwrap_or(false);
+        if reported { failure = None; }
+    }
+    let timers = ctx.host_mut::<Timers>().expect("timer heap");
+    timers.current_nesting = old_nesting;
+    if aborted { timers.clear(ticket.id, &firing.owner); }
+    else { timers.finish_browser_firing(&firing, Instant::now()); }
+    failure
 }
 
 /// WHATWG timer-initialization steps, abridged: coerce the delay (NaN/negative -> 0), stash
@@ -264,6 +401,13 @@ fn schedule(
 /// heap and cancellation/lifetime rules as the JavaScript timer globals. Browser subsystems use
 /// this for asynchronous operations whose completion must be ordered by real elapsed time, rather
 /// than introducing a second callback queue or blocking the event loop.
+/// Cancel only a timer owned by the current host realm. Native browser services
+/// use this same heap admission/cancellation path as author timers.
+pub fn cancel_host_callback(ctx:&mut Ctx,id:u64) {
+    let owner=ctx.current_host_realm();
+    if let Some(timers)=ctx.host_mut::<Timers>() {timers.clear(id,&owner);}
+}
+
 pub fn schedule_host_callback(
     ctx: &mut Ctx,
     callback: Value,
@@ -297,6 +441,89 @@ fn schedule_delay(
         return Err(NativeError::overflow("timer capacity exhausted").into());
     }
     Ok(timers.schedule(callback, args.to_vec(), owner, delay, repeat, deadline))
+}
+
+#[cfg(feature = "hosted")]
+pub fn install_browser(ctx: &mut Ctx, hooks: BrowserHooks) -> Result<(), OpError> {
+    if ctx.host_mut::<Timers>().is_none() { ctx.op_state().put(Timers::default()); }
+    lumen_host::realm_services::RealmServices::replace_current(ctx, hooks);
+    let global = ctx.global_object();
+    ctx.install_module::<browser::Module>(&global).map_err(OpError::thrown)
+}
+
+#[cfg(feature = "hosted")]
+fn schedule_browser(ctx: &mut Ctx, handler: Value, timeout: Value, args: &[Value], repeat: bool) -> Result<f64, OpError> {
+    let hooks = lumen_host::realm_services::RealmServices::<BrowserHooks>::current(ctx)
+        .ok_or_else(|| OpError::new("InvalidStateError", "browser timer settings unavailable"))?;
+    // WebIDL union conversion precedes timeout conversion and ID allocation.
+    let (callback, source) = if handler.is_callable() { (handler, None) } else {
+        let source = ctx.coerce_string(&handler)?.to_string();
+        (Value::Undefined, Some(source))
+    };
+    let timeout = ctx.webidl_long(&timeout)?;
+    let timeout = timeout.max(0) as u32;
+    // Trusted Types is timer initialization step 1, after all WebIDL argument
+    // conversions; a timeout conversion may itself execute author code.
+    let script = match source {
+        Some(source) => { let context = (hooks.capture)(ctx, &source, repeat)?;
+            Some(Rc::new(TimerScript { source, context })) },
+        None => None,
+    };
+    let owner = ctx.current_host_realm();
+    let timers = ctx.host_mut::<Timers>().ok_or_else(|| OpError::new("InvalidStateError", "timer heap unavailable"))?;
+    if timers.limit.is_some_and(|limit| timers.queue.len() >= limit) { return Err(NativeError::overflow("timer capacity exhausted").into()); }
+    let nesting = timers.current_nesting.unwrap_or(0);
+    let delay = browser_delay(timeout, nesting);
+    let deadline = Instant::now().checked_add(delay).ok_or_else(|| NativeError::overflow("timer delay exceeds clock range"))?;
+    let key = realm_key(&owner);
+    // One shared cursor gives the ordinary allocation O(1), including pages
+    // with many timers. Wrap within positive WebIDL long and skip live IDs in
+    // this realm; the heap handle and firing generation never alias reused IDs.
+    let mut public_id = timers.next_browser_id.checked_add(1).unwrap_or(1);
+    let first = public_id;
+    while timers.browser_ids.contains_key(&(key, public_id)) {
+        public_id = public_id.checked_add(1).unwrap_or(1);
+        if public_id == first { return Err(NativeError::overflow("browser timer IDs exhausted").into()); }
+    }
+    timers.next_browser_id = public_id;
+    // The string-script branch never consumes extra arguments. Retaining them
+    // would unnecessarily keep arbitrary author objects alive until firing.
+    let arguments = if script.is_some() { Vec::new() } else { args.to_vec() };
+    let id = timers.schedule(callback, arguments, owner, delay, repeat, deadline);
+    timers.browser_ids.insert((key, public_id), id);
+    timers.queue.get_mut(id).expect("new timer").browser = Some(Box::new(BrowserEntry {
+        public_id, script, hooks, nesting: nesting.saturating_add(1), generation: 1, timeout,
+    }));
+    Ok(public_id as f64)
+}
+
+#[cfg(feature = "hosted")]
+#[lumen_bind::module(name = "browser_timers")]
+mod browser {
+    use super::*;
+    #[op(name = "setTimeout")]
+    fn set_timeout(ctx: &mut Ctx, handler: Value, #[default(Value::Num(0.0))] timeout: Value, #[varargs] args: &[Value]) -> Result<f64, OpError> {
+        schedule_browser(ctx, handler, timeout, args, false)
+    }
+    #[op(name = "setInterval")]
+    fn set_interval(ctx: &mut Ctx, handler: Value, #[default(Value::Num(0.0))] timeout: Value, #[varargs] args: &[Value]) -> Result<f64, OpError> {
+        schedule_browser(ctx, handler, timeout, args, true)
+    }
+    #[op(name = "clearTimeout")]
+    fn clear_timeout(ctx: &mut Ctx, #[default(Value::Num(0.0))] id: Value) -> Result<(), Value> { clear_browser_timer(ctx, id) }
+    #[op(name = "clearInterval")]
+    fn clear_interval(ctx: &mut Ctx, #[default(Value::Num(0.0))] id: Value) -> Result<(), Value> { clear_browser_timer(ctx, id) }
+    fn clear_browser_timer(ctx: &mut Ctx, id: Value) -> Result<(), Value> {
+        let id = ctx.webidl_long(&id)?;
+        let owner = ctx.current_host_realm();
+        if id > 0 {
+            let timers = ctx.host_mut::<Timers>().expect("timer heap");
+            if let Some(handle) = timers.browser_ids.get(&(realm_key(&owner), id)).copied() {
+                timers.clear(handle, &owner);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A timer id argument; `None` for ids that name no timer (non-numeric, negative, NaN).
@@ -402,5 +629,104 @@ mod immediate {
         }
         CallbackQueue::enqueue(ctx.op_state(), callback, args.to_vec());
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "hosted"))]
+mod tests {
+    use super::*;
+
+    fn hooks() -> BrowserHooks {
+        BrowserHooks {
+            capture: |ctx, _, _| Ok(ctx.default_classic_script_context()), eligible: |_| true,
+            script: |ctx, source, context| ctx.run_classic_script(source, context).map(|_| ()).map_err(lumen::embed::abrupt_value),
+            report: |_, _| false,
+        }
+    }
+
+    #[test]
+    fn specification_browser_timer_generations_repeat_after_execution_and_reset_nesting() {
+        let mut engine = lumen::Engine::new();
+        install_browser(engine.ctx(), hooks()).unwrap_or_else(|_| panic!("browser timers install"));
+        engine.eval_value("globalThis.calls=0; globalThis.repeat=setInterval(()=>{calls++;},0)")
+            .expect("interval parses").ok().expect("interval registers");
+        let now = Instant::now() + Duration::from_secs(1);
+        let first = engine.ctx().host_mut::<Timers>().expect("heap").take_next_firing(now).expect("first ticket");
+        let duplicate = TimerFiring { callback: first.callback.clone(), args: first.args.clone(), owner: first.owner.clone(),
+            browser: first.browser.as_ref().map(|ticket| BrowserFiring { id: ticket.id, generation: ticket.generation,
+                nesting: ticket.nesting, script: ticket.script.clone(), hooks: ticket.hooks.clone() }) };
+        let id = first.browser.as_ref().expect("browser ticket").id;
+        assert_eq!(engine.ctx().host_mut::<Timers>().expect("heap").queue.get(id).expect("entry").browser.as_ref().expect("browser").generation, 1);
+        assert!(run_browser_firing(engine.ctx(), first).is_none());
+        assert_eq!(engine.ctx().host_mut::<Timers>().expect("heap").queue.get(id).expect("entry").browser.as_ref().expect("browser").generation, 2);
+        assert!(run_browser_firing(engine.ctx(), duplicate).is_none());
+        assert!(matches!(engine.eval_value("calls"), Ok(Ok(Value::Num(1.0)))), "stale generation cannot execute or repeat");
+        let next = engine.ctx().host_mut::<Timers>().expect("heap").take_next_firing(now).expect("repeat ticket");
+        engine.eval_value("clearTimeout(repeat)").expect("clear parses").ok().expect("clear runs");
+        assert!(run_browser_firing(engine.ctx(), next).is_none());
+        assert!(matches!(engine.eval_value("calls"), Ok(Ok(Value::Num(1.0)))), "clearing the ID invalidates an already-ready ticket");
+        assert_eq!(browser_delay(0, 5), Duration::ZERO);
+        assert_eq!(browser_delay(0, 6), Duration::from_millis(4));
+        engine.ctx().host_mut::<Timers>().expect("heap").current_nesting = Some(6);
+        engine.eval_value("globalThis.nested=setTimeout(()=>{},0)").expect("nested parses").ok().expect("nested runs");
+        engine.ctx().host_mut::<Timers>().expect("heap").current_nesting = None;
+        let callback = engine.eval_value("()=>{globalThis.checkpointTimer=setTimeout(()=>{},0)}")
+            .expect("microtask parses").ok().expect("microtask evaluates");
+        engine.ctx().queue_microtask(callback);
+        engine.run_microtasks();
+        let timers = engine.ctx().host_mut::<Timers>().expect("heap");
+        let mut levels: Vec<_> = timers.queue.values().filter_map(|entry| entry.browser.as_ref().map(|browser| (browser.nesting, entry.delay))).collect();
+        levels.sort();
+        assert_eq!(levels, [(1, Duration::ZERO), (7, Duration::from_millis(4))], "checkpoint timers do not inherit the preceding task nesting");
+    }
+
+    #[test]
+    fn specification_browser_timer_public_ids_wrap_without_aliasing_ready_handles() {
+        let mut engine = lumen::Engine::new();
+        install_browser(engine.ctx(), hooks()).unwrap_or_else(|_| panic!("browser timers install"));
+        engine.eval_value("globalThis.oldCalls=0;globalThis.newCalls=0;globalThis.oldId=setTimeout(()=>{oldCalls++},0)")
+            .expect("old timer parses").ok().expect("old timer registers");
+        let old = engine.ctx().host_mut::<Timers>().expect("heap").take_next_firing(Instant::now() + Duration::from_secs(1)).expect("old ready ticket");
+        engine.eval_value("clearInterval(oldId)").expect("clear parses").ok().expect("clear runs");
+        engine.ctx().host_mut::<Timers>().expect("heap").next_browser_id = i32::MAX;
+        engine.eval_value("globalThis.newId=setTimeout(()=>{newCalls++},0)").expect("new timer parses").ok().expect("new timer registers");
+        assert!(matches!(engine.eval_value("oldId === newId && newId === 1"), Ok(Ok(Value::Bool(true)))), "public long wraps and may reuse a cleared ID");
+        assert!(run_browser_firing(engine.ctx(), old).is_none());
+        let new = engine.ctx().host_mut::<Timers>().expect("heap").take_next_firing(Instant::now() + Duration::from_secs(1)).expect("new ready ticket");
+        assert!(run_browser_firing(engine.ctx(), new).is_none());
+        assert!(matches!(engine.eval_value("oldCalls === 0 && newCalls === 1"), Ok(Ok(Value::Bool(true)))), "public ID reuse cannot revalidate an old unique handle");
+        let timers = engine.ctx().host_mut::<Timers>().expect("heap");
+        assert!(timers.browser_ids.is_empty() && timers.queue.is_empty());
+    }
+
+    #[test]
+    fn specification_browser_timer_cancellation_releases_actual_function_and_source_owners() {
+        let mut engine = lumen::Engine::new();
+        let child = engine.ctx().create_host_realm();
+        let weak = engine.ctx().weak_value(&child.global()).expect("child global");
+        let (ignored_argument, function_argument) = engine.ctx().with_host_realm(&child, |ctx| {
+            install_browser(ctx, hooks()).unwrap_or_else(|_| panic!("browser timers install"));
+            let context = Rc::new(lumen::ClassicScriptContext { base_url: "https://timer.test/captured.js".into(), ..Default::default() });
+            let ignored = ctx.run_classic_script("({ marker: 'unused string argument' })", context.clone()).ok().expect("ignored object evaluates");
+            let passed = ctx.run_classic_script("({ marker: 'function argument' })", context.clone()).ok().expect("function argument evaluates");
+            let ignored_argument = ctx.weak_value(&ignored).expect("ignored object weak identity");
+            let function_argument = ctx.weak_value(&passed).expect("function object weak identity");
+            let callback = ctx.run_classic_script("(function(extra) {})", context).ok().expect("callback evaluates");
+            schedule_browser(ctx, callback, Value::Num(1000.0), &[passed], false)
+                .unwrap_or_else(|_| panic!("Function timer registers"));
+            schedule_browser(ctx, Value::str("globalThis.pending=true"), Value::Num(1000.0), &[ignored], false)
+                .unwrap_or_else(|_| panic!("string timer registers"));
+            (ignored_argument, function_argument)
+        }).expect("child realm enters");
+        engine.ctx().dispose_host_realm(&child).expect("child retires");
+        engine.collect_garbage();
+        assert!(weak.upgrade().is_some(), "pending timers legitimately retain their admitting global and callback");
+        assert!(ignored_argument.upgrade().is_none(), "unused string-timer arguments cannot root objects while the timer remains pending");
+        assert!(function_argument.upgrade().is_some(), "Function-timer extra arguments retain their exact object until firing or cancellation");
+        assert_eq!(engine.ctx().host_mut::<Timers>().expect("heap").cancel_realm(&child), 2);
+        drop(child);
+        engine.collect_garbage();
+        assert!(function_argument.upgrade().is_none(), "canceling the Function timer releases its actual argument owner");
+        assert!(weak.upgrade().is_none(), "source metadata and weak hook registration cannot pin a canceled realm");
     }
 }

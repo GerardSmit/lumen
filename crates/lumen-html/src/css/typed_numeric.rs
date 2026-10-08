@@ -3,9 +3,9 @@
 //! Numeric CSS values share one bounded expression parser. Rendering supplies
 //! a context resolver; Typed OM keeps the expression tree for reification.
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, string::{String,ToString}, vec, vec::Vec};
 
-use super::{UnparsedComponent, css_list_items, parse_unparsed_value, supports_declaration};
+use super::{css_list_items, parse_unparsed_value, supports_declaration, UnparsedComponent};
 
 /// A CSS unit that can be represented by one `CSSUnitValue`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,6 +82,19 @@ pub struct NumericValue {
     pub unit: NumericUnit,
 }
 
+/// CSS calculation comparisons propagate NaN and order signed zeroes.
+pub fn numeric_minimum(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() { f64::NAN }
+    else if left == 0.0 && right == 0.0 { if left.is_sign_negative() || right.is_sign_negative() { -0.0 } else { 0.0 } }
+    else { left.min(right) }
+}
+
+pub fn numeric_maximum(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() { f64::NAN }
+    else if left == 0.0 && right == 0.0 { if left.is_sign_negative() && right.is_sign_negative() { -0.0 } else { 0.0 } }
+    else { left.max(right) }
+}
+
 /// A bounded, language-neutral CSS numeric expression.
 ///
 /// `Calc` preserves an explicit `calc()` boundary because Typed OM reification
@@ -89,6 +102,8 @@ pub struct NumericValue {
 #[derive(Clone, Debug, PartialEq)]
 pub enum NumericExpression {
     Value(NumericValue),
+    /// Scoped numeric keyword admitted only by a caller-provided named builder.
+    Identifier(&'static str),
     Calc(Box<Self>),
     Sum(Vec<Self>),
     Product(Vec<Self>),
@@ -98,6 +113,91 @@ pub enum NumericExpression {
     Negate(Box<Self>),
     Invert(Box<Self>),
     Sign(Box<Self>),
+    Function(MathFunction, Vec<Self>),
+}
+
+/// CSS Values math functions share type checking and arithmetic with the AST.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum MathFunction { Sin, Cos, Tan, Asin, Acos, Atan, Atan2, Pow, Sqrt, Hypot, Log, Exp, Abs, Mod, Rem, Round(RoundingStrategy), Progress {clamp:bool}, SiblingIndex, SiblingCount }
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum RoundingStrategy { Nearest, Up, Down, ToZero }
+impl RoundingStrategy {
+    fn name(self)->&'static str {match self {Self::Nearest=>"nearest",Self::Up=>"up",Self::Down=>"down",Self::ToZero=>"to-zero"}}
+}
+impl MathFunction {
+    pub fn name(self)->&'static str {match self {Self::Sin=>"sin",Self::Cos=>"cos",Self::Tan=>"tan",Self::Asin=>"asin",Self::Acos=>"acos",Self::Atan=>"atan",Self::Atan2=>"atan2",Self::Pow=>"pow",Self::Sqrt=>"sqrt",Self::Hypot=>"hypot",Self::Log=>"log",Self::Exp=>"exp",Self::Abs=>"abs",Self::Mod=>"mod",Self::Rem=>"rem",Self::Round(_)=>"round",Self::Progress{..}=>"progress",Self::SiblingIndex=>"sibling-index",Self::SiblingCount=>"sibling-count"}}
+    fn kind(self,types:&[NumericType])->Option<NumericType>{
+        if matches!(self,Self::SiblingIndex|Self::SiblingCount){return types.is_empty().then_some(NumericType::default());}
+        let first=*types.first()?;let number=NumericType::default();let angle=NumericType::from_unit(NumericUnit::Deg);
+        match self {
+            Self::Progress{..} if types.len()==3=>{
+                let consistent=first.add(types[1])?.add(types[2])?;
+                // A progress argument is a number, percentage or dimension;
+                // squared dimensions are calculations but not this production.
+                let plain=NumericType{percent_hint:None,..consistent};
+                if ![NumericUnit::Number,NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx,NumericUnit::Fr].into_iter().any(|unit|plain==NumericType::from_unit(unit)){return None;}
+                Some(NumericType{percent_hint:consistent.percent_hint,..number})
+            },
+            Self::Sin|Self::Cos|Self::Tan if types.len()==1&&(first==number||first==angle)=>Some(number),
+            Self::Asin|Self::Acos|Self::Atan if types.len()==1&&first==number=>Some(angle),
+            Self::Atan2 if types.len()==2 && first==types[1]=>Some(angle),
+            Self::Pow if types.len()==2&&types.iter().all(|kind|*kind==number)=>Some(number),
+            Self::Sqrt|Self::Exp if types.len()==1&&first==number=>Some(number),
+            Self::Log if (1..=2).contains(&types.len())&&types.iter().all(|kind|*kind==number)=>Some(number),
+            Self::Abs if types.len()==1=>Some(first),
+            Self::Mod|Self::Rem|Self::Round(_) if types.len()==2=>first.add(types[1]),
+            Self::Round(_) if types.len()==1&&first==number=>Some(number),
+            Self::Hypot=>{let mut result=first;for next in &types[1..]{result=result.add(*next)?;}Some(result)},
+            _=>None,
+        }
+    }
+    /// Numeric arguments use canonical units: angle inputs are degrees.
+    pub fn evaluate(self,values:&[f64],types:&[NumericType])->Option<f64>{
+        self.kind(types)?;if values.len()!=types.len(){return None;}
+        if matches!(self,Self::SiblingIndex|Self::SiblingCount){return None;}
+        if values.iter().any(|value|value.is_nan()){return Some(f64::NAN);}
+        let first=*values.first()?;let radians=if types[0]==NumericType::from_unit(NumericUnit::Deg){first*core::f64::consts::PI/180.0}else{first};
+        let degrees=180.0/core::f64::consts::PI;
+        let value=match self {
+            Self::SiblingIndex|Self::SiblingCount=>return None,
+            Self::Progress{clamp}=>{
+                let start=values[1];let end=values[2];
+                let result=if start==end {
+                    if clamp||first==start{0.0}else if first<start{f64::NEG_INFINITY}else{f64::INFINITY}
+                }else{(first-start)/(end-start)};
+                if clamp{result.clamp(0.0,1.0)}else{result}
+            },
+            Self::Sin=>libm::sin(radians),Self::Cos=>libm::cos(radians),Self::Tan=>libm::tan(radians),
+            Self::Asin=>libm::asin(first)*degrees,Self::Acos=>libm::acos(first)*degrees,Self::Atan=>libm::atan(first)*degrees,
+            Self::Atan2=>libm::atan2(first,values[1])*degrees,Self::Pow=>if first.abs()==1.0&&values[1].is_infinite(){f64::NAN}else{libm::pow(first,values[1])},Self::Sqrt=>libm::sqrt(first),
+            Self::Hypot=>values.iter().fold(0.0,|sum,value|libm::hypot(sum,*value)),
+            Self::Mod=>{
+                let step=values[1];
+                if step==0.0||first.is_infinite()||step.is_infinite()&&first.is_sign_negative()!=step.is_sign_negative(){f64::NAN}
+                else if step.is_infinite(){first}
+                else {let remainder=libm::fmod(first,step);if remainder==0.0{libm::copysign(0.0,step)}else if remainder.is_sign_negative()!=step.is_sign_negative(){remainder+step}else{remainder}}
+            },
+            Self::Rem=>{let step=values[1];if step==0.0||first.is_infinite(){f64::NAN}else if step.is_infinite(){first}else{libm::fmod(first,step)}},
+            Self::Round(strategy)=>{
+                let step=values.get(1).copied().unwrap_or(1.0).abs();
+                if step==0.0||first.is_infinite()&&step.is_infinite(){return Some(f64::NAN);}
+                if first.is_infinite(){return Some(first);}
+                if step.is_infinite(){return Some(match strategy {
+                    RoundingStrategy::Nearest|RoundingStrategy::ToZero=>libm::copysign(0.0,first),
+                    RoundingStrategy::Up=>if first>0.0{f64::INFINITY}else{libm::copysign(0.0,first)},
+                    RoundingStrategy::Down=>if first<0.0{f64::NEG_INFINITY}else{libm::copysign(0.0,first)},
+                });}
+                let ratio=first/step;
+                // Exact multiples retain their value and signed zero.
+                if libm::fmod(first,step)==0.0||!ratio.is_finite(){first}else{
+                    let multiple=match strategy {RoundingStrategy::Nearest=>libm::floor(ratio+0.5),RoundingStrategy::Up=>libm::ceil(ratio),RoundingStrategy::Down=>libm::floor(ratio),RoundingStrategy::ToZero=>libm::trunc(ratio)};
+                    if multiple==0.0{libm::copysign(0.0,first)}else{multiple*step}
+                }
+            },
+            Self::Log=>libm::log(first)/values.get(1).map_or(1.0,|base|libm::log(*base)),Self::Exp=>libm::exp(first),Self::Abs=>first.abs(),
+        };Some(value)
+    }
 }
 
 /// Limits applied before an expression is returned to CSS or Typed OM.
@@ -114,6 +214,7 @@ pub trait NumericExpressionContext {
     type Value;
 
     fn unit(&mut self, value: NumericValue) -> Option<Self::Value>;
+    fn identifier(&mut self,_name:&str)->Option<Self::Value> {None}
     fn add(&mut self, left: Self::Value, right: Self::Value) -> Option<Self::Value>;
     fn multiply(&mut self, left: Self::Value, right: Self::Value) -> Option<Self::Value>;
     fn minimum(&mut self, left: Self::Value, right: Self::Value) -> Option<Self::Value>;
@@ -127,13 +228,105 @@ pub trait NumericExpressionContext {
     fn negate(&mut self, value: Self::Value) -> Option<Self::Value>;
     fn invert(&mut self, value: Self::Value) -> Option<Self::Value>;
     fn sign(&mut self, value: Self::Value) -> Option<Self::Value>;
+    fn function(&mut self,_function:MathFunction,_values:Vec<Self::Value>,_types:Vec<NumericType>)->Option<Self::Value>{None}
 }
 
 impl NumericExpression {
+    /// Heap storage retained by this bounded expression, excluding its root.
+    /// Overflow conservatively defeats callers' bounded admission checks.
+    pub fn retained_bytes(&self) -> usize {
+        self.checked_retained_bytes().unwrap_or(usize::MAX)
+    }
+    pub fn checked_retained_bytes(&self) -> Option<usize> {
+        let boxed=|value:&Self| core::mem::size_of::<Self>().checked_add(value.checked_retained_bytes()?);
+        match self {
+            Self::Value(_)|Self::Identifier(_)=>Some(0),
+            Self::Calc(value)|Self::Negate(value)|Self::Invert(value)|Self::Sign(value)=>boxed(value),
+            Self::Clamp(lower,value,upper)=>boxed(lower)?.checked_add(boxed(value)?)?.checked_add(boxed(upper)?),
+            Self::Sum(values)|Self::Product(values)|Self::Min(values)|Self::Max(values)|Self::Function(_,values)=>{
+                let mut bytes=values.capacity().checked_mul(core::mem::size_of::<Self>())?;
+                for value in values {bytes=bytes.checked_add(value.checked_retained_bytes()?)?;}
+                Some(bytes)
+            }
+        }
+    }
+    /// Resolve leaves in place while preserving this canonical bounded tree.
+    /// The caller supplies computed unit policy; no additional expression parse
+    /// or temporary tree is needed for context-dependent image values.
+    /// Resolve a percentage-as-number property context without altering
+    /// already dimensionless subtrees (such as progress()'s dimensional inputs).
+    /// A mixed sum is typed only after its context-dependent percentages resolve.
+    pub fn percentages_as_numbers(&mut self)->Option<()>{
+        if self.numeric_type()==Some(NumericType::default()){return Some(());}
+        match self {
+            Self::Value(value)=>{if value.unit==NumericUnit::Percent{value.value/=100.0;value.unit=NumericUnit::Number;}},
+            Self::Identifier(_)=>{},
+            Self::Calc(value)|Self::Negate(value)|Self::Invert(value)|Self::Sign(value)=>value.percentages_as_numbers()?,
+            Self::Clamp(a,b,c)=>{a.percentages_as_numbers()?;b.percentages_as_numbers()?;c.percentages_as_numbers()?;},
+            Self::Function(MathFunction::Progress{..},_)=>{},
+            Self::Sum(values)|Self::Product(values)|Self::Min(values)|Self::Max(values)|Self::Function(_,values)=>{for value in values{value.percentages_as_numbers()?;}},
+        }
+        Some(())
+    }
+    pub fn map_numeric_values(&mut self, mut map: impl FnMut(NumericValue) -> Option<NumericValue>) -> Option<()> {
+        fn visit(expression: &mut NumericExpression, map: &mut impl FnMut(NumericValue) -> Option<NumericValue>) -> Option<()> {
+            match expression {
+                NumericExpression::Value(value) => *value = map(*value)?,
+                NumericExpression::Identifier(_)=>{},
+                NumericExpression::Calc(value) | NumericExpression::Negate(value) |
+                NumericExpression::Invert(value) | NumericExpression::Sign(value) => visit(value, map)?,
+                NumericExpression::Sum(values) | NumericExpression::Product(values) |
+                NumericExpression::Min(values) | NumericExpression::Max(values) | NumericExpression::Function(_,values) => {
+                    for value in values { visit(value, map)?; }
+                }
+                NumericExpression::Clamp(lower, value, upper) => {visit(lower,map)?;visit(value,map)?;visit(upper,map)?;}
+            }
+            Some(())
+        }
+        visit(self, &mut map)
+    }
+
+    /// Project a computed percentage/dimension mix after value combination.
+    /// CSS Values' mix computation differs from authored calculation-tree
+    /// simplification: a zero dimension becomes a percentage, and a zero
+    /// percentage becomes a dimension. Do not use this on authored math trees.
+    pub fn computed_percentage_dimension_mix(&self)->Option<NumericValue> {
+        let Self::Sum(values)=self else{return self.single_numeric_value();};
+        let mut percentage=None;let mut dimension=None;
+        for expression in values {
+            let value=expression.single_numeric_value()?;
+            if !value.value.is_finite(){return None;}
+            if value.unit==NumericUnit::Percent {
+                percentage=Some(percentage.unwrap_or(0.0)+value.value);
+            }else if value.unit.dimension()!=NumericDimension::Number {
+                let (unit,factor)=value.unit.canonical_unit_and_factor()?;
+                let (previous,old_unit)=dimension.unwrap_or((0.0,unit));
+                if old_unit!=unit{return None;}
+                dimension=Some((previous+value.value*factor,unit));
+            }else{return None;}
+        }
+        let percentage=percentage?;let (dimension,unit)=dimension?;
+        if !percentage.is_finite()||!dimension.is_finite(){return None;}
+        if percentage==0.0{Some(NumericValue{value:dimension,unit})}
+        else if dimension==0.0{Some(NumericValue{value:percentage,unit:NumericUnit::Percent})}
+        else{None}
+    }
+
+    /// Inspect units without reparsing or exposing a second expression grammar.
+    pub fn contains_unit(&self, predicate:fn(NumericUnit)->bool) -> bool {
+        match self {
+            Self::Value(value) => predicate(value.unit),
+            Self::Identifier(_)=>false,
+            Self::Calc(value) | Self::Negate(value) | Self::Invert(value) | Self::Sign(value) => value.contains_unit(predicate),
+            Self::Sum(values) | Self::Product(values) | Self::Min(values) | Self::Max(values) | Self::Function(_,values) => values.iter().any(|value| value.contains_unit(predicate)),
+            Self::Clamp(lower, value, upper) => lower.contains_unit(predicate) || value.contains_unit(predicate) || upper.contains_unit(predicate),
+        }
+    }
     /// Evaluate with caller-supplied unit conversion and type rules.
     pub fn evaluate<C: NumericExpressionContext>(&self, context: &mut C) -> Option<C::Value> {
         match self {
             Self::Value(value) => context.unit(*value),
+            Self::Identifier(name)=>context.identifier(name),
             Self::Calc(value) => value.evaluate(context),
             Self::Sum(values) => {
                 let mut values = values.iter();
@@ -185,6 +378,12 @@ impl NumericExpression {
                 let value = value.evaluate(context)?;
                 context.invert(value)
             }
+            Self::Function(function,arguments)=>{
+                let mut values=Vec::new();let mut types=Vec::new();
+                values.try_reserve_exact(arguments.len()).ok()?;types.try_reserve_exact(arguments.len()).ok()?;
+                for argument in arguments {types.push(argument.numeric_type()?);values.push(argument.evaluate(context)?);}
+                context.function(*function,values,types)
+            }
             Self::Sign(value) => {
                 let value = value.evaluate(context)?;
                 context.sign(value)
@@ -192,17 +391,29 @@ impl NumericExpression {
         }
     }
 
+    /// Numeric tree-counting functions require an actual owner. Typed OM
+    /// cannot reify them as a context-free CSSNumericValue.
+    pub fn contains_tree_functions(&self)->bool {
+        match self {
+            Self::Function(MathFunction::SiblingIndex|MathFunction::SiblingCount,_)=>true,
+            Self::Calc(value)|Self::Negate(value)|Self::Invert(value)|Self::Sign(value)=>value.contains_tree_functions(),
+            Self::Sum(values)|Self::Product(values)|Self::Min(values)|Self::Max(values)|Self::Function(_,values)=>values.iter().any(Self::contains_tree_functions),
+            Self::Clamp(lower,value,upper)=>lower.contains_tree_functions()||value.contains_tree_functions()||upper.contains_tree_functions(),
+            _=>false,
+        }
+    }
+
     pub fn contains_sign(&self) -> bool {
         match self {
             Self::Sign(_) => true,
             Self::Calc(value) | Self::Negate(value) | Self::Invert(value) => value.contains_sign(),
-            Self::Sum(values) | Self::Product(values) | Self::Min(values) | Self::Max(values) => {
+            Self::Sum(values) | Self::Product(values) | Self::Min(values) | Self::Max(values) | Self::Function(_,values) => {
                 values.iter().any(Self::contains_sign)
             }
             Self::Clamp(lower, value, upper) => {
                 lower.contains_sign() || value.contains_sign() || upper.contains_sign()
             }
-            Self::Value(_) => false,
+            Self::Value(_)|Self::Identifier(_) => false,
         }
     }
 
@@ -220,6 +431,7 @@ impl NumericExpression {
             }
             let children: &[NumericExpression] = match value {
                 NumericExpression::Value(_) => return true,
+                NumericExpression::Identifier(name)=>return CHANNEL_KEYWORDS.contains(name),
                 NumericExpression::Calc(value)
                 | NumericExpression::Negate(value)
                 | NumericExpression::Invert(value)
@@ -229,7 +441,7 @@ impl NumericExpression {
                 NumericExpression::Sum(values)
                 | NumericExpression::Product(values)
                 | NumericExpression::Min(values)
-                | NumericExpression::Max(values) => values,
+                | NumericExpression::Max(values) | NumericExpression::Function(_,values) => values,
                 NumericExpression::Clamp(lower, value, upper) => {
                     return measure(lower, depth + 1, count)
                         && measure(value, depth + 1, count)
@@ -262,7 +474,13 @@ impl NumericExpression {
                 append_string(out, text, MAX_NUMERIC_EXPRESSION_BYTES).ok()
             };
             match expression {
+                NumericExpression::Identifier(name)=>append_text(out,name),
                 NumericExpression::Value(value) => {
+                    if !value.value.is_finite() {
+                        let constant=if value.value.is_nan(){"NaN"}else if value.value.is_sign_negative(){"-infinity"}else{"infinity"};
+                        let bare=if value.unit==NumericUnit::Number{constant.into()}else{alloc::format!("{constant} * 1{}",value.unit.as_str())};
+                        return append_text(out,&if paren_less{bare}else{alloc::format!("calc({bare})")});
+                    }
                     let text = serialize_numeric_value(value.value, value.unit);
                     append_text(out, &text)
                 }
@@ -313,7 +531,14 @@ impl NumericExpression {
                         if let NumericExpression::Negate(inner) = value {
                             append_text(out, " - ")?;
                             append(out, inner, true, false)?;
-                        } else {
+                        } else if let NumericExpression::Value(number)=value {
+                            if number.value<0.0 {
+                                append_text(out," - ")?;
+                                append_text(out,&serialize_numeric_value(-number.value,number.unit))?;
+                            }else{
+                                append_text(out," + ")?;
+                                append(out,value,true,false)?;
+                            }                        } else {
                             append_text(out, " + ")?;
                             append(out, value, true, false)?;
                         }
@@ -367,9 +592,16 @@ impl NumericExpression {
                     }
                     Some(())
                 }
+                NumericExpression::Function(function,values)=>{
+                    append_text(out,function.name())?;append_text(out,"(")?;
+                    if let MathFunction::Round(strategy)=function {append_text(out,strategy.name())?;append_text(out,", ")?;}
+                    if let MathFunction::Progress{clamp:false}=function{append_text(out,"no-clamp ")?;}
+                    for (at,value) in values.iter().enumerate(){if at!=0{append_text(out,", ")?;}append(out,value,false,false)?;}
+                    append_text(out,")")
+                }
                 NumericExpression::Sign(value) => {
                     append_text(out, "sign(")?;
-                    append(out, value, false, false)?;
+                    append(out, value, true, true)?;
                     append_text(out, ")")
                 }
             }
@@ -383,12 +615,31 @@ impl NumericExpression {
         Some(output)
     }
 
+    /// Specified CSS math keeps its calculation boundary after source-only
+    /// simplification. Consume the existing bounded AST without another parse
+    /// or a temporary clone; computed serializers still emit numeric leaves.
+    pub fn serialize_specified(mut self)->Option<String> {
+        let calculation=!matches!(&self,Self::Value(_)|Self::Identifier(_));
+        self.simplify_absolute_units();
+        if calculation&&matches!(&self,Self::Value(_)){self=Self::Calc(Box::new(self));}
+        self.serialize()
+    }
+
     pub fn numeric_type(&self) -> Option<NumericType> {
         match self {
             Self::Value(value) => Some(NumericType::from_unit(value.unit)),
+            Self::Identifier(_)=>Some(NumericType::default()),
             Self::Calc(value) | Self::Negate(value) => value.numeric_type(),
             Self::Invert(value) => Some(value.numeric_type()?.invert()),
-            Self::Sign(_) => Some(NumericType::default()),
+            Self::Function(function,values)=>{
+                let mut types=Vec::new();types.try_reserve_exact(values.len()).ok()?;
+                for value in values {types.push(value.numeric_type()?);}
+                function.kind(&types)
+            }
+            Self::Sign(value) => {
+                value.numeric_type()?;
+                Some(NumericType::default())
+            },
             Self::Sum(values) | Self::Min(values) | Self::Max(values) => {
                 let mut values = values.iter();
                 let mut result = values.next()?.numeric_type()?;
@@ -414,69 +665,212 @@ impl NumericExpression {
         }
     }
 
-    /// Simplify sums whose primitive units have a context-independent common
-    /// canonical unit. Relative lengths and unresolved percentages are kept.
-    pub fn simplify_absolute_units(&mut self) {
+    /// A simplified math expression whose remaining operator wrappers carry
+    /// one primitive value. Computed CSS serializes that primitive directly;
+    /// specified Typed OM retains its explicit calc() boundary.
+    pub fn single_numeric_value(&self) -> Option<NumericValue> {
         match self {
-            Self::Value(_) => return,
-            Self::Calc(value) | Self::Negate(value) | Self::Invert(value) | Self::Sign(value) => {
-                value.simplify_absolute_units();
-                return;
-            }
-            Self::Clamp(lower, value, upper) => {
-                lower.simplify_absolute_units();
-                value.simplify_absolute_units();
-                upper.simplify_absolute_units();
-                return;
-            }
-            Self::Product(values) | Self::Min(values) | Self::Max(values) => {
-                for value in values.iter_mut() {
-                    value.simplify_absolute_units();
-                }
-                return;
-            }
-            Self::Sum(values) => {
-                for value in values.iter_mut() {
-                    value.simplify_absolute_units();
-                }
-                if values.len() < 2 {
-                    return;
-                }
-            }
+            Self::Value(value)=>Some(*value),
+            Self::Calc(value)=>value.single_numeric_value(),
+            Self::Sum(values)|Self::Product(values) if values.len()==1=>values[0].single_numeric_value(),
+            _=>None,
         }
-
-        let Self::Sum(values) = self else {
-            return;
-        };
-        let mut canonical = None;
-        let mut sum = 0.0;
-        for expression in values.iter() {
-            let (number, unit, sign) = match expression {
-                Self::Value(value) => (value.value, value.unit, 1.0),
-                Self::Negate(value) => match value.as_ref() {
-                    Self::Value(value) => (value.value, value.unit, -1.0),
-                    _ => return,
-                },
-                _ => return,
-            };
-            let Some((target, factor)) = unit.canonical_unit_and_factor() else {
-                return;
-            };
-            if canonical.is_some_and(|previous| previous != target) {
-                return;
-            }
-            canonical = Some(target);
-            sum += number * factor * sign;
-            if !sum.is_finite() {
-                return;
-            }
-        }
-        let Some(unit) = canonical else {
-            return;
-        };
-        values.clear();
-        values.push(Self::Value(NumericValue { value: sum, unit }));
     }
+
+    /// Simplify the supported calculation operators using information already
+    /// present in the tree. Contextual units are resolved by the caller first;
+    /// unresolved percentage bases never become comparison or sign values.
+    pub fn simplify_absolute_units(&mut self) {
+        fn canonical(expression:&NumericExpression)->Option<NumericValue> {
+            let value=expression.single_numeric_value()?;
+            let(unit,factor)=value.unit.canonical_unit_and_factor()?;
+            let value=value.value*factor;
+            Some(NumericValue{value,unit})
+        }
+        fn comparable(expression:&NumericExpression)->Option<NumericValue> {
+            canonical(expression).filter(|value|value.unit!=NumericUnit::Percent)
+        }
+        match self {
+            Self::Value(_)|Self::Identifier(_)=>{},
+            Self::Calc(value)=>value.simplify_absolute_units(),
+            Self::Negate(value)=>{
+                value.simplify_absolute_units();
+                if let Some(mut value)=value.single_numeric_value(){value.value=-value.value;*self=Self::Value(value);}
+            },
+            Self::Invert(value)=>{
+                value.simplify_absolute_units();
+                if let Some(value)=value.single_numeric_value().filter(|value|value.unit==NumericUnit::Number){
+                    let reciprocal=1.0/value.value;
+                    if reciprocal.is_finite(){*self=Self::Value(NumericValue{value:reciprocal,unit:NumericUnit::Number});}
+                }
+            },
+            Self::Function(function,values)=>{
+                for value in values.iter_mut(){value.simplify_absolute_units();}
+                let all_percent=matches!(function,MathFunction::Progress{..})&&values.iter().all(|value|value.numeric_type()==Some(NumericType::from_unit(NumericUnit::Percent)));
+                let Some(arguments):Option<Vec<_>>=values.iter().map(|value|if all_percent{
+                    if let Some(value)=canonical(value){return Some(value);}
+                    let mut expression=value.clone();
+                    expression.map_numeric_values(|mut value|{if value.unit==NumericUnit::Percent{value.unit=NumericUnit::Number;}Some(value)})?;
+                    expression.simplify_absolute_units();let mut value=expression.single_numeric_value()?;
+                    value.unit=NumericUnit::Percent;Some(value)
+                }else{comparable(value)}).collect() else{return;};
+                let numbers:Vec<_>=arguments.iter().map(|value|value.value).collect();
+                let types:Vec<_>=arguments.iter().map(|value|NumericType::from_unit(value.unit)).collect();
+                let Some(kind)=function.kind(&types) else{return;};
+                let unit=[NumericUnit::Number,NumericUnit::Px,NumericUnit::Percent,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx,NumericUnit::Fr].into_iter().find(|unit|NumericType::from_unit(*unit)==kind);
+                if let(Some(unit),Some(value))=(unit,function.evaluate(&numbers,&types)){
+                    let value=Self::Value(NumericValue{value,unit});
+                    *self=if matches!(function,MathFunction::Progress{..}){Self::Calc(Box::new(value))}else{value};
+                }
+            },
+            Self::Sign(value)=>{
+                value.simplify_absolute_units();
+                if let Some(value)=comparable(value){
+                    // sign() preserves signed zero; f64::signum() maps zero to
+                    // +/-1 and therefore cannot implement the CSS operation.
+                    let sign=if value.value.is_nan(){f64::NAN}else if value.value==0.0{value.value}else if value.value>0.0{1.0}else{-1.0};
+                    *self=Self::Value(NumericValue{value:sign,unit:NumericUnit::Number});
+                }
+            },
+            Self::Clamp(lower,value,upper)=>{
+                lower.simplify_absolute_units();value.simplify_absolute_units();upper.simplify_absolute_units();
+                if let (Some(lower),Some(value),Some(upper))=(comparable(lower),comparable(value),comparable(upper)) {
+                    if lower.unit==value.unit&&value.unit==upper.unit {
+                        *self=Self::Value(NumericValue{value:numeric_maximum(lower.value,numeric_minimum(value.value,upper.value)),unit:value.unit});
+                    }
+                }
+            },
+            Self::Min(_) | Self::Max(_)=>{
+                let minimum=matches!(self,Self::Min(_));
+                let(Self::Min(values)|Self::Max(values))=self else{unreachable!()};
+                for value in values.iter_mut(){value.simplify_absolute_units();}
+                let mut index=0;
+                while index<values.len(){
+                    if let Some(mut combined)=comparable(&values[index]){
+                        let mut other=index+1;
+                        while other<values.len(){
+                            if let Some(value)=comparable(&values[other]).filter(|value|value.unit==combined.unit){
+                                combined.value=if minimum{numeric_minimum(combined.value,value.value)}else{numeric_maximum(combined.value,value.value)};
+                                values.remove(other);
+                            }else{other+=1;}
+                        }
+                        values[index]=Self::Value(combined);
+                    }
+                    index+=1;
+                }
+                if values.len()==1{*self=values.pop().unwrap();}
+            },
+            Self::Product(values)=>{
+                // Cancel exact source and unit-conversion factors before rounding
+                // either quotient. Never use an approximate equality or epsilon.
+                fn product_factors(expression:&NumericExpression,inverse:bool,numerators:&mut Vec<f64>,denominators:&mut Vec<f64>,powers:&mut [i32;7])->Option<()> {
+                    match expression {
+                        NumericExpression::Calc(value)=>product_factors(value,inverse,numerators,denominators,powers),
+                        NumericExpression::Invert(value)=>product_factors(value,!inverse,numerators,denominators,powers),
+                        NumericExpression::Product(values)=>{for value in values{product_factors(value,inverse,numerators,denominators,powers)?;}Some(())},
+                        NumericExpression::Value(value)=>{
+                            let(unit,numerator,denominator)=value.unit.canonical_unit_and_ratio()?;
+                            if !value.value.is_finite()||value.value==0.0{return None;}
+                            let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx,NumericUnit::Fr];
+                            if unit!=NumericUnit::Number {powers[units.iter().position(|candidate|*candidate==unit)?]+=if inverse{-1}else{1};}
+                            let(top,bottom)=if inverse{(denominators,numerators)}else{(numerators,denominators)};
+                            if value.value!=1.0{top.push(value.value);}if numerator!=1.0{top.push(numerator);}if denominator!=1.0{bottom.push(denominator);}Some(())
+                        },
+                        _=>None,
+                    }
+                }
+                // Ordinary px/scalar products keep the existing allocation-free
+                // simplification path. Count only factors this rare path stores.
+                fn factor_budget(expression:&NumericExpression)->Option<(usize,bool)> {
+                    match expression {
+                        NumericExpression::Calc(value)|NumericExpression::Invert(value)=>factor_budget(value),
+                        NumericExpression::Product(values)=>{let(mut count,mut needed)=(0usize,false);for value in values{let(next,ratio)=factor_budget(value)?;count=count.checked_add(next)?;needed|=ratio;}Some((count,needed))},
+                        NumericExpression::Value(value)=>{let(_,numerator,denominator)=value.unit.canonical_unit_and_ratio()?;Some((usize::from(value.value!=1.0)+usize::from(numerator!=1.0)+usize::from(denominator!=1.0),denominator!=1.0))},
+                        _=>None,
+                    }
+                }
+                let budget=values.iter().try_fold((0usize,false),|(count,needed),value|{let(next,ratio)=factor_budget(value)?;Some((count.checked_add(next)?,needed||ratio))});
+                if let Some((count,true))=budget.filter(|(count,_)|*count<=MAX_NUMERIC_EXPRESSION_NODES*3) {
+                let mut numerators=Vec::new();let mut denominators=Vec::new();let mut powers=[0;7];
+                if numerators.try_reserve_exact(count).is_ok()&&denominators.try_reserve_exact(count).is_ok()&&values.iter().all(|value|product_factors(value,false,&mut numerators,&mut denominators,&mut powers).is_some()) {
+                    for numerator in &mut numerators {if let Some(denominator)=denominators.iter_mut().find(|denominator|**denominator==*numerator){*numerator=1.0;*denominator=1.0;}}
+                    let product=numerators.iter().product::<f64>()/denominators.iter().product::<f64>();
+                    let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx,NumericUnit::Fr];
+                    let mut unit=NumericUnit::Number;let mut simple=true;
+                    for(index,power)in powers.iter().enumerate(){if *power!=0{if *power!=1||unit!=NumericUnit::Number{simple=false;break;}unit=units[index];}}
+                    if simple&&product.is_finite(){*self=Self::Value(NumericValue{value:product,unit});return;}
+                }
+                }
+                for value in values.iter_mut(){value.simplify_absolute_units();}
+                values.sort_by_key(|value|value.single_numeric_value().is_none());
+                let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx];
+                let mut powers=[0i32;6];let mut product=1.0;
+                for expression in values.iter(){
+                    let (value,inverse)=match expression{Self::Invert(value)=>(canonical(value),true),_=>(canonical(expression),false)};
+                    let Some(value)=value else{return;};
+                    if value.unit!=NumericUnit::Number{
+                        let Some(index)=units.iter().position(|unit|*unit==value.unit)else{return;};
+                        powers[index]+=if inverse{-1}else{1};
+                    }
+                    product*=if inverse{1.0/value.value}else{value.value};
+                }
+                let mut unit=NumericUnit::Number;
+                for(index,power)in powers.iter().enumerate(){
+                    if *power!=0{
+                        if *power!=1||unit!=NumericUnit::Number{return;}
+                        unit=units[index];
+                    }
+                }
+                *self=Self::Value(NumericValue{value:product,unit});
+            },
+            Self::Sum(values)=>{
+                for value in values.iter_mut(){value.simplify_absolute_units();}
+                // Combine the same source unit before conversion. Distributing
+                // a non-exact scale across a subtraction loses identities such
+                // as (100dpi - 4dpi) / 96dpi = 1 without any CSS rounding policy.
+                let mut index=0;
+                while index<values.len(){
+                    if let Some(mut combined)=values[index].single_numeric_value(){
+                        let mut other=index+1;
+                        while other<values.len(){
+                            if let Some(value)=values[other].single_numeric_value().filter(|value|value.unit==combined.unit){
+                                let sum=combined.value+value.value;
+                                combined.value=sum;values.remove(other);continue;
+                            }
+                            other+=1;
+                        }
+                        values[index]=Self::Value(combined);
+                    }
+                    index+=1;
+                }
+                // Fold identical units independently: retaining a zero % term
+                // is required even when every other term is an absolute length.
+                let mut index=0;
+                while index<values.len(){
+                    if let Some(value)=values[index].single_numeric_value(){
+                        let (unit,factor)=value.unit.canonical_unit_and_factor().unwrap_or((value.unit,1.0));
+                        let mut combined=value.value*factor;
+                        let mut other=index+1;
+                        while other<values.len(){
+                            if let Some(value)=values[other].single_numeric_value(){
+                                let (candidate,factor)=value.unit.canonical_unit_and_factor().unwrap_or((value.unit,1.0));
+                                if candidate==unit{combined+=value.value*factor;values.remove(other);continue;}
+                            }
+                            other+=1;
+                        }
+                        values[index]=Self::Value(NumericValue{value:combined,unit});
+                    }
+                    index+=1;
+                }
+                values.sort_by_key(|value|match value.single_numeric_value(){
+                    Some(value)=>match value.unit{NumericUnit::Number=>(0,""),NumericUnit::Percent=>(1,""),unit=>(2,unit.as_str())},
+                    None=>(3,""),
+                });
+                if values.len()==1{*self=values.pop().unwrap();}
+            },
+        }
+    }
+
 }
 
 /// Builder interface for the shared math grammar. A renderer can fold into a
@@ -486,6 +880,9 @@ pub trait NumericExpressionBuilder {
     type Accumulator;
 
     fn value(&mut self, value: NumericValue) -> Option<Self::Expr>;
+    /// Context-defined numeric identifiers, such as relative color channels.
+    /// Ordinary numeric properties retain their strict no-identifier grammar.
+    fn identifier(&mut self, _name:&str)->Option<Self::Expr> {None}
     fn begin_sum(&mut self, first: Self::Expr) -> Option<Self::Accumulator>;
     fn push_sum(
         &mut self,
@@ -521,6 +918,110 @@ pub trait NumericExpressionBuilder {
     fn begin_sign_input(&mut self) {}
     fn end_sign_input(&mut self) {}
     fn sign(&mut self, value: Self::Expr) -> Option<Self::Expr>;
+    fn function(&mut self,_function:MathFunction,_values:Vec<Self::Expr>)->Option<Self::Expr>{None}
+}
+
+/// Operation-local named numeric values; no AST or source text is retained.
+/// The same expression grammar, unit checking and resource bounds apply.
+pub struct NamedNumericBuilder<'a,B> {
+    pub inner:&'a mut B,
+    pub values:&'a [(&'a str,NumericValue)],
+}
+impl<B:NumericExpressionBuilder> NumericExpressionBuilder for NamedNumericBuilder<'_,B> {
+    type Expr=B::Expr;
+    type Accumulator=B::Accumulator;
+    fn identifier(&mut self,name:&str)->Option<Self::Expr> {
+        let value=self.values.iter().find(|(key,_)|name.eq_ignore_ascii_case(key))?.1;
+        self.inner.value(value)
+    }
+    fn value(&mut self, value: NumericValue) -> Option<Self::Expr> {self.inner.value(value)}
+    fn begin_sum(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_sum(first)}
+    fn push_sum(
+        &mut self,
+        values: &mut Self::Accumulator,
+        next: Self::Expr,
+        subtract: bool,
+    ) -> Option<()> {self.inner.push_sum(values, next, subtract)}
+    fn finish_sum(&mut self, values: Self::Accumulator, operated: bool) -> Option<Self::Expr> {self.inner.finish_sum(values, operated)}
+    fn begin_product(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_product(first)}
+    fn push_product(
+        &mut self,
+        values: &mut Self::Accumulator,
+        next: Self::Expr,
+        divide: bool,
+    ) -> Option<()> {self.inner.push_product(values, next, divide)}
+    fn finish_product(&mut self, values: Self::Accumulator, operated: bool) -> Option<Self::Expr> {self.inner.finish_product(values, operated)}
+    fn begin_min(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_min(first)}
+    fn push_min(&mut self, values: &mut Self::Accumulator, next: Self::Expr) -> Option<()> {self.inner.push_min(values, next)}
+    fn finish_min(&mut self, values: Self::Accumulator) -> Option<Self::Expr> {self.inner.finish_min(values)}
+    fn begin_max(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_max(first)}
+    fn push_max(&mut self, values: &mut Self::Accumulator, next: Self::Expr) -> Option<()> {self.inner.push_max(values, next)}
+    fn finish_max(&mut self, values: Self::Accumulator) -> Option<Self::Expr> {self.inner.finish_max(values)}
+    fn calc(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.calc(value)}
+    fn clamp(
+        &mut self,
+        lower: Self::Expr,
+        value: Self::Expr,
+        upper: Self::Expr,
+    ) -> Option<Self::Expr> {self.inner.clamp(lower, value, upper)}
+    fn negate(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.negate(value)}
+    fn invert(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.invert(value)}
+    fn begin_sign_input(&mut self) {self.inner.begin_sign_input()}
+    fn end_sign_input(&mut self) {self.inner.end_sign_input()}
+    fn sign(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.sign(value)}
+    fn function(&mut self,function:MathFunction,values:Vec<Self::Expr>)->Option<Self::Expr>{self.inner.function(function,values)}
+}
+
+const CHANNEL_KEYWORDS:&[&str]=&["r","g","b","h","s","l","w","a","c","x","y","z","alpha"];
+struct NamedExpressionTreeBuilder<'a> {inner:NumericExpressionTreeBuilder,names:&'a[&'static str]}
+impl NumericExpressionBuilder for NamedExpressionTreeBuilder<'_> {
+    type Expr=NumericExpression;
+    type Accumulator=Vec<NumericExpression>;
+    fn identifier(&mut self,name:&str)->Option<Self::Expr> {
+        let name=*self.names.iter().find(|key|name.eq_ignore_ascii_case(key))?;
+        Some(NumericExpression::Identifier(name))
+    }
+    fn value(&mut self, value: NumericValue) -> Option<Self::Expr> {self.inner.value(value)}
+    fn begin_sum(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_sum(first)}
+    fn push_sum(
+        &mut self,
+        values: &mut Self::Accumulator,
+        next: Self::Expr,
+        subtract: bool,
+    ) -> Option<()> {self.inner.push_sum(values, next, subtract)}
+    fn finish_sum(&mut self, values: Self::Accumulator, operated: bool) -> Option<Self::Expr> {self.inner.finish_sum(values, operated)}
+    fn begin_product(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_product(first)}
+    fn push_product(
+        &mut self,
+        values: &mut Self::Accumulator,
+        next: Self::Expr,
+        divide: bool,
+    ) -> Option<()> {self.inner.push_product(values, next, divide)}
+    fn finish_product(&mut self, values: Self::Accumulator, operated: bool) -> Option<Self::Expr> {self.inner.finish_product(values, operated)}
+    fn begin_min(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_min(first)}
+    fn push_min(&mut self, values: &mut Self::Accumulator, next: Self::Expr) -> Option<()> {self.inner.push_min(values, next)}
+    fn finish_min(&mut self, values: Self::Accumulator) -> Option<Self::Expr> {self.inner.finish_min(values)}
+    fn begin_max(&mut self, first: Self::Expr) -> Option<Self::Accumulator> {self.inner.begin_max(first)}
+    fn push_max(&mut self, values: &mut Self::Accumulator, next: Self::Expr) -> Option<()> {self.inner.push_max(values, next)}
+    fn finish_max(&mut self, values: Self::Accumulator) -> Option<Self::Expr> {self.inner.finish_max(values)}
+    fn calc(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.calc(value)}
+    fn clamp(
+        &mut self,
+        lower: Self::Expr,
+        value: Self::Expr,
+        upper: Self::Expr,
+    ) -> Option<Self::Expr> {self.inner.clamp(lower, value, upper)}
+    fn negate(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.negate(value)}
+    fn invert(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.invert(value)}
+    fn begin_sign_input(&mut self) {self.inner.begin_sign_input()}
+    fn end_sign_input(&mut self) {self.inner.end_sign_input()}
+    fn sign(&mut self, value: Self::Expr) -> Option<Self::Expr> {self.inner.sign(value)}
+    fn function(&mut self,function:MathFunction,values:Vec<Self::Expr>)->Option<Self::Expr>{self.inner.function(function,values)}
+}
+/// Canonical symbolic channel math; ordinary expression parsing remains strict.
+pub(super) fn parse_channel_expression(input:&str,names:&[&'static str])->Option<NumericExpression> {
+    if names.iter().any(|name|!CHANNEL_KEYWORDS.contains(name)) {return None;}
+    parse_numeric_expression_with(input,&mut NamedExpressionTreeBuilder{inner:NumericExpressionTreeBuilder,names})
 }
 
 /// Parse a CSS numeric primitive or math function without resolving units.
@@ -558,6 +1059,17 @@ pub fn parse_numeric_expression_with<B: NumericExpressionBuilder>(
     (parser.position == input.len()).then_some(expression)
 }
 
+// The dependency gate and length grammar share the parser's supported function
+// dispatch. Unsupported functions are not silently admitted as computable math.
+const NUMERIC_MATH_FUNCTIONS: [(&str,u8);24] = [
+    ("calc(",0),("min(",1),("max(",2),("clamp(",3),("sign(",4),
+    ("sin(",5),("cos(",6),("tan(",7),("asin(",8),("acos(",9),("atan(",10),("atan2(",11),("pow(",12),("sqrt(",13),("hypot(",14),("log(",15),("exp(",16),("abs(",17),("mod(",18),("rem(",19),("round(",20),("progress(",21),("sibling-index(",22),("sibling-count(",23),
+];
+pub(super) fn is_numeric_math_function(name:&str)->bool {
+    NUMERIC_MATH_FUNCTIONS.iter().any(|(function,_)|
+        name.eq_ignore_ascii_case(&function[..function.len()-1]))
+}
+
 struct NumericExpressionParser<'a, 'b, B> {
     input: &'a str,
     position: usize,
@@ -567,13 +1079,12 @@ struct NumericExpressionParser<'a, 'b, B> {
 
 impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
     fn space(&mut self) {
-        while self
-            .input
-            .as_bytes()
-            .get(self.position)
-            .is_some_and(|byte| matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '))
-        {
-            self.position += 1;
+        loop {
+            while self.input.as_bytes().get(self.position).is_some_and(|byte| matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')) { self.position += 1; }
+            if !self.input[self.position..].starts_with("/*") { break; }
+            let mut cursor = super::syntax::Cursor::new(self.input, self.position).expect("bounded numeric input");
+            let Some(token) = cursor.next() else { break; };
+            self.position = token.end;
         }
     }
 
@@ -649,18 +1160,47 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
         }
         self.space();
         let rest = self.input.get(self.position..)?;
-        for (name, kind) in [
-            ("calc(", 0u8),
-            ("min(", 1),
-            ("max(", 2),
-            ("clamp(", 3),
-            ("sign(", 4),
-        ] {
-            if rest
-                .get(..name.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
-            {
-                self.position += name.len();
+        // Decode only escaped function names; ordinary numeric parsing stays borrowed.
+        let escaped = rest.find('(').filter(|end| rest[..*end].contains('\\')).and_then(|end| {
+            let mut consumed = 0;
+            let name = super::consume_selector_identifier(&rest[..end], &mut consumed)?;
+            (consumed == end).then_some((name, end + 1))
+        });
+        for (name, kind) in NUMERIC_MATH_FUNCTIONS {
+            let escaped_length = escaped.as_ref().filter(|(decoded,_)| decoded.eq_ignore_ascii_case(&name[..name.len()-1])).map(|(_,length)| *length);
+            if rest.get(..name.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(name)) || escaped_length.is_some() {
+                self.position += escaped_length.unwrap_or(name.len());
+                if kind>=5 {
+                    let mut function=match kind {5=>MathFunction::Sin,6=>MathFunction::Cos,7=>MathFunction::Tan,8=>MathFunction::Asin,9=>MathFunction::Acos,10=>MathFunction::Atan,11=>MathFunction::Atan2,12=>MathFunction::Pow,13=>MathFunction::Sqrt,14=>MathFunction::Hypot,15=>MathFunction::Log,16=>MathFunction::Exp,17=>MathFunction::Abs,18=>MathFunction::Mod,19=>MathFunction::Rem,20=>MathFunction::Round(RoundingStrategy::Nearest),21=>MathFunction::Progress{clamp:true},22=>MathFunction::SiblingIndex,23=>MathFunction::SiblingCount,_=>return None};
+                    if kind==22||kind==23 {
+                        self.space();if self.input.as_bytes().get(self.position)!=Some(&b')'){return None;}
+                        self.position+=1;self.count_node()?;return self.builder.function(function,Vec::new());
+                    }
+                    if kind==20 {
+                        self.space();let start=self.position;let mut consumed=0;
+                        if let Some(name)=super::consume_selector_identifier(&self.input[start..],&mut consumed){
+                            let strategy=match name.to_ascii_lowercase().as_str(){"nearest"=>Some(RoundingStrategy::Nearest),"up"=>Some(RoundingStrategy::Up),"down"=>Some(RoundingStrategy::Down),"to-zero"=>Some(RoundingStrategy::ToZero),_=>None};
+                            if let Some(strategy)=strategy {
+                                self.position+=consumed;self.space();
+                                if self.input.as_bytes().get(self.position)!=Some(&b','){return None;}
+                                self.position+=1;function=MathFunction::Round(strategy);
+                            }
+                        }
+                    }
+                    if kind==21 {
+                        self.space();let start=self.position;let mut consumed=0;
+                        if super::consume_selector_identifier(&self.input[start..],&mut consumed).is_some_and(|name|name.eq_ignore_ascii_case("no-clamp")) {
+                            self.position+=consumed;self.space();function=MathFunction::Progress{clamp:false};
+                        }
+                    }
+                    let mut values=Vec::new();
+                    loop {
+                        if values.len()>=MAX_NUMERIC_EXPRESSION_ARGS{return None;}
+                        values.try_reserve(1).ok()?;values.push(self.sum(depth+1)?);self.space();
+                        match self.input.as_bytes().get(self.position){Some(b',')=>self.position+=1,Some(b')')=>{self.position+=1;break;},_=>return None}
+                    }
+                    self.count_node()?;return self.builder.function(function,values);
+                }
                 if kind == 1 || kind == 2 {
                     let first = self.sum(depth + 1)?;
                     let mut values = if kind == 1 {
@@ -749,6 +1289,17 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
             }
             self.position += 1;
             return Some(expression);
+        }
+        if super::would_start_css_identifier(rest) {
+            let mut consumed=0;
+            let name=super::consume_selector_identifier(rest,&mut consumed)?;
+            self.position=self.position.checked_add(consumed)?;
+            self.count_node()?;
+            if depth>0 {
+                let constant=match name.to_ascii_lowercase().as_str(){"infinity"=>Some(f64::INFINITY),"-infinity"=>Some(f64::NEG_INFINITY),"nan"=>Some(f64::NAN),_=>None};
+                if let Some(value)=constant{return self.builder.value(NumericValue{value,unit:NumericUnit::Number});}
+            }
+            return self.builder.identifier(&name);
         }
         let (value, consumed) = parse_numeric_prefix(rest)?;
         self.position = self.position.checked_add(consumed)?;
@@ -891,6 +1442,7 @@ impl NumericExpressionBuilder for NumericExpressionTreeBuilder {
     fn sign(&mut self, value: Self::Expr) -> Option<Self::Expr> {
         Some(NumericExpression::Sign(Box::new(value)))
     }
+    fn function(&mut self,function:MathFunction,values:Vec<Self::Expr>)->Option<Self::Expr>{Some(NumericExpression::Function(function,values))}
 }
 
 fn is_css_whitespace(byte: u8) -> bool {
@@ -1159,6 +1711,7 @@ impl NumericUnit {
         let lower = unit.to_ascii_lowercase();
         match lower.as_str() {
             "q" => Some(Self::Q),
+            "x" => Some(Self::Dppx),
             "hz" => Some(Self::Hz),
             "khz" => Some(Self::KHz),
             _ => Self::parse(&lower),
@@ -1297,27 +1850,32 @@ impl NumericUnit {
     /// Return a context-independent canonical unit and scale factor, if one
     /// exists for this unit.
     pub const fn canonical_unit_and_factor(self) -> Option<(Self, f64)> {
+        match self.canonical_unit_and_ratio() {Some((unit,numerator,denominator))=>Some((unit,numerator/denominator)),None=>None}
+    }
+
+    /// Keep authored conversion factors separate until product cancellation.
+    pub const fn canonical_unit_and_ratio(self) -> Option<(Self, f64, f64)> {
         match self {
-            Self::Number => Some((Self::Number, 1.0)),
-            Self::Percent => Some((Self::Percent, 1.0)),
-            Self::Px => Some((Self::Px, 1.0)),
-            Self::In => Some((Self::Px, 96.0)),
-            Self::Cm => Some((Self::Px, 96.0 / 2.54)),
-            Self::Mm => Some((Self::Px, 96.0 / 25.4)),
-            Self::Q => Some((Self::Px, 96.0 / 101.6)),
-            Self::Pt => Some((Self::Px, 96.0 / 72.0)),
-            Self::Pc => Some((Self::Px, 16.0)),
-            Self::Deg => Some((Self::Deg, 1.0)),
-            Self::Grad => Some((Self::Deg, 0.9)),
-            Self::Rad => Some((Self::Deg, 180.0 / core::f64::consts::PI)),
-            Self::Turn => Some((Self::Deg, 360.0)),
-            Self::S => Some((Self::S, 1.0)),
-            Self::Ms => Some((Self::S, 0.001)),
-            Self::Hz => Some((Self::Hz, 1.0)),
-            Self::KHz => Some((Self::Hz, 1000.0)),
-            Self::Dpi => Some((Self::Dppx, 1.0 / 96.0)),
-            Self::Dpcm => Some((Self::Dppx, 2.54 / 96.0)),
-            Self::Dppx => Some((Self::Dppx, 1.0)),
+            Self::Number => Some((Self::Number, 1.0, 1.0)),
+            Self::Percent => Some((Self::Percent, 1.0, 1.0)),
+            Self::Px => Some((Self::Px, 1.0, 1.0)),
+            Self::In => Some((Self::Px, 96.0, 1.0)),
+            Self::Cm => Some((Self::Px, 96.0, 2.54)),
+            Self::Mm => Some((Self::Px, 96.0, 25.4)),
+            Self::Q => Some((Self::Px, 96.0, 101.6)),
+            Self::Pt => Some((Self::Px, 96.0, 72.0)),
+            Self::Pc => Some((Self::Px, 16.0, 1.0)),
+            Self::Deg => Some((Self::Deg, 1.0, 1.0)),
+            Self::Grad => Some((Self::Deg, 0.9, 1.0)),
+            Self::Rad => Some((Self::Deg, 180.0, core::f64::consts::PI)),
+            Self::Turn => Some((Self::Deg, 360.0, 1.0)),
+            Self::S => Some((Self::S, 1.0, 1.0)),
+            Self::Ms => Some((Self::S, 0.001, 1.0)),
+            Self::Hz => Some((Self::Hz, 1.0, 1.0)),
+            Self::KHz => Some((Self::Hz, 1000.0, 1.0)),
+            Self::Dpi => Some((Self::Dppx, 1.0, 96.0)),
+            Self::Dpcm => Some((Self::Dppx, 2.54, 96.0)),
+            Self::Dppx => Some((Self::Dppx, 1.0, 1.0)),
             _ => None,
         }
     }
@@ -1394,7 +1952,11 @@ fn parse_numeric_prefix(input: &str) -> Option<(NumericValue, usize)> {
     if bytes.get(position) == Some(&b'%') {
         position += 1;
     }
-    let suffix = &input[suffix_start..position];
+    let decoded = if bytes.get(position) == Some(&b'\\') {
+        position = suffix_start;
+        Some(super::consume_selector_identifier(input, &mut position)?)
+    } else { None };
+    let suffix = decoded.as_deref().unwrap_or(&input[suffix_start..position]);
     let unit = if suffix == "%" {
         NumericUnit::Percent
     } else if suffix.is_empty() {
@@ -1493,6 +2055,10 @@ pub fn is_list_valued_property(property: &str) -> bool {
 
 /// Serialize a number and unit using CSS numeric-value formatting.
 pub fn serialize_numeric_value(value: f64, unit: NumericUnit) -> String {
+    if !value.is_finite() {
+        let constant=if value.is_nan(){"NaN"}else if value.is_sign_negative(){"-infinity"}else{"infinity"};
+        return if unit==NumericUnit::Number{alloc::format!("calc({constant})")}else{alloc::format!("calc({constant} * 1{})",unit.as_str())};
+    }
     let number = if value == 0.0 {
         String::from("0")
     } else {
@@ -1511,8 +2077,147 @@ fn css_whitespace(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_math_special_values_share_evaluation_and_simplification() {
+        for(raw,expected)in [("round(up,1,infinity)",f64::INFINITY),("round(down,-1,infinity)",f64::NEG_INFINITY),("round(1,infinity)",0.0),("round(-1,infinity)",-0.0),("round(1e-300,1e300)",0.0),("mod(-1,3)",2.0),("mod(1,-3)",-2.0),("rem(-1,3)",-1.0),("mod(1,infinity)",1.0),("rem(-1,infinity)",-1.0)] {
+            let mut expression=parse_numeric_expression(raw).unwrap();expression.simplify_absolute_units();
+            let value=expression.single_numeric_value().unwrap_or_else(||panic!("{raw}: {expression:?}")).value;
+            assert_eq!(value,expected,"{raw}");if expected==0.0{assert_eq!(value.is_sign_negative(),expected.is_sign_negative(),"{raw}");}
+        }
+        for raw in ["round(1,0)","round(infinity,infinity)","mod(-1,infinity)","mod(0,infinity * -1)","rem(infinity,1)","mod(1,0)","pow(NaN,0)","pow(1,infinity)","hypot(infinity,NaN)","min(NaN,1)","max(NaN,1)","clamp(0,NaN,1)","sign(NaN)"] {
+            let mut expression=parse_numeric_expression(raw).unwrap();expression.simplify_absolute_units();
+            assert!(expression.single_numeric_value().unwrap_or_else(||panic!("{raw}: {expression:?}")).value.is_nan(),"{raw}");
+        }
+        assert!(numeric_minimum(0.0,-0.0).is_sign_negative());
+        assert!(!numeric_maximum(-0.0,0.0).is_sign_negative());
+    }
+
+    #[test]
+    fn specification_specified_math_keeps_calculation_boundary() {
+        for(raw,expected)in [("progress(0.5,0,1)","calc(0.5)"),("sin(0deg)","calc(0)"),("round(1.5)","calc(2)"),("calc(3 * 4)","calc(12)"),("progress(1em,0px,10px)","progress(1em, 0px, 10px)"),("2","2")] {
+            assert_eq!(parse_numeric_expression(raw).unwrap().serialize_specified().as_deref(),Some(expected),"{raw}");
+        }
+    }
+
+    #[test]
+    fn specification_sibling_numeric_functions_keep_owner_and_syntax_authority() {
+        for raw in ["sibling-index()","sibling-count(/* comment */)",r"sibling-\69 ndex()","calc(1dppx * sibling-index())"] {
+            let expression=parse_numeric_expression(raw).unwrap();assert!(expression.numeric_type().is_some());assert!(expression.contains_tree_functions());
+            let (resolved,dependent)=substitute_sibling_functions(raw,2,4).unwrap();assert!(dependent);
+            let expression=parse_numeric_expression(&resolved).unwrap();assert!(!expression.contains_tree_functions());
+        }
+        let(resolved,dependent)=substitute_sibling_functions("steps(sibling-index(), jump-none)",1,3).unwrap();
+        assert!(dependent);assert_eq!(resolved,"steps(calc(1), jump-none)");
+        let input=r#"image-set(url("sibling-index()") calc(1dppx * sibling-\69 ndex(/*x*/)))"#;
+        let (resolved,dependent)=substitute_sibling_functions(input,3,4).unwrap();assert!(dependent);
+        assert_eq!(resolved,r#"image-set(url("sibling-index()") calc(1dppx * calc(3)))"#);
+        let (unchanged,dependent)=substitute_sibling_functions(r#"url(sibling-index()) "sibling-count()" /*sibling-index()*/"#,2,4).unwrap();
+        assert!(!dependent);assert!(matches!(unchanged,alloc::borrow::Cow::Borrowed(_)));
+        for invalid in ["sibling-index(1)","sibling-count(1, 2)","sibling-index("] {assert!(parse_numeric_expression(invalid).is_none());assert!(substitute_sibling_functions(invalid,2,4).is_none());}
+    }
+
+    #[test]
+    fn specification_progress_math_shared_types_clamping_and_degenerate_ranges() {
+        for (raw,expected) in [
+            ("progress(0.5, 0, 1)",0.5),("progress(100px, 0px, 50px)",1.0),
+            ("progress(no-clamp 100px, 0px, 50px)",2.0),("progress(no-clamp -100px, 0px, 50px)",-2.0),
+            ("progress(1%, (10% - 10%), 100%)",0.01),
+            ("progress(abs(5%), hypot(3%, 4%), 10%)",0.0),
+            ("progress(100px, 10px, 10px)",0.0),("progress(no-clamp 10px, 10px, 10px)",0.0),
+            ("progress(progress(1, 0, 1), progress(0px, 0px, 1px), progress(1deg, 0deg, 1deg))",1.0),
+        ] {
+            let mut expression=parse_numeric_expression(raw).unwrap();assert_eq!(expression.numeric_type(),Some(NumericType::default()),"{raw}");
+            expression.simplify_absolute_units();let value=expression.single_numeric_value().unwrap();
+            assert_eq!(value.unit,NumericUnit::Number);assert!((value.value-expected).abs()<1e-12,"{raw}");
+        }
+        for (raw,expected) in [("progress(no-clamp 100px, 10px, 10px)","calc(infinity)"),("progress(no-clamp 1px, 10px, 10px)","calc(-infinity)")] {
+            let mut expression=parse_numeric_expression(raw).unwrap();expression.simplify_absolute_units();
+            assert_eq!(expression.serialize().as_deref(),Some(expected));
+            assert!(parse_numeric_expression(expected).unwrap().single_numeric_value().unwrap().value.is_infinite());
+        }
+        for invalid in ["progress(1)","progress(1, 0)","progress(1, 0, 1, 2)","progress(no-clamp, 1, 2)","progress(1 no-clamp, 0, 1)","progress(1px, 0s, 1s)","progress(1px * 1px, 0px * 0px, 1px * 1px)"] {
+            assert!(parse_numeric_expression(invalid).is_none_or(|expression|expression.numeric_type().is_none()),"{invalid}");
+        }
+        assert_eq!(computed_f32(f64::INFINITY),f32::MAX);
+        assert_eq!(computed_f32(f64::NEG_INFINITY),-f32::MAX);
+        assert_eq!(computed_f32(f64::NAN),0.0);
+        assert!(!computed_f32(-0.0).is_sign_negative());
+        for constant in ["infinity","-infinity","NaN"]{assert!(parse_numeric_expression(constant).is_none(),"calc-keywords are not bare numeric tokens");}
+        assert!(parse_numeric_expression("calc(-InFiNiTy)").unwrap().single_numeric_value().unwrap().value.is_sign_negative());
+    }
+
+    #[test]
+    fn specification_numeric_product_preserves_exact_conversion_cancellation() {
+        for (raw,unit) in [("calc(1dpcm * 96 / 2.54)",NumericUnit::Dppx),("calc(1cm * 2.54 / 96)",NumericUnit::Px),("calc(1rad * 3.141592653589793 / 180)",NumericUnit::Deg)] {
+            let mut expression=parse_numeric_expression(raw).unwrap();expression.simplify_absolute_units();
+            assert_eq!(expression.single_numeric_value(),Some(NumericValue{value:1.0,unit}));
+        }
+        let mut expression=parse_numeric_expression("calc(2dpcm * 48 / 2.54)").unwrap();expression.simplify_absolute_units();
+        assert_eq!(expression.single_numeric_value(),Some(NumericValue{value:1.0,unit:NumericUnit::Dppx}));
+        let mut expression=parse_numeric_expression("calc(1dpcm * 96 / 2.540000000000001)").unwrap();expression.simplify_absolute_units();
+        assert_ne!(expression.single_numeric_value().unwrap().value,1.0);
+    }
+
+    #[test]
+    fn specification_computed_percentage_mix_does_not_simplify_authored_zero_units() {
+        for input in ["calc(5% + 0px)","calc(0% + 1px)"] {
+            let mut expression=parse_numeric_expression(input).unwrap();expression.simplify_absolute_units();
+            assert_eq!(expression.serialize().as_deref(),Some(input),"authored calculation retains its units");
+        }
+        assert_eq!(crate::animation::combine_numeric_values(&[("0px",0.5),("10%",0.5)]).as_deref(),Some("5%"));
+        assert_eq!(crate::animation::combine_numeric_values(&[("0%",0.5),("10px",0.5)]).as_deref(),Some("5px"));
+        assert_eq!(crate::animation::combine_numeric_values(&[("0%",0.5),("0px",0.5)]).as_deref(),Some("0px"));
+        assert_eq!(crate::animation::combine_numeric_values(&[("10px",0.5),("10%",0.5)]).as_deref(),Some("calc(5% + 5px)"));
+        assert!(crate::animation::combine_numeric_values(&[("0s",0.5),("10px",0.5)]).is_none(),"invalid dimensions cannot be erased by a zero projection");
+    }
+
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn specification_same_unit_sums_convert_once_without_serialization_rounding() {
+        for (raw,expected) in [("calc(100dpi - 4dpi)","calc(1dppx)"),("calc(100in - 4in)","calc(9216px)"),("calc(100ms - 4ms)","calc(0.096s)")] {
+            let mut expression=parse_numeric_expression(raw).unwrap();
+            expression.simplify_absolute_units();
+            assert_eq!(expression.serialize().as_deref(),Some(expected),"{raw}");
+        }
+    }
+
+    #[test]
+    fn specification_computed_math_folds_resolved_operators_and_keeps_unknown_bases() {
+        for(raw,expected)in [
+            ("calc(70% + 10% * sign(999px))","calc(80%)"),
+            ("calc(70% + 10% * sign(-1px))","calc(60%)"),
+            ("calc(70% + 10% * sign(0px))","calc(70%)"),
+            ("calc(10px * (6 / 2))","calc(30px)"),
+            ("calc(10px / 2px)","calc(5)"),
+            ("min(1in, 100px)","96px"),
+            ("max(1s, 2000ms)","2s"),
+            ("clamp(30px, 10px, 20px)","30px"),
+            ("calc(100% - 100% + 1px)","calc(0% + 1px)"),
+            ("calc(1px + 10% - 2px)","calc(10% - 1px)"),
+            ("calc(70% + 10% * sign(1em))","calc(70% + (10% * sign(1em)))"),
+            ("min(10%, 20%)","min(10%, 20%)"),
+            ("sign(10%)","sign(10%)"),
+        ] {
+            let mut expression=parse_numeric_expression(raw).unwrap();
+            expression.simplify_absolute_units();
+            assert_eq!(expression.serialize().unwrap(),expected,"{raw}");
+            assert!(expression.checked_retained_bytes().unwrap()<=MAX_NUMERIC_EXPRESSION_BYTES*8);
+        }
+        let mut zero=parse_numeric_expression("sign(-0px)").unwrap();zero.simplify_absolute_units();
+        let zero=zero.single_numeric_value().unwrap();assert_eq!(zero.value,0.0);assert!(zero.value.is_sign_negative());
+    }
+
+    #[test]
+    fn shared_math_canonicalizes_primitive_products_and_function_arguments() {
+        for (raw,expected) in [("calc(30deg * 2)","calc(60deg)"),
+            ("calc(30deg + sign(2cqw - 10px) * 5deg)","calc(30deg + (5deg * sign(2cqw - 10px)))")] {
+            let mut expression = parse_numeric_expression(raw).unwrap();
+            expression.simplify_absolute_units();
+            assert_eq!(expression.serialize().unwrap(), expected, "{raw}");
+        }
+    }
 
     #[test]
     fn numeric_primitives_preserve_units_and_reject_extra_tokens() {
@@ -1620,11 +2325,10 @@ mod tests {
         assert!(matches!(
             absolute,
             NumericExpression::Calc(ref value)
-                if matches!(value.as_ref(), NumericExpression::Sum(terms)
-                    if matches!(terms.as_slice(), [NumericExpression::Value(NumericValue {
-                        value: 97.0,
-                        unit: NumericUnit::Px,
-                    })]))
+                if matches!(value.as_ref(), NumericExpression::Value(NumericValue {
+                    value: 97.0,
+                    unit: NumericUnit::Px,
+                }))
         ));
 
         let too_deep = alloc::format!("{}1px{}", "calc(".repeat(18), ")".repeat(18));
@@ -1637,11 +2341,9 @@ mod tests {
                 .join(",")
         );
         assert!(parse_numeric_expression(&too_many).is_none());
-        assert!(
-            parse_numeric_expression("calc(sign(1px))")
-                .unwrap()
-                .contains_sign()
-        );
+        assert!(parse_numeric_expression("calc(sign(1px))")
+            .unwrap()
+            .contains_sign());
 
         assert!(parse_numeric_expression("1px + 2px").is_none());
         assert!(parse_numeric_expression("2 * 3s").is_none());
@@ -1663,11 +2365,9 @@ mod tests {
             .multiply(NumericType::from_unit(NumericUnit::Px))
             .unwrap();
         assert_eq!(length_squared.length, 2);
-        assert!(
-            length_squared
-                .add(NumericType::from_unit(NumericUnit::Percent))
-                .is_none()
-        );
+        assert!(length_squared
+            .add(NumericType::from_unit(NumericUnit::Percent))
+            .is_none());
 
         let length_percent = NumericType::from_unit(NumericUnit::Px)
             .add(NumericType::from_unit(NumericUnit::Percent))
@@ -1679,4 +2379,62 @@ mod tests {
         let inverse_time = NumericType::from_unit(NumericUnit::S).invert();
         assert_eq!(inverse_time.time, -1);
     }
+}
+
+/// CSS Values range checks apply to the top-level calculation. Keep IEEE
+/// values inside the tree; censor NaN/signed zero and bound the final scalar
+/// to the implementation's existing f32 storage range only after evaluation.
+pub(super) fn computed_f32(value:f64)->f32 {
+    if value.is_nan()||value==0.0{0.0}else{value.clamp(-f64::from(f32::MAX),f64::from(f32::MAX)) as f32}
+}
+
+/// Resolve the same numeric tree functions inside any CSS component value.
+/// Syntax owns strings/comments/URLs, escaped names and block bounds. Ordinary
+/// values stay borrowed; output allocates only after a real owner dependency.
+pub(super) fn substitute_sibling_functions(input:&str,index:usize,count:usize)->Option<(alloc::borrow::Cow<'_,str>,bool)> {
+    use super::syntax::{Cursor,TokenKind};
+    if input.len()>super::MAX_VARIABLE_BYTES{return None;}
+    let mut cursor=Cursor::new(input,0).ok()?;let mut output=String::new();let mut copied=0;let mut changed=false;
+    while let Some(token)=cursor.next(){
+        if token.kind!=TokenKind::Other||input.as_bytes().get(token.end)!=Some(&b'('){continue;}
+        let mut at=token.start;let Some(name)=super::consume_selector_identifier(input,&mut at).filter(|_|at==token.end)else{continue;};
+        let function=if name.eq_ignore_ascii_case("sibling-index"){MathFunction::SiblingIndex}else if name.eq_ignore_ascii_case("sibling-count"){MathFunction::SiblingCount}else{continue;};
+        let block=super::syntax::block(input,token.end).ok()?;if !block.closed{return None;}
+        let expression=parse_numeric_expression(&input[token.start..block.after])?;
+        if expression.numeric_type()!=Some(NumericType::default()){return None;}
+        let value=match function{MathFunction::SiblingIndex=>index,MathFunction::SiblingCount=>count,_=>unreachable!()};
+        if !changed{output.try_reserve(input.len()).ok()?;}
+        output.push_str(&input[copied..token.start]);
+        // Tree functions are math expressions, even when their computed result
+        // is an integer. Preserve that boundary so consuming grammar applies
+        // computed-value range clamping rather than literal admission rules.
+        output.push_str("calc(");output.push_str(&value.to_string());output.push(')');
+        if output.len()>super::MAX_VARIABLE_BYTES{return None;}
+        copied=block.after;cursor.position=block.after;changed=true;
+    }
+    if !changed{return Some((alloc::borrow::Cow::Borrowed(input),false));}
+    output.push_str(&input[copied..]);
+    (output.len()<=super::MAX_VARIABLE_BYTES).then_some((alloc::borrow::Cow::Owned(output),true))
+}
+
+/// Resolve numeric leaves with the same dimensional authority used by lengths.
+/// Absolute dimensions retain their f64 precision; only contextual metrics use
+/// the layout's existing f32 length resolver.
+pub(super) fn computed_numeric_value(value: NumericValue, context: super::LengthContext, query: super::ContainerUnitContext) -> Option<NumericValue> {
+    if let Some((unit, factor)) = value.unit.canonical_unit_and_factor() {
+        let value = NumericValue { unit, value: value.value * factor };
+        return Some(value);
+    }
+    if value.unit.dimension() != NumericDimension::Length { return Some(value); }
+    let mut resolver = super::LengthValueBuilder { context: Some(context), query,
+        allow_viewport: true, scalar: false, sign_input_depth: 0, context_dependent: false };
+    let (pixels, dimension) = resolver.value(value)?;
+    dimension.then_some(NumericValue { unit: NumericUnit::Px, value: f64::from(pixels) })
+}
+
+/// Units whose basis cannot be changed by an authored CSS property.
+pub(super) fn computationally_independent_unit(unit:NumericUnit)->bool {
+    use NumericUnit::*;
+    matches!(unit,Number|Percent|Px|In|Cm|Mm|Q|Pt|Pc|Deg|Grad|Rad|Turn|S|Ms|Hz|KHz|Dpi|Dpcm|Dppx
+        |Vw|Vh|Vi|Vb|Vmin|Vmax|Svw|Svh|Svi|Svb|Svmin|Svmax|Lvw|Lvh|Lvi|Lvb|Lvmin|Lvmax|Dvw|Dvh|Dvi|Dvb|Dvmin|Dvmax)
 }

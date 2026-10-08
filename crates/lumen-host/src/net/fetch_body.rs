@@ -446,9 +446,20 @@ pub(crate) struct Drain {
     reader: RefCell<Option<Value>>,
     net: RefCell<Option<Rc<NetBody>>>,
     bytes: RefCell<Vec<u8>>,
+    limit: usize,
 }
 
 impl Drain {
+    fn append(self:&Rc<Self>,ctx:&mut Ctx,chunk:&[u8])->bool {
+        if chunk.len()>self.limit.saturating_sub(self.bytes.borrow().len()) {
+            let reason=OpError::type_error("Response body exceeds the resource byte budget").to_value(ctx);
+            self.cancel(ctx,reason);
+            false
+        } else {
+            self.bytes.borrow_mut().extend_from_slice(chunk);
+            true
+        }
+    }
     fn finish(&self, ctx: &mut Ctx, result: Result<Vec<u8>, Value>) {
         let Some(done) = self.done.borrow_mut().take() else {
             return;
@@ -490,6 +501,10 @@ fn swallow(ctx: &mut Ctx, promise: &Value) {
 /// Read the whole body, marking it used. `done` may run before this returns when the bytes are
 /// in memory.
 pub(crate) fn read_all(ctx: &mut Ctx, cell: &BodyCell, done: Finished) -> Rc<Drain> {
+    read_all_bounded(ctx,cell,usize::MAX,done)
+}
+
+pub(crate) fn read_all_bounded(ctx:&mut Ctx,cell:&BodyCell,limit:usize,done:Finished)->Rc<Drain> {
     let (source, stream) = {
         let mut body = cell.borrow_mut();
         body.used = true;
@@ -500,6 +515,7 @@ pub(crate) fn read_all(ctx: &mut Ctx, cell: &BodyCell, done: Finished) -> Rc<Dra
         reader: RefCell::new(None),
         net: RefCell::new(None),
         bytes: RefCell::new(Vec::new()),
+        limit,
     });
     if let Some(stream) = stream {
         match call(ctx, &stream, "getReader", &[]) {
@@ -513,7 +529,12 @@ pub(crate) fn read_all(ctx: &mut Ctx, cell: &BodyCell, done: Finished) -> Rc<Dra
     }
     match source {
         Source::Null | Source::Stream => drain.finish(ctx, Ok(Vec::new())),
-        Source::Bytes(bytes) => drain.finish(ctx, Ok(bytes.to_vec())),
+        Source::Bytes(bytes) => {
+            if drain.append(ctx,&bytes) {
+                let bytes=std::mem::take(&mut *drain.bytes.borrow_mut());
+                drain.finish(ctx,Ok(bytes));
+            }
+        },
         Source::Net(net) => {
             *drain.net.borrow_mut() = Some(net);
             pump_net(ctx, &drain);
@@ -531,8 +552,7 @@ fn pump_net(ctx: &mut Ctx, drain: &Rc<Drain>) {
         ctx,
         Box::new(move |ctx, result| match result {
             Ok(Some(chunk)) => {
-                drain.bytes.borrow_mut().extend_from_slice(&chunk);
-                pump_net(ctx, &drain);
+                if drain.append(ctx,&chunk) {pump_net(ctx, &drain);}
             }
             Ok(None) => {
                 let bytes = std::mem::take(&mut *drain.bytes.borrow_mut());
@@ -570,8 +590,7 @@ fn pump_stream(ctx: &mut Ctx, drain: &Rc<Drain>) {
                 let chunk = ctx.member_get(&result, "value")?;
                 match ctx.typed_array_bytes(&chunk) {
                     Some(bytes) => {
-                        drain.bytes.borrow_mut().extend_from_slice(&bytes);
-                        pump_stream(ctx, &drain);
+                        if drain.append(ctx,&bytes) {pump_stream(ctx, &drain);}
                     }
                     None => {
                         let reason = chunk_error().to_value(ctx);

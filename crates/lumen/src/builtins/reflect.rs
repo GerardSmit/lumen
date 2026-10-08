@@ -14,17 +14,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         Value::Obj(o) => js_get_prototype_of(i, &Value::Obj(o)),
         _ => Err(i.make_error("TypeError", "Reflect.getPrototypeOf called on non-object")),
     });
-    it.def_method(&r, "setPrototypeOf", 2, |i, _t, a| {
-        let obj = arg(a, 0);
-        if !matches!(obj, Value::Obj(_)) {
-            return Err(i.make_error("TypeError", "Reflect.setPrototypeOf called on non-object"));
-        }
-        let proto = arg(a, 1);
-        if !matches!(proto, Value::Obj(_) | Value::Null) {
-            return Err(i.make_error("TypeError", "prototype must be an object or null"));
-        }
-        Ok(Value::Bool(js_set_prototype_of(i, &obj, &proto)?))
-    });
+    it.def_method(&r, "setPrototypeOf", 2, reflect_set_prototype_of);
     it.def_method(&r, "defineProperty", 3, reflect_define);
     it.def_method(&r, "apply", 3, |i, _t, a| {
         crate::bytecode::reflect::native_transparent(i);
@@ -69,6 +59,22 @@ pub(super) fn install_reflect(it: &mut Interp) {
     });
     set_to_string_tag(it, &r, "Reflect");
     set_builtin(&it.global, "Reflect", Value::Obj(r));
+}
+
+pub(crate) fn reflect_set_prototype_of(
+    i: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let obj = arg(args, 0);
+    if !matches!(obj, Value::Obj(_)) {
+        return Err(i.make_error("TypeError", "Reflect.setPrototypeOf called on non-object"));
+    }
+    let proto = arg(args, 1);
+    if !matches!(proto, Value::Obj(_) | Value::Null) {
+        return Err(i.make_error("TypeError", "prototype must be an object or null"));
+    }
+    Ok(Value::Bool(js_set_prototype_of(i, &obj, &proto)?))
 }
 
 pub(crate) fn reflect_get(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {

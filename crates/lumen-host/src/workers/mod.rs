@@ -26,7 +26,7 @@ mod service;
 mod service_scope;
 
 pub use backend::{
-    set_backend, unsupported, DedicatedSpec, ScopeKind, SharedSpec, WorkerBackend, WorkerScopeHost,
+    set_backend, set_request_policy, WorkerRequestPolicy, unsupported, DedicatedSpec, ScopeKind, SharedSpec, WorkerBackend, WorkerScopeHost,
 };
 pub use control::{Control, WorkerEvent};
 pub use page::bindings as page_bindings;

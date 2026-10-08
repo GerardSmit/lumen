@@ -589,12 +589,13 @@ pub struct Function {
     /// (`None` = uses constructs outside the bytecode subset; runs in the tree-walker forever).
     pub calls: std::cell::Cell<u32>,
     pub code: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
-    /// Lazily-built object-map templates for closures of this function (see
+    /// Lazily-built realm-neutral object-map templates for closures of this function (see
     /// `Interp::make_function` and [`crate::value::FnMaps`]): the function object's `Props`
     /// (length/name and a `prototype` placeholder) and, for prototype-bearing kinds, the fresh
     /// `.prototype`'s `Props` — cloned per closure instance instead of rebuilt insert by insert,
     /// so key hashing and shape transitions are paid once per FUNCTION rather than once per
-    /// closure, and a prototype-less closure shares the template's entry block outright.
+    /// closure. Legacy accessor placeholders are filled from the actual closure's realm;
+    /// other prototype-less closures share the template's entry block outright.
     pub fn_maps: std::cell::OnceCell<Box<crate::value::FnMaps>>,
 }
 

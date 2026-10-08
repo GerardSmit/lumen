@@ -16,13 +16,13 @@ __builtins.set("perf_hooks", __lazyValue(() => {
   } = __errors;
   const { validateFunction, validateInteger, validateNumber, validateObject, validateString } = __validators;
 
-  const kSkipThrow = Symbol("skip-throw");
   const kEmptyObject = Object.freeze({ __proto__: null });
   const inspectCustom = Symbol.for("nodejs.util.inspect.custom");
   const inspect = (value, options) => __builtins.get("util").inspect(value, options);
   const Performance = globalThis.performance.constructor;
   const perf = globalThis.performance;
   const now = () => perf.now();
+  const hrtimeNanos = process.hrtime.bigint.bind(process.hrtime);
 
   const invalidMark = (name) => __nodeError(Error, "ERR_INVALID_PERFORMANCE_MARK", `The "${name}" performance mark has not been set`);
   const invalidTimestamp = (value) => __nodeError(TypeError, "ERR_PERFORMANCE_INVALID_TIMESTAMP", `${value} is not a valid timestamp`);
@@ -41,74 +41,22 @@ __builtins.set("perf_hooks", __lazyValue(() => {
     NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64,
   };
 
-  // ---- entries ----------------------------------------------------------------------------
-  const entryInspect = function (depth, options) {
-    if (typeof depth === "number" && depth < 0) return this;
-    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
-    return `${this.constructor.name} ${inspect(this.toJSON(), opts)}`;
-  };
-
-  class PerformanceEntry {
-    #name;
-    #type;
-    #start;
-    #duration;
-    #detail;
-    constructor(skip, name, type, start, duration, detail) {
-      if (skip !== kSkipThrow) throw new ERR_ILLEGAL_CONSTRUCTOR();
-      this.#name = name;
-      this.#type = type;
-      this.#start = start;
-      this.#duration = duration;
-      this.#detail = detail;
-    }
-    get name() { return this.#name; }
-    get entryType() { return this.#type; }
-    get startTime() { return this.#start; }
-    get duration() { return this.#duration; }
-    get detail() { return this.#detail; }
-    toJSON() {
-      return {
-        name: this.name,
-        entryType: this.entryType,
-        startTime: this.startTime,
-        duration: this.duration,
-        detail: this.detail,
-      };
-    }
-    [inspectCustom](depth, options) { return entryInspect.call(this, depth, options); }
-  }
-  const tag = (Class) => Object.defineProperty(Class.prototype, Symbol.toStringTag, {
-    __proto__: null, configurable: true, enumerable: false, writable: false, value: Class.name,
+  const api = globalThis.__performance_timeline.createProvider({
+    node: true, inspectCustom, inspect, invalidMark, invalidTimestamp,
+    supported: ["dns", "function", "gc", "http", "http2", "mark", "measure", "net", "resource"],
+    task: callback => globalThis.setImmediate(callback),
+    resources: () => resourceBuffer,
+    countObserver,
+    resolveSpecial: name => { const index = kMilestones.indexOf(name); return index < 0 ? undefined : timingSnapshot()[index]; },
   });
-  for (const name of ["name", "entryType", "startTime", "duration", "detail"]) {
-    Object.defineProperty(PerformanceEntry.prototype, name, { enumerable: true });
-  }
-  tag(PerformanceEntry);
-
-  const cloneDetail = (detail) => (detail != null ? structuredClone(detail) : null);
-
-  class PerformanceMark extends PerformanceEntry {
-    constructor(name, options) {
-      name = `${name}`;
-      if (options != null) validateObject(options, "options");
-      const startTime = options?.startTime ?? now();
-      validateNumber(startTime, "startTime");
-      if (startTime < 0) throw invalidTimestamp(startTime);
-      super(kSkipThrow, name, "mark", startTime, 0, cloneDetail(options?.detail));
-    }
-  }
-  tag(PerformanceMark);
-
-  class PerformanceMeasure extends PerformanceEntry {
-    constructor(skip, name, start, duration, detail) {
-      if (skip !== kSkipThrow) throw new ERR_ILLEGAL_CONSTRUCTOR();
-      super(kSkipThrow, name, "measure", start, duration, detail);
-    }
-  }
-  tag(PerformanceMeasure);
+  const { PerformanceEntry, PerformanceMark, PerformanceMeasure,
+    PerformanceObserver, PerformanceObserverEntryList,
+    kSkipThrow, tag, filterTimeline, enqueue } = api;
+  const { mark, measure, clearMarks, clearMeasures } = api.methods;
 
   class PerformanceNodeEntry extends PerformanceEntry {
+    get detail() { return this._detail(); }
+    toJSON() { return { ...super.toJSON(), detail: this.detail }; }
     constructor(name, type, start, duration, detail) {
       super(kSkipThrow, name, type, start, duration, detail);
     }
@@ -183,6 +131,7 @@ __builtins.set("perf_hooks", __lazyValue(() => {
   }
   tag(PerformanceResourceTiming);
 
+
   // ---- timing milestones and the loop's idle time ------------------------------------------
   const kMilestones = ["nodeStart", "v8Start", "environment", "bootstrapComplete", "loopStart", "loopExit"];
   const timingSnapshot = () => __node.perfTiming();
@@ -238,49 +187,13 @@ __builtins.set("perf_hooks", __lazyValue(() => {
     return { idle: idleDelta, active: activeDelta, utilization: activeDelta / (idleDelta + activeDelta) };
   }
 
-  // ---- observers and the timeline buffers ----------------------------------------------------
-  const kSupportedEntryTypes = Object.freeze(["dns", "function", "gc", "http", "http2", "mark", "measure", "net", "resource"]);
-  const kBuffer = Symbol("kBuffer");
-  const kEntryTypes = Symbol("kEntryTypes");
-  const kType = Symbol("kType");
-  const kCallback = Symbol("kCallback");
-  const kDispatch = Symbol("kDispatch");
-
-  let markBuffer = [];
-  let measureBuffer = [];
+  // Node sources and resource-buffer policy extend the shared timeline provider.
   let resourceBuffer = [];
   let resourceSecondary = [];
   let resourceLimit = 250;
   let resourceFullPending = false;
-
-  const observers = new Set();
   const observerCounts = new Map();
-  const pending = new Set();
-  let flushQueued = false;
-
-  const hasObserver = (type) => (observerCounts.get(type) ?? 0) > 0;
-
-  function queuePending() {
-    if (flushQueued) return;
-    flushQueued = true;
-    globalThis.setImmediate(() => {
-      flushQueued = false;
-      const list = [...pending];
-      pending.clear();
-      for (const observer of list) observer[kDispatch]();
-    });
-  }
-
-  function enqueue(entry) {
-    const type = entry.entryType;
-    for (const observer of observers) {
-      if (observer[kEntryTypes].has(type)) {
-        observer[kBuffer].push(entry);
-        pending.add(observer);
-      }
-    }
-    if (pending.size) queuePending();
-  }
+  const hasObserver = type => (observerCounts.get(type) ?? 0) > 0;
 
   function countObserver(type, delta) {
     const count = (observerCounts.get(type) ?? 0) + delta;
@@ -299,211 +212,6 @@ __builtins.set("perf_hooks", __lazyValue(() => {
         flags: events[i + 2] ? constants.NODE_PERFORMANCE_GC_FLAGS_FORCED : constants.NODE_PERFORMANCE_GC_FLAGS_NO,
       };
       enqueue(new PerformanceNodeEntry("gc", "gc", events[i], events[i + 1], detail));
-    }
-  }
-
-  function filterTimeline(name, type) {
-    let entries;
-    switch (type) {
-      case undefined: entries = [...markBuffer, ...measureBuffer, ...resourceBuffer]; break;
-      case "mark": entries = markBuffer.slice(); break;
-      case "measure": entries = measureBuffer.slice(); break;
-      case "resource": entries = resourceBuffer.slice(); break;
-      default: return [];
-    }
-    if (name !== undefined) entries = entries.filter((entry) => entry.name === name);
-    return entries.sort((a, b) => a.startTime - b.startTime);
-  }
-
-  class PerformanceObserverEntryList {
-    #entries;
-    constructor(entries) {
-      this.#entries = entries.slice().sort((a, b) => a.startTime - b.startTime);
-    }
-    getEntries() { return this.#entries.slice(); }
-    getEntriesByType(type) {
-      if (arguments.length === 0) throw new ERR_MISSING_ARGS("type");
-      type = `${type}`;
-      return this.#entries.filter((entry) => entry.entryType === type);
-    }
-    getEntriesByName(name, type) {
-      if (arguments.length === 0) throw new ERR_MISSING_ARGS("name");
-      name = `${name}`;
-      if (type !== undefined) type = `${type}`;
-      return this.#entries.filter((entry) => entry.name === name && (type === undefined || entry.entryType === type));
-    }
-    [inspectCustom](depth, options) {
-      if (typeof depth === "number" && depth < 0) return this;
-      const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
-      return `PerformanceObserverEntryList ${inspect(this.#entries, opts)}`;
-    }
-  }
-  tag(PerformanceObserverEntryList);
-
-  class PerformanceObserver {
-    constructor(callback) {
-      validateFunction(callback, "callback");
-      this[kBuffer] = [];
-      this[kEntryTypes] = new Set();
-      this[kType] = undefined;
-      this[kCallback] = callback;
-    }
-    observe(options = kEmptyObject) {
-      validateObject(options, "options");
-      const { entryTypes, type, buffered } = options;
-      if (entryTypes === undefined && type === undefined) {
-        throw new ERR_MISSING_ARGS("options.entryTypes", "options.type");
-      }
-      if (entryTypes != null && type != null) {
-        throw new ERR_INVALID_ARG_VALUE("options.entryTypes", entryTypes,
-          "options.entryTypes can not set with options.type together");
-      }
-      switch (this[kType]) {
-        case undefined: break;
-        case "single":
-          if (entryTypes !== undefined) {
-            throw new ERR_INVALID_ARG_VALUE("options.entryTypes", entryTypes,
-              "options.entryTypes can not set when type previously used");
-          }
-          break;
-        case "multiple":
-          if (type !== undefined) {
-            throw new ERR_INVALID_ARG_VALUE("options.type", type,
-              "options.type can not be used when entryTypes previously used");
-          }
-          break;
-      }
-      if (entryTypes) {
-        __validators.validateArray(entryTypes, "options.entryTypes");
-        const types = entryTypes.filter((t) => kSupportedEntryTypes.includes(t));
-        if (types.length === 0) return;
-        this[kType] = "multiple";
-        for (const old of this[kEntryTypes]) countObserver(old, -1);
-        this[kEntryTypes].clear();
-        for (const t of types) {
-          if (!this[kEntryTypes].has(t)) {
-            this[kEntryTypes].add(t);
-            countObserver(t, 1);
-          }
-        }
-        observers.add(this);
-        return;
-      }
-      validateString(type, "options.type");
-      this[kType] = "single";
-      if (!kSupportedEntryTypes.includes(type)) return;
-      if (!this[kEntryTypes].has(type)) {
-        this[kEntryTypes].add(type);
-        countObserver(type, 1);
-      }
-      observers.add(this);
-      if (buffered) {
-        const entries = filterTimeline(undefined, type);
-        if (entries.length) {
-          this[kBuffer].push(...entries);
-          pending.add(this);
-          queuePending();
-        }
-      }
-    }
-    disconnect() {
-      for (const t of this[kEntryTypes]) countObserver(t, -1);
-      observers.delete(this);
-      pending.delete(this);
-      this[kEntryTypes].clear();
-      this[kBuffer] = [];
-      this[kType] = undefined;
-    }
-    takeRecords() {
-      const records = this[kBuffer];
-      this[kBuffer] = [];
-      return records;
-    }
-    static get supportedEntryTypes() { return kSupportedEntryTypes; }
-    [kDispatch]() {
-      const entries = this.takeRecords();
-      if (entries.length === 0) return;
-      Reflect.apply(this[kCallback], this, [new PerformanceObserverEntryList(entries), this]);
-    }
-    [inspectCustom](depth, options) {
-      if (typeof depth === "number" && depth < 0) return this;
-      const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
-      return `PerformanceObserver ${inspect({ connected: observers.has(this), pending: pending.has(this), entryTypes: [...this[kEntryTypes]], buffer: this[kBuffer] }, opts)}`;
-    }
-  }
-  tag(PerformanceObserver);
-
-  // ---- user timing -------------------------------------------------------------------------
-  const getMark = (mark) => {
-    if (typeof mark === "number") {
-      if (mark < 0) throw invalidTimestamp(mark);
-      return mark;
-    }
-    mark = `${mark}`;
-    const index = kMilestones.indexOf(mark);
-    if (index >= 0) return timingSnapshot()[index];
-    for (let i = markBuffer.length - 1; i >= 0; i--) {
-      if (markBuffer[i].name === mark) return markBuffer[i].startTime;
-    }
-    throw invalidMark(mark);
-  };
-
-  function mark(name, options = kEmptyObject) {
-    const entry = new PerformanceMark(name, options);
-    enqueue(entry);
-    markBuffer.push(entry);
-    return entry;
-  }
-
-  function measure(name, startOrMeasureOptions, endMark) {
-    name = `${name}`;
-    let start, end, duration, detail;
-    let optionsValid = false;
-    startOrMeasureOptions ??= 0;
-    if (typeof startOrMeasureOptions === "object") {
-      ({ start, end, duration, detail } = startOrMeasureOptions);
-      optionsValid = start !== undefined || end !== undefined;
-    }
-    if (optionsValid) {
-      if (endMark !== undefined) throw new ERR_INVALID_ARG_VALUE("endMark", endMark, "must not be specified");
-      if (start !== undefined && end !== undefined && duration !== undefined) {
-        throw new ERR_INVALID_ARG_VALUE("options", startOrMeasureOptions, "must not have duration with start and end");
-      }
-    } else {
-      start = startOrMeasureOptions;
-      end = endMark;
-      duration = undefined;
-      detail = undefined;
-    }
-    let endTime;
-    if (end !== undefined) endTime = getMark(end);
-    else if (start !== undefined && duration !== undefined) endTime = getMark(start) + getMark(duration);
-    else endTime = now();
-    let startTime;
-    if (start !== undefined) startTime = getMark(start);
-    else if (duration !== undefined) startTime = endTime - getMark(duration);
-    else startTime = 0;
-    const entry = new PerformanceMeasure(kSkipThrow, name, startTime, endTime - startTime, cloneDetail(detail));
-    enqueue(entry);
-    measureBuffer.push(entry);
-    return entry;
-  }
-
-  function clearMarks(name) {
-    if (name !== undefined) {
-      name = `${name}`;
-      markBuffer = markBuffer.filter((entry) => entry.name !== name);
-    } else {
-      markBuffer = [];
-    }
-  }
-
-  function clearMeasures(name) {
-    if (name !== undefined) {
-      name = `${name}`;
-      measureBuffer = measureBuffer.filter((entry) => entry.name !== name);
-    } else {
-      measureBuffer = [];
     }
   }
 
@@ -559,8 +267,11 @@ __builtins.set("perf_hooks", __lazyValue(() => {
   }
 
   // ---- timerify --------------------------------------------------------------------------------
-  function processComplete(name, start, args, histogram) {
-    const duration = now() - start;
+  function processComplete(name, start, startNanos, args, histogram) {
+    // Histogram nanoseconds need the existing native clock, not the public web
+    // clock's 100-microsecond buckets, which can report zero for short calls.
+    const elapsedNanos = hrtimeNanos() - startNanos;
+    const duration = Number(elapsedNanos) / 1e6;
     if (histogram !== undefined) histogram.record(Math.ceil(duration * 1e6));
     if (hasObserver("function")) {
       const entry = new PerformanceNodeEntry(name, "function", start, duration, args);
@@ -579,11 +290,12 @@ __builtins.set("perf_hooks", __lazyValue(() => {
     function timerified(...args) {
       const isConstructorCall = new.target !== undefined;
       const start = now();
+      const startNanos = hrtimeNanos();
       const result = isConstructorCall ? Reflect.construct(fn, args, fn) : Reflect.apply(fn, this, args);
       if (!isConstructorCall && typeof result?.finally === "function") {
-        return result.finally(() => processComplete(fn.name, start, args, histogram));
+        return result.finally(() => processComplete(fn.name, start, startNanos, args, histogram));
       }
-      processComplete(fn.name, start, args, histogram);
+      processComplete(fn.name, start, startNanos, args, histogram);
       return result;
     }
     Object.defineProperties(timerified, {

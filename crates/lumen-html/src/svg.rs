@@ -36,7 +36,7 @@ pub fn local_name(name: &Name) -> &str {
 
 pub fn parse_view_box(input: &str) -> Option<ViewBox> {
     let values = number_list(input, 4)?;
-    if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
+    if values.len() != 4 || values[2] < 0.0 || values[3] < 0.0 {
         return None;
     }
     Some(ViewBox {
@@ -45,6 +45,161 @@ pub fn parse_view_box(input: &str) -> Option<ViewBox> {
         width: values[2],
         height: values[3],
     })
+}
+
+/// The view overrides are parsed once per URL fragment, then resolved against
+/// the actual document's existing ID index. No native or node owner is retained.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fragment {
+    Named(Arc<str>),
+    View(ViewSpec),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ViewSpec {
+    pub view_box: Option<ViewBox>,
+    pub aspect: Option<AspectRatio>,
+    pub transform: Option<Affine>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AspectRatio {
+    x: u8,
+    y: u8,
+    mode: u8,
+}
+impl Default for AspectRatio {
+    fn default() -> Self {
+        Self {
+            x: 1,
+            y: 1,
+            mode: 1,
+        }
+    }
+}
+pub fn parse_aspect_ratio(input: &str) -> Option<AspectRatio> {
+    let mut parts = input.split_ascii_whitespace();
+    let align = parts.next()?;
+    let mode = match parts.next() {
+        None | Some("meet") => 1,
+        Some("slice") => 2,
+        _ => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    if align == "none" {
+        return Some(AspectRatio {
+            x: 0,
+            y: 0,
+            mode: 0,
+        });
+    }
+    let (x, y) = match align {
+        "xMinYMin" => (0, 0),
+        "xMidYMin" => (1, 0),
+        "xMaxYMin" => (2, 0),
+        "xMinYMid" => (0, 1),
+        "xMidYMid" => (1, 1),
+        "xMaxYMid" => (2, 1),
+        "xMinYMax" => (0, 2),
+        "xMidYMax" => (1, 2),
+        "xMaxYMax" => (2, 2),
+        _ => return None,
+    };
+    Some(AspectRatio { x, y, mode })
+}
+impl Fragment {
+    /// SVG2 view parameters are atomic, ordered arbitrarily, and each occurs
+    /// at most once. URL escaping is decoded by the shared caller beforehand.
+    pub fn parse(decoded: &str) -> Option<Self> {
+        if decoded.is_empty() || decoded.len() > MAX_TRANSFORM_BYTES {
+            return None;
+        }
+        if !decoded.starts_with("svgView(") {
+            return crate::xml::is_xml_name(decoded).then(|| Self::Named(Arc::from(decoded)));
+        }
+        let body = decoded.strip_prefix("svgView(")?.strip_suffix(')')?;
+        let mut rest = body.trim_matches([' ', '\t', '\r', '\n']);
+        let mut result = ViewSpec::default();
+        let mut count = 0;
+        loop {
+            count += 1;
+            if count > 3 {
+                return None;
+            }
+            let open = rest.find('(')?;
+            let name = rest[..open].trim_matches([' ', '\t', '\r', '\n']);
+            let mut depth = 1usize;
+            let mut close = None;
+            for (offset, byte) in rest.bytes().enumerate().skip(open + 1) {
+                match byte {
+                    b'(' => {
+                        depth = depth.checked_add(1)?;
+                        if depth > 3 {
+                            return None;
+                        }
+                    }
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close?;
+            let value = &rest[open + 1..close];
+            match name {
+                "viewBox" if result.view_box.is_none() => {
+                    result.view_box = Some(parse_view_box(value)?)
+                }
+                "preserveAspectRatio" if result.aspect.is_none() => {
+                    result.aspect = Some(parse_aspect_ratio(value)?)
+                }
+                "transform" if result.transform.is_none() => {
+                    result.transform = Some(parse_transform(value)?)
+                }
+                _ => return None,
+            }
+            rest = rest[close + 1..].trim_matches([' ', '\t', '\r', '\n']);
+            if rest.is_empty() {
+                return Some(Self::View(result));
+            }
+            rest = rest
+                .strip_prefix(';')?
+                .trim_matches([' ', '\t', '\r', '\n']);
+            if rest.is_empty() {
+                return None;
+            }
+        }
+    }
+    pub fn resolve(&self, document: &crate::Document) -> Option<ViewSpec> {
+        match self {
+            Self::View(view) => Some(*view),
+            Self::Named(id) => {
+                let node =
+                    crate::selector::get_element_by_id(document, document.root(), id).ok()??;
+                let crate::NodeKind::Element {
+                    namespace: crate::Namespace::Svg,
+                    name,
+                    attributes,
+                } = document.kind(node).ok()?
+                else {
+                    return None;
+                };
+                if local_name(name) != "view" {
+                    return None;
+                }
+                Some(ViewSpec {
+                    view_box: attribute(attributes, "viewBox").and_then(parse_view_box),
+                    aspect: attribute(attributes, "preserveAspectRatio")
+                        .and_then(parse_aspect_ratio),
+                    transform: None,
+                })
+            }
+        }
+    }
 }
 
 /// Resolve intrinsic dimensions for an inline SVG viewport. Explicit CSS
@@ -57,7 +212,27 @@ pub fn root_size(
     available_width: f32,
     available_height: Option<f32>,
 ) -> (f32, f32) {
-    let view_box = attribute(attributes, "viewBox").and_then(parse_view_box);
+    root_size_with_view(
+        attributes,
+        css_width,
+        css_height,
+        available_width,
+        available_height,
+        None,
+    )
+}
+
+pub fn root_size_with_view(
+    attributes: &[(Name, String)],
+    css_width: Option<f32>,
+    css_height: Option<f32>,
+    available_width: f32,
+    available_height: Option<f32>,
+    view: Option<ViewSpec>,
+) -> (f32, f32) {
+    let view_box = view
+        .and_then(|view| view.view_box)
+        .or_else(|| attribute(attributes, "viewBox").and_then(parse_view_box));
     let width = css_width.or_else(|| {
         attribute(attributes, "width").and_then(|value| dimension(value, available_width))
     });
@@ -65,7 +240,9 @@ pub fn root_size(
         attribute(attributes, "height")
             .and_then(|value| dimension(value, available_height.unwrap_or(150.0)))
     });
-    let ratio = view_box.map(|view_box| view_box.width / view_box.height);
+    let ratio = view_box
+        .map(|view_box| view_box.width / view_box.height)
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
     let width = width.filter(|width| width.is_finite() && *width >= 0.0);
     let height = height.filter(|height| height.is_finite() && *height >= 0.0);
     let (width, height) = match (width, height) {
@@ -160,19 +337,38 @@ pub fn view_box_transform(
         width: width.max(1.0),
         height: height.max(1.0),
     });
-    if width <= 0.0 || height <= 0.0 {
+    if width <= 0.0 || height <= 0.0 || view_box.width <= 0.0 || view_box.height <= 0.0 {
         return (Affine::IDENTITY, view_box);
     }
-    let preserve = attribute(attributes, "preserveAspectRatio").unwrap_or("xMidYMid meet");
-    let mut parts = preserve.split_ascii_whitespace();
-    let align = parts.next().unwrap_or("xMidYMid");
-    let mode = parts.next().unwrap_or("meet");
+    let aspect = attribute(attributes, "preserveAspectRatio")
+        .and_then(parse_aspect_ratio)
+        .unwrap_or_default();
+    view_box_transform_with_aspect(Some(view_box), aspect, x, y, width, height)
+}
+
+pub fn view_box_transform_with_aspect(
+    view_box: Option<ViewBox>,
+    aspect: AspectRatio,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> (Affine, ViewBox) {
+    let view_box = view_box.unwrap_or(ViewBox {
+        min_x: 0.0,
+        min_y: 0.0,
+        width: width.max(1.0),
+        height: height.max(1.0),
+    });
+    if width <= 0.0 || height <= 0.0 || view_box.width <= 0.0 || view_box.height <= 0.0 {
+        return (Affine::IDENTITY, view_box);
+    }
     let sx = width / view_box.width;
     let sy = height / view_box.height;
-    let (scale_x, scale_y) = if align == "none" {
+    let (scale_x, scale_y) = if aspect.mode == 0 {
         (sx, sy)
     } else {
-        let scale = if mode == "slice" {
+        let scale = if aspect.mode == 2 {
             sx.max(sy)
         } else {
             sx.min(sy)
@@ -181,20 +377,8 @@ pub fn view_box_transform(
     };
     let spare_x = width - view_box.width * scale_x;
     let spare_y = height - view_box.height * scale_y;
-    let align_x = if align.contains("xMin") {
-        0.0
-    } else if align.contains("xMax") {
-        1.0
-    } else {
-        0.5
-    };
-    let align_y = if align.contains("YMin") {
-        0.0
-    } else if align.contains("YMax") {
-        1.0
-    } else {
-        0.5
-    };
+    let align_x = f32::from(aspect.x) * 0.5;
+    let align_y = f32::from(aspect.y) * 0.5;
     (
         Affine {
             a: scale_x,
@@ -552,6 +736,70 @@ fn number_list(input: &str, limit: usize) -> Option<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_svg_view_fragment_atomic_grammar_shared_transform_and_live_id_resolution() {
+        let fragment=Fragment::parse("svgView( preserveAspectRatio(none);viewBox(100,0,100,50);transform(translate(10,20)) )").unwrap();
+        let document=crate::xml::parse("<svg xmlns='http://www.w3.org/2000/svg'><view id='actual' viewBox='0 0 20 10' preserveAspectRatio='xMaxYMax slice'/></svg>",32).unwrap();
+        let spec = fragment.resolve(&document).unwrap();
+        assert_eq!(
+            spec.view_box,
+            Some(ViewBox {
+                min_x: 100.0,
+                min_y: 0.0,
+                width: 100.0,
+                height: 50.0
+            })
+        );
+        let (base, _) = view_box_transform_with_aspect(
+            spec.view_box,
+            spec.aspect.unwrap(),
+            0.0,
+            0.0,
+            200.0,
+            100.0,
+        );
+        let projected = spec.transform.unwrap().then(base);
+        assert_eq!(projected.apply(100.0, 0.0), (10.0, 20.0));
+        for invalid in [
+            "svgView()",
+            "svgView(viewBox(0,0,1,1);viewBox(0,0,2,2))",
+            "svgView(viewBox(-1,0,-2,2))",
+            "svgView(preserveAspectRatio(invalid))",
+            "svgView(transform(translate(NaN)))",
+            "svgView(viewBox(0,0,1,1);)",
+            "svgView(viewTarget(actual))",
+        ] {
+            assert!(Fragment::parse(invalid).is_none(), "{invalid}");
+        }
+        let named = Fragment::parse("actual").unwrap();
+        assert_eq!(
+            named.resolve(&document).unwrap().view_box.unwrap().width,
+            20.0
+        );
+        let mut document = document;
+        let view = crate::selector::get_element_by_id(&document, document.root(), "actual")
+            .unwrap()
+            .unwrap();
+        document
+            .set_attribute(view, "viewBox", "0 0 40 10")
+            .unwrap();
+        assert_eq!(
+            named.resolve(&document).unwrap().view_box.unwrap().width,
+            40.0
+        );
+        assert!(Fragment::parse("x".repeat(MAX_TRANSFORM_BYTES + 1).as_str()).is_none());
+        assert_eq!(
+            Fragment::parse("svgView(viewBox(0,0,0,10))")
+                .unwrap()
+                .resolve(&document)
+                .unwrap()
+                .view_box
+                .unwrap()
+                .width,
+            0.0
+        );
+    }
+
     use super::*;
 
     #[test]

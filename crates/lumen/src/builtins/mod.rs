@@ -19,6 +19,7 @@ mod num_fmt;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 pub(crate) mod dataview;
 mod date;
+#[cfg(feature = "embed")]
 pub(crate) use date::time_clip;
 mod disposable;
 mod errors;
@@ -27,6 +28,9 @@ pub(crate) use function_proto::nf_function_call;
 mod globals;
 mod host;
 mod json;
+pub(crate) fn parse_json_module_default(i:&mut Interp,text:&str)->Result<Value,Value> {
+    json::parse_module_default(i,text)
+}
 mod math;
 pub(crate) mod natives;
 pub(crate) use math::jit_math_fns;

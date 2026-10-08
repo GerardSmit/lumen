@@ -98,38 +98,12 @@ impl DomToggleEvent {
         else {
             return Value::Null;
         };
-        let Some((source_realm, source_node)) = ctx
-            .with_instance::<DomElement, _>(&source, |element| {
-                let node = &element.base;
-                node.realm.resolve_adopted_node(node.id)
-            })
-            .ok()
-        else {
-            return source;
-        };
-        let active_target = self.base.active_current_target();
-        let target_node = active_target.as_ref().and_then(|target| {
-            ctx.with_instance::<DomElement, _>(target, |element| {
-                let node = &element.base;
-                node.realm.resolve_adopted_node(node.id)
-            })
-            .ok()
-        });
-        let context = target_node.and_then(|(target_realm, target_node)| {
-            Rc::ptr_eq(&source_realm, &target_realm).then_some(target_node)
-        });
-        let retargeted = source_realm
-            .session
-            .borrow()
-            .document()
-            .retarget(source_node, context)
-            .ok();
-        retargeted.map_or(source, |node| source_realm.wrap(ctx, node))
+        super::element_reflection::retarget_event_source(ctx, source, self.base.active_current_target())
     }
 }
 
 pub(crate) fn constructors(ctx: &mut Ctx) -> Vec<(&'static str, Value)> {
-    vec![("ToggleEvent", ctx.class_constructor::<DomToggleEvent>())]
+    vec![("ToggleEvent", ctx.class_constructor::<DomToggleEvent>()), ("CommandEvent", ctx.class_constructor::<super::command_events::DomCommandEvent>())]
 }
 
 fn nullable_element(ctx: &mut Ctx, value: Value) -> OpResult<Value> {
@@ -239,6 +213,7 @@ pub(crate) fn set_dialog_return_value(
 }
 
 pub(crate) fn dialog_open(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<bool> {
+    let (realm,node)=realm.resolve_adopted_node(node);
     let session = realm.session.borrow();
     session
         .document()
@@ -248,6 +223,7 @@ pub(crate) fn dialog_open(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<bool> 
 }
 
 pub(crate) fn set_dialog_open(realm: &Rc<DomRealm>, node: NodeId, open: bool) -> OpResult<()> {
+    let (realm,node)=realm.resolve_adopted_node(node);
     let mut session = realm.session.borrow_mut();
     if open {
         session
@@ -267,6 +243,16 @@ pub(crate) fn show_dialog(
     realm: &Rc<DomRealm>,
     node: NodeId,
     mode: top_layer::DialogMode,
+) -> OpResult<()> {
+    show_dialog_with_source(ctx, realm, node, mode, Value::Null)
+}
+
+pub(crate) fn show_dialog_with_source(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    mode: top_layer::DialogMode,
+    source: Value,
 ) -> OpResult<()> {
     let (mut realm, mut node) = realm.resolve_adopted_node(node);
     if mode == top_layer::DialogMode::Modal && !has_active_browsing_context(&realm) {
@@ -288,7 +274,7 @@ pub(crate) fn show_dialog(
         "closed",
         "open",
         true,
-        Value::Null,
+        source.clone(),
     )? {
         return Ok(());
     }
@@ -366,6 +352,13 @@ pub(crate) fn show_dialog(
     }
     .map_err(|error| state_error(ctx, error))?;
     if changed {
+        let retired_request = realm.dialog_requests.borrow().get(&node).cloned();
+        if let Some(request) = retired_request {
+            request.active.set(true);
+            *request.result.borrow_mut() = None;
+            let wrapper = realm.wrap(ctx, node);
+            ctx.set_native_internal_value_slot(&wrapper, &request.source_slot, Value::Null).map_err(OpError::thrown)?;
+        }
         queue_toggle_task(
             ctx,
             realm.clone(),
@@ -373,10 +366,13 @@ pub(crate) fn show_dialog(
             ToggleTaskKind::Dialog,
             "closed",
             "open",
-            Value::Null,
+            source,
         )?;
-        let target = dialog_focus_target(&realm, node)?;
-        realm.focus(ctx, Some(target))?;
+        if super::focus::allow_focus(&realm) {
+            let target = dialog_focus_target(&realm, node)?;
+            realm.focus(ctx, Some(target))?;
+            super::focus::mark_processed(&realm);
+        }
     }
     Ok(())
 }
@@ -387,11 +383,75 @@ fn has_active_browsing_context(realm: &DomRealm) -> bool {
         .is_some_and(|context| browsing_context::is_active_document(&context, realm))
 }
 
+pub(crate) struct DialogRequest {
+    active: std::cell::Cell<bool>,
+    generation: std::cell::Cell<u64>,
+    running: std::cell::Cell<bool>,
+    result: RefCell<Option<String>>,
+    source_slot: String,
+}
+
+impl DialogRequest {
+    pub(crate) fn adopted(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.running.set(false);
+    }
+}
+
+pub(crate) fn dialog_attribute_changed(document: &lumen_html::Document, realm: &DomRealm, node: NodeId, old: Option<&str>) {
+    let Some(request) = realm.dialog_requests.borrow().get(&node).cloned() else { return; };
+    let open = document.get_attribute_ns_ref(node, None, "open").ok().flatten().is_some();
+    if open != old.is_some() {
+        request.generation.set(request.generation.get().wrapping_add(1));
+        request.active.set(open);
+    }
+}
+
+pub(crate) fn request_close_dialog(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, result: Option<&str>, source: Value) -> OpResult<()> {
+    let (realm, node) = realm.resolve_adopted_node(node);
+    if !dialog_open(&realm, node)? || !realm.session.borrow().document().is_connected_element(node)
+        || !has_active_browsing_context(&realm) { return Ok(()); }
+    let wrapper = realm.wrap(ctx, node);
+    let existing = realm.dialog_requests.borrow().get(&node).cloned();
+    let request = if let Some(request) = existing { request } else {
+        let request = Rc::new(DialogRequest { active: std::cell::Cell::new(true), generation: std::cell::Cell::new(0), running: std::cell::Cell::new(false), result: RefCell::new(None), source_slot: ctx.allocate_native_private_slot_name() });
+        realm.dialog_requests.borrow_mut().try_reserve(1).map_err(|_| OpError::new("QuotaExceededError", "dialog request allocation"))?;
+        realm.dialog_requests.borrow_mut().insert(node, request.clone());
+        request
+    };
+    *request.result.borrow_mut() = result.map(str::to_owned);
+    ctx.set_native_internal_value_slot(&wrapper, &request.source_slot, source).map_err(OpError::thrown)?;
+    if !request.active.get() { return Ok(()); }
+    if request.running.replace(true) { return Ok(()); }
+    let generation = request.generation.get();
+    // Requests without requiring history-action activation always allow cancel.
+    let accepted = realm.dispatch_user_agent(ctx, node, "cancel", false, true, &[]);
+    request.running.set(false);
+    if !accepted? { realm.consume_history_action_activation(); return Ok(()); }
+    let (realm, node) = realm.resolve_adopted_node(node);
+    if !has_active_browsing_context(&realm) || !request.active.get() || request.generation.get() != generation
+        || !realm.dialog_requests.borrow().get(&node).is_some_and(|current| Rc::ptr_eq(current, &request)) { return Ok(()); }
+    request.active.set(false);
+    let result = request.result.borrow().clone();
+    let source = ctx.native_private_value_slot(&wrapper, &request.source_slot).unwrap_or(Value::Null);
+    close_dialog_with_source(ctx, &realm, node, result.as_deref(), source)
+}
+
 pub(crate) fn close_dialog(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     node: NodeId,
     result: Option<&str>,
+) -> OpResult<()> {
+    close_dialog_with_source(ctx, realm, node, result, Value::Null)
+}
+
+pub(crate) fn close_dialog_with_source(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    result: Option<&str>,
+    source: Value,
 ) -> OpResult<()> {
     let (mut realm, mut node) = realm.resolve_adopted_node(node);
     if !dialog_open(&realm, node)? {
@@ -405,7 +465,7 @@ pub(crate) fn close_dialog(
         "open",
         "closed",
         false,
-        Value::Null,
+        source.clone(),
     )?;
     (realm, node) = realm.resolve_adopted_node(node);
     if !dialog_open(&realm, node)? {
@@ -420,6 +480,13 @@ pub(crate) fn close_dialog(
     if let Some(result) = result {
         set_dialog_return_value(&realm, node, result)?;
     }
+    let retired_request = realm.dialog_requests.borrow().get(&node).cloned();
+        if let Some(request) = retired_request {
+        request.active.set(false);
+        let wrapper = realm.wrap(ctx, node);
+        ctx.set_native_internal_value_slot(&wrapper, &request.source_slot, Value::Null).map_err(OpError::thrown)?;
+        *request.result.borrow_mut() = None;
+    }
     queue_toggle_task(
         ctx,
         realm.clone(),
@@ -427,7 +494,7 @@ pub(crate) fn close_dialog(
         ToggleTaskKind::Dialog,
         "open",
         "closed",
-        Value::Null,
+        source,
     )?;
     queue_close_event(ctx, realm.clone(), node)?;
     if transition.was_modal {
@@ -493,7 +560,7 @@ enum ToggleTaskKind {
 /// owns this controller; bound task leases preserve it across adoption without
 /// retaining the original document or creating a strong cycle.
 pub(crate) struct DetailsController {
-    sender: scheduling::TaskSender,
+    sender: RefCell<scheduling::TaskSender>,
     ready: Rc<std::cell::Cell<bool>>,
     realm: RefCell<std::rc::Weak<DomRealm>>,
     pending: RefCell<ToggleTasks<(NodeId, ToggleTaskKind), &'static str, ()>>,
@@ -537,7 +604,7 @@ impl Drop for DetailsController {
 impl DetailsController {
     pub(crate) fn prepare(ctx: &mut Ctx) -> OpResult<Rc<Self>> {
         Ok(Rc::new(Self {
-            sender: scheduling::task_sender(ctx)?,
+            sender: RefCell::new(scheduling::task_sender(ctx)?),
             ready: Rc::new(std::cell::Cell::new(false)),
             realm: RefCell::new(std::rc::Weak::new()),
             pending: RefCell::new(ToggleTasks::default()),
@@ -555,6 +622,16 @@ impl DetailsController {
     /// Binding happens only after successful installation, outside a Document
     /// borrow. Parser failures therefore leave no retained native node/global.
     pub(crate) fn bind(self: &Rc<Self>, ctx: &mut Ctx, realm: &Rc<DomRealm>) {
+        // Parsing can happen in a temporary global while initial-about:blank
+        // navigation reuses the actual Window. Preserve admitted task order.
+        if let Ok(sender) = scheduling::task_sender(ctx) {
+            for slot in self.slots.borrow().iter().filter_map(std::rc::Weak::upgrade) {
+                if let Some(task) = slot.task.borrow().as_ref() {
+                    if task.retarget(&sender).is_err() { self.failure(scheduling::TaskDiagnosticCause::OwnerRetired); }
+                }
+            }
+            *self.sender.borrow_mut() = sender;
+        } else { self.failure(scheduling::TaskDiagnosticCause::OwnerRetired); }
         *self.realm.borrow_mut() = Rc::downgrade(realm);
         *realm.details_controller.borrow_mut() = Rc::downgrade(self);
         for slot in self.slots.borrow().iter().filter_map(std::rc::Weak::upgrade) {
@@ -580,12 +657,12 @@ impl DetailsController {
     }
 
     fn failure(&self, cause: scheduling::TaskDiagnosticCause) {
-        self.sender.record_failure(scheduling::TaskDiagnosticSource::DetailsToggle, cause);
+        self.sender.borrow().record_failure(scheduling::TaskDiagnosticSource::DetailsToggle, cause);
     }
 
     fn notify(self: &Rc<Self>, transition: lumen_html::details::DetailsTransition) {
         use scheduling::TaskDiagnosticCause as Cause;
-        if !self.sender.is_live() { return; }
+        if !self.sender.borrow().is_live() { return; }
         let state = |open| if open { "open" } else { "closed" };
         if let Some(realm) = self.realm.borrow().upgrade() {
             // Adoption preserves the original admitted task and coalescer. A
@@ -623,7 +700,7 @@ impl DetailsController {
             pending: std::cell::Cell::new(true), task: RefCell::new(None), lease: RefCell::new(None),
         });
         let callback_slot = slot.clone();
-        let admitted = self.sender.queue_tracked_when_ready(self.ready.clone(), move |ctx| {
+        let admitted = self.sender.borrow().queue_tracked_when_ready(self.ready.clone(), move |ctx| {
             let Some(controller) = callback_slot.controller.upgrade() else { return Ok(()); };
             callback_slot.pending.set(false);
             let Some(task) = controller.pending.borrow_mut().take(callback_slot.id) else { return Ok(()); };
@@ -682,7 +759,7 @@ pub(crate) fn adopt_details_tasks(
             }
             needs_route
         };
-        if let Some(task) = slot.task.borrow().as_ref() { task.retarget(&destination.sender)?; }
+        if let Some(task) = slot.task.borrow().as_ref() { task.retarget(&destination.sender.borrow())?; }
         lease._node.adopt_nodes(source, target, mapping);
         events::DomEventTarget::from_data(lease._target.clone()).rebind_node(target, *node);
         lease.realm = target.clone();
@@ -773,6 +850,10 @@ pub(crate) fn set_popover_value(realm: &Rc<DomRealm>, node: NodeId, value: &str)
 }
 
 pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> OpResult<()> {
+    show_popover_with_source(ctx, realm, node, Value::Null)
+}
+
+pub(crate) fn show_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<()> {
     let (mut realm, mut node) = realm.resolve_adopted_node(node);
     {
         let session = realm.session.borrow();
@@ -787,7 +868,7 @@ pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) ->
         "closed",
         "open",
         true,
-        Value::Null,
+        source.clone(),
     )? {
         return Ok(());
     }
@@ -882,6 +963,9 @@ pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) ->
         )?;
     }
     if transition.changed {
+        let trigger=ctx.with_instance::<super::DomElement,_>(&source,|element|element.base.realm.resolve_adopted_node(element.base.id)).ok()
+            .filter(|(owner,_)|Rc::ptr_eq(owner,&realm)).map(|(_,node)|node);
+        realm.session.borrow_mut().document_mut().set_popover_trigger(node,trigger);
         queue_toggle_task(
             ctx,
             realm.clone(),
@@ -889,14 +973,26 @@ pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) ->
             ToggleTaskKind::Popover,
             "closed",
             "open",
-            Value::Null,
+            source,
         )?;
-        realm.focus(ctx, Some(node))?;
+        if super::focus::allow_focus(&realm) {
+            let autofocus=realm.session.borrow().document().get_attribute_ns_ref(node,None,"autofocus").ok().flatten().is_some();
+            let target=if autofocus { Some(node) }
+                else { super::focus::autofocus_delegate(&realm,node)? };
+            if let Some(target)=target {
+                realm.focus(ctx,Some(target))?;
+                super::focus::mark_processed(&realm);
+            }
+        }
     }
     Ok(())
 }
 
 pub(crate) fn hide_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> OpResult<()> {
+    hide_popover_with_source(ctx, realm, node, Value::Null)
+}
+
+pub(crate) fn hide_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<()> {
     let (mut realm, mut node) = realm.resolve_adopted_node(node);
     let showing = {
         let session = realm.session.borrow();
@@ -906,7 +1002,7 @@ pub(crate) fn hide_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) ->
     if !showing {
         return Ok(());
     }
-    dispatch_popover_close_beforetoggle(ctx, &realm, node)?;
+    dispatch_popover_close_beforetoggle_with_source(ctx, &realm, node, source.clone())?;
     (realm, node) = realm.resolve_adopted_node(node);
     let (changed, restore_focus) =
         top_layer::hide_popover_with_state(realm.session.borrow_mut().document_mut(), node)
@@ -919,7 +1015,7 @@ pub(crate) fn hide_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) ->
             ToggleTaskKind::Popover,
             "open",
             "closed",
-            Value::Null,
+            source,
         )?;
         if let Some(target) =
             restore_focus.filter(|target| realm.session.borrow().document().kind(*target).is_ok())
@@ -1060,6 +1156,10 @@ fn dispatch_popover_close_beforetoggle(
     realm: &Rc<DomRealm>,
     node: NodeId,
 ) -> OpResult<bool> {
+    dispatch_popover_close_beforetoggle_with_source(ctx, realm, node, Value::Null)
+}
+
+fn dispatch_popover_close_beforetoggle_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<bool> {
     let began = {
         let mut session = realm.session.borrow_mut();
         if top_layer::popover_visibility(session.document(), node)
@@ -1084,7 +1184,7 @@ fn dispatch_popover_close_beforetoggle(
         "open",
         "closed",
         false,
-        Value::Null,
+        source,
     );
     realm
         .session
@@ -1099,6 +1199,38 @@ mod tests {
     use super::*;
     use lumen::{embed::WeakValue, Engine};
     use lumen_runtime::Runtime;
+
+    #[test]
+    fn specification_dialog_open_retained_wrapper_follows_cross_realm_adopted_owner() {
+        let mut engine=Engine::new();
+        let source=crate::install(engine.ctx(),"<body></body>",128).unwrap();
+        let child=engine.ctx().create_host_realm();
+        let destination=engine.ctx().with_host_realm(&child,|ctx|crate::install(ctx,"<body></body>",128))
+            .expect("destination host settings").unwrap();
+        assert!(!Rc::ptr_eq(&source,&destination),"guard uses distinct physical document arenas");
+        let target_document=engine.ctx().member_get(&child.global(),"document").ok().expect("destination document");
+        let global=engine.ctx().global_object();
+        engine.ctx().set_member(&global,"targetDocument",target_document).ok().expect("guard destination binding");
+        boolean(&mut engine,r#"(() => {
+            const check=(ok,message)=>{if(!ok)throw Error(message)};
+            const changes=[];
+            class AdoptedDialog extends HTMLDialogElement {
+                static observedAttributes=['open'];
+                attributeChangedCallback(name,before,after){changes.push([after,this.ownerDocument===targetDocument])}
+            }
+            customElements.define('x-adopted-dialog',AdoptedDialog,{extends:'dialog'});
+            const retained=document.createElement('dialog',{is:'x-adopted-dialog'});
+            document.body.appendChild(retained);
+            targetDocument.adoptNode(retained);targetDocument.body.appendChild(retained);
+            check(retained.ownerDocument===targetDocument && !retained.open,'adopted getter');
+            retained.open='yes';
+            check(retained.open && retained.getAttribute('open')==='','setter reaches new physical owner');
+            retained.open=0;
+            check(!retained.open && !retained.hasAttribute('open'),'removal reaches new physical owner');
+            check(changes.length===2 && changes[0][0]==='' && changes[1][0]===null && changes.every(change=>change[1]),'shared CE reactions use actual adopted owner');
+            return true;
+        })()"#);
+    }
 
     #[test]
     fn shared_toggle_tracker_keeps_latest_source_and_trusted_equal_states() {

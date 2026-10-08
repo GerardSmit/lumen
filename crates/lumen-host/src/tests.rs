@@ -497,6 +497,25 @@ mod owner_loop_tests {
     }
 
     #[test]
+    fn native_resource_completion_retains_context_without_a_js_callback() {
+        let (mut engine, _) = owner_engine();
+        fn decode(ctx: &mut Ctx, payload: Box<dyn Any + Send>) -> Result<Vec<Value>, Value> {
+            assert!(matches!(ctx.async_context(), Value::Num(7.0)));
+            assert_eq!(*payload.downcast::<usize>().unwrap(), 42);
+            Ok(Vec::new())
+        }
+        let ctx = engine.ctx();
+        ctx.set_async_context(Value::Num(7.0));
+        let id = register_native_task(ctx, decode);
+        ctx.set_async_context(Value::Num(9.0));
+        let settled = owner_loop::settle(ctx, TaskCompletion { task: id, result: Box::new(42usize) }).unwrap();
+        assert!(matches!(settled.outcome, owner_loop::Outcome::Complete));
+        settled.finish(ctx);
+        assert!(matches!(ctx.async_context(), Value::Num(9.0)));
+        assert!(!ctx.host_mut::<TaskRegistry>().unwrap().has_ref_pending());
+    }
+
+    #[test]
     fn a_full_queue_is_a_quota_error_and_an_oversized_message_a_clone_error() {
         let (mut engine, _) = owner_engine();
         eval_str(&mut engine, "nativeTest.limits(64, 3); 0");

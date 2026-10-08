@@ -25,6 +25,10 @@ pub struct ParseError {
     pub message: &'static str,
 }
 
+fn tree_failure(failure:DomError,context:&'static str)->&'static str {
+    if failure==DomError::LimitExceeded {"XML DOM allocation limit exceeded"}else {context}
+}
+
 fn error(offset: usize, message: &'static str) -> ParseError {
     ParseError { offset, message }
 }
@@ -45,9 +49,10 @@ pub fn parse_initialized(
     let input = checked_input(input)?;
     let mut document = Document::new(max_nodes);
     initialize(&mut document);
-    let (parser, mut builder) = new_parser(document);
+    let (parser, mut builder) = new_parser(&mut document);
     run(parser, &mut builder, input)?;
-    Ok(builder.document)
+    drop(builder);
+    Ok(document)
 }
 
 fn checked_input(input: &str) -> Result<&str, ParseError> {
@@ -64,7 +69,7 @@ fn checked_input(input: &str) -> Result<&str, ParseError> {
     }
 }
 
-fn new_parser(document: Document) -> (Parser, Builder) {
+fn new_parser(document: &mut Document) -> (Parser, Builder<'_,Document>) {
     let parser = Parser::new(Options {
         encoding: Some(String::from("UTF-8")),
         ..Options::default()
@@ -73,19 +78,154 @@ fn new_parser(document: Document) -> (Parser, Builder) {
     (parser, builder)
 }
 
-fn run(mut parser: Parser, builder: &mut Builder, input: &str) -> Result<(), ParseError> {
+fn run(mut parser: Parser, builder: &mut Builder<'_,Document>, input: &str) -> Result<(), ParseError> {
     match parser.parse(builder, input.as_bytes(), true) {
         Ok(()) => Ok(()),
-        Err(failure) => Err(builder.failure.take().unwrap_or_else(|| {
+        Err(failure) => {
+            let original=builder.state.failure.take().unwrap_or_else(|| {
             error(
                 builder.shared.error_position().byte as usize,
                 failure.message(),
             )
-        })),
+        });
+            let _=builder.retire_open_elements();
+            Err(original)
+        }
     }
 }
 
 const FRAGMENT_ROOT: &str = "lumen-fragment-root";
+
+/// Resumable XML tree construction over the host's live Document. Namespace
+/// and tokenizer state survive each script turn; DOMParser uses the same
+/// builder with scripting yields disabled.
+pub struct XmlDocumentParser {
+    parser: Parser,
+    state: Option<BuilderState>,
+    closed: bool,
+    paused_script: Option<NodeId>,
+}
+
+impl XmlDocumentParser {
+    pub fn start(document: &mut Document, input: &str) -> Result<(Self, Option<NodeId>), ParseError> {
+        let input = checked_input(input)?;
+        let (mut parser, mut builder) = new_parser(document);
+        builder.state.yield_scripts = true;
+        let result = parser.parse(&mut builder, input.as_bytes(), true);
+        if let Err(failure) = result {
+            let original=builder.state.failure.take().unwrap_or_else(|| error(builder.shared.error_position().byte as usize, failure.message()));
+            let _=builder.retire_open_elements();
+            return Err(original);
+        }
+        let script = builder.state.yielded_script.take();
+        let closed = !parser.is_suspended();
+        Ok((Self { parser, state: Some(builder.state), closed, paused_script: script }, script))
+    }
+
+    pub fn resume<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &mut D) -> Result<Option<NodeId>, ParseError> {
+        if self.closed { return Ok(None); }
+        let mut builder = Builder { shared: self.parser.shared(), document,
+            state: self.state.take().expect("XML parser state available between feeds") };
+        let result = self.parser.resume(&mut builder);
+        let script = builder.state.yielded_script.take();
+        let failure = builder.state.failure.take();
+        let offset = builder.shared.error_position().byte as usize;
+        if result.is_err() {let _=builder.retire_open_elements();}
+        self.state = Some(builder.state);
+        self.project_retained_nodes(|node|document.current_node(node));
+        if let Err(error_code) = result {
+            self.closed=true;self.paused_script=None;
+            // A fatal well-formedness failure ends open-element status; XML
+            // does not synthesize end tags or recover the tokenizer stream.
+            if let Some(state)=&mut self.state {state.pending_element=None;state.yielded_script=None;}
+            return Err(failure.unwrap_or_else(|| error(offset, error_code.message())));
+        }
+        self.closed = !self.parser.is_suspended();
+        let script=script.map(|node|document.current_node(node));
+        self.paused_script = script;
+        Ok(script)
+    }
+
+    fn retire_after_tree_error<D:crate::parser_documents::ParserDocument+?Sized>(&mut self,document:&mut D) {
+        self.closed=true;self.paused_script=None;
+        if let Some(state)=self.state.take() {
+            let mut builder=Builder {shared:self.parser.shared(),document,state};
+            let _=builder.retire_open_elements();self.state=Some(builder.state);
+        }
+        self.project_retained_nodes(|node|document.current_node(node));
+    }
+
+    pub fn has_open_element(&self,node:NodeId)->bool {
+        self.state.as_ref().is_some_and(|state|state.open.iter().any(|open|open.element==node))
+    }
+
+    pub fn visit_retained_nodes(&self, mut visit: impl FnMut(NodeId)) {
+        if let Some(script) = self.paused_script { visit(script); }
+        if let Some(state) = &self.state {
+            if let Some(pending) = &state.pending_element { visit(pending.node); visit(pending.parent); }
+            for open in &state.open { visit(open.element); visit(open.content); }
+            if let Some(script) = state.yielded_script { visit(script); }
+        }
+    }
+
+    pub fn project_retained_nodes(&mut self,mut project:impl FnMut(NodeId)->NodeId) {
+        self.paused_script=self.paused_script.map(&mut project);
+        if let Some(state)=&mut self.state {state.project_nodes(&mut project);}
+    }
+
+    pub fn pending_element(&self) -> Option<NodeId> {
+        self.state.as_ref()?.pending_element.as_ref().map(|pending| pending.node)
+    }
+
+    pub fn pending_element_context(&self) -> Option<NodeId> {
+        self.state.as_ref()?.pending_element.as_ref().map(|pending| pending.parent)
+    }
+
+    pub fn replace_pending_element<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &D, replacement: NodeId) -> Result<(), ParseError> {
+        let content=document.template_content(replacement).map_err(|_|error(0,"invalid XML template"))?.unwrap_or(replacement);
+        let state = self.state.as_mut().expect("XML parser state between feeds");
+        let old = state.pending_element.as_ref().expect("pending XML element").node;
+        state.pending_element.as_mut().unwrap().node = replacement;
+        for open in &mut state.open {
+            if open.element == old {
+                open.element = replacement;
+                open.content = content;
+            }
+        }
+        if self.paused_script == Some(old) { self.paused_script = Some(replacement); }
+        Ok(())
+    }
+
+    pub fn append_pending_element_attributes<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &mut D) -> Result<(), ParseError> {
+        let result=(|| {
+            let pending = self.state.as_mut().unwrap().pending_element.as_mut().expect("pending XML element");
+            for (name, value, uri) in core::mem::take(&mut pending.attributes) {
+                document.set_attribute_ns(pending.node, uri.as_deref(), name.as_str(), &value)
+                    .map_err(|failure|error(0,tree_failure(failure,"invalid XML token attribute")))?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {self.retire_after_tree_error(document);}
+        result
+    }
+
+    pub fn insert_pending_element<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &mut D) -> Result<(), ParseError> {
+        let pending = self.state.as_mut().unwrap().pending_element.take().expect("pending XML element");
+        let result=document.insert_before(pending.parent, pending.node, None).map_err(|failure|error(0,tree_failure(failure,"invalid XML element placement")));
+        if result.is_err() {self.retire_after_tree_error(document);}
+        self.project_retained_nodes(|node|document.current_node(node));
+        result
+    }
+
+    pub fn resume_after_pending_element<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &mut D) -> Result<Option<NodeId>, ParseError> {
+        if let Some(script) = self.paused_script { Ok(Some(script)) } else { self.resume(document) }
+    }
+
+    pub fn finish_pending_element<D:crate::parser_documents::ParserDocument+?Sized>(&mut self, document: &mut D) -> Result<Option<NodeId>, ParseError> {
+        self.insert_pending_element(document)?;
+        self.resume_after_pending_element(document)
+    }
+}
 
 /// Parse a well-formed XML fragment using the namespace bindings in an element
 /// context and move the completed fragment into the caller's document.
@@ -129,7 +269,8 @@ pub fn parse_fragment_in(
     }
 
     let remaining = document.max_nodes.saturating_sub(document.live_nodes);
-    let (parser, mut builder) = new_parser(Document::new(remaining.saturating_add(2)));
+    let mut temporary = Document::new(remaining.saturating_add(2));
+    let (parser, mut builder) = new_parser(&mut temporary);
     if html_catalog {
         parser
             .shared()
@@ -139,7 +280,7 @@ pub fn parse_fragment_in(
         offset: failure.offset.saturating_sub(prefix_len),
         ..failure
     })?;
-    let mut temporary = builder.document;
+    drop(builder);
     let root = temporary.root();
     let wrapper = temporary
         .first_child(root)
@@ -284,7 +425,7 @@ fn fragment_context(
     Ok((namespaces, html_entity_catalog))
 }
 
-fn namespace_uri(namespace: &Namespace) -> &str {
+pub(crate) fn namespace_uri(namespace: &Namespace) -> &str {
     match namespace {
         Namespace::Html => "http://www.w3.org/1999/xhtml",
         Namespace::Svg => "http://www.w3.org/2000/svg",
@@ -294,26 +435,74 @@ fn namespace_uri(namespace: &Namespace) -> &str {
 }
 
 struct Open {
+    element: NodeId,
     content: NodeId,
     mark: usize,
 }
 
-struct Builder {
+struct Builder<'a,D:crate::parser_documents::ParserDocument+?Sized> {
     shared: Rc<Shared>,
-    document: Document,
+    document: &'a mut D,
+    state: BuilderState,
+}
+
+struct BuilderState {
     open: Vec<Open>,
     bindings: Vec<(String, String)>,
     text: String,
     doctype_name: Option<String>,
     failure: Option<ParseError>,
     in_cdata: bool,
+    in_doctype: bool,
+    yield_scripts: bool,
+    yielded_script: Option<NodeId>,
+    pending_element: Option<PendingXmlElement>,
 }
 
-impl Builder {
-    fn new(shared: Rc<Shared>, document: Document) -> Builder {
+impl BuilderState {
+    fn project_nodes(&mut self,mut project:impl FnMut(NodeId)->NodeId) {
+        for open in &mut self.open {open.element=project(open.element);open.content=project(open.content);}
+        self.yielded_script=self.yielded_script.map(&mut project);
+        if let Some(pending)=&mut self.pending_element {pending.node=project(pending.node);pending.parent=project(pending.parent);}
+    }
+}
+
+struct PendingXmlElement {
+    node: NodeId,
+    parent: NodeId,
+    attributes: Vec<(Name, String, Option<String>)>,
+}
+
+impl<'a,D:crate::parser_documents::ParserDocument+?Sized> Builder<'a,D> {
+    fn finish_style(&self,node:NodeId)->Result<(),&'static str> {
+        if matches!(self.document.kind(node),Ok(NodeKind::Element {namespace:Namespace::Html|Namespace::Svg,name,..})
+            if name.as_str().rsplit(':').next()==Some("style")) {
+            self.document.record_parser_style_block_update(node).map_err(|failure|tree_failure(failure,"invalid style block update"))?;
+        }
+        Ok(())
+    }
+
+    fn retire_open_elements(&mut self)->Result<(),&'static str> {
+        let mut failure=if self.state.in_cdata {
+            let text=core::mem::take(&mut self.state.text);
+            if text.is_empty() {None}else {self.add(NodeKind::CData(text),"invalid CDATA placement").err()}
+        }else {self.flush_text().err()};
+        // Fatal XML detection ends open-element status without synthetic end
+        // tags or script preparation. Style retirement uses the actual owner.
+        while let Some(open)=self.state.open.pop() {
+            self.state.bindings.truncate(open.mark);
+            self.document.record_parser_element_completion(open.element);
+            if let Err(error)=self.finish_style(open.element) {failure.get_or_insert(error);}
+        }
+        self.state.pending_element=None;self.state.yielded_script=None;
+        failure.map_or(Ok(()),Err)
+    }
+
+    fn new(shared: Rc<Shared>, document: &'a mut D) -> Builder<'a,D> {
         Builder {
             shared,
             document,
+            state: BuilderState {
             open: Vec::new(),
             bindings: alloc::vec![
                 (String::from("xml"), String::from(XML_NAMESPACE)),
@@ -323,37 +512,43 @@ impl Builder {
             doctype_name: None,
             failure: None,
             in_cdata: false,
+            in_doctype: false,
+            yield_scripts: false,
+            yielded_script: None,
+            pending_element: None,
+            },
         }
     }
 
     fn fail(&mut self, message: &'static str) -> Flow {
         let offset = self.shared.position().byte as usize;
-        self.failure.get_or_insert(error(offset, message));
+        self.state.failure.get_or_insert(error(offset, message));
         Flow::Abort
     }
 
     fn parent(&self) -> NodeId {
-        self.open
+        self.state.open
             .last()
             .map_or(self.document.root(), |open| open.content)
     }
 
     fn add(&mut self, kind: NodeKind, placement: &'static str) -> Result<NodeId, &'static str> {
-        let id = self.document.create(kind).map_err(|e| match e {
+        let parent = self.parent();
+        let id = self.document.create_at(parent,kind,None).map_err(|e| match e {
             DomError::LimitExceeded => "XML node limit exceeded",
             _ => "invalid XML node",
         })?;
         self.document
-            .append(self.parent(), id)
-            .map_err(|_| placement)?;
+            .append(parent, id)
+            .map_err(|failure|tree_failure(failure,placement))?;
         Ok(id)
     }
 
     fn flush_text(&mut self) -> Result<(), &'static str> {
-        if self.text.is_empty() {
+        if self.state.text.is_empty() {
             return Ok(());
         }
-        let text = core::mem::take(&mut self.text);
+        let text = core::mem::take(&mut self.state.text);
         self.add(NodeKind::Text(text), "invalid text placement")
             .map(|_| ())
     }
@@ -376,33 +571,33 @@ impl Builder {
 
     fn start(&mut self, qname: &str, attrs: &[Attribute]) -> Result<(), &'static str> {
         self.flush_text()?;
-        if self.open.len() >= MAX_DEPTH {
+        if self.state.open.len() >= MAX_DEPTH {
             return Err("XML nesting limit exceeded");
         }
-        if self.open.is_empty()
+        if self.state.open.is_empty()
             && self
-                .doctype_name
+                .state.doctype_name
                 .as_deref()
                 .is_some_and(|name| name != qname)
         {
             return Err("doctype name does not match document element");
         }
-        let mark = self.bindings.len();
+        let mark = self.state.bindings.len();
         for attr in attrs {
             if attr.name == "xmlns" {
-                bind_namespace(&mut self.bindings, "", &attr.value)?;
+                bind_namespace(&mut self.state.bindings, "", &attr.value)?;
             } else if let Some(prefix) = attr.name.strip_prefix("xmlns:") {
                 if prefix.is_empty() || split_qname(prefix).is_none_or(|(p, _)| !p.is_empty()) {
                     return Err("invalid namespace prefix");
                 }
-                bind_namespace(&mut self.bindings, prefix, &attr.value)?;
+                bind_namespace(&mut self.state.bindings, prefix, &attr.value)?;
             }
         }
-        let (prefix, _) = split_qname(qname).ok_or("invalid qualified name")?;
+        let (prefix, local) = split_qname(qname).ok_or("invalid qualified name")?;
         let uri = if prefix.is_empty() {
-            namespace_for(&self.bindings, "")
+            namespace_for(&self.state.bindings, "")
         } else {
-            Some(namespace_for(&self.bindings, prefix).ok_or("unbound element prefix")?)
+            Some(namespace_for(&self.state.bindings, prefix).ok_or("unbound element prefix")?)
         };
         let mut expanded_names: Vec<(Option<String>, &str)> = Vec::new();
         let mut namespace_metadata: Vec<(&str, Option<String>)> = Vec::new();
@@ -416,7 +611,7 @@ impl Builder {
             let uri = if prefix.is_empty() {
                 None
             } else {
-                Some(namespace_for(&self.bindings, prefix).ok_or("unbound attribute prefix")?)
+                Some(namespace_for(&self.state.bindings, prefix).ok_or("unbound attribute prefix")?)
             };
             if expanded_names
                 .iter()
@@ -427,40 +622,55 @@ impl Builder {
             namespace_metadata.push((name, uri.clone()));
             expanded_names.push((uri, local));
         }
+        let namespace = namespace_from_uri(uri.as_deref());
+        let is_value = attrs.iter().find(|attribute| attribute.name == "is").map(|attribute| attribute.value.as_str());
+        let parent = self.parent();
+        let deferred = self.state.yield_scripts && namespace == Namespace::Html
+            && self.document.parser_custom_element_defined(parent, local, is_value);
         let kind = NodeKind::Element {
-            namespace: namespace_from_uri(uri.as_deref()),
+            namespace,
             name: Name::new(qname),
-            attributes: attrs
+            attributes: if deferred { Vec::new() } else { attrs
                 .iter()
                 .map(|attr| (Name::new(&attr.name), attr.value.clone()))
-                .collect(),
+                .collect() },
         };
-        let id = self.document.create(kind).map_err(|e| match e {
+        let id = self.document.create_at(parent,kind, is_value).map_err(|e| match e {
             DomError::LimitExceeded => "XML node limit exceeded",
             _ => "invalid XML node",
         })?;
+        self.document.record_parser_element_birth(id,parent,true).map_err(|failure|tree_failure(failure,"invalid XML registry association"))?;
+        if deferred {
+            let attributes = attrs.iter().map(|attribute| {
+                let uri = namespace_metadata.iter().find(|(name, _)| *name == attribute.name)
+                    .and_then(|(_, uri)| uri.clone());
+                (Name::new(&attribute.name), attribute.value.clone(), uri)
+            }).collect();
+            self.state.pending_element = Some(PendingXmlElement { node: id, parent, attributes });
+            self.shared.suspend();
+        } else {
         for (qualified_name, uri) in namespace_metadata {
             self.document
                 .set_attribute_namespace_metadata(id, qualified_name, uri.as_deref())
-                .map_err(|_| "invalid attribute namespace metadata")?;
+                .map_err(|failure|tree_failure(failure,"invalid attribute namespace metadata"))?;
         }
-        let parent = self.parent();
         self.document
             .append(parent, id)
-            .map_err(|_| "invalid element placement")?;
+            .map_err(|failure|tree_failure(failure,"invalid element placement"))?;
+        }
         // HTML templates keep their children in a detached content fragment, even
         // when the qualified name carries a namespace prefix.
         let content = self
             .document
             .template_content(id)
-            .map_err(|_| "invalid template contents")?
+            .map_err(|failure|tree_failure(failure,"invalid template contents"))?
             .unwrap_or(id);
-        self.open.push(Open { content, mark });
+        self.state.open.push(Open { element: id, content, mark });
         Ok(())
     }
 }
 
-impl Handler for Builder {
+impl<D:crate::parser_documents::ParserDocument+?Sized> Handler for Builder<'_,D> {
     fn start_doctype(
         &mut self,
         name: &str,
@@ -480,11 +690,13 @@ impl Handler for Builder {
             .and_then(|id| {
                 self.document
                     .set_doctype_identifiers(id, pubid.unwrap_or(""), sysid.unwrap_or(""))
-                    .map_err(|_| "invalid doctype identifiers")
+                    .map_err(|failure|tree_failure(failure,"invalid doctype identifiers"))
             });
-        self.doctype_name = Some(name.to_string());
+        self.state.doctype_name = Some(name.to_string());
+        self.state.in_doctype = true;
         self.flow(result)
     }
+    fn end_doctype(&mut self)->Flow {self.state.in_doctype=false;Flow::Continue}
 
     fn start_element(&mut self, name: &str, attrs: &[Attribute], _specified: usize) -> Flow {
         let result = self.start(name, attrs);
@@ -492,29 +704,39 @@ impl Handler for Builder {
     }
 
     fn end_element(&mut self, _name: &str) -> Flow {
-        let result = self.flush_text();
-        if let Some(open) = self.open.pop() {
-            self.bindings.truncate(open.mark);
+        let mut result = self.flush_text();
+        if let Some(open) = self.state.open.pop() {
+            self.state.bindings.truncate(open.mark);
+            self.document.record_parser_element_completion(open.element);
+            if result.is_ok() {result=self.finish_style(open.element);}
+            if result.is_ok() && self.state.yield_scripts && matches!(
+                self.document.kind(open.element),
+                Ok(NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, name, .. })
+                    if name.as_str().rsplit(':').next() == Some("script")
+            ) {
+                self.state.yielded_script = Some(open.element);
+                self.shared.suspend();
+            }
         }
         self.flow(result)
     }
 
     fn chardata(&mut self, data: &str) -> Flow {
-        if !self.open.is_empty() {
-            self.text.push_str(data);
+        if !self.state.open.is_empty() {
+            self.state.text.push_str(data);
         }
         Flow::Continue
     }
 
     fn start_cdata(&mut self) -> Flow {
         let result = self.flush_text();
-        self.in_cdata = true;
+        self.state.in_cdata = true;
         self.flow(result)
     }
 
     fn end_cdata(&mut self) -> Flow {
-        self.in_cdata = false;
-        let text = core::mem::take(&mut self.text);
+        self.state.in_cdata = false;
+        let text = core::mem::take(&mut self.state.text);
         let result = self
             .add(NodeKind::CData(text), "invalid CDATA placement")
             .map(|_| ());
@@ -522,6 +744,7 @@ impl Handler for Builder {
     }
 
     fn comment(&mut self, data: &str) -> Flow {
+        if self.state.in_doctype {return Flow::Continue;}
         let result = self
             .add_node(
                 NodeKind::Comment(data.to_string()),
@@ -532,6 +755,9 @@ impl Handler for Builder {
     }
 
     fn processing_instruction(&mut self, target: &str, data: &str) -> Flow {
+        // Internal-subset PIs are not direct Document children. The browser
+        // DOM has no DTD child tree; CSSOM only considers actual prolog nodes.
+        if self.state.in_doctype {return Flow::Continue;}
         if target.eq_ignore_ascii_case("xml") {
             return self.fail("reserved processing instruction target");
         }
@@ -539,11 +765,14 @@ impl Handler for Builder {
             .add_node(
                 NodeKind::ProcessingInstruction {
                     target: target.to_string(),
-                    data: data.trim().to_string(),
+                    // The shared scanner has already consumed the required
+                    // separator whitespace after the target. Any remaining
+                    // whitespace belongs to the PI data and must be retained.
+                    data: data.to_string(),
                 },
                 "invalid processing instruction",
             )
-            .map(|_| ());
+            .and_then(|node| self.document.record_parser_style_block_update(node).map_err(|failure|tree_failure(failure,"XML stylesheet instruction admission")));
         self.flow(result)
     }
 
@@ -570,9 +799,116 @@ impl Handler for Builder {
 pub fn is_valid_attribute_local_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|character| {
-            matches!(character, '\0' | '/' | '=' | '>')
-                || matches!(character, '\t' | '\n' | '\u{c}' | '\r' | ' ')
+            matches!(character, '\0' | '/' | '=' | '>') || is_ascii_whitespace(character)
         })
+}
+
+/// The DOM qualified-name validation context from DOM §1.4.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomNameContext {
+    Element,
+    Attribute,
+}
+
+/// The two exception classes produced by DOM's namespace/name validation algorithm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomNameError {
+    InvalidCharacter,
+    Namespace,
+}
+
+/// The validated components of a DOM qualified name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DomQualifiedName<'namespace, 'name> {
+    pub namespace: Option<&'namespace str>,
+    pub prefix: Option<&'name str>,
+    pub local_name: &'name str,
+}
+
+/// Whether `name` satisfies DOM's current element-local-name grammar.
+///
+/// Names beginning with ASCII alpha use the HTML parser's permissive character
+/// set. Other names use the restricted historical ASCII set with non-ASCII
+/// code points accepted.
+pub fn is_valid_element_local_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() {
+        return !name.chars().any(|character| {
+            is_ascii_whitespace(character) || matches!(character, '\0' | '/' | '>')
+        });
+    }
+    if !matches!(first, ':' | '_') && first < '\u{80}' {
+        return false;
+    }
+    chars.all(|character| {
+        character >= '\u{80}'
+            || character.is_ascii_alphanumeric()
+            || matches!(character, '-' | '.' | ':' | '_')
+    })
+}
+
+/// Whether `name` satisfies DOM's doctype-name grammar. The empty string is valid.
+pub fn is_valid_doctype_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|character| is_ascii_whitespace(character) || matches!(character, '\0' | '>'))
+}
+
+fn is_valid_namespace_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix.chars().any(|character| {
+            is_ascii_whitespace(character) || matches!(character, '\0' | '/' | '>')
+        })
+}
+
+fn is_ascii_whitespace(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\u{c}' | '\r' | ' ')
+}
+
+/// Validate and split a DOM qualified name, preserving the current DOM name
+/// grammar rather than XML's stricter QName grammar.
+pub fn validate_dom_qualified_name<'namespace, 'name>(
+    namespace: Option<&'namespace str>,
+    qualified_name: &'name str,
+    context: DomNameContext,
+) -> Result<DomQualifiedName<'namespace, 'name>, DomNameError> {
+    let namespace = namespace.filter(|namespace| !namespace.is_empty());
+    let (prefix, local_name) = if let Some((prefix, local_name)) = qualified_name.split_once(':') {
+        if !is_valid_namespace_prefix(prefix) {
+            return Err(DomNameError::InvalidCharacter);
+        }
+        (Some(prefix), local_name)
+    } else {
+        (None, qualified_name)
+    };
+
+    let valid_local_name = match context {
+        DomNameContext::Element => is_valid_element_local_name(local_name),
+        DomNameContext::Attribute => is_valid_attribute_local_name(local_name),
+    };
+    if !valid_local_name {
+        return Err(DomNameError::InvalidCharacter);
+    }
+
+    if (prefix.is_some() && namespace.is_none())
+        || (prefix == Some("xml") && namespace != Some(XML_NAMESPACE))
+        || ((qualified_name == "xmlns" || prefix == Some("xmlns"))
+            && namespace != Some(XMLNS_NAMESPACE))
+        || (namespace == Some(XMLNS_NAMESPACE)
+            && qualified_name != "xmlns"
+            && prefix != Some("xmlns"))
+    {
+        return Err(DomNameError::Namespace);
+    }
+
+    Ok(DomQualifiedName {
+        namespace,
+        prefix,
+        local_name,
+    })
 }
 
 fn public_id_char(byte: u8) -> bool {
@@ -645,7 +981,7 @@ fn bind_namespace(
     Ok(())
 }
 
-fn namespace_from_uri(uri: Option<&str>) -> Namespace {
+pub(crate) fn namespace_from_uri(uri: Option<&str>) -> Namespace {
     match uri.unwrap_or("") {
         "http://www.w3.org/1999/xhtml" => Namespace::Html,
         "http://www.w3.org/2000/svg" => Namespace::Svg,
@@ -674,20 +1010,37 @@ enum SerializeEvent {
 /// The namespace stack is restored as elements close, so a large sibling list
 /// does not retain a copy of every ancestor's declarations. Output is bounded
 /// independently of the document's node budget.
-pub fn outer_html(document: &Document, root: NodeId) -> Result<String, DomError> {
-    serialize_xml(document, root, true)
+pub fn outer_html(document: &Document, root: NodeId) -> Result<String, DomError> { outer_html_with_graph(document, root) }
+
+pub fn outer_html_with_graph<G: crate::graph::DocumentGraph>(graph: &G, root: NodeId) -> Result<String, DomError> { serialize_xml_with_graph(graph, root, true) }
+
+/// Serialize ordinary children as a well-formed XML fragment. Template contents live in
+/// their separate fragment, and each top-level child starts with a fresh namespace scope.
+pub fn inner_html(document: &Document, root: NodeId) -> Result<String, DomError> { inner_html_with_graph(document, root) }
+
+pub fn inner_html_with_graph<G: crate::graph::DocumentGraph>(graph: &G, root: NodeId) -> Result<String, DomError> {
+    let root = graph.read(root)?.template_content(root)?.unwrap_or(root);
+    serialize_xml_start(graph, root, true, true)
 }
 
 /// Serialize a node using the DOM Parsing XML serialization algorithm.
 ///
 /// `require_well_formed` selects whether XML well-formedness constraints are
 /// enforced. XMLSerializer uses `false`; XML `outerHTML` uses `true`.
-pub fn serialize_xml(
-    document: &Document,
+pub fn serialize_xml(document: &Document, root: NodeId, require_well_formed: bool) -> Result<String, DomError> { serialize_xml_with_graph(document, root, require_well_formed) }
+
+pub fn serialize_xml_with_graph<G: crate::graph::DocumentGraph>(graph: &G, root: NodeId, require_well_formed: bool) -> Result<String, DomError> { serialize_xml_start(graph, root, require_well_formed, false) }
+
+fn serialize_xml_start<G: crate::graph::DocumentGraph>(
+    graph: &G,
     root: NodeId,
     require_well_formed: bool,
+    children_only: bool,
 ) -> Result<String, DomError> {
+    let root_document = graph.read(root)?;
+    let document = &*root_document;
     if require_well_formed
+        && !children_only
         && matches!(document.kind(root)?, NodeKind::Document)
         && crate::selector::document_element(document).is_none()
     {
@@ -695,14 +1048,22 @@ pub fn serialize_xml(
     }
     let mut output = String::new();
     let mut bindings = alloc::vec![(String::from("xml"), String::from(XML_NAMESPACE)),];
-    let mut events = alloc::vec![SerializeEvent::Node {
-        id: root,
-        context_namespace: None,
-    }];
+    let mut events = Vec::new();
+    events.try_reserve_exact(1).map_err(|_| DomError::LimitExceeded)?;
+    if children_only {
+        if let Some(child) = document.first_child(root)? {
+            events.push(SerializeEvent::Sibling { id: child, context_namespace: None });
+        }
+    } else {
+        events.push(SerializeEvent::Node { id: root, context_namespace: None });
+    }
     let mut next_prefix = 1usize;
     let mut open_elements = 0usize;
 
     while let Some(event) = events.pop() {
+        let event_node = match &event { SerializeEvent::Node { id, .. } | SerializeEvent::Sibling { id, .. } => Some(*id), SerializeEvent::Close { .. } => None };
+        let event_document = event_node.map(|id| graph.read(id)).transpose()?;
+        let document = event_document.as_deref().unwrap_or(&*root_document);
         match event {
             SerializeEvent::Close { name, scope_start } => {
                 append_xml(&mut output, "</")?;
@@ -827,8 +1188,11 @@ pub fn serialize_xml(
                         let mut generated = Vec::new();
                         let mut generated_bytes = 0usize;
                         let mut ignore_default_declaration = false;
+                        let (element_prefix, element_local_name) =
+                            document.element_name_parts(id)?;
                         let (element_name, child_context_namespace) = fixup_element_name(
-                            name.as_str(),
+                            element_prefix,
+                            element_local_name,
                             namespace_uri(namespace),
                             context_namespace.as_deref(),
                             local_default_namespace.as_deref(),
@@ -886,30 +1250,29 @@ pub fn serialize_xml(
                                     return Err(DomError::WrongKind);
                                 }
                             } else {
+                                let (attribute_prefix, _) =
+                                    attribute_name_parts(name.as_str(), uri);
                                 candidate = uri.and_then(|uri| {
-                                    preferred_prefix(
-                                        &bindings,
-                                        uri,
-                                        split_qname(name.as_str()).map(|(prefix, _)| prefix),
-                                    )
+                                    preferred_prefix(&bindings, uri, attribute_prefix)
                                 });
                                 if uri.is_some_and(|uri| uri == XMLNS_NAMESPACE) {
                                     candidate = Some(String::from("xmlns"));
                                 } else if let Some(uri) = uri.filter(|uri| !uri.is_empty()) {
                                     if candidate.is_none() {
-                                        let source_prefix = split_qname(name.as_str())
-                                            .map(|(prefix, _)| prefix)
-                                            .filter(|prefix| !prefix.is_empty());
-                                        let prefix = if let Some(prefix) =
-                                            source_prefix.filter(|prefix| {
-                                                !local_prefixes
-                                                    .iter()
-                                                    .any(|(local, _)| local == *prefix)
-                                            }) {
-                                            String::from(prefix)
-                                        } else {
-                                            fresh_prefix(&mut next_prefix)
-                                        };
+                                        // DOM Parsing prefers an authored prefix
+                                        // that is not declared on this element.
+                                        // Ancestor bindings remain in the namespace
+                                        // history, but the local-prefix map is the
+                                        // conflict check for attributes.
+                                        let prefix = attribute_prefix
+                                            .filter(|prefix| {
+                                                !prefix.is_empty()
+                                                    && !local_prefixes.iter().any(
+                                                        |(local, _)| local == prefix,
+                                                    )
+                                            })
+                                            .map(String::from)
+                                            .unwrap_or_else(|| fresh_prefix(&mut next_prefix));
                                         candidate = Some(prefix.clone());
                                         map_add(&mut bindings, uri, &prefix);
                                         local_prefixes.push((prefix.clone(), String::from(uri)));
@@ -932,6 +1295,7 @@ pub fn serialize_xml(
                             append_fixed_attribute_name(
                                 &mut output,
                                 name.as_str(),
+                                attribute_name_parts(name.as_str(), uri),
                                 uri,
                                 candidate.as_deref(),
                                 &bindings,
@@ -943,13 +1307,10 @@ pub fn serialize_xml(
                         }
 
                         let child_root = document.template_content(id)?.unwrap_or(id);
-                        let child = document.first_child(child_root)?;
+                        let child = graph.read(child_root)?.first_child(child_root)?;
                         let has_children = child.is_some();
                         let is_html_void = *namespace == Namespace::Html
-                            && crate::html::serializes_void(
-                                split_qname(name.as_str())
-                                    .map_or(name.as_str(), |(_, local)| local),
-                            );
+                            && crate::html::serializes_void(element_local_name);
                         if is_html_void && !has_children {
                             append_xml(&mut output, " />")?;
                             bindings.truncate(scope_start);
@@ -1025,6 +1386,26 @@ fn stored_doctype_name(raw: &str) -> &str {
         .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '[' | '>'))
         .unwrap_or(name.len());
     &name[..end]
+}
+
+fn attribute_name_parts<'a>(name: &'a str, uri: Option<&str>) -> (Option<&'a str>, &'a str) {
+    if uri.is_none() {
+        // setAttribute() creates a null-namespace Attr whose entire qualified
+        // name is its local name, even when it contains a colon.
+        return (None, name);
+    }
+    if uri == Some(XMLNS_NAMESPACE) {
+        if name == "xmlns" {
+            return (None, name);
+        }
+        if let Some(local_name) = name.strip_prefix("xmlns:") {
+            return (Some("xmlns"), local_name);
+        }
+    }
+    match name.split_once(':') {
+        Some((prefix, local_name)) => (Some(prefix), local_name),
+        None => (None, name),
+    }
 }
 
 fn declaration_prefix<'a>(name: &'a str, uri: Option<&str>) -> Option<&'a str> {
@@ -1107,7 +1488,8 @@ fn fresh_prefix(next: &mut usize) -> String {
 }
 
 fn fixup_element_name(
-    qname: &str,
+    prefix: Option<&str>,
+    local_name: &str,
     uri: &str,
     context_namespace: Option<&str>,
     local_default_namespace: Option<&str>,
@@ -1120,11 +1502,11 @@ fn fixup_element_name(
     ignore_default_declaration: &mut bool,
     require_well_formed: bool,
 ) -> Result<(String, Option<String>), DomError> {
-    let (prefix, local) = match split_qname(qname) {
-        Some(parts) => parts,
-        None if !require_well_formed => ("", qname),
-        None => return Err(DomError::WrongKind),
-    };
+    if require_well_formed
+        && (!is_ncname(local_name) || prefix.is_some_and(|prefix| !is_ncname(prefix)))
+    {
+        return Err(DomError::WrongKind);
+    }
     let namespace = (!uri.is_empty()).then_some(uri);
     let parent_namespace = context_namespace.filter(|uri| !uri.is_empty());
     if parent_namespace == namespace {
@@ -1132,19 +1514,20 @@ fn fixup_element_name(
             *ignore_default_declaration = true;
         }
         let name = if namespace == Some(XML_NAMESPACE) {
-            alloc::format!("xml:{local}")
+            alloc::format!("xml:{local_name}")
         } else {
-            String::from(local)
+            String::from(local_name)
         };
         return Ok((name, parent_namespace.map(String::from)));
     }
 
-    let mut candidate = preferred_prefix(bindings, uri, (!prefix.is_empty()).then_some(prefix));
-    if prefix == "xmlns" {
+    let mut candidate =
+        preferred_prefix(bindings, uri, prefix.filter(|prefix| !prefix.is_empty()));
+    if prefix == Some("xmlns") {
         if require_well_formed {
             return Err(DomError::WrongKind);
         }
-        candidate = Some(String::from(prefix));
+        candidate = Some(String::from("xmlns"));
     }
     if let Some(candidate) = candidate {
         let inherited =
@@ -1155,10 +1538,10 @@ fn fixup_element_name(
             } else {
                 parent_namespace.map(String::from)
             };
-        return Ok((alloc::format!("{candidate}:{local}"), inherited));
+        return Ok((alloc::format!("{candidate}:{local_name}"), inherited));
     }
 
-    if !prefix.is_empty() {
+    if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {
         let generated_prefix = if local_prefixes
             .iter()
             .any(|(local_prefix, _)| local_prefix == prefix)
@@ -1178,21 +1561,22 @@ fn fixup_element_name(
             } else {
                 parent_namespace.map(String::from)
             };
-        return Ok((alloc::format!("{generated_prefix}:{local}"), inherited));
+        return Ok((alloc::format!("{generated_prefix}:{local_name}"), inherited));
     }
 
     if !has_local_default_namespace || local_default_namespace != namespace {
         *ignore_default_declaration = true;
         bind_for_serialization("", uri, bindings, generated, generated_bytes)?;
-        return Ok((String::from(local), namespace.map(String::from)));
+        return Ok((String::from(local_name), namespace.map(String::from)));
     }
 
-    Ok((String::from(local), namespace.map(String::from)))
+    Ok((String::from(local_name), namespace.map(String::from)))
 }
 
 fn append_fixed_attribute_name(
     output: &mut String,
     qname: &str,
+    (prefix, local_name): (Option<&str>, &str),
     uri: Option<&str>,
     candidate_prefix: Option<&str>,
     _bindings: &[(String, String)],
@@ -1203,25 +1587,28 @@ fn append_fixed_attribute_name(
     // treating its XMLNS namespace like an ordinary namespaced attribute
     // would incorrectly serialize it as `xmlns:xmlns`.
     if declaration_prefix(qname, uri).is_some() {
-        if require_well_formed && !is_xml_name(qname) {
+        if require_well_formed
+            && (prefix.is_some_and(|prefix| !is_ncname(prefix)) || !is_ncname(local_name))
+        {
             return Err(DomError::WrongKind);
         }
         return append_xml(output, qname);
     }
-    let local = split_qname(qname).map_or(qname, |(_, local)| local);
     if uri.is_none_or(str::is_empty) {
-        if require_well_formed && (!is_xml_name(local) || local.contains(':') || local == "xmlns") {
+        if require_well_formed && (!is_ncname(local_name) || local_name == "xmlns") {
             return Err(DomError::WrongKind);
         }
-        return append_xml(output, local);
+        return append_xml(output, local_name);
     }
-    if require_well_formed && (!is_xml_name(local) || local.contains(':')) {
+    if require_well_formed
+        && (!is_ncname(local_name) || prefix.is_some_and(|prefix| !is_ncname(prefix)))
+    {
         return Err(DomError::WrongKind);
     }
     let prefix = candidate_prefix.ok_or(DomError::WrongKind)?;
     append_xml(output, prefix)?;
     append_xml(output, ":")?;
-    append_xml(output, local)
+    append_xml(output, local_name)
 }
 
 fn append_namespace_declaration(
@@ -1305,6 +1692,41 @@ fn append_cdata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specification_live_xml_parser_element_creation_phases() {
+        let mut document = Document::new(64);
+        document.set_parser_custom_element_predicate(Some(Rc::new(|_, _, local, _| local == "x-phase")));
+        let (mut parser, script) = XmlDocumentParser::start(&mut document,
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><x-phase data-value=\"token\"><span>child</span></x-phase><script>after</script></html>").unwrap();
+        assert!(script.is_none());
+        let node = parser.pending_element().expect("XML constructor phase");
+        assert_eq!(document.parent(node), Ok(None));
+        assert_eq!(document.first_child(node), Ok(None));
+        assert_eq!(document.get_attribute_ns_ref(node, None, "data-value"), Ok(None));
+        parser.append_pending_element_attributes(&mut document).unwrap();
+        assert_eq!(document.get_attribute_ns_ref(node, None, "data-value").unwrap(), Some("token"));
+        assert!(parser.finish_pending_element(&mut document).unwrap().is_some());
+        assert!(document.parent(node).unwrap().is_some());
+        assert!(document.first_child(node).unwrap().is_some());
+        assert!(parser.resume(&mut document).unwrap().is_none());
+    }
+
+    #[test]
+    fn specification_live_xml_parser_entity_script_continuations() {
+        let mut document = Document::new(64);
+        let (mut parser, first) = XmlDocumentParser::start(&mut document,
+            r#"<!DOCTYPE html [<!ENTITY inner "<script>first</script><p>after</p>"><!ENTITY outer "&inner;<span>end</span>">]><html xmlns="http://www.w3.org/1999/xhtml">&outer;<script>second</script></html>"#).unwrap();
+        let first = first.expect("entity script yields");
+        let root = document.parent(first).unwrap().unwrap();
+        assert_eq!(document.next_sibling(first), Ok(None));
+        let second = parser.resume(&mut document).unwrap().expect("document script yields");
+        assert_ne!(first, second);
+        assert_eq!(document.parent(second), Ok(Some(root)));
+        let p = document.next_sibling(first).unwrap().unwrap();
+        assert!(matches!(document.kind(p), Ok(NodeKind::Element { name, .. }) if name == "p"));
+        assert!(parser.resume(&mut document).unwrap().is_none());
+    }
 
     fn root_element(document: &Document) -> NodeId {
         let mut child = document.first_child(document.root()).unwrap();
@@ -1647,6 +2069,18 @@ mod tests {
     }
 
     #[test]
+    fn xml_parser_preserves_trailing_processing_instruction_data() {
+        let document = parse("<?ready yes ?><root/>", 8).unwrap();
+        let instruction = document.first_child(document.root()).unwrap().unwrap();
+        assert!(matches!(
+            document.kind(instruction).unwrap(),
+            NodeKind::ProcessingInstruction { target, data }
+                if target == "ready" && data == "yes "
+        ));
+        assert_eq!(outer_html(&document, instruction).unwrap(), "<?ready yes ?>");
+    }
+
+    #[test]
     fn malformed_or_over_budget_xml_fragments_leave_the_document_unchanged() {
         let mut document = parse("<root><kept/></root>", 8).unwrap();
         let root = root_element(&document);
@@ -1709,6 +2143,76 @@ mod tests {
             outer_html(&nested, nested_root).unwrap(),
             "<outer xmlns=\"urn:outer\"><plain xmlns=\"\"/></outer>"
         );
+    }
+
+    #[test]
+    fn xml_literal_colon_name_metadata_survives_copy_move_and_reclamation() {
+        let mut source = Document::new(16);
+        let mut target = Document::new(16);
+        let literal = source.create_unprefixed_element(Namespace::Html, "p:name".into(), Vec::new()).unwrap();
+        assert_eq!(source.element_name_parts(literal).unwrap(), (None, "p:name"));
+        assert_eq!(outer_html(&source, literal), Err(DomError::WrongKind));
+        assert_eq!(serialize_xml(&source, literal, false).unwrap(),
+            "<p:name xmlns=\"http://www.w3.org/1999/xhtml\"></p:name>");
+        let clone = source.clone_node(literal, true).unwrap();
+        let imported = target.clone_subtree_from(&source, literal, true).unwrap();
+        assert_eq!(source.element_name_parts(clone).unwrap(), (None, "p:name"));
+        assert_eq!(target.element_name_parts(imported).unwrap(), (None, "p:name"));
+        assert!(crate::equality::is_equal_node(&source, literal, &target, imported).unwrap());
+        let mut full = Document::new(1);
+        assert!(matches!(full.adopt_subtree_from(&mut source, literal), Err(DomError::LimitExceeded)));
+        assert_eq!(source.element_name_parts(literal).unwrap(), (None, "p:name"));
+        assert_eq!(source.literal_colon_names.len(), 2);
+        assert!(full.literal_colon_names.is_empty());
+        let (adopted, _) = target.adopt_subtree_from(&mut source, literal).unwrap();
+        assert_eq!(target.element_name_parts(adopted).unwrap(), (None, "p:name"));
+        assert_eq!(source.literal_colon_names, alloc::vec![clone]);
+        source.destroy_subtree(clone).unwrap();
+        assert_eq!(source.literal_colon_names.capacity(), 0);
+        target.destroy_subtree(imported).unwrap();
+        target.destroy_subtree(adopted).unwrap();
+        assert_eq!(target.literal_colon_names.capacity(), 0);
+        for _ in 0..100 {
+            let literal = target.create_unprefixed_element(Namespace::Html, "p:name".into(), Vec::new()).unwrap();
+            target.destroy_subtree(literal).unwrap();
+            let prefixed = target.create(NodeKind::Element { namespace: Namespace::Html, name: "p:name".into(), attributes: Vec::new() }).unwrap();
+            assert_eq!(target.element_name_parts(prefixed).unwrap(), (Some("p"), "name"));
+            assert!(outer_html(&target, prefixed).unwrap().contains("xmlns:p="));
+            assert!(target.literal_colon_names.is_empty());
+            target.destroy_subtree(prefixed).unwrap();
+            assert_eq!(target.node_count(), 1);
+        }
+        let ordinary = target.create_unprefixed_element(Namespace::Html, "div".into(), Vec::new()).unwrap();
+        assert_eq!(target.element_name_parts(ordinary).unwrap(), (None, "div"));
+        assert_eq!(target.literal_colon_names.capacity(), 0);
+    }
+
+    #[test]
+    fn xml_inner_html_reuses_scoped_serializer_without_retained_arena_nodes() {
+        let mut document = parse("<root xmlns:p='urn:p'><p:child/><p:child/></root>", 16).unwrap();
+        let root = root_element(&document);
+        let before = document.node_count();
+        let expected = "<p:child xmlns:p=\"urn:p\"/><p:child xmlns:p=\"urn:p\"/>";
+        for _ in 0..100 {
+            let output = inner_html(&document, root).unwrap();
+            assert_eq!(output, expected);
+            let roundtrip = parse(&alloc::format!("<root>{output}</root>"), 16).unwrap();
+            let roundtrip_root = root_element(&roundtrip);
+            assert_eq!(inner_html(&roundtrip, roundtrip_root).unwrap(), expected);
+            let child = roundtrip.first_child(roundtrip_root).unwrap().unwrap();
+            assert!(matches!(roundtrip.kind(child).unwrap(), NodeKind::Element { namespace: Namespace::Other(uri), name, .. }
+                if uri.as_ref() == "urn:p" && name == "p:child"));
+            assert_eq!(document.node_count(), before);
+        }
+        let child = document.first_child(root).unwrap().unwrap();
+        let invalid = document.create(NodeKind::Text(String::from("\u{c}"))).unwrap();
+        document.append(child, invalid).unwrap();
+        let before = document.node_count();
+        for _ in 0..100 {
+            assert_eq!(inner_html(&document, root), Err(DomError::WrongKind));
+            assert!(serialize_xml(&document, root, false).unwrap().contains('\u{c}'));
+            assert_eq!(document.node_count(), before);
+        }
     }
 
     #[test]
@@ -1776,6 +2280,84 @@ mod tests {
     }
 
     #[test]
+    fn xml_serializer_uses_dom_name_components_in_lenient_mode() {
+        let mut document = parse("<root/>", 16).unwrap();
+        let root = root_element(&document);
+        document
+            .set_attribute(root, "literal:attribute", "one")
+            .unwrap();
+        document
+            .set_attribute_ns(root, Some("urn:attributes"), "9:local:part", "two")
+            .unwrap();
+
+        let numeric_prefix = document
+            .create(NodeKind::Element {
+                namespace: Namespace::Other(Rc::from("urn:numeric-prefix")),
+                name: Name::new("1:item"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        let multiple_colons = document
+            .create(NodeKind::Element {
+                namespace: Namespace::Other(Rc::from("urn:multiple-colons")),
+                name: Name::new("p:local:part"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        let literal_colon = document
+            .create_unprefixed_element(
+                Namespace::Other(Rc::from("")),
+                Name::new("literal:element"),
+                Vec::new(),
+            )
+            .unwrap();
+        document.append(root, numeric_prefix).unwrap();
+        document.append(root, multiple_colons).unwrap();
+        document.append(root, literal_colon).unwrap();
+
+        assert_eq!(
+            serialize_xml(&document, root, false).unwrap(),
+            "<root literal:attribute=\"one\" xmlns:9=\"urn:attributes\" 9:local:part=\"two\"><1:item xmlns:1=\"urn:numeric-prefix\"/><p:local:part xmlns:p=\"urn:multiple-colons\"/><literal:element/></root>"
+        );
+        assert_eq!(
+            serialize_xml(&document, root, true),
+            Err(DomError::WrongKind)
+        );
+
+        let mut invalid_attribute = parse("<root/>", 8).unwrap();
+        let root = root_element(&invalid_attribute);
+        invalid_attribute
+            .set_attribute_ns(root, Some("urn:attributes"), "p:local:part", "value")
+            .unwrap();
+        assert_eq!(
+            serialize_xml(&invalid_attribute, root, false).unwrap(),
+            "<root xmlns:p=\"urn:attributes\" p:local:part=\"value\"/>"
+        );
+        assert_eq!(
+            serialize_xml(&invalid_attribute, root, true),
+            Err(DomError::WrongKind)
+        );
+
+        let mut lookalike_declaration = parse("<root/>", 8).unwrap();
+        let root = root_element(&lookalike_declaration);
+        lookalike_declaration
+            .set_attribute(root, "xmlns:p", "urn:lookalike")
+            .unwrap();
+        let child = lookalike_declaration
+            .create(NodeKind::Element {
+                namespace: Namespace::Other(Rc::from("urn:lookalike")),
+                name: Name::new("p:child"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        lookalike_declaration.append(root, child).unwrap();
+        assert_eq!(
+            serialize_xml(&lookalike_declaration, root, false).unwrap(),
+            "<root xmlns:p=\"urn:lookalike\"><p:child xmlns:p=\"urn:lookalike\"/></root>"
+        );
+    }
+
+    #[test]
     fn xml_serializer_uses_scoped_prefix_map_and_unbound_attribute_prefixes() {
         let mut shadowed = parse(
             "<el1 xmlns:p='u1' xmlns:q='u1'><el2 xmlns:q='u2'/></el1>",
@@ -1813,6 +2395,55 @@ mod tests {
             serialize_xml(&generated, root, false).unwrap(),
             "<root xmlns:ns2=\"uri2\"><child xmlns:ns1=\"uri1\" xmlns:ns1=\"uri3\" ns1:attr1=\"value1\"/></root>"
         );
+    }
+
+    #[test]
+    fn xml_serializer_repairs_authored_default_declarations_and_rebound_attribute_prefixes() {
+        let mut document = parse("<package><manifest/></package>", 8).unwrap();
+        let root = root_element(&document);
+        let child = document.first_child(root).unwrap().unwrap();
+        for node in [root, child] {
+            document
+                .set_attribute_ns(
+                    node,
+                    Some(XMLNS_NAMESPACE),
+                    "xmlns",
+                    "http://www.idpf.org/2007/opf",
+                )
+                .unwrap();
+        }
+        assert_eq!(serialize_xml(&document, root, false).unwrap(), "<package><manifest/></package>");
+
+        let mut document = parse("<root xmlns:p='uri1'><child/></root>", 8).unwrap();
+        let root = root_element(&document);
+        let child = document.first_child(root).unwrap().unwrap();
+        document.set_attribute_ns(child, Some("uri2"), "p:foobar", "v").unwrap();
+        assert_eq!(serialize_xml(&document, root, false).unwrap(), "<root xmlns:p=\"uri1\"><child xmlns:p=\"uri2\" p:foobar=\"v\"/></root>");
+
+        for (source, expected) in [
+            (
+                "<root><child xmlns=\"\"/></root>",
+                "<root><child/></root>",
+            ),
+            (
+                "<root xmlns=\"\"><child xmlns=\"\"/></root>",
+                "<root><child/></root>",
+            ),
+            (
+                "<root xmlns=\"u1\"><child xmlns=\"u1\"/></root>",
+                "<root xmlns=\"u1\"><child/></root>",
+            ),
+        ] {
+            let document = parse(source, 8).unwrap();
+            let root = root_element(&document);
+            assert_eq!(serialize_xml(&document, root, false).unwrap(), expected);
+        }
+
+        let mut document = parse("<root xmlns='' xmlns:foo='urn:bar'/>", 8).unwrap();
+        let root = root_element(&document);
+        document.set_attribute_ns(root, Some(XMLNS_NAMESPACE), "xmlns:foo", "").unwrap();
+        assert_eq!(serialize_xml(&document, root, false).unwrap(), "<root xmlns:foo=\"\"/>");
+        assert_eq!(serialize_xml(&document, root, true), Err(DomError::WrongKind));
     }
 
     #[test]
@@ -2007,6 +2638,83 @@ mod tests {
         ] {
             assert!(!is_valid_attribute_local_name(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn dom_factory_names_follow_context_sensitive_name_validation() {
+        assert!(is_valid_element_local_name("section"));
+        assert!(is_valid_element_local_name("a=b"));
+        assert!(is_valid_element_local_name("a:b:c"));
+        assert!(is_valid_element_local_name(":_é"));
+        assert!(!is_valid_element_local_name(""));
+        assert!(!is_valid_element_local_name("9name"));
+        assert!(!is_valid_element_local_name("a/b"));
+        assert!(!is_valid_element_local_name("a b"));
+
+        assert!(is_valid_doctype_name(""));
+        assert!(is_valid_doctype_name("html:5"));
+        assert!(!is_valid_doctype_name("html name"));
+        assert!(!is_valid_doctype_name("html>"));
+        assert!(!is_valid_doctype_name("html\0"));
+
+        assert_eq!(
+            validate_dom_qualified_name(Some(""), "p:a:b", DomNameContext::Element),
+            Err(DomNameError::Namespace)
+        );
+        let parsed = validate_dom_qualified_name(
+            Some("urn:x"),
+            "p:a:b",
+            DomNameContext::Element,
+        )
+        .unwrap();
+        assert_eq!(parsed.namespace, Some("urn:x"));
+        assert_eq!(parsed.prefix, Some("p"));
+        assert_eq!(parsed.local_name, "a:b");
+
+        assert_eq!(
+            validate_dom_qualified_name(None, "p:name", DomNameContext::Element),
+            Err(DomNameError::Namespace)
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some(XML_NAMESPACE), "xml:name", DomNameContext::Attribute)
+                .unwrap()
+                .local_name,
+            "name"
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "p:a=b", DomNameContext::Element)
+                .unwrap()
+                .local_name,
+            "a=b"
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "p:a=b", DomNameContext::Attribute),
+            Err(DomNameError::InvalidCharacter)
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some(XMLNS_NAMESPACE), "xmlns:decl", DomNameContext::Attribute)
+                .unwrap()
+                .prefix,
+            Some("xmlns")
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "xmlns:decl", DomNameContext::Attribute),
+            Err(DomNameError::Namespace)
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "p:bad/name", DomNameContext::Element),
+            Err(DomNameError::InvalidCharacter)
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "a=b:name", DomNameContext::Element)
+                .unwrap()
+                .prefix,
+            Some("a=b")
+        );
+        assert_eq!(
+            validate_dom_qualified_name(Some("urn:x"), "bad/p:name", DomNameContext::Element),
+            Err(DomNameError::InvalidCharacter)
+        );
     }
 
     #[test]

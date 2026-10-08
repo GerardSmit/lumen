@@ -79,6 +79,7 @@ pub(crate) struct Entry {
     pub(crate) node: NodeId,
     pub(crate) kind: Kind,
     pub(crate) restore_focus: Option<NodeId>,
+    pub(crate) popover_trigger: Option<NodeId>,
     /// Transient guard while a popover's synchronous beforetoggle closing
     /// event runs. It lives on the existing bounded top-layer entry rather
     /// than in a second per-node registry.

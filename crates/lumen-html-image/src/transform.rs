@@ -124,27 +124,11 @@ pub(super) fn rasterize(
             {
                 continue;
             }
-            let (ix, iy) = (px.floor() as i64, py.floor() as i64);
-            let (tx, ty) = (px - px.floor(), py - py.floor());
-            let mut sum = [0.0; 4];
-            for (dx, dy, weight) in [
-                (0, 0, (1.0 - tx) * (1.0 - ty)),
-                (1, 0, tx * (1.0 - ty)),
-                (0, 1, (1.0 - tx) * ty),
-                (1, 1, tx * ty),
-            ] {
-                let (xx, yy) = (ix + dx, iy + dy);
-                if xx < 0 || yy < 0 || xx >= source.width as i64 || yy >= source.height as i64 {
-                    continue;
-                }
-                let offset = (yy as usize * source.width as usize + xx as usize) * 4;
-                let pixel = &source.pixels[offset..offset + 4];
-                let alpha = pixel[3] as f64;
-                sum[3] += alpha * weight;
-                for channel in 0..3 {
-                    sum[channel] += pixel[channel] as f64 * alpha * weight;
-                }
-            }
+            let mut sum=[0.0;4];
+            visit_bilinear_samples(source.width,source.height,px,py,|at,weight| {
+                let pixel=&source.pixels[at*4..at*4+4];let alpha=f64::from(pixel[3]);sum[3]+=alpha*weight;
+                for channel in 0..3 {sum[channel]+=f64::from(pixel[channel])*alpha*weight;}
+            });
             let offset = (y as usize * width as usize + x as usize) * 4;
             let alpha = sum[3].round() as u8;
             if alpha != 0 {
@@ -156,6 +140,15 @@ pub(super) fn rasterize(
         }
     }
     Ok(Some((rect, output)))
+}
+
+pub(super) fn visit_bilinear_samples(width:u32,height:u32,x:f64,y:f64,mut visit:impl FnMut(usize,f64)) {
+    if !x.is_finite() || !y.is_finite() || x < -1.0 || y < -1.0 || x>=f64::from(width) || y>=f64::from(height) {return;}
+    let (ix,iy)=(x.floor() as i64,y.floor() as i64);let (tx,ty)=(x-x.floor(),y-y.floor());
+    for (dx,dy,weight) in [(0,0,(1.0-tx)*(1.0-ty)),(1,0,tx*(1.0-ty)),(0,1,(1.0-tx)*ty),(1,1,tx*ty)] {
+        let (xx,yy)=(ix+dx,iy+dy);
+        if xx>=0 && yy>=0 && xx<i64::from(width) && yy<i64::from(height) {visit(yy as usize*width as usize+xx as usize,weight);}
+    }
 }
 
 #[cfg(test)]

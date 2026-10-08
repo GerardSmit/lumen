@@ -133,7 +133,7 @@ fn browser_fetch_response_clone_tees_native_byte_reader_chunks() {
     let ctx = engine.engine().ctx();
     let global = ctx.global_object();
     let Ok(stub) = ctx.member_get(&global, "stubHttp") else { panic!("stub transport") };
-    lumen_host::net::Transport::install(ctx, stub, lumen::embed::Value::Undefined, lumen::embed::Value::Undefined);
+    lumen_host::net::Transport::install(ctx, stub, lumen::embed::Value::Undefined, lumen::embed::Value::Undefined).expect("install stub transport");
     eval(
         &mut engine,
         r#"

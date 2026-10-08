@@ -7,9 +7,9 @@
 //! calls them with native callbacks, so no script function is involved.
 
 use crate::realm_services::RealmServices;
-use lumen::embed::{Ctx, OpError, Value};
+use lumen::embed::{Ctx, NativeIdentityOwner, OpError, OpResult, Value};
 use lumen_common::cors::{Credentials, Mode, Redirect};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::{Rc, Weak}};
 
 /// A failed request: the error's `name` and `message`.
 #[derive(Clone, Debug)]
@@ -113,6 +113,7 @@ pub(crate) struct Head<'a> {
 
 /// The fetch options handed to the transport with a request.
 pub(crate) struct SendOptions {
+    pub cookies_allowed: bool,
     pub mode: Mode,
     pub credentials: Credentials,
     pub redirect: Redirect,
@@ -174,24 +175,99 @@ pub struct Transport {
     policy: Value,
 }
 
+// Installed lookup is weak; the realm's private, traced wrapper owns the
+// original transport. An in-flight Rust request may independently retain the
+// shared transport, in which case its Values remain legitimate external roots.
+#[lumen_bind::class(name = "RealmHttpTransport")]
+struct TransportOwner {
+    transport: Rc<Transport>,
+}
+
+struct TransportSlot(String);
+
+#[lumen_bind::methods]
+impl TransportOwner {}
+
+impl NativeIdentityOwner for TransportOwner {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, _: u64, _: &mut dyn FnMut(&Value)) {}
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
+        if Rc::strong_count(&self.transport) == 1 {
+            visit(&self.transport.request);
+            visit(&self.transport.sync);
+            visit(&self.transport.policy);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn specification_http_transport_retains_live_request_handles_and_releases_retired_realms() {
+        for reinstall in [false,true] {
+        let mut engine=lumen::Engine::new();
+        let child=engine.ctx().create_host_realm();
+        let weak_global=engine.ctx().weak_value(&child.global()).expect("child global");
+        let transport=engine.ctx().with_host_realm(&child,|ctx| {
+            let global=ctx.global_object();
+            let request=ctx.eval_in_realm(&global,"({request(){return globalThis}})").ok().expect("request module");
+            let policy=ctx.eval_in_realm(&global,"({requestSync(){return globalThis}})").ok().expect("policy module");
+            Transport::install(ctx,request,policy.clone(),policy).expect("install captured modules");
+            let first=Transport::current(ctx).expect("installed transport");
+            let again=Transport::current(ctx).expect("same captured transport");
+            assert!(Rc::ptr_eq(&first,&again));
+            assert_eq!(first.sync.object_identity(),first.policy.object_identity(),"two physical captured handles may own the same policy object");
+            drop(again);
+            if reinstall {
+                ctx.freeze_native_object(&global);
+                Transport::install(ctx,Value::Undefined,Value::Undefined,Value::Undefined).expect("reinstall internal transport on frozen global");
+                let replacement=Transport::current(ctx).expect("replacement transport");
+                assert!(!Rc::ptr_eq(&first,&replacement),"reinstallation replaces only the installed lookup, preserving live requests");
+            }
+            first
+        }).expect("enter child realm");
+        engine.ctx().dispose_host_realm(&child).expect("dispose inactive realm");
+        drop(child);
+        engine.ctx().collect_garbage_for_host();
+        assert!(weak_global.upgrade().is_some(),"a live request handle retains its original transport realm");
+        let function=transport.callable_member(engine.ctx(),&transport.request,"request").expect("original request method");
+        let origin=engine.ctx().invoke(function,transport.request.clone(),&[]).ok().expect("retained request remains usable");
+        assert_eq!(origin.object_identity(),weak_global.upgrade().and_then(|value|value.object_identity()));
+        drop(origin);
+        drop(transport);
+        engine.ctx().collect_garbage_for_host();
+        assert!(weak_global.upgrade().is_none(),"installed lookup alone must not root a retired realm");
+        }
+    }
+}
+
 impl Transport {
     /// Register the transport of the current realm. `request` has `request()`; `sync` has
     /// `requestSync()`; `policy` (the same object or another) may have `policyHandledByHost` and
     /// `browserOrigin`. `undefined` stands for an absent object.
-    pub fn install(ctx: &mut Ctx, request: Value, sync: Value, policy: Value) {
-        RealmServices::replace_current(
-            ctx,
-            Transport {
-                request,
-                sync,
-                policy,
-            },
-        );
+    pub fn install(ctx: &mut Ctx, request: Value, sync: Value, policy: Value) -> OpResult<()> {
+        let transport=Rc::new(Transport { request, sync, policy });
+        let owner=ctx.new_instance(TransportOwner { transport:transport.clone() });
+        ctx.set_native_identity_owner::<TransportOwner>(&owner)?;
+        let slot=match ctx.op_state().get::<TransportSlot>() {
+            Some(slot)=>slot.0.clone(),
+            None=>{
+                let name=ctx.allocate_native_private_slot_name();
+                ctx.op_state().put(TransportSlot(name.clone()));
+                name
+            }
+        };
+        let global=ctx.global_object();
+        ctx.set_native_internal_value_slot(&global,&slot,owner).map_err(OpError::thrown)?;
+        RealmServices::replace_current(ctx,Rc::downgrade(&transport));
+        Ok(())
     }
 
     /// The current realm's transport.
     pub fn current(ctx: &mut Ctx) -> Option<Rc<Transport>> {
-        RealmServices::<Transport>::current(ctx)
+        RealmServices::<Weak<Transport>>::current(ctx)?.upgrade()
     }
 
     fn callable_member(&self, ctx: &mut Ctx, object: &Value, name: &str) -> Option<Value> {
@@ -317,6 +393,7 @@ impl Transport {
         };
         let option_object = Value::Obj(ctx.new_object());
         for (key, value) in [
+            ("cookiesAllowed", Value::Bool(options.cookies_allowed)),
             ("mode", Value::str(mode_name(options.mode))),
             ("credentials", Value::str(credentials_name(options.credentials))),
             ("redirect", Value::str(redirect_name(options.redirect))),

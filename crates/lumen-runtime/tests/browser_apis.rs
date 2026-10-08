@@ -1282,7 +1282,7 @@ fn install_stub_transport(runtime: &mut Runtime, origin: Option<&str>) {
     let Ok(stub) = ctx.member_get(&global, "__stub") else {
         panic!("stub transport")
     };
-    lumen_host::net::Transport::install(ctx, stub.clone(), stub.clone(), stub);
+    lumen_host::net::Transport::install(ctx, stub.clone(), stub.clone(), stub).expect("install stub transport");
 }
 
 #[test]

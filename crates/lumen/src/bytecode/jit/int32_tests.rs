@@ -150,6 +150,42 @@ fn evaluate(src: &str, tier: Tier, mode: JitMode) -> (String, crate::JitStats) {
 }
 
 #[test]
+fn computed_numeric_read_preserves_proxy_receiver_keys_mutation_and_exceptions() {
+    let source = r#"
+        var reads=0, receiverOK=true;
+        var target=Object.create({get 3(){return this.marker;}});
+        target.marker=17;
+        var proxy=new Proxy(target,{get:function(t,k,r){
+            reads++; receiverOK=receiverOK && r===proxy;
+            if(k==='4')throw 'numeric read failed';
+            return Reflect.get(t,k,r);
+        }});
+        function localRead(o,k){return o[k];}
+        function stackRead(k){return (true?proxy:target)[k];}
+        var sum=0;
+        for(var n=0;n<2048;n++)sum+=localRead(proxy,3)+stackRead(3);
+        target.marker=23;
+        var after=localRead(proxy,3), caught='';
+        try{localRead(proxy,4);}catch(e){caught=e;}
+        target['0']='zero';target['-1']='negative';target['1.5']='fraction';
+        target['NaN']='nan';target['Infinity']='infinity';
+        var keys=[-0,-1,1.5,NaN,Infinity],values=[];
+        for(var q=0;q<keys.length;q++)values.push(localRead(proxy,keys[q]));
+        var converted=0;
+        values.push(localRead(proxy,{toString:function(){converted++;return '3';}}));
+        var nullError=false;
+        try{localRead(null,0);}catch(e){nullError=e instanceof TypeError;}
+        JSON.stringify([sum,after,caught,receiverOK,reads,values,converted,nullError]);
+    "#;
+    let expected = evaluate(source, Tier::Bytecode, JitMode::Disabled).0;
+    for mode in [JitMode::Hot, JitMode::Eager] {
+        let (actual, stats) = evaluate(source, Tier::Bytecode, mode);
+        assert_eq!(actual, expected);
+        assert!(stats.executed_entries > 0);
+    }
+}
+
+#[test]
 fn inline_atomics_keep_identity_coercion_unsigned_and_exchange_semantics() {
     let source = r#"
         var a = new Int32Array(new SharedArrayBuffer(16));

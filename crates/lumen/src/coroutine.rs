@@ -126,6 +126,18 @@ impl Coroutine {
             #[cfg(feature = "aot-native")]
             Coroutine::Native(c) => &c.frame,
         };
+        // An await job can be drained while a different document is entered.
+        // Every module step, including resumed steps, uses its captured settings.
+        let saved_realm = if let crate::interpreter::stack_trace::ResumeFrame::Script(module) = frame {
+            if module.settings != crate::value::Gc::as_ptr(&i.global) as usize {
+                let Some(origin) = i.realms.get(&module.settings).map(crate::interpreter::RealmState::snapshot_clone) else {
+                    return Suspend::Throw(crate::interpreter::abrupt_value(i.throw("TypeError","module settings no longer exist")));
+                };
+                let saved = i.snapshot_realm();
+                i.restore_realm(&origin);
+                Some(saved)
+            } else { None }
+        } else { None };
         let pushed = i.enter_resume_frame(frame, started);
         let s = match self {
             Coroutine::Thread(c) => c.resume(i, signal),
@@ -134,6 +146,7 @@ impl Coroutine {
             Coroutine::Native(c) => c.resume(i, signal),
         };
         i.leave_resume_frame(pushed);
+        if let Some(saved) = saved_realm { i.restore_realm(&saved); }
         s
     }
     /// The frame (function or module body) the body's resumes run under.

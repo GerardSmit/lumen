@@ -86,6 +86,7 @@ pub fn validate_payload(bytes: &[u8], function_count: usize) -> Result<(), Strin
 
 /// Check an authenticated upload against this realm before replacing a live
 /// application. This performs no executable mapping or JavaScript execution.
+#[cfg(all(feature = "embed", feature = "aot-native"))]
 pub(crate) fn validate_install(
     interp: &Interp,
     bytes: &[u8],
@@ -587,6 +588,7 @@ pub(crate) fn load_engine(
 
 /// Execute an image whose text and GOT were placed by the system linker.
 /// The caller keeps these ranges alive for every realm that uses the image.
+#[cfg(all(feature = "embed", feature = "aot-native"))]
 pub(crate) unsafe fn load_linked_engine(
     interp: &mut Interp,
     bytes: Arc<[u8]>,
@@ -609,6 +611,7 @@ pub(crate) unsafe fn load_linked_engine(
 
 /// Load compiler-produced, executable-embedded glue at the portable CPU and
 /// built-in catalog baseline. This is deliberately restricted to static bytes.
+#[cfg(all(feature = "embed", feature = "aot-native"))]
 pub(crate) fn load_static_glue_engine(
     interp: &mut Interp,
     bytes: &'static [u8],

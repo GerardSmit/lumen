@@ -72,6 +72,12 @@ lto = false
 codegen-units = 64
 incremental = true
 
+
+# Keep the large native DOM test harness below Mach-O compact-unwind limits.
+# Optimize only this test package; preserve assertions and ordinary dev builds.
+[profile.test.package.lumen-html-js]
+opt-level = 1
+
 # CI tests: optimized like `fast` so deep-recursion tests fit the stack, but keep debug assertions
 # and overflow checks.
 [profile.ci]

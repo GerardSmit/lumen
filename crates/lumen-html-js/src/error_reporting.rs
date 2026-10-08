@@ -6,9 +6,9 @@ use lumen::embed::{JsFunction, JsObject, OpError, OpResult};
 #[derive(Clone)]
 struct Reporter {
     realm: std::rc::Weak<DomRealm>,
-    constructor: Value,
-    legacy_constructors: HashMap<&'static str, Value>,
-    console: Option<(Value, JsFunction)>,
+    constructor: WeakValue,
+    legacy_constructors: HashMap<&'static str, WeakValue>,
+    console: Option<(WeakValue, WeakValue)>,
     active: Rc<Cell<bool>>,
 }
 
@@ -35,14 +35,17 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ] {
         if let Ok(constructor) = ctx.member_get(&global, name) {
             if constructor.is_callable() {
-                legacy_constructors.insert(name, constructor);
+                legacy_constructors.insert(name, crate::realm_services::capture_realm_value(ctx, constructor)?);
             }
         }
     }
     let console = ctx.member_get(&global, "console").ok().and_then(|console| {
         let report = ctx.member_get(&console, "error").ok()?;
-        Some((console, JsFunction::from_value(report)?))
+        JsFunction::from_value(report.clone())?;
+        Some((crate::realm_services::capture_realm_value(ctx, console).ok()?,
+            crate::realm_services::capture_realm_value(ctx, report).ok()?))
     });
+    let constructor = crate::realm_services::capture_realm_value(ctx, constructor)?;
     RealmServices::replace_current(
         ctx,
         Reporter {
@@ -113,7 +116,7 @@ pub(crate) fn create_legacy_event(ctx: &mut Ctx, interface: &str) -> OpResult<Va
         return Ok(ctx.new_instance(event));
     }
     let constructor = RealmServices::<Reporter>::current(ctx)
-        .and_then(|state| state.legacy_constructors.get(name).cloned())
+        .and_then(|state| state.legacy_constructors.get(name).and_then(WeakValue::upgrade))
         .ok_or_else(|| dom_exception(ctx, "NotSupportedError", "event interface is not exposed"))?;
     let event = ctx
         .construct(constructor, &[Value::str("")])
@@ -125,8 +128,14 @@ pub(crate) fn create_legacy_event(ctx: &mut Ctx, interface: &str) -> OpResult<Va
 
 /// Reporting an exception must not become an exception from dispatchEvent.
 pub(crate) fn report_exception(ctx: &mut Ctx, exception: Value) {
+    let _=report_browser_exception(ctx,exception);
+}
+
+/// None means this reporting global has no native HTML reporter. Once present,
+/// browser reporting (including recursive/default reports) owns the exception.
+pub(crate) fn report_browser_exception(ctx: &mut Ctx, exception: Value)->Option<bool> {
     let Some(reporter) = RealmServices::<Reporter>::current(ctx) else {
-        return;
+        return None;
     };
     let mut not_handled = true;
     if !reporter.active.replace(true) {
@@ -167,7 +176,7 @@ pub(crate) fn report_exception(ctx: &mut Ctx, exception: Value) {
             }
             let event = ctx
                 .construct(
-                    reporter.constructor.clone(),
+                    reporter.constructor.upgrade().ok_or_else(|| OpError::new("InvalidStateError", "ErrorEvent realm is unavailable"))?,
                     &[Value::str("error"), options],
                 )
                 .map_err(lumen::embed::abrupt_value)
@@ -182,10 +191,12 @@ pub(crate) fn report_exception(ctx: &mut Ctx, exception: Value) {
         }
     }
     if not_handled {
-        if let Some((console, report)) = reporter.console.clone() {
+        if let Some((console, report)) = reporter.console.as_ref().and_then(|(console, report)|
+            Some((console.upgrade()?, JsFunction::from_value(report.upgrade()?)?))) {
             let _ = report.call(ctx, console, &[exception]);
         }
     }
+    Some(!not_handled)
 }
 
 #[cfg(test)]

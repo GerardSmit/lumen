@@ -2,7 +2,8 @@
 //!
 //! The upstream `testdriver.js` resource remains unchanged. After it installs its public API and
 //! replaces `test_driver_internal`, the WPT host calls [`install_after_testdriver_script`] to
-//! enable automation and supply the native click/send-keys operations. Other callable commands
+//! enable automation and supply native pointer/keyboard actions and privileged cookie cleanup.
+//! Other callable commands
 //! are observed only when invoked; reading namespace objects or ordinary bookkeeping properties
 //! does not mark the case unsupported.
 
@@ -11,7 +12,7 @@ use crate::realm_services::RealmServices;
 use lumen::embed::{Deferred, JsFunction, JsHost, Promise, Slot, WeakValue};
 use lumen_bind::{FromArg, Host};
 use std::time::Instant;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::{HashMap, VecDeque}, rc::Rc, time::Duration};
 
 const UNSUPPORTED_COMMAND: &str = "WPT testdriver command is not implemented by the native host";
 const UNSUPPORTED_KEY: &str = "WPT testdriver send_keys contains an unsupported key";
@@ -24,8 +25,11 @@ const MAX_WRAPPED_NAMESPACE_VALUES: usize = 256;
 const UNSUPPORTED_NAMESPACE_LIMIT: &str = "WPT testdriver namespace cache limit was reached";
 const UNSUPPORTED_ACTION_PROFILE: &str =
     "WPT testdriver Actions input profile is not implemented by the native host";
-const ACTION_INPUT_BUSY: &str = "WPT testdriver Actions sequence is already active in this realm";
+const MAX_PENDING_ACTION_COMMANDS: usize = 64;
 const MAX_ACTION_SOURCES: usize = 8;
+// The per-command simultaneous-source limit is distinct from the bounded
+// session history needed by fresh Actions builders and later pointer origins.
+const MAX_RETAINED_ACTION_SOURCES: usize = 256;
 const MAX_ACTION_TICKS: usize = 256;
 const MAX_ACTION_CELLS: usize = 2048;
 const MAX_ACTION_DELAY_MS: u64 = 10_000;
@@ -62,6 +66,7 @@ struct RealmBridge {
     internal_proxy: Option<WeakValue>,
     public_proxy: Option<WeakValue>,
     handler: Option<WeakValue>,
+    supported_delete_cookies: WeakValue,
     supported_click: WeakValue,
     supported_send_keys: WeakValue,
     supported_action_sequence: WeakValue,
@@ -81,6 +86,14 @@ struct ActionState {
     last_click: Option<LastClick>,
     busy: bool,
     plan: Option<ActionPlan>,
+    pending: VecDeque<QueuedAction>,
+    pending_owner_slot: Option<String>,
+}
+
+struct QueuedAction {
+    plan: ActionPlan,
+    resolve: WeakValue,
+    reject: WeakValue,
 }
 
 struct ActionPlan {
@@ -245,6 +258,10 @@ fn is_allowed_function(value: &Value, bridge: &RealmBridge) -> bool {
         return false;
     };
     bridge
+        .supported_delete_cookies
+        .upgrade()
+        .and_then(|value| value.object_identity()) == Some(identity)
+        || bridge
         .supported_click
         .upgrade()
         .and_then(|value| value.object_identity())
@@ -532,6 +549,9 @@ pub fn install_after_testdriver_script(
     let public_id = public.object_identity().expect("checked object");
     ctx.member_set(&internal, "in_automation", Value::Bool(true))
         .map_err(OpError::thrown)?;
+    let delete_cookies = ctx.bound_function(&lumen_bind::FnItem::of::<delete_all_cookies::Op>());
+    ctx.member_set(&internal, "delete_all_cookies", delete_cookies.clone()).map_err(OpError::thrown)?;
+    let weak_delete_cookies = ctx.weak_value(&delete_cookies).expect("native cookie deletion is an object");
     let click = ctx.bound_function(&lumen_bind::FnItem::of::<click::Op>());
     let send_keys = ctx.bound_function(&lumen_bind::FnItem::of::<send_keys::Op>());
     ctx.member_set(&internal, "click", click.clone())
@@ -553,6 +573,7 @@ pub fn install_after_testdriver_script(
         .expect("native send_keys operation is an object");
     let mut harmless_public_functions = Vec::with_capacity(5);
     for name in [
+        "delete_all_cookies",
         "click",
         "send_keys",
         "action_sequence",
@@ -584,6 +605,7 @@ pub fn install_after_testdriver_script(
             internal_proxy: None,
             public_proxy: None,
             handler: None,
+            supported_delete_cookies: weak_delete_cookies,
             supported_click: weak_click,
             supported_send_keys: weak_send_keys,
             supported_action_sequence: weak_action_sequence,
@@ -1140,7 +1162,7 @@ fn prepare_pointer_sources(
             missing += 1;
         }
     }
-    if state.pointers.len().saturating_add(missing) > MAX_ACTION_SOURCES {
+    if state.pointers.len().saturating_add(missing) > MAX_RETAINED_ACTION_SOURCES {
         case.record_unsupported(UNSUPPORTED_ACTION_PROFILE);
         return Err(OpError::new(
             "NotSupportedError",
@@ -1228,27 +1250,58 @@ fn action_sequence(
             "testdriver Actions context must be the current browsing context",
         ));
     }
-    if bridge.borrow().action_state.busy {
-        bridge.borrow().case.record_unsupported(ACTION_INPUT_BUSY);
-        return Promise::rejected(OpError::new("InvalidStateError", ACTION_INPUT_BUSY));
-    }
-    let mut plan = match parse_action_sequence(ctx, &actions) {
+    let plan = match parse_action_sequence(ctx, &actions) {
         Ok(plan) => plan,
         Err(error) => return Promise::rejected(error),
     };
-    if let Err(error) = validate_action_state(&bridge, &plan) {
-        return Promise::rejected(error);
-    }
-    if plan.ticks.is_empty() {
-        return Promise::resolved(Value::Undefined);
-    }
-    if let Err(error) = prepare_pointer_sources(&bridge, &mut plan) {
-        return Promise::rejected(error);
-    }
+    if plan.ticks.is_empty() { return Promise::resolved(Value::Undefined); }
+    let deferred = Deferred::new(ctx);
+    let (resolve, reject) = deferred.resolving_functions(ctx);
     if bridge.borrow().action_state.busy {
-        bridge.borrow().case.record_unsupported(ACTION_INPUT_BUSY);
-        return Promise::rejected(OpError::new("InvalidStateError", ACTION_INPUT_BUSY));
+        if bridge.borrow().action_state.pending.len() >= MAX_PENDING_ACTION_COMMANDS {
+            return Promise::rejected(OpError::new("QuotaExceededError", "too many queued testdriver action commands"));
+        }
+        let queued = QueuedAction {
+            plan,
+            resolve: ctx.weak_value(&resolve).expect("action resolver is callable"),
+            reject: ctx.weak_value(&reject).expect("action rejector is callable"),
+        };
+        bridge.borrow_mut().action_state.pending.push_back(queued);
+        if let Err(error) = refresh_pending_action_roots(ctx, &bridge) {
+            bridge.borrow_mut().action_state.pending.pop_back();
+            return Promise::rejected(error);
+        }
+    } else if let Err(error) = start_action_plan(ctx, &bridge, plan, &resolve, &reject) {
+        return Promise::rejected(error);
     }
+    Promise::pending(&deferred)
+}
+
+// WebDriver commands are serialized per session. A click's animation frame
+// may run before its action tick finishes; another command waits in this FIFO
+// instead of rejecting that valid interaction. Root only queued callbacks in
+// a reflection-hidden, GC-traced slot on this command's actual global.
+fn refresh_pending_action_roots(ctx: &mut Ctx, bridge: &Rc<RefCell<RealmBridge>>) -> OpResult<()> {
+    let (slot, values) = {
+        let mut bridge = bridge.borrow_mut();
+        let state = &mut bridge.action_state;
+        let slot = state.pending_owner_slot.get_or_insert_with(||ctx.allocate_native_private_slot_name()).clone();
+        let mut values = Vec::with_capacity(state.pending.len()*2);
+        for pending in &state.pending {
+            values.push(pending.resolve.upgrade().ok_or_else(||OpError::new("InvalidStateError","queued action resolver expired"))?);
+            values.push(pending.reject.upgrade().ok_or_else(||OpError::new("InvalidStateError","queued action rejector expired"))?);
+        }
+        (slot, values)
+    };
+    let array = ctx.make_array(values);
+    let global = ctx.global_object();
+    ctx.set_native_internal_value_slot(&global, &slot, array).map_err(OpError::thrown)
+}
+
+fn start_action_plan(ctx: &mut Ctx, bridge: &Rc<RefCell<RealmBridge>>, mut plan: ActionPlan, resolve: &Value, reject: &Value) -> OpResult<()> {
+    // Admission checks depend on the preceding command's final input state.
+    validate_action_state(bridge, &plan)?;
+    prepare_pointer_sources(bridge, &mut plan)?;
     {
         let mut bridge = bridge.borrow_mut();
         let state = &mut bridge.action_state;
@@ -1262,16 +1315,31 @@ fn action_sequence(
         state.plan = Some(plan);
         state.busy = true;
     }
-
-    let deferred = Deferred::new(ctx);
-    let (resolve, reject) = deferred.resolving_functions(ctx);
-    if let Err(error) = schedule_action_step(ctx, 0, &resolve, &reject, Duration::ZERO) {
-        let mut state = bridge.borrow_mut();
-        state.action_state.plan = None;
-        state.action_state.busy = false;
-        return Promise::rejected(error);
+    if let Err(error) = schedule_action_step(ctx, 0, resolve, reject, Duration::ZERO) {
+        let mut bridge = bridge.borrow_mut();
+        bridge.action_state.plan = None;
+        bridge.action_state.busy = false;
+        return Err(error);
     }
-    Promise::pending(&deferred)
+    Ok(())
+}
+
+fn start_next_action_plan(ctx: &mut Ctx, bridge: &Rc<RefCell<RealmBridge>>) -> OpResult<()> {
+    loop {
+        let next = bridge.borrow_mut().action_state.pending.pop_front();
+        let Some(next) = next else { return Ok(()); };
+        let resolve = next.resolve.upgrade().ok_or_else(||OpError::new("InvalidStateError","queued action resolver expired"))?;
+        let reject = next.reject.upgrade().ok_or_else(||OpError::new("InvalidStateError","queued action rejector expired"))?;
+        let result = start_action_plan(ctx, bridge, next.plan, &resolve, &reject);
+        match result {
+            Ok(()) => { refresh_pending_action_roots(ctx, bridge)?; return Ok(()); }
+            Err(error) => {
+                let reason=error.to_value(ctx);
+                settle_action_callback(ctx,&reject,reason)?;
+                refresh_pending_action_roots(ctx,bridge)?;
+            }
+        }
+    }
 }
 
 fn validate_action_state(bridge: &Rc<RefCell<RealmBridge>>, plan: &ActionPlan) -> OpResult<()> {
@@ -1366,6 +1434,7 @@ fn action_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value) -> Op
     let (tick, pointer_state_indices) = match step {
         Step::Tick(tick, pointer_state_indices) => (tick, pointer_state_indices),
         Step::Finished | Step::Missing => {
+            start_next_action_plan(ctx, &bridge)?;
             settle_action_callback(ctx, &resolve, Value::Undefined)?;
             return Ok(());
         }
@@ -1379,6 +1448,7 @@ fn action_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value) -> Op
         state.action_state.active_motion = None;
         drop(state);
         let reason = error.to_value(ctx);
+        start_next_action_plan(ctx, &bridge)?;
         settle_action_callback(ctx, &reject, reason)?;
         return Ok(());
     }
@@ -1395,6 +1465,7 @@ fn action_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value) -> Op
         state.action_state.active_motion = None;
         drop(state);
         let reason = error.to_value(ctx);
+        start_next_action_plan(ctx, &bridge)?;
         settle_action_callback(ctx, &reject, reason)?;
     }
     Ok(())
@@ -1496,6 +1567,7 @@ fn action_motion_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value
         state.action_state.active_motion = None;
         drop(state);
         let reason = error.to_value(ctx);
+        start_next_action_plan(ctx, &bridge)?;
         settle_action_callback(ctx, &reject, reason)?;
         return Ok(());
     }
@@ -1508,6 +1580,7 @@ fn action_motion_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value
             state.action_state.active_motion = None;
             drop(state);
             let reason = error.to_value(ctx);
+            start_next_action_plan(ctx, &bridge)?;
             settle_action_callback(ctx, &reject, reason)?;
         }
     } else {
@@ -1525,6 +1598,7 @@ fn action_motion_step(ctx: &mut Ctx, index: usize, resolve: Value, reject: Value
             state.action_state.active_motion = None;
             drop(state);
             let reason = error.to_value(ctx);
+            start_next_action_plan(ctx, &bridge)?;
             settle_action_callback(ctx, &reject, reason)?;
         }
     }
@@ -1931,6 +2005,9 @@ fn wheel_coordinates(
 }
 
 fn visible_element_center(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<(f64, f64)> {
+    // Action origins can become stale between command admission and a later
+    // tick. Use the same protocol error as direct element commands.
+    validate_element_reference(realm, node)?;
     realm.flush_layout()?;
     let session = realm.session_handle();
     let session = session.borrow();
@@ -1982,6 +2059,58 @@ mod tests {
         }
         fn line_height(&self, size: f32) -> f32 {
             size * 1.2
+        }
+    }
+
+    #[test]
+    fn specification_window_send_keys_commands_queue_after_focus_handlers_and_cancel_with_document() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<style>html,body{margin:0}</style><button id='a'>a</button><button id='b'>b</button><button id='c'>c</button>",128).unwrap();
+        realm.set_layout_flusher(Rc::new(|session|session.display_list(200,100,&NoText).map(|_|()).map_err(|error|format!("{error:?}"))));
+        let function=engine.ctx().bound_function(&lumen_bind::FnItem::of::<send_keys::Op>());
+        let global=engine.ctx().global_object();
+        engine.ctx().member_set(&global,"nativeSendKeys",function).ok().expect("publish typed queued input operation");
+        assert!(matches!(eval_value(&mut engine,r#"
+            globalThis.log=[];globalThis.count=0;globalThis.firstSettled=false;
+            document.addEventListener('focus',event=>{
+                log.push('focus:'+event.target.id);const current=++count;
+                if(current<3)nativeSendKeys(document.body,'\uE004').then(()=>log.push('settled:'+current));
+                log.push('return:'+current);
+            },true);
+            nativeSendKeys(document.body,'\uE004').then(()=>firstSettled=true);
+            count===0&&!firstSettled
+        "#),Value::Bool(true)));
+        for expected in 1..=3 {
+            assert!(super::super::scheduling::run_tasks(&mut engine,64).is_empty());
+            assert!(matches!(eval_value(&mut engine,&format!("count==={expected}")),Value::Bool(true)),"a command requested by a focus listener must wait for the next owner-loop turn");
+        }
+        assert!(matches!(eval_value(&mut engine,"firstSettled&&log.join(',')==='focus:a,return:1,focus:b,return:2,settled:1,focus:c,return:3,settled:2'"),Value::Bool(true)));
+        eval_value(&mut engine,"globalThis.staleError=null;globalThis.staleEvents=0;const stale=document.createElement('button');stale.addEventListener('keydown',()=>staleEvents++);document.body.append(stale);nativeSendKeys(stale,'x').catch(error=>staleError=error);stale.remove();");
+        assert!(super::super::scheduling::run_tasks(&mut engine,64).is_empty());
+        assert!(matches!(eval_value(&mut engine,"staleError instanceof Error&&staleError.name==='Error'&&staleError.code==='stale element reference'&&staleError.message==='input element is no longer connected to its active document'&&staleEvents===0"),Value::Bool(true)));
+        eval_value(&mut engine,r"globalThis.retiredSettled=false;nativeSendKeys(document.body,'\uE004').then(()=>retiredSettled=true);");
+        let _retired=realm.retire_browsing_context_group(engine.ctx());
+        assert!(super::super::scheduling::run_tasks(&mut engine,64).is_empty());
+        assert!(matches!(eval_value(&mut engine,"count===3&&!retiredSettled"),Value::Bool(true)),"actual document retirement cancels pending input without dispatching to a replacement document");
+    }
+
+    #[test]
+    fn specification_window_element_commands_and_action_ticks_share_stale_protocol_errors() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<button id='target'>target</button>",64).unwrap();
+        let target=eval_value(&mut engine,"document.getElementById('target')");
+        let (_,node)=element_data(engine.ctx(),&target).unwrap();
+        // An action can retain its admitted origin between ticks. Removing
+        // that element must reject before either layout or event dispatch.
+        eval_value(&mut engine,"document.getElementById('target').remove()");
+        let pointer=pointer_move_coordinates(&realm,&forms::TrustedPointerState::default(),&PointerOrigin::Element(node),0.0,0.0).err().expect("stale pointer origin");
+        let wheel=wheel_coordinates(&realm,&WheelOrigin::Element(node),0.0,0.0).err().expect("stale wheel origin");
+        let direct=element_data(engine.ctx(),&target).err().expect("stale direct command");
+        for error in [pointer,wheel,direct] {
+            let value=error.to_value(engine.ctx());
+            let global=engine.ctx().global_object();
+            engine.ctx().member_set(&global,"protocolError",value).ok().expect("publish protocol error");
+            assert!(matches!(eval_value(&mut engine,"protocolError instanceof Error&&protocolError.name==='Error'&&protocolError.code==='stale element reference'"),Value::Bool(true)));
         }
     }
 
@@ -2044,6 +2173,33 @@ mod tests {
             ]"#,
         );
         assert!(parse_action_sequence(engine.ctx(), &actions).is_err());
+    }
+
+    #[test]
+    fn native_cookie_cleanup_calls_the_privileged_host_and_preserves_proxy_guards() {
+        struct Host(std::cell::Cell<usize>);
+        impl crate::CookieHost for Host {
+            fn read(&self, _: &str) -> String { String::new() }
+            fn write(&self, _: &str, _: &str) {}
+            fn delete_associated(&self, url: &str) -> OpResult<()> {
+                assert_eq!(url, "https://example.test/account/page");
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+        }
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<body></body>", 32).unwrap();
+        realm.set_document_url("https://example.test/account/page");
+        let host = Rc::new(Host(std::cell::Cell::new(0)));
+        realm.set_cookie_host(host.clone());
+        eval_value(&mut engine, "globalThis.test_driver_internal={}; globalThis.test_driver={delete_all_cookies:function(context=null){return test_driver_internal.delete_all_cookies(context)}}; true");
+        let case = Rc::new(TestDriverCaseState::default());
+        assert!(install_after_testdriver_script(engine.ctx(), case.clone()).unwrap());
+        eval_value(&mut engine, "globalThis.cookie_cleanup_done=false;test_driver.delete_all_cookies().then(()=>cookie_cleanup_done=true); true");
+        engine.run_microtasks();
+        assert_eq!(host.0.get(), 1);
+        assert!(matches!(eval_value(&mut engine, "cookie_cleanup_done"), Value::Bool(true)));
+        assert_eq!(case.unsupported_reason(), None);
     }
 
     #[test]
@@ -2117,6 +2273,58 @@ mod tests {
         (engine, case)
     }
 
+    #[test]
+    fn specification_window_testdriver_click_uses_hit_descendant_and_preserves_interception() {
+        for child in [
+            "<button id='child' style='width:100%;height:100%;padding:0;border:0'></button>",
+            "<a id='child' href='#'></a>",
+        ] {
+            let html = format!("<style>html,body{{margin:0}}#parent{{position:relative;width:100px;height:80px}}a{{display:contents;&::after{{content:'';position:absolute;inset:0}}}}</style><div id='parent'>{child}</div>");
+            let (mut engine, case) = setup_action_test(&html);
+            eval_value(&mut engine, r#"
+                globalThis.events=[]; globalThis.bubbles=[]; globalThis.done=false;
+                const clickParent=document.getElementById('parent');
+                const clickChild=document.getElementById('child');
+                for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                    clickChild.addEventListener(type,event=>{
+                        events.push([event.type,event.target.id,event.isTrusted,event.clientX,event.clientY]);
+                        if (type==='click') event.preventDefault();
+                    });
+                }
+                clickParent.addEventListener('click',event=>bubbles.push([event.target.id,event.currentTarget.id]));
+                test_driver_internal.click(clickParent,{x:50,y:40}).then(()=>done=true,error=>{globalThis.failure=String(error)});
+                true
+            "#);
+            engine.run_microtasks();
+            assert!(matches!(eval_value(&mut engine, r#"
+                done && events.map(event=>event[0]).join(',')==='pointerdown,mousedown,pointerup,mouseup,click' &&
+                events.every(event=>event[1]==='child' && event[2] && event[3]===50 && event[4]===40) &&
+                bubbles.length===1 && bubbles[0].join(',')==='child,parent'
+            "#), Value::Bool(true)), "hit descendant must receive the real trusted pointer sequence: {child}");
+            eval_value(&mut engine, r#"
+                globalThis.intercepted=false; globalThis.interceptionDiagnostic='pending';
+                const overlay=document.createElement('div');
+                overlay.id='overlay';
+                overlay.style.cssText='position:absolute;left:0;top:0;width:100px;height:80px;z-index:10';
+                document.body.appendChild(overlay);
+                test_driver_internal.click(clickParent,{x:50,y:40}).then(()=>{globalThis.unexpected=true},error=>{
+                    intercepted=error instanceof Error && error.name==='Error' &&
+                        error.code==='element click intercepted' &&
+                        error.message==='testdriver click target is not the topmost hit-tested element';
+                    interceptionDiagnostic=JSON.stringify({name:error.name,code:error.code,message:error.message,
+                        hit:document.elementFromPoint(50,40)?.id,events,bubbles});
+                });
+                true
+            "#);
+            engine.run_microtasks();
+            let intercepted=eval_value(&mut engine, "intercepted && events.length===5 && bubbles.length===1 && !globalThis.unexpected");
+            let diagnostic=eval_value(&mut engine,"interceptionDiagnostic");
+            let diagnostic=engine.ctx().coerce_string(&diagnostic).ok().unwrap_or_default();
+            assert!(matches!(intercepted,Value::Bool(true)), "unrelated covering element must intercept the click: {child}; {diagnostic}");
+            assert_eq!(case.unsupported_reason(), None);
+        }
+    }
+
     fn finish_action_sequence(engine: &mut Engine) {
         let deadline = lumen_host::time::Instant::now() + Duration::from_secs(2);
         for _ in 0..256 {
@@ -2152,6 +2360,48 @@ mod tests {
             ),
             "action sequence settled through the shared timer heap"
         );
+    }
+
+    #[test]
+    fn queued_actions_are_bounded_serial_and_gc_rooted_on_a_frozen_global() {
+        let (mut engine, case)=setup_action_test("<body><div id='target'></div></body>");
+        eval_value(&mut engine, r#"
+            globalThis.queueState={done:false};globalThis.commandOrder=[];globalThis.commandFailures=[];
+            Object.defineProperty(globalThis,'action_done',{get(){return queueState.done}});
+            true
+        "#);
+        // WindowProxy rejects Object.freeze. Freeze its actual host global directly
+        // to exercise the internal-slot guarantee independently of that proxy.
+        let global = engine.ctx().global_object();
+        engine.ctx().freeze_native_object(&global);
+        let result=engine.eval_value(r#"
+            for(let index=0;index<66;index++) {
+                test_driver_internal.action_sequence([{type:'none',id:'pause',actions:[{type:'pause',duration:1}]}])
+                    .then(()=>{commandOrder.push(index);if(commandOrder.length===65)queueState.done=true},
+                          error=>commandFailures.push([index,error.name]));
+            }
+            true
+        "#).expect("valid queue fixture source");
+        let value=match result {
+            Ok(value)=>value,
+            Err(error)=>{
+                let message=engine.ctx().get_member(&error,"stack").ok().and_then(|value|engine.ctx().coerce_string(&value).ok()).unwrap_or_default();
+                panic!("queued action fixture failed: {message}");
+            }
+        };
+        assert!(matches!(value,Value::Bool(true)));
+        let bridge=bridge_for_current_realm(engine.ctx()).unwrap();
+        let slot=bridge.borrow().action_state.pending_owner_slot.clone().expect("queue roots have a private slot");
+        let state=eval_value(&mut engine, "queueState");
+        engine.ctx().set_member(&state, "slotKey", Value::str(&slot)).ok().expect("set fixture slot key");
+        engine.ctx().set_member(&state, "slotOwner", global.clone()).ok().expect("set actual slot owner");
+        engine.ctx().collect_garbage();
+        finish_action_sequence(&mut engine);
+        assert!(matches!(eval_value(&mut engine,"commandOrder.length===65 && commandOrder.every((value,index)=>value===index) && commandFailures.length===1 && commandFailures[0][0]===65 && commandFailures[0][1]==='QuotaExceededError' && !Reflect.ownKeys(queueState.slotOwner).includes(queueState.slotKey)"),Value::Bool(true)));
+        let bridge=bridge_for_current_realm(engine.ctx()).unwrap();
+        assert!(bridge.borrow().action_state.pending.is_empty());
+        assert!(!bridge.borrow().action_state.busy);
+        assert_eq!(case.unsupported_reason(),None);
     }
 
     #[test]
@@ -2454,9 +2704,28 @@ impl<'a> FromArg<'a, JsHost> for PointerCoordinates {
 }
 
 fn element_data(ctx: &mut Ctx, value: &Value) -> OpResult<(Rc<DomRealm>, NodeId)> {
-    ctx.with_instance::<DomElement, _>(value, |element| {
+    let (realm,node)=ctx.with_instance::<DomElement, _>(value, |element| {
         (element.base.realm.clone(), element.base.id)
-    })
+    })?;
+    validate_element_reference(&realm,node)?;
+    Ok((realm,node))
+}
+
+fn stale_element_error() -> OpError {
+    // WebDriver defines a protocol error code, not a JavaScript error class.
+    OpError::error("input element is no longer connected to its active document")
+        .with_code("stale element reference")
+}
+
+fn validate_element_reference(realm:&DomRealm,node:NodeId)->OpResult<()> {
+    if !realm.browsing_context().is_some_and(|context|browsing_context::is_active_document(&context,realm)) {
+        return Err(stale_element_error());
+    }
+    let session=realm.session.borrow();
+    if session.document().root_node(node,true).ok()!=Some(session.document().root()) {
+        return Err(stale_element_error());
+    }
+    Ok(())
 }
 
 fn click_target_contains_hit(realm: &Rc<DomRealm>, target: NodeId, hit: NodeId) -> bool {
@@ -2470,6 +2739,22 @@ fn click_target_contains_hit(realm: &Rc<DomRealm>, target: NodeId, hit: NodeId) 
         current = document.parent(node).ok().flatten();
     }
     false
+}
+
+#[lumen_bind::op(name = "delete_all_cookies")]
+fn delete_all_cookies(ctx: &mut Ctx, context: Value) -> Promise<Value> {
+    let result = (|| {
+        if !matches!(context, Value::Null | Value::Undefined) {
+            if let Some(bridge) = bridge_for_current_realm(ctx) {
+                bridge.borrow().case.record_unsupported(UNSUPPORTED_CONTEXT);
+            }
+            return Err(OpError::new("NotSupportedError", "cookie automation requires the caller context"));
+        }
+        let realm = window_globals::current_dom_realm(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "testdriver has no document"))?;
+        realm.delete_associated_cookies()
+    })();
+    Promise::ready(result.map(|()| Value::Undefined))
 }
 
 #[lumen_bind::op(name = "click")]
@@ -2488,20 +2773,21 @@ fn click(ctx: &mut Ctx, element: Value, coordinates: PointerCoordinates) -> Prom
             ));
         }
         let hit = geometry::element_from_point_in_tree(&realm, None, coordinates.x, coordinates.y)?;
-        if !hit.is_some_and(|hit| click_target_contains_hit(&realm, node, hit)) {
-            return Err(OpError::new(
-                "ElementClickInterceptedError",
+        let Some(hit) = hit.filter(|hit| click_target_contains_hit(&realm, node, *hit)) else {
+            return Err(OpError::error(
                 "testdriver click target is not the topmost hit-tested element",
-            ));
-        }
-        forms::trusted_pointer_click(ctx, &realm, node, coordinates.x, coordinates.y)
+            ).with_code("element click intercepted"));
+        };
+        // The requested element supplies the click point and interception
+        // boundary. Pointer actions dispatch to the element actually hit there.
+        forms::trusted_pointer_click(ctx, &realm, hit, coordinates.x, coordinates.y)
     })();
     Promise::ready(result.map(|()| Value::Undefined))
 }
 
 #[lumen_bind::op(name = "send_keys", coerce)]
 fn send_keys(ctx: &mut Ctx, element: Value, keys: String) -> Promise<Value> {
-    let result = (|| {
+    let admitted = (|| {
         let realm = window_globals::current_dom_realm(ctx)
             .ok_or_else(|| OpError::new("InvalidStateError", "testdriver has no document"))?;
         let (target_realm, node) = element_data(ctx, &element)?;
@@ -2514,6 +2800,16 @@ fn send_keys(ctx: &mut Ctx, element: Value, keys: String) -> Promise<Value> {
                 "native testdriver send_keys currently requires an element in its caller document",
             ));
         }
+        let sender=super::scheduling::task_sender(ctx)?;
+        Ok((Rc::downgrade(&realm),node,sender))
+    })();
+    let (realm,node,sender)=match admitted {Ok(admitted)=>admitted,Err(error)=>return Promise::rejected(error)};
+    let deferred=Deferred::new(ctx);
+    let promise=Promise::pending(&deferred);
+    if let Err(failure)=sender.queue(move |ctx| {
+        let result=(|| {
+        let realm=realm.upgrade().ok_or_else(stale_element_error)?;
+        validate_element_reference(&realm,node)?;
         match super::keyboard_automation::trusted_send_keys(ctx, &realm, node, &keys) {
             Ok(()) => Ok(()),
             Err(super::keyboard_automation::TrustedInputError::UnsupportedKey { .. }) => {
@@ -2527,6 +2823,9 @@ fn send_keys(ctx: &mut Ctx, element: Value, keys: String) -> Promise<Value> {
             }
             Err(super::keyboard_automation::TrustedInputError::Operation(error)) => Err(error),
         }
-    })();
-    Promise::ready(result.map(|()| Value::Undefined))
+        })();
+        match result {Ok(())=>deferred.resolve(ctx,Value::Undefined),Err(error)=>deferred.reject(ctx,error)};
+        Ok(())
+    }) {return Promise::rejected(failure.error);}
+    promise
 }

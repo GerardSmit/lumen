@@ -25,12 +25,15 @@ mod web;
 
 pub use form::{
     append_file, append_text, decode_multipart, encode_form_data, form_data_entries,
-    is_form_data, new_form_data, EncodedForm, FormBridge, FormEntry, FormFile, FormValue,
+    StoredFormValue, snapshot_form_value, restore_form_value, is_form_data, is_file, clone_form_data, append_form_data, append_file_value, new_form_data, EncodedForm, FormBridge, FormEntry, FormFile, FormValue,
 };
 pub use bridge::internals;
 pub use urls::{
     create_object_url, object_url_resource, resolve_object_url, revoke_object_url,
     set_object_url_limits, set_token_provider, ObjectUrlLimits, ObjectUrlResource,
+    set_object_url_environment_provider, revoke_object_urls_for_environment,
+    ObjectUrlEnvironment, ObjectUrlEnvironmentProvider, object_url_environment,
+    ensure_random_token_provider, object_url_resource_for_environment,
 };
 pub use web::bindings;
 pub use web::bindings::{Blob, File, FormData};

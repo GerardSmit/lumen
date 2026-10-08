@@ -99,12 +99,6 @@ fn remove_nulls(input: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
-fn element_local_name(name: &str) -> &str {
-    crate::xml::split_qname(name)
-        .map(|(_, local_name)| local_name)
-        .unwrap_or(name)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub offset: usize,
@@ -148,16 +142,7 @@ pub fn is_valid_custom_element_name(name: &str) -> bool {
     if !first.is_ascii_lowercase() || !name.contains('-') {
         return false;
     }
-    if !chars.all(|ch| {
-        let cp = ch as u32;
-        ch.is_ascii_lowercase()
-            || ch.is_ascii_digit()
-            || matches!(cp,
-                0x2D | 0x2E | 0x5F | 0xB7 | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x37D |
-                0x37F..=0x1FFF | 0x200C..=0x200D | 0x203F..=0x2040 | 0x2070..=0x218F |
-                0x2C00..=0x2FEF | 0x3001..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD |
-                0x10000..=0xEFFFF)
-    }) {
+    if chars.any(|ch| ch.is_ascii_uppercase()) || !crate::xml::is_valid_element_local_name(name) {
         return false;
     }
     ![
@@ -365,6 +350,24 @@ fn dom_error(offset: usize, value: DomError) -> ParseError {
             _ => "invalid document tree",
         },
     )
+}
+
+/// HTML tree construction's adjusted insertion guards are deliberately
+/// distinct from DOM insertion, which normally moves an already-parented node.
+pub fn insert_at_adjusted_location<D: crate::parser_documents::ParserDocument + ?Sized>(document: &mut D, parent: NodeId, element: NodeId, before: Option<NodeId>) -> Result<bool, DomError> {
+    if document.parent(element)?.is_some()
+        || document.is_host_including_inclusive_ancestor(element, parent)? {
+        return Ok(false);
+    }
+    if matches!(document.kind(parent)?, NodeKind::Document) {
+        let mut child = document.first_child(parent)?;
+        while let Some(node) = child {
+            if matches!(document.kind(node)?, NodeKind::Element { .. }) { return Ok(false); }
+            child = document.next_sibling(node)?;
+        }
+    }
+    document.insert_before(parent, element, before)?;
+    Ok(true)
 }
 
 struct ParsedDoctype {
@@ -739,6 +742,11 @@ fn starts_ascii_case_insensitive(input: &[u8], prefix: &[u8]) -> bool {
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
+fn create_html_element<D: crate::parser_documents::ParserDocument + ?Sized>(document: &mut D, name: impl Into<Name>, attributes: Vec<(Name, String)>) -> Result<NodeId, DomError> {
+    document.create_unprefixed_element(Namespace::Html, name.into(), attributes)
+}
+
+#[cfg(test)]
 fn element(name: impl Into<Name>, attributes: Vec<(Name, String)>) -> NodeKind {
     NodeKind::Element {
         namespace: Namespace::Html,
@@ -1451,40 +1459,207 @@ fn serializes_text_literally(name: &str) -> bool {
     )
 }
 
-fn serialize_into(
+fn serialization_name<'a>(document: &'a Document, id: NodeId, namespace: &Namespace, name: &'a str) -> Result<&'a str, DomError> {
+    if matches!(namespace, Namespace::Html | Namespace::Svg | Namespace::MathMl) && name.contains(':') {
+        Ok(document.element_name_parts(id)?.1)
+    } else {
+        Ok(name)
+    }
+}
+
+fn serialization_raw_text(document: &Document, name: &str) -> bool {
+    serializes_text_literally(name) || (name == "noscript" && document.scripting_enabled())
+}
+
+fn serialization_uses_template_contents(
     document: &Document,
+    id: NodeId,
+    name: &Name,
+) -> Result<bool, DomError> {
+    let qualified_name = name.as_str();
+    if qualified_name != "template" && !qualified_name.ends_with(":template") {
+        return Ok(false);
+    }
+    document.is_html_template(id)
+}
+
+enum SerializationStep {
+    Node(NodeId, bool, bool),
+    Children(NodeId, bool),
+    ShadowStart(NodeId, crate::ShadowOptions),
+    ShadowEnd,
+}
+
+enum SelectedShadowRoots<'a> {
+    None,
+    Borrowed(&'a [NodeId]),
+    SortedKeys(&'a [u128]),
+}
+
+impl SelectedShadowRoots<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Borrowed(roots) => roots.is_empty(),
+            Self::SortedKeys(keys) => keys.is_empty(),
+        }
+    }
+
+    fn contains(&self, root: NodeId) -> bool {
+        match self {
+            Self::None => false,
+            Self::Borrowed(roots) => roots.contains(&root),
+            Self::SortedKeys(keys) => keys.binary_search(&root.key()).is_ok(),
+        }
+    }
+}
+
+impl Default for SelectedShadowRoots<'_> {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Default)]
+struct ShadowSerialization<'a> {
+    serializable: bool,
+    selected: SelectedShadowRoots<'a>,
+}
+
+fn push_serialization_children<G: crate::graph::DocumentGraph>(
+    graph: &G,
+    id: NodeId,
+    template_contents: bool,
+    raw: bool,
+    shadows: &ShadowSerialization<'_>,
+    pending: &mut Vec<SerializationStep>,
+) -> Result<(), DomError> {
+    let owner = graph.read(id)?;
+    let document = &*owner;
+    let children_root = if template_contents {
+        document.template_content(id)?.unwrap_or(id)
+    } else {
+        id
+    };
+    if let Some(child) = graph.read(children_root)?.first_child(children_root)? {
+        pending.push(SerializationStep::Children(child, raw));
+    }
+    // The stack visits the synthetic template before the host's light children.
+    if shadows.serializable || !shadows.selected.is_empty() {
+        if let Some((root, options)) = document.shadow_root_with_options_for_valid_node(id) {
+            if (shadows.serializable && options.serializable) || shadows.selected.contains(root)
+            {
+                pending.push(SerializationStep::ShadowStart(root, options));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn serialize_into<G: crate::graph::DocumentGraph>(
+    graph: &G,
     root: NodeId,
     children_only: bool,
     output: &mut String,
+    shadows: &ShadowSerialization<'_>,
 ) -> Result<(), DomError> {
-    let mut pending = Vec::with_capacity(32);
-    output.reserve(256);
+    // Most Element/ShadowRoot.getHTML calls serialize only a few levels, and
+    // empty roots serialize nothing. Let the iterative depth stack grow only
+    // when needed instead of allocating 32 events for every call.
+    let mut pending = Vec::new();
+    let root_document = graph.read(root)?;
+    let document = &*root_document;
     if children_only {
-        if matches!(document.kind(root)?, NodeKind::Element { name, .. } if serializes_void(name.as_str()))
-        {
-            return Ok(());
-        }
-        let raw = matches!(document.kind(root)?, NodeKind::Element { name, .. } if serializes_text_literally(name.as_str()));
-        let mut child = document.last_child(document.template_content(root)?.unwrap_or(root))?;
-        while let Some(id) = child {
-            pending.push((id, false, raw));
-            child = document.previous_sibling(id)?;
-        }
+        let root_kind = document.kind(root)?;
+        let template_contents = match root_kind {
+            NodeKind::Element {
+                namespace: Namespace::Html,
+                name,
+                ..
+            } => {
+                if serializes_void(serialization_name(document, root, &Namespace::Html, name)?) {
+                    return Ok(());
+                }
+                serialization_uses_template_contents(document, root, name)?
+            }
+            _ => false,
+        };
+        let context = if matches!(root_kind, NodeKind::DocumentFragment) {
+            document.shadow_host(root)?.unwrap_or(root)
+        } else {
+            root
+        };
+        let raw = match document.kind(context)? {
+            NodeKind::Element { namespace: Namespace::Html, name, .. } =>
+                serialization_raw_text(document, serialization_name(document, context, &Namespace::Html, name)?),
+            _ => false,
+        };
+        push_serialization_children(
+            graph,
+            root,
+            template_contents,
+            raw,
+            shadows,
+            &mut pending,
+        )?;
     } else {
-        pending.push((root, false, false));
+        pending.push(SerializationStep::Node(root, false, false));
     }
-    while let Some((id, closing, raw_text)) = pending.pop() {
+    if !pending.is_empty() {
+        output.reserve(256);
+    }
+    while let Some(step) = pending.pop() {
+        let step_node = match &step {
+            SerializationStep::Node(id, ..) | SerializationStep::Children(id, ..) | SerializationStep::ShadowStart(id, ..) => Some(*id),
+            SerializationStep::ShadowEnd => None,
+        };
+        let step_document = step_node.map(|node| graph.read(node)).transpose()?;
+        let document = step_document.as_deref().unwrap_or(&*root_document);
+        let (id, closing, raw_text) = match step {
+            SerializationStep::Node(id, closing, raw) => (id, closing, raw),
+            SerializationStep::Children(id, raw) => {
+                if let Some(next) = document.next_sibling(id)? {
+                    pending.push(SerializationStep::Children(next, raw));
+                }
+                (id, false, raw)
+            }
+            SerializationStep::ShadowEnd => {
+                output.push_str("</template>");
+                continue;
+            }
+            SerializationStep::ShadowStart(root, options) => {
+                output.push_str("<template shadowrootmode=\"");
+                output.push_str(match options.mode { crate::ShadowMode::Open => "open", crate::ShadowMode::Closed => "closed" });
+                output.push('"');
+                for (enabled, attribute) in [
+                    (options.delegates_focus, " shadowrootdelegatesfocus=\"\""),
+                    (options.serializable, " shadowrootserializable=\"\""),
+                    (
+                        options.slot_assignment == crate::shadow::SlotAssignmentMode::Manual,
+                        " shadowrootslotassignment=\"manual\"",
+                    ),
+                    (options.clonable, " shadowrootclonable=\"\""),
+                ] {
+                    if enabled { output.push_str(attribute); }
+                }
+                output.push('>');
+                pending.push(SerializationStep::ShadowEnd);
+                push_serialization_children(graph, root, false, false, shadows, &mut pending)?;
+                continue;
+            }
+        };
         let kind = document.kind(id)?;
         if closing {
-            if let NodeKind::Element { name, .. } = kind {
+            if let NodeKind::Element { namespace, name, .. } = kind {
                 output.push_str("</");
-                output.push_str(name);
+                output.push_str(serialization_name(document, id, namespace, name)?);
                 output.push('>');
             }
             continue;
         }
         let mut descend = true;
         let mut child_raw = raw_text;
+        let mut template_contents = false;
         match kind {
             NodeKind::Document | NodeKind::DocumentFragment => {}
             // Attributes are serialized with their owning element, never as
@@ -1510,36 +1685,58 @@ fn serialize_into(
                 descend = false;
             }
             NodeKind::Element {
-                name, attributes, ..
+                namespace, name, attributes, ..
             } => {
+                template_contents = namespace == &Namespace::Html
+                    && serialization_uses_template_contents(document, id, name)?;
+                let name = serialization_name(document, id, namespace, name)?;
                 output.push('<');
                 output.push_str(name);
-                for (key, value) in attributes {
+                let namespaces = document.attribute_namespace_metadata(id);
+                if !attributes.iter().enumerate().any(|(index, (key, _))| key == "is" &&
+                    !namespaces.iter().any(|(known, _)| *known == index)) {
+                    if let Some(value) = document.custom_element_is_value(id)? {
+                        output.push_str(" is=\"");
+                        escape(output, value, true);
+                        output.push('"');
+                    }
+                }
+                for (index, (key, value)) in attributes.iter().enumerate() {
                     output.push(' ');
-                    output.push_str(key);
+                    let uri = namespaces.iter().find(|(known, _)| *known == index).map(|(_, uri)| uri.as_ref());
+                    let local = key.split_once(':').map_or(key.as_str(), |(_, local)| local);
+                    match uri {
+                        Some("http://www.w3.org/XML/1998/namespace") => {
+                            output.push_str("xml:");
+                            output.push_str(local);
+                        }
+                        Some("http://www.w3.org/2000/xmlns/") => {
+                            if local != "xmlns" { output.push_str("xmlns:"); }
+                            output.push_str(local);
+                        }
+                        Some("http://www.w3.org/1999/xlink") => {
+                            output.push_str("xlink:");
+                            output.push_str(local);
+                        }
+                        _ => output.push_str(key),
+                    }
                     output.push_str("=\"");
                     escape(output, value, true);
                     output.push('"');
                 }
                 output.push('>');
-                descend = !serializes_void(name.as_str());
-                child_raw = serializes_text_literally(name.as_str());
+                descend = namespace != &Namespace::Html || !serializes_void(name);
+                child_raw = namespace == &Namespace::Html && serialization_raw_text(document, name);
                 if descend {
-                    pending.push((id, true, raw_text));
+                    pending.push(SerializationStep::Node(id, true, raw_text));
                 }
             }
-            NodeKind::Text(value) => {
+            NodeKind::Text(value) | NodeKind::CData(value) => {
                 if raw_text {
                     output.push_str(value);
                 } else {
                     escape(output, value, false);
                 }
-                descend = false;
-            }
-            NodeKind::CData(value) => {
-                output.push_str("<![CDATA[");
-                output.push_str(value);
-                output.push_str("]]>");
                 descend = false;
             }
             NodeKind::Comment(value) => {
@@ -1558,25 +1755,59 @@ fn serialize_into(
             }
         }
         if descend {
-            let mut child = document.last_child(document.template_content(id)?.unwrap_or(id))?;
-            while let Some(next) = child {
-                pending.push((next, false, child_raw));
-                child = document.previous_sibling(next)?;
-            }
+            push_serialization_children(
+                graph,
+                id,
+                template_contents,
+                child_raw,
+                shadows,
+                &mut pending,
+            )?;
         }
     }
     Ok(())
 }
 
-pub fn outer_html(document: &Document, id: NodeId) -> Result<String, DomError> {
+pub fn outer_html(document: &Document, id: NodeId) -> Result<String, DomError> { outer_html_with_graph(document, id) }
+
+pub fn outer_html_with_graph<G: crate::graph::DocumentGraph>(graph: &G, id: NodeId) -> Result<String, DomError> {
     let mut output = String::new();
-    serialize_into(document, id, false, &mut output)?;
+    serialize_into(graph, id, false, &mut output, &ShadowSerialization::default())?;
     Ok(output)
 }
 
-pub fn inner_html(document: &Document, id: NodeId) -> Result<String, DomError> {
+pub fn inner_html(document: &Document, id: NodeId) -> Result<String, DomError> { inner_html_with_graph(document, id) }
+
+pub fn inner_html_with_graph<G: crate::graph::DocumentGraph>(graph: &G, id: NodeId) -> Result<String, DomError> {
     let mut output = String::new();
-    serialize_into(document, id, true, &mut output)?;
+    serialize_into(graph, id, true, &mut output, &ShadowSerialization::default())?;
+    Ok(output)
+}
+
+/// HTML fragment serialization with explicitly selected or serializable shadow trees.
+pub fn get_html(document: &Document, id: NodeId, serializable: bool, selected: &[NodeId]) -> Result<String, DomError> { get_html_with_graph(document, id, serializable, selected) }
+
+pub fn get_html_with_graph<G: crate::graph::DocumentGraph>(graph: &G, id: NodeId, serializable: bool, selected: &[NodeId]) -> Result<String, DomError> {
+    // The common API use is one or two explicitly selected roots. Check those
+    // directly; sorting a temporary key vector on every getHTML call is
+    // needless allocation. Keep logarithmic membership for unusually large
+    // lists so serialization stays bounded under hostile options.
+    let selected_keys = if selected.len() > 8 {
+        let mut keys = selected.iter().map(|root| root.key()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        Some(keys)
+    } else {
+        None
+    };
+    let selected_roots = match selected_keys.as_deref() {
+        Some(keys) => SelectedShadowRoots::SortedKeys(keys),
+        None if selected.is_empty() => SelectedShadowRoots::None,
+        None => SelectedShadowRoots::Borrowed(selected),
+    };
+    let shadows = ShadowSerialization { serializable, selected: selected_roots };
+    let mut output = String::new();
+    serialize_into(graph, id, true, &mut output, &shadows)?;
     Ok(output)
 }
 
@@ -1690,18 +1921,18 @@ impl HtmlDocumentParser {
         // processed by the ordinary document tree builder.
         document.set_document_mode(crate::DocumentMode::Quirks);
 
-        let html = document
-            .create(element("html", Vec::new()))
+        let html = create_html_element(document, "html", Vec::new())
             .map_err(|error| dom_error(0, error))?;
-        let head = document
-            .create(element("head", Vec::new()))
+        let head = create_html_element(document, "head", Vec::new())
             .map_err(|error| dom_error(0, error))?;
-        let body = document
-            .create(element("body", Vec::new()))
+        let body = create_html_element(document, "body", Vec::new())
             .map_err(|error| dom_error(0, error))?;
-        document.attach_detached(root, html);
-        document.attach_detached(html, head);
-        document.attach_detached(html, body);
+        document.set_node_document(html, root).map_err(|failure| dom_error(0, failure))?;
+        document.set_node_document(head, root).map_err(|failure| dom_error(0, failure))?;
+        document.set_node_document(body, root).map_err(|failure| dom_error(0, failure))?;
+        document.record_parser_element_birth(html, root, true).map_err(|failure| dom_error(0, failure))?;
+        document.record_parser_element_birth(head, html, true).map_err(|failure| dom_error(0, failure))?;
+        document.record_parser_element_birth(body, html, true).map_err(|failure| dom_error(0, failure))?;
 
         Ok((
             Self {
@@ -1724,16 +1955,16 @@ impl HtmlDocumentParser {
 
     /// Append a source chunk and synchronously construct every complete token
     /// while retaining unfinished tokenizer input for the next call.
-    pub fn write(&mut self, document: &mut Document, chunk: &str) -> Result<(), ParseError> {
+    pub fn write<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D, chunk: &str) -> Result<(), ParseError> {
         self.append_chunk(chunk, false)?;
         self.run_available(document, false, false).map(|_| ())
     }
 
     /// Append input and stop after the next parser-inserted HTML script end tag.
     /// The tree-builder state and unread input remain live for `resume_until_script`.
-    pub fn write_until_script(
+    pub fn write_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         chunk: &str,
     ) -> Result<Option<NodeId>, ParseError> {
         if self.paused_script.is_some() {
@@ -1747,11 +1978,17 @@ impl HtmlDocumentParser {
         Ok(script)
     }
 
+    pub fn write_final_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D, chunk: &str) -> Result<Option<NodeId>, ParseError> {
+        self.append_chunk(chunk, false)?;
+        self.request_close()?;
+        self.parse_until_script(document)
+    }
+
     /// Append all Web IDL `document.write()` arguments before parsing them as
     /// one source sequence, yielding at each parser-script boundary.
-    pub fn write_parts_until_script(
+    pub fn write_parts_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         chunks: &[String],
         append_newline: bool,
     ) -> Result<Option<NodeId>, ParseError> {
@@ -1770,22 +2007,22 @@ impl HtmlDocumentParser {
         self.parse_until_script(document)
     }
 
-    fn parse_until_script(
+    fn parse_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
     ) -> Result<Option<NodeId>, ParseError> {
         let script = self.run_available(document, self.finish_requested, true)?;
         self.pause_at_script(script);
-        if self.finish_requested && script.is_none() {
+        if self.finish_requested && script.is_none() && self.pending_element().is_none() {
             self.closed = true;
         }
         Ok(script)
     }
 
     /// Resume after the embedder has prepared the yielded parser script.
-    pub fn resume_until_script(
+    pub fn resume_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
     ) -> Result<Option<NodeId>, ParseError> {
         let Some(finished_script) = self.paused_script.take() else {
             return Err(error(
@@ -1805,7 +2042,7 @@ impl HtmlDocumentParser {
         let final_input = self.finish_requested;
         let script = self.run_available(document, final_input, true)?;
         self.pause_at_script(script);
-        if final_input && script.is_none() {
+        if final_input && script.is_none() && self.pending_element().is_none() {
             self.closed = true;
         }
         Ok(script)
@@ -1827,9 +2064,9 @@ impl HtmlDocumentParser {
     /// only the inserted source before returning. Any parser scripts in that
     /// source are yielded to the embedder; the currently executing script is
     /// restored as the paused parser owner when the inserted region is done.
-    pub fn write_at_script_position_until_script(
+    pub fn write_at_script_position_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         writer_script: NodeId,
         chunks: &[String],
         append_newline: bool,
@@ -1877,9 +2114,9 @@ impl HtmlDocumentParser {
     /// Continue parsing an inserted write region after the yielded nested
     /// parser script finishes. When the region is exhausted, restore its
     /// caller's still-running parser script without consuming the outer tail.
-    pub fn resume_insertion_until_script(
+    pub fn resume_insertion_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         finished_script: NodeId,
         parent_script: NodeId,
     ) -> Result<Option<NodeId>, ParseError> {
@@ -1997,6 +2234,141 @@ impl HtmlDocumentParser {
 
     pub fn is_finishing(&self) -> bool {
         self.finish_requested
+    }
+
+    pub fn pending_element(&self) -> Option<NodeId> {
+        self.state.as_ref()?.pending_element.as_ref().map(|pending| pending.node)
+    }
+
+    pub fn pending_element_context(&self) -> Option<NodeId> {
+        let pending = self.state.as_ref()?.pending_element.as_ref()?;
+        pending.insertion.map(|(parent, _)| parent).or_else(|| pending.declarative.map(|(host, _)| host))
+    }
+
+    pub fn replace_pending_element(&mut self, replacement: NodeId) {
+        let state = self.state.as_mut().expect("parser state between feeds");
+        let old = state.pending_element.as_mut().expect("pending element creation").node;
+        state.pending_element.as_mut().unwrap().node = replacement;
+        for open in state.stack.iter_mut().chain(state.formatting.iter_mut().flatten()) {
+            if open.id == old { open.id = replacement; }
+        }
+        if state.html == Some(old) { state.html = Some(replacement); }
+        if state.head == Some(old) { state.head = Some(replacement); }
+        if state.body == old { state.body = replacement; }
+        if state.form_element == Some(old) { state.form_element = Some(replacement); }
+        for select in &mut state.custom_selects { if *select == old { *select = replacement; } }
+        for (template, root) in &mut state.declarative_roots {
+            if *template == old { *template = replacement; }
+            if *root == old { *root = replacement; }
+        }
+    }
+
+    pub fn append_pending_element_attributes<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D) -> Result<(), ParseError> {
+        let state = self.state.as_mut().expect("parser state between feeds");
+        let pending = state.pending_element.as_mut().expect("pending element creation");
+        for (name, value) in core::mem::take(&mut pending.attributes) {
+            document.set_attribute(pending.node, name.as_str(), &value).map_err(|failure| dom_error(state.pos, failure))?;
+        }
+        Ok(())
+    }
+
+    pub fn insert_pending_element<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D) -> Result<(), ParseError> {
+        let result=(|| {
+        let state = self.state.as_mut().expect("parser state between feeds");
+        let pending = state.pending_element.take().expect("pending element creation");
+        let mut shadow = None;
+        if let Some((host, options)) = pending.declarative {
+            shadow = match document.attach_shadow_with_options(host, options) {
+                Ok(root) => Some(root),
+                Err(DomError::WrongKind | DomError::Hierarchy) => None,
+                Err(failure) => return Err(dom_error(state.pos, failure)),
+            };
+        }
+        if let Some(form) = pending.parser_form {
+            // Token construction reactions run before the form-pointer step.
+            // Recheck the actual intended parent's tree after those reactions;
+            // the detached constructed element can have another node document.
+            let same_tree=if let Some((parent,_))=pending.insertion {
+                document.root_node(parent,false).map_err(|failure|dom_error(state.pos,failure))?
+                    ==document.root_node(form,false).map_err(|failure|dom_error(state.pos,failure))?
+            }else {false};
+            if same_tree && document.get_attribute_ns_ref(pending.node, None, "form").map_err(|failure| dom_error(state.pos, failure))?.is_none() {
+                document.associate_parser_form(pending.node, form).map_err(|failure| dom_error(state.pos, failure))?;
+            }
+        }
+        if let Some(root) = shadow {
+            state.declarative_roots.push((pending.node, root));
+        } else if let Some((parent, before)) = pending.insertion {
+            insert_at_adjusted_location(document, parent, pending.node, before).map_err(|failure| dom_error(state.pos, failure))?;
+        }
+        Ok(())
+        })();
+        // Construction reactions can move this detached element to another
+        // arena. Commit every parser identity before the borrowed view's
+        // operation-local adoption aliases are released, including failures.
+        self.project_retained_nodes(|node|document.current_node(node));
+        result
+    }
+
+    pub fn resume_after_pending_element<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D) -> Result<Option<NodeId>, ParseError> {
+        if let Some(frame) = self.insertion_frames.last() {
+            let writer = frame.writer;
+            let end = frame.end;
+            self.paused_script = None;
+            let script = self.run_available_limited(document, false, true, Some(end))?;
+            if script.is_some() { self.flush_pending_insertion_cr()?; }
+            self.pause_at_script(Some(script.unwrap_or(writer)));
+            if script.is_none() { self.insertion_cursor = self.insertion_frame_end(writer); }
+            return Ok(script);
+        }
+        self.parse_until_script(document)
+    }
+
+    pub fn finish_pending_element<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D) -> Result<Option<NodeId>, ParseError> {
+        self.insert_pending_element(document)?;
+        self.resume_after_pending_element(document)
+    }
+
+    /// Native owners retain the live tree-builder identities across author
+    /// script and garbage collection, including detached open elements.
+    pub fn has_open_element(&self, node: NodeId) -> bool {
+        self.state.as_ref().is_some_and(|state| state.stack.iter().any(|open| open.id == node))
+    }
+
+    pub fn visit_retained_nodes(&self, mut visit: impl FnMut(NodeId)) {
+        if let Some(state) = &self.state {
+            for node in state.html.into_iter().chain(state.head).chain(core::iter::once(state.body)) {
+                visit(node);
+            }
+            for open in state.stack.iter().chain(state.formatting.iter().flatten()) {
+                visit(open.id);
+            }
+            for &(template, root) in &state.declarative_roots {
+                visit(template);
+                visit(root);
+            }
+            for &select in &state.custom_selects { visit(select); }
+            if let Some(pending) = &state.pending_element {
+                visit(pending.node);
+                if let Some(form)=pending.parser_form {visit(form);}
+                if let Some((parent,before))=pending.insertion {visit(parent);if let Some(before)=before {visit(before);}}
+                if let Some((host,_))=pending.declarative {visit(host);}
+            }
+            for node in state.form_element.into_iter().chain(state.fragment_context_node).chain(state.fragment_registry_target) {visit(node);}
+        }
+        if let Some(script) = self.paused_script { visit(script); }
+        for frame in &self.insertion_frames { visit(frame.writer); }
+    }
+
+    /// Project retained tree-builder identities after a real DOM adoption.
+    /// Tag/tokenizer state remains unchanged; the parser resumes in the actual
+    /// current node document instead of inventing end tags or closing scopes.
+    pub fn project_retained_nodes(&mut self, mut project: impl FnMut(NodeId)->NodeId) {
+        if let Some(state)=&mut self.state {
+            state.project_nodes(&mut project);
+        }
+        self.paused_script=self.paused_script.map(&mut project);
+        for frame in &mut self.insertion_frames {frame.writer=project(frame.writer);}
     }
 
     fn pause_at_script(&mut self, script: Option<NodeId>) {
@@ -2155,7 +2527,7 @@ impl HtmlDocumentParser {
 
     /// Finish the current stream. Incomplete tokenizer states are resolved by
     /// the same EOF rules as ordinary HTML document parsing.
-    pub fn close(&mut self, document: &mut Document) -> Result<(), ParseError> {
+    pub fn close<D: crate::parser_documents::ParserDocument + ?Sized>(&mut self, document: &mut D) -> Result<(), ParseError> {
         if self.closed {
             return Ok(());
         }
@@ -2169,9 +2541,9 @@ impl HtmlDocumentParser {
 
     /// Request EOF and yield parser-inserted scripts one at a time. Reentrant
     /// `close()` calls set the EOF flag and return until the active script exits.
-    pub fn finish_until_script(
+    pub fn finish_until_script<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
     ) -> Result<Option<NodeId>, ParseError> {
         if self.closed {
             return Ok(None);
@@ -2190,18 +2562,18 @@ impl HtmlDocumentParser {
         Ok(script)
     }
 
-    fn run_available(
+    fn run_available<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         final_input: bool,
         stop_after_script: bool,
     ) -> Result<Option<NodeId>, ParseError> {
         self.run_available_limited(document, final_input, stop_after_script, None)
     }
 
-    fn run_available_limited(
+    fn run_available_limited<D: crate::parser_documents::ParserDocument + ?Sized>(
         &mut self,
-        document: &mut Document,
+        document: &mut D,
         final_input: bool,
         stop_after_script: bool,
         max_end: Option<usize>,
@@ -2231,7 +2603,8 @@ impl HtmlDocumentParser {
             self.state = Some(parser.state);
             result.map(|()| yielded_script)
         };
-        let result = result.map_err(|mut parse_error| {
+        self.project_retained_nodes(|node|document.current_node(node));
+        let result = result.map(|script|script.map(|node|document.current_node(node))).map_err(|mut parse_error| {
             parse_error.offset = self.source_base.saturating_add(parse_error.offset);
             parse_error
         })?;
@@ -2293,7 +2666,7 @@ fn normalize_stream_chunk(chunk: &str, mut pending_cr: bool) -> Result<(String, 
 /// The tree builder only sees this prefix, so a tag, character reference, or
 /// raw-text end tag split across `document.write()` calls cannot be consumed
 /// as EOF and then reparsed with different node identities.
-fn incremental_safe_prefix(input: &str, state: &ParserState, document: &Document) -> usize {
+fn incremental_safe_prefix<D: crate::parser_documents::ParserDocument + ?Sized>(input: &str, state: &ParserState, document: &D) -> usize {
     let bytes = input.as_bytes();
     let mut cursor = state.pos.min(bytes.len());
 
@@ -2583,14 +2956,11 @@ pub fn tokenize_for_conformance(
     let input = normalized_input(input);
     let mut document = Document::new(input.len().saturating_add(4));
     let root = document.root();
-    let html = document
-        .create(element("html", Vec::new()))
+    let html = create_html_element(&mut document, "html", Vec::new())
         .map_err(|e| dom_error(0, e))?;
-    let head = document
-        .create(element("head", Vec::new()))
+    let head = create_html_element(&mut document, "head", Vec::new())
         .map_err(|e| dom_error(0, e))?;
-    let body = document
-        .create(element("body", Vec::new()))
+    let body = create_html_element(&mut document, "body", Vec::new())
         .map_err(|e| dom_error(0, e))?;
     document.attach_detached(root, html);
     document.attach_detached(html, head);
@@ -2603,6 +2973,8 @@ pub fn tokenize_for_conformance(
             html: Some(html),
             head: Some(head),
             body,
+            scaffold_attached: 7,
+            pending_element: None,
             stack: Vec::with_capacity(32),
             formatting: Vec::new(),
             scratch: Vec::new(),
@@ -2614,6 +2986,8 @@ pub fn tokenize_for_conformance(
             custom_selects: Vec::new(),
             fragment_context: None,
             fragment_context_kind: None,
+            fragment_context_node: None,
+            fragment_registry_target: None,
             fragment_text_mode: None,
             form_element: None,
             conformance_tokens: Some(Vec::new()),
@@ -2636,7 +3010,7 @@ pub fn tokenize_for_conformance(
 
 /// Parse a detached fragment in an existing arena for template reuse.
 pub fn parse_fragment(document: &mut Document, input: &str) -> Result<NodeId, ParseError> {
-    parse_fragment_context(document, input, None, None)
+    parse_fragment_context(document, input, None, None, None, None, false)
 }
 
 /// Parse markup using the tokenizer and table context of an HTML element.
@@ -2645,9 +3019,38 @@ pub fn parse_fragment_in(
     context: NodeId,
     input: &str,
 ) -> Result<NodeId, ParseError> {
-    let kind = document.kind(context).map_err(|e| dom_error(0, e))?.clone();
+    parse_fragment_in_with_declarative_shadow_roots(document, context, input, false)
+}
+
+/// Use the same fragment parser with explicit declarative-shadow-root admission.
+/// Ordinary markup setters keep the default opt-out above.
+pub fn parse_fragment_in_with_declarative_shadow_roots(
+    document: &mut Document,
+    context: NodeId,
+    input: &str,
+    allow_declarative_shadow_roots: bool,
+) -> Result<NodeId, ParseError> {
+    parse_fragment_for_target(document,context,context,input,allow_declarative_shadow_roots)
+}
+
+/// Preserve the registry target when a shadow host supplies tokenizer context.
+pub fn parse_fragment_for_target(
+    document: &mut Document,
+    context: NodeId,
+    registry_target: NodeId,
+    input: &str,
+    allow_declarative_shadow_roots: bool,
+) -> Result<NodeId, ParseError> {
+    let mut kind = document.kind(context).map_err(|e| dom_error(0, e))?.clone();
     if !matches!(&kind, NodeKind::Element { .. }) {
         return Err(error(0, "fragment context must be an element"));
+    }
+    // Fragment parser state needs the DOM local name, not the lexical qualified name.
+    // The context itself is never inserted into the result. Reuse an existing Name when
+    // it is already local; only qualified contexts need an adjusted interned name.
+    if let NodeKind::Element { name, .. } = &mut kind {
+        let (prefix, local) = document.element_name_parts(context).map_err(|e| dom_error(0, e))?;
+        if prefix.is_some() { *name = Name::new(local); }
     }
     let mut ancestor = Some(context);
     let mut form_element = None;
@@ -2656,23 +3059,25 @@ pub fn parse_fragment_in(
             document.kind(id),
             Ok(NodeKind::Element {
                 namespace: Namespace::Html,
-                name,
                 ..
-            }) if element_local_name(name.as_str()) == "form"
+            }) if document.element_name_parts(id).is_ok_and(|(_, local)| local == "form")
         ) {
             form_element = Some(id);
             break;
         }
         ancestor = document.parent(id).map_err(|error| dom_error(0, error))?;
     }
-    parse_fragment_context(document, input, Some(kind), form_element)
+    parse_fragment_context(document, input, Some(kind), Some(context), Some(registry_target), form_element, allow_declarative_shadow_roots)
 }
 
 fn parse_fragment_context(
     document: &mut Document,
     input: &str,
     context: Option<NodeKind>,
+    context_node: Option<NodeId>,
+    registry_target: Option<NodeId>,
     form_element: Option<NodeId>,
+    allow_declarative_shadow_roots: bool,
 ) -> Result<NodeId, ParseError> {
     if input.len() > MAX_HTML_BYTES {
         return Err(error(0, "HTML input too large"));
@@ -2686,7 +3091,7 @@ fn parse_fragment_context(
             namespace: Namespace::Html,
             name,
             ..
-        }) => Tag::classify(element_local_name(name)),
+        }) => Tag::classify(name),
         _ => Tag::Other,
     };
     let fragment_context = context.as_ref().map(|_| context_tag);
@@ -2695,7 +3100,7 @@ fn parse_fragment_context(
             namespace: Namespace::Html,
             name,
             ..
-        }) => match element_local_name(name) {
+        }) => match name.as_str() {
             "title" | "textarea" => Some(true),
             "style" | "script" | "iframe" | "xmp" | "noembed" | "noframes" | "plaintext" => {
                 Some(false)
@@ -2717,7 +3122,7 @@ fn parse_fragment_context(
     // as html5lib's fragment tree. Other contexts contribute only parser state
     // and are never inserted into the returned fragment.
     if fragment_context == Some(Tag::Html) {
-        let head_id = match document.create(element("head", Vec::new())) {
+        let head_id = match create_html_element(document, "head", Vec::new()) {
             Ok(id) => id,
             Err(error) => {
                 document
@@ -2726,8 +3131,10 @@ fn parse_fragment_context(
                 return Err(dom_error(0, error));
             }
         };
+        document.record_parser_element_birth(head_id, registry_target.unwrap_or(fragment), false)
+            .map_err(|failure| dom_error(0, failure))?;
         document.attach_detached(fragment, head_id);
-        let body_id = match document.create(element("body", Vec::new())) {
+        let body_id = match create_html_element(document, "body", Vec::new()) {
             Ok(id) => id,
             Err(error) => {
                 document
@@ -2736,6 +3143,8 @@ fn parse_fragment_context(
                 return Err(dom_error(0, error));
             }
         };
+        document.record_parser_element_birth(body_id, registry_target.unwrap_or(fragment), false)
+            .map_err(|failure| dom_error(0, failure))?;
         document.attach_detached(fragment, body_id);
         head = Some(head_id);
         body = body_id;
@@ -2748,6 +3157,8 @@ fn parse_fragment_context(
             html: None,
             head,
             body,
+            scaffold_attached: 7,
+            pending_element: None,
             stack,
             formatting: Vec::new(),
             scratch: Vec::new(),
@@ -2758,7 +3169,7 @@ fn parse_fragment_context(
             },
             declarative_roots: Vec::new(),
             declarative_cleanup_pending: false,
-            allow_declarative_shadow_roots: false,
+            allow_declarative_shadow_roots,
             scripting_enabled,
             custom_selects: Vec::new(),
             // A detached fragment has no context element. Treating `Other` as a
@@ -2766,6 +3177,8 @@ fn parse_fragment_context(
             // to close (for example, sibling `<slot>` elements).
             fragment_context,
             fragment_context_kind: context.clone(),
+            fragment_context_node: context_node,
+            fragment_registry_target: registry_target,
             fragment_text_mode,
             form_element,
             conformance_tokens: None,
@@ -2811,13 +3224,21 @@ enum TemplateMode {
     InBody,
 }
 
-struct Parser<'a, 'd> {
+struct Parser<'a, 'd, D: crate::parser_documents::ParserDocument + ?Sized> {
     input: &'a str,
-    document: &'d mut Document,
+    document: &'d mut D,
     state: ParserState,
     final_input: bool,
     stop_after_script: bool,
     yielded_script: Option<NodeId>,
+}
+
+struct PendingElement {
+    parser_form: Option<NodeId>,
+    node: NodeId,
+    attributes: Vec<(Name, String)>,
+    insertion: Option<(NodeId, Option<NodeId>)>,
+    declarative: Option<(NodeId, crate::shadow::ShadowOptions)>,
 }
 
 struct ParserState {
@@ -2825,6 +3246,8 @@ struct ParserState {
     html: Option<NodeId>,
     head: Option<NodeId>,
     body: NodeId,
+    scaffold_attached: u8,
+    pending_element: Option<PendingElement>,
     stack: Vec<Open>,
     formatting: Vec<Option<Open>>,
     scratch: Vec<(Name, String)>,
@@ -2841,6 +3264,8 @@ struct ParserState {
     // returned fragment while still using its namespace and integration-point
     // state as the adjusted current node.
     fragment_context_kind: Option<NodeKind>,
+    fragment_context_node: Option<NodeId>,
+    fragment_registry_target: Option<NodeId>,
     // Some(true) is RCDATA; Some(false) is raw text/script/plaintext.
     // Fragment parsing has no appropriate end-tag token, so this mode lasts
     // through EOF even if the input contains a matching context end tag.
@@ -2859,12 +3284,28 @@ struct ParserState {
 }
 
 impl ParserState {
+    fn project_nodes(&mut self,mut project:impl FnMut(NodeId)->NodeId) {
+            self.html=self.html.map(&mut project);self.head=self.head.map(&mut project);self.body=project(self.body);
+            for open in self.stack.iter_mut().chain(self.formatting.iter_mut().flatten()) {open.id=project(open.id);}
+            for (template,root) in &mut self.declarative_roots {*template=project(*template);*root=project(*root);}
+            for select in &mut self.custom_selects {*select=project(*select);}
+            self.form_element=self.form_element.map(&mut project);
+            self.fragment_context_node=self.fragment_context_node.map(&mut project);
+            self.fragment_registry_target=self.fragment_registry_target.map(&mut project);
+            if let Some(pending)=&mut self.pending_element {
+                pending.node=project(pending.node);pending.parser_form=pending.parser_form.map(&mut project);
+                pending.insertion=pending.insertion.map(|(parent,before)|(project(parent),before.map(&mut project)));
+                pending.declarative=pending.declarative.map(|(host,options)|(project(host),options));
+            }
+    }
     fn document(html: NodeId, head: NodeId, body: NodeId, options: ParseOptions) -> Self {
         Self {
             pos: 0,
             html: Some(html),
             head: Some(head),
             body,
+            scaffold_attached: 0,
+            pending_element: None,
             stack: Vec::with_capacity(32),
             formatting: Vec::new(),
             scratch: Vec::new(),
@@ -2876,6 +3317,8 @@ impl ParserState {
             custom_selects: Vec::new(),
             fragment_context: None,
             fragment_context_kind: None,
+            fragment_context_node: None,
+            fragment_registry_target: None,
             fragment_text_mode: None,
             form_element: None,
             conformance_tokens: None,
@@ -2891,7 +3334,7 @@ impl ParserState {
     }
 }
 
-impl core::ops::Deref for Parser<'_, '_> {
+impl<D: crate::parser_documents::ParserDocument + ?Sized> core::ops::Deref for Parser<'_, '_, D> {
     type Target = ParserState;
 
     fn deref(&self) -> &Self::Target {
@@ -2899,13 +3342,73 @@ impl core::ops::Deref for Parser<'_, '_> {
     }
 }
 
-impl core::ops::DerefMut for Parser<'_, '_> {
+impl<D: crate::parser_documents::ParserDocument + ?Sized> core::ops::DerefMut for Parser<'_, '_, D> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.state
     }
 }
 
-impl<'a> Parser<'a, '_> {
+impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> {
+    fn pop_open_element(&mut self) -> Option<Open> {
+        let open = self.stack.pop()?;
+        self.document.record_parser_element_completion(open.id);
+        Some(open)
+    }
+
+    fn remove_open_element(&mut self, index: usize) -> Open {
+        let open = self.stack.remove(index);
+        self.document.record_parser_element_completion(open.id);
+        open
+    }
+
+    fn truncate_open_elements(&mut self, length: usize) {
+        while self.stack.len() > length { self.pop_open_element(); }
+    }
+
+    fn registry_context(&self,parent:NodeId)->NodeId {
+        if self.fragment_context.is_some() && self.stack.first().is_some_and(|open|open.id==parent) {
+            self.fragment_registry_target.unwrap_or(parent)
+        } else {parent}
+    }
+    fn insert_token_element(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) -> Result<(), ParseError> {
+        self.ensure_scaffold(parent)?;
+        if self.pending_element.as_ref().is_some_and(|pending| pending.node == node) {
+            let owner = self.document.node_document(parent).map_err(|failure| dom_error(self.pos, failure))?;
+            self.document.set_node_document(node, owner).map_err(|failure| dom_error(self.pos, failure))?;
+            self.pending_element.as_mut().unwrap().insertion = Some((parent, before));
+            return Ok(());
+        }
+        insert_at_adjusted_location(self.document, parent, node, before).map(|_| ()).map_err(|failure| dom_error(self.pos, failure))
+    }
+
+    fn ensure_scaffold(&mut self, parent: NodeId) -> Result<(), ParseError> {
+        let Some(html) = self.html else { return Ok(()); };
+        if parent != html && Some(parent) != self.head && parent != self.body { return Ok(()); }
+        if self.scaffold_attached & 1 == 0 {
+            let root = self.document.root();
+            if self.pending_element.as_ref().is_some_and(|pending| pending.node == html) {
+                self.pending_element.as_mut().unwrap().insertion = Some((root, None));
+            } else { insert_at_adjusted_location(self.document, root, html, None).map_err(|e| dom_error(self.pos, e))?; }
+            self.scaffold_attached |= 1;
+        }
+        if Some(parent) == self.head || parent == self.body {
+            if self.scaffold_attached & 2 == 0 {
+                if let Some(head) = self.head {
+                    if self.pending_element.as_ref().is_some_and(|pending| pending.node == head) {
+                        self.pending_element.as_mut().unwrap().insertion = Some((html, None));
+                    } else { insert_at_adjusted_location(self.document, html, head, None).map_err(|e| dom_error(self.pos, e))?; }
+                }
+                self.scaffold_attached |= 2;
+            }
+        }
+        if parent == self.body && self.scaffold_attached & 4 == 0 {
+            if self.pending_element.as_ref().is_some_and(|pending| pending.node == parent) {
+                self.pending_element.as_mut().unwrap().insertion = Some((html, None));
+            } else { insert_at_adjusted_location(self.document, html, parent, None).map_err(|e| dom_error(self.pos, e))?; }
+            self.scaffold_attached |= 4;
+        }
+        Ok(())
+    }
     fn emit_conformance_token(&mut self, token: ConformanceToken) {
         let Some(tokens) = &mut self.conformance_tokens else {
             return;
@@ -3020,12 +3523,10 @@ impl<'a> Parser<'a, '_> {
         }
         while index < self.formatting.len() {
             let old = self.formatting[index].unwrap();
-            let id = self
-                .document
-                .clone_shallow(old.id)
-                .map_err(|e| dom_error(self.pos, e))?;
             let (parent, before) = self.insertion_location(self.parent(), self.parent_tag());
-            self.document.insert_detached_before(parent, id, before);
+            let id = self.document.clone_shallow_at(parent, old.id).map_err(|e|dom_error(self.pos,e))?;
+            self.document.record_parser_element_birth(id, self.registry_context(parent), self.html.is_some()).map_err(|e| dom_error(self.pos, e))?;
+            self.ensure_scaffold(parent)?; self.document.insert_before(parent, id, before).map_err(|e| dom_error(self.pos, e))?;
             let open = Open { id, tag: old.tag };
             self.stack.push(open);
             self.formatting[index] = Some(open);
@@ -3064,7 +3565,7 @@ impl<'a> Parser<'a, '_> {
                 .position(|node| node.tag.is_special())
                 .map(|position| open + 1 + position);
             let Some(block) = block else {
-                self.stack.truncate(open);
+                self.truncate_open_elements(open);
                 self.formatting.remove(index);
                 return Ok(());
             };
@@ -3094,14 +3595,15 @@ impl<'a> Parser<'a, '_> {
                     active
                 };
                 let Some(active) = active else {
-                    self.stack.remove(position);
+                    self.remove_open_element(position);
                     continue;
                 };
                 let copy = self
                     .document
-                    .clone_shallow(node.id)
+                    .clone_shallow_at(ancestor, node.id)
                     .map_err(|e| dom_error(self.pos, e))?;
-                self.append(ancestor, copy);
+                self.document.record_parser_element_birth(copy, self.registry_context(ancestor), self.html.is_some()).map_err(|e| dom_error(self.pos, e))?;
+                self.append(ancestor, copy)?;
                 let copied = Open {
                     id: copy,
                     tag: node.tag,
@@ -3114,18 +3616,19 @@ impl<'a> Parser<'a, '_> {
                 self.document
                     .detach(last)
                     .map_err(|e| dom_error(self.pos, e))?;
-                self.append(copy, last);
+                self.append(copy, last)?;
                 last = copy;
             }
             self.document
                 .detach(last)
                 .map_err(|e| dom_error(self.pos, e))?;
             let (parent, before) = self.insertion_location(ancestor, ancestor_tag);
-            self.document.insert_detached_before(parent, last, before);
+            self.ensure_scaffold(parent)?; self.document.insert_before(parent, last, before).map_err(|e| dom_error(self.pos, e))?;
             let copy = self
                 .document
-                .clone_shallow(id)
+                .clone_shallow_at(furthest, id)
                 .map_err(|e| dom_error(self.pos, e))?;
+            self.document.record_parser_element_birth(copy, self.registry_context(furthest), self.html.is_some()).map_err(|e| dom_error(self.pos, e))?;
             while let Some(child) = self
                 .document
                 .first_child(furthest)
@@ -3134,9 +3637,9 @@ impl<'a> Parser<'a, '_> {
                 self.document
                     .detach(child)
                     .map_err(|e| dom_error(self.pos, e))?;
-                self.append(copy, child);
+                self.append(copy, child)?;
             }
-            self.append(furthest, copy);
+            self.append(furthest, copy)?;
             let active = self
                 .formatting
                 .iter()
@@ -3148,7 +3651,7 @@ impl<'a> Parser<'a, '_> {
             }
             let copied = Open { id: copy, tag };
             self.formatting.insert(bookmark, Some(copied));
-            self.stack.remove(open);
+            self.remove_open_element(open);
             let block = self
                 .stack
                 .iter()
@@ -3182,7 +3685,7 @@ impl<'a> Parser<'a, '_> {
             self.formatting.remove(index);
         }
         if let Some(index) = self.stack.iter().position(|entry| entry.id == open.id) {
-            self.stack.remove(index);
+            self.remove_open_element(index);
         }
         Ok(())
     }
@@ -3323,21 +3826,18 @@ impl<'a> Parser<'a, '_> {
                 (Name::new(adjusted), value)
             })
             .collect();
+        let (parent, before) = self.insertion_location(self.parent(), self.parent_tag());
         let id = self
             .document
-            .create(NodeKind::Element {
-                namespace,
-                name: Name::new(element_name),
-                attributes,
-            })
+            .create_unprefixed_at(parent, namespace, Name::new(element_name), attributes)
             .map_err(|e| dom_error(offset, e))?;
         for (name, uri) in foreign_namespaces {
             self.document
                 .set_attribute_namespace_metadata(id, &name, Some(uri))
                 .map_err(|e| dom_error(offset, e))?;
         }
-        let (parent, before) = self.insertion_location(self.parent(), self.parent_tag());
-        self.document.insert_detached_before(parent, id, before);
+        self.document.record_parser_element_birth(id, self.registry_context(parent), self.html.is_some()).map_err(|e| dom_error(offset, e))?;
+        self.ensure_scaffold(parent)?; self.document.insert_before(parent, id, before).map_err(|e| dom_error(self.pos, e))?;
         if !self_closing {
             // Foreign elements do not participate in HTML insertion modes or the
             // active formatting list, even when their local name resembles one.
@@ -3411,7 +3911,7 @@ impl<'a> Parser<'a, '_> {
             {
                 break;
             }
-            self.stack.pop();
+            self.pop_open_element();
         }
     }
 
@@ -3617,57 +4117,31 @@ impl<'a> Parser<'a, '_> {
         }
     }
 
-    fn append(&mut self, parent: NodeId, child: NodeId) {
+    fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), ParseError> {
         let parent = self.template_content(parent).unwrap_or(parent);
-        self.document.attach_detached(parent, child);
+        self.ensure_scaffold(parent)?;
+        self.document.append(parent, child).map_err(|e| dom_error(self.pos, e))
     }
 
-    fn append_comment(&mut self, child: NodeId, offset: usize) -> Result<(), ParseError> {
-        if let Some(html) = self.html.filter(|_| self.document_tail != 0) {
-            let parent = if self.document_tail == 3 {
-                self.document.root()
-            } else {
-                html
-            };
-            let before = if self.document_tail == 1 {
-                Some(self.body)
-            } else {
-                None
-            };
-            self.document
-                .insert_before(parent, child, before)
-                .map_err(|error| dom_error(offset, error))?;
-        } else if let Some(html) = self
-            .html
-            .filter(|_| self.after_head && self.stack.is_empty())
-        {
-            self.document
-                .insert_before(html, child, Some(self.body))
-                .map_err(|error| dom_error(offset, error))?;
-        } else if self.html.is_none()
-            && self.fragment_context == Some(Tag::Html)
-            && self.document_tail == 3
-            && self.stack.len() == 1
-        {
-            self.document
-                .insert_before(self.stack[0].id, child, None)
-                .map_err(|error| dom_error(offset, error))?;
-        } else if let Some(html) = self
-            .html
-            .filter(|_| !self.body_started && !self.in_head && self.stack.is_empty())
-        {
-            let (parent, before) = if self.html_started {
-                (html, self.head)
-            } else {
-                (self.document.root(), Some(html))
-            };
-            self.document
-                .insert_before(parent, child, before)
-                .map_err(|error| dom_error(offset, error))?;
-        } else {
-            self.append(self.parent(), child);
-        }
-        Ok(())
+    fn comment_location(&mut self)->Result<(NodeId,Option<NodeId>),ParseError> {
+        let location=if let Some(html)=self.html.filter(|_|self.document_tail!=0) {
+            let parent=if self.document_tail==3 {self.document.root()}else {html};
+            let before=(self.document_tail==1 && self.scaffold_attached&4!=0).then_some(self.body);
+            (parent,before)
+        } else if let Some(html)=self.html.filter(|_|self.after_head && self.stack.is_empty()) {
+            (html,(self.scaffold_attached&4!=0).then_some(self.body))
+        } else if self.html.is_none() && self.fragment_context==Some(Tag::Html) && matches!(self.document_tail,2|3) {
+            (self.stack[0].id,None)
+        } else if let Some(html)=self.html.filter(|_|!self.body_started && !self.in_head && self.stack.is_empty()) {
+            if self.html_started {(html,self.head.filter(|_|self.scaffold_attached&2!=0))}
+            else {(self.document.root(),(self.scaffold_attached&1!=0).then_some(html))}
+        } else {let parent=self.parent();(self.template_content(parent).unwrap_or(parent),None)};
+        self.ensure_scaffold(location.0)?;Ok(location)
+    }
+    fn append_comment_kind(&mut self,kind:NodeKind,offset:usize)->Result<(),ParseError> {
+        let (parent,before)=self.comment_location()?;
+        let id=self.document.create_at(parent,kind,None).map_err(|e|dom_error(offset,e))?;
+        self.document.insert_before(parent,id,before).map_err(|e|dom_error(offset,e))
     }
 
     fn append_text(&mut self, value: Cow<'_, str>, offset: usize) -> Result<(), ParseError> {
@@ -3718,16 +4192,16 @@ impl<'a> Parser<'a, '_> {
         }
         .map_err(|e| dom_error(offset, e))?;
         if let Some(last) = previous {
-            if let NodeKind::Text(existing) = &mut self.document.node_mut(last).kind {
-                existing.push_str(&value);
+            if matches!(self.document.kind(last), Ok(NodeKind::Text(_))) {
+                self.document.append_data(last, &value).map_err(|e| dom_error(offset, e))?;
                 return Ok(());
             }
         }
         let id = self
             .document
-            .create(NodeKind::Text(value.into_owned()))
+            .create_at(parent, NodeKind::Text(value.into_owned()), None)
             .map_err(|e| dom_error(offset, e))?;
-        self.document.insert_detached_before(parent, id, before);
+        self.ensure_scaffold(parent)?; self.document.insert_before(parent, id, before).map_err(|e| dom_error(self.pos, e))?;
         Ok(())
     }
 
@@ -3864,7 +4338,7 @@ impl<'a> Parser<'a, '_> {
         }
         self.custom_selects
             .retain(|select| !removed_selects.contains(select));
-        self.stack.truncate(index);
+        self.truncate_open_elements(index);
     }
 
     fn clear_formatting(&mut self) {
@@ -3882,7 +4356,7 @@ impl<'a> Parser<'a, '_> {
             .is_some_and(|open| open.tag != Tag::Template && !tags.contains(&open.tag))
             && !(self.html.is_none() && self.stack.len() == 1 && self.stack[0].tag == Tag::Html)
         {
-            self.stack.pop();
+            self.pop_open_element();
         }
     }
 
@@ -3980,33 +4454,49 @@ impl<'a> Parser<'a, '_> {
                         | Tag::Rtc
                 )
         }) {
-            self.stack.pop();
+            self.pop_open_element();
         }
     }
 
-    fn merge_scaffold_attributes(&mut self, id: NodeId, attributes: Vec<(Name, String)>) {
-        if let NodeKind::Element {
-            attributes: existing,
-            ..
-        } = &mut self.document.node_mut(id).kind
-        {
-            for (key, value) in attributes {
-                if !existing.iter().any(|(name, _)| name == &key) {
-                    existing.push((key, value));
-                }
+    fn merge_scaffold_attributes(&mut self, id: NodeId, attributes: Vec<(Name, String)>) -> Result<(), ParseError> {
+        let bit = if self.html == Some(id) { 1 } else if self.head == Some(id) { 2 } else if self.body == id { 4 } else { 0 };
+        let is_value = attributes.iter().find(|(name, _)| name == "is").map(|(_, value)| value.as_str());
+        let defined = match self.document.kind(id).map_err(|failure| dom_error(self.pos, failure))? {
+            NodeKind::Element { name, .. } => self.document.parser_custom_element_defined(self.document.root(), name.as_str(), is_value),
+            _ => false,
+        };
+        if self.stop_after_script && bit != 0 && self.scaffold_attached & bit == 0 && defined {
+            self.document.initialize_parser_is_value(id, is_value).map_err(|failure| dom_error(self.pos, failure))?;
+            self.pending_element = Some(PendingElement { node: id, attributes, insertion: None, declarative: None, parser_form: None });
+            return Ok(());
+        }
+        for (key, value) in attributes {
+            if self.document.get_attribute_ns_ref(id, None, key.as_str())
+                .map_err(|error| dom_error(self.pos, error))?.is_none() {
+                self.document.set_attribute(id, key.as_str(), &value)
+                    .map_err(|error| dom_error(self.pos, error))?;
             }
         }
+        Ok(())
     }
 
     fn create_plain(&mut self, name: &'static str, offset: usize) -> Result<NodeId, ParseError> {
-        self.document
-            .create(element(name, Vec::new()))
-            .map_err(|e| dom_error(offset, e))
+        let (parent,_)=self.insertion_location(self.parent(), self.parent_tag());
+        let id=self.document.create_unprefixed_at(parent, Namespace::Html, Name::new(name), Vec::new()).map_err(|e| dom_error(offset, e))?;
+        self.document.record_parser_element_birth(id,self.registry_context(self.parent()), self.html.is_some()).map_err(|e| dom_error(offset,e))?;
+        Ok(id)
     }
 
     fn run(&mut self) -> Result<(), ParseError> {
         let input = self.input;
+        let mut identity_revision=self.document.identity_revision();
         while self.pos < input.len() {
+            let revision=self.document.identity_revision();
+            if revision!=identity_revision {
+                let document=&*self.document;
+                self.state.project_nodes(|node|document.current_node(node));
+                identity_revision=revision;
+            }
             if self.initial_text_token()? {
                 continue;
             }
@@ -4083,7 +4573,11 @@ impl<'a> Parser<'a, '_> {
                     .stop_after_script
                     .then(|| self.active_html_parser_script())
                     .flatten();
+                let parser_style = self.stack.last().filter(|open| open.tag == Tag::Style).map(|open| open.id);
                 self.end_tag()?;
+                if let Some(style) = parser_style.filter(|style| !self.stack.iter().any(|open| open.id == *style)) {
+                    self.document.record_parser_style_block_update(style).map_err(|error| dom_error(self.pos, error))?;
+                }
                 if parser_script
                     .is_some_and(|script| !self.stack.iter().any(|open| open.id == script))
                 {
@@ -4105,12 +4599,26 @@ impl<'a> Parser<'a, '_> {
             if self.declarative_cleanup_pending {
                 self.reclaim_declarative_templates(false)?;
             }
-            if self.yielded_script.is_some() {
+            if self.yielded_script.is_some() || self.pending_element.is_some() {
                 break;
             }
         }
-        if self.final_input && self.yielded_script.is_none() {
+        if self.final_input && self.yielded_script.is_none() && self.pending_element.is_none() {
+            if let Some(style) = self.stack.last().filter(|open| open.tag == Tag::Style).map(|open| open.id) {
+                self.pop_open_element();
+                self.document.record_parser_style_block_update(style).map_err(|error| dom_error(self.pos, error))?;
+            }
+            if self.html.is_some() {
+                self.ensure_scaffold(self.body)?;
+            }
             self.refresh_selected_content()?;
+            // EOF completes remaining source-owned elements even when HTML's
+            // stack remains open. The sink only records completion; native
+            // loading is queued after this borrowed parser turn returns.
+            for open in self.stack.iter().rev() {
+                self.document.record_parser_element_completion(open.id);
+            }
+
             // The spec's parser-only template stack elements must not retain an
             // extra template/content pair in the document arena after parsing.
             self.reclaim_declarative_templates(true)?;
@@ -4175,6 +4683,13 @@ impl<'a> Parser<'a, '_> {
                 .document
                 .template_content(node)
                 .map_err(|error| dom_error(self.pos, error))?;
+            // A parser script can adopt associated template contents into a
+            // different arena. Their control state then belongs to that
+            // document's ordinary adoption/mutation hooks, not this parser's
+            // owner-local completion refresh.
+            if content.is_some_and(|content| content.document_id() != self.document.root().document_id()) {
+                continue;
+            }
             let mut child = self
                 .document
                 .last_child(content.unwrap_or(node))
@@ -4265,7 +4780,7 @@ impl<'a> Parser<'a, '_> {
                         .document
                         .clone_subtree(*child)
                         .map_err(|error| dom_error(self.pos, error))?;
-                    self.document.attach_detached(target, clone);
+                    self.append(target, clone)?;
                 }
             }
         }
@@ -4280,11 +4795,7 @@ impl<'a> Parser<'a, '_> {
         if self.conformance_tokens.is_some() {
             self.emit_conformance_token(ConformanceToken::Comment(data.clone()));
         }
-        let id = self
-            .document
-            .create(NodeKind::Comment(data))
-            .map_err(|e| dom_error(self.pos, e))?;
-        self.append_comment(id, self.pos)?;
+        self.append_comment_kind(NodeKind::Comment(data), self.pos)?;
         self.pos = (end + 1).min(self.input.len());
         Ok(())
     }
@@ -4359,14 +4870,7 @@ impl<'a> Parser<'a, '_> {
             target: target.to_string(),
             data: data.clone(),
         });
-        let id = self
-            .document
-            .create(NodeKind::ProcessingInstruction {
-                target: target.to_string(),
-                data,
-            })
-            .map_err(|e| dom_error(start, e))?;
-        self.append_comment(id, start)?;
+        self.append_comment_kind(NodeKind::ProcessingInstruction {target:target.to_string(),data},start)?;
         self.pos = close + 1;
         Ok(())
     }
@@ -4414,11 +4918,7 @@ impl<'a> Parser<'a, '_> {
         };
         let data = replace_nulls(&rest[..end]).into_owned();
         self.emit_conformance_token(ConformanceToken::Comment(data.clone()));
-        let id = self
-            .document
-            .create(NodeKind::Comment(data))
-            .map_err(|e| dom_error(start, e))?;
-        self.append_comment(id, start)?;
+        self.append_comment_kind(NodeKind::Comment(data), start)?;
         self.pos = start + 4 + end + suffix;
         Ok(())
     }
@@ -4455,7 +4955,7 @@ impl<'a> Parser<'a, '_> {
             )
             .map_err(|e| dom_error(start, e))?;
         self.document
-            .insert_before(self.document.root(), id, self.html)
+            .insert_before(self.document.root(), id, self.html.filter(|_| self.scaffold_attached & 1 != 0))
             .map_err(|error| dom_error(start, error))?;
         self.pos = (end + if terminated { 1 } else { 0 }).min(self.input.len());
         Ok(())
@@ -4478,11 +4978,7 @@ impl<'a> Parser<'a, '_> {
             if end > 0 {
                 let data = replace_nulls(&self.remaining()[..end]).into_owned();
                 self.emit_conformance_token(ConformanceToken::Comment(data.clone()));
-                let id = self
-                    .document
-                    .create(NodeKind::Comment(data))
-                    .map_err(|e| dom_error(start, e))?;
-                self.append_comment(id, start)?;
+                self.append_comment_kind(NodeKind::Comment(data), start)?;
             }
             self.pos = (self.pos + end + 1).min(self.input.len());
             return Ok(());
@@ -4520,9 +5016,18 @@ impl<'a> Parser<'a, '_> {
         {
             return Ok(());
         }
-        if self.html.is_none() && self.fragment_context == Some(Tag::Html) && tag == Tag::Html {
-            self.document_tail = 3;
-            return Ok(());
+        if self.html.is_none() && self.fragment_context == Some(Tag::Html) && self.template_modes.is_empty() {
+            match tag {
+                Tag::Body => {
+                    self.document_tail = 2;
+                    return Ok(());
+                }
+                Tag::Html => {
+                    self.document_tail = 3;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         if !self.template_modes.is_empty() && matches!(tag, Tag::Head | Tag::Body | Tag::Html) {
             return Ok(());
@@ -4565,7 +5070,7 @@ impl<'a> Parser<'a, '_> {
                 self.reconstruct_formatting()?;
                 let id = self.create_plain("br", start)?;
                 let (parent, before) = self.insertion_location(self.parent(), self.parent_tag());
-                self.document.insert_detached_before(parent, id, before);
+                self.ensure_scaffold(parent)?; self.document.insert_before(parent, id, before).map_err(|e| dom_error(self.pos, e))?;
             }
             Tag::P => {
                 let boundary = [
@@ -4582,7 +5087,7 @@ impl<'a> Parser<'a, '_> {
                     let id = self.create_plain("p", start)?;
                     let (parent, before) =
                         self.insertion_location(self.parent(), self.parent_tag());
-                    self.document.insert_detached_before(parent, id, before);
+                    self.ensure_scaffold(parent)?; self.document.insert_before(parent, id, before).map_err(|e| dom_error(self.pos, e))?;
                 } else {
                     self.close_in_scope(&[Tag::P], &boundary);
                 }
@@ -4591,7 +5096,7 @@ impl<'a> Parser<'a, '_> {
                 self.in_head = false;
                 self.body_started = false;
                 self.after_head = true;
-                self.stack.clear();
+                self.truncate_open_elements(0);
                 self.document_tail = 1;
             }
             Tag::Body if self.html.is_some() => {
@@ -4648,7 +5153,7 @@ impl<'a> Parser<'a, '_> {
             Tag::Form => {
                 if let Some(form) = self.form_element.take() {
                     if let Some(index) = self.stack.iter().position(|open| open.id == form) {
-                        self.stack.remove(index);
+                        self.remove_open_element(index);
                     }
                 } else if self.template_modes.is_empty()
                     && self.fragment_context != Some(Tag::Template)
@@ -4731,7 +5236,7 @@ impl<'a> Parser<'a, '_> {
                 Tag::Base | Tag::Link | Tag::Meta | Tag::Style => {}
                 Tag::Head | Tag::Noscript => return Ok(()),
                 Tag::Html => {
-                    self.merge_scaffold_attributes(self.html.unwrap_or(self.body), attributes);
+                    self.merge_scaffold_attributes(self.html.unwrap_or(self.body), attributes)?;
                     return Ok(());
                 }
                 _ => {
@@ -4779,7 +5284,7 @@ impl<'a> Parser<'a, '_> {
                     _ => None,
                 };
                 if let Some(target) = target {
-                    self.merge_scaffold_attributes(target, attributes);
+                    self.merge_scaffold_attributes(target, attributes)?;
                 }
                 return Ok(());
             }
@@ -4835,24 +5340,27 @@ impl<'a> Parser<'a, '_> {
         if document_root {
             match tag {
                 Tag::Html => {
-                    self.merge_scaffold_attributes(self.html.unwrap(), attributes);
+                    self.merge_scaffold_attributes(self.html.unwrap(), attributes)?;
+                    self.ensure_scaffold(self.html.unwrap())?;
                     return Ok(());
                 }
                 Tag::Head => {
                     if self.body_started || self.after_head {
                         return Ok(());
                     }
-                    self.merge_scaffold_attributes(self.head.unwrap(), attributes);
+                    self.merge_scaffold_attributes(self.head.unwrap(), attributes)?;
+                    self.ensure_scaffold(self.head.unwrap())?;
                     self.in_head = true;
                     self.after_head = false;
                     return Ok(());
                 }
                 Tag::Body => {
-                    self.merge_scaffold_attributes(self.body, attributes);
+                    self.merge_scaffold_attributes(self.body, attributes)?;
+                    self.ensure_scaffold(self.body)?;
                     self.in_head = false;
                     self.body_started = true;
                     self.after_head = false;
-                    self.stack.clear();
+                    self.truncate_open_elements(0);
                     self.document_tail = 0;
                     return Ok(());
                 }
@@ -5010,6 +5518,7 @@ impl<'a> Parser<'a, '_> {
                 Tag::Tr,
                 Tag::Colgroup,
             ])
+            && self.fragment_context != Some(Tag::Template)
         {
             return Ok(());
         }
@@ -5088,7 +5597,7 @@ impl<'a> Parser<'a, '_> {
                     Tag::H1 | Tag::H2 | Tag::H3 | Tag::H4 | Tag::H5 | Tag::H6
                 )
             }) {
-                self.stack.pop();
+                self.pop_open_element();
             }
         }
         if tag.closes_paragraph() {
@@ -5156,7 +5665,7 @@ impl<'a> Parser<'a, '_> {
                         && self.template_modes.last() == Some(&TemplateMode::InTableBody))
                 {
                     let row = self.create_plain("tr", start)?;
-                    self.append(parent, row);
+                    self.append(parent, row)?;
                     self.stack.push(Open {
                         id: row,
                         tag: Tag::Tr,
@@ -5167,7 +5676,7 @@ impl<'a> Parser<'a, '_> {
                 let parent = self.parent();
                 if self.parent_tag() == Tag::Table {
                     let group = self.create_plain("colgroup", start)?;
-                    self.append(parent, group);
+                    self.append(parent, group)?;
                     self.stack.push(Open {
                         id: group,
                         tag: Tag::Colgroup,
@@ -5226,26 +5735,55 @@ impl<'a> Parser<'a, '_> {
                         return None;
                     };
                     let has = |expected: &str| attributes.iter().any(|(name, _)| name == expected);
+                    let slot_assignment = attributes
+                        .iter()
+                        .find(|(name, _)| name == "shadowrootslotassignment")
+                        .map_or(crate::shadow::SlotAssignmentMode::Named, |(_, value)| {
+                            if value.eq_ignore_ascii_case("manual") {
+                                crate::shadow::SlotAssignmentMode::Manual
+                            } else {
+                                crate::shadow::SlotAssignmentMode::Named
+                            }
+                        });
                     Some(crate::shadow::ShadowOptions {
                         mode,
-                        slot_assignment: crate::shadow::SlotAssignmentMode::Named,
+                        slot_assignment,
                         delegates_focus: has("shadowrootdelegatesfocus"),
                         clonable: has("shadowrootclonable"),
                         serializable: has("shadowrootserializable"),
                         declarative: true,
+                        keep_custom_element_registry_null: has("shadowrootcustomelementregistry"),
                         ..crate::shadow::ShadowOptions::new(mode)
                     })
                 })
         } else {
             None
         };
-        let id = self
-            .document
-            .create(element(element_name, attributes))
-            .map_err(|e| dom_error(start, e))?;
+        let is_value = attributes.iter().find(|(name, _)| name == "is").map(|(_, value)| value.as_str());
+        let deferred = self.stop_after_script && self.document.parser_custom_element_defined(parent, element_name, is_value);
+        let id = if deferred {
+            let id = self.document.create_at(parent, NodeKind::Element {
+                namespace: Namespace::Html, name: Name::new(element_name), attributes: Vec::new(),
+            }, is_value).map_err(|failure| dom_error(start, failure))?;
+            self.pending_element = Some(PendingElement { node: id, attributes, insertion: None, declarative: None, parser_form: None });
+            id
+        } else {
+            self.document.create_unprefixed_at(parent, Namespace::Html, Name::new(element_name), attributes).map_err(|failure| dom_error(start, failure))?
+        };
+        if deferred {
+            let owner=self.document.node_document(parent).map_err(|e|dom_error(start,e))?;
+            self.document.set_node_document(id,owner).map_err(|e|dom_error(start,e))?;
+        }
+        let registry_context=self.registry_context(parent);
+        self.document.record_parser_element_birth(id,registry_context,self.html.is_some()).map_err(|e| dom_error(start,e))?;
         let shadow = if let Some(options) = declarative {
-            let host = self.parent();
+            let host = if self.at_fragment_context() {
+                self.fragment_context_node.unwrap_or_else(|| self.parent())
+            } else { self.parent() };
             if self.html == Some(host) {
+                None
+            } else if deferred {
+                self.pending_element.as_mut().unwrap().declarative = Some((host, options));
                 None
             } else {
                 match self.document.attach_shadow_with_options(host, options) {
@@ -5257,13 +5795,33 @@ impl<'a> Parser<'a, '_> {
         } else {
             None
         };
+        if matches!(element_name, "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea")
+            && self.template_modes.is_empty() && self.fragment_context.is_none()
+            && self.document.get_attribute_ns_ref(id, None, "form").map_err(|e| dom_error(start, e))?.is_none()
+        {
+            if let Some(form) = self.form_element {
+                if self.document.root_node(parent, false).map_err(|e| dom_error(start, e))?
+                    == self.document.root_node(form, false).map_err(|e| dom_error(start, e))? {
+                    let mut ancestor = Some(parent);
+                    let mut normal_owner = false;
+                    while let Some(node) = ancestor {
+                        if node == form { normal_owner = true; break; }
+                        ancestor = self.document.parent(node).map_err(|e| dom_error(start, e))?;
+                    }
+                    if !normal_owner {
+                        if deferred { self.pending_element.as_mut().unwrap().parser_form = Some(form); }
+                        else { self.document.associate_parser_form(id, form).map_err(|e| dom_error(start, e))?; }
+                    }
+                }
+            }
+        }
         if let Some(root) = shadow {
             self.declarative_roots
                 .try_reserve(1)
                 .map_err(|_| error(start, "parser allocation limit"))?;
             self.declarative_roots.push((id, root));
         } else {
-            self.document.insert_detached_before(parent, id, before);
+            self.insert_token_element(parent, id, before)?;
         }
         if tag == Tag::Form
             && self.template_modes.is_empty()
@@ -5321,7 +5879,7 @@ impl<'a> Parser<'a, '_> {
         {
             let parent = self.parent();
             let tbody = self.create_plain("tbody", offset)?;
-            self.append(parent, tbody);
+            self.append(parent, tbody)?;
             self.stack.push(Open {
                 id: tbody,
                 tag: Tag::Tbody,
@@ -5396,7 +5954,7 @@ impl<'a> Parser<'a, '_> {
                     return self.append_text_at(
                         decode_entities(content, false),
                         self.html.unwrap_or(self.body),
-                        Some(self.body),
+                        (self.scaffold_attached & 4 != 0).then_some(self.body),
                         start,
                     );
                 }
@@ -5405,7 +5963,7 @@ impl<'a> Parser<'a, '_> {
                     self.append_text_at(
                         decode_entities(&content[..split], false),
                         self.html.unwrap_or(self.body),
-                        Some(self.body),
+                        (self.scaffold_attached & 4 != 0).then_some(self.body),
                         start,
                     )?;
                     content = &content[split..];
@@ -5506,6 +6064,84 @@ impl<'a> Parser<'a, '_> {
 mod tests {
     use alloc::borrow::ToOwned;
     #[test]
+    fn specification_custom_element_names_use_shared_local_name_validation() {
+        for name in ["a-a×","a-a\u{3000}","a-a\u{f0000}","a-:","a-="] {
+            assert!(super::is_valid_custom_element_name(name),"valid local custom name: {name}");
+            assert!(crate::xml::is_valid_element_local_name(name));
+        }
+        for name in ["A-a","a-A","a-a\0","a-a\t","a-a/","a-a>","annotation-xml","plain"] {
+            assert!(!super::is_valid_custom_element_name(name),"invalid custom name: {name}");
+        }
+    }
+    #[test]
+    fn specification_parser_element_birth_precedes_connection_and_uses_actual_context() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        let births=Rc::new(RefCell::new(Vec::new()));
+        let capture=births.clone();
+        let mut document=parse_with_options_initialized(
+            "<div id=host><template shadowrootmode=open shadowrootcustomelementregistry><span></span><x-undefined></x-undefined></template></div>",
+            64,ParseOptions {allow_declarative_shadow_roots:true,..ParseOptions::default()},
+            move |document|document.set_parser_element_birth_sink(Some(Rc::new(move |document,node,context,_document_parser| {
+                assert_eq!(document.parent(node),Ok(None),"birth must precede connection");
+                capture.borrow_mut().push((node,context));Ok(())
+            }))),
+        ).unwrap();
+        let host=crate::selector::query_selector(&document,document.root(),"#host").unwrap().unwrap();
+        let shadow=document.shadow_root(host).unwrap().unwrap();
+        let span=crate::selector::query_selector(&document,shadow,"span").unwrap().unwrap();
+        let custom=crate::selector::query_selector(&document,shadow,"x-undefined").unwrap().unwrap();
+        assert!(births.borrow().contains(&(span,shadow)));
+        assert!(births.borrow().contains(&(custom,shadow)));
+        let html=crate::selector::query_selector(&document,document.root(),"html").unwrap().unwrap();
+        assert!(births.borrow().contains(&(html,document.root())));
+        let fragment=parse_fragment_for_target(&mut document,host,shadow,"<i><x-fragment></x-fragment></i>",false).unwrap();
+        let italic=document.first_child(fragment).unwrap().unwrap();
+        let fragment_custom=document.first_child(italic).unwrap().unwrap();
+        assert!(births.borrow().contains(&(italic,shadow)),"shadow target differs from tokenizer host");
+        assert!(births.borrow().contains(&(fragment_custom,italic)),"descendants use their newly born parent");
+    }
+    #[test]
+    fn specification_parser_adjusted_insertion_guards() {
+        let mut document = parse("<main></main>", 64).unwrap();
+        let main = crate::selector::query_selector(&document, document.root(), "main").unwrap().unwrap();
+        let element = create_html_element(&mut document, "aside", Vec::new()).unwrap();
+        let root = document.root();
+        assert!(!insert_at_adjusted_location(&mut document, root, element, None).unwrap());
+        assert_eq!(document.parent(element), Ok(None));
+        document.append(main, element).unwrap();
+        let template = create_html_element(&mut document, "template", Vec::new()).unwrap();
+        let content = document.template_content(template).unwrap().unwrap();
+        assert!(!insert_at_adjusted_location(&mut document, content, element, None).unwrap());
+        assert_eq!(document.parent(element), Ok(Some(main)));
+        assert!(!insert_at_adjusted_location(&mut document, content, template, None).unwrap());
+        let host = create_html_element(&mut document, "div", Vec::new()).unwrap();
+        let shadow = document.attach_shadow(host, crate::ShadowMode::Open).unwrap();
+        let intended = create_html_element(&mut document, "section", Vec::new()).unwrap();
+        document.append(shadow, intended).unwrap();
+        assert!(!insert_at_adjusted_location(&mut document, intended, host, None).unwrap());
+        assert!(insert_at_adjusted_location(&mut document, main, host, None).unwrap());
+        assert_eq!(document.parent(host), Ok(Some(main)));
+    }
+    #[test]
+    fn specification_live_html_parser_element_creation_phases() {
+        let mut document = Document::new(64);
+        document.set_parser_custom_element_predicate(Some(alloc::rc::Rc::new(|_, _, local, _| local == "x-phase")));
+        let (mut parser, _) = HtmlDocumentParser::open(&mut document, ParseOptions::default()).unwrap();
+        assert!(parser.write_final_until_script(&mut document, "<x-phase data-value=token><span>child</span></x-phase><script>after</script>").unwrap().is_none());
+        let node = parser.pending_element().expect("constructor phase");
+        assert_eq!(document.parent(node), Ok(None));
+        assert_eq!(document.first_child(node), Ok(None));
+        assert_eq!(document.get_attribute_ns_ref(node, None, "data-value"), Ok(None));
+        parser.append_pending_element_attributes(&mut document).unwrap();
+        assert_eq!(document.get_attribute_ns_ref(node, None, "data-value").unwrap(), Some("token"));
+        assert_eq!(document.parent(node), Ok(None));
+        assert!(parser.finish_pending_element(&mut document).unwrap().is_some());
+        assert!(document.parent(node).unwrap().is_some());
+        assert!(document.first_child(node).unwrap().is_some());
+        assert!(parser.resume_until_script(&mut document).unwrap().is_none());
+    }
+    #[test]
     fn initialized_document_parser_observes_initial_details_transitions() {
         use alloc::rc::Rc;
         use core::cell::RefCell;
@@ -5593,6 +6229,231 @@ mod tests {
     }
 
     #[test]
+    fn custom_element_birth_values_are_sparse_immutable_shared_and_serialized() {
+        let mut document = Document::new(128);
+        let ordinary = document.create(NodeKind::Element {
+            namespace: Namespace::Html, name: "div".into(), attributes: Vec::new(),
+        }).unwrap();
+        assert_eq!(document.custom_element_is_values.capacity(), 0);
+        document.set_attribute(ordinary, "is", "late-value").unwrap();
+        assert_eq!(document.custom_element_is_value(ordinary).unwrap(), None);
+        let custom = document.create_with_is_value(NodeKind::Element {
+            namespace: Namespace::Html, name: "p".into(), attributes: vec![("class".into(), "first".into())],
+        }, Some("birth-value")).unwrap();
+        assert_eq!(document.get_attribute_ns_ref(custom, None, "is").unwrap(), None);
+        assert_eq!(outer_html(&document, custom).unwrap(), "<p is=\"birth-value\" class=\"first\"></p>");
+        document.set_attribute(custom, "is", "other\"&\n").unwrap();
+        assert_eq!(outer_html(&document, custom).unwrap(), "<p class=\"first\" is=\"other&quot;&amp;\n\"></p>");
+        assert_eq!(document.custom_element_is_value(custom).unwrap(), Some("birth-value"));
+        let clone = document.clone_node(custom, true).unwrap();
+        assert_eq!(document.custom_element_is_value(clone).unwrap(), Some("birth-value"));
+        assert_eq!(document.custom_element_is_value(clone).unwrap().unwrap().as_ptr(),
+            document.custom_element_is_value(custom).unwrap().unwrap().as_ptr());
+        document.remove_attribute(custom, "is").unwrap();
+        assert_eq!(outer_html(&document, custom).unwrap(), "<p is=\"birth-value\" class=\"first\"></p>");
+        let mut target = Document::new(128);
+        let imported = target.clone_subtree_from(&document, custom, true).unwrap();
+        assert_eq!(target.custom_element_is_value(imported).unwrap(), Some("birth-value"));
+        assert_eq!(target.custom_element_is_value(imported).unwrap().unwrap().as_ptr(),
+            document.custom_element_is_value(custom).unwrap().unwrap().as_ptr());
+        let mut full = Document::new(1);
+        assert_eq!(full.adopt_subtree_from(&mut document, custom), Err(DomError::LimitExceeded));
+        assert_eq!(document.custom_element_is_value(custom).unwrap(), Some("birth-value"));
+        let (adopted, _) = target.adopt_subtree_from(&mut document, custom).unwrap();
+        assert!(document.custom_element_is_value(custom).is_err());
+        assert_eq!(target.custom_element_is_value(adopted).unwrap(), Some("birth-value"));
+        target.destroy_subtree(adopted).unwrap();
+        let fresh = target.create(NodeKind::Element { namespace: Namespace::Html, name: "p".into(), attributes: Vec::new() }).unwrap();
+        assert_eq!(target.custom_element_is_value(fresh).unwrap(), None);
+        let fragment = parse_fragment(&mut document, "<p is='parser-value'></p><template><p is='template-value'></p></template>").unwrap();
+        let parsed = document.first_child(fragment).unwrap().unwrap();
+        document.set_attribute(parsed, "is", "changed").unwrap();
+        assert_eq!(document.custom_element_is_value(parsed).unwrap(), Some("parser-value"));
+        let template = document.next_sibling(parsed).unwrap().unwrap();
+        let template_clone = document.clone_node(template, true).unwrap();
+        let child = document.first_child(document.template_content(template_clone).unwrap().unwrap()).unwrap().unwrap();
+        assert_eq!(document.custom_element_is_value(child).unwrap(), Some("template-value"));
+    }
+
+    #[test]
+    fn get_html_uses_html_namespace_names_and_text_rules_in_xml_documents() {
+        let document = crate::xml::parse(
+            "<h:div xmlns:h='http://www.w3.org/1999/xhtml'><h:style><![CDATA[<&>]]></h:style><h:p><![CDATA[<&>]]></h:p><h:br/></h:div>",
+            32,
+        ).unwrap();
+        let root = document.first_child(document.root()).unwrap().unwrap();
+        assert_eq!(get_html(&document, root, false, &[]).unwrap(), "<style><&></style><p>&lt;&amp;&gt;</p><br>");
+        assert!(crate::xml::inner_html(&document, root).unwrap().contains("<![CDATA[<&>]]>"));
+        let foreign = crate::xml::parse("<root><q:br xmlns:q='urn:custom' xmlns:l='http://www.w3.org/1999/xlink' l:href='a&amp;b' xml:lang='en'>text</q:br></root>", 16).unwrap();
+        let root = foreign.first_child(foreign.root()).unwrap().unwrap();
+        assert_eq!(get_html(&foreign, root, false, &[]).unwrap(), "<q:br xmlns:q=\"urn:custom\" xmlns:l=\"http://www.w3.org/1999/xlink\" xlink:href=\"a&amp;b\" xml:lang=\"en\">text</q:br>");
+    }
+
+    #[test]
+    fn get_html_uses_actual_html_local_name_for_template_contents() {
+        let mut document = Document::new(16);
+        document.set_html_document(true);
+        let literal = document
+            .create_unprefixed_element(Namespace::Html, "x:template".into(), Vec::new())
+            .unwrap();
+        let literal_text = document
+            .create(NodeKind::Text("literal child".into()))
+            .unwrap();
+        document.append(literal, literal_text).unwrap();
+
+        let qualified = document
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: "x:template".into(),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        let content = document.template_content(qualified).unwrap().unwrap();
+        let template_text = document
+            .create(NodeKind::Text("template content".into()))
+            .unwrap();
+        document.append(content, template_text).unwrap();
+        let light_text = document
+            .create(NodeKind::Text("qualified light child".into()))
+            .unwrap();
+        document.append(qualified, light_text).unwrap();
+
+        assert_eq!(document.element_name_parts(literal), Ok((None, "x:template")));
+        assert_eq!(document.element_name_parts(qualified), Ok((Some("x"), "template")));
+        assert_eq!(document.template_content(literal), Ok(None));
+        assert_eq!(document.template_content(qualified), Ok(Some(content)));
+        assert_eq!(get_html(&document, literal, false, &[]).unwrap(), "literal child");
+        assert_eq!(
+            get_html(&document, qualified, false, &[]).unwrap(),
+            "template content"
+        );
+    }
+
+    #[test]
+    fn get_html_serializes_selected_shadow_roots_before_light_children_without_mutation() {
+        let document = parse_with_declarative_shadow_roots(
+            "<div id=host><b>light</b><template shadowrootmode=open shadowrootdelegatesfocus shadowrootserializable shadowrootclonable><section><template shadowrootmode=closed><i>inner&amp;</i></template><em>nested light</em></section></template></div>",
+            64, true,
+        ).unwrap();
+        let host = crate::selector::query_selector(&document, document.root(), "#host").unwrap().unwrap();
+        let root = document.shadow_root(host).unwrap().unwrap();
+        let section = document.first_child(root).unwrap().unwrap();
+        let nested = document.shadow_root(section).unwrap().unwrap();
+        let count = document.node_count();
+        let version = document.version();
+        let outer_start = "<template shadowrootmode=\"open\" shadowrootdelegatesfocus=\"\" shadowrootserializable=\"\" shadowrootclonable=\"\">";
+        let inner = "<template shadowrootmode=\"closed\"><i>inner&amp;</i></template>";
+        assert_eq!(get_html(&document, host, false, &[]).unwrap(), "<b>light</b>");
+        assert_eq!(get_html(&document, host, false, &[nested]).unwrap(), "<b>light</b>");
+        assert_eq!(get_html(&document, host, true, &[]).unwrap(), alloc::format!("{outer_start}<section><em>nested light</em></section></template><b>light</b>"));
+        assert_eq!(get_html(&document, host, true, &[nested]).unwrap(), alloc::format!("{outer_start}<section>{inner}<em>nested light</em></section></template><b>light</b>"));
+        assert_eq!(get_html(&document, host, false, &[nested, root, root]).unwrap(), get_html(&document, host, true, &[nested]).unwrap());
+        assert_eq!(get_html(&document, root, false, &[nested]).unwrap(), alloc::format!("<section>{inner}<em>nested light</em></section>"));
+        assert_eq!(document.node_count(), count);
+        assert_eq!(document.version(), version);
+        assert_eq!(inner_html(&document, host).unwrap(), "<b>light</b>");
+    }
+
+    #[test]
+    fn specification_live_parser_foreign_template_adoption_before_eof() {
+        let mut document = Document::new(96);
+        let (mut parser, _) = HtmlDocumentParser::open(&mut document, ParseOptions {
+            scripting_enabled: true, allow_declarative_shadow_roots: false,
+        }).unwrap();
+        assert!(parser.write_final_until_script(&mut document,
+            "<!doctype html><template id=host><select><option selected>stored</option></select></template><script>pause</script><select id=live><option selected>live</option></select>").unwrap().is_some());
+        let host = crate::selector::query_selector(&document, document.root(), "#host").unwrap().unwrap();
+        let content = document.template_content(host).unwrap().unwrap();
+        let mut destination = Document::new(96);
+        let (moved, _) = destination.adopt_subtree_from(&mut document, content).unwrap();
+        assert_eq!(document.template_content(host), Ok(Some(moved)));
+        assert_ne!(moved.document_id(), document.root().document_id());
+        assert!(parser.resume_until_script(&mut document).unwrap().is_none());
+        assert!(parser.is_closed());
+        assert!(crate::selector::query_selector(&document, document.root(), "#live").unwrap().is_some());
+        assert!(destination.first_child(moved).unwrap().is_some(), "completion preserves destination-owned controls");
+    }
+
+    #[test]
+    fn declarative_manual_slot_assignment_round_trips_through_get_html() {
+        let document = parse_with_declarative_shadow_roots(
+            "<div id=host><template shadowrootmode=open shadowrootdelegatesfocus shadowrootserializable shadowrootslotassignment=manual shadowrootclonable></template></div>",
+            16,
+            true,
+        )
+        .unwrap();
+        let host = crate::selector::query_selector(&document, document.root(), "#host")
+            .unwrap()
+            .unwrap();
+        let root = document.shadow_root(host).unwrap().unwrap();
+        assert_eq!(
+            document.shadow_options(root).unwrap().unwrap().slot_assignment,
+            crate::shadow::SlotAssignmentMode::Manual
+        );
+        assert_eq!(
+            get_html(&document, host, true, &[]).unwrap(),
+            "<template shadowrootmode=\"open\" shadowrootdelegatesfocus=\"\" shadowrootserializable=\"\" shadowrootslotassignment=\"manual\" shadowrootclonable=\"\"></template>"
+        );
+    }
+
+    #[test]
+    fn get_html_preserves_reverse_attached_and_adopted_shadow_roots() {
+        let mut source = parse("<main><div id=a></div><div id=b></div></main>", 64).unwrap();
+        let a = crate::selector::query_selector(&source, source.root(), "#a").unwrap().unwrap();
+        let b = crate::selector::query_selector(&source, source.root(), "#b").unwrap().unwrap();
+        let mut options = crate::ShadowOptions::new(crate::ShadowMode::Closed);
+        options.serializable = true;
+        // Host creation and root attachment deliberately have opposite orders.
+        for (host, text) in [(b, "B"), (a, "A")] {
+            let root = source.attach_shadow_with_options(host, options).unwrap();
+            let child = source.create(NodeKind::Text(text.into())).unwrap();
+            source.append(root, child).unwrap();
+        }
+        let expected_a = "<template shadowrootmode=\"closed\" shadowrootserializable=\"\">A</template>";
+        let expected_b = "<template shadowrootmode=\"closed\" shadowrootserializable=\"\">B</template>";
+        assert_eq!(get_html(&source, a, true, &[]).unwrap(), expected_a);
+        assert_eq!(get_html(&source, b, true, &[]).unwrap(), expected_b);
+        let mut target = parse("<span></span>", 64).unwrap();
+        let existing = crate::selector::query_selector(&target, target.root(), "span").unwrap().unwrap();
+        let existing_root = target.attach_shadow(existing, crate::ShadowMode::Open).unwrap();
+        let (adopted, _) = target.adopt_subtree_from(&mut source, a).unwrap();
+        assert_eq!(get_html(&target, adopted, true, &[]).unwrap(), expected_a);
+        assert_eq!(get_html(&source, b, true, &[]).unwrap(), expected_b);
+        assert_eq!(target.shadow_root(existing).unwrap(), Some(existing_root));
+        target.destroy_subtree(adopted).unwrap();
+        assert!(target.shadow_root(adopted).is_err());
+        assert_eq!(target.shadow_root(existing).unwrap(), Some(existing_root));
+    }
+
+    #[test]
+    fn unsafe_fragment_permission_is_explicit_and_preserves_template_context() {
+        let mut document = parse("<div></div><template></template>", 128).unwrap();
+        let context = crate::selector::query_selector(&document, document.root(), "div").unwrap().unwrap();
+        let markup = "<section><template shadowrootmode=closed shadowrootserializable><i>shadow</i></template><b>light</b></section>";
+        let ordinary = parse_fragment_in(&mut document, context, markup).unwrap();
+        let ordinary_host = document.first_child(ordinary).unwrap().unwrap();
+        assert!(document.shadow_root(ordinary_host).unwrap().is_none());
+        let fragment = parse_fragment_in_with_declarative_shadow_roots(&mut document, context, markup, true).unwrap();
+        let host = document.first_child(fragment).unwrap().unwrap();
+        let root = document.shadow_root(host).unwrap().unwrap();
+        assert_eq!(inner_html(&document, root).unwrap(), "<i>shadow</i>");
+        assert_eq!(inner_html(&document, host).unwrap(), "<b>light</b>");
+        assert!(document.shadow_options(root).unwrap().unwrap().serializable);
+        assert!(!document.allow_declarative_shadow_roots(), "opt-in must not alter the document parser default");
+        let template = crate::selector::query_selector(&document, document.root(), "template").unwrap().unwrap();
+        let content = parse_fragment_in_with_declarative_shadow_roots(&mut document, template, "<tr><td>cell", true).unwrap();
+        assert_eq!(inner_html(&document, content).unwrap(), "<tr><td>cell</td></tr>");
+        let ordinary_content = parse_fragment_in(&mut document, template, "<tr><td>cell").unwrap();
+        assert_eq!(inner_html(&document, ordinary_content).unwrap(), "<tr><td>cell</td></tr>");
+        let columns = parse_fragment_in_with_declarative_shadow_roots(&mut document, template, "<col><col>", true).unwrap();
+        assert_eq!(inner_html(&document, columns).unwrap(), "<col><col>");
+        let in_body = parse_fragment_in_with_declarative_shadow_roots(&mut document, template, "<div><tr><td>text</div>", true).unwrap();
+        assert_eq!(inner_html(&document, in_body).unwrap(), "<div>text</div>");
+        let outside_template = parse_fragment_in_with_declarative_shadow_roots(&mut document, context, "<tr><td>text", true).unwrap();
+        assert_eq!(inner_html(&document, outside_template).unwrap(), "text");
+    }
+
+    #[test]
     fn declarative_shadow_roots_attach_during_document_parsing() {
         let document = parse_with_declarative_shadow_roots(
             "<div id=host><template shadowrootmode=OPEN shadowrootdelegatesfocus shadowrootclonable shadowrootserializable><p>shadow</p></template><b>light</b><template shadowrootmode=closed>ignored</template></div>",
@@ -5661,6 +6522,47 @@ mod tests {
         assert!(inner_html(&fragment_document, fragment)
             .unwrap()
             .contains("<template"));
+    }
+
+    #[test]
+    fn specification_parser_form_pointer_association_and_mutation_reset() {
+        let mut document = parse("<table><form id=owner><tr><td><input id=control><select id=selection></select></table>", 64).unwrap();
+        let find = |document: &Document, id: &str| crate::selector::query_selector(document, document.root(), id).unwrap().unwrap();
+        let form = find(&document, "#owner");
+        let control = find(&document, "#control");
+        let selection = find(&document, "#selection");
+        assert_eq!(crate::forms::form_owner(&document, control), Some(form));
+        assert_eq!(crate::forms::form_owner(&document, selection), Some(form));
+        document.set_attribute(control, "form", "absent").unwrap();
+        document.remove_attribute(control, "form").unwrap();
+        assert_eq!(crate::forms::form_owner(&document, control), None);
+        document.remove(selection).unwrap();
+        assert_eq!(crate::forms::form_owner(&document, selection), None);
+        let body = crate::selector::query_selector(&document, document.root(), "body").unwrap().unwrap();
+        document.append(body, selection).unwrap();
+        assert_eq!(crate::forms::form_owner(&document, selection), None);
+    }
+
+    #[test]
+    fn specification_declarative_fragment_uses_actual_context_host_and_permission() {
+        let mut document = parse("<main><div id=host></div><input id=invalid></main>", 64).unwrap();
+        let host = crate::selector::query_selector(&document, document.root(), "#host").unwrap().unwrap();
+        let fragment = parse_fragment_in_with_declarative_shadow_roots(&mut document, host,
+            "<template shadowrootmode=closed shadowrootcustomelementregistry><p>shadow</p></template><b>light</b>", true).unwrap();
+        let root = document.shadow_root(host).unwrap().expect("actual fragment context receives shadow root");
+        assert_eq!(document.shadow_mode(root).unwrap(), Some(crate::shadow::ShadowMode::Closed));
+        assert!(document.shadow_options(root).unwrap().unwrap().keep_custom_element_registry_null);
+        assert_eq!(inner_html(&document, root).unwrap(), "<p>shadow</p>");
+        assert_eq!(inner_html(&document, fragment).unwrap(), "<b>light</b>");
+        let invalid = crate::selector::query_selector(&document, document.root(), "#invalid").unwrap().unwrap();
+        let fragment = parse_fragment_in_with_declarative_shadow_roots(&mut document, invalid,
+            "<template shadowrootmode=open>inert</template>", true).unwrap();
+        assert!(document.shadow_root(invalid).unwrap().is_none());
+        assert!(inner_html(&document, fragment).unwrap().contains("<template"));
+        let fragment = parse_fragment_in(&mut document, invalid,
+            "<template shadowrootmode=open>ordinary setter</template>").unwrap();
+        assert!(document.shadow_root(invalid).unwrap().is_none());
+        assert!(inner_html(&document, fragment).unwrap().contains("ordinary setter"));
     }
 
     #[test]
@@ -5789,6 +6691,86 @@ mod tests {
             doc.append(context, fragment).unwrap();
             assert_eq!(inner_html(&doc, context).unwrap(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn html_tokenizer_literal_colon_names_preserve_namespaces_and_reclaim_quota_failures() {
+        let mut doc = parse("<main></main>", 32).unwrap();
+        let before = doc.node_count();
+        for _ in 0..100 {
+            let fragment = parse_fragment(&mut doc,
+                "<test:test></test:test><svg><test:test/></svg><math><test:test/></math>").unwrap();
+            let html = doc.first_child(fragment).unwrap().unwrap();
+            let svg = doc.next_sibling(html).unwrap().unwrap();
+            let math = doc.next_sibling(svg).unwrap().unwrap();
+            for (node, namespace) in [(html, Namespace::Html),
+                (doc.first_child(svg).unwrap().unwrap(), Namespace::Svg),
+                (doc.first_child(math).unwrap().unwrap(), Namespace::MathMl)] {
+                assert_eq!(doc.element_name_parts(node).unwrap(), (None, "test:test"));
+                assert!(matches!(doc.kind(node).unwrap(), NodeKind::Element { namespace: actual, .. } if *actual == namespace));
+            }
+            let clone = doc.clone_node(fragment, true).unwrap();
+            assert!(crate::equality::is_equal_node(&doc, fragment, &doc, clone).unwrap());
+            doc.destroy_subtree(clone).unwrap();
+            doc.destroy_subtree(fragment).unwrap();
+            assert_eq!(doc.node_count(), before);
+            assert!(doc.literal_colon_names.is_empty());
+            assert_eq!(doc.literal_colon_names.capacity(), 0);
+        }
+        let oversized = "<test:test></test:test>".repeat(64);
+        for _ in 0..100 {
+            assert!(parse_fragment(&mut doc, &oversized).is_err());
+            assert_eq!(doc.node_count(), before);
+            assert_eq!(doc.literal_colon_names.capacity(), 0);
+        }
+        let xml = crate::xml::parse("<p:root xmlns:p='urn:p'><p:child/></p:root>", 8).unwrap();
+        let root = crate::selector::document_element(&xml).unwrap();
+        assert_eq!(xml.element_name_parts(root).unwrap(), (Some("p"), "root"));
+        assert_eq!(xml.element_name_parts(xml.first_child(root).unwrap().unwrap()).unwrap(), (Some("p"), "child"));
+    }
+
+    #[test]
+    fn fragment_context_distinguishes_literal_colon_names_from_qualified_local_names() {
+        let mut doc = Document::new(24);
+        doc.set_html_document(true);
+        let literal = doc.create_unprefixed_element(Namespace::Html, "h:textarea".into(), Vec::new()).unwrap();
+        let qualified = doc.create(NodeKind::Element { namespace: Namespace::Html, name: "h:textarea".into(), attributes: Vec::new() }).unwrap();
+        let literal_html = doc.create_unprefixed_element(Namespace::Html, "h:html".into(), Vec::new()).unwrap();
+        for _ in 0..100 {
+            let before = doc.node_count();
+            let parsed = parse_fragment_in(&mut doc, literal, "<b>&amp;</b>").unwrap();
+            let first = doc.first_child(parsed).unwrap().unwrap();
+            assert!(matches!(doc.kind(first).unwrap(), NodeKind::Element { name, .. } if name == "b"));
+            doc.destroy_subtree(parsed).unwrap();
+            let rawtext = parse_fragment_in(&mut doc, qualified, "<b>&amp;</b>").unwrap();
+            assert!(matches!(doc.kind(doc.first_child(rawtext).unwrap().unwrap()).unwrap(), NodeKind::Text(text) if text == "<b>&</b>"));
+            doc.destroy_subtree(rawtext).unwrap();
+            let ordinary = parse_fragment_in(&mut doc, literal_html, "<span>text</span>").unwrap();
+            assert!(matches!(doc.kind(doc.first_child(ordinary).unwrap().unwrap()).unwrap(), NodeKind::Element { name, .. } if name == "span"));
+            doc.destroy_subtree(ordinary).unwrap();
+            assert_eq!(doc.node_count(), before);
+        }
+    }
+
+    #[test]
+    fn html_context_body_end_places_comments_after_body_and_reclaims_failed_fragments() {
+        let mut doc = Document::new(16);
+        let context = doc.create_unprefixed_element(Namespace::Html, "html".into(), Vec::new()).unwrap();
+        for _ in 0..100 {
+            for source in ["<head></head><body></body><!-- tail -->", "<body></body><!-- tail -->",
+                           "<body></body></html><!-- tail -->"] {
+                let fragment = parse_fragment_in(&mut doc, context, source).unwrap();
+                assert_eq!(inner_html(&doc, fragment).unwrap(), "<head></head><body></body><!-- tail -->");
+                doc.destroy_subtree(fragment).unwrap();
+                assert_eq!(doc.node_count(), 2);
+            }
+            let source = "<body></body><!-- tail -->".to_owned() + &"<span></span>".repeat(32);
+            assert!(parse_fragment_in(&mut doc, context, &source).is_err());
+            assert_eq!(doc.node_count(), 2);
+        }
+        let full = parse("<!doctype html><html><head></head><body></body><!-- tail --></html><!-- document -->", 16).unwrap();
+        assert_eq!(inner_html(&full, full.root()).unwrap(),
+                   "<!DOCTYPE html><html><head></head><body></body><!-- tail --></html><!-- document -->");
     }
 
     #[test]

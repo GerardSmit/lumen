@@ -131,7 +131,10 @@ fn settle_transfer_list(
         if bridge.flag(ctx, "isUntransferable", item)? {
             return Err(clone_error("Unsupported or duplicate transferable"));
         }
-        if is_port {
+        if let Some(codec) = clone_transfer::native_codec(ctx, item) {
+            if !transport { return Err(clone_error("Native transferable requires message transport")); }
+            (codec.validate)(ctx, item)?;
+        } else if is_port {
             bridge.call(ctx, "validate", std::slice::from_ref(item))?;
         } else if !transport || !ctx.is_transferable_array_buffer(item) {
             return Err(clone_error("Unsupported or detached transferable"));
@@ -157,7 +160,14 @@ fn write_message(
         locals.is_some(),
         limit,
     );
+    let mut natives = Vec::new();
     for item in list {
+        if let Some(codec) = clone_transfer::native_codec(ctx, item) {
+            let index = clone_transfer::reserve_native(ctx, codec.kind)?;
+            writer.add_native(item.clone(), index as u32);
+            natives.push((item.clone(), codec, index));
+            continue;
+        }
         if !bridge.flag(ctx, "isPort", item)? {
             continue;
         }
@@ -178,13 +188,24 @@ fn write_message(
     // Getters may have transferred an outer buffer or port in a nested message: revalidate the
     // whole list before detaching any sender-owned resource.
     for item in list {
-        if bridge.flag(ctx, "isPort", item)? {
+        if let Some(codec) = clone_transfer::native_codec(ctx, item) {
+            (codec.validate)(ctx, item)?;
+        } else if bridge.flag(ctx, "isPort", item)? {
             bridge.call(ctx, "validate", std::slice::from_ref(item))?;
         } else if !ctx.is_transferable_array_buffer(item) {
             return Err(clone_error("Transferable was detached during serialization"));
         }
     }
+    // Export after getters and all revalidation, before committing any detach.
+    let exports = natives.into_iter().map(|(item, codec, index)| {
+        (codec.export)(ctx, &item).map(|payload| (item, codec, index, payload))
+    }).collect::<OpResult<Vec<_>>>()?;
+    for (item, codec, index, payload) in exports {
+        (codec.detach)(ctx, &item, &*payload);
+        clone_transfer::fill_native(ctx, index, payload);
+    }
     for item in list {
+        if clone_transfer::native_codec(ctx, item).is_some() { continue; }
         if bridge.flag(ctx, "isPort", item)? {
             bridge.call(ctx, "detach", std::slice::from_ref(item))?;
         } else {
@@ -252,6 +273,24 @@ pub fn serialize(
 pub fn deserialize(ctx: &mut Ctx, bytes: &[u8], bridge: &Value) -> OpResult<Value> {
     let bridge = Bridge::resolve(ctx, bridge);
     deserialize_with(ctx, bytes, &bridge, &[])
+}
+
+/// StructuredSerializeForStorage without transfer attachments or an authored
+/// bridge. The byte budget is checked by the existing writer as it grows.
+pub fn serialize_for_storage(ctx: &mut Ctx, value: &Value, max_bytes: usize) -> OpResult<Vec<u8>> {
+    let bridge = Bridge { value: Value::Null };
+    let mut writer = Writer::for_storage(ctx, &bridge, max_bytes);
+    writer.write(ctx, value)?;
+    if writer.sink.overflow { return Err(writer.too_large()); }
+    Ok(writer.sink.bytes)
+}
+
+/// Read a storage record using the same attachment-free structured clone core.
+pub fn deserialize_for_storage(ctx: &mut Ctx, bytes: &[u8]) -> OpResult<Value> {
+    let bridge = Bridge { value: Value::Null };
+    // Storage records have no attachment frame; do not finish a message frame
+    // owned by an outer, possibly reentrant structured clone operation.
+    Reader::for_storage(bytes, &bridge).run(ctx)
 }
 
 /// `structuredClone(value, { transfer })` for an already validated transfer list. A transferable
@@ -365,5 +404,31 @@ pub mod internals {
             .ok_or_else(|| invalid_arg_type(ctx, "bytes", "an instance of Uint8Array", &bytes))?;
         let bridge = bridge.unwrap_or(Value::Undefined);
         super::deserialize(ctx, &bytes, &bridge)
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn storage_clone_rejects_attachments_without_consuming_an_outer_message_frame() {
+        let mut engine = lumen::Engine::new();
+        let shared = engine.eval_value("new SharedArrayBuffer(4)").unwrap().ok().expect("shared buffer fixture");
+        let ctx = engine.ctx();
+        let bytes = serialize(ctx, &shared, &[], true, &Value::Null).ok().expect("transport fixture");
+        let message = clone_transfer::take_message(ctx, bytes);
+        let _outer_bytes = clone_transfer::install_message(ctx, message);
+        assert!(matches!(deserialize_for_storage(ctx, &[wire::T_NULL]), Ok(Value::Null)));
+        for tag in [wire::T_SHARED, wire::T_PORT, wire::T_PORTS, wire::T_HOST] {
+            let failure = match deserialize_for_storage(ctx, &[tag, 0, 0, 0, 0]) {
+                Err(failure) => failure,
+                Ok(_) => panic!("storage admitted an attachment or host resolver"),
+            };
+            assert_eq!(failure.class(), "DataCloneError");
+        }
+        assert!(clone_transfer::import_shared(ctx, 0.0).is_ok(), "storage must preserve the outer incoming frame");
+        assert!(serialize_for_storage(ctx, &shared, 128).is_err(), "storage cannot retain shared memory");
+        clone_transfer::finish_frame(ctx);
     }
 }

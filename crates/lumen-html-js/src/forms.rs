@@ -93,6 +93,7 @@ pub struct FormSubmissionRequest {
     pub form: NodeId,
     pub metadata: core_forms::FormSubmission,
     pub form_data: Value,
+    pub navigation_metadata: super::browsing_context::NavigationMetadata,
 }
 
 #[derive(Clone)]
@@ -122,6 +123,7 @@ struct Checkedness {
 
 #[derive(Clone)]
 struct PendingInputTypeChange {
+    previous_type: &'static str,
     previous_mode: core_forms::InputValueMode,
     previous_value: Option<String>,
     previous_value_dirty: bool,
@@ -139,10 +141,32 @@ struct SingleSelectOptionCache {
 const USER_EDITED: u8 = 1 << 0;
 const USER_VALIDITY_INTERACTED: u8 = 1 << 1;
 
+/// Rare FACE state; actual JavaScript values are traced by its one attached
+/// ElementInternals wrapper, while default native controls keep no entry.
+#[derive(Default)]
+pub(crate) struct CustomFormState {
+    pub completed:bool,
+    pub states:Option<Rc<RefCell<lumen::embed::DomStringSet>>>,
+    pub submission:Option<Value>,
+    pub restore:Option<Value>,
+    pub validity:ValidityState,
+    pub message:String,
+    pub anchor:Option<Value>,
+}
+impl CustomFormState {
+    pub fn trace_values(&self,visit:&mut dyn FnMut(&Value)) {
+        for value in [&self.submission,&self.restore,&self.anchor].into_iter().flatten(){visit(value);}
+    }
+}
+
+#[derive(Clone)]
+struct NumberEdit { text: String, bad_input: bool }
+
 /// State held by each `DomRealm`. Only dirty live values are stored here;
 /// defaults remain in the shared DOM attributes or textarea text children.
 #[derive(Clone, Default)]
 pub struct FormState {
+    pub(crate) custom_elements:HashMap<NodeId,Rc<RefCell<CustomFormState>>>,
     defaults: HashMap<NodeId, Defaults>,
     dirty: HashSet<NodeId>,
     checkedness: HashMap<NodeId, Checkedness>,
@@ -153,6 +177,9 @@ pub struct FormState {
     /// drives :user-valid/:user-invalid and survives script value assignment.
     user_state: HashMap<NodeId, u8>,
     live_values: HashMap<NodeId, String>,
+    /// Actual user-visible number text, including partial exponents. API and
+    /// submission values stay sanitized in live_values. Entries are user-edit only.
+    number_edits: HashMap<NodeId, NumberEdit>,
     pending_input_type_change: Option<(NodeId, PendingInputTypeChange)>,
     custom_messages: HashMap<NodeId, String>,
     selectedness: HashMap<NodeId, bool>,
@@ -171,6 +198,22 @@ pub struct FormState {
 }
 
 impl FormState {
+pub(crate) fn custom_form_state(&mut self,node:NodeId)->OpResult<Rc<RefCell<CustomFormState>>> {
+    if let Some(state)=self.custom_elements.get(&node){return Ok(state.clone());}
+    if self.custom_elements.len()>=65_536{return Err(OpError::new("QuotaExceededError","custom form state limit"));}
+    self.custom_elements.try_reserve(1).map_err(|_|OpError::new("QuotaExceededError","custom form state allocation"))?;
+    let state=Rc::new(RefCell::new(CustomFormState::default()));
+    self.custom_elements.insert(node,state.clone());Ok(state)
+}
+pub(crate) fn is_custom_form_control(&self,node:NodeId)->bool {
+    self.custom_elements.get(&node).is_some_and(|state|state.borrow().completed)
+}
+pub(crate) fn complete_custom_form_control(&mut self,node:NodeId)->OpResult<()> {
+    self.custom_form_state(node)?.borrow_mut().completed=true;
+    self.bump_validity_generation();Ok(())
+}
+pub(crate) fn changed_custom_form_state(&mut self){self.bump_validity_generation();}
+
     fn was_user_edited(&self, node: NodeId) -> bool {
         self.user_state
             .get(&node)
@@ -311,6 +354,8 @@ impl FormState {
 }
 
 impl core_forms::ValidityStateView for FormState {
+    fn user_bad_input(&self, node: NodeId) -> bool { self.number_edits.get(&node).is_some_and(|edit| edit.bad_input) }
+    fn custom_element_validity(&self,node:NodeId)->Option<ValidityState>{self.custom_elements.get(&node).map(|state|state.borrow().validity)}
     fn value_override(&self, node: NodeId) -> Option<&str> {
         self.live_values.get(&node).map(String::as_str)
     }
@@ -360,6 +405,14 @@ impl core_forms::FormEntryStateView for FormState {
     }
 }
 
+pub fn presentation_value(state: &FormState, node: NodeId) -> Option<&str> {
+    state
+        .number_edits
+        .get(&node)
+        .map(|edit| edit.text.as_str())
+        .or_else(|| live_value(state, node))
+}
+
 pub fn live_value(state: &FormState, node: NodeId) -> Option<&str> {
     state.live_values.get(&node).map(String::as_str)
 }
@@ -376,6 +429,7 @@ struct FileListData {
 /// Drop adapter state after the shared DOM has reclaimed detached nodes.
 /// Call from `DomRealm::reap_detached` after `destroy_subtree` completes.
 pub fn reap(state: &mut FormState, document: &lumen_html::Document) {
+    state.custom_elements.retain(|node,_|document.kind(*node).is_ok());
     state
         .defaults
         .retain(|node, _| document.kind(*node).is_ok());
@@ -388,6 +442,7 @@ pub fn reap(state: &mut FormState, document: &lumen_html::Document) {
         .retain(|node| document.kind(*node).is_ok());
     state.live_dirty.retain(|node| document.kind(*node).is_ok());
     state.user_state.retain(|node, _| document.kind(*node).is_ok());
+    state.number_edits.retain(|node, _| document.kind(*node).is_ok());
     state
         .live_values
         .retain(|node, _| document.kind(*node).is_ok());
@@ -426,6 +481,7 @@ pub fn adopt_nodes_into(
     mapping: &[(NodeId, NodeId)],
 ) {
     for &(old, new) in mapping {
+        if let Some(value)=source.custom_elements.remove(&old){target.custom_elements.insert(new,value);}
         if let Some(value) = source.defaults.remove(&old) {
             target.defaults.insert(new, value);
         }
@@ -447,6 +503,7 @@ pub fn adopt_nodes_into(
         if let Some(value) = source.live_values.remove(&old) {
             target.live_values.insert(new, value);
         }
+        if let Some(edit) = source.number_edits.remove(&old) { target.number_edits.insert(new, edit); }
         if let Some(value) = source.custom_messages.remove(&old) {
             target.custom_messages.insert(new, value);
         }
@@ -499,9 +556,6 @@ pub fn clone_live_values_into(
             if source.live_dirty.contains(&old) {
                 target.live_dirty.insert(new);
             }
-            if let Some(value) = source.user_state.get(&old) {
-                target.user_state.insert(new, *value);
-            }
             copies_reset_default = true;
         }
         if let Some(checked) = source.checkedness.get(&old) {
@@ -518,6 +572,22 @@ pub fn clone_live_values_into(
             capture_defaults(target, document, new);
         }
     }
+}
+
+/// Snapshot only the states named by HTML's input/textarea cloning steps.
+/// The source and destination can share a realm, so release the read borrow
+/// before applying this small snapshot. User validity, validity messages,
+/// selection and picker state belong to the new control's initial state.
+pub(crate) fn clone_state_snapshot(source: &FormState, mapping: &[(NodeId, NodeId)]) -> FormState {
+    let mut snapshot = FormState::default();
+    for &(old, _) in mapping {
+        if let Some(value) = source.live_values.get(&old) { snapshot.live_values.insert(old, value.clone()); }
+        if source.live_dirty.contains(&old) { snapshot.live_dirty.insert(old); }
+        if source.dirty.contains(&old) { snapshot.dirty.insert(old); }
+        if let Some(value) = source.checkedness.get(&old) { snapshot.checkedness.insert(old, *value); }
+        if source.indeterminate.contains(&old) { snapshot.indeterminate.insert(old); }
+    }
+    snapshot
 }
 
 pub fn install(ctx: &mut Ctx) -> OpResult<()> {
@@ -582,8 +652,41 @@ pub fn set_control_value_from_user(
     node: NodeId,
     value: &str,
 ) -> OpResult<()> {
+    let number = core_forms::html_element_local_name(realm.session.borrow().document(), node)
+        == Some("input")
+        && core_forms::input_type_state(realm.session.borrow().document(), node) == "number";
+    if number {
+        if value.len() > super::editing_history::MAX_CONTROL_BYTES {
+            return Err(OpError::new(
+                "RangeError",
+                "number editing text exceeds the editing limit",
+            ));
+        }
+        let api = core_forms::number_user_value(value);
+        let bad_input = api.is_none();
+        let edit = if value == api.as_deref().unwrap_or("") {
+            None
+        } else {
+            let mut text = String::new();
+            text.try_reserve_exact(value.len())
+                .map_err(|_| OpError::new("RangeError", "number editing allocation failed"))?;
+            text.push_str(value);
+            state.number_edits.try_reserve(1).map_err(|_| {
+                OpError::new("RangeError", "number editing state allocation failed")
+            })?;
+            Some(NumberEdit { text, bad_input })
+        };
+        set_control_value_inner(realm, state, node, api.as_deref().unwrap_or(""), false)?;
+        if let Some(edit) = edit {
+            state.number_edits.insert(node, edit);
+        } else {
+            state.number_edits.remove(&node);
+        }
+        return Ok(());
+    }
     set_control_value_inner(realm, state, node, value, false)
 }
+
 
 fn set_control_value_inner(
     realm: &DomRealm,
@@ -635,6 +738,7 @@ fn set_control_value_inner(
     // Any successful IDL assignment replaces the user-edit provenance,
     // including an assignment equal to the currently displayed value.
     state.clear_user_edited(node);
+    if invalidate_editing { state.number_edits.remove(&node); }
     if is_select {
         let session = realm.session.borrow();
         let document = session.document();
@@ -731,20 +835,27 @@ fn mark_form_user_validity_interacted(
     form: NodeId,
     state: &RefCell<FormState>,
 ) -> OpResult<()> {
+    // Eligibility calls the shared document resolver, which borrows the same
+    // form state. Finish that read phase before mutating interaction state.
+    let eligible = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut eligible = Vec::new();
+        let mut allocation_failed = false;
+        core_forms::for_each_form_control(document, form, |node| {
+            if core_forms::will_validate(document, node) {
+                if eligible.try_reserve(1).is_err() { allocation_failed = true; return false; }
+                eligible.push(node);
+            }
+            true
+        }).map_err(dom_error)?;
+        if allocation_failed { return Err(OpError::new("QuotaExceededError", "validation control snapshot allocation failed")); }
+        eligible
+    };
     let mut state = state.borrow_mut();
-    let session = realm.session.borrow();
-    let document = session.document();
     let mut changed = false;
-    core_forms::for_each_form_control(document, form, |node| {
-        if core_forms::will_validate(document, node) {
-            changed |= state.mark_user_validity_interacted(node);
-        }
-        true
-    })
-    .map_err(dom_error)?;
-    if changed {
-        state.bump_validity_generation();
-    }
+    for node in eligible { changed |= state.mark_user_validity_interacted(node); }
+    if changed { state.bump_validity_generation(); }
     Ok(())
 }
 
@@ -785,6 +896,7 @@ pub fn prepare_input_attribute_change(
         state.pending_input_type_change = Some((
             node,
             PendingInputTypeChange {
+                previous_type: core_forms::input_type_state(document, node),
                 previous_mode,
                 previous_value,
                 previous_value_dirty,
@@ -905,6 +1017,10 @@ pub fn resanitize_input_after_attribute_change(
         let session = realm.session.borrow();
         core_forms::input_value_mode(session.document(), node)
     };
+
+    if pending_type_change.as_ref().is_some_and(|pending| {
+        pending.previous_type != core_forms::input_type_state(realm.session.borrow().document(), node)
+    }) { state.number_edits.remove(&node); }
 
     let became_selection_supported = pending_type_change.as_ref().is_some_and(|pending| {
         !pending.previous_selection_supported
@@ -1869,36 +1985,134 @@ pub(crate) fn select_option_list_changed_with_preferred(
     Ok(())
 }
 
-pub(crate) fn selected_option_in_subtree(
+/// Return the last selected option across a bounded set of insertion roots.
+/// This is used after a DocumentFragment has been drained, when the fragment
+/// itself no longer contains the options whose selectedness was snapshotted
+/// before insertion.
+pub(crate) fn selected_option_in_roots(
     realm: &DomRealm,
-    root: NodeId,
+    roots: &[NodeId],
 ) -> OpResult<Option<NodeId>> {
-    Ok(option_subtree_selection(realm, root)?.1)
-}
-
-pub(crate) fn option_subtree_selection(
-    realm: &DomRealm,
-    root: NodeId,
-) -> OpResult<(bool, Option<NodeId>)> {
     let state = realm.forms.borrow();
     let session = realm.session.borrow();
     let document = session.document();
-    let mut contains_option = false;
     let mut selected = None;
+    for &root in roots {
+        core_forms::for_each_option_in_subtree(document, root, |option, _| {
+            let is_selected = state
+                .selectedness
+                .get(&option)
+                .copied()
+                .unwrap_or_else(|| has_null_attribute(document, option, "selected"));
+            if is_selected {
+                selected = Some(option);
+            }
+            true
+        })
+        .map_err(dom_error)?;
+    }
+    Ok(selected)
+}
+
+/// Preserve the actual selectedness of options whose select-list owner may
+/// change during a tree mutation. Most option values remain represented by
+/// their `selected` attribute; only existing overrides, selected attributes
+/// suppressed by a single-select winner, and selected options without a
+/// selected attribute need a sparse entry in FormState.
+///
+/// `source_select` is the select-list owner before the mutation, if any. A
+/// single-select winner is resolved once, then reused for every moved option
+/// so a large optgroup does not trigger one full select scan per option. The
+/// returned booleans distinguish options in that source list from unowned
+/// options that might become list members after insertion.
+pub(crate) fn capture_option_subtree_selectedness(
+    realm: &DomRealm,
+    root: NodeId,
+    source_select: Option<NodeId>,
+) -> OpResult<(bool, bool, Option<NodeId>)> {
+    let mut state = realm.forms.borrow_mut();
+    let session = realm.session.borrow();
+    let document = session.document();
+    let single_select_winner = source_select
+        .and_then(|select| state.single_select_option(document, select));
+    let mut contains_source_options = false;
+    let mut contains_unowned_options = false;
+    let mut selected_option = None;
+    let mut walk_error = None;
     core_forms::for_each_option_in_subtree(document, root, |option, _| {
-        contains_option = true;
-        let is_selected = state
-            .selectedness
-            .get(&option)
-            .copied()
-            .unwrap_or_else(|| has_null_attribute(document, option, "selected"));
-        if is_selected {
-            selected = Some(option);
+        let owner = match core_forms::option_select(document, option) {
+            Ok(owner) => owner,
+            Err(error) => {
+                walk_error = Some(error);
+                return false;
+            }
+        };
+        // Options inside nested selects keep their owner when an ancestor
+        // subtree moves. Unowned options are also snapshotted: changing an
+        // optgroup boundary can make them members of the destination list.
+        let source_member = owner.is_some() && owner == source_select;
+        if source_member {
+            contains_source_options = true;
+        } else if owner.is_none() {
+            contains_unowned_options = true;
+        } else {
+            return true;
+        }
+        let had_override = state.selectedness.get(&option).copied();
+        let has_selected_attribute = has_null_attribute(document, option, "selected");
+        let selected = match (source_member, single_select_winner) {
+            (true, Some(winner)) => winner == Some(option),
+            _ => had_override.unwrap_or(has_selected_attribute),
+        };
+        if had_override.is_some()
+            || (has_selected_attribute && !selected)
+            || (selected && !has_selected_attribute)
+        {
+            state.selectedness.insert(option, selected);
+        }
+        if selected {
+            selected_option = Some(option);
         }
         true
     })
     .map_err(dom_error)?;
-    Ok((contains_option, selected))
+    if let Some(error) = walk_error {
+        return Err(dom_error(error));
+    }
+    Ok((
+        contains_source_options,
+        contains_unowned_options,
+        selected_option,
+    ))
+}
+
+pub(crate) fn option_subtree_has_select_owner(
+    realm: &DomRealm,
+    root: NodeId,
+    select: NodeId,
+) -> OpResult<bool> {
+    let session = realm.session.borrow();
+    let document = session.document();
+    let mut found = false;
+    let mut walk_error = None;
+    core_forms::for_each_option_in_subtree(document, root, |option, _| {
+        match core_forms::option_select(document, option) {
+            Ok(Some(owner)) if owner == select => {
+                found = true;
+                false
+            }
+            Ok(_) => true,
+            Err(error) => {
+                walk_error = Some(error);
+                false
+            }
+        }
+    })
+    .map_err(dom_error)?;
+    if let Some(error) = walk_error {
+        return Err(dom_error(error));
+    }
+    Ok(found)
 }
 
 /// Initialize an option's selectedness without setting its dirty flag.
@@ -2054,13 +2268,25 @@ fn populate_form_data_with_encoding(
     // Freeze only the live entry-list inputs before calling author-controlled
     // FormData.append methods. The full FormState also contains unrelated
     // validity, selection, and wrapper state and must not be cloned here.
-    let entries = {
-        let state = realm.forms.borrow();
-        core_forms::form_entries_with_state_and_encoding(
-            realm.session.borrow().document(), form, submitter, &*state, encoding,
-        )
-    };
-    for entry in entries {
+let (entries,custom_entries)={
+    let state=realm.forms.borrow();let session=realm.session.borrow();let document=session.document();
+    let mut entries=Vec::new();let mut custom_entries=Vec::new();
+    core_forms::for_each_form_control(document,form,|node| {
+        if document.is_form_associated_custom_element(node) {
+            if !core_forms::is_disabled(document,node) {
+                if let Some(value)=state.custom_elements.get(&node).and_then(|state|state.borrow().submission.clone()) {
+                    let name=document.get_attribute_ns_ref(node,None,"name").ok().flatten().unwrap_or("").to_owned();
+                    custom_entries.push((entries.len(),name,value));
+                }
+            }
+        }else{core_forms::append_form_entries_for_control(document,node,submitter,&*state,encoding,&mut entries);}
+        true
+    }).map_err(dom_error)?;(entries,custom_entries)
+};
+let mut custom_entries=custom_entries.into_iter().peekable();
+for (index,entry) in entries.into_iter().enumerate() {
+    append_custom_form_entries(ctx,&data,index,&mut custom_entries)?;
+
         match entry.value {
             FormEntryValue::Text(value) => {
                 lumen_host::blob::append_text(ctx, &data, &entry.name, &value)?
@@ -2078,8 +2304,20 @@ fn populate_form_data_with_encoding(
             )?,
         }
     }
+    append_custom_form_entries(ctx,&data,usize::MAX,&mut custom_entries)?;
     realm.dispatch_user_agent(ctx, form, "formdata", false, false, &[("formData", data)])?;
     Ok(())
+}
+
+fn append_custom_form_entries(ctx:&mut Ctx,data:&Value,before:usize,entries:&mut std::iter::Peekable<std::vec::IntoIter<(usize,String,Value)>>)->OpResult<()> {
+    while entries.peek().is_some_and(|entry|entry.0<=before){
+        let (_,name,value)=entries.next().expect("peeked custom entry");
+        if lumen_host::blob::is_form_data(ctx,&value){lumen_host::blob::append_form_data(ctx,data,&value)?;}
+        else if !name.is_empty(){
+            if let Value::Str(text)=value {lumen_host::blob::append_text(ctx,data,&name,text.as_str())?;}
+            else{lumen_host::blob::append_file_value(ctx,data,&name,value)?;}
+        }
+    }Ok(())
 }
 
 pub fn set_custom_validity(state: &mut FormState, node: NodeId, message: &str) {
@@ -2149,6 +2387,11 @@ pub struct DomValidityState {
     owner: Value,
 }
 
+impl lumen::embed::NativeIdentityOwner for DomValidityState {
+    const TRACES_NATIVE_VALUES:bool=true;
+    fn trace_native_identities(&self,_:u64,_:&mut dyn FnMut(&Value)){}
+    fn trace_native_values(&self,visit:&mut dyn FnMut(&Value)){visit(&self.owner);}
+}
 impl DomValidityState {
     fn current(&self, ctx: &mut Ctx) -> OpResult<ValidityState> {
         ctx.with_instance::<DomNode, _>(&self.owner, |node| {
@@ -2216,7 +2459,8 @@ fn current_validity(realm: &DomRealm, node: NodeId, state: &FormState) -> OpResu
 }
 
 pub fn validity_object(ctx: &mut Ctx, owner: Value) -> OpResult<Value> {
-    Ok(ctx.new_instance(DomValidityState { owner }))
+    let value=ctx.new_instance(DomValidityState { owner });
+    ctx.set_native_identity_owner::<DomValidityState>(&value)?;Ok(value)
 }
 
 pub fn will_validate(realm: &DomRealm, node: NodeId) -> bool {
@@ -2232,6 +2476,7 @@ pub fn validation_message(
         return Ok(String::new());
     }
     let state = state.borrow();
+    if let Some(custom)=state.custom_elements.get(&node){return Ok(custom.borrow().message.clone());}
     if let Some(message) = state.custom_messages.get(&node) {
         return Ok(message.clone());
     }
@@ -2321,6 +2566,15 @@ pub fn report_validity(
         realm.focus(ctx, Some(node))?;
     }
     Ok(valid)
+}
+
+pub(crate) fn report_custom_validity(ctx:&mut Ctx,realm:&Rc<DomRealm>,node:NodeId,custom:&Rc<RefCell<CustomFormState>>)->OpResult<bool>{
+    let (valid,not_canceled)=validate_control(ctx,realm,node,&realm.forms)?;
+    if !valid && not_canceled {
+        let anchor=custom.borrow().anchor.clone();
+        let target=if let Some(anchor)=anchor {ctx.with_instance::<DomNode,_>(&anchor,|node|node.realm.resolve_adopted_node(node.id)).ok()}else{None};
+        if let Some((owner,id))=target {owner.focus(ctx,Some(id))?;}else{realm.focus(ctx,Some(node))?;}
+    }Ok(valid)
 }
 
 /// Statically validate the form's associated controls and fire one invalid
@@ -2506,6 +2760,11 @@ fn finish_submission(
         form,
         metadata,
         form_data,
+        navigation_metadata: {
+            let mut metadata = super::browsing_context::NavigationMetadata::from_document(realm);
+            metadata.source_element = Some(form);
+            metadata
+        },
     }))
 }
 
@@ -2550,6 +2809,7 @@ pub fn reset_form(
     if !realm.dispatch(ctx, form, "reset", true, true, &[])? {
         return Ok(false);
     }
+    custom_elements::enqueue_form_reset(realm,form)?;
     let controls = core_forms::form_reset_controls(realm.session.borrow().document(), form);
     let has_controls = !controls.is_empty();
     let selects = {
@@ -2565,6 +2825,7 @@ pub fn reset_form(
     let mut session = realm.session.borrow_mut();
     let document = session.document_mut();
     for node in controls {
+        state.number_edits.remove(&node);
         let Some(name) = html_local_name(document, node) else {
             continue;
         };
@@ -3670,6 +3931,144 @@ fn dispatch_pointer_sequence_event(
     super::events::dispatch_user_agent_event(ctx, lumen_bind::This(receiver), event)
 }
 
+struct ControlActivation {
+    element: Value,
+    event: Value,
+    previous_checked: bool,
+    previous_indeterminate: bool,
+    previous_radio: Option<Value>,
+    prepared: bool,
+}
+
+pub(crate) fn activation_behavior(ctx: &mut Ctx, receiver: &Value, event: &Value) -> OpResult<Option<lumen_host::events::PreparedActivation>> {
+    let Some((realm, node)) = ctx.with_instance::<DomNode, _>(receiver, |node| (node.realm.clone(), node.id)).ok() else { return Ok(None); };
+    let name = {
+        let session = realm.session.borrow();
+        html_local_name(session.document(), node).map(str::to_owned)
+    };
+    if !matches!(name.as_deref(), Some("input" | "button" | "summary" | "label")) { return Ok(None); }
+    if ctx.with_instance::<super::ui_events::DomMouseEvent, _>(event, |_| ()).is_err()
+        || !ctx.with_instance::<DomEvent, _>(event, |event| event.kind()=="click").unwrap_or(false) { return Ok(None); }
+    Ok(Some(Box::new(ControlActivation {
+        element: receiver.clone(), event: event.clone(), previous_checked:false,
+        previous_indeterminate:false, previous_radio:None, prepared:false,
+    })))
+}
+
+impl lumen_host::events::ActivationBehavior for ControlActivation {
+    fn pre_activate(&mut self, ctx: &mut Ctx) -> OpResult<()> {
+        let (realm, node) = ctx.with_instance::<DomNode, _>(&self.element, |node| (node.realm.clone(), node.id))?;
+        let action = click_activation(realm.session.borrow().document(), node);
+        self.previous_checked = checked(&realm, node)?;
+        self.previous_indeterminate = indeterminate(&realm.forms.borrow(), node);
+        if let ClickActivation::Checkable { radio:true } = action {
+            let mut members = core_forms::radio_group_members(realm.session.borrow().document(), node);
+            members.push(node);
+            for member in members {
+                if checked(&realm, member)? {
+                    self.previous_radio = Some(realm.wrap(ctx, member));
+                    break;
+                }
+            }
+        }
+        self.prepared = true;
+        if let ClickActivation::Checkable { radio } = action {
+            set_checked(&realm, &mut realm.forms.borrow_mut(), node, radio || !self.previous_checked)?;
+            if !radio { set_indeterminate(&mut realm.forms.borrow_mut(), node, false); }
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, ctx: &mut Ctx, accepted: bool) -> OpResult<()> {
+        let (realm, node) = ctx.with_instance::<DomNode, _>(&self.element, |node| (node.realm.clone(), node.id))?;
+        let (name, action, form, connected, disabled) = {
+            let session = realm.session.borrow();
+            let document = session.document();
+            if document.kind(node).is_err() { return Ok(()); }
+            (html_local_name(document,node).unwrap_or("").to_owned(),
+                click_activation(document,node), core_forms::form_owner(document,node),
+                document.is_connected_element(node), core_forms::is_disabled(document,node))
+        };
+        if !accepted {
+            if !self.prepared { return Ok(()); }
+            // Cancellation is defined by the input's current type and current
+            // radio group, not the type/group that existed before listeners.
+            match action {
+                ClickActivation::Checkable { radio:false } => {
+                    set_checked(&realm, &mut realm.forms.borrow_mut(),node,self.previous_checked)?;
+                    set_indeterminate(&mut realm.forms.borrow_mut(),node,self.previous_indeterminate);
+                }
+                ClickActivation::Checkable { radio:true } => {
+                    let previous = self.previous_radio.as_ref().and_then(|value|
+                        ctx.with_instance::<DomNode,_>(value,|node|(node.realm.clone(),node.id)).ok());
+                    let previous = previous.filter(|(owner,previous)| Rc::ptr_eq(owner,&realm) &&
+                        (*previous==node || core_forms::radio_group_members(realm.session.borrow().document(),node).contains(previous)));
+                    if let Some((_,previous))=previous {
+                        set_checked(&realm,&mut realm.forms.borrow_mut(),previous,true)?;
+                    } else { set_checked(&realm,&mut realm.forms.borrow_mut(),node,false)?; }
+                }
+                _=>{}
+            }
+            return Ok(());
+        }
+        if name=="summary" {
+            realm.session.borrow_mut().document_mut().activate_summary(node).map_err(dom_error)?;
+            return Ok(());
+        }
+        if name=="label" {
+            let event_target=ctx.with_instance::<DomEvent,_>(&self.event,|event|event.target_for_retarget())?;
+            let event_target=ctx.with_instance::<DomNode,_>(&event_target,|target|(target.realm.clone(),target.id)).ok();
+            let control = {
+                let session=realm.session.borrow();
+                let document=session.document();
+                let control=lumen_html::labels::label_control(document,node).map_err(dom_error)?;
+                let mut blocked=false;
+                if let Some((owner,target))=&event_target {
+                    if Rc::ptr_eq(owner,&realm) {
+                        let mut current=Some(*target);
+                        while let Some(candidate)=current {
+                            if candidate==node { break; }
+                            if Some(candidate)==control || document.is_interactive_content(candidate) { blocked=true;break; }
+                            current=document.composed_parent(candidate).map_err(dom_error)?;
+                        }
+                    }
+                }
+                control.filter(|control|!blocked && !core_forms::is_disabled(document,*control))
+            };
+            if let Some(control)=control {
+                // The platform's label policy focuses the shared associated
+                // control and sends a real synthetic click, including FACE.
+                if realm.focusable_node(control)? { realm.focus(ctx,Some(control))?; }
+                click_element(ctx,&realm,&DomEventTarget::node(&realm,control),control)?;
+            }
+            return Ok(());
+        }
+        let event_target = ctx.with_instance::<DomEvent, _>(&self.event, |event| event.target_for_retarget())?;
+        if name == "button" {
+            return super::invokers::button_activation(ctx, self.element.clone(), event_target);
+        }
+        match action {
+            ClickActivation::Checkable { .. } if connected => {
+                realm.dispatch_user_agent(ctx,node,"input",true,false,&[])?;
+                realm.dispatch_user_agent(ctx,node,"change",true,false,&[])?;
+            }
+            ClickActivation::Submit | ClickActivation::Reset if !disabled => {
+                if !realm.browsing_context().is_some_and(|context| browsing_context::is_active_document(&context,&realm)) { return Ok(()); }
+                if let Some(form)=form {
+                    match action {
+                        ClickActivation::Submit=>{ realm.submit_form(ctx,form,Some(node))?; }
+                        ClickActivation::Reset=>{ reset_form(ctx,&realm,form,&realm.forms)?; }
+                        _=>{}
+                    }
+                }
+            }
+            _=>{}
+        }
+        if name == "input" { super::invokers::input_popover_activation(ctx, self.element.clone(), event_target)?; }
+        Ok(())
+    }
+}
+
 fn click_with_event(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
@@ -3680,196 +4079,79 @@ fn click_with_event(
     allow_non_html: bool,
     set_click_in_progress: bool,
 ) -> OpResult<()> {
-    let (activation, disabled, checked_snapshot, indeterminate) = {
-        let session = realm.session.borrow();
-        let document = session.document();
-        let name = html_local_name(document, node);
-        if name.is_none() && !allow_non_html {
-            return Err(OpError::type_error("click requires an HTML element"));
-        }
-        let name = name.unwrap_or("");
-        let is_form_control = matches!(name, "input" | "button" | "select" | "textarea");
-        let disabled = is_form_control && core_forms::is_disabled(document, node);
-        let activation = click_activation(document, node);
-        let checked_snapshot = if !disabled {
-            match activation {
-                ClickActivation::Checkable { radio: true } => {
-                    let mut members = core_forms::radio_group_members(document, node);
-                    members.push(node);
-                    let state = realm.forms.borrow();
-                    members
-                        .into_iter()
-                        .map(|member| {
-                            let checked = state
-                                .checkedness
-                                .get(&member)
-                                .map(|value| value.value)
-                                .unwrap_or_else(|| has_null_attribute(document, member, "checked"));
-                            (member, checked)
-                        })
-                        .collect()
-                }
-                ClickActivation::Checkable { radio: false } => {
-                    let state = realm.forms.borrow();
-                    vec![(
-                        node,
-                        state
-                            .checkedness
-                            .get(&node)
-                            .map(|value| value.value)
-                            .unwrap_or_else(|| has_null_attribute(document, node, "checked")),
-                    )]
-                }
-                _ => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let indeterminate = realm.forms.borrow().indeterminate.contains(&node);
-        (activation, disabled, checked_snapshot, indeterminate)
-    };
-    if disabled {
-        return Ok(());
+    {
+        let session=realm.session.borrow();
+        let document=session.document();
+        let name=html_local_name(document,node);
+        if name.is_none() && !allow_non_html { return Err(OpError::type_error("click requires an HTML element")); }
+        if matches!(name,Some("input"|"button"|"select"|"textarea")) && core_forms::is_disabled(document,node) { return Ok(()); }
     }
-    let click_guard = set_click_in_progress;
-    if click_guard && !target.try_begin_click() {
-        return Ok(());
-    }
-
-    let restore_checkable = |realm: &Rc<DomRealm>| -> OpResult<()> {
-        match activation {
-            ClickActivation::Checkable { radio: true } => {
-                let previously_checked = checked_snapshot
-                    .iter()
-                    .find_map(|(member, checked)| checked.then_some(*member));
-                let previous_is_still_in_group = previously_checked.is_some_and(|previous| {
-                    if previous == node {
-                        return true;
-                    }
-                    let session = realm.session.borrow();
-                    core_forms::radio_group_members(session.document(), node).contains(&previous)
-                });
-                let mut state = realm.forms.borrow_mut();
-                if previous_is_still_in_group {
-                    if let Some(previous) = previously_checked {
-                        set_checked(realm, &mut state, previous, true)?;
-                    }
-                } else {
-                    set_checked(realm, &mut state, node, false)?;
-                }
-            }
-            ClickActivation::Checkable { radio: false } => {
-                let was_checked = checked_snapshot
-                    .iter()
-                    .find_map(|(member, checked)| (*member == node).then_some(*checked))
-                    .unwrap_or(false);
-                let mut state = realm.forms.borrow_mut();
-                set_checked(realm, &mut state, node, was_checked)?;
-                set_indeterminate(&mut state, node, indeterminate);
-            }
-            _ => {}
-        }
-        Ok(())
-    };
-
-    let mut checkable_changed = false;
-    if let ClickActivation::Checkable { radio } = activation {
-        let was_checked = checked_snapshot
-            .iter()
-            .find(|(member, _)| *member == node)
-            .is_some_and(|(_, checked)| *checked);
-        let preactivation = set_checked(
-            realm,
-            &mut realm.forms.borrow_mut(),
-            node,
-            radio || !was_checked,
-        );
-        if let Err(error) = preactivation {
-            if click_guard {
-                target.end_click();
-            }
-            return Err(error);
-        }
-        checkable_changed = !radio || !was_checked;
-        if !radio {
-            set_indeterminate(&mut realm.forms.borrow_mut(), node, false);
-        }
-    }
-
-    let event_result = (|| {
-        let receiver = realm.wrap(ctx, node);
-        let event = lumen::embed::JsObject::from_value(event_value)
-            .ok_or_else(|| OpError::type_error("click event constructor returned a non-object"))?;
-        if trusted {
-            events::dispatch_user_agent_event(ctx, lumen_bind::This(receiver), event)
-        } else {
-            crate::events::dispatch_event(ctx, lumen_bind::This(receiver), event)
-        }
-    })();
-
-    let result = (|| match event_result {
-        Err(error) => {
-            if matches!(activation, ClickActivation::Checkable { .. }) {
-                restore_checkable(realm)?;
-            }
-            Err(error)
-        }
-        Ok(false) => {
-            if matches!(activation, ClickActivation::Checkable { .. }) {
-                restore_checkable(realm)?;
-            }
-            Ok(())
-        }
-        Ok(true) => {
-            if matches!(activation, ClickActivation::Checkable { .. }) && checkable_changed {
-                let (event_realm, event_node) = realm.resolve_adopted_node(node);
-                if event_realm.session.borrow().document().kind(event_node).is_ok() {
-                    event_realm.dispatch_user_agent(ctx, event_node, "input", true, false, &[])?;
-                    event_realm.dispatch_user_agent(ctx, event_node, "change", true, false, &[])?;
-                }
-            }
-
-            // Activation behavior is selected again after click listeners run. In particular,
-            // author code may change an input's type, move it to another form, detach it, or
-            // adopt it into another document before the default action is chosen.
-            let (action_realm, action_node) = realm.resolve_adopted_node(node);
-            let (action, form) = {
-                let session = action_realm.session.borrow();
-                let document = session.document();
-                (
-                    click_activation(document, action_node),
-                    core_forms::form_owner(document, action_node),
-                )
-            };
-            if let Some(form) = form {
-                match action {
-                    ClickActivation::Reset => {
-                        reset_form(ctx, &action_realm, form, &action_realm.forms)?;
-                    }
-                    ClickActivation::Submit => {
-                        action_realm.submit_form(ctx, form, Some(action_node))?;
-                    }
-                    _ => {}
-                }
-            }
-            // Summary activation uses the same current target after listeners,
-            // including adoption and changes to first-summary/interactive state.
-            // Central attribute mutation admits the genuine native toggle task.
-            action_realm.session.borrow_mut().document_mut()
-                .activate_summary(action_node).map_err(dom_error)?;
-            Ok(())
-        }
-    })();
-    if click_guard {
-        target.end_click();
-    }
-    result
+    if set_click_in_progress && !target.try_begin_click() { return Ok(()); }
+    struct ClickScope<'a> { target:&'a DomEventTarget, enabled:bool }
+    impl Drop for ClickScope<'_> { fn drop(&mut self) { if self.enabled { self.target.end_click(); } } }
+    let _scope=ClickScope {target,enabled:set_click_in_progress};
+    let receiver=realm.wrap(ctx,node);
+    let event=lumen::embed::JsObject::from_value(event_value)
+        .ok_or_else(||OpError::type_error("click event constructor returned a non-object"))?;
+    if trusted { events::dispatch_user_agent_event(ctx,lumen_bind::This(receiver),event)?; }
+    else { events::dispatch_event(ctx,lumen_bind::This(receiver),event)?; }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lumen::Engine;
+
+    #[test]
+    fn specification_window_shared_activation_pre_cancel_post_and_path_arbitration() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<!doctype html><form id=form><input id=box type=checkbox><input id=old type=radio name=g checked><input id=radio type=radio name=g><button id=submit><span id=leaf></span></button></form><details id=details><summary id=summary><input id=nested type=checkbox></summary></details><label id=label for=box><span id=labelleaf></span><button id=interactive type=button></button></label>", 256).unwrap();
+        realm.set_document_url("https://activation.test/page");
+        let value = engine.eval_value(r#"(() => {
+            const check=(ok,message)=>{if(!ok)throw new Error(message);};
+            const box=document.getElementById('box'),radio=document.getElementById('radio'),old=document.getElementById('old');
+            let input=0,change=0;
+            box.addEventListener('input',event=>{check(event.isTrusted && event.composed,'UA input metadata');input++;});
+            box.addEventListener('change',event=>{check(event.isTrusted && !event.composed,'UA change metadata');change++;});
+            box.indeterminate=true;
+            box.onclick=event=>{check(box.checked && !box.indeterminate,'preactivation precedes listeners');event.preventDefault();};
+            const canceled=new MouseEvent('click',{bubbles:true,cancelable:true});
+            check(!box.dispatchEvent(canceled) && !box.checked && box.indeterminate,'author dispatch cancellation restores state');
+            check(input===0 && change===0,'canceled activation has no post events');
+            box.onclick=null;box.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(box.checked && input===1 && change===1,'accepted author MouseEvent performs native activation');
+            radio.onclick=event=>{check(radio.checked && !old.checked,'radio group preactivation');event.preventDefault();};
+            radio.click();check(old.checked && !radio.checked,'canceled radio restores actual prior group member');
+            radio.onclick=event=>{radio.name='different';event.preventDefault();};
+            radio.click();check(!radio.checked,'changed group cannot restore old radio into a different group');
+            box.onclick=event=>{box.type='text';event.preventDefault();};
+            box.click();check(!box.checked,'canceled activation examines the current input type');
+            box.type='checkbox';box.onclick=null;box.disabled=true;box.click();
+            check(!box.checked,'HTMLElement click bails for disabled form control');
+            box.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(box.checked,'author dispatch still performs checkbox preactivation');
+            box.disabled=false;
+            const details=document.getElementById('details'),nested=document.getElementById('nested');
+            nested.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(nested.checked && !details.open,'nearest input activation suppresses summary activation');
+            document.getElementById('summary').dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(details.open,'summary action runs through the common dispatcher');
+            let submissions=0;document.getElementById('form').onsubmit=event=>{submissions++;event.preventDefault();};
+            document.getElementById('leaf').dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(submissions===1,'ancestor submit button wins the actual event path');
+            document.getElementById('interactive').dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(box.checked,'interactive descendant prevents label forwarding');
+            document.getElementById('labelleaf').dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+            check(!box.checked,'label forwards through core control association and common activation');
+            return true;
+        })()"#).unwrap().unwrap_or_else(|exception| {
+            let message = engine.ctx().member_get(&exception, "stack").ok()
+                .and_then(|value| engine.ctx().coerce_string(&value).ok()).map(|value|value.to_string()).unwrap_or_default();
+            panic!("shared activation guard: {message}");
+        });
+        assert!(matches!(value, Value::Bool(true)));
+    }
     use lumen_runtime::Runtime;
 
     fn eval(engine: &mut Engine, source: &str) -> Value {
@@ -4060,6 +4342,28 @@ mod tests {
         if !matches!(eval(engine, source), Value::Bool(true)) {
             panic!("{label}");
         }
+    }
+
+    #[test]
+    fn trusted_pointer_descendant_focuses_ancestor_without_retargeting_events() {
+        let mut runtime=Runtime::new();
+        let engine=runtime.engine();
+        let realm=crate::install(engine.ctx(),"<button id=before>before</button><table id=table tabindex=0><tr><td id=cell>cell</td></tr></table>",64).unwrap();
+        assert_true(engine,r#"
+            globalThis.before=document.getElementById('before');
+            globalThis.table=document.getElementById('table');
+            globalThis.cell=document.getElementById('cell');
+            globalThis.trace=[];
+            table.addEventListener('focus',e=>trace.push('focus:'+e.target.id));
+            table.addEventListener('click',e=>trace.push('click:'+e.target.id));
+            before.focus();cell.focus();document.activeElement===before
+        "#,"programmatic focus on a nonfocusable descendant does not climb");
+        let cell=query_node(&realm,"#cell");
+        trusted_pointer_click(engine.ctx(),&realm,cell,10.0,10.0).unwrap();
+        assert_true(engine,"document.activeElement===table && trace.join(',')==='focus:table,click:cell' && !table.matches(':focus-visible')","pointer focus climbs while click retains the hit descendant");
+        assert_true(engine,"before.focus();trace=[];cell.addEventListener('mousedown',e=>e.preventDefault(),{once:true});true","canceling fixture installs");
+        trusted_pointer_click(engine.ctx(),&realm,cell,10.0,10.0).unwrap();
+        assert_true(engine,"document.activeElement===before && trace.join(',')==='click:cell'","canceling mousedown prevents ancestor focus but preserves click");
     }
 
     #[test]
@@ -5272,6 +5576,39 @@ mod tests {
             "(()=>{const file=new FormData(document.querySelector('form')).get('upload');return file!==null&&file.name===''&&file.type==='application/octet-stream'&&file.size===0})()",
         );
         assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn specification_clone_control_state_excludes_user_interaction_and_selection() {
+        let mut runtime = Runtime::new();
+        let engine = runtime.engine();
+        let realm = crate::install(engine.ctx(), "<input id='edited' minlength='5'><textarea id='area'>default</textarea><input id='checked' type='checkbox'>", 128).unwrap();
+        let input = {
+            let session = realm.session.borrow();
+            lumen_html::selector::query_selector(session.document(), session.document().root(), "#edited").unwrap().unwrap()
+        };
+        {
+            let mut state = realm.forms.borrow_mut();
+            set_control_value_from_user(&realm, &mut state, input, "x").unwrap();
+            mark_user_edited(&mut state, input);
+        }
+        assert!(matches!(eval(engine, r#"
+          const check=(v,m)=>{if(!v)throw new Error(m)}, input=document.querySelector('#edited'), area=document.querySelector('#area'), checked=document.querySelector('#checked');
+          area.value='live';area.setSelectionRange(1,3);checked.checked=true;checked.indeterminate=true;input.setCustomValidity('source-only');
+          const copy=input.cloneNode(), areaCopy=document.importNode(area,true), checkedCopy=checked.cloneNode();
+          check(input.validity.tooShort,'original actual user edit provenance');
+          check(copy.value==='x','cloned live value');
+          check(!copy.validity.tooShort,'clone initial user edit provenance');
+          check(!copy.matches(':user-invalid'),'clone initial user validity');
+          check(!copy.validity.customError && copy.validationMessage==='','custom validity is not a cloning state');
+          copy.maxLength=0;check(copy.getAttribute('maxlength')==='0' && !copy.validity.tooLong,'input maxlength reflection without user editing clone');
+          check(areaCopy.value==='live' && areaCopy.selectionStart===0 && areaCopy.selectionEnd===0,'textarea raw value with initial selection');
+          check(checkedCopy.checked && checkedCopy.indeterminate,'checkedness and indeterminate copy');
+          copy.setAttribute('value','new-default');areaCopy.textContent='new-default';check(copy.value==='x' && areaCopy.value==='live','dirty flags copied');
+          checkedCopy.defaultChecked=false;check(checkedCopy.checked,'dirty checkedness copied independently from value');
+          const pristine=document.createElement('input'), pristineCopy=document.importNode(pristine,false);pristineCopy.defaultValue='changed';pristineCopy.defaultChecked=true;check(pristineCopy.value==='changed' && pristineCopy.checked,'initial dirty flags remain false');
+          const select=document.createElement('select');select.innerHTML='<option selected>first</option><option>second</option>';select.selectedIndex=1;const selectCopy=select.cloneNode(true);check(select.selectedIndex===1 && selectCopy.selectedIndex===0,'option selectedness initializes from cloned attributes rather than dirty selectedness');true
+        "#), Value::Bool(true)));
     }
 
     #[test]

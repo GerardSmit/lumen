@@ -431,6 +431,7 @@ const PROTOCOLS: &[&str] = &[
     "init",
     "len",
     "getitem",
+    "indexof",
     "setitem",
     "delitem",
     "contains",

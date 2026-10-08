@@ -454,14 +454,15 @@ fn expand_root(rect: Rect, margins: [Margin; 4]) -> Rect {
 struct ResizeHub {
     realm: Weak<DomRealm>,
     observers: RefCell<Vec<Weak<ResizeData>>>,
-    delivery: RefCell<Option<JsFunction>>,
+    delivery: RefCell<Option<WeakValue>>,
     scheduled: Cell<bool>,
 }
 struct IntersectionHub {
     realm: Weak<DomRealm>,
     observers: RefCell<Vec<Weak<IntersectionData>>>,
-    delivery: RefCell<Option<JsFunction>>,
+    delivery: RefCell<Option<WeakValue>>,
     scheduled: Cell<bool>,
+    task_queued: Cell<bool>,
 }
 
 impl ResizeHub {
@@ -954,14 +955,26 @@ fn bind_delivery(ctx: &mut Ctx, delivery: Value, value: Value) -> OpResult<Value
 /// exact retained frame; the host controls ResizeObserver pre-paint and
 /// IntersectionObserver task delivery through the phase functions below.
 pub fn layout_completed(ctx: &mut Ctx) {
+    if let Err(error)=gather_resize(ctx,0) {
+        let exception=error.to_value(ctx);
+        crate::error_reporting::report_exception(ctx,exception);
+    }
+    sample_intersections(ctx);
+}
+
+#[derive(Default)]
+struct ResizeGather {
+    shallowest: Option<usize>,
+    skipped: bool,
+}
+
+fn gather_resize(ctx: &mut Ctx, minimum_depth: usize) -> OpResult<ResizeGather> {
+    let mut result=ResizeGather::default();
     let Some(resize_hub) = RealmServices::<ResizeHub>::current(ctx) else {
-        return;
-    };
-    let Some(intersection_hub) = RealmServices::<IntersectionHub>::current(ctx) else {
-        return;
+        return Ok(result);
     };
     let Some(realm) = resize_hub.realm.upgrade() else {
-        return;
+        return Ok(result);
     };
     let resize_observers = resize_hub
         .observers
@@ -975,7 +988,7 @@ pub fn layout_completed(ctx: &mut Ctx) {
             let sampled = {
                 let mut session = realm.session.borrow_mut();
                 let geometry = crate::geometry::snapshot(&mut session, *target);
-                geometry.and_then(|geometry| {
+                if let Some(geometry)=geometry {
                     let resolution = session.media_environment().resolution;
                     let content_box_size =
                         (geometry.content_rect.width, geometry.content_rect.height);
@@ -988,14 +1001,28 @@ pub fn layout_completed(ctx: &mut Ctx) {
                         ResizeBox::BorderBox => geometry.border_box_size,
                         ResizeBox::DevicePixelContentBox => device_pixel_size,
                     };
-                    observation.state.sample_with_box(
+                    let mut depth=0;
+                    let mut ancestor=Some(*target);
+                    while let Some(node)=ancestor {
+                        if depth==512 {return Err(OpError::new("QuotaExceededError","ResizeObserver ancestry limit"));}
+                        depth+=1;
+                        ancestor=session.document().composed_parent(node).map_err(dom_error)?;
+                    }
+                    if depth<=minimum_depth && observation.state.last_observed_size!=Some(observed_size) {
+                        result.skipped=true;
+                        None
+                    } else {
+                    let entry=observation.state.sample_with_box(
                         *target,
                         geometry.content_rect,
                         geometry.border_box_size,
                         observed_size,
                         device_pixel_size,
-                    )
-                })
+                    );
+                    if entry.is_some() {result.shallowest=Some(result.shallowest.map_or(depth,|old|old.min(depth)));}
+                    entry
+                    }
+                } else {None}
             };
             if let Some(entry) = sampled {
                 observer.pending.borrow_mut().push(ResizePending {
@@ -1009,6 +1036,12 @@ pub fn layout_completed(ctx: &mut Ctx) {
             resize_hub.schedule();
         }
     }
+    Ok(result)
+}
+
+fn sample_intersections(ctx: &mut Ctx) {
+    let Some(intersection_hub)=RealmServices::<IntersectionHub>::current(ctx) else {return;};
+    let Some(realm)=intersection_hub.realm.upgrade() else {return;};
     let intersection_observers = intersection_hub
         .observers
         .borrow()
@@ -1039,6 +1072,50 @@ pub fn layout_completed(ctx: &mut Ctx) {
     }
 }
 
+/// The rendering host has completed layout. Broadcast resize observations in
+/// depth order, re-layout real callback mutations, then enqueue intersections.
+pub(crate) fn rendering_checkpoint(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
+    let mut depth=0;
+    loop {
+        let gathered=gather_resize(ctx,depth)?;
+        let Some(next_depth)=gathered.shallowest else {
+            if gathered.skipped {
+                let options=ctx.new_object_with_proto(&Value::Null);
+                ctx.create_data_property(&options,"message",Value::str("ResizeObserver loop completed with undelivered notifications.")).map_err(OpError::thrown)?;
+                ctx.create_data_property(&options,"cancelable",Value::Bool(true)).map_err(OpError::thrown)?;
+                let constructor=ctx.class_constructor::<lumen_host::events::ErrorEvent>();
+                let event=ctx.construct(constructor,&[Value::str("error"),options]).map_err(lumen::embed::abrupt_value).map_err(OpError::thrown)?;
+                let event=JsObject::from_value(event).ok_or_else(||OpError::type_error("ErrorEvent required"))?;
+                let window=realm.window_wrapper.borrow().as_ref().and_then(WeakValue::upgrade).and_then(JsObject::from_value);
+                if let Some(window)=window {
+                    events::dispatch_user_agent_event(ctx,This(window.into_value()),event)?;
+                }
+                realm.flush_layout()?;
+            }
+            break;
+        };
+        if let Err(error)=deliver_resize(ctx) {
+            let exception=error.to_value(ctx);
+            crate::error_reporting::report_exception(ctx,exception);
+        }
+        realm.flush_layout()?;
+        // Every broadcast increases depth; the bounded ancestry walk above
+        // therefore also bounds this callback/layout loop without a timer.
+        depth=next_depth;
+    }
+    sample_intersections(ctx);
+    if let Some(hub)=RealmServices::<IntersectionHub>::current(ctx) {
+        if hub.scheduled.get() && !hub.task_queued.replace(true) {
+            let weak=Rc::downgrade(&hub);
+            if let Err(error)=scheduling::queue_task(ctx,move|ctx| {
+                if let Some(hub)=weak.upgrade() {hub.task_queued.set(false);deliver_intersections(ctx)?;}
+                Ok(())
+            }) {hub.task_queued.set(false);return Err(error);}
+        }
+    }
+    Ok(())
+}
+
 /// Deliver pending ResizeObserver callbacks in the host's pre-paint phase.
 pub fn deliver_resize(ctx: &mut Ctx) -> OpResult<()> {
     let Some(hub) = RealmServices::<ResizeHub>::current(ctx) else {
@@ -1047,7 +1124,7 @@ pub fn deliver_resize(ctx: &mut Ctx) -> OpResult<()> {
     if !hub.scheduled.replace(false) {
         return Ok(());
     }
-    let callback = hub.delivery.borrow().clone();
+    let callback = hub.delivery.borrow().as_ref().and_then(WeakValue::upgrade).and_then(JsFunction::from_value);
     if let Some(callback) = callback {
         callback.call(ctx, Value::Undefined, &[])?;
     }
@@ -1067,7 +1144,7 @@ pub fn deliver_intersections(ctx: &mut Ctx) -> OpResult<()> {
     if !hub.scheduled.replace(false) {
         return Ok(());
     }
-    let callback = hub.delivery.borrow().clone();
+    let callback = hub.delivery.borrow().as_ref().and_then(WeakValue::upgrade).and_then(JsFunction::from_value);
     if let Some(callback) = callback {
         callback.call(ctx, Value::Undefined, &[])?;
     }
@@ -1091,6 +1168,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
             observers: RefCell::new(Vec::new()),
             delivery: RefCell::new(None),
             scheduled: Cell::new(false),
+            task_queued: Cell::new(false),
         },
     );
     ctx.class_constructor::<ResizeDelivery>();
@@ -1099,19 +1177,13 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         hub: resize_hub.clone(),
     });
     let resize_bound = bind_delivery(ctx, resize_delivery.clone(), resize_delivery)?;
-    *resize_hub.delivery.borrow_mut() = Some(
-        JsFunction::from_value(resize_bound)
-            .ok_or_else(|| OpError::new("TypeError", "ResizeObserver delivery invalid"))?,
-    );
+    *resize_hub.delivery.borrow_mut() = Some(crate::realm_services::capture_realm_value(ctx, resize_bound)?);
     let intersection_delivery = ctx.new_instance(IntersectionDelivery {
         hub: intersection_hub.clone(),
     });
     let intersection_bound =
         bind_delivery(ctx, intersection_delivery.clone(), intersection_delivery)?;
-    *intersection_hub.delivery.borrow_mut() = Some(
-        JsFunction::from_value(intersection_bound)
-            .ok_or_else(|| OpError::new("TypeError", "IntersectionObserver delivery invalid"))?,
-    );
+    *intersection_hub.delivery.borrow_mut() = Some(crate::realm_services::capture_realm_value(ctx, intersection_bound)?);
     let global = ctx.global_object();
     let resize_constructor = ctx.class_constructor::<DomResizeObserver>();
     let intersection_constructor = ctx.class_constructor::<DomIntersectionObserver>();
@@ -1257,6 +1329,57 @@ mod tests {
         assert!(IntersectionState::new(vec![-0.1]).is_err());
         let state = IntersectionState::new(vec![1.0, 0.5, 0.5]).unwrap();
         assert_eq!(state.thresholds, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn rendering_checkpoint_delivers_real_canvas_resize_and_queues_intersections() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<!doctype html><canvas id=c width=5 height=7 style='width:20px;height:10px'></canvas>",64).unwrap();
+        assert!(matches!(eval(&mut engine,r#"
+            globalThis.c=document.getElementById('c');globalThis.sizes=[];globalThis.intersections=0;
+            globalThis.ro=new ResizeObserver(entries=>{
+                const box=entries[0].devicePixelContentBoxSize[0];sizes.push([box.inlineSize,box.blockSize]);
+                c.width=box.inlineSize;c.height=box.blockSize;
+            });ro.observe(c);
+            globalThis.io=new IntersectionObserver(()=>intersections++);io.observe(c);true
+        "#),Value::Bool(true)));
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"sizes.length===0 && intersections===0"),Value::Bool(true)),"an unrendered document does not fabricate observations");
+        let font=Rc::new(FontFace::new(Arc::from(DEFAULT_FONT_BYTES)).unwrap());
+        realm.set_layout_flusher(Rc::new(move|session|session.display_list(120,100,font.as_ref()).map(|_|()).map_err(|error|format!("{error:?}"))));
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"sizes.length===1 && sizes[0][0]===20 && sizes[0][1]===10 && c.width===20 && c.height===10 && intersections===0"),Value::Bool(true)));
+        assert!(scheduling::run_tasks(&mut engine,16).is_empty());
+        assert!(matches!(eval(&mut engine,"intersections===1"),Value::Bool(true)),"intersection delivery waits for its owner task");
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"sizes.length===1"),Value::Bool(true)),"same-size bitmap mutations do not create a resize loop");
+        eval(&mut engine,"c.style.width='30px';true");
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"sizes.length===2 && sizes[1][0]===30 && c.width===30"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn rendering_checkpoint_resize_depth_loop_reports_and_recovers() {
+        let (mut engine,realm)=install_with_font("<!doctype html><div id=p style='width:20px;height:20px'><div id=child style='width:10px;height:10px'></div></div>");
+        assert!(matches!(eval(&mut engine,r#"
+            globalThis.p=document.getElementById('p');globalThis.child=document.getElementById('child');
+            globalThis.broadcasts=[];globalThis.errors=0;globalThis.errorBrand=false;
+            addEventListener('error',e=>{if(e.message==='ResizeObserver loop completed with undelivered notifications.'){errors++;e.preventDefault();errorBrand=e instanceof ErrorEvent && e.isTrusted && e.cancelable && e.defaultPrevented}});
+            globalThis.ro=new ResizeObserver(entries=>{
+                broadcasts.push(entries.map(e=>e.target.id+':'+e.contentRect.width).sort().join(','));
+                if(entries.some(e=>e.target===p))child.style.width='30px';
+            });ro.observe(p);ro.observe(child);true
+        "#),Value::Bool(true)));
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"broadcasts.length===2 && broadcasts[0]==='child:10,p:20' && broadcasts[1]==='child:30' && errors===0"),Value::Bool(true)),"a deeper target changed by a callback broadcasts within the same frame");
+        eval(&mut engine,r#"ro.disconnect();globalThis.loopCalls=0;globalThis.loopRO=new ResizeObserver(()=>{loopCalls++;p.style.width=(20+loopCalls)+'px'});loopRO.observe(p);true"#);
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"loopCalls===1 && errors===1 && errorBrand"),Value::Bool(true)),"same-depth callback mutations produce one real loop error, without unbounded callbacks");
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"loopCalls===2 && errors===2"),Value::Bool(true)),"undelivered sizes remain observable on the next frame");
+        eval(&mut engine,"loopRO.disconnect();true");
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(matches!(eval(&mut engine,"loopCalls===2 && errors===2"),Value::Bool(true)));
     }
 
     #[test]

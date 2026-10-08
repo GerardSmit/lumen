@@ -60,8 +60,8 @@ impl Interp {
                         }
                     }
                 }
-                let parent = crate::builtins::js_get_prototype_of(self, &ov)
-                    .map_err(Abrupt::Throw)?;
+                let parent =
+                    crate::builtins::js_get_prototype_of(self, &ov).map_err(Abrupt::Throw)?;
                 cur = match parent {
                     Value::Obj(parent) => Some(parent),
                     _ => None,

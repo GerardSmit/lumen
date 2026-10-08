@@ -949,7 +949,7 @@ function __initByCopy(Class) {
     for (const n of names) delete perf[n];
     __builtins.get("perf_hooks");
   };
-  if (perf && typeof perf.mark !== "function") {
+  if (perf && typeof perf.timerify !== "function") {
     for (const name of names) {
       Object.defineProperty(perf, name, {
         get() { materialize(); return perf[name]; },

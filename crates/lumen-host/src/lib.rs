@@ -51,10 +51,12 @@ pub mod loop_reactor;
 pub mod perf;
 /// The native `Performance` interface and the `performance` and `self` globals.
 pub mod performance;
+pub mod performance_timeline;
 /// Transferable `MessagePort` endpoints.
 pub mod ports;
 /// `structuredClone` and the wire format behind `postMessage` (`docs/native-clone.md`).
 pub mod structured_clone;
+pub mod indexed_db;
 /// Typed host services scoped to one realm.
 pub mod random;
 pub mod realm_services;
@@ -1004,6 +1006,8 @@ pub struct TaskRegistry {
 /// reject — when absent, a decode error is reported as an uncaught exception), and the
 /// payload decoder.
 pub struct TaskEntry {
+    /// A host-owned resource decoder can finish without entering JavaScript.
+    pub native_only: bool,
     pub on_ok: Value,
     pub on_err: Option<Value>,
     pub decode: TaskDecoder,
@@ -1028,6 +1032,7 @@ impl TaskRegistry {
         self.map.insert(
             id,
             TaskEntry {
+                native_only: false,
                 on_ok,
                 on_err,
                 decode,
@@ -1053,6 +1058,7 @@ impl TaskRegistry {
         if let Some(e) = self.map.get(&id) {
             if e.persistent {
                 return Some(TaskEntry {
+                    native_only: e.native_only,
                     on_ok: e.on_ok.clone(),
                     on_err: e.on_err.clone(),
                     decode: e.decode,
@@ -1162,6 +1168,14 @@ pub fn register_task(
     let entry = registry.map.get_mut(&id).unwrap();
     entry.context = context;
     entry.owner = Some(owner);
+    id
+}
+
+/// Admit host-managed I/O which settles entirely in Rust, retaining the realm and async frame
+/// without manufacturing a JavaScript no-op callback.
+pub fn register_native_task(ctx: &mut Ctx, decode: TaskDecoder) -> TaskId {
+    let id = register_task(ctx, Value::Undefined, None, decode);
+    ctx.host_mut::<TaskRegistry>().unwrap().map.get_mut(&id).unwrap().native_only = true;
     id
 }
 

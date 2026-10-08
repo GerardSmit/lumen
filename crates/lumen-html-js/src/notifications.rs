@@ -522,39 +522,39 @@ impl DomNotification {
     }
 
     #[getter]
-    fn onclick(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("click"))
+    fn onclick(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "click")
     }
     #[setter]
-    fn set_onclick(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "click", callback);
+    fn set_onclick(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "click", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onshow(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("show"))
+    fn onshow(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "show")
     }
     #[setter]
-    fn set_onshow(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "show", callback);
+    fn set_onshow(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "show", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onclose(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("close"))
+    fn onclose(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "close")
     }
     #[setter]
-    fn set_onclose(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "close", callback);
+    fn set_onclose(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "close", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onerror(&self) -> Nullable<JsFunction> {
-        Nullable(self.base.handler("error"))
+    fn onerror(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "error")
     }
     #[setter]
-    fn set_onerror(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "error", callback);
+    fn set_onerror(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "error", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
 }

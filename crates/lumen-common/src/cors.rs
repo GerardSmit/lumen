@@ -85,6 +85,18 @@ pub struct FetchPolicy {
 }
 
 impl FetchPolicy {
+    /// A user-agent CSP report: fixed method/MIME/credentials, no CORS handshake,
+    /// and no redirects. This entrypoint does not change author fetch validation.
+    pub fn new_policy_report(origin: &str, url: &str, body: Vec<u8>) -> Result<Self, PolicyError> {
+        let target = crate::url::parse_url(url, None).ok_or(PolicyError::InvalidUrl)?;
+        if !matches!(target.scheme.as_str(), "http" | "https") { return Err(PolicyError::InvalidUrl); }
+        let mut policy = Self::new(origin,"POST",url,&target.origin(),
+            vec![("content-type".into(),"application/csp-report".into())],Some(body),
+            Mode::Cors,Credentials::SameOrigin,Redirect::Error)?;
+        policy.mode = Mode::NoCors;
+        set_header(&mut policy.headers,"origin",origin);
+        Ok(policy)
+    }
     pub fn new(
         origin: &str,
         method: &str,
@@ -182,6 +194,12 @@ impl FetchPolicy {
 
     pub fn current_url(&self) -> &str {
         &self.url
+    }
+    /// Credentials are selected from the trusted request policy at each redirect hop.
+    pub fn credentials_allowed(&self) -> bool {
+        self.credentials == Credentials::Include
+            || (self.credentials == Credentials::SameOrigin
+                && self.current_url_origin == self.origin && !self.cors_tainted)
     }
     pub fn method(&self) -> &str {
         &self.method
@@ -287,6 +305,16 @@ impl FetchPolicy {
             headers,
             body: None,
         }
+    }
+    /// Fetch's TAO check uses the current hop's response tainting and serialized
+    /// request origin. The transport retains failure across redirect hops.
+    pub fn timing_allow_response(&self, headers: &[(String, String)]) -> bool {
+        let cross = self.cors_tainted || self.current_url_origin != self.origin;
+        if !cross { return true; }
+        headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("timing-allow-origin"))
+            .flat_map(|(_, value)| value.split(','))
+            .map(|value|value.trim_matches(|c|matches!(c,' '| '\t')))
+            .any(|value|value == "*" || value == self.cors_origin)
     }
     /// Validate a response head and, when it is a followed redirect, update the next hop.
     /// Return `true` when the adapter should issue the next request.
@@ -632,4 +660,35 @@ fn upload_listeners_force_preflight_only_across_origins() {
         Credentials::SameOrigin, Redirect::Follow).unwrap();
     same.set_force_preflight(true);
     assert!(!same.needs_preflight());
+}
+
+#[cfg(test)]
+mod policy_report_tests {
+    use super::*;
+    #[test]
+    fn ua_reports_preserve_mime_omit_cross_origin_credentials_and_reject_redirects() {
+        let mut report=FetchPolicy::new_policy_report("https://example.test","https://other.test/report",b"{}".to_vec()).unwrap();
+        assert!(report.preflight_request().is_none());assert!(!report.credentials_allowed());
+        let head=report.actual_request();assert_eq!(head.method,"POST");
+        assert!(head.headers.iter().any(|(name,value)|name=="content-type"&&value=="application/csp-report"));
+        assert!(head.headers.iter().any(|(name,value)|name=="origin"&&value=="https://example.test"));
+        assert_eq!(report.response_head(302,&[],Some("https://example.test/redirected"),Some(("https://example.test/redirected","https://example.test"))),Err(PolicyError::Redirect));
+        assert!(FetchPolicy::new_policy_report("https://example.test","https://example.test/report",Vec::new()).unwrap().credentials_allowed());
+        assert!(matches!(FetchPolicy::new("https://example.test","POST","https://other.test/report","https://other.test",Vec::new(),None,Mode::NoCors,Credentials::SameOrigin,Redirect::Error),Err(PolicyError::NoCorsRedirect)));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn specification_stylesheet_timing_access_is_independent_of_cors_and_redirect_tainting() {
+    let mut policy=FetchPolicy::new("https://page.test","GET","https://page.test/root.css","https://page.test",Vec::new(),None,
+        Mode::NoCors,Credentials::Include,Redirect::Follow).unwrap();
+    assert!(policy.timing_allow_response(&[]));
+    policy.response_head(302,&[],Some("https://other.test/root.css"),Some(("https://other.test/root.css","https://other.test"))).unwrap();
+    assert!(!policy.timing_allow_response(&[]));
+    assert!(policy.timing_allow_response(&alloc::vec![("Timing-Allow-Origin".into(),"*".into())]),"TAO wildcard permits credentialed responses");
+    assert!(policy.timing_allow_response(&alloc::vec![("Timing-Allow-Origin".into(),"https://page.test".into())]));
+    policy.response_head(302,&[],Some("https://third.test/next.css"),Some(("https://third.test/next.css","https://third.test"))).unwrap();
+    assert!(!policy.timing_allow_response(&alloc::vec![("Timing-Allow-Origin".into(),"https://page.test".into())]),"redirect-tainted origin is null");
+    assert!(policy.timing_allow_response(&alloc::vec![("Timing-Allow-Origin".into(),"null".into())]));
 }

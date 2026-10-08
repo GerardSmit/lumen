@@ -343,16 +343,40 @@ pub struct ModuleRequest {
     pub attribute_type: Option<String>,
 }
 
+/// A captured fetch request. Hosts may copy its plain metadata to an I/O worker;
+/// the engine retains the originating settings separately while work is pending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleFetchRequest {
+    pub settings_key: usize,
+    pub resolution: Option<lumen_common::import_maps::Resolution>,
+    pub specifier: String,
+    pub referrer: String,
+    pub attribute_type: Option<String>,
+    pub script_context: Option<std::rc::Rc<ClassicScriptContext>>,
+}
+
+pub struct ModuleFetchResult {
+    pub key: String,
+    pub source: String,
+    /// Effective options after the response, with its final URL as the base.
+    pub script_context: Option<std::rc::Rc<ClassicScriptContext>>,
+}
+
 /// A host request for an asynchronous dynamic `import()`. Hosts that cannot
 /// synchronously fetch a module may install the async loader and complete the
 /// request later with [`Engine::complete_async_module_import`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsyncModuleImportRequest {
     pub id: u64,
+    /// Identity of the captured environment settings, never the completion's active realm.
+    pub settings_key: usize,
+    pub resolution: Option<lumen_common::import_maps::Resolution>,
     pub specifier: String,
     pub referrer: String,
     pub attribute_type: Option<String>,
     pub defer: bool,
+    /// Captured initiating script fetch options; contains no realm handles.
+    pub script_context: Option<std::rc::Rc<ClassicScriptContext>>,
 }
 
 /// The outcome of evaluating a script.
@@ -362,6 +386,16 @@ pub enum Completion {
     /// A value was thrown. `name` is the error's constructor name (`"TypeError"`, …) when the
     /// thrown value is an Error object, else `""`.
     Throw { name: String, message: String },
+}
+
+/// Host-defined classic-script fetch context. Shared source metadata contains
+/// no JavaScript handles and can safely outlive its originating realm.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct ClassicScriptContext {
+    pub base_url: String,
+    pub nonce: String,
+    pub credentials_mode: String,
+    pub referrer_policy: String,
 }
 
 #[cfg(feature = "embed")]
@@ -387,6 +421,11 @@ pub struct ModuleEvaluationHandle {
 
 #[cfg(feature = "embed")]
 impl ModuleEvaluationHandle {
+    /// The real evaluation promise, including dependency and top-level-await
+    /// completion, for host APIs such as Worklet.addModule.
+    pub fn promise(&self) -> &embed::Value {
+        &self.promise
+    }
     /// The linked namespace for the root module. Its bindings remain live as evaluation proceeds.
     pub fn namespace(&self) -> &embed::Value {
         &self.namespace
@@ -434,7 +473,9 @@ pub fn module_requests(src: &str) -> Result<Vec<ModuleRequest>, ParseError> {
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
 /// [`eval`](Engine::eval) calls.
 pub struct Engine {
-    interp: Interp,
+    // Suspended coroutines retain the interpreter address across host calls.
+    // Moving the public driver must preserve that address.
+    interp: Box<Interp>,
 }
 
 /// Collect unreachable object/scope cycles after all realms on this driver have been
@@ -542,7 +583,7 @@ impl Drop for Engine {
         if !last || std::thread::panicking() || !value::gc_state_alive() {
             return;
         }
-        drop(std::mem::replace(&mut self.interp, Interp::uninitialized()));
+        drop(std::mem::replace(&mut self.interp, Box::new(Interp::uninitialized())));
         release_thread_realm_roots();
         self.interp.gc_collect();
         release_thread_dead_weaks();
@@ -555,6 +596,18 @@ impl Drop for Engine {
 }
 
 impl Engine {
+    /// Register immutable host script metadata while parsing/evaluating a
+    /// source. Closures retain metadata through the canonical weak source table.
+    pub fn with_classic_script_context<R>(
+        &mut self,
+        context: std::rc::Rc<ClassicScriptContext>,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.interp.classic_script_context.replace(context);
+        let result = operation(self);
+        self.interp.classic_script_context = previous;
+        result
+    }
     /// Select before evaluating scripts; existing chunks may retain native code.
     pub fn set_jit_mode(&mut self, mode: JitMode) {
         self.interp.jit_mode = mode;
@@ -593,7 +646,7 @@ impl Engine {
         let _mem = memstats::enter(memstats::Cat::Builtins);
         let _ = LIVE_ENGINES.try_with(|n| n.set(n.get() + 1));
         Engine {
-            interp: Interp::new(),
+            interp: Box::new(Interp::new()),
         }
     }
 
@@ -817,6 +870,16 @@ impl Engine {
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
     }
 
+    /// Install the loader for the currently entered environment settings.
+    /// Legacy Node loaders remain supported by set_module_loader_attrs.
+    pub fn set_module_fetch_loader(
+        &mut self,
+        loader: impl Fn(ModuleFetchRequest) -> Option<ModuleFetchResult> + 'static,
+    ) {
+        let key = value::Gc::as_ptr(&self.interp.global) as usize;
+        self.interp.module_fetch_loaders.insert(key, std::rc::Rc::new(loader));
+    }
+
     /// Route dynamic `import()` requests to an asynchronous host. Static module
     /// linking keeps using the loader passed to `eval_module_attrs_pending`;
     /// hosts complete these requests after preparing the graph.
@@ -825,7 +888,8 @@ impl Engine {
         &mut self,
         handler: impl Fn(AsyncModuleImportRequest) + 'static,
     ) {
-        self.interp.async_module_import_handler = Some(std::rc::Rc::new(handler));
+        let key = value::Gc::as_ptr(&self.interp.global) as usize;
+        self.interp.async_module_import_handlers.insert(key, std::rc::Rc::new(handler));
     }
 
     /// Complete a request previously delivered to the async module handler.
@@ -1176,7 +1240,12 @@ impl Engine {
 /// published crate; it stabilizes together with the `lumen-host`/`lumen-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
-    pub use crate::embed_clone::{object_identity, CloneBrand};
+    /// Parse the canonical ECMAScript array-index property key without coercion.
+    #[inline]
+    pub fn array_index(key: &str) -> Option<u32> {
+        crate::value::canonical_index(key)
+    }
+    pub use crate::embed_clone::{object_identity, CloneBrand, DomStringSet};
     pub use crate::embed_realms::{
         HostGlobalThisError, HostRealmDisposeError, HostRealmEvalError, HostRealmScopeError,
         RealmHandle, WindowProxyDisposition, WindowProxyError, WindowProxyOperation,
@@ -1198,7 +1267,7 @@ pub mod embed {
     pub use crate::embed_convert::{
         class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
         JsFunction, JsHost, JsObject, Nullable, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
-        LazyGroupInit, NativeIdentityOwner, WeakValue,
+        LazyGroupInit, NativeIdentityOwner, NativeOperationHooks, WeakValue,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
@@ -1577,9 +1646,15 @@ impl Engine {
     /// Errors thrown by `queueMicrotask` callbacks since the last call.
     pub fn take_task_errors(&mut self) -> Vec<embed::Value> {
         match self.interp.task_errors.as_mut() {
-            Some(list) => std::mem::take(list),
+            Some(list) => std::mem::take(list).into_iter().map(|(error,_)|error).collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Pending queueMicrotask throws paired with actual reporting globals.
+    /// Owned globals live only until delivery; the value-only API stays compatible.
+    pub fn take_task_errors_with_globals(&mut self)->Vec<(embed::Value,embed::Value)> {
+        self.interp.task_errors.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is

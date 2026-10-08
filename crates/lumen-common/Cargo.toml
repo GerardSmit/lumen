@@ -9,11 +9,14 @@ publish = false
 # Hash-flooding test helpers (`fasthash::tests`) shared with the engine's own tests.
 test-support = []
 web-encoding = ["dep:encoding_rs"]
+# WHATWG resource classification uses Servo's maintained pure-Rust sniffer.
+object-mime = ["dep:mime_classifier"]
 video = ["dep:shiguredo_mp4", "dep:rusty_h264-decoder", "dep:rusty_h264-common"]
 # AAC decoding is isolated because the pinned decoder currently requires std;
 # the portable MP4/H.264 demux path stays available without it.
 aac = ["video", "dep:rusty_aac"]
 cookies = ["dep:psl"]
+csp = ["dep:content-security-policy", "dep:serde_json", "dep:sfv"]
 # Exact allocation counters in `fastalloc` (see the engine's `memstats`); they sit on the allocation fast path.
 mem-stats = []
 # `executable`: ELF / Mach-O / PE structure of standalone stubs, read through the `object` crate.
@@ -31,6 +34,10 @@ lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
 crypt = ["dep:bcrypt"]
 
 [dependencies]
+parse-srcset = { version = "=0.1.1", path = "../../vendor/parse-srcset-0.1.1", default-features = false }
+libm = "0.2"
+mime_classifier = { version = "=0.0.1", optional = true }
+mediatype = { version = "=0.23.0", default-features = false }
 encoding_rs = { version = "=0.8.42", default-features = false, optional = true }
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
@@ -41,6 +48,9 @@ unicode-segmentation = { version = "=1.12.0", default-features = false }
 unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"] }
 unicode-script = "=0.5.8"
 psl = { version = "=2.1.238", optional = true }
+content-security-policy = { version = "=0.9.0", optional = true }
+serde_json = { version = "=1.0.151", default-features = false, features = ["alloc"], optional = true }
+sfv = { version = "=0.15.0", optional = true }
 # Same version as lumen-codegen's object writer; `read` brings the ELF, Mach-O and PE readers (no_std + alloc).
 object = { version = "=0.36.7", default-features = false, features = ["read"], optional = true }
 digest = { version = "0.10", optional = true }

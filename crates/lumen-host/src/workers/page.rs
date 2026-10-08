@@ -148,6 +148,8 @@ fn resolve_dedicated(ctx: &mut Ctx, script_url: &str) -> OpResult<(String, Optio
             format!("Failed to construct 'Worker': Invalid URL '{script_url}'"),
         )
     })?;
+    // Blob URLs additionally require creator-partition authorization in the backend's registry;
+    // serialized "null" origins alone cannot establish same-origin access.
     if url.origin() != origin {
         return Err(dom_error(
             ctx,
@@ -156,7 +158,7 @@ fn resolve_dedicated(ctx: &mut Ctx, script_url: &str) -> OpResult<(String, Optio
         ));
     }
     match url.scheme.as_str() {
-        "http" | "https" | "file" => Ok((url.href(), Some(origin))),
+        "http" | "https" | "file" | "blob" => Ok((url.href(), Some(origin))),
         scheme => Err(dom_error(
             ctx,
             "NotSupportedError",
@@ -248,7 +250,7 @@ fn resolve_shared(
 
 struct WorkerState {
     backend: Rc<dyn WorkerBackend>,
-    id: u64,
+    id: Option<u64>,
     control: Control,
     task: Cell<Option<TaskId>>,
     pin: RefCell<Option<Value>>,
@@ -317,7 +319,7 @@ fn worker_wake(ctx: &mut Ctx, target: &WeakValue, state: &Rc<WorkerState>) {
                 flush_worker(ctx, worker);
             }
             state.exited.set(true);
-            state.backend.exited(ctx, state.id);
+            if let Some(id)=state.id {state.backend.exited(ctx,id);}
             stop_control(ctx, &state.control, &state.task);
             unpin(&state.pin);
             return;
@@ -339,7 +341,7 @@ impl CtorRet<JsHost, bindings::Worker> for Started {
         let instance = <JsHost as Host>::construct(cx, self.worker)?;
         <JsHost as Host>::with_ctx(cx, |ctx: &mut Ctx| {
             start_worker(ctx, &instance, &state, self.outside).map_err(|error| {
-                state.backend.terminate(ctx, state.id);
+                if let Some(id)=state.id {state.backend.terminate(ctx,id);}
                 error.to_value(ctx)
             })
         })?;
@@ -377,7 +379,7 @@ fn start_worker(
 
 struct SharedState {
     backend: Rc<dyn WorkerBackend>,
-    id: u64,
+    id: Option<u64>,
     control: Control,
     task: Cell<Option<TaskId>>,
     pin: RefCell<Option<Value>>,
@@ -466,7 +468,7 @@ impl CtorRet<JsHost, bindings::SharedWorker> for SharedStarted {
         let instance = <JsHost as Host>::construct(cx, self.worker)?;
         <JsHost as Host>::with_ctx(cx, |ctx: &mut Ctx| {
             start_shared(ctx, &instance, &state, &self.slot, self.port).map_err(|error| {
-                state.backend.disconnect_shared(ctx, state.id);
+                if let Some(id)=state.id {state.backend.disconnect_shared(ctx,id);}
                 error.to_value(ctx)
             })
         })?;
@@ -508,7 +510,7 @@ fn shared_disconnect(ctx: &mut Ctx, state: &Rc<SharedState>) {
     }
     unpin(&state.pin);
     stop_control(ctx, &state.control, &state.task);
-    state.backend.disconnect_shared(ctx, state.id);
+    if let Some(id)=state.id {state.backend.disconnect_shared(ctx,id);}
 }
 
 #[lumen_bind::module(name = "workers")]
@@ -546,6 +548,7 @@ pub mod bindings {
                 ));
             };
             let (url, owner_origin) = resolve_dedicated(ctx, script_url)?;
+            let allowed=super::super::backend::check_request_policy(ctx, &url, false)?;
             let (outside, inside) = ports::new_pair();
             let control = Control::new();
             let spec = DedicatedSpec {
@@ -557,16 +560,20 @@ pub mod bindings {
                 inside,
                 control: control.clone(),
             };
-            let id = match backend.spawn_dedicated(ctx, spec) {
-                Ok(id) => id,
+            let id = if !allowed {
+                drop(spec);
+                control.send(WorkerEvent::Error("worker blocked by Content Security Policy".into()));
+                control.send(WorkerEvent::Exit(1));
+                None
+            } else {match backend.spawn_dedicated(ctx, spec) {
+                Ok(id) => Some(id),
                 Err(error) => {
                     outside.close();
                     return Err(error.into());
                 }
-            };
+            }};
             if !ports::available(ctx) {
-                backend.terminate(ctx, id);
-                backend.exited(ctx, id);
+                if let Some(id)=id {backend.terminate(ctx,id);backend.exited(ctx,id);}
                 outside.close();
                 return Err(OpError::type_error(
                     "Workers require the message-ports extension",
@@ -614,7 +621,7 @@ pub mod bindings {
                 return Ok(());
             }
             unpin(&self.state.pin);
-            self.state.backend.terminate(ctx, self.state.id);
+            if let Some(id)=self.state.id {self.state.backend.terminate(ctx,id);}
             if let Some(receiver) = self.receiver.get().cloned() {
                 receiver.close(ctx, &this.0);
             }
@@ -682,6 +689,7 @@ pub mod bindings {
                 ));
             };
             let (key, entry, remote) = resolve_shared(ctx, script_url, &options)?;
+            let allowed=super::super::backend::check_request_policy(ctx, &entry, true)?;
             let (page_side, worker_side) = ports::new_pair();
             let control = Control::new();
             let spec = SharedSpec {
@@ -692,15 +700,20 @@ pub mod bindings {
                 worker_side,
                 control: control.clone(),
             };
-            let id = match backend.connect_shared(ctx, spec) {
-                Ok(id) => id,
+            let id = if !allowed {
+                drop(spec);
+                control.send(WorkerEvent::Error("worker blocked by Content Security Policy".into()));
+                control.send(WorkerEvent::Close);
+                None
+            } else {match backend.connect_shared(ctx, spec) {
+                Ok(id) => Some(id),
                 Err(error) => {
                     page_side.close();
                     return Err(error.into());
                 }
-            };
+            }};
             if !ports::available(ctx) {
-                backend.disconnect_shared(ctx, id);
+                if let Some(id)=id {backend.disconnect_shared(ctx,id);}
                 page_side.close();
                 return Err(OpError::type_error(
                     "Workers require the message-ports extension",

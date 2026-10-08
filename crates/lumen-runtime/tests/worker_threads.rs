@@ -10,6 +10,83 @@ use std::time::Duration;
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
 use lumen_web::FetchConfig;
 
+#[test]
+fn blob_worker_executes_snapshot_after_revocation_and_reports_unavailable_entries() {
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()), err: Box::new(Captured::default()),
+    });
+    let source = r#"
+        const url = URL.createObjectURL(new Blob([
+            'onmessage = ({data}) => { postMessage([data + 1, location.href]); close(); };'
+        ], {type: 'text/javascript'}));
+        const worker = new Worker(url);
+        URL.revokeObjectURL(url);
+        worker.onmessage = ({data}) => console.log('snapshot', data[0], data[1] === url);
+        worker.onerror = ({message}) => { console.log('unexpected', message); worker.terminate(); };
+        worker.postMessage(41);
+        const unavailable = new Worker(url);
+        unavailable.onerror = () => console.log('revoked');
+        const badUrl = URL.createObjectURL(new Blob(['postMessage("classic plain"); close();'], {type:'text/plain'}));
+        const classic = new Worker(badUrl);
+        classic.onmessage = ({data}) => console.log(data);
+        const invalid = new Worker(badUrl, {type:'module'});
+        URL.revokeObjectURL(badUrl);
+        invalid.onerror = () => console.log('mime');
+        const moduleUrl = URL.createObjectURL(new Blob(['export const value=43; postMessage(value); close();'], {type:'text/javascript'}));
+        const moduleWorker = new Worker(moduleUrl, {type:'module'});
+        URL.revokeObjectURL(moduleUrl);
+        moduleWorker.onmessage = ({data}) => console.log('module', data);
+    "#;
+    match runtime.eval(source).expect("blob Worker parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    let mut lines = out.lines();
+    lines.sort();
+    assert_eq!(lines, ["classic plain", "mime", "module 43", "revoked", "snapshot 42 true"]);
+}
+
+#[test]
+fn blob_worker_registry_denies_other_opaque_partition_and_retired_owner() {
+    use lumen_host::blob::ObjectUrlEnvironment;
+    struct Environment(u64);
+    impl ObjectUrlEnvironment for Environment {
+        fn serialized_origin(&self) -> String { "null".to_owned() }
+        fn owner_identity(&self) -> usize { self.0 as usize }
+        fn same_partition(&self, other: &dyn ObjectUrlEnvironment) -> bool {
+            other.as_any().downcast_ref::<Self>().is_some_and(|other| self.0 == other.0)
+        }
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()), err: Box::new(Captured::default()),
+    });
+    let partition = Rc::new(std::cell::Cell::new(1));
+    let current = partition.clone();
+    lumen_host::blob::set_object_url_environment_provider(runtime.engine().ctx(), Rc::new(move |_| {
+        Ok(Some(Rc::new(Environment(current.get())) as Rc<dyn ObjectUrlEnvironment>))
+    }));
+    runtime.eval("globalThis.fixtureBlobUrl = URL.createObjectURL(new Blob(['postMessage(99); close();']))").unwrap();
+    let ctx = runtime.engine().ctx();
+    let global = ctx.global_object();
+    let url = match ctx.member_get(&global, "fixtureBlobUrl") {
+        Ok(lumen::embed::Value::Str(url)) => url.to_string(),
+        _ => panic!("expected Blob URL"),
+    };
+    partition.set(2);
+    let denied = format!("const denied = new Worker({url:?}); denied.onmessage = () => console.log('leak'); denied.onerror = () => console.log('denied');");
+    assert!(matches!(runtime.eval(&denied).unwrap(), Completion::Value(_)));
+    partition.set(1);
+    lumen_host::blob::revoke_object_urls_for_environment(runtime.engine().ctx(), 1);
+    let retired = format!("const retired = new Worker({url:?}); retired.onmessage = () => console.log('leak'); retired.onerror = () => console.log('retired');");
+    assert!(matches!(runtime.eval(&retired).unwrap(), Completion::Value(_)));
+    assert_eq!(out.lines(), ["denied", "retired"]);
+}
+
 #[derive(Clone, Default)]
 struct Captured(Rc<RefCell<Vec<u8>>>);
 

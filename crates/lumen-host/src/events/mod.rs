@@ -33,7 +33,7 @@ pub use event::{EventInit, EventState};
 pub use internals::NodeEventTarget;
 pub use target::{
     report_exception, Callback, ChangeObserver, DeferredCompile, EventPath, HandlerKind, ListenerOptions,
-    PathEntry, TargetData, TargetHooks,
+    ActivationBehavior, PreparedActivation, PathEntry, TargetData, TargetHooks,
 };
 
 const WEAK_HANDLER: &str = "nodejs.internal.kWeakHandler";

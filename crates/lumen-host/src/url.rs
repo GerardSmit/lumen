@@ -389,10 +389,7 @@ pub mod bindings {
             if parsed.scheme != "blob" {
                 return Ok(());
             }
-            let Some(id) = parsed.path.strip_prefix("nodedata:") else {
-                return Ok(());
-            };
-            crate::blob::revoke_object_url(ctx, id);
+            crate::blob::revoke_object_url(ctx, &parsed.href());
             Ok(())
         }
 

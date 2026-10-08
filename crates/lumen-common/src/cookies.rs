@@ -3,6 +3,8 @@
 use crate::url::Url;
 
 const MAX_COOKIE_BYTES: usize = 4096;
+const MAX_COOKIE_FIELD_BYTES: usize = 64 * 1024;
+const MAX_ATTRIBUTE_BYTES: usize = 1024;
 const MAX_COOKIES: usize = 3000;
 const MAX_SITE_COOKIES: usize = 180;
 const MAX_JAR_BYTES: usize = 8 * 1024 * 1024;
@@ -51,6 +53,13 @@ struct Cookie {
     accessed: u64,
 }
 impl Cookie {
+    fn matches_url(&self, url: &Url, context: &Context) -> bool {
+        (if self.host_only { url.hostname() == self.domain }
+         else { domain_match(url.hostname(), &self.domain) })
+            && path_match(&url.path, &self.path)
+            && (!self.secure || secure(url))
+            && (self.partition.is_none() || self.partition == context.site)
+    }
     fn bytes(&self) -> usize {
         self.name.len()
             + self.value.len()
@@ -140,6 +149,15 @@ impl CookieJar {
             .retain(|cookie| cookie.expires.is_none_or(|end| end > now));
     }
 
+    /// Browser automation deletes associated HTTP cookies, including HttpOnly cookies.
+    /// Preserve unrelated hosts, paths and partition keys in the same profile jar.
+    pub fn delete_associated(&mut self, url: &Url, context: &Context, now: i64) {
+        self.purge(now);
+        if site(url).is_some() {
+            self.entries.retain(|cookie| !cookie.matches_url(url, context));
+        }
+    }
+
     /// Store one Set-Cookie field or one non-HTTP document.cookie assignment.
     /// Invalid cookies are ignored, matching the cookie storage algorithm.
     pub fn store(
@@ -152,7 +170,7 @@ impl CookieJar {
     ) -> bool {
         self.purge(now);
         if site(url).is_none()
-            || field.len() > MAX_COOKIE_BYTES
+            || field.len() > MAX_COOKIE_FIELD_BYTES
             || field
                 .bytes()
                 .any(|byte| (byte < 32 && byte != b'\t') || byte == 127)
@@ -161,16 +179,11 @@ impl CookieJar {
         }
         let mut parts = field.split(';');
         let pair = parts.next().unwrap_or("").trim_matches([' ', '\t']);
-        let Some((name, value)) = pair.split_once('=') else {
-            return false;
-        };
+        let (name, value) = pair.split_once('=').unwrap_or(("", pair));
         let name = name.trim_matches([' ', '\t']);
         let value = value.trim_matches([' ', '\t']);
-        if name.is_empty()
-            || name
-                .bytes()
-                .any(|byte| byte <= 32 || byte >= 127 || b"()<>@,;:\\\"/[]?={}".contains(&byte))
-        {
+        if (name.is_empty() && value.is_empty())
+            || name.len().saturating_add(value.len()) > MAX_COOKIE_BYTES {
             return false;
         }
         let mut cookie = Cookie {
@@ -198,6 +211,7 @@ impl CookieJar {
                 .split_once('=')
                 .unwrap_or((part.trim_matches([' ', '\t']), ""));
             let value = value.trim_matches([' ', '\t']);
+            if value.len() > MAX_ATTRIBUTE_BYTES { continue; }
             match attribute
                 .trim_matches([' ', '\t'])
                 .to_ascii_lowercase()
@@ -280,15 +294,23 @@ impl CookieJar {
             };
             cookie.partition = Some(key);
         }
-        if cookie.name.starts_with("__Secure-") && !cookie.secure {
+        let has_prefix = |value: &str, prefix: &str| {
+            value.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        if cookie.name.is_empty()
+            && ["__Secure-", "__Host-", "__Http-"].iter().any(|prefix| has_prefix(&cookie.value, prefix))
+        {
             return false;
         }
-        if cookie.name.starts_with("__Host-")
+        if has_prefix(&cookie.name, "__Secure-") && !cookie.secure {
+            return false;
+        }
+        if has_prefix(&cookie.name, "__Host-")
             && (!cookie.secure || domain_attribute.is_some() || !root_path_attribute)
         {
             return false;
         }
-        if (cookie.name.starts_with("__Http-") || cookie.name.starts_with("__Host-Http-"))
+        if (has_prefix(&cookie.name, "__Http-") || has_prefix(&cookie.name, "__Host-Http-"))
             && (!cookie.secure || !cookie.http_only)
         {
             return false;
@@ -379,14 +401,8 @@ impl CookieJar {
             .entries
             .iter_mut()
             .filter(|cookie| {
-                (if cookie.host_only {
-                    url.hostname() == cookie.domain
-                } else {
-                    domain_match(url.hostname(), &cookie.domain)
-                }) && path_match(&url.path, &cookie.path)
-                    && (!cookie.secure || secure(url))
+                cookie.matches_url(url, context)
                     && (!cookie.http_only || for_http)
-                    && (cookie.partition.is_none() || cookie.partition == context.site)
                     && (!for_http || same_site_allowed(cookie, url, context, now))
             })
             .collect::<Vec<_>>();
@@ -396,7 +412,8 @@ impl CookieJar {
         }
         selected
             .into_iter()
-            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+            .map(|cookie| if cookie.name.is_empty() { cookie.value.clone() }
+                else { format!("{}={}", cookie.name, cookie.value) })
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -492,6 +509,53 @@ mod tests {
     use super::*;
     fn url(value: &str) -> Url {
         crate::url::parse(value, None).unwrap()
+    }
+
+    #[test]
+    fn cookie_loose_pairs_and_attribute_limits_preserve_storage_security() {
+        let origin = url("https://app.example.com/account/page");
+        let context = Context::document(&origin);
+        let mut jar = CookieJar::default();
+        assert!(jar.store(&origin, "test9; max-age=2.63,", true, &context, 100));
+        assert_eq!(jar.header(&origin, false, &context, 100), "test9");
+        assert!(jar.store(&origin, "test test=8", false, &context, 100));
+        assert!(jar.store(&origin, "тест=2", false, &context, 100));
+        assert!(!jar.store(&origin, "bad=\u{7f}", false, &context, 100));
+        assert!(!jar.store(&origin, "=", false, &context, 100));
+        let value = "1".repeat(4095);
+        assert!(jar.store(&origin, &format!("t={value}; Path=/"), false, &context, 100));
+        assert!(!jar.store(&origin, &format!("tt={value}; Path=/"), false, &context, 100));
+        let invalid_path = format!("/{}", "a".repeat(1024));
+        assert!(jar.store(&origin, &format!("path=1; Path=/account; Path={invalid_path}"), false, &context, 100));
+        assert!(jar.header(&origin, false, &context, 100).contains("path=1"));
+        assert!(jar.store(&origin, &format!("age=1; Max-Age=5; Max-Age=-{}", "1".repeat(1024)), false, &context, 100));
+        assert!(jar.header(&origin, false, &context, 100).contains("age=1"));
+        assert!(!jar.store(&origin, "__Host-secret=1; Domain=example.com; Secure; Path=/", true, &context, 100));
+        for value in [
+            "__secure-secret=1", "__hOsT-secret=1; Secure; Path=/; Domain=example.com",
+            "__http-secret=1; Secure", "=__Secure-secret=1; Secure",
+            "__HOST-secret; Secure; Path=/", "=__Http-secret=1; Secure; HttpOnly",
+        ] {
+            assert!(!jar.store(&origin, value, true, &context, 100), "{value}");
+        }
+        assert!(jar.store(&origin, "__hOsT-valid=1; Secure; Path=/", true, &context, 100));
+    }
+
+    #[test]
+    fn automation_deletes_associated_http_cookies_without_clearing_other_scopes() {
+        let current = url("https://app.example.com/account/page");
+        let context = Context::document(&current);
+        let other = url("https://other.test/account/page");
+        let other_context = Context::document(&other);
+        let mut jar = CookieJar::default();
+        assert!(jar.store(&current, "session=secret; HttpOnly; Secure; Path=/", true, &context, 100));
+        assert!(jar.store(&current, "theme=dark; Domain=example.com; Path=/account", false, &context, 100));
+        assert!(jar.store(&current, "elsewhere=1; Path=/different", false, &context, 100));
+        assert!(jar.store(&other, "other=1; Path=/", true, &other_context, 100));
+        jar.delete_associated(&current, &context, 101);
+        assert_eq!(jar.header(&current, true, &context, 101), "");
+        assert_eq!(jar.header(&url("https://app.example.com/different/"), true, &context, 101), "elsewhere=1");
+        assert_eq!(jar.header(&other, true, &other_context, 101), "other=1");
     }
 
     #[test]

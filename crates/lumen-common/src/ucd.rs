@@ -30,7 +30,7 @@ pub fn graphemes(text: &str) -> unicode_segmentation::GraphemeIndices<'_> {
 
 /// Allocation-free default UAX #29 word-boundary segments, including spaces
 /// and punctuation. Offsets are UTF-8 bytes; dictionary tailoring is absent.
-pub fn word_boundaries(text: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+pub fn word_boundaries(text: &str) -> unicode_segmentation::UWordBoundIndices<'_> {
     unicode_segmentation::UnicodeSegmentation::split_word_bound_indices(text)
 }
 
@@ -196,6 +196,50 @@ fn decomp_offset(cp: u32, version: Version) -> usize {
     db::DECOMP_INDEX2.get((block << db::SHIFT) + (cp & ((1 << db::SHIFT) - 1)) as usize) as usize
 }
 
+/// Direct tagged decomposition from the pinned Unicode database. This is not
+/// normalization: callers choose the one compatibility relationship they need.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum DecompositionKind { Wide, Narrow, Font }
+pub fn tagged_mapping(cp:u32,kind:DecompositionKind)->CanonicalMapping {
+    let at=decomp_offset(cp,Version::Current);
+    let head=db::DECOMP_DATA.get(at);
+    let prefix=match kind {DecompositionKind::Wide=>"<wide>",DecompositionKind::Narrow=>"<narrow>",DecompositionKind::Font=>"<font>"};
+    if at==0 || db::DECOMP_PREFIXES[(head>>8) as usize]!=prefix {
+        return CanonicalMapping {at:0,end:0,singleton:None};
+    }
+    CanonicalMapping {at:at+1,end:at+1+(head&0xff) as usize,singleton:None}
+}
+
+// Only nonempty compressed decomposition blocks are scanned, once. The small
+// inverse maps are shared by every document and retain no text or node data.
+struct DisplayMappings { wide:Vec<(u32,u32)>, italic:Vec<(u32,u32)> }
+fn display_mappings()->&'static DisplayMappings {
+    static MAPPINGS:std::sync::OnceLock<DisplayMappings>=std::sync::OnceLock::new();
+    MAPPINGS.get_or_init(|| {
+        let mut result=DisplayMappings {wide:Vec::new(),italic:Vec::new()};
+        let empty_zero_block=(0..1usize<<db::SHIFT).all(|offset|db::DECOMP_INDEX2.get(offset)==0);
+        for block in 0..(0x110000u32>>db::SHIFT) {
+            if empty_zero_block && db::DECOMP_INDEX1.get(block as usize)==0 {continue;}
+            for low in 0..(1u32<<db::SHIFT) {
+                let cp=(block<<db::SHIFT)|low;
+                let math=matches!(cp,0x1d434..=0x1d467|0x1d6a4..=0x1d6a5|0x1d6e2..=0x1d71b|0x210e);
+                let kind=if math {DecompositionKind::Font}else {DecompositionKind::Wide};
+                let mut mapping=tagged_mapping(cp,kind);
+                if let Some(original)=mapping.next().filter(|_|mapping.next().is_none()) {
+                    if math {result.italic.push((original,cp));}else {result.wide.push((original,cp));}
+                }
+            }
+        }
+        result.wide.sort_unstable();result.italic.sort_unstable();result
+    })
+}
+pub fn full_width_inverse(cp:u32)->Option<u32> {
+    let map=&display_mappings().wide;map.binary_search_by_key(&cp,|&(original,_)|original).ok().map(|index|map[index].1)
+}
+pub fn math_italic(cp:u32)->Option<u32> {
+    let map=&display_mappings().italic;map.binary_search_by_key(&cp,|&(original,_)|original).ok().map(|index|map[index].1)
+}
+
 /// The decomposition mapping of `cp` as `unicodedata.decomposition` spells it
 /// (`"<compat> 0020 0301"`), or "" when it has none.
 pub fn decomposition(cp: u32, version: Version) -> String {
@@ -217,12 +261,46 @@ pub fn decomposition(cp: u32, version: Version) -> String {
 /// The normalization data of one database version.
 pub struct Norm(pub Version);
 
+/// Direct canonical mapping from the pinned UCD, without formatting or allocation.
+pub struct CanonicalMapping { at: usize, end: usize, singleton: Option<u32> }
+impl Iterator for CanonicalMapping {
+    type Item=u32;
+    fn next(&mut self)->Option<u32> {
+        if let Some(cp)=self.singleton.take(){return Some(cp);}
+        if self.at>=self.end{return None;}
+        let cp=db::DECOMP_DATA.get(self.at);self.at+=1;Some(cp)
+    }
+}
+impl DoubleEndedIterator for CanonicalMapping {
+    fn next_back(&mut self)->Option<u32> {
+        if let Some(cp)=self.singleton.take(){return Some(cp);}
+        if self.at>=self.end{return None;}
+        self.end-=1;Some(db::DECOMP_DATA.get(self.end))
+    }
+}
+pub fn canonical_mapping(cp:u32,version:Version)->CanonicalMapping {
+    if version==Version::V3_2_0 {
+        if let Ok(index)=db::OLD_NORMALIZATION.binary_search_by_key(&cp,|&(c,_)|c) {
+            return CanonicalMapping {at:0,end:0,singleton:Some(db::OLD_NORMALIZATION[index].1)};
+        }
+    }
+    let at=decomp_offset(cp,version);
+    let head=if at==0 {0}else{db::DECOMP_DATA.get(at)};
+    if head>>8!=0 {return CanonicalMapping {at:0,end:0,singleton:None};}
+    CanonicalMapping {at:at+1,end:at+1+(head&0xff) as usize,singleton:None}
+}
+
 impl NormData for Norm {
     fn ccc(&self, cp: u32) -> u8 {
         db::RECORDS[record_index(cp)].2
     }
 
     fn push_mapping(&self, cp: u32, compat: bool, stack: &mut Vec<u32>) -> bool {
+        if !compat {
+            let mut found=false;
+            for cp in canonical_mapping(cp,self.0).rev(){stack.push(cp);found=true;}
+            return found;
+        }
         if self.0 == Version::V3_2_0 {
             if let Ok(k) = db::OLD_NORMALIZATION.binary_search_by_key(&cp, |&(c, _)| c) {
                 stack.push(db::OLD_NORMALIZATION[k].1);

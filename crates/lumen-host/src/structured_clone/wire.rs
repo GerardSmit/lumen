@@ -40,6 +40,9 @@ pub(super) const T_PORTS: u8 = 25;
 /// `AbortSignal`): a `u32` index into the caller's list.
 pub(super) const T_LOCAL: u8 = 26;
 pub(super) const T_BIGINTOBJ: u8 = 27;
+pub(super) const T_NATIVE_TRANSFER: u8 = 28;
+pub(super) const T_NATIVE_VALUE: u8 = 29;
+pub(super) const T_NATIVE_GRAPH_VALUE: u8 = 30;
 
 pub(super) const KEY_INDEX: u8 = 0;
 pub(super) const KEY_NAME: u8 = 1;

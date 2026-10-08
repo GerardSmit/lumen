@@ -244,6 +244,34 @@ pub(crate) struct CbCache {
     species: crate::eval::fastpaths::SlotCache,
 }
 
+impl CbIntr {
+    fn for_each_object(&self, visit: &mut dyn FnMut(&Gc)) {
+        for object in [&self.array_proto, &self.array_ctor, &self.species_getter] { visit(object); }
+        for object in self.methods.iter().flatten() { visit(object); }
+    }
+}
+
+impl CbCache {
+    pub(crate) fn count_intrinsic_edges(&self, visit: &mut dyn FnMut(&Gc)) {
+        if let Ok(cache) = self.intr.try_borrow() {
+            if let Some(intr) = cache.as_ref().filter(|intr| Rc::strong_count(intr) == 1) { intr.for_each_object(visit); }
+        }
+    }
+
+    pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
+        if let Ok(cache) = self.intr.try_borrow() {
+            if let Some(intr) = cache.as_ref().filter(|intr| Gc::as_ptr(&intr.array_proto) as usize == pointer) { intr.for_each_object(visit); }
+        }
+    }
+
+    pub(crate) fn sweep_intrinsics(&self, garbage: &[Gc]) {
+        if let Ok(mut cache) = self.intr.try_borrow_mut() {
+            if cache.as_ref().is_some_and(|intr| Rc::strong_count(intr) == 1
+                && garbage.iter().any(|object| Gc::ptr_eq(object, &intr.array_proto))) { *cache = None; }
+        }
+    }
+}
+
 fn intrinsics(i: &Interp) -> Option<Rc<CbIntr>> {
     let c = &i.lang.array_cb;
     if let Some(x) = &*c.intr.borrow() {
@@ -1124,4 +1152,49 @@ impl Compiler {
 fn disabled_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LUMEN_INLINE_CB").map_or(true, |v| v != "0"))
+}
+
+#[cfg(all(test, feature = "embed", feature = "compiler"))]
+mod lifetime_tests {
+    use super::*;
+    use crate::Engine;
+
+    #[test]
+    fn iteration_intrinsic_caches_collect_retired_realms_and_preserve_inflight_callbacks() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        let realm = ctx.create_host_realm();
+        let global = realm.global();
+        let weak_global = ctx.weak_value(&global).expect("child global");
+        let bundle = ctx.with_host_realm(&realm, |ctx| {
+            let result = ctx.eval_in_realm(&global,
+                "let sum=0; const a=[1,2]; for(const x of a) sum+=x; \
+                 for(const [k,v] of new Map([[1,2]])) sum+=k+v; \
+                 for(const x of new Set([3])) sum+=x; \
+                 const [first,...rest]=a; const copied=[...a]; a.push(3); \
+                 sum===9 && first===1 && rest[0]===2 && copied.length===2 && \
+                 a.map(x=>x+1).join(',')==='2,3,4'")
+                .unwrap_or_else(|_| panic!("exercise iteration and callback protectors"));
+            assert!(matches!(result, Value::Bool(true)));
+            intrinsics(ctx).expect("callback intrinsic bundle")
+        }).expect("enter child realm");
+        let weak_map = ctx.weak_value(&Value::Obj(bundle.methods[CbMethod::Map.slot()]
+            .as_ref().expect("original map").clone())).expect("original map handle");
+        drop(bundle);
+        ctx.eval_in_realm(&global, "Array.prototype.map=null")
+            .unwrap_or_else(|_| panic!("replace public method"));
+        ctx.collect_garbage();
+        assert!(weak_map.upgrade().is_some(), "a live realm retains its recorded intrinsic");
+        let bundle = ctx.with_host_realm(&realm, |ctx| intrinsics(ctx).expect("cached bundle"))
+            .expect("enter live realm");
+        ctx.dispose_host_realm(&realm).expect("retire child realm");
+        drop(global);
+        drop(realm);
+        ctx.collect_garbage();
+        assert!(weak_global.upgrade().is_some(), "an executing callback bundle owns its realm");
+        drop(bundle);
+        ctx.collect_garbage();
+        assert!(weak_global.upgrade().is_none(), "iteration caches release the retired realm in one collection");
+        assert!(weak_map.upgrade().is_none(), "unreachable recorded methods are released");
+    }
 }

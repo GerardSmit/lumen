@@ -5160,6 +5160,40 @@ fn bound_function_length_name() {
 }
 
 #[test]
+fn bound_calls_preserve_prefix_identity_receiver_throw_and_constructor_state() {
+    assert_eq!(run(r#"
+        const receiver = {tag:'receiver'};
+        const marker = {};
+        function collect(...values) {
+            return this === receiver && values[0] === marker &&
+                values.slice(1).join(',') === '1,2,3,4,5,6,7';
+        }
+        collect.bind(receiver,marker,1,2).bind(null,3,4)(5,6,7);
+    "#), "true");
+    assert_eq!(run(r#"
+        function collect(...values) { return values.join(','); }
+        collect.bind(null,0,1,2,3,4)(5,6,7,8);
+    "#), "0,1,2,3,4,5,6,7,8");
+    assert_eq!(run(r#"
+        const sentinel = {};
+        const bound = (()=>{throw sentinel}).bind(null);
+        let caught = false;
+        try { bound(); } catch(error) { caught = error === sentinel; }
+        function Outer() {
+            function ordinary() { return new.target; }
+            this.ok = ordinary.bind(null)() === undefined && new.target === Outer;
+        }
+        caught && new Outer().ok;
+    "#), "true");
+    assert_eq!(run(r#"
+        function Target(value) { this.value=value;this.target=new.target; }
+        const Bound=Target.bind(null,42);
+        const result=new Bound();
+        result.value===42 && result.target===Target && result instanceof Target;
+    "#), "true");
+}
+
+#[test]
 fn new_target_basics() {
     // A constructor's new.target is the constructor; a plain call's is undefined.
     assert_eq!(
@@ -11955,7 +11989,7 @@ fn heap_stats_count_this_heap_from_another_thread() {
             std::thread::sleep(std::time::Duration::from_millis(20));
             crate::coroutine::Suspend::Done(crate::value::Value::Undefined)
         });
-    let ptr = &mut e.interp as *mut crate::interpreter::Interp;
+    let ptr = &mut *e.interp as *mut crate::interpreter::Interp;
     let mut coro = crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)).unwrap();
     coro.resume(&mut e.interp, crate::coroutine::Resume::Next(crate::value::Value::Undefined));
     assert!(stats.coroutine_time() - before >= std::time::Duration::from_millis(20));

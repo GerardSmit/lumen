@@ -15,6 +15,7 @@ impl TextShaper for Text {
                     id: c as u16,
                     face: 0,
                     cluster: cluster as u32,
+                    caps_expansion: 0,
                     x: i as f32 * 6.,
                     y: 0.,
                     size_scale: 1.,
@@ -133,7 +134,7 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
     assert!(first
         .nodes
         .iter()
-        .any(|(id, _, style)| *id == node && style[0].as_deref() == Some("fade")));
+        .any(|(id, _, _, style)| *id == node && style[0].as_deref() == Some("fade")));
     session
         .set_animation_declarations(node, vec![("opacity".into(), "0.5".into())])
         .unwrap();
@@ -148,7 +149,7 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
     assert!(changed
         .nodes
         .iter()
-        .any(|(id, _, style)| *id == node && style[0].as_deref() == Some("other")));
+        .any(|(id, _, _, style)| *id == node && style[0].as_deref() == Some("other")));
     session
         .set_media_environment(css::MediaEnvironment {
             width: 400.,

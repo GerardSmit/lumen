@@ -32,7 +32,9 @@ pub struct PropsCensus {
     pub owned_shape_keys: usize,
 }
 
-/// The per-function closure templates (see `ast::Function::fn_maps`).
+/// Realm-neutral per-function closure templates (see `ast::Function::fn_maps`).
+/// Legacy accessor slots are placeholders; actual closure objects receive
+/// their own realm's canonical getters before becoming observable.
 #[derive(Clone)]
 pub struct FnMaps {
     /// The function object's map: `length`, `name` and, for generators, a `prototype`
