@@ -1,30 +1,57 @@
 //! HTML's attribute-number algorithms, independent of DOM and host bindings.
 
+/// Which HTML floating-point grammar [`scan_float`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatGrammar {
+    /// §2.3.4.3 "rules for parsing": optional `+` or `-`, a numeric prefix, trailing input and an
+    /// incomplete exponent ignored.
+    Parsing,
+    /// §2.3.4.3 "valid floating-point number": only `-`, the whole input must match. User editing
+    /// may accept `1.` (`allow_empty_fraction`) and text that is merely a prefix of a valid
+    /// number (`editing`: empty, `-`, `1.`, `1e`, `1e-`).
+    Valid { allow_empty_fraction: bool, editing: bool },
+}
+
+/// End offset of the float token at the start of `bytes` under `grammar`; `None` when it does not
+/// match. `Valid` only returns the full length.
+pub fn scan_float(bytes: &[u8], grammar: FloatGrammar) -> Option<usize> {
+    let (parsing, allow_empty_fraction, editing) = match grammar {
+        FloatGrammar::Parsing => (true, true, false),
+        FloatGrammar::Valid { allow_empty_fraction, editing } => (false, allow_empty_fraction, editing),
+    };
+    let digits = |mut at: usize| { while bytes.get(at).is_some_and(u8::is_ascii_digit) { at += 1; } at };
+    let mut end = usize::from(bytes.first() == Some(&b'-') || (parsing && bytes.first() == Some(&b'+')));
+    if editing && end == bytes.len() { return Some(end); }
+    let integer_start = end;
+    end = digits(end);
+    let has_integer = end != integer_start;
+    if bytes.get(end) == Some(&b'.') {
+        let fraction_start = end + 1;
+        end = digits(fraction_start);
+        if end == fraction_start && !(allow_empty_fraction && has_integer) {
+            return (editing && end == bytes.len()).then_some(end);
+        }
+    } else if !has_integer { return None; }
+    let mantissa_end = end;
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        end += 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
+        let exponent_start = end;
+        end = digits(end);
+        if end == exponent_start {
+            if parsing { return Some(mantissa_end); }
+            return (editing && end == bytes.len()).then_some(end);
+        }
+    }
+    (parsing || end == bytes.len()).then_some(end)
+}
+
 /// HTML §2.3.4.3 parsing (not authoring validation). Consume the numeric
 /// prefix, ignoring an incomplete exponent and trailing nonnumeric input.
 /// Rust's decimal conversion supplies correctly rounded binary64 without an
 /// intermediate rounded significand or a temporary normalization buffer.
 pub fn parse_floating_point(input: &str) -> Option<f64> {
     let input = input.trim_start_matches(|c| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' '));
-    let bytes = input.as_bytes();
-    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let integer_start = end;
-    while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
-    let integer_digits = end != integer_start;
-    if bytes.get(end) == Some(&b'.') {
-        end += 1;
-        let fraction_start = end;
-        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
-        if !integer_digits && end == fraction_start { return None; }
-    } else if !integer_digits { return None; }
-    let mantissa_end = end;
-    if matches!(bytes.get(end), Some(b'e' | b'E')) {
-        end += 1;
-        if matches!(bytes.get(end), Some(b'+' | b'-')) { end += 1; }
-        let exponent_start = end;
-        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
-        if end == exponent_start { end = mantissa_end; }
-    }
+    let end = scan_float(input.as_bytes(), FloatGrammar::Parsing)?;
     let value = input[..end].parse::<f64>().ok()?;
     value.is_finite().then_some(if value == 0.0 { 0.0 } else { value })
 }
@@ -168,6 +195,42 @@ mod tests {
             assert_eq!(parse_floating_point(input), None, "{input}");
         }
         assert_eq!(parse_floating_point("1.7976931348623157e308"), Some(f64::MAX));
+    }
+
+    #[test]
+    fn specification_html_valid_float_is_strict_where_parsing_is_lenient() {
+        let valid = FloatGrammar::Valid { allow_empty_fraction: false, editing: false };
+        for input in ["1", "-1", ".5", "-.5e+3", "1.5E2", "0"] {
+            assert_eq!(scan_float(input.as_bytes(), valid), Some(input.len()), "{input}");
+        }
+        for input in ["", "+1", "1.", "1.e2", "1e", "1e+", "1x", "1 ", "-", ".", "--1", "1.5.5"] {
+            assert_eq!(scan_float(input.as_bytes(), valid), None, "{input}");
+        }
+        for (input, end) in [("+1", 2), ("1x", 1), ("1.", 2), ("1e", 1), ("1.5e+x", 3), ("1.5.5", 3)] {
+            assert_eq!(scan_float(input.as_bytes(), FloatGrammar::Parsing), Some(end), "{input}");
+        }
+        for input in ["", ".", "-", "-.e2", "x"] {
+            assert_eq!(scan_float(input.as_bytes(), FloatGrammar::Parsing), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn specification_html_valid_float_editing_modes_accept_incomplete_text_only_at_the_end() {
+        let empty_fraction = FloatGrammar::Valid { allow_empty_fraction: true, editing: false };
+        assert_eq!(scan_float(b"1.", empty_fraction), Some(2));
+        assert_eq!(scan_float(b"1.e2", empty_fraction), Some(4));
+        assert_eq!(scan_float(b".", empty_fraction), None);
+        assert_eq!(scan_float(b"1e", empty_fraction), None);
+        let editing = FloatGrammar::Valid { allow_empty_fraction: true, editing: true };
+        for input in ["", "-", "1.", "-.", ".", "1e", "1e-", "1.5e+", ".5e"] {
+            assert_eq!(scan_float(input.as_bytes(), editing), Some(input.len()), "{input}");
+        }
+        for input in ["+", "--", "1.x", "1e-x", "1e5x", "..", "1.5.", "e5", "1ee"] {
+            assert_eq!(scan_float(input.as_bytes(), editing), None, "{input}");
+        }
+        let strict_editing = FloatGrammar::Valid { allow_empty_fraction: false, editing: true };
+        assert_eq!(scan_float(b"1.", strict_editing), Some(2));
+        assert_eq!(scan_float(b"1.e2", strict_editing), None);
     }
 
     #[test]

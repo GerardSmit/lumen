@@ -140,6 +140,7 @@ fn blur_sizes(blur: f32, scale: f32) -> Result<([usize; 3], usize), ImageError> 
 /// approximation as CSS box shadows. `reserved_bytes` accounts for storage
 /// owned by the caller while this helper is active (for example the temporary
 /// pixmap from which a canvas alpha plane was extracted).
+// Shadows use three box passes (cost independent of radius, bounded scratch); SVG filters need exact per-axis sigma, so they use image::imageops' true Gaussian.
 pub(super) fn blur_alpha_mask(
     mask: &mut [u8],
     width: usize,

@@ -868,43 +868,7 @@ fn number_list_tokens_each(input:&str,limit:usize,mut push:impl FnMut(&str)->boo
             break;
         }
         let start = offset;
-        if matches!(bytes[offset], b'+' | b'-') {
-            offset += 1;
-        }
-        let mut digits = 0usize;
-        while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-            digits += 1;
-            offset += 1;
-        }
-        if bytes.get(offset) == Some(&b'.') {
-            offset += 1;
-            while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-                digits += 1;
-                offset += 1;
-            }
-        }
-        if digits == 0 {
-            return None;
-        }
-        if bytes
-            .get(offset)
-            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
-        {
-            offset += 1;
-            if bytes
-                .get(offset)
-                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
-            {
-                offset += 1;
-            }
-            let exponent = offset;
-            while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-                offset += 1;
-            }
-            if exponent == offset {
-                return None;
-            }
-        }
+        offset = lumen_common::svg_number::svg_number_token(bytes, start).ok()?;
         if count == limit {return None;}
         if !push(input.get(start..offset)?){return None;}count+=1;
         comma_pending = false;

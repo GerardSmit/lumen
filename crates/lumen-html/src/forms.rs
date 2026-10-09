@@ -3778,53 +3778,19 @@ pub fn number_user_value(value: &str) -> Option<String> {
 /// rejecting impossible duplicate signs, decimal separators or exponents.
 /// Conversion and API sanitization continue to share the same lexical core.
 pub fn number_user_text_allowed(value: &str) -> bool {
-    html_float_token(value.strip_prefix('+').unwrap_or(value), true, true)
+    float_grammar_matches(value.strip_prefix('+').unwrap_or(value), true, true)
 }
 
 fn parse_html_float_decimal(value: &str, allow_empty_fraction: bool) -> Option<f64> {
-    html_float_token(value, allow_empty_fraction, false)
+    float_grammar_matches(value, allow_empty_fraction, false)
         .then(|| value.parse::<f64>().ok())
         .flatten()
         .filter(|n| n.is_finite())
 }
 
-fn html_float_token(value: &str, allow_empty_fraction: bool, incomplete: bool) -> bool {
-    let bytes = value.as_bytes();
-    if incomplete && (bytes.is_empty() || bytes == b"-") {
-        return true;
-    }
-    let mut i = usize::from(bytes.first() == Some(&b'-'));
-    let integer_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-        i += 1;
-    }
-    let has_integer = i > integer_start;
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        let fraction_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == fraction_start && !(allow_empty_fraction && has_integer) {
-            return incomplete && i == bytes.len();
-        }
-    } else if !has_integer {
-        return false;
-    }
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        let exponent_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == exponent_start {
-            return incomplete && i == bytes.len();
-        }
-    }
-    i == bytes.len()
+fn float_grammar_matches(value: &str, allow_empty_fraction: bool, editing: bool) -> bool {
+    use lumen_common::html_numbers::{scan_float, FloatGrammar};
+    scan_float(value.as_bytes(), FloatGrammar::Valid { allow_empty_fraction, editing }).is_some()
 }
 
 /// HTML patterns use the existing ECMAScript Unicode-set regular expression

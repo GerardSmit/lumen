@@ -71,6 +71,7 @@ pub mod local_tz;
 pub mod memcat;
 pub mod mime;
 pub mod srcset;
+pub mod svg_number;
 pub mod referrer;
 pub mod mt19937;
 pub mod multipart;

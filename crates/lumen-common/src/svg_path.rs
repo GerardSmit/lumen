@@ -1,4 +1,11 @@
 //! Shared bounded SVG path geometry for HTML, Canvas and raster consumers.
+//!
+//! This is a hand-written parser rather than `svgtypes` (0.16.1): that crate is `no_std` but pulls in
+//! `kurbo` and `siphasher`, parses in `f64`, expands every arc through `kurbo` with a fixed 0.1
+//! tolerance into an unbounded internal `Vec` (`SimplifyingPathParser`), so the segment and byte
+//! budgets of `BoundedPathBuilder` (`BudgetExceeded` versus `Invalid`) cannot be enforced before the
+//! buffers grow, and its `Error` values carry no mapping to this module's diagnostics.
+use crate::svg_number::{svg_number_token,SvgNumberError};
 use tiny_skia_path::{BoundedPathBuilder,Path,PathBuilder,Stroke};
 
 const MAX_SVG_PATH_BYTES: usize = 1024 * 1024;
@@ -312,49 +319,10 @@ impl<'a,B:SvgPathBuilder> SvgPathParser<'a,B> {
             }
         }
         let start = self.offset;
-        if self
-            .data
-            .get(self.offset)
-            .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-        {
-            self.offset += 1;
-        }
-        let mut digits = 0;
-        while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-            self.offset += 1;
-            digits += 1;
-        }
-        if self.data.get(self.offset) == Some(&b'.') {
-            self.offset += 1;
-            while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-                digits += 1;
-            }
-        }
-        if digits == 0 {
-            return Err("invalid SVG path number");
-        }
-        if self
-            .data
-            .get(self.offset)
-            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
-        {
-            self.offset += 1;
-            if self
-                .data
-                .get(self.offset)
-                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-            {
-                self.offset += 1;
-            }
-            let exponent_start = self.offset;
-            while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-            if self.offset == exponent_start {
-                return Err("invalid SVG path exponent");
-            }
-        }
+        self.offset = svg_number_token(self.data, start).map_err(|error| match error {
+            SvgNumberError::NoDigits => "invalid SVG path number",
+            SvgNumberError::NoExponentDigits => "invalid SVG path exponent",
+        })?;
         let text = core::str::from_utf8(&self.data[start..self.offset])
             .map_err(|_| "invalid SVG path number")?;
         let value = text.parse::<f32>().map_err(|_| "invalid SVG path number")?;
