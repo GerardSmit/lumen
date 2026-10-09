@@ -89,7 +89,7 @@ impl TaskQueueState {
 /// Fixed native contexts: diagnostics never retain author values, callbacks,
 /// nodes, realm handles or leases while a Document mutation borrow is active.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum TaskDiagnosticSource { DetailsToggle, DialogToggle, PopoverToggle }
+pub(crate) enum TaskDiagnosticSource { DetailsToggle, DialogToggle, PopoverToggle, PolicyViolation }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TaskDiagnosticCause {
@@ -97,9 +97,9 @@ pub(crate) enum TaskDiagnosticCause {
     TrackerAllocationFailed, TrackerSequenceExhausted, QueueDisposed, ProducerAllocationFailed,
 }
 
-const DIAGNOSTIC_SOURCES: [TaskDiagnosticSource; 3] = [
+const DIAGNOSTIC_SOURCES: [TaskDiagnosticSource; 4] = [
     TaskDiagnosticSource::DetailsToggle, TaskDiagnosticSource::DialogToggle,
-    TaskDiagnosticSource::PopoverToggle,
+    TaskDiagnosticSource::PopoverToggle, TaskDiagnosticSource::PolicyViolation,
 ];
 const DIAGNOSTIC_CAUSES: [TaskDiagnosticCause; 8] = [
     TaskDiagnosticCause::QueueFull, TaskDiagnosticCause::AllocationFailed,
@@ -109,7 +109,7 @@ const DIAGNOSTIC_CAUSES: [TaskDiagnosticCause; 8] = [
 ];
 
 #[derive(Default)]
-struct TaskDiagnostics { counts: [[u64; 8]; 3], overflow: [[bool; 8]; 3] }
+struct TaskDiagnostics { counts: [[u64; 8]; 4], overflow: [[bool; 8]; 4] }
 
 impl TaskDiagnostics {
     fn record(&mut self, source: TaskDiagnosticSource, cause: TaskDiagnosticCause) {
@@ -773,12 +773,13 @@ pub(crate) fn run_animation_frame_in_realm_at(
     errors.extend(checkpoint(engine));
 
     // A failing service must not strand another service's pending frame work.
-    for service in 0..4 {
+    for service in 0..5 {
         match engine.ctx().with_host_realm(realm, |ctx| {
             let result = match service {
-                0 => super::animations::advance(ctx, timestamp),
-                1 => super::scrolling::advance_smooth_scrolls(ctx, timestamp),
-                2 => super::scrolling::run_scroll_steps(ctx),
+                0 => super::focus::rendering_checkpoint(ctx,timestamp),
+                1 => super::animations::advance(ctx, timestamp),
+                2 => super::scrolling::advance_smooth_scrolls(ctx, timestamp),
+                3 => super::scrolling::run_scroll_steps(ctx),
                 _ => super::view_transition::advance(ctx),
             };
             result.map_err(|error| {

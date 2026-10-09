@@ -1,6 +1,6 @@
 //! Pieces the native `WebSocket` and `EventSource` classes share: the constructor that starts the
 //! connection once the wrapper exists, the strong references that keep a listening connection
-//! alive, URL parsing through the realm's `URL`, and event helpers.
+//! alive, native URL parsing against the shared API base, and event helpers.
 
 use lumen::embed::{Ctx, JsHost, NativeIdentityOwner, OpResult, Value};
 use lumen_bind::{Class, CtorRet, Host};
@@ -66,7 +66,7 @@ pub(crate) fn set_pin(ctx: &mut Ctx, key: u64, pin: Option<Value>) {
 
 pub(crate) use lumen_host::net::dom_error;
 
-/// A URL as the realm's `URL` class reads it.
+/// A URL record serialized by the common URL authority.
 pub(crate) struct ParsedUrl {
     pub(crate) href: String,
     pub(crate) protocol: String,
@@ -74,20 +74,17 @@ pub(crate) struct ParsedUrl {
     pub(crate) origin: String,
 }
 
-/// `new URL(text)` in this realm, `None` when it throws.
+/// Parse a scalar URL against the relevant settings object's API base URL.
 pub(crate) fn parse_url(ctx: &mut Ctx, text: &str) -> Option<ParsedUrl> {
-    let global = ctx.global_object();
-    let constructor = ctx.member_get(&global, "URL").ok()?;
-    let url = ctx.construct_value(constructor, &[Value::str(text)]).ok()?;
-    let mut field = |name: &str| -> Option<String> {
-        let value = ctx.member_get(&url, name).ok()?;
-        Some(ctx.coerce_string(&value).ok()?.to_string())
-    };
+    let base=lumen_host::net::api_base_url(ctx);
+    let text=lumen::well_formed_utf8(text);
+    let url=lumen_common::url::parse(&text,base.as_deref()).ok()?;
     Some(ParsedUrl {
-        href: field("href")?,
-        protocol: field("protocol")?,
-        hash: field("hash")?,
-        origin: field("origin")?,
+        href: url.href(),
+        protocol: format!("{}:",url.scheme),
+        hash: url.fragment.as_deref().filter(|fragment|!fragment.is_empty())
+            .map_or_else(String::new,|fragment|format!("#{fragment}")),
+        origin: url.origin(),
     })
 }
 

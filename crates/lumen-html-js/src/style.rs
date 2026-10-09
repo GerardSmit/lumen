@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use lumen_html::{
     css,
     paint::FontSizeAdjustValue,
@@ -58,7 +59,7 @@ impl DomStyle {
             let fonts = if computed_font_property(&property) {
                 Some(super::canvas::realm_font_source(&self.realm)?)
             } else {super::canvas::initialized_realm_font_source(&self.realm)?};
-            let (style, mut context, grid_tracks) = {
+            let (style, mut context, grid_tracks,timeline_source) = {
                 let mut session = self.realm.session.borrow_mut();
                 let style = self.resolved_style(&mut session,fonts.as_ref())
                     .map_err(|error| OpError::new("InvalidStateError", format!("computed style failed: {error:?}")))?;
@@ -80,6 +81,8 @@ impl DomStyle {
                 let context = css::computed_values::ComputedValueContext {
                     resolved,
                     border_box,
+                    transform_reference_box: if needs_layout {session.layout_transform_reference_box(self.node,self.pseudo)
+                        .map(|(rect,svg)|if svg {rect}else{style.css_transform_reference_box(rect)})}else{None},
                     percentage_basis: (needs_layout && used_margins.is_none()).then(|| match self.pseudo {Some(pseudo)=>session.pseudo_layout_percentage_basis(self.node,pseudo),None=>session.layout_percentage_basis(self.node)}).flatten(),
                     used_margins,
                     used_line_height: if resolved && matches!(self.pseudo,None|Some(css::PseudoElement::Placeholder)) && matches!(property.as_ref(), "line-height" | "font") {
@@ -95,8 +98,10 @@ impl DomStyle {
                     ..Default::default()
                 };
                 let grid_tracks = if resolved && matches!(property.as_ref(), "grid-template-columns" | "grid-template-rows" | "grid-template" | "grid" | "grid-lanes") { session.layout_grid_tracks(self.node) } else { None };
-                (style, context, grid_tracks)
+                let timeline_source=if resolved&&property.as_ref()=="transform"{session.used_transform_timeline_source(self.node,self.pseudo,&style)}else{None};
+                (style, context, grid_tracks,timeline_source)
             };
+            context.transform_timeline_source=timeline_source.as_deref();
             if let Some((columns, rows, column_names, row_names)) = &grid_tracks {
                 context.grid_columns = (!columns.is_empty()).then_some(columns.as_ref());
                 context.grid_rows = (!rows.is_empty()).then_some(rows.as_ref());
@@ -190,6 +195,38 @@ pub(crate) fn computed_property_value(
         _owner: Value::Undefined,
     }
     .property_value(property, false)
+}
+
+/// One operation's canonical computed style and registration epoch. Iteration
+/// reads every longhand, so font and rare query context are initialized once.
+pub(crate) struct ComputedPropertyMapSnapshot {
+    pub style: css::Style,
+    pub registrations: Option<Arc<[css::registered_properties::RegisteredCustomProperty]>>,
+    pub context: css::computed_values::ComputedValueContext<'static>,
+}
+pub(crate) fn computed_property_map_snapshot(realm: &Rc<DomRealm>, node: NodeId)
+    -> OpResult<Option<ComputedPropertyMapSnapshot>> {
+    let (realm,node)=realm.resolve_adopted_node(node);
+    realm.synchronize_embedding_color_scheme()?;
+    if !rendered_ancestry(&realm,node,false)? {return Ok(None);}
+    let fonts=super::canvas::realm_font_source(&realm)?;
+    let read=|session:&mut lumen_html::session::RenderSession|session
+        .computed_style_with_text(node,Some(&fonts as &dyn lumen_html::paint::TextShaper))
+        .map_err(|error|OpError::new("InvalidStateError",format!("computed style failed: {error:?}")));
+    let mut style=read(&mut realm.session.borrow_mut())?;
+    if style.has_query_container_dependencies()
+        && (realm.layout_flusher.borrow().is_some() || realm.session.borrow().viewport_size().is_some()) {
+        realm.flush_layout()?;
+        style=read(&mut realm.session.borrow_mut())?;
+    }
+    let mut context=css::computed_values::ComputedValueContext::default();
+    if let Some(adjust)=style.font_spec().size_adjust.filter(|adjust|
+        matches!(adjust.value,FontSizeAdjustValue::FromFont)) {
+        realm.font_loading.request_metric_font(style.font_spec());
+        context.primary_font_metric=realm.font_loading.primary_metric(style.font_spec(),adjust.metric);
+    }
+    let registrations=realm.session.borrow().registered_custom_property_snapshot();
+    Ok(Some(ComputedPropertyMapSnapshot {style,registrations,context}))
 }
 
 fn computed_font_property(property: &str) -> bool {
@@ -328,7 +365,7 @@ impl DomStyle {
     }
 }
 
-fn computed_property_names() -> &'static [&'static str] {
+pub(crate) fn computed_property_names() -> &'static [&'static str] {
     static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         let mut names: Vec<_> = css::cssom_property_names().into_iter()
@@ -598,6 +635,8 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
         "::before" | ":before" => Some(css::PseudoElement::Before),
         "::after" | ":after" => Some(css::PseudoElement::After),
         "::marker" => Some(css::PseudoElement::Marker),
+        "::before::marker" => Some(css::PseudoElement::BeforeMarker),
+        "::after::marker" => Some(css::PseudoElement::AfterMarker),
         "::placeholder" => Some(css::PseudoElement::Placeholder),
         "::first-line" | ":first-line" => Some(css::PseudoElement::FirstLine),
         "::first-letter" | ":first-letter" => Some(css::PseudoElement::FirstLetter),
@@ -726,7 +765,7 @@ mod tests {
             fieldset.style.display='none';check(outer.width==='30px','hidden fieldset computes its authored dimension');
             fieldset.style.display='inline';check(outer.width==='30px','restored retained principal formatting');
             return true;
-        })()"#).unwrap().unwrap_or_else(|error|panic!("host used CSSOM: {}",engine.ctx().coerce_string(&error).unwrap()));
+        })()"#).unwrap().unwrap_or_else(|error|panic!("host used CSSOM: {}",engine.ctx().coerce_string(&error).map(|text|text.to_string()).unwrap_or_else(|_|"unprintable JavaScript exception".into())));
         assert!(matches!(answer,Value::Bool(true)));
     }
 

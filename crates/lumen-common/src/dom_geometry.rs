@@ -1,5 +1,23 @@
 //! Language-neutral homogeneous geometry used by native DOM geometry values.
 //! Matrices are column-major, with unrestricted IEEE-754 components.
+/// Integral quarter turns have exact sine/cosine coefficients. Preserve all
+/// other angles through normal trigonometry; no tolerance-based snapping.
+pub fn sin_cos_degrees(degrees:f64)->(f64,f64) {
+    match degrees.rem_euclid(360.0) {
+        0.0=>(0.0,1.0),90.0=>(1.0,0.0),180.0=>(0.0,-1.0),270.0=>(-1.0,0.0),
+        _=>degrees.to_radians().sin_cos(),
+    }
+}
+
+/// The compact legacy transform representation stores radians in f32. Only
+/// exact representable quarter turns qualify; source admission must preserve
+/// higher-precision angles which happen to round to this representation.
+pub fn exact_quarter_turn_radians_f32(radians:f32)->Option<(f32,f32)> {
+    let quarter=(radians/core::f32::consts::FRAC_PI_2).round();
+    if !quarter.is_finite() || radians!=quarter*core::f32::consts::FRAC_PI_2{return None;}
+    Some(match quarter.rem_euclid(4.0) {0.0=>(0.0,1.0),1.0=>(1.0,0.0),2.0=>(0.0,-1.0),3.0=>(-1.0,0.0),_=>return None})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point(pub [f64; 4]);
 impl Default for Point { fn default() -> Self { Self([0.0, 0.0, 0.0, 1.0]) } }
@@ -51,7 +69,7 @@ impl Matrix {
         let is_2d=x==0.0&&y==0.0;
         let length = x.hypot(y).hypot(z);
         if length == 0.0 { return self; }
-        let (x,y,z) = (x/length,y/length,z/length); let (s,c) = degrees.to_radians().sin_cos(); let t=1.0-c;
+        let (x,y,z) = (x/length,y/length,z/length); let (s,c) = sin_cos_degrees(degrees); let t=1.0-c;
         let rotation = Self { values: [t*x*x+c,t*x*y+s*z,t*x*z-s*y,0.0, t*x*y-s*z,t*y*y+c,t*y*z+s*x,0.0, t*x*z+s*y,t*y*z-s*x,t*z*z+c,0.0, 0.0,0.0,0.0,1.0], is_2d };
         self.multiply(rotation)
     }
@@ -210,6 +228,29 @@ pub fn decode_numbers<const N: usize>(bytes: &[u8]) -> Option<[f64; N]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_quarter_turns_preserve_nearby_nonzero_rotation_components() {
+        use super::{sin_cos_degrees,exact_quarter_turn_radians_f32,Matrix};
+        for (degrees,expected) in [(0.0,(0.0,1.0)),(90.0,(1.0,0.0)),(180.0,(0.0,-1.0)),(270.0,(-1.0,0.0)),(360.0,(0.0,1.0)),(-90.0,(-1.0,0.0)),(-180.0,(0.0,-1.0)),(450.0,(1.0,0.0))] {
+            assert_eq!(sin_cos_degrees(degrees),expected);
+            assert_eq!(exact_quarter_turn_radians_f32((degrees as f32/90.0)*core::f32::consts::FRAC_PI_2),Some((expected.0 as f32,expected.1 as f32)));
+            let matrix=Matrix::default().rotated_axis(0.0,0.0,1.0,degrees);
+            assert_eq!([matrix.values[0],matrix.values[1],matrix.values[4],matrix.values[5]],[expected.1,expected.0,-expected.0,expected.1]);
+        }
+        assert_eq!(sin_cos_degrees(360000000090.0),(1.0,0.0));
+        assert_eq!(sin_cos_degrees(-360000000090.0),(-1.0,0.0));
+        for degrees in [90.0-1e-10,90.0+1e-10,180.0-1e-10,180.0+1e-10] {
+            let (s,c)=sin_cos_degrees(degrees);
+            assert_eq!((s,c),degrees.to_radians().sin_cos());
+            assert!(s!=0.0 && c!=0.0,"near-quarter angles retain both nonzero components");
+        }
+        for bits in [core::f32::consts::FRAC_PI_2.to_bits()-1,core::f32::consts::FRAC_PI_2.to_bits()+1] {
+            assert_eq!(exact_quarter_turn_radians_f32(f32::from_bits(bits)),None);
+        }
+        assert!(sin_cos_degrees(f64::INFINITY).0.is_nan());
+        assert!(exact_quarter_turn_radians_f32(f32::INFINITY).is_none());
+    }
+
     #[test]
     fn affine_plane_projection_preserves_homogeneous_coordinates(){
         let matrix=super::Matrix::default().translated(3.0,4.0,5.0).rotated_axis(1.0,2.0,3.0,30.0).scaled(2.0,3.0,4.0,super::Point::default());

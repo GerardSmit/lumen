@@ -2597,6 +2597,7 @@ impl HtmlDocumentParser {
                 final_input,
                 stop_after_script,
                 yielded_script: None,
+                completion_error: None,
             };
             let result = parser.run();
             let yielded_script = parser.yielded_script;
@@ -3003,6 +3004,7 @@ pub fn tokenize_for_conformance(
         final_input: true,
         stop_after_script: false,
         yielded_script: None,
+        completion_error: None,
     };
     parser.run()?;
     Ok(parser.conformance_tokens.take().unwrap_or_default())
@@ -3194,6 +3196,7 @@ fn parse_fragment_context(
         final_input: true,
         stop_after_script: false,
         yielded_script: None,
+        completion_error: None,
     }
     .run();
     match result {
@@ -3231,6 +3234,7 @@ struct Parser<'a, 'd, D: crate::parser_documents::ParserDocument + ?Sized> {
     final_input: bool,
     stop_after_script: bool,
     yielded_script: Option<NodeId>,
+    completion_error: Option<ParseError>,
 }
 
 struct PendingElement {
@@ -3349,15 +3353,27 @@ impl<D: crate::parser_documents::ParserDocument + ?Sized> core::ops::DerefMut fo
 }
 
 impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> {
+    fn complete_open_element(&mut self, node: NodeId) {
+        self.document.record_parser_element_completion(node);
+        // HTML's foreign-content stack uses a different tokenizer tag for
+        // SVG style elements. Their stylesheet lifecycle still runs when the
+        // actual element is popped, including recovery and EOF pops.
+        if matches!(self.document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, name, .. }) if name == "style") {
+            if let Err(failure) = self.document.record_parser_style_block_update(node) {
+                if self.completion_error.is_none() { self.completion_error = Some(dom_error(self.pos, failure)); }
+            }
+        }
+    }
+
     fn pop_open_element(&mut self) -> Option<Open> {
         let open = self.stack.pop()?;
-        self.document.record_parser_element_completion(open.id);
+        self.complete_open_element(open.id);
         Some(open)
     }
 
     fn remove_open_element(&mut self, index: usize) -> Open {
         let open = self.stack.remove(index);
-        self.document.record_parser_element_completion(open.id);
+        self.complete_open_element(open.id);
         open
     }
 
@@ -3845,6 +3861,8 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 id,
                 tag: Tag::Other,
             });
+        } else {
+            self.complete_open_element(id);
         }
         Ok(())
     }
@@ -4573,11 +4591,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     .stop_after_script
                     .then(|| self.active_html_parser_script())
                     .flatten();
-                let parser_style = self.stack.last().filter(|open| open.tag == Tag::Style).map(|open| open.id);
                 self.end_tag()?;
-                if let Some(style) = parser_style.filter(|style| !self.stack.iter().any(|open| open.id == *style)) {
-                    self.document.record_parser_style_block_update(style).map_err(|error| dom_error(self.pos, error))?;
-                }
                 if parser_script
                     .is_some_and(|script| !self.stack.iter().any(|open| open.id == script))
                 {
@@ -4599,14 +4613,14 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if self.declarative_cleanup_pending {
                 self.reclaim_declarative_templates(false)?;
             }
+            if let Some(failure) = self.completion_error.take() { return Err(failure); }
             if self.yielded_script.is_some() || self.pending_element.is_some() {
                 break;
             }
         }
         if self.final_input && self.yielded_script.is_none() && self.pending_element.is_none() {
-            if let Some(style) = self.stack.last().filter(|open| open.tag == Tag::Style).map(|open| open.id) {
+            if self.stack.last().is_some_and(|open| open.tag == Tag::Style) {
                 self.pop_open_element();
-                self.document.record_parser_style_block_update(style).map_err(|error| dom_error(self.pos, error))?;
             }
             if self.html.is_some() {
                 self.ensure_scaffold(self.body)?;
@@ -4615,14 +4629,15 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             // EOF completes remaining source-owned elements even when HTML's
             // stack remains open. The sink only records completion; native
             // loading is queued after this borrowed parser turn returns.
-            for open in self.stack.iter().rev() {
-                self.document.record_parser_element_completion(open.id);
+            for index in (0..self.stack.len()).rev() {
+                self.complete_open_element(self.stack[index].id);
             }
 
             // The spec's parser-only template stack elements must not retain an
             // extra template/content pair in the document arena after parsing.
             self.reclaim_declarative_templates(true)?;
         }
+        if let Some(failure) = self.completion_error.take() { return Err(failure); }
         Ok(())
     }
 
@@ -6064,6 +6079,41 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
 mod tests {
     use alloc::borrow::ToOwned;
     #[test]
+    fn specification_parser_style_completion_uses_actual_html_and_svg_owners() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        for (source, expected) in [
+            ("<style id=h>body{color:red}</style><svg><style id=s>rect{fill:green}</style></svg><script id=next></script>", 2),
+            ("<svg><style id=s>rect{fill:green}<p id=next>recovery", 1),
+            ("<svg><style id=s>rect{fill:green}", 1),
+            ("<svg><style id='s'/></svg><script id=next></script>", 1),
+            ("<svg><style id=a><style id=b>rect{fill:green}</style></style></svg><script id=next></script>", 2),
+        ] {
+            let completed=Rc::new(RefCell::new(Vec::new()));
+            let captured=completed.clone();
+            let document=parse_with_options_initialized(source,64,ParseOptions::default(),move |document| {
+                document.set_parser_style_block_sink(Some(Rc::new(move |document,node| {
+                    assert!(crate::selector::query_selector(document,document.root(),"#next").unwrap().is_none(),"style update precedes following token insertion");
+                    assert!(matches!(document.kind(node),Ok(NodeKind::Element{namespace:Namespace::Html|Namespace::Svg,name,..}) if name=="style"));
+                    captured.borrow_mut().push(node);Ok(())
+                })));
+            }).unwrap();
+            let completed=completed.borrow();
+            assert_eq!(completed.len(),expected,"{source}");
+            for (index,node) in completed.iter().enumerate(){
+                assert!(!completed[..index].contains(node),"one update per actual completion");
+                assert!(document.parent(*node).unwrap().is_some());
+            }
+        }
+        for source in ["<style>x{}</style>","<svg><style>x{}</style></svg>","<svg><style>x{}"] {
+            let result=parse_with_options_initialized(source,32,ParseOptions::default(),|document| {
+                document.set_parser_style_block_sink(Some(Rc::new(|_,_|Err(crate::Error::LimitExceeded))));
+            });
+            assert!(result.is_err(),"stylesheet completion admission propagates: {source}");
+        }
+    }
+
+    #[test]
     fn specification_custom_element_names_use_shared_local_name_validation() {
         for name in ["a-a×","a-a\u{3000}","a-a\u{f0000}","a-:","a-="] {
             assert!(super::is_valid_custom_element_name(name),"valid local custom name: {name}");
@@ -6484,9 +6534,10 @@ mod tests {
         );
         assert_eq!(
             document.node_count(),
-            13,
+            14,
             "parser-only template and its unused content must be reclaimed"
         );
+        assert!(document.template_owner_document().is_some(),"template contents retain their one inert owner document");
     }
 
     #[test]
@@ -6598,8 +6649,9 @@ mod tests {
     #[test]
     fn declarative_shadow_parser_reclaims_temporary_nodes_as_roots_close() {
         let source = "<div><template shadowrootmode=open>x</template></div>".repeat(100);
-        let document = parse_with_declarative_shadow_roots(&source, 306, true).unwrap();
-        assert_eq!(document.node_count(), 304);
+        let document = parse_with_declarative_shadow_roots(&source, 307, true).unwrap();
+        assert_eq!(document.node_count(), 305);
+        assert!(document.template_owner_document().is_some());
         assert_eq!(document.shadow_roots().count(), 100);
     }
 
@@ -6628,7 +6680,9 @@ mod tests {
         );
         doc.destroy_subtree(clone).unwrap();
         doc.destroy_subtree(fragment).unwrap();
-        assert_eq!(doc.node_count(), 1);
+        assert_eq!(doc.node_count(), 2);
+        let inert=doc.template_owner_document().unwrap();
+        assert!(matches!(doc.kind(inert),Ok(NodeKind::Document)));
     }
     use super::*;
     use alloc::vec;
@@ -6655,7 +6709,7 @@ mod tests {
             let mut doc = Document::new(64);
             let fragment = parse_fragment(&mut doc, source).unwrap();
             assert_eq!(inner_html(&doc, fragment).unwrap(), expected, "{source}");
-            assert!(doc.mutations().is_empty());
+            assert!(doc.parent(fragment).unwrap().is_none(),"parsing leaves the recovered fragment detached");
         }
     }
 
@@ -7171,7 +7225,8 @@ mod tests {
         let mut doc = Document::new(16);
         let fragment = parse_fragment(&mut doc, "<b>A</b><i>B</i>").unwrap();
         assert_eq!(inner_html(&doc, fragment).unwrap(), "<b>A</b><i>B</i>");
-        assert!(doc.drain_mutations().is_empty());
+        doc.drain_mutations();
+        assert!(doc.parent(fragment).unwrap().is_none());
         let copy = doc.clone_subtree(fragment).unwrap();
         assert_eq!(inner_html(&doc, copy).unwrap(), "<b>A</b><i>B</i>");
         let count = doc.node_count();
@@ -7257,7 +7312,8 @@ mod tests {
             inner_html(&doc, columns).unwrap(),
             "<table><colgroup><col></colgroup><tbody><tr><td>C</td></tr></tbody></table>"
         );
-        assert!(doc.mutations().is_empty());
+        assert!(doc.parent(fragment).unwrap().is_none());
+        assert!(doc.parent(columns).unwrap().is_none());
     }
 
     #[test]
@@ -7530,12 +7586,12 @@ mod tests {
         assert_eq!(document.root(), root);
         assert_eq!(removed.len(), 2);
 
-        let body = crate::selector::query_selector(&document, root, "body")
-            .unwrap()
-            .unwrap();
+        let body = parser.state.as_ref().unwrap().body;
+        assert!(crate::selector::query_selector(&document,root,"body").unwrap().is_none(),"document.open has not consumed an HTML token yet");
         parser.write(&mut document, "<div id=\"fragment").unwrap();
         assert!(document.first_child(body).unwrap().is_none());
         parser.write(&mut document, "\">alpha&amp").unwrap();
+        assert_eq!(crate::selector::query_selector(&document,root,"body").unwrap(),Some(body));
         let host = document.first_child(body).unwrap().unwrap();
         let text = document.first_child(host).unwrap().unwrap();
         assert!(matches!(document.kind(text), Ok(NodeKind::Text(value)) if value == "alpha"));

@@ -279,11 +279,6 @@ pub trait FontProvider: TextShaper {
         options: &CanvasTextOptions,
     ) -> Result<ShapedRun, &'static str>;
 
-    /// SVG2 object bounds use full glyph cells: native horizontal advance
-    /// and the face's ascent/descent, before raster coverage or filter ink.
-    /// Opaque providers may decline instead of guessing from visible pixels.
-    fn glyph_cell_bounds(&self,_face:u64,_id:u16,_size:f32)->Option<lumen_html::paint::Rect>{None}
-
     /// Returns the native vector outline used for stroked Canvas text.
     fn outline_glyph(&self, face: u64, id: u16, size: f32) -> Result<GlyphOutline, &'static str>;
 
@@ -464,6 +459,7 @@ pub struct FontSet {
     default_ignorable: &'static [(u32, u32)],
     generation: u64,
     shapes: RunCache<ShapedRun>,
+    metric_selections: RunCache<FontMetricSelection,16>,
     feature_environment: lumen_html::css::MediaEnvironment,
     display: Option<Arc<[lumen_html::font_display::DisplayPhase]>>,
 }
@@ -1225,6 +1221,7 @@ impl FontSet {
             default_ignorable,
             generation,
             shapes: RunCache::new(),
+            metric_selections: RunCache::new(),
             feature_environment: lumen_html::css::MediaEnvironment::default(),
             display: None,
         })
@@ -1514,26 +1511,24 @@ impl FontSet {
         )
     }
 
-    fn metric_face_index(&self, spec: &FontSpec) -> usize {
-        self.face_order(spec)
-            .ok()
-            // CSS Fonts 4: the first available font excludes faces whose
-            // unicode-range does not include U+0020, independent of its cmap.
-            .and_then(|order| {
-                order.iter().copied().find(|&index| {
-                    self.unicode_ranges[index].as_ref().is_none_or(|ranges| {
-                        ranges
-                            .iter()
-                            .any(|&(first, last)| first <= 0x20 && 0x20 <= last)
-                    })
-                }).and_then(|index| {
-                    if self.display_phase(index)==lumen_html::font_display::DisplayPhase::Loaded {Some(index)}
-                    else {order.into_iter().find(|&candidate|self.display_phase(candidate)==lumen_html::font_display::DisplayPhase::Loaded
-                        && self.unicode_ranges[candidate].as_ref().is_none_or(|ranges|ranges.iter().any(|&(first,last)|first<=0x20 && 0x20<=last)))}
-                })
-            })
-            .unwrap_or(0)
+    fn metric_selection(&self,spec:&FontSpec)->FontMetricSelection {
+        // Unresolved owner math never enters a font-selection cache.
+        if spec.unresolved_style.is_some()||spec.unresolved_stretch.is_some(){return FontMetricSelection {first:0,ch:0,ic:0};}
+        if let Some(selection)=self.metric_selections.get_styled("",0.0,None,0,Some(spec)){return selection;}
+        let Ok(order)=self.face_order(spec) else{return FontMetricSelection {first:0,ch:0,ic:0};};
+        // Retain the same first-available and cluster fallback authorities.
+        // FontSet descriptors, unicode ranges and display phases are immutable
+        // after construction; a new resource snapshot owns a new bounded cache.
+        let first=order.iter().copied().find(|&index|
+            self.display_phase(index)==lumen_html::font_display::DisplayPhase::Loaded
+            && self.unicode_ranges[index].as_ref().is_none_or(|ranges|
+                ranges.iter().any(|&(first,last)|first<=0x20&&0x20<=last))).unwrap_or(0);
+        let select=|glyph|self.cluster_face(glyph,&order).0;
+        let selection=FontMetricSelection {first,ch:select("0"),ic:select("水")};
+        self.metric_selections.insert_styled("",0.0,None,0,Some(spec),selection);
+        selection
     }
+    fn metric_face_index(&self, spec: &FontSpec) -> usize { self.metric_selection(spec).first }
 
     #[cfg(test)]
     fn metric_face(&self, spec: &FontSpec) -> &FontFace {
@@ -1682,6 +1677,10 @@ impl ShapeCacheStats {
         }
     }
 }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct FontMetricSelection {first:usize,ch:usize,ic:usize}
+impl CachedValue for FontMetricSelection {fn cache_bytes(&self)->usize{0}}
+
 trait CachedValue: Clone {
     fn cache_bytes(&self) -> usize;
 }
@@ -1711,7 +1710,7 @@ struct RunSlot<V> {
 
 /// Direct-mapped cache, bounded by slots, text length and retained bytes.
 /// Contention is a miss; shaping never waits for another thread's cache lock.
-struct RunCache<V> {
+struct RunCache<V,const SLOTS:usize=RUN_CACHE_SLOTS> {
     busy: AtomicBool,
     slots: UnsafeCell<Vec<Option<RunSlot<V>>>>,
     hits: AtomicU64,
@@ -1719,8 +1718,8 @@ struct RunCache<V> {
     evictions: AtomicU64,
 }
 // SAFETY: slots is touched only while the busy flag is held.
-unsafe impl<V: Send> Sync for RunCache<V> {}
-impl<V: CachedValue> RunCache<V> {
+unsafe impl<V: Send,const SLOTS:usize> Sync for RunCache<V,SLOTS> {}
+impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
     const fn new() -> Self {
         Self {
             busy: AtomicBool::new(false),
@@ -1834,7 +1833,7 @@ impl<V: CachedValue> RunCache<V> {
             if let Some(language)=language {hash=lumen_common::fasthash::fnv1a64(hash,language.as_bytes());}
             if let Some((start,end))=source {hash=lumen_common::fasthash::fnv1a64(hash,&start.to_le_bytes());hash=lumen_common::fasthash::fnv1a64(hash,&end.to_le_bytes());}
             self.locked(|slots| {
-                let slot = slots.get(hash as usize % RUN_CACHE_SLOTS)?.as_ref()?;
+                let slot = slots.get(hash as usize % SLOTS)?.as_ref()?;
                 (slot.hash == hash
                     && slot.size == size
                     && slot.dir == dir
@@ -1894,17 +1893,17 @@ impl<V: CachedValue> RunCache<V> {
         if let Some((start,end))=source {hash=lumen_common::fasthash::fnv1a64(hash,&start.to_le_bytes());hash=lumen_common::fasthash::fnv1a64(hash,&end.to_le_bytes());}
         self.locked(|slots| {
             if slots.is_empty() {
-                if slots.try_reserve_exact(RUN_CACHE_SLOTS).is_err() {
+                if slots.try_reserve_exact(SLOTS).is_err() {
                     return;
                 }
-                slots.resize_with(RUN_CACHE_SLOTS, || None);
+                slots.resize_with(SLOTS, || None);
             }
             if slots.capacity() * core::mem::size_of::<Option<RunSlot<V>>>() + bytes
                 > MAX_RUN_CACHE_BYTES
             {
                 return;
             }
-            let index = hash as usize % RUN_CACHE_SLOTS;
+            let index = hash as usize % SLOTS;
             if slots[index].take().is_some() {
                 self.evictions.fetch_add(1, Ordering::Relaxed);
             }
@@ -2065,6 +2064,9 @@ pub struct FontFace {
     underline: (f32, f32),
     strike: (f32, f32),
     metrics: [Option<f32>; 6],
+    // The CSS ch/ic probes share the immutable face's maintained cmap
+    // admission; metrics lookup must not reparse every font table per style.
+    metric_glyph_coverage:u8,
     primary_character_widths: Option<PrimaryCharacterWidths>,
     caps_features: u8,
     shapes: RunCache<ShapedRun>,
@@ -2141,6 +2143,8 @@ impl FontFace {
                 .map(|advance| advance as f32 / units_per_em),
             face.glyph_index('0').and_then(|glyph| face.glyph_ver_advance(glyph)).map(|advance| advance as f32 / units_per_em),
         ];
+        let metric_glyph_coverage=u8::from(face.glyph_index('0').is_some_and(|glyph|glyph.0!=0))
+            | (u8::from(face.glyph_index('水').is_some_and(|glyph|glyph.0!=0))<<1);
         let mut caps_features = 0u8;
         if let Some(table) = face.tables().gsub {
             for (index, tag) in [b"smcp", b"c2sc", b"pcap", b"c2pc", b"unic", b"titl"]
@@ -2175,6 +2179,7 @@ impl FontFace {
             underline,
             strike,
             metrics,
+            metric_glyph_coverage,
             primary_character_widths,
             caps_features,
             shapes: RunCache::new(),
@@ -2249,8 +2254,8 @@ impl FontFace {
         ranges: Option<&[(u32, u32)]>,
         default_ignorable: &[(u32, u32)],
     ) -> bool {
-        let Ok(cmap) = ttf_parser::Face::parse(&self.bytes, 0) else {
-            return false;
+        let cmap=if matches!(cluster,"0"|"水"){None}else{
+            match ttf_parser::Face::parse(&self.bytes,0){Ok(face)=>Some(face),Err(_)=>return false}
         };
         cluster.chars().all(|ch| {
             let codepoint = ch as u32;
@@ -2270,7 +2275,11 @@ impl FontFace {
                     ranges
                         .iter()
                         .any(|&(first, last)| first <= codepoint && codepoint <= last)
-                }) && cmap.glyph_index(ch).is_some_and(|glyph| glyph.0 != 0))
+                }) && match ch {
+                    '0'=>self.metric_glyph_coverage&1!=0,
+                    '水'=>self.metric_glyph_coverage&2!=0,
+                    _=>cmap.as_ref().is_some_and(|face|face.glyph_index(ch).is_some_and(|glyph|glyph.0!=0)),
+                })
         })
     }
 
@@ -3000,6 +3009,16 @@ impl FontFace {
 }
 
 impl TextShaper for FontFace {
+    fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
+        if face!=0 && face!=self.id && !self.is_invisible_key(face){return None;}
+        self.with_rasterizer(id,size,|font| {
+            let metrics=font.metrics_indexed(id,size);
+            let line=font.horizontal_line_metrics(size)?;
+            Some(lumen_html::paint::Rect{x:0.0,y:-line.ascent,width:metrics.advance_width,height:line.ascent-line.descent})
+        }).ok().flatten()
+    }
+
+
     fn first_available_font_metric(&self, _font: &FontSpec, metric: FontMetric) -> Option<Option<f32>> {
         Some(self.metric_ratio(metric))
     }
@@ -3245,15 +3264,6 @@ impl FontProvider for FontFace {
         self.rasterize(id, size)
     }
 
-    fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
-        if face!=0 && face!=self.id && !self.is_invisible_key(face){return None;}
-        self.with_rasterizer(id,size,|font| {
-            let metrics=font.metrics_indexed(id,size);
-            let line=font.horizontal_line_metrics(size)?;
-            Some(lumen_html::paint::Rect{x:0.0,y:-line.ascent,width:metrics.advance_width,height:line.ascent-line.descent})
-        }).ok().flatten()
-    }
-
     fn outline_glyph(&self, face: u64, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
         if self.is_invisible_key(face) {
             if !size.is_finite() || size<=0.0 || size>512.0 {return Err("invalid font size");}
@@ -3276,6 +3286,11 @@ impl FontProvider for FontFace {
 }
 
 impl TextShaper for FontSet {
+    fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
+        self.face_by_identity(face)?.glyph_cell_bounds(face,id,size)
+    }
+
+
     fn first_available_font_metric(&self, font: &FontSpec, metric: FontMetric) -> Option<Option<f32>> {
         Some(self.first_available_metric(font, metric))
     }
@@ -3451,15 +3466,9 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
     }
 
     fn font_unit_metrics_styled(&self, size: f32, font: &FontSpec, vertical: bool, upright_zero: bool) -> lumen_html::paint::FontUnitMetrics {
-        let order = self.face_order(font).ok();
-        let first = order.as_ref().and_then(|order| order.iter().copied().find(|&index| {
-            self.display_phase(index) == lumen_html::font_display::DisplayPhase::Loaded
-                && self.unicode_ranges[index].as_ref().is_none_or(|ranges| {
-                    ranges.iter().any(|&(first, last)| first <= 0x20 && 0x20 <= last)
-                })
-        })).unwrap_or(0);
+        let selection=self.metric_selection(font);
         let metric = |name: FontMetric, glyph: Option<&str>| {
-            let index = glyph.and_then(|glyph| order.as_ref().map(|order| self.cluster_face(glyph, order).0)).unwrap_or(first);
+            let index=match glyph{Some("0")=>selection.ch,Some("水")=>selection.ic,_=>selection.first};
             let face = &self.faces[index].face;
             let ratio = match name {
                 FontMetric::ChWidth => face.metrics[if upright_zero { 5 } else { 2 }],
@@ -3571,10 +3580,6 @@ impl FontProvider for FontSet {
         font.rasterize_glyph(face,id,size)
     }
 
-    fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
-        self.face_by_identity(face)?.glyph_cell_bounds(face,id,size)
-    }
-
     fn outline_glyph(&self, face: u64, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
         let font=self.face_by_identity(face).ok_or("unknown font face")?;
         font.outline_glyph(face,id,size)
@@ -3622,6 +3627,136 @@ mod tests {
         let shaped_before=fonts.shape_cache_stats();
         for _ in 0..16 {assert_eq!(fonts.primary_character_widths_styled(size,&spec),Some(expected));}
         assert_eq!(fonts.shape_cache_stats(),shaped_before);
+    }
+
+    #[test]
+    fn specification_native_kerning_keeps_max_content_words_on_one_line() {
+        for bytes in [TEST_FONT_BYTES,TEST_FONT_BOLD_BYTES] {
+            let face=FontFace::new(Arc::from(bytes)).unwrap();
+            for text in ["Filler Text","AV AV","To AV"] {
+                let document=lumen_html::html::parse(&format!("<!doctype html><style>html,body{{margin:0}}#outer,#inner{{display:table}}#row{{display:table-row}}#cell{{display:table-cell;width:192px;height:96px}}</style><div id=outer><div id=inner>{text}</div><div id=row><div id=cell></div></div></div>"),64).unwrap();
+                let inner=lumen_html::selector::get_element_by_id(&document,document.root(),"inner").unwrap().unwrap();
+                let mut session=lumen_html::session::RenderSession::new(document);
+                let style=session.computed_style(inner).unwrap();
+                let expected=face.shape_styled(text,style.font_size,false,&style.font).unwrap().width;
+                let line_height=face.line_height_styled(style.font_size,&style.font);
+                let first=session.display_list(400,300,&face).unwrap().clone();
+                let rect=session.layout_rect(inner).unwrap();
+                assert!((rect.width-expected).abs()<0.001,"{text}: the shared native max-content metric defines the track");
+                assert!((rect.height-line_height).abs()<0.001,"{text}: break chunks must preserve the complete run's kerning, got {rect:?}");
+                assert_eq!(first,session.display_list(400,300,&face).unwrap().clone());
+                assert_eq!(first,lumen_html::layout::display_list(session.document(),400,300,&face).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn specification_native_shaping_checks_only_the_separating_inline_edge() {
+        let face=FontFace::new(Arc::from(TEST_FONT_BYTES)).unwrap();
+        for (markup,joined,leading) in [
+            ("A<span style='padding-right:10px'>V</span>",true,0.0),
+            ("<span style='padding-left:10px'>A</span>V",true,10.0),
+            ("A<span style='padding-left:10px'>V</span>",false,10.0),
+            ("<span style='padding-right:10px'>A</span>V",false,10.0),
+            ("A<span style='margin-right:10px'>V</span>",true,0.0),
+            ("<span style='border-left:10px solid transparent'>A</span>V",true,10.0),
+        ] {
+            let document=lumen_html::html::parse(&format!("<!doctype html><style>html,body{{margin:0}}#box{{display:table;font-size:36px}}</style><div id=box>{markup}</div>"),64).unwrap();
+            let node=lumen_html::selector::get_element_by_id(&document,document.root(),"box").unwrap().unwrap();
+            let mut session=lumen_html::session::RenderSession::new(document);
+            let style=session.computed_style(node).unwrap();
+            let whole=face.shape_styled("AV",style.font_size,false,&style.font).unwrap();
+            let single=face.shape_styled("V",style.font_size,false,&style.font).unwrap();
+            let glyph_id=single.glyphs[0].id;
+            let expected=leading+if joined {whole.glyphs.iter().find(|glyph|glyph.id==glyph_id).unwrap().x}
+                else {face.shape_styled("A",style.font_size,false,&style.font).unwrap().width};
+            let cold=session.display_list(400,300,&face).unwrap().clone();
+            let expected_width=10.0+if joined {whole.width}
+                else {face.shape_styled("A",style.font_size,false,&style.font).unwrap().width+single.width};
+            let rect=session.layout_rect(node).unwrap();
+            assert!((rect.width-expected_width).abs()<0.001,"{markup}: intrinsic and painted shaping must agree: expected {expected_width}, got {rect:?}");
+            let actual=cold.0.iter().find_map(|command|match command {
+                lumen_html::paint::Command::GlyphRun{origin_x,glyphs,..}=>glyphs.iter().find(|glyph|glyph.id==glyph_id).map(|glyph|origin_x+glyph.x),
+                _=>None,
+            }).unwrap();
+            assert!((actual-expected).abs()<0.001,"{markup}: expected glyph origin {expected}, got {actual}");
+            assert_eq!(cold,session.display_list(400,300,&face).unwrap().clone());
+            assert_eq!(cold,lumen_html::layout::display_list(session.document(),400,300,&face).unwrap());
+        }
+    }
+
+    #[test]
+    fn specification_emergency_wrap_preserves_complete_arabic_shaping() {
+        let fonts=FontSet::new(vec![registered("sans-serif",400,FontStyle::Normal,
+            include_bytes!("../tests/fixtures/shaping/NotoNaskhArabic-regular.woff2"))]).unwrap();
+        let word="عائلة";
+        for policy in ["break-word","anywhere"] {
+            let document=lumen_html::html::parse(&format!("<!doctype html><style>html,body{{margin:0}}main{{width:70px;font:64px sans-serif;overflow-wrap:{policy}}}</style><main lang=ar dir=rtl>{word}</main>"),64).unwrap();
+            let mut session=lumen_html::session::RenderSession::new(document);
+            let first=session.display_list(200,300,&fonts).unwrap().clone();
+            let whole=fonts.shape_styled_context(word,64.0,true,&FontSpec::default(),Some("ar")).unwrap();
+            let mut expected=whole.glyphs.iter().map(|glyph|glyph.id).collect::<Vec<_>>();expected.sort_unstable();
+            let mut actual=Vec::new();let mut lines=Vec::new();
+            for command in &first.0 {if let lumen_html::paint::Command::GlyphRun{baseline_y,glyphs,..}=command {
+                lines.push(*baseline_y);actual.extend(glyphs.iter().map(|glyph|glyph.id));
+            }}
+            actual.sort_unstable();lines.sort_by(f32::total_cmp);lines.dedup();
+            assert!(lines.len()>1,"{policy}: the real glyphs must wrap");
+            assert_eq!(actual,expected,"{policy}: line boundaries retain the whole word's contextual forms");
+            assert_eq!(first,session.display_list(200,300,&fonts).unwrap().clone());
+            assert_eq!(first,lumen_html::layout::display_list(session.document(),200,300,&fonts).unwrap());
+        }
+    }
+
+    #[test]
+    fn specification_font_unit_probe_coverage_reuses_immutable_cmap_and_unicode_ranges(){
+        let ignored=lumen_common::unicode_props::lookup("DI",None).unwrap();
+        for bytes in [DEFAULT_FONT_BYTES,TEST_FONT_BYTES,TEST_FONT_BOLD_BYTES]{
+            let face=FontFace::new(Arc::from(bytes)).unwrap();
+            let parsed=ttf_parser::Face::parse(bytes,0).unwrap();
+            for character in ['0','水']{
+                let expected=parsed.glyph_index(character).is_some_and(|glyph|glyph.0!=0);
+                let mut encoded=[0;4];let cluster=character.encode_utf8(&mut encoded);
+                assert_eq!(face.covers_cluster_with_properties(cluster,None,ignored),expected);
+                assert_eq!(face.covers_cluster_with_properties(cluster,Some(&[(character as u32,character as u32)]),ignored),expected);
+                assert!(!face.covers_cluster_with_properties(cluster,Some(&[(0x41,0x5a)]),ignored));
+            }
+            assert_eq!(face.covers_cluster_with_properties("0A",None,ignored),['0','A'].into_iter().all(|character|parsed.glyph_index(character).is_some_and(|glyph|glyph.0!=0)));
+            assert!(face.covers_cluster_with_properties("\n",Some(&[]),ignored));
+        }
+    }
+
+    #[test]
+    fn specification_font_metric_selection_cache_preserves_fallback_and_bounds() {
+        let fonts=FontSet::new_with_unicode_ranges(vec![
+            registered("Fallback",400,FontStyle::Normal,DEFAULT_FONT_BYTES),
+            registered("Slice",400,FontStyle::Normal,TEST_FONT_BYTES),
+            registered("Slice",400,FontStyle::Normal,TEST_FONT_BOLD_BYTES),
+        ],vec![None,Some(Arc::from([(0x20,0x20)])),Some(Arc::from([(0x30,0x30)]))]).unwrap();
+        let spec=FontSpec{families:Some(Arc::from([FontFamily::from("Slice")])),..FontSpec::default()};
+        let selection=fonts.metric_selection(&spec);
+        let order=fonts.face_order(&spec).unwrap();
+        assert_eq!(selection.first,1,"space-qualified slice owns first-available metrics");
+        assert_eq!(selection.ch,fonts.cluster_face("0",&order).0);
+        assert_eq!(selection.ic,fonts.cluster_face("水",&order).0);
+        let cold=fonts.metric_selections.stats();
+        for _ in 0..64 {
+            assert_eq!(fonts.metric_selection(&spec),selection);
+            assert_eq!(fonts.metric_face_index(&spec),selection.first);
+        }
+        assert!(fonts.metric_selections.stats().hits>=cold.hits+128);
+        let other=FontSpec{families:Some(Arc::from([FontFamily::from("Fallback")])),..FontSpec::default()};
+        assert_eq!(fonts.metric_selection(&other).first,0,"font metadata must participate in cache identity");
+        for index in 0..256 {
+            let spec=FontSpec{weight:1+(index as u16%1000),families:Some(Arc::from([
+                FontFamily::from(alloc::format!("Missing-{index}").as_str()),FontFamily::from("Slice")
+            ])),..FontSpec::default()};
+            assert_eq!(fonts.metric_selection(&spec),selection);
+            let stats=fonts.metric_selections.stats();
+            assert!(stats.entries<=16&&stats.bytes<=MAX_RUN_CACHE_BYTES);
+        }
+        assert!(fonts.metric_selections.stats().evictions>0);
+        assert_eq!(fonts.metric_selection(&spec),selection,"collisions retain exact fallback semantics");
     }
 
     #[test]
@@ -4588,7 +4723,7 @@ fn joining_context_preserves_font_item_clusters_and_exact_cache_identity() {
 
     #[test]
     fn shape_cache_eviction_enforces_retained_byte_budget() {
-        let cache = RunCache::new();
+        let cache = RunCache::<ShapedRun>::new();
         let run = ShapedRun {
             glyphs: Arc::from(vec![
                 Glyph {

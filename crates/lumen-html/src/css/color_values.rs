@@ -322,8 +322,10 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
     let raw=raw.trim();
     if decoded_css_keyword(raw,"currentcolor") {return Some("currentcolor".into());}
     let Some((name,body))=raw.split_once('(') else {
-        endpoint(raw,depth)?;
-        return if raw.starts_with('#') {Some(raw.to_ascii_lowercase())}else {Some(identifier(raw)?.into_owned())};
+        let value=endpoint(raw,depth)?;
+        // CSS Color 4 §16.2 preserves authored named keywords, while hex
+        // colors use the shared CSS sRGB serialization for declared values.
+        return if raw.starts_with('#') {Some(super::computed_values::color(rgba(value)))}else {Some(identifier(raw)?.into_owned())};
     };
     let name=identifier(name)?;let body=body.strip_suffix(')')?;
     if name=="color-mix" {

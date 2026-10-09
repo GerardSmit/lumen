@@ -96,8 +96,17 @@ pub(crate) fn declared(document: &Document, node: NodeId) -> Result<Option<&str>
 /// `work` lets selectors charge the same canonical parent walk to their quota.
 pub(crate) fn determine(
     document: &Document,
+    node: NodeId,
+    work: impl FnMut() -> bool,
+) -> Result<Option<&str>, Error> {
+    determine_with_parent(document,node,work,|node|document.parent(node))
+}
+
+pub(crate) fn determine_with_parent(
+    document: &Document,
     mut node: NodeId,
     mut work: impl FnMut() -> bool,
+    mut parent: impl FnMut(NodeId)->Result<Option<NodeId>,Error>,
 ) -> Result<Option<&str>, Error> {
     for _ in 0..512 {
         if !work() {
@@ -106,7 +115,7 @@ pub(crate) fn determine(
         if let Some(value) = declared(document, node)? {
             return Ok(Some(value));
         }
-        if let Some(parent) = document.parent(node)? {
+        if let Some(parent) = parent(node)? {
             if let Some(host) = document.shadow_host(parent)? {
                 node = host;
                 continue;

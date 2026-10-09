@@ -68,22 +68,7 @@ impl<'a, T: Class + Clone> FromArg<'a, lumen::embed::JsHost> for NativeClassArgu
     }
 }
 
-#[derive(Clone)]
-struct ProgressBinding {
-    sampled_time: Option<f64>,
-    source: Option<NodeId>,
-    subject: Option<NodeId>,
-    horizontal: bool,
-    range: animation::ProgressRange,
-    insets: Option<[lumen_html::css::DecorationLength;2]>,
-    duration_auto:bool,
-}
-
-impl ProgressBinding{
-    fn checked_retained_bytes(&self)->Option<usize>{
-        self.range.checked_retained_bytes()?.checked_add(match &self.insets{Some(values)=>lumen_html::css::checked_progress_offset_bytes(values)?,None=>0})
-    }
-}
+use lumen_html::animation::progress_timelines::ProgressBinding;
 
 #[derive(Clone)]
 struct Record {
@@ -1365,90 +1350,18 @@ fn reposition_css_records(
 }
 
 fn progress_axis_horizontal(session:&mut lumen_html::session::RenderSession,node:NodeId,axis:&str)->OpResult<bool>{
-    let node=if node==session.document().root(){session.document().document_element_at(node).map_err(dom_error)?.unwrap_or(node)}else{node};
-    let writing=session.computed_style(node).map_err(|_|OpError::error("timeline writing mode resolution failed"))?.writing_mode;
-    Ok(match axis{"x"=>true,"y"=>false,"inline"=>writing==lumen_html::css::WritingMode::HorizontalTb,_=>writing!=lumen_html::css::WritingMode::HorizontalTb})
+    animation::progress_timelines::axis_horizontal(session,node,axis).map_err(|_|OpError::error("timeline axis resolution failed"))
 }
 fn nearest_progress_scroll_source(session:&mut lumen_html::session::RenderSession,node:NodeId,axis:&str)->OpResult<(Option<NodeId>,bool)>{
-    let mut ancestor=session.document().composed_parent(node).map_err(dom_error)?;
-    while let Some(id)=ancestor{
-        let horizontal=progress_axis_horizontal(session,id,axis)?;
-        // The Document is the viewport scroll source, not an element with a
-        // computed overflow declaration. Its axis was resolved via its root
-        // element above; do not ask the element cascade for Document styles.
-        if id==session.document().root(){return Ok((Some(id),horizontal));}
-
-        let style=session.computed_style(id).map_err(|_|OpError::error("timeline scroll source resolution failed"))?;
-        let overflow=if horizontal{style.overflow_x}else{style.overflow_y};
-        use lumen_html::css::Display as D;
-        if !matches!(style.display,D::Inline|D::Contents|D::None|D::TableRow|D::TableRowGroup|D::TableHeaderGroup|D::TableFooterGroup|D::TableColumn|D::TableColumnGroup)
-            &&matches!(overflow,lumen_html::css::Overflow::Hidden|lumen_html::css::Overflow::Scroll|lumen_html::css::Overflow::Auto){return Ok((Some(id),horizontal));}
-        ancestor=session.document().composed_parent(id).map_err(dom_error)?;
-    }
-    let source=session.document().root();let horizontal=progress_axis_horizontal(session,source,axis)?;
-    Ok((Some(source),horizontal))
+    animation::progress_timelines::nearest_scroll_source(session,node,axis).map_err(|_|OpError::error("timeline scroll source resolution failed"))
 }
-
-fn resolve_named_progress_timeline(
-    realm: &DomRealm, snapshot: &lumen_html::session::AnimationSnapshot,
-    node: NodeId, scope: Option<NodeId>, name: &str, range: animation::ProgressRange,
-) -> OpResult<ProgressBinding> {
-    if let Some(timeline)=lumen_html::css::parse_anonymous_progress_timeline(name){
-        let mut session=realm.session.borrow_mut();
-        let(source,horizontal)=if timeline.scroller=="root"{
-            let source=session.document().root();(Some(source),progress_axis_horizontal(&mut session,source,&timeline.axis)?)
-        }else if timeline.scroller=="self"&&!timeline.view{(Some(node),progress_axis_horizontal(&mut session,node,&timeline.axis)?)}else{nearest_progress_scroll_source(&mut session,node,&timeline.axis)?};
-
-        return Ok(ProgressBinding{sampled_time:None,source,subject:timeline.view.then_some(node),horizontal,range,insets:timeline.view.then_some(timeline.insets),duration_auto:true});
-    }
-    let mut current=Some(node);
-    let mut session=realm.session.borrow_mut();
-    while let Some(candidate)=current {
-        if let Some((_,_,_,style))=snapshot.nodes.iter().find(|(id,pseudo,tree,_)| *id==candidate && pseudo.is_none() && *tree==scope) {
-            for (names_slot,axis_slot,view) in [(11,12,false),(13,14,true)] {
-                let names=style[names_slot].as_deref().map(lumen_html::css::css_list_items).unwrap_or_default();
-                if let Some(index)=names.iter().rposition(|candidate|candidate==name) {
-                    let axis=css_list_value(style,axis_slot,index,"block");
-                    let(source,horizontal)=if view{nearest_progress_scroll_source(&mut session,candidate,&axis)?}else{(Some(candidate),progress_axis_horizontal(&mut session,candidate,&axis)?)};
-                    let insets=if view{
-                        let value=css_list_value(style,18,index,"auto");
-                        lumen_html::css::parse_anonymous_progress_timeline(&format!("view({value})")).map(|timeline|timeline.insets)
-                    }else{None};
-                    return Ok(ProgressBinding{sampled_time:None,source,subject:view.then_some(candidate),horizontal,range,insets,duration_auto:true});
-
-                }
-            }
-        }
-        current=session.document().composed_parent(candidate).map_err(dom_error)?;
-    }
-    Ok(ProgressBinding{sampled_time:None,source:None,subject:None,horizontal:false,range,insets:None,duration_auto:true})
+fn resolve_named_progress_timeline(realm:&DomRealm,snapshot:&lumen_html::session::AnimationSnapshot,
+    node:NodeId,scope:Option<NodeId>,name:&str,range:animation::ProgressRange)->OpResult<ProgressBinding>{
+    animation::progress_timelines::resolve(&mut realm.session.borrow_mut(),snapshot,node,scope,name,range)
+        .map_err(|_|OpError::error("CSS progress timeline resolution failed"))
 }
-
-fn progress_time(realm: &DomRealm, binding: &ProgressBinding) -> Option<f64> {
-    let source=binding.source?;
-    let mut session=realm.session.borrow_mut();
-    let style_node=if source==session.document().root(){session.document().document_element_at(source).ok().flatten().unwrap_or(source)}else{source};
-    let sides=session.computed_style(style_node).ok()?.logical_sides();
-    let start_edge=[sides[0],sides[2]].into_iter().find(|edge|if binding.horizontal{matches!(*edge,1|3)}else{matches!(*edge,0|2)})?;
-    let reverse=if binding.horizontal{start_edge==1}else{start_edge==2};
-    let (x,y)=session.scroll_offset(source);
-
-    let offset=f64::from(if binding.horizontal{x}else{y})*if reverse{-1.0}else{1.0};
-    let (start,end)=if let Some(subject)=binding.subject {
-        let rect=session.layout_rect(subject)?;
-        let (port,_)=session.scrollport_coordinate_space(source)?;
-        let mut subject_start=if binding.horizontal{rect.x-port.x+x}else{rect.y-port.y+y} as f64;
-        let subject_size=if binding.horizontal{rect.width}else{rect.height} as f64;
-        let viewport_size=if binding.horizontal{port.width}else{port.height} as f64;
-        if reverse{subject_start=viewport_size-subject_start-subject_size;}
-                let offsets=binding.insets.as_ref().map(|insets|[f64::from(insets[0].used(viewport_size as f32).unwrap_or(0.0)),f64::from(insets[1].used(viewport_size as f32).unwrap_or(0.0))]).unwrap_or([0.0;2]);
-        binding.range.view_bounds(subject_start-offsets[0],subject_size,viewport_size-offsets[0]-offsets[1])?
-
-    }else{
-        let (min_x,max_x,min_y,max_y)=session.scroll_bounds(source)?;
-        let(start,end)=if binding.horizontal{(min_x as f64,max_x as f64)}else{(min_y as f64,max_y as f64)};let(start,end)=if reverse{(-end,-start)}else{(start,end)};binding.range.scroll_bounds(start,end)?
-    };
-    animation::progress_fraction(offset,start,end).map(|progress|progress*1000.0)
+fn progress_time(realm:&DomRealm,binding:&ProgressBinding)->Option<f64>{
+    animation::progress_timelines::sample(&mut realm.session.borrow_mut(),binding).map(|sample|sample.progress*1000.0)
 }
 
 fn transition_parameters(style:&lumen_html::css::Style,index:usize)->(animation::TransitionParameters,Rc<str>,bool) {
@@ -1472,10 +1385,10 @@ fn interpolate_transition_value(property:&str,from:&str,to:&str,progress:f64)->O
     match lumen_html::css::transition_value_kind(property) {
         NotAnimatable | Discrete | Display | Visibility | Custom => None,
         Integer => {
-            use lumen_html::css::typed_numeric::{parse_numeric_value,serialize_numeric_value,NumericUnit};
+            use lumen_html::css::typed_numeric::{parse_numeric_value,NumericUnit};
             let a=parse_numeric_value(from)?; let b=parse_numeric_value(to)?;
             if a.unit!=NumericUnit::Number || b.unit!=NumericUnit::Number {return None;}
-            Some(serialize_numeric_value((a.value+(b.value-a.value)*progress+0.5).floor(),NumericUnit::Number))
+            lumen_html::css::computed_integer_css_value(property,a.value+(b.value-a.value)*progress)
         }
         _=>interpolate_animation_value(from,to,progress),
     }
@@ -1641,8 +1554,6 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         && hub.borrow().records.get(id).is_some_and(|record|record.cancelled))
         .map(|(target,id)|(target.clone(),*id)).collect::<Vec<_>>();
     for (target,id) in removed {hub.borrow_mut().running_transitions.remove(&target);cancel_owned_transition(ctx,hub,id)?;}
-    // Sampling old records precedes updating CSS animation declarations/timing.
-    apply_realm_with_underlying(hub,realm,now,true)?;
     // Style changes can occur after the active interval but before the next
     // rendering event phase. Reconcile completion without consuming end events.
     let completed= {
@@ -1661,6 +1572,11 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         .map_err(|error|OpError::new("InvalidStateError",format!("transition style inputs failed: {error:?}")))?;
     if !completed_display && hub.borrow().transition_snapshots.get(&realm_key).is_some_and(|(owner,previous)|
         owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && previous.epoch==epoch) {return Ok(());}
+    // An unchanged cascade input epoch needs lifecycle reconciliation above,
+    // but no BEFORE stack publication. The caller samples its actual demand.
+    // Genuine style changes still advance old effects against their captured
+    // source before projecting AFTER declarations and new CSS timing.
+    apply_realm_with_underlying(hub,realm,now,true)?;
     // Preserve the complete old composited stack before calculating AFTER.
     // Merely suppressing the Transition cascade origin is insufficient: an
     // additive Animation-origin result may already contain a lower transition.
@@ -3724,11 +3640,13 @@ fn dispatch_css_event(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32,
 
 fn pseudo_order(pseudo:Option<lumen_html::css::PseudoElement>)->u8 {
     use lumen_html::css::PseudoElement::*;
-    match pseudo {None=>0,Some(Marker)=>1,Some(Before)=>2,Some(After)=>4,_=>3}
+    match pseudo {None=>0,Some(Marker)=>1,Some(Before)=>2,Some(BeforeMarker)=>3,
+        Some(After)=>4,Some(AfterMarker)=>5,_=>6}
 }
 fn pseudo_name(pseudo:Option<lumen_html::css::PseudoElement>)->&'static str {
     use lumen_html::css::PseudoElement::*;
     match pseudo {None=>"",Some(Before)=>"::before",Some(After)=>"::after",Some(Marker)=>"::marker",
+        Some(BeforeMarker)=>"::before::marker",Some(AfterMarker)=>"::after::marker",
         Some(FirstLine)=>"::first-line",Some(FirstLetter)=>"::first-letter",Some(Highlight)=>"::highlight",Some(Placeholder)=>"::placeholder",
         Some(ViewTransition)=>"::view-transition",Some(ViewTransitionGroup)=>"::view-transition-group",
         Some(ViewTransitionImagePair)=>"::view-transition-image-pair",Some(ViewTransitionOld)=>"::view-transition-old",

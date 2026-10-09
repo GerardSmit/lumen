@@ -40,6 +40,7 @@ pub mod session;
 pub mod stylesheet_loading;
 pub mod shadow;
 pub mod svg;
+mod svg_filter;
 pub mod svg_dom;
 pub mod xml;
 pub mod xml_stylesheet;

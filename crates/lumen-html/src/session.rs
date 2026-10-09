@@ -234,6 +234,9 @@ impl ImageResolver for NodeImages<'_> {
         self.fallback
             .and_then(|images| images.resolve_node_from(node, base, source))
     }
+    fn resolve_image_request(&self,node:NodeId,base:&str,source:&str,parameters:layout::ImageRequestParameters)->layout::ImageState {
+        self.fallback.map_or(layout::ImageState::Failed,|images|images.resolve_image_request(node,base,source,parameters))
+    }
     fn node_origin_clean(&self, node: NodeId, base: &str, source: &str) -> bool {
         self.fallback
             .is_none_or(|images| images.node_origin_clean(node, base, source))
@@ -282,6 +285,9 @@ impl ImageResolver for SnapshotImages<'_> {
     }
     fn resolve_node_from(&self,node:NodeId,base:&str,source:&str)->Option<layout::ImageState> {
         self.0.resolve_node_from(node,base,source).map(|state|self.filtered(state,self.0.node_origin_clean(node,base,source)))
+    }
+    fn resolve_image_request(&self,node:NodeId,base:&str,source:&str,parameters:layout::ImageRequestParameters)->layout::ImageState {
+        self.filtered(self.0.resolve_image_request(node,base,source,parameters),self.0.node_origin_clean(node,base,source))
     }
     fn resolve_node(&self,node:NodeId)->Option<layout::ImageState> {
         let embeds_document = matches!(self.1.kind(node),Ok(NodeKind::Element{name,..}) if matches!(name.as_str(),"iframe"|"object"|"embed"));
@@ -485,6 +491,9 @@ pub struct RenderSession {
     style_environment: Option<css::MediaEnvironment>,
     presentation_root: Option<NodeId>,
     animation_snapshot: Option<Arc<AnimationSnapshot>>,
+    timeline_transform_values:Option<Arc<crate::animation::progress_timelines::TransformTimelineValues>>,
+    forced_layout:bool,
+    timeline_layout_stale:bool,
     // Only deterministic provenance-budget rejection is memoized. The rare
     // record has no DOM roots and includes actual font and paint inputs.
     rejected_transition_snapshot: Option<Box<(TransitionInputEpoch, Option<u64>, u64)>>,
@@ -511,7 +520,7 @@ struct ReadStyleKey {
     layout_frame_id: u64,
 }
 
-fn style_with_query_context(
+pub(crate) fn style_with_query_context(
     document: &Document,
     node: NodeId,
     rules: &StyleIndex,
@@ -707,6 +716,9 @@ impl RenderSession {
             style_environment: None,
             presentation_root: None,
             animation_snapshot: None,
+            timeline_transform_values:None,
+            forced_layout:false,
+            timeline_layout_stale:false,
             rejected_transition_snapshot: None,
             animation_generation: 0,
             animation_epoch: 0,
@@ -911,8 +923,10 @@ impl RenderSession {
     }
     pub fn set_node_bitmap_with_metadata(&mut self,node:NodeId,image:Option<Arc<ImageData>>,metadata:crate::responsive_images::ImageMetadata)->Result<(),LayoutError> {
         if !metadata.is_valid() {return Err(LayoutError::ImageFailed);}
-        if !matches!(self.document.kind(node), Ok(NodeKind::Element { name, namespace: crate::Namespace::Html, .. }) if name == "canvas" || name == "img" || name == "video" || name == "object")
-        {
+        // Image Button fetches retain their available image across type
+        // changes. The canonical input owner may receive an in-flight result
+        // while its current type is non-image; only image layout uses it.
+        if !matches!(crate::forms::html_element_local_name(&self.document,node),Some("canvas"|"img"|"video"|"object"|"input")) {
             return Err(LayoutError::InvalidTree);
         }
         if image.as_ref().is_some_and(|image| !image.is_valid()) {
@@ -2351,7 +2365,7 @@ impl RenderSession {
         // Allocation/parse/text failures remain retryable; admission checks
         // alone set this flag, so an unchanged oversized tree is walked once.
         let mut quota_exceeded=false;
-        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None);
+        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None);
         self.rejected_transition_snapshot=if quota_exceeded {Some(Box::new(key))} else {None};
         result
     }
@@ -2391,14 +2405,14 @@ impl RenderSession {
             if let Some(pseudo)=pseudo{*selection.selected.get_mut(&node.key()).ok_or(LayoutError::InvalidTree)?|=1u16<<(pseudo as u8);}
         }
         let mut quota_exceeded=false;
-        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection))
+        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection),None)
     }
 
     fn capture_transition_snapshot_with_text(&mut self,text:Option<&dyn TextShaper>,epoch:TransitionInputEpoch,
-        quota_exceeded:&mut bool,selection:Option<&EffectStyleSelection>)->Result<Arc<TransitionSnapshot>,LayoutError> {
+        quota_exceeded:&mut bool,selection:Option<&EffectStyleSelection>,completed_geometry:Option<&layout::LayoutGeometry>)->Result<Arc<TransitionSnapshot>,LayoutError> {
 
         let rules=self.rules.as_ref().expect("stylesheets initialized");
-        let geometry=self.cached.as_ref().map(|frame| &frame.geometry);
+        let geometry=completed_geometry.or_else(||self.cached.as_ref().map(|frame| &frame.geometry));
         let mut cache=match selection {Some(selection)=>css::StyleCache::selected(&selection.nodes).ok_or(LayoutError::CommandLimit)?,None=>css::StyleCache::default()};
         let root=self.document.root();
         let mut selected_index=0;
@@ -2448,14 +2462,21 @@ impl RenderSession {
                 {
                     let quote=matches!(self.document.kind(node),Ok(NodeKind::Element {name,namespace:crate::Namespace::Html,..}) if name == "q");
                     for pseudo in [css::PseudoElement::Marker,css::PseudoElement::Before,css::PseudoElement::After,
+                        css::PseudoElement::BeforeMarker,css::PseudoElement::AfterMarker,
                         css::PseudoElement::FirstLine,css::PseudoElement::FirstLetter,css::PseudoElement::Highlight,css::PseudoElement::Placeholder,
                         css::PseudoElement::ViewTransition,css::PseudoElement::ViewTransitionGroup,css::PseudoElement::ViewTransitionImagePair,
                         css::PseudoElement::ViewTransitionOld,css::PseudoElement::ViewTransitionNew] {
                         let requested=selection.is_some_and(|selection|selection.selected.get(&node.key()).is_some_and(|bits|bits&(1u16<<(pseudo as u8))!=0));
                         if selection.is_some()&&!requested{continue;}
-                        if selection.is_none()&&!matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After){continue;}
-                        if !requested && !rules.has_transition_pseudo_rules(pseudo) && !(pseudo==css::PseudoElement::Marker && style.is_list_item()) && !(quote && pseudo!=css::PseudoElement::Marker) {continue;}
-                        let (mut generated,mut eligible)=rules.compute_transition_snapshot_cached(&self.document,node,Some(&style),Some(pseudo),text,
+                        if selection.is_none()&&!matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After|css::PseudoElement::BeforeMarker|css::PseudoElement::AfterMarker){continue;}
+                        let generated_origin = pseudo.marker_origin().map(|parent| rules.compute_pseudo_cached(
+                            &self.document, node, &style, parent, text, &mut cache)).transpose().map_err(LayoutError::Css)?.flatten();
+                        let pseudo_origin = generated_origin.as_ref().map_or(style.as_ref(), |parent| &parent.style);
+                        let origin_present = pseudo.marker_origin().is_none() || generated_origin.as_ref()
+                            .is_some_and(|parent| parent.style.display != css::Display::None && parent.style.is_list_item());
+                        if !requested && !origin_present {continue;}
+                        if !requested && !rules.has_transition_pseudo_rules(pseudo) && !(pseudo.is_marker() && pseudo_origin.is_list_item()) && !(quote && !pseudo.is_marker()) {continue;}
+                        let (mut generated,mut eligible)=rules.compute_transition_snapshot_cached(&self.document,node,Some(pseudo_origin),Some(pseudo),text,
                             &mut cache,false).map_err(LayoutError::Css)?;
                         if generated.has_query_container_dependencies() || generated.has_inherited_query_container_dependencies() {
                             let context=match query {Some(context)=>context,None=>style_with_query_context(&self.document,node,rules,&mut cache,geometry,text,true)?.1};
@@ -2463,11 +2484,11 @@ impl RenderSession {
                         }
                         let generated_present=match generated.generated_content() {
                             css::GeneratedContent::Items(_) => true,
-                            css::GeneratedContent::Normal => pseudo == css::PseudoElement::Marker && style.is_list_item(),
+                            css::GeneratedContent::Normal => pseudo.is_marker() && origin_present && pseudo_origin.is_list_item(),
                             css::GeneratedContent::None => false,
                         };
                         if generated_present || requested {
-                            Self::push_transition_style(&mut nodes,&mut payload_bytes,TransitionStyleInput {node,parent:Some(node),pseudo:Some(pseudo),rendered:Cell::new(rendered && generated.display != css::Display::None && (generated_present || !matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After))),style:generated,eligibility:eligible},quota_exceeded)?;
+                            Self::push_transition_style(&mut nodes,&mut payload_bytes,TransitionStyleInput {node,parent:Some(node),pseudo:Some(pseudo),rendered:Cell::new(rendered && origin_present && (generated.display != css::Display::None || pseudo.is_marker()) && (generated_present || !matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After|css::PseudoElement::BeforeMarker|css::PseudoElement::AfterMarker))),style:generated,eligibility:eligible},quota_exceeded)?;
                         }
                     }
                 }
@@ -2707,10 +2728,7 @@ impl RenderSession {
                 .iter()
                 .filter(|clip| clip.hits.contains(&index))
             {
-                let transforms = frame.geometry.transforms[clip.first_transform..]
-                    .iter()
-                    .filter(|transform| transform.hits.contains(&index))
-                    .map(|transform| transform.matrix);
+                let transforms = frame.geometry.clip_transforms(clip);
                 let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = false;
                     break;
@@ -2790,10 +2808,7 @@ impl RenderSession {
                 .iter()
                 .filter(|clip| clip.hits.contains(&index))
             {
-                let transforms = frame.geometry.transforms[clip.first_transform..]
-                    .iter()
-                    .filter(|transform| transform.hits.contains(&index))
-                    .map(|transform| transform.matrix);
+                let transforms = frame.geometry.clip_transforms(clip);
                 let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = false;
                     break;
@@ -2965,6 +2980,13 @@ impl RenderSession {
         self.effect_layout_box(node, None)
     }
 
+    /// Actual reference geometry produced by the same layout as paint/hits.
+    /// SVG records are selected local user boxes; tables record their wrapper.
+    pub fn layout_transform_reference_box(&self,node:NodeId,pseudo:Option<css::PseudoElement>)->Option<(Rect,bool)>{
+        let frame=self.cached.as_ref().filter(|frame|frame.document_version==self.document.version() && self.document.kind(node).is_ok())?;
+        frame.geometry.transform_reference_box(node,pseudo)
+    }
+
     /// The current principal box's used formatting, retained with its actual
     /// geometry. Host-language blockification does not change computed display.
     pub fn layout_used_display(&self, node: NodeId) -> Option<css::Display> {
@@ -2983,28 +3005,7 @@ impl RenderSession {
         let frame = self.cached.as_ref().filter(|frame| {
             frame.document_version == self.document.version() && self.document.kind(node).is_ok()
         })?;
-        let mut rects = frame
-            .geometry
-            .hits
-            .iter()
-            .filter(|hit| hit.node == node && match pseudo {
-                Some(pseudo)=>hit.pseudo==Some(pseudo),
-                None=>!hit.virtual_generated && hit.pseudo.is_none(),
-            } && hit.rect.is_valid())
-            .map(|hit| (hit.rect, hit.replaced_element));
-        let first = rects.next()?;
-        Some(rects.fold(first, |(current, replaced), (rect, next_replaced)| {
-            let left = current.x.min(rect.x);
-            let top = current.y.min(rect.y);
-            let right = (current.x + current.width).max(rect.x + rect.width);
-            let bottom = (current.y + current.height).max(rect.y + rect.height);
-            (Rect {
-                x: left,
-                y: top,
-                width: right - left,
-                height: bottom - top,
-            }, replaced || next_replaced)
-        }))
+        frame.geometry.effect_box(node,pseudo)
     }
 
     /// Exact percentage basis recorded by the layout that produced this box.
@@ -3094,7 +3095,7 @@ impl RenderSession {
         };
         let mut clips = Vec::new();
         for clip in &frame.geometry.rounded_clips {
-            let Some(hit_index) = clip.hits.clone().find(|index| {
+            let Some(_) = clip.hits.clone().find(|index| {
                 frame
                     .geometry
                     .hits
@@ -3103,12 +3104,7 @@ impl RenderSession {
             }) else {
                 continue;
             };
-            let mut transforms = Vec::new();
-            for transform in &frame.geometry.transforms[clip.first_transform..] {
-                if transform.hits.contains(&hit_index) {
-                    transforms.push(transform.matrix);
-                }
-            }
+            let transforms=frame.geometry.clip_transforms(clip).collect();
             clips.push(RetainedOverflowClip {
                 rect: clip.rect,
                 corners: clip.corners.as_deref().copied(),
@@ -3156,10 +3152,7 @@ impl RenderSession {
                 .iter()
                 .filter(|clip| clip.hits.contains(&index))
             {
-                let transforms = frame.geometry.transforms[clip.first_transform..]
-                    .iter()
-                    .filter(|transform| transform.hits.contains(&index))
-                    .map(|transform| transform.matrix);
+                let transforms = frame.geometry.clip_transforms(clip);
                 let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = Rect {
                         x: visible.x,
@@ -3220,12 +3213,21 @@ impl RenderSession {
             .map(|extent| (extent.max_x-extent.min_x, extent.max_y-extent.min_y))
     }
 
+    pub fn used_transform_timeline_source(&self,node:NodeId,pseudo:Option<css::PseudoElement>,style:&Style)->Option<Arc<str>>{
+        let source=style.transform_timeline_source()?;
+        let frame=self.cached.as_ref().filter(|frame|frame.document_version==self.document.version()&&self.document.kind(node).is_ok())?;
+        frame.geometry.transform_timeline_values.as_deref()?.get_value(node,pseudo,source).map(|value|value.used.clone())
+    }
+
+    pub(crate) fn completed_geometry(&self)->Option<&layout::LayoutGeometry>{
+        self.cached.as_ref().filter(|frame|frame.document_version==self.document.version()).map(|frame|&frame.geometry)
+    }
+
     /// Signed CSSOM scroll limits from the actual overflow and scroll origin.
     pub fn scroll_bounds(&self, node: NodeId) -> Option<(f32,f32,f32,f32)> {
         let frame=self.cached.as_ref().filter(|frame|
             frame.document_version==self.document.version() && self.document.kind(node).is_ok())?;
-        frame.geometry.scroll_extents.iter().find(|bounds|bounds.node==node)
-            .map(|bounds|(bounds.min_x,bounds.max_x,bounds.min_y,bounds.max_y))
+        frame.geometry.scroll_bounds(node)
     }
 
     /// The padding-box scrollport in viewport CSS pixels from the last fresh
@@ -3267,15 +3269,7 @@ impl RenderSession {
     pub fn scrollport_coordinate_space(&self, node: NodeId) -> Option<(Rect, crate::paint::Affine)> {
         let frame = self.cached.as_ref().filter(|frame| frame.document_version == self.document.version()
             && self.document.kind(node).is_ok())?;
-        let port = frame.geometry.scroll_ports.iter().find(|port| port.node == node)?;
-        let mut matrix = crate::paint::Affine::IDENTITY;
-        if let Some(index) = port.owner_hit {
-            frame.geometry.hits.get(index)?;
-            for transform in frame.geometry.transforms.iter().filter(|transform| transform.hits.contains(&index)) {
-                matrix = transform.matrix.then(matrix);
-            }
-        }
-        Some((port.rect, matrix.inverse()?))
+        frame.geometry.scrollport_coordinate_space(node)
     }
 
     /// Whether this element is positioned against the viewport in the most
@@ -3435,6 +3429,7 @@ impl RenderSession {
             self.scrolls.push(layout::ScrollOffset { node, x, y });
         }
         let replayed = self.cached.as_mut().is_some_and(|frame| {
+            if frame.geometry.transform_timeline_values.is_some(){return false;}
             frame
                 .geometry
                 .scroll_region(&mut frame.list.0, node, from, (x, y))
@@ -3478,6 +3473,50 @@ impl RenderSession {
         let members = &frame.geometry.rendered_table_members;
         let start = members.partition_point(|member| member.node.key() < node.key());
         members[start..].iter().take_while(|member| member.node == node).find(|member| member.role == role).copied()
+    }
+
+    /// The embedder's ordinary display-list entry points can also serve a
+    /// forced CSSOM layout. Preserve that phase while the existing callback
+    /// runs, so it cannot admit a rendering-opportunity stale timeline update.
+    fn sample_transform_timeline_values(&mut self,geometry:&layout::LayoutGeometry,text:&dyn TextShaper)->Result<bool,LayoutError>{
+        use crate::animation::{ProgressRange,progress_timelines as timelines};
+        use css::typed_numeric::{NumericType,NumericValue,NumericUnit};
+        let Some(sources)=geometry.transform_timeline_values.as_deref() else{
+            let changed=self.timeline_transform_values.is_some();self.timeline_transform_values=None;return Ok(changed);
+        };
+        let epoch=self.transition_input_epoch()?;let mut quota=false;
+        let source=self.capture_transition_snapshot_with_text(Some(text),epoch,&mut quota,None,Some(geometry))?;
+        let snapshot=self.animation_snapshot_from_transition(&source)?;
+        let mut values=timelines::TransformTimelineValues::default();let mut changed=false;
+        for input in sources.values.values() {
+            let root=self.document.root_node(input.node,false).map_err(|_|LayoutError::InvalidTree)?;
+            let scope=(root!=self.document.root()).then_some(root);
+            let mut sample=|name:&str,absolute:Option<NumericType>|->Option<NumericValue>{
+                let binding=timelines::resolve(self,&snapshot,input.node,scope,name,ProgressRange::parse("normal")?).ok()?;
+                let sampled=binding.source.and_then(|node|{
+                    let style_node=if node==self.document.root(){self.document.document_element_at(node).ok().flatten()?}else{node};
+                    let style=source.nodes.iter().find(|input|input.node==style_node&&input.pseudo.is_none())?.style.as_ref();
+                    timelines::sample_completed_geometry(&binding,style.logical_sides(),geometry,self.scroll_offset(node))
+                });
+                let Some(sampled)=sampled else{return Some(NumericValue {value:0.0,unit:NumericUnit::Number});};
+                Some(match absolute {
+                    None=>NumericValue {value:sampled.progress,unit:NumericUnit::Number},
+                    Some(kind) if kind==NumericType::from_unit(NumericUnit::Px)=>NumericValue {value:sampled.position,unit:NumericUnit::Px},
+                    // CSS scroll/view timelines have length coordinates. A
+                    // time-typed absolute map cannot use their length progress.
+                    _=>return None,
+                })
+            };
+            let used:Arc<str>=Arc::from(css::typed_transforms::resolve_timeline_progress(&input.source,&mut sample).unwrap_or_else(||String::from("none")));
+            changed|=used.as_ref()!=input.used.as_ref();
+            values.insert(timelines::TransformTimelineValue {node:input.node,pseudo:input.pseudo,source:input.source.clone(),used})?;
+        }
+        self.timeline_transform_values=Some(Arc::new(values));Ok(changed)
+    }
+
+    pub fn with_forced_layout<R>(&mut self,callback:impl FnOnce(&mut Self)->R)->R {
+        let previous=self.forced_layout;self.forced_layout=true;
+        let result=callback(self);self.forced_layout=previous;result
     }
 
     pub fn display_list(
@@ -3578,7 +3617,7 @@ impl RenderSession {
         }) {
             self.layout_cache.clear();
         }
-        let fresh = self.cached.as_ref().is_some_and(|cached| {
+        let fresh = (self.forced_layout||!self.timeline_layout_stale)&&self.cached.as_ref().is_some_and(|cached| {
             cached.document_version == version
                 && cached.width == width
                 && cached.height == height
@@ -3692,8 +3731,19 @@ impl RenderSession {
             self.layout_cache.begin_frame();
             self.style_version = version;
             self.style_environment = Some(rules.environment);
+            // Overflow bounds are expressed before the container's own scroll
+            // translation. A changed box or writing direction can therefore
+            // clamp existing offsets after layout, with at most one correction
+            // layout before publishing commands and hit geometry.
+            let mut corrected = false;
+            let mut sampled_timelines=false;
+            let mut timeline_corrected=false;
+            let (mut list, mut geometry) = loop {
+                let mut geometry = layout::LayoutGeometry::default();
+                geometry.collect_rendered_text = self.rendered_text_requested;
+                let list = {
             let node_images = NodeImages {
-                color_schemes:rules.environment.color_schemes,
+                color_schemes:self.media_environment().color_schemes,
                 svg_fragment:self.svg_fragment.as_deref(), svg_image_viewport:self.svg_image_viewport.as_deref().copied(),
                 paint_definitions: &self.paint_definitions,
                 paint_registration_revision:self.rules_generation,
@@ -3701,15 +3751,7 @@ impl RenderSession {
                 objects: &self.object_representations,
                 fallback: images,
             };
-            // Overflow bounds are expressed before the container's own scroll
-            // translation. A changed box or writing direction can therefore
-            // clamp existing offsets after layout, with at most one correction
-            // layout before publishing commands and hit geometry.
-            let mut corrected = false;
-            let (mut list, mut geometry) = loop {
-                let mut geometry = layout::LayoutGeometry::default();
-                geometry.collect_rendered_text = self.rendered_text_requested;
-                let list = layout::display_list_with_retained_layout_and_root(
+                    layout::display_list_with_snapshot_mode_and_timelines(
                     &self.document,
                     width,
                     height,
@@ -3722,12 +3764,12 @@ impl RenderSession {
                     Some(&mut self.layout_cache),
                     self.presentation_root,
                     canvas_background,
-                )?;
-                if corrected {
-                    break (list, geometry);
-                }
+                    None,
+                    self.timeline_transform_values.as_deref(),
+                )?
+                };
                 let mut changed = false;
-                for scroll in &mut self.scrolls {
+                if !corrected {for scroll in &mut self.scrolls {
                     let bounds = geometry.scroll_extents.iter().find(|bounds| bounds.node == scroll.node);
                     let (x, y) = bounds.map_or((0.0, 0.0), |bounds| (
                         scroll.x.clamp(bounds.min_x, bounds.max_x),
@@ -3742,20 +3784,33 @@ impl RenderSession {
                     }
                     scroll.x = x;
                     scroll.y = y;
+                }}
+                if changed {
+                    self.paint_revision = self.paint_revision.wrapping_add(1);
+                    corrected=true;
                 }
-                if !changed {
-                    break (list, geometry);
+                // Normalize actual offsets before the single post-layout
+                // stale-timeline update. A changed transform and scroll clamp
+                // share the same bounded correction layout. Forced CSSOM
+                // layouts preserve the previously sampled timeline value.
+                if !sampled_timelines&&!self.forced_layout {
+                    sampled_timelines=true;
+                    timeline_corrected=self.sample_transform_timeline_values(&geometry,text)?;
+                    changed|=timeline_corrected;
                 }
-                self.paint_revision = self.paint_revision.wrapping_add(1);
+                if !changed {break (list,geometry);}
                 self.layout_cache.clear();
                 self.layout_cache.begin_frame();
-                corrected = true;
             };
             let mut requests = Vec::new();
             apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
             self.paint_worklet_cache.retain(|(request,_)|requests.contains(request));
             geometry.rendered_text_boxes.sort_unstable_by_key(|value| (value.node.key(), value.order));
             geometry.rendered_table_members.sort_unstable_by_key(|value| value.node.key());
+            // A correction can itself change a timeline range/scope. Keep
+            // that operation stale until the next rendering opportunity,
+            // without sampling it a second time in this frame.
+            self.timeline_layout_stale=geometry.transform_timeline_values.is_some()&&(self.forced_layout||timeline_corrected);
             self.frame_id += 1;
             self.cached = Some(CachedFrame {
                 document_version: version,
@@ -3789,6 +3844,87 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use core::cell::Cell;
+
+    #[test]
+    fn specification_transform_timeline_uses_completed_owner_geometry_and_render_phase() {
+        let document=crate::html::parse("<style>#port{width:100px;height:100px;overflow:auto;scroll-timeline:--owner block}#content{height:300px}#box{width:20px;height:10px;transform-origin:0 0;transform:transform-interpolate(--owner,0%:translateX(0px),100%:translateX(100px))}</style><div id=port><div id=content><div id=box></div></div></div>",128).unwrap();
+        let port=crate::selector::query_selector(&document,document.root(),"#port").unwrap().unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#box").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        session.display_list(300,200,&NoText).unwrap();
+        let initial=session.bounding_client_rect(node).unwrap();
+        let initial_style=session.computed_style(node).unwrap();
+        let initial_used=session.used_transform_timeline_source(node,None,&initial_style).unwrap();
+        assert!(session.set_scroll_offset(port,0.0,100.0).unwrap());
+        session.with_forced_layout(|session|session.display_list(300,200,&NoText).map(|_|())).unwrap();
+        let forced_style=session.computed_style(node).unwrap();
+        assert_eq!(session.used_transform_timeline_source(node,None,&forced_style).unwrap(),initial_used,"a forced query cannot advance a stale timeline");
+        session.display_list(300,200,&NoText).unwrap();
+        let rect=session.bounding_client_rect(node).unwrap();
+        assert_eq!(rect.x-initial.x,50.0,"paint and hit geometry use the actual owner scroll range");
+        let style=session.computed_style(node).unwrap();
+        let used=session.used_transform_timeline_source(node,None,&style).unwrap();
+        assert_ne!(used,initial_used);
+        assert!(session.cached.as_ref().unwrap().geometry.transform_timeline_values.is_some());
+        session.document_mut().set_attribute(node,"style","transform:none").unwrap();
+        session.display_list(300,200,&NoText).unwrap();
+        let style=session.computed_style(node).unwrap();
+        assert!(session.used_transform_timeline_source(node,None,&style).is_none());
+        assert!(session.cached.as_ref().unwrap().geometry.transform_timeline_values.is_none());
+        assert!(session.timeline_transform_values.is_none());
+    }
+
+    #[test]
+    fn specification_transform_timeline_absolute_length_and_inactive_progress_use_one_authority() {
+        let document=crate::html::parse("<style>#port{width:100px;height:100px;overflow:auto;scroll-timeline:--owner block}#content{height:300px}#box{width:20px;height:10px;transform-origin:0 0;transform:transform-interpolate(--missing,0px:translateX(20px),200px:translateX(120px))}</style><div id=port><div id=content><div id=box></div></div></div>",128).unwrap();
+        let port=crate::selector::query_selector(&document,document.root(),"#port").unwrap().unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#box").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        // No existing rendering opportunity: initially stale and missing
+        // sources both mean proportional progress zero, even for length stops.
+        session.with_forced_layout(|session|session.display_list(300,200,&NoText).map(|_|())).unwrap();
+        let initially_stale=session.bounding_client_rect(node).unwrap();
+        session.display_list(300,200,&NoText).unwrap();
+        assert_eq!(session.bounding_client_rect(node).unwrap().x,initially_stale.x,"missing timeline selects the same zero-progress endpoint");
+        session.document_mut().set_attribute(node,"style","transform:transform-interpolate(--owner,0px:translateX(20px),200px:translateX(120px))").unwrap();
+        session.display_list(300,200,&NoText).unwrap();
+        assert!(session.set_scroll_offset(port,0.0,100.0).unwrap());
+        session.display_list(300,200,&NoText).unwrap();
+        assert_eq!(session.bounding_client_rect(node).unwrap().x-initially_stale.x,50.0,"absolute progress uses actual 100px owner scroll coordinate and map stop range");
+        session.document_mut().set_attribute(port,"style","overflow:visible").unwrap();
+        session.display_list(300,200,&NoText).unwrap();
+        assert_eq!(session.bounding_client_rect(node).unwrap().x,initially_stale.x,"a named timeline without an active scrollport returns proportional zero");
+    }
+
+    #[test]
+    fn specification_transform_timeline_absolute_time_is_invalid_at_computed_values() {
+        let source="transform-interpolate(scroll(),0s:translateX(0px),1s:translateX(100px))";
+        assert!(css::supports_property_value("transform",source),"absolute time stops are part of the map syntax");
+        let document=crate::html::parse("<style>#box{transform:transform-interpolate(scroll(),0s:translateX(0px),1s:translateX(100px))}</style><div id=box></div>",64).unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#box").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        let style=session.computed_style(node).unwrap();
+        assert!(!style.has_transform(),"a time range cannot establish a transform on a length-based CSS scroll timeline");
+        session.display_list(200,100,&NoText).unwrap();
+        assert!(session.cached.as_ref().unwrap().geometry.transform_timeline_values.is_none());
+    }
+
+    #[test]
+    fn specification_deferred_transform_map_drives_real_paint_and_hit_geometry() {
+        let document=crate::html::parse("<style>#box{width:20px;height:10px;background:red;transform-origin:0 0;transform:transform-interpolate(50%,0%:translateX(0%),100%:scale(2))}</style><div id=box></div>",64).unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#box").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        let style=session.computed_style(node).unwrap();
+        assert!(style.has_transform(),"a valid deferred source still establishes a transform");
+        let commands=&session.display_list(200,100,&NoText).unwrap().0;
+        assert!(commands.iter().any(|command|matches!(command,crate::paint::Command::PushTransform(matrix) if matrix.a==1.5&&matrix.d==1.5)));
+        let rect=session.bounding_client_rect(node).unwrap();
+        assert_eq!((rect.width,rect.height),(30.0,15.0),"hit geometry uses the same actual reference-box matrix as paint");
+        session.document_mut().set_attribute(node,"style","transform:none").unwrap();
+        session.display_list(200,100,&NoText).unwrap();
+        let rect=session.bounding_client_rect(node).unwrap();
+        assert_eq!((rect.width,rect.height),(20.0,10.0),"source removal clears transform paint and geometry");
+    }
 
     #[test]
     fn specification_effect_underlying_snapshot_selects_ordered_lineage_and_requested_pseudos() {
@@ -3926,6 +4062,28 @@ mod tests {
         let mut fresh=RenderSession::new(session.document().clone_document(true).unwrap());
         assert_eq!(changed,fresh.display_list(100,80,&NoText).unwrap().clone(),"generic XML uses the same invalidation and fresh layout path as HTML");
         assert_eq!(changed,session.display_list(100,80,&NoText).unwrap().clone());
+    }
+
+    #[test]
+    fn specification_rendered_svg_text_boxes_belong_to_paint_not_geometry_or_use_instances() {
+        for effect in ["", "filter='url(#f)'"] {
+            let markup=alloc::format!("<!doctype html><div id=target><svg width=100 height=80><defs><filter id=f><feColorMatrix/></filter></defs><text id=source {effect}>a<tspan>b</tspan>c</text><use href='#source' x=20/></svg></div>");
+            let document=crate::html::parse(&markup,128).unwrap();
+            let target=crate::selector::query_selector(&document,document.root(),"#target").unwrap().unwrap();
+            let mut session=RenderSession::new(document);
+            session.request_rendered_text_boxes();
+            for _ in 0..2 {
+                session.display_list(100,80,&NoText).unwrap();
+                assert_eq!(crate::rendered_text::get(&mut session,target).unwrap(),"abc",
+                    "actual DOM text boxes are collected once; geometry probes and use instances create no duplicate DOM text");
+                assert_eq!(session.rendered_text_boxes().unwrap().len(),3);
+            }
+            let document=session.document().clone_document(true).unwrap();
+            let fresh_target=crate::selector::query_selector(&document,document.root(),"#target").unwrap().unwrap();
+            let mut fresh=RenderSession::new(document);
+            fresh.request_rendered_text_boxes();fresh.display_list(100,80,&NoText).unwrap();
+            assert_eq!(crate::rendered_text::get(&mut fresh,fresh_target).unwrap(),"abc");
+        }
     }
 
     #[test]
@@ -4333,6 +4491,43 @@ mod tests {
             session.display_list(10, 10, &NoText),
             Err(LayoutError::ImageFailed)
         );
+    }
+
+    #[test]
+    fn specification_image_button_bitmap_owner_used_dimensions_and_type_replay() {
+        let document=crate::html::parse("<!doctype html><style>body{margin:0}input,img{display:block}</style><input id=button type=image src=actual.png width=30 height=20><img id=reference width=30 height=20>",64).unwrap();
+        let button=crate::selector::get_element_by_id(&document,document.root(),"button").unwrap().unwrap();
+        let reference=crate::selector::get_element_by_id(&document,document.root(),"reference").unwrap().unwrap();
+        let mut session=RenderSession::new(document);
+        session.set_node_bitmap(button,None).unwrap();
+        session.display_list(400,200,&NoText).unwrap();
+        let rect=session.layout_rect(button).unwrap();assert_eq!((rect.width,rect.height),(30.0,20.0));
+        let computed=session.computed_style(button).unwrap();
+        assert_eq!(computed.appearance,crate::css::Appearance::None);
+        assert_eq!(computed.used_border_widths(),[0.0;4],"image buttons do not acquire text-widget chrome");
+        assert_eq!((computed.width,computed.height),(None,None),"13px primitive-control defaults do not override image dimensions");
+        let image=Arc::new(ImageData{width:4,height:2,pixels:alloc::vec![0,128,0,255].repeat(8)});
+        session.set_node_bitmap(button,Some(image.clone())).unwrap();session.set_node_bitmap(reference,Some(image.clone())).unwrap();
+        let first=session.display_list(400,200,&NoText).unwrap().clone();
+        assert_eq!(first.0.iter().filter(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&image))).count(),2);
+        session.document_mut().set_attribute(button,"type","text").unwrap();session.document_mut().set_attribute(button,"style","display:none").unwrap();
+        let replacement=Arc::new(ImageData{width:6,height:3,pixels:alloc::vec![0,0,255,255].repeat(18)});
+        session.set_node_bitmap(button,Some(replacement.clone())).unwrap();
+        assert!(!session.display_list(400,200,&NoText).unwrap().0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))));
+        session.document_mut().set_attribute(button,"type","IMAGE").unwrap();session.document_mut().remove_attribute(button,"style").unwrap();
+        session.document_mut().remove_attribute(button,"width").unwrap();session.document_mut().remove_attribute(button,"height").unwrap();
+        let replay=session.display_list(400,200,&NoText).unwrap().clone();
+        let rect=session.layout_rect(button).unwrap();assert_eq!((rect.width,rect.height),(6.0,3.0));
+        assert!(replay.0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))));
+        assert_eq!(replay,session.display_list(400,200,&NoText).unwrap().clone(),"warm state reuses the published request bitmap");
+        session.document_mut().set_attribute(button,"style","width:72px;height:19px;padding:5px;border:3px solid").unwrap();
+        session.display_list(400,200,&NoText).unwrap();let rect=session.layout_rect(button).unwrap();
+        assert_eq!((rect.width,rect.height),(88.0,35.0),"author CSS still controls the real replaced content box and edges");
+        session.document_mut().remove_attribute(button,"src").unwrap();
+        assert!(!session.display_list(400,200,&NoText).unwrap().0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))),"missing src represents a button rather than its retained image");
+        assert!(session.node_bitmaps.iter().any(|(node,published,_)|*node==button&&Arc::ptr_eq(published,&replacement)),"representation does not discard available request storage");
+        session.document_mut().set_attribute(button,"src","actual.png").unwrap();
+        assert!(session.display_list(400,200,&NoText).unwrap().0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))));
     }
 
     #[test]
@@ -5745,6 +5940,27 @@ mod tests {
         session.cached.as_mut().unwrap().geometry.hits[1].rect.width=0.0;
         let corners:Vec<_>=session.client_fragment_corners(target).collect();
         assert_eq!(corners,vec![[(-100.0,-100.0);4]],"when all fragments have a zero dimension use the first fragment");
+    }
+
+    #[test]
+    fn specification_shared_progress_timeline_owner_geometry_and_scope(){
+        use crate::animation::{ProgressRange,progress_timelines as timelines};
+        let document=crate::html::parse("<!doctype html><style>html,body{margin:0}#port{overflow:auto;width:100px;height:100px;scroll-timeline-name:--track;scroll-timeline-axis:y}#subject{height:20px;margin-top:100px}#tail{height:400px}</style><div id=port><div id=subject></div><div id=tail></div></div>",64).unwrap();
+        let port=crate::selector::get_element_by_id(&document,document.root(),"port").unwrap().unwrap();
+        let subject=crate::selector::get_element_by_id(&document,document.root(),"subject").unwrap().unwrap();
+        let mut session=RenderSession::new(document);session.display_list(200,200,&NoText).unwrap();
+        let snapshot=session.animation_snapshot().unwrap();
+        let named=timelines::resolve(&mut session,&snapshot,subject,None,"--track",ProgressRange::parse("normal").unwrap()).unwrap();
+        assert_eq!(named.source,Some(port));assert!(!named.horizontal);assert_eq!(named.subject,None);
+        let before=timelines::sample(&mut session,&named).unwrap();assert_eq!(before.position,0.0);assert_eq!(before.progress,0.0);
+        session.set_scroll_offset(port,0.0,50.0).unwrap();session.display_list(200,200,&NoText).unwrap();
+        let after=timelines::sample(&mut session,&named).unwrap();assert_eq!(after.position,50.0);assert!(after.progress>before.progress);
+        assert_eq!(after.progress,crate::animation::progress_fraction(50.0,after.start,after.end).unwrap());
+        let view=timelines::resolve(&mut session,&snapshot,subject,None,"view(y)",ProgressRange::parse("normal").unwrap()).unwrap();
+        assert_eq!(view.source,Some(port));assert_eq!(view.subject,Some(subject));assert!(timelines::sample(&mut session,&view).is_some());
+        let missing=timelines::resolve(&mut session,&snapshot,subject,None,"--missing",ProgressRange::parse("normal").unwrap()).unwrap();assert!(timelines::sample(&mut session,&missing).is_none());
+        let wrong_scope=Some(session.document().root());
+        let scoped=timelines::resolve(&mut session,&snapshot,subject,wrong_scope,"--track",ProgressRange::parse("normal").unwrap()).unwrap();assert_eq!(scoped.source,None);
     }
 
     #[test]

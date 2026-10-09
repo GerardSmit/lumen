@@ -2,7 +2,8 @@
 use content_security_policy as csp;
 use alloc::{string::String, vec::Vec};
 pub use csp::{Destination, PolicyDisposition, PolicySource, InlineCheckType};
-const MAX_BYTES: usize = 65_536;
+pub const MAX_POLICY_BYTES: usize = 65_536;
+const MAX_BYTES: usize = MAX_POLICY_BYTES;
 const MAX_POLICIES: usize = 64;
 const MAX_TOKENS: usize = 4096;
 #[derive(Clone, Default)]

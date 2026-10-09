@@ -88,6 +88,7 @@ mod html_interfaces;
 mod hyperlinks;
 mod referrer;
 mod csp;
+mod permissions_policy;
 mod csp_reports;
 mod reporting;
 #[cfg(test)]
@@ -797,6 +798,7 @@ pub struct DomRealm {
     about_base_url: RefCell<Option<String>>,
     referrer_policy: Cell<lumen_common::referrer::ReferrerPolicy>,
     csp: RefCell<csp::State>,
+    permissions_policy: RefCell<permissions_policy::State>,
     csp_report_budget: RefCell<csp_reports::DeliveryBudget>,
     reporting: Rc<reporting::State>,
     csp_overflow: Cell<bool>,
@@ -1535,6 +1537,7 @@ impl DomRealm {
             browsing_context::update_document_origin(&context, &url);
             self.set_document_origin(browsing_context::context_origin(&context));
         }
+        if first_assignment { self.finalize_initial_permissions_identity(); }
     }
 
     /// Set the inherited about base URL for an initial about:blank or srcdoc
@@ -2883,6 +2886,12 @@ impl DomRealm {
     pub fn settle_font_loading(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<bool> {
         if self.font_loading.has_live_sets() {
             self.flush_layout()?;
+            // Layout can discover additional matching faces. Admit those
+            // requests before resolving ready/loadingdone: CSS Font Loading
+            // §3 keeps the set pending while layout still requires font loads.
+            if self.font_loading.has_metric_requests() {
+                self.queue_font_tasks(ctx)?;
+            }
         }
         self.font_loading.settle(ctx)
     }
@@ -2896,70 +2905,92 @@ impl DomRealm {
         let completions = {
             let session = self.session.borrow();
             self.images.queue_completions(session.document(), &base)
-        };
+        }.into_iter().map(|mut completion| {
+            // Acquire completion cleanup before any later fallible host work.
+            let lease=completion.input_task.take().map(|slot|InputCompletionTask {client:self.clone(),slot:slot.get()-1});
+            (completion,lease)
+        }).collect::<Vec<_>>();
         for violation in self.images.take_policy_violations().map_err(|_|OpError::new("QuotaExceededError","image CSP reporting budget exhausted"))? {
             self.queue_csp_violation(ctx,violation,None)?;
         }
-        let mut event_roots = Vec::with_capacity(completions.len());
+        let budget_failed=self.images.take_input_budget_failure();
+        let pending=self.images.take_pending_scratch();
         {
-            let mut roots = self.image_request_roots.borrow_mut();
-            if !roots.is_empty() {
-                roots.retain(|&node, _| {
-                    self.images.is_loading(node)
-                        || completions.iter().any(|completion| completion.node == node)
-                });
-            }
-            let missing = self.images.take_unknown_pending(&roots);
-            for &node in &missing {
-                roots.insert(node, self.retain_resource_request(ctx, node));
-            }
-            self.images.return_pending_scratch(missing);
-            for completion in &completions {
-                let retained = roots
-                    .remove(&completion.node)
-                    .unwrap_or_else(|| self.retain_resource_request(ctx, completion.node));
-                event_roots.push(self.retain_image_event(ctx, completion.node, retained));
+            let mut roots=self.image_request_roots.borrow_mut();
+            for &node in &pending {
+                if !roots.contains_key(&node) {
+                    let (owner,current)=self.resolve_adopted_node(node);
+                    roots.insert(node,owner.retain_resource_request(ctx,current));
+                }
             }
         }
         self.sync_image_bitmaps()?;
-
-        let count = completions.len();
-        for (completion, root) in completions.into_iter().zip(event_roots) {
-            let realm = self.clone();
-            scheduling::queue_task(ctx, move |ctx| {
-                // The active image algorithm keeps both the detached node's
-                // wrapper and its event target alive through event dispatch.
-                let _root = root;
-                let node_exists = realm
-                    .session
-                    .borrow()
-                    .document()
-                    .kind(completion.node)
-                    .is_ok();
-                if node_exists
-                    && realm
-                        .images
-                        .completion_is_current(completion.node, completion.generation)
-                {
-                    realm.dispatch(
-                        ctx,
-                        completion.node,
-                        completion.kind.as_str(),
-                        false,
-                        false,
-                        &[],
-                    )?;
-                }
-                Ok(())
-            })?;
+        let count=completions.len();
+        for (completion,task_lease) in completions {
+            if completion.captured_input {
+                // HTML §4.10.5.1.19: the networking completion settles the
+                // original document before the distinct user interaction task.
+                let client=self.clone();
+                let networking=|ctx:&mut Ctx|scheduling::queue_task(ctx,move |ctx| {
+                    let _networking_completion=task_lease;
+                    let (owner,node)=client.resolve_adopted_node(completion.node);
+                    if owner.session.borrow().document().kind(node).is_err(){return Ok(());}
+                    if let Some(completed)=_networking_completion.as_ref()
+                        .and_then(|lease|client.images.take_input_completion(lease.slot)) {
+                        owner.images.commit_input_completion(node,completed);
+                        owner.sync_image_bitmaps()?;
+                    }
+                    owner.queue_image_event(ctx,node,completion)
+                });
+                if let Some(handle)=self.relevant_host_realm(ctx) {
+                    ctx.with_host_realm(&handle,networking).map_err(browsing_context::host_realm_error)??;
+                } else {networking(ctx)?;}
+            } else {
+                self.queue_image_event(ctx,completion.node,completion)?;
+            }
+        }
+        // Original networking clients retain pending roots after adoption;
+        // completion tasks have acquired their own current-owner leases.
+        self.image_request_roots.borrow_mut().retain(|node,_|pending.binary_search_by_key(&node.key(),|pending|pending.key()).is_ok());
+        self.images.return_pending_scratch(pending);
+        if budget_failed {
+            return Err(OpError::new("QuotaExceededError","input image request metadata budget exhausted"));
         }
         Ok(count)
+    }
+
+    fn queue_image_event(self:&Rc<Self>,ctx:&mut Ctx,node:NodeId,completion:image_loading::QueuedImageEvent)->OpResult<()> {
+        if self.session.borrow().document().kind(node).is_err(){return Ok(());}
+        let queue=|ctx:&mut Ctx| -> OpResult<()> {
+            let retained=self.retain_resource_request(ctx,node);
+            let root=self.retain_image_event(ctx,node,retained);
+            let realm=self.clone();
+            let image_loading::QueuedImageEvent {generation,captured_input,kind,..}=completion;
+            scheduling::queue_task(ctx,move |ctx| {
+                let _root=root;
+                // Input element tasks follow adoption. The img algorithm
+                // cancels its old owner's queued completion during adoption.
+                let (owner,current)=if captured_input {realm.resolve_adopted_node(node)}
+                    else {(realm,node)};
+                if owner.session.borrow().document().kind(current).is_ok()
+                    && (captured_input || owner.images.completion_is_current(current,generation)) {
+                    let dispatch=|ctx:&mut Ctx|owner.dispatch_user_agent(ctx,current,kind.as_str(),false,false,&[]).map(|_|());
+                    if let Some(handle)=owner.relevant_host_realm(ctx) {
+                        ctx.with_host_realm(&handle,dispatch).map_err(browsing_context::host_realm_error)??;
+                    } else {dispatch(ctx)?;}
+                }
+                Ok(())
+            })
+        };
+        if let Some(handle)=self.relevant_host_realm(ctx) {
+            ctx.with_host_realm(&handle,queue).map_err(browsing_context::host_realm_error)?
+        } else {queue(ctx)}
     }
 
     /// A source change starts an image request that must keep its wrapper's
     /// listeners alive before the next pump, even for a detached `new Image()`.
     fn retain_dirty_image_request(self: &Rc<Self>, node: NodeId) {
-        if !self.images.has_dirty_source(node) {
+        if !self.images.has_dirty_source(node) && !self.images.is_loading(node) {
             return;
         }
         let Some(target) = self
@@ -3024,6 +3055,9 @@ impl DomRealm {
             self.images
                 .synchronize_dirty(self.session.borrow().document(), &base);
         }
+        if self.images.take_input_budget_failure() {
+            return Err(OpError::new("QuotaExceededError","input image request metadata budget exhausted"));
+        }
         let updates = self.images.take_bitmap_updates();
         if updates.is_empty() {
             return Ok(());
@@ -3044,20 +3078,30 @@ impl DomRealm {
     }
 
     pub(crate) fn flush_layout(&self) -> OpResult<()> {
+        self.flush_layout_mode(true)
+    }
+
+    fn flush_layout_mode(&self,forced:bool)->OpResult<()> {
         self.refresh_embedded_intrinsic_sizes()?;
         self.sync_image_bitmaps()?;
         self.sync_canvas()?;
-        self.flush_layout_frame()
+        self.flush_layout_frame_mode(forced)
     }
 
-    fn flush_layout_frame(&self)->OpResult<()> {
+    fn flush_layout_frame(&self)->OpResult<()> {self.flush_layout_frame_mode(true)}
+
+    fn flush_layout_frame_mode(&self,forced:bool)->OpResult<()> {
         let callback = self.layout_flusher.borrow().clone();
         if let Some(callback) = callback {
             let result=match callback {
-                LayoutFlusher::Direct(callback)=>callback(&mut self.session.borrow_mut()),
+                LayoutFlusher::Direct(callback)=>{
+                    let mut session=self.session.borrow_mut();
+                    if forced{session.with_forced_layout(|session|callback(session))}else{callback(&mut session)}
+                },
                 LayoutFlusher::PreparedViewport{prepare,flush}=>{
                     let viewport=prepare().map_err(|message|OpError::new("InvalidStateError",message))?;
-                    flush(&mut self.session.borrow_mut(),viewport)
+                    let mut session=self.session.borrow_mut();
+                    if forced{session.with_forced_layout(|session|flush(session,viewport))}else{flush(&mut session,viewport)}
                 },
             };
             result.map_err(|message| OpError::new("InvalidStateError", message))?;
@@ -3294,7 +3338,9 @@ impl DomRealm {
                 browsing_context::is_active_document(&context, self)
             });
         if self.session.borrow().viewport_size().is_some() || active_provider {
-            self.flush_layout()?;
+            // Runtime's rendering opportunity admits the one completed-layout
+            // stale timeline update; CSSOM's ordinary flush remains forced.
+            self.flush_layout_mode(false)?;
         }
         if self.session.borrow().viewport_size().is_some() {
             layout_observers::rendering_checkpoint(ctx,self)?;
@@ -3350,6 +3396,20 @@ impl DomRealm {
     }
 
     fn focus_with_cause(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: Option<NodeId>,
+        pointer_cause: bool,
+    ) -> OpResult<()> {
+        // Focusing a child also focuses its ancestor navigable containers.
+        // Each document constructs and dispatches its UI events in its own
+        // relevant realm, independent of the original caller's realm.
+        let Some(owner)=self.relevant_host_realm(ctx) else {return Ok(());};
+        ctx.with_host_realm(&owner,|ctx|self.focus_with_cause_in_owner(ctx,node,pointer_cause))
+            .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?
+    }
+
+    fn focus_with_cause_in_owner(
         self: &Rc<Self>,
         ctx: &mut Ctx,
         node: Option<NodeId>,
@@ -3459,7 +3519,13 @@ impl DomRealm {
         cancelable: bool,
         properties: &[(&str, Value)],
     ) -> OpResult<bool> {
-        self.dispatch_with_trust(ctx, node, kind, bubbles, cancelable, properties, true)
+        let iframe_load=kind=="load" && lumen_html::forms::html_element_local_name(self.session.borrow().document(),node)==Some("iframe");
+        let result=self.dispatch_with_trust(ctx, node, kind, bubbles, cancelable, properties, true)?;
+        if iframe_load{
+            let(owner,node)=self.resolve_adopted_node(node);
+            owner.report_container_policy(ctx,node)?;
+        }
+        Ok(result)
     }
 
     /// Dispatch a native KeyboardEvent for host key input without running its
@@ -6541,6 +6607,10 @@ pub struct DomHtmlHtmlElement {
 }
 #[lumen_bind::methods]
 impl DomHtmlHtmlElement {
+            #[getter(name = "version")]
+            fn version(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("version")?.unwrap_or_default()) }
+            #[setter(name = "version", coerce, hint(js(ce_reactions)))]
+            fn set_version(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("version", value) }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -6626,6 +6696,30 @@ pub struct DomHtmlBodyElement {
     base: DomHtmlElement,
 }
 event_content_handlers::bind_body_handlers! { DomHtmlBodyElement {
+            #[getter(name = "text")]
+            fn text(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("text")?.unwrap_or_default()) }
+            #[setter(name = "text", coerce, hint(js(ce_reactions)))]
+            fn set_text(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("text", value.0) }
+            #[getter(name = "link")]
+            fn link(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("link")?.unwrap_or_default()) }
+            #[setter(name = "link", coerce, hint(js(ce_reactions)))]
+            fn set_link(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("link", value.0) }
+            #[getter(name = "vLink")]
+            fn v_link(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("vlink")?.unwrap_or_default()) }
+            #[setter(name = "vLink", coerce, hint(js(ce_reactions)))]
+            fn set_v_link(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("vlink", value.0) }
+            #[getter(name = "aLink")]
+            fn a_link(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("alink")?.unwrap_or_default()) }
+            #[setter(name = "aLink", coerce, hint(js(ce_reactions)))]
+            fn set_a_link(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("alink", value.0) }
+            #[getter(name = "bgColor")]
+            fn bg_color(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("bgcolor")?.unwrap_or_default()) }
+            #[setter(name = "bgColor", coerce, hint(js(ce_reactions)))]
+            fn set_bg_color(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("bgcolor", value.0) }
+            #[getter(name = "background")]
+            fn background(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("background")?.unwrap_or_default()) }
+            #[setter(name = "background", coerce, hint(js(ce_reactions)))]
+            fn set_background(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("background", value) }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -6669,20 +6763,22 @@ impl DomHtmlBaseElement {
     #[getter]
     fn href(&self) -> OpResult<String> {
         let node = &self.base.base.base;
+        let (owner, id) = node.realm.resolve_adopted_node(node.id);
         let href = {
-            let session = node.realm.session.borrow();
-            html_base_href(session.document(), node.id, node.realm.is_html_document)
+            let session = owner.session.borrow();
+            html_base_href(session.document(), id, owner.is_html_document)
         };
         let href = href.unwrap_or_default();
-        let fallback = node.realm.fallback_base_url();
+        let href = lumen::well_formed_utf8(&href);
+        let fallback = owner.fallback_base_url();
         Ok(lumen_common::url::parse(&href, Some(&fallback))
             .map(|url| url.href())
-            .unwrap_or(href))
+            .unwrap_or_else(|_| href.into_owned()))
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_href(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("href", value)
+    fn set_href(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("href", &value.0)
     }
 
     #[getter]
@@ -6736,6 +6832,14 @@ impl DomHtmlLinkElement {
     fn rel(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("rel")?.unwrap_or_default()) }
     #[setter(name = "rel", coerce, hint(js(ce_reactions)))]
     fn set_rel(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("rel", value) }
+    #[getter]
+    fn rev(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("rev")?.unwrap_or_default())}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_rev(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("rev",value)}
+    #[getter]
+    fn target(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("target")?.unwrap_or_default())}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_target(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("target",value)}
     #[getter(name="as")]
     fn as_(&self)->OpResult<String> {
         let value=self.base.base.base.get_null_attribute("as")?.unwrap_or_default().to_ascii_lowercase();
@@ -6784,7 +6888,9 @@ impl DomHtmlLinkElement {
             if value.eq_ignore_ascii_case("use-credentials") {"use-credentials".into()} else {"anonymous".into()})))
     }
     #[setter(name = "crossOrigin", coerce, hint(js(ce_reactions)))]
-    fn set_cross_origin(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("crossorigin",value) }
+    fn set_cross_origin(&self, value: Option<&str>) -> OpResult<()> {
+        self.base.base.base.set_nullable_attribute_core("crossorigin",value)
+    }
     #[getter(name = "referrerPolicy")]
     fn referrer_policy(&self)->OpResult<String> {
         Ok(self.base.base.base.get_null_attribute("referrerpolicy")?
@@ -6804,20 +6910,12 @@ impl DomHtmlLinkElement {
     fn set_fetch_priority(&self,value:&str)->OpResult<()> { self.base.base.base.set_attribute_core("fetchpriority",value) }
     #[getter]
     fn href(&self) -> OpResult<String> {
-        let node = &self.base.base.base;
-        let Some(href) = node.get_null_attribute("href")? else {
-            return Ok(String::new());
-        };
-        let (owner,_) = node.realm.resolve_adopted_node(node.id);
-        let base = owner.base_url();
-        Ok(lumen_common::url::parse(&href, Some(&base))
-            .map(|url| url.href())
-            .unwrap_or(href))
+        crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "href")
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_href(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("href", value)
+    fn set_href(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("href", &value.0)
     }
 }
 #[lumen_bind::class(name = "HTMLScriptElement", extends = DomHtmlElement, hint(js(webidl)))]
@@ -6826,6 +6924,31 @@ pub struct DomHtmlScriptElement {
 }
 #[lumen_bind::methods]
 impl DomHtmlScriptElement {
+            #[getter(name = "integrity")]
+            fn integrity(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("integrity")?.unwrap_or_default()) }
+            #[setter(name = "integrity", coerce, hint(js(ce_reactions)))]
+            fn set_integrity(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("integrity", value) }
+            #[getter(name = "charset")]
+            fn charset(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("charset")?.unwrap_or_default()) }
+            #[setter(name = "charset", coerce, hint(js(ce_reactions)))]
+            fn set_charset(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("charset", value) }
+            #[getter(name = "event")]
+            fn event(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("event")?.unwrap_or_default()) }
+            #[setter(name = "event", coerce, hint(js(ce_reactions)))]
+            fn set_event(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("event", value) }
+            #[getter(name = "htmlFor")]
+            fn html_for(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("for")?.unwrap_or_default()) }
+            #[setter(name = "htmlFor", coerce, hint(js(ce_reactions)))]
+            fn set_html_for(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("for", value) }
+    #[getter(name = "crossOrigin")]
+    fn cross_origin(&self) -> OpResult<Nullable<String>> {
+        Ok(Nullable(self.base.base.base.get_null_attribute("crossorigin")?.map(|value|
+            if value.eq_ignore_ascii_case("use-credentials") {"use-credentials".into()} else {"anonymous".into()})))
+    }
+    #[setter(name = "crossOrigin", coerce, hint(js(ce_reactions)))]
+    fn set_cross_origin(&self, value: Option<&str>) -> OpResult<()> {
+        self.base.base.base.set_nullable_attribute_core("crossorigin", value)
+    }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -6911,19 +7034,12 @@ impl DomHtmlScriptElement {
 
     #[getter]
     fn src(&self) -> OpResult<String> {
-        let node = &self.base.base.base;
-        let Some(source) = node.get_null_attribute("src")? else {
-            return Ok(String::new());
-        };
-        let base = node.realm.base_url();
-        Ok(lumen_common::url::parse(&source, Some(&base))
-            .map(|url| url.href())
-            .unwrap_or(source))
+        crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "src")
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_src(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("src", value)?;
+    fn set_src(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("src", &value.0)?;
         self.base.base.base.realm.flush_script_activations(ctx)
     }
 
@@ -6952,18 +7068,33 @@ impl DomHtmlImageElement {
         &self.base.base.base
     }
 
-    fn image_snapshot(&self) -> image_loading::ImageSnapshot {
-        let node = self.image_node();
-        let base = node.realm.base_url();
-        let _=node.realm.prepare_image_selection(&base);
-        let scheme=node.realm.embedding_color_scheme(node.id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
-        let snapshot = {
-            let session = node.realm.session.borrow();
-            node.realm.images.snapshot(session.document(),node.id,&base,scheme)
-        };
-        let _ = node.realm.sync_image_bitmaps();
-        snapshot
-    }
+    fn image_snapshot(&self) -> image_loading::ImageSnapshot {image_node_snapshot(self.image_node())}
+}
+
+fn image_node_snapshot(node:&DomNode) -> image_loading::ImageSnapshot {
+    let (realm,id)=node.realm.resolve_adopted_node(node.id);
+    let base=realm.base_url();let _=realm.prepare_image_selection(&base);
+    let scheme=realm.embedding_color_scheme(id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
+    let snapshot={let session=realm.session.borrow();realm.images.snapshot(session.document(),id,&base,scheme)};
+    let _=realm.sync_image_bitmaps();snapshot
+}
+
+fn image_dimension(node:&DomNode,vertical:bool)->OpResult<u32> {
+    let (realm,id)=node.realm.resolve_adopted_node(node.id);
+    if lumen_html::forms::html_element_local_name(realm.session.borrow().document(),id)==Some("input")
+        &&lumen_html::forms::input_type_state(realm.session.borrow().document(),id)!="image" {return Ok(0);}
+    let base=realm.base_url();realm.prepare_image_selection(&base)?;
+    let rendered=if realm.layout_flusher.borrow().is_some()||realm.session.borrow().viewport_size().is_some() {
+        realm.flush_layout()?;
+        geometry::content_box_size(&mut realm.session.borrow_mut(),id).map(|(width,height)|(f64::from(width),f64::from(height)))
+    }else{None};
+    let natural=if rendered.is_none(){
+        let scheme=realm.embedding_color_scheme(id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
+        let session=realm.session.borrow();realm.images.natural_dimensions(session.document(),id,&base,scheme)
+    }else{None};
+    let (width,height)=lumen_html::forms::image_dimensions(realm.session.borrow().document(),id,natural,rendered);
+    let value=if vertical{height}else{width};
+    Ok(image_loading::natural_dimension(value))
 }
 
 fn legacy_image_factory(
@@ -7008,6 +7139,58 @@ fn legacy_image_factory(
 
 #[lumen_bind::methods]
 impl DomHtmlImageElement {
+            #[getter(name = "alt")]
+            fn alt(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("alt")?.unwrap_or_default()) }
+            #[setter(name = "alt", coerce, hint(js(ce_reactions)))]
+            fn set_alt(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("alt", value) }
+            #[getter(name = "srcset")]
+            fn srcset(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_value(&self.base.base.base, "srcset") }
+            #[setter(name = "srcset", hint(js(ce_reactions)))]
+            fn set_srcset(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("srcset", &value.0) }
+            #[getter(name = "sizes")]
+            fn sizes(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("sizes")?.unwrap_or_default()) }
+            #[setter(name = "sizes", coerce, hint(js(ce_reactions)))]
+            fn set_sizes(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("sizes", value) }
+            #[getter(name = "useMap")]
+            fn use_map(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("usemap")?.unwrap_or_default()) }
+            #[setter(name = "useMap", coerce, hint(js(ce_reactions)))]
+            fn set_use_map(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("usemap", value) }
+            #[getter(name = "isMap")]
+            fn is_map(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("ismap")?.is_some()) }
+            #[setter(name = "isMap", coerce, hint(js(ce_reactions)))]
+            fn set_is_map(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("ismap", value.then_some("")) }
+            #[getter(name = "controls")]
+            fn controls(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("controls")?.is_some()) }
+            #[setter(name = "controls", coerce, hint(js(ce_reactions)))]
+            fn set_controls(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("controls", value.then_some("")) }
+            #[getter(name = "name")]
+            fn name(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("name")?.unwrap_or_default()) }
+            #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+            fn set_name(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("name", value) }
+            #[getter(name = "lowsrc")]
+            fn lowsrc(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "lowsrc") }
+            #[setter(name = "lowsrc", hint(js(ce_reactions)))]
+            fn set_lowsrc(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("lowsrc", &value.0) }
+            #[getter(name = "align")]
+            fn align(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("align")?.unwrap_or_default()) }
+            #[setter(name = "align", coerce, hint(js(ce_reactions)))]
+            fn set_align(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("align", value) }
+            #[getter(name = "hspace")]
+            fn hspace(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((&self.base.base.base).get_null_attribute("hspace")?.as_deref(), 0)) }
+            #[setter(name = "hspace", coerce, hint(js(ce_reactions)))]
+            fn set_hspace(&self, value: u32) -> OpResult<()> { (&self.base.base.base).set_attribute_core("hspace", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "vspace")]
+            fn vspace(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((&self.base.base.base).get_null_attribute("vspace")?.as_deref(), 0)) }
+            #[setter(name = "vspace", coerce, hint(js(ce_reactions)))]
+            fn set_vspace(&self, value: u32) -> OpResult<()> { (&self.base.base.base).set_attribute_core("vspace", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "longDesc")]
+            fn long_desc(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "longdesc") }
+            #[setter(name = "longDesc", hint(js(ce_reactions)))]
+            fn set_long_desc(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("longdesc", &value.0) }
+            #[getter(name = "border")]
+            fn border(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("border")?.unwrap_or_default()) }
+            #[setter(name = "border", coerce, hint(js(ce_reactions)))]
+            fn set_border(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("border", value.0) }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -7018,22 +7201,12 @@ impl DomHtmlImageElement {
 
     #[getter]
     fn src(&self) -> OpResult<String> {
-        let node = self.image_node();
-        let Some(source) = node.get_null_attribute("src")? else {
-            return Ok(String::new());
-        };
-        let base = node.realm.base_url();
-        let resolved = image_loading::resolved_url(&source, &base);
-        Ok(if resolved.is_empty() {
-            source
-        } else {
-            resolved
-        })
+        crate::html_interfaces::reflected_usv_url_value(self.image_node(), "src")
     }
 
-    #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_src(&self, source: &str) -> OpResult<()> {
-        self.image_node().set_attribute_core("src", source)
+    #[setter(hint(js(ce_reactions)))]
+    fn set_src(&self, source: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.image_node().set_attribute_core("src", &source.0)
     }
 
     #[getter(rename(js = "crossOrigin"))]
@@ -7049,8 +7222,8 @@ impl DomHtmlImageElement {
     }
 
     #[setter(rename(js = "crossOrigin"), coerce, hint(js(ce_reactions)))]
-    fn set_cross_origin(&self, value: &str) -> OpResult<()> {
-        self.image_node().set_attribute_core("crossorigin", value)
+    fn set_cross_origin(&self, value: Option<&str>) -> OpResult<()> {
+        self.image_node().set_nullable_attribute_core("crossorigin", value)
     }
 
     #[getter(rename(js = "currentSrc"))]
@@ -7074,34 +7247,42 @@ impl DomHtmlImageElement {
     }
 
     #[getter]
-    fn width(&self) -> OpResult<u32> {
-        let node = self.image_node();
-        match node.get_null_attribute("width")? {
-            Some(value) => Ok(lumen_html::layout::canvas_dimension(Some(&value), 0)),
-            None => Ok(self.image_snapshot().natural_width),
-        }
-    }
+    fn width(&self) -> OpResult<u32> {image_dimension(self.image_node(),false)}
 
-    #[setter(hint(js(ce_reactions)))]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_width(&self, width: u32) -> OpResult<()> {
         self.image_node()
-            .set_attribute_core("width", &width.to_string())
+            .set_attribute_core("width", &lumen_html::forms::reflected_unsigned_long_setter_value(width, 0).to_string())
     }
 
     #[getter]
-    fn height(&self) -> OpResult<u32> {
-        let node = self.image_node();
-        match node.get_null_attribute("height")? {
-            Some(value) => Ok(lumen_html::layout::canvas_dimension(Some(&value), 0)),
-            None => Ok(self.image_snapshot().natural_height),
-        }
-    }
+    fn height(&self) -> OpResult<u32> {image_dimension(self.image_node(),true)}
 
-    #[setter(hint(js(ce_reactions)))]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_height(&self, height: u32) -> OpResult<()> {
         self.image_node()
-            .set_attribute_core("height", &height.to_string())
+            .set_attribute_core("height", &lumen_html::forms::reflected_unsigned_long_setter_value(height, 0).to_string())
     }
+    #[getter(name = "decoding")]
+    fn decoding(&self) -> OpResult<String> { crate::html_interfaces::reflected_keyword(&self.base.base.base, "decoding", &["sync","async","auto"], "auto", "auto") }
+    #[setter(name = "decoding", coerce, hint(js(ce_reactions)))]
+    fn set_decoding(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("decoding", value) }
+    #[getter(name = "loading")]
+    fn loading(&self) -> OpResult<String> { crate::html_interfaces::reflected_keyword(&self.base.base.base, "loading", &["lazy","eager"], "eager", "eager") }
+    #[setter(name = "loading", coerce, hint(js(ce_reactions)))]
+    fn set_loading(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("loading", value) }
+    #[getter(name = "fetchPriority")]
+    fn fetch_priority(&self) -> OpResult<String> { crate::html_interfaces::reflected_keyword(&self.base.base.base, "fetchpriority", &["high","low","auto"], "auto", "auto") }
+    #[setter(name = "fetchPriority", coerce, hint(js(ce_reactions)))]
+    fn set_fetch_priority(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("fetchpriority", value) }
+    #[getter(name = "referrerPolicy")]
+    fn referrer_policy(&self) -> OpResult<String> {
+        Ok(self.image_node().get_null_attribute("referrerpolicy")?
+            .and_then(|value| lumen_common::referrer::ReferrerPolicy::parse(&value))
+            .map_or(String::new(), |policy| policy.name().into()))
+    }
+    #[setter(name = "referrerPolicy", coerce, hint(js(ce_reactions)))]
+    fn set_referrer_policy(&self, value: &str) -> OpResult<()> { self.image_node().set_attribute_core("referrerpolicy", value) }
 
     #[getter]
     fn onload(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
@@ -7143,6 +7324,46 @@ pub struct DomIFrameElement {
 }
 #[lumen_bind::methods]
 impl DomIFrameElement {
+            #[getter(name = "allow")]
+            fn allow(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("allow")?.unwrap_or_default()) }
+            #[setter(name = "allow", coerce, hint(js(ce_reactions)))]
+            fn set_allow(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("allow", value) }
+            #[getter(name = "allowFullscreen")]
+            fn allow_fullscreen(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("allowfullscreen")?.is_some()) }
+            #[setter(name = "allowFullscreen", coerce, hint(js(ce_reactions)))]
+            fn set_allow_fullscreen(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("allowfullscreen", value.then_some("")) }
+            #[getter(name = "width")]
+            fn width(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("width")?.unwrap_or_default()) }
+            #[setter(name = "width", coerce, hint(js(ce_reactions)))]
+            fn set_width(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("width", value) }
+            #[getter(name = "height")]
+            fn height(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("height")?.unwrap_or_default()) }
+            #[setter(name = "height", coerce, hint(js(ce_reactions)))]
+            fn set_height(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("height", value) }
+            #[getter(name = "align")]
+            fn align(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("align")?.unwrap_or_default()) }
+            #[setter(name = "align", coerce, hint(js(ce_reactions)))]
+            fn set_align(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("align", value) }
+            #[getter(name = "scrolling")]
+            fn scrolling(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("scrolling")?.unwrap_or_default()) }
+            #[setter(name = "scrolling", coerce, hint(js(ce_reactions)))]
+            fn set_scrolling(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("scrolling", value) }
+            #[getter(name = "frameBorder")]
+            fn frame_border(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("frameborder")?.unwrap_or_default()) }
+            #[setter(name = "frameBorder", coerce, hint(js(ce_reactions)))]
+            fn set_frame_border(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("frameborder", value) }
+            #[getter(name = "longDesc")]
+            fn long_desc(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "longdesc") }
+            #[setter(name = "longDesc", hint(js(ce_reactions)))]
+            fn set_long_desc(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("longdesc", &value.0) }
+            #[getter(name = "marginHeight")]
+            fn margin_height(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("marginheight")?.unwrap_or_default()) }
+            #[setter(name = "marginHeight", coerce, hint(js(ce_reactions)))]
+            fn set_margin_height(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("marginheight", value.0) }
+            #[getter(name = "marginWidth")]
+            fn margin_width(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("marginwidth")?.unwrap_or_default()) }
+            #[setter(name = "marginWidth", coerce, hint(js(ce_reactions)))]
+            fn set_margin_width(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("marginwidth", value.0) }
     #[constructor]
     fn new(
         ctx: &mut Ctx,
@@ -7151,6 +7372,10 @@ impl DomIFrameElement {
         custom_elements::construct_customized_element(ctx, this.0, "iframe")
     }
 
+    #[getter]
+    fn permissions_policy(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value>{
+        permissions_policy::object(ctx,this.0,false)
+    }
     #[getter]
     fn name(&self) -> OpResult<String> {
         Ok(self
@@ -7168,19 +7393,12 @@ impl DomIFrameElement {
 
     #[getter]
     fn src(&self) -> OpResult<String> {
-        let node = &self.base.base.base;
-        let Some(source) = node.get_null_attribute("src")? else {
-            return Ok(String::new());
-        };
-        let base = node.realm.base_url();
-        Ok(lumen_common::url::parse(&source, Some(&base))
-            .map(|url| url.href())
-            .unwrap_or(source))
+        crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "src")
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_src(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("src", value)
+    fn set_src(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("src", &value.0)
     }
 
     #[getter]
@@ -7276,17 +7494,13 @@ impl DomStyleElement {
     fn set_blocking(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("blocking",value)}
     #[getter]
     fn disabled(&self,ctx:&mut Ctx)->OpResult<bool> {
-        let node=&self.base.base.base;let (owner,id)=node.realm.resolve_adopted_node(node.id);
-        if !owner.ensure_inline_stylesheet(ctx,id)? {return Ok(false)}
-        let disabled=owner.session.borrow().stylesheet_disabled(id);Ok(disabled)
+        let node=&self.base.base.base;
+        cssom::style_element_disabled(ctx,&node.realm,node.id)
     }
     #[setter(coerce)]
     fn set_disabled(&self,ctx:&mut Ctx,value:bool)->OpResult<()> {
-        let node=&self.base.base.base;let (owner,id)=node.realm.resolve_adopted_node(node.id);
-        if !owner.ensure_inline_stylesheet(ctx,id)? {return Ok(())}
-        owner.stylesheet_links.set_sheet_disabled(id,value)?;
-        let result=owner.session.borrow_mut().set_stylesheet_disabled(id,value)
-            .map_err(|error|OpError::new("InvalidStateError",format!("inline stylesheet disable: {error:?}")));result
+        let node=&self.base.base.base;
+        cssom::set_style_element_disabled(ctx,&node.realm,node.id,value)
     }
     #[getter]
     fn sheet(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
@@ -7342,8 +7556,8 @@ impl DomFormElement {
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_action(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("action", value)
+    fn set_action(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("action", &value.0)
     }
 
     #[getter]
@@ -7804,8 +8018,19 @@ impl DomHtmlOptionsCollection {
     }
 }
 
+fn control_autocomplete(node: &DomNode) -> String {
+    let (realm,id)=node.realm.resolve_adopted_node(node.id);
+    let session=realm.session.borrow();
+    lumen_html::forms::autocomplete_state(session.document(),id).idl_value()
+}
+
 #[lumen_bind::methods]
 impl DomSelectElement {
+    #[getter]
+    fn autocomplete(&self) -> String {control_autocomplete(&self.base.base.base)}
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autocomplete(&self,value:&str) -> OpResult<()> {self.base.base.base.set_attribute_core("autocomplete",value)}
+
     #[getter]
     fn size(&self) -> OpResult<u32> {
         Ok(lumen_html::forms::reflected_unsigned_long(
@@ -8133,15 +8358,22 @@ fn set_text_control_length_attribute(
 
 fn textarea_size_attribute(node: &DomNode, name: &str, default: u32) -> OpResult<u32> {
     let value = node.get_null_attribute(name)?;
-    Ok(value
-        .and_then(|value| lumen_html::forms::parse_nonnegative_integer(&value))
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(default)
-        .max(1))
+    let value = lumen_html::forms::reflected_unsigned_long(value.as_deref(), default);
+    Ok(if value == 0 { default } else { value })
+}
+
+fn set_positive_size_attribute(node: &DomNode, name: &str, value: u32, default: u32) -> OpResult<()> {
+    let value = if value == 0 { default } else { lumen_html::forms::reflected_unsigned_long_setter_value(value, default) };
+    node.set_attribute_core(name, &value.to_string())
 }
 
 #[lumen_bind::methods]
 impl DomTextAreaElement {
+    #[getter]
+    fn autocomplete(&self) -> String {control_autocomplete(&self.base.base.base)}
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autocomplete(&self,value:&str) -> OpResult<()> {self.base.base.base.set_attribute_core("autocomplete",value)}
+
     #[getter]
     fn labels(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
         let node = &self.base.base.base;
@@ -8266,10 +8498,7 @@ impl DomTextAreaElement {
     }
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_rows(&self, value: u32) -> OpResult<()> {
-        self.base
-            .base
-            .base
-            .set_attribute_core("rows", &value.to_string())
+        set_positive_size_attribute(&self.base.base.base, "rows", value, 2)
     }
     #[getter]
     fn cols(&self) -> OpResult<u32> {
@@ -8277,21 +8506,11 @@ impl DomTextAreaElement {
     }
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_cols(&self, value: u32) -> OpResult<()> {
-        self.base
-            .base
-            .base
-            .set_attribute_core("cols", &value.to_string())
+        set_positive_size_attribute(&self.base.base.base, "cols", value, 20)
     }
     #[getter]
-    fn wrap(&self) -> OpResult<&'static str> {
-        let value = self.base.base.base.get_null_attribute("wrap")?;
-        Ok(
-            if value.is_some_and(|value| value.eq_ignore_ascii_case("hard")) {
-                "hard"
-            } else {
-                "soft"
-            },
-        )
+    fn wrap(&self) -> OpResult<String> {
+        Ok(self.base.base.base.get_null_attribute("wrap")?.unwrap_or_default())
     }
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_wrap(&self, value: &str) -> OpResult<()> {
@@ -8323,6 +8542,55 @@ impl DomTextAreaElement {
 }
 #[lumen_bind::methods]
 impl DomInputElement {
+    #[getter]
+    fn width(&self)->OpResult<u32>{image_dimension(&self.base.base.base,false)}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_width(&self,value:u32)->OpResult<()>{self.base.base.base.set_attribute_core("width",&lumen_html::forms::reflected_unsigned_long_setter_value(value,0).to_string())}
+    #[getter]
+    fn height(&self)->OpResult<u32>{image_dimension(&self.base.base.base,true)}
+    #[setter(coerce,hint(js(ce_reactions)))]
+    fn set_height(&self,value:u32)->OpResult<()>{self.base.base.base.set_attribute_core("height",&lumen_html::forms::reflected_unsigned_long_setter_value(value,0).to_string())}
+
+    #[getter]
+    fn autocomplete(&self) -> String {control_autocomplete(&self.base.base.base)}
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autocomplete(&self,value:&str) -> OpResult<()> {self.base.base.base.set_attribute_core("autocomplete",value)}
+
+    #[getter]
+    fn size(&self) -> OpResult<u32> { textarea_size_attribute(&self.base.base.base, "size", 20) }
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_size(&self, ctx: &mut Ctx, value: u32) -> OpResult<()> {
+        if value == 0 { return Err(error_reporting::dom_exception(ctx, "IndexSizeError", "input size must be positive")); }
+        set_positive_size_attribute(&self.base.base.base, "size", value, 20)
+    }
+            #[getter(name = "accept")]
+            fn accept(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("accept")?.unwrap_or_default()) }
+            #[setter(name = "accept", coerce, hint(js(ce_reactions)))]
+            fn set_accept(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("accept", value) }
+            #[getter(name = "alt")]
+            fn alt(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("alt")?.unwrap_or_default()) }
+            #[setter(name = "alt", coerce, hint(js(ce_reactions)))]
+            fn set_alt(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("alt", value) }
+            #[getter(name = "multiple")]
+            fn multiple(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("multiple")?.is_some()) }
+            #[setter(name = "multiple", coerce, hint(js(ce_reactions)))]
+            fn set_multiple(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("multiple", value.then_some("")) }
+            #[getter(name = "alpha")]
+            fn alpha(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("alpha")?.is_some()) }
+            #[setter(name = "alpha", coerce, hint(js(ce_reactions)))]
+            fn set_alpha(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("alpha", value.then_some("")) }
+            #[getter(name = "src")]
+            fn src(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "src") }
+            #[setter(name = "src", hint(js(ce_reactions)))]
+            fn set_src(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("src", &value.0) }
+            #[getter(name = "align")]
+            fn align(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("align")?.unwrap_or_default()) }
+            #[setter(name = "align", coerce, hint(js(ce_reactions)))]
+            fn set_align(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("align", value) }
+            #[getter(name = "useMap")]
+            fn use_map(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("usemap")?.unwrap_or_default()) }
+            #[setter(name = "useMap", coerce, hint(js(ce_reactions)))]
+            fn set_use_map(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("usemap", value) }
     #[getter(name = "popoverTargetElement")]
     fn popover_target_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get(ctx, this.0, "popovertarget") }
     #[setter(name = "popoverTargetElement", hint(js(ce_reactions)))]
@@ -8401,12 +8669,10 @@ impl DomInputElement {
     }
     #[getter(name = "type")]
     fn input_type(&self) -> OpResult<String> {
-        Ok(self
-            .base
-            .base
-            .base
-            .get_null_attribute("type")?
-            .unwrap_or_else(|| "text".into()))
+        let node = &self.base.base.base;
+        let (owner, id) = node.realm.resolve_adopted_node(node.id);
+        let state = lumen_html::forms::input_type_state(owner.session.borrow().document(), id);
+        Ok(state.into())
     }
     #[setter(name = "type", coerce, hint(js(ce_reactions)))]
     fn set_input_type(&self, value: &str) -> OpResult<()> {
@@ -8653,8 +8919,8 @@ impl DomInputElement {
         html_interfaces::form_action_value(&self.base.base.base)
     }
     #[setter(name = "formAction", coerce, hint(js(ce_reactions)))]
-    fn set_form_action(&self, value: &str) -> OpResult<()> {
-        self.base.base.base.set_attribute_core("formaction", value)
+    fn set_form_action(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("formaction", &value.0)
     }
     #[getter(name = "formEnctype")]
     fn form_enctype(&self) -> OpResult<String> {
@@ -8733,6 +8999,14 @@ impl DomTemplateElement {
     }
 }
 event_content_handlers::bind_node_handlers! { DomHtmlElement {
+    #[getter(name = "inputMode")]
+    fn input_mode(&self) -> OpResult<String> { html_interfaces::reflected_keyword(&self.base.base, "inputmode", &["none","text","tel","url","email","numeric","decimal","search"], "", "") }
+    #[setter(name = "inputMode", coerce, hint(js(ce_reactions)))]
+    fn set_input_mode(&self, value: &str) -> OpResult<()> { self.base.base.set_attribute_core("inputmode", value) }
+    #[getter(name = "enterKeyHint")]
+    fn enter_key_hint(&self) -> OpResult<String> { html_interfaces::reflected_keyword(&self.base.base, "enterkeyhint", &["enter","done","go","next","previous","search","send"], "", "") }
+    #[setter(name = "enterKeyHint", coerce, hint(js(ce_reactions)))]
+    fn set_enter_key_hint(&self, value: &str) -> OpResult<()> { self.base.base.set_attribute_core("enterkeyhint", value) }
     fn attach_internals(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
         custom_elements::attach_internals(ctx, &self.base.base.realm, self.base.base.id, this.0)
     }
@@ -9867,6 +10141,27 @@ pub struct DomXmlDocument {
 impl DomXmlDocument {}
 
 impl DomDocument {
+    fn body_node_id(&self) -> OpResult<Option<NodeId>> {
+        let session = self.realm.session.borrow();
+        let document = session.document();
+        let html = named_child(document, self.base.id, &["html"]).map_err(dom_error)?;
+        html.map(|html| named_child(document, html, &["body", "frameset"]).map_err(dom_error)).transpose().map(Option::flatten)
+    }
+
+    fn legacy_body_color(&self, attribute: &str) -> OpResult<String> {
+        let Some(body) = self.body_node_id()? else { return Ok(String::new()); };
+        let session = self.realm.session.borrow();
+        let document = session.document();
+        if lumen_html::forms::html_element_local_name(document, body) != Some("body") { return Ok(String::new()); }
+        Ok(document.get_attribute_ns(body, None, attribute).map_err(dom_error)?.unwrap_or_default())
+    }
+
+    fn set_legacy_body_color(&self, ctx: &mut Ctx, attribute: &str, value: &str) -> OpResult<()> {
+        let Some(body) = self.body_node_id()? else { return Ok(()); };
+        if lumen_html::forms::html_element_local_name(self.realm.session.borrow().document(), body) != Some("body") { return Ok(()); }
+        let element = self.realm.wrap(ctx, body);
+        ctx.with_instance::<DomNode, _>(&element, |node| node.set_attribute_core(attribute, value))?
+    }
     fn prepare_node_ownership(&self, ctx: &mut Ctx) -> OpResult<()> {
         self.realm.prepare_allocation(ctx, 1)?;
         self.realm
@@ -9903,6 +10198,26 @@ impl DomDocument {
 }
 
 event_content_handlers::bind_node_handlers! { DomDocument {
+    #[getter(name = "fgColor")]
+    fn fg_color(&self) -> OpResult<String> { self.legacy_body_color("text") }
+    #[setter(name = "fgColor", coerce, hint(js(ce_reactions)))]
+    fn set_fg_color(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> { self.set_legacy_body_color(ctx, "text", value.0) }
+    #[getter(name = "linkColor")]
+    fn link_color(&self) -> OpResult<String> { self.legacy_body_color("link") }
+    #[setter(name = "linkColor", coerce, hint(js(ce_reactions)))]
+    fn set_link_color(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> { self.set_legacy_body_color(ctx, "link", value.0) }
+    #[getter(name = "vlinkColor")]
+    fn vlink_color(&self) -> OpResult<String> { self.legacy_body_color("vlink") }
+    #[setter(name = "vlinkColor", coerce, hint(js(ce_reactions)))]
+    fn set_vlink_color(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> { self.set_legacy_body_color(ctx, "vlink", value.0) }
+    #[getter(name = "alinkColor")]
+    fn alink_color(&self) -> OpResult<String> { self.legacy_body_color("alink") }
+    #[setter(name = "alinkColor", coerce, hint(js(ce_reactions)))]
+    fn set_alink_color(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> { self.set_legacy_body_color(ctx, "alink", value.0) }
+    #[getter(name = "bgColor")]
+    fn bg_color(&self) -> OpResult<String> { self.legacy_body_color("bgcolor") }
+    #[setter(name = "bgColor", coerce, hint(js(ce_reactions)))]
+    fn set_bg_color(&self, ctx: &mut Ctx, value: LegacyNullToEmptyString<'_>) -> OpResult<()> { self.set_legacy_body_color(ctx, "bgcolor", value.0) }
 
 
     #[getter]
@@ -10047,8 +10362,8 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 
     #[setter(coerce)]
-    fn set_cookie(&self, assignment: &str) -> OpResult<()> {
-        self.set_cookie_value(assignment)
+    fn set_cookie(&self, assignment: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.set_cookie_value(&assignment.0)
     }
 
     #[getter]
@@ -10107,7 +10422,23 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 
     #[method(name = "open", hint(js(ce_reactions)))]
-    fn open(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+    fn open(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>,
+        first: lumen_bind::Passed<Value>, second: lumen_bind::Passed<Value>,
+        third: lumen_bind::Passed<Value>) -> OpResult<Value> {
+        if let Some(features) = third.0 {
+            let url = lumen_host::webidl::usv_string(ctx, &first.0.unwrap_or(Value::Undefined))
+                .map_err(OpError::thrown)?;
+            let name = ctx.coerce_string(&second.0.unwrap_or(Value::Undefined))
+                .map_err(OpError::thrown)?.to_string();
+            let features = ctx.coerce_string(&features).map_err(OpError::thrown)?.to_string();
+            if !self.realm.browsing_context().is_some_and(|context|
+                browsing_context::is_active_document(&context, &self.realm)) {
+                return Err(error_reporting::dom_exception(ctx, "InvalidAccessError", "Document is not fully active"));
+            }
+            return window_globals::window_open(ctx, &self.realm, &url, &name, &features);
+        }
+        crate::option_factory::optional_string(ctx, first)?;
+        crate::option_factory::optional_string(ctx, second)?;
         if self.is_inert_template_document() {
             return Err(OpError::new(
                 "NotSupportedError",
@@ -10170,6 +10501,11 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     fn referrer(&self) -> String {
         if self.is_inert_template_document() { String::new() }
         else { self.realm.document_referrer.borrow().clone() }
+    }
+
+    #[getter]
+    fn permissions_policy(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value>{
+        permissions_policy::object(ctx,this.0,true)
     }
 
     #[getter]
@@ -10368,7 +10704,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 
     #[setter(coerce)]
-    fn set_location(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    fn set_location(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
         if self.is_inert_template_document() {
             return Err(OpError::new(
                 "InvalidStateError",
@@ -10390,7 +10726,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
             ));
         }
         let entry_base = window_globals::entry_base_url(ctx, &context);
-        context.request_location_navigation_with_caller(ctx, value, &entry_base)
+        context.request_location_navigation_with_caller(ctx, &value.0, &entry_base)
     }
 
     #[getter]
@@ -10717,15 +11053,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
 
     #[getter]
     fn body(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        let session = self.realm.session.borrow();
-        let document = session.document();
-        let html = named_child(document, self.base.id, &["html"]).map_err(dom_error)?;
-        let body = if let Some(html) = html {
-            named_child(document, html, &["body", "frameset"]).map_err(dom_error)?
-        } else {
-            None
-        };
-        drop(session);
+        let body = self.body_node_id()?;
         Ok(self.realm.wrap_option(ctx, body))
     }
 
@@ -12493,6 +12821,15 @@ impl DomNode {
         self.after_attribute_write(name, namespaced)
     }
 
+    /// HTML's nullable reflected DOMString deletes the attribute for null.
+    /// Both writes use the ordinary mutation, adoption and reaction authority.
+    fn set_nullable_attribute_core(&self,name:&str,value:Option<&str>)->OpResult<()> {
+        match value {
+            Some(value)=>self.set_attribute_core(name,value),
+            None=>self.remove_attribute_core(name),
+        }
+    }
+
     fn set_attribute_core(&self, name: &str, value: &str) -> OpResult<()> {
         let _html_allocations = enter_html_allocation_category();
         forms::prepare_input_attribute_change(&self.realm, self.id, name)?;
@@ -12944,6 +13281,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             about_base_url: RefCell::new(None),
             referrer_policy: Cell::new(lumen_common::referrer::ReferrerPolicy::default()),
             csp: RefCell::new(csp::State::default()),
+            permissions_policy: RefCell::new(permissions_policy::State::default()),
             csp_report_budget: RefCell::new(csp_reports::DeliveryBudget::default()),
             reporting: Rc::new(reporting::State::default()),
             csp_overflow: Cell::new(false),
@@ -13073,6 +13411,15 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
                         realm.observe_frame_navigation_mutation(document, mutation, base_changed);
                         realm.canvases.on_mutation(document, mutation);
                         realm.images.on_mutation(document, mutation);
+                        if realm.images.input_mutation_needs_selection(document,mutation) {
+                            // The document is already borrowed by its mutation
+                            // sink; use the canonical base cache, not session reentry.
+                            if !realm.document_base_url.borrow().initialized {
+                                realm.recompute_document_base_url(document,false);
+                            }
+                            let base=realm.effective_base_url_from_cache().expect("input request base initialized");
+                            realm.images.synchronize_input_mutation(document,mutation,&base,|node|realm.retain_dirty_image_request(node));
+                        }
                         realm.stylesheet_links.mutation(document,mutation);
                         if realm.object_resources.observe(document, mutation).is_err() {
                             realm.object_resources.processing_failed.set(true);
@@ -13250,6 +13597,18 @@ impl ScriptActivation {
     /// adoption. Source and base URL stay those captured at preparation time.
     pub fn current_node(&self) -> (Rc<DomRealm>, NodeId) {
         self.realm.resolve_adopted_node(self.script.node)
+    }
+}
+
+// The input fetch client delays its original document through completion,
+// even if its element moves to another document before the task runs.
+struct InputCompletionTask {client:Rc<DomRealm>,slot:usize}
+impl Drop for InputCompletionTask {
+    fn drop(&mut self) {
+        if let Some(node)=self.client.images.finish_input_completion_task(self.slot) {
+            let (owner,node)=self.client.resolve_adopted_node(node);
+            owner.images.finish_input_retention(node);
+        }
     }
 }
 
@@ -13596,6 +13955,7 @@ fn install_document_with_context_metadata(
         // Reuse the Window's listeners, expandos, intrinsics and named-properties
         // object. New Document wrappers and native services belong to the new arena.
         window_globals::rebind_document(ctx, &realm).map_err(|_| InstallError::Global)?;
+        permissions_policy::install(ctx,&realm).map_err(|_|InstallError::Global)?;
         scheduling::rebind_document(ctx);
         realm.font_loading.capture_dom_exception(ctx);
         let document = realm.document_value(ctx);
@@ -13651,6 +14011,7 @@ fn install_document_with_context_metadata(
     let _ = ctx.class_constructor::<font_loading::DomFontFaceSetIterator>();
     for (name, ctor) in [
         ("EventTarget", ctx.class_constructor::<DomEventTarget>()),
+        ("PermissionsPolicy",ctx.class_constructor::<permissions_policy::DomPermissionsPolicy>()),
         (
             "Window",
             ctx.class_constructor::<window_globals::DomWindow>(),
@@ -13873,6 +14234,7 @@ fn install_document_with_context_metadata(
     form_data_bridge::install(ctx).map_err(|_| InstallError::Global)?;
     scheduling::install(ctx).map_err(|_| InstallError::Global)?;
     window_globals::install(ctx, &realm).map_err(|_| InstallError::Global)?;
+    permissions_policy::install(ctx,&realm).map_err(|_|InstallError::Global)?;
     dataset::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     browser_services::install(ctx, &realm).map_err(|_| InstallError::Global)?;
     media_capture::install(ctx, &realm).map_err(|_| InstallError::Global)?;
@@ -14559,7 +14921,7 @@ mod tests {
             ("body removal with stale scroll", "document.body.remove();"),
         ] {
             let result=engine.eval_value(source).expect("authored source evaluation");
-            if let Err(error)=result {panic!("{phase}: author {}",engine.ctx().coerce_string(&error).unwrap().to_string());}
+            if let Err(error)=result {panic!("{phase}: author {}",engine.ctx().coerce_string(&error).map(|text|text.to_string()).unwrap_or_else(|_|"unprintable JavaScript exception".into()));}
             realm.update_rendered_focus(engine.ctx()).unwrap_or_else(|error|panic!("{phase}: rendering focus {error:?}"));
             realm.flush_layout().unwrap_or_else(|error|panic!("{phase}: real layout {error:?}"));
             realm.update_rendered_focus(engine.ctx()).unwrap_or_else(|error|panic!("{phase}: next rendering opportunity {error:?}"));

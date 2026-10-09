@@ -117,12 +117,12 @@ impl ContentAlignment {
 
 fn start_is_far(style: &Style, horizontal: bool) -> bool {
     match (style.writing_mode, horizontal) {
-        (WritingMode::HorizontalTb, true) => style.direction == Direction::Rtl,
+        (WritingMode::HorizontalTb, true) => style.used_direction() == Direction::Rtl,
         (WritingMode::VerticalRl | WritingMode::SidewaysRl, true) => true,
         (WritingMode::VerticalLr | WritingMode::SidewaysLr, true) => false,
-        (WritingMode::SidewaysLr, false) => style.direction == Direction::Ltr,
+        (WritingMode::SidewaysLr, false) => style.used_direction() == Direction::Ltr,
         (WritingMode::HorizontalTb, false) => false,
-        (_, false) => style.direction == Direction::Rtl,
+        (_, false) => style.used_direction() == Direction::Rtl,
     }
 }
 

@@ -13,6 +13,7 @@ pub(crate) struct DocumentLifecycle {
     pub(crate) hidden: Cell<bool>,
     pub(crate) initial_about_blank: Cell<bool>,
     pub(crate) sandboxed_automatic_features: Cell<bool>,
+    pub(crate) sandboxed_origin: Cell<bool>,
     pub(crate) revealed: Cell<bool>,
 }
 

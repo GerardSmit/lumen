@@ -101,6 +101,7 @@ impl CanvasFontSource {
 }
 
 impl TextShaper for CanvasFontSource {
+    fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {self.with_fonts(|fonts|fonts.glyph_cell_bounds(face,id,size))}
     fn first_available_font_metric(&self, spec: &FontSpec, metric: lumen_html::paint::FontMetric) -> Option<Option<f32>> {
         self.request_metric_font(spec);
         self.with_fonts(|fonts| fonts.first_available_font_metric(spec, metric))
@@ -846,6 +847,13 @@ impl CanvasRegistry {
             let session = realm.session.borrow();
             canvas_dimensions(session.document(), node)
         };
+        self.data_for_dimensions(node, width, height)
+    }
+
+    fn data_for_dimensions(&self, node: NodeId, width: u32, height: u32) -> OpResult<Rc<RefCell<CanvasData>>> {
+        if let Some(state) = self.surfaces.borrow().get(&node).cloned() {
+            return Ok(state);
+        }
         let state = Rc::new(RefCell::new(CanvasData::new(width, height)?));
         self.surfaces.borrow_mut().insert(node, state.clone());
         Ok(state)
@@ -1385,10 +1393,10 @@ impl CanvasPath {
                 PathCommand::SharedSvg(ref parsed) => {
                     if let Some(path) = &parsed.path {
                         builder.push_path(path);
-                    } else {
+                    } else if parsed.has_subpath {
                         builder.move_to(parsed.current.0, parsed.current.1);
                     }
-                    has_subpath = true;
+                    has_subpath |= parsed.has_subpath;
                     current = parsed.current;
                     subpath_start = parsed.subpath_start;
                 }
@@ -1408,6 +1416,7 @@ impl CanvasPath {
             path: builder.finish().and_then(|path| path.transform(transform)),
             current: (current.x, current.y),
             subpath_start: (subpath.x, subpath.y),
+            has_subpath,
         }
     }
 }
@@ -1783,10 +1792,13 @@ impl DomCanvasElement {
         canvas_idl_dimension(&self.base.base.base, "width", DEFAULT_WIDTH)
     }
 
-    #[setter]
-    fn set_width(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
-        let value = webidl_unsigned_long(ctx, &value)?;
-        let data = self.data()?;
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_width(&self, ctx: &mut Ctx, value: u32) -> OpResult<()> {
+        let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, DEFAULT_WIDTH);
+        let node = &self.base.base.base;
+        // An unmaterialized bitmap must use the replacement dimension, rather
+        // than allocating the old content attribute before applying the setter.
+        let data = node.realm.canvases.data_for_dimensions(node.id, value, node_height(node))?;
         if data.borrow().transferred { return Err(OpError::new("InvalidStateError", "canvas control was transferred")); }
         set_dom_dimension(ctx, &self.base.base.base, &data, "width", value)
     }
@@ -1822,10 +1834,11 @@ impl DomCanvasElement {
         )
     }
 
-    #[setter]
-    fn set_height(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
-        let value = webidl_unsigned_long(ctx, &value)?;
-        let data = self.data()?;
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_height(&self, ctx: &mut Ctx, value: u32) -> OpResult<()> {
+        let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, DEFAULT_HEIGHT);
+        let node = &self.base.base.base;
+        let data = node.realm.canvases.data_for_dimensions(node.id, node_width(node), value)?;
         if data.borrow().transferred { return Err(OpError::new("InvalidStateError", "canvas control was transferred")); }
         set_dom_dimension(ctx, &self.base.base.base, &data, "height", value)
     }
@@ -1950,7 +1963,10 @@ fn canvas_blob(
 }
 
 fn canvas_idl_dimension(node: &DomNode, name: &str, fallback: u32) -> u32 {
-    canvas_dimension_at(&node.realm, node.id, name, fallback)
+    let (owner, id) = node.realm.resolve_adopted_node(node.id);
+    let session = owner.session.borrow();
+    lumen_html::forms::reflected_unsigned_long(
+        session.document().get_attribute_ns_ref(id, None, name).ok().flatten(), fallback)
 }
 
 fn canvas_dimension_at(realm: &Rc<DomRealm>, id: NodeId, name: &str, fallback: u32) -> u32 {

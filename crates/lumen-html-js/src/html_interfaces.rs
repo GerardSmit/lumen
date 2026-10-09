@@ -2,7 +2,7 @@
 //! HTMLElement behavior. Their interface-specific attributes and methods remain
 //! separate work where they are not already implemented by another subsystem.
 use super::{DomElement, DomHtmlElement, DomNode};
-use lumen::embed::{Ctx, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, OpError, OpResult, Value, WeakValue};
 use lumen_html::NodeId;
 use std::vec::Vec;
 
@@ -169,6 +169,10 @@ define_plain_html_interfaces! {
         crate::DomTemplateElement, "HTMLTemplateElement" => ["template"], |base| crate::DomTemplateElement { base };
     }
     DomHtmlButtonElement, "HTMLButtonElement" => ["button"] {
+            #[getter(name = "name")]
+            fn name(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("name")?.unwrap_or_default()) }
+            #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+            fn set_name(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("name", value) }
         #[getter(name = "value")]
         fn button_value(&self) -> OpResult<String> {
             Ok(self.base.base.base.get_null_attribute("value")?.unwrap_or_default())
@@ -236,8 +240,8 @@ define_plain_html_interfaces! {
         }
 
         #[setter(name = "formAction", coerce, hint(js(ce_reactions)))]
-        fn set_form_action(&self, value: &str) -> OpResult<()> {
-            self.base.base.base.set_attribute_core("formaction", value)
+        fn set_form_action(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("formaction", &value.0)
         }
 
         #[getter(name = "formEnctype")]
@@ -290,7 +294,16 @@ define_plain_html_interfaces! {
             self.base.base.base.set_attribute_core("formtarget", value)
         }
     };
-    DomHtmlDataElement, "HTMLDataElement" => ["data"];
+    DomHtmlDataElement, "HTMLDataElement" => ["data"] {
+        #[getter(name = "value")]
+        fn value(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("value")?.unwrap_or_default())
+        }
+        #[setter(name = "value", coerce, hint(js(ce_reactions)))]
+        fn set_value(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("value", value)
+        }
+    };
     DomHtmlDataListElement, "HTMLDataListElement" => ["datalist"] {
         #[getter]
         fn options(
@@ -402,9 +415,36 @@ define_plain_html_interfaces! {
             super::dialog_popover::close_dialog(ctx, &realm, node, result.as_deref())
         }
     };
-    DomHtmlModElement, "HTMLModElement" => ["del", "ins"];
-    DomHtmlDirectoryElement, "HTMLDirectoryElement" => ["dir"];
-    DomHtmlDListElement, "HTMLDListElement" => ["dl"];
+    DomHtmlModElement, "HTMLModElement" => ["del", "ins"] {
+        #[getter(name = "cite")]
+        fn cite(&self) -> OpResult<String> {
+            reflected_usv_url_value(&self.base.base.base, "cite")
+        }
+        #[setter(name = "cite", hint(js(ce_reactions)))]
+        fn set_cite(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("cite", &value.0)
+        }
+        #[getter(name = "dateTime")]
+        fn date_time(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("datetime")?.unwrap_or_default())
+        }
+        #[setter(name = "dateTime", coerce, hint(js(ce_reactions)))]
+        fn set_date_time(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("datetime", value)
+        }
+    };
+    DomHtmlDirectoryElement, "HTMLDirectoryElement" => ["dir"] {
+        #[getter]
+        fn compact(&self) -> OpResult<bool> { Ok(self.base.base.base.get_null_attribute("compact")?.is_some()) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_compact(&self, value: bool) -> OpResult<()> { self.base.base.base.set_nullable_attribute_core("compact", value.then_some("")) }
+    };
+    DomHtmlDListElement, "HTMLDListElement" => ["dl"] {
+        #[getter(name="compact")]
+        fn compact(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("compact")?.is_some())}
+        #[setter(name="compact",coerce,hint(js(ce_reactions)))]
+        fn set_compact(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("compact",value.then_some(""))}
+    };
     DomHtmlEmbedElement, "HTMLEmbedElement" => ["embed"] {
         #[getter]
         fn src(&self) -> OpResult<String> {
@@ -443,6 +483,10 @@ define_plain_html_interfaces! {
         }
     };
     DomHtmlFieldSetElement, "HTMLFieldSetElement" => ["fieldset"] {
+            #[getter(name = "name")]
+            fn name(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("name")?.unwrap_or_default()) }
+            #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+            fn set_name(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("name", value) }
         #[getter(name = "type")]
         fn fieldset_type(&self) -> String {
             "fieldset".into()
@@ -479,11 +523,112 @@ define_plain_html_interfaces! {
             value
         }
     };
-    DomHtmlFontElement, "HTMLFontElement" => ["font"];
-    DomHtmlFrameElement, "HTMLFrameElement" => ["frame"];
-    DomHtmlFrameSetElement, "HTMLFrameSetElement" => ["frameset"] [window_handlers];
-    DomHtmlHeadingElement, "HTMLHeadingElement" => ["h1", "h2", "h3", "h4", "h5", "h6"];
-    DomHtmlHrElement, "HTMLHRElement" => ["hr"];
+    DomHtmlFontElement, "HTMLFontElement" => ["font"] {
+        #[getter(name = "face")]
+        fn face(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("face")?.unwrap_or_default())
+        }
+        #[setter(name = "face", coerce, hint(js(ce_reactions)))]
+        fn set_face(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("face", value)
+        }
+        #[getter(name = "size")]
+        fn size(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("size")?.unwrap_or_default())
+        }
+        #[setter(name = "size", coerce, hint(js(ce_reactions)))]
+        fn set_size(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("size", value)
+        }
+        #[getter]
+        fn color(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("color")?.unwrap_or_default()) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_color(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { self.base.base.base.set_attribute_core("color", value.0) }
+    };
+    DomHtmlFrameElement, "HTMLFrameElement" => ["frame"] {
+            #[getter(name = "name")]
+            fn name(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("name")?.unwrap_or_default()) }
+            #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+            fn set_name(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("name", value) }
+            #[getter(name = "scrolling")]
+            fn scrolling(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("scrolling")?.unwrap_or_default()) }
+            #[setter(name = "scrolling", coerce, hint(js(ce_reactions)))]
+            fn set_scrolling(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("scrolling", value) }
+            #[getter(name = "src")]
+            fn src(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "src") }
+            #[setter(name = "src", hint(js(ce_reactions)))]
+            fn set_src(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("src", &value.0) }
+            #[getter(name = "frameBorder")]
+            fn frame_border(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("frameborder")?.unwrap_or_default()) }
+            #[setter(name = "frameBorder", coerce, hint(js(ce_reactions)))]
+            fn set_frame_border(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("frameborder", value) }
+            #[getter(name = "longDesc")]
+            fn long_desc(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "longdesc") }
+            #[setter(name = "longDesc", hint(js(ce_reactions)))]
+            fn set_long_desc(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("longdesc", &value.0) }
+            #[getter(name = "noResize")]
+            fn no_resize(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("noresize")?.is_some()) }
+            #[setter(name = "noResize", coerce, hint(js(ce_reactions)))]
+            fn set_no_resize(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("noresize", value.then_some("")) }
+            #[getter(name = "marginHeight")]
+            fn margin_height(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("marginheight")?.unwrap_or_default()) }
+            #[setter(name = "marginHeight", coerce, hint(js(ce_reactions)))]
+            fn set_margin_height(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("marginheight", value.0) }
+            #[getter(name = "marginWidth")]
+            fn margin_width(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("marginwidth")?.unwrap_or_default()) }
+            #[setter(name = "marginWidth", coerce, hint(js(ce_reactions)))]
+            fn set_margin_width(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("marginwidth", value.0) }
+    };
+    DomHtmlFrameSetElement, "HTMLFrameSetElement" => ["frameset"] [window_handlers] {
+        #[getter(name = "cols")]
+        fn cols(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("cols")?.unwrap_or_default())
+        }
+        #[setter(name = "cols", coerce, hint(js(ce_reactions)))]
+        fn set_cols(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("cols", value)
+        }
+        #[getter(name = "rows")]
+        fn rows(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("rows")?.unwrap_or_default())
+        }
+        #[setter(name = "rows", coerce, hint(js(ce_reactions)))]
+        fn set_rows(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("rows", value)
+        }
+    };
+    DomHtmlHeadingElement, "HTMLHeadingElement" => ["h1", "h2", "h3", "h4", "h5", "h6"] {
+        #[getter(name = "align")]
+        fn align(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("align")?.unwrap_or_default())
+        }
+        #[setter(name = "align", coerce, hint(js(ce_reactions)))]
+        fn set_align(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("align", value)
+        }
+    };
+    DomHtmlHrElement, "HTMLHRElement" => ["hr"] {
+        #[getter(name="align")]
+        fn align(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("align")?.unwrap_or_default())}
+        #[setter(name="align",coerce,hint(js(ce_reactions)))]
+        fn set_align(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("align",value)}
+        #[getter(name="color")]
+        fn color(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("color")?.unwrap_or_default())}
+        #[setter(name="color",coerce,hint(js(ce_reactions)))]
+        fn set_color(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("color",value)}
+        #[getter(name="noShade")]
+        fn no_shade(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("noshade")?.is_some())}
+        #[setter(name="noShade",coerce,hint(js(ce_reactions)))]
+        fn set_no_shade(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("noshade",value.then_some(""))}
+        #[getter(name="size")]
+        fn size(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("size")?.unwrap_or_default())}
+        #[setter(name="size",coerce,hint(js(ce_reactions)))]
+        fn set_size(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("size",value)}
+        #[getter(name="width")]
+        fn width(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("width")?.unwrap_or_default())}
+        #[setter(name="width",coerce,hint(js(ce_reactions)))]
+        fn set_width(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("width",value)}
+    };
     DomHtmlLabelElement, "HTMLLabelElement" => ["label"] {
         #[getter(name = "htmlFor")]
         fn html_for(&self) -> OpResult<String> {
@@ -548,9 +693,92 @@ define_plain_html_interfaces! {
             }))
         }
     };
-    DomHtmlLiElement, "HTMLLIElement" => ["li"];
-    DomHtmlMapElement, "HTMLMapElement" => ["map"];
+    DomHtmlLiElement, "HTMLLIElement" => ["li"] {
+        #[getter(name="value")]
+        fn value(&self)->OpResult<i32> {Ok(self.base.base.base.get_null_attribute("value")?.as_deref().and_then(lumen_common::html_numbers::parse_integer_i32).unwrap_or(0))}
+        #[setter(name="value",coerce,hint(js(ce_reactions)))]
+        fn set_value(&self,value:i32)->OpResult<()> {self.base.base.base.set_attribute_core("value",&value.to_string())}
+        #[getter(name="type")]
+        fn type_(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())}
+        #[setter(name="type",coerce,hint(js(ce_reactions)))]
+        fn set_type_(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("type",value)}
+    };
+    DomHtmlMenuElement, "HTMLMenuElement" => ["menu"] {
+        #[getter]
+        fn compact(&self) -> OpResult<bool> { Ok(self.base.base.base.get_null_attribute("compact")?.is_some()) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_compact(&self, value: bool) -> OpResult<()> { self.base.base.base.set_nullable_attribute_core("compact", value.then_some("")) }
+    };
+    DomHtmlMapElement, "HTMLMapElement" => ["map"] {
+        #[getter(name = "name")]
+        fn name(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("name")?.unwrap_or_default())
+        }
+        #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+        fn set_name(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("name", value)
+        }
+        #[getter]
+        fn areas(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+            self.base.base.base.descendant_collection(ctx, this.0, "areas".into(), super::DescendantFilter::TagNs(Some("http://www.w3.org/1999/xhtml".into()), "area".into()))
+        }
+    };
+    DomHtmlMarqueeElement, "HTMLMarqueeElement" => ["marquee"] {
+        #[getter(name="behavior")]
+        fn behavior(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("behavior")?.unwrap_or_default())}
+        #[setter(name="behavior",coerce,hint(js(ce_reactions)))]
+        fn set_behavior(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("behavior",value)}
+        #[getter(name="bgColor")]
+        fn bg_color(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("bgcolor")?.unwrap_or_default())}
+        #[setter(name="bgColor",coerce,hint(js(ce_reactions)))]
+        fn set_bg_color(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("bgcolor",value)}
+        #[getter(name="direction")]
+        fn direction(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("direction")?.unwrap_or_default())}
+        #[setter(name="direction",coerce,hint(js(ce_reactions)))]
+        fn set_direction(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("direction",value)}
+        #[getter(name="height")]
+        fn height(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("height")?.unwrap_or_default())}
+        #[setter(name="height",coerce,hint(js(ce_reactions)))]
+        fn set_height(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("height",value)}
+        #[getter(name="width")]
+        fn width(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("width")?.unwrap_or_default())}
+        #[setter(name="width",coerce,hint(js(ce_reactions)))]
+        fn set_width(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("width",value)}
+        #[getter(name="hspace")]
+        fn hspace(&self)->OpResult<u32> {Ok(lumen_html::forms::reflected_unsigned_long(self.base.base.base.get_null_attribute("hspace")?.as_deref(),0))}
+        #[setter(name="hspace",coerce,hint(js(ce_reactions)))]
+        fn set_hspace(&self,value:u32)->OpResult<()> {self.base.base.base.set_attribute_core("hspace",&lumen_html::forms::reflected_unsigned_long_setter_value(value,0).to_string())}
+        #[getter(name="vspace")]
+        fn vspace(&self)->OpResult<u32> {Ok(lumen_html::forms::reflected_unsigned_long(self.base.base.base.get_null_attribute("vspace")?.as_deref(),0))}
+        #[setter(name="vspace",coerce,hint(js(ce_reactions)))]
+        fn set_vspace(&self,value:u32)->OpResult<()> {self.base.base.base.set_attribute_core("vspace",&lumen_html::forms::reflected_unsigned_long_setter_value(value,0).to_string())}
+        #[getter(name="scrollAmount")]
+        fn scroll_amount(&self)->OpResult<u32> {Ok(lumen_html::forms::reflected_unsigned_long(self.base.base.base.get_null_attribute("scrollamount")?.as_deref(),6))}
+        #[setter(name="scrollAmount",coerce,hint(js(ce_reactions)))]
+        fn set_scroll_amount(&self,value:u32)->OpResult<()> {self.base.base.base.set_attribute_core("scrollamount",&lumen_html::forms::reflected_unsigned_long_setter_value(value,6).to_string())}
+        #[getter(name="scrollDelay")]
+        fn scroll_delay(&self)->OpResult<u32> {Ok(lumen_html::forms::reflected_unsigned_long(self.base.base.base.get_null_attribute("scrolldelay")?.as_deref(),85))}
+        #[setter(name="scrollDelay",coerce,hint(js(ce_reactions)))]
+        fn set_scroll_delay(&self,value:u32)->OpResult<()> {self.base.base.base.set_attribute_core("scrolldelay",&lumen_html::forms::reflected_unsigned_long_setter_value(value,85).to_string())}
+        #[getter(name="trueSpeed")]
+        fn true_speed(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("truespeed")?.is_some())}
+        #[setter(name="trueSpeed",coerce,hint(js(ce_reactions)))]
+        fn set_true_speed(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("truespeed",value.then_some(""))}
+        #[getter(name="loop")]
+        fn loop_(&self)->OpResult<i32> {Ok(self.base.base.base.get_null_attribute("loop")?.as_deref().and_then(lumen_common::html_numbers::parse_integer_i32).filter(|value|*value>0).unwrap_or(-1))}
+        #[setter(name="loop",coerce,hint(js(ce_reactions)))]
+        fn set_loop(&self,value:i32)->OpResult<()> {
+            if (value>0 || value == -1) && value != self.loop_()? {self.base.base.base.set_attribute_core("loop",&value.to_string())?;}
+            Ok(())
+        }
+    };
     DomHtmlMetaElement, "HTMLMetaElement" => ["meta"] {
+        #[getter]
+        fn media(&self)->OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("media")?.unwrap_or_default())
+        }
+        #[setter(coerce,hint(js(ce_reactions)))]
+        fn set_media(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("media",value)}
         #[getter]
         fn name(&self) -> OpResult<String> {
             Ok(self.base.base.base.get_null_attribute("name")?.unwrap_or_default())
@@ -578,6 +806,30 @@ define_plain_html_interfaces! {
     };
     DomHtmlMeterElement, "HTMLMeterElement" => ["meter"] {
         #[getter]
+        fn value(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.value) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_value(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "value", value, false) }
+        #[getter]
+        fn min(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.minimum) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_min(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "min", value, false) }
+        #[getter]
+        fn max(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.maximum) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_max(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "max", value, false) }
+        #[getter]
+        fn low(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.low) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_low(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "low", value, false) }
+        #[getter]
+        fn high(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.high) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_high(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "high", value, false) }
+        #[getter]
+        fn optimum(&self) -> OpResult<f64> { Ok(meter_state(&self.base.base.base)?.optimum) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_optimum(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "optimum", value, false) }
+        #[getter]
         fn labels(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
             let node = &self.base.base.base;
             super::labels::control_labels(
@@ -590,6 +842,50 @@ define_plain_html_interfaces! {
         }
     };
     DomHtmlObjectElement, "HTMLObjectElement" => ["object"] {
+            #[getter(name = "align")]
+            fn align(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("align")?.unwrap_or_default()) }
+            #[setter(name = "align", coerce, hint(js(ce_reactions)))]
+            fn set_align(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("align", value) }
+            #[getter(name = "archive")]
+            fn archive(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("archive")?.unwrap_or_default()) }
+            #[setter(name = "archive", coerce, hint(js(ce_reactions)))]
+            fn set_archive(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("archive", value) }
+            #[getter(name = "code")]
+            fn code(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("code")?.unwrap_or_default()) }
+            #[setter(name = "code", coerce, hint(js(ce_reactions)))]
+            fn set_code(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("code", value) }
+            #[getter(name = "declare")]
+            fn declare(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("declare")?.is_some()) }
+            #[setter(name = "declare", coerce, hint(js(ce_reactions)))]
+            fn set_declare(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("declare", value.then_some("")) }
+            #[getter(name = "hspace")]
+            fn hspace(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((&self.base.base.base).get_null_attribute("hspace")?.as_deref(), 0)) }
+            #[setter(name = "hspace", coerce, hint(js(ce_reactions)))]
+            fn set_hspace(&self, value: u32) -> OpResult<()> { (&self.base.base.base).set_attribute_core("hspace", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "vspace")]
+            fn vspace(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((&self.base.base.base).get_null_attribute("vspace")?.as_deref(), 0)) }
+            #[setter(name = "vspace", coerce, hint(js(ce_reactions)))]
+            fn set_vspace(&self, value: u32) -> OpResult<()> { (&self.base.base.base).set_attribute_core("vspace", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "standby")]
+            fn standby(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("standby")?.unwrap_or_default()) }
+            #[setter(name = "standby", coerce, hint(js(ce_reactions)))]
+            fn set_standby(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("standby", value) }
+            #[getter(name = "codeType")]
+            fn code_type(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("codetype")?.unwrap_or_default()) }
+            #[setter(name = "codeType", coerce, hint(js(ce_reactions)))]
+            fn set_code_type(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("codetype", value) }
+            #[getter(name = "useMap")]
+            fn use_map(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("usemap")?.unwrap_or_default()) }
+            #[setter(name = "useMap", coerce, hint(js(ce_reactions)))]
+            fn set_use_map(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("usemap", value) }
+            #[getter(name = "border")]
+            fn border(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("border")?.unwrap_or_default()) }
+            #[setter(name = "border", coerce, hint(js(ce_reactions)))]
+            fn set_border(&self, value: lumen_host::webidl::LegacyNullToEmptyString<'_>) -> OpResult<()> { (&self.base.base.base).set_attribute_core("border", value.0) }
+            #[getter(name = "codeBase")]
+            fn code_base(&self) -> OpResult<String> { crate::html_interfaces::reflected_url_value(&self.base.base.base, "codebase") }
+            #[setter(name = "codeBase", coerce, hint(js(ce_reactions)))]
+            fn set_code_base(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("codebase", value) }
         #[getter]
         fn form(&self, ctx: &mut Ctx) -> Value {
             let node = &self.base.base.base;
@@ -646,12 +942,87 @@ define_plain_html_interfaces! {
             super::object_loading::content_document(ctx, &node.realm, node.id, true)
         }
     };
-    DomHtmlOListElement, "HTMLOListElement" => ["ol"];
-    DomHtmlOptGroupElement, "HTMLOptGroupElement" => ["optgroup"];
-    DomHtmlParagraphElement, "HTMLParagraphElement" => ["p"];
-    DomHtmlParamElement, "HTMLParamElement" => ["param"];
-    DomHtmlPreElement, "HTMLPreElement" => ["listing", "pre", "xmp"];
+    DomHtmlOListElement, "HTMLOListElement" => ["ol"] {
+        #[getter(name="reversed")]
+        fn reversed(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("reversed")?.is_some())}
+        #[setter(name="reversed",coerce,hint(js(ce_reactions)))]
+        fn set_reversed(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("reversed",value.then_some(""))}
+        #[getter(name="start")]
+        fn start(&self)->OpResult<i32> {Ok(self.base.base.base.get_null_attribute("start")?.as_deref().and_then(lumen_common::html_numbers::parse_integer_i32).unwrap_or(1))}
+        #[setter(name="start",coerce,hint(js(ce_reactions)))]
+        fn set_start(&self,value:i32)->OpResult<()> {self.base.base.base.set_attribute_core("start",&value.to_string())}
+        #[getter(name="type")]
+        fn type_(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())}
+        #[setter(name="type",coerce,hint(js(ce_reactions)))]
+        fn set_type_(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("type",value)}
+        #[getter(name="compact")]
+        fn compact(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("compact")?.is_some())}
+        #[setter(name="compact",coerce,hint(js(ce_reactions)))]
+        fn set_compact(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("compact",value.then_some(""))}
+    };
+    DomHtmlOptGroupElement, "HTMLOptGroupElement" => ["optgroup"] {
+            #[getter(name = "label")]
+            fn label(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("label")?.unwrap_or_default()) }
+            #[setter(name = "label", coerce, hint(js(ce_reactions)))]
+            fn set_label(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("label", value) }
+    };
+    DomHtmlParagraphElement, "HTMLParagraphElement" => ["p"] {
+        #[getter(name="align")]
+        fn align(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("align")?.unwrap_or_default())}
+        #[setter(name="align",coerce,hint(js(ce_reactions)))]
+        fn set_align(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("align",value)}
+    };
+    DomHtmlParamElement, "HTMLParamElement" => ["param"] {
+        #[getter(name = "name")]
+        fn name(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("name")?.unwrap_or_default())
+        }
+        #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+        fn set_name(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("name", value)
+        }
+        #[getter(name = "value")]
+        fn value(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("value")?.unwrap_or_default())
+        }
+        #[setter(name = "value", coerce, hint(js(ce_reactions)))]
+        fn set_value(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("value", value)
+        }
+        #[getter(name = "type")]
+        fn kind(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())
+        }
+        #[setter(name = "type", coerce, hint(js(ce_reactions)))]
+        fn set_kind(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("type", value)
+        }
+        #[getter(name = "valueType")]
+        fn value_type(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("valuetype")?.unwrap_or_default())
+        }
+        #[setter(name = "valueType", coerce, hint(js(ce_reactions)))]
+        fn set_value_type(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("valuetype", value)
+        }
+    };
+    DomHtmlPreElement, "HTMLPreElement" => ["listing", "pre", "xmp"] {
+        #[getter(name="width")]
+        fn width(&self)->OpResult<i32> {Ok(self.base.base.base.get_null_attribute("width")?.as_deref().and_then(lumen_common::html_numbers::parse_integer_i32).unwrap_or(0))}
+        #[setter(name="width",coerce,hint(js(ce_reactions)))]
+        fn set_width(&self,value:i32)->OpResult<()> {self.base.base.base.set_attribute_core("width",&value.to_string())}
+    };
     DomHtmlProgressElement, "HTMLProgressElement" => ["progress"] {
+        #[getter]
+        fn value(&self) -> OpResult<f64> { Ok(progress_state(&self.base.base.base)?.value) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_value(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "value", value, false) }
+        #[getter]
+        fn max(&self) -> OpResult<f64> { Ok(progress_state(&self.base.base.base)?.maximum) }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_max(&self, ctx: &mut Ctx, value: f64) -> OpResult<()> { set_reflected_double(&self.base.base.base, ctx, "max", value, true) }
+        #[getter]
+        fn position(&self) -> OpResult<f64> { Ok(progress_state(&self.base.base.base)?.position) }
         #[getter]
         fn labels(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
             let node = &self.base.base.base;
@@ -664,12 +1035,173 @@ define_plain_html_interfaces! {
             )
         }
     };
-    DomHtmlQuoteElement, "HTMLQuoteElement" => ["blockquote", "q"];
-    DomHtmlSourceElement, "HTMLSourceElement" => ["source"];
+    DomHtmlQuoteElement, "HTMLQuoteElement" => ["blockquote", "q"] {
+        #[getter(name="cite")]
+        fn cite(&self)->OpResult<String> {reflected_usv_url_value(&self.base.base.base,"cite")}
+        #[setter(name="cite",hint(js(ce_reactions)))]
+        fn set_cite(&self,value:lumen_host::webidl::Usv)->OpResult<()> {self.base.base.base.set_attribute_core("cite",&value.0)}
+    };
+    DomHtmlSourceElement, "HTMLSourceElement" => ["source"] {
+        #[getter(name = "src")]
+        fn src(&self) -> OpResult<String> {
+            reflected_usv_url_value(&self.base.base.base, "src")
+        }
+        #[setter(name = "src", hint(js(ce_reactions)))]
+        fn set_src(&self, value: lumen_host::webidl::Usv) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("src", &value.0)
+        }
+        #[getter(name = "type")]
+        fn kind(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())
+        }
+        #[setter(name = "type", coerce, hint(js(ce_reactions)))]
+        fn set_kind(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("type", value)
+        }
+        #[getter(name = "sizes")]
+        fn sizes(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("sizes")?.unwrap_or_default())
+        }
+        #[setter(name = "sizes", coerce, hint(js(ce_reactions)))]
+        fn set_sizes(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("sizes", value)
+        }
+        #[getter(name = "media")]
+        fn media(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("media")?.unwrap_or_default())
+        }
+        #[setter(name = "media", coerce, hint(js(ce_reactions)))]
+        fn set_media(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("media", value)
+        }
+        #[getter]
+        fn srcset(&self) -> OpResult<String> { reflected_usv_value(&self.base.base.base, "srcset") }
+        #[setter(hint(js(ce_reactions)))]
+        fn set_srcset(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { self.base.base.base.set_attribute_core("srcset", &value.0) }
+        #[getter]
+        fn width(&self) -> OpResult<u32> {
+            let value = self.base.base.base.get_null_attribute("width")?;
+            Ok(lumen_html::forms::reflected_unsigned_long(value.as_deref(), 0))
+        }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_width(&self, value: u32) -> OpResult<()> {
+            let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, 0);
+            self.base.base.base.set_attribute_core("width", &value.to_string())
+        }
+        #[getter]
+        fn height(&self) -> OpResult<u32> {
+            let value = self.base.base.base.get_null_attribute("height")?;
+            Ok(lumen_html::forms::reflected_unsigned_long(value.as_deref(), 0))
+        }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_height(&self, value: u32) -> OpResult<()> {
+            let value = lumen_html::forms::reflected_unsigned_long_setter_value(value, 0);
+            self.base.base.base.set_attribute_core("height", &value.to_string())
+        }
+    };
     DomHtmlSpanElement, "HTMLSpanElement" => ["span"];
-    DomHtmlTimeElement, "HTMLTimeElement" => ["time"];
-    DomHtmlTrackElement, "HTMLTrackElement" => ["track"];
-    DomHtmlUListElement, "HTMLUListElement" => ["ul"];
+    DomHtmlTimeElement, "HTMLTimeElement" => ["time"] {
+        #[getter(name = "dateTime")]
+        fn date_time(&self) -> OpResult<String> {
+            Ok(self.base.base.base.get_null_attribute("datetime")?.unwrap_or_default())
+        }
+        #[setter(name = "dateTime", coerce, hint(js(ce_reactions)))]
+        fn set_date_time(&self, value: &str) -> OpResult<()> {
+            self.base.base.base.set_attribute_core("datetime", value)
+        }
+    };
+    DomHtmlTrackElement, "HTMLTrackElement" => ["track"] {
+            #[getter(name = "src")]
+            fn src(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(&self.base.base.base, "src") }
+            #[setter(name = "src", hint(js(ce_reactions)))]
+            fn set_src(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("src", &value.0) }
+            #[getter(name = "srclang")]
+            fn srclang(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("srclang")?.unwrap_or_default()) }
+            #[setter(name = "srclang", coerce, hint(js(ce_reactions)))]
+            fn set_srclang(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("srclang", value) }
+            #[getter(name = "label")]
+            fn label(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("label")?.unwrap_or_default()) }
+            #[setter(name = "label", coerce, hint(js(ce_reactions)))]
+            fn set_label(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("label", value) }
+            #[getter(name = "default")]
+            fn default_(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("default")?.is_some()) }
+            #[setter(name = "default", coerce, hint(js(ce_reactions)))]
+            fn set_default_(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("default", value.then_some("")) }
+        #[getter]
+        fn kind(&self) -> OpResult<String> {
+            reflected_keyword(&self.base.base.base, "kind", &["subtitles","captions","descriptions","chapters","metadata"], "subtitles", "metadata")
+        }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_kind(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("kind", value) }
+    };
+    DomHtmlUListElement, "HTMLUListElement" => ["ul"] {
+        #[getter(name="compact")]
+        fn compact(&self)->OpResult<bool> {Ok(self.base.base.base.get_null_attribute("compact")?.is_some())}
+        #[setter(name="compact",coerce,hint(js(ce_reactions)))]
+        fn set_compact(&self,value:bool)->OpResult<()> {self.base.base.base.set_nullable_attribute_core("compact",value.then_some(""))}
+        #[getter(name="type")]
+        fn type_(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())}
+        #[setter(name="type",coerce,hint(js(ce_reactions)))]
+        fn set_type_(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("type",value)}
+    };
+}
+
+/// HTML reflected URL attributes resolve against the adopted owner's base.
+fn progress_state(node: &DomNode) -> OpResult<lumen_html::forms::ProgressState> {
+    let (owner, id) = node.realm.resolve_adopted_node(node.id);
+    let session = owner.session.borrow();
+    lumen_html::forms::progress_state(session.document(), id)
+        .ok_or_else(|| OpError::type_error("Expected an HTML progress element"))
+}
+
+fn meter_state(node: &DomNode) -> OpResult<lumen_html::forms::MeterState> {
+    let (owner, id) = node.realm.resolve_adopted_node(node.id);
+    let session = owner.session.borrow();
+    lumen_html::forms::meter_state(session.document(), id)
+        .ok_or_else(|| OpError::type_error("Expected an HTML meter element"))
+}
+
+fn set_reflected_double(node: &DomNode, ctx: &mut Ctx, attribute: &str, value: f64, positive: bool) -> OpResult<()> {
+    // WebIDL double conversion rejects nonfinite numbers before either the
+    // positive-only no-op or the ordinary mutation/CE reaction authority.
+    if !value.is_finite() { return Err(OpError::type_error("Expected a finite double")); }
+    if positive && value <= 0.0 { return Ok(()); }
+    let serialized = ctx.coerce_string(&Value::Num(value))?;
+    node.set_attribute_core(attribute, &serialized)
+}
+
+pub(super) fn reflected_cors(node: &DomNode) -> OpResult<lumen::embed::Nullable<String>> {
+    Ok(lumen::embed::Nullable(node.get_null_attribute("crossorigin")?.map(|value|
+        if value.eq_ignore_ascii_case("use-credentials") { "use-credentials".into() } else { "anonymous".into() })))
+}
+
+pub(super) fn reflected_keyword(node: &DomNode, attribute: &str, keywords: &[&str], missing: &str, invalid: &str) -> OpResult<String> {
+    let value = node.get_null_attribute(attribute)?;
+    Ok(match value {
+        None => missing,
+        Some(ref value) => keywords.iter().copied().find(|keyword| value.eq_ignore_ascii_case(keyword)).unwrap_or(invalid),
+    }.into())
+}
+
+pub(super) fn reflected_url_value(node:&DomNode,attribute:&str)->OpResult<String> {
+    let Some(value)=node.get_null_attribute(attribute)? else{return Ok(String::new());};
+    let (owner,_)=node.realm.resolve_adopted_node(node.id);
+    Ok(lumen_common::url::parse(&value,Some(&owner.base_url())).map(|url|url.href()).unwrap_or(value))
+}
+
+pub(super) fn reflected_usv_value(node:&DomNode,attribute:&str)->OpResult<String> {
+    let value=node.get_null_attribute(attribute)?.unwrap_or_default();
+    match lumen::well_formed_utf8(&value) {
+        std::borrow::Cow::Borrowed(_)=>Ok(value),
+        std::borrow::Cow::Owned(value)=>Ok(value),
+    }
+}
+
+pub(super) fn reflected_usv_url_value(node:&DomNode,attribute:&str)->OpResult<String> {
+    let Some(value)=node.get_null_attribute(attribute)? else{return Ok(String::new());};
+    let value=lumen::well_formed_utf8(&value);
+    let (owner,_)=node.realm.resolve_adopted_node(node.id);
+    Ok(lumen_common::url::parse(&value,Some(&owner.base_url())).map(|url|url.href()).unwrap_or_else(|_|value.into_owned()))
 }
 
 pub(crate) fn form_action_value(node: &DomNode) -> OpResult<String> {
@@ -677,32 +1209,32 @@ pub(crate) fn form_action_value(node: &DomNode) -> OpResult<String> {
 }
 
 pub(crate) fn action_attribute_value(node: &DomNode, attribute: &str) -> OpResult<String> {
+    let (owner, _) = node.realm.resolve_adopted_node(node.id);
     let Some(action) = node.get_null_attribute(attribute)? else {
-        return Ok(node
-            .realm
+        return Ok(owner
             .document_url()
             .unwrap_or_else(|| "about:blank".into()));
     };
     if action.is_empty() {
-        return Ok(node
-            .realm
+        return Ok(owner
             .document_url()
             .unwrap_or_else(|| "about:blank".into()));
     }
-    let base = node.realm.base_url();
+    let action = lumen::well_formed_utf8(&action);
+    let base = owner.base_url();
     Ok(lumen_common::url::parse(&action, Some(&base))
         .map(|url| url.href())
-        .unwrap_or(action))
+        .unwrap_or_else(|_| action.into_owned()))
 }
 
 pub(crate) fn form_method_value(node: &DomNode) -> OpResult<String> {
-    let value = node.get_null_attribute("formmethod")?.unwrap_or_default();
-    Ok(lumen_html::forms::normalized_form_method(&value).into())
+    Ok(node.get_null_attribute("formmethod")?
+        .map_or_else(String::new, |value| lumen_html::forms::normalized_form_method(&value).into()))
 }
 
 pub(crate) fn form_enctype_value(node: &DomNode) -> OpResult<String> {
-    let value = node.get_null_attribute("formenctype")?.unwrap_or_default();
-    Ok(lumen_html::forms::normalized_form_enctype(&value).into())
+    Ok(node.get_null_attribute("formenctype")?
+        .map_or_else(String::new, |value| lumen_html::forms::normalized_form_enctype(&value).into()))
 }
 
 #[lumen_bind::class(

@@ -169,8 +169,23 @@ fn soft_dotted(c:char) -> bool {
     let cp=c as u32;let index=ranges.partition_point(|&(_,last)|last<cp);
     ranges.get(index).is_some_and(|&(first,_)|first<=cp)
 }
-fn language_is(language:Option<&str>, expected:&str) -> bool {
-    language.and_then(|value| value.split('-').next()).is_some_and(|value| value.eq_ignore_ascii_case(expected))
+fn language_is(language:Option<&str>, expected:&str, script:&str) -> bool {
+    let Some(language)=language else{return false;};
+    let mut subtags=language.split('-');
+    let Some(primary)=subtags.next() else{return false;};
+    if !primary.eq_ignore_ascii_case(expected){return false;}
+    let mut next=subtags.next();
+    // BCP47 places the script after up to three extlang subtags, before
+    // regions, variants and extensions. A private-use string is not a script.
+    if primary.len()<=3 {
+        for _ in 0..3 {
+            if next.is_some_and(|value|value.len()==3 && value.bytes().all(|byte|byte.is_ascii_alphabetic())) {
+                next=subtags.next();
+            } else {break;}
+        }
+    }
+    next.filter(|value|value.len()==4 && value.bytes().all(|byte|byte.is_ascii_alphabetic()))
+        .is_none_or(|value|value.eq_ignore_ascii_case(script))
 }
 fn final_sigma(text:&str, at:usize, end:usize) -> bool {
     text[..at].chars().rev().find(|&c| !ignorable(c)).is_some_and(cased)
@@ -211,10 +226,10 @@ fn visit_case_range_with_context<E>(context:&mut CaseContext<'_>,range:Range<usi
         for (offset,c) in text[range.clone()].char_indices() {emit(c,range.start+offset..range.start+offset+c.len_utf8())?;}
         return Ok(());
     }
-    let turkic=language_is(language,"tr") || language_is(language,"az");
-    let lithuanian=language_is(language,"lt");
-    let dutch=mode==CaseTransform::Capitalize && language_is(language,"nl");
-    let greek=mode==CaseTransform::Uppercase && language_is(language,"el");
+    let turkic=language_is(language,"tr","Latn") || language_is(language,"az","Latn");
+    let lithuanian=language_is(language,"lt","Latn");
+    let dutch=mode==CaseTransform::Capitalize && language_is(language,"nl","Latn");
+    let greek=mode==CaseTransform::Uppercase && language_is(language,"el","Grek");
     let mut dutch_i=dutch && range.start>0 && matches!(text.as_bytes().get(range.start-1),Some(b'i'|b'I'))
         && context.initial(range.start-1);
     for (local,c) in text[range.clone()].char_indices() {
@@ -366,6 +381,13 @@ mod tests {
         assert_eq!(map("Maß ﬃ",CaseTransform::Uppercase,None),"MASS FFI");
         assert_eq!(map("ΟΣ ΟΣΑ ΟΣ'",CaseTransform::Lowercase,None),"ος οσα ος'");
         assert_eq!(map("I İ i ı I\u{307}",CaseTransform::Lowercase,Some("tr-Latn")),"ı i i ı i");
+        assert_eq!(map("IСТАНБУЛ",CaseTransform::Lowercase,Some("tr-Cyrl")),"iстанбул");
+        assert_eq!(map("I",CaseTransform::Lowercase,Some("TR-lAtN-TR")),"ı");
+        assert_eq!(map("I",CaseTransform::Lowercase,Some("tr-x-Cyrl")),"ı","private-use text does not override the writing system");
+        assert_eq!(map("i",CaseTransform::Uppercase,Some("az-Arab")),"I");
+        assert_eq!(map("I\u{301}",CaseTransform::Lowercase,Some("lt-Cyrl")),"i\u{301}");
+        assert_eq!(map("ijsland",CaseTransform::Capitalize,Some("nl-Arab")),"Ijsland");
+        assert_eq!(map("καλημέρα",CaseTransform::Uppercase,Some("el-Latn")),"ΚΑΛΗΜΈΡΑ");
         assert_eq!(map("i ı",CaseTransform::Uppercase,Some("az")),"İ I");
         assert_eq!(map("I\u{301} Í",CaseTransform::Lowercase,Some("lt")),"i\u{307}\u{301} i\u{307}\u{301}");
         assert_eq!(map("i\u{307}\u{301}",CaseTransform::Uppercase,Some("lt")),"I\u{301}");

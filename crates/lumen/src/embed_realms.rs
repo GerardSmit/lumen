@@ -916,6 +916,13 @@ impl Interp {
             })
     }
 
+    /// Test the host-created WindowProxy brand without accessing its target.
+    /// Web IDL interface-value conversion is independent of the origin policy
+    /// used when a Window member is accessed or a native method is invoked.
+    pub fn is_window_proxy_value(&self, value: &Value) -> bool {
+        value.as_obj().is_some_and(|object| self.is_window_proxy(object))
+    }
+
     /// Avoid call-site realm bookkeeping in embedders that have not created a WindowProxy.
     pub(crate) fn has_window_proxies(&self) -> bool {
         self.host_state

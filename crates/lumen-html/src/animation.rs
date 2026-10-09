@@ -1,5 +1,6 @@
 //! Shared Web Animations effect timing and CSS-value interpolation.
 pub mod transition_values;
+pub mod progress_timelines;
 
 use alloc::{borrow::ToOwned, boxed::Box, format, string::String, vec, vec::Vec};
 

@@ -6,6 +6,13 @@ use lumen_common::{csp::Violation, csp_report::{self, Context, Destinations}};
 pub(crate) struct DeliveryBudget { requests: usize, bytes: usize }
 const MAX_IN_FLIGHT: usize = 32;
 const MAX_IN_FLIGHT_BYTES: usize = 65_536;
+impl DeliveryBudget {
+    pub(crate) fn admit(&mut self,bytes:usize)->bool{
+        if self.requests>=MAX_IN_FLIGHT || self.bytes.saturating_add(bytes)>MAX_IN_FLIGHT_BYTES{return false;}
+        self.requests+=1;self.bytes+=bytes;true
+    }
+    pub(crate) fn release(&mut self,bytes:usize){self.requests=self.requests.saturating_sub(1);self.bytes=self.bytes.saturating_sub(bytes);}
+}
 
 pub(crate) fn deliver(realm: &Rc<DomRealm>, ctx: &mut Ctx, violation: &Violation,
     document_url: &str, referrer: &str, source_file: Option<&str>,status_code:u16,line_number:u32,column_number:u32) {
@@ -15,17 +22,7 @@ pub(crate) fn deliver(realm: &Rc<DomRealm>, ctx: &mut Ctx, violation: &Violation
         Ok(Destinations::Legacy(endpoints)) => endpoints,
         Ok(Destinations::Reporting(group)) => {
             let Ok(body)=lumen_common::reporting::CspBody::new(violation,&context)else{return};
-            if let Err(error)=realm.reporting.record(ctx,body.clone()){let exception=error.to_value(ctx);DomRealm::report_exception(ctx,exception);}
-            let endpoint=realm.reporting.endpoints.borrow().get(&group,realm.reporting.elapsed_ms()).map(|endpoint|endpoint.url.clone());
-            let Some(endpoint)=endpoint else{return};
-            let Ok(body)=lumen_common::reporting::csp_envelope(&body,&realm.reporting.user_agent.borrow(),0)else{return};
-            let bytes=body.len();
-            {let mut budget=realm.csp_report_budget.borrow_mut();if budget.requests>=MAX_IN_FLIGHT||budget.bytes.saturating_add(bytes)>MAX_IN_FLIGHT_BYTES{return}budget.requests+=1;budget.bytes+=bytes;}
-            let weak=Rc::downgrade(realm);
-            lumen_host::net::start_reporting_report(ctx,document_url,&endpoint.clone(),body,move|ctx,response|{
-                let gone=if let Ok(response)=response{let gone=response.status==410;response.body.cancel(ctx);gone}else{false};
-                if let Some(realm)=weak.upgrade(){if gone{realm.reporting.endpoints.borrow_mut().remove(&group,&endpoint);}let mut budget=realm.csp_report_budget.borrow_mut();budget.requests=budget.requests.saturating_sub(1);budget.bytes=budget.bytes.saturating_sub(bytes);}
-            });
+            super::reporting::deliver(realm,ctx,lumen_common::reporting::ReportBody::Csp(body),Some(&group));
             return;
         },
         Err(_) => return,

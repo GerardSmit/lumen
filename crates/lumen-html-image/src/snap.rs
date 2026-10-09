@@ -22,6 +22,10 @@ pub(crate) fn boxes(list: &mut DisplayList, scale: f32) {
             Command::PushBoxClip(rect) | Command::FillRect { rect, .. } | Command::FillRoundedRect { rect, .. }
                 | Command::Image { rect, .. } | Command::ReservedImage { rect, .. }
                 if transforms == 0 => rectangle(rect, scale),
+            // A CSS layer result uses the same box contour as its ordinary
+            // background and border. SVG source/path clipping retains user
+            // coordinates; a transformed layer retains its fractional contour.
+            Command::PushLayer{rect,clip:true,svg_clip:None,..} if transforms==0=>rectangle(rect,scale),
             Command::FillBackground(fill) if transforms == 0 => {
                 let origin = (fill.positioning_rect.x, fill.positioning_rect.y);
                 rectangle(&mut fill.rect, scale);
@@ -58,6 +62,57 @@ mod tests {
     use lumen_html::paint::{Affine, Rgba};
     // /html/rendering/non-replaced-elements/the-fieldset-and-legend-elements/absolute-fixed-in-legend.html
     // /html/rendering/non-replaced-elements/the-fieldset-and-legend-elements/fieldset-baseline.html
+    #[test]
+    fn specification_css_layer_clips_share_snapped_boxes_and_preserve_source_modes() {
+        use std::sync::Arc;
+        use crate::{GlyphCache,RasterizationMode};
+        use lumen_html::paint::{SvgClip,SvgLayerClip,SvgGradientUnits};
+        let font=crate::default_font().unwrap();let green=Rgba{r:0,g:128,b:0,a:255};
+        let canvas=Command::FillRect{rect:Rect{x:0.0,y:0.0,width:32.0,height:32.0},color:Rgba{r:255,g:255,b:255,a:255}};
+        for scale in [1.0,1.25,2.0] {for phase in [-0.375,0.125,0.875] {for opacity in [0.25,0.75,1.0] {
+            let rect=Rect{x:4.0+phase,y:6.0+phase,width:16.0,height:12.0};
+            let layer=Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:true,svg_clip:None,filters:None};
+            let source=DisplayList(vec![canvas.clone(),layer.clone(),Command::FillRect{rect:Rect{x:0.0,y:0.0,width:32.0,height:32.0},color:green},Command::PopLayer]);
+            let reference=DisplayList(vec![canvas.clone(),Command::FillRect{rect,color:Rgba{a:(255.0*opacity).round()as u8,..green}}]);
+            let draw=|list:&DisplayList,mode|crate::render_with_mode_cached(list,32,32,scale,mode,font,&mut GlyphCache::default()).unwrap();
+            assert_eq!(draw(&source,RasterizationMode::CssPixelSnapped),draw(&reference,RasterizationMode::CssPixelSnapped),"CSS result clipping and ordinary boxes share their device contour and opacity");
+            assert_ne!(draw(&source,RasterizationMode::Antialiased),draw(&source,RasterizationMode::CssPixelSnapped),"unsnapped antialiased coverage remains an independent supported mode");
+            let transformed=DisplayList(vec![canvas.clone(),Command::PushTransform(Affine::IDENTITY),layer.clone(),Command::FillRect{rect:Rect{x:0.0,y:0.0,width:32.0,height:32.0},color:green},Command::PopLayer,Command::PopTransform]);
+            assert_eq!(draw(&transformed,RasterizationMode::CssPixelSnapped),draw(&transformed,RasterizationMode::Antialiased),"transform scopes preserve fractional source/result coverage");
+            assert!(matches!(source.0[1],Command::PushLayer{rect:original,..} if original==rect),"render mode never changes CSS layout coordinates");
+            let mut untouched=DisplayList(vec![Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:false,svg_clip:None,filters:None},
+                Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:true,svg_clip:Some(Arc::new(SvgLayerClip{transform:Affine::IDENTITY,
+                    clip:Arc::new(SvgClip{units:SvgGradientUnits::ObjectBoundingBox,transform:Affine::IDENTITY,shapes:Arc::from([])})})),filters:None}]);
+            boxes(&mut untouched,scale);
+            assert!(untouched.0.iter().all(|command|matches!(command,Command::PushLayer{rect:original,..} if *original==rect)),"filter metadata and SVG object-box/path contours remain in their source coordinate system");
+        }}}
+    }
+
+    #[test]
+    fn specification_snapped_css_layer_clip_preserves_fractional_source_alpha_across_roi_partitions() {
+        use crate::{FilterPixelRegion,Rgba8Image};
+        for scale in [1.0,1.25,2.0] {for radius in [0.0,2.7] {for opacity in [0.25,0.75,1.0] {
+            let raw=Rect{x:4.125,y:6.875,width:16.33,height:12.27};
+            let mut list=DisplayList(vec![Command::PushLayer{rect:raw,radius,corners:None,opacity,clip:true,svg_clip:None,filters:None}]);
+            boxes(&mut list,scale);let Command::PushLayer{rect,..}=list.0[0] else{panic!("layer")};
+            let source=Rgba8Image{width:64,height:64,pixels:(0..4096).flat_map(|index|[0,128,0,if index%2==0{127}else{255}]).collect()};
+            let mut full=source.clone();crate::apply_layer_result_coverage(&mut full,rect,radius,None,opacity,true,None,None,scale,0.0,0.0,0).unwrap();
+            let region=FilterPixelRegion{left:0,top:0,width:64,height:64};let mut joined=source.clone();
+            for row in (0..64u32).step_by(7) {for column in (0..64u32).step_by(11) {
+                let tile_region=FilterPixelRegion{left:i64::from(column),top:i64::from(row),width:11.min(64-column),height:7.min(64-row)};
+                let mut tile=crate::crop_filter_region(&source,region,tile_region,0).unwrap();
+                crate::apply_layer_result_coverage(&mut tile,rect,radius,None,opacity,true,None,None,scale,column as f32,row as f32,0).unwrap();
+                for y in 0..tile.height {let at=((row+y)*64+column)as usize*4;let from=(y*tile.width)as usize*4;
+                    joined.pixels[at..at+tile.width as usize*4].copy_from_slice(&tile.pixels[from..from+tile.width as usize*4]);}
+            }}
+            if let Some((index,(actual,expected)))=joined.pixels.chunks_exact(4).zip(full.pixels.chunks_exact(4)).enumerate().find(|(_, (actual,expected))|actual!=expected) {
+                panic!("partitioned clip differs: scale={scale}, radius={radius}, opacity={opacity}, pixel=({},{}), joined={actual:?}, full={expected:?}",index%64,index/64);
+            }
+            if radius==0.0 {let x=(rect.x*scale)as usize+2;let y=(rect.y*scale)as usize+2;let at=(y*64+x)*4;
+                assert_eq!(full.pixels[at+3],(source.pixels[at+3]as f32*opacity).round()as u8,"clip does not erase pre-existing source antialiasing");}
+        }}}
+    }
+
     #[test]
     fn specification_css_box_clips_share_device_edges_and_preserve_ink_clips() {
         use crate::{GlyphCache, RasterizationMode};

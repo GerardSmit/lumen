@@ -59,6 +59,24 @@ pub(super) fn timeline(raw:&str,context:Option<(LengthContext,ContainerUnitConte
     Some(alloc::format!("{function}({})",parts.join(" ")))
 }
 
+/// A map progress source is an animation timeline except the two inactive
+/// property keywords. Grammar and canonical spelling remain owned by timeline.
+pub(super) fn interpolation_timeline(raw:&str)->Option<String>{
+    timeline(raw,None).filter(|value|!matches!(value.as_str(),"none"|"auto"))
+}
+pub(super) fn computed_interpolation_timeline(raw:&str,resolve:&mut dyn FnMut(typed_numeric::NumericValue)->Option<typed_numeric::NumericValue>)->Option<String>{
+    let source=interpolation_timeline(raw)?;
+    let Some(body)=source.strip_prefix("view(").and_then(|value|value.strip_suffix(')')) else{return Some(source);};
+    let mut parts=Vec::new();
+    for component in grid_components(body)?{
+        if matches!(component,"auto"|"block"|"inline"|"x"|"y"){parts.push(component.to_string());continue;}
+        let mut expression=typed_numeric::parse_numeric_expression(component)?;
+        expression.map_numeric_values(&mut *resolve)?;expression.simplify_absolute_units();
+        parts.push(expression.serialize()?);
+    }
+    interpolation_timeline(&alloc::format!("view({})",parts.join(" ")))
+}
+
 pub(super) fn timeline_list(raw:&str,context:Option<(LengthContext,ContainerUnitContext)>)->Option<String>{
     Some(top_level_split(raw,b',',64)?.into_iter().map(|raw|timeline(raw.trim(),context)).collect::<Option<Vec<_>>>()?.join(", "))
 }

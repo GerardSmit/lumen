@@ -381,33 +381,33 @@ pub(super) fn fill(raster: &mut Raster<'_>, rect: Rect, radius: f32, gradient: &
     let Some(prepared) = Prepared::new(gradient, rect) else {
         return;
     };
-    let Some(visible) = raster.clips.last().and_then(|clip| clip.intersection(rect)) else {
+    let Some(visible) = raster.visible_rect(rect) else {
         return;
     };
     let scale = raster.scale;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let mut hint = 0;
     for y in y0..y1 {
-        let row = prepared.row_term((y as f32 + 0.5) / scale);
+        let row = prepared.row_term(raster.css_y(y as f32 + 0.5));
         for x in x0..x1 {
             let coverage = if raster.antialias {
                 super::coverage::rounded(
                     x as f32,
                     y as f32,
-                    rect.x * scale,
-                    rect.y * scale,
-                    (rect.x + rect.width) * scale,
-                    (rect.y + rect.height) * scale,
+                    raster.device_x(rect.x),
+                    raster.device_y(rect.y),
+                    raster.device_x(rect.x + rect.width),
+                    raster.device_y(rect.y + rect.height),
                     radius * scale,
                 )
             } else {
-                rect.contains_rounded((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale, radius)
+                rect.contains_rounded(raster.css_x(x as f32 + 0.5), raster.css_y(y as f32 + 0.5), radius)
                     as u8 as f32
             };
             if !(coverage > 0.0) {
                 continue;
             }
-            let color = prepared.color_at((x as f32 + 0.5) / scale, row, &mut hint);
+            let color = prepared.color_at(raster.css_x(x as f32 + 0.5), row, &mut hint);
             let offset = (y as usize * raster.image.width as usize + x as usize) * 4;
             let pixel = &mut raster.image.pixels[offset..offset + 4];
             if coverage == 1.0 && color.a == 255 {

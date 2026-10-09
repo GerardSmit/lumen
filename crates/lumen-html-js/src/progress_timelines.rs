@@ -62,19 +62,11 @@ impl ProgressTimeline {
         let document_scroller=crate::scrolling::document_scrolling_element(&realm)?;
         if let Some(node)=self.input_node {
             let mut session=realm.session.borrow_mut();
-            let style=session.computed_style(node).map_err(|_|OpError::error("timeline axis style resolution failed"))?;
-            binding.horizontal=match self.axis.as_str(){"x"=>true,"y"=>false,"inline"=>style.writing_mode==lumen_html::css::WritingMode::HorizontalTb,_=>style.writing_mode!=lumen_html::css::WritingMode::HorizontalTb};
             if self.view {
-                let mut candidate=session.document().composed_parent(node).map_err(dom_error)?;
-                binding.source=None;
-                while let Some(ancestor)=candidate {
-                    let style=session.computed_style(ancestor).map_err(|_|OpError::error("view timeline source style resolution failed"))?;
-                    let overflow=if binding.horizontal{style.overflow_x}else{style.overflow_y};
-                    if matches!(overflow,lumen_html::css::Overflow::Hidden|lumen_html::css::Overflow::Scroll|lumen_html::css::Overflow::Auto){binding.source=Some(ancestor);break;}
-                    candidate=session.document().composed_parent(ancestor).map_err(dom_error)?;
-                }
-                binding.source=binding.source.or(Some(session.document().root()));
+                let(source,horizontal)=nearest_progress_scroll_source(&mut session,node,&self.axis)?;
+                binding.source=source;binding.horizontal=horizontal;
             }else {
+                binding.horizontal=progress_axis_horizontal(&mut session,node,&self.axis)?;
                 binding.source=if document_scroller==self.input_node{Some(session.document().root())}else{self.input_node};
             }
         }

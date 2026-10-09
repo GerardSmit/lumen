@@ -39,6 +39,8 @@ pub enum SvgGradientKind {
 /// `units`; `transform` is the SVG gradientTransform matrix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SvgGradient {
+    /// Per-operation paint opacity, applied after gradient interpolation.
+    pub opacity: f32,
     pub units: SvgGradientUnits,
     pub transform: Affine,
     pub kind: SvgGradientKind,
@@ -73,6 +75,7 @@ pub fn valid_svg_paint(paint: Option<&SvgPaint>) -> bool {
         }
     };
     gradient.transform.is_finite()
+        && gradient.opacity.is_finite() && (0.0..=1.0).contains(&gradient.opacity)
         && valid_kind
         && gradient.stops.len() <= MAX_SVG_GRADIENT_STOPS
         && gradient
@@ -84,7 +87,7 @@ pub fn valid_svg_paint(paint: Option<&SvgPaint>) -> bool {
 pub fn svg_paint_has_ink(paint: Option<&SvgPaint>) -> bool {
     match paint {
         Some(SvgPaint::Color(color)) => color.a != 0,
-        Some(SvgPaint::Gradient(gradient)) => gradient.stops.iter().any(|stop| stop.color.a != 0),
+        Some(SvgPaint::Gradient(gradient)) => gradient.opacity > 0.0 && gradient.stops.iter().any(|stop| stop.color.a != 0),
         None => false,
     }
 }
@@ -665,6 +668,12 @@ impl Iterator for CapsExpansions<'_> {
 pub use lumen_common::raster::Rgba8Image as ImageData;
 
 pub trait TextShaper {
+    /// SVG2 object bounds use full glyph cells: native horizontal advance
+    /// and the face's ascent/descent, before raster coverage or filter ink.
+    /// Opaque providers may decline instead of guessing from visible pixels.
+    fn glyph_cell_bounds(&self,_face:u64,_id:u16,_size:f32)->Option<Rect>{None}
+
+
     /// None means the provider has no metric authority. Some(None) means
     /// the selected first available font actually lacks the requested metric.
     fn first_available_font_metric(&self, _font: &FontSpec, _metric: FontMetric) -> Option<Option<f32>> {
@@ -1596,6 +1605,24 @@ pub struct DisplayList(pub Vec<Command>);
 /// Conservatively counted bytes referenced by a command. Shared Arc payloads
 /// are charged once per reference, so this is an upper bound, not heap usage.
 impl Command {
+    /// Owned heap storage allocated by `Command::clone`. Immutable Arc
+    /// payloads remain shared and do not consume a new source-scratch lease.
+    pub fn clone_owned_bytes(&self) -> Option<usize> {
+        let mut bytes=0usize;let mut command=self;
+        loop {
+            match command {
+                Self::FillBackground(_)=>return bytes.checked_add(core::mem::size_of::<BackgroundFill>()),
+                Self::StrokeBoxBorder(_)=>return bytes.checked_add(core::mem::size_of::<BoxBorder>()),
+                Self::MaskedBackground(mask)=>{
+                    bytes=bytes.checked_add(core::mem::size_of::<MaskedBackground>())?
+                        .checked_add(core::mem::size_of::<Command>())?;
+                    command=&mask.paint;
+                }
+                _=>return Some(bytes),
+            }
+        }
+    }
+
     pub fn referenced_bytes(&self) -> usize {
         let arc_header = 2 * core::mem::size_of::<usize>();
         let gradient_bytes = |gradient: &Gradient| {

@@ -109,11 +109,37 @@ pub(super) fn resolve_timing(raw:&str,length:LengthContext,query:ContainerUnitCo
     let (number,position)=steps_parts(raw)?;
     let (expression,_)=steps_expression(number,index,count)?;
     let value=expression.evaluate(&mut FontAngleContext{length:Some(length),query,percent_scale:1.0})?;
+    computed_steps_value(value,position)
+}
+
+fn computed_steps_value(value:f64,position:&str)->Option<String> {
     if !value.is_finite(){return None;}
     let minimum=if position=="jump-none"{2.0}else{1.0};
     let value=(value+0.5).floor().clamp(minimum,u32::MAX as f64) as u32;
     Some(if matches!(position,"end"|"jump-end") {alloc::format!("steps({value})")}
         else {alloc::format!("steps({value}, {position})")})
+}
+
+// Source-preserving numeric consumers (including interpolation maps) already
+// own their contextual numeric leaf resolver. Reuse the same timing grammar,
+// integer range and serializer without constructing a second length context.
+pub(super) fn computationally_independent_easing(raw:&str)->bool {
+    let Some(normalized)=easing(raw)else{return false;};
+    let Some((count,_))=steps_parts(&normalized)else{return true;};
+    typed_numeric::parse_numeric_expression(count).is_some_and(|expression|
+        !expression.contains_tree_functions()&&!expression.contains_unit(|unit|!typed_numeric::computationally_independent_unit(unit)))
+}
+
+pub(super) fn computed_easing_with(raw:&str,resolve:&mut dyn FnMut(typed_numeric::NumericValue)->Option<typed_numeric::NumericValue>)->Option<String> {
+    let normalized=easing(raw)?;
+    let Some((count,position))=steps_parts(&normalized)else{return Some(normalized);};
+    if !math_function(count){return Some(normalized);}
+    let mut expression=typed_numeric::parse_numeric_expression(count)?;
+    if expression.numeric_type()?!=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Number){return None;}
+    expression.map_numeric_values(resolve)?;expression.simplify_absolute_units();
+    if let Some(value)=expression.single_numeric_value(){return computed_steps_value(value.value,position);}
+    let count=expression.serialize()?;
+    Some(if matches!(position,"end"|"jump-end"){alloc::format!("steps({count})")}else{alloc::format!("steps({count}, {position})")})
 }
 
 pub(super) fn resolve_timings(raw:&str,length:LengthContext,query:ContainerUnitContext,index:usize,count:usize)->Option<Arc<[Arc<str>]>> {

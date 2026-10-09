@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [features]
+vector-path = ["dep:tiny-skia-path"]
 # Hash-flooding test helpers (`fasthash::tests`) shared with the engine's own tests.
 test-support = []
 web-encoding = ["dep:encoding_rs"]
@@ -34,6 +35,7 @@ lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
 crypt = ["dep:bcrypt"]
 
 [dependencies]
+tiny-skia-path = { version = "=0.11.4", default-features=false, features=["no-std-float"], optional=true }
 parse-srcset = { version = "=0.1.1", path = "../../vendor/parse-srcset-0.1.1", default-features = false }
 libm = "0.2"
 mime_classifier = { version = "=0.0.1", optional = true }

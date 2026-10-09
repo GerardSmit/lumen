@@ -980,6 +980,66 @@ fn attribute<'a>(document: &'a Document, node: NodeId, name: &str) -> Option<&'a
         .flatten()
 }
 
+/// HTML §4.10.13: absence of value makes progress indeterminate; invalid
+/// present values remain determinate. All consumers share the same state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressState {
+    pub maximum: f64,
+    pub value: f64,
+    pub position: f64,
+}
+
+pub fn progress_state(document: &Document, node: NodeId) -> Option<ProgressState> {
+    if html_element_local_name(document, node)? != "progress" { return None; }
+    let maximum = attribute(document, node, "max")
+        .and_then(lumen_common::html_numbers::parse_floating_point)
+        .filter(|value| *value > 0.0).unwrap_or(1.0);
+    let raw_value = attribute(document, node, "value");
+    let value = raw_value.and_then(lumen_common::html_numbers::parse_floating_point)
+        .unwrap_or(0.0).max(0.0).min(maximum);
+    Some(ProgressState { maximum, value, position: if raw_value.is_some() { value / maximum } else { -1.0 } })
+}
+
+/// HTML §4.10.14 evaluates these six gauge points in dependency order.
+/// Values come from the current null-namespace attributes, never IDL sidecars.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterState {
+    pub minimum: f64,
+    pub maximum: f64,
+    pub value: f64,
+    pub low: f64,
+    pub high: f64,
+    pub optimum: f64,
+}
+
+impl MeterState {
+    pub fn fraction(self) -> f64 {
+        if self.maximum == self.minimum { return 0.0; }
+        let range = self.maximum - self.minimum;
+        if range.is_finite() { (self.value - self.minimum) / range }
+        else { (self.value / 2.0 - self.minimum / 2.0) / (self.maximum / 2.0 - self.minimum / 2.0) }
+    }
+}
+
+pub fn meter_state(document: &Document, node: NodeId) -> Option<MeterState> {
+    if html_element_local_name(document, node)? != "meter" { return None; }
+    let number = |name| attribute(document, node, name)
+        .and_then(lumen_common::html_numbers::parse_floating_point);
+    let minimum = number("min").unwrap_or(0.0);
+    let maximum = number("max").unwrap_or(1.0).max(minimum);
+    let clamp = |value: f64| value.max(minimum).min(maximum);
+    let value = clamp(number("value").unwrap_or(0.0));
+    let low = clamp(number("low").unwrap_or(minimum));
+    let high = number("high").unwrap_or(maximum).max(low).min(maximum);
+    // Opposite signs cannot overflow their sum; same signs cannot overflow
+    // their difference. Preserve small/subnormal midpoint precision as well.
+    let midpoint = if minimum.is_sign_negative() != maximum.is_sign_negative() {
+        (minimum + maximum) / 2.0
+    } else { minimum + (maximum - minimum) / 2.0 };
+    let optimum = clamp(number("optimum").unwrap_or(midpoint));
+    Some(MeterState { minimum, maximum, value, low, high, optimum })
+}
+
 fn nonnegative_integer_digits(value: &str) -> Option<&str> {
     let value = value
         .trim_start_matches(|character| matches!(character, '\t' | '\n' | '\u{000C}' | '\r' | ' '));
@@ -999,6 +1059,18 @@ pub fn parse_nonnegative_integer_capped(value: &str, limit: usize) -> Option<usi
     Some(digits.bytes().fold(0usize, |value, digit| {
         value.saturating_mul(10).saturating_add(usize::from(digit - b'0')).min(limit)
     }))
+}
+
+/// HTML §4.8.17. A current rendered content box takes precedence over
+/// independently parsed attributes; absent or invalid attributes preserve
+/// the actual available image's natural dimensions.
+pub fn image_dimensions(document: &Document,node:NodeId,natural:Option<(f64,f64)>,rendered:Option<(f64,f64)>) -> (f64,f64) {
+    if html_element_local_name(document,node)==Some("input")&&input_type_state(document,node)!="image" {return (0.0,0.0);}
+    if let Some(rendered)=rendered {return rendered;}
+    let (mut width,mut height)=natural.unwrap_or((0.0,0.0));
+    if let Some(value)=attribute(document,node,"width").and_then(parse_nonnegative_integer){width=value as f64;}
+    if let Some(value)=attribute(document,node,"height").and_then(parse_nonnegative_integer){height=value as f64;}
+    (width,height)
 }
 
 /// Ordinary HTML unsigned-long reflection falls back outside its signed-32-bit range.
@@ -2616,6 +2688,15 @@ fn has_datalist_ancestor(document: &Document, node: NodeId) -> bool {
     false
 }
 
+/// Resolve the current DOM's autofill mantle and form default through the
+/// existing type and form-owner authorities, without a per-control cache.
+pub fn autocomplete_state(document: &Document, node: NodeId) -> lumen_common::html_autofill::Autofill<'_> {
+    let anchor=html_element_local_name(document,node)==Some("input")&&input_type_state(document,node)=="hidden";
+    let form_off=form_owner(document,node).and_then(|form|attribute(document,form,"autocomplete"))
+        .is_some_and(|value|value.eq_ignore_ascii_case("off"));
+    lumen_common::html_autofill::parse(attribute(document,node,"autocomplete"),anchor,form_off)
+}
+
 /// Return the normalized input type state without allocating. Unknown
 /// keywords use the Text state, as required by the input type algorithm.
 pub fn input_type_state(document: &Document, node: NodeId) -> &'static str {
@@ -4045,8 +4126,55 @@ pub fn append_form_entries_for_control(document:&Document,node:NodeId,submitter:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_image_dimensions_rendered_available_attribute_and_input_states() {
+        let mut document=crate::html::parse("<img><input type=image>",32).unwrap();
+        let img=crate::selector::query_selector(&document,document.root(),"img").unwrap().unwrap();
+        let input=crate::selector::query_selector(&document,document.root(),"input").unwrap().unwrap();
+        assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),Some((35.5,22.25))),(35.5,22.25));
+        assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(100.0,60.0));
+        for (raw,expected) in [("+10",10.0),("10px",10.0),("50%",50.0),("1.9",1.0),("-0.5",0.0),("\n10",10.0),("2147483647",2147483647.0)] {
+            document.set_attribute(img,"width",raw).unwrap();
+            assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(expected,60.0));
+        }
+        for raw in ["-10","","abc"] {
+            document.set_attribute(img,"width",raw).unwrap();
+            assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(100.0,60.0));
+        }
+        document.set_attribute(input,"width","30").unwrap();document.set_attribute(input,"height","40").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,None,None),(30.0,40.0));
+        document.set_attribute(input,"type","text").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,Some((100.0,60.0)),Some((35.5,22.25))),(0.0,0.0));
+        document.set_attribute(input,"type","IMAGE").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,Some((100.0,60.0)),None),(30.0,40.0));
+    }
+
     use super::*;
     use crate::html;
+    #[test]
+    fn specification_autofill_uses_live_type_form_owner_and_content_attributes() {
+        let mut document=html::parse("<form id=off autocomplete=off><input id=control autocomplete=invalid></form><form id=on></form><select id=select form=off></select><textarea id=text autocomplete='HOME email'></textarea>",48).unwrap();
+        let find=|document:&Document,selector|crate::selector::query_selector(document,document.root(),selector).unwrap().unwrap();
+        let input=find(&document,"#control");let form=find(&document,"#off");let select=find(&document,"#select");
+        assert_eq!(autocomplete_state(&document,input).field_name,"off");
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"");
+        assert_eq!(autocomplete_state(&document,select).field_name,"off");
+        document.set_attribute_ns(form,None,"autocomplete"," OFF ").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"on");
+        document.set_attribute_ns(form,None,"autocomplete","OFF").unwrap();
+        document.set_attribute_ns(input,None,"type","HiDdEn").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"");
+        document.set_attribute_ns(input,None,"autocomplete","on").unwrap();
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"");
+        document.set_attribute_ns(input,None,"type","unknown").unwrap();
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"on");
+        document.set_attribute_ns(input,None,"autocomplete","invalid").unwrap();
+        document.set_attribute_ns(input,None,"form","on").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"on");
+        assert_eq!(autocomplete_state(&document,find(&document,"#text")).idl_value(),"home email");
+        document.remove_attribute_ns(input,None,"form").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"off");
+    }
     #[test]
     fn specification_number_control_preferred_domain_uses_canonical_step_precision_without_enumeration(
     ) {

@@ -2,6 +2,7 @@
 //! to the caller. Spatial filters and resource-backed filters are separate.
 use crate::color::{Color, ColorSpace};
 use alloc::sync::Arc;
+pub mod resource;
 
 pub const MAX_COLOR_FILTERS: usize = 32;
 
@@ -76,6 +77,11 @@ impl ColorFilter {
     }
 }
 
+/// CSS local fragment references retain their local URL flag even when the
+/// computed href has been made absolute in its declaring stylesheet context.
+#[derive(Clone,Debug,PartialEq)]
+pub struct UrlReference {pub href:Arc<str>,pub local:bool}
+
 /// One resolved primitive in an ordered Filter Effects function list.
 /// Spatial amounts are local CSS lengths; consumers choose operating scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +91,10 @@ pub struct DropShadowFilter { pub offset: [f32; 2], pub sigma: f32, pub color: C
 pub enum FilterOperation {
     Color(ColorFilter),
     Blur(f32),
+    /// Computed URL tokens retain canonical declaring-resource resolution.
+    /// They must be bound to a used resource before issuing paint commands.
+    Url(Arc<UrlReference>),
+    Resource(Arc<resource::Use>),
     // Keep the color operations compact; only shadows allocate their larger
     // immutable parameter block, shared by styles and paint commands.
     DropShadow(Arc<DropShadowFilter>),
@@ -97,6 +107,8 @@ impl FilterOperation {
         match self {
             Self::Color(filter) => filter.is_valid(),
             Self::Blur(sigma) => sigma.is_finite() && *sigma >= 0.0,
+            Self::Url(url)=>url.href.len()<=8192,
+            Self::Resource(resource)=>resource.valid(usize::MAX),
             Self::DropShadow(shadow) => shadow.offset.iter().all(|v|v.is_finite())
                 && shadow.sigma.is_finite() && shadow.sigma >= 0.0 && shadow.color.alpha.is_finite()
                 && shadow.color.components.iter().all(|v|v.is_finite()),
@@ -104,7 +116,12 @@ impl FilterOperation {
     }
     pub fn is_spatial(&self) -> bool { !matches!(self, Self::Color(_)) }
     pub fn payload_bytes(&self) -> usize {
-        match self {Self::DropShadow(_)=>core::mem::size_of::<DropShadowFilter>()+2*core::mem::size_of::<usize>(),_=>0}
+        match self {
+            Self::DropShadow(_)=>core::mem::size_of::<DropShadowFilter>()+2*core::mem::size_of::<usize>(),
+            Self::Url(url)=>url.href.len()+core::mem::size_of::<UrlReference>()+4*core::mem::size_of::<usize>(),
+            Self::Resource(resource)=>core::mem::size_of::<resource::Use>()+4*core::mem::size_of::<usize>()+resource.url.len()+resource.program.bytes(),
+            _=>0,
+        }
     }
 }
 
@@ -115,15 +132,25 @@ impl ColorMatrix {
         [1.0, 0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0],
     ]);
-    pub fn apply(self, source: Color) -> Color {
-        let source = source.to(ColorSpace::Srgb);
+    pub const fn coefficients(self)->[[f32;5];4] {self.0}
+    pub fn from_coefficients(values:[[f32;5];4])->Self {Self(values)}
+    pub fn apply(self, source: Color) -> Color {self.apply_in_space(source,ColorSpace::Srgb)}
+    /// SVG filter primitives choose their working color space independently
+    /// of CSS filter functions, which always use sRGB.
+    pub fn apply_in_space(self,source:Color,space:ColorSpace)->Color {
+        let source = source.to(space);
         let input = [source.components[0], source.components[1], source.components[2], source.alpha];
         let out: [f32; 4] = core::array::from_fn(|i| {
             let row = self.0[i];
-            (row[0] * input[0] + row[1] * input[1] + row[2] * input[2] + row[3] * input[3] + row[4]).clamp(0.0, 1.0)
+            let sum=row[0]*input[0]+row[1]*input[1]+row[2]*input[2]+row[3]*input[3]+row[4];
+            // Preserve the existing ordinary f32 path. Finite but extreme SVG
+            // coefficients can otherwise cancel overflowing terms to NaN.
+            let sum=if sum.is_nan(){(f64::from(row[0])*f64::from(input[0])+f64::from(row[1])*f64::from(input[1])+f64::from(row[2])*f64::from(input[2])+f64::from(row[3])*f64::from(input[3])+f64::from(row[4])) as f32}else{sum};
+            sum.clamp(0.0,1.0)
         });
-        Color::new(ColorSpace::Srgb, [out[0], out[1], out[2]], out[3], 0)
+        Color::new(space, [out[0], out[1], out[2]], out[3], 0)
     }
+
 }
 
 #[cfg(test)]

@@ -181,7 +181,7 @@ pub(crate) fn install(realm: &Rc<DomRealm>) {
 }
 
 pub(crate) fn fullscreen_enabled(realm: &DomRealm) -> bool {
-    realm
+    realm.permissions_policy_allows(super::permissions_policy::FULLSCREEN) && realm
         .browser_services
         .presentation
         .host
@@ -195,6 +195,10 @@ pub(crate) fn request_fullscreen(
     realm: &Rc<DomRealm>,
     node: NodeId,
 ) -> OpResult<()> {
+    if !realm.use_permissions_policy(Some(ctx),super::permissions_policy::FULLSCREEN){
+        dispatch_error(ctx,realm,node,"fullscreenerror")?;
+        return Err(OpError::type_error("fullscreen is disabled by Permissions Policy"));
+    }
     if !is_connected(realm, node) {
         dispatch_error(ctx, realm, node, "fullscreenerror")?;
         return Err(OpError::new(

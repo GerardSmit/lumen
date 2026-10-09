@@ -3,6 +3,32 @@ use crate::realm_services::RealmServices;
 use lumen::embed::Promise;
 use lumen_bind::OneOrNumberPair;
 
+pub(crate) fn window_open(ctx: &mut Ctx, source: &Rc<DomRealm>, url: &str, target: &str, features: &str) -> OpResult<Value> {
+    let caller = ctx.invocation_host_realm();
+    let entry = ctx.with_host_realm(&caller, |ctx|
+        RealmServices::<WindowRealm>::current(ctx).and_then(|state| state.0.upgrade()))
+        .map_err(browsing_context::host_realm_error)?;
+    let source = entry.as_ref().unwrap_or(source);
+    let Some(context)=source.browsing_context().filter(|context|context.is_active()) else{return Ok(Value::Null)};
+    // HTML window-open steps parse before choosing or creating a target.
+    let url = if url.is_empty() { None } else {
+        Some(lumen_common::url::parse(url, Some(&source.base_url()))
+            .map_err(|_| crate::error_reporting::dom_exception(ctx, "SyntaxError", "Invalid window URL"))?.href())
+    };
+    let features=features.to_ascii_lowercase();
+    let disowned=features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|matches!(feature.split('=').next(),Some("noopener"|"noreferrer")) && !matches!(feature.split('=').nth(1),Some("0"|"no")));
+    let target=if target.is_empty(){"_blank"}else{target};
+    let target=if disowned && !matches!(target.to_ascii_lowercase().as_str(),"_self"|"_parent"|"_top"){"_blank"}else{target};
+    let Some(target)=context.choose_navigation_target(ctx,target)? else{return Ok(Value::Null)};
+    if disowned {target.disown_opener();}
+    if let Some(url) = url {
+        let mut metadata=browsing_context::NavigationMetadata::from_document(source);
+        if features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|feature.split('=').next()==Some("noreferrer") && !matches!(feature.split('=').nth(1),Some("0"|"no"))) {metadata.referrer.policy=lumen_common::referrer::ReferrerPolicy::NoReferrer;}
+        target.request_hyperlink_navigation(ctx,&url,source,metadata)?;
+    }
+    Ok(if disowned {Value::Null}else{target.proxy().unwrap_or(Value::Null)})
+}
+
 pub(crate) fn handler_get(ctx:&mut Ctx,receiver:&Value,event:&str,lenient:bool)->OpResult<Value> {
     let data=match ctx.with_instance::<DomWindow,_>(receiver,|window|window.base.data_handle()) {
         Ok(data)=>data,
@@ -177,23 +203,11 @@ crate::event_content_handlers::bind_window_handlers! {
     }
 
     #[method]
-    fn open(ctx:&mut Ctx,this:lumen_bind::This<Value>,url:Option<String>,target:Option<String>,features:Option<String>)->OpResult<Value> {
+    fn open(ctx:&mut Ctx,this:lumen_bind::This<Value>,#[default(lumen_host::webidl::OptUsv::default())] url:lumen_host::webidl::OptUsv,target:lumen_bind::Passed<Value>,features:lumen_bind::Passed<Value>)->OpResult<Value> {
+        let target=crate::option_factory::optional_string(ctx,target)?.unwrap_or_else(||"_blank".into());
+        let features=crate::option_factory::optional_string(ctx,features)?.unwrap_or_default();
         let Some(source)=window_attribute_realm(ctx,this.0)? else{return Ok(Value::Null)};
-        let Some(context)=source.browsing_context().filter(|context|context.is_active()) else{return Ok(Value::Null)};
-        let features=features.unwrap_or_default().to_ascii_lowercase();
-        let disowned=features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|matches!(feature.split('=').next(),Some("noopener"|"noreferrer")) && !matches!(feature.split('=').nth(1),Some("0"|"no")));
-        let target=target.unwrap_or_else(||"_blank".into());
-        let target=if target.is_empty(){"_blank".to_owned()}else{target};
-        let target=if disowned && !matches!(target.to_ascii_lowercase().as_str(),"_self"|"_parent"|"_top"){"_blank"}else{target.as_str()};
-        let Some(target)=context.choose_navigation_target(ctx,target)? else{return Ok(Value::Null)};
-        if disowned {target.disown_opener();}
-        let url=url.unwrap_or_default();
-        if !url.is_empty() {
-            let mut metadata=browsing_context::NavigationMetadata::from_document(&source);
-            if features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|feature.split('=').next()==Some("noreferrer") && !matches!(feature.split('=').nth(1),Some("0"|"no"))) {metadata.referrer.policy=lumen_common::referrer::ReferrerPolicy::NoReferrer;}
-            target.request_hyperlink_navigation(ctx,&url,&source,metadata)?;
-        }
-        Ok(if disowned {Value::Null}else{target.proxy().unwrap_or(Value::Null)})
+        window_open(ctx,&source,&url.0.unwrap_or_default(),&target,&features)
     }
 
     #[method]
@@ -439,11 +453,11 @@ crate::event_content_handlers::bind_window_handlers! {
     }
 
     #[setter(coerce)]
-    fn set_location(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    fn set_location(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
         let context = browsing_context::current_realm_context(ctx)
             .ok_or_else(|| OpError::new("InvalidStateError", "Window has no active context"))?;
         let entry_base = entry_base_url(ctx, &context);
-        context.request_location_navigation_with_caller(ctx, value, &entry_base)
+        context.request_location_navigation_with_caller(ctx, &value.0, &entry_base)
     }
 
     #[getter(name = "frameElement")]
@@ -555,8 +569,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_href(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.navigate(ctx, value)
+    fn set_href(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.navigate(ctx, &value.0)
     }
 
     #[getter]
@@ -572,8 +586,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_protocol(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.update(ctx, |url| url.set_protocol(value))
+    fn set_protocol(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.update(ctx, |url| url.set_protocol(&value.0))
     }
 
     #[getter]
@@ -588,8 +602,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_host(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.update(ctx, |url| url.set_host(value))
+    fn set_host(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.update(ctx, |url| url.set_host(&value.0))
     }
 
     #[getter]
@@ -598,8 +612,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_hostname(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.update(ctx, |url| url.set_hostname(value))
+    fn set_hostname(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.update(ctx, |url| url.set_hostname(&value.0))
     }
 
     #[getter]
@@ -612,8 +626,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_port(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.update(ctx, |url| url.set_port(value))
+    fn set_port(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.update(ctx, |url| url.set_port(&value.0))
     }
 
     #[getter]
@@ -622,8 +636,8 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_pathname(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
-        self.update(ctx, |url| url.set_pathname(value))
+    fn set_pathname(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.update(ctx, |url| url.set_pathname(&value.0))
     }
 
     #[getter]
@@ -637,9 +651,9 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_search(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    fn set_search(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
         self.update(ctx, |url| {
-            url.set_search(value);
+            url.set_search(&value.0);
             true
         })
     }
@@ -655,30 +669,30 @@ impl DomLocation {
     }
 
     #[setter(coerce)]
-    fn set_hash(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    fn set_hash(&self, ctx: &mut Ctx, value: lumen_host::webidl::Usv) -> OpResult<()> {
         self.update(ctx, |url| {
             // Location's compatibility bailout compares a null old fragment
             // as the empty string, while the new URL record retains a real
             // empty fragment if a navigation is required (HTML hash steps 4–8).
             let previous = url.fragment.clone().unwrap_or_default();
-            url.set_hash(value);
+            url.set_hash(&value.0);
             if url.fragment.is_none() { url.fragment = Some(String::new()); }
             url.fragment.as_deref() != Some(previous.as_str())
         })
     }
 
     #[method]
-    fn assign(&self, ctx: &mut Ctx, url: &str) -> OpResult<()> {
+    fn assign(&self, ctx: &mut Ctx, url: lumen_host::webidl::Usv) -> OpResult<()> {
         let (_, context) = self.active_owner_and_context()?;
         browsing_context::require_same_origin_context(ctx, &context)?;
-        self.navigate(ctx, url)
+        self.navigate(ctx, &url.0)
     }
 
     #[method]
-    fn replace(&self, ctx: &mut Ctx, url: &str) -> OpResult<()> {
+    fn replace(&self, ctx: &mut Ctx, url: lumen_host::webidl::Usv) -> OpResult<()> {
         let (_, context) = self.active_owner_and_context()?;
         let entry_base = entry_base_url(ctx, &context);
-        context.request_location_navigation_with_handling(ctx, url, &entry_base, true)
+        context.request_location_navigation_with_handling(ctx, &url.0, &entry_base, true)
     }
 
     #[method]
@@ -938,6 +952,8 @@ fn install_named_properties(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()>
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     RealmServices::replace_current(ctx, WindowRealm(Rc::downgrade(realm)));
+    lumen_host::net::set_api_base_url_provider(ctx, |ctx|
+        current_dom_realm(ctx).map(|realm|realm.base_url()));
     window_messaging::install(ctx)?;
     let function = ctx.bound_function(&lumen_bind::FnItem::of::<get_selection::Op>());
     let global = ctx.global_object();

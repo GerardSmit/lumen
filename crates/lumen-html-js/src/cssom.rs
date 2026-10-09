@@ -461,6 +461,10 @@ fn style_values_from_text(
     };
     let components = css::parse_unparsed_value(css_text)
         .map_err(|_| OpError::type_error("CSS text is invalid for the requested property"))?;
+    // Empty custom token sequences remain distinct from an absent property.
+    if property.starts_with("--") && components.is_empty() {
+        return Ok(vec![unparsed_value_from_components(ctx,&components)?]);
+    }
     // A transform list reifies specified function identities directly, including
     // legal 3D geometry values independently of used rendering reference boxes.
     if property=="transform" && !has_variable_component(&components) && !css_identifier_value(css_text.trim()).is_some_and(|keyword|matches!(keyword.to_ascii_lowercase().as_str(),"none"|"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
@@ -493,6 +497,16 @@ fn style_values_from_text(
 }
 
 fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> OpResult<Value> {
+    if css::declaration_block::is_shorthand(property) {
+        if let Some(keyword)=css_identifier_value(css_text.trim()).filter(|keyword|
+            matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
+            return Ok(ctx.new_instance(keyword_value(keyword)));
+        }
+        return Ok(ctx.new_instance(DomCssStyleValue {
+            serialized_value:RefCell::new(css::serialize_cssom_property_value(property,css_text)
+                .unwrap_or_else(||css_text.trim().to_owned())),
+        }));
+    }
     if let Some(numeric) = css::typed_numeric::parse_property_numeric_value(property, css_text) {
         return Ok(unit_value(ctx, numeric.value, numeric.unit));
     }
@@ -1857,17 +1871,77 @@ fn inline_property_value(realm: &DomRealm, node: NodeId, property: &str) -> OpRe
         .map_err(dom_error)?.unwrap_or(""), property).map_err(css_error)
 }
 
-fn value_from_inline_style(
-    ctx: &mut Ctx,
-    realm: &DomRealm,
-    node: NodeId,
-    property: &str,
-) -> OpResult<Option<Value>> {
-    let Some((value, _)) = inline_property_value(realm, node, property)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(style_value_from_text(ctx, property, &value)?))
+pub(crate) fn style_map_property(property: &str) -> OpResult<Cow<'_, str>> {
+    let property=if !property.starts_with("--") && property.bytes().any(|byte|byte.is_ascii_uppercase()) {
+        Cow::Owned(property.to_ascii_lowercase())
+    } else {Cow::Borrowed(property)};
+    if !css::is_cssom_property_name(&property) {
+        return Err(OpError::type_error("unrecognized CSS property"));
+    }
+    Ok(property)
+}
+
+enum StyleMapSnapshot {
+    Computed(Option<crate::style::ComputedPropertyMapSnapshot>),
+    Inline(css::DeclarationBlock),
+}
+impl StyleMapSnapshot {
+    fn capture(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly) -> OpResult<Self> {
+        let (realm,node)=map.realm.resolve_adopted_node(map.node);
+        if map.computed {
+            crate::animations::flush_css_transitions_for(ctx,&realm,Some(node))?;
+            Ok(Self::Computed(crate::style::computed_property_map_snapshot(&realm,node)?))
+        } else {Ok(Self::Inline(inline_declaration(&realm,node)?))}
+    }
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Inline(block)=>block.names().collect(),
+            Self::Computed(None)=>Vec::new(),
+            Self::Computed(Some(snapshot))=>{
+                let mut names=crate::style::computed_property_names().to_vec();
+                names.extend(snapshot.style.custom_properties().iter().filter(|(_,value)|value.is_some()).map(|(name,_)|name.as_str()));
+                if let Some(registrations)=snapshot.registrations.as_deref() {
+                    names.extend(registrations.iter().map(|entry|entry.name.as_str()));
+                }
+                names.sort_unstable_by(|left,right|css::cssom_property_order(left,right));
+                names.dedup();
+                names
+            }
+        }
+    }
+    fn values(&self,ctx:&mut Ctx,property:&str)->OpResult<Vec<Value>> {
+        match self {
+            Self::Inline(block)=>match block.value(property) {
+                Some((text,_))=>style_values_from_text(ctx,property,&text,true),
+                None=>Ok(Vec::new()),
+            },
+            Self::Computed(None)=>Ok(Vec::new()),
+            Self::Computed(Some(snapshot))=>{
+                let syntax=snapshot.registrations.as_deref().and_then(|entries|
+                    entries.iter().find(|entry|entry.name==property)).map(|entry|entry.syntax.as_str());
+                let text=snapshot.style.computed_css_value(property,snapshot.context);
+                match text {
+                    Some(text)=>registered_style_values(ctx,property,&text,syntax,true),
+                    None if syntax.is_some()=>registered_style_values(ctx,property,"",syntax,true),
+                    None=>Err(OpError::new("InvalidStateError","supported property has no computed value")),
+                }
+            }
+        }
+    }
+    fn iterator(&self,ctx:&mut Ctx,kind:u8)->OpResult<Value> {
+        let names=self.names();
+        let mut values=Vec::with_capacity(names.len());
+        for name in names {
+            let value=if kind==0 {Value::str(name)} else {
+                let parts=self.values(ctx,&name)?;
+                let parts=JsHost::from_list(ctx,parts);
+                if kind==1 {parts} else {JsHost::from_list(ctx,vec![Value::str(name),parts])}
+            };
+            values.push(value);
+        }
+        let collection=JsHost::from_list(ctx,values);
+        Ok(ctx.new_instance(DomCssomCollectionIterator::new(collection)))
+    }
 }
 
 fn property_map_text(
@@ -1876,27 +1950,49 @@ fn property_map_text(
     property: &str,
 ) -> OpResult<Option<String>> {
     if map.computed {
-        crate::animations::flush_css_transitions_for_property(ctx,&map.realm,Some(map.node),Some(property))?;
-        let value = crate::style::computed_property_value(&map.realm, map.node, property)?;
-        Ok((!value.is_empty()).then_some(value))
+        let (realm,node)=map.realm.resolve_adopted_node(map.node);
+        crate::animations::flush_css_transitions_for_property(ctx,&realm,Some(node),Some(property))?;
+        if !crate::style::rendered_ancestry(&realm,node,false)? {return Ok(None);}
+        let value = crate::style::computed_property_value(&realm, node, property)?;
+        if !value.is_empty() {return Ok(Some(value));}
+        if property.starts_with("--") {
+            let fonts=crate::canvas::initialized_realm_font_source(&realm)?;
+            let mut session=realm.session.borrow_mut();
+            let style=session.computed_style_with_text(node,fonts.as_ref().map(|fonts|fonts as &dyn lumen_html::paint::TextShaper))
+                .map_err(|error|OpError::new("InvalidStateError",format!("computed style failed: {error:?}")))?;
+            if style.custom_properties().iter().any(|(name,value)|name==property && value.is_some())
+                || session.registered_custom_property_snapshot().as_deref().is_some_and(|entries|entries.iter().any(|entry|entry.name==property)) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     } else {
-        Ok(inline_property_value(&map.realm, map.node, property)?.map(|(value, _)| value))
+        let (realm,node)=map.realm.resolve_adopted_node(map.node);
+        Ok(inline_property_value(&realm, node, property)?.map(|(value, _)| value))
     }
+}
+
+pub(crate) fn registered_style_values(ctx: &mut Ctx, property: &str, text: &str,
+    syntax: Option<&str>, multiple: bool) -> OpResult<Vec<Value>> {
+    if let Some(parts) = syntax.and_then(|syntax|
+        css::registered_properties::computed_value_items(syntax, text)) {
+        let mut values = Vec::new();
+        for part in parts.into_iter().take(if multiple { usize::MAX } else { 1 }) {
+            values.push(registered_style_value(ctx, property, part, syntax)?);
+        }
+        return Ok(values);
+    }
+    style_values_from_text(ctx, property, text, multiple)
 }
 
 fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
     property: &str, text: &str, multiple: bool) -> OpResult<Vec<Value>> {
     if property.starts_with("--") {
         let (realm, _) = map.realm.resolve_adopted_node(map.node);
-        let syntax = realm.session.borrow().registered_custom_property_syntax(property).map(String::from);
-        if let Some(parts) = syntax.as_deref().and_then(|syntax|
-            css::registered_properties::computed_value_items(syntax, text)) {
-            let mut values = Vec::new();
-            for part in parts.into_iter().take(if multiple { usize::MAX } else { 1 }) {
-                values.push(registered_style_value(ctx, property, part, syntax.as_deref())?);
-            }
-            return Ok(values);
-        }
+        let registrations = realm.session.borrow().registered_custom_property_snapshot();
+        let syntax = registrations.as_deref().and_then(|entries|
+            entries.iter().find(|entry| entry.name == property)).map(|entry| entry.syntax.as_str());
+        return registered_style_values(ctx, property, text, syntax, multiple);
     }
     style_values_from_text(ctx, property, text, multiple)
 }
@@ -1909,37 +2005,57 @@ fn value_array(ctx: &mut Ctx, values: impl IntoIterator<Item = Value>) -> OpResu
 impl DomStylePropertyMapReadOnly {
     #[method(coerce)]
     fn get(&self, ctx: &mut Ctx, property: &str) -> OpResult<Value> {
-        let value = if self.computed {
-            property_map_text(ctx, self, property)?
-                .map(|text| computed_map_values(ctx, self, property, &text, false))
-                .transpose()?.and_then(|values| values.into_iter().next())
-        } else {
-            value_from_inline_style(ctx, &self.realm, self.node, property)?
+        let property=style_map_property(property)?;
+        let value=property_map_text(ctx,self,&property)?;
+        let values=match value {
+            Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,false)?,
+            Some(text)=>style_values_from_text(ctx,&property,&text,false)?,
+            None=>Vec::new(),
         };
-        Ok(value.unwrap_or(Value::Undefined))
+        Ok(values.into_iter().next().unwrap_or(Value::Undefined))
     }
-
     #[method(coerce)]
     fn get_all(&self, ctx: &mut Ctx, property: &str) -> OpResult<Value> {
-        if self.computed {
-            let values = property_map_text(ctx, self, property)?
-                .map(|text| computed_map_values(ctx, self, property, &text, true))
-                .transpose()?
-                .unwrap_or_default();
-            value_array(ctx, values)
-        } else {
-            let value = value_from_inline_style(ctx, &self.realm, self.node, property)?;
-            value_array(ctx, value.into_iter())
-        }
+        let property=style_map_property(property)?;
+        let value=property_map_text(ctx,self,&property)?;
+        let values=match value {
+            Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,true)?,
+            Some(text)=>style_values_from_text(ctx,&property,&text,true)?,
+            None=>Vec::new(),
+        };
+        value_array(ctx,values)
     }
-
     #[method(coerce)]
     fn has(&self, ctx: &mut Ctx, property: &str) -> OpResult<bool> {
-        if self.computed {
-            Ok(property_map_text(ctx, self, property)?.is_some())
-        } else {
-            Ok(inline_property_value(&self.realm, self.node, property)?.is_some())
+        let property=style_map_property(property)?;
+        Ok(property_map_text(ctx,self,&property)?.is_some())
+    }
+    #[getter]
+    fn size(&self,ctx:&mut Ctx)->OpResult<usize> {
+        Ok(StyleMapSnapshot::capture(ctx,self)?.names().len())
+    }
+    #[proto(iter)]
+    fn iter(&self,ctx:&mut Ctx)->OpResult<Value> {
+        StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,2)
+    }
+    fn entries(&self,ctx:&mut Ctx)->OpResult<Value> {
+        StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,2)
+    }
+    fn keys(&self,ctx:&mut Ctx)->OpResult<Value> {
+        StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,0)
+    }
+    fn values(&self,ctx:&mut Ctx)->OpResult<Value> {
+        StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,1)
+    }
+    fn for_each(&self,ctx:&mut Ctx,this:This<Value>,callback:JsFunction,this_arg:Option<Value>)->OpResult<()> {
+        let snapshot=StyleMapSnapshot::capture(ctx,self)?;
+        for name in snapshot.names() {
+            let values=snapshot.values(ctx,&name)?;
+            let values=JsHost::from_list(ctx,values);
+            callback.call(ctx,this_arg.clone().unwrap_or(Value::Undefined),
+                &[values,Value::str(name),this.0.clone()])?;
         }
+        Ok(())
     }
 }
 
@@ -4913,6 +5029,20 @@ fn write_source_text_with_import_map(realm: &DomRealm, source: &SheetSource, tex
     }
 }
 
+/// Both HTMLStyleElement and SVGStyleElement use the same associated sheet.
+pub(crate) fn style_element_disabled(ctx:&mut Ctx,realm:&Rc<DomRealm>,node:NodeId)->OpResult<bool> {
+    let (owner,node)=realm.resolve_adopted_node(node);
+    if !owner.ensure_inline_stylesheet(ctx,node)? {return Ok(false)}
+    let disabled=owner.session.borrow().stylesheet_disabled(node);Ok(disabled)
+}
+pub(crate) fn set_style_element_disabled(ctx:&mut Ctx,realm:&Rc<DomRealm>,node:NodeId,value:bool)->OpResult<()> {
+    let (owner,node)=realm.resolve_adopted_node(node);
+    if !owner.ensure_inline_stylesheet(ctx,node)? {return Ok(())}
+    owner.stylesheet_links.set_sheet_disabled(node,value)?;
+    let result=owner.session.borrow_mut().set_stylesheet_disabled(node,value)
+        .map_err(|error|OpError::new("InvalidStateError",format!("inline stylesheet disable: {error:?}")));result
+}
+
 /// Creates the live stylesheet object for a `<style>` node. The DOM adapter
 /// uses this from `HTMLStyleElement.sheet` and caches the returned instance on
 /// the element wrapper.
@@ -4929,7 +5059,7 @@ pub fn style_element_sheet(
     let link=instruction || matches!(realm.session.borrow().document().kind(node),Ok(NodeKind::Element {name,namespace:Namespace::Html,..}) if name=="link");
     let link_state=realm.session.borrow().link_stylesheet_state(node);
     if link && link_state.is_none() {return Ok(Value::Null)}
-    if !link && !matches!(realm.session.borrow().document().kind(node), Ok(NodeKind::Element { name, .. }) if name == "style")
+    if !link && !crate::stylesheet_loading::is_style(realm.session.borrow().document(),node)
     {
         return Err(OpError::new(
             "TypeError",
@@ -6658,6 +6788,45 @@ impl DomCssRuleStyle {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn specification_readonly_style_maps_share_live_values_iteration_and_registry_epoch() {
+        let mut engine=lumen::Engine::new();
+        let realm=crate::install(engine.ctx(),r#"<style id=registry>@property --items {syntax: '<length>+';inherits:false;initial-value:1px 2px}</style><div id=parent style='--inherited:parent'><div id=target style='--Z:z; width:50%; --A:a; transition-duration:1s, 2s; --empty:;'></div></div>"#,512).unwrap();
+        realm.set_layout_flusher(Rc::new(|session|session.display_list(200,100,crate::canvas::canvas_fallback_fonts()).map(|_|()).map_err(|error|format!("{error:?}"))));
+        let result=engine.eval_value(r#"(()=>{
+            const target=document.getElementById('target'),map=target.computedStyleMap();
+            const check=(condition,message)=>{if(!condition)throw Error(message)};
+            check(target.computedStyleMap()===map,'same object');
+            check(map.get('WiDtH').unit==='percent'&&map.get('width').value===50,'computed percentage');
+            for(const operation of ['get','getAll','has']){let threw=false;try{map[operation]('unrecognized-lumen-property')}catch(error){threw=error instanceof TypeError}check(threw,'invalid '+operation)}
+            check(map.get('--Missing')===undefined&&map.getAll('--Missing').length===0&&!map.has('--Missing'),'missing custom');
+            for(const name of ['--','--a b','--a\nb',String.raw`--\41`])check(map.get(name)===undefined&&map.getAll(name).length===0&&!map.has(name),'literal custom property string');
+            check(map.get('--A') instanceof CSSUnparsedValue && map.get(String.raw`--\41`)===undefined,'custom lookup does not decode CSS escapes');
+            for(const operation of ['get','getAll','has']){let threw=false;try{map[operation](String.raw`\77 idth`)}catch(error){threw=error instanceof TypeError}check(threw,'escaped standard lookup '+operation)}
+            check(map.get('--empty') instanceof CSSUnparsedValue && map.get('--empty').length===0 && map.has('--empty'),'present empty custom');
+            const entries=Array.from(map),keys=Array.from(map.keys()),values=Array.from(map.values());
+            check(entries.length===map.size&&keys.length===map.size&&values.length===map.size,'size');
+            check(entries.every((entry,index)=>entry[0]===keys[index]&&Array.isArray(entry[1])&&entry[1].length>0&&entry[1].every(value=>value instanceof CSSStyleValue)),'iterable shape and all catalog values');
+            check(map.get('rx').value==='auto'&&map.get('ry').value==='auto','SVG auto radius grammar');
+            check(keys.includes('--inherited')&&!keys.includes('margin'),'canonical longhands and inherited customs');
+            const category=name=>name.startsWith('--')?2:name.startsWith('-')?1:0;
+            check(keys.every((name,index)=>index===0||category(keys[index-1])<category(name)||category(keys[index-1])===category(name)&&keys[index-1]<name),'ordering');
+            const itemIndex=keys.indexOf('--items');check(values[itemIndex].length===2&&values[itemIndex][1].value===2,'registered repeated reification');
+            const durationIndex=keys.indexOf('transition-duration');check(values[durationIndex].length===2&&values[durationIndex][1].value===2,'ordinary list reification');
+            target.style.setProperty('--豈','BMP');target.style.setProperty('--💩','nonBMP');const unicodeKeys=Array.from(map.keys());check(unicodeKeys.indexOf('--豈')<unicodeKeys.indexOf('--💩'),'modern code-point ordering');
+            const receiver={};let called=0;map.forEach(function(items,name,owner){check(this===receiver&&owner===map&&Array.isArray(items),'callback');called++},receiver);check(called===map.size,'callback count');
+            const oldItems=entries[itemIndex][1];document.getElementById('registry').textContent="@property --items {syntax:'<number>';inherits:false;initial-value:7}";
+            check(map.get('--items').unit==='number'&&map.get('--items').value===7&&oldItems[1].unit==='px'&&oldItems[1].value===2,'new registry and frozen earlier values');
+            target.style.setProperty('--A','updated');check(String(map.get('--A'))==='updated','live mutation');
+            target.remove();check(map.size===0&&Array.from(map).length===0&&map.get('width')===undefined,'disconnected declarations');
+            document.body.appendChild(target);check(map.get('width').unit==='percent','reconnected same map');
+            const inline=target.attributeStyleMap,inlineKeys=Array.from(inline.keys());
+            check(inlineKeys[0]==='--Z'&&inlineKeys[1]==='width'&&inlineKeys[2]==='--A','inline declaration order');
+            check(inline.getAll('transition-duration').length===2&&inline.size===inlineKeys.length&&Array.from(inline).length===inline.size,'inline list and size');
+            return true;
+        })()"#).unwrap();
+        assert!(matches!(result,Ok(Value::Bool(true))),"readonly map lifecycle");
+    }
+    #[test]
     fn specification_individual_transform_cssom_owner_and_animation(){
         let mut runtime=lumen_runtime::Runtime::new_browser();let engine=runtime.engine();
         let realm=crate::install(engine.ctx(),"<div id=target style='width:200px;height:100px'></div>",128).unwrap();install_cssom_layout(&realm);
@@ -6670,7 +6839,7 @@ mod tests {
             s.scale='2';const b=t.animate({scale:['5','5']},{duration:1000,fill:'both',composite:'add'});b.currentTime=500;check(getComputedStyle(t).scale==='10','scale multiplicative addition');b.cancel();
             const c=t.animate({rotate:['y 0deg','y 720deg']},{duration:1000,fill:'both'});c.currentTime=250;check(getComputedStyle(t).rotate==='y 180deg','unwrapped matched-axis rotation');c.cancel();
             s.all='initial';check(getComputedStyle(t).translate==='none'&&getComputedStyle(t).rotate==='none'&&getComputedStyle(t).scale==='none','registry reset');return true})()"#);
-        assert!(matches!(result,Ok(Ok(Value::Bool(true)))),"individual transform CSSOM: {result:?}");
+        assert!(matches!(result,Ok(Ok(Value::Bool(true)))),"individual transform CSSOM");
     }
 
     #[test]
@@ -6733,6 +6902,32 @@ mod tests {
             return true;
         })()"#).unwrap();
         if let Err(error)=result{let message=engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_else(|_|"unprintable exception".into());panic!("all metadata projection: {message}");}
+    }
+
+    #[test]
+    fn specification_svg_style_element_uses_shared_associated_stylesheet_lifecycle() {
+        let mut engine=lumen::Engine::new();let realm=crate::install(engine.ctx(),"<!doctype html><body></body>",512).unwrap();install_cssom_layout(&realm);
+        let result=engine.eval_value(r#"(() => {
+const check=(value,message)=>{if(!value)throw Error(message)};
+const ns='http://www.w3.org/2000/svg';
+const owner=document.createElementNS(ns,'style');
+check(owner instanceof SVGStyleElement && owner instanceof SVGElement && !(owner instanceof HTMLStyleElement),'native SVG identity');
+check(owner.type==='' && owner.media==='' && owner.title==='' && owner.sheet===null && owner.disabled===false,'absent reflected attrs and disconnected association');
+for(const attribute of ['type','media','title']) {owner[attribute]='arbitrary/value';check(owner.getAttribute(attribute)==='arbitrary/value','IDL reflection '+attribute);owner.setAttribute(attribute,'content');check(owner[attribute]==='content','content reflection '+attribute);owner.removeAttribute(attribute);check(owner[attribute]==='','reflection removal '+attribute);}
+const svg=document.createElementNS(ns,'svg'),rect=document.createElementNS(ns,'rect');svg.setAttribute('width','100');svg.setAttribute('height','100');rect.setAttribute('class','target');rect.setAttribute('width','50');rect.setAttribute('height','50');owner.textContent='.target {fill:red}';svg.append(owner,rect);document.body.append(svg);
+owner.style.setProperty('display','block','important');check(getComputedStyle(owner).display==='none','mandatory never-rendered SVG style UA rule');
+const sheet=owner.sheet;
+check(sheet instanceof CSSStyleSheet && sheet===owner.sheet && sheet===document.styleSheets[0] && sheet.ownerNode===owner && sheet.cssRules.length===1,'shared associated sheet identity');
+check(getComputedStyle(rect).fill==='rgb(255, 0, 0)','SVG source rule applies');
+owner.disabled=true;check(owner.disabled && sheet.disabled && getComputedStyle(rect).fill==='rgb(0, 0, 0)','owner disabling controls actual renderer');
+sheet.disabled=false;check(!owner.disabled && getComputedStyle(rect).fill==='rgb(255, 0, 0)','sheet and owner share disabled source');
+owner.media='not all';check(getComputedStyle(rect).fill==='rgb(0, 0, 0)','media mutation deactivates actual source');owner.removeAttribute('media');check(getComputedStyle(rect).fill==='rgb(255, 0, 0)','media removal restores source');
+sheet.cssRules[0].style.fill='blue';check(getComputedStyle(rect).fill==='rgb(0, 0, 255)','shared CSSOM declaration edit drives renderer');
+owner.type='no/mime';check(owner.sheet===null && document.styleSheets.length===0 && getComputedStyle(rect).fill==='rgb(0, 0, 0)','type mutation removes association');owner.type='text/css';check(owner.sheet instanceof CSSStyleSheet && document.styleSheets.length===1 && getComputedStyle(rect).fill==='rgb(255, 0, 0)','valid type rebuilds authored source');
+const prefixed=document.createElementNS(ns,'s:style');prefixed.textContent='.target{stroke:green}';svg.append(prefixed);check(prefixed.sheet instanceof CSSStyleSheet && prefixed.sheet===document.styleSheets[1] && getComputedStyle(rect).stroke==='rgb(0, 128, 0)','prefixed XML style shares maintained owner classification');prefixed.remove();check(document.styleSheets.length===1 && getComputedStyle(rect).stroke==='none','prefixed source removal follows the same lifecycle');
+owner.remove();check(owner.sheet===null && document.styleSheets.length===0 && getComputedStyle(rect).fill==='rgb(0, 0, 0)','detached source cannot control live rendering');svg.prepend(owner);check(owner.sheet===document.styleSheets[0] && getComputedStyle(rect).fill==='rgb(255, 0, 0)','reconnection restores shared lifecycle');
+return true;})()"#).unwrap();
+        if let Err(error)=result {let message=engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_else(|_|"unprintable exception".into());panic!("SVG stylesheet lifecycle: {message}");}
     }
 
     #[test]
@@ -8875,13 +9070,23 @@ mod tests {
                         calculatedDuration.unit === 's' && calculatedDuration.value === 6 &&
                         getComputedStyle(typedElement).getPropertyValue('transition-duration') === '6s');
                     typedElement.style.setProperty('transition-duration', '0.5s, 250ms');
+                    CSS.registerProperty({name:'--readonly-adoption',syntax:'<number>',initialValue:'5',inherits:false});
+                    typedElement.style.setProperty('--readonly-adoption','9');
                     const adoptedDocument = new DOMParser().parseFromString('<main></main>', 'text/html');
                     adoptedDocument.querySelector('main').appendChild(adoptedDocument.adoptNode(typedElement));
                     const adoptedDurationValue = computedMap.get('transition-duration');
-                    check('computed map follows adopted element',
-                        adoptedDurationValue instanceof CSSUnitValue &&
-                        adoptedDurationValue.unit === 's' && adoptedDurationValue.value === 0.5 &&
+                    check('computed map follows inactive adopted owner availability',
+                        adoptedDurationValue === undefined && computedMap.size === 0 &&
+                        Array.from(computedMap).length === 0 &&
                         adoptedDocument.querySelector('main').firstChild === typedElement);
+                    document.body.appendChild(typedElement);
+                    const reconnectedDurationValue = computedMap.get('transition-duration');
+                    check('computed map follows reconnected adopted owner',
+                        reconnectedDurationValue instanceof CSSUnitValue &&
+                        reconnectedDurationValue.unit === 's' && reconnectedDurationValue.value === 0.5 &&
+                        typedElement.computedStyleMap() === computedMap &&
+                        computedMap.get('--readonly-adoption').unit === 'number' &&
+                        computedMap.get('--readonly-adoption').value === 9);
 
                     const custom = attempt('parse custom property with variable',
                         () => CSSStyleValue.parse('--tokens', 'calc(1px + var(--gap, 2px))'));

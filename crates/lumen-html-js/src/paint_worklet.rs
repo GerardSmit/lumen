@@ -3,8 +3,8 @@
 use super::*;
 use lumen_html::css;
 use crate::realm_services::{capture_realm_value, RealmServices};
-use lumen::embed::{JsHost, RealmHandle};
-use lumen_bind::Host;
+use lumen::embed::{JsFunction, JsHost, RealmHandle};
+use lumen_bind::{Host, This};
 use lumen_common::limits::ByteBudget;
 use lumen_html::paint::PaintWorkletRequest;
 use std::collections::{HashMap, HashSet};
@@ -52,23 +52,35 @@ mod scope_bindings {
     #[op(rename(js="registerPaint"))]
     pub fn register_paint(ctx:&mut Ctx,name:&str,constructor:Value)->OpResult<()> {
         if name.is_empty()||name.len()>1024{return Err(OpError::type_error("paint name must not be empty or exceed its budget"));}
-        if !ctx.value_is_constructor(&constructor){return Err(OpError::type_error("paint definition must be a constructor"));}
         let state=service(ctx)?;
-        if state.borrow().definitions.contains_key(name){return Err(OpError::new("NotSupportedError","paint name is already registered"));}
+        if state.borrow().definitions.contains_key(name) {
+            let constructor=ctx.class_constructor::<lumen_host::events::DomException>();
+            let exception=ctx.construct_value(constructor,&[Value::str("paint name is already registered"),
+                Value::str("InvalidModificationError")]).map_err(OpError::thrown)?;
+            return Err(OpError::thrown(exception));
+        }
         if state.borrow().definitions.len()>=MAX_DEFINITIONS{return Err(OpError::new("QuotaExceededError","paint definition budget exhausted"));}
-        let inputs=strings(ctx,&constructor,"inputProperties",MAX_INPUTS)?;
+        let mut inputs=strings(ctx,&constructor,"inputProperties",MAX_INPUTS)?;
+        inputs.retain_mut(|name| {
+            if !css::is_cssom_property_name(name) {return false;}
+            if !name.starts_with("--") && name.bytes().any(|byte|byte.is_ascii_uppercase()) {
+                *name=Arc::from(name.to_ascii_lowercase());
+            }
+            true
+        });
         let arguments=strings(ctx,&constructor,"inputArguments",64)?;
         if arguments.iter().any(|syntax|syntax.as_ref()!="*" && !css::registered_properties::valid_typed_syntax(syntax)) {
             return Err(OpError::type_error("paint argument syntax is invalid"));
         }
-        let prototype=ctx.member_get(&constructor,"prototype").map_err(OpError::thrown)?;
-        let paint=ctx.member_get(&prototype,"paint").map_err(OpError::thrown)?;
-        if !paint.is_callable(){return Err(OpError::type_error("paint prototype must have a paint method"));}
         let options=ctx.member_get(&constructor,"contextOptions").map_err(OpError::thrown)?;
         let alpha=if matches!(options,Value::Null|Value::Undefined){true}else{
             let value=ctx.member_get(&options,"alpha").map_err(OpError::thrown)?;
             matches!(value,Value::Undefined)||ctx.to_boolean(&value)
         };
+        if !ctx.value_is_constructor(&constructor){return Err(OpError::type_error("paint definition must be a constructor"));}
+        let prototype=ctx.member_get(&constructor,"prototype").map_err(OpError::thrown)?;
+        let paint=ctx.member_get(&prototype,"paint").map_err(OpError::thrown)?;
+        if !paint.is_callable(){return Err(OpError::type_error("paint prototype must have a paint method"));}
         let owner=state.borrow().owner.upgrade().ok_or_else(||OpError::new("InvalidStateError","paint document was retired"))?;
         owner.session.borrow_mut().register_paint_worklet(Arc::from(name),inputs.into())
             .map_err(|_|OpError::new("QuotaExceededError","paint metadata budget exhausted"))?;
@@ -91,6 +103,7 @@ fn ensure_scope(ctx:&mut Ctx,state:&Rc<RefCell<PaintState>>)->OpResult<RealmHand
         crate::canvas::install_paint_context(ctx)?;
         crate::cssom::install_typed_numeric(ctx)?;
         for (name,constructor) in [
+            ("DOMException",ctx.class_constructor::<lumen_host::events::DomException>()),
             ("PaintSize",ctx.class_constructor::<DomPaintSize>()),
             ("StylePropertyMapReadOnly",ctx.class_constructor::<DomPaintStyleMap>()),
         ] {crate::install_interface(ctx,&global,name,constructor)?;}
@@ -123,19 +136,69 @@ impl DomPaintSize {
     #[getter] fn height(&self)->f64{self.height}
 }
 #[lumen_bind::class(name="StylePropertyMapReadOnly",hint(js(webidl)))]
-struct DomPaintStyleMap {values:Vec<(Arc<str>,Option<Arc<str>>,Option<Arc<str>>)>}
+struct DomPaintStyleMap {
+    values: Vec<(Arc<str>, Arc<str>)>,
+    registrations: Option<Arc<[css::registered_properties::RegisteredCustomProperty]>>,
+}
+impl DomPaintStyleMap {
+    fn syntax(&self, property: &str) -> Option<&str> {
+        self.registrations.as_deref()?.iter().find(|entry| entry.name == property)
+            .map(|entry| entry.syntax.as_str())
+    }
+    fn reify(&self, ctx: &mut Ctx, property: &str, value: &str, multiple: bool) -> OpResult<Vec<Value>> {
+        crate::cssom::registered_style_values(ctx, property, value, self.syntax(property), multiple)
+    }
+    fn iterator(&self, ctx: &mut Ctx, kind: u8) -> OpResult<Value> {
+        let mut values = Vec::with_capacity(self.values.len());
+        for (name, text) in &self.values {
+            let value = if kind == 0 { Value::str(name.as_ref()) } else {
+                let parts = self.reify(ctx, name, text, true)?;
+                let parts = JsHost::from_list(ctx, parts);
+                if kind == 1 { parts } else {
+                    JsHost::from_list(ctx, vec![Value::str(name.as_ref()), parts])
+                }
+            };
+            values.push(value);
+        }
+        let collection = JsHost::from_list(ctx, values);
+        Ok(ctx.new_instance(crate::cssom::DomCssomCollectionIterator::new(collection)))
+    }
+}
 #[lumen_bind::methods]
 impl DomPaintStyleMap {
-    #[getter] fn size(&self)->usize{self.values.len()}
-    fn get(&self,ctx:&mut Ctx,property:&str)->OpResult<Value> {
-        let Some((_,Some(value),syntax))=self.values.iter().find(|(name,_,_)|name.as_ref()==property)else{return Ok(Value::Undefined);};
-        crate::cssom::registered_style_value(ctx,property,value,syntax.as_deref())
+    #[getter] fn size(&self) -> usize { self.values.len() }
+    fn get(&self, ctx: &mut Ctx, property: &str) -> OpResult<Value> {
+        let property=crate::cssom::style_map_property(property)?;
+        let Some((_, value)) = self.values.iter().find(|(name, _)| name.as_ref() == property.as_ref())
+            else { return Ok(Value::Undefined); };
+        Ok(self.reify(ctx, &property, value, false)?.into_iter().next().unwrap_or(Value::Undefined))
     }
-    fn get_all(&self,ctx:&mut Ctx,property:&str)->OpResult<Value> {
-        let value=self.get(ctx,property)?;
-        Ok(JsHost::from_list(ctx,if matches!(value,Value::Undefined){Vec::new()}else{vec![value]}))
+    fn get_all(&self, ctx: &mut Ctx, property: &str) -> OpResult<Value> {
+        let property=crate::cssom::style_map_property(property)?;
+        let values = match self.values.iter().find(|(name, _)| name.as_ref() == property.as_ref()) {
+            Some((_, value)) => self.reify(ctx, &property, value, true)?,
+            None => Vec::new(),
+        };
+        Ok(JsHost::from_list(ctx, values))
     }
-    fn has(&self,property:&str)->bool{self.values.iter().any(|(name,value,_)|name.as_ref()==property && value.is_some())}
+    fn has(&self, property: &str) -> OpResult<bool> {
+        let property=crate::cssom::style_map_property(property)?;
+        Ok(self.values.iter().any(|(name, _)| name.as_ref() == property.as_ref()))
+    }
+    #[proto(iter)] fn iter(&self, ctx: &mut Ctx) -> OpResult<Value> { self.iterator(ctx, 2) }
+    fn entries(&self, ctx: &mut Ctx) -> OpResult<Value> { self.iterator(ctx, 2) }
+    fn keys(&self, ctx: &mut Ctx) -> OpResult<Value> { self.iterator(ctx, 0) }
+    fn values(&self, ctx: &mut Ctx) -> OpResult<Value> { self.iterator(ctx, 1) }
+    fn for_each(&self, ctx: &mut Ctx, this: This<Value>, callback: JsFunction,
+        this_arg: Option<Value>) -> OpResult<()> {
+        for (name, text) in &self.values {
+            let parts = self.reify(ctx, name, text, true)?;
+            let parts = JsHost::from_list(ctx, parts);
+            callback.call(ctx, this_arg.clone().unwrap_or(Value::Undefined),
+                &[parts, Value::str(name.as_ref()), this.0.clone()])?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn install(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
@@ -168,9 +231,17 @@ pub(crate) fn update(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
         if state.borrow().failures.contains(&request){continue;}
         if request.arguments.len()!=definition.arguments.len() || request.width<=0.0 || request.height<=0.0 {continue;}
         if request.width>8192.0 || request.height>8192.0 {continue;}
-        let values=request.properties.iter().map(|(name,value)|
-            (name.clone(),value.clone(),realm.session.borrow().registered_custom_property_syntax(name).map(Arc::from)))
-            .collect::<Vec<_>>();
+        // Freeze one source-epoch registry for the immutable worklet map.
+        let registrations=realm.session.borrow().registered_custom_property_snapshot();
+        let mut values=request.properties.iter().filter_map(|(name,value)|
+            value.as_ref().map(|value|{
+                let name=if !name.starts_with("--")&&name.bytes().any(|byte|byte.is_ascii_uppercase()) {
+                    Arc::from(name.to_ascii_lowercase())
+                } else {name.clone()};
+                (name,value.clone())
+            })).collect::<Vec<_>>();
+        values.sort_unstable_by(|(left,_),(right,_)|css::cssom_property_order(left,right));
+        values.dedup_by(|left,right|left.0==right.0);
         let scope=ensure_scope(ctx,&state)?;
         let result=ctx.with_host_realm(&scope,|ctx|{
             let instance=match definition.instance.as_ref().and_then(WeakValue::upgrade) {
@@ -190,7 +261,7 @@ pub(crate) fn update(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
             }
             let context=crate::canvas::paint_context(ctx,request.width.ceil() as u32,request.height.ceil() as u32,definition.alpha,&state.borrow().pixels)?;
             let size=ctx.new_instance(DomPaintSize {width:request.width as f64,height:request.height as f64});
-            let properties=ctx.new_instance(DomPaintStyleMap {values});
+            let properties=ctx.new_instance(DomPaintStyleMap {values,registrations});
             let arguments=JsHost::from_list(ctx,arguments);
             let paint=definition.paint.upgrade().ok_or_else(||OpError::new("InvalidStateError","paint method was collected"))?;
             ctx.call(paint,instance,&[context.clone(),size,properties,arguments])
@@ -305,6 +376,40 @@ mod tests {
         eval(&mut engine,"document.getElementById('target').style.setProperty('--extent','14')");
         frame(&mut engine,&realm,1016.0);
         let changed=pixels(&realm);assert_eq!(pixel(&changed,12,12),[0,128,0,255]);
+    }
+    #[test]
+    fn specification_paint_shorthand_drives_real_registered_map_and_pixels() {
+        let (mut engine,realm)=setup("registerPaint('shorthand',class{static get inputProperties(){return ['--items']}paint(ctx,size,map){const values=map.getAll('--items');const entries=Array.from(map);ctx.fillStyle=values.length===2 && values.every(value=>value instanceof CSSUnitValue) && entries[0][1].length===2 ? 'green':'red';ctx.fillRect(0,0,size.width,size.height)}})");
+        eval(&mut engine,"CSS.registerProperty({name:'--items',syntax:'<length>+',initialValue:'1px 2px',inherits:false});const sheet=document.createElement('style');sheet.textContent='#target{background:paint(shorthand)}';document.head.appendChild(sheet)");
+        frame(&mut engine,&realm,1000.0);
+        assert_eq!(pixel(&pixels(&realm),2,2),[0,128,0,255]);
+        assert!(matches!(eval(&mut engine,"getComputedStyle(document.getElementById('target')).backgroundImage==='paint(shorthand)'"),Value::Bool(true)));
+        eval(&mut engine,"document.getElementById('target').style.background='paint(shorthand) center / 100% 100% no-repeat'");
+        frame(&mut engine,&realm,1016.0);
+        assert_eq!(pixel(&pixels(&realm),12,12),[0,128,0,255]);
+    }
+    #[test]
+    fn specification_registered_paint_map_lists_iteration_and_computed_map_agreement() {
+        let (mut engine,realm)=setup(r#"
+            registerPaint('lists',class {
+                static get inputProperties(){return ['--space','--comma','--raw','--space'];}
+                paint(ctx,size,map){
+                    const units=(values,count)=>values.length===count && values.every(value=>value instanceof CSSUnitValue && value.unit==='px');
+                    if(map.size!==3 || !units(map.getAll('--space'),4) || !units(map.getAll('--comma'),2))throw Error('registered iterations');
+                    if(map.get('--space').value!==10 || !(map.get('--raw') instanceof CSSUnparsedValue))throw Error('first or universal value');
+                    const entries=Array.from(map);
+                    if(entries.map(entry=>entry[0]).join(',')!=='--comma,--raw,--space' || !units(entries[2][1],4))throw Error('ordered entries');
+                    if(Array.from(map.keys()).join(',')!=='--comma,--raw,--space' || !units(Array.from(map.values())[2],4))throw Error('keys or values');
+                    let seen=0;const receiver={};map.forEach(function(values,key,owner){if(this!==receiver || owner!==map || !Array.isArray(values))throw Error('callback');seen++;},receiver);
+                    if(seen!==3 || map.has('--missing') || map.getAll('--missing').length!==0)throw Error('missing or callback count');
+                    ctx.fillStyle='green';ctx.fillRect(0,0,size.width,size.height);
+                }
+            });
+        "#);
+        eval(&mut engine,"CSS.registerProperty({name:'--space',syntax:'<length>+',initialValue:'10px 20px 30px 40px',inherits:false});CSS.registerProperty({name:'--comma',syntax:'<length>#',initialValue:'1px, 2px',inherits:false});document.getElementById('target').style.setProperty('--raw','tokens');document.getElementById('target').style.backgroundImage='paint(lists)'");
+        frame(&mut engine,&realm,1000.0);
+        assert_eq!(pixel(&pixels(&realm),2,2),[0,128,0,255]);
+        assert!(matches!(eval(&mut engine,"document.getElementById('target').computedStyleMap().getAll('--space').length===4"),Value::Bool(true)));
     }
     #[test]
     fn paint_worklet_registered_initial_value_and_real_animation_sample_update_pixels() {

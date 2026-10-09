@@ -30,6 +30,8 @@ pub mod csp;
 pub mod csp_report;
 #[cfg(feature = "csp")]
 pub mod reporting;
+#[cfg(feature = "csp")]
+pub mod permissions_policy;
 pub mod crc32;
 #[cfg(feature = "crypt")]
 pub mod crypt;
@@ -57,6 +59,7 @@ pub mod hash;
 #[cfg(feature = "hash")]
 pub mod integrity;
 pub mod history;
+pub mod html_autofill;
 pub mod html_numbers;
 pub mod http_body;
 pub mod json;
@@ -110,3 +113,6 @@ pub mod video;
 pub mod wait;
 pub mod x509;
 pub mod xml;
+
+#[cfg(feature="vector-path")]
+pub mod svg_path;

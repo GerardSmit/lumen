@@ -662,12 +662,12 @@ impl DomMediaDevices {
                 "media device realm has been destroyed",
             )));
         };
-        let descriptions = realm.media_capture.host().map_or_else(Vec::new, |host| {
+        let descriptions = if !realm.use_permissions_policy(Some(ctx),super::permissions_policy::CAMERA){Vec::new()}else{realm.media_capture.host().map_or_else(Vec::new, |host| {
             (host.enumerate)()
                 .into_iter()
                 .filter(|device| device.kind == MediaDeviceKind::VideoInput)
                 .collect()
-        });
+        })};
         Promise::ready(Ok::<Vec<Value>, OpError>(
             descriptions
                 .into_iter()
@@ -698,6 +698,9 @@ impl DomMediaDevices {
                 "TypeError",
                 "at least one media kind must be requested",
             )));
+        }
+        if video && !realm.use_permissions_policy(Some(ctx),super::permissions_policy::CAMERA){
+            return Promise::ready(Err(OpError::new("NotAllowedError","camera is disabled by Permissions Policy")));
         }
         if audio {
             return Promise::ready(Err(OpError::new(

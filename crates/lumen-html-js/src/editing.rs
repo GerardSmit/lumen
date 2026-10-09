@@ -1524,7 +1524,7 @@ mod tests {
             );
             let unchanged = session.display_list(300, 100, fonts).unwrap().clone();
             assert_eq!(after, unchanged);
-            let mut fresh = lumen_html::RenderSession::new(session.document().clone());
+            let mut fresh = lumen_html::session::RenderSession::new(session.document().clone_document(true).unwrap());
             let fresh_list = fresh.display_list(300, 100, fonts).unwrap().clone();
             assert_eq!(
                 after, fresh_list,

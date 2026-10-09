@@ -25,7 +25,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
-use super::{composite, rounded_contains, Raster};
+use super::{composite, composite_disjoint_samples, rounded_contains, Raster};
 use lumen_html::paint::{BorderPattern, Rect, Rgba};
 
 fn inset_radii(radii: [[f32; 2]; 4], widths: [f32; 4]) -> [[f32; 2]; 4] {
@@ -260,20 +260,17 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
         draw_box(raster, &inner);
         return;
     }
-    let Some(visible) = raster
-        .clips
-        .last()
-        .and_then(|clip| clip.intersection(border.rect))
+    let Some(visible) = raster.visible_rect(border.rect)
     else {
         return;
     };
     let scale = raster.scale;
     let rect = border.rect;
     let (left, top, right, bottom) = (
-        rect.x * scale,
-        rect.y * scale,
-        (rect.x + rect.width) * scale,
-        (rect.y + rect.height) * scale,
+        raster.device_x(rect.x),
+        raster.device_y(rect.y),
+        raster.device_x(rect.x + rect.width),
+        raster.device_y(rect.y + rect.height),
     );
     let radius = (border.radius * scale)
         .min((right - left) * 0.5)
@@ -477,15 +474,8 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
                     coverage,
                 );
             } else {
-                for side in 0..8 {
-                    if hits[side] != 0 {
-                        composite(
-                            &mut raster.image.pixels[offset..offset + 4],
-                            colors[side],
-                            coverage * hits[side] as f32 / total as f32,
-                        );
-                    }
-                }
+                composite_disjoint_samples(&mut raster.image.pixels[offset..offset + 4],
+                    &colors, &hits, total, coverage);
             }
         }
     }
@@ -494,6 +484,56 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
 mod box_tests {
     use lumen_html::paint::{BoxBorder, Command, DisplayList, Rect, Rgba};
     use std::boxed::Box;
+
+    #[test]
+    fn specification_disjoint_border_samples_mix_premultiplied_color_before_source_over() {
+        let mut colors = [Rgba { r: 0, g: 0, b: 0, a: 0 }; 8];
+        colors[0] = Rgba { r: 255, g: 0, b: 0, a: 255 };
+        colors[1] = Rgba { r: 0, g: 0, b: 255, a: 128 };
+        let hits = [32, 32, 0, 0, 0, 0, 0, 0];
+        let mut pixel = [0; 4];
+        super::composite_disjoint_samples(&mut pixel, &colors, &hits, 64, 1.0);
+        assert_eq!(pixel, [170, 0, 85, 192], "two adjacent halves combine their authored opacity");
+        colors[1].a = 0;
+        pixel = [0; 4];
+        super::composite_disjoint_samples(&mut pixel, &colors, &hits, 64, 1.0);
+        assert_eq!(pixel, [255, 0, 0, 128], "transparent samples contribute no color");
+    }
+
+    #[test]
+    fn specification_adjoining_border_colors_keep_complete_coverage_and_authored_alpha() {
+        use lumen_html::paint::BorderPattern;
+        let rect = Rect { x: 0.0, y: 0.0, width: 8.0, height: 8.0 };
+        for pattern in [None, Some(BorderPattern::Inset), Some(BorderPattern::Outset),
+            Some(BorderPattern::Groove), Some(BorderPattern::Ridge)] {
+            for alpha in [128, 255] {
+                let colors = [Rgba { r: 255, g: 0, b: 0, a: alpha },
+                    Rgba { r: 0, g: 0, b: 255, a: alpha },
+                    Rgba { r: 0, g: 128, b: 0, a: alpha },
+                    Rgba { r: 128, g: 0, b: 128, a: alpha }];
+                let border = Command::StrokeBoxBorder(Box::new(BoxBorder { rect, radius: 0.0,
+                    widths: [2.0; 4], colors, pattern, side_patterns: None, corners: None }));
+                let image = crate::render(&DisplayList(vec![border.clone()]), 8, 8, 1.0, true).unwrap();
+                for (x, y) in [(0, 0), (7, 0), (0, 7), (7, 7), (1, 1), (6, 6)] {
+                    assert_eq!(image.pixels[(y * 8 + x) * 4 + 3], alpha,
+                        "disjoint corner samples cover one border surface: {pattern:?}");
+                }
+                if alpha == 255 {
+                    let mut painted = Vec::new();
+                    for background in [Rgba { r: 255, g: 0, b: 0, a: 255 },
+                        Rgba { r: 255, g: 255, b: 255, a: 255 }] {
+                        painted.push(crate::render(&DisplayList(vec![Command::FillRect { rect, color: background },
+                            border.clone()]), 8, 8, 1.0, true).unwrap());
+                    }
+                    for (x, y) in [(0, 0), (7, 0), (0, 7), (7, 7), (1, 1), (6, 6)] {
+                        let offset = (y * 8 + x) * 4;
+                        assert_eq!(&painted[0].pixels[offset..offset + 4], &painted[1].pixels[offset..offset + 4],
+                            "opaque corner colors cannot reveal their different backgrounds: {pattern:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn double_borders_leave_the_background_visible_between_bands() {
@@ -668,19 +708,15 @@ pub(super) fn draw(
         );
         return;
     }
-    let Some(visible) = raster
-        .clips
-        .last()
-        .copied()
-        .and_then(|clip| clip.intersection(rect))
+    let Some(visible) = raster.visible_rect(rect)
     else {
         return;
     };
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
-    let left = rect.x * raster.scale;
-    let top = rect.y * raster.scale;
-    let right = (rect.x + rect.width) * raster.scale;
-    let bottom = (rect.y + rect.height) * raster.scale;
+    let left = raster.device_x(rect.x);
+    let top = raster.device_y(rect.y);
+    let right = raster.device_x(rect.x + rect.width);
+    let bottom = raster.device_y(rect.y + rect.height);
     let border = (width * raster.scale)
         .min((right - left) * 0.5)
         .min((bottom - top) * 0.5);

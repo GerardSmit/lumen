@@ -178,7 +178,7 @@ pub(super) fn fill(
     if image_rect.width <= 0.0 || image_rect.height <= 0.0 {
         return;
     }
-    let Some(visible) = raster.clips.last().and_then(|clip| clip.intersection(rect)) else {
+    let Some(visible) = raster.visible_rect(rect) else {
         return;
     };
     let xaxis = Axis::new(
@@ -224,11 +224,11 @@ pub(super) fn fill(
     let scale = raster.scale;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let columns: Vec<Option<f32>> = (x0..x1)
-        .map(|x| xaxis.sample((x as f32 + 0.5) / scale))
+        .map(|x| xaxis.sample(raster.css_x(x as f32 + 0.5)))
         .collect();
     let mut hint = 0;
     for y in y0..y1 {
-        let Some(py) = yaxis.sample((y as f32 + 0.5) / scale) else {
+        let Some(py) = yaxis.sample(raster.css_y(y as f32 + 0.5)) else {
             continue;
         };
         let row = gradient.as_ref().map_or(0.0, |g| g.row_term(py));
@@ -241,16 +241,16 @@ pub(super) fn fill(
                     super::coverage::rounded_corners(
                         x as f32,
                         y as f32,
-                        rect.x * scale,
-                        rect.y * scale,
-                        (rect.x + rect.width) * scale,
-                        (rect.y + rect.height) * scale,
+                        raster.device_x(rect.x),
+                        raster.device_y(rect.y),
+                        raster.device_x(rect.x + rect.width),
+                        raster.device_y(rect.y + rect.height),
                         corners.map(|r| [r[0] * scale, r[1] * scale]),
                     )
                 } else {
                     rect.contains_corners(
-                        (x as f32 + 0.5) / scale,
-                        (y as f32 + 0.5) / scale,
+                        raster.css_x(x as f32 + 0.5),
+                        raster.css_y(y as f32 + 0.5),
                         corners,
                     ) as u8 as f32
                 }
@@ -258,14 +258,14 @@ pub(super) fn fill(
                 super::coverage::rounded(
                     x as f32,
                     y as f32,
-                    rect.x * scale,
-                    rect.y * scale,
-                    (rect.x + rect.width) * scale,
-                    (rect.y + rect.height) * scale,
+                    raster.device_x(rect.x),
+                    raster.device_y(rect.y),
+                    raster.device_x(rect.x + rect.width),
+                    raster.device_y(rect.y + rect.height),
                     radius * scale,
                 )
             } else {
-                rect.contains_rounded((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale, radius)
+                rect.contains_rounded(raster.css_x(x as f32 + 0.5), raster.css_y(y as f32 + 0.5), radius)
                     as u8 as f32
             };
             if coverage == 0.0 {

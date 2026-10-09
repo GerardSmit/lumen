@@ -130,7 +130,11 @@ fn nullable_window(ctx: &mut Ctx, value: Value) -> OpResult<Value> {
     if matches!(value, Value::Null | Value::Undefined) {
         return Ok(Value::Null);
     }
-    if ctx.with_instance::<DomWindow, _>(&value, |_| ()).is_ok() {
+    // Conversion checks the interface brand, not access to a Window member.
+    // A cross-origin WindowProxy remains a Window value.
+    if ctx.is_window_proxy_value(&value)
+        || ctx.with_instance::<DomWindow, _>(&value, |_| ()).is_ok()
+    {
         Ok(value)
     } else {
         Err(OpError::type_error(

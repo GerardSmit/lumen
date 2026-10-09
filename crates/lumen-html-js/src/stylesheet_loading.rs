@@ -493,7 +493,7 @@ impl StylesheetLinks {
     }
 }
 
-fn is_style(document:&lumen_html::Document,node:NodeId)->bool {
+pub(crate) fn is_style(document:&lumen_html::Document,node:NodeId)->bool {
     matches!(document.kind(node),Ok(NodeKind::Element{name,namespace,..})
         if matches!(namespace,Namespace::Html|Namespace::Svg) && lumen_html::svg::local_name(name)=="style")
 }

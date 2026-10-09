@@ -26,6 +26,8 @@ mod color_values;
 mod image_source;
 mod media_queries;
 pub(crate) mod columns;
+pub(crate) mod break_control;
+pub use break_control::BreakControl;
 pub use columns::ColumnWidth;
 mod intrinsic_override;
 pub use intrinsic_override::IntrinsicOverride;
@@ -668,6 +670,21 @@ pub enum VerticalAlign {
     Length(LengthPercentage),
 }
 
+/// CSS Transforms 1 §5 computed keyword; used aliases depend on the
+/// element's actual CSS layout box or SVG geometry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransformBox {ContentBox,BorderBox,FillBox,StrokeBox,#[default] ViewBox}
+impl TransformBox {
+    pub fn keyword(self)->&'static str {match self {Self::ContentBox=>"content-box",Self::BorderBox=>"border-box",Self::FillBox=>"fill-box",Self::StrokeBox=>"stroke-box",Self::ViewBox=>"view-box"}}
+    pub fn svg_reference_box(self,fill:Rect,stroke:Rect,viewport:Rect)->Rect {
+        match self {Self::ContentBox|Self::FillBox=>fill,Self::BorderBox|Self::StrokeBox=>stroke,Self::ViewBox=>viewport}
+    }
+    fn parse(input:&str)->Option<Self> {
+        [Self::ContentBox,Self::BorderBox,Self::FillBox,Self::StrokeBox,Self::ViewBox]
+            .into_iter().find(|value|decoded_css_keyword(input,value.keyword()))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BoxSizing {
     ContentBox,
@@ -963,7 +980,8 @@ impl Transform {
                 ..Affine::IDENTITY
             },
             Transform::Rotate(angle) => {
-                let (s, c) = (libm::sinf(angle), libm::cosf(angle));
+                let (s,c)=lumen_common::dom_geometry::exact_quarter_turn_radians_f32(angle)
+                    .unwrap_or_else(||(libm::sinf(angle),libm::cosf(angle)));
                 Affine {
                     a: c,
                     b: s,
@@ -2264,9 +2282,28 @@ pub enum PseudoElement {
     ViewTransitionOld,
     ViewTransitionNew,
     Placeholder,
+    BeforeMarker,
+    AfterMarker,
 }
 
 impl PseudoElement {
+    pub fn is_marker(self) -> bool {
+        matches!(self, Self::Marker | Self::BeforeMarker | Self::AfterMarker)
+    }
+
+    pub fn marker_origin(self) -> Option<Self> {
+        match self { Self::BeforeMarker => Some(Self::Before), Self::AfterMarker => Some(Self::After), _ => None }
+    }
+
+    pub fn generated_marker(self) -> Option<Self> {
+        match self { Self::Before => Some(Self::BeforeMarker), Self::After => Some(Self::AfterMarker), _ => None }
+    }
+
+    pub(crate) fn generated_source_order(self) -> u8 {
+        match self { Self::Marker => 1, Self::Before => 2, Self::BeforeMarker => 3,
+            Self::After => 4, Self::AfterMarker => 5, _ => 6 }
+    }
+
     pub fn is_view_transition(self) -> bool {
         matches!(self, Self::ViewTransition | Self::ViewTransitionGroup
             | Self::ViewTransitionImagePair | Self::ViewTransitionOld | Self::ViewTransitionNew)
@@ -2485,6 +2522,13 @@ pub struct SourceColor {
     pub color_function:bool,
     pub expression:Option<Arc<ColorExpression>>,
 }
+/// Filter shadows share the sparse source-color carrier with box/text shadows.
+#[derive(Clone,Debug,PartialEq)]
+struct SourceFilterList {
+    filters:Arc<[lumen_common::filter::FilterOperation]>,
+    colors:Option<Arc<[SourceColor]>>,
+}
+
 /// Shared computed shadow endpoints retain floating-point colors only when
 /// the ordinary display carrier would discard source precision or dependency.
 #[derive(Clone,Debug,PartialEq)]
@@ -2498,6 +2542,15 @@ impl SourceShadowList {
             .or_else(||self.shadows.get(index).map(|shadow|legacy_source_color(shadow.color)))
     }
 }
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub struct SvgFilterProperties {pub flood:Rgba,pub opacity:f32,pub interpolation:FilterInterpolation}
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub enum FilterInterpolation {Auto,Srgb,LinearRgb}
+impl FilterInterpolation {
+    pub fn space(self)->lumen_common::color::ColorSpace {match self{Self::Auto|Self::Srgb=>lumen_common::color::ColorSpace::Srgb,Self::LinearRgb=>lumen_common::color::ColorSpace::SrgbLinear}}
+    pub(crate) fn css_keyword(self)->&'static str {match self{Self::Auto=>"auto",Self::Srgb=>"srgb",Self::LinearRgb=>"linearrgb"}}
+}
+impl SvgFilterProperties {pub const INITIAL:Self=Self{flood:Rgba{r:0,g:0,b:0,a:255},opacity:1.0,interpolation:FilterInterpolation::LinearRgb};}
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleExtras {
     pub source_colors:Option<Arc<[(usize,SourceColor)]>>,
@@ -2542,6 +2595,10 @@ pub struct StyleExtras {
     pub contain_inline_size: bool,
     pub contain_intrinsic: Option<Arc<[IntrinsicOverride;4]>>,
     pub column_width: ColumnWidth,
+    /// Initial line-count constraints share no allocation; noninitial pairs
+    /// live only in the existing rare computed-style carrier.
+    line_break_counts: Option<Arc<[usize;2]>>,
+    break_controls: Option<Arc<FragmentationStyle>>,
     pub visibility_visible: bool,
     /// Retain the computed `collapse` keyword separately from `hidden` so
     /// table track suppression does not erase the shared visibility value.
@@ -2551,6 +2608,8 @@ pub struct StyleExtras {
     pub svg_fill: SvgPaint,
     pub svg_stroke: SvgPaint,
     pub svg_stroke_width: f32,
+    pub svg_fill_opacity: f32,
+    pub svg_stroke_opacity: f32,
     pub svg_fill_rule: SvgFillRule,
     pub svg_clip_rule: SvgFillRule,
     pub svg_clip_path: Option<Arc<str>>,
@@ -2559,6 +2618,10 @@ pub struct StyleExtras {
     pub svg_geometry: [Option<Arc<str>>; 9],
     pub svg_stop_color: Rgba,
     pub svg_stop_opacity: f32,
+    svg_filter_properties:Option<Arc<SvgFilterProperties>>,
+    /// Declaring tree chain for local filter URL references, retained through
+    /// inheritance/revert by the same canonical name-scope authority as fonts.
+    pub(crate) filter_reference_scope:Option<Arc<[NodeId]>>,
     /// `content` is evaluated against the pseudo-element's originating node
     /// by layout; it is deliberately not inherited.
     pub generated_content: Option<Arc<[GeneratedContentItem]>>,
@@ -2608,6 +2671,7 @@ pub struct StyleExtras {
     pub max_height_intrinsic: Option<IntrinsicSizing>,
     pub logical_inline_size: Option<f32>,
     pub logical_block_size: Option<f32>,
+    pub logical_overflow: [Option<Overflow>; 2],
     pub logical_min_size: [Option<f32>; 2],
     pub logical_max_size: [Option<f32>; 2],
     pub logical_offsets: [Option<Option<f32>>; 4],
@@ -2652,6 +2716,7 @@ pub struct StyleExtras {
     pub(crate) individual_transforms:[Option<Arc<individual_transforms::IndividualTransform>>;3],
     pub filters: Option<Arc<[lumen_common::filter::FilterOperation]>>,
     pub transform_origin: [TransformLength; 2],
+    pub transform_box:TransformBox,
     pub border_pattern: Option<BorderPattern>,
     pub shadows: Option<Arc<[BoxShadow]>>,
     pub background_images: Option<Arc<[BackgroundImage]>>,
@@ -2778,6 +2843,8 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     contain_inline_size: false,
     contain_intrinsic: None,
     column_width: ColumnWidth::Auto,
+    line_break_counts: None,
+    break_controls: None,
     visibility_visible: true,
     visibility_collapsed: false,
     pointer_events_auto: true,
@@ -2789,6 +2856,8 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     }),
     svg_stroke: SvgPaint::None,
     svg_stroke_width: 1.0,
+    svg_fill_opacity: 1.0,
+    svg_stroke_opacity: 1.0,
     svg_fill_rule: SvgFillRule::NonZero,
     svg_clip_rule: SvgFillRule::NonZero,
     svg_clip_path: None,
@@ -2800,6 +2869,8 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
         a: 255,
     },
     svg_stop_opacity: 1.0,
+    svg_filter_properties:None,
+    filter_reference_scope:None,
     generated_content: None,
     content_none: false,
     color_scheme: None,
@@ -2839,6 +2910,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     max_height_intrinsic: None,
     logical_inline_size: None,
     logical_block_size: None,
+    logical_overflow: [None; 2],
     logical_min_size: [None; 2],
     logical_max_size: [None; 2],
     logical_offsets: [None; 4],
@@ -2887,6 +2959,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     grid_columns_auto: None,
     grid_rows_auto: None,
     transforms: None,
+    transform_box:TransformBox::ViewBox,
     individual_transforms:[None,None,None],
     filters: None,
     transform_origin: [TransformLength {
@@ -3122,8 +3195,53 @@ impl Style {
         image_source::computed_layers(&expression.raw,expression.context,ContainerUnitContext::no_container(expression.context.viewport),&self.resolved_source_color(1,self.color),expression.source_url.as_deref())
     }
     pub fn used_color_scheme(&self,environment:MediaEnvironment)->UsedScheme {environment.color_schemes.element(self.color_scheme.as_deref())}
+    fn resolve_context_value(&self,slot:usize,raw:&str,context:LengthContext,nonnegative:bool,query:ContainerUnitContext)->Option<Value> {
+        if slot==233 {return filter_source_list(raw,&self.resolved_source_color(1,self.color),context,query).map(Value::SourceFilters);}
+        context_length_value(slot,raw,context,nonnegative,query)
+    }
+    fn resolve_filter_urls(&mut self,base:Option<&str>) {
+        let Some(filters)=self.filters.as_ref().filter(|filters|filters.iter().any(|filter|matches!(filter,lumen_common::filter::FilterOperation::Url(url) if !url.local && !url.href.is_empty()))) else{return;};
+        let mut resolved=Vec::new();if resolved.try_reserve_exact(filters.len()).is_err(){return;}
+        for filter in filters.iter(){resolved.push(match filter {
+            lumen_common::filter::FilterOperation::Url(reference) if !reference.local && !reference.href.is_empty()=>{
+                let href=resolve_css_url(&reference.href,base).unwrap_or_else(||reference.href.clone());
+                lumen_common::filter::FilterOperation::Url(Arc::new(lumen_common::filter::UrlReference{href,local:false}))
+            }
+            _=>filter.clone(),
+        });}
+        self.filters=Some(resolved.into());
+    }
+    pub fn svg_filter_properties(&self)->SvgFilterProperties {self.svg_filter_properties.as_deref().copied().unwrap_or(SvgFilterProperties::INITIAL)}
+    fn set_svg_filter_properties(&mut self,value:SvgFilterProperties) {
+        if value==self.svg_filter_properties(){return;}
+        if value==SvgFilterProperties::INITIAL {self.svg_filter_properties=None;}else{
+            let stored=self.svg_filter_properties.get_or_insert_with(||Arc::new(SvgFilterProperties::INITIAL));
+            *Arc::make_mut(stored)=value;
+        }
+    }
+    pub fn has_spatial_filters(&self)->bool {self.filters.as_ref().is_some_and(|filters|filters.iter().any(lumen_common::filter::FilterOperation::is_spatial))}
+    pub(super) fn filter_shadow_color_value(&self,index:usize,fallback:lumen_common::color::Color)->Option<String> {
+        let source=self.shadow_source_colors.as_ref().and_then(|lists|lists.iter().find(|(slot,_)|*slot==233))
+            .and_then(|(_,colors)|colors.get(index));
+        match source {
+            Some(source)=>match source.expression.as_ref() {
+                Some(expression) if !decoded_css_keyword(&expression.raw,"currentcolor")=>color_values::serialize_computed(&expression.raw,expression.context,expression.query),
+                _=>source.serialize(),
+            },
+            None=>color_values::serialize(fallback,false),
+        }
+    }
     pub fn source_shadow_list(&self,slot:usize)->Option<SourceShadowList> {
-        let shadows=match slot{58=>self.shadows.clone()?,219=>self.text_shadows.clone()?,_=>return None};
+        let shadows=match slot{58=>self.shadows.clone()?,219=>self.text_shadows.clone()?,233=>{
+            let mut shadows=Vec::new();
+            for filter in self.filters.as_ref()?.iter() {
+                if let lumen_common::filter::FilterOperation::DropShadow(shadow)=filter {
+                    shadows.try_reserve(1).ok()?;shadows.push(BoxShadow{offset_x:shadow.offset[0],offset_y:shadow.offset[1],
+                        blur:shadow.sigma,spread:0.0,color:color_values::rgba(shadow.color),inset:false});
+                }
+            }
+            Arc::from(shadows)
+        },_=>return None};
         let colors=self.shadow_source_colors.as_ref().and_then(|lists|lists.iter().find(|(key,_)|*key==slot)).map(|(_,colors)|colors.clone());
         Some(SourceShadowList{shadows,colors})
     }
@@ -3136,7 +3254,16 @@ impl Style {
         self.shadow_source_colors=(!lists.is_empty()).then(||Arc::from(lists));
     }
     fn apply_source_shadows(&mut self,slot:usize,source:SourceShadowList) {
-        if slot==219 {self.text_shadows=Some(source.shadows);self.text_shadow_current_color=0;}
+        if slot==233 {
+            let Some(filters)=self.filters.as_mut() else{return;};
+            let mut index=0;
+            for filter in Arc::make_mut(filters).iter_mut() {
+                if let lumen_common::filter::FilterOperation::DropShadow(shadow)=filter {
+                    if let Some(color)=source.color(index) {Arc::make_mut(shadow).color=color.value;}
+                    index+=1;
+                }
+            }
+        } else if slot==219 {self.text_shadows=Some(source.shadows);self.text_shadow_current_color=0;}
         else{self.shadows=Some(source.shadows);}
         self.set_shadow_sources(slot,source.colors);
     }
@@ -3223,6 +3350,7 @@ impl Style {
             match *slot {
                 1=>self.color=value,2=>self.background=value,10=>self.border_color=value,
                 79=>self.column_rule_color=Some(value),141=>self.svg_fill=SvgPaint::Color(value),142=>self.svg_stroke=SvgPaint::Color(value),156=>self.svg_stop_color=value,119..=122=>self.border_color_sides[*slot-119]=Some(value),
+                252=>{let mut properties=self.svg_filter_properties();properties.flood=value;self.set_svg_filter_properties(properties);},
                 187=>self.outline.color=Some(value),203=>self.text_decoration_color=Some(value),107..=110=>self.logical_border_color[*slot-107]=Some(value),_=>{},
             }
         }
@@ -3277,7 +3405,62 @@ impl Style {
         self.source_colors=(!colors.is_empty()).then(||Arc::from(colors));
     }
 }
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub(crate) enum ColumnSpan {
+    #[default] None,All,Auto,Count(usize),
+}
+impl ColumnSpan {
+    fn serialize(self)->String {match self{Self::None=>"none".into(),Self::All=>"all".into(),Self::Auto=>"auto".into(),Self::Count(value)=>value.to_string()}}
+}
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub(crate) enum BoxDecorationBreak {#[default] Slice,Clone}
+impl BoxDecorationBreak {
+    fn serialize(self)->String {match self{Self::Slice=>"slice",Self::Clone=>"clone"}.into()}
+}
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+struct FragmentationStyle {
+    controls:[BreakControl;3],
+    span:ColumnSpan,
+    decoration:BoxDecorationBreak,
+}
 impl Style {
+    pub(crate) fn break_controls(&self)->[BreakControl;3] {
+        self.break_controls.as_deref().map_or([BreakControl::Auto;3],|value|value.controls)
+    }
+    fn set_break_control(&mut self,slot:usize,value:BreakControl) {
+        let mut payload=self.break_controls.as_deref().copied().unwrap_or_default();let index=slot-247;
+        if payload.controls[index]==value{return;}
+        payload.controls[index]=value;
+        self.break_controls=(payload!=FragmentationStyle::default()).then(||Arc::new(payload));
+    }
+    pub(crate) fn column_span(&self)->ColumnSpan {
+        self.break_controls.as_deref().map_or(ColumnSpan::None,|value|value.span)
+    }
+    fn set_column_span(&mut self,value:ColumnSpan) {
+        let mut payload=self.break_controls.as_deref().copied().unwrap_or_default();
+        if payload.span==value{return;}
+        payload.span=value;
+        self.break_controls=(payload!=FragmentationStyle::default()).then(||Arc::new(payload));
+    }
+    pub(crate) fn box_decoration_break(&self)->BoxDecorationBreak {
+        self.break_controls.as_deref().map_or(BoxDecorationBreak::Slice,|value|value.decoration)
+    }
+    fn set_box_decoration_break(&mut self,value:BoxDecorationBreak) {
+        let mut payload=self.break_controls.as_deref().copied().unwrap_or_default();
+        if payload.decoration==value{return;}
+        payload.decoration=value;
+        self.break_controls=(payload!=FragmentationStyle::default()).then(||Arc::new(payload));
+    }
+    pub(crate) fn line_break_counts(&self)->[usize;2] {
+        self.line_break_counts.as_deref().copied().unwrap_or([2,2])
+    }
+    fn set_line_break_count(&mut self,slot:usize,value:usize) {
+        let mut counts=self.line_break_counts();
+        let index=slot-244;
+        if counts[index]==value{return;}
+        counts[index]=value;
+        self.line_break_counts=(counts!=[2,2]).then(||Arc::new(counts));
+    }
     /// Consume the computed line-height only on a formatter-owned style copy.
     /// HTML text-entry widgets apply a font-metric floor to its used value.
     pub(crate) fn project_used_line_height(&mut self, value: f32) {
@@ -3316,6 +3499,11 @@ impl Style {
             }
         }
     }
+    pub(crate) fn has_contextual_svg_dimensions(&self) -> bool {
+        self.relative_lengths.iter().any(|(slot, _)| matches!(*slot, 3 | 4 | 23 | 24 | 51 | 52))
+            || self.relative_expressions.iter().any(|source| matches!(source.slot, 3 | 4 | 23 | 24 | 51 | 52))
+    }
+
     /// Replaced elements prefer their natural ratio for `auto <ratio>`;
     /// degenerate ratios behave as `auto` without dividing by zero in layout.
     pub fn preferred_aspect_ratio(&self, natural: Option<f32>) -> Option<f32> {
@@ -3361,25 +3549,30 @@ impl Style {
     /// removes this axis's preferred/min/max short circuits and percentages.
     pub fn intrinsic_measurement_style(&self, horizontal: bool) -> Style {
         let mut result = self.clone();
-        result.clear_intrinsic_size_keywords(horizontal);
-        if horizontal { result.width = None; result.min_width = 0.0; result.max_width = None; if result.min_width_auto { result.min_width_auto = false; } }
-        else { result.height = None; result.min_height = 0.0; result.max_height = None; if result.min_height_auto { result.min_height_auto = false; } }
+        result.clear_intrinsic_measurement_axis(horizontal);
+        result
+    }
+
+    pub(crate) fn clear_intrinsic_measurement_axis(&mut self, horizontal: bool) {
+        self.clear_intrinsic_size_keywords(horizontal);
+        if horizontal { self.width = None; self.min_width = 0.0; self.max_width = None; if self.min_width_auto { self.min_width_auto = false; } }
+        else { self.height = None; self.min_height = 0.0; self.max_height = None; if self.min_height_auto { self.min_height_auto = false; } }
         let inline = horizontal == (self.writing_mode == WritingMode::HorizontalTb);
         let slots = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
         let logical = if inline { [87, 91, 92] } else { [88, 93, 94] };
         let axis = usize::from(!inline);
-        if inline { if result.logical_inline_size.is_some() { result.logical_inline_size = None; } }
-        else if result.logical_block_size.is_some() { result.logical_block_size = None; }
-        if result.logical_min_size[axis].is_some() { result.logical_min_size[axis] = None; }
-        if result.logical_max_size[axis].is_some() { result.logical_max_size[axis] = None; }
-        if result.relative_lengths.iter().any(|(slot, _)| slots.contains(slot) || logical.contains(slot)) {
-            result.relative_lengths.retain(|(slot, _)| !slots.contains(slot) && !logical.contains(slot));
+        if inline { if self.logical_inline_size.is_some() { self.logical_inline_size = None; } }
+        else if self.logical_block_size.is_some() { self.logical_block_size = None; }
+        if self.logical_min_size[axis].is_some() { self.logical_min_size[axis] = None; }
+        if self.logical_max_size[axis].is_some() { self.logical_max_size[axis] = None; }
+        if self.relative_lengths.iter().any(|(slot, _)| slots.contains(slot) || logical.contains(slot)) {
+            self.relative_lengths.retain(|(slot, _)| !slots.contains(slot) && !logical.contains(slot));
         }
-        if result.relative_expressions.iter().any(|expression| slots.contains(&expression.slot) || logical.contains(&expression.slot)) {
-            result.relative_expressions.retain(|expression| !slots.contains(&expression.slot) && !logical.contains(&expression.slot));
+        if self.relative_expressions.iter().any(|expression| slots.contains(&expression.slot) || logical.contains(&expression.slot)) {
+            self.relative_expressions.retain(|expression| !slots.contains(&expression.slot) && !logical.contains(&expression.slot));
         }
-        result
     }
+
     /// Relative-position computed offsets. Specified non-auto sides remain
     /// visible; an auto side resolves to the negative opposite side, or zero
     /// when both are auto. Layout consumes the start offsets from this same
@@ -3556,6 +3749,14 @@ impl Style {
         })
     }
 
+    /// WM4 §5.1: upright vertical typography forces the used inline
+    /// direction to LTR. Keep the computed carrier for cascade and CSSOM.
+    pub fn used_direction(&self) -> Direction {
+        if matches!(self.writing_mode, WritingMode::VerticalRl | WritingMode::VerticalLr)
+            && self.text_orientation == TextOrientation::Upright { Direction::Ltr }
+        else { self.direction }
+    }
+
     /// Sideways writing modes rotate text regardless of computed text-orientation.
     pub fn used_text_orientation(&self) -> TextOrientation {
         if matches!(self.writing_mode, WritingMode::SidewaysRl | WritingMode::SidewaysLr) {
@@ -3565,9 +3766,19 @@ impl Style {
         }
     }
 
+    /// Writing Modes 4 §6.4: the line-relative ascender/over edge.
+    /// It is independent of direction and need not be block-start.
+    pub fn line_over_side(&self) -> usize {
+        match self.writing_mode {
+            WritingMode::HorizontalTb => 0,
+            WritingMode::SidewaysLr => 3,
+            WritingMode::VerticalRl | WritingMode::VerticalLr | WritingMode::SidewaysRl => 1,
+        }
+    }
+
     /// Inline-start/end, block-start/end physical edges in that order.
     pub fn logical_sides(&self) -> [usize; 4] {
-        match (self.writing_mode, self.direction) {
+        match (self.writing_mode, self.used_direction()) {
             (WritingMode::HorizontalTb, Direction::Ltr) => [3, 1, 0, 2],
             (WritingMode::HorizontalTb, Direction::Rtl) => [1, 3, 0, 2],
             (WritingMode::VerticalRl, Direction::Ltr) => [0, 2, 1, 3],
@@ -3800,6 +4011,8 @@ impl Style {
             .checked_add(self.relative_expressions.capacity().checked_mul(core::mem::size_of::<RelativeExpression>())?)?;
         for value in self.individual_transforms.iter().flatten(){bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of::<individual_transforms::IndividualTransform>())?.checked_add(value.checked_retained_bytes()?)?;}
         if let Some(pending) = &self.registered_query { bytes = bytes.checked_add(pending.checked_retained_bytes()?)?; }
+        if let Some(properties)=&self.svg_filter_properties{bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(properties.as_ref()))?;}
+        if let Some(scopes)=&self.filter_reference_scope{bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(scopes.as_ref()))?;}
         for expression in &self.relative_expressions {
             bytes=bytes.checked_add(header.checked_add(expression.raw.len())?)?;
             if let Some(url)=&expression.source_url { bytes=bytes.checked_add(header.checked_add(url.len())?)?; }
@@ -3829,6 +4042,8 @@ impl Style {
         }
         if let Some(axes)=&self.contain_intrinsic {bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(axes.as_ref()))?;}
         bytes=bytes.checked_add(self.column_width.checked_retained_bytes()?)?;
+        if let Some(counts)=&self.line_break_counts {bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(counts.as_ref()))?;}
+        if let Some(controls)=&self.break_controls {bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(controls.as_ref()))?;}
         if let Some(origins)=&self.image_color_origins {
             bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(origins.as_ref()))?;
         }
@@ -3856,9 +4071,29 @@ impl Style {
         }
     }
     pub fn has_transform(&self)->bool {
-        self.transforms.is_some()||self.individual_transforms.iter().any(Option::is_some)||self.relative_expressions.iter().any(|expression|(239..=241).contains(&expression.slot))
+        self.transforms.is_some()||self.individual_transforms.iter().any(Option::is_some)||self.relative_expressions.iter().any(|expression|expression.slot==59||(239..=241).contains(&expression.slot))
+    }
+    pub(crate) fn transform_timeline_source(&self)->Option<&Arc<str>> {
+        self.relative_expressions.iter().find(|expression|expression.slot==59)
+            .filter(|expression|typed_transforms::has_timeline_progress(&expression.raw)).map(|expression|&expression.raw)
+    }
+    /// The CSS layout reference aliases retain the specified keyword. A
+    /// table uses its wrapper border box for both content and border choices.
+    pub(crate) fn css_transform_reference_insets(&self)->Option<[f32;4]> {
+        if self.display.is_table() || !matches!(self.transform_box,TransformBox::ContentBox|TransformBox::FillBox) {return None;}
+        let widths=self.used_border_widths();let padding=self.padding_sides();
+        Some(core::array::from_fn(|side|widths[side]+padding[side]))
+    }
+    pub fn css_transform_reference_box(&self,border:Rect)->Rect {
+        let Some([top,right,bottom,left])=self.css_transform_reference_insets() else{return border;};
+        Rect{x:border.x+left,y:border.y+top,
+            width:(border.width-left-right).max(0.0),
+            height:(border.height-top-bottom).max(0.0)}
     }
     pub fn transform_matrix(&self, rect: Rect) -> Option<Affine> {
+        self.transform_matrix_with_source(self.css_transform_reference_box(rect),None)
+    }
+    pub(crate) fn transform_matrix_with_source(&self,rect:Rect,used_source:Option<&str>)->Option<Affine>{
         if !self.has_transform(){return None;}
         let transforms = self.transforms.as_deref().unwrap_or(&[]);
         let mut matrix = Affine {
@@ -3870,7 +4105,7 @@ impl Style {
             f: 0.0,
         };
         let source_matrix=if let Some(source)=self.relative_expressions.iter().find(|expression|expression.slot==59) {
-            Some(typed_transforms::computed_matrix(&source.raw,Some([rect.width as f64,rect.height as f64]))?)
+            Some(typed_transforms::computed_matrix(used_source.unwrap_or(&source.raw),Some([rect.width as f64,rect.height as f64]))?)
         }else{
             for transform in transforms.iter() {
                 let local = transform.matrix(rect.width, rect.height);
@@ -3948,6 +4183,12 @@ impl Style {
     pub(crate) fn has_min_width_percentage(&self) -> bool {
         self.cyclic_percentage_slot(23)
     }
+    pub(crate) fn has_min_height_percentage(&self) -> bool {
+        self.cyclic_percentage_slot(51)
+    }
+    pub(crate) fn has_max_height_percentage(&self) -> bool {
+        self.cyclic_percentage_slot(52)
+    }
     pub(crate) fn has_max_width_percentage(&self) -> bool {
         self.cyclic_percentage_slot(24)
     }
@@ -3955,20 +4196,21 @@ impl Style {
     /// length-percentage carrier, never from a sampled used pixel width.
     /// Nonlinear percentage math retains its normal used-value resolver and
     /// does not pretend to have a single intrinsic percentage coefficient.
-    pub(crate) fn table_width_percentage(&self) -> Option<f32> {
+    pub(crate) fn table_axis_percentage(&self, horizontal: bool) -> Option<f32> {
         let percentage = |slot| self.relative_lengths.iter()
             .find(|(key, length)| *key == slot && length.pixels == 0.0)
             .map(|(_, length)| length.percent / 100.0);
-        let width = percentage(3)?;
-        let maximum = percentage(24).unwrap_or(f32::INFINITY);
-        Some(width.min(maximum).max(0.0))
+        let size = percentage(if horizontal { 3 } else { 4 })?;
+        let maximum = percentage(if horizontal { 24 } else { 52 }).unwrap_or(f32::INFINITY);
+        Some(size.min(maximum).max(0.0))
     }
     /// CSS Values 3 §8.1.3 permits percentage-bearing math on internal
     /// table boxes to behave as auto. Keep simplified pure percentages as
     /// percentage constraints; mixed/nonlinear carriers remain computed
-    /// expressions and never become fabricated column width hints.
-    pub(crate) fn table_width_behaves_as_auto_math(&self) -> bool {
-        self.has_width_percentage() && self.table_width_percentage().is_none()
+    /// expressions and never become fabricated column size hints.
+    pub(crate) fn table_axis_behaves_as_auto_math(&self, horizontal: bool) -> bool {
+        self.cyclic_percentage_slot(if horizontal { 3 } else { 4 })
+            && self.table_axis_percentage(horizontal).is_none()
     }
     pub fn has_cyclic_box_edge_percentage(&self) -> bool {
         [5,6,39,40,41,42,43,44,45,46,81,82,83,84,85,86,99,100]
@@ -3994,6 +4236,13 @@ impl Style {
         axes: [bool; 2],
     ) -> Style {
         let mut result = self.resolve_percentages(width, height);
+        self.project_intrinsic_percentage_axes(&mut result, axes);
+        result
+    }
+
+    /// Project cyclic intrinsic size declarations using their unresolved
+    /// source, after the canonical contextual value resolver has run.
+    pub(crate) fn project_intrinsic_percentage_axes(&self, used: &mut Style, axes: [bool; 2]) {
         for (axis, slots) in [[3, 23, 24], [4, 51, 52]].into_iter().enumerate() {
             if !axes[axis] {
                 continue;
@@ -4004,38 +4253,47 @@ impl Style {
                     continue;
                 }
                 match slot {
-                    3 => { result.width = None; result.set_intrinsic_size_keyword(3, None); }
+                    3 => { used.width = None; used.set_intrinsic_size_keyword(3, None); }
                     4 => {
-                        result.height = None;
-                        result.height_intrinsic = None;
+                        used.height = None;
+                        used.height_intrinsic = None;
                     }
                     23 => {
-                        result.min_width = 0.0;
-                        result.min_width_auto = false;
-                        result.set_intrinsic_size_keyword(23, None);
+                        used.min_width = 0.0;
+                        used.min_width_auto = false;
+                        used.set_intrinsic_size_keyword(23, None);
                     }
                     51 => {
-                        result.min_height = 0.0;
-                        result.min_height_auto = false;
-                        result.min_height_intrinsic = None;
+                        used.min_height = 0.0;
+                        used.min_height_auto = false;
+                        used.min_height_intrinsic = None;
                     }
-                    24 => { result.max_width = None; result.set_intrinsic_size_keyword(24, None); }
+                    24 => { used.max_width = None; used.set_intrinsic_size_keyword(24, None); }
                     52 => {
-                        result.max_height = None;
-                        result.max_height_intrinsic = None;
+                        used.max_height = None;
+                        used.max_height_intrinsic = None;
                     }
                     _ => unreachable!(),
                 }
             }
         }
-        result
     }
 
     pub fn resolve_percentages(&self, width: f32, height: Option<f32>) -> Style {
         self.resolve_percentages_with_query(width, height, ContainerUnitContext::default())
     }
 
+    // Transform percentages use the target transform reference box. Their
+    // canonical source survives containing-block percentage projection until
+    // the shared used-matrix consumer has that actual box.
     pub fn resolve_percentages_with_query(&self, width: f32, height: Option<f32>, query: ContainerUnitContext) -> Style {
+        self.resolve_percentages_for_box(Some(width), height, Some(width), query)
+    }
+    /// Physical dimensions may be indefinite independently. Margin/padding
+    /// percentages consume the containing box's inline dimension, which is
+    /// separate from its physical width in a vertical formatting context.
+    pub(crate) fn resolve_percentages_for_box(&self, width: Option<f32>, height: Option<f32>,
+        inline: Option<f32>, query: ContainerUnitContext) -> Style {
         let query = query.for_writing_mode(self.writing_mode);
         let mut result = self.clone();
         for &(slot, length) in &self.relative_lengths {
@@ -4045,9 +4303,9 @@ impl Style {
             }
             let basis = if matches!(slot, 4 | 35 | 37 | 51 | 52) {
                 height
-            } else {
-                Some(width)
-            };
+            } else if matches!(slot, 5 | 6 | 39..=46 | 81..=86 | 99..=100) {
+                inline
+            } else { width };
             let value = basis.map(|basis| length.pixels + length.percent * basis / 100.0);
             if let Some(value) = value.filter(|v| v.is_finite()) {
                 if let Some(value) = length_value(
@@ -4060,6 +4318,13 @@ impl Style {
                 ) {
                     value.apply(&mut result);
                 }
+            } else if slot == 3 {
+                result.width = None;
+            } else if slot == 23 {
+                result.min_width = 0.0;
+                result.min_width_auto = false;
+            } else if slot == 24 {
+                result.max_width = None;
             } else if slot == 4 {
                 result.height = None;
             } else if slot == 51 {
@@ -4074,14 +4339,16 @@ impl Style {
         }
         result.relative_expressions.clear();
         for expression in self.relative_expressions.iter().filter(|expression|expression.slot==7).chain(self.relative_expressions.iter().filter(|expression|expression.slot!=7)) {
-            if expression.parent_font_pending || matches!(expression.slot, 53 | 227 | 178 | 158 | 69 | 131 | 139 | 200 | 228 | 229 | 230) { result.relative_expressions.push(expression.clone()); continue; }
+            if expression.parent_font_pending || matches!(expression.slot, 59 | 239..=241 | 53 | 227 | 178 | 158 | 69 | 131 | 139 | 200 | 228 | 229 | 230) { result.relative_expressions.push(expression.clone()); continue; }
             if expression.slot == 20 {
                 result.flex_basis = None;
                 continue;
             }
             let basis = if matches!(expression.slot, 7 | 13) {
                 expression.context.percent
-            } else if matches!(expression.slot, 4 | 35 | 37 | 51 | 52) { height } else { Some(width) };
+            } else if matches!(expression.slot, 4 | 35 | 37 | 51 | 52) { height }
+            else if matches!(expression.slot, 5 | 6 | 39..=46 | 81..=86 | 99..=100) { inline }
+            else { width };
             let Some(context)=result.current_font_length_context(expression,None) else{result.relative_expressions.push(expression.clone());continue;};
             if color_slot(expression.slot) {
                 let origin=result.stored_source_color(expression.slot).and_then(|source|source.expression.as_ref().and_then(|expression|expression.origin));
@@ -4099,13 +4366,17 @@ impl Style {
                 } else {result.relative_expressions.push(expression.clone());}
                 continue;
             }
-            let value = context_length_value(expression.slot, &expression.raw,
+            let value = result.resolve_context_value(expression.slot, &expression.raw,
                 LengthContext { percent: basis, ..context }, expression.nonnegative, query);
             if let Some(value) = value {
                 value.apply(&mut result);
+                if expression.slot==233{result.resolve_filter_urls(expression.source_url.as_deref());}
             } else if expression.query_dependent {
                 result.relative_expressions.push(expression.clone());
-            } else if expression.slot == 4 { result.height = None; }
+            } else if expression.slot == 3 { result.width = None; }
+            else if expression.slot == 23 { result.min_width = 0.0; result.min_width_auto = false; }
+            else if expression.slot == 24 { result.max_width = None; }
+            else if expression.slot == 4 { result.height = None; }
             else if expression.slot == 51 { result.min_height = 0.0; result.min_height_auto = false; }
             else if expression.slot == 52 { result.max_height = None; }
         }
@@ -4197,7 +4468,7 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
             inherited.registered_query = None;
             let replay = compute_for_named_registered_mode(&kind, Some(&inherited), &index, None,
                 u64::MAX, text, pending.pseudo, None, Some(pending.provenance.box_parent), false, false,
-                None, Some((baseline, &pending.provenance)), Some(&pending.registrations), Some(query), Some(pending.sibling));
+                None, Some((baseline, &pending.provenance)), Some(&pending.registrations), Some(query), Some(pending.sibling), pending.svg_instance_root, &[]);
             let Ok(mut computed) = replay else { return false; };
             computed.registered_query = None;
             *self = computed;
@@ -4295,7 +4566,7 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
                 self.relative_expressions.push(expression);
                 continue;
             }
-            if expression.raw.contains('%') && !matches!(expression.slot, 7 | 13 | 58 | 164 | 165 | 166 | 167 | 206 | 214 | 215 | 217 | 219 | 222 | 223 | 224 | 225 | 228 | 229 | 230 | 233) {
+            if expression.raw.contains('%') && !matches!(expression.slot, 7 | 13 | 31 | 58 | 145..=153 | 157 | 164 | 165 | 166 | 167 | 206 | 214 | 215 | 217 | 219 | 222 | 223 | 224 | 225 | 228 | 229 | 230 | 233 | 250 | 251 | 253) {
                 if let Some(raw)=computed_percentage_expression(&expression.raw,expression.context,query) {
                     expression.raw=raw;
                     expression.query_dependent=false;
@@ -4317,9 +4588,10 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
                 }else {self.relative_expressions.push(expression);}
                 continue;
             }
-            if let Some(value) = context_length_value(expression.slot, &expression.raw,
+            if let Some(value) = self.resolve_context_value(expression.slot, &expression.raw,
                 context, expression.nonnegative, query) {
                 value.apply(self);
+                if expression.slot==233{self.resolve_filter_urls(expression.source_url.as_deref());}
             } else { self.relative_expressions.push(expression); }
         }
         let fonts_resolved = resolve_font_style_query_context(self, query) && resolve_font_width_query_context(self, query) && resolve_font_features_query_context(self, query);
@@ -5107,6 +5379,7 @@ enum Value {
     TransformRaw(String),
     IndividualTransform(usize,Option<Arc<individual_transforms::IndividualTransform>>),
     IndividualTransformRaw(usize,String),
+    TransformBox(TransformBox),
     TransformOrigin([TransformLength; 2]),
     TransformOriginRaw(String),
     BorderCurrentColor,
@@ -5192,6 +5465,7 @@ enum Value {
     Display(Display),
     Opacity(f32),
     Filters(Option<Arc<[lumen_common::filter::FilterOperation]>>),
+    SourceFilters(SourceFilterList),
     Color(Rgba),
     Background(Rgba),
     Width(f32),
@@ -5218,12 +5492,17 @@ enum Value {
     SvgFill(SvgPaint),
     SvgStroke(SvgPaint),
     SvgStrokeWidth(f32),
+    SvgFillOpacity(f32),
+    SvgStrokeOpacity(f32),
     SvgFillRule(SvgFillRule),
     SvgClipRule(SvgFillRule),
     SvgClipPath(Option<Arc<str>>),
     SvgGeometry(usize, Option<Arc<str>>),
     SvgStopColor(Option<Rgba>),
     SvgStopOpacity(f32),
+    SvgFloodColor(Option<Rgba>),
+    SvgFloodOpacity(f32),
+    SvgFilterColorSpace(FilterInterpolation),
     BorderRadius(f32),
     BorderRadiusRaw(Arc<str>),
     BorderRadii([BorderRadiusCorner; 4]),
@@ -5277,6 +5556,10 @@ enum Value {
     GridAreas(Arc<[GridArea]>, [u8; 2]),
     GridArea(Option<Arc<str>>),
     ColumnCount(Option<usize>),
+    ColumnSpan(ColumnSpan),
+    BoxDecorationBreak(BoxDecorationBreak),
+    LineBreakCount(usize,usize),
+    BreakControl(usize,BreakControl),
     ColumnWidth(ColumnWidth),
     ColumnGap(Option<f32>),
     ColumnFillAuto(bool),
@@ -5343,6 +5626,9 @@ impl Value {
             Self::GridAreas(..) => 66,
             Self::GridArea(_) => 67,
             Self::ColumnCount(_) => 75,
+            Self::ColumnSpan(_)=>255,
+            Self::BoxDecorationBreak(_)=>256,
+            Self::LineBreakCount(slot,_) | Self::BreakControl(slot,_) => *slot,
             Self::ColumnWidth(_) => 238,
             Self::ColumnGap(_) => 76,
             Self::ColumnFillAuto(_) => 77,
@@ -5371,6 +5657,7 @@ impl Value {
             Self::LogicalBorder(slot, _) => *slot,
             Self::Transforms(_) | Self::TransformRaw(_) => 59,
             Self::IndividualTransform(slot,_)|Self::IndividualTransformRaw(slot,_)=>*slot,
+            Self::TransformBox(_)=>246,
             Self::TransformOrigin(_) | Self::TransformOriginRaw(_) => 60,
             Self::BorderStyle(_) => 11,
             Self::BorderCurrentColor => 10,
@@ -5435,7 +5722,7 @@ impl Value {
             Self::ListStyleImage(_) => 178,
             Self::Display(_) => 0,
             Self::Opacity(_) => 31,
-            Self::Filters(_) => 233,
+            Self::Filters(_) | Self::SourceFilters(_) => 233,
             Self::Color(_) => 1,
             Self::Background(_) => 2,
             Self::Width(_) => 3,
@@ -5458,12 +5745,15 @@ impl Value {
             Self::SvgFill(_) => 141,
             Self::SvgStroke(_) => 142,
             Self::SvgStrokeWidth(_) => 143,
+            Self::SvgFillOpacity(_) => 250,
+            Self::SvgStrokeOpacity(_) => 251,
             Self::SvgFillRule(_) => 144,
             Self::SvgGeometry(index, _) => 145 + *index,
             Self::SvgClipPath(_) => 154,
             Self::SvgClipRule(_) => 155,
             Self::SvgStopColor(_) => 156,
             Self::SvgStopOpacity(_) => 157,
+            Self::SvgFloodColor(_) =>252,Self::SvgFloodOpacity(_) =>253,Self::SvgFilterColorSpace(_) =>254,
             Self::BorderRadius(_) => 8,
             Self::BorderRadiusRaw(_) | Self::BorderRadii(_) => 8,
             Self::BorderRadiusCornerRaw(index, _)
@@ -5500,7 +5790,7 @@ impl Value {
             Self::BackgroundCurrentColor=>Some(2),Self::BorderCurrentColor=>Some(10),
             Self::LogicalBorder(slot,LogicalBorderComponent::CurrentColor)=>Some(*slot),
             Self::ColumnRuleColor(None)=>Some(79),Self::OutlineColor(None)=>Some(187),
-            Self::TextDecorationColor(None)=>Some(203),Self::SvgStopColor(None)=>Some(156),
+            Self::TextDecorationColor(None)=>Some(203),Self::SvgStopColor(None)=>Some(156),Self::SvgFloodColor(None)=>Some(252),
             Self::SvgFill(SvgPaint::CurrentColor)=>Some(141),Self::SvgStroke(SvgPaint::CurrentColor)=>Some(142),
             _=>None,
         };
@@ -5539,6 +5829,7 @@ impl Value {
                 let index=slot-239;
                 if style.individual_transforms[index]!=*value{style.individual_transforms[index]=value.clone();}
             },
+            Self::TransformBox(value)=>{if style.transform_box!=*value {style.transform_box=*value;}},
             Self::TransformOrigin(v) => {
                 if style.transform_origin != *v {
                     style.transform_origin = *v;
@@ -5750,7 +6041,8 @@ impl Value {
             Self::GridLanesPack(v) => style.grid_lanes_dense = *v,
             Self::FlowTolerance(v) => style.flow_tolerance = *v,
             Self::Opacity(v) => style.opacity = *v,
-            Self::Filters(v) => style.filters = v.clone(),
+            Self::Filters(v) => {style.filters=v.clone();style.set_shadow_sources(233,None);}
+            Self::SourceFilters(v) => {style.filters=Some(v.filters.clone());style.set_shadow_sources(233,v.colors.clone());}
             Self::Color(v) => style.color = *v,
             Self::Background(v) => style.background = *v,
             Self::Width(v) => style.width = Some(*v),
@@ -5806,12 +6098,17 @@ impl Value {
                 }
             }
             Self::SvgStrokeWidth(value) => style.svg_stroke_width = *value,
+            Self::SvgFillOpacity(value) => style.svg_fill_opacity = *value,
+            Self::SvgStrokeOpacity(value) => style.svg_stroke_opacity = *value,
             Self::SvgFillRule(value) => style.svg_fill_rule = *value,
             Self::SvgClipRule(value) => style.svg_clip_rule = *value,
             Self::SvgClipPath(value) => style.svg_clip_path = value.clone(),
             Self::SvgGeometry(index, value) => style.svg_geometry[*index] = value.clone(),
             Self::SvgStopColor(value) => style.svg_stop_color = value.unwrap_or(style.color),
             Self::SvgStopOpacity(value) => style.svg_stop_opacity = *value,
+            Self::SvgFloodColor(value)=>{let mut properties=style.svg_filter_properties();properties.flood=value.unwrap_or(style.color);style.set_svg_filter_properties(properties);}
+            Self::SvgFloodOpacity(value)=>{let mut properties=style.svg_filter_properties();properties.opacity=*value;style.set_svg_filter_properties(properties);}
+            Self::SvgFilterColorSpace(value)=>{let mut properties=style.svg_filter_properties();properties.interpolation=*value;style.set_svg_filter_properties(properties);}
             Self::GeneratedContent(value) => match value {
                 GeneratedContent::Normal => {
                     style.generated_content = None;
@@ -5850,7 +6147,9 @@ impl Value {
                 style.border_pattern = value.pattern();
             }
             Self::OverflowAxis(slot, v) => {
-                if *slot == 12 {
+                if matches!(*slot,242|243) {
+                    style.logical_overflow[*slot-242]=Some(*v);
+                } else if *slot == 12 {
                     style.overflow_x = *v;
                 } else {
                     style.overflow_y = *v;
@@ -5917,6 +6216,10 @@ impl Value {
             }
             Self::GridArea(v) => style.grid_area = v.clone(),
             Self::ColumnCount(v) => style.column_count = *v,
+            Self::ColumnSpan(value)=>style.set_column_span(*value),
+            Self::BoxDecorationBreak(value)=>style.set_box_decoration_break(*value),
+            Self::LineBreakCount(slot,value)=>style.set_line_break_count(*slot,*value),
+            Self::BreakControl(slot,value)=>style.set_break_control(*slot,*value),
             Self::ColumnWidth(value)=>{if style.column_width!=*value{style.column_width=value.clone();}}
             Self::ColumnGap(v) => {
                 style.column_gap = *v;
@@ -6169,6 +6472,36 @@ struct ScopeContext {
     outer: Option<Arc<ScopeContext>>,
 }
 
+/// Borrowed traversal of the actual SVG use instance, never a cloned DOM.
+/// Source attributes and descendants remain identical; ancestor/sibling
+/// selectors stop at its reference root. Inherited language crosses to hosts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SvgInstanceFrame { pub root: NodeId, pub host: NodeId }
+
+#[derive(Clone, Copy)]
+struct SelectorDocument<'a> { source: &'a Document, instances: &'a [SvgInstanceFrame] }
+impl core::ops::Deref for SelectorDocument<'_> {
+    type Target=Document;
+    fn deref(&self)->&Document {self.source}
+}
+impl<'a> SelectorDocument<'a> {
+    fn ordinary(source:&'a Document)->Self {Self{source,instances:&[]}}
+    fn boundary(&self)->Option<NodeId> {self.instances.last().map(|frame|frame.root)}
+    fn parent(&self,node:NodeId)->Result<Option<NodeId>,crate::Error> {
+        if self.boundary()==Some(node){Ok(None)}else{self.source.parent(node)}
+    }
+    fn next_sibling(&self,node:NodeId)->Result<Option<NodeId>,crate::Error> {
+        if self.boundary()==Some(node){Ok(None)}else{self.source.next_sibling(node)}
+    }
+    fn previous_sibling(&self,node:NodeId)->Result<Option<NodeId>,crate::Error> {
+        if self.boundary()==Some(node){Ok(None)}else{self.source.previous_sibling(node)}
+    }
+    fn inheritance_parent(&self,node:NodeId)->Result<Option<NodeId>,crate::Error> {
+        if let Some(frame)=self.instances.iter().rev().find(|frame|frame.root==node){Ok(Some(frame.host))}
+        else{self.source.parent(node)}
+    }
+}
+
 impl ScopeContext {
     fn has_validity_dependency(&self) -> bool {
         self.start.iter().chain(self.end.iter()).any(|list| list.iter().any(Selector::has_validity_dependency))
@@ -6178,7 +6511,7 @@ impl ScopeContext {
     /// scopes. Subjects inside a scope limit are excluded, while ancestors in
     /// an authored selector are still matched using the ordinary tree matcher.
     fn visit_roots(
-        &self, document: &Document, subject: NodeId, shadow: Option<NodeId>,
+        &self, document: &SelectorDocument<'_>, subject: NodeId, shadow: Option<NodeId>,
         owner: Option<StylesheetIdentity>, validity: &dyn crate::forms::ValidityStateView,
         depth: usize, work: &mut usize, visit: &mut dyn FnMut(NodeId, usize, &mut usize),
     ) {
@@ -6243,7 +6576,7 @@ impl ScopeContext {
     }
 }
 
-fn scope_parent(document: &Document, node: NodeId, shadow: Option<NodeId>) -> Option<NodeId> {
+fn scope_parent(document: &SelectorDocument<'_>, node: NodeId, shadow: Option<NodeId>) -> Option<NodeId> {
     if shadow == Some(node) { document.shadow_host(node).ok().flatten() }
     else { document.parent(node).ok().flatten() }
 }
@@ -6296,6 +6629,9 @@ impl Rule {
     }
 
     fn match_scope_proximity(&self, document: &Document, node: NodeId, validity: &dyn crate::forms::ValidityStateView) -> Option<usize> {
+        self.match_scope_proximity_in_tree(&SelectorDocument::ordinary(document),node,validity)
+    }
+    fn match_scope_proximity_in_tree(&self, document: &SelectorDocument<'_>, node: NodeId, validity: &dyn crate::forms::ValidityStateView) -> Option<usize> {
         if let Some(scope) = &self.css_scope {
             let mut nearest = None;
             scope.visit_roots(document, node, self.scope, self.stylesheet_owner, validity, 0, &mut 16_384,
@@ -6317,16 +6653,13 @@ impl Rule {
                         && (!self.selector.scope
                             || crate::selector::document_element(document) == Some(node))).then_some(usize::MAX);
                 }
-                self.selector.matches_node_in_scope_with_validity(
-                    document,
-                    node,
-                    crate::selector::document_element(document),
-                    validity,
+                self.selector.matches_in_context_with_validity(
+                    document, node, None,
+                    if document.boundary().is_some(){None}else{crate::selector::document_element(document)},
+                    0, validity,
                 )
             }
-            Some(root) => self
-                .selector
-                .matches_shadow_with_validity(document, node, root, validity),
+            Some(root) => self.selector.matches_in_context_with_validity(document,node,Some(root),Some(root),0,validity),
         };
         matched.then_some(usize::MAX)
     }
@@ -6574,6 +6907,8 @@ impl StyleIndex {
             Some(PseudoElement::Before) => 1,
             Some(PseudoElement::After) => 2,
             Some(PseudoElement::Marker) => 4,
+            Some(PseudoElement::BeforeMarker) => 8,
+            Some(PseudoElement::AfterMarker) => 16,
             _ => 0,
         });
         let has_z_index = rules.iter().any(|rule| {
@@ -6635,7 +6970,7 @@ impl StyleIndex {
                 })
         });
         let has_list_item_data = rules.iter().any(|rule| {
-            rule.selector.pseudo_element == Some(PseudoElement::Marker)
+            rule.selector.pseudo_element.is_some_and(PseudoElement::is_marker)
                 || rule
                     .declarations
                     .iter()
@@ -6743,6 +7078,17 @@ impl StyleIndex {
         }
     }
 
+    fn declaration_reference_scope(&self,document:&Document,node:NodeId,priority:&Priority,slot:usize)->Result<Option<Arc<[NodeId]>>,CssError> {
+        if let Some(snapshot)=self.snapshot_declarations.iter().find(|snapshot|snapshot.priority==*priority && snapshot.target==Some(slot)){
+            return Ok(snapshot.reference_scope.clone());
+        }
+        let scope=if priority.3.1==usize::MAX {
+            let root=document.root_node(node,false).map_err(|_|CssError{offset:0,message:"invalid CSS reference scope"})?;
+            (root!=document.root()).then_some(root)
+        }else{priority.3.1.checked_sub(1).and_then(|order|self.rules.get(order)).and_then(|rule|rule.scope)};
+        self.font_scope_chain(document,scope)
+    }
+
     pub(crate) fn font_scope_chain(&self, document:&Document, scope:Option<NodeId>) -> Result<Option<Arc<[NodeId]>>,CssError> {
         let Some(scope)=scope else{return Ok(None);};
         if let Some((_,chain))=self.font_scope_chains.borrow().iter().find(|(root,_)|*root==scope) {return Ok(Some(chain.clone()));}
@@ -6823,6 +7169,8 @@ impl StyleIndex {
             PseudoElement::Before => 1,
             PseudoElement::After => 2,
             PseudoElement::Marker => 4,
+            PseudoElement::BeforeMarker => 8,
+            PseudoElement::AfterMarker => 16,
             _ => return false,
         };
         self.transition_pseudo_rules & bit != 0
@@ -6870,6 +7218,8 @@ impl StyleIndex {
         origin_style: &Style, pseudo: PseudoElement, text: Option<&dyn TextShaper>,
     ) -> Result<Style, CssError> {
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid pseudo-element origin" })?;
+        let generated_origin = pseudo.marker_origin().map(|parent| self.compute_pseudo_computed(document, origin, origin_style, parent, text)).transpose()?;
+        let origin_style = generated_origin.as_ref().unwrap_or(origin_style);
         let role = self.box_children_context(document, origin, origin_style, text, &mut StyleCache::default())?;
         let computed = compute_for_named(kind, Some(origin_style), self, Some((document, origin)), u64::MAX, text, Some(pseudo), None, Some(role))?;
         if matches!(pseudo, PseudoElement::FirstLine | PseudoElement::FirstLetter | PseudoElement::Placeholder) {
@@ -6903,6 +7253,11 @@ impl StyleIndex {
         pseudo: PseudoElement,
         text: Option<&dyn TextShaper>,
     ) -> Result<Option<GeneratedStyle>, CssError> {
+        if let Some(parent) = pseudo.marker_origin() {
+            let Some(parent) = self.compute_pseudo(document, origin, origin_style, parent, text)? else { return Ok(None); };
+            let role = self.box_children_context(document, origin, &parent.style, text, &mut StyleCache::default())?;
+            return self.compute_pseudo_in_context(document, origin, &parent.style, pseudo, text, role);
+        }
         let role = self.box_children_context(document, origin, origin_style, text, &mut StyleCache::default())?;
         self.compute_pseudo_in_context(document, origin, origin_style, pseudo, text, role)
     }
@@ -6943,7 +7298,7 @@ impl StyleIndex {
         if !matches!(kind, NodeKind::Element { .. }) {
             return Ok(None);
         }
-        if pseudo == PseudoElement::Marker && !origin_style.is_list_item() {
+        if pseudo.is_marker() && !origin_style.is_list_item() {
             return Ok(None);
         }
         let html_q = matches!(
@@ -6954,7 +7309,7 @@ impl StyleIndex {
                 ..
             } if crate::svg::local_name(name) == "q"
         );
-        if !self.has_generated_content && !html_q && pseudo != PseudoElement::Marker {
+        if !self.has_generated_content && !html_q && !pseudo.is_marker() {
             return Ok(None);
         }
         let style = compute_for_named(
@@ -6968,12 +7323,12 @@ impl StyleIndex {
             None,
             Some(box_parent),
         )?;
-        let marker_uses_default_content = pseudo == PseudoElement::Marker
+        let marker_uses_default_content = pseudo.is_marker()
             && matches!(style.generated_content(), GeneratedContent::Normal);
         let content = match style.generated_content() {
             GeneratedContent::Items(content) => GeneratedContent::Items(content),
-            GeneratedContent::Normal if pseudo == PseudoElement::Marker => {
-                default_marker_content(&style.list_style_type)
+            GeneratedContent::Normal if pseudo.is_marker() => {
+                default_marker_content(&origin_style.list_style_type)
             }
             GeneratedContent::Normal => GeneratedContent::Normal,
             GeneratedContent::None => GeneratedContent::None,
@@ -6985,8 +7340,8 @@ impl StyleIndex {
                 content: GeneratedContent::Items(content),
             })),
             GeneratedContent::Normal | GeneratedContent::None => {
-                if marker_uses_default_content && style.list_style_image.is_some() {
-                    let fallback = default_marker_content(&style.list_style_type);
+                if marker_uses_default_content && origin_style.list_style_image.is_some() {
+                    let fallback = default_marker_content(&origin_style.list_style_type);
                     let fallback = match fallback {
                         GeneratedContent::Items(items) => GeneratedContent::Items(items),
                         GeneratedContent::Normal | GeneratedContent::None => {
@@ -7010,16 +7365,15 @@ impl StyleIndex {
         document: &Document,
         node: NodeId,
     ) -> Vec<String> {
-        self.rules
-            .iter()
-            .filter(|rule| {
-                rule.media
-                    .iter()
-                    .all(|query| media_matches(query, self.environment))
-                    && rule.matches_at(document, node)
-            })
-            .flat_map(|rule| rule.unsupported_svg_properties.iter().cloned())
-            .collect()
+        self.unsupported_svg_properties_in_instance(document,node,&[])
+    }
+    pub(crate) fn unsupported_svg_properties_in_instance(
+        &self, document:&Document, node:NodeId, frames:&[SvgInstanceFrame],
+    )->Vec<String> {
+        let tree=SelectorDocument{source:document,instances:frames};
+        self.rules.iter().filter(|rule|rule.media.iter().all(|query|media_matches(query,self.environment))
+            &&rule.match_scope_proximity_in_tree(&tree,node,&crate::forms::NoValidityOverrides).is_some())
+            .flat_map(|rule|rule.unsupported_svg_properties.iter().cloned()).collect()
     }
 
     /// Replace one element's animation sample using the shared effect cascade.
@@ -8020,11 +8374,22 @@ fn parse_simple_selector_depth(
                 message: "::slotted must end its compound selector",
             });
         }
-        if selector.pseudo_element.is_some() {
-            return Err(selector_error(
-                offset + start,
-                "pseudo-element must end its compound selector",
-            ));
+        if let Some(previous) = selector.pseudo_element {
+            // CSS Pseudo 4 §4.2 admits exactly the marker of a generated
+            // before/after list item. Other pseudo-element chains remain invalid.
+            if let Some(marker) = previous.generated_marker() {
+                let rest = &input[start..];
+                if rest.starts_with("::") && !rest.starts_with(":::") {
+                    let parsed = parse_pseudo_source(rest, offset + start)?;
+                    if parsed.name == "marker" && parsed.args.is_none() {
+                        selector.pseudo_element = Some(marker);
+                        selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                        start += parsed.end;
+                        continue;
+                    }
+                }
+            }
+            return Err(selector_error(offset + start, "pseudo-element must end its compound selector"));
         }
         let kind = bytes[start];
         if kind == b'&' {
@@ -8683,14 +9048,16 @@ fn border_spacing_value(input: &str) -> Option<Value> {
 
 fn context_length_value(slot: usize, raw: &str, context: LengthContext, nonnegative: bool,
     query: ContainerUnitContext) -> Option<Value> {
+    if matches!(slot,31|157|250|251|253) {return css_scalar_with_length_context(raw,true,context,query).and_then(|(value,_)|opacity_value(slot,value));}
+    if (145..=153).contains(&slot) {return computed_svg_geometry_value(slot-145,raw,context,query);}
     if matches!(slot,175|176){return transition_time_values_with_context(raw,slot==175,context,query).map(|values|Value::TransitionTimes(slot,values));}
     if (239..=241).contains(&slot){return individual_transforms::computed(slot,raw,context,query).map(|value|Value::IndividualTransform(slot,value));}
-    if matches!(slot, 48 | 74 | 75) {
+    if matches!(slot, 48 | 74 | 75 | 244 | 245 | 255) {
         return integer_property_value(slot, css_integer_with_context(raw, Some(context), query)?);
     }
     if (234..=237).contains(&slot) {return intrinsic_override::resolve(slot,raw,context,query);}
     if slot==238{return columns::resolve(raw,context,query);}
-    if slot == 233 { return color_filter_list(raw, context, query).map(|filters| Value::Filters(Some(filters))); }
+    if slot == 233 { return filter_source_list(raw,&legacy_source_color(Style::initial().color),context,query).map(Value::SourceFilters); }
     if slot == 140 { return font_size_adjust_with_context(raw, context, query).map(Value::FontSizeAdjust); }
         if slot==166{return transition_controls::resolve_timings(raw,context,query,1,1).map(|values|Value::Animation(slot,Arc::from(values.iter().map(|value|value.as_ref()).collect::<Vec<_>>().join(", "))));}
     if matches!(slot,164|165|167|224) {
@@ -9105,6 +9472,23 @@ fn css_scalar_with_percentage_basis(input:&str,percentages:bool,context:LengthCo
     Some((typed_numeric::computed_f32(value),expression.contains_unit(|unit|unit.canonical_unit_and_factor().is_none())))
 }
 
+fn opacity_value(slot:usize,value:f32)->Option<Value> {
+    let value=value.clamp(0.0,1.0);
+    Some(match slot {
+        31=>Value::Opacity(value),157=>Value::SvgStopOpacity(value),
+        250=>Value::SvgFillOpacity(value),251=>Value::SvgStrokeOpacity(value),
+        253=>Value::SvgFloodOpacity(value),_=>return None,
+    })
+}
+
+fn contextual_opacity_value(slot:usize,raw:&str)->Option<Value> {
+    let (admission,sibling)=typed_numeric::substitute_sibling_functions(raw,1,1)?;
+    let (value,dependent)=css_scalar_with_context(&admission,true)?;
+    if sibling || dependent {
+        Some(Value::ContextLength(slot,Box::from(raw),false))
+    } else {opacity_value(slot,value)}
+}
+
 fn ascii_lower(value: &str) -> alloc::borrow::Cow<'_, str> {
     if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
         alloc::borrow::Cow::Owned(value.to_ascii_lowercase())
@@ -9160,7 +9544,160 @@ fn svg_geometry_property_index(property: &str) -> Option<usize> {
 
 fn svg_geometry_value(property: &str, input: &str) -> Option<Value> {
     let index = svg_geometry_property_index(property)?;
-    crate::svg::supports_length(input).then(|| Value::SvgGeometry(index, Some(Arc::from(input))))
+    if matches!(property,"rx"|"ry") && decoded_css_keyword(input,"auto") {
+        return Some(Value::SvgGeometry(index,Some(Arc::from("auto"))));
+    }
+    let nonnegative=matches!(index,4|5|8);
+    if nonnegative && negative_length_primitive(input){return None;}
+    let (admission,_)=typed_numeric::substitute_sibling_functions(input,1,1)?;
+    let value=parse_context_length(145+index,&admission,nonnegative)?;
+    if admission==input {return Some(value);}
+    Some(Value::ContextLength(145+index,input.into(),nonnegative))
+}
+
+fn svg_geometry_numeric_type(kind:typed_numeric::NumericType)->bool {
+    use typed_numeric::{NumericType,NumericUnit,NumericDimension};
+    let length=NumericType::from_unit(NumericUnit::Px);
+    kind==length || kind==NumericType{percent_hint:Some(NumericDimension::Length),..length}
+        || kind==NumericType::from_unit(NumericUnit::Percent)
+}
+fn computed_svg_geometry_value(index:usize,raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<Value> {
+    let mut expression=typed_numeric::parse_numeric_expression(raw)?;
+    if let typed_numeric::NumericExpression::Value(value)=&mut expression {
+        if value.unit==typed_numeric::NumericUnit::Number {value.unit=typed_numeric::NumericUnit::Px;}
+    }
+    if !svg_geometry_numeric_type(expression.numeric_type()?){return None;}
+    expression.map_numeric_values(|value|typed_numeric::computed_numeric_value(value,context,query))?;
+    expression.simplify_absolute_units();
+    let raw=if let Some(mut value)=expression.single_numeric_value() {
+        if !value.value.is_finite() || value.value==0.0 {value.value=f64::from(typed_numeric::computed_f32(value.value));}
+        if matches!(index,4|5|8) {value.value=value.value.max(0.0);}
+        typed_numeric::serialize_numeric_value(value.value,value.unit)
+    }else{expression.serialize()?};
+    Some(Value::SvgGeometry(index,Some(Arc::from(raw))))
+}
+pub(crate) fn svg_xml_coordinate_supported(raw:&str)->bool {
+    if crate::svg::supports_length(raw){return true;}
+    let Some((raw,_))=typed_numeric::substitute_sibling_functions(raw,1,1) else{return false;};
+    typed_numeric::parse_numeric_expression(&raw).and_then(|expression|expression.numeric_type()).is_some_and(svg_geometry_numeric_type)
+}
+
+/// Operation-local owner context for XML coordinates which are not CSS
+/// presentation properties. It borrows the maintained numeric grammar and
+/// font/query authorities without retaining another value cache.
+pub(crate) struct SvgCoordinateContext<'a> {
+    style:&'a Style,
+    text:Option<&'a dyn TextShaper>,
+    environment:MediaEnvironment,
+    length:core::cell::Cell<Option<LengthContext>>,
+    query:ContainerUnitContext,
+    sibling:(usize,usize),
+}
+impl<'a> SvgCoordinateContext<'a> {
+    pub(crate) fn new(style:&'a Style,text:Option<&'a dyn TextShaper>,environment:MediaEnvironment,
+        query:ContainerUnitContext,sibling:(usize,usize))->Self {
+        Self{style,text,environment,length:core::cell::Cell::new(None),query:query.for_writing_mode(style.writing_mode),sibling}
+    }
+    pub(crate) fn for_owner(document:&Document,node:NodeId,frames:&[SvgInstanceFrame],style:&'a Style,
+        text:Option<&'a dyn TextShaper>,environment:MediaEnvironment,query:ContainerUnitContext)->Self {
+        Self::new(style,text,environment,query,svg_coordinate_sibling_position(document,node,frames))
+    }
+    pub(crate) fn coordinate(&self,raw:&str,basis:f32)->Option<f32> {
+        if raw.len()>typed_numeric::MAX_NUMERIC_EXPRESSION_BYTES{return None;}
+        if crate::svg::supports_length(raw) {return crate::svg::coordinate_value(raw,basis);}
+        self.numeric_expression(raw,basis,svg_geometry_numeric_type)
+    }
+    /// Strict <number> evaluation shares the coordinate's owner/font/query
+    /// resolver, but never admits an uncancelled length or percentage dimension.
+    pub(crate) fn number(&self,raw:&str)->Option<f32> {
+        if let Some(value)=raw.trim().parse::<f32>().ok().filter(|value|value.is_finite()){return Some(value);}
+        self.numeric_expression(raw,0.0,|kind|kind==typed_numeric::NumericType::default())
+    }
+    fn numeric_expression(&self,raw:&str,basis:f32,accept:impl FnOnce(typed_numeric::NumericType)->bool)->Option<f32> {
+        if raw.len()>typed_numeric::MAX_NUMERIC_EXPRESSION_BYTES{return None;}
+        let (raw,_)=typed_numeric::substitute_sibling_functions(raw,self.sibling.0,self.sibling.1)?;
+        let expression=typed_numeric::parse_numeric_expression(&raw)?;
+        if !accept(expression.numeric_type()?){return None;}
+        let length=expression.contains_unit(|unit|unit.dimension()==typed_numeric::NumericDimension::Length
+            && unit.canonical_unit_and_factor().is_none() && !container_unit(unit)).then(||self.length.get().unwrap_or_else(||{
+                let length=style_length_context(self.text,self.style,self.environment,None);
+                self.length.set(Some(length));length
+            }));
+        expression.evaluate(&mut FontAngleContext{length,query:self.query,percent_scale:f64::from(basis)/100.0})
+            .map(typed_numeric::computed_f32)
+    }
+    pub(crate) fn dimension(&self,raw:&str,basis:f32)->Option<f32> {
+        if negative_length_primitive(raw) {return None;}
+        self.coordinate(raw,basis).map(|value|value.max(0.0))
+    }
+}
+/// Peak temporary storage for a streamed CSS numeric list: one maintained
+/// numeric tree plus the CSS identifier decoder's replacement/reallocation
+/// peak (three UTF-8 bytes per source byte, at most doubled capacity).
+/// Literal SVG number lists bypass this authority without heap allocation.
+pub(crate) fn css_identifier_peak_bytes_bound(raw:&str)->Option<usize> {raw.len().checked_mul(6)?.checked_add(32)}
+pub(crate) fn numeric_list_peak_bytes_bound(raw:&str)->Option<usize> {
+    typed_numeric::numeric_expression_peak_bytes_bound()?.checked_add(css_identifier_peak_bytes_bound(raw)?)
+}
+/// XML attributes defined with CSS Value Syntax share predefined keyword
+/// matching, escapes, comments and CSS whitespace with ordinary CSS consumers.
+/// Plain known keywords do not instantiate a cursor or decoded String.
+pub(crate) fn css_enum_keyword(raw:&str,keywords:&[&'static str])->Option<&'static str> {
+    let raw=raw.trim_matches(|ch:char|ch.is_ascii() && is_css_whitespace(ch as u8));
+    if let Some(keyword)=keywords.iter().find(|keyword|raw.eq_ignore_ascii_case(keyword)){return Some(*keyword);}
+    if !raw.contains('\\') && !raw.contains("/*"){return None;}
+    let mut result=None;
+    numeric_list_components_each(raw,1,|component|{
+        result=keywords.iter().find(|keyword|decoded_css_keyword(component,keyword)).copied();result.is_some()
+    })?;
+    result
+}
+/// Borrowed CSS component boundaries for XML numeric lists. Numeric conversion
+/// remains in the shared numeric evaluator; strings, units and unknown functions
+/// are never interpreted by this scanner. SVG's compact literal lexer remains
+/// the first path, including its historical sign-separated number boundaries.
+pub(crate) fn numeric_list_components_each(raw:&str,limit:usize,mut push:impl FnMut(&str)->bool)->Option<()> {
+    if raw.len()>MAX_VARIABLE_BYTES{return None;}
+    let mut cursor=syntax::Cursor::new(raw,0).ok()?;
+    let (mut count,mut separated,mut comma_pending)=(0usize,true,false);
+    let mut previous_literal=false;
+    while let Some(token)=cursor.next() {
+        match token.kind {
+            syntax::TokenKind::Comment{..}=>{separated=true;continue;}
+            syntax::TokenKind::Other if is_css_whitespace(raw.as_bytes()[token.start])=>{separated=true;continue;}
+            syntax::TokenKind::Other if &raw[token.start..token.end]==","=>{
+                if count==0 || comma_pending{return None;}
+                separated=true;comma_pending=true;continue;
+            }
+            syntax::TokenKind::Other=>{}
+            _=>return None,
+        }
+        if !separated && !(previous_literal && matches!(raw.as_bytes()[token.start],b'+'|b'-')){return None;}
+        let mut end=token.end;
+        if raw.as_bytes().get(end)==Some(&b'(') {
+            end=syntax::block(raw,end).ok()?.after;cursor.position=end;
+        }
+        if count==limit{return None;}
+        let component=raw.get(token.start..end)?;
+        if !push(component){return None;}
+        previous_literal=component.parse::<f32>().ok().is_some_and(|value|value.is_finite());
+        count+=1;separated=false;comma_pending=false;
+    }
+    (!comma_pending).then_some(())
+}
+
+fn svg_coordinate_sibling_position(document:&Document,node:NodeId,frames:&[SvgInstanceFrame])->(usize,usize) {
+    if frames.last().is_some_and(|frame|frame.root==node){(1,1)}else{element_sibling_position(document,node)}
+}
+
+/// Resolve already-computed SVG geometry with the actual SVG viewport axis.
+/// Relative font/query units are never replaced by guessed renderer metrics.
+pub(crate) fn resolved_svg_coordinate_expression(raw:&str,basis:f32)->Option<f32> {
+    let expression=typed_numeric::parse_numeric_expression(raw)?;
+    if !svg_geometry_numeric_type(expression.numeric_type()?) || expression.contains_unit(|unit|
+        unit.dimension()==typed_numeric::NumericDimension::Length && unit.canonical_unit_and_factor().is_none()) {return None;}
+    expression.evaluate(&mut FontAngleContext{length:None,query:ContainerUnitContext::default(),percent_scale:f64::from(basis)/100.0})
+        .map(typed_numeric::computed_f32)
 }
 
 fn svg_local_fragment(input: &str) -> Option<Arc<str>> {
@@ -9178,8 +9715,9 @@ fn sibling_context_colors(input:&str,index:usize,count:usize)->Option<(String,bo
 fn value_depends_on_sibling_position(value: &Value) -> bool {
     match value {
         Value::ColorRaw(_, raw) | Value::Deferred(_,raw) | Value::Custom(_,raw) => {
-            sibling_context_colors(raw, 1, 1).is_some_and(|(_, replaced)| replaced)
+            typed_numeric::substitute_sibling_functions(raw, 1, 1).is_some_and(|(_, replaced)| replaced)
         }
+        Value::ContextLength(_,raw,_)=>typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent),
         Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>typed_numeric::substitute_sibling_functions(&group.value,1,1).is_some_and(|(_,dependent)|dependent),
         Value::TransitionTimingFunction(values)=>values.iter().any(|value|transition_controls::timing_dependencies(value).2),
         Value::Animation(166,raw)=>transition_controls::timing_dependencies(raw).2,
@@ -9259,7 +9797,7 @@ fn color_value(slot: usize, input: &str) -> Option<Value> {
     source_color_at_slot(slot,source,!color_values::legacy(input))
 }
 
-fn color_slot(slot:usize)->bool {matches!(slot,1|2|10|79|107..=110|119..=122|141|142|156|187|203)}
+fn color_slot(slot:usize)->bool {matches!(slot,1|2|10|79|107..=110|119..=122|141|142|156|187|203|252)}
 
 fn source_color_at_slot(slot:usize,value:lumen_common::color::Color,color_function:bool)->Option<Value> {
     if color_function {return color_slot(slot).then_some(Value::SourceColor(slot,SourceColor{value,color_function,expression:None}));}
@@ -9278,6 +9816,7 @@ fn color_at_slot(slot: usize, color: Rgba) -> Option<Value> {
         141=>Value::SvgFill(SvgPaint::Color(color)),142=>Value::SvgStroke(SvgPaint::Color(color)),156=>Value::SvgStopColor(Some(color)),
         187 => Value::OutlineColor(Some(color)),
         203 => Value::TextDecorationColor(Some(color)),
+        252 =>Value::SvgFloodColor(Some(color)),
         107..=110 | 119..=122 => Value::LogicalBorder(slot, LogicalBorderComponent::Color(color)),
         _ => return None,
     })
@@ -9564,7 +10103,6 @@ const SVG_UNSUPPORTED_CSS_PROPERTIES: &[&str] = &[
     "alignment-baseline",
     "baseline-shift",
     "dominant-baseline",
-    "fill-opacity",
     "filter",
     "gradienttransform",
     "lengthadjust",
@@ -9579,16 +10117,10 @@ const SVG_UNSUPPORTED_CSS_PROPERTIES: &[&str] = &[
     "stroke-linecap",
     "stroke-linejoin",
     "stroke-miterlimit",
-    "stroke-opacity",
     "text-anchor",
     "textlength",
     "text-rendering",
-    "transform",
-    "transform-box",
-    "transform-origin",
     "vector-effect",
-    "width",
-    "height",
 ];
 
 /// Return SVG declarations whose computed rendering behavior is not yet
@@ -10299,6 +10831,7 @@ pub fn set_declaration(
 
 fn length_value(slot: usize, value: f32) -> Option<Value> {
     Some(match slot {
+        145..=153=>Value::SvgGeometry(slot-145,Some(Arc::from(computed_values::px(value)))),
         3 => Value::Width(value),
         4 => Value::Height(value),
         5 => Value::Margin(value),
@@ -10351,7 +10884,7 @@ fn parse_context_length(slot: usize, raw: &str, nonnegative: bool) -> Option<Val
     if raw.contains('%')
         && !matches!(
             slot,
-            3 | 4 | 5 | 6 | 7 | 13 | 20 | 23 | 24 | 35..=46 | 51 | 52 | 81..=88 | 91..=100
+            3 | 4 | 5 | 6 | 7 | 13 | 20 | 23 | 24 | 35..=46 | 51 | 52 | 81..=88 | 91..=100 | 145..=153
         )
     {
         return None;
@@ -10413,7 +10946,7 @@ struct PropertyRegistration {
     in_all: bool,
 }
 
-const PROPERTY_COUNT: usize = 242;
+const PROPERTY_COUNT: usize = 257;
 
 const fn same_property_name(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
@@ -10518,8 +11051,11 @@ const ALL_PROPERTY_COUNT: usize = {
 const ALL_PROPERTY_IDS: [usize; ALL_PROPERTY_COUNT] = {
     let mut ids = [0; ALL_PROPERTY_COUNT];
     let (mut id, mut index) = (0, 0);
+    // The physical overflow longhands win an all reset after their logical
+    // counterparts, including inheritance across different writing modes.
+    ids[index]=242;index+=1;ids[index]=243;index+=1;
     while id < PROPERTY_COUNT {
-        if ALL_PROPERTIES[id] {
+        if ALL_PROPERTIES[id] && id!=242 && id!=243 {
             ids[index] = id;
             index += 1;
         }
@@ -10611,6 +11147,7 @@ property_registry! {
     "rotate" => [240], false, true;
     "scale" => [241], false, true;
     "transform-origin" => [60], false, true;
+    "transform-box" => [246], false, true;
     "order" => [48], false, true;
     "align-content" => [49], false, true;
     "place-content" => [49,15], false, true;
@@ -10699,6 +11236,8 @@ property_registry! {
     "fill" => [141], true, true;
     "stroke" => [142], true, true;
     "stroke-width" => [143], true, true;
+    "fill-opacity" => [250], true, true;
+    "stroke-opacity" => [251], true, true;
     "fill-rule" => [144], true, true;
     "x" => [145], false, true;
     "y" => [146], false, true;
@@ -10711,6 +11250,9 @@ property_registry! {
     "clip-rule" => [155], true, true;
     "stop-color" => [156], false, true;
     "stop-opacity" => [157], false, true;
+    "flood-color" => [252], false, true;
+    "flood-opacity" => [253], false, true;
+    "color-interpolation-filters" => [254], true, true;
     "border-radius" => [8,134,135,136,137], false, true;
     "border-top-left-radius" => [134], false, true;
     "border-top-right-radius" => [135], false, true;
@@ -10732,6 +11274,8 @@ property_registry! {
     "overflow" => [12,132], false, true;
     "overflow-x" => [12], false, true;
     "overflow-y" => [132], false, true;
+    "overflow-inline" => [242], false, true;
+    "overflow-block" => [243], false, true;
     "background-attachment" => [133], false, true;
     "inset" => [35,36,37,38], false, true;
     "line-height" => [13], true, true;
@@ -10790,6 +11334,16 @@ property_registry! {
     "padding-bottom" => [45], false, true;
     "padding-left" => [46], false, true;
     "column-count" => [75], false, true;
+    "column-span" => [255], false, true;
+    "box-decoration-break" => [256], false, true;
+    "orphans" => [244], true, true;
+    "widows" => [245], true, true;
+    "break-before" => [247], false, true;
+    "break-after" => [248], false, true;
+    "break-inside" => [249], false, true;
+    "page-break-before" => [247], false, true;
+    "page-break-after" => [248], false, true;
+    "page-break-inside" => [249], false, true;
     "column-width" => [238], false, true;
     "columns" => [238,75], false, true;
     "column-gap" => [76], false, true;
@@ -10884,6 +11438,21 @@ pub fn cssom_property_names() -> Vec<&'static str> {
     PROPERTIES.iter().map(|property| property.name).chain(core::iter::once("all")).collect()
 }
 
+/// Typed OM uses the shared recognized property catalog, with literal custom
+/// property strings admitted independently of declaration-value grammar.
+pub fn is_cssom_property_name(name: &str) -> bool {
+    name.starts_with("--") || name.eq_ignore_ascii_case("all")
+        || PROPERTIES.iter().any(|property| property.name.eq_ignore_ascii_case(name))
+}
+
+/// Typed OM initial ordering groups standard, vendor and custom properties.
+/// Canonical names are decoded UTF-8; its lexical order is code-point order.
+pub fn cssom_property_order(left: &str, right: &str) -> core::cmp::Ordering {
+    let category=|name: &str| if name.starts_with("--") {2}
+        else if name.starts_with('-') {1} else {0};
+    (category(left),left).cmp(&(category(right),right))
+}
+
 /// Property animation types, independent of whether a particular endpoint pair
 /// can interpolate. Web Animations Appendix A supplies by-computed-value for
 /// legacy definitions; modern property definitions override that default.
@@ -10911,11 +11480,11 @@ pub fn transition_value_kind(property: &str) -> TransitionValueKind {
         | "view-timeline-name" | "view-timeline-axis" | "view-timeline-inset" | "transition-property"
         | "transition-duration" | "transition-delay" | "transition-timing-function"
         | "transition-behavior" => NotAnimatable,
-        "appearance" | "-webkit-appearance" | "field-sizing" => Discrete,
+        "appearance" | "-webkit-appearance" | "field-sizing" | "break-before" | "break-after" | "break-inside" | "column-span" | "box-decoration-break" => Discrete,
         "transform" | "translate" | "rotate" | "scale" => Transform,
         "display" => Display,
         "visibility" => Visibility,
-        "z-index" | "order" | "column-count" => Integer,
+        "z-index" | "order" | "column-count" | "orphans" | "widows" => Integer,
         "box-shadow" | "text-shadow" => ShadowList,
         "background-position" | "background-size" => RepeatableList,
         "border-image-source" | "border-image-repeat" | "background-image" | "background-repeat" | "background-attachment"
@@ -10929,7 +11498,7 @@ pub fn transition_value_kind(property: &str) -> TransitionValueKind {
         | "align-content" | "align-self" | "justify-items" | "justify-self"
         | "grid-auto-flow" | "grid-template-areas" | "grid-column" | "grid-row"
         | "grid-lanes-direction" | "grid-lanes-pack" | "position" | "float" | "clear"
-        | "overflow-x" | "overflow-y" | "table-layout" | "border-collapse"
+        | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" | "table-layout" | "border-collapse"
         | "empty-cells" | "caption-side" | "column-fill" | "list-style-type"
         | "list-style-position" | "list-style-image" | "pointer-events"
         | "white-space" | "word-break" | "overflow-wrap" | "word-wrap" | "text-transform"
@@ -10951,7 +11520,8 @@ fn is_logical_property_slot(slot:usize)->bool {
 pub fn transition_property_physical_name<'a>(style: &Style, name: &'a str) -> &'a str {
     let name = declaration_block::canonical_alias(name);
     if !name.contains("-inline-") && !name.contains("-block-") && !name.ends_with("inline-size")
-        && !name.ends_with("block-size") && !name.starts_with("border-start-") && !name.starts_with("border-end-") {return name;}
+        && !name.ends_with("block-size") && !name.starts_with("border-start-") && !name.starts_with("border-end-")
+        && !matches!(name,"overflow-inline"|"overflow-block") {return name;}
     let Some(entry) = PROPERTIES.iter().find(|entry| entry.name == name) else { return name; };
     let Some(slot) = entry.ids.iter().find_map(|slot| logical_physical_slot(style, *slot)) else { return name; };
     PROPERTIES.iter().find(|entry| entry.ids.first() == Some(&slot)
@@ -10981,6 +11551,8 @@ fn logical_physical_slot(style: &Style, slot: usize) -> Option<usize> {
         94 => if horizontal { 52 } else { 24 },
         236 => if horizontal {234}else{235},
         237 => if horizontal {235}else{234},
+        242 => if horizontal {12}else{132},
+        243 => if horizontal {132}else{12},
         _ => return None,
     })
 }
@@ -11000,7 +11572,15 @@ fn copy_slot_state(slot:usize,from:&Style,to:&mut Style,computed:bool) {
         let source=from.image_color_origins.as_ref().and_then(|origins|origins.iter().find(|(key,_,_)|*key==source_slot)).map(|(_,value,modern)|SourceColor{value:*value,color_function:*modern,expression:None});
         to.set_image_color_origin(slot,source.as_ref());
     }
-    if color_slot(slot) {to.set_source_color(slot,if computed {from.source_color(source_slot)}else {from.stored_source_color(source_slot)});}
+    if color_slot(slot) {
+        let source=if computed {from.source_color(source_slot)}else {from.stored_source_color(source_slot)};
+        let initial_current=match source_slot {79=>from.column_rule_color.is_none(),187=>from.outline.color.is_none(),203=>from.text_decoration_color.is_none(),_=>false};
+        // These compact None carriers represent the currentcolor keyword.
+        // Copying their initial value must keep the dependency after its
+        // legacy used-color projection has materialized a concrete color.
+        let source=source.or_else(||initial_current.then(||to.current_color_source()));
+        to.set_source_color(slot,source);
+    }
 }
 fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: bool) {
     let source_slot = if computed { logical_physical_slot(from, slot).unwrap_or(slot) } else { slot };
@@ -11062,6 +11642,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
                 if to.logical_max_size[axis] != value { to.logical_max_size[axis] = value; }
             }
             236|237 => to.set_intrinsic_override(slot,from.stored_intrinsic_override(source_slot)),
+            242|243 => Value::OverflowAxis(slot,if source_slot==12 {from.overflow_x}else{from.overflow_y}).apply(to),
             _ => unreachable!(),
         }
         return;
@@ -11086,7 +11667,8 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         218 => to.transition_behavior = from.transition_behavior.clone(),
         226 => to.appearance = from.appearance,
         232 => to.field_sizing = from.field_sizing,
-        233 => to.filters = from.filters.clone(),
+        233 => {to.filters=from.filters.clone();if to.filter_reference_scope!=from.filter_reference_scope{to.filter_reference_scope=from.filter_reference_scope.clone();}to.set_shadow_sources(233,from.shadow_source_colors.as_ref()
+            .and_then(|lists|lists.iter().find(|(slot,_)|*slot==233)).map(|(_,colors)|colors.clone()));}
         234..=237 => to.set_intrinsic_override(slot,from.stored_intrinsic_override(slot)),
         227..=231=>border_images::copy(to,from,slot),
         220 => to.view_transition_name = from.view_transition_name.clone(),
@@ -11127,6 +11709,10 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         }
         12 => to.overflow_x = from.overflow_x,
         132 => to.overflow_y = from.overflow_y,
+        242|243 => {
+            let value=from.logical_overflow[slot-242];
+            if to.logical_overflow[slot-242]!=value {to.logical_overflow[slot-242]=value;}
+        }
         133 => to.background_attachment = from.background_attachment.clone(),
         13 => to.line_height = from.line_height,
         14 => to.flex_direction = from.flex_direction,
@@ -11251,6 +11837,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         }
         74 => to.z_index = from.z_index,
         75 => to.column_count = from.column_count,
+        244 | 245 => to.set_line_break_count(slot,from.line_break_counts()[slot-244]),
         238 => Value::ColumnWidth(from.column_width.clone()).apply(to),
         76 => {
             to.column_gap = from.column_gap;
@@ -11313,12 +11900,15 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         141 => to.svg_fill = from.svg_fill.clone(),
         142 => to.svg_stroke = from.svg_stroke.clone(),
         143 => to.svg_stroke_width = from.svg_stroke_width,
+        250 => to.svg_fill_opacity = from.svg_fill_opacity,
+        251 => to.svg_stroke_opacity = from.svg_stroke_opacity,
         144 => to.svg_fill_rule = from.svg_fill_rule,
         145..=153 => to.svg_geometry[slot - 145] = from.svg_geometry[slot - 145].clone(),
         154 => to.svg_clip_path = from.svg_clip_path.clone(),
         155 => to.svg_clip_rule = from.svg_clip_rule,
         156 => to.svg_stop_color = from.svg_stop_color,
         157 => to.svg_stop_opacity = from.svg_stop_opacity,
+        252..=254=>{let mut properties=to.svg_filter_properties();let other=from.svg_filter_properties();match slot{252=>properties.flood=other.flood,253=>properties.opacity=other.opacity,_=>properties.interpolation=other.interpolation};to.set_svg_filter_properties(properties);}
         158 => {
             to.generated_content = from.generated_content.clone();
             to.content_none = from.content_none;
@@ -11372,6 +11962,10 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         219 => Value::TextShadows(from.text_shadows.clone(), from.text_shadow_current_color).apply(to),
         59 => Value::Transforms(from.transforms.clone()).apply(to),
         239..=241=>Value::IndividualTransform(slot,from.individual_transforms[source_slot-239].clone()).apply(to),
+        246=>Value::TransformBox(from.transform_box).apply(to),
+        247..=249=>to.set_break_control(slot,from.break_controls()[slot-247]),
+        255=>to.set_column_span(from.column_span()),
+        256=>to.set_box_decoration_break(from.box_decoration_break()),
         60 => Value::TransformOrigin(from.transform_origin).apply(to),
         _ => {}
     }
@@ -11706,6 +12300,7 @@ pub fn animation_value_needs_context(property:&str,input:&str)->bool {
     // transform pass. Absolute unit conversion does not depend on an owner;
     // retaining a font/source snapshot for these literals adds no information.
     let transform=matches!(property,"transform"|"translate"|"rotate"|"scale");
+    if property=="transform"&&typed_transforms::has_timeline_progress(input){return true;}
     let Ok(mut cursor)=syntax::Cursor::new(input,0) else{return true;};
     while let Some(token)=cursor.next() {
         if token.kind!=syntax::TokenKind::Other {continue;}
@@ -11786,6 +12381,13 @@ pub fn parse_animation_transforms(
     transform_list(input, style_length_context(text, style, viewport, None))
 }
 
+/// Primitive result names use the ordinary canonical CSS identifier grammar.
+pub(crate) fn filter_primitive_name(raw:&str)->Option<alloc::borrow::Cow<'_,str>> {
+    let raw=raw.trim();let mut position=0;
+    let name=consume_selector_identifier(raw,&mut position)?;
+    if position!=raw.len() || matches!(name.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer"|"default"){return None;}
+    Some(if name==raw{alloc::borrow::Cow::Borrowed(raw)}else{alloc::borrow::Cow::Owned(name)})
+}
 /// Shared source-preserving function boundaries for filter admission and
 /// specified serialization. No second filter grammar or author-side metadata.
 fn visit_color_filter_arguments(raw: &str, mut visit: impl FnMut(&str, &str) -> Option<()>) -> Option<()> {
@@ -11798,7 +12400,7 @@ fn visit_color_filter_arguments(raw: &str, mut visit: impl FnMut(&str, &str) -> 
         if count == lumen_common::filter::MAX_COLOR_FILTERS { return None; }
         let mut end = token.start;
         let name = consume_selector_identifier(raw, &mut end)?.to_ascii_lowercase();
-        if end != token.end || raw.as_bytes().get(end) != Some(&b'(') { return None; }
+        if !(end==token.end || name=="url" && matches!(token.kind,syntax::TokenKind::Url{closed:true})) || raw.as_bytes().get(end) != Some(&b'(') { return None; }
         let block = syntax::block(raw, end).ok()?;
         if !block.closed { return None; }
         let args = raw.get(end + 1..block.content_end)?.trim();
@@ -11821,11 +12423,36 @@ pub fn combine_animation_source_transforms(from:&str,to:&str,operation:registere
 
 /// Bounded color-filter list. `none` is represented by the caller as no list;
 /// identity functions still retain their stacking/containing-block semantics.
-fn color_filter_list(raw: &str, context: LengthContext, query: ContainerUnitContext)
-    -> Option<Arc<[lumen_common::filter::FilterOperation]>> {
+fn filter_source_list(raw:&str,current:&SourceColor,context:LengthContext,query:ContainerUnitContext)->Option<SourceFilterList> {
     use lumen_common::filter::ColorFilter as F;
-    let mut filters = Vec::new();
+    use lumen_common::filter::{FilterOperation as O,DropShadowFilter};
+    let mut filters=Vec::new();let mut colors:Option<Vec<SourceColor>>=None;
+    let length_context=LengthContext{percent:None,..context};
     visit_color_filter_arguments(raw, |name, args| {
+        if name=="url" {
+            let url=background_url(&alloc::format!("url({args})"))?;
+            filters.try_reserve(1).ok()?;filters.push(O::Url(Arc::new(lumen_common::filter::UrlReference{local:url.starts_with('#'),href:url})));return Some(());
+        }
+        if name=="blur" {
+            let sigma=if components(args)?.is_empty(){0.0}else{contextual_length_with_query(args,Some(length_context),true,query)?};
+            if sigma<0.0 && !math_function(args) {return None;}
+            filters.try_reserve(1).ok()?;filters.push(O::Blur(sigma.max(0.0)));return Some(());
+        }
+        if name=="drop-shadow" {
+            let parsed=parse_source_shadows(args,current,Some(length_context),true,query)?;
+            if parsed.shadows.len()!=1 {return None;}
+            let shadow=parsed.shadows[0];let source=parsed.color(0)?;
+            if colors.is_none() && parsed.colors.is_some() {
+                let mut prior=Vec::new();prior.try_reserve(filters.len()).ok()?;
+                for filter in &filters {if let O::DropShadow(shadow)=filter {
+                    prior.push(SourceColor{value:shadow.color,color_function:false,expression:None});
+                }}
+                colors=Some(prior);
+            }
+            if let Some(colors)=colors.as_mut() {colors.try_reserve(1).ok()?;colors.push(source.clone());}
+            filters.try_reserve(1).ok()?;filters.push(O::DropShadow(Arc::new(DropShadowFilter{
+                offset:[shadow.offset_x,shadow.offset_y],sigma:shadow.blur,color:source.value})));return Some(());
+        }
         let omitted = components(args)?.is_empty();
         let value = if name == "hue-rotate" {
             if omitted { 0.0 }
@@ -11851,7 +12478,7 @@ fn color_filter_list(raw: &str, context: LengthContext, query: ContainerUnitCont
         filters.push(lumen_common::filter::FilterOperation::Color(filter));
         Some(())
     })?;
-    Some(filters.into())
+    Some(SourceFilterList{filters:filters.into(),colors:colors.map(Arc::from)})
 }
 
 /// Specified CSSOM retains percentages and calculations. Only literal
@@ -11859,16 +12486,22 @@ fn color_filter_list(raw: &str, context: LengthContext, query: ContainerUnitCont
 fn serialize_color_filter_declaration(raw: &str) -> Option<String> {
     if decoded_css_keyword(raw, "none") { return Some("none".into()); }
     let context = static_length_context();
-    color_filter_list(raw, context, ContainerUnitContext::no_container(context.viewport))?;
+    filter_source_list(raw,&legacy_source_color(Style::initial().color),context,ContainerUnitContext::no_container(context.viewport))?;
     use typed_numeric::{NumericExpression as E, NumericUnit as U};
     let mut output = String::new();
     visit_color_filter_arguments(raw, |name, args| {
-        let value = if components(args)?.is_empty() {
-            if name == "hue-rotate" { "0deg".into() } else { "1".into() }
+        let value = if name=="url" {
+            let url=background_url(&alloc::format!("url({args})"))?;
+            let serialized=serialize_url(&url);
+            if !output.is_empty(){output.push(' ');}output.push_str(&serialized);
+            return (output.len()<=8192).then_some(());
+        } else if name=="drop-shadow" {serialize_declared_shadows(args)?}
+        else if components(args)?.is_empty() {
+            if name=="blur" {"0px".into()} else if name == "hue-rotate" { "0deg".into() } else { "1".into() }
         } else {
             let mut expression = typed_numeric::parse_numeric_expression(args)?;
             if let E::Value(value) = &mut expression {
-                if name == "hue-rotate" && value.unit == U::Number && value.value == 0.0 { value.unit = U::Deg; }
+                if value.unit==U::Number && value.value==0.0 {if name=="hue-rotate" {value.unit=U::Deg;}else if name=="blur" {value.unit=U::Px;}}
                 if matches!(name, "grayscale" | "invert" | "opacity" | "sepia") {
                     value.value = value.value.min(if value.unit == U::Percent { 100.0 } else { 1.0 });
                 }
@@ -12102,7 +12735,7 @@ fn serialize_declared_shadows(raw:&str)->Option<String> {
         let mut color=None;let mut inset=false;let mut lengths=Vec::new();
         for token in components(shadow)? {
             if decoded_css_keyword(token,"inset"){inset=true;}
-            else if let Some(value)=color_values::serialize_declared_endpoint(token){color=Some(value);}
+            else if let Some(value)=color_values::serialize_declared(token,0){color=Some(value);}
             else{let mut value=typed_numeric::parse_numeric_expression(token)?;value.simplify_absolute_units();lengths.push(if typed_numeric::parse_numeric_value(token).is_some_and(|value|value.unit==typed_numeric::NumericUnit::Number&&value.value==0.0){String::from("0px")}else{value.serialize()?});}
         }
         let mut result=String::new();if let Some(color)=color{result.push_str(&color);result.push(' ');}result.push_str(&lengths.join(" "));
@@ -13440,24 +14073,6 @@ fn is_background_position_token(token: &str) -> bool {
     ) || background_length(token, static_length_context()).is_some()
 }
 
-fn is_background_function(token: &str) -> bool {
-    let function = token.split_once('(').map_or("", |(name, _)| name);
-    matches!(
-        &*ascii_lower(function),
-        "linear-gradient"
-            | "repeating-linear-gradient"
-            | "radial-gradient"
-            | "repeating-radial-gradient"
-            | "conic-gradient"
-            | "repeating-conic-gradient"
-            | "image-set"
-            | "-webkit-image-set"
-            | "image"
-            | "light-dark"
-            | "cross-fade"
-    )
-}
-
 /// Parses the full `background` shorthand per layer. Unsupported components
 /// reject the whole value so the declaration is
 /// dropped rather than silently ignored.
@@ -13637,8 +14252,9 @@ fn background_shorthand(raw: &str) -> Option<BackgroundShorthand> {
                 // A second size separator has no grammar position here.
                 return None;
             } else if token.contains('(') && !position_token {
-                // Not a color, so any remaining function must be a gradient.
-                if !is_background_function(token) || image_seen {
+                // All image functions use the same validated image grammar as the
+                // background-image longhand; painters are ordinary images.
+                if !valid_background_images(token) || image_seen {
                     return None;
                 }
                 image = token;
@@ -14295,8 +14911,28 @@ pub fn serialize_quotes_declaration(raw: &str) -> Option<String> {
 /// Canonically serialize CSSOM property values whose parsed representation is
 /// shared between inline and stylesheet declarations.
 pub fn serialize_cssom_property_value(name: &str, value: &str) -> Option<String> {
-    if matches!(name.to_ascii_lowercase().as_str(), "order" | "z-index" | "column-count") && math_function(value.trim()) {
-        let slot=if name.eq_ignore_ascii_case("order"){48}else if name.eq_ignore_ascii_case("z-index"){74}else{75};
+    if svg_geometry_property_index(&name.to_ascii_lowercase()).is_some() {
+        svg_geometry_value(&name.to_ascii_lowercase(),value)?;
+        if decoded_css_keyword(value,"auto") {return Some("auto".into());}
+        let mut expression=typed_numeric::parse_numeric_expression(value)?;
+        if let typed_numeric::NumericExpression::Value(number)=&mut expression {
+            if number.unit==typed_numeric::NumericUnit::Number {number.unit=typed_numeric::NumericUnit::Px;}
+        }
+        if math_function(value.trim()) {expression.serialize_specified()}else{expression.serialize()}
+    } else if name.eq_ignore_ascii_case("fill-opacity") || name.eq_ignore_ascii_case("stroke-opacity") || name.eq_ignore_ascii_case("flood-opacity") || name.eq_ignore_ascii_case("stop-opacity") {
+        // SVG paint opacity serializes percentages as numbers. Specified values
+        // retain their range; clamping belongs to computed-value resolution.
+        let (admission,_)=typed_numeric::substitute_sibling_functions(value,1,1)?;
+        let scalar = css_scalar(&admission, true)?;
+        if math_function(value.trim()) {
+            typed_numeric::parse_numeric_expression(value)?.serialize_specified()
+        } else {
+            Some(computed_values::number(scalar))
+        }
+    } else if break_control::slot(&name.to_ascii_lowercase()).is_some() {
+        break_control::specified(&name.to_ascii_lowercase(),value)
+    }else if matches!(name.to_ascii_lowercase().as_str(), "order" | "z-index" | "column-count" | "orphans" | "widows" | "column-span") && math_function(value.trim()) {
+        let slot=if name.eq_ignore_ascii_case("order"){48}else if name.eq_ignore_ascii_case("z-index"){74}else if name.eq_ignore_ascii_case("orphans"){244}else if name.eq_ignore_ascii_case("widows"){245}else if name.eq_ignore_ascii_case("column-span"){255}else{75};
         integer_declaration(slot,value.trim())?;
         typed_numeric::parse_numeric_expression(value)?.serialize_specified()
     } else if matches!(name.to_ascii_lowercase().as_str(),"columns"|"column-width") {
@@ -14313,6 +14949,13 @@ pub fn serialize_cssom_property_value(name: &str, value: &str) -> Option<String>
         serialize_color_filter_declaration(value)
     } else if name.eq_ignore_ascii_case("font-size-adjust") {
         serialize_declared_font_size_adjust(value)
+    } else if name.eq_ignore_ascii_case("box-decoration-break") {
+        let raw=ascii_lower(value.trim());
+        if matches!(raw.as_ref(),"initial"|"inherit"|"unset"|"revert"|"revert-layer") {
+            return Some(raw.into_owned());
+        }
+        typed_declarations("box-decoration-break",&raw,0).ok()?.iter().find_map(|declaration|
+            if let Value::BoxDecorationBreak(value)=declaration.value {Some(value.serialize().into())}else{None})
     } else if name.eq_ignore_ascii_case("field-sizing") {
         FieldSizing::parse(value.trim()).map(|value|value.as_str().into())
     } else if name.eq_ignore_ascii_case("appearance") || name.eq_ignore_ascii_case("-webkit-appearance") {
@@ -14368,7 +15011,8 @@ pub fn serialize_cssom_property_value(name: &str, value: &str) -> Option<String>
     {
         serialize_transition_time_declaration(name, value)
     } else if name.eq_ignore_ascii_case("opacity") {
-        css_scalar(value,true)?;
+        let (admission,_)=typed_numeric::substitute_sibling_functions(value,1,1)?;
+        css_scalar(&admission,true)?;
         let expression=typed_numeric::parse_numeric_expression(value)?;
         if math_function(value.trim()){expression.serialize_specified()}else{expression.serialize()}
     } else {
@@ -15647,6 +16291,19 @@ fn declarations_with_variables(
         let Some((name, raw)) = declaration_pair(&input[start..end]) else {
             continue;
         };
+        append_declaration_pair_values(name,raw,offset+start,defer_variables,&mut out)?;
+    }
+    Ok(out)
+}
+
+/// One declaration pair's maintained typed expansion. Declaration-list and
+/// structured property-value consumers append through this same authority,
+/// without constructing and reparsing a serialized declaration list.
+fn append_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_variables:bool,
+    out:&mut Vec<Declaration>)->Result<(),CssError> {
+    // A single iteration preserves the existing rejected-pair control flow;
+    // nested component loops retain their independent continue semantics.
+    for _ in core::iter::once(()) {
         let Some(decoded_name)=parsed_declaration_name(name) else {continue;};
         let name=decoded_name.as_ref();
         let Some(completed)=syntax::complete(raw)? else {continue;};
@@ -15654,7 +16311,7 @@ fn declarations_with_variables(
         if name.starts_with("--") {
             if name.len() > 256 || raw.len() > MAX_VARIABLE_BYTES {
                 return Err(CssError {
-                    offset: offset + start,
+                    offset: offset,
                     message: "custom property too large",
                 });
             }
@@ -15684,7 +16341,7 @@ fn declarations_with_variables(
         }
         if defer_variables&&typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent) {
             let Some((validation,_))=typed_numeric::substitute_sibling_functions(raw,1,1)else{continue;};
-            if !declarations_with_variables(&alloc::format!("{name}:{validation}"),offset+start,false)?.is_empty(){
+            if !declarations_with_variables(&alloc::format!("{name}:{validation}"),offset,false)?.is_empty(){
                 out.push(Declaration{value:Value::Deferred(name.into(),raw.into()),important});
             }
             continue;
@@ -15699,7 +16356,7 @@ fn declarations_with_variables(
             };
             if out.len() + values.len() > MAX_DECLARATIONS {
                 return Err(CssError {
-                    offset: offset + start,
+                    offset: offset,
                     message: "too many declarations",
                 });
             }
@@ -15713,7 +16370,7 @@ fn declarations_with_variables(
             && !["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|keyword| raw.eq_ignore_ascii_case(keyword)) {
             let Some(values) = transition_values(name, raw) else { continue; };
             if out.len().checked_add(values.len()).is_none_or(|len|len>MAX_DECLARATIONS) {
-                return Err(CssError { offset: offset + start, message: "too many declarations" });
+                return Err(CssError { offset: offset, message: "too many declarations" });
             }
             out.extend(values.into_iter().map(|value|Declaration {value,important}));
             continue;
@@ -15953,6 +16610,14 @@ fn declarations_with_variables(
                     }
                 }
             }
+            continue;
+        }
+        if let Some(slot)=break_control::slot(name) {
+            if let Some(value)=break_control::parse(name,raw){out.push(Declaration{value:Value::BreakControl(slot,value),important});}
+            continue;
+        }
+        if name=="transform-box" {
+            if let Some(value)=TransformBox::parse(raw){out.push(Declaration{value:Value::TransformBox(value),important});}
             continue;
         }
         if matches!(name,"translate"|"rotate"|"scale") {
@@ -16434,7 +17099,7 @@ fn declarations_with_variables(
                     continue;
                 }
                 if let Some(basis) = basis {
-                    let parsed = typed_declarations("flex", &converted, offset + start)?;
+                    let parsed = typed_declarations("flex", &converted, offset)?;
                     for mut declaration in parsed {
                         if matches!(declaration.value, Value::FlexBasis(_)) {
                             declaration.value = basis.clone();
@@ -16446,7 +17111,7 @@ fn declarations_with_variables(
                 }
             }
         }
-        let mut parsed = typed_declarations(name, raw, offset + start)?;
+        let mut parsed = typed_declarations(name, raw, offset)?;
         if name == "flex-wrap" && matches!(raw, "wrap" | "nowrap" | "wrap-reverse") {
             parsed.push(Declaration {
                 value: Value::FlexWrapReverse(raw == "wrap-reverse"),
@@ -16482,7 +17147,7 @@ fn declarations_with_variables(
             out.push(declaration);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn animation_values(name: &str, raw: &str) -> Option<Vec<(usize, String)>> {
@@ -17455,7 +18120,23 @@ fn css_integer_with_context(raw: &str, context: Option<LengthContext>, query: Co
     let value = expression.evaluate(&mut FontAngleContext { length: context, query, percent_scale: 1.0 })?;
     // CSS integers round toward positive infinity at a tie. Retain f64 until
     // rounding, then apply the implementation's signed integer storage range.
-    Some(if value.is_nan() { 0 } else { (value + 0.5).floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32 })
+    Some(css_integer_storage(value))
+}
+
+fn css_integer_storage(value:f64)->i32 {
+    if value.is_nan(){0}else{(value+0.5).floor().clamp(i32::MIN as f64,i32::MAX as f64) as i32}
+}
+
+/// Interpolated integers consume the same computed range and storage policy as
+/// CSS math. Authored literal validation remains at the declaration boundary.
+pub fn computed_integer_css_value(property:&str,value:f64)->Option<String> {
+    let registration=PROPERTIES.iter().find(|entry|entry.name.eq_ignore_ascii_case(property))?;
+    if registration.ids.len()!=1{return None;}
+    match integer_property_value(registration.ids[0],css_integer_storage(value))? {
+        Value::Order(value)|Value::ZIndex(Some(value))=>Some(value.to_string()),
+        Value::ColumnCount(Some(value))|Value::LineBreakCount(_,value)|Value::ColumnSpan(ColumnSpan::Count(value))=>Some(value.to_string()),
+        _=>None,
+    }
 }
 
 fn integer_property_value(slot: usize, value: i32) -> Option<Value> {
@@ -17463,14 +18144,30 @@ fn integer_property_value(slot: usize, value: i32) -> Option<Value> {
         48 => Some(Value::Order(value)),
         74 => Some(Value::ZIndex(Some(value))),
         75 => Some(Value::ColumnCount(Some(value.max(1) as usize))),
+        244 | 245 => Some(Value::LineBreakCount(slot,value.max(1) as usize)),
+        255=>Some(Value::ColumnSpan(ColumnSpan::Count(value.max(1) as usize))),
         _ => None,
     }
 }
 
 fn integer_declaration(slot: usize, raw: &str) -> Option<Value> {
     if !math_function(raw) {
-        let value = raw.parse::<i32>().ok()?;
-        if slot == 75 && value < 1 { return None; }
+        // CSS Values 4 §5: storage limits convert to the closest supported
+        // integer; they do not make a syntactically valid literal invalid.
+        let (negative, digits) = if let Some(digits) = raw.strip_prefix('-') {
+            (true, digits)
+        } else {
+            (false, raw.strip_prefix('+').unwrap_or(raw))
+        };
+        if digits.is_empty() { return None; }
+        let limit = if negative { 2147483648u32 } else { i32::MAX as u32 };
+        let mut magnitude = 0u32;
+        for digit in digits.bytes() {
+            if !digit.is_ascii_digit() { return None; }
+            magnitude = magnitude.saturating_mul(10).saturating_add(u32::from(digit - b'0')).min(limit);
+        }
+        let value = if negative { -(magnitude as i64) as i32 } else { magnitude as i32 };
+        if matches!(slot,75|244|245|255) && value < 1 { return None; }
         return integer_property_value(slot, value);
     }
     let expression = typed_numeric::parse_numeric_expression(raw)?;
@@ -17511,9 +18208,10 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
         let value = if decoded_css_keyword(raw, "none") {
             Some(Value::Filters(None))
         } else {
-            color_filter_list(raw, context, ContainerUnitContext::no_container(context.viewport)).map(|list| {
-                if length_independent(raw) { Value::Filters(Some(list)) }
-                else { Value::ContextLength(233, Box::from(raw), true) }
+            filter_source_list(raw,&legacy_source_color(Style::initial().color),context,ContainerUnitContext::no_container(context.viewport)).map(|list| {
+                if length_independent(raw) && !list.filters.iter().any(|filter|matches!(filter,lumen_common::filter::FilterOperation::DropShadow(_))) {
+                    Value::Filters(Some(list.filters))
+                } else {Value::ContextLength(233,Box::from(raw),true)}
             })
         };
         if let Some(value) = value { out.push(Declaration { value, important }); }
@@ -17925,6 +18623,10 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 }
             }
             "column-count" => column_count_value(raw),
+            "box-decoration-break"=>match ascii_lower(raw).as_ref(){"slice"=>Some(Value::BoxDecorationBreak(BoxDecorationBreak::Slice)),"clone"=>Some(Value::BoxDecorationBreak(BoxDecorationBreak::Clone)),_=>None},
+            "column-span"=>match ascii_lower(raw).as_ref(){"none"=>Some(Value::ColumnSpan(ColumnSpan::None)),"all"=>Some(Value::ColumnSpan(ColumnSpan::All)),"auto"=>Some(Value::ColumnSpan(ColumnSpan::Auto)),_=>integer_declaration(255,raw)},
+            "orphans" => integer_declaration(244,raw),
+            "widows" => integer_declaration(245,raw),
             "column-gap" => gap_value(76, raw),
             "column-fill" => match raw {
                 "balance" => Some(Value::ColumnFillAuto(false)),
@@ -18167,7 +18869,12 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
             "color-scheme" => parse_color_scheme(raw).map(Value::ColorScheme),
             "fill" => color_value(141,raw).or_else(||parse_svg_paint(raw).map(Value::SvgFill)),
             "stroke" => color_value(142,raw).or_else(||parse_svg_paint(raw).map(Value::SvgStroke)),
-            "stroke-width" => nonnegative_length(raw).map(Value::SvgStrokeWidth),
+            "fill-opacity" => contextual_opacity_value(250,raw),
+            "stroke-opacity" => contextual_opacity_value(251,raw),
+            "stroke-width" => nonnegative_length(raw).or_else(|| {
+                let value=css_scalar(raw,false)?;
+                (value>=0.0 || math_function(raw.trim())).then(||value.max(0.0))
+            }).map(Value::SvgStrokeWidth),
             "clip-path" => {
                 if raw.eq_ignore_ascii_case("none") {
                     Some(Value::SvgClipPath(None))
@@ -18176,9 +18883,13 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 }
             }
             "stop-color" => color_value(156,raw),
-            "stop-opacity" => css_scalar(raw, true)
-                .filter(|value| value.is_finite())
-                .map(|value| Value::SvgStopOpacity(value.clamp(0.0, 1.0))),
+            "flood-color"=>color_value(252,raw),
+            "flood-opacity"=>contextual_opacity_value(253,raw),
+            "color-interpolation-filters"=>{let mut position=0;consume_selector_identifier(raw.trim(),&mut position).and_then(|keyword|if position!=raw.trim().len(){None}else{match keyword.to_ascii_lowercase().as_str(){
+                "auto"=>Some(Value::SvgFilterColorSpace(FilterInterpolation::Auto)),"srgb"=>Some(Value::SvgFilterColorSpace(FilterInterpolation::Srgb)),
+                "linearrgb"=>Some(Value::SvgFilterColorSpace(FilterInterpolation::LinearRgb)),_=>None,
+            }})},
+            "stop-opacity" => contextual_opacity_value(157,raw),
             "clip-rule" => {
                 if raw.eq_ignore_ascii_case("nonzero") {
                     Some(Value::SvgClipRule(SvgFillRule::NonZero))
@@ -18282,6 +18993,8 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 })
             }
             "overflow-x" => Overflow::parse(raw).map(|v| Value::OverflowAxis(12, v)),
+            "overflow-inline" => Overflow::parse(raw).map(|v| Value::OverflowAxis(242, v)),
+            "overflow-block" => Overflow::parse(raw).map(|v| Value::OverflowAxis(243, v)),
             "overflow-y" => Overflow::parse(raw).map(|v| Value::OverflowAxis(132, v)),
             "background-attachment" => background_attachments(raw).map(Value::BackgroundAttachment),
             "visibility" => match raw {
@@ -18398,7 +19111,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
             "grid-row" => grid_placement(raw)
                 .map(Value::GridRow)
                 .or_else(|| grid_line_spec(raw, 2).then(|| Value::GridRowSpec(Arc::from(raw)))),
-            "opacity" => css_scalar(raw, true).map(|v| Value::Opacity(v.clamp(0.0, 1.0))),
+            "opacity" => contextual_opacity_value(31,raw),
             "flex-grow" => css_scalar(raw, false)
                 .filter(|value| *value >= 0.0 || math_function(raw))
                 .map(|value| value.max(0.0))
@@ -20880,7 +21593,7 @@ fn take_selector_work(quota: Option<&core::cell::Cell<usize>>) -> bool {
 impl RelativeSelector {
     fn matches_from(
         &self,
-        document: &Document,
+        document: &SelectorDocument<'_>,
         anchor: NodeId,
         shadow_root: Option<NodeId>,
         scope_root: Option<NodeId>,
@@ -21026,7 +21739,7 @@ fn validity_pseudo_matches(
 }
 
 fn relative_relation_matches(
-    document: &Document,
+    document: &SelectorDocument<'_>,
     node: NodeId,
     anchor: NodeId,
     relation: Relation,
@@ -21244,19 +21957,9 @@ impl Selector {
         Some(true)
     }
 
-    pub(crate) fn matches_shadow_with_validity(
-        &self,
-        document: &Document,
-        node: NodeId,
-        root: NodeId,
-        validity: &dyn crate::forms::ValidityStateView,
-    ) -> bool {
-        self.matches_in_context_with_validity(document, node, Some(root), Some(root), 0, validity)
-    }
-
     fn matches_in_context_with_validity(
         &self,
-        document: &Document,
+        document: &SelectorDocument<'_>,
         node: NodeId,
         shadow_root: Option<NodeId>,
         scope_root: Option<NodeId>,
@@ -21267,7 +21970,7 @@ impl Selector {
     }
 
     fn matches_in_context_with_quota(
-        &self, document: &Document, node: NodeId, shadow_root: Option<NodeId>, scope_root: Option<NodeId>,
+        &self, document: &SelectorDocument<'_>, node: NodeId, shadow_root: Option<NodeId>, scope_root: Option<NodeId>,
         depth: usize, validity: &dyn crate::forms::ValidityStateView, quota: Option<&core::cell::Cell<usize>>,
     ) -> bool {
         self.matches_in_context_with_anchor_and_validity(
@@ -21283,7 +21986,7 @@ impl Selector {
     }
 
     fn matches_in_context_with_work(
-        &self, document: &Document, node: NodeId, shadow_root: Option<NodeId>, scope_root: Option<NodeId>,
+        &self, document: &SelectorDocument<'_>, node: NodeId, shadow_root: Option<NodeId>, scope_root: Option<NodeId>,
         validity: &dyn crate::forms::ValidityStateView, work: &mut usize,
     ) -> bool {
         let quota = core::cell::Cell::new(*work);
@@ -21294,7 +21997,7 @@ impl Selector {
 
     fn matches_in_context_with_anchor_and_validity(
         &self,
-        document: &Document,
+        document: &SelectorDocument<'_>,
         node: NodeId,
         shadow_root: Option<NodeId>,
         scope_root: Option<NodeId>,
@@ -21355,6 +22058,15 @@ impl Selector {
                 });
         }
         if shadow_root.is_none() && (self.host || self.slotted || self.part.is_some()) {
+            return false;
+        }
+        // CSS Scoping: ordinary selectors in a shadow stylesheet cannot
+        // select elements in another node tree. The explicit host, slotted
+        // and part paths above retain their defined boundary crossings.
+        if shadow_root.is_some_and(|root| {
+            document.root_node(node, false) != Ok(root)
+                && document.shadow_host(root) != Ok(Some(node))
+        }) {
             return false;
         }
         self.matches_flat_depth(
@@ -21428,12 +22140,12 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
         scope_root: Option<NodeId>,
         validity: &dyn crate::forms::ValidityStateView,
     ) -> bool {
-        self.matches_in_context_with_validity(document, node, None, scope_root, 0, validity)
+        self.matches_in_context_with_validity(&SelectorDocument::ordinary(document), node, None, scope_root, 0, validity)
     }
 
     fn matches_flat_depth(
         &self,
-        document: &Document,
+        document: &SelectorDocument<'_>,
         node: NodeId,
         shadow_root: Option<NodeId>,
         scope_root: Option<NodeId>,
@@ -21487,7 +22199,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             if self.directionality_mask == 3 {
                 return false;
             }
-            let direction = crate::directionality::resolved_element_directionality(document, node);
+            let direction = crate::directionality::resolved_instance_directionality(document, node, document.instances);
             let bit = match direction {
                 crate::directionality::Direction::Ltr => 1,
                 crate::directionality::Direction::Rtl => 2,
@@ -21546,7 +22258,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             }
         }
         if !self.languages.is_empty() {
-            let Ok(language) = crate::language::determine(document, node, || take_selector_work(quota)) else { return false; };
+            let Ok(language) = crate::language::determine_with_parent(document, node, || take_selector_work(quota), |node|document.inheritance_parent(node)) else { return false; };
             let language = language.unwrap_or("");
             if !self.languages.iter().all(|ranges| {
                 ranges.iter().any(|range| {
@@ -21611,9 +22323,8 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 Ok(NodeKind::Element { .. }) => None,
                 _ => return false,
             };
-            let Some(parent) = document.parent(node).ok().flatten() else {
-                return false;
-            };
+            let parent = document.parent(node).ok().flatten();
+            if parent.is_none() && document.boundary()!=Some(node) {return false;}
             let matches_sibling = |sibling| {
                 let Ok(NodeKind::Element {
                     namespace, name, ..
@@ -21651,7 +22362,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 let mut current = if *reverse {
                     document.next_sibling(node).ok().flatten()
                 } else {
-                    document.first_child(parent).ok().flatten()
+                    parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node))
                 };
                 while let Some(sibling) = current {
                     if !take_selector_work(quota) { return false; }
@@ -21675,7 +22386,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 continue;
             }
 
-            let mut current = document.first_child(parent).ok().flatten();
+            let mut current = parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node));
             let (mut index, mut count) = (0i64, 0i64);
             while let Some(sibling) = current {
                 if !take_selector_work(quota) { return false; }
@@ -22331,6 +23042,7 @@ struct RegisteredQuerySources {
     inherited_custom: Option<Arc<[(String, Option<String>)]>>,
     owner: Option<(Arc<str>, Arc<str>)>,
     sibling: (usize,usize),
+    svg_instance_root: bool,
     pseudo: Option<PseudoElement>,
     environment: MediaEnvironment,
     query_axes: u8,
@@ -22444,6 +23156,7 @@ impl EffectEligibility {
         let empty_style_bytes=crate::layout::checked_style_retained_bytes(&Style::initial())?;
         for source in sources {
             if let Some(url)=&source.source_url {bytes=bytes.checked_add(header.checked_add(url.len())?)?;}
+            if let Some(scope)=&source.reference_scope{bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(scope.as_ref()))?;}
             let payload=match &source.declaration.value {
                 Value::Custom(name,raw)|Value::Deferred(name,raw)=>header.checked_mul(2)?.checked_add(name.len())?.checked_add(raw.len())?,
                 Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>header.checked_mul(3)?.checked_add(core::mem::size_of::<declaration_block::Pending>())?.checked_add(group.property.len())?.checked_add(group.value.len())?,
@@ -22479,7 +23192,7 @@ type Priority = (CascadeOrigin, [usize; 8], (u16, u16, u16, u16), (usize, usize)
 #[derive(Clone, Debug)]
 struct SnapshotDeclaration {
     priority: Priority,
-    font_scope: Option<Arc<[NodeId]>>,
+    reference_scope: Option<Arc<[NodeId]>>,
     declaration: Declaration,
     source_url: Option<Arc<str>>,
     // A pending shorthand cohort is retained once by Arc and projected only
@@ -22819,7 +23532,7 @@ fn cascade_custom_properties(
                 }
                 if !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
                     provenance.dependent.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-                    provenance.dependent.push(SnapshotDeclaration { priority: *priority, font_scope:None, declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
+                    provenance.dependent.push(SnapshotDeclaration { priority: *priority, reference_scope:None, declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
                 }
             }
         }
@@ -22969,6 +23682,7 @@ struct SharedStyle {
     dom_parent: NodeId,
     parent_token: u32,
     box_parent: BoxParentContext,
+    auto_direction: Option<crate::directionality::Direction>,
     style: Arc<Style>,
 }
 
@@ -23539,11 +24253,23 @@ fn compute_node_cached_impl(
     } else {
         None
     };
+    // HTML auto direction depends on each element's contents or live control
+    // value, even when sibling tags and attributes are identical. Keep style
+    // sharing for equal directions without conflating these contextual inputs.
+    let auto_direction=dom_parent.and_then(|_|match kind {
+        NodeKind::Element{namespace:Namespace::Html,name,..}
+            if crate::svg::local_name(name)=="bdi"
+                || document.get_attribute_ns_ref(node,None,"dir").ok().flatten()
+                    .is_some_and(|value|value.eq_ignore_ascii_case("auto")) =>
+            Some(crate::directionality::resolved_element_directionality(document,node)),
+        _=>None,
+    });
     if let Some(dom_parent) = dom_parent {
         let shared = cache.shared.iter().find(|entry| {
             entry.dom_parent == dom_parent
                 && entry.parent_token == token
                 && entry.box_parent==box_parent
+                && entry.auto_direction==auto_direction
                 && !entry.style.sibling_position_dependent
                 && document
                     .kind(entry.node)
@@ -23600,6 +24326,7 @@ fn compute_node_cached_impl(
             dom_parent,
             parent_token: token,
             box_parent,
+            auto_direction,
             style: style.clone(),
         };
         if cache.shared.len() < SHARED_RECENT {
@@ -23650,7 +24377,32 @@ fn compute_for_named_mode(
 ) -> Result<Style, CssError> {
     compute_for_named_registered_mode(kind, parent, index, context, ancestor_bloom, text,
         pseudo_target, highlight_name, box_parent, starting_style, include_transitions,
-        eligibility, style_seed, None, None, None)
+        eligibility, style_seed, None, None, None, false, &[])
+}
+
+// The direct SVG use instance root shares the ordinary declaration evaluator,
+// but its mandatory symbol UA rule differs from the corresponding source node.
+// It is operation-local and deliberately bypasses the source-node style cache.
+#[cfg(test)]
+pub(crate) fn compute_svg_instance_root(
+    document: &Document, node: NodeId, parent: &Style, index: &StyleIndex,
+    text: Option<&dyn TextShaper>,
+) -> Result<Style, CssError> {
+    let kind = document.kind(node).map_err(|_| CssError { offset: 0, message: "invalid SVG instance root" })?;
+    compute_for_named_registered_mode(kind, Some(parent), index, Some((document, node)),
+        u64::MAX, text, None, None, Some(BoxParentContext::Flow.for_children(parent)), false, true,
+        None, None, None, None, None, true, &[])
+}
+
+pub(crate) fn compute_svg_instance_style(
+    document: &Document, node: NodeId, parent: &Style, index: &StyleIndex,
+    text: Option<&dyn TextShaper>, frames: &[SvgInstanceFrame],
+) -> Result<Style, CssError> {
+    let kind=document.kind(node).map_err(|_|CssError{offset:0,message:"invalid SVG instance node"})?;
+    let direct=frames.last().is_some_and(|frame|frame.root==node);
+    compute_for_named_registered_mode(kind,Some(parent),index,Some((document,node)),u64::MAX,
+        text,None,None,Some(BoxParentContext::Flow.for_children(parent)),false,true,
+        None,None,None,None,None,direct,frames)
 }
 
 fn compute_for_named_registered_mode(
@@ -23670,6 +24422,8 @@ fn compute_for_named_registered_mode(
     registration_override: Option<&[registered_properties::RegisteredCustomProperty]>,
     registered_query: Option<ContainerUnitContext>,
     sibling_override:Option<(usize,usize)>,
+    svg_instance_root: bool,
+    instance_frames: &[SvgInstanceFrame],
 ) -> Result<Style, CssError> {
     let registration_snapshot = index.registered_snapshot();
     let registrations = registration_override.unwrap_or(&registration_snapshot);
@@ -23718,6 +24472,12 @@ fn compute_for_named_registered_mode(
     if pseudo_target.is_some() {
         style.display = Display::Inline;
     }
+    if pseudo_target.is_some_and(PseudoElement::is_marker) {
+        // CSS Lists §3.1.1 UA defaults precede author declarations.
+        style.unicode_bidi = UnicodeBidi::Isolate;
+        style.white_space = WhiteSpace::Pre;
+        style.text_transform = TextTransform::None;
+    }
     if let (
         Some(pseudo),
         NodeKind::Element {
@@ -23731,7 +24491,7 @@ fn compute_for_named_registered_mode(
             let item = match pseudo {
                 PseudoElement::Before => Some(GeneratedContentItem::OpenQuote),
                 PseudoElement::After => Some(GeneratedContentItem::CloseQuote),
-                PseudoElement::Marker | PseudoElement::FirstLine | PseudoElement::FirstLetter | PseudoElement::Placeholder | PseudoElement::Highlight
+                PseudoElement::Marker | PseudoElement::BeforeMarker | PseudoElement::AfterMarker | PseudoElement::FirstLine | PseudoElement::FirstLetter | PseudoElement::Placeholder | PseudoElement::Highlight
                 | PseudoElement::ViewTransition | PseudoElement::ViewTransitionGroup | PseudoElement::ViewTransitionImagePair
                 | PseudoElement::ViewTransitionOld | PseudoElement::ViewTransitionNew => None,
             };
@@ -23787,9 +24547,15 @@ fn compute_for_named_registered_mode(
         style.set_source_color(141,parent.source_color(141));
         style.set_source_color(142,parent.source_color(142));
         style.svg_stroke_width = parent.svg_stroke_width;
+        style.svg_fill_opacity = parent.svg_fill_opacity;
+        style.svg_stroke_opacity = parent.svg_stroke_opacity;
+        copy_slot(254,parent,&mut style);
         style.svg_fill_rule = parent.svg_fill_rule;
         style.svg_clip_rule = parent.svg_clip_rule;
         style.line_height = parent.line_height;
+        if style.line_break_counts!=parent.line_break_counts {
+            style.line_break_counts=parent.line_break_counts.clone();
+        }
         style.border_spacing = parent.border_spacing;
         style.quotes = parent.quotes.clone();
         style.color_scheme = parent.color_scheme.clone();
@@ -23924,10 +24690,17 @@ fn compute_for_named_registered_mode(
                     "pre" => {Value::WhiteSpace(WhiteSpace::Pre).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[54]);}}
                     "nobr" => {Value::WhiteSpace(WhiteSpace::NoWrap).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[54]);}}
                     "input" => {
-                        if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[7,13,129,130,131,139,140,185,199,200]);}
                         let input_type = crate::svg::attribute(attributes, "type")
                             .map_or_else(|| "text".into(), ascii_lower);
                         style.display = Display::InlineBlock;
+                        if input_type=="image" {
+                            // HTML rendering: Image Button has appearance:none
+                            // and image replacement sizing, not 13px widget ink.
+                            style.appearance=Appearance::None;
+                            style.line_height=LineHeight::Normal;
+                            if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[13]);}
+                        } else {
+                        if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[7,13,129,130,131,139,140,185,199,200]);}
                         style.font_size = 13.333_333;
                         style.font = FontSpec {
         ligatures: FontLigatures::NORMAL,
@@ -23971,6 +24744,7 @@ fn compute_for_named_registered_mode(
                             // their `value` attribute as text.
                             style.width = Some(13.0);
                             style.height = Some(13.0);
+                        }
                         }
                     }
                     "textarea" => {
@@ -24251,12 +25025,35 @@ fn compute_for_named_registered_mode(
             }
         }
     }
+    if pseudo_target.is_none() {
+        if let NodeKind::Element{namespace:Namespace::Svg,name,..}=kind {
+            let nested=context.is_some_and(|(document,node)|document.parent(node).ok().flatten().is_some_and(|parent|
+                matches!(document.kind(parent),Ok(NodeKind::Element{namespace:Namespace::Svg,name,..}) if crate::svg::local_name(name)!="foreignObject")));
+            if crate::svg::local_name(name)!="svg" || nested {
+                style.transform_origin=[TransformLength{pixels:0.0,percent:0.0};2];
+            }
+            if crate::svg::local_name(name)=="symbol" || (crate::svg::local_name(name)=="svg" && context.is_some_and(|(document,node)|
+                document.document_element_at(document.root()).ok().flatten()!=Some(node))) {
+                style.overflow_x=Overflow::Hidden;style.overflow_y=Overflow::Hidden;
+            }
+        }
+    }
     if let Some(provenance) = eligibility.as_deref_mut() {
         provenance.baseline = Some(Arc::new(style.clone()));
         provenance.box_parent = box_parent.unwrap_or_default();
     }
     if let Some((seed, _)) = style_seed { style = seed.clone(); }
     let mut candidates: Vec<Candidate<'_>> = Vec::new();
+    if pseudo_target.is_none() && matches!(kind,
+        NodeKind::Element { namespace: Namespace::Svg, name, .. }
+            if matches!(crate::svg::local_name(name),"defs"|"clipPath"|"mask"|"marker"|"desc"|"title"|"metadata"|"pattern"|"linearGradient"|"radialGradient"|"script"|"style"|"symbol")) {
+        // SVG2 6.8: definition and metadata elements never render, even
+        // against author !important. Only a direct symbol instance root
+        // has the opposite mandatory UA rule (SVG2 5.4.2).
+        candidates.push(((CascadeOrigin::UaImportant, [usize::MAX; 8], (3, 0, 0, 0), (0, usize::MAX)),
+            alloc::borrow::Cow::Owned(Declaration { value: Value::Display(
+                if svg_instance_root && matches!(kind,NodeKind::Element{name,..} if crate::svg::local_name(name)=="symbol") { Display::Inline } else { Display::None }), important: true }), None));
+    }
     // Presentational hints participate at author origin with zero specificity.
     // Keep them out of the UA baseline so authored `revert` returns to the
     // rendering defaults instead of reviving an HTML attribute hint.
@@ -24335,41 +25132,35 @@ fn compute_for_named_registered_mode(
         } = kind
         {
             let tag = crate::svg::local_name(name);
+            if let Some(matrix)=crate::svg::presentation_transform(tag,attributes,context) {
+                candidates.push(((CascadeOrigin::Author,[0;8],(0,0,0,0),(0,0)),
+                    alloc::borrow::Cow::Owned(Declaration{value:Value::Transforms(Some(Arc::from([Transform::Matrix(matrix)]))),important:false}),index.document_base_url.clone()));
+            }
             // SVG presentation attributes participate at author origin with zero
             // specificity, below every stylesheet declaration.
             for (name, raw) in attributes {
+                if name.as_str().contains(':'){continue;}
                 let local = crate::xml::split_qname(name.as_str())
                     .map(|(_, local)| local)
                     .unwrap_or_else(|| name.as_str());
-                let geometry = match tag {
-                    "svg" => matches!(local, "width" | "height"),
-                    "rect" => matches!(local, "x" | "y" | "width" | "height" | "rx" | "ry"),
-                    "circle" => matches!(local, "cx" | "cy" | "r"),
-                    "ellipse" => matches!(local, "cx" | "cy" | "rx" | "ry"),
-                    _ => false,
-                };
-                if !matches!(
-                    local,
-                    "fill"
-                        | "stroke"
-                        | "stroke-width"
-                        | "fill-rule"
-                        | "clip-path"
-                        | "clip-rule"
-                        | "stop-color"
-                        | "stop-opacity"
-                        | "filter"
-                ) && !geometry
-                {
-                    continue;
-                }
+                if matches!(local,"transform"|"gradientTransform"|"patternTransform") {continue;}
+                let Some(property)=crate::svg::presentation_property(tag,local) else{continue;};
+                if matches!(property,"width"|"height") && (matches!(tag,"use"|"symbol") || (tag=="svg" && context.is_some_and(|(document,node)|
+                    document.parent(node).ok().flatten().is_some_and(|parent|matches!(document.kind(parent),Ok(NodeKind::Element{namespace:Namespace::Svg,name,..}) if crate::svg::local_name(name)!="foreignObject"))))) {continue;}
+                // Attributes are property values, not declaration lists. SVG2
+                // expressly makes !important invalid at this cascade position.
+                if important_value(raw).1 {continue;}
+                let geometry=matches!(property,"x"|"y"|"width"|"height"|"cx"|"cy"|"r"|"rx"|"ry"|"d");
                 // SVG user-unit dimensions are CSS pixel lengths at the presentation
                 // attribute cascade position; CSS declarations can still override them.
-                let pixel_dimension = if geometry && matches!(local, "width" | "height") {
-                    raw.trim_matches(|ch:char|ch.is_ascii() && is_css_whitespace(ch as u8)).parse::<f32>().ok().filter(|value| value.is_finite() && *value >= 0.0)
+                let pixel_dimension = if (geometry && local!="d") || matches!(local,"font-size"|"letter-spacing"|"word-spacing") {
+                    raw.trim_matches(|ch:char|ch.is_ascii() && is_css_whitespace(ch as u8)).parse::<f32>().ok().filter(|value| value.is_finite() && (*value >= 0.0 || matches!(local,"x"|"y"|"cx"|"cy"|"letter-spacing"|"word-spacing")))
                         .map(|value| alloc::format!("{value}px"))
                 } else { None };
-                for mut declaration in typed_declarations(local, pixel_dimension.as_deref().unwrap_or(raw), 0)? {
+                // Property-value validation and expansion share the author
+                // declaration-pair authority, without serializing a block or
+                // accepting embedded declarations and priorities.
+                for mut declaration in declaration_block::parsed_value(property,pixel_dimension.as_deref().unwrap_or(raw))?.unwrap_or_default() {
                     declaration.important = false;
                     candidates.push((
                         (CascadeOrigin::Author, [0; 8], (0, 0, 0, 0), (0, 0)),
@@ -24412,7 +25203,8 @@ fn compute_for_named_registered_mode(
                 {
                     return;
                 }
-                let Some(proximity) = rule.match_scope_proximity(document, node, &crate::forms::NoValidityOverrides) else { return; };
+                let tree=SelectorDocument{source:document,instances:instance_frames};
+                let Some(proximity) = rule.match_scope_proximity_in_tree(&tree, node, &crate::forms::NoValidityOverrides) else { return; };
                 usize::MAX - proximity
             }
             None => {
@@ -24575,7 +25367,8 @@ fn compute_for_named_registered_mode(
         raw.filter(|raw|needs_expansion(raw)).and_then(|raw|parent.and_then(|parent|expand_variables(raw,parent.custom_properties(),&mut Vec::new())))
             .is_some_and(|raw|typed_numeric::substitute_sibling_functions(&raw,1,1).is_some_and(|(_,dependent)|dependent))
     });
-    let sibling=sibling_override.unwrap_or_else(||if sibling_dependent{context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1))}else{(1,1)});
+    let sibling=sibling_override.unwrap_or_else(||if sibling_dependent{context.map(|(document,node)|
+        if instance_frames.last().is_some_and(|frame|frame.root==node){(1,1)}else{element_sibling_position(document,node)}).unwrap_or((1,1))}else{(1,1)});
     style.sibling_position_dependent|=sibling_dependent;
     let custom_baseline=style_seed.filter(|(_,provenance)|provenance.baseline.is_none()).map(|(seed,_)|seed);
     let registered_candidates: Vec<Candidate<'_>> = if registrations.is_empty() { Vec::new() }
@@ -24912,6 +25705,14 @@ fn compute_for_named_registered_mode(
                         if slot == 10 { Value::BorderCurrentColor.apply(&mut style); }
                         else { Value::LogicalBorder(slot, LogicalBorderComponent::CurrentColor).apply(&mut style); }
                     }
+                } else if matches!(declaration.value,Value::Filters(_)|Value::SourceFilters(_)) {
+                    declaration.value.apply(&mut style);
+                    style.resolve_filter_urls(source_url.as_deref());
+                    if style.filters.as_ref().is_some_and(|filters|filters.iter().any(|filter|matches!(filter,lumen_common::filter::FilterOperation::Url(url) if url.local))) {
+                        if let Some((document,node))=context {
+                            style.filter_reference_scope=index.declaration_reference_scope(document,node,priority,233)?;
+                        }
+                    } else if style.filter_reference_scope.is_some(){style.filter_reference_scope=None;}
                 } else if let Value::GridRaw(slot, raw) = &declaration.value {
                     let context = resolved_length_context.unwrap_or_else(|| style_length_context(text, &style, index.environment, None));
                     if let Some(value) = grid_resolve(*slot, raw, context) {
@@ -25118,6 +25919,12 @@ fn compute_for_named_registered_mode(
                     if let Some(value) = border_radius_corner_value(raw, context) {
                         Value::LogicalBorderRadiusCorner(*corner, value).apply(&mut style);
                     }
+                } else if let Value::SvgGeometry(geometry_index,Some(raw))=&declaration.value {
+                    if decoded_css_keyword(raw,"auto") {declaration.value.apply(&mut style);}
+                    else {
+                        let length=resolved_length_context.unwrap_or_else(||style_length_context(text,&style,index.environment,None));
+                        if let Some(value)=computed_svg_geometry_value(*geometry_index,raw,length,query){value.apply(&mut style);}
+                    }
                 } else if let Value::TextIndentRaw(raw) = &declaration.value {
                     let context = resolved_length_context.unwrap_or_else(|| style_length_context(text, &style, index.environment, None));
                     if let Some(value) = background_length(raw, context) {
@@ -25200,10 +26007,13 @@ fn compute_for_named_registered_mode(
                 } else if let Value::FontSizeKeyword(keyword) = declaration.value {
                     style.font_size = keyword.resolve(parent.map_or(16.0, |parent| parent.font_size));
                 } else if let Value::ContextLength(_, raw, nonnegative) = &declaration.value {
-                    let sibling_raw=if matches!(slot,164|165|166|167|206|222|223|224|225){
-                        let(index,count)=context.map(|(document,node)|element_sibling_position(document,node)).unwrap_or((1,1));
-                        sibling_context_colors(raw,index,count).map(|(resolved,dependent)|{style.sibling_position_dependent|=dependent;resolved})
-                    }else{None};
+                    if slot==233 {
+                        if let Some((document,node))=context {
+                            style.filter_reference_scope=index.declaration_reference_scope(document,node,priority,233)?;
+                        }
+                    }
+                    let sibling_raw=typed_numeric::substitute_sibling_functions(raw,sibling.0,sibling.1)
+                        .map(|(resolved,dependent)|{style.sibling_position_dependent|=dependent;resolved});
                     let raw=sibling_raw.as_deref().unwrap_or(raw.as_ref());
                     let numeric_input = if slot == 140 { font_size_adjust_components(raw).map(|(_, input)| input).unwrap_or(raw) } else if (234..=237).contains(&slot) {intrinsic_override::numeric_input(raw).unwrap_or(raw)} else if slot==238{columns::numeric_input(raw)} else { raw };
 
@@ -25222,7 +26032,7 @@ fn compute_for_named_registered_mode(
                         components(raw).is_some_and(|values| values.iter().any(|raw| contains_container_unit(raw)))
                     } else { contains_container_unit(numeric_input) };
                     if uses_container || pending_parent || pending_current {
-                        style.relative_expressions.push(RelativeExpression { source_url:None,
+                        style.relative_expressions.push(RelativeExpression { source_url:if slot==233{source_url.clone()}else{None},
                             slot,
                             raw: Arc::from(raw.as_ref()),
                             context,
@@ -25233,8 +26043,8 @@ fn compute_for_named_registered_mode(
                         });
                         continue;
                     }
-                    if matches!(slot,48|74|75|140|164|165|166|167|206|214|215|222|223|224|225|233|234..=238) {
-                        if let Some(value)=context_length_value(slot,raw,context,false,ContainerUnitContext::default()) {value.apply(&mut style);}
+                    if matches!(slot,31|48|74|75|140|145..=153|157|164|165|166|167|206|214|215|222|223|224|225|233|234..=238|244|245|250|251|253|255) {
+                        if let Some(value)=style.resolve_context_value(slot,raw,context,false,ContainerUnitContext::default()) {value.apply(&mut style);if slot==233{style.resolve_filter_urls(source_url.as_deref());}}
                         continue;
                     }
                     if matches!(slot,26|180) {
@@ -25297,12 +26107,8 @@ fn compute_for_named_registered_mode(
                 } else {
                     declaration.value.apply(&mut style);
                     if matches!(declaration.value,Value::FontFamily(_)) {
-                        if let Some(snapshot)=index.snapshot_declarations.iter().find(|snapshot|snapshot.priority==*priority && snapshot.target==Some(129)) {
-                            style.font.family_scope=snapshot.font_scope.clone();
-                        } else if let Some((document,node))=context {
-                            let scope=if priority.3.1==usize::MAX {let root=document.root_node(node,false).map_err(|_|CssError{offset:0,message:"invalid font reference scope"})?;(root!=document.root()).then_some(root)}
-                                else {priority.3.1.checked_sub(1).and_then(|order|index.rules.get(order)).and_then(|rule|rule.scope)};
-                            style.font.family_scope=index.font_scope_chain(document,scope)?;
+                        if let Some((document,node))=context {
+                            style.font.family_scope=index.declaration_reference_scope(document,node,priority,129)?;
                         }
                     }
                 }
@@ -25376,6 +26182,12 @@ fn compute_for_named_registered_mode(
         let wins=cascade_alias_wins(logical,physical,&expanded,&winner_orders,false);
         project_relative_alias(&mut style,logical,physical,wins);
         if wins {let value=style.stored_intrinsic_override(logical);style.set_intrinsic_override(physical,value);}
+    }
+    for logical in 242..=243 {
+        let physical=logical_physical_slot(&style,logical).unwrap();
+        if cascade_alias_wins(logical,physical,&expanded,&winner_orders,false) {
+            Value::OverflowAxis(physical,style.logical_overflow[logical-242].unwrap_or(Overflow::Visible)).apply(&mut style);
+        }
     }
     // Logical and physical sizing declarations share the same cascade. Use
     // existing winner priorities rather than always letting logical extras win.
@@ -25550,6 +26362,13 @@ fn compute_for_named_registered_mode(
         style.extras = None;
     }
     animation_controls::project_range(&mut style);
+    if pseudo_target.is_some_and(PseudoElement::is_marker) {
+        if parent.is_none_or(|origin| !origin.is_list_item()) {
+            Value::GeneratedContent(GeneratedContent::None).apply(&mut style);
+        }
+        style.display_list_item = false;
+        if style.display == Display::ListItem { style.display = Display::Block; }
+    }
     // The UA's list-item increment is the initial declaration for every
     // list-item box. An authored counter-increment (including `none`) replaces
     // it through the ordinary cascade.
@@ -25607,7 +26426,7 @@ fn compute_for_named_registered_mode(
             eligibility.dependent.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS snapshot sources exceed limit" })?;
             eligibility.dependent.push(SnapshotDeclaration {
                 priority: *priority,
-                font_scope: if slot==129 {style.font.family_scope.clone()} else {None},
+                reference_scope: match slot{129=>style.font.family_scope.clone(),233=>style.filter_reference_scope.clone(),_=>None},
                 declaration: expanded_originals.get(source - 1).and_then(Option::as_ref).unwrap_or(declaration.as_ref()).clone(),
                 source_url: source_url.clone(), target: Some(slot),
             });
@@ -25639,7 +26458,7 @@ fn compute_for_named_registered_mode(
                 sources.extend_from_slice(existing);
                 for (priority, declaration, source_url) in overlays {
                     sources.push(SnapshotDeclaration { priority: *priority,
-                        font_scope: (declaration.value.slot() == 129).then(|| style.font.family_scope.clone()).flatten(),
+                        reference_scope: match declaration.value.slot(){129=>style.font.family_scope.clone(),233=>style.filter_reference_scope.clone(),_=>None},
                         declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
                 }
                 query_provenance.sources = Some(sources.into());
@@ -25664,7 +26483,7 @@ fn compute_for_named_registered_mode(
             }
             let pending = RegisteredQuerySources { provenance: query_provenance,
                 registrations: registration_snapshot.clone(), inherited_custom: parent.and_then(|parent| parent.custom.clone()), owner,
-                pseudo: pseudo_target, environment: index.environment, sibling,
+                pseudo: pseudo_target, environment: index.environment, sibling, svg_instance_root,
                 query_axes: registered_raw_sources.as_deref().unwrap_or(&[]).iter()
                     .filter_map(|(_, value)| value.as_deref()).fold(0, |axes, raw| axes | registered_query_axes(raw))
                     | style.relative_expressions.iter().fold(0, |axes, value| axes | registered_query_axes(&value.raw)), query_slots, query_custom };
@@ -25687,6 +26506,85 @@ fn compute_for_named_registered_mode(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn specification_svg_instance_registered_query_replays_preserve_matched_sources_and_virtual_siblings() {
+        let document=crate::html::parse("<!doctype html><svg><g class='source'><rect/><g id='template'/><rect/></g><use id='host'/></svg>",64).unwrap();
+        let root=crate::selector::query_selector(&document,document.root(),"#template").unwrap().unwrap();
+        let host=crate::selector::query_selector(&document,document.root(),"#host").unwrap().unwrap();
+        let frames=[SvgInstanceFrame{root,host}];
+        let mut rules=StyleIndex::new(parse_stylesheet(".source #template {--measure:calc(99cqw * sibling-index())} #template:first-child {--measure:calc(1cqw * sibling-index());stroke-width:var(--measure)}").unwrap().rules);
+        let mut registrations=Vec::new();registered_properties::register(&mut registrations,"--measure".into(),"<length>",false,Some("0px".into())).unwrap();rules.set_registered_properties(&registrations);
+        let mut instance=compute_svg_instance_style(&document,root,&Style::initial(),&rules,None,&frames).unwrap();
+        assert!(instance.property_query_context_pending("--measure"));
+        assert!(instance.sibling_position_dependent);
+        let query=|width|ContainerUnitContext{width:ContainerUnitBasis::Size(width),..ContainerUnitContext::default()};
+        let retained=instance.clone();
+        for (width,expected) in [(200.0,"2px"),(300.0,"3px")] {
+            instance=retained.clone();assert!(instance.resolve_query_context(query(width)));
+            assert_eq!(instance.custom_properties().iter().find(|(name,_)|name=="--measure").unwrap().1.as_deref(),Some(expected),"replay evaluates the captured instance declaration and virtual-root sibling index, without matching source ancestors again");
+            assert_eq!(instance.svg_stroke_width,width/100.0);
+        }
+        let mut source=compute_node(&document,root,None,&rules).unwrap();assert!(source.resolve_query_context(query(200.0)));
+        assert_eq!(source.custom_properties().iter().find(|(name,_)|name=="--measure").unwrap().1.as_deref(),Some("396px"),"source siblings and source ancestry remain independent of the instance replay");
+    }
+
+    #[test]
+    fn specification_svg_never_rendered_sources_keep_mandatory_ua_in_source_and_instances() {
+        for tag in ["defs","clipPath","mask","marker","desc","title","metadata","pattern","linearGradient","radialGradient","script","style","symbol"] {
+            let mut document=crate::html::parse("<!doctype html><svg></svg>",64).unwrap();
+            let svg=crate::selector::query_selector(&document,document.root(),"svg").unwrap().unwrap();
+            let source=document.create(NodeKind::Element{namespace:Namespace::Svg,name:tag.into(),attributes:Vec::new()}).unwrap();
+            document.set_attribute(source,"style","display:block!important").unwrap();
+            document.append(svg,source).unwrap();
+            let index=StyleIndex::new(Vec::new());
+            assert_eq!(compute_node(&document,source,None,&index).unwrap().display,Display::None,"mandatory source rule for {tag}");
+            let frames=[SvgInstanceFrame{root:source,host:svg}];
+            assert_eq!(compute_svg_instance_style(&document,source,&Style::initial(),&index,None,&frames).unwrap().display,if tag=="symbol"{Display::Inline}else{Display::None},"only symbol changes at a direct instance boundary: {tag}");
+        }
+    }
+
+    #[test]
+    fn specification_svg_instance_selectors_share_canonical_boundary_and_host_inheritance() {
+        let document=crate::html::parse("<!doctype html><div dir=ltr><svg lang=fr><g class=source><rect id='before'/><g id=template><rect class=leaf id='a'/><rect class=leaf id='b'/></g><rect id='after'/></g></svg></div><div dir=rtl><svg><use id=host lang='en'/></svg></div>",128).unwrap();
+        let by_id=|id|crate::selector::query_selector(&document,document.root(),&alloc::format!("#{id}")).unwrap().unwrap();
+        let root=by_id("template");let a=by_id("a");let b=by_id("b");let frames=[SvgInstanceFrame{root,host:by_id("host")}];
+        let ordinary=SelectorDocument::ordinary(&document);let instance=SelectorDocument{source:&document,instances:&frames};
+        let matches=|tree:&SelectorDocument<'_>,node,raw|parse_selector_list(raw,0).unwrap().iter().any(|selector|
+            selector.matches_in_context_with_validity(tree,node,None,None,0,&crate::forms::NoValidityOverrides));
+        for raw in [".source #template","#before + #template","#before ~ #template","#template:nth-child(2)","#template:has(+ #after)","#template:nth-child(n of .source #template)","#template:nth-last-child(n of .source #template)","#template:lang(fr)","#template:dir(ltr)"] {
+            assert!(matches(&ordinary,root,raw),"source {raw}");assert!(!matches(&instance,root,raw),"instance boundary {raw}");
+        }
+        for raw in ["#template:first-child","#template:last-child","#template:only-child","#template:nth-child(1)","#template:nth-last-child(1)","#template:nth-child(1 of g)","#template:nth-last-child(1 of g)","#template:has(> .leaf)","#template:lang(en)","#template:dir(rtl)"] {
+            assert!(matches(&instance,root,raw),"instance {raw}");
+        }
+        for raw in ["use #template","use > #template","#template:root","#template:scope","#template:has(~ #after)"] {assert!(!matches(&instance,root,raw),"host and source neighbors are not cloned {raw}");}
+        assert!(matches(&instance,a,"#template:first-child > .leaf:first-child"));
+        assert!(matches(&instance,b,"#template:only-child > .leaf:nth-child(2)"));
+        assert!(matches(&instance,b,"#a + #b"));
+        assert!(!matches(&instance,a,".source #a"));
+        let mut work=0;assert!(!parse_selector_list("#template:has(.leaf)",0).unwrap()[0].matches_in_context_with_work(&instance,root,None,None,&crate::forms::NoValidityOverrides,&mut work));
+        let rules=parse_stylesheet("@scope (.source) { #a {fill:red} } @scope (#template) { #a {fill:green} }").unwrap().rules;
+        assert!(rules[0].match_scope_proximity_in_tree(&ordinary,a,&crate::forms::NoValidityOverrides).is_some());
+        assert!(rules[0].match_scope_proximity_in_tree(&instance,a,&crate::forms::NoValidityOverrides).is_none());
+        assert!(rules[1].match_scope_proximity_in_tree(&instance,a,&crate::forms::NoValidityOverrides).is_some());
+    }
+
+    #[test]
+    fn specification_transform_sources_survive_containing_block_projection() {
+        let document=crate::html::parse("<style>#box{width:20px;height:10px;transform-origin:0 0;transform:transform-interpolate(50%,0%:translateX(0%),100%:scale(2));translate:50% 20%}</style><div id=box></div>",64).unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#box").unwrap().unwrap();
+        let mut session=crate::session::RenderSession::new(document);
+        let computed=session.computed_style(node).unwrap();
+        let used=computed.resolve_percentages(1000.0,Some(800.0));
+        let source=used.relative_expressions.iter().find(|expression|expression.slot==59).unwrap();
+        assert!(source.raw.contains("transform-interpolate"));
+        let reference=Rect{x:0.0,y:0.0,width:20.0,height:10.0};
+        let matrix=used.transform_matrix(reference).unwrap();
+        assert_eq!((matrix.a,matrix.d,matrix.e,matrix.f),(1.5,1.5,10.0,2.0),"both transform and individual percentages use the actual target reference box");
+        let again=used.resolve_percentages(2000.0,Some(1600.0));
+        assert_eq!(again.transform_matrix(reference),Some(matrix),"warm percentage projection cannot drop or rebase transform sources");
+    }
+
+    #[test]
     fn specification_numeric_source_simplification_keeps_percentage_ratios_basis_independent() {
         let ratio="calc(1px * progress(abs(10%), (10% - 10%), 100% / 10))";
         assert_eq!(serialize_cssom_property_value("opacity","progress(100px,0px,100px)").as_deref(),Some("calc(1)"));
@@ -25702,6 +26600,138 @@ mod tests {
         let style=compute(&element(&alloc::format!("width:{ratio}")),None,&StyleIndex::new(Vec::new())).unwrap();
         assert_eq!(style.width,Some(1.0));
         assert!(style.relative_lengths.is_empty(),"a context-free ratio does not become a percentage width");
+    }
+
+    #[test]
+    fn specification_box_decoration_break_uses_shared_fragmentation_payload_and_codec() {
+        let index=StyleIndex::new(Vec::new());
+        let parent=compute(&element("box-decoration-break:clone;break-inside:avoid-column;column-span:all"),None,&index).unwrap();
+        assert_eq!(parent.box_decoration_break(),BoxDecorationBreak::Clone);
+        assert_eq!(parent.break_controls()[2],BreakControl::AvoidColumn);
+        assert_eq!(parent.column_span(),ColumnSpan::All);
+        for (raw,expected) in [("",BoxDecorationBreak::Slice),("box-decoration-break:inherit",BoxDecorationBreak::Clone),("all:inherit",BoxDecorationBreak::Clone),("box-decoration-break:unset",BoxDecorationBreak::Slice),("all:initial",BoxDecorationBreak::Slice)] {
+            let style=compute(&element(raw),Some(&parent),&index).unwrap();
+            assert_eq!(style.box_decoration_break(),expected,"{raw}");
+            assert_eq!(style.computed_css_value("box-decoration-break",Default::default()),Some(expected.serialize()));
+        }
+        let cleared=compute(&element("box-decoration-break:clone;box-decoration-break:initial"),None,&index).unwrap();
+        assert!(cleared.break_controls.is_none());
+        for raw in ["slice","clone","CLONE"] {
+            let block=DeclarationBlock::parse(&alloc::format!("box-decoration-break:{raw}")).unwrap();
+            assert_eq!(block.value("box-decoration-break"),Some((raw.to_ascii_lowercase(),false)));
+            assert_eq!(serialize_cssom_property_value("BOX-DECORATION-BREAK",raw),Some(raw.to_ascii_lowercase()));
+        }
+        for raw in ["clone slice","auto","0","calc(1)"] {assert!(!supports_property_value("box-decoration-break",raw),"{raw}");}
+        assert_eq!(transition_value_kind("box-decoration-break"),TransitionValueKind::Discrete);
+    }
+
+    #[test]
+    fn specification_column_span_query_source_freezes_in_the_declaring_owner() {
+        let index=StyleIndex::new(Vec::new());
+        let mut parent=compute(&element("column-span:calc(1cqw / 1px);break-inside:avoid-column"),None,&index).unwrap();
+        assert!(parent.property_query_context_pending("column-span"));
+        assert!(parent.resolve_query_context(ContainerUnitContext{width:ContainerUnitBasis::Size(300.0),..ContainerUnitContext::default()}));
+        assert_eq!(parent.column_span(),ColumnSpan::Count(3));
+        for raw in ["column-span:inherit;break-inside:inherit","all:inherit"] {
+            let mut child=compute(&element(raw),Some(&parent),&index).unwrap();
+            child.resolve_query_context(ContainerUnitContext{width:ContainerUnitBasis::Size(500.0),..ContainerUnitContext::default()});
+            assert_eq!(child.column_span(),ColumnSpan::Count(3));assert!(!child.property_query_context_pending("column-span"));
+            assert_eq!(child.break_controls()[2],BreakControl::AvoidColumn);
+            assert_eq!(child.computed_css_value("column-span",Default::default()).as_deref(),Some("3"));
+        }
+        for raw in ["","column-span:unset","all:initial"] {
+            let child=compute(&element(raw),Some(&parent),&index).unwrap();assert_eq!(child.column_span(),ColumnSpan::None);
+        }
+        let extremes=compute(&element("column-span:calc(NaN)"),None,&index).unwrap();assert_eq!(extremes.column_span(),ColumnSpan::Count(1));
+    }
+
+    #[test]
+    fn specification_column_span_codec_shares_break_payload_and_integer_math() {
+        let initial=Style::initial();assert_eq!(initial.column_span(),ColumnSpan::None);assert!(initial.break_controls.is_none());
+        for (raw,expected) in [("none",ColumnSpan::None),("all",ColumnSpan::All),("auto",ColumnSpan::Auto),("3",ColumnSpan::Count(3)),("calc(2 + 3)",ColumnSpan::Count(5))] {
+            let style=compute(&element(&alloc::format!("column-span:{raw};break-inside:avoid-column")),None,&StyleIndex::new(Vec::new())).unwrap();
+            assert_eq!(style.column_span(),expected);assert_eq!(style.break_controls()[2],BreakControl::AvoidColumn);
+            assert_eq!(style.computed_css_value("column-span",Default::default()),Some(expected.serialize()));
+            let inherited=compute(&element("all:inherit"),Some(&style),&StyleIndex::new(Vec::new())).unwrap();assert_eq!(inherited.column_span(),expected);
+            let unset=compute(&element("column-span:unset;break-inside:inherit"),Some(&style),&StyleIndex::new(Vec::new())).unwrap();assert_eq!(unset.column_span(),ColumnSpan::None);assert_eq!(unset.break_controls()[2],BreakControl::AvoidColumn);
+        }
+        for raw in ["0","-1","1.5","all none","span 2"]{assert!(!supports_property_value("column-span",raw),"{raw}");}
+        let block=DeclarationBlock::parse("column-span:calc(2 + 3)").unwrap();assert_eq!(block.value("column-span"),Some(("calc(5)".into(),false)));
+    }
+
+    #[test]
+    fn specification_break_controls_share_keyword_alias_source_and_sparse_cascade_authority() {
+        for name in ["break-before","break-after"] {
+            for raw in ["auto","avoid","always","all","avoid-page","page","left","right","recto","verso","avoid-column","column","avoid-region","region"] {
+                assert!(supports_property_value(name,raw),"{name}:{raw}");
+                let style=compute(&element(&alloc::format!("{name}:{raw}")),None,&StyleIndex::new(Vec::new())).unwrap();
+                assert_eq!(style.computed_css_value(name,Default::default()).as_deref(),Some(raw));
+                assert_eq!(serialize_cssom_property_value(name,&raw.to_ascii_uppercase()).as_deref(),Some(raw));
+            }
+        }
+        for raw in ["auto","avoid","avoid-page","avoid-column","avoid-region"]{assert!(supports_property_value("break-inside",raw));}
+        for (name,raw) in [("break-inside","column"),("break-inside","always"),("break-before","none"),("break-after","auto column"),("page-break-before","column"),("page-break-inside","avoid-column")]{assert!(!supports_property_value(name,raw),"{name}:{raw}");}
+        assert_eq!(serialize_cssom_property_value("break-before",r"c\6f lumn").as_deref(),Some("column"));
+        let initial=Style::initial();assert_eq!(initial.break_controls(),[BreakControl::Auto;3]);assert!(initial.break_controls.is_none());
+        let parent=compute(&element("break-before:column;break-after:avoid;break-inside:avoid-column"),None,&StyleIndex::new(Vec::new())).unwrap();
+        let child=compute(&element(""),Some(&parent),&StyleIndex::new(Vec::new())).unwrap();assert_eq!(child.break_controls(),[BreakControl::Auto;3]);assert!(child.break_controls.is_none(),"break controls are not inherited");
+        for raw in ["all:inherit","break-before:inherit;break-after:inherit;break-inside:inherit"] {
+            let style=compute(&element(raw),Some(&parent),&StyleIndex::new(Vec::new())).unwrap();assert_eq!(style.break_controls(),parent.break_controls());
+        }
+        for raw in ["all:initial","all:unset","break-before:unset;break-after:initial;break-inside:unset"] {
+            let style=compute(&element(raw),Some(&parent),&StyleIndex::new(Vec::new())).unwrap();assert_eq!(style.break_controls(),[BreakControl::Auto;3]);assert!(style.break_controls.is_none());
+        }
+        let mut block=DeclarationBlock::parse("page-break-before:always!important;page-break-inside:avoid").unwrap();
+        assert_eq!(block.value("break-before"),Some(("page".into(),true)));assert_eq!(block.value("page-break-before"),Some(("always".into(),true)));
+        assert!(block.serialize().unwrap().contains("break-before: page !important"));assert!(!block.serialize().unwrap().contains("page-break-before"),"CSSOM preferred order excludes legacy shorthands");
+        assert!(block.set("break-before","column",false).unwrap());assert!(block.value("page-break-before").is_none(),"column cannot serialize through the page-only legacy shorthand");
+        let page=compute(&element("page-break-before:always;page-break-after:right;page-break-inside:avoid"),None,&StyleIndex::new(Vec::new())).unwrap();assert_eq!(page.break_controls(),[BreakControl::Page,BreakControl::Right,BreakControl::Avoid]);
+        assert_eq!(page.computed_css_value("page-break-before",Default::default()).as_deref(),Some("always"));
+        assert_eq!(parent.computed_css_value("page-break-before",Default::default()).as_deref(),Some(""));
+    }
+
+    #[test]
+    fn specification_line_break_counts_share_integer_source_query_and_inheritance_authority() {
+        let index=StyleIndex::new(Vec::new());
+        let initial=compute(&element(""),None,&index).unwrap();
+        assert_eq!(initial.line_break_counts(),[2,2]);assert!(initial.line_break_counts.is_none());
+        for name in ["orphans","widows"] {
+            for invalid in ["0","-1","1.5","auto","calc(1px)"] {assert!(!supports_property_value(name,invalid),"{name}:{invalid}");}
+            let mut declaration=super::declaration_block::DeclarationBlock::default();
+            assert!(declaration.set(name,"calc(1.5)",false).unwrap());
+            assert_eq!(declaration.value(name).unwrap().0,"calc(1.5)");
+            assert_eq!(declaration_value(&alloc::format!("{name}:calc(1.5)"),name).unwrap().as_ref().map(|(value,_)|value.as_str()),Some("calc(1.5)"));
+        }
+        let mut parent=compute(&element("orphans:calc(1cqw / 1px);widows:calc(2cqw / 1px)"),None,&index).unwrap();
+        assert!(parent.property_query_context_pending("orphans"));
+        parent.resolve_query_context(ContainerUnitContext{width:ContainerUnitBasis::Size(250.0),..ContainerUnitContext::default()});
+        assert_eq!(parent.line_break_counts(),[3,5]);
+        let child=compute(&element("font-size:40px"),Some(&parent),&index).unwrap();
+        assert_eq!(child.line_break_counts(),[3,5]);
+        assert!(!child.property_query_context_pending("orphans"),"inherit frozen integer, not the ancestor's query source");
+        assert_eq!(child.computed_css_value("orphans",computed_values::ComputedValueContext::default()).as_deref(),Some("3"));
+        assert_eq!(child.computed_css_value("widows",computed_values::ComputedValueContext::default()).as_deref(),Some("5"));
+        assert!(Arc::ptr_eq(child.line_break_counts.as_ref().unwrap(),parent.line_break_counts.as_ref().unwrap()),"implicit inheritance shares the frozen sparse pair");
+        for source in ["orphans:inherit;widows:inherit","orphans:unset;widows:unset","all:inherit","all:unset"] {
+            let inherited=compute(&element(source),Some(&parent),&index).unwrap();
+            assert_eq!(inherited.line_break_counts(),[3,5],"{source}");
+            assert!(!inherited.property_query_context_pending("orphans"),"{source}: computed source freezes before inheritance");
+        }
+        let all_initial=compute(&element("all:initial"),Some(&parent),&index).unwrap();
+        assert_eq!(all_initial.line_break_counts(),[2,2]);assert!(all_initial.line_break_counts.is_none());
+        let reset=compute(&element("orphans:initial;widows:initial"),Some(&parent),&index).unwrap();
+        assert_eq!(reset.line_break_counts(),[2,2]);assert!(reset.line_break_counts.is_none());
+        let scalar=compute(&element("orphans:calc(4.5);widows:round(13,4)"),None,&index).unwrap();
+        assert_eq!(scalar.line_break_counts(),[5,12],"context-free scalar math uses the same integer codec as query-dependent math");
+        for name in ["orphans","widows","column-count"] {
+            assert_eq!(computed_integer_css_value(name,-7.0).as_deref(),Some("1"));
+            assert_eq!(computed_integer_css_value(name,4.5).as_deref(),Some("5"));
+            assert_eq!(computed_integer_css_value(name,f64::INFINITY).as_deref(),Some("2147483647"));
+        }
+        assert_eq!(computed_integer_css_value("order",-4.5).as_deref(),Some("-4"));
+        assert_eq!(computed_integer_css_value("z-index",f64::NAN).as_deref(),Some("0"));
+        let wide=compute(&element("orphans:999999999999999999999999;widows:calc(NaN)"),None,&index).unwrap();
+        assert_eq!(wide.line_break_counts(),[i32::MAX as usize,1]);
     }
 
     #[test]
@@ -25727,6 +26757,25 @@ mod tests {
         let mut style=pending;
         assert!(style.resolve_query_context(ContainerUnitContext{width:ContainerUnitBasis::Size(450.0),..ContainerUnitContext::default()}));
         assert_eq!(style.order,5);assert_eq!(style.z_index,Some(-4));assert_eq!(style.column_count,Some(5));
+    }
+
+    #[test]
+    fn specification_literal_integers_clamp_storage_limits_and_preserve_grammar() {
+        for (raw, expected) in [("2147483648",i32::MAX),("-2147483649",i32::MIN),
+            ("+999999999999999999999999999999999999999999",i32::MAX),
+            ("-999999999999999999999999999999999999999999",i32::MIN),
+            ("0000000000000000000000000000000000000000000000000000000017",17),("-0",0)] {
+            let style=compute(&element(&alloc::format!("order:{raw};z-index:{raw}")),None,&StyleIndex::new(Vec::new())).unwrap();
+            assert_eq!(style.order,expected,"{raw}");assert_eq!(style.z_index,Some(expected),"{raw}");
+            assert!(supports_property_value("z-index",raw));
+        }
+        for invalid in ["", "+", "-", "++1", "--1", "1e3", "1.0", "999999999999999999999999x", "1 2"] {
+            assert!(!supports_property_value("z-index",invalid),"{invalid}");
+        }
+        assert!(!supports_property_value("column-count","-999999999999999999999999"));
+        assert!(!supports_property_value("column-count","0"));
+        let style=compute(&element("column-count:999999999999999999999999"),None,&StyleIndex::new(Vec::new())).unwrap();
+        assert_eq!(style.column_count,Some(i32::MAX as usize));
     }
 
     #[test]
@@ -27673,11 +28722,15 @@ mod tests {
         }
         let reset=compute(&element("text-decoration-color:red;text-decoration-style:wavy;text-decoration:underline;text-underline-position:left"),Some(&parent),&index).unwrap();
         assert_eq!(reset.text_decoration_style,TextDecorationStyle::Solid);
-        assert_eq!(reset.text_decoration_color,None);
+        assert_eq!(reset.text_decoration_color,Some(parent.color));
+        assert!(reset.source_color(203).and_then(|source|source.expression.clone())
+            .is_some_and(|expression|decoded_css_keyword(&expression.raw,"currentcolor")),"shorthand reset retains the initial keyword while projecting its actual used color");
         assert_eq!(reset.text_underline_position.serialize(),"left");
         assert_eq!(reset.computed_css_value("text-decoration-color",context).unwrap(),"rgb(0, 0, 255)");
         let all=compute(&element("text-decoration:underline double red;text-underline-position:under;all:initial"),None,&index).unwrap();
-        assert_eq!(all.text_decoration,0); assert_eq!(all.text_decoration_color,None);
+        assert_eq!(all.text_decoration,0); assert_eq!(all.text_decoration_color,Some(Style::initial().color));
+        assert!(all.source_color(203).and_then(|source|source.expression.clone())
+            .is_some_and(|expression|decoded_css_keyword(&expression.raw,"currentcolor")));
         assert_eq!(all.text_decoration_style,TextDecorationStyle::Solid); assert_eq!(all.text_underline_position.0,0);
     }
 
@@ -30097,6 +31150,28 @@ mod tests {
     }
 
     #[test]
+    fn specification_upright_used_direction_preserves_computed_cssom_and_logical_edge_mapping() {
+        let index=StyleIndex::new(Vec::new());
+        for mode in ["horizontal-tb","vertical-rl","vertical-lr","sideways-rl","sideways-lr"] {
+            for orientation in ["mixed","upright","sideways"] {
+                let style=compute(&element(&alloc::format!("writing-mode:{mode};direction:rtl;text-orientation:{orientation};margin-inline-start:7px;margin-inline-end:11px")),None,&index).unwrap();
+                let forced=orientation=="upright" && matches!(mode,"vertical-rl"|"vertical-lr");
+                assert_eq!(style.direction,Direction::Rtl);
+                assert_eq!(style.used_direction(),if forced{Direction::Ltr}else{Direction::Rtl},"typographic used direction {mode}/{orientation}");
+                assert_eq!(style.computed_css_value("direction",computed_values::ComputedValueContext::default()).as_deref(),Some("rtl"));
+                let start=match mode {"horizontal-tb"=>1,"sideways-lr"=>0,_=>if forced{0}else{2}};
+                assert_eq!(style.logical_sides()[0],start);
+                assert_eq!(style.margin_sides[start],7.0,"logical source edge uses upright direction {mode}/{orientation}");
+                assert_eq!(style.margin_sides[(start+2)%4],11.0);
+                let alignment=style.self_alignment(&style,false);
+                if mode!="horizontal-tb" {
+                    assert_eq!(alignment.offset(20.0,&style,&style,false,false),if mode=="sideways-lr"||forced{0.0}else{20.0},"shared physical vertical alignment start");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn specification_border_logical_pairs_share_mapping_cascade_and_cssom() {
         let index=StyleIndex::new(Vec::new());
         for mode in ["horizontal-tb","vertical-rl","vertical-lr"] {
@@ -31364,6 +32439,86 @@ mod tests {
         assert!(document_rule.matches_at(&document, part));
         document.set_interaction_state(crate::interaction::InteractionState::default());
         assert!(!document_rule.matches_at(&document, part));
+    }
+
+    #[test]
+    fn specification_logical_overflow_uses_shared_axes_cascade_and_computed_inheritance() {
+        let empty=StyleIndex::new(Vec::new());
+        for writing in ["horizontal-tb","vertical-rl","vertical-lr","sideways-rl","sideways-lr"] {
+            let horizontal=writing=="horizontal-tb";
+            let physical=if horizontal {"overflow-x"}else{"overflow-y"};
+            for (source,expected) in [
+                (alloc::format!("overflow-inline:hidden;{physical}:scroll"),Overflow::Scroll),
+                (alloc::format!("{physical}:scroll;overflow-inline:hidden"),Overflow::Hidden),
+                ("overflow-inline:scroll;overflow-block:clip".into(),Overflow::Scroll),
+                ("overflow-inline:scroll;overflow-inline:initial".into(),Overflow::Visible),
+            ] {
+                let style=compute(&element(&alloc::format!("writing-mode:{writing};{source}")),None,&empty).unwrap();
+                assert_eq!(if horizontal {style.overflow_x}else{style.overflow_y},expected,"{writing}/{source}");
+                assert_eq!(style.computed_css_value("overflow-inline",Default::default()),style.computed_css_value(physical,Default::default()));
+                assert_eq!(transition_property_physical_name(&style,"overflow-inline"),physical);
+            }
+            let parent=compute(&element("writing-mode:horizontal-tb;overflow-x:scroll;overflow-y:hidden"),None,&empty).unwrap();
+            let child=compute(&element(&alloc::format!("writing-mode:{writing};overflow-inline:inherit;overflow-block:inherit")),Some(&parent),&empty).unwrap();
+            assert_eq!(if horizontal {(child.overflow_x,child.overflow_y)}else{(child.overflow_y,child.overflow_x)},(Overflow::Scroll,Overflow::Hidden),"logical inheritance follows parent axes");
+            let child=compute(&element(&alloc::format!("all:inherit;writing-mode:{writing}")),Some(&parent),&empty).unwrap();
+            assert_eq!((child.overflow_x,child.overflow_y),(Overflow::Scroll,Overflow::Hidden),"all physical aliases inherit last");
+            let index=StyleIndex::new(parse(&alloc::format!("@layer a,b;@layer a{{div{{{physical}:hidden}}}}@layer b{{div{{overflow-inline:scroll;{physical}:revert-layer}}}}")).unwrap());
+            let child=compute(&element(&alloc::format!("writing-mode:{writing}")),None,&index).unwrap();
+            assert_eq!(if horizontal {child.overflow_x}else{child.overflow_y},Overflow::Hidden,"rollback excludes both alias names in the layer");
+        }
+        for property in ["overflow-inline","overflow-block"] {
+            for value in ["visible","hidden","clip","scroll","auto","inherit","initial","unset","revert","revert-layer"] {assert!(supports_property_value(property,value),"{property}/{value}");}
+            for value in ["scroll hidden","bogus","1px"] {assert!(!supports_property_value(property,value),"{property}/{value}");}
+        }
+    }
+
+    #[test]
+    fn specification_shared_sibling_styles_preserve_content_auto_direction() {
+        for (tag,attribute) in [("div","dir=auto"),("bdi","")] {
+            let source=alloc::format!("<main><{tag} {attribute}>xyz</{tag}><{tag} {attribute}>ابج</{tag}><{tag} {attribute}>456</{tag}><{tag} {attribute}>xyz</{tag}><{tag} {attribute}>אבג</{tag}><{tag} {attribute}>456</{tag}></main>");
+            let document=crate::html::parse(&source,64).unwrap();
+            let parent=Style::initial();let index=StyleIndex::new(Vec::new());
+            let nodes=crate::selector::query_selector_all(&document,document.root(),tag).unwrap();
+            let mut cache=StyleCache::default();
+            for (node,direction) in nodes.iter().copied().zip([Direction::Ltr,Direction::Rtl,Direction::Ltr,Direction::Ltr,Direction::Rtl,Direction::Ltr]) {
+                let cached=compute_node_cached(&document,node,Some(&parent),&index,&mut cache).unwrap();
+                assert_eq!(cached.direction,direction,"{tag}: each sibling uses its own contained text");
+                assert_eq!(cached,compute_node(&document,node,Some(&parent),&index).unwrap(),"shared and uncached {tag} cascade agree");
+            }
+            assert!(cache.stats().shared_hits>=4,"equal auto-direction siblings still share styles");
+        }
+    }
+
+    #[test]
+    fn specification_shadow_ordinary_selectors_stay_in_their_node_tree() {
+        let mut document=crate::html::parse("<p id=outside></p><div id=one><p id=assigned></p></div><div id=two></div>",64).unwrap();
+        let find=|document:&Document,root,id:&str|crate::selector::get_element_by_id(document,root,id).unwrap().unwrap();
+        let outside=find(&document,document.root(),"outside");
+        let one=find(&document,document.root(),"one");
+        let assigned=find(&document,document.root(),"assigned");
+        let two=find(&document,document.root(),"two");
+        let first=document.attach_shadow(one,crate::ShadowMode::Open).unwrap();
+        let second=document.attach_shadow(two,crate::ShadowMode::Open).unwrap();
+        let fragment=crate::html::parse_fragment(&mut document,"<p id=inside></p><slot></slot>").unwrap();
+        document.append(first,fragment).unwrap();
+        let fragment=crate::html::parse_fragment(&mut document,"<p id=other></p>").unwrap();
+        document.append(second,fragment).unwrap();
+        let inside=find(&document,first,"inside");let other=find(&document,second,"other");
+        for selector in ["p",":is(p)",":not(div)",":where(p)","p:not(.missing)"] {
+            let mut rule=parse_stylesheet(&alloc::format!("{selector}{{width:23px}}")).unwrap().rules.remove(0);
+            rule.scope=Some(first);
+            assert!(rule.matches_at(&document,inside),"inside {selector}");
+            for node in [outside,assigned,other] {assert!(!rule.matches_at(&document,node),"ordinary tree boundary {selector}");}
+            let index=StyleIndex::new(alloc::vec![rule]);
+            assert_eq!(compute_node(&document,inside,None,&index).unwrap().width,Some(23.0));
+            assert_eq!(compute_node(&document,outside,None,&index).unwrap().width,None);
+            assert_eq!(compute_node(&document,other,None,&index).unwrap().width,None);
+        }
+        for (selector,node) in [(":host",one),(":is(:host)",one),("::slotted(p)",assigned)] {
+            let mut rule=parse_stylesheet(&alloc::format!("{selector}{{width:31px}}")).unwrap().rules.remove(0);
+            rule.scope=Some(first);assert!(rule.matches_at(&document,node),"defined crossing {selector}");
+        }
     }
 
     #[test]
@@ -34157,6 +35312,238 @@ mod tests {
     }
 
     #[test]
+    fn specification_svg_geometry_and_opacity_share_numeric_owner_and_query_context() {
+        for property in ["x","y","cx","cy","r","rx","ry"] {
+            assert!(supports_property_value(property,"calc(10% + 2em)"),"{property}");
+            assert!(supports_property_value(property,"calc(1cqw * sibling-index())"),"{property}");
+            assert!(!supports_property_value(property,"calc(1s + 1px)"),"{property}");
+        }
+        for property in ["r","rx","ry"] {assert!(!supports_property_value(property,"-1em"));}
+        for property in ["x","y","cx","cy"] {assert!(supports_property_value(property,"-1em"));}
+        let mut block=declaration_block::DeclarationBlock::default();
+        assert!(block.set("x","0",false).unwrap());assert_eq!(block.value("x").unwrap().0,"0px");
+        assert!(block.set("cx","-1em",false).unwrap());assert_eq!(block.value("cx").unwrap().0,"-1em");
+        let document=crate::html::parse("<svg><g/><rect id=owner x=99 cx=3 /><g/></svg>",32).unwrap();
+        let owner=crate::selector::get_element_by_id(&document,document.root(),"owner").unwrap().unwrap();
+        for (font,opacity,x) in [(10,0.0,40.0),(20,0.5,60.0)] {
+            let index=StyleIndex::new(parse(&alloc::format!("#owner{{font-size:{font}px;x:calc(10% + 2em);cx:1em;opacity:calc(.5 * sign(10em - 120px));fill-opacity:calc(.5 * sign(10em - 120px));stroke-opacity:calc(.5 * sign(10em - 120px));stop-opacity:calc(.5 * sign(10em - 120px));flood-opacity:calc(.5 * sign(10em - 120px))}}")).unwrap());
+            let style=compute_node(&document,owner,None,&index).unwrap();
+            assert_eq!(crate::svg::coordinate_value(style.svg_geometry[0].as_deref().unwrap(),200.0),Some(x));
+            assert_eq!(style.svg_geometry[6].as_deref(),Some(alloc::format!("{font}px").as_str()));
+            assert_eq!((style.opacity,style.svg_fill_opacity,style.svg_stroke_opacity,style.svg_stop_opacity,style.svg_filter_properties().opacity),(opacity,opacity,opacity,opacity,opacity));
+            assert!(style.relative_expressions.is_empty());
+        }
+        let index=StyleIndex::new(parse("#owner{x:calc(10% + 10cqw);fill-opacity:calc(.5 * sign(1cqw - 3px));stroke-opacity:calc(sibling-index() / sibling-count())}").unwrap());
+        let pending=compute_node(&document,owner,None,&index).unwrap();
+        assert!(pending.has_query_container_dependencies());
+        assert!(pending.sibling_position_dependent);
+        assert_eq!(pending.svg_stroke_opacity,2.0/3.0);
+        for (width,x,opacity) in [(200.0,40.0,0.0),(400.0,60.0,0.5)] {
+            let mut style=pending.clone();
+            assert!(style.resolve_query_context(ContainerUnitContext{width:ContainerUnitBasis::Size(width),inline:ContainerUnitBasis::Size(width),..ContainerUnitContext::default()}));
+            assert_eq!(crate::svg::coordinate_value(style.svg_geometry[0].as_deref().unwrap(),200.0),Some(x));
+            assert_eq!(style.svg_fill_opacity,opacity);
+        }
+    }
+
+    #[test]
+    fn specification_svg_geometry_css_lengths_and_presentation_numbers_have_distinct_admission() {
+        for property in ["x","y","cx","cy","r","rx","ry"] {
+            assert!(supports_property_value(property,"0"),"{property}");
+            for raw in ["10","-10","10 px","10 %","calc(10)"] {
+                assert!(!supports_property_value(property,raw),"{property}: {raw}");
+            }
+            assert!(supports_property_value(property,"10px"),"{property}");
+            assert!(supports_property_value(property,"10%"),"{property}");
+        }
+        let document=crate::html::parse("<svg><circle id=target cx=-10 cy=5 r=10 /></svg>",32).unwrap();
+        let target=crate::selector::get_element_by_id(&document,document.root(),"target").unwrap().unwrap();
+        let index=StyleIndex::new(parse("#target{font-size:40px;cx:10;cy:calc(10px + .5em);r:calc(10px - .5em)}").unwrap());
+        let style=compute_node(&document,target,None,&index).unwrap();
+        assert_eq!(style.svg_geometry[6].as_deref(),Some("-10px"),"invalid CSS number leaves the presentation attribute in the cascade");
+        assert_eq!(style.svg_geometry[7].as_deref(),Some("30px"),"computed math serializes its primitive result");
+        assert_eq!(style.svg_geometry[8].as_deref(),Some("0px"),"computed radius math clamps its primitive result");
+        let block=declaration_block::DeclarationBlock::parse("cx:10;cy:calc(10px + .5em);r:10px").unwrap();
+        assert!(block.value("cx").is_none());
+        assert_eq!(block.value("cy").unwrap().0,"calc(0.5em + 10px)","specified math retains its boundary and relative units");
+    }
+
+    #[test]
+    fn specification_svg_presentation_index_uses_real_css_cascade_and_value_grammar() {
+        for (tag,name,expected) in [("text","font-size",Some("font-size")),("g","opacity",Some("opacity")),
+            ("g","display",Some("display")),("rect","color",Some("color")),("text","x",None),
+            ("linearGradient","r",None),("rect","font",None),("text","line-height",None),
+            ("text","font-feature-settings",None),("text","Font-size",None),
+            ("linearGradient","gradientTransform",Some("transform")),("linearGradient","transform",None)] {
+            assert_eq!(crate::svg::presentation_property(tag,name),expected,"{tag} {name}");
+        }
+        let document=crate::html::parse("<svg><text id=attribute font-family=Ahem font-size=200 font-weight=700 font-style=italic letter-spacing=-2 word-spacing=-3 opacity=.5 color=red>X</text><text id=override font-size=200>X</text><text id=revert font-size=200>X</text><text id=invalid font-size='200 !important'>X</text><g id=group display='none'/><g id=html-only margin='50'/></svg>",64).unwrap();
+        let index=StyleIndex::new(parse("#override{font-size:20px}#revert{font-size:revert}").unwrap());
+        let get=|name|{let node=crate::selector::get_element_by_id(&document,document.root(),name).unwrap().unwrap();compute_node(&document,node,None,&index).unwrap()};
+        let attribute=get("attribute");assert_eq!(attribute.font_size,200.0);assert_eq!(attribute.font_spec().weight,700);assert_eq!(attribute.opacity,0.5);assert_eq!(attribute.letter_spacing,Some(-2.0));assert_eq!(attribute.word_spacing.pixels,-3.0);
+        assert_eq!(get("override").font_size,20.0);assert_eq!(get("revert").font_size,Style::initial().font_size);
+        assert_eq!(get("invalid").font_size,Style::initial().font_size);assert_eq!(get("group").display,Display::None);
+        assert_eq!(get("html-only").margin,Style::initial().margin);
+    }
+
+    #[test]
+    fn specification_generated_list_item_markers_keep_selector_and_inheritance_identity() {
+        for (selector, pseudo) in [("div::before::marker", PseudoElement::BeforeMarker),
+            ("div:after::marker", PseudoElement::AfterMarker), ("div::marker", PseudoElement::Marker)] {
+            let parsed = parse_selector(selector, 0).unwrap();
+            assert_eq!(parsed.pseudo_element, Some(pseudo));
+            assert_eq!(parsed.specificity.2, if pseudo == PseudoElement::Marker { 2 } else { 3 });
+        }
+        for selector in ["div::marker::before", "div::marker::marker", "div::before::after",
+            "div::before::marker::marker", "div::before:marker", "div::before::marker()"] {
+            assert!(parse_selector(selector, 0).is_err(), "{selector}");
+        }
+        let document = crate::html::parse("<div id='target'></div>", 32).unwrap();
+        let target = crate::selector::query_selector(&document, document.root(), "#target").unwrap().unwrap();
+        let index = StyleIndex::new(parse("#target{color:green;font-size:10px}#target::before{content:'B';display:list-item;color:red;font-size:20px}#target::after{content:'A';display:list-item;color:blue}#target::marker{content:'WRONG'}#target::before::marker{content:'M';font-size:30px}").unwrap());
+        let style = compute_node(&document, target, None, &index).unwrap();
+        assert!(index.compute_pseudo(&document, target, &style, PseudoElement::Marker, None).unwrap().is_none());
+        let before = index.compute_pseudo(&document, target, &style, PseudoElement::BeforeMarker, None).unwrap().unwrap();
+        let after = index.compute_pseudo(&document, target, &style, PseudoElement::AfterMarker, None).unwrap().unwrap();
+        assert_eq!(before.style.color, Rgba{r:255,g:0,b:0,a:255});
+        assert_eq!(before.style.font_size, 30.0);
+        assert_eq!(after.style.color, Rgba{r:0,g:0,b:255,a:255});
+        assert_eq!(after.style.font_size, 10.0);
+        assert!(!before.style.is_list_item());
+        assert_eq!(index.compute_pseudo_computed(&document, target, &style, PseudoElement::BeforeMarker, None).unwrap().color, before.style.color);
+    }
+
+    #[test]
+    fn specification_quarter_turn_rotation_source_keeps_near_angles_precise() {
+        for (value,expected) in [("90deg",[0.0,1.0,-1.0,0.0]),("180deg",[-1.0,0.0,0.0,-1.0]),("-180deg",[-1.0,0.0,0.0,-1.0]),("450deg",[0.0,1.0,-1.0,0.0]),("360000000090deg",[0.0,1.0,-1.0,0.0]),("-360000000090deg",[0.0,-1.0,1.0,0.0]),(".25turn",[0.0,1.0,-1.0,0.0]),("100grad",[0.0,1.0,-1.0,0.0]),("calc(45deg * 2)",[0.0,1.0,-1.0,0.0])] {
+            let style=compute(&element(&alloc::format!("transform:rotate({value})")),None,&StyleIndex::new(Vec::new())).unwrap();
+            let matrix=style.transform_matrix(Rect{x:0.0,y:0.0,width:100.0,height:100.0}).unwrap();
+            assert_eq!([matrix.a,matrix.b,matrix.c,matrix.d],expected,"{value}: used source coefficients are mathematically exact");
+        }
+        for value in ["90.0000000001deg","89.9999999999deg","3.1415927rad","1.5707964rad","calc(90deg + 0.0000000001deg)"] {
+            let raw=alloc::format!("rotate({value})");
+            assert!(typed_transforms::requires_source_carrier(&raw),"{value}: f32 quarter collision retains the existing precise source carrier");
+            let style=compute(&element(&alloc::format!("transform:{raw}")),None,&StyleIndex::new(Vec::new())).unwrap();
+            let matrix=style.transform_matrix(Rect{x:0.0,y:0.0,width:100.0,height:100.0}).unwrap();
+            assert!(matrix.b!=0.0 && matrix.a!=0.0,"{value}: near-quarter angles are never epsilon snapped");
+        }
+    }
+
+    #[test]
+    fn specification_svg_presentation_values_share_full_author_declaration_expansion() {
+        for tag in ["rect","g","linearGradient"] {
+            let markup=alloc::format!("<style>#css{{font-variant:small-caps;overflow:scroll;transform-origin:1px 1px}}svg{{color:green}}</style><svg><{tag} id='attribute' font-variant='small-caps' overflow='scroll' transform-origin='1px 1px' color='inherit'/><{tag} id='css' color='inherit'/><{tag} id='invalid' font-variant='small-caps small-caps' overflow='scroll;display:none' transform-origin='1px 1px !important'/></svg>");
+            let document=crate::html::parse(&markup,64).unwrap();
+            let index=StyleIndex::new(parse("#css{font-variant:small-caps;overflow:scroll;transform-origin:1px 1px}svg{color:green}").unwrap());
+            let svg=crate::selector::query_selector(&document,document.root(),"svg").unwrap().unwrap();
+            let parent=compute_node(&document,svg,None,&index).unwrap();
+            let compute=|selector| {
+                let node=crate::selector::query_selector(&document,document.root(),selector).unwrap().unwrap();
+                compute_node(&document,node,Some(&parent),&index).unwrap()
+            };
+            let attribute=compute("#attribute");let author=compute("#css");let invalid=compute("#invalid");
+            assert_eq!(attribute.font_spec().caps,FontVariantCaps::SmallCaps,"{tag}: author shorthand codec applies to attributes");
+            assert_eq!(attribute.font_spec().caps,author.font_spec().caps);
+            assert_eq!(attribute.overflow_x,Overflow::Scroll);assert_eq!(attribute.overflow_y,Overflow::Scroll);
+            assert_eq!((attribute.overflow_x,attribute.overflow_y),(author.overflow_x,author.overflow_y));
+            assert_eq!(attribute.transform_origin,[TransformLength{pixels:1.0,percent:0.0};2]);
+            assert_eq!(attribute.transform_origin,author.transform_origin);
+            assert_eq!(attribute.color,parent.color,"CSS-wide inheritance uses the same cascade authority");
+            assert_eq!(invalid.font_spec().caps,FontVariantCaps::Normal);
+            assert_eq!(invalid.overflow_x,Overflow::Visible,"embedded declarations cannot escape attribute value grammar");
+            assert_eq!(invalid.display,if tag=="linearGradient"{Display::None}else{Display::Inline},"invalid attribute cannot change the mandatory UA display of its element");
+            assert_ne!(invalid.transform_origin,attribute.transform_origin,"priority is invalid in presentation attribute values");
+        }
+        let document=crate::html::parse("<svg><rect id='fallback' font-variant='var(--caps, small-caps)' overflow='var(--overflow, scroll)' transform-origin='var(--origin, 1px 1px)' /></svg>",32).unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#fallback").unwrap().unwrap();
+        let style=compute_node(&document,node,None,&StyleIndex::new(Vec::new())).unwrap();
+        assert_eq!(style.font_spec().caps,FontVariantCaps::SmallCaps);
+        assert_eq!((style.overflow_x,style.overflow_y),(Overflow::Scroll,Overflow::Scroll));
+        assert_eq!(style.transform_origin,[TransformLength{pixels:1.0,percent:0.0};2]);
+    }
+
+    #[test]
+    fn specification_svg_stroke_width_number_uses_shared_numeric_and_author_cascade() {
+        for (raw,expected) in [("10",10.0),("10px",10.0),("calc(2 * 5)",10.0),("calc(-2)",0.0)] {
+            assert!(supports_property_value("stroke-width",raw),"{raw}");
+            let style=compute(&element(&alloc::format!("stroke-width:{raw}")),None,&StyleIndex::new(Vec::new())).unwrap();
+            assert_eq!(style.svg_stroke_width,expected,"{raw}");
+        }
+        for raw in ["-1","10deg","2s","10 20"] {assert!(!supports_property_value("stroke-width",raw),"{raw}");}
+        let document=crate::html::parse("<style>#override{stroke-width:3}</style><svg><rect id=attribute stroke-width=10 /><rect id=override stroke-width=10 /></svg>",32).unwrap();
+        let index=StyleIndex::new(parse("#override{stroke-width:3}").unwrap());
+        for (id,expected) in [("attribute",10.0),("override",3.0)] {
+            let node=crate::selector::get_element_by_id(&document,document.root(),id).unwrap().unwrap();
+            assert_eq!(compute_node(&document,node,None,&index).unwrap().svg_stroke_width,expected);
+        }
+    }
+
+    #[test]
+    fn specification_transform_box_keyword_and_css_used_aliases_share_reference_geometry() {
+        for keyword in ["content-box","border-box","fill-box","stroke-box","view-box"] {
+            assert!(supports_property_value("transform-box",keyword));
+            assert!(supports_property_value("transform-box",&keyword.to_ascii_uppercase()));
+        }
+        assert!(supports_property_value("transform-box",r"content-\62 ox"));
+        for invalid in ["padding-box","none","content-box border-box","view-box, fill-box"] {
+            assert!(!supports_property_value("transform-box",invalid));
+        }
+        let border=Rect{x:30.0,y:40.0,width:130.0,height:70.0};
+        let mut style=Style::initial();style.display=Display::Block;
+        style.border_width=5.0;style.border_solid=true;style.border_style=BorderStyle::Solid;
+        style.padding_sides=[10.0;4];
+        style.transforms=Some(Arc::from([Transform::Translate(TransformLength{pixels:0.0,percent:50.0},TransformLength{pixels:0.0,percent:100.0})]));
+        for keyword in [TransformBox::ContentBox,TransformBox::FillBox] {
+            style.transform_box=keyword;
+            assert_eq!(style.css_transform_reference_box(border),Rect{x:45.0,y:55.0,width:100.0,height:40.0});
+            let matrix=style.transform_matrix(border).unwrap();assert_eq!((matrix.e,matrix.f),(50.0,40.0));
+            assert_eq!(style.computed_css_value("transform-box",Default::default()).unwrap(),keyword.keyword());
+        }
+        for keyword in [TransformBox::BorderBox,TransformBox::StrokeBox,TransformBox::ViewBox] {
+            style.transform_box=keyword;assert_eq!(style.css_transform_reference_box(border),border);
+            let matrix=style.transform_matrix(border).unwrap();assert_eq!((matrix.e,matrix.f),(65.0,70.0));
+        }
+        style.display=Display::Table;style.transform_box=TransformBox::ContentBox;
+        assert_eq!(style.css_transform_reference_box(border),border,"table reference is its supplied wrapper border box");
+    }
+
+    #[test]
+    fn specification_typed_om_catalog_initial_values_and_svg_auto_have_valid_grammar() {
+        for name in ["--", "--a b", "--a\nb", r"--\61 bc"] { assert!(is_cssom_property_name(name)); }
+        for name in ["", "unknown-property", r"\77 idth"] { assert!(!is_cssom_property_name(name)); }
+        let initial=Style::initial();
+        for name in cssom_property_names().into_iter().filter(|name|
+            !declaration_block::is_shorthand(name) && declaration_block::canonical_alias(name)==*name) {
+            let value=initial.computed_css_value(name,computed_values::ComputedValueContext::default())
+                .unwrap_or_else(||panic!("supported longhand has no computed initial: {name}"));
+            assert!(supports_property_value(name,&value),"{name}: {value}");
+        }
+        for name in ["rx","ry"] {
+            assert!(supports_property_value(name,"auto"));
+            assert!(supports_property_value(name,"AuTo"));
+            assert!(supports_property_value(name,r"\61 uto"));
+        }
+        for name in ["x","y","cx","cy","r"] {assert!(!supports_property_value(name,"auto"));}
+    }
+    #[test]
+    fn specification_background_shorthand_uses_canonical_paint_image_admission() {
+        for value in ["paint(owner)","paint(owner", "paint(owner, 10px, red) center / cover no-repeat", "paint(owner), linear-gradient(red, blue)"] {
+            assert!(supports_property_value("background",value),"{value}");
+            let mut block=DeclarationBlock::default();
+            assert!(block.set("background",value,false).unwrap(),"{value}");
+            let image=block.value("background-image").unwrap().0;
+            assert!(image.starts_with("paint(owner"),"{image}");
+            assert!(valid_background_images(&image));
+        }
+        let mut block=DeclarationBlock::default();block.set("background","red",false).unwrap();
+        let before=block.serialize().unwrap();
+        for value in ["unknown-image(owner)","paint()", "paint(owner,)","paint(owner) paint(other)","paint(owner) / cover"] {
+            assert!(!supports_property_value("background",value),"{value}");
+            assert!(!block.set("background",value,false).unwrap(),"{value}");
+            assert_eq!(block.serialize().unwrap(),before,"invalid whole image grammar must be atomic");
+        }
+    }
+    #[test]
     fn specification_background_shorthand_preserves_color_layers_and_atomic_grammar() {
         let index=StyleIndex::new(Vec::new());
         for color in ["red","blue"] {
@@ -34351,6 +35738,33 @@ mod tests {
     }
 
     #[test]
+    fn specification_declared_hex_colors_share_css_serialization_and_roundtrip() {
+        for property in ["color","background-color","outline-color","border-top-color","flood-color","fill"] {
+            for (source,expected) in [("#00FF00","rgb(0, 255, 0)"),("#f008","rgba(255, 0, 0, 0.533)"),("LIME","lime")] {
+                let block=DeclarationBlock::parse(&alloc::format!("{property}:{source}")).unwrap();
+                assert_eq!(block.value(property),Some((expected.into(),false)),"{property}:{source}");
+                let rebuilt=DeclarationBlock::parse(&block.serialize().unwrap()).unwrap();
+                assert_eq!(rebuilt.value(property),block.value(property));
+            }
+        }
+    }
+
+    #[test]
+    fn specification_svg_filter_color_space_uses_canonical_cssom_keywords() {
+        for (source,expected,space) in [("sRGB","srgb",lumen_common::color::ColorSpace::Srgb),
+            ("linearRGB","linearrgb",lumen_common::color::ColorSpace::SrgbLinear),
+            ("AUTO","auto",lumen_common::color::ColorSpace::Srgb)] {
+            let declarations=DeclarationBlock::parse(&alloc::format!("color-interpolation-filters:{source}")).unwrap();
+            assert_eq!(declarations.value("color-interpolation-filters"),Some((expected.into(),false)));
+            let style=compute(&element(&declarations.serialize().unwrap()),None,&StyleIndex::new(Vec::new())).unwrap();
+            assert_eq!(style.computed_css_value("color-interpolation-filters",Default::default()),Some(expected.into()));
+            assert_eq!(style.svg_filter_properties().interpolation.space(),space);
+            let child=compute(&element(""),Some(&style),&StyleIndex::new(Vec::new())).unwrap();
+            assert_eq!(child.svg_filter_properties().interpolation,style.svg_filter_properties().interpolation);
+        }
+    }
+
+    #[test]
     fn specification_svg_filter_presentation_uses_shared_typed_cascade() {
         for (source, expected) in [
             ("<svg><g id=host filter='invert()'/></svg>", "invert(1)"),
@@ -34390,7 +35804,7 @@ mod tests {
             assert_eq!(style.computed_css_value("filter", Default::default()).as_deref(), Some(expected), "{raw}");
             assert!(supports_property_value("filter", raw), "{raw}");
         }
-        for raw in ["invert(-1)", "invert(1px)", "hue-rotate(10)", "hue-rotate(10%)", "invert(1, 0)", "none invert()", "invert() none", "blur(1px)", "url(#filter)", "drop-shadow(1px 2px red)", "", "invert(\"1\")"] {
+        for raw in ["invert(-1)", "invert(1px)", "hue-rotate(10)", "hue-rotate(10%)", "invert(1, 0)", "none invert()", "invert() none", "url(#filter)", "", "invert(\"1\")"] {
             assert!(!supports_property_value("filter", raw), "{raw}");
         }
         let over_limit = "invert() ".repeat(lumen_common::filter::MAX_COLOR_FILTERS + 1);
@@ -34401,6 +35815,39 @@ mod tests {
         assert!(compute(&element("filter:invert();all:initial"), None, &StyleIndex::new(Vec::new())).unwrap().filters.is_none());
         let contextual = compute(&element("font-size:20px;filter:brightness(sign(1em))"), None, &StyleIndex::new(Vec::new())).unwrap();
         assert_eq!(contextual.computed_css_value("filter", Default::default()).as_deref(), Some("brightness(1)"));
+    }
+
+    #[test]
+    fn specification_spatial_filter_typed_lengths_source_colors_and_cssom() {
+        for(raw,computed)in [
+            ("blur()","blur(0px)"),("blur(0)","blur(0px)"),
+            ("blur(calc(-2px))","blur(0px)"),("blur(1em)","blur(20px)"),
+            ("drop-shadow(1px 2px)","drop-shadow(rgb(0, 255, 0) 1px 2px 0px)"),
+            ("drop-shadow(1px 2px calc(-1px) red)","drop-shadow(rgb(255, 0, 0) 1px 2px 0px)"),
+            ("drop-shadow(1px 2px 3px rgb(4, 5, 6))","drop-shadow(rgb(4, 5, 6) 1px 2px 3px)"),
+            ("invert() blur(.5px) drop-shadow(2px 0 blue)","invert(1) blur(0.5px) drop-shadow(rgb(0, 0, 255) 2px 0px 0px)"),
+        ] {
+            let style=compute(&element(&alloc::format!("color:lime;font-size:20px;filter:{raw}")),None,&StyleIndex::new(Vec::new())).unwrap();
+            assert!(supports_property_value("filter",raw),"{raw}");
+            assert_eq!(style.computed_css_value("filter",Default::default()).as_deref(),Some(computed),"{raw}");
+            assert!(style.has_spatial_filters());
+        }
+        for raw in ["blur(-1px)","blur(10%)","blur(1px 2px)","drop-shadow(1px)",
+            "drop-shadow(1px 2px -1px)","drop-shadow(1px 2px 3px 4px)","drop-shadow(inset 1px 2px)",
+            "drop-shadow(1px 2px,3px 4px)","drop-shadow(1% 2px)"] {
+            assert!(!supports_property_value("filter",raw),"{raw}");
+        }
+        for(raw,specified)in[("blur(0)","blur(0px)"),("blur(calc(-1px))","blur(calc(-1px))"),
+            ("drop-shadow(1px 2px red)","drop-shadow(red 1px 2px)")] {
+            assert_eq!(serialize_cssom_property_value("filter",raw).as_deref(),Some(specified),"{raw}");
+        }
+        let mut style=compute(&element("color:color(srgb 1.2 -0.25 .3);filter:drop-shadow(1px 0)"),None,&StyleIndex::new(Vec::new())).unwrap();
+        let source=style.source_shadow_list(233).unwrap().color(0).unwrap();
+        assert_eq!(source.value.components,[1.2,-0.25,0.3],"drop-shadow uses the shared floating-point foreground endpoint");
+        let child=compute(&element("color:blue;filter:inherit"),Some(&style),&StyleIndex::new(Vec::new())).unwrap();
+        assert_eq!(child.source_shadow_list(233).unwrap().color(0).unwrap().value.components,[0.0,0.0,1.0],"inherited currentColor resolves against the receiving element");
+        let colors=style.shadow_source_colors.clone();style.refresh_used_shadow_colors();
+        assert!(Arc::ptr_eq(colors.as_ref().unwrap(),style.shadow_source_colors.as_ref().unwrap()),"unchanged source colors do not clone the sparse palette");
     }
 
     #[test]
@@ -34435,6 +35882,14 @@ mod tests {
             fn line_height(&self, size: f32) -> f32 { size }
         }
         let mut session = crate::session::RenderSession::new(document);
+        for (raw,expected) in [
+            ("blur(calc(100px + (sign(2cqw - 10px) * 50px)))","blur(50px)"),
+            ("drop-shadow(calc(1px + sign(2cqw - 10px) * 2px) 2px)","drop-shadow(rgb(0, 0, 0) -1px 2px 0px)"),
+        ] {
+            session.document_mut().set_attribute(target,"style",&alloc::format!("filter:{raw}")).unwrap();
+            session.display_list(120,100,&EmptyText).unwrap();
+            assert_eq!(session.computed_style(target).unwrap().computed_css_value("filter",Default::default()).as_deref(),Some(expected),"{raw}");
+        }
         // filter-computed.html: 2cqw - 10px = -8px, hence sign(...) = -1.
         for (name, prefix, expected) in [("brightness", "10", "5"), ("contrast", "10", "5"),
             ("grayscale", "100%", "0.5"), ("invert", "100%", "0.5"),
@@ -35487,6 +36942,24 @@ mod registered_animation_snapshot_guards {
         assert_eq!(replay.custom_properties().iter().find(|(name,_)|name=="--other").and_then(|(_,value)|value.as_deref()),Some("7px"));
         assert!(Arc::ptr_eq(eligibility.registrations.as_ref().unwrap(),&registrations));
         assert!(eligibility.checked_retained_bytes().is_some());
+    }
+    #[test]
+    fn specification_svg_xml_numeric_context_preserves_owner_axes_and_dimensions() {
+        let mut style=Style::initial();style.font_size=20.0;style.root_font_size=30.0;
+        let viewport=MediaEnvironment{width:200.0,height:100.0,..MediaEnvironment::default()};
+        let context=SvgCoordinateContext::new(&style,None,viewport,ContainerUnitContext::no_container(viewport),(2,3));
+        for (source,basis,value) in [("-4",100.0,-4.0),("25%",80.0,20.0),("calc(25% + 1em)",80.0,40.0),("1rem",100.0,30.0),("10vw",100.0,20.0),("calc(1px * sibling-index())",100.0,2.0)] {
+            assert!(svg_xml_coordinate_supported(source));assert_eq!(context.coordinate(source,basis),Some(value),"{source}");
+        }
+        assert_eq!(context.dimension("-1px",100.0),None);
+        assert_eq!(context.dimension("calc(1em - 30px)",100.0),Some(0.0));
+        for source in ["1s","1deg","calc(1px + 1s)","1em 2em"] {assert!(!svg_xml_coordinate_supported(source));assert_eq!(context.coordinate(source,100.0),None);}
+        assert_eq!(context.length.get().unwrap().font,20.0);
+        let literal=SvgCoordinateContext::new(&style,None,viewport,ContainerUnitContext::no_container(viewport),(1,1));
+        assert_eq!(literal.coordinate("7",100.0),Some(7.0));assert!(literal.length.get().is_none(),"literal coordinates do not request font metrics or allocate an AST");
+        assert_eq!(literal.number("calc(1 + 2)"),Some(3.0));assert!(literal.length.get().is_none(),"dimensionless math does not request owner font metrics");
+        assert_eq!(literal.number("calc(1em / 1px)"),Some(20.0));assert!(literal.length.get().is_some(),"dimensionally cancelled math still evaluates actual owner units");
+        assert_eq!(literal.number("calc(1em)"),None);assert_eq!(literal.number("50%"),None);
     }
 }
 

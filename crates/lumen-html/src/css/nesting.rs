@@ -1549,10 +1549,10 @@ mod tests {
             let selector = parse_selector(raw, 0).unwrap();
             assert!(selector.matches_node_in_scope_with_validity(&document, root, Some(root), &validity));
             let mut small = 4;
-            assert!(!selector.matches_in_context_with_work(&document, root, None, Some(root), &validity, &mut small));
+            assert!(!selector.matches_in_context_with_work(&super::SelectorDocument::ordinary(&document), root, None, Some(root), &validity, &mut small));
             assert_eq!(small, 0);
             let mut sufficient = 256;
-            assert!(selector.matches_in_context_with_work(&document, root, None, Some(root), &validity, &mut sufficient));
+            assert!(selector.matches_in_context_with_work(&super::SelectorDocument::ordinary(&document), root, None, Some(root), &validity, &mut sufficient));
             assert!(sufficient > 0 && sufficient < 256);
         }
     }

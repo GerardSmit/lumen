@@ -1,5 +1,34 @@
 //! HTML's attribute-number algorithms, independent of DOM and host bindings.
 
+/// HTML §2.3.4.3 parsing (not authoring validation). Consume the numeric
+/// prefix, ignoring an incomplete exponent and trailing nonnumeric input.
+/// Rust's decimal conversion supplies correctly rounded binary64 without an
+/// intermediate rounded significand or a temporary normalization buffer.
+pub fn parse_floating_point(input: &str) -> Option<f64> {
+    let input = input.trim_start_matches(|c| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' '));
+    let bytes = input.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let integer_start = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+    let integer_digits = end != integer_start;
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        let fraction_start = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+        if !integer_digits && end == fraction_start { return None; }
+    } else if !integer_digits { return None; }
+    let mantissa_end = end;
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        end += 1;
+        if matches!(bytes.get(end), Some(b'+' | b'-')) { end += 1; }
+        let exponent_start = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; }
+        if end == exponent_start { end = mantissa_end; }
+    }
+    let value = input[..end].parse::<f64>().ok()?;
+    value.is_finite().then_some(if value == 0.0 { 0.0 } else { value })
+}
+
 /// A parsed HTML dimension. Percentages retain their numeric value in percent
 /// units so callers can resolve them against the property's actual basis.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -125,6 +154,21 @@ pub fn parse_legacy_rgb(input: &str, named: impl FnOnce(&str) -> Option<[u8; 3]>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specification_html_floating_point_prefixes_round_once_and_normalize_zero() {
+        for (input, expected) in [(" +.5tail", 0.5), ("1.e2x", 100.0),
+            ("1.", 1.0), ("1.e-", 1.0), ("2e+", 2.0), ("-0", 0.0),
+            ("-1e-9999", 0.0), ("0.1000000000000000055511151231257827021181583404541015625", 0.1)] {
+            let value = parse_floating_point(input).unwrap();
+            assert_eq!(value, expected, "{input}");
+            if value == 0.0 { assert!(!value.is_sign_negative()); }
+        }
+        for input in ["", ".", "-.e2", "+", "NaN", "Infinity", "\u{a0}1", "1e9999"] {
+            assert_eq!(parse_floating_point(input), None, "{input}");
+        }
+        assert_eq!(parse_floating_point("1.7976931348623157e308"), Some(f64::MAX));
+    }
 
     #[test]
     fn specification_html_signed_integer_sign_preserves_zero_and_unbounded_prefixes() {

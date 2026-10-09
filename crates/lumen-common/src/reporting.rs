@@ -87,15 +87,47 @@ impl CspBody {
         "effectiveDirective":self.effective_directive,"originalPolicy":self.original_policy,"sourceFile":self.source_file,"sample":self.sample,
         "disposition":if self.report_only{"report"}else{"enforce"},"statusCode":self.status_code,"lineNumber":self.line_number,"columnNumber":self.column_number})}
 }
-pub fn csp_envelope(body:&CspBody,user_agent:&str,age_ms:u64)->Result<Vec<u8>,Error>{
+#[derive(Clone)]
+pub struct PermissionsBody {
+    pub document_url:String,pub feature_id:String,pub source_file:Option<String>,
+    pub line_number:Option<u32>,pub column_number:Option<u32>,pub report_only:bool,
+    pub potential:bool,pub allow_attribute:Option<String>,pub src_attribute:Option<String>,
+}
+impl PermissionsBody {
+    pub fn json(&self)->serde_json::Value{serde_json::json!({
+        "featureId":self.feature_id,"sourceFile":self.source_file,"lineNumber":self.line_number,
+        "columnNumber":self.column_number,"disposition":if self.report_only{"report"}else{"enforce"},
+        "allowAttribute":self.allow_attribute,"srcAttribute":self.src_attribute,
+    })}
+}
+#[derive(Clone)]
+pub enum ReportBody {Csp(CspBody),Permissions(PermissionsBody)}
+impl ReportBody {
+    pub fn kind(&self)->&'static str{match self{Self::Csp(_)=>"csp-violation",Self::Permissions(body)=>if body.potential{"potential-permissions-policy-violation"}else{"permissions-policy-violation"}}}
+    pub fn url(&self)->&str{match self{Self::Csp(body)=>&body.document_url,Self::Permissions(body)=>&body.document_url}}
+    pub fn json(&self)->serde_json::Value{match self{Self::Csp(body)=>body.json(),Self::Permissions(body)=>body.json()}}
+    pub fn envelope(&self,user_agent:&str,age_ms:u64)->Result<Vec<u8>,Error>{report_envelope(self.kind(),self.url(),self.json(),user_agent,age_ms)}
+}
+fn report_envelope(kind:&str,url:&str,body:serde_json::Value,user_agent:&str,age_ms:u64)->Result<Vec<u8>,Error>{
     if user_agent.len()>8192{return Err(Error::Capacity)}
-    let bytes=serde_json::to_vec(&serde_json::json!([{"age":age_ms,"type":"csp-violation","url":body.document_url,"user_agent":user_agent,"body":body.json()}])).map_err(|_|Error::Capacity)?;
+    let bytes=serde_json::to_vec(&serde_json::json!([{"age":age_ms,"type":kind,"url":url,"user_agent":user_agent,"body":body}])).map_err(|_|Error::Capacity)?;
     if bytes.len()>MAX_REPORT_BYTES{return Err(Error::Capacity)}Ok(bytes)
 }
+pub fn csp_envelope(body:&CspBody,user_agent:&str,age_ms:u64)->Result<Vec<u8>,Error>{report_envelope("csp-violation",&body.document_url,body.json(),user_agent,age_ms)}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn specification_permissions_policy_report_envelopes_preserve_actual_and_potential_types(){
+        let mut body=PermissionsBody{document_url:"https://owner.test/page".into(),feature_id:"camera".into(),source_file:None,line_number:None,column_number:None,report_only:true,potential:false,allow_attribute:None,src_attribute:None};
+        let report=ReportBody::Permissions(body.clone());
+        let value:serde_json::Value=serde_json::from_slice(&report.envelope("test",3).unwrap()).unwrap();
+        assert_eq!(value[0]["type"],"permissions-policy-violation");assert_eq!(value[0]["body"]["disposition"],"report");assert!(value[0]["body"]["sourceFile"].is_null());assert!(value[0]["body"]["allowAttribute"].is_null());
+        body.potential=true;body.allow_attribute=Some("camera *".into());body.src_attribute=Some("https://target.test/".into());
+        let value:serde_json::Value=serde_json::from_slice(&ReportBody::Permissions(body).envelope("test",0).unwrap()).unwrap();
+        assert_eq!(value[0]["type"],"potential-permissions-policy-violation");assert_eq!(value[0]["body"]["allowAttribute"],"camera *");
+    }
     #[test]
     fn reporting_endpoints_use_structured_fields_response_base_and_trust(){
         let mut endpoints=Endpoints::default();

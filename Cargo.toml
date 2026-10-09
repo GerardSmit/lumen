@@ -32,6 +32,12 @@ members = [
 ]
 
 [patch.crates-io]
+# Patched vendored crates; each vendor/<crate>/PATCHES.md lists the changes.
+content-security-policy = { path = "vendor/content-security-policy-0.9.0" }
+# Pinned image backend exposes independent SVG Gaussian axes.
+image = { path = "vendor/image-0.25.10" }
+tiny-skia = { path = "vendor/tiny-skia-0.11.4" }
+tiny-skia-path = { path = "vendor/tiny-skia-path-0.11.4" }
 # Upstream 0.16.0's profile-only edcstat module uses Vec without importing it
 # from alloc, which breaks its supported no_std + alloc configuration.
 rusty_h264-decoder = { path = "vendor/rusty_h264-decoder-0.16.0" }

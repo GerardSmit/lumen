@@ -7,6 +7,11 @@ pub struct ComputedValueContext<'a> {
     /// CSSOM resolved values, distinct from computed values used by animation timing.
     pub resolved: bool,
     pub border_box: Option<Rect>,
+    /// Exact SVG used reference; CSS layout aliases derive from the border box.
+    pub transform_reference_box:Option<Rect>,
+    /// Owner-qualified used map source from the same completed geometry epoch.
+    /// Raw computed source remains available for new scroll/rendering samples.
+    pub transform_timeline_source: Option<&'a str>,
     pub percentage_basis: Option<(f32, Option<f32>)>,
     /// Sparse used margin values recorded when layout resolved `auto` margins
     /// or adjusted a resolved side for its formatting constraint.
@@ -98,6 +103,15 @@ pub(crate) fn percentage(pixels: f32, percent: f32) -> String {
 pub(crate) fn lp(value: LengthPercentage) -> String {
     percentage(value.pixels, value.fraction * 100.0)
 }
+fn transform_reference(style:&Style,context:ComputedValueContext<'_>)->Option<Rect> {
+    if let Some(reference)=context.transform_reference_box {return Some(reference);}
+    let border=context.border_box?;
+    let resolved=context.percentage_basis
+        .filter(|_|!style.relative_lengths.is_empty() || !style.relative_expressions.is_empty())
+        .map(|(width,height)|style.resolve_percentages(width,height));
+    Some(resolved.as_ref().unwrap_or(style).css_transform_reference_box(border))
+}
+
 fn pair(a: String, b: String) -> String {
     if a == b {
         a
@@ -399,13 +413,16 @@ impl Style {
             "opacity" => number(self.opacity),
             "filter" => self.filters.as_ref().map_or_else(|| "none".into(), |filters| {
                 use lumen_common::filter::ColorFilter as F;
+                let mut shadow_index=0;
                 filters.iter().map(|filter| {
                     let filter = match filter {
                         lumen_common::filter::FilterOperation::Color(filter) => *filter,
                         lumen_common::filter::FilterOperation::Blur(sigma) => return alloc::format!("blur({})",px(*sigma)),
+                        lumen_common::filter::FilterOperation::Url(url)=>return super::serialize_url(&url.href),
+                        lumen_common::filter::FilterOperation::Resource(resource)=>return super::serialize_url(&resource.url),
                         lumen_common::filter::FilterOperation::DropShadow(shadow) => {
                             let color=shadow.color;let offset=shadow.offset;let sigma=shadow.sigma;
-                            let color=color_values::serialize(color,false).unwrap_or_else(||"transparent".into());
+                            let color=self.filter_shadow_color_value(shadow_index,color).unwrap_or_else(||"transparent".into());shadow_index+=1;
                             return alloc::format!("drop-shadow({color} {} {} {})",px(offset[0]),px(offset[1]),px(sigma));
                         }
                     };
@@ -587,6 +604,8 @@ impl Style {
             }
             "overflow-x" => overflow(self.overflow_x).into(),
             "overflow-y" => overflow(self.overflow_y).into(),
+            "overflow-inline" => overflow(if self.writing_mode==WritingMode::HorizontalTb {self.overflow_x}else{self.overflow_y}).into(),
+            "overflow-block" => overflow(if self.writing_mode==WritingMode::HorizontalTb {self.overflow_y}else{self.overflow_x}).into(),
             "overflow" => pair(
                 overflow(self.overflow_x).into(),
                 overflow(self.overflow_y).into(),
@@ -684,6 +703,13 @@ impl Style {
             "column-count" => self
                 .column_count
                 .map_or_else(|| "auto".into(), |value| value.to_string()),
+            "break-before"|"break-after"|"break-inside"|"page-break-before"|"page-break-after"|"page-break-inside"=>{
+                let slot=break_control::slot(name)?;break_control::serialize(name,self.break_controls()[slot-247]).unwrap_or("").into()
+            },
+            "column-span"=>self.column_span().serialize(),
+            "box-decoration-break"=>self.box_decoration_break().serialize(),
+            "orphans" => self.line_break_counts()[0].to_string(),
+            "widows" => self.line_break_counts()[1].to_string(),
             "column-fill" => if self.column_fill_auto {
                 "auto"
             } else {
@@ -845,7 +871,9 @@ impl Style {
                 if self.text_decoration_style != TextDecorationStyle::Solid {
                     if !result.is_empty() { result.push(' '); } result.push_str(self.text_decoration_style.as_str());
                 }
-                if let Some(value) = self.text_decoration_color {
+                let initial_color=self.source_color(203).and_then(|source|source.expression.clone())
+                    .is_some_and(|expression|super::decoded_css_keyword(&expression.raw,"currentcolor"));
+                if let Some(value) = self.text_decoration_color.filter(|_|!initial_color) {
                     if !result.is_empty() { result.push(' '); } result.push_str(&style_color(self,203,value));
                 }
                 if result.is_empty() { result.push_str("none"); }
@@ -941,6 +969,8 @@ impl Style {
             "fill" => if self.source_color(141).is_some() {style_color(self,141,self.color)}else {svg_paint(&self.svg_fill,self.color)?},
             "stroke" => if self.source_color(142).is_some() {style_color(self,142,self.color)}else {svg_paint(&self.svg_stroke,self.color)?},
             "stroke-width" => px(self.svg_stroke_width),
+            "fill-opacity" => number(self.svg_fill_opacity),
+            "stroke-opacity" => number(self.svg_stroke_opacity),
             "fill-rule" => if self.svg_fill_rule == SvgFillRule::EvenOdd {
                 "evenodd"
             } else {
@@ -959,6 +989,9 @@ impl Style {
             ),
             "stop-color" => style_color(self,156,self.svg_stop_color),
             "stop-opacity" => number(self.svg_stop_opacity),
+            "flood-color"=>style_color(self,252,self.svg_filter_properties().flood),
+            "flood-opacity"=>number(self.svg_filter_properties().opacity),
+            "color-interpolation-filters"=>self.svg_filter_properties().interpolation.css_keyword().into(),
             "x" | "y" | "rx" | "ry" | "cx" | "cy" | "r" => {
                 let index = match name {
                     "x" => 0,
@@ -1942,7 +1975,7 @@ impl Style {
             "text-shadow" => self.source_shadows_css_value(name)?,
             "transform-origin" => {
                 let values = self.transform_origin;
-                if let Some(rect) = context.border_box {
+                if let Some(rect) = transform_reference(self,context) {
                     alloc::format!(
                         "{} {}",
                         px(values[0].resolve(rect.width)),
@@ -1960,11 +1993,14 @@ impl Style {
                 let index=match name{"translate"=>0,"rotate"=>1,_=>2};
                 self.individual_transforms[index].as_ref().map_or_else(||Some("none".into()),|value|value.computed_css_value())?
             },
+            "transform-box"=>self.transform_box.keyword().into(),
             "transform" => {
+                let reference=transform_reference(self,context);
                 if let Some(source)=self.relative_expressions.iter().find(|expression|expression.slot==59) {
                     return Some(if context.resolved {
-                        if let Some(rect)=context.border_box {
-                            typed_transforms::matrix_css_value(typed_transforms::computed_matrix(&source.raw,Some([rect.width as f64,rect.height as f64]))?)?
+                        if context.transform_timeline_source==Some("none"){return Some("none".into());}
+                        if let Some(rect)=reference {
+                            typed_transforms::matrix_css_value(typed_transforms::computed_matrix(context.transform_timeline_source.unwrap_or(&source.raw),Some([rect.width as f64,rect.height as f64]))?)?
                         }else{source.raw.to_string()}
                     }else{source.raw.to_string()});
                 }
@@ -1975,7 +2011,7 @@ impl Style {
                 else {
                     return Some("none".into());
                 };
-                if !context.resolved || (context.border_box.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = context.border_box.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(matrix.a), number(matrix.b), number(matrix.c), number(matrix.d), number(matrix.e), number(matrix.f)) }
+                if !context.resolved || (reference.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = reference.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(matrix.a), number(matrix.b), number(matrix.c), number(matrix.d), number(matrix.e), number(matrix.f)) }
             }
             _ => return None,
         })
@@ -2070,6 +2106,26 @@ mod tests {
         style
             .computed_css_value(name, ComputedValueContext::default())
             .unwrap_or_else(|| panic!("missing computed property: {name}"))
+    }
+
+    #[test]
+    fn specification_text_decoration_shorthand_omits_initial_color_after_resolution() {
+        for (raw,expected) in [("none","none"),("solid","none"),("currentcolor","none"),
+            ("line-through","line-through"),("double overline underline","underline overline double"),
+            ("10px","10px"),("underline blue","underline rgb(0, 0, 255)")] {
+            let style=styled(&alloc::format!("color:blue;text-decoration:{raw}"));
+            assert_eq!(value(&style,"text-decoration"),expected,"{raw}: initial keyword ownership survives its used color projection");
+            assert_eq!(value(&style,"text-decoration-color"),"rgb(0, 0, 255)");
+        }
+        let style=styled("color:blue;text-decoration:underline;text-decoration-color:rgb(0, 0, 255)");
+        assert_eq!(value(&style,"text-decoration"),"underline rgb(0, 0, 255)","an explicit color equal to the foreground remains explicit");
+        let style=styled("color:blue;text-decoration:underline red;text-decoration-color:currentcolor");
+        assert_eq!(value(&style,"text-decoration"),"underline","a later initial keyword replaces an explicit color");
+        let style=styled("text-decoration:underline red;all:initial;color:red");
+        assert_eq!(value(&style,"text-decoration"),"none");
+        for property in ["text-decoration-color","column-rule-color","outline-color"] {
+            assert_eq!(value(&style,property),"rgb(255, 0, 0)","{property}: copying an initial keyword keeps the later foreground dependency");
+        }
     }
 
     #[test]
@@ -2351,6 +2407,14 @@ mod tests {
         assert_eq!(value(&style, "stroke"), "rgb(0, 0, 255)");
         assert_eq!(value(&style, "rx"), "3px");
         assert_eq!(value(&style, "r"), "4px");
+        let content=styled("display:block;padding:10%;border:5px solid;transform-box:content-box;transform-origin:50% 50%;transform:translate(50%,100%)");
+        let content_context=ComputedValueContext {
+            resolved:true,border_box:Some(Rect{x:0.0,y:0.0,width:100.0,height:60.0}),
+            percentage_basis:Some((200.0,Some(100.0))),..Default::default()
+        };
+        assert_eq!(content.computed_css_value("transform-origin",content_context).unwrap(),"25px 5px",
+            "content reference resolves percentage padding against its actual containing block");
+        assert_eq!(content.computed_css_value("transform",content_context).unwrap(),"matrix(1, 0, 0, 1, 25, 10)");
         assert!(!needs_layout("color"));
         assert!(needs_layout("padding-left"));
     }

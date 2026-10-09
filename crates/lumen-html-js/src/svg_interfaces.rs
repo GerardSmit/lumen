@@ -81,6 +81,38 @@ impl DomSvgSvgElement {
     }
 }
 
+svg_class!(DomSvgStyleElement, "SVGStyleElement", DomSvgElement);
+#[lumen_bind::methods]
+impl DomSvgStyleElement {
+    #[getter(name="type")]
+    fn type_(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("type")?.unwrap_or_default())}
+    #[setter(name="type",coerce)]
+    fn set_type_(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("type",value)}
+    #[getter]
+    fn media(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("media")?.unwrap_or_default())}
+    #[setter(coerce)]
+    fn set_media(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("media",value)}
+    #[getter]
+    fn title(&self)->OpResult<String> {Ok(self.base.base.base.get_null_attribute("title")?.unwrap_or_default())}
+    #[setter(coerce)]
+    fn set_title(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("title",value)}
+    #[getter]
+    fn disabled(&self,ctx:&mut Ctx)->OpResult<bool> {
+        let node=&self.base.base.base;
+        crate::cssom::style_element_disabled(ctx,&node.realm,node.id)
+    }
+    #[setter(coerce)]
+    fn set_disabled(&self,ctx:&mut Ctx,value:bool)->OpResult<()> {
+        let node=&self.base.base.base;
+        crate::cssom::set_style_element_disabled(ctx,&node.realm,node.id,value)
+    }
+    #[getter]
+    fn sheet(&self,ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<Value> {
+        let node=&self.base.base.base;
+        crate::cssom::style_element_sheet(ctx,&node.realm,node.id,this.0)
+    }
+}
+
 macro_rules! svg_element_classes {
     ($( $ty:ident, $interface:literal, $base:ident => $tag:literal; )+) => {
         $(
@@ -91,6 +123,7 @@ macro_rules! svg_element_classes {
         pub(crate) fn wrap(ctx: &mut Ctx, id: NodeId, node: DomNode, local: &str) -> Value {
             match local {
                 "svg" => ctx.cached_instance(id, || DomSvgSvgElement::from_node(node)),
+                "style" => ctx.cached_instance(id, || DomSvgStyleElement::from_node(node)),
                 $( $tag => ctx.cached_instance(id, || $ty::from_node(node)), )+
                 _ => ctx.cached_instance(id, || DomSvgElement::from_node(node)),
             }
@@ -104,6 +137,7 @@ macro_rules! svg_element_classes {
                 ("SVGTextPositioningElement", ctx.class_constructor::<DomSvgTextPositioningElement>()),
                 ("SVGGradientElement", ctx.class_constructor::<DomSvgGradientElement>()),
                 ("SVGSVGElement", ctx.class_constructor::<DomSvgSvgElement>()),
+                ("SVGStyleElement", ctx.class_constructor::<DomSvgStyleElement>()),
                 $( ($interface, ctx.class_constructor::<$ty>()), )+
             ]
         }
@@ -132,7 +166,6 @@ svg_element_classes! {
     DomSvgDescElement, "SVGDescElement", DomSvgElement => "desc";
     DomSvgMetadataElement, "SVGMetadataElement", DomSvgElement => "metadata";
     DomSvgTitleElement, "SVGTitleElement", DomSvgElement => "title";
-    DomSvgStyleElement, "SVGStyleElement", DomSvgElement => "style";
     DomSvgMarkerElement, "SVGMarkerElement", DomSvgElement => "marker";
     DomSvgLinearGradientElement, "SVGLinearGradientElement", DomSvgGradientElement => "linearGradient";
     DomSvgRadialGradientElement, "SVGRadialGradientElement", DomSvgGradientElement => "radialGradient";

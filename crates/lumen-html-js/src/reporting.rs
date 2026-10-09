@@ -2,13 +2,13 @@
 use super::*;
 use lumen_bind::{CtorRet,Host};
 use lumen::embed::{JsFunction,JsHost};
-use lumen_common::reporting::{CspBody,Endpoints};
+use lumen_common::reporting::{CspBody,PermissionsBody,ReportBody,Endpoints};
 use std::{cell::Cell,collections::VecDeque,rc::Weak,time::Instant};
 
 const MAX_OBSERVERS:usize=64;
 const MAX_REPORTS:usize=100;
 const MAX_BYTES:usize=65_536;
-struct Record {body:Rc<CspBody>,bytes:usize}
+struct Record {body:Rc<ReportBody>,bytes:usize}
 pub(crate) struct State {
     pub endpoints:RefCell<Endpoints>,
     pub status:Cell<u16>,
@@ -33,9 +33,8 @@ impl State {
         else {let slot=ctx.allocate_native_private_slot_name();ctx.define_native_internal_value_slot(&global,&slot,array).map_err(OpError::thrown)?;*self.owner_slot.borrow_mut()=Some(slot);}
         Ok(())
     }
-    pub fn record(self:&Rc<Self>,ctx:&mut Ctx,body:CspBody)->OpResult<()> {
-        let bytes=lumen_common::reporting::csp_envelope(&body,"",0).map_err(|_|OpError::new("QuotaExceededError","report exceeds bounded storage"))?.len();
-        let body=Rc::new(body);
+    pub fn record(self:&Rc<Self>,ctx:&mut Ctx,body:Rc<ReportBody>)->OpResult<()> {
+        let bytes=body.envelope("",0).map_err(|_|OpError::new("QuotaExceededError","report exceeds bounded storage"))?.len();
         {let mut buffered=self.buffered.borrow_mut();while buffered.len()>=MAX_REPORTS||self.buffered_bytes.get().saturating_add(bytes)>MAX_BYTES {let Some(old)=buffered.pop_front()else{break};self.buffered_bytes.set(self.buffered_bytes.get().saturating_sub(old.bytes));}
         buffered.push_back(Record{body:body.clone(),bytes});self.buffered_bytes.set(self.buffered_bytes.get()+bytes);}
         let observers=self.observers.borrow().iter().filter_map(Weak::upgrade).filter(|data|data.registered.get()).collect::<Vec<_>>();
@@ -67,8 +66,8 @@ struct ObserverData {
     wrapper:RefCell<Option<WeakValue>>,pending:RefCell<VecDeque<Record>>,bytes:Cell<usize>,
 }
 impl ObserverData {
-    fn enqueue(self:&Rc<Self>,ctx:&mut Ctx,state:&Rc<State>,body:Rc<CspBody>,bytes:usize)->OpResult<()> {
-        if !self.types.is_empty()&&!self.types.iter().any(|kind|kind=="csp-violation"){return Ok(())}
+    fn enqueue(self:&Rc<Self>,ctx:&mut Ctx,state:&Rc<State>,body:Rc<ReportBody>,bytes:usize)->OpResult<()> {
+        if !self.types.is_empty()&&!self.types.iter().any(|kind|kind==body.kind()){return Ok(())}
         let was_empty=self.pending.borrow().is_empty();
         {let mut pending=self.pending.borrow_mut();while pending.len()>=MAX_REPORTS||self.bytes.get().saturating_add(bytes)>MAX_BYTES {let Some(old)=pending.pop_front()else{break};self.bytes.set(self.bytes.get().saturating_sub(old.bytes));}
         pending.push_back(Record{body,bytes});self.bytes.set(self.bytes.get()+bytes);}
@@ -79,14 +78,78 @@ impl ObserverData {
         self.bytes.set(0);self.pending.borrow_mut().drain(..).map(|record|report_value(ctx,&record.body)).collect()
     }
 }
-fn report_value(ctx:&mut Ctx,body:&CspBody)->OpResult<Value> {
-    let value=Value::Obj(ctx.new_object());let report_body=Value::Obj(ctx.new_object());
+fn csp_body_value(ctx:&mut Ctx,body:&CspBody)->OpResult<Value>{
+    let report_body=Value::Obj(ctx.new_object());
     let text=|value:&str|Value::Str(value.to_string().into());
     let nullable=|value:&Option<String>|value.as_ref().map_or(Value::Null,|value|text(value));
     let number=|value:Option<u32>|value.map_or(Value::Null,|value|Value::Num(value as f64));
     for(key,field)in[("documentURL",text(&body.document_url)),("referrer",text(&body.referrer)),("blockedURL",text(&body.blocked_url)),("effectiveDirective",text(&body.effective_directive)),("originalPolicy",text(&body.original_policy)),("sourceFile",nullable(&body.source_file)),("sample",text(&body.sample)),("disposition",text(if body.report_only{"report"}else{"enforce"})),("statusCode",Value::Num(body.status_code as f64)),("lineNumber",number(body.line_number)),("columnNumber",number(body.column_number))]{ctx.create_data_property(&report_body,key,field).map_err(OpError::thrown)?;}
-    for(key,field)in[("type",text("csp-violation")),("url",text(&body.document_url)),("body",report_body)]{ctx.create_data_property(&value,key,field).map_err(OpError::thrown)?;}
+    Ok(report_body)
+}
+fn csp_report_value(ctx:&mut Ctx,body:&CspBody)->OpResult<Value>{
+    let value=Value::Obj(ctx.new_object());let report_body=csp_body_value(ctx,body)?;
+    for(key,field)in[("type",Value::str("csp-violation")),("url",Value::Str(body.document_url.clone().into())),("body",report_body)]{ctx.create_data_property(&value,key,field).map_err(OpError::thrown)?;}
     Ok(value)
+}
+fn report_value(ctx:&mut Ctx,body_owner:&Rc<ReportBody>)->OpResult<Value>{
+    match body_owner.as_ref(){ReportBody::Csp(body)=>csp_report_value(ctx,body),ReportBody::Permissions(body)=>{
+        let report=Value::Obj(ctx.new_object());
+        let wrapper=ctx.new_instance(DomPermissionsPolicyViolationReportBody{base:DomReportBody{body:body_owner.clone()}});
+        ctx.create_data_property(&report,"type",Value::str(if body.potential{"potential-permissions-policy-violation"}else{"permissions-policy-violation"})).map_err(OpError::thrown)?;
+        ctx.create_data_property(&report,"url",Value::Str(body.document_url.clone().into())).map_err(OpError::thrown)?;
+        ctx.create_data_property(&report,"body",wrapper).map_err(OpError::thrown)?;Ok(report)
+    }}
+}
+#[lumen_bind::class(name="ReportBody",hint(js(webidl)))]
+pub(crate) struct DomReportBody {body:Rc<ReportBody>}
+#[lumen_bind::class(name="PermissionsPolicyViolationReportBody",extends=DomReportBody,hint(js(webidl)))]
+pub(crate) struct DomPermissionsPolicyViolationReportBody {base:DomReportBody}
+impl DomPermissionsPolicyViolationReportBody {
+    fn data(&self)->&PermissionsBody{
+        match self.base.body.as_ref(){ReportBody::Permissions(body)=>body,ReportBody::Csp(_)=>unreachable!("PermissionsPolicyViolationReportBody has its native permissions body")}
+    }
+}
+#[lumen_bind::methods]
+impl DomPermissionsPolicyViolationReportBody {
+    #[method(name="toJSON")]
+    fn to_json(&self,ctx:&mut Ctx)->OpResult<Value>{self.base.to_json(ctx)}
+    #[getter] fn feature_id(&self)->String{self.data().feature_id.clone()}
+    #[getter] fn source_file(&self)->Nullable<String>{Nullable(self.data().source_file.clone())}
+    #[getter] fn line_number(&self)->Nullable<u32>{Nullable(self.data().line_number)}
+    #[getter] fn column_number(&self)->Nullable<u32>{Nullable(self.data().column_number)}
+    #[getter] fn disposition(&self)->&'static str{if self.data().report_only{"report"}else{"enforce"}}
+    #[getter] fn allow_attribute(&self)->Nullable<String>{Nullable(self.data().allow_attribute.clone())}
+    #[getter] fn src_attribute(&self)->Nullable<String>{Nullable(self.data().src_attribute.clone())}
+}
+#[lumen_bind::methods]
+impl DomReportBody {
+    #[method(name="toJSON")]
+    fn to_json(&self,ctx:&mut Ctx)->OpResult<Value>{
+        match self.body.as_ref(){ReportBody::Csp(body)=>csp_body_value(ctx,body),ReportBody::Permissions(body)=>{
+            let result=Value::Obj(ctx.new_object());
+            let nullable=|value:&Option<String>|value.as_ref().map_or(Value::Null,|value|Value::Str(value.clone().into()));
+            let number=|value:Option<u32>|value.map_or(Value::Null,|value|Value::Num(value as f64));
+            for(key,value)in[("featureId",Value::Str(body.feature_id.clone().into())),("sourceFile",nullable(&body.source_file)),("lineNumber",number(body.line_number)),("columnNumber",number(body.column_number)),("disposition",Value::str(if body.report_only{"report"}else{"enforce"})),("allowAttribute",nullable(&body.allow_attribute)),("srcAttribute",nullable(&body.src_attribute))]{ctx.create_data_property(&result,key,value).map_err(OpError::thrown)?;}
+            Ok(result)
+        }}
+    }
+}
+/// Reporting's existing bounded observer and network queues serve every report
+/// type. Endpoint failure/410 removal and in-flight accounting stay shared.
+pub(crate) fn deliver(realm:&Rc<DomRealm>,ctx:&mut Ctx,body:ReportBody,group:Option<&str>){
+    let body=Rc::new(body);
+    if let Err(error)=realm.reporting.record(ctx,body.clone()){let exception=error.to_value(ctx);DomRealm::report_exception(ctx,exception);}
+    let Some(group)=group else{return;};
+    let endpoint=realm.reporting.endpoints.borrow().get(group,realm.reporting.elapsed_ms()).map(|endpoint|endpoint.url.clone());
+    let Some(endpoint)=endpoint else{return;};
+    let Ok(bytes)=body.envelope(&realm.reporting.user_agent.borrow(),0)else{return;};
+    let count=bytes.len();
+    if !realm.csp_report_budget.borrow_mut().admit(count){return;}
+    let weak=Rc::downgrade(realm);let group=group.to_owned();
+    lumen_host::net::start_reporting_report(ctx,body.url(),&endpoint.clone(),bytes,move|ctx,response|{
+        let gone=if let Ok(response)=response{let gone=response.status==410;response.body.cancel(ctx);gone}else{false};
+        if let Some(realm)=weak.upgrade(){if gone{realm.reporting.endpoints.borrow_mut().remove(&group,&endpoint);}realm.csp_report_budget.borrow_mut().release(count);}
+    });
 }
 #[lumen_bind::class(name="ReportingObserver",hint(js(webidl)))]
 pub struct DomReportingObserver {state:Rc<State>,data:Rc<ObserverData>}
@@ -129,7 +192,8 @@ impl DomReportingObserver {
 }
 pub(crate) fn install(ctx:&mut Ctx,state:Rc<State>)->OpResult<()> {
     realm_services::RealmServices::replace_shared_current(ctx,state);
-    let constructor=ctx.class_constructor::<DomReportingObserver>();let global=ctx.global_object();install_interface(ctx,&global,"ReportingObserver",constructor).map_err(OpError::thrown)
+    let global=ctx.global_object();
+    for(name,constructor)in[("ReportingObserver",ctx.class_constructor::<DomReportingObserver>()),("ReportBody",ctx.class_constructor::<DomReportBody>()),("PermissionsPolicyViolationReportBody",ctx.class_constructor::<DomPermissionsPolicyViolationReportBody>())]{install_interface(ctx,&global,name,constructor).map_err(OpError::thrown)?;}Ok(())
 }
 
 #[cfg(test)]

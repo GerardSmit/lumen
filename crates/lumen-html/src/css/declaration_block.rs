@@ -168,6 +168,7 @@ fn limit() -> CssError {
 pub fn longhands(name: &str) -> &'static [&'static str] {
     match name {
         "columns"=>&["column-width","column-count"],
+        "page-break-before"=>&["break-before"],"page-break-after"=>&["break-after"],"page-break-inside"=>&["break-inside"],
         "contain-intrinsic-size" => &["contain-intrinsic-width","contain-intrinsic-height"],
         "transition" => &["transition-property","transition-duration","transition-timing-function","transition-delay","transition-behavior"],
         "text-decoration" => &["text-decoration-line", "text-decoration-style", "text-decoration-color", "text-decoration-thickness"],
@@ -396,7 +397,7 @@ fn normalized_name(name: &str) -> Option<Arc<str>> {
     }
 }
 
-fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declaration>>, CssError> {
+pub(super) fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declaration>>, CssError> {
     let Some(completed) = syntax::complete(raw)? else { return Ok(None); };
     let raw = completed.as_ref();
     if raw.len() > MAX_CSS_BYTES
@@ -409,18 +410,6 @@ fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declaration>>, CssEr
     if !raw.trim().is_empty() && (spans.len() != 1 || spans[0] != (0, raw.len())) {
         return Ok(None);
     }
-    let mut source = String::new();
-    source
-        .try_reserve(
-            name.len()
-                .checked_add(raw.len())
-                .and_then(|n| n.checked_add(1))
-                .ok_or_else(limit)?,
-        )
-        .map_err(|_| limit())?;
-    source.push_str(name);
-    source.push(':');
-    source.push_str(raw);
     let has_variables = raw
         .as_bytes()
         .windows(4)
@@ -432,7 +421,8 @@ fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declaration>>, CssEr
         });
     let owner_dependent=typed_numeric::substitute_sibling_functions(raw,1,1)
         .is_some_and(|(_,dependent)|dependent);
-    let parsed = declarations_with_variables(&source, 0, has_variables||owner_dependent)?;
+    let mut parsed=Vec::new();
+    append_declaration_pair_values(name,raw,0,has_variables||owner_dependent,&mut parsed)?;
     if parsed.is_empty() || expand_variables_mode(raw, &[], &mut Vec::new(), true).is_none() {
         return Ok(None);
     }
@@ -537,7 +527,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
     let targets = longhands(&name);
     if targets.is_empty() {
         let value = match name.as_ref() {
-            "order" | "z-index" | "column-count" => super::serialize_cssom_property_value(&name,raw),
+            "order" | "z-index" | "column-count" | "orphans" | "widows" | "column-span" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" | "x" | "y" | "cx" | "cy" | "r" | "rx" | "ry" => super::serialize_cssom_property_value(&name,raw),
             "contain-intrinsic-width"|"contain-intrinsic-height"|"contain-intrinsic-inline-size"|"contain-intrinsic-block-size" => super::intrinsic_override::specified(raw),
             "background-image" => super::image_source::serialize(raw),
             "filter" => super::serialize_color_filter_declaration(raw),
@@ -553,7 +543,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             | "animation-timing-function" | "transition-property"
  | "transition-duration" | "transition-timing-function" | "transition-delay" | "transition-behavior"
             | "font-style" | "font-width" | "font-feature-settings" | "font-variant-alternates" | "text-transform"
-            | "scroll-behavior" | "text-overflow" | "content"
+            | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break"
             | "border-image-source" | "box-shadow" | "text-shadow"
             | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" => parsed.iter().find_map(|declaration|
                 serialize_typed(&declaration.value, raw, &name, &name)),
@@ -586,6 +576,9 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                     None
                 }
             }),
+            "color-interpolation-filters"=>parsed.iter().find_map(|declaration|
+                if let Value::SvgFilterColorSpace(value)=declaration.value {Some(value.css_keyword().into())}else{None}),
+            _ if super::animation_color_property(&name)=>super::serialize_cssom_property_value(&name,raw),
             _ => parsed.iter().find_map(|declaration| match &declaration.value {
                 Value::FontSizeKeyword(value) => Some(value.as_str().into()),
                 Value::IntrinsicSize(_, value) | Value::FlexBasisIntrinsic(value) =>
@@ -734,7 +727,8 @@ fn css_color(value: Rgba, raw: &str) -> String {
     if let Some(token) = components(raw)
         .and_then(|tokens| tokens.into_iter().find(|token| color(token) == Some(value)))
     {
-        return token.to_owned();
+        return super::color_values::serialize_declared(token,0)
+            .unwrap_or_else(||computed_values::color(value));
     }
     computed_values::color(value)
 }
@@ -819,12 +813,17 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::DecorationLength(_,value)=>value.serialize(),
         Value::FontSizeKeyword(value) => value.as_str().into(),
         Value::ContainerType(value) => value.as_str().into(),
+        Value::ColumnSpan(value)=>value.serialize(),
+        Value::BoxDecorationBreak(value)=>value.serialize(),
+        Value::SvgFilterColorSpace(value)=>value.css_keyword().into(),
+        Value::LineBreakCount(_,value)=>value.to_string(),
+        Value::BreakControl(_,value)=>super::break_control::serialize(target,*value)?.into(),
         Value::ColumnWidth(_)=>super::columns::specified("column-width",raw)?,
         Value::ContextLength(238,raw,_)=>super::columns::specified("column-width",raw)?,
         Value::ContainIntrinsic(_,_)=>super::intrinsic_override::specified_component(origin,target,raw)?,
         Value::ContextLength(slot,value,_) if (234..=237).contains(slot)=>super::intrinsic_override::specified(value)?,
         Value::ContextLength(slot, value, _) if matches!(slot,214|215) => serialize_decoration_length(value)?,
-        Value::ContextLength(slot, value, _) if matches!(slot,48|74|75) => super::typed_numeric::parse_numeric_expression(value)?.serialize_specified()?,
+        Value::ContextLength(slot, value, _) if matches!(slot,48|74|75|244|245|255) => super::typed_numeric::parse_numeric_expression(value)?.serialize_specified()?,
         Value::ContextLength(_, value, _) => value.to_string(),
         Value::ColorRaw(_,value)=>super::color_values::serialize_declared(value,0)?,
         Value::GapRaw(_,value)=>value.to_string(),
@@ -1443,6 +1442,12 @@ pub fn serialize_box_sides(values: [&str; 4]) -> String {
 }
 
 fn synthesize(name: &str, values: &[&str]) -> Option<String> {
+    if let Some(slot)=super::break_control::slot(name).filter(|_|name.starts_with("page-")) {
+        let [value]=values else{return None;};
+        let target=match slot{247=>"break-before",248=>"break-after",_=>"break-inside"};
+        if ["initial","inherit","unset","revert","revert-layer"].contains(value){return Some((*value).into());}
+        return Some(super::break_control::serialize(name,super::break_control::parse(target,value)?)?.into());
+    }
     if name=="columns" {return match values{[width,count]=>Some(super::columns::shorthand_value(width,count)),_=>None};}
     if name=="contain-intrinsic-size" {return match values{[a,b]=>Some(if a==b{(*a).into()}else{alloc::format!("{a} {b}")}),_=>None};}
     if name=="animation" {return animation_controls::shorthand(values);}
@@ -1770,6 +1775,21 @@ fn append_serialized(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_svg_paint_opacity_specified_numbers_preserve_range_and_roundtrip() {
+        for name in ["fill-opacity", "stroke-opacity", "flood-opacity"] {
+            let mut block = DeclarationBlock::default();
+            for (authored, expected) in [("-100%", "-1"), ("50%", "0.5"), ("300%", "3"), ("0.125", "0.125")] {
+                assert!(block.set(name, authored, false).unwrap());
+                assert_eq!(block.value(name).unwrap().0, expected);
+                let replay = DeclarationBlock::parse(&block.serialize().unwrap()).unwrap();
+                assert_eq!(replay.value(name), block.value(name));
+            }
+            assert!(block.set(name, "inherit", true).unwrap());
+            assert_eq!(block.value(name), Some(("inherit".into(), true)));
+        }
+    }
+
     #[test]
     fn specification_pending_timings_serialize_through_shared_easing_authority(){
         for name in ["transition-timing-function","animation-timing-function"]{

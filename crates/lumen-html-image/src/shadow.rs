@@ -11,18 +11,17 @@ pub(super) fn draw(
     if shadow.color.a == 0 {
         return Ok(());
     }
-    let Some(visible) = raster
-        .clips
-        .last()
-        .and_then(|clip| clip.intersection(shadow.bounds(rect)))
+    let Some(visible) = raster.visible_rect(shadow.bounds(rect))
     else {
         return Ok(());
     };
     let (_, padding) = blur_sizes(shadow.blur, raster.scale)?;
-    let left = (visible.x * raster.scale).floor() - padding as f32;
-    let top = (visible.y * raster.scale).floor() - padding as f32;
-    let width = ((visible.x + visible.width) * raster.scale).ceil() - left + padding as f32;
-    let height = ((visible.y + visible.height) * raster.scale).ceil() - top + padding as f32;
+    let (x0,y0,x1,y1)=raster.pixel_span(visible);
+    if x1<=x0 || y1<=y0 {return Ok(());}
+    let left=(i64::from(x0)+raster.device_origin[0]) as f32-padding as f32;
+    let top=(i64::from(y0)+raster.device_origin[1]) as f32-padding as f32;
+    let width=(x1-x0) as f32+padding as f32*2.0;
+    let height=(y1-y0) as f32+padding as f32*2.0;
     if width <= 0.0 || height <= 0.0 {
         return Ok(());
     }
@@ -32,6 +31,7 @@ pub(super) fn draw(
     let (width, height) = (width as usize, height as usize);
     let pixels = lumen_common::limits::size::repeat(width, height, MAX_LAYER_BYTES / 2)
         .map_err(|_| ImageError::TooLarge)?;
+    validate_blur_budget(width,height,shadow.blur,raster.scale,raster.source_reserved.unwrap_or(0))?;
     let mut mask = vec![0u8; pixels];
     let spread = if shadow.inset {
         -shadow.spread
@@ -74,12 +74,12 @@ pub(super) fn draw(
                 .round() as u8;
         }
     }
-    blur_alpha_mask(&mut mask, width, height, shadow.blur, raster.scale, 0)?;
+    blur_alpha_mask(&mut mask, width, height, shadow.blur, raster.scale, raster.source_reserved.unwrap_or(0))?;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let transparent = if shadow.inset { 255 } else { 0 };
     for y in y0..y1 {
         for x in x0..x1 {
-            let mask_offset = (y as f32 - top) as usize * width + (x as f32 - left) as usize;
+            let mask_offset = ((i64::from(y)+raster.device_origin[1]) as f32 - top) as usize * width + ((i64::from(x)+raster.device_origin[0]) as f32 - left) as usize;
             let level = mask[mask_offset];
             if level == transparent {
                 continue;
@@ -88,8 +88,8 @@ pub(super) fn draw(
                 rect,
                 radius,
                 corners,
-                x as f32,
-                y as f32,
+                (i64::from(x)+raster.device_origin[0]) as f32,
+                (i64::from(y)+raster.device_origin[1]) as f32,
                 raster.scale,
                 raster.antialias,
             );

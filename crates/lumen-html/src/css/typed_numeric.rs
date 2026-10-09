@@ -206,6 +206,24 @@ pub const MAX_NUMERIC_EXPRESSION_DEPTH: usize = 16;
 pub const MAX_NUMERIC_EXPRESSION_NODES: usize = 256;
 pub const MAX_NUMERIC_EXPRESSION_ARGS: usize = 32;
 
+/// Conservative live-heap ceiling for a bounded numeric parse plus f64
+/// evaluation and sibling substitution. Derived from the shared grammar's
+/// node, recursion, argument and input limits, rather than a caller's raw text.
+/// Includes AST boxes, vector spare capacity/reallocation peaks, nested empty
+/// sum/product accumulators, function values/types and transient decoded text.
+/// Callers with a smaller operation budget reject before invoking the parser.
+pub fn numeric_expression_peak_bytes_bound()->Option<usize> {
+    let levels=MAX_NUMERIC_EXPRESSION_DEPTH.checked_add(1)?;
+    let slots=MAX_NUMERIC_EXPRESSION_NODES.checked_mul(3)?
+        .checked_add(levels.checked_mul(8)?)?
+        .checked_add(MAX_NUMERIC_EXPRESSION_ARGS.checked_mul(2)?)?;
+    let tree=slots.checked_mul(core::mem::size_of::<NumericExpression>())?;
+    let functions=levels.checked_mul(MAX_NUMERIC_EXPRESSION_ARGS)?
+        .checked_mul(core::mem::size_of::<f64>().checked_add(core::mem::size_of::<NumericType>().checked_mul(2)?)?)?;
+    tree.checked_add(functions)?.checked_add(MAX_NUMERIC_EXPRESSION_BYTES.checked_mul(8)?)
+}
+
+
 /// Context operations used to evaluate the shared expression tree.
 ///
 /// The parser owns syntax and operator order; a caller owns unit resolution
@@ -2384,7 +2402,7 @@ mod tests {
 /// CSS Values range checks apply to the top-level calculation. Keep IEEE
 /// values inside the tree; censor NaN/signed zero and bound the final scalar
 /// to the implementation's existing f32 storage range only after evaluation.
-pub(super) fn computed_f32(value:f64)->f32 {
+pub(crate) fn computed_f32(value:f64)->f32 {
     if value.is_nan()||value==0.0{0.0}else{value.clamp(-f64::from(f32::MAX),f64::from(f32::MAX)) as f32}
 }
 

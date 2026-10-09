@@ -10,24 +10,7 @@ use tiny_skia::{
     Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
-const MAX_SVG_PATH_BYTES: usize = 1024 * 1024;
-const MAX_SVG_PATH_SEGMENTS: usize = 65_536;
-
-#[derive(Clone)]
-pub struct ParsedSvgPath {
-    pub path: Option<Path>,
-    pub current: (f32, f32),
-    pub subpath_start: (f32, f32),
-}
-
-/// Parses SVG path data into the shared vector path representation used by
-/// Canvas and the HTML image rasterizer.
-pub fn parse_svg_path(data: &str) -> Result<ParsedSvgPath, &'static str> {
-    if data.len() > MAX_SVG_PATH_BYTES {
-        return Err("SVG path data is too large");
-    }
-    SvgPathParser::new(data).parse()
-}
+pub use lumen_common::svg_path::{parse_svg_path,ParsedSvgPath};
 
 /// Resize a straight-alpha raster image using tiny-skia's shared sampling
 /// implementation. The result remains straight-alpha for ImageData and
@@ -147,431 +130,6 @@ pub fn resize_image_straight_with_quality(
     })
 }
 
-struct SvgPathParser<'a> {
-    data: &'a [u8],
-    offset: usize,
-    builder: PathBuilder,
-    current: (f32, f32),
-    subpath: (f32, f32),
-    previous_command: u8,
-    cubic_control: (f32, f32),
-    quad_control: (f32, f32),
-    segments: usize,
-    last_was_number: bool,
-}
-
-impl<'a> SvgPathParser<'a> {
-    fn new(data: &'a str) -> Self {
-        Self {
-            data: data.as_bytes(),
-            offset: 0,
-            builder: PathBuilder::new(),
-            current: (0.0, 0.0),
-            subpath: (0.0, 0.0),
-            previous_command: 0,
-            cubic_control: (0.0, 0.0),
-            quad_control: (0.0, 0.0),
-            segments: 0,
-            last_was_number: false,
-        }
-    }
-
-    fn parse(mut self) -> Result<ParsedSvgPath, &'static str> {
-        let mut command = 0u8;
-        let mut had_move = false;
-        while self.has_more() {
-            self.skip_whitespace();
-            if self.offset >= self.data.len() {
-                break;
-            }
-            if self.data[self.offset].is_ascii_alphabetic() {
-                command = self.data[self.offset];
-                self.offset += 1;
-                self.last_was_number = false;
-                if !matches!(
-                    command.to_ascii_uppercase(),
-                    b'M' | b'Z' | b'L' | b'H' | b'V' | b'C' | b'S' | b'Q' | b'T' | b'A'
-                ) {
-                    return Err("unsupported SVG path command");
-                }
-                if command.to_ascii_uppercase() == b'Z' {
-                    if !had_move {
-                        return Err("SVG path close has no subpath");
-                    }
-                    self.builder.close();
-                    self.current = self.subpath;
-                    self.previous_command = command;
-                    command = 0;
-                    self.segment()?;
-                    continue;
-                }
-            } else if command == 0 {
-                return Err("SVG path data must begin with a command");
-            }
-
-            let relative = command.is_ascii_lowercase();
-            let upper = command.to_ascii_uppercase();
-            if !had_move && upper != b'M' {
-                return Err("SVG path must begin with moveto");
-            }
-            match upper {
-                b'M' => {
-                    let (x, y) = self.point(relative)?;
-                    self.builder.move_to(x, y);
-                    self.current = (x, y);
-                    self.subpath = (x, y);
-                    had_move = true;
-                    self.previous_command = command;
-                    self.segment()?;
-                    // Subsequent pairs after moveto are implicit lineto.
-                    command = if relative { b'l' } else { b'L' };
-                }
-                b'L' => {
-                    let (x, y) = self.point(relative)?;
-                    self.builder.line_to(x, y);
-                    self.current = (x, y);
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'H' => {
-                    let value = self.number()?;
-                    let x = if relative {
-                        self.current.0 + value
-                    } else {
-                        value
-                    };
-                    self.builder.line_to(x, self.current.1);
-                    self.current.0 = x;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'V' => {
-                    let value = self.number()?;
-                    let y = if relative {
-                        self.current.1 + value
-                    } else {
-                        value
-                    };
-                    self.builder.line_to(self.current.0, y);
-                    self.current.1 = y;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'C' => {
-                    let c1 = self.point(relative)?;
-                    let c2 = self.point(relative)?;
-                    let end = self.point(relative)?;
-                    self.builder.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
-                    self.current = end;
-                    self.cubic_control = c2;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'S' => {
-                    let c1 = if matches!(self.previous_command.to_ascii_uppercase(), b'C' | b'S') {
-                        (
-                            2.0 * self.current.0 - self.cubic_control.0,
-                            2.0 * self.current.1 - self.cubic_control.1,
-                        )
-                    } else {
-                        self.current
-                    };
-                    let c2 = self.point(relative)?;
-                    let end = self.point(relative)?;
-                    self.builder.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
-                    self.current = end;
-                    self.cubic_control = c2;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'Q' => {
-                    let control = self.point(relative)?;
-                    let end = self.point(relative)?;
-                    self.builder.quad_to(control.0, control.1, end.0, end.1);
-                    self.current = end;
-                    self.quad_control = control;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'T' => {
-                    let control =
-                        if matches!(self.previous_command.to_ascii_uppercase(), b'Q' | b'T') {
-                            (
-                                2.0 * self.current.0 - self.quad_control.0,
-                                2.0 * self.current.1 - self.quad_control.1,
-                            )
-                        } else {
-                            self.current
-                        };
-                    let end = self.point(relative)?;
-                    self.builder.quad_to(control.0, control.1, end.0, end.1);
-                    self.current = end;
-                    self.quad_control = control;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                b'A' => {
-                    let rx = self.number()?.abs();
-                    let ry = self.number()?.abs();
-                    let rotation = self.number()?;
-                    let large_arc = self.flag()?;
-                    let sweep = self.flag()?;
-                    let end = self.point(relative)?;
-                    append_svg_arc(
-                        &mut self.builder,
-                        self.current,
-                        end,
-                        rx,
-                        ry,
-                        rotation,
-                        large_arc,
-                        sweep,
-                    )?;
-                    self.current = end;
-                    self.previous_command = command;
-                    self.segment()?;
-                }
-                _ => return Err("invalid SVG path command"),
-            }
-        }
-        Ok(ParsedSvgPath {
-            path: self.builder.finish(),
-            current: self.current,
-            subpath_start: self.subpath,
-        })
-    }
-
-    fn has_more(&self) -> bool {
-        self.offset < self.data.len()
-    }
-    fn skip_whitespace(&mut self) {
-        while self
-            .data
-            .get(self.offset)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            self.offset += 1;
-        }
-    }
-    fn number(&mut self) -> Result<f32, &'static str> {
-        self.skip_whitespace();
-        if self.data.get(self.offset) == Some(&b',') {
-            if !self.last_was_number {
-                return Err("SVG path comma is misplaced");
-            }
-            self.offset += 1;
-            self.skip_whitespace();
-            if self.offset >= self.data.len()
-                || self.data[self.offset] == b','
-                || self.data[self.offset].is_ascii_alphabetic()
-            {
-                return Err("SVG path comma has no following number");
-            }
-        }
-        let start = self.offset;
-        if self
-            .data
-            .get(self.offset)
-            .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-        {
-            self.offset += 1;
-        }
-        let mut digits = 0;
-        while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-            self.offset += 1;
-            digits += 1;
-        }
-        if self.data.get(self.offset) == Some(&b'.') {
-            self.offset += 1;
-            while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-                digits += 1;
-            }
-        }
-        if digits == 0 {
-            return Err("invalid SVG path number");
-        }
-        if self
-            .data
-            .get(self.offset)
-            .is_some_and(|byte| *byte == b'e' || *byte == b'E')
-        {
-            self.offset += 1;
-            if self
-                .data
-                .get(self.offset)
-                .is_some_and(|byte| *byte == b'+' || *byte == b'-')
-            {
-                self.offset += 1;
-            }
-            let exponent_start = self.offset;
-            while self.data.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-            if self.offset == exponent_start {
-                return Err("invalid SVG path exponent");
-            }
-        }
-        let text = core::str::from_utf8(&self.data[start..self.offset])
-            .map_err(|_| "invalid SVG path number")?;
-        let value = text.parse::<f32>().map_err(|_| "invalid SVG path number")?;
-        if !value.is_finite() {
-            return Err("SVG path number must be finite");
-        }
-        self.last_was_number = true;
-        Ok(value)
-    }
-    fn flag(&mut self) -> Result<bool, &'static str> {
-        self.skip_whitespace();
-        if self.data.get(self.offset) == Some(&b',') {
-            if !self.last_was_number {
-                return Err("SVG arc flag separator is misplaced");
-            }
-            self.offset += 1;
-            self.skip_whitespace();
-        }
-        let value = match self.data.get(self.offset) {
-            Some(b'0') => false,
-            Some(b'1') => true,
-            _ => return Err("invalid SVG arc flag"),
-        };
-        self.offset += 1;
-        self.last_was_number = true;
-        Ok(value)
-    }
-    fn point(&mut self, relative: bool) -> Result<(f32, f32), &'static str> {
-        let x = self.number()?;
-        let y = self.number()?;
-        let point = if relative {
-            (self.current.0 + x, self.current.1 + y)
-        } else {
-            (x, y)
-        };
-        if point.0.is_finite() && point.1.is_finite() {
-            Ok(point)
-        } else {
-            Err("SVG path coordinate is out of range")
-        }
-    }
-    fn segment(&mut self) -> Result<(), &'static str> {
-        self.segments += 1;
-        if self.segments > MAX_SVG_PATH_SEGMENTS {
-            Err("SVG path has too many segments")
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn append_svg_arc(
-    builder: &mut PathBuilder,
-    start: (f32, f32),
-    end: (f32, f32),
-    rx: f32,
-    ry: f32,
-    rotation_degrees: f32,
-    large_arc: bool,
-    sweep: bool,
-) -> Result<(), &'static str> {
-    if start == end {
-        return Ok(());
-    }
-    if rx == 0.0 || ry == 0.0 {
-        builder.line_to(end.0, end.1);
-        return Ok(());
-    }
-    let phi = rotation_degrees
-        .to_radians()
-        .rem_euclid(core::f32::consts::TAU);
-    let (sin_phi, cos_phi) = phi.sin_cos();
-    let dx = (start.0 - end.0) * 0.5;
-    let dy = (start.1 - end.1) * 0.5;
-    let x1p = cos_phi * dx + sin_phi * dy;
-    let y1p = -sin_phi * dx + cos_phi * dy;
-    let mut rx = rx.abs();
-    let mut ry = ry.abs();
-    let lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
-    if lambda > 1.0 {
-        let scale = lambda.sqrt();
-        rx *= scale;
-        ry *= scale;
-    }
-    let numerator = (rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p).max(0.0);
-    let denominator = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
-    if denominator == 0.0 || !denominator.is_finite() {
-        return Err("invalid SVG arc geometry");
-    }
-    let sign = if large_arc == sweep { -1.0 } else { 1.0 };
-    let coefficient = sign * (numerator / denominator).sqrt();
-    let cxp = coefficient * rx * y1p / ry;
-    let cyp = -coefficient * ry * x1p / rx;
-    let center = (
-        cos_phi * cxp - sin_phi * cyp + (start.0 + end.0) * 0.5,
-        sin_phi * cxp + cos_phi * cyp + (start.1 + end.1) * 0.5,
-    );
-    let angle = |ux: f32, uy: f32, vx: f32, vy: f32| (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
-    let ux = (x1p - cxp) / rx;
-    let uy = (y1p - cyp) / ry;
-    let vx = (-x1p - cxp) / rx;
-    let vy = (-y1p - cyp) / ry;
-    let theta = uy.atan2(ux);
-    let mut delta = angle(ux, uy, vx, vy);
-    if !sweep && delta > 0.0 {
-        delta -= core::f32::consts::TAU;
-    }
-    if sweep && delta < 0.0 {
-        delta += core::f32::consts::TAU;
-    }
-    if large_arc && delta.abs() < core::f32::consts::PI {
-        delta += if sweep {
-            core::f32::consts::TAU
-        } else {
-            -core::f32::consts::TAU
-        };
-    }
-    if !large_arc && delta.abs() > core::f32::consts::PI {
-        delta += if sweep {
-            -core::f32::consts::TAU
-        } else {
-            core::f32::consts::TAU
-        };
-    }
-    let count = (delta.abs() / core::f32::consts::FRAC_PI_2).ceil().max(1.0) as usize;
-    let step = delta / count as f32;
-    for segment in 0..count {
-        let a0 = theta + step * segment as f32;
-        let a1 = a0 + step;
-        let (s0, c0) = a0.sin_cos();
-        let (s1, c1) = a1.sin_cos();
-        let point = |c: f32, s: f32| {
-            (
-                center.0 + cos_phi * rx * c - sin_phi * ry * s,
-                center.1 + sin_phi * rx * c + cos_phi * ry * s,
-            )
-        };
-        let derivative = |c: f32, s: f32| {
-            (
-                -cos_phi * rx * s - sin_phi * ry * c,
-                -sin_phi * rx * s + cos_phi * ry * c,
-            )
-        };
-        let p0 = point(c0, s0);
-        let p1 = point(c1, s1);
-        let d0 = derivative(c0, s0);
-        let d1 = derivative(c1, s1);
-        let tangent = (4.0 / 3.0) * (step / 4.0).tan();
-        builder.cubic_to(
-            p0.0 + tangent * d0.0,
-            p0.1 + tangent * d0.1,
-            p1.0 - tangent * d1.0,
-            p1.1 - tangent * d1.1,
-            p1.0,
-            p1.1,
-        );
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 pub enum CanvasGradientKind {
     Linear {
@@ -654,6 +212,17 @@ impl CanvasGradient {
             stops: Rc::new(RefCell::new(Vec::new())),
         }
     }
+    pub(crate) fn new_reserved(kind:CanvasGradientKind,count:usize,max_bytes:usize)->Result<Self,ImageError> {
+        let wrapper=2*core::mem::size_of::<usize>()+core::mem::size_of::<RefCell<Vec<CanvasGradientStop>>>();
+        if count.checked_mul(core::mem::size_of::<CanvasGradientStop>()).and_then(|bytes|bytes.checked_add(wrapper)).is_none_or(|bytes|bytes>max_bytes) {return Err(ImageError::TooLarge);}
+        let mut stops=Vec::new();stops.try_reserve_exact(count).map_err(|_|ImageError::TooLarge)?;
+        if stops.capacity().checked_mul(core::mem::size_of::<CanvasGradientStop>()).and_then(|bytes|bytes.checked_add(wrapper)).is_none_or(|bytes|bytes>max_bytes) {return Err(ImageError::TooLarge);}
+        Ok(Self{kind,stops:Rc::new(RefCell::new(stops))})
+    }
+    pub(crate) fn allocated_bytes(&self)->usize {
+        2*core::mem::size_of::<usize>()+core::mem::size_of::<RefCell<Vec<CanvasGradientStop>>>()
+            +self.stops.borrow().capacity()*core::mem::size_of::<CanvasGradientStop>()
+    }
     pub fn add_color_stop(&self, offset: f32, color: [u8; 4]) -> Result<(), ()> {
         if !offset.is_finite() || !(0.0..=1.0).contains(&offset) {
             return Err(());
@@ -663,24 +232,30 @@ impl CanvasGradient {
         stops.insert(index, CanvasGradientStop { offset, color });
         Ok(())
     }
-    fn shader(&self, alpha: f32) -> Option<Shader<'static>> {
-        let original_stops = self.stops.borrow().clone();
-        let make_stops = |stops: Vec<CanvasGradientStop>| {
-            stops
-                .into_iter()
-                .map(|stop| {
-                    let [r, g, b, a] = stop.color;
-                    GradientStop::new(
-                        stop.offset,
-                        Color::from_rgba8(r, g, b, (f32::from(a) * alpha).round() as u8),
-                    )
-                })
-                .collect::<Vec<_>>()
+    fn shader_with_budget(&self,alpha:f32,budget:Option<usize>)->Result<Option<Shader<'static>>,ImageError> {
+        let borrowed=self.stops.borrow();
+        if let Some(limit)=budget {
+            let bytes=borrowed.len().checked_mul(core::mem::size_of::<CanvasGradientStop>()).ok_or(ImageError::TooLarge)?;
+            if bytes>limit {return Err(ImageError::TooLarge);}
+        }
+        let mut original_stops=Vec::new();
+        original_stops.try_reserve_exact(borrowed.len()).map_err(|_|ImageError::TooLarge)?;
+        if budget.is_some_and(|limit|original_stops.capacity()*core::mem::size_of::<CanvasGradientStop>()>limit) {return Err(ImageError::TooLarge);}
+        original_stops.extend_from_slice(&borrowed);drop(borrowed);
+        let make_stops=|stops:Vec<CanvasGradientStop>|->Result<Vec<GradientStop>,ImageError> {
+            let existing=stops.capacity().checked_mul(core::mem::size_of::<CanvasGradientStop>()).ok_or(ImageError::TooLarge)?;
+            let capacity=stops.len().checked_add(2).ok_or(ImageError::TooLarge)?;
+            let requested=capacity.checked_mul(core::mem::size_of::<GradientStop>()).ok_or(ImageError::TooLarge)?;
+            if budget.is_some_and(|limit|existing.checked_add(requested).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+            let mut native=Vec::new();native.try_reserve_exact(capacity).map_err(|_|ImageError::TooLarge)?;
+            if budget.is_some_and(|limit|native.capacity().checked_mul(core::mem::size_of::<GradientStop>()).and_then(|bytes|bytes.checked_add(existing)).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+            for stop in stops {let [r,g,b,a]=stop.color;native.push(GradientStop::new(stop.offset,Color::from_rgba8(r,g,b,(f32::from(a)*alpha).round()as u8)));}
+            Ok(native)
         };
         if original_stops.is_empty() {
-            return Some(Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)));
+            return Ok(Some(Shader::SolidColor(Color::from_rgba8(0,0,0,0))));
         }
-        match self.kind {
+        let shader=match self.kind {
             CanvasGradientKind::Linear {
                 start,
                 end,
@@ -688,7 +263,7 @@ impl CanvasGradient {
             } => LinearGradient::new(
                 Point::from_xy(start[0], start[1]),
                 Point::from_xy(end[0], end[1]),
-                make_stops(original_stops),
+                make_stops(original_stops)?,
                 SpreadMode::Pad,
                 transform,
             ),
@@ -707,13 +282,9 @@ impl CanvasGradient {
                         start[0] - start_radius / delta * (end[0] - start[0]),
                         start[1] - start_radius / delta * (end[1] - start[1]),
                     ];
-                    let mut stops = original_stops
-                        .into_iter()
-                        .map(|mut stop| {
-                            stop.offset = (start_radius + stop.offset * delta) / end_radius;
-                            stop
-                        })
-                        .collect::<Vec<_>>();
+                    let mut stops=original_stops;
+                    for stop in &mut stops {stop.offset=(start_radius+stop.offset*delta)/end_radius;}
+                    if budget.is_some_and(|limit|stops.capacity().checked_add(stops.len()).and_then(|slots|slots.checked_mul(core::mem::size_of::<CanvasGradientStop>())).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
                     stops.sort_by(|left, right| left.offset.total_cmp(&right.offset));
                     (focus, end, end_radius, stops)
                 } else if start_radius > end_radius {
@@ -722,31 +293,32 @@ impl CanvasGradient {
                         end[0] - end_radius / delta * (start[0] - end[0]),
                         end[1] - end_radius / delta * (start[1] - end[1]),
                     ];
-                    let mut stops = original_stops
-                        .into_iter()
-                        .map(|mut stop| {
-                            stop.offset = (end_radius + (1.0 - stop.offset) * delta) / start_radius;
-                            stop
-                        })
-                        .collect::<Vec<_>>();
+                    let mut stops=original_stops;
+                    for stop in &mut stops {stop.offset=(end_radius+(1.0-stop.offset)*delta)/start_radius;}
+                    if budget.is_some_and(|limit|stops.capacity().checked_add(stops.len()).and_then(|slots|slots.checked_mul(core::mem::size_of::<CanvasGradientStop>())).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
                     stops.sort_by(|left, right| left.offset.total_cmp(&right.offset));
                     (focus, start, start_radius, stops)
                 } else {
-                    return None;
+                    return Ok(None);
                 };
                 RadialGradient::new(
                     Point::from_xy(start[0], start[1]),
                     Point::from_xy(end[0], end[1]),
                     radius,
-                    make_stops(mapped),
+                    make_stops(mapped)?,
                     SpreadMode::Pad,
                     transform,
                 )
             }
-        }
+        };
+        if budget.is_some_and(|limit|shader.as_ref().is_some_and(|shader|shader.allocated_bytes()>limit)) {return Err(ImageError::TooLarge);}
+        Ok(shader)
     }
 
-    fn equal_radial_bitmap(&self, width: u32, height: u32) -> Option<Pixmap> {
+    fn equal_radial_bitmap(&self,width:u32,height:u32)->Option<Pixmap> {
+        self.equal_radial_bitmap_with_budget(width,height,None).ok().flatten()
+    }
+    fn equal_radial_bitmap_with_budget(&self,width:u32,height:u32,budget:Option<usize>)->Result<Option<Pixmap>,ImageError> {
         let CanvasGradientKind::Radial {
             start,
             end,
@@ -755,44 +327,42 @@ impl CanvasGradient {
             transform,
         } = &self.kind
         else {
-            return None;
+            return Ok(None);
         };
         if start_radius != end_radius {
-            return None;
+            return Ok(None);
         }
-        let inverse = transform.invert()?;
-        let stops = self.stops.borrow().clone();
-        if stops.is_empty() {
-            return Some(Pixmap::new(width, height)?);
+        let Some(inverse)=transform.invert()else{return Ok(None);};
+        let image_bytes=(width as usize).checked_mul(height as usize).and_then(|pixels|pixels.checked_mul(4)).ok_or(ImageError::TooLarge)?;
+        let lookup_width=4096u32;let lookup_bytes=lookup_width as usize*4;
+        let buffers=image_bytes.checked_add(lookup_bytes).ok_or(ImageError::TooLarge)?;
+        let shader_budget=budget.map(|limit|limit.checked_sub(buffers).ok_or(ImageError::TooLarge)).transpose()?;
+        if self.stops.borrow().is_empty() {
+            if budget.is_some_and(|limit|image_bytes>limit){return Err(ImageError::TooLarge);}
+            return Ok(Some(Pixmap::new(width,height).ok_or(ImageError::TooLarge)?));
         }
-        let gradient_stops = stops
-            .into_iter()
-            .map(|stop| {
-                let [r, g, b, a] = stop.color;
-                GradientStop::new(stop.offset, Color::from_rgba8(r, g, b, a))
-            })
-            .collect::<Vec<_>>();
-        let lookup_width = 4096u32;
-        let shader = LinearGradient::new(
-            Point::from_xy(0.0, 0.0),
-            Point::from_xy(lookup_width as f32, 0.0),
-            gradient_stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        )?;
-        let mut lookup = Pixmap::new(lookup_width, 1)?;
-        let paint = Paint {
-            shader,
-            ..Paint::default()
-        };
-        let rect = Rect::from_xywh(0.0, 0.0, lookup_width as f32, 1.0)?;
-        lookup.fill_rect(rect, &paint, Transform::identity(), None);
-        let mut image = Pixmap::new(width, height)?;
+        let lookup_gradient=Self{kind:CanvasGradientKind::Linear{start:[0.0,0.0],end:[lookup_width as f32,0.0],transform:Transform::identity()},stops:self.stops.clone()};
+        let Some(shader)=lookup_gradient.shader_with_budget(1.0,shader_budget)? else{return Ok(None);};
+        let shader_bytes=shader.allocated_bytes();
+        if budget.is_some_and(|limit|buffers.checked_add(shader_bytes).is_none_or(|bytes|bytes>limit)){return Err(ImageError::TooLarge);}
+        let mut lookup=Pixmap::new(lookup_width,1).ok_or(ImageError::TooLarge)?;
+        let paint=Paint{shader,..Paint::default()};
+        let rect=Rect::from_xywh(0.0,0.0,lookup_width as f32,1.0).ok_or(ImageError::InvalidViewport)?;
+        if let Some(limit)=budget {
+            let remaining=limit.checked_sub(buffers).and_then(|bytes|bytes.checked_sub(shader_bytes)).ok_or(ImageError::TooLarge)?;
+            let mut builder=tiny_skia::BoundedPathBuilder::new(remaining).map_err(|_|ImageError::TooLarge)?;
+            builder.move_to(rect.left(),rect.top());builder.line_to(rect.right(),rect.top());builder.line_to(rect.right(),rect.bottom());builder.line_to(rect.left(),rect.bottom());builder.close();
+            let path=builder.finish().map_err(|_|ImageError::TooLarge)?.ok_or(ImageError::InvalidViewport)?;
+            let remaining=remaining.checked_sub(path.allocated_bytes()).ok_or(ImageError::TooLarge)?;
+            lookup.fill_path_bounded(&path,&paint,FillRule::Winding,Transform::identity(),None,remaining).map_err(|_|ImageError::TooLarge)?;
+        }else{lookup.fill_rect(rect,&paint,Transform::identity(),None);}
+        drop(paint);
+        let mut image=Pixmap::new(width,height).ok_or(ImageError::TooLarge)?;
         let dx = end[0] - start[0];
         let dy = end[1] - start[1];
         let a = dx * dx + dy * dy;
         if *start_radius == 0.0 || a <= f32::EPSILON {
-            return Some(image);
+            return Ok(Some(image));
         }
         let radius_squared = *start_radius * *start_radius;
         for y in 0..height {
@@ -816,7 +386,7 @@ impl CanvasGradient {
                 image.pixels_mut()[y as usize * width as usize + x as usize] = source;
             }
         }
-        Some(image)
+        Ok(Some(image))
     }
 }
 
@@ -2248,6 +1818,22 @@ impl CanvasSurface {
         }
         Ok(())
     }
+    pub(crate) fn clip_alpha(&self)->Option<&[u8]> {self.state.clip.as_ref().map(Mask::data)}
+
+    pub(crate) fn source_path_bounded(&mut self,path:&Path,rule:FillRule,stroke:bool,max_bytes:usize)->Result<(),ImageError> {
+        if self.state.shadow_color[3]!=0 || self.state.fill_pattern.is_some() || self.state.stroke_pattern.is_some() {return Err(ImageError::InvalidViewport);}
+        let gradient=if stroke{self.state.stroke_gradient.as_ref()}else{self.state.fill_gradient.as_ref()};
+        let custom=gradient.map(|gradient|gradient.equal_radial_bitmap_with_budget(self.width,self.height,Some(max_bytes))).transpose()?.flatten();
+        let remaining=max_bytes.checked_sub(custom.as_ref().map_or(0,|bitmap|bitmap.data().len())).ok_or(ImageError::TooLarge)?;
+        let paint=Self::paint_with_budget(self.state.blend,self.state.alpha,if stroke{self.state.stroke}else{self.state.fill},gradient,None,self.state.transform,custom.as_ref(),Some(remaining))?;
+        let remaining=remaining.checked_sub(paint.shader.allocated_bytes()).ok_or(ImageError::TooLarge)?;
+        if let Some(bitmap)=&mut self.bitmap {
+            if stroke {bitmap.stroke_path_bounded(path,&paint,&self.state.line,self.state.transform,self.state.clip.as_ref(),remaining).map_err(|_|ImageError::TooLarge)?;}
+            else{bitmap.fill_path_bounded(path,&paint,rule,self.state.transform,self.state.clip.as_ref(),remaining).map_err(|_|ImageError::TooLarge)?;}
+        }
+        drop(paint);self.changed();Ok(())
+    }
+
     pub fn stroke_path(&mut self, path: &Path) -> Result<(), ImageError> {
         let gradient_image = self
             .state
@@ -2328,24 +1914,34 @@ impl CanvasSurface {
     /// Intersect the current clip with the union of the supplied transformed
     /// paths. SVG clipPath children contribute a logical OR before ancestor
     /// clip regions are intersected.
-    pub fn clip_paths_union(
-        &mut self,
-        paths: &[(&Path, FillRule, Transform)],
-    ) -> Result<(), ImageError> {
-        let mut pixmap = Pixmap::new(self.width, self.height).ok_or(ImageError::TooLarge)?;
+    pub fn clip_paths_union(&mut self,paths:&[(&Path,FillRule,Transform)])->Result<(),ImageError> {
+        self.clip_paths_union_with_budget(paths,None)
+    }
+    pub(crate) fn clip_paths_union_bounded(&mut self,paths:&[(&Path,FillRule,Transform)],max_bytes:usize)->Result<(),ImageError> {
+        self.clip_paths_union_with_budget(paths,Some(max_bytes))
+    }
+    fn clip_paths_union_with_budget(&mut self,paths:&[(&Path,FillRule,Transform)],budget:Option<usize>)->Result<(),ImageError> {
+        let pixels=(self.width as usize).checked_mul(self.height as usize).ok_or(ImageError::TooLarge)?;
+        let rgba=pixels.checked_mul(4).ok_or(ImageError::TooLarge)?;
+        let existing=self.state.clip.as_ref().map_or(0,|clip|clip.data().len());
+        if budget.is_some_and(|limit|rgba.checked_add(existing).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+        let mut pixmap=Pixmap::new(self.width,self.height).ok_or(ImageError::TooLarge)?;
+        let occupied=pixmap.data().len().checked_add(existing).ok_or(ImageError::TooLarge)?;
+        let scan_budget=budget.map(|limit|limit.checked_sub(occupied).ok_or(ImageError::TooLarge)).transpose()?;
         let mut paint = Paint::default();
         paint.set_color(Color::WHITE);
         for (path, rule, transform) in paths {
-            pixmap.fill_path(path, &paint, *rule, *transform, None);
+            if let Some(limit)=scan_budget {pixmap.fill_path_bounded(path,&paint,*rule,*transform,None,limit).map_err(|_|ImageError::TooLarge)?;}
+            else{pixmap.fill_path(path,&paint,*rule,*transform,None);}
         }
-        let union = Mask::from_pixmap(pixmap.as_ref(), tiny_skia::MaskType::Alpha);
+        if budget.is_some_and(|limit|occupied.checked_add(pixels).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+        let union=Mask::from_pixmap(pixmap.as_ref(),tiny_skia::MaskType::Alpha);
+        drop(pixmap);
         let combined = if let Some(existing) = self.state.clip.as_ref() {
-            let data = existing
-                .data()
-                .iter()
-                .zip(union.data())
-                .map(|(left, right)| ((u16::from(*left) * u16::from(*right) + 127) / 255) as u8)
-                .collect();
+            if budget.is_some_and(|limit|existing.data().len().checked_add(union.data().len()).and_then(|bytes|bytes.checked_add(pixels)).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+            let mut data=Vec::new();data.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
+            if budget.is_some_and(|limit|existing.data().len().checked_add(union.data().len()).and_then(|bytes|bytes.checked_add(data.capacity())).is_none_or(|bytes|bytes>limit)) {return Err(ImageError::TooLarge);}
+            for (left,right) in existing.data().iter().zip(union.data()) {data.push(((u16::from(*left)*u16::from(*right)+127)/255)as u8);}
             Mask::from_vec(
                 data,
                 tiny_skia::IntSize::from_wh(self.width, self.height)
@@ -2524,7 +2120,20 @@ impl CanvasSurface {
         pattern: Option<&'a CanvasPattern>,
         canvas_transform: Transform,
         custom_gradient: Option<&'a Pixmap>,
-    ) -> Paint<'a> {
+    ) ->Paint<'a> {
+        Self::paint_with_budget(blend,alpha,color,gradient,pattern,canvas_transform,custom_gradient,None)
+            .unwrap_or_else(|_|Paint{blend_mode:blend,shader:Shader::SolidColor(Color::from_rgba8(0,0,0,0)),..Paint::default()})
+    }
+    fn paint_with_budget<'a>(
+        blend: BlendMode,
+        alpha: f32,
+        color: [u8; 4],
+        gradient: Option<&CanvasGradient>,
+        pattern: Option<&'a CanvasPattern>,
+        canvas_transform: Transform,
+        custom_gradient: Option<&'a Pixmap>,
+        budget:Option<usize>,
+    ) ->Result<Paint<'a>,ImageError> {
         let mut paint = Paint {
             blend_mode: blend,
             ..Paint::default()
@@ -2538,9 +2147,7 @@ impl CanvasSurface {
                 Transform::identity(),
             );
         } else if let Some(gradient) = gradient {
-            paint.shader = gradient
-                .shader(alpha)
-                .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(0, 0, 0, 0)));
+            paint.shader=gradient.shader_with_budget(alpha,budget)?.unwrap_or_else(||Shader::SolidColor(Color::from_rgba8(0,0,0,0)));
         } else if let Some(pattern) = pattern {
             paint.shader = Pattern::new(
                 pattern.pixmap.as_ref().as_ref(),
@@ -2557,7 +2164,7 @@ impl CanvasSurface {
                 (f32::from(color[3]) * alpha).round() as u8,
             );
         }
-        paint
+        Ok(paint)
     }
 
     fn pattern_clip(&self, pattern: Option<&CanvasPattern>) -> Option<Mask> {

@@ -179,6 +179,7 @@ impl DomRealm {
     }
     /// Response policies precede parser metadata and author script.
     pub fn set_content_security_policy_headers(&self,headers:&[(String,String)])->OpResult<()> {
+        self.set_permissions_policy_headers(headers)?;
         self.reporting.configure(&self.document_url().unwrap_or_else(||"about:blank".into()),headers).map_err(policy_error)?;
         for (name,value) in headers {
             let disposition=if name.eq_ignore_ascii_case("content-security-policy") {PolicyDisposition::Enforce}
@@ -191,6 +192,7 @@ impl DomRealm {
             };
             if self.has_browsing_context {self.session.borrow_mut().document_mut().set_connected_nonce_hiding(header_policy).map_err(dom_error)?;}
         }
+        focus::response_policy_ready(self);
         Ok(())
     }
     /// Enforce policy during real script preparation, before fetching or executing it.

@@ -259,6 +259,7 @@ pub(super) fn without_fragment(url: &str) -> String {
 }
 
 pub(super) fn document_base(ctx: &mut Ctx) -> Option<String> {
+    if let Some(base)=super::native_api_base_url(ctx) {return Some(base);}
     let global = ctx.global_object();
     for (object, key) in [("document", "baseURI"), ("location", "href")] {
         let Ok(holder @ Value::Obj(_)) = ctx.member_get(&global, object) else {

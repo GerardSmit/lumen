@@ -1092,7 +1092,10 @@ impl FrameContext {
         };
         if let (Some(parent),Some(node))=(self.inner.parent.as_ref().and_then(std::rc::Weak::upgrade),self.inner.owner_node) {
             let owner=parent.document.borrow().clone();
-            if let Some(owner)=owner {document.inherit_embedding_color_scheme(&owner,node).map_err(|_|FrameInstallError::HostRealm)?;}
+            if let Some(owner)=owner {
+                document.initialize_permissions_policy(&owner,Some(node)).map_err(|_|FrameInstallError::HostRealm)?;
+                document.inherit_embedding_color_scheme(&owner,node).map_err(|_|FrameInstallError::HostRealm)?;
+            }
         }
         if let Some(container) = crate::object_urls::policy_container(ctx, &prepared.final_url) {
             document.inherit_policy_container(&container);
@@ -1212,6 +1215,7 @@ impl FrameContext {
         if let Some(staging) = prepared.staging_realm.take() { retired_realms.push(staging); }
         else { retired_realms.push(old_realm); }
         prepared.committed = true;
+        super::focus::admit_created_document(&document);
         Ok(FrameCommitResult {
             document,
             retired_realms,
@@ -2196,7 +2200,7 @@ impl DomRealm {
         // Attribute processing starts src/srcdoc navigation separately.
         let source = String::new();
         let url = "about:blank";
-        let origin = if sandboxed && !sandbox_allows_same_origin {
+        let origin = if self.lifecycle.sandboxed_origin.get() || (sandboxed && !sandbox_allows_same_origin) {
             Origin::opaque()
         } else {
             Origin::for_document(url, Some(&parent.root_or_child_origin()))
@@ -2325,6 +2329,7 @@ impl DomRealm {
         });
         match install {
             Ok(Ok(realm)) => {
+                realm.initialize_permissions_policy(self,node)?;
                 if let Some(node)=node {realm.inherit_embedding_color_scheme(self,node)?;}
                 realm.inherit_policy_container(&self.policy_container());
                 realm.inherit_cookie_environment(self);
@@ -2591,18 +2596,15 @@ pub(crate) fn require_same_origin_context(ctx: &mut Ctx, context: &BrowsingConte
 }
 
 pub(crate) fn focus_window_context(ctx: &mut Ctx, context: &BrowsingContext, blur: bool) -> OpResult<()> {
-    if !context.active.get() { return Ok(()); }
-    if let (Some(parent), Some(owner)) = (context.parent_context(), context.owner_node) {
-        if let Some(parent_document) = parent.document() {
-            if blur {
-                if parent_document.focused_node() == Some(owner) { parent_document.focus(ctx, None)?; }
-            } else { parent_document.focus(ctx, Some(owner))?; }
-        }
-    }
-    if blur {
-        if let Some(document) = context.document() { document.focus(ctx, None)?; }
-    }
-    Ok(())
+    // Window.blur() has no focus or reporting side effects. A retired Window
+    // likewise has no active navigable on which to run the focusing steps.
+    if blur || !context.is_active() {return Ok(());}
+    let Some(document)=context.document() else{return Ok(());};
+    if !super::focus::allow_focus_with_context(Some(ctx),&document) {return Ok(());}
+    // Navigable focusing resolves to its active document's viewport. Reuse the
+    // maintained owner chain and focus-event dispatch, including realm entry.
+    super::focus::focus_parent_chain(ctx,&document)?;
+    document.focus(ctx,None)
 }
 
 pub(crate) fn is_active_document(context: &BrowsingContext, document: &DomRealm) -> bool {

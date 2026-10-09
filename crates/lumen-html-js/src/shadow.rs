@@ -236,7 +236,7 @@ impl DomSlotElement {
             .0
             .unwrap_or_default())
     }
-    #[setter(hint(js(ce_reactions)))]
+    #[setter(coerce, hint(js(ce_reactions)))]
     fn set_name(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("name", value)
     }

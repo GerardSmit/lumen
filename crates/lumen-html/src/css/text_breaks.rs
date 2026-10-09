@@ -4,6 +4,7 @@
 //! line before they are split, and break-word does not shrink min-content.
 use super::{OverflowWrap, Style, WhiteSpace, WordBreak};
 use lumen_common::ucd::{self, BreakClass, BreakOpportunity};
+use lumen_common::bidi::{Script, UnicodeScript};
 
 impl Style {
     pub fn emergency_wrap(&self) -> bool {
@@ -72,6 +73,26 @@ fn complex_context_unit(cluster: &str) -> bool {
         .is_some_and(|ch| ucd::break_property(ch as u32) == BreakClass::ComplexContext)
 }
 
+// CSS Text §5.5 requires letter-unit fallback when the UA lacks the
+// lexical/orthographic analyzer. SA covers dictionary-dependent scripts;
+// Javanese and Balinese also require syllable analysis despite their AL class.
+// Reuse the common Unicode providers, with no private range table or allocation.
+fn lexical_character(ch: char) -> bool {
+    !ch.is_ascii() && ch.is_alphabetic()
+        && (ucd::break_property(ch as u32) == BreakClass::ComplexContext
+            || matches!(ch.script(), Script::Javanese | Script::Balinese))
+}
+
+pub fn requires_lexical_fallback(text: &str) -> bool {
+    !text.is_ascii() && text.chars().any(lexical_character)
+}
+
+fn lexical_unit(cluster: &str) -> bool {
+    cluster.chars().find(|ch| !matches!(ucd::break_property(*ch as u32),
+        BreakClass::CombiningMark | BreakClass::ZeroWidthJoiner))
+        .is_some_and(lexical_character)
+}
+
 /// The policy callback selects the containing inline style for each unit.
 /// Untailored paragraphs never invoke it or traverse the grapheme iterator.
 pub fn opportunities_with<'a>(
@@ -83,6 +104,7 @@ pub fn opportunities_with<'a>(
     // AutoPhrase deliberately stays on the Normal opportunity path: this UA
     // has no language-specific phrase detector, for which CSS Text requires
     // the normal fallback.
+    let tailored = tailored || requires_lexical_fallback(text);
     let mut ordinary = ucd::line_breaks(text).peekable();
     let mut clusters = ucd::graphemes(text).peekable();
     core::iter::from_fn(move || {
@@ -118,9 +140,13 @@ pub fn opportunities_with<'a>(
             if manual_sa_pair && kind == Some(BreakOpportunity::Allowed) {
                 kind = None;
             }
+            let lexical_pair = !manual_sa_pair && !cluster.ends_with('\u{200d}')
+                && lexical_unit(cluster)
+                && clusters.peek().is_some_and(|(_, right)| lexical_unit(right));
+            if lexical_pair { kind = Some(BreakOpportunity::Allowed); }
             let letters = letter_unit(cluster)
                 && clusters.peek().is_some_and(|(_, right)| letter_unit(right));
-            if word_break == WordBreak::KeepAll && letters && !intrinsic_anywhere {
+            if word_break == WordBreak::KeepAll && letters && !lexical_pair && !intrinsic_anywhere {
                 kind = None;
             }
             // Explicit joiners still suppress ordinary break-all boundaries.
@@ -144,6 +170,27 @@ pub fn opportunities_with<'a>(
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn specification_lexical_fallback_preserves_units_manual_policy_and_joiners() {
+        let breaks = |text, word| opportunities(text, word, OverflowWrap::Normal, false)
+            .map(|(at, _)| at).collect::<Vec<_>>();
+        for text in ["กข", "ກຂ", "កខ", "ကခ", "ꦏꦑ", "ᬓᬔ"] {
+            assert_eq!(breaks(text, WordBreak::Normal), [3, 6]);
+            assert_eq!(breaks(text, WordBreak::AutoPhrase), [3, 6]);
+            assert_eq!(breaks(text, WordBreak::KeepAll), [3, 6], "dictionary fallback survives keep-all: {text}");
+        }
+        assert_eq!(breaks("ก้ข", WordBreak::Normal), [6, 9]);
+        assert_eq!(breaks("กข", WordBreak::Manual), [6]);
+        assert_eq!(breaks("ꦏꦑ", WordBreak::Manual), [3, 6], "manual targets SA, not syllable analysis");
+        assert_eq!(breaks("ก\u{2060}ข", WordBreak::Normal), [9]);
+        assert_eq!(breaks("ก\u{200d}ข", WordBreak::Normal), [9]);
+        assert_eq!(breaks("ก\u{200b}ข", WordBreak::Normal), [6, 9]);
+        assert_eq!(breaks("กข\nก", WordBreak::Normal), [3, 7, 10]);
+        assert_eq!(breaks("latin", WordBreak::Normal), [5]);
+        assert_eq!(breaks("abc漢字", WordBreak::KeepAll), [9]);
+        assert!(!requires_lexical_fallback("plain Latin text"));
+    }
 
     #[test]
     fn text_break_policy_preserves_clusters_punctuation_and_intrinsic_distinctions() {

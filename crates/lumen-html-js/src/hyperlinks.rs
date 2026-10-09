@@ -186,7 +186,7 @@ fn update_url(node: &DomNode, change: impl FnOnce(&mut Url) -> bool) -> OpResult
 }
 
 macro_rules! hyperlink_element {
-    ($ty:ident, $name:literal) => {
+    ($ty:ident, $name:literal, { $($members:tt)* }) => {
         #[lumen_bind::class(name = $name, extends = DomHtmlElement, hint(js(webidl)))]
         pub(crate) struct $ty {
             pub(crate) base: DomHtmlElement,
@@ -194,6 +194,19 @@ macro_rules! hyperlink_element {
 
         #[lumen_bind::methods]
         impl $ty {
+            #[getter(name = "ping")]
+            fn ping(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_value(&self.base.base.base, "ping") }
+            #[setter(name = "ping", hint(js(ce_reactions)))]
+            fn set_ping(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (&self.base.base.base).set_attribute_core("ping", &value.0) }
+            #[getter(name = "hreflang")]
+            fn hreflang(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("hreflang")?.unwrap_or_default()) }
+            #[setter(name = "hreflang", coerce, hint(js(ce_reactions)))]
+            fn set_hreflang(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("hreflang", value) }
+            #[getter(name = "type")]
+            fn kind(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("type")?.unwrap_or_default()) }
+            #[setter(name = "type", coerce, hint(js(ce_reactions)))]
+            fn set_kind(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("type", value) }
+            $($members)*
             #[constructor]
             fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<crate::custom_elements::HtmlElementCtor> {
                 crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
@@ -348,8 +361,46 @@ macro_rules! hyperlink_element {
     };
 }
 
-hyperlink_element!(DomAnchorElement, "HTMLAnchorElement");
-hyperlink_element!(DomAreaElement, "HTMLAreaElement");
+hyperlink_element!(DomAnchorElement, "HTMLAnchorElement", {
+            #[getter(name = "coords")]
+            fn coords(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("coords")?.unwrap_or_default()) }
+            #[setter(name = "coords", coerce, hint(js(ce_reactions)))]
+            fn set_coords(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("coords", value) }
+            #[getter(name = "charset")]
+            fn charset(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("charset")?.unwrap_or_default()) }
+            #[setter(name = "charset", coerce, hint(js(ce_reactions)))]
+            fn set_charset(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("charset", value) }
+            #[getter(name = "name")]
+            fn name(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("name")?.unwrap_or_default()) }
+            #[setter(name = "name", coerce, hint(js(ce_reactions)))]
+            fn set_name(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("name", value) }
+            #[getter(name = "rev")]
+            fn rev(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("rev")?.unwrap_or_default()) }
+            #[setter(name = "rev", coerce, hint(js(ce_reactions)))]
+            fn set_rev(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("rev", value) }
+            #[getter(name = "shape")]
+            fn shape(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("shape")?.unwrap_or_default()) }
+            #[setter(name = "shape", coerce, hint(js(ce_reactions)))]
+            fn set_shape(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("shape", value) }
+});
+hyperlink_element!(DomAreaElement, "HTMLAreaElement", {
+            #[getter(name = "alt")]
+            fn alt(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("alt")?.unwrap_or_default()) }
+            #[setter(name = "alt", coerce, hint(js(ce_reactions)))]
+            fn set_alt(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("alt", value) }
+            #[getter(name = "coords")]
+            fn coords(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("coords")?.unwrap_or_default()) }
+            #[setter(name = "coords", coerce, hint(js(ce_reactions)))]
+            fn set_coords(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("coords", value) }
+            #[getter(name = "shape")]
+            fn shape(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("shape")?.unwrap_or_default()) }
+            #[setter(name = "shape", coerce, hint(js(ce_reactions)))]
+            fn set_shape(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("shape", value) }
+            #[getter(name = "noHref")]
+            fn no_href(&self) -> OpResult<bool> { Ok((&self.base.base.base).get_null_attribute("nohref")?.is_some()) }
+            #[setter(name = "noHref", coerce, hint(js(ce_reactions)))]
+            fn set_no_href(&self, value: bool) -> OpResult<()> { (&self.base.base.base).set_nullable_attribute_core("nohref", value.then_some("")) }
+});
 
 #[cfg(test)]
 mod tests {

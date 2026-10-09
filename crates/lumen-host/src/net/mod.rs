@@ -38,6 +38,21 @@ pub use fetch::{
 };
 pub use xhr::bindings;
 
+struct ApiBaseUrlProvider(fn(&mut Ctx) -> Option<String>);
+
+/// Register the embedder's native settings-object URL authority.
+pub fn set_api_base_url_provider(ctx:&mut Ctx,provider:fn(&mut Ctx)->Option<String>) {
+    ctx.op_state().put(ApiBaseUrlProvider(provider));
+}
+
+fn native_api_base_url(ctx:&mut Ctx)->Option<String> {
+    let provider=ctx.op_state().get::<ApiBaseUrlProvider>().map(|provider|provider.0)?;
+    provider(ctx)
+}
+
+/// Shared API URL basis for fetch, XHR and streaming web classes.
+pub fn api_base_url(ctx:&mut Ctx)->Option<String> {xhr::document_base(ctx)}
+
 /// Cancellation for a user-agent resource body still being consumed.
 pub struct ResourceBodyControl(std::rc::Rc<fetch_body::Drain>);
 impl ResourceBodyControl {

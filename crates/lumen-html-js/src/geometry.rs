@@ -415,7 +415,7 @@ fn box_metrics(layout_box: Rect, style: &lumen_html::css::Style) -> BoxMetrics {
 pub(crate) fn content_box_size(session: &mut RenderSession, node: NodeId) -> Option<(f32, f32)> {
     let style = session.used_box_style(node).ok()?;
     if style.display == lumen_html::css::Display::None {
-        return Some((0.0, 0.0));
+        return None;
     }
     let layout_box = session.layout_rect(node)?;
     let metrics = box_metrics(layout_box, &style);

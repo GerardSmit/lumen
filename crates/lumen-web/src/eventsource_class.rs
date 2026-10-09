@@ -335,10 +335,11 @@ pub mod bindings {
         #[constructor(coerce)]
         fn constructor(
             ctx: &mut Ctx,
-            url: &str,
+            url: lumen_host::webidl::Usv,
             #[default(Value::Undefined)] init: Value,
         ) -> OpResult<Started<Self>> {
-            let Some(parsed) = parse_url(ctx, url) else {
+            let url = url.0;
+            let Some(parsed) = parse_url(ctx, &url) else {
                 return Err(dom_error(ctx, "SyntaxError", format!("invalid EventSource URL: {url}")));
             };
             let with_credentials = match &init {

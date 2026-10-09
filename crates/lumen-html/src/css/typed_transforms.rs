@@ -52,22 +52,22 @@ impl<'a> TransformInterpolation<'a> {
             let value=header[i];
             if decoded_css_keyword(value,"by") {
                 if saw_global{return None;} i+=1;global_easing=*header.get(i)?;
-                crate::animation::ease(global_easing,0.5)?;saw_global=true;
-            }else if coordinate_expression(value).is_some(){
+                if crate::animation::ease(global_easing,0.5).is_none(){transition_controls::easing(global_easing)?;}saw_global=true;
+            }else if coordinate_expression(value).is_some()||animation_controls::interpolation_timeline(value).is_some(){
                 if progress.replace(value).is_some(){return None;}
             }else{
-                if saw_default{return None;}crate::animation::ease(value,0.5)?;
+                if saw_default{return None;}if crate::animation::ease(value,0.5).is_none(){transition_controls::easing(value)?;}
                 default_easing=value;saw_default=true;
             }
             i+=1;
         }
-        let progress=progress?;let mut absolute=coordinate_type(progress)?;
+        let progress=progress?;let timeline=animation_controls::interpolation_timeline(progress).is_some();let mut absolute=if timeline{None}else{coordinate_type(progress)?};
         let mut has_absolute_stop=false;let mut stops=Vec::new();let mut easing=default_easing;let mut between=false;
         for argument in &arguments[1..]{
             let pair=top_level_split(argument,b':',2)?;
             if pair.len()==1 {
                 if stops.is_empty()||between{return None;}
-                crate::animation::ease(argument,0.5)?;easing=argument;between=true;continue;
+                if crate::animation::ease(argument,0.5).is_none(){transition_controls::easing(argument)?;}easing=argument;between=true;continue;
             }
             if pair.len()!=2{return None;}
             let positions=components(pair[0])?;
@@ -75,6 +75,7 @@ impl<'a> TransformInterpolation<'a> {
             if !decoded_css_keyword(pair[1].trim(),"none"){validated_function_tokens(pair[1])?;}
             for position in positions {
                 if let Some(kind)=coordinate_type(position)? {
+                    if timeline&&kind!=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Px)&&kind!=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::S){return None;}
                     if absolute.is_some_and(|old|old!=kind){return None;}
                     absolute=Some(kind);has_absolute_stop=true;
                 }
@@ -84,7 +85,7 @@ impl<'a> TransformInterpolation<'a> {
             }
             easing=default_easing;between=false;
         }
-        if stops.is_empty()||between||coordinate_type(progress)?.is_some()&&!has_absolute_stop{return None;}
+        if stops.is_empty()||between||!timeline&&coordinate_type(progress)?.is_some()&&!has_absolute_stop{return None;}
         Some(Self{progress,global_easing,stops})
     }
     fn selected(&self,mut resolve:impl FnMut(typed_numeric::NumericValue)->Option<typed_numeric::NumericValue>)->Option<(&'a str,&'a str,f64)> {
@@ -130,6 +131,17 @@ pub(super) fn has_deferred_interpolation(input:&str)->bool {
     function_tokens(input).is_some_and(|functions|functions.iter().any(|function|function.name=="transform-interpolate"))
 }
 
+/// Detect only canonical map progress sources. Numeric maps and ordinary
+/// transform functions keep the existing allocation-free caller gate.
+pub(super) fn has_timeline_progress(input:&str)->bool {
+    if !has_deferred_interpolation(input){return false;}
+    let Some(functions)=validated_function_tokens(input) else{return false;};
+    functions.iter().filter(|function|function.name=="transform-interpolate").any(|function|
+        TransformInterpolation::parse(&function.arguments).is_some_and(|map|
+            animation_controls::interpolation_timeline(map.progress).is_some()
+            ||map.stops.iter().any(|stop|has_timeline_progress(stop.value))))
+}
+
 /// Initial registrations use the same numeric unit authority recursively
 /// through modern map coordinates and transform values.
 pub(super) fn computationally_independent(input:&str)->bool {
@@ -138,8 +150,8 @@ pub(super) fn computationally_independent(input:&str)->bool {
     functions.iter().all(|function| {
         if function.name=="transform-interpolate" {
             return TransformInterpolation::parse(&function.arguments).is_some_and(|map|
-                coordinate_expression(map.progress).is_some_and(independent)&&map.stops.iter().all(|stop|
-                    coordinate_expression(stop.position).is_some_and(independent)&&
+                coordinate_expression(map.progress).is_some_and(independent)&&transition_controls::computationally_independent_easing(map.global_easing)&&map.stops.iter().all(|stop|
+                    transition_controls::computationally_independent_easing(stop.easing)&&coordinate_expression(stop.position).is_some_and(independent)&&
                     (decoded_css_keyword(stop.value,"none")||computationally_independent(stop.value))));
         }
         function.arguments.iter().enumerate().all(|(index,raw)|
@@ -195,8 +207,22 @@ pub fn argument_expression(raw: &str, kind: TransformArgument) -> Option<typed_n
 /// interpolation maps and 3D operations use the same sparse slot source carrier
 /// and canonical matrix codec, preserving percentages and owner dependencies.
 pub(super) fn requires_source_carrier(input:&str)->bool {
-    function_tokens(input).is_some_and(|functions|functions.iter().any(|function|matches!(function.name.as_str(),
-        "transform-interpolate"|"matrix3d"|"translatez"|"translate3d"|"scalez"|"scale3d"|"rotatex"|"rotatey"|"rotatez"|"rotate3d"|"perspective")))
+    function_tokens(input).is_some_and(|functions|functions.iter().any(|function| {
+        if matches!(function.name.as_str(),"transform-interpolate"|"matrix3d"|"translatez"|"translate3d"|"scalez"|"scale3d"|"rotatex"|"rotatey"|"rotatez"|"rotate3d"|"perspective"){return true;}
+        if function.name!="rotate" || function.arguments.len()!=1{return false;}
+        let raw=function.arguments[0];
+        let Some(expression)=argument_expression(raw,TransformArgument::Angle) else{return false;};
+        let Some(degrees)=resolved_argument_scalar(&expression,None) else{return true;};
+        let legacy=angle(raw).unwrap_or((degrees*core::f64::consts::PI/180.0)as f32);
+        let legacy_quarter=lumen_common::dom_geometry::exact_quarter_turn_radians_f32(legacy);
+        // Compare the actual quadrant as well as integral-quarter admission:
+        // large authored angles can lose whole quadrants in f32 conversion.
+        // Near-quarter collisions likewise retain canonical f64 evaluation.
+        if degrees.rem_euclid(90.0)==0.0 {
+            let precise=lumen_common::dom_geometry::sin_cos_degrees(degrees);
+            legacy_quarter.is_none_or(|(s,c)|(f64::from(s),f64::from(c))!=precise)
+        }else{legacy_quarter.is_some()}
+    }))
 }
 
 pub fn validated_function_tokens(input: &str) -> Option<Vec<TransformFunction<'_>>> {
@@ -279,7 +305,24 @@ fn computed_with(input:&str,resolve:&mut dyn FnMut(typed_numeric::NumericValue)-
 }
 
 fn computed_interpolation(arguments:&[&str],resolve:&mut dyn FnMut(typed_numeric::NumericValue)->Option<typed_numeric::NumericValue>)->Option<String> {
-    let map=TransformInterpolation::parse(arguments)?;
+    let mut map=TransformInterpolation::parse(arguments)?;
+    // CSS progress sources here name scroll/view timelines. Their coordinate
+    // is a length; a time-typed absolute map is grammatically valid but cannot
+    // compute against that coordinate (Values 5 interpolation progress).
+    if animation_controls::interpolation_timeline(map.progress).is_some()
+        &&map.stops.iter().filter_map(|stop|coordinate_type(stop.position).flatten()).any(|kind|kind==typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::S)){return None;}
+    // Literal timings retain the existing borrowed sampling path. Only a
+    // calculated or decoded timing needs source computation before selection.
+    let contextual_easing=core::iter::once(map.global_easing).chain(map.stops.iter().map(|stop|stop.easing))
+        .any(|raw|crate::animation::ease(raw,0.5).is_none());
+    let easings=if contextual_easing {
+        Some(core::iter::once(map.global_easing).chain(map.stops.iter().map(|stop|stop.easing))
+            .map(|raw|transition_controls::computed_easing_with(raw,&mut *resolve)).collect::<Option<Vec<_>>>()?)
+    }else{None};
+    if let Some(easings)=&easings {
+        map.global_easing=&easings[0];
+        for (stop,easing) in map.stops.iter_mut().zip(&easings[1..]){stop.easing=easing;}
+    }
     let transform=|raw:&str,resolve:&mut dyn FnMut(typed_numeric::NumericValue)->Option<typed_numeric::NumericValue>| {
         if decoded_css_keyword(raw,"none"){Some("none".into())}else{computed_with(raw,resolve)}
     };
@@ -297,12 +340,12 @@ fn computed_interpolation(arguments:&[&str],resolve:&mut dyn FnMut(typed_numeric
     };
     let mut header=Vec::new();
     for value in components(arguments[0])? {
-        header.push(if coordinate_expression(value).is_some(){freeze(value,resolve)?}else{value.to_string()});
+        header.push(if coordinate_expression(value).is_some(){freeze(value,resolve)?}else if animation_controls::interpolation_timeline(value).is_some(){animation_controls::computed_interpolation_timeline(value,resolve)?}else if decoded_css_keyword(value,"by"){String::from("by")}else{transition_controls::computed_easing_with(value,&mut *resolve)?});
     }
     result.push(header.join(" "));
     for argument in &arguments[1..] {
         let pair=top_level_split(argument,b':',2)?;
-        if pair.len()==1{result.push(argument.trim().to_string());continue;}
+        if pair.len()==1{result.push(transition_controls::computed_easing_with(argument,&mut *resolve)?);continue;}
         let positions=components(pair[0])?.into_iter().map(|raw|freeze(raw,resolve)).collect::<Option<Vec<_>>>()?;
         result.push(alloc::format!("{}: {}",positions.join(" "),transform(pair[1].trim(),resolve)?));
     }
@@ -310,6 +353,37 @@ fn computed_interpolation(arguments:&[&str],resolve:&mut dyn FnMut(typed_numeric
     if value.len()>MAX_VARIABLE_BYTES{return None;}
     function_tokens(&value)?;
     Some(value)
+}
+
+/// Resolve owner-qualified progress sources only when the caller can supply
+/// actual timeline coordinates. Other computed arguments and source tokens
+/// stay in the canonical transform representation until reference boxes exist.
+pub(crate) fn resolve_timeline_progress(input:&str,progress:&mut dyn FnMut(&str,Option<typed_numeric::NumericType>)->Option<typed_numeric::NumericValue>)->Option<String>{
+    if decoded_css_keyword(input.trim(),"none"){return Some("none".into());}
+    let mut result=String::new();
+    for function in validated_function_tokens(input)?{
+        if function.name!="transform-interpolate"{
+            append_function(&mut result,&ComputedFunction::from_token(function)?.serialize()?)?;continue;
+        }
+        let map=TransformInterpolation::parse(&function.arguments)?;
+        let absolute=map.stops.iter().find_map(|stop|coordinate_type(stop.position).flatten());
+        let sampled=if animation_controls::interpolation_timeline(map.progress).is_some(){Some(progress(map.progress,absolute)?)}else{None};
+        let mut arguments=Vec::new();
+        let mut header=Vec::new();
+        for component in components(function.arguments[0])?{
+            header.push(if component==map.progress&&sampled.is_some(){let value=sampled?;typed_numeric::serialize_numeric_value(value.value,value.unit)}else{component.to_string()});
+        }
+        arguments.push(header.join(" "));
+        for argument in &function.arguments[1..]{
+            let pair=top_level_split(argument,b':',2)?;
+            arguments.push(if pair.len()==2{alloc::format!("{}: {}",pair[0],resolve_timeline_progress(pair[1].trim(),progress)?)}else{argument.to_string()});
+        }
+        let borrowed=arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut identity=|value:typed_numeric::NumericValue|Some(value);
+        let value=computed_interpolation(&borrowed,&mut identity)?;
+        append_function(&mut result,&value)?;
+    }
+    Some(result)
 }
 
 // Animation extends the same validated transform token representation. Numeric
@@ -562,6 +636,23 @@ pub(crate) fn combine_resolved(from:&[Transform],to:&[Transform],operation:regis
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn specification_transform_map_timings_share_context_computation_and_initial_independence() {
+        use typed_numeric::{NumericUnit as U,NumericValue};
+        let source="transform-interpolate(0.4 by StEpS(calc(1em / 5px), JuMp-EnD), 0: translateX(0px), 1: translateX(100px))";
+        assert!(validated_function_tokens(source).is_some(),"map admission uses the same calculated steps grammar as transition timing");
+        let owner=|em|move|value:NumericValue|Some(if value.unit==U::Em{NumericValue{value:value.value*em,unit:U::Px}}else{value});
+        assert_eq!(computed(source,owner(20.0)).as_deref(),Some("translateX(25px)"));
+        assert_eq!(computed(source,owner(40.0)).as_deref(),Some("translateX(37.5px)"));
+        let default="transform-interpolate(0.4 steps(calc(4)), 0: translateX(0px), 1: translateX(100px))";
+        let between="transform-interpolate(0.4, 0: translateX(0px), steps(calc(4)), 1: translateX(100px))";
+        for source in [default,between]{assert_eq!(computed(source,Some).as_deref(),Some("translateX(25px)"));}
+        assert!(!computationally_independent(source),"font-dependent global easing is not a valid computationally independent initial value");
+        assert!(!computationally_independent("transform-interpolate(0.4 steps(calc(1cqw / 5px)), 0: scale(1), 1: scale(2))"));
+        assert!(!computationally_independent("transform-interpolate(0.4, 0: scale(1), steps(sibling-index()), 1: scale(2))"));
+        assert!(computationally_independent("transform-interpolate(0.4 by steps(calc(1vw / 5px)), 0: scale(1), 1: scale(2))"),"viewport dimensions remain computationally independent");
+    }
+
     #[test]
     fn specification_transform_map_progress_uses_shared_numeric_math() {
         let context=static_length_context();

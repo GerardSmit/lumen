@@ -28,7 +28,7 @@ impl<'a> FromArg<'a, JsHost> for FocusOptions {
 
 pub(crate) fn focus_element(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, options: FocusOptions) -> OpResult<()> {
     let (realm,node)=realm.resolve_adopted_node(node);
-    if !allow_focus(&realm) { return Ok(()); }
+    if !allow_focus_with_context(Some(ctx),&realm) { return Ok(()); }
     realm.focus(ctx, Some(node))?;
     if let Some(visible)=options.focus_visible {
         realm.focus_visible.set(if visible { realm.focused_node() } else { None });
@@ -103,10 +103,19 @@ macro_rules! bind_focus_mixin {
 }
 pub(crate) use bind_focus_mixin;
 
+struct PendingAutofocusCandidate {
+    node: NodeId,
+    sequence: u64,
+    // Live insertion has already passed the insertion-time permission checks.
+    // A host's pre-parsed document is initialized before its navigable is bound;
+    // only that bootstrap snapshot still needs the shared admission checks.
+    permission_checked: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct AutofocusState {
     processed: bool,
-    pending: Vec<(NodeId,u64)>,
+    pending: Vec<PendingAutofocusCandidate>,
     candidates: Vec<(std::rc::Weak<DomRealm>,NodeId,u64)>,
     blocking_stylesheets: HashMap<NodeId,usize>,
     admission_failed: bool,
@@ -284,30 +293,43 @@ pub(crate) fn focus_in_realm(ctx: &mut Ctx, owner: &Rc<DomRealm>, node: NodeId) 
         .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?
 }
 
-fn queue_subtree(state: &mut AutofocusState, document: &lumen_html::Document, root: NodeId) {
+fn autofocus_candidates(document:&lumen_html::Document,root:NodeId)->impl Iterator<Item=NodeId>+'_ {
     let mut cursor=Some(root);
-    while let Some(node)=cursor {
-        if document.is_connected_element(node) && document.get_attribute_ns_ref(node,None,"autofocus").ok().flatten().is_some() {
-            state.pending.retain(|(candidate,_)|*candidate!=node);
-            let sequence=INSERTION_SEQUENCE.try_update(Ordering::Relaxed,Ordering::Relaxed,|value|value.checked_add(1));
-            if let Ok(sequence)=sequence {
-                if state.pending.try_reserve(1).is_ok() { state.pending.push((node,sequence)); }
-                else {state.admission_failed=true;}
-            } else {state.admission_failed=true;}
+    std::iter::from_fn(move||{
+        while let Some(node)=cursor {
+            cursor=selector::next_shadow_including_descendant(document,root,node).ok().flatten();
+            if document.is_connected_element(node)&&document.get_attribute_ns_ref(node,None,"autofocus").ok().flatten().is_some(){return Some(node);}
         }
-        cursor=selector::next_shadow_including_descendant(document,root,node).ok().flatten();
-    }
+        None
+    })
 }
-
-pub(crate) fn observe_insertion(realm: &Rc<DomRealm>, document: &lumen_html::Document,
-    mutation: &lumen_html::observe::ObservedMutation) {
-    if !active(realm) || top_document(realm).is_some_and(|top|top.autofocus.borrow().processed) { return; }
-    for node in mutation.kind.added_nodes() { queue_subtree(&mut realm.autofocus.borrow_mut(),document,node); }
+fn queue_candidate(state:&mut AutofocusState,node:NodeId,permission_checked:bool){
+    state.pending.retain(|candidate|candidate.node!=node);
+    let sequence=INSERTION_SEQUENCE.try_update(Ordering::Relaxed,Ordering::Relaxed,|value|value.checked_add(1));
+    if let Ok(sequence)=sequence {
+        if state.pending.try_reserve(1).is_ok(){state.pending.push(PendingAutofocusCandidate{node,sequence,permission_checked});}
+        else{state.admission_failed=true;}
+    }else{state.admission_failed=true;}
 }
-
-pub(crate) fn initial_candidates(realm: &Rc<DomRealm>) {
-    let session=realm.session.borrow();
-    queue_subtree(&mut realm.autofocus.borrow_mut(),session.document(),session.document().root());
+pub(crate) fn observe_insertion(realm:&Rc<DomRealm>,document:&lumen_html::Document,mutation:&lumen_html::observe::ObservedMutation){
+    if !active(realm)||realm.lifecycle.sandboxed_automatic_features.get(){return;}
+    let processed=top_document(realm).is_some_and(|top|top.autofocus.borrow().processed);
+    for root in mutation.kind.added_nodes(){for node in autofocus_candidates(document,root){
+        // Policy use is an autofocus candidate's insertion step. Unrelated
+        // attribute/child mutations neither check nor report that feature.
+        if !allow_focus(realm)||processed{continue;}
+        queue_candidate(&mut realm.autofocus.borrow_mut(),node,true);
+    }}
+}
+pub(crate) fn initial_candidates(realm:&Rc<DomRealm>){
+    // Native root installation publishes its response identity immediately
+    // afterward. Its parsed candidates must observe that response's policy.
+    let permission_checked=active(realm)&&realm.document_identity.url.borrow().is_some();
+    if permission_checked&&realm.lifecycle.sandboxed_automatic_features.get(){return;}
+    let session=realm.session.borrow();let document=session.document();
+    let mut candidates=autofocus_candidates(document,document.root()).peekable();
+    if candidates.peek().is_none(){return;}
+    for node in candidates{if !permission_checked||allow_focus(realm){queue_candidate(&mut realm.autofocus.borrow_mut(),node,permission_checked);}}
 }
 
 fn active(realm: &Rc<DomRealm>) -> bool {
@@ -316,16 +338,12 @@ fn active(realm: &Rc<DomRealm>) -> bool {
 
 fn top_document(realm: &Rc<DomRealm>) -> Option<Rc<DomRealm>> { realm.navigation_context()?.top_document() }
 
-pub(crate) fn allow_focus(realm: &Rc<DomRealm>) -> bool {
-    if realm.has_transient_user_activation() { return true; }
-    let Some(origin)=realm.document_origin() else { return false; };
-    let mut context=realm.navigation_context();
-    while let Some(current)=context {
-        if current.current_document().is_some_and(|document|
-            document.document_origin().is_none_or(|ancestor|!origin.same_origin(&ancestor))) { return false; }
-        context=current.parent_navigation_context();
-    }
-    true
+pub(crate) fn allow_focus(realm: &Rc<DomRealm>) -> bool {allow_focus_with_context(None,realm)}
+
+/// HTML allow-focus uses the target Document, in this order, for element,
+/// navigable and autofocus consumers. Script caller policy is not substituted.
+pub(crate) fn allow_focus_with_context(ctx:Option<&mut Ctx>,realm:&Rc<DomRealm>)->bool {
+    realm.use_permissions_policy(ctx,super::permissions_policy::FOCUS) || realm.has_transient_user_activation()
 }
 
 pub(crate) fn mark_processed(realm: &Rc<DomRealm>) {
@@ -338,11 +356,13 @@ pub(crate) fn mark_processed(realm: &Rc<DomRealm>) {
 pub(crate) fn admit_candidates(realm: &Rc<DomRealm>) -> OpResult<()> {
     if realm.autofocus.borrow().admission_failed { return Err(OpError::new("QuotaExceededError","autofocus candidate admission")); }
     let pending=std::mem::take(&mut realm.autofocus.borrow_mut().pending);
-    if !active(realm) || !allow_focus(realm) || realm.lifecycle.sandboxed_automatic_features.get() { return Ok(()); }
+    if !active(realm) { return Ok(()); }
     let Some(top)=top_document(realm) else { return Ok(()); };
     let mut state=top.autofocus.borrow_mut();
-    if state.processed { return Ok(()); }
-    for (node,sequence) in pending {
+    for candidate in pending {
+        if !candidate.permission_checked && (realm.lifecycle.sandboxed_automatic_features.get() || !allow_focus(realm)) { continue; }
+        if state.processed { continue; }
+        let PendingAutofocusCandidate{node,sequence,..}=candidate;
         state.candidates.retain(|(owner,candidate,_)|*candidate!=node || !owner.ptr_eq(&Rc::downgrade(realm)));
         state.candidates.try_reserve(1).map_err(|_|OpError::new("QuotaExceededError","autofocus candidate allocation"))?;
         state.candidates.push((Rc::downgrade(realm),node,sequence));
@@ -350,7 +370,40 @@ pub(crate) fn admit_candidates(realm: &Rc<DomRealm>) -> OpResult<()> {
     Ok(())
 }
 
+/// Complete the native parse/replay insertion phase when response policy and
+/// actual document ownership have been published, before author scripts. This
+/// only admits candidates; focusing still belongs to the rendering checkpoint.
+/// Preserve the existing producer-failure flag rather than abandoning a
+/// published navigation or hiding an admission allocation failure.
+pub(crate) fn admit_created_document(realm:&Rc<DomRealm>){
+    if admit_candidates(realm).is_err(){realm.autofocus.borrow_mut().admission_failed=true;}
+}
+pub(crate) fn response_policy_ready(realm:&DomRealm){
+    let Some(context)=realm.browsing_context().filter(|context|browsing_context::is_active_document(context,realm)) else{return;};
+    if let Some(document)=context.document(){admit_created_document(&document);}
+}
+
+/// HTML update-the-rendering steps reveal the document, then flush the
+/// top-level document's autofocus candidates before animation-frame callbacks.
+/// Reuse the same fragment and focusing authorities as the later layout phase;
+/// this checkpoint does not run layout observers, paint or a second evaluator.
+pub(crate) fn rendering_checkpoint(ctx:&mut Ctx,timestamp:f64)->OpResult<()> {
+    let Some(document)=super::window_globals::current_dom_realm(ctx) else{return Ok(());};
+    if !active(&document) {return Ok(());}
+    // A rendering task queued by a child still processes the eligible top-level
+    // document first. RAF ownership remains with the caller's document.
+    let Some(top)=top_document(&document) else{return Ok(());};
+    if !active(&top) || top.lifecycle.hidden.get() || top.rendering_blocked_at(timestamp) {return Ok(());}
+    let Some(handle)=top.relevant_host_realm(ctx) else{return Ok(());};
+    ctx.with_host_realm(&handle,|ctx| {
+        super::navigation_lifecycle::reveal(ctx)?;
+        super::fragment::checkpoint(ctx,&top,false)?;
+        flush_autofocus(ctx,&top)
+    }).map_err(|error|OpError::new("InvalidStateError",error.to_string()))?
+}
+
 pub(crate) fn flush_autofocus(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
+    if !active(realm) || !realm.navigation_context().is_some_and(|context|context.is_top_level()) {return Ok(());}
     let Some(top)=top_document(realm) else { return Ok(()); };
     if top.autofocus.borrow().processed { return Ok(()); }
     let mut pending=vec![top.clone()];
