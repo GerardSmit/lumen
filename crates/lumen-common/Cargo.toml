@@ -80,11 +80,11 @@ rusty_h264-common = { version = "=0.16.0", default-features = false, features = 
 rusty_aac = { version = "=0.5.0", default-features = false, optional = true }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
-# browser and bare-metal builds use the pure-Rust ruzstd.
-[target.'cfg(not(any(target_arch = "wasm32", target_os = "none")))'.dependencies]
+# browser, bare-metal and musl (Bitnest app) builds use the pure-Rust ruzstd, so no C sysroot is needed.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "none", target_env = "musl")))'.dependencies]
 zstd = { version = "0.13", optional = true }
 
-[target.'cfg(any(target_arch = "wasm32", target_os = "none"))'.dependencies]
+[target.'cfg(any(target_arch = "wasm32", target_os = "none", target_env = "musl"))'.dependencies]
 ruzstd = { version = "0.8", optional = true }
 
 [dev-dependencies]
