@@ -42,7 +42,7 @@ use crate::value::{
 };
 pub use lumen_bind::Slot;
 use lumen_bind::{
-    BigInt, Class, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet, Make, Methods,
+    BigInt, Class, ClassDesc, ConstItem, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet, Make, Methods,
     Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State, StateHost,
     flags,
 };
@@ -315,16 +315,28 @@ impl<'s> ArgCx<'s> {
 
     /// Run `f` with the interpreter (the `&mut Ctx` handoff). Buffers borrowed so far are lent
     /// first, so JS run by `f` cannot invalidate them.
+    #[inline(always)]
     pub fn with_ctx<R>(&self, f: impl FnOnce(&mut Interp) -> R) -> R {
+        let mut f = Some(f);
+        let mut out = None;
+        self.with_ctx_dyn(&mut |ctx| {
+            if let Some(f) = f.take() {
+                out = Some(f(ctx));
+            }
+        });
+        out.expect("with_ctx closure ran")
+    }
+
+    #[inline(never)]
+    fn with_ctx_dyn(&self, f: &mut dyn FnMut(&mut Interp)) {
         self.before_js();
         // SAFETY: `in_ctx` makes every other interpreter access through `self` panic until `f`
         // returns, so this is the only live `&mut Interp`.
         let ctx = unsafe { self.interp_mut() };
         let reset = ResetOnDrop(&self.in_ctx);
         self.in_ctx.set(true);
-        let r = f(ctx);
+        f(ctx);
         drop(reset);
-        r
     }
 
     /// Run `f` with the host state slot `T` (see [`State`]). Throws when the embedder never
@@ -763,7 +775,13 @@ impl<'s> ArgCx<'s> {
 
     /// Finish a class constructor: wrap the Rust value in an instance whose prototype comes
     /// from `new.target` (so JS subclasses get their own prototype and still pass brand checks).
+    #[inline(always)]
     fn construct<T: Class>(&self, value: T) -> Result<Value, Value> {
+        self.construct_erased(ErasedInstance::new(value))
+    }
+
+    #[inline(never)]
+    fn construct_erased(&self, instance: ErasedInstance) -> Result<Value, Value> {
         self.before_js();
         let nt = self
             .scratch_ref()
@@ -774,11 +792,11 @@ impl<'s> ArgCx<'s> {
         // instance already allocated as `this`: attach the Rust value to it directly (returning
         // it unchanged, so the engine's native-parent graft has nothing to move).
         if let Value::Obj(o) = self.this {
-            attach_instance(ctx, o, value);
+            attach_instance(ctx, o, instance);
             return Ok(self.this.clone());
         }
-        let Some((_, class_proto)) = resolved_class::<T>(ctx) else {
-            return Err(unregistered::<T>(ctx));
+        let Some((_, class_proto)) = resolved_class(ctx, instance.ty, instance.desc) else {
+            return Err(unregistered(ctx, instance.desc));
         };
         let proto = match &nt {
             Value::Obj(_) => match ctx.get_member(&nt, "prototype").map_err(abrupt_value)? {
@@ -787,51 +805,75 @@ impl<'s> ArgCx<'s> {
             },
             _ => class_proto,
         };
-        Ok(new_instance(ctx, value, proto))
+        Ok(new_instance(ctx, instance, proto))
     }
 
     pub(crate) fn class_rc<T: Class>(&self, v: &Value, at: Slot) -> Result<Rc<RefCell<T>>, Value> {
         match host_data(self.interp(), v).and_then(|d| d.downcast::<RefCell<T>>().ok()) {
             Some(rc) => Ok(rc),
-            None if at == Slot::THIS && T::DESC.hint("js", "invalid_this").is_some() => {
-                let msg = format!("Value of \"this\" must be of type {}", class_name::<T>());
-                let error = self.interp().make_error("TypeError", msg);
-                if let Value::Obj(object) = &error {
-                    object
-                        .borrow_mut()
-                        .props
-                        .insert("code", Property::plain(Value::str("ERR_INVALID_THIS")));
-                }
-                Err(error)
-            }
-            None if at == Slot::THIS => {
-                let msg = format!(
-                    "{}: illegal invocation (receiver is not a {})",
-                    self.label(),
-                    class_name::<T>()
-                );
-                Err(self.interp().make_error("TypeError", msg))
-            }
-            None => Err(self.type_error(at, &format!("must be a {}", class_name::<T>()))),
+            None => Err(self.not_a_class(at, T::DESC)),
         }
     }
 
-    /// Borrow a class instance shared (`&self` receivers, `&T` arguments).
-    pub fn class_ref<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a T, Value> {
-        if let Some(entry) = host_entry(self.interp(), v) {
-            if let Ok((ptr, guard)) = (entry.view_ref)(&entry.data, TypeId::of::<T>()) {
-                // The erased guard retains the allocation and its shared borrow.
-                let value = unsafe { &*ptr }
-                    .downcast_ref::<T>()
-                    .expect("matching class view");
-                self.retain_class_guard(guard);
-                return Ok(value);
+    #[cold]
+    #[inline(never)]
+    fn not_a_class(&self, at: Slot, desc: &'static ClassDesc) -> Value {
+        let name = desc.name_for("js");
+        if at == Slot::THIS && desc.hint("js", "invalid_this").is_some() {
+            let msg = format!("Value of \"this\" must be of type {name}");
+            let error = self.interp().make_error("TypeError", msg);
+            if let Value::Obj(object) = &error {
+                object
+                    .borrow_mut()
+                    .props
+                    .insert("code", Property::plain(Value::str("ERR_INVALID_THIS")));
             }
+            return error;
         }
+        if at == Slot::THIS {
+            let msg = format!(
+                "{}: illegal invocation (receiver is not a {name})",
+                self.label(),
+            );
+            return self.interp().make_error("TypeError", msg);
+        }
+        self.type_error(at, &format!("must be a {name}"))
+    }
+
+    #[inline(never)]
+    fn view_shared(&self, v: &Value, ty: TypeId) -> Option<*const dyn Any> {
+        let entry = host_entry(self.interp(), v)?;
+        let (ptr, guard) = (entry.view_ref)(&entry.data, ty).ok()?;
+        self.retain_class_guard(guard);
+        Some(ptr)
+    }
+
+    #[inline(never)]
+    fn view_exclusive(&self, v: &Value, ty: TypeId) -> Option<*mut dyn Any> {
+        let entry = host_entry(self.interp(), v)?;
+        let (ptr, guard) = (entry.view_mut)(&entry.data, ty).ok()?;
+        self.retain_class_guard(guard);
+        Some(ptr)
+    }
+
+    /// Borrow a class instance shared (`&self` receivers, `&T` arguments).
+    #[inline(always)]
+    pub fn class_ref<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a T, Value> {
+        if let Some(ptr) = self.view_shared(v, TypeId::of::<T>()) {
+            // The erased guard retains the allocation and its shared borrow.
+            return Ok(unsafe { &*ptr }
+                .downcast_ref::<T>()
+                .expect("matching class view"));
+        }
+        self.class_ref_slow::<T>(v, at)
+    }
+
+    #[inline(never)]
+    fn class_ref_slow<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a T, Value> {
         let rc = self.class_rc::<T>(v, at)?;
         let r = match rc.try_borrow() {
             Ok(r) => r,
-            Err(_) => return Err(self.borrow_conflict::<T>(at)),
+            Err(_) => return Err(self.borrow_conflict(at, T::DESC)),
         };
         // SAFETY: the guard keeps `rc` (and so the RefCell) alive, and drops the `Ref` first.
         let r: std::cell::Ref<'static, T> = unsafe { std::mem::transmute(r) };
@@ -847,20 +889,23 @@ impl<'s> ArgCx<'s> {
     /// Borrow a class instance exclusively (`&mut self` receivers, `&mut T` arguments). A
     /// conflicting borrow (re-entrant call on the same instance) throws a TypeError.
     #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
     pub fn class_mut<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a mut T, Value> {
-        if let Some(entry) = host_entry(self.interp(), v) {
-            if let Ok((ptr, guard)) = (entry.view_mut)(&entry.data, TypeId::of::<T>()) {
-                let value = unsafe { &mut *ptr }
-                    .downcast_mut::<T>()
-                    .expect("matching class view");
-                self.retain_class_guard(guard);
-                return Ok(value);
-            }
+        if let Some(ptr) = self.view_exclusive(v, TypeId::of::<T>()) {
+            return Ok(unsafe { &mut *ptr }
+                .downcast_mut::<T>()
+                .expect("matching class view"));
         }
+        self.class_mut_slow::<T>(v, at)
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    #[inline(never)]
+    fn class_mut_slow<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a mut T, Value> {
         let rc = self.class_rc::<T>(v, at)?;
         let r = match rc.try_borrow_mut() {
             Ok(r) => r,
-            Err(_) => return Err(self.borrow_conflict::<T>(at)),
+            Err(_) => return Err(self.borrow_conflict(at, T::DESC)),
         };
         // SAFETY: as in `class_ref`.
         let mut r: std::cell::RefMut<'static, T> = unsafe { std::mem::transmute(r) };
@@ -874,12 +919,13 @@ impl<'s> ArgCx<'s> {
     }
 
     #[cold]
-    fn borrow_conflict<T: Class>(&self, at: Slot) -> Value {
+    #[inline(never)]
+    fn borrow_conflict(&self, at: Slot, desc: &'static ClassDesc) -> Value {
         self.type_error(
             at,
             &format!(
                 "is a {} already in use by an enclosing call (re-entrant borrow)",
-                class_name::<T>()
+                desc.name_for("js")
             ),
         )
     }
@@ -1293,17 +1339,29 @@ impl Interp {
 // The host
 // =============================================================================================
 
-#[inline(always)]
+type NativeCall = for<'a, 'b> fn(&'a ArgCx<'b>) -> Result<Value, Value>;
+
 fn js_entry<N: Native<JsHost>>(
     ctx: &mut Interp,
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-    if matches!(N::DESC.role, Role::Constructor) {
-        return js_construct::<N>(ctx, this, args);
+    run_entry(ctx, this, args, N::DESC, N::call)
+}
+
+#[inline(never)]
+fn run_entry(
+    ctx: &mut Interp,
+    this: Value,
+    args: &[Value],
+    desc: &'static FnDesc,
+    call: NativeCall,
+) -> Result<Value, Value> {
+    if matches!(desc.role, Role::Constructor) {
+        return run_construct(ctx, this, args, desc, call);
     }
-    let cx = ArgCx::new(ctx, &this, args, N::DESC);
-    let result = N::call(&cx);
+    let cx = ArgCx::new(ctx, &this, args, desc);
+    let result = call(&cx);
     let operation_end = cx.operation_end.take();
     drop(cx);
     if let Some(end) = operation_end { end(ctx); }
@@ -1312,23 +1370,25 @@ fn js_entry<N: Native<JsHost>>(
 }
 
 #[inline(never)]
-fn js_construct<N: Native<JsHost>>(
+fn run_construct(
     ctx: &mut Interp,
     this: Value,
     args: &[Value],
+    desc: &'static FnDesc,
+    call: NativeCall,
 ) -> Result<Value, Value> {
     if !ctx.constructing {
-        let name = match N::DESC.owner {
+        let name = match desc.owner {
             Owner::Class(c) => c.name_for("js"),
-            _ => N::DESC.name,
+            _ => desc.name,
         };
         let msg = format!("Class constructor {name} cannot be invoked without 'new'");
         return Err(ctx.make_error("TypeError", msg));
     }
     let nt = ctx.new_target.clone();
-    let cx = ArgCx::new(ctx, &this, args, N::DESC);
+    let cx = ArgCx::new(ctx, &this, args, desc);
     cx.scratch().new_target = Some(nt);
-    let result = N::call(&cx);
+    let result = call(&cx);
     let operation_end = cx.operation_end.take();
     drop(cx);
     if let Some(end) = operation_end { end(ctx); }
@@ -1391,6 +1451,47 @@ impl ArgCx<'_> {
     }
 }
 
+#[inline(never)]
+fn validate_receiver_of(cx: &ArgCx<'_>, value: &Value, ty: TypeId) -> Result<(), Value> {
+    cx.with_ctx(|ctx| {
+        ctx.check_instance(value, ty).map_err(|error| error.to_value(ctx))
+    })
+}
+
+#[inline(never)]
+fn bind_slots<'c>(cx: &'c ArgCx<'_>, slots: &mut [Option<&'c Value>]) -> Result<(), Value> {
+    let args: &'c [Value] = cx.args;
+    let max = cx.desc.max_pos as usize;
+    let min = cx.desc.min_pos as usize;
+    // Attribute setters convert an omitted first argument from undefined.
+    // Their required value slot is not an operation's arity check.
+    if args.len() < min && !matches!(cx.desc.role, Role::Setter) {
+        return Err(cx.missing_argument(Slot::arg(args.len() as u32)));
+    }
+    // Keyword-only parameters after `*args` cannot be passed positionally.
+    let positional = if slots.len() > max && cx.desc.has_varargs() {
+        max
+    } else {
+        slots.len()
+    };
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = match args.get(i) {
+            Some(value @ Value::Undefined)
+                if i < positional
+                    && cx.desc.params.get(i).is_some_and(|parameter| {
+                        parameter.pass_undefined || !parameter.optional()
+                    }) =>
+            {
+                Some(value)
+            }
+            Some(Value::Undefined) | None => None,
+            Some(v) if i < positional => Some(v),
+            Some(_) => None,
+        };
+    }
+    Ok(())
+}
+
 impl Host for JsHost {
     const NAME: &'static str = "js";
     type Value = Value;
@@ -1415,8 +1516,7 @@ impl Host for JsHost {
     }
 
     fn validate_receiver<T: Class>(cx: &ArgCx<'_>, value: &Value) -> Result<(), Value> {
-        cx.with_ctx(|ctx| ctx.with_instance::<T, _>(value, |_| ())
-            .map_err(|error| error.to_value(ctx)))
+        validate_receiver_of(cx, value, TypeId::of::<T>())
     }
 
     /// JS has no keywords: named parameters are the arguments in declaration order. For optional
@@ -1424,33 +1524,9 @@ impl Host for JsHost {
     /// as a supplied value for Web IDL coercion; `Passed<T>` also distinguishes it from omission.
     #[inline(always)]
     fn bind<'c, const N: usize>(cx: &'c ArgCx<'_>) -> Result<[Option<&'c Value>; N], Value> {
-        let args: &'c [Value] = cx.args;
-        let max = cx.desc.max_pos as usize;
-        let min = cx.desc.min_pos as usize;
-        // Attribute setters convert an omitted first argument from undefined.
-        // Their required value slot is not an operation's arity check.
-        if args.len() < min && !matches!(cx.desc.role, Role::Setter) {
-            return Err(cx.missing_argument(Slot::arg(args.len() as u32)));
-        }
-        // Keyword-only parameters after `*args` cannot be passed positionally.
-        let positional = if N > max && cx.desc.has_varargs() {
-            max
-        } else {
-            N
-        };
-        Ok(std::array::from_fn(|i| match args.get(i) {
-            Some(value @ Value::Undefined)
-                if i < positional
-                    && cx.desc.params.get(i).is_some_and(|parameter| {
-                        parameter.pass_undefined || !parameter.optional()
-                    }) =>
-            {
-                Some(value)
-            }
-            Some(Value::Undefined) | None => None,
-            Some(v) if i < positional => Some(v),
-            Some(_) => None,
-        }))
+        let mut slots = [None; N];
+        bind_slots(cx, &mut slots)?;
+        Ok(slots)
     }
 
     fn rest<'c>(cx: &'c ArgCx<'_>) -> &'c [Value] {
@@ -1653,9 +1729,10 @@ impl Host for JsHost {
     }
 
     fn new_instance<T: Class>(ctx: &mut Interp, value: T) -> Result<Value, Value> {
-        match resolved_class::<T>(ctx) {
-            Some((_, proto)) => Ok(new_instance(ctx, value, proto)),
-            None => Err(unregistered::<T>(ctx)),
+        let instance = ErasedInstance::new(value);
+        match resolved_class(ctx, instance.ty, instance.desc) {
+            Some((_, proto)) => Ok(new_instance(ctx, instance, proto)),
+            None => Err(unregistered(ctx, instance.desc)),
         }
     }
 
@@ -2731,6 +2808,14 @@ fn host_entry_key_checked(i: &mut Interp, v: &Value) -> Result<Option<usize>, Va
         .then_some(key))
 }
 
+#[cold]
+fn wrong_instance() -> OpError {
+    OpError::new(
+        "TypeError",
+        "native instance has the wrong class or is already in use",
+    )
+}
+
 fn host_entry<'a>(i: &'a Interp, v: &Value) -> Option<&'a HostEntry> {
     let key = host_entry_key(i, v)?;
     i.host_state.get::<HostObjects>()?.map.get(&key)
@@ -2800,11 +2885,34 @@ fn active_realm_key(i: &Interp) -> RealmKey {
     RealmKey(i.global.clone())
 }
 
-fn new_instance<T: Class>(i: &mut Interp, value: T, proto: Gc) -> Value {
+struct ErasedInstance {
+    desc: &'static ClassDesc,
+    ty: TypeId,
+    data: Rc<dyn Any>,
+    view_ref: fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, ClassBorrowGuard), ()>,
+    view_mut: fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuard), ()>,
+}
+
+impl ErasedInstance {
+    #[inline(always)]
+    fn new<T: Class>(value: T) -> Self {
+        ErasedInstance {
+            desc: T::DESC,
+            ty: TypeId::of::<T>(),
+            data: Rc::new(RefCell::new(value)),
+            view_ref: view_ref::<T>,
+            view_mut: view_mut::<T>,
+        }
+    }
+}
+
+#[inline(never)]
+fn new_instance(i: &mut Interp, instance: ErasedInstance, proto: Gc) -> Value {
     let obj = Object::new(Some(proto));
-    attach_instance(i, &obj, value);
+    let ty = instance.ty;
+    attach_instance(i, &obj, instance);
     let target = Value::Obj(obj);
-    let key = (active_realm_key(i), TypeId::of::<T>());
+    let key = (active_realm_key(i), ty);
     let indexed = i
         .host_state
         .get::<IndexedClasses>()
@@ -3705,15 +3813,16 @@ fn indexed_prevent_extensions(_: &mut Interp, _: Value, _: &[Value]) -> Result<V
     Ok(Value::Bool(false))
 }
 
-fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
-    if T::DESC.hint("js", "error").is_some() {
+#[inline(never)]
+fn attach_instance(i: &mut Interp, obj: &Gc, instance: ErasedInstance) {
+    if instance.desc.hint("js", "error").is_some() {
         let stack = i.capture_trace(None);
         obj.borrow_mut().set_exotic(Exotic::Error, Some(stack));
     }
     if let Some(accessors) = i
         .host_state
         .get::<Unforgeables>()
-        .and_then(|u| u.by_class.get(&(active_realm_key(i), TypeId::of::<T>())))
+        .and_then(|u| u.by_class.get(&(active_realm_key(i), instance.ty)))
         .cloned()
     {
         let mut object = obj.borrow_mut();
@@ -3733,7 +3842,7 @@ fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
         Gc::as_ptr(obj) as usize,
         HostEntry {
             _weak: Gc::downgrade(obj),
-            data: Rc::new(RefCell::new(value)),
+            data: instance.data,
             indexed_wrapper: None,
             indexed_read: None,
             indexed_index_of: None,
@@ -3742,8 +3851,8 @@ fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
             callbacks_retained: false,
             identity_owner: None,
             native_values: None,
-            view_ref: view_ref::<T>,
-            view_mut: view_mut::<T>,
+            view_ref: instance.view_ref,
+            view_mut: instance.view_mut,
         },
     );
 }
@@ -3779,8 +3888,8 @@ fn illegal_constructor(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, V
     Err(i.make_error("TypeError", "Illegal constructor"))
 }
 
-fn registered_class<T: Class>(i: &Interp) -> Option<(Value, Gc)> {
-    let key = (active_realm_key(i), TypeId::of::<T>());
+fn registered_class(i: &Interp, ty: TypeId) -> Option<(Value, Gc)> {
+    let key = (active_realm_key(i), ty);
     i.host_state
         .get::<ClassRegistry>()
         .and_then(|r| r.map.get(&key))
@@ -3788,42 +3897,65 @@ fn registered_class<T: Class>(i: &Interp) -> Option<(Value, Gc)> {
 }
 
 /// `T`'s registration, building it first when `T` belongs to a lazily installed module.
-fn resolved_class<T: Class>(i: &mut Interp) -> Option<(Value, Gc)> {
-    if let Some(entry) = registered_class::<T>(i) {
+fn resolved_class(i: &mut Interp, ty: TypeId, desc: &'static ClassDesc) -> Option<(Value, Gc)> {
+    if let Some(entry) = registered_class(i, ty) {
         return Some(entry);
     }
-    let key = (active_realm_key(i), class_name::<T>());
+    let key = (active_realm_key(i), desc.name_for("js"));
     let make = i
         .host_state
         .get::<ClassRegistry>()
         .and_then(|r| r.pending.get(&key))
         .copied()?;
     make(i).ok()?;
-    registered_class::<T>(i)
+    registered_class(i, ty)
 }
 
 #[cold]
-fn unregistered<T: Class>(i: &mut Interp) -> Value {
+fn unregistered(i: &mut Interp, desc: &'static ClassDesc) -> Value {
     let msg = format!(
         "class {} is not registered with this engine (define its module or class first)",
-        class_name::<T>()
+        desc.name_for("js")
     );
     i.make_error("TypeError", msg)
 }
 
 /// This realm's constructor + prototype for `T`, created on first use.
 fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
-    if let Some(e) = registered_class::<T>(i) {
+    class_entry_erased(i, TypeId::of::<T>(), &ClassOpsOf::<T>::OPS)
+}
+
+struct ClassOps {
+    desc: &'static ClassDesc,
+    members: fn(&mut Vec<FnItem<JsHost>>),
+    constants: fn(&mut Vec<ConstItem<JsHost>>),
+    base_class: fn(&mut Interp) -> Result<Option<Value>, Value>,
+}
+
+struct ClassOpsOf<T>(std::marker::PhantomData<T>);
+
+impl<T: Methods<JsHost>> ClassOpsOf<T> {
+    const OPS: ClassOps = ClassOps {
+        desc: T::DESC,
+        members: T::members,
+        constants: T::constants,
+        base_class: T::base_class,
+    };
+}
+
+#[inline(never)]
+fn class_entry_erased(i: &mut Interp, ty: TypeId, ops: &ClassOps) -> (Value, Gc) {
+    if let Some(e) = registered_class(i, ty) {
         return e;
     }
     let mut members = Vec::new();
-    T::members(&mut members);
+    (ops.members)(&mut members);
     members.retain(|m| m.desc.exposed_to("js"));
     // Web IDL has enumerable named operations and attributes. Ordinary native
     // classes retain JavaScript class/builtin descriptor conventions.
-    let webidl = T::DESC.hint("js", "webidl").is_some();
-    let named_properties = T::DESC.hint("js", "named_properties").is_some();
-    let override_builtins = T::DESC.hint("js", "override_builtins").is_some();
+    let webidl = ops.desc.hint("js", "webidl").is_some();
+    let named_properties = ops.desc.hint("js", "named_properties").is_some();
+    let override_builtins = ops.desc.hint("js", "override_builtins").is_some();
     if override_builtins && !named_properties {
         panic!("override_builtins requires named native properties");
     }
@@ -3884,7 +4016,7 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
             length.entry,
             setter.map(|setter| setter.entry),
             named_hooks,
-            T::DESC.hint("js", "indexed_missing_undefined").is_some(),
+            ops.desc.hint("js", "indexed_missing_undefined").is_some(),
         );
         let index_of = members.iter().find(|member| member.desc.role == Role::Proto("indexof"));
         if let Some(member) = index_of { register_op(i, member); }
@@ -3892,10 +4024,10 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
             .get_mut::<IndexedClasses>()
             .unwrap()
             .0
-            .insert((realm_key.clone(), TypeId::of::<T>()), (handler, index_of.map(|member| member.entry)));
+            .insert((realm_key.clone(), ty), (handler, index_of.map(|member| member.entry)));
     }
-    let name = class_name::<T>();
-    let base = T::base_class(i).unwrap_or_else(|_| panic!("native base class registration"));
+    let name = ops.desc.name_for("js");
+    let base = (ops.base_class)(i).unwrap_or_else(|_| panic!("native base class registration"));
     let base_proto = base
         .as_ref()
         .and_then(|base| base.as_obj())
@@ -3905,8 +4037,8 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                 .get("prototype")
                 .and_then(|p| p.value().as_obj().cloned())
         });
-    let iterator_class = T::DESC.hint("js", "iterator").is_some();
-    let error_class = T::DESC.hint("js", "error").is_some();
+    let iterator_class = ops.desc.hint("js", "iterator").is_some();
+    let error_class = ops.desc.hint("js", "error").is_some();
     let parent_proto = if iterator_class {
         i.extra_protos.get("%IteratorPrototype%").cloned()
     } else if error_class && base_proto.is_none() {
@@ -4066,7 +4198,7 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
             .insert(&*name, Property::accessor_prop(get, set, webidl, true));
     }
     let mut constants = Vec::new();
-    T::constants(&mut constants);
+    (ops.constants)(&mut constants);
     for constant in constants {
         let value = (constant.value)(i)
             .unwrap_or_else(|_| panic!("class constant {} does not convert", constant.name));
@@ -4092,7 +4224,7 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         );
         registry
             .by_class
-            .insert((realm_key.clone(), TypeId::of::<T>()), list);
+            .insert((realm_key.clone(), ty), list);
     }
     let entry = (Value::Obj(ctor), proto);
     if !i.host_state.has::<ClassRegistry>() {
@@ -4102,7 +4234,7 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         .get_mut::<ClassRegistry>()
         .unwrap()
         .map
-        .insert((realm_key, TypeId::of::<T>()), entry.clone());
+        .insert((realm_key, ty), entry.clone());
     entry
 }
 
@@ -4491,7 +4623,7 @@ impl Interp {
     /// Wrap a Rust value as a new JS instance of its class.
     pub fn new_instance<T: Methods<JsHost>>(&mut self, value: T) -> Value {
         let (_, proto) = class_entry::<T>(self);
-        new_instance(self, value, proto)
+        new_instance(self, ErasedInstance::new(value), proto)
     }
 
     /// Give an existing host object a native class and its prototype.
@@ -4508,7 +4640,7 @@ impl Interp {
         };
         let (_, prototype) = class_entry::<T>(self);
         object.borrow_mut().proto = Some(prototype);
-        attach_instance(self, object, value);
+        attach_instance(self, object, ErasedInstance::new(value));
         Ok(())
     }
 
@@ -4536,7 +4668,7 @@ impl Interp {
                 "object already has native instance state",
             ));
         }
-        attach_instance(self, object, value);
+        attach_instance(self, object, ErasedInstance::new(value));
         Ok(())
     }
 
@@ -4552,26 +4684,30 @@ impl Interp {
         host_entry_key(self, v).is_some()
     }
 
+    fn instance_entry(&mut self, value: &Value) -> OpResult<&HostEntry> {
+        let key = host_entry_key_checked(self, value)
+            .map_err(OpError::thrown)?
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
+        self.host_state
+            .get::<HostObjects>()
+            .and_then(|objects| objects.map.get(&key))
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))
+    }
+
+    fn check_instance(&mut self, value: &Value, ty: TypeId) -> OpResult<()> {
+        let entry = self.instance_entry(value)?;
+        (entry.view_ref)(&entry.data, ty).map(drop).map_err(|_| wrong_instance())
+    }
+
     /// Read a native instance or one of its embedded base classes.
     pub fn with_instance<T: Class, R>(
         &mut self,
         value: &Value,
         read: impl FnOnce(&T) -> R,
     ) -> OpResult<R> {
-        let key = host_entry_key_checked(self, value)
-            .map_err(OpError::thrown)?
-            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
-        let entry = self
-            .host_state
-            .get::<HostObjects>()
-            .and_then(|objects| objects.map.get(&key))
-            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
-        let (pointer, guard) = (entry.view_ref)(&entry.data, TypeId::of::<T>()).map_err(|_| {
-            OpError::new(
-                "TypeError",
-                "native instance has the wrong class or is already in use",
-            )
-        })?;
+        let entry = self.instance_entry(value)?;
+        let (pointer, guard) =
+            (entry.view_ref)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
         let data = unsafe { &*pointer }
             .downcast_ref::<T>()
             .expect("matching native projection");
@@ -4586,20 +4722,9 @@ impl Interp {
         value: &Value,
         update: impl FnOnce(&mut T) -> R,
     ) -> OpResult<R> {
-        let key = host_entry_key_checked(self, value)
-            .map_err(OpError::thrown)?
-            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
-        let entry = self
-            .host_state
-            .get::<HostObjects>()
-            .and_then(|objects| objects.map.get(&key))
-            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
-        let (pointer, guard) = (entry.view_mut)(&entry.data, TypeId::of::<T>()).map_err(|_| {
-            OpError::new(
-                "TypeError",
-                "native instance has the wrong class or is already in use",
-            )
-        })?;
+        let entry = self.instance_entry(value)?;
+        let (pointer, guard) =
+            (entry.view_mut)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
         let data = unsafe { &mut *pointer }
             .downcast_mut::<T>()
             .expect("matching mutable native projection");

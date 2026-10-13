@@ -398,11 +398,16 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         )
         .collect::<Vec<_>>()
         .join(", ");
-    let pushes = members
-        .iter()
-        .map(|m| format!("out.push({B}::FnItem::of::<{modname}::{m}>());"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let pushes = if members.is_empty() {
+        String::new()
+    } else {
+        let items = members
+            .iter()
+            .map(|m| format!("{B}::FnItem::of::<{modname}::{m}>()"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("out.extend_from_slice(&[\n{items}\n]);")
+    };
     let const_pushes = constants
         .iter()
         .map(|(shown, name, ty)| {
