@@ -10,9 +10,8 @@ use lumen_html_image::{
     Rgba8Image,
 };
 use lumen_html_text::{
-    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering, FontFace,
-    FontProvider, FontSet, RegisteredFont, DEFAULT_FONT_BYTES, TEST_FONT_BOLD_BYTES,
-    TEST_FONT_BYTES,
+    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering,
+    FontProvider, FontSet, RegisteredFont,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -4933,18 +4932,8 @@ pub(crate) fn initialized_realm_font_source(realm:&Rc<DomRealm>)->OpResult<Optio
 
 pub(crate) fn canvas_fallback_fonts() -> &'static FontSet {
     CANVAS_FONTS.get_or_init(|| {
-        let mono = Arc::new(
-            FontFace::new(Arc::from(DEFAULT_FONT_BYTES))
-                .expect("bundled Inconsolata font is valid"),
-        );
-        let sans = Arc::new(
-            FontFace::new(Arc::from(TEST_FONT_BYTES))
-                .expect("bundled Liberation Sans font is valid"),
-        );
-        let sans_bold = Arc::new(
-            FontFace::new(Arc::from(TEST_FONT_BOLD_BYTES))
-                .expect("bundled Liberation Sans bold font is valid"),
-        );
+        let defaults = lumen_html_text::default_faces().expect("default fonts are available");
+        let (mono, sans, sans_bold) = (&defaults.mono, &defaults.sans, &defaults.sans_bold);
         let mut faces = Vec::new();
         for family in ["monospace", "Inconsolata"] {
             faces.push(RegisteredFont {

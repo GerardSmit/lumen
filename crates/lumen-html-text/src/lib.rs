@@ -2,6 +2,13 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "std")]
+mod default_faces;
+#[cfg(feature = "std")]
+pub use default_faces::{default_faces, set_font_directory, DefaultFaces, FILES as DEFAULT_FACE_FILES};
 
 mod manual_font_registry;
 pub use manual_font_registry::{
@@ -3590,13 +3597,16 @@ impl FontProvider for FontSet {
     }
 }
 
-pub const DEFAULT_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inconsolata-Regular.ttf");
+#[cfg(feature = "bundled-fonts")]
+pub static DEFAULT_FONT_BYTES: &[u8] = include_bytes!("../fonts/Inconsolata-Regular.ttf");
 /// Proportional conformance face, redistributed unchanged under SIL OFL 1.1.
-pub const TEST_FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
+#[cfg(feature = "bundled-fonts")]
+pub static TEST_FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
 /// Bold proportional conformance face from the same Liberation Fonts release.
-pub const TEST_FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
+#[cfg(feature = "bundled-fonts")]
+pub static TEST_FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bundled-fonts"))]
 mod tests {
     use super::*;
     use alloc::format;

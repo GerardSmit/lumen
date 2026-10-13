@@ -4205,10 +4205,9 @@ pub fn render_html(
 }
 
 fn default_font() -> Result<&'static FontFace, ImageError> {
-    static FONT: std::sync::OnceLock<Result<FontFace, &'static str>> = std::sync::OnceLock::new();
-    FONT.get_or_init(|| FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)))
-        .as_ref()
-        .map_err(|&error| ImageError::Font(error))
+    lumen_html_text::default_faces()
+        .map(|faces| faces.mono.as_ref())
+        .map_err(ImageError::Font)
 }
 
 pub fn render_html_with_font(

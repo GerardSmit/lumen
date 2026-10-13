@@ -698,7 +698,7 @@ fn shared_feature_metadata_bytes(rules:&[lumen_html::css::FontFamilyDisplayRule]
     Some(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bundled-fonts"))]
 mod tests {
     use super::*;
     use crate::{FontFace, DEFAULT_FONT_BYTES};

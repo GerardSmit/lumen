@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["bundled-fonts"]
+bundled-fonts = ["lumen-html-text/bundled-fonts"]
+
 [dependencies]
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 lumen-html = { path = "../lumen-html" }
-lumen-html-text = { path = "../lumen-html-text" }
+lumen-html-text = { path = "../lumen-html-text", default-features = false, features = ["std"] }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "webp", "gif", "png", "bmp"] }
 moxcms = "0.8.1"
