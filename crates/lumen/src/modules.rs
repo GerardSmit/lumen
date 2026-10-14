@@ -1994,6 +1994,13 @@ impl Interp {
         Some(Ok(Property::data(value, true, true, false)))
     }
 
+    /// `import(specifier)` for an embedder: a promise of the module's namespace, resolved against
+    /// the realm's import base. Use an absolute specifier (a `file:` URL) for a module that is
+    /// not relative to it.
+    pub fn import_module(&mut self, specifier: &str) -> Value {
+        self.dynamic_import(specifier, None, false, None)
+    }
+
     /// `import(specifier)`: synchronously load the module and return an already-resolved promise of
     /// its namespace (or a rejected promise if loading throws).
     pub(crate) fn dynamic_import(
