@@ -161,3 +161,19 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
         changed.generation
     );
 }
+
+#[test]
+fn design_token_stylesheet_with_hundreds_of_custom_properties_cascades() {
+    let tokens: String = (0..300).map(|index| format!("--token-{index}:#{index:06x};")).collect();
+    let markup = format!(
+        "<style>@media screen{{:root,.skin-invert{{{tokens}}}}}p{{color:var(--token-299);background:var(--token-1)}}\
+         q{{{}}}</style><p id=a>x</p><q id=b>y</q>",
+        "margin:0;".repeat(3000),
+    );
+    let document = html::parse(&markup, 64).unwrap();
+    let paragraph = selector::query_selector(&document, document.root(), "#a").unwrap().unwrap();
+    let mut session = RenderSession::new(document);
+    let style = session.computed_style(paragraph).unwrap();
+    assert_eq!(style.color, lumen_html::paint::Rgba { r: 0, g: 1, b: 43, a: 255 },
+        "var() resolves a token declared among 300 siblings; the oversized q rule is dropped alone");
+}

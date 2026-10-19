@@ -2339,9 +2339,27 @@ impl RenderSession {
 
     /// One document walk at each real style-change event. Shared ancestor Arc
     /// styles preserve DOM inheritance and cached principal-parent provenance.
-    fn push_transition_style(nodes:&mut Vec<TransitionStyleInput>,payload_bytes:&mut usize,input:TransitionStyleInput,quota_exceeded:&mut bool)->Result<(),LayoutError> {
-        const LIMIT:usize=16*1024*1024;
-        let charge=layout::checked_style_retained_bytes(&input.style).and_then(|bytes|
+    ///
+    /// The walk allocates a fresh `Style` per element (`compute_transition_snapshot_cached`
+    /// shares nothing with the session's own frame or style cache), and the previous
+    /// snapshot stays alive in the animation hub while this one is built, so the
+    /// charge measures memory the snapshot really adds. An element whose computed
+    /// style equals one of the last few distinct styles reuses that allocation, which
+    /// makes runs of identical (or alternating, like `p`/`span`) siblings cost one `Style` plus one eligibility record each; each
+    /// distinct allocation is charged once. A `Style` is about 9 KiB, so the 32 MiB
+    /// bound admits roughly 3,500 distinct styles and far more entries when styles repeat.
+    fn push_transition_style(nodes:&mut Vec<TransitionStyleInput>,payload_bytes:&mut usize,charged:&mut alloc::collections::BTreeSet<usize>,
+        recent:&mut Vec<Arc<Style>>,mut input:TransitionStyleInput,quota_exceeded:&mut bool)->Result<(),LayoutError> {
+        const LIMIT:usize=32*1024*1024;
+        const RECENT_STYLES:usize=8;
+        if input.pseudo.is_none() {
+            match recent.iter().position(|candidate|Arc::ptr_eq(candidate,&input.style) || **candidate==*input.style) {
+                Some(index) => {let found=recent.remove(index);input.style=found.clone();recent.insert(0,found);}
+                None => {recent.insert(0,input.style.clone());recent.truncate(RECENT_STYLES);}
+            }
+        }
+        let style_bytes=if charged.contains(&(Arc::as_ptr(&input.style) as usize)) {Some(0)} else {layout::checked_style_retained_bytes(&input.style)};
+        let charge=style_bytes.and_then(|bytes|
             input.eligibility.checked_retained_bytes().and_then(|eligibility|bytes.checked_add(eligibility)))
             .ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?;
         let payload=payload_bytes.checked_add(charge).ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?;
@@ -2349,6 +2367,7 @@ impl RenderSession {
         if capacity.checked_mul(core::mem::size_of::<TransitionStyleInput>()).and_then(|bytes|bytes.checked_add(payload)).is_none_or(|bytes|bytes>LIMIT) {*quota_exceeded=true;return Err(LayoutError::CommandLimit);}
         nodes.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
         if nodes.capacity().checked_mul(core::mem::size_of::<TransitionStyleInput>()).and_then(|bytes|bytes.checked_add(payload)).is_none_or(|bytes|bytes>LIMIT) {*quota_exceeded=true;return Err(LayoutError::CommandLimit);}
+        charged.insert(Arc::as_ptr(&input.style) as usize);
         *payload_bytes=payload;nodes.push(input);Ok(())
     }
 
@@ -2419,6 +2438,8 @@ impl RenderSession {
         let mut cursor=selection.map_or(Some(root),|selection|selection.nodes.first().copied());
         let mut nodes=Vec::new();
         let mut payload_bytes=selection.map_or(0,|selection|selection.retained_bytes);
+        let mut charged_styles=alloc::collections::BTreeSet::<usize>::new();
+        let mut recent_styles:Vec<Arc<Style>>=Vec::new();
         let mut eligibility=alloc::collections::BTreeMap::new();
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
         while let Some(node)=cursor {
@@ -2457,7 +2478,7 @@ impl RenderSession {
                     if matches!(self.document.kind(id),Ok(NodeKind::Element{..})) {break;}
                     inherited_parent=self.document.composed_parent(id).map_err(|_|LayoutError::InvalidTree)?;
                 }
-                Self::push_transition_style(&mut nodes,&mut payload_bytes,TransitionStyleInput {node,parent:inherited_parent,pseudo:None,style:style.clone(),rendered:Cell::new(rendered),
+                Self::push_transition_style(&mut nodes,&mut payload_bytes,&mut charged_styles,&mut recent_styles,TransitionStyleInput {node,parent:inherited_parent,pseudo:None,style:style.clone(),rendered:Cell::new(rendered),
                     eligibility:eligible},quota_exceeded)?;
                 {
                     let quote=matches!(self.document.kind(node),Ok(NodeKind::Element {name,namespace:crate::Namespace::Html,..}) if name == "q");
@@ -2488,7 +2509,7 @@ impl RenderSession {
                             css::GeneratedContent::None => false,
                         };
                         if generated_present || requested {
-                            Self::push_transition_style(&mut nodes,&mut payload_bytes,TransitionStyleInput {node,parent:Some(node),pseudo:Some(pseudo),rendered:Cell::new(rendered && origin_present && (generated.display != css::Display::None || pseudo.is_marker()) && (generated_present || !matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After|css::PseudoElement::BeforeMarker|css::PseudoElement::AfterMarker))),style:generated,eligibility:eligible},quota_exceeded)?;
+                            Self::push_transition_style(&mut nodes,&mut payload_bytes,&mut charged_styles,&mut recent_styles,TransitionStyleInput {node,parent:Some(node),pseudo:Some(pseudo),rendered:Cell::new(rendered && origin_present && (generated.display != css::Display::None || pseudo.is_marker()) && (generated_present || !matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After|css::PseudoElement::BeforeMarker|css::PseudoElement::AfterMarker))),style:generated,eligibility:eligible},quota_exceeded)?;
                         }
                     }
                 }
@@ -3959,15 +3980,15 @@ mod tests {
     struct NoText;
     #[test]
     fn specification_render_snapshot_budget_rejection_is_stable_and_retries_changed_inputs() {
-        // A wide connected tree exceeds the existing provenance byte budget;
+        // A wide tree of distinct styles exceeds the snapshot byte budget;
         // no depth, display-command, or arbitrary node-count limit is changed.
-        let source = alloc::format!("<section id=large>{}</section>","<div></div>".repeat(20_000));
+        let source = alloc::format!("<section id=large>{}</section>",(0..8_000).map(|width|alloc::format!("<div style=\"width:{}px\"></div>",width+1)).collect::<String>());
         let document = crate::html::parse(&source,24_000).unwrap();
         let large = crate::selector::query_selector(&document,document.root(),"#large").unwrap().unwrap();
         let mut session = RenderSession::new(document);
         assert!(matches!(session.transition_snapshot(),Err(LayoutError::CommandLimit)));
         let selective=session.effect_underlying_snapshot_with_text(&[(large,None),(large,None),(large,Some(css::PseudoElement::Before))],None).unwrap();
-        assert!(selective.nodes.len()<8,"one target does not capture the 20,000 unrelated descendant styles");
+        assert!(selective.nodes.len()<8,"one target does not capture the 8,000 unrelated descendant styles");
         assert_eq!(selective.nodes.iter().filter(|input|input.node==large&&input.pseudo.is_none()).count(),1);
         let absent=selective.nodes.iter().find(|input|input.node==large&&input.pseudo==Some(css::PseudoElement::Before)).unwrap();
         assert!(!absent.was_rendered(),"requested underlying pseudo style does not fabricate a generated box");

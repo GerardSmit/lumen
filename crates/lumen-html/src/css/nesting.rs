@@ -650,8 +650,8 @@ fn flush_declarations(
     let has_declarations=if rule.declaration_ranges.len()>MAX_DECLARATIONS {
         let source=rule.declaration_source(text);
         let block=DeclarationBlock::parse(source.as_ref()).map_err(|mut failure|{
-            if failure.message=="CSS declaration block exceeds limit" || failure.message=="too many declarations" {
-                return error(first,"too many declarations");
+            if failure.message=="CSS declaration block exceeds limit" || failure.is_declaration_limit() {
+                return error(first,TOO_MANY_DECLARATIONS);
             }
             failure.offset+=first;failure
         })?;
@@ -700,7 +700,7 @@ fn parse_body(
                 // cohort. Validate its compact admission when the run ends;
                 // ordinary authored declarations keep their existing quota.
                 if pending.len() > MAX_DECLARATIONS + PROPERTIES.len() {
-                    return Err(error(start, "too many declarations"));
+                    return Err(error(start, TOO_MANY_DECLARATIONS));
                 }
             } else if valid_statement(
                 text[start..end].trim().trim_end_matches(';'),

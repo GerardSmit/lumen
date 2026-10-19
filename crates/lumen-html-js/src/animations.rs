@@ -186,6 +186,10 @@ struct AnimationHub {
     running_transitions:HashMap<TransitionTarget,u32>,
     completed_transitions:HashMap<TransitionTarget,String>,
     transition_snapshots:HashMap<usize,(Weak<DomRealm>,Arc<lumen_html::session::TransitionSnapshot>)>,
+    transition_over_budget:HashMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
+    transition_budget_reported:HashSet<usize>,
+    animation_over_budget:HashMap<usize,(Weak<DomRealm>,lumen_html::session::TransitionInputEpoch)>,
+    animation_budget_reported:HashSet<usize>,
     transition_mutation_realms:Vec<Weak<DomRealm>>,
     transition_generation:u64,
     refreshing_transitions:bool,
@@ -215,6 +219,8 @@ impl Default for AnimationHub {
             css_events: HashMap::new(),
             transitions:HashMap::new(),running_transitions:HashMap::new(),
             completed_transitions:HashMap::new(),transition_snapshots:HashMap::new(),
+            transition_over_budget:HashMap::new(),transition_budget_reported:HashSet::new(),
+            animation_over_budget:HashMap::new(),animation_budget_reported:HashSet::new(),
             transition_mutation_realms:Vec::new(),
             transition_generation:0,refreshing_transitions:false,
             rendered_revisions: HashMap::new(),
@@ -321,7 +327,7 @@ pub(crate) fn retire_document(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
     state.css_records.retain(|target,_|target.0!=key);
     state.running_transitions.retain(|target,_|target.0!=key);
     state.completed_transitions.retain(|target,_|target.0!=key);
-    state.transition_snapshots.remove(&key);state.css_generations.remove(&key);state.rendered_revisions.remove(&key);
+    state.transition_snapshots.remove(&key);state.transition_over_budget.remove(&key);state.transition_budget_reported.remove(&key);state.animation_over_budget.remove(&key);state.animation_budget_reported.remove(&key);state.css_generations.remove(&key);state.rendered_revisions.remove(&key);
     // Frozen cancellation batches from a real retired document cannot retarget
     // a successor Document merely because its Window/global was reused.
     state.css_cancellations.retain(|snapshot|snapshot.upgrade().is_some_and(|snapshot|!Rc::ptr_eq(&snapshot.owner,realm)));
@@ -1570,6 +1576,13 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     {let mut state=hub.borrow_mut();for (key,value) in completed {state.running_transitions.remove(&key);state.completed_transitions.insert(key,value);}}
     let epoch=realm.session.borrow_mut().transition_input_epoch()
         .map_err(|error|OpError::new("InvalidStateError",format!("transition style inputs failed: {error:?}")))?;
+    if hub.borrow().transition_over_budget.get(&realm_key).is_some_and(|(owner,over)|
+        owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && *over==epoch) {
+        // Transitions that finished above have nothing left to reconcile while
+        // the document is over budget; drop them so none lingers unprocessed.
+        hub.borrow_mut().completed_transitions.retain(|target,_|target.0!=realm_key);
+        return Ok(());
+    }
     if !completed_display && hub.borrow().transition_snapshots.get(&realm_key).is_some_and(|(owner,previous)|
         owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && previous.epoch==epoch) {return Ok(());}
     // An unchanged cascade input epoch needs lifecycle reconciliation above,
@@ -1587,8 +1600,31 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     apply_realm_in_phase(hub,realm,now,EffectStylePhase::AfterChange)?;
     let fonts=crate::canvas::initialized_realm_font_source(realm)?;
     let text=fonts.as_ref().map(|fonts|&**fonts as &dyn lumen_html::paint::TextShaper);
-    let mut snapshot=realm.session.borrow_mut().transition_snapshot_with_text(text)
-        .map_err(|error|OpError::new("InvalidStateError",format!("transition style snapshot failed: {error:?}")))?;
+    let snapshot=realm.session.borrow_mut().transition_snapshot_with_text(text);
+    let mut snapshot=match snapshot {
+        Ok(snapshot)=>snapshot,
+        Err(lumen_html::layout::LayoutError::CommandLimit)=>{
+            // An oversized document gets no CSS transitions rather than an
+            // error on every animation frame. The marker keeps later frames
+            // at the same input epoch from repeating the failed capture.
+            let first={
+                let mut state=hub.borrow_mut();
+                state.transition_snapshots.remove(&realm_key);
+                state.completed_transitions.retain(|target,_|target.0!=realm_key);
+                state.transition_over_budget.insert(realm_key,(Rc::downgrade(realm),epoch));
+                state.transition_budget_reported.insert(realm_key)
+            };
+            if first {
+                eprintln!("lumen: document exceeds the transition style snapshot budget; CSS transitions are disabled for it");
+            }
+            let running=hub.borrow().running_transitions.iter().filter(|(target,_)|target.0==realm_key)
+                .map(|(target,id)|(target.clone(),*id)).collect::<Vec<_>>();
+            for (target,id) in running {hub.borrow_mut().running_transitions.remove(&target);cancel_owned_transition(ctx,hub,id)?;}
+            apply_realm(hub,realm,now)?;
+            return Ok(());
+        }
+        Err(error)=>return Err(OpError::new("InvalidStateError",format!("transition style snapshot failed: {error:?}"))),
+    };
     let registrations=realm.session.borrow().registered_custom_property_snapshot();
     let previous=hub.borrow().transition_snapshots.get(&realm_key).map(|(_,snapshot)|snapshot.clone());
     let generation=realm.browsing_context().ok_or_else(||OpError::new("InvalidStateError","transition document browsing context unavailable"))?.next_transition_generation()?;
@@ -1713,7 +1749,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     if let Some(snapshot)=Arc::get_mut(&mut snapshot) {
         for input in &mut snapshot.nodes {input.set_rendered(effective_rendered.get(&(input.node,input.pseudo)).copied().unwrap_or(false));}
     }
-    hub.borrow_mut().transition_snapshots.insert(realm_key,(Rc::downgrade(realm),snapshot));
+    {let mut state=hub.borrow_mut();state.transition_over_budget.remove(&realm_key);state.transition_snapshots.insert(realm_key,(Rc::downgrade(realm),snapshot));}
     Ok(())
 }
 
@@ -1745,12 +1781,50 @@ fn refresh_css_animations(
     realm: &Rc<DomRealm>,
     now: f64,
 ) -> OpResult<()> {
-    let source=hub.borrow().transition_snapshots.get(&(Rc::as_ptr(realm) as usize)).map(|(_,snapshot)|snapshot.clone());
+    let realm_key = Rc::as_ptr(realm) as usize;
+    if hub.borrow().animation_over_budget.contains_key(&realm_key) {
+        let epoch=realm.session.borrow_mut().transition_input_epoch().ok();
+        if epoch.is_some_and(|epoch|hub.borrow().animation_over_budget.get(&realm_key).is_some_and(|(owner,over)|
+            owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && *over==epoch)) {return Ok(());}
+    }
+    let source=hub.borrow().transition_snapshots.get(&realm_key).map(|(_,snapshot)|snapshot.clone());
     let snapshot = {let mut session=realm.session.borrow_mut();match source {
         Some(source)=>session.animation_snapshot_from_transition(&source),None=>session.animation_snapshot(),
-    }}.map_err(|error|OpError::new("SyntaxError",format!("CSS animation style resolution failed: {error:?}")))?;
+    }};
+    let snapshot=match snapshot {
+        Ok(snapshot)=>snapshot,
+        Err(lumen_html::layout::LayoutError::CommandLimit)=>{
+            // An oversized document gets no CSS animations rather than an
+            // error on every frame. Running ones are cancelled so none keeps
+            // sampling a style that can no longer be resolved.
+            let epoch=realm.session.borrow_mut().transition_input_epoch().ok();
+            let first={
+                let mut state=hub.borrow_mut();
+                state.css_generations.remove(&realm_key);
+                if let Some(epoch)=epoch {state.animation_over_budget.insert(realm_key,(Rc::downgrade(realm),epoch));}
+                state.animation_budget_reported.insert(realm_key)
+            };
+            if first {
+                eprintln!("lumen: document exceeds the animation style snapshot budget; CSS animations are disabled for it");
+            }
+            let stale=hub.borrow().css_records.keys().filter(|key|key.0==realm_key).copied().collect::<Vec<_>>();
+            let mut cancelled=Vec::new();
+            for key in stale {
+                let old_entry={hub.borrow_mut().css_records.remove(&key)};
+                if let Some((_,_,id))=old_entry {
+                    retire_css_snapshot_record(ctx,hub,id,now)?;
+                    cancelled.push(id);
+                }
+            }
+            let mut publication=DispatchRetention{hub:hub.clone(),ids:Vec::new()};
+            for id in &cancelled {publication.retain(*id);}
+            for id in cancelled {reset_pending_task(ctx,hub,id)?;}
+            return Ok(());
+        }
+        Err(error)=>return Err(OpError::new("SyntaxError",format!("CSS animation style resolution failed: {error:?}"))),
+    };
+    hub.borrow_mut().animation_over_budget.remove(&realm_key);
     let environment = realm.session.borrow().media_environment();
-    let realm_key = Rc::as_ptr(realm) as usize;
     if hub.borrow().css_generations.get(&realm_key).is_some_and(|(owner, generation)| {
         *generation == snapshot.generation && owner.upgrade().is_some_and(|owner| Rc::ptr_eq(&owner, realm))
     }) {
@@ -5708,6 +5782,64 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
             eval_ok(&mut engine,"transitions[0].currentTime=50000");advance(engine.ctx(),0.0).unwrap();
             assert!(matches!(eval_ok(&mut engine,&format!("getComputedStyle(target).getPropertyValue('--value')==='{expected}'")),Value::Bool(true)),"registered transition sampled value");
         }
+    }
+
+    #[test]
+    fn css_transition_starts_in_document_with_thousands_of_elements() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(2000));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),0.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transitions_over_snapshot_budget_degrade_once_per_epoch() {
+        let mut engine=Engine::new();
+        let divs:String=(0..8_000).map(|width|format!("<div style=\"width:{}px\"></div>",width+1)).collect();
+        let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{divs}");
+        let realm=crate::install(engine.ctx(),&markup,24_000).unwrap();
+        progress_layout(&realm);advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),0.0).unwrap();
+        advance(engine.ctx(),16.0).unwrap();
+        let hub=hub(engine.ctx()).unwrap();
+        let key=Rc::as_ptr(&realm) as usize;
+        let epoch=realm.session.borrow_mut().transition_input_epoch().unwrap();
+        {
+            let state=hub.borrow();
+            assert!(state.transition_over_budget.get(&key).is_some_and(|(_,over)|*over==epoch),"over-budget epoch is remembered");
+            assert!(!state.transition_snapshots.contains_key(&key),"no stale BEFORE snapshot is kept");
+            assert!(state.running_transitions.keys().all(|target|target.0!=key));
+        }
+        advance(engine.ctx(),32.0).unwrap();
+        assert!(hub.borrow().transition_over_budget.get(&key).is_some_and(|(_,over)|*over==epoch));
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===0"),Value::Bool(true)));
+        assert!(hub.borrow().transition_budget_reported.contains(&key));
+    }
+
+    #[test]
+    fn css_animations_over_snapshot_budget_degrade_once_per_epoch() {
+        let mut engine=Engine::new();
+        let divs:String=(0..8_000).map(|width|format!("<div style=\"width:{}px\"></div>",width+1)).collect();
+        let markup=format!("<style>@keyframes pulse{{from{{opacity:0}}to{{opacity:1}}}}#target{{animation:pulse 100s linear}}</style><div id=target></div>{divs}");
+        let realm=crate::install(engine.ctx(),&markup,24_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        advance(engine.ctx(),16.0).unwrap();
+        let hub=hub(engine.ctx()).unwrap();
+        let key=Rc::as_ptr(&realm) as usize;
+        let epoch=realm.session.borrow_mut().transition_input_epoch().unwrap();
+        {
+            let state=hub.borrow();
+            assert!(state.animation_over_budget.get(&key).is_some_and(|(_,over)|*over==epoch),"over-budget epoch is remembered");
+            assert!(state.css_records.keys().all(|record|record.0!=key),"no CSS animation outlives its unresolvable style");
+            assert!(state.animation_budget_reported.contains(&key));
+        }
+        advance(engine.ctx(),32.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"document.getElementById('target').getAnimations().length===0"),Value::Bool(true)));
     }
 
     #[test]

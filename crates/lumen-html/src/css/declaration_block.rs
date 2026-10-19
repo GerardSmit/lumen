@@ -5,6 +5,10 @@ use super::*;
 use alloc::collections::BTreeSet;
 
 const MAX_ENTRIES: usize = MAX_DECLARATIONS;
+/// Serialization keeps this many entry views on the stack; longer blocks use the heap.
+const LOCAL_ENTRIES: usize = 128;
+/// Sources beyond this many spans compact wide-keyword longhands into `all` cohorts.
+const COMPACT_WIDE_SPANS: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Pending {
@@ -440,7 +444,7 @@ pub(super) fn supports(name: &str, raw: &str) -> bool {
 }
 
 fn push_entry(entries: &mut Vec<Entry>, entry: Entry) -> Result<(), CssError> {
-    if entries.len() >= MAX_ENTRIES * 2 + 1 || !matches!(entry.value, Specified::All(_)) && entries.iter().filter(|entry| !matches!(entry.value, Specified::All(_))).count() >= MAX_ENTRIES {
+    if entries.len() >= MAX_ENTRIES * 2 + 1 || !matches!(entry.value, Specified::All(_)) && entries.len() >= MAX_ENTRIES && entries.iter().filter(|entry| !matches!(entry.value, Specified::All(_))).count() >= MAX_ENTRIES {
         return Err(limit());
     }
     entries.try_reserve(1).map_err(|_| limit())?;
@@ -959,7 +963,7 @@ impl DeclarationBlock {
     fn parse_with_keyframe_policy(input: &str, keyframes: bool) -> Result<Self, CssError> {
         let mut result = Self::default();
         let spans=declaration_spans_with_limit(input,true,MAX_ENTRIES+PROPERTIES.len())?;
-        let compact_wide=spans.len()>MAX_ENTRIES;
+        let compact_wide=spans.len()>COMPACT_WIDE_SPANS;
         let mut ordinary_sources=0usize;
         for (start,end) in spans {
             let Some((name, raw)) = declaration_pair(&input[start..end]) else {
@@ -1292,10 +1296,10 @@ impl DeclarationBlock {
     pub fn serialize(&self) -> Result<String, CssError> {
         let mut output = String::new();
         let Some(first)=self.views().next() else{return Ok(output);};
-        let mut local_entries=[first;MAX_ENTRIES];let mut local_used=[false;MAX_ENTRIES];
+        let mut local_entries=[first;LOCAL_ENTRIES];let mut local_used=[false;LOCAL_ENTRIES];
         let mut expanded_entries=Vec::new();let mut expanded_used=Vec::new();
         let length=self.len();
-        let(entries,used):(&[EntryView<'_>],&mut[bool])=if length<=MAX_ENTRIES{
+        let(entries,used):(&[EntryView<'_>],&mut[bool])=if length<=LOCAL_ENTRIES{
             for(index,entry)in self.views().enumerate(){local_entries[index]=entry;}
             (&local_entries[..length],&mut local_used[..length])
         }else{
@@ -1867,7 +1871,7 @@ mod tests {
         assert_eq!(block.value("width"),Some(("revert".into(),false)));
         assert_eq!(block.value("font").unwrap().0,"revert");
         assert_eq!(block.value("margin").unwrap().0,"revert");
-        assert!(block.len()>MAX_ENTRIES);
+        assert!(block.len()>COMPACT_WIDE_SPANS);
         assert_eq!(block.entries.len(),4,"one reset must not allocate a retained longhand list");
         assert!(block.retained_text_bytes()<512);
         let names=block.names().map(String::from).collect::<Vec<_>>();
@@ -1907,7 +1911,7 @@ mod tests {
         let mut block=DeclarationBlock::parse("direction:rtl;unicode-bidi:isolate;--kept:green;all:initial").unwrap();
         block.set("width","37px",false).unwrap();block.set("color","green",false).unwrap();
         let source=block.serialize().unwrap();
-        assert!(declaration_spans_with_limit(&source,true,MAX_ENTRIES+PROPERTIES.len()).unwrap().len()>MAX_ENTRIES);
+        assert!(declaration_spans_with_limit(&source,true,MAX_ENTRIES+PROPERTIES.len()).unwrap().len()>COMPACT_WIDE_SPANS);
         let rule_source=alloc::format!("div{{{source}}}");
         let single=nesting::parse_one_source_rule(&rule_source,&[]).unwrap();
         assert_eq!(single.kind,nesting::SourceRuleKind::Style);
@@ -1919,9 +1923,9 @@ mod tests {
         assert_eq!(actual.width,Some(37.0));assert_eq!(actual.color,expected.color);
         assert_eq!(actual.direction,expected.direction);assert_eq!(actual.unicode_bidi,expected.unicode_bidi);
         assert_eq!(actual.border_width_sides(),expected.border_width_sides());
-        assert!(parse_stylesheet(&alloc::format!("div{{{}}}","color:red;".repeat(MAX_ENTRIES+1))).is_err(),"ordinary repeated declarations remain bounded before deduplication");
+        assert!(parse_stylesheet(&alloc::format!("div{{{}}}","color:red;".repeat(MAX_DECLARATIONS+1))).is_err(),"ordinary repeated declarations remain bounded before deduplication");
         assert!(DeclarationBlock::parse(&"color:red;".repeat(MAX_ENTRIES+1)).is_err());
-        assert_eq!(nesting::parse_one_source_rule(&alloc::format!("div{{{}}}","color:red;".repeat(MAX_ENTRIES+1)),&[]).unwrap_err().message,"too many declarations");
+        assert_eq!(nesting::parse_one_source_rule(&alloc::format!("div{{{}}}","color:red;".repeat(MAX_DECLARATIONS+1)),&[]).unwrap_err().message,"too many CSS source items");
     }
 
     #[test]
@@ -2438,6 +2442,24 @@ mod tests {
     }
 
     #[test]
+    fn declaration_block_holds_hundreds_of_custom_properties_and_serializes_them() {
+        assert_eq!(MAX_ENTRIES, MAX_DECLARATIONS);
+        let source: String = (0..300).map(|index| alloc::format!("--token-{index}:{index};")).collect();
+        let mut block = DeclarationBlock::parse(&source).unwrap();
+        assert_eq!(block.len(), 300);
+        assert_eq!(block.value("--token-299"), Some(("299".into(), false)));
+        block.set("--token-300", "300", false).unwrap();
+        block.set("color", "red", false).unwrap();
+        assert_eq!(block.len(), 302);
+        let serialized = block.serialize().unwrap();
+        let reparsed = DeclarationBlock::parse(&serialized).unwrap();
+        assert_eq!(reparsed.len(), 302);
+        assert_eq!(reparsed.value("--token-0"), Some(("0".into(), false)));
+        let too_many: String = (0..=MAX_ENTRIES).map(|index| alloc::format!("--t{index}:1;")).collect();
+        assert!(DeclarationBlock::parse(&too_many).is_err());
+    }
+
+    #[test]
     fn declaration_block_atomic_limits_replacement_and_clear_reclaim() {
         let mut block = DeclarationBlock::default();
         for index in 0..MAX_ENTRIES {
@@ -2448,7 +2470,7 @@ mod tests {
         let snapshot = block.clone();
         assert!(block.set("margin", "1px", false).is_err());
         assert_eq!(block, snapshot);
-        for _ in 0..2048 {
+        for _ in 0..64 {
             assert!(!block.set("--v0", "token", false).unwrap());
         }
         assert_eq!(block.len(), MAX_ENTRIES);

@@ -4673,6 +4673,17 @@ pub struct CssError {
     pub message: &'static str,
 }
 
+/// Message shared by every site that rejects an oversized declaration block, so
+/// callers that treat the cap as a resource bound match it through
+/// [`CssError::is_declaration_limit`] instead of an inline string.
+pub(crate) const TOO_MANY_DECLARATIONS: &str = "too many declarations";
+
+impl CssError {
+    pub(crate) fn is_declaration_limit(&self) -> bool {
+        self.message == TOO_MANY_DECLARATIONS
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Selector {
     namespace: NamespaceConstraint,
@@ -6738,7 +6749,7 @@ pub struct StyleIndex {
 }
 
 pub(crate) const MAX_RULES: usize = 4096;
-const MAX_DECLARATIONS: usize = 128;
+const MAX_DECLARATIONS: usize = 4096;
 const MAX_SELECTOR_BYTES: usize = 256;
 const MAX_SELECTOR_NESTING: usize = 32;
 const MAX_SELECTOR_COMPOUNDS: usize = 64;
@@ -10021,13 +10032,13 @@ fn declaration_spans_with_limit(input:&str,recover:bool,limit:usize)->Result<Vec
             }
             _=>{}
         }
-        if spans.len()>limit{return Err(syntax::error(token.start,"too many declarations"));}
+        if spans.len()>limit{return Err(syntax::error(token.start,TOO_MANY_DECLARATIONS));}
     }
     // EOF closes components and strings. A bad token invalidates only this
     // declaration; a grammar consumer decides what the completed tokens mean.
     if invalid && !recover {return Err(syntax::error(start,"invalid CSS declaration component"));}
     if !invalid && start<input.len(){spans.push((start,input.len()));}
-    if spans.len()>limit{return Err(syntax::error(start,"too many declarations"));}
+    if spans.len()>limit{return Err(syntax::error(start,TOO_MANY_DECLARATIONS));}
     Ok(spans)
 }
 
@@ -16270,7 +16281,7 @@ fn declarations(input: &str, offset: usize) -> Result<Vec<Declaration>, CssError
         // A serialized partial `all` reset has a registry-bounded set of
         // virtual wide longhands, not an unbounded authored declaration list.
         // Reuse its compact specified storage and canonical slot projection.
-        Err(error) if error.message=="too many declarations" => {
+        Err(error) if error.is_declaration_limit() => {
             DeclarationBlock::parse(input).and_then(|block|block.render_declarations())
                 .map_err(|mut projected_error|{
                     if projected_error.message=="CSS declaration block exceeds limit"{return error;}
@@ -16357,7 +16368,7 @@ fn append_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_variable
             if out.len() + values.len() > MAX_DECLARATIONS {
                 return Err(CssError {
                     offset: offset,
-                    message: "too many declarations",
+                    message: TOO_MANY_DECLARATIONS,
                 });
             }
             out.extend(values.into_iter().map(|(slot, value)| Declaration {
@@ -16370,7 +16381,7 @@ fn append_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_variable
             && !["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|keyword| raw.eq_ignore_ascii_case(keyword)) {
             let Some(values) = transition_values(name, raw) else { continue; };
             if out.len().checked_add(values.len()).is_none_or(|len|len>MAX_DECLARATIONS) {
-                return Err(CssError { offset: offset, message: "too many declarations" });
+                return Err(CssError { offset: offset, message: TOO_MANY_DECLARATIONS });
             }
             out.extend(values.into_iter().map(|value|Declaration {value,important}));
             continue;
@@ -17058,7 +17069,7 @@ fn append_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_variable
         if name.starts_with("contain-intrinsic-") {
             let values=if name=="contain-intrinsic-size" {intrinsic_override::shorthand(raw)}else{slots(name).first().and_then(|slot|intrinsic_override::value(*slot,raw)).map(|value|alloc::vec![value])};
             if let Some(values)=values {
-                if out.len()+values.len()>MAX_DECLARATIONS {return Err(CssError{offset,message:"too many declarations"});}
+                if out.len()+values.len()>MAX_DECLARATIONS {return Err(CssError{offset,message:TOO_MANY_DECLARATIONS});}
                 out.extend(values.into_iter().map(|value|Declaration{value,important}));
             }
             continue;
@@ -18248,7 +18259,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
             };
             out.try_reserve_exact(3).map_err(|_| CssError {
                 offset,
-                message: "too many declarations",
+                message: TOO_MANY_DECLARATIONS,
             })?;
             out.push(Declaration {
                 value: Value::ListStyleType(marker),
@@ -18269,7 +18280,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + 5 > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 let raw: Arc<str> = Arc::from(raw);
@@ -18362,7 +18373,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + 3 > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 for value in [Value::FlexGrow(grow), Value::FlexShrink(shrink), basis] {
@@ -18377,7 +18388,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + values.len() > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 out.extend(
@@ -18393,7 +18404,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + values.len() > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 out.extend(
@@ -18410,7 +18421,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + values.len() > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 out.extend(
@@ -18426,7 +18437,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 if out.len() + values.len() > MAX_DECLARATIONS {
                     return Err(CssError {
                         offset,
-                        message: "too many declarations",
+                        message: TOO_MANY_DECLARATIONS,
                     });
                 }
                 out.extend(
@@ -19155,7 +19166,7 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
             if out.len() >= MAX_DECLARATIONS {
                 return Err(CssError {
                     offset,
-                    message: "too many declarations",
+                    message: TOO_MANY_DECLARATIONS,
                 });
             }
             out.push(Declaration { value, important });
@@ -21499,9 +21510,16 @@ fn emit_source_rules(
         }) {
             let raw = node.declaration_source(input);
             let offset = base_offset + node.declaration_offset.unwrap_or(node.range.start);
-            let declarations: Arc<[Declaration]> = declarations(&raw, offset)?.into();
+            // The declaration cap is a resource bound, not a syntax error: an
+            // oversized block drops its own rule and leaves the sheet intact.
+            let declarations: Option<Arc<[Declaration]>> = match declarations(&raw, offset) {
+                Ok(declarations) => Some(declarations.into()),
+                Err(error) if error.is_declaration_limit() => None,
+                Err(error) => return Err(error),
+            };
             let unsupported: Arc<[String]> = unsupported_svg_style_properties(&raw).into();
-            for selector in selectors.iter() {
+            for selector in selectors.iter().filter(|_| declarations.is_some()) {
+                let declarations = declarations.clone().unwrap_or_else(|| Arc::from([]));
                 if rules.len() >= MAX_RULES {
                     return Err(CssError {
                         offset,
@@ -22745,7 +22763,7 @@ pub fn compute(
     compute_for(kind, parent, index, None, u64::MAX, None, None)
 }
 
-const MAX_CUSTOM_PROPERTIES: usize = 128;
+const MAX_CUSTOM_PROPERTIES: usize = MAX_DECLARATIONS;
 const MAX_VARIABLE_DEPTH: usize = 32;
 const MAX_VARIABLE_BYTES: usize = 8192;
 
@@ -22773,6 +22791,17 @@ fn expand_variables_bounded(
     stack: &mut Vec<String>,
     syntax_only: bool,
     max_bytes: usize,
+) -> Option<String> {
+    expand_variables_indexed(raw, properties, stack, syntax_only, max_bytes, &LINEAR_NAMES)
+}
+
+fn expand_variables_indexed(
+    raw: &str,
+    properties: &[(String, Option<String>)],
+    stack: &mut Vec<String>,
+    syntax_only: bool,
+    max_bytes: usize,
+    index: &NameIndex,
 ) -> Option<String> {
     if stack.len() >= MAX_VARIABLE_DEPTH || raw.len() > max_bytes {
         return None;
@@ -22814,7 +22843,7 @@ fn expand_variables_bounded(
             if syntax_only {
                 if let Some(fallback) = fallback {
                     stack.push(name);
-                    let valid = expand_variables_mode(fallback, properties, stack, true);
+                    let valid = expand_variables_indexed(fallback, properties, stack, true, MAX_VARIABLE_BYTES, index);
                     stack.pop();
                     valid?;
                 }
@@ -22825,19 +22854,17 @@ fn expand_variables_bounded(
             let value = if stack.iter().any(|v| v == &name) {
                 None
             } else {
-                properties
-                    .iter()
-                    .find(|(key, _)| key == &name)
-                    .and_then(|(_, value)| value.as_ref())
+                index.find(properties, &name)
+                    .and_then(|position| properties[position].1.as_ref())
                     .and_then(|value| {
                         stack.push(name.into());
-                        let result = expand_variables(value, properties, stack);
+                        let result = expand_variables_indexed(value, properties, stack, false, MAX_VARIABLE_BYTES, index);
                         stack.pop();
                         result
                     })
             };
             let value = value.or_else(|| {
-                fallback.and_then(|fallback| expand_variables(fallback, properties, stack))
+                fallback.and_then(|fallback| expand_variables_indexed(fallback, properties, stack, false, MAX_VARIABLE_BYTES, index))
             })?;
             if out.len() + value.len() > max_bytes {
                 return None;
@@ -22871,6 +22898,7 @@ fn custom_cycle(
     properties: &[(String, Option<String>)],
     stack: &mut Vec<String>,
     budget: &mut usize,
+    index: &NameIndex,
 ) -> bool {
     if stack.len() >= MAX_VARIABLE_DEPTH || *budget == 0 {
         return true;
@@ -22879,10 +22907,8 @@ fn custom_cycle(
     if stack.iter().any(|v| v == name) {
         return stack.first().is_some_and(|root| root == name);
     }
-    let Some(raw) = properties
-        .iter()
-        .find(|(key, _)| key == name)
-        .and_then(|(_, v)| v.as_ref())
+    let Some(raw) = index.find(properties, name)
+        .and_then(|position| properties[position].1.as_ref())
     else {
         return false;
     };
@@ -22923,12 +22949,12 @@ fn custom_cycle(
                 stack.pop();
                 return true;
             };
-            if custom_cycle(&dependency, properties, stack, budget) {
+            if custom_cycle(&dependency, properties, stack, budget, index) {
                 stack.pop();
                 return true;
             }
             if fallback
-                .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget))
+                .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget, index))
             {
                 stack.pop();
                 return true;
@@ -22955,6 +22981,7 @@ fn custom_value_cycle(
     properties: &[(String, Option<String>)],
     stack: &mut Vec<String>,
     budget: &mut usize,
+    index: &NameIndex,
 ) -> bool {
     if *budget == 0 {
         return true;
@@ -22993,9 +23020,9 @@ fn custom_value_cycle(
             let Some((end, dependency, fallback)) = variable_reference(raw, position + 3) else {
                 return true;
             };
-            if custom_cycle(&dependency, properties, stack, budget)
+            if custom_cycle(&dependency, properties, stack, budget, index)
                 || fallback
-                    .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget))
+                    .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget, index))
             {
                 return true;
             }
@@ -23418,6 +23445,36 @@ type Candidate<'a> = (
     Option<Arc<str>>,
 );
 
+/// Name lookup over an insertion-ordered `(name, value)` list. Short lists use a
+/// linear scan; once a cascade does many lookups the positions are indexed, so a
+/// block of N custom properties costs O(N log N) instead of O(N^2). Positions
+/// stay valid because entries are only appended.
+struct NameIndex(Option<alloc::collections::BTreeMap<String, usize>>);
+
+impl NameIndex {
+    const INDEX_THRESHOLD: usize = 16;
+
+    fn new<K: AsRef<str>, V>(list: &[(K, V)], lookups: usize) -> Self {
+        if lookups < Self::INDEX_THRESHOLD { return Self(None); }
+        let mut map = alloc::collections::BTreeMap::new();
+        for (index, (name, _)) in list.iter().enumerate() { map.entry(name.as_ref().to_string()).or_insert(index); }
+        Self(Some(map))
+    }
+
+    fn find<K: AsRef<str>, V>(&self, list: &[(K, V)], name: &str) -> Option<usize> {
+        match &self.0 {
+            Some(map) => map.get(name).copied(),
+            None => list.iter().position(|(key, _)| key.as_ref() == name),
+        }
+    }
+
+    fn appended(&mut self, name: &str, index: usize) {
+        if let Some(map) = &mut self.0 { map.entry(name.to_string()).or_insert(index); }
+    }
+}
+
+static LINEAR_NAMES: NameIndex = NameIndex(None);
+
 fn cascade_custom_properties(
     parent: Option<&Style>,
     baseline: Option<&Style>,
@@ -23433,9 +23490,24 @@ fn cascade_custom_properties(
         .iter().any(|(_, declaration, _)| matches!(declaration.value, Value::Custom(..))) {
         return Ok(baseline.or(parent).and_then(|v| v.custom.clone()));
     }
+    let custom_declarations = candidates.iter().filter(|(_, declaration, _)| matches!(declaration.value, Value::Custom(..))).count();
+    if registrations.is_empty() && custom_declarations == 0 && blocked.is_empty() && raw_sources.is_none() {
+        // Nothing declares or rewrites a custom property: the inherited list is
+        // already resolved, so share it and only record its provenance.
+        let shared = baseline.or(parent).and_then(|v| v.custom.clone());
+        if let (Some(provenance), Some(list)) = (provenance.as_deref_mut(), shared.as_ref()) {
+            provenance.inherited_custom.try_reserve(list.len()).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+            for (name, _) in list.iter() { provenance.inherited_custom.push(Arc::from(name.as_str())); }
+        }
+        return Ok(shared);
+    }
     let mut custom_properties = baseline.or(parent)
         .map(|v| v.custom_properties().to_vec())
         .unwrap_or_default();
+    let lookups = custom_declarations + registrations.len() + blocked.len();
+    let mut custom_index = NameIndex::new(&custom_properties, lookups);
+    let mut computed_index = NameIndex::new::<String, Option<Arc<str>>>(&[], lookups);
+    let mut sources_index = NameIndex::new::<Arc<str>, usize>(&[], lookups);
     let inherited = |name: &str| parent.and_then(|style| style.custom_properties().iter()
         .find(|(key, _)| key == name)).map(|(_, value)| value.clone());
     let initial = |name: &str| registrations.iter().find(|property| property.name == name)
@@ -23448,9 +23520,8 @@ fn cascade_custom_properties(
     };
     for registration in registrations {
         let value = default_value(&registration.name);
-        if let Some((_, previous)) = custom_properties.iter_mut().find(|(name, _)| *name == registration.name) { if baseline.is_none(){*previous = value;} }
-        else if custom_properties.len() < MAX_CUSTOM_PROPERTIES { custom_properties.push((registration.name.clone(), value)); }
-        else { return Err(CssError { offset: 0, message: "too many custom properties" }); }
+        if let Some(position) = custom_index.find(&custom_properties, &registration.name) { if baseline.is_none(){custom_properties[position].1 = value;} }
+        else if custom_properties.len() < MAX_CUSTOM_PROPERTIES { custom_index.appended(&registration.name, custom_properties.len()); custom_properties.push((registration.name.clone(), value)); }
     }
     let mut custom_layer = None;
     let has_custom_revert_layer = candidates.iter().any(
@@ -23473,18 +23544,20 @@ fn cascade_custom_properties(
             if !registrations.is_empty() {
                 let url = if raw.as_ref()=="revert-layer" {baseline_urls.iter().find(|(key,_)| key==name.as_ref()).and_then(|(_,url)|url.clone())}
                     else {source_url.clone()};
-                if let Some((_,previous))=computed_sources.iter_mut().find(|(key,_)| key==name.as_ref()) {*previous=url;}
-                else {computed_sources.push((name.to_string(),url));}
+                if let Some(position)=computed_index.find(&computed_sources,name.as_ref()) {computed_sources[position].1=url;}
+                else {computed_index.appended(name.as_ref(),computed_sources.len());computed_sources.push((name.to_string(),url));}
             }
             if provenance.is_some() && !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
                 let source = if raw.as_ref() == "revert-layer" {
                     baseline_sources.iter().find(|(key, _)| key == name).map_or(0, |(_, source)| *source)
                 } else { order + 1 };
-                if let Some((_, previous)) = custom_sources.iter_mut().find(|(key, _)| key == name) { *previous = source; }
+                if let Some(position) = sources_index.find(&custom_sources, name.as_ref()) { custom_sources[position].1 = source; }
                 else {
-                    if custom_sources.len() >= MAX_CUSTOM_PROPERTIES { return Err(CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" }); }
-                    custom_sources.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-                    custom_sources.push((name.clone(), source));
+                    if custom_sources.len() < MAX_CUSTOM_PROPERTIES {
+                        custom_sources.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                        sources_index.appended(name.as_ref(), custom_sources.len());
+                        custom_sources.push((name.clone(), source));
+                    }
                 }
             }
             let value = match &**raw {
@@ -23495,24 +23568,17 @@ fn cascade_custom_properties(
                     .map(|(_, value)| value.clone()).unwrap_or_else(|| default_value(name)),
                 _ => Some(raw.to_string()),
             };
-            if let Some((_, existing)) = custom_properties
-                .iter_mut()
-                .find(|(key, _)| key.as_str() == &**name)
-            {
-                *existing = value;
+            if let Some(position) = custom_index.find(&custom_properties, name) {
+                custom_properties[position].1 = value;
             } else if custom_properties.len() < MAX_CUSTOM_PROPERTIES {
+                custom_index.appended(name, custom_properties.len());
                 custom_properties.push((name.to_string(), value));
-            } else {
-                return Err(CssError {
-                    offset: 0,
-                    message: "too many custom properties",
-                });
             }
         }
     }
     if let Some(provenance) = provenance.as_deref_mut() {
         for (name, _) in &custom_properties {
-            let source = custom_sources.iter().find(|(key, _)| key.as_ref() == name).map_or(0, |(_, source)| *source);
+            let source = sources_index.find(&custom_sources, name).map_or(0, |position| custom_sources[position].1);
             let registration = registrations.iter().find(|registration| registration.name == *name);
             let inherited = if source == 0 { registration.is_none_or(|registration| registration.inherits) }
                 else { match &candidates[source - 1].1.value {
@@ -23539,17 +23605,18 @@ fn cascade_custom_properties(
     }
     if let Some(sources) = raw_sources { *sources = Some(Arc::from(custom_properties.clone())); }
     for name in blocked {
-        if let Some((_, value)) = custom_properties.iter_mut().find(|(key, _)| key == name) {
-            *value = if registrations.iter().any(|registration|registration.name==*name){initial(name)}else{None};
+        if let Some(position) = custom_index.find(&custom_properties, name) {
+            custom_properties[position].1 = if registrations.iter().any(|registration|registration.name==*name){initial(name)}else{None};
         }
     }
     let needs_work = |value: &Option<String>| value.as_deref().is_some_and(needs_expansion);
     if custom_properties.iter().any(|(_, value)| needs_work(value)) {
+        let lookup_index = NameIndex::new(&custom_properties, custom_properties.len());
         let cyclic: Vec<bool> = custom_properties
             .iter()
             .map(|(name, value)| {
                 needs_work(value)
-                    && custom_cycle(name, &custom_properties, &mut Vec::new(), &mut 4096)
+                    && custom_cycle(name, &custom_properties, &mut Vec::new(), &mut 4096, &lookup_index)
             })
             .collect();
         for ((_, value), cyclic) in custom_properties.iter_mut().zip(cyclic) {
@@ -23562,7 +23629,7 @@ fn cascade_custom_properties(
             .iter()
             .map(|(_, value)| match value.as_deref() {
                 Some(value) if needs_expansion(value) => {
-                    Some(expand_variables(value, &custom_properties, &mut Vec::new()))
+                    Some(expand_variables_indexed(value, &custom_properties, &mut Vec::new(), false, MAX_VARIABLE_BYTES, &lookup_index))
                 }
                 _ => None,
             })
@@ -34295,6 +34362,21 @@ mod tests {
     }
 
     #[test]
+    fn rules_with_thousands_of_custom_properties_compute_and_overflow_is_dropped() {
+        let document = crate::html::parse("<html><body><div id='target'></div></body></html>", 16).unwrap();
+        let html = crate::selector::query_selector(&document, document.root(), "html").unwrap().unwrap();
+        let body = crate::selector::query_selector(&document, document.root(), "body").unwrap().unwrap();
+        let target = crate::selector::query_selector(&document, document.root(), "#target").unwrap().unwrap();
+        let tokens = |prefix: &str| -> String { (0..3000).map(|index| alloc::format!("--{prefix}{index}:{};", if index == 2999 { "var(--a0)".to_string() } else { alloc::format!("#{index:06x}") })).collect() };
+        let stylesheet = alloc::format!(":root{{{}--a0:red}} :root{{{}}} div{{color:var(--a2999)}}", tokens("a"), tokens("b"));
+        let index = StyleIndex::new(parse(&stylesheet).unwrap());
+        let html_style = compute_node(&document, html, None, &index).unwrap();
+        assert_eq!(html_style.custom_properties().len(), MAX_CUSTOM_PROPERTIES, "overflow past the cap is dropped, not an error");
+        let body_style = compute_node(&document, body, Some(&html_style), &index).unwrap();
+        assert_eq!(compute_node(&document, target, Some(&body_style), &index).unwrap().color, color("red").unwrap());
+    }
+
+    #[test]
     fn absolute_lengths_and_calc_preserve_dimensions_and_precedence() {
         for (source, expected) in [
             ("1in", 96.0),
@@ -36734,12 +36816,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_css_rules() {
-        let stylesheet = alloc::format!("p {{ {} }}", "color:red;".repeat(MAX_DECLARATIONS + 1));
+    fn declaration_limit_is_a_typed_error_distinct_from_source_item_limit() {
+        let oversized_block = "margin:0;".repeat(MAX_DECLARATIONS + 1);
+        let oversized = declarations(&oversized_block, 0).unwrap_err();
+        assert!(oversized.is_declaration_limit());
+        assert_eq!(oversized.message, TOO_MANY_DECLARATIONS);
+        assert!(!CssError { offset: 0, message: "too many CSS source items" }.is_declaration_limit());
         assert_eq!(
-            parse(&stylesheet).unwrap_err().message,
-            "too many declarations"
+            parse(&alloc::format!("q {{ {oversized_block} }} a {{ color:blue }}")).unwrap_err().message,
+            "too many CSS source items",
+            "a block past the source-item bound is a sheet error, not a typed declaration limit"
         );
+        let repeated = alloc::format!("q {{ {} }} a {{ color:blue }}", "border-radius:1px;".repeat(MAX_DECLARATIONS / 2));
+        assert_eq!(parse(&repeated).unwrap().len(), 2, "repeated shorthand expansion deduplicates instead of failing the rule");
+    }
+
+    #[test]
+    fn oversized_declaration_block_is_bounded_by_source_items() {
+        let block = |count: usize| -> String { (0..count).map(|index| alloc::format!("--v{index}:1;")).collect() };
+        let rules = parse(&alloc::format!("p {{ {} }} a {{ color:blue }}", block(MAX_DECLARATIONS))).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].declarations.len(), MAX_DECLARATIONS);
+        assert_eq!(
+            parse(&alloc::format!("p {{ {} }}", block(MAX_DECLARATIONS + 1))).unwrap_err().message,
+            "too many CSS source items"
+        );
+    }
+
+    #[test]
+    fn accepts_design_token_rules_with_hundreds_of_custom_properties() {
+        let tokens: String = (0..300).map(|index| alloc::format!("--token-{index}:#{index:06x};")).collect();
+        let stylesheet = alloc::format!("@media screen {{ :root {{ {tokens} }} }} p {{ color:var(--token-299) }}");
+        let rules = parse(&stylesheet).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].declarations.len(), 300);
     }
 
     #[test]
