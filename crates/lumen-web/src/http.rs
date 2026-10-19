@@ -597,7 +597,7 @@ fn one_request(
     config: &crate::FetchConfig,
     upload: Option<&lumen_common::http_body::UploadProgress>,
 ) -> Result<OpenHttpResponse, String> {
-    if method.is_empty() || !method.bytes().all(http_token_byte) {
+    if !lumen_common::http_body::is_token(method) {
         return Err("fetch: invalid HTTP method".into());
     }
     let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
@@ -725,10 +725,6 @@ fn one_request(
 
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
-
-fn http_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-}
 
 #[cfg(test)]
 mod tests {

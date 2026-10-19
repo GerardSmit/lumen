@@ -8,8 +8,99 @@ pub fn mime_essence(raw:&str)->Option<&str> {
     let essence=raw.split(';').next()?.trim_end_matches(|c|matches!(c,' '| '\t' | '\r' | '\n'));
     if mediatype::MediaType::parse(essence).is_ok() {return Some(essence)}
     let (ty,subty)=essence.split_once('/')?;
-    (!ty.is_empty() && !subty.is_empty() && ty.bytes().all(crate::http_body::token)
-        && subty.bytes().all(crate::http_body::token)).then_some(essence)
+    (!ty.is_empty() && !subty.is_empty() && ty.bytes().all(crate::http_body::is_token_byte)
+        && subty.bytes().all(crate::http_body::is_token_byte)).then_some(essence)
+}
+
+/// Value of parameter `name` from WHATWG MIME Sniffing's "parse a MIME type"; `None` when the type fails to parse or lacks the parameter.
+pub fn parameter(input: &str, name: &str) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let ws = |c: char| matches!(c, '\n' | '\r' | '\t' | ' ');
+    let token = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii() && crate::http_body::is_token_byte(c as u8));
+    let chars: Vec<char> = input.trim_matches(ws).chars().collect();
+    let len = chars.len();
+    let mut pos = 0;
+    while pos < len && chars[pos] != '/' {
+        pos += 1;
+    }
+    let ty: String = chars[..pos].iter().collect();
+    if !token(&ty) || pos >= len {
+        return None;
+    }
+    pos += 1;
+    let start = pos;
+    while pos < len && chars[pos] != ';' {
+        pos += 1;
+    }
+    let subtype: String = chars[start..pos].iter().collect();
+    if !token(subtype.trim_end_matches(ws)) {
+        return None;
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    while pos < len {
+        pos += 1;
+        while pos < len && ws(chars[pos]) {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < len && chars[pos] != ';' && chars[pos] != '=' {
+            pos += 1;
+        }
+        let pname: String = chars[start..pos].iter().collect::<String>().to_ascii_lowercase();
+        if pos < len && chars[pos] == ';' {
+            continue;
+        }
+        if pos >= len {
+            break;
+        }
+        pos += 1;
+        if pos >= len {
+            break;
+        }
+        let value: String = if chars[pos] == '"' {
+            pos += 1;
+            let mut buf = String::new();
+            while pos < len {
+                let c = chars[pos];
+                pos += 1;
+                if c == '"' {
+                    break;
+                }
+                if c == '\\' {
+                    if pos >= len {
+                        buf.push('\\');
+                        break;
+                    }
+                    buf.push(chars[pos]);
+                    pos += 1;
+                } else {
+                    buf.push(c);
+                }
+            }
+            while pos < len && chars[pos] != ';' {
+                pos += 1;
+            }
+            buf
+        } else {
+            let start = pos;
+            while pos < len && chars[pos] != ';' {
+                pos += 1;
+            }
+            let v: String = chars[start..pos].iter().collect();
+            let v = v.trim_end_matches(ws);
+            if v.is_empty() {
+                continue;
+            }
+            v.into()
+        };
+        let value_ok = value.chars().all(|c| matches!(c, '\t' | ' '..='~' | '\u{80}'..='\u{ff}'));
+        if token(&pname) && value_ok && !found.iter().any(|(n, _)| *n == pname) {
+            found.push((pname, value));
+        }
+    }
+    let name = name.to_ascii_lowercase();
+    found.into_iter().find(|(n, _)| *n == name).map(|(_, v)| v)
 }
 
 /// Image formats available to the shared static image decoder. A CSS image-set
@@ -115,6 +206,28 @@ pub fn determine_nosniff(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_follows_whatwg_parse_a_mime_type() {
+        let cs = |s: &str| parameter(s, "charset");
+        assert_eq!(cs("text/html;charset=gbk").as_deref(), Some("gbk"));
+        assert_eq!(cs("TEXT/HTML;CHARSET=GBK").as_deref(), Some("GBK"));
+        assert_eq!(cs("text/html;charset=gbk(").as_deref(), Some("gbk("));
+        assert_eq!(cs("text/html;x=(;charset=gbk").as_deref(), Some("gbk"));
+        assert_eq!(cs("text/html;charset=gbk;charset=windows-1255").as_deref(), Some("gbk"));
+        assert_eq!(cs("text/html;charset=\"gbk\"").as_deref(), Some("gbk"));
+        assert_eq!(cs("text/html;charset=\"gbk").as_deref(), Some("gbk"));
+        assert_eq!(cs("text/html;charset=\"g\\\"bk\"").as_deref(), Some("g\"bk"));
+        assert_eq!(cs("text/html;charset=  ;x=y"), None);
+        assert_eq!(cs("text/html;charset=gbk   ").as_deref(), Some("gbk"));
+        assert_eq!(cs("text/html ;charset=gbk").as_deref(), Some("gbk"));
+        assert_eq!(cs("/html;charset=gbk"), None);
+        assert_eq!(cs("text/;charset=gbk"), None);
+        assert_eq!(cs("text html;charset=gbk"), None);
+        assert_eq!(cs("text/html;charset=g\u{0}bk"), None);
+        assert_eq!(cs("text/html;ch\u{e5}rset=gbk"), None);
+        assert_eq!(cs("text/html;charset=\"g\\").as_deref(), Some("g\\"));
+    }
 
     #[test]
     fn specification_image_types_share_decoder_capabilities_and_validate_parameters() {

@@ -606,13 +606,18 @@ fn valid_header_line(line: &[u8]) -> bool {
         return false;
     };
     colon != 0
-        && line[..colon].iter().all(|&b| token(b))
+        && line[..colon].iter().all(|&b| is_token_byte(b))
         && line[colon + 1..]
             .iter()
             .all(|&b| b == b'\t' || b >= 32 && b != 127)
 }
-pub(crate) fn token(byte: u8) -> bool {
+/// Whether `byte` is an RFC 9110 `tchar`.
+pub fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+/// Whether `text` is an HTTP token (a method or a header name).
+pub fn is_token(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(is_token_byte)
 }
 
 pub struct ResponseHead {
@@ -630,7 +635,7 @@ pub fn request_head(
     user_agent: &str,
 ) -> Result<String, Error> {
     use alloc::format;
-    if method.is_empty() || !method.bytes().all(token) {
+    if !is_token(method) {
         return Err(Error("invalid HTTP method"));
     }
     let host = url.port.map_or_else(
@@ -644,7 +649,7 @@ pub fn request_head(
     let mut have_agent = false;
     for (name, value) in headers {
         if name.is_empty()
-            || !name.bytes().all(token)
+            || !is_token(name)
             || value
                 .bytes()
                 .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
@@ -733,6 +738,15 @@ pub fn response_head(bytes: &[u8]) -> Result<ResponseHead, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_token_accepts_only_non_empty_tchar_text() {
+        assert!(!is_token(""));
+        assert!(is_token("GET"));
+        assert!(!is_token("a b"));
+        assert!(is_token("x-custom"));
+    }
+
     #[test]
     fn synchronous_http_messages_roundtrip_binary_bodies_and_validate_lengths() {
         let request = SyncHttpRequest {

@@ -5,11 +5,11 @@
 //! mutations are silently dropped (forbidden request headers in a browsing context) or refused
 //! (an immutable response).
 
-use super::is_token;
 use crate::webidl::usv_string;
 use lumen::embed::{ArgCx, Ctx, JsHost, OpError, OpResult, Slot, Value};
 use lumen::embed::bind::FromArg;
-use lumen_common::cors::{is_forbidden_request_header, is_no_cors_safelisted_header};
+use lumen_common::cors::{is_forbidden_request_header, is_forbidden_response_header, is_no_cors_safelisted_header};
+use lumen_common::http_body::is_token;
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,10 +62,6 @@ pub(crate) fn normalize_value(value: &str) -> &str {
 
 fn is_valid_value(value: &str) -> bool {
     !value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
-}
-
-fn is_forbidden_response_header(name: &str) -> bool {
-    matches!(name, "set-cookie" | "set-cookie2")
 }
 
 fn is_privileged_no_cors(name: &str) -> bool {

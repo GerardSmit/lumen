@@ -124,7 +124,7 @@ impl FetchPolicy {
             method.to_string()
         };
         if method.is_empty()
-            || !method.bytes().all(is_http_token_byte)
+            || !method.bytes().all(crate::http_body::is_token_byte)
             || ["CONNECT", "TRACE", "TRACK"]
                 .iter()
                 .any(|blocked| method.eq_ignore_ascii_case(blocked))
@@ -416,29 +416,9 @@ impl FetchPolicy {
 pub fn is_safelisted_method(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "POST")
 }
-fn is_http_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
 fn valid_header(name: &str, value: &str) -> bool {
     !name.is_empty()
-        && name.bytes().all(is_http_token_byte)
+        && name.bytes().all(crate::http_body::is_token_byte)
         && value.chars().all(|character| character as u32 <= 0xff)
         && !value.bytes().any(|byte| {
             byte == 0
@@ -575,11 +555,9 @@ fn is_request_body_header(name: &str) -> bool {
         "content-encoding" | "content-language" | "content-location" | "content-type"
     )
 }
-fn is_forbidden_response_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "set-cookie" | "set-cookie2"
-    )
+/// Whether `name` is a Fetch forbidden response-header name.
+pub fn is_forbidden_response_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
 }
 fn is_cors_safelisted_response_header(name: &str) -> bool {
     matches!(
@@ -642,6 +620,13 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 
 extern crate alloc;
 
+#[cfg(test)]
+#[test]
+fn forbidden_response_headers_are_matched_case_insensitively() {
+    assert!(is_forbidden_response_header("Set-Cookie"));
+    assert!(is_forbidden_response_header("set-cookie2"));
+    assert!(!is_forbidden_response_header("cookie"));
+}
 #[cfg(test)]
 #[test]
 fn upload_listeners_force_preflight_only_across_origins() {

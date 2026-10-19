@@ -5,6 +5,11 @@
 use crate::search;
 use std::ops::Range;
 
+/// The `boundary` parameter of a `multipart/*` Content-Type value, unquoted; `None` when absent or empty.
+pub fn boundary(content_type: &str) -> Option<String> {
+    crate::mime::parameter(content_type, "boundary").filter(|b| !b.is_empty())
+}
+
 /// The value of one entry to encode.
 pub enum Value<'a> {
     Text(&'a str),
@@ -208,6 +213,23 @@ pub fn decode(bytes: &[u8], boundary: &str) -> Vec<Part> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_reads_the_boundary_parameter() {
+        assert_eq!(boundary("multipart/form-data; boundary=abc").as_deref(), Some("abc"));
+        assert_eq!(boundary("multipart/form-data; boundary=\"a b\"").as_deref(), Some("a b"));
+        assert_eq!(
+            boundary("multipart/form-data; boundary=\"a;b\"; charset=utf-8").as_deref(),
+            Some("a;b")
+        );
+        assert_eq!(boundary("multipart/form-data; xboundary=abc"), None);
+        assert_eq!(boundary("multipart/form-data; BOUNDARY=abc").as_deref(), Some("abc"));
+        assert_eq!(boundary("multipart/form-data"), None);
+        assert_eq!(
+            boundary("multipart/form-data; boundary=----=_Part_0/x:y").as_deref(),
+            Some("----=_Part_0/x:y")
+        );
+    }
 
     #[test]
     fn round_trips_text_and_file_entries() {

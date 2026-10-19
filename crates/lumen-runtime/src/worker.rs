@@ -352,7 +352,7 @@ fn prepare_web_worker_entry(
                     "file Worker URL cannot name a remote host",
                 ));
             }
-            let entry = percent_decode_path(&url.path)
+            let entry = lumen_common::url::percent_decoded_path(&url.path)
                 .ok_or_else(|| NativeError::named("SyntaxError", "invalid escape in Worker URL"))?;
             let href = url.href();
             Ok((entry, false, None, Some(href)))
@@ -365,10 +365,6 @@ fn prepare_web_worker_entry(
             ),
         )),
     }
-}
-
-fn percent_decode_path(path: &str) -> Option<String> {
-    String::from_utf8(lumen_common::codec::percent_decode_strict(path.as_bytes())?).ok()
 }
 
 fn start_thread(

@@ -1522,6 +1522,11 @@ pub fn parse(input: &str, base: Option<&str>) -> Result<Url, String> {
     parse_url(input, base.as_ref()).ok_or_else(|| format!("invalid URL '{input}'"))
 }
 
+/// A URL path with its percent escapes decoded, or `None` for an invalid escape or non-UTF-8 bytes.
+pub fn percent_decoded_path(path: &str) -> Option<String> {
+    alloc::string::String::from_utf8(crate::codec::percent_decode_strict(path.as_bytes())?).ok()
+}
+
 /// Node's `url.domainToASCII`: the hostname a special URL would get, or "" when invalid.
 pub fn domain_to_ascii(input: &str) -> String {
     if input.is_empty() {
@@ -1626,6 +1631,14 @@ mod tests {
 
     fn href(s: &str) -> String {
         parse(s, None).unwrap().href()
+    }
+
+    #[test]
+    fn percent_decoded_path_decodes_and_rejects() {
+        assert_eq!(percent_decoded_path("/a/b.js").as_deref(), Some("/a/b.js"));
+        assert_eq!(percent_decoded_path("/a%20b.js").as_deref(), Some("/a b.js"));
+        assert_eq!(percent_decoded_path("/a%zz.js"), None);
+        assert_eq!(percent_decoded_path("/a%ff.js"), None);
     }
 
     #[test]

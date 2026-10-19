@@ -8,12 +8,13 @@
 use super::body::{charset_of, decode_text, essence_of, extract_body, ExtractedBody};
 use super::flow::{header, start, RequestControl, RequestSpec, Response, ResponseKind};
 use super::transport::{cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, Transport};
-use super::{dom_error, has_global_object, is_token};
+use super::{dom_error, has_global_object};
+use lumen_common::http_body::is_token;
 use crate::blob::new_blob;
 use crate::events::{Event, EventTarget};
 use crate::timers::{set_timeout, Timer};
 use lumen::embed::{Ctx, OpError, OpResult, Value};
-use lumen_common::cors::{is_forbidden_request_header, Credentials, Mode, Redirect};
+use lumen_common::cors::{is_forbidden_request_header, is_forbidden_response_header, Credentials, Mode, Redirect};
 use std::{cell::RefCell, rc::Rc};
 
 const UPLOAD_POLL_MS: f64 = 50.0;
@@ -1364,7 +1365,7 @@ pub mod bindings {
         fn get_response_header(&self, name: &str) -> Value {
             let state = self.core.s.borrow();
             let name = name.to_ascii_lowercase();
-            if state.ready < 2 || name == "set-cookie" || name == "set-cookie2" {
+            if state.ready < 2 || is_forbidden_response_header(&name) {
                 return Value::Null;
             }
             state
@@ -1381,7 +1382,7 @@ pub mod bindings {
             let mut headers: Vec<_> = state
                 .response_headers
                 .iter()
-                .filter(|(name, _)| name != "set-cookie" && name != "set-cookie2")
+                .filter(|(name, _)| !is_forbidden_response_header(name))
                 .collect();
             headers.sort();
             headers

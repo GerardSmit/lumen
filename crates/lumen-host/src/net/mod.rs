@@ -83,14 +83,6 @@ pub fn dom_error(ctx: &mut Ctx, name: &str, message: impl AsRef<str>) -> OpError
     OpError::thrown(ctx.new_instance(DomException::with_name(message.as_ref(), name)))
 }
 
-/// Whether `text` is an HTTP token (a method or a header name).
-pub(crate) fn is_token(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-}
-
 pub(crate) fn has_global_object(ctx: &mut Ctx, name: &str) -> bool {
     let global = ctx.global_object();
     matches!(ctx.member_get(&global, name), Ok(Value::Obj(_)))

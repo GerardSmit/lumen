@@ -361,7 +361,7 @@ fn build_request(ctx: &mut Ctx, input: &Value, init: &Value) -> OpResult<binding
     }
     if !matches!(init_method, Value::Undefined) {
         let text = byte_string(ctx, &init_method)?;
-        if !super::is_token(&text) {
+        if !lumen_common::http_body::is_token(&text) {
             return Err(OpError::type_error(format!("'{text}' is not a valid HTTP method.")));
         }
         if FORBIDDEN_METHODS.contains(&text.to_ascii_uppercase().as_str()) {
@@ -548,15 +548,6 @@ enum Consume {
     FormData,
 }
 
-fn boundary_of(content_type: &str) -> Option<String> {
-    let lower = content_type.to_ascii_lowercase();
-    let at = lower.find("boundary=")?;
-    let rest = &content_type[at + "boundary=".len()..];
-    let end = rest.find(';').unwrap_or(rest.len());
-    let boundary = rest[..end].trim().trim_matches('"');
-    (!boundary.is_empty()).then(|| boundary.to_owned())
-}
-
 fn convert(ctx: &mut Ctx, kind: Consume, bytes: Vec<u8>, content_type: String) -> OpResult<Value> {
     match kind {
         Consume::Text => Ok(Value::from_string(decode_text(&bytes, Some("utf-8")))),
@@ -579,7 +570,7 @@ fn convert(ctx: &mut Ctx, kind: Consume, bytes: Vec<u8>, content_type: String) -
                 }
                 Ok(form)
             }
-            "multipart/form-data" => match boundary_of(&content_type) {
+            "multipart/form-data" => match lumen_common::multipart::boundary(&content_type) {
                 Some(boundary) => decode_multipart(ctx, &Bytes::new(bytes), &boundary),
                 None => Err(OpError::type_error(
                     "formData(): multipart/form-data without a boundary",
@@ -861,7 +852,7 @@ pub fn request_from_parts(
     credentials: Credentials,
     redirect: Redirect,
 ) -> OpResult<Value> {
-    if !super::is_token(method) {
+    if !lumen_common::http_body::is_token(method) {
         return Err(OpError::type_error(format!("'{method}' is not a valid HTTP method.")));
     }
     if FORBIDDEN_METHODS.contains(&method.to_ascii_uppercase().as_str()) {

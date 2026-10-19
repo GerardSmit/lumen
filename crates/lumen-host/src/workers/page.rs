@@ -167,10 +167,6 @@ fn resolve_dedicated(ctx: &mut Ctx, script_url: &str) -> OpResult<(String, Optio
     }
 }
 
-fn percent_decode_path(path: &str) -> Option<String> {
-    String::from_utf8(lumen_common::codec::percent_decode_strict(path.as_bytes())?).ok()
-}
-
 /// A shared worker's identity, what it runs and whether that is fetched, from the constructor's
 /// URL. The base is the page's location, or the realm's working directory without one.
 fn resolve_shared(
@@ -219,7 +215,7 @@ fn resolve_shared(
         ));
     }
     let (url, entry, remote) = if parsed.scheme == "file" {
-        let entry = percent_decode_path(&parsed.path).ok_or_else(|| {
+        let entry = lumen_common::url::percent_decoded_path(&parsed.path).ok_or_else(|| {
             dom_error(ctx, "SyntaxError", "invalid escape in shared worker URL")
         })?;
         let canonical =
