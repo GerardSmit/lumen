@@ -21704,7 +21704,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
     fn paint_positioned_flex_children(
         &mut self,
-        positioned: Vec<(NodeId, Style, f32, f32)>,
+        positioned: Vec<(PositionedBoxSource, Style, f32, f32)>,
         style: &Style,
         x: f32,
         y: f32,
@@ -21713,7 +21713,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         reverse: bool,
         depth: usize,
     ) -> Result<(), LayoutError> {
-        for (node, item_style, w, h) in positioned {
+        for (source, item_style, w, h) in positioned {
             let main_extent = if row {
                 width
             } else {
@@ -21757,17 +21757,46 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             let local=self.content_overflow_origin(x,y);
             self.pending_overflow_moves=true;self.pending_overflow_placement=Some((local.0+f64::from(if row {main}else{cross}),local.1+f64::from(if row {cross}else{main})));
-            self.box_for(
-                node,
+            self.paint_positioned_box_source(
+                source,
                 style,
-                Some(item_style),
+                item_style,
                 x + if row { main } else { cross },
                 y + if row { cross } else { main },
                 width,
                 depth + 1,
+                0,
             )?;
         }
         Ok(())
+    }
+
+    /// An out-of-flow generated child of a flex container is sized like a
+    /// positioned element and painted by the container's positioned pass.
+    fn virtual_positioned_flex_item(
+        &self,
+        child: VirtualGeneratedChild,
+        width: f32,
+        depth: usize,
+    ) -> Result<(PositionedBoxSource, Style, f32, f32), LayoutError> {
+        if depth > 512 {
+            return Err(LayoutError::DepthLimit);
+        }
+        let mut item_style =
+            self.resolve_style_percentages(&child.unresolved_style, width, self.parent_height);
+        for horizontal in [true, false] {
+            resolve_intrinsic_axis_with(
+                &mut item_style,
+                horizontal,
+                if horizontal { Some(width) } else { self.parent_height },
+                |measurement, minimum| {
+                    self.intrinsic_virtual_generated_size_impl(&child, measurement, minimum)
+                },
+            )?;
+        }
+        let (w, h) = self.intrinsic_virtual_generated_size(&child, &item_style, false)?;
+        tmpstd::eprintln!("TMPPOS {:?} class={:?} id={:?} z={:?} w={w} h={h}", child.pseudo as u8, self.document.get_attribute_ns_ref(child.origin,None,"class"), self.document.get_attribute_ns_ref(child.origin,None,"id"), item_style.z_index);
+        Ok((PositionedBoxSource::Generated(child), item_style, w, h))
     }
 
     fn virtual_flex_item(
@@ -21991,7 +22020,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     fn push_flex_item(
         &mut self,
         items: &mut Vec<FlexItem>,
-        positioned: &mut Vec<(NodeId, Style, f32, f32)>,
+        positioned: &mut Vec<(PositionedBoxSource, Style, f32, f32)>,
         node: NodeId,
         mut item_style: Style,
         anonymous_text: Option<InlineParagraph>,
@@ -22030,7 +22059,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             positioned
                 .try_reserve(1)
                 .map_err(|_| LayoutError::CommandLimit)?;
-            positioned.push((node, item_style, w, h));
+            positioned.push((PositionedBoxSource::Node(node), item_style, w, h));
             return Ok(());
         }
         let edges = box_edges(&item_style, row);
@@ -22272,7 +22301,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } = child;
             let node = match child_kind {
                 FlattenedBoxChildKind::Generated(generated) => {
-
+                    if matches!(generated.style.position, Position::Absolute | Position::Fixed) {
+                        if positioned.len() >= MAX_DISPLAY_COMMANDS {
+                            return Err(LayoutError::CommandLimit);
+                        }
+                        positioned
+                            .try_reserve(1)
+                            .map_err(|_| LayoutError::CommandLimit)?;
+                        positioned.push(self.virtual_positioned_flex_item(generated, width, depth + 1)?);
+                        continue;
+                    }
                     if items.len() >= MAX_DISPLAY_COMMANDS {
                         return Err(LayoutError::CommandLimit);
                     }
@@ -31884,8 +31922,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 for record in entries[..early].iter().rev().chain(entries[early..].iter()) {
                     if !context.real && matches!(record.phase,3|8|9){return Err(LayoutError::InvalidTree);}
                     let after=record.phase<=5;let destination=key*2+usize::from(!after);
-                    if record.entry.2<record.entry.3 {commands.move_relative(record.anchors,destination,after)?;}
-                    if record.entry.4<record.entry.5 {hits.move_relative(record.anchors,destination,after)?;}
+                    if record.entry.2<record.entry.3 {if let Err(e)=commands.move_relative(record.anchors,destination,after){tmpstd::eprintln!("TMPMOVE {:?} id={:?} pseudo={:?} class={:?} phase={} z={} range={}..{} key={key} real={}",e,record.entry.7.0,record.entry.7.1.map(|p|p as u8),self.document.get_attribute_ns_ref(record.entry.7.0,None,"class"),record.phase,record.entry.6,record.entry.2,record.entry.3,context.real);return Err(e);}}
+                    if record.entry.4<record.entry.5 {if let Err(e)=hits.move_relative(record.anchors,destination,after){tmpstd::eprintln!("TMPMOVEH {:?} id={:?} pseudo={:?} class={:?} phase={} z={} range={}..{} key={key} real={}",e,record.entry.7.0,record.entry.7.1.map(|p|p as u8),self.document.get_attribute_ns_ref(record.entry.7.0,None,"class"),record.phase,record.entry.6,record.entry.4,record.entry.5,context.real);return Err(e);}}
                 }
             }
         }
@@ -53782,3 +53820,5 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
     }
 
 }
+
+extern crate std as tmpstd;
