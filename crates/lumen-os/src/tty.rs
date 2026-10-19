@@ -293,7 +293,10 @@ pub fn login_tty(fd: i32) -> R<()> {
 /// The `termios` module's constants on this platform (flags, speeds, control-character indexes,
 /// `ioctl` requests).
 pub fn constants() -> Vec<(&'static str, i64)> {
+    #[cfg(unix)]
     let mut v: Vec<(&'static str, i64)> = Vec::new();
+    #[cfg(not(unix))]
+    let v: Vec<(&'static str, i64)> = Vec::new();
     #[cfg(unix)]
     v.push(("NCCS", nccs() as i64));
     #[cfg(any(target_os = "linux", target_os = "android"))]

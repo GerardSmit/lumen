@@ -33,10 +33,13 @@ impl ImageEventKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone,Copy,Debug)]
 pub(crate) struct QueuedImageEvent {
     pub(crate) node: NodeId,
     pub(crate) generation: u64,
+    /// Image Button fetch completions survive later source/type changes.
+    pub(crate) captured_input: bool,
+    pub(crate) input_task: Option<core::num::NonZeroUsize>,
     pub(crate) kind: ImageEventKind,
 }
 
@@ -46,7 +49,8 @@ pub(crate) struct ImageSnapshot {
     pub(crate) current_src: String,
     pub(crate) natural_width: u32,
     pub(crate) natural_height: u32,
-    pub(crate) origin_clean: bool,
+    /// Exact committed dimensions precede the unsigned WebIDL projection.
+    pub(crate) natural_size: Option<(f64,f64)>,
 }
 
 /// The image source state exposed to canvas consumers. Pending or absent
@@ -67,17 +71,23 @@ enum RequestState {
     Broken,
 }
 
-#[derive(Default)]
 struct ImageRequest {
     current_src: String,
     generation: u64,
     state: RequestState,
     image: Option<Arc<ImageData>>,
+    intrinsic:Option<lumen_html::object::IntrinsicSize>,
+    density:f64,
     force_error: bool,
     event_queued: bool,
     origin_clean: bool,
+    response_policy:Option<ResponsePolicy>,
+    parameters:lumen_html::layout::ImageRequestParameters,
 }
 
+impl Default for ImageRequest {
+    fn default()->Self {Self{current_src:String::new(),generation:0,state:RequestState::Unavailable,image:None,intrinsic:None,density:1.0,force_error:false,event_queued:false,origin_clean:false,response_policy:None,parameters:lumen_html::layout::ImageRequestParameters::html_image(None)}}
+}
 impl ImageRequest {
     fn loading(current_src: String, generation: u64, force_error: bool) -> Self {
         Self {
@@ -85,9 +95,13 @@ impl ImageRequest {
             generation,
             state: RequestState::Loading,
             image: None,
+            intrinsic:None,
+            density:1.0,
             force_error,
             event_queued: false,
             origin_clean: false,
+            response_policy:None,
+            parameters:lumen_html::layout::ImageRequestParameters::html_image(None),
         }
     }
 }
@@ -98,23 +112,38 @@ struct Request {
     // its inner option distinguishes an omitted src from src="".
     selected_source: Option<Option<String>>,
     selected_crossorigin: Option<Option<bool>>,
+    selected_density:Option<f64>,
+    observed_version:Option<u64>,
+    environment_dirty:bool,
+    auto_width:Option<f32>,
     selection_dirty: bool,
     selection_generation: u64,
     base: String,
     current: ImageRequest,
     pending: Option<ImageRequest>,
+    // None is the img algorithm; input availability and representation differ.
+    input_represents_current: Option<bool>,
+    // Current-node retention proof, independent of original-client load blocking.
+    input_loading: usize,
     // A completed request can satisfy a later source update from the
     // document's available-image list. That update still queues its own load
     // event, but does not need to resolve or decode the URL again.
     ready_event: Option<ImageEventKind>,
     published_image: Option<Arc<ImageData>>,
+    published_metadata:Option<lumen_html::responsive_images::ImageMetadata>,
 }
 
 #[derive(Default)]
 pub(crate) struct ImageLoader {
     resolver: RefCell<Option<Rc<dyn ImageResolver>>>,
+    policy: RefCell<Option<Rc<dyn Fn(&str)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>>>,
+    response_policy:RefCell<Option<Rc<dyn Fn()->ResponsePolicy>>>,
+    policy_violations: RefCell<Vec<lumen_common::csp::Violation>>,
+    policy_overflow: Cell<bool>,
+    selection_environment:Cell<Option<(lumen_html::css::MediaEnvironment,f64)>>,
+    auto_inputs_epoch:Cell<Option<(u64,u64,usize,u64)>>,
     requests: RefCell<HashMap<NodeId, Request>>,
-    bitmap_updates: RefCell<HashMap<NodeId, Option<Arc<ImageData>>>>,
+    bitmap_updates: RefCell<HashMap<NodeId, (Option<Arc<ImageData>>,lumen_html::responsive_images::ImageMetadata)>>,
     next_generation: Cell<u64>,
     tree_generation: Cell<u64>,
     discovery: RefCell<Discovery>,
@@ -123,6 +152,8 @@ pub(crate) struct ImageLoader {
     loading_remaining: Cell<bool>,
     polled_generation: Cell<Option<u64>>,
     pending_scratch: RefCell<Vec<NodeId>>,
+    input_fetches: RefCell<Option<InputFetches>>,
+    input_budget_failed: Cell<bool>,
 }
 
 /// Image discovery results reused while the tree, image attributes and base
@@ -143,9 +174,98 @@ struct PendingLoad {
     current_src: String,
     base: String,
     force_error: bool,
+    response_policy:Option<ResponsePolicy>,
+    parameters:lumen_html::layout::ImageRequestParameters,
 }
+// These are live fetches, rather than another image cache. Source and base
+// buffers are leased until the response completes; recycled slots keep the
+// outstanding-request arena bounded by the existing HTML resource authority.
+struct InputFetch {
+    node: NodeId,
+    request: ImageRequest,
+    base: lumen_common::limits::BudgetedString,
+    _source: lumen_common::limits::ByteLease,
+}
+pub(crate) struct InputCompletion {request:ImageRequest,_source:lumen_common::limits::ByteLease}
+struct InputFetchSlot {fetch:Option<InputFetch>,completed_node:Option<NodeId>,next_free:Option<usize>}
+struct InputFetches {
+    budget: Arc<lumen_common::limits::ByteBudget>,
+    records: lumen_common::limits::BudgetedVec<InputFetchSlot>,
+    free:Option<usize>,
+    outstanding:usize,
+}
+impl InputFetches {
+    fn new() -> Self {
+        let budget=lumen_common::limits::ByteBudget::new(lumen_html::html::MAX_HTML_BYTES);
+        let records=lumen_common::limits::BudgetedVec::new(budget.clone(),
+            (lumen_html::html::MAX_HTML_BYTES / std::mem::size_of::<InputFetchSlot>())
+                .min(super::scheduling::MAX_PENDING_HTML_TASKS));
+        Self {budget,records,free:None,outstanding:0}
+    }
+    fn push(&mut self,node:NodeId,request:ImageRequest,base:&str)->Result<(),lumen_common::limits::size::TooLarge> {
+        use lumen_common::limits::size::TooLarge;
+        // The canonical URL parser supplied this owned buffer. Admission moves
+        // it into the fetch arena without a second URL serialization or clone.
+        let source=self.budget.reserve(request.current_src.capacity()).ok_or(TooLarge)?;
+        let base=lumen_common::limits::BudgetedString::copy(base,&self.budget)?;
+        let fetch=InputFetch {node,request,base,_source:source};
+        let result=if let Some(index)=self.free {
+            let slot=&mut self.records.as_mut_slice()[index];
+            self.free=slot.next_free.take();slot.fetch=Some(fetch);Ok(())
+        } else {self.records.push(InputFetchSlot{fetch:Some(fetch),completed_node:None,next_free:None})};
+        if result.is_ok(){self.outstanding+=1;}result
+    }
+}
+impl Request {
+    fn is_loading(&self)->bool {
+        self.current.state==RequestState::Loading
+            || self.pending.as_ref().is_some_and(|pending|pending.state==RequestState::Loading)
+    }
+}
+type ResponsePolicy=Rc<dyn Fn(&str,&str,u32)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>;
 
 impl ImageLoader {
+    pub(crate) fn invalidate_environment(&self) {
+        for request in self.requests.borrow_mut().values_mut(){request.environment_dirty=true;}
+        self.has_dirty.set(true);self.mark_scan_needed();
+    }
+    /// Rendering supplies all selection inputs. Warm requests reuse their
+    /// parsed/request state until actual environment or auto-size inputs change.
+    pub(crate) fn configure_selection(&self,session:&mut lumen_html::session::RenderSession,dpr:f64,base:&str) {
+        self.refresh_discovery(session.document(),base);
+        let environment=session.media_environment();
+        if self.selection_environment.replace(Some((environment,dpr)))!=Some((environment,dpr)){self.invalidate_environment();}
+        let epoch=(session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get());
+        if self.auto_inputs_epoch.get()==Some(epoch){return;}
+        let nodes=self.requests.borrow().keys().copied().collect::<Vec<_>>();
+        for node in nodes {
+            let width=if session.document().is_connected_element(node){session.image_auto_sizes_width(node)}else{None};
+            let mut requests=self.requests.borrow_mut();let Some(request)=requests.get_mut(&node)else{continue};
+            let next=if session.document().is_connected_element(node){width.or(request.auto_width)}else{None};
+            if next!=request.auto_width {request.auto_width=next;request.environment_dirty=true;self.has_dirty.set(true);self.mark_scan_needed();}
+        }
+        self.auto_inputs_epoch.set(Some((session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get())));
+    }
+    pub(crate) fn set_policy(&self,policy:Rc<dyn Fn(&str)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>) {
+        *self.policy.borrow_mut()=Some(policy);
+    }
+    pub(crate) fn set_response_policy(&self,policy:Rc<dyn Fn()->ResponsePolicy>){*self.response_policy.borrow_mut()=Some(policy);}
+    pub(crate) fn take_policy_violations(&self)->Result<Vec<lumen_common::csp::Violation>,lumen_common::csp::Error> {
+        if self.policy_overflow.replace(false) {self.policy_violations.borrow_mut().clear();return Err(lumen_common::csp::Error::Capacity)}
+        Ok(std::mem::take(&mut *self.policy_violations.borrow_mut()))
+    }
+    fn policy_blocks(&self,source:&str)->bool {
+        let policy=self.policy.borrow().clone();let Some(policy)=policy else{return false};
+        self.record_policy_decision(policy(source))
+    }
+    fn record_policy_decision(&self,result:Result<lumen_common::csp::Decision,lumen_common::csp::Error>)->bool {
+        let decision=match result {Ok(decision)=>decision,Err(lumen_common::csp::Error::Capacity)=>{self.policy_overflow.set(true);return true},Err(lumen_common::csp::Error::InvalidUrl)=>return true};
+        let mut pending=self.policy_violations.borrow_mut();
+        // Bound pending reporting metadata while getter-driven source selection
+        // runs without an engine task context. Exhaustion fails closed.
+        if pending.len().saturating_add(decision.violations.len())>256 {self.policy_overflow.set(true);return true}
+        pending.extend(decision.violations);decision.blocked
+    }
     pub(crate) fn set_resolver(&self, resolver: Rc<dyn ImageResolver>) {
         let mut installed = self.resolver.borrow_mut();
         if installed
@@ -172,9 +292,27 @@ impl ImageLoader {
 
     pub(crate) fn on_mutation(&self, document: &Document, mutation: &ObservedMutation) {
         match &mutation.kind {
-            ObservedKind::SlotAssignment => {}
+            ObservedKind::TextSplit { .. } | ObservedKind::TextMerge { .. } | ObservedKind::SlotAssignment | ObservedKind::ChildListReplacement { .. } => {}
             ObservedKind::ChildList { .. } | ObservedKind::ChildListMany { .. } => {
-                self.bump_tree_generation();
+                self.bump_tree_generation();self.mark_scan_needed();
+                self.note_picture_change(document,mutation.target);
+                for node in mutation.kind.added_nodes().chain(mutation.kind.removed_nodes()) {
+                    if is_html_image(document,node) && (lumen_html::forms::html_element_local_name(document,node)!=Some("input")
+                        || !self.requests.borrow().contains_key(&node)) {self.note_source_change(document,node);}
+                }
+                // Newly parsed nested inputs own their initial source before
+                // a following author script can replace it in the same turn.
+                for node in input_mutation_nodes(document,mutation) {
+                    if !self.requests.borrow().contains_key(&node) {self.note_source_change(document,node);}
+                }
+            }
+            ObservedKind::Attribute {name,old_value,namespace_uri} if namespace_uri.is_none()
+                &&name.eq_ignore_ascii_case("type")&&lumen_html::forms::html_element_local_name(document,mutation.target)==Some("input")=>{
+                if lumen_html::forms::input_type_state(document,mutation.target)=="image" {
+                    self.note_input_image_entry(document,mutation.target);
+                }else if old_value.as_deref().is_some_and(|value|value.eq_ignore_ascii_case("image")) {
+                    self.bump_tree_generation();self.mark_scan_needed();
+                }
             }
             ObservedKind::Attribute {
                 name,
@@ -186,13 +324,12 @@ impl ImageLoader {
                 }
                 if name.eq_ignore_ascii_case("src") {
                     self.note_source_change(document, mutation.target);
-                } else if ["srcset", "sizes", "referrerpolicy", "decoding", "loading"]
+                } else if lumen_html::forms::html_element_local_name(document,mutation.target)==Some("img") && ["srcset", "sizes", "referrerpolicy", "decoding", "loading"]
                     .iter()
                     .any(|relevant| name.eq_ignore_ascii_case(relevant))
                 {
-                    self.bump_tree_generation();
-                    self.mark_scan_needed();
-                } else if name.eq_ignore_ascii_case("crossorigin")
+                    self.note_source_change(document,mutation.target);
+                } else if lumen_html::forms::html_element_local_name(document,mutation.target)==Some("img") && name.eq_ignore_ascii_case("crossorigin")
                     && crossorigin_state(old_value.as_deref())
                         != image_crossorigin(document, mutation.target)
                 {
@@ -201,8 +338,34 @@ impl ImageLoader {
                     self.note_source_change(document, mutation.target);
                 }
             }
+            ObservedKind::Attribute{name,namespace_uri,..} if namespace_uri.is_none()
+                &&matches!(document.kind(mutation.target),Ok(NodeKind::Element{namespace:Namespace::Html,name:tag,..})if tag=="source")
+                &&["srcset","sizes","media","type","width","height"].iter().any(|attribute|name.eq_ignore_ascii_case(attribute))=>{
+                if let Some(parent)=document.parent(mutation.target).ok().flatten(){self.note_picture_change(document,parent);}
+            }
             _ => {}
         }
+    }
+    fn note_picture_change(&self,document:&Document,parent:NodeId) {
+        if !matches!(document.kind(parent),Ok(NodeKind::Element{namespace:Namespace::Html,name,..})if name=="picture"){return;}
+        let mut current=document.first_child(parent).ok().flatten();let mut remaining=document.node_count();
+        while let Some(node)=current {if remaining==0{break;}remaining-=1;current=document.next_sibling(node).ok().flatten();if is_html_image(document,node){self.note_source_change(document,node);}}
+    }
+
+    fn note_input_image_entry(&self,document:&Document,node:NodeId) {
+        let source=document.get_attribute_ns_ref(node,None,"src").ok().flatten();
+        let mut requests=self.requests.borrow_mut();
+        // Returning to Image Button with the unchanged source preserves its
+        // available image or in-flight fetch; it does not queue a second load.
+        let Some(request)=requests.get_mut(&node) else {
+            drop(requests);
+            if source.is_some(){self.note_source_change(document,node);}
+            return;
+        };
+        let unchanged=request.selected_source.as_ref().is_some_and(|selected|selected.as_deref()==source);
+        request.observed_version=None;
+        if !unchanged {request.selection_dirty=true;}
+        self.has_dirty.set(true);self.bump_tree_generation();self.mark_scan_needed();
     }
 
     fn note_source_change(&self, document: &Document, node: NodeId) {
@@ -224,14 +387,31 @@ impl ImageLoader {
         // Invalidate any completion task already queued for the previous
         // selection immediately. The next synchronization either preserves
         // its in-flight request or stages a fresh cached completion.
-        request.selection_generation = self.allocate_generation();
+        if lumen_html::forms::html_element_local_name(document,node)!=Some("input") {
+            request.selection_generation = self.allocate_generation();
+        }
     }
+
+    /// Qualifying Image Button mutations start individual fetches synchronously.
+    /// The ordinary img update algorithm remains coalesced by its existing pump.
+    pub(crate) fn input_mutation_needs_selection(&self,document:&Document,mutation:&ObservedMutation)->bool {
+        input_mutation_nodes(document,mutation).any(|node|self.has_dirty_source(node))
+    }
+    pub(crate) fn synchronize_input_mutation(&self,document:&Document,mutation:&ObservedMutation,base:&str,
+        mut retain:impl FnMut(NodeId)) {
+        for node in input_mutation_nodes(document,mutation) {
+            if self.has_dirty_source(node) {
+                self.synchronize_node(document,node,base);retain(node);
+            }
+        }
+    }
+    pub(crate) fn take_input_budget_failure(&self)->bool {self.input_budget_failed.replace(false)}
 
     pub(crate) fn has_dirty_source(&self, node: NodeId) -> bool {
         self.requests
             .borrow()
             .get(&node)
-            .is_some_and(|request| request.selection_dirty)
+            .is_some_and(|request| request.selection_dirty||request.environment_dirty)
     }
 
     pub(crate) fn has_dirty_requests(&self) -> bool {
@@ -248,7 +428,7 @@ impl ImageLoader {
             .requests
             .borrow()
             .iter()
-            .filter_map(|(&node, request)| request.selection_dirty.then_some(node))
+            .filter_map(|(&node, request)| (request.selection_dirty||request.environment_dirty||request.observed_version.is_none()).then_some(node))
             .collect::<Vec<_>>();
         for node in dirty {
             self.synchronize_node(document, node, base);
@@ -256,22 +436,33 @@ impl ImageLoader {
     }
 
     fn synchronize_node(&self, document: &Document, node: NodeId, base: &str) -> bool {
-        let Some(source) = image_source(document, node) else {
-            return false;
+        if !is_html_image(document,node){return false;}
+        if self.requests.borrow().get(&node).is_some_and(|request|!request.selection_dirty&&!request.environment_dirty&&request.observed_version==Some(document.version())&&request.base==base&&request.selected_source.is_some()){return true;}
+        let (auto_width,deferred)=self.requests.borrow().get(&node).map_or((None,false),|request|(request.auto_width,request.environment_dirty&&!request.selection_dirty&&request.pending.is_some()));
+        // HTML's environment algorithm leaves an in-flight pending selection
+        // alone. Relevant source mutations can still replace that request.
+        if deferred{return true;}
+        let input_image=lumen_html::forms::html_element_local_name(document,node)==Some("input");
+        let selection=if !input_image&&self.selection_environment.get().is_some(){
+            let (environment,dpr)=self.selection_environment.get().expect("selection environment checked");
+            match lumen_html::responsive_images::select_for_device(document,node,environment,dpr,auto_width) {
+                Ok(Some(selection))=>selection,
+                Ok(None)=>return false,
+                Err(_)=>lumen_html::responsive_images::Selection{source:Some(String::new()),density:1.0,dimension_source:node},
+            }
+        }else{
+            let Some(source)=image_source(document,node)else{return false};
+            lumen_html::responsive_images::Selection{source,density:1.0,dimension_source:node}
         };
-        let crossorigin = image_crossorigin(document, node);
-        let mut requests = self.requests.borrow_mut();
-        let request = requests.entry(node).or_default();
-        if !request.selection_dirty
-            && request
-                .selected_source
-                .as_ref()
-                .is_some_and(|selected| selected == &source)
-            && request.selected_crossorigin == Some(crossorigin)
-        {
-            return true;
+        let crossorigin=image_crossorigin(document,node);
+        let mut requests=self.requests.borrow_mut();let request=requests.entry(node).or_default();
+        request.observed_version=Some(document.version());
+        if !request.selection_dirty&&request.selected_source.as_ref().is_some_and(|selected|selected==&selection.source)
+            &&request.selected_density==Some(selection.density)&&request.selected_crossorigin==Some(crossorigin) {
+            request.environment_dirty=false;return true;
         }
-        self.select_source(request, node, source, crossorigin, base);
+        request.environment_dirty=false;
+        self.select_source(request,node,selection.source,selection.density,crossorigin,base,input_image);
         true
     }
 
@@ -280,13 +471,22 @@ impl ImageLoader {
         request: &mut Request,
         node: NodeId,
         source: Option<String>,
+        density:f64,
         crossorigin: Option<bool>,
         base: &str,
+        input_image:bool,
     ) {
         request.selection_dirty = false;
+        request.selected_density=Some(density);
         self.mark_scan_needed();
         let cors_mode_changed = request.selected_crossorigin != Some(crossorigin);
         let Some(source) = source else {
+            if input_image {
+                request.selection_generation=self.allocate_generation();
+                request.selected_source=Some(None);request.selected_crossorigin=Some(None);
+                request.input_represents_current=Some(false);
+                request.base=base.to_owned();self.stage_current_image(request,node);return;
+            }
             request.selection_generation = self.allocate_generation();
             request.ready_event = None;
             request.selected_source = Some(None);
@@ -304,6 +504,66 @@ impl ImageLoader {
             resolved_url(&source, base)
         };
         let force_error = source.is_empty() || current_src.is_empty();
+        if input_image&&force_error {
+            // Image Button aborts missing/empty/unparseable sources without
+            // an error event or discarding an already available image.
+            request.selection_generation=self.allocate_generation();
+            request.selected_source=Some(Some(source));request.selected_crossorigin=Some(None);
+            request.input_represents_current=Some(false);
+            request.base=base.to_owned();self.stage_current_image(request,node);return;
+        }
+
+        if input_image {
+            // Unlike img's update-image-data algorithm, every qualifying input
+            // source update fetches and owns a response-end completion task.
+            let generation=self.allocate_generation();
+            request.selection_generation=generation;
+            request.ready_event=None;
+            request.selected_source=Some(Some(source));
+            request.selected_crossorigin=Some(None);
+            request.base=base.to_owned();
+            request.input_represents_current=Some(request.current.state==RequestState::Available
+                && request.current.current_src==current_src);
+            self.stage_current_image(request,node);
+            let mut next=ImageRequest::loading(current_src,generation,false);
+            next.force_error=self.policy_blocks(&next.current_src);
+            next.parameters=lumen_html::layout::ImageRequestParameters::image_button();
+            next.response_policy=self.response_policy.borrow().as_ref().map(|capture|capture());
+            let mut fetches=self.input_fetches.borrow_mut();
+            if fetches.get_or_insert_with(InputFetches::new).push(node,next,base).is_err() {
+                // Selection has already consumed this mutation. Exhaustion is
+                // surfaced by the host pump, never retried as a stale source.
+                self.input_budget_failed.set(true);return;
+            }
+            request.input_loading+=1;
+            return;
+        }
+
+        if let Some(pending) = request.pending.as_mut() {
+            if !cors_mode_changed
+                && pending.current_src == current_src
+                && pending.force_error == force_error
+            {
+                // Updating image data step 14 returns for an unchanged pending
+                // URL. Its pixel density remains captured by that request; the
+                // later source mutation must not prepare it again.
+                // The in-flight request already represents this selection.
+                // Keep it alive, while invalidating any event queued for the
+                // previous current request.
+                request.selection_generation = self.allocate_generation();
+                request.ready_event = None;
+                request.selected_source = Some(Some(source));
+                request.selected_crossorigin = Some(crossorigin);
+                request.base = base.to_owned();
+                return;
+            }
+        }
+
+        // Actual request preparation checks CSP before either provider I/O or
+        // reuse of an available bitmap; an unchanged pending fetch keeps its
+        // already captured policy decision. Selection generation invalidates
+        // stale load/error events through the existing image state machine.
+        let force_error = force_error || (!current_src.is_empty() && self.policy_blocks(&current_src));
 
         if !cors_mode_changed
             && !force_error
@@ -317,28 +577,13 @@ impl ImageLoader {
             request.selection_generation = self.allocate_generation();
             request.ready_event = Some(ImageEventKind::Load);
             request.current.event_queued = true;
+            request.current.density=density;
             request.selected_source = Some(Some(source));
             request.selected_crossorigin = Some(crossorigin);
             request.base = base.to_owned();
             request.pending = None;
             self.stage_current_image(request, node);
             return;
-        }
-        if let Some(pending) = request.pending.as_ref() {
-            if !cors_mode_changed
-                && pending.current_src == current_src
-                && pending.force_error == force_error
-            {
-                // The in-flight request already represents this selection.
-                // Keep it alive, while invalidating any event queued for the
-                // previous current request.
-                request.selection_generation = self.allocate_generation();
-                request.ready_event = None;
-                request.selected_source = Some(Some(source));
-                request.selected_crossorigin = Some(crossorigin);
-                request.base = base.to_owned();
-                return;
-            }
         }
 
         request.selection_generation = self.allocate_generation();
@@ -347,7 +592,10 @@ impl ImageLoader {
         request.selected_source = Some(Some(source.clone()));
         request.selected_crossorigin = Some(crossorigin);
         request.base = base.to_owned();
-        let next = ImageRequest::loading(current_src, self.allocate_generation(), force_error);
+        let mut next = ImageRequest::loading(current_src, self.allocate_generation(), force_error);
+        next.density=density;
+        next.parameters=if input_image {lumen_html::layout::ImageRequestParameters::image_button()}else{lumen_html::layout::ImageRequestParameters::html_image(crossorigin)};
+        next.response_policy=self.response_policy.borrow().as_ref().map(|capture|capture());
         if request.current.state == RequestState::Available {
             request.pending = Some(next);
         } else {
@@ -357,23 +605,19 @@ impl ImageLoader {
         self.stage_current_image(request, node);
     }
 
-    fn stage_current_image(&self, request: &mut Request, node: NodeId) {
-        if same_image(
-            request.published_image.as_ref(),
-            request.current.image.as_ref(),
-        ) {
-            return;
-        }
-        let image = request.current.image.clone();
-        request.published_image = image.clone();
-        self.bitmap_updates.borrow_mut().insert(node, image);
+    fn stage_current_image(&self,request:&mut Request,node:NodeId) {
+        let metadata=lumen_html::responsive_images::ImageMetadata{intrinsic:request.current.intrinsic,density:request.current.density,
+            source:(!request.current.current_src.is_empty()).then(||Arc::from(request.current.current_src.as_str()))};
+        let image=if request.input_represents_current==Some(false){None}else{request.current.image.clone()};
+        if same_image(request.published_image.as_ref(),image.as_ref())&&request.published_metadata.as_ref()==Some(&metadata){return;}
+        request.published_image=image.clone();request.published_metadata=Some(metadata.clone());
+        self.bitmap_updates.borrow_mut().insert(node,(image,metadata));
+    }
+    pub(crate) fn take_bitmap_updates(&self)->Vec<(NodeId,Option<Arc<ImageData>>,lumen_html::responsive_images::ImageMetadata)> {
+        self.bitmap_updates.borrow_mut().drain().map(|(node,(image,metadata))|(node,image,metadata)).collect()
     }
 
-    pub(crate) fn take_bitmap_updates(&self) -> Vec<(NodeId, Option<Arc<ImageData>>)> {
-        self.bitmap_updates.borrow_mut().drain().collect()
-    }
-
-    pub(crate) fn snapshot(&self, document: &Document, node: NodeId, base: &str) -> ImageSnapshot {
+    pub(crate) fn snapshot(&self, document: &Document, node: NodeId, base: &str,scheme:lumen_html::css::UsedColorScheme) -> ImageSnapshot {
         if !self.synchronize_node(document, node, base) {
             return ImageSnapshot {
                 complete: true,
@@ -399,21 +643,20 @@ impl ImageLoader {
             }
             None => true,
         };
-        ImageSnapshot {
-            complete,
-            current_src: request.current.current_src.clone(),
-            natural_width: request
-                .current
-                .image
-                .as_ref()
-                .map_or(0, |image| image.width),
-            natural_height: request
-                .current
-                .image
-                .as_ref()
-                .map_or(0, |image| image.height),
-            origin_clean: request.current.origin_clean,
-        }
+        let dimensions=self.request_natural_dimensions(node,request,scheme);
+        ImageSnapshot{complete,current_src:request.current.current_src.clone(),natural_width:dimensions.map_or(0,|size|natural_dimension(size.0)),natural_height:dimensions.map_or(0,|size|natural_dimension(size.1)),natural_size:dimensions}
+    }
+
+    fn request_natural_dimensions(&self,node:NodeId,request:&Request,scheme:lumen_html::css::UsedColorScheme)->Option<(f64,f64)> {
+        let image=request.current.image.as_ref()?;
+        let intrinsic=self.resolver.borrow().as_ref().and_then(|resolver|resolver.node_image_intrinsic_size(node,image,scheme))
+            .or(request.current.intrinsic).unwrap_or(lumen_html::object::IntrinsicSize{width:Some(image.width as f32),height:Some(image.height as f32),ratio:None});
+        Some(intrinsic.dimensions_at_density((300.0,150.0),request.current.density))
+    }
+    /// Width/height fallback does not materialize currentSrc or a full snapshot.
+    pub(crate) fn natural_dimensions(&self,document:&Document,node:NodeId,base:&str,scheme:lumen_html::css::UsedColorScheme)->Option<(f64,f64)> {
+        if !self.synchronize_node(document,node,base){return None;}
+        self.request_natural_dimensions(node,self.requests.borrow().get(&node)?,scheme)
     }
 
     pub(crate) fn canvas_image_state(&self, node: NodeId) -> CanvasImageState {
@@ -436,11 +679,7 @@ impl ImageLoader {
         }
     }
 
-    pub(crate) fn queue_completions(
-        &self,
-        document: &Document,
-        base: &str,
-    ) -> Vec<QueuedImageEvent> {
+    fn refresh_discovery(&self,document:&Document,base:&str) {
         let mut discovery = self.discovery.borrow_mut();
         let discovery = &mut *discovery;
         let key = (self.tree_generation.get(), document.node_count());
@@ -450,7 +689,7 @@ impl ImageLoader {
             discovery.seen.extend(discovery.nodes.iter().copied());
             discovery.stale.clear();
             for &node in self.requests.borrow().keys() {
-                if is_html_image(document, node) {
+                if is_retained_image_owner(document, node) {
                     if discovery.seen.insert(node) {
                         discovery.nodes.push(node);
                     }
@@ -464,13 +703,41 @@ impl ImageLoader {
                     requests.remove(&node);
                 }
             }
+            let base_changed=discovery.base!=base;
+            let mut requests=self.requests.borrow_mut();
             for &node in &discovery.nodes {
-                self.synchronize_node(document, node, base);
+                let request=requests.entry(node).or_default();
+                // Rediscovery invalidates the observation proof, without
+                // turning unrelated tree changes into new load events.
+                request.observed_version=None;
+                if base_changed && request.selected_source.is_some() && lumen_html::forms::html_element_local_name(document,node)!=Some("input"){request.selection_dirty=true;}
             }
+            self.has_dirty.set(true);
             discovery.key = Some(key);
             discovery.base.clear();
             discovery.base.push_str(base);
         }
+    }
+
+    /// A fresh frame is needed only for actual auto-size consumers after an
+    /// input epoch change. Discover first, so a static first image is measured
+    /// before its first source is selected, using the existing discovery cache.
+    pub(crate) fn needs_auto_layout(&self,session:&lumen_html::session::RenderSession,base:&str)->bool {
+        self.refresh_discovery(session.document(),base);
+        let epoch=(session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get());
+        if self.auto_inputs_epoch.get()==Some(epoch)
+            &&self.selection_environment.get().is_some_and(|(environment,_)|environment==session.media_environment()){return false;}
+        self.requests.borrow().keys().any(|&node|session.document().is_connected_element(node)
+            &&lumen_html::responsive_images::allows_auto_sizes(session.document(),node))
+    }
+
+    pub(crate) fn queue_completions(
+        &self,
+        document: &Document,
+        base: &str,
+    ) -> Vec<QueuedImageEvent> {
+        self.refresh_discovery(document,base);
+        self.synchronize_dirty(document,base);
 
         let resolver = self.resolver.borrow().clone();
         let resolver_generation = resolver.as_ref().map_or(0, |resolver| resolver.generation());
@@ -486,12 +753,15 @@ impl ImageLoader {
         let mut still_loading = false;
 
         let mut queued = Vec::new();
+        let mut discovery = self.discovery.borrow_mut();
         discovery.pending.clear();
         for (&node, request) in self.requests.borrow_mut().iter_mut() {
             if let Some(kind) = request.ready_event.take() {
                 queued.push(QueuedImageEvent {
                     node,
                     generation: request.selection_generation,
+                    captured_input:false,
+                    input_task:None,
                     kind,
                 });
             }
@@ -509,6 +779,8 @@ impl ImageLoader {
                     current_src: selected.current_src.clone(),
                     base: request.base.clone(),
                     force_error: selected.force_error,
+                    response_policy:selected.response_policy.clone(),
+                    parameters:selected.parameters,
                 });
             }
         }
@@ -518,19 +790,11 @@ impl ImageLoader {
             current_src,
             base,
             force_error,
+            response_policy,
+            parameters,
         } in discovery.pending.drain(..)
         {
-            // An empty src is a broken request, not a URL for the base document.
-            // Never let a catch-all resolver turn it into a successful image.
-            let state = if force_error {
-                ImageState::Failed
-            } else {
-                resolver.as_ref().map_or(ImageState::Failed, |resolver| {
-                    resolver
-                        .resolve_node_from(node, &base, &current_src)
-                        .unwrap_or_else(|| resolver.resolve_from(&base, &current_src))
-                })
-            };
+            let state=self.resolve_request(resolver.as_deref(),node,&base,&current_src,force_error,response_policy.as_ref(),parameters);
             let (image, kind) = match state {
                 ImageState::Ready(image) if image.is_valid() => (Some(image), ImageEventKind::Load),
                 ImageState::Pending => {
@@ -539,7 +803,8 @@ impl ImageLoader {
                 }
                 ImageState::Ready(_) | ImageState::Failed => (None, ImageEventKind::Error),
             };
-            let origin_clean = resolver
+            let intrinsic=image.as_ref().and_then(|image|resolver.as_ref().and_then(|resolver|resolver.node_image_intrinsic_size(node,image,lumen_html::css::UsedColorScheme::Light)));
+            let origin_clean = image.is_some() && resolver
                 .as_ref()
                 .is_some_and(|resolver| resolver.node_origin_clean(node, &base, &current_src));
             let mut requests = self.requests.borrow_mut();
@@ -552,28 +817,73 @@ impl ImageLoader {
                 .is_some_and(|pending| pending.generation == generation)
             {
                 let mut completed = request.pending.take().expect("pending request checked");
-                complete_request(&mut completed, image, kind, origin_clean);
+                complete_request(&mut completed, image, intrinsic, kind, origin_clean);
                 request.current = completed;
                 true
             } else if request.current.generation == generation
                 && request.current.state == RequestState::Loading
             {
-                complete_request(&mut request.current, image, kind, origin_clean);
+                complete_request(&mut request.current, image, intrinsic, kind, origin_clean);
                 true
             } else {
                 false
             };
             if completed {
+                if request.environment_dirty {self.has_dirty.set(true);self.mark_scan_needed();}
                 self.stage_current_image(request, node);
                 queued.push(QueuedImageEvent {
                     node,
                     generation: request.selection_generation,
+                    captured_input:false,
+                    input_task:None,
                     kind,
                 });
             }
         }
+        let mut input_fetches=self.input_fetches.borrow_mut();
+        if let Some(fetches)=input_fetches.as_mut() {
+            for (index,slot) in fetches.records.as_mut_slice().iter_mut().enumerate() {
+                if slot.completed_node.is_some(){continue;}
+                let Some(fetch)=slot.fetch.as_ref()else{continue};
+                let state=self.resolve_request(resolver.as_deref(),fetch.node,fetch.base.as_str(),
+                    &fetch.request.current_src,fetch.request.force_error,fetch.request.response_policy.as_ref(),fetch.request.parameters);
+                let (image,kind)=match state {
+                    ImageState::Pending=>{still_loading=true;continue;}
+                    ImageState::Ready(image)if image.is_valid()=>(Some(image),ImageEventKind::Load),
+                    ImageState::Ready(_)|ImageState::Failed=>(None,ImageEventKind::Error),
+                };
+                let fetch=slot.fetch.as_mut().expect("completed input fetch checked");
+                slot.completed_node=Some(fetch.node);
+                let intrinsic=image.as_ref().and_then(|image|resolver.as_ref().and_then(|resolver|
+                    resolver.node_image_intrinsic_size(fetch.node,image,lumen_html::css::UsedColorScheme::Light)));
+                let origin_clean=image.is_some()&&resolver.as_ref().is_some_and(|resolver|
+                    resolver.node_origin_clean(fetch.node,fetch.base.as_str(),&fetch.request.current_src));
+                let generation=fetch.request.generation;
+                complete_request(&mut fetch.request,image,intrinsic,kind,origin_clean);
+                queued.push(QueuedImageEvent{node:fetch.node,generation,captured_input:true,kind,input_task:core::num::NonZeroUsize::new(index+1)});
+            }
+        }
+        if input_fetches.as_ref().is_some_and(|fetches|fetches.outstanding==0) {
+            *input_fetches=None;
+        }
         self.loading_remaining.set(still_loading);
         queued
+    }
+
+    fn resolve_request(&self,resolver:Option<&dyn ImageResolver>,node:NodeId,base:&str,source:&str,
+        force_error:bool,response_policy:Option<&ResponsePolicy>,parameters:lumen_html::layout::ImageRequestParameters)->ImageState {
+        // One provider/response-policy authority for img and input requests.
+        let state=if force_error {ImageState::Failed}else{
+            resolver.map_or(ImageState::Failed,|resolver|resolver.resolve_image_request(node,base,source,parameters))
+        };
+        if !force_error&&!matches!(state,ImageState::Pending) {
+            let metadata=resolver.and_then(|resolver|resolver.response_metadata(node,base,source));
+            if metadata.zip(response_policy).is_some_and(|(metadata,policy)|
+                self.record_policy_decision(policy(source,&metadata.final_url,metadata.redirect_count))) {
+                return ImageState::Failed;
+            }
+        }
+        state
     }
 
     fn mark_scan_needed(&self) {
@@ -581,55 +891,61 @@ impl ImageLoader {
         self.loading_remaining.set(true);
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
-        self.loading_remaining.get()
+    pub(crate) fn is_loading(&self,node:NodeId)->bool {
+        self.requests.borrow().get(&node).is_some_and(|request|
+            request.input_loading!=0 || request.is_loading())
     }
 
-    pub(crate) fn is_loading(&self, node: NodeId) -> bool {
-        self.requests.borrow().get(&node).is_some_and(|request| {
-            request.current.state == RequestState::Loading
-                || request
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.state == RequestState::Loading)
-        })
+    pub(crate) fn take_pending_scratch(&self)->Vec<NodeId> {
+        let mut nodes=std::mem::take(&mut *self.pending_scratch.borrow_mut());
+        nodes.clear();self.append_pending_nodes(&mut nodes);nodes
     }
-
-    /// Loading nodes absent from `known`, collected into a reused buffer.
-    pub(crate) fn take_unknown_pending<V>(&self, known: &HashMap<NodeId, V>) -> Vec<NodeId> {
-        let mut out = std::mem::take(&mut *self.pending_scratch.borrow_mut());
-        out.clear();
-        if self.loading_remaining.get() {
-            out.extend(self.requests.borrow().iter().filter_map(|(&node, request)| {
-                (!known.contains_key(&node)
-                    && (request.current.state == RequestState::Loading
-                        || request
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.state == RequestState::Loading)))
-                .then_some(node)
-            }));
+    pub(crate) fn return_pending_scratch(&self,scratch:Vec<NodeId>) {
+        *self.pending_scratch.borrow_mut()=scratch;
+    }
+    fn append_pending_nodes(&self,nodes:&mut Vec<NodeId>) {
+        nodes.extend(self.requests.borrow().iter().filter_map(|(&node,request)|request.is_loading().then_some(node)));
+        if let Some(fetches)=self.input_fetches.borrow().as_ref() {
+            nodes.extend(fetches.records.as_slice().iter().filter_map(|slot|slot.completed_node.or_else(||slot.fetch.as_ref().map(|fetch|fetch.node))));
         }
-        out
+        nodes.sort_unstable_by_key(|node|node.key());nodes.dedup();
+    }
+    pub(crate) fn pending_nodes(&self)->Vec<NodeId> {
+        let mut nodes=Vec::new();self.append_pending_nodes(&mut nodes);nodes
     }
 
-    pub(crate) fn return_pending_scratch(&self, scratch: Vec<NodeId>) {
-        *self.pending_scratch.borrow_mut() = scratch;
+    pub(crate) fn take_input_completion(&self,index:usize)->Option<InputCompletion> {
+        let mut arena=self.input_fetches.borrow_mut();
+        let slot=arena.as_mut()?.records.as_mut_slice().get_mut(index)?;
+        slot.completed_node?;
+        let fetch=slot.fetch.take()?;
+        Some(InputCompletion {request:fetch.request,_source:fetch._source})
+    }
+    pub(crate) fn finish_input_completion_task(&self,index:usize)->Option<NodeId> {
+        let mut arena=self.input_fetches.borrow_mut();
+        let fetches=arena.as_mut()?;
+        let slot=fetches.records.as_mut_slice().get_mut(index)?;
+        let node=slot.completed_node.take()?;
+        slot.fetch=None;
+        slot.next_free=fetches.free;fetches.free=Some(index);
+        fetches.outstanding-=1;
+        if fetches.outstanding==0 {*arena=None;}
+        Some(node)
+    }
+    pub(crate) fn finish_input_retention(&self,node:NodeId) {
+        if let Some(request)=self.requests.borrow_mut().get_mut(&node) {
+            request.input_loading=request.input_loading.saturating_sub(1);
+        }
     }
 
-    pub(crate) fn pending_nodes(&self) -> Vec<NodeId> {
-        self.requests
-            .borrow()
-            .iter()
-            .filter_map(|(&node, request)| {
-                (request.current.state == RequestState::Loading
-                    || request
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.state == RequestState::Loading))
-                .then_some(node)
-            })
-            .collect()
+    pub(crate) fn commit_input_completion(&self,node:NodeId,completion:InputCompletion) {
+        let mut requests=self.requests.borrow_mut();
+        let Some(request)=requests.get_mut(&node)else{return};
+        if request.selection_generation==completion.request.generation {
+            request.current=completion.request;
+            request.input_represents_current=Some(request.current.state==RequestState::Available);
+            self.stage_current_image(request,node);
+        }
     }
 
     pub(crate) fn completion_is_current(&self, node: NodeId, generation: u64) -> bool {
@@ -647,8 +963,19 @@ impl ImageLoader {
         let mut source = self.requests.borrow_mut();
         let mut destination = target.requests.borrow_mut();
         for &(old, new) in mapping {
-            source.remove(&old);
+            let request=source.remove(&old);
             destination.remove(&new);
+            self.bitmap_updates.borrow_mut().remove(&old);
+            if let Some(mut request)=request.filter(|request|request.input_represents_current.is_some()) {
+                target.next_generation.set(target.next_generation.get().max(request.selection_generation)
+                    .max(request.current.generation));
+                // Fetch clients stay in their original loader; the selected
+                // image follows the node through maintained adoption mapping.
+                request.observed_version=None;
+                request.published_image=None;request.published_metadata=None;
+                target.stage_current_image(&mut request,new);
+                destination.insert(new,request);
+            }
         }
         self.bump_tree_generation();
         target.bump_tree_generation();
@@ -666,13 +993,20 @@ impl ImageLoader {
     }
 }
 
+pub(crate) fn natural_dimension(value:f64)->u32 {
+    if !value.is_finite()||value==0.0{return 0;}
+    value.trunc().rem_euclid(4294967296.0) as u32
+}
+
 fn complete_request(
     request: &mut ImageRequest,
     image: Option<Arc<ImageData>>,
+    intrinsic:Option<lumen_html::object::IntrinsicSize>,
     kind: ImageEventKind,
     origin_clean: bool,
 ) {
     request.image = image;
+    request.intrinsic=intrinsic;
     request.state = if kind == ImageEventKind::Load {
         RequestState::Available
     } else {
@@ -681,6 +1015,7 @@ fn complete_request(
     request.force_error = false;
     request.event_queued = true;
     request.origin_clean = origin_clean;
+    request.response_policy=None;
 }
 
 fn same_image(left: Option<&Arc<ImageData>>, right: Option<&Arc<ImageData>>) -> bool {
@@ -689,6 +1024,16 @@ fn same_image(left: Option<&Arc<ImageData>>, right: Option<&Arc<ImageData>>) -> 
         (Some(left), Some(right)) => Arc::ptr_eq(left, right),
         _ => false,
     }
+}
+
+fn input_mutation_nodes<'a>(document:&'a Document,mutation:&'a ObservedMutation)->impl Iterator<Item=NodeId>+'a {
+    let attribute=matches!(&mutation.kind,ObservedKind::Attribute{name,namespace_uri,..}
+        if namespace_uri.is_none()&&(name.eq_ignore_ascii_case("src")||name.eq_ignore_ascii_case("type")));
+    std::iter::once(mutation.target).filter(move |_|attribute).chain(
+        mutation.kind.added_nodes().flat_map(move |root|std::iter::successors(Some(root),move |node|
+            lumen_html::selector::next_shadow_including_descendant(document,root,*node).ok().flatten())))
+        .filter(move |node|lumen_html::forms::html_element_local_name(document,*node)==Some("input")
+            &&lumen_html::forms::input_type_state(document,*node)=="image")
 }
 
 fn collect_image_nodes(document: &Document, images: &mut Vec<NodeId>) {
@@ -706,48 +1051,89 @@ fn collect_image_nodes(document: &Document, images: &mut Vec<NodeId>) {
 }
 
 fn image_source(document: &Document, node: NodeId) -> Option<Option<String>> {
-    match document.kind(node).ok()? {
-        NodeKind::Element {
-            namespace: Namespace::Html,
-            name,
-            ..
-        } if name == "img" => Some(document.get_attribute_ns(node, None, "src").ok().flatten()),
-        _ => None,
-    }
+    is_html_image(document,node).then(||document.get_attribute_ns(node,None,"src").ok().flatten())
 }
 
 fn image_crossorigin(document: &Document, node: NodeId) -> Option<bool> {
-    let NodeKind::Element {
-        namespace: Namespace::Html,
-        name,
-        ..
-    } = document.kind(node).ok()?
-    else {
-        return None;
-    };
-    if name != "img" {
-        return None;
-    }
-    document
-        .get_attribute_ns(node, None, "crossorigin")
-        .ok()
-        .flatten()
-        .map(|value| crossorigin_state(Some(value.as_str())).unwrap_or(false))
+    if lumen_html::forms::html_element_local_name(document,node)!=Some("img") { return None; }
+    document.get_attribute_ns(node,None,"crossorigin").ok().flatten()
+        .map(|value|crossorigin_state(Some(value.as_str())).unwrap_or(false))
 }
 
 fn crossorigin_state(value: Option<&str>) -> Option<bool> {
     value.map(|value| value.eq_ignore_ascii_case("use-credentials"))
 }
 
+fn is_retained_image_owner(document:&Document,node:NodeId)->bool {
+    matches!(lumen_html::forms::html_element_local_name(document,node),Some("img"|"input"))
+}
 fn is_html_image(document: &Document, node: NodeId) -> bool {
-    matches!(
-        document.kind(node),
-        Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "img"
-    )
+    match lumen_html::forms::html_element_local_name(document,node) {
+        Some("img")=>true,
+        Some("input")=>lumen_html::forms::input_type_state(document,node)=="image",
+        _=>false,
+    }
 }
 
 pub(crate) fn resolved_url(source: &str, base: &str) -> String {
     lumen_common::url::parse(source, Some(base))
         .map(|url| url.href())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod responsive_request_tests {
+    use super::*;
+    #[test]
+    fn specification_canvas_source_dimensions_precede_webidl_projection() {
+        let document=lumen_html::html::parse("<img src='actual.png'>",16).unwrap();
+        let node=lumen_html::selector::query_selector(&document,document.root(),"img").unwrap().unwrap();
+        let loader=ImageLoader::default();let base="https://images.test/page.html";
+        loader.snapshot(&document,node,base,lumen_html::css::UsedColorScheme::Light);
+        {
+            let mut requests=loader.requests.borrow_mut();let request=requests.get_mut(&node).unwrap();
+            request.current.state=RequestState::Available;request.current.density=4.0;
+            request.current.image=Some(Arc::new(ImageData{width:2,height:2,pixels:vec![0,128,0,255].repeat(4)}));
+        }
+        let snapshot=loader.snapshot(&document,node,base,lumen_html::css::UsedColorScheme::Light);
+        assert_eq!(snapshot.natural_size,Some((0.5,0.5)));
+        assert_eq!((snapshot.natural_width,snapshot.natural_height),(0,0));
+    }
+
+    #[test]
+    fn specification_same_pending_url_preserves_prepared_density() {
+        let loader=ImageLoader::default();let document=Document::new(8);let node=document.root();
+        let mut request=Request::default();
+        request.current.state=RequestState::Available;
+        request.current.current_src=String::from("https://images.test/old.png");
+        loader.select_source(&mut request,node,Some(String::from("next.png")),2.0,None,"https://images.test/page.html",false);
+        let generation=request.pending.as_ref().unwrap().generation;
+        loader.select_source(&mut request,node,Some(String::from("next.png")),4.0,None,"https://images.test/page.html",false);
+        let pending=request.pending.as_ref().unwrap();
+        assert_eq!(pending.generation,generation);
+        assert_eq!(pending.density,2.0);
+        assert_eq!(request.selected_density,Some(4.0));
+        assert_eq!(request.current.density,1.0);
+    }
+    #[test]
+    fn specification_first_discovered_auto_image_uses_fresh_frame_and_warm_epoch() {
+        let document=lumen_html::html::parse("<!doctype html><body><img loading=lazy sizes=auto srcset='actual.png 400w' style='width:200px;height:100px;border:10px solid;padding:10px'></body>",32).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        let loader=ImageLoader::default();let base="https://images.test/page.html";
+        assert!(loader.needs_auto_layout(&session,base));
+        assert_eq!(loader.requests.borrow().len(),1,"discovery precedes the first selection");
+        session.display_list(600,400,crate::canvas::canvas_fallback_fonts()).unwrap();
+        loader.configure_selection(&mut session,1.0,base);
+        loader.synchronize_dirty(session.document(),base);
+        let node=*loader.requests.borrow().keys().next().unwrap();
+        assert_eq!(loader.requests.borrow()[&node].auto_width,Some(200.0),"source size uses content width, excluding the actual box edges");
+        assert_eq!(loader.requests.borrow()[&node].current.density,2.0);
+        assert!(!loader.needs_auto_layout(&session,base),"warm owner inputs reuse their frame epoch");
+        session.document_mut().set_attribute(node,"style","width:100px;height:100px").unwrap();
+        assert!(loader.needs_auto_layout(&session,base),"style mutation requires a fresh frame");
+        session.display_list(600,400,crate::canvas::canvas_fallback_fonts()).unwrap();
+        loader.configure_selection(&mut session,1.0,base);
+        assert_eq!(loader.requests.borrow()[&node].auto_width,Some(100.0));
+    }
+
 }

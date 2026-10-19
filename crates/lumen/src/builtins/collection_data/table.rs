@@ -194,6 +194,14 @@ impl<E: Entry> Table<E> {
         self.locate(key).is_ok()
     }
 
+    #[cfg(feature = "embed")]
+    pub(super) fn contains_string(&self,key:&str,hash:u32)->bool {
+        self.index.find(hash,|slot| {
+            let entry=&self.entries[slot as usize];
+            entry.hash()==hash && matches!(&*entry.key().get(),Value::Str(value) if value.as_str()==key)
+        }).is_some()
+    }
+
     pub(super) fn insert(&mut self, key: Value, value: Value) {
         debug_assert!(!matches!(key, Value::Empty));
         let hash = match self.locate(&key) {

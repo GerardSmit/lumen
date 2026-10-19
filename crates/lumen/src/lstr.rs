@@ -137,6 +137,7 @@ impl ViewRegistry {
         self.native_stacks.set(self.native_stacks.get() - 1);
     }
 }
+#[cfg(feature = "embed")]
 pub(crate) fn views_can_compact() -> bool {
     ROOTS.with(|state| state.borrow().native_stacks.get() == 0)
 }

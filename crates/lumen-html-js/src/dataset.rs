@@ -9,14 +9,14 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 pub(crate) struct ProxyIntrinsics {
-    constructor: Value,
-    prototype: Value,
-    reflect_get: Value,
-    reflect_set: Value,
-    reflect_delete: Value,
-    reflect_has: Value,
-    reflect_own_keys: Value,
-    reflect_get_own_property_descriptor: Value,
+    constructor: WeakValue,
+    prototype: WeakValue,
+    reflect_get: WeakValue,
+    reflect_set: WeakValue,
+    reflect_delete: WeakValue,
+    reflect_has: WeakValue,
+    reflect_own_keys: WeakValue,
+    reflect_get_own_property_descriptor: WeakValue,
 }
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> Result<(), Value> {
@@ -33,14 +33,14 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> Result<(), Value> 
     let constructor = ctx.class_constructor::<crate::DomDomStringMap>();
     let prototype = ctx.member_get(&constructor, "prototype")?;
     *realm.dataset_intrinsics.borrow_mut() = Some(ProxyIntrinsics {
-        constructor: proxy_constructor,
-        prototype,
-        reflect_get,
-        reflect_set,
-        reflect_delete,
-        reflect_has,
-        reflect_own_keys,
-        reflect_get_own_property_descriptor,
+        constructor: crate::realm_services::capture_realm_value(ctx,proxy_constructor).map_err(|error|error.to_value(ctx))?,
+        prototype: crate::realm_services::capture_realm_value(ctx,prototype).map_err(|error|error.to_value(ctx))?,
+        reflect_get: crate::realm_services::capture_realm_value(ctx,reflect_get).map_err(|error|error.to_value(ctx))?,
+        reflect_set: crate::realm_services::capture_realm_value(ctx,reflect_set).map_err(|error|error.to_value(ctx))?,
+        reflect_delete: crate::realm_services::capture_realm_value(ctx,reflect_delete).map_err(|error|error.to_value(ctx))?,
+        reflect_has: crate::realm_services::capture_realm_value(ctx,reflect_has).map_err(|error|error.to_value(ctx))?,
+        reflect_own_keys: crate::realm_services::capture_realm_value(ctx,reflect_own_keys).map_err(|error|error.to_value(ctx))?,
+        reflect_get_own_property_descriptor: crate::realm_services::capture_realm_value(ctx,reflect_get_own_property_descriptor).map_err(|error|error.to_value(ctx))?,
     });
     Ok(())
 }
@@ -70,6 +70,7 @@ pub(crate) fn for_element(ctx: &mut Ctx, node: &DomNode) -> OpResult<Value> {
         element: node.id,
         _element_wrapper: element_wrapper,
     });
+    ctx.set_native_identity_owner::<DomStringMapBackend>(&backend)?;
     let handler = DomStringMapProxyHandler {
         backend: backend.clone(),
         has_named: method(ctx, &backend, "hasNamedProperty").map_err(OpError::thrown)?,
@@ -78,17 +79,18 @@ pub(crate) fn for_element(ctx: &mut Ctx, node: &DomNode) -> OpResult<Value> {
         delete_named: method(ctx, &backend, "deleteNamedProperty").map_err(OpError::thrown)?,
         supported_names: method(ctx, &backend, "supportedPropertyNames")
             .map_err(OpError::thrown)?,
-        reflect_get: intrinsics.reflect_get,
-        reflect_set: intrinsics.reflect_set,
-        reflect_delete: intrinsics.reflect_delete,
-        reflect_has: intrinsics.reflect_has,
-        reflect_own_keys: intrinsics.reflect_own_keys,
-        reflect_get_own_property_descriptor: intrinsics.reflect_get_own_property_descriptor,
+        reflect_get: intrinsics.reflect_get.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
+        reflect_set: intrinsics.reflect_set.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
+        reflect_delete: intrinsics.reflect_delete.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
+        reflect_has: intrinsics.reflect_has.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
+        reflect_own_keys: intrinsics.reflect_own_keys.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
+        reflect_get_own_property_descriptor: intrinsics.reflect_get_own_property_descriptor.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
     };
     let handler = ctx.new_instance(handler);
-    let target = ctx.new_object_with_proto(&intrinsics.prototype);
+    ctx.set_native_identity_owner::<DomStringMapProxyHandler>(&handler)?;
+    let target = ctx.new_object_with_proto(&intrinsics.prototype.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset prototype realm is unavailable"))?);
     let proxy = ctx
-        .construct_value(intrinsics.constructor, &[target, handler])
+        .construct_value(intrinsics.constructor.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?, &[target, handler])
         .map_err(OpError::thrown)?;
     node.collections.borrow_mut().insert(
         "dataset".into(),
@@ -159,6 +161,16 @@ struct DomStringMapProxyHandler {
     reflect_has: Value,
     reflect_own_keys: Value,
     reflect_get_own_property_descriptor: Value,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomStringMapProxyHandler {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, _:u64, _: &mut dyn FnMut(&Value)) {}
+    fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {
+        for value in [&self.backend,&self.has_named,&self.get_named,&self.set_named,&self.delete_named,
+            &self.supported_names,&self.reflect_get,&self.reflect_set,&self.reflect_delete,&self.reflect_has,
+            &self.reflect_own_keys,&self.reflect_get_own_property_descriptor] {visit(value);}
+    }
 }
 
 #[lumen_bind::methods]
@@ -272,6 +284,12 @@ struct DomStringMapBackend {
     _element_wrapper: Value,
 }
 
+impl lumen::embed::NativeIdentityOwner for DomStringMapBackend {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, _:u64, _: &mut dyn FnMut(&Value)) {}
+    fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {visit(&self._element_wrapper);}
+}
+
 impl DomStringMapBackend {
     fn element(&self) -> (Rc<DomRealm>, NodeId) {
         self.realm.resolve_adopted_node(self.element)
@@ -317,19 +335,19 @@ impl DomStringMapBackend {
             }))
     }
 
-    #[method(name = "setNamedProperty", coerce)]
-    fn set_named_property(&self, name: &str, value: &str) -> OpResult<()> {
-        let attribute = attribute_for_set(name)?;
+    #[method(name = "setNamedProperty", coerce, hint(js(ce_reactions)))]
+    fn set_named_property(&self, ctx: &mut Ctx, name: &str, value: &str) -> OpResult<()> {
+        let attribute = attribute_for_set(ctx, name)?;
         let (realm, element) = self.element();
         let result = realm
             .session
             .borrow_mut()
             .document_mut()
-            .set_attribute(element, &attribute, value);
+            .set_attribute_ns(element, None, &attribute, value);
         result.map_err(crate::dom_error)
     }
 
-    #[method(name = "deleteNamedProperty", coerce)]
+    #[method(name = "deleteNamedProperty", coerce, hint(js(ce_reactions)))]
     fn delete_named_property(&self, name: &str) -> OpResult<()> {
         let Some(attribute) = attribute_for_property_name(name) else {
             return Ok(());
@@ -402,7 +420,7 @@ fn attribute_for_property_name(name: &str) -> Option<String> {
     Some(attribute)
 }
 
-fn attribute_for_set(name: &str) -> OpResult<String> {
+fn attribute_for_set(ctx: &mut Ctx, name: &str) -> OpResult<String> {
     let mut attribute = String::with_capacity(5 + name.len());
     attribute.push_str("data-");
     let mut characters = name.chars().peekable();
@@ -412,7 +430,8 @@ fn attribute_for_set(name: &str) -> OpResult<String> {
                 .peek()
                 .is_some_and(|next| next.is_ascii_lowercase())
         {
-            return Err(OpError::new(
+            return Err(crate::error_reporting::dom_exception(
+                ctx,
                 "SyntaxError",
                 "dataset property name cannot contain a hyphen followed by a lowercase ASCII letter",
             ));
@@ -424,11 +443,42 @@ fn attribute_for_set(name: &str) -> OpResult<String> {
             attribute.push(character);
         }
     }
-    if !lumen_html::xml::is_xml_name(&attribute) {
-        return Err(OpError::new(
+    if !lumen_html::xml::is_valid_attribute_local_name(&attribute) {
+        return Err(crate::error_reporting::dom_exception(
+            ctx,
             "InvalidCharacterError",
             "dataset property name does not produce a valid attribute name",
         ));
     }
     Ok(attribute)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn specification_dataset_namespace_mutation_and_foreign_same_object_adoption() {
+        let mut engine = lumen::Engine::new();
+        let _realm = crate::install(engine.ctx(), "<!doctype html><body></body>", 192).unwrap();
+        let result = engine.eval_value(r#"(() => {
+            const check=(value,label)=>{if(!value)throw Error(label)};
+            for(const namespace of ["http://www.w3.org/1999/xhtml","http://www.w3.org/2000/svg","http://www.w3.org/1998/Math/MathML"]) {
+                const element=document.createElementNS(namespace,namespace.endsWith("svg")?"svg":namespace.endsWith("MathML")?"math":"div");
+                const data=element.dataset;
+                check(data instanceof DOMStringMap && data===element.dataset,"same native DOMStringMap");
+                element.setAttributeNS("urn:first","data-value","first");
+                element.setAttributeNS("urn:second","data-value","second");
+                data.value="third";
+                check(element.attributes.length===3 && element.getAttributeNS("urn:first","data-value")==="first" && element.getAttributeNS("urn:second","data-value")==="second" && element.getAttributeNS(null,"data-value")==="third","dataset setter selects the null namespace");
+                element.removeAttributeNS("urn:first","data-value");element.removeAttributeNS("urn:second","data-value");
+                const donor=document.implementation.createHTMLDocument("donor");donor.body.append(element);
+                check(data===element.dataset && data.value==="third","held map follows actual owner adoption");
+                data.liveValue="after adoption";check(element.getAttribute("data-live-value")==="after adoption","live adopted backing");
+                delete data.liveValue;check(!element.hasAttribute("data-live-value"),"real attribute deletion");
+                let rejected=false;try{data["bad-name"]="invalid"}catch(error){rejected=error instanceof DOMException && error.name==="SyntaxError"}check(rejected,"shared property-name conversion");
+            }
+            check(document.createElementNS("urn:other","other").dataset===undefined,"mixin applies only to supported namespaces");
+            return true;
+        })()"#).unwrap().unwrap_or_else(|error|panic!("dataset guard: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
+        assert!(matches!(result,lumen::embed::Value::Bool(true)));
+    }
 }

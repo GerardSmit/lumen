@@ -62,14 +62,20 @@ fn recompose(parts: Parts) -> Option<[f64; 6]> {
 /// Accumulate decomposed parameters, using a delta from one for scale and
 /// diagonal remainder entries, and a delta from zero for other parameters.
 pub fn accumulate(from: [f64; 6], to: [f64; 6]) -> Option<[f64; 6]> {
+    accumulate_weighted(from,to,1.0)
+}
+
+/// Weighted accumulation used by an animation's completed iterations.
+pub fn accumulate_weighted(from:[f64;6],to:[f64;6],count:f64)->Option<[f64;6]> {
+    if !count.is_finite(){return None;}
     let a = decompose(from)?;
     let b = decompose(to)?;
     recompose(Parts {
-        translation: core::array::from_fn(|i| a.translation[i] + b.translation[i]),
-        scale: core::array::from_fn(|i| a.scale[i] + b.scale[i] - 1.0),
-        angle: a.angle + b.angle,
+        translation: core::array::from_fn(|i| count*a.translation[i] + b.translation[i]),
+        scale: core::array::from_fn(|i| count*(a.scale[i]-1.0)+b.scale[i]),
+        angle: count*a.angle + b.angle,
         remainder: core::array::from_fn(|i| {
-            a.remainder[i] + b.remainder[i] - if i == 0 || i == 3 { 1.0 } else { 0.0 }
+            count*(a.remainder[i]-if i == 0 || i == 3 { 1.0 } else { 0.0 })+b.remainder[i]
         }),
     })
 }

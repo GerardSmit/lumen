@@ -17,6 +17,7 @@ lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 [dev-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
 lumen-host = { path = "../lumen-host", default-features = false, features = ["compiler"] }
 lumen-runtime = { path = "../lumen-runtime" }
 

@@ -297,9 +297,7 @@ fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
 }
 
 pub fn cpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    crate::sched::current().available_parallelism().get()
 }
 
 /// Byte values of `/proc/meminfo` fields (`"MemTotal:"`), 0 for a missing one.
@@ -343,16 +341,6 @@ pub fn set_priority(pid: i32, priority: i32) -> R<()> {
         let _ = (pid, priority);
         Ok(())
     }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__error()
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__errno_location()
 }
 
 /// The temporary directory as Node's `os.tmpdir()` picks it from the environment `env`: Unix

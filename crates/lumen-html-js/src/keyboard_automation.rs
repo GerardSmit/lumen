@@ -307,9 +307,13 @@ fn action_keyboard_properties(
 }
 
 fn action_event_target(realm: &DomRealm) -> NodeId {
-    realm
-        .focused_node()
-        .unwrap_or_else(|| realm.session.borrow().document().root())
+    realm.focused_node().unwrap_or_else(|| {
+        let session=realm.session.borrow();
+        let document=session.document();
+        let element=lumen_html::selector::document_element(document);
+        element.and_then(|element| super::named_child(document,element,&["body","frameset"]).ok().flatten())
+            .or(element).unwrap_or(document.root())
+    })
 }
 
 /// Deliver a single held-key transition. The caller owns the per-realm pressed-key set and passes
@@ -338,7 +342,9 @@ pub(crate) fn trusted_action_key_down(
     realm.mark_user_activation();
     let down = action_keyboard_properties(action, "keydown", held_after, repeat);
     let allowed = realm.dispatch_user_agent_keyboard_event(ctx, target, "keydown", &down)?;
-    if allowed && realm.focused_node() == Some(target) {
+    if allowed && matches!(action, KeyAction::Tab) {
+        realm.focus_next(ctx, held_after.iter().any(|key| key == "Shift" || key == "\u{e008}"))?;
+    } else if allowed && realm.focused_node() == Some(target) {
         let keypress = action
             .is_character()
             .then(|| action_keyboard_properties(action, "keypress", held_after, repeat));
@@ -455,9 +461,17 @@ pub fn trusted_send_keys(
         }
     }
 
+    // WebDriver keyboard interactability includes body and the document element,
+    // independently of whether HTML gives that element its own focusable area.
+    let viewport_target = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        lumen_html::selector::document_element(document) == Some(node)
+            || lumen_html::forms::html_element_local_name(document, node) == Some("body")
+    };
     realm.note_keyboard_modality();
     realm.focus(ctx, Some(node))?;
-    if realm.focused_node() != Some(node) {
+    if !viewport_target && realm.focused_node() != Some(node) {
         return Err(OpError::new(
             "InvalidStateError",
             "key input target could not receive focus",
@@ -467,7 +481,7 @@ pub fn trusted_send_keys(
 
     for (offset, ch) in keys.char_indices() {
         let action = decode_key(&keys[offset..], ch)?;
-        let event_target = realm.focused_node().unwrap_or(node);
+        let event_target = action_event_target(realm);
         if action.needs_text_control() {
             let (is_text_control, _) = is_text_control(realm, event_target)?;
             let implicit_enter = matches!(action, KeyAction::Enter | KeyAction::NumpadEnter)
@@ -487,7 +501,9 @@ pub fn trusted_send_keys(
             realm.mark_user_activation();
             let down_allowed =
                 realm.dispatch_user_agent_keyboard_event(ctx, event_target, "keydown", &down)?;
-            if down_allowed && realm.focused_node() == Some(event_target) {
+            if down_allowed && matches!(action, KeyAction::Tab) {
+                realm.focus_next(ctx, false)?;
+            } else if down_allowed && realm.focused_node() == Some(event_target) {
                 let keypress = action
                     .is_character()
                     .then(|| keyboard_properties(action, "keypress"));
@@ -505,7 +521,7 @@ pub fn trusted_send_keys(
             Ok(())
         })();
 
-        let keyup_target = realm.focused_node().unwrap_or(event_target);
+        let keyup_target = action_event_target(realm);
         let up = keyboard_properties(action, "keyup");
         let keyup = realm.dispatch_user_agent_keyboard_event(ctx, keyup_target, "keyup", &up);
         default_action?;
@@ -533,6 +549,22 @@ mod tests {
         lumen_html::selector::get_element_by_id(document, document.root(), id)
             .expect("valid id lookup")
             .expect("element exists")
+    }
+
+    #[test]
+    fn specification_window_webdriver_viewport_tab_keeps_cancellation_and_keyup_target() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<body id=body><input id=first><input id=second></body>",64).unwrap();
+        evaluate(&mut engine,"globalThis.cancelTab=true;globalThis.keys=[];document.addEventListener('keydown',e=>{if(cancelTab)e.preventDefault()});document.addEventListener('keyup',e=>keys.push(e.target.id));");
+        let body=element(&realm,"body");
+        trusted_send_keys(engine.ctx(),&realm,body,"\u{e004}").unwrap();
+        assert_eq!(realm.focused_node(),None);
+        evaluate(&mut engine,"cancelTab=false");
+        trusted_send_keys(engine.ctx(),&realm,body,"\u{e004}").unwrap();
+        assert_eq!(realm.focused_node(),Some(element(&realm,"first")));
+        trusted_send_keys(engine.ctx(),&realm,body,"\u{e004}").unwrap();
+        assert_eq!(realm.focused_node(),Some(element(&realm,"second")));
+        assert!(matches!(evaluate(&mut engine,"keys.join(',')==='body,first,second'"),Value::Bool(true)));
     }
 
     #[test]

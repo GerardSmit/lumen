@@ -179,17 +179,6 @@ impl VmStack {
         }
     }
 
-    #[inline(always)]
-    pub(super) fn pop(&mut self) -> Option<Value> {
-        if self.sp == self.base {
-            return None;
-        }
-        unsafe {
-            self.sp = self.sp.sub(1);
-            Some(std::ptr::read(self.sp))
-        }
-    }
-
     /// Pop the top value; underflow (a compiler bug) panics. Unlike `pop()`, the value moves
     /// as one 16-byte load: `Option<Value>` uses the tag's niche, so going through it copies the
     /// tag byte and then bytes 1..16 with misaligned loads, which never forward from the
@@ -218,15 +207,6 @@ impl VmStack {
             None
         } else {
             unsafe { Some(&*self.sp.sub(1)) }
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn last_mut(&mut self) -> Option<&mut Value> {
-        if self.sp == self.base {
-            None
-        } else {
-            unsafe { Some(&mut *self.sp.sub(1)) }
         }
     }
 
@@ -394,7 +374,7 @@ mod tests {
             }
             s.push(Value::str("a"));
             assert_eq!(s.len(), 102);
-            assert!(matches!(s.pop(), Some(Value::Str(_))));
+            assert!(matches!(s.pop_val(), Value::Str(_)));
             s.truncate(50);
             assert!(matches!(s[49], Value::Num(x) if x == 48.0));
             let tail = s.split_off(40);

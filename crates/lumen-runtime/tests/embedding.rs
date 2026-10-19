@@ -287,7 +287,7 @@ fn text_decoder_windows_1252_matches_node_all_bytes_views_and_streams() {
         }
         assert.throws(() => decoder.decode([]), TypeError);
         assert.throws(() => new TextDecoder('\u00a0latin1'), RangeError);
-        assert.throws(() => new TextDecoder('shift-jis'), RangeError);
+        assert.throws(() => new TextDecoder('not-an-encoding'), RangeError);
         const utf8 = new TextDecoder(' unicode20utf8 ', { fatal: true });
         assert.equal(utf8.decode(Uint8Array.of(0xe2, 0x82), { stream: true }), '');
         assert.equal(utf8.decode(Uint8Array.of(0xac)), '\u20ac');

@@ -148,6 +148,8 @@ impl Semaphore {
     /// The semaphore behind a handle number from [`Semaphore::raw`] (inherited across `fork`);
     /// the result does not close it.
     pub fn from_raw(raw: usize) -> Semaphore {
+        #[cfg(not(unix))]
+        let _ = raw;
         Semaphore {
             #[cfg(unix)]
             handle: raw as *mut libc::sem_t,

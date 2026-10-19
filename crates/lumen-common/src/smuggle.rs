@@ -152,6 +152,32 @@ pub fn utf16_units(s: &str) -> Vec<u16> {
     out
 }
 
+/// Recombine smuggled surrogate pairs formed by adjacent literal/escaped UTF-16 halves.
+pub fn canonicalize_utf16(s: &str) -> Option<String> {
+    let mut prev_high=false;
+    for c in s.chars() {
+        if prev_high && smuggled_low(c).is_some() {return Some(utf16_from_units(&utf16_units(s)));}
+        prev_high=smuggled_high(c).is_some();
+    }
+    None
+}
+
+/// Compare JavaScript strings by their UTF-16 code units without allocating.
+pub fn cmp_utf16(a: &str, b: &str) -> Ordering {
+    fn units(s: &str) -> impl Iterator<Item = u16> + '_ {
+        s.chars().flat_map(|c| {
+            if let Some(unit) = smuggled(c) {
+                [Some(unit), None]
+            } else {
+                let mut encoded = [0; 2];
+                let count = c.encode_utf16(&mut encoded).len();
+                [Some(encoded[0]), (count == 2).then_some(encoded[1])]
+            }
+        }).flatten()
+    }
+    units(a).cmp(units(b))
+}
+
 /// The UTF-16 code-unit length of `s` without materializing the units.
 pub fn utf16_unit_len(s: &str) -> usize {
     if s.is_ascii() {

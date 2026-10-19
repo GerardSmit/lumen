@@ -76,7 +76,6 @@ const isWindows = platform === 'win32';
 
 const bindingUrl = internalBinding('url');
 const { URL, URLSearchParams } = bindingUrl;
-const updateActions = bindingUrl.updateActions;
 
 const FORWARD_SLASH = /\\//g;
 const SideEffectFreeRegExpPrototypeSymbolReplace = RegExpPrototypeSymbolReplace;
@@ -102,7 +101,6 @@ module.exports = {
   encodeStr,
   isURL,
 
-  urlUpdateActions: updateActions,
   unsafeProtocol,
   hostlessProtocol,
   slashedProtocol,

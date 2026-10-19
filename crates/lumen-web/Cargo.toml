@@ -1,8 +1,8 @@
 # WinterTC "Minimum Common Web Platform API" op crate: Event/AbortController, TextEncoder/
 # TextDecoder, atob/btoa, structuredClone, URL/URLSearchParams, performance.now, crypto
 # (getRandomValues/randomUUID/subtle.digest), fetch (HTTP and verified HTTPS through lumen-tls:
-# system OpenSSL on Unix, rustls on Windows). Pure-JS pieces ship as js_init glue;
-# Rust backs the parsing/crypto/network ops. See lib.rs for the conformance checklist.
+# system OpenSSL on Unix, rustls on Windows). Every API is native
+# lumen_bind Rust. See lib.rs for the conformance checklist.
 [package]
 name = "lumen-web"
 version.workspace = true
@@ -14,9 +14,9 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen", default-features = false }
 lumen-bind = { path = "../lumen-bind" }
-lumen-host = { path = "../lumen-host", default-features = false }
+lumen-host = { path = "../lumen-host", default-features = false, features = ["webcrypto"] }
 lumen-os = { path = "../lumen-os" }
-lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "cookies", "csp", "compress"] }
 lumen-codegen = { path = "../lumen-codegen" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -26,13 +26,12 @@ lumen-tls = { path = "../lumen-tls" }
 wasm-bindgen = "=0.2.127"
 js-sys = "0.3"
 
-# Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
-[build-dependencies]
-lumen = { path = "../lumen" }
-lumen-aot = { path = "../lumen-aot", features = ["native"] }
-
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[build-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 [features]
 default = ["compiler", "jit", "aot-native", "intl", "typed"]

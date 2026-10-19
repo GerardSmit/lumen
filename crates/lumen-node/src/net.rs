@@ -3,20 +3,24 @@
 //! the public Socket/Server/dgram.Socket surface).
 //!
 //! ## How it runs on the loop
-//! The engine is single-threaded and `!Send`, so JS callbacks never leave the loop thread. Every
-//! blocking socket call runs off-thread and comes back as a [`TaskCompletion`], settled through
-//! the [`TaskRegistry`] exactly like `node:child_process` (see `child.rs`, the direct model):
-//! - **reads / accept / recv** block for an unbounded time, so they run on *dedicated* threads
-//!   ([`CompletionSender::run_blocking`]) — never a shared pool worker. The JS glue re-arms the
-//!   next read/accept/recv after each completion, which is what keeps the loop alive while a
-//!   socket or server is open (an idle server's pending `accept` is its keep-alive handle).
-//! - **connect / write / send** also run on dedicated threads (they can block on a slow peer or a
-//!   DNS lookup); the promise settles when they finish.
+//! The engine is single-threaded and `!Send`, so JS callbacks never leave the loop thread. Socket
+//! I/O is readiness-driven on the loop's reactor ([`ready::Io`], the runtime's
+//! `lumen_os::reactor::Poller`); each operation settles through the [`TaskRegistry`] as a
+//! [`TaskCompletion`], exactly like `node:child_process` (see `child.rs`):
+//! - **reads / accept / recv / write / send-message** try their syscall on the loop thread at
+//!   once. Only on `WouldBlock` is the descriptor's one-shot registration armed; the wake then
+//!   reads straight into the buffer that becomes the JS `Uint8Array` and sends the completion.
+//!   The pending task is what keeps the loop alive while a socket or server is open (an idle
+//!   server's pending `accept` is its keep-alive handle); the registration alone does not.
+//! - **connect** is a nonblocking `connect(2)` plus a writable registration on unix; the
+//!   `getaddrinfo` of a host name runs on the shared pool. Windows connects, and named-pipe
+//!   operations, still block a dedicated thread ([`CompletionSender::run_blocking`]) because their
+//!   handles cannot be waited on.
 //!
 //! Live handles live in [`NetRegistry`] / [`DgramRegistry`] in `OpState`, keyed by the id handed
-//! to JS. A `TcpStream`/`UdpSocket` is shared as an `Arc` so one thread can read while another
-//! writes (both `Read`/`Write` are implemented for `&TcpStream`); JS callbacks are never moved
-//! into a worker closure.
+//! to JS. A socket is shared as an `Arc` between the registry entry and its `Io`; JS callbacks are
+//! never moved into a closure that leaves the loop thread. A descriptor is never put in
+//! `O_NONBLOCK` on unix (it may be shared with another process): every call passes `MSG_DONTWAIT`.
 //!
 //! ## What's real vs. std-limited
 //! Plain TCP and UDP are fully real (loopback + cross-runtime verified against the Node oracle):
@@ -37,21 +41,17 @@ use std::net::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use lumen_host::{CallbackQueue, CompletionSender, Ctx, TaskId, TaskRegistry, Value};
+use lumen_os::reactor::{Reactor, Source};
+use ready::{Dir, Io, Step, Trigger};
 
-/// A UDP recv poll interval: the recv thread wakes this often to notice `close()` and exit (std
-/// gives no other way to interrupt a blocked `recv_from`).
-const UDP_POLL: Duration = Duration::from_millis(200);
-
+mod ready;
 #[cfg(unix)]
 mod fdpass;
-#[cfg(unix)]
-mod wake;
 /// Descriptor passing is unix-only (Windows IPC rides the child's stdio instead).
 #[cfg(not(unix))]
 mod fdpass {
@@ -111,13 +111,16 @@ struct SockEntry {
     unref: bool,
     /// The in-flight read task, so `ref`/`unref` can retroactively toggle it.
     pending: Option<TaskId>,
-    /// Set to stop a parked reader without shutting the connection down (see `wake`).
-    cancel: Arc<AtomicBool>,
+    /// The socket's readiness queues, created by its first operation.
+    io: Option<Arc<Io>>,
 }
 
 struct ServerEntry {
     listener: Arc<NetListener>,
+    /// Ends a pipe listener's blocked accept thread (socket listeners are woken by the reactor).
+    #[cfg_attr(unix, allow(dead_code))]
     closed: Arc<AtomicBool>,
+    io: Option<Arc<Io>>,
     local_addr: ServerAddress,
     unref: bool,
     pending: Option<TaskId>,
@@ -199,6 +202,70 @@ impl NetStream {
         }
     }
 
+    /// What the reactor waits on; `None` for a named pipe, which has no readiness registration.
+    fn source(&self) -> Option<Source> {
+        match self {
+            #[cfg(unix)]
+            Self::Tcp(_) | Self::Unix(_) => Some(Source::Fd(self.raw_fd())),
+            #[cfg(windows)]
+            Self::Tcp(stream) => Some(socket_source(stream)),
+            #[cfg(windows)]
+            Self::Pipe(_) => None,
+            #[cfg(not(any(unix, windows)))]
+            Self::Tcp(_) => None,
+        }
+    }
+
+    /// One `recv` into `buf`'s spare capacity without blocking (`WouldBlock` when nothing is
+    /// there); `buf.len()` is the byte count afterwards. `Ok(0)` is end of stream.
+    fn recv_nb(&self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            let spare = buf.spare_capacity_mut();
+            // SAFETY: the kernel writes at most `spare.len()` bytes into the uninitialised spare
+            // capacity of `buf`, and `set_len` below covers exactly the `n` it wrote.
+            let n = unsafe {
+                libc::recv(
+                    self.raw_fd(),
+                    spare.as_mut_ptr().cast(),
+                    spare.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `recv` initialised the first `n` bytes of the spare capacity.
+            unsafe { buf.set_len(buf.len() + n as usize) };
+            Ok(n as usize)
+        }
+        #[cfg(not(unix))]
+        {
+            let start = buf.len();
+            buf.resize(buf.capacity(), 0);
+            let result = (&*self).read(&mut buf[start..]);
+            buf.truncate(start + result.as_ref().copied().unwrap_or(0));
+            result
+        }
+    }
+
+    /// One `send` of a prefix of `data` without blocking; `WouldBlock` when the socket takes
+    /// nothing right now.
+    fn send_nb(&self, data: &[u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            let data = sendable(self.raw_fd(), data);
+            if data.is_empty() {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            lumen_os::net::send(self.raw_fd(), data, libc::MSG_DONTWAIT).map_err(os_error)
+        }
+        #[cfg(not(unix))]
+        {
+            (&*self).write(data)
+        }
+    }
+
     fn tcp(&self) -> Option<&TcpStream> {
         match self {
             Self::Tcp(stream) => Some(stream),
@@ -262,14 +329,30 @@ impl NetListener {
         }
     }
 
-    /// Unix listeners are non-blocking: the accept thread parks in `wake::wait` instead, so a
-    /// close (or another process sharing the socket winning the race) never strands it.
-    #[cfg(unix)]
+    /// Socket listeners are non-blocking: a pending accept is a reactor registration, and a
+    /// connection that another process sharing the socket won is just a `WouldBlock`.
     fn set_nonblocking(&self) {
         let _ = match self {
             Self::Tcp(listener) => listener.set_nonblocking(true),
+            #[cfg(unix)]
             Self::Unix(listener) => listener.set_nonblocking(true),
+            #[cfg(windows)]
+            Self::Pipe(_) => Ok(()),
         };
+    }
+
+    /// What the reactor waits on; `None` for a named-pipe listener.
+    fn source(&self) -> Option<Source> {
+        match self {
+            #[cfg(unix)]
+            Self::Tcp(_) | Self::Unix(_) => Some(Source::Fd(self.raw_fd())),
+            #[cfg(windows)]
+            Self::Tcp(listener) => Some(socket_source(listener)),
+            #[cfg(windows)]
+            Self::Pipe(_) => None,
+            #[cfg(not(any(unix, windows)))]
+            Self::Tcp(_) => None,
+        }
     }
 
     fn accept(&self) -> std::io::Result<NetStream> {
@@ -298,14 +381,17 @@ pub struct NetRegistry {
     sockets: HashMap<u64, SockEntry>,
     next_server: u64,
     servers: HashMap<u64, ServerEntry>,
+    /// Nonblocking connects in flight, by their task; dropping one deregisters its socket.
+    #[cfg(unix)]
+    connecting: HashMap<TaskId, Arc<ready::ConnectAttempt>>,
 }
 
 struct UdpEntry {
     socket: Arc<UdpSocket>,
-    closed: Arc<AtomicBool>,
     kind6: bool,
     unref: bool,
     pending: Option<TaskId>,
+    io: Option<Arc<Io>>,
 }
 
 #[derive(Default)]
@@ -402,6 +488,67 @@ fn addr_object(ctx: &mut Ctx, addr: &SocketAddr) -> Value {
     o
 }
 
+#[cfg(windows)]
+fn socket_source<T: std::os::windows::io::AsRawSocket>(socket: &T) -> Source {
+    Source::Socket(socket.as_raw_socket() as usize)
+}
+
+/// What the reactor waits on for a datagram socket.
+#[cfg(unix)]
+fn udp_source(socket: &UdpSocket) -> Option<Source> {
+    use std::os::fd::AsRawFd;
+    Some(Source::Fd(socket.as_raw_fd()))
+}
+
+#[cfg(windows)]
+fn udp_source(socket: &UdpSocket) -> Option<Source> {
+    Some(socket_source(socket))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn udp_source(_socket: &UdpSocket) -> Option<Source> {
+    None
+}
+
+fn no_readiness_source() -> OpError {
+    NativeError::runtime("this socket has no readiness source on this platform").into()
+}
+
+/// The loop's readiness reactor, or the error a socket op throws where there is none.
+fn loop_reactor(ctx: &mut Ctx) -> Result<Arc<dyn Reactor>, OpError> {
+    ctx.op_state()
+        .get::<lumen_host::loop_reactor::LoopReactor>()
+        .and_then(|reactor| reactor.reactor())
+        .ok_or_else(|| NativeError::runtime("no I/O readiness reactor on this platform").into())
+}
+
+/// A socket's `Io`, created on first use around `owner`, which keeps its descriptor open.
+fn io_for(
+    ctx: &mut Ctx,
+    slot: Option<Arc<Io>>,
+    source: Source,
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+) -> Result<(Arc<Io>, bool), OpError> {
+    if let Some(io) = slot {
+        return Ok((io, false));
+    }
+    let reactor = loop_reactor(ctx)?;
+    Ok((Io::new(reactor, source, completions(ctx), owner), true))
+}
+
+/// The error that fails writes still queued on a socket that is closing.
+fn closed_write_error() -> std::io::Error {
+    #[cfg(unix)]
+    return std::io::Error::from_raw_os_error(libc::EPIPE);
+    #[cfg(not(unix))]
+    std::io::Error::from_raw_os_error(10058)
+}
+
+/// A `Uint8Array` over `bytes`, adopted without a copy.
+fn uint8array_owned(ctx: &mut Ctx, bytes: Vec<u8>) -> Result<Value, Value> {
+    Ok(<lumen::embed::JsHost as lumen_bind::Host>::from_bytes(ctx, bytes))
+}
+
 fn completions(ctx: &mut Ctx) -> CompletionSender {
     ctx.op_state()
         .get::<CompletionSender>()
@@ -434,6 +581,11 @@ fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, OpErr
     let peer = stream
         .peer_addr()
         .map_err(|e| NativeError::runtime(format!("peer_addr: {e}")))?;
+    // Windows has no per-call non-blocking flag: the socket itself must not block.
+    #[cfg(windows)]
+    if let NetStream::Tcp(tcp) = &stream {
+        let _ = tcp.set_nonblocking(true);
+    }
     let reg = ctx
         .host_mut::<NetRegistry>()
         .expect("net registry installed");
@@ -445,7 +597,7 @@ fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, OpErr
             stream: Arc::new(stream),
             unref: false,
             pending: None,
-            cancel: Arc::new(AtomicBool::new(false)),
+            io: None,
         },
     );
     match (local, peer) {
@@ -483,19 +635,10 @@ fn path_err(syscall: &'static str, path: String, error: std::io::Error) -> NetEr
 
 /// `TcpStream::connect`, except that on Windows a loopback connect fails fast when nothing
 /// listens: like libuv, the socket is told not to retransmit its SYN (`SIO_TCP_INITIAL_RTO`), so
-/// ECONNREFUSED arrives at once instead of after Windows' ~2 s of retries.
-fn connect_tcp(
-    addr: SocketAddr,
-    local: Option<(Option<IpAddr>, u16)>,
-) -> std::io::Result<TcpStream> {
-    #[cfg(unix)]
-    {
-        if let Some((ip, port)) = local {
-            return connect_tcp_from(addr, ip, port);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = local;
+/// ECONNREFUSED arrives at once instead of after Windows' ~2 s of retries. Unix connects without
+/// blocking (see [`drive_connect`]).
+#[cfg(not(unix))]
+fn connect_tcp(addr: SocketAddr) -> std::io::Result<TcpStream> {
     #[cfg(windows)]
     {
         if addr.ip().is_loopback() {
@@ -505,16 +648,16 @@ fn connect_tcp(
     TcpStream::connect(addr)
 }
 
-/// A socket bound to a local address/port before it connects, which std cannot express.
+/// The local address a connect binds to first (`None` for an unbound connect), in `addr`'s family.
 #[cfg(unix)]
-fn connect_tcp_from(
+fn connect_local(
     addr: SocketAddr,
-    local_ip: Option<IpAddr>,
-    local_port: u16,
-) -> std::io::Result<TcpStream> {
-    use lumen_os::net::{self as os, SockAddr};
-    use std::os::fd::FromRawFd;
-    let ip = local_ip.unwrap_or(if addr.is_ipv6() {
+    local: Option<(Option<IpAddr>, u16)>,
+) -> std::io::Result<Option<SocketAddr>> {
+    let Some((ip, port)) = local else {
+        return Ok(None);
+    };
+    let ip = ip.unwrap_or(if addr.is_ipv6() {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     } else {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -522,22 +665,7 @@ fn connect_tcp_from(
     if ip.is_ipv6() != addr.is_ipv6() {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let domain = if addr.is_ipv6() {
-        libc::AF_INET6
-    } else {
-        libc::AF_INET
-    };
-    let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
-    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    os::bind(fd, &SockAddr::from(SocketAddr::new(ip, local_port))).map_err(os_error)?;
-    loop {
-        match os::connect(fd, &SockAddr::from(addr)) {
-            Ok(()) => return Ok(stream),
-            Err(e) if e.errno() == libc::EINTR => {}
-            Err(e) => return Err(os_error(e)),
-        }
-    }
+    Ok(Some(SocketAddr::new(ip, port)))
 }
 
 /// The `io::Error` of a `lumen_os` error, keeping its errno.
@@ -693,14 +821,41 @@ mod win_loopback {
     }
 }
 
+/// The addresses of `host:port`; a host name goes through `getaddrinfo`, which blocks.
+fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, NetErr> {
+    (host, port)
+        .to_socket_addrs()
+        .map(|addrs| addrs.collect())
+        .map_err(|e| NetErr {
+            code: "ENOTFOUND",
+            syscall: "getaddrinfo",
+            message: e.to_string(),
+            address: Some(host.to_string()),
+            port: Some(port),
+            errno: None,
+        })
+}
+
+/// What a connect task settles with: the socket or the error, and the task so the loop can
+/// forget the attempt.
+struct ConnectOutcome {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    id: TaskId,
+    result: Result<NetStream, NetErr>,
+}
+
 fn decode_connect(
     ctx: &mut Ctx,
     payload: Box<dyn std::any::Any + Send>,
 ) -> Result<Vec<Value>, Value> {
-    match *payload
-        .downcast::<Result<NetStream, NetErr>>()
-        .expect("connect payload")
-    {
+    let outcome = *payload
+        .downcast::<ConnectOutcome>()
+        .expect("connect payload");
+    #[cfg(unix)]
+    if let Some(reg) = ctx.host_mut::<NetRegistry>() {
+        reg.connecting.remove(&outcome.id);
+    }
+    match outcome.result {
         Ok(stream) => register_stream(ctx, stream).map_err(|e| e.to_value(ctx)),
         Err(e) => Err(net_error_value(ctx, &e)),
     }
@@ -712,125 +867,214 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
         .expect("read payload")
     {
         Ok(bytes) if bytes.is_empty() => Ok(vec![Value::Null]),
-        Ok(bytes) => Ok(vec![ctx.make_uint8array(&bytes)?]),
+        Ok(bytes) => Ok(vec![uint8array_owned(ctx, bytes)?]),
         Err(e) => Err(net_error_value(ctx, &e)),
     }
 }
 
+/// The prefix of `data` that one send can take without blocking. BSD/Darwin sockets ignore
+/// `MSG_DONTWAIT` once a send outgrows the free buffer space and block until it all fits, so the
+/// slice is capped to what the buffer can take right now (empty: no room).
 #[cfg(unix)]
-fn try_write(stream: &NetStream, data: &[u8]) -> usize {
-    use std::os::fd::AsRawFd;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const MSG_DONTWAIT: i32 = 0x40;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    const MSG_DONTWAIT: i32 = 0x80;
-    extern "C" {
-        fn send(fd: i32, buf: *const std::ffi::c_void, len: usize, flags: i32) -> isize;
-    }
-    let fd = match stream {
-        NetStream::Tcp(s) => s.as_raw_fd(),
-        NetStream::Unix(s) => s.as_raw_fd(),
-    };
-    if data.is_empty() {
-        return 0;
-    }
-    // BSD/Darwin sockets ignore MSG_DONTWAIT once a send outgrows the free buffer space and
-    // block until it all fits, so the slice is capped to what the buffer can take right now.
+fn sendable(fd: std::os::fd::RawFd, data: &[u8]) -> &[u8] {
     #[cfg(target_vendor = "apple")]
-    let data = {
-        extern "C" {
-            fn getsockopt(
-                fd: i32,
-                level: i32,
-                name: i32,
-                value: *mut std::ffi::c_void,
-                len: *mut u32,
-            ) -> i32;
-        }
-        const SOL_SOCKET: i32 = 0xffff;
-        const SO_SNDBUF: i32 = 0x1001;
-        const SO_NWRITE: i32 = 0x1024;
+    {
         let query = |name: i32| -> Option<usize> {
-            let mut v: i32 = 0;
-            let mut len = 4u32;
-            // SAFETY: `v` is a live i32 and `len` its size, for an open socket.
-            let rc =
-                unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
-            (rc == 0 && v >= 0).then_some(v as usize)
+            lumen_os::net::getsockopt_int(fd, libc::SOL_SOCKET, name)
+                .ok()
+                .and_then(|v| usize::try_from(v).ok())
         };
-        let space = match (query(SO_SNDBUF), query(SO_NWRITE)) {
+        let space = match (query(libc::SO_SNDBUF), query(libc::SO_NWRITE)) {
             (Some(buf), Some(queued)) => buf.saturating_sub(queued),
             _ => 0,
         };
-        &data[..data.len().min(space)]
-    };
-    if data.is_empty() {
-        return 0;
+        return &data[..data.len().min(space)];
     }
-    // SAFETY: `fd` is an open socket owned by `stream`, and `data` is a live buffer of `len` bytes.
-    let n = unsafe { send(fd, data.as_ptr().cast(), data.len(), MSG_DONTWAIT) };
-    if n > 0 {
-        n as usize
-    } else {
-        0
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = fd;
+        data
     }
 }
 
-/// Windows has no per-call non-blocking send; the socket stays blocking (its reader thread
-/// relies on that). A `select` with a zero timeout says whether the send buffer has room, and a
-/// write of at most one buffer's worth is then taken without blocking.
-#[cfg(windows)]
+/// libuv's `uv_try_write`: what the socket takes right now (0 when nothing, or on an error, which
+/// the async write that follows reports).
 fn try_write(stream: &NetStream, data: &[u8]) -> usize {
-    use std::os::windows::io::AsRawSocket;
-    const MAX_SYNC: usize = 64 * 1024;
-    #[repr(C)]
-    struct FdSet {
-        count: u32,
-        sockets: [usize; 64],
-    }
-    #[repr(C)]
-    struct TimeVal {
-        sec: i32,
-        usec: i32,
-    }
-    #[link(name = "ws2_32")]
-    extern "system" {
-        fn select(n: i32, r: *mut FdSet, w: *mut FdSet, e: *mut FdSet, t: *const TimeVal) -> i32;
-    }
-    let NetStream::Tcp(tcp) = stream else {
-        return 0;
-    };
+    // Like uv_try_write on Windows, a large write takes a partial first slice synchronously; the
+    // rest is queued, so writeQueueSize shows progress (Socket#_onTimeout suppresses its timeout
+    // on it).
+    #[cfg(windows)]
+    let data = &data[..data.len().min(64 * 1024)];
     if data.is_empty() {
         return 0;
     }
-    // Like uv_try_write, a large write takes a partial first slice synchronously; the rest is
-    // queued, so writeQueueSize shows progress (Socket#_onTimeout suppresses its timeout on it).
-    let data = &data[..data.len().min(MAX_SYNC)];
-    let mut set = FdSet {
-        count: 1,
-        sockets: [0; 64],
-    };
-    set.sockets[0] = tcp.as_raw_socket() as usize;
-    let zero = TimeVal { sec: 0, usec: 0 };
-    // SAFETY: `set` holds one open socket; the null sets and the zero timeout are valid.
-    let ready = unsafe {
-        select(
-            0,
-            std::ptr::null_mut(),
-            &mut set,
-            std::ptr::null_mut(),
-            &zero,
-        )
-    };
-    if ready != 1 {
-        return 0;
-    }
-    (&*tcp).write(data).unwrap_or(0)
+    stream.send_nb(data).unwrap_or(0)
 }
 
-#[cfg(not(any(unix, windows)))]
-fn try_write(_stream: &NetStream, _data: &[u8]) -> usize {
-    0
+/// A queued write: sends `data` in as many `send`s as the socket takes, finishing when all of it
+/// is out. Several writes on one socket complete in the order they were issued.
+fn write_step(
+    stream: Arc<NetStream>,
+    data: Vec<u8>,
+) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    let mut sent = 0;
+    move |trigger| {
+        let fail = |e: &std::io::Error| Step::Done(Box::new(Err::<(), NetErr>(net_err("write", e, None))));
+        if let Trigger::Failed(e) = &trigger {
+            return fail(e);
+        }
+        while sent < data.len() {
+            match stream.send_nb(&data[sent..]) {
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Step::Again,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return fail(&e),
+            }
+        }
+        Step::Done(Box::new(Ok::<(), NetErr>(())))
+    }
+}
+
+/// How many bytes one read takes off a socket at most.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Fills a buffer for a read result: reads that returned little give the rest back.
+fn trimmed(mut buf: Vec<u8>) -> Vec<u8> {
+    if buf.len() < READ_CHUNK / 2 {
+        buf.shrink_to_fit();
+    }
+    buf
+}
+
+/// A queued read: one chunk, straight into the `Vec` that becomes the JS `Uint8Array`.
+fn read_step(stream: Arc<NetStream>) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    move |trigger| {
+        let result: Result<Vec<u8>, NetErr> = match trigger {
+            Trigger::Failed(e) => Err(net_err("read", &e, None)),
+            Trigger::Ready => {
+                let mut buf = Vec::with_capacity(READ_CHUNK);
+                loop {
+                    match stream.recv_nb(&mut buf) {
+                        Ok(_) => break Ok(trimmed(buf)),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Step::Again,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => break Err(net_err("read", &e, None)),
+                    }
+                }
+            }
+        };
+        Step::Done(Box::new(result))
+    }
+}
+
+/// A connect on unix: the addresses still to try, and what the loop needs to carry on from a wake.
+#[cfg(unix)]
+struct ConnectJob {
+    id: TaskId,
+    addrs: std::collections::VecDeque<SocketAddr>,
+    last: Option<std::io::Error>,
+    host: String,
+    port: u16,
+    local: Option<(Option<IpAddr>, u16)>,
+    attempt: Arc<ready::ConnectAttempt>,
+    reactor: Arc<dyn Reactor>,
+    completions: CompletionSender,
+}
+
+#[cfg(unix)]
+impl ConnectJob {
+    fn finish(&self, result: Result<NetStream, NetErr>) {
+        self.completions
+            .send(self.id, Box::new(ConnectOutcome { id: self.id, result }));
+    }
+}
+
+/// Tries the addresses in turn: starts a nonblocking connect and, while it is in progress, waits
+/// for the socket to become writable on the reactor. Runs on the loop thread (a wake) or, for the
+/// first address, on whichever thread resolved the host name.
+#[cfg(unix)]
+fn drive_connect(mut job: ConnectJob) {
+    use std::os::fd::AsRawFd;
+    loop {
+        if job.attempt.is_cancelled() {
+            return;
+        }
+        let Some(addr) = job.addrs.pop_front() else {
+            let error = job
+                .last
+                .take()
+                .unwrap_or_else(|| std::io::Error::other("no address"));
+            let result = Err(net_err("connect", &error, Some((job.host.clone(), job.port))));
+            job.finish(result);
+            return;
+        };
+        let started = connect_local(addr, job.local)
+            .and_then(|local| lumen_os::net::connect_start(addr, local));
+        match started {
+            Err(e) => job.last = Some(e),
+            Ok((stream, false)) => {
+                let _ = stream.set_nonblocking(false);
+                job.finish(Ok(NetStream::Tcp(stream)));
+                return;
+            }
+            Ok((stream, true)) => {
+                let stream = Arc::new(stream);
+                let io = Io::new(
+                    job.reactor.clone(),
+                    Source::Fd(stream.as_raw_fd()),
+                    job.completions.clone(),
+                    stream.clone(),
+                );
+                if !job.attempt.set_current(io.clone()) {
+                    return;
+                }
+                let id = job.id;
+                io.submit(Dir::Write, id, false, connect_step(stream, job));
+                return;
+            }
+        }
+    }
+}
+
+/// Finishes a connect when its socket becomes writable: success, or the failure, which moves on to
+/// the next address.
+#[cfg(unix)]
+fn connect_step(
+    stream: Arc<TcpStream>,
+    job: ConnectJob,
+) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    let mut job = Some(job);
+    move |trigger| {
+        let failure = match trigger {
+            Trigger::Failed(e) => Some(e),
+            Trigger::Ready => match stream.take_error() {
+                Ok(Some(e)) | Err(e) => Some(e),
+                Ok(None) => match stream.peer_addr() {
+                    Ok(_) => None,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => return Step::Again,
+                    Err(e) => Some(e),
+                },
+            },
+        };
+        let mut job = job.take().expect("a connect step finishes once");
+        let connected = match failure {
+            None => stream.try_clone().and_then(|dup| {
+                dup.set_nonblocking(false)?;
+                Ok(dup)
+            }),
+            Some(e) => Err(e),
+        };
+        match connected {
+            Ok(dup) => {
+                job.finish(Ok(NetStream::Tcp(dup)));
+            }
+            Err(e) => {
+                job.last = Some(e);
+                drive_connect(job);
+            }
+        }
+        Step::Handled
+    }
 }
 
 fn decode_write(
@@ -905,76 +1149,56 @@ fn decode_accept(
     }
 }
 
-/// Flag a listener closed and wake its blocked `accept` (a throwaway connection, or the pipe's
-/// own cancel) so the accept thread sees the flag and ends.
-fn close_server_entry(entry: ServerEntry) {
+/// Closes a listener: its pending accept settles `null`, its reactor registration goes, and a
+/// unix socket path this process bound is unlinked. A named-pipe listener cancels its own blocked
+/// accept thread.
+fn close_server_entry(entry: ServerEntry, completions: Option<&CompletionSender>) {
     let ServerEntry {
         closed,
         local_addr,
         listener,
         owns_path,
+        io,
+        pending,
         ..
     } = entry;
     closed.store(true, Ordering::SeqCst);
     #[cfg(unix)]
-    {
-        wake::wake_all();
-        if let (true, ServerAddress::Unix(path)) = (owns_path, &local_addr) {
-            let _ = std::fs::remove_file(path);
-        }
-        drop(listener);
-        return;
+    if let (true, ServerAddress::Unix(path)) = (owns_path, &local_addr) {
+        let _ = std::fs::remove_file(path);
     }
     #[cfg(not(unix))]
-    let _ = owns_path;
-    #[allow(unreachable_code)]
-    match local_addr {
-        ServerAddress::Tcp(local_addr) => {
-            let wake = if local_addr.ip().is_unspecified() {
-                let ip = if local_addr.is_ipv6() {
-                    IpAddr::V6(Ipv6Addr::LOCALHOST)
-                } else {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
-                };
-                SocketAddr::new(ip, local_addr.port())
-            } else {
-                local_addr
-            };
-            let _ = TcpStream::connect_timeout(&wake, Duration::from_millis(250));
-        }
-        #[cfg(unix)]
-        ServerAddress::Unix(path) => {
-            let _ = UnixStream::connect(&path);
-            let _ = std::fs::remove_file(path);
-        }
-        // A pipe listener cancels its own blocked accept.
-        #[cfg(windows)]
-        ServerAddress::Pipe(_) => {
-            if let NetListener::Pipe(pipe) = &*listener {
-                pipe.close();
-            }
-        }
+    let _ = (owns_path, local_addr);
+    #[cfg(windows)]
+    if let NetListener::Pipe(pipe) = &*listener {
+        pipe.close();
     }
+    if let (Some(id), Some(_), Some(completions)) = (pending, &io, completions) {
+        completions.send(id, Box::new(AcceptResult::Closed));
+    }
+    drop(io);
     drop(listener);
 }
 
-/// Shut every socket and listener down and release every blocked reader, accept and receive
-/// thread: a terminated or dropped realm has nobody left to settle them, and their threads would
-/// otherwise sit in the kernel until the peer acts.
+/// Releases every socket and listener: a terminated or dropped realm has nobody left to settle
+/// their operations, and a descriptor must not stay registered with the reactor.
 pub(crate) fn close_all(ctx: &mut Ctx) {
+    let sender = ctx.op_state().get::<CompletionSender>().cloned();
     if let Some(reg) = ctx.host_mut::<NetRegistry>() {
         for (_, entry) in reg.sockets.drain() {
             let _ = entry.stream.shutdown(Shutdown::Both);
         }
+        #[cfg(unix)]
+        for (_, attempt) in reg.connecting.drain() {
+            attempt.cancel();
+        }
         let servers: Vec<ServerEntry> = reg.servers.drain().map(|(_, e)| e).collect();
         for entry in servers {
-            close_server_entry(entry);
+            close_server_entry(entry, sender.as_ref());
         }
     }
     if let Some(reg) = ctx.host_mut::<DgramRegistry>() {
-        for (_, entry) in reg.sockets.drain() {
-            entry.closed.store(true, Ordering::SeqCst);
-        }
+        reg.sockets.clear();
     }
 }
 
@@ -1042,7 +1266,9 @@ fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
 
 #[cfg(not(unix))]
 fn bind_udp(addr: SocketAddr, _flags: u32) -> std::io::Result<UdpSocket> {
-    UdpSocket::bind(addr)
+    let socket = UdpSocket::bind(addr)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
 }
 
 #[cfg(unix)]
@@ -1058,17 +1284,55 @@ fn disconnect_udp(_socket: &UdpSocket) -> std::io::Result<()> {
 
 enum RecvResult {
     Msg(Vec<u8>, SocketAddr),
-    Closed,
     Err(NetErr),
+}
+
+/// One datagram without blocking (`WouldBlock` when none is queued).
+fn recv_datagram(socket: &UdpSocket) -> std::io::Result<(Vec<u8>, SocketAddr)> {
+    let mut buf = vec![0u8; 65536];
+    #[cfg(unix)]
+    let (n, from) = {
+        use std::os::fd::AsRawFd;
+        use lumen_os::net::SockAddr;
+        let (n, from) = lumen_os::net::recvfrom(socket.as_raw_fd(), &mut buf, libc::MSG_DONTWAIT)
+            .map_err(os_error)?;
+        let from = match from {
+            Some(SockAddr::V4(a)) => Some(SocketAddr::V4(a)),
+            Some(SockAddr::V6(a)) => Some(SocketAddr::V6(a)),
+            _ => None,
+        };
+        (n, from.map_or_else(|| socket.peer_addr(), Ok)?)
+    };
+    #[cfg(not(unix))]
+    let (n, from) = socket.recv_from(&mut buf)?;
+    buf.truncate(n);
+    Ok((trimmed(buf), from))
+}
+
+/// A queued receive: one datagram with its source.
+fn recv_step(socket: Arc<UdpSocket>) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    move |trigger| {
+        let result = match trigger {
+            Trigger::Failed(e) => RecvResult::Err(net_err("recv", &e, None)),
+            Trigger::Ready => loop {
+                match recv_datagram(&socket) {
+                    Ok((bytes, from)) => break RecvResult::Msg(bytes, from),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Step::Again,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => break RecvResult::Err(net_err("recv", &e, None)),
+                }
+            },
+        };
+        Step::Done(Box::new(result))
+    }
 }
 
 fn decode_recv(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     match *payload.downcast::<RecvResult>().expect("recv payload") {
-        RecvResult::Closed => Ok(vec![Value::Null]),
         RecvResult::Err(e) => Err(net_error_value(ctx, &e)),
         RecvResult::Msg(bytes, from) => {
             let size = bytes.len();
-            let data = ctx.make_uint8array(&bytes)?;
+            let data = uint8array_owned(ctx, bytes)?;
             let o = Value::Obj(ctx.new_object());
             let _ = ctx.set_member(&o, "data", data);
             let _ = ctx.set_member(&o, "address", Value::from_string(from.ip().to_string()));
@@ -1776,6 +2040,122 @@ fn port_of(n: f64) -> u16 {
     n as u64 as u16
 }
 
+/// A queued accept: one connection off a listener that is not blocking.
+fn accept_step(listener: Arc<NetListener>) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    move |trigger| {
+        if let Trigger::Failed(_) = trigger {
+            return Step::Done(Box::new(AcceptResult::Closed));
+        }
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    // BSD sockets inherit the listener's O_NONBLOCK; calls on the stream pass
+                    // MSG_DONTWAIT themselves, and a descriptor handed to a child must block.
+                    #[cfg(unix)]
+                    let _ = match &stream {
+                        NetStream::Tcp(s) => s.set_nonblocking(false),
+                        NetStream::Unix(s) => s.set_nonblocking(false),
+                    };
+                    return Step::Done(Box::new(AcceptResult::Conn(stream)));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Step::Again,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(_) => return Step::Done(Box::new(AcceptResult::Closed)),
+            }
+        }
+    }
+}
+
+/// Named pipes (Windows) have no readiness registration: their reads, writes and accepts block a
+/// dedicated thread, as they always did.
+#[cfg(windows)]
+fn pipe_read(
+    ctx: &mut Ctx,
+    sid: u64,
+    stream: Arc<NetStream>,
+    unref: bool,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
+    if unref {
+        ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
+    }
+    if let Some(e) = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get_mut(&sid))
+    {
+        e.pending = Some(id);
+    }
+    completions(ctx).run_blocking(id, move || {
+        let mut buf = vec![0u8; READ_CHUNK];
+        let mut s: &NetStream = &stream;
+        let result: Result<Vec<u8>, NetErr> = match s.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Err(e) => Err(net_err("read", &e, None)),
+        };
+        Box::new(result)
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pipe_write(
+    ctx: &mut Ctx,
+    stream: Arc<NetStream>,
+    data: Vec<u8>,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
+    completions(ctx).run_blocking(id, move || {
+        let mut s: &NetStream = &stream;
+        let result: Result<(), NetErr> = s
+            .write_all(&data)
+            .and_then(|()| s.flush())
+            .map_err(|e| net_err("write", &e, None));
+        Box::new(result)
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pipe_accept(
+    ctx: &mut Ctx,
+    sid: u64,
+    listener: Arc<NetListener>,
+    closed: Arc<AtomicBool>,
+    unref: bool,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_accept);
+    if unref {
+        ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
+    }
+    if let Some(e) = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.servers.get_mut(&sid))
+    {
+        e.pending = Some(id);
+    }
+    completions(ctx).run_blocking(id, move || {
+        let result = match listener.accept() {
+            Ok(stream) if !closed.load(Ordering::SeqCst) => AcceptResult::Conn(stream),
+            _ => AcceptResult::Closed,
+        };
+        Box::new(result)
+    });
+    Ok(())
+}
+
 #[lumen_bind::module(name = "__net")]
 mod tcp_bindings {
     use super::*;
@@ -1853,48 +2233,72 @@ mod tcp_bindings {
         let port = port_of(port);
         let local_port = port_of(local_port);
         let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
+        let local_ip: Option<IpAddr> = if local_host.is_empty() {
+            None
+        } else {
+            local_host.parse().ok()
+        };
+        let local = (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
 
-        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
-        completions(ctx).run_blocking(id, move || {
-            let result: Result<NetStream, NetErr> = (|| {
-                let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
-                    Ok(it) => it.collect(),
-                    Err(e) => {
-                        return Err(NetErr {
-                            code: "ENOTFOUND",
-                            syscall: "getaddrinfo",
-                            message: e.to_string(),
-                            address: Some(host.clone()),
-                            port: Some(port),
-                            errno: None,
-                        })
+        #[cfg(unix)]
+        {
+            let reactor = loop_reactor(ctx)?;
+            let sender = completions(ctx);
+            let spawn = ctx.op_state().get::<lumen_host::SpawnHandle>().cloned();
+            let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
+            let attempt = ready::ConnectAttempt::new();
+            if let Some(reg) = ctx.host_mut::<NetRegistry>() {
+                reg.connecting.insert(id, attempt.clone());
+            }
+            let literal = host.parse::<IpAddr>().is_ok();
+            let start = move || match resolve_host(&host, port) {
+                Ok(addrs) => drive_connect(ConnectJob {
+                    id,
+                    addrs: addrs.into(),
+                    last: None,
+                    host,
+                    port,
+                    local,
+                    attempt,
+                    reactor,
+                    completions: sender,
+                }),
+                Err(e) => sender.send(id, Box::new(ConnectOutcome { id, result: Err(e) })),
+            };
+            match spawn {
+                Some(spawn) if !literal => spawn.spawn_detached(Box::new(start)),
+                _ => start(),
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = local;
+            let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
+            completions(ctx).run_blocking(id, move || {
+                let result = resolve_host(&host, port).and_then(|addrs| {
+                    let mut last = None;
+                    for addr in addrs {
+                        match connect_tcp(addr) {
+                            Ok(s) => return Ok(NetStream::Tcp(s)),
+                            Err(e) => last = Some(e),
+                        }
                     }
-                };
-                let local_ip: Option<IpAddr> = if local_host.is_empty() {
-                    None
-                } else {
-                    local_host.parse().ok()
-                };
-                let local =
-                    (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
-                let mut last = None;
-                for addr in addrs {
-                    match connect_tcp(addr, local) {
-                        Ok(s) => return Ok(NetStream::Tcp(s)),
-                        Err(e) => last = Some(e),
-                    }
-                }
-                Err(net_err(
-                    "connect",
-                    &last.unwrap_or_else(|| std::io::Error::other("no address")),
-                    Some((host.clone(), port)),
-                ))
-            })();
-            Box::new(result)
-        });
-        Ok(())
+                    Err(net_err(
+                        "connect",
+                        &last.unwrap_or_else(|| std::io::Error::other("no address")),
+                        Some((host.clone(), port)),
+                    ))
+                });
+                Box::new(ConnectOutcome { id, result })
+            });
+            Ok(())
+        }
     }
 
+    /// `(path, resolve, reject)` — connect to a Unix-domain socket path (a named pipe on Windows).
+    /// The connect of a local path ends at once, but may block while the listener's backlog is
+    /// full, so it stays on a dedicated thread.
     #[op(coerce, name = "connectPath")]
     fn op_connect_path(
         ctx: &mut Ctx,
@@ -1910,7 +2314,7 @@ mod tcp_bindings {
                 let result = UnixStream::connect(&path)
                     .map(NetStream::Unix)
                     .map_err(|error| path_err("connect", path, error));
-                Box::new(result)
+                Box::new(ConnectOutcome { id, result })
             });
             Ok(())
         }
@@ -1921,7 +2325,7 @@ mod tcp_bindings {
                 let result = crate::win_pipe::PipeStream::connect(&path)
                     .map(NetStream::Pipe)
                     .map_err(|error| path_err("connect", path, error));
-                Box::new(result)
+                Box::new(ConnectOutcome { id, result })
             });
             Ok(())
         }
@@ -1943,58 +2347,33 @@ mod tcp_bindings {
         let found = ctx
             .host_mut::<NetRegistry>()
             .and_then(|r| r.sockets.get(&sid))
-            .map(|e| (e.stream.clone(), e.unref, e.cancel.clone()));
-        let (stream, unref, cancel) = match found {
-            Some(v) => v,
-            None => {
-                enqueue(ctx, resolve, vec![Value::Null]); // gone → treat as EOF
-                return Ok(());
-            }
+            .map(|e| (e.stream.clone(), e.unref, e.io.clone()));
+        let Some((stream, unref, io)) = found else {
+            enqueue(ctx, resolve, vec![Value::Null]); // gone → treat as EOF
+            return Ok(());
         };
-        #[cfg(not(unix))]
-        let _ = &cancel;
+        let Some(source) = stream.source() else {
+            #[cfg(windows)]
+            return pipe_read(ctx, sid, stream, unref, resolve, reject);
+            #[cfg(not(windows))]
+            return Err(no_readiness_source());
+        };
+        let (io, created) = io_for(ctx, io, source, stream.clone())?;
 
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_read);
-        let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
         if unref {
-            reg.set_unref(id);
+            ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
         }
         if let Some(e) = ctx
             .host_mut::<NetRegistry>()
             .and_then(|r| r.sockets.get_mut(&sid))
         {
             e.pending = Some(id);
+            if created {
+                e.io = Some(io.clone());
+            }
         }
-        completions(ctx).run_blocking(id, move || {
-            let mut buf = vec![0u8; 65536];
-            let mut s: &NetStream = &stream;
-            #[cfg(unix)]
-            let read = loop {
-                match wake::wait(stream.raw_fd(), libc::POLLIN, &cancel) {
-                    Ok(true) => {}
-                    Ok(false) => break Ok(0),
-                    Err(e) => break Err(e),
-                }
-                match lumen_os::net::recv(stream.raw_fd(), &mut buf, libc::MSG_DONTWAIT) {
-                    Ok(n) => break Ok(n),
-                    Err(e) if lumen_os::net::would_block(e.errno()) || e.errno() == libc::EINTR => {
-                    }
-                    Err(e) => break Err(os_error(e)),
-                }
-            };
-            #[cfg(not(unix))]
-            let read = s.read(&mut buf);
-            let _ = &mut s;
-            let result: Result<Vec<u8>, NetErr> = match read {
-                Ok(0) => Ok(Vec::new()),
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(buf)
-                }
-                Err(e) => Err(net_err("read", &e, None)),
-            };
-            Box::new(result)
-        });
+        io.submit(Dir::Read, id, true, read_step(stream));
         Ok(())
     }
 
@@ -2010,11 +2389,11 @@ mod tcp_bindings {
         let sid = uid(sid);
         let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
 
-        let stream = ctx
+        let found = ctx
             .host_mut::<NetRegistry>()
             .and_then(|r| r.sockets.get(&sid))
-            .map(|e| e.stream.clone());
-        let Some(stream) = stream else {
+            .map(|e| (e.stream.clone(), e.io.clone()));
+        let Some((stream, io)) = found else {
             let err = net_error_value(
                 ctx,
                 &NetErr {
@@ -2029,16 +2408,24 @@ mod tcp_bindings {
             enqueue(ctx, reject, vec![err]);
             return Ok(());
         };
+        let Some(source) = stream.source() else {
+            #[cfg(windows)]
+            return pipe_write(ctx, stream, data, resolve, reject);
+            #[cfg(not(windows))]
+            return Err(no_readiness_source());
+        };
+        let (io, created) = io_for(ctx, io, source, stream.clone())?;
 
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
-        completions(ctx).run_blocking(id, move || {
-            let mut s: &NetStream = &stream;
-            let result: Result<(), NetErr> = s
-                .write_all(&data)
-                .and_then(|()| s.flush())
-                .map_err(|e| net_err("write", &e, None));
-            Box::new(result)
-        });
+        if created {
+            if let Some(e) = ctx
+                .host_mut::<NetRegistry>()
+                .and_then(|r| r.sockets.get_mut(&sid))
+            {
+                e.io = Some(io.clone());
+            }
+        }
+        io.submit(Dir::Write, id, true, write_step(stream, data));
         Ok(())
     }
 
@@ -2077,6 +2464,9 @@ mod tcp_bindings {
         let pending = match ctx.host_mut::<NetRegistry>() {
             Some(reg) => reg.sockets.remove(&sid).and_then(|e| {
                 let _ = e.stream.shutdown(Shutdown::Both);
+                if let Some(io) = &e.io {
+                    io.close(closed_write_error);
+                }
                 e.pending
             }),
             None => None,
@@ -2193,11 +2583,11 @@ mod tcp_bindings {
             ServerEntry {
                 listener: Arc::new({
                     let listener = NetListener::Tcp(listener);
-                    #[cfg(unix)]
                     listener.set_nonblocking();
                     listener
                 }),
                 closed: Arc::new(AtomicBool::new(false)),
+                io: None,
                 local_addr: ServerAddress::Tcp(local_addr),
                 unref: false,
                 pending: None,
@@ -2237,6 +2627,7 @@ mod tcp_bindings {
                         listener
                     }),
                     closed: Arc::new(AtomicBool::new(false)),
+                    io: None,
                     local_addr: ServerAddress::Unix(path.clone()),
                     unref: false,
                     pending: None,
@@ -2262,6 +2653,7 @@ mod tcp_bindings {
                 ServerEntry {
                     listener: Arc::new(NetListener::Pipe(listener)),
                     closed: Arc::new(AtomicBool::new(false)),
+                    io: None,
                     local_addr: ServerAddress::Pipe(path.clone()),
                     unref: false,
                     pending: None,
@@ -2291,73 +2683,40 @@ mod tcp_bindings {
         let found = ctx.host_mut::<NetRegistry>().and_then(|r| {
             r.servers
                 .get(&sid)
-                .map(|e| (e.listener.clone(), e.closed.clone(), e.unref))
+                .map(|e| (e.listener.clone(), e.closed.clone(), e.unref, e.io.clone()))
         });
-        let (listener, closed, unref) = match found {
-            Some(v) => v,
-            None => {
-                enqueue(ctx, resolve, vec![Value::Null]);
-                return Ok(());
-            }
+        let Some((listener, closed, unref, io)) = found else {
+            enqueue(ctx, resolve, vec![Value::Null]);
+            return Ok(());
         };
+        let Some(source) = listener.source() else {
+            #[cfg(windows)]
+            return pipe_accept(ctx, sid, listener, closed, unref, resolve, reject);
+            #[cfg(not(windows))]
+            return Err(no_readiness_source());
+        };
+        #[cfg(not(windows))]
+        let _ = closed;
+        let (io, created) = io_for(ctx, io, source, listener.clone())?;
 
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_accept);
-        let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
         if unref {
-            reg.set_unref(id);
+            ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
         }
         if let Some(e) = ctx
             .host_mut::<NetRegistry>()
             .and_then(|r| r.servers.get_mut(&sid))
         {
             e.pending = Some(id);
+            if created {
+                e.io = Some(io.clone());
+            }
         }
-        completions(ctx).run_blocking(id, move || {
-            #[cfg(unix)]
-            let accepted = loop {
-                match wake::wait(listener.raw_fd(), libc::POLLIN, &closed) {
-                    Ok(true) => {}
-                    Ok(false) => break Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
-                    Err(e) => break Err(e),
-                }
-                match listener.accept() {
-                    // BSD sockets inherit the listener's O_NONBLOCK; the stream threads block.
-                    Ok(stream) => {
-                        let _ = match &stream {
-                            NetStream::Tcp(s) => s.set_nonblocking(false),
-                            NetStream::Unix(s) => s.set_nonblocking(false),
-                        };
-                        break Ok(stream);
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::ConnectionAborted
-                        ) => {}
-                    Err(e) => break Err(e),
-                }
-            };
-            #[cfg(not(unix))]
-            let accepted = listener.accept();
-            let result: AcceptResult = match accepted {
-                Ok(stream) => {
-                    if closed.load(Ordering::SeqCst) {
-                        AcceptResult::Closed // woken by closeServer()'s throwaway connect
-                    } else {
-                        AcceptResult::Conn(stream)
-                    }
-                }
-                Err(_) => AcceptResult::Closed,
-            };
-            Box::new(result)
-        });
+        io.submit(Dir::Read, id, true, accept_step(listener));
         Ok(())
     }
 
-    /// `(serverId)` — stop the listener: flag it closed and poke it with a throwaway connection so the
-    /// blocked `accept()` wakes and reports closed.
+    /// `(serverId)` — stop the listener: its pending accept settles `null`.
     #[op(coerce, name = "closeServer")]
     fn op_close_server(ctx: &mut Ctx, sid: f64) {
         let sid = uid(sid);
@@ -2365,7 +2724,8 @@ mod tcp_bindings {
             .host_mut::<NetRegistry>()
             .and_then(|r| r.servers.remove(&sid));
         if let Some(entry) = entry {
-            close_server_entry(entry);
+            let sender = ctx.op_state().get::<CompletionSender>().cloned();
+            close_server_entry(entry, sender.as_ref());
         }
     }
 
@@ -2446,8 +2806,6 @@ mod udp_bindings {
             Ok(s) => s,
             Err(e) => return Err(net_error(&net_err("bind", &e, Some((host, port)))).into()),
         };
-        // Bounded read timeout so the recv thread can notice close() and exit.
-        let _ = socket.set_read_timeout(Some(UDP_POLL));
         let local = socket
             .local_addr()
             .map_err(|e| NativeError::runtime(format!("local_addr: {e}")))?;
@@ -2461,10 +2819,10 @@ mod udp_bindings {
             id,
             UdpEntry {
                 socket: Arc::new(socket),
-                closed: Arc::new(AtomicBool::new(false)),
                 kind6,
                 unref: false,
                 pending: None,
+                io: None,
             },
         );
 
@@ -2513,7 +2871,7 @@ mod udp_bindings {
     }
 
     /// `(socketId, resolve, reject)` — receive one datagram; resolves with
-    /// `{ data, address, port, family, size }` or `null` once the socket is closed.
+    /// `{ data, address, port, family, size }`. Closing the socket cancels the receive.
     #[op(coerce, name = "recv")]
     fn op_udp_recv(ctx: &mut Ctx, sid: f64, resolve: Value, reject: Value) -> Result<(), OpError> {
         let sid = uid(sid);
@@ -2522,53 +2880,29 @@ mod udp_bindings {
         let found = ctx.host_mut::<DgramRegistry>().and_then(|r| {
             r.sockets
                 .get(&sid)
-                .map(|e| (e.socket.clone(), e.closed.clone(), e.unref))
+                .map(|e| (e.socket.clone(), e.unref, e.io.clone()))
         });
-        let (socket, closed, unref) = match found {
-            Some(v) => v,
-            None => {
-                enqueue(ctx, resolve, vec![Value::Null]);
-                return Ok(());
-            }
+        let Some((socket, unref, io)) = found else {
+            enqueue(ctx, resolve, vec![Value::Null]);
+            return Ok(());
         };
+        let source = udp_source(&socket).ok_or_else(no_readiness_source)?;
+        let (io, created) = io_for(ctx, io, source, socket.clone())?;
 
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_recv);
-        let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
         if unref {
-            reg.set_unref(id);
+            ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
         }
         if let Some(e) = ctx
             .host_mut::<DgramRegistry>()
             .and_then(|r| r.sockets.get_mut(&sid))
         {
             e.pending = Some(id);
+            if created {
+                e.io = Some(io.clone());
+            }
         }
-        completions(ctx).run_blocking(id, move || {
-            let mut buf = vec![0u8; 65536];
-            let result: RecvResult = loop {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, from)) => {
-                        if closed.load(Ordering::SeqCst) {
-                            break RecvResult::Closed;
-                        }
-                        buf.truncate(n);
-                        break RecvResult::Msg(buf, from);
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        if closed.load(Ordering::SeqCst) {
-                            break RecvResult::Closed;
-                        }
-                    }
-                    Err(e) => break RecvResult::Err(net_err("recv", &e, None)),
-                }
-            };
-            Box::new(result)
-        });
+        io.submit(Dir::Read, id, true, recv_step(socket));
         Ok(())
     }
 
@@ -2600,19 +2934,16 @@ mod udp_bindings {
             .map_err(|e| OpError::from(net_error(&net_err("send", &e, None))))
     }
 
-    /// `(socketId)` — close: flag it so the recv thread exits at its next poll, and drop the handle.
+    /// `(socketId)` — close: deregister the socket and drop the handle.
     #[op(coerce, name = "close")]
     fn op_udp_close(ctx: &mut Ctx, sid: f64) {
         let sid = uid(sid);
-        let mut pending = None;
-        if let Some(reg) = ctx.host_mut::<DgramRegistry>() {
-            if let Some(e) = reg.sockets.remove(&sid) {
-                e.closed.store(true, Ordering::SeqCst);
-                pending = e.pending;
-            }
-        }
-        // As with TCP (`op_close`): the in-flight receive is cancelled rather than left to notice
-        // the flag, so it neither holds the loop open nor runs its callback after the close.
+        let pending = ctx
+            .host_mut::<DgramRegistry>()
+            .and_then(|reg| reg.sockets.remove(&sid))
+            .and_then(|e| e.pending);
+        // As with TCP (`op_close`): the in-flight receive is cancelled, so it neither holds the
+        // loop open nor runs its callback after the close.
         if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
             tasks.take(id);
         }

@@ -433,7 +433,7 @@ const shims = {
         const bytes = new Uint8Array(fsb.readFile(p, 0));
         return bytes.slice(from, to);
       };
-      return Blob[Symbol.for("lumen.fileBlob")](opened.size, options?.type, read);
+      return globalThis.__lumenBlobInternals.fileBlob(opened.size, `${options?.type ?? ""}`, read);
     },
   },
 };

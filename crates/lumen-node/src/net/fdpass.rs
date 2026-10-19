@@ -62,7 +62,6 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
     if kind == "udp" {
         // SAFETY: the caller hands this descriptor over; it is a UDP socket (checked above).
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-        let _ = socket.set_read_timeout(Some(UDP_POLL));
         let reg = ctx
             .host_mut::<DgramRegistry>()
             .expect("dgram registry installed");
@@ -72,10 +71,10 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
             id,
             UdpEntry {
                 socket: Arc::new(socket),
-                closed: Arc::new(AtomicBool::new(false)),
                 kind6: family == libc::AF_INET6,
                 unref: false,
                 pending: None,
+                io: None,
             },
         );
         set_member(ctx, &o, "socketId", Value::Num(id as f64));
@@ -110,6 +109,7 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
             ServerEntry {
                 listener: Arc::new(listener),
                 closed: Arc::new(AtomicBool::new(false)),
+                io: None,
                 local_addr: local_addr.clone(),
                 unref: false,
                 pending: None,
@@ -180,17 +180,18 @@ pub(super) fn udp_fd(ctx: &mut Ctx, sid: u64) -> f64 {
 }
 
 /// `(socketId)` — close this process's copy of a socket without shutting the connection down
-/// (it lives on in the process the descriptor was sent to): the parked reader is cancelled and
-/// the descriptor closed once it lets go.
+/// (it lives on in the process the descriptor was sent to): its registration and parked reader
+/// are dropped and the descriptor closed once nothing else holds it.
 pub(super) fn release(ctx: &mut Ctx, sid: u64) {
     let pending = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.remove(&sid))
         .and_then(|e| {
-            e.cancel.store(true, Ordering::SeqCst);
+            if let Some(io) = &e.io {
+                io.close(closed_write_error);
+            }
             e.pending
         });
-    wake::wake_all();
     if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
         tasks.take(id);
     }
@@ -214,12 +215,13 @@ pub(super) fn read_msg(
     let found = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
-        .map(|e| (e.stream.clone(), e.unref, e.cancel.clone()));
-    let Some((stream, unref, cancel)) = found else {
+        .map(|e| (e.stream.clone(), e.unref, e.io.clone()));
+    let Some((stream, unref, io)) = found else {
         let empty = ctx.make_array(Vec::new());
         enqueue(ctx, resolve, vec![Value::Null, empty]);
         return Ok(());
     };
+    let (io, created) = io_for(ctx, io, Source::Fd(stream.raw_fd()), stream.clone())?;
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_msg);
     if unref {
         ctx.host_mut::<TaskRegistry>()
@@ -231,32 +233,39 @@ pub(super) fn read_msg(
         .and_then(|r| r.sockets.get_mut(&sid))
     {
         e.pending = Some(id);
+        if created {
+            e.io = Some(io.clone());
+        }
     }
-    completions(ctx).run_blocking(id, move || {
-        let mut buf = vec![0u8; 65536];
-        let mut fds = Vec::new();
-        let result: MsgResult = loop {
-            match wake::wait(stream.raw_fd(), libc::POLLIN, &cancel) {
-                Ok(true) => {}
-                Ok(false) => break Ok((Vec::new(), Vec::new())),
-                Err(e) => break Err(net_err("read", &e, None)),
-            }
-            match recv_with_fds(stream.raw_fd(), &mut buf, &mut fds) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    break Ok((buf, fds));
+    io.submit(Dir::Read, id, true, msg_step(stream));
+    Ok(())
+}
+
+/// A queued channel read: `recvmsg` into the `Vec` that becomes the JS `Uint8Array`.
+fn msg_step(stream: Arc<NetStream>) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    move |trigger| {
+        let result: MsgResult = match trigger {
+            Trigger::Failed(e) => Err(net_err("read", &e, None)),
+            Trigger::Ready => {
+                let mut buf = vec![0u8; READ_CHUNK];
+                let mut fds = Vec::new();
+                loop {
+                    match recv_with_fds(stream.raw_fd(), &mut buf, &mut fds) {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            break Ok((trimmed(buf), fds));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Step::Again
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => break Err(net_err("read", &e, None)),
+                    }
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) => {}
-                Err(e) => break Err(net_err("read", &e, None)),
             }
         };
-        Box::new(result)
-    });
-    Ok(())
+        Step::Done(Box::new(result))
+    }
 }
 
 fn decode_msg(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
@@ -266,7 +275,7 @@ fn decode_msg(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<V
             if bytes.is_empty() {
                 Ok(vec![Value::Null, fds])
             } else {
-                Ok(vec![ctx.make_uint8array(&bytes)?, fds])
+                Ok(vec![uint8array_owned(ctx, bytes)?, fds])
             }
         }
         Err(e) => Err(net_error_value(ctx, &e)),
@@ -300,28 +309,15 @@ pub(super) fn try_send_msg(ctx: &mut Ctx, sid: u64, data: &[u8], pass: Option<f6
         return 0.0;
     }
     let fd = stream.raw_fd();
-    // Darwin blocks a send larger than the free buffer space despite MSG_DONTWAIT (see try_write).
-    #[cfg(target_vendor = "apple")]
-    let data = {
-        let space = match (
-            sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF),
-            sockopt_int(fd, libc::SOL_SOCKET, libc::SO_NWRITE),
-        ) {
-            (Ok(buf), Ok(queued)) if buf >= 0 && queued >= 0 => {
-                (buf as usize).saturating_sub(queued as usize)
-            }
-            _ => 0,
-        };
-        &data[..data.len().min(space)]
-    };
+    let data = sendable(fd, data);
     if data.is_empty() {
         return 0.0;
     }
     send_with_fd(fd, data, pass, true).unwrap_or(0) as f64
 }
 
-/// `(socketId, bytes, fd, resolve, reject)` — write all bytes on a worker thread, `fd` (-1 for
-/// none) attached to the first chunk.
+/// `(socketId, bytes, fd, resolve, reject)` — write all bytes, `fd` (-1 for none) attached to the
+/// first chunk; writes on one channel complete in order.
 pub(super) fn write_msg(
     ctx: &mut Ctx,
     sid: u64,
@@ -332,37 +328,59 @@ pub(super) fn write_msg(
 ) -> Result<(), OpError> {
     let pass = pass_arg(pass);
     let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
-    let stream = ctx
+    let found = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
-        .map(|e| e.stream.clone());
-    let Some(stream) = stream else {
+        .map(|e| (e.stream.clone(), e.io.clone()));
+    let Some((stream, io)) = found else {
         let e = std::io::Error::from_raw_os_error(libc::EPIPE);
         let err = net_error_value(ctx, &net_err("write", &e, None));
         enqueue(ctx, reject, vec![err]);
         return Ok(());
     };
+    let (io, created) = io_for(ctx, io, Source::Fd(stream.raw_fd()), stream.clone())?;
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
-    completions(ctx).run_blocking(id, move || {
+    if created {
+        if let Some(e) = ctx
+            .host_mut::<NetRegistry>()
+            .and_then(|r| r.sockets.get_mut(&sid))
+        {
+            e.io = Some(io.clone());
+        }
+    }
+    io.submit(Dir::Write, id, true, write_msg_step(stream, data, pass));
+    Ok(())
+}
+
+fn write_msg_step(
+    stream: Arc<NetStream>,
+    data: Vec<u8>,
+    mut pass: RawFd,
+) -> impl FnMut(Trigger) -> Step + Send + 'static {
+    let mut offset = 0;
+    move |trigger| {
+        let fail = |e: &std::io::Error| Step::Done(Box::new(Err::<(), NetErr>(net_err("write", e, None))));
+        if let Trigger::Failed(e) = &trigger {
+            return fail(e);
+        }
         let fd = stream.raw_fd();
-        let mut offset = 0;
-        let mut pass = pass;
-        let result: Result<(), NetErr> = loop {
-            if offset >= data.len() {
-                break Ok(());
+        while offset < data.len() {
+            let window = sendable(fd, &data[offset..]);
+            if window.is_empty() {
+                return Step::Again;
             }
-            match send_with_fd(fd, &data[offset..], pass, false) {
+            match send_with_fd(fd, window, pass, true) {
                 Ok(n) => {
                     offset += n;
                     pass = -1;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Step::Again,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => break Err(net_err("write", &e, None)),
+                Err(e) => return fail(&e),
             }
-        };
-        Box::new(result)
-    });
-    Ok(())
+        }
+        Step::Done(Box::new(Ok::<(), NetErr>(())))
+    }
 }
 
 /// `(fd)` — libuv's `uv_guess_handle`: "TCP", "TTY", "UDP", "FILE", "PIPE" or "UNKNOWN".

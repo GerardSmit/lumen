@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::rc::Rc;
 
+mod support;
+
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
 
 #[derive(Clone, Default)]
@@ -40,6 +42,10 @@ fn cstr(value: &str) -> Vec<u8> {
 
 #[test]
 fn postgres_adapter_uses_extended_protocol_and_decodes_rows() {
+    support::on_engine_stack(postgres_adapter_uses_extended_protocol_and_decodes_rows_body);
+}
+
+fn postgres_adapter_uses_extended_protocol_and_decodes_rows_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
@@ -179,6 +185,10 @@ fn postgres_adapter_uses_extended_protocol_and_decodes_rows() {
 
 #[test]
 fn postgres_adapter_authenticates_with_scram_sha_256() {
+    support::on_engine_stack(postgres_adapter_authenticates_with_scram_sha_256_body);
+}
+
+fn postgres_adapter_authenticates_with_scram_sha_256_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let peer = std::thread::spawn(move || {

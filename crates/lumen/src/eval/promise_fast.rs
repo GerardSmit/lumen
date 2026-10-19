@@ -21,7 +21,6 @@ use std::rc::Rc;
 
 struct NativeRejectionHandledHook(Option<Rc<dyn Fn(&mut Interp, Value) -> bool>>);
 
-
 /// [[PromiseState]] values of [`PromiseSlot::status`].
 pub(crate) const PENDING: u8 = 0;
 pub(crate) const FULFILLED: u8 = 1;
@@ -285,6 +284,38 @@ pub(crate) struct PromiseCaches {
     /// A pending `Call; Await` fusion request: the callee object's address and the call depth
     /// its body runs at (see [`Interp::note_await_call`]); `(0, 0)` when none.
     await_call: Cell<(usize, u32)>,
+}
+
+impl PromiseCaches {
+    /// Cache ownership is bookkeeping only when no executing fast path holds
+    /// the intrinsic bundle. An external bundle must keep all five objects live.
+    pub(crate) fn count_intrinsic_edges(&self, visit: &mut dyn FnMut(&Gc)) {
+        let cached = self.intr.borrow();
+        if let Some(intr) = cached.as_ref().filter(|intr| Rc::strong_count(intr) == 1) {
+            for object in [&intr.global, &intr.proto, &intr.ctor, &intr.then, &intr.resolve] {
+                visit(object);
+            }
+        }
+    }
+
+    /// Original methods remain live with their realm even after author code
+    /// replaces the public properties used by the pristine checks.
+    pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
+        let cached = self.intr.borrow();
+        if let Some(intr) = cached.as_ref().filter(|intr| Gc::as_ptr(&intr.global) as usize == pointer) {
+            for object in [&intr.global, &intr.proto, &intr.ctor, &intr.then, &intr.resolve] {
+                visit(object);
+            }
+        }
+    }
+
+    pub(crate) fn sweep_intrinsics(&self, garbage: &[Gc]) {
+        let mut cached = self.intr.borrow_mut();
+        if cached.as_ref().is_some_and(|intr| Rc::strong_count(intr) == 1
+            && garbage.iter().any(|object| Gc::ptr_eq(object, &intr.global))) {
+            *cached = None;
+        }
+    }
 }
 
 impl Interp {
@@ -775,7 +806,9 @@ impl Interp {
             .remove(&(Gc::as_ptr(p) as usize))
             .is_none()
         {
-            let hook = self.op_state().get::<NativeRejectionHandledHook>()
+            let hook = self
+                .op_state()
+                .get::<NativeRejectionHandledHook>()
                 .and_then(|hook| hook.0.clone());
             if hook.is_some_and(|hook| hook(self, Value::Obj(p.clone()))) {
                 return;
@@ -791,7 +824,8 @@ impl Interp {
     /// it must only perform native admission, never invoke author code. Returning
     /// false preserves the existing late-handled list for the ordinary host.
     pub fn set_native_rejection_handled_hook(
-        &mut self, hook: Option<Rc<dyn Fn(&mut Interp, Value) -> bool>>,
+        &mut self,
+        hook: Option<Rc<dyn Fn(&mut Interp, Value) -> bool>>,
     ) {
         self.op_state().put(NativeRejectionHandledHook(hook));
     }
@@ -933,7 +967,10 @@ mod native_rejection_handled_tests {
     use std::cell::Cell;
 
     fn evaluate(engine: &mut crate::Engine, source: &str) {
-        assert!(engine.eval_value(source).expect("parse").is_ok(), "evaluation failed");
+        assert!(
+            engine.eval_value(source).expect("parse").is_ok(),
+            "evaluation failed"
+        );
     }
 
     #[test]
@@ -941,21 +978,33 @@ mod native_rejection_handled_tests {
         for consume in [false, true] {
             let mut engine = crate::Engine::new();
             engine.track_late_handled_rejections();
-            evaluate(&mut engine, "globalThis.p = Promise.reject({nativeReason:true});");
+            evaluate(
+                &mut engine,
+                "globalThis.p = Promise.reject({nativeReason:true});",
+            );
             engine.run_microtasks();
             assert_eq!(engine.take_unhandled_rejections_full().len(), 1);
             let calls = Rc::new(Cell::new(0));
             let captured = calls.clone();
-            engine.ctx().set_native_rejection_handled_hook(Some(Rc::new(move |ctx, promise| {
-                captured.set(captured.get() + 1);
-                // Reenter native state to prove no hook-slot or Promise borrow is held.
-                assert!(ctx.promise_rejection_reason(&promise).is_some());
-                ctx.set_native_rejection_handled_hook(None);
-                consume
-            })));
+            engine
+                .ctx()
+                .set_native_rejection_handled_hook(Some(Rc::new(move |ctx, promise| {
+                    captured.set(captured.get() + 1);
+                    // Reenter native state to prove no hook-slot or Promise borrow is held.
+                    assert!(ctx.promise_rejection_reason(&promise).is_some());
+                    ctx.set_native_rejection_handled_hook(None);
+                    consume
+                })));
             evaluate(&mut engine, "p.catch(() => {});");
-            assert_eq!(calls.get(), 1, "native admission precedes the next microtask checkpoint");
-            assert_eq!(engine.take_late_handled_rejections().len(), usize::from(!consume));
+            assert_eq!(
+                calls.get(),
+                1,
+                "native admission precedes the next microtask checkpoint"
+            );
+            assert_eq!(
+                engine.take_late_handled_rejections().len(),
+                usize::from(!consume)
+            );
             evaluate(&mut engine, "p.catch(() => {});");
             assert_eq!(calls.get(), 1);
             assert!(engine.take_late_handled_rejections().is_empty());
@@ -968,9 +1017,12 @@ mod native_rejection_handled_tests {
         engine.track_late_handled_rejections();
         let calls = Rc::new(Cell::new(0));
         let captured = calls.clone();
-        engine.ctx().set_native_rejection_handled_hook(Some(Rc::new(move |_, _| {
-            captured.set(captured.get() + 1); true
-        })));
+        engine
+            .ctx()
+            .set_native_rejection_handled_hook(Some(Rc::new(move |_, _| {
+                captured.set(captured.get() + 1);
+                true
+            })));
         evaluate(&mut engine, "Promise.reject(1).catch(() => {});");
         engine.run_microtasks();
         assert_eq!(calls.get(), 0);

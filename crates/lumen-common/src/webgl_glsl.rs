@@ -126,7 +126,7 @@ pub fn translate_es_to_glsl_450_with_uniforms(
         if trimmed.starts_with("#extension") {
             return Err("GLSL extensions are not supported by this WebGL context".into());
         }
-        let mut translated = line
+        let translated = line
             .replace("highp ", "")
             .replace("mediump ", "")
             .replace("lowp ", "")

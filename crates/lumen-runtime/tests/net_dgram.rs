@@ -39,6 +39,17 @@ impl Captured {
     }
 }
 
+/// Runs `body` on the stack real engine hosts use: the lazily evaluated node glue nests deeply
+/// enough in a debug build to overflow a default 2 MiB test thread.
+fn on_engine_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(body)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 fn test_runtime() -> (Runtime, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
@@ -333,6 +344,11 @@ fn net_address_math_still_real() {
 #[cfg(unix)]
 #[test]
 fn net_unix_path_accept_and_cleanup() {
+    on_engine_stack(net_unix_path_accept_and_cleanup_body);
+}
+
+#[cfg(unix)]
+fn net_unix_path_accept_and_cleanup_body() {
     let path = std::env::temp_dir().join(format!(
         "lumen-net-{}-{}.sock",
         std::process::id(),
@@ -428,6 +444,10 @@ fn net_unix_path_client_writes_to_std_peer() {
 
 #[test]
 fn dgram_loopback_echo_with_rinfo() {
+    on_engine_stack(dgram_loopback_echo_with_rinfo_body);
+}
+
+fn dgram_loopback_echo_with_rinfo_body() {
     let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,
@@ -464,6 +484,10 @@ fn dgram_loopback_echo_with_rinfo() {
 
 #[test]
 fn dgram_connected_mode_and_offsets() {
+    on_engine_stack(dgram_connected_mode_and_offsets_body);
+}
+
+fn dgram_connected_mode_and_offsets_body() {
     let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,
@@ -490,6 +514,10 @@ fn dgram_connected_mode_and_offsets() {
 
 #[test]
 fn dgram_against_std_udp_socket() {
+    on_engine_stack(dgram_against_std_udp_socket_body);
+}
+
+fn dgram_against_std_udp_socket_body() {
     // A plain std UdpSocket plays the foreign peer.
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
     let peer_port = peer.local_addr().unwrap().port();
@@ -517,6 +545,10 @@ fn dgram_against_std_udp_socket() {
 
 #[test]
 fn dgram_errors_and_option_paths() {
+    on_engine_stack(dgram_errors_and_option_paths_body);
+}
+
+fn dgram_errors_and_option_paths_body() {
     let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,
@@ -559,6 +591,10 @@ fn dgram_errors_and_option_paths() {
 
 #[test]
 fn dgram_udp6_and_eaddrinuse() {
+    on_engine_stack(dgram_udp6_and_eaddrinuse_body);
+}
+
+fn dgram_udp6_and_eaddrinuse_body() {
     let (mut rt, out) = test_runtime();
     eval_ok(
         &mut rt,

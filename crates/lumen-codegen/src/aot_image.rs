@@ -128,6 +128,7 @@ pub struct Image {
     pub got_relocs: Vec<Reloc>,
     pub functions: Vec<aot::native_data::FunctionEntry>,
     pub unwind: Vec<aot::native_unwind::Record>,
+    #[cfg(feature = "standalone-object")]
     static_fixups: Vec<(usize, u32, FixupKind)>,
 }
 
@@ -904,6 +905,7 @@ pub fn link(functions: &[Function]) -> Result<Image, String> {
     let got_base = code.len();
     let mut slots = BTreeMap::new();
     let mut got_relocs = Vec::new();
+    #[cfg(feature = "standalone-object")]
     let mut static_fixups = Vec::new();
     for fixup in fixups {
         if fixup.symbol.0 == Kind::Function && fixup.symbol.1 as usize >= functions.len() {
@@ -926,6 +928,7 @@ pub fn link(functions: &[Function]) -> Result<Image, String> {
         let slot_offset = (slot as usize)
             .checked_mul(8)
             .ok_or("GOT offset overflow")?;
+        #[cfg(feature = "standalone-object")]
         static_fixups.push((fixup.offset, slot, fixup.encoding));
         let target = got_base
             .checked_add(slot_offset)
@@ -956,6 +959,7 @@ pub fn link(functions: &[Function]) -> Result<Image, String> {
         got_relocs,
         functions: entries,
         unwind,
+        #[cfg(feature = "standalone-object")]
         static_fixups,
     })
 }

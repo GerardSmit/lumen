@@ -44,11 +44,28 @@ pub fn epoll_create() -> R<i32> {
     Err(FsError("ENOSYS"))
 }
 
+/// One `struct epoll_event`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub type EpollEvent = libc::epoll_event;
+
+/// Stand-in so signatures exist where `epoll` does not.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub u64: u64,
+}
+
 /// `epoll_ctl(epfd, op, fd, events)`.
 pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32) -> R<()> {
+    epoll_ctl_data(epfd, op, fd, events, fd as u64)
+}
+
+/// `epoll_ctl` with caller-chosen `data`, returned verbatim by [`epoll_wait_into`].
+pub fn epoll_ctl_data(epfd: i32, op: i32, fd: i32, events: u32, data: u64) -> R<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let mut ev = libc::epoll_event { events, u64: fd as u64 };
+        let mut ev = libc::epoll_event { events, u64: data };
         // SAFETY: `ev` is a live epoll_event.
         if unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) } < 0 {
             return Err(last());
@@ -57,7 +74,27 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32) -> R<()> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = (epfd, op, fd, events);
+        let _ = (epfd, op, fd, events, data);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// `epoll_wait` into `out`, without allocating: the number of events written after at most
+/// `timeout_ms` (negative: forever). `EINTR` is returned as an error.
+pub fn epoll_wait_into(epfd: i32, out: &mut [EpollEvent], timeout_ms: i32) -> R<usize> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let max = out.len().min(libc::c_int::MAX as usize) as libc::c_int;
+        // SAFETY: `out` has room for `max` events.
+        let n = unsafe { libc::epoll_wait(epfd, out.as_mut_ptr(), max, timeout_ms) };
+        if n < 0 {
+            return Err(last());
+        }
+        Ok(n as usize)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (epfd, out, timeout_ms);
         Err(FsError("ENOSYS"))
     }
 }
@@ -65,21 +102,24 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32) -> R<()> {
 /// `epoll_wait`: up to `max` `(fd, events)` pairs after at most `timeout_ms` (negative: forever).
 /// `EINTR` is returned as an error.
 pub fn epoll_wait(epfd: i32, max: usize, timeout_ms: i32) -> R<Vec<(i32, u32)>> {
+    let mut buf = vec![EpollEvent { events: 0, u64: 0 }; max.max(1)];
+    let n = epoll_wait_into(epfd, &mut buf, timeout_ms)?;
+    Ok(buf[..n].iter().map(|e| { let events = e.events; (e.u64 as i32, events) }).collect())
+}
+
+/// `eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)`: a counter descriptor, for cross-thread wakes.
+pub fn eventfd() -> R<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let mut buf = vec![libc::epoll_event { events: 0, u64: 0 }; max.max(1)];
-        // SAFETY: `buf` has room for `max` events.
-        let n = unsafe { libc::epoll_wait(epfd, buf.as_mut_ptr(), max as libc::c_int, timeout_ms) };
-        if n < 0 {
+        // SAFETY: plain integer arguments.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
             return Err(last());
         }
-        Ok(buf[..n as usize].iter().map(|e| { let events = e.events; (e.u64 as i32, events) }).collect())
+        Ok(fd)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = (epfd, max, timeout_ms);
-        Err(FsError("ENOSYS"))
-    }
+    Err(FsError("ENOSYS"))
 }
 
 /// The `EPOLL*` constants of this platform.
@@ -138,43 +178,87 @@ pub fn kqueue() -> R<i32> {
     Err(FsError("ENOSYS"))
 }
 
+/// One native `struct kevent`.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+pub type RawKevent = libc::kevent;
+
+/// Stand-in so signatures exist where `kqueue` does not.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+pub type RawKevent = Kevent;
+
+/// `EVFILT_USER`: a filter triggered from user space.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+pub const EVFILT_USER: i16 = libc::EVFILT_USER as i16;
+/// `NOTE_TRIGGER`: the `fflags` that fire an `EVFILT_USER` event.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+pub const NOTE_TRIGGER: u32 = libc::NOTE_TRIGGER as u32;
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+impl Kevent {
+    /// The native form of this event.
+    pub fn to_raw(&self) -> RawKevent {
+        // SAFETY: an all-zero kevent is valid; the named fields are then set.
+        let mut e: libc::kevent = unsafe { std::mem::zeroed() };
+        e.ident = self.ident as _;
+        e.filter = self.filter as _;
+        e.flags = self.flags as _;
+        e.fflags = self.fflags as _;
+        e.data = self.data as _;
+        e.udata = self.udata as *mut libc::c_void;
+        e
+    }
+
+    pub fn from_raw(e: &RawKevent) -> Kevent {
+        Kevent {
+            ident: e.ident as usize,
+            filter: e.filter as i16,
+            flags: e.flags as u16,
+            fflags: e.fflags as u32,
+            data: e.data as isize,
+            udata: e.udata as usize,
+        }
+    }
+}
+
+/// `kevent(2)` without allocating: applies `changes`, then writes events into `out`, waiting at
+/// most `timeout` (seconds, nanoseconds; `None`: forever). Returns the event count. `EINTR` is
+/// returned as an error.
+pub fn kevent_into(
+    kq: i32,
+    changes: &[RawKevent],
+    out: &mut [RawKevent],
+    timeout: Option<(i64, i64)>,
+) -> R<usize> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        let ts = timeout.map(|(s, n)| libc::timespec { tv_sec: s as _, tv_nsec: n as _ });
+        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        // SAFETY: both arrays are live and sized as passed; `tsp` is null or a live timespec.
+        let n = unsafe {
+            libc::kevent(kq, changes.as_ptr(), changes.len() as _, out.as_mut_ptr(), out.len() as _, tsp)
+        };
+        if n < 0 {
+            return Err(last());
+        }
+        Ok(n as usize)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    {
+        let _ = (kq, changes, out, timeout);
+        Err(FsError("ENOSYS"))
+    }
+}
+
 /// `kevent(2)`: applies `changes`, then collects up to `max` events, waiting at most `timeout`
 /// (seconds, nanoseconds; `None`: forever). `EINTR` is returned as an error.
 pub fn kevent(kq: i32, changes: &[Kevent], max: usize, timeout: Option<(i64, i64)>) -> R<Vec<Kevent>> {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     {
-        let raw = |k: &Kevent| {
-            // SAFETY: an all-zero kevent is valid; the named fields are then set.
-            let mut e: libc::kevent = unsafe { std::mem::zeroed() };
-            e.ident = k.ident as _;
-            e.filter = k.filter as _;
-            e.flags = k.flags as _;
-            e.fflags = k.fflags as _;
-            e.data = k.data as _;
-            e.udata = k.udata as *mut libc::c_void as _;
-            e
-        };
-        let ch: Vec<libc::kevent> = changes.iter().map(raw).collect();
-        // SAFETY: as above.
-        let mut out: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; max];
-        let ts = timeout.map(|(s, n)| libc::timespec { tv_sec: s as _, tv_nsec: n as _ });
-        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
-        // SAFETY: both arrays are live and sized as passed; `tsp` is null or a live timespec.
-        let n = unsafe { libc::kevent(kq, ch.as_ptr(), ch.len() as _, out.as_mut_ptr(), max as _, tsp) };
-        if n < 0 {
-            return Err(last());
-        }
-        Ok(out[..n as usize]
-            .iter()
-            .map(|e| Kevent {
-                ident: e.ident as usize,
-                filter: e.filter as i16,
-                flags: e.flags as u16,
-                fflags: e.fflags as u32,
-                data: e.data as isize,
-                udata: e.udata as usize,
-            })
-            .collect())
+        let ch: Vec<RawKevent> = changes.iter().map(Kevent::to_raw).collect();
+        // SAFETY: an all-zero kevent is valid.
+        let mut out: Vec<RawKevent> = vec![unsafe { std::mem::zeroed() }; max];
+        let n = kevent_into(kq, &ch, &mut out, timeout)?;
+        Ok(out[..n].iter().map(Kevent::from_raw).collect())
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
     {

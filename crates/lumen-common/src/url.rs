@@ -12,6 +12,23 @@ pub use idna::to_unicode as domain_to_unicode_raw;
 
 pub const MAX_DATA_URL_METADATA_BYTES: usize = 8192;
 
+/// Fetch's data-URL MIME value, including transport charset parameters.
+/// The final base64 marker belongs to the URL processor, not the MIME value.
+pub fn data_url_media_type(source:&str)->Option<alloc::borrow::Cow<'_,str>> {
+    if !source.get(..5)?.eq_ignore_ascii_case("data:") {return None}
+    let (metadata,_)=source[5..].split('#').next()?.split_once(',')?;
+    if metadata.len()>MAX_DATA_URL_METADATA_BYTES {return None}
+    let trim=|c:char|c.is_ascii() && crate::codec::is_ascii_whitespace(c as u8);
+    let metadata=metadata.trim_matches(trim);
+    let metadata=metadata.rsplit_once(';').filter(|(_,tail)|tail.trim_start_matches(' ').eq_ignore_ascii_case("base64"))
+        .map_or(metadata,|(head,_)|head);
+    let value=if metadata.starts_with(';') {
+        alloc::borrow::Cow::Owned(alloc::format!("text/plain{metadata}"))
+    }else {alloc::borrow::Cow::Borrowed(metadata)};
+    if crate::mime::mime_essence(value.as_ref()).is_some() {Some(value)}
+    else {Some(alloc::borrow::Cow::Borrowed("text/plain;charset=US-ASCII"))}
+}
+
 /// Borrow the MIME essence of a data URL, defaulting invalid or omitted types
 /// to `text/plain` as required by the Fetch data URL processor.
 /// Parameters stay in the URL; consumers needing only an essence do not allocate.
@@ -23,16 +40,7 @@ pub fn data_url_mime_essence(source: &str) -> Option<&str> {
     if metadata.len() > MAX_DATA_URL_METADATA_BYTES {
         return None;
     }
-    let essence = metadata.split(';').next()?.trim_matches(|c: char| {
-        c.is_ascii() && crate::codec::is_ascii_whitespace(c as u8)
-    });
-    let token = |s: &str| !s.is_empty() && s.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-    });
-    match essence.split_once('/') {
-        Some((kind, subtype)) if token(kind) && token(subtype) => Some(essence),
-        _ => Some("text/plain"),
-    }
+    Some(crate::mime::mime_essence(metadata).unwrap_or("text/plain"))
 }
 
 /// Decode a data URL with bounded encoded input and a decoded-body budget.
@@ -715,6 +723,18 @@ impl Url {
             }
         }
         "null".into()
+    }
+
+    /// Secure Contexts' URL-level trust predicate, without resolving a host or
+    /// consulting an operating-system network service.
+    pub fn is_potentially_trustworthy(&self) -> bool {
+        if matches!(self.scheme.as_str(), "https" | "wss" | "file") { return true; }
+        if self.scheme == "about" && matches!(self.path.as_str(), "blank" | "srcdoc") { return true; }
+        let host = self.hostname();
+        let host = host.trim_end_matches('.');
+        if host == "localhost" || host.ends_with(".localhost") { return true; }
+        let address = host.trim_start_matches('[').trim_end_matches(']');
+        address.parse::<core::net::IpAddr>().is_ok_and(|address| address.is_loopback())
     }
 
     pub fn is_special(&self) -> bool {
@@ -1553,6 +1573,53 @@ pub fn format(href: &str, hash: bool, unicode: bool, search: bool, auth: bool) -
     Some(out.href())
 }
 
+/// `application/x-www-form-urlencoded` parser (WHATWG URL §5.1): `&`-separated `name=value`
+/// sequences, `+` as space, percent-decoded as UTF-8 with replacement. Empty sequences are
+/// skipped.
+pub fn form_urlencoded_parse(input: &str) -> Vec<(String, String)> {
+    fn decode(bytes: &[u8]) -> String {
+        let spaced: Vec<u8> = bytes
+            .iter()
+            .map(|&byte| if byte == b'+' { b' ' } else { byte })
+            .collect();
+        String::from_utf8_lossy(&percent_decode(&spaced)).into_owned()
+    }
+    input
+        .as_bytes()
+        .split(|&byte| byte == b'&')
+        .filter(|sequence| !sequence.is_empty())
+        .map(|sequence| match sequence.iter().position(|&byte| byte == b'=') {
+            Some(at) => (decode(&sequence[..at]), decode(&sequence[at + 1..])),
+            None => (decode(sequence), String::new()),
+        })
+        .collect()
+}
+
+/// `application/x-www-form-urlencoded` serializer: everything but ASCII alphanumerics and
+/// `*-._` is percent-encoded (UTF-8), a space becomes `+`.
+pub fn form_urlencoded_serialize<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    fn encode(out: &mut String, text: &str) {
+        for &byte in text.as_bytes() {
+            match byte {
+                b' ' => out.push('+'),
+                b'*' | b'-' | b'.' | b'_' => out.push(byte as char),
+                _ if byte.is_ascii_alphanumeric() => out.push(byte as char),
+                _ => crate::codec::push_percent_escape(out, byte),
+            }
+        }
+    }
+    let mut out = String::new();
+    for (name, value) in pairs {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        encode(&mut out, name);
+        out.push('=');
+        encode(&mut out, value);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1651,6 +1718,27 @@ mod tests {
             .unwrap()
             .components();
         assert_eq!(c, [9, 9, 9, 9, OMITTED, 11, OMITTED, OMITTED, 1]);
+    }
+
+    #[test]
+    fn form_urlencoded_round_trip() {
+        let pairs = form_urlencoded_parse("a=1&&b=x+y%20z&c&=d&e=%E4%F6&f=g=h");
+        let expected = [
+            ("a", "1"),
+            ("b", "x y z"),
+            ("c", ""),
+            ("", "d"),
+            ("e", "\u{fffd}\u{fffd}"),
+            ("f", "g=h"),
+        ];
+        assert_eq!(pairs.len(), expected.len());
+        for (pair, expected) in pairs.iter().zip(expected) {
+            assert_eq!((pair.0.as_str(), pair.1.as_str()), expected);
+        }
+        assert_eq!(
+            form_urlencoded_serialize([("a b", "\u{e9}*-._~"), ("", "")]),
+            "a+b=%C3%A9*-._%7E&="
+        );
     }
 }
 

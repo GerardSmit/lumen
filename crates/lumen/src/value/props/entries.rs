@@ -98,28 +98,14 @@ impl EntryVec {
         );
     }
 
-    /// Use `n` uninitialized property slots at `buf` as this vector's storage. Only on a vector
-    /// that owns nothing yet (empty, not shared); see the module docs for the contract.
-    ///
-    /// # Safety
-    /// `buf` must be the inline area of the heap box that contains `self`, valid for `n`
-    /// properties for as long as that box's object lives.
-    #[inline(always)]
-    pub(in crate::value) unsafe fn adopt_inline(&mut self, buf: *mut Property, n: usize) {
-        debug_assert!(self.len == 0 && self.cap == 0);
-        debug_assert!(n > 0 && n < INLINE_FLAG as usize);
-        self.ptr = NonNull::new_unchecked(buf);
-        self.cap = n as u32 | INLINE_FLAG;
-        self.check_inline_home();
-    }
-
     /// An inline-mode vector over `cap` slots at `buf` whose first `len` are already
     /// initialized, built by value for a box under construction (the fast allocation paths
     /// write it straight into the new box, so no home check runs here).
     ///
     /// # Safety
-    /// As [`adopt_inline`](Self::adopt_inline); the value must be written into the box that
-    /// owns `buf` before anything reads it.
+    /// `buf` must be the inline area of the heap box that will contain the value, valid for
+    /// `cap` properties for as long as that box's object lives; the value must be written into
+    /// that box before anything reads it.
     #[inline(always)]
     pub(in crate::value) const unsafe fn inline_raw(
         buf: *mut Property,
@@ -133,11 +119,12 @@ impl EntryVec {
         }
     }
 
-    /// Move an owned buffer of at most `n` entries (or nothing at all) into `buf`, as
-    /// [`adopt_inline`](Self::adopt_inline). Shared and larger vectors are left alone.
+    /// Move an owned buffer of at most `n` entries (or nothing at all) into `buf`, making it this
+    /// vector's inline storage. Shared and larger vectors are left alone.
     ///
     /// # Safety
-    /// As [`adopt_inline`](Self::adopt_inline).
+    /// `buf` must be the inline area of the heap box that contains `self`, valid for `n`
+    /// properties for as long as that box's object lives.
     pub(in crate::value) unsafe fn move_to_inline(&mut self, buf: *mut Property, n: usize) {
         if self.is_shared() || self.is_inline() || self.len as usize > n {
             return;
@@ -291,11 +278,6 @@ impl EntryVec {
     #[inline]
     pub(in crate::value) fn capacity(&self) -> usize {
         self.cap_slots()
-    }
-
-    /// Whether the entries live in the object's inline slots (census).
-    pub(in crate::value) fn is_inline_storage(&self) -> bool {
-        self.is_inline()
     }
 
     #[inline]

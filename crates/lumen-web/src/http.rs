@@ -3,12 +3,12 @@
 //! redirects followed up to 5 hops. HTTPS goes through lumen-tls (the dynamically loaded system
 //! OpenSSL on Unix, rustls on Windows) with CA and hostname verification.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::time::Duration;
 
 use crate::url;
 pub(crate) use lumen_os::http_body::read_capped_line;
-use lumen_os::http_body::{BodyReader, Framing};
+use lumen_os::http_body::BodyReader;
 
 pub struct HttpResponse {
     pub status: u16,
@@ -22,17 +22,15 @@ pub struct HttpResponse {
 impl HttpResponse {
     /// The normalized MIME essence, independent of any response parameters.
     pub fn content_type(&self) -> Option<String> {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-            })
+        self.response_mime_type()
+            .and_then(|value| lumen_common::mime::mime_essence(&value).map(str::to_ascii_lowercase))
+    }
+
+    /// Fetch's extracted response MIME, including effective charset parameters.
+    pub fn response_mime_type(&self) -> Option<String> {
+        lumen_common::mime::extract_mime_type(self.headers.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str()))
     }
 }
 
@@ -79,22 +77,10 @@ impl Drop for OpenHttpBody {
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 /// Response-body cap so a hostile server can't balloon the worker (32 MiB).
-const MAX_BODY: u64 = 32 << 20;
+pub(crate) const MAX_BODY: u64 = 32 << 20;
 /// Cap on the status/request line plus headers (and on chunked trailers).
 pub(crate) const MAX_HEADER_BYTES: usize = 64 << 10;
-const INITIAL_BODY_CAPACITY: u64 = 64 << 10;
-
-/// Read `len` bytes (capped at `MAX_BODY`), growing the buffer as data arrives rather than
-/// trusting the declared length for the allocation.
-pub(crate) fn read_body_exact(reader: &mut impl BufRead, len: u64) -> std::io::Result<Vec<u8>> {
-    let want = len.min(MAX_BODY);
-    let mut body = Vec::with_capacity(want.min(INITIAL_BODY_CAPACITY) as usize);
-    reader.by_ref().take(want).read_to_end(&mut body)?;
-    if (body.len() as u64) < want {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(body)
-}
+pub(crate) const INITIAL_BODY_CAPACITY: u64 = 64 << 10;
 
 pub(crate) fn request(
     method: &str,
@@ -159,6 +145,42 @@ pub(crate) fn request_with_config_same_origin(
     collect_response(response)
 }
 
+pub(crate) fn request_navigation_with_config(
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &crate::FetchConfig,
+    referrer: lumen_common::referrer::Referrer,
+) -> Result<crate::NavigationResponse, String> {
+    let mut state = crate::NavigationFetchState { referrer, request_referrer: None };
+    let response = open_request_cancellable_with_redirect_origin(
+        method, target, headers, body, &lumen_os::net::TcpCancellation::default(),
+        config, None, None, Some(&mut state), None,
+    )?;
+    Ok(crate::NavigationResponse {
+        response: collect_response(response)?, request_referrer: state.request_referrer,
+    })
+}
+
+pub(crate) fn request_embedded_navigation_with_config(
+    target: &str,
+    config: &crate::FetchConfig,
+    metadata: &mut crate::ScriptFetchMetadata,
+    cancellation: &lumen_os::net::TcpCancellation,
+) -> Result<crate::NavigationResponse, String> {
+    let mut state = crate::NavigationFetchState {
+        referrer: metadata.referrer.clone(), request_referrer: None,
+    };
+    let response = open_request_cancellable_with_redirect_origin(
+        "GET", target, &[], None, cancellation, config, None, None,
+        Some(&mut state), Some(metadata),
+    )?;
+    Ok(crate::NavigationResponse {
+        response: collect_response(response)?, request_referrer: state.request_referrer,
+    })
+}
+
 pub(crate) fn request_cancellable_with_config(
     method: &str,
     target: &str,
@@ -188,34 +210,70 @@ pub(crate) fn request_sync_with_timeout(
     config: &crate::FetchConfig,
     timeout_ms: u32,
 ) -> Result<HttpResponse, SyncRequestError> {
-    let cancellation = lumen_os::net::TcpCancellation::default();
-    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    request_sync_with_timeout_on(
+        lumen_os::sched::current(),
+        method,
+        target,
+        headers,
+        body,
+        config,
+        timeout_ms,
+    )
+}
+
+/// The same bounded request with an externally owned socket cancellation.
+/// Cancelling a stylesheet ticket interrupts the existing live transport.
+pub(crate) fn request_sync_with_timeout_cancellable(
+    method:&str,target:&str,headers:&[(String,String)],body:Option<&[u8]>,config:&crate::FetchConfig,
+    timeout_ms:u32,cancellation:&lumen_os::net::TcpCancellation,
+)->Result<HttpResponse,SyncRequestError> {
+    request_sync_with_timeout_on_cancellable(lumen_os::sched::current(),method,target,headers,body,config,timeout_ms,cancellation)
+}
+
+/// The deadline is a timer of `scheduler`, armed for the length of the request and cancelled when
+/// it finishes first; no thread waits for it.
+fn request_sync_with_timeout_on(
+    scheduler: &dyn lumen_os::sched::Scheduler,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &crate::FetchConfig,
+    timeout_ms: u32,
+) -> Result<HttpResponse, SyncRequestError> {
+    request_sync_with_timeout_on_cancellable(scheduler,method,target,headers,body,config,timeout_ms,
+        &lumen_os::net::TcpCancellation::default())
+}
+fn request_sync_with_timeout_on_cancellable(
+    scheduler:&dyn lumen_os::sched::Scheduler,method:&str,target:&str,headers:&[(String,String)],
+    body:Option<&[u8]>,config:&crate::FetchConfig,timeout_ms:u32,cancellation:&lumen_os::net::TcpCancellation,
+)->Result<HttpResponse,SyncRequestError> {
+    let state =
+ std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let timer = if timeout_ms == 0 {
         None
     } else {
         let timer_state = state.clone();
         let timer_cancellation = cancellation.clone();
-        let (finished, wait) = std::sync::mpsc::channel();
-        let timer = std::thread::Builder::new()
-            .name("lumen-xhr-timeout".into())
-            .spawn(move || {
-                if matches!(
-                    wait.recv_timeout(Duration::from_millis(timeout_ms as u64)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) && timer_state
-                    .compare_exchange(
-                        0,
-                        2,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    timer_cancellation.cancel();
-                }
-            })
+        let timer = scheduler
+            .after(
+                Duration::from_millis(timeout_ms as u64),
+                Box::new(move || {
+                    if timer_state
+                        .compare_exchange(
+                            0,
+                            2,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        timer_cancellation.cancel();
+                    }
+                }),
+            )
             .map_err(|error| SyncRequestError::Transport(format!("XHR timeout timer: {error}")))?;
-        Some((finished, timer))
+        Some(timer)
     };
     let result =
         request_cancellable_with_config(method, target, headers, body, &cancellation, config);
@@ -225,10 +283,7 @@ pub(crate) fn request_sync_with_timeout(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     );
-    if let Some((finished, timer)) = timer {
-        let _ = finished.send(());
-        let _ = timer.join();
-    }
+    drop(timer);
     if state.load(std::sync::atomic::Ordering::Acquire) == 2 {
         return Err(SyncRequestError::Timeout);
     }
@@ -308,6 +363,8 @@ pub(crate) fn open_request_cancellable_with_progress(
         config,
         None,
         upload,
+        None,
+        None,
     )
 }
 
@@ -331,6 +388,8 @@ fn open_request_cancellable_with_config_same_origin(
         config,
         Some(origin),
         None,
+        None,
+        None,
     )
 }
 
@@ -343,16 +402,36 @@ fn open_request_cancellable_with_redirect_origin(
     config: &crate::FetchConfig,
     required_origin: Option<HttpOrigin>,
     upload: Option<std::sync::Arc<lumen_common::http_body::UploadProgress>>,
+    mut navigation: Option<&mut crate::NavigationFetchState>,
+    mut policy: Option<&mut crate::ScriptFetchMetadata>,
 ) -> Result<OpenHttpResponse, String> {
+    let target_initial = target;
     let mut method = method.to_ascii_uppercase();
     let mut target = target.to_string();
     let mut headers = headers.to_vec();
     let mut body = body;
-    for _ in 0..=MAX_REDIRECTS {
+    for redirect_count in 0..=MAX_REDIRECTS {
         if cancellation.is_cancelled() {
             return Err("fetch: request aborted".into());
         }
         let u = url::parse(&target, None)?;
+        if let Some(policy) = policy.as_deref_mut() {
+            let decision = policy.policies.check_resource_redirect(target_initial, &target,
+                &policy.self_url, policy.destination, &policy.nonce, &policy.integrity,
+                policy.parser_inserted, redirect_count as u32)
+                .map_err(|error| format!("fetch: invalid resource policy: {error:?}"))?;
+            policy.violations.extend(decision.violations);
+            if decision.blocked { return Err("fetch: resource blocked by Content Security Policy".into()); }
+        }
+
+        if let Some(navigation) = navigation.as_deref_mut() {
+            navigation.request_referrer = navigation.referrer.for_url(&u);
+            navigation.referrer.source = navigation.request_referrer.clone().unwrap_or_default();
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
+            if let Some(value) = &navigation.request_referrer {
+                headers.push(("Referer".into(), value.clone()));
+            }
+        }
         if required_origin
             .as_ref()
             .is_some_and(|origin| !origin.matches(&u))
@@ -365,6 +444,15 @@ fn open_request_cancellable_with_redirect_origin(
         match u.scheme.as_str() {
             "http" | "https" => {}
             other => return Err(format!("fetch: unsupported scheme '{other}'")),
+        }
+        if let Some(jar) = &config.cookies {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+            if !config.cookies_disabled {
+                let mut context = config.cookie_context.clone().unwrap_or_else(|| lumen_common::cookies::Context::document(&u));
+                context.safe_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+                let value = jar.read(&u, &context, true);
+                if !value.is_empty() { headers.push(("Cookie".into(), value)); }
+            }
         }
         let result = one_request(
             &method,
@@ -382,6 +470,23 @@ fn open_request_cancellable_with_redirect_origin(
                 return Err(error);
             }
         };
+        if let Some(policy) = policy.as_deref_mut() {
+            let decision = policy.policies.check_resource_response(target_initial, &u.href(),
+                &policy.self_url, policy.destination, &policy.nonce, &policy.integrity,
+                policy.parser_inserted, redirect_count as u32)
+                .map_err(|error| format!("fetch: invalid resource response policy: {error:?}"))?;
+            policy.violations.extend(decision.violations);
+            if decision.blocked { return Err("fetch: resource response blocked by Content Security Policy".into()); }
+        }
+        if !config.cookies_disabled {
+            if let Some(jar) = &config.cookies {
+                let mut context = config.cookie_context.clone().unwrap_or_else(|| lumen_common::cookies::Context::document(&u));
+                context.safe_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+                for (name, value) in &response.headers {
+                    if name.eq_ignore_ascii_case("set-cookie") { jar.write(&u, value, &context, true); }
+                }
+            }
+        }
         if config.manual_redirect {
             return Ok(OpenHttpResponse {
                 url: u.href(),
@@ -390,6 +495,9 @@ fn open_request_cancellable_with_redirect_origin(
         }
         match response.status {
             301 | 302 | 303 | 307 | 308 => {
+                if let Some(navigation) = navigation.as_deref_mut() {
+                    navigation.referrer.apply_redirect_policy(&response.headers);
+                }
                 let Some(location) = header(&response.headers, "location") else {
                     return Ok(OpenHttpResponse {
                         url: u.href(),
@@ -601,7 +709,7 @@ fn one_request(
 
     let framing = lumen_os::http_body::framing(method, status, &headers_out)
         .map_err(|error| format!("fetch '{}': framing: {error}", u.href()))?;
-    let reader = BodyReader::new(reader, framing, MAX_BODY)
+    let reader = BodyReader::new(reader, framing, config.response_body_limit())
         .map_err(|error| format!("fetch '{}': body: {error}", u.href()))?;
     Ok(OpenHttpResponse {
         status,
@@ -622,33 +730,10 @@ fn http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
-fn read_body(
-    reader: &mut impl BufRead,
-    headers: &[(String, String)],
-    method: &str,
-    status: u16,
-) -> std::io::Result<Vec<u8>> {
-    let framing = lumen_os::http_body::framing(method, status, headers)?;
-    let mut reader = BodyReader::new(reader, framing, MAX_BODY)?;
-    let mut body = Vec::new();
-    while let Some(chunk) = reader.read_chunk(64 << 10)? {
-        body.extend(chunk);
-    }
-    Ok(body)
-}
-
-pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
-    let mut reader = BodyReader::new(reader, Framing::Chunked, MAX_BODY)?;
-    let mut body = Vec::new();
-    while let Some(chunk) = reader.read_chunk(64 << 10)? {
-        body.extend(chunk);
-    }
-    Ok(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
     use std::net::TcpListener;
 
     fn serve_http_once(
@@ -679,13 +764,6 @@ mod tests {
     }
 
     #[test]
-    fn chunked_decoding() {
-        let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        let mut r = std::io::BufReader::new(&raw[..]);
-        assert_eq!(read_chunked(&mut r).unwrap(), b"Wikipedia");
-    }
-
-    #[test]
     fn endless_header_line_is_rejected_at_the_cap() {
         struct Endless(usize);
         impl Read for Endless {
@@ -702,38 +780,43 @@ mod tests {
     }
 
     #[test]
+    fn bounded_cors_resources_preserve_routes_and_reject_oversized_heads() {
+        for (response, expected) in [
+            ("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://page.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", "ok"),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", "cors"),
+            // The server sends no body: rejection must happen from the framing limit rather
+            // than first allocating or attempting to read the advertised payload.
+            ("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://page.test\r\nContent-Length: 33554432\r\nConnection: close\r\n\r\n", "size"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut config = crate::FetchConfig::default();
+            config.set_require_routes(true);
+            config.set_route("font.test", 80, listener.local_addr().unwrap()).unwrap();
+            let captured = config.clone();
+            config.remove_route("font.test", 80).unwrap();
+            let server = serve_http_once(listener, response);
+            let result = crate::load_cors_resource_with_config(
+                "http://font.test/face.ttf", "https://page.test", &captured, 2, 3000,
+            );
+            let request = server.join().unwrap();
+            assert!(request.starts_with("GET /face.ttf HTTP/1.1\r\n"));
+            assert!(request.to_ascii_lowercase().contains("origin: https://page.test"));
+            match expected {
+                "ok" => assert_eq!(result.unwrap().body, b"ok"),
+                "cors" => assert!(result.err().unwrap().contains("response policy rejected")),
+                _ => assert!(result.is_err()),
+            }
+            assert_eq!(captured.response_body_limit(), MAX_BODY);
+        }
+    }
+
+    #[test]
     fn header_budget_is_shared_across_lines() {
         let raw = b"aaaa\r\nbbbb\r\n";
         let mut r = std::io::Cursor::new(&raw[..]);
         let mut budget = 10;
         assert_eq!(read_capped_line(&mut r, &mut budget).unwrap(), "aaaa\r\n");
         assert!(read_capped_line(&mut r, &mut budget).is_err());
-    }
-
-    #[test]
-    fn oversized_chunk_size_line_is_rejected() {
-        let mut raw = vec![b'1'; 100_000];
-        raw.extend_from_slice(b"\r\n");
-        let mut r = std::io::Cursor::new(raw);
-        assert!(read_chunked(&mut r).is_err());
-    }
-
-    #[test]
-    fn huge_content_length_with_small_body_does_not_preallocate() {
-        struct Probe<'a>(std::io::Cursor<&'a [u8]>);
-        impl Read for Probe<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.0.read(buf)
-            }
-        }
-        let mut reader = BufReader::new(Probe(std::io::Cursor::new(b"tiny")));
-        let err = read_body_exact(&mut reader, u64::MAX).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-
-        let mut cursor = std::io::Cursor::new(b"hello world".to_vec());
-        let body = read_body_exact(&mut cursor, 5).unwrap();
-        assert_eq!(body, b"hello");
-        assert!(body.capacity() <= INITIAL_BODY_CAPACITY as usize);
     }
 
     #[test]
@@ -820,6 +903,72 @@ mod tests {
                 .unwrap()
                 .contains("route")
         );
+    }
+
+    #[test]
+    fn specification_window_navigation_redirect_recomputes_real_referrer_and_preserves_response() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let first = serve_http_once(first_listener,
+            "HTTP/1.1 303 See Other\r\nLocation: http://target.test:8000/final\r\nReferrer-Policy: unsafe-url, no-referrer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let second = serve_http_once(second_listener,
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let mut config = crate::FetchConfig::default();
+        config.set_route("origin.test", 8000, first_address).unwrap();
+        config.set_route("target.test", 8000, second_address).unwrap();
+        let response = crate::request_navigation_resource_with_config(
+            "POST", "http://origin.test:8000/start", &[("Content-Type".into(),"text/plain".into())], Some(b"data"), &config,
+            lumen_common::referrer::Referrer { source: "http://user:password@origin.test:8000/source?q#fragment".into(),
+                policy: lumen_common::referrer::ReferrerPolicy::UnsafeUrl },
+        ).unwrap();
+        let first_request = first.join().unwrap();
+        let second_request = second.join().unwrap();
+        assert!(first_request.starts_with("POST /start HTTP/1.1\r\n"));
+        assert!(first_request.to_ascii_lowercase().contains("\r\nreferer: http://origin.test:8000/source?q\r\n"));
+        assert!(!first_request.contains("password"));
+        assert!(second_request.starts_with("GET /final HTTP/1.1\r\n"));
+        assert!(!second_request.to_ascii_lowercase().contains("\r\nreferer:"));
+        assert!(!second_request.to_ascii_lowercase().contains("\r\ncontent-type:"));
+        assert_eq!(response.request_referrer, None);
+        assert_eq!(response.response.status, 404);
+        assert_eq!(response.response.body, b"ok");
+        assert_eq!(response.response.url, "http://target.test:8000/final");
+    }
+
+    #[test]
+    fn specification_window_navigation_redirect_cannot_restore_reduced_referrer_source() {
+        use lumen_common::referrer::{Referrer, ReferrerPolicy};
+        for policy in [ReferrerPolicy::Origin, ReferrerPolicy::NoReferrer] {
+            let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let first_address = first_listener.local_addr().unwrap();
+            let second_address = second_listener.local_addr().unwrap();
+            let first = serve_http_once(first_listener,
+                "HTTP/1.1 302 Found\r\nLocation: http://target.test:8000/final\r\nReferrer-Policy: unsafe-url\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let second = serve_http_once(second_listener,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let mut config = crate::FetchConfig::default();
+            config.set_route("origin.test", 8000, first_address).unwrap();
+            config.set_route("target.test", 8000, second_address).unwrap();
+            let response = crate::request_navigation_resource_with_config("GET",
+                "http://origin.test:8000/start", &[], None, &config,
+                Referrer { source: "http://origin.test:8000/private?secret#fragment".into(), policy }).unwrap();
+            let initial = first.join().unwrap().to_ascii_lowercase();
+            let redirected = second.join().unwrap().to_ascii_lowercase();
+            assert!(!redirected.contains("private"));
+            assert!(!redirected.contains("secret"));
+            if policy == ReferrerPolicy::Origin {
+                assert!(initial.contains("\r\nreferer: http://origin.test:8000/\r\n"));
+                assert!(redirected.contains("\r\nreferer: http://origin.test:8000/\r\n"));
+                assert_eq!(response.request_referrer.as_deref(), Some("http://origin.test:8000/"));
+            } else {
+                assert!(!initial.contains("\r\nreferer:"));
+                assert!(!redirected.contains("\r\nreferer:"));
+                assert_eq!(response.request_referrer, None);
+            }
+        }
     }
 
     #[test]
@@ -1027,6 +1176,168 @@ mod tests {
         let result =
             request_sync_with_timeout("GET", "http://timeout.test/slow", &[], None, &config, 20);
         assert!(matches!(result, Err(SyncRequestError::Timeout)));
+        server.join().unwrap();
+    }
+
+    /// A scheduler that forwards to an OS scheduler and counts the timers it hands out.
+    struct CountingScheduler {
+        inner: lumen_os::sched::OsScheduler,
+        armed: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
+    }
+
+    struct CountedTimer {
+        timer: lumen_os::sched::Timer,
+        scheduler: &'static CountingScheduler,
+    }
+
+    impl lumen_os::sched::TimerCancel for CountedTimer {
+        fn cancel(&self) -> bool {
+            self.scheduler
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.timer.cancel()
+        }
+    }
+
+    impl lumen_os::sched::Scheduler for CountingScheduler {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn available_parallelism(&self) -> std::num::NonZeroUsize {
+            self.inner.available_parallelism()
+        }
+        fn spawn_thread(
+            &self,
+            spec: lumen_os::sched::ThreadSpec,
+            main: lumen_os::sched::ThreadMain,
+        ) -> Result<lumen_os::sched::ThreadHandle, lumen_os::sched::SchedError> {
+            self.inner.spawn_thread(spec, main)
+        }
+        fn spawn_blocking(
+            &self,
+            job: lumen_os::sched::Job,
+        ) -> Result<(), lumen_os::sched::Job> {
+            self.inner.spawn_blocking(job)
+        }
+        fn parker(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lumen_os::sched::Park>, lumen_os::sched::SchedError> {
+            self.inner.parker()
+        }
+        fn after(
+            &self,
+            delay: Duration,
+            fire: lumen_os::sched::Job,
+        ) -> Result<lumen_os::sched::Timer, lumen_os::sched::SchedError> {
+            self.armed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let timer = self.inner.after(delay, fire)?;
+            let scheduler: &'static CountingScheduler = counting();
+            Ok(lumen_os::sched::Timer::new(std::sync::Arc::new(CountedTimer {
+                timer,
+                scheduler,
+            })))
+        }
+    }
+
+    fn counting() -> &'static CountingScheduler {
+        static SCHEDULER: CountingScheduler = CountingScheduler {
+            inner: lumen_os::sched::OsScheduler::new(),
+            armed: std::sync::atomic::AtomicUsize::new(0),
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
+        };
+        &SCHEDULER
+    }
+
+    #[test]
+    fn synchronous_timeout_is_a_scheduler_timer_that_completion_cancels() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scheduler = counting();
+        let route = |listener: &TcpListener, config: &mut crate::FetchConfig| {
+            config.set_require_routes(true);
+            config
+                .set_route("timer.test", 80, listener.local_addr().unwrap())
+                .unwrap();
+        };
+        let serve = |listener: TcpListener, delay: Duration| {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                std::thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            })
+        };
+
+        // The request outlives its deadline: the timer fires and cancels the socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::from_millis(300));
+        let armed = scheduler.armed.load(SeqCst);
+        let started = std::time::Instant::now();
+        let result = request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/slow",
+            &[],
+            None,
+            &config,
+            50,
+        );
+        assert!(matches!(result, Err(SyncRequestError::Timeout)));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(scheduler.armed.load(SeqCst), armed + 1);
+        server.join().unwrap();
+
+        // The request finishes first: the timer is cancelled before it could fire.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::ZERO);
+        let (armed, cancelled) = (scheduler.armed.load(SeqCst), scheduler.cancelled.load(SeqCst));
+        let response = request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/fast",
+            &[],
+            None,
+            &config,
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(scheduler.armed.load(SeqCst), armed + 1);
+        assert_eq!(scheduler.cancelled.load(SeqCst), cancelled + 1);
+        server.join().unwrap();
+
+        // No deadline, no timer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::ZERO);
+        let armed = scheduler.armed.load(SeqCst);
+        request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/none",
+            &[],
+            None,
+            &config,
+            0,
+        )
+        .unwrap();
+        assert_eq!(scheduler.armed.load(SeqCst), armed);
         server.join().unwrap();
     }
 

@@ -189,6 +189,7 @@ pub(crate) fn extension() -> Extension {
         state_init: Some(|state: &mut OpState| state.put(RealmEnvironment::default())),
         js_init: None,
         js_init_snapshot: None,
+        lazy_globals: &[],
     }
 }
 

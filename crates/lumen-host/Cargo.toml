@@ -15,11 +15,14 @@ lumen = { path = "../lumen", default-features = false, features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 lumen-common = { path = "../lumen-common", features = ["compress", "web-encoding"] }
 lumen-os = { path = "../lumen-os" }
+urlpattern = { path = "../../vendor/urlpattern" }
 
 web-time = "1"
 
 [features]
-default = ["compiler", "jit", "aot-native", "intl", "typed"]
+default = ["compiler", "jit", "aot-native", "intl", "typed", "webcrypto"]
+# `webcrypto`: the Web Crypto globals (`lumen_host::webcrypto`), which need the digest crates.
+webcrypto = ["lumen-common/hash"]
 compiler = ["lumen/compiler"]
 jit = ["compiler", "lumen/jit"]
 aot-native = ["lumen/aot-native"]

@@ -8,6 +8,7 @@ use crate::{Document, Error, NodeId, NodeKind};
 
 /// Whether an HTML element participates in the labelable-element algorithms.
 pub fn is_labelable(document: &Document, node: NodeId) -> Result<bool, Error> {
+    if document.is_form_associated_custom_element(node) {return Ok(true);}
     Ok(
         match crate::forms::html_element_local_name(document, node) {
             Some("button" | "meter" | "output" | "progress" | "select" | "textarea") => true,

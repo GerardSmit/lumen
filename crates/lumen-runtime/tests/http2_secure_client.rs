@@ -24,6 +24,10 @@ impl Write for Captured {
 
 #[test]
 fn secure_client_negotiates_h2_with_node_server() {
+    support::on_engine_stack(secure_client_negotiates_h2_with_node_server_body);
+}
+
+fn secure_client_negotiates_h2_with_node_server_body() {
     if Command::new("node").arg("--version").output().is_err()
         || Command::new("openssl").arg("version").output().is_err()
     {

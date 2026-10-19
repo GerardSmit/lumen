@@ -1,6 +1,6 @@
 //! Serial transport for the shared native install frames.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::time::{Duration, Instant};
 
 use lumen_common::aot::install::{self, Kind, Receiver};

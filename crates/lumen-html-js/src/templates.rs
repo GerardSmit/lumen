@@ -8,7 +8,7 @@ struct TemplateData {
 }
 impl Drop for TemplateData {
     fn drop(&mut self) {
-        self.realm.detached.borrow_mut().push(self.root);
+        self.realm.defer_detached_root(self.root);
     }
 }
 

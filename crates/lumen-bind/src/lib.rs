@@ -51,9 +51,15 @@
 //!   class as `This<_>`), `#[skip]`. A member without a receiver (`&self`, `&mut self`,
 //!   `This<_>`) is static.
 //! - `#[module(options)]` on an inline `mod`: every `#[op]`, `#[class]`, `#[constant(name = ..)]`
-//!   (a `const`) and `#[init]` (`fn(&mut Ctx, &Value)`, runs once on the new module object, for
+//!   (a `const`; `enumerable` makes the property enumerable, as a Web IDL attribute of the global
+//!   object is) and `#[init]` (`fn(&mut Ctx, &Value)`, runs once on the new module object, for
 //!   host-specific extras such as exception types) inside is registered by one declaration
-//!   (`<mod>::Module`).
+//!   (`<mod>::Module`). A constant's value may be an instance of a class of the same module
+//!   (`const CRYPTO: Crypto = Crypto;`); hosts register the module's classes first.
+//! - `#[constant(name = ..)]` on an associated `const` inside a `#[methods]` impl: a class
+//!   constant (a Web IDL `const`). The JS host defines it on the constructor and on the
+//!   prototype, enumerable, non-writable and non-configurable. The Python host does not read
+//!   class constants ([`Methods::constants`] is empty for it unless it implements it).
 //!
 //! Options: `name = ".."` (verbatim for every host), `rename(js = "..", py = "..")`,
 //! `only(js, ..)` / `skip(py, ..)` (rare), `coerce` (the host's lenient conversions), `async`
@@ -79,10 +85,58 @@
 //! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`.
 //! The JS host recognizes `hint(js(webidl))` on a class to make named operations
 //! and attributes enumerable as required by Web IDL; ordinary native classes
-//! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable.
+//! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable. On an `#[op]`
+//! the same hint makes the installed property enumerable (a Web IDL operation of the global
+//! object such as `atob`). Further JS hints:
+//! - `hint(js(symbol_for = "key"))` on an instance method or getter installs it (non-enumerable)
+//!   under the registry symbol `Symbol.for("key")` instead of a string name
+//!   (`nodejs.util.inspect.custom`);
+//! - `hint(js(unforgeable))` on a getter also defines it as an own, non-configurable accessor on
+//!   every instance, sharing the prototype accessor's getter (Web IDL `[LegacyUnforgeable]`,
+//!   `Event.isTrusted`); subclasses inherit it;
+//! - `hint(js(invalid_this))` on a class makes a failed receiver check throw Node's
+//!   `ERR_INVALID_THIS` (`Value of "this" must be of type <Class>`);
+//! - `hint(js(error))` on a class makes it a native `Error` subclass: the prototype inherits
+//!   `Error.prototype`, the constructor inherits `Error` and every instance gets `[[ErrorData]]`
+//!   with a captured stack (`DOMException`);
+//! - `hint(js(missing_message = "..", missing_code = ".."))` on an op or member replaces the
+//!   `TypeError` a missing required argument throws with that message and `err.code`;
+//! - `hint(js(length = "N"))` on a method overrides the function `length` derived from the
+//!   signature, for a parameter that is required in Web IDL but must reach the body when absent
+//!   (`ServiceWorkerContainer.register` rejects its promise instead of throwing);
+//! - `hint(js(also_iterator))` on an instance method also installs the same function object
+//!   (non-enumerable) as `[Symbol.iterator]` (`URLSearchParams.prototype.entries`);
+//! - `hint(js(iterator))` on a class makes its prototype inherit `%IteratorPrototype%` and
+//!   drops the prototype's `constructor`, as the prototype of a built-in iterator has it;
+//!   its `#[proto(next)]` is the iterator's `next`.
+//!
+//! # Lazy globals (JS host)
+//! `ctx.install_module_lazy::<M>()` (`Engine::define_lazy_globals`, `lumen_host::lazy_globals`)
+//! publishes everything a module declares as globals that are built on first access: each name
+//! is an accessor on the global object (enumerable only for a `webidl` op or an `enumerable`
+//! constant, configurable) whose getter creates the class, function or constant, replaces the
+//! accessor with the data property (writable, configurable, same enumerability, so an interface
+//! object has the descriptor of an eager one) and returns it; a setter replaces it with the
+//! assigned value. A name the realm already defines is left alone, `#[init]` runs immediately,
+//! and a script that redefines or deletes the accessor first is never overwritten.
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.
+//!
+//! # Native instance state (JS host)
+//! - `Ctx::attach_native_data::<T>(object, value)` gives an existing object (a realm global,
+//!   `performance`) the native state of class `T` without touching its prototype chain.
+//! - `Ctx::set_native_identity_owner::<T>(value)` makes the wrapper a traced owner of the values
+//!   its `NativeIdentityOwner` reports; `Ctx::ensure_native_identity_owner::<T>(value)` does so
+//!   unless the instance already has an owner (a subclass that traces more keeps its own).
+//! - `Ctx::allocate_native_private_slot_name` / `define_native_private_value_slot` /
+//!   `native_private_value_slot` hold a JS value on an instance, traced from the wrapper and
+//!   invisible to script (`CustomEvent.detail`, `AbortController.signal`).
+//! - `Ctx::then_value(value, on_ok, on_err)` reacts to any value the way `await value` does (a
+//!   thenable is adopted) through the engine's own promise machinery, with native closures from
+//!   `Ctx::new_native_fn` as the reactions (`Lumen.serve` awaits its handler this way).
+//! - `Ctx::freeze_native_object(value)` freezes an object without consulting globals (the frozen,
+//!   null-prototype `WebAssembly.Instance.exports`).
 //!
 //! # Parameters
 //! Named parameters are positional-only unless marked `#[kw]` (positional or keyword) or
@@ -130,6 +184,18 @@
 //!    `BufferError: Existing exports of data: object cannot be re-sized`.
 //! 9. Run the corpus (`cargo test --release -p lumen-py --test corpus`) and compare error
 //!    messages with `python3`.
+//!
+//! # Classifying and building objects from a JS native
+//! A native that walks or rebuilds script values (structured clone, serializers) must not
+//! read properties the script can replace. `Ctx::clone_brand` classifies an object by its
+//! internal slots (`CloneBrand`: Date, RegExp, boxed primitives, Error, Array, Map, Set,
+//! buffers and views with their windows, uncloneable kinds); `Ctx::collection_entries`,
+//! `enumerable_own_string_keys` and `object_identity` read without running author code. The
+//! matching builders (`new_date_value`, `new_regexp_value`, `new_boxed_primitive`,
+//! `new_collection_value` with `collection_insert`, `new_typed_array_view`,
+//! `new_data_view_value`, `make_array_buffer_from`, `create_data_property`) construct from the
+//! realm's own intrinsics. Recursive walkers call `check_native_stack_for_host` per level.
+//! `lumen_host::structured_clone` is the reference user.
 //!
 //! # Implementing a host
 //! Implement [`Host`]: value / error / context types, the argument primitives (`to_f64`,

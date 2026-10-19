@@ -31,6 +31,7 @@ struct ScriptState {
     already_started: bool,
     parser_inserted: bool,
     force_async: bool,
+    csp_decision: Option<bool>,
 }
 
 impl Default for ScriptState {
@@ -39,6 +40,7 @@ impl Default for ScriptState {
             already_started: false,
             parser_inserted: false,
             force_async: true,
+            csp_decision: None,
         }
     }
 }
@@ -77,8 +79,12 @@ impl ScriptLoader {
         self.queued.retain(|candidate| *candidate != node);
     }
 
-    pub(crate) fn mark_parser_prepared(&mut self, node: NodeId) {
-        self.states.entry(node).or_default().parser_inserted = false;
+    pub(crate) fn mark_parser_prepared(&mut self, node: NodeId, has_async_attribute: bool) {
+        let state = self.states.entry(node).or_default();
+        if state.parser_inserted && !has_async_attribute {
+            state.force_async = true;
+        }
+        state.parser_inserted = false;
     }
 
     pub(crate) fn already_started(&self, node: NodeId) -> bool {
@@ -117,6 +123,9 @@ impl ScriptLoader {
         }
     }
 
+    pub(crate) fn csp_decision(&self,node:NodeId)->Option<bool>{self.states.get(&node).and_then(|state|state.csp_decision)}
+    pub(crate) fn record_csp_decision(&mut self,node:NodeId,allowed:bool){self.states.entry(node).or_default().csp_decision=Some(allowed);}
+
     pub(crate) fn unhandled(&self) -> Vec<UnhandledScriptActivation> {
         self.unhandled.clone()
     }
@@ -130,6 +139,7 @@ impl ScriptLoader {
                     already_started: true,
                     parser_inserted: false,
                     force_async: true,
+            csp_decision: None,
                 },
             );
         } else {
@@ -152,6 +162,7 @@ impl ScriptLoader {
                         already_started: true,
                         parser_inserted: false,
                         force_async: true,
+            csp_decision: None,
                     },
                 );
             } else {
@@ -226,7 +237,7 @@ impl ScriptLoader {
                     self.queue_connected_scripts(document, *added);
                 }
             }
-            ObservedKind::ChildListMany { added, .. } => {
+            ObservedKind::ChildListMany { added, .. } | ObservedKind::ChildListReplacement { added, .. } => {
                 if !added.is_empty()
                     && is_script(document, mutation.target)
                     && is_connected(document, mutation.target)
@@ -267,6 +278,7 @@ impl ScriptLoader {
 
 pub(crate) enum ScriptKind {
     ClassicInline(String),
+    ImportMapInline(String),
     SuppressedClassic,
     InvalidSource,
     Unhandled(UnhandledScriptReason, Option<String>),
@@ -330,9 +342,8 @@ pub struct ScriptDescriptor {
 pub(crate) fn is_script(document: &Document, node: NodeId) -> bool {
     matches!(
         document.kind(node),
-        Ok(NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, name, .. })
-            if lumen_html::xml::split_qname(name.as_str()).is_some_and(|(_, local)| local == "script")
-    )
+        Ok(NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, .. })
+    ) && document.element_name_parts(node).is_ok_and(|(_, local)| local == "script")
 }
 
 pub(crate) fn is_connected(document: &Document, node: NodeId) -> bool {
@@ -371,8 +382,8 @@ pub(crate) fn parser_scripts(document: &Document) -> Vec<NodeId> {
 }
 
 /// Script elements in template contents are not parser-blocking scripts in the
-/// document tree. They do, however, carry the parser's inert/already-started
-/// state when their template contents are later moved into a live tree.
+/// document tree. An inert parser marks them already-started; an active
+/// parser leaves disconnected template contents eligible after cloning.
 pub(crate) fn template_scripts(document: &Document) -> Vec<NodeId> {
     let mut result = Vec::new();
     let mut pending = vec![(document.root(), false)];
@@ -436,6 +447,24 @@ pub(crate) fn scripts_in_subtree(document: &Document, root: NodeId) -> Vec<NodeI
         .collect()
 }
 
+/// Markup setters also own parsed shadow trees and template contents. Visit
+/// those trees once in source order, while keeping one cursor per nesting level.
+pub(crate) fn markup_scripts(document: &Document, root: NodeId) -> Vec<(NodeId, bool)> {
+    let mut scripts = Vec::new();
+    let mut pending = vec![(root, false, false)];
+    while let Some((node, siblings, in_template)) = pending.pop() {
+        if siblings {
+            if let Ok(Some(next)) = document.next_sibling(node) { pending.push((next, true, in_template)); }
+        }
+        if is_script(document, node) { scripts.push((node, in_template)); }
+        if let Ok(Some(first)) = document.first_child(node) { pending.push((first, true, in_template)); }
+        if let Ok(Some(content)) = document.template_content(node) { pending.push((content, false, true)); }
+        if let Ok(Some(shadow)) = document.shadow_root(node) { pending.push((shadow, false, in_template)); }
+    }
+    scripts
+}
+
+
 pub(crate) fn prepare_kind(
     document: &Document,
     node: NodeId,
@@ -459,10 +488,7 @@ pub(crate) fn prepare_kind(
             return Some(ScriptKind::Unhandled(UnhandledScriptReason::Module, source));
         }
         DeclaredScriptType::ImportMap => {
-            return Some(ScriptKind::Unhandled(
-                UnhandledScriptReason::ImportMap,
-                source,
-            ));
+            return Some(if source.is_some() { ScriptKind::InvalidSource } else { ScriptKind::ImportMapInline(text) });
         }
         DeclaredScriptType::SpeculationRules => {
             return Some(ScriptKind::Unhandled(
@@ -495,6 +521,25 @@ pub(crate) fn script_child_text(document: &Document, node: NodeId) -> String {
         child = document.next_sibling(id).ok().flatten();
     }
     text
+}
+
+/// Admit a child-text copy before allocating it. This is the same HTML child
+/// text content algorithm, with a consumer-specific existing source limit.
+pub(crate) fn script_child_text_bounded(document:&Document,node:NodeId,limit:usize)->Result<String,lumen_html::Error> {
+    let mut bytes=0usize;let mut child=document.first_child(node)?;
+    while let Some(id)=child {
+        if let NodeKind::Text(value)|NodeKind::CData(value)=document.kind(id)? {
+            bytes=bytes.checked_add(value.len()).filter(|bytes|*bytes<=limit).ok_or(lumen_html::Error::LimitExceeded)?;
+        }
+        child=document.next_sibling(id)?;
+    }
+    let mut text=String::new();text.try_reserve_exact(bytes).map_err(|_|lumen_html::Error::LimitExceeded)?;
+    let mut child=document.first_child(node)?;
+    while let Some(id)=child {
+        if let NodeKind::Text(value)|NodeKind::CData(value)=document.kind(id)? {text.push_str(value);}
+        child=document.next_sibling(id)?;
+    }
+    Ok(text)
 }
 
 fn type_from_attributes(attribute: impl Fn(&str) -> Option<String>) -> DeclaredScriptType {

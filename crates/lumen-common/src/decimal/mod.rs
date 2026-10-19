@@ -348,10 +348,6 @@ impl Decimal {
         Decimal { sign: other.sign, ..self.clone() }
     }
 
-    pub(crate) fn with_sign(&self, sign: bool) -> Decimal {
-        Decimal { sign, ..self.clone() }
-    }
-
     /// The number of digits of the coefficient (1 for zero and for specials with no payload).
     pub fn digits(&self) -> u64 {
         coef::ndigits(&self.coef)

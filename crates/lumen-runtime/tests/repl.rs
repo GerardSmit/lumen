@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
+mod support;
+
 use lumen_runtime::{Completion, ConsoleOut, Runtime};
 
 #[derive(Clone, Default)]
@@ -18,6 +20,10 @@ impl Write for Captured {
 
 #[test]
 fn repl_evaluates_streamed_commands_and_multiline_input() {
+    support::on_engine_stack(repl_evaluates_streamed_commands_and_multiline_input_body);
+}
+
+fn repl_evaluates_streamed_commands_and_multiline_input_body() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {

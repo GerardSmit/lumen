@@ -611,7 +611,7 @@ fn valid_header_line(line: &[u8]) -> bool {
             .iter()
             .all(|&b| b == b'\t' || b >= 32 && b != 127)
 }
-fn token(byte: u8) -> bool {
+pub(crate) fn token(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
@@ -874,4 +874,42 @@ mod tests {
         assert_eq!(step.consumed, 3);
         assert!(step.done);
     }
+}
+
+/// Decode HTTP content codings in reverse application order through the shared
+/// maintained codecs. Framing has already bounded encoded bytes; every decode
+/// stage independently enforces the final response-body admission limit.
+#[cfg(feature="compress")]
+pub fn decode_content_codings(headers:&[(String,String)],mut body:Vec<u8>,limit:usize)->Result<Vec<u8>,String> {
+    if body.len()>limit {return Err(String::from(crate::compress::OUTPUT_LIMIT))}
+    let mut codings=Vec::new();
+    for (_,value) in headers.iter().filter(|(name,_)|name.eq_ignore_ascii_case("content-encoding")) {
+        for coding in value.split(',').map(|value|value.trim_matches(|c|matches!(c,' '| '\t'))).filter(|value|!value.is_empty()) {
+            if codings.len()==128 {return Err(String::from("HTTP content-coding depth exceeded"))}
+            codings.push(coding);
+        }
+    }
+    for coding in codings.into_iter().rev() {
+        body=if coding.eq_ignore_ascii_case("identity") {body}
+        else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {crate::compress::gzip_decompress_limited(&body,limit)?}
+        else if coding.eq_ignore_ascii_case("deflate") {crate::compress::zlib_decompress_limited(&body,limit)?}
+        else if coding.eq_ignore_ascii_case("br") {crate::compress::brotli_decompress_limited(&body,limit)?}
+        else if coding.eq_ignore_ascii_case("zstd") {crate::compress::zstd_decompress_limited(&body,limit)?}
+        else {return Err(String::from("unsupported HTTP content coding"))};
+    }
+    Ok(body)
+}
+
+#[cfg(all(test,feature="compress"))]
+#[test]
+fn specification_stylesheet_content_codings_preserve_encoded_bounds_and_decode_before_integrity() {
+    let original=b"@import 'child.css'; div{color:green}";
+    let packed=crate::compress::gzip_compress(original);
+    assert_ne!(packed.as_slice(),original);
+    let headers=alloc::vec![(String::from("Content-Encoding"),String::from("gzip"))];
+    assert_eq!(decode_content_codings(&headers,packed.clone(),1024).unwrap(),original);
+    assert!(decode_content_codings(&headers,packed,8).is_err());
+    assert!(decode_content_codings(&alloc::vec![(String::from("content-encoding"),String::from("unknown"))],original.to_vec(),1024).is_err());
+    let plain=original.to_vec();let pointer=plain.as_ptr();let plain=decode_content_codings(&[],plain,1024).unwrap();
+    assert_eq!(plain.as_ptr(),pointer,"ordinary identity responses keep the admitted buffer");
 }

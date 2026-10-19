@@ -15,11 +15,8 @@ use super::{
 };
 use crate::crypto::cipher::bindings::bytes_to_key;
 
-pub const FORMAT_DER: u32 = 0;
 pub const FORMAT_PEM: u32 = 1;
-pub const FORMAT_JWK: u32 = 2;
 pub const ENC_PKCS1: u32 = 0;
-pub const ENC_PKCS8: u32 = 1;
 pub const ENC_SPKI: u32 = 2;
 pub const ENC_SEC1: u32 = 3;
 
@@ -405,7 +402,7 @@ fn legacy_pem(
     Ok(Exported::Pem(pem::encode(label, &headers, &body)))
 }
 
-/// `WritePrivateKey`: `enc` is `ENC_PKCS1` (RSA), `ENC_PKCS8` or `ENC_SEC1` (EC).
+/// `WritePrivateKey`: `enc` is `ENC_PKCS1` (RSA), `ENC_SEC1` (EC) or anything else for PKCS#8.
 pub fn export_private(
     key: &AsymKey,
     format: u32,

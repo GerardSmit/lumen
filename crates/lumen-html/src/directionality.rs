@@ -11,18 +11,20 @@ pub use lumen_common::bidi::Directionality as Direction;
 // when slot directionality follows assigned nodes into another slot.
 const MAX_SLOT_DIRECTIONALITY_DEPTH: usize = 128;
 
-struct DirectionalityBudget {
+struct DirectionalityBudget<'a> {
     visits_left: usize,
     slot_depth: usize,
     exhausted: bool,
+    instance_frames: &'a [crate::css::SvgInstanceFrame],
 }
 
-impl DirectionalityBudget {
+impl DirectionalityBudget<'_> {
     fn new(document: &Document) -> Self {
         Self {
             visits_left: document.node_count().saturating_mul(8).saturating_add(64),
             slot_depth: 0,
             exhausted: false,
+            instance_frames: &[],
         }
     }
 
@@ -117,6 +119,14 @@ pub fn dir_attribute_state(document: &Document, node: NodeId) -> Option<DirAttri
 pub fn resolved_element_directionality(document: &Document, node: NodeId) -> Direction {
     let mut budget = DirectionalityBudget::new(document);
     resolved_element_directionality_with_budget(document, node, &mut budget)
+}
+
+pub(crate) fn resolved_instance_directionality(
+    document:&Document,node:NodeId,frames:&[crate::css::SvgInstanceFrame],
+)->Direction {
+    let mut budget=DirectionalityBudget::new(document);
+    budget.instance_frames=frames;
+    resolved_element_directionality_with_budget(document,node,&mut budget)
 }
 
 fn resolved_element_directionality_with_budget(
@@ -234,7 +244,8 @@ fn parent_directionality_element(
     // Parent directionality follows the DOM parent chain, not the flattened
     // slot-assignment parent. A shadow root is the one special boundary: its
     // host supplies the parent directionality.
-    let mut current = document.parent(node).ok().flatten();
+    let mut current = budget.instance_frames.iter().rev().find(|frame|frame.root==node)
+        .map(|frame|frame.host).or_else(||document.parent(node).ok().flatten());
     let limit = document.node_count();
     for _ in 0..limit {
         if !budget.visit() {
@@ -248,7 +259,8 @@ fn parent_directionality_element(
             .shadow_host(parent)
             .ok()
             .flatten()
-            .or_else(|| document.parent(parent).ok().flatten());
+            .or_else(||budget.instance_frames.iter().rev().find(|frame|frame.root==parent)
+                .map(|frame|frame.host).or_else(||document.parent(parent).ok().flatten()));
     }
     None
 }

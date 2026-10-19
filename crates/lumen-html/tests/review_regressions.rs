@@ -15,6 +15,7 @@ impl TextShaper for Text {
                     id: c as u16,
                     face: 0,
                     cluster: cluster as u32,
+                    caps_expansion: 0,
                     x: i as f32 * 6.,
                     y: 0.,
                     size_scale: 1.,
@@ -133,7 +134,7 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
     assert!(first
         .nodes
         .iter()
-        .any(|(id, _, style)| *id == node && style[0].as_deref() == Some("fade")));
+        .any(|(id, _, _, style)| *id == node && style[0].as_deref() == Some("fade")));
     session
         .set_animation_declarations(node, vec![("opacity".into(), "0.5".into())])
         .unwrap();
@@ -148,7 +149,7 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
     assert!(changed
         .nodes
         .iter()
-        .any(|(id, _, style)| *id == node && style[0].as_deref() == Some("other")));
+        .any(|(id, _, _, style)| *id == node && style[0].as_deref() == Some("other")));
     session
         .set_media_environment(css::MediaEnvironment {
             width: 400.,
@@ -159,4 +160,20 @@ fn animation_snapshot_reuses_unchanged_inputs_and_refreshes_dom_and_media() {
         session.animation_snapshot().unwrap().generation,
         changed.generation
     );
+}
+
+#[test]
+fn design_token_stylesheet_with_hundreds_of_custom_properties_cascades() {
+    let tokens: String = (0..300).map(|index| format!("--token-{index}:#{index:06x};")).collect();
+    let markup = format!(
+        "<style>@media screen{{:root,.skin-invert{{{tokens}}}}}p{{color:var(--token-299);background:var(--token-1)}}\
+         q{{{}}}</style><p id=a>x</p><q id=b>y</q>",
+        "margin:0;".repeat(3000),
+    );
+    let document = html::parse(&markup, 64).unwrap();
+    let paragraph = selector::query_selector(&document, document.root(), "#a").unwrap().unwrap();
+    let mut session = RenderSession::new(document);
+    let style = session.computed_style(paragraph).unwrap();
+    assert_eq!(style.color, lumen_html::paint::Rgba { r: 0, g: 1, b: 43, a: 255 },
+        "var() resolves a token declared among 300 siblings; the oversized q rule is dropped alone");
 }

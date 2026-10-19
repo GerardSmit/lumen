@@ -25,6 +25,10 @@ impl Write for Captured {
 
 #[test]
 fn tls_server_accepts_verified_client_and_exchanges_data() {
+    support::on_engine_stack(tls_server_accepts_verified_client_and_exchanges_data_body);
+}
+
+fn tls_server_accepts_verified_client_and_exchanges_data_body() {
     if Command::new("openssl").arg("version").output().is_err() {
         return;
     }
@@ -114,6 +118,10 @@ fn tls_server_accepts_verified_client_and_exchanges_data() {
 
 #[test]
 fn tls_client_upgrades_a_paused_tcp_socket() {
+    support::on_engine_stack(tls_client_upgrades_a_paused_tcp_socket_body);
+}
+
+fn tls_client_upgrades_a_paused_tcp_socket_body() {
     if Command::new("openssl").arg("version").output().is_err() {
         return;
     }

@@ -3,6 +3,7 @@ use lumen_html::paint::{BackgroundPaint, BackgroundRepeat, ImageData, Rect, Rgba
 
 enum MixedPaint<'a> {
     Solid(lumen_html::paint::Rgba),
+    Border(&'a lumen_html::paint::BorderImagePaint,Box<MixedPaint<'a>>),
     Image(&'a ImageData),
     Gradient(Prepared<'a>, usize),
     Mix(Vec<(MixedPaint<'a>, f32)>),
@@ -11,7 +12,12 @@ impl<'a> MixedPaint<'a> {
     fn new(image: &'a BackgroundPaint, tile: Rect) -> Option<Self> {
         Some(match image {
             BackgroundPaint::Solid(color) => Self::Solid(*color),
+            BackgroundPaint::Border(border)=>Self::Border(border,Box::new(Self::new(&border.image,Rect{x:0.0,y:0.0,width:border.source_size[0],height:border.source_size[1]})?)),
             BackgroundPaint::Image(image) => Self::Image(image),
+            BackgroundPaint::Worklet(image) => match &image.pixels {
+                Some(pixels) => Self::Image(&pixels.image),
+                None => Self::Solid(Rgba { r: 0, g: 0, b: 0, a: 0 }),
+            },
             BackgroundPaint::Gradient(g) => Self::Gradient(Prepared::new(g, tile)?, 0),
             BackgroundPaint::CrossFade(items) => Self::Mix(
                 items
@@ -21,12 +27,22 @@ impl<'a> MixedPaint<'a> {
             ),
         })
     }
-    fn premultiplied(&mut self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+    fn premultiplied(&mut self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {self.premultiplied_clipped(x,y,width,height,None)}
+    fn premultiplied_clipped(&mut self, x: f32, y: f32, width: f32, height: f32, crop:Option<[f32;4]>) -> [f32; 4] {
         let color = match self {
             Self::Solid(c) => *c,
+            Self::Border(border,paint)=>{
+                let Some(([x,y],crop))=border.source_coordinate(x,y,width,height) else{return [0.0;4];};
+                return paint.premultiplied_clipped(x,y,border.source_size[0],border.source_size[1],Some(crop));
+            },
             Self::Image(i) => {
                 if i.is_valid() {
-                    sample_image(i, x / width, y / height)
+                    let mut x=x/width;let mut y=y/height;
+                    if let Some(crop)=crop {
+                        let clamp=|value:f32,start:f32,end:f32,extent:f32,pixels:u32|{let center=0.5/pixels as f32;let lo=start/extent+center;let hi=end/extent-center;if lo<=hi{value.clamp(lo,hi)}else{(start+end)/(2.0*extent)}};
+                        x=clamp(x,crop[0],crop[2],width,i.width);y=clamp(y,crop[1],crop[3],height,i.height);
+                    }
+                    sample_image(i,x,y)
                 } else {
                     lumen_html::paint::Rgba {
                         r: 0,
@@ -40,7 +56,7 @@ impl<'a> MixedPaint<'a> {
             Self::Mix(items) => {
                 let mut rgba = [0.0f32; 4];
                 for (image, weight) in items {
-                    let c = image.premultiplied(x, y, width, height);
+                    let c = image.premultiplied_clipped(x, y, width, height,crop);
                     for channel in 0..4 {
                         rgba[channel] += c[channel] * *weight;
                     }
@@ -151,10 +167,18 @@ pub(super) fn fill(
     repeat: [BackgroundRepeat; 2],
     image: &BackgroundPaint,
 ) {
+    if let BackgroundPaint::Border(border)=image {
+        if !border.image.is_available() {
+            let mut fallback=border.fallback.clone();
+            fallback.rect.x+=image_rect.x;fallback.rect.y+=image_rect.y;
+            super::border::draw_box(raster,&fallback);
+            return;
+        }
+    }
     if image_rect.width <= 0.0 || image_rect.height <= 0.0 {
         return;
     }
-    let Some(visible) = raster.clips.last().and_then(|clip| clip.intersection(rect)) else {
+    let Some(visible) = raster.visible_rect(rect) else {
         return;
     };
     let xaxis = Axis::new(
@@ -185,7 +209,7 @@ pub(super) fn fill(
         width: xaxis.tile,
         height: yaxis.tile,
     };
-    let mut mixed = if matches!(image, BackgroundPaint::CrossFade(_)) {
+    let mut mixed = if matches!(image, BackgroundPaint::CrossFade(_)|BackgroundPaint::Border(_)) {
         MixedPaint::new(image, tile)
     } else {
         None
@@ -200,11 +224,11 @@ pub(super) fn fill(
     let scale = raster.scale;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let columns: Vec<Option<f32>> = (x0..x1)
-        .map(|x| xaxis.sample((x as f32 + 0.5) / scale))
+        .map(|x| xaxis.sample(raster.css_x(x as f32 + 0.5)))
         .collect();
     let mut hint = 0;
     for y in y0..y1 {
-        let Some(py) = yaxis.sample((y as f32 + 0.5) / scale) else {
+        let Some(py) = yaxis.sample(raster.css_y(y as f32 + 0.5)) else {
             continue;
         };
         let row = gradient.as_ref().map_or(0.0, |g| g.row_term(py));
@@ -217,16 +241,16 @@ pub(super) fn fill(
                     super::coverage::rounded_corners(
                         x as f32,
                         y as f32,
-                        rect.x * scale,
-                        rect.y * scale,
-                        (rect.x + rect.width) * scale,
-                        (rect.y + rect.height) * scale,
+                        raster.device_x(rect.x),
+                        raster.device_y(rect.y),
+                        raster.device_x(rect.x + rect.width),
+                        raster.device_y(rect.y + rect.height),
                         corners.map(|r| [r[0] * scale, r[1] * scale]),
                     )
                 } else {
                     rect.contains_corners(
-                        (x as f32 + 0.5) / scale,
-                        (y as f32 + 0.5) / scale,
+                        raster.css_x(x as f32 + 0.5),
+                        raster.css_y(y as f32 + 0.5),
                         corners,
                     ) as u8 as f32
                 }
@@ -234,14 +258,14 @@ pub(super) fn fill(
                 super::coverage::rounded(
                     x as f32,
                     y as f32,
-                    rect.x * scale,
-                    rect.y * scale,
-                    (rect.x + rect.width) * scale,
-                    (rect.y + rect.height) * scale,
+                    raster.device_x(rect.x),
+                    raster.device_y(rect.y),
+                    raster.device_x(rect.x + rect.width),
+                    raster.device_y(rect.y + rect.height),
                     radius * scale,
                 )
             } else {
-                rect.contains_rounded((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale, radius)
+                rect.contains_rounded(raster.css_x(x as f32 + 0.5), raster.css_y(y as f32 + 0.5), radius)
                     as u8 as f32
             };
             if coverage == 0.0 {
@@ -249,7 +273,7 @@ pub(super) fn fill(
             }
             let color = match image {
                 BackgroundPaint::Solid(color) => *color,
-                BackgroundPaint::CrossFade(_) => {
+                BackgroundPaint::CrossFade(_)|BackgroundPaint::Border(_) => {
                     let Some(paint) = mixed.as_mut() else {
                         continue;
                     };
@@ -261,6 +285,10 @@ pub(super) fn fill(
                 BackgroundPaint::Image(image) => {
                     sample_image(image, px / xaxis.tile, py / yaxis.tile)
                 }
+                BackgroundPaint::Worklet(image) => match &image.pixels {
+                    Some(pixels) => sample_image(&pixels.image, px / xaxis.tile, py / yaxis.tile),
+                    None => continue,
+                },
             };
             let offset = (y as usize * raster.image.width as usize + x as usize) * 4;
             let pixel = &mut raster.image.pixels[offset..offset + 4];

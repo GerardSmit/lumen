@@ -784,7 +784,7 @@ fn dispatch_host_event(
     }
     let event = JsObject::from_value(event)
         .ok_or_else(|| OpError::new("TypeError", "could not construct WebRTC event"))?;
-    crate::events::DomEventTarget::dispatch_event(ctx, This(target), event).map(|_| ())
+    crate::events::dispatch_event(ctx, This(target), event).map(|_| ())
 }
 
 /// Deliver protocol events on the owner turn. Packets and timers are pumped
@@ -861,7 +861,7 @@ pub(crate) fn pump(ctx: &mut Ctx) -> OpResult<()> {
                         let event = JsObject::from_value(event).ok_or_else(|| {
                             OpError::new("TypeError", "could not construct ICE candidate event")
                         })?;
-                        crate::events::DomEventTarget::dispatch_event(
+                        crate::events::dispatch_event(
                             ctx,
                             This(peer.clone()),
                             event,

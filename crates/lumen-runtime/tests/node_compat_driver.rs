@@ -34,6 +34,17 @@ impl Captured {
     }
 }
 
+/// Runs `body` on the stack real engine hosts use: the lazily evaluated node glue nests deeply
+/// enough in a debug build to overflow a default 2 MiB test thread.
+fn on_engine_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(body)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 fn runtime() -> (Runtime, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
@@ -388,6 +399,10 @@ fn process_args_exit_protocol_and_exit_code() {
 
 #[test]
 fn node_test_runner_runs_sequentially_and_reports() {
+    on_engine_stack(node_test_runner_runs_sequentially_and_reports_body);
+}
+
+fn node_test_runner_runs_sequentially_and_reports_body() {
     let (mut rt, out) = runtime();
     eval_ok(
         &mut rt,
@@ -517,6 +532,10 @@ fn write_file_exclusive_create_and_mode() {
 /// not a stray "ended by the other party".
 #[test]
 fn net_write_before_connect_waits_for_the_connection() {
+    on_engine_stack(net_write_before_connect_waits_for_the_connection_body);
+}
+
+fn net_write_before_connect_waits_for_the_connection_body() {
     let (mut rt, out) = runtime();
     eval_ok(
         &mut rt,
@@ -555,6 +574,10 @@ fn net_write_before_connect_waits_for_the_connection() {
 /// preface, SETTINGS and HEADERS, not ahead of them (which the peer answers with a reset).
 #[test]
 fn http2_request_ended_before_connect_keeps_frame_order() {
+    on_engine_stack(http2_request_ended_before_connect_keeps_frame_order_body);
+}
+
+fn http2_request_ended_before_connect_keeps_frame_order_body() {
     let (mut rt, out) = runtime();
     eval_ok(
         &mut rt,

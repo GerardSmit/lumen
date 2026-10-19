@@ -1,5 +1,6 @@
 //! HTML audio element state and its owner-local media command queue.
 
+use crate::events::HtmlTargetExt;
 use lumen::embed::{Ctx, Deferred, OpError, OpResult, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -426,6 +427,58 @@ impl DomHtmlMediaElement {
 
 #[lumen_bind::methods]
 impl DomHtmlMediaElement {
+    #[getter]
+    fn src(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(self.node(), "src") }
+    #[setter(hint(js(ce_reactions)))]
+    fn set_src(&self, ctx: &mut Ctx, source: lumen_host::webidl::Usv) -> OpResult<()> {
+        self.node().set_attribute_core("src", &source.0)?;
+        self.node().realm.media_reload(ctx, self.node().id);
+        Ok(())
+    }
+    // HTML media IDL: a CEReactions boolean reflection. The DOM attribute
+            #[getter(name = "autoplay")]
+            fn autoplay(&self) -> OpResult<bool> { Ok((self.node()).get_null_attribute("autoplay")?.is_some()) }
+            #[setter(name = "autoplay", coerce, hint(js(ce_reactions)))]
+            fn set_autoplay(&self, value: bool) -> OpResult<()> { (self.node()).set_nullable_attribute_core("autoplay", value.then_some("")) }
+            #[getter(name = "loop")]
+            fn loop_(&self) -> OpResult<bool> { Ok((self.node()).get_null_attribute("loop")?.is_some()) }
+            #[setter(name = "loop", coerce, hint(js(ce_reactions)))]
+            fn set_loop(&self, value: bool) -> OpResult<()> { (self.node()).set_nullable_attribute_core("loop", value.then_some("")) }
+            #[getter(name = "defaultMuted")]
+            fn default_muted(&self) -> OpResult<bool> { Ok((self.node()).get_null_attribute("muted")?.is_some()) }
+            #[setter(name = "defaultMuted", coerce, hint(js(ce_reactions)))]
+            fn set_default_muted(&self, value: bool) -> OpResult<()> { (self.node()).set_nullable_attribute_core("muted", value.then_some("")) }
+    #[getter(name = "crossOrigin")]
+    fn cross_origin(&self) -> OpResult<lumen::embed::Nullable<String>> {
+        crate::html_interfaces::reflected_cors(self.node())
+    }
+    #[setter(name = "crossOrigin", coerce, hint(js(ce_reactions)))]
+    fn set_cross_origin(&self, value: Option<&str>) -> OpResult<()> {
+        self.node().set_nullable_attribute_core("crossorigin", value)
+    }
+    #[getter]
+    fn preload(&self) -> OpResult<String> {
+        if self.node().get_null_attribute("preload")?.as_deref() == Some("") { return Ok("auto".into()); }
+        crate::html_interfaces::reflected_keyword(self.node(), "preload", &["none","metadata","auto"], "metadata", "metadata")
+    }
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_preload(&self, value: &str) -> OpResult<()> { self.node().set_attribute_core("preload", value) }
+    #[getter]
+    fn loading(&self) -> OpResult<String> {
+        crate::html_interfaces::reflected_keyword(self.node(), "loading", &["lazy","eager"], "eager", "eager")
+    }
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_loading(&self, value: &str) -> OpResult<()> { self.node().set_attribute_core("loading", value) }
+    // remains the single source for the control presentation policy.
+    #[getter]
+    fn controls(&self) -> OpResult<bool> { self.node().has_null_attribute("controls") }
+
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_controls(&self, value: bool) -> OpResult<()> {
+        if value { self.node().set_attribute_core("controls", "") }
+        else { self.node().remove_attribute_core("controls") }
+    }
+
     #[getter(rename(js = "defaultPlaybackRate"))]
     fn default_playback_rate(&self) -> f64 {
         let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
@@ -459,6 +512,11 @@ pub struct DomHtmlAudioElement {
 }
 
 impl DomHtmlAudioElement {
+    pub(crate) fn from_html(base: DomHtmlElement) -> Self {
+        base.base.base.realm.media.borrow_mut().register_detached(base.base.base.id);
+        Self { base: DomHtmlMediaElement { base } }
+    }
+
     fn node(&self) -> &DomNode {
         &self.base.base.base.base
     }
@@ -469,6 +527,8 @@ impl DomHtmlAudioElement {
     }
 
     fn create(realm: Rc<DomRealm>, source: Option<&str>) -> OpResult<Self> {
+        let mut attributes = vec![("preload".into(), "auto".into())];
+        if let Some(source) = source { attributes.push(("src".into(), source.to_owned())); }
         let id = realm
             .session
             .borrow_mut()
@@ -476,17 +536,9 @@ impl DomHtmlAudioElement {
             .create(NodeKind::Element {
                 namespace: Namespace::Html,
                 name: "audio".into(),
-                attributes: Vec::new(),
+                attributes,
             })
             .map_err(crate::dom_error)?;
-        if let Some(source) = source.filter(|source| !source.is_empty()) {
-            realm
-                .session
-                .borrow_mut()
-                .document_mut()
-                .set_attribute(id, "src", source)
-                .map_err(crate::dom_error)?;
-        }
         let node = DomNode {
             base: crate::DomEventTarget::node(&realm, id),
             realm: realm.clone(),
@@ -510,6 +562,11 @@ pub struct DomHtmlVideoElement {
 }
 
 impl DomHtmlVideoElement {
+    pub(crate) fn from_html(base: DomHtmlElement) -> Self {
+        base.base.base.realm.media.borrow_mut().register_detached(base.base.base.id);
+        Self { base: DomHtmlMediaElement { base } }
+    }
+
     pub(super) fn node(&self) -> &DomNode {
         &self.base.base.base.base
     }
@@ -522,80 +579,25 @@ impl DomHtmlVideoElement {
 
 #[lumen_bind::methods]
 impl DomHtmlVideoElement {
+            #[getter(name = "width")]
+            fn width(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((self.node()).get_null_attribute("width")?.as_deref(), 0)) }
+            #[setter(name = "width", coerce, hint(js(ce_reactions)))]
+            fn set_width(&self, value: u32) -> OpResult<()> { (self.node()).set_attribute_core("width", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "height")]
+            fn height(&self) -> OpResult<u32> { Ok(lumen_html::forms::reflected_unsigned_long((self.node()).get_null_attribute("height")?.as_deref(), 0)) }
+            #[setter(name = "height", coerce, hint(js(ce_reactions)))]
+            fn set_height(&self, value: u32) -> OpResult<()> { (self.node()).set_attribute_core("height", &lumen_html::forms::reflected_unsigned_long_setter_value(value, 0).to_string()) }
+            #[getter(name = "poster")]
+            fn poster(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(self.node(), "poster") }
+            #[setter(name = "poster", hint(js(ce_reactions)))]
+            fn set_poster(&self, value: lumen_host::webidl::Usv) -> OpResult<()> { (self.node()).set_attribute_core("poster", &value.0) }
+            #[getter(name = "playsInline")]
+            fn plays_inline(&self) -> OpResult<bool> { Ok((self.node()).get_null_attribute("playsinline")?.is_some()) }
+            #[setter(name = "playsInline", coerce, hint(js(ce_reactions)))]
+            fn set_plays_inline(&self, value: bool) -> OpResult<()> { (self.node()).set_nullable_attribute_core("playsinline", value.then_some("")) }
     #[constructor]
-    fn new(
-        ctx: &mut Ctx,
-        #[default(0)] width: u32,
-        #[default(0)] height: u32,
-    ) -> OpResult<crate::NodeConstructorResult<Self>> {
-        let global = ctx.global_object();
-        let document_value = ctx
-            .get_member(&global, "document")
-            .map_err(|_| OpError::new("TypeError", "Video has no active document"))?;
-        let realm = ctx
-            .with_instance::<crate::DomDocument, _>(&document_value, |document| {
-                document.realm.clone()
-            })
-            .map_err(|_| OpError::new("TypeError", "Video has no active document"))?;
-        let id = realm
-            .session
-            .borrow_mut()
-            .document_mut()
-            .create(NodeKind::Element {
-                namespace: Namespace::Html,
-                name: "video".into(),
-                attributes: Vec::new(),
-            })
-            .map_err(crate::dom_error)?;
-        if width > 0 {
-            realm
-                .session
-                .borrow_mut()
-                .document_mut()
-                .set_attribute(id, "width", &width.to_string())
-                .map_err(crate::dom_error)?;
-        }
-        if height > 0 {
-            realm
-                .session
-                .borrow_mut()
-                .document_mut()
-                .set_attribute(id, "height", &height.to_string())
-                .map_err(crate::dom_error)?;
-        }
-        realm.media.borrow_mut().register_detached(id);
-        let node = DomNode {
-            base: crate::DomEventTarget::node(&realm, id),
-            realm: realm.clone(),
-            id,
-            collections: std::cell::RefCell::new(std::collections::HashMap::new()),
-        };
-        let video = Self {
-            base: DomHtmlMediaElement {
-                base: DomHtmlElement {
-                    base: crate::DomElement { base: node },
-                },
-            },
-        };
-        Ok(crate::NodeConstructorResult::from_native(video, realm, id))
-    }
-
-    #[getter]
-    fn src(&self) -> OpResult<String> {
-        let Some(source) = self.node().get_attribute("src")? else {
-            return Ok(String::new());
-        };
-        let base = self.node().realm.base_url();
-        Ok(lumen_common::url::parse(&source, Some(&base))
-            .map(|url| url.href())
-            .unwrap_or(source))
-    }
-
-    #[setter(coerce)]
-    fn set_src(&self, ctx: &mut Ctx, source: &str) -> OpResult<()> {
-        self.node().set_attribute_core("src", source)?;
-        self.node().realm.media_reload(ctx, self.node().id);
-        Ok(())
+    fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
     #[getter(rename(js = "currentSrc"))]
@@ -607,6 +609,7 @@ impl DomHtmlVideoElement {
         if self
             .node()
             .get_attribute("src")?
+            .0
             .as_deref()
             .unwrap_or("")
             .is_empty()
@@ -744,50 +747,24 @@ impl DomHtmlVideoElement {
     }
 }
 
+pub(crate) fn legacy_audio_factory(
+    ctx: &mut Ctx,
+    source: Option<&str>,
+) -> OpResult<crate::NodeConstructorResult<DomHtmlAudioElement>> {
+    let realm = crate::window_globals::current_dom_realm(ctx)
+        .ok_or_else(|| OpError::new("TypeError", "Audio has no active document"))?;
+    let audio = DomHtmlAudioElement::create(realm, source)?;
+    let node = audio.node();
+    let realm = node.realm.clone();
+    let id = node.id;
+    Ok(crate::NodeConstructorResult::from_native(audio, realm, id))
+}
+
 #[lumen_bind::methods]
 impl DomHtmlAudioElement {
     #[constructor]
-    fn new(
-        ctx: &mut Ctx,
-        #[default("")] source: &str,
-    ) -> OpResult<crate::NodeConstructorResult<Self>> {
-        let global = ctx.global_object();
-        let document_value = ctx
-            .get_member(&global, "document")
-            .map_err(|_| OpError::new("TypeError", "Audio has no active document"))?;
-        let realm = ctx
-            .with_instance::<crate::DomDocument, _>(&document_value, |document| {
-                document.realm.clone()
-            })
-            .map_err(|_| OpError::new("TypeError", "Audio has no active document"))?;
-        let audio = Self::create(realm, Some(source))?;
-        let node = audio.node();
-        let realm = node.realm.clone();
-        let id = node.id;
-        Ok(crate::NodeConstructorResult::from_native(audio, realm, id))
-    }
-
-    #[getter]
-    fn src(&self) -> OpResult<String> {
-        let node = self.node();
-        let Some(source) = node.get_attribute("src")? else {
-            return Ok(String::new());
-        };
-        let base = node.realm.base_url();
-        Ok(lumen_common::url::parse(&source, Some(&base))
-            .map(|url| url.href())
-            .unwrap_or(source))
-    }
-
-    #[setter(coerce)]
-    fn set_src(&self, ctx: &mut Ctx, source: &str) -> OpResult<()> {
-        self.node().set_attribute_core("src", source)?;
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .reload(ctx, self.node().id);
-        Ok(())
+    fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<crate::custom_elements::HtmlElementCtor> {
+        crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
     #[getter(rename(js = "currentSrc"))]
@@ -799,6 +776,7 @@ impl DomHtmlAudioElement {
         if self
             .node()
             .get_attribute("src")?
+            .0
             .as_deref()
             .unwrap_or("")
             .is_empty()

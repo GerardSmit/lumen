@@ -98,7 +98,15 @@ pub(crate) enum ResumeFrame {
     /// function's own call, which already has the frame (an async function's first step).
     Fn { f: WeakGc, skip_first: bool },
     /// A module body with top-level `await`.
-    Script(Rc<ScriptFrame>),
+    Script(Box<ModuleResumeFrame>),
+}
+
+/// Only module bodies need both source and captured settings. Keep this rare
+/// payload out of the inline frame stored by every ordinary async coroutine.
+#[derive(Clone)]
+pub(crate) struct ModuleResumeFrame {
+    pub(crate) source: Option<Rc<ScriptFrame>>,
+    pub(crate) settings: usize,
 }
 
 /// Line starts and UTF-16 column corrections of one source text.
@@ -282,6 +290,7 @@ pub(crate) struct SourceInfo {
     /// Added to every line, and to the columns of the first line (`vm`'s `lineOffset` /
     /// `columnOffset`).
     offsets: (i32, i32),
+    classic_script: Option<Rc<crate::ClassicScriptContext>>,
 }
 
 /// The source registry, keyed by the address of a source's `Rc<str>` text (the `src` every
@@ -315,6 +324,7 @@ impl Sources {
                     wrapper: 0,
                     table: None,
                     offsets: (0, 0),
+                    classic_script: None,
                 },
             );
         }
@@ -703,6 +713,10 @@ impl Interp {
         self.sources.borrow_mut().entry(src).offsets = (line, column);
     }
 
+    pub(crate) fn set_source_script_context(&self, src: &Rc<str>, context: Rc<crate::ClassicScriptContext>) {
+        self.sources.borrow_mut().entry(src).classic_script = Some(context);
+    }
+
     /// Take the source the parse / decode that just ran read from ([`take_parsed_source`]),
     /// registering it under `name` (`None`: keep its name) with its own text at `body_start`.
     pub(crate) fn adopt_parsed_source(
@@ -711,6 +725,9 @@ impl Interp {
         body_start: u32,
     ) -> Option<Rc<str>> {
         let (src, table) = take_parsed_source()?;
+        if let Some(context) = &self.classic_script_context {
+            self.sources.borrow_mut().entry(&src).classic_script = Some(context.clone());
+        }
         if name.is_some() || table.is_some() || body_start != 0 {
             self.register_source(&src, name, Some(body_start), 0, table);
         }
@@ -898,7 +915,7 @@ impl Interp {
                 // The handle keeps the callee alive while the frame is up (`FnFrame::fn_ptr`).
                 Some((depth, ptr, Some(g)))
             }
-            ResumeFrame::Script(sf) => Some((self.push_script_frame(sf.clone()), 0, None)),
+            ResumeFrame::Script(frame) => frame.source.as_ref().map(|sf|(self.push_script_frame(sf.clone()),0,None)),
         }
     }
 
@@ -927,11 +944,8 @@ impl Interp {
     }
 
     /// The resume frame for a module body with top-level `await`.
-    pub(crate) fn resume_frame_script(src: Option<Rc<str>>) -> ResumeFrame {
-        match src {
-            Some(src) => ResumeFrame::Script(Rc::new(ScriptFrame { src, eval: false })),
-            None => ResumeFrame::None,
-        }
+    pub(crate) fn resume_frame_script(src: Option<Rc<str>>, settings: usize) -> ResumeFrame {
+        ResumeFrame::Script(Box::new(ModuleResumeFrame { source:src.map(|src|Rc::new(ScriptFrame {src,eval:false})),settings }))
     }
 
     /// `Error.stackTraceLimit` as a frame count; `None` (no stack at all) when it is not a
@@ -1510,6 +1524,64 @@ impl Interp {
             Callable::User(u) => source_of(&u.func),
             _ => None,
         }
+    }
+
+    /// The active script's captured host metadata, including later calls into
+    /// functions parsed from that script. Uses the existing weak source table.
+    pub fn current_classic_script_context(&self) -> Option<Rc<crate::ClassicScriptContext>> {
+        if let Some(source) = self.innermost_source() {
+            if let Some(context) = self.sources.borrow().map.get(&key_of(&source))
+                .and_then(|entry| entry.classic_script.clone()) {
+                return Some(context);
+            }
+        }
+        self.classic_script_context.clone()
+    }
+
+    /// Capture the active JavaScript call site without invoking author stack
+    /// formatters. Positions share the engine's source table, UTF-16 columns,
+    /// bytecode call-site decoding and host-provided source offsets.
+    pub fn current_execution_location(&self) -> Option<(String, u32, u32)> {
+        let n = self.fn_frames.len();
+        for (k, frame) in self.fn_frames.iter().enumerate().rev() {
+            let site = site_pos(if k + 1 == n { self.cur_site } else { self.fn_frames[k + 1].caller_site });
+            let (file, location) = if frame.fn_ptr == 0 {
+                let Some(source) = frame.extra.as_ref().and_then(|extra| extra.script.as_ref()) else { continue };
+                let pos = if site == NO_SITE || site & SITE_PC != 0 { NO_POS } else { site };
+                let (file, location, _) = self.sources.borrow_mut().describe(&source.src, pos);
+                (file, location)
+            } else {
+                let resolved = self.resolve_fn(&Value::Obj(frame.callee()), site, 0);
+                (resolved.file, resolved.line)
+            };
+            if let (Value::Str(file), Some((line, column))) = (file, location) {
+                return Some((file.to_string(), line, column));
+            }
+        }
+        None
+    }
+
+    pub fn default_classic_script_context(&self) -> Rc<crate::ClassicScriptContext> {
+        Rc::new(crate::ClassicScriptContext { base_url: self.import_base.clone(),
+            credentials_mode: "same-origin".into(), ..Default::default() })
+    }
+
+    /// Host classic-script evaluation uses ParseScript/ScriptEvaluation in the
+    /// target global, with a scoped source context rather than a Function body.
+    pub fn run_classic_script(&mut self, source: &str, context: Rc<crate::ClassicScriptContext>) -> Result<Value, super::Abrupt> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(self.throw("EvalError", "dynamic code is unavailable in native execution"));
+        }
+        let (body, strict) = crate::parser::parse_classic_script(source)
+            .map_err(|error| self.throw("SyntaxError", format!("{} (line {})", error.message, error.line)))?;
+        let source_context = context.clone();
+        let previous = self.classic_script_context.replace(context);
+        let previous_strict = std::mem::replace(&mut self.strict, strict);
+        let name = (!source_context.base_url.is_empty()).then_some(source_context.base_url.as_str());
+        let result = self.run_program_named(&body, name).map_err(super::Abrupt::Throw);
+        self.strict = previous_strict;
+        self.classic_script_context = previous;
+        result
     }
 }
 

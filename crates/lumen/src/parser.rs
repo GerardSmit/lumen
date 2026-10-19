@@ -34,6 +34,13 @@ pub fn parse_script(src: &str, strict: bool) -> Result<Vec<Stmt>, ParseError> {
     parse_script_inner(src, strict, false, false, &[], lazy_bodies(), false)
 }
 
+/// Classic-script hosts need the parser's actual directive-prologue result,
+/// including later directives and escaped string literals.
+pub(crate) fn parse_classic_script(src: &str) -> Result<(Vec<Stmt>, bool), ParseError> {
+    parse_script_impl(src, false, false, false, &[], lazy_bodies(), false, false, false, None)
+        .map(|(body, _, strict)| (body, strict))
+}
+
 /// [`parse_script`] with function bodies skipped whatever the environment says: the parse a
 /// snapshot is encoded from, so the snapshot's functions decode lazy even when the build runs
 /// under `LUMEN_EAGER_PARSE=1`.

@@ -19,14 +19,18 @@ mod num_fmt;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 pub(crate) mod dataview;
 mod date;
+#[cfg(feature = "embed")]
 pub(crate) use date::time_clip;
 mod disposable;
 mod errors;
-mod function_proto;
+pub(crate) mod function_proto;
 pub(crate) use function_proto::nf_function_call;
 mod globals;
 mod host;
 mod json;
+pub(crate) fn parse_json_module_default(i:&mut Interp,text:&str)->Result<Value,Value> {
+    json::parse_module_default(i,text)
+}
 mod math;
 pub(crate) mod natives;
 pub(crate) use math::jit_math_fns;
@@ -3714,44 +3718,7 @@ fn install_object(it: &mut Interp) {
         }
         Ok(Value::Obj(result))
     });
-    it.def_method(&ctor, "keys", 1, |i, _this, args| {
-        let o = to_object_arg(i, arg(args, 0), "Object.keys")?;
-        if let Some(keys) = i.object_keys_fast(&o) {
-            return Ok(i.make_array(keys));
-        }
-        ab(i.defer_trigger(&o, None))?;
-        if let Some(keys) = window_proxy_enum_string_keys(i, &Value::Obj(o.clone()))? {
-            return Ok(i.make_array(keys));
-        }
-        if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
-            let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
-            return Ok(i.make_array(keys));
-        }
-        // A TypedArray's enumerable own keys are its integer indices plus string expandos.
-        if let Some(info) = ta_info(i, &o) {
-            let n = i.ta_len(&info).unwrap_or(0);
-            let mut keys: Vec<Value> = (0..n).map(|k| Value::from_string(k.to_string())).collect();
-            for k in ordered_enum_keys(&o) {
-                if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
-                    keys.push(Value::Str(k.into()));
-                }
-            }
-            return Ok(i.make_array(keys));
-        }
-        let names = ordered_enum_keys(&o);
-        // A module namespace's Object.keys reads each binding's [[GetOwnProperty]], throwing for an
-        // uninitialized export.
-        let ptr = Gc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            for k in &names {
-                if let Some(res) = i.namespace_own_property(ptr, k) {
-                    ab(res)?;
-                }
-            }
-        }
-        let keys: Vec<Value> = names.into_iter().map(|k| Value::Str(k.into())).collect();
-        Ok(i.make_array(keys))
-    });
+    it.def_method(&ctor, "keys", 1, |i, _this, args| object_keys_array(i, arg(args, 0)));
     it.def_method(&ctor, "getOwnPropertyNames", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyNames")?;
         ab(i.defer_trigger(&o, None))?;
@@ -3893,6 +3860,7 @@ fn install_object(it: &mut Interp) {
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptor")?;
         let key = ab(i.to_property_key(&arg(args, 1)))?;
         ab(i.defer_trigger(&o, Some(&key)))?;
+        i.materialize_lazy_globals(&o, Some(&key))?;
         if Interp::is_private_key(&key) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
@@ -3938,6 +3906,7 @@ fn install_object(it: &mut Interp) {
         // ToObject coerces primitives (and throws for null/undefined).
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptors")?;
         let ov = Value::Obj(o.clone());
+        i.materialize_lazy_globals(&o, None)?;
         let result = i.new_object();
         // A proxy goes through its [[OwnPropertyKeys]]/[[GetOwnProperty]] traps, in order.
         if let Some((target, handler)) = proxy_pair(i, &ov) {
@@ -9284,9 +9253,49 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
     Ok(i.unit_slice(&s, start as usize, end as usize))
 }
 
+/// `Object.keys(target)`: the enumerable own string keys as an array.
+pub(crate) fn object_keys_array(i: &mut Interp, target: Value) -> Result<Value, Value> {
+    let o = to_object_arg(i, target, "Object.keys")?;
+    if let Some(keys) = i.object_keys_fast(&o) {
+        return Ok(i.make_array(keys));
+    }
+    ab(i.defer_trigger(&o, None))?;
+    if let Some(keys) = window_proxy_enum_string_keys(i, &Value::Obj(o.clone()))? {
+        return Ok(i.make_array(keys));
+    }
+    if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
+        let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
+        return Ok(i.make_array(keys));
+    }
+    // A TypedArray's enumerable own keys are its integer indices plus string expandos.
+    if let Some(info) = ta_info(i, &o) {
+        let n = i.ta_len(&info).unwrap_or(0);
+        let mut keys: Vec<Value> = (0..n).map(|k| Value::from_string(k.to_string())).collect();
+        for k in ordered_enum_keys(&o) {
+            if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
+                keys.push(Value::Str(k.into()));
+            }
+        }
+        return Ok(i.make_array(keys));
+    }
+    let names = ordered_enum_keys(&o);
+    // A module namespace's Object.keys reads each binding's [[GetOwnProperty]], throwing for an
+    // uninitialized export.
+    let ptr = Gc::as_ptr(&o) as usize;
+    if i.is_namespace(ptr) {
+        for k in &names {
+            if let Some(res) = i.namespace_own_property(ptr, k) {
+                ab(res)?;
+            }
+        }
+    }
+    let keys: Vec<Value> = names.into_iter().map(|k| Value::Str(k.into())).collect();
+    Ok(i.make_array(keys))
+}
+
 /// Box a Number/String/Boolean primitive into a wrapper object (right prototype + exotic). Other
 /// values pass through unchanged (Symbol/BigInt wrappers are not modeled yet).
-fn box_primitive(i: &mut Interp, v: Value) -> Value {
+pub(crate) fn box_primitive(i: &mut Interp, v: Value) -> Value {
     let (proto, exotic) = match &v {
         Value::Num(_) => (i.number_proto.clone(), Exotic::NumWrap),
         Value::Bool(_) => (i.boolean_proto.clone(), Exotic::BoolWrap),

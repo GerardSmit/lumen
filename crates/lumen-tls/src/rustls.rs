@@ -6,21 +6,32 @@
 //! `close_notify` reads as a clean EOF. Clients trust the operating system's certificate store,
 //! falling back to the bundled Mozilla roots when that store yields nothing.
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 use std::collections::HashMap;
 use std::io::{Cursor, ErrorKind, Read, Write};
+#[cfg(any(test, not(unix), target_os = "android"))]
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use std::sync::Mutex;
+use std::time::Duration;
+#[cfg(any(test, not(unix), target_os = "android"))]
+use std::time::Instant;
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{self, CryptoProvider};
+#[cfg(any(test, not(unix), target_os = "android"))]
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::pki_types::PrivateKeyDer;
 use rustls::time_provider::TimeProvider;
-use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, Connection, DigitallySignedStruct,
-    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
-};
+use rustls::{ClientConfig, ClientConnection, ProtocolVersion, RootCertStore};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::{DigitallySignedStruct, SignatureScheme};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::{CipherSuite, Connection, ServerConfig, ServerConnection};
 
 pub type RuntimeRandomFill = fn(&mut [u8]) -> Result<(), String>;
 pub type RuntimeUnixTimeSource = fn() -> Option<u64>;
@@ -71,8 +82,6 @@ impl TimeProvider for RuntimeTimeProvider {
         Some(UnixTime::since_unix_epoch(Duration::from_secs(seconds)))
     }
 }
-
-static RUNTIME_TIME_PROVIDER: RuntimeTimeProvider = RuntimeTimeProvider;
 
 fn runtime_provider() -> Result<Arc<CryptoProvider>, String> {
     if RUNTIME_CRYPTO.get().is_none() {
@@ -131,7 +140,16 @@ pub fn client_config_with_roots(
 pub struct ClientSession {
     connection: ClientConnection,
     transport_eof: bool,
+    /// The transport's EOF reached Rustls (it waits for `backlog` to drain first).
+    eof_delivered: bool,
+    /// Encrypted bytes Rustls could not take yet because its plaintext buffer was full. They
+    /// (and then a deferred EOF) are processed as `read_plaintext` drains that buffer.
+    backlog: Vec<u8>,
 }
+
+/// Rustls refuses encrypted input once more plaintext than this is buffered
+/// (`DEFAULT_RECEIVED_PLAINTEXT_LIMIT`).
+const RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 
 /// Result of attempting a nonblocking plaintext read from [`ClientSession`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +187,8 @@ impl ClientSession {
         Ok(Self {
             connection,
             transport_eof: false,
+            eof_delivered: false,
+            backlog: Vec::new(),
         })
     }
 
@@ -177,15 +197,30 @@ impl ClientSession {
         self.connection.is_handshaking()
     }
 
-    /// Feed encrypted peer bytes, processing every complete TLS record they contain.
+    /// Feed encrypted peer bytes, processing every complete TLS record they contain. Records
+    /// beyond what the plaintext buffer holds are kept and processed as
+    /// [`read_plaintext`](Self::read_plaintext) drains it, so every byte is taken.
     pub fn feed_encrypted(&mut self, bytes: &[u8]) -> Result<usize, String> {
         if self.transport_eof {
             return Err(String::from(
                 "TLS encrypted input arrived after transport EOF",
             ));
         }
+        if self.backlog.is_empty() {
+            let consumed = self.process_encrypted(bytes)?;
+            self.backlog.extend_from_slice(&bytes[consumed..]);
+        } else {
+            self.backlog.extend_from_slice(bytes);
+            self.drain_backlog()?;
+        }
+        Ok(bytes.len())
+    }
+
+    /// Hands `bytes` to Rustls until they run out or its plaintext buffer is full. Returns how
+    /// many it took.
+    fn process_encrypted(&mut self, bytes: &[u8]) -> Result<usize, String> {
         let mut input = Cursor::new(bytes);
-        while (input.position() as usize) < bytes.len() {
+        while (input.position() as usize) < bytes.len() && !self.plaintext_full()? {
             let consumed = self
                 .connection
                 .read_tls(&mut input)
@@ -200,6 +235,29 @@ impl ClientSession {
         Ok(input.position() as usize)
     }
 
+    /// Whether Rustls would refuse more encrypted input until plaintext is read.
+    fn plaintext_full(&mut self) -> Result<bool, String> {
+        let state = self
+            .connection
+            .process_new_packets()
+            .map_err(|error| format!("TLS peer data rejected: {error}"))?;
+        Ok(state.plaintext_bytes_to_read() > RECEIVED_PLAINTEXT_LIMIT)
+    }
+
+    /// Processes the backlog as far as the plaintext buffer allows, then a deferred EOF.
+    fn drain_backlog(&mut self) -> Result<(), String> {
+        if !self.backlog.is_empty() {
+            let backlog = std::mem::take(&mut self.backlog);
+            let consumed = self.process_encrypted(&backlog)?;
+            self.backlog = backlog;
+            self.backlog.drain(..consumed);
+        }
+        if self.transport_eof && !self.eof_delivered && self.backlog.is_empty() && !self.plaintext_full()? {
+            self.deliver_eof()?;
+        }
+        Ok(())
+    }
+
     /// Signal that the underlying byte transport reached EOF.
     ///
     /// Rustls treats this as an unauthenticated transport close. Any subsequent plaintext read
@@ -210,6 +268,11 @@ impl ClientSession {
             return Ok(());
         }
         self.transport_eof = true;
+        self.drain_backlog()
+    }
+
+    fn deliver_eof(&mut self) -> Result<(), String> {
+        self.eof_delivered = true;
         let mut empty = Cursor::new(&[]);
         self.connection
             .read_tls(&mut empty)
@@ -252,11 +315,23 @@ impl ClientSession {
         if bytes.is_empty() {
             return Ok(PlaintextRead::Data(0));
         }
-        match self.connection.reader().read(bytes) {
-            Ok(0) => Ok(PlaintextRead::Closed),
-            Ok(length) => Ok(PlaintextRead::Data(length)),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(PlaintextRead::Pending),
-            Err(error) => Err(format!("TLS plaintext read failed: {error}")),
+        loop {
+            match self.connection.reader().read(bytes) {
+                Ok(0) => return Ok(PlaintextRead::Closed),
+                Ok(length) => return Ok(PlaintextRead::Data(length)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(format!("TLS plaintext read failed: {error}")),
+            }
+            let pending = self.backlog.len();
+            let undelivered = self.transport_eof && !self.eof_delivered;
+            if pending == 0 && !undelivered {
+                return Ok(PlaintextRead::Pending);
+            }
+            self.drain_backlog()?;
+            // A backlog that yields no record (only a partial one) waits for more input.
+            if self.backlog.len() == pending && undelivered == (self.transport_eof && !self.eof_delivered) {
+                return Ok(PlaintextRead::Pending);
+            }
         }
     }
 
@@ -291,18 +366,23 @@ impl ClientSession {
 
 /// How long a handshake may keep retrying reads that time out. The runtime's sockets carry short
 /// poll-style read timeouts (100 ms), so a single timeout is not a failure.
+#[cfg(any(test, not(unix), target_os = "android"))]
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 pub struct TlsStream {
     connection: Connection,
     stream: TcpStream,
+    nonblocking: bool,
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl TlsStream {
     pub fn connect(stream: TcpStream, hostname: &str) -> Result<Self, String> {
         Self::connect_with_options(stream, hostname, &[], true)
     }
 
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn connect_with_alpn(
         stream: TcpStream,
         hostname: &str,
@@ -358,6 +438,7 @@ impl TlsStream {
         let mut tls = Self {
             connection: connection.into(),
             stream,
+            nonblocking: false,
         };
         tls.handshake()
             .map_err(|error| format!("TLS handshake failed: {error}"))?;
@@ -401,14 +482,34 @@ impl TlsStream {
         let mut tls = Self {
             connection: connection.into(),
             stream,
+            nonblocking: false,
         };
         tls.handshake()
             .map_err(|error| format!("TLS server handshake failed: {error}"))?;
         Ok(tls)
     }
 
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    /// The TCP socket under the TLS session, for registering it with a readiness reactor.
+    #[cfg(any(not(unix), target_os = "android"))]
+    pub fn socket(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    /// Switches the socket to nonblocking mode. A read that needs the peer then fails with
+    /// `WouldBlock` (wait for the socket, then repeat the call) instead of `Interrupted`. A write
+    /// always accepts what it is given; records the socket would not take stay queued, and
+    /// [`Write::flush`] fails with `WouldBlock` until they are out. Call it after the handshake,
+    /// which always runs blocking.
+    #[cfg(any(not(unix), target_os = "android"))]
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)?;
+        self.nonblocking = nonblocking;
+        Ok(())
     }
 
     /// The negotiated version in OpenSSL's `SSL_get_version` spelling ("TLSv1.3").
@@ -513,6 +614,7 @@ impl TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn is_retry(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -530,6 +632,7 @@ fn validate_alpn(protocols: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Read for TlsStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         loop {
@@ -541,10 +644,16 @@ impl Read for TlsStream {
                 Err(error) => return Err(error),
             }
             // Post-handshake messages (key updates, alerts) may have queued a reply.
-            self.flush_tls()?;
+            match self.flush_tls() {
+                Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {}
+                other => other?,
+            }
             match self.connection.read_tls(&mut self.stream) {
                 // EOF is recorded by rustls; the next reader() call reports it.
                 Ok(_) => self.process_packets()?,
+                Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {
+                    return Err(ErrorKind::WouldBlock.into())
+                }
                 Err(error) if is_retry(&error) => {
                     return Err(std::io::Error::new(
                         ErrorKind::Interrupted,
@@ -557,12 +666,17 @@ impl Read for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Write for TlsStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         // Drain earlier records first so the plaintext buffer has room for this one.
         self.flush_tls()?;
         let length = self.connection.writer().write(buffer)?;
-        self.flush_tls()?;
+        match self.flush_tls() {
+            // The plaintext is accepted and its records are queued; `flush` sends them.
+            Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {}
+            other => other?,
+        }
         Ok(length)
     }
 
@@ -573,6 +687,7 @@ impl Write for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Drop for TlsStream {
     fn drop(&mut self) {
         self.connection.send_close_notify();
@@ -580,12 +695,14 @@ impl Drop for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn provider() -> &'static Arc<CryptoProvider> {
     static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
     PROVIDER.get_or_init(|| Arc::new(crypto::ring::default_provider()))
 }
 
 /// The operating system's trust store, or the bundled Mozilla roots if it yields nothing.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn root_store() -> &'static Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS.get_or_init(|| {
@@ -600,6 +717,7 @@ fn root_store() -> &'static Arc<RootCertStore> {
 }
 
 /// Client configs are shared per (verify, ALPN) pair so connections reuse the session cache.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn client_config(verify_peer: bool, protocols: &[String]) -> Result<Arc<ClientConfig>, String> {
     type Key = (bool, Vec<String>);
     static CONFIGS: OnceLock<Mutex<HashMap<Key, Arc<ClientConfig>>>> = OnceLock::new();
@@ -629,6 +747,7 @@ fn client_config(verify_peer: bool, protocols: &[String]) -> Result<Arc<ClientCo
 
 /// Build a verified socket client using the normal root set plus connection-local PEM roots.
 /// Configurations containing caller roots are deliberately not entered in the shared cache.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn client_config_with_extra_pem(
     protocols: &[String],
     pem: &[u8],
@@ -656,9 +775,11 @@ fn client_config_with_extra_pem(
 
 /// `rejectUnauthorized: false`: any certificate chain and name is accepted, but the handshake
 /// signatures are still checked against the presented certificate.
+#[cfg(any(test, not(unix), target_os = "android"))]
 #[derive(Debug)]
 struct AcceptAnyCertificate(Arc<CryptoProvider>);
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl ServerCertVerifier for AcceptAnyCertificate {
     fn verify_server_cert(
         &self,
@@ -846,6 +967,46 @@ mod tests {
             client.read_plaintext(&mut response).unwrap(),
             PlaintextRead::Closed
         );
+    }
+
+    #[test]
+    fn transport_free_session_takes_more_records_than_its_plaintext_buffer() {
+        install_runtime();
+        let (cert_pem, key_pem) = self_signed();
+        let (certs, _) = der_pair(&cert_pem, &key_pem);
+        let roots = certs
+            .iter()
+            .map(|cert| cert.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        let mut client = ClientSession::connect_with_roots("localhost", &[], &roots).unwrap();
+        let mut server = local_server(&cert_pem, &key_pem, &[]);
+        finish_handshake(&mut client, &mut server).unwrap();
+
+        let body: Vec<u8> = (0..100 * 1024).map(|index| (index % 251) as u8).collect();
+        server.set_buffer_limit(None);
+        server.writer().write_all(&body).unwrap();
+        server.send_close_notify();
+        let mut server_bytes = Vec::new();
+        while server.wants_write() {
+            assert_ne!(server.write_tls(&mut server_bytes).unwrap(), 0);
+        }
+        // Far more than Rustls buffers as plaintext, in pieces fed before any is read, then EOF.
+        let (first, second) = server_bytes.split_at(server_bytes.len() / 3);
+        let (second, third) = second.split_at(second.len() / 2);
+        for part in [first, second, third] {
+            assert_eq!(client.feed_encrypted(part).unwrap(), part.len());
+        }
+        client.feed_eof().unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match client.read_plaintext(&mut chunk).unwrap() {
+                PlaintextRead::Data(count) => received.extend_from_slice(&chunk[..count]),
+                PlaintextRead::Closed => break,
+                PlaintextRead::Pending => panic!("plaintext pending with every record fed"),
+            }
+        }
+        assert_eq!(received, body);
     }
 
     #[test]

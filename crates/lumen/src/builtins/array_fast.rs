@@ -651,6 +651,10 @@ pub(super) fn array_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Res
             }
         }
     };
+    #[cfg(feature = "embed")]
+    if let Some(result) = crate::embed_convert::indexed_index_of(i, &Value::Obj(o.clone()), &target, from, len)? {
+        return Ok(result);
+    }
     let simple = matches!(
         target,
         Value::Num(_)

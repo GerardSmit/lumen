@@ -115,6 +115,13 @@ impl CollectionData {
         table!(&self.store, t => t.contains(key))
     }
 
+    /// A native DOMString-set lookup using the same seeded hash/index as JS Set.
+    #[cfg(feature = "embed")]
+    pub(crate) fn contains_string(&self,key:&str)->bool {
+        let mut hash=FxHasher::default();hash.write(key.as_bytes());
+        table!(&self.store,t=>t.contains_string(key,hash.finish() as u32))
+    }
+
     pub(crate) fn insert(&mut self, key: Value, value: Value) {
         let key = match key {
             Value::Num(n) if n == 0.0 => Value::Num(0.0),

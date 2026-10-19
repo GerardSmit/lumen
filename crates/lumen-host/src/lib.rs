@@ -33,13 +33,50 @@ pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 pub use lumen_common::compress as codec;
 
 pub mod encoding;
+/// The native `Event` / `EventTarget` / `AbortSignal` / `DOMException` core (`docs/native-events.md`).
+pub mod events;
+/// Native structured-clone attachments (`__cloneTransfer`).
+pub mod clone_transfer;
+/// `MessageEvent`, `CloseEvent`, `PromiseRejectionEvent`, `MessagePort`, `MessageChannel` and
+/// `BroadcastChannel` (`docs/native-messaging.md`).
+pub mod messaging;
+/// The native `Navigator` interface and the `navigator` global.
+pub mod navigator;
+/// Event delivery for hosts without their own event loop (the Bitnest kernel): `install`,
+/// `has_ready`, `pump` and `settle`.
+pub mod owner_loop;
+/// The readiness reactor of a loop that blocks in a poller, reachable from a `Ctx`.
+pub mod loop_reactor;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
+/// The native `Performance` interface and the `performance` and `self` globals.
+pub mod performance;
+pub mod performance_timeline;
+/// Transferable `MessagePort` endpoints.
+pub mod ports;
+/// `structuredClone` and the wire format behind `postMessage` (`docs/native-clone.md`).
+pub mod structured_clone;
+pub mod indexed_db;
+/// Typed host services scoped to one realm.
+pub mod random;
+pub mod realm_services;
+pub mod blob;
 pub mod sysfs;
+/// Network requests for native web classes: the shared request pipeline and `XMLHttpRequest`
+/// (`docs/native-network.md`).
+pub mod net;
+/// Native callbacks scheduled through the realm's `setTimeout`.
+pub mod timers;
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 pub mod url;
+pub mod url_pattern;
+pub mod webidl;
+/// `Worker`, `SharedWorker` and the worker global scopes (`docs/native-workers.md`).
+pub mod workers;
+#[cfg(feature = "webcrypto")]
+pub mod webcrypto;
 
 /// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
 /// JSPI) and the completion queue the embedder pushes settled Promises into.
@@ -61,6 +98,14 @@ pub type ModuleInit = fn(&mut Ctx) -> Result<(), Value>;
 pub fn globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
     let g = ctx.global_object();
     ctx.install_module::<M>(&g)
+}
+
+/// [`ModuleInit`]: everything `M` declares as lazy globals: each name is an accessor on the
+/// global object that builds the real class or function on first access and replaces itself
+/// with a data property (see `Ctx::install_module_lazy`). A realm that already defines a name
+/// keeps it.
+pub fn lazy_globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    ctx.install_module_lazy::<M>()
 }
 
 /// [`ModuleInit`]: `globalThis.<module name>` holding everything `M` declares.
@@ -91,6 +136,26 @@ pub struct Extension {
     /// `LUMENAOT`): the glue's AST, bytecode and (compressed) function text, loaded with
     /// `Engine::load_precompiled` — then `js_init` may be `None` (it is only a fallback).
     pub js_init_snapshot: Option<&'static [u8]>,
+    /// Globals the glue defines and nothing else (no side effects other pieces rely on). When
+    /// non-empty, `install` / `install_realm_in_ctx` do not run the glue at boot: each name is
+    /// published as a lazy global instead, and the glue (`js_init` / `js_init_snapshot`, the
+    /// same sources as the eager path) runs once, in the realm that owns the global, on the
+    /// first access to any listed name. Reflection reports ordinary data properties because the
+    /// engine materializes a lazy global before `Object.getOwnPropertyDescriptor`,
+    /// `Object.keys` and friends see it, and the accessors are replaced by the real properties
+    /// the glue defines. The glue must therefore:
+    ///
+    /// - define every listed name on `globalThis` (it may read other globals, which may be lazy
+    ///   themselves);
+    /// - not read a listed name before defining it (the accessors are already gone, so it reads
+    ///   `undefined`);
+    /// - keep a data property a script put on a listed name beforehand (assigning to a lazy
+    ///   name replaces only that accessor with the assigned value and does not run the glue).
+    ///
+    /// A name the realm already defines is skipped. `in` does not trigger the glue. A glue
+    /// that throws surfaces the error at the first access, and the names are then gone.
+    /// Empty (the default) keeps the eager behavior.
+    pub lazy_globals: &'static [&'static str],
 }
 
 /// Records which extensions initialized their shared OpState during ordinary installation.
@@ -157,8 +222,39 @@ impl Extension {
             state_init: None,
             js_init: None,
             js_init_snapshot: None,
+            lazy_globals: &[],
         }
     }
+
+    /// The glue-only view of this extension that a lazy global group runs on first access.
+    fn glue(&self) -> Extension {
+        Extension {
+            name: self.name,
+            modules: &[],
+            state_init: None,
+            js_init: self.js_init,
+            js_init_snapshot: self.js_init_snapshot,
+            lazy_globals: &[],
+        }
+    }
+
+    fn defers_glue(&self) -> bool {
+        !self.lazy_globals.is_empty() && (self.js_init.is_some() || self.js_init_snapshot.is_some())
+    }
+}
+
+/// Publish `extension.lazy_globals` in the active realm; the glue runs on first access.
+fn defer_glue(ctx: &mut Ctx, extension: &Extension) {
+    let glue = extension.glue();
+    ctx.install_lazy_global_group(
+        extension.lazy_globals,
+        Rc::new(move |ctx, global| {
+            let realm = ctx
+                .host_realm_for_global(global)
+                .ok_or_else(|| ctx.make_error("Error", "lazy extension realm is unavailable"))?;
+            install_realm_glue(ctx, &realm, &glue).map_err(|message| ctx.make_error("Error", message))
+        }),
+    );
 }
 
 /// Install extensions into an engine: state first (an op may fire during install), then ops,
@@ -192,6 +288,10 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             if m(engine.ctx()).is_err() {
                 panic!("extension {}: installing a module threw", ext.name);
             }
+        }
+        if ext.defers_glue() {
+            defer_glue(engine.ctx(), ext);
+            continue;
         }
         let aot = ext.js_init_snapshot.filter(|b| b.starts_with(b"LUMENAOT"));
         if let Some(blob) = aot {
@@ -304,6 +404,11 @@ pub fn install_realm_in_ctx(
             .map_err(|error| error.to_string())?;
         installed?;
 
+        if extension.defers_glue() {
+            ctx.with_host_realm(realm, |ctx| defer_glue(ctx, extension))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         install_realm_glue(ctx, realm, extension)?;
     }
     Ok(())
@@ -556,69 +661,139 @@ impl CallbackQueue {
     }
 }
 
-enum Task {
-    /// Work whose result goes back to the loop as a [`TaskCompletion`] tagged `id`.
-    Tracked {
-        id: TaskId,
-        work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
-    },
-    /// Work that reports back by itself (an async op's job holds a `Completer`).
-    Detached(Box<dyn FnOnce() + Send>),
+/// The sending end of a loop's completion channel. A loop whose thread parks on a scheduler
+/// [`Park`](lumen_os::sched::Park) instead of blocking on the channel registers it with
+/// [`CompletionTx::set_notify`]; a loop blocked in a [`lumen_os::reactor::Poller`] registers the
+/// poller's waker with [`CompletionTx::set_loop_waker`]. Every send then wakes both, and a burst of
+/// sends costs the poller one syscall.
+#[derive(Clone)]
+pub struct CompletionTx {
+    tx: mpsc::Sender<TaskCompletion>,
+    notify: std::sync::Arc<Notify>,
 }
 
-/// A fixed pool of std worker threads running blocking work (`std::fs`, blocking
-/// `std::net`); completions come back over the `mpsc` channel given at construction. This is
-/// the whole async-I/O story until (if ever) a hand-rolled readiness reactor on raw platform
-/// syscalls is explicitly authorized — never via a crate.
+#[derive(Default)]
+struct Notify {
+    unpark: std::sync::OnceLock<std::sync::Arc<dyn lumen_os::sched::Unpark>>,
+    waker: std::sync::OnceLock<lumen_os::reactor::LoopWaker>,
+}
+
+impl CompletionTx {
+    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionTx {
+        CompletionTx {
+            tx,
+            notify: Default::default(),
+        }
+    }
+
+    /// Unpark `notify` after every completion sent from now on, through any clone. Set once; a
+    /// second call is ignored.
+    pub fn set_notify(&self, notify: std::sync::Arc<dyn lumen_os::sched::Unpark>) {
+        let _ = self.notify.unpark.set(notify);
+    }
+
+    /// Wake `waker`'s poller after every completion sent from now on, through any clone. Set
+    /// once; a second call is ignored. A completion sent before this call is in the channel and
+    /// is not announced, so the loop drains the channel once after setting it.
+    pub fn set_loop_waker(&self, waker: lumen_os::reactor::LoopWaker) {
+        let _ = self.notify.waker.set(waker);
+    }
+
+    pub fn send(&self, done: TaskCompletion) -> Result<(), mpsc::SendError<TaskCompletion>> {
+        self.tx.send(done)?;
+        if let Some(waker) = self.notify.waker.get() {
+            waker.wake();
+        }
+        if let Some(notify) = self.notify.unpark.get() {
+            notify.unpark();
+        }
+        Ok(())
+    }
+}
+
+impl From<mpsc::Sender<TaskCompletion>> for CompletionTx {
+    fn from(tx: mpsc::Sender<TaskCompletion>) -> CompletionTx {
+        CompletionTx::new(tx)
+    }
+}
+
+/// Runs blocking work on the process scheduler's shared pool (`std::fs`, blocking `std::net`);
+/// completions come back over the `mpsc` channel given at construction. The pool owns no
+/// threads: this adapter keeps the runtime's own accounting (what it has in flight, so dropping
+/// it can wait for exactly its tasks) and the [`TaskCompletion`] wrapping. Work that blocks for an
+/// unbounded time belongs on a dedicated thread ([`CompletionSender::run_blocking`]), never here.
+///
+/// Readiness-driven I/O does not belong here either: `lumen_os::reactor` is the hand-rolled
+/// raw-syscall readiness reactor (no crate, no mio) for sources that can be waited on.
 pub struct ThreadPool {
     shared: std::sync::Arc<PoolShared>,
 }
 
-/// State shared by the pool and its spawn handles. Worker threads are created by the first
-/// submission, so a runtime that never runs blocking work never starts any.
 struct PoolShared {
-    size: usize,
-    completions: mpsc::Sender<TaskCompletion>,
+    completions: CompletionTx,
     /// Tasks submitted and not yet finished (queued or running).
-    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    state: std::sync::Mutex<PoolState>,
+    pending: std::sync::atomic::AtomicUsize,
+    closed: std::sync::atomic::AtomicBool,
+    /// Set by a dropping pool that is waiting for `pending` to reach zero.
+    drain: std::sync::Mutex<Option<std::sync::Arc<dyn lumen_os::sched::Unpark>>>,
 }
 
-enum PoolState {
-    Idle,
-    Running {
-        work_tx: mpsc::Sender<Task>,
-        workers: Vec<std::thread::JoinHandle<()>>,
-    },
-    Closed,
+/// Counts one task against its pool for as long as it is queued or running, including when the
+/// work panics.
+struct PendingTask(std::sync::Arc<PoolShared>);
+
+impl Drop for PendingTask {
+    fn drop(&mut self) {
+        let before = self
+            .0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if before == 1 {
+            let drain = self.0.drain.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(drain) = drain {
+                drain.unpark();
+            }
+        }
+    }
 }
 
-/// Spawn a host thread with the engine's thread stack size: work run here may call back into an
-/// engine (or run one), whose recursion is sized for it.
+/// Spawn a host thread through the process scheduler with the engine's thread stack size: work
+/// run here may call back into an engine (or run one), whose recursion is sized for it. Detached
+/// when the handle is dropped.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .stack_size(lumen::THREAD_STACK_SIZE)
-        .spawn(move || {
-            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
+pub fn spawn_thread<F: FnOnce() + Send + 'static>(
+    name: &'static str,
+    purpose: lumen_os::sched::Purpose,
+    f: F,
+) -> Result<lumen_os::sched::ThreadHandle, lumen_os::sched::SchedError> {
+    let mut spec = lumen_os::sched::ThreadSpec::new(name, purpose);
+    spec.stack_bytes = lumen::THREAD_STACK_SIZE;
+    lumen_os::sched::current().spawn_thread(
+        spec,
+        Box::new(move |start| {
+            let stack = if start.stack_bytes > 0 {
+                start.stack_bytes
+            } else {
+                lumen::THREAD_STACK_SIZE
+            };
+            lumen::set_thread_stack_size(stack);
             f()
-        })
-        .expect("spawn host thread")
+        }),
+    )
 }
 
 impl ThreadPool {
-    /// Up to `size` worker threads, started on the first submitted job, sending
-    /// [`TaskCompletion`]s to `completions` (the loop thread holds the receiving end).
+    /// Sends [`TaskCompletion`]s to `completions` (the loop thread holds the receiving end).
     ///
-    /// On `wasm32` there are no threads: the pool has no workers and runs each job inline on the
-    /// calling (loop) thread, delivering its completion on the same channel.
-    pub fn new(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
+    /// Where the scheduler has no pool (`wasm32`), each job runs inline on the calling (loop)
+    /// thread, delivering its completion on the same channel.
+    pub fn new(completions: impl Into<CompletionTx>) -> ThreadPool {
         ThreadPool {
             shared: std::sync::Arc::new(PoolShared {
-                size,
-                completions,
+                completions: completions.into(),
                 pending: Default::default(),
-                state: std::sync::Mutex::new(PoolState::Idle),
+                closed: Default::default(),
+                drain: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -641,70 +816,28 @@ impl ThreadPool {
         }
     }
 
-    /// Whether any worker thread has been started.
-    pub fn started(&self) -> bool {
-        matches!(
-            *self.shared.state.lock().expect("pool state poisoned"),
-            PoolState::Running { .. }
-        )
+    /// Tasks submitted and not yet finished.
+    pub fn pending(&self) -> usize {
+        self.shared.pending.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 impl PoolShared {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn start(&self) -> (mpsc::Sender<Task>, Vec<std::thread::JoinHandle<()>>) {
-        let (work_tx, work_rx) = mpsc::channel::<Task>();
-        // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
-        let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-        let workers = (0..self.size.max(1))
-            .map(|_| {
-                let work_rx = std::sync::Arc::clone(&work_rx);
-                let completions = self.completions.clone();
-                let pending = std::sync::Arc::clone(&self.pending);
-                spawn_thread(move || loop {
-                    let task = match work_rx.lock().expect("worker queue poisoned").recv() {
-                        Ok(t) => t,
-                        Err(_) => return, // pool dropped: no more work
-                    };
-                    match task {
-                        Task::Tracked { id, work } => {
-                            let result = work();
-                            // The loop shutting down first is fine; the result just has nowhere
-                            // to go.
-                            let _ = completions.send(TaskCompletion { task: id, result });
-                        }
-                        Task::Detached(job) => job(),
-                    }
-                    pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-            .collect();
-        (work_tx, workers)
-    }
-
-    /// Queue `task`, starting the workers if this is the first submission. `Err` hands the task
-    /// back when the pool is closed or has no threads (`wasm32`).
-    fn submit(&self, task: Task) -> Result<(), Task> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            return Err(task);
+    /// Run `work` on the scheduler's pool, or inline when it has none. Dropped when the pool has
+    /// been closed.
+    fn submit(self: &std::sync::Arc<Self>, work: Box<dyn FnOnce() + Send>) {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut state = self.state.lock().expect("pool state poisoned");
-            if matches!(*state, PoolState::Idle) {
-                let (work_tx, workers) = self.start();
-                *state = PoolState::Running { work_tx, workers };
-            }
-            match &*state {
-                PoolState::Running { work_tx, .. } => {
-                    self.pending
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    work_tx.send(task).expect("worker threads gone");
-                    Ok(())
-                }
-                _ => Err(task),
-            }
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let task = PendingTask(std::sync::Arc::clone(self));
+        let job: lumen_os::sched::Job = Box::new(move || {
+            let _task = task;
+            work();
+        });
+        if let Err(job) = lumen_os::sched::current().spawn_blocking(job) {
+            job();
         }
     }
 }
@@ -722,29 +855,18 @@ impl SpawnHandle {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        let task = Task::Tracked {
-            id,
-            work: Box::new(work),
-        };
-        if let Err(Task::Tracked { id, work }) = self.shared.submit(task) {
-            if cfg!(target_arch = "wasm32") {
-                let result = work();
-                let _ = self
-                    .shared
-                    .completions
-                    .send(TaskCompletion { task: id, result });
-            }
-        }
+        let completions = self.shared.completions.clone();
+        self.shared.submit(Box::new(move || {
+            let result = work();
+            // The loop shutting down first is fine; the result just has nowhere to go.
+            let _ = completions.send(TaskCompletion { task: id, result });
+        }));
     }
 
     /// Run `job` on a pool thread; it reports back by itself (e.g. through a
     /// [`lumen::embed::Completer`]), so no completion is sent for it.
     pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
-        if let Err(Task::Detached(job)) = self.shared.submit(Task::Detached(job)) {
-            if cfg!(target_arch = "wasm32") {
-                job();
-            }
-        }
+        self.shared.submit(job);
     }
 }
 
@@ -755,20 +877,48 @@ impl SpawnHandle {
 /// call; blocked threads cost only memory, not a pool slot.
 #[derive(Clone)]
 pub struct CompletionSender {
-    tx: mpsc::Sender<TaskCompletion>,
+    tx: CompletionTx,
+    wake: Option<std::sync::Arc<owner_loop::Wake>>,
 }
 
 impl CompletionSender {
-    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionSender {
-        CompletionSender { tx }
+    pub fn new(tx: impl Into<CompletionTx>) -> CompletionSender {
+        CompletionSender {
+            tx: tx.into(),
+            wake: None,
+        }
     }
+
+    /// A sender for a loop that is driven by its host's turns ([`owner_loop`]): every completion
+    /// is counted, and `notify` runs on the transition from nothing ready to something ready, so a
+    /// burst of sends wakes the host once. `notify` runs on the sending thread and must not block.
+    pub fn with_notify(
+        tx: impl Into<CompletionTx>,
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> CompletionSender {
+        CompletionSender {
+            tx: tx.into(),
+            wake: Some(std::sync::Arc::new(owner_loop::Wake::new(notify))),
+        }
+    }
+
+    pub(crate) fn wake_handle(&self) -> Option<std::sync::Arc<owner_loop::Wake>> {
+        self.wake.clone()
+    }
+
     /// Run `work` on a new dedicated thread; its result comes back to the loop as a
     /// [`TaskCompletion`] tagged with `id` (settled through the [`TaskRegistry`], like pool work).
+    ///
+    /// Not available on an [`owner_loop`] sender: the owner loop never spawns threads.
     pub fn run_blocking(
         &self,
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
+        debug_assert!(
+            self.wake.is_none(),
+            "run_blocking is not supported on an owner-loop sender"
+        );
         let tx = self.tx.clone();
         let run = move || {
             let result = work();
@@ -777,11 +927,25 @@ impl CompletionSender {
         #[cfg(target_arch = "wasm32")]
         run();
         #[cfg(not(target_arch = "wasm32"))]
-        spawn_thread(run);
+        spawn_thread("lumen-blocking-io", lumen_os::sched::Purpose::Blocking, run)
+            .expect("spawn host thread");
     }
+
     /// Deliver a completion from any thread (an I/O callback, a readiness thread).
     pub fn send(&self, id: TaskId, result: Box<dyn Any + Send>) {
-        let _ = self.tx.send(TaskCompletion { task: id, result });
+        match &self.wake {
+            None => {
+                let _ = self.tx.send(TaskCompletion { task: id, result });
+            }
+            Some(wake) => {
+                // Count before queueing so the receiver never sees a message the counter does not
+                // cover; notify after queueing so the woken host finds it.
+                let first = wake.arrive();
+                if self.tx.send(TaskCompletion { task: id, result }).is_ok() && first {
+                    wake.notify();
+                }
+            }
+        }
     }
 }
 
@@ -806,7 +970,8 @@ impl lumen::embed::AsyncHost for LoopAsyncHost {
     fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         if dedicated {
-            spawn_thread(job);
+            spawn_thread("lumen-blocking-io", lumen_os::sched::Purpose::Blocking, job)
+                .expect("spawn host thread");
             return;
         }
         #[cfg(target_arch = "wasm32")]
@@ -841,6 +1006,8 @@ pub struct TaskRegistry {
 /// reject — when absent, a decode error is reported as an uncaught exception), and the
 /// payload decoder.
 pub struct TaskEntry {
+    /// A host-owned resource decoder can finish without entering JavaScript.
+    pub native_only: bool,
     pub on_ok: Value,
     pub on_err: Option<Value>,
     pub decode: TaskDecoder,
@@ -865,6 +1032,7 @@ impl TaskRegistry {
         self.map.insert(
             id,
             TaskEntry {
+                native_only: false,
                 on_ok,
                 on_err,
                 decode,
@@ -890,6 +1058,7 @@ impl TaskRegistry {
         if let Some(e) = self.map.get(&id) {
             if e.persistent {
                 return Some(TaskEntry {
+                    native_only: e.native_only,
                     on_ok: e.on_ok.clone(),
                     on_err: e.on_err.clone(),
                     decode: e.decode,
@@ -1002,41 +1171,47 @@ pub fn register_task(
     id
 }
 
+/// Admit host-managed I/O which settles entirely in Rust, retaining the realm and async frame
+/// without manufacturing a JavaScript no-op callback.
+pub fn register_native_task(ctx: &mut Ctx, decode: TaskDecoder) -> TaskId {
+    let id = register_task(ctx, Value::Undefined, None, decode);
+    ctx.host_mut::<TaskRegistry>().unwrap().map.get_mut(&id).unwrap().native_only = true;
+    id
+}
+
 /// How long dropping a pool waits for tasks already running before it stops waiting.
 const POOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Closing the work channel ends each worker's recv loop. Normally the workers are joined
-        // so none outlives the runtime that owns the completion receiver; a task stuck in a
+        // No task may outlive the runtime that owns the completion receiver. A task stuck in a
         // blocking call (a read that never returns) must not hold the drop hostage, so after a
-        // grace period the workers are detached and exit when that call does.
-        let state = std::mem::replace(
-            &mut *self.shared.state.lock().expect("pool state poisoned"),
-            PoolState::Closed,
-        );
-        let PoolState::Running { work_tx, workers } = state else {
+        // grace period it is left to finish on its own; its completion then has nowhere to go.
+        use std::sync::atomic::Ordering::SeqCst;
+        let shared = &self.shared;
+        shared.closed.store(true, SeqCst);
+        if shared.pending.load(SeqCst) == 0 {
+            return;
+        }
+        let Ok(parker) = lumen_os::sched::current().parker() else {
             return;
         };
-        drop(work_tx);
-        let pending = &self.shared.pending;
+        *shared.drain.lock().unwrap_or_else(|e| e.into_inner()) = Some(parker.clone().unparker());
         let give_up = std::time::Instant::now() + POOL_DRAIN_GRACE;
-        while pending.load(std::sync::atomic::Ordering::SeqCst) > 0
-            && std::time::Instant::now() < give_up
-        {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        let stuck = pending.load(std::sync::atomic::Ordering::SeqCst) > 0;
-        for w in workers {
-            if !stuck || w.is_finished() {
-                let _ = w.join();
+        while shared.pending.load(SeqCst) > 0 {
+            if parker.park(Some(give_up)) == lumen_os::sched::Woke::TimedOut {
+                break;
             }
         }
+        *shared.drain.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod service_worker_tests;
 
 /// Starts a subprocess for `child_process`. The default is `command.spawn()`; an embedder that runs
 /// realms inside its own process supplies one that puts the child where it belongs (a job object

@@ -661,8 +661,6 @@ pub(crate) const CHUNK_DENTRY: usize =
     std::mem::offset_of!(Chunk, jit) + std::mem::offset_of!(ChunkJit, dentry);
 pub(crate) const CHUNK_DSIZE: usize =
     std::mem::offset_of!(Chunk, jit) + std::mem::offset_of!(ChunkJit, dsize);
-pub(crate) const CHUNK_DCODE: usize =
-    std::mem::offset_of!(Chunk, jit) + std::mem::offset_of!(ChunkJit, dcode);
 
 /// The [`JitFrame`] header of a directly called frame on the shadow stack, rounded so the
 /// slots after it are 16-byte aligned.

@@ -4,11 +4,12 @@
 //! adapter can expose them from the element classes without maintaining a
 //! second control tree.
 use crate::{Document, Error, Name, Namespace, NodeId, NodeKind};
+#[cfg(test)]
+use alloc::vec;
 use alloc::{
     borrow::ToOwned,
     string::{String, ToString},
     sync::Arc,
-    vec,
     vec::Vec,
 };
 
@@ -31,6 +32,8 @@ pub struct ValidityState {
 /// ask only about the candidate node currently being matched.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FormSelectorState {
+    /// True only after an autonomous form-associated custom element is custom.
+    pub form_associated_custom_element: bool,
     pub checkedness: Option<bool>,
     pub selectedness: Option<bool>,
     /// Resolved selected option for a single-select containing the candidate.
@@ -130,9 +133,15 @@ impl ValidityState {
 /// or computing validity. The shared algorithms consult only the nodes they
 /// inspect and do not require copying an adapter's control-state tables.
 pub trait ValidityStateView {
+    fn custom_element_validity(&self, _node:NodeId) -> Option<ValidityState> {None}
+
     fn value_override(&self, _node: NodeId) -> Option<&str> {
         None
     }
+
+    /// User-interface conversion can fail while the sanitized API value is
+    /// empty. Attribute-backed and script-assigned values do not set this flag.
+    fn user_bad_input(&self, _node: NodeId) -> bool { false }
 
     fn custom_message(&self, _node: NodeId) -> Option<&str> {
         None
@@ -624,7 +633,7 @@ pub fn form_owner(document: &Document, control: NodeId) -> Option<NodeId> {
     if tag == "img" {
         return ancestor_form_owner(document, control);
     }
-    if !matches!(
+    if !document.is_form_associated_custom_element(control) && !matches!(
         tag,
         "input" | "textarea" | "select" | "button" | "fieldset" | "output" | "object"
     ) {
@@ -648,6 +657,7 @@ pub fn form_owner(document: &Document, control: NodeId) -> Option<NodeId> {
             .is_some_and(|(tag, _)| tag == "form")
             .then_some(first);
     }
+    if let Some(form) = document.parser_form_owner(control) { return Some(form); }
     ancestor_form_owner(document, control)
 }
 
@@ -881,6 +891,7 @@ fn is_form_associated_control(
     document: &Document,
     node: NodeId,
 ) -> bool {
+    if document.is_form_associated_custom_element(node) {return true;}
     if listed_only {
         is_listed_form_element(document, node, name)
     } else {
@@ -905,6 +916,7 @@ fn is_listed_form_element_with_image_policy(
     name: &str,
     include_image_input: bool,
 ) -> bool {
+    if document.is_form_associated_custom_element(node) {return true;}
     matches!(
         name,
         "button" | "fieldset" | "object" | "output" | "select" | "textarea"
@@ -968,22 +980,129 @@ fn attribute<'a>(document: &'a Document, node: NodeId, name: &str) -> Option<&'a
         .flatten()
 }
 
-pub fn parse_nonnegative_integer(value: &str) -> Option<usize> {
+/// HTML §4.10.13: absence of value makes progress indeterminate; invalid
+/// present values remain determinate. All consumers share the same state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressState {
+    pub maximum: f64,
+    pub value: f64,
+    pub position: f64,
+}
+
+pub fn progress_state(document: &Document, node: NodeId) -> Option<ProgressState> {
+    if html_element_local_name(document, node)? != "progress" { return None; }
+    let maximum = attribute(document, node, "max")
+        .and_then(lumen_common::html_numbers::parse_floating_point)
+        .filter(|value| *value > 0.0).unwrap_or(1.0);
+    let raw_value = attribute(document, node, "value");
+    let value = raw_value.and_then(lumen_common::html_numbers::parse_floating_point)
+        .unwrap_or(0.0).max(0.0).min(maximum);
+    Some(ProgressState { maximum, value, position: if raw_value.is_some() { value / maximum } else { -1.0 } })
+}
+
+/// HTML §4.10.14 evaluates these six gauge points in dependency order.
+/// Values come from the current null-namespace attributes, never IDL sidecars.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterState {
+    pub minimum: f64,
+    pub maximum: f64,
+    pub value: f64,
+    pub low: f64,
+    pub high: f64,
+    pub optimum: f64,
+}
+
+impl MeterState {
+    pub fn fraction(self) -> f64 {
+        if self.maximum == self.minimum { return 0.0; }
+        let range = self.maximum - self.minimum;
+        if range.is_finite() { (self.value - self.minimum) / range }
+        else { (self.value / 2.0 - self.minimum / 2.0) / (self.maximum / 2.0 - self.minimum / 2.0) }
+    }
+}
+
+pub fn meter_state(document: &Document, node: NodeId) -> Option<MeterState> {
+    if html_element_local_name(document, node)? != "meter" { return None; }
+    let number = |name| attribute(document, node, name)
+        .and_then(lumen_common::html_numbers::parse_floating_point);
+    let minimum = number("min").unwrap_or(0.0);
+    let maximum = number("max").unwrap_or(1.0).max(minimum);
+    let clamp = |value: f64| value.max(minimum).min(maximum);
+    let value = clamp(number("value").unwrap_or(0.0));
+    let low = clamp(number("low").unwrap_or(minimum));
+    let high = number("high").unwrap_or(maximum).max(low).min(maximum);
+    // Opposite signs cannot overflow their sum; same signs cannot overflow
+    // their difference. Preserve small/subnormal midpoint precision as well.
+    let midpoint = if minimum.is_sign_negative() != maximum.is_sign_negative() {
+        (minimum + maximum) / 2.0
+    } else { minimum + (maximum - minimum) / 2.0 };
+    let optimum = clamp(number("optimum").unwrap_or(midpoint));
+    Some(MeterState { minimum, maximum, value, low, high, optimum })
+}
+
+fn nonnegative_integer_digits(value: &str) -> Option<&str> {
     let value = value
         .trim_start_matches(|character| matches!(character, '\t' | '\n' | '\u{000C}' | '\r' | ' '));
+    let negative = value.starts_with('-');
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
     let digits = value.bytes().take_while(u8::is_ascii_digit).count();
-    (digits > 0).then(|| value[..digits].parse().ok()).flatten()
+    let value = &value[..digits];
+    (digits > 0 && (!negative || value.bytes().all(|digit| digit == b'0'))).then_some(value)
+}
+
+pub fn parse_nonnegative_integer(value: &str) -> Option<usize> {
+    nonnegative_integer_digits(value)?.parse().ok()
+}
+
+pub fn parse_nonnegative_integer_capped(value: &str, limit: usize) -> Option<usize> {
+    let digits = nonnegative_integer_digits(value)?;
+    Some(digits.bytes().fold(0usize, |value, digit| {
+        value.saturating_mul(10).saturating_add(usize::from(digit - b'0')).min(limit)
+    }))
+}
+
+/// HTML §4.8.17. A current rendered content box takes precedence over
+/// independently parsed attributes; absent or invalid attributes preserve
+/// the actual available image's natural dimensions.
+pub fn image_dimensions(document: &Document,node:NodeId,natural:Option<(f64,f64)>,rendered:Option<(f64,f64)>) -> (f64,f64) {
+    if html_element_local_name(document,node)==Some("input")&&input_type_state(document,node)!="image" {return (0.0,0.0);}
+    if let Some(rendered)=rendered {return rendered;}
+    let (mut width,mut height)=natural.unwrap_or((0.0,0.0));
+    if let Some(value)=attribute(document,node,"width").and_then(parse_nonnegative_integer){width=value as f64;}
+    if let Some(value)=attribute(document,node,"height").and_then(parse_nonnegative_integer){height=value as f64;}
+    (width,height)
+}
+
+/// Ordinary HTML unsigned-long reflection falls back outside its signed-32-bit range.
+pub fn reflected_unsigned_long(value: Option<&str>, default: u32) -> u32 {
+    value.and_then(|value| parse_nonnegative_integer_capped(value, i32::MAX as usize + 1))
+        .filter(|value| *value <= i32::MAX as usize)
+        .map_or(default, |value| value as u32)
+}
+
+/// HTML unsigned-long reflection clamps parsed content only on retrieval.
+pub fn reflected_clamped_unsigned_long(value: Option<&str>, minimum: u32, maximum: u32, default: u32) -> u32 {
+    value.and_then(|value| parse_nonnegative_integer_capped(value, maximum as usize))
+        .map_or(default, |value| (value as u32).max(minimum))
+}
+
+/// The binding has already applied Web IDL ToUint32. ReflectRange does not
+/// constrain the setter: only the common unsigned-long upper bound applies.
+pub fn reflected_unsigned_long_setter_value(value: u32, default: u32) -> u32 {
+    if value <= i32::MAX as u32 { value } else { default }
 }
 
 fn element<'a>(document: &'a Document, node: NodeId) -> Option<(&'a str, &'a [(Name, String)])> {
-    match document.kind(node).ok()? {
-        NodeKind::Element {
-            namespace: Namespace::Html,
-            name,
-            attributes,
-            ..
-        } => Some((crate::svg::local_name(name), attributes)),
-        _ => None,
+    html_element_parts(document, node).ok().flatten()
+}
+
+fn html_element_parts(document: &Document, node: NodeId) -> Result<Option<(&str, &[(Name, String)])>, Error> {
+    match document.kind(node)? {
+        NodeKind::Element { namespace: Namespace::Html, name, attributes, .. } => {
+            let local = if name.contains(':') { document.element_name_parts(node)?.1 } else { name.as_str() };
+            Ok(Some((local, attributes)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -995,22 +1114,6 @@ fn text_content(document: &Document, root: NodeId) -> String {
         let _ = document.append_descendant_text(root, &mut text);
     }
     text
-}
-
-fn descendants(document: &Document, root: NodeId) -> Vec<NodeId> {
-    let mut result = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        result.push(node);
-        let mut children = Vec::new();
-        let mut current = document.first_child(node).ok().flatten();
-        while let Some(child) = current {
-            children.push(child);
-            current = document.next_sibling(child).ok().flatten();
-        }
-        pending.extend(children.into_iter().rev());
-    }
-    result
 }
 
 /// The input states whose `value` IDL property is backed by a separate live
@@ -1045,23 +1148,16 @@ pub fn button_type_state(document: &Document, node: NodeId) -> Option<ButtonType
     if html_element_local_name(document, node)? != "button" {
         return None;
     }
-    let raw = attribute(document, node, "type").unwrap_or("submit");
-    Some(if raw.eq_ignore_ascii_case("reset") {
-        ButtonTypeState::Reset
-    } else if raw.eq_ignore_ascii_case("button") {
-        ButtonTypeState::Button
-    } else {
-        ButtonTypeState::Submit
+    Some(match crate::invokers::reflected_button_type(document, node) {
+        "submit" => ButtonTypeState::Submit,
+        "reset" => ButtonTypeState::Reset,
+        _ => ButtonTypeState::Button,
     })
 }
 
 /// Whether an HTML input or button is in a submit-button state.
 pub fn is_submit_button(document: &Document, node: NodeId) -> bool {
-    match html_element_local_name(document, node) {
-        Some("button") => button_type_state(document, node) == Some(ButtonTypeState::Submit),
-        Some("input") => matches!(input_type_state(document, node), "submit" | "image"),
-        _ => false,
-    }
+    crate::invokers::is_submit_button(document, node)
 }
 
 /// The default action associated with implicit form submission from a text
@@ -1142,14 +1238,19 @@ pub fn implicit_submission(document: &Document, input: NodeId) -> Option<Implici
 /// helper also handles elements created in the HTML namespace with a prefix,
 /// without accidentally treating foreign-namespace elements as controls.
 pub fn html_element_local_name(document: &Document, node: NodeId) -> Option<&str> {
-    match document.kind(node).ok()? {
-        NodeKind::Element {
-            namespace: Namespace::Html,
-            name,
-            ..
-        } => Some(crate::svg::local_name(name)),
-        _ => None,
-    }
+    element(document, node).map(|(local, _)| local)
+}
+
+/// HTML button-state contents use the Default-mode value attribute. An
+/// explicitly empty value is a label, not a request for the missing-value label.
+pub fn input_button_label(document: &Document, node: NodeId) -> Option<&str> {
+    if html_element_local_name(document, node)? != "input" { return None; }
+    let kind = attribute(document, node, "type").unwrap_or("text");
+    let fallback = if kind.eq_ignore_ascii_case("submit") { "Submit" }
+        else if kind.eq_ignore_ascii_case("reset") { "Reset" }
+        else if kind.eq_ignore_ascii_case("button") { "" }
+        else { return None; };
+    Some(attribute(document, node, "value").unwrap_or(fallback))
 }
 
 pub fn input_value_mode(document: &Document, node: NodeId) -> Option<InputValueMode> {
@@ -1490,14 +1591,7 @@ pub fn default_value(document: &Document, node: NodeId) -> Option<String> {
 }
 
 fn is_html_element_named(document: &Document, node: NodeId, wanted: &str) -> Result<bool, Error> {
-    Ok(matches!(
-        document.kind(node)?,
-        NodeKind::Element {
-            namespace: Namespace::Html,
-            name,
-            ..
-        } if name.as_str() == wanted
-    ))
+    Ok(html_element_parts(document, node)?.is_some_and(|(local, _)| local == wanted))
 }
 
 fn option_walk_prunes_subtree(
@@ -1505,15 +1599,10 @@ fn option_walk_prunes_subtree(
     select: NodeId,
     node: NodeId,
 ) -> Result<bool, Error> {
-    if is_html_element_named(document, node, "select")?
-        || is_html_element_named(document, node, "hr")?
-        || is_html_element_named(document, node, "option")?
-        || is_html_element_named(document, node, "datalist")?
-    {
-        return Ok(true);
-    }
-    if !is_html_element_named(document, node, "optgroup")? {
-        return Ok(false);
+    match html_element_parts(document, node)?.map(|(local, _)| local) {
+        Some("select" | "hr" | "option" | "datalist") => return Ok(true),
+        Some("optgroup") => {},
+        _ => return Ok(false),
     }
 
     let mut ancestor = document.parent(node)?;
@@ -1536,6 +1625,25 @@ pub fn for_each_select_option(
     select: NodeId,
     mut visit: impl FnMut(NodeId, usize) -> bool,
 ) -> Result<(), Error> {
+    for_each_select_item(document, select, |item| match item {
+        SelectItem::Option { node, index } => visit(node, index),
+        SelectItem::Group(_) => true,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub enum SelectItem {
+    Option { node: NodeId, index: usize },
+    Group(NodeId),
+}
+
+/// The same bounded select walk used by selection and formatting. Group
+/// headers are real items, while option indices retain their DOM meaning.
+pub fn for_each_select_item(
+    document: &Document,
+    select: NodeId,
+    mut visit: impl FnMut(SelectItem) -> bool,
+) -> Result<(), Error> {
     document.kind(select)?;
     if !is_html_element_named(document, select, "select")? {
         return Ok(());
@@ -1545,10 +1653,16 @@ pub fn for_each_select_option(
     let mut node = document.first_child(select)?;
     while let Some(id) = node {
         if is_html_element_named(document, id, "option")? {
-            if !visit(id, index) {
+            if !visit(SelectItem::Option { node: id, index }) {
                 return Ok(());
             }
             index += 1;
+        } else if is_html_element_named(document, id, "optgroup")?
+            && !option_walk_prunes_subtree(document, select, id)?
+        {
+            if !visit(SelectItem::Group(id)) {
+                return Ok(());
+            }
         }
         node = if option_walk_prunes_subtree(document, select, id)? {
             crate::selector::next_after_subtree(document, select, id)?
@@ -1558,7 +1672,6 @@ pub fn for_each_select_option(
     }
     Ok(())
 }
-
 /// Find the nearest HTML select containing `node`, including `node` itself.
 /// This is used by the DOM adapter after option-related tree mutations; it
 /// follows ordinary parent links and therefore does not cross shadow roots.
@@ -1860,6 +1973,13 @@ pub fn select_options(document: &Document, select: NodeId) -> Vec<NodeId> {
 /// Option text in tree order, excluding HTML/SVG scripts and collapsing only
 /// ASCII whitespace. Streams borrowed text chunks without a traversal buffer.
 pub fn option_text(document: &Document, option: NodeId) -> Result<String, Error> {
+    option_text_bounded(document, option, usize::MAX)
+}
+
+/// Rendering admits label source bytes before the shared whitespace scanner
+/// allocates its result; ordinary DOM option.text keeps its uncapped contract.
+pub(crate) fn option_text_bounded(document: &Document, option: NodeId, maximum: usize) -> Result<String, Error> {
+    let mut remaining = maximum;
     let mut cursor = document.first_child(option)?;
     let mut error = None;
     let parts = core::iter::from_fn(|| loop {
@@ -1872,8 +1992,8 @@ pub fn option_text(document: &Document, option: NodeId) -> Result<String, Error>
                 return None;
             }
         };
-        let skip = matches!(kind, NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, name, .. }
-            if crate::svg::local_name(name) == "script");
+        let skip = matches!(kind, NodeKind::Element { namespace: Namespace::Html | Namespace::Svg, .. })
+            && document.element_name_parts(node).is_ok_and(|(_, local)| local == "script");
         cursor = match if skip {
             crate::selector::next_after_subtree(document, option, node)
         } else {
@@ -1886,6 +2006,10 @@ pub fn option_text(document: &Document, option: NodeId) -> Result<String, Error>
             }
         };
         if let NodeKind::Text(text) | NodeKind::CData(text) = kind {
+            let Some(next) = remaining.checked_sub(text.len()) else {
+                error = Some(Error::LimitExceeded); cursor = None; return None;
+            };
+            remaining = next;
             return Some(text.as_str());
         }
     });
@@ -1965,7 +2089,8 @@ pub fn option_disabled(document: &Document, option: NodeId) -> bool {
 /// Return whether `:enabled`/`:disabled` apply to this element and, if so,
 /// whether it is actually disabled. This keeps the HTML selector tag set
 /// separate from the more general disabled-ancestor helper used by controls.
-fn selector_disabled_state(document: &Document, node: NodeId) -> Option<bool> {
+pub fn selector_disabled_state(document: &Document, node: NodeId) -> Option<bool> {
+    if document.is_form_associated_custom_element(node) {return Some(is_disabled(document,node));}
     match html_element_local_name(document, node)? {
         "button" | "input" | "select" | "textarea" => Some(is_disabled(document, node)),
         "fieldset" => Some(is_disabled(document, node)),
@@ -2007,40 +2132,6 @@ fn required_state(document: &Document, node: NodeId) -> Option<bool> {
     }
 }
 
-fn contenteditable_value(value: &str) -> Option<bool> {
-    if value.is_empty()
-        || value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("plaintext-only")
-    {
-        Some(true)
-    } else if value.eq_ignore_ascii_case("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn content_is_editable(document: &Document, node: NodeId) -> bool {
-    let mut current = Some(node);
-    for _ in 0..512 {
-        let Some(candidate) = current else {
-            return false;
-        };
-        if let Some(tag) = html_element_local_name(document, candidate) {
-            if matches!(tag, "input" | "textarea") {
-                return false;
-            }
-            if let Some(value) = attribute(document, candidate, "contenteditable") {
-                if let Some(editable) = contenteditable_value(value) {
-                    return editable;
-                }
-            }
-        }
-        current = document.parent(candidate).ok().flatten();
-    }
-    false
-}
-
 fn selector_read_write(document: &Document, node: NodeId) -> bool {
     match html_element_local_name(document, node) {
         Some("input") => {
@@ -2051,7 +2142,7 @@ fn selector_read_write(document: &Document, node: NodeId) -> bool {
         Some("textarea") => {
             attribute(document, node, "readonly").is_none() && !is_disabled(document, node)
         }
-        Some(_) => content_is_editable(document, node),
+        Some(_) => crate::element_metadata::is_content_editable(document, node),
         None => false,
     }
 }
@@ -2224,6 +2315,7 @@ pub fn placeholder_shown(
     value_empty
 }
 
+#[cfg(test)]
 fn selected_option_ids(document: &Document, select: NodeId) -> Vec<NodeId> {
     selected_option_ids_with(document, select, &[])
 }
@@ -2557,7 +2649,7 @@ pub fn will_validate(document: &Document, node: NodeId) -> bool {
     let Some((name, _attributes)) = element(document, node) else {
         return false;
     };
-    if !matches!(name, "input" | "select" | "textarea" | "button")
+    if !document.is_form_associated_custom_element(node) && !matches!(name, "input" | "select" | "textarea" | "button")
         || is_disabled(document, node)
         || has_datalist_ancestor(document, node)
     {
@@ -2566,11 +2658,12 @@ pub fn will_validate(document: &Document, node: NodeId) -> bool {
     // HTML bars every input with a specified readonly content attribute from
     // constraint validation, even when readonly does not make that input type
     // user-editable. Textarea has the same candidate rule.
-    if matches!(name, "input" | "textarea")
+    if (document.is_form_associated_custom_element(node) || matches!(name, "input" | "textarea"))
         && attribute(document, node, "readonly").is_some()
     {
         return false;
     }
+    if document.is_form_associated_custom_element(node) {return true;}
     match name {
         "input" => {
             let kind = input_type_state(document, node);
@@ -2595,9 +2688,18 @@ fn has_datalist_ancestor(document: &Document, node: NodeId) -> bool {
     false
 }
 
+/// Resolve the current DOM's autofill mantle and form default through the
+/// existing type and form-owner authorities, without a per-control cache.
+pub fn autocomplete_state(document: &Document, node: NodeId) -> lumen_common::html_autofill::Autofill<'_> {
+    let anchor=html_element_local_name(document,node)==Some("input")&&input_type_state(document,node)=="hidden";
+    let form_off=form_owner(document,node).and_then(|form|attribute(document,form,"autocomplete"))
+        .is_some_and(|value|value.eq_ignore_ascii_case("off"));
+    lumen_common::html_autofill::parse(attribute(document,node,"autocomplete"),anchor,form_off)
+}
+
 /// Return the normalized input type state without allocating. Unknown
 /// keywords use the Text state, as required by the input type algorithm.
-pub(crate) fn input_type_state(document: &Document, node: NodeId) -> &'static str {
+pub fn input_type_state(document: &Document, node: NodeId) -> &'static str {
     const STATES: &[&str] = &[
         "hidden",
         "text",
@@ -2947,7 +3049,6 @@ struct InputStepSettings {
     minimum: Option<f64>,
     maximum: Option<f64>,
     step: Option<f64>,
-    step_is_any: bool,
     base: f64,
 }
 
@@ -3007,11 +3108,71 @@ fn input_step_settings(document: &Document, node: NodeId, kind: &str) -> InputSt
         minimum,
         maximum,
         step,
-        step_is_any,
         base,
     }
 }
 
+/// A bounded Number stepping domain supplies a constant number of canonical
+/// display candidates for the renderer's approximate fixed preferred width.
+/// Unbounded/continuous domains have no finite widest author value; the UA
+/// retains its ordinary primary-font preferred width in that case. No values
+/// are enumerated, and actual live value strings remain untouched.
+pub(crate) fn for_each_number_preferred_value(
+    document: &Document,
+    node: NodeId,
+    mut visit: impl FnMut(&str),
+) -> bool {
+    if input_type_state(document, node) != "number" {
+        return false;
+    }
+    let settings = input_step_settings(document, node, "number");
+    let (Some(min), Some(max), Some(step)) = (settings.minimum, settings.maximum, settings.step)
+    else {
+        return false;
+    };
+    if min > max {
+        return false;
+    }
+    let (Some(first), Some(last)) = (
+        aligned_step_index(step_quotient(min, settings.base, step), true),
+        aligned_step_index(step_quotient(max, settings.base, step), false),
+    ) else {
+        return false;
+    };
+    if first > last {
+        return false;
+    }
+    let low = stabilize_numeric_step_result(
+        document,
+        node,
+        "number",
+        attribute(document, node, "min").unwrap_or(""),
+        settings.base + first * step,
+    );
+    let high = stabilize_numeric_step_result(
+        document,
+        node,
+        "number",
+        attribute(document, node, "max").unwrap_or(""),
+        settings.base + last * step,
+    );
+    if !low.is_finite() || !high.is_finite() || low > high {
+        return false;
+    }
+    for value in [low, high, low + step, high - step] {
+        if value.is_finite() && value >= low && value <= high {
+            let value = stabilize_numeric_step_result(
+                document,
+                node,
+                "number",
+                attribute(document, node, "min").unwrap_or(""),
+                value,
+            );
+            visit(&format_html_number(value));
+        }
+    }
+    true
+}
 fn step_quotient_is_integral(quotient: f64) -> bool {
     quotient.is_finite() && (quotient - quotient.round()).abs() <= 1e-7
 }
@@ -3275,6 +3436,7 @@ pub fn validity_with_view(
     node: NodeId,
     view: &dyn ValidityStateView,
 ) -> ValidityState {
+    if let Some(validity)=view.custom_element_validity(node) {return validity;}
     let mut state = ValidityState {
         custom_error: view
             .custom_message(node)
@@ -3285,6 +3447,7 @@ pub fn validity_with_view(
         return state;
     };
     let type_name = input_type_state(document, node);
+    state.bad_input = name == "input" && type_name == "number" && view.user_bad_input(node);
     let value_buffer;
     let value = if let Some(value) = view.value_override(node) {
         value
@@ -3594,43 +3757,40 @@ fn input_value_number(value: &str, kind: &str) -> Option<f64> {
     n.filter(|n| n.is_finite())
 }
 
-fn parse_html_float(value: &str) -> Option<f64> {
-    let bytes = value.as_bytes();
-    let mut i = usize::from(bytes.first() == Some(&b'-'));
-    let integer_start = i;
-    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-        i += 1;
+pub(crate) fn parse_html_float(value: &str) -> Option<f64> {
+    parse_html_float_decimal(value, false)
+}
+
+/// The ASCII number UI permits an optional plus and an incomplete decimal
+/// fraction when the complete input still converts to a finite number. Keep
+/// this policy distinct from the stricter value-attribute/IDL grammar.
+pub fn number_user_value(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some(String::new());
     }
-    let has_integer = i > integer_start;
-    if bytes.get(i) == Some(&b'.') {
-        i += 1;
-        let fraction_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == fraction_start {
-            return None;
-        }
-    } else if !has_integer {
-        return None;
+    if parse_html_float(value).is_some() {
+        return Some(value.to_owned());
     }
-    if matches!(bytes.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(bytes.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        let exponent_start = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-        if i == exponent_start {
-            return None;
-        }
-    }
-    (i == bytes.len())
+    parse_html_float_decimal(value.strip_prefix('+').unwrap_or(value), true).map(format_html_number)
+}
+
+/// ASCII editing policy: accept incomplete decimal/exponent text, while
+/// rejecting impossible duplicate signs, decimal separators or exponents.
+/// Conversion and API sanitization continue to share the same lexical core.
+pub fn number_user_text_allowed(value: &str) -> bool {
+    float_grammar_matches(value.strip_prefix('+').unwrap_or(value), true, true)
+}
+
+fn parse_html_float_decimal(value: &str, allow_empty_fraction: bool) -> Option<f64> {
+    float_grammar_matches(value, allow_empty_fraction, false)
         .then(|| value.parse::<f64>().ok())
         .flatten()
         .filter(|n| n.is_finite())
+}
+
+fn float_grammar_matches(value: &str, allow_empty_fraction: bool, editing: bool) -> bool {
+    use lumen_common::html_numbers::{scan_float, FloatGrammar};
+    scan_float(value.as_bytes(), FloatGrammar::Valid { allow_empty_fraction, editing }).is_some()
 }
 
 /// HTML patterns use the existing ECMAScript Unicode-set regular expression
@@ -3802,19 +3962,26 @@ pub fn form_entries_with_state_and_encoding(
     state: &impl FormEntryStateView,
     encoding: &str,
 ) -> Vec<FormEntry> {
-    let mut entries = Vec::new();
-    let _ = for_each_form_control(document, form, |node| {
+    let mut entries=Vec::new();
+    let _=for_each_form_control(document,form,|node| {
+        append_form_entries_for_control(document,node,submitter,state,encoding,&mut entries);true
+    });entries
+}
+
+/// The authoritative built-in successful-control algorithm, reused by hosts
+/// interleaving form-associated custom elements in the same tree-order walk.
+pub fn append_form_entries_for_control(document:&Document,node:NodeId,submitter:Option<NodeId>,state:&impl FormEntryStateView,encoding:&str,entries:&mut Vec<FormEntry>) {
         let Some((tag, _attributes)) = element(document, node) else {
-            return true;
+            return;
         };
         if !matches!(tag, "input" | "textarea" | "select" | "button")
             || is_disabled(document, node)
             || has_datalist_ancestor(document, node)
         {
-            return true;
+            return;
         }
         let Some(name) = attribute(document, node, "name").filter(|name| !name.is_empty()) else {
-            return true;
+            return;
         };
         let input_type = match tag {
             "input" => input_type_state(document, node),
@@ -3822,19 +3989,19 @@ pub fn form_entries_with_state_and_encoding(
                 Some(ButtonTypeState::Submit) => "submit",
                 Some(ButtonTypeState::Reset) => "reset",
                 Some(ButtonTypeState::Button) => "button",
-                None => return true,
+                None => return,
             },
             _ => "text",
         };
         if tag == "button" {
             if input_type != "submit" || submitter != Some(node) {
-                return true;
+                return;
             }
         } else if tag == "input"
             && (matches!(input_type, "button" | "reset" | "image")
                 || input_type == "submit" && submitter != Some(node))
         {
-            return true;
+            return;
         }
         if tag == "input" && input_type == "file" {
             if let Some(selected_files) = state
@@ -3858,14 +4025,14 @@ pub fn form_entries_with_state_and_encoding(
                     },
                 ));
             }
-            return true;
+            return;
         }
         let is_checkbox = tag == "input" && input_type == "checkbox";
         let is_radio = tag == "input" && input_type == "radio";
         if (is_checkbox || is_radio)
             && !checked_by(document, node, |control| state.checked_for_control(control))
         {
-            return true;
+            return;
         }
         if tag == "select" {
             let selected =
@@ -3882,7 +4049,7 @@ pub fn form_entries_with_state_and_encoding(
                 let value = option_value(document, option).unwrap_or_default();
                 entries.push(FormEntry::text(name, value));
             }
-            return true;
+            return;
         }
         let value = if tag == "input" && input_type == "hidden" && name.eq_ignore_ascii_case("_charset_") {
             encoding.to_owned()
@@ -3921,15 +4088,121 @@ pub fn form_entries_with_state_and_encoding(
         if let (Some(dirname), Some(direction)) = (dirname, dirname_value) {
             entries.push(FormEntry::text(dirname, direction));
         }
-        true
-    });
-    entries
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specification_image_dimensions_rendered_available_attribute_and_input_states() {
+        let mut document=crate::html::parse("<img><input type=image>",32).unwrap();
+        let img=crate::selector::query_selector(&document,document.root(),"img").unwrap().unwrap();
+        let input=crate::selector::query_selector(&document,document.root(),"input").unwrap().unwrap();
+        assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),Some((35.5,22.25))),(35.5,22.25));
+        assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(100.0,60.0));
+        for (raw,expected) in [("+10",10.0),("10px",10.0),("50%",50.0),("1.9",1.0),("-0.5",0.0),("\n10",10.0),("2147483647",2147483647.0)] {
+            document.set_attribute(img,"width",raw).unwrap();
+            assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(expected,60.0));
+        }
+        for raw in ["-10","","abc"] {
+            document.set_attribute(img,"width",raw).unwrap();
+            assert_eq!(super::image_dimensions(&document,img,Some((100.0,60.0)),None),(100.0,60.0));
+        }
+        document.set_attribute(input,"width","30").unwrap();document.set_attribute(input,"height","40").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,None,None),(30.0,40.0));
+        document.set_attribute(input,"type","text").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,Some((100.0,60.0)),Some((35.5,22.25))),(0.0,0.0));
+        document.set_attribute(input,"type","IMAGE").unwrap();
+        assert_eq!(super::image_dimensions(&document,input,Some((100.0,60.0)),None),(30.0,40.0));
+    }
+
     use super::*;
     use crate::html;
+    #[test]
+    fn specification_autofill_uses_live_type_form_owner_and_content_attributes() {
+        let mut document=html::parse("<form id=off autocomplete=off><input id=control autocomplete=invalid></form><form id=on></form><select id=select form=off></select><textarea id=text autocomplete='HOME email'></textarea>",48).unwrap();
+        let find=|document:&Document,selector|crate::selector::query_selector(document,document.root(),selector).unwrap().unwrap();
+        let input=find(&document,"#control");let form=find(&document,"#off");let select=find(&document,"#select");
+        assert_eq!(autocomplete_state(&document,input).field_name,"off");
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"");
+        assert_eq!(autocomplete_state(&document,select).field_name,"off");
+        document.set_attribute_ns(form,None,"autocomplete"," OFF ").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"on");
+        document.set_attribute_ns(form,None,"autocomplete","OFF").unwrap();
+        document.set_attribute_ns(input,None,"type","HiDdEn").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"");
+        document.set_attribute_ns(input,None,"autocomplete","on").unwrap();
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"");
+        document.set_attribute_ns(input,None,"type","unknown").unwrap();
+        assert_eq!(autocomplete_state(&document,input).idl_value(),"on");
+        document.set_attribute_ns(input,None,"autocomplete","invalid").unwrap();
+        document.set_attribute_ns(input,None,"form","on").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"on");
+        assert_eq!(autocomplete_state(&document,find(&document,"#text")).idl_value(),"home email");
+        document.remove_attribute_ns(input,None,"form").unwrap();
+        assert_eq!(autocomplete_state(&document,input).field_name,"off");
+    }
+    #[test]
+    fn specification_number_control_preferred_domain_uses_canonical_step_precision_without_enumeration(
+    ) {
+        let document=crate::html::parse("<input id=bounded type=number min=0.1 max=0.9 step=0.2><input id=any type=number min=0 max=9 step=any><input id=empty type=number min=9 max=0><input id=unbounded type=number><input id=extreme type=number min=1e308 max=1.7e308 step=1e308><input id=overflow type=number min=-1.7976931348623157e308 max=1.7976931348623157e308 step=1>",48).unwrap();
+        let find = |name| {
+            crate::selector::query_selector(&document, document.root(), name)
+                .unwrap()
+                .unwrap()
+        };
+        let mut values = Vec::new();
+        assert!(for_each_number_preferred_value(
+            &document,
+            find("#bounded"),
+            |value| values.push(String::from(value))
+        ));
+        assert_eq!(values, alloc::vec!["0.1", "0.9", "0.3", "0.7"]);
+        let mut extrema = Vec::new();
+        assert!(for_each_number_preferred_value(
+            &document,
+            find("#extreme"),
+            |value| extrema.push(String::from(value))
+        ));
+        assert!(
+            extrema.len() <= 4
+                && extrema
+                    .iter()
+                    .all(|value| parse_html_float(value).is_some_and(f64::is_finite))
+        );
+        for name in ["#any", "#empty", "#unbounded", "#overflow"] {
+            let mut visited = false;
+            assert!(!for_each_number_preferred_value(
+                &document,
+                find(name),
+                |_| visited = true
+            ));
+            assert!(!visited);
+        }
+    }
+    #[test]
+    fn specification_reflected_unsigned_ranges_separate_content_parsing_and_setter_bounds() {
+        assert_eq!(reflected_unsigned_long(None, 0), 0);
+        for invalid in ["", "-1", "2147483648", "999999999999999999999999999999999999"] {
+            assert_eq!(reflected_unsigned_long(Some(invalid), 7), 7, "{invalid:?}");
+        }
+        assert_eq!(reflected_unsigned_long(Some("-0"), 7), 0);
+        assert_eq!(reflected_unsigned_long(Some(" +0005suffix"), 0), 5);
+        assert_eq!(reflected_unsigned_long(Some("2147483647"), 0), i32::MAX as u32);
+        for (minimum, maximum, default) in [(0, 8, 0), (1, 1000, 1), (0, 65534, 1)] {
+            assert_eq!(reflected_clamped_unsigned_long(None, minimum, maximum, default), default);
+            for invalid in ["", "-", "+", "-1", "\u{00a0}7", "word"] {
+                assert_eq!(reflected_clamped_unsigned_long(Some(invalid), minimum, maximum, default), default, "{invalid:?}");
+            }
+            assert_eq!(reflected_clamped_unsigned_long(Some(" +0005suffix"), minimum, maximum, default), 5);
+            assert_eq!(reflected_clamped_unsigned_long(Some("-0"), minimum, maximum, default), minimum);
+            assert_eq!(reflected_clamped_unsigned_long(Some("999999999999999999999999999999999999"), minimum, maximum, default), maximum);
+            assert_eq!(reflected_unsigned_long_setter_value(maximum + 1, default), maximum + 1);
+            assert_eq!(reflected_unsigned_long_setter_value(0, default), 0);
+            assert_eq!(reflected_unsigned_long_setter_value(i32::MAX as u32, default), i32::MAX as u32);
+            assert_eq!(reflected_unsigned_long_setter_value(i32::MAX as u32 + 1, default), default);
+            assert_eq!(reflected_unsigned_long_setter_value(u32::MAX, default), default);
+        }
+    }
 
     #[test]
     fn implicit_submission_uses_default_button_or_single_blocking_input() {
@@ -4243,6 +4516,45 @@ mod tests {
             &filled
         ));
         assert!(crate::css::parse_selector_list("input:user-valid(x)", 0).is_err());
+    }
+
+    #[test]
+    fn specification_number_user_conversion_and_empty_api_bad_input_are_distinct() {
+        assert_eq!(number_user_value("1."), Some("1".into()));
+        assert_eq!(number_user_value("+1."), Some("1".into()));
+        assert_eq!(number_user_value("1.e2"), Some("100".into()));
+        assert_eq!(number_user_value("1.e"), None);
+        assert!(
+            number_user_text_allowed("1.e")
+                && number_user_text_allowed("-.")
+                && number_user_text_allowed("1e+")
+        );
+        assert!(
+            !number_user_text_allowed("1e-+1")
+                && !number_user_text_allowed("1e++1")
+                && !number_user_text_allowed("1.2.3")
+        );
+        assert_eq!(number_user_value("-"), None);
+        assert_eq!(number_user_value(""), Some(String::new()));
+        assert_eq!(sanitize_input_value("number", "1."), "");
+        struct User;
+        impl ValidityStateView for User {
+            fn value_override(&self, _: NodeId) -> Option<&str> {
+                Some("")
+            }
+            fn user_bad_input(&self, _: NodeId) -> bool {
+                true
+            }
+        }
+        let document =
+            crate::html::parse("<input id=n type=number required maxlength=1>", 64).unwrap();
+        let node = crate::selector::get_element_by_id(&document, document.root(), "n")
+            .unwrap()
+            .unwrap();
+        let validity = validity_with_view(&document, node, &User);
+        assert!(validity.bad_input && validity.value_missing && !validity.too_long);
+        let script = validity_with_value(&document, node, Some(""), "");
+        assert!(script.value_missing && !script.bad_input);
     }
 
     #[test]
@@ -4812,6 +5124,46 @@ mod tests {
             Some(InputValueMode::Value)
         );
         assert_eq!(input_value_mode(&xml_document, foreign_input), None);
+    }
+
+    #[test]
+    fn form_algorithms_distinguish_qualified_names_from_literal_colons() {
+        fn add(document: &mut Document, parent: NodeId, name: &str, literal: bool) -> NodeId {
+            let node = if literal {
+                document.create_unprefixed_element(Namespace::Html, Name::new(name), Vec::new())
+            } else {
+                document.create(NodeKind::Element { namespace: Namespace::Html, name: Name::new(name), attributes: Vec::new() })
+            }.unwrap();
+            document.append(parent, node).unwrap();
+            node
+        }
+        let mut document = Document::new(64);
+        let root = document.root();
+        let container = add(&mut document, root, "div", false);
+        let form = add(&mut document, container, "p:form", false);
+        let input = add(&mut document, form, "p:input", false);
+        let literal_input = add(&mut document, form, "p:input", true);
+        assert_eq!(form_owner(&document, input), Some(form));
+        assert_eq!(input_value_mode(&document, input), Some(InputValueMode::Value));
+        assert_eq!(form_owner(&document, literal_input), None);
+        assert_eq!(input_value_mode(&document, literal_input), None);
+        assert_eq!(html_element_local_name(&document, literal_input), Some("p:input"));
+        let literal_form = add(&mut document, container, "p:form", true);
+        let unowned = add(&mut document, literal_form, "input", false);
+        assert_eq!(form_owner(&document, unowned), None);
+        let select = add(&mut document, form, "p:select", false);
+        let option = add(&mut document, select, "p:option", false);
+        add(&mut document, select, "p:option", true);
+        add(&mut document, select, "p:option", false);
+        assert_eq!(select_option_count(&document, select).unwrap(), 2);
+        assert_eq!(option_select(&document, option).unwrap(), Some(select));
+        let literal_script = add(&mut document, option, "p:script", true);
+        let visible = document.create(NodeKind::Text(" visible ".into())).unwrap();
+        document.append(literal_script, visible).unwrap();
+        let script = add(&mut document, option, "p:script", false);
+        let hidden = document.create(NodeKind::Text(" hidden ".into())).unwrap();
+        document.append(script, hidden).unwrap();
+        assert_eq!(option_text(&document, option).unwrap(), "visible");
     }
 
     #[test]

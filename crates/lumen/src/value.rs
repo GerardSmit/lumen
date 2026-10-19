@@ -2317,9 +2317,8 @@ pub struct Property {
 }
 
 /// The boxed getter/setter pair of an accessor property, shared copy-on-write by the clones of
-/// one property: a closure that copies its function's map template bumps `owners` instead of
-/// allocating (sloppy functions' own `arguments` / `caller` accessors are in every such
-/// template). Each owner holds its own strong reference to `get` / `set` (the box's values
+/// one property: a closure that copies its realm's legacy descriptor bumps `owners` instead of
+/// allocating a new accessor box. Each owner holds its own strong reference to `get` / `set` (the box's values
 /// stand for `owners` references), so the cycle collector, which counts one edge per property
 /// (`gc_edges`), sees exactly the references that exist.
 #[repr(align(16))]

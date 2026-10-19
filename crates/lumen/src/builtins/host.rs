@@ -167,13 +167,10 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         let (bcast_tx, bcast_rx) = std::sync::mpsc::channel();
         let report_tx = i.agent.as_ref().unwrap().report_tx.clone();
         i.agent.as_mut().unwrap().agent_broadcast_txs.push(bcast_tx);
-        let spawned = std::thread::Builder::new()
-            .stack_size(crate::THREAD_STACK_SIZE)
-            .spawn(move || {
-                crate::set_thread_stack_size(crate::THREAD_STACK_SIZE);
-                let mut eng = crate::Engine::new();
-                eng.run_as_agent(&src, bcast_rx, report_tx);
-            });
+        let spawned = crate::spawn_engine_thread("lumen-agent", 0, move || {
+            let mut eng = crate::Engine::new();
+            eng.run_as_agent(&src, bcast_rx, report_tx);
+        });
         if spawned.is_err() {
             return Err(i.make_error("Error", "$262.agent.start: cannot spawn a thread"));
         }

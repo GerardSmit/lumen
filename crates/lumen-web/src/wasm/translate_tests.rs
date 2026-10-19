@@ -497,7 +497,9 @@ fn differential(bytes: &[u8], cases: &[(u32, Vec<Val>)]) {
                 env.wr(cell, val_bits(store.globals[ga].get()));
             }
 
+            #[cfg(target_arch = "x86_64")]
             let init_mem = env.memory().to_vec();
+            #[cfg(target_arch = "x86_64")]
             let init_cells: Vec<u64> = (0..instance.global_addrs.len())
                 .map(|i| env.rd(CELLS + 8 * i as u64))
                 .collect();

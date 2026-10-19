@@ -193,15 +193,7 @@ pub fn needs_join_fixup(a: &str, b: &str) -> bool {
 /// Canonicalize any adjacent smuggled high+low surrogate pairs inside `s` (needed after building
 /// a string from independently produced pieces, e.g. `join` or `repeat`).
 pub fn canonicalize(s: &str) -> Option<String> {
-    let mut prev_high = false;
-    for c in s.chars() {
-        if prev_high && smuggled_low(c).is_some() {
-            // Slow path: rebuild through the unit round-trip.
-            return Some(from_units(&units(s)));
-        }
-        prev_high = smuggled_high(c).is_some();
-    }
-    None
+    lumen_common::smuggle::canonicalize_utf16(s)
 }
 
 /// The code points of `s`, with lone surrogates as their surrogate values (paired smuggled

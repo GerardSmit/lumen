@@ -116,6 +116,7 @@ pub fn extension() -> Extension {
         } else {
             Some(JS_GLUE_AOT)
         },
+        lazy_globals: &[],
     }
 }
 
@@ -437,10 +438,14 @@ mod node_bindings {
         ctx.set_multiple_resolves_hook(hook);
     }
 
-    /// `__node.native()`: a fresh object holding every `native` op (called once by preamble.js).
+    /// `__node.native()`: a fresh object holding every `native` op (called once by preamble.js),
+    /// with the URL string helpers (`domainToASCII`, `format`, ...) under `url`.
     #[op]
     pub fn native(ctx: &mut Ctx) -> Result<Value, Value> {
-        ctx.module_object::<crate::native::Module>()
+        let native = ctx.module_object::<crate::native::Module>()?;
+        let url = ctx.module_object::<lumen_host::url::natives::Module>()?;
+        ctx.member_set(&native, "url", url)?;
+        Ok(native)
     }
 
     #[op(name = "heapObjectCount")]

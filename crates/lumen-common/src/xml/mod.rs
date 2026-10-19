@@ -10,6 +10,8 @@ mod chars;
 mod dtd;
 mod parser;
 mod scan;
+mod pseudo_attributes;
+pub use pseudo_attributes::{parse_pseudo_attributes, PseudoAttribute, PseudoAttributeError};
 
 pub use chars::{is_name, is_name_char, is_name_start, is_xml_char};
 pub use parser::{Parser, ParserKind};
@@ -225,6 +227,7 @@ pub struct Shared {
     pub(crate) use_foreign_dtd: Cell<bool>,
     pub(crate) reparse_deferral: Cell<bool>,
     pub(crate) started: Cell<bool>,
+    pub(crate) suspended: Cell<bool>,
     pub(crate) account: Rc<Account>,
     pub(crate) error_pos: Cell<Position>,
     pub(crate) error_code: Cell<u32>,
@@ -254,6 +257,7 @@ impl Shared {
             use_foreign_dtd: Cell::new(false),
             reparse_deferral: Cell::new(true),
             started: Cell::new(false),
+            suspended: Cell::new(false),
             account,
             error_pos: Cell::new(Position { line: 1, column: 0, byte: 0 }),
             error_code: Cell::new(0),
@@ -268,6 +272,10 @@ impl Shared {
     pub fn position(&self) -> Position {
         self.pos.get()
     }
+
+    /// Pause after the current complete token without turning suspension into
+    /// a sticky parse error. Its unread input and namespace stack remain live.
+    pub fn suspend(&self) { self.suspended.set(true); }
 
     /// Where the last error occurred.
     pub fn error_position(&self) -> Position {

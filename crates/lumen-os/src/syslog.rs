@@ -60,7 +60,7 @@ pub fn setlogmask(mask: i32) -> i32 {
 
 /// The `syslog` module's `LOG_*` constants.
 pub fn constants() -> Vec<(&'static str, i64)> {
-    let mut v: Vec<(&'static str, i64)> = vec![
+    let base: Vec<(&'static str, i64)> = vec![
         ("LOG_EMERG", 0),
         ("LOG_ALERT", 1),
         ("LOG_CRIT", 2),
@@ -95,6 +95,10 @@ pub fn constants() -> Vec<(&'static str, i64)> {
         ("LOG_LOCAL6", 176),
         ("LOG_LOCAL7", 184),
     ];
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    let mut v = base;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+    let v = base;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     v.push(("LOG_FTP", 88));
     #[cfg(any(target_os = "macos", target_os = "ios"))]

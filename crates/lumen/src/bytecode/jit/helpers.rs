@@ -987,6 +987,34 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
         let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
         return fail(f, e);
     }
+    // Computed reads that miss the inline element paths (notably native
+    // indexed wrappers and author proxies) still use ordinary [[Get]]. They
+    // need neither a VM operand vector nor a single-op VM frame. Numeric keys
+    // cannot run author code during ToPropertyKey; other keys stay on the VM
+    // path, including their conversion and exception ordering.
+    let read = match chunk.ops[pc] {
+        Op::GetElem if depth == base + 2 => Some(((*f).stack.add(base), base + 1, true)),
+        Op::GetElemLocal(slot) if depth == base + 1 && (slot as usize) < chunk.n_slots =>
+            Some(((*f).slots.add(slot as usize), base, false)),
+        _ => None,
+    };
+    if let Some((object, key_at, consume)) = read {
+        if matches!(&*(*f).stack.add(key_at), Value::Num(_)) {
+            let i = &mut *(*f).interp;
+            let object_value = (*object).clone();
+            let key = std::ptr::replace((*f).stack.add(key_at), Value::Undefined);
+            let result = if matches!(object_value, Value::Undefined | Value::Null) {
+                Err(i.throw("TypeError", i.null_read_message(&object_value, Some(&key))))
+            } else {
+                i.to_property_key(&key).and_then(|key| i.get_member(&object_value, &key))
+            };
+            if consume { *object = Value::Undefined; }
+            return match result {
+                Ok(value) => { std::ptr::write((*f).stack.add(base), value); STATUS_OK }
+                Err(error) => fail(f, error),
+            };
+        }
+    }
     if let (Some(&Op::ApplyArgs(s, tag)), true) = (chunk.ops.get(pc), depth == base + 3) {
         if let Some(st) = apply_args(f, chunk, pc, base, s, tag) {
             return st;
@@ -1418,7 +1446,7 @@ unsafe fn unwrap_adaptor(
     }
     let take = |k: usize| std::ptr::replace(args.add(k), Value::Undefined);
     match &b.call {
-        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_call as usize => {
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_call as crate::value::NativeFn as usize => {
             if argc > ARGBUF + 1 || !this.is_callable() {
                 return None;
             }
@@ -1428,7 +1456,7 @@ unsafe fn unwrap_adaptor(
             }
             Some((this.clone(), t))
         }
-        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_apply as usize => {
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize => {
             if argc > 2 || !this.is_callable() {
                 return None;
             }
@@ -1620,7 +1648,7 @@ unsafe fn apply_args(
     let intrinsic = match &*st.add(base + 1) {
         Value::Obj(o) => o.try_borrow().is_ok_and(|b| {
             matches!(&b.call, crate::value::Callable::Native(fp)
-                if *fp as usize == crate::builtins::nf_function_apply as usize)
+                if *fp as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize)
         }),
         _ => false,
     };

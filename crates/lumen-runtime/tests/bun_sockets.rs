@@ -28,7 +28,19 @@ impl Captured {
     }
 }
 
+/// Runs on the stack real engine hosts use: the lazily evaluated node glue nests deeply enough in
+/// a debug build to overflow a default 2 MiB test thread.
 fn run(source: &str) -> Vec<String> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(move || run_on_this_thread(&source))
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn run_on_this_thread(source: &str) -> Vec<String> {
     let mut runtime = Runtime::new();
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {

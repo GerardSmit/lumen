@@ -23,6 +23,17 @@ pub enum ParserKind {
     ExternalSubset,
 }
 
+struct ReplacementFrame {
+    text: Rc<str>,
+    offset: usize,
+    subset: bool,
+    entity: String,
+    floor: usize,
+    cdata: bool,
+    cond: usize,
+    level: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Prolog,
@@ -84,7 +95,7 @@ fn off(t: &str, sub: &str) -> usize {
     (sub.as_ptr() as usize).wrapping_sub(t.as_ptr() as usize)
 }
 
-fn predefined(name: &str) -> Option<char> {
+pub(super) fn predefined(name: &str) -> Option<char> {
     match name {
         "lt" => Some('<'),
         "gt" => Some('>'),
@@ -145,6 +156,8 @@ pub struct Parser {
     err_off: Option<usize>,
     error: Option<u32>,
     finished: bool,
+    final_input: bool,
+    replacements: Vec<ReplacementFrame>,
     first_chunk: bool,
 }
 
@@ -214,6 +227,8 @@ impl Parser {
             err_off: None,
             error: None,
             finished: false,
+            final_input: false,
+            replacements: Vec::new(),
             first_chunk: true,
         }
     }
@@ -239,6 +254,9 @@ impl Parser {
     /// Feeds `data`; `is_final` marks the end of the input. After an error every later call
     /// reports the same error; after a successful final call, `FINISHED`.
     pub fn parse(&mut self, h: &mut dyn Handler, data: &[u8], is_final: bool) -> Result<(), XmlError> {
+        if self.shared.suspended.get() {
+            return Err(XmlError { code: err::SUSPENDED });
+        }
         if let Some(code) = self.error {
             return Err(XmlError { code });
         }
@@ -253,9 +271,10 @@ impl Parser {
             }
         }
         self.raw.extend_from_slice(data);
+        self.final_input |= is_final;
         match self.parse_inner(h, is_final) {
             Ok(()) => {
-                if is_final {
+                if is_final && !self.shared.suspended.get() {
                     self.finished = true;
                 }
                 Ok(())
@@ -270,10 +289,30 @@ impl Parser {
         }
     }
 
+    pub fn is_suspended(&self) -> bool { self.shared.suspended.get() }
+
+    pub fn resume(&mut self, h: &mut dyn Handler) -> Result<(), XmlError> {
+        if !self.shared.suspended.get() {
+            return Err(XmlError { code: err::NOT_SUSPENDED });
+        }
+        self.shared.suspended.set(false);
+        while let Some(frame) = self.replacements.pop() {
+            if let Err(code) = self.run_replacement(h, frame) {
+                self.error = Some(code);
+                self.shared.error_code.set(code);
+                self.shared.error_pos.set(self.shared.pos.get());
+                return Err(XmlError { code });
+            }
+            if self.shared.suspended.get() { return Ok(()); }
+        }
+        self.parse(h, &[], self.final_input)
+    }
+
     fn parse_inner(&mut self, h: &mut dyn Handler, fin: bool) -> Res<()> {
         loop {
             let grew = self.decode(h, fin)?;
             self.tokenize(h, fin)?;
+            if self.shared.suspended.get() { break; }
             if self.resolved {
                 self.resolved = false;
                 continue;
@@ -506,6 +545,7 @@ impl Parser {
 
     fn run(&mut self, h: &mut dyn Handler, t: &str, i: &mut usize, fin: bool) -> Res<()> {
         while *i < t.len() {
+            if self.shared.suspended.get() { return Ok(()); }
             let step = match self.phase {
                 Phase::Prolog | Phase::AfterDoctype => self.prolog_step(h, t, i, fin)?,
                 Phase::Subset => self.subset_step(h, t, i, fin, false)?,
@@ -516,7 +556,7 @@ impl Parser {
                 return Ok(());
             }
         }
-        if fin && self.decl == DeclState::Done && (self.rpos >= self.raw.len() || self.partial_char) {
+        if !self.shared.suspended.get() && fin && self.decl == DeclState::Done && (self.rpos >= self.raw.len() || self.partial_char) {
             return self.at_end();
         }
         Ok(())
@@ -1304,8 +1344,8 @@ impl Parser {
             Some(body) => {
                 self.account_indirect(body.len())?;
                 self.set_param_open(name, true);
-                let r = self.run_nested(h, &body, true);
-                self.set_param_open(name, false);
+                let r = self.run_nested(h, body, true, name);
+                if !self.shared.suspended.get() { self.set_param_open(name, false); }
                 r
             }
             None => {
@@ -1329,20 +1369,30 @@ impl Parser {
     }
 
     /// Parses entity replacement text (`subset` selects markup declarations instead of content).
-    fn run_nested(&mut self, h: &mut dyn Handler, text: &str, subset: bool) -> Res<()> {
+    fn run_nested(&mut self, h: &mut dyn Handler, text: Rc<str>, subset: bool, entity: &str) -> Res<()> {
         if self.nested >= MAX_NESTING {
             return Err(err::NO_MEMORY);
         }
-        self.nested += 1;
+        self.run_replacement(h, ReplacementFrame {
+            text, offset: 0, subset, entity: entity.to_owned(), floor: self.tags.len(),
+            cdata: false, cond: self.cond_depth, level: self.nested + 1,
+        })
+    }
+
+    fn run_replacement(&mut self, h: &mut dyn Handler, mut frame: ReplacementFrame) -> Res<()> {
         let saved_floor = self.tag_floor;
         let saved_cdata = self.in_cdata;
-        let saved_cond = self.cond_depth;
-        self.tag_floor = self.tags.len();
-        self.in_cdata = false;
-        let mut i = 0usize;
+        let saved_nested = self.nested;
+        self.nested = frame.level;
+        self.tag_floor = frame.floor;
+        self.in_cdata = frame.cdata;
+        let text = frame.text.clone();
+        let subset = frame.subset;
+        let mut i = frame.offset;
         let mut result = Ok(());
         while i < text.len() {
-            let step = if subset { self.subset_step(h, text, &mut i, true, true) } else { self.content_step(h, text, &mut i, true) };
+            if self.shared.suspended.get() { break; }
+            let step = if subset { self.subset_step(h, &text, &mut i, true, true) } else { self.content_step(h, &text, &mut i, true) };
             match step {
                 Ok(Step::Go) => {}
                 Ok(Step::Stuck) => {
@@ -1355,18 +1405,29 @@ impl Parser {
                 }
             }
         }
-        if result.is_ok() {
+        let suspended = result.is_ok() && self.shared.suspended.get();
+        if result.is_ok() && !suspended {
             if self.in_cdata {
                 result = Err(err::UNCLOSED_CDATA_SECTION);
-            } else if subset && self.cond_depth != saved_cond {
+            } else if subset && self.cond_depth != frame.cond {
                 result = Err(err::INCOMPLETE_PE);
             } else if !subset && self.tags.len() != self.tag_floor {
                 result = Err(err::ASYNC_ENTITY);
             }
         }
         self.tag_floor = saved_floor;
+        frame.cdata = self.in_cdata;
         self.in_cdata = saved_cdata;
-        self.nested -= 1;
+        self.nested = saved_nested;
+        if suspended {
+            frame.offset = i;
+            let index = self.replacements.partition_point(|pending| pending.level < frame.level);
+            self.replacements.insert(index, frame);
+        } else if subset {
+            self.set_param_open(&frame.entity, false);
+        } else {
+            self.set_general_open(&frame.entity, false);
+        }
         result
     }
 
@@ -1558,8 +1619,8 @@ impl Parser {
                 }
                 self.account_indirect(body.len())?;
                 self.set_general_open(name, true);
-                let r = self.run_nested(h, &body, false);
-                self.set_general_open(name, false);
+                let r = self.run_nested(h, body, false, name);
+                if !self.shared.suspended.get() { self.set_general_open(name, false); }
                 r
             }
             None => {

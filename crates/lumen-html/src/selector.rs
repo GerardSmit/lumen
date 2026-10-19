@@ -270,7 +270,7 @@ pub fn native_identity_parent(document: &Document, id: NodeId) -> Result<Option<
             return Ok(Some(*owner));
         }
     }
-    document.host_including_parent(id)
+    Ok(document.host_including_parent(id)?.filter(|parent| parent.document_id() == document.root().document_id()))
 }
 
 /// Find the root of the native identity component containing `id`.
@@ -327,7 +327,7 @@ fn native_identity_first_child(document: &Document, id: NodeId) -> Result<Option
         return Ok(Some(shadow));
     }
     if let Some(content) = document.template_content(id)? {
-        return Ok(Some(content));
+        if content.document_id() == document.root().document_id() { return Ok(Some(content)); }
     }
     document.first_child(id)
 }

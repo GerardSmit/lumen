@@ -79,6 +79,7 @@ pub(crate) struct Entry {
     pub(crate) node: NodeId,
     pub(crate) kind: Kind,
     pub(crate) restore_focus: Option<NodeId>,
+    pub(crate) popover_trigger: Option<NodeId>,
     /// Transient guard while a popover's synchronous beforetoggle closing
     /// event runs. It lives on the existing bounded top-layer entry rather
     /// than in a second per-node registry.
@@ -629,7 +630,7 @@ fn auto_popovers_to_hide_until(
     nodes
         .try_reserve(count.saturating_sub(first_to_hide))
         .map_err(|_| StateError::ResourceLimit)?;
-    for (index, (node, kind, _)) in document
+    for (index, (node, _, _)) in document
         .top_layer_entries()
         .filter(|(_, kind, _)| *kind == Kind::Popover(PopoverMode::Auto))
         .enumerate()

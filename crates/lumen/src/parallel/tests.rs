@@ -18,6 +18,61 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
     }
 }
 
+const ABORT_GLOBALS: &str = "(function(){
+    class AbortSignal {
+        constructor() { this.aborted = false; this.reason = undefined; this._listeners = []; }
+        addEventListener(type, fn, options) { this._listeners.push({ type, fn, once: !!(options && options.once) }); }
+        removeEventListener(type, fn) { this._listeners = this._listeners.filter(entry => entry.fn !== fn); }
+        static abort(reason) { const controller = new AbortController(); controller.abort(reason); return controller.signal; }
+    }
+    class AbortController {
+        constructor() { this.signal = new AbortSignal(); }
+        abort(reason) {
+            const signal = this.signal;
+            if (signal.aborted) return;
+            signal.aborted = true;
+            signal.reason = reason === undefined ? new Error('aborted') : reason;
+            for (const entry of signal._listeners.slice()) {
+                if (entry.once) signal._listeners = signal._listeners.filter(other => other !== entry);
+                entry.fn.call(signal, { type: 'abort', target: signal });
+            }
+        }
+    }
+    Object.assign(globalThis, { AbortSignal, AbortController });
+})();";
+
+fn install_abort_globals(engine: &mut Engine) {
+    evaluate(engine, ABORT_GLOBALS);
+}
+
+fn engine_with_abort() -> Engine {
+    let mut engine = Engine::new();
+    install_abort_globals(&mut engine);
+    engine
+}
+
+fn host() -> std::sync::Arc<super::ThreadHost> {
+    std::sync::Arc::new(super::ThreadHost::with_configure(install_abort_globals))
+}
+
+#[test]
+fn parallel_works_without_host_abort_classes() {
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::default()),
+    );
+    assert_eq!(
+        evaluate(&mut engine, "typeof Lumen.parallel.signal"),
+        "undefined"
+    );
+    evaluate(
+        &mut engine,
+        "var answer;Lumen.parallel.run(()=>'signal:'+typeof Lumen.parallel.signal,[]).then(x=>answer=x);",
+    );
+    assert_eq!(await_global(&mut engine, "answer"), "signal:undefined");
+}
+
 fn await_global(engine: &mut Engine, name: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -204,10 +259,10 @@ fn checkpoint_reserves_before_reentrant_getters() {
 
 #[test]
 fn signals_close_iteration_argument_shapes_and_error_classes() {
-    let mut engine = Engine::new();
+    let mut engine = engine_with_abort();
     super::install(
         &mut engine,
-        std::sync::Arc::new(super::ThreadHost::default()),
+        host(),
     );
     assert_eq!(
         evaluate(
@@ -315,13 +370,27 @@ fn installed_web_abort_globals_keep_their_identity() {
     evaluate(&mut engine, "globalThis.performance={now:()=>Date.now()};");
     evaluate(
         &mut engine,
-        concat!(
-            "(function(){\n",
-            include_str!("../../../lumen-web/src/js/preamble.js"),
-            "\n",
-            include_str!("../../../lumen-web/src/js/events.js"),
-            "\n})();"
-        ),
+        "(function(){
+            class EventTarget {
+                constructor() { this.listeners = []; }
+                addEventListener(type, fn) { this.listeners.push([type, fn]); }
+                removeEventListener(type, fn) { this.listeners = this.listeners.filter(entry => entry[1] !== fn); }
+                dispatchEvent(event) { for (const [type, fn] of this.listeners.slice()) if (type === event.type) fn.call(this, event); }
+            }
+            class AbortSignal extends EventTarget {
+                constructor() { super(); this.aborted = false; this.reason = undefined; }
+            }
+            class AbortController {
+                constructor() { this.signal = new AbortSignal(); }
+                abort(reason) {
+                    if (this.signal.aborted) return;
+                    this.signal.aborted = true;
+                    this.signal.reason = reason;
+                    this.signal.dispatchEvent({ type: 'abort' });
+                }
+            }
+            Object.assign(globalThis, { EventTarget, AbortSignal, AbortController });
+        })();",
     );
     evaluate(
         &mut engine,
@@ -347,11 +416,8 @@ fn installed_web_abort_globals_keep_their_identity() {
 
 #[test]
 fn host_cancellation_delivers_a_stable_code_and_worker_signal() {
-    let mut engine = Engine::new();
-    super::install(
-        &mut engine,
-        std::sync::Arc::new(super::ThreadHost::default()),
-    );
+    let mut engine = engine_with_abort();
+    super::install(&mut engine, host());
     evaluate(
         &mut engine,
         "var ready,code,flushed;var task=Lumen.parallel.spawn(port=>new Promise(resolve=>{Lumen.signal.addEventListener('abort',()=>{port.postMessage(port.signal.reason.code);resolve();});port.postMessage(true);}));task.receive().then(x=>ready=x);task.result.catch(e=>code=e.name+':'+e.code);",
@@ -490,11 +556,8 @@ fn module_exports_and_realm_shutdown() {
         _ => panic!("host loader spoofed a reserved module without a parallel host"),
     }
     drop(unavailable);
-    let mut engine = Engine::new();
-    super::install(
-        &mut engine,
-        std::sync::Arc::new(super::ThreadHost::default()),
-    );
+    let mut engine = engine_with_abort();
+    super::install(&mut engine, host());
     match engine.eval_module("import {run,spawn} from 'lumen:parallel';globalThis.exportsMatch=run===Lumen.parallel.run&&spawn===Lumen.parallel.spawn;", "main", |_, _| None).unwrap() {
         Completion::Value(_) => {},
         Completion::Throw {name,message} => panic!("{name}: {message}"),
@@ -584,11 +647,8 @@ fn parent_drop_interrupts_a_child_already_in_a_grace_period() {
 
 #[test]
 fn tasks_copy_helpers_and_resolve_worker_builtins() {
-    let mut engine = Engine::new();
-    super::install(
-        &mut engine,
-        std::sync::Arc::new(super::ThreadHost::default()),
-    );
+    let mut engine = engine_with_abort();
+    super::install(&mut engine, host());
     evaluate(
         &mut engine,
         "var answer;Lumen.parallel.run((even,odd)=>JSON.stringify([even(8,odd),Math.max(1,42),Lumen.parallel.signal.aborted]),[function even(n,odd){return n===0?true:odd(n-1,even);},function odd(n,even){return n===0?false:even(n-1,odd);}]).then(x=>answer=x,e=>answer=e.name+':'+e.message);",
@@ -1060,4 +1120,97 @@ fn buffer_flags_and_all_typed_array_kinds_are_preserved() {
         evaluate(&mut receiver, "root.resizable.resize(16);");
         assert_eq!(evaluate(&mut receiver, "root.track.length===16 && root.track[0]===42"), "true");
     }).join().unwrap();
+}
+
+#[test]
+fn idle_thread_host_worker_does_not_spin() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let turns = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = turns.clone();
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::with_turn(
+            |_, _| {},
+            move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+        )),
+    );
+    evaluate(
+        &mut engine,
+        "var ready;var task=Lumen.parallel.spawn(port=>{port.postMessage('ready');return new Promise(()=>{});});task.receive().then(x=>ready=x);task.result.catch(()=>{});",
+    );
+    assert_eq!(await_global(&mut engine, "ready"), "ready");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let before = turns.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let idle_turns = turns.load(Ordering::Relaxed) - before;
+    assert!(idle_turns <= 2, "idle worker ran {idle_turns} turns in 200 ms");
+    evaluate(&mut engine, "task.terminate();");
+}
+
+#[test]
+fn thread_host_worker_turns_on_the_deadline_the_turn_returns() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let turns = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = turns.clone();
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::with_turn(
+            |_, _| {},
+            move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                ))
+            },
+        )),
+    );
+    evaluate(
+        &mut engine,
+        "var ready;var task=Lumen.parallel.spawn(port=>{port.postMessage('ready');return new Promise(()=>{});});task.receive().then(x=>ready=x);task.result.catch(()=>{});",
+    );
+    assert_eq!(await_global(&mut engine, "ready"), "ready");
+    let before = turns.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let ticks = turns.load(Ordering::Relaxed) - before;
+    assert!((4..=40).contains(&ticks), "{ticks} turns in 250 ms at a 20 ms deadline");
+    evaluate(&mut engine, "task.terminate();");
+}
+
+#[test]
+fn interrupt_after_fires_from_the_scheduler_timer() {
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::default()),
+    );
+    evaluate(
+        &mut engine,
+        "var entered;var cancelled;var task=Lumen.parallel.spawn(port=>{port.postMessage('entered');while(true){}},[],{grace:40});task.receive().then(x=>entered=x);task.result.catch(e=>cancelled=String(e));",
+    );
+    assert_eq!(await_global(&mut engine, "entered"), "entered");
+    let started = std::time::Instant::now();
+    evaluate(&mut engine, "task.terminate('stop');");
+    await_global(&mut engine, "cancelled");
+    // The result rejects at once; the spinning worker only stops when the grace timer hard-stops it.
+    while engine
+        .interp
+        .host_mut::<super::api::Realm>()
+        .unwrap()
+        .task_count()
+        != 0
+    {
+        engine.ctx().poll_async();
+        while engine.run_one_job() {}
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "worker failed to stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
 }

@@ -240,6 +240,7 @@ pub fn package(
     if icon.is_some() && !pe {
         return Err("standalone --icon requires a Windows PE stub".into());
     }
+    #[cfg(windows)]
     let icon = icon
         .map(|path| std::fs::read(path).map_err(|e| format!("{}: {e}", path.display())))
         .transpose()?;

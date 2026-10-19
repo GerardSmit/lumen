@@ -28,12 +28,12 @@ fn publish_slot(
 
 pub(crate) fn address(id: u32) -> Option<usize> {
     if id == crate::native_ops::SHAPE_GUARD {
-        return Some(shape_guard as usize);
+        return Some(shape_guard as *const () as usize);
     }
     if id == crate::native_ops::SHAPE_GET_PROP {
-        return Some(shape_get_prop as usize);
+        return Some(shape_get_prop as *const () as usize);
     }
-    let index = id.checked_sub(0x1000)?;
+    let index = id.checked_sub(crate::native_ops::OP_BASE)?;
     let helpers: &[unsafe extern "C" fn(*mut NativeFrame, u32, u32, u32, u32, u32, u32) -> u32] =
         &include!("op_addresses.rs");
     helpers.get(index as usize).map(|helper| *helper as usize)

@@ -37,14 +37,15 @@ pub(super) fn is_regex_syntax_char(c: char) -> bool {
     )
 }
 
-pub(super) fn regex_ident_start(c: char) -> bool {
+/// IdentifierStart for a capture-group name (ID_Start ∪ {$, _}); also URLPattern's name start.
+pub fn regex_ident_start(c: char) -> bool {
     if c.is_ascii() {
         return c == '$' || c == '_' || c.is_ascii_alphabetic();
     }
     uprop_has("ID_Start", c)
 }
-/// IdentifierPart for a capture-group name (ID_Continue ∪ {$, _, ZWNJ, ZWJ}).
-pub(super) fn regex_ident_part(c: char) -> bool {
+/// IdentifierPart for a capture-group name (ID_Continue ∪ {$, _, ZWNJ, ZWJ}); also URLPattern's name part.
+pub fn regex_ident_part(c: char) -> bool {
     if c.is_ascii() {
         return c == '$' || c == '_' || c.is_ascii_alphanumeric();
     }

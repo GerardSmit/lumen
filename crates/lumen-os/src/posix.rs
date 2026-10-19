@@ -330,7 +330,7 @@ pub fn statvfs_flags() -> Vec<(&'static str, i64)> {
     v
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 fn sched_param(priority: i32) -> libc::sched_param {
     // SAFETY: sched_param is plain integers (some libcs add private padding).
     let mut p: libc::sched_param = unsafe { std::mem::zeroed() };

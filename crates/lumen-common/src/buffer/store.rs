@@ -199,6 +199,20 @@ impl ByteStore {
         }
     }
 
+    /// A read-only, fixed-length view of `range` of shared bytes, without copying them. The
+    /// bytes are immutable for as long as any view exists, so nothing can write through it.
+    ///
+    /// # Panics
+    /// When `range` is not within `bytes`.
+    pub fn shared_readonly(bytes: Rc<Vec<u8>>, range: std::ops::Range<usize>) -> ByteStore {
+        let window = &bytes[range];
+        let (ptr, len) = (window.as_ptr() as *mut u8, window.len());
+        // SAFETY: `ptr..ptr + len` lies inside the `Vec` that `bytes` keeps alive and unchanged
+        // (an `Rc<Vec<u8>>` is never handed out mutably), and the READONLY flag set below stops
+        // every write through the store.
+        unsafe { ByteStore::external(ptr, len, bytes) }.readonly()
+    }
+
     /// Make the store resizable up to `max` bytes (at least its current length).
     pub fn with_max_len(self, max: usize) -> ByteStore {
         self.max_len.set(max.max(self.len()));

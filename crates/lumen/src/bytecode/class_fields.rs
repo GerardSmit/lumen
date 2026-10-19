@@ -205,23 +205,31 @@ pub(crate) fn construct_class(
         return None;
     };
     let (ic, derived) = class_ctor(i, callee, true)?;
-    let proto = if Gc::ptr_eq(c, nt) {
-        own_prototype(c)?
+    let proto = if derived {
+        None
     } else {
-        if (!i.proxies.is_empty() && i.proxies.contains_key(&(Gc::as_ptr(nt) as usize)))
-            || !matches!(nt.borrow().call, Callable::User(_))
-        {
-            return None;
-        }
-        own_prototype(nt)?
+        let proto = if Gc::ptr_eq(c, nt) {
+            own_prototype(c)?
+        } else {
+            if (!i.proxies.is_empty() && i.proxies.contains_key(&(Gc::as_ptr(nt) as usize)))
+                || !matches!(nt.borrow().call, Callable::User(_))
+            {
+                return None;
+            }
+            own_prototype(nt)?
+        };
+        Some(match proto {
+            Value::Obj(p) => p,
+            // (Single realm: GetFunctionRealm is the current one.)
+            _ => i.object_proto.clone(),
+        })
     };
-    let proto = match proto {
-        Value::Obj(p) => p,
-        // (Single realm: GetFunctionRealm is the current one.)
-        _ => i.object_proto.clone(),
+    let capacity = if derived {
+        0
+    } else {
+        i.learned_construct_capacity(c)
     };
-    let capacity = i.learned_construct_capacity(c);
-    let inst = crate::value::Object::new_with_capacity(Some(proto), capacity);
+    let inst = crate::value::Object::new_with_capacity(proto, capacity);
     let this = Value::Obj(inst.clone());
     if !derived {
         if let Err(e) = i.init_instance_fields(callee, &this) {
@@ -238,7 +246,12 @@ pub(crate) fn construct_class(
         derived,
     );
     Some(r.map(|v| {
-        i.observe_construct_capacity(c, &inst);
+        let observed = if derived {
+            v.as_obj().unwrap_or(&inst)
+        } else {
+            &inst
+        };
+        i.observe_construct_capacity(c, observed);
         match v {
             Value::Obj(_) => v,
             _ => this,

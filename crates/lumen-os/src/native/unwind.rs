@@ -1,7 +1,6 @@
-use lumen_common::aot::{
-    native_data::FunctionEntry,
-    native_unwind::{self, Record},
-};
+#[cfg(any(unix, windows))]
+use lumen_common::aot::native_unwind;
+use lumen_common::aot::{native_data::FunctionEntry, native_unwind::Record};
 use lumen_common::target::Arch;
 
 pub(super) struct Registration {

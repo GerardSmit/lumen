@@ -4,6 +4,10 @@ use super::*;
 use lumen_common::json;
 use std::borrow::Cow;
 
+pub(super) fn parse_module_default(i:&mut Interp,text:&str)->Result<Value,Value> {
+    json::Parser::new(text,PARSE).document(&mut JsSink::new(i,text))
+}
+
 pub(super) fn install_json(it: &mut Interp) {
     let j = it.new_object();
     it.def_method(&j, "stringify", 3, |i, _t, args| {

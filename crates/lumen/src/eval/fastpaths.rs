@@ -136,6 +136,39 @@ pub(crate) struct LangCaches {
     pub(crate) array_cb: crate::bytecode::inline_callback::CbCache,
 }
 
+impl LangCaches {
+    pub(crate) fn count_intrinsic_edges(&self, visit: &mut dyn FnMut(&Gc)) {
+        if let Ok(cache) = self.intrinsics.try_borrow_mut() {
+            if let Some(intr) = cache.as_ref() {
+                for object in [&intr.array_proto, &intr.values, &intr.next, &intr.aip] { visit(object); }
+            }
+        }
+        self.iter_proof.count_intrinsic_edges(visit);
+        self.array_cb.count_intrinsic_edges(visit);
+        self.promise.count_intrinsic_edges(visit);
+    }
+
+    pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
+        if let Ok(cache) = self.intrinsics.try_borrow() {
+            if let Some(intr) = cache.as_ref().filter(|intr| Gc::as_ptr(&intr.array_proto) as usize == pointer) {
+                for object in [&intr.array_proto, &intr.values, &intr.next, &intr.aip] { visit(object); }
+            }
+        }
+        self.iter_proof.trace_intrinsic_edges(pointer, visit);
+        self.array_cb.trace_intrinsic_edges(pointer, visit);
+        self.promise.trace_intrinsic_edges(pointer, visit);
+    }
+
+    pub(crate) fn sweep_intrinsics(&self, garbage: &[Gc]) {
+        if let Ok(mut cache) = self.intrinsics.try_borrow_mut() {
+            if cache.as_ref().is_some_and(|intr| garbage.iter().any(|object| Gc::ptr_eq(object, &intr.array_proto))) { *cache = None; }
+        }
+        self.iter_proof.sweep_intrinsics(garbage);
+        self.array_cb.sweep_intrinsics(garbage);
+        self.promise.sweep_intrinsics(garbage);
+    }
+}
+
 impl Interp {
     /// The property key of the realm's `Symbol.iterator`.
     fn iter_sym_key(&self) -> Option<Rc<str>> {

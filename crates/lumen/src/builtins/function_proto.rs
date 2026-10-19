@@ -48,40 +48,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
                 "Function.prototype.toString requires that 'this' be a function",
             ));
         }
-        // A user function returns the source text it was parsed from; everything else
-        // (natives, bound functions, proxies) renders as a native function carrying its name.
-        if let Value::Obj(o) = &this {
-            if let Callable::User(user) = &o.borrow().call {
-                if let Some(src) = user.func.source() {
-                    return Ok(Value::from_string(src.to_string()));
-                }
-            }
-            let name = match o.borrow().props.get("name").map(|p| p.value()) {
-                Some(Value::Str(n)) => n.to_string(),
-                _ => String::new(),
-            };
-            // Render the name only when it's a well-formed PropertyName (optionally get/set
-            // prefixed, or a computed [Symbol.x] form) — a bound function's "bound f" is not.
-            let is_ident = |t: &str| {
-                !t.is_empty()
-                    && t.chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
-                    && t.chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-            };
-            let renderable = is_ident(&name)
-                || (name.starts_with('[') && name.ends_with(']'))
-                || name
-                    .strip_prefix("get ")
-                    .or_else(|| name.strip_prefix("set "))
-                    .is_some_and(is_ident);
-            let name = if renderable { name.as_str() } else { "" };
-            return Ok(Value::from_string(format!(
-                "function {name}() {{ [native code] }}"
-            )));
-        }
-        Ok(Value::str("function () { [native code] }"))
+        Ok(Value::from_string(function_source_text(&this)))
     });
 
     // The %ThrowTypeError% poison pill: a single frozen function (length 0, name "") reused as the
@@ -338,4 +305,41 @@ mod intrinsic_bind_tests {
             .ok().expect("bound callback runs");
         assert!(matches!(value, crate::Value::Num(value) if value == 42.0));
     }
+}
+
+/// The text `Function.prototype.toString` gives a callable: a user function's source, or a native
+/// function carrying its name.
+pub(crate) fn function_source_text(this: &Value) -> String {
+    // A user function returns the source text it was parsed from; everything else
+    // (natives, bound functions, proxies) renders as a native function carrying its name.
+    if let Value::Obj(o) = this {
+        if let Callable::User(user) = &o.borrow().call {
+            if let Some(src) = user.func.source() {
+                return src.to_string();
+            }
+        }
+        let name = match o.borrow().props.get("name").map(|p| p.value()) {
+            Some(Value::Str(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        // Render the name only when it's a well-formed PropertyName (optionally get/set
+        // prefixed, or a computed [Symbol.x] form) — a bound function's "bound f" is not.
+        let is_ident = |t: &str| {
+            !t.is_empty()
+                && t.chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                && t.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        };
+        let renderable = is_ident(&name)
+            || (name.starts_with('[') && name.ends_with(']'))
+            || name
+                .strip_prefix("get ")
+                .or_else(|| name.strip_prefix("set "))
+                .is_some_and(is_ident);
+        let name = if renderable { name.as_str() } else { "" };
+        return format!("function {name}() {{ [native code] }}");
+    }
+    "function () { [native code] }".to_string()
 }

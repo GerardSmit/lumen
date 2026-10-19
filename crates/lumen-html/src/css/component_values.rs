@@ -5,8 +5,8 @@
 //! objects, even when the containing property's grammar is otherwise unknown.
 
 use super::{
-    CssError, MAX_VARIABLE_BYTES, MAX_VARIABLE_DEPTH, matching_css_block,
-    quoted_css_end, selector_escape, valid_custom_property_name,
+    syntax, selector_escape, valid_custom_property_name, CssError,
+    MAX_VARIABLE_BYTES, MAX_VARIABLE_DEPTH,
 };
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
@@ -28,16 +28,15 @@ pub enum UnparsedComponent {
 /// to CSS token boundaries; limits match the shared variable-expansion budget.
 pub fn parse_unparsed_value(input: &str) -> Result<Vec<UnparsedComponent>, CssError> {
     let mut remaining = MAX_COMPONENTS;
-    parse_inner(input, 0, 0, &mut remaining)
+    let completed=syntax::complete(input)?.ok_or_else(||error(0,"invalid CSS component token"))?;
+    parse_inner(completed.as_ref(), 0, 0, &mut remaining)
 }
 
 /// Serialize a parsed component tree using Typed OM's raw-token serialization.
 /// Adjacent text spans are separated with `/**/` so concatenation cannot merge
 /// two component values. The output has the same byte and nesting bounds as the
 /// parser and variable expansion paths.
-pub fn serialize_unparsed_value(
-    components: &[UnparsedComponent],
-) -> Result<String, CssError> {
+pub fn serialize_unparsed_value(components: &[UnparsedComponent]) -> Result<String, CssError> {
     let mut output = String::new();
     serialize_inner(components, 0, &mut output)?;
     Ok(output)
@@ -56,91 +55,35 @@ fn parse_inner(
         return Err(error(base_offset, "CSS component value is too large"));
     }
 
-    let bytes = input.as_bytes();
-    let mut position = 0usize;
-    let mut text = String::new();
-    let mut result = Vec::new();
-
-    while position < bytes.len() {
-        let byte = bytes[position];
-        if byte == b'/' && bytes.get(position + 1) == Some(&b'*') {
-            let Some(end) = input[position + 2..].find("*/") else {
-                return Err(error(base_offset + position, "unterminated CSS comment"));
-            };
-            // Comments disappear during tokenization. Keep a serialization
-            // boundary so adjacent identifiers do not become one token.
+    let bytes=input.as_bytes();
+    let mut cursor=syntax::Cursor::new(input,0)?;
+    let mut text=String::new();
+    let mut result=Vec::new();
+    while let Some(token)=cursor.next(){
+        if matches!(token.kind,syntax::TokenKind::Comment{..}) {
             text.push_str("/**/");
-            position += end + 4;
             continue;
         }
-        if matches!(byte, b'\'' | b'"') {
-            let Some(end) = quoted_css_end(input, position) else {
-                return Err(error(base_offset + position, "unterminated CSS string"));
-            };
-            text.push_str(&input[position..end]);
-            position = end;
-            continue;
+        if matches!(token.kind,syntax::TokenKind::BadString|syntax::TokenKind::BadUrl){
+            return Err(error(base_offset+token.start,"invalid CSS component token"));
         }
-        if byte == b'\\' {
-            let start = position;
-            selector_escape(input, &mut position)
-                .ok_or_else(|| error(base_offset + start, "invalid CSS escape"))?;
-            text.push_str(&input[start..position]);
-            continue;
-        }
-
-        if let Some((ident, end)) = consume_ident(input, position) {
-            if ident.eq_ignore_ascii_case("var") && bytes.get(end) == Some(&b'(') {
-                let Some(after) = matching_css_block(input, end) else {
-                    return Err(error(base_offset + end, "malformed var() component"));
-                };
-                let body_start = end + 1;
-                let body_end = after - 1;
-                let body = &input[body_start..body_end];
-                let (name, fallback, fallback_offset) =
-                    parse_var_arguments(body, base_offset + body_start)?;
-                let fallback = fallback
-                    .map(|value| {
-                        parse_inner(
-                            value,
-                            base_offset + fallback_offset,
-                            depth + 1,
-                            remaining,
-                        )
-                    })
-                    .transpose()?;
-
-                if !text.is_empty() {
-                    push_component(
-                        &mut result,
-                        UnparsedComponent::Text(core::mem::take(&mut text)),
-                        remaining,
-                        base_offset + position,
-                    )?;
+        if let Some((ident,end))=consume_ident(input,token.start) {
+            if ident.eq_ignore_ascii_case("var") && bytes.get(end)==Some(&b'(') {
+                let block=syntax::block(input,end)?;
+                let body_start=end+1;
+                let body=&input[body_start..block.content_end];
+                let (name,fallback,fallback_offset)=parse_var_arguments(body,base_offset+body_start)?;
+                let fallback=fallback.map(|value|parse_inner(value,fallback_offset,depth+1,remaining)).transpose()?;
+                if !text.is_empty(){
+                    push_component(&mut result,UnparsedComponent::Text(core::mem::take(&mut text)),remaining,base_offset+token.start)?;
                 }
-                push_component(
-                    &mut result,
-                    UnparsedComponent::Variable { name, fallback },
-                    remaining,
-                    base_offset + position,
-                )?;
-                position = after;
+                push_component(&mut result,UnparsedComponent::Variable{name,fallback},remaining,base_offset+token.start)?;
+                cursor.position=block.after;
                 continue;
             }
-            text.push_str(&input[position..end]);
-            position = end;
-            continue;
         }
-
-        let character = input[position..]
-            .chars()
-            .next()
-            .ok_or_else(|| error(base_offset + position, "invalid CSS character"))?;
-        text.push(character);
-        position += character.len_utf8();
-        if text.len() > MAX_VARIABLE_BYTES {
-            return Err(error(base_offset + position, "CSS component value is too large"));
-        }
+        text.push_str(&input[token.start..token.end]);
+        if text.len()>MAX_VARIABLE_BYTES{return Err(error(base_offset+token.end,"CSS component value is too large"));}
     }
 
     if !text.is_empty() {
@@ -165,19 +108,31 @@ fn parse_var_arguments<'a>(
     skip_trivia(name_slice, &mut position, base_offset)?;
     let start = position;
     let Some((decoded, end)) = consume_ident(name_slice, position) else {
-        return Err(error(base_offset + position, "var() requires a custom property name"));
+        return Err(error(
+            base_offset + position,
+            "var() requires a custom property name",
+        ));
     };
     if !decoded.starts_with("--") {
-        return Err(error(base_offset + start, "var() requires a custom property name"));
+        return Err(error(
+            base_offset + start,
+            "var() requires a custom property name",
+        ));
     }
     let name = name_slice[start..end].to_owned();
     if !valid_custom_property_name(&name) {
-        return Err(error(base_offset + start, "invalid custom property name in var()"));
+        return Err(error(
+            base_offset + start,
+            "invalid custom property name in var()",
+        ));
     }
     position = end;
     skip_trivia(name_slice, &mut position, base_offset)?;
     if position != name_slice.len() {
-        return Err(error(base_offset + position, "unexpected token after var() name"));
+        return Err(error(
+            base_offset + position,
+            "unexpected token after var() name",
+        ));
     }
 
     let Some(comma) = comma else {
@@ -191,43 +146,14 @@ fn parse_var_arguments<'a>(
     ))
 }
 
-fn top_level_comma(input: &str, base_offset: usize) -> Result<Option<usize>, CssError> {
-    let bytes = input.as_bytes();
-    let mut position = 0usize;
-    while position < bytes.len() {
-        match bytes[position] {
-            b'/' if bytes.get(position + 1) == Some(&b'*') => {
-                let Some(end) = input[position + 2..].find("*/") else {
-                    return Err(error(base_offset + position, "unterminated CSS comment"));
-                };
-                position += end + 4;
-            }
-            b'\\' => {
-                selector_escape(input, &mut position)
-                    .ok_or_else(|| error(base_offset + position, "invalid CSS escape"))?;
-            }
-            quote @ (b'\'' | b'"') => {
-                let _ = quote;
-                position = quoted_css_end(input, position)
-                    .ok_or_else(|| error(base_offset + position, "unterminated CSS string"))?;
-            }
-            open @ (b'(' | b'[' | b'{') => {
-                let Some(after) = matching_css_block(input, position) else {
-                    return Err(error(base_offset + position, "unbalanced CSS component block"));
-                };
-                debug_assert_eq!(bytes[position], open);
-                position = after;
-            }
-            b')' | b']' | b'}' => {
-                return Err(error(base_offset + position, "unbalanced CSS component block"));
-            }
-            b',' => return Ok(Some(position)),
-            _ => {
-                position += input[position..]
-                    .chars()
-                    .next()
-                    .map_or(1, char::len_utf8);
-            }
+fn top_level_comma(input:&str,base_offset:usize)->Result<Option<usize>,CssError>{
+    let mut cursor=syntax::Cursor::new(input,0)?;
+    while let Some(token)=cursor.next(){
+        match token.kind {
+            syntax::TokenKind::Open(_)=>cursor.position=syntax::block(input,token.start)?.after,
+            syntax::TokenKind::Close(_)|syntax::TokenKind::BadString|syntax::TokenKind::BadUrl=>return Err(error(base_offset+token.start,"invalid CSS component token")),
+            syntax::TokenKind::Other if input.as_bytes()[token.start]==b','=>return Ok(Some(token.start)),
+            _=>{},
         }
     }
     Ok(None)
@@ -360,10 +286,9 @@ mod tests {
 
     #[test]
     fn reifies_nested_variables_without_scanning_strings_or_comments() {
-        let parsed = parse_unparsed_value(
-            "calc(42px + var(--foo, 15em) + var(--bar, var(--far) + 15px))",
-        )
-        .unwrap();
+        let parsed =
+            parse_unparsed_value("calc(42px + var(--foo, 15em) + var(--bar, var(--far) + 15px))")
+                .unwrap();
         assert_eq!(
             parsed,
             vec![
@@ -422,17 +347,38 @@ mod tests {
             UnparsedComponent::Text("on".into()),
             UnparsedComponent::Text("ade".into()),
         ];
-        assert_eq!(serialize_unparsed_value(&value).unwrap(), "lem/**/on/**/ade");
+        assert_eq!(
+            serialize_unparsed_value(&value).unwrap(),
+            "lem/**/on/**/ade"
+        );
     }
 
     #[test]
     fn rejects_malformed_and_oversized_var_components_with_bounds() {
-        for input in ["var()", "var(color)", "var(--x", "var(--x, 'unterminated)"] {
+        for input in ["var()", "var(color)", "var(--x, 'bad\n)", "var(--x, url(foo bar))"] {
             assert!(parse_unparsed_value(input).is_err(), "accepted {input:?}");
         }
         let large = "x".repeat(MAX_VARIABLE_BYTES + 1);
         assert!(parse_unparsed_value(&large).is_err());
-        let nested = format!("{}--x{}", "var(--x, ".repeat(MAX_VARIABLE_DEPTH + 2), ")".repeat(MAX_VARIABLE_DEPTH + 2));
+        let nested = format!(
+            "{}--x{}",
+            "var(--x, ".repeat(MAX_VARIABLE_DEPTH + 2),
+            ")".repeat(MAX_VARIABLE_DEPTH + 2)
+        );
         assert!(parse_unparsed_value(&nested).is_err());
+    }
+
+    #[test]
+    fn specification_css_typed_om_eof_recovery_keeps_variable_token_identity() {
+        let bare=parse_unparsed_value("var(--x").unwrap();
+        assert_eq!(bare,vec![UnparsedComponent::Variable{name:"--x".into(),fallback:None}]);
+        assert_eq!(serialize_unparsed_value(&bare).unwrap(),"var(--x)");
+        let quoted=parse_unparsed_value("var(--x, 'unterminated)").unwrap();
+        assert_eq!(serialize_unparsed_value(&quoted).unwrap(),"var(--x, 'unterminated)')");
+        let nested=parse_unparsed_value("calc(2px + var(--x, [fallback").unwrap();
+        assert_eq!(serialize_unparsed_value(&nested).unwrap(),"calc(2px + var(--x, [fallback]))");
+        let mismatched=parse_unparsed_value("var(--x, [)] )").unwrap();
+        assert_eq!(serialize_unparsed_value(&mismatched).unwrap(),"var(--x, [)] )","a closing parenthesis inside a square component block is an ordinary token");
+        assert!(parse_unparsed_value("var(--x))").is_err(),"an unmatched top-level closing token is not a valid declaration value");
     }
 }

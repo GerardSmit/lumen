@@ -507,7 +507,7 @@ impl DomNotification {
         options: Option<Value>,
     ) -> OpResult<()> {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
-        DomEventTarget::add_event_listener(ctx, this, kind, callback, options)
+        crate::events::add_event_listener(ctx, this, kind, callback, options)
     }
 
     fn remove_event_listener(
@@ -518,43 +518,43 @@ impl DomNotification {
         callback: Value,
         options: Option<Value>,
     ) -> OpResult<()> {
-        DomEventTarget::remove_event_listener(ctx, this, kind, callback, options)
+        crate::events::remove_event_listener(ctx, this, kind, callback, options)
     }
 
     #[getter]
-    fn onclick(&self) -> Option<JsFunction> {
-        self.base.handler("click")
+    fn onclick(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "click")
     }
     #[setter]
-    fn set_onclick(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "click", callback);
+    fn set_onclick(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "click", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onshow(&self) -> Option<JsFunction> {
-        self.base.handler("show")
+    fn onshow(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "show")
     }
     #[setter]
-    fn set_onshow(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "show", callback);
+    fn set_onshow(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "show", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onclose(&self) -> Option<JsFunction> {
-        self.base.handler("close")
+    fn onclose(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "close")
     }
     #[setter]
-    fn set_onclose(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "close", callback);
+    fn set_onclose(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "close", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onerror(&self) -> Option<JsFunction> {
-        self.base.handler("error")
+    fn onerror(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "error")
     }
     #[setter]
-    fn set_onerror(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
-        self.base.set_handler(ctx, &this.0, "error", callback);
+    fn set_onerror(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "error", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
 }
@@ -866,7 +866,7 @@ fn dispatch_notification_event(ctx: &mut Ctx, data: &NotificationData, kind: &st
     let event = DomEvent::new(ctx, kind, Some(options))?;
     let event = JsObject::from_value(ctx.new_instance(event))
         .ok_or_else(|| OpError::new("TypeError", "notification event is invalid"))?;
-    DomEventTarget::dispatch_event(ctx, This(wrapper), event).map(|_| ())
+    crate::events::dispatch_event(ctx, This(wrapper), event).map(|_| ())
 }
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {

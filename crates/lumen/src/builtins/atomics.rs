@@ -318,9 +318,13 @@ pub(super) fn install_atomics(it: &mut Interp) {
             return Ok(Value::Obj(result));
         };
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let park = i.agent_park();
         std::thread::spawn(move || {
             let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout, None);
             let _ = tx.send(if woken { "ok" } else { "timed-out" });
+            if let Some(park) = park {
+                park.unpark();
+            }
         });
         let promise = i.new_promise();
         i.pending_async_waits.push((promise.clone(), rx));

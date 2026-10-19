@@ -3,6 +3,7 @@
 //! Device-backed camera and microphone capture is provided by an embedder
 //! `MediaDevicesHost`; the default host has no inputs and rejects requests.
 
+use crate::events::HtmlTargetExt;
 use crate::{media::VideoFrameSnapshot, DomRealm};
 use lumen::embed::{Ctx, JsObject, OpError, OpResult, Promise, Value, WeakValue};
 use lumen_bind::This;
@@ -661,12 +662,12 @@ impl DomMediaDevices {
                 "media device realm has been destroyed",
             )));
         };
-        let descriptions = realm.media_capture.host().map_or_else(Vec::new, |host| {
+        let descriptions = if !realm.use_permissions_policy(Some(ctx),super::permissions_policy::CAMERA){Vec::new()}else{realm.media_capture.host().map_or_else(Vec::new, |host| {
             (host.enumerate)()
                 .into_iter()
                 .filter(|device| device.kind == MediaDeviceKind::VideoInput)
                 .collect()
-        });
+        })};
         Promise::ready(Ok::<Vec<Value>, OpError>(
             descriptions
                 .into_iter()
@@ -697,6 +698,9 @@ impl DomMediaDevices {
                 "TypeError",
                 "at least one media kind must be requested",
             )));
+        }
+        if video && !realm.use_permissions_policy(Some(ctx),super::permissions_policy::CAMERA){
+            return Promise::ready(Err(OpError::new("NotAllowedError","camera is disabled by Permissions Policy")));
         }
         if audio {
             return Promise::ready(Err(OpError::new(
@@ -849,7 +853,7 @@ fn dispatch_track_event(ctx: &mut Ctx, track: &TrackData, kind: &str) -> OpResul
     let event = crate::events::DomEvent::new(ctx, kind, None)?;
     let event = JsObject::from_value(ctx.new_instance(event))
         .ok_or_else(|| OpError::new("TypeError", "could not construct a track event"))?;
-    crate::events::DomEventTarget::dispatch_event(ctx, This(target), event).map(|_| ())
+    crate::events::dispatch_event(ctx, This(target), event).map(|_| ())
 }
 
 pub(crate) fn canvas_capture_stream(

@@ -424,6 +424,7 @@ pub fn gen(s: &Spec) -> Res<String> {
     // The unboxed entry.
     let mut items = String::new();
     let scalar_ok = s.role == Role::Function
+        && !s.opts.hints.iter().any(|(host, key, _)| host == "js" && key == "ce_reactions")
         && !is_async
         && !coerce
         && receiver.is_none()
@@ -611,6 +612,15 @@ pub fn gen(s: &Spec) -> Res<String> {
         .collect::<Vec<_>>()
         .join(", ");
     let mut body = format!("let [{slots}] = H::bind::<{n}>(__cx)?;\n");
+    // With no injected values or argument conversions, class_ref/class_mut below
+    // performs the same receiver check before any host or author code can run.
+    // Keep the early Web IDL check whenever binding may execute a conversion.
+    if receiver.is_some() && !uses.is_empty() {
+        let ty = self_ty.unwrap();
+        body.insert_str(0, &format!(
+            "if <{ty} as {B}::Class>::DESC.hint(\"js\", \"webidl\").is_some() {{ H::validate_receiver::<{ty}>(__cx, H::this(__cx))?; }}\n"
+        ));
+    }
     body.push_str(&conv_early);
     body.push_str(&conv_late);
     if let Some(r) = receiver {
@@ -624,6 +634,9 @@ pub fn gen(s: &Spec) -> Res<String> {
             "let __self = H::{f}::<{ty}>(__cx, H::this(__cx), {B}::Slot::THIS)?;\n"
         ));
         call_args.insert(0, "__self".into());
+    }
+    if s.opts.hints.iter().any(|(host, key, _)| host == "js" && key == "ce_reactions") {
+        body.push_str("H::begin_operation(__cx)?;\n");
     }
     let call = format!("{}({})", s.call_path, call_args.join(", "));
     let call = if ctx_ty.is_some() {

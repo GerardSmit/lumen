@@ -134,8 +134,86 @@ mod imp {
         Err(FsError("ENOSYS"))
     }
 
+    #[cfg(windows)]
+    pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> Result<usize, FsError> {
+        super::win::poll(fds, timeout_ms)
+    }
+
+    #[cfg(not(windows))]
     pub fn poll(_fds: &mut [PollFd], _timeout_ms: i32) -> Result<usize, FsError> {
         Err(FsError("ENOSYS"))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) mod win {
+    use super::*;
+    use std::sync::Once;
+
+    /// `WSAPOLLFD`: unlike [`PollFd`] the descriptor is a full `SOCKET`.
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub(crate) struct WsaPollFd {
+        pub socket: usize,
+        pub events: i16,
+        pub revents: i16,
+    }
+
+    #[repr(C, align(8))]
+    struct WsaData([u8; 512]);
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAPoll(fds: *mut WsaPollFd, count: u32, timeout: i32) -> i32;
+        fn WSAStartup(version: u16, data: *mut WsaData) -> i32;
+    }
+
+    /// Winsock must be started before `WSAPoll`; `WSAStartup` is reference counted, so this
+    /// coexists with the start `std::net` does on its first socket.
+    pub(crate) fn ensure_winsock() {
+        static START: Once = Once::new();
+        START.call_once(|| {
+            let mut data = WsaData([0; 512]);
+            // SAFETY: `data` is larger than any `WSADATA` layout and outlives the call.
+            unsafe { WSAStartup(0x0202, &mut data) };
+        });
+    }
+
+    /// Blocks up to `timeout_ms` (negative: forever). `Err` carries the Winsock error.
+    pub(crate) fn wsa_poll(fds: &mut [WsaPollFd], timeout_ms: i32) -> Result<usize, FsError> {
+        ensure_winsock();
+        // SAFETY: `WsaPollFd` has `WSAPOLLFD`'s layout and `fds` is a live slice.
+        let n = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(n as usize)
+    }
+
+    pub(super) fn poll(fds: &mut [PollFd], timeout_ms: i32) -> Result<usize, FsError> {
+        if fds.is_empty() {
+            // WSAPoll rejects an empty set; poll(2) just sleeps.
+            if timeout_ms < 0 {
+                loop {
+                    std::thread::park();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
+            return Ok(0);
+        }
+        let mut wsa: Vec<WsaPollFd> = fds
+            .iter()
+            .map(|f| WsaPollFd {
+                socket: if f.fd < 0 { usize::MAX } else { f.fd as usize },
+                events: f.events,
+                revents: 0,
+            })
+            .collect();
+        let n = wsa_poll(&mut wsa, timeout_ms)?;
+        for (f, w) in fds.iter_mut().zip(&wsa) {
+            f.revents = w.revents;
+        }
+        Ok(n)
     }
 }
 

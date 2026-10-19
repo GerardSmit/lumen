@@ -830,20 +830,20 @@ static TIMED_OUT_AFTER: AtomicU64 = AtomicU64::new(0);
 /// process itself (a native call that cannot be interrupted would otherwise hang it).
 const TIMEOUT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// `--timeout`: a watchdog thread interrupts the runtime when the budget runs out. The script
+/// `--timeout`: a scheduler timer interrupts the runtime when the budget runs out. The script
 /// stops at its next safe point, or the event loop wakes if it was blocked, and the CLI exits 124
 /// (`timeout(1)`'s code) through its normal path with output flushed. Only if that path does not
 /// finish within a few seconds does the watchdog exit the process itself.
 fn start_watchdog(runtime: &mut Runtime, ms: u64) {
     let handle = runtime.interrupt_handle();
-    lumen::limits::Deadline::start(
+    lumen_os::sched::Deadline::start(
         "lumen-timeout",
         std::time::Duration::from_millis(ms),
         move || {
             TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
             handle.interrupt();
-            std::thread::sleep(TIMEOUT_EXIT_GRACE);
-            exit_if_timed_out();
+            lumen_os::sched::Deadline::start("lumen-timeout-exit", TIMEOUT_EXIT_GRACE, exit_if_timed_out)
+                .detach();
         },
     )
     .detach();

@@ -5,10 +5,20 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["bundled-fonts"]
+# Compiles Inconsolata and Liberation Sans (about 900 KB) into the crate as
+# `DEFAULT_FONT_BYTES`, `TEST_FONT_BYTES` and `TEST_FONT_BOLD_BYTES`. Hosts that
+# ship the files in a font directory turn it off and load the faces at run time.
+bundled-fonts = []
+# `default_faces()`: the shared fallback faces, bundled or read from a font directory.
+std = []
+
 [dependencies]
 lumen-html = { path = "../lumen-html" }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
 fontdue = "0.9"
+read-fonts = { version = "0.37", default-features = false, features = ["libm"] }
 rustybuzz = { version = "0.20", default-features = false }
 ttf-parser = { version = "0.25", default-features = false, features = ["opentype-layout", "no-std-float"] }
 

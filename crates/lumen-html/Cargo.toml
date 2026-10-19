@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-lumen-common = { path = "../lumen-common", features = ["web-encoding"] }
+lumen-common = { path = "../lumen-common", features = ["web-encoding", "vector-path"] }
 libm = "0.2"
 
 [lints]

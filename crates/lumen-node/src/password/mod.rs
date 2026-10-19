@@ -21,7 +21,6 @@ use argon2::password_hash::{
     Error as PhError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
-use base64::Engine;
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

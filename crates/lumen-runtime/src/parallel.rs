@@ -1,5 +1,7 @@
 use crate::{Engine, Runtime};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use lumen_os::sched::Unpark;
 
 struct Driver(Runtime);
 
@@ -17,8 +19,9 @@ pub(super) fn install(engine: &mut Engine) {
     .expect("initialize native parallel runtime");
 }
 
-fn configure(engine: &mut Engine) {
+fn configure(engine: &mut Engine, unpark: Arc<dyn Unpark>) {
     let mut runtime = Runtime::new();
+    runtime.set_completion_notify(unpark);
     #[cfg(feature = "aot-native")]
     runtime
         .install_native_builtins()
@@ -27,7 +30,7 @@ fn configure(engine: &mut Engine) {
     engine.ctx().op_state().put(Driver(runtime));
 }
 
-fn turn(engine: &mut Engine) -> Result<(), String> {
+fn turn(engine: &mut Engine) -> Result<Option<Instant>, String> {
     let Some(Driver(mut runtime)) = engine.ctx().op_state().take::<Driver>() else {
         return Err("parallel runtime driver is unavailable".into());
     };
@@ -38,6 +41,11 @@ fn turn(engine: &mut Engine) -> Result<(), String> {
     if status.halted {
         Err("parallel worker runtime halted".into())
     } else {
-        Ok(())
+        let now = Instant::now();
+        Ok(status.next_timer_ms.and_then(|ms| {
+            Duration::try_from_secs_f64(ms.max(0.0) / 1000.0)
+                .ok()
+                .and_then(|delay| now.checked_add(delay))
+        }))
     }
 }

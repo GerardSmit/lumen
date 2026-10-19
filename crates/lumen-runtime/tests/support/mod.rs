@@ -6,7 +6,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Output};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lumen_runtime::Runtime;
 
@@ -83,4 +83,16 @@ pub fn output_within(child: Child, limit: Duration) -> Output {
             panic!("the child process did not exit within {limit:?}");
         }
     }
+}
+
+/// Runs `body` on the stack real engine hosts use: the lazily evaluated node glue nests deeply
+/// enough in a debug build to overflow a default 2 MiB test thread, which surfaces as a
+/// RangeError thrown inside a loop callback.
+pub fn on_engine_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(body)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

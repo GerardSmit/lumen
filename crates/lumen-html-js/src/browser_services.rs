@@ -5,6 +5,7 @@
 use super::*;
 use lumen::embed::{Deferred, JsObject, Promise};
 use lumen_bind::{IntoError, This};
+use lumen_host::navigator::Navigator;
 use std::{
     cell::Cell,
     rc::Weak,
@@ -37,10 +38,12 @@ pub struct ClipboardHost {
 pub struct RealmBrowserServices {
     clipboard: RefCell<Option<ClipboardHost>>,
     pub(super) presentation: super::presentation::RealmPresentation,
+    pub(super) render_capture: super::rendering_capture::RealmRenderCapture,
     pub(super) notifications: super::notifications::RealmNotifications,
     last_user_activation: Cell<Option<Instant>>,
     has_been_active: Cell<bool>,
     activation_generation: Cell<u64>,
+    consumed_history_activation_generation: Cell<u64>,
     activation_expiry_notified_generation: Cell<u64>,
     permission_statuses: RefCell<Vec<Weak<PermissionStatusData>>>,
 }
@@ -163,6 +166,13 @@ impl DomRealm {
         self.browser_services.has_transient_user_activation()
     }
 
+    pub(crate) fn consume_history_action_activation(&self) -> bool {
+        let generation = self.browser_services.activation_generation.get();
+        let active = generation > self.browser_services.consumed_history_activation_generation.get();
+        self.browser_services.consumed_history_activation_generation.set(generation);
+        active
+    }
+
     /// Consume authority for APIs that open a native user interface.
     pub fn consume_user_activation(&self) -> bool {
         let active = self.has_transient_user_activation();
@@ -207,11 +217,20 @@ impl DomRealm {
     }
 }
 
-#[lumen_bind::class(name = "Navigator", hint(js(webidl)))]
+#[lumen_bind::class(name = "Navigator", extends = Navigator, hint(js(webidl)))]
 pub struct DomNavigator {
+    base: Navigator,
     clipboard: Value,
     permissions: Value,
     user_activation: Value,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomNavigator {
+    const TRACES_NATIVE_VALUES: bool=true;
+    fn trace_native_identities(&self,_:u64,_:&mut dyn FnMut(&Value)){}
+    fn trace_native_values(&self,visit:&mut dyn FnMut(&Value)) {
+        visit(&self.clipboard);visit(&self.permissions);visit(&self.user_activation);
+    }
 }
 
 #[lumen_bind::methods]
@@ -454,12 +473,12 @@ impl DomPermissionStatus {
         options: Option<Value>,
     ) -> OpResult<()> {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
-        DomEventTarget::add_event_listener(ctx, this, kind, callback, options)
+        crate::events::add_event_listener(ctx, this, kind, callback, options)
     }
 
     #[getter]
-    fn onchange(&self) -> Option<lumen::embed::JsFunction> {
-        self.base.handler("change")
+    fn onchange(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "change")
     }
 
     #[setter]
@@ -467,9 +486,9 @@ impl DomPermissionStatus {
         &self,
         ctx: &mut Ctx,
         this: This<Value>,
-        callback: Option<lumen::embed::JsFunction>,
+        callback: crate::events::EventHandler,
     ) {
-        self.base.set_handler(ctx, &this.0, "change", callback);
+        self.base.set_event_handler(ctx, &this.0, "change", callback);
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
 }
@@ -531,9 +550,10 @@ impl DomClipboard {
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     super::presentation::install(realm);
     let global = ctx.global_object();
-    let existing = ctx
-        .member_get(&global, "navigator")
-        .map_err(OpError::thrown)?;
+    let existing = match ctx.native_private_value_slot(&global, window_globals::NAVIGATOR_OWNER) {
+        Some(original)=>original,
+        None=>ctx.member_get(&global,"navigator").map_err(OpError::thrown)?,
+    };
     let _ = ctx.class_constructor::<DomClipboard>();
     let _ = ctx.class_constructor::<DomPermissions>();
     let _ = ctx.class_constructor::<DomPermissionStatus>();
@@ -548,6 +568,7 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         realm: Rc::downgrade(realm),
     });
     let navigator_data = DomNavigator {
+        base: Navigator,
         clipboard,
         permissions,
         user_activation,
@@ -560,6 +581,9 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         }
         _ => ctx.new_instance(navigator_data),
     };
+    ctx.set_native_identity_owner::<DomNavigator>(&navigator)?;
+    ctx.set_native_internal_value_slot(&global, window_globals::NAVIGATOR_OWNER, navigator.clone())
+        .map_err(OpError::thrown)?;
     let navigator_constructor = ctx.class_constructor::<DomNavigator>();
     let clipboard_constructor = ctx.class_constructor::<DomClipboard>();
     let permissions_constructor = ctx.class_constructor::<DomPermissions>();

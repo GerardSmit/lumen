@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::window_globals::DomWindow;
-use lumen::embed::{Ctx, JsHost, OpError, OpResult, Value};
+use lumen::embed::{Ctx, JsHost, Nullable, OpError, OpResult, Value};
 use lumen_bind::{CtorRet, Host};
 
 pub(crate) fn dictionary_member(
@@ -76,7 +76,7 @@ fn number_to_signed(number: f64, bits: u32) -> i32 {
     }
 }
 
-fn dictionary_unsigned(
+pub(crate) fn dictionary_unsigned(
     ctx: &mut Ctx,
     dictionary: &Option<Value>,
     name: &str,
@@ -130,7 +130,11 @@ fn nullable_window(ctx: &mut Ctx, value: Value) -> OpResult<Value> {
     if matches!(value, Value::Null | Value::Undefined) {
         return Ok(Value::Null);
     }
-    if ctx.with_instance::<DomWindow, _>(&value, |_| ()).is_ok() {
+    // Conversion checks the interface brand, not access to a Window member.
+    // A cross-origin WindowProxy remains a Window value.
+    if ctx.is_window_proxy_value(&value)
+        || ctx.with_instance::<DomWindow, _>(&value, |_| ()).is_ok()
+    {
         Ok(value)
     } else {
         Err(OpError::type_error(
@@ -367,6 +371,12 @@ pub(crate) struct DomMouseEvent {
     related_target: RefCell<Value>,
 }
 
+impl DomMouseEvent {
+    pub(crate) fn activation_coordinates(&self) -> (i32, i32) {
+        (self.client_x.get(), self.client_y.get())
+    }
+}
+
 fn mouse_event(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<DomMouseEvent> {
     let dictionary = options.clone();
     let base = ui_event(ctx, kind, options)?;
@@ -418,42 +428,6 @@ pub(crate) fn synthetic_click_event(ctx: &mut Ctx, view: Value) -> OpResult<Valu
         .map_err(OpError::thrown)
 }
 
-/// Construct a trusted mouse PointerEvent for the browser's bounded pointer
-/// interaction path. The event is dispatched through `dispatch_user_agent_event`
-/// by the caller; script-created PointerEvents continue to use the constructors
-/// above and remain untrusted.
-pub(crate) fn user_agent_pointer_event(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    pressure: f64,
-    bubbles: bool,
-    cancelable: bool,
-) -> OpResult<Value> {
-    user_agent_pointer_event_with_state(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        pressure,
-        bubbles,
-        cancelable,
-        Value::Null,
-        UserAgentModifiers::default(),
-        0.0,
-        0.0,
-    )
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) struct UserAgentModifiers {
     pub ctrl: bool,
@@ -489,44 +463,6 @@ impl Default for UserAgentPointerProperties {
             twist: 0,
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn user_agent_pointer_event_with_state(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    pressure: f64,
-    bubbles: bool,
-    cancelable: bool,
-    related_target: Value,
-    modifiers: UserAgentModifiers,
-    movement_x: f64,
-    movement_y: f64,
-) -> OpResult<Value> {
-    user_agent_pointer_event_with_properties(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        pressure,
-        bubbles,
-        cancelable,
-        related_target,
-        modifiers,
-        movement_x,
-        movement_y,
-        UserAgentPointerProperties::default(),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,38 +545,6 @@ pub(crate) fn host_pointer_or_mouse_event(
     } else {
         Ok(None)
     }
-}
-
-/// Construct the compatibility MouseEvent associated with a trusted mouse
-/// pointer sequence. Trust is assigned only by the user-agent dispatch path.
-pub(crate) fn user_agent_mouse_event(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    bubbles: bool,
-    cancelable: bool,
-) -> OpResult<Value> {
-    user_agent_mouse_event_with_state(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        bubbles,
-        cancelable,
-        Value::Null,
-        UserAgentModifiers::default(),
-        0.0,
-        0.0,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1513,8 +1417,8 @@ impl DomInputEvent {
     }
 
     #[getter]
-    fn data(&self) -> Option<String> {
-        self.data.borrow().clone()
+    fn data(&self) -> Nullable<String> {
+        Nullable(self.data.borrow().clone())
     }
     #[getter]
     fn is_composing(&self) -> bool {
@@ -1533,76 +1437,6 @@ impl DomInputEvent {
             .unwrap_or_default();
         JsHost::from_list(ctx, values)
     }
-}
-
-#[lumen_bind::class(name = "ErrorEvent", extends = DomEvent, hint(js(webidl)))]
-pub(crate) struct DomErrorEvent {
-    base: DomEvent,
-    message: String,
-    filename: String,
-    lineno: u32,
-    colno: u32,
-    error: Value,
-}
-
-#[lumen_bind::methods]
-impl DomErrorEvent {
-    #[constructor(coerce)]
-    fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
-        let dictionary = options.clone();
-        let base = DomEvent::new(ctx, kind, options)?;
-        let colno = dictionary_unsigned(ctx, &dictionary, "colno", 0, 32)?;
-        let error = dictionary_member(ctx, &dictionary, "error")?.unwrap_or(Value::Undefined);
-        let filename = dictionary_string(ctx, &dictionary, "filename", "", true)?;
-        let lineno = dictionary_unsigned(ctx, &dictionary, "lineno", 0, 32)?;
-        let message = dictionary_string(ctx, &dictionary, "message", "", false)?;
-        Ok(Self {
-            base,
-            message,
-            filename,
-            lineno,
-            colno,
-            error,
-        })
-    }
-
-    #[getter]
-    fn message(&self) -> String {
-        self.message.clone()
-    }
-    #[getter]
-    fn filename(&self) -> String {
-        self.filename.clone()
-    }
-    #[getter]
-    fn lineno(&self) -> u32 {
-        self.lineno
-    }
-    #[getter]
-    fn colno(&self) -> u32 {
-        self.colno
-    }
-    #[getter]
-    fn error(&self) -> Value {
-        self.error.clone()
-    }
-}
-
-/// Snapshot the ErrorEvent fields consumed by Window.onerror's special handling algorithm.
-/// This reads the native IDL attribute state rather than performing JavaScript property gets, so
-/// author-defined own accessors cannot run while the platform prepares callback arguments. The
-/// returned values are detached from the native borrow before script is invoked.
-pub(crate) fn error_event_handler_arguments(ctx: &mut Ctx, event: &Value) -> Option<[Value; 5]> {
-    ctx.with_instance::<DomErrorEvent, _>(event, |event| {
-        [
-            Value::str(&event.message),
-            Value::str(&event.filename),
-            Value::Num(event.lineno as f64),
-            Value::Num(event.colno as f64),
-            event.error.clone(),
-        ]
-    })
-    .ok()
 }
 
 #[cfg(test)]
@@ -1646,7 +1480,7 @@ mod tests {
             ),
             (
                 "ErrorEvent",
-                engine.ctx().class_constructor::<DomErrorEvent>(),
+                engine.ctx().class_constructor::<lumen_host::events::ErrorEvent>(),
             ),
         ];
         let keyboard = constructors
@@ -1889,7 +1723,7 @@ mod tests {
             .ok()
             .expect("setup script returned a value");
         let arguments =
-            error_event_handler_arguments(engine.ctx(), &event).expect("native ErrorEvent brand");
+            lumen_host::events::ErrorEvent::handler_arguments(engine.ctx(), &event).expect("native ErrorEvent brand");
         let global = engine.ctx().global_object();
         let sentinel = engine
             .ctx()

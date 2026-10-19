@@ -4,6 +4,10 @@ use std::time::Duration;
 
 /// Runs a closure on a timer thread once `limit` has passed. Dropping it before then cancels the
 /// timer and joins the thread; [`Deadline::detach`] lets it run unattended instead.
+///
+/// Kept only because `lumen-py` still imports it. `lumen_os::sched::Deadline` is the replacement
+/// (same `start`/`detach`/drop API, no thread per deadline); delete this type once `lumen-py`
+/// has moved.
 pub struct Deadline {
     cancel: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,

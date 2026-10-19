@@ -84,8 +84,12 @@ fn quad(rect: &mut Rect, scale: f32) {
 }
 
 pub(crate) fn snap(list: &mut DisplayList, scale: f32) {
+    let mut transforms = 0usize;
     for command in &mut list.0 {
         match command {
+            Command::PushTransform(_) => transforms += 1,
+            Command::PopTransform => transforms = transforms.saturating_sub(1),
+            Command::PushBoxClip(rect) if transforms == 0 => quad(rect, scale),
             Command::FillRect { rect, .. } | Command::FillRoundedRect { rect, .. } => {
                 quad(rect, scale)
             }

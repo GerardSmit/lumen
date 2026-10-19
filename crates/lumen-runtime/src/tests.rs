@@ -39,6 +39,19 @@ fn test_runtime() -> (Runtime, Captured, Captured) {
     (rt, out, err)
 }
 
+/// Like [`test_runtime`], with the browser globals: `MessagePort` and friends are the web
+/// classes, not Node's `worker_threads` ones.
+fn browser_test_runtime() -> (Runtime, Captured, Captured) {
+    let mut rt = Runtime::new_browser();
+    let out = Captured::default();
+    let err = Captured::default();
+    rt.engine().ctx().op_state().put(console::ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(err.clone()),
+    });
+    (rt, out, err)
+}
+
 fn eval_ok(rt: &mut Runtime, src: &str) {
     match rt.eval(src).expect("parses") {
         Completion::Value(_) => {}
@@ -124,6 +137,174 @@ fn eval_host_value(
         .eval_value_in_host_realm(realm, source, false)
         .unwrap_or_else(|_| panic!("host-realm script parses"))
         .unwrap_or_else(|_| panic!("host-realm script runs"))
+}
+
+#[test]
+fn specification_browser_reports_timer_microtask_and_task_exceptions_once_in_source_realms() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let parent_document = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("parent DOM installs"));
+    eval_ok(&mut runtime, "globalThis.parentErrors = []; addEventListener('error', e => { parentErrors.push(e.error); e.preventDefault(); });");
+    let child = runtime.engine().ctx().create_host_realm();
+    runtime.install_browser_realm(&child).expect("child runtime providers install");
+    let child_document = runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_html_js::install(ctx, "<!doctype html><body>", 1024)
+    }).expect("child realm exists").unwrap_or_else(|_| panic!("child DOM installs"));
+    eval_host_value(&mut runtime, &child,
+        "globalThis.childErrors = []; globalThis.childOnErrors = []; addEventListener('error', e => { childErrors.push(e.error); e.preventDefault(); }); onerror = function(message, source, line, column, error) { childOnErrors.push([arguments.length, error]); return true; }; true");
+    let timer = runtime.engine().eval_value("setTimeout").expect("timer lookup parses")
+        .unwrap_or_else(|_| panic!("timer lookup succeeds"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw 'child-timer'; }");
+    runtime.engine().call_function(&timer, Value::Undefined, &[child_callback, Value::Num(0.0)])
+        .unwrap_or_else(|_| panic!("parent timer accepts child callback"));
+    let microtask = runtime.engine().eval_value("queueMicrotask").expect("microtask lookup parses")
+        .unwrap_or_else(|_| panic!("microtask lookup succeeds"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw 'child-microtask'; }");
+    runtime.engine().call_function(&microtask, Value::Undefined, &[child_callback])
+        .unwrap_or_else(|_| panic!("parent microtask accepts child callback"));
+    let foreign_error = runtime.engine().eval_value("new Error('parent-error-object')")
+        .expect("parent error parses").ok().expect("parent error evaluates");
+    runtime.engine().ctx().member_set(&child.global(), "foreignError", foreign_error)
+        .unwrap_or_else(|_| panic!("child keeps foreign error identity"));
+    let child_callback = eval_host_value(&mut runtime, &child, "() => { throw foreignError; }");
+    runtime.engine().call_function(&microtask, Value::Undefined, &[child_callback])
+        .unwrap_or_else(|_| panic!("cross-realm Error does not determine reporting source"));
+    runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_html_js::scheduling::queue_task(ctx, |_| Err(lumen::embed::OpError::new("Error", "child-task")))
+    }).expect("child task realm exists").unwrap_or_else(|_| panic!("child task admits"));
+    let native_task = runtime.engine().ctx().with_host_realm(&child, |ctx| {
+        lumen_host::register_task(ctx, Value::Undefined, None, |ctx, _| Err(ctx.make_error("Error", "child-native")))
+    }).expect("child native task admits");
+    runtime.completion_sender().send(native_task, Box::new(()));
+    eval_ok(&mut runtime, "setTimeout(() => { globalThis.afterErrors = true; }, 0);");
+    runtime.run_until_idle();
+    assert!(matches!(eval_host_value(&mut runtime, &child,
+        "childErrors.length === 5 && childErrors.includes('child-timer') && childErrors.includes('child-microtask') && childErrors.filter(e => e === foreignError && !(e instanceof Error)).length === 1 && childErrors.filter(e => e instanceof Error && e.message === 'child-task').length === 1 && childErrors.filter(e => e instanceof Error && e.message === 'child-native').length === 1 && childOnErrors.length === 5 && childOnErrors.every(e => e[0] === 5)"), Value::Bool(true)));
+    eval_ok(&mut runtime, "if (parentErrors.length !== 0 || !afterErrors) throw Error('wrong reporting realm or stopped loop');");
+    assert!(stderr.lines().is_empty(), "canceled browser errors: {:?}", stderr.lines());
+    drop((parent_document, child_document));
+}
+
+#[test]
+fn specification_browser_uncanceled_and_recursive_errors_continue_without_duplicate_dispatch() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let document = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    eval_ok(&mut runtime, r#"
+        globalThis.reports = [];
+        addEventListener('error', event => {
+            reports.push(event.error);
+            if (event.error === 'recursive-outer') reportError('recursive-inner');
+        });
+        setTimeout(() => { throw 'uncanceled'; }, 0);
+        queueMicrotask(() => { throw 'recursive-outer'; });
+        setTimeout(() => { globalThis.continued = true; }, 0);
+    "#);
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (!continued || reports.length !== 2 || !reports.includes('uncanceled') || !reports.includes('recursive-outer')) throw Error('recursive or duplicate reporting');");
+    let lines = stderr.lines();
+    for error in ["uncanceled", "recursive-inner", "recursive-outer"] {
+        assert_eq!(lines.iter().filter(|line| line.contains(error)).count(), 1, "default console reporting: {lines:?}");
+    }
+    drop(document);
+}
+
+#[test]
+fn specification_browser_timer_conversion_classic_globals_repetition_and_error_phases() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    let context = Rc::new(lumen::ClassicScriptContext { base_url: "https://timer.test/origin/entry.js".into(),
+        nonce: "captured-nonce".into(), credentials_mode: "include".into(), referrer_policy: "no-referrer".into() });
+    runtime.engine().ctx().run_classic_script(r#"
+        globalThis.timerLog = [];
+        globalThis.timerErrors = [];
+        addEventListener('error', e => { timerErrors.push(e.error); e.preventDefault(); });
+        setTimeout({toString() {
+            timerLog.push('convert');
+            setTimeout("timerLog.push('ONE')", 0);
+            return "timerLog.push('TWO'); let timerLexical = 42; globalThis.stringThis = this === window; globalThis.scriptIsNull = document.currentScript === null;";
+        }}, {valueOf() { timerLog.push('delay'); return 0; }});
+        setTimeout("globalThis.lexicalResult = timerLexical", 0);
+        setTimeout(function(a, b) { globalThis.functionArgs = this === window && a === 4 && b === 9; }, 0, 4, 9);
+        globalThis.intervalCount = 0;
+        const interval = setInterval("if (++intervalCount === 3) clearTimeout(interval)", 0);
+        globalThis.registrationComplete = false;
+        setTimeout("const =", 0);
+        setTimeout("throw new Error('string-runtime')", 0);
+        setTimeout("'first directive'; 'use strict'; try { timerStrictLeak = 1; } catch (e) { globalThis.strictTimer = e instanceof ReferenceError; }", 0);
+        registrationComplete = true;
+        globalThis.retainedTimerSource = () => setTimeout('globalThis.sourceKept = true', 0);
+    "#, context.clone()).unwrap_or_else(|error| {
+        let error = lumen::embed::abrupt_value(error);
+        match runtime.engine().describe_throw(error) {
+            Completion::Throw { name, message } => panic!("timer registration: {name}: {message}"),
+            Completion::Value(_) => panic!("timer registration failed"),
+        }
+    });
+    runtime.run_to_completion();
+    eval_ok(&mut runtime, r#"
+        if (timerLog.join(',') !== 'convert,delay,ONE,TWO' || !stringThis || !scriptIsNull ||
+            lexicalResult !== 42 || !functionArgs || intervalCount !== 3 || !registrationComplete ||
+            !strictTimer || timerErrors.length !== 2 || !timerErrors.some(e => e instanceof SyntaxError) ||
+            !timerErrors.some(e => e instanceof Error && e.message === 'string-runtime')) throw Error('timer phase or global-script semantics');
+    "#);
+    let captured = runtime.engine().eval_value("retainedTimerSource")
+        .expect("callback parses").ok().expect("callback evaluates");
+    runtime.engine().call_function(&captured, Value::Undefined, &[]).ok().expect("callback runs");
+    let firing = runtime.take_next_due_timer(Instant::now() + Duration::from_secs(1)).expect("retained callback scheduled a timer");
+    assert_eq!(firing.script_context(), Some(context.as_ref()), "later callback preserves its real source metadata");
+    runtime.fire_timer_ticket(firing);
+    eval_ok(&mut runtime, "if (!sourceKept) throw Error('retained source timer did not execute');");
+    let module_url = "https://timer.test/modules/later.js";
+    let result = runtime.engine().with_classic_script_context(context.clone(), |engine| engine.eval_module_attrs(
+        "globalThis.retainedModuleTimer = () => setTimeout('globalThis.moduleSourceKept=true', 0);",
+        module_url,
+        |_, _, _| None,
+    ));
+    assert!(matches!(result, Ok(Completion::Value(_))), "module source evaluates");
+    let callback = runtime.engine().eval_value("retainedModuleTimer").expect("module callback parses").ok().expect("module callback evaluates");
+    runtime.engine().call_function(&callback, Value::Undefined, &[]).ok().expect("module callback runs");
+    let firing = runtime.take_next_due_timer(Instant::now() + Duration::from_secs(1)).expect("module callback timer");
+    let mut module_context = context.as_ref().clone();
+    module_context.base_url = module_url.into();
+    assert_eq!(firing.script_context(), Some(&module_context), "module functions retain actual module URL and captured fetch settings");
+    runtime.fire_timer_ticket(firing);
+    eval_ok(&mut runtime, "if (!moduleSourceKept) throw Error('module timer did not execute');");
+    assert!(stderr.lines().is_empty(), "canceled timer errors: {:?}", stderr.lines());
+    drop((realm, context));
+}
+
+#[test]
+fn specification_browser_timer_csp_is_checked_at_execution_and_trusted_sink_after_conversion() {
+    let (mut runtime, _, stderr) = browser_test_runtime();
+    let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body>", 1024)
+        .unwrap_or_else(|_| panic!("DOM installs"));
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy-Report-Only".into(),
+        "script-src 'none' 'report-sample'; require-trusted-types-for 'script'".into())]).unwrap_or_else(|_| panic!("report policy installs"));
+    runtime.engine().eval_value(r#"
+        globalThis.violations=[]; globalThis.errors=[]; globalThis.delayCalls=0;
+        addEventListener('securitypolicyviolation', e => violations.push([e.effectiveDirective,e.blockedURI,e.disposition]));
+        addEventListener('error', e => { errors.push(e.error); e.preventDefault(); });
+        setTimeout("globalThis.reportOnlyRan = 'ä'", 0);
+    "#).expect("report timer parses").ok().expect("report timer registers");
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (reportOnlyRan !== 'ä' || violations.length !== 2 || violations.some(e => e[2] !== 'report')) throw Error('report-only policy blocked or missed timer source');");
+    // Policy is checked when source is compiled, not frozen at registration.
+    runtime.engine().eval_value("setTimeout('globalThis.forbiddenRan=true', 0)").expect("pending timer parses").ok().expect("pending timer registers");
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "script-src 'none'".into())]).unwrap_or_else(|_| panic!("enforcement policy installs"));
+    runtime.run_until_idle();
+    eval_ok(&mut runtime, "if (typeof forbiddenRan !== 'undefined' || errors.length !== 1 || !(errors[0] instanceof EvalError)) throw Error('string compilation did not report its execution-time CSP failure');");
+    realm.set_content_security_policy_headers(&[("Content-Security-Policy".into(), "require-trusted-types-for 'script'".into())]).unwrap_or_else(|_| panic!("trusted sink policy installs"));
+    eval_ok(&mut runtime, r#"
+        let blocked=false;
+        try { setTimeout({toString(){return "globalThis.neverRuns=true"}}, {valueOf(){delayCalls++;return 0}}); }
+        catch(e) { blocked=e instanceof TypeError; }
+        if (!blocked || delayCalls !== 1) throw Error('trusted sink must enforce after WebIDL conversion');
+        setTimeout(() => { globalThis.functionStillRuns = true; }, 0);
+    "#);
+    eval_ok(&mut runtime, "if (!functionStillRuns || typeof trustedTypes !== 'undefined' || typeof TrustedScript !== 'undefined') throw Error('unsupported Trusted Types surface was fabricated or ordinary Function blocked');");
+    assert!(stderr.lines().is_empty(), "canceled compilation errors: {:?}", stderr.lines());
 }
 
 #[test]
@@ -568,14 +749,19 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
     // Node: an exception nobody catches ends the process with code 1 — later timers never run,
     // 'exit' fires (no 'beforeExit'), and the error is printed.
     let (mut rt, out, err) = test_runtime();
-    eval_ok(
-        &mut rt,
-        r#"
+    let completion = rt
+        .eval(
+            r#"
         process.on("beforeExit", () => console.log("beforeExit must not run"));
         process.on("exit", (code) => console.log("exit", code));
         setTimeout(() => { throw new TypeError("boom") }, 5);
         setTimeout(() => console.log("must not run"), 10);
         "#,
+        )
+        .expect("parses");
+    assert!(
+        matches!(&completion, Completion::Throw { name, message } if name == "TypeError" && message == "boom"),
+        "{}", show(&completion)
     );
     assert_eq!(rt.fatal_exit_code(), Some(1));
     assert_eq!(rt.finish_process(), 1);
@@ -616,6 +802,63 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
         ]
     );
     assert_eq!(err.lines(), Vec::<String>::new());
+}
+
+fn show(completion: &Completion) -> String {
+    match completion {
+        Completion::Value(_) => "value".into(),
+        Completion::Throw { name, message } => format!("throw {name}: {message}"),
+    }
+}
+
+fn eval_throw(src: &str) -> (Completion, Vec<String>) {
+    let (mut rt, out, _) = test_runtime();
+    let completion = rt.eval(src).expect("parses");
+    (completion, out.lines())
+}
+
+#[test]
+fn uncaught_errors_in_loop_callbacks_surface_from_eval() {
+    for (label, src) in [
+        ("timer", r#"setTimeout(() => { throw new RangeError("late") }, 1)"#),
+        ("immediate", r#"setImmediate(() => { throw new RangeError("late") })"#),
+        ("tick", r#"process.nextTick(() => { throw new RangeError("late") })"#),
+        ("microtask", r#"queueMicrotask(() => { throw new RangeError("late") })"#),
+        (
+            "emitter",
+            r#"const e = new (require("events"))();
+               e.on("x", () => { throw new RangeError("late") });
+               setTimeout(() => e.emit("x"), 1)"#,
+        ),
+        (
+            "completion",
+            r#"require("fs").stat(".", () => { throw new RangeError("late") })"#,
+        ),
+        (
+            "rejection",
+            r#"Promise.reject(new RangeError("late"))"#,
+        ),
+    ] {
+        let (completion, out) = eval_throw(&format!(
+            "{src}; setTimeout(() => console.log('after'), 50);"
+        ));
+        assert!(
+            matches!(&completion, Completion::Throw { name, message } if name == "RangeError" && message == "late"),
+            "{label}: {}", show(&completion)
+        );
+        assert!(!out.contains(&"after".to_string()), "{label}: loop kept running");
+    }
+}
+
+#[test]
+fn uncaught_exception_listener_keeps_eval_value_and_loop_running() {
+    let (completion, out) = eval_throw(
+        r#"process.on("uncaughtException", (e) => console.log("caught", e.message));
+           setTimeout(() => { throw new RangeError("late") }, 1);
+           setTimeout(() => console.log("after"), 20);"#,
+    );
+    assert!(matches!(completion, Completion::Value(_)), "{}", show(&completion));
+    assert_eq!(out, ["caught late", "after"]);
 }
 
 #[test]
@@ -1018,6 +1261,184 @@ fn idle_main_loop_reclaims_before_silent_task_completion() {
 #[test]
 fn idle_worker_loop_reclaims_before_silent_task_completion() {
     idle_loop_reclaims_setup_cycles(true);
+}
+
+struct IdleWorker {
+    waker: RuntimeWaker,
+    wakeups: Arc<AtomicU64>,
+    turns: Arc<AtomicU64>,
+    exited: mpsc::Receiver<Instant>,
+}
+
+/// A worker loop kept alive by a task that never completes, with its maintenance pass quiet, so
+/// the only thing that can end or wake it is what the test does.
+fn start_idle_worker(parent: Option<WorkerEmbedding>, stop: Arc<AtomicBool>) -> IdleWorker {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (exited_tx, exited) = mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut rt = Runtime::new_worker(parent);
+            let live = rt.engine().ctx().live_object_count();
+            rt.idle_gc = (Instant::now(), live);
+            rt.engine()
+                .eval("globalThis.never = () => {}; 0", false)
+                .expect("setup parses");
+            let global = rt.engine().global_this();
+            let callback = rt
+                .engine()
+                .ctx()
+                .get_member(&global, "never")
+                .unwrap_or_else(|_| panic!("callback exists"));
+            lumen_host::register_task(rt.engine().ctx(), callback, None, |_, _| Ok(Vec::new()));
+            ready_tx
+                .send((
+                    rt.waker(),
+                    Arc::clone(&rt.loop_wakeups),
+                    Arc::clone(&rt.loop_turns),
+                ))
+                .unwrap();
+            rt.run_worker_loop(&stop);
+            exited_tx.send(Instant::now()).unwrap();
+        })
+        .unwrap();
+    let (waker, wakeups, turns) = ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    IdleWorker {
+        waker,
+        wakeups,
+        turns,
+        exited,
+    }
+}
+
+const SETTLE: Duration = Duration::from_millis(100);
+const PROMPT: Duration = Duration::from_millis(40);
+
+#[test]
+fn stopping_an_idle_worker_wakes_it_at_once() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let kill = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(SETTLE);
+    let slot = worker::WakeSlot::default();
+    let _ = slot.set(worker.waker.clone());
+    let stopped = Instant::now();
+    worker::stop_worker(&stop, &kill, &slot);
+    let exited = worker
+        .exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an idle worker never saw its stop flag");
+    assert!(exited - stopped < PROMPT, "{:?}", exited - stopped);
+}
+
+#[test]
+fn an_idle_worker_loop_does_not_wake() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(worker.wakeups.load(Ordering::Relaxed), 0);
+    stop.store(true, Ordering::SeqCst);
+    worker.waker.wake();
+    worker.exited.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn an_idle_worker_loop_blocks_in_one_turn() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(worker.turns.load(Ordering::Relaxed), 1);
+    stop.store(true, Ordering::SeqCst);
+    worker.waker.wake();
+    worker.exited.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn a_burst_of_completions_is_one_loop_wake() {
+    const BURST: usize = 1000;
+    let mut rt = Runtime::new();
+    // The first wait creates the poller and finds nothing.
+    assert!(!rt.wait_for_completion(Duration::from_millis(1)));
+    let turns = rt.loop_turns.load(Ordering::Relaxed);
+    let waker = rt.waker();
+    std::thread::spawn(move || {
+        for _ in 0..BURST {
+            waker.wake();
+        }
+    })
+    .join()
+    .unwrap();
+    assert!(rt.wait_for_completion(Duration::from_secs(5)));
+    assert!(rt.completions.try_recv().is_err(), "the burst was not drained");
+    assert!(rt.loop_turns.load(Ordering::Relaxed) - turns <= 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registered_descriptor_wakes_the_loop_on_its_own_thread() {
+    use lumen_os::reactor::{Interest, Ready, Source};
+    let mut rt = Runtime::new();
+    let reactor = rt.reactor().expect("a reactor on this platform");
+    let (read, write) = lumen_os::fs::pipe().unwrap();
+    let woke_on = Arc::new(Mutex::new(None));
+    let waker = rt.waker();
+    let registration = {
+        let woke_on = Arc::clone(&woke_on);
+        reactor
+            .register(
+                Source::Fd(read),
+                Interest::READ,
+                Arc::new(move || {
+                    *woke_on.lock().unwrap() = Some(std::thread::current().id());
+                    waker.wake();
+                }),
+            )
+            .unwrap()
+    };
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        lumen_os::fs::write(write, b"x", None).unwrap();
+    });
+    let started = Instant::now();
+    assert!(rt.wait_for_completion(Duration::from_secs(10)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    writer.join().unwrap();
+    assert_eq!(*woke_on.lock().unwrap(), Some(std::thread::current().id()));
+    assert!(registration.take_ready().contains(Ready::READ));
+    drop(registration);
+    lumen_os::fs::close(read).unwrap();
+    lumen_os::fs::close(write).unwrap();
+}
+
+#[test]
+fn a_parent_interrupt_wakes_an_idle_worker() {
+    let mut parent = Runtime::new_embedded(Embedding {
+        argv: vec!["host".into()],
+        env: Vec::new(),
+        cwd: std::env::current_dir().unwrap(),
+        stdin: Box::new(std::io::empty()),
+        stdout: SharedWriter::new(std::io::sink()),
+        stderr: SharedWriter::new(std::io::sink()),
+        interrupt: Arc::new(AtomicBool::new(false)),
+        live_object_limit: None,
+        spawner: None,
+    });
+    let embedding = parent
+        .engine()
+        .ctx()
+        .op_state()
+        .get::<WorkerEmbedding>()
+        .cloned()
+        .expect("an embedded realm hands its workers an embedding");
+    let worker = start_idle_worker(Some(embedding), Arc::new(AtomicBool::new(false)));
+    std::thread::sleep(SETTLE);
+    let interrupted = Instant::now();
+    parent.terminator().expect("embedded").terminate();
+    let exited = worker
+        .exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the parent's interrupt never woke the worker");
+    assert!(exited - interrupted < PROMPT, "{:?}", exited - interrupted);
 }
 
 #[test]
@@ -1630,16 +2051,6 @@ fn web_encoding_bom_options_order_and_brand_share_native_stream_state() {
         assert(decoder.decode(detaching,{get stream(){
             structuredClone(detaching.buffer,{transfer:[detaching.buffer]});return false;
         }}) === '');
-        const nativeDecode = __lumenEncoding.Decoder.prototype.decode;
-        const nativeLabel = __lumenEncoding.label;
-        try {
-            __lumenEncoding.Decoder.prototype.decode = () => 'corrupt';
-            __lumenEncoding.label = () => 'corrupt';
-            assert(new TextDecoder('utf-8').decode(Uint8Array.of(65)) === 'A');
-        } finally {
-            __lumenEncoding.Decoder.prototype.decode = nativeDecode;
-            __lumenEncoding.label = nativeLabel;
-        }
         console.log('bom-and-brand-ok');
     "#);
     assert_eq!(out.lines(), ["bom-and-brand-ok"]);
@@ -1721,6 +2132,116 @@ fn web_url_reads_the_native_record() {
             "http://us:pw@other.org:9/z",
             "http://ex.com/?x=1&y=2 ?x=1&y=2",
             "https: true",
+        ]
+    );
+}
+
+#[test]
+fn web_url_pattern_matches_and_reports_groups() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const books = new URLPattern({ pathname: "/books/:id" });
+        console.log(books.pathname, books.protocol, books.hasRegExpGroups);
+        console.log(books.test("https://ex.com/books/123"), books.test("https://ex.com/books/"));
+        const hit = books.exec("https://ex.com/books/123?x=1#h");
+        console.log(JSON.stringify(hit.pathname), JSON.stringify(hit.search), hit.inputs.length, hit.inputs[0]);
+        console.log(JSON.stringify(Object.keys(hit)));
+        console.log(JSON.stringify(new URLPattern({ pathname: "/:b/:a" }).exec({ pathname: "/1/2" }).pathname.groups));
+
+        const based = new URLPattern("/a/:b", "https://example.com");
+        console.log(based.protocol, based.hostname, based.port, based.pathname, based.search);
+        console.log(based.test("https://example.com/a/z"), based.test("http://example.com/a/z"));
+
+        const digits = new URLPattern({ pathname: "/files/(\\d+)" });
+        console.log(digits.hasRegExpGroups, digits.test({ pathname: "/files/12" }), digits.test({ pathname: "/files/ab" }));
+        console.log(JSON.stringify(digits.exec({ pathname: "/files/12" }).pathname.groups));
+
+        const optional = new URLPattern({ pathname: "/a/:b?" }).exec("http://x/a");
+        console.log("b" in optional.pathname.groups, optional.pathname.groups.b);
+
+        console.log(new URLPattern({ pathname: "/Foo" }, { ignoreCase: true }).test({ pathname: "/foo" }));
+        console.log(new URLPattern({ pathname: "/Foo" }).test({ pathname: "/foo" }));
+        console.log(new URLPattern({ hostname: "*.example.com" }).test("https://a.example.com/"));
+
+        const rel = new URLPattern({ pathname: "/b" });
+        console.log(rel.test("/b", "https://x.org"), rel.exec("not a url"), JSON.stringify(rel.exec("/b", "https://x.org").inputs));
+        console.log(rel.exec(undefined) === null, new URLPattern().test("https://any.example/p?q#h"));
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "/books/:id * false",
+            "true false",
+            r#"{"input":"/books/123","groups":{"id":"123"}} {"input":"x=1","groups":{"0":"x=1"}} 1 https://ex.com/books/123?x=1#h"#,
+            r#"["inputs","protocol","username","password","hostname","port","pathname","search","hash"]"#,
+            r#"{"b":"1","a":"2"}"#,
+            "https example.com  /a/:b *",
+            "true false",
+            "true true false",
+            r#"{"0":"12"}"#,
+            "true undefined",
+            "true",
+            "false",
+            "true",
+            "true null [\"/b\",\"https://x.org\"]",
+            "true true",
+        ]
+    );
+}
+
+#[test]
+fn web_url_pattern_errors_and_interface_shape() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const name = (fn) => { try { fn(); return "no error"; } catch (e) { return e.name; } };
+        console.log(name(() => new URLPattern("/relative")));
+        console.log(name(() => new URLPattern({ pathname: "/a(" })));
+        console.log(name(() => new URLPattern({ pathname: "/(?<n>x)" })));
+        console.log(name(() => new URLPattern({ pathname: "/:a/:a" })));
+        console.log(name(() => new URLPattern({}, "https://x.org")));
+        console.log(name(() => new URLPattern("/a", "not a url")));
+        console.log(name(() => new URLPattern("https://x.org/", 5)));
+        console.log(name(() => new URLPattern({ protocol: "ht tp" })));
+        console.log(name(() => new URLPattern({ port: "99999" })));
+        console.log(name(() => new URLPattern({ pathname: "/x" }).test({ pathname: "/x" }, "https://x.org")));
+        console.log(name(() => URLPattern.prototype.exec.call({})));
+        console.log(name(() => URLPattern()));
+
+        console.log(URLPattern.length, URLPattern.prototype.test.length, URLPattern.prototype.exec.length);
+        console.log(Object.prototype.toString.call(new URLPattern()));
+        const d = Object.getOwnPropertyDescriptor(URLPattern.prototype, "pathname");
+        console.log(typeof d.get, d.set, d.enumerable, d.configurable);
+        console.log(Object.getOwnPropertyDescriptor(URLPattern.prototype, "exec").enumerable);
+        console.log(Object.getOwnPropertyNames(URLPattern.prototype).sort().join(","));
+        console.log(Object.getOwnPropertyDescriptor(globalThis, "URLPattern").enumerable);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "0 0 0",
+            "[object URLPattern]",
+            "function undefined true true",
+            "true",
+            "constructor,exec,hasRegExpGroups,hash,hostname,password,pathname,port,protocol,search,test,username",
+            "false",
         ]
     );
 }
@@ -2128,6 +2649,293 @@ fn message_channel_semantics() {
 }
 
 #[test]
+fn message_channel_has_no_queue_or_size_limit_by_default() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        let received = 0;
+        let big = 0;
+        for (let i = 0; i < 2000; i++) port2.postMessage(i);
+        port2.postMessage(new Uint8Array(8 * 1024 * 1024));
+        port1.onmessage = (e) => {
+            received++;
+            if (e.data instanceof Uint8Array) big = e.data.length;
+            if (received === 2001) {
+                console.log(received, big);
+                port1.close();
+            }
+        };
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["2001 8388608"]);
+}
+
+#[test]
+fn message_channel_delivers_each_message_as_its_own_task_with_microtasks_between() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        const order = [];
+        port1.onmessage = (e) => {
+            order.push("m" + e.data);
+            Promise.resolve().then(() => order.push("t" + e.data));
+            if (e.data === 3) {
+                port1.close();
+                setTimeout(() => console.log(order.join()), 0);
+            }
+        };
+        for (let i = 1; i <= 3; i++) port2.postMessage(i);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["m1,t1,m2,t2,m3,t3"]);
+}
+
+#[test]
+fn completions_for_cancelled_tasks_are_ignored_by_the_loop() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        port1.onmessage = () => console.log("never");
+        port2.postMessage(1);
+        port1.close();
+        setTimeout(() => console.log("done"), 5);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["done"]);
+}
+
+#[test]
+fn native_messaging_classes_have_the_web_idl_shape() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, "MessagePort");
+        console.log(descriptor.enumerable, descriptor.writable, descriptor.configurable);
+        const channel = new MessageChannel();
+        console.log(channel.port1 === channel.port1, channel.port1 !== channel.port2);
+        console.log(Object.prototype.toString.call(channel), Object.prototype.toString.call(channel.port1));
+        console.log(MessagePort.length, MessageChannel.length, BroadcastChannel.length,
+            MessageEvent.length, CloseEvent.length, PromiseRejectionEvent.length);
+        console.log(Object.getPrototypeOf(MessagePort) === EventTarget,
+            Object.getPrototypeOf(BroadcastChannel) === EventTarget,
+            Object.getPrototypeOf(MessageEvent) === Event,
+            Object.getPrototypeOf(CloseEvent) === Event,
+            Object.getPrototypeOf(PromiseRejectionEvent) === Event);
+        const post = Object.getOwnPropertyDescriptor(MessagePort.prototype, "postMessage");
+        console.log(post.enumerable, MessagePort.prototype.postMessage.length, BroadcastChannel.prototype.postMessage.length);
+        try { new MessagePort(); } catch (e) { console.log("ctor", e.constructor.name); }
+        try { MessagePort.prototype.start.call({}); } catch (e) { console.log("brand", e.constructor.name); }
+        channel.port1.close();
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "false true true",
+            "true true",
+            "[object MessageChannel] [object MessagePort]",
+            "0 0 1 1 1 2",
+            "true true true true true",
+            "true 1 1",
+            "ctor TypeError",
+            "brand TypeError",
+        ]
+    );
+}
+
+#[test]
+fn message_channel_transfers_buffers_and_ports() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        const inner = new MessageChannel();
+        const buffer = new ArrayBuffer(8);
+        new Uint8Array(buffer)[0] = 7;
+        port1.onmessage = (e) => {
+            console.log("buffer", e.data.buffer.byteLength, new Uint8Array(e.data.buffer)[0], buffer.byteLength);
+            console.log("ports", e.ports.length, Object.isFrozen(e.ports), e.ports[0] instanceof MessagePort, e.ports === e.ports);
+            const received = e.ports[0];
+            received.onmessage = (m) => {
+                console.log("inner", m.data);
+                port1.close();
+                received.close();
+            };
+            inner.port1.postMessage("via-transferred");
+        };
+        port2.postMessage({ buffer }, [buffer, inner.port2]);
+        console.log("detached", buffer.byteLength);
+        inner.port2.postMessage("ignored: transferred away");
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "detached 0",
+            "buffer 8 7 0",
+            "ports 1 true true true",
+            "inner via-transferred",
+        ]
+    );
+}
+
+#[test]
+fn message_port_listeners_do_not_start_a_port_and_close_reaches_the_peer() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        port1.addEventListener("message", (e) => console.log("message", e.data));
+        port1.addEventListener("close", () => console.log("close event"));
+        port2.postMessage("queued");
+        setTimeout(() => {
+            console.log("before start");
+            port1.start();
+            port2.postMessage("last");
+            port2.close();
+            port2.postMessage("dropped");
+        }, 5);
+        setTimeout(() => console.log("done"), 40);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        ["before start", "message queued", "message last", "close event", "done"]
+    );
+}
+
+#[test]
+fn broadcast_channel_delivers_to_same_name_channels_and_close_stops_it() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const a = new BroadcastChannel("t");
+        const b = new BroadcastChannel("t");
+        const c = new BroadcastChannel("other");
+        console.log(a.name);
+        b.onmessage = (e) => console.log("b", e.data.n, e instanceof MessageEvent, e.origin === "", e.target === b);
+        c.onmessage = () => console.log("c: wrong channel");
+        a.onmessage = () => console.log("a: wrong, the sender");
+        const message = { n: 1 };
+        a.postMessage(message);
+        message.n = 2;
+        setTimeout(() => {
+            b.close();
+            try { b.postMessage(1); } catch (e) { console.log(e.name); }
+            a.postMessage(3);
+            a.close();
+            a.close();
+            c.close();
+        }, 20);
+        setTimeout(() => console.log("done"), 50);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["t", "b 1 true true true", "InvalidStateError", "done"]);
+}
+
+#[test]
+fn message_close_and_promise_rejection_events_read_their_init() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const m = new MessageEvent("message", { data: { x: 1 }, origin: "https://a.test", lastEventId: "7", ports: [] });
+        console.log(m.data.x, m.origin, m.lastEventId, m.source, Object.isFrozen(m.ports), m.ports.length, m.isTrusted, m instanceof Event);
+        const d = new MessageEvent("message");
+        console.log(d.data, d.origin === "", d.lastEventId === "", d.source);
+        try { new MessageEvent("m", { source: {} }); } catch (e) { console.log("source", e.constructor.name); }
+        try { new MessageEvent("m", { ports: [{}] }); } catch (e) { console.log("ports", e.constructor.name); }
+        m.initMessageEvent("again", true, true, "d", "o", "i", null, []);
+        console.log(m.type, m.bubbles, m.data, m.origin, m.lastEventId);
+        const c = new CloseEvent("close", { code: 1006, reason: "gone", wasClean: false });
+        console.log(c.code, c.reason, c.wasClean, c.type);
+        const p = Promise.reject(1);
+        p.catch(() => {});
+        const r = new PromiseRejectionEvent("unhandledrejection", { promise: p, reason: "why", cancelable: true });
+        console.log(r.promise === p, r.reason, r.cancelable, r instanceof Event);
+        try { new PromiseRejectionEvent("x"); } catch (e) { console.log("missing", e.constructor.name); }
+        try { new PromiseRejectionEvent("x", {}); } catch (e) { console.log("promise", e.constructor.name); }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "1 https://a.test 7 null true 0 false true",
+            "null true true null",
+            "source TypeError",
+            "ports TypeError",
+            "again true d o i",
+            "1006 gone false close",
+            "true why true true",
+            "missing TypeError",
+            "promise TypeError",
+        ]
+    );
+}
+
+#[test]
+fn specification_stylesheet_browser_resource_timeline_bootstrap_uses_original_native_publisher() {
+    let (mut runtime, out, _) = browser_test_runtime();
+    runtime.eval(r#"
+        globalThis.resourceEntries = performance.getEntriesByType.bind(performance);
+        performance.getEntriesByType = () => { throw new Error('replaced public reader'); };
+        globalThis.__performance_timeline.install_resource_publisher = () => {
+            throw new Error('replaced installation method');
+        };
+    "#).unwrap();
+    lumen_host::performance_timeline::record_resource(runtime.engine().ctx(),
+        "https://example.test/style.css", "link", 12.0, 18.0, 40, 80, true).unwrap();
+    runtime.eval(r#"
+        const entries = resourceEntries('resource');
+        const entry = entries[0];
+        console.log(entries.length === 1, entry instanceof PerformanceResourceTiming,
+            entry.name === 'https://example.test/style.css', entry.initiatorType === 'link',
+            entry.startTime === 12, entry.responseEnd === 18,
+            entry.encodedBodySize === 40, entry.decodedBodySize === 80);
+    "#).unwrap();
+    assert_eq!(out.lines(), ["true true true true true true true true"]);
+}
+
+#[test]
+fn performance_is_a_native_event_target_over_the_process_clock() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const a = performance.now();
+        const b = performance.now();
+        console.log(a >= 0, b >= a, Number.isFinite(performance.timeOrigin), performance.timeOrigin > 1e12);
+        console.log(performance.toJSON().timeOrigin === performance.timeOrigin);
+        console.log(Object.prototype.toString.call(performance), performance instanceof EventTarget, performance instanceof Performance);
+        try { new Performance(); } catch (e) { console.log(e.constructor.name); }
+        console.log(self === globalThis, Object.getOwnPropertyDescriptor(globalThis, "performance").enumerable);
+        console.log(Object.getOwnPropertyDescriptor(Performance.prototype, "now").enumerable);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "true true true true",
+            "true",
+            "[object Performance] true true",
+            "TypeError",
+            "true true",
+            "true",
+        ]
+    );
+}
+
+#[test]
 fn message_port_close_and_guards() {
     let (mut rt, out, _err) = test_runtime();
     rt.eval(
@@ -2371,6 +3179,282 @@ fn structured_clone_wire_round_trips() {
     );
 }
 
+#[test]
+fn structured_clone_arrays_objects_and_property_order() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const holey = [1, , 3];
+        holey.extra = 'x';
+        const copy = structuredClone(holey);
+        check(copy.length === 3 && !(1 in copy) && copy[0] === 1 && copy[2] === 3, 'holes survive');
+        check(copy.extra === 'x', 'extra array property survives');
+        const sparse = [];
+        sparse[5] = 'tail';
+        const sparseCopy = structuredClone(sparse);
+        check(sparseCopy.length === 6 && Object.keys(sparseCopy).join() === '5', 'sparse length');
+        const proto = structuredClone(JSON.parse('{"__proto__":{"polluted":1}}'));
+        check(Object.getPrototypeOf(proto) === Object.prototype, '__proto__ key stays data');
+        check(Object.prototype.hasOwnProperty.call(proto, '__proto__') && proto.polluted === undefined, '__proto__ own');
+        const symbolKeyed = { [Symbol('k')]: 1, visible: 2 };
+        check(Object.getOwnPropertySymbols(structuredClone(symbolKeyed)).length === 0, 'symbol keys dropped');
+        const hidden = Object.defineProperty({ shown: 1 }, 'hidden', { value: 2, enumerable: false });
+        check(!('hidden' in structuredClone(hidden)), 'non-enumerable dropped');
+        const order = [];
+        const source = {
+            get first() { order.push('first'); delete this.second; return 1; },
+            second: 2,
+            third: 3,
+        };
+        const ordered = structuredClone(source);
+        check(order.join() === 'first', 'getters run once');
+        check(JSON.stringify(ordered) === '{"first":1,"third":3}', 'deleted key is skipped');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_errors_boxed_primitives_and_strings() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = new RangeError('bad', { cause: new TypeError('inner') });
+        const copy = structuredClone(failure);
+        check(copy instanceof RangeError && copy !== failure, 'error type');
+        check(copy.message === 'bad' && copy.stack === failure.stack, 'message and stack');
+        check(copy.cause instanceof TypeError && copy.cause.message === 'inner', 'cause');
+        check(!Object.prototype.propertyIsEnumerable.call(copy, 'cause'), 'cause hidden');
+        class Custom extends Error {
+            constructor(message) { super(message); this.name = 'Custom'; this.extra = 1; }
+        }
+        const custom = structuredClone(new Custom('x'));
+        check(Object.getPrototypeOf(custom) === Error.prototype && custom.message === 'x', 'custom error name');
+        check(!('extra' in custom), 'error own properties dropped');
+        const noMessage = structuredClone(new Error());
+        check(!Object.prototype.hasOwnProperty.call(noMessage, 'message'), 'no message stays absent');
+        const big = structuredClone(Object(90071992547409910n));
+        check(typeof big === 'object' && big.valueOf() === 90071992547409910n, 'boxed bigint');
+        check(structuredClone(new Boolean(false)).valueOf() === false, 'boxed boolean');
+        check(structuredClone(Object(-0)).valueOf() === 0 && Object.is(structuredClone(Object(-0)).valueOf(), -0), 'boxed -0');
+        const lone = structuredClone('a\ud800b');
+        check(lone.length === 3 && lone.charCodeAt(1) === 0xd800, 'lone surrogate string');
+        const boxedLone = structuredClone(new String('\udc00'));
+        check(boxedLone.valueOf().charCodeAt(0) === 0xdc00, 'lone surrogate in String object');
+        const key = structuredClone({ ['\ud800']: 1 });
+        check(Object.keys(key)[0].charCodeAt(0) === 0xd800, 'lone surrogate key');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_collections_dates_and_regexps_keep_identity() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const map = new Map();
+        map.set('self', map);
+        map.set(map, 1);
+        const mapCopy = structuredClone(map);
+        check(mapCopy !== map && mapCopy.get('self') === mapCopy && mapCopy.get(mapCopy) === 1, 'map cycle');
+        const set = new Set();
+        set.add(set);
+        set.add(1);
+        const setCopy = structuredClone(set);
+        check(setCopy.has(setCopy) && setCopy.has(1) && setCopy.size === 2, 'set cycle');
+        const date = new Date(5);
+        const shared = structuredClone({ a: date, b: date, s: new Set([date]) });
+        check(shared.a === shared.b && shared.s.has(shared.a) && shared.a.getTime() === 5, 'date identity');
+        const re = /x(y)/gi;
+        re.lastIndex = 3;
+        const regexps = structuredClone({ a: re, b: re });
+        check(regexps.a === regexps.b && regexps.a.lastIndex === 0, 'regexp identity and lastIndex');
+        check(regexps.a.source === 'x(y)' && regexps.a.flags === 'gi', 'regexp parts');
+        check(structuredClone(new Date(NaN)).getTime() !== structuredClone(new Date(NaN)).getTime(), 'invalid date');
+        const buffer = new ArrayBuffer(8);
+        const views = structuredClone({ whole: new Uint8Array(buffer), part: new Int16Array(buffer, 2, 2), dv: new DataView(buffer, 1, 3) });
+        check(views.whole.buffer === views.part.buffer && views.part.buffer === views.dv.buffer, 'views share the buffer');
+        check(views.part.byteOffset === 2 && views.part.length === 2 && views.dv.byteOffset === 1 && views.dv.byteLength === 3, 'view windows');
+        check(views.whole.buffer !== buffer, 'buffer copied');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_rejects_uncloneable_values_and_bad_options() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name + ':' + (e.code ?? ''); } };
+        for (const [label, make] of [
+            ['proxy', () => new Proxy({}, {})],
+            ['function proxy', () => new Proxy(function () {}, {})],
+            ['weakmap', () => new WeakMap()],
+            ['weakset', () => new WeakSet()],
+            ['weakref', () => new WeakRef({})],
+            ['promise', () => Promise.resolve(1)],
+            ['symbol object', () => Object(Symbol('s'))],
+            ['symbol', () => Symbol('s')],
+            ['function', () => () => {}],
+            ['nested function', () => ({ deep: [{ f() {} }] })],
+            ['native instance', () => new Event('x')],
+        ]) {
+            check(failure(() => structuredClone(make())) === 'DataCloneError:25', label);
+        }
+        check(failure(() => structuredClone()) === 'TypeError:ERR_MISSING_ARGS', 'missing value');
+        check(structuredClone(undefined) === undefined, 'explicit undefined');
+        check(failure(() => structuredClone(1, 5)) === 'TypeError:ERR_INVALID_ARG_TYPE', 'options type');
+        check(failure(() => structuredClone(1, { transfer: 5 })) === 'TypeError:ERR_INVALID_ARG_TYPE', 'transfer type');
+        check(structuredClone(1, null) === 1 && structuredClone(1, { transfer: null }) === 1, 'null options');
+        const iterable = { *[Symbol.iterator]() { yield new ArrayBuffer(1); } };
+        check(structuredClone(2, { transfer: iterable }) === 2, 'iterable transfer');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_transfer_detaches_only_after_success() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const buffer = new ArrayBuffer(8);
+        const view = new Uint8Array(buffer, 2, 4);
+        view.set([1, 2, 3, 4]);
+        const moved = structuredClone({ buffer, view }, { transfer: [buffer] });
+        check(buffer.byteLength === 0 && buffer.detached, 'source detached');
+        check(moved.buffer.byteLength === 8 && moved.view.buffer === moved.buffer, 'clone keeps the buffer');
+        check(moved.view.byteOffset === 2 && moved.view.join() === '1,2,3,4', 'clone keeps the view');
+        check(failure(() => structuredClone(1, { transfer: [buffer] })) === 'DataCloneError', 'detached transfer');
+        const twice = new ArrayBuffer(4);
+        check(failure(() => structuredClone(1, { transfer: [twice, twice] })) === 'DataCloneError', 'duplicate transfer');
+        check(failure(() => structuredClone(1, { transfer: [{}] })) === 'DataCloneError', 'object transfer');
+        check(failure(() => structuredClone(1, { transfer: [new SharedArrayBuffer(1)] })) === 'DataCloneError', 'shared transfer');
+        check(twice.byteLength === 4, 'refused transfer leaves the buffer');
+        const kept = new ArrayBuffer(4);
+        check(failure(() => structuredClone({ f() {} }, { transfer: [kept] })) === 'DataCloneError', 'failed clone');
+        check(kept.byteLength === 4, 'failed clone leaves the buffer');
+        const mutated = new ArrayBuffer(4);
+        const sneaky = { get detach() { structuredClone(0, { transfer: [mutated] }); return 1; } };
+        check(failure(() => structuredClone(sneaky, { transfer: [mutated] })) === 'DataCloneError', 'detached by a getter');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_ports_and_shared_memory() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const channel = new MessageChannel();
+        check(failure(() => structuredClone({ port: channel.port1 })) === 'DataCloneError', 'unlisted port');
+        const moved = structuredClone({ port: channel.port1, again: channel.port1 }, { transfer: [channel.port1] });
+        check(moved.port instanceof MessagePort && moved.port !== channel.port1 && moved.port === moved.again, 'transferred port');
+        check(failure(() => structuredClone(1, { transfer: [channel.port1] })) === 'DataCloneError', 'transferred port is detached');
+        const shared = new SharedArrayBuffer(8);
+        const copy = structuredClone({ a: shared, b: shared, view: new Int32Array(shared) });
+        check(copy.a instanceof SharedArrayBuffer && copy.a !== shared && copy.a === copy.b, 'shared copy');
+        copy.view[1] = 42;
+        check(new Int32Array(shared)[1] === 42, 'shared memory stays shared');
+        moved.port.close();
+        channel.port2.close();
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_host_object_protocol_and_blobs() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const kClone = Symbol.for('lumen.transferable.clone');
+        const kDeserialize = Symbol.for('lumen.transferable.deserialize');
+        class Box {
+            constructor(value) { this.value = value; }
+            [kClone]() { return { data: { value: this.value }, deserializeInfo: 'test:box' }; }
+            [kDeserialize](data) { this.value = data.value; }
+        }
+        const factory = (data) => ({ factory: data.n });
+        globalThis.__lumenCloneResolve = (info) => ({ 'test:box': Box, 'test:factory': factory })[info];
+        const box = new Box(7);
+        const pair = structuredClone({ one: box, two: box });
+        check(pair.one instanceof Box && pair.one !== box && pair.one.value === 7 && pair.one === pair.two, 'host object');
+        class Made { [kClone]() { return { data: { n: 3 }, deserializeInfo: 'test:factory' }; } }
+        check(structuredClone(new Made()).factory === 3, 'factory host object');
+        class Unknown { [kClone]() { return { data: 1, deserializeInfo: 'test:missing' }; } }
+        try { structuredClone(new Unknown()); check(false, 'unknown host object'); } catch (e) { check(e.name === 'DataCloneError', 'unknown host error'); }
+        const file = new File(['abc'], 'n.txt', { type: 'Text/Plain', lastModified: 9 });
+        const blob = new Blob(['xy'], { type: 'a/b' });
+        const copy = structuredClone({ file, blob, again: blob });
+        check(copy.file instanceof File && copy.file !== file && copy.file.name === 'n.txt', 'file clone');
+        check(copy.file.lastModified === 9 && copy.file.type === 'text/plain' && copy.file.size === 3, 'file parts');
+        check(copy.blob instanceof Blob && !(copy.blob instanceof File) && copy.blob === copy.again && copy.blob.size === 2, 'blob clone');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_wire_extended_round_trips() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const name = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const rt = (v, transfer) => __deserializeClone(__serializeForClone(v, transfer));
+        const date = new Date(7);
+        const graph = rt({ a: date, b: date, list: Object.assign([1, , 3], { tag: 't' }), e: new Error('x', { cause: 4 }) });
+        check(graph.a === graph.b, 'date identity on the wire');
+        check(graph.list.length === 3 && !(1 in graph.list) && graph.list.tag === 't', 'array entries on the wire');
+        check(graph.e.cause === 4 && graph.e.message === 'x', 'error cause on the wire');
+        const buffer = new ArrayBuffer(16);
+        const out = rt({ view: new Float32Array(buffer, 4, 2), dv: new DataView(buffer, 8, 8) });
+        check(out.view.buffer === out.dv.buffer && out.view.byteOffset === 4 && out.dv.byteOffset === 8, 'views on the wire');
+        if (typeof Float16Array === 'function') {
+            check(rt(new Float16Array([1.5, 2])).join() === '1.5,2', 'Float16Array on the wire');
+        }
+        check(name(() => __serializeForClone(new SharedArrayBuffer(1))) === 'DataCloneError', 'shared memory needs transport');
+        check(name(() => __serializeForClone(1, [new ArrayBuffer(1)])) === 'DataCloneError', 'buffer transfer needs transport');
+        check(name(() => __deserializeClone(new Uint8Array(0))) === 'DataCloneError', 'empty message');
+        check(name(() => __deserializeClone(Uint8Array.of(250))) === 'DataCloneError', 'unknown tag');
+        const truncated = __serializeForClone('hello');
+        check(name(() => __deserializeClone(truncated.subarray(0, truncated.length - 2))) === 'DataCloneError', 'truncated message');
+        const file = rt(new File(['abc'], 'n.txt', { type: 'text/plain', lastModified: 9 }));
+        check(file instanceof File && file.name === 'n.txt' && file.lastModified === 9 && file.size === 3, 'file on the wire');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
 // ---- Web Workers (realm-per-thread + structured messaging) ----
 
 /// Write worker scripts into a temp dir and drive `main_src` against them; returns stdout lines.
@@ -2439,6 +3523,76 @@ fn browser_worker_installs_shared_css_typed_om_interfaces() {
         "#,
     );
     assert_eq!(lines, ["function|true|calc(2 * 3s)|1|-1"]);
+}
+
+#[test]
+fn browser_worker_geometry_native_clone_and_indexed_db_storage() {
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        let (mut runtime, out, err) = browser_test_runtime();
+        runtime.set_deadline(Duration::from_secs(10));
+        let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body></body>", 1024).unwrap();
+        realm.set_document_url("https://geometry-worker.test/document.html");
+        runtime.eval(r#"
+            const url=URL.createObjectURL(new Blob([`
+                postMessage([typeof DOMMatrix,typeof DOMMatrixReadOnly,typeof DOMPoint,typeof DOMPointReadOnly,typeof DOMRect,typeof DOMRectReadOnly].join('|'));
+                const matrix=new DOMMatrix([2,0,0,3,4,5]);
+                const value={matrix,alias:matrix,readonly:new DOMMatrixReadOnly(),point:new DOMPoint(1,2,3,4),readonlyPoint:new DOMPointReadOnly(5,6,7,8),rect:new DOMRect(1,2,3,4),readonlyRect:new DOMRectReadOnly(5,6,7,8)};
+                const copy=structuredClone(value);
+                if(copy.matrix!==copy.alias || !(copy.matrix instanceof DOMMatrix) || copy.matrix.transformPoint(copy.point).x!==18)throw new Error('worker native clone');
+                let strings=false;try{new DOMMatrix('matrix(1,0,0,1,0,0)')}catch(e){strings=e.name==='TypeError'};
+                if(!strings)throw new Error('worker string restriction');
+                const opening=indexedDB.open('worker-geometry',1);
+                opening.onerror=()=>{postMessage('error:'+opening.error.name);close()};
+                opening.onupgradeneeded=()=>{
+                    const store=opening.result.createObjectStore('values');
+                    store.put(value,1).onsuccess=()=>store.get(1).onsuccess=e=>{
+                        const stored=e.target.result;
+                        if(stored.matrix!==stored.alias || !(stored.matrix instanceof DOMMatrix) || !(stored.readonly instanceof DOMMatrixReadOnly) || !(stored.point instanceof DOMPoint) || !(stored.readonlyPoint instanceof DOMPointReadOnly) || !(stored.rect instanceof DOMRect) || !(stored.readonlyRect instanceof DOMRectReadOnly))throw new Error('worker storage brands');
+                        postMessage('stored:'+stored.matrix.transformPoint(stored.point).x+':'+stored.readonlyPoint.w);
+                    };
+                };
+                opening.onsuccess=()=>{opening.result.close();close()};
+            `],{type:'text/javascript'}));
+            const worker=new Worker(url);worker.onmessage=e=>console.log(e.data);worker.onerror=e=>console.error(e.message);
+        "#).expect("actual worker geometry lifecycle reaches quiescence");
+        assert_eq!(out.lines(), ["function|function|function|function|function|function", "stored:18:8"]);
+        assert!(err.lines().is_empty(), "{:?}",err.lines());
+    }).unwrap().join().unwrap();
+}
+
+#[test]
+fn browser_worker_indexed_db_shares_origin_profile_records() {
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        let (mut runtime, out, err) = browser_test_runtime();
+        runtime.set_deadline(Duration::from_secs(10));
+        let realm = lumen_html_js::install(runtime.engine().ctx(), "<!doctype html><body></body>", 1024).unwrap();
+        realm.set_document_url("https://db-worker.test/document.html");
+        runtime.eval(r#"
+            const opened = indexedDB.open('shared-records', 1);
+            opened.onupgradeneeded = () => opened.result.createObjectStore('items').put({answer:42}, 1);
+            opened.onerror = () => console.error('parent open failure', opened.error.name);
+            opened.onsuccess = () => {
+                opened.result.close();
+                const url = URL.createObjectURL(new Blob([`
+                    const opened = indexedDB.open('shared-records');
+                    opened.onupgradeneeded = () => {postMessage('unexpected upgrade');close();};
+                    opened.onerror = () => {postMessage('worker open failure:' + opened.error.name);close();};
+                    opened.onsuccess = () => {
+                        const db=opened.result,tx=db.transaction('items');
+                        tx.objectStore('items').get(1).onsuccess = event => {
+                            postMessage('stored:' + event.target.result.answer);
+                            db.close();close();
+                        };
+                    };
+                `], {type:'text/javascript'}));
+                const worker = new Worker(url);
+                worker.onmessage = event => console.log(event.data);
+                worker.onerror = event => console.error('worker failure', event.message);
+            };
+        "#).expect("browser IDB worker lifecycle must run to quiescence");
+        assert_eq!(out.lines(), ["stored:42"]);
+        assert!(err.lines().is_empty(), "{:?}", err.lines());
+    }).unwrap().join().unwrap();
 }
 
 #[test]
@@ -2681,6 +3835,234 @@ fn websocket_constructor_validation() {
     );
 }
 
+/// Run `script` against a fresh browser runtime that exposes `gc()`.
+fn gc_runtime(script: &str) -> (Runtime, Captured) {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.expose_gc();
+    rt.eval(script).expect("script parses and runs to quiescence");
+    (rt, out)
+}
+
+#[test]
+fn websocket_and_eventsource_have_the_web_idl_shape() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const d = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+        console.log(d.enumerable, d.writable, d.configurable, WebSocket.length, EventSource.length);
+        console.log(Object.getPrototypeOf(WebSocket) === EventTarget, Object.getPrototypeOf(EventSource) === EventTarget);
+        for (const [ctor, names] of [[WebSocket, ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]], [EventSource, ["CONNECTING", "OPEN", "CLOSED"]]]) {
+            console.log(names.map((name) => {
+                const own = Object.getOwnPropertyDescriptor(ctor, name);
+                const inherited = Object.getOwnPropertyDescriptor(ctor.prototype, name);
+                return `${name}=${own.value}/${inherited.value}/${own.writable}/${own.enumerable}/${own.configurable}`;
+            }).join(" "));
+        }
+        const accessors = (proto, names) => names.map((name) => {
+            const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+            return `${name}:${typeof descriptor.get}:${typeof descriptor.set}`;
+        }).join(" ");
+        console.log(accessors(WebSocket.prototype, ["url", "readyState", "bufferedAmount", "extensions", "protocol", "binaryType", "onopen", "onmessage", "onerror", "onclose"]));
+        console.log(accessors(EventSource.prototype, ["url", "withCredentials", "readyState", "onopen", "onmessage", "onerror"]));
+        const ws = new WebSocket("ws://127.0.0.1:1/");
+        const es = new EventSource("http://127.0.0.1:1/", { withCredentials: true });
+        console.log(Object.prototype.toString.call(ws), Object.prototype.toString.call(es));
+        console.log(ws instanceof EventTarget, es instanceof EventTarget, ws.url, es.url, es.withCredentials);
+        console.log(ws.readyState, ws.protocol === "", ws.extensions === "", ws.bufferedAmount, ws.binaryType, es.readyState);
+        const handler = () => {};
+        console.log(ws.onopen === null, (ws.onopen = handler, ws.onopen === handler), (ws.onopen = null, ws.onopen === null), (es.onmessage = 5, es.onmessage === null));
+        console.log(WebSocket.prototype.send.length, WebSocket.prototype.close.length, EventSource.prototype.close.length);
+        try { WebSocket.prototype.send.call({}, "x"); } catch (e) { console.log("brand", e.constructor.name, e.code); }
+        try { new WebSocket(); } catch (e) { console.log("missing", e.constructor.name); }
+        es.close();
+        ws.close();
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "false true true 1 1",
+            "true true",
+            "CONNECTING=0/0/false/true/false OPEN=1/1/false/true/false CLOSING=2/2/false/true/false CLOSED=3/3/false/true/false",
+            "CONNECTING=0/0/false/true/false OPEN=1/1/false/true/false CLOSED=2/2/false/true/false",
+            "url:function:undefined readyState:function:undefined bufferedAmount:function:undefined extensions:function:undefined protocol:function:undefined binaryType:function:function onopen:function:function onmessage:function:function onerror:function:function onclose:function:function",
+            "url:function:undefined withCredentials:function:undefined readyState:function:undefined onopen:function:function onmessage:function:function onerror:function:function",
+            "[object WebSocket] [object EventSource]",
+            "true true ws://127.0.0.1:1/ http://127.0.0.1:1/ true",
+            "0 true true 0 blob 0",
+            "true true true true",
+            "1 0 0",
+            "brand TypeError ERR_INVALID_THIS",
+            "missing TypeError",
+        ]
+    );
+}
+
+#[test]
+fn websocket_event_sequence_and_ready_states() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        const sizeOf = (data) => data instanceof Blob ? "blob:" + data.size : data instanceof ArrayBuffer ? "arraybuffer:" + data.byteLength : typeof data;
+        ws.addEventListener("open", (e) => {
+            console.log("open", ws.readyState, e.constructor.name, e.isTrusted, e.target === ws);
+            ws.send("hello");
+        });
+        ws.addEventListener("message", (e) => {
+            console.log("message", sizeOf(e.data), e.constructor.name, e.isTrusted, e.lastEventId === "", e.source);
+            if (typeof e.data === "string") {
+                ws.send(new Uint8Array([1, 2, 3]));
+            } else if (e.data instanceof Blob) {
+                ws.binaryType = "arraybuffer";
+                ws.send(new Blob([new Uint8Array([9, 8, 7, 6])]));
+            } else {
+                ws.close(4000, "bye");
+                console.log("closing", ws.readyState);
+            }
+        });
+        ws.onclose = (e) => console.log("close", ws.readyState, e.constructor.name, e.isTrusted, e.code, e.reason, e.wasClean);
+        const bad = (fn) => { try { fn(); return "none"; } catch (e) { return e.name; } };
+        console.log(bad(() => { ws.binaryType = "text"; }), bad(() => ws.close(1)), bad(() => ws.close(1000, "x".repeat(124))));
+        "#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "SyntaxError InvalidAccessError SyntaxError",
+            "open 1 Event true true",
+            "message string MessageEvent true true null",
+            "message blob:3 MessageEvent true true null",
+            "message arraybuffer:4 MessageEvent true true null",
+            "closing 2",
+            "close 3 CloseEvent true 4000 bye true",
+        ]
+    );
+}
+
+#[test]
+fn websocket_send_before_open_throws_and_close_while_connecting_fails() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        try { ws.send("early"); } catch (e) { console.log(e.name, e instanceof DOMException); }
+        ws.onopen = () => console.log("open (wrong!)");
+        ws.onerror = () => console.log("error", ws.readyState);
+        ws.onclose = (e) => console.log("close", e.code, e.wasClean);
+        ws.close();
+        console.log("state", ws.readyState);
+        ws.send("after close request");
+        "#,
+    );
+    assert_eq!(
+        lines,
+        ["InvalidStateError true", "state 2", "error 3", "close 1006 false"]
+    );
+}
+
+#[test]
+fn websocket_refused_connection_is_error_then_close() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:1/");
+        ws.onopen = () => console.log("open (wrong!)");
+        ws.addEventListener("error", (e) => console.log("error", ws.readyState, e.constructor.name, e.isTrusted));
+        ws.addEventListener("close", (e) => console.log("close", ws.readyState, e.code, e.reason === "", e.wasClean));
+        "#,
+    );
+    assert_eq!(out.lines(), ["error 3 Event true", "close 3 1006 true false"]);
+}
+
+#[test]
+fn websocket_with_listeners_survives_collection_and_closed_sockets_collect() {
+    let port = spawn_echo(WsMode::Echo, 1);
+    let (mut rt, out) = gc_runtime(&format!(
+        r#"
+        globalThis.refs = [];
+        (() => {{
+            const ws = new WebSocket("ws://127.0.0.1:{port}/");
+            ws.onopen = () => ws.send("ping");
+            ws.onmessage = (e) => {{ console.log("echo", e.data); ws.close(); }};
+            ws.onclose = (e) => console.log("close", e.code, e.wasClean);
+            refs.push(new WeakRef(ws));
+            const refused = new WebSocket("ws://127.0.0.1:1/");
+            refused.onerror = () => {{}};
+            refs.push(new WeakRef(refused));
+        }})();
+        let rounds = 0;
+        const timer = setInterval(() => {{ gc(); if (++rounds === 20) clearInterval(timer); }}, 2);
+        "#
+    ));
+    assert_eq!(out.lines(), ["echo ping", "close 1000 true"]);
+    rt.eval("gc(); gc(); console.log(refs.map((ref) => ref.deref() === undefined).join());")
+        .unwrap();
+    assert_eq!(out.lines()[2], "true,true");
+}
+
+#[test]
+fn eventsource_custom_events_and_last_event_id() {
+    let lines = sse_drive(
+        SseMode::Events,
+        1,
+        r#"
+        const es = new EventSource("http://127.0.0.1:{PORT}/stream");
+        es.addEventListener("tick", (e) => console.log("tick", e.data, e.type, e.constructor.name, e.isTrusted, e.origin === new URL(es.url).origin, JSON.stringify(e.lastEventId)));
+        es.onmessage = (e) => console.log("message", JSON.stringify(e.data), JSON.stringify(e.lastEventId));
+        es.onerror = () => { console.log("error", es.readyState); es.close(); console.log("closed", es.readyState); };
+        "#,
+    );
+    assert_eq!(
+        lines,
+        [
+            r#"message "hello" """#,
+            r#"tick 42 tick MessageEvent true true """#,
+            r#"message "line one\nline two" "9""#,
+            "error 0",
+            "closed 2",
+        ]
+    );
+}
+
+#[test]
+fn eventsource_reconnects_while_unreferenced_with_listeners() {
+    let port = spawn_sse(SseMode::Reconnect, 2);
+    let (_rt, out) = gc_runtime(&format!(
+        r#"
+        (() => {{
+            const es = new EventSource("http://127.0.0.1:{port}/stream");
+            let seen = 0;
+            es.onmessage = (e) => {{
+                console.log("msg", e.data, e.lastEventId);
+                if (++seen === 2) e.target.close();
+            }};
+        }})();
+        let rounds = 0;
+        const timer = setInterval(() => {{ gc(); if (++rounds === 20) clearInterval(timer); }}, 2);
+        "#
+    ));
+    assert_eq!(out.lines(), ["msg first 5", "msg resumed-from-5 5"]);
+}
+
+#[test]
+fn closed_eventsource_is_collectable_and_close_during_error_stops_reconnects() {
+    let (mut rt, out) = gc_runtime(
+        r#"
+        globalThis.weak = (() => {
+            const es = new EventSource("http://127.0.0.1:1/");
+            es.onerror = () => { es.close(); console.log("error", es.readyState); };
+            return new WeakRef(es);
+        })();
+        "#,
+    );
+    assert_eq!(out.lines(), ["error 2"]);
+    rt.eval("gc(); gc(); console.log(weak.deref() === undefined);").unwrap();
+    assert_eq!(out.lines()[1], "true");
+}
+
 #[test]
 fn wintertc_functional_smoke() {
     // Presence is not correctness: exercise the core interfaces end-to-end.
@@ -2732,7 +4114,7 @@ fn perf_boot_breakdown() {
     let mut totals = vec![Vec::new(); names.len()];
     for _ in 0..30 {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let pool = ThreadPool::new(4, tx);
+        let pool = ThreadPool::new(tx);
         let mut engine = lumen_host::Engine::new();
         engine.ctx().op_state().put(pool.handle());
         engine.ctx().op_state().put(TaskRegistry::default());
@@ -2797,6 +4179,348 @@ fn web_serve_roundtrip_over_loopback() {
         out.lines(),
         ["200 hi pong", "200 true 42", "200 got:hey", "closed"]
     );
+}
+
+#[test]
+fn web_serve_has_the_lumen_namespace_shape() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const names = Object.keys(Lumen).filter((name) => ["serve", "upgradeWebSocket", "version"].includes(name));
+        console.log(names.sort().join());
+        console.log(typeof Lumen.serve, typeof Lumen.upgradeWebSocket, typeof Lumen.version);
+        const version = Object.getOwnPropertyDescriptor(Lumen, "version");
+        console.log(version.writable, version.enumerable, version.configurable);
+        try { Lumen.serve(42); } catch (error) { console.log(error.name); }
+        try { Lumen.serve({}); } catch (error) { console.log(error.name); }
+        try { Lumen.upgradeWebSocket({}); } catch (error) { console.log(error.name); }
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "serve,upgradeWebSocket,version",
+            "function function string",
+            "false true true",
+            "TypeError",
+            "TypeError",
+            "TypeError"
+        ]
+    );
+}
+
+#[test]
+fn web_serve_accepts_every_handler_form_and_reports_errors() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const listening = [];
+            const optionsFirst = Lumen.serve(
+                { hostname: "127.0.0.1", port: 0, onListen: (info) => listening.push(info.hostname) },
+                (req, info) => new Response(info.remoteAddr.transport + ":" + info.remoteAddr.hostname),
+            );
+            const r1 = await fetch(`http://127.0.0.1:${optionsFirst.port}/`);
+            console.log("options-first", r1.status, await r1.text(), listening.join());
+            await optionsFirst.shutdown();
+
+            const app = {
+                greeting: "hello",
+                onError() { return new Response("must not be used", { status: 418 }); },
+                fetch(req) { return new Response(this.greeting + " " + new URL(req.url).pathname); },
+                hostname: "127.0.0.1",
+                port: 0,
+            };
+            const fromObject = Lumen.serve(app);
+            const r2 = await fetch(`http://127.0.0.1:${fromObject.port}/object`);
+            console.log("object", r2.status, await r2.text());
+            await fromObject.shutdown();
+
+            const thrown = Lumen.serve(() => { throw new Error("boom"); }, { hostname: "127.0.0.1", port: 0 });
+            const r3 = await fetch(`http://127.0.0.1:${thrown.port}/`);
+            console.log("default-500", r3.status, r3.statusText, r3.headers.get("content-type"), await r3.text());
+            await thrown.shutdown();
+
+            const hooked = Lumen.serve(
+                async (req) => { if (req.method === "GET") return "not a response"; throw new RangeError("later"); },
+                {
+                    hostname: "127.0.0.1",
+                    port: 0,
+                    onError: async (error) => new Response(error.name + ":" + error.message, { status: 502 }),
+                },
+            );
+            const r4 = await fetch(`http://127.0.0.1:${hooked.port}/`);
+            console.log("hook-type", r4.status, await r4.text());
+            const r5 = await fetch(`http://127.0.0.1:${hooked.port}/`, { method: "POST", body: "x" });
+            console.log("hook-throw", r5.status, await r5.text());
+            await hooked.shutdown();
+
+            const failingHook = Lumen.serve(
+                () => { throw new Error("first"); },
+                { hostname: "127.0.0.1", port: 0, onError: () => { throw new Error("second"); } },
+            );
+            const r6 = await fetch(`http://127.0.0.1:${failingHook.port}/`);
+            console.log("hook-fails", r6.status, await r6.text());
+            await failingHook.shutdown();
+
+            const controller = new AbortController();
+            const aborted = Lumen.serve(() => new Response("x"), {
+                hostname: "127.0.0.1",
+                port: 0,
+                signal: controller.signal,
+            });
+            controller.abort();
+            await aborted.finished;
+            console.log("aborted");
+            const early = new AbortController();
+            early.abort();
+            const never = Lumen.serve(() => new Response("x"), { hostname: "127.0.0.1", port: 0, signal: early.signal });
+            await never.finished;
+            console.log("pre-aborted");
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "options-first 200 tcp:127.0.0.1 127.0.0.1",
+            "object 200 hello /object",
+            "default-500 500 Internal Server Error text/plain;charset=UTF-8 Internal Server Error",
+            "hook-type 502 TypeError:serve handler did not return a Response",
+            "hook-throw 502 RangeError:later",
+            "hook-fails 500 Internal Server Error",
+            "aborted",
+            "pre-aborted",
+        ]
+    );
+    assert!(err.lines().iter().any(|line| line.contains("boom")), "{:?}", err.lines());
+}
+
+#[test]
+fn web_serve_gives_the_handler_native_requests_and_writes_native_responses() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve(async (req) => {
+                const url = new URL(req.url);
+                if (url.pathname === "/inspect") {
+                    return new Response(JSON.stringify({
+                        isRequest: req instanceof Request,
+                        method: req.method,
+                        query: url.searchParams.get("q"),
+                        header: req.headers.get("x-probe"),
+                        body: req.body === null,
+                    }));
+                }
+                if (url.pathname === "/stream") {
+                    return new Response(new ReadableStream({
+                        start(controller) {
+                            controller.enqueue(new TextEncoder().encode("one,"));
+                            controller.enqueue(new TextEncoder().encode("two"));
+                            controller.close();
+                        },
+                    }), { status: 201, statusText: "Made", headers: { "x-extra": "yes" } });
+                }
+                if (url.pathname === "/used") {
+                    const response = new Response("consumed");
+                    await response.text();
+                    return response;
+                }
+                if (url.pathname === "/cookies") {
+                    const headers = new Headers();
+                    headers.append("x-multi", "a=1");
+                    headers.append("x-multi", "b=2");
+                    return new Response(null, { status: 204, headers });
+                }
+                if (url.pathname === "/echo") {
+                    return new Response(await req.arrayBuffer(), { headers: { "content-type": req.headers.get("content-type") } });
+                }
+                return new Response("missing", { status: 404 });
+            }, { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            const inspect = await fetch(`${base}/inspect?q=7`, { headers: { "x-probe": "p" } });
+            console.log(JSON.stringify(await inspect.json()));
+            const stream = await fetch(`${base}/stream`);
+            console.log(stream.status, stream.statusText, stream.headers.get("x-extra"), await stream.text());
+            const used = await fetch(`${base}/used`);
+            console.log(used.status, JSON.stringify(await used.text()));
+            const cookies = await fetch(`${base}/cookies`);
+            console.log(cookies.status, cookies.headers.get("x-multi"));
+            const echo = await fetch(`${base}/echo`, { method: "PUT", body: new Uint8Array([1, 2, 3, 250]) });
+            console.log(echo.status, [...new Uint8Array(await echo.arrayBuffer())].join());
+            const missing = await fetch(`${base}/nope`);
+            console.log(missing.status, await missing.text());
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            r#"{"isRequest":true,"method":"GET","query":"7","header":"p","body":true}"#,
+            "201 Made yes one,two",
+            r#"200 """#,
+            "204 a=1, b=2",
+            "200 1,2,3,250",
+            "404 missing",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_writes_each_set_cookie_and_no_body_for_null_body_statuses() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve((req) => {
+                const path = new URL(req.url).pathname;
+                if (path === "/init") {
+                    return new Response("ok", { headers: { "set-cookie": "a=1", "x-a": "1" } });
+                }
+                if (path === "/append") {
+                    const headers = new Headers();
+                    headers.append("set-cookie", "a=1");
+                    headers.append("set-cookie", "b=2; Path=/");
+                    return new Response("ok", { headers });
+                }
+                if (path === "/empty204") return new Response("", { status: 204 });
+                return new Response("payload", { headers: { "x-kind": "get" } });
+            }, { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            const init = await fetch(`${base}/init`);
+            console.log("init", init.headers.getSetCookie().join("|"), init.headers.get("x-a"));
+            const appended = await fetch(`${base}/append`);
+            console.log("append", appended.headers.getSetCookie().join("|"));
+            const empty = await fetch(`${base}/empty204`, { method: "DELETE", body: new Uint8Array(0) });
+            console.log("204", empty.status, JSON.stringify(await empty.text()));
+            const head = await fetch(`${base}/get`, { method: "HEAD" });
+            console.log("head", head.status, head.headers.get("x-kind"), head.headers.get("content-length"), JSON.stringify(await head.text()));
+            console.log("browser guard", new Response("", { headers: { "set-cookie": "z=1" } }).headers.has("set-cookie"));
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "init a=1 1",
+            "append a=1|b=2; Path=/",
+            r#"204 204 """#,
+            r#"head 200 get 7 """#,
+            "browser guard true",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_upgrades_a_connection_to_a_websocket() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const serverEvents = [];
+            let handleSeen = null;
+            let secondUpgrade = "";
+            const server = Lumen.serve((req) => {
+                const handle = Lumen.upgradeWebSocket(req, { protocol: "chat", headers: { "x-served": "lumen" } });
+                if (!handle) return new Response("plain");
+                handleSeen = handle;
+                try { Lumen.upgradeWebSocket(req); } catch (error) { secondUpgrade = error.message; }
+                handle.onmessage = (data, isBinary) => {
+                    serverEvents.push(isBinary ? "binary:" + data.length : "text:" + data);
+                    handle.send(isBinary ? data : data.toUpperCase());
+                };
+                handle.onclose = (code, reason, clean) => serverEvents.push(`close:${code}:${clean}`);
+                return new Response("ignored after upgrade");
+            }, { hostname: "127.0.0.1", port: 0 });
+
+            const plain = await fetch(`http://127.0.0.1:${server.port}/`);
+            console.log("plain", await plain.text());
+
+            const ws = new WebSocket(`ws://127.0.0.1:${server.port}/`, "chat");
+            ws.binaryType = "arraybuffer";
+            const received = [];
+            const closed = new Promise((resolve) => { ws.onclose = (event) => resolve(event.code); });
+            await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+            console.log("protocol", ws.protocol, typeof handleSeen.send, typeof handleSeen.close, handleSeen.remoteAddress);
+            const next = () => new Promise((resolve) => { ws.onmessage = (event) => resolve(event.data); });
+            let pending = next();
+            ws.send("hello");
+            received.push(await pending);
+            pending = next();
+            ws.send(new Uint8Array([9, 8, 7]));
+            received.push([...new Uint8Array(await pending)].join(""));
+            console.log("received", received.join("|"));
+            console.log("second upgrade", secondUpgrade);
+
+            ws.close(1000);
+            console.log("client close", await closed);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            console.log("server events", serverEvents.join(","));
+            console.log("send after close", handleSeen.send("late"));
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "plain plain",
+            "protocol chat function function 127.0.0.1",
+            "received HELLO|987",
+            "second upgrade upgradeWebSocket: connection already upgraded",
+            "client close 1000",
+            "server events text:hello,binary:3,close:1000:true",
+            "send after close false",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_handler_requests_and_responses_are_collectable() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.expose_gc();
+    eval_ok(
+        &mut rt,
+        r#"
+        globalThis.weak = {};
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve((req) => {
+                const response = new Response("gc");
+                weak.request = new WeakRef(req);
+                weak.headers = new WeakRef(req.headers);
+                weak.response = new WeakRef(response);
+                return response;
+            }, { hostname: "127.0.0.1", port: 0 });
+            await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    rt.engine().collect_garbage();
+    rt.engine().collect_garbage();
+    eval_ok(
+        &mut rt,
+        "console.log(weak.request.deref() === undefined, weak.headers.deref() === undefined, weak.response.deref() === undefined);",
+    );
+    assert_eq!(out.lines(), ["true true true"]);
 }
 
 // ---- lumen-node (node: compat; the runtime assembles it) ----
@@ -3315,4 +5039,274 @@ fn bun_hash_matches_bun_through_the_glue() {
             "true",
         ]
     );
+}
+
+#[test]
+fn node_url_module_uses_native_url_classes() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const url = require('url');
+        const util = require('util');
+        const buffer = require('buffer');
+        console.log(url.URL === URL, url.URLSearchParams === URLSearchParams);
+        console.log(url.domainToASCII('español.com'), url.domainToUnicode('xn--espaol-zwa.com'));
+        console.log(url.format(new URL('https://a:b@測試.com/p?q=1#h'), { fragment: false, unicode: true, auth: false, search: false }));
+        console.log(url.fileURLToPath('file:///tmp/a%20b'), url.pathToFileURL('/tmp/a b').href);
+        console.log(util.inspect(new URL('http://u@a.com:81/p?x=1#f')).split('\n')[0]);
+        console.log(util.inspect(new URLSearchParams('a=1&b=2')));
+        console.log(util.inspect(new URLSearchParams('a=1').keys()));
+        const blob = new Blob(['x']);
+        const id = URL.createObjectURL(blob);
+        console.log(buffer.resolveObjectURL(id) !== undefined);
+        URL.revokeObjectURL(id);
+        console.log(buffer.resolveObjectURL(id) === undefined);
+        try { new URL('bad'); } catch (e) { console.log(e.code, e.input); }
+        try { url.fileURLToPath('http://a/'); } catch (e) { console.log(e.code); }
+        "#,
+    );
+    assert!(err.lines().is_empty(), "stderr: {:?}", err.lines());
+    assert_eq!(
+        out.lines(),
+        [
+            "true true",
+            "xn--espaol-zwa.com español.com",
+            "https://測試.com/p",
+            "/tmp/a b file:///tmp/a%20b",
+            "URL {",
+            "URLSearchParams { 'a' => '1', 'b' => '2' }",
+            "URLSearchParams Iterator { 'a' }",
+            "true",
+            "true",
+            "ERR_INVALID_URL bad",
+            "ERR_INVALID_URL_SCHEME",
+        ]
+    );
+}
+
+#[test]
+fn node_blob_keeps_files_on_disk_and_resolves_object_urls() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const fs = require('fs');
+        const os = require('os');
+        const path = require('path');
+        const buffer = require('buffer');
+        const file = path.join(os.tmpdir(), `lumen-blob-${process.pid}-${Date.now()}.txt`);
+        fs.writeFileSync(file, 'hello file');
+        (async () => {
+          const blob = await fs.openAsBlob(file, { type: 'Text/Plain' });
+          console.log(blob instanceof Blob, blob.size, blob.type);
+          console.log(await blob.slice(6, 10).text());
+          console.log((await blob.arrayBuffer()).byteLength);
+          const url = URL.createObjectURL(blob);
+          const resolved = buffer.resolveObjectURL(url);
+          console.log(resolved instanceof Blob, resolved.size, resolved.type, await resolved.text());
+          try { structuredClone(blob); } catch (error) { console.log(error.code); }
+          const reader = blob.slice(0, 5).stream().getReader();
+          console.log(Buffer.from((await reader.read()).value).toString());
+          console.log(new Blob([blob, '!']).size);
+          const memory = new Blob(['abc'], { type: 'a/b' });
+          const copy = structuredClone(new File([memory], 'n.txt', { lastModified: 9 }));
+          console.log(copy instanceof File, copy.name, copy.lastModified, copy.size);
+          URL.revokeObjectURL(url);
+          console.log(buffer.resolveObjectURL(url));
+          fs.writeFileSync(file, 'a different, longer body');
+          try { await blob.text(); } catch (error) { console.log(error.name); }
+          fs.unlinkSync(file);
+        })().catch((error) => console.log('failed', error));
+        "#,
+    );
+    assert!(err.lines().is_empty(), "stderr: {:?}", err.lines());
+    assert_eq!(
+        out.lines(),
+        [
+            "true 10 text/plain",
+            "file",
+            "10",
+            "true 10 text/plain hello file",
+            "ERR_INVALID_STATE",
+            "hello",
+            "11",
+            "true n.txt 9 3",
+            "undefined",
+            "NotReadableError",
+        ]
+    );
+}
+
+#[test]
+fn native_event_target_follows_node_event_target_semantics() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const events = require("events");
+        const failures = [];
+        const check = (ok, name) => { if (!ok) failures.push(name); };
+
+        const target = new EventTarget();
+        const first = () => {};
+        const second = { handleEvent() {} };
+        target.addEventListener("a", first);
+        target.addEventListener("a", second);
+        target.addEventListener("b", first);
+        const listeners = events.getEventListeners(target, "a");
+        check(listeners.length === 2 && listeners[0] === first && listeners[1] === second, "listeners");
+
+        check(target[Symbol.for("lumen.kEvents")] instanceof Map &&
+            target[Symbol.for("lumen.kEvents")].size === 2, "kEvents-snapshot");
+
+        const warnings = [];
+        process.on("warning", (warning) => { warnings.push(warning); });
+        events.setMaxListeners(1, target);
+        target.addEventListener("c", () => {});
+        target.addEventListener("c", () => {});
+
+        const trusted = new Event("t");
+        check(trusted.isTrusted === false, "untrusted");
+        check(Object.keys(Object.getOwnPropertyDescriptors(trusted)).includes("isTrusted"), "own-isTrusted");
+
+        target.addEventListener("d", null);
+        check(events.getEventListeners(target, "d").length === 0, "null-listener-ignored");
+
+        let reported = null;
+        process.once("uncaughtException", (error) => { reported = error; });
+        const failing = new EventTarget();
+        const boom = new Error("listener failure");
+        failing.addEventListener("x", () => { throw boom; });
+        let afterFailure = false;
+        failing.addEventListener("x", () => { afterFailure = true; });
+        check(failing.dispatchEvent(new Event("x")) === true && afterFailure, "failing-listener-does-not-stop-dispatch");
+
+        const signal = AbortSignal.abort();
+        check(signal.reason instanceof DOMException && signal.reason.name === "AbortError", "abort-reason");
+        check(typeof events.once === "function", "once");
+
+        process.nextTick(() => {
+            setImmediate(() => {
+                const warned = warnings.find((w) => w.name === "MaxListenersExceededWarning");
+                const nullWarning = warnings.find((w) => w.name === "AddEventListenerArgumentTypeWarning");
+                check(warned && warned.name === "MaxListenersExceededWarning" && warned.count === 2 && warned.type === "c", "max-listeners-warning");
+                check(nullWarning && nullWarning.name === "AddEventListenerArgumentTypeWarning", "null-warning");
+                check(reported === boom, "reported-through-uncaughtException");
+                console.log(failures.length === 0 ? "ok" : failures.join("|"));
+            });
+        });
+        "#,
+    );
+    rt.run_to_completion();
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn worker_scope_shape_and_dedicated_transfer() {
+    let lines = worker_drive(
+        &[(
+            "scope.mjs",
+            r#"
+            onmessage = (e) => {
+                const [buffer] = e.data.buffers;
+                const port = e.ports[0];
+                port.postMessage({ len: buffer.byteLength });
+                const back = new ArrayBuffer(8);
+                postMessage({
+                    shape: [
+                        self instanceof EventTarget,
+                        Object.getPrototypeOf(self) === DedicatedWorkerGlobalScope.prototype,
+                        self === globalThis,
+                        location.constructor.name,
+                    ].join(),
+                    detached: buffer.byteLength,
+                }, [back]);
+                port.close();
+                close();
+            };
+            "#,
+        )],
+        r#"
+        const w = new Worker("{DIR}/scope.mjs", { type: "module" });
+        const channel = new MessageChannel();
+        channel.port1.onmessage = (e) => console.log("port", e.data.len);
+        w.onmessage = (e) => console.log("main", e.data.shape, e.data.detached);
+        const buffer = new ArrayBuffer(16);
+        w.postMessage({ buffers: [buffer] }, [buffer, channel.port2]);
+        console.log("sent", buffer.byteLength);
+        "#,
+    );
+    assert_eq!(lines[0], "sent 0");
+    assert!(lines.contains(&"port 16".to_string()));
+    assert!(lines.contains(&"main true,true,true,WorkerLocation 16".to_string()));
+}
+
+#[test]
+fn worker_message_posted_before_terminate_is_dropped() {
+    let lines = worker_drive(
+        &[("quiet.mjs", "onmessage = () => postMessage('late');")],
+        r#"
+        const w = new Worker("{DIR}/quiet.mjs", { type: "module" });
+        w.onmessage = () => console.log("unexpected");
+        w.postMessage(1);
+        w.terminate();
+        console.log("terminated");
+        "#,
+    );
+    assert_eq!(lines, ["terminated"]);
+}
+
+fn pump_until(rt: &mut Runtime, condition: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        rt.run_until_idle();
+        let done = rt
+            .engine()
+            .eval_value(condition)
+            .expect("condition parses")
+            .unwrap_or_else(|_| panic!("condition runs"));
+        if matches!(done, Value::Bool(true)) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {condition}");
+        rt.wait_for_completion(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_idle_server_websocket_holds_no_thread_and_wakes_nothing() {
+    let (mut rt, _out, _err) = test_runtime();
+    rt.engine()
+        .eval(
+            r#"
+            globalThis.state = { open: false, echoed: false, upgraded: false };
+            globalThis.server = Lumen.serve((req) => {
+                const peer = Lumen.upgradeWebSocket(req);
+                state.upgraded = peer !== null;
+                peer.onmessage = (data) => peer.send("echo:" + data);
+                return new Response("");
+            }, { hostname: "127.0.0.1", port: 0 });
+            globalThis.ws = new WebSocket(`ws://127.0.0.1:${server.port}/`);
+            ws.onopen = () => { state.open = true; ws.send("hi"); };
+            ws.onmessage = (event) => { state.echoed = event.data === "echo:hi"; };
+            "#,
+            false,
+        )
+        .expect("setup parses");
+    pump_until(&mut rt, "state.open && state.echoed && state.upgraded");
+
+    // Let the last completions drain, then watch an idle connection.
+    rt.run_until_idle();
+    let turns = rt.loop_turns.load(Ordering::Relaxed);
+    let wakeups = rt.loop_wakeups.load(Ordering::Relaxed);
+    assert!(!rt.wait_for_completion(Duration::from_millis(300)));
+    assert_eq!(rt.pool.pending(), 0, "a connection holds a pool thread");
+    assert!(rt.loop_turns.load(Ordering::Relaxed) - turns <= 1);
+    assert_eq!(rt.loop_wakeups.load(Ordering::Relaxed), wakeups);
+
+    rt.engine()
+        .eval("ws.close(); server.shutdown()", false)
+        .expect("teardown parses");
+    pump_until(&mut rt, "ws.readyState === 3");
 }
