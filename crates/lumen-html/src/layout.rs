@@ -21795,7 +21795,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             )?;
         }
         let (w, h) = self.intrinsic_virtual_generated_size(&child, &item_style, false)?;
-        tmpstd::eprintln!("TMPPOS {:?} class={:?} id={:?} z={:?} w={w} h={h}", child.pseudo as u8, self.document.get_attribute_ns_ref(child.origin,None,"class"), self.document.get_attribute_ns_ref(child.origin,None,"id"), item_style.z_index);
         Ok((PositionedBoxSource::Generated(child), item_style, w, h))
     }
 
@@ -31922,8 +31921,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 for record in entries[..early].iter().rev().chain(entries[early..].iter()) {
                     if !context.real && matches!(record.phase,3|8|9){return Err(LayoutError::InvalidTree);}
                     let after=record.phase<=5;let destination=key*2+usize::from(!after);
-                    if record.entry.2<record.entry.3 {if let Err(e)=commands.move_relative(record.anchors,destination,after){tmpstd::eprintln!("TMPMOVE {:?} id={:?} pseudo={:?} class={:?} phase={} z={} range={}..{} key={key} real={}",e,record.entry.7.0,record.entry.7.1.map(|p|p as u8),self.document.get_attribute_ns_ref(record.entry.7.0,None,"class"),record.phase,record.entry.6,record.entry.2,record.entry.3,context.real);return Err(e);}}
-                    if record.entry.4<record.entry.5 {if let Err(e)=hits.move_relative(record.anchors,destination,after){tmpstd::eprintln!("TMPMOVEH {:?} id={:?} pseudo={:?} class={:?} phase={} z={} range={}..{} key={key} real={}",e,record.entry.7.0,record.entry.7.1.map(|p|p as u8),self.document.get_attribute_ns_ref(record.entry.7.0,None,"class"),record.phase,record.entry.6,record.entry.4,record.entry.5,context.real);return Err(e);}}
+                    if record.entry.2<record.entry.3 {commands.move_relative(record.anchors,destination,after)?;}
+                    if record.entry.4<record.entry.5 {hits.move_relative(record.anchors,destination,after)?;}
                 }
             }
         }
@@ -53821,4 +53820,3 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
 
 }
 
-extern crate std as tmpstd;
