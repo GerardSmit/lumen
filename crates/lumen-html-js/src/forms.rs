@@ -2975,7 +2975,9 @@ pub fn click_element(
     click_with_event(ctx, realm, target, node, event, false, false, true)
 }
 
-pub(crate) fn activate_keyboard_default_button(
+/// Trusted synthetic click with activation behavior, for keyboard activation
+/// (Enter or Space on a button, link, checkbox, or a form's default button).
+pub fn keyboard_activate(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     button: NodeId,

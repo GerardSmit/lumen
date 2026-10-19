@@ -356,7 +356,7 @@ pub(crate) fn trusted_action_key_down(
             keypress.as_ref().map(|properties| &properties[..]),
         )?;
         if matches!(action, KeyAction::Enter | KeyAction::NumpadEnter) {
-            perform_implicit_submission(ctx, realm, target)?;
+            keyboard_implicit_submission(ctx, realm, target)?;
         }
     }
     Ok(())
@@ -410,7 +410,9 @@ fn implicit_submission(
     lumen_html::forms::implicit_submission(session.document(), node)
 }
 
-fn perform_implicit_submission(
+/// Implicit form submission for Enter in a text control: clicks the form's default button
+/// (trusted) or submits the form when it has none.
+pub fn keyboard_implicit_submission(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     input: NodeId,
@@ -420,7 +422,7 @@ fn perform_implicit_submission(
     match action {
         Some(lumen_html::forms::ImplicitSubmission::ClickDefaultButton { button, .. }) => {
             let (button_realm, button) = current_realm.resolve_adopted_node(button);
-            super::forms::activate_keyboard_default_button(ctx, &button_realm, button)?;
+            super::forms::keyboard_activate(ctx, &button_realm, button)?;
         }
         Some(lumen_html::forms::ImplicitSubmission::SubmitForm(form)) => {
             let (form_realm, form) = current_realm.resolve_adopted_node(form);
@@ -515,7 +517,7 @@ pub fn trusted_send_keys(
                     keypress.as_ref().map(|properties| &properties[..]),
                 )?;
                 if matches!(action, KeyAction::Enter | KeyAction::NumpadEnter) {
-                    perform_implicit_submission(ctx, realm, event_target)?;
+                    keyboard_implicit_submission(ctx, realm, event_target)?;
                 }
             }
             Ok(())
@@ -663,5 +665,41 @@ mod tests {
             evaluate(&mut engine, "field.value === '' && events === 0"),
             Value::Bool(true)
         ));
+    }
+
+    #[test]
+    fn keyboard_activate_dispatches_trusted_click_and_toggles_checkbox() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<button id=b></button><input id=c type=checkbox>", 32).unwrap();
+        evaluate(
+            &mut engine,
+            "globalThis.trusted=[];for(const id of ['b','c'])document.getElementById(id).addEventListener('click',e=>trusted.push(e.isTrusted));",
+        );
+        let button = element(&realm, "b");
+        let checkbox = element(&realm, "c");
+        crate::forms::keyboard_activate(engine.ctx(), &realm, button).unwrap();
+        crate::forms::keyboard_activate(engine.ctx(), &realm, checkbox).unwrap();
+        assert!(matches!(
+            evaluate(&mut engine, "trusted.join()==='true,true'&&document.getElementById('c').checked"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn keyboard_implicit_submission_clicks_default_button_trusted() {
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<form id=f><input id=t type=text><button id=go></button></form>",
+            32,
+        )
+        .unwrap();
+        evaluate(
+            &mut engine,
+            "globalThis.log=[];document.getElementById('go').addEventListener('click',e=>{e.preventDefault();log.push(e.isTrusted)});",
+        );
+        let input = element(&realm, "t");
+        keyboard_implicit_submission(engine.ctx(), &realm, input).unwrap();
+        assert!(matches!(evaluate(&mut engine, "log.join()==='true'"), Value::Bool(true)));
     }
 }
