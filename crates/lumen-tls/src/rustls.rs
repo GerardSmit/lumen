@@ -140,7 +140,16 @@ pub fn client_config_with_roots(
 pub struct ClientSession {
     connection: ClientConnection,
     transport_eof: bool,
+    /// The transport's EOF reached Rustls (it waits for `backlog` to drain first).
+    eof_delivered: bool,
+    /// Encrypted bytes Rustls could not take yet because its plaintext buffer was full. They
+    /// (and then a deferred EOF) are processed as `read_plaintext` drains that buffer.
+    backlog: Vec<u8>,
 }
+
+/// Rustls refuses encrypted input once more plaintext than this is buffered
+/// (`DEFAULT_RECEIVED_PLAINTEXT_LIMIT`).
+const RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
 
 /// Result of attempting a nonblocking plaintext read from [`ClientSession`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +187,8 @@ impl ClientSession {
         Ok(Self {
             connection,
             transport_eof: false,
+            eof_delivered: false,
+            backlog: Vec::new(),
         })
     }
 
@@ -186,15 +197,30 @@ impl ClientSession {
         self.connection.is_handshaking()
     }
 
-    /// Feed encrypted peer bytes, processing every complete TLS record they contain.
+    /// Feed encrypted peer bytes, processing every complete TLS record they contain. Records
+    /// beyond what the plaintext buffer holds are kept and processed as
+    /// [`read_plaintext`](Self::read_plaintext) drains it, so every byte is taken.
     pub fn feed_encrypted(&mut self, bytes: &[u8]) -> Result<usize, String> {
         if self.transport_eof {
             return Err(String::from(
                 "TLS encrypted input arrived after transport EOF",
             ));
         }
+        if self.backlog.is_empty() {
+            let consumed = self.process_encrypted(bytes)?;
+            self.backlog.extend_from_slice(&bytes[consumed..]);
+        } else {
+            self.backlog.extend_from_slice(bytes);
+            self.drain_backlog()?;
+        }
+        Ok(bytes.len())
+    }
+
+    /// Hands `bytes` to Rustls until they run out or its plaintext buffer is full. Returns how
+    /// many it took.
+    fn process_encrypted(&mut self, bytes: &[u8]) -> Result<usize, String> {
         let mut input = Cursor::new(bytes);
-        while (input.position() as usize) < bytes.len() {
+        while (input.position() as usize) < bytes.len() && !self.plaintext_full()? {
             let consumed = self
                 .connection
                 .read_tls(&mut input)
@@ -209,6 +235,29 @@ impl ClientSession {
         Ok(input.position() as usize)
     }
 
+    /// Whether Rustls would refuse more encrypted input until plaintext is read.
+    fn plaintext_full(&mut self) -> Result<bool, String> {
+        let state = self
+            .connection
+            .process_new_packets()
+            .map_err(|error| format!("TLS peer data rejected: {error}"))?;
+        Ok(state.plaintext_bytes_to_read() > RECEIVED_PLAINTEXT_LIMIT)
+    }
+
+    /// Processes the backlog as far as the plaintext buffer allows, then a deferred EOF.
+    fn drain_backlog(&mut self) -> Result<(), String> {
+        if !self.backlog.is_empty() {
+            let backlog = std::mem::take(&mut self.backlog);
+            let consumed = self.process_encrypted(&backlog)?;
+            self.backlog = backlog;
+            self.backlog.drain(..consumed);
+        }
+        if self.transport_eof && !self.eof_delivered && self.backlog.is_empty() && !self.plaintext_full()? {
+            self.deliver_eof()?;
+        }
+        Ok(())
+    }
+
     /// Signal that the underlying byte transport reached EOF.
     ///
     /// Rustls treats this as an unauthenticated transport close. Any subsequent plaintext read
@@ -219,6 +268,11 @@ impl ClientSession {
             return Ok(());
         }
         self.transport_eof = true;
+        self.drain_backlog()
+    }
+
+    fn deliver_eof(&mut self) -> Result<(), String> {
+        self.eof_delivered = true;
         let mut empty = Cursor::new(&[]);
         self.connection
             .read_tls(&mut empty)
@@ -261,11 +315,23 @@ impl ClientSession {
         if bytes.is_empty() {
             return Ok(PlaintextRead::Data(0));
         }
-        match self.connection.reader().read(bytes) {
-            Ok(0) => Ok(PlaintextRead::Closed),
-            Ok(length) => Ok(PlaintextRead::Data(length)),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(PlaintextRead::Pending),
-            Err(error) => Err(format!("TLS plaintext read failed: {error}")),
+        loop {
+            match self.connection.reader().read(bytes) {
+                Ok(0) => return Ok(PlaintextRead::Closed),
+                Ok(length) => return Ok(PlaintextRead::Data(length)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(format!("TLS plaintext read failed: {error}")),
+            }
+            let pending = self.backlog.len();
+            let undelivered = self.transport_eof && !self.eof_delivered;
+            if pending == 0 && !undelivered {
+                return Ok(PlaintextRead::Pending);
+            }
+            self.drain_backlog()?;
+            // A backlog that yields no record (only a partial one) waits for more input.
+            if self.backlog.len() == pending && undelivered == (self.transport_eof && !self.eof_delivered) {
+                return Ok(PlaintextRead::Pending);
+            }
         }
     }
 
@@ -901,6 +967,46 @@ mod tests {
             client.read_plaintext(&mut response).unwrap(),
             PlaintextRead::Closed
         );
+    }
+
+    #[test]
+    fn transport_free_session_takes_more_records_than_its_plaintext_buffer() {
+        install_runtime();
+        let (cert_pem, key_pem) = self_signed();
+        let (certs, _) = der_pair(&cert_pem, &key_pem);
+        let roots = certs
+            .iter()
+            .map(|cert| cert.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        let mut client = ClientSession::connect_with_roots("localhost", &[], &roots).unwrap();
+        let mut server = local_server(&cert_pem, &key_pem, &[]);
+        finish_handshake(&mut client, &mut server).unwrap();
+
+        let body: Vec<u8> = (0..100 * 1024).map(|index| (index % 251) as u8).collect();
+        server.set_buffer_limit(None);
+        server.writer().write_all(&body).unwrap();
+        server.send_close_notify();
+        let mut server_bytes = Vec::new();
+        while server.wants_write() {
+            assert_ne!(server.write_tls(&mut server_bytes).unwrap(), 0);
+        }
+        // Far more than Rustls buffers as plaintext, in pieces fed before any is read, then EOF.
+        let (first, second) = server_bytes.split_at(server_bytes.len() / 3);
+        let (second, third) = second.split_at(second.len() / 2);
+        for part in [first, second, third] {
+            assert_eq!(client.feed_encrypted(part).unwrap(), part.len());
+        }
+        client.feed_eof().unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match client.read_plaintext(&mut chunk).unwrap() {
+                PlaintextRead::Data(count) => received.extend_from_slice(&chunk[..count]),
+                PlaintextRead::Closed => break,
+                PlaintextRead::Pending => panic!("plaintext pending with every record fed"),
+            }
+        }
+        assert_eq!(received, body);
     }
 
     #[test]
