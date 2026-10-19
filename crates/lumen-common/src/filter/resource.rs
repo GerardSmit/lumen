@@ -280,9 +280,7 @@ impl Use {
             }
         }
         if rect.iter().any(|v|!v.is_finite()) || rect[2]<=0.0 || rect[3]<=0.0{return None;}
-        let left=rect[0].max(filter[0]);let top=rect[1].max(filter[1]);
-        let right=(rect[0]+rect[2]).min(filter[0]+filter[2]);let bottom=(rect[1]+rect[3]).min(filter[1]+filter[3]);
-        (right>left && bottom>top && right.is_finite() && bottom.is_finite()).then_some([left,top,right-left,bottom-top])
+        intersect(rect,filter)
     }
     /// Subregion geometry is resolved once per actual reference. It depends
     /// on preceding declared regions, never on alpha crops of cached images.
@@ -292,7 +290,7 @@ impl Use {
         let mut regions:Vec<Option<[f32;4]>>=Vec::new();regions.try_reserve_exact(count).map_err(|_|BuildError::BudgetExceeded)?;
         regions.capacity().checked_add(count).and_then(|count|count.checked_mul(slot)).and_then(|bytes|bytes.checked_add(2*core::mem::size_of::<usize>())).filter(|bytes|*bytes<=available).ok_or(BuildError::BudgetExceeded)?;
         for node in self.program.nodes.iter() {
-            let mut union:Option<[f32;4]>=None;
+            let mut joined:Option<[f32;4]>=None;
             let region_inputs=match &node.operation {
                 Primitive::DropShadowMerge{original}=>core::slice::from_ref(original),
                 _=>node.inputs.as_ref(),
@@ -300,16 +298,11 @@ impl Use {
             for input in region_inputs.iter(){
                 if let Input::Result(at)=input {
                     if let Some(rect)=regions.get(*at as usize).ok_or(BuildError::Invalid)? {
-                        union=Some(if let Some(previous)=union {
-                            let left=previous[0].min(rect[0]);let top=previous[1].min(rect[1]);
-                            let right=(previous[0]+previous[2]).max(rect[0]+rect[2]);let bottom=(previous[1]+previous[3]).max(rect[1]+rect[3]);
-                            if !right.is_finite() || !bottom.is_finite(){return Err(BuildError::Invalid);}
-                            [left,top,right-left,bottom-top]
-                        }else{*rect});
+                        joined=Some(if let Some(previous)=joined {union(previous,*rect).ok_or(BuildError::Invalid)?}else{*rect});
                     }
                 }
             }
-            regions.push(self.primitive_region(node,union));
+            regions.push(self.primitive_region(node,joined));
         }
         Ok(regions.into())
     }
@@ -321,6 +314,22 @@ impl Use {
             if axis<2 && units==Units::ObjectBoundingBox {rect[axis]+=basis[axis];}}
         rect.iter().all(|v|v.is_finite()).then_some(rect)
     }
+}
+
+/// Intersection of `[x, y, w, h]` rects; an operand's exact origin and size are kept when it bounds an axis, avoiding f32 edge round-trip loss.
+fn intersect(a:[f32;4],b:[f32;4])->Option<[f32;4]> {combine(a,b,true).filter(|r|r[2]>0.0 && r[3]>0.0)}
+/// Union of `[x, y, w, h]` rects; an operand's exact origin and size are kept when it bounds an axis, avoiding f32 edge round-trip loss.
+fn union(a:[f32;4],b:[f32;4])->Option<[f32;4]> {combine(a,b,false)}
+fn combine(a:[f32;4],b:[f32;4],clip:bool)->Option<[f32;4]> {
+    let mut out=[0.0;4];
+    for axis in 0..2 {
+        let (a0,al,b0,bl)=(a[axis],a[axis+2],b[axis],b[axis+2]);
+        let (start,end)=if clip{(a0.max(b0),(a0+al).min(b0+bl))}else{(a0.min(b0),(a0+al).max(b0+bl))};
+        if !end.is_finite(){return None;}
+        let (origin,size)=if start==a0 && end==a0+al{(a0,al)}else if start==b0 && end==b0+bl{(b0,bl)}else{(start,end-start)};
+        out[axis]=origin;out[axis+2]=size;
+    }
+    out.iter().all(|v|v.is_finite()).then_some(out)
 }
 
 #[cfg(test)]
@@ -382,6 +391,9 @@ mod tests {
         assert_eq!(used.primitive_lengths([0.1,0.2]),Some([20.0,10.0]));
         assert_eq!(used.filter_region(),Some([-10.0,15.0,1.2f32*200.0,1.2f32*50.0]));
         assert_eq!(used.primitive_region(&used.program.nodes()[0],None),used.filter_region());
+        let mut chain=Builder::new();chain.push(node(Primitive::Flood(Color::rgba8([255,0,0,255])),&[]),None,8192).unwrap();chain.push(node(Primitive::Merge,&[Input::Result(0),Input::Result(0)]),None,8192).unwrap();
+        let joined=Use{program:chain.finish(region(),Units::ObjectBoundingBox,Units::ObjectBoundingBox,8192).unwrap(),url:used.url.clone(),..used.clone()};
+        assert_eq!(joined.resolved_regions(8192).unwrap().as_ref(),&[used.filter_region();2]);
         let mut input=node(Primitive::Offset([0.0;2]),&[Input::Result(0)]);
         assert_eq!(used.primitive_region(&input,Some([20.0,30.0,10.0,10.0])),Some([20.0,30.0,10.0,10.0]));
         input.region[0]=Some(Coordinate{value:0.5,percentage:false});input.region[2]=Some(Coordinate{value:0.25,percentage:false});
