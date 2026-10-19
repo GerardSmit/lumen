@@ -159,6 +159,18 @@ struct CachedFrame {
     geometry: layout::LayoutGeometry,
 }
 
+/// The inputs of a layout that failed, keyed like [`CachedFrame`]: the same
+/// inputs fail the same way, so a retry waits until one of them changes.
+/// Pending and failed images are not kept (see `render`).
+struct FailedFrame {
+    document_version: u64,
+    width: u32,
+    height: u32,
+    image_generation: Option<u64>,
+    collect_rendered_text: bool,
+    error: LayoutError,
+}
+
 struct NodeImages<'a> {
     color_schemes:css::ColorSchemeEnvironment,
     svg_fragment: Option<&'a crate::svg::Fragment>,
@@ -455,6 +467,7 @@ pub struct RenderSession {
     stylesheet_graph_leases: Vec<(NodeId, u64, Weak<StylesheetGraphLease>)>,
     cssom_stylesheet_texts: Vec<layout::CssomStylesheetText>,
     cached: Option<CachedFrame>,
+    failed_frame: Option<FailedFrame>,
     rendered_text_requested: bool,
     frame_id: u64,
     font_generation: u64,
@@ -680,6 +693,7 @@ impl RenderSession {
             stylesheet_graph_leases: Vec::new(),
             cssom_stylesheet_texts: Vec::new(),
             cached: None,
+            failed_frame: None,
             rendered_text_requested: false,
             frame_id: 0,
             font_generation: 0,
@@ -774,7 +788,7 @@ impl RenderSession {
             // Backing canvas paint precedes every retained box fragment and
             // does not change its style, geometry, or propagated CSS canvas
             // source. Rebuild the full list without discarding those boxes.
-            self.cached = None;
+            self.discard_frame();
             self.paint_revision = self.paint_revision.wrapping_add(1);
         }
     }
@@ -950,8 +964,15 @@ impl RenderSession {
         Ok(())
     }
 
-    fn invalidate_paint(&mut self) {
+    /// Drops the retained frame, and a remembered failure with it: whatever
+    /// made the frame stale may also change a failing layout's outcome.
+    fn discard_frame(&mut self) {
         self.cached = None;
+        self.failed_frame = None;
+    }
+
+    fn invalidate_paint(&mut self) {
+        self.discard_frame();
         self.layout_cache.clear();
         self.paint_revision = self.paint_revision.wrapping_add(1);
     }
@@ -1802,7 +1823,7 @@ impl RenderSession {
         }
         if self.presentation_root != root {
             self.presentation_root = root;
-            self.cached = None;
+            self.discard_frame();
             self.layout_cache.clear();
             self.paint_revision = self.paint_revision.wrapping_add(1);
         }
@@ -2114,7 +2135,7 @@ impl RenderSession {
             self.pending_animation_full = true;
             self.pending_animation_nodes.clear();
         }
-        self.cached = None;
+        self.discard_frame();
         self.frame_id += 1;
         Ok(())
     }
@@ -2148,7 +2169,7 @@ impl RenderSession {
                 cache.invalidate_node(*node);
             }
         }
-        self.cached = None;
+        self.discard_frame();
         self.layout_cache
             .invalidate_subtree_targets(&self.document, &nodes);
         self.paint_revision = self.paint_revision.wrapping_add(1);
@@ -2664,7 +2685,7 @@ impl RenderSession {
         Ok(())
     }
     pub fn invalidate_fonts(&mut self) {
-        self.cached = None;
+        self.discard_frame();
         self.style_cache.borrow_mut().clear();
         self.layout_cache.invalidate_fonts();
         self.paint_revision = self.paint_revision.wrapping_add(1);
@@ -3456,8 +3477,9 @@ impl RenderSession {
                 .scroll_region(&mut frame.list.0, node, from, (x, y))
         });
         if !replayed {
-            self.cached = None;
+            self.discard_frame();
         }
+        self.failed_frame = None;
         self.layout_cache.clear();
         self.paint_revision = self.paint_revision.wrapping_add(1);
         self.frame_id += 1;
@@ -3646,211 +3668,261 @@ impl RenderSession {
                 && (!self.rendered_text_requested || cached.geometry.collect_rendered_text)
         });
         if !fresh {
-            self.refresh_rules()?;
-            let rules = self.rules.as_mut().expect("stylesheets initialized");
-            rules.environment = css::MediaEnvironment {
-                width: width as f32,
-                height: height as f32,
-                ..rules.environment
-            };
-            let canvas_background=if self.canvas_background_is_default {
-                let environment=self.media_environment();
-                let scheme=if let Some(root)=crate::selector::document_element(&self.document) {
-                    self.computed_style_with_text(root,Some(text))?.used_color_scheme(environment).scheme
-                }else {environment.color_schemes.page().scheme};
-                if self.embedding_color_scheme==Some(scheme) {None}else{css::color_scheme::system_color("canvas",scheme)}
-            }else {self.canvas_background};
-            let rules = self.rules.as_ref().expect("stylesheets initialized");
-            let only_text_mutations = !self.document.mutations().is_empty()
-                && self.document.mutations().iter().all(|mutation| {
-                    matches!(mutation.kind, MutationKind::CharacterData)
-                        && !in_style(&self.document, mutation.target)
-                });
-            let only_local_mutations = !self.document.mutations().is_empty()
-                && self.document.mutations().iter().all(|mutation| {
-                    !in_style(&self.document, mutation.target)
-                        && match &mutation.kind {
-                            MutationKind::CharacterData | MutationKind::Attribute(_) => true,
-                            MutationKind::Tree {
-                                added,
-                                removed,
-                                styles_changed,
-                            } => {
-                                !*styles_changed
-                                    && !added
-                                        .is_some_and(|node| subtree_has_style(&self.document, node))
-                                    && !removed
-                                        .is_some_and(|node| subtree_has_style(&self.document, node))
-                            }
-                            MutationKind::FullRebuild => false,
-                        }
-                });
-            // Counter and quote output depends on preceding siblings, not just
-            // the changed subtree. Keep reuse on unchanged frames, but recapture
-            // fragments after mutations in documents with that shared context.
-            let generated_context_changed = self.style_version != version
-                && (rules.has_counter_data()
-                    || rules.has_quote_content()
-                    || rules.has_list_item_data()
-                    || layout::contains_list_item_candidate(&self.document, self.document.root())?);
-            let can_retain = !generated_context_changed
-                && (self.style_version == version
-                    || (only_local_mutations && rules.siblings_share));
-            let environment_changed = self.style_environment != Some(rules.environment);
-            if !can_retain || environment_changed {
-                self.style_cache.borrow_mut().clear();
-                self.layout_cache.clear();
-            } else if self.style_version != version {
-                let mut targets: Vec<_> = self
-                    .document
-                    .mutations()
-                    .iter()
-                    .map(|mutation| mutation.target)
-                    .collect();
-                let slot_hosts: Vec<_> = self
-                    .document
-                    .mutations()
-                    .iter()
-                    .filter_map(|mutation| match &mutation.kind {
-                        MutationKind::Attribute(name) => {
-                            slot_assignment_host(&self.document, mutation.target, name.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                targets.extend(slot_hosts.iter().copied());
-                if only_text_mutations {
-                    self.layout_cache
-                        .invalidate_text_targets(&self.document, &targets);
-                } else {
-                    // Attribute changes and moved subtrees can change ancestry
-                    // matches even if the parent's computed style is identical.
-                    self.style_cache.borrow_mut().clear();
-                    self.layout_cache
-                        .invalidate_text_targets(&self.document, &targets);
-                    let mut subtrees = Vec::new();
-                    for mutation in self.document.mutations() {
-                        match &mutation.kind {
-                            MutationKind::Attribute(_) => subtrees.push(mutation.target),
-                            MutationKind::Tree { added, removed, .. } => {
-                                subtrees.extend(added.iter().copied());
-                                subtrees.extend(removed.iter().copied());
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Slot/name mutations can move assigned light children
-                    // between sibling slots. The changed node's new composed
-                    // ancestry does not include the slot fragment that lost
-                    // those children, so invalidate their common host subtree.
-                    subtrees.extend(slot_hosts);
-                    self.layout_cache
-                        .invalidate_subtree_targets(&self.document, &subtrees);
-                }
-            }
-            self.style_cache.borrow_mut().begin_frame();
-            self.layout_cache.begin_frame();
-            self.style_version = version;
-            self.style_environment = Some(rules.environment);
-            // Overflow bounds are expressed before the container's own scroll
-            // translation. A changed box or writing direction can therefore
-            // clamp existing offsets after layout, with at most one correction
-            // layout before publishing commands and hit geometry.
-            let mut corrected = false;
-            let mut sampled_timelines=false;
-            let mut timeline_corrected=false;
-            let (mut list, mut geometry) = loop {
-                let mut geometry = layout::LayoutGeometry::default();
-                geometry.collect_rendered_text = self.rendered_text_requested;
-                let list = {
-            let node_images = NodeImages {
-                color_schemes:self.media_environment().color_schemes,
-                svg_fragment:self.svg_fragment.as_deref(), svg_image_viewport:self.svg_image_viewport.as_deref().copied(),
-                paint_definitions: &self.paint_definitions,
-                paint_registration_revision:self.rules_generation,
-                bitmaps: &self.node_bitmaps, embedded:&self.embedded_bitmaps,
-                objects: &self.object_representations,
-                fallback: images,
-            };
-                    layout::display_list_with_snapshot_mode_and_timelines(
-                    &self.document,
-                    width,
-                    height,
-                    text,
-                    self.rules.as_ref().expect("stylesheets initialized"),
-                    Some(&node_images),
-                    Some(&mut geometry),
-                    &self.scrolls,
-                    &self.style_cache,
-                    Some(&mut self.layout_cache),
-                    self.presentation_root,
-                    canvas_background,
-                    None,
-                    self.timeline_transform_values.as_deref(),
-                )?
-                };
-                let mut changed = false;
-                if !corrected {for scroll in &mut self.scrolls {
-                    let bounds = geometry.scroll_extents.iter().find(|bounds| bounds.node == scroll.node);
-                    let (x, y) = bounds.map_or((0.0, 0.0), |bounds| (
-                        scroll.x.clamp(bounds.min_x, bounds.max_x),
-                        scroll.y.clamp(bounds.min_y, bounds.max_y),
-                    ));
-                    if (scroll.x,scroll.y)!=(x,y) {
-                        if !self.normalized_scroll_events.contains(&scroll.node) {
-                            self.normalized_scroll_events.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                            self.normalized_scroll_events.push(scroll.node);
-                        }
-                        changed=true;
-                    }
-                    scroll.x = x;
-                    scroll.y = y;
-                }}
-                if changed {
-                    self.paint_revision = self.paint_revision.wrapping_add(1);
-                    corrected=true;
-                }
-                // Normalize actual offsets before the single post-layout
-                // stale-timeline update. A changed transform and scroll clamp
-                // share the same bounded correction layout. Forced CSSOM
-                // layouts preserve the previously sampled timeline value.
-                if !sampled_timelines&&!self.forced_layout {
-                    sampled_timelines=true;
-                    timeline_corrected=self.sample_transform_timeline_values(&geometry,text)?;
-                    changed|=timeline_corrected;
-                }
-                if !changed {break (list,geometry);}
-                self.layout_cache.clear();
-                self.layout_cache.begin_frame();
-            };
-            let mut requests = Vec::new();
-            apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
-            self.paint_worklet_cache.retain(|(request,_)|requests.contains(request));
-            geometry.rendered_text_boxes.sort_unstable_by_key(|value| (value.node.key(), value.order));
-            geometry.rendered_table_members.sort_unstable_by_key(|value| value.node.key());
-            // A correction can itself change a timeline range/scope. Keep
-            // that operation stale until the next rendering opportunity,
-            // without sampling it a second time in this frame.
-            self.timeline_layout_stale=geometry.transform_timeline_values.is_some()&&(self.forced_layout||timeline_corrected);
-            self.frame_id += 1;
-            self.cached = Some(CachedFrame {
-                document_version: version,
-                width,
-                height,
-                // Lazy resolvers may admit/decode an image while constructing
-                // this frame. Its completed commands own that generation.
-                image_generation:images.map(ImageResolver::generation),
-                list,
-                geometry,
+            let retry_cached_failure = self.failed_frame.as_ref().filter(|failed| {
+                (self.forced_layout || !self.timeline_layout_stale)
+                    && failed.document_version == version
+                    && failed.width == width
+                    && failed.height == height
+                    && failed.image_generation == image_generation
+                    && (!self.rendered_text_requested || failed.collect_rendered_text)
             });
-            // Consume source changes while their mutation journal still
-            // exists, even when this layout reused the stylesheet index.
-            // Otherwise a later source query cannot distinguish an unrelated
-            // style edit from an unobserved replacement of a loaded sheet.
-            self.reclaim_stale_stylesheet_sources();
-            self.document.clear_mutations();
+            if let Some(failed) = retry_cached_failure {
+                return Err(failed.error.clone());
+            }
+            if let Err(error) = self.relayout(width, height, text, images, version) {
+                // Image errors follow the resolver's state, which may settle
+                // without a new generation, and CommandLimit also reports
+                // transient allocation failure. Only deterministic failures
+                // are kept, keyed by the generation before the attempt: a
+                // lazy resolver may have admitted an image while it ran.
+                self.failed_frame = matches!(
+                    error,
+                    LayoutError::Css(_)
+                        | LayoutError::InvalidTree
+                        | LayoutError::DepthLimit
+                        | LayoutError::Text
+                        | LayoutError::UnsupportedGeneratedContent
+                        | LayoutError::UnsupportedMulticolumnLayout
+                        | LayoutError::UnsupportedWidgetAppearance
+                        | LayoutError::GridLimit
+                )
+                    .then(|| FailedFrame {
+                        document_version: version,
+                        width,
+                        height,
+                        image_generation,
+                        collect_rendered_text: self.rendered_text_requested,
+                        error: error.clone(),
+                    });
+                return Err(error);
+            }
+            self.failed_frame = None;
         }
         Ok(&self.cached.as_ref().expect("cached after layout").list)
+    }
+
+    fn relayout(
+        &mut self,
+        width: u32,
+        height: u32,
+        text: &dyn TextShaper,
+        images: Option<&dyn ImageResolver>,
+        version: u64,
+    ) -> Result<(), LayoutError> {
+        self.refresh_rules()?;
+        let rules = self.rules.as_mut().expect("stylesheets initialized");
+        rules.environment = css::MediaEnvironment {
+            width: width as f32,
+            height: height as f32,
+            ..rules.environment
+        };
+        let canvas_background=if self.canvas_background_is_default {
+            let environment=self.media_environment();
+            let scheme=if let Some(root)=crate::selector::document_element(&self.document) {
+                self.computed_style_with_text(root,Some(text))?.used_color_scheme(environment).scheme
+            }else {environment.color_schemes.page().scheme};
+            if self.embedding_color_scheme==Some(scheme) {None}else{css::color_scheme::system_color("canvas",scheme)}
+        }else {self.canvas_background};
+        let rules = self.rules.as_ref().expect("stylesheets initialized");
+        let only_text_mutations = !self.document.mutations().is_empty()
+            && self.document.mutations().iter().all(|mutation| {
+                matches!(mutation.kind, MutationKind::CharacterData)
+                    && !in_style(&self.document, mutation.target)
+            });
+        let only_local_mutations = !self.document.mutations().is_empty()
+            && self.document.mutations().iter().all(|mutation| {
+                !in_style(&self.document, mutation.target)
+                    && match &mutation.kind {
+                        MutationKind::CharacterData | MutationKind::Attribute(_) => true,
+                        MutationKind::Tree {
+                            added,
+                            removed,
+                            styles_changed,
+                        } => {
+                            !*styles_changed
+                                && !added
+                                    .is_some_and(|node| subtree_has_style(&self.document, node))
+                                && !removed
+                                    .is_some_and(|node| subtree_has_style(&self.document, node))
+                        }
+                        MutationKind::FullRebuild => false,
+                    }
+            });
+        // Counter and quote output depends on preceding siblings, not just
+        // the changed subtree. Keep reuse on unchanged frames, but recapture
+        // fragments after mutations in documents with that shared context.
+        let generated_context_changed = self.style_version != version
+            && (rules.has_counter_data()
+                || rules.has_quote_content()
+                || rules.has_list_item_data()
+                || layout::contains_list_item_candidate(&self.document, self.document.root())?);
+        let can_retain = !generated_context_changed
+            && (self.style_version == version
+                || (only_local_mutations && rules.siblings_share));
+        let environment_changed = self.style_environment != Some(rules.environment);
+        if !can_retain || environment_changed {
+            self.style_cache.borrow_mut().clear();
+            self.layout_cache.clear();
+        } else if self.style_version != version {
+            let mut targets: Vec<_> = self
+                .document
+                .mutations()
+                .iter()
+                .map(|mutation| mutation.target)
+                .collect();
+            let slot_hosts: Vec<_> = self
+                .document
+                .mutations()
+                .iter()
+                .filter_map(|mutation| match &mutation.kind {
+                    MutationKind::Attribute(name) => {
+                        slot_assignment_host(&self.document, mutation.target, name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            targets.extend(slot_hosts.iter().copied());
+            if only_text_mutations {
+                self.layout_cache
+                    .invalidate_text_targets(&self.document, &targets);
+            } else {
+                // Attribute changes and moved subtrees can change ancestry
+                // matches even if the parent's computed style is identical.
+                self.style_cache.borrow_mut().clear();
+                self.layout_cache
+                    .invalidate_text_targets(&self.document, &targets);
+                let mut subtrees = Vec::new();
+                for mutation in self.document.mutations() {
+                    match &mutation.kind {
+                        MutationKind::Attribute(_) => subtrees.push(mutation.target),
+                        MutationKind::Tree { added, removed, .. } => {
+                            subtrees.extend(added.iter().copied());
+                            subtrees.extend(removed.iter().copied());
+                        }
+                        _ => {}
+                    }
+                }
+                // Slot/name mutations can move assigned light children
+                // between sibling slots. The changed node's new composed
+                // ancestry does not include the slot fragment that lost
+                // those children, so invalidate their common host subtree.
+                subtrees.extend(slot_hosts);
+                self.layout_cache
+                    .invalidate_subtree_targets(&self.document, &subtrees);
+            }
+        }
+        self.style_cache.borrow_mut().begin_frame();
+        self.layout_cache.begin_frame();
+        self.style_version = version;
+        self.style_environment = Some(rules.environment);
+        // Overflow bounds are expressed before the container's own scroll
+        // translation. A changed box or writing direction can therefore
+        // clamp existing offsets after layout, with at most one correction
+        // layout before publishing commands and hit geometry.
+        let mut corrected = false;
+        let mut sampled_timelines=false;
+        let mut timeline_corrected=false;
+        let (mut list, mut geometry) = loop {
+            let mut geometry = layout::LayoutGeometry::default();
+            geometry.collect_rendered_text = self.rendered_text_requested;
+            let list = {
+        let node_images = NodeImages {
+            color_schemes:self.media_environment().color_schemes,
+            svg_fragment:self.svg_fragment.as_deref(), svg_image_viewport:self.svg_image_viewport.as_deref().copied(),
+            paint_definitions: &self.paint_definitions,
+            paint_registration_revision:self.rules_generation,
+            bitmaps: &self.node_bitmaps, embedded:&self.embedded_bitmaps,
+            objects: &self.object_representations,
+            fallback: images,
+        };
+                layout::display_list_with_snapshot_mode_and_timelines(
+                &self.document,
+                width,
+                height,
+                text,
+                self.rules.as_ref().expect("stylesheets initialized"),
+                Some(&node_images),
+                Some(&mut geometry),
+                &self.scrolls,
+                &self.style_cache,
+                Some(&mut self.layout_cache),
+                self.presentation_root,
+                canvas_background,
+                None,
+                self.timeline_transform_values.as_deref(),
+            )?
+            };
+            let mut changed = false;
+            if !corrected {for scroll in &mut self.scrolls {
+                let bounds = geometry.scroll_extents.iter().find(|bounds| bounds.node == scroll.node);
+                let (x, y) = bounds.map_or((0.0, 0.0), |bounds| (
+                    scroll.x.clamp(bounds.min_x, bounds.max_x),
+                    scroll.y.clamp(bounds.min_y, bounds.max_y),
+                ));
+                if (scroll.x,scroll.y)!=(x,y) {
+                    if !self.normalized_scroll_events.contains(&scroll.node) {
+                        self.normalized_scroll_events.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                        self.normalized_scroll_events.push(scroll.node);
+                    }
+                    changed=true;
+                }
+                scroll.x = x;
+                scroll.y = y;
+            }}
+            if changed {
+                self.paint_revision = self.paint_revision.wrapping_add(1);
+                corrected=true;
+            }
+            // Normalize actual offsets before the single post-layout
+            // stale-timeline update. A changed transform and scroll clamp
+            // share the same bounded correction layout. Forced CSSOM
+            // layouts preserve the previously sampled timeline value.
+            if !sampled_timelines&&!self.forced_layout {
+                sampled_timelines=true;
+                timeline_corrected=self.sample_transform_timeline_values(&geometry,text)?;
+                changed|=timeline_corrected;
+            }
+            if !changed {break (list,geometry);}
+            self.layout_cache.clear();
+            self.layout_cache.begin_frame();
+        };
+        let mut requests = Vec::new();
+        apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
+        self.paint_worklet_cache.retain(|(request,_)|requests.contains(request));
+        geometry.rendered_text_boxes.sort_unstable_by_key(|value| (value.node.key(), value.order));
+        geometry.rendered_table_members.sort_unstable_by_key(|value| value.node.key());
+        // A correction can itself change a timeline range/scope. Keep
+        // that operation stale until the next rendering opportunity,
+        // without sampling it a second time in this frame.
+        self.timeline_layout_stale=geometry.transform_timeline_values.is_some()&&(self.forced_layout||timeline_corrected);
+        self.frame_id += 1;
+        self.cached = Some(CachedFrame {
+            document_version: version,
+            width,
+            height,
+            // Lazy resolvers may admit/decode an image while constructing
+            // this frame. Its completed commands own that generation.
+            image_generation:images.map(ImageResolver::generation),
+            list,
+            geometry,
+        });
+        // Consume source changes while their mutation journal still
+        // exists, even when this layout reused the stylesheet index.
+        // Otherwise a later source query cannot distinguish an unrelated
+        // style edit from an unobserved replacement of a loaded sheet.
+        self.reclaim_stale_stylesheet_sources();
+        self.document.clear_mutations();
+        Ok(())
     }
 }
 
@@ -6738,6 +6810,51 @@ mod tests {
             fallback: Some(&images),
         };
         assert_eq!(ImageResolver::generation(&node_images), 23);
+    }
+
+    struct FailingText {
+        generation: Cell<u64>,
+        calls: Cell<u32>,
+    }
+
+    impl TextShaper for FailingText {
+        fn generation(&self) -> u64 {
+            self.generation.get()
+        }
+        fn shape(&self, _: &str, _: f32) -> Result<ShapedRun, ()> {
+            self.calls.set(self.calls.get() + 1);
+            Err(())
+        }
+        fn ascent(&self, _: f32) -> f32 {
+            0.0
+        }
+        fn line_height(&self, _: f32) -> f32 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn a_failed_layout_is_retried_only_when_its_inputs_change() {
+        let document = crate::html::parse("<body><p>text</p><div id=extra></div>", 64).unwrap();
+        let extra = crate::selector::query_selector(&document, document.root(), "#extra").unwrap().unwrap();
+        let mut session = RenderSession::new(document);
+        let text = FailingText { generation: Cell::new(0), calls: Cell::new(0) };
+        let render = |session: &mut RenderSession, width| session.display_list(width, 8, &text).map(|_| ());
+        assert_eq!(render(&mut session, 8), Err(LayoutError::Text));
+        let calls = text.calls.get();
+        assert!(calls > 0);
+        assert_eq!(render(&mut session, 8), Err(LayoutError::Text));
+        assert_eq!(text.calls.get(), calls, "the same inputs fail without another layout");
+        text.generation.set(1);
+        assert_eq!(render(&mut session, 8), Err(LayoutError::Text));
+        assert!(text.calls.get() > calls, "a new text generation is laid out again");
+        let calls = text.calls.get();
+        assert_eq!(render(&mut session, 9), Err(LayoutError::Text));
+        assert!(text.calls.get() > calls, "a new size is laid out again");
+        let calls = text.calls.get();
+        session.document_mut().remove(extra).unwrap();
+        assert_eq!(render(&mut session, 9), Err(LayoutError::Text));
+        assert!(text.calls.get() > calls, "a changed document is laid out again");
     }
 
     #[test]

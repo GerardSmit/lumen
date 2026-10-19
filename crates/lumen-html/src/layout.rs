@@ -8686,11 +8686,30 @@ impl OverflowLinePaint {
         self.owner_hit = if let Some(hit) = self.owner_hit { Some(if relative {hit.checked_sub(hit_base)?}else{hit.checked_add(hit_base)?}) } else {None};
         let sources = Arc::make_mut(&mut self.sources);
         for source in sources {
-            source.commands = index(source.commands.start)?..index(source.commands.end)?;
+            source.commands = if source.commands.is_empty() {self.marker..self.marker}
+                else {index(source.commands.start)?..index(source.commands.end)?};
             source.anchor = if let Some(anchor) = source.anchor { Some(index(anchor)?) } else { None };
             source.hit = if let Some(hit) = source.hit { Some(if relative {hit.checked_sub(hit_base)?}else{hit.checked_add(hit_base)?}) } else {None};
         }
         Some(())
+    }
+    /// Follows `raise_flow_paint`, which rotates `commands` and `hits` to the
+    /// ends of their streams.
+    fn raise(&mut self, commands: &Range<usize>, command_end: usize, hits: &Range<usize>, hit_end: usize) {
+        let command = |index: usize| raised_index(index, commands, command_end);
+        let hit = |index: usize| raised_index(index, hits, hit_end);
+        self.marker = command(self.marker);
+        for marker in self.markers.iter_mut().flatten() {
+            if marker.commands.is_empty() { marker.commands = self.marker..self.marker; }
+            else { raise_range(&mut marker.commands, commands.start, commands.end, command_end); }
+        }
+        self.owner_hit = self.owner_hit.map(hit);
+        for source in Arc::make_mut(&mut self.sources) {
+            if source.commands.is_empty() { source.commands = self.marker..self.marker; }
+            else { raise_range(&mut source.commands, commands.start, commands.end, command_end); }
+            source.anchor = source.anchor.map(command);
+            source.hit = source.hit.map(hit);
+        }
     }
 }
 
@@ -12941,6 +12960,13 @@ fn raise_range(range: &mut core::ops::Range<usize>, first: usize, last: usize, e
         range.start -= offset;
         range.end -= offset;
     }
+}
+
+/// Where `raise_range` moves the single entry at `index`.
+fn raised_index(index: usize, moved: &core::ops::Range<usize>, end: usize) -> usize {
+    let mut range = index..index + 1;
+    raise_range(&mut range, moved.start, moved.end, end);
+    range.start
 }
 
 fn move_command(command: &mut Command, dx: f32, dy: f32) {
@@ -31570,6 +31596,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     );
                 }
             }
+            for line in &mut self.overflow_lines {
+                line.raise(&commands, command_end, &hits, hit_end);
+            }
             for (command_range, hit_range) in &mut chunks[index + 1..] {
                 raise_range(command_range, commands.start, commands.end, command_end);
                 raise_range(hit_range, hits.start, hits.end, hit_end);
@@ -33807,6 +33836,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 (id,generated_pseudo),first_command as u64,false));
         }
         if let Some((z,identity,order,transparent))=principal_escape {
+            if !transparent {
+                // A stacking context paints its relatively positioned
+                // descendants within itself. Left queued, an ancestor's later
+                // raise would move them out of this context's paint range.
+                let hit_end=self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len());
+                self.discard_positioned_flow_in(first_command..self.commands.len(),first_hit..hit_end);
+            }
             self.record_stacking_escape_range(first_command,first_hit,z,identity,order,transparent)?;
         }
         let overflow = if self
@@ -53818,5 +53854,35 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         assert!(presentation.list_box&&!presentation.dropdown_button,"devolved list boxes never acquire a drop-down button");
     }
 
-}
 
+    #[test]
+    fn relative_descendant_of_a_later_stacking_context_paints_inside_it() {
+        // The absolutely positioned box ends the body's positioned phase
+        // early; the relatively positioned box inside the z-index context
+        // must not be raised past it, out of that context's paint range.
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}div{height:4px}</style><a style='position:absolute;width:4px;height:4px;background:#f00'>x</a><header style='position:relative;z-index:3'><div><div style='position:relative'><div id=inner style='background:#00f'>y</div></div></div></header>", 64).unwrap();
+        let inner = crate::selector::query_selector(&document, document.root(), "#inner").unwrap().unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        let list = session.display_list(40, 40, &FixedText).unwrap();
+        let fills: Vec<_> = list.0.iter().filter_map(|command| match command {
+            Command::FillRect { color, .. } => Some((color.r, color.b)),
+            _ => None,
+        }).collect();
+        let red = fills.iter().position(|fill| *fill == (255, 0)).unwrap();
+        let blue = fills.iter().position(|fill| *fill == (0, 255)).unwrap();
+        assert!(red < blue, "the z-index context paints above the earlier positioned box: {fills:?}");
+        let hit = session.hit_test(1.0, 1.0).unwrap();
+        assert!(hit == inner || session.document().parent(hit).unwrap() == Some(inner));
+    }
+
+    #[test]
+    fn ellipsis_line_of_a_raised_transformed_block_keeps_its_marker() {
+        // The transformed block is raised above the later list item. Its
+        // ellipsis line must follow its commands, not stay at the old index.
+        let document = crate::html::parse("<div style='transform:translate(0);overflow:hidden;text-overflow:ellipsis'>Toggle</div><ul><li>2.2</li></ul>", 64).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        let list = session.display_list(200, 100, &RecordingText::default()).unwrap();
+        assert!(list.0.iter().any(|command| matches!(command, Command::PushTransform(_))));
+    }
+
+}
