@@ -341,6 +341,20 @@ fn stylesheet_source_mutation_owner(document: &Document, mutation: &crate::Mutat
     }
 }
 
+/// A viewport size change keeps retained styles when no media query result
+/// changes; the cache then drops only the results that read the viewport.
+fn retain_styles_for_resize(
+    rules: &StyleIndex,
+    style_cache: &RefCell<css::StyleCache>,
+    old: Option<css::MediaEnvironment>,
+) -> bool {
+    let Some(old) = old else { return false };
+    let new = rules.environment;
+    css::MediaEnvironment { width: new.width, height: new.height, ..old } == new
+        && !rules.media_results_change(old)
+        && style_cache.borrow_mut().invalidate_viewport_dependent()
+}
+
 pub(crate) fn subtree_has_style(document: &Document, root: NodeId) -> bool {
     let mut current = root;
     loop {
@@ -3770,9 +3784,14 @@ impl RenderSession {
             && (self.style_version == version
                 || (only_local_mutations && rules.siblings_share));
         let environment_changed = self.style_environment != Some(rules.environment);
-        if !can_retain || environment_changed {
-            self.style_cache.borrow_mut().clear();
+        let full_restyle = !can_retain
+            || (environment_changed
+                && !retain_styles_for_resize(rules, &self.style_cache, self.style_environment));
+        if environment_changed || full_restyle {
             self.layout_cache.clear();
+        }
+        if full_restyle {
+            self.style_cache.borrow_mut().clear();
         } else if self.style_version != version {
             let mut targets: Vec<_> = self
                 .document
@@ -3937,6 +3956,29 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use core::cell::Cell;
+
+    #[test]
+    fn resize_retained_styles_match_a_fresh_session() {
+        let source = "<style>:root{--gap:5vh}#a{height:20vh;background:red}\
+            #b{width:calc(10% + 10vw);height:4px;background:blue}\
+            #c{margin-top:var(--gap);height:3px;background:green}\
+            #d::before{content:'';display:block;height:2vh;background:navy}\
+            @media (min-height:300px){#e{height:7px;background:olive}}\
+            #f{height:6px;background:gray}</style>\
+            <div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div><div id=f></div>";
+        let sizes = [(200, 100), (200, 400), (150, 400), (200, 250), (200, 100)];
+        // Fresh sessions first: their viewport reads must not precede the
+        // retained session's cache lifetime.
+        let expected: Vec<_> = sizes.iter().map(|&(width, height)| {
+            let mut fresh = RenderSession::new(crate::html::parse(source, 128).unwrap());
+            alloc::format!("{:?}", fresh.display_list(width, height, &NoText).unwrap().0)
+        }).collect();
+        let mut session = RenderSession::new(crate::html::parse(source, 128).unwrap());
+        for (&(width, height), expected) in sizes.iter().zip(&expected) {
+            let retained = alloc::format!("{:?}", session.display_list(width, height, &NoText).unwrap().0);
+            assert_eq!(&retained, expected, "{width}x{height}");
+        }
+    }
 
     #[test]
     fn specification_transform_timeline_uses_completed_owner_geometry_and_render_phase() {
@@ -4703,8 +4745,10 @@ mod tests {
         session.display_list(100, 100, &NoText).unwrap();
         assert!(session.style_cache_stats().computed_styles > 0);
         assert_eq!(session.computed_style(p).unwrap().height, Some(20.0));
+        // A resize may retain styles that read neither the viewport nor a
+        // media query; whether it does depends on viewport reads elsewhere.
         session.display_list(200, 100, &NoText).unwrap();
-        assert!(session.style_cache_stats().computed_styles > 0);
+        assert_eq!(session.computed_style(p).unwrap().height, Some(20.0));
     }
 
     #[test]

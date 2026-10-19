@@ -23,7 +23,7 @@ pub use lumen_common::ucd::{
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp::Ordering as CmpOrdering;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lumen_common::bidi::{self, Script, ScriptExtension, UnicodeScript};
 use lumen_html::paint::{
     PrimaryCharacterWidths,
@@ -35,8 +35,8 @@ use lumen_html::paint::{
 static NEXT_FACE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SHAPE_TEXT_BYTES: usize = 64 * 1024;
-const RUN_CACHE_SLOTS: usize = 512;
-const MAX_RUN_CACHE_BYTES: usize = 512 * 1024;
+const RUN_CACHE_SLOTS: usize = 16384;
+const MAX_RUN_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHED_TEXT_BYTES: usize = 256;
 const MAX_REGISTERED_FONTS: usize = 64;
 const MAX_REQUESTED_FAMILIES: usize = 64;
@@ -1715,11 +1715,15 @@ struct RunSlot<V> {
     value: V,
 }
 
-/// Direct-mapped cache, bounded by slots, text length and retained bytes.
-/// Contention is a miss; shaping never waits for another thread's cache lock.
+/// Two-way set-associative cache, bounded by slots, text length and retained
+/// bytes. A set's newer entry sits in its even slot; inserting demotes it to the
+/// odd slot. Contention is a miss; shaping never waits for another thread's
+/// cache lock.
 struct RunCache<V,const SLOTS:usize=RUN_CACHE_SLOTS> {
     busy: AtomicBool,
-    slots: UnsafeCell<Vec<Option<RunSlot<V>>>>,
+    slots: UnsafeCell<Vec<Option<Box<RunSlot<V>>>>>,
+    /// Sum of the occupied slots' `bytes`, maintained under the busy flag.
+    retained: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -1731,6 +1735,7 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
         Self {
             busy: AtomicBool::new(false),
             slots: UnsafeCell::new(Vec::new()),
+            retained: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
@@ -1777,7 +1782,7 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
         }
         (hash, size, dir)
     }
-    fn locked<R>(&self, f: impl FnOnce(&mut Vec<Option<RunSlot<V>>>) -> R) -> Option<R> {
+    fn locked<R>(&self, f: impl FnOnce(&mut Vec<Option<Box<RunSlot<V>>>>) -> R) -> Option<R> {
         struct Release<'a>(&'a AtomicBool);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
@@ -1791,8 +1796,11 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
         // SAFETY: busy grants exclusive access until Release drops.
         Some(f(unsafe { &mut *self.slots.get() }))
     }
-    fn bytes(slots: &Vec<Option<RunSlot<V>>>) -> usize {
-        slots.capacity() * core::mem::size_of::<Option<RunSlot<V>>>()
+    fn set(hash: u64) -> usize {
+        (hash as usize % (SLOTS / 2)) * 2
+    }
+    fn bytes(slots: &Vec<Option<Box<RunSlot<V>>>>) -> usize {
+        slots.capacity() * core::mem::size_of::<Option<Box<RunSlot<V>>>>()
             + slots
                 .iter()
                 .filter_map(Option::as_ref)
@@ -1840,15 +1848,18 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
             if let Some(language)=language {hash=lumen_common::fasthash::fnv1a64(hash,language.as_bytes());}
             if let Some((start,end))=source {hash=lumen_common::fasthash::fnv1a64(hash,&start.to_le_bytes());hash=lumen_common::fasthash::fnv1a64(hash,&end.to_le_bytes());}
             self.locked(|slots| {
-                let slot = slots.get(hash as usize % SLOTS)?.as_ref()?;
-                (slot.hash == hash
-                    && slot.size == size
-                    && slot.dir == dir
-                    && slot.mode == mode
-                    && slot.spec.as_ref() == spec
-                    && slot.language.as_deref()==language && slot.source==source
-                    && &*slot.text == text)
-                    .then(|| (slot.value.clone(),slot.clusters.clone()))
+                let set = Self::set(hash);
+                (set..set + 2).find_map(|index| {
+                    let slot = slots.get(index)?.as_ref()?;
+                    (slot.hash == hash
+                        && slot.size == size
+                        && slot.dir == dir
+                        && slot.mode == mode
+                        && slot.spec.as_ref() == spec
+                        && slot.language.as_deref()==language && slot.source==source
+                        && &*slot.text == text)
+                        .then(|| (slot.value.clone(),slot.clusters.clone()))
+                })
             })
             .flatten()
         };
@@ -1894,7 +1905,7 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
             2 * core::mem::size_of::<usize>() + core::mem::size_of_val(settings.as_ref()) + settings.retained_bytes());
         let alternate_bytes=spec.and_then(|spec|spec.alternates.as_ref()).map_or(0,|value|value.retained_bytes());
         let scope_bytes=spec.and_then(|spec|spec.family_scope.as_ref()).map_or(0,|chain|core::mem::size_of_val(chain.as_ref()));
-        let bytes = text.len() + value.cache_bytes() + family_bytes + feature_bytes + alternate_bytes + scope_bytes + language.map_or(0,str::len) + clusters.as_ref().map_or(0,|clusters|core::mem::size_of_val(clusters.as_ref()));
+        let bytes = core::mem::size_of::<RunSlot<V>>() + text.len() + value.cache_bytes() + family_bytes + feature_bytes + alternate_bytes + scope_bytes + language.map_or(0,str::len) + clusters.as_ref().map_or(0,|clusters|core::mem::size_of_val(clusters.as_ref()));
         let (mut hash, size, dir) = Self::key(text, size, rtl, mode, spec);
         if let Some(language)=language {hash=lumen_common::fasthash::fnv1a64(hash,language.as_bytes());}
         if let Some((start,end))=source {hash=lumen_common::fasthash::fnv1a64(hash,&start.to_le_bytes());hash=lumen_common::fasthash::fnv1a64(hash,&end.to_le_bytes());}
@@ -1905,28 +1916,38 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
                 }
                 slots.resize_with(SLOTS, || None);
             }
-            if slots.capacity() * core::mem::size_of::<Option<RunSlot<V>>>() + bytes
-                > MAX_RUN_CACHE_BYTES
-            {
+            let table = slots.capacity() * core::mem::size_of::<Option<Box<RunSlot<V>>>>();
+            if table + bytes > MAX_RUN_CACHE_BYTES {
                 return;
             }
-            let index = hash as usize % SLOTS;
-            if slots[index].take().is_some() {
-                self.evictions.fetch_add(1, Ordering::Relaxed);
+            let set = Self::set(hash);
+            let mut retained = self.retained.load(Ordering::Relaxed);
+            let evict = |slot: &mut Option<Box<RunSlot<V>>>, retained: &mut usize| {
+                if let Some(previous) = slot.take() {
+                    *retained -= previous.bytes;
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            // Replace an equal key in place; otherwise demote the newer entry.
+            if slots[set].as_ref().is_some_and(|slot| slot.hash == hash) {
+                evict(&mut slots[set], &mut retained);
+            } else if slots[set + 1].as_ref().is_some_and(|slot| slot.hash == hash) {
+                evict(&mut slots[set + 1], &mut retained);
+                slots.swap(set, set + 1);
+            } else {
+                evict(&mut slots[set + 1], &mut retained);
+                slots.swap(set, set + 1);
             }
-            let mut retained = Self::bytes(slots);
-            if retained + bytes > MAX_RUN_CACHE_BYTES {
+            if table + retained + bytes > MAX_RUN_CACHE_BYTES {
                 for slot in slots.iter_mut() {
-                    if let Some(previous) = slot.take() {
-                        retained -= previous.bytes;
-                        self.evictions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if retained + bytes <= MAX_RUN_CACHE_BYTES {
+                    evict(slot, &mut retained);
+                    if table + retained + bytes <= MAX_RUN_CACHE_BYTES {
                         break;
                     }
                 }
             }
-            slots[index] = Some(RunSlot {
+            self.retained.store(retained + bytes, Ordering::Relaxed);
+            slots[set] = Some(Box::new(RunSlot {
                 hash,
                 size,
                 dir,
@@ -1937,7 +1958,7 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
                 text: text.into(),
                 bytes,
                 value,
-            });
+            }));
         });
     }
 }

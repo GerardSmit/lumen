@@ -66,6 +66,12 @@ pub fn resolve_formatted<'a>(text:&'a str,formatted:&str,segments:&[SourceSegmen
     Ok(BidiInfo{text,original_classes:classes,levels,paragraphs})
 }
 
+/// Whether `ch` has bidi class LRI, RLI, FSI or PDI. Each class has exactly
+/// one code point, so this avoids the class table search.
+pub fn is_isolate_control(ch: char) -> bool {
+    matches!(ch, '\u{2066}'..='\u{2069}')
+}
+
 /// Visual items suitable for shaping. UAX #9 L1 can reset trailing spaces to
 /// the paragraph level without changing their visual direction. Such a level
 /// boundary is not a shaping boundary: retain kerning and joining with the
@@ -75,7 +81,7 @@ pub fn shaping_runs(info: &BidiInfo<'_>, paragraph: &unicode_bidi::ParagraphInfo
     range: std::ops::Range<usize>) -> Result<(Vec<Level>, Vec<std::ops::Range<usize>>), &'static str> {
     let (levels, visual) = info.visual_runs(paragraph, range);
     if visual.len() <= 1 && !visual.iter().any(|run| info.text[run.clone()].chars().any(|ch|
-        matches!(bidi_class(ch), BidiClass::LRI | BidiClass::RLI | BidiClass::FSI | BidiClass::PDI))) {
+        is_isolate_control(ch))) {
         return Ok((levels, visual));
     }
     let mut output: Vec<std::ops::Range<usize>> = Vec::new();
@@ -85,7 +91,7 @@ pub fn shaping_runs(info: &BidiInfo<'_>, paragraph: &unicode_bidi::ParagraphInfo
         let mut pieces = Vec::new();
         let mut start = run.start;
         for (offset, ch) in info.text[run.clone()].char_indices() {
-            if matches!(bidi_class(ch), BidiClass::LRI | BidiClass::RLI | BidiClass::FSI | BidiClass::PDI) {
+            if is_isolate_control(ch) {
                 let at = run.start + offset;
                 pieces.try_reserve(2).map_err(|_| "bidi shaping allocation failed")?;
                 if start < at {pieces.push((start..at, false));}

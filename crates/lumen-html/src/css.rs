@@ -4337,7 +4337,11 @@ impl Style {
         if !self.relative_lengths.is_empty() {
             result.relative_lengths.clear();
         }
-        result.relative_expressions.clear();
+        // Clearing through DerefMut copies shared extras; skip that when the
+        // list is already empty but keep materializing absent extras.
+        if !self.relative_expressions.is_empty() || result.extras.is_none() {
+            result.relative_expressions.clear();
+        }
         for expression in self.relative_expressions.iter().filter(|expression|expression.slot==7).chain(self.relative_expressions.iter().filter(|expression|expression.slot!=7)) {
             if expression.parent_font_pending || matches!(expression.slot, 59 | 239..=241 | 53 | 227 | 178 | 158 | 69 | 131 | 139 | 200 | 228 | 229 | 230) { result.relative_expressions.push(expression.clone()); continue; }
             if expression.slot == 20 {
@@ -6745,6 +6749,10 @@ pub struct StyleIndex {
     snapshot_declarations: Arc<[SnapshotDeclaration]>,
     registered_properties: Option<Arc<[registered_properties::RegisteredCustomProperty]>>,
     registration_snapshot: core::cell::RefCell<Option<(MediaEnvironment, Arc<[registered_properties::RegisteredCustomProperty]>)>>,
+    /// Per rule media-list result for one environment: 0 unknown, 1 match, 2 no match.
+    /// Query text is reparsed on every evaluation, and the cascade asks once
+    /// per candidate rule per element.
+    media_results: core::cell::RefCell<(Option<MediaEnvironment>, Vec<u8>)>,
     pub(crate) keyframes: Vec<KeyframesRuleText>,
 }
 
@@ -6878,6 +6886,39 @@ impl StyleIndex {
         *self.registration_snapshot.get_mut() = None;
     }
 
+    fn rule_media_matches(&self, order: usize) -> bool {
+        let rule = &self.rules[order];
+        if rule.media.is_empty() { return true; }
+        let mut results = self.media_results.borrow_mut();
+        if results.0 != Some(self.environment) || results.1.len() != self.rules.len() {
+            results.0 = Some(self.environment);
+            results.1.clear();
+            results.1.resize(self.rules.len(), 0);
+        }
+        match results.1[order] {
+            1 => true,
+            2 => false,
+            _ => {
+                // Not counted as a media read: a resize compares these results
+                // for every rule before retaining styles.
+                let matched = rule.media.iter().all(|query| media_queries::query_matches(query, self.environment));
+                results.1[order] = if matched { 1 } else { 2 };
+                matched
+            }
+        }
+    }
+
+    /// Whether a style or keyframes rule's media query matches differently
+    /// in `old` than in the current environment.
+    pub(crate) fn media_results_change(&self, old: MediaEnvironment) -> bool {
+        let mut last = None;
+        self.rules.iter().map(|rule| &rule.media).chain(self.keyframes.iter().map(|rule| &rule.media)).any(|media| {
+            if media.is_empty() || last == Some(media.as_ptr()) { return false; }
+            last = Some(media.as_ptr());
+            media.iter().any(|query| media_matches(query, old) != media_matches(query, self.environment))
+        })
+    }
+
     /// One source/environment-epoch snapshot is shared by all style targets.
     /// Rule carriers follow the canonical import/owner/adoption traversal order;
     /// last valid active declaration wins, and API registration wins over rules.
@@ -6886,9 +6927,9 @@ impl StyleIndex {
             if *environment == self.environment { return snapshot.clone(); }
         }
         let mut effective = Vec::new();
-        for rule in &self.rules {
-            if !rule.media.iter().all(|query| media_matches(query, self.environment)) { continue; }
+        for (order, rule) in self.rules.iter().enumerate() {
             let Some(registration) = &rule.registration else { continue; };
+            if !self.rule_media_matches(order) { continue; }
             let mut registration = registration.clone();
             registration.source_url = rule.source_url.clone().or_else(||self.document_base_url.clone());
             if let Some(at) = effective.iter().position(|property: &registered_properties::RegisteredCustomProperty| property.name == registration.name) {
@@ -7085,6 +7126,7 @@ impl StyleIndex {
             snapshot_declarations: Arc::from([]),
             registered_properties: None,
             registration_snapshot: core::cell::RefCell::new(None),
+            media_results: core::cell::RefCell::new((None, Vec::new())),
             keyframes: Vec::new(),
         }
     }
@@ -7242,9 +7284,9 @@ impl StyleIndex {
 
     pub(crate) fn compute_typographic(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: &dyn TextShaper) -> Result<Option<Style>, CssError> {
-        if !self.has_typographic_content || !self.rules.iter().any(|rule|
+        if !self.has_typographic_content || !self.rules.iter().enumerate().any(|(order,rule)|
             rule.selector.pseudo_element == Some(pseudo) && rule.matches_at(document, origin)
-                && rule.media.iter().all(|query| media_matches(query, self.environment))) { return Ok(None); }
+                && self.rule_media_matches(order)) { return Ok(None); }
         let mut filtered = self.compute_pseudo_computed(document, origin, origin_style, pseudo, Some(text))?;
         filtered.direction = origin_style.direction;
         filtered.writing_mode = origin_style.writing_mode;
@@ -7291,8 +7333,23 @@ impl StyleIndex {
     pub(crate) fn compute_pseudo_cached(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: Option<&dyn TextShaper>,
         cache: &mut StyleCache) -> Result<Option<GeneratedStyle>, CssError> {
+        cache.prepare_text_context(text);
         let role = self.box_children_context(document, origin, origin_style, text, cache)?;
-        self.compute_pseudo_in_context(document, origin, origin_style, pseudo, text, role)
+        let token = cache.parent_token(Some(origin_style));
+        if let Some(token) = token {
+            if let Some(generated) = cache.pseudo_entry(origin, pseudo, token, role) {
+                return Ok(generated);
+            }
+        }
+        let window = cache.begin_viewport_window();
+        let generated = self.compute_pseudo_in_context(document, origin, origin_style, pseudo, text, role);
+        let viewport_dependent = cache.end_viewport_window(window);
+        let generated = generated?;
+        if let Some(token) = token.filter(|_| generated.as_ref().is_none_or(|generated| !generated.style.sibling_position_dependent)) {
+            cache.store_pseudo(document, origin, pseudo, token, role, &generated);
+            if viewport_dependent { cache.note_viewport_dependent(origin, true); }
+        }
+        Ok(generated)
     }
 
     fn compute_pseudo_in_context(&self, document: &Document, origin: NodeId,
@@ -7382,9 +7439,9 @@ impl StyleIndex {
         &self, document:&Document, node:NodeId, frames:&[SvgInstanceFrame],
     )->Vec<String> {
         let tree=SelectorDocument{source:document,instances:frames};
-        self.rules.iter().filter(|rule|rule.media.iter().all(|query|media_matches(query,self.environment))
+        self.rules.iter().enumerate().filter(|(order,rule)|self.rule_media_matches(*order)
             &&rule.match_scope_proximity_in_tree(&tree,node,&crate::forms::NoValidityOverrides).is_some())
-            .flat_map(|rule|rule.unsupported_svg_properties.iter().cloned()).collect()
+            .flat_map(|(_,rule)|rule.unsupported_svg_properties.iter().cloned()).collect()
     }
 
     /// Replace one element's animation sample using the shared effect cascade.
@@ -9279,6 +9336,9 @@ impl typed_numeric::NumericExpressionBuilder for LengthValueBuilder {
             // division, then round the final CSS value to our scalar storage.
             let resolved=(value.value*f64::from(self.context?.percent?)/100.0) as f32;
             return resolved.is_finite().then_some((resolved,true));
+        }
+        if matches!(value.unit, Unit::Vw | Unit::Vh | Unit::Vmin | Unit::Vmax) {
+            note_viewport_read();
         }
         let scale = match value.unit {
             Unit::Number | Unit::Px => 1.0,
@@ -15596,7 +15656,7 @@ impl ContainerUnitContext {
         use typed_numeric::NumericUnit as Unit;
         let axis = |basis, fallback| match basis {
             ContainerUnitBasis::Unknown => None,
-            ContainerUnitBasis::NoContainer => Some(fallback),
+            ContainerUnitBasis::NoContainer => { note_viewport_read(); Some(fallback) }
             ContainerUnitBasis::Size(size) => (size.is_finite() && size >= 0.0).then_some(size),
         };
         let (inline, block) = if self.writing_mode == WritingMode::HorizontalTb {
@@ -22746,14 +22806,31 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
     }
 }
 
-fn media_matches(query:&str,environment:MediaEnvironment)->bool {media_queries::query_matches(query,environment)}
+/// Viewport-size reads by length resolution. A style cache attributes the
+/// reads made while it computes a node; any read outside those computations
+/// may come from a retained style and keeps resizes on the full restyle path.
+static VIEWPORT_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Media evaluations, attributed like viewport reads. Evaluations outside a
+/// node computation only feed layout or the per-rule media results.
+static MEDIA_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn note_viewport_read() { VIEWPORT_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+fn viewport_reads() -> u64 { VIEWPORT_READS.load(core::sync::atomic::Ordering::Relaxed) }
+fn media_reads() -> u64 { MEDIA_READS.load(core::sync::atomic::Ordering::Relaxed) }
+
+fn media_matches(query:&str,environment:MediaEnvironment)->bool {
+    MEDIA_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    media_queries::query_matches(query,environment)
+}
 
 /// Shared cascade, HTML picture, and DOM media-query authority.
 pub fn media_query_matches(query:&str,environment:MediaEnvironment)->bool {media_matches(query,environment)}
 
 /// HTML source-size lengths resolve against the node document viewport and
 /// initial media-query font units, independently of authored element styles.
-pub fn image_source_size(raw:&str,environment:MediaEnvironment,auto_width:Option<f32>)->f32 {media_queries::source_size(raw,environment,auto_width)}
+pub fn image_source_size(raw:&str,environment:MediaEnvironment,auto_width:Option<f32>)->f32 {
+    MEDIA_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    media_queries::source_size(raw,environment,auto_width)
+}
 
 pub fn compute(
     kind: &NodeKind,
@@ -23744,6 +23821,14 @@ impl BoxParentContext {
     }
 }
 
+struct PseudoStyleEntry {
+    origin: NodeId,
+    pseudo: PseudoElement,
+    origin_token: u32,
+    box_parent: BoxParentContext,
+    generated: Option<GeneratedStyle>,
+}
+
 struct SharedStyle {
     node: NodeId,
     dom_parent: NodeId,
@@ -23751,6 +23836,7 @@ struct SharedStyle {
     box_parent: BoxParentContext,
     auto_direction: Option<crate::directionality::Direction>,
     style: Arc<Style>,
+    viewport_dependent: bool,
 }
 
 /// Shared computed style objects. The owner invalidates the cache when cascade
@@ -23763,6 +23849,9 @@ pub(crate) struct StyleCache {
     selected:Option<Box<SelectedStyleCache>>,
     /// Per node index: (parent style token, computed style).
     nodes: Vec<Option<(NodeId, u32, BoxParentContext, Arc<Style>)>>,
+    /// Per origin node index: generated pseudo-element results, keyed by the
+    /// pseudo-element, the origin style token and the box parent context.
+    pseudos: Vec<Vec<PseudoStyleEntry>>,
     /// Distinct parent styles seen; token `n + 1` is `parents[n]`, 0 is no parent.
     parents: Vec<Arc<Style>>,
     last_parent: usize,
@@ -23777,6 +23866,14 @@ pub(crate) struct StyleCache {
     shared_hits: usize,
     intern_hits: usize,
     interned: Vec<Arc<Style>>,
+    /// Nodes whose retained style or generated pseudo-element styles read the
+    /// viewport size or a media query while being computed.
+    viewport_nodes: Vec<NodeId>,
+    viewport_pseudos: Vec<NodeId>,
+    /// Global viewport read count when this cache first computed, and the
+    /// reads made by its own computations since.
+    viewport_reads_start: Option<u64>,
+    attributed_viewport_reads: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -23820,6 +23917,21 @@ impl StyleCache {
     fn forget_node_entry(&mut self,node:NodeId) {
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].entry=None;}}
         else if let Some(slot)=self.nodes.get_mut(node.index()){*slot=None;}
+        if let Some(pseudos)=self.pseudos.get_mut(node.index()){pseudos.clear();}
+    }
+    fn pseudo_entry(&self,origin:NodeId,pseudo:PseudoElement,token:u32,box_parent:BoxParentContext)->Option<Option<GeneratedStyle>> {
+        if self.selected.is_some(){return None;}
+        self.pseudos.get(origin.index())?.iter().find(|entry|entry.origin==origin && entry.pseudo==pseudo
+            && entry.box_parent==box_parent && self.same_parent(entry.origin_token,token))
+            .map(|entry|entry.generated.clone())
+    }
+    fn store_pseudo(&mut self,document:&Document,origin:NodeId,pseudo:PseudoElement,token:u32,box_parent:BoxParentContext,generated:&Option<GeneratedStyle>) {
+        if self.selected.is_some(){return;}
+        let slot=origin.index();
+        if self.pseudos.len()<=slot {self.pseudos.resize_with(document.node_count().max(slot+1),Vec::new);}
+        let entries=&mut self.pseudos[slot];
+        entries.retain(|entry|entry.origin==origin && entry.pseudo!=pseudo);
+        entries.push(PseudoStyleEntry{origin,pseudo,origin_token:token,box_parent,generated:generated.clone()});
     }
     fn bloom(&self,node:NodeId)->Option<u64> {
         if let Some(selected)=&self.selected {let index=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()).ok()?;Some(selected.entries[index].bloom)}
@@ -23869,6 +23981,40 @@ impl StyleCache {
         let mut selected=self.selected.take();
         if let Some(selected)=selected.as_mut(){for entry in &mut selected.entries{entry.entry=None;entry.bloom=0;}}
         *self = Self::default();self.selected=selected;
+    }
+    fn begin_viewport_window(&mut self) -> (u64, u64) {
+        let reads = viewport_reads();
+        self.viewport_reads_start.get_or_insert(reads);
+        (reads, media_reads())
+    }
+    fn end_viewport_window(&mut self, start: (u64, u64)) -> bool {
+        let reads = viewport_reads().wrapping_sub(start.0);
+        self.attributed_viewport_reads = self.attributed_viewport_reads.wrapping_add(reads);
+        reads != 0 || media_reads() != start.1
+    }
+    fn note_viewport_dependent(&mut self, node: NodeId, pseudo: bool) {
+        if self.selected.is_some() { return; }
+        let nodes = if pseudo { &mut self.viewport_pseudos } else { &mut self.viewport_nodes };
+        nodes.push(node);
+        if nodes.len() > 2 * self.nodes.len() + 64 {
+            nodes.sort_unstable_by_key(|node| node.key());
+            nodes.dedup();
+        }
+    }
+    /// Retain styles across a viewport size change whose media results are
+    /// unchanged: drop only the results that read the viewport or a media
+    /// query. Returns false, leaving the cache untouched, when a viewport read
+    /// happened outside this cache's node computations, since a retained
+    /// style may then carry a length resolved against the old size.
+    pub(crate) fn invalidate_viewport_dependent(&mut self) -> bool {
+        if self.selected.is_some() { return false; }
+        if self.viewport_reads_start.is_some_and(|start|
+            viewport_reads().wrapping_sub(start) != self.attributed_viewport_reads) { return false; }
+        for node in core::mem::take(&mut self.viewport_nodes) { self.invalidate_node(node); }
+        for node in core::mem::take(&mut self.viewport_pseudos) {
+            if let Some(pseudos) = self.pseudos.get_mut(node.index()) { pseudos.clear(); }
+        }
+        true
     }
     /// Drop one node's own cascade result. Descendants are keyed by their
     /// parent's style value, so a changed parent style misses them naturally.
@@ -23943,6 +24089,14 @@ impl StyleCache {
         };
         self.last_parent = position;
         Some(position as u32 + 1)
+    }
+
+    /// Token lookup only scans recent parents, so an equal parent style seen
+    /// earlier can come back under a second token.
+    fn same_parent(&self, cached: u32, token: u32) -> bool {
+        cached == token || (cached != 0 && token != 0
+            && self.parents.get(cached as usize - 1).zip(self.parents.get(token as usize - 1))
+                .is_some_and(|(cached, parent)| Arc::ptr_eq(cached, parent) || cached == parent))
     }
 
     fn ancestor_bloom(&mut self, document: &Document, node: NodeId) -> u64 {
@@ -24308,7 +24462,8 @@ fn compute_node_cached_impl(
         );
     };
     if let Some((cached_node, cached_token, cached_box_parent, style)) = cache.node_entry(node) {
-        if *cached_node == node && *cached_token == token && *cached_box_parent==box_parent && !style.sibling_position_dependent {
+        if *cached_node == node && *cached_box_parent==box_parent && !style.sibling_position_dependent
+            && cache.same_parent(*cached_token, token) {
             let style=(**style).clone();
             cache.hits += 1;
             return Ok(style);
@@ -24334,16 +24489,17 @@ fn compute_node_cached_impl(
     if let Some(dom_parent) = dom_parent {
         let shared = cache.shared.iter().find(|entry| {
             entry.dom_parent == dom_parent
-                && entry.parent_token == token
                 && entry.box_parent==box_parent
                 && entry.auto_direction==auto_direction
                 && !entry.style.sibling_position_dependent
                 && document
                     .kind(entry.node)
                     .is_ok_and(|other| same_element(kind, other))
+                && cache.same_parent(entry.parent_token, token)
         });
         if let Some(entry) = shared {
-            let style = entry.style.clone();
+            let (style, viewport_dependent) = (entry.style.clone(), entry.viewport_dependent);
+            if viewport_dependent { cache.note_viewport_dependent(node, false); }
             cache.shared_hits += 1;
             cache.store(document, node, token, box_parent, &style);
             return Ok((*style).clone());
@@ -24354,6 +24510,7 @@ fn compute_node_cached_impl(
     } else {
         u64::MAX
     };
+    let window = cache.begin_viewport_window();
     let computed = compute_for_named(
         kind,
         parent,
@@ -24364,7 +24521,9 @@ fn compute_node_cached_impl(
         None,
         None,
         Some(box_parent),
-    )?;
+    );
+    let viewport_dependent = cache.end_viewport_window(window);
+    let computed = computed?;
     cache.computed += 1;
     // Value interning is safe even for contextual selectors: the full cascade
     // has already run for this node before equality is checked.
@@ -24386,6 +24545,7 @@ fn compute_node_cached_impl(
     };
     if !style.sibling_position_dependent {
         cache.store(document, node, token, box_parent, &style);
+        if viewport_dependent { cache.note_viewport_dependent(node, false); }
     }
     if let Some(dom_parent) = dom_parent.filter(|_| !style.sibling_position_dependent) {
         let entry = SharedStyle {
@@ -24395,6 +24555,7 @@ fn compute_node_cached_impl(
             box_parent,
             auto_direction,
             style: style.clone(),
+            viewport_dependent,
         };
         if cache.shared.len() < SHARED_RECENT {
             cache.shared.push(entry);
@@ -25251,11 +25412,7 @@ fn compute_for_named_registered_mode(
                 && rule.selector.highlight_name.as_deref() == Some("*") && highlight_name.is_some())) {
             return;
         }
-        if !rule
-            .media
-            .iter()
-            .all(|query| media_matches(query, index.environment))
-        {
+        if !index.rule_media_matches(order) {
             return;
         }
         let proximity = match context {

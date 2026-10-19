@@ -25711,12 +25711,21 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     }
 
     fn shape_compatible_inline_tokens_until(&self,paragraph:&InlineParagraph,tokens:&mut [InlineToken],trailing:Option<usize>) -> Result<(),LayoutError> {
-        let language=|token:&InlineToken| token.style_node.and_then(|node|self.document.content_language(node).ok().flatten());
+        // Adjacent tokens usually share a style node; each lookup walks ancestors.
+        let last_language=core::cell::Cell::new(None::<(NodeId,Option<&str>)>);
+        let language=|token:&InlineToken| token.style_node.and_then(|node| {
+            if let Some((cached,value))=last_language.get() {
+                if cached==node {return value;}
+            }
+            let value=self.document.content_language(node).ok().flatten();
+            last_language.set(Some((node,value)));
+            value
+        });
         let joining=|left:&InlineToken,right:&InlineToken| {
             let (Some(a),Some(b),Some(ar),Some(br))=(&left.style,&right.style,&left.source_range,&right.source_range) else {return false;};
             if left.rtl!=right.rtl || if left.rtl {br.end!=ar.start} else {ar.end!=br.start} {return false;}
             if [ar,br].iter().any(|range|paragraph.text[(*range).clone()].chars().any(|ch|
-                matches!(lumen_common::bidi::bidi_class(ch),lumen_common::bidi::BidiClass::LRI|lumen_common::bidi::BidiClass::RLI|lumen_common::bidi::BidiClass::FSI|lumen_common::bidi::BidiClass::PDI))) {return false;}
+                lumen_common::bidi::is_isolate_control(ch))) {return false;}
             if a.writing_mode!=b.writing_mode {return false;}
             let boundary=if left.rtl {ar.start}else{ar.end};
             let at=paragraph.bidi_anchors.partition_point(|anchor|anchor.offset<boundary);
