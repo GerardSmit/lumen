@@ -159,6 +159,7 @@ pub use rejection_delivery::{
 pub mod scheduling;
 mod shadow;
 mod templates;
+mod visual_viewport;
 mod window_globals;
 mod window_messaging;
 use editing_history::EditingState;
@@ -14275,6 +14276,8 @@ fn install_document_with_context_metadata(
         object_loading::register_document(ctx,&realm);
     Ok(realm)
 }
+
+pub use visual_viewport::set_visual_viewport;
 
 /// Notify media-query listeners after the embedder updates layout/environment.
 pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {

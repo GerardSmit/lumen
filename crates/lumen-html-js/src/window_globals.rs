@@ -377,6 +377,13 @@ crate::event_content_handlers::bind_window_handlers! {
             .and_then(|handle|ctx.native_private_value_slot(&handle.global(),NAVIGATOR_OWNER)).unwrap_or(Value::Undefined))
     }
 
+    #[getter(name = "visualViewport", hint(js(global)))]
+    fn visual_viewport(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        let realm=window_attribute_realm(ctx,this.0)?;
+        Ok(realm.and_then(|realm|realm.relevant_host_realm(ctx))
+            .map_or(Value::Undefined,|handle|crate::visual_viewport::value(ctx,&handle.global())))
+    }
+
     #[setter(name = "clientInformation")]
     fn set_client_information(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
         replace_window_attribute(ctx, this.0, "clientInformation", value)

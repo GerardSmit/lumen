@@ -3920,6 +3920,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     let match_media = ctx.bound_function(&lumen_bind::FnItem::of::<match_media::Op>());
     ctx.set_member(&global, "matchMedia", match_media)
         .map_err(|_| OpError::new("Error", "matchMedia installation failed"))?;
+    crate::visual_viewport::install(ctx, realm)?;
     Ok(())
 }
 
