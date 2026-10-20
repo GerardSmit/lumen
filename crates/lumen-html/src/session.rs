@@ -728,6 +728,16 @@ pub struct TransitionInputEpoch {
     environment:css::MediaEnvironment,
 }
 
+impl TransitionInputEpoch {
+    /// Whether only the document differs, so that a snapshot of `other` stays
+    /// valid for every element the document change does not reach.
+    fn differs_only_in_document(&self, other: &Self) -> bool {
+        self.rules_generation == other.rules_generation && self.font_generation == other.font_generation
+            && self.validity_generation == other.validity_generation
+            && self.interaction_generation == other.interaction_generation && self.environment == other.environment
+    }
+}
+
 pub struct TransitionStyleInput {
     pub node:NodeId,
     pub parent:Option<NodeId>,
@@ -744,6 +754,14 @@ impl TransitionStyleInput {
 
 // One operation-local target closure; the ordered nodes preserve parent-before-child
 // computation while the bits select only actual requested pseudo snapshots.
+struct SnapshotBase<'a> {
+    previous:&'a TransitionSnapshot,
+    // Principal input and trailing pseudo inputs of each element of `previous`.
+    ranges:alloc::collections::BTreeMap<u128,(usize,usize)>,
+    dirty:alloc::collections::BTreeSet<u128>,
+    subtrees:alloc::collections::BTreeSet<u128>,
+}
+
 struct EffectStyleSelection {
     nodes:Vec<NodeId>,
     selected:alloc::collections::BTreeMap<u128,u16>,
@@ -854,6 +872,11 @@ pub struct RenderSession {
     read_dirty: ReadDirty,
     /// Journal entries up to this version are accounted for in `read_dirty`.
     read_noted_version: u64,
+    snapshot_basis: Option<SnapshotBasis>,
+    /// Nodes mutations since `snapshot_basis` can have restyled.
+    snapshot_dirty: ReadDirty,
+    /// Journal entries up to this version are accounted for in `snapshot_dirty`.
+    snapshot_noted_version: u64,
     /// The retained frame needs a layout although its document is unchanged.
     layout_stale: bool,
     verify_incremental: bool,
@@ -890,6 +913,9 @@ pub struct InvalidationStats {
     /// Boxes laid out (retained fragments replayed are not counted).
     pub boxes_laid_out: u64,
     pub fragments_replayed: u64,
+    /// Intrinsic sizes computed, and served from the retained sizes.
+    pub intrinsics_measured: u64,
+    pub intrinsics_reused: u64,
     /// Times every retained fragment was dropped.
     pub fragment_clears: u64,
     /// Full restyles by cause: generated counter/quote/list context, a
@@ -907,13 +933,81 @@ pub struct InvalidationStats {
     pub bails: [u64; 6],
     /// Frames whose incremental result differed from a full recompute (verify mode).
     pub verify_mismatches: u64,
+    /// Transition snapshots that walked and styled the whole document.
+    pub transition_snapshots_full: u64,
+    /// Transition snapshots built on the previous one.
+    pub transition_snapshots_incremental: u64,
+    /// Element styles transition snapshots computed through the cascade.
+    pub transition_styles_computed: u64,
+    /// Element styles transition snapshots carried over from the previous snapshot.
+    pub transition_styles_reused: u64,
 }
 
+/// Nodes a stretch of journaled mutations can have restyled, for a cache of
+/// styles computed at an earlier document version.
 #[derive(Default)]
 struct ReadDirty {
     all: bool,
     nodes: Vec<NodeId>,
     subtrees: Vec<NodeId>,
+    tree_changed: bool,
+}
+
+impl ReadDirty {
+    /// Adds the journal entries after version `since`. Anything the journal
+    /// cannot bound (entries missing, rules that are not bounded by tree
+    /// position, more than `limit` nodes) marks everything dirty. With
+    /// `attribute_subtrees` a changed attribute dirties its whole subtree;
+    /// otherwise only the nodes the rules can reach, because a cache that
+    /// compares parent styles recomputes inheriting descendants itself.
+    fn note_journal(&mut self, document: &Document, rules: Option<&css::StyleIndex>, since: u64, limit: usize, attribute_subtrees: bool) {
+        if self.all {
+            return;
+        }
+        let mutations = document.mutations();
+        let first = mutations.partition_point(|mutation| mutation.version <= since);
+        let pending = &mutations[first..];
+        self.tree_changed |= pending.iter().any(|mutation| matches!(mutation.kind, MutationKind::Tree { .. }));
+        let roots = if !document.mutations_cover(since) || pending.iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)) {
+            None
+        } else {
+            rules.and_then(|rules| rules.mutation_restyle_targets(document, pending))
+        };
+        match roots {
+            Some(roots) if self.nodes.len() + self.subtrees.len() + roots.len() + pending.len() <= limit => {
+                if attribute_subtrees {
+                    self.subtrees.extend(roots);
+                } else {
+                    self.nodes.extend(roots);
+                }
+                for mutation in pending {
+                    match &mutation.kind {
+                        MutationKind::Attribute(name) => {
+                            if attribute_subtrees {
+                                self.subtrees.push(mutation.target);
+                            } else {
+                                self.nodes.push(mutation.target);
+                            }
+                            if let Some(host) = slot_assignment_host(document, mutation.target, name.as_str()) {
+                                self.subtrees.push(host);
+                            }
+                        }
+                        _ => self.nodes.push(mutation.target),
+                    }
+                }
+            }
+            _ => self.all = true,
+        }
+    }
+}
+
+/// The document version, text shaper and effect state of the last whole
+/// document transition snapshot, which the next one can build on.
+#[derive(Clone, Copy, PartialEq)]
+struct SnapshotBasis {
+    version: u64,
+    text_generation: Option<u64>,
+    had_effects: bool,
 }
 
 const READ_DIRTY_LIMIT: usize = 4096;
@@ -1157,6 +1251,9 @@ impl RenderSession {
             read_style_stamp: (0, 0),
             read_dirty: ReadDirty::default(),
             read_noted_version: 0,
+            snapshot_basis: None,
+            snapshot_dirty: ReadDirty::default(),
+            snapshot_noted_version: 0,
             layout_stale: false,
             verify_incremental: false,
             damage_pending: None,
@@ -2777,33 +2874,22 @@ impl RenderSession {
         if version == self.read_noted_version {
             return;
         }
-        let mutations = self.document.mutations();
-        let first = mutations.partition_point(|mutation| mutation.version <= self.read_noted_version);
-        let pending = &mutations[first..];
-        let roots = if !self.document.mutations_cover(self.read_noted_version) || pending.iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)) {
-            None
-        } else {
-            self.rules.as_ref().and_then(|rules| rules.mutation_restyle_targets(&self.document, pending))
-        };
-        let dirty = &mut self.read_dirty;
-        match roots {
-            Some(roots) if dirty.nodes.len() + dirty.subtrees.len() + roots.len() + pending.len() <= READ_DIRTY_LIMIT => {
-                dirty.subtrees.extend(roots);
-                for mutation in pending {
-                    match &mutation.kind {
-                        MutationKind::Attribute(name) => {
-                            dirty.subtrees.push(mutation.target);
-                            if let Some(host) = slot_assignment_host(&self.document, mutation.target, name.as_str()) {
-                                dirty.subtrees.push(host);
-                            }
-                        }
-                        _ => dirty.nodes.push(mutation.target),
-                    }
-                }
-            }
-            _ => dirty.all = true,
-        }
+        self.read_dirty.note_journal(&self.document, self.rules.as_ref(), self.read_noted_version, READ_DIRTY_LIMIT, true);
         self.read_noted_version = version;
+    }
+
+    /// Like `note_read_dirty`, for the next transition snapshot.
+    fn note_snapshot_dirty(&mut self) {
+        if self.snapshot_basis.is_none() || self.snapshot_dirty.all {
+            return;
+        }
+        let version = self.document.version();
+        if version == self.snapshot_noted_version {
+            return;
+        }
+        let limit = (self.document.node_count() / 2).max(READ_DIRTY_LIMIT);
+        self.snapshot_dirty.note_journal(&self.document, self.rules.as_ref(), self.snapshot_noted_version, limit, false);
+        self.snapshot_noted_version = version;
     }
 
     pub fn computed_style(&mut self, node: NodeId) -> Result<Style, LayoutError> {
@@ -3021,17 +3107,67 @@ impl RenderSession {
     }
 
     pub fn transition_snapshot_with_text(&mut self,text:Option<&dyn TextShaper>)->Result<Arc<TransitionSnapshot>,LayoutError> {
+        self.transition_snapshot_after(text,None)
+    }
+
+    /// The whole-document snapshot. Given the snapshot this session returned
+    /// last, only the elements mutations since then can have restyled, and the
+    /// elements below one whose style changed, are styled again; every other
+    /// element keeps its earlier style and eligibility.
+    pub fn transition_snapshot_after(&mut self,text:Option<&dyn TextShaper>,previous:Option<&Arc<TransitionSnapshot>>)->Result<Arc<TransitionSnapshot>,LayoutError> {
         let epoch=self.transition_input_epoch()?;
         let key=(epoch,text.map(TextShaper::generation),self.paint_revision);
         if self.rejected_transition_snapshot.as_deref()==Some(&key) {
             return Err(LayoutError::CommandLimit);
         }
+        let basis=SnapshotBasis{version:epoch.document_version,text_generation:text.map(TextShaper::generation),
+            had_effects:self.rules.as_ref().is_some_and(css::StyleIndex::has_effect_declarations)};
+        let base=previous.and_then(|previous|self.snapshot_extension(previous,&epoch,basis));
+        let incremental=base.is_some();
         // Allocation/parse/text failures remain retryable; admission checks
         // alone set this flag, so an unchanged oversized tree is walked once.
         let mut quota_exceeded=false;
-        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None);
+        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None,base.as_ref());
         self.rejected_transition_snapshot=if quota_exceeded {Some(Box::new(key))} else {None};
+        if result.is_ok() {
+            self.snapshot_basis=Some(basis);
+            self.snapshot_dirty=ReadDirty::default();
+            self.snapshot_noted_version=basis.version;
+            if incremental {self.invalidation_stats.transition_snapshots_incremental+=1;}
+            else {self.invalidation_stats.transition_snapshots_full+=1;}
+        }
         result
+    }
+
+    /// What `previous` still gives the next snapshot, or `None` when it must
+    /// be rebuilt: it is not the snapshot the dirty nodes are counted from,
+    /// another cascade input changed, effect samples shape either snapshot, or
+    /// the journal cannot bound the change.
+    fn snapshot_extension<'a>(&mut self,previous:&'a Arc<TransitionSnapshot>,epoch:&TransitionInputEpoch,basis:SnapshotBasis)->Option<SnapshotBase<'a>> {
+        let held=self.snapshot_basis?;
+        if held.version!=previous.epoch.document_version || held.text_generation!=basis.text_generation
+            || held.had_effects || basis.had_effects || !previous.epoch.differs_only_in_document(epoch) {return None;}
+        let tree_changed=self.snapshot_dirty.tree_changed
+            || self.document.mutations().iter()
+                .any(|mutation|mutation.version>self.snapshot_noted_version && matches!(mutation.kind,MutationKind::Tree{..}));
+        // An inserted or removed node moves its later siblings; the dirty sets
+        // follow the selectors that notice, not `sibling-index()` in a value.
+        if tree_changed && previous.nodes.iter().any(|input|input.style.sibling_position_dependent) {return None;}
+        self.note_snapshot_dirty();
+        if self.snapshot_dirty.all {return None;}
+        let mut ranges=alloc::collections::BTreeMap::new();
+        let nodes=&previous.nodes;
+        let mut start=0;
+        while start<nodes.len() {
+            let node=nodes[start].node;
+            let mut end=start+1;
+            while end<nodes.len() && nodes[end].pseudo.is_some() && nodes[end].node==node {end+=1;}
+            if nodes[start].pseudo.is_none() {ranges.insert(node.key(),(start,end));}
+            start=end;
+        }
+        Some(SnapshotBase{previous,ranges,
+            dirty:self.snapshot_dirty.nodes.iter().map(|node|node.key()).collect(),
+            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
     }
 
     /// Capture current effect-underlying author provenance only for the supplied
@@ -3069,11 +3205,12 @@ impl RenderSession {
             if let Some(pseudo)=pseudo{*selection.selected.get_mut(&node.key()).ok_or(LayoutError::InvalidTree)?|=1u16<<(pseudo as u8);}
         }
         let mut quota_exceeded=false;
-        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection),None)
+        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection),None,None)
     }
 
     fn capture_transition_snapshot_with_text(&mut self,text:Option<&dyn TextShaper>,epoch:TransitionInputEpoch,
-        quota_exceeded:&mut bool,selection:Option<&EffectStyleSelection>,completed_geometry:Option<&layout::LayoutGeometry>)->Result<Arc<TransitionSnapshot>,LayoutError> {
+        quota_exceeded:&mut bool,selection:Option<&EffectStyleSelection>,completed_geometry:Option<&layout::LayoutGeometry>,
+        base:Option<&SnapshotBase>)->Result<Arc<TransitionSnapshot>,LayoutError> {
 
         let rules=self.rules.as_ref().expect("stylesheets initialized");
         let geometry=completed_geometry.or_else(||self.cached.as_ref().map(|frame| &frame.geometry));
@@ -3087,8 +3224,63 @@ impl RenderSession {
         let mut recent_styles:Vec<Arc<Style>>=Vec::new();
         let mut eligibility=alloc::collections::BTreeMap::new();
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
+        let mut forced_nodes=alloc::collections::BTreeSet::<u128>::new();
+        let (mut computed_styles,mut reused_styles)=(0u64,0u64);
+        // Counter, quote and list marker output depends on preceding siblings,
+        // so generated-content styles are never carried over after a change.
+        let generated_context_changed=base.is_some()
+            && (rules.has_counter_data() || rules.has_quote_content() || rules.has_list_item_data()
+                || layout::contains_list_item_candidate(&self.document,self.document.root())?);
         while let Some(node)=cursor {
-            if matches!(self.document.kind(node),Ok(NodeKind::Element{..})) {
+            let mut carried=false;
+            if let Some(base)=base.filter(|_|matches!(self.document.kind(node),Ok(NodeKind::Element{..}))) {
+                let mut inherited_parent=self.document.composed_parent(node).map_err(|_|LayoutError::InvalidTree)?;
+                while let Some(id)=inherited_parent {
+                    if matches!(self.document.kind(id),Ok(NodeKind::Element{..})) {break;}
+                    inherited_parent=self.document.composed_parent(id).map_err(|_|LayoutError::InvalidTree)?;
+                }
+                if base.subtrees.contains(&node.key()) || inherited_parent.is_some_and(|parent|forced_nodes.contains(&parent.key())) {
+                    forced_nodes.insert(node.key());
+                }
+                let range=base.ranges.get(&node.key()).copied()
+                    .filter(|&(start,end)|!forced_nodes.contains(&node.key()) && !base.dirty.contains(&node.key())
+                        && !(generated_context_changed && end-start>1));
+                if let Some((start,end))=range {
+                    let earlier=&base.previous.nodes[start..end];
+                    let parent=match inherited_parent {
+                        None=>Some(None),
+                        Some(id)=>cache.node_style(id).zip(base.ranges.get(&id.key())).filter(|(current,&(first,_))|{
+                            let old=&base.previous.nodes[first].style;
+                            Arc::ptr_eq(current,old) || **current==**old
+                        }).map(|(current,_)|Some(current)),
+                    };
+                    let unchanged=earlier[0].parent==inherited_parent && !earlier.iter().any(|input|
+                        input.style.has_query_container_dependencies() || input.style.has_inherited_query_container_dependencies());
+                    if let (true,Some(parent))=(unchanged,parent) {
+                        let own_display=earlier[0].style.display;
+                        let parent_rendered=parent.as_ref().is_none_or(|parent:&Arc<Style>|parent.display != css::Display::None);
+                        let ancestor_rendered=self.document.composed_parent(node).ok().flatten()
+                            .and_then(|id|rendered_nodes.get(&id.key()).copied()).unwrap_or(parent_rendered);
+                        let node_rendered=ancestor_rendered && own_display != css::Display::None;
+                        rendered_nodes.insert(node.key(),node_rendered);
+                        let rendered=self.document.is_connected_element(node) && node_rendered;
+                        rules.seed_transition_snapshot(&self.document,node,parent.as_deref(),text,&mut cache,&earlier[0].style).map_err(LayoutError::Css)?;
+                        for input in earlier {
+                            let pseudo_rendered=match input.pseudo {
+                                None=>rendered,
+                                Some(pseudo)=>rendered && (input.style.display != css::Display::None || pseudo.is_marker()),
+                            };
+                            Self::push_transition_style(&mut nodes,&mut payload_bytes,&mut charged_styles,&mut recent_styles,TransitionStyleInput {
+                                node,parent:input.pseudo.map_or(inherited_parent,|_|Some(node)),pseudo:input.pseudo,style:input.style.clone(),
+                                rendered:Cell::new(pseudo_rendered),eligibility:input.eligibility.clone()},quota_exceeded)?;
+                        }
+                        reused_styles+=1;
+                        carried=true;
+                    }
+                }
+            }
+            if !carried && matches!(self.document.kind(node),Ok(NodeKind::Element{..})) {
+                computed_styles+=1;
                 let mut ancestors=Vec::new();
                 let mut current=Some(node);
                 let mut parent=None;
@@ -3162,6 +3354,8 @@ impl RenderSession {
             cursor=if let Some(selection)=selection{selected_index+=1;selection.nodes.get(selected_index).copied()}
                 else{crate::selector::next_shadow_including_descendant(&self.document,root,node).map_err(|_|LayoutError::InvalidTree)?};
         }
+        self.invalidation_stats.transition_styles_computed+=computed_styles;
+        self.invalidation_stats.transition_styles_reused+=reused_styles;
         Ok(Arc::new(TransitionSnapshot {epoch,nodes}))
     }
 
@@ -4266,7 +4460,7 @@ impl RenderSession {
             let changed=self.timeline_transform_values.is_some();self.timeline_transform_values=None;return Ok(changed);
         };
         let epoch=self.transition_input_epoch()?;let mut quota=false;
-        let source=self.capture_transition_snapshot_with_text(Some(text),epoch,&mut quota,None,Some(geometry))?;
+        let source=self.capture_transition_snapshot_with_text(Some(text),epoch,&mut quota,None,Some(geometry),None)?;
         let snapshot=self.animation_snapshot_from_transition(&source)?;
         let mut values=timelines::TransformTimelineValues::default();let mut changed=false;
         for input in sources.values.values() {
@@ -4627,6 +4821,7 @@ impl RenderSession {
             cached.document_version = version;
         }
         self.note_read_dirty();
+        self.note_snapshot_dirty();
         self.style_version = version;
         self.reclaim_stale_stylesheet_sources();
         self.document.clear_mutations();
@@ -4725,7 +4920,13 @@ impl RenderSession {
             .chain(subtrees.iter())
             .chain(structural.iter().map(|entry| &entry.0))
             .any(|&node| in_svg(&self.document, node));
-        if svg_touched && self.svg_use_present() {
+        let resource_touched = svg_touched
+            && targets
+                .iter()
+                .chain(subtrees.iter())
+                .chain(structural.iter().map(|entry| &entry.0))
+                .any(|&node| in_svg_resource(&self.document, node));
+        if svg_touched && (resource_touched || self.svg_use_present()) {
             self.invalidation_stats.bails[5] += 1;
             // `<use>` instances can show stale fragments of the changed subtree anywhere, and any
             // taken rule subjects were not applied: `relayout` must restyle everything and drop
@@ -4838,6 +5039,7 @@ impl RenderSession {
         }
         if mutations_pending {
             self.note_read_dirty();
+            self.note_snapshot_dirty();
             self.style_version = version;
             self.reclaim_stale_stylesheet_sources();
             self.document.clear_mutations();
@@ -5272,6 +5474,9 @@ impl RenderSession {
             stats.styles_computed += styles.computed_styles as u64;
             stats.boxes_laid_out += self.layout_cache.boxes_laid_out() as u64;
             stats.fragments_replayed += self.layout_cache.stats().hits as u64;
+            let (measured, reused) = self.layout_cache.intrinsics_measured();
+            stats.intrinsics_measured += measured as u64;
+            stats.intrinsics_reused += reused as u64;
         }
         let mut requests = Vec::new();
         apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
@@ -5307,6 +5512,7 @@ impl RenderSession {
         // style edit from an unobserved replacement of a loaded sheet.
         self.reclaim_stale_stylesheet_sources();
         self.note_read_dirty();
+        self.note_snapshot_dirty();
         self.document.clear_mutations();
         if self.verify_incremental {
             self.verify_against_full_layout(width, height, text, images, canvas_background, origin_attempted);
@@ -5385,6 +5591,24 @@ fn in_svg(document: &Document, node: NodeId) -> bool {
         let Some(id) = current else { return false };
         if matches!(document.kind(id), Ok(NodeKind::Element { namespace: crate::Namespace::Svg, .. })) {
             return true;
+        }
+        current = document.composed_parent(id).ok().flatten();
+    }
+    true
+}
+
+/// Whether `node` is, or sits inside, an SVG resource definition (a filter, paint server, clip,
+/// mask, marker or `defs`). Elements reference these through `url()` without being their
+/// ancestors, so a change inside one is not local to its own fragments. `<symbol>` is only
+/// reached through `<use>`, which `svg_use_present` already covers.
+fn in_svg_resource(document: &Document, node: NodeId) -> bool {
+    let mut current = Some(node);
+    for _ in 0..512 {
+        let Some(id) = current else { return false };
+        if let Ok(NodeKind::Element { namespace: crate::Namespace::Svg, name, .. }) = document.kind(id) {
+            if crate::svg::is_resource_element(crate::svg::local_name(name)) {
+                return true;
+            }
         }
         current = document.composed_parent(id).ok().flatten();
     }

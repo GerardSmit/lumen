@@ -28,6 +28,15 @@ pub fn attribute<'a>(attributes: &'a [(Name, String)], local: &str) -> Option<&'
     })
 }
 
+/// Elements other elements reference through `url()` or `href` instead of
+/// containing: paint servers, clips, masks, markers, filters and `defs`.
+pub fn is_resource_element(local: &str) -> bool {
+    matches!(
+        local,
+        "clipPath" | "defs" | "filter" | "linearGradient" | "marker" | "mask" | "pattern" | "radialGradient"
+    )
+}
+
 pub fn local_name(name: &Name) -> &str {
     crate::xml::split_qname(name.as_str())
         .map(|(_, local)| local)

@@ -69,19 +69,28 @@ impl DomDocument {
 
 fn cookie_url(realm: &DomRealm) -> OpResult<Option<String>> {
     let origin = realm.document_origin().or_else(|| realm.browsing_context().map(|context| context.root_or_child_origin()));
+    let mut url = realm.document_url().unwrap_or_else(|| "about:blank".into());
+    let initial = lumen_common::url::parse(&url, None).ok();
+    let initial_about = initial.as_ref().is_some_and(|parsed| parsed.scheme == "about" && matches!(parsed.path.as_str(), "blank" | "srcdoc"));
+    let network_scheme = initial.as_ref().is_some_and(|parsed| matches!(parsed.scheme.as_str(), "http" | "https"));
+    // Documents that are neither network-scheme nor initial about: are cookie-averse
+    // and never reach the opaque-origin check.
+    if initial.is_some() && !initial_about && !network_scheme {
+        return Ok(None);
+    }
     if matches!(origin, Some(browsing_context::Origin::Opaque(_))) {
         return Err(OpError::new("SecurityError", "document has an opaque cookie origin"));
     }
-    let mut url = realm.document_url().unwrap_or_else(|| "about:blank".into());
-    if lumen_common::url::parse(&url, None).is_ok_and(|parsed| parsed.scheme == "about" && matches!(parsed.path.as_str(), "blank" | "srcdoc")) {
-        if let Some(source) = realm.cookie_source_url.borrow().clone() {
-            let source_origin = browsing_context::Origin::from_url(&source);
-            let trusted_origin = realm.document_origin().or_else(|| realm.browsing_context().map(|context| context.root_or_child_origin()));
-            if trusted_origin.is_some_and(|origin| origin.same_origin(&source_origin)) { url = source; }
+    let source = if initial_about { realm.cookie_source_url.borrow().clone() } else { None };
+    let source = source.filter(|source| origin.as_ref().is_some_and(|origin| origin.same_origin(&browsing_context::Origin::from_url(source))));
+    let parsed = match source {
+        Some(source) => {
+            url = source;
+            lumen_common::url::parse(&url, None).ok()
         }
+        None => initial,
     }
-    let parsed = lumen_common::url::parse(&url, None)
-        .map_err(|_| OpError::new("SecurityError", "document has no cookie origin"))?;
+    .ok_or_else(|| OpError::new("SecurityError", "document has no cookie origin"))?;
     if !matches!(parsed.scheme.as_str(), "http" | "https") {
         return Ok(None);
     }

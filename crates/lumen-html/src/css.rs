@@ -3147,6 +3147,7 @@ fn arcs_equal<T: ?Sized + PartialEq>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> 
 
 impl PartialEq for Style {
     fn eq(&self, other: &Self) -> bool {
+        if core::ptr::eq(self, other) { return true; }
         let Style {
             extras,
             custom,
@@ -4019,7 +4020,7 @@ impl Style {
         }
         index.set_pseudo_effect_declarations(node,pseudo,EffectOrigin::Animation,&admitted)?;
         let kind=document.kind(node).map_err(|_|CssError{offset:0,message:"invalid snapshot target"})?;
-        let mut sampled=compute_for_named_mode(kind,parent,&index,Some((document,node)),u64::MAX,text,
+        let mut sampled=compute_for_named_mode(kind,parent,&index,Some((document,node)),AncestorBloom::ALL,text,
             pseudo,None,Some(eligibility.box_parent),false,false,None,Some((&baseline, eligibility)))?;
         if let Some(query)=eligibility.query_context {let _=sampled.resolve_query_context_with_text(query,text);}
         *self = sampled;
@@ -4543,7 +4544,7 @@ fn current_font_length_context(&self,expression:&RelativeExpression,text:Option<
             inherited.custom = pending.inherited_custom.clone();
             inherited.registered_query = None;
             let replay = compute_for_named_registered_mode(&kind, Some(&inherited), &index, None,
-                u64::MAX, text, pending.pseudo, None, Some(pending.provenance.box_parent), false, false,
+                AncestorBloom::ALL, text, pending.pseudo, None, Some(pending.provenance.box_parent), false, false,
                 None, Some((baseline, &pending.provenance)), Some(&pending.registrations), Some(query), Some(pending.sibling), pending.svg_instance_root, &[]);
             let Ok(mut computed) = replay else { return false; };
             computed.registered_query = None;
@@ -6835,8 +6836,10 @@ pub struct StyleIndex {
     universal: Vec<usize>,
     /// Per rule: bloom bits its ancestor chain requires (tag/id/class of every
     /// compound reached through descendant/child combinators).
-    ancestor_masks: Vec<u64>,
+    ancestor_masks: Vec<AncestorBloom>,
     uses_ancestor_bloom: bool,
+    #[cfg(test)]
+    bloom_rejects: core::cell::Cell<usize>,
     /// No rule depends on anything but the element itself, its ancestors and
     /// its attributes, so siblings with equal elements compute equal styles.
     pub(crate) siblings_share: bool,
@@ -7061,8 +7064,8 @@ fn ascii_ci_cmp(a: &str, b: &str) -> core::cmp::Ordering {
     a.bytes().map(|byte| byte.to_ascii_lowercase()).cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
-fn rule_ancestor_mask(rule: &Rule) -> u64 {
-    if rule.selector.part.is_some() { 0 } else { rule.selector.ancestor_mask() }
+fn rule_ancestor_mask(rule: &Rule) -> AncestorBloom {
+    if rule.selector.part.is_some() { AncestorBloom::EMPTY } else { rule.selector.ancestor_mask() }
 }
 
 fn rule_shares_siblings(rule: &Rule) -> bool {
@@ -7242,8 +7245,8 @@ impl StyleIndex {
         let (mut tags, mut ids, mut classes, mut universal) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         index_rules(&rules, 0, &mut tags, &mut ids, &mut classes, &mut universal);
-        let ancestor_masks: Vec<u64> = rules.iter().map(rule_ancestor_mask).collect();
-        let uses_ancestor_bloom = ancestor_masks.iter().any(|mask| *mask != 0);
+        let ancestor_masks: Vec<AncestorBloom> = rules.iter().map(rule_ancestor_mask).collect();
+        let uses_ancestor_bloom = ancestor_masks.iter().any(|mask| !mask.is_empty());
         let siblings_share = rules.iter().all(rule_shares_siblings);
         let invalidation = invalidation::InvalidationSets::new(&rules);
         let children_state_dependent = rules.iter().any(|rule| {
@@ -7269,6 +7272,8 @@ impl StyleIndex {
             universal,
             ancestor_masks,
             uses_ancestor_bloom,
+            #[cfg(test)]
+            bloom_rejects: core::cell::Cell::new(0),
             siblings_share,
             rules_siblings_share: siblings_share,
             document_base_url,
@@ -7345,7 +7350,7 @@ impl StyleIndex {
             return Err(CssError { offset: 0, message: "invalid view transition pseudo target" });
         }
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid view transition origin" })?;
-        compute_for_named(kind, inherited, self, Some((document, origin)), u64::MAX,
+        compute_for_named(kind, inherited, self, Some((document, origin)), AncestorBloom::ALL,
             Some(text), Some(pseudo), name, None)
     }
 
@@ -7355,7 +7360,7 @@ impl StyleIndex {
         let mut parent = ordinary.clone();
         parent.background = inherited.map_or(Rgba { r: 0, g: 0, b: 0, a: 0 }, |style| style.background);
         if let Some(inherited) = inherited { parent.color = inherited.color; }
-        let computed = compute_for_named(kind, Some(&parent), self, Some((document, origin)), u64::MAX,
+        let computed = compute_for_named(kind, Some(&parent), self, Some((document, origin)), AncestorBloom::ALL,
             Some(text), Some(PseudoElement::Highlight), Some(name), None)?;
         let mut filtered = ordinary.clone();
         for property in PROPERTIES {
@@ -7420,6 +7425,23 @@ impl StyleIndex {
         Ok((style, eligibility))
     }
 
+    /// Whether sampled animation or transition effects are installed; the
+    /// snapshot of every element they reach then depends on their samples.
+    pub(crate) fn has_effect_declarations(&self) -> bool {
+        !self.effect_declarations.is_empty()
+    }
+
+    /// Records a style carried over from an earlier snapshot, so later
+    /// elements of the walk find it as their parent exactly as if it had been
+    /// computed here.
+    pub(crate) fn seed_transition_snapshot(&self, document: &Document, node: NodeId,
+        parent: Option<&Style>, text: Option<&dyn TextShaper>, cache: &mut StyleCache,
+        style: &Arc<Style>) -> Result<(), CssError> {
+        let role = resolve_box_parent(document, node, parent, self, cache, text)?;
+        cache.store_unattributed(document, node, role, style);
+        Ok(())
+    }
+
     pub fn compute_pseudo_computed(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: Option<&dyn TextShaper>,
     ) -> Result<Style, CssError> {
@@ -7427,7 +7449,7 @@ impl StyleIndex {
         let generated_origin = pseudo.marker_origin().map(|parent| self.compute_pseudo_computed(document, origin, origin_style, parent, text)).transpose()?;
         let origin_style = generated_origin.as_ref().unwrap_or(origin_style);
         let role = self.box_children_context(document, origin, origin_style, text, &mut StyleCache::default())?;
-        let computed = compute_for_named(kind, Some(origin_style), self, Some((document, origin)), u64::MAX, text, Some(pseudo), None, Some(role))?;
+        let computed = compute_for_named(kind, Some(origin_style), self, Some((document, origin)), AncestorBloom::ALL, text, Some(pseudo), None, Some(role))?;
         if matches!(pseudo, PseudoElement::FirstLine | PseudoElement::FirstLetter | PseudoElement::Placeholder) {
             let mut filtered = origin_style.clone();
             filtered.copy_typographic_properties(&computed, pseudo, false);
@@ -7539,7 +7561,7 @@ impl StyleIndex {
             Some(origin_style),
             self,
             Some((document, origin)),
-            u64::MAX,
+            AncestorBloom::ALL,
             text,
             Some(pseudo),
             None,
@@ -7868,7 +7890,7 @@ impl StyleIndex {
         self.has_list_item_data |= flags.has_list_item_data;
         self.has_validity_data |= flags.has_validity_data;
         self.ancestor_masks.extend(rules.iter().map(rule_ancestor_mask));
-        self.uses_ancestor_bloom = self.ancestor_masks.iter().any(|mask| *mask != 0);
+        self.uses_ancestor_bloom = self.ancestor_masks.iter().any(|mask| !mask.is_empty());
         let shares = rules.iter().all(rule_shares_siblings);
         self.siblings_share &= shares;
         self.rules_siblings_share &= shares;
@@ -22191,32 +22213,69 @@ fn emit_source_rules(
     Ok(())
 }
 
-fn bloom_bits(kind: u8, name: &str) -> u64 {
-    let hash = lumen_common::fasthash::fnv1a64(
-        lumen_common::fasthash::FNV1A64_OFFSET ^ u64::from(kind),
-        name.as_bytes(),
-    );
-    (1u64 << (hash & 63)) | (1u64 << ((hash >> 20) & 63))
+/// Set of hashed tags, ids and classes. A rule only matches when every
+/// feature its ancestor compounds require is present in the element's
+/// ancestor set; 256 bits keep deep documents from saturating it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AncestorBloom([u64; 4]);
+
+impl AncestorBloom {
+    const EMPTY: Self = Self([0; 4]);
+    const ALL: Self = Self([u64::MAX; 4]);
+    fn is_empty(&self) -> bool { *self == Self::EMPTY }
+    fn contains_all(&self, mask: &Self) -> bool {
+        self.0.iter().zip(&mask.0).all(|(have, need)| have & need == *need)
+    }
 }
 
-/// Bloom bits for the tag, id and classes of an element.
-fn element_bloom(kind: &NodeKind) -> u64 {
+impl core::ops::BitOr for AncestorBloom {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self([self.0[0] | other.0[0], self.0[1] | other.0[1], self.0[2] | other.0[2], self.0[3] | other.0[3]])
+    }
+}
+
+impl core::ops::BitOrAssign for AncestorBloom {
+    fn bitor_assign(&mut self, other: Self) { *self = *self | other; }
+}
+
+/// Bloom bits for a tag (kind 0, hashed ASCII-lowercase because HTML tag
+/// matching ignores case), id (1) or class (2).
+fn bloom_bits(kind: u8, name: &str) -> AncestorBloom {
+    let seed = lumen_common::fasthash::FNV1A64_OFFSET ^ u64::from(kind);
+    let hash = if kind == 0 && name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        lumen_common::fasthash::fnv1a64(seed, name.to_ascii_lowercase().as_bytes())
+    } else {
+        lumen_common::fasthash::fnv1a64(seed, name.as_bytes())
+    };
+    let mut bloom = AncestorBloom::EMPTY;
+    for bit in [hash & 255, (hash >> 20) & 255] {
+        bloom.0[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+    }
+    bloom
+}
+
+/// Bloom bits for the tag, id and classes of an element. Over-approximates
+/// the matcher: the tag counts under its qualified and local name, and the
+/// attribute names are compared without case.
+fn element_bloom(kind: &NodeKind) -> AncestorBloom {
     let NodeKind::Element {
         name, attributes, ..
     } = kind
     else {
-        return 0;
+        return AncestorBloom::EMPTY;
     };
     let mut bits = bloom_bits(0, crate::svg::local_name(name));
+    if name.as_str().contains(':') {
+        bits |= bloom_bits(0, name.as_str());
+    }
     for (key, value) in attributes {
-        match key.as_str() {
-            "id" => bits |= bloom_bits(1, value),
-            "class" => {
-                for class in value.split_ascii_whitespace() {
-                    bits |= bloom_bits(2, class);
-                }
+        if key.as_str().eq_ignore_ascii_case("id") {
+            bits |= bloom_bits(1, value);
+        } else if key.as_str().eq_ignore_ascii_case("class") {
+            for class in value.split_ascii_whitespace() {
+                bits |= bloom_bits(2, class);
             }
-            _ => {}
         }
     }
     bits
@@ -22515,14 +22574,14 @@ impl Selector {
             || self.ancestor.as_ref().is_some_and(|(_, ancestor)| ancestor.depends_on_children())
     }
 
-    fn ancestor_mask(&self) -> u64 {
+    fn ancestor_mask(&self) -> AncestorBloom {
         // `::part()` and `:host`/`::slotted()` matching ignores the ancestor chain.
         // Logical branches are alternatives, so their ancestor masks cannot be
         // unioned here without rejecting a node that matches just one branch.
         if self.part.is_some() || self.host || self.slotted {
-            return 0;
+            return AncestorBloom::EMPTY;
         }
-        let mut mask = 0;
+        let mut mask = AncestorBloom::EMPTY;
         let mut current = self;
         while let Some((Relation::Child | Relation::Descendant, ancestor)) = &current.ancestor {
             if !(ancestor.host || ancestor.slotted || ancestor.part.is_some()) {
@@ -23422,7 +23481,7 @@ pub fn compute(
     parent: Option<&Style>,
     index: &StyleIndex,
 ) -> Result<Style, CssError> {
-    compute_for(kind, parent, index, None, u64::MAX, None, None)
+    compute_for(kind, parent, index, None, AncestorBloom::ALL, None, None)
 }
 
 const MAX_CUSTOM_PROPERTIES: usize = MAX_DECLARATIONS;
@@ -24164,6 +24223,18 @@ fn cascade_custom_properties(
         }
         return Ok(shared);
     }
+    if provenance.is_none() && registrations.is_empty() && blocked.is_empty() && raw_sources.is_none() {
+        let base = baseline.or(parent).map_or(&[][..], |v| v.custom_properties());
+        let redeclares_inherited = candidates.iter().all(|(_, declaration, _)| match &declaration.value {
+            Value::Custom(name, raw) => !needs_expansion(raw)
+                && !matches!(&**raw, "initial" | "inherit" | "unset" | "revert" | "revert-layer")
+                && base.iter().any(|(key, value)| key.as_str() == &**name && value.as_deref() == Some(&**raw)),
+            _ => true,
+        });
+        if redeclares_inherited {
+            return Ok(baseline.or(parent).and_then(|v| v.custom.clone()));
+        }
+    }
     let mut custom_properties = baseline.or(parent)
         .map(|v| v.custom_properties().to_vec())
         .unwrap_or_default();
@@ -24416,6 +24487,41 @@ struct PseudoStyleEntry {
     generated: Option<GeneratedStyle>,
 }
 
+/// Cheap identity of a parent style. Equal styles have equal scalar parts;
+/// the shared allocations are compared by address, so a style that merely
+/// equals another through distinct allocations gets its own token instead
+/// of paying a deep comparison of every field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ParentKey {
+    extras: usize,
+    custom: usize,
+    display: Display,
+    color: Rgba,
+    background: Rgba,
+    font_size: u32,
+    opacity: u32,
+    gap: u32,
+}
+
+impl ParentKey {
+    fn same_shape(&self, other: &Self) -> bool {
+        Self { extras: 0, custom: 0, ..*self } == Self { extras: 0, custom: 0, ..*other }
+    }
+    fn of(style: &Style) -> Self {
+        let bits = |value: f32| (value + 0.0).to_bits();
+        Self {
+            extras: style.extras.as_ref().map_or(0, |extras| Arc::as_ptr(extras) as *const () as usize),
+            custom: style.custom.as_ref().map_or(0, |custom| Arc::as_ptr(custom) as *const () as usize),
+            display: style.display,
+            color: style.color,
+            background: style.background,
+            font_size: bits(style.font_size),
+            opacity: bits(style.opacity),
+            gap: bits(style.gap),
+        }
+    }
+}
+
 struct SharedStyle {
     node: NodeId,
     dom_parent: NodeId,
@@ -24428,7 +24534,7 @@ struct SharedStyle {
 
 /// Shared computed style objects. The owner invalidates the cache when cascade
 /// inputs change; unchanged text updates can retain these objects.
-struct SelectedStyleEntry {node:NodeId,entry:Option<(NodeId,u32,BoxParentContext,Arc<Style>)>,bloom:u64}
+struct SelectedStyleEntry {node:NodeId,entry:Option<(NodeId,u32,BoxParentContext,Arc<Style>)>,bloom:AncestorBloom}
 struct SelectedStyleCache {entries:Vec<SelectedStyleEntry>}
 
 #[derive(Default)]
@@ -24445,11 +24551,13 @@ pub(crate) struct StyleCache {
     pseudos: Vec<Vec<PseudoStyleEntry>>,
     /// Distinct parent styles seen; token `n + 1` is `parents[n]`, 0 is no parent.
     parents: Vec<Arc<Style>>,
+    /// `parents[n]`'s cheap identity; see `ParentKey`.
+    parent_keys: Vec<ParentKey>,
     last_parent: usize,
     shared: Vec<SharedStyle>,
     next_shared: usize,
     /// Per node index: bloom of its ancestors' tags, ids and classes; 0 = unset.
-    blooms: Vec<(u32, u64)>,
+    blooms: Vec<(u32, AncestorBloom)>,
     pending: Vec<NodeId>,
     text_generation: Option<Option<u64>>,
     computed: usize,
@@ -24504,7 +24612,7 @@ impl StyleCache {
         if bytes>16*1024*1024{return None;}
         let mut entries=Vec::new();entries.try_reserve_exact(nodes.len()).ok()?;
         if entries.capacity().checked_mul(core::mem::size_of::<SelectedStyleEntry>())?>16*1024*1024{return None;}
-        for &node in nodes{entries.push(SelectedStyleEntry{node,entry:None,bloom:0});}
+        for &node in nodes{entries.push(SelectedStyleEntry{node,entry:None,bloom:AncestorBloom::EMPTY});}
         entries.sort_unstable_by_key(|entry|entry.node.key());entries.dedup_by_key(|entry|entry.node.key());
         Some(Self{selected:Some(Box::new(SelectedStyleCache{entries})),..Self::default()})
     }
@@ -24540,13 +24648,13 @@ impl StyleCache {
         }
         entries.push(PseudoStyleEntry{origin,pseudo,origin_token:token,box_parent,generated:generated.clone()});
     }
-    fn bloom(&self,node:NodeId)->Option<u64> {
+    fn bloom(&self,node:NodeId)->Option<AncestorBloom> {
         if let Some(selected)=&self.selected {let index=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()).ok()?;Some(selected.entries[index].bloom)}
         else{self.blooms.get(node.index()).filter(|(generation,_)|*generation==node.generation).map(|(_,bloom)|*bloom)}
     }
-    fn store_bloom(&mut self,document:&Document,node:NodeId,bloom:u64) {
+    fn store_bloom(&mut self,document:&Document,node:NodeId,bloom:AncestorBloom) {
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].bloom=bloom;}}
-        else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),(0,0));}self.blooms[node.index()]=(node.generation,bloom);}
+        else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),(0,AncestorBloom::EMPTY));}self.blooms[node.index()]=(node.generation,bloom);}
     }
     /// A hit in `previous_nodes` swaps it with the current entry, so the
     /// entry `node_entry` reports is the one last asked for, as after a
@@ -24614,7 +24722,7 @@ impl StyleCache {
     }
     pub(crate) fn clear(&mut self) {
         let mut selected=self.selected.take();
-        if let Some(selected)=selected.as_mut(){for entry in &mut selected.entries{entry.entry=None;entry.bloom=0;}}
+        if let Some(selected)=selected.as_mut(){for entry in &mut selected.entries{entry.entry=None;entry.bloom=AncestorBloom::EMPTY;}}
         let epoch = self.epoch.wrapping_add(1);
         *self = Self::default();self.selected=selected;self.epoch=epoch;
     }
@@ -24726,13 +24834,16 @@ impl StyleCache {
         if self.selected.is_some() { return; }
         let mut tokens = vec![0u32; self.parents.len() + 1];
         let mut kept = Vec::new();
+        let mut kept_keys = Vec::new();
         let parents = core::mem::take(&mut self.parents);
+        let keys = core::mem::take(&mut self.parent_keys);
         let mut remap = |token: &mut u32| {
             if *token == 0 { return; }
             let Some(parent) = parents.get(*token as usize - 1) else { *token = u32::MAX; return; };
             let slot = &mut tokens[*token as usize];
             if *slot == 0 {
                 kept.push(parent.clone());
+                kept_keys.push(keys[*token as usize - 1]);
                 *slot = kept.len() as u32;
             }
             *token = *slot;
@@ -24742,6 +24853,7 @@ impl StyleCache {
         for entry in &mut self.shared { remap(&mut entry.parent_token); }
         self.compacted_parents = kept.len();
         self.parents = kept;
+        self.parent_keys = kept_keys;
         self.last_parent = 0;
     }
 
@@ -24749,21 +24861,16 @@ impl StyleCache {
         let Some(parent) = parent else {
             return Some(0);
         };
-        if self
-            .parents
-            .get(self.last_parent)
-            .is_some_and(|candidate| candidate.as_ref() == parent)
-        {
+        let key = ParentKey::of(parent);
+        let same = |parents: &[Arc<Style>], keys: &[ParentKey], position: usize|
+            keys[position] == key && (core::ptr::eq(parents[position].as_ref(), parent) || parents[position].as_ref() == parent);
+        if self.last_parent < self.parents.len() && same(&self.parents, &self.parent_keys, self.last_parent) {
             return Some(self.last_parent as u32 + 1);
         }
-        let found = self
-            .parents
-            .iter()
-            .enumerate()
+        let found = (0..self.parents.len())
             .rev()
             .take(PARENT_STYLES_RECENT)
-            .find(|(_, candidate)| candidate.as_ref() == parent)
-            .map(|(position, _)| position);
+            .find(|&position| same(&self.parents, &self.parent_keys, position));
         let position = match found {
             Some(position) => position,
             None if self.parents.len() < MAX_PARENT_STYLES => {
@@ -24772,9 +24879,10 @@ impl StyleCache {
                     .iter()
                     .rev()
                     .take(PARENT_STYLES_RECENT)
-                    .find(|style| style.as_ref() == parent)
+                    .find(|style| ParentKey::of(style) == key && style.as_ref() == parent)
                     .cloned()
                     .unwrap_or_else(|| Arc::new(parent.clone()));
+                self.parent_keys.push(ParentKey::of(&shared));
                 self.parents.push(shared);
                 self.parents.len() - 1
             }
@@ -24789,7 +24897,9 @@ impl StyleCache {
     fn same_parent(&self, cached: u32, token: u32) -> bool {
         cached == token || (cached != 0 && token != 0
             && self.parents.get(cached as usize - 1).zip(self.parents.get(token as usize - 1))
-                .is_some_and(|(cached, parent)| Arc::ptr_eq(cached, parent) || cached == parent))
+                .zip(self.parent_keys.get(cached as usize - 1).zip(self.parent_keys.get(token as usize - 1)))
+                .is_some_and(|((cached, parent), (cached_key, key))| Arc::ptr_eq(cached, parent)
+                    || (cached_key.same_shape(key) && cached == parent)))
     }
 
     /// Drop the ancestor blooms that no longer describe `node`'s subtree when
@@ -24798,11 +24908,11 @@ impl StyleCache {
         if self.selected.is_some() {
             return;
         }
-        let Some(stored) = self.bloom(node).filter(|bloom| *bloom != 0) else { return };
-        let own = document.kind(node).map_or(0, element_bloom);
+        let Some(stored) = self.bloom(node).filter(|bloom| !bloom.is_empty()) else { return };
+        let own = document.kind(node).map_or(AncestorBloom::EMPTY, element_bloom);
         let expected = match document.parent(node).ok().flatten() {
             Some(parent) if matches!(document.kind(parent), Ok(NodeKind::Element { .. })) => {
-                self.bloom(parent).filter(|bloom| *bloom != 0).map(|bloom| bloom | own)
+                self.bloom(parent).filter(|bloom| !bloom.is_empty()).map(|bloom| bloom | own)
             }
             _ => Some(own),
         };
@@ -24812,10 +24922,10 @@ impl StyleCache {
         let mut pending = Vec::new();
         pending.push(node);
         while let Some(current) = pending.pop() {
-            self.store_bloom(document, current, 0);
+            self.store_bloom(document, current, AncestorBloom::EMPTY);
             let mut child = document.first_child(current).ok().flatten();
             while let Some(id) = child {
-                if self.bloom(id).is_some_and(|bloom| bloom != 0) {
+                if self.bloom(id).is_some_and(|bloom| !bloom.is_empty()) {
                     pending.push(id);
                 }
                 child = document.next_sibling(id).ok().flatten();
@@ -24823,13 +24933,13 @@ impl StyleCache {
         }
     }
 
-    fn ancestor_bloom(&mut self, document: &Document, node: NodeId) -> u64 {
+    fn ancestor_bloom(&mut self, document: &Document, node: NodeId) -> AncestorBloom {
         self.pending.clear();
-        let mut bloom = 0;
+        let mut bloom = AncestorBloom::EMPTY;
         let mut current = document.parent(node).ok().flatten();
         while let Some(id) = current {
             match self.bloom(id) {
-                Some(known) if known != 0 => {
+                Some(known) if !known.is_empty() => {
                     bloom = known;
                     break;
                 }
@@ -24839,7 +24949,7 @@ impl StyleCache {
             current = document.parent(id).ok().flatten();
         }
         while let Some(id) = self.pending.pop() {
-            bloom |= document.kind(id).map_or(0, element_bloom);
+            bloom |= document.kind(id).map_or(AncestorBloom::EMPTY, element_bloom);
             self.store_bloom(document,id,bloom);
         }
         bloom
@@ -25443,7 +25553,7 @@ fn compute_node_cached_impl(
             parent,
             index,
             Some((document, node)),
-            u64::MAX,
+            AncestorBloom::ALL,
             text,
             None,
             None,
@@ -25506,7 +25616,7 @@ fn compute_node_cached_impl(
     let bloom = if index.uses_ancestor_bloom {
         cache.ancestor_bloom(document, node)
     } else {
-        u64::MAX
+        AncestorBloom::ALL
     };
     let window = cache.begin_viewport_window();
     let computed = compute_for_named(
@@ -25568,7 +25678,7 @@ fn compute_node_cached_impl(
 }
 
 fn compute_for(kind: &NodeKind, parent: Option<&Style>, index: &StyleIndex,
-    context: Option<(&Document, NodeId)>, ancestor_bloom: u64,
+    context: Option<(&Document, NodeId)>, ancestor_bloom: AncestorBloom,
     text: Option<&dyn TextShaper>, pseudo_target: Option<PseudoElement>) -> Result<Style, CssError> {
     compute_for_named(kind, parent, index, context, ancestor_bloom, text, pseudo_target, None, None)
 }
@@ -25578,7 +25688,7 @@ fn compute_for_named(
     parent: Option<&Style>,
     index: &StyleIndex,
     context: Option<(&Document, NodeId)>,
-    ancestor_bloom: u64,
+    ancestor_bloom: AncestorBloom,
     text: Option<&dyn TextShaper>,
     pseudo_target: Option<PseudoElement>,
     highlight_name: Option<&str>,
@@ -25593,7 +25703,7 @@ fn compute_for_named_mode(
     parent: Option<&Style>,
     index: &StyleIndex,
     context: Option<(&Document, NodeId)>,
-    ancestor_bloom: u64,
+    ancestor_bloom: AncestorBloom,
     text: Option<&dyn TextShaper>,
     pseudo_target: Option<PseudoElement>,
     highlight_name: Option<&str>,
@@ -25618,7 +25728,7 @@ pub(crate) fn compute_svg_instance_root(
 ) -> Result<Style, CssError> {
     let kind = document.kind(node).map_err(|_| CssError { offset: 0, message: "invalid SVG instance root" })?;
     compute_for_named_registered_mode(kind, Some(parent), index, Some((document, node)),
-        u64::MAX, text, None, None, Some(BoxParentContext::Flow.for_children(parent)), false, true,
+        AncestorBloom::ALL, text, None, None, Some(BoxParentContext::Flow.for_children(parent)), false, true,
         None, None, None, None, None, true, &[])
 }
 
@@ -25628,7 +25738,7 @@ pub(crate) fn compute_svg_instance_style(
 ) -> Result<Style, CssError> {
     let kind=document.kind(node).map_err(|_|CssError{offset:0,message:"invalid SVG instance node"})?;
     let direct=frames.last().is_some_and(|frame|frame.root==node);
-    compute_for_named_registered_mode(kind,Some(parent),index,Some((document,node)),u64::MAX,
+    compute_for_named_registered_mode(kind,Some(parent),index,Some((document,node)),AncestorBloom::ALL,
         text,None,None,Some(BoxParentContext::Flow.for_children(parent)),false,true,
         None,None,None,None,None,direct,frames)
 }
@@ -25638,7 +25748,7 @@ fn compute_for_named_registered_mode(
     parent: Option<&Style>,
     index: &StyleIndex,
     context: Option<(&Document, NodeId)>,
-    ancestor_bloom: u64,
+    ancestor_bloom: AncestorBloom,
     text: Option<&dyn TextShaper>,
     pseudo_target: Option<PseudoElement>,
     highlight_name: Option<&str>,
@@ -26408,7 +26518,9 @@ fn compute_for_named_registered_mode(
     let mut in_document: Option<bool> = None;
     let mut apply = |order: usize| {
         let mask = index.ancestor_masks[order];
-        if ancestor_bloom & mask != mask {
+        if !ancestor_bloom.contains_all(&mask) {
+            #[cfg(test)]
+            index.bloom_rejects.set(index.bloom_rejects.get() + 1);
             return;
         }
         let rule = &index.rules[order];
@@ -26607,7 +26719,7 @@ fn compute_for_named_registered_mode(
     let mut registered_raw_sources = None;
     let mut blocked_registered = Vec::new();
     style.custom = cascade_custom_properties(parent, custom_baseline, &candidates, registrations, eligibility.as_deref_mut(),
-        (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, Some(&mut registered_raw_sources))?;
+        (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, (!registrations.is_empty()).then_some(&mut registered_raw_sources))?;
     let root = pseudo_target.is_none() && style_seed.map_or_else(|| context.map_or(parent.is_none(), |(document, node)| {
         document.parent(node).ok().flatten().is_some_and(|parent| matches!(document.kind(parent), Ok(NodeKind::Document)))
     }), |(_, provenance)| provenance.root);
@@ -28720,7 +28832,7 @@ mod tests {
         }
         let index = StyleIndex::new(Vec::new());
         let compute = |raw: &str, parent: Option<&Style>| compute_for_named(&element(raw), parent, &index, None,
-            u64::MAX, Some(&Metrics), None, None, None).unwrap();
+            AncestorBloom::ALL, Some(&Metrics), None, None, None).unwrap();
         let root = compute("width:2lh;font-size:20px;line-height:2", None);
         assert_eq!(root.width, Some(80.0), "source order cannot precede line-height computation");
         let child = compute("font-size:10px;line-height:1.5;width:2lh;height:2rlh;margin:1rex 1rcap 1rch 1ric", Some(&root));
@@ -28779,7 +28891,7 @@ mod tests {
         for (raw, expected) in [("font-size:20px;width:1cap;height:1ic",(15.0,20.0)),
             ("font-size:20px;width:1ch;height:1lh",(10.0,30.0)),
             ("font-size:20px;writing-mode:vertical-rl;text-orientation:upright;width:1ch;height:1ic",(20.0,20.0))] {
-            let style=compute_for_named(&element(raw),None,&index,None,u64::MAX,Some(&Missing),None,None,None).unwrap();
+            let style=compute_for_named(&element(raw),None,&index,None,AncestorBloom::ALL,Some(&Missing),None,None,None).unwrap();
             assert_eq!((style.width,style.height),(Some(expected.0),Some(expected.1)));
         }
     }
@@ -30432,13 +30544,13 @@ mod tests {
             }
         }
         let index = StyleIndex::new(Vec::new());
-        let parent = compute_for(&element("font-size-adjust:from-font"), None, &index, None, u64::MAX, Some(&Metrics), None).unwrap();
+        let parent = compute_for(&element("font-size-adjust:from-font"), None, &index, None, AncestorBloom::ALL, Some(&Metrics), None).unwrap();
         assert_eq!(parent.font.size_adjust.unwrap().value, FontSizeAdjustValue::Number(0.5));
-        let inherited = compute_for(&element("font-weight:700"), Some(&parent), &index, None, u64::MAX, Some(&Metrics), None).unwrap();
+        let inherited = compute_for(&element("font-weight:700"), Some(&parent), &index, None, AncestorBloom::ALL, Some(&Metrics), None).unwrap();
         assert_eq!(inherited.font.size_adjust.unwrap().value, FontSizeAdjustValue::Number(0.5), "inherit the computed metric, not the child's different font ratio");
-        let explicit = compute_for(&element("font-weight:700;font-size-adjust:from-font"), Some(&parent), &index, None, u64::MAX, Some(&Metrics), None).unwrap();
+        let explicit = compute_for(&element("font-weight:700;font-size-adjust:from-font"), Some(&parent), &index, None, AncestorBloom::ALL, Some(&Metrics), None).unwrap();
         assert_eq!(explicit.font.size_adjust.unwrap().value, FontSizeAdjustValue::Number(0.8));
-        let missing = compute_for(&element("font-size-adjust:ic-height from-font"), None, &index, None, u64::MAX, Some(&Metrics), None).unwrap();
+        let missing = compute_for(&element("font-size-adjust:ic-height from-font"), None, &index, None, AncestorBloom::ALL, Some(&Metrics), None).unwrap();
         assert!(missing.font.size_adjust.is_none(), "a genuinely absent metric computes to none");
         let mut pending = compute(&element("font-size-adjust:from-font"), None, &index).unwrap();
         assert_eq!(pending.font.size_adjust.unwrap().value, FontSizeAdjustValue::FromFont, "no authority stays unresolved");
@@ -35604,6 +35716,69 @@ mod tests {
         );
     }
 
+    fn custom_value(style: &Style, name: &str) -> Option<String> {
+        style.custom_properties().iter().find(|(key, _)| key == name).and_then(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn custom_property_inherits_three_levels_and_overrides_in_the_middle() {
+        let document = crate::html::parse("<style>:root{--tone:red;--wide:blue}</style><div id=top><div id=mid><div id=leaf></div></div></div>", 16).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        let find = |session: &crate::session::RenderSession, id: &str| crate::selector::query_selector(session.document(), session.document().root(), id).unwrap().unwrap();
+        let (top, mid, leaf) = (find(&session, "#top"), find(&session, "#mid"), find(&session, "#leaf"));
+        for node in [top, mid, leaf] {
+            assert_eq!(custom_value(&session.computed_style(node).unwrap(), "--tone").as_deref(), Some("red"));
+        }
+        session.document_mut().set_attribute(mid, "style", "--tone:green;--tone:green").unwrap();
+        assert_eq!(custom_value(&session.computed_style(top).unwrap(), "--tone").as_deref(), Some("red"));
+        assert_eq!(custom_value(&session.computed_style(mid).unwrap(), "--tone").as_deref(), Some("green"));
+        let leaf_style = session.computed_style(leaf).unwrap();
+        assert_eq!(custom_value(&leaf_style, "--tone").as_deref(), Some("green"));
+        assert_eq!(custom_value(&leaf_style, "--wide").as_deref(), Some("blue"));
+        session.document_mut().set_attribute(mid, "style", "--tone:purple").unwrap();
+        assert_eq!(custom_value(&session.computed_style(leaf).unwrap(), "--tone").as_deref(), Some("purple"));
+        session.document_mut().set_attribute(mid, "style", "").unwrap();
+        assert_eq!(custom_value(&session.computed_style(leaf).unwrap(), "--tone").as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn custom_property_redeclaring_the_inherited_value_keeps_the_shared_map() {
+        let document = crate::html::parse("<style>:root{--tone:red}</style><div id=top><div id=same style='--tone:red'></div><div id=other style='--tone:red;--extra:1px'></div></div>", 16).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        let find = |session: &crate::session::RenderSession, id: &str| crate::selector::query_selector(session.document(), session.document().root(), id).unwrap().unwrap();
+        let (top, same, other) = (find(&session, "#top"), find(&session, "#same"), find(&session, "#other"));
+        let top_style = session.computed_style(top).unwrap();
+        let same_style = session.computed_style(same).unwrap();
+        assert_eq!(same_style.custom_properties(), top_style.custom_properties());
+        let other_style = session.computed_style(other).unwrap();
+        assert_eq!(custom_value(&other_style, "--extra").as_deref(), Some("1px"));
+        assert_eq!(custom_value(&other_style, "--tone").as_deref(), Some("red"));
+        assert_eq!(custom_value(&top_style, "--extra"), None);
+    }
+
+    #[test]
+    fn var_fallback_applies_only_without_a_custom_property() {
+        let document = crate::html::parse("<style>:root{--set:blue}#a{color:var(--missing,red)}#b{color:var(--set,red)}#c{--set:green;color:var(--set,red)}</style><div id=a></div><div id=b></div><div id=c></div>", 16).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        for (id, expected) in [("#a", "red"), ("#b", "blue"), ("#c", "green")] {
+            let node = crate::selector::query_selector(session.document(), session.document().root(), id).unwrap().unwrap();
+            assert_eq!(session.computed_style(node).unwrap().color, color(expected).unwrap(), "{id}");
+        }
+    }
+
+    #[test]
+    fn registered_property_with_inherits_false_is_not_inherited() {
+        let document = crate::html::parse("<style>@property --len{syntax:'<length>';inherits:false;initial-value:1px}@property --kept{syntax:'<length>';inherits:true;initial-value:2px}#top{--len:9px;--kept:8px}</style><div id=top><div id=leaf></div></div>", 16).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        let top = crate::selector::query_selector(session.document(), session.document().root(), "#top").unwrap().unwrap();
+        let leaf = crate::selector::query_selector(session.document(), session.document().root(), "#leaf").unwrap().unwrap();
+        let top_style = session.computed_style(top).unwrap();
+        assert_eq!(custom_value(&top_style, "--len").as_deref(), Some("9px"));
+        let leaf_style = session.computed_style(leaf).unwrap();
+        assert_eq!(custom_value(&leaf_style, "--len").as_deref(), Some("1px"));
+        assert_eq!(custom_value(&leaf_style, "--kept").as_deref(), Some("8px"));
+    }
+
     #[test]
     fn rules_with_thousands_of_custom_properties_compute_and_overflow_is_dropped() {
         let document = crate::html::parse("<html><body><div id='target'></div></body></html>", 16).unwrap();
@@ -38629,5 +38804,212 @@ mod incremental_style_tests {
         let (_, damage) = restyle(&document, &index, &mut cache);
         assert!(damage.contains(&(paragraph, StyleDamage::Paint)));
         assert_matches_full_restyle(&document, &index, &cache);
+    }
+    fn is_red(style: &Style) -> bool { style.color.r == 255 && style.color.g == 0 && style.color.b == 0 }
+
+    /// Styles every element with and without the ancestor filter, requires
+    /// identical results and returns the red elements (by id) and the number
+    /// of rule applications the filter rejected.
+    fn filtered_reds(html: &str, css: &str) -> (Vec<String>, usize) {
+        let mut document = crate::html::parse(html, 8192).unwrap();
+        document.clear_mutations();
+        let filtered = StyleIndex::new(parse_stylesheet(css).unwrap().rules);
+        let mut plain = StyleIndex::new(parse_stylesheet(css).unwrap().rules);
+        plain.uses_ancestor_bloom = false;
+        let (mut with, mut without) = (StyleCache::default(), StyleCache::default());
+        warm(&document, &filtered, &mut with, document.root(), None);
+        warm(&document, &plain, &mut without, document.root(), None);
+        let mut reds = Vec::new();
+        for node in elements(&document, "") {
+            let (a, b) = (with.node_style(node).unwrap(), without.node_style(node).unwrap());
+            assert_eq!(a, b, "{css}: filtered and unfiltered styles differ for {node:?}");
+            if is_red(&a) {
+                reds.push(document.get_attribute_ns_ref(node, None, "id").unwrap().unwrap_or("").to_string());
+            }
+        }
+        reds.sort();
+        (reds, filtered.bloom_rejects.get())
+    }
+
+    #[test]
+    fn ancestor_filter_keeps_descendant_and_child_matches() {
+        let html = "<div class=a><section id=s><p id=p1 class=b>x</p></section><p id=p2 class=b>y</p></div>\
+                    <div id=top><p id=p3 class=b>z</p></div><p id=p4 class=b>w</p>";
+        for (css, expected, rejects) in [
+            (".a .b { color: red }", vec!["p1", "p2"], true),
+            (".a > .b { color: red }", vec!["p2"], true),
+            (".a section .b { color: red }", vec!["p1"], true),
+            ("#top p { color: red }", vec!["p3"], true),
+            ("div > p.b { color: red }", vec!["p2", "p3"], true),
+            ("body div p { color: red }", vec!["p1", "p2", "p3"], true),
+            (".missing .b { color: red }", vec![], true),
+            (".a #top .b { color: red }", vec![], true),
+        ] {
+            let (reds, rejected) = filtered_reds(html, css);
+            assert_eq!(reds, expected, "{css}");
+            assert_eq!(rejected > 0, rejects, "{css}: rejected {rejected}");
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_ignores_negated_and_alternative_ancestors() {
+        let html = "<div class=a><i id=i1 class=c>x</i></div><div class=b><i id=i2 class=c>y</i></div>\
+                    <div class=z><i id=i3 class=c>w</i></div>";
+        for (css, expected) in [
+            (":not(.a) .c { color: red }", vec!["i1", "i2", "i3"]),
+            (":not(.a) > .c { color: red }", vec!["i2", "i3"]),
+            (":is(.a, .b) .c { color: red }", vec!["i1", "i2"]),
+            (":where(.a, .b) > .c { color: red }", vec!["i1", "i2"]),
+            (":is(.a) .c { color: red }", vec!["i1"]),
+            ("div:not(.z) > .c { color: red }", vec!["i1", "i2"]),
+            ("body :not(.a):not(.b) .c { color: red }", vec!["i3"]),
+            (".a + div .c { color: red }", vec!["i2"]),
+            (".a ~ .z .c { color: red }", vec!["i3"]),
+            ("div:has(> i) .c { color: red }", vec!["i1", "i2", "i3"]),
+        ] {
+            let (reds, _) = filtered_reds(html, css);
+            assert_eq!(reds, expected, "{css}");
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_matches_tags_ignoring_ascii_case() {
+        let html = "<div id=d class=Foo><p id=p class=bar>x</p></div>";
+        for (css, expected) in [
+            ("DIV p { color: red }", vec!["p"]),
+            ("Div > P.bar { color: red }", vec!["p"]),
+            (".Foo p { color: red }", vec!["p"]),
+            (".foo p { color: red }", vec![]),
+            ("#D p { color: red }", vec![]),
+        ] {
+            let (reds, _) = filtered_reds(html, css);
+            assert_eq!(reds, expected, "{css}");
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_handles_attribute_selectors_on_ancestors() {
+        let html = "<div data-k=1 class=a><p id=p1>x</p></div><div class=a><p id=p2>y</p></div>";
+        for (css, expected) in [
+            ("[data-k] p { color: red }", vec!["p1"]),
+            ("[data-k=\"1\"].a > p { color: red }", vec!["p1"]),
+            ("[data-k=\"2\"] p { color: red }", vec![]),
+            (".a:not([data-k]) p { color: red }", vec!["p2"]),
+        ] {
+            let (reds, _) = filtered_reds(html, css);
+            assert_eq!(reds, expected, "{css}");
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_stays_selective_in_deep_trees() {
+        let depth = 12;
+        let mut html = String::new();
+        for level in 0..depth {
+            html.push_str(&alloc::format!("<div class='l{level} common' id=d{level}>"));
+        }
+        html.push_str("<p id=leaf class=leaf>x</p>");
+        html.push_str(&"</div>".repeat(depth));
+        let (reds, rejected) = filtered_reds(&html, ".l0 .leaf { color: red } .l11 > .leaf { color: red } .l5 .common .leaf { color: red }");
+        assert_eq!(reds, ["leaf"]);
+        assert_eq!(rejected, 0, "every required ancestor feature is present");
+        let (reds, rejected) = filtered_reds(&html, ".nope .leaf { color: red } .l99 > .leaf { color: red } #absent p { color: red }");
+        assert!(reds.is_empty());
+        assert!(rejected >= 2, "rejected {rejected}");
+    }
+
+    #[test]
+    fn ancestor_filter_counts_rejected_rules() {
+        let html = "<div class=a><p id=p1>x</p></div><div class=b><p id=p2>y</p></div>";
+        let (reds, rejected) = filtered_reds(html, ".a p { color: red } .b p { color: blue } .c p { color: green }");
+        assert_eq!(reds, ["p1"]);
+        // Per element, only rules whose ancestor features are all present run:
+        // p1 rejects `.b p` and `.c p`; p2 rejects `.a p` and `.c p`.
+        assert_eq!(rejected, 4);
+    }
+
+    #[test]
+    fn ancestor_filter_leaves_shadow_selectors_alone() {
+        let mut document = crate::html::parse("<x-host class=h><span id=light slot=s class=sl>l</span></x-host>", 64).unwrap();
+        let host = elements(&document, "x-host")[0];
+        let shadow = document.attach_shadow(host, crate::ShadowMode::Open).unwrap();
+        let build = |document: &mut Document, name: &str, class: &str, parent: NodeId| {
+            let node = document.create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: name.into(),
+                attributes: alloc::vec![("class".into(), class.into())],
+            }).unwrap();
+            document.append(parent, node).unwrap();
+            node
+        };
+        let wrapper = build(&mut document, "div", "w", shadow);
+        let inner = build(&mut document, "p", "x", wrapper);
+        let slot = build(&mut document, "slot", "slot", shadow);
+        document.set_attribute(slot, "name", "s").unwrap();
+        let light = elements(&document, "span")[0];
+        let cases: [(&str, NodeId, Option<bool>); 7] = [
+            (":host .x { color: red }", inner, None),
+            (":host(.h) .x { color: red }", inner, None),
+            (":host(.nope) .x { color: red }", inner, Some(false)),
+            (".w .x { color: red }", inner, Some(true)),
+            (".w > .x { color: red }", inner, Some(true)),
+            ("::slotted(.sl) { color: red }", light, Some(true)),
+            (".w ::slotted(.sl) { color: red }", light, None),
+        ];
+        for (css, node, expected) in cases {
+            let mut rules = parse_stylesheet(css).unwrap().rules;
+            for rule in &mut rules { rule.scope = Some(shadow); }
+            let filtered = StyleIndex::new(rules.clone());
+            let mut plain = StyleIndex::new(rules);
+            plain.uses_ancestor_bloom = false;
+            let (mut with, mut without) = (StyleCache::default(), StyleCache::default());
+            let a = compute_node_cached_with_text(&document, node, None, &filtered, &mut with, &TestText).unwrap();
+            let b = compute_node_cached_with_text(&document, node, None, &plain, &mut without, &TestText).unwrap();
+            assert_eq!(a, b, "{css}");
+            if let Some(expected) = expected { assert_eq!(is_red(&a), expected, "{css}"); }
+        }
+    }
+
+    #[test]
+    fn ancestor_filter_follows_incremental_restyle_of_ancestors() {
+        let (mut document, index, mut cache) = setup(
+            "<div id=outer><div id=mid><p id=leaf>x</p></div></div>",
+            ".a .b p { color: red } #mid > p { background: #123 }",
+        );
+        let outer = elements(&document, "div")[0];
+        let mid = elements(&document, "div")[1];
+        let leaf = elements(&document, "p")[0];
+        assert!(!is_red(&cache.node_style(leaf).unwrap()));
+        document.set_attribute(outer, "class", "a").unwrap();
+        document.set_attribute(mid, "class", "b").unwrap();
+        restyle(&document, &index, &mut cache);
+        assert!(is_red(&cache.node_style(leaf).unwrap()));
+        assert_matches_full_restyle(&document, &index, &cache);
+        document.clear_mutations();
+        document.set_attribute(outer, "class", "other").unwrap();
+        restyle(&document, &index, &mut cache);
+        assert!(!is_red(&cache.node_style(leaf).unwrap()));
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn parent_token_matches_equal_styles_by_identity() {
+        let mut cache = StyleCache::default();
+        let mut parent = Style::initial();
+        parent.font_size = 17.0;
+        let first = cache.parent_token(Some(&parent)).unwrap();
+        assert_eq!(cache.parent_token(Some(&parent)), Some(first));
+        assert_eq!(cache.parent_token(Some(&parent.clone())), Some(first));
+        let mut other = parent.clone();
+        other.color = Rgba { r: 1, g: 2, b: 3, a: 255 };
+        let second = cache.parent_token(Some(&other)).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(cache.parent_token(Some(&parent)), Some(first));
+        assert_eq!(cache.parent_token(None), Some(0));
+        let mut wide = parent.clone();
+        wide.min_width = 5.0;
+        let third = cache.parent_token(Some(&wide)).unwrap();
+        assert!(third != first && third != second);
+        assert_eq!(cache.parent_token(Some(&wide.clone())), Some(third));
     }
 }

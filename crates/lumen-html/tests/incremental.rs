@@ -202,6 +202,29 @@ macro_rules! diff {
 }
 
 diff!(
+    svg_resource_definitions_invalidate_referencing_elements,
+    "<style>body{margin:0}#host{width:60px;height:40px;background:#369}\
+     #lg{width:60px;height:30px;fill:url(#grad)}#cl{clip-path:url(#clip);width:60px;height:40px;background:#c00}</style>\
+     <svg style=display:none><defs>\
+     <filter id=paint><feFlood id=flood flood-color=green/></filter>\
+     <linearGradient id=grad><stop id=stop offset=0 stop-color=red /><stop offset=1 stop-color=blue /></linearGradient>\
+     <clipPath id=clip clipPathUnits=userSpaceOnUse><rect id=cr x=0 y=0 width=30 height=20 /></clipPath>\
+     </defs></svg>\
+     <div id=host style=\"filter:url(#paint)\">x</div>\
+     <svg id=lg width=60 height=30><rect width=60 height=30 style=\"fill:url(#grad)\"/></svg>\
+     <div id=cl>y</div>",
+    [
+        |s| attr(s, "#flood", "style", "flood-color:red"),
+        |s| attr(s, "#flood", "style", "flood-color:blue"),
+        |s| attr(s, "#flood", "style", "flood-color:red"),
+        |s| attr(s, "#stop", "stop-color", "lime"),
+        |s| attr(s, "#stop", "style", "stop-color:yellow"),
+        |s| attr(s, "#cr", "width", "50"),
+        |s| attr(s, "#cr", "style", "height:10px"),
+    ]
+);
+
+diff!(
     class_toggle,
     "<style>body{margin:0}p{margin:4px;height:20px}.on{color:red;background:#eee;height:40px}.big{font-size:24px}</style>\
      <div id=w><p id=a>one</p><p id=b>two</p><p id=c>three</p></div>",
@@ -1158,5 +1181,335 @@ diff!(
     [
         |s| attr(s, ".r", "class", "big"),
         |s| attr(s, ".big", "class", "r"),
+    ]
+);
+
+fn multicol_source(items: usize) -> String {
+    let list: String = (0..items).map(|i| format!("<li id=i{i}>reference item number {i} with some text</li>")).collect();
+    format!(
+        "<style>body{{margin:0}}.refs{{columns:3 10em}}.far{{height:10px}}.on{{height:30px}}.wide{{columns:2}}</style>\
+         <div class=far id=far>x</div><div style='position:relative'><div id=wrap style='display:flex'>\
+         <div class=refs id=refs><ol>{list}</ol></div></div></div><div id=after>tail</div>"
+    )
+}
+
+fn measured_after(session: &mut RenderSession, step: impl FnOnce(&mut RenderSession)) -> (u64, u64) {
+    let before = session.invalidation_stats();
+    step(session);
+    render(session);
+    let after = session.invalidation_stats();
+    (after.intrinsics_measured - before.intrinsics_measured, after.intrinsics_reused - before.intrinsics_reused)
+}
+
+fn grid_multicol_source(columns: &str, rows: &str, items: usize) -> String {
+    let list: String = (0..items).map(|i| format!("<li id=i{i}>reference item number {i} with some text</li>")).collect();
+    format!(
+        "<style>body{{margin:0}}.refs{{columns:3 10em}}</style>\
+         <div style='display:grid;width:600px;grid-template-columns:{columns};grid-template-rows:{rows}'>\
+         <div class=refs><ol>{list}</ol></div><div>side</div></div>"
+    )
+}
+
+#[test]
+fn grid_with_definite_fixed_and_zero_minimum_tracks_measures_no_items() {
+    let measured = |columns: &str, rows: &str| {
+        let mut session = RenderSession::new(html::parse(&grid_multicol_source(columns, rows, 120), MAX_NODES).unwrap());
+        session.set_verify_incremental(false);
+        measured_after(&mut session, |_| {}).0
+    };
+    let content_based = measured("1fr 100px", "60px");
+    let zero_minimum = measured("minmax(0,1fr) 100px", "60px");
+    let fixed = measured("400px 100px", "60px");
+    let auto_rows = measured("400px 100px", "auto");
+    assert!(content_based >= 120, "a content-minimum track measured {content_based}");
+    assert!(auto_rows >= 120, "an auto row measured {auto_rows}");
+    assert!(zero_minimum < 12, "minmax(0,1fr) measured {zero_minimum} boxes");
+    assert!(fixed < 12, "fixed tracks measured {fixed} boxes");
+}
+
+#[test]
+fn intrinsic_sizes_survive_a_shift_of_the_positioned_ancestor() {
+    let mut session = RenderSession::new(html::parse(&multicol_source(120), MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    let (first, _) = measured_after(&mut session, |_| {});
+    assert!(first >= 120, "first layout measured {first}");
+    let (shifted, _) = measured_after(&mut session, |s| attr(s, "#far", "style", "height:90px"));
+    assert_eq!(shifted, 0, "a shift above re-measured {shifted} boxes");
+    let (restyled, _) = measured_after(&mut session, |s| attr(s, "#wrap", "style", "display:flex;margin-left:3px"));
+    assert_eq!(restyled, 0, "a restyled parent re-measured {restyled} boxes");
+    let (edited, reused) = measured_after(&mut session, |s| text(s, "#i60", "one edited reference item with much longer text"));
+    assert!(edited < 12 && reused > 0, "an edit re-measured {edited} boxes, reused {reused}");
+}
+
+diff!(
+    multicol_intrinsic_content_changes,
+    multicol_source(24),
+    [
+        |s| text(s, "#i5", "a much longer reference item that changes the max-content width of the whole column set"),
+        |s| {
+            add(s, "#refs ol", "li", &[("id", "extra")], Some("added item"), Some("#i3"));
+        },
+        |s| del(s, "#i7"),
+        |s| attr(s, "#refs", "class", "refs wide"),
+        |s| attr(s, "#far", "style", "height:70px"),
+        |s| attr(s, "#wrap", "style", "display:flex;margin-left:9px"),
+        |s| unattr(s, "#refs", "class"),
+    ]
+);
+
+diff!(
+    inherited_font_size_change_remeasures_intrinsic_child,
+    "<style>body{margin:0}.box{float:left;border:1px solid red}.big{font-size:30px}</style>\
+     <div id=far>x</div><div class=box id=box><div id=parent style='display:flex'><span id=child>inherited width text</span></div></div><p id=after>tail</p>",
+    [
+        |s| attr(s, "#parent", "class", "big"),
+        |s| attr(s, "#box", "class", "box big"),
+        |s| unattr(s, "#parent", "class"),
+        |s| attr(s, "#far", "style", "height:20px"),
+        |s| attr(s, "#box", "class", "box"),
+    ]
+);
+
+fn table_source() -> String {
+    let rows: String = (0..12).map(|i| format!("<tr><th>head {i}</th><td id=c{i}>cell value {i}</td></tr>")).collect();
+    format!(
+        "<style>body{{margin:0}}.box{{float:left;border:1px solid red}}table{{border-collapse:collapse}}td{{padding:2px}}\
+         .wide td{{padding:12px}}</style><div id=far>x</div><div class=box id=box><table id=t>{rows}</table></div><p id=after>tail text</p>"
+    )
+}
+
+diff!(
+    table_cell_text_changes_intrinsic_width,
+    table_source(),
+    [
+        |s| text(s, "#c4", "a very long cell value that makes the shrink-to-fit table much wider than before"),
+        |s| text(s, "#c4", "short"),
+        |s| attr(s, "#t", "class", "wide"),
+        |s| {
+            add(s, "#t", "tr", &[("id", "nr")], Some(""), None);
+        },
+        |s| attr(s, "#far", "style", "height:40px"),
+        |s| del(s, "#c2"),
+    ]
+);
+
+fn grid_source() -> String {
+    let cells: String = (0..9).map(|i| format!("<div id=g{i}>grid item {i}</div>")).collect();
+    format!(
+        "<style>body{{margin:0}}.grid{{display:grid;grid-template-columns:auto auto 1fr;gap:3px;width:600px}}\
+         .fit{{display:inline-grid;grid-template-columns:min-content max-content}}</style>\
+         <div id=far>x</div><div class=grid id=gr>{cells}</div>"
+    )
+}
+
+diff!(
+    grid_intrinsic_tracks_follow_item_changes,
+    grid_source(),
+    [
+        |s| text(s, "#g1", "a considerably longer grid item label"),
+        |s| text(s, "#g4", "x"),
+        |s| attr(s, "#gr", "class", "grid fit"),
+        |s| text(s, "#g0", "another much longer first item"),
+        |s| attr(s, "#far", "style", "height:25px"),
+        |s| del(s, "#g2"),
+    ]
+);
+
+fn quotes_source() -> String {
+    "<style>body{margin:0}q{color:#336}.plain q::before,.plain q::after{content:none}\
+     .fr{quotes:'<<' '>>' '<' '>'}</style>\
+     <p id=p1>say <q id=q1>outer <q id=q2>inner</q> end</q> then <q id=q3>solo</q>.</p>\
+     <p id=p2 lang=de>sag <q id=q4>aussen <q id=q5>innen</q></q></p><div id=d>after</div>"
+        .to_string()
+}
+
+diff!(
+    quotes_nest_and_toggle_with_classes,
+    quotes_source(),
+    [
+        |s| attr(s, "#p1", "class", "plain"),
+        |s| attr(s, "#p1", "class", ""),
+        |s| attr(s, "#q1", "class", "fr"),
+        |s| attr(s, "#p2", "lang", "fr"),
+        |s| {
+            add(s, "#d", "q", &[("id", "q6")], Some("late quote"), None);
+        },
+        |s| del(s, "#q2"),
+        |s| attr(s, "#p1", "class", "plain"),
+        |s| unattr(s, "#q1", "class"),
+    ]
+);
+
+#[test]
+fn quote_positions_are_reused_until_a_change_can_move_them() {
+    let mut session = RenderSession::new(html::parse(&quotes_source(), MAX_NODES).unwrap());
+    session.set_verify_incremental(true);
+    render(&mut session);
+    attr(&mut session, "#d", "style", "height:30px");
+    render(&mut session);
+    assert_eq!(session.invalidation_stats().verify_mismatches, 0);
+    attr(&mut session, "#p1", "class", "plain");
+    let toggled = render(&mut session).clone();
+    attr(&mut session, "#p1", "class", "");
+    let restored = render(&mut session).clone();
+    assert_ne!(toggled, restored, "removing the quotes changed nothing");
+    assert_eq!(session.invalidation_stats().verify_mismatches, 0);
+}
+
+use lumen_html::session::TransitionSnapshot;
+
+fn snapshot_after(s: &mut RenderSession, previous: Option<&Arc<TransitionSnapshot>>) -> Arc<TransitionSnapshot> {
+    s.transition_snapshot_after(Some(&Shaper), previous).unwrap()
+}
+
+fn assert_snapshot_matches_fresh(session: &mut RenderSession, snapshot: &TransitionSnapshot) {
+    let fresh = session.transition_snapshot_with_text(Some(&Shaper)).unwrap();
+    assert_eq!(snapshot.nodes.len(), fresh.nodes.len());
+    for (built, expected) in snapshot.nodes.iter().zip(&fresh.nodes) {
+        assert!(built.node == expected.node && built.pseudo == expected.pseudo && built.parent == expected.parent);
+        assert!(*built.style == *expected.style, "style of {:?} differs from a fresh snapshot", built.node);
+        assert_eq!(built.was_rendered(), expected.was_rendered());
+    }
+}
+
+fn snapshot_session(n: usize, extra: &str) -> RenderSession {
+    let source = format!(
+        "<style>body{{margin:0}}.on{{color:red}}.hot{{opacity:.5}}p:last-child{{margin-left:3px}}#w{{color:green}}#w.warm{{color:blue}}{extra}</style><div id=w>{}</div>",
+        paras(n)
+    );
+    let mut session = RenderSession::new(html::parse(&source, MAX_NODES).unwrap());
+    render(&mut session);
+    session
+}
+
+#[test]
+fn transition_snapshot_styles_only_the_changed_element() {
+    let mut session = snapshot_session(2000, "");
+    let first = snapshot_after(&mut session, None);
+    assert_eq!(session.invalidation_stats().transition_snapshots_full, 1);
+    attr(&mut session, "#p500", "class", "on");
+    let before = session.invalidation_stats();
+    let second = snapshot_after(&mut session, Some(&first));
+    let after = session.invalidation_stats();
+    assert_eq!(after.transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+    assert_eq!(after.transition_snapshots_full, before.transition_snapshots_full);
+    assert!(after.transition_styles_computed - before.transition_styles_computed < 20,
+        "styles computed: {}", after.transition_styles_computed - before.transition_styles_computed);
+    assert!(after.transition_styles_reused - before.transition_styles_reused > 1900);
+    let node = q(&session, "#p500");
+    let changed = second.nodes.iter().find(|input| input.node == node && input.pseudo.is_none()).unwrap();
+    let unchanged = first.nodes.iter().find(|input| input.node == node && input.pseudo.is_none()).unwrap();
+    assert!(*changed.style != *unchanged.style);
+    assert_snapshot_matches_fresh(&mut session, &second);
+}
+
+#[test]
+fn transition_snapshot_restyles_inheriting_descendants_of_a_changed_parent() {
+    let mut session = snapshot_session(200, "");
+    let first = snapshot_after(&mut session, None);
+    attr(&mut session, "#w", "class", "warm");
+    let before = session.invalidation_stats();
+    let second = snapshot_after(&mut session, Some(&first));
+    let after = session.invalidation_stats();
+    assert_eq!(after.transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+    assert!(after.transition_styles_computed - before.transition_styles_computed >= 201);
+    let child = q(&session, "#p7");
+    let color = |snapshot: &TransitionSnapshot| snapshot.nodes.iter()
+        .find(|input| input.node == child && input.pseudo.is_none()).unwrap().style.color;
+    assert!(color(&first) != color(&second), "the child inherits the parent's new color");
+    assert_snapshot_matches_fresh(&mut session, &second);
+}
+
+#[test]
+fn transition_snapshot_computes_nothing_when_no_style_input_changed() {
+    let mut session = snapshot_session(500, "");
+    let first = snapshot_after(&mut session, None);
+    text(&mut session, "#p3", "edited");
+    let before = session.invalidation_stats();
+    let second = snapshot_after(&mut session, Some(&first));
+    let after = session.invalidation_stats();
+    assert_eq!(after.transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+    assert_eq!(after.transition_styles_computed, before.transition_styles_computed);
+    assert_snapshot_matches_fresh(&mut session, &second);
+}
+
+#[test]
+fn transition_snapshot_follows_sibling_index_after_an_earlier_insert() {
+    let mut session = snapshot_session(6, "p{width:calc(sibling-index() * 10px)}");
+    let mut snapshot = snapshot_after(&mut session, None);
+    let steps: [Step; 3] = [
+        |s| { add(s, "#w", "p", &[("id", "first")], Some("new"), Some("#p0")); },
+        |s| del(s, "#p2"),
+        |s| attr(s, "#p4", "class", "on"),
+    ];
+    for step in steps {
+        step(&mut session);
+        snapshot = snapshot_after(&mut session, Some(&snapshot));
+        assert_snapshot_matches_fresh(&mut session, &snapshot);
+    }
+}
+
+#[test]
+fn transition_snapshot_follows_sibling_index_after_an_insert_and_a_render() {
+    let mut session = snapshot_session(6, "p{width:calc(sibling-index() * 10px)}");
+    let mut snapshot = snapshot_after(&mut session, None);
+    add(&mut session, "#w", "p", &[("id", "first")], Some("new"), Some("#p0"));
+    render(&mut session);
+    snapshot = snapshot_after(&mut session, Some(&snapshot));
+    assert_snapshot_matches_fresh(&mut session, &snapshot);
+}
+
+#[test]
+fn transition_snapshot_follows_counters_after_an_earlier_insert() {
+    let mut session = snapshot_session(6, "#w{counter-reset:c}p{counter-increment:c}p::before{content:counter(c) '. '}");
+    let mut snapshot = snapshot_after(&mut session, None);
+    for step in [
+        (|s: &mut RenderSession| { add(s, "#w", "p", &[("id", "first")], Some("new"), Some("#p0")); }) as Step,
+        |s| del(s, "#p2"),
+    ] {
+        step(&mut session);
+        snapshot = snapshot_after(&mut session, Some(&snapshot));
+        assert_snapshot_matches_fresh(&mut session, &snapshot);
+    }
+}
+
+#[test]
+fn transition_snapshot_follows_structural_changes_and_rule_changes() {
+    let mut session = snapshot_session(100, "");
+    let mut snapshot = snapshot_after(&mut session, None);
+    let steps: [Step; 5] = [
+        |s| { add(s, "#w", "p", &[("id", "extra")], Some("new"), None); },
+        |s| del(s, "#p10"),
+        |s| mv(s, "#p20", "#w", Some("#p2")),
+        |s| { add(s, "#w", "style", &[], Some("#p30{color:red}"), None); },
+        |s| attr(s, "#p40", "style", "color:red"),
+    ];
+    for (index, step) in steps.into_iter().enumerate() {
+        step(&mut session);
+        if index % 2 == 1 {
+            render(&mut session);
+        }
+        snapshot = snapshot_after(&mut session, Some(&snapshot));
+        assert_snapshot_matches_fresh(&mut session, &snapshot);
+    }
+    let stats = session.invalidation_stats();
+    assert!(stats.transition_snapshots_incremental >= 3);
+    assert!(stats.transition_snapshots_full >= 2, "a new stylesheet rebuilds the snapshot");
+}
+
+diff!(
+    ancestor_selector_filter_follows_ancestor_changes,
+    "<style>body{margin:0}p{height:20px}.on .inner p{color:red;height:40px}#box > .inner > p{background:#eee}\
+     DIV.mark span{font-size:24px}.off .inner p{height:60px}</style>\
+     <div id=box><div class=inner><p id=a>one</p><span id=s>s</span></div></div><div class=inner><p id=b>two</p></div>",
+    [
+        |s| attr(s, "#box", "class", "on"),
+        |s| attr(s, "#box", "class", "off"),
+        |s| attr(s, "#box", "id", "other"),
+        |s| attr(s, "#other", "class", "on mark"),
+        |s| mv(s, "#b", ".inner", None),
+        |s| { add(s, "#other", "section", &[("class", "on")], None, None); },
+        |s| mv(s, ".inner", "section", None),
+        |s| unattr(s, "section", "class"),
     ]
 );

@@ -302,24 +302,10 @@ const SVG_UNSUPPORTED_ATTRIBUTES: &[&str] = &[
     "vector-effect",
 ];
 
-const SVG_INERT_DEFINITION_ELEMENTS: &[&str] = &[
-    "clipPath",
-    "defs",
-    "desc",
-    "filter",
-    "linearGradient",
-    "marker",
-    "mask",
-    "metadata",
-    "pattern",
-    "radialGradient",
-    "script",
-    "stop",
-    "style",
-    "symbol",
-    "view",
-    "title",
-];
+fn is_svg_inert_definition(tag: &str) -> bool {
+    crate::svg::is_resource_element(tag)
+        || matches!(tag, "desc" | "metadata" | "script" | "stop" | "style" | "symbol" | "view" | "title")
+}
 
 const SVG_SUPPORTED_ELEMENTS: &[&str] = &[
     "a", "circle", "ellipse", "g", "line", "path", "polygon", "polyline", "rect", "svg", "text",
@@ -369,7 +355,7 @@ pub fn unsupported_svg_features(
         let in_svg = is_svg || parent_svg_depth > 0;
         if in_svg && is_svg {
             if !SVG_SUPPORTED_ELEMENTS.contains(&tag)
-                && !SVG_INERT_DEFINITION_ELEMENTS.contains(&tag)
+                && !is_svg_inert_definition(tag)
                 && tag != "foreignObject"
             {
                 features.insert(SvgUnsupportedFeature::Element(tag.into()));
@@ -477,7 +463,7 @@ pub fn unsupported_svg_features(
                 features.insert(SvgUnsupportedFeature::TextLayout);
             }
         }
-        if in_svg && SVG_INERT_DEFINITION_ELEMENTS.contains(&tag) {
+        if in_svg && is_svg_inert_definition(tag) {
             continue;
         }
         let child_in_text = in_text || (is_svg && tag == "text");
@@ -1593,6 +1579,9 @@ pub(crate) struct IntrinsicSizes {
     /// reads replayed by cache hits. A measurement depends on an axis when
     /// its count moved while it ran.
     reads: [core::cell::Cell<u64>; 2],
+    /// Measurements made and cache hits served since `begin_frame`.
+    measured: core::cell::Cell<usize>,
+    reused: core::cell::Cell<usize>,
 }
 
 impl IntrinsicSizes {
@@ -1634,6 +1623,8 @@ impl IntrinsicSizes {
         true
     }
     fn begin_frame(&self) {
+        self.measured.set(0);
+        self.reused.set(0);
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
     }
@@ -1703,6 +1694,12 @@ struct IntrinsicProvenance {
     context: Option<IntrinsicContext>,
 }
 
+/// A rectangle's size at the origin: intrinsic sizes resolve against the size
+/// of a containing block, not against where it sits.
+fn sized_only(rect: Rect) -> Rect {
+    Rect { x: 0.0, y: 0.0, width: rect.width, height: rect.height }
+}
+
 #[derive(Clone, PartialEq)]
 struct IntrinsicContext {
     parent_height: Option<f32>,
@@ -1716,7 +1713,28 @@ struct IntrinsicContext {
     intrinsic_inline_axis: Option<bool>,
     intrinsic_minimum_atomics: bool,
     vertical: (bool, bool, bool),
-    computed_parent: Option<(NodeId, Arc<Style>)>,
+    computed_parent: ComputedParent,
+}
+
+/// The box being laid out when a measurement was made, with its origin style.
+/// Equality compares the node only: below it a measured child is validated by
+/// its own style, and the origin style matters only to the measured node
+/// itself (`IntrinsicContext::same_for_slot`).
+#[derive(Clone)]
+struct ComputedParent(Option<(NodeId, Arc<Style>)>);
+
+impl PartialEq for ComputedParent {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref().map(|(node, _)| node.key()) == other.0.as_ref().map(|(node, _)| node.key())
+    }
+}
+
+impl IntrinsicContext {
+    fn same_for_slot(&self, other: &Self, slot: usize) -> bool {
+        let own = |context: &Self| context.computed_parent.0.as_ref()
+            .filter(|(node, _)| node.index() == slot / 2).map(|(_, style)| style.clone());
+        self == other && own(self) == own(other)
+    }
 }
 
 struct IntrinsicMark {
@@ -1757,6 +1775,9 @@ pub(crate) struct RetainedLayoutCache {
     /// Counter and quote values of the last layout; the next layout drops
     /// what depended on the values that changed since.
     generated: Option<(Vec<CounterNodeValues>, Vec<QuoteNodePosition>)>,
+    /// `generated` still holds the quote positions of the current document:
+    /// nothing that can move a quote has changed since it was taken.
+    quotes_current: bool,
     scan: GeneratedScan,
     parent_styles: Vec<Arc<Style>>,
     /// Retained fragments per distinct style (by pointer) with the style's
@@ -1769,6 +1790,7 @@ impl RetainedLayoutCache {
         self.clear_fragments();
         self.intrinsics.clear();
         self.generated = None;
+        self.quotes_current = false;
         self.scan = GeneratedScan::default();
     }
 
@@ -1789,6 +1811,7 @@ impl RetainedLayoutCache {
     /// sizes elsewhere validate themselves by style and constraints, and are
     /// replayed translated when only their position differs.
     pub(crate) fn invalidate_changed(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId], paint: &[NodeId]) {
+        if !layout.is_empty() || !subtrees.is_empty() { self.quotes_current = false; }
         self.note_scan_changes(document, layout, subtrees);
         let mut fragments: BTreeSet<RetainedNodeKey> = BTreeSet::new();
         let mut sizes: BTreeSet<RetainedNodeKey> = BTreeSet::new();
@@ -1881,6 +1904,7 @@ impl RetainedLayoutCache {
                 snapshot_quotes.extend_from_slice(quotes);
                 (snapshot_counters, snapshot_quotes)
             });
+        self.quotes_current = self.generated.is_some();
     }
 
     pub(crate) fn clear_count(&self) -> u64 {
@@ -1891,14 +1915,21 @@ impl RetainedLayoutCache {
         self.laid_out
     }
 
+    /// Intrinsic sizes measured and served from the retained sizes this frame.
+    pub(crate) fn intrinsics_measured(&self) -> (usize, usize) {
+        (self.intrinsics.measured.get(), self.intrinsics.reused.get())
+    }
+
     /// Drop the retained fragments for a viewport size change. Intrinsic
     /// sizes stay unless they read a changed viewport axis.
     pub(crate) fn clear_for_resize(&mut self, width_changed: bool, height_changed: bool) {
+        self.quotes_current = false;
         self.clear_fragments();
         self.intrinsics.retain_for_resize(width_changed, height_changed);
     }
 
     pub(crate) fn clear_intrinsics(&mut self) {
+        self.quotes_current = false;
         self.intrinsics.clear();
     }
 
@@ -1935,6 +1966,7 @@ impl RetainedLayoutCache {
     /// every ancestor of a text-bearing fragment because ancestors replay
     /// their descendants' commands.
     pub(crate) fn invalidate_fonts(&mut self) {
+        self.quotes_current = false;
         self.intrinsics.clear();
         if !self.entries.iter().any(|entry| entry.has_text) {
             return;
@@ -1944,6 +1976,7 @@ impl RetainedLayoutCache {
     }
 
     pub(crate) fn invalidate_text_targets(&mut self, document: &Document, targets: &[NodeId]) {
+        self.quotes_current = false;
         self.intrinsics.clear();
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
@@ -1955,6 +1988,7 @@ impl RetainedLayoutCache {
     }
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
+        self.quotes_current = false;
         self.intrinsics.clear();
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
@@ -4386,6 +4420,11 @@ impl Layout<'_> {
     }
 
     fn prepare_quote_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
+        if let Some((_, quotes)) = self.retained_fragments.as_deref()
+            .filter(|cache| cache.quotes_current).and_then(|cache| cache.generated.as_ref()) {
+            self.quote_positions = Cow::Owned(quotes.clone());
+            return Ok(());
+        }
         if !self.rules.has_quote_content() && !self.document_has_quotes(root)? {
             return Ok(());
         }
@@ -6344,7 +6383,8 @@ impl Layout<'_> {
         while let Some(child_node)=child {
             child=self.document.next_sibling(child_node).map_err(|_|LayoutError::InvalidTree)?;
             let Ok(NodeKind::Element{namespace:Namespace::Svg,name,..})=self.document.kind(child_node) else{continue;};
-            if matches!(crate::svg::local_name(name),"defs"|"symbol"|"clipPath"|"mask"|"marker"|"pattern"|"filter"){continue;}
+            let child_tag=crate::svg::local_name(name);
+            if crate::svg::is_resource_element(child_tag) || child_tag=="symbol" {continue;}
             let child_style=self.computed_style(child_node,Some(style)).map_err(LayoutError::Css)?;
             if child_style.display==Display::None {continue;}
             let Some(id)=self.svg_geometry_id(child_node,&child_style,child_user,depth+1,use_chain)? else{continue;};
@@ -6811,24 +6851,9 @@ impl Layout<'_> {
                 return Ok(());
             }
             if tag=="symbol" && !instance_root {return Ok(());}
-            if matches!(
-                tag,
-                "defs"
-                    | "view"
-                    | "clipPath"
-                    | "mask"
-                    | "filter"
-                    | "marker"
-                    | "pattern"
-                    | "linearGradient"
-                    | "radialGradient"
-                    | "title"
-                    | "desc"
-                    | "metadata"
-                    | "style"
-                    | "script"
-                    | "foreignObject"
-            ) {
+            if crate::svg::is_resource_element(tag)
+                || matches!(tag, "view" | "title" | "desc" | "metadata" | "style" | "script" | "foreignObject")
+            {
                 return Ok(());
             }
             let viewport_hit_start=self.geometry.as_deref().map_or(0,|geometry|geometry.hits.len());
@@ -8446,6 +8471,12 @@ fn collect_quote_positions(
     {
         return Ok(());
     }
+    // Without quote content in any rule, only the user agent's own `q`
+    // generated content can carry quotes.
+    let generates_quotes = rules.has_quote_content() || matches!(
+        kind,
+        NodeKind::Element { name, namespace: Namespace::Html, .. } if crate::svg::local_name(name) == "q"
+    );
     let outer_quote_depth = style.as_ref().filter(|style| style_contains_generated_effects(style)).map(|_| *quote_depth);
     let language = if is_element {
         quote_language(document, node)?.or_else(|| parent_language.cloned())
@@ -8458,7 +8489,7 @@ fn collect_quote_positions(
     );
     let mut has_quotes = false;
     let mut marker_quote_depth = *quote_depth;
-    if let Some(style) = style.as_ref() {
+    if let Some(style) = style.as_ref().filter(|_| generates_quotes) {
         let generated = rules
             .compute_pseudo_cached(
                 document,
@@ -8481,7 +8512,7 @@ fn collect_quote_positions(
     let mut before_quote_depth = *quote_depth;
     let mut before_marker_quote_depth = *quote_depth;
 
-    if let Some(style) = style.as_ref() {
+    if let Some(style) = style.as_ref().filter(|_| generates_quotes) {
         let generated = rules
             .compute_pseudo_cached(
                 document,
@@ -8532,7 +8563,7 @@ fn collect_quote_positions(
 
     let mut after_quote_depth = *quote_depth;
     let mut after_marker_quote_depth = *quote_depth;
-    if let Some(style) = style.as_ref() {
+    if let Some(style) = style.as_ref().filter(|_| generates_quotes) {
         let generated = rules
             .compute_pseudo_cached(document, node, style, css::PseudoElement::After, Some(text), &mut style_cache.borrow_mut())
             .map_err(LayoutError::Css)?
@@ -11384,6 +11415,37 @@ fn grid_automatic_minimum(
             content.min((maximum.max(0.0) - edge_floor - shim_floor).max(0.0))
         });
     content + edge_floor + shim_floor
+}
+
+/// Whether the track sizing algorithm reads item contributions for a span:
+/// intrinsic or fit-content sizing functions (CSS Grid §12.5), percentages on
+/// an indefinite axis, and flexible tracks on an indefinite axis (§12.7). A
+/// definite free space sizes `fr` tracks from the leftover space alone, and
+/// `minmax(0, 1fr)` has no content-based minimum (§6.6).
+fn grid_span_needs_contributions(
+    definitions: &[css::GridTrack],
+    start: usize,
+    span: usize,
+    available: Option<f32>,
+) -> bool {
+    use css::{GridBreadth as B, GridTrack as T};
+
+    let definite = available.is_some_and(|value| value.is_finite());
+    (start..start.saturating_add(span).min(css::MAX_GRID_TRACKS)).any(|index| {
+        let track = definitions.get(index).copied().unwrap_or(T::Auto);
+        if matches!(track, T::FitContent(_) | T::FitContentLength(_)) {
+            return true;
+        }
+        [track.minimum(), track.maximum()]
+            .into_iter()
+            .any(|breadth| match breadth {
+                B::Auto | B::MinContent | B::MaxContent => true,
+                B::Percentage(_) => !definite,
+                B::Length(_, percent) => percent != 0.0 && !definite,
+                B::Fraction(_) => !definite,
+                B::Pixels(_) => false,
+            })
+    })
 }
 
 fn grid_track_sizes(
@@ -19947,10 +20009,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut provenance = intrinsics.provenance.borrow_mut();
         let entry = provenance.get_mut(slot)?;
         if entry.frame != intrinsics.frame.get() {
-            if entry.context.is_none() || entry.context != self.intrinsic_context() { return None; }
+            let current = self.intrinsic_context();
+            let same = match (&entry.context, &current) {
+                (Some(stored), Some(current)) => stored.same_for_slot(current, slot),
+                _ => false,
+            };
+            if !same { return None; }
             entry.frame = intrinsics.frame.get();
         }
         intrinsics.viewport_read((), entry.axes);
+        intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
         self.text_uses.set(self.text_uses.get().wrapping_add(1));
         Some(size)
     }
@@ -19975,23 +20043,24 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         Some(IntrinsicContext {
             parent_height: self.parent_height,
-            containing_block: self.containing_block,
+            containing_block: self.containing_block.map(sized_only),
             containing_block_node: self.containing_block_node,
-            fixed_containing_block: self.fixed_containing_block,
+            fixed_containing_block: self.fixed_containing_block.map(sized_only),
             fixed_containing_block_node: self.fixed_containing_block_node,
-            sticky_bounds: self.sticky_bounds,
+            sticky_bounds: self.sticky_bounds.map(sized_only),
             container_units: self.container_units.get().into(),
             export_block_table_baselines: self.export_block_table_baselines,
             intrinsic_inline_axis: self.intrinsic_inline_axis,
             intrinsic_minimum_atomics: self.intrinsic_minimum_atomics,
             vertical: (self.vertical_paragraph, self.vertical_inline_lr, self.vertical_sideways_lr),
-            computed_parent: self.computed_parent.clone(),
+            computed_parent: ComputedParent(self.computed_parent.clone()),
         })
     }
 
     fn store_intrinsic(&self, slot: usize, style: &Style, size: (f32, f32),
         margins: Option<BlockMargins>, mark: &IntrinsicMark) {
         let intrinsics = &*self.intrinsics;
+        intrinsics.measured.set(intrinsics.measured.get().saturating_add(1));
         let mut axes = 0;
         for (axis, reads) in intrinsics.reads.iter().enumerate() {
             if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
@@ -20543,6 +20612,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             rows: usize,
             natural: (f32, f32),
             minimum: (f32, f32),
+            measured: bool,
             lane_position: f32,
             lane_extent: f32,
             baseline_origin: f32,
@@ -20780,12 +20850,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     rows = rows
                         .max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span)
                         .min(MAX_GRID_TRACKS);
-                    let sizing_style = computed.resolve_grid_intrinsic_percentages(
-                        physical_width,
-                        style.height.or(self.parent_height),
-                    );
-                    let natural = self.flex_intrinsic_size(node, &sizing_style, anonymous_text.as_ref(), depth + 1, false)?;
-                    let minimum = self.flex_intrinsic_size(node, &sizing_style, anonymous_text.as_ref(), depth + 1, true)?;
                     items
                         .try_reserve(1)
                         .map_err(|_| LayoutError::CommandLimit)?;
@@ -20799,8 +20863,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         row: 0,
                         cols: 1,
                         rows: 1,
-                        natural: axes.logical(natural),
-                        minimum: axes.logical(minimum),
+                        natural: (0.0, 0.0),
+                        minimum: (0.0, 0.0),
+                        measured: false,
                         lane_position: 0.0,
                         lane_extent: 0.0,
                         baseline_origin: 0.0,
@@ -20876,12 +20941,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             rows = rows
                 .max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span)
                 .min(MAX_GRID_TRACKS);
-            let sizing_style = computed.resolve_grid_intrinsic_percentages(
-                physical_width,
-                style.height.or(self.parent_height),
-            );
-            let natural = self.intrinsic_virtual_generated_size(&child, &sizing_style, false)?;
-            let minimum = self.intrinsic_virtual_generated_size(&child, &sizing_style, true)?;
             items
                 .try_reserve(1)
                 .map_err(|_| LayoutError::CommandLimit)?;
@@ -20895,8 +20954,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 row: 0,
                 cols: 1,
                 rows: 1,
-                natural: axes.logical(natural),
-                minimum: axes.logical(minimum),
+                natural: (0.0, 0.0),
+                minimum: (0.0, 0.0),
+                measured: false,
                 lane_position: 0.0,
                 lane_extent: 0.0,
                 baseline_origin: 0.0,
@@ -20911,6 +20971,35 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             });
         }
         items.sort_unstable_by_key(|item| (item.style.order, item.source_order));
+        let measure_item = |this: &Self, item: &mut Item| -> Result<(), LayoutError> {
+            if item.measured {
+                return Ok(());
+            }
+            let sizing_style = item.style.resolve_grid_intrinsic_percentages(
+                physical_width,
+                style.height.or(this.parent_height),
+            );
+            let (natural, minimum) = if let Some(generated) = item.generated.as_ref() {
+                (
+                    this.intrinsic_virtual_generated_size(generated, &sizing_style, false)?,
+                    this.intrinsic_virtual_generated_size(generated, &sizing_style, true)?,
+                )
+            } else {
+                (
+                    this.flex_intrinsic_size(item.node, &sizing_style, item.anonymous_text.as_ref(), depth + 1, false)?,
+                    this.flex_intrinsic_size(item.node, &sizing_style, item.anonymous_text.as_ref(), depth + 1, true)?,
+                )
+            };
+            item.natural = axes.logical(natural);
+            item.minimum = axes.logical(minimum);
+            item.measured = true;
+            Ok(())
+        };
+        if style.grid_lanes {
+            for item in &mut items {
+                measure_item(self, item)?;
+            }
+        }
         if style.grid_lanes {
             let row = style.grid_lanes_direction.is_row(style);
             if let Some(auto) = if row {
@@ -22111,6 +22200,19 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             Some(width)
         };
+        let row_available = definite_height;
+        for item in &mut items {
+            let columns_needed = !item.style.grid_columns_subgrid
+                && grid_span_needs_contributions(&column_definitions, item.col, item.cols, column_available);
+            let rows_needed = !item.style.grid_rows_subgrid
+                && grid_span_needs_contributions(&row_definitions, item.row, item.rows, row_available);
+            let baseline_aligned = item.style.self_alignment(style, true).is_baseline()
+                || item.style.self_alignment(style, false).is_baseline()
+                || item.style.content_alignment(false).is_baseline();
+            if columns_needed || rows_needed || baseline_aligned || item.anonymous_text.is_some() {
+                measure_item(self, item)?;
+            }
+        }
         for item in &items {
             if item.style.grid_columns_subgrid {
                 self.subgrid_axis_contributions(
@@ -22126,7 +22228,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     &mut column_contributions,
                     depth,
                 )?;
-            } else {
+            } else if item.measured
+                && grid_span_needs_contributions(&column_definitions, item.col, item.cols, column_available)
+            {
                 push_grid_track_contribution(
                     &mut column_contributions,
                     GridTrackContribution {
@@ -22159,10 +22263,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             column_contributions.iter().copied(),
         )?;
         let mut row_contributions = Vec::new();
-        let row_available = definite_height;
         let mut subgrid_contributions = Vec::new();
         for item in &items {
             if !item.style.grid_rows_subgrid {
+                if !item.measured {
+                    continue;
+                }
                 push_grid_track_contribution(
                     &mut row_contributions,
                     GridTrackContribution {
@@ -22371,6 +22477,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             computed.blockify_display();
             let resolved_alignment = computed.self_alignment(style, true);
             let alignment = resolved_alignment.alignment;
+            let sizes_from_content = if axes.vertical {
+                (computed.height.is_none() && alignment != AlignItems::Stretch)
+                    || (computed.width.is_none()
+                        && computed.self_alignment(style, false).alignment != AlignItems::Stretch)
+            } else {
+                computed.width.is_none() && alignment != AlignItems::Stretch
+            };
+            if sizes_from_content {
+                measure_item(self, item)?;
+            }
             if axes.vertical {
                 if computed.height.is_none() {
                     computed.height = Some(specified_height(
@@ -22506,6 +22622,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }
             item.natural = axes.logical((painted_width, painted_height));
+            if !item.measured {
+                item.minimum = item.natural;
+            }
             item.baselines = self.flow_baselines.take();
             self.flow_baselines = saved_baselines;
             item.content_ranges = self
@@ -44670,6 +44789,117 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         assert_eq!(glyph_runs[0].0, 0.0);
         assert_eq!(glyph_runs[1].0, 0.0);
         assert_eq!(glyph_runs[1].1 - glyph_runs[0].1, 10.0);
+    }
+
+    fn grid_column_extents(columns: &str, extra: &str, item: &str, width: u32) -> Vec<(f32, f32)> {
+        let markup = alloc::format!(
+            "<div style='display:grid;{extra}grid-template-columns:{columns}'>\
+             <div style='background:green'>{item}</div>\
+             <div style='background:green;height:10px'></div></div>"
+        );
+        colored_boxes_in(&markup, width, 100)
+            .iter()
+            .map(|rect| (rect.x, rect.width))
+            .collect()
+    }
+
+    const WIDE_CHILD: &str = "<div style='width:500px;height:10px;background:red'></div>";
+
+    #[test]
+    fn grid_minmax_zero_fraction_track_ignores_item_content() {
+        assert_eq!(
+            grid_column_extents("minmax(0,1fr) 200px", "width:400px;", WIDE_CHILD, 600),
+            [(0.0, 200.0), (0.0, 500.0), (200.0, 200.0)]
+        );
+    }
+
+    #[test]
+    fn grid_bare_fraction_track_keeps_content_based_minimum() {
+        assert_eq!(
+            grid_column_extents("1fr 200px", "width:400px;", WIDE_CHILD, 700),
+            [(0.0, 500.0), (0.0, 500.0), (500.0, 200.0)]
+        );
+    }
+
+    #[test]
+    fn grid_auto_track_stretches_over_item_content() {
+        assert_eq!(
+            grid_column_extents(
+                "auto 100px",
+                "width:400px;",
+                "<div style='width:50px;height:10px;background:red'></div>",
+                600
+            ),
+            [(0.0, 300.0), (0.0, 50.0), (300.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn grid_fit_content_track_keeps_the_content_minimum_above_its_limit() {
+        assert_eq!(
+            grid_column_extents("fit-content(300px) 100px", "width:800px;", WIDE_CHILD, 900),
+            [(0.0, 500.0), (0.0, 500.0), (500.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn grid_under_max_content_width_resolves_fractions_from_item_contributions() {
+        assert_eq!(
+            grid_column_extents("minmax(0,1fr) 100px", "width:max-content;", WIDE_CHILD, 700),
+            [(0.0, 500.0), (0.0, 500.0), (500.0, 100.0)]
+        );
+    }
+
+    fn grid_row_extents(rows: &str, extra: &str, item: &str) -> Vec<(f32, f32)> {
+        let markup = alloc::format!(
+            "<div style='display:grid;width:40px;grid-template-columns:40px;{extra}{rows}'>\
+             <div style='background:green;font-size:10px;line-height:10px'>{item}</div>\
+             <div style='background:green;font-size:10px;line-height:10px'>aa aa aa</div></div>"
+        );
+        colored_boxes_in(&markup, 800, 200)
+            .iter()
+            .map(|rect| (rect.y, rect.height))
+            .collect()
+    }
+
+    #[test]
+    fn grid_rows_with_intrinsic_minimums_use_item_contributions() {
+        let tall = "<div style='height:70px'></div>";
+        let scroll = "<div style='overflow:auto'><div style='height:70px'></div></div>";
+        let wrap = "aa aa aa aa aa";
+        for (name, rows, extra, item, expected) in [
+            ("minmax", "grid-auto-rows:minmax(auto,40px);", "", tall, [(0.0, 40.0), (40.0, 40.0)]),
+            ("minmax wrap", "grid-auto-rows:minmax(auto,40px);", "", wrap, [(0.0, 40.0), (40.0, 40.0)]),
+            ("fit-content", "grid-template-rows:fit-content(25px) fit-content(100px);", "", tall, [(0.0, 70.0), (70.0, 100.0)]),
+            ("fit-content wrap", "grid-template-rows:fit-content(25px) auto;", "", wrap, [(0.0, 25.0), (25.0, 10.0)]),
+            ("wrap auto", "", "", wrap, [(0.0, 10.0), (10.0, 10.0)]),
+            ("auto tall", "", "", tall, [(0.0, 70.0), (70.0, 10.0)]),
+            ("scroll", "", "", scroll, [(0.0, 70.0), (70.0, 10.0)]),
+            ("scroll minmax", "grid-auto-rows:minmax(0,auto);", "", scroll, [(0.0, 70.0), (70.0, 10.0)]),
+            ("definite auto", "", "height:150px;", wrap, [(0.0, 75.0), (75.0, 75.0)]),
+            ("definite fr", "grid-template-rows:1fr 1fr;", "height:150px;", wrap, [(0.0, 75.0), (75.0, 75.0)]),
+            ("indefinite fr", "grid-template-rows:1fr 2fr;", "", wrap, [(0.0, 10.0), (10.0, 20.0)]),
+            ("min-content", "grid-template-rows:min-content max-content;", "", wrap, [(0.0, 10.0), (10.0, 10.0)]),
+        ] {
+            assert_eq!(grid_row_extents(rows, extra, item), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn grid_spanning_item_measures_only_when_it_crosses_an_intrinsic_track() {
+        let spanning = |columns: &str| {
+            let markup = alloc::format!(
+                "<div style='display:grid;width:400px;grid-template-columns:{columns}'>\
+                 <div style='grid-column:1/3;background:green'>{WIDE_CHILD}</div>\
+                 <div style='background:green;height:10px'></div></div>"
+            );
+            colored_boxes_in(&markup, 800, 100)
+                .iter()
+                .map(|rect| (rect.x, rect.width))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spanning("100px minmax(0,1fr)"), [(0.0, 400.0), (0.0, 500.0), (0.0, 100.0)]);
+        assert_eq!(spanning("100px 1fr"), [(0.0, 500.0), (0.0, 500.0), (0.0, 100.0)]);
     }
 
     #[test]

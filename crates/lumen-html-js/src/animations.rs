@@ -1600,7 +1600,10 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     apply_realm_in_phase(hub,realm,now,EffectStylePhase::AfterChange)?;
     let fonts=crate::canvas::initialized_realm_font_source(realm)?;
     let text=fonts.as_ref().map(|fonts|&**fonts as &dyn lumen_html::paint::TextShaper);
-    let snapshot=realm.session.borrow_mut().transition_snapshot_with_text(text);
+    let earlier=hub.borrow().transition_snapshots.get(&realm_key)
+        .filter(|(owner,_)|owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm))).map(|(_,snapshot)|snapshot.clone());
+    let snapshot=realm.session.borrow_mut().transition_snapshot_after(text,earlier.as_ref());
+    drop(earlier);
     let mut snapshot=match snapshot {
         Ok(snapshot)=>snapshot,
         Err(lumen_html::layout::LayoutError::CommandLimit)=>{
@@ -5793,6 +5796,42 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
         eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
         advance(engine.ctx(),0.0).unwrap();
         assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_snapshots_restyle_only_changed_elements_and_idle_frames_do_no_work() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(2000));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        eval_ok(&mut engine,"document.body.getBoundingClientRect().height");
+        advance(engine.ctx(),0.0).unwrap();
+        let idle=realm.session.borrow().invalidation_stats();
+        advance(engine.ctx(),16.0).unwrap();advance(engine.ctx(),32.0).unwrap();
+        let still=realm.session.borrow().invalidation_stats();
+        assert_eq!(still.transition_snapshots_full+still.transition_snapshots_incremental,idle.transition_snapshots_full+idle.transition_snapshots_incremental,"unchanged frames capture no snapshot");
+        assert_eq!(still.transition_styles_computed,idle.transition_styles_computed);
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),48.0).unwrap();
+        let changed=realm.session.borrow().invalidation_stats();
+        assert_eq!(changed.transition_snapshots_incremental,still.transition_snapshots_incremental+1,"full {} -> {}",still.transition_snapshots_full,changed.transition_snapshots_full);
+        assert!(changed.transition_styles_computed-still.transition_styles_computed<20,"styles computed: {}",changed.transition_styles_computed-still.transition_styles_computed);
+        assert!(changed.transition_styles_reused-still.transition_styles_reused>2000);
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_on_inheriting_child_when_parent_changes() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#parent{{color:red}}#parent.end{{color:blue}}#child{{transition:color 100s linear}}</style><div id=parent><span id=child>x</span></div>{}","<p><span>x</span></p>".repeat(500));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        eval_ok(&mut engine,"document.body.getBoundingClientRect().height");
+        advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.child=document.getElementById('child');document.getElementById('parent').className='end'");
+        advance(engine.ctx(),16.0).unwrap();
+        assert!(realm.session.borrow().invalidation_stats().transition_snapshots_incremental>=1);
+        assert!(matches!(eval_ok(&mut engine,"child.getAnimations().length===1 && child.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
     }
 
     #[test]
