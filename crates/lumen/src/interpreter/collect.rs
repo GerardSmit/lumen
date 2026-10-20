@@ -382,8 +382,6 @@ impl Interp {
                 if let crate::modules::NsBinding::Static(Value::Obj(object)) = binding { object.gc_add_ref(); }
             }
         }
-        // The HTMLDDA identity list is branding bookkeeping, not an owner.
-        for object in &self.htmldda { object.gc_add_ref(); }
         self.lang.count_intrinsic_edges(&mut |object| object.gc_add_ref());
         #[cfg(feature = "embed")]
         crate::embed_convert::count_host_class_cache_edges(self, &mut |object| object.gc_add_ref());
@@ -612,11 +610,6 @@ impl Interp {
             }
         }
 
-        let mut dead_htmldda = Vec::new();
-        self.htmldda.retain(|object| {
-            if object.gc_marked() { true }
-            else { dead_htmldda.push(object.clone()); false }
-        });
         // Collect the garbage, holding it strongly, and reset the scratch of every node for the
         // next collection.
         let mut garbage: Vec<Gc> =
@@ -712,7 +705,6 @@ impl Interp {
         drop(dead_scopes);
         drop(removed);
         drop(dead_realms);
-        drop(dead_htmldda);
         // FinalizationRegistry targets may have died: the next checkpoint scans for them.
         self.weak_note_collection();
         value::gc_trim_heap();

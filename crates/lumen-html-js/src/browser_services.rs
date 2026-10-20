@@ -217,24 +217,221 @@ impl DomRealm {
     }
 }
 
+/// What `navigator` reports about the browser. The embedder replaces the default with
+/// [`set_navigator_profile`] before installing documents.
+#[derive(Clone, Debug)]
+pub struct NavigatorProfile {
+    pub user_agent: String,
+    pub platform: String,
+    pub vendor: String,
+    pub language: String,
+    pub languages: Vec<String>,
+    pub hardware_concurrency: u32,
+    pub max_touch_points: u32,
+    pub cookie_enabled: bool,
+    pub online: bool,
+}
+
+impl Default for NavigatorProfile {
+    fn default() -> Self {
+        Self {
+            user_agent: "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Lumen".into(),
+            platform: "Linux aarch64".into(),
+            vendor: "Google Inc.".into(),
+            language: "en-US".into(),
+            languages: vec!["en-US".into(), "en".into()],
+            hardware_concurrency: 4,
+            max_touch_points: 0,
+            cookie_enabled: true,
+            online: true,
+        }
+    }
+}
+
+/// Set the `navigator` profile of documents installed afterwards in this interpreter.
+pub fn set_navigator_profile(ctx: &mut Ctx, profile: NavigatorProfile) {
+    ctx.op_state().put(profile);
+}
+
 #[lumen_bind::class(name = "Navigator", extends = Navigator, hint(js(webidl)))]
 pub struct DomNavigator {
     base: Navigator,
     clipboard: Value,
     permissions: Value,
     user_activation: Value,
+    languages: Value,
+    /// `fetch` as it was when the document was installed; page script cannot replace it.
+    fetch: Value,
+    beacon_bytes: Rc<Cell<usize>>,
+    profile: NavigatorProfile,
+    realm: Weak<DomRealm>,
 }
+
+/// Fetch's limit on the bodies of in-flight `keepalive` requests.
+const KEEPALIVE_QUOTA: usize = 64 * 1024;
 
 impl lumen::embed::NativeIdentityOwner for DomNavigator {
     const TRACES_NATIVE_VALUES: bool=true;
     fn trace_native_identities(&self,_:u64,_:&mut dyn FnMut(&Value)){}
     fn trace_native_values(&self,visit:&mut dyn FnMut(&Value)) {
-        visit(&self.clipboard);visit(&self.permissions);visit(&self.user_activation);
+        visit(&self.clipboard);visit(&self.permissions);visit(&self.user_activation);visit(&self.languages);visit(&self.fetch);
     }
 }
 
 #[lumen_bind::methods]
 impl DomNavigator {
+    #[getter(name = "userAgent")]
+    fn user_agent(&self) -> String {
+        self.profile.user_agent.clone()
+    }
+
+    #[getter(name = "appVersion")]
+    fn app_version(&self) -> String {
+        let agent = &self.profile.user_agent;
+        agent.strip_prefix("Mozilla/").unwrap_or(agent).to_owned()
+    }
+
+    #[getter(name = "appName")]
+    fn app_name(&self) -> &'static str {
+        "Netscape"
+    }
+
+    #[getter(name = "appCodeName")]
+    fn app_code_name(&self) -> &'static str {
+        "Mozilla"
+    }
+
+    #[getter]
+    fn product(&self) -> &'static str {
+        "Gecko"
+    }
+
+    #[getter(name = "productSub")]
+    fn product_sub(&self) -> &'static str {
+        "20030107"
+    }
+
+    #[getter]
+    fn vendor(&self) -> String {
+        self.profile.vendor.clone()
+    }
+
+    #[getter(name = "vendorSub")]
+    fn vendor_sub(&self) -> &'static str {
+        ""
+    }
+
+    #[getter]
+    fn platform(&self) -> String {
+        self.profile.platform.clone()
+    }
+
+    #[getter]
+    fn language(&self) -> String {
+        self.profile.language.clone()
+    }
+
+    #[getter]
+    fn languages(&self) -> Value {
+        self.languages.clone()
+    }
+
+    #[getter(name = "hardwareConcurrency")]
+    fn hardware_concurrency(&self) -> u32 {
+        self.profile.hardware_concurrency
+    }
+
+    #[getter(name = "maxTouchPoints")]
+    fn max_touch_points(&self) -> u32 {
+        self.profile.max_touch_points
+    }
+
+    #[getter(name = "cookieEnabled")]
+    fn cookie_enabled(&self) -> bool {
+        self.profile.cookie_enabled
+    }
+
+    #[getter(name = "onLine")]
+    fn on_line(&self) -> bool {
+        self.profile.online
+    }
+
+    #[getter]
+    fn webdriver(&self) -> bool {
+        false
+    }
+
+    #[getter(name = "pdfViewerEnabled")]
+    fn pdf_viewer_enabled(&self) -> bool {
+        false
+    }
+
+    #[getter(name = "doNotTrack")]
+    fn do_not_track(&self) -> Nullable<String> {
+        Nullable(None)
+    }
+
+    #[method(name = "javaEnabled")]
+    fn java_enabled(&self) -> bool {
+        false
+    }
+
+    /// Queues a keepalive POST through the `fetch` captured at install. Per the Beacon API the
+    /// request is `no-cors` unless the body's content type is not CORS-safelisted, always sends
+    /// credentials, and is refused (`false`) when in-flight keepalive bodies would exceed 64 KiB.
+    /// Nothing throws once the request is handed to fetch.
+    #[method(name = "sendBeacon", coerce)]
+    fn send_beacon(&self, ctx: &mut Ctx, url: &str, data: Option<Value>) -> OpResult<bool> {
+        let base = self.realm.upgrade().map(|realm| realm.base_url());
+        let parsed = lumen_common::url::parse(url, base.as_deref())
+            .map_err(|_| OpError::type_error(format!("Invalid beacon URL '{url}'")))?;
+        if !matches!(parsed.scheme.as_str(), "http" | "https") {
+            return Err(OpError::type_error("sendBeacon only supports http and https URLs"));
+        }
+        let data = data.filter(|data| !matches!(data, Value::Undefined | Value::Null));
+        let (size, cors) = match &data {
+            Some(data) => {
+                let body = lumen_host::net::extract_body(ctx, data)?;
+                let safelisted = body
+                    .content_type
+                    .as_deref()
+                    .is_none_or(|kind| lumen_common::cors::is_no_cors_safelisted_header("content-type", kind));
+                (body.bytes.len(), !safelisted)
+            }
+            None => (0, false),
+        };
+        if size > KEEPALIVE_QUOTA.saturating_sub(self.beacon_bytes.get()) {
+            return Ok(false);
+        }
+        let init = Value::Obj(ctx.new_object());
+        for (name, value) in [
+            ("method", Value::str("POST")),
+            ("keepalive", Value::Bool(true)),
+            ("credentials", Value::str("include")),
+            ("mode", Value::str(if cors { "cors" } else { "no-cors" })),
+        ] {
+            ctx.member_set(&init, name, value).map_err(OpError::thrown)?;
+        }
+        if let Some(data) = data {
+            ctx.member_set(&init, "body", data).map_err(OpError::thrown)?;
+        }
+        let Ok(pending) = ctx.invoke(self.fetch.clone(), Value::Undefined, &[Value::from_string(url.to_owned()), init]) else {
+            return Ok(false);
+        };
+        self.beacon_bytes.set(self.beacon_bytes.get() + size);
+        let in_flight = self.beacon_bytes.clone();
+        let settled = ctx.new_native_fn(
+            "",
+            1,
+            Rc::new(move |_, _, _| {
+                in_flight.set(in_flight.get().saturating_sub(size));
+                Ok(Value::Undefined)
+            }),
+        );
+        ctx.then_value(pending, settled.clone(), settled);
+        Ok(true)
+    }
+
     #[getter]
     fn clipboard(&self) -> Value {
         self.clipboard.clone()
@@ -567,11 +764,23 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     let user_activation = ctx.new_instance(DomUserActivation {
         realm: Rc::downgrade(realm),
     });
+    let profile = ctx.op_state().get::<NavigatorProfile>().cloned().unwrap_or_default();
+    let languages = ctx.make_array(profile.languages.iter().map(|language| Value::str(language)).collect());
+    ctx.freeze_native_object(&languages);
+    let fetch = match ctx.member_get(&global, "fetch") {
+        Ok(fetch) if fetch.is_callable() => fetch,
+        _ => ctx.op_function::<lumen_host::net::fetch_bindings::fetch::Op>(),
+    };
     let navigator_data = DomNavigator {
         base: Navigator,
         clipboard,
         permissions,
         user_activation,
+        languages,
+        fetch,
+        beacon_bytes: Rc::new(Cell::new(0)),
+        profile,
+        realm: Rc::downgrade(realm),
     };
     let navigator = match existing {
         Value::Obj(_) => {
@@ -935,6 +1144,129 @@ mod tests {
         realm.pump_browser_services(engine.ctx()).unwrap();
         assert!(matches!(
             eval(&mut engine, "changes===1"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn navigator_reports_a_chrome_like_profile_and_a_frozen_language_list() {
+        let (mut engine, _realm) = install_engine();
+        assert!(matches!(
+            eval(&mut engine, r#"(() => {
+                const n = navigator;
+                if (!n.userAgent.startsWith('Mozilla/5.0 (X11; Linux aarch64)') || !n.userAgent.includes('Chrome/') || !n.userAgent.endsWith(' Lumen')) return false;
+                if (n.appVersion !== n.userAgent.slice('Mozilla/'.length)) return false;
+                if (n.platform !== 'Linux aarch64' || n.vendor !== 'Google Inc.' || n.appName !== 'Netscape' || n.product !== 'Gecko' || n.appCodeName !== 'Mozilla') return false;
+                if (n.language !== 'en-US' || n.languages.join() !== 'en-US,en' || n.languages !== n.languages || !Object.isFrozen(n.languages)) return false;
+                if (n.hardwareConcurrency < 1 || n.maxTouchPoints !== 0 || n.cookieEnabled !== true || n.onLine !== true || n.webdriver !== false) return false;
+                if (n.javaEnabled() !== false || n.doNotTrack !== null || n.productSub !== '20030107') return false;
+                return Object.getPrototypeOf(n) === Navigator.prototype && 'userAgent' in Navigator.prototype;
+            })()"#),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn navigator_profile_is_configurable_by_the_embedder() {
+        let mut engine = Engine::new();
+        set_navigator_profile(engine.ctx(), NavigatorProfile {
+            user_agent: "Mozilla/5.0 (Test) Probe".into(),
+            platform: "TestOS".into(),
+            language: "nl-NL".into(),
+            languages: vec!["nl-NL".into(), "nl".into()],
+            hardware_concurrency: 8,
+            max_touch_points: 5,
+            online: false,
+            ..NavigatorProfile::default()
+        });
+        let realm = super::super::install(engine.ctx(), "<main></main>", 32).unwrap();
+        install(engine.ctx(), &realm).unwrap();
+        assert!(matches!(
+            eval(&mut engine, "navigator.userAgent === 'Mozilla/5.0 (Test) Probe' && navigator.appVersion === '5.0 (Test) Probe' && navigator.platform === 'TestOS' && navigator.language === 'nl-NL' && navigator.languages.join() === 'nl-NL,nl' && navigator.hardwareConcurrency === 8 && navigator.maxTouchPoints === 5 && navigator.onLine === false"),
+            Value::Bool(true)
+        ));
+    }
+
+    const BEACON_FETCH: &str = "globalThis.calls = []; globalThis.fetch = (url, init) => { calls.push([url, init.method, init.keepalive, init.body, init.credentials, init.mode]); return Promise.reject(new Error('offline')); }; 0";
+
+    fn beacon_engine() -> (Engine, Rc<DomRealm>) {
+        let mut engine = Engine::new();
+        eval(&mut engine, BEACON_FETCH);
+        let realm = super::super::install(engine.ctx(), "<main></main>", 32).unwrap();
+        install(engine.ctx(), &realm).unwrap();
+        realm.set_document_url("https://beacon.test/page");
+        (engine, realm)
+    }
+
+    #[test]
+    fn send_beacon_posts_through_fetch_and_validates_the_url() {
+        let (mut engine, _realm) = beacon_engine();
+        assert!(matches!(
+            eval(&mut engine, r#"(() => {
+                if (navigator.sendBeacon('/log', 'payload') !== true) return false;
+                if (calls.length !== 1 || calls[0].join() !== '/log,POST,true,payload,include,no-cors') return false;
+                if (navigator.sendBeacon('https://other.test/x') !== true || calls.length !== 2 || calls[1][3] !== undefined) return false;
+                for (const bad of ['ftp://x.test/', 'javascript:1', 'http://']) {
+                    try { navigator.sendBeacon(bad, 'x'); return false; } catch (e) { if (!(e instanceof TypeError)) return false; }
+                }
+                try { navigator.sendBeacon(); return false; } catch (e) { return e instanceof TypeError && calls.length === 2; }
+            })()"#),
+            Value::Bool(true)
+        ));
+        while engine.run_one_job() {}
+    }
+
+    #[test]
+    fn send_beacon_ignores_a_fetch_replaced_by_the_page() {
+        let (mut engine, _realm) = beacon_engine();
+        assert!(matches!(
+            eval(&mut engine, r#"(() => {
+                let hijacked = 0;
+                globalThis.fetch = () => { hijacked++; return Promise.resolve(); };
+                const sent = navigator.sendBeacon('/log', 'x');
+                delete globalThis.fetch;
+                return sent === true && hijacked === 0 && calls.length === 1 && navigator.sendBeacon('/again', 'y') === true && calls.length === 2;
+            })()"#),
+            Value::Bool(true)
+        ));
+        while engine.run_one_job() {}
+    }
+
+    #[test]
+    fn send_beacon_uses_cors_only_for_unsafelisted_content_types() {
+        let (mut engine, _realm) = beacon_engine();
+        engine.define_lazy_globals::<lumen_host::blob::bindings::Module>().ok().unwrap();
+        engine.define_lazy_globals::<lumen_host::url::bindings::Module>().ok().unwrap();
+        assert!(matches!(
+            eval(&mut engine, r#"(() => {
+                navigator.sendBeacon('/a', new Blob(['{}'], { type: 'application/json' }));
+                navigator.sendBeacon('/b', new Blob(['x'], { type: 'text/plain' }));
+                navigator.sendBeacon('/c', new URLSearchParams({ k: 'v' }));
+                navigator.sendBeacon('/d', new Uint8Array([1, 2, 3]));
+                navigator.sendBeacon('/e', new Blob(['x']));
+                return calls.map(call => call[5]).join() === 'cors,no-cors,no-cors,no-cors,no-cors';
+            })()"#),
+            Value::Bool(true)
+        ));
+        while engine.run_one_job() {}
+    }
+
+    #[test]
+    fn send_beacon_enforces_the_keepalive_quota_until_requests_settle() {
+        let (mut engine, _realm) = beacon_engine();
+        assert!(matches!(
+            eval(&mut engine, r#"(() => {
+                const big = new Uint8Array(40 * 1024);
+                if (navigator.sendBeacon('/one', big) !== true) return false;
+                if (navigator.sendBeacon('/two', big) !== false || calls.length !== 1) return false;
+                if (navigator.sendBeacon('/huge', new Uint8Array(65 * 1024)) !== false) return false;
+                return navigator.sendBeacon('/small', 'tiny') === true && calls.length === 2;
+            })()"#),
+            Value::Bool(true)
+        ));
+        while engine.run_one_job() {}
+        assert!(matches!(
+            eval(&mut engine, "navigator.sendBeacon('/after', new Uint8Array(60 * 1024)) === true && calls.length === 3"),
             Value::Bool(true)
         ));
     }

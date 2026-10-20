@@ -1894,6 +1894,15 @@ fn packed_elements_do_not_duplicate_far_index_entries() {
 }
 
 #[test]
+fn htmldda_brand_is_per_object_and_leaves_other_callables_alone() {
+    assert_eq!(
+        run("const other=$262.createRealm(); const a=$262.IsHTMLDDA, b=other.IsHTMLDDA;
+             [typeof a,typeof b,!a,!b,a==null,b==undefined,a===b,typeof function(){},!!{},!!function(){},typeof a.call].join('|')"),
+        "undefined|undefined|true|true|true|true|false|function|true|true|function"
+    );
+}
+
+#[test]
 fn jit_linked_scan_preserves_loose_htmldda_null_semantics() {
     assert_eq!(
         run_bytecode(

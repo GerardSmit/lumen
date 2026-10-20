@@ -186,6 +186,16 @@ crate::event_content_handlers::bind_window_handlers! {
         }
     }
 
+    #[getter(name = "localStorage")]
+    fn local_storage(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        crate::web_storage::window_storage(ctx, self.base.associated_realm().as_ref(), false)
+    }
+
+    #[getter(name = "sessionStorage")]
+    fn session_storage(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        crate::web_storage::window_storage(ctx, self.base.associated_realm().as_ref(), true)
+    }
+
     #[getter]
     fn closed(&self) -> bool {
         self.base.associated_realm().and_then(|realm| realm.browsing_context())

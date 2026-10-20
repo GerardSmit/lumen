@@ -567,6 +567,8 @@ pub struct RenderSession {
     /// again, and the number of versions to wait after the next reduction.
     window_reduced: Option<(u64, u64)>,
     rendered_text_requested: bool,
+    selectable_text: bool,
+    selection: Option<(crate::ranges::Boundary, crate::ranges::Boundary)>,
     frame_id: u64,
     font_generation: u64,
     validity_generation: u64,
@@ -805,6 +807,8 @@ impl RenderSession {
             origin_refused: false,
             window_reduced: None,
             rendered_text_requested: false,
+            selectable_text: false,
+            selection: None,
             frame_id: 0,
             font_generation: 0,
             validity_generation: 0,
@@ -2835,6 +2839,29 @@ impl RenderSession {
         result
     }
 
+    /// The topmost node of the painted frame at the point, even when the
+    /// document changed since it was laid out; nodes removed since are skipped.
+    /// Pointer input targets what the user sees, so embedders use this instead
+    /// of waiting for the next layout.
+    pub fn painted_hit_test(&self, x_css: f32, y_css: f32) -> Option<NodeId> {
+        let frame = self.cached.as_ref()?;
+        if !x_css.is_finite() || !y_css.is_finite() || x_css < 0.0 || y_css < 0.0
+            || x_css >= frame.width as f32 || y_css >= frame.height as f32 {
+            return None;
+        }
+        frame.geometry.hits.iter().enumerate().rev().find_map(|(index, hit)| {
+            (frame.geometry.contains_hit(index, x_css, y_css) && self.painted_node_live(hit.node)).then_some(hit.node)
+        })
+    }
+
+    fn painted_node_live(&self, node: NodeId) -> bool {
+        match self.document.kind(node) {
+            Ok(NodeKind::Element { .. }) => self.document.is_connected_element(node),
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
     /// Visit hit regions from topmost to bottommost without allocating a list.
     /// Returning false from the visitor stops the walk. The return value says
     /// whether the point belongs to a current completed viewport, including a
@@ -3656,6 +3683,46 @@ impl RenderSession {
         self.rendered_text_requested = false;
     }
 
+    /// Record the geometry of document text so it can be selected (see
+    /// [`caret_position_from_point`](Self::caret_position_from_point)). The
+    /// retained layout is made again once, with the records.
+    pub fn set_selectable_text(&mut self, enabled: bool) {
+        if self.selectable_text != enabled {
+            self.selectable_text = enabled;
+            if enabled {
+                self.discard_frame();
+                self.layout_cache.clear();
+                self.frame_id += 1;
+            }
+        }
+    }
+
+    pub fn selectable_text(&self) -> bool {
+        self.selectable_text
+    }
+
+    /// The text runs and display list of the last completed layout, and
+    /// whether the document is unchanged since. A changed document keeps the
+    /// frame that is painted: its geometry stays consistent, and a user of it
+    /// checks the nodes it names.
+    pub(crate) fn text_run_frame(&self) -> Option<(&[layout::ControlTextRun], &[crate::paint::Command], bool)> {
+        let frame = self.cached.as_ref().filter(|frame| frame.geometry.collect_text_runs)?;
+        Some((&frame.geometry.control_text_runs, &frame.list.0, frame.document_version == self.document.version()))
+    }
+
+    pub(crate) fn selection_state(&self) -> Option<(crate::ranges::Boundary, crate::ranges::Boundary)> {
+        self.selection
+    }
+
+    pub(crate) fn store_selection(&mut self, selection: Option<(crate::ranges::Boundary, crate::ranges::Boundary)>) -> bool {
+        if self.selection == selection {
+            return false;
+        }
+        self.selection = selection;
+        self.paint_revision = self.paint_revision.wrapping_add(1);
+        true
+    }
+
     pub(crate) fn rendered_text_boxes(&self) -> Option<&[layout::RenderedTextBox]> {
         let frame = self.cached.as_ref()?;
         (frame.document_version == self.document.version() && frame.geometry.collect_rendered_text)
@@ -3948,6 +4015,7 @@ impl RenderSession {
                 && cached.height == height
                 && cached.image_generation == image_generation
                 && (!self.rendered_text_requested || cached.geometry.collect_rendered_text)
+                && (!self.selectable_text || cached.geometry.collect_text_runs)
         });
         if !fresh {
             let retry_cached_failure = self.failed_frame.as_ref().filter(|failed| {
@@ -4138,6 +4206,7 @@ impl RenderSession {
         let (mut list, mut geometry) = loop {
             let mut geometry = layout::LayoutGeometry::default();
             geometry.collect_rendered_text = self.rendered_text_requested;
+            geometry.collect_text_runs = self.selectable_text;
             let list = {
         let node_images = NodeImages {
             color_schemes:self.media_environment().color_schemes,
@@ -4149,9 +4218,11 @@ impl RenderSession {
             fallback: images,
             pending: Default::default(),
         };
+                let selectable_text = self.selectable_text;
                 let fresh = |collect_rendered_text: bool| {
                     let mut geometry = layout::LayoutGeometry::default();
                     geometry.collect_rendered_text = collect_rendered_text;
+                    geometry.collect_text_runs = selectable_text;
                     geometry
                 };
                 let mut lay_out = |window: Option<f32>, geometry: &mut layout::LayoutGeometry| {

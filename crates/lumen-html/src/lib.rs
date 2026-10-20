@@ -35,6 +35,7 @@ pub mod render_capture;
 pub mod ranges;
 pub mod highlights;
 pub mod rendered_text;
+pub mod selection;
 pub mod selector;
 pub mod session;
 pub mod stylesheet_loading;

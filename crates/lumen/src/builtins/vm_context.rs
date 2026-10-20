@@ -293,9 +293,7 @@ impl Interp {
         let realm = self.realms[&gptr].snapshot_clone();
         self.restore_realm(&realm);
         // The test262 host hook is not part of a context's global.
-        if g.borrow_mut().props.remove("$262") {
-            self.htmldda.pop();
-        }
+        g.borrow_mut().props.remove("$262");
         let handler = Object::new(None);
         self.def_method(&handler, "get", 3, trap_get);
         self.def_method(&handler, "set", 4, trap_set);

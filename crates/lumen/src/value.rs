@@ -1274,6 +1274,9 @@ pub struct Object {
     /// caches check this byte on the receiver and take the checked path when clear, so ONE proxy
     /// existing somewhere doesn't disable the caches for every plain object in the program.
     pub(crate) ic_plain: Cell<bool>,
+    /// `[[IsHTMLDDA]]` brand (`document.all`, `$262.IsHTMLDDA`): `typeof` "undefined", falsy,
+    /// loosely equal to null and undefined. Always set together with a clear `ic_plain`.
+    pub(crate) html_dda: Cell<bool>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: the internal-reference count (low bits) and mark bit ([`GC_MARK`]) while
@@ -1504,6 +1507,7 @@ impl Object {
                 exotic: Exotic::None,
                 extensible: true,
                 ic_plain: Cell::new(true),
+                html_dda: Cell::new(false),
                 is_constructor: false,
                 gc_internal: Cell::new(0),
             }));
@@ -1550,6 +1554,7 @@ impl Object {
                 exotic: Exotic::Array,
                 extensible: true,
                 ic_plain: Cell::new(true),
+                html_dda: Cell::new(false),
                 is_constructor: false,
                 gc_internal: Cell::new(0),
             }));
@@ -1725,6 +1730,7 @@ impl Object {
                     exotic,
                     extensible: true,
                     ic_plain: Cell::new(true),
+                    html_dda: Cell::new(false),
                     is_constructor: false,
                     gc_internal: Cell::new(0),
                 },

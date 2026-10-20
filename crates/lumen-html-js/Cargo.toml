@@ -6,7 +6,11 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["bundled-fonts"]
+default = ["bundled-fonts", "compiler"]
+# Select how build.rs precompiles the Performance Timeline glue (see `performance_extension`):
+# bytecode with `compiler`, a native AOT blob with `aot-native`, source evaluation with neither.
+compiler = []
+aot-native = ["dep:lumen-aot"]
 bundled-fonts = ["lumen-html-text/bundled-fonts", "lumen-html-image/bundled-fonts"]
 
 [dependencies]
@@ -19,6 +23,10 @@ lumen-html-text = { path = "../lumen-html-text", default-features = false, featu
 lumen-common = { path = "../lumen-common", features = ["cookies", "csp", "object-mime"] }
 lumen-timers = { path = "../lumen-timers" }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+
+[build-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
+lumen-aot = { path = "../lumen-aot", features = ["native"], optional = true }
 
 [dev-dependencies]
 lumen = { path = "../lumen", default-features = false, features = ["embed", "compiler"] }

@@ -793,6 +793,7 @@ impl Style {
                 "hidden"
             }
             .into(),
+            "user-select" | "-webkit-user-select" => self.user_select.as_str().into(),
             "pointer-events" => if self.pointer_events_auto {
                 "auto"
             } else {

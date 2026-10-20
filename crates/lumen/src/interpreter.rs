@@ -1174,9 +1174,6 @@ pub struct Interp {
     /// constructor may explicitly return a platform object instead, which lets derived JS
     /// constructors bind `this` to an existing host object without changing other built-ins.
     pub(crate) native_super_return_overrides: Vec<Option<Value>>,
-    /// The `$262.IsHTMLDDA` objects, one per realm (emulate `document.all`): typeof "undefined",
-    /// falsy, and loosely equal to undefined/null, despite being callable Objects.
-    pub(crate) htmldda: Vec<Gc>,
     /// The caller's realm during a cross-realm [[Construct]]: the spec pops the callee context
     /// before throwing a derived constructor's return/`this` validation errors, so those errors
     /// belong to the caller's realm.
@@ -2092,7 +2089,6 @@ impl Interp {
             new_target: Value::Undefined,
             pending_new_target: Value::Undefined,
             native_super_return_overrides: Vec::new(),
-            htmldda: Vec::new(),
             ctor_caller_realm: None,
             realms: Default::default(),
             unhandled_rejections: Default::default(),
@@ -5377,10 +5373,20 @@ impl Interp {
         }
     }
 
+    /// Make `value` an [[IsHTMLDDA]] object: `typeof` reports "undefined", it is falsy and loosely
+    /// equal to `null` and `undefined` (HTML's `document.all`).
+    pub fn mark_html_dda(&mut self, value: &Value) {
+        if let Value::Obj(object) = value {
+            let object = object.borrow();
+            object.html_dda.set(true);
+            object.ic_plain.set(false);
+        }
+    }
+
     /// Whether `v` is the [[IsHTMLDDA]] object.
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
         match v {
-            Value::Obj(o) => self.htmldda.iter().any(|d| Gc::ptr_eq(o, d)),
+            Value::Obj(o) => o.borrow().html_dda.get(),
             _ => false,
         }
     }

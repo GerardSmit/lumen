@@ -9469,6 +9469,8 @@ pub(crate) struct LayoutGeometry {
     pub transform_timeline_values:Option<alloc::boxed::Box<crate::animation::progress_timelines::TransformTimelineValues>>,
     transform_reference_boxes:Option<alloc::boxed::Box<TransformReferenceBoxes>>,
     pub collect_rendered_text: bool,
+    /// Record every painted document text token for selection.
+    pub collect_text_runs: bool,
     pub rendered_text_boxes: Vec<RenderedTextBox>,
     pub rendered_text_bytes: usize,
     pub rendered_table_members: Vec<RenderedTableMember>,
@@ -9779,6 +9781,59 @@ pub struct ControlTextRun {
     pub transform: crate::paint::Affine,
     /// Inline writing-mode coordinate frame, separate from CSS transforms.
     pub(crate) orientation: Affine,
+    /// Set for a run of ordinary document text, which selection addresses.
+    pub(crate) selectable: Option<SelectableRun>,
+}
+
+/// One painted token of document text and the paragraph it belongs to.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectableRun {
+    pub paragraph: Arc<SelectableParagraph>,
+    /// `user-select` of the run's text; a `none` run still absorbs presses.
+    pub select: css::UserSelect,
+}
+
+/// The rendered text of one inline formatting context and where each DOM text
+/// node sits in it.
+#[derive(Debug)]
+pub(crate) struct SelectableParagraph {
+    pub text: Arc<str>,
+    pub pieces: Vec<SelectablePiece>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SelectablePiece {
+    pub node: NodeId,
+    /// UTF-8 byte range of the node's rendered text in the paragraph.
+    pub range: Range<usize>,
+    /// The rendered byte at every character start of the node's text and at
+    /// its end, in source order. Collapsed whitespace repeats a byte.
+    pub bytes: Box<[u32]>,
+    /// The UTF-16 offset of each entry of `bytes`; `None` when entry `i` is
+    /// offset `i` (no character outside the BMP).
+    pub units: Option<Box<[u32]>>,
+}
+
+impl SelectablePiece {
+    fn from_offsets(node: NodeId, range: Range<usize>, offsets: &[(usize, usize)]) -> Result<Self, LayoutError> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(offsets.len()).map_err(|_| LayoutError::CommandLimit)?;
+        bytes.extend(offsets.iter().map(|&(_, byte)| byte as u32));
+        let identity = offsets.iter().enumerate().all(|(index, &(unit, _))| unit == index);
+        let units = if identity {
+            None
+        } else {
+            let mut units = Vec::new();
+            units.try_reserve_exact(offsets.len()).map_err(|_| LayoutError::CommandLimit)?;
+            units.extend(offsets.iter().map(|&(unit, _)| unit as u32));
+            Some(units.into_boxed_slice())
+        };
+        Ok(Self { node, range, bytes: bytes.into_boxed_slice(), units })
+    }
+
+    pub(crate) fn unit(&self, index: usize) -> usize {
+        self.units.as_ref().map_or(index, |units| units[index] as usize)
+    }
 }
 
 /// A planned [`LayoutGeometry::scroll_root`]: the region, the translation of
@@ -10219,7 +10274,11 @@ impl LayoutGeometry {
             if let Some(matrix)=clip.source_transform.as_mut(){let moved=(**matrix).translated_space(dx,dy);*Arc::make_mut(matrix)=moved;}
         }
         for run in &mut self.control_text_runs {
-            if run.hit_index.is_some_and(|index| hits.contains(&index)) {
+            // Document text may be tied to a box outside the scope (a scroller
+            // holding it), so its painted glyphs say whether it moves.
+            let moves = run.hit_index.is_some_and(|index| hits.contains(&index))
+                || (run.selectable.is_some() && run.command_index.is_some_and(|index| scope.commands.contains(&index)));
+            if moves {
                 run.x += dx;
                 run.y += dy;
                 run.baseline_y += dy;
@@ -25852,6 +25911,37 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         self.geometry.as_ref().is_some_and(|geometry| geometry.collect_rendered_text)
     }
 
+    fn collects_text_runs(&self) -> bool {
+        self.geometry.as_ref().is_some_and(|geometry| geometry.collect_text_runs)
+    }
+
+    /// The hit of the box that holds the text node `node`, found among the
+    /// few hits recorded just before `before`; `None` when none of them is an
+    /// ancestor, so a text run is never tied to an unrelated box.
+    fn enclosing_box_hit(&self, before: usize, node: NodeId) -> Option<usize> {
+        const SEARCH: usize = 16;
+        let hits = &self.geometry.as_ref()?.hits;
+        (before.saturating_sub(SEARCH)..before.min(hits.len())).rev().find(|&index| {
+            let mut current = Some(node);
+            while let Some(id) = current {
+                if id == hits[index].node {
+                    return true;
+                }
+                current = self.document.parent(id).ok().flatten();
+            }
+            false
+        })
+    }
+
+    fn selectable_paragraph(paragraph: &InlineParagraph) -> Result<SelectableParagraph, LayoutError> {
+        let mut pieces = Vec::new();
+        pieces.try_reserve(paragraph.rendered_sources.len()).map_err(|_| LayoutError::CommandLimit)?;
+        for source in &paragraph.rendered_sources {
+            pieces.push(SelectablePiece::from_offsets(source.node, source.range.clone(), &source.highlight_offsets)?);
+        }
+        Ok(SelectableParagraph { text: Arc::from(paragraph.text.as_str()), pieces })
+    }
+
     fn paragraph_append_dom_text(&self, paragraph: &mut InlineParagraph, value: &str,
         node: NodeId, style_node: NodeId, style: &Style, frames: &[usize]) -> Result<(), LayoutError> {
         let start = paragraph.text.len();
@@ -25865,6 +25955,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }
         }
+        if self.collects_text_runs() && style.visibility_visible {
+            let mut units = 0;
+            highlight_offsets.try_reserve(value.chars().count() + 1).map_err(|_| LayoutError::CommandLimit)?;
+            for character in value.chars() {
+                highlight_offsets.push((units, 0));
+                units += character.len_utf16();
+            }
+            highlight_offsets.push((units, 0));
+        }
         highlight_offsets.sort_unstable_by_key(|(source, _)| *source);
         highlight_offsets.dedup_by_key(|(source, _)| *source);
         charge_inline_split_storage(paragraph, highlight_offsets.len().checked_mul(core::mem::size_of::<(usize, usize)>())
@@ -25874,7 +25973,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         if style.text_transform != css::TextTransform::None || self.rules.has_typographic_content() {
             Self::record_case_source(paragraph, node, None, start)?;
         }
-        if (self.collects_rendered_text() || !self.document.highlights.is_empty()) && style.visibility_visible && start < end {
+        if (self.collects_rendered_text() || self.collects_text_runs() || !self.document.highlights.is_empty()) && style.visibility_visible && start < end {
             if paragraph.rendered_sources.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
             paragraph.rendered_sources.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
             paragraph.rendered_sources.push(RenderedTextSource { node, range: start..end, highlight_offsets });
@@ -29381,6 +29480,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             .map_or(frame_hit_start, |geometry| geometry.hits.len());
 
         let mut rendered_text = None;
+        let mut selectable_paragraph: Option<Arc<SelectableParagraph>> = None;
         let mut decoration_surfaces=Vec::<InlineDecorationSurface>::new();
         for paragraph_index in 0..bidi.paragraphs.len() {
             let paragraph_range = bidi.paragraphs[paragraph_index].range.clone();
@@ -30132,7 +30232,47 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                     password: paragraph.control_password,
                                     transform: crate::paint::Affine::IDENTITY,
                                     orientation: Affine::IDENTITY,
+                                    selectable: None,
                                 });
+                            }
+                        }
+                    }
+                    if paragraph.control_node.is_none() && token.command.is_some() && self.collects_text_runs() {
+                        if let (Some(range), Some(style)) = (token.source_range.as_ref(), token.style.as_ref()) {
+                            if style.visibility_visible && !paragraph.rendered_sources.is_empty() {
+                                if selectable_paragraph.is_none() {
+                                    selectable_paragraph = Some(Arc::new(Self::selectable_paragraph(paragraph)?));
+                                }
+                                let shared = selectable_paragraph.clone().ok_or(LayoutError::InvalidTree)?;
+                                let node = shared.pieces.iter().find(|piece| piece.range.end > range.start).or(shared.pieces.last()).map(|piece| piece.node);
+                                let hit_index = token.frames.last().and_then(|frame| paragraph.frames[*frame].hit).or_else(|| node.and_then(|node| self.enclosing_box_hit(frame_hit_start, node)));
+                                let baseline_y = *cursor + self.baseline(style) + token.vertical_shift;
+                                if let (Some(node), Some(geometry)) = (node, self.geometry.as_mut()) {
+                                    if geometry.control_text_runs.len() >= MAX_DISPLAY_COMMANDS {
+                                        return Err(LayoutError::CommandLimit);
+                                    }
+                                    geometry.control_text_runs.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+                                    geometry.control_text_runs.push(ControlTextRun {
+                                        node,
+                                        range: range.clone(),
+                                        display_range: range.clone(),
+                                        hit_index,
+                                        command_index: token.command,
+                                        x: token_x,
+                                        y: *cursor,
+                                        width: token.width,
+                                        height,
+                                        baseline_y,
+                                        rtl: token.rtl,
+                                        font_size: style.font_size,
+                                        font: style.font.clone(),
+                                        placeholder: false,
+                                        password: false,
+                                        transform: crate::paint::Affine::IDENTITY,
+                                        orientation: Affine::IDENTITY,
+                                        selectable: Some(SelectableRun { paragraph: shared, select: style.user_select }),
+                                    });
+                                }
                             }
                         }
                     }
@@ -35800,6 +35940,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         password,
                         transform: crate::paint::Affine::IDENTITY,
                         orientation: Affine::IDENTITY,
+                        selectable: None,
                     });
                 }
             }
@@ -39075,8 +39216,10 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         return Ok(list);
     }
     let collect_rendered_text = geometry.collect_rendered_text;
+    let collect_text_runs = geometry.collect_text_runs;
     *geometry = LayoutGeometry::default();
     geometry.collect_rendered_text = collect_rendered_text;
+    geometry.collect_text_runs = collect_text_runs;
     geometry.origin_layout_refused = true;
     laid_out_display_list(document, width, height, text, rules, images, Some(geometry), scrolls, style_cache,
         retained_fragments, presentation_root, canvas_background, drawable_snapshot, timeline_values, scroll_window, false)
@@ -39204,8 +39347,8 @@ fn laid_out_display_list(
     let Some(html)=html else {
         if let Some(cache)=layout.retained_fragments.as_deref_mut() {cache.clear();}
         if let Some(geometry)=layout.geometry.as_deref_mut() {
-            let collect_rendered_text=geometry.collect_rendered_text;
-            *geometry=LayoutGeometry::default();geometry.collect_rendered_text=collect_rendered_text;
+            let collect_rendered_text=geometry.collect_rendered_text;let collect_text_runs=geometry.collect_text_runs;
+            *geometry=LayoutGeometry::default();geometry.collect_rendered_text=collect_rendered_text;geometry.collect_text_runs=collect_text_runs;
         }
         layout.finish_root_scroll_extent()?;
         return layout.finish_display_list().map(|list| (list, false));

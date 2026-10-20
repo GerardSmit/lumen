@@ -24,6 +24,10 @@ pub(crate) enum DescendantFilter {
     Name(String),
     WindowNamed(String),
     FormNamedImages(NodeId, String),
+    /// `document.links`: `a` and `area` elements with an `href`.
+    Links,
+    /// `document.anchors`: `a` elements with a `name`.
+    Anchors,
 }
 
 impl DescendantFilter {
@@ -85,6 +89,16 @@ impl DescendantFilter {
                             == Some(wanted.as_str());
                     has_id || has_named_legacy_element
                 }
+            }
+            Self::Links => {
+                matches!(namespace, Namespace::Html)
+                    && (name.as_str() == "a" || name.as_str() == "area")
+                    && document.get_attribute_ns_ref(id, None, "href")?.is_some()
+            }
+            Self::Anchors => {
+                matches!(namespace, Namespace::Html)
+                    && name.as_str() == "a"
+                    && document.get_attribute_ns_ref(id, None, "name")?.is_some()
             }
             Self::FormNamedImages(form, wanted) => {
                 matches!(namespace, Namespace::Html)
@@ -1067,6 +1081,81 @@ impl DomHtmlCollection {
     }
 }
 
+/// `document.all`: every element of the document, an [[IsHTMLDDA]] object like in browsers.
+#[lumen_bind::class(name = "HTMLAllCollection", hint(js(webidl, named_properties)))]
+pub struct DomHtmlAllCollection {
+    base: DomHtmlCollection,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomHtmlAllCollection {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_values(&self.base, visit);
+    }
+    fn trace_native_identities(&self, epoch: u64, visit: &mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_identities(&self.base, epoch, visit);
+    }
+}
+
+impl DomHtmlAllCollection {
+    pub(crate) fn create(ctx: &mut Ctx, base: DomNodeList) -> Value {
+        let value = ctx.new_instance(Self { base: DomHtmlCollection { base } });
+        ctx.set_native_identity_owner::<Self>(&value).ok().expect("HTMLAllCollection identity owner");
+        ctx.mark_html_dda(&value);
+        value
+    }
+}
+
+#[lumen_bind::methods]
+impl DomHtmlAllCollection {
+    #[method(hint(js(named_supported)))]
+    fn named_supported(&self, name: &str) -> OpResult<bool> {
+        self.base.base.supports_html_collection_name(name, false)
+    }
+
+    #[method(hint(js(named_names)))]
+    fn named_names(&self) -> OpResult<Vec<String>> {
+        self.base.base.html_collection_names(false)
+    }
+
+    #[method(hint(js(named_getter)))]
+    fn named_getter(&self, ctx: &mut Ctx, name: &str) -> OpResult<Value> {
+        self.base.base.html_collection_named_item(ctx, name, false)
+    }
+
+    #[proto(len)]
+    fn length(&self) -> OpResult<usize> {
+        self.base.base.length()
+    }
+
+    #[proto(getitem)]
+    fn indexed(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
+        self.base.base.indexed(ctx, index)
+    }
+
+    #[method(coerce)]
+    fn item(&self, ctx: &mut Ctx, name_or_index: Value) -> OpResult<Value> {
+        if let Value::Num(index) = name_or_index {
+            if index >= 0.0 && index.fract() == 0.0 {
+                return self.base.base.item(ctx, index as usize);
+            }
+            return Ok(Value::Null);
+        }
+        let name = ctx.coerce_string(&name_or_index).map_err(OpError::thrown)?.to_string();
+        self.base.base.html_collection_named_item(ctx, &name, false)
+    }
+
+    #[method(name = "namedItem", coerce)]
+    fn named_item(&self, ctx: &mut Ctx, name: &str) -> OpResult<Value> {
+        self.base.base.html_collection_named_item(ctx, name, false)
+    }
+
+    #[proto(iter)]
+    fn values(&self, this: This<Value>) -> DomCollectionIterator {
+        DomCollectionIterator { collection: this.0, index: Cell::new(0) }
+    }
+}
+
 #[lumen_bind::class(
     name = "HTMLFormControlsCollection",
     extends = DomHtmlCollection,
@@ -1647,5 +1736,72 @@ impl DomTokenList {
             collection: this.0,
             index: Cell::new(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod document_collection_tests {
+    use super::*;
+    use lumen::Engine;
+
+    fn check(markup: &str, source: &str) {
+        let mut engine = Engine::new();
+        install(engine.ctx(), markup, 256).unwrap();
+        let wrapped = format!("(()=>{{{source}}})()");
+        match engine.eval_value(&wrapped).unwrap() {
+            Ok(Value::Bool(true)) => {}
+            _ => panic!("document collection check failed: {source}"),
+        }
+    }
+
+    #[test]
+    fn html_document_is_a_distinct_interface_inheriting_document() {
+        check("<body></body>", r#"
+            if (HTMLDocument === Document || Object.getPrototypeOf(HTMLDocument.prototype) !== Document.prototype) return false;
+            if (Object.getPrototypeOf(HTMLDocument) !== Document) return false;
+            if (!(document instanceof HTMLDocument) || !(document instanceof Document) || document.constructor !== HTMLDocument) return false;
+            if (Object.prototype.toString.call(document) !== '[object HTMLDocument]') return false;
+            if (!(document.implementation.createHTMLDocument('x') instanceof HTMLDocument)) return false;
+            const xml = document.implementation.createDocument(null, 'root');
+            if (!(xml instanceof XMLDocument) || xml instanceof HTMLDocument) return false;
+            if (new Document() instanceof HTMLDocument || !(new Document() instanceof Document)) return false;
+            try { new HTMLDocument(); return false; } catch (e) { return e instanceof TypeError; }
+        "#);
+    }
+
+    #[test]
+    fn document_exposes_live_scripts_images_embeds_links_anchors_and_forms() {
+        check(
+            "<body><script id=s1></script><img id=i1 name=pic><embed><a href='/x' name=top>x</a><a name=only>y</a><a>none</a><area href='/m'><form id=f></form></body>",
+            r#"
+            const names = c => Array.from(c, e => e.localName).join();
+            if (names(document.scripts) !== 'script' || names(document.images) !== 'img' || names(document.embeds) !== 'embed') return false;
+            if (document.plugins !== document.embeds || document.scripts !== document.scripts) return false;
+            if (names(document.links) !== 'a,area' || names(document.anchors) !== 'a,a' || names(document.forms) !== 'form') return false;
+            if (document.applets.length !== 0) return false;
+            if (!(document.scripts instanceof HTMLCollection) || document.scripts.namedItem('s1') !== document.scripts[0]) return false;
+            const added = document.createElement('script');
+            document.body.append(added);
+            const svgScript = document.createElementNS('http://www.w3.org/2000/svg', 'script');
+            document.body.append(svgScript);
+            if (document.scripts.length !== 2 || document.scripts[1] !== added) return false;
+            document.querySelector('a:not([href]):not([name])').setAttribute('href', '/late');
+            return document.links.length === 3 && document.images.namedItem('pic') === document.images[0];
+        "#,
+        );
+    }
+
+    #[test]
+    fn document_all_is_an_undetectable_collection_of_every_element() {
+        check("<html><head></head><body><p id=p></p><p></p></body></html>", r#"
+            const all = document.all;
+            if (typeof all !== 'undefined' || all) return false;
+            if (!(all == null) || all === undefined || all === null) return false;
+            if (all.length !== document.getElementsByTagName('*').length || all[0] !== document.documentElement) return false;
+            if (all.item(0) !== all[0] || all.item('p') !== document.getElementById('p') || all.namedItem('p') !== all.p) return false;
+            if (all.item(9999) !== null || document.all !== all || !(all instanceof HTMLAllCollection)) return false;
+            document.body.append(document.createElement('i'));
+            return all.length === document.getElementsByTagName('*').length && Array.from(all).length === all.length;
+        "#);
     }
 }

@@ -603,6 +603,8 @@ pub(crate) struct BrowsingContext {
     insertion_order: u64,
     target_name: RefCell<String>,
     source_bytes: Cell<usize>,
+    /// `sessionStorage` of a top-level traversable; nested contexts use their top-level one.
+    session_storage: RefCell<Option<lumen_common::web_storage::SharedBackend>>,
 }
 
 struct BrowsingContextService {
@@ -1566,6 +1568,7 @@ impl BrowsingContext {
             insertion_order: 0,
             target_name: RefCell::new(String::new()),
             source_bytes: Cell::new(0),
+            session_storage: RefCell::new(None),
         });
         context
             .make_window_proxy(ctx)
@@ -1711,6 +1714,18 @@ impl BrowsingContext {
         self.realm.borrow().clone()
     }
 
+    /// The active documents of every browsing context sharing this context's group, with the
+    /// realm each one runs in.
+    pub(crate) fn group_documents(&self) -> Vec<(Rc<DomRealm>, RealmHandle)> {
+        let Some(group) = self.group.upgrade() else { return Vec::new() };
+        let contexts = group.contexts.borrow();
+        contexts
+            .values()
+            .filter(|context| context.is_active())
+            .filter_map(|context| Some((context.document()?, context.realm_handle())))
+            .collect()
+    }
+
     pub(crate) fn document(&self) -> Option<Rc<DomRealm>> {
         self.document.borrow().clone()
     }
@@ -1756,7 +1771,16 @@ impl BrowsingContext {
         if let Some(group)=self.group.upgrade(){group.pending_retired.borrow_mut().extend(retired);}
     }
 
-    fn top_context(self: &Rc<Self>) -> Rc<Self> {
+    /// The in-memory `sessionStorage` backend of this context's top-level traversable.
+    pub(crate) fn session_storage_backend(self: &Rc<Self>) -> lumen_common::web_storage::SharedBackend {
+        self.top_context()
+            .session_storage
+            .borrow_mut()
+            .get_or_insert_with(lumen_common::web_storage::MemoryBackend::shared)
+            .clone()
+    }
+
+    pub(crate) fn top_context(self: &Rc<Self>) -> Rc<Self> {
         let mut current = self.clone();
         while let Some(parent) = current.parent_context() {
             current = parent;
@@ -2282,6 +2306,7 @@ impl DomRealm {
             insertion_order,
             target_name: RefCell::new(target_name),
             source_bytes: Cell::new(source.len()),
+            session_storage: RefCell::new(None),
         });
         let proxy = match child.make_window_proxy(ctx) {
             Ok(proxy) => proxy,

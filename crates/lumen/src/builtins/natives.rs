@@ -77,8 +77,7 @@ fn has_fast_properties(_i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value,
 /// null and undefined.
 fn get_undetectable(i: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, Value> {
     let ddda = i.make_native("Undetectable", 0, |_i, _t, _a| Ok(Value::Null));
-    ddda.borrow().ic_plain.set(false);
-    i.htmldda.push(ddda.clone());
+    i.mark_html_dda(&Value::Obj(ddda.clone()));
     Ok(Value::Obj(ddda))
 }
 

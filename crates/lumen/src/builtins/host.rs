@@ -30,11 +30,10 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             Some(Value::Str(s)) if s.is_empty() => Ok(Value::Null),
             _ => Ok(Value::Null),
         });
-        it.htmldda.push(ddda.clone());
         // An [[IsHTMLDDA]] object is falsy and compares loosely equal to undefined/null; fast
         // paths that assume neither of an ordinary object gate on the receiver's `ic_plain`
-        // byte — clear it so this object always takes the checked path.
-        ddda.borrow().ic_plain.set(false);
+        // byte, which `mark_html_dda` clears so this object always takes the checked path.
+        it.mark_html_dda(&Value::Obj(ddda.clone()));
         set_builtin(&host, "IsHTMLDDA", Value::Obj(ddda));
     }
     it.def_method(&host, "createRealm", 0, |i, _t, _a| {

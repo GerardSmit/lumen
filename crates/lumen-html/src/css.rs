@@ -816,6 +816,13 @@ impl TextAlign {
         matches!(self, Self::Justify | Self::JustifyAll)
     }
 }
+/// Computed `user-select`. `auto`, `text` and `contain` select as text.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UserSelect { #[default] Text, None, All }
+impl UserSelect {
+    pub const fn as_str(self) -> &'static str { match self { Self::Text => "auto", Self::None => "none", Self::All => "all" } }
+}
+
 /// Inline overflow paint policy (CSS Overflow 3 §5.1).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TextOverflow { #[default] Clip, Ellipsis }
@@ -2631,6 +2638,8 @@ pub struct StyleExtras {
     /// table track suppression does not erase the shared visibility value.
     pub visibility_collapsed: bool,
     pub pointer_events_auto: bool,
+    /// Computed `user-select`; inherited, so text below `none` cannot be selected.
+    pub user_select: UserSelect,
     /// Inherited SVG paint properties used by the shared vector renderer.
     pub svg_fill: SvgPaint,
     pub svg_stroke: SvgPaint,
@@ -2882,6 +2891,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     visibility_visible: true,
     visibility_collapsed: false,
     pointer_events_auto: true,
+    user_select: UserSelect::Text,
     svg_fill: SvgPaint::Color(Rgba {
         r: 0,
         g: 0,
@@ -5669,6 +5679,7 @@ enum Value {
     },
     Visibility { visible: bool, collapsed: bool },
     PointerEvents(bool),
+    UserSelect(UserSelect),
     IntrinsicSize(usize, IntrinsicSizing),
     EmptyCellsHide(bool),
     CaptionBottom(bool),
@@ -5731,6 +5742,7 @@ impl Value {
             Self::ContainIntrinsic(slot,_) => *slot,
             Self::Visibility { .. } => 101,
             Self::PointerEvents(_) => 177,
+            Self::UserSelect(_) => 264,
             Self::IntrinsicSize(slot, _) => *slot,
             Self::EmptyCellsHide(_) => 102,
             Self::CaptionBottom(_) => 127,
@@ -6380,6 +6392,7 @@ impl Value {
                 style.visibility_collapsed = *collapsed;
             }
             Self::PointerEvents(value) => style.pointer_events_auto = *value,
+            Self::UserSelect(value) => style.user_select = *value,
             Self::IntrinsicSize(slot, value) => {
                 style.set_intrinsic_size_keyword(*slot, Some(*value));
                 match slot {
@@ -11099,7 +11112,7 @@ struct PropertyRegistration {
     in_all: bool,
 }
 
-const PROPERTY_COUNT: usize = 264;
+const PROPERTY_COUNT: usize = 265;
 
 const fn same_property_name(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
@@ -11538,6 +11551,8 @@ property_registry! {
     "contain-intrinsic-size" => [234,235], false, true;
     "visibility" => [101], true, true;
     "pointer-events" => [177], true, true;
+    "user-select" => [264], true, true;
+    "-webkit-user-select" => [264], true, true;
     "empty-cells" => [102], true, true;
     "caption-side" => [127], true, true;
     "border-collapse" => [128], true, true;
@@ -11668,7 +11683,7 @@ pub fn transition_value_kind(property: &str) -> TransitionValueKind {
         | "grid-lanes-direction" | "grid-lanes-pack" | "position" | "float" | "clear"
         | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" | "table-layout" | "border-collapse"
         | "empty-cells" | "caption-side" | "column-fill" | "list-style-type"
-        | "list-style-position" | "list-style-image" | "pointer-events"
+        | "list-style-position" | "list-style-image" | "pointer-events" | "user-select" | "-webkit-user-select"
         | "white-space" | "word-break" | "overflow-wrap" | "word-wrap" | "text-transform"
         | "text-align" | "text-overflow" | "text-decoration-line" | "text-decoration-style"
         | "text-underline-position" | "color-scheme"
@@ -12040,6 +12055,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.visibility_collapsed = from.visibility_collapsed;
         }
         177 => to.pointer_events_auto = from.pointer_events_auto,
+        264 => to.user_select = from.user_select,
         102 => to.empty_cells_hide = from.empty_cells_hide,
         127 => to.caption_bottom = from.caption_bottom,
         128 => to.border_collapse = from.border_collapse,
@@ -19353,6 +19369,12 @@ fn typed_declarations(name: &str, raw: &str, offset: usize) -> Result<Vec<Declar
                 "none" => Some(Value::PointerEvents(false)),
                 _ => None,
             },
+            "user-select" | "-webkit-user-select" => match raw {
+                "auto" | "text" | "contain" => Some(Value::UserSelect(UserSelect::Text)),
+                "none" => Some(Value::UserSelect(UserSelect::None)),
+                "all" => Some(Value::UserSelect(UserSelect::All)),
+                _ => None,
+            },
             "empty-cells" => match raw {
                 "show" => Some(Value::EmptyCellsHide(false)),
                 "hide" => Some(Value::EmptyCellsHide(true)),
@@ -25193,6 +25215,7 @@ fn compute_for_named_registered_mode(
         if style.pointer_events_auto != parent.pointer_events_auto {
             style.pointer_events_auto = parent.pointer_events_auto;
         }
+        style.user_select = parent.user_select;
         if style.empty_cells_hide != parent.empty_cells_hide {
             style.empty_cells_hide = parent.empty_cells_hide;
         }

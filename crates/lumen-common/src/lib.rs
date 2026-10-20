@@ -43,6 +43,7 @@ pub mod dedent;
 pub mod editdist;
 pub mod entities;
 pub mod indexed_db;
+pub mod web_storage;
 pub mod import_maps;
 #[cfg(feature = "executable")]
 pub mod executable;

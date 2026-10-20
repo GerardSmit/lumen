@@ -985,6 +985,8 @@ pub(crate) struct SelectionData {
     pub(crate) focus: Cell<Option<Boundary>>,
     backward: Cell<Option<bool>>,
     wrapper: RefCell<Option<Value>>,
+    /// A `selectionchange` task is queued and has not run yet.
+    change_queued: Rc<Cell<bool>>,
 }
 
 impl SelectionData {
@@ -996,6 +998,7 @@ impl SelectionData {
             focus: Cell::new(None),
             backward: Cell::new(None),
             wrapper: RefCell::new(None),
+            change_queued: Rc::new(Cell::new(false)),
         })
     }
 
@@ -1705,10 +1708,177 @@ pub(crate) fn sync_selection(data: &SelectionData) {
     }
 }
 
+impl DomRealm {
+    fn host_selection_data(self: &Rc<Self>) -> Rc<SelectionData> {
+        if let Some(data) = self.host_selection.borrow().as_ref() {
+            return data.clone();
+        }
+        let data = self.selection.borrow().upgrade().unwrap_or_else(|| SelectionData::new(self.ranges.clone()));
+        *self.selection.borrow_mut() = Rc::downgrade(&data);
+        *self.host_selection.borrow_mut() = Some(data.clone());
+        data
+    }
+
+    fn selection_data(&self) -> Option<Rc<SelectionData>> {
+        self.host_selection.borrow().clone().or_else(|| self.selection.borrow().upgrade())
+    }
+
+    /// The Selection's endpoints as `(anchor, focus)`, when its range is in this document.
+    pub fn document_selection(self: &Rc<Self>) -> Option<((NodeId, usize), (NodeId, usize))> {
+        let data = self.selection_data()?;
+        sync_selection(&data);
+        let range = data.ranges.borrow().first().cloned()?;
+        if !Rc::ptr_eq(&range.realm.borrow(), self) { return None; }
+        let session = self.session.borrow();
+        let document = session.document();
+        if document.root_node(range.start.get().container, true).ok()? != document.root()
+            || document.root_node(range.end.get().container, true).ok()? != document.root() { return None; }
+        let (anchor, focus) = (data.anchor.get()?, data.focus.get()?);
+        Some(((anchor.container, anchor.offset), (focus.container, focus.offset)))
+    }
+
+    /// Replace the Selection with a range from `anchor` to `focus`, as a user
+    /// selection does: `getSelection()` reflects it and the range follows
+    /// later changes to the document. The change is announced by
+    /// [`flush_selection`](Self::flush_selection).
+    pub fn set_document_selection(self: &Rc<Self>, anchor: (NodeId, usize), focus: (NodeId, usize)) -> Result<(), String> {
+        let a = Boundary { container: anchor.0, offset: anchor.1 };
+        let f = Boundary { container: focus.0, offset: focus.1 };
+        let order = {
+            let session = self.session.borrow();
+            let document = session.document();
+            validate_boundary(document, a).map_err(|_| "selection anchor is not a valid position".to_string())?;
+            validate_boundary(document, f).map_err(|_| "selection focus is not a valid position".to_string())?;
+            if document.root_node(a.container, true).ok() != Some(document.root())
+                || document.root_node(f.container, true).ok() != Some(document.root()) {
+                return Err("selection is outside the document".into());
+            }
+            compare_points(document, a, f).map_err(|_| "selection endpoints are disconnected".to_string())?
+        };
+        let data = self.host_selection_data();
+        let range = RangeData::new(if order == PointOrder::After { f.container } else { a.container }, self);
+        if order == PointOrder::After {
+            range.set_start(f);
+            range.set_end(a);
+        } else {
+            range.set_start(a);
+            range.set_end(f);
+        }
+        self.ranges.register(&range);
+        *data.ranges.borrow_mut() = vec![range];
+        *data.wrapper.borrow_mut() = None;
+        data.backward.set(Some(order == PointOrder::After));
+        sync_selection(&data);
+        Ok(())
+    }
+
+    /// Remove the Selection's range.
+    pub fn clear_document_selection(&self) {
+        let Some(data) = self.selection_data() else { return };
+        data.ranges.borrow_mut().clear();
+        *data.wrapper.borrow_mut() = None;
+        data.anchor.set(None);
+        data.focus.set(None);
+        data.backward.set(None);
+    }
+
+    /// Drop what the host's selection keeps alive: its range holds the realm.
+    pub fn release_selection(&self) {
+        self.host_selection.borrow_mut().take();
+    }
+
+    /// Publish the Selection to rendering and queue a `selectionchange` task
+    /// at the document when its anchor or focus moved since the last call,
+    /// whoever changed it (the host or a script). Changes made before the task
+    /// runs share it. True when it did.
+    pub fn flush_selection(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<bool> {
+        let data = self.selection_data();
+        let current = data.as_ref().and_then(|data| {
+            sync_selection(data);
+            let range = data.ranges.borrow().first().cloned()?;
+            if !Rc::ptr_eq(&range.realm.borrow(), self) { return None; }
+            let session = self.session.borrow();
+            let document = session.document();
+            (document.root_node(range.start.get().container, true).ok()? == document.root()
+                && document.root_node(range.end.get().container, true).ok()? == document.root())
+                .then_some(())?;
+            Some((data.anchor.get()?, data.focus.get()?))
+        });
+        if self.published_selection.get() == current { return Ok(false); }
+        self.published_selection.set(current);
+        self.session.borrow_mut().set_selection(current.filter(|(anchor, focus)| anchor != focus));
+        let queued = data.map(|data| data.change_queued.clone());
+        if queued.as_ref().is_some_and(|queued| queued.replace(true)) { return Ok(true); }
+        let realm = Rc::downgrade(self);
+        super::scheduling::queue_task(ctx, move |ctx| {
+            if let Some(queued) = queued { queued.set(false); }
+            let Some(realm) = realm.upgrade() else { return Ok(()) };
+            let root = realm.session.borrow().document().root();
+            realm.dispatch(ctx, root, "selectionchange", false, false, &[]).map(|_| ())
+        })?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lumen::Engine;
+
+    #[test]
+    fn a_host_selection_reaches_get_selection_paint_and_selectionchange() {
+        let mut engine = Engine::new();
+        let realm = super::super::install(engine.ctx(), "<!doctype html><main>hello world</main><p>second</p>", 256).unwrap();
+        let (text, other) = {
+            let session = realm.session.borrow();
+            let document = session.document();
+            let main = selector::query_selector(document, document.root(), "main").unwrap().unwrap();
+            let p = selector::query_selector(document, document.root(), "p").unwrap().unwrap();
+            (document.first_child(main).unwrap().unwrap(), document.first_child(p).unwrap().unwrap())
+        };
+        assert!(evaluates_true(&mut engine, r#"
+          globalThis.changes = 0;
+          document.addEventListener('selectionchange', () => { changes++; });
+          document.getSelection().rangeCount === 0
+        "#));
+        assert!(!realm.flush_selection(engine.ctx()).unwrap(), "nothing selected, nothing announced");
+        realm.set_document_selection((text, 6), (text, 2)).unwrap();
+        assert!(realm.flush_selection(engine.ctx()).unwrap());
+        assert!(!realm.flush_selection(engine.ctx()).unwrap(), "announced once");
+        assert!(evaluates_true(&mut engine, "changes === 0"), "selectionchange is a task, not part of the flush");
+        scheduling::run_tasks(&mut engine, 8);
+        assert!(evaluates_true(&mut engine, r#"
+          const selection = window.getSelection(), main = document.querySelector('main').firstChild;
+          changes === 1 && selection.toString() === 'llo ' && selection.type === 'Range' && selection.direction === 'backward'
+            && selection.anchorNode === main && selection.anchorOffset === 6 && selection.focusOffset === 2
+            && selection.getRangeAt(0).startOffset === 2
+        "#));
+        let spans = realm.with_session(|session| session.selection());
+        let (start, end) = spans.expect("published to the session");
+        assert_eq!((start.container, start.offset, end.offset), (text, 2, 6));
+        assert_eq!(realm.document_selection(), Some(((text, 6), (text, 2))));
+        realm.set_document_selection((text, 2), (text, 6)).unwrap();
+        assert!(realm.flush_selection(engine.ctx()).unwrap(), "the same range in the other direction is a change");
+        scheduling::run_tasks(&mut engine, 8);
+        assert!(evaluates_true(&mut engine, "changes === 2 && document.getSelection().direction === 'forward'"));
+        realm.set_document_selection((text, 1), (other, 3)).unwrap();
+        assert!(evaluates_true(&mut engine, "document.getSelection().toString().startsWith('ello world')"));
+        assert!(realm.flush_selection(engine.ctx()).unwrap());
+        realm.set_document_selection((text, 0), (other, 2)).unwrap();
+        assert!(realm.flush_selection(engine.ctx()).unwrap());
+        scheduling::run_tasks(&mut engine, 8);
+        assert!(evaluates_true(&mut engine, "changes === 3"), "changes made before the task runs share it");
+        assert!(evaluates_true(&mut engine, "document.getSelection().removeAllRanges(); true"));
+        assert!(realm.flush_selection(engine.ctx()).unwrap(), "a script's change is announced too");
+        scheduling::run_tasks(&mut engine, 8);
+        assert!(evaluates_true(&mut engine, "changes === 4 && document.getSelection().rangeCount === 0"));
+        assert!(realm.with_session(|session| session.selection()).is_none());
+        realm.set_document_selection((text, 0), (text, 3)).unwrap();
+        realm.clear_document_selection();
+        assert!(realm.flush_selection(engine.ctx()).unwrap() || realm.document_selection().is_none());
+        assert!(realm.with_session(|session| session.selection()).is_none());
+        realm.release_selection();
+    }
 
     #[test]
     fn specification_range_boundaries_queries_and_cross_document_ownership() {

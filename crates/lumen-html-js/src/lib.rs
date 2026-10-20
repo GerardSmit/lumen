@@ -28,7 +28,7 @@ mod paint_worklet;
 mod browser_services;
 mod browsing_context;
 mod realm_services;
-pub use browser_services::{ClipboardHost, ClipboardOperation, ClipboardPermission};
+pub use browser_services::{set_navigator_profile, ClipboardHost, ClipboardOperation, ClipboardPermission, NavigatorProfile};
 pub use browsing_context::{
     FrameCommitResult, FrameContext, FrameInstallError, FrameNavigationRequest, FrameSource, NavigationPostResource, NavigationMetadata, UserNavigationInvolvement,
     FrameUnsupportedReason, FrameResourceLimits, Origin, PreparedFrameResponse, WeakFrameIdentity,
@@ -160,6 +160,8 @@ pub mod scheduling;
 mod shadow;
 mod templates;
 mod visual_viewport;
+mod legacy_timing;
+mod web_storage;
 mod window_globals;
 mod window_messaging;
 use editing_history::EditingState;
@@ -825,6 +827,9 @@ pub struct DomRealm {
     tree_walkers: Rc<document_utilities::TreeWalkerRegistry>,
     selection: RefCell<std::rc::Weak<range::SelectionData>>,
     selection_wrapper: RefCell<Option<WeakValue>>,
+    /// Keeps the selection the host made alive until `release_selection`.
+    host_selection: RefCell<Option<Rc<range::SelectionData>>>,
+    published_selection: Cell<Option<(lumen_html::ranges::Boundary, lumen_html::ranges::Boundary)>>,
     ready_state: Cell<DocumentReadyState>,
     current_script: Cell<Option<NodeId>>,
     document_parser: RefCell<Option<html::HtmlDocumentParser>>,
@@ -1821,6 +1826,11 @@ impl DomRealm {
             return Ok(());
         }
         self.ready_state.set(state);
+        match state {
+            DocumentReadyState::Interactive => self.lifecycle.times.interactive(),
+            DocumentReadyState::Complete => self.lifecycle.times.complete(),
+            DocumentReadyState::Loading => {}
+        }
         fragment::checkpoint(ctx,self,state==DocumentReadyState::Complete)?;
         let root = self.session.borrow().document().root();
         self.dispatch(ctx, root, "readystatechange", false, false, &[])
@@ -2875,9 +2885,7 @@ impl DomRealm {
         }
         if self.font_loading.has_metric_requests() {
             let document=self.document_value(ctx);
-            let native=ctx.instance_data::<DomDocument>(&document)
-                .ok_or_else(||OpError::new("InvalidStateError","font demand document wrapper"))?;
-            let value=native.borrow().fonts(ctx);
+            let value=document_font_face_set(ctx,&document)?;
             let set=ctx.instance_data::<font_loading::DomFontFaceSet>(&value)
                 .ok_or_else(||OpError::new("InvalidStateError","font demand set wrapper"))?;
             self.font_loading.queue_metric_requests(ctx,&set.borrow())?;
@@ -3782,7 +3790,7 @@ impl DomRealm {
         let event = lumen::embed::JsObject::from_value(ctx.new_instance(event))
             .expect("native Event object");
         if matches!(kind, "load" | "unload") {
-            if kind == "load" { self.lifecycle.page_showing.set(true); }
+            if kind == "load" { self.lifecycle.page_showing.set(true); self.lifecycle.times.load_started(); }
             let document = self.document_value(ctx);
             let result = events::dispatch_user_agent_event_with_target(
                 ctx,
@@ -3790,6 +3798,7 @@ impl DomRealm {
                 event,
                 document,
             )?;
+            if kind == "load" { self.lifecycle.times.load_finished(); }
             if kind == "load" { history::restore_form_state_before_pageshow(ctx,self)?;navigation_lifecycle::page_transition(ctx, self, "pageshow")?; }
             Ok(result)
         } else {
@@ -10120,6 +10129,10 @@ fn read_element_metadata<T>(node:&DomNode,read:impl FnOnce(&lumen_html::Document
     let session=realm.session.borrow();read(session.document(),id)
 }
 
+fn html_tag_filter(name: &str) -> DescendantFilter {
+    DescendantFilter::TagNs(Some("http://www.w3.org/1999/xhtml".into()), name.to_owned())
+}
+
 #[lumen_bind::class(name = "Document", extends = DomNode, hint(js(webidl)))]
 pub struct DomDocument {
     base: DomNode,
@@ -10138,9 +10151,36 @@ impl lumen::embed::NativeIdentityOwner for DomDocument {
     }
 }
 
+fn new_font_face_set(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> Value {
+    let value = ctx.new_instance(font_loading::DomFontFaceSet::new(realm));
+    ctx.instance_data::<font_loading::DomFontFaceSet>(&value)
+        .expect("new FontFaceSet has native backing")
+        .borrow()
+        .attach(ctx, &value);
+    value
+}
+
+/// `document.fonts` of a Document, XMLDocument or HTMLDocument wrapper.
+fn document_font_face_set(ctx: &mut Ctx, document: &Value) -> OpResult<Value> {
+    let (existing, realm) = ctx
+        .with_instance::<DomDocument, _>(document, |native| (native.fonts.borrow().clone(), native.realm.clone()))
+        .map_err(|_| OpError::new("InvalidStateError", "font demand document wrapper"))?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+    let value = new_font_face_set(ctx, &realm);
+    ctx.with_instance::<DomDocument, _>(document, |native| *native.fonts.borrow_mut() = Some(value.clone()))
+        .map_err(|_| OpError::new("InvalidStateError", "font demand document wrapper"))?;
+    Ok(value)
+}
+
 fn register_node_identity_owner(ctx:&mut Ctx,value:&Value)->OpResult<()> {
     if ctx.instance_data::<DomDocument>(value).is_some() {
         ctx.set_native_identity_owner::<DomDocument>(value)
+    } else if ctx.instance_data::<DomHtmlDocument>(value).is_some() {
+        ctx.set_native_identity_owner::<DomHtmlDocument>(value)
+    } else if ctx.instance_data::<DomXmlDocument>(value).is_some() {
+        ctx.set_native_identity_owner::<DomXmlDocument>(value)
     } else {
         ctx.set_native_identity_owner::<DomNode>(value)
     }
@@ -10150,8 +10190,37 @@ fn register_node_identity_owner(ctx:&mut Ctx,value:&Value)->OpResult<()> {
 pub struct DomXmlDocument {
     base: DomDocument,
 }
+
+impl lumen::embed::NativeIdentityOwner for DomXmlDocument {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, epoch:u64, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_identities(&self.base,epoch,visit);
+    }
+    fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_values(&self.base,visit);
+    }
+}
 #[lumen_bind::methods]
 impl DomXmlDocument {}
+
+/// The interface of HTML documents; `Document` itself stays the interface of other documents
+/// (`new Document()`).
+#[lumen_bind::class(name = "HTMLDocument", extends = DomDocument, hint(js(webidl)))]
+pub struct DomHtmlDocument {
+    base: DomDocument,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomHtmlDocument {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, epoch:u64, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_identities(&self.base,epoch,visit);
+    }
+    fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {
+        lumen::embed::NativeIdentityOwner::trace_native_values(&self.base,visit);
+    }
+}
+#[lumen_bind::methods]
+impl DomHtmlDocument {}
 
 impl DomDocument {
     fn body_node_id(&self) -> OpResult<Option<NodeId>> {
@@ -10374,6 +10443,53 @@ event_content_handlers::bind_node_handlers! { DomDocument {
         )
     }
 
+    #[getter]
+    fn scripts(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "scripts".into(), html_tag_filter("script"))
+    }
+
+    #[getter]
+    fn images(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "images".into(), html_tag_filter("img"))
+    }
+
+    #[getter]
+    fn embeds(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "embeds".into(), html_tag_filter("embed"))
+    }
+
+    #[getter]
+    fn plugins(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "embeds".into(), html_tag_filter("embed"))
+    }
+
+    #[getter]
+    fn links(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "links".into(), DescendantFilter::Links)
+    }
+
+    #[getter]
+    fn anchors(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "anchors".into(), DescendantFilter::Anchors)
+    }
+
+    #[getter]
+    fn applets(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.descendant_collection(ctx, this.0, "applets".into(), html_tag_filter("applet"))
+    }
+
+    #[getter]
+    fn all(&self, ctx: &mut Ctx) -> Value {
+        if let Some(value) = self.base.collections.borrow().get("all").and_then(WeakValue::upgrade) {
+            return value;
+        }
+        let owner = self.realm.document_value(ctx);
+        let nodes = DomNodeList::descendants(self.realm.clone(), self.base.id, DescendantFilter::Tag("*".into()), owner);
+        let value = collections::DomHtmlAllCollection::create(ctx, nodes);
+        self.base.collections.borrow_mut().insert("all".into(), ctx.weak_value(&value).expect("collection object"));
+        value
+    }
+
     #[setter(coerce)]
     fn set_cookie(&self, assignment: lumen_host::webidl::Usv) -> OpResult<()> {
         self.set_cookie_value(&assignment.0)
@@ -10384,11 +10500,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
         if let Some(value) = self.fonts.borrow().as_ref() {
             return value.clone();
         }
-        let value = ctx.new_instance(font_loading::DomFontFaceSet::new(&self.realm));
-        ctx.instance_data::<font_loading::DomFontFaceSet>(&value)
-            .expect("new FontFaceSet has native backing")
-            .borrow()
-            .attach(ctx, &value);
+        let value = new_font_face_set(ctx, &self.realm);
         *self.fonts.borrow_mut() = Some(value.clone());
         value
     }
@@ -13317,6 +13429,8 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             tree_walkers: document_utilities::TreeWalkerRegistry::new(),
             selection: RefCell::new(std::rc::Weak::new()),
             selection_wrapper: RefCell::new(None),
+            host_selection: RefCell::new(None),
+            published_selection: Cell::new(None),
             lifecycle: navigation_lifecycle::DocumentLifecycle::default(),
             ready_state: Cell::new(if has_browsing_context {
                 DocumentReadyState::Loading
@@ -13503,6 +13617,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             fonts: RefCell::new(None),
         };
         let document = match self.document_interface {
+            DocumentInterface::Document if self.is_html_document => ctx.new_instance(DomHtmlDocument { base: document }),
             DocumentInterface::Document => ctx.new_instance(document),
             DocumentInterface::XmlDocument => ctx.new_instance(DomXmlDocument { base: document }),
         };
@@ -14043,6 +14158,9 @@ fn install_document_with_context_metadata(
         ("PageRevealEvent", ctx.class_constructor::<navigation_lifecycle::DomPageRevealEvent>()),
         ("PopStateEvent", ctx.class_constructor::<navigation_lifecycle::DomPopStateEvent>()),
         ("HashChangeEvent", ctx.class_constructor::<navigation_lifecycle::DomHashChangeEvent>()),
+        ("HTMLAllCollection", ctx.class_constructor::<collections::DomHtmlAllCollection>()),
+        ("Storage", ctx.class_constructor::<web_storage::DomStorage>()),
+        ("StorageEvent", ctx.class_constructor::<web_storage::DomStorageEvent>()),
         ("UIEvent", ctx.class_constructor::<ui_events::DomUIEvent>()),
         (
             "FocusEvent",
@@ -14173,6 +14291,7 @@ fn install_document_with_context_metadata(
             ctx.class_constructor::<DomDocumentFragment>(),
         ),
         ("XMLDocument", ctx.class_constructor::<DomXmlDocument>()),
+        ("HTMLDocument", ctx.class_constructor::<DomHtmlDocument>()),
     ] {
         crate::install_interface(ctx, &global, name, ctor).map_err(|_| InstallError::Global)?;
     }
@@ -14290,6 +14409,8 @@ fn install_document_with_context_metadata(
 }
 
 pub use visual_viewport::set_visual_viewport;
+pub use web_storage::set_local_storage_backend;
+pub use legacy_timing::performance_extension;
 
 /// Notify media-query listeners after the embedder updates layout/environment.
 pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {

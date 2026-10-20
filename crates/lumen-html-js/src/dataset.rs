@@ -5,7 +5,7 @@
 use crate::{DomNode, DomRealm};
 use lumen::embed::{Ctx, OpError, OpResult, Value, WeakValue};
 use lumen_html::{NodeId, NodeKind};
-use std::rc::Rc;
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 #[derive(Clone)]
 pub(crate) struct ProxyIntrinsics {
@@ -71,32 +71,57 @@ pub(crate) fn for_element(ctx: &mut Ctx, node: &DomNode) -> OpResult<Value> {
         _element_wrapper: element_wrapper,
     });
     ctx.set_native_identity_owner::<DomStringMapBackend>(&backend)?;
-    let handler = DomStringMapProxyHandler {
-        backend: backend.clone(),
-        has_named: method(ctx, &backend, "hasNamedProperty").map_err(OpError::thrown)?,
-        get_named: method(ctx, &backend, "getNamedProperty").map_err(OpError::thrown)?,
-        set_named: method(ctx, &backend, "setNamedProperty").map_err(OpError::thrown)?,
-        delete_named: method(ctx, &backend, "deleteNamedProperty").map_err(OpError::thrown)?,
-        supported_names: method(ctx, &backend, "supportedPropertyNames")
-            .map_err(OpError::thrown)?,
-        reflect_get: intrinsics.reflect_get.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-        reflect_set: intrinsics.reflect_set.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-        reflect_delete: intrinsics.reflect_delete.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-        reflect_has: intrinsics.reflect_has.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-        reflect_own_keys: intrinsics.reflect_own_keys.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-        reflect_get_own_property_descriptor: intrinsics.reflect_get_own_property_descriptor.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?,
-    };
-    let handler = ctx.new_instance(handler);
-    ctx.set_native_identity_owner::<DomStringMapProxyHandler>(&handler)?;
-    let target = ctx.new_object_with_proto(&intrinsics.prototype.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset prototype realm is unavailable"))?);
-    let proxy = ctx
-        .construct_value(intrinsics.constructor.upgrade().ok_or_else(||OpError::new("InvalidStateError","dataset intrinsic realm is unavailable"))?, &[target, handler])
-        .map_err(OpError::thrown)?;
+    let proxy = build_proxy(ctx, &intrinsics, &backend, None)?;
     node.collections.borrow_mut().insert(
         "dataset".into(),
         ctx.weak_value(&proxy).expect("dataset proxy"),
     );
     Ok(proxy)
+}
+
+/// Wraps a named-property backend object in the Proxy that gives it Web IDL named property
+/// behavior. `shadow_prototype` is the interface prototype of a backend whose names never hide
+/// inherited properties (`Storage`); `None` is the `DOMStringMap` rule.
+pub(crate) fn build_proxy(
+    ctx: &mut Ctx,
+    intrinsics: &ProxyIntrinsics,
+    backend: &Value,
+    shadow_prototype: Option<&Value>,
+) -> OpResult<Value> {
+    let missing = || OpError::new("InvalidStateError", "dataset intrinsic realm is unavailable");
+    let handler = DomStringMapProxyHandler {
+        backend: backend.clone(),
+        has_named: method(ctx, backend, "hasNamedProperty").map_err(OpError::thrown)?,
+        get_named: method(ctx, backend, "getNamedProperty").map_err(OpError::thrown)?,
+        set_named: method(ctx, backend, "setNamedProperty").map_err(OpError::thrown)?,
+        delete_named: method(ctx, backend, "deleteNamedProperty").map_err(OpError::thrown)?,
+        supported_names: method(ctx, backend, "supportedPropertyNames").map_err(OpError::thrown)?,
+        reflect_get: intrinsics.reflect_get.upgrade().ok_or_else(missing)?,
+        reflect_set: intrinsics.reflect_set.upgrade().ok_or_else(missing)?,
+        reflect_delete: intrinsics.reflect_delete.upgrade().ok_or_else(missing)?,
+        reflect_has: intrinsics.reflect_has.upgrade().ok_or_else(missing)?,
+        reflect_own_keys: intrinsics.reflect_own_keys.upgrade().ok_or_else(missing)?,
+        reflect_get_own_property_descriptor: intrinsics.reflect_get_own_property_descriptor.upgrade().ok_or_else(missing)?,
+        shadowed_by_prototype: shadow_prototype.is_some(),
+        proxy: RefCell::new(None),
+    };
+    let handler = ctx.new_instance(handler);
+    ctx.set_native_identity_owner::<DomStringMapProxyHandler>(&handler)?;
+    let prototype = match shadow_prototype {
+        Some(prototype) => prototype.clone(),
+        None => intrinsics.prototype.upgrade().ok_or_else(missing)?,
+    };
+    let target = ctx.new_object_with_proto(&prototype);
+    let constructor = intrinsics.constructor.upgrade().ok_or_else(missing)?;
+    let proxy = ctx.construct_value(constructor, &[target, handler.clone()]).map_err(OpError::thrown)?;
+    let weak = ctx.weak_value(&proxy);
+    ctx.with_instance::<DomStringMapProxyHandler, _>(&handler, |handler| *handler.proxy.borrow_mut() = weak)?;
+    Ok(proxy)
+}
+
+pub(crate) fn intrinsics(realm: &DomRealm) -> OpResult<ProxyIntrinsics> {
+    realm.dataset_intrinsics.borrow().clone()
+        .ok_or_else(|| OpError::new("InvalidStateError", "named property proxy is not initialized"))
 }
 
 fn method(ctx: &mut Ctx, backend: &Value, name: &str) -> Result<Value, Value> {
@@ -118,6 +143,10 @@ fn backend_has(ctx: &mut Ctx, backend: &Value, has: &Value, key: &Value) -> OpRe
     ))
 }
 
+/// Upper bound of a key list a named-property trap may produce (a full `localStorage` quota of
+/// short keys stays below it).
+const MAX_KEY_LIST: usize = 1 << 22;
+
 fn array_values(ctx: &mut Ctx, array: &Value) -> OpResult<Vec<Value>> {
     let length = ctx.member_get(array, "length")?;
     let Value::Num(length) = length else {
@@ -126,7 +155,7 @@ fn array_values(ctx: &mut Ctx, array: &Value) -> OpResult<Vec<Value>> {
             "proxy trap produced a non-array key list",
         ));
     };
-    if !length.is_finite() || length < 0.0 || length > 65_536.0 || length.fract() != 0.0 {
+    if !length.is_finite() || length < 0.0 || length > MAX_KEY_LIST as f64 || length.fract() != 0.0 {
         return Err(OpError::new(
             "RangeError",
             "proxy trap key list is too large",
@@ -137,14 +166,6 @@ fn array_values(ctx: &mut Ctx, array: &Value) -> OpResult<Vec<Value>> {
         values.push(ctx.member_get(array, &index.to_string())?);
     }
     Ok(values)
-}
-
-fn same_property_key(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Str(left), Value::Str(right)) => left.as_str() == right.as_str(),
-        (Value::Sym(left), Value::Sym(right)) => left.id == right.id,
-        _ => false,
-    }
 }
 
 #[lumen_bind::class(name = "DOMStringMapProxyHandler")]
@@ -161,6 +182,8 @@ struct DomStringMapProxyHandler {
     reflect_has: Value,
     reflect_own_keys: Value,
     reflect_get_own_property_descriptor: Value,
+    shadowed_by_prototype: bool,
+    proxy: RefCell<Option<WeakValue>>,
 }
 
 impl lumen::embed::NativeIdentityOwner for DomStringMapProxyHandler {
@@ -170,6 +193,30 @@ impl lumen::embed::NativeIdentityOwner for DomStringMapProxyHandler {
         for value in [&self.backend,&self.has_named,&self.get_named,&self.set_named,&self.delete_named,
             &self.supported_names,&self.reflect_get,&self.reflect_set,&self.reflect_delete,&self.reflect_has,
             &self.reflect_own_keys,&self.reflect_get_own_property_descriptor] {visit(value);}
+    }
+}
+
+impl DomStringMapProxyHandler {
+    /// Whether `receiver` is the proxy itself; the named setter applies only then.
+    fn is_proxy(&self, receiver: &Value) -> bool {
+        match (self.proxy.borrow().as_ref().and_then(WeakValue::upgrade), receiver) {
+            (Some(Value::Obj(proxy)), Value::Obj(receiver)) => std::ptr::eq(&*proxy, &**receiver),
+            (Some(_), _) => false,
+            (None, _) => true,
+        }
+    }
+
+    /// Web IDL's named property visibility: a name hides nothing, and an interface without
+    /// `[LegacyOverrideBuiltIns]` lets inherited properties hide the name.
+    fn named_visible(&self, ctx: &mut Ctx, target: &Value, key: &Value) -> OpResult<bool> {
+        if !backend_has(ctx, &self.backend, &self.has_named, key)? {
+            return Ok(false);
+        }
+        if !self.shadowed_by_prototype {
+            return Ok(true);
+        }
+        let inherited = call(ctx, &self.reflect_has, Value::Undefined, &[target.clone(), key.clone()])?;
+        Ok(!matches!(inherited, Value::Bool(true)))
     }
 }
 
@@ -183,7 +230,7 @@ impl DomStringMapProxyHandler {
         key: Value,
         receiver: Value,
     ) -> OpResult<Value> {
-        if backend_has(ctx, &self.backend, &self.has_named, &key)? {
+        if self.named_visible(ctx, &target, &key)? {
             return call(ctx, &self.get_named, self.backend.clone(), &[key]);
         }
         call(
@@ -203,7 +250,7 @@ impl DomStringMapProxyHandler {
         value: Value,
         receiver: Value,
     ) -> OpResult<Value> {
-        if matches!(&key, Value::Str(_)) {
+        if matches!(&key, Value::Str(_)) && self.is_proxy(&receiver) {
             call(ctx, &self.set_named, self.backend.clone(), &[key, value])?;
             return Ok(Value::Bool(true));
         }
@@ -217,7 +264,7 @@ impl DomStringMapProxyHandler {
 
     #[method(name = "deleteProperty")]
     fn delete_property(&self, ctx: &mut Ctx, target: Value, key: Value) -> OpResult<Value> {
-        if backend_has(ctx, &self.backend, &self.has_named, &key)? {
+        if self.named_visible(ctx, &target, &key)? {
             call(ctx, &self.delete_named, self.backend.clone(), &[key])?;
             return Ok(Value::Bool(true));
         }
@@ -226,7 +273,7 @@ impl DomStringMapProxyHandler {
 
     #[method(name = "has")]
     fn has_property(&self, ctx: &mut Ctx, target: Value, key: Value) -> OpResult<Value> {
-        if backend_has(ctx, &self.backend, &self.has_named, &key)? {
+        if self.named_visible(ctx, &target, &key)? {
             return Ok(Value::Bool(true));
         }
         call(ctx, &self.reflect_has, Value::Undefined, &[target, key])
@@ -237,11 +284,19 @@ impl DomStringMapProxyHandler {
         let names = call(ctx, &self.supported_names, self.backend.clone(), &[])?;
         let target_keys = call(ctx, &self.reflect_own_keys, Value::Undefined, &[target])?;
         let mut keys = array_values(ctx, &names)?;
+        let mut seen: HashSet<String> = keys
+            .iter()
+            .filter_map(|key| match key {
+                Value::Str(name) => Some(name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
         for key in array_values(ctx, &target_keys)? {
-            if !keys
-                .iter()
-                .any(|existing| same_property_key(existing, &key))
-            {
+            let new = match &key {
+                Value::Str(name) => seen.insert(name.as_str().to_owned()),
+                _ => true,
+            };
+            if new {
                 keys.push(key);
             }
         }
@@ -255,7 +310,7 @@ impl DomStringMapProxyHandler {
         target: Value,
         key: Value,
     ) -> OpResult<Value> {
-        if backend_has(ctx, &self.backend, &self.has_named, &key)? {
+        if self.named_visible(ctx, &target, &key)? {
             let value = call(ctx, &self.get_named, self.backend.clone(), &[key])?;
             let descriptor = Value::Obj(ctx.new_object());
             for (name, value) in [
