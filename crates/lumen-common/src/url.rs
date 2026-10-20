@@ -243,12 +243,12 @@ fn is_forbidden_domain(c: u8) -> bool {
     is_forbidden_host(c) || c == b'%' || c <= 32 || (127..255).contains(&c)
 }
 
-fn remove_tab_newline(input: &[u8]) -> Vec<u8> {
-    input
-        .iter()
-        .copied()
-        .filter(|&c| !matches!(c, b'\t' | b'\n' | b'\r'))
-        .collect()
+fn remove_tab_newline(input: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
+    let strip = |c: &u8| matches!(c, b'\t' | b'\n' | b'\r');
+    if !input.iter().any(strip) {
+        return alloc::borrow::Cow::Borrowed(input);
+    }
+    alloc::borrow::Cow::Owned(input.iter().copied().filter(|c| !strip(c)).collect())
 }
 
 fn is_alnum_plus(c: u8) -> bool {
@@ -966,7 +966,7 @@ impl Url {
     }
 
     pub fn set_protocol(&mut self, input: &str) -> bool {
-        let mut view = remove_tab_newline(input.as_bytes());
+        let mut view = remove_tab_newline(input.as_bytes()).into_owned();
         if view.is_empty() {
             return true;
         }
@@ -1515,11 +1515,50 @@ pub fn parse_url(user_input: &str, base: Option<&Url>) -> Option<Url> {
 /// `input` parsed on its own, or against `base` when given. The error text is for Rust callers
 /// (fetch/WebSocket/EventSource); the JS `URL` class reports Node's `ERR_INVALID_URL` instead.
 pub fn parse(input: &str, base: Option<&str>) -> Result<Url, String> {
-    let base = match base {
-        Some(b) => Some(parse_url(b, None).ok_or_else(|| format!("invalid base URL '{b}'"))?),
-        None => None,
+    let Some(base) = base else {
+        return parse_url(input, None).ok_or_else(|| format!("invalid URL '{input}'"));
     };
-    parse_url(input, base.as_ref()).ok_or_else(|| format!("invalid URL '{input}'"))
+    with_parsed_base(base, |parsed| match parsed {
+        Some(parsed) => parse_url(input, Some(parsed)).ok_or_else(|| format!("invalid URL '{input}'")),
+        None => Err(format!("invalid base URL '{base}'")),
+    })
+}
+
+/// Bases kept parsed per thread. A page resolves hundreds of references against the same
+/// document or stylesheet URL, so re-parsing the base each time doubled the cost of a join.
+const BASE_CACHE_SLOTS: usize = 4;
+const BASE_CACHE_MAX_LEN: usize = 2048;
+
+std::thread_local! {
+    static BASES: core::cell::RefCell<Vec<(String, Option<Url>)>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_parsed_base<R>(base: &str, f: impl FnOnce(Option<&Url>) -> R) -> R {
+    if base.len() > BASE_CACHE_MAX_LEN {
+        return f(parse_url(base, None).as_ref());
+    }
+    let mut f = Some(f);
+    let hit = BASES.try_with(|bases| {
+        let mut bases = bases.borrow_mut();
+        let index = match bases.iter().position(|(key, _)| key == base) {
+            Some(index) => index,
+            None => {
+                if bases.len() >= BASE_CACHE_SLOTS {
+                    bases.pop();
+                }
+                bases.insert(0, (base.to_owned(), parse_url(base, None)));
+                0
+            }
+        };
+        if index != 0 {
+            bases[..=index].rotate_right(1);
+        }
+        (f.take().expect("called once"))(bases[0].1.as_ref())
+    });
+    match hit {
+        Ok(result) => result,
+        Err(_) => (f.take().expect("thread-local unavailable"))(parse_url(base, None).as_ref()),
+    }
 }
 
 /// A URL path with its percent escapes decoded, or `None` for an invalid escape or non-UTF-8 bytes.
@@ -1752,6 +1791,43 @@ mod tests {
             form_urlencoded_serialize([("a b", "\u{e9}*-._~"), ("", "")]),
             "a+b=%C3%A9*-._%7E&="
         );
+    }
+
+    #[test]
+    fn joins_against_a_cached_base_match_uncached_parsing() {
+        let bases = [
+            "https://example.com/a/b/c.html?q=1#f",
+            "https://example.com/a/b/c.html?q=1#f",
+            "http://other.test/x/",
+            "file:///tmp/dir/file.txt",
+            "mailto:someone@example.com",
+            "https://example.com/a/b/c.html?q=1#f",
+        ];
+        let inputs = ["../img.png", "/root.css", "//cdn.test/x", "#top", "?s=2", "", "https://abs.test/p", "x\ty\n.png"];
+        for base in bases {
+            let parsed_base = parse_url(base, None);
+            for input in inputs {
+                let direct = parse_url(input, parsed_base.as_ref());
+                assert_eq!(parse(input, Some(base)).ok(), direct, "{base} + {input:?}");
+            }
+        }
+        assert!(parse("x", Some("::not a url")).unwrap_err().contains("invalid base URL"));
+        assert!(parse("x", Some("::not a url")).is_err());
+    }
+
+    #[test]
+    fn many_distinct_bases_evict_without_changing_results() {
+        for round in 0..3 {
+            for index in 0..BASE_CACHE_SLOTS * 3 {
+                let base = format!("https://h{index}.test/dir{round}/page");
+                assert_eq!(parse("r.png", Some(&base)).unwrap().href(), format!("https://h{index}.test/dir{round}/r.png"));
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_and_newlines_inside_a_url_are_dropped() {
+        assert_eq!(href("ht\ttp://exa\nmple.com/\r"), "http://example.com/");
     }
 }
 
