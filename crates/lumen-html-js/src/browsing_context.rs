@@ -2121,6 +2121,32 @@ impl DomRealm {
     pub(crate) fn connected_iframe_nodes(&self) -> Vec<NodeId> {
         let session = self.session.borrow();
         let document = session.document();
+        let candidates = {
+            let mut cache = self.frame_candidates.borrow_mut();
+            match cache.as_ref() {
+                Some((version, nodes)) if *version == document.version() => nodes.clone(),
+                _ => {
+                    let nodes = Self::frame_candidate_nodes(document);
+                    *cache = Some((document.version(), nodes.clone()));
+                    nodes
+                }
+            }
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|node| {
+                matches!(
+                    document.kind(*node),
+                    Ok(NodeKind::Element { name, .. }) if lumen_html::xml::split_qname(name.as_str())
+                        .is_some_and(|(_, local_name)| local_name == "iframe" || matches!(local_name, "object" | "embed")
+                            && self.object_resources.representation(*node).has_child_navigable())
+                )
+            })
+            .collect()
+    }
+
+    fn frame_candidate_nodes(document: &lumen_html::Document) -> Rc<[NodeId]> {
         let root = document.root();
         let mut out = Vec::new();
         let mut next = selector::next_shadow_including_descendant(document, root, root)
@@ -2135,8 +2161,7 @@ impl DomRealm {
                         name,
                         ..
                     }) if lumen_html::xml::split_qname(name.as_str())
-                        .is_some_and(|(_, local_name)| local_name == "iframe" || matches!(local_name, "object" | "embed")
-                            && self.object_resources.representation(node).has_child_navigable())
+                        .is_some_and(|(_, local_name)| matches!(local_name, "iframe" | "object" | "embed"))
                 )
             {
                 out.push(node);
@@ -2145,7 +2170,7 @@ impl DomRealm {
                 .ok()
                 .flatten();
         }
-        out
+        out.into()
     }
 
     /// Existing active contexts only: rendering never creates navigables or requests.

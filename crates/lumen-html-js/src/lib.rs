@@ -884,6 +884,8 @@ pub struct DomRealm {
     browsing_context: RefCell<std::rc::Weak<browsing_context::BrowsingContext>>,
     frame_contexts: RefCell<HashMap<NodeId, std::rc::Weak<browsing_context::BrowsingContext>>>,
     pending_frame_contexts: RefCell<HashMap<NodeId, Rc<browsing_context::BrowsingContext>>>,
+    /// Connected `iframe`, `object` and `embed` elements, valid for one document version.
+    frame_candidates: RefCell<Option<(u64, Rc<[NodeId]>)>>,
     pending_frame_realms: RefCell<Vec<lumen::embed::RealmHandle>>,
     pending_iframe_post_connections: RefCell<VecDeque<NodeId>>,
     pending_inserted_content_handlers: RefCell<Vec<NodeId>>,
@@ -13489,6 +13491,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             browsing_context: RefCell::new(std::rc::Weak::new()),
             frame_contexts: RefCell::new(HashMap::new()),
             pending_frame_contexts: RefCell::new(HashMap::new()),
+            frame_candidates: RefCell::new(None),
             pending_frame_realms: RefCell::new(Vec::new()),
             pending_iframe_post_connections: RefCell::new(VecDeque::new()),
             pending_inserted_content_handlers: RefCell::new(Vec::new()),
@@ -19479,6 +19482,21 @@ mod tests {
         } else {
             panic!("textarea diagnostic must be a string");
         }
+    }
+
+    #[test]
+    fn child_windows_follow_frames_added_inside_shadow_roots_and_removed_again() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<main><div id=host></div></main>", 128).unwrap();
+        script(
+            &mut engine,
+            "var host = document.getElementById('host'); var counts = [window.length];\
+             var root = host.attachShadow({mode:'open'}); counts.push(window.length);\
+             var frame = document.createElement('iframe'); root.appendChild(frame); counts.push(window.length);\
+             root.removeChild(frame); counts.push(window.length);\
+             root.appendChild(document.createElement('iframe')); counts.push(window.length);\
+             if (counts.join() !== '0,0,1,0,1') throw new Error('child windows ' + counts.join());",
+        );
     }
 
     #[test]

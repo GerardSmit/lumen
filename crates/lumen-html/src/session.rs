@@ -155,6 +155,7 @@ struct CachedFrame {
     width: u32,
     height: u32,
     image_generation: Option<u64>,
+    rules_generation: u64,
     list: DisplayList,
     geometry: layout::LayoutGeometry,
 }
@@ -191,6 +192,17 @@ struct NodeImages<'a> {
 struct PendingLog {
     entries: core::cell::RefCell<Vec<(layout::PendingLookup, bool)>>,
     paint_only: core::cell::Cell<bool>,
+    culled: core::cell::RefCell<Vec<NodeId>>,
+    reached: core::cell::RefCell<Vec<NodeId>>,
+}
+
+fn lookup_node(lookup: &layout::PendingLookup) -> Option<NodeId> {
+    match lookup {
+        layout::PendingLookup::Node(node)
+        | layout::PendingLookup::NodeFrom(node, ..)
+        | layout::PendingLookup::Request(node, ..) => Some(*node),
+        _ => None,
+    }
 }
 
 impl PendingLog {
@@ -326,6 +338,13 @@ impl ImageResolver for NodeImages<'_> {
     fn arrivals_only_since(&self, generation: u64) -> bool {
         self.fallback.is_some_and(|images| images.arrivals_only_since(generation))
     }
+    fn note_image_box(&self, node: NodeId, culled: bool) {
+        if culled {
+            self.pending.culled.borrow_mut().push(node);
+        } else {
+            self.pending.reached.borrow_mut().push(node);
+        }
+    }
     fn replay_pending(&self, lookups: &[(layout::PendingLookup, bool)]) {
         self.pending.entries.borrow_mut().extend_from_slice(lookups);
     }
@@ -380,11 +399,17 @@ impl ImageResolver for SnapshotImages<'_> {
     }
 }
 
+fn is_style_source_element(namespace: &crate::Namespace, name: &crate::Name) -> bool {
+    let local = crate::svg::local_name(name);
+    (*namespace == crate::Namespace::Html && matches!(local, "style" | "link"))
+        || (*namespace == crate::Namespace::Svg && local == "style")
+}
+
 fn in_style(document: &Document, mut id: NodeId) -> bool {
     loop {
         match document.kind(id) {
             Ok(NodeKind::ProcessingInstruction { target, .. }) if target=="xml-stylesheet" => return true,
-            Ok(NodeKind::Element { name, .. }) if name == "style" || name == "link" => return true,
+            Ok(NodeKind::Element { name, namespace, .. }) if is_style_source_element(namespace, name) => return true,
             Err(_) => return true,
             _ => {}
         }
@@ -428,14 +453,40 @@ fn retain_styles_for_resize(
         && style_cache.borrow_mut().invalidate_viewport_dependent()
 }
 
+/// Elements whose state or text is read from outside a `display: none`
+/// subtree: a radio group across forms, a `select`'s label from its options,
+/// fallback content of media and objects, document-wide `base` and `meta`.
+fn reaches_outside_inert_subtree(namespace: &crate::Namespace, name: &crate::Name) -> bool {
+    *namespace != crate::Namespace::Html
+        || matches!(
+            crate::svg::local_name(name),
+            "input" | "form" | "fieldset" | "label" | "output" | "option" | "optgroup" | "select" | "datalist"
+                | "source" | "track" | "canvas" | "video" | "audio" | "object" | "embed" | "base" | "meta"
+        )
+}
+
+fn subtree_reaches_outside(document: &Document, root: NodeId) -> bool {
+    let mut current = root;
+    loop {
+        match document.kind(current) {
+            Ok(NodeKind::Element { name, namespace, .. }) if reaches_outside_inert_subtree(namespace, name) => return true,
+            Err(_) => return true,
+            _ => {}
+        }
+        match crate::selector::next_shadow_including_descendant(document, root, current) {
+            Ok(Some(next)) => current = next,
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
 pub(crate) fn subtree_has_style(document: &Document, root: NodeId) -> bool {
     let mut current = root;
     loop {
         match document.kind(current) {
             Ok(NodeKind::ProcessingInstruction { target, .. }) if target == "xml-stylesheet" => return true,
-            Ok(NodeKind::Element { name, namespace, .. })
-                if (*namespace == crate::Namespace::Html && matches!(crate::svg::local_name(name), "style" | "link"))
-                    || (*namespace == crate::Namespace::Svg && crate::svg::local_name(name) == "style") => return true,
+            Ok(NodeKind::Element { name, namespace, .. }) if is_style_source_element(namespace, name) => return true,
             Err(_) => return true,
             _ => {}
         }
@@ -622,6 +673,15 @@ pub struct RenderSession {
     pending_lookups: Vec<(layout::PendingLookup, bool)>,
     layout_count: u64,
     image_patch_count: u64,
+    /// Elements which received their first bitmap since the retained frame
+    /// was laid out; see `resolve_bitmap_arrivals`.
+    bitmap_arrivals: Vec<NodeId>,
+    /// Sized `<img>` elements the last layout skipped below the culled
+    /// region, sorted by key: their arriving bitmaps change nothing in it.
+    culled_images: Vec<NodeId>,
+    /// The `<img>` elements the last layout reached, sorted by key, when no
+    /// retained fragment stood in for part of it (else `None`).
+    reached_images: Option<Vec<NodeId>>,
     rules_generation: u64,
     read_style_cache: css::StyleCache,
     read_style_key: Option<ReadStyleKey>,
@@ -857,6 +917,9 @@ impl RenderSession {
             pending_lookups: Vec::new(),
             layout_count: 0,
             image_patch_count: 0,
+            bitmap_arrivals: Vec::new(),
+            culled_images: Vec::new(),
+            reached_images: None,
             rules_generation: 0,
             read_style_cache: css::StyleCache::default(),
             read_style_key: None,
@@ -1072,15 +1135,63 @@ impl RenderSession {
             (Some((_,previous,old)),Some(image))=>Arc::ptr_eq(previous,image) && *old==metadata,
             _=>false,
         } {return Ok(());}
+        let first_arrival = previous.is_none() && image.is_some();
         match (at,image) {
             (Ok(at),Some(image))=>self.node_bitmaps[at]=(node,image,metadata),
             (Ok(at),None)=>{self.node_bitmaps.remove(at);},
             (Err(at),Some(image))=>{self.node_bitmaps.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;self.node_bitmaps.insert(at,(node,image,metadata));},
             (Err(_),None)=>{},
         }
+        if first_arrival && self.cached.is_some() && self.bitmap_arrivals.try_reserve(1).is_ok() {
+            // Decided at the next render, which knows whether the element's
+            // box took its geometry from the image.
+            self.bitmap_arrivals.push(node);
+            self.failed_frame = None;
+            self.paint_revision = self.paint_revision.wrapping_add(1);
+            self.frame_id = self.frame_id.wrapping_add(1);
+            return Ok(());
+        }
+        self.bitmap_arrivals.clear();
         self.invalidate_paint();
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
+    }
+
+    /// Settles the bitmaps which arrived since the last layout. When every
+    /// such element's box was laid out around a loading image without taking
+    /// geometry from it (a sized `<img>`), the arrived image is painted into
+    /// the retained frame; otherwise the frame is dropped to be laid out
+    /// again. Returns the elements to be painted into the frame (empty when
+    /// no patch is to be attempted).
+    fn resolve_bitmap_arrivals(&mut self) -> Vec<NodeId> {
+        if self.bitmap_arrivals.is_empty() {
+            return Vec::new();
+        }
+        let nodes = core::mem::take(&mut self.bitmap_arrivals);
+        let paint_only = self.cached.is_some()
+            && nodes.iter().all(|node| {
+                let mut used = false;
+                for (lookup, paint_only) in &self.pending_lookups {
+                    if lookup_node(lookup) == Some(*node) {
+                        if !*paint_only {
+                            return false;
+                        }
+                        used = true;
+                    }
+                }
+                // Every replaced element the layout reached is noted, so an
+                // element it did not reach (hidden, or not an image) sized
+                // nothing; only an `<img>` is ever skipped below the region.
+                let is_img = crate::forms::html_element_local_name(&self.document, *node) == Some("img");
+                used || (is_img && self.culled_images.binary_search_by_key(&node.key(), |culled| culled.key()).is_ok())
+                    || self.reached_images.as_ref().is_some_and(|reached| reached.binary_search_by_key(&node.key(), |reached| reached.key()).is_err())
+            });
+        if !paint_only {
+            self.invalidate_paint();
+            self.frame_id = self.frame_id.wrapping_add(1);
+            return Vec::new();
+        }
+        nodes
     }
 
     /// Drops the retained frame, and a remembered failure with it: whatever
@@ -3871,7 +3982,7 @@ impl RenderSession {
     /// When every image which arrived since the last layout only paints (it
     /// sizes no box), swaps it into the retained frame instead of laying the
     /// page out again. Returns whether the frame now matches the resolver.
-    fn patch_arrived_images(&mut self, version: u64, width: u32, height: u32, images: Option<&dyn ImageResolver>) -> bool {
+    fn patch_arrived_images(&mut self, version: u64, width: u32, height: u32, images: Option<&dyn ImageResolver>, arrivals: &[NodeId]) -> bool {
         let Some(generation) = images.map(ImageResolver::generation).filter(|generation| *generation != 0) else {
             return false;
         };
@@ -3887,8 +3998,11 @@ impl RenderSession {
         let patched = frame.document_version == version
             && frame.width == width
             && frame.height == height
-            && frame.image_generation != Some(generation)
-            && self.patch_frame(&mut frame, images, generation);
+            && (!arrivals.is_empty() || frame.image_generation != Some(generation))
+            && self.patch_frame(&mut frame, images, generation)
+            // A lookup of an arrived element still pending was not answered
+            // by its bitmap: the frame would keep the loading placeholder.
+            && !self.pending_lookups.iter().any(|(lookup, _)| lookup_node(lookup).is_some_and(|node| arrivals.contains(&node)));
         self.cached = Some(frame);
         patched
     }
@@ -3960,6 +4074,122 @@ impl RenderSession {
         true
     }
 
+    /// Keeps the retained frame when every mutation since it was laid out
+    /// happened inside a subtree that is not rendered (`display: none`, such
+    /// as the scripts and styles a page's loader adds to and removes from
+    /// `head`), since nothing that is rendered can change then. The frame is
+    /// then current for the document's version without a style pass or layout.
+    fn reuse_frame_after_inert_mutations(
+        &mut self,
+        width: u32,
+        height: u32,
+        text: &dyn TextShaper,
+        version: u64,
+    ) -> bool {
+        if !(self.forced_layout || !self.timeline_layout_stale) {
+            return false;
+        }
+        let candidate = self.cached.as_ref().is_some_and(|cached| {
+            cached.document_version != version
+                && cached.width == width
+                && cached.height == height
+                && (!self.rendered_text_requested || cached.geometry.collect_rendered_text)
+                && (!self.selectable_text || cached.geometry.collect_text_runs)
+                && cached.rules_generation == self.rules_generation
+                && self.style_version == cached.document_version
+        });
+        if !candidate || self.refresh_rules().is_err() {
+            return false;
+        }
+        let Some(cached) = self.cached.as_ref() else {
+            return false;
+        };
+        let span = version.wrapping_sub(cached.document_version);
+        let rules = self.rules.as_ref().expect("stylesheets initialized");
+        if cached.rules_generation != self.rules_generation
+            || rules.depends_on_children()
+            || span == 0
+            || (self.document.mutations().len() as u64) < span
+            || self.document.mutations().iter().any(|mutation| mutation.version <= cached.document_version)
+        {
+            return false;
+        }
+        let targets: Vec<(NodeId, bool)> = {
+            let mut targets = Vec::new();
+            for mutation in self.document.mutations() {
+                let element_itself_may_change = match &mutation.kind {
+                    MutationKind::Attribute(name) => {
+                        // Names and states other elements are matched or
+                        // grouped by (`:target`, `label for`, radio groups).
+                        if matches!(name.as_str(), "id" | "name" | "for" | "form" | "list" | "checked" | "selected" | "value" | "type") {
+                            return false;
+                        }
+                        true
+                    }
+                    MutationKind::CharacterData => true,
+                    MutationKind::Tree { styles_changed: false, added, removed } => {
+                        if added.is_some_and(|node| subtree_has_style(&self.document, node) || subtree_reaches_outside(&self.document, node))
+                            || removed.is_some_and(|node| subtree_has_style(&self.document, node) || subtree_reaches_outside(&self.document, node))
+                        {
+                            return false;
+                        }
+                        false
+                    }
+                    _ => return false,
+                };
+                if in_style(&self.document, mutation.target) {
+                    return false;
+                }
+                targets.push((mutation.target, element_itself_may_change));
+            }
+            targets
+        };
+        let mut unrendered: Vec<NodeId> = Vec::new();
+        let mut rendered: Vec<NodeId> = Vec::new();
+        for (target, strict) in targets {
+            let mut current = if strict { self.document.parent(target).ok().flatten() } else { Some(target) };
+            let mut inert = false;
+            while let Some(node) = current {
+                if let Ok(NodeKind::Element { namespace, name, .. }) = self.document.kind(node) {
+                    if reaches_outside_inert_subtree(namespace, name) {
+                        return false;
+                    }
+                }
+                if unrendered.contains(&node) {
+                    inert = true;
+                    break;
+                }
+                if !rendered.contains(&node) && matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+                    // Other vocabularies reach unrendered elements from
+                    // rendered ones (an SVG `symbol` through its `use`).
+                    if !matches!(self.document.kind(node), Ok(NodeKind::Element { namespace: crate::Namespace::Html, .. })) {
+                        return false;
+                    }
+                    match self.computed_style_with_text(node, Some(text)) {
+                        Ok(style) if style.display == css::Display::None => {
+                            unrendered.push(node);
+                            inert = true;
+                            break;
+                        }
+                        Ok(_) => rendered.push(node),
+                        Err(_) => return false,
+                    }
+                }
+                current = self.document.composed_parent(node).ok().flatten();
+            }
+            if !inert {
+                return false;
+            }
+        }
+        if let Some(cached) = self.cached.as_mut() {
+            cached.document_version = version;
+        }
+        self.style_version = version;
+        self.reclaim_stale_stylesheet_sources();
+        self.document.clear_mutations();
+        true
+    }
+
     fn render(
         &mut self,
         width: u32,
@@ -3984,7 +4214,14 @@ impl RenderSession {
         self.object_representations.retain(|(node, _, _)| self.document.kind(*node).is_ok());
         let version = self.document.version();
         let image_generation = images.map(ImageResolver::generation);
-        self.patch_arrived_images(version, width, height, images);
+        let arrivals = self.resolve_bitmap_arrivals();
+        if !(self.images_pending && image_generation == Some(0)) {
+            self.reuse_frame_after_inert_mutations(width, height, text, version);
+        }
+        if !self.patch_arrived_images(version, width, height, images, &arrivals) && !arrivals.is_empty() {
+            self.invalidate_paint();
+            self.frame_id = self.frame_id.wrapping_add(1);
+        }
         // A layout which fails leaves the previous frame's pending state.
         let pending_before = self.images_pending;
         // Generation 0 means the resolver does not version its state, so a
@@ -4202,6 +4439,8 @@ impl RenderSession {
         let mut timeline_corrected=false;
         let mut pending_images = self.images_pending;
         let mut pending_lookups: Vec<(layout::PendingLookup, bool)>;
+        let mut culled_images: Vec<NodeId>;
+        let mut reached_images: Vec<NodeId>;
         let origin_attempted = !self.origin_refused;
         let (mut list, mut geometry) = loop {
             let mut geometry = layout::LayoutGeometry::default();
@@ -4296,6 +4535,8 @@ impl RenderSession {
                 self.scroll_window = window;
                 pending_images |= node_images.pending.get();
                 pending_lookups = node_images.pending.take_distinct();
+                culled_images = node_images.pending.culled.take();
+                reached_images = node_images.pending.reached.take();
                 list
             };
             let mut changed = false;
@@ -4335,6 +4576,12 @@ impl RenderSession {
         };
         self.images_pending = pending_images;
         self.pending_lookups = pending_lookups;
+        culled_images.sort_unstable_by_key(|node| node.key());
+        culled_images.dedup();
+        self.culled_images = culled_images;
+        reached_images.sort_unstable_by_key(|node| node.key());
+        reached_images.dedup();
+        self.reached_images = (self.layout_cache.stats().hits == 0).then_some(reached_images);
         // A layout made at the scroll offset directly shows whether the
         // document can be moved again, so that the origin is tried once it can.
         self.origin_refused = if origin_attempted {
@@ -4360,6 +4607,7 @@ impl RenderSession {
             // Lazy resolvers may admit/decode an image while constructing
             // this frame. Its completed commands own that generation.
             image_generation:images.map(ImageResolver::generation),
+            rules_generation: self.rules_generation,
             list,
             geometry,
         });
@@ -8004,6 +8252,218 @@ mod tests {
         ready.arrive("back.png");
         let reference = fresh.display_list_with_images(200, 400, &NoText, &ready).unwrap().clone();
         assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn mutating_an_unrendered_head_script_keeps_the_frame() {
+        let document = crate::html::parse("<head><script id=s></script></head><body><p id=p>text</p>", 64).unwrap();
+        let script = crate::selector::get_element_by_id(&document, document.root(), "s").unwrap().unwrap();
+        let mut session = RenderSession::new(document);
+        let before = session.display_list(200, 100, &NoText).unwrap().clone();
+        assert_eq!(session.layout_count(), 1);
+        session.document_mut().set_attribute(script, "src", "late.js").unwrap();
+        let after = session.display_list(200, 100, &NoText).unwrap().clone();
+        assert_eq!(session.layout_count(), 1, "nothing rendered changed");
+        assert!(before.0 == after.0);
+        let paragraph = crate::selector::get_element_by_id(session.document(), session.document().root(), "p").unwrap().unwrap();
+        session.document_mut().set_attribute(paragraph, "style", "height:40px").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        assert_eq!(session.layout_count(), 2, "a rendered element does change the frame");
+    }
+
+    #[test]
+    fn a_bitmap_for_a_sized_image_below_the_viewport_does_not_lay_out_again() {
+        let source = "<body style='margin:0'><div style='height:2000px'></div>\
+            <img id=far width=10 height=10 style='display:block'>\
+            <img id=near width=10 height=10 style='display:block;position:absolute;top:0'>";
+        let document = crate::html::parse(source, 64).unwrap();
+        let far = crate::selector::get_element_by_id(&document, document.root(), "far").unwrap().unwrap();
+        let images = Sources::new();
+        let mut session = RenderSession::new(document);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 1);
+        let image = Arc::new(ImageData { width: 4, height: 4, pixels: alloc::vec![9; 4 * 4 * 4] });
+        session.set_node_bitmap(far, Some(image.clone())).unwrap();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 1, "the image is below what the frame paints");
+    }
+
+    #[test]
+    fn a_bitmap_for_an_unsized_image_lays_out_again() {
+        let document = crate::html::parse("<body style='margin:0'><img id=free style='display:block'><div id=tail style='height:10px'></div>", 64).unwrap();
+        let free = crate::selector::get_element_by_id(&document, document.root(), "free").unwrap().unwrap();
+        let images = Sources::new();
+        let mut session = RenderSession::new(document);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        let tail = id_rect(&session, "tail");
+        let image = Arc::new(ImageData { width: 4, height: 30, pixels: alloc::vec![9; 4 * 30 * 4] });
+        session.set_node_bitmap(free, Some(image)).unwrap();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 2);
+        assert_ne!(id_rect(&session, "tail"), tail, "the image sizes its box");
+    }
+
+    fn bitmap_page(source: &str) -> (RenderSession, Sources) {
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        let images = Sources::new();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        (session, images)
+    }
+
+    fn node_by_id(session: &RenderSession, id: &str) -> NodeId {
+        crate::selector::get_element_by_id(session.document(), session.document().root(), id).unwrap().unwrap()
+    }
+
+    fn small_bitmap() -> Arc<ImageData> {
+        Arc::new(ImageData { width: 4, height: 30, pixels: alloc::vec![9; 4 * 30 * 4] })
+    }
+
+    #[test]
+    fn a_bitmap_for_a_width_only_image_below_the_viewport_lays_out_again() {
+        let (mut session, images) = bitmap_page("<body style='margin:0'><div style='height:2000px'></div>\
+            <img id=far width=10 style='display:block'><div id=tail style='height:10px'></div>");
+        let far = node_by_id(&session, "far");
+        let tail = id_rect(&session, "tail");
+        session.set_node_bitmap(far, Some(small_bitmap())).unwrap();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 2);
+        assert_ne!(id_rect(&session, "tail"), tail, "the image gives the box its height");
+    }
+
+    #[test]
+    fn a_bitmap_for_an_aspect_ratio_image_below_the_viewport_lays_out_again() {
+        let (mut session, images) = bitmap_page("<body style='margin:0'><div style='height:2000px'></div>\
+            <img id=far style='display:block;height:20px;aspect-ratio:2'><div id=tail style='height:10px'></div>\
+            <img id=wide style='display:block;width:20px;aspect-ratio:2'>");
+        let far = node_by_id(&session, "far");
+        session.set_node_bitmap(far, Some(small_bitmap())).unwrap();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 2);
+        let wide = node_by_id(&session, "wide");
+        session.set_node_bitmap(wide, Some(small_bitmap())).unwrap();
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert_eq!(session.layout_count(), 3);
+    }
+
+    #[test]
+    fn a_bitmap_for_other_replaced_elements_which_size_their_box_lays_out_again() {
+        let (mut session, images) = bitmap_page("<body style='margin:0'><canvas id=c style='display:block'></canvas>\
+            <input id=b type=image style='display:block'><video id=v style='display:block'></video>\
+            <div id=tail style='height:10px'></div>");
+        let mut expected = 1;
+        for id in ["c", "b", "v"] {
+            let node = node_by_id(&session, id);
+            session.set_node_bitmap(node, Some(small_bitmap())).unwrap();
+            session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+            expected += 1;
+            assert_eq!(session.layout_count(), expected, "{id}");
+        }
+    }
+
+    fn paints_bitmap(list: &DisplayList, bitmap: &Arc<ImageData>) -> bool {
+        list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { image, .. } if Arc::ptr_eq(image, bitmap)))
+    }
+
+    struct PendingNodes(u64);
+
+    impl ImageResolver for PendingNodes {
+        fn resolve(&self, _: &str) -> ImageState {
+            ImageState::Pending
+        }
+        fn resolve_node(&self, _: NodeId) -> Option<ImageState> {
+            Some(ImageState::Pending)
+        }
+        fn generation(&self) -> u64 {
+            self.0
+        }
+        fn arrivals_only_since(&self, _: u64) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_bitmap_for_a_sized_image_is_painted_into_the_retained_frame() {
+        let mut session = RenderSession::new(crate::html::parse("<body style='margin:0'><img id=i src='x.png' width=10 height=10>", 64).unwrap());
+        let images = PendingNodes(1);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        let node = node_by_id(&session, "i");
+        let bitmap = small_bitmap();
+        session.set_node_bitmap(node, Some(bitmap.clone())).unwrap();
+        assert!(paints_bitmap(session.display_list_with_images(200, 100, &NoText, &images).unwrap(), &bitmap));
+        assert_eq!(session.layout_count(), 1);
+        assert_eq!(session.image_patch_count(), 1);
+    }
+
+    #[test]
+    fn a_bitmap_which_cannot_be_patched_in_never_leaves_the_loading_frame() {
+        let mut session = RenderSession::new(crate::html::parse("<body style='margin:0'><img id=i src='x.png' width=10 height=10>", 64).unwrap());
+        let images = PendingNodes(0);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        let node = node_by_id(&session, "i");
+        let bitmap = small_bitmap();
+        session.set_node_bitmap(node, Some(bitmap.clone())).unwrap();
+        assert!(paints_bitmap(session.display_list_with_images(200, 100, &NoText, &images).unwrap(), &bitmap));
+        assert_eq!(session.layout_count(), 2);
+    }
+
+    const HIDDEN_HEAD_PAGE: &str = "<head><script id=s></script></head><body style='margin:0'>\
+        <div id=d style='height:20px'><span id=c>x</span></div><p id=p style='margin:0;height:10px'>t</p>";
+
+    fn rendered_height_of_p_offset(session: &RenderSession) -> f32 {
+        id_rect(session, "p").y
+    }
+
+    #[test]
+    fn a_batch_hiding_an_ancestor_then_mutating_inside_it_lays_out_again() {
+        let (mut session, _) = bitmap_page(HIDDEN_HEAD_PAGE);
+        let (d, c) = (node_by_id(&session, "d"), node_by_id(&session, "c"));
+        let before = rendered_height_of_p_offset(&session);
+        assert!(before > 0.0);
+        session.document_mut().set_attribute(d, "style", "height:20px;display:none").unwrap();
+        session.document_mut().set_attribute(c, "title", "t").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        assert_eq!(session.layout_count(), 2);
+        assert_eq!(rendered_height_of_p_offset(&session), 0.0);
+    }
+
+    #[test]
+    fn a_batch_showing_an_ancestor_then_mutating_inside_it_lays_out_again() {
+        let (mut session, _) = bitmap_page(&HIDDEN_HEAD_PAGE.replace("<div id=d style='height:20px'>", "<div id=d style='height:20px;display:none'>"));
+        let (d, c) = (node_by_id(&session, "d"), node_by_id(&session, "c"));
+        assert_eq!(rendered_height_of_p_offset(&session), 0.0);
+        session.document_mut().set_attribute(d, "style", "height:20px;display:block").unwrap();
+        session.document_mut().set_attribute(c, "title", "t").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        assert_eq!(session.layout_count(), 2);
+        assert!(rendered_height_of_p_offset(&session) > 0.0);
+    }
+
+    #[test]
+    fn mutations_in_unrendered_form_and_select_subtrees_are_not_reused() {
+        let source = "<head><script id=s></script></head><body style='margin:0'>\
+            <div style='display:none'><input type=radio name=g id=r1></div><input type=radio name=g id=r2 checked>\
+            <select id=sel><option id=o>one</option></select><p id=p>t</p>";
+        let (mut session, _) = bitmap_page(source);
+        let mut expected = 1;
+        let radio = node_by_id(&session, "r1");
+        session.document_mut().set_attribute(radio, "checked", "").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        expected += 1;
+        assert_eq!(session.layout_count(), expected, "hidden radio");
+        let option = node_by_id(&session, "o");
+        let text = session.document().first_child(option).unwrap().unwrap();
+        session.document_mut().replace_data(text, "two").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        expected += 1;
+        assert_eq!(session.layout_count(), expected, "option text");
+        let script = node_by_id(&session, "s");
+        session.document_mut().set_attribute(script, "id", "t").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        expected += 1;
+        assert_eq!(session.layout_count(), expected, "id of a hidden element");
+        session.document_mut().set_attribute(script, "src", "late.js").unwrap();
+        session.display_list(200, 100, &NoText).unwrap();
+        assert_eq!(session.layout_count(), expected, "a script source alone changes nothing");
     }
 
     #[test]

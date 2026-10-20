@@ -805,6 +805,17 @@ impl WindowNamedPropertiesHandler {
         Ok(names)
     }
 
+    fn has_named_nodes(&self, name: &str) -> OpResult<bool> {
+        let Some(realm) = self.realm.borrow().upgrade() else {
+            return Ok(false);
+        };
+        let indexed = realm.session.borrow().document().indexed_window_name_exists(name);
+        match indexed {
+            Some(exists) => Ok(exists),
+            None => Ok(!self.named_nodes(name)?.is_empty()),
+        }
+    }
+
     fn named_nodes(&self, name: &str) -> OpResult<Vec<NodeId>> {
         let Some(realm) = self.realm.borrow().upgrade() else {
             return Ok(Vec::new());
@@ -831,7 +842,7 @@ impl WindowNamedPropertiesHandler {
             Some(realm) => realm.named_child_windows(ctx)?.iter().any(|(_, candidate, _)| candidate == name),
             None => false,
         };
-        if !navigable && self.named_nodes(name)?.is_empty() {
+        if !navigable && !self.has_named_nodes(name)? {
             return Ok(false);
         }
         let inherited = ctx
@@ -1054,6 +1065,27 @@ mod tests {
                     .unwrap_or_else(|| "script threw".into());
                 panic!("{message}");
             }
+        }
+    }
+
+    #[test]
+    fn indexed_window_names_match_the_named_properties_walk() {
+        let source = "<body id=top><a name=anchor id=link></a><area name=areaname><form name=f1 id=f2></form>\
+            <img name=pic><embed name=emb><object name=obj></object><input name=field id=control>\
+            <img name=''><div id=''></div><svg><image name=svgpic id=svgid></image></svg>\
+            <span name=Pic></span><IMG NAME=upper>";
+        let document = lumen_html::html::parse(source, 64).unwrap();
+        let names = ["top", "anchor", "link", "areaname", "f1", "f2", "pic", "Pic", "emb", "obj", "field", "control", "svgpic", "svgid", "upper", "UPPER", "", "absent"];
+        for name in names {
+            let filter = DescendantFilter::WindowNamed(name.to_owned());
+            let root = document.root();
+            let mut walked = false;
+            let mut next = super::next_descendant(&document, root, root).unwrap();
+            while let Some(node) = next {
+                walked |= filter.matches(&document, node).unwrap();
+                next = super::next_descendant(&document, root, node).unwrap();
+            }
+            assert_eq!(document.indexed_window_name_exists(name), Some(walked), "name {name:?}");
         }
     }
 

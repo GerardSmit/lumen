@@ -111,6 +111,11 @@ pub trait ImageResolver {
     fn pending_since(&self, _mark: usize) -> Vec<(PendingLookup, bool)> {
         Vec::new()
     }
+    /// Records that the layout reached a replaced element (`<img>`, canvas,
+    /// video, image button, object), and whether it skipped it as lying below
+    /// the culled region (its image then neither sizes nor paints anything in
+    /// this layout; only recorded for a box sized in both dimensions).
+    fn note_image_box(&self, _node: NodeId, _culled: bool) {}
     /// Re-logs the lookups of a replayed fragment for the boxes around it.
     fn replay_pending(&self, _lookups: &[(PendingLookup, bool)]) {}
     /// Marks the following lookups as uses whose answer cannot change the
@@ -36367,6 +36372,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         if !virtual_parent
             && (tag == "img" || html_image_button(tag, attributes) || tag == "canvas" || tag == "video" || object_image || replacement_source.is_some())
         {
+            if let Some(images) = self.images {
+                images.note_image_box(id, false);
+            }
             let dimension = |key: &str| {
                 if tag == "canvas" {
                     let raw = crate::svg::attribute(attributes, key);
@@ -36400,6 +36408,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 .map(|height| content_height_dimension(&style, height));
             if self.source_capture_depth == 0 && self.transform_depth == 0 && outer_y >= self.cull_bottom() {
                 if let Some(height) = specified_height {
+                    // Only a box sized in both dimensions takes nothing from
+                    // its image, so that its arrival changes nothing here.
+                    if tag == "img" && specified_width.is_some() {
+                        if let Some(images) = self.images {
+                            images.note_image_box(id, true);
+                        }
+                    }
                     return Ok(height
                         + padding_top
                         + padding_bottom

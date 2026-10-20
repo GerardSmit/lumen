@@ -306,6 +306,8 @@ struct IdIndex {
     walked_version: Option<u64>,
     built_version: Option<u64>,
     first: alloc::collections::BTreeMap<String, NodeId>,
+    /// `name` values of the HTML `embed`, `form`, `img` and `object` elements.
+    legacy_names: alloc::collections::BTreeSet<String>,
 }
 
 /// Host-owned live form state is read through a weak adapter without copying
@@ -397,28 +399,68 @@ impl Document {
     /// Returns `None` when the index is not warm yet and the caller must walk the tree.
     pub(crate) fn indexed_element_by_id(&self, wanted: &str) -> Option<Option<NodeId>> {
         let mut index = self.id_index.borrow_mut();
-        if index.built_version != Some(self.version) {
-            if index.walked_version != Some(self.version) {
-                index.walked_version = Some(self.version);
-                return None;
-            }
-            let mut first = alloc::collections::BTreeMap::new();
-            let root = self.root();
-            let mut current = self.first_child(root).ok()?;
-            while let Some(id) = current {
-                if matches!(self.kind(id), Ok(NodeKind::Element { .. })) {
-                    if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "id") {
-                        if !value.is_empty() && !first.contains_key(value) {
-                            first.insert(String::from(value), id);
+        if !self.warm_id_index(&mut index, false) {
+            return None;
+        }
+        Some(index.first.get(wanted).copied())
+    }
+
+    /// Whether some connected light-tree element is a window named property
+    /// `wanted` (an `id`, or the `name` of an `embed`, `form`, `img` or
+    /// `object`). Builds the index on the first call, since the alternative is
+    /// a walk of the whole tree as well; `None` only if the tree cannot be walked.
+    pub fn indexed_window_name_exists(&self, wanted: &str) -> Option<bool> {
+        let mut index = self.id_index.borrow_mut();
+        if !self.warm_id_index(&mut index, true) {
+            return None;
+        }
+        Some(index.first.contains_key(wanted) || index.legacy_names.contains(wanted))
+    }
+
+    /// `eager` builds the index at once; otherwise it is built on the second
+    /// lookup of a version, so that a single `id` lookup can still stop early.
+    fn warm_id_index(&self, index: &mut IdIndex, eager: bool) -> bool {
+        if index.built_version == Some(self.version) {
+            return true;
+        }
+        if !eager && index.walked_version != Some(self.version) {
+            index.walked_version = Some(self.version);
+            return false;
+        }
+        let mut first = alloc::collections::BTreeMap::new();
+        let mut legacy_names = alloc::collections::BTreeSet::new();
+        let root = self.root();
+        let Ok(mut current) = self.first_child(root) else {
+            return false;
+        };
+        while let Some(id) = current {
+            if let Ok(NodeKind::Element { namespace, name, .. }) = self.kind(id) {
+                if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "id") {
+                    if !value.is_empty() && !first.contains_key(value) {
+                        first.insert(String::from(value), id);
+                    }
+                }
+                if matches!(namespace, Namespace::Html)
+                    && ["embed", "form", "img", "object"]
+                        .iter()
+                        .any(|tag| name.eq_ignore_ascii_case(tag))
+                {
+                    if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "name") {
+                        if !value.is_empty() {
+                            legacy_names.insert(String::from(value));
                         }
                     }
                 }
-                current = selector::next_descendant(self, root, id).ok()?;
             }
-            index.first = first;
-            index.built_version = Some(self.version);
+            match selector::next_descendant(self, root, id) {
+                Ok(next) => current = next,
+                Err(_) => return false,
+            }
         }
-        Some(index.first.get(wanted).copied())
+        index.first = first;
+        index.legacy_names = legacy_names;
+        index.built_version = Some(self.version);
+        true
     }
 
     pub fn set_validity_resolver(

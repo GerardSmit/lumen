@@ -6616,6 +6616,10 @@ impl ScopeContext {
         self.start.iter().chain(self.end.iter()).any(|list| list.iter().any(Selector::has_validity_dependency))
             || self.outer.as_ref().is_some_and(|outer| outer.has_validity_dependency())
     }
+    fn depends_on_children(&self) -> bool {
+        self.start.iter().chain(self.end.iter()).any(|list| list.iter().any(Selector::depends_on_children))
+            || self.outer.as_ref().is_some_and(|outer| outer.depends_on_children())
+    }
     /// Enumerate only ancestor roots, sharing one work budget across nested
     /// scopes. Subjects inside a scope limit are excluded, while ancestors in
     /// an authored selector are still matched using the ordinary tree matcher.
@@ -6836,6 +6840,7 @@ pub struct StyleIndex {
     /// its attributes, so siblings with equal elements compute equal styles.
     pub(crate) siblings_share: bool,
     rules_siblings_share: bool,
+    children_state_dependent: bool,
     document_base_url: Option<Arc<str>>,
     /// Web Animations effect declarations are kept outside the DOM/cascade
     /// source and applied at the animation cascade origin for their target.
@@ -7195,8 +7200,13 @@ impl StyleIndex {
                     .iter()
                     .any(|declaration| value_depends_on_sibling_position(&declaration.value))
         });
+        let children_state_dependent = rules.iter().any(|rule| {
+            rule.selector.depends_on_children()
+                || rule.css_scope.as_ref().is_some_and(|scope| scope.depends_on_children())
+        });
         Self {
             environment: MediaEnvironment::default(),
+            children_state_dependent,
             has_z_index,
             has_generated_content,
             has_typographic_content,
@@ -7592,6 +7602,13 @@ impl StyleIndex {
         }
         self.siblings_share = self.rules_siblings_share && self.effect_declarations.is_empty();
         Ok(())
+    }
+
+    /// Whether some selector matches depending on an element's children
+    /// (`:has()`, `:empty`, form validity), so that a change inside an
+    /// element can change the element's own style.
+    pub fn depends_on_children(&self) -> bool {
+        self.children_state_dependent
     }
 
     /// Append another stylesheet's parsed rules after the existing sheets and
@@ -22229,6 +22246,25 @@ impl Selector {
             })
     }
 
+    /// Whether the selector (or a compound of it) can match depending on the
+    /// children of an element: `:has()`, `:empty` and the form validity
+    /// states of a container.
+    fn depends_on_children(&self) -> bool {
+        self.form_state.contains(crate::forms::FormStatePseudo::UserValid)
+            || self.form_state.contains(crate::forms::FormStatePseudo::UserInvalid)
+            || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Empty | StructuralPseudo::Valid | StructuralPseudo::Invalid))
+            || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Nth { of: Some(of), .. } if of.iter().any(Selector::depends_on_children)))
+            || self.logical.iter().any(|pseudo| match pseudo {
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) => true,
+                LogicalPseudo::Not(selectors)
+                | LogicalPseudo::Is(selectors)
+                | LogicalPseudo::Where(selectors) => selectors.iter().any(Selector::depends_on_children),
+                LogicalPseudo::Nesting(selectors) => selectors.iter().any(Selector::depends_on_children),
+                LogicalPseudo::Heading(_) | LogicalPseudo::InvalidNesting => false,
+            })
+            || self.ancestor.as_ref().is_some_and(|(_, ancestor)| ancestor.depends_on_children())
+    }
+
     fn ancestor_mask(&self) -> u64 {
         // `::part()` and `:host`/`::slotted()` matching ignores the ancestor chain.
         // Logical branches are alternatives, so their ancestor masks cannot be
@@ -27149,6 +27185,20 @@ fn compute_for_named_registered_mode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn style_index_reports_child_state_dependence_through_combinators_scopes_and_appends() {
+        let depends = |css: &str| StyleIndex::new(parse_stylesheet(css).unwrap().rules).depends_on_children();
+        assert!(!depends("div + p, .a ~ b > i { color: red }"));
+        assert!(depends("div:empty + p { color: red }"));
+        assert!(depends("x:has(y) ~ z { color: red }"));
+        assert!(depends("a > b:not(:empty) c { color: red }"));
+        assert!(depends("@scope (.card:has(img)) { p { color: red } }"));
+        let mut index = StyleIndex::new(parse_stylesheet("p { color: red }").unwrap().rules);
+        assert!(!index.depends_on_children());
+        index.append_rules(parse_stylesheet("div:empty + p { color: blue }").unwrap().rules);
+        assert!(index.depends_on_children());
+    }
+
     #[test]
     fn specification_svg_instance_registered_query_replays_preserve_matched_sources_and_virtual_siblings() {
         let document=crate::html::parse("<!doctype html><svg><g class='source'><rect/><g id='template'/><rect/></g><use id='host'/></svg>",64).unwrap();
