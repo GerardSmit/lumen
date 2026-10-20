@@ -587,6 +587,8 @@ pub struct RenderSession {
     animated_styles: Vec<(NodeId, Option<css::PseudoElement>, css::EffectOrigin, Vec<(String, String)>)>,
     style_cache: RefCell<css::StyleCache>,
     layout_cache: layout::RetainedLayoutCache,
+    /// The style cache epoch the retained intrinsic sizes were measured in.
+    intrinsic_style_epoch: Option<u64>,
     style_version: u64,
     style_environment: Option<css::MediaEnvironment>,
     presentation_root: Option<NodeId>,
@@ -819,6 +821,7 @@ impl RenderSession {
             animated_styles: Vec::new(),
             style_cache: RefCell::default(),
             layout_cache: layout::RetainedLayoutCache::default(),
+            intrinsic_style_epoch: None,
             style_version: 0,
             style_environment: None,
             presentation_root: None,
@@ -3868,8 +3871,14 @@ impl RenderSession {
         // A new generation only changes what the loading images answer: the
         // retained fragments laid out around one that is still loading revalidate
         // themselves (see `RetainedFragment::pending_images`), all others replay.
-        if self.cached.as_ref().is_some_and(|cached| cached.width != width || cached.height != height) {
-            self.layout_cache.clear();
+        if let Some(cached) = self.cached.as_ref().filter(|cached| cached.width != width || cached.height != height) {
+            let (width_changed, height_changed) = (cached.width != width, cached.height != height);
+            self.layout_cache.clear_for_resize(width_changed, height_changed);
+        }
+        // Intrinsic sizes measured around images keep the answers of the
+        // generation they were measured in.
+        if unversioned_pending || self.cached.as_ref().is_some_and(|cached| cached.image_generation != image_generation) {
+            self.layout_cache.clear_intrinsics();
         }
         if unversioned_pending || self.cached.as_ref().is_some_and(|cached| {
             cached.width != width
@@ -3993,8 +4002,13 @@ impl RenderSession {
         let full_restyle = !can_retain
             || (environment_changed
                 && !retain_styles_for_resize(rules, &self.style_cache, self.style_environment));
-        if environment_changed || full_restyle {
+        if full_restyle {
             self.layout_cache.clear();
+            self.images_pending = false;
+        } else if environment_changed {
+            // Only the viewport size changed (`retain_styles_for_resize`).
+            let old = self.style_environment.unwrap_or(rules.environment);
+            self.layout_cache.clear_for_resize(old.width != rules.environment.width, old.height != rules.environment.height);
             self.images_pending = false;
         }
         if full_restyle {
@@ -4048,6 +4062,11 @@ impl RenderSession {
             }
         }
         self.style_cache.borrow_mut().begin_frame();
+        let style_epoch = self.style_cache.borrow().epoch();
+        if self.intrinsic_style_epoch != Some(style_epoch) {
+            self.layout_cache.clear_intrinsics();
+            self.intrinsic_style_epoch = Some(style_epoch);
+        }
         self.layout_cache.begin_frame();
         self.style_version = version;
         self.style_environment = Some(rules.environment);
@@ -4191,6 +4210,35 @@ mod tests {
             alloc::format!("{:?}", fresh.display_list(width, height, &NoText).unwrap().0)
         }).collect();
         let mut session = RenderSession::new(crate::html::parse(source, 128).unwrap());
+        for (&(width, height), expected) in sizes.iter().zip(&expected) {
+            let retained = alloc::format!("{:?}", session.display_list(width, height, &NoText).unwrap().0);
+            assert_eq!(&retained, expected, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn resize_retained_intrinsic_sizes_match_a_fresh_session() {
+        let source = "<style>html,body{margin:0;height:100%}#ratio{display:inline-block;height:20%}#ratio div{height:100%;aspect-ratio:1;background:lime}.fill{height:3px;background:red}\
+            #float{float:left}#float div{width:10vh;height:2px;background:blue}\
+            #inline{display:inline-block}#inline div{width:20vw;height:5vh;background:green}\
+            #fixed{display:inline-block}#fixed div{width:30px;height:4px;background:navy}\
+            table{border-spacing:0}td{padding:0}td div{width:15vh;height:2px;background:olive}\
+            #grid{display:grid;grid-template-columns:auto auto}#grid div{width:8vh;height:3px;background:gray}\
+            #flex{display:flex}#flex div{min-width:min-content}#flex span{display:block;width:12vw;height:max(2px,1vh);background:teal}\
+            #tall{display:inline-block;max-height:50vh}#tall div{width:7px;height:400px;background:maroon}\
+            @media (min-height:300px){#media div{width:40px}}#media{float:right}#media div{width:20px;height:2px;background:purple}</style>\
+            <div class=fill></div><span id=inline><div></div></span><span id=fixed><div></div></span>\
+            <table><tr><td><div></div></td><td><div style=width:9px></div></td></tr></table>\
+            <div id=grid><div></div><div style=width:5px></div></div>\
+            <div id=flex><div><span></span></div><div style=width:6px></div></div>\
+            <span id=ratio><div></div></span><span id=tall><div></div></span>\
+            <div class=fill></div><div id=float><div></div></div><div id=media><div></div></div>";
+        let sizes = [(200, 100), (200, 400), (200, 100), (150, 100), (150, 400), (200, 250), (200, 400)];
+        let expected: Vec<_> = sizes.iter().map(|&(width, height)| {
+            let mut fresh = RenderSession::new(crate::html::parse(source, 256).unwrap());
+            alloc::format!("{:?}", fresh.display_list(width, height, &NoText).unwrap().0)
+        }).collect();
+        let mut session = RenderSession::new(crate::html::parse(source, 256).unwrap());
         for (&(width, height), expected) in sizes.iter().zip(&expected) {
             let retained = alloc::format!("{:?}", session.display_list(width, height, &NoText).unwrap().0);
             assert_eq!(&retained, expected, "{width}x{height}");

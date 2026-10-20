@@ -138,6 +138,66 @@ pub(crate) fn determine_with_parent(
     Err(Error::LimitExceeded)
 }
 
+/// Where a `determine` walk ended: the element declaring the language, or
+/// the last element walked when the document defaults apply.
+#[derive(Clone, Copy)]
+pub(crate) enum LanguageSource {
+    Declared(NodeId),
+    Defaults(NodeId),
+}
+
+/// For each element a `determine_memoized` walk visited: where the walk
+/// ended and how many elements it visited from there, indexed by node.
+pub(crate) type LanguageMemo = alloc::vec::Vec<Option<(NodeId, LanguageSource, u16)>>;
+
+/// `determine` through DOM parents, sharing walks through `memo`. The memo
+/// is valid while the document is unchanged.
+pub(crate) fn determine_memoized<'a>(document: &'a Document, node: NodeId, memo: &mut LanguageMemo)
+    -> Result<Option<&'a str>, Error> {
+    let mut walked = alloc::vec::Vec::new();
+    let mut current = node;
+    let (source, rest) = loop {
+        if let Some(Some((cached, source, steps))) = memo.get(current.index()) {
+            if *cached == current { break (*source, usize::from(*steps)); }
+        }
+        if walked.len() >= 512 { return Err(Error::LimitExceeded); }
+        walked.try_reserve(1).map_err(|_| Error::LimitExceeded)?;
+        walked.push(current);
+        if declared(document, current)?.is_some() { break (LanguageSource::Declared(current), 0); }
+        if let Some(parent) = document.parent(current)? {
+            if let Some(host) = document.shadow_host(parent)? {
+                current = host;
+                continue;
+            }
+            if matches!(document.kind(parent)?, NodeKind::Element { .. }) {
+                current = parent;
+                continue;
+            }
+        }
+        break (LanguageSource::Defaults(current), 0);
+    };
+    let total = walked.len() + rest;
+    if total > 512 { return Err(Error::LimitExceeded); }
+    if let Some(last) = walked.iter().map(|node| node.index()).max() {
+        if memo.len() <= last { memo.resize(document.node_count().max(last + 1), None); }
+    }
+    for (index, visited) in walked.iter().enumerate() {
+        memo[visited.index()] = Some((*visited, source, (total - index) as u16));
+    }
+    match source {
+        LanguageSource::Declared(node) => declared(document, node),
+        LanguageSource::Defaults(node) => {
+            if document.node_document(node)? != document.root() {
+                return Ok(None);
+            }
+            Ok(document
+                .language_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.pragma.as_deref().or(defaults.protocol.as_deref())))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

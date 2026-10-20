@@ -37,6 +37,11 @@ const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SHAPE_TEXT_BYTES: usize = 64 * 1024;
 const RUN_CACHE_SLOTS: usize = 16384;
 const MAX_RUN_CACHE_BYTES: usize = 8 * 1024 * 1024;
+/// A font set's own shaped runs hold whole-paragraph segments with cluster
+/// advances. A long article needs about 15 MiB of them; a smaller bound makes
+/// every relayout reshape most paragraphs.
+const FONT_SET_RUN_CACHE_SLOTS: usize = 32768;
+const MAX_FONT_SET_RUN_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CACHED_TEXT_BYTES: usize = 256;
 const MAX_REGISTERED_FONTS: usize = 64;
 const MAX_REQUESTED_FAMILIES: usize = 64;
@@ -465,8 +470,9 @@ pub struct FontSet {
     descriptors: Vec<RegisteredFontDescriptors>,
     default_ignorable: &'static [(u32, u32)],
     generation: u64,
-    shapes: RunCache<ShapedRun>,
+    shapes: RunCache<ShapedRun,FONT_SET_RUN_CACHE_SLOTS,MAX_FONT_SET_RUN_CACHE_BYTES>,
     metric_selections: RunCache<FontMetricSelection,16>,
+    last_metric_selection: LastMetricSelection,
     feature_environment: lumen_html::css::MediaEnvironment,
     display: Option<Arc<[lumen_html::font_display::DisplayPhase]>>,
 }
@@ -1229,6 +1235,7 @@ impl FontSet {
             generation,
             shapes: RunCache::new(),
             metric_selections: RunCache::new(),
+            last_metric_selection: LastMetricSelection::default(),
             feature_environment: lumen_html::css::MediaEnvironment::default(),
             display: None,
         })
@@ -1525,7 +1532,14 @@ impl FontSet {
     fn metric_selection(&self,spec:&FontSpec)->FontMetricSelection {
         // Unresolved owner math never enters a font-selection cache.
         if spec.unresolved_style.is_some()||spec.unresolved_stretch.is_some(){return FontMetricSelection {first:0,ch:0,ic:0};}
-        if let Some(selection)=self.metric_selections.get_styled("",0.0,None,0,Some(spec)){return selection;}
+        if let Some(selection)=self.last_metric_selection.get(spec) {
+            self.metric_selections.hits.fetch_add(1,Ordering::Relaxed);
+            return selection;
+        }
+        if let Some(selection)=self.metric_selections.get_styled("",0.0,None,0,Some(spec)){
+            self.last_metric_selection.set(spec,selection);
+            return selection;
+        }
         let Ok(order)=self.face_order(spec) else{return FontMetricSelection {first:0,ch:0,ic:0};};
         // Retain the same first-available and cluster fallback authorities.
         // FontSet descriptors, unicode ranges and display phases are immutable
@@ -1537,6 +1551,7 @@ impl FontSet {
         let select=|glyph|self.cluster_face(glyph,&order).0;
         let selection=FontMetricSelection {first,ch:select("0"),ic:select("水")};
         self.metric_selections.insert_styled("",0.0,None,0,Some(spec),selection);
+        self.last_metric_selection.set(spec,selection);
         selection
     }
     fn metric_face_index(&self, spec: &FontSpec) -> usize { self.metric_selection(spec).first }
@@ -1719,11 +1734,36 @@ struct RunSlot<V> {
     value: V,
 }
 
+/// The most recent metric selection. Layout asks for the same specification
+/// many times in a row, and the run cache key hashes every family name.
+#[derive(Default)]
+struct LastMetricSelection {
+    busy: AtomicBool,
+    value: UnsafeCell<Option<(FontSpec,FontMetricSelection)>>,
+}
+// SAFETY: value is touched only while the busy flag is held.
+unsafe impl Sync for LastMetricSelection {}
+impl LastMetricSelection {
+    fn locked<R>(&self,f:impl FnOnce(&mut Option<(FontSpec,FontMetricSelection)>)->R)->Option<R> {
+        if self.busy.swap(true,Ordering::Acquire) {return None;}
+        // SAFETY: busy grants exclusive access until it is released below.
+        let result=f(unsafe {&mut *self.value.get()});
+        self.busy.store(false,Ordering::Release);
+        Some(result)
+    }
+    fn get(&self,spec:&FontSpec)->Option<FontMetricSelection> {
+        self.locked(|value|value.as_ref().filter(|(cached,_)|cached==spec).map(|(_,selection)|*selection)).flatten()
+    }
+    fn set(&self,spec:&FontSpec,selection:FontMetricSelection) {
+        self.locked(|value|*value=Some((spec.clone(),selection)));
+    }
+}
+
 /// Two-way set-associative cache, bounded by slots, text length and retained
 /// bytes. A set's newer entry sits in its even slot; inserting demotes it to the
 /// odd slot. Contention is a miss; shaping never waits for another thread's
 /// cache lock.
-struct RunCache<V,const SLOTS:usize=RUN_CACHE_SLOTS> {
+struct RunCache<V,const SLOTS:usize=RUN_CACHE_SLOTS,const BYTES:usize=MAX_RUN_CACHE_BYTES> {
     busy: AtomicBool,
     slots: UnsafeCell<Vec<Option<Box<RunSlot<V>>>>>,
     /// Sum of the occupied slots' `bytes`, maintained under the busy flag.
@@ -1733,8 +1773,8 @@ struct RunCache<V,const SLOTS:usize=RUN_CACHE_SLOTS> {
     evictions: AtomicU64,
 }
 // SAFETY: slots is touched only while the busy flag is held.
-unsafe impl<V: Send,const SLOTS:usize> Sync for RunCache<V,SLOTS> {}
-impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
+unsafe impl<V: Send,const SLOTS:usize,const BYTES:usize> Sync for RunCache<V,SLOTS,BYTES> {}
+impl<V: CachedValue,const SLOTS:usize,const BYTES:usize> RunCache<V,SLOTS,BYTES> {
     const fn new() -> Self {
         Self {
             busy: AtomicBool::new(false),
@@ -1921,7 +1961,7 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
                 slots.resize_with(SLOTS, || None);
             }
             let table = slots.capacity() * core::mem::size_of::<Option<Box<RunSlot<V>>>>();
-            if table + bytes > MAX_RUN_CACHE_BYTES {
+            if table + bytes > BYTES {
                 return;
             }
             let set = Self::set(hash);
@@ -1942,10 +1982,10 @@ impl<V: CachedValue,const SLOTS:usize> RunCache<V,SLOTS> {
                 evict(&mut slots[set + 1], &mut retained);
                 slots.swap(set, set + 1);
             }
-            if table + retained + bytes > MAX_RUN_CACHE_BYTES {
+            if table + retained + bytes > BYTES {
                 for slot in slots.iter_mut() {
                     evict(slot, &mut retained);
-                    if table + retained + bytes <= MAX_RUN_CACHE_BYTES {
+                    if table + retained + bytes <= BYTES {
                         break;
                     }
                 }

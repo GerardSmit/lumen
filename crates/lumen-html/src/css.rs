@@ -7333,7 +7333,7 @@ impl StyleIndex {
         if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>2*1024*1024) {
             return Err(CssError{offset:0,message:"CSS transition snapshot provenance exceeds limit"});
         }
-        if pseudo.is_none() && !starting { cache.store(document, node, 0, role, &style); }
+        if pseudo.is_none() && !starting { cache.store_unattributed(document, node, role, &style); }
         Ok((style, eligibility))
     }
 
@@ -7408,6 +7408,7 @@ impl StyleIndex {
         let token = cache.parent_token(Some(origin_style));
         if let Some(token) = token {
             if let Some(generated) = cache.pseudo_entry(origin, pseudo, token, role) {
+                cache.replay_viewport_read(origin, 2);
                 return Ok(generated);
             }
         }
@@ -23069,8 +23070,8 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
 }
 
 /// Viewport-size reads by length resolution. A style cache attributes the
-/// reads made while it computes a node; any read outside those computations
-/// may come from a retained style and keeps resizes on the full restyle path.
+/// reads made while it computes a node to that node; reads from other
+/// threads only make the attribution conservative.
 static VIEWPORT_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Media evaluations, attributed like viewport reads. Evaluations outside a
 /// node computation only feed layout or the per-rule media results.
@@ -23078,6 +23079,9 @@ static MEDIA_READS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 fn note_viewport_read() { VIEWPORT_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
 fn viewport_reads() -> u64 { VIEWPORT_READS.load(core::sync::atomic::Ordering::Relaxed) }
 fn media_reads() -> u64 { MEDIA_READS.load(core::sync::atomic::Ordering::Relaxed) }
+/// Viewport and media read counts, for layout measurements that attribute
+/// the reads made while they run.
+pub(crate) fn viewport_read_counts() -> (u64, u64) { (viewport_reads(), media_reads()) }
 
 fn media_matches(query:&str,environment:MediaEnvironment)->bool {
     MEDIA_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -24069,6 +24073,7 @@ pub fn compute_node(
 const SHARED_RECENT: usize = 16;
 const PARENT_STYLES_RECENT: usize = 32;
 const MAX_PARENT_STYLES: usize = 1 << 16;
+const PARENT_STYLES_COMPACT: usize = 4096;
 
 /// Box-tree parentage is independent of element-tree inheritance. The rare
 /// computation cache distinguishes inline principal parents and flex/grid
@@ -24112,6 +24117,10 @@ pub(crate) struct StyleCache {
     selected:Option<Box<SelectedStyleCache>>,
     /// Per node index: (parent style token, computed style).
     nodes: Vec<Option<(NodeId, u32, BoxParentContext, Arc<Style>)>>,
+    /// The entry `nodes` held before its node was computed with another
+    /// parent style. Layout asks for some nodes with both their computed and
+    /// a used parent style; keeping both stops them from recomputing in turn.
+    previous_nodes: Vec<Option<(NodeId, u32, BoxParentContext, Arc<Style>)>>,
     /// Per origin node index: generated pseudo-element results, keyed by the
     /// pseudo-element, the origin style token and the box parent context.
     pseudos: Vec<Vec<PseudoStyleEntry>>,
@@ -24133,10 +24142,16 @@ pub(crate) struct StyleCache {
     /// viewport size or a media query while being computed.
     viewport_nodes: Vec<NodeId>,
     viewport_pseudos: Vec<NodeId>,
-    /// Global viewport read count when this cache first computed, and the
-    /// reads made by its own computations since.
-    viewport_reads_start: Option<u64>,
-    attributed_viewport_reads: u64,
+    /// Parent styles still referenced after the last compaction.
+    compacted_parents: usize,
+    /// Per node slot: bit 0 when its retained style, bit 1 when its retained
+    /// pseudo-element styles, read the viewport or a media query.
+    viewport_flags: Vec<u8>,
+    /// Open node computations (`begin_viewport_window`).
+    window_depth: u32,
+    /// Bumped whenever retained results are dropped or replaced other than
+    /// for a viewport size change, which keeps this count.
+    epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -24178,8 +24193,10 @@ impl StyleCache {
         }else{self.nodes.get(node.index())?.as_ref().filter(|(cached,_,_,_)|*cached==node)}
     }
     fn forget_node_entry(&mut self,node:NodeId) {
+        if let Some(flags)=self.viewport_flags.get_mut(node.index()){*flags=0;}
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].entry=None;}}
         else if let Some(slot)=self.nodes.get_mut(node.index()){*slot=None;}
+        if let Some(slot)=self.previous_nodes.get_mut(node.index()){*slot=None;}
         if let Some(pseudos)=self.pseudos.get_mut(node.index()){pseudos.clear();}
     }
     fn pseudo_entry(&self,origin:NodeId,pseudo:PseudoElement,token:u32,box_parent:BoxParentContext)->Option<Option<GeneratedStyle>> {
@@ -24193,7 +24210,12 @@ impl StyleCache {
         let slot=origin.index();
         if self.pseudos.len()<=slot {self.pseudos.resize_with(document.node_count().max(slot+1),Vec::new);}
         let entries=&mut self.pseudos[slot];
-        entries.retain(|entry|entry.origin==origin && entry.pseudo!=pseudo);
+        entries.retain(|entry|entry.origin==origin);
+        // Like node entries, keep the variant computed for the other origin
+        // style a formatter asks with; the newest is last.
+        if let Some(older)=entries.iter().position(|entry|entry.pseudo==pseudo) {
+            if entries.iter().filter(|entry|entry.pseudo==pseudo).count()>=2 {entries.remove(older);}
+        }
         entries.push(PseudoStyleEntry{origin,pseudo,origin_token:token,box_parent,generated:generated.clone()});
     }
     fn bloom(&self,node:NodeId)->Option<u64> {
@@ -24204,9 +24226,35 @@ impl StyleCache {
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].bloom=bloom;}}
         else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),0);}self.blooms[node.index()]=bloom;}
     }
+    /// A hit in `previous_nodes` swaps it with the current entry, so the
+    /// entry `node_entry` reports is the one last asked for, as after a
+    /// recomputation.
+    fn take_previous_entry(&mut self, node: NodeId, token: u32, box_parent: BoxParentContext) -> Option<Arc<Style>> {
+        if self.selected.is_some() { return None; }
+        let slot = node.index();
+        let (cached, cached_token, cached_box_parent, style) = self.previous_nodes.get(slot)?.as_ref()?;
+        if *cached != node || *cached_box_parent != box_parent || style.sibling_position_dependent
+            || !self.same_parent(*cached_token, token) {
+            return None;
+        }
+        let style = style.clone();
+        let current = self.nodes.get_mut(slot)?;
+        core::mem::swap(current, &mut self.previous_nodes[slot]);
+        Some(style)
+    }
     /// Only for a cache whose owner has already validated all cascade inputs.
     pub(crate) fn node_style(&self, node: NodeId) -> Option<Arc<Style>> {
-        self.node_entry(node).map(|(_,_,_,style)|style.clone())
+        let style = self.node_entry(node).map(|(_,_,_,style)|style.clone());
+        if style.is_some() { self.replay_viewport_read(node, 1); }
+        style
+    }
+    /// A retained result that read the viewport, handed out outside a node
+    /// computation, counts as a viewport read for the layout measurement
+    /// using it. Inside a computation the result's value keys its dependents.
+    fn replay_viewport_read(&self, node: NodeId, flag: u8) {
+        if self.window_depth == 0 && self.viewport_flags.get(node.index()).is_some_and(|flags| flags & flag != 0) {
+            note_viewport_read();
+        }
     }
     /// Count a read of a snapshot whose owner has validated its cascade inputs.
     pub(crate) fn snapshot_style(&mut self, node: NodeId) -> Option<Arc<Style>> {
@@ -24225,7 +24273,7 @@ impl StyleCache {
         }
         let style = Arc::new(style);
         let box_parent=self.cached_box_parent(document,node).unwrap_or_default();
-        self.store(document, node, 0, box_parent, &style);
+        self.store_unattributed(document, node, box_parent, &style);
         style
     }
     /// Replace an owner-validated read snapshot after query-context resolution.
@@ -24233,30 +24281,36 @@ impl StyleCache {
     pub(crate) fn replace_snapshot_style(&mut self, document: &Document, node: NodeId, style: Style) -> Arc<Style> {
         let style = Arc::new(style);
         let box_parent=self.cached_box_parent(document,node).unwrap_or_default();
-        self.store(document, node, 0, box_parent, &style);
+        self.store_unattributed(document, node, box_parent, &style);
+        self.epoch = self.epoch.wrapping_add(1);
         style
     }
     /// Forget a pending read snapshot without scanning the shared cascade pool.
     pub(crate) fn forget_snapshot_style(&mut self, node: NodeId) {
         self.forget_node_entry(node);
+        self.epoch = self.epoch.wrapping_add(1);
     }
     pub(crate) fn clear(&mut self) {
         let mut selected=self.selected.take();
         if let Some(selected)=selected.as_mut(){for entry in &mut selected.entries{entry.entry=None;entry.bloom=0;}}
-        *self = Self::default();self.selected=selected;
+        let epoch = self.epoch.wrapping_add(1);
+        *self = Self::default();self.selected=selected;self.epoch=epoch;
     }
+    pub(crate) fn epoch(&self) -> u64 { self.epoch }
     fn begin_viewport_window(&mut self) -> (u64, u64) {
-        let reads = viewport_reads();
-        self.viewport_reads_start.get_or_insert(reads);
-        (reads, media_reads())
+        self.window_depth += 1;
+        (viewport_reads(), media_reads())
     }
     fn end_viewport_window(&mut self, start: (u64, u64)) -> bool {
+        self.window_depth = self.window_depth.saturating_sub(1);
         let reads = viewport_reads().wrapping_sub(start.0);
-        self.attributed_viewport_reads = self.attributed_viewport_reads.wrapping_add(reads);
         reads != 0 || media_reads() != start.1
     }
     fn note_viewport_dependent(&mut self, node: NodeId, pseudo: bool) {
         if self.selected.is_some() { return; }
+        let slot = node.index();
+        if self.viewport_flags.len() <= slot { self.viewport_flags.resize(slot + 1, 0); }
+        self.viewport_flags[slot] |= if pseudo { 2 } else { 1 };
         let nodes = if pseudo { &mut self.viewport_pseudos } else { &mut self.viewport_nodes };
         nodes.push(node);
         if nodes.len() > 2 * self.nodes.len() + 64 {
@@ -24266,27 +24320,35 @@ impl StyleCache {
     }
     /// Retain styles across a viewport size change whose media results are
     /// unchanged: drop only the results that read the viewport or a media
-    /// query. Returns false, leaving the cache untouched, when a viewport read
-    /// happened outside this cache's node computations, since a retained
-    /// style may then carry a length resolved against the old size.
+    /// query. Every entry is stored by a computation that records its own
+    /// reads (`begin_viewport_window`), and dependents are keyed by the
+    /// value of the style they inherit from, so a recomputed node misses its
+    /// descendants' entries when its value changes. Reads outside those
+    /// computations (layout, other caches) do not reach retained entries.
     pub(crate) fn invalidate_viewport_dependent(&mut self) -> bool {
         if self.selected.is_some() { return false; }
-        if self.viewport_reads_start.is_some_and(|start|
-            viewport_reads().wrapping_sub(start) != self.attributed_viewport_reads) { return false; }
-        for node in core::mem::take(&mut self.viewport_nodes) { self.invalidate_node(node); }
+        for node in core::mem::take(&mut self.viewport_nodes) { self.drop_node(node); }
         for node in core::mem::take(&mut self.viewport_pseudos) {
             if let Some(pseudos) = self.pseudos.get_mut(node.index()) { pseudos.clear(); }
+            if let Some(flags) = self.viewport_flags.get_mut(node.index()) { *flags &= !2; }
         }
         true
     }
     /// Drop one node's own cascade result. Descendants are keyed by their
     /// parent's style value, so a changed parent style misses them naturally.
     pub(crate) fn invalidate_node(&mut self, node: NodeId) {
+        self.drop_node(node);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+    fn drop_node(&mut self, node: NodeId) {
         self.forget_node_entry(node);
         self.shared.retain(|entry| entry.node != node);
         self.next_shared = self.next_shared.min(self.shared.len());
     }
     pub(crate) fn begin_frame(&mut self) {
+        if self.parents.len() > PARENT_STYLES_COMPACT.max(2 * self.compacted_parents) {
+            self.compact_parents();
+        }
         self.computed = 0;
         self.hits = 0;
         self.shared_hits = 0;
@@ -24313,6 +24375,33 @@ impl StyleCache {
             shared_hits: self.shared_hits,
             intern_hits: self.intern_hits,
         }
+    }
+
+    /// Drops parent styles no entry refers to any more. Token lookup only
+    /// scans recent parents, so without this every frame that asks with
+    /// parent styles seen longer ago adds tokens until `MAX_PARENT_STYLES`
+    /// stops caching altogether.
+    fn compact_parents(&mut self) {
+        if self.selected.is_some() { return; }
+        let mut tokens = vec![0u32; self.parents.len() + 1];
+        let mut kept = Vec::new();
+        let parents = core::mem::take(&mut self.parents);
+        let mut remap = |token: &mut u32| {
+            if *token == 0 { return; }
+            let Some(parent) = parents.get(*token as usize - 1) else { *token = u32::MAX; return; };
+            let slot = &mut tokens[*token as usize];
+            if *slot == 0 {
+                kept.push(parent.clone());
+                *slot = kept.len() as u32;
+            }
+            *token = *slot;
+        };
+        for entry in self.nodes.iter_mut().chain(self.previous_nodes.iter_mut()).flatten() { remap(&mut entry.1); }
+        for entry in self.pseudos.iter_mut().flatten() { remap(&mut entry.origin_token); }
+        for entry in &mut self.shared { remap(&mut entry.parent_token); }
+        self.compacted_parents = kept.len();
+        self.parents = kept;
+        self.last_parent = 0;
     }
 
     fn parent_token(&mut self, parent: Option<&Style>) -> Option<u32> {
@@ -24389,6 +24478,12 @@ impl StyleCache {
         let (cached,_,incoming,style)=self.node_entry(parent)?;
         (*cached==parent).then(||incoming.for_children(style))
     }
+    /// Stores a style computed outside a viewport window; a resize restyles
+    /// it since its viewport reads are unknown.
+    fn store_unattributed(&mut self, document: &Document, node: NodeId, box_parent:BoxParentContext, style: &Arc<Style>) {
+        self.store(document, node, 0, box_parent, style);
+        self.note_viewport_dependent(node, false);
+    }
     fn store(&mut self, document: &Document, node: NodeId, token: u32, box_parent:BoxParentContext, style: &Arc<Style>) {
         if let Some(selected)=self.selected.as_mut(){
             if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].entry=Some((node,token,box_parent,style.clone()));}
@@ -24399,7 +24494,15 @@ impl StyleCache {
             self.nodes
                 .resize_with(document.node_count().max(slot + 1), || None);
         }
-        self.nodes[slot] = Some((node, token, box_parent, style.clone()));
+        let previous = self.nodes[slot].replace((node, token, box_parent, style.clone()));
+        if let Some(previous) = previous.filter(|(cached, cached_token, cached_box_parent, _)| {
+            *cached == node && (*cached_box_parent != box_parent || !self.same_parent(*cached_token, token))
+        }) {
+            if self.previous_nodes.len() <= slot {
+                self.previous_nodes.resize_with(self.nodes.len(), || None);
+            }
+            self.previous_nodes[slot] = Some(previous);
+        }
     }
 }
 
@@ -24729,8 +24832,14 @@ fn compute_node_cached_impl(
             && cache.same_parent(*cached_token, token) {
             let style=(**style).clone();
             cache.hits += 1;
+            cache.replay_viewport_read(node, 1);
             return Ok(style);
         }
+    }
+    if let Some(style) = cache.take_previous_entry(node, token, box_parent) {
+        cache.hits += 1;
+        cache.replay_viewport_read(node, 1);
+        return Ok((*style).clone());
     }
     let is_element = matches!(kind, NodeKind::Element { .. });
     let dom_parent = if is_element && index.siblings_share {
@@ -24762,9 +24871,12 @@ fn compute_node_cached_impl(
         });
         if let Some(entry) = shared {
             let (style, viewport_dependent) = (entry.style.clone(), entry.viewport_dependent);
-            if viewport_dependent { cache.note_viewport_dependent(node, false); }
             cache.shared_hits += 1;
             cache.store(document, node, token, box_parent, &style);
+            if viewport_dependent {
+                cache.note_viewport_dependent(node, false);
+                cache.replay_viewport_read(node, 1);
+            }
             return Ok((*style).clone());
         }
     }
@@ -24801,9 +24913,11 @@ fn compute_node_cached_impl(
         style.clone()
     } else {
         let style = Arc::new(computed);
-        if cache.interned.len() < MAX_PARENT_STYLES {
-            cache.interned.push(style.clone());
+        // Only the most recent styles are searched.
+        if cache.interned.len() >= 4 * SHARED_RECENT {
+            cache.interned.drain(..2 * SHARED_RECENT);
         }
+        cache.interned.push(style.clone());
         style
     };
     if !style.sibling_position_dependent {
