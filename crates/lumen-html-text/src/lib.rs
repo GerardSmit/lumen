@@ -1385,7 +1385,7 @@ impl FontSet {
 
     fn face_by_identity(&self,identity:u64)->Option<&Arc<FontFace>> {
         if identity==0 {return self.faces.first().map(|font|&font.face);}
-        self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity)).map(|font|&font.face)
+        self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity)).map(|font|&font.face)
     }
 
     fn append_resolved_range(
@@ -1500,7 +1500,11 @@ impl FontSet {
             return Ok(());
         }
         let face=&registered.face;
-        let glyph_face=if run.invisible {face.invisible_key()?}else{face.id()};
+        let synthetic_oblique = !run.invisible
+            && registered.style == FontStyle::Normal
+            && descriptor.oblique_range.is_none()
+            && spec.style.angle().is_none_or(|angle| angle != 0.0);
+        let glyph_face=if run.invisible {face.invisible_key()?}else if synthetic_oblique {face.oblique_key()?}else{face.id()};
         face.shape_caps_into_context(
             &text[run.start..run.end],
             size * size_scale,
@@ -2070,6 +2074,61 @@ impl RasterizerCache {
     }
 }
 
+/// Horizontal shear applied when a normal face stands in for italic or oblique
+/// text (Skia's fake italic skews by -1/4).
+const SYNTHETIC_OBLIQUE_SLANT: f32 = 0.25;
+
+fn shear_coverage(coverage: GlyphCoverage, slant: f32) -> GlyphCoverage {
+    if coverage.width == 0 || coverage.height == 0 {
+        return coverage;
+    }
+    let top = (coverage.y_min + coverage.height as i32) as f32;
+    let row_shift = |row: usize| slant * (top - row as f32 - 0.5);
+    let (mut min_whole, mut max_whole) = (i32::MAX, i32::MIN);
+    for row in 0..coverage.height {
+        let whole = row_shift(row).floor() as i32;
+        min_whole = min_whole.min(whole);
+        max_whole = max_whole.max(whole);
+    }
+    let width = coverage.width + (max_whole - min_whole) as usize + 1;
+    let mut alpha = alloc::vec![0u8; width * coverage.height];
+    for row in 0..coverage.height {
+        let shift = row_shift(row);
+        let whole = shift.floor();
+        let fraction = shift - whole;
+        let start = (whole as i32 - min_whole) as usize;
+        let source = &coverage.alpha[row * coverage.width..(row + 1) * coverage.width];
+        let target = &mut alpha[row * width..(row + 1) * width];
+        for (column, &value) in source.iter().enumerate() {
+            let value = f32::from(value);
+            let near = (value * (1.0 - fraction)).round() as u16;
+            let far = (value * fraction).round() as u16;
+            target[start + column] = (u16::from(target[start + column]) + near).min(255) as u8;
+            target[start + column + 1] = (u16::from(target[start + column + 1]) + far).min(255) as u8;
+        }
+    }
+    GlyphCoverage { x_min: coverage.x_min + min_whole, y_min: coverage.y_min, width, height: coverage.height, alpha }
+}
+
+fn shear_outline(outline: &mut GlyphOutline, slant: f32) {
+    for command in &mut outline.commands {
+        let point = |x: &mut f32, y: &f32| *x += slant * *y;
+        match command {
+            GlyphOutlineCommand::MoveTo(x, y) | GlyphOutlineCommand::LineTo(x, y) => point(x, y),
+            GlyphOutlineCommand::QuadTo(x1, y1, x, y) => {
+                point(x1, y1);
+                point(x, y);
+            }
+            GlyphOutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                point(x1, y1);
+                point(x2, y2);
+                point(x, y);
+            }
+            GlyphOutlineCommand::Close => {}
+        }
+    }
+}
+
 fn rasterize_coverage(font: &fontdue::Font, glyph_id: u16, size: f32) -> GlyphCoverage {
     let (metrics, alpha) = font.rasterize_indexed(glyph_id, size);
     GlyphCoverage {
@@ -2086,9 +2145,11 @@ pub struct FontFace {
     bytes: Arc<[u8]>,
     glyph_count: u16,
     invisible_id: AtomicU64,
+    oblique_id: AtomicU64,
     units_per_em: f32,
     ascent: f32,
     descent: f32,
+    line_gap: f32,
     underline: (f32, f32),
     strike: (f32, f32),
     metrics: [Option<f32>; 6],
@@ -2143,6 +2204,7 @@ impl FontFace {
         };
         let ascent = face.ascender() as f32 / units_per_em;
         let descent = face.descender() as f32 / units_per_em;
+        let line_gap = face.line_gap().max(0) as f32 / units_per_em;
         let underline = face.underline_metrics().map_or((0.1, 1.0 / 16.0), |m| {
             (
                 -m.position as f32 / units_per_em,
@@ -2201,9 +2263,11 @@ impl FontFace {
             bytes,
             glyph_count,
             invisible_id: AtomicU64::new(0),
+            oblique_id: AtomicU64::new(0),
             units_per_em,
             ascent,
             descent,
+            line_gap,
             underline,
             strike,
             metrics,
@@ -2229,6 +2293,24 @@ impl FontFace {
     }
     fn is_invisible_key(&self,identity:u64)->bool {
         identity!=0 && identity==self.invisible_id.load(Ordering::Relaxed)
+    }
+
+    /// Glyph identity for this face drawn with a synthetic oblique slant. It
+    /// separates the sheared rasters in caches; shaping data stays shared.
+    pub fn oblique_key(&self)->Result<u64,&'static str> {
+        let existing=self.oblique_id.load(Ordering::Relaxed);
+        if existing!=0 {return Ok(existing);}
+        let id=NEXT_FACE_ID.try_update(Ordering::Relaxed,Ordering::Relaxed,
+            |next|next.checked_add(1)).map_err(|_|"font face identity exhausted")?;
+        match self.oblique_id.compare_exchange(0,id,Ordering::Relaxed,Ordering::Relaxed) {
+            Ok(_)=>Ok(id),Err(existing)=>Ok(existing),
+        }
+    }
+    fn is_oblique_key(&self,identity:u64)->bool {
+        identity!=0 && identity==self.oblique_id.load(Ordering::Relaxed)
+    }
+    fn owns_key(&self,identity:u64)->bool {
+        identity==0 || identity==self.id || self.is_invisible_key(identity) || self.is_oblique_key(identity)
     }
 
     /// Override CSS font metrics in em units without modifying glyph outlines.
@@ -2957,11 +3039,17 @@ impl FontFace {
         })
     }
 
+    /// Content-area height. Chromium rounds the font's ascent and descent to
+    /// whole pixels before anything is laid out with them.
     pub fn line_height(&self, size: f32) -> f32 {
-        (self.ascent - self.descent) * size
+        self.ascent(size) + (-self.descent * size).round()
+    }
+    /// Used `line-height: normal`: the content area plus the rounded line gap.
+    pub fn normal_line_height(&self, size: f32) -> f32 {
+        self.line_height(size) + (self.line_gap * size).round()
     }
     pub fn ascent(&self, size: f32) -> f32 {
-        self.ascent * size
+        (self.ascent * size).round()
     }
 
     pub fn rasterize(&self, id: u16, size: f32) -> Result<GlyphCoverage, &'static str> {
@@ -3038,10 +3126,15 @@ impl FontFace {
 
 impl TextShaper for FontFace {
     fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
-        if face!=0 && face!=self.id && !self.is_invisible_key(face){return None;}
+        if !self.owns_key(face){return None;}
+        let oblique=self.is_oblique_key(face);
         self.with_rasterizer(id,size,|font| {
             let metrics=font.metrics_indexed(id,size);
             let line=font.horizontal_line_metrics(size)?;
+            if oblique {
+                return Some(lumen_html::paint::Rect{x:SYNTHETIC_OBLIQUE_SLANT*line.descent,y:-line.ascent,
+                    width:metrics.advance_width+SYNTHETIC_OBLIQUE_SLANT*(line.ascent-line.descent),height:line.ascent-line.descent});
+            }
             Some(lumen_html::paint::Rect{x:0.0,y:-line.ascent,width:metrics.advance_width,height:line.ascent-line.descent})
         }).ok().flatten()
     }
@@ -3054,10 +3147,18 @@ impl TextShaper for FontFace {
         self.primary_character_widths(size, self.size_adjust_scale(font.size_adjust, self))
     }
     fn glyph_ink_bounds(&self,glyph:&Glyph,size:f32) -> Option<lumen_html::paint::Rect> {
-        if glyph.face!=0 && glyph.face!=self.id {return None;}
+        if glyph.face!=0 && glyph.face!=self.id && !self.is_oblique_key(glyph.face) {return None;}
+        let oblique=self.is_oblique_key(glyph.face);
         self.with_rasterizer(glyph.id,size*glyph.size_scale,|font| {
             let metrics=font.metrics_indexed(glyph.id,size*glyph.size_scale);
-            lumen_html::paint::Rect{x:glyph.x+metrics.xmin as f32,y:glyph.y-metrics.ymin as f32-metrics.height as f32,width:metrics.width as f32,height:metrics.height as f32}
+            let (mut left,mut width)=(metrics.xmin as f32,metrics.width as f32);
+            if oblique {
+                let bottom=SYNTHETIC_OBLIQUE_SLANT*metrics.ymin as f32;
+                let top=SYNTHETIC_OBLIQUE_SLANT*(metrics.ymin as f32+metrics.height as f32);
+                width+=bottom.max(top)-bottom.min(top);
+                left+=bottom.min(top);
+            }
+            lumen_html::paint::Rect{x:glyph.x+left,y:glyph.y-metrics.ymin as f32-metrics.height as f32,width,height:metrics.height as f32}
         }).ok()
     }
     fn shape_styled_context(&self,text:&str,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<ShapedRun,()> {
@@ -3195,6 +3296,10 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
         FontFace::line_height(self, size * self.size_adjust_scale(font.size_adjust, self))
     }
 
+    fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        FontFace::normal_line_height(self, size * self.size_adjust_scale(font.size_adjust, self))
+    }
+
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         let size = size * self.size_adjust_scale(font.size_adjust, self);
         self.underline_metrics(size)
@@ -3286,6 +3391,9 @@ impl FontProvider for FontFace {
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphCoverage {x_min:0,y_min:0,width:0,height:0,alpha:Vec::new()});
         }
+        if self.is_oblique_key(face) {
+            return self.rasterize(id, size).map(|coverage| shear_coverage(coverage, SYNTHETIC_OBLIQUE_SLANT));
+        }
         if face != 0 && face != self.id {
             return Err("font face identity mismatch");
         }
@@ -3298,6 +3406,11 @@ impl FontProvider for FontFace {
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphOutline {commands:Vec::new()});
         }
+        if self.is_oblique_key(face) {
+            let mut outline = self.outline(id, size)?;
+            shear_outline(&mut outline, SYNTHETIC_OBLIQUE_SLANT);
+            return Ok(outline);
+        }
         if face != 0 && face != self.id {
             return Err("font face identity mismatch");
         }
@@ -3305,7 +3418,7 @@ impl FontProvider for FontFace {
     }
 
     fn face_key(&self, face: u64) -> Result<u64, &'static str> {
-        if self.is_invisible_key(face) {Ok(face)} else if face == 0 || face == self.id {
+        if self.is_invisible_key(face) || self.is_oblique_key(face) {Ok(face)} else if face == 0 || face == self.id {
             Ok(self.id)
         } else {
             Err("font face identity mismatch")
@@ -3477,6 +3590,13 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
         self.faces[index]
             .face
             .line_height(size * self.size_adjust_scale(font, index))
+    }
+
+    fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        let index = self.metric_face_index(font);
+        self.faces[index]
+            .face
+            .normal_line_height(size * self.size_adjust_scale(font, index))
     }
 
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
@@ -3670,7 +3790,7 @@ mod tests {
                 let mut session=lumen_html::session::RenderSession::new(document);
                 let style=session.computed_style(inner).unwrap();
                 let expected=face.shape_styled(text,style.font_size,false,&style.font).unwrap().width;
-                let line_height=face.line_height_styled(style.font_size,&style.font);
+                let line_height=face.normal_line_height_styled(style.font_size,&style.font);
                 let first=session.display_list(400,300,&face).unwrap().clone();
                 let rect=session.layout_rect(inner).unwrap();
                 assert!((rect.width-expected).abs()<0.001,"{text}: the shared native max-content metric defines the track");
@@ -5291,6 +5411,47 @@ fn joining_context_preserves_font_item_clusters_and_exact_cache_identity() {
             medium_id
         );
         assert_ne!(medium_id, italic_id);
+    }
+
+    #[test]
+    fn normal_faces_stand_in_for_italic_with_a_sheared_raster() {
+        let regular = registered("Slanted", 400, FontStyle::Normal, TEST_FONT_BYTES);
+        let real_italic = registered("Real", 400, FontStyle::Italic, TEST_FONT_BYTES);
+        let id = regular.face.id();
+        let real_id = real_italic.face.id();
+        let set = FontSet::new(vec![regular, real_italic]).unwrap();
+        let spec = |family: &str, style| FontSpec {
+            families: Some(vec![FontFamily::from(family)].into()), style, ..FontSpec::default()
+        };
+        let upright = set.shape_styled("l", 40.0, false, &spec("Slanted", FontStyle::Normal)).unwrap();
+        let slanted = set.shape_styled("l", 40.0, false, &spec("Slanted", FontStyle::Italic)).unwrap();
+        let oblique = set.shape_styled("l", 40.0, false, &spec("Slanted", FontStyle::oblique(20.0).unwrap())).unwrap();
+        let genuine = set.shape_styled("l", 40.0, false, &spec("Real", FontStyle::Italic)).unwrap();
+        assert_eq!(upright.glyphs[0].face, id);
+        assert_ne!(slanted.glyphs[0].face, id);
+        assert_eq!(slanted.glyphs[0].face, oblique.glyphs[0].face);
+        assert_eq!(genuine.glyphs[0].face, real_id, "a real italic face is never sheared");
+        assert_eq!(slanted.width, upright.width, "the slant does not change advances");
+        assert_ne!(set.face_key(slanted.glyphs[0].face).unwrap(), set.face_key(id).unwrap());
+        let flat = set.rasterize_glyph(id, upright.glyphs[0].id, 40.0).unwrap();
+        let sheared = set.rasterize_glyph(slanted.glyphs[0].face, slanted.glyphs[0].id, 40.0).unwrap();
+        assert_eq!(flat.height, sheared.height);
+        assert!(sheared.width > flat.width + 5, "{} versus {}", sheared.width, flat.width);
+        let centre = |glyph: &GlyphCoverage, row: usize| {
+            let cells = &glyph.alpha[row * glyph.width..(row + 1) * glyph.width];
+            let total: f32 = cells.iter().map(|&value| f32::from(value)).sum();
+            cells.iter().enumerate().map(|(column, &value)| column as f32 * f32::from(value)).sum::<f32>() / total
+                + glyph.x_min as f32
+        };
+        let rise = |glyph: &GlyphCoverage| centre(glyph, 0) - centre(glyph, glyph.height - 1);
+        assert!(rise(&flat).abs() < 0.5);
+        let expected = 0.25 * (sheared.height - 1) as f32;
+        assert!((rise(&sheared) - expected).abs() < 1.0, "{} versus {expected}", rise(&sheared));
+        let outline = set.outline_glyph(slanted.glyphs[0].face, slanted.glyphs[0].id, 40.0).unwrap();
+        let plain = set.outline_glyph(id, upright.glyphs[0].id, 40.0).unwrap();
+        let (GlyphOutlineCommand::MoveTo(sx, sy), GlyphOutlineCommand::MoveTo(px, py)) = (outline.commands[0], plain.commands[0]) else { panic!() };
+        assert_eq!(sy, py);
+        assert!((sx - px - 0.25 * py).abs() < 1e-3);
     }
 
     #[test]

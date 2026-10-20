@@ -4381,24 +4381,25 @@ fn settle_pass(
     pending: bool,
 ) -> Result<Option<Rgba8Image>, ImageError> {
     let font_generation=font.generation();
-    match session.display_list_with_images(width_css, height_css, font, images) {
-        Err(lumen_html::layout::LayoutError::ImagePending) => Ok(None),
-        Err(error) => Err(ImageError::Layout(error)),
-        // A shaping pass can record first-use font demand. Give the existing
-        // owner task pump another turn before committing that stale snapshot.
-        Ok(_) if font.generation()!=font_generation=>Ok(None),
-        Ok(list) if !pending => render_with_mode_cached(
-            list,
-            width_css,
-            height_css,
-            scale,
-            RasterizationMode::CssPixelSnapped,
-            font,
-            &mut GlyphCache::default(),
-        )
-        .map(Some),
-        Ok(_) => Ok(None),
+    session.display_list_with_images(width_css, height_css, font, images).map_err(ImageError::Layout)?;
+    // A shaping pass can record first-use font demand. Give the existing
+    // owner task pump another turn before committing that stale snapshot.
+    // Layout never waits for images: a page with loading ones is complete,
+    // but not final, so the capture waits for them to settle.
+    if pending || font.generation()!=font_generation || session.images_pending() {
+        return Ok(None);
     }
+    let list = session.display_list_with_images(width_css, height_css, font, images).map_err(ImageError::Layout)?;
+    render_with_mode_cached(
+        list,
+        width_css,
+        height_css,
+        scale,
+        RasterizationMode::CssPixelSnapped,
+        font,
+        &mut GlyphCache::default(),
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -7890,11 +7891,9 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.pixels, [1, 2, 3, 255]);
         let failed = |_: &str| ImageState::Failed;
-        assert_eq!(
-            render_document_with_images(session.document(), 1, 1, 1.0, &font, &failed),
-            Err(ImageError::Layout(
-                lumen_html::layout::LayoutError::ImageFailed
-            ))
+        assert!(
+            render_document_with_images(session.document(), 1, 1, 1.0, &font, &failed).is_ok(),
+            "a failed image is a broken image, not a layout failure"
         );
     }
 

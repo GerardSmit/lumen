@@ -161,7 +161,7 @@ struct CachedFrame {
 
 /// The inputs of a layout that failed, keyed like [`CachedFrame`]: the same
 /// inputs fail the same way, so a retry waits until one of them changes.
-/// Pending and failed images are not kept (see `render`).
+/// Image errors are not kept (see `render`).
 struct FailedFrame {
     document_version: u64,
     width: u32,
@@ -181,6 +181,61 @@ struct NodeImages<'a> {
     bitmaps: &'a [(NodeId, Arc<ImageData>, crate::responsive_images::ImageMetadata)],
     embedded: &'a [(NodeId, Arc<crate::render_capture::ReservedImageData>)],
     fallback: Option<&'a dyn ImageResolver>,
+    /// Every lookup which answered `Pending`: that layout used placeholder
+    /// geometry and must be redone once the resolver's generation advances.
+    pending: PendingLog,
+}
+
+/// Pending lookups in the order made, each with whether it was a paint-only use.
+#[derive(Default)]
+struct PendingLog {
+    entries: core::cell::RefCell<Vec<(layout::PendingLookup, bool)>>,
+    paint_only: core::cell::Cell<bool>,
+}
+
+impl PendingLog {
+    fn get(&self) -> bool {
+        !self.entries.borrow().is_empty()
+    }
+    /// The distinct lookups made, geometry-affecting uses winning over paint-only ones.
+    fn take_distinct(&self) -> Vec<(layout::PendingLookup, bool)> {
+        let mut distinct: Vec<(layout::PendingLookup, bool)> = Vec::new();
+        for (lookup, paint_only) in self.entries.take() {
+            match distinct.iter_mut().find(|(known, _)| *known == lookup) {
+                Some(known) => known.1 &= paint_only,
+                None => distinct.push((lookup, paint_only)),
+            }
+        }
+        distinct
+    }
+}
+
+impl NodeImages<'_> {
+    /// What asking `lookup` again answers, without logging it.
+    fn lookup_state(&self, lookup: &layout::PendingLookup) -> Option<layout::ImageState> {
+        use layout::PendingLookup as Lookup;
+        let images = self.fallback?;
+        match lookup {
+            Lookup::Source(source) => Some(images.resolve(source)),
+            Lookup::From(base, source) => Some(images.resolve_from(base, source)),
+            Lookup::NodeFrom(node, base, source) => images.resolve_node_from(*node, base, source),
+            Lookup::Request(node, base, source, parameters) => Some(images.resolve_image_request(*node, base, source, *parameters)),
+            Lookup::Node(node) => match self.bitmaps.binary_search_by_key(&node.key(), |(id, _, _)| id.key()) {
+                Ok(at) => Some(layout::ImageState::Ready(self.bitmaps[at].1.clone())),
+                Err(_) => images.resolve_node(*node),
+            },
+            Lookup::Unknown => None,
+        }
+    }
+    fn note(&self, state: layout::ImageState, lookup: impl FnOnce() -> layout::PendingLookup) -> layout::ImageState {
+        if matches!(state, layout::ImageState::Pending) {
+            self.pending.entries.borrow_mut().push((lookup(), self.pending.paint_only.get()));
+        }
+        state
+    }
+    fn note_optional(&self, state: Option<layout::ImageState>, lookup: impl FnOnce() -> layout::PendingLookup) -> Option<layout::ImageState> {
+        state.map(|state| self.note(state, lookup))
+    }
 }
 
 impl ImageResolver for NodeImages<'_> {
@@ -191,7 +246,7 @@ impl ImageResolver for NodeImages<'_> {
     fn svg_image_viewport(&self)->Option<(f32,f32)> {self.svg_image_viewport}
     fn resolve_viewport(&self,node:Option<NodeId>,base:&str,source:&str,natural:&Arc<crate::paint::ImageData>,width:f32,height:f32,scheme:css::UsedColorScheme)->Option<layout::ImageState> {
         let committed=node.and_then(|node|self.bitmaps.binary_search_by_key(&node.key(),|(id,_,_)|id.key()).ok()).and_then(|at|Arc::ptr_eq(&self.bitmaps[at].1,natural).then_some(&self.bitmaps[at].2)).and_then(|metadata|metadata.source.as_deref());
-        self.fallback.and_then(|images|images.resolve_viewport(node,base,committed.unwrap_or(source),natural,width,height,scheme))
+        self.note_optional(self.fallback.and_then(|images|images.resolve_viewport(node,base,committed.unwrap_or(source),natural,width,height,scheme)),||layout::PendingLookup::Unknown)
     }
     fn paint_input_properties(&self, name: &str) -> Option<&[Arc<str>]> {
         self.paint_definitions.iter().find(|(candidate,_)|candidate.as_ref()==name).map(|(_,inputs)|inputs.as_ref())
@@ -225,13 +280,13 @@ impl ImageResolver for NodeImages<'_> {
             .or_else(|| self.fallback.and_then(|images| images.embedded_intrinsic_size(node)))
     }
     fn resolve(&self, source: &str) -> layout::ImageState {
-        self.fallback
-            .map_or(layout::ImageState::Failed, |images| images.resolve(source))
+        self.note(self.fallback
+            .map_or(layout::ImageState::Failed, |images| images.resolve(source)), || layout::PendingLookup::Source(source.into()))
     }
     fn resolve_from(&self, base: &str, source: &str) -> layout::ImageState {
-        self.fallback.map_or(layout::ImageState::Failed, |images| {
+        self.note(self.fallback.map_or(layout::ImageState::Failed, |images| {
             images.resolve_from(base, source)
-        })
+        }), || layout::PendingLookup::From(base.into(), source.into()))
     }
     fn origin_clean_from(&self, base: &str, source: &str) -> bool {
         self.fallback
@@ -243,11 +298,11 @@ impl ImageResolver for NodeImages<'_> {
         base: &str,
         source: &str,
     ) -> Option<layout::ImageState> {
-        self.fallback
-            .and_then(|images| images.resolve_node_from(node, base, source))
+        self.note_optional(self.fallback
+            .and_then(|images| images.resolve_node_from(node, base, source)), || layout::PendingLookup::NodeFrom(node, base.into(), source.into()))
     }
     fn resolve_image_request(&self,node:NodeId,base:&str,source:&str,parameters:layout::ImageRequestParameters)->layout::ImageState {
-        self.fallback.map_or(layout::ImageState::Failed,|images|images.resolve_image_request(node,base,source,parameters))
+        self.note(self.fallback.map_or(layout::ImageState::Failed,|images|images.resolve_image_request(node,base,source,parameters)), || layout::PendingLookup::Request(node, base.into(), source.into(), parameters))
     }
     fn node_origin_clean(&self, node: NodeId, base: &str, source: &str) -> bool {
         self.fallback
@@ -256,11 +311,29 @@ impl ImageResolver for NodeImages<'_> {
     fn resolve_node(&self, node: NodeId) -> Option<layout::ImageState> {
         self.bitmaps.binary_search_by_key(&node.key(),|(id,_,_)|id.key()).ok()
             .map(|at|layout::ImageState::Ready(self.bitmaps[at].1.clone()))
-            .or_else(|| self.fallback.and_then(|images| images.resolve_node(node)))
+            .or_else(|| self.note_optional(self.fallback.and_then(|images| images.resolve_node(node)), || layout::PendingLookup::Node(node)))
     }
     fn generation(&self) -> u64 {
         self.fallback
             .map_or(0, |images| ImageResolver::generation(images))
+    }
+    fn pending_mark(&self) -> usize {
+        self.pending.entries.borrow().len()
+    }
+    fn pending_since(&self, mark: usize) -> Vec<(layout::PendingLookup, bool)> {
+        self.pending.entries.borrow().get(mark..).map(<[_]>::to_vec).unwrap_or_default()
+    }
+    fn arrivals_only_since(&self, generation: u64) -> bool {
+        self.fallback.is_some_and(|images| images.arrivals_only_since(generation))
+    }
+    fn replay_pending(&self, lookups: &[(layout::PendingLookup, bool)]) {
+        self.pending.entries.borrow_mut().extend_from_slice(lookups);
+    }
+    fn set_paint_only(&self, paint_only: bool) -> bool {
+        self.pending.paint_only.replace(paint_only)
+    }
+    fn still_pending(&self, lookup: &layout::PendingLookup) -> bool {
+        matches!(self.lookup_state(lookup), Some(layout::ImageState::Pending))
     }
 }
 
@@ -528,6 +601,12 @@ pub struct RenderSession {
     animation_epoch: u64,
     pending_animation_nodes: Vec<NodeId>,
     pending_animation_full: bool,
+    images_pending: bool,
+    /// The distinct lookups the last layout answered `Pending` and whether
+    /// each was only a paint-only use (`ImageResolver::set_paint_only`).
+    pending_lookups: Vec<(layout::PendingLookup, bool)>,
+    layout_count: u64,
+    image_patch_count: u64,
     rules_generation: u64,
     read_style_cache: css::StyleCache,
     read_style_key: Option<ReadStyleKey>,
@@ -752,6 +831,10 @@ impl RenderSession {
             animation_epoch: 0,
             pending_animation_nodes: Vec::new(),
             pending_animation_full: false,
+            images_pending: false,
+            pending_lookups: Vec::new(),
+            layout_count: 0,
+            image_patch_count: 0,
             rules_generation: 0,
             read_style_cache: css::StyleCache::default(),
             read_style_key: None,
@@ -3576,6 +3659,25 @@ impl RenderSession {
         let result=callback(self);self.forced_layout=previous;result
     }
 
+    /// Frames laid out so far (a repaint that only swaps in arrived images is not one).
+    pub fn layout_count(&self) -> u64 {
+        self.layout_count
+    }
+
+    /// Frames whose arrived images were painted into the retained layout
+    /// without laying it out again.
+    pub fn image_patch_count(&self) -> u64 {
+        self.image_patch_count
+    }
+
+    /// Whether the last layout used placeholder geometry for an image that is
+    /// still loading. Layout never waits for images: such a frame is complete,
+    /// and is laid out again when the resolver's generation advances. Hosts
+    /// that must capture the final page (comparisons, snapshots) poll this.
+    pub fn images_pending(&self) -> bool {
+        self.images_pending
+    }
+
     pub fn display_list(
         &mut self,
         width: u32,
@@ -3629,7 +3731,7 @@ impl RenderSession {
         let (viewport_width,viewport_height)=self.cached.as_ref().map(|frame|(frame.width,frame.height)).unwrap_or((width,height));
         self.render(viewport_width, viewport_height, text, images)?;
         let mut geometry = layout::LayoutGeometry::default();
-        let node_images = NodeImages { color_schemes:self.media_environment().color_schemes, svg_fragment:self.svg_fragment.as_deref(), svg_image_viewport:self.svg_image_viewport.as_deref().copied(), paint_definitions: &self.paint_definitions, paint_registration_revision:self.rules_generation, bitmaps: &self.node_bitmaps, embedded:&self.embedded_bitmaps, objects: &self.object_representations, fallback: images };
+        let node_images = NodeImages { color_schemes:self.media_environment().color_schemes, svg_fragment:self.svg_fragment.as_deref(), svg_image_viewport:self.svg_image_viewport.as_deref().copied(), paint_definitions: &self.paint_definitions, paint_registration_revision:self.rules_generation, bitmaps: &self.node_bitmaps, embedded:&self.embedded_bitmaps, objects: &self.object_representations, fallback: images, pending: Default::default() };
         let safe_images = SnapshotImages(&node_images,&self.document);
         let styles = core::cell::RefCell::new(css::StyleCache::default());
         let list = layout::display_list_with_snapshot_mode(
@@ -3638,9 +3740,99 @@ impl RenderSession {
             Some(&safe_images), Some(&mut geometry), &self.scrolls, &styles,
             None, None, None, Some(root),
         )?;
+        self.images_pending |= node_images.pending.get();
         let rect = geometry.hits.iter().find(|hit| hit.node == root && !hit.virtual_generated)
             .map(|hit| hit.rect).unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
         Ok((list, rect))
+    }
+
+    /// When every image which arrived since the last layout only paints (it
+    /// sizes no box), swaps it into the retained frame instead of laying the
+    /// page out again. Returns whether the frame now matches the resolver.
+    fn patch_arrived_images(&mut self, version: u64, width: u32, height: u32, images: Option<&dyn ImageResolver>) -> bool {
+        let Some(generation) = images.map(ImageResolver::generation).filter(|generation| *generation != 0) else {
+            return false;
+        };
+        if self.pending_lookups.is_empty() || !(self.forced_layout || !self.timeline_layout_stale) {
+            return false;
+        }
+        let Some(mut frame) = self.cached.take() else {
+            return false;
+        };
+        let patched = frame.document_version == version
+            && frame.width == width
+            && frame.height == height
+            && frame.image_generation != Some(generation)
+            && self.patch_frame(&mut frame, images, generation);
+        self.cached = Some(frame);
+        patched
+    }
+
+    fn patch_frame(&mut self, frame: &mut CachedFrame, images: Option<&dyn ImageResolver>, generation: u64) -> bool {
+        // Only completed loads may have happened since the frame: a painted
+        // image which was dropped, failed or replaced is for a layout.
+        if !frame.image_generation.is_some_and(|painted| images.is_some_and(|images| images.arrivals_only_since(painted))) {
+            return false;
+        }
+        let (arrived, patches) = {
+            let node_images = NodeImages {
+                color_schemes: self.media_environment().color_schemes,
+                svg_fragment: self.svg_fragment.as_deref(), svg_image_viewport: self.svg_image_viewport.as_deref().copied(),
+                paint_definitions: &self.paint_definitions,
+                paint_registration_revision: self.rules_generation,
+                bitmaps: &self.node_bitmaps, embedded: &self.embedded_bitmaps,
+                objects: &self.object_representations,
+                fallback: images,
+                pending: Default::default(),
+            };
+            let mut arrived: Vec<layout::PendingLookup> = Vec::new();
+            for (lookup, _) in &self.pending_lookups {
+                match node_images.lookup_state(lookup) {
+                    Some(layout::ImageState::Pending) => {}
+                    // Anything but a valid image (a failed one changes what the
+                    // element is) is for a layout to handle.
+                    Some(layout::ImageState::Ready(image)) if image.is_valid() => arrived.push(lookup.clone()),
+                    _ => {
+                        return false;
+                    }
+                }
+            }
+            if self.pending_lookups.iter().any(|(lookup, paint_only)| !*paint_only && arrived.contains(lookup)) {
+                return false;
+            }
+            let mut patches = Vec::new();
+            for lookup in &arrived {
+                let mut covered = false;
+                for record in frame.geometry.deferred_images.iter().filter(|record| record.lookup == *lookup) {
+                    covered = true;
+                    let Some(index) = layout::deferred_image_command(&frame.list.0, record) else {
+                        return false;
+                    };
+                    let Some(command) = layout::rebuild_deferred(record, &node_images, &frame.list.0[index]) else {
+                        return false;
+                    };
+                    patches.push((index, command));
+                }
+                // A paint-only use without a record (srcset candidates, nested
+                // cross-fade images, ...) cannot be painted into the frame.
+                if !covered {
+                    return false;
+                }
+            }
+            (arrived, patches)
+        };
+        for (index, command) in patches {
+            frame.list.0[index] = command;
+        }
+        frame.geometry.deferred_images.retain(|record| !arrived.contains(&record.lookup));
+        self.pending_lookups.retain(|(lookup, _)| !arrived.contains(lookup));
+        self.images_pending = !self.pending_lookups.is_empty();
+        frame.image_generation = Some(generation);
+        if !arrived.is_empty() {
+            self.frame_id += 1;
+            self.image_patch_count += 1;
+        }
+        true
     }
 
     fn render(
@@ -3667,14 +3859,26 @@ impl RenderSession {
         self.object_representations.retain(|(node, _, _)| self.document.kind(*node).is_ok());
         let version = self.document.version();
         let image_generation = images.map(ImageResolver::generation);
-        if self.cached.as_ref().is_some_and(|cached| {
+        self.patch_arrived_images(version, width, height, images);
+        // A layout which fails leaves the previous frame's pending state.
+        let pending_before = self.images_pending;
+        // Generation 0 means the resolver does not version its state, so a
+        // frame laid out around a loading image cannot tell when to be redone.
+        let unversioned_pending = self.images_pending && image_generation == Some(0);
+        // A new generation only changes what the loading images answer: the
+        // retained fragments laid out around one that is still loading revalidate
+        // themselves (see `RetainedFragment::pending_images`), all others replay.
+        if self.cached.as_ref().is_some_and(|cached| cached.width != width || cached.height != height) {
+            self.layout_cache.clear();
+        }
+        if unversioned_pending || self.cached.as_ref().is_some_and(|cached| {
             cached.width != width
                 || cached.height != height
                 || cached.image_generation != image_generation
         }) {
-            self.layout_cache.clear();
+            self.images_pending = false;
         }
-        let fresh = (self.forced_layout||!self.timeline_layout_stale)&&self.cached.as_ref().is_some_and(|cached| {
+        let fresh = (self.forced_layout||!self.timeline_layout_stale)&&!unversioned_pending&&self.cached.as_ref().is_some_and(|cached| {
             cached.document_version == version
                 && cached.width == width
                 && cached.height == height
@@ -3691,9 +3895,11 @@ impl RenderSession {
                     && (!self.rendered_text_requested || failed.collect_rendered_text)
             });
             if let Some(failed) = retry_cached_failure {
+                self.images_pending = pending_before;
                 return Err(failed.error.clone());
             }
             if let Err(error) = self.relayout(width, height, text, images, version) {
+                self.images_pending = pending_before;
                 // Image errors follow the resolver's state, which may settle
                 // without a new generation, and CommandLimit also reports
                 // transient allocation failure. Only deterministic failures
@@ -3789,6 +3995,7 @@ impl RenderSession {
                 && !retain_styles_for_resize(rules, &self.style_cache, self.style_environment));
         if environment_changed || full_restyle {
             self.layout_cache.clear();
+            self.images_pending = false;
         }
         if full_restyle {
             self.style_cache.borrow_mut().clear();
@@ -3851,6 +4058,8 @@ impl RenderSession {
         let mut corrected = false;
         let mut sampled_timelines=false;
         let mut timeline_corrected=false;
+        let mut pending_images = self.images_pending;
+        let mut pending_lookups: Vec<(layout::PendingLookup, bool)>;
         let (mut list, mut geometry) = loop {
             let mut geometry = layout::LayoutGeometry::default();
             geometry.collect_rendered_text = self.rendered_text_requested;
@@ -3863,8 +4072,9 @@ impl RenderSession {
             bitmaps: &self.node_bitmaps, embedded:&self.embedded_bitmaps,
             objects: &self.object_representations,
             fallback: images,
+            pending: Default::default(),
         };
-                layout::display_list_with_snapshot_mode_and_timelines(
+                let list = layout::display_list_with_snapshot_mode_and_timelines(
                 &self.document,
                 width,
                 height,
@@ -3879,7 +4089,10 @@ impl RenderSession {
                 canvas_background,
                 None,
                 self.timeline_transform_values.as_deref(),
-            )?
+            )?;
+                pending_images |= node_images.pending.get();
+                pending_lookups = node_images.pending.take_distinct();
+                list
             };
             let mut changed = false;
             if !corrected {for scroll in &mut self.scrolls {
@@ -3914,7 +4127,11 @@ impl RenderSession {
             if !changed {break (list,geometry);}
             self.layout_cache.clear();
             self.layout_cache.begin_frame();
+            pending_images = false;
         };
+        self.images_pending = pending_images;
+        self.pending_lookups = pending_lookups;
+        self.layout_count += 1;
         let mut requests = Vec::new();
         apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
         self.paint_worklet_cache.retain(|(request,_)|requests.contains(request));
@@ -6829,6 +7046,9 @@ mod tests {
         fn generation(&self) -> u64 {
             self.generation.get()
         }
+        fn arrivals_only_since(&self, _: u64) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -6852,6 +7072,7 @@ mod tests {
             embedded:&[],
             objects: &[],
             fallback: Some(&images),
+            pending: Default::default(),
         };
         assert_eq!(ImageResolver::generation(&node_images), 23);
     }
@@ -6901,6 +7122,24 @@ mod tests {
         assert!(text.calls.get() > calls, "a changed document is laid out again");
     }
 
+    fn test_images(width: u32, height: u32) -> Images {
+        Images {
+            generation: Cell::new(1),
+            ready: Cell::new(false),
+            calls: Cell::new(0),
+            image: Arc::new(ImageData {
+                width,
+                height,
+                pixels: alloc::vec![1; (width * height * 4) as usize],
+            }),
+        }
+    }
+
+    fn id_rect(session: &RenderSession, id: &str) -> Rect {
+        let node = crate::selector::get_element_by_id(session.document(), session.document().root(), id).unwrap().unwrap();
+        session.client_rects(node)[0]
+    }
+
     #[test]
     fn image_generation_controls_retained_display_list() {
         let document = crate::html::parse(
@@ -6909,33 +7148,361 @@ mod tests {
         )
         .unwrap();
         let mut session = RenderSession::new(document);
-        let images = Images {
-            generation: Cell::new(0),
-            ready: Cell::new(false),
-            calls: Cell::new(0),
-            image: Arc::new(ImageData {
-                width: 1,
-                height: 1,
-                pixels: alloc::vec![1, 2, 3, 255],
-            }),
-        };
-        assert_eq!(
-            session.display_list_with_images(1, 1, &NoText, &images),
-            Err(LayoutError::ImagePending)
-        );
+        let images = test_images(1, 1);
+        session.display_list_with_images(1, 1, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let calls = images.calls.get();
+        assert!(calls > 0);
+        session.display_list_with_images(1, 1, &NoText, &images).unwrap();
+        assert_eq!(images.calls.get(), calls, "a pending image does not relayout an unchanged page");
         images.ready.set(true);
-        session
-            .display_list_with_images(1, 1, &NoText, &images)
-            .unwrap();
-        session
-            .display_list_with_images(1, 1, &NoText, &images)
-            .unwrap();
-        assert_eq!(images.calls.get(), 2);
-        images.generation.set(1);
-        session
-            .display_list_with_images(1, 1, &NoText, &images)
-            .unwrap();
-        assert_eq!(images.calls.get(), 3);
+        images.generation.set(2);
+        let list = session.display_list_with_images(1, 1, &NoText, &images).unwrap();
+        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { .. })));
+        assert!(images.calls.get() > calls);
+        assert!(!session.images_pending());
+    }
+
+    #[test]
+    fn pending_image_lays_out_with_placeholder_geometry_and_relayouts_on_arrival() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><img id=a src='a.png' width=100 height=50 style='display:block'><div id=b style='height:10px'></div>",
+            16,
+        )
+        .unwrap();
+        let mut session = RenderSession::new(document);
+        let images = test_images(7, 3);
+        session.display_list_with_images(200, 200, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let image = id_rect(&session, "a");
+        assert_eq!((image.width, image.height), (100.0, 50.0));
+        assert_eq!(id_rect(&session, "b").y, 50.0);
+
+        let document = crate::html::parse(
+            "<body style='margin:0'><img id=a src='a.png' style='display:block'><div id=b style='height:10px'></div>",
+            16,
+        )
+        .unwrap();
+        let mut session = RenderSession::new(document);
+        let images = test_images(7, 3);
+        session.display_list_with_images(200, 200, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let image = id_rect(&session, "a");
+        assert_eq!((image.width, image.height), (0.0, 0.0));
+        assert_eq!(id_rect(&session, "b").y, 0.0);
+        images.ready.set(true);
+        images.generation.set(2);
+        session.display_list_with_images(200, 200, &NoText, &images).unwrap();
+        assert!(!session.images_pending());
+        let image = id_rect(&session, "a");
+        assert_eq!((image.width, image.height), (7.0, 3.0));
+        assert_eq!(id_rect(&session, "b").y, 3.0);
+    }
+
+    struct Sources {
+        generation: Cell<u64>,
+        ready: core::cell::RefCell<Vec<&'static str>>,
+        image: Arc<ImageData>,
+    }
+
+    impl Sources {
+        fn new() -> Self {
+            Self {
+                generation: Cell::new(1),
+                ready: Default::default(),
+                image: Arc::new(ImageData { width: 7, height: 3, pixels: alloc::vec![1; 7 * 3 * 4] }),
+            }
+        }
+        fn arrive(&self, source: &'static str) {
+            self.ready.borrow_mut().push(source);
+            self.generation.set(self.generation.get() + 1);
+        }
+    }
+
+    impl ImageResolver for Sources {
+        fn resolve(&self, source: &str) -> ImageState {
+            if self.ready.borrow().contains(&source) {
+                ImageState::Ready(self.image.clone())
+            } else {
+                ImageState::Pending
+            }
+        }
+        fn generation(&self) -> u64 {
+            self.generation.get()
+        }
+        fn arrivals_only_since(&self, _: u64) -> bool {
+            true
+        }
+    }
+
+    const PAGE_WITH_IMAGES: &str = "<body style='margin:0'>\
+        <div id=text style='height:30px'>text</div>\
+        <img id=sized src='sized.png' width=100 height=50 style='display:block'>\
+        <div id=plain style='width:40px;height:20px;background-image:url(back.png)'></div>\
+        <div id=mid style='height:10px'>mid</div>\
+        <img id=free src='free.png' style='display:block'>\
+        <div id=tail style='height:10px'>tail</div>";
+
+    fn page_with_images() -> (RenderSession, Sources) {
+        let document = crate::html::parse(PAGE_WITH_IMAGES, 64).unwrap();
+        (RenderSession::new(document), Sources::new())
+    }
+
+    fn image_commands(list: &DisplayList) -> usize {
+        list.0.iter().filter(|command| matches!(command, crate::paint::Command::Image { .. })).count()
+    }
+
+    fn background_tiles(list: &DisplayList) -> Vec<f32> {
+        list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::FillBackground(fill) => Some(fill.image_rect.width),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn arriving_images_which_do_not_size_a_box_do_not_lay_it_out_again() {
+        let (mut session, images) = page_with_images();
+        session.display_list_with_images(200, 400, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        let tail = id_rect(&session, "tail");
+        assert_eq!(session.layout_count(), 1);
+        assert_eq!(background_tiles(session.display_list_with_images(200, 400, &NoText, &images).unwrap()), [0.0]);
+
+        images.arrive("other.png");
+        session.display_list_with_images(200, 400, &NoText, &images).unwrap();
+        assert_eq!((session.layout_count(), session.image_patch_count()), (1, 0), "an image the page does not use changes nothing");
+
+        images.arrive("sized.png");
+        let list = session.display_list_with_images(200, 400, &NoText, &images).unwrap().clone();
+        assert_eq!((session.layout_count(), session.image_patch_count()), (1, 1), "a sized <img> is painted, not laid out");
+        assert_eq!(image_commands(&list), 1, "the arrived image replaces its placeholder");
+        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { image, .. } if image.pixels[0] == 1)));
+        assert_eq!(id_rect(&session, "tail"), tail, "its box keeps the geometry it had");
+        assert!(session.images_pending(), "two images are still loading");
+
+        images.arrive("back.png");
+        let list = session.display_list_with_images(200, 400, &NoText, &images).unwrap().clone();
+        assert_eq!((session.layout_count(), session.image_patch_count()), (1, 2), "a background image is painted, not laid out");
+        assert_eq!(background_tiles(&list), [7.0], "the arrived background is painted at its natural size");
+        assert_eq!(id_rect(&session, "tail"), tail);
+        assert!(session.images_pending(), "the unsized <img> is still loading");
+
+        let (mut fresh, ready) = page_with_images();
+        ready.arrive("sized.png");
+        ready.arrive("back.png");
+        let reference = fresh.display_list_with_images(200, 400, &NoText, &ready).unwrap().clone();
+        assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn an_arriving_image_which_sizes_its_box_moves_what_follows() {
+        let (mut session, images) = page_with_images();
+        session.display_list_with_images(200, 400, &NoText, &images).unwrap();
+        let tail = id_rect(&session, "tail");
+        let free = id_rect(&session, "free");
+        assert_eq!((free.width, free.height), (0.0, 0.0));
+
+        images.arrive("free.png");
+        let list = session.display_list_with_images(200, 400, &NoText, &images).unwrap().clone();
+        let free = id_rect(&session, "free");
+        assert_eq!((free.width, free.height), (7.0, 3.0));
+        assert_eq!(id_rect(&session, "tail").y, tail.y + 3.0);
+        assert_eq!(image_commands(&list), 2);
+        assert_eq!(session.layout_count(), 2, "an <img> without dimensions needs the layout again");
+        assert!(session.images_pending(), "the others are still loading");
+    }
+
+    /// Answers per URL and per node; images can arrive, be dropped or be replaced.
+    struct Library {
+        generation: Cell<u64>,
+        removed: Cell<u64>,
+        urls: core::cell::RefCell<Vec<(&'static str, Arc<ImageData>)>>,
+        node: core::cell::RefCell<Option<Arc<ImageData>>>,
+        nodes: Cell<bool>,
+    }
+
+    impl Library {
+        fn new() -> Self {
+            Self { generation: Cell::new(1), removed: Cell::new(0), urls: Default::default(), node: Default::default(), nodes: Cell::new(false) }
+        }
+        fn pixel(value: u8) -> Arc<ImageData> {
+            Arc::new(ImageData { width: 7, height: 3, pixels: alloc::vec![value; 7 * 3 * 4] })
+        }
+        fn arrive(&self, source: &'static str, value: u8) {
+            self.urls.borrow_mut().push((source, Self::pixel(value)));
+            self.generation.set(self.generation.get() + 1);
+        }
+        fn arrive_node(&self, value: u8) {
+            *self.node.borrow_mut() = Some(Self::pixel(value));
+            self.generation.set(self.generation.get() + 1);
+        }
+        fn drop_url(&self, source: &'static str) {
+            self.urls.borrow_mut().retain(|(known, _)| *known != source);
+            self.generation.set(self.generation.get() + 1);
+            self.removed.set(self.generation.get());
+        }
+    }
+
+    impl ImageResolver for Library {
+        fn resolve(&self, source: &str) -> ImageState {
+            match self.urls.borrow().iter().find(|(known, _)| *known == source) {
+                Some((_, image)) => ImageState::Ready(image.clone()),
+                None => ImageState::Pending,
+            }
+        }
+        fn resolve_node(&self, _: NodeId) -> Option<ImageState> {
+            self.nodes.get().then(|| self.node.borrow().clone().map_or(ImageState::Pending, ImageState::Ready))
+        }
+        fn generation(&self) -> u64 {
+            self.generation.get()
+        }
+        fn arrivals_only_since(&self, generation: u64) -> bool {
+            generation >= self.removed.get()
+        }
+    }
+
+    fn painted_pixels(list: &DisplayList) -> Vec<u8> {
+        list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::Image { image, .. } if image.pixels.len() > 4 => Some(image.pixels[0]),
+            crate::paint::Command::FillBackground(fill) => match &fill.image {
+                crate::paint::BackgroundPaint::CrossFade(items) => items.iter().find_map(|(paint, _)| match paint {
+                    crate::paint::BackgroundPaint::Image(image) if image.is_valid() => Some(image.pixels[0]),
+                    _ => None,
+                }),
+                crate::paint::BackgroundPaint::Image(image) if image.is_valid() => Some(image.pixels[0]),
+                _ => None,
+            },
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn a_selected_img_candidate_arriving_is_painted_with_the_page_still_pending_until_then() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><img src='fallback.png' srcset='big.png 2x' width=100 height=50 style='display:block'>",
+            64,
+        ).unwrap();
+        let mut session = RenderSession::new(document);
+        let images = Library::new();
+        images.nodes.set(true);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        images.arrive("fallback.png", 9);
+        assert!(painted_pixels(session.display_list_with_images(200, 100, &NoText, &images).unwrap()).is_empty(),
+            "the node's candidate is still loading, not the src");
+        assert!(session.images_pending());
+        images.arrive_node(5);
+        let list = session.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        assert_eq!(painted_pixels(&list), [5], "the selected candidate is painted");
+        assert!(!session.images_pending());
+        let (mut fresh, _) = (RenderSession::new(crate::html::parse(
+            "<body style='margin:0'><img src='fallback.png' srcset='big.png 2x' width=100 height=50 style='display:block'>", 64).unwrap()), ());
+        let reference = fresh.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        assert!(list.0 == reference.0, "the patched frame paints what a fresh layout does");
+    }
+
+    #[test]
+    fn an_arrival_without_a_record_lays_out_again_and_paints() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><img srcset='big.png 2x' width=100 height=50 style='display:block'>",
+            64,
+        ).unwrap();
+        let mut session = RenderSession::new(document);
+        let images = Library::new();
+        images.nodes.set(true);
+        session.display_list_with_images(200, 100, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        images.arrive_node(5);
+        let list = session.display_list_with_images(200, 100, &NoText, &images).unwrap().clone();
+        assert_eq!(painted_pixels(&list), [5], "an <img> without src is painted once it arrives");
+        assert!(!session.images_pending());
+    }
+
+    #[test]
+    fn a_nested_cross_fade_image_arriving_is_painted() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div style='width:40px;height:20px;background-image:cross-fade(50% url(a.png), 50% url(b.png))'></div>",
+            64,
+        ).unwrap();
+        let mut session = RenderSession::new(document);
+        let images = Library::new();
+        session.display_list_with_images(100, 100, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        images.arrive("a.png", 4);
+        images.arrive("b.png", 6);
+        let list = session.display_list_with_images(100, 100, &NoText, &images).unwrap().clone();
+        assert_eq!(painted_pixels(&list), [4], "the cross-fade paints its arrived images");
+        assert!(!session.images_pending());
+    }
+
+    #[test]
+    fn a_dropped_painted_image_is_not_kept_by_a_patch() {
+        let (mut session, images) = (RenderSession::new(crate::html::parse(PAGE_WITH_IMAGES, 64).unwrap()), Library::new());
+        images.arrive("free.png", 3);
+        session.display_list_with_images(200, 400, &NoText, &images).unwrap();
+        assert!(session.images_pending());
+        assert_eq!(painted_pixels(session.display_list_with_images(200, 400, &NoText, &images).unwrap()), [3]);
+        let layouts = session.layout_count();
+        images.drop_url("free.png");
+        images.arrive("sized.png", 8);
+        let list = session.display_list_with_images(200, 400, &NoText, &images).unwrap().clone();
+        assert!(session.layout_count() > layouts, "the dropped image needs a layout, not a patch");
+        assert_eq!(session.image_patch_count(), 0);
+        assert!(painted_pixels(&list).contains(&8), "the arrived image is painted by the layout");
+    }
+
+    #[test]
+    fn pending_state_survives_a_failed_layout() {
+        struct Flaky(Cell<bool>, Cell<u64>);
+        impl TextShaper for Flaky {
+            fn generation(&self) -> u64 { self.1.get() }
+            fn shape(&self, _: &str, _: f32) -> Result<ShapedRun, ()> {
+                if self.0.get() { Err(()) } else { Ok(ShapedRun { glyphs: Arc::from([]), width: 0.0 }) }
+            }
+            fn ascent(&self, _: f32) -> f32 { 0.0 }
+            fn line_height(&self, _: f32) -> f32 { 0.0 }
+        }
+        let document = crate::html::parse(
+            "<body style='margin:0'><p>text</p><img src='a.png' width=10 height=10>", 64,
+        ).unwrap();
+        let mut session = RenderSession::new(document);
+        let images = Library::new();
+        let text = Flaky(Cell::new(false), Cell::new(0));
+        session.display_list_with_images(100, 100, &text, &images).unwrap();
+        assert!(session.images_pending());
+        images.arrive("other.png", 1);
+        text.0.set(true);
+        text.1.set(1);
+        assert!(session.display_list_with_images(100, 101, &text, &images).is_err());
+        assert!(session.images_pending(), "the image is still loading after a layout which failed");
+        text.0.set(false);
+        text.1.set(2);
+        session.display_list_with_images(100, 101, &text, &images).unwrap();
+        assert!(session.images_pending());
+        images.arrive("a.png", 2);
+        session.display_list_with_images(100, 101, &text, &images).unwrap();
+        assert!(!session.images_pending());
+    }
+
+    #[test]
+    fn pending_background_image_paints_nothing_without_failing() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div style='width:40px;height:20px;background-image:url(a.png)'></div>",
+            64,
+        )
+        .unwrap();
+        let mut session = RenderSession::new(document);
+        let images = test_images(2, 2);
+        let tiles = |list: &DisplayList| list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::FillBackground(fill) => Some(fill.image_rect.width),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tiles(session.display_list_with_images(100, 100, &NoText, &images).unwrap()), [0.0]);
+        assert!(session.images_pending());
+        images.ready.set(true);
+        images.generation.set(2);
+        assert_eq!(tiles(session.display_list_with_images(100, 100, &NoText, &images).unwrap()), [2.0]);
+        assert!(!session.images_pending());
     }
 
     #[test]

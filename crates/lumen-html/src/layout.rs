@@ -85,9 +85,56 @@ pub trait ImageResolver {
     fn resolve_node(&self, _node: NodeId) -> Option<ImageState> {
         None
     }
+    /// Advances whenever any answer of this resolver may have changed (an image
+    /// arrived, failed or was dropped). A frame laid out while an image was
+    /// `Pending` is kept until it advances; 0 marks a resolver which does not
+    /// version its state, whose pending frames are laid out again on every render.
     fn generation(&self) -> u64 {
         0
     }
+    /// Whether every change since `generation` was an image completing (a
+    /// loading one becoming ready or failed): none that was ready or failed
+    /// was dropped, cancelled or replaced. Only then can a frame laid out at
+    /// `generation` be patched with the arrived images; the default answers
+    /// no, which keeps such resolvers on the layout path.
+    fn arrivals_only_since(&self, _generation: u64) -> bool {
+        false
+    }
+    /// Position in the log of lookups which answered `Pending`. Layout takes a
+    /// mark before a box and reads what followed it, so that a retained
+    /// fragment knows which loading images it was laid out around.
+    fn pending_mark(&self) -> usize {
+        0
+    }
+    /// The lookups since `mark`, each with whether it was made as a paint-only
+    /// use (see `set_paint_only`).
+    fn pending_since(&self, _mark: usize) -> Vec<(PendingLookup, bool)> {
+        Vec::new()
+    }
+    /// Re-logs the lookups of a replayed fragment for the boxes around it.
+    fn replay_pending(&self, _lookups: &[(PendingLookup, bool)]) {}
+    /// Marks the following lookups as uses whose answer cannot change the
+    /// geometry of the layout (a sized `<img>`, a background image): a host
+    /// may paint them later without laying out again. Returns the previous mark.
+    fn set_paint_only(&self, _paint_only: bool) -> bool {
+        false
+    }
+    /// Whether asking again would still answer `Pending`, without logging it.
+    fn still_pending(&self, _lookup: &PendingLookup) -> bool {
+        false
+    }
+}
+
+/// A resolver question which was answered `Pending`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingLookup {
+    Source(Arc<str>),
+    From(Arc<str>, Arc<str>),
+    NodeFrom(NodeId, Arc<str>, Arc<str>),
+    Request(NodeId, Arc<str>, Arc<str>, ImageRequestParameters),
+    Node(NodeId),
+    /// Cannot be asked again: any generation change ends it.
+    Unknown,
 }
 
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -200,7 +247,11 @@ pub enum LayoutError {
     /// The customizable select requires its genuine picker/shadow tree.
     UnsupportedWidgetAppearance,
     CommandLimit,
+    /// No longer returned by layout: an image that is still loading lays out
+    /// with placeholder geometry and paints nothing (see
+    /// `RenderSession::images_pending`).
     ImagePending,
+    /// No longer returned by layout: a failed image is a broken image.
     ImageFailed,
     GridLimit,
 }
@@ -1177,6 +1228,8 @@ fn parse_svg_stop_offset(input: &str) -> Option<f32> {
 }
 
 const MAX_DISPLAY_COMMANDS: usize = 16 * 1024;
+// Chromium's LayoutUnit granularity: absolute f32 coordinates must not push an exactly fitting word onto the next line.
+const INLINE_FIT_TOLERANCE: f64 = 1.0 / 64.0;
 const MAX_DISPLAY_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RETAINED_FRAGMENT_ENTRIES: usize = 2048;
 const MAX_RETAINED_FRAGMENT_BYTES: usize = 1 * 1024 * 1024;
@@ -1329,6 +1382,12 @@ struct RetainedFragment {
     /// Layout of this subtree consulted the text shaper, so its commands and
     /// geometry depend on loaded fonts.
     has_text: bool,
+    /// Loading images this subtree was laid out around (placeholder geometry),
+    /// and the resolver generation they were last known to be loading at. The
+    /// fragment replays while they are all still loading.
+    pending_images: Option<Arc<[(PendingLookup, bool)]>>,
+    deferred_images: Option<Arc<[DeferredImage]>>,
+    pending_generation: u64,
     bytes: usize,
     last_used: u64,
 }
@@ -1407,6 +1466,10 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
     fn line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
         self.bump();
         self.inner.line_height_styled(size, font)
+    }
+    fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        self.bump();
+        self.inner.normal_line_height_styled(size, font)
     }
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
@@ -3649,7 +3712,7 @@ impl Layout<'_> {
         self.overflow_frames.last().map_or(f64::from(paint),|frame|frame.flow_cursor.filter(|point|point.0==paint)
             .map_or(f64::from(paint)-f64::from(frame.paint_origin.1),|point|point.1))
     }
-    fn containing_overflow_origin(&self,node:Option<NodeId>)->(f64,f64) {
+    fn containing_overflow_origin(&self,node:Option<NodeId>,own:NodeId)->(f64,f64) {
         if let Some(inline) = node.and_then(|node| self.inline_containing_origins.iter().rev().find(|entry|entry.node==node)) {
             let mut point = inline.origin;
             for frame in self.overflow_frames.get(inline.frame + 1..).unwrap_or(&[]) {
@@ -3657,7 +3720,11 @@ impl Layout<'_> {
             }
             return point;
         }
-        let target=node.and_then(|node|self.overflow_frames.iter().rposition(|frame|frame.node==node)).unwrap_or(0);
+        // A generated box's frame carries its origin element's node, which is also
+        // its containing block's: the box's own frame is not that block's frame.
+        let own_frame=usize::from(node==Some(own)&&self.overflow_frames.last().is_some_and(|frame|frame.node==own));
+        let candidates=&self.overflow_frames[..self.overflow_frames.len()-own_frame];
+        let target=node.and_then(|node|candidates.iter().rposition(|frame|frame.node==node)).unwrap_or(0);
         let mut point=self.overflow_frames.get(target).and_then(|frame|frame.containing_origin).unwrap_or((0.0,0.0));
         for frame in self.overflow_frames.get(target+1..).unwrap_or(&[]) {point.0-=frame.placement.0;point.1-=frame.placement.1;}
         point
@@ -6610,6 +6677,7 @@ struct FlexItem {
     first_hit: usize,
     last_hit: usize,
     baselines: Option<FlowBaselines>,
+    cross_shift: f32,
     content_ranges: Option<FlowContentRanges>,
 }
 
@@ -9268,6 +9336,87 @@ pub(crate) struct LayoutGeometry {
     pub viewport_fixed_nodes: Vec<NodeId>,
     pub scroll_regions: Vec<ScrollRegion>,
     pub control_text_runs: Vec<ControlTextRun>,
+    /// Paint-only images which were still loading when this was laid out; see
+    /// [`DeferredImage`].
+    pub deferred_images: Vec<DeferredImage>,
+}
+
+/// An image that was still loading when a box whose geometry cannot depend on
+/// it was laid out. Its command holds `placeholder` (an invalid image); once
+/// `lookup` is answered, `rebuild_deferred` gives the command to put in its
+/// place without laying out again.
+#[derive(Clone)]
+pub(crate) struct DeferredImage {
+    pub lookup: PendingLookup,
+    pub placeholder: Arc<ImageData>,
+    paint: DeferredPaint,
+}
+
+#[derive(Clone)]
+enum DeferredPaint {
+    Image {
+        node: NodeId,
+        base: Option<Arc<str>>,
+        source: Arc<str>,
+        scheme: css::UsedColorScheme,
+    },
+    Background(Box<DeferredBackground>),
+}
+
+#[derive(Clone)]
+struct DeferredBackground {
+    rect: Rect,
+    coverage: Option<Rect>,
+    style: Style,
+    layer: BackgroundLayer,
+    layer_index: usize,
+    viewport: Rect,
+    local_padding_area: Option<Rect>,
+    sizing: Option<(DecorationJoinAxis, f32, Option<Rect>)>,
+}
+
+fn paint_command_holds(command: &Command, placeholder: &Arc<ImageData>) -> bool {
+    match command {
+        Command::Image { image, .. } => Arc::ptr_eq(image, placeholder),
+        Command::FillBackground(fill) => matches!(&fill.image, BackgroundPaint::Image(image) if Arc::ptr_eq(image, placeholder)),
+        Command::MaskedBackground(masked) => paint_command_holds(&masked.paint, placeholder),
+        _ => false,
+    }
+}
+
+/// The index in `commands` of the command painting `deferred`'s placeholder.
+pub(crate) fn deferred_image_command(commands: &[Command], deferred: &DeferredImage) -> Option<usize> {
+    commands.iter().position(|command| paint_command_holds(command, &deferred.placeholder))
+}
+
+/// The command which paints `deferred` now that its image has arrived, or
+/// `None` when it did not arrive as a valid image (that needs a layout).
+pub(crate) fn rebuild_deferred(deferred: &DeferredImage, images: &dyn ImageResolver, old: &Command) -> Option<Command> {
+    match &deferred.paint {
+        DeferredPaint::Image { node, base, source, scheme } => {
+            let Command::Image { rect, .. } = old else { return None };
+            let state = resolve_element_image(images, *node, Some(source), base.as_deref())?;
+            let ImageState::Ready(image) = state else { return None };
+            if !image.is_valid() {
+                return None;
+            }
+            let image = match images.resolve_viewport(Some(*node), base.as_deref().unwrap_or(""), source, &image, rect.width, rect.height, *scheme) {
+                Some(ImageState::Ready(viewport_image)) if viewport_image.is_valid() => viewport_image,
+                _ => image,
+            };
+            Some(Command::Image { rect: *rect, image })
+        }
+        DeferredPaint::Background(background) => {
+            let paint = background_paint(&background.layer, Some(images));
+            if !matches!(&paint, BackgroundPaint::Image(image) if image.is_valid()) {
+                return None;
+            }
+            Some(background_command_with_fragment_sizing(
+                background.rect, background.coverage, &background.style, &background.layer, background.layer_index,
+                &paint, background.viewport, background.local_padding_area, Some(images), background.sizing,
+            ))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -11360,6 +11509,38 @@ fn empty_image() -> Arc<ImageData> {
         height: 0,
         pixels: Vec::new(),
     })
+}
+
+/// What a loading <img> paints until its image arrives: a valid image (the
+/// rasterizer rejects invalid ones) which shows nothing, and is unique so the
+/// command can be found again.
+fn transparent_placeholder() -> Arc<ImageData> {
+    Arc::new(ImageData {
+        width: 1,
+        height: 1,
+        pixels: alloc::vec![0; 4],
+    })
+}
+
+fn deferred_background_paint(images: Option<&dyn ImageResolver>, recording: bool, viewport: Rect, rect: Rect, coverage: Option<Rect>,
+style: &Style, layer: &BackgroundLayer, layer_index: usize, local_padding_area: Option<Rect>,
+sizing: Option<(DecorationJoinAxis, f32, Option<Rect>)>) -> (BackgroundPaint, Option<DeferredImage>) {
+    let paint = background_paint(layer, images);
+    if let BackgroundImage::Url(url) | BackgroundImage::UrlResolution { url, .. } = &layer.image {
+        if recording && background_image_pending(&layer.image, images) {
+            let placeholder = empty_image();
+            let deferred = DeferredImage {
+                lookup: PendingLookup::Source(url.as_ref().into()),
+                placeholder: placeholder.clone(),
+                paint: DeferredPaint::Background(Box::new(DeferredBackground {
+                    rect, coverage, style: style.clone(), layer: layer.clone(), layer_index,
+                    viewport, local_padding_area, sizing,
+                })),
+            };
+            return (BackgroundPaint::Image(placeholder), Some(deferred));
+        }
+    }
+    (paint, None)
 }
 
 fn background_image_pending(image: &BackgroundImage, images: Option<&dyn ImageResolver>) -> bool {
@@ -14282,13 +14463,29 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         if matches!(layer.image, BackgroundImage::None) {
             return Ok(());
         }
-        if background_image_pending(&layer.image, self.images) {
-            return Err(LayoutError::ImagePending);
-        }
-        let paint = background_paint(layer, self.images);
-        self.push_command(background_command_with_fragment_sizing(
+        // A background image never sizes a box, so it is a paint-only use.
+        // `finish_background_indices` usually replaces this command with the
+        // final one, and its record with that command's.
+        let previous = self.images.map(|images| images.set_paint_only(true));
+        let (paint, deferred) = self.deferred_background_paint(rect, coverage, style, layer, layer_index, None, sizing);
+        let command = background_command_with_fragment_sizing(
             rect,coverage,style,layer,layer_index,&paint,self.viewport,None,self.images,sizing,
-        ))
+        );
+        if let (Some(images), Some(previous)) = (self.images, previous) {
+            images.set_paint_only(previous);
+        }
+        if let (Some(deferred), Some(geometry)) = (deferred, self.geometry.as_deref_mut()) {
+            geometry.deferred_images.push(deferred);
+        }
+        self.push_command(command)
+    }
+
+    /// The paint of a background layer, and when its image is still loading
+    /// the record which paints it later, with a placeholder in its place.
+    fn deferred_background_paint(&self, rect: Rect, coverage: Option<Rect>, style: &Style, layer: &BackgroundLayer,
+        layer_index: usize, local_padding_area: Option<Rect>,
+        sizing: Option<(DecorationJoinAxis, f32, Option<Rect>)>) -> (BackgroundPaint, Option<DeferredImage>) {
+        deferred_background_paint(self.images, self.geometry.is_some(), self.viewport, rect, coverage, style, layer, layer_index, local_padding_area, sizing)
     }
 
     fn finish_background(
@@ -14363,15 +14560,20 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             match command {
                 Command::FillBackground(_) => {
                     if let Some((layer_index, layer)) = layers.next() {
-                        let paint = background_paint(&layer, self.images);
-                        replace_command_bytes(
-                            command,
-                            &mut command_bytes,
-                            background_command_with_fragment_sizing(
-                                rect,coverage,style,&layer,layer_index,&paint,self.viewport,
-                                local_padding_area,self.images,sizing,
-                            ),
-                        )?;
+                        let previous = self.images.map(|images| images.set_paint_only(true));
+                        let (paint, deferred) = deferred_background_paint(self.images, self.geometry.is_some(), self.viewport, rect, coverage, style, &layer, layer_index, local_padding_area, sizing);
+                        let replacement = background_command_with_fragment_sizing(
+                            rect,coverage,style,&layer,layer_index,&paint,self.viewport,
+                            local_padding_area,self.images,sizing,
+                        );
+                        if let (Some(images), Some(previous)) = (self.images, previous) {
+                            images.set_paint_only(previous);
+                        }
+                        if let Some(geometry) = self.geometry.as_deref_mut() {
+                            geometry.deferred_images.retain(|record| !paint_command_holds(command, &record.placeholder));
+                            geometry.deferred_images.extend(deferred);
+                        }
+                        replace_command_bytes(command, &mut command_bytes, replacement)?;
                     }
                 }
                 Command::BoxShadow {
@@ -22203,6 +22405,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             first_hit: 0,
             last_hit: 0,
             baselines: None,
+            cross_shift: 0.0,
             content_ranges: None,
         })
     }
@@ -22446,6 +22649,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             first_hit: 0,
             last_hit: 0,
             baselines: None,
+            cross_shift: 0.0,
             content_ranges: None,
         });
         *source_order += 1;
@@ -23171,6 +23375,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
                 if let Some(baselines) = item.baselines {
                     item.baselines = Some(baselines.translated(dx, dy));
+                } else {
+                    item.cross_shift += dy;
                 }
             }
             lines[line_index].2 = align_extent;
@@ -23212,6 +23418,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             (0.0, 0.0)
         };
+        // Flexbox §8.5: when no item of the first line has a baseline, the
+        // container's baseline is synthesized from the first item's border box.
+        let mut synthesize_first_baseline = lines
+            .first()
+            .filter(|&&(start, end, _)| row && !items[start..end].iter().any(|item| item.baselines.is_some()))
+            .map(|&(start, _, _)| start);
         for &(start, end, base_extent) in &lines {
             let extent = base_extent + final_stretch;
             let position = if style.flex_wrap && cross_reverse {
@@ -23219,7 +23431,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else {
                 line_origin
             };
-            for item in &mut items[start..end] {
+            for (item_index, item) in items[start..end].iter_mut().enumerate() {
+                let mut border_box_end = (item.cross - item.style.margin_sides[2]).max(0.0) + item.cross_shift;
                 if final_stretch != 0.0 {
                     let alignment = item.style.self_alignment(style, false);
                     let participation = baseline_participation(
@@ -23255,6 +23468,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     if stretches {
                         self.stretch_flex_item_cross(item, extent)?;
                         offset = 0.0;
+                        border_box_end = (extent - item.style.margin_sides[2]).max(0.0) + item.cross_shift;
                     }
                     if let Some((group, content_only)) = participation {
                         let baseline_offset = if (group == 0) != style.flex_wrap_reverse {
@@ -23270,6 +23484,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             offset = baseline_offset;
                         }
                     }
+                    border_box_end += offset;
                     for command in &mut self.commands[item.first_command..item.last_command] {
                         move_command(command, 0.0, offset);
                     }
@@ -23297,7 +23512,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.first_hit..item.last_hit, dx, dy);
                     geometry.move_hits(item.first_hit..item.last_hit, dx, dy);
                 }
-                if let Some(baselines) = item.baselines {
+                let exported = item.baselines.or_else(|| {
+                    if synthesize_first_baseline != Some(start + item_index) {
+                        return None;
+                    }
+                    synthesize_first_baseline = None;
+                    Some(FlowBaselines { first: border_box_end, last: border_box_end, horizontal: false, reverse: false })
+                });
+                if let Some(baselines) = exported {
                     FlowBaselines::include(
                         &mut self.flow_baselines,
                         baselines.translated(x + dx, y + dy),
@@ -23527,7 +23749,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     }
 
     fn line_height(&self, style: &Style) -> f32 {
-        resolved_line_height(style, || self.font_line_height(style))
+        resolved_line_height(style, || self.normal_font_line_height(style))
+    }
+
+    fn normal_font_line_height(&self, style: &Style) -> f32 {
+        if style.font_size == 0.0 {
+            0.0
+        } else {
+            self.text.normal_line_height_styled(style.font_size, &style.font)
+        }
     }
 
     fn baseline(&self, style: &Style) -> f32 {
@@ -23851,10 +24081,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         self.resolve_generated_image(source,true)
     }
     fn resolve_generated_image(&self,source:BackgroundImage,marker_default:bool)->Result<Option<Rc<GeneratedImage>>,LayoutError> {
-        if !matches!(source,BackgroundImage::Url(_)|BackgroundImage::UrlResolution{..}) && background_image_pending(&source,self.images){return Err(LayoutError::ImagePending);}
+        if marker_default && !matches!(source,BackgroundImage::Url(_)|BackgroundImage::UrlResolution{..}) && background_image_pending(&source,self.images){return Ok(None);}
         let paint=match &source {
             BackgroundImage::Url(url)|BackgroundImage::UrlResolution{url,..}=>match self.images.map(|images|images.resolve_from(self.rules.document_base_url().unwrap_or(""),url)) {
-                Some(ImageState::Pending)=>return Err(LayoutError::ImagePending),
                 Some(ImageState::Ready(image)) if image.is_valid()=>BackgroundPaint::Image(image),
                 _ if marker_default=>return Ok(None),
                 _=>BackgroundPaint::Image(empty_image()),
@@ -24071,7 +24300,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         frames.extend_from_slice(frame_path);
         let used=Self::generated_inline_atom_style(&child.style,parent_style);
         let (width, height) = self.intrinsic_virtual_generated_size(child, &used, false)?;
-        let [margin_top, margin_right, margin_bottom, margin_left] = child.style.margin_sides;
         paragraph
             .atoms
             .try_reserve(1)
@@ -24082,8 +24310,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             parent_style: parent_style.clone(),
             style: child.style.clone(),
             frames,
-            width: width + margin_left + margin_right,
-            height: height + margin_top + margin_bottom,
+            width,
+            height,
             content: InlineAtomContent::Generated(Box::new(child.clone())),
         });
         paragraph.collapse_space = false;
@@ -26345,16 +26573,10 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             css::VerticalAlign::Length(length) => {
                 baseline + length.resolve(self.line_height(style))
             }
-            // CSS leaves the sub/superscript displacement to the UA. Use
-            // font-relative metrics, shared with relative font sizing.
-            css::VerticalAlign::Sub => {
-                baseline
-                    - self.font_relative_metrics(parent).ex * 0.5
-            }
-            css::VerticalAlign::Super => {
-                baseline
-                    + self.font_relative_metrics(parent).ex * 0.5
-            }
+            // CSS leaves the sub/superscript displacement to the UA; this
+            // matches the offsets Chromium applies to the parent's font size.
+            css::VerticalAlign::Sub => baseline - (parent.font_size / 5.0 + 1.0),
+            css::VerticalAlign::Super => baseline + (parent.font_size / 3.0 + 1.0),
         })
     }
 
@@ -27014,7 +27236,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 let visible = if visible_end == candidate { token_width } else {
                     self.inline_paragraph_edge_width(paragraph, bidi, paragraph_index, token_start..candidate,visible_end)?
                 };
-                if f64::from(accumulated)+f64::from(visible)+cloned.extra(start..candidate,paragraph.text.len())<=f64::from(capacity) { last_fit = Some(candidate); }
+                if f64::from(accumulated)+f64::from(visible)+cloned.extra(start..candidate,paragraph.text.len())<=f64::from(capacity)+INLINE_FIT_TOLERANCE { last_fit = Some(candidate); }
                 else {
                     chosen = last_fit.unwrap_or(candidate);
                     // Emergency opportunities are used only after ordinary
@@ -27040,7 +27262,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                             if inside_cluster{continue;}
                             width+=self.inline_paragraph_width(paragraph,bidi,paragraph_index,piece_start..end)?;
                             piece_start=end;first.get_or_insert(end);
-                            if f64::from(width)+cloned.extra(start..end,paragraph.text.len())>f64::from(capacity){break;}
+                            if f64::from(width)+cloned.extra(start..end,paragraph.text.len())>f64::from(capacity)+INLINE_FIT_TOLERANCE{break;}
                             fitting=Some(end);
                         }
                         if let Some(end)=fitting.or(first){chosen=end;}
@@ -32766,6 +32988,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         Ok(())
     }
 
+    /// A fragment laid out around loading images is only reusable while they
+    /// still load: an arrived one gives its box real geometry and paint.
+    fn retained_pending_images_unchanged(&self, fragment: &RetainedFragment) -> bool {
+        let Some(pending) = fragment.pending_images.as_deref() else {
+            return true;
+        };
+        let Some(images) = self.images else {
+            return false;
+        };
+        let generation = images.generation();
+        (generation != 0 && generation == fragment.pending_generation)
+            || pending.iter().all(|(lookup, _)| images.still_pending(lookup))
+    }
+
     fn capture_retained_fragment(
         &self,
         key: RetainedFragmentKey,
@@ -32948,6 +33184,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             rendered_text_bytes: geometry.rendered_text_bytes.checked_sub(rendered_bytes_start)?,
             rendered_table_context: self.rendered_table_context,
             has_text,
+            pending_images: None,
+            deferred_images: None,
+            pending_generation: 0,
             bytes,
             last_used: 0,
         })
@@ -33330,7 +33569,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             .as_ref()
             .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key))
             .filter(|fragment| !collect_rendered_text || fragment.rendered_text_collected)
+            .filter(|fragment| self.retained_pending_images_unchanged(fragment))
         {
+            if let (Some(pending), Some(images)) = (fragment.pending_images.as_deref(), self.images) {
+                images.replay_pending(pending);
+            }
+            if let (Some(deferred), Some(geometry)) = (fragment.deferred_images.as_deref(), self.geometry.as_deref_mut()) {
+                geometry.deferred_images.extend_from_slice(deferred);
+            }
             let command_base = self.commands.len();
             let hit_base = self.geometry.as_ref().map_or(0, |g| g.hits.len());
             self.replay_retained_fragment(&fragment,placement,retain_to_parent)?;
@@ -33393,6 +33639,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let command_start = self.commands.len();
         let paint_starts=(self.paint_contexts.len(),self.completed_stacking_contexts.len(),self.pending_escapes.len(),self.surface_records.len(),self.next_paint_order);
         let text_uses_before = self.text_uses.get();
+        let pending_mark = self.images.map_or(0, |images| images.pending_mark());
+        let deferred_mark = self.geometry.as_deref().map_or(0, |geometry| geometry.deferred_images.len());
         let timeline_source_uses_before=self.timeline_source_uses;
         let filter_source_uses_before=self.filter_source_uses;
         let geometry_start = self.geometry.as_deref().map(|geometry| {
@@ -33493,7 +33741,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 && self.viewport_scroll_axes == key.viewport_scroll_axes
                 && self.decorations == key.decorations;
             if stable {
-                if let Some(fragment) = self.capture_retained_fragment(
+                if let Some(mut fragment) = self.capture_retained_fragment(
                     key,
                     command_start,
                     starts,
@@ -33502,6 +33750,23 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     self.text_uses.get() != text_uses_before,
                     paint_starts,
                 ) {
+                    if let Some(images) = self.images {
+                        let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                        for entry in images.pending_since(pending_mark) {
+                            if !distinct.contains(&entry) {
+                                distinct.push(entry);
+                            }
+                        }
+                        if !distinct.is_empty() {
+                            fragment.bytes = fragment.bytes.saturating_add(distinct.len() * 96);
+                            fragment.pending_generation = images.generation();
+                            fragment.pending_images = Some(Arc::from(distinct));
+                        }
+                    }
+                    if let Some(deferred) = self.geometry.as_deref().and_then(|geometry| geometry.deferred_images.get(deferred_mark..)).filter(|deferred| !deferred.is_empty()) {
+                        fragment.bytes = fragment.bytes.saturating_add(deferred.len() * 512);
+                        fragment.deferred_images = Some(Arc::from(deferred));
+                    }
                     if let Some(cache) = self.retained_fragments.as_deref_mut() {
                         cache.store(fragment);
                     }
@@ -33796,7 +34061,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 } else {
                     saved.unwrap_or(self.viewport)
                 };
-                let precise_containing=self.containing_overflow_origin(containing_block_node);
+                let precise_containing=self.containing_overflow_origin(containing_block_node,id);
                 available = containing.width;
                 if style.width.is_none() {
                     let table_fit = style.display.is_table()
@@ -34189,7 +34454,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
     fn html_image_presentation<'b>(
         &self,id:NodeId,attributes:&'b [(crate::Name,String)],style:&Style,
     )->HtmlImagePresentation<'b> {
-        self.html_image_presentation_with_dimensions(id,attributes,style.width.is_some()||style.height.is_some())
+        // An <img> with both dimensions given takes no geometry from its image
+        // arriving (see `ImageResolver::set_paint_only`).
+        let sized_img=style.width.is_some()&&style.height.is_some()&&crate::forms::html_element_local_name(self.document,id)==Some("img");
+        let previous=if sized_img{self.images.map(|images|images.set_paint_only(true))}else{None};
+        let presentation=self.html_image_presentation_with_dimensions(id,attributes,style.width.is_some()||style.height.is_some());
+        if let (Some(images),Some(previous))=(self.images,previous){images.set_paint_only(previous);}
+        presentation
     }
     fn html_image_presentation_with_dimensions<'b>(
         &self,id:NodeId,attributes:&'b [(crate::Name,String)],has_style_dimensions:bool,
@@ -35277,6 +35548,11 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             let source = replacement_source
                 .as_deref()
                 .or_else(|| crate::svg::attribute(attributes, "src"));
+            // An <img> with both dimensions given does not take its geometry
+            // from the image: while it loads it is a paint-only use.
+            let paint_only_image = tag == "img" && replacement_source.is_none() && source.is_some()
+                && specified_width.is_some() && specified_height.is_some();
+            let previous_paint_only = if paint_only_image { self.images.map(|images| images.set_paint_only(true)) } else { None };
             let procedural_replacement=if let Some(source)=replacement_source.as_deref() {
                 let image=css::computed_image_source(source,style.color);
                 if matches!(image,BackgroundImage::Url(_)) {None}else{self.resolve_generated_image(image,false)?}
@@ -35320,17 +35596,36 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 Some(_) => None,
                 None => match resolved {
                 Some(ImageState::Ready(image)) if image.is_valid() => Some(image),
-                Some(ImageState::Ready(_)) if replacement_source.is_some() => None,
-                Some(ImageState::Ready(_)) if tag == "video" => None,
-                Some(ImageState::Ready(_)) => return Err(LayoutError::ImageFailed),
-                Some(ImageState::Pending) if tag == "video" => None,
-                Some(ImageState::Pending) => return Err(LayoutError::ImagePending),
-                Some(ImageState::Failed) if replacement_source.is_some() => None,
-                Some(ImageState::Failed) if tag == "video" => None,
-                Some(ImageState::Failed) => return Err(LayoutError::ImageFailed),
-                None => None,
+                _ => None,
                 },
             };
+            let mut deferred_image = None;
+            if let (true, true, Some(images), Some(source)) = (paint_only_image, image.is_none(), self.images, source.filter(|source| !source.is_empty())) {
+                let base = self.rules.document_base_url();
+                let mark = images.pending_mark();
+                if matches!(resolve_element_image(images, id, Some(source), base), Some(ImageState::Pending)) {
+                    // The record answers to the lookup the resolver logged: a
+                    // node's selected candidate (srcset, <picture>) is asked
+                    // as `Node`, a plain `src` by its URL.
+                    let lookup = images.pending_since(mark).pop().map(|(lookup, _)| lookup).unwrap_or_else(|| match base {
+                        Some(base) => PendingLookup::From(base.into(), source.into()),
+                        None => PendingLookup::Source(source.into()),
+                    });
+                    deferred_image = Some(DeferredImage {
+                        lookup,
+                        placeholder: transparent_placeholder(),
+                        paint: DeferredPaint::Image {
+                            node: id,
+                            base: base.map(Into::into),
+                            source: source.into(),
+                            scheme: style.used_color_scheme(self.rules.environment).scheme,
+                        },
+                    });
+                }
+            }
+            if let (Some(images), Some(previous)) = (self.images, previous_paint_only) {
+                images.set_paint_only(previous);
+            }
             // A blank canvas is still a replaced element: its bitmap dimensions
             // size the box even when no renderer bitmap has been allocated.
             if image.is_some() || html_presentation.is_some() || replacement_source.is_some() || matches!(tag, "canvas" | "video") {
@@ -35340,7 +35635,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 // originating element's children stay suppressed.
                 let alternative = match html_presentation.as_ref() {
                     Some(HtmlImagePresentation::Text(text)) => Some((*text, false)),
-                    Some(HtmlImagePresentation::Replaced(text)) if !text.is_empty() => Some((*text, true)),
+                    Some(HtmlImagePresentation::Replaced(text)) if !text.is_empty() && deferred_image.is_none() => Some((*text, true)),
                     _ => None,
                 };
                 let (image_width, image_height) = if let Some(image) = image.as_ref() {
@@ -35406,13 +35701,20 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         let image=match (self.images,source) {
                             (Some(images),Some(source))=>match images.resolve_viewport(Some(id),self.rules.document_base_url().unwrap_or(""),source,&image,rect.width,rect.height,style.used_color_scheme(self.rules.environment).scheme) {
                                 Some(ImageState::Ready(viewport_image)) if viewport_image.is_valid()=>viewport_image,
-                                Some(ImageState::Pending)=>return Err(LayoutError::ImagePending),
-                                Some(_)=>return Err(LayoutError::ImageFailed),
-                                None=>image,
+                                _=>image,
                             },
                             _=>image,
                         };
                         self.push_command(Command::Image { rect, image })?;
+                    }
+                } else if let Some(deferred) = deferred_image {
+                    if style.visibility_visible
+                        && (self.source_capture_depth != 0 || self.transform_depth > 0 || rect.intersection(self.cull).is_some())
+                    {
+                        self.push_command(Command::Image { rect, image: deferred.placeholder.clone() })?;
+                        if let Some(geometry) = self.geometry.as_deref_mut() {
+                            geometry.deferred_images.push(deferred);
+                        }
                     }
                 }
                 if let Some(image)=procedural_replacement.as_deref() {
@@ -39679,8 +39981,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 let text = RecordingText::default();
                 let images = |_: &str| state.clone();
                 let list = display_list_with_images(&document, 200, 100, &text, &images).unwrap();
-                assert!(list.0.iter().all(|command| !matches!(command, Command::Image { .. })));
-                if markup.contains("alt=alternative") {
+                assert!(list.0.iter().all(|command| !matches!(command, Command::Image { image, .. } if image.pixels.iter().any(|byte| *byte != 0))));
+                // A loading <img> with both dimensions is painted when its image arrives, without its alternative text first.
+                let deferred = matches!(state, ImageState::Pending) && markup.contains("width=40");
+                if markup.contains("alt=alternative") && !deferred {
                     assert!(text.0.borrow().iter().any(|run| run.contains("alternative")), "alternative text must use ordinary shaping: {markup}");
                 }
             }
@@ -40581,17 +40885,23 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
-    fn background_url_pending_errors_and_failed_paints_nothing() {
+    fn background_url_pending_and_failed_paint_nothing() {
         let document = crate::html::parse(
             "<style>body{margin:0}</style><div style='width:40px;height:20px;background-image:url(a.png)'></div>",
             32,
         )
         .unwrap();
         let pending = |_: &str| ImageState::Pending;
-        assert_eq!(
-            display_list_with_images(&document, 100, 100, &NoShape, &pending),
-            Err(LayoutError::ImagePending)
-        );
+        let list = display_list_with_images(&document, 100, 100, &NoShape, &pending).unwrap();
+        let tiles = list
+            .0
+            .iter()
+            .filter_map(|command| match command {
+                Command::FillBackground(fill) => Some(fill.image_rect.width),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tiles, [0.0], "a pending background image lays out and paints no tile");
         let fills = background_fills(
             "<style>body{margin:0}</style><div style='width:40px;height:20px;background-image:url(missing.png)'></div>",
             test_image,
@@ -40858,6 +41168,61 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         assert_eq!(intrinsic_keyword_rect(&document,&geometry,"#box").height,20.0,"a combining sequence stays together even when wider than a line");
         let (document,geometry)=intrinsic_keyword_geometry("<main id=box style='width:5px;overflow-wrap:anywhere;white-space:nowrap'>abcd</main>");
         assert_eq!(intrinsic_keyword_rect(&document,&geometry,"#box").height,10.0,"nowrap prevents emergency breaks");
+    }
+
+    #[test]
+    fn break_word_links_in_shrink_to_fit_list_items_keep_trailing_punctuation_attached() {
+        let mut bad = Vec::new();
+        for width in (120..300).step_by(4) {
+            let (document, geometry) = intrinsic_keyword_geometry_at(
+                &alloc::format!("<style>ul{{margin:0;padding:0;display:inline-block;list-style:none}}\
+                 li{{display:inline-block;padding:0 5px 0 0}}li:after{{content:', '}}\
+                 a{{overflow-wrap:break-word}}</style>\
+                 <table style='width:{width}px'><tr><th>Typing discipline</th><td><ul id=list>\
+                 <li id=first><a>Affine</a></li><li><a>inferred</a></li><li><a>nominal</a></li>\
+                 <li><a>static</a></li><li><a>strong</a></li></ul></td></tr></table>"),
+                300,
+                300,
+            );
+            if intrinsic_keyword_rect(&document, &geometry, "#first").height != 16.0 { bad.push(width); }
+        }
+        assert!(bad.is_empty(), "list items wrapped their trailing separator at table widths {bad:?}");
+    }
+
+    #[test]
+    fn superscript_and_subscript_shrink_and_shift_by_the_parent_font_size() {
+        let (document, geometry) = intrinsic_keyword_geometry(
+            "<main style='font-size:30px;line-height:1'>a<span id=same style='font-size:24px'>b</span>\
+             <sup id=sup>c</sup><sub id=sub>d</sub></main>",
+        );
+        let same = intrinsic_keyword_rect(&document, &geometry, "#same");
+        let sup = intrinsic_keyword_rect(&document, &geometry, "#sup");
+        let sub = intrinsic_keyword_rect(&document, &geometry, "#sub");
+        assert_eq!(sup.height, same.height);
+        assert_eq!(same.y - sup.y, 30.0 / 3.0 + 1.0);
+        assert_eq!(sub.y - same.y, 30.0 / 5.0 + 1.0);
+    }
+
+    #[test]
+    fn inline_block_pseudo_margins_are_counted_once_in_the_atomic_inline() {
+        for (name, rule) in [
+            ("margin-right", "margin-right:0.25em"),
+            ("margin-inline", "margin-inline:0 0.25em"),
+            ("both", "margin-right:0.25em;margin-inline:0 0.25em"),
+        ] {
+            let (document, geometry) = intrinsic_keyword_geometry(&alloc::format!(
+                "<style>a{{display:inline-block}}a::before{{content:'[';display:inline-block;{rule}}}</style>\
+                 <main style='font-size:40px'><span style='font-size:10px'><a id=a>x</a></span></main>"
+            ));
+            let a = intrinsic_keyword_rect(&document, &geometry, "#a");
+            assert_eq!(a.width, 5.0 + 2.5 + 5.0, "{name}");
+        }
+        let (document, geometry) = intrinsic_keyword_geometry(
+            "<style>a::before{content:'[';display:inline-block;margin:0.5em 0}</style>\
+             <main style='font-size:10px;line-height:1'><a id=a>x</a></main>",
+        );
+        let main = intrinsic_keyword_rect(&document, &geometry, "main");
+        assert_eq!(main.height, 20.0);
     }
 
     #[test]
@@ -47251,6 +47616,61 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn inline_flex_without_item_baselines_uses_its_first_items_border_box_edge() {
+        let boxes = colored_boxes(
+            "<div style='font:14px/16px monospace'><label style='display:inline-flex;align-items:center;min-height:32px'><span></span></label></div><div style='width:10px;height:5px;background:red'></div>",
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].y, 32.0);
+    }
+
+    fn inline_flex_baseline_offset(flex: &str, items: &str) -> f32 {
+        let boxes = colored_boxes(&alloc::format!(
+            "<div style='font:14px/16px monospace'><span style='display:inline-flex;{flex};background:green'>{items}</span><span style='display:inline-block;width:5px;height:5px;background:red'></span></div>"
+        ));
+        let green = boxes.iter().find(|rect| rect.height > 5.0).expect("flex box");
+        let red = boxes.iter().find(|rect| rect.width == 5.0 && rect.height == 5.0).expect("marker");
+        red.y + red.height - green.y
+    }
+
+    #[test]
+    fn synthesized_flex_baseline_follows_a_stretched_item_edge() {
+        let stretched = inline_flex_baseline_offset(
+            "flex-wrap:wrap;align-content:stretch;width:40px;height:60px",
+            "<span style='display:block;width:20px'><i style='display:block;height:10px'></i></span>",
+        );
+        assert_eq!(stretched, 60.0, "the item grew with its line");
+    }
+
+    #[test]
+    fn synthesized_flex_baseline_follows_a_line_stretched_item_alignment() {
+        let aligned = inline_flex_baseline_offset(
+            "flex-wrap:wrap;align-content:stretch;align-items:flex-end;width:40px;height:60px",
+            "<span style='display:block;width:20px;height:10px'></span>",
+        );
+        assert_eq!(aligned, 60.0, "the item moved to the end of its stretched line");
+        let top = inline_flex_baseline_offset(
+            "flex-wrap:wrap;align-content:stretch;width:40px;height:60px",
+            "<span style='display:block;width:20px;height:10px'></span>",
+        );
+        assert_eq!(top, 10.0, "an item at the start of its line keeps its own edge");
+    }
+
+    #[test]
+    fn synthesized_flex_baseline_comes_from_the_first_line() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;align-items:baseline;width:100px;font:14px/16px monospace'><div style='display:flex;flex-wrap:wrap;width:30px;background:green'><div style='width:30px;height:10px'></div><div style='width:30px'>text</div></div><div style='width:5px;height:5px;background:red'></div></div>",
+        );
+        let green = boxes.iter().find(|rect| rect.width == 30.0).expect("wrapping flex box");
+        let red = boxes.iter().find(|rect| rect.width == 5.0).expect("marker");
+        assert_eq!(
+            red.y + red.height - green.y,
+            10.0,
+            "a first line without baselines takes its first item's edge, not a later line's text"
+        );
+    }
+
+    #[test]
     fn flex_column_baseline_falls_back_to_cross_start_for_orthogonal_items() {
         let boxes = colored_boxes(
             "<main style='display:flex;flex-direction:column;align-items:baseline;width:200px;height:100px'><div style='width:40px;height:30px;background:red'></div><div style='width:120px;height:20px;background:green'></div></main>",
@@ -50058,10 +50478,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             )
             .unwrap();
             let pending = |_: &str| ImageState::Pending;
-            assert_eq!(
-                display_list_with_images(&document, 160, 80, &FixedText, &pending),
-                Err(LayoutError::ImagePending),
-                "pending {position} list marker"
+            let list = display_list_with_images(&document, 160, 80, &FixedText, &pending).unwrap();
+            assert!(
+                list.0.iter().all(|command| !matches!(command, Command::Image { .. })),
+                "pending {position} list marker paints no image"
             );
         }
     }

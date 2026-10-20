@@ -3986,6 +3986,7 @@ impl Style {
                 }
             }
             if let Some(scale) = eligibility.baseline_font_scale { baseline.font_size = parent.font_size * scale; }
+            if eligibility.baseline_font_smaller { baseline.font_size = FontSizeKeyword::Smaller.resolve(parent.font_size); }
             if eligibility.baseline_bolder { baseline.font.weight = relative_font_weight(-1, parent.font.weight); }
         }
         let mut admitted = Vec::new();
@@ -23470,6 +23471,7 @@ pub struct EffectEligibility {
     box_parent: BoxParentContext,
     baseline_inherited: [u64; (PROPERTY_COUNT + 63) / 64],
     baseline_font_scale: Option<f32>,
+    baseline_font_smaller: bool,
     baseline_bolder: bool,
     root: bool,
     ua_hidden_input: bool,
@@ -23481,7 +23483,7 @@ impl Default for EffectEligibility {
     fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), inherited_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
         baseline_inherited: core::array::from_fn(|word| {
             let mut flags = 0; for bit in 0..64 { let slot = word * 64 + bit; if slot < PROPERTY_COUNT && inherited_property(slot) { flags |= 1 << bit; } } flags
-        }), baseline_font_scale: None, baseline_bolder: false, root: false,
+        }), baseline_font_scale: None, baseline_font_smaller: false, baseline_bolder: false, root: false,
         ua_hidden_input: false, ua_clip_input: false, ua_margin_block_em: None, query_context: None,
     } }
 }
@@ -25171,6 +25173,11 @@ fn compute_for_named_registered_mode(
                     "b" | "strong" | "th" => {
                         style.font.weight = relative_font_weight(-1, style.font.weight);
                         if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[130]);provenance.baseline_bolder=true;}
+                    }
+                    "sub" | "sup" => {
+                        style.font_size = FontSizeKeyword::Smaller.resolve(style.font_size);
+                        style.vertical_align = if tag == "sub" { VerticalAlign::Sub } else { VerticalAlign::Super };
+                        if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[7]);provenance.baseline_font_smaller=true;}
                     }
                     "i" | "em" | "cite" | "var" | "address" => {
                         Value::FontStyle(FontStyle::Italic).apply(&mut style);

@@ -774,6 +774,10 @@ fn shape_resolved_segment_with_cluster_advances(
     fn line_height_styled(&self, size: f32, _font: &FontSpec) -> f32 {
         self.line_height(size)
     }
+    /// Used `line-height: normal`: the content area plus the font's line gap.
+    fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        self.line_height_styled(size, font)
+    }
     fn underline_metrics_styled(&self, size: f32, _font: &FontSpec) -> (f32, f32) {
         self.underline_metrics(size)
     }

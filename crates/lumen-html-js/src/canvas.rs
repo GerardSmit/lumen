@@ -123,6 +123,7 @@ impl TextShaper for CanvasFontSource {
     fn strike_metrics(&self,size:f32)->(f32,f32) {self.with_fonts(|fonts|fonts.strike_metrics(size))}
     fn ascent_styled(&self,size:f32,spec:&FontSpec)->f32 {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.ascent_styled(size,spec))}
     fn line_height_styled(&self,size:f32,spec:&FontSpec)->f32 {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.line_height_styled(size,spec))}
+    fn normal_line_height_styled(&self,size:f32,spec:&FontSpec)->f32 {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.normal_line_height_styled(size,spec))}
     fn underline_metrics_styled(&self,size:f32,spec:&FontSpec)->(f32,f32) {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.underline_metrics_styled(size,spec))}
     fn strike_metrics_styled(&self,size:f32,spec:&FontSpec)->(f32,f32) {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.strike_metrics_styled(size,spec))}
     fn primary_character_widths_styled(&self,size:f32,spec:&FontSpec)->Option<lumen_html::paint::PrimaryCharacterWidths> {self.request_metric_font(spec);self.with_fonts(|fonts|fonts.primary_character_widths_styled(size,spec))}

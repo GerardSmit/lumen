@@ -35,6 +35,9 @@ pub(crate) fn jsx_path(key: &str) -> Option<bool> {
 pub fn parse_script(_: &str, _: bool) -> Result<Vec<Stmt>, ParseError> {
     unavailable()
 }
+pub(crate) fn parse_classic_script(_: &str) -> Result<(Vec<Stmt>, bool), ParseError> {
+    unavailable()
+}
 pub fn parse_script_lazy(_: &str) -> Result<Vec<Stmt>, ParseError> {
     unavailable()
 }
