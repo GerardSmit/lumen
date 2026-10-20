@@ -813,6 +813,30 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// The smallest rect covering both.
+    pub fn union(self, other: Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        // Measure extents relative to the shared origin. Adding world-coordinate
+        // edges and subtracting the origin loses local dimensions during scrolling.
+        let width = ((self.x - x) + self.width).max((other.x - x) + other.width);
+        let height = ((self.y - y) + self.height).max((other.y - y) + other.height);
+        Rect { x, y, width, height }
+    }
+
+    /// Grown by `by` on every side.
+    pub fn expanded(self, by: f32) -> Rect {
+        Rect { x: self.x - by, y: self.y - by, width: self.width + 2.0 * by, height: self.height + 2.0 * by }
+    }
+
+    /// Whether the rects overlap or share an edge.
+    pub fn touches(self, other: Rect) -> bool {
+        self.x <= other.x + other.width
+            && other.x <= self.x + self.width
+            && self.y <= other.y + other.height
+            && other.y <= self.y + self.height
+    }
+
     pub fn is_valid(self) -> bool {
         [self.x, self.y, self.width, self.height]
             .iter()
@@ -1738,6 +1762,58 @@ impl Command {
             })
     }
 }
+impl DisplayList {
+    /// Equality that lets every number differ by up to `tolerance`. A
+    /// retained fragment replayed at another position adds its shift to
+    /// coordinates computed at the old one, which can differ from a fresh
+    /// layout in the last bits of an `f32`.
+    pub fn approx_eq(&self, other: &DisplayList, tolerance: f32) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0.iter().zip(other.0.iter()).all(|(a, b)| {
+            a == b || debug_numbers_close(&alloc::format!("{a:?}"), &alloc::format!("{b:?}"), tolerance)
+        })
+    }
+}
+
+/// Compares two `Debug` renderings token by token, numbers within `tolerance`.
+fn debug_numbers_close(a: &str, b: &str, tolerance: f32) -> bool {
+    fn tokens(text: &str) -> impl Iterator<Item = &str> {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        core::iter::from_fn(move || {
+            if start >= bytes.len() {
+                return None;
+            }
+            let number = |byte: u8| byte.is_ascii_digit() || byte == b'.' || byte == b'-' || byte == b'e';
+            let first = bytes[start];
+            let mut end = start + text[start..].chars().next().map_or(1, char::len_utf8);
+            if first.is_ascii_digit() || (first == b'-' && bytes.get(end).is_some_and(u8::is_ascii_digit)) {
+                while end < bytes.len() && number(bytes[end]) {
+                    end += 1;
+                }
+            }
+            let token = &text[start..end];
+            start = end;
+            Some(token)
+        })
+    }
+    let mut left = tokens(a);
+    let mut right = tokens(b);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => match (x.parse::<f32>(), y.parse::<f32>()) {
+                (Ok(x), Ok(y)) if (x - y).abs() <= tolerance => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 impl DisplayList {
     pub fn referenced_bytes(&self) -> usize {
         self.0

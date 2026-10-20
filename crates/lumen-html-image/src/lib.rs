@@ -81,11 +81,8 @@ pub fn render_with_mode_cached(
             render_with_font_cached(&snapped, width_css, height_css, scale, true, font, cache)
         }
         RasterizationMode::Gpui => {
-            // Resolve the same sprite fallbacks as HtmlView before snapping
-            // native quads; their internal geometry stays antialiased.
-            let mut resolved = rasterize_for_gpui_in_region(list, scale, font, cache, false,Rect{
-                x:0.0,y:0.0,width:width_css as f32,height:height_css as f32})?;
-            gpui::snap(&mut resolved, scale);
+            let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
+            let resolved = gpui_snapped(list, scale, font, cache, full, None)?;
             render_internal_mode(
                 &resolved,
                 width_css,
@@ -98,6 +95,79 @@ pub fn render_with_mode_cached(
             )
         }
     }
+}
+
+/// Redraws only `region` (CSS pixels) of `target`, a frame of this list that
+/// `render_with_mode_cached` produced at the same size and scale, so the
+/// region's pixels equal a full render's. `Ok(false)` leaves `target`
+/// untouched: the mode or the region's device edges cannot be clipped
+/// exactly, and the caller renders in full. On `Err` the region of `target`
+/// may already be cleared or partly drawn, so its contents are unspecified
+/// and the caller must re-render the frame in full.
+pub fn render_region_with_mode_cached(
+    list: &DisplayList,
+    width_css: u32,
+    height_css: u32,
+    scale: f32,
+    mode: RasterizationMode,
+    font: &dyn FontProvider,
+    cache: &mut GlyphCache,
+    target: &mut Rgba8Image,
+    region: Rect,
+) -> Result<bool, ImageError> {
+    if mode != RasterizationMode::Gpui {
+        return Ok(false);
+    }
+    let _html_allocations = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::HTML);
+    if !scale.is_finite() || scale <= 0.0 || width_css == 0 || height_css == 0 {
+        return Err(ImageError::InvalidViewport);
+    }
+    if ![region.x, region.y, region.width, region.height].iter().all(|v| v.is_finite()) {
+        return Ok(false);
+    }
+    let width = (width_css as f64 * scale as f64).round();
+    let height = (height_css as f64 * scale as f64).round();
+    if width != target.width as f64 || height != target.height as f64 {
+        return Ok(false);
+    }
+    let (width, height) = (target.width, target.height);
+    if (width as usize).checked_mul(height as usize).and_then(|pixels| pixels.checked_mul(4)).is_none_or(|bytes| target.pixels.len() < bytes) {
+        return Err(ImageError::InvalidViewport);
+    }
+    let left = ((region.x * scale).floor().max(0.0) as u32).min(width);
+    let top = ((region.y * scale).floor().max(0.0) as u32).min(height);
+    let right = (((region.x + region.width) * scale).ceil().max(0.0) as u32).min(width);
+    let bottom = (((region.y + region.height) * scale).ceil().max(0.0) as u32).min(height);
+    if right <= left || bottom <= top {
+        return Ok(true);
+    }
+    let exact = |pixel: u32| (pixel as f32 / scale) * scale == pixel as f32;
+    if (left != 0 && !exact(left))
+        || (top != 0 && !exact(top))
+        || (right != width && !exact(right))
+        || (bottom != height && !exact(bottom))
+    {
+        return Ok(false);
+    }
+    let clip = Rect {
+        x: if left == 0 { 0.0 } else { left as f32 / scale },
+        y: if top == 0 { 0.0 } else { top as f32 / scale },
+        width: (if right == width { width_css as f32 } else { right as f32 / scale })
+            - if left == 0 { 0.0 } else { left as f32 / scale },
+        height: (if bottom == height { height_css as f32 } else { bottom as f32 / scale })
+            - if top == 0 { 0.0 } else { top as f32 / scale },
+    };
+    let margin = 2.0 / scale;
+    let keep = clip.expanded(margin);
+    let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
+    let resolved = gpui_snapped(list, scale, font, cache, full, Some(keep))?;
+    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, full)?;
+    let stride = width as usize * 4;
+    for row in top as usize..bottom as usize {
+        target.pixels[row * stride + left as usize * 4..row * stride + right as usize * 4].fill(0);
+    }
+    replay_into(&replay, target, scale, true, true, Some(font), cache, clip)?;
+    Ok(true)
 }
 
 /// Retains admitted vector source bytes and weak viewport rasters. The ordinary
@@ -1474,7 +1544,7 @@ pub fn rasterize_for_gpui(
     cache: &mut GlyphCache,
     rasterize_text: bool,
 ) -> Result<DisplayList, ImageError> {
-    rasterize_gpui_region(list,scale,font,cache,rasterize_text,None)
+    rasterize_gpui_region(list,scale,font,cache,rasterize_text,None,None)
 }
 
 /// Capture source dependencies outside the visible viewport, while retaining
@@ -1483,11 +1553,11 @@ pub fn rasterize_for_gpui_in_region(list:&DisplayList,scale:f32,font:&dyn FontPr
     cache:&mut GlyphCache,rasterize_text:bool,region:Rect)->Result<DisplayList,ImageError> {
     if ![region.x,region.y,region.width,region.height].iter().all(|v|v.is_finite())
         || region.width<=0.0 || region.height<=0.0 {return Err(ImageError::InvalidViewport);}
-    rasterize_gpui_region(list,scale,font,cache,rasterize_text,Some(region))
+    rasterize_gpui_region(list,scale,font,cache,rasterize_text,Some(region),None)
 }
 
 fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
-    cache:&mut GlyphCache,rasterize_text:bool,region:Option<Rect>)->Result<DisplayList,ImageError> {
+    cache:&mut GlyphCache,rasterize_text:bool,region:Option<Rect>,skip_outside:Option<Rect>)->Result<DisplayList,ImageError> {
     let _html_allocations = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::HTML);
     list.validate().map_err(ImageError::DisplayList)?;
     if !scale.is_finite() || scale <= 0.0 {
@@ -1514,6 +1584,10 @@ fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
             }
             _ => continue,
         };
+        if skip_outside.is_some_and(|keep|keep.intersection(rect).is_none()) {
+            *command=Command::FillRect{rect:Rect{x:0.0,y:0.0,width:0.0,height:0.0},color:Rgba{r:0,g:0,b:0,a:0}};
+            continue;
+        }
         let rect=if let Some(region)=region {
             let Some(rect)=rect.intersection(region)else {
                 *command=Command::FillRect{rect:Rect{x:0.0,y:0.0,width:0.0,height:0.0},color:Rgba{r:0,g:0,b:0,a:0}};
@@ -3708,6 +3782,68 @@ fn render_internal(
     )
 }
 
+/// Resolves the same sprite fallbacks as HtmlView and snaps native quads to the device grid; their
+/// internal geometry stays antialiased. `keep` skips commands outside that rect.
+fn gpui_snapped(
+    list: &DisplayList,
+    scale: f32,
+    font: &dyn FontProvider,
+    cache: &mut GlyphCache,
+    full: Rect,
+    keep: Option<Rect>,
+) -> Result<DisplayList, ImageError> {
+    let mut resolved = rasterize_gpui_region(list, scale, font, cache, false, Some(full), keep)?;
+    gpui::snap(&mut resolved, scale);
+    Ok(resolved)
+}
+
+fn layers_resolved_for_replay<'a>(
+    list: &'a DisplayList,
+    scale: f32,
+    font: Option<&dyn FontProvider>,
+    cache: &mut GlyphCache,
+    full: Rect,
+) -> Result<std::borrow::Cow<'a, DisplayList>, ImageError> {
+    let has_layers = list.0.iter().any(|command| {
+        matches!(command, Command::MaskedBackground(_) | Command::PushLayer { .. } | Command::PushTransform(_))
+    });
+    if !has_layers {
+        return Ok(std::borrow::Cow::Borrowed(list));
+    }
+    list.validate().map_err(ImageError::DisplayList)?;
+    Ok(std::borrow::Cow::Owned(resolve_layers_region(&list.0, scale, font, cache, &mut 0, false, Some(full))?))
+}
+
+fn replay_into(
+    list: &DisplayList,
+    image: &mut Rgba8Image,
+    scale: f32,
+    antialias: bool,
+    gpui_coverage: bool,
+    font: Option<&dyn FontProvider>,
+    cache: &mut GlyphCache,
+    clip: Rect,
+) -> Result<(), ImageError> {
+    let mut sink = Raster {
+        image,
+        scale,
+        antialias,
+        gpui_coverage,
+        device_origin: [0, 0],
+        source_window: false,
+        source_reserved: None,
+        clips: vec![clip],
+        font,
+        cache,
+        error: None,
+    };
+    list.replay(&mut sink).map_err(ImageError::DisplayList)?;
+    match sink.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn render_internal_mode(
     list: &DisplayList,
     width_css: u32,
@@ -3722,20 +3858,8 @@ fn render_internal_mode(
     if !scale.is_finite() || scale <= 0.0 || width_css == 0 || height_css == 0 {
         return Err(ImageError::InvalidViewport);
     }
-    let resolved;
-    let list = if list.0.iter().any(|command| {
-        matches!(
-            command,
-            Command::MaskedBackground(_) | Command::PushLayer { .. } | Command::PushTransform(_)
-        )
-    }) {
-        list.validate().map_err(ImageError::DisplayList)?;
-        resolved = resolve_layers_region(&list.0, scale, font, cache, &mut 0,false,Some(Rect{
-            x:0.0,y:0.0,width:width_css as f32,height:height_css as f32}))?;
-        &resolved
-    } else {
-        list
-    };
+    let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
+    let list = layers_resolved_for_replay(list, scale, font, cache, full)?;
     let width = (width_css as f64 * scale as f64).round();
     let height = (height_css as f64 * scale as f64).round();
     if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
@@ -3756,29 +3880,7 @@ fn render_internal_mode(
         height,
         pixels: data,
     };
-    let full = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: width_css as f32,
-        height: height_css as f32,
-    };
-    let mut sink = Raster {
-        image: &mut image,
-        scale,
-        antialias,
-        gpui_coverage,
-        device_origin:[0,0],
-        source_window:false,
-        source_reserved:None,
-        clips: vec![full],
-        font,
-        cache,
-        error: None,
-    };
-    list.replay(&mut sink).map_err(ImageError::DisplayList)?;
-    if let Some(error) = sink.error {
-        return Err(error);
-    }
+    replay_into(&list, &mut image, scale, antialias, gpui_coverage, font, cache, full)?;
     Ok(image)
 }
 

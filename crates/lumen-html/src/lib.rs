@@ -43,6 +43,7 @@ pub mod shadow;
 pub mod svg;
 mod svg_filter;
 pub mod svg_dom;
+pub mod untrusted;
 pub mod xml;
 pub mod xml_stylesheet;
 pub use name::Name;
@@ -163,7 +164,16 @@ pub struct Mutation {
     pub kind: MutationKind,
 }
 
+impl Mutation {
+    /// An entry standing for any change below `target` that left no entry of
+    /// its own: the journal summarized too many distinct changes.
+    pub fn is_subtree_summary(&self) -> bool {
+        matches!(&self.kind, MutationKind::Tree { added: Some(added), removed: Some(removed), .. } if *added == self.target && *removed == self.target)
+    }
+}
+
 const MAX_JOURNAL: usize = 1024;
+const MAX_JOURNAL_TARGETS: usize = 8192;
 const NO_LINK: u32 = u32::MAX;
 
 #[derive(Debug)]
@@ -261,6 +271,13 @@ pub struct Document {
     allocation_budget_group: Option<Rc<()>>,
     node_count_tracking: Option<Rc<core::cell::Cell<usize>>>,
     journal: Vec<Mutation>,
+    /// The class or id value each journaled `class`/`id` mutation replaced,
+    /// by the mutation's version, for selector invalidation.
+    replaced_identities: Vec<(u64, Option<Rc<str>>)>,
+    journal_compact_at: usize,
+    journal_base: u64,
+    /// The class and id of the element an attribute write is about to change.
+    identity_snapshot: Option<(NodeId, Option<Rc<str>>, Option<Rc<str>>)>,
     mutation_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
     mutation_observer_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
     details_sink: Option<Rc<dyn Fn(&Document, details::DetailsTransition)>>,
@@ -352,6 +369,10 @@ impl Document {
             allocation_budget_group: None,
             node_count_tracking: None,
             journal: Vec::new(),
+            replaced_identities: Vec::new(),
+            journal_compact_at: MAX_JOURNAL,
+            journal_base: 0,
+            identity_snapshot: None,
             mutation_sink: None,
             mutation_observer_sink: None,
             details_sink: None,
@@ -1142,7 +1163,42 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     pub fn drain_mutations(&mut self) -> Vec<Mutation> {
+        if self.journal.len() > 1 {
+            self.compact_journal();
+        }
+        self.replaced_identities.clear();
+        self.journal_compact_at = MAX_JOURNAL;
+        self.journal_base = self.version;
         core::mem::take(&mut self.journal)
+    }
+
+    /// Whether the journal still describes every change after `version`:
+    /// it was not drained or cleared since. Entries may be coalesced, so
+    /// their count no longer equals the number of versions.
+    pub fn mutations_cover(&self, version: u64) -> bool {
+        self.journal_base <= version
+    }
+
+    /// The value a journaled `class` or `id` mutation replaced: `None` when
+    /// it was not recorded, `Some(None)` when the attribute was absent.
+    pub fn replaced_identity(&self, version: u64) -> Option<Option<&str>> {
+        let index = self.replaced_identities.binary_search_by_key(&version, |(at, _)| *at).ok()?;
+        Some(self.replaced_identities[index].1.as_deref())
+    }
+
+    /// Remember `id`'s `class` and `id` before an attribute write, but only
+    /// when `identity_relevant` (the written attribute is one of them).
+    fn snapshot_selector_identity(&mut self, id: NodeId, identity_relevant: bool) {
+        if !identity_relevant {
+            return;
+        }
+        self.identity_snapshot = match self.kind(id) {
+            Ok(NodeKind::Element { attributes, .. }) => {
+                let value = |name: &str| attributes.iter().find(|(key, _)| key.as_str() == name).map(|(_, value)| Rc::<str>::from(value.as_str()));
+                Some((id, value("class"), value("id")))
+            }
+            _ => None,
+        };
     }
 
     pub fn mutations(&self) -> &[Mutation] {
@@ -1151,6 +1207,9 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 
     pub fn clear_mutations(&mut self) {
         self.journal.clear();
+        self.replaced_identities.clear();
+        self.journal_compact_at = MAX_JOURNAL;
+        self.journal_base = self.version;
     }
 
     pub fn create(&mut self, kind: NodeKind) -> Result<NodeId, Error> {
@@ -3077,6 +3136,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         namespace_aware: bool,
     ) -> Result<Option<NodeId>, Error> {
         let details_before = self.details_open_state(element);
+        self.snapshot_selector_identity(element, true);
         let (namespace_uri, qualified_name, value, owner) = match self.kind(attribute)? {
             NodeKind::Attribute {
                 namespace_uri,
@@ -3359,6 +3419,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             return Ok(());
         }
         let details_before = self.details_open_state(owner);
+        self.snapshot_selector_identity(owner, true);
         let qualified_name = match self.kind(attribute)? {
             NodeKind::Attribute { qualified_name, .. } => qualified_name.clone(),
             _ => return Err(Error::WrongKind),
@@ -3612,8 +3673,26 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         // later identities precise: a source accepted after that barrier must
         // not become stale merely because an unrelated node changes afterward.
         // Actual journal overflow still introduces a new current barrier.
-        if self.journal.len() == MAX_JOURNAL {
+        if let MutationKind::Attribute(name) = &kind {
+            let replaced = match (&self.identity_snapshot, name.as_str()) {
+                (Some((node, class, _)), "class") if *node == target => Some(class.clone()),
+                (Some((node, _, id)), "id") if *node == target => Some(id.clone()),
+                _ => None,
+            };
+            if let Some(replaced) = replaced {
+                if self.replaced_identities.len() < MAX_JOURNAL_TARGETS && self.replaced_identities.try_reserve(1).is_ok() {
+                    self.replaced_identities.push((self.version, replaced));
+                }
+            }
+        }
+        self.identity_snapshot = None;
+        if self.journal.len() >= self.journal_compact_at {
+            self.compact_journal();
+        }
+        if self.journal.len() >= MAX_JOURNAL_TARGETS {
+            self.replaced_identities.clear();
             self.journal.clear();
+            self.journal_compact_at = MAX_JOURNAL;
             self.journal.push(Mutation {
                 version: self.version,
                 target: self.root(),
@@ -3625,6 +3704,154 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
                 target,
                 kind,
             });
+        }
+    }
+
+    /// Keep one entry per distinct change (the latest), so a script that
+    /// touches the same nodes repeatedly never reaches the journal limit.
+    /// A repeated `class` or `id` write keeps the value the first one
+    /// replaced. Past `MAX_JOURNAL_TARGETS` distinct changes the entries that
+    /// cannot change stylesheets are replaced by one summary of their common
+    /// ancestor's subtree.
+    fn compact_journal(&mut self) {
+        type JournalKey<'a> = (u8, u128, u128, u128, bool, &'a str);
+        fn journal_key(mutation: &Mutation) -> JournalKey<'_> {
+            match &mutation.kind {
+                MutationKind::Attribute(name) => (0, mutation.target.key(), 0, 0, false, name.as_str()),
+                MutationKind::CharacterData => (1, mutation.target.key(), 0, 0, false, ""),
+                MutationKind::Tree { added, removed, styles_changed } => (
+                    2,
+                    mutation.target.key(),
+                    added.map_or(0, NodeId::key),
+                    removed.map_or(0, NodeId::key),
+                    *styles_changed,
+                    "",
+                ),
+                MutationKind::FullRebuild => (3, 0, 0, 0, false, ""),
+            }
+        }
+        let journal = core::mem::take(&mut self.journal);
+        let mut kept = Vec::new();
+        if kept.try_reserve(journal.len()).is_err() {
+            self.journal = journal;
+            self.journal_compact_at = MAX_JOURNAL_TARGETS;
+            return;
+        }
+        let mut last: alloc::collections::BTreeMap<JournalKey<'_>, usize> = alloc::collections::BTreeMap::new();
+        let mut first: alloc::collections::BTreeMap<JournalKey<'_>, usize> = alloc::collections::BTreeMap::new();
+        for (position, mutation) in journal.iter().enumerate() {
+            let key = journal_key(mutation);
+            last.insert(key, position);
+            first.entry(key).or_insert(position);
+        }
+        let old_identities = core::mem::take(&mut self.replaced_identities);
+        let identity = |version: u64| old_identities.binary_search_by_key(&version, |(at, _)| *at).ok().map(|at| old_identities[at].1.clone());
+        let mut identities = Vec::new();
+        for (position, mutation) in journal.iter().enumerate() {
+            let key = journal_key(mutation);
+            if last.get(&key) != Some(&position) {
+                continue;
+            }
+            if matches!(&mutation.kind, MutationKind::Attribute(name) if matches!(name.as_str(), "class" | "id")) {
+                let earliest = first.get(&key).and_then(|at| identity(journal[*at].version));
+                if let Some(replaced) = earliest {
+                    identities.push((mutation.version, replaced));
+                }
+            }
+            kept.push(mutation.clone());
+        }
+        drop(last);
+        drop(first);
+        self.journal = kept;
+        self.replaced_identities = identities;
+        let length = self.journal.len();
+        self.journal_compact_at = length.saturating_mul(2).clamp(MAX_JOURNAL, MAX_JOURNAL_TARGETS);
+        if length >= MAX_JOURNAL_TARGETS {
+            self.collapse_journal();
+        }
+    }
+
+    fn collapse_journal(&mut self) {
+        let journal = core::mem::take(&mut self.journal);
+        self.replaced_identities.clear();
+        self.journal_compact_at = MAX_JOURNAL;
+        let mut kept = Vec::new();
+        let mut common: Option<Vec<NodeId>> = None;
+        let mut version = 0;
+        for mutation in journal {
+            if self.mutation_may_change_sheets(&mutation) {
+                kept.push(mutation);
+                continue;
+            }
+            version = version.max(mutation.version);
+            let anchor = match self.parent(mutation.target) {
+                Ok(Some(parent)) => parent,
+                _ => mutation.target,
+            };
+            let Some(mut path) = self.path_to_root(anchor) else {
+                kept.push(Mutation { version: mutation.version, target: self.root(), kind: MutationKind::FullRebuild });
+                continue;
+            };
+            path.reverse();
+            common = Some(match common {
+                None => path,
+                Some(mut current) => {
+                    let shared = current.iter().zip(&path).take_while(|(a, b)| a == b).count();
+                    current.truncate(shared);
+                    current
+                }
+            });
+        }
+        if let Some(ancestor) = common.and_then(|path| path.last().copied()) {
+            kept.push(Mutation {
+                version,
+                target: ancestor,
+                kind: MutationKind::Tree { added: Some(ancestor), removed: Some(ancestor), styles_changed: false },
+            });
+        }
+        kept.sort_by_key(|mutation| mutation.version);
+        self.journal = kept;
+    }
+
+    fn path_to_root(&self, node: NodeId) -> Option<Vec<NodeId>> {
+        let mut path = Vec::new();
+        let mut current = Some(node);
+        while let Some(id) = current {
+            path.try_reserve(1).ok()?;
+            path.push(id);
+            if path.len() > 4096 {
+                return None;
+            }
+            current = self.composed_parent(id).ok().flatten();
+        }
+        (path.last() == Some(&self.root())).then_some(path)
+    }
+
+    /// Whether a journaled change can alter the document's stylesheets or
+    /// its color-scheme metadata, which the style rebuild reads from entries.
+    fn mutation_may_change_sheets(&self, mutation: &Mutation) -> bool {
+        let in_source = |mut id: NodeId| loop {
+            match self.kind(id) {
+                Ok(NodeKind::ProcessingInstruction { .. }) => return true,
+                Ok(NodeKind::Element { name, .. }) if matches!(svg::local_name(name), "style" | "link" | "meta" | "base") => return true,
+                Err(_) => return true,
+                _ => {}
+            }
+            match self.parent(id) {
+                Ok(Some(parent)) => id = parent,
+                Ok(None) => return false,
+                Err(_) => return true,
+            }
+        };
+        match &mutation.kind {
+            MutationKind::FullRebuild => true,
+            MutationKind::CharacterData | MutationKind::Attribute(_) => in_source(mutation.target),
+            MutationKind::Tree { added, removed, styles_changed } => {
+                *styles_changed
+                    || in_source(mutation.target)
+                    || added.is_some_and(|node| session::subtree_has_style(self, node) || css::color_scheme::subtree_has_meta(self, node))
+                    || removed.is_some_and(|node| session::subtree_has_style(self, node) || css::color_scheme::subtree_has_meta(self, node))
+            }
         }
     }
 
@@ -4380,6 +4607,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) -> Result<(), Error> {
         let details_before = self.details_open_state(id);
+        self.snapshot_selector_identity(id, matches!(name, "class" | "id"));
         let index = {
             let NodeKind::Element { attributes, .. } = &self.node(id)?.kind else {
                 return Err(Error::WrongKind);
@@ -4479,6 +4707,8 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let nonce_removed=matches!(self.kind(id)?,NodeKind::Element {attributes,..} if attributes[index].0=="nonce") && self.attribute_namespace_uri_at(id,index).is_none();
         if nonce_removed {self.nonce_attribute_changed(id,None,"nonce",None)?;}
         let details_before = self.details_open_state(id);
+        let identity_relevant = matches!(self.kind(id)?, NodeKind::Element { attributes, .. } if matches!(attributes[index].0.as_str(), "class" | "id"));
+        self.snapshot_selector_identity(id, identity_relevant);
         let name_changed = matches!(&self.node(id)?.kind, NodeKind::Element { attributes, .. } if attributes[index].0 == "name")
             && self.attribute_namespace_uri_at(id, index).is_none();
         if matches!(&self.node(id)?.kind, NodeKind::Element { attributes, .. } if attributes[index].0 == "style")
@@ -4576,6 +4806,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         namespace_uri: Option<&str>,
     ) -> Result<(), Error> {
         let details_before = self.details_open_state(id);
+        self.snapshot_selector_identity(id, matches!(qualified_name, "class" | "id"));
         let NodeKind::Element { attributes, .. } = &self.node(id)?.kind else {
             return Err(Error::WrongKind);
         };
@@ -4682,6 +4913,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         preserve_cryptographic_nonce: bool,
     ) -> Result<(), Error> {
         let details_before = self.details_open_state(id);
+        self.snapshot_selector_identity(id, matches!(qualified_name, "class" | "id"));
         let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
         let local = if namespace_uri.is_some() {
             split_qualified_name(qualified_name).1
@@ -5163,21 +5395,72 @@ mod tests {
     }
 
     #[test]
-    fn journal_overflow_requests_full_rebuild() {
+    fn journal_coalesces_repeated_changes() {
         let mut doc = Document::new(2);
         let text = doc.create(NodeKind::Text(String::new())).unwrap();
-        for n in 0..=MAX_JOURNAL {
+        for n in 0..=(3 * MAX_JOURNAL) {
             let value = alloc::format!("{n}");
             doc.replace_data(text, &value).unwrap();
         }
-        assert_eq!(
-            doc.drain_mutations(),
-            alloc::vec![Mutation {
-                version: doc.version(),
-                target: doc.root(),
-                kind: MutationKind::FullRebuild,
-            }]
-        );
+        let journal = doc.drain_mutations();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].kind, MutationKind::CharacterData);
+        assert_eq!(journal[0].target, text);
+        assert_eq!(journal[0].version, doc.version());
+    }
+
+    #[test]
+    fn journal_keeps_first_replaced_class_when_coalescing() {
+        let mut doc = Document::new(4);
+        let root = doc.root();
+        let div = doc.create(element("div")).unwrap();
+        doc.append(root, div).unwrap();
+        doc.set_attribute(div, "class", "a").unwrap();
+        doc.clear_mutations();
+        for n in 0..(2 * MAX_JOURNAL) {
+            let value = if n % 2 == 0 { "b" } else { "c" };
+            doc.set_attribute(div, "class", value).unwrap();
+        }
+        let classes: Vec<&Mutation> = doc.mutations().iter().filter(|mutation| matches!(&mutation.kind, MutationKind::Attribute(name) if name.as_str() == "class")).collect();
+        assert!(classes.len() < MAX_JOURNAL / 2);
+        assert_eq!(doc.replaced_identity(classes[0].version), Some(Some("a")));
+    }
+
+    #[test]
+    fn journal_past_the_target_limit_summarizes_the_common_ancestor() {
+        let mut doc = Document::new(2 * MAX_JOURNAL_TARGETS + 8);
+        let root = doc.root();
+        let container = doc.create(element("div")).unwrap();
+        doc.append(root, container).unwrap();
+        let mut children = Vec::new();
+        for _ in 0..(MAX_JOURNAL_TARGETS + 8) {
+            let child = doc.create(element("p")).unwrap();
+            doc.append(container, child).unwrap();
+            children.push(child);
+        }
+        doc.clear_mutations();
+        for child in &children {
+            doc.set_attribute(*child, "data-x", "1").unwrap();
+        }
+        let journal = doc.drain_mutations();
+        assert!(journal.len() < MAX_JOURNAL_TARGETS);
+        assert!(journal.iter().any(|mutation| mutation.is_subtree_summary() && mutation.target == container));
+        assert!(!journal.iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)));
+    }
+
+    #[test]
+    fn journal_summary_keeps_detached_mutations_as_a_rebuild() {
+        let mut doc = Document::new(2 * MAX_JOURNAL_TARGETS + 8);
+        let mut children = Vec::new();
+        for _ in 0..(MAX_JOURNAL_TARGETS + 8) {
+            children.push(doc.create(element("p")).unwrap());
+        }
+        doc.clear_mutations();
+        for child in &children {
+            doc.set_attribute(*child, "data-x", "1").unwrap();
+        }
+        let journal = doc.drain_mutations();
+        assert!(journal.iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)));
     }
 
     #[test]

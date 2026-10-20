@@ -462,9 +462,22 @@ fn cache() -> &'static Cache {
     CACHE.with(|c| unsafe { &*(c as *const Cache) })
 }
 
+static EXTERNAL_HEAP: std::sync::OnceLock<fn() -> Option<usize>> = std::sync::OnceLock::new();
+
+/// Let a program whose global allocator is not [`ClassAlloc`] feed its own process-wide byte
+/// count to [`heap_bytes`], and so to every heap limit. The counter returns `None` while it has
+/// nothing to report. The first counter installed stays; later calls are ignored.
+pub fn set_external_heap_counter(counter: fn() -> Option<usize>) {
+    let _ = EXTERNAL_HEAP.set(counter);
+}
+
 /// Bytes currently allocated through [`ClassAlloc`] by the whole process (this thread's pending
-/// delta included), or `None` when `ClassAlloc` is not the global allocator.
+/// delta included), or `None` when `ClassAlloc` is not the global allocator and no external
+/// counter was installed with [`set_external_heap_counter`].
 pub fn heap_bytes() -> Option<usize> {
+    if let Some(bytes) = EXTERNAL_HEAP.get().and_then(|counter| counter()) {
+        return Some(bytes);
+    }
     if !ACTIVE.load(Relaxed) {
         return None;
     }

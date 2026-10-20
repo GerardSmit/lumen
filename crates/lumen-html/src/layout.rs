@@ -1240,8 +1240,25 @@ pub(crate) const ROOT_SCROLL_WINDOW_SCREENS: f32 = 4.0;
 // Chromium's LayoutUnit granularity: absolute f32 coordinates must not push an exactly fitting word onto the next line.
 const INLINE_FIT_TOLERANCE: f64 = 1.0 / 64.0;
 const MAX_DISPLAY_LIST_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RETAINED_FRAGMENT_ENTRIES: usize = 2048;
+/// Largest charge for one retained fragment.
 const MAX_RETAINED_FRAGMENT_BYTES: usize = 1 * 1024 * 1024;
+const DEFAULT_RETAINED_ENTRIES: usize = 16384;
+const DEFAULT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+/// Styles shared between neighbouring retained fragments.
+const RETAINED_STYLE_POOL: usize = 32;
+
+/// Limits of the retained fragment cache; the session sets them per document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedLayoutBudget {
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for RetainedLayoutBudget {
+    fn default() -> Self {
+        Self { max_entries: DEFAULT_RETAINED_ENTRIES, max_bytes: DEFAULT_RETAINED_BYTES }
+    }
+}
 const MAX_CONTROL_TEXT_BYTES: usize = lumen_common::bidi::MAX_TEXT_BYTES;
 const MAX_COLLAPSED_BORDER_CANDIDATES: usize = 64 * 1024;
 
@@ -1253,15 +1270,17 @@ pub struct RetainedLayoutCacheStats {
     pub bytes: usize,
 }
 
+/// Inputs of a box's layout other than its styles and its position. A
+/// fragment is replayed at another position when `anchored` is `None`.
 #[derive(Clone, PartialEq)]
 struct RetainedFragmentKey {
-    typographic_origin_count: usize,
     node: NodeId,
-    parent_style: Style,
-    style: Option<Style>,
-    x: f32,
-    y: f32,
+    /// The box position, when geometry outside the box depends on it.
+    anchored: Option<(f32, f32)>,
     available: f32,
+    /// Floats of the box's formatting context precede it. Such a fragment is
+    /// replayed only below them, see `RetainedFragment::float_floor`.
+    floats_above: bool,
     depth: usize,
     parent_height: Option<f32>,
     containing_block: Option<Rect>,
@@ -1277,7 +1296,6 @@ struct RetainedFragmentKey {
     svg_geometry_capture: bool,
     source_capture: bool,
     export_block_table_baselines: bool,
-    next_paint_order: u64,
     suppressed_border_node: Option<NodeId>,
     canvas_background_source: Option<NodeId>,
     viewport_overflow_source: Option<NodeId>,
@@ -1361,6 +1379,21 @@ pub(crate) fn mark_unmeasured_container_units(
 #[derive(Clone)]
 struct RetainedFragment {
     key: RetainedFragmentKey,
+    parent_style: Arc<Style>,
+    style: Arc<Style>,
+    /// Where the box was laid out. Commands and geometry are kept there and
+    /// translated by the difference to the position of a replay.
+    origin: (f32, f32),
+    /// Bounds of everything emitted at `origin`, with a margin.
+    extent: Rect,
+    /// Whether every position-bearing part of the fragment is translated by
+    /// `replay_retained_fragment`.
+    translatable: bool,
+    /// With `key.floats_above`: the lowest position the layout consulted the
+    /// floats at, in float-storage coordinates, where `float_base` is the
+    /// box's own position. Floats ending above it cannot change the layout.
+    float_floor: f32,
+    float_base: f32,
     advance: f32,
     baselines: Option<FlowBaselines>,
     content_ranges: Option<FlowContentRanges>,
@@ -1398,7 +1431,10 @@ struct RetainedFragment {
     deferred_images: Option<Arc<[DeferredImage]>>,
     pending_generation: u64,
     bytes: usize,
-    last_used: u64,
+    last_used: core::cell::Cell<u64>,
+    /// Key of this fragment in `RetainedLayoutCache::lru`, which lags
+    /// `last_used` until an eviction pass catches up.
+    lru_stamp: core::cell::Cell<u64>,
 }
 
 /// Counts font-dependent queries so retained fragments can record whether
@@ -1546,6 +1582,10 @@ pub(crate) struct IntrinsicSizes {
     /// Margin escapes of the block box measured into `sizes`, same slots.
     margins: RefCell<Vec<Option<BlockMargins>>>,
     provenance: RefCell<Vec<IntrinsicProvenance>>,
+    /// Earlier measurements of a slot with other styles, newest first: a
+    /// box is measured with its own style and with used variants of it
+    /// (stretched, min/max-content, table cell projections) in one frame.
+    others: RefCell<Vec<Vec<IntrinsicEntry>>>,
     /// Content languages, which depend on the document only.
     languages: RefCell<crate::language::LanguageMemo>,
     frame: core::cell::Cell<u32>,
@@ -1560,7 +1600,38 @@ impl IntrinsicSizes {
         self.sizes.borrow_mut().clear();
         self.margins.borrow_mut().clear();
         self.provenance.borrow_mut().clear();
+        self.others.borrow_mut().clear();
         self.languages.borrow_mut().clear();
+    }
+    fn drop_slot(&self, slot: usize) {
+        if let Some(size) = self.sizes.borrow_mut().get_mut(slot) { *size = None; }
+        if let Some(margin) = self.margins.borrow_mut().get_mut(slot) { *margin = None; }
+        if let Some(entry) = self.provenance.borrow_mut().get_mut(slot) { *entry = IntrinsicProvenance::default(); }
+        if let Some(others) = self.others.borrow_mut().get_mut(slot) { others.clear(); }
+    }
+    /// Make the newest measurement of `slot` with `style` the primary one,
+    /// moving the primary into the other ways.
+    fn promote(&self, slot: usize, style: &Style) -> bool {
+        let mut others = self.others.borrow_mut();
+        let Some(ways) = others.get_mut(slot) else { return false };
+        let Some(way) = ways.iter().position(|entry| entry.style == *style) else { return false };
+        let entry = ways.remove(way);
+        let mut sizes = self.sizes.borrow_mut();
+        let mut margins = self.margins.borrow_mut();
+        let mut provenance = self.provenance.borrow_mut();
+        let (Some(size), Some(margin), Some(origin)) = (sizes.get_mut(slot), margins.get_mut(slot), provenance.get_mut(slot)) else { return false };
+        if let Some((old_style, old_size)) = size.replace((entry.style, entry.size)) {
+            ways.insert(0, IntrinsicEntry {
+                style: old_style,
+                size: old_size,
+                margins: core::mem::replace(margin, entry.margins),
+                provenance: core::mem::replace(origin, entry.provenance),
+            });
+        } else {
+            *margin = entry.margins;
+            *origin = entry.provenance;
+        }
+        true
     }
     fn begin_frame(&self) {
         self.frame.set(self.frame.get().wrapping_add(1));
@@ -1568,6 +1639,10 @@ impl IntrinsicSizes {
     }
     /// Keep at most `limit` retained sizes, dropping the oldest frames first.
     fn retain_newest(&self, limit: usize) {
+        {
+            let mut others = self.others.borrow_mut();
+            if others.iter().map(Vec::len).sum::<usize>() > limit { others.clear(); }
+        }
         let mut sizes = self.sizes.borrow_mut();
         let live = sizes.iter().filter(|size| size.is_some()).count();
         if live <= limit { return; }
@@ -1583,6 +1658,7 @@ impl IntrinsicSizes {
             if let Some(margin) = margins.get_mut(slot) { *margin = None; }
             if let Some(entry) = provenance.get_mut(slot) { *entry = IntrinsicProvenance::default(); }
         }
+        self.others.borrow_mut().clear();
     }
     /// Count a read of a value derived from the given viewport axes.
     fn viewport_read<T>(&self, value: T, axes: u8) -> T {
@@ -1603,7 +1679,20 @@ impl IntrinsicSizes {
                 if let Some(margin) = margins.get_mut(slot) { *margin = None; }
             }
         }
+        for ways in self.others.borrow_mut().iter_mut() {
+            ways.retain(|entry| entry.provenance.axes & changed == 0 && entry.provenance.context.is_some());
+        }
     }
+}
+
+/// Ways kept per slot in `IntrinsicSizes::others`.
+const INTRINSIC_OTHER_WAYS: usize = 3;
+
+struct IntrinsicEntry {
+    style: Style,
+    size: (f32, f32),
+    margins: Option<BlockMargins>,
+    provenance: IntrinsicProvenance,
 }
 
 #[derive(Clone, Default)]
@@ -1637,25 +1726,169 @@ struct IntrinsicMark {
     context: Option<IntrinsicContext>,
 }
 
+/// Whether the document may hold list items or quotes, so that counter and
+/// quote values must be collected. `None` is unknown; a node change only
+/// rescans what changed.
+#[derive(Default)]
+struct GeneratedScan {
+    list_items: Option<bool>,
+    quotes: Option<bool>,
+}
+
 /// Bounded command/geometry fragments retained between RenderSession frames.
-/// `index` maps a node to its slot and `lru` orders slots by last use; both are
-/// charged to the byte budget through `RETAINED_INDEX_ENTRY_BYTES`.
+/// `index` maps a node to its slot and `lru` orders slots by the use they were
+/// last queued at; both are charged to the byte budget through
+/// `RETAINED_INDEX_ENTRY_BYTES`. A use only updates the fragment; the queue
+/// catches up when an eviction reaches the fragment.
 #[derive(Default)]
 pub(crate) struct RetainedLayoutCache {
     intrinsics: Rc<IntrinsicSizes>,
-    entries: Vec<RetainedFragment>,
+    entries: Vec<Rc<RetainedFragment>>,
     index: BTreeMap<RetainedNodeKey, usize>,
     lru: BTreeMap<u64, RetainedNodeKey>,
     bytes: usize,
+    budget: RetainedLayoutBudget,
     clock: u64,
     hits: usize,
     misses: usize,
+    /// Boxes laid out since `begin_frame`, other than retained replays.
+    laid_out: usize,
+    clears: u64,
+    /// Counter and quote values of the last layout; the next layout drops
+    /// what depended on the values that changed since.
+    generated: Option<(Vec<CounterNodeValues>, Vec<QuoteNodePosition>)>,
+    scan: GeneratedScan,
+    parent_styles: Vec<Arc<Style>>,
+    /// Retained fragments per distinct style (by pointer) with the style's
+    /// bytes, which `bytes` counts once however many fragments share it.
+    style_owners: BTreeMap<usize, (usize, usize)>,
 }
 
 impl RetainedLayoutCache {
     pub(crate) fn clear(&mut self) {
         self.clear_fragments();
         self.intrinsics.clear();
+        self.generated = None;
+        self.scan = GeneratedScan::default();
+    }
+
+    pub(crate) fn set_budget(&mut self, budget: RetainedLayoutBudget) {
+        self.budget = budget;
+        while !self.entries.is_empty()
+            && (self.entries.len() > budget.max_entries || self.bytes > budget.max_bytes)
+        {
+            if !self.evict_oldest() { break; }
+        }
+    }
+
+    /// Drop what a change invalidates. `layout` nodes lose the retained
+    /// fragments and intrinsic sizes of themselves and their composed
+    /// ancestors; everything inside the `subtrees` roots loses both too, as do
+    /// the roots' ancestors. For `paint` nodes only the fragments containing
+    /// them are dropped, since their geometry is unchanged. Fragments and
+    /// sizes elsewhere validate themselves by style and constraints, and are
+    /// replayed translated when only their position differs.
+    pub(crate) fn invalidate_changed(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId], paint: &[NodeId]) {
+        self.note_scan_changes(document, layout, subtrees);
+        let mut fragments: BTreeSet<RetainedNodeKey> = BTreeSet::new();
+        let mut sizes: BTreeSet<RetainedNodeKey> = BTreeSet::new();
+        for &node in layout.iter().chain(subtrees) {
+            let mut current = Some(node);
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                let key = retained_node_key(id);
+                if !sizes.insert(key) { current = None; break; }
+                fragments.insert(key);
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() {
+                self.clear();
+                return;
+            }
+        }
+        for &node in paint {
+            let mut current = Some(node);
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                if !fragments.insert(retained_node_key(id)) { current = None; break; }
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() {
+                self.clear();
+                return;
+            }
+        }
+        let mut victims: Vec<usize> = fragments.iter().filter_map(|key| self.index.get(key).copied()).collect();
+        let intrinsics = Rc::clone(&self.intrinsics);
+        let drop_slots = |index: usize| {
+            for slot in [index * 2, index * 2 + 1] {
+                intrinsics.drop_slot(slot);
+            }
+        };
+        for &(_, index, _) in &sizes { drop_slots(index as usize); }
+        let mut pending: Vec<NodeId> = subtrees.to_vec();
+        let mut visited = 0usize;
+        while let Some(node) = pending.pop() {
+            visited += 1;
+            if visited > document.node_count().saturating_add(1) {
+                self.clear();
+                return;
+            }
+            if let Some(&slot) = self.index.get(&retained_node_key(node)) { victims.push(slot); }
+            drop_slots(node.index());
+            let mut child = document.first_child(node).ok().flatten();
+            while let Some(id) = child {
+                pending.push(id);
+                child = document.next_sibling(id).ok().flatten();
+            }
+            if let Some(root) = document.shadow_root(node).ok().flatten() { pending.push(root); }
+        }
+        victims.sort_unstable_by(|a, b| b.cmp(a));
+        victims.dedup();
+        for slot in victims { self.remove_slot(slot); }
+        intrinsics.languages.borrow_mut().clear();
+    }
+
+    fn note_scan_changes(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId]) {
+        if self.scan.list_items == Some(false) {
+            let found = layout.iter().any(|&node| list_item_candidate_node(document, node))
+                || subtrees.iter().any(|&root| contains_list_item_candidate(document, root).unwrap_or(true));
+            if found { self.scan.list_items = None; }
+        }
+        if self.scan.quotes == Some(false)
+            && subtrees.iter().any(|&root| contains_html_quote_element(document, root, 0).unwrap_or(true))
+        {
+            self.scan.quotes = None;
+        }
+    }
+
+    fn reconcile_generated(&mut self, document: &Document, counters: &[CounterNodeValues], quotes: &[QuoteNodePosition]) {
+        match self.generated.take() {
+            Some((old_counters, old_quotes)) => {
+                let mut changed = changed_generated_nodes(&old_counters, counters, |value| (value.node.key(), value.pseudo as u8), |value| value.node);
+                changed.extend(changed_generated_nodes(&old_quotes, quotes, |value| (value.node.key(), 0), |value| value.node));
+                if !changed.is_empty() { self.invalidate_changed(document, &changed, &[], &[]); }
+            }
+            None => {
+                if !self.entries.is_empty() { self.clear(); }
+            }
+        }
+        let mut snapshot_counters = Vec::new();
+        let mut snapshot_quotes = Vec::new();
+        self.generated = (snapshot_counters.try_reserve_exact(counters.len()).is_ok() && snapshot_quotes.try_reserve_exact(quotes.len()).is_ok())
+            .then(|| {
+                snapshot_counters.extend_from_slice(counters);
+                snapshot_quotes.extend_from_slice(quotes);
+                (snapshot_counters, snapshot_quotes)
+            });
+    }
+
+    pub(crate) fn clear_count(&self) -> u64 {
+        self.clears
+    }
+
+    pub(crate) fn boxes_laid_out(&self) -> usize {
+        self.laid_out
     }
 
     /// Drop the retained fragments for a viewport size change. Intrinsic
@@ -1670,9 +1903,12 @@ impl RetainedLayoutCache {
     }
 
     fn clear_fragments(&mut self) {
+        if !self.entries.is_empty() { self.clears += 1; }
         self.entries.clear();
         self.index.clear();
         self.lru.clear();
+        self.parent_styles.clear();
+        self.style_owners.clear();
         self.bytes = 0;
         self.hits = 0;
         self.misses = 0;
@@ -1681,6 +1917,7 @@ impl RetainedLayoutCache {
     pub(crate) fn begin_frame(&mut self) {
         self.hits = 0;
         self.misses = 0;
+        self.laid_out = 0;
         self.clock = self.clock.saturating_add(1);
         self.intrinsics.begin_frame();
     }
@@ -1708,6 +1945,7 @@ impl RetainedLayoutCache {
 
     pub(crate) fn invalidate_text_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.intrinsics.clear();
+        self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
             !targets
                 .iter()
@@ -1718,6 +1956,7 @@ impl RetainedLayoutCache {
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.intrinsics.clear();
+        self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
             document.kind(entry.key.node).is_ok()
                 && !targets.iter().any(|target| {
@@ -1728,16 +1967,24 @@ impl RetainedLayoutCache {
         self.rebuild_indexes();
     }
 
-    fn lookup(&mut self, key: &RetainedFragmentKey) -> Option<RetainedFragment> {
+    /// The fragment retained for the box, when its inputs are unchanged and it
+    /// can be replayed at `at`, with the translation from where it was laid out.
+    fn lookup(
+        &mut self,
+        key: &RetainedFragmentKey,
+        parent_style: &Style,
+        style: &Style,
+        at: (f32, f32),
+    ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
         self.clock = self.clock.saturating_add(1);
-        let node = retained_node_key(key.node);
-        if let Some(&slot) = self.index.get(&node) {
-            if self.entries[slot].key == *key {
-                let previous = core::mem::replace(&mut self.entries[slot].last_used, self.clock);
-                self.lru.remove(&previous);
-                self.lru.insert(self.clock, node);
-                self.hits = self.hits.saturating_add(1);
-                return Some(self.entries[slot].clone());
+        if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
+            let entry = &self.entries[slot];
+            if entry.key == *key && *entry.style == *style && *entry.parent_style == *parent_style {
+                if let Some(shift) = entry.shift_to(at, key.cull) {
+                    entry.last_used.set(self.clock);
+                    self.hits = self.hits.saturating_add(1);
+                    return Some((Rc::clone(entry), shift));
+                }
             }
         }
         self.misses = self.misses.saturating_add(1);
@@ -1747,58 +1994,206 @@ impl RetainedLayoutCache {
     fn remove_slot(&mut self, slot: usize) {
         let removed = self.entries.swap_remove(slot);
         self.bytes = self.bytes.saturating_sub(removed.bytes);
+        self.release_style(&removed.parent_style);
+        self.release_style(&removed.style);
         self.index.remove(&retained_node_key(removed.key.node));
-        self.lru.remove(&removed.last_used);
+        self.lru.remove(&removed.lru_stamp.get());
         if let Some(moved) = self.entries.get(slot) {
             self.index.insert(retained_node_key(moved.key.node), slot);
         }
     }
 
+    /// Removes the least recently used fragment.
+    fn evict_oldest(&mut self) -> bool {
+        loop {
+            let Some((&stamp, &node)) = self.lru.iter().next() else { return false };
+            let Some(&slot) = self.index.get(&node) else {
+                self.lru.remove(&stamp);
+                continue;
+            };
+            let used = self.entries[slot].last_used.get();
+            if used != stamp {
+                self.lru.remove(&stamp);
+                self.entries[slot].lru_stamp.set(used);
+                self.lru.insert(used, node);
+                continue;
+            }
+            self.remove_slot(slot);
+            return true;
+        }
+    }
+
+    /// Shares equal style Arcs between fragments. Pointer identity is tried
+    /// across the pool before any deep comparison.
+    fn intern_style(&mut self, style: Arc<Style>) -> Arc<Style> {
+        let position = self.parent_styles.iter().position(|shared| Arc::ptr_eq(shared, &style))
+            .or_else(|| self.parent_styles.iter().position(|shared| **shared == *style));
+        if let Some(position) = position {
+            return Arc::clone(&self.parent_styles[position]);
+        }
+        if self.parent_styles.len() >= RETAINED_STYLE_POOL { self.parent_styles.remove(0); }
+        self.parent_styles.push(Arc::clone(&style));
+        style
+    }
+
+    fn acquire_style(&mut self, style: &Arc<Style>, bytes: usize) {
+        let owner = self.style_owners.entry(Arc::as_ptr(style) as usize).or_insert((0, bytes));
+        if owner.0 == 0 {
+            self.bytes = self.bytes.saturating_add(bytes);
+        }
+        owner.0 += 1;
+    }
+
+    fn release_style(&mut self, style: &Arc<Style>) {
+        let key = Arc::as_ptr(style) as usize;
+        let Some(owner) = self.style_owners.get_mut(&key) else { return };
+        owner.0 -= 1;
+        if owner.0 == 0 {
+            let bytes = owner.1;
+            self.style_owners.remove(&key);
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Bytes `store` would add for styles no retained fragment holds yet.
+    fn unheld_style_bytes(&self, styles: [(&Arc<Style>, usize); 2]) -> usize {
+        let [(parent, parent_bytes), (style, style_bytes)] = styles;
+        let held = |style: &Arc<Style>| self.style_owners.contains_key(&(Arc::as_ptr(style) as usize));
+        let mut bytes = if held(parent) { 0 } else { parent_bytes };
+        if !held(style) && !(Arc::ptr_eq(parent, style) && !held(parent)) {
+            bytes = bytes.saturating_add(style_bytes);
+        }
+        bytes
+    }
+
     fn store(&mut self, mut fragment: RetainedFragment) {
-        let Some(charged) = fragment.bytes.checked_add(RETAINED_INDEX_ENTRY_BYTES) else {
+        let parent_style = self.intern_style(Arc::clone(&fragment.parent_style));
+        let style = self.intern_style(Arc::clone(&fragment.style));
+        let (Some(parent_bytes), Some(style_bytes)) = (retained_style_bytes(&parent_style), retained_style_bytes(&style)) else { return };
+        let Some(owned) = fragment.bytes.checked_add(parent_bytes).and_then(|owned| owned.checked_add(style_bytes)) else { return };
+        fragment.parent_style = parent_style;
+        fragment.style = style;
+        let Some(charged) = owned.checked_add(RETAINED_INDEX_ENTRY_BYTES) else {
             return;
         };
-        if fragment.bytes == 0 || charged > MAX_RETAINED_FRAGMENT_BYTES {
+        if fragment.bytes == 0
+            || charged > MAX_RETAINED_FRAGMENT_BYTES
+            || charged > self.budget.max_bytes
+            || self.budget.max_entries == 0
+        {
             return;
         }
-        fragment.bytes = charged;
+        let own_bytes = charged - parent_bytes - style_bytes;
+        fragment.bytes = own_bytes;
         self.clock = self.clock.saturating_add(1);
-        fragment.last_used = self.clock;
+        fragment.last_used.set(self.clock);
+        fragment.lru_stamp.set(self.clock);
         let node = retained_node_key(fragment.key.node);
         if let Some(&slot) = self.index.get(&node) {
             self.remove_slot(slot);
         }
-        while self.entries.len() >= MAX_RETAINED_FRAGMENT_ENTRIES
-            || self.bytes.saturating_add(fragment.bytes) > MAX_RETAINED_FRAGMENT_BYTES
+        while self.entries.len() >= self.budget.max_entries
+            || self.bytes.saturating_add(fragment.bytes).saturating_add(
+                self.unheld_style_bytes([(&fragment.parent_style, parent_bytes), (&fragment.style, style_bytes)]),
+            ) > self.budget.max_bytes
         {
-            let Some(oldest) = self.lru.values().next().copied() else {
+            if !self.evict_oldest() {
                 return;
-            };
-            let Some(&slot) = self.index.get(&oldest) else {
-                return;
-            };
-            self.remove_slot(slot);
+            }
         }
         if self.entries.try_reserve(1).is_err() {
             return;
         }
         self.bytes += fragment.bytes;
+        self.acquire_style(&fragment.parent_style, parent_bytes);
+        self.acquire_style(&fragment.style, style_bytes);
         self.index.insert(node, self.entries.len());
-        self.lru.insert(fragment.last_used, node);
-        self.entries.push(fragment);
+        self.lru.insert(fragment.lru_stamp.get(), node);
+        self.entries.push(Rc::new(fragment));
     }
 
     fn rebuild_indexes(&mut self) {
         self.index.clear();
         self.lru.clear();
         self.bytes = 0;
-        for (slot, entry) in self.entries.iter().enumerate() {
+        self.style_owners.clear();
+        for slot in 0..self.entries.len() {
+            let entry = Rc::clone(&self.entries[slot]);
+            for style in [&entry.parent_style, &entry.style] {
+                self.acquire_style(style, retained_style_bytes(style).unwrap_or(0));
+            }
+            entry.lru_stamp.set(entry.last_used.get());
             self.index.insert(retained_node_key(entry.key.node), slot);
             self.lru
-                .insert(entry.last_used, retained_node_key(entry.key.node));
+                .insert(entry.last_used.get(), retained_node_key(entry.key.node));
             self.bytes += entry.bytes;
         }
     }
+}
+
+impl RetainedFragment {
+    /// The translation to replay at `at`, or `None` when the fragment cannot
+    /// be replayed there: it must lie in the cull window at both positions, or
+    /// clear of it (with a margin for overflow) at both, so no culling
+    /// decision changes.
+    fn shift_to(&self, at: (f32, f32), cull: Rect) -> Option<(f32, f32)> {
+        if at == self.origin {
+            return Some((0.0, 0.0));
+        }
+        if !self.translatable || self.deferred_images.is_some() {
+            return None;
+        }
+        let shift = (at.0 - self.origin.0, at.1 - self.origin.1);
+        if !shift.0.is_finite() || !shift.1.is_finite() {
+            return None;
+        }
+        let moved = Rect { x: self.extent.x + shift.0, y: self.extent.y + shift.1, ..self.extent };
+        let outside = |rect: Rect| {
+            let grown = Rect { x: rect.x - RETAINED_EXTENT_MARGIN, y: rect.y - RETAINED_EXTENT_MARGIN,
+                width: rect.width + 2.0 * RETAINED_EXTENT_MARGIN, height: rect.height + 2.0 * RETAINED_EXTENT_MARGIN };
+            grown.intersection(cull).is_none()
+        };
+        let replayable = (rect_within(self.extent, cull) && rect_within(moved, cull))
+            || (outside(self.extent) && outside(moved));
+        replayable.then_some(shift)
+    }
+}
+
+fn rect_within(inner: Rect, outer: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
+}
+
+fn list_item_candidate_node(document: &Document, node: NodeId) -> bool {
+    matches!(document.kind(node), Ok(NodeKind::Element { name, namespace, attributes })
+        if (*namespace == Namespace::Html && crate::svg::local_name(name) == "li")
+            || attributes.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("style")
+                    && value.as_bytes().windows(b"list-item".len()).any(|token| token.eq_ignore_ascii_case(b"list-item"))
+            }))
+}
+
+/// Nodes whose entries differ between two lists sorted by `key`.
+fn changed_generated_nodes<T: PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) -> (u128, u8), node: impl Fn(&T) -> NodeId) -> Vec<NodeId> {
+    let mut changed = Vec::new();
+    let (mut a, mut b) = (0, 0);
+    while a < old.len() || b < new.len() {
+        match (old.get(a), new.get(b)) {
+            (Some(x), Some(y)) if key(x) == key(y) => {
+                if x != y { changed.push(node(y)); }
+                a += 1;
+                b += 1;
+            }
+            (Some(x), Some(y)) if key(x) < key(y) => { changed.push(node(x)); a += 1; }
+            (Some(_), Some(y)) => { changed.push(node(y)); b += 1; }
+            (Some(x), None) => { changed.push(node(x)); a += 1; }
+            (None, Some(y)) => { changed.push(node(y)); b += 1; }
+            (None, None) => break,
+        }
+    }
+    changed
 }
 
 fn document_is_ancestor(document: &Document, ancestor: NodeId, node: NodeId) -> bool {
@@ -1848,6 +2243,17 @@ fn rebase_range(range: Range<usize>, base: usize) -> Result<Range<usize>, Layout
     Ok(start..end)
 }
 
+/// Bytes of a style held by retained fragments; fragments share equal styles,
+/// which are charged once.
+fn retained_style_bytes(style: &Style) -> Option<usize> {
+    let mut bytes = 0usize;
+    add_retained_bytes(&mut bytes, core::mem::size_of::<Style>())?;
+    add_retained_bytes(&mut bytes, core::mem::size_of::<css::StyleExtras>())?;
+    add_font_spec_bytes(&mut bytes, style.font_spec())?;
+    add_style_payload_bytes(&mut bytes, style)?;
+    Some(bytes)
+}
+
 fn retained_fragment_bytes(
     key: &RetainedFragmentKey,
     commands: &[Command],
@@ -1879,16 +2285,6 @@ fn retained_fragment_bytes(
             .len()
             .checked_mul(core::mem::size_of::<TextDecoration>())?,
     )?;
-    add_retained_bytes(&mut bytes, core::mem::size_of::<Style>())?;
-    add_retained_bytes(&mut bytes, core::mem::size_of::<css::StyleExtras>())?;
-    add_font_spec_bytes(&mut bytes, key.parent_style.font_spec())?;
-    add_style_payload_bytes(&mut bytes, &key.parent_style)?;
-    if let Some(style) = key.style.as_ref() {
-        add_retained_bytes(&mut bytes, core::mem::size_of::<Style>())?;
-        add_retained_bytes(&mut bytes, core::mem::size_of::<css::StyleExtras>())?;
-        add_font_spec_bytes(&mut bytes, style.font_spec())?;
-        add_style_payload_bytes(&mut bytes, style)?;
-    }
     for decoration in &key.decorations {
         add_font_spec_bytes(&mut bytes, &decoration.font)?;
         add_style_payload_bytes(&mut bytes, &decoration.source)?;
@@ -3248,6 +3644,9 @@ struct Layout<'a> {
     float_start: usize,
     /// Visual relative/sticky displacement, excluded from normal-flow float geometry.
     float_offset: (f32, f32),
+    /// Lowest block position, in float-storage coordinates, at which the
+    /// current retained box consulted the floats of its formatting context.
+    float_floor: core::cell::Cell<f32>,
     float_frame: FloatFrame,
     active_box: Option<NodeId>,
     canvas_root_box: Option<Rect>,
@@ -3278,6 +3677,10 @@ struct Layout<'a> {
     sticky_anchors: Vec<(usize, StickyAnchor, (f32, f32))>,
     /// Nesting of `box_for` calls; a generated box shares its element's id.
     box_depth: usize,
+    /// Absolutely and fixed positioned boxes laid out, and replayed fragments
+    /// that cannot be translated; an enclosing fragment that saw any of them
+    /// cannot be translated either.
+    positioned_uses: usize,
     /// Root scroll offset the document is laid out away from, for the window
     /// around it: a viewport-sticky box is placed against the viewport there.
     cull_scroll: (f32, f32),
@@ -3512,6 +3915,7 @@ impl<'a> Layout<'a> {
         float_line_storage: 0,
         float_start: 0,
         float_offset: (0.0, 0.0),
+        float_floor: core::cell::Cell::new(f32::INFINITY),
         float_frame: FloatFrame::default(),
         canvas_background_source: None,
         viewport_overflow_source: None,
@@ -3531,6 +3935,7 @@ impl<'a> Layout<'a> {
         root_scroll_hazards: 0,
         sticky_anchors: Vec::new(),
         box_depth: 0,
+        positioned_uses: 0,
         cull_scroll: (0.0, 0.0),
         translate_transform_depth: 0,
         containing_block: None,
@@ -3961,9 +4366,27 @@ impl Layout<'_> {
         }
     }
 
+    /// Scans for list items once and then follows the cache's change notes.
+    fn document_has_list_items(&mut self, root: NodeId) -> Result<bool, LayoutError> {
+        if let Some(known) = self.retained_fragments.as_deref().and_then(|cache| cache.scan.list_items) {
+            return Ok(known);
+        }
+        let found = contains_list_item_candidate(self.document, root)?;
+        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.scan.list_items = Some(found); }
+        Ok(found)
+    }
+
+    fn document_has_quotes(&mut self, root: NodeId) -> Result<bool, LayoutError> {
+        if let Some(known) = self.retained_fragments.as_deref().and_then(|cache| cache.scan.quotes) {
+            return Ok(known);
+        }
+        let found = contains_html_quote_element(self.document, root, 0)?;
+        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.scan.quotes = Some(found); }
+        Ok(found)
+    }
+
     fn prepare_quote_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
-        if !self.rules.has_quote_content() && !contains_html_quote_element(self.document, root, 0)?
-        {
+        if !self.rules.has_quote_content() && !self.document_has_quotes(root)? {
             return Ok(());
         }
         let mut positions = Vec::new();
@@ -3991,7 +4414,7 @@ impl Layout<'_> {
     fn prepare_counter_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
         if !self.rules.has_counter_data()
             && !self.rules.has_list_item_data()
-            && !contains_list_item_candidate(self.document, root)?
+            && !self.document_has_list_items(root)?
         {
             return Ok(());
         }
@@ -7766,7 +8189,7 @@ struct VirtualGeneratedChild {
     inline_images: Option<Arc<[(usize,Rc<GeneratedImage>)]>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum QuoteSystem {
     None,
     Auto(Option<Arc<str>>),
@@ -7776,13 +8199,13 @@ enum QuoteSystem {
 // Quote preparation follows the composed tree, whose live identifiers need
 // not densely occupy arena indices after replacement, adoption, or collection.
 // Keep identity with each position and bound storage by the live node count.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct QuoteNodePosition {
     node: NodeId,
     position: QuotePosition,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct QuotePosition {
     marker: usize,
     before: usize,
@@ -7792,13 +8215,13 @@ struct QuotePosition {
     system: QuoteSystem,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct CounterReplacement {
     item_index: usize,
     value: Arc<str>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct CounterNodeValues {
     node: NodeId,
     pseudo: css::PseudoElement,
@@ -9403,21 +9826,6 @@ impl OverflowFrame {
         OverflowMetrics {parent:Some(parent),border:self.border_box}
     }
 
-}
-
-fn union_rect(left: Rect, right: Rect) -> Rect {
-    let x = left.x.min(right.x);
-    let y = left.y.min(right.y);
-    // Measure extents relative to the shared origin. Adding world-coordinate
-    // edges and subtracting the origin loses local dimensions during scrolling.
-    let width = ((left.x - x) + left.width).max((right.x - x) + right.width);
-    let height = ((left.y - y) + left.height).max((right.y - y) + right.height);
-    Rect {
-        x,
-        y,
-        width,
-        height,
-    }
 }
 
 pub(crate) fn transformed_bounds(
@@ -12889,7 +13297,7 @@ trait ColumnFragmentSource:Copy {
     fn with_rect(self,rect:Rect)->Self;
     fn column(self)->Option<usize>{None}
     fn source_scope(self)->usize{usize::MAX}
-    fn joined(self,other:Self)->Self{self.with_rect(union_rect(self.rect(),other.rect()))}
+    fn joined(self,other:Self)->Self{self.with_rect(Rect::union(self.rect(),other.rect()))}
 }
 impl ColumnFragmentSource for Rect {
     fn rect(self)->Rect{self}
@@ -12905,7 +13313,7 @@ impl ColumnFragmentSource for ColumnPaintFragment {
     fn joined(self,other:Self)->Self {
         let offset=self.position.offset.min(other.position.offset);
         let end=(self.position.offset+self.extent).max(other.position.offset+other.extent);
-        let mut rect=union_rect(self.rect,other.rect);rect.height=css::typed_numeric::computed_f32(end-offset);
+        let mut rect=Rect::union(self.rect,other.rect);rect.height=css::typed_numeric::computed_f32(end-offset);
         Self{position:css::columns::SourcePosition{offset,..self.position},extent:end-offset,rect,source_scope:self.source_scope}
     }
 }
@@ -13720,6 +14128,36 @@ fn raised_index(index: usize, moved: &core::ops::Range<usize>, end: usize) -> us
     range.start
 }
 
+/// Paint records pending outside a retained box are compared before and after
+/// its layout; more than this many make that comparison too costly.
+const RETAINED_OUTER_PAINT_RECORDS: usize = 256;
+
+/// Slack around everything a retained fragment emitted, for ink the
+/// commands' own rectangles do not cover (blurs, glyph overhang).
+const RETAINED_EXTENT_MARGIN: f32 = 64.0;
+
+/// Approximate bounds of a command, for the cull-window test of retained
+/// fragments; commands without a cheap bound are covered by the fragment's
+/// hit regions and margin.
+fn command_bounds(command: &Command) -> Option<Rect> {
+    match command {
+        Command::PushClip(rect) | Command::PushBoxClip(rect)
+        | Command::FillRect { rect, .. }
+        | Command::FillRoundedRect { rect, .. }
+        | Command::FillGradient { rect, .. }
+        | Command::BoxShadow { rect, .. }
+        | Command::StrokeBorder { rect, .. }
+        | Command::StrokePatternBorder { rect, .. }
+        | Command::Image { rect, .. }
+        | Command::ReservedImage { rect, .. } => Some(*rect),
+        Command::GlyphRun { origin_x, baseline_y, size, glyphs, .. } => {
+            let width = glyphs.iter().fold(0.0f32, |widest, glyph| widest.max(glyph.x)) + *size;
+            Some(Rect { x: *origin_x, y: *baseline_y - *size, width, height: *size * 1.5 })
+        }
+        _ => None,
+    }
+}
+
 fn move_command(command: &mut Command, dx: f32, dy: f32) {
     match command {
         Command::MaskedBackground(mask) => {
@@ -14151,6 +14589,14 @@ impl Layout<'_> {
             ..rect
         })
     }
+    /// Floats whose bottom lies above every position recorded here cannot
+    /// affect the box being laid out: each float query goes through this.
+    fn note_float_query(&self, frame: FloatFrame, start: usize, y: f32) {
+        if start < self.floats.len() {
+            let at = if frame.vertical { f32::NEG_INFINITY } else { y - self.float_offset.1 };
+            self.float_floor.set(self.float_floor.get().min(at));
+        }
+    }
     fn context_float_edges_in(
         &self,
         frame: FloatFrame,
@@ -14160,6 +14606,7 @@ impl Layout<'_> {
         y: f32,
         height: f32,
     ) -> (f32, f32) {
+        self.note_float_query(frame, start, y);
         float_edges(
             self.floats[start..]
                 .iter()
@@ -14174,6 +14621,7 @@ impl Layout<'_> {
         self.next_float_end_in(self.float_frame, start, cursor)
     }
     fn next_float_end_in(&self, frame: FloatFrame, start: usize, cursor: f32) -> Option<f32> {
+        self.note_float_query(frame, start, cursor);
         self.floats[start..]
             .iter()
             .map(|(rect, _)| {
@@ -14198,13 +14646,14 @@ impl Layout<'_> {
     }
 
     fn clear_forced_inline_break(&mut self,cursor:&mut f32,frame:FloatFrame,start:usize,clear:Clear) {
-        if let Some(bottom)=self.float_clearance(frame,start,clear).filter(|bottom|*bottom>*cursor) {
+        if let Some(bottom)=self.float_clearance(frame,start,clear,*cursor).filter(|bottom|*bottom>*cursor) {
             let local=self.local_cursor(*cursor)+f64::from(bottom)-f64::from(*cursor);
             self.set_layout_cursor(cursor,bottom,local);
         }
     }
 
-    fn float_clearance(&self, frame: FloatFrame, start: usize, clear: Clear) -> Option<f32> {
+    fn float_clearance(&self, frame: FloatFrame, start: usize, clear: Clear, at: f32) -> Option<f32> {
+        self.note_float_query(frame, start, at);
         self.floats[start..]
             .iter()
             .filter_map(|(rect, side)| {
@@ -14386,6 +14835,7 @@ fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
         let mut changed=false;
         let mut bands=Vec::new();
         if !initial.clearances.is_empty() {
+            self.note_float_query(FloatFrame::default(),self.float_start,hypothetical);
             let count=self.floats.len()-self.float_start;
             bands.try_reserve(count+initial.floats.len()).map_err(|_|LayoutError::CommandLimit)?;
             bands.extend(self.floats[self.float_start..].iter().map(|(rect,side)|(self.float_rect(FloatFrame::default(),*rect),*side)));
@@ -14416,7 +14866,7 @@ fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
         cursor: f32, preceding_margin: MarginStrut, leading_margin: MarginStrut) -> Option<f32> {
         let collapsed = preceding_margin.merge(leading_margin).value();
         let hypothetical = cursor + collapsed - preceding_margin.value();
-        self.float_clearance(frame, start, clear)
+        self.float_clearance(frame, start, clear, hypothetical)
             .filter(|bottom| hypothetical < *bottom)
             .map(|bottom| hypothetical.max(bottom) - leading_margin.value())
     }
@@ -14710,6 +15160,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
 
     fn place_float(&self, frame:FloatFrame,start:usize,left:f32,width:f32,cursor:f32,
         extent:f32,side:Float,clear:Clear)->(f32,f32) {
+        self.note_float_query(frame,start,cursor);
         place_float_in(self.floats[start..].iter().map(|(rect,side)|(self.float_rect(frame,*rect),*side)),
             left,width,cursor,extent,side,clear)
     }
@@ -14750,7 +15201,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                     for glyph in glyphs.iter() {
                         let mut rect=self.text.glyph_ink_bounds(glyph,*size).ok_or(LayoutError::Text)?;
                         rect.x+=*origin_x;rect.y+=*baseline_y;
-                        if rect.width>0.0&&rect.height>0.0 {bounds=Some(bounds.map_or(rect,|old|union_rect(old,rect)));}
+                        if rect.width>0.0&&rect.height>0.0 {bounds=Some(bounds.map_or(rect,|old|Rect::union(old,rect)));}
                     }None
                 }
                 Command::FillRect{rect,..}|Command::FillRoundedRect{rect,..}=>Some(*rect),
@@ -14758,7 +15209,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 Command::PushClip(_) | Command::PushBoxClip(_)|Command::PopClip=>None,
                 _=>return Err(LayoutError::InvalidTree),
             };
-            if let Some(rect)=rect.filter(|rect|rect.width>0.0&&rect.height>0.0) {bounds=Some(bounds.map_or(rect,|old|union_rect(old,rect)));}
+            if let Some(rect)=rect.filter(|rect|rect.width>0.0&&rect.height>0.0) {bounds=Some(bounds.map_or(rect,|old|Rect::union(old,rect)));}
         }
         let Some(bounds)=bounds else{return Ok(());};
         let cull_rect=self.cull;
@@ -19484,9 +19935,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// the viewport reads its measurement made toward enclosing measurements.
     fn cached_intrinsic(&self, slot: usize, style: &Style) -> Option<(f32, f32)> {
         let intrinsics = &*self.intrinsics;
-        let size = match intrinsics.sizes.borrow().get(slot) {
-            Some(Some((cached, size))) if cached == style => *size,
-            _ => return None,
+        let primary = match intrinsics.sizes.borrow().get(slot) {
+            Some(Some((cached, size))) if cached == style => Some(*size),
+            _ => None,
+        };
+        let size = match primary {
+            Some(size) => size,
+            None if intrinsics.promote(slot, style) => intrinsics.sizes.borrow()[slot].as_ref().map(|(_, size)| *size)?,
+            None => return None,
         };
         let mut provenance = intrinsics.provenance.borrow_mut();
         let entry = provenance.get_mut(slot)?;
@@ -19544,17 +20000,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let unchanged_images = self.images.map(|images| images.pending_mark()) == mark.pending;
         let mut cache = intrinsics.sizes.borrow_mut();
         if cache.len() <= slot { cache.resize_with(slot + 1, || None); }
-        cache[slot] = Some((style.clone(), size));
+        let previous = cache[slot].replace((style.clone(), size));
         let mut table = intrinsics.margins.borrow_mut();
         if table.len() <= slot { table.resize_with(slot + 1, || None); }
-        table[slot] = margins;
+        let previous_margins = core::mem::replace(&mut table[slot], margins);
         let mut provenance = intrinsics.provenance.borrow_mut();
         if provenance.len() <= slot { provenance.resize_with(slot + 1, IntrinsicProvenance::default); }
-        provenance[slot] = IntrinsicProvenance {
+        let previous_provenance = core::mem::replace(&mut provenance[slot], IntrinsicProvenance {
             frame: intrinsics.frame.get(),
             axes,
             context: mark.context.clone().filter(|_| unchanged_images),
-        };
+        });
+        let mut others = intrinsics.others.borrow_mut();
+        if let Some(ways) = others.get_mut(slot) {
+            ways.retain(|entry| entry.style != *style);
+        }
+        if let Some((previous_style, previous_size)) = previous.filter(|(previous_style, _)| previous_style != style) {
+            if others.len() <= slot { others.resize_with(slot + 1, Vec::new); }
+            let ways = &mut others[slot];
+            ways.insert(0, IntrinsicEntry { style: previous_style, size: previous_size, margins: previous_margins, provenance: previous_provenance });
+            ways.truncate(INTRINSIC_OTHER_WAYS);
+        }
     }
 
     fn subgrid_axis_contributions(
@@ -25256,7 +25722,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         };
         let forced=self.initial_clearances.iter().find(|(node,pseudo,_)|*node==child.origin&&*pseudo==Some(child.pseudo)).map(|(_,_,position)|*position);
         let clearance=if let Some(hypothetical)=forced {
-            self.float_clearance(FloatFrame::default(),float_start,child.style.clear).map(|bottom|bottom.max(hypothetical)-leading_margin.value())
+            self.note_float_query(FloatFrame::default(),float_start,f32::NEG_INFINITY);
+            self.float_clearance(FloatFrame::default(),float_start,child.style.clear,hypothetical).map(|bottom|bottom.max(hypothetical)-leading_margin.value())
         } else { self.inflow_block_clearance(FloatFrame::default(),float_start,child.style.clear,*cursor,*previous_margin,leading_margin) };
         if let Some(next) = clearance
         {
@@ -28553,8 +29020,8 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 let source_last=first+line_end==last && if parent_reverse{at==line_first}else{at+1==line_end};
                 let view=DecorationFragmentView{fragment:source.rect,composite:surface,widest,first:source_first,last:source_last};
                 let mut ink=surface;
-                if let Some(shadows)=&style.shadows{for shadow in shadows.iter().filter(|shadow|!shadow.inset){ink=union_rect(ink,shadow.bounds(surface));}}
-                if let Some(value)=style.border_image.as_deref(){ink=union_rect(ink,border_image_area(surface,value,style.used_border_widths()));}
+                if let Some(shadows)=&style.shadows{for shadow in shadows.iter().filter(|shadow|!shadow.inset){ink=Rect::union(ink,shadow.bounds(surface));}}
+                if let Some(value)=style.border_image.as_deref(){ink=Rect::union(ink,border_image_area(surface,value,style.used_border_widths()));}
                 let clip=view.slice_clip(edge_axis,ink);
                 for index in self.closed_owner_command_indices(source.clip_owner,false)? {
                     if matches!(self.commands.get(index),Some(Command::PushClip(_))){self.replace_command(index,Command::PushClip(clip))?;}
@@ -28599,13 +29066,13 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         let clip=if sliced {
             let mut ink=rect;
             if let Some(shadows)=&style.shadows {for shadow in shadows.iter().filter(|shadow|!shadow.inset) {
-                ink=union_rect(ink,shadow.bounds(rect));
+                ink=Rect::union(ink,shadow.bounds(rect));
             }}
             if let Some(value)=style.border_image.as_deref(){
-                ink=union_rect(ink,border_image_area(rect,value,style.used_border_widths()));
+                ink=Rect::union(ink,border_image_area(rect,value,style.used_border_widths()));
             }
             let expansion=(style.outline.offset+style.outline.used_width()).max(0.0);
-            if expansion>0.0{ink=union_rect(ink,Rect{x:rect.x-expansion,y:rect.y-expansion,
+            if expansion>0.0{ink=Rect::union(ink,Rect{x:rect.x-expansion,y:rect.y-expansion,
                 width:rect.width+2.0*expansion,height:rect.height+2.0*expansion});}
             let index=self.commands.len();self.push_command(Command::PushClip(view.slice_clip(axis,ink)))?;Some(index)
         }else{None};
@@ -29207,8 +29674,10 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             let mut local_line = *line;
             local_line.command=0; local_line.float_command=0; local_line.hit=0; local_line.float_hit=0;
             local_line.paint_owner=None;
-            measurement.flow_inline_paragraph_horizontal_contents(paragraph, block_style, left, width,
-                &mut y,&mut x,&mut height,float_start,&mut local_line,&mut space,depth,&mut owners)
+            let outcome = measurement.flow_inline_paragraph_horizontal_contents(paragraph, block_style, left, width,
+                &mut y,&mut x,&mut height,float_start,&mut local_line,&mut space,depth,&mut owners);
+            self.float_floor.set(self.float_floor.get().min(measurement.float_floor.get()));
+            outcome
         })();
         for frame in &mut paragraph.frames { frame.hit=None; frame.bounds=None; frame.line_background=0..0; }
         measured?;
@@ -29996,7 +30465,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                         let mut ink:Option<Rect>=None;
                                         for glyph in glyphs {
                                             let bounds=self.text.glyph_ink_bounds(glyph,style.font_size).ok_or(LayoutError::Text)?;
-                                            if bounds.width>0.0 && bounds.height>0.0 {ink=Some(ink.map_or(bounds,|previous|union_rect(previous,bounds)));}
+                                            if bounds.width>0.0 && bounds.height>0.0 {ink=Some(ink.map_or(bounds,|previous|Rect::union(previous,bounds)));}
                                         }
                                         let Some(bounds)=ink else{first=end;continue;};
                                         let (left,right)=strip.bounds;
@@ -33491,15 +33960,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             NodeKind::Element { name, .. } => name,
             _ => return None,
         };
-        // Keep the retained path deliberately narrow: only ordinary block
-        // boxes at an exact layout position are independent of formatting
-        // context bookkeeping. More complex formatting stays on the normal
-        // layout path and can still reuse safe block descendants.
-        if self.floats.len() != self.float_start
-            || depth == 0
+        // Keep the retained path narrow: ordinary block-level boxes (block,
+        // list item, flow root, flex and grid containers) in a block container
+        // (block, list item, flow root, inline block, table cell or caption).
+        // Flex and grid items, inline-level and table boxes, positioned boxes
+        // and scroll containers stay on the normal layout path and can still
+        // reuse safe descendants.
+        if depth == 0
             || matches!(name.as_str(), "html" | "body")
-            || parent_style.display != Display::Block
-            || style.display != Display::Block
+            || !matches!(parent_style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::InlineBlock | Display::TableCell | Display::TableCaption)
+            || !matches!(style.display, Display::Block | Display::ListItem | Display::FlowRoot | Display::Flex | Display::Grid)
             || style.position != Position::Static
             || style.float != Float::None
             || style.paints_as_group()
@@ -33518,20 +33988,26 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     .any(|item| *item != css::BackgroundAttachment::Scroll)
             })
             || self.transform_depth != 0
-            || !self.pending_escapes.is_empty()
-            || !self.positioned_flow_paints.is_empty()
+            || self.pending_escapes.len() > RETAINED_OUTER_PAINT_RECORDS
+            || self.positioned_flow_paints.len() > RETAINED_OUTER_PAINT_RECORDS
             || self.geometry.is_none()
         {
             return None;
         }
+        // A formatting-context root sees only its own floats; any other box
+        // keeps the floats before it in its key and is replayed only where
+        // they still end above everything it consulted them at.
+        let floats_above = self.floats.len() != self.float_start && !establishes_formatting_context(style, parent_style);
+        let anchored = (self.containing_block.is_some()
+            || self.fixed_containing_block.is_some()
+            || self.sticky_bounds.is_some()
+            || !self.inline_containing_origins.is_empty())
+        .then_some((x, y));
         Some(RetainedFragmentKey {
-            typographic_origin_count: self.typographic_origins.len(),
             node: id,
-            parent_style: parent_style.clone(),
-            style: computed.clone(),
-            x,
-            y,
+            anchored,
             available,
+            floats_above,
             depth,
             parent_height: self.parent_height,
             containing_block: self.containing_block,
@@ -33547,7 +34023,6 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             svg_geometry_capture: self.svg_geometry_capture,
             source_capture: self.source_capture_depth != 0,
             export_block_table_baselines: self.export_block_table_baselines,
-            next_paint_order: self.next_paint_order,
             suppressed_border_node: self.suppressed_border_node,
             canvas_background_source: self.canvas_background_source,
             viewport_overflow_source: self.viewport_overflow_source,
@@ -33559,15 +34034,19 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         })
     }
 
-    fn replay_retained_fragment(&mut self, fragment: &RetainedFragment,placement:(f64,f64),movable:bool) -> Result<(), LayoutError> {
+    fn replay_retained_fragment(&mut self, fragment: &RetainedFragment,placement:(f64,f64),movable:bool,shift:(f32,f32)) -> Result<(), LayoutError> {
+        let moved = shift != (0.0, 0.0);
         if let Some(origins) = &fragment.typographic_origins {
             if self.typographic_origins.len().saturating_add(origins.len()) > MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
             self.typographic_origins.try_reserve(origins.len()).map_err(|_| LayoutError::CommandLimit)?;
-            self.typographic_origins.extend_from_slice(origins);
-            self.typographic_origin_index.extend(origins.iter().map(|node| node.key()));
+            for &node in origins.iter() {
+                if self.typographic_origin_index.insert(node.key()) { self.typographic_origins.push(node); }
+            }
         }
         for command in fragment.commands.iter() {
-            self.push_command(command.clone())?;
+            let mut command = command.clone();
+            if moved { move_command(&mut command, shift.0, shift.1); }
+            self.push_command(command)?;
         }
         if let Some(lines) = &fragment.overflow_lines {
             let base = self.commands.len() - fragment.commands.len();
@@ -33643,10 +34122,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             .map_err(|_| LayoutError::CommandLimit)?;
 
         for hit in fragment.hits.iter() {
-            geometry.hits.push(hit.clone());
+            let mut hit = hit.clone();
+            hit.rect.x += shift.0;
+            hit.rect.y += shift.1;
+            geometry.hits.push(hit);
         }
         for entry in fragment.hit_fragments.iter() {
-            geometry.append_hit_fragments(hit_base.checked_add(entry.hit).ok_or(LayoutError::InvalidTree)?,None,entry.rects.iter().copied())?;
+            geometry.append_hit_fragments(hit_base.checked_add(entry.hit).ok_or(LayoutError::InvalidTree)?,None,entry.rects.iter().map(|rect| Rect { x: rect.x + shift.0, y: rect.y + shift.1, ..*rect }))?;
         }
         if let Some(entries)=fragment.transform_reference_boxes.as_deref(){
             for (index,value) in entries {
@@ -33678,6 +34160,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         for transform in fragment.transforms.iter() {
             let mut transform = transform.clone();
             transform.hits = rebase_range(transform.hits, hit_base)?;
+            if moved { transform.matrix = transform.matrix.translated_space(shift.0, shift.1); }
             geometry.transforms.push(transform);
         }
         for clip in fragment.rounded_clips.iter() {
@@ -33686,6 +34169,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 .checked_add(clip.first_transform)
                 .ok_or(LayoutError::InvalidTree)?;
             clip.hits = rebase_range(clip.hits, hit_base)?;
+            if moved {
+                clip.rect.x += shift.0;
+                clip.rect.y += shift.1;
+                if let Some(matrix) = clip.source_transform.as_mut() {
+                    let translated = (**matrix).translated_space(shift.0, shift.1);
+                    *Arc::make_mut(matrix) = translated;
+                }
+            }
             if clip.source_transform.is_some(){geometry.svg_hit_clip_bytes=geometry.svg_hit_clip_bytes.checked_add(core::mem::size_of::<Affine>()+2*core::mem::size_of::<usize>()).ok_or(LayoutError::CommandLimit)?;}
             geometry.rounded_clips.push(clip);
         }
@@ -33730,7 +34221,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         if self.active_box == Some(fragment.key.node)
             && self.document.parent(fragment.key.node).ok().flatten() == Some(self.document.root()) {
-            self.canvas_root_box = fragment.hits.first().filter(|hit| hit.node == fragment.key.node).map(|hit| hit.rect);
+            self.canvas_root_box = fragment.hits.first().filter(|hit| hit.node == fragment.key.node)
+                .map(|hit| Rect { x: hit.rect.x + shift.0, y: hit.rect.y + shift.1, ..hit.rect });
         }
         let hit_end=geometry.hits.len();
         if let Some(phases)=fragment.paint_phases.as_ref(){
@@ -33768,6 +34260,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         Ok(())
     }
 
+    /// The position in float-storage coordinates above which the floats must
+    /// end for a floats-above fragment to be replayed at `y`.
+    fn retained_float_limit(&self, fragment: &RetainedFragment, y: f32) -> f32 {
+        let base = y - self.float_offset.1;
+        let shift = base - fragment.float_base;
+        if shift == 0.0 { fragment.float_floor } else { fragment.float_floor + shift - 1e-3 }
+    }
+
+    fn retained_floats_fit(&self, fragment: &RetainedFragment, y: f32) -> bool {
+        if !fragment.key.floats_above { return true; }
+        let limit = self.retained_float_limit(fragment, y);
+        self.floats[self.float_start..].iter().all(|(rect, _)| rect.y + rect.height <= limit)
+    }
+
     /// A fragment laid out around loading images is only reusable while they
     /// still load: an arrived one gives its box real geometry and paint.
     fn retained_pending_images_unchanged(&self, fragment: &RetainedFragment) -> bool {
@@ -33785,6 +34291,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     fn capture_retained_fragment(
         &self,
         key: RetainedFragmentKey,
+        parent_style: &Style,
+        style: Style,
+        origin: (f32, f32),
+        typographic_start: usize,
+        positioned_free: bool,
         command_start: usize,
         starts: (usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize),
         advance: f32,
@@ -33841,7 +34352,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let rendered_text_boxes = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_text_boxes.get(rendered_box_start..)?)?) } else { None };
         let rendered_table_members = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_table_members.get(rendered_member_start..)?)?) } else { None };
         let typographic_origins = if self.rules.has_typographic_content() {
-            Some(clone_arc_slice(self.typographic_origins.get(key.typographic_origin_count..)?)?)
+            Some(clone_arc_slice(self.typographic_origins.get(typographic_start..)?)?)
         } else { None };
 
         for transform in &mut transforms {
@@ -33929,7 +34440,32 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let bytes=hit_fragments.iter().try_fold(bytes,|bytes,entry|bytes.checked_add(core::mem::size_of::<HitFragments>())?.checked_add(entry.rects.len().checked_mul(core::mem::size_of::<Rect>())?))?;
         let bytes=bytes.checked_add(transform_reference_boxes.as_ref().map_or(0,|entries:&Arc<[(usize,TransformReferenceBox)]>|entries.len()*core::mem::size_of::<(usize,TransformReferenceBox)>()))?;
         if self.flow_content_ranges.is_some_and(|ranges|self.content_range_fragments.contains_key(&ranges)) {return None;}
+        let translatable = positioned_free
+            && overflow_lines.is_none()
+            && transform_reference_boxes.is_none()
+            && scroll_extents.is_empty()
+            && scroll_ports.is_empty()
+            && scroll_regions.is_empty()
+            && viewport_fixed_nodes.is_empty()
+            && control_text_runs.is_empty();
+        let mut extent = Rect { x: origin.0, y: origin.1, width: key.available.max(0.0), height: advance.max(0.0) };
+        for hit in hits.iter() {
+            extent = extent.union(hit.rect);
+        }
+        for entry in hit_fragments.iter() {
+            for rect in &entry.rects { extent = extent.union(*rect); }
+        }
+        for command in commands.iter() {
+            if let Some(rect) = command_bounds(command) { extent = extent.union(rect); }
+        }
         Some(RetainedFragment {
+            parent_style: Arc::new(parent_style.clone()),
+            style: Arc::new(style),
+            origin,
+            extent,
+            translatable,
+            float_floor: f32::INFINITY,
+            float_base: 0.0,
             baselines: self.flow_baselines,
             content_ranges: self.flow_content_ranges.map(|ranges| FlowContentRanges {
                 command_start: ranges.command_start.saturating_sub(command_start),
@@ -33968,7 +34504,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             deferred_images: None,
             pending_generation: 0,
             bytes,
-            last_used: 0,
+            last_used: core::cell::Cell::new(0),
+            lru_stamp: core::cell::Cell::new(0),
         })
     }
 
@@ -34194,6 +34731,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             flow.paragraph_start=true;let (destination,shift)=flow.place_source(available)?;(x+shift,destination)
         }else{(x,y)};
         let positioned=computed.has_principal_box() && matches!(computed.position,Position::Absolute|Position::Fixed);
+        if positioned { self.positioned_uses = self.positioned_uses.wrapping_add(1); }
         let clip_containing_block=if computed.position==Position::Fixed {self.fixed_containing_block_node}else{self.containing_block_node};
         let source=(id,child_override.as_ref().and_then(|source|source.generated.as_ref()).map(|child|child.pseudo));
         let clip_command_start=self.commands.len();
@@ -34345,12 +34883,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             None
         } else { self.retained_fragment_key(id, parent_style, &computed, x, y, available, depth) };
         let collect_rendered_text = self.collects_rendered_text();
-        if let Some(fragment) = key
+        if let Some((fragment, shift)) = key
             .as_ref()
-            .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key))
-            .filter(|fragment| !collect_rendered_text || fragment.rendered_text_collected)
-            .filter(|fragment| self.retained_pending_images_unchanged(fragment))
+            .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key, parent_style, computed.as_ref()?, (x, y)))
+            .filter(|(fragment, _)| !collect_rendered_text || fragment.rendered_text_collected)
+            .filter(|(fragment, _)| self.retained_pending_images_unchanged(fragment))
+            .filter(|(fragment, _)| self.retained_floats_fit(fragment, y))
         {
+            if fragment.key.floats_above {
+                self.float_floor.set(self.float_floor.get().min(self.retained_float_limit(&fragment, y)));
+            }
             if let (Some(pending), Some(images)) = (fragment.pending_images.as_deref(), self.images) {
                 images.replay_pending(pending);
             }
@@ -34359,13 +34901,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             let command_base = self.commands.len();
             let hit_base = self.geometry.as_ref().map_or(0, |g| g.hits.len());
-            self.replay_retained_fragment(&fragment,placement,retain_to_parent)?;
+            self.replay_retained_fragment(&fragment,placement,retain_to_parent,shift)?;
+            if !fragment.translatable { self.positioned_uses = self.positioned_uses.wrapping_add(1); }
             self.last_overflow_box=fragment.overflow.border.map(|border|(border,placement));
             self.flow_content_ranges = fragment
                 .content_ranges
                 .map(|ranges| ranges.rebased(command_base, hit_base));
             if let Some(baselines) = fragment.baselines {
-                FlowBaselines::include(&mut self.flow_baselines, baselines);
+                FlowBaselines::include(&mut self.flow_baselines, baselines.translated(shift.0, shift.1));
             }
             if fragment.has_text {
                 self.text_uses.set(self.text_uses.get().wrapping_add(1));
@@ -34439,6 +34982,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 geometry.rendered_text_bytes,
             )
         });
+        let retained_capture = key.as_ref().map(|_| (computed.clone(), self.typographic_origins.len(), self.positioned_uses));
         let pending_before = key.as_ref().map(|_| self.pending_escapes.clone());
         let positioned_before = key.as_ref().map(|_| self.positioned_flow_paints.clone());
         let clip_policies_before=self.positioned_clip_policies.len();
@@ -34450,6 +34994,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let saved_float_start = self.float_start;
         let saved_float_offset = self.float_offset;
         let floats_before = self.floats.len();
+        let outer_float_floor = key.as_ref().map(|_| self.float_floor.replace(f32::INFINITY));
         let isolated = computed.as_ref().is_some_and(|style| {
             style.has_principal_box()
                 && (depth == 0 || establishes_formatting_context(style, parent_style))
@@ -34473,6 +35018,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             self.cull = self.viewport;
             self.cull_scroll = (0.0, 0.0);
         }
+        if let Some(cache) = self.retained_fragments.as_deref_mut() { cache.laid_out += 1; }
         let result = self.box_for_uncached(id, parent_style, computed, x, y, available, depth, child_override, output_rect);
         self.cull = saved_cull;
         self.cull_scroll = saved_cull_scroll;
@@ -34487,6 +35033,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         self.float_start = saved_float_start;
         self.float_offset = saved_float_offset;
+        let box_float_floor = self.float_floor.get();
+        if let Some(outer) = outer_float_floor {
+            self.float_floor.set(if isolated { outer } else { outer.min(box_float_floor) });
+        }
         if result.is_err() {
             self.overflow_contribution_count=self.overflow_contribution_count.saturating_sub(self.overflow_frames[overflow_depth..].iter().map(|frame|frame.children.len()).sum::<usize>());
             for frame in &self.overflow_frames[overflow_depth..] {Self::retire_overflow_tokens(&mut self.overflow_move_index,frame);}self.overflow_frames.truncate(overflow_depth);
@@ -34546,9 +35096,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 && self.viewport_overflow_source == key.viewport_overflow_source
                 && self.viewport_scroll_axes == key.viewport_scroll_axes
                 && self.decorations == key.decorations;
-            if stable {
+            if let (true, Some((Some(style), typographic_start, positioned_uses))) = (stable, retained_capture) {
                 if let Some(mut fragment) = self.capture_retained_fragment(
                     key,
+                    parent_style,
+                    style,
+                    (x, y),
+                    typographic_start,
+                    self.positioned_uses == positioned_uses,
                     command_start,
                     starts,
                     advance,
@@ -34556,6 +35111,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     self.text_uses.get() != text_uses_before,
                     paint_starts,
                 ) {
+                    if fragment.key.floats_above {
+                        fragment.float_floor = box_float_floor;
+                        fragment.float_base = y - self.float_offset.1;
+                    }
+                    // A fragment laid out beside a float depends on that float's
+                    // geometry, which its key does not hold.
+                    let float_independent = self.retained_floats_fit(&fragment, y);
+                    if float_independent {
                     if let Some(images) = self.images {
                         let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
                         for entry in images.pending_since(pending_mark) {
@@ -34575,6 +35138,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     }
                     if let Some(cache) = self.retained_fragments.as_deref_mut() {
                         cache.store(fragment);
+                    }
                     }
                 }
             }
@@ -38038,7 +38602,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                             };
                             let forced = self.initial_clearances.iter().find(|(node,pseudo,_)|*node==current&&pseudo.is_none()).map(|(_,_,position)|*position);
                             let clearance = if let Some(hypothetical)=forced {
-                                self.float_clearance(frame,float_start,child_style.clear)
+                                self.note_float_query(frame,float_start,f32::NEG_INFINITY);
+                                self.float_clearance(frame,float_start,child_style.clear,hypothetical)
                                     .map(|bottom|bottom.max(hypothetical)-leading_margin.value())
                             } else {self.inflow_block_clearance(frame,float_start,
                                 child_style.clear,block,previous_margin,leading_margin)};
@@ -38910,7 +39475,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     width:box_width,height:rect.height,
                 })
             };
-            if let Some(rect)=fragments().reduce(union_rect) {hit_rect=rect;}
+            if let Some(rect)=fragments().reduce(Rect::union) {hit_rect=rect;}
             if let (Some(geometry),Some(hit))=(self.geometry.as_mut(),hit) {
                 geometry.append_hit_fragments(hit,None,fragments())?;
             }
@@ -39370,6 +39935,9 @@ fn laid_out_display_list(
     };
     layout.prepare_quote_positions(html)?;
     layout.prepare_counter_positions(html)?;
+    if let Some(cache) = layout.retained_fragments.as_deref_mut() {
+        cache.reconcile_generated(layout.document, &layout.counter_positions, &layout.quote_positions);
+    }
     let mut initial = layout
         .computed_style(html, None)
         .map_err(LayoutError::Css)?;
@@ -55810,5 +56378,121 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         assert_eq!(kept, [0, 1, 2, 3], "the four newest frames survive");
         sizes.retain_newest(4);
         assert_eq!(sizes.sizes.borrow().iter().flatten().count(), 4);
+    }
+
+    fn retained_frame(document: &Document, cache: &mut RetainedLayoutCache) -> (DisplayList, LayoutGeometry) {
+        let rules = stylesheets(document).unwrap();
+        let styles = RefCell::default();
+        cache.begin_frame();
+        let mut geometry = LayoutGeometry::default();
+        let list = display_list_with_retained_layout(document, 400, 300, &FixedText, &rules, None,
+            Some(&mut geometry), &[], &styles, Some(cache)).unwrap();
+        (list, geometry)
+    }
+
+    fn fresh_frame(document: &Document) -> (DisplayList, LayoutGeometry) {
+        let rules = stylesheets(document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        let list = display_list_with_styles(document, 400, 300, &FixedText, &rules, None, Some(&mut geometry), &[]).unwrap();
+        (list, geometry)
+    }
+
+    fn assert_same_frame(actual: &(DisplayList, LayoutGeometry), expected: &(DisplayList, LayoutGeometry)) {
+        assert_eq!(actual.0, expected.0);
+        let hits = |geometry: &LayoutGeometry| geometry.hits.iter().map(|hit| (hit.node, hit.rect)).collect::<Vec<_>>();
+        assert_eq!(hits(&actual.1), hits(&expected.1));
+    }
+
+    const RETAINED_PAGE: &str = "<!doctype html><style>html,body{margin:0}div,ul{width:200px}ul{margin:0;padding:0 0 0 20px}</style>\
+        <div id=a style='height:10px'></div><div id=b>hello <b id=bold>world</b></div>\
+        <ul id=list><li>one</li><li>two</li></ul><div id=c style='display:flow-root'>tail</div>";
+
+    fn retained_node(document: &Document, selector: &str) -> NodeId {
+        crate::selector::query_selector(document, document.root(), selector).unwrap().unwrap()
+    }
+
+    #[test]
+    fn retained_block_that_only_moved_replays_translated() {
+        let mut document = crate::html::parse(RETAINED_PAGE, 64).unwrap();
+        let a = retained_node(&document, "#a");
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        let first_boxes = cache.boxes_laid_out();
+        document.set_attribute(a, "style", "height:30px").unwrap();
+        cache.invalidate_changed(&document, &[a], &[], &[]);
+        let second = retained_frame(&document, &mut cache);
+        assert!(cache.stats().hits >= 3, "the siblings below the resized block replay: {:?}", cache.stats());
+        assert!(cache.boxes_laid_out() < first_boxes);
+        assert_same_frame(&second, &fresh_frame(&document));
+        document.set_attribute(a, "style", "height:5px").unwrap();
+        cache.invalidate_changed(&document, &[a], &[], &[]);
+        let third = retained_frame(&document, &mut cache);
+        assert!(cache.stats().hits >= 3);
+        assert_same_frame(&third, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_changed_block_is_laid_out_again_while_siblings_replay() {
+        let mut document = crate::html::parse(RETAINED_PAGE, 64).unwrap();
+        let b = retained_node(&document, "#b");
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        document.set_attribute(b, "style", "height:40px;padding:3px").unwrap();
+        cache.invalidate_changed(&document, &[b], &[], &[]);
+        let second = retained_frame(&document, &mut cache);
+        let stats = cache.stats();
+        assert!(stats.hits >= 3 && stats.misses >= 1, "{stats:?}");
+        assert_same_frame(&second, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_text_change_matches_a_fresh_layout() {
+        let mut document = crate::html::parse(RETAINED_PAGE, 64).unwrap();
+        let bold = retained_node(&document, "#bold");
+        let text = document.first_child(bold).unwrap().unwrap();
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        document.replace_data(text, "a much longer word that wraps onto several lines of the narrow block").unwrap();
+        cache.invalidate_changed(&document, &[text], &[], &[]);
+        let second = retained_frame(&document, &mut cache);
+        assert!(cache.stats().hits >= 2, "{:?}", cache.stats());
+        assert_same_frame(&second, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_paint_and_subtree_invalidation_drop_only_what_contains_the_nodes() {
+        let document = crate::html::parse(RETAINED_PAGE, 64).unwrap();
+        let (bold, list) = (retained_node(&document, "#bold"), retained_node(&document, "#list"));
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        let full = cache.stats().entries;
+        assert!(full >= 5, "{full}");
+        cache.invalidate_changed(&document, &[], &[], &[bold]);
+        let after_paint = cache.stats().entries;
+        assert!(after_paint < full && after_paint >= full - 2, "only the box holding the node goes: {full} -> {after_paint}");
+        cache.invalidate_changed(&document, &[], &[list], &[]);
+        assert!(cache.stats().entries <= after_paint - 3, "the list and its items go");
+        let rebuilt = retained_frame(&document, &mut cache);
+        assert_same_frame(&rebuilt, &fresh_frame(&document));
+    }
+
+    #[test]
+    fn retained_cache_evicts_least_recently_used_fragments_within_its_budget() {
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}div{height:10px}</style>");
+        for _ in 0..8 { markup.push_str("<div>row</div>"); }
+        let document = crate::html::parse(&markup, 64).unwrap();
+        let mut cache = RetainedLayoutCache::default();
+        assert_eq!(RetainedLayoutBudget::default(), RetainedLayoutBudget { max_entries: 16384, max_bytes: 8 * 1024 * 1024 });
+        cache.set_budget(RetainedLayoutBudget { max_entries: 3, max_bytes: 8 * 1024 * 1024 });
+        let first = retained_frame(&document, &mut cache);
+        assert!(cache.stats().entries <= 3, "{:?}", cache.stats());
+        assert_same_frame(&first, &fresh_frame(&document));
+        let second = retained_frame(&document, &mut cache);
+        assert_same_frame(&second, &fresh_frame(&document));
+        cache.set_budget(RetainedLayoutBudget { max_entries: 16384, max_bytes: 1 });
+        assert_eq!((cache.stats().entries, cache.stats().bytes), (0, 0));
+        let third = retained_frame(&document, &mut cache);
+        assert_eq!(cache.stats().entries, 0, "no fragment fits the byte budget");
+        assert_same_frame(&third, &fresh_frame(&document));
     }
 }

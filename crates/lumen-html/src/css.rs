@@ -27,6 +27,7 @@ mod image_source;
 mod media_queries;
 pub(crate) mod columns;
 pub(crate) mod break_control;
+pub(crate) mod invalidation;
 pub use break_control::BreakControl;
 pub use columns::ColumnWidth;
 mod intrinsic_override;
@@ -6853,6 +6854,9 @@ pub struct StyleIndex {
     /// per candidate rule per element.
     media_results: core::cell::RefCell<(Option<MediaEnvironment>, Vec<u8>)>,
     pub(crate) keyframes: Vec<KeyframesRuleText>,
+    invalidation: invalidation::InvalidationSets,
+    layer_order: LayerCanonicalizer,
+    last_layers: Option<Arc<[String]>>,
 }
 
 pub(crate) const MAX_RULES: usize = 4096;
@@ -6922,6 +6926,175 @@ impl LayerCanonicalizer {
         }
         Some(path)
     }
+}
+
+#[derive(Clone, Copy)]
+struct RuleFlags {
+    has_typographic_content: bool,
+    transition_pseudo_rules: u8,
+    has_z_index: bool,
+    has_generated_content: bool,
+    has_quote_content: bool,
+    has_counter_data: bool,
+    has_list_item_data: bool,
+    has_validity_data: bool,
+}
+
+impl RuleFlags {
+    fn scan(rules: &[Rule]) -> Self {
+        let has_typographic_content = rules.iter().any(|rule| matches!(rule.selector.pseudo_element, Some(PseudoElement::FirstLine | PseudoElement::FirstLetter)));
+        let transition_pseudo_rules = rules.iter().fold(0, |mask, rule| mask | match rule.selector.pseudo_element {
+            Some(PseudoElement::Before) => 1,
+            Some(PseudoElement::After) => 2,
+            Some(PseudoElement::Marker) => 4,
+            Some(PseudoElement::BeforeMarker) => 8,
+            Some(PseudoElement::AfterMarker) => 16,
+            _ => 0,
+        });
+        let has_z_index = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| matches!(declaration.value, Value::ZIndex(_)))
+        });
+        let has_generated_content = rules.iter().any(|rule| {
+            rule.selector.pseudo_element.is_some()
+                && rule.declarations.iter().any(|declaration| {
+                    matches!(&declaration.value, Value::GeneratedContent(_))
+                        || matches!(
+                            &declaration.value,
+                            Value::Deferred(name, _) if matches!(&**name, "content" | "all")
+                        )
+                        || matches!(
+                            &declaration.value,
+                            Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158)
+                        )
+                })
+        });
+        let has_quote_content = rules.iter().any(|rule| {
+            rule.selector.pseudo_element.is_some()
+                && rule
+                    .declarations
+                    .iter()
+                    .any(|declaration| match &declaration.value {
+                        Value::GeneratedContent(GeneratedContent::Items(items)) => {
+                            items.iter().any(|item| {
+                                matches!(
+                                    item,
+                                    GeneratedContentItem::OpenQuote
+                                        | GeneratedContentItem::CloseQuote
+                                        | GeneratedContentItem::NoOpenQuote
+                                        | GeneratedContentItem::NoCloseQuote
+                                )
+                            })
+                        }
+                        Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
+                        Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => {
+                            true
+                        }
+                        _ => false,
+                    })
+        });
+        let has_counter_data = rules.iter().any(|rule| {
+            rule.declarations
+                .iter()
+                .any(|declaration| match &declaration.value {
+                    Value::CounterReset(value)
+                    | Value::CounterIncrement(value)
+                    | Value::CounterSet(value) => value.is_some(),
+                    Value::GeneratedContent(GeneratedContent::Items(items)) => {
+                        generated_items_have_counters(items)
+                    }
+                    Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
+                    Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
+                    _ => false,
+                })
+        });
+        let has_list_item_data = rules.iter().any(|rule| {
+            rule.selector.pseudo_element.is_some_and(PseudoElement::is_marker)
+                || rule
+                    .declarations
+                    .iter()
+                    .any(|declaration| match &declaration.value {
+                        Value::Display(Display::ListItem)
+                        | Value::DisplayComponents { principal: Display::ListItem, .. }
+                        | Value::DisplayComponents { list_item: true, .. }
+                        | Value::ListStyleType(_)
+                        | Value::ListStylePosition(_)
+                        | Value::ListStyleImage(_) => true,
+                        Value::Deferred(name, _) => {
+                            matches!(
+                                &**name,
+                                "display" | "list-style" | "list-style-type" | "list-style-image"
+                            )
+                        }
+                        _ => false,
+                    })
+        });
+        let has_validity_data = rules
+            .iter()
+            .any(|rule| rule.selector.has_validity_dependency()
+                || rule.css_scope.as_ref().is_some_and(|scope| scope.has_validity_dependency()));
+        Self {
+            has_typographic_content,
+            transition_pseudo_rules,
+            has_z_index,
+            has_generated_content,
+            has_quote_content,
+            has_counter_data,
+            has_list_item_data,
+            has_validity_data,
+        }
+    }
+}
+
+fn assign_layer_paths(rules: &mut [Rule], order: &mut LayerCanonicalizer, previous: &mut Option<Arc<[String]>>) {
+    for rule in rules {
+        if previous.as_ref().is_none_or(|previous| !Arc::ptr_eq(previous, &rule.layers)) {
+            order.add_sheet(&rule.layers);
+            *previous = Some(rule.layers.clone());
+        }
+        rule.layer_path = order.path(&rule.layers, rule.layer, order.sheets);
+    }
+}
+
+fn ascii_ci_cmp(a: &str, b: &str) -> core::cmp::Ordering {
+    a.bytes().map(|byte| byte.to_ascii_lowercase()).cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+fn rule_ancestor_mask(rule: &Rule) -> u64 {
+    if rule.selector.part.is_some() { 0 } else { rule.selector.ancestor_mask() }
+}
+
+fn rule_shares_siblings(rule: &Rule) -> bool {
+    rule.scope.is_none()
+        && rule.css_scope.is_none()
+        && !rule.selector.position_dependent()
+        && !rule.selector.has_validity_dependency()
+        && !rule
+            .declarations
+            .iter()
+            .any(|declaration| value_depends_on_sibling_position(&declaration.value))
+}
+
+/// Add `rules[from..]` to the tag, id, class and universal buckets and keep
+/// each bucket sorted by its key; ties stay in rule order.
+fn index_rules(rules: &[Rule], from: usize, tags: &mut Vec<usize>, ids: &mut Vec<usize>, classes: &mut Vec<usize>, universal: &mut Vec<usize>) {
+    for (index, rule) in rules.iter().enumerate().skip(from) {
+        if rule.selector.part.is_some() {
+            universal.push(index);
+        } else if rule.selector.id.is_some() {
+            ids.push(index);
+        } else if !rule.selector.classes.is_empty() {
+            classes.push(index);
+        } else if rule.selector.tag.is_some() {
+            tags.push(index);
+        } else {
+            universal.push(index);
+        }
+    }
+    tags.sort_by(|&a, &b| ascii_ci_cmp(rules[a].selector.tag.as_deref().unwrap(), rules[b].selector.tag.as_deref().unwrap()));
+    ids.sort_by(|&a, &b| rules[a].selector.id.cmp(&rules[b].selector.id));
+    classes.sort_by(|&a, &b| rules[a].selector.classes[0].cmp(&rules[b].selector.classes[0]));
 }
 
 impl StyleIndex {
@@ -7053,153 +7226,26 @@ impl StyleIndex {
         mut rules: Vec<Rule>,
         document_base_url: Option<Arc<str>>,
     ) -> Self {
-        let has_typographic_content = rules.iter().any(|rule| matches!(rule.selector.pseudo_element, Some(PseudoElement::FirstLine | PseudoElement::FirstLetter)));
-        let transition_pseudo_rules = rules.iter().fold(0, |mask, rule| mask | match rule.selector.pseudo_element {
-            Some(PseudoElement::Before) => 1,
-            Some(PseudoElement::After) => 2,
-            Some(PseudoElement::Marker) => 4,
-            Some(PseudoElement::BeforeMarker) => 8,
-            Some(PseudoElement::AfterMarker) => 16,
-            _ => 0,
-        });
-        let has_z_index = rules.iter().any(|rule| {
-            rule.declarations
-                .iter()
-                .any(|declaration| matches!(declaration.value, Value::ZIndex(_)))
-        });
-        let has_generated_content = rules.iter().any(|rule| {
-            rule.selector.pseudo_element.is_some()
-                && rule.declarations.iter().any(|declaration| {
-                    matches!(&declaration.value, Value::GeneratedContent(_))
-                        || matches!(
-                            &declaration.value,
-                            Value::Deferred(name, _) if matches!(&**name, "content" | "all")
-                        )
-                        || matches!(
-                            &declaration.value,
-                            Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158)
-                        )
-                })
-        });
-        let has_quote_content = rules.iter().any(|rule| {
-            rule.selector.pseudo_element.is_some()
-                && rule
-                    .declarations
-                    .iter()
-                    .any(|declaration| match &declaration.value {
-                        Value::GeneratedContent(GeneratedContent::Items(items)) => {
-                            items.iter().any(|item| {
-                                matches!(
-                                    item,
-                                    GeneratedContentItem::OpenQuote
-                                        | GeneratedContentItem::CloseQuote
-                                        | GeneratedContentItem::NoOpenQuote
-                                        | GeneratedContentItem::NoCloseQuote
-                                )
-                            })
-                        }
-                        Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
-                        Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => {
-                            true
-                        }
-                        _ => false,
-                    })
-        });
-        let has_counter_data = rules.iter().any(|rule| {
-            rule.declarations
-                .iter()
-                .any(|declaration| match &declaration.value {
-                    Value::CounterReset(value)
-                    | Value::CounterIncrement(value)
-                    | Value::CounterSet(value) => value.is_some(),
-                    Value::GeneratedContent(GeneratedContent::Items(items)) => {
-                        generated_items_have_counters(items)
-                    }
-                    Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
-                    Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
-                    _ => false,
-                })
-        });
-        let has_list_item_data = rules.iter().any(|rule| {
-            rule.selector.pseudo_element.is_some_and(PseudoElement::is_marker)
-                || rule
-                    .declarations
-                    .iter()
-                    .any(|declaration| match &declaration.value {
-                        Value::Display(Display::ListItem)
-                        | Value::DisplayComponents { principal: Display::ListItem, .. }
-                        | Value::DisplayComponents { list_item: true, .. }
-                        | Value::ListStyleType(_)
-                        | Value::ListStylePosition(_)
-                        | Value::ListStyleImage(_) => true,
-                        Value::Deferred(name, _) => {
-                            matches!(
-                                &**name,
-                                "display" | "list-style" | "list-style-type" | "list-style-image"
-                            )
-                        }
-                        _ => false,
-                    })
-        });
-        let has_validity_data = rules
-            .iter()
-            .any(|rule| rule.selector.has_validity_dependency()
-                || rule.css_scope.as_ref().is_some_and(|scope| scope.has_validity_dependency()));
+        let RuleFlags {
+            has_typographic_content,
+            transition_pseudo_rules,
+            has_z_index,
+            has_generated_content,
+            has_quote_content,
+            has_counter_data,
+            has_list_item_data,
+            has_validity_data,
+        } = RuleFlags::scan(&rules);
         let mut layer_order = LayerCanonicalizer::default();
-        let mut previous: Option<Arc<[String]>> = None;
-        let mut sheet = 0usize;
-        for rule in &mut rules {
-            if previous
-                .as_ref()
-                .is_none_or(|previous| !Arc::ptr_eq(previous, &rule.layers))
-            {
-                sheet = layer_order.add_sheet(&rule.layers);
-                previous = Some(rule.layers.clone());
-            }
-            rule.layer_path = layer_order.path(&rule.layers, rule.layer, sheet);
-        }
+        let mut last_layers: Option<Arc<[String]>> = None;
+        assign_layer_paths(&mut rules, &mut layer_order, &mut last_layers);
         let (mut tags, mut ids, mut classes, mut universal) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (index, rule) in rules.iter().enumerate() {
-            if rule.selector.part.is_some() {
-                universal.push(index);
-            } else if rule.selector.id.is_some() {
-                ids.push(index);
-            } else if !rule.selector.classes.is_empty() {
-                classes.push(index);
-            } else if rule.selector.tag.is_some() {
-                tags.push(index);
-            } else {
-                universal.push(index);
-            }
-        }
-        tags.sort_unstable_by_key(|&index| {
-            rules[index]
-                .selector
-                .tag
-                .as_deref()
-                .unwrap()
-                .to_ascii_lowercase()
-        });
-        ids.sort_unstable_by(|&a, &b| rules[a].selector.id.cmp(&rules[b].selector.id));
-        classes.sort_unstable_by(|&a, &b| {
-            rules[a].selector.classes[0].cmp(&rules[b].selector.classes[0])
-        });
-        let ancestor_masks: Vec<u64> = rules
-            .iter()
-            .map(|rule| if rule.selector.part.is_some() {0} else {rule.selector.ancestor_mask()})
-            .collect();
+        index_rules(&rules, 0, &mut tags, &mut ids, &mut classes, &mut universal);
+        let ancestor_masks: Vec<u64> = rules.iter().map(rule_ancestor_mask).collect();
         let uses_ancestor_bloom = ancestor_masks.iter().any(|mask| *mask != 0);
-        let siblings_share = rules.iter().all(|rule| {
-            rule.scope.is_none()
-                && rule.css_scope.is_none()
-                && !rule.selector.position_dependent()
-                && !rule.selector.has_validity_dependency()
-                && !rule
-                    .declarations
-                    .iter()
-                    .any(|declaration| value_depends_on_sibling_position(&declaration.value))
-        });
+        let siblings_share = rules.iter().all(rule_shares_siblings);
+        let invalidation = invalidation::InvalidationSets::new(&rules);
         let children_state_dependent = rules.iter().any(|rule| {
             rule.selector.depends_on_children()
                 || rule.css_scope.as_ref().is_some_and(|scope| scope.depends_on_children())
@@ -7232,6 +7278,9 @@ impl StyleIndex {
             registration_snapshot: core::cell::RefCell::new(None),
             media_results: core::cell::RefCell::new((None, Vec::new())),
             keyframes: Vec::new(),
+            invalidation,
+            layer_order,
+            last_layers,
         }
     }
 
@@ -7611,18 +7660,227 @@ impl StyleIndex {
         self.children_state_dependent
     }
 
+    /// The elements whose styles the journaled mutations can change; `None`
+    /// when they are not bounded by tree position (restyle everything).
+    pub(crate) fn mutation_restyle_targets(&self, document: &Document, mutations: &[crate::Mutation]) -> Option<Vec<NodeId>> {
+        self.invalidation.affected(document, mutations)
+    }
+
+    /// The elements a rebuild from `previous` to this index can restyle: the
+    /// subjects of the rules only one of them has, found through the same
+    /// id/class/tag buckets the cascade uses and then matched. The flag marks
+    /// a subject one of those rules styles a pseudo-element of. Rules are
+    /// equal when they come from the same place in the same source; the
+    /// common prefix and suffix are kept, so an inserted, removed or replaced
+    /// sheet differs only in its own rules. `None` when the rebuild changes
+    /// anything other than rules with bounded subjects.
+    pub(crate) fn changed_rule_subjects(&self, previous: &StyleIndex, document: &Document, cache: &StyleCache) -> Option<Vec<(NodeId, bool)>> {
+        const MAX_CHANGED_RULES: usize = MAX_RULES;
+        const MAX_UNKEYED_RULES: usize = 32;
+        // Flags that gate work across the whole document (generated
+        // content, counters, validity, cache sharing) must not change; the
+        // ones gating per-element work (z-index, quotes, pseudo-element
+        // transitions, child-state selectors) apply to changed subjects only.
+        if self.environment != previous.environment
+            || self.has_generated_content != previous.has_generated_content
+            || self.has_typographic_content != previous.has_typographic_content
+            || self.has_counter_data != previous.has_counter_data
+            || self.has_list_item_data != previous.has_list_item_data
+            || self.has_validity_data != previous.has_validity_data
+            || self.uses_ancestor_bloom != previous.uses_ancestor_bloom
+            || self.siblings_share != previous.siblings_share
+            || self.rules_siblings_share != previous.rules_siblings_share
+            || self.document_base_url != previous.document_base_url
+            || self.effect_declarations.len() != previous.effect_declarations.len()
+            || !Arc::ptr_eq(&self.snapshot_declarations, &previous.snapshot_declarations) && !(self.snapshot_declarations.is_empty() && previous.snapshot_declarations.is_empty())
+            || self.registered_properties != previous.registered_properties
+        {
+            return None;
+        }
+        let mut subjects = Vec::new();
+        if self.keyframes != previous.keyframes {
+            // A changed `@keyframes` reaches the elements animated by name.
+            let mut names: Vec<&str> = Vec::new();
+            for keyframes in self.keyframes.iter().filter(|keyframes| !previous.keyframes.contains(keyframes))
+                .chain(previous.keyframes.iter().filter(|keyframes| !self.keyframes.contains(keyframes)))
+            {
+                names.push(keyframes.name.as_str());
+            }
+            let animated = |style: &Style| style.animation[0].as_deref().is_some_and(|list| list.split(',')
+                .any(|name| names.iter().any(|changed| name.trim().trim_matches(|ch| ch == '"' || ch == '\'').eq_ignore_ascii_case(changed))));
+            subjects.extend(cache.nodes_with_style(animated)?.into_iter().map(|node| (node, true)));
+        }
+        let mut last_text: Option<(*const u8, *const u8, bool)> = None;
+        let mut same_text = |a: &Arc<str>, b: &Arc<str>| {
+            if Arc::ptr_eq(a, b) {
+                return true;
+            }
+            let key = (a.as_ptr(), b.as_ptr());
+            if let Some((left, right, equal)) = last_text {
+                if (left, right) == key {
+                    return equal;
+                }
+            }
+            let equal = a.len() == b.len() && a == b;
+            last_text = Some((key.0, key.1, equal));
+            equal
+        };
+        let mut same = |a: &Rule, b: &Rule| {
+            a.registration.is_none()
+                && b.registration.is_none()
+                && a.stylesheet_owner == b.stylesheet_owner
+                && a.scope == b.scope
+                && a.starting_style == b.starting_style
+                && a.declaration_offset == b.declaration_offset
+                && a.declaration_offset != usize::MAX
+                && a.layer == b.layer
+                && a.layer_path == b.layer_path
+                && a.source_url == b.source_url
+                && a.media == b.media
+                && a.layers == b.layers
+                && match (&a.css_scope, &b.css_scope) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+                && match (&a.source_text, &b.source_text) {
+                    (Some(a), Some(b)) => same_text(a, b),
+                    _ => false,
+                }
+        };
+        let (old, new) = (&previous.rules, &self.rules);
+        let shorter = old.len().min(new.len());
+        let prefix = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
+        let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev())
+            .take(shorter - prefix)
+            .take_while(|(a, b)| same(a, b))
+            .count();
+        let changed: Vec<&Rule> = old[prefix..old.len() - suffix].iter()
+            .chain(&new[prefix..new.len() - suffix])
+            .collect();
+        if changed.is_empty() {
+            return Some(subjects);
+        }
+        if changed.len() > MAX_CHANGED_RULES {
+            return None;
+        }
+        let mut ids: alloc::collections::BTreeMap<&str, Vec<&Rule>> = alloc::collections::BTreeMap::new();
+        let mut classes: alloc::collections::BTreeMap<&str, Vec<&Rule>> = alloc::collections::BTreeMap::new();
+        let mut tags: alloc::collections::BTreeMap<String, Vec<&Rule>> = alloc::collections::BTreeMap::new();
+        let mut attributes: alloc::collections::BTreeMap<String, Vec<&Rule>> = alloc::collections::BTreeMap::new();
+        let mut unkeyed: Vec<&Rule> = Vec::new();
+        for rule in changed {
+            let selector = &rule.selector;
+            if selector.host || selector.slotted || selector.part.is_some() {
+                return None;
+            }
+            if let Some(id) = &selector.id {
+                ids.entry(id.as_str()).or_default().push(rule);
+            } else if let Some(class) = selector.classes.first() {
+                classes.entry(class.as_str()).or_default().push(rule);
+            } else if let Some(tag) = selector.tag.as_ref().filter(|tag| tag.as_str() != "*") {
+                tags.entry(tag.to_ascii_lowercase()).or_default().push(rule);
+            } else if let Some(attribute) = selector.attributes.first() {
+                let name = attribute.name.rsplit(['|', ':']).next().unwrap_or(&attribute.name);
+                attributes.entry(name.to_ascii_lowercase()).or_default().push(rule);
+            } else {
+                unkeyed.push(rule);
+            }
+        }
+        if unkeyed.len() > MAX_UNKEYED_RULES {
+            return None;
+        }
+        let limit = document.node_count() / 2 + 64;
+        let mut candidates: Vec<&Rule> = Vec::new();
+        let mut pending = Vec::new();
+        pending.push(document.root());
+        while let Some(current) = pending.pop() {
+            if let Ok(NodeKind::Element { name, attributes: element_attributes, .. }) = document.kind(current) {
+                candidates.clear();
+                candidates.extend(unkeyed.iter().copied());
+                if let Some(rules) = tags.get(crate::svg::local_name(name).to_ascii_lowercase().as_str()) {
+                    candidates.extend(rules.iter().copied());
+                }
+                for (key, value) in element_attributes {
+                    if !attributes.is_empty() {
+                        let local = key.as_str().rsplit(':').next().unwrap_or(key.as_str());
+                        if let Some(rules) = attributes.get(local.to_ascii_lowercase().as_str()) {
+                            candidates.extend(rules.iter().copied());
+                        }
+                    }
+                    if key.as_str().eq_ignore_ascii_case("id") {
+                        if let Some(rules) = ids.get(&**value) {
+                            candidates.extend(rules.iter().copied());
+                        }
+                    } else if key.as_str().eq_ignore_ascii_case("class") {
+                        for class in value.split_ascii_whitespace() {
+                            if let Some(rules) = classes.get(class) {
+                                candidates.extend(rules.iter().copied());
+                            }
+                        }
+                    }
+                }
+                let mut matched = false;
+                let mut pseudo = false;
+                for rule in &candidates {
+                    if rule.selector.has_validity_dependency() || rule.matches_at(document, current) {
+                        matched = true;
+                        pseudo |= rule.selector.pseudo_element.is_some();
+                    }
+                }
+                if matched {
+                    if subjects.len() >= limit {
+                        return None;
+                    }
+                    subjects.push((current, pseudo));
+                }
+            }
+            if let Some(root) = document.shadow_root(current).ok().flatten() {
+                pending.push(root);
+            }
+            let mut child = document.first_child(current).ok().flatten();
+            while let Some(id) = child {
+                if matches!(document.kind(id), Ok(NodeKind::Element { .. })) {
+                    pending.push(id);
+                }
+                child = document.next_sibling(id).ok().flatten();
+            }
+        }
+        Some(subjects)
+    }
+
     /// Append another stylesheet's parsed rules after the existing sheets and
     /// rebuild the selector index. Used by adopted/constructable sheets so
     /// they follow the same cascade and selector implementation as DOM sheets.
-    pub fn append_rules(&mut self, rules: Vec<Rule>) {
-        let environment = self.environment;
-        let document_base_url = self.document_base_url.clone();
-        let registrations = self.registered_properties.clone();
-        let mut combined = core::mem::take(&mut self.rules);
-        combined.extend(rules);
-        *self = Self::new_with_document_base_url(combined, document_base_url);
-        self.registered_properties = registrations;
-        self.environment = environment;
+    pub fn append_rules(&mut self, mut rules: Vec<Rule>) {
+        if rules.is_empty() {
+            return;
+        }
+        let from = self.rules.len();
+        assign_layer_paths(&mut rules, &mut self.layer_order, &mut self.last_layers);
+        let flags = RuleFlags::scan(&rules);
+        self.has_typographic_content |= flags.has_typographic_content;
+        self.transition_pseudo_rules |= flags.transition_pseudo_rules;
+        self.has_z_index |= flags.has_z_index;
+        self.has_generated_content |= flags.has_generated_content;
+        self.has_quote_content |= flags.has_quote_content;
+        self.has_counter_data |= flags.has_counter_data;
+        self.has_list_item_data |= flags.has_list_item_data;
+        self.has_validity_data |= flags.has_validity_data;
+        self.ancestor_masks.extend(rules.iter().map(rule_ancestor_mask));
+        self.uses_ancestor_bloom = self.ancestor_masks.iter().any(|mask| *mask != 0);
+        let shares = rules.iter().all(rule_shares_siblings);
+        self.siblings_share &= shares;
+        self.rules_siblings_share &= shares;
+        self.children_state_dependent |= rules.iter().any(|rule| {
+            rule.selector.depends_on_children()
+                || rule.css_scope.as_ref().is_some_and(|scope| scope.depends_on_children())
+        });
+        self.invalidation.extend(&rules);
+        self.rules.extend(rules);
+        index_rules(&self.rules, from, &mut self.tags, &mut self.ids, &mut self.classes, &mut self.universal);
+        *self.media_results.borrow_mut() = (None, Vec::new());
+        *self.registration_snapshot.borrow_mut() = None;
     }
 
     fn matches<'a>(&'a self, entries: &'a [usize], key: &str, field: u8) -> &'a [usize] {
@@ -7640,17 +7898,9 @@ impl StyleIndex {
     }
 
     fn matches_tag<'a>(&'a self, key: &str) -> &'a [usize] {
-        let key = key.to_ascii_lowercase();
-        let tag = |index: usize| {
-            self.rules[index]
-                .selector
-                .tag
-                .as_deref()
-                .unwrap()
-                .to_ascii_lowercase()
-        };
-        let start = self.tags.partition_point(|&index| tag(index) < key);
-        let end = start + self.tags[start..].partition_point(|&index| tag(index) == key);
+        let tag = |index: usize| self.rules[index].selector.tag.as_deref().unwrap();
+        let start = self.tags.partition_point(|&index| ascii_ci_cmp(tag(index), key).is_lt());
+        let end = start + self.tags[start..].partition_point(|&index| ascii_ci_cmp(tag(index), key).is_eq());
         &self.tags[start..end]
     }
 }
@@ -24199,10 +24449,13 @@ pub(crate) struct StyleCache {
     shared: Vec<SharedStyle>,
     next_shared: usize,
     /// Per node index: bloom of its ancestors' tags, ids and classes; 0 = unset.
-    blooms: Vec<u64>,
+    blooms: Vec<(u32, u64)>,
     pending: Vec<NodeId>,
     text_generation: Option<Option<u64>>,
     computed: usize,
+    /// An incremental restyle ran since the last frame began: its computed
+    /// count belongs to that frame.
+    restyled: bool,
     hits: usize,
     shared_hits: usize,
     intern_hits: usize,
@@ -24289,11 +24542,11 @@ impl StyleCache {
     }
     fn bloom(&self,node:NodeId)->Option<u64> {
         if let Some(selected)=&self.selected {let index=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()).ok()?;Some(selected.entries[index].bloom)}
-        else{self.blooms.get(node.index()).copied()}
+        else{self.blooms.get(node.index()).filter(|(generation,_)|*generation==node.generation).map(|(_,bloom)|*bloom)}
     }
     fn store_bloom(&mut self,document:&Document,node:NodeId,bloom:u64) {
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].bloom=bloom;}}
-        else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),0);}self.blooms[node.index()]=bloom;}
+        else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),(0,0));}self.blooms[node.index()]=(node.generation,bloom);}
     }
     /// A hit in `previous_nodes` swaps it with the current entry, so the
     /// entry `node_entry` reports is the one last asked for, as after a
@@ -24409,6 +24662,23 @@ impl StyleCache {
         self.drop_node(node);
         self.epoch = self.epoch.wrapping_add(1);
     }
+    /// The nodes whose retained style passes `test`; `None` when a retained
+    /// pseudo-element style does, or a node holds more than one variant.
+    pub(crate) fn nodes_with_style(&self, test: impl Fn(&Style) -> bool) -> Option<Vec<NodeId>> {
+        if self.selected.is_some() {
+            return None;
+        }
+        let mut nodes = Vec::new();
+        let mut seen = alloc::collections::BTreeSet::new();
+        for (node, _, _, style) in self.nodes.iter().chain(&self.previous_nodes).flatten() {
+            if test(style) && seen.insert(node.key()) {
+                nodes.push(*node);
+            }
+        }
+        let pseudo = self.pseudos.iter().flatten().any(|entry| entry.generated.as_ref().is_some_and(|generated| test(&generated.style)));
+        let shared = self.shared.iter().any(|entry| test(&entry.style) && !seen.contains(&entry.node.key()));
+        (!pseudo && !shared).then_some(nodes)
+    }
     fn drop_node(&mut self, node: NodeId) {
         self.forget_node_entry(node);
         self.shared.retain(|entry| entry.node != node);
@@ -24418,7 +24688,9 @@ impl StyleCache {
         if self.parents.len() > PARENT_STYLES_COMPACT.max(2 * self.compacted_parents) {
             self.compact_parents();
         }
-        self.computed = 0;
+        if !core::mem::take(&mut self.restyled) {
+            self.computed = 0;
+        }
         self.hits = 0;
         self.shared_hits = 0;
         self.intern_hits = 0;
@@ -24518,6 +24790,37 @@ impl StyleCache {
         cached == token || (cached != 0 && token != 0
             && self.parents.get(cached as usize - 1).zip(self.parents.get(token as usize - 1))
                 .is_some_and(|(cached, parent)| Arc::ptr_eq(cached, parent) || cached == parent))
+    }
+
+    /// Drop the ancestor blooms that no longer describe `node`'s subtree when
+    /// the node's tag, id, classes or parent changed since they were stored.
+    fn refresh_bloom(&mut self, document: &Document, node: NodeId) {
+        if self.selected.is_some() {
+            return;
+        }
+        let Some(stored) = self.bloom(node).filter(|bloom| *bloom != 0) else { return };
+        let own = document.kind(node).map_or(0, element_bloom);
+        let expected = match document.parent(node).ok().flatten() {
+            Some(parent) if matches!(document.kind(parent), Ok(NodeKind::Element { .. })) => {
+                self.bloom(parent).filter(|bloom| *bloom != 0).map(|bloom| bloom | own)
+            }
+            _ => Some(own),
+        };
+        if expected == Some(stored) {
+            return;
+        }
+        let mut pending = Vec::new();
+        pending.push(node);
+        while let Some(current) = pending.pop() {
+            self.store_bloom(document, current, 0);
+            let mut child = document.first_child(current).ok().flatten();
+            while let Some(id) = child {
+                if self.bloom(id).is_some_and(|bloom| bloom != 0) {
+                    pending.push(id);
+                }
+                child = document.next_sibling(id).ok().flatten();
+            }
+        }
     }
 
     fn ancestor_bloom(&mut self, document: &Document, node: NodeId) -> u64 {
@@ -24830,6 +25133,257 @@ pub(crate) fn compute_node_cached(
     cache: &mut StyleCache,
 ) -> Result<Style, CssError> {
     compute_node_cached_impl(document, node, parent, index, cache, None)
+}
+
+/// What a computed style change requires of the rendering pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum StyleDamage {
+    None,
+    Paint,
+    Layout,
+}
+
+/// Compare an old and a new computed style. `Paint` when the styles differ
+/// only in properties that change how already placed boxes are drawn (colors,
+/// borders' colors and radii, backgrounds, shadows, outlines, decoration
+/// styles, visibility, hit-testing flags, SVG paint, and the value of an
+/// opacity or filter that stays present); `Layout` for any other difference,
+/// including every property not listed.
+pub(crate) fn style_damage(old: &Style, new: &Style) -> StyleDamage {
+    if old == new {
+        return StyleDamage::None;
+    }
+    let mut probe = old.clone();
+    probe.color = new.color;
+    probe.background = new.background;
+    probe.border_color = new.border_color;
+    probe.border_radius = new.border_radius;
+    if (old.opacity == 1.0) == (new.opacity == 1.0) {
+        probe.opacity = new.opacity;
+    }
+    macro_rules! paint_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(if probe.$field != new.$field {
+                probe.$field = new.$field.clone();
+            })+
+        };
+    }
+    paint_fields!(
+        source_colors,
+        shadow_source_colors,
+        image_color_origins,
+        text_shadows,
+        text_shadow_current_color,
+        border_corner_radii,
+        logical_border_radius_corners,
+        border_color_sides,
+        logical_border_color,
+        outline,
+        shadows,
+        background_images,
+        background_position,
+        background_size,
+        background_size_math,
+        background_repeat,
+        background_clip,
+        background_origin,
+        background_attachment,
+        mask_images,
+        mask_position,
+        mask_size,
+        mask_repeat,
+        mask_origin,
+        mask_clip,
+        mask_mode,
+        text_decoration,
+        text_decoration_style,
+        text_decoration_color,
+        text_underline_position,
+        text_decoration_thickness,
+        text_underline_offset,
+        visibility_visible,
+        pointer_events_auto,
+        user_select,
+        svg_fill,
+        svg_stroke,
+        svg_stroke_width,
+        svg_fill_opacity,
+        svg_stroke_opacity,
+        svg_fill_rule,
+        svg_clip_rule,
+        svg_stop_color,
+        svg_stop_opacity,
+        column_rule_color,
+    );
+    if old.filters.is_some() == new.filters.is_some() {
+        paint_fields!(filters);
+    }
+    if probe == *new { StyleDamage::Paint } else { StyleDamage::Layout }
+}
+
+fn pseudo_damage(old: &Option<GeneratedStyle>, new: &Option<GeneratedStyle>) -> StyleDamage {
+    match (old, new) {
+        (None, None) => StyleDamage::None,
+        (Some(old), Some(new)) if old.pseudo == new.pseudo && old.content == new.content => style_damage(&old.style, &new.style),
+        _ => StyleDamage::Layout,
+    }
+}
+
+/// Distance from the root along the composed tree.
+fn style_depth(document: &Document, node: NodeId) -> usize {
+    let mut depth = 0;
+    let mut current = document.composed_parent(node).ok().flatten();
+    while let Some(id) = current {
+        depth += 1;
+        current = document.composed_parent(id).ok().flatten();
+    }
+    depth
+}
+
+/// Recompute one node's retained style against `forced_parent`, or against
+/// the parent style its retained entry was computed with. `None` when the
+/// node has no retained style that can be compared with (its entry is
+/// missing or was computed against an unknown parent): its damage is
+/// `Layout` and its descendants are left to recompute on demand.
+fn restyle_one(
+    document: &Document,
+    index: &StyleIndex,
+    cache: &mut StyleCache,
+    text: &dyn TextShaper,
+    node: NodeId,
+    forced_parent: Option<&Arc<Style>>,
+) -> Result<(StyleDamage, Option<Arc<Style>>, Option<Arc<Style>>), CssError> {
+    let old = cache.node_entry(node).cloned();
+    let old_pseudos: Vec<(PseudoElement, Option<GeneratedStyle>)> = if cache.selected.is_some() { Vec::new() } else {
+        cache.pseudos.get(node.index()).map_or_else(Vec::new, |entries| entries.iter()
+            .filter(|entry| entry.origin == node)
+            .map(|entry| (entry.pseudo, entry.generated.clone()))
+            .collect())
+    };
+    cache.drop_node(node);
+    cache.refresh_bloom(document, node);
+    let Some((_, token, _, old_style)) = old else {
+        return Ok((StyleDamage::Layout, None, None));
+    };
+    let parent = match forced_parent {
+        Some(parent) => Some(parent.clone()),
+        None => match token {
+            0 => {
+                let styled_parent = document.flat_tree_parent(node).ok().flatten()
+                    .is_some_and(|parent| matches!(document.kind(parent), Ok(NodeKind::Element { .. })));
+                if styled_parent {
+                    return Ok((StyleDamage::Layout, None, None));
+                }
+                None
+            }
+            token => match cache.parents.get(token as usize - 1) {
+                Some(parent) => Some(parent.clone()),
+                None => return Ok((StyleDamage::Layout, None, None)),
+            },
+        },
+    };
+    let style = compute_node_cached_impl(document, node, parent.as_deref(), index, cache, Some(text))?;
+    let mut damage = style_damage(&old_style, &style);
+    let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| matches!(&generated.content,
+        GeneratedContent::Items(items) if items.iter().any(|item| matches!(item, GeneratedContentItem::Attribute { .. }))));
+    for (position, (pseudo, generated)) in old_pseudos.iter().enumerate() {
+        if old_pseudos[..position].iter().any(|(earlier, _)| earlier == pseudo) { continue; }
+        if reads_attributes(generated) { damage = StyleDamage::Layout; break; }
+        let current = index.compute_pseudo_cached(document, node, &style, *pseudo, Some(text), cache)?;
+        let mut changed = StyleDamage::Layout;
+        for (_, old) in old_pseudos.iter().filter(|(kind, _)| kind == pseudo) {
+            changed = changed.min(pseudo_damage(old, &current));
+        }
+        damage = damage.max(changed);
+    }
+    // First-line and first-letter styles are computed during layout and
+    // retained nowhere, so a change to them cannot be compared.
+    if index.has_typographic_content {
+        damage = StyleDamage::Layout;
+    }
+    let new_style = (damage != StyleDamage::None && style != *old_style).then(|| Arc::new(style));
+    Ok((damage, new_style, Some(old_style)))
+}
+
+/// Recompute the retained styles of `nodes`, which a mutation may have
+/// changed. Each node is computed with the parent style its retained entry
+/// was computed with, so only its own cascade inputs are compared. When a
+/// node's style changes, its children are recomputed against the new style,
+/// and so on down to the children whose style comes out unchanged. Returns
+/// the nodes whose style or generated pseudo-element styles changed, or that
+/// had no retained style to compare with, with the damage the change causes;
+/// nodes whose damage is `None` are omitted and the styles of all others are
+/// kept as they were. Fails when the work exceeds a bound that makes a full
+/// restyle cheaper.
+pub(crate) fn restyle_nodes(
+    document: &Document,
+    index: &StyleIndex,
+    cache: &mut StyleCache,
+    text: &dyn TextShaper,
+    nodes: &[NodeId],
+) -> Result<Vec<(NodeId, StyleDamage)>, CssError> {
+    let mut order: Vec<(usize, NodeId)> = nodes.iter()
+        .filter(|node| document.kind(**node).is_ok())
+        .map(|&node| (style_depth(document, node), node))
+        .collect();
+    order.sort_by_key(|(depth, node)| (*depth, node.key()));
+    order.dedup_by_key(|(_, node)| node.key());
+    if !order.is_empty() && !cache.restyled {
+        cache.restyled = true;
+        cache.computed = 0;
+    }
+    let mut budget = document.node_count() / 2 + 256;
+    let mut damage: alloc::collections::BTreeMap<u128, (NodeId, StyleDamage)> = alloc::collections::BTreeMap::new();
+    let mut done: alloc::collections::BTreeSet<u128> = alloc::collections::BTreeSet::new();
+    let mut pending: Vec<(NodeId, Arc<Style>, Arc<Style>)> = Vec::new();
+    let record = |damage: &mut alloc::collections::BTreeMap<u128, (NodeId, StyleDamage)>, node: NodeId, level: StyleDamage| {
+        let entry = damage.entry(node.key()).or_insert((node, StyleDamage::None));
+        entry.1 = entry.1.max(level);
+    };
+    for (_, node) in order {
+        if done.contains(&node.key()) {
+            continue;
+        }
+        done.insert(node.key());
+        let (level, new_style, old_style) = restyle_one(document, index, cache, text, node, None)?;
+        record(&mut damage, node, level);
+        if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
+            pending.push((node, new_style, old_style));
+        }
+        while let Some((parent, new_parent, old_parent)) = pending.pop() {
+            let mut children = document.composed_children_iter(parent).map_err(|_| CssError { offset: 0, message: "invalid restyle node" })?;
+            while let Some(child) = children.next().map_err(|_| CssError { offset: 0, message: "invalid restyle node" })? {
+                if !matches!(document.kind(child), Ok(NodeKind::Element { .. }))
+                    || document.flat_tree_parent(child).ok().flatten() != Some(parent)
+                    || done.contains(&child.key())
+                {
+                    continue;
+                }
+                let inherited_from_old = cache.node_entry(child).map(|(_, token, _, _)| *token).map(|token| {
+                    token != 0 && cache.parents.get(token as usize - 1).is_some_and(|candidate| Arc::ptr_eq(candidate, &old_parent) || **candidate == *old_parent)
+                });
+                match inherited_from_old {
+                    None => continue,
+                    Some(false) => {
+                        record(&mut damage, child, StyleDamage::Layout);
+                        continue;
+                    }
+                    Some(true) => {}
+                }
+                if budget == 0 {
+                    return Err(CssError { offset: 0, message: "restyle exceeds the incremental budget" });
+                }
+                budget -= 1;
+                done.insert(child.key());
+                let (level, new_style, old_style) = restyle_one(document, index, cache, text, child, Some(&new_parent))?;
+                record(&mut damage, child, level);
+                if let (Some(new_style), Some(old_style)) = (new_style, old_style) {
+                    pending.push((child, new_style, old_style));
+                }
+            }
+        }
+    }
+    Ok(damage.into_values().filter(|(_, level)| *level != StyleDamage::None).collect())
 }
 
 pub(crate) fn compute_node_cached_with_text(
@@ -37767,4 +38321,313 @@ mod registered_animation_snapshot_guards {
 pub fn combine_animation_individual_transform(property:&str,from:&str,to:&str,operation:registered_properties::ComputedValueOperation,style:&Style,viewport:MediaEnvironment,text:Option<&dyn TextShaper>,query:ContainerUnitContext)->Option<String>{
     let slot=match property{"translate"=>239,"rotate"=>240,"scale"=>241,_=>return None};
     individual_transforms::combine(slot,from,to,operation,style_length_context(text,style,viewport,None),query)
+}
+
+#[cfg(test)]
+mod incremental_style_tests {
+    use super::*;
+    use crate::paint::ShapedRun;
+
+    struct TestText;
+
+    impl TextShaper for TestText {
+        fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+            Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+        }
+        fn ascent(&self, _: f32) -> f32 {
+            2.0
+        }
+        fn line_height(&self, _: f32) -> f32 {
+            3.0
+        }
+    }
+
+    fn elements(document: &Document, tag: &str) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        let mut pending = vec![document.root()];
+        while let Some(node) = pending.pop() {
+            if matches!(document.kind(node), Ok(NodeKind::Element { name, .. }) if tag.is_empty() || crate::svg::local_name(name) == tag) {
+                found.push(node);
+            }
+            let mut children = Vec::new();
+            let mut child = document.first_child(node).unwrap();
+            while let Some(id) = child {
+                children.push(id);
+                child = document.next_sibling(id).unwrap();
+            }
+            pending.extend(children.into_iter().rev());
+        }
+        found
+    }
+
+    fn warm(document: &Document, index: &StyleIndex, cache: &mut StyleCache, node: NodeId, parent: Option<&Style>) {
+        let style = matches!(document.kind(node), Ok(NodeKind::Element { .. }))
+            .then(|| compute_node_cached_with_text(document, node, parent, index, cache, &TestText).unwrap());
+        let inherited = style.as_ref().or(parent);
+        let mut child = document.first_child(node).unwrap();
+        while let Some(id) = child {
+            warm(document, index, cache, id, inherited);
+            child = document.next_sibling(id).unwrap();
+        }
+    }
+
+    fn setup(html: &str, css: &str) -> (Document, StyleIndex, StyleCache) {
+        let mut document = crate::html::parse(html, 4096).unwrap();
+        document.clear_mutations();
+        let index = StyleIndex::new(parse_stylesheet(css).unwrap().rules);
+        let mut cache = StyleCache::default();
+        let root = document.root();
+        warm(&document, &index, &mut cache, root, None);
+        (document, index, cache)
+    }
+
+    fn assert_matches_full_restyle(document: &Document, index: &StyleIndex, cache: &StyleCache) {
+        let mut fresh = StyleCache::default();
+        warm(document, index, &mut fresh, document.root(), None);
+        for node in elements(document, "") {
+            assert_eq!(cache.node_style(node), fresh.node_style(node), "{node:?}");
+        }
+    }
+
+    fn restyle(document: &Document, index: &StyleIndex, cache: &mut StyleCache) -> (Vec<NodeId>, Vec<(NodeId, StyleDamage)>) {
+        let targets = index.mutation_restyle_targets(document, document.mutations()).unwrap();
+        let damage = restyle_nodes(document, index, cache, &TestText, &targets).unwrap();
+        (targets, damage)
+    }
+
+    #[test]
+    fn style_damage_classifies_properties() {
+        let base = Style::initial();
+        assert_eq!(style_damage(&base, &base.clone()), StyleDamage::None);
+        let changed = |edit: &dyn Fn(&mut Style)| {
+            let mut style = base.clone();
+            edit(&mut style);
+            style_damage(&base, &style)
+        };
+        assert_eq!(changed(&|style| style.color = Rgba { r: 200, g: 0, b: 0, a: 255 }), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.background = Rgba { r: 0, g: 200, b: 0, a: 255 }), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.border_color = Rgba { r: 0, g: 0, b: 200, a: 255 }), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.visibility_visible = false), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.pointer_events_auto = false), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.text_decoration = 1), StyleDamage::Paint);
+        assert_eq!(changed(&|style| style.display = Display::None), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.width = Some(10.0)), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.font_size = 30.0), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.position = Position::Absolute), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.z_index = Some(2)), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.overflow_x = Overflow::Hidden), StyleDamage::Layout);
+        assert_eq!(changed(&|style| style.opacity = 0.5), StyleDamage::Layout);
+        let mut translucent = base.clone();
+        translucent.opacity = 0.5;
+        let mut fainter = base.clone();
+        fainter.opacity = 0.25;
+        assert_eq!(style_damage(&translucent, &fainter), StyleDamage::Paint);
+        let mut mixed = base.clone();
+        mixed.color = Rgba { r: 1, g: 2, b: 3, a: 255 };
+        mixed.width = Some(4.0);
+        assert_eq!(style_damage(&base, &mixed), StyleDamage::Layout);
+    }
+
+    #[test]
+    fn class_toggle_restyles_one_element() {
+        let mut html = String::from("<div>");
+        for _ in 0..40 {
+            html.push_str("<p>text</p>");
+        }
+        html.push_str("</div>");
+        let (mut document, index, mut cache) = setup(&html, ".hot { color: red }");
+        let target = elements(&document, "p")[7];
+        document.set_attribute(target, "class", "hot").unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert_eq!(targets, vec![target]);
+        assert_eq!(damage, vec![(target, StyleDamage::Paint)]);
+        assert_matches_full_restyle(&document, &index, &cache);
+        document.clear_mutations();
+        document.set_attribute(target, "class", "").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert_eq!(damage, vec![(target, StyleDamage::Paint)]);
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn irrelevant_class_changes_report_no_damage() {
+        let (mut document, index, mut cache) = setup("<div><p>text</p></div>", ".hot { color: red }");
+        let target = elements(&document, "p")[0];
+        document.set_attribute(target, "class", "unrelated").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.is_empty());
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn inherited_changes_recompute_descendants() {
+        let html = "<div><p><span>text</span></p><i>other</i></div>";
+        let (mut document, index, mut cache) = setup(html, ".big { font-size: 30px } .red { color: red } .box { background: blue }");
+        let container = elements(&document, "div")[0];
+        let descendants = elements(&document, "")
+            .into_iter()
+            .filter(|node| !elements(&document, "div").contains(node) && matches!(document.kind(*node), Ok(NodeKind::Element { name, .. }) if !["html", "head", "body"].contains(&crate::svg::local_name(name))))
+            .collect::<Vec<_>>();
+        assert_eq!(descendants.len(), 3);
+
+        document.set_attribute(container, "class", "big").unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert_eq!(targets, vec![container]);
+        assert!(damage.contains(&(container, StyleDamage::Layout)));
+        assert!(descendants.iter().all(|node| damage.contains(&(*node, StyleDamage::Layout))));
+        assert_matches_full_restyle(&document, &index, &cache);
+
+        document.clear_mutations();
+        document.set_attribute(container, "class", "red").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.contains(&(container, StyleDamage::Layout)), "font size reverts");
+        assert_matches_full_restyle(&document, &index, &cache);
+
+        document.clear_mutations();
+        document.set_attribute(container, "class", "box").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.contains(&(container, StyleDamage::Paint)), "the color reverts");
+        document.clear_mutations();
+        document.set_attribute(container, "class", "red box").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.iter().all(|(_, level)| *level == StyleDamage::Paint));
+        assert!(descendants.iter().all(|node| damage.contains(&(*node, StyleDamage::Paint))), "color is inherited");
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn non_inherited_paint_change_stops_at_the_element() {
+        let (mut document, index, mut cache) = setup("<div><p><span>text</span></p></div>", ".box { background: blue }");
+        let container = elements(&document, "div")[0];
+        document.set_attribute(container, "class", "box").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert_eq!(damage, vec![(container, StyleDamage::Paint)]);
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn selector_kinds_restyle_what_they_match() {
+        let (mut document, index, mut cache) = setup("<ul><li>1</li><li>2</li><li>3</li></ul>", "li:first-child { color: red } li.sel + li { color: blue } ul:has(.mark) { background: green }");
+        let items = elements(&document, "li");
+        let list = elements(&document, "ul")[0];
+        document.remove(items[0]).unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert!(targets.contains(&items[1]));
+        assert!(damage.contains(&(items[1], StyleDamage::Paint)));
+        assert_matches_full_restyle(&document, &index, &cache);
+
+        document.clear_mutations();
+        document.set_attribute(items[1], "class", "sel").unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert!(targets.contains(&items[2]));
+        assert!(damage.contains(&(items[2], StyleDamage::Paint)));
+        assert_matches_full_restyle(&document, &index, &cache);
+
+        document.clear_mutations();
+        document.set_attribute(items[2], "class", "mark").unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert!(targets.contains(&list));
+        assert!(damage.contains(&(list, StyleDamage::Paint)));
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn inserted_elements_get_styles_from_their_parent() {
+        let (mut document, index, mut cache) = setup("<div class=red><p>text</p></div>", ".red { color: red } p { margin: 3px }");
+        let container = elements(&document, "div")[0];
+        let added = document.create(NodeKind::Element { namespace: Namespace::Html, name: "p".into(), attributes: Vec::new() }).unwrap();
+        document.append(container, added).unwrap();
+        let (targets, damage) = restyle(&document, &index, &mut cache);
+        assert!(targets.contains(&added));
+        assert!(damage.iter().any(|(node, level)| *node == added && *level == StyleDamage::Layout));
+        let mut fresh = StyleCache::default();
+        warm(&document, &index, &mut fresh, document.root(), None);
+        let expected = fresh.node_style(added).unwrap();
+        assert_eq!(compute_node_cached_with_text(&document, added, cache.node_style(container).as_deref(), &index, &mut cache, &TestText).unwrap(), *expected);
+    }
+
+    #[test]
+    fn restyle_reaches_every_inheriting_child() {
+        let mut html = String::from("<div class=wrap>");
+        for _ in 0..100 {
+            html.push_str("<p>text</p>");
+        }
+        html.push_str("</div>");
+        let (mut document, index, mut cache) = setup(&html, ".big { font-size: 30px }");
+        let wrap = elements(&document, "div")[0];
+        document.set_attribute(wrap, "class", "wrap big").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert_eq!(damage.len(), 101);
+        assert!(damage.iter().all(|(_, level)| *level == StyleDamage::Layout));
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
+
+    #[test]
+    fn restyle_fails_when_inheritance_reaches_too_much() {
+        let mut html = String::from("<div class=wrap>");
+        for _ in 0..600 {
+            html.push_str("<p></p>");
+        }
+        html.push_str("</div>");
+        let (mut document, index, mut cache) = setup(&html, ".big { font-size: 30px }");
+        let wrap = elements(&document, "div")[0];
+        document.set_attribute(wrap, "class", "wrap big").unwrap();
+        let targets = index.mutation_restyle_targets(&document, document.mutations()).unwrap();
+        assert!(restyle_nodes(&document, &index, &mut cache, &TestText, &targets).is_err());
+    }
+
+    #[test]
+    fn append_equals_a_full_rebuild() {
+        let first = parse_stylesheet("p { color: red } .a { margin: 1px } #i { width: 3px } * { padding: 0 }").unwrap().rules;
+        let second = parse_stylesheet("@layer base { p { color: blue } } .a .b { height: 2px } div:empty { opacity: .5 } P { z-index: 2 } span::before { content: 'x' }").unwrap().rules;
+        let mut combined = first.clone();
+        combined.extend(second.clone());
+        let full = StyleIndex::new(combined);
+        let mut appended = StyleIndex::new(first);
+        appended.append_rules(second);
+        assert_eq!(full.tags, appended.tags);
+        assert_eq!(full.ids, appended.ids);
+        assert_eq!(full.classes, appended.classes);
+        assert_eq!(full.universal, appended.universal);
+        assert_eq!(full.ancestor_masks, appended.ancestor_masks);
+        assert_eq!(full.uses_ancestor_bloom, appended.uses_ancestor_bloom);
+        assert_eq!(full.siblings_share, appended.siblings_share);
+        assert_eq!(full.has_z_index, appended.has_z_index);
+        assert_eq!(full.has_generated_content, appended.has_generated_content);
+        assert_eq!(full.children_state_dependent, appended.children_state_dependent);
+        assert_eq!(full.rules.iter().map(|rule| rule.layer_path).collect::<Vec<_>>(), appended.rules.iter().map(|rule| rule.layer_path).collect::<Vec<_>>());
+        let html = "<div id=i class=a><p class=b><span class=b>t</span></p><div></div></div>";
+        let document = crate::html::parse(html, 256).unwrap();
+        let (mut left, mut right) = (StyleCache::default(), StyleCache::default());
+        warm(&document, &full, &mut left, document.root(), None);
+        warm(&document, &appended, &mut right, document.root(), None);
+        for node in elements(&document, "") {
+            assert_eq!(left.node_style(node), right.node_style(node));
+        }
+    }
+
+    #[test]
+    fn tag_lookup_ignores_ascii_case() {
+        let index = StyleIndex::new(parse_stylesheet("P { color: red } div { color: blue } SPAN { color: green }").unwrap().rules);
+        assert_eq!(index.matches_tag("p").len(), 1);
+        assert_eq!(index.matches_tag("P").len(), 1);
+        assert_eq!(index.matches_tag("Span").len(), 1);
+        assert_eq!(index.matches_tag("table").len(), 0);
+    }
+
+    #[test]
+    fn ancestor_blooms_follow_identity_changes() {
+        let (mut document, index, mut cache) = setup("<div><section><p>text</p></section></div>", ".on p { color: red }");
+        let container = elements(&document, "div")[0];
+        let paragraph = elements(&document, "p")[0];
+        document.set_attribute(container, "class", "on").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.contains(&(paragraph, StyleDamage::Paint)));
+        assert_matches_full_restyle(&document, &index, &cache);
+        document.clear_mutations();
+        document.set_attribute(container, "class", "").unwrap();
+        let (_, damage) = restyle(&document, &index, &mut cache);
+        assert!(damage.contains(&(paragraph, StyleDamage::Paint)));
+        assert_matches_full_restyle(&document, &index, &cache);
+    }
 }
