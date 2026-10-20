@@ -555,6 +555,17 @@ pub struct RenderSession {
     cssom_stylesheet_texts: Vec<layout::CssomStylesheetText>,
     cached: Option<CachedFrame>,
     failed_frame: Option<FailedFrame>,
+    /// Screens laid out around the viewport for root scrolling; see
+    /// `layout::ROOT_SCROLL_WINDOW_SCREENS`. `None` lays out the viewport only.
+    scroll_window: Option<f32>,
+    scroll_window_enabled: bool,
+    /// The last layout at the origin could not be moved into place. Layouts
+    /// are made at the scroll offset directly until one of them could be moved.
+    origin_refused: bool,
+    /// Set while the window is smaller than the default because the default
+    /// was too dense: the document version from which the default is tried
+    /// again, and the number of versions to wait after the next reduction.
+    window_reduced: Option<(u64, u64)>,
     rendered_text_requested: bool,
     frame_id: u64,
     font_generation: u64,
@@ -789,6 +800,10 @@ impl RenderSession {
             cssom_stylesheet_texts: Vec::new(),
             cached: None,
             failed_frame: None,
+            scroll_window: Some(layout::ROOT_SCROLL_WINDOW_SCREENS),
+            scroll_window_enabled: true,
+            origin_refused: false,
+            window_reduced: None,
             rendered_text_requested: false,
             frame_id: 0,
             font_generation: 0,
@@ -1228,6 +1243,10 @@ impl RenderSession {
             return;
         }
         self.document_base_url = base;
+        // Another document, which may fit the window the last one did not.
+        self.scroll_window = self.scroll_window_enabled.then_some(layout::ROOT_SCROLL_WINDOW_SCREENS);
+        self.origin_refused = false;
+        self.window_reduced = None;
         self.rules = None;
         self.invalidate_paint();
         self.frame_id = self.frame_id.wrapping_add(1);
@@ -2792,6 +2811,14 @@ impl RenderSession {
         self.frame_id += 1;
     }
 
+    /// The host's image resolver advanced its generation. The next render
+    /// paints arrived images into the retained frame, or lays it out again
+    /// when an image changes geometry or failed.
+    pub fn image_resources_advanced(&mut self) {
+        self.paint_revision = self.paint_revision.wrapping_add(1);
+        self.frame_id = self.frame_id.wrapping_add(1);
+    }
+
     /// Invalidate retained layout and paint after a host image resource changes.
     pub fn invalidate_image_resources(&mut self) {
         self.invalidate_paint();
@@ -3570,20 +3597,45 @@ impl RenderSession {
                 .map_err(|_| LayoutError::CommandLimit)?;
             self.scrolls.push(layout::ScrollOffset { node, x, y });
         }
+        let root = self.document.root();
+        // Fragments of a document laid out at the origin do not depend on the
+        // root scroll offset, but each is keyed on the window it was culled
+        // to. A scroll that moves the frame stays in that window and keeps
+        // them; one that lays out again culls to another window, which none
+        // of them could match.
+        let keeps_fragments = node == root && self.cached.as_ref().is_some_and(|frame| frame.geometry.laid_out_at_origin);
         let replayed = self.cached.as_mut().is_some_and(|frame| {
             if frame.geometry.transform_timeline_values.is_some(){return false;}
-            frame
-                .geometry
-                .scroll_region(&mut frame.list.0, node, from, (x, y))
+            if node == root {
+                frame.geometry.scroll_root(&mut frame.list.0, (x, y))
+            } else {
+                frame.geometry.scroll_region(&mut frame.list.0, node, from, (x, y))
+            }
         });
         if !replayed {
             self.discard_frame();
         }
         self.failed_frame = None;
-        self.layout_cache.clear();
+        if !keeps_fragments || !replayed {
+            self.layout_cache.clear();
+        }
         self.paint_revision = self.paint_revision.wrapping_add(1);
         self.frame_id += 1;
         Ok(true)
+    }
+
+    /// Whether layout emits a window of screens around the viewport, so that
+    /// scrolling the document moves its retained frame (on by default). Off,
+    /// only the viewport is painted and every root scroll lays out again.
+    pub fn set_root_scroll_window(&mut self, enabled: bool) {
+        self.scroll_window_enabled = enabled;
+        let window = enabled.then_some(layout::ROOT_SCROLL_WINDOW_SCREENS);
+        if self.scroll_window != window {
+            self.scroll_window = window;
+            self.window_reduced = None;
+            self.discard_frame();
+            self.layout_cache.clear();
+        }
     }
 
     /// The list produced by the most recent successful render, if still valid.
@@ -3756,7 +3808,10 @@ impl RenderSession {
         let Some(generation) = images.map(ImageResolver::generation).filter(|generation| *generation != 0) else {
             return false;
         };
-        if self.pending_lookups.is_empty() || !(self.forced_layout || !self.timeline_layout_stale) {
+        // With no lookup pending, the generation advanced for images this
+        // frame does not use; it stays valid as long as nothing was removed.
+        // A pending image no lookup records is for a layout.
+        if (self.images_pending && self.pending_lookups.is_empty()) || !(self.forced_layout || !self.timeline_layout_stale) {
             return false;
         }
         let Some(mut frame) = self.cached.take() else {
@@ -3827,7 +3882,7 @@ impl RenderSession {
         for (index, command) in patches {
             frame.list.0[index] = command;
         }
-        frame.geometry.deferred_images.retain(|record| !arrived.contains(&record.lookup));
+        frame.geometry.retire_deferred_images(&arrived);
         self.pending_lookups.retain(|(lookup, _)| !arrived.contains(lookup));
         self.images_pending = !self.pending_lookups.is_empty();
         frame.image_generation = Some(generation);
@@ -4079,6 +4134,7 @@ impl RenderSession {
         let mut timeline_corrected=false;
         let mut pending_images = self.images_pending;
         let mut pending_lookups: Vec<(layout::PendingLookup, bool)>;
+        let origin_attempted = !self.origin_refused;
         let (mut list, mut geometry) = loop {
             let mut geometry = layout::LayoutGeometry::default();
             geometry.collect_rendered_text = self.rendered_text_requested;
@@ -4093,22 +4149,80 @@ impl RenderSession {
             fallback: images,
             pending: Default::default(),
         };
-                let list = layout::display_list_with_snapshot_mode_and_timelines(
-                &self.document,
-                width,
-                height,
-                text,
-                self.rules.as_ref().expect("stylesheets initialized"),
-                Some(&node_images),
-                Some(&mut geometry),
-                &self.scrolls,
-                &self.style_cache,
-                Some(&mut self.layout_cache),
-                self.presentation_root,
-                canvas_background,
-                None,
-                self.timeline_transform_values.as_deref(),
-            )?;
+                let fresh = |collect_rendered_text: bool| {
+                    let mut geometry = layout::LayoutGeometry::default();
+                    geometry.collect_rendered_text = collect_rendered_text;
+                    geometry
+                };
+                let mut lay_out = |window: Option<f32>, geometry: &mut layout::LayoutGeometry| {
+                    layout::display_list_with_snapshot_mode_and_timelines(
+                        &self.document,
+                        width,
+                        height,
+                        text,
+                        self.rules.as_ref().expect("stylesheets initialized"),
+                        Some(&node_images),
+                        Some(geometry),
+                        &self.scrolls,
+                        &self.style_cache,
+                        Some(&mut self.layout_cache),
+                        self.presentation_root,
+                        canvas_background,
+                        None,
+                        self.timeline_transform_values.as_deref(),
+                        window,
+                        !self.origin_refused,
+                    )
+                };
+                let full = self.scroll_window_enabled.then_some(layout::ROOT_SCROLL_WINDOW_SCREENS);
+                // A reduction made for an earlier version of the document
+                // may not apply to this one: try the full window again, but
+                // less often each time it is reduced again.
+                let retrying = full.is_some() && self.window_reduced.is_some_and(|(at, _)| version >= at);
+                let mut window = if retrying { full } else { self.scroll_window };
+                let list = loop {
+                    let list = lay_out(window, &mut geometry);
+                    let (Err(LayoutError::CommandLimit), Some(screens)) = (&list, window) else {
+                        break list?;
+                    };
+                    // Only the window may be too dense: try smaller ones, and
+                    // then the viewport alone, which fails like a layout without
+                    // a window when it is too dense itself.
+                    geometry = fresh(self.rendered_text_requested);
+                    let mut screens = screens / 2.0;
+                    let smaller = loop {
+                        if screens < 0.5 {
+                            break None;
+                        }
+                        match lay_out(Some(screens), &mut geometry) {
+                            Err(LayoutError::CommandLimit) => {
+                                geometry = fresh(self.rendered_text_requested);
+                                screens /= 2.0;
+                            }
+                            list => break Some((list?, screens)),
+                        }
+                    };
+                    match smaller {
+                        Some((list, screens)) => {
+                            window = Some(screens);
+                            break list;
+                        }
+                        None => {
+                            window = None;
+                            break lay_out(None, &mut geometry)?;
+                        }
+                    }
+                };
+                self.window_reduced = match (window != full, self.window_reduced, retrying) {
+                    (false, _, _) => None,
+                    (true, None, _) => Some((version + 1, 1)),
+                    (true, Some((_, gap)), true) => {
+                        let gap = (gap * 2).min(64);
+                        Some((version + gap, gap))
+                    }
+                    (true, Some(reduced), false) => Some(reduced),
+                };
+                self.scroll_window = window;
                 pending_images |= node_images.pending.get();
                 pending_lookups = node_images.pending.take_distinct();
                 list
@@ -4150,6 +4264,13 @@ impl RenderSession {
         };
         self.images_pending = pending_images;
         self.pending_lookups = pending_lookups;
+        // A layout made at the scroll offset directly shows whether the
+        // document can be moved again, so that the origin is tried once it can.
+        self.origin_refused = if origin_attempted {
+            geometry.origin_layout_refused
+        } else {
+            !geometry.root_movable(list.0.len())
+        };
         self.layout_count += 1;
         let mut requests = Vec::new();
         apply_paint_worklet_cache(&mut list.0, &self.paint_worklet_cache, &mut requests);
@@ -6653,6 +6774,416 @@ mod tests {
         assert_eq!(session.scrollport(outer), Some(outer_port));
     }
 
+    /// Scrolls `source` through `steps` (scroller id, or the document for
+    /// `None`, and a y offset) and compares each frame against a session that
+    /// lays the same scroll state out afresh. Returns the number of steps that
+    /// moved the retained frame instead of laying it out again.
+    fn root_scroll_replay_matches_fresh_layout(source: &str, ids: &[&str], steps: &[(Option<&str>, f32)]) -> usize {
+        let (width, height) = (200, 150);
+        let find = |document: &Document, id: &str| crate::selector::get_element_by_id(document, document.root(), id).unwrap().unwrap();
+        let mut session = RenderSession::new(crate::html::parse(source, 256).unwrap());
+        session.display_list(width, height, &NoText).unwrap();
+        let mut replays = 0;
+        for &(scroller, y) in steps {
+            let node = scroller.map_or(session.document().root(), |id| find(session.document(), id));
+            let layouts = session.layout_count();
+            assert!(session.set_scroll_offset(node, 0.0, y).unwrap());
+            let list = session.display_list(width, height, &NoText).unwrap().0.clone();
+            if scroller.is_none() && session.layout_count() == layouts {
+                replays += 1;
+            }
+            let mut fresh = RenderSession::new(crate::html::parse(source, 256).unwrap());
+            fresh.display_list(width, height, &NoText).unwrap();
+            for (id, offset) in [None, Some("port"), Some("toc")].into_iter().filter_map(|id| {
+                let node = id.map_or(Some(session.document().root()), |id| crate::selector::get_element_by_id(session.document(), session.document().root(), id).unwrap())?;
+                Some((id, session.scroll_offset(node)))
+            }) {
+                let node = id.map_or(fresh.document().root(), |id| find(fresh.document(), id));
+                fresh.set_scroll_offset(node, offset.0, offset.1).unwrap();
+                fresh.display_list(width, height, &NoText).unwrap();
+            }
+            fresh.cached = None;
+            let expected = fresh.display_list(width, height, &NoText).unwrap().0.clone();
+            // Laid out where it is, without a window or retained fragments.
+            let mut direct = RenderSession::new(crate::html::parse(source, 256).unwrap());
+            direct.set_root_scroll_window(false);
+            direct.display_list(width, height, &NoText).unwrap();
+            for (id, offset) in [None, Some("port"), Some("toc")].into_iter().filter_map(|id| {
+                let node = id.map_or(Some(session.document().root()), |id| crate::selector::get_element_by_id(session.document(), session.document().root(), id).unwrap())?;
+                Some((id, session.scroll_offset(node)))
+            }) {
+                let node = id.map_or(direct.document().root(), |id| find(direct.document(), id));
+                direct.set_scroll_offset(node, offset.0, offset.1).unwrap();
+                direct.display_list(width, height, &NoText).unwrap();
+            }
+            assert!(!direct.cached.as_ref().unwrap().geometry.laid_out_at_origin);
+            if list != expected {
+                let first = list.iter().zip(&expected).position(|(a, b)| a != b).unwrap_or(list.len().min(expected.len()));
+                let mut report = alloc::format!("lengths {} {} first {first}", list.len(), expected.len());
+                for index in first.saturating_sub(2)..(first + 6) {
+                    report.push_str(&alloc::format!("\n{index}\n  got {:?}\n  exp {:?}", list.get(index), expected.get(index)));
+                }
+                panic!("display list after scrolling {scroller:?} to {y}: {report}");
+            }
+            for id in ids {
+                assert_eq!(
+                    session.bounding_client_rect(find(session.document(), id)),
+                    fresh.bounding_client_rect(find(fresh.document(), id)),
+                    "#{id} after scrolling {scroller:?} to {y}"
+                );
+                assert_eq!(
+                    session.bounding_client_rect(find(session.document(), id)),
+                    direct.bounding_client_rect(find(direct.document(), id)),
+                    "#{id} after scrolling {scroller:?} to {y}, against a direct layout"
+                );
+            }
+            let extents = |session: &RenderSession| session.completed_geometry().map(|geometry| geometry.scroll_extents.iter()
+                .map(|extent| (extent.node.index(), extent.min_x, extent.max_x, extent.min_y, extent.max_y)).collect::<Vec<_>>());
+            assert!(extents(&direct).is_some());
+            assert_eq!(extents(&session), extents(&direct), "scroll extents after scrolling {scroller:?} to {y}");
+            for x in (0..width).step_by(10) {
+                for y in (0..height).step_by(10) {
+                    let (x, y) = (x as f32 + 5.0, y as f32 + 5.0);
+                    assert_eq!(session.hit_test(x, y).map(NodeId::index), fresh.hit_test(x, y).map(NodeId::index), "hit at {x},{y} after scrolling {scroller:?}");
+                    assert_eq!(session.hit_test(x, y).map(NodeId::index), direct.hit_test(x, y).map(NodeId::index), "direct hit at {x},{y} after scrolling {scroller:?}");
+                }
+            }
+        }
+        replays
+    }
+
+    #[test]
+    fn root_scroll_moves_retained_frame_with_fixed_sticky_and_nested_scrollers() {
+        let source = "<!doctype html><style>html,body{margin:0}div{box-sizing:border-box}\
+            #head{display:flex;position:fixed;top:0;left:0;width:200px;height:20px;background:navy}\
+            #sticky{position:sticky;top:20px;height:30px;background:green}\
+            #port{overflow:auto;width:100px;height:60px}#port>div{height:40px}\
+            #inner{position:sticky;top:0;height:10px;background:red}\
+            #fade{opacity:.5;height:20px;background:purple}\
+            #corner{position:fixed;right:0;bottom:0;width:30px;height:30px;background:orange}\
+            #bottom{position:sticky;bottom:5px;height:10px;background:black}</style>\
+            <div style='height:50px;background:silver'></div>\
+            <div id=wrap><div id=sticky></div><div style='height:150px;background:yellow'></div></div>\
+            <div id=port><div id=inner></div><div style='background:blue'></div><div style='background:teal'></div></div>\
+            <div id=fade></div><div id=bottom></div><div style='height:90px;background:gray'></div>\
+            <div id=head></div><div id=corner><div id=pinned style='position:sticky;top:0;height:5px;background:white'></div></div>";
+        let ids = ["head", "sticky", "port", "inner", "fade", "corner", "bottom", "pinned"];
+        let steps = [
+            (None, 30.0), (None, 60.0), (None, 100.0), (None, 161.5), (Some("port"), 25.0),
+            (None, 250.0), (None, 120.0), (Some("port"), 5.0), (None, 0.0), (None, 10.0),
+        ];
+        assert!(root_scroll_replay_matches_fresh_layout(source, &ids, &steps) >= 6);
+    }
+
+    #[test]
+    fn root_scroll_moves_nested_sticky_anchors_and_reopened_clips() {
+        // Shaped like Wikipedia's pinned table of contents: a sticky scroller
+        // with a sticky `::after` fade, and positioned content whose clips the
+        // layout reopens around it.
+        let source = "<!doctype html><style>html,body{margin:0}div{box-sizing:border-box}\
+            #side{position:absolute;left:0;top:0;width:60px;height:440px}\
+            #toc{position:sticky;top:10px;height:120px;overflow:auto;background:khaki}\
+            #toc::after{content:'';display:block;position:sticky;bottom:0;height:8px;background:brown}\
+            #toc>div{height:50px;border:1px solid}\
+            #clip{overflow:hidden;height:30px}\
+            #escape{position:absolute;left:5px;top:20px;width:20px;height:40px;background:red}\
+            #main{margin-left:70px;height:440px;background:linear-gradient(white,black)}</style>\
+            <div id=side><div id=toc><div></div><div id=clip><div style='position:static'><div id=escape></div></div></div><div></div></div></div>\
+            <div id=main></div>";
+        let ids = ["side", "toc", "clip", "escape", "main"];
+        let steps = [
+            (None, 15.0), (None, 40.0), (Some("toc"), 30.0), (None, 120.0), (None, 290.0), (None, 200.0), (None, 0.0),
+        ];
+        assert!(root_scroll_replay_matches_fresh_layout(source, &ids, &steps) >= 4);
+    }
+
+    /// The solid boxes painted inside the viewport, in a comparable order.
+    fn visible_solid_boxes(list: &[crate::paint::Command], width: u32, height: u32) -> Vec<String> {
+        let viewport = Rect { x: 0.0, y: 0.0, width: width as f32, height: height as f32 };
+        let mut boxes: Vec<String> = list.iter().filter_map(|command| match command {
+            crate::paint::Command::FillRect { rect, color } => Some((*rect, alloc::format!("{color:?}"))),
+            crate::paint::Command::FillBackground(fill) => match &fill.image {
+                crate::paint::BackgroundPaint::Solid(color) => Some((fill.rect, alloc::format!("{color:?}"))),
+                _ => None,
+            },
+            crate::paint::Command::FillRoundedRect { rect, color, .. } => Some((*rect, alloc::format!("rounded {color:?}"))),
+            crate::paint::Command::GlyphRun { origin_x, baseline_y, color, glyphs, .. } => Some((
+                Rect { x: *origin_x, y: *baseline_y, width: glyphs.len() as f32, height: 0.0 },
+                alloc::format!("text {color:?}"),
+            )),
+            _ => None,
+        })
+        .filter(|(rect, _)| rect.intersection(viewport).is_some() || (rect.height == 0.0 && rect.y >= 0.0 && rect.y <= viewport.height))
+        .map(|(rect, color)| alloc::format!("{} {} {} {} {color}", rect.x, rect.y, rect.width, rect.height))
+        .collect();
+        boxes.sort();
+        boxes
+    }
+
+    fn root_node(session: &RenderSession) -> NodeId {
+        session.document().root()
+    }
+
+    const FIXED_AND_STICKY_PAGE: &str = "<!doctype html><style>html,body{margin:0;font:10px/10px sans-serif}\
+        #head{position:fixed;top:0;left:0;width:200px;height:20px;background:navy;color:white}\
+        #foot{position:fixed;bottom:0;right:0;width:30px;height:10px;background:orange;color:black}\
+        #sticky{position:sticky;top:20px;height:30px;background:green;color:red}\
+        #bottom{position:sticky;bottom:0;height:12px;width:50px;background:purple;color:blue}</style>\
+        <div id=wrap><div style='height:100px'></div><div id=sticky><span style='background:pink'>sticky</span><input type=checkbox style='width:10px;height:10px'></div><div id=bottom>bottom</div>\
+        <div style='height:6000px;background:yellow'></div></div><div id=head>head<span style='background:aqua'>head</span><input type=checkbox style='width:10px;height:10px'></div><div id=foot><span style='background:lime'>foot</span></div>";
+
+    fn assert_painted_like_direct_layout(session: &mut RenderSession, offset: f32) {
+        let (width, height) = (200, 150);
+        let root = root_node(session);
+        assert!(session.set_scroll_offset(root, 0.0, offset).unwrap());
+        let list = session.display_list(width, height, &Mono).unwrap().0.clone();
+        let mut direct = RenderSession::new(crate::html::parse(FIXED_AND_STICKY_PAGE, 256).unwrap());
+        direct.set_root_scroll_window(false);
+        direct.display_list(width, height, &Mono).unwrap();
+        let root = root_node(&direct);
+        direct.set_scroll_offset(root, 0.0, offset).unwrap();
+        let expected = visible_solid_boxes(&direct.display_list(width, height, &Mono).unwrap().0, width, height);
+        assert!(expected.iter().any(|painted| painted.contains("0 0 200 20")), "the fixed header paints at {offset}");
+        assert!(expected.iter().any(|painted| painted.contains("text Rgba { r: 255, g: 255, b: 255")), "the fixed header text paints at {offset}: {expected:?}");
+        assert_eq!(expected.iter().filter(|painted| painted.contains("rounded")).count() >= 2, true, "widgets paint at {offset}: {expected:?}");
+        for color in ["g: 255, b: 255", "g: 255, b: 0", "g: 192, b: 203"] {
+            assert!(expected.iter().any(|painted| painted.contains(color)), "an inline background with {color} paints at {offset}: {expected:?}");
+        }
+        assert_eq!(visible_solid_boxes(&list, width, height), expected, "painted boxes after scrolling to {offset}");
+    }
+
+    #[test]
+    fn scrolling_far_past_the_window_paints_fixed_and_sticky_boxes() {
+        let mut session = RenderSession::new(crate::html::parse(FIXED_AND_STICKY_PAGE, 256).unwrap());
+        session.display_list(200, 150, &Mono).unwrap();
+        assert_painted_like_direct_layout(&mut session, 3000.0);
+        assert_painted_like_direct_layout(&mut session, 3040.0);
+        assert_painted_like_direct_layout(&mut session, 20.0);
+        assert_painted_like_direct_layout(&mut session, 5400.0);
+    }
+
+    #[test]
+    fn wheeling_far_past_the_window_paints_fixed_and_sticky_boxes() {
+        let mut session = RenderSession::new(crate::html::parse(FIXED_AND_STICKY_PAGE, 256).unwrap());
+        session.display_list(200, 150, &Mono).unwrap();
+        for step in 1..=30 {
+            assert_painted_like_direct_layout(&mut session, step as f32 * 100.0);
+        }
+    }
+
+    const UNMOVABLE_PAGE: &str = "<!doctype html><style>html,body{margin:0}\
+        #bg{height:400px;background:url(none.png) fixed}</style>\
+        <div id=bg></div><div id=more style='height:900px;background:silver'></div>";
+
+    fn origin_attempt_state(session: &RenderSession) -> (bool, bool, bool) {
+        let geometry = &session.cached.as_ref().unwrap().geometry;
+        (session.origin_refused, geometry.origin_layout_refused, geometry.laid_out_at_origin)
+    }
+
+    #[test]
+    fn a_document_which_cannot_scroll_by_translation_is_not_laid_out_at_the_origin_after_a_mutation() {
+        let mut session = RenderSession::new(crate::html::parse(UNMOVABLE_PAGE, 256).unwrap());
+        session.display_list(200, 150, &NoText).unwrap();
+        assert_eq!(origin_attempt_state(&session), (true, true, false), "at scroll 0 the layout is already where the document is");
+        let root = root_node(&session);
+        session.set_scroll_offset(root, 0.0, 60.0).unwrap();
+        session.display_list(200, 150, &NoText).unwrap();
+        assert_eq!(origin_attempt_state(&session), (true, false, false), "the scroll lays out at its offset only");
+        let more = crate::selector::get_element_by_id(session.document(), session.document().root(), "more").unwrap().unwrap();
+        for width in [50, 60, 70] {
+            session.document_mut().set_attribute(more, "style", &alloc::format!("height:900px;width:{width}px")).unwrap();
+            session.display_list(200, 150, &NoText).unwrap();
+            assert_eq!(origin_attempt_state(&session), (true, false, false), "a mutation does not try the origin again");
+        }
+    }
+
+    #[test]
+    fn the_origin_is_tried_again_once_the_document_can_scroll_by_translation() {
+        let mut session = RenderSession::new(crate::html::parse(UNMOVABLE_PAGE, 256).unwrap());
+        session.display_list(200, 150, &NoText).unwrap();
+        let root = root_node(&session);
+        session.set_scroll_offset(root, 0.0, 60.0).unwrap();
+        session.display_list(200, 150, &NoText).unwrap();
+        assert!(session.origin_refused);
+        let bg = crate::selector::get_element_by_id(session.document(), session.document().root(), "bg").unwrap().unwrap();
+        session.document_mut().set_attribute(bg, "style", "background:none").unwrap();
+        session.display_list(200, 150, &NoText).unwrap();
+        assert_eq!(origin_attempt_state(&session), (false, false, false), "laid out at its offset, and found movable");
+        let more = crate::selector::get_element_by_id(session.document(), session.document().root(), "more").unwrap().unwrap();
+        session.document_mut().set_attribute(more, "style", "height:900px;width:50px").unwrap();
+        session.display_list(200, 150, &NoText).unwrap();
+        assert_eq!(origin_attempt_state(&session), (false, false, true));
+    }
+
+    #[test]
+    fn the_first_scroll_of_an_unmovable_document_lays_out_once() {
+        let mut session = RenderSession::new(crate::html::parse(UNMOVABLE_PAGE, 256).unwrap());
+        session.display_list(200, 150, &NoText).unwrap();
+        assert!(!session.cached.as_ref().unwrap().geometry.laid_out_at_origin, "nothing was moved into place");
+        assert!(session.origin_refused, "so the scroll does not try the origin again");
+        let root = root_node(&session);
+        session.set_scroll_offset(root, 0.0, 60.0).unwrap();
+        session.display_list(200, 150, &NoText).unwrap();
+        assert!(!session.cached.as_ref().unwrap().geometry.origin_layout_refused);
+    }
+
+    struct Mono;
+
+    impl TextShaper for Mono {
+        fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+            let glyphs: Vec<crate::paint::Glyph> = text.char_indices()
+                .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x: at as f32, y: 0.0, size_scale: 1.0 })
+                .collect();
+            Ok(ShapedRun { glyphs: Arc::from(glyphs), width: text.len() as f32 })
+        }
+        fn ascent(&self, _: f32) -> f32 { 1.0 }
+        fn line_height(&self, _: f32) -> f32 { 1.0 }
+    }
+
+    fn dense_rows(rows: usize) -> RenderSession {
+        let source = alloc::format!("<!doctype html><style>html,body{{margin:0}}div{{width:1px;font:1px/1px sans-serif}}</style><body><div>{}</div>", "w ".repeat(rows));
+        RenderSession::new(crate::html::parse(&source, 64).unwrap())
+    }
+
+    #[test]
+    fn a_window_too_dense_for_the_command_limit_is_halved_and_a_new_document_starts_again() {
+        let mut session = dense_rows(18_000);
+        session.display_list(100, 3400, &Mono).unwrap();
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0));
+        assert!(session.cached.as_ref().unwrap().geometry.root_scroll_region.is_some());
+        session.set_document_base_url(Some("https://example.test/next".into()));
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS));
+    }
+
+    #[test]
+    fn the_full_window_is_tried_again_when_the_document_changes() {
+        let mut session = dense_rows(18_000);
+        session.display_list(100, 3400, &Mono).unwrap();
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0));
+        assert!(session.window_reduced.is_some());
+        let rows = crate::selector::query_selector(session.document(), session.document().root(), "div").unwrap().unwrap();
+        session.document_mut().set_attribute(rows, "style", "width:2px").unwrap();
+        session.display_list(100, 3400, &Mono).unwrap();
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0), "still too dense");
+        assert_eq!(session.window_reduced.map(|(_, gap)| gap), Some(2), "so the next attempt waits longer");
+        session.document_mut().set_attribute(rows, "style", "display:none").unwrap();
+        session.display_list(100, 3400, &Mono).unwrap();
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS / 2.0), "the retry is not due yet");
+        session.document_mut().set_attribute(rows, "style", "display:none;width:1px").unwrap();
+        session.display_list(100, 3400, &Mono).unwrap();
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS));
+        assert_eq!(session.window_reduced, None);
+    }
+
+    #[test]
+    fn a_viewport_too_dense_for_the_command_limit_keeps_the_window() {
+        let mut session = dense_rows(18_000);
+        assert!(matches!(session.display_list(100, 17_000, &Mono), Err(LayoutError::CommandLimit)));
+        assert_eq!(session.scroll_window, Some(layout::ROOT_SCROLL_WINDOW_SCREENS), "the window was not the cause");
+    }
+
+    #[test]
+    fn sticky_boxes_in_scaled_or_translated_ancestors_scroll_like_a_direct_layout() {
+        let page = |transform: &str| alloc::format!("<!doctype html><style>html,body{{margin:0}}div{{box-sizing:border-box}}\
+            #t{{transform:{transform};transform-origin:0 0;width:100px}}\
+            #st{{position:sticky;top:10px;height:20px;background:green}}</style>\
+            <div style='height:30px'></div><div id=t><div id=pad style='height:20px'></div><div id=st></div><div style='height:400px;background:silver'></div></div>");
+        let steps = [(None, 20.0), (None, 60.0), (None, 130.0), (None, 40.0), (None, 0.0)];
+        let scaled = page("scale(1.5)");
+        root_scroll_replay_matches_fresh_layout(&scaled, &["t", "st"], &steps);
+        let rotated = page("rotate(10deg)");
+        root_scroll_replay_matches_fresh_layout(&rotated, &["t", "st"], &steps);
+        let moved = page("translate(10px, 5px)");
+        assert!(root_scroll_replay_matches_fresh_layout(&moved, &["t", "st"], &steps) >= 3, "a translation still scrolls by translation");
+    }
+
+    #[test]
+    fn a_content_layer_filling_the_viewport_moves_with_its_content() {
+        let source = "<!doctype html><style>html,body{margin:0}div{width:20px;font:10px/10px sans-serif}\
+            div::first-line{opacity:.5}</style><div>w w w w w w w w</div><div style='height:100px'></div>";
+        let layers = |list: &DisplayList| list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::PushLayer { rect, clip: false, .. } => Some(*rect),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        session.display_list(15, 10, &Mono).unwrap();
+        let root = root_node(&session);
+        let layouts = session.layout_count();
+        session.set_scroll_offset(root, 0.0, 6.0).unwrap();
+        let moved = layers(session.display_list(15, 10, &Mono).unwrap());
+        assert_eq!(session.layout_count(), layouts, "the frame was moved");
+        let mut direct = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        direct.set_root_scroll_window(false);
+        direct.display_list(15, 10, &Mono).unwrap();
+        let root = root_node(&direct);
+        direct.set_scroll_offset(root, 0.0, 6.0).unwrap();
+        let expected = layers(direct.display_list(15, 10, &Mono).unwrap());
+        assert_eq!(expected.len(), 1);
+        assert_eq!(moved, expected);
+    }
+
+    #[test]
+    fn a_content_layer_that_comes_to_fill_the_viewport_keeps_moving() {
+        let source = "<!doctype html><style>html,body{margin:0}div{width:20px;font:10px/10px sans-serif}\
+            div::first-line{opacity:.5}</style><div style='height:30px'></div><div>w w w w w w w w</div><div style='height:100px'></div>";
+        let layers = |list: &DisplayList| list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::PushLayer { rect, clip: false, .. } => Some(*rect),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        session.display_list(15, 10, &Mono).unwrap();
+        let mut direct = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        direct.set_root_scroll_window(false);
+        direct.display_list(15, 10, &Mono).unwrap();
+        let mut filled = false;
+        for y in [30.0, 35.0, 30.0, 12.0, 30.0, 31.0] {
+            let layouts = session.layout_count();
+            let root = root_node(&session);
+            session.set_scroll_offset(root, 0.0, y).unwrap();
+            let moved = layers(session.display_list(15, 10, &Mono).unwrap());
+            assert_eq!(session.layout_count(), layouts, "the frame was moved at {y}");
+            let root = root_node(&direct);
+            direct.set_scroll_offset(root, 0.0, y).unwrap();
+            let expected = layers(direct.display_list(15, 10, &Mono).unwrap());
+            filled |= expected.iter().any(|rect| *rect == Rect { x: 0.0, y: 0.0, width: 15.0, height: 10.0 });
+            assert_eq!(moved, expected, "layers at {y}");
+        }
+        assert!(filled, "a content layer coincides with the viewport");
+    }
+
+    const FAR_ELEMENT_PAGE: &str = "<!doctype html><style>html,body{margin:0}</style>\
+        <div style='height:4000px;background:silver'></div><div id=far style='height:30px;background:red'></div>\
+        <div style='height:1000px;background:gray'></div>";
+
+    #[test]
+    fn elements_outside_the_window_have_their_geometry_after_scrolling() {
+        let steps = [(None, 20.0), (None, 100.0), (None, 500.0), (None, 3900.0), (None, 3950.0), (None, 0.0)];
+        assert!(root_scroll_replay_matches_fresh_layout(FAR_ELEMENT_PAGE, &["far"], &steps) >= 3);
+    }
+
+    #[test]
+    fn the_placed_offset_follows_the_scrolled_frame() {
+        let mut session = RenderSession::new(crate::html::parse(FAR_ELEMENT_PAGE, 64).unwrap());
+        session.display_list(200, 150, &NoText).unwrap();
+        let placed = |session: &RenderSession| session.cached.as_ref().unwrap().geometry.root_scroll_region.as_ref().map(|root| root.placed);
+        for y in [100.0, 450.0, 30.0] {
+            let root = root_node(&session);
+            session.set_scroll_offset(root, 0.0, y).unwrap();
+            session.display_list(200, 150, &NoText).unwrap();
+            assert_eq!(placed(&session), Some((0.0, y)));
+        }
+    }
+
+    #[test]
+    fn a_layer_the_size_of_the_viewport_moves_with_its_element() {
+        let source = "<!doctype html><style>html,body{margin:0}div{box-sizing:border-box}\
+            #full{width:200px;height:150px;opacity:.5;background:teal}\
+            #line{height:30px;font:10px sans-serif}#line span{opacity:.5;background:red}</style>\
+            <div id=full></div><div id=line><span id=span>word</span></div><div style='height:300px;background:gray'></div>";
+        let steps = [(None, 20.0), (None, 90.0), (None, 150.0), (None, 10.0)];
+        assert!(root_scroll_replay_matches_fresh_layout(source, &["full", "line", "span"], &steps) >= 3);
+    }
+
     #[test]
     fn root_scroll_extent_includes_visible_and_absolute_overflow_but_not_clipped_or_fixed() {
         let document = crate::html::parse(
@@ -7305,6 +7836,68 @@ mod tests {
             crate::paint::Command::FillBackground(fill) => Some(fill.image_rect.width),
             _ => None,
         }).collect()
+    }
+
+    fn scrolled_session(source: &str, images: &Sources, height: u32, offset: f32, shaper: &dyn TextShaper) -> RenderSession {
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        session.display_list_with_images(200, height, shaper, images).unwrap();
+        let root = root_node(&session);
+        session.set_scroll_offset(root, 0.0, offset).unwrap();
+        session
+    }
+
+    #[test]
+    fn a_background_arriving_after_the_document_scrolled_is_painted_where_it_moved() {
+        let source = "<body style='margin:0;font:10px/10px sans-serif'><div style='width:36px'>\
+            <span style='background:url(back.png)'>w w w w w w w w</span></div>\
+            <div id=plain style='margin-top:20px;width:40px;height:20px;background-image:url(back.png)'></div>\
+            <div style='height:300px'></div>";
+        let images = Sources::new();
+        let mut session = scrolled_session(source, &images, 60, 0.0, &Mono);
+        for offset in [4.0, 9.0] {
+            let root = root_node(&session);
+            let layouts = session.layout_count();
+            session.set_scroll_offset(root, 0.0, offset).unwrap();
+            session.display_list_with_images(200, 60, &Mono, &images).unwrap();
+            assert_eq!(session.layout_count(), layouts, "the frame was moved");
+        }
+        let deferred = session.cached.as_ref().unwrap().geometry.deferred_images.len();
+        assert!(deferred >= 2, "{deferred} deferred images");
+        assert!(session.cached.as_ref().unwrap().geometry.deferred_commands.is_some(), "the commands of the deferred backgrounds are kept");
+        images.arrive("back.png");
+        let patched = session.display_list_with_images(200, 60, &Mono, &images).unwrap().clone();
+        assert_eq!(session.image_patch_count(), 1);
+        assert!(session.cached.as_ref().unwrap().geometry.deferred_images.is_empty());
+
+        let mut fresh = scrolled_session(source, &images, 60, 9.0, &Mono);
+        let expected = fresh.display_list_with_images(200, 60, &Mono, &images).unwrap().clone();
+        let tiles = |list: &DisplayList| list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::FillBackground(fill) if matches!(fill.image, crate::paint::BackgroundPaint::Image(_)) => Some((fill.rect, fill.image_rect)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tiles(&patched).len(), tiles(&expected).len());
+        assert!(!tiles(&expected).is_empty());
+        assert_eq!(tiles(&patched), tiles(&expected), "the patched backgrounds paint where a fresh layout puts them");
+    }
+
+    #[test]
+    fn an_image_first_used_after_the_layout_is_painted_when_it_arrives() {
+        let images = Sources::new();
+        let source = "<body style='margin:0'><div id=host style='height:30px'></div><div style='height:300px'></div>";
+        let mut session = RenderSession::new(crate::html::parse(source, 64).unwrap());
+        session.display_list_with_images(200, 60, &NoText, &images).unwrap();
+        assert!(!session.images_pending());
+        let host = crate::selector::get_element_by_id(session.document(), session.document().root(), "host").unwrap().unwrap();
+        session.document_mut().set_attribute(host, "style", "height:30px;background-image:url(late.png)").unwrap();
+        session.display_list_with_images(200, 60, &NoText, &images).unwrap();
+        assert!(session.images_pending(), "the new background is loading");
+        images.arrive("late.png");
+        let list = session.display_list_with_images(200, 60, &NoText, &images).unwrap().clone();
+        assert!(!session.images_pending());
+        assert_eq!(background_tiles(&list), [7.0], "the arrived background replaces its placeholder");
+        images.arrive("unrelated.png");
+        session.display_list_with_images(200, 60, &NoText, &images).unwrap();
+        assert_eq!(background_tiles(&session.display_list_with_images(200, 60, &NoText, &images).unwrap().clone()), [7.0]);
     }
 
     #[test]

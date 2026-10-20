@@ -1228,6 +1228,10 @@ fn parse_svg_stop_offset(input: &str) -> Option<f32> {
 }
 
 const MAX_DISPLAY_COMMANDS: usize = 16 * 1024;
+/// Screens of content emitted beyond the viewport, on each side, across the
+/// document's block axis when its root scroll moves the retained frame. The
+/// session halves it for documents too dense to emit that much.
+pub(crate) const ROOT_SCROLL_WINDOW_SCREENS: f32 = 4.0;
 // Chromium's LayoutUnit granularity: absolute f32 coordinates must not push an exactly fitting word onto the next line.
 const INLINE_FIT_TOLERANCE: f64 = 1.0 / 64.0;
 const MAX_DISPLAY_LIST_BYTES: usize = 16 * 1024 * 1024;
@@ -3259,6 +3263,21 @@ struct Layout<'a> {
     /// Bumped by content whose position does not follow its scroll container
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
+    /// Viewport-fixed and viewport-sticky boxes recorded as scroll anchors
+    /// (`ScrollRegion::anchor`) for scrolling the document by translation.
+    root_anchors: usize,
+    /// Bumped by content that keeps the document from scrolling by translation.
+    root_scroll_hazards: usize,
+    /// Viewport-sticky boxes being laid out, with their `box_for` depth and
+    /// used origin, until `box_for` records them as anchors.
+    sticky_anchors: Vec<(usize, StickyAnchor, (f32, f32))>,
+    /// Nesting of `box_for` calls; a generated box shares its element's id.
+    box_depth: usize,
+    /// Root scroll offset the document is laid out away from, for the window
+    /// around it: a viewport-sticky box is placed against the viewport there.
+    cull_scroll: (f32, f32),
+    /// Enclosing transforms which only translate (a subset of `transform_depth`).
+    translate_transform_depth: usize,
     containing_block: Option<Rect>,
     containing_block_node: Option<NodeId>,
     fixed_containing_block: Option<Rect>,
@@ -3503,6 +3522,12 @@ impl<'a> Layout<'a> {
         scrolls,
         cull: viewport,
         scroll_hazards: 0,
+        root_anchors: 0,
+        root_scroll_hazards: 0,
+        sticky_anchors: Vec::new(),
+        box_depth: 0,
+        cull_scroll: (0.0, 0.0),
+        translate_transform_depth: 0,
         containing_block: None,
         containing_block_node: None,
         fixed_containing_block: None,
@@ -9466,10 +9491,19 @@ pub(crate) struct LayoutGeometry {
     pub scroll_ports: Vec<ScrollPort>,
     pub viewport_fixed_nodes: Vec<NodeId>,
     pub scroll_regions: Vec<ScrollRegion>,
+    pub root_scroll_region: Option<RootScrollRegion>,
+    /// Laid out as if not scrolled and then moved to the root scroll offset.
+    pub laid_out_at_origin: bool,
+    /// The document could not be laid out at the origin and moved: it was
+    /// laid out at its scroll offset.
+    pub origin_layout_refused: bool,
     pub control_text_runs: Vec<ControlTextRun>,
     /// Paint-only images which were still loading when this was laid out; see
     /// [`DeferredImage`].
     pub deferred_images: Vec<DeferredImage>,
+    /// `(deferred image, command)` of the deferred backgrounds, found when a
+    /// frame is first scrolled and kept until a deferred image is retired.
+    pub(crate) deferred_commands: Option<Vec<(usize, usize)>>,
 }
 
 /// An image that was still loading when a box whose geometry cannot depend on
@@ -9747,6 +9781,23 @@ pub struct ControlTextRun {
     pub(crate) orientation: Affine,
 }
 
+/// A planned [`LayoutGeometry::scroll_root`]: the region, the translation of
+/// the document, and for each anchor its region index, translation relative to
+/// the document's and its new sticky shift.
+struct RootMove {
+    root: RootScrollRegion,
+    delta: (f32, f32),
+    plan: Vec<(usize, (f32, f32), Option<(f32, f32)>)>,
+}
+
+/// The index ranges [`LayoutGeometry::translate_scope`] moves.
+struct TranslatedScope {
+    commands: core::ops::Range<usize>,
+    hits: core::ops::Range<usize>,
+    transforms: core::ops::Range<usize>,
+    clips: core::ops::Range<usize>,
+}
+
 /// Index ranges of one scroll container's scrolled content, recorded when the
 /// content can be moved by translation alone.
 #[derive(Clone)]
@@ -9760,6 +9811,81 @@ pub(crate) struct ScrollRegion {
     pub base: (f32, f32),
     /// Largest distance from `base` whose content was laid out.
     pub window: (f32, f32),
+    /// Set when this records a box anchored to the viewport instead of a
+    /// scroller's content: it does not move with the document by translation
+    /// alone (see [`LayoutGeometry::scroll_root`]).
+    pub anchor: Option<ScrollAnchor>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScrollAnchor {
+    /// `position: fixed` against the viewport: it stays where it is.
+    Fixed,
+    /// `position: sticky` against the viewport: placed again from its static
+    /// position.
+    Sticky(StickyAnchor),
+}
+
+/// What placing a viewport-sticky box needs, in a form that stays valid when
+/// the box is moved: its static position is derived from its own hit rect.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StickyAnchor {
+    pseudo: Option<css::PseudoElement>,
+    /// `top`, `right`, `bottom`, `left`.
+    insets: [Option<f32>; 4],
+    size: (f32, f32),
+    containing: Rect,
+    /// Used minus static origin.
+    shift: (f32, f32),
+    /// The box's own hit origin minus its used origin.
+    hit_offset: (f32, f32),
+}
+
+/// The sticky position of a box at `origin` (its static position) against
+/// `containing`, the scrollport it sticks to.
+fn sticky_origin(mut origin: (f32, f32), insets: [Option<f32>; 4], size: (f32, f32), containing: Rect) -> (f32, f32) {
+    let [top, right, bottom, left] = insets;
+    if let Some(top) = top {
+        origin.1 = origin.1.max(containing.y + top);
+    }
+    if let Some(bottom) = bottom {
+        origin.1 = origin.1.min(containing.y + containing.height - bottom - size.1);
+    }
+    if let Some(left) = left {
+        origin.0 = origin.0.max(containing.x + left);
+    }
+    if let Some(right) = right {
+        origin.0 = origin.0.min(containing.x + containing.width - right - size.0);
+    }
+    origin
+}
+
+/// Radius of the unclipped opacity/filter layers that span the viewport
+/// instead of their content. A negative zero draws like zero (an unclipped
+/// layer has no corners) and survives copying and reordering commands, so
+/// scrolling the document keeps these layers over the viewport.
+const VIEWPORT_LAYER_RADIUS: f32 = -0.0;
+
+fn is_viewport_layer_radius(radius: f32) -> bool {
+    radius.is_sign_negative()
+}
+
+/// The document's laid-out content, recorded when scrolling it can move the
+/// commands instead of laying the page out again.
+#[derive(Clone)]
+pub(crate) struct RootScrollRegion {
+    pub commands: core::ops::Range<usize>,
+    pub hits: core::ops::Range<usize>,
+    /// Root scroll offset the content was laid out at.
+    pub base: (f32, f32),
+    /// Root scroll offset the commands are placed at now: scrolling moves
+    /// them by the distance from here, whatever offset the caller left.
+    pub placed: (f32, f32),
+    /// Largest distance from `base` whose content was laid out.
+    pub window: (f32, f32),
+    /// Anchor regions recorded by the layout. Fewer remain when a later step
+    /// could not keep one of them contiguous; the document then relays out.
+    pub anchors: usize,
 }
 
 #[derive(Clone)]
@@ -9841,7 +9967,7 @@ impl LayoutGeometry {
         from: (f32, f32),
         to: (f32, f32),
     ) -> bool {
-        let Some(region) = self.scroll_regions.iter().find(|r| r.node == node) else {
+        let Some(region) = self.scroll_regions.iter().find(|r| r.node == node && r.anchor.is_none()) else {
             return false;
         };
         if (to.0 - region.base.0).abs() > region.window.0
@@ -9866,12 +9992,217 @@ impl LayoutGeometry {
         }) {
             return false;
         }
-        let (dx, dy) = (from.0 - to.0, from.1 - to.1);
-        for command in &mut list[commands] {
-            if !matches!(command, Command::PushLayer { clip: false, .. }) {
-                move_command(command, dx, dy);
+        let Some(deferred) = self.deferred_background_commands(list) else {
+            return false;
+        };
+        let scope = TranslatedScope { commands, hits, transforms, clips };
+        self.translate_scope(list, &scope, (from.0 - to.0, from.1 - to.1), |_| true, &deferred);
+        true
+    }
+
+    /// Scrolls the document to root scroll offset `to` by moving
+    /// its laid-out content, like a scroller's in [`scroll_region`](Self::scroll_region):
+    /// viewport-fixed boxes stay where they are and viewport-sticky boxes are
+    /// placed again from their moved static position. False, with nothing
+    /// changed, when `to` lies outside the laid-out window or the frame's
+    /// anchors could not be kept; the caller then relays out.
+    pub(crate) fn scroll_root(&mut self, list: &mut [Command], to: (f32, f32)) -> bool {
+        self.move_root(list, to, true)
+    }
+
+    /// Moves a document laid out at the origin to root scroll offset `to`,
+    /// which then becomes the base of its window.
+    fn place_root_scroll(&mut self, list: &mut [Command], to: (f32, f32)) -> bool {
+        if !self.move_root(list, to, false) {
+            return false;
+        }
+        if let Some(root) = self.root_scroll_region.as_mut() {
+            root.base = to;
+        }
+        true
+    }
+
+    /// Whether the document can be moved by scrolling it, as it was laid out.
+    pub(crate) fn root_movable(&self, list_len: usize) -> bool {
+        self.root_scroll_region.as_ref().is_some_and(|root| self.plan_root_move(list_len, root.placed, false).is_some())
+    }
+
+    /// Works out how [`move_root`](Self::move_root) moves each anchor, or
+    /// `None` when the frame cannot be moved. Changes nothing.
+    fn plan_root_move(&self, list_len: usize, to: (f32, f32), in_window: bool) -> Option<RootMove> {
+        let root = self.root_scroll_region.clone()?;
+        let from = root.placed;
+        if (in_window && ((to.0 - root.base.0).abs() > root.window.0 || (to.1 - root.base.1).abs() > root.window.1))
+            || root.commands.end > list_len
+            || root.hits.end > self.hits.len()
+        {
+            return None;
+        }
+        let mut anchors: Vec<usize> = (0..self.scroll_regions.len())
+            .filter(|&index| self.scroll_regions[index].anchor.is_some())
+            .collect();
+        if anchors.len() != root.anchors {
+            return None;
+        }
+        anchors.sort_by_key(|&index| {
+            let region = &self.scroll_regions[index];
+            (region.hits.start, Reverse(region.hits.end))
+        });
+        let within = |outer: &core::ops::Range<usize>, inner: &core::ops::Range<usize>| {
+            inner.is_empty() || (outer.start <= inner.start && inner.end <= outer.end)
+        };
+        let delta = (from.0 - to.0, from.1 - to.1);
+        // Plan every move before changing anything: an anchor's translation
+        // is relative to the one its enclosing scope already received.
+        let mut plan: Vec<(usize, (f32, f32), Option<(f32, f32)>)> = Vec::with_capacity(anchors.len());
+        let mut open: Vec<(core::ops::Range<usize>, core::ops::Range<usize>, (f32, f32))> = Vec::new();
+        for &index in &anchors {
+            let region = &self.scroll_regions[index];
+            if region.commands.end > list_len
+                || region.hits.end > self.hits.len()
+                || region.transforms.end > self.transforms.len()
+                || region.clips.end > self.rounded_clips.len()
+            {
+                return None;
+            }
+            while open.last().is_some_and(|scope| scope.0.end <= region.hits.start) {
+                open.pop();
+            }
+            let (outer_hits, outer_commands, enclosing) = open
+                .last()
+                .cloned()
+                .unwrap_or((root.hits.clone(), root.commands.clone(), delta));
+            if region.hits.is_empty() || !within(&outer_hits, &region.hits) || !within(&outer_commands, &region.commands) {
+                return None;
+            }
+            let (moved, shift) = match region.anchor {
+                Some(ScrollAnchor::Fixed) => ((0.0, 0.0), None),
+                Some(ScrollAnchor::Sticky(sticky)) => {
+                    let Some(hit) = self.hits[region.hits.clone()]
+                        .iter()
+                        .find(|hit| hit.node == region.node && hit.pseudo == sticky.pseudo)
+                    else {
+                        return None;
+                    };
+                    // The hit has not moved yet; its enclosing scope moves it by `enclosing`.
+                    let used = (
+                        hit.rect.x - sticky.hit_offset.0,
+                        hit.rect.y - sticky.hit_offset.1,
+                    );
+                    let static_origin = (
+                        used.0 - sticky.shift.0 + enclosing.0,
+                        used.1 - sticky.shift.1 + enclosing.1,
+                    );
+                    let placed = sticky_origin(static_origin, sticky.insets, sticky.size, sticky.containing);
+                    (
+                        (placed.0 - used.0, placed.1 - used.1),
+                        Some((placed.0 - static_origin.0, placed.1 - static_origin.1)),
+                    )
+                }
+                None => return None,
+            };
+            plan.push((index, (moved.0 - enclosing.0, moved.1 - enclosing.1), shift));
+            open.push((region.hits.clone(), region.commands.clone(), moved));
+        }
+        Some(RootMove { root, delta, plan })
+    }
+
+    fn move_root(&mut self, list: &mut [Command], to: (f32, f32), in_window: bool) -> bool {
+        let Some(RootMove { root, delta, plan }) = self.plan_root_move(list.len(), to, in_window) else {
+            return false;
+        };
+        let Some(deferred) = self.deferred_background_commands(list) else {
+            return false;
+        };
+        let keeps = is_viewport_layer_radius;
+        let scope = TranslatedScope {
+            commands: root.commands.clone(),
+            hits: root.hits.clone(),
+            transforms: 0..self.transforms.len(),
+            clips: 0..self.rounded_clips.len(),
+        };
+        self.translate_scope(list, &scope, delta, keeps, &deferred);
+        for (index, relative, shift) in plan {
+            let region = &self.scroll_regions[index];
+            let scope = TranslatedScope {
+                commands: region.commands.clone(),
+                hits: region.hits.clone(),
+                transforms: region.transforms.clone(),
+                clips: region.clips.clone(),
+            };
+            self.translate_scope(list, &scope, relative, keeps, &deferred);
+            if let (Some(ScrollAnchor::Sticky(sticky)), Some(shift)) = (self.scroll_regions[index].anchor.as_mut(), shift) {
+                sticky.shift = shift;
             }
         }
+        if let Some(root) = self.root_scroll_region.as_mut() {
+            root.placed = to;
+        }
+        true
+    }
+
+    /// Indices of the deferred background images and of the commands that
+    /// paint their placeholders: their rects move with those commands. `None`
+    /// when a placeholder's command cannot be found, which the frame cannot be
+    /// moved without.
+    fn deferred_background_commands(&mut self, list: &[Command]) -> Option<Vec<(usize, usize)>> {
+        if self.deferred_commands.is_none() {
+            let mut found = Vec::new();
+            for (index, deferred) in self.deferred_images.iter().enumerate() {
+                if !matches!(deferred.paint, DeferredPaint::Background(_)) {
+                    continue;
+                }
+                found.push((index, deferred_image_command(list, deferred)?));
+            }
+            self.deferred_commands = Some(found);
+        }
+        self.deferred_commands.clone()
+    }
+
+    /// Drops `arrived` deferred images, once they are painted into the frame.
+    pub(crate) fn retire_deferred_images(&mut self, arrived: &[PendingLookup]) {
+        self.deferred_images.retain(|record| !arrived.contains(&record.lookup));
+        self.deferred_commands = None;
+    }
+
+    /// Moves one scope of laid-out content and its geometry by `dx, dy`.
+    /// `keeps_layer` tells, from the radius of an unclipped layer, which
+    /// layers keep their bounds.
+    fn translate_scope(
+        &mut self,
+        list: &mut [Command],
+        scope: &TranslatedScope,
+        (dx, dy): (f32, f32),
+        keeps_layer: impl Fn(f32) -> bool,
+        deferred: &[(usize, usize)],
+    ) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        for command in &mut list[scope.commands.clone()] {
+            if let Command::PushLayer { clip: false, radius, .. } = command {
+                if keeps_layer(*radius) {
+                    continue;
+                }
+            }
+            move_command(command, dx, dy);
+        }
+        for &(index, command) in deferred {
+            if !scope.commands.contains(&command) {
+                continue;
+            }
+            if let DeferredPaint::Background(background) = &mut self.deferred_images[index].paint {
+                let surface = background.sizing.as_mut().and_then(|(_, _, surface)| surface.as_mut());
+                for rect in [Some(&mut background.rect), background.coverage.as_mut(), background.local_padding_area.as_mut(), surface]
+                    .into_iter()
+                    .flatten()
+                {
+                    rect.x += dx;
+                    rect.y += dy;
+                }
+            }
+        }
+        let hits = scope.hits.clone();
         for hit in &mut self.hits[hits.clone()] {
             hit.rect.x += dx;
             hit.rect.y += dy;
@@ -9879,10 +10210,10 @@ impl LayoutGeometry {
         self.move_transform_reference_boxes(&hits,dx,dy);
         for entry in &mut self.hit_fragments {if hits.contains(&entry.hit){for rect in &mut entry.rects {rect.x+=dx;rect.y+=dy;}}}
         self.move_scrollports_for_hits(&hits, dx, dy);
-        for transform in &mut self.transforms[transforms] {
+        for transform in &mut self.transforms[scope.transforms.clone()] {
             transform.matrix = transform.matrix.translated_space(dx, dy);
         }
-        for clip in &mut self.rounded_clips[clips] {
+        for clip in &mut self.rounded_clips[scope.clips.clone()] {
             clip.rect.x += dx;
             clip.rect.y += dy;
             if let Some(matrix)=clip.source_transform.as_mut(){let moved=(**matrix).translated_space(dx,dy);*Arc::make_mut(matrix)=moved;}
@@ -9896,7 +10227,6 @@ impl LayoutGeometry {
             }
         }
         self.refresh_control_run_transforms(hits);
-        true
     }
 
     fn move_hits(&mut self, range: core::ops::Range<usize>, x: f32, y: f32) {
@@ -30432,6 +30762,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         if !logical.is_empty(){return Err(LayoutError::InvalidTree);}
         if !changed&&self.geometry.is_none(){return Ok(());}
+        // Reconstructed command ranges of the document and its anchors, or
+        // `None` once one no longer moves as a unit.
+        let mut moved:Option<Vec<Option<Range<usize>>>>=None;
         if changed {
         let mut rendered=Vec::new();let mut desired=Vec::new();
         rendered.try_reserve(512).map_err(|_|LayoutError::CommandLimit)?;desired.try_reserve(512).map_err(|_|LayoutError::CommandLimit)?;
@@ -30468,12 +30801,32 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let mut output=Vec::new();output.try_reserve_exact(actions.len()).map_err(|_|LayoutError::CommandLimit)?;
         let mut indices = Vec::new(); indices.try_reserve_exact(self.commands.len()).map_err(|_|LayoutError::CommandLimit)?;
         indices.resize(self.commands.len(),usize::MAX);
+        let tracked=self.geometry.as_ref().is_some_and(|geometry|geometry.root_scroll_region.is_some());
+        // The original command each output command comes from; `usize::MAX`
+        // for a pop, which carries no geometry.
+        let mut sources=Vec::new();
+        if tracked {sources.try_reserve_exact(actions.len()).map_err(|_|LayoutError::CommandLimit)?;}
         for action in actions{
             match action{
-                PositionedClipAction::Original(index)=>{indices[index]=output.len();output.push(core::mem::replace(&mut self.commands[index],Command::PopClip));},
-                PositionedClipAction::Push(scope)=>output.push(self.commands[scope].clone()),
-                PositionedClipAction::Pop(scope)=>{let _=close_indices.get(&scope).ok_or(LayoutError::InvalidTree)?;output.push(paint_scope_pop(&self.commands[scope])?);}
+                PositionedClipAction::Original(index)=>{indices[index]=output.len();output.push(core::mem::replace(&mut self.commands[index],Command::PopClip));if tracked{sources.push(index);}},
+                PositionedClipAction::Push(scope)=>{output.push(self.commands[scope].clone());if tracked{sources.push(scope);}},
+                PositionedClipAction::Pop(scope)=>{let _=close_indices.get(&scope).ok_or(LayoutError::InvalidTree)?;output.push(paint_scope_pop(&self.commands[scope])?);if tracked{sources.push(usize::MAX);}}
             }
+        }
+        if let Some(geometry)=self.geometry.as_ref().filter(|_|tracked) {
+            // A moving range takes along the copies of its own scopes, so its
+            // new span holds only commands from it and pops.
+            let span=|range:&Range<usize>|->Option<Range<usize>>{
+                let inside=|source:usize|range.contains(&source);
+                let first=sources.iter().position(|&source|inside(source))?;
+                let last=sources.iter().rposition(|&source|inside(source))?;
+                sources[first..=last].iter().all(|&source|source==usize::MAX||inside(source)).then_some(first..last+1)
+            };
+            let mut spans=Vec::new();spans.try_reserve_exact(geometry.scroll_regions.len()+1).map_err(|_|LayoutError::CommandLimit)?;
+            for region in geometry.scroll_regions.iter().map(|region|&region.commands).chain(geometry.root_scroll_region.as_ref().map(|region|&region.commands)) {
+                spans.push(if region.is_empty(){Some(0..0)}else{span(region)});
+            }
+            moved=Some(spans);
         }
         // Original leaf encounter order is stable through scope reconstruction;
         // range boundaries therefore use the next retained original command.
@@ -30499,7 +30852,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         for index in (1..base).rev(){maximums[index]=maximums[index*2].max(maximums[index*2+1]);}
         if let Some(geometry)=self.geometry.as_mut(){
             let mut clips=Vec::new();let mut hit_changed=false;
+            let mut clip_starts=Vec::new();clip_starts.try_reserve_exact(geometry.rounded_clips.len()+1).map_err(|_|LayoutError::CommandLimit)?;
             for clip in &geometry.rounded_clips{
+                clip_starts.push(clips.len());
                 if clip.hits.is_empty(){if clips.len()>=MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}clips.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;clips.push(clip.clone());continue;}
                 let mut removed=Vec::new();
                 if let Some(owner)=clip.owner{
@@ -30527,11 +30882,30 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 }
                 if cursor<clip.hits.end{if clips.len()>=MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}clips.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;let mut value=clip.clone();value.hits=cursor..clip.hits.end;clips.push(value);}
             }
+            clip_starts.push(clips.len());
             geometry.rounded_clips=clips;
             // The command scopes now have holes owned by other containing
             // blocks. Translation replay cannot represent this split source;
             // shared scrolling relayout supplies fresh exact geometry.
-            if changed||hit_changed{geometry.scroll_regions.clear();}
+            // The document still moves as a whole, and so does an anchor
+            // unless reopened clips of its ancestors now lie inside it.
+            if changed||hit_changed{
+                let mut movable=true;
+                if let Some(spans)=moved.as_ref() {
+                    for (region,span) in geometry.scroll_regions.iter_mut().zip(spans) {
+                        match span {Some(span) if !span.is_empty()=>region.commands=span.clone(),Some(_)=>{},None=>movable=false}
+                    }
+                    match (geometry.root_scroll_region.as_mut(),spans.get(geometry.scroll_regions.len())) {
+                        (Some(root),Some(Some(span))) if !span.is_empty()=>root.commands=span.clone(),
+                        (Some(_),Some(None))=>movable=false,_=>{}
+                    }
+                }
+                geometry.scroll_regions.retain(|region|region.anchor.is_some());
+                for region in &mut geometry.scroll_regions {
+                    region.clips=*clip_starts.get(region.clips.start).ok_or(LayoutError::InvalidTree)?..*clip_starts.get(region.clips.end).ok_or(LayoutError::InvalidTree)?;
+                }
+                if !movable {geometry.root_scroll_region=None;}
+            }
         }
         Ok(())
     }
@@ -30564,6 +30938,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 if let Some(index) = run.command_index.as_mut() { *index = *indices.get(*index).ok_or(LayoutError::InvalidTree)?; }
             }
             for region in &mut geometry.scroll_regions { range(&mut region.commands)?; }
+            if let Some(region) = geometry.root_scroll_region.as_mut() { range(&mut region.commands)?; }
         }
         Ok(())
     }
@@ -31918,6 +32293,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         if has_layer_attachment(&style, css::BackgroundAttachment::Fixed) {
             self.scroll_hazards += 1;
+            self.root_scroll_hazards += 1;
         }
         if matches!(
             style.display,
@@ -32191,7 +32567,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 filters: style.filters.clone(),
                 corners: None,
                 rect: self.viewport_rect(),
-                radius: 0.0,
+                radius: VIEWPORT_LAYER_RADIUS,
                 opacity: style.opacity,
                 clip: false,
             })?;
@@ -32837,7 +33213,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         for entry in mine { commands.push(entry.2..entry.3);hits.push(entry.4..entry.5); }
         let mut command_map=PaintPermutation::new(self.commands.len(),at.0,&commands)?;
         let mut hit_map=PaintPermutation::new(self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len()),at.1,&hits)?;
-        command_map.track_scope_copies=self.flow_paint_owners.is_some();
+        // Scope carriers reopened between pieces of a fixed or sticky anchor
+        // belong to that anchor and move with it.
+        command_map.track_scope_copies=self.flow_paint_owners.is_some()
+            || self.geometry.as_ref().is_some_and(|geometry|geometry.scroll_regions.iter().any(|region|region.anchor.is_some()));
         if adoptions.is_empty(){command_map.scoped_commands(&mut self.commands,&mut self.overflow_clip_commands)?;}
         else{command_map.scoped_commands_with_adoptions(&mut self.commands,&mut self.overflow_clip_commands,adoptions)?;}
         self.command_bytes=self.commands.iter().try_fold(0usize,|bytes,command|
@@ -32913,6 +33292,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 // A scroll replay requires one contiguous payload. Escaped
                 // content uses normal relayout rather than translating an
                 // unrelated interval between disconnected pieces.
+                let commands=if value.anchor.is_some()&&commands.len()>1 {command_map.owned_parts(value.commands.clone())?.into_iter().try_fold(Vec::<Range<usize>>::new(),|mut parts,part|{
+                    parts.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;parts.push(part);Ok::<_,LayoutError>(parts)})
+                    .map(|mut parts|{parts.sort_unstable_by_key(|part|part.start);let mut merged:Vec<Range<usize>>=Vec::new();
+                        for part in parts {match merged.last_mut() {
+                            // Pops carry no geometry: closing a scope between two pieces leaves the anchor movable.
+                            Some(last) if self.commands.get(last.end..part.start).is_some_and(|gap|gap.iter().all(|command|matches!(command,Command::PopClip|Command::PopLayer|Command::PopTransform)))=>last.end=part.end,
+                            _=>merged.push(part)}}merged})?}else{commands};
                 if hits.len()!=1 || commands.len()!=1 {continue;}
                 let mut region=value.clone();region.hits=hits[0].clone();region.commands=commands[0].clone();
                 region.transforms=*transform_boundaries.get(value.transforms.start).ok_or(LayoutError::InvalidTree)?..*transform_boundaries.get(value.transforms.end).ok_or(LayoutError::InvalidTree)?;
@@ -33178,6 +33564,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             region.hits = rebase_range(region.hits, hit_base)?;
             region.transforms = rebase_range(region.transforms, transform_base)?;
             region.clips = rebase_range(region.clips, clip_base)?;
+            self.root_anchors += usize::from(region.anchor.is_some());
             geometry.scroll_regions.push(region);
         }
         for run in fragment.control_text_runs.iter() {
@@ -33913,6 +34300,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let stacking_before = key.as_ref().map(|_| self.stacking_roots.clone());
         let next_paint_before = self.next_paint_order;
         let hazards_before = self.scroll_hazards;
+        let root_hazards_before = self.root_scroll_hazards;
 
         let saved_float_start = self.float_start;
         let saved_float_offset = self.float_offset;
@@ -33931,7 +34319,21 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let saved_overflow_capture=self.overflow_capture;
         if computed.as_ref().is_some_and(|style|!matches!(style.display,Display::Inline|Display::Contents)) {self.overflow_capture=false;}
         let saved_initial_margin_origin=self.initial_margin_origin.take();
+        self.box_depth += 1;
+        let box_depth = self.box_depth;
+        // A box fixed to the viewport is laid out where the viewport is,
+        // however far the window around the scroll offset lies from it.
+        let (saved_cull, saved_cull_scroll) = (self.cull, self.cull_scroll);
+        if matches!(overflow_route, OverflowRoute::ViewportFixed) && self.cull != MEASUREMENT_CULL {
+            self.cull = self.viewport;
+            self.cull_scroll = (0.0, 0.0);
+        }
         let result = self.box_for_uncached(id, parent_style, computed, x, y, available, depth, child_override, output_rect);
+        self.cull = saved_cull;
+        self.cull_scroll = saved_cull_scroll;
+        self.box_depth -= 1;
+        let sticky = self.sticky_anchors.last().filter(|(at, _, _)| *at == box_depth).copied();
+        self.sticky_anchors.retain(|(at, _, _)| *at < box_depth);
         self.initial_margin_origin=saved_initial_margin_origin;
         self.overflow_capture=saved_overflow_capture;
         if let Some(saved) = inherited_decorations { self.decorations = saved; }
@@ -33968,6 +34370,16 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 .map_err(|_| LayoutError::CommandLimit)?;
             geometry.viewport_fixed_nodes.push(id);
         }
+        if let Some(starts) = geometry_start {
+            let anchor = if viewport_fixed_box {
+                Some((ScrollAnchor::Fixed, None))
+            } else {
+                sticky.map(|(_, anchor, used)| (ScrollAnchor::Sticky(anchor), Some(used)))
+            };
+            if let Some((anchor, used)) = anchor {
+                self.record_scroll_anchor(id, anchor, used, command_start, (starts.0, starts.2, starts.3))?;
+            }
+        }
         if let (Some(key), Some(starts)) = (key, geometry_start) {
             // Timeline-bearing fragments are sampled by the current source
             // operation. Retain unrelated fragments, without freezing rare
@@ -33975,6 +34387,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let stable = self.filter_source_uses==filter_source_uses_before && self.timeline_source_uses==timeline_source_uses_before && self.positioned_clip_policies.len()==clip_policies_before && self.floats.len() == floats_before
                 && self.next_paint_order == next_paint_before
                 && self.scroll_hazards == hazards_before
+                && self.root_scroll_hazards == root_hazards_before
                 && pending_before.as_ref() == Some(&self.pending_escapes)
                 && positioned_before.as_ref() == Some(&self.positioned_flow_paints)
                 && stacking_before.as_ref() == Some(&self.stacking_roots)
@@ -34028,6 +34441,48 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         minimum: bool, generated: Option<&VirtualGeneratedChild>) -> Result<(f32,f32),LayoutError> {
         if let Some(source) = generated { self.intrinsic_virtual_generated_size(source, style, minimum) }
         else { self.intrinsic_size_mode(id, style, depth, minimum) }
+    }
+
+    /// Records the box laid out from `command_start` and `starts` (hits,
+    /// transforms, clips) as a scroll anchor of the document.
+    fn record_scroll_anchor(
+        &mut self,
+        id: NodeId,
+        mut anchor: ScrollAnchor,
+        used: Option<(f32, f32)>,
+        command_start: usize,
+        starts: (usize, usize, usize),
+    ) -> Result<(), LayoutError> {
+        let commands = command_start..self.commands.len();
+        let Some(geometry) = self.geometry.as_deref_mut() else {
+            return Ok(());
+        };
+        if let (ScrollAnchor::Sticky(sticky), Some(used)) = (&mut anchor, used) {
+            let own = geometry.hits.get(starts.0..).and_then(|hits| {
+                hits.iter().find(|hit| hit.node == id && hit.pseudo == sticky.pseudo)
+            });
+            let Some(hit) = own else {
+                self.root_scroll_hazards += 1;
+                return Ok(());
+            };
+            sticky.hit_offset = (hit.rect.x - used.0, hit.rect.y - used.1);
+        }
+        if geometry.scroll_regions.len() >= MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        geometry.scroll_regions.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+        geometry.scroll_regions.push(ScrollRegion {
+            node: id,
+            commands,
+            hits: starts.0..geometry.hits.len(),
+            transforms: starts.1..geometry.transforms.len(),
+            clips: starts.2..geometry.rounded_clips.len(),
+            base: (0.0, 0.0),
+            window: (0.0, 0.0),
+            anchor: Some(anchor),
+        });
+        self.root_anchors += 1;
+        Ok(())
     }
 
     fn box_for_uncached(
@@ -34397,20 +34852,34 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     |height| Ok(content_height_dimension(style, height) + box_edges(style, false)),
                 )?;
                 if let Some(top) = style.top {
-                    overflow_origin.1=overflow_origin.1.max(local_containing.top+f64::from(top));origin.1 = origin.1.max(containing.y + top);
+                    overflow_origin.1=overflow_origin.1.max(local_containing.top+f64::from(top));
                 }
-                if let Some(bottom) = style.bottom {overflow_origin.1=overflow_origin.1.min(local_containing.bottom-f64::from(bottom)-f64::from(height));
-                    origin.1 = origin
-                        .1
-                        .min(containing.y + containing.height - bottom - height);
-                }
+                if let Some(bottom) = style.bottom {overflow_origin.1=overflow_origin.1.min(local_containing.bottom-f64::from(bottom)-f64::from(height));}
                 if let Some(left) = style.left {
-                    overflow_origin.0=overflow_origin.0.max(local_containing.left+f64::from(left));origin.0 = origin.0.max(containing.x + left);
+                    overflow_origin.0=overflow_origin.0.max(local_containing.left+f64::from(left));
                 }
-                if let Some(right) = style.right {overflow_origin.0=overflow_origin.0.min(local_containing.right-f64::from(right)-f64::from(width));
-                    origin.0 = origin
-                        .0
-                        .min(containing.x + containing.width - right - width);
+                if let Some(right) = style.right {overflow_origin.0=overflow_origin.0.min(local_containing.right-f64::from(right)-f64::from(width));}
+                let insets = [style.top, style.right, style.bottom, style.left];
+                let static_origin = origin;
+                // Laid out away from its root scroll offset, the viewport the
+                // box sticks to lies at that offset.
+                let at = if self.sticky_bounds.is_none() { self.cull_scroll } else { (0.0, 0.0) };
+                origin = sticky_origin(origin, insets, (width, height), Rect { x: containing.x + at.0, y: containing.y + at.1, ..containing });
+                // Sticking to the viewport, the box moves differently from the
+                // document when it scrolls: record it as a scroll anchor.
+                if self.sticky_bounds.is_none() && self.geometry.is_some() {
+                    if self.transform_depth > self.translate_transform_depth {
+                        // A scale or rotation does not carry a screen-space move.
+                        self.root_scroll_hazards += 1;
+                    }
+                    self.sticky_anchors.push((self.box_depth, StickyAnchor {
+                        pseudo: generated_pseudo,
+                        insets,
+                        size: (width, height),
+                        containing,
+                        shift: (origin.0 - static_origin.0, origin.1 - static_origin.1),
+                        hit_offset: (0.0, 0.0),
+                    }, origin));
                 }
             }
             if matches!(style.position, Position::Relative | Position::Sticky) {
@@ -34484,10 +34953,13 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
             .filter(|style| style.has_transform())
             .cloned();
         let transform_boundaries = self.paint_boundary_counts();
+        let mut translate_only = false;
         let transform_command = if transform_style.is_some() {
             let index = self.commands.len();
             self.push_command(Command::PushTransform(crate::paint::Affine::IDENTITY))?;
             self.transform_depth += 1;
+            translate_only = transform_style.as_ref().is_some_and(Style::transform_only_translates);
+            self.translate_transform_depth += usize::from(translate_only);
             Some(index)
         } else {
             None
@@ -34541,6 +35013,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
         self.decorations.truncate(saved_decorations);
         if transform_command.is_some() {
             self.transform_depth -= 1;
+            self.translate_transform_depth -= usize::from(translate_only);
         }
         let result = result?;
         if filter_binding.is_some()||mask_binding.is_some() {
@@ -35619,6 +36092,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             // A scrolling ancestor must relayout so fixed layers keep their
             // viewport positioning area while the element's clip moves.
             self.scroll_hazards += 1;
+            self.root_scroll_hazards += 1;
         }
         if style.display.is_table() {
             if virtual_children.is_none() {return self.table(id,parent_style,&style,x,y,available,depth).map(|(_,height)|height);}
@@ -38220,6 +38694,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         clips: scroll_clips..geometry.rounded_clips.len(),
                         base,
                         window,
+                        anchor: None,
                     });
                 }
                 geometry.rounded_clips.push(HitClip {
@@ -38556,10 +39031,61 @@ pub(crate) fn display_list_with_snapshot_mode(
     canvas_background: Option<Rgba>,
     drawable_snapshot: Option<NodeId>,
 ) -> Result<DisplayList, LayoutError> {
-    display_list_with_snapshot_mode_and_timelines(document,width,height,text,rules,images,geometry,scrolls,style_cache,retained_fragments,presentation_root,canvas_background,drawable_snapshot,None)
+    display_list_with_snapshot_mode_and_timelines(document,width,height,text,rules,images,geometry,scrolls,style_cache,retained_fragments,presentation_root,canvas_background,drawable_snapshot,None,None,false)
 }
 
+/// With `scroll_window` and `at_origin`, the document is laid out as if it were not
+/// scrolled, for a window of screens around its scroll offset, and then moved
+/// into place like a scroll by [`RootScrollRegion`]: its layout, and every
+/// retained fragment of it, does not depend on the root scroll offset. A
+/// document that cannot be moved that way is laid out again at its offset.
 pub(crate) fn display_list_with_snapshot_mode_and_timelines(
+    document: &Document,
+    width: u32,
+    height: u32,
+    text: &dyn TextShaper,
+    rules: &StyleIndex,
+    images: Option<&dyn ImageResolver>,
+    mut geometry: Option<&mut LayoutGeometry>,
+    scrolls: &[ScrollOffset],
+    style_cache: &core::cell::RefCell<css::StyleCache>,
+    mut retained_fragments: Option<&mut RetainedLayoutCache>,
+    presentation_root: Option<NodeId>,
+    canvas_background: Option<Rgba>,
+    drawable_snapshot: Option<NodeId>,
+    timeline_values:Option<&crate::animation::progress_timelines::TransformTimelineValues>,
+    scroll_window: Option<f32>,
+    at_origin: bool,
+) -> Result<DisplayList, LayoutError> {
+    let (mut list, at_origin) = laid_out_display_list(document, width, height, text, rules, images, geometry.as_deref_mut(),
+        scrolls, style_cache, retained_fragments.as_deref_mut(), presentation_root, canvas_background, drawable_snapshot,
+        timeline_values, scroll_window, at_origin)?;
+    let root = document.root();
+    let root_scroll = scrolls.iter().find(|scroll| scroll.node == root).map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
+    let Some(geometry) = geometry.as_deref_mut().filter(|_| at_origin) else {
+        return Ok(list);
+    };
+    if geometry.place_root_scroll(&mut list.0, root_scroll) {
+        geometry.laid_out_at_origin = true;
+        return Ok(list);
+    }
+    if root_scroll == (0.0, 0.0) && geometry.root_scroll_region.is_none() {
+        // Nothing to move, and the layout is already where the document is.
+        geometry.origin_layout_refused = true;
+        return Ok(list);
+    }
+    let collect_rendered_text = geometry.collect_rendered_text;
+    *geometry = LayoutGeometry::default();
+    geometry.collect_rendered_text = collect_rendered_text;
+    geometry.origin_layout_refused = true;
+    laid_out_display_list(document, width, height, text, rules, images, Some(geometry), scrolls, style_cache,
+        retained_fragments, presentation_root, canvas_background, drawable_snapshot, timeline_values, scroll_window, false)
+        .map(|(list, _)| list)
+}
+
+/// The display list, and whether the document was laid out at the origin
+/// (`at_origin` and a scroll window applied) rather than at its root scroll offset.
+fn laid_out_display_list(
     document: &Document,
     width: u32,
     height: u32,
@@ -38574,7 +39100,9 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     canvas_background: Option<Rgba>,
     drawable_snapshot: Option<NodeId>,
     timeline_values:Option<&crate::animation::progress_timelines::TransformTimelineValues>,
-) -> Result<DisplayList, LayoutError> {
+    scroll_window: Option<f32>,
+    at_origin: bool,
+) -> Result<(DisplayList, bool), LayoutError> {
 
     let root = document.root();
     let mut html = None;
@@ -38626,6 +39154,15 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         width: width as f32,
         height: height as f32,
     };
+    // With `scroll_window`, the document's content is emitted for a window of
+    // screens around the viewport, so that scrolling within it moves the
+    // commands instead of laying the page out again (see `RootScrollRegion`).
+    let window = scroll_window.filter(|_| tracks_root_scroll && drawable_snapshot.is_none() && timeline_values.is_none())
+        .map(|screens| (screens.min(1.0) * width as f32, screens * height as f32));
+    let at_origin = at_origin && window.is_some();
+    // The window stays around the viewport's place in the document.
+    let cull_scroll = root_scroll;
+    let root_scroll = if at_origin { (0.0, 0.0) } else { root_scroll };
     let mut overflow_frames = Vec::new();
     if tracks_root_scroll {
         overflow_frames
@@ -38642,6 +39179,16 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     layout.timeline_values=timeline_values;
     layout.drawable_snapshot_root = drawable_snapshot;
     layout.root_scroll = root_scroll;
+    if let Some((window_x, window_y)) = window {
+        let shift = if at_origin { cull_scroll } else { (0.0, 0.0) };
+        layout.cull_scroll = shift;
+        layout.cull = Rect {
+            x: shift.0 - window_x,
+            y: shift.1 - window_y,
+            width: width as f32 + 2.0 * window_x,
+            height: height as f32 + 2.0 * window_y,
+        };
+    }
     layout.overflow_frames = overflow_frames;
     if let Some(color) = canvas_background {
         layout.push_command(Command::FillRect {
@@ -38661,7 +39208,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
             *geometry=LayoutGeometry::default();geometry.collect_rendered_text=collect_rendered_text;
         }
         layout.finish_root_scroll_extent()?;
-        return layout.finish_display_list();
+        return layout.finish_display_list().map(|list| (list, false));
     };
     layout.prepare_quote_positions(html)?;
     layout.prepare_counter_positions(html)?;
@@ -38681,11 +39228,11 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     layout.container_units.set(query_context);
     layout.resolve_query_context(&mut initial);
     if initial.display == Display::None {
-        return layout.finish_display_list();
+        return layout.finish_display_list().map(|list| (list, false));
     }
     if let Some(root) = drawable_snapshot {
         let mut style = layout.computed_style_from_tree(root)?;
-        if style.display == Display::None { return layout.finish_display_list(); }
+        if style.display == Display::None { return layout.finish_display_list().map(|list| (list, false)); }
         style.blockify_display();
         style.position = Position::Static;
         style.transforms = None;
@@ -38701,7 +39248,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         layout.stacking_roots.pop();
         layout.defer_stacking_context(owner, true)?;
         layout.finish_stacking_contexts(owner)?;
-        return layout.finish_display_list();
+        return layout.finish_display_list().map(|list| (list, false));
     }
     if standalone_svg || presentation_root.is_some() {
         let root_has_box = initial.display != Display::Contents;
@@ -38761,7 +39308,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         layout.parent_height = Some(height as f32);
         layout.paint_svg_root(html, attributes, &style, 0.0, 0.0, width as f32, 0, None)?;
         layout.parent_height = parent_height;
-        return layout.finish_display_list();
+        return layout.finish_display_list().map(|list| (list, false));
     }
     if let Some(root) = presentation_root {
         if !matches!(document.kind(root), Ok(NodeKind::Element { .. })) {
@@ -38771,7 +39318,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
             .computed_style(root, Some(&initial))
             .map_err(LayoutError::Css)?;
         if top_layer.display == Display::None {
-            return layout.finish_display_list();
+            return layout.finish_display_list().map(|list| (list, false));
         }
         // Fullscreen is a viewport presentation layer. Preserve the selected
         // element's computed paint/text styles while applying the CSS
@@ -38797,7 +39344,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         layout.stacking_roots.pop();
         layout.defer_stacking_context(root_owner,true)?;
         layout.finish_stacking_contexts(root_owner)?;
-        return layout.finish_display_list();
+        return layout.finish_display_list().map(|list| (list, false));
     }
     // The initial containing block is the viewport. The document element is
     // an ordinary root box inside it, with its actual dimensions and edges.
@@ -38907,6 +39454,24 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     if let (Some(index), Some(rect)) = (canvas_index, layout.canvas_root_box) {
         layout.finish_background_with_coverage(index, rect, &canvas_style, None, Some(layout.viewport_rect()))?;
     }
+    // Only a canvas painted in one colour stays put while the document moves.
+    let canvas_images = canvas_index.is_some() && canvas_style.background_images.as_ref().is_some_and(|images|
+        images.iter().any(|image| !matches!(image, BackgroundImage::None)));
+    let spatial_filters = layout.commands[root_target.0..].iter().any(|command| matches!(command,
+        Command::PushLayer { filters: Some(filters), .. } if filters.iter().any(lumen_common::filter::FilterOperation::is_spatial)));
+    if let Some(window) = window.filter(|_| root_filter_layer.is_none() && layout.root_scroll_hazards == 0 && !canvas_images && !spatial_filters) {
+        let (commands, anchors) = (root_target.0..layout.commands.len(), layout.root_anchors);
+        if let Some(geometry) = layout.geometry.as_deref_mut() {
+            geometry.root_scroll_region = Some(RootScrollRegion {
+                commands,
+                hits: root_target.1..geometry.hits.len(),
+                base: root_scroll,
+                placed: root_scroll,
+                window,
+                anchors,
+            });
+        }
+    }
     layout.finish_root_scroll_extent()?;
     layout.source_capture_depth = 0;
     if let (Some((layer,_)),Some(binding))=(root_filter_layer,root_filter_binding) {
@@ -38918,7 +39483,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
         layout.bind_css_mask(layer,binding,border)?;
     }
     layout.end_opacity(root_filter_layer)?;
-    layout.finish_display_list()
+    layout.finish_display_list().map(|list| (list, at_origin))
 }
 
 #[cfg(test)]

@@ -2558,6 +2558,12 @@ impl DomRealm {
         self.images.set_resolver(resolver);
     }
 
+    /// Number of detached `Audio()`/`Video()` elements; they join the source walks without a
+    /// document version change.
+    pub fn detached_media_count(&self) -> usize {
+        self.media.borrow().detached_count()
+    }
+
     /// Audio nodes with explicit `src` resources, including detached `Audio()` elements.
     pub fn media_sources(&self) -> Vec<(NodeId, String)> {
         let document = self.session.borrow();
@@ -2806,6 +2812,12 @@ impl DomRealm {
     /// Invalidate retained HTML layout and paint after host-managed image data changes.
     pub fn invalidate_image_resources(&self) {
         self.session.borrow_mut().invalidate_image_resources();
+    }
+
+    /// Ask for a new frame after the host's image resolver advanced; see
+    /// `RenderSession::image_resources_advanced`.
+    pub fn image_resources_advanced(&self) {
+        self.session.borrow_mut().image_resources_advanced();
     }
 
     /// Nodes with active image requests, including detached `new Image()` nodes.

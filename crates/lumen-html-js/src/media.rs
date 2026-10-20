@@ -96,6 +96,10 @@ impl MediaController {
         self.detached.insert(node);
     }
 
+    pub(crate) fn detached_count(&self) -> usize {
+        self.detached.len()
+    }
+
     pub(crate) fn detached_nodes(&self) -> Vec<NodeId> {
         self.detached.iter().copied().collect()
     }

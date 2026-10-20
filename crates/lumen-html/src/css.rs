@@ -4120,6 +4120,17 @@ impl Style {
     pub fn paints_as_group(&self) -> bool {
         self.opacity < 1.0 || self.filters.is_some() || self.has_mask()
     }
+    /// Whether the transform only translates (a scale, rotation, skew or a
+    /// transform still to be computed does not).
+    pub(crate) fn transform_only_translates(&self)->bool {
+        !self.relative_expressions.iter().any(|expression|expression.slot==59||(239..=241).contains(&expression.slot))
+            && self.individual_transforms[1..].iter().all(Option::is_none)
+            && self.transforms.as_deref().is_none_or(|transforms|transforms.iter().all(|transform|match transform {
+                Transform::Translate(..)=>true,
+                Transform::Matrix(matrix)=>(matrix.a,matrix.b,matrix.c,matrix.d)==(1.0,0.0,0.0,1.0),
+                _=>false,
+            }))
+    }
     pub fn has_transform(&self)->bool {
         self.transforms.is_some()||self.individual_transforms.iter().any(Option::is_some)||self.relative_expressions.iter().any(|expression|expression.slot==59||(239..=241).contains(&expression.slot))
     }
