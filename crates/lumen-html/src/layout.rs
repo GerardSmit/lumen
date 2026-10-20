@@ -2966,6 +2966,40 @@ impl FilterSourceBinding {
     }
 }
 
+/// Mask layers captured before the used box owns/moves its Style. Layers paint
+/// through the background machinery, so the binding is a Style whose background
+/// longhands carry the mask longhands.
+struct MaskBinding {
+    layers: Style,
+    modes: Arc<[bool]>,
+}
+impl MaskBinding {
+    fn from_style(style: &Style) -> Option<Self> {
+        if !style.has_mask() {
+            return None;
+        }
+        let mut layers = style.clone();
+        layers.background = Rgba { r: 0, g: 0, b: 0, a: 0 };
+        layers.background_images = style.mask_images.clone();
+        layers.background_position = style.mask_position.clone();
+        layers.background_size = style.mask_size.clone();
+        layers.background_size_math = None;
+        layers.background_repeat = style.mask_repeat.clone();
+        layers.background_origin = Some(style.mask_origin.clone().unwrap_or_else(|| Arc::from([BackgroundBox::Border])));
+        layers.background_clip = style.mask_clip.clone();
+        layers.background_attachment = None;
+        layers.shadows = None;
+        layers.border_radius = 0.0;
+        layers.border_corner_radii = None;
+        layers.visibility_visible = true;
+        let count = style.mask_images.as_ref().map_or(0, |images| images.len().min(MAX_BACKGROUND_LAYERS));
+        let modes = (0..count)
+            .map(|index| cycle_layer(index, &style.mask_mode, css::MaskMode::default()).luminance())
+            .collect();
+        Some(Self { layers, modes })
+    }
+}
+
 struct Layout<'a> {
     drawable_snapshot_root: Option<NodeId>,
     timeline_values:Option<&'a crate::animation::progress_timelines::TransformTimelineValues>,
@@ -2977,6 +3011,7 @@ struct Layout<'a> {
     // Only intrinsic paragraph collection uses this purpose. Real box/line
     // measurement forks start without it, and resolve their assigned basis.
     intrinsic_inline_axis: Option<bool>,
+    intrinsic_minimum_atomics: bool,
     flow_baselines: Option<FlowBaselines>,
     export_block_table_baselines: bool,
     vertical_inline_lr: bool,
@@ -3087,6 +3122,8 @@ struct Layout<'a> {
     /// Subtree intrinsic sizes keyed by node index and minimum mode; an entry
     /// is reused only when the style it was measured with is unchanged.
     intrinsic_cache: Rc<core::cell::RefCell<Vec<Option<(Style, (f32, f32))>>>>,
+    /// Margin escapes of the block box measured into `intrinsic_cache`, same slots.
+    intrinsic_margins: Rc<core::cell::RefCell<Vec<Option<BlockMargins>>>>,
     /// The active DOM parent's computed values, before used box projections.
     /// Saved by formatter recursion, not retained per node or in layout fragments.
     computed_parent: Option<(NodeId, Style)>,
@@ -3225,6 +3262,7 @@ impl<'a> Layout<'a> {
         }),
         percentage_basis: None,
         intrinsic_inline_axis: None,
+        intrinsic_minimum_atomics: false,
         flow_baselines: None,
         export_block_table_baselines: true,
         vertical_inline_lr: false,
@@ -3309,6 +3347,7 @@ impl<'a> Layout<'a> {
         paragraph_column_flow:None,
         next_paint_order: 0,
         intrinsic_cache: Rc::new(core::cell::RefCell::new(Vec::new())),
+        intrinsic_margins: Rc::new(core::cell::RefCell::new(Vec::new())),
         style_cache,
         quote_positions: Cow::Owned(Vec::new()),
         counter_positions: Cow::Owned(Vec::new()),
@@ -4922,7 +4961,7 @@ impl Layout<'_> {
     /// Opacity and transforms group the whole inline box, including block
     /// children, so they cannot be painted per split fragment.
     fn inline_split_creates_group(style: &Style) -> bool {
-        style.opacity < 1.0 || style.filters.is_some() || style.has_transform()
+        style.paints_as_group() || style.has_transform()
             || style.view_transition_name != css::ViewTransitionName::None
     }
 
@@ -5543,7 +5582,7 @@ impl Layout<'_> {
     fn svg_layer_clip(&mut self,style:&Style,transform:Affine,user_box:crate::svg::ViewBox)
         ->Result<Option<Arc<crate::paint::SvgLayerClip>>,LayoutError> {
         let Some(reference)=style.svg_clip_path.as_deref() else{return Ok(None);};
-        Ok(self.svg_clip(reference,user_box)?.map(|clip|Arc::new(crate::paint::SvgLayerClip{transform,clip})))
+        Ok(self.svg_clip(reference,user_box)?.map(|clip|Arc::new(crate::paint::SvgLayerClip{transform,clip,mask:None})))
     }
 
     /// Local geometric boxes precede the owner's transform, clipping and
@@ -6035,7 +6074,7 @@ impl Layout<'_> {
                     let data=alloc::format!("M{} {}h{}v{}h{}z",viewport.x,viewport.y,viewport.width,viewport.height,-viewport.width);
                     let clip=Arc::new(crate::paint::SvgClip{units:crate::paint::SvgGradientUnits::UserSpaceOnUse,
                         transform:Affine::IDENTITY,shapes:Arc::from([crate::paint::SvgClipShape{data:Arc::from(data),transform:Affine::IDENTITY,fill_rule:crate::paint::SvgFillRule::NonZero}])});
-                    self.push_command(Command::PushLayer{svg_clip:Some(Arc::new(crate::paint::SvgLayerClip{transform:inverse,clip})),
+                    self.push_command(Command::PushLayer{svg_clip:Some(Arc::new(crate::paint::SvgLayerClip{transform:inverse,clip,mask:None})),
                         filters:None,corners:None,rect:paint_viewport,radius:0.0,opacity:1.0,clip:false})?;
                 }else {
                     self.push_command(Command::PushLayer {svg_clip:None,filters:None,corners:None,
@@ -6167,7 +6206,7 @@ impl Layout<'_> {
                     let data=alloc::format!("M{} {}h{}v{}h{}z",rect.x,rect.y,rect.width,rect.height,-rect.width);
                     let clip=Arc::new(crate::paint::SvgClip{units:crate::paint::SvgGradientUnits::UserSpaceOnUse,
                         transform:Affine::IDENTITY,shapes:Arc::from([crate::paint::SvgClipShape{data:Arc::from(data),transform:Affine::IDENTITY,fill_rule:crate::paint::SvgFillRule::NonZero}])});
-                    self.push_command(Command::PushLayer{svg_clip:Some(Arc::new(crate::paint::SvgLayerClip{transform:paint_transform,clip})),
+                    self.push_command(Command::PushLayer{svg_clip:Some(Arc::new(crate::paint::SvgLayerClip{transform:paint_transform,clip,mask:None})),
                         filters:None,corners:None,rect:paint_viewport,radius:0.0,opacity:1.0,clip:false})?;
                 }
                 let result=self.with_svg_geometry_capture(object_geometry,|layout|layout.paint_svg_children(
@@ -6436,6 +6475,12 @@ impl MarginStrut {
     }
     fn value(self) -> f32 { self.positive + self.negative }
 }
+
+/// CSS2 8.3.1 margins of a measured block box that adjoin its first and last
+/// in-flow content. `*_add` is the part of those margins already counted inside
+/// the measured block size, which a collapsing parent takes back out.
+#[derive(Clone, Copy, Default)]
+struct BlockMargins { lead: MarginStrut, lead_add: f32, trail: MarginStrut, trail_add: f32 }
 
 #[derive(Clone, Copy)]
 struct InitialClearance { node: NodeId, pseudo: Option<css::PseudoElement>, clear: Clear, float_count: usize }
@@ -12311,7 +12356,7 @@ fn fragmentable_column_decoration(style:&Style)->bool {
         && style.writing_mode==css::WritingMode::HorizontalTb && !css::columns::active(style)
         && style.aspect_ratio.is_none() && style.margin_sides[0]==0.0 && style.margin_sides[2]==0.0
         && !style.has_cyclic_box_edge_percentage()
-        && style.opacity==1.0 && style.filters.is_none() && !style.has_transform()
+        && !style.paints_as_group() && !style.has_transform()
         && style.overflow_x==css::Overflow::Visible && style.overflow_y==css::Overflow::Visible
         && !style.contain_layout && !style.contain_paint && !style.contain_size && !style.contain_inline_size
         && style.container_type==css::ContainerType::Normal && style.svg_clip_path.is_none()
@@ -13004,7 +13049,10 @@ fn move_command(command: &mut Command, dx: f32, dy: f32) {
         }
         Command::PushLayer{rect,svg_clip,..}=>{
             rect.x+=dx;rect.y+=dy;
-            if let Some(owner)=svg_clip {let owner=Arc::make_mut(owner);owner.transform.e+=dx;owner.transform.f+=dy;}
+            if let Some(owner)=svg_clip {
+                let owner=Arc::make_mut(owner);owner.transform.e+=dx;owner.transform.f+=dy;
+                if let Some(mask)=&mut owner.mask {let mask=Arc::make_mut(mask);mask.offset[0]+=dx;mask.offset[1]+=dy;}
+            }
         }
         Command::PushClip(rect) | Command::PushBoxClip(rect)
         | Command::FillRect { rect, .. }
@@ -14210,16 +14258,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         }
         if let Some(layers) = background_layers(style) {
             for (layer_index, layer) in layers.iter().enumerate().rev() {
-                if matches!(layer.image, BackgroundImage::None) {
-                    continue;
-                }
-                if background_image_pending(&layer.image, self.images) {
-                    return Err(LayoutError::ImagePending);
-                }
-                let paint = background_paint(&layer, self.images);
-                self.push_command(background_command_with_fragment_sizing(
-                    rect,coverage,style,layer,layer_index,&paint,self.viewport,None,self.images,sizing,
-                ))?;
+                self.push_background_layer(rect,coverage,style,layer,layer_index,sizing)?;
             }
         }
         if let Some(shadows) = &style.shadows {
@@ -14236,6 +14275,20 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             }
         }
         Ok(())
+    }
+
+    fn push_background_layer(&mut self,rect:Rect,coverage:Option<Rect>,style:&Style,layer:&BackgroundLayer,
+        layer_index:usize,sizing:Option<(DecorationJoinAxis,f32,Option<Rect>)>)->Result<(),LayoutError> {
+        if matches!(layer.image, BackgroundImage::None) {
+            return Ok(());
+        }
+        if background_image_pending(&layer.image, self.images) {
+            return Err(LayoutError::ImagePending);
+        }
+        let paint = background_paint(layer, self.images);
+        self.push_command(background_command_with_fragment_sizing(
+            rect,coverage,style,layer,layer_index,&paint,self.viewport,None,self.images,sizing,
+        ))
     }
 
     fn finish_background(
@@ -14630,6 +14683,11 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
 
     fn intrinsic_normalized_children<'b>(&self,children:impl IntoIterator<Item=&'b FlattenedBoxChild>,style:&Style,
         depth:usize,minimum:bool,prefix:(f32,f32),contain_floats:bool) -> Result<(f32,f32),LayoutError> {
+        Ok(self.intrinsic_normalized_flow(children,style,depth,minimum,prefix,contain_floats)?.0)
+    }
+
+    fn intrinsic_normalized_flow<'b>(&self,children:impl IntoIterator<Item=&'b FlattenedBoxChild>,style:&Style,
+        depth:usize,minimum:bool,prefix:(f32,f32),contain_floats:bool) -> Result<((f32,f32),BlockMargins),LayoutError> {
         let mut children=children.into_iter().peekable();let first=children.next();
         // A standalone collapsing text source has no cross-source shaping or
         // line-break dependency. Keep its cached metric path allocation-light.
@@ -14640,7 +14698,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             if let Some(FlattenedBoxChild{kind:FlattenedBoxChildKind::Node(node),..})=first {
                 if let Ok(NodeKind::Text(value)|NodeKind::CData(value))=self.document.kind(*node) {
                     let value=formatted_text(value,style.white_space);
-                    if value.trim_matches(' ').is_empty(){return Ok((0.0,0.0));}
+                    if value.trim_matches(' ').is_empty(){return Ok(((0.0,0.0),BlockMargins::default()));}
                     let advance=self.text_intrinsic_advance(&value,style,false,Some(*node))?;
                     let axes=GridAxes::new(style);
                     let preferred=axes.basis(style,true).unwrap_or(advance);
@@ -14649,18 +14707,23 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                     // fits. A real inline constraint that causes wrapping must
                     // consume the canonical paragraph's actual block extent.
                     if style.white_space==WhiteSpace::NoWrap || advance<=available {
-                        return Ok((advance,self.line_height(style)));
+                        return Ok(((advance,self.line_height(style)),BlockMargins::default()));
                     }
                 }
             }
         }
         let (mut width,mut height,mut inline_width,mut inline_height)=(0.0f32,0.0f32,prefix.0,prefix.1);
         let mut float_bands=BinaryHeap::new();let mut active_float_inline=0.0f64;
-        let mut float_count=0usize;let mut float_bottom=0.0f32;
+        let mut float_count=0usize;let mut float_bottom=0.0f32;let mut side_bottom=[0.0f32;2];
         let axes = GridAxes::new(style);
+        // CSS2 8.3.1: block margins collapse between siblings, through empty
+        // boxes, and out of open first/last children (reported in `BlockMargins`).
+        let collapse = !axes.vertical;
+        let (mut pending,mut lead,mut lead_add,mut placed,mut collapsed)=(MarginStrut::default(),MarginStrut::default(),0.0f32,false,false);
         let available = axes.basis(style, true)
             .unwrap_or(if axes.vertical { self.viewport.height } else { self.viewport.width });
         let mut collector=self.measurement_layout();
+        collector.intrinsic_minimum_atomics=minimum;
         // Inline collection must use this formatting source's definite
         // physical height, rather than a viewport or an unrelated ancestor.
         collector.parent_height = style.intrinsic_dimension(false)
@@ -14699,6 +14762,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 let end=height+h.max(0.0);
                 if !minimum {push_intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,end,w)?;}
                 float_bottom=float_bottom.max(end);
+                side_bottom[usize::from(computed.float==Float::Right)]=side_bottom[usize::from(computed.float==Float::Right)].max(end);
                 let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(h).max(self.line_height(style)));
                 width=width.max(w).max(intrinsic_inline_line_width(inline_width,overlap,minimum));
             } else if computed.is_inline_level() {
@@ -14706,15 +14770,70 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             } else {
                 let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(self.line_height(style)));
                 width=width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)).max(w);
-                height+=inline_height+h;inline_width=0.0;inline_height=0.0;
+                let margins=if collapse&&computed.writing_mode==css::WritingMode::HorizontalTb {
+                    let (top,bottom)=(computed.margin_sides[0],computed.margin_sides[2]);
+                    let inner=match &child.kind {
+                        FlattenedBoxChildKind::Node(node)=>self.intrinsic_margins.borrow().get(node.index()*2+usize::from(minimum)).copied().flatten().unwrap_or_default(),
+                        _=>BlockMargins::default(),
+                    };
+                    let border_box=h-top-bottom-inner.lead_add-inner.trail_add;
+                    (border_box.is_finite()&&border_box>=-0.01).then(||(border_box.max(0.0),top,bottom,inner))
+                } else {None};
+                if let Some((border_box,top,bottom,inner))=margins {
+                    collapsed=true;
+                    if inline_height>0.0 {
+                        let gap=pending.value();
+                        if !placed {lead=pending;lead_add=gap;placed=true;}
+                        height+=gap+inline_height;pending=MarginStrut::default();
+                    }
+                    let (top,bottom)=(MarginStrut::new(top).merge(inner.lead),MarginStrut::new(bottom).merge(inner.trail));
+                    // CSS2 9.5.2: when the collapsed hypothetical position lies above
+                    // the floats being cleared, clearance puts the border edge at
+                    // their bottom: the box then neither collapses with the margin
+                    // above it nor through itself.
+                    let clear_bottom=match computed.clear {
+                        css::Clear::None=>0.0,
+                        css::Clear::Left=>side_bottom[0],
+                        css::Clear::Right=>side_bottom[1],
+                        css::Clear::Both=>float_bottom,
+                    };
+                    let cleared=principal&&clear_bottom>0.0&&height+pending.merge(top).value()<clear_bottom;
+                    let empty=!cleared && border_box<0.01 && !establishes_formatting_context(computed,style)
+                        && matches!(computed.display,Display::Block|Display::ListItem)
+                        && computed.height.is_none_or(|value|value==0.0) && computed.min_height==0.0 && computed.min_height_intrinsic.is_none();
+                    if empty {
+                        pending=pending.merge(top).merge(bottom);
+                    } else if cleared {
+                        if !placed {lead=pending;lead_add=pending.value();placed=true;}
+                        height=clear_bottom+border_box;pending=bottom;
+                    } else {
+                        let gap=pending.merge(top);
+                        if !placed {lead=gap;lead_add=gap.value();placed=true;}
+                        height+=gap.value()+border_box;pending=bottom;
+                    }
+                } else {
+                    height+=inline_height+h;
+                }
+                inline_width=0.0;inline_height=0.0;
             }
         }
         self.prepare_case_context(&mut paragraph, &mut case_context)?;
         let (w,h)=self.intrinsic_inline_paragraph(&mut paragraph,style,depth+1,minimum)?;
         inline_width+=w;inline_height=inline_height.max(h);
         let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(self.line_height(style)));
-        let content_height=height+inline_height;
-        Ok((width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)),if contain_floats {content_height.max(float_bottom)}else{content_height}))
+        let mut margins=BlockMargins::default();
+        let content_height=if collapsed {
+            if inline_height>0.0 {
+                let gap=pending.value();
+                if !placed {lead=pending;lead_add=gap;placed=true;}
+                height+=gap+inline_height;pending=MarginStrut::default();
+            }
+            height+=pending.value();
+            margins=if placed {BlockMargins{lead,lead_add,trail:pending,trail_add:pending.value()}}
+                else {BlockMargins{lead:pending,lead_add:pending.value(),trail:pending,trail_add:0.0}};
+            height
+        } else {height+inline_height};
+        Ok(((width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)),if contain_floats {content_height.max(float_bottom)}else{content_height}),margins))
     }
 
     fn table_cell_child_used_style(&self, source: &Style, width: f32,
@@ -16721,6 +16840,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         layout.percentage_basis = self.percentage_basis;
         layout.export_block_table_baselines = self.export_block_table_baselines;
         layout.intrinsic_cache = Rc::clone(&self.intrinsic_cache);
+        layout.intrinsic_margins = Rc::clone(&self.intrinsic_margins);
         layout.quote_positions = Cow::Borrowed(self.quote_positions.as_ref());
         layout.counter_positions = Cow::Borrowed(self.counter_positions.as_ref());
         layout.cull = Rect { x: -f32::MAX * 0.25, y: -f32::MAX * 0.25,
@@ -17740,9 +17860,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let available = if minimum { 0.0 } else { f32::MAX * 0.125 };
             let size = layout.table_with_children(id, style, style, 0.0, 0.0, available, depth + 1,
                 None, None, Some(available))?;
-            let mut cache = self.intrinsic_cache.borrow_mut();
-            if cache.len() <= slot { cache.resize_with(slot + 1, || None); }
-            cache[slot] = Some((style.clone(), size));
+            self.store_intrinsic(slot, style, size, None);
             return Ok(size);
         }
         if fieldset {
@@ -17783,9 +17901,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 constrained_height(&outer, outer.height.map_or(physical.1, |height| content_height_dimension(&outer, height))) + box_edges(&outer, false),
             );
             if origin.is_none() {
-                let mut cache=self.intrinsic_cache.borrow_mut();
-                if cache.len()<=slot {cache.resize_with(slot+1,||None);}
-                cache[slot]=Some((style.clone(),size));
+                self.store_intrinsic(slot, style, size, None);
             }
             return Ok(size);
         }
@@ -17935,6 +18051,102 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         None
     }
 
+    /// css-flexbox-1 §9.9.1: a single-line container's max-content main size is
+    /// the sum of its items' max-content contributions (a wrapping container's
+    /// min-content size is the largest one); the cross size is the largest item.
+    /// Returns the physical content size, with item margins included.
+    fn intrinsic_flex_children(
+        &self, id: NodeId, children: &[FlattenedBoxChild], style: &Style, depth: usize, minimum: bool,
+    ) -> Result<(f32, f32), LayoutError> {
+        let axes = GridAxes::new(style);
+        let row = matches!(style.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
+        let main_gap = if row {
+            resolved_gap(style.column_gap.unwrap_or(0.0), style.column_gap_fraction, None)
+        } else {
+            resolved_gap(style.gap, style.row_gap_fraction, None)
+        };
+        let (mut main_sum, mut main_largest, mut cross_largest, mut count) = (0.0f32, 0.0f32, 0.0f32, 0usize);
+        let sources = self.anonymous_formatting_items(children.iter().cloned(), style)?;
+        for source in sources {
+            let (child, paragraph) = source.into_parts(id);
+            let mut computed = child.computed_style.clone().unwrap_or_else(|| child.parent_style.clone());
+            let node = match &child.kind {
+                FlattenedBoxChildKind::Node(node) => {
+                    if paragraph.is_none()
+                        && !matches!(self.document.kind(*node), Ok(NodeKind::Element { .. }))
+                    {
+                        continue;
+                    }
+                    Some(*node)
+                }
+                _ => None,
+            };
+            if computed.display == Display::None
+                || computed.display.is_table_column()
+                || matches!(computed.position, Position::Absolute | Position::Fixed)
+            {
+                continue;
+            }
+            computed = computed.resolve_grid_intrinsic_percentages(style.width.unwrap_or(0.0), style.height);
+            computed.blockify_display();
+            // A flexible item contributes its max-content size (its main size
+            // property when definite): a zero or small flex-basis must not hide
+            // its content from the container. Only an inflexible item is pinned
+            // to its flex-basis.
+            let inflexible = computed.flex_grow <= 0.0 && computed.flex_shrink <= 0.0;
+            let basis = computed.resolve_flex_basis_percentage(None).filter(|_| inflexible);
+            if let Some(basis) = basis {
+                if row {
+                    computed.width = Some(specified_dimension(&computed, content_dimension(&computed, basis)));
+                } else {
+                    computed.height = Some(specified_height(&computed, content_height_dimension(&computed, basis)));
+                }
+            } else if computed.flex_basis_content {
+                if row { computed.width = None; } else { computed.height = None; }
+            }
+            let measure = |measurement: &Style, minimum: bool| -> Result<(f32, f32), LayoutError> {
+                match (&child.kind, paragraph.as_ref()) {
+                    (_, Some(paragraph)) => {
+                        let node = node.ok_or(LayoutError::InvalidTree)?;
+                        self.flex_intrinsic_size(node, measurement, Some(paragraph), depth + 1, minimum)
+                    }
+                    (FlattenedBoxChildKind::Node(node), None) => {
+                        self.intrinsic_size_mode(*node, measurement, depth + 1, minimum)
+                    }
+                    (FlattenedBoxChildKind::Generated(generated), None) => {
+                        self.intrinsic_virtual_generated_size(generated, measurement, minimum)
+                    }
+                    (FlattenedBoxChildKind::AnonymousTable(table), None) => {
+                        self.anonymous_table_intrinsic(table, depth + 1, minimum)
+                    }
+                }
+            };
+            let (w, h) = if inflexible && basis.is_none() && !computed.flex_basis_content && computed.flex_basis_intrinsic.is_some() {
+                let kind = computed.flex_basis_intrinsic.ok_or(LayoutError::InvalidTree)?;
+                let outer = intrinsic_flex_basis_with(&computed, row, None, kind, &measure)?;
+                let mut sized = computed.clone();
+                if row {
+                    sized.width = Some(specified_dimension(&sized, (outer - box_edges(&sized, true)).max(0.0)));
+                } else {
+                    sized.height = Some(specified_height(&sized, (outer - box_edges(&sized, false)).max(0.0)));
+                }
+                measure(&sized, minimum)?
+            } else {
+                measure(&computed, minimum)?
+            };
+            let (inline, block) = axes.logical((w, h));
+            let (item_main, item_cross) = if row { (inline, block) } else { (block, inline) };
+            main_sum += item_main;
+            main_largest = main_largest.max(item_main);
+            cross_largest = cross_largest.max(item_cross);
+            count += 1;
+        }
+        let gaps = main_gap * count.saturating_sub(1) as f32;
+        let main = if minimum && style.flex_wrap { main_largest } else { main_sum + gaps };
+        let (inline, block) = if row { (main, cross_largest) } else { (cross_largest, main) };
+        Ok(axes.physical((inline, block)))
+    }
+
     /// Intrinsic sizing of actual formatting sources, including generated
     /// principals. Host-language replacement and widget metrics stay outside.
     fn intrinsic_formatting_children(
@@ -17983,11 +18195,24 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 ) + vertical_edges,
             );
             if origin.is_none() && !children.is_empty() {
-                let mut cache = self.intrinsic_cache.borrow_mut();
-                if cache.len() <= slot {
-                    cache.resize_with(slot + 1, || None);
-                }
-                cache[slot] = Some((style.clone(), size));
+                self.store_intrinsic(slot, style, size, None);
+            }
+            return Ok(size);
+        }
+        if style.display == Display::Flex {
+            let (w, h) = self.intrinsic_flex_children(id, &children, style, depth + 1, minimum)?;
+            let size = (
+                constrained_width(
+                    style,
+                    style.width.map_or(w, |value| content_dimension(style, value)),
+                ) + edges,
+                constrained_height(
+                    style,
+                    style.height.map_or(h, |value| content_height_dimension(style, value)),
+                ) + vertical_edges,
+            );
+            if origin.is_none() && !children.is_empty() {
+                self.store_intrinsic(slot, style, size, None);
             }
             return Ok(size);
         }
@@ -18470,7 +18695,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }
         }
-        let logical = self.intrinsic_normalized_children(children.iter(), style, depth + 1, minimum,
+        let (logical, mut margins) = self.intrinsic_normalized_flow(children.iter(), style, depth + 1, minimum,
             (inline_width, inline_height), establishes_formatting_context(style, style))?;
         let natural = GridAxes::new(style).physical(logical);
         let size = (
@@ -18490,13 +18715,31 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             ) + vertical_edges,
         );
         if origin.is_none() && has_children {
-            let mut cache = self.intrinsic_cache.borrow_mut();
-            if cache.len() <= slot {
-                cache.resize_with(slot + 1, || None);
-            }
-            cache[slot] = Some((style.clone(), size));
+            let widths = border_widths(style);
+            let block = matches!(style.display, Display::Block | Display::ListItem)
+                && style.writing_mode == css::WritingMode::HorizontalTb
+                && !margin_context_root(self.document, id, style, style);
+            let open_top = block && widths[0] == 0.0 && style.padding_sides[0] == 0.0;
+            let open_bottom = open_top && widths[2] == 0.0 && style.padding_sides[2] == 0.0
+                && style.height.is_none() && style.min_height == 0.0 && style.min_height_intrinsic.is_none()
+                && constrained_height(style, natural.1) == natural.1;
+            if !open_top { margins.lead = MarginStrut::default(); margins.lead_add = 0.0; }
+            if !open_bottom { margins.trail = MarginStrut::default(); margins.trail_add = 0.0; }
+            if style.height.is_some() || constrained_height(style, natural.1) != natural.1 { margins.lead_add = 0.0; }
+            self.store_intrinsic(slot, style, size, Some(margins));
         }
         Ok(size)
+    }
+
+    /// Cached intrinsic size and the margin escapes measured with it share one
+    /// lifecycle: they are always replaced together.
+    fn store_intrinsic(&self, slot: usize, style: &Style, size: (f32, f32), margins: Option<BlockMargins>) {
+        let mut cache = self.intrinsic_cache.borrow_mut();
+        if cache.len() <= slot { cache.resize_with(slot + 1, || None); }
+        cache[slot] = Some((style.clone(), size));
+        let mut table = self.intrinsic_margins.borrow_mut();
+        if table.len() <= slot { table.resize_with(slot + 1, || None); }
+        table[slot] = margins;
     }
 
     fn subgrid_axis_contributions(
@@ -21411,7 +21654,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 let mut command_bytes = self.command_bytes;
                 for command in self.commands[item.commands.clone()].iter_mut().take(
                     paints
-                        + usize::from(item.style.opacity < 1.0 || item.style.filters.is_some())
+                        + usize::from(item.style.paints_as_group())
                         + usize::from(item.style.has_transform()),
                 ) {
                     match command {
@@ -21731,29 +21974,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     fn paint_positioned_flex_children(
         &mut self,
         positioned: Vec<(PositionedBoxSource, Style, f32, f32)>,
+        parent: NodeId,
         style: &Style,
         x: f32,
         y: f32,
         width: f32,
+        content_height: f32,
         row: bool,
         reverse: bool,
         depth: usize,
     ) -> Result<(), LayoutError> {
+        let used_height = constrained_height(style, style
+            .height
+            .map_or(content_height, |height| content_height_dimension(style, height)));
+        if !positioned.is_empty() && self.containing_block_node == Some(parent) {
+            if let Some(block) = self.containing_block.as_mut() {
+                block.height = used_height + style.padding_sides[0] + style.padding_sides[2];
+            }
+        }
         for (source, item_style, w, h) in positioned {
-            let main_extent = if row {
-                width
-            } else {
-                style
-                    .height
-                    .map_or(0.0, |height| content_height_dimension(style, height))
-            };
-            let cross_extent = if row {
-                style
-                    .height
-                    .map_or(0.0, |height| content_height_dimension(style, height))
-            } else {
-                width
-            };
+            let main_extent = if row { width } else { used_height };
+            let cross_extent = if row { used_height } else { width };
             let main_size = if row { w } else { h };
             let cross_size = if row { h } else { w };
             let free = main_extent - main_size;
@@ -22393,7 +22634,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
 
         if items.is_empty() {
             self.paint_positioned_flex_children(
-                positioned, style, x, y, width, row, reverse, depth,
+                positioned, parent, style, x, y, width, 0.0, row, reverse, depth,
             )?;
             return Ok((0.0, 0.0));
         }
@@ -22434,7 +22675,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let cross_limit = if row {
             style
                 .height
-                .map(|height| content_height_dimension(style, height))
+                .map(|height| constrained_height(style, content_height_dimension(style, height)))
+                .or_else(|| {
+                    let clamped = constrained_height(style, natural_cross);
+                    (clamped != natural_cross).then_some(clamped)
+                })
         } else {
             Some(width)
         };
@@ -22555,10 +22800,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let cross_extent = if style.flex_wrap {
                 line_cross + line_stretch
             } else if row {
-                style
+                constrained_height(style, style
                     .height
                     .map(|height| content_height_dimension(style, height))
-                    .unwrap_or(items.iter().map(|item| item.cross).fold(0.0f32, f32::max))
+                    .unwrap_or(items.iter().map(|item| item.cross).fold(0.0f32, f32::max)))
             } else {
                 width
             };
@@ -22810,11 +23055,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let align_extent = if style.flex_wrap {
                 actual_cross.max(cross_extent)
             } else if row {
-                style
+                constrained_height(style, style
                     .height
                     .filter(|_| !style.flex_wrap)
                     .map(|height| content_height_dimension(style, height))
-                    .unwrap_or(actual_cross)
+                    .unwrap_or(actual_cross))
             } else {
                 width
             };
@@ -23066,7 +23311,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             natural_cross
         };
-        self.paint_positioned_flex_children(positioned, style, x, y, width, row, reverse, depth)?;
+        self.paint_positioned_flex_children(positioned, parent, style, x, y, width,
+            if row { cross_offset } else { total_main }, row, reverse, depth)?;
         Ok(if row {
             (total_main, cross_offset)
         } else {
@@ -23099,7 +23345,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             .iter_mut()
             .take(
                 paints
-                    + usize::from(item.style.opacity < 1.0 || item.style.filters.is_some())
+                    + usize::from(item.style.paints_as_group())
                     + usize::from(item.style.has_transform()),
             )
         {
@@ -23307,6 +23553,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             && style.position == Position::Static
             && style.float == Float::None
             && style.opacity == 1.0
+            && !style.has_mask()
             && !style.has_transform()
             && !style.overflow_clip
             && !style.contain_paint
@@ -27617,6 +27864,9 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             if let Some(binding)=FilterSourceBinding::from_style(&paragraph.frames[frame].style){
                 self.bind_css_filter_source(owners[at].layer,binding,paragraph.frames[frame].bounds.unwrap_or(owners[at].containing))?;
             }
+            if let Some(binding)=MaskBinding::from_style(&paragraph.frames[frame].style){
+                self.bind_css_mask(owners[at].layer,binding,paragraph.frames[frame].bounds.unwrap_or(owners[at].containing))?;
+            }
             let count=pieces.len().max(hit_pieces.len());let mut moved=Vec::new();
             moved.try_reserve_exact(count).map_err(|_|LayoutError::CommandLimit)?;
             for index in 0..count {let command=pieces.get(index).cloned().unwrap_or(0..0);
@@ -30651,6 +30901,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         if !style.is_atomic_inline() || style.width.is_some() {
             return Ok(());
         }
+        let available = if self.intrinsic_minimum_atomics { 0.0 } else { available };
         let minimum = self.intrinsic_size_mode(id, style, depth + 1, true)?.0;
         let preferred = self.intrinsic_size_mode(id, style, depth + 1, false)?.0;
         let shrink_to_fit = available.max(0.0).min(preferred).max(minimum);
@@ -31061,7 +31312,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
         }
         let inline_paint = computed.as_ref().filter(|style| style.display == Display::Inline
-            && (style.opacity < 1.0 || style.filters.is_some()) && self.measurement_glyphs.is_none())
+            && style.paints_as_group() && self.measurement_glyphs.is_none())
             .map(|_| (self.commands.len(), self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len()), self.next_paint_order()));
         let layer = self.begin_opacity(computed.as_ref().filter(|style| {
             !matches!(
@@ -31074,6 +31325,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             )
         }))?;
         let spatial = computed.as_ref().is_some_and(Style::has_spatial_filters);
+        let mask_binding = computed.as_ref().filter(|_| layer.is_some()).and_then(MaskBinding::from_style);
         let result = self.with_spatial_source_capture(spatial, |layout| layout.inline_content(
             id,
             parent_style,
@@ -31084,6 +31336,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             depth,
         ));
         let result = result?;
+        if let (Some((index, _)), Some(binding)) = (layer, mask_binding) {
+            let border = Rect { x: x + offset.0, y: y + offset.1, width: result.0, height: result.1 };
+            self.bind_css_mask(index, binding, border)?;
+        }
         self.end_opacity(layer)?;
         if let Some((commands, hits, order)) = inline_paint {
             self.record_stacking_escape_range(commands, hits, 0, (id,None), order, false)?;
@@ -31257,7 +31513,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             Some(self.reserve_side_border_commands(Rect { x: outer_x, y: outer_y, width: 0.0, height: 0.0 }, &style)?)
         } else { None };
         let saved_roots = (self.stacking_roots.len(), self.surface_roots.len());
-        let inline_context = if (style.opacity < 1.0 || style.filters.is_some()) && self.measurement_glyphs.is_none() {
+        let inline_context = if style.paints_as_group() && self.measurement_glyphs.is_none() {
             if saved_roots.0 == 512 || saved_roots.1 == 512 { return Err(LayoutError::DepthLimit); }
             self.stacking_roots.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
             self.surface_roots.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
@@ -31362,6 +31618,37 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             .map_err(|_| LayoutError::InvalidTree)? != Some(id))
     }
 
+    /// Paints the mask layers over the element's border box into their own
+    /// list and attaches it to the element's group, which multiplies its whole
+    /// result by that coverage.
+    fn bind_css_mask(&mut self,layer:usize,binding:MaskBinding,border:Rect)->Result<(),LayoutError> {
+        let saved=core::mem::take(&mut self.commands);
+        let saved_bytes=core::mem::replace(&mut self.command_bytes,0);
+        let mut layers=Vec::new();
+        let mut painted=Ok(());
+        if let Some(paint_layers)=background_layers(&binding.layers) {
+            for (index,layer) in paint_layers.iter().enumerate() {
+                painted=self.push_background_layer(border,None,&binding.layers,layer,index,None);
+                if painted.is_err(){break;}
+                let list=core::mem::take(&mut self.commands);
+                if !list.is_empty() {
+                    layers.push(crate::paint::MaskLayer{list:Arc::new(DisplayList(list)),luminance:binding.modes.get(index).copied().unwrap_or(false)});
+                }
+            }
+        }
+        self.commands=saved;
+        self.command_bytes=saved_bytes;
+        painted?;
+        let mut command=self.commands.get(layer).cloned().ok_or(LayoutError::InvalidTree)?;
+        let Command::PushLayer{svg_clip,..}=&mut command else{return Err(LayoutError::InvalidTree);};
+        *svg_clip=Some(Arc::new(crate::paint::SvgLayerClip{
+            transform:Affine::IDENTITY,
+            clip:Arc::new(crate::paint::SvgClip{units:crate::paint::SvgGradientUnits::UserSpaceOnUse,transform:Affine::IDENTITY,shapes:Arc::from([])}),
+            mask:Some(Arc::new(crate::paint::LayerMask{layers:Arc::from(layers),offset:[0.0;2]})),
+        }));
+        self.replace_command(layer,command)
+    }
+
     fn bind_css_filter_source(&mut self,layer:usize,binding:FilterSourceBinding,border:Rect)->Result<(),LayoutError> {
         // Filter Effects uses the element's current local coordinate system,
         // whose origin/percentage basis is the canonical transform reference.
@@ -31428,7 +31715,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn begin_opacity(&mut self, style: Option<&Style>) -> Result<Option<(usize, (usize, usize, usize))>, LayoutError> {
-        if let Some(style) = style.filter(|style|style.display!=Display::None && (style.opacity < 1.0 || style.filters.is_some())) {
+        if let Some(style) = style.filter(|style|style.display!=Display::None && style.paints_as_group()) {
             let index = self.commands.len();
             self.push_command(Command::PushLayer { svg_clip: None,
                 filters: style.filters.clone(),
@@ -31851,7 +32138,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             if let Some(z)=style.z_index{return Ok(Some(z));}
         }
         Ok((matches!(style.position,Position::Fixed|Position::Sticky) || style.has_transform()
-            || style.opacity<1.0 || style.filters.is_some() || style.contain_paint || style.contain_layout
+            || style.paints_as_group() || style.contain_paint || style.contain_layout
             || style.view_transition_name != css::ViewTransitionName::None).then_some(0))
     }
 
@@ -32214,8 +32501,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || style.display != Display::Block
             || style.position != Position::Static
             || style.float != Float::None
-            || style.opacity < 1.0
-            || style.filters.is_some()
+            || style.paints_as_group()
             || style.z_index.is_some()
             || style.has_transform()
             || style.overflow_clip
@@ -33698,6 +33984,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
         // would apply the same opacity/filter twice and use a CSS box basis.
         let svg_filter_owner=generated.is_none() && matches!(self.document.kind(id),Ok(NodeKind::Element{namespace:Namespace::Svg,name,..}) if crate::svg::local_name(name)=="svg");
         let filter_binding=computed.as_ref().filter(|style|!svg_filter_owner && style.display!=Display::None).and_then(FilterSourceBinding::from_style);
+        let mask_binding=computed.as_ref().filter(|style|!svg_filter_owner && style.display!=Display::None).and_then(MaskBinding::from_style);
         let mut filter_reference=Rect{x:origin.0,y:origin.1,width:0.0,height:0.0};
         let mut output_rect=output_rect;
         let layer = self.begin_opacity(computed.as_ref().filter(|_|!svg_filter_owner))?;
@@ -33730,7 +34017,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
             available,
             depth,
             child_override,
-            if filter_binding.is_some(){Some(&mut filter_reference)}else{output_rect.as_deref_mut()},
+            if filter_binding.is_some()||mask_binding.is_some(){Some(&mut filter_reference)}else{output_rect.as_deref_mut()},
         ));
         self.containing_block = saved;
         self.containing_block_node = saved_containing_block_node;
@@ -33743,9 +34030,14 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
             self.transform_depth -= 1;
         }
         let result = result?;
-        if let Some(binding)=filter_binding {
+        if filter_binding.is_some()||mask_binding.is_some() {
             if let Some(output)=output_rect{*output=filter_reference;}
+        }
+        if let Some(binding)=filter_binding {
             if let Some((index,_))=layer{self.bind_css_filter_source(index,binding,filter_reference)?;}
+        }
+        if let Some(binding)=mask_binding {
+            if let Some((index,_))=layer{self.bind_css_mask(index,binding,filter_reference)?;}
         }
         self.end_opacity(layer)?;
         let mut overflow_transform = None;
@@ -38015,12 +38307,14 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     // group together with root content. The principal used style below drops
     // only this filter to avoid applying the operation a second time.
     let root_filter_binding=FilterSourceBinding::from_style(&root_style);
-    let root_filter_layer = if initial.filters.is_some() {
+    let root_mask_binding=MaskBinding::from_style(&root_style);
+    let root_filter_layer = if initial.filters.is_some() || initial.has_mask() {
         let mut filter_style = initial.clone();
         filter_style.opacity = 1.0;
         let layer = layout.begin_opacity(Some(&filter_style))?;
         layout.source_capture_depth = usize::from(filter_style.has_spatial_filters());
         initial.filters = None;
+        initial.mask_images = None;
         layer
     } else { None };
     let canvas_index = if layout.canvas_background_source.is_some()
@@ -38067,6 +38361,10 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     if let (Some((layer,_)),Some(binding))=(root_filter_layer,root_filter_binding) {
         let border=layout.canvas_root_box.unwrap_or(Rect{x:0.0,y:0.0,width:0.0,height:0.0});
         layout.bind_css_filter_source(layer,binding,border)?;
+    }
+    if let (Some((layer,_)),Some(binding))=(root_filter_layer,root_mask_binding) {
+        let border=layout.canvas_root_box.unwrap_or(layout.viewport);
+        layout.bind_css_mask(layer,binding,border)?;
     }
     layout.end_opacity(root_filter_layer)?;
     layout.finish_display_list()
@@ -46796,6 +47094,146 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             boxes.iter().map(|rect| rect.width).collect::<Vec<_>>(),
             [8.0, 22.0, 14.0]
         );
+    }
+
+    #[test]
+    fn flex_container_intrinsic_size_sums_main_axis_item_contributions() {
+        let row = colored_boxes(
+            "<div style='float:left'><div style='display:flex;column-gap:4px;background:green'><div style='width:30px;height:10px;margin:0 5px'></div><div style='width:40px;height:12px'></div></div></div>",
+        );
+        assert_eq!(row.len(), 1);
+        assert_eq!((row[0].width, row[0].height), (84.0, 12.0));
+        let column = colored_boxes(
+            "<div style='float:left'><div style='display:flex;flex-direction:column;row-gap:4px;background:green'><div style='width:30px;height:10px'></div><div style='width:40px;height:20px'></div></div></div>",
+        );
+        assert_eq!(column.len(), 1);
+        assert_eq!((column[0].width, column[0].height), (40.0, 34.0));
+        let widths = colored_boxes(
+            "<div style='display:flex;width:min-content;background:green'><div style='width:30px;height:4px'></div><div style='width:40px;height:4px'></div></div><div style='display:flex;flex-wrap:wrap;width:min-content;background:green'><div style='width:30px;height:4px'></div><div style='width:40px;height:4px'></div></div>",
+        );
+        assert_eq!(
+            widths.iter().map(|rect| rect.width).collect::<Vec<_>>(),
+            [70.0, 40.0]
+        );
+    }
+
+    #[test]
+    fn min_content_of_inline_blocks_uses_their_own_min_content_contribution() {
+        let boxes = colored_boxes(
+            "<div style='width:min-content;background:green'><span style='display:inline-block'><span style='display:inline-block;width:30px;height:10px'></span> <span style='display:inline-block;width:40px;height:10px'></span></span></div>",
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].width, 40.0);
+    }
+
+    #[test]
+    fn grid_item_intrinsic_height_collapses_block_margins() {
+        let heights = |markup: &str| colored_boxes(markup).iter().map(|rect| rect.height).collect::<Vec<_>>();
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='margin:20px 0;height:10px'></div><div style='margin:20px 0;height:10px'></div></div></div>"),
+            [80.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='margin:20px 0;height:10px'></div><div style='margin:30px 0'></div><div style='margin:20px 0;height:10px'></div></div></div>"),
+            [90.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='margin:20px 0 0'><div style='margin:30px 0 0;height:10px'></div></div></div></div>"),
+            [40.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='margin:24px 0'></div></div></div>"),
+            [24.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='overflow:hidden'><div style='margin:30px 0;height:10px'></div></div></div></div>"),
+            [70.0]
+        );
+    }
+
+    #[test]
+    fn intrinsic_margin_escapes_share_the_intrinsic_cache_lifecycle() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=p><div id=b><div style='margin:20px 0;height:10px'></div></div></div>", 32).unwrap();
+        let b = crate::selector::query_selector(&document, document.root(), "#b").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let layout = Layout::new(&document, &FixedText, &uses, &rules, None,
+            Rect { x:0.0,y:0.0,width:100.0,height:100.0 }, None, &[], &styles, None);
+        let style = layout.computed_style_from_tree(b).unwrap();
+        layout.intrinsic_size_mode(b, &style, 0, false).unwrap();
+        let slot = b.index() * 2;
+        let measured = layout.intrinsic_margins.borrow().get(slot).copied().flatten();
+        let adds = |margins: Option<BlockMargins>| margins.map(|margins| (margins.lead_add, margins.trail_add));
+        assert!(adds(measured).is_some_and(|(lead, _)| lead > 0.0));
+        layout.intrinsic_size_mode_inner(b, &style, Some(&style), 0, false, None).unwrap();
+        assert_eq!(adds(layout.intrinsic_margins.borrow().get(slot).copied().flatten()), adds(measured),
+            "an origin-qualified measurement leaves the cached size and its margins untouched");
+    }
+
+    #[test]
+    fn cleared_block_does_not_collapse_with_previous_sibling_in_intrinsic_height() {
+        let heights = |markup: &str| colored_boxes(markup).iter().map(|rect| rect.height).collect::<Vec<_>>();
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='float:left;width:10px;height:60px'></div><div style='height:10px;margin-bottom:20px'></div><div style='clear:both;height:10px;margin-top:20px'></div></div></div>"),
+            [70.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='float:left;width:10px;height:60px'></div><div style='height:10px;margin-bottom:20px'></div><div style='clear:both;margin:20px 0'></div><div style='height:10px;margin-top:5px'></div></div></div>"),
+            [90.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='float:right;width:10px;height:35px'></div><div style='height:10px;margin-bottom:20px'></div><div style='clear:left;height:10px;margin-top:20px'></div></div></div>"),
+            [40.0],
+            "clearing the other side keeps the margins collapsed"
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='float:right;width:10px;height:35px'></div><div style='height:10px;margin-bottom:20px'></div><div style='clear:right;height:10px;margin-top:20px'></div></div></div>"),
+            [45.0]
+        );
+        assert_eq!(
+            heights("<div style='display:grid;background:green'><div><div style='height:10px;margin-bottom:20px'></div><div style='clear:both;height:10px;margin-top:20px'></div></div></div>"),
+            [40.0]
+        );
+    }
+
+    #[test]
+    fn flex_items_with_zero_flex_basis_still_contribute_their_content_size() {
+        let widths = |markup: &str| colored_boxes(markup).iter().map(|rect| rect.width).collect::<Vec<_>>();
+        assert_eq!(
+            widths("<div style='float:left;display:flex;background:green'><div style='flex:1 1 0px'><div style='width:30px;height:4px'></div></div><div style='flex:1 1 0px'><div style='width:40px;height:4px'></div></div></div>"),
+            [70.0]
+        );
+        assert_eq!(
+            widths("<div style='float:left;display:flex;background:green'><div style='flex:0 1 100px'><div style='width:30px;height:4px'></div></div></div>"),
+            [30.0]
+        );
+        assert_eq!(
+            widths("<div style='float:left;display:flex;background:green'><div style='flex:0 0 100px'><div style='width:30px;height:4px'></div></div><div style='flex:1'><div style='width:40px;height:4px'></div></div></div>"),
+            [140.0]
+        );
+    }
+
+    #[test]
+    fn single_line_flex_cross_size_is_clamped_by_min_height() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;align-items:center;min-height:40px'><div style='width:20px;height:10px;background:green'></div></div>",
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].y, boxes[0].height), (15.0, 10.0));
+        let capped = colored_boxes(
+            "<div style='display:flex;align-items:flex-end;max-height:20px'><div style='width:20px;height:30px;background:green'></div></div>",
+        );
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].height, 30.0);
+    }
+
+    #[test]
+    fn absolute_flex_child_resolves_bottom_against_auto_height_container() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;position:relative;width:50px'><div style='width:20px;height:30px'></div><div style='position:absolute;bottom:0;left:0;width:10px;height:5px;background:green'></div></div>",
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y), (0.0, 25.0));
     }
 
     #[test]

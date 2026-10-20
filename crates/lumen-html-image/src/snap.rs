@@ -81,7 +81,7 @@ mod tests {
             assert_eq!(draw(&transformed,RasterizationMode::CssPixelSnapped),draw(&transformed,RasterizationMode::Antialiased),"transform scopes preserve fractional source/result coverage");
             assert!(matches!(source.0[1],Command::PushLayer{rect:original,..} if original==rect),"render mode never changes CSS layout coordinates");
             let mut untouched=DisplayList(vec![Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:false,svg_clip:None,filters:None},
-                Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:true,svg_clip:Some(Arc::new(SvgLayerClip{transform:Affine::IDENTITY,
+                Command::PushLayer{rect,radius:0.0,corners:None,opacity,clip:true,svg_clip:Some(Arc::new(SvgLayerClip{mask:None,transform:Affine::IDENTITY,
                     clip:Arc::new(SvgClip{units:SvgGradientUnits::ObjectBoundingBox,transform:Affine::IDENTITY,shapes:Arc::from([])})})),filters:None}]);
             boxes(&mut untouched,scale);
             assert!(untouched.0.iter().all(|command|matches!(command,Command::PushLayer{rect:original,..} if *original==rect)),"filter metadata and SVG object-box/path contours remain in their source coordinate system");

@@ -1564,6 +1564,27 @@ pub enum Command {
 pub struct SvgLayerClip {
     pub transform: Affine,
     pub clip: Arc<SvgClip>,
+    /// CSS `mask-image` coverage for the layer's whole result. A mask owner
+    /// carries no clip shapes: its coverage is the mask alone.
+    pub mask: Option<Arc<LayerMask>>,
+}
+
+/// Painted mask layers of a CSS masked element, in the coordinates of the
+/// display list they ride in. Retained scroll movement adjusts `offset`
+/// without cloning the layers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerMask {
+    /// Mask layers in paint order (bottom first); their alphas are unioned.
+    pub layers: Arc<[MaskLayer]>,
+    pub offset: [f32; 2],
+}
+
+/// One `mask-image` layer with its own `mask-mode`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskLayer {
+    pub list: Arc<DisplayList>,
+    /// `mask-mode: luminance` weighs the layer by its luminance; otherwise by alpha.
+    pub luminance: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1692,7 +1713,9 @@ impl Command {
         let payload=payload.saturating_add(match self {
             Self::PushLayer{svg_clip:Some(owner),..}=>core::mem::size_of::<SvgLayerClip>()+2*arc_header
                 +core::mem::size_of::<SvgClip>()+owner.clip.shapes.iter().fold(0usize,|bytes,shape|
-                    bytes.saturating_add(core::mem::size_of::<SvgClipShape>()+shape.data.len()+arc_header)),
+                    bytes.saturating_add(core::mem::size_of::<SvgClipShape>()+shape.data.len()+arc_header))
+                +owner.mask.as_ref().map_or(0,|mask|core::mem::size_of::<LayerMask>()+arc_header+mask.layers.iter().fold(0usize,|bytes,layer|
+                    bytes.saturating_add(core::mem::size_of::<MaskLayer>()+arc_header+layer.list.referenced_bytes()))),
             _=>0,
         });
         let corners = match self {
@@ -1848,7 +1871,9 @@ impl DisplayList {
                             || *radius < 0.0
                             || !opacity.is_finite()
                             || !(0.0..=1.0).contains(opacity)
-                            || svg_clip.as_ref().is_some_and(|owner|!owner.transform.is_finite()
+                            || svg_clip.as_ref().is_some_and(|owner|owner.mask.as_ref().is_some_and(|mask|
+                                    mask.offset.iter().any(|value|!value.is_finite()) || mask.layers.iter().any(|layer|layer.list.validate().is_err()))
+                                || !owner.transform.is_finite()
                                 || !owner.clip.transform.is_finite() || owner.clip.shapes.len()>MAX_SVG_CLIP_PATHS
                                 || owner.clip.shapes.iter().any(|shape|shape.data.len()>MAX_SVG_PATH_BYTES || !shape.transform.is_finite()))
                             || filters.as_ref().is_some_and(|values| values.is_empty() || values.len() > lumen_common::filter::MAX_COLOR_FILTERS || values.iter().any(|value| !value.is_valid()))

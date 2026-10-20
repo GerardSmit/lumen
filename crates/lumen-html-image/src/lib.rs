@@ -2660,6 +2660,9 @@ impl FilterRegionGraph {
         let Command::PushLayer{rect,radius,corners,opacity,clip,svg_clip,..}=command else{return Err(ImageError::InvalidViewport);};
         apply_layer_result_coverage(&mut image,rect,radius,corners.as_deref().copied(),opacity,clip,svg_clip.as_deref(),svg_object_box,
             scale,region.left as f32,region.top as f32,working)?;
+        if let Some(mask)=svg_clip.as_ref().and_then(|owner|owner.mask.as_deref()) {
+            apply_layer_mask(&mut image,mask,scale,region.left as f32,region.top as f32,working,font,cache)?;
+        }
         return self.publish(node,image,reserved);
     }
     let all_filters=filters.as_ref();
@@ -2790,11 +2793,42 @@ fn render_filter_region_in_operation(source:&[Command],filters:&[lumen_common::f
     graph.input(root,source,filters,scale,font,cache,reserved,capture,scene,view)
 }
 
+/// CSS `mask-image`: the layer result is multiplied by the alpha (or
+/// luminance) of the painted mask layers. Mask layers are ordinary display
+/// commands in the layer's coordinates, rendered over the same device window.
+fn apply_layer_mask(image:&mut Rgba8Image,mask:&lumen_html::paint::LayerMask,scale:f32,left:f32,top:f32,
+    reserved:usize,font:Option<&dyn FontProvider>,cache:&mut GlyphCache)->Result<(),ImageError> {
+    let plane_bytes=image.pixels.len()/4;
+    let held=reserved.checked_add(image.pixels.len()).and_then(|bytes|bytes.checked_add(plane_bytes))
+        .filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    let mut union=vec![0u8;plane_bytes];
+    for layer in mask.layers.iter() {
+        let mut commands=layer.list.0.clone();
+        if mask.offset!=[0.0;2] {
+            for command in &mut commands {translate_command(command,mask.offset[0],mask.offset[1]);}
+        }
+        let mut bytes=held;
+        let resolved=resolve_layers(&commands,scale,font,cache,&mut bytes)?;
+        let coverage=render_scaled_region_at(&resolved,image.width,image.height,scale,font,cache,[left as i64,top as i64],Some(bytes))?;
+        for(accumulated,sample)in union.iter_mut().zip(coverage.pixels.chunks_exact(4)) {
+            let weight=if layer.luminance {
+                let luminance=(2126*u32::from(sample[0])+7152*u32::from(sample[1])+722*u32::from(sample[2])+5000)/10000;
+                (luminance*u32::from(sample[3])+127)/255
+            }else{u32::from(sample[3])};
+            *accumulated=(weight+(u32::from(*accumulated)*(255-weight)+127)/255)as u8;
+        }
+    }
+    for(pixel,weight)in image.pixels.chunks_exact_mut(4).zip(union.iter()) {
+        pixel[3]=((u32::from(pixel[3])*u32::from(*weight)+127)/255)as u8;
+    }
+    Ok(())
+}
+
 fn apply_layer_result_coverage(image:&mut Rgba8Image,rect:Rect,radius:f32,corners:Option<[[f32;2];4]>,
     opacity:f32,clip:bool,svg_clip:Option<&lumen_html::paint::SvgLayerClip>,svg_object_box:Option<Affine>,
     scale:f32,left:f32,top:f32,reserved:usize)->Result<(),ImageError> {
         let width=image.width as f32;let height=image.height as f32;
-        if let Some(owner)=svg_clip {
+        if let Some(owner)=svg_clip.filter(|owner|owner.mask.is_none() || !owner.clip.shapes.is_empty()) {
             // Source image + mask Canvas + its snapshot remain under one shared
             // layer budget. Clip coverage is applied once, after all filters.
             let len=image.pixels.len();
@@ -2931,6 +2965,9 @@ fn resolve_layer_region_tiles(source:&[Command],filters:Option<&[lumen_common::f
         let coverage_reserved=graph.occupied(reserved)?.checked_add(image.pixels.len()).ok_or(ImageError::TooLarge)?;
         apply_layer_result_coverage(&mut image,rect,radius,corners,opacity,clip,svg_clip,svg_object_box,
             scale,tile.left as f32,tile.top as f32,coverage_reserved)?;
+        if let Some(mask)=svg_clip.and_then(|owner|owner.mask.as_deref()) {
+            apply_layer_mask(&mut image,mask,scale,tile.left as f32,tile.top as f32,coverage_reserved,font,cache)?;
+        }
         if let Some(visible)=filter_visible_region(&image,tile) {
             if visible!=tile {image=crop_filter_region(&image,tile,visible,graph.occupied(reserved)?)?;}
             let wrapper=core::mem::size_of::<ImageData>()+2*core::mem::size_of::<usize>();
@@ -3404,6 +3441,9 @@ fn resolve_layers_region_in_operation(
         if let Some(filters)=filters {apply_filter_operations(&mut image,filters,scale,*bytes)?;}
         apply_layer_result_coverage(&mut image,rect,radius,corners.as_deref().copied(),opacity,clip,
             svg_clip.as_deref(),svg_object_box,scale,left,top,*bytes)?;
+        if let Some(mask)=svg_clip.as_ref().and_then(|owner|owner.mask.as_deref()) {
+            apply_layer_mask(&mut image,mask,scale,left,top,*bytes,font,cache)?;
+        }
         output.0.push(Command::Image {
             rect: Rect {
                 x,
@@ -3587,7 +3627,8 @@ fn translate_command(command: &mut Command, x: f32, y: f32) {
         }
         Command::PushLayer{rect,svg_clip,..}=>{
             rect.x+=x;rect.y+=y;
-            if let Some(owner)=svg_clip {let owner=Arc::make_mut(owner);owner.transform.e+=x;owner.transform.f+=y;}
+            if let Some(owner)=svg_clip {let owner=Arc::make_mut(owner);owner.transform.e+=x;owner.transform.f+=y;
+                if let Some(mask)=&mut owner.mask {let mask=Arc::make_mut(mask);mask.offset[0]+=x;mask.offset[1]+=y;}}
         }
         Command::PushClip(rect) | Command::PushBoxClip(rect)
         | Command::FillRect { rect, .. }
@@ -5018,6 +5059,56 @@ mod tests {
     }
 
     #[test]
+    fn mask_image_multiplies_the_whole_element_group_by_mask_alpha() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        for property in ["mask-image", "-webkit-mask-image"] {
+            let html = format!(
+                "<body style='margin:0'><div style='width:8px;height:4px;background:red;{property}:linear-gradient(to right,#000 4px,transparent 4px)'><div style='width:8px;height:4px;background:blue'></div></div></body>"
+            );
+            let image = render_html_with_font(&html, 8, 4, 1.0, &font).unwrap();
+            let pixel = |x: usize, y: usize| &image.pixels[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+            assert_eq!(pixel(1, 1), &[0, 0, 255, 255], "{property}: inside the mask");
+            assert_eq!(pixel(6, 1), &[255, 255, 255, 255], "{property}: outside the mask shows the page");
+        }
+        let unmasked = render_html_with_font(
+            "<body style='margin:0'><div style='width:8px;height:4px;background:red;mask-image:none'></div></body>", 8, 4, 1.0, &font).unwrap();
+        assert_eq!(&unmasked.pixels[6 * 4..7 * 4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn mask_mode_applies_per_layer() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let render = |style: &str| {
+            let html = format!("<body style='margin:0'><div style='width:8px;height:4px;background:red;{style}'></div></body>");
+            render_html_with_font(&html, 8, 4, 1.0, &font).unwrap()
+        };
+        let layers = "mask-image:linear-gradient(to right,#000 4px,transparent 4px),linear-gradient(#000,#000);";
+        let mixed = render(&format!("{layers}mask-mode:alpha,luminance"));
+        let pixel = |image: &Rgba8Image, x: usize| image.pixels[(x + 8) * 4..(x + 8) * 4 + 4].to_vec();
+        assert_eq!(pixel(&mixed, 1), [255, 0, 0, 255], "the alpha layer covers the left half");
+        assert_eq!(pixel(&mixed, 6), [255, 255, 255, 255], "an opaque black luminance layer has no coverage");
+        let alpha = render(&format!("{layers}mask-mode:alpha"));
+        assert_eq!(pixel(&alpha, 6), [255, 0, 0, 255], "alpha mode on every layer covers the right half too");
+        let second_luminance = render(&format!("{layers}mask-mode:luminance,alpha"));
+        assert_eq!(pixel(&second_luminance, 6), [255, 0, 0, 255], "the second layer's own mode is honoured");
+    }
+
+    #[test]
+    fn mask_image_applies_to_inline_boxes_and_the_root_element() {
+        let font = FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let mask = "mask-image:linear-gradient(to right,#000 4px,transparent 4px)";
+        let inline = render_html_with_font(&format!(
+            "<body style='margin:0'><span style='display:inline;{mask};background:red;font-size:8px'>&#9608;&#9608;&#9608;&#9608;</span></body>"), 32, 8, 1.0, &font).unwrap();
+        let alpha_covered = |image: &Rgba8Image, x: usize, y: usize| image.pixels[(y * image.width as usize + x) * 4..][..4] != [255, 255, 255, 255];
+        assert!(alpha_covered(&inline, 1, 1), "inline ink inside the mask is kept");
+        assert!(!alpha_covered(&inline, 6, 1), "inline ink outside the mask is removed");
+        let root = render_html_with_font(&format!(
+            "<html style='{mask}'><body style='margin:0;background:red'><div style='height:4px'></div></body></html>"), 8, 4, 1.0, &font).unwrap();
+        assert!(alpha_covered(&root, 1, 1), "the root box inside the mask is kept");
+        assert!(!alpha_covered(&root, 6, 1), "the root box outside the mask is removed");
+    }
+
+    #[test]
     fn layers_crop_and_apply_opacity_after_children_overlap() {
         let rect = Rect {
             x: 3.0,
@@ -5243,7 +5334,7 @@ mod tests {
         use lumen_html::paint::{SvgClip,SvgClipShape,SvgLayerClip,SvgGradientUnits,SvgPaint};
         let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
         let viewport=Rect{x:0.0,y:0.0,width:10.0,height:10.0};
-        let clip=|data:&str,units,transform|Arc::new(SvgLayerClip{transform,clip:Arc::new(SvgClip{
+        let clip=|data:&str,units,transform|Arc::new(SvgLayerClip{transform,mask:None,clip:Arc::new(SvgClip{
             units,transform:Affine::IDENTITY,shapes:Arc::from([SvgClipShape{data:Arc::from(data),transform:Affine::IDENTITY,fill_rule:PaintSvgFillRule::NonZero}])})});
         let path=|data:&str,color|Command::SvgPath{bounds:viewport,data:Arc::from(data),transform:Affine::IDENTITY,
             fill:Some(SvgPaint::Color(color)),stroke:None,stroke_width:0.0,fill_rule:PaintSvgFillRule::NonZero,clips:Arc::from([])};
@@ -8105,4 +8196,18 @@ mod tests {
         assert!(range.pixels.chunks_exact(4).any(|pixel|pixel==[0,0,0,255]),"primitive range retains actual operating thumb");
     }
 
+
+    #[test]
+    fn translate_command_shifts_layer_mask_offset_with_the_layer() {
+        use lumen_html::paint::{LayerMask,SvgClip,SvgGradientUnits,SvgLayerClip};
+        let mask=Arc::new(LayerMask{layers:Arc::from([]),offset:[3.0,4.0]});
+        let owner=Arc::new(SvgLayerClip{transform:Affine::IDENTITY,mask:Some(mask),
+            clip:Arc::new(SvgClip{units:SvgGradientUnits::UserSpaceOnUse,transform:Affine::IDENTITY,shapes:Arc::from([])})});
+        let mut command=Command::PushLayer{svg_clip:Some(owner),filters:None,corners:None,
+            rect:Rect{x:1.0,y:2.0,width:10.0,height:10.0},radius:0.0,opacity:1.0,clip:false};
+        translate_command(&mut command,5.0,-2.0);
+        let Command::PushLayer{rect,svg_clip:Some(owner),..}=&command else{panic!("layer")};
+        assert_eq!((rect.x,rect.y),(6.0,0.0));
+        assert_eq!(owner.mask.as_ref().unwrap().offset,[8.0,2.0],"mask stays aligned with the translated layer");
+    }
 }

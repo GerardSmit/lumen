@@ -264,6 +264,33 @@ pub enum BackgroundAttachment {
     Fixed,
     Local,
 }
+/// `mask-mode`; `match-source` resolves to alpha for raster and SVG images.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MaskMode {
+    #[default]
+    MatchSource,
+    Alpha,
+    Luminance,
+}
+impl MaskMode {
+    pub fn luminance(self) -> bool {
+        self == Self::Luminance
+    }
+}
+
+fn mask_modes(raw: &str) -> Option<Arc<[MaskMode]>> {
+    let values = top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)?
+        .into_iter()
+        .map(|part| match &*ascii_lower(part.trim()) {
+            "match-source" => Some(MaskMode::MatchSource),
+            "alpha" => Some(MaskMode::Alpha),
+            "luminance" => Some(MaskMode::Luminance),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(values.into())
+}
+
 fn background_attachments(raw: &str) -> Option<Arc<[BackgroundAttachment]>> {
     let values = top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)?
         .into_iter()
@@ -2727,6 +2754,13 @@ pub struct StyleExtras {
     pub background_clip: Option<Arc<[BackgroundBox]>>,
     pub background_origin: Option<Arc<[BackgroundBox]>>,
     pub background_attachment: Option<Arc<[BackgroundAttachment]>>,
+    pub mask_images: Option<Arc<[BackgroundImage]>>,
+    pub mask_position: Option<Arc<[[LengthPercentage; 2]]>>,
+    pub mask_size: Option<Arc<[BackgroundSize]>>,
+    pub mask_repeat: Option<Arc<[[BackgroundRepeat; 2]]>>,
+    pub mask_origin: Option<Arc<[BackgroundBox]>>,
+    pub mask_clip: Option<Arc<[BackgroundBox]>>,
+    pub mask_mode: Option<Arc<[MaskMode]>>,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub white_space: WhiteSpace,
@@ -2976,6 +3010,13 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     background_clip: None,
     background_origin: None,
     background_attachment: None,
+    mask_images: None,
+    mask_position: None,
+    mask_size: None,
+    mask_repeat: None,
+    mask_origin: None,
+    mask_clip: None,
+    mask_mode: None,
     overflow_x: Overflow::Visible,
     overflow_y: Overflow::Visible,
     white_space: WhiteSpace::Normal,
@@ -4069,6 +4110,14 @@ impl Style {
         if self.relative_expressions.iter().any(|expression|(239..=241).contains(&expression.slot)){
             self.relative_expressions.retain(|expression|!(239..=241).contains(&expression.slot));
         }
+    }
+    /// A non-`none` `mask-image` layer masks the element's whole painted group.
+    pub fn has_mask(&self) -> bool {
+        self.mask_images.as_ref().is_some_and(|images| images.iter().any(|image| !matches!(image, BackgroundImage::None)))
+    }
+    /// Opacity, filters and masks each paint the element as one isolated group.
+    pub fn paints_as_group(&self) -> bool {
+        self.opacity < 1.0 || self.filters.is_some() || self.has_mask()
     }
     pub fn has_transform(&self)->bool {
         self.transforms.is_some()||self.individual_transforms.iter().any(Option::is_some)||self.relative_expressions.iter().any(|expression|expression.slot==59||(239..=241).contains(&expression.slot))
@@ -5432,6 +5481,12 @@ enum Value {
     BackgroundRepeats(Arc<[[BackgroundRepeat; 2]]>),
     BackgroundClip(Arc<[BackgroundBox]>),
     BackgroundOrigin(Arc<[BackgroundBox]>),
+    MaskImages(Option<Arc<[BackgroundImage]>>),
+    MaskPosition(Option<Arc<[[LengthPercentage; 2]]>>),
+    MaskSize(Option<Arc<[BackgroundSize]>>),
+    MaskRepeat(Option<Arc<[[BackgroundRepeat; 2]]>>),
+    MaskBoxes(usize, Option<Arc<[BackgroundBox]>>),
+    MaskModes(Option<Arc<[MaskMode]>>),
 
     ContextLength(usize, Box<str>, bool),
     HtmlDimension(usize, RelativeLength),
@@ -5705,6 +5760,12 @@ impl Value {
             Self::BackgroundRepeats(_) => 70,
             Self::BackgroundClip(_) => 71,
             Self::BackgroundOrigin(_) => 72,
+            Self::MaskImages(_) => 257,
+            Self::MaskPosition(_) => 258,
+            Self::MaskSize(_) => 259,
+            Self::MaskRepeat(_) => 260,
+            Self::MaskBoxes(slot, _) => *slot,
+            Self::MaskModes(_) => 263,
 
             Self::ContextLength(slot, _, _) | Self::HtmlDimension(slot, _) => *slot,
             Self::MinHeight(_) | Self::MinHeightAuto => 51,
@@ -5940,6 +6001,14 @@ impl Value {
                     Some(v.clone())
                 };
             }
+            Self::MaskImages(v) => style.mask_images = v.clone(),
+            Self::MaskPosition(v) => style.mask_position = v.clone(),
+            Self::MaskSize(v) => style.mask_size = v.clone(),
+            Self::MaskRepeat(v) => style.mask_repeat = v.clone(),
+            Self::MaskBoxes(slot, v) => {
+                if *slot == 261 { style.mask_origin = v.clone(); } else { style.mask_clip = v.clone(); }
+            }
+            Self::MaskModes(v) => style.mask_mode = v.clone(),
 
             Self::HtmlDimension(slot, dimension) => {
                 if dimension.percent != 0.0 {
@@ -11017,7 +11086,7 @@ struct PropertyRegistration {
     in_all: bool,
 }
 
-const PROPERTY_COUNT: usize = 257;
+const PROPERTY_COUNT: usize = 264;
 
 const fn same_property_name(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
@@ -11234,6 +11303,21 @@ property_registry! {
     "background-repeat" => [70], false, true;
     "background-clip" => [71], false, true;
     "background-origin" => [72], false, true;
+    "mask" => [257,258,259,260,261,262,263], false, true;
+    "-webkit-mask" => [257,258,259,260,261,262,263], false, true;
+    "mask-image" => [257], false, true;
+    "-webkit-mask-image" => [257], false, true;
+    "mask-position" => [258], false, true;
+    "-webkit-mask-position" => [258], false, true;
+    "mask-size" => [259], false, true;
+    "-webkit-mask-size" => [259], false, true;
+    "mask-repeat" => [260], false, true;
+    "-webkit-mask-repeat" => [260], false, true;
+    "mask-origin" => [261], false, true;
+    "-webkit-mask-origin" => [261], false, true;
+    "mask-clip" => [262], false, true;
+    "-webkit-mask-clip" => [262], false, true;
+    "mask-mode" => [263], false, true;
     "aspect-ratio" => [73], false, true;
     "z-index" => [74], false, true;
     "margin-inline" => [85, 86], false, true;
@@ -11901,6 +11985,13 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
         70 => to.background_repeat = from.background_repeat.clone(),
         71 => to.background_clip = from.background_clip.clone(),
         72 => to.background_origin = from.background_origin.clone(),
+        257 => to.mask_images = from.mask_images.clone(),
+        258 => to.mask_position = from.mask_position.clone(),
+        259 => to.mask_size = from.mask_size.clone(),
+        260 => to.mask_repeat = from.mask_repeat.clone(),
+        261 => to.mask_origin = from.mask_origin.clone(),
+        262 => to.mask_clip = from.mask_clip.clone(),
+        263 => to.mask_mode = from.mask_mode.clone(),
         73 => {
             to.aspect_ratio = from.aspect_ratio;
             to.aspect_ratio_components = from.aspect_ratio_components;
@@ -14109,6 +14200,170 @@ fn background_clip_boxes(raw: &str) -> Option<Arc<[BackgroundBox]>> {
         boxes.push(value);
     }
     Some(boxes.into())
+}
+
+fn mask_property(name: &str) -> Option<&str> {
+    let unprefixed = name.strip_prefix("-webkit-").unwrap_or(name);
+    (matches!(
+        unprefixed,
+        "mask" | "mask-image" | "mask-position" | "mask-size" | "mask-repeat" | "mask-origin" | "mask-clip" | "mask-mode"
+    ) && !slots(name).is_empty())
+    .then_some(unprefixed)
+}
+
+fn mask_image_value(raw: &str) -> Option<Value> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("none") {
+        return Some(Value::MaskImages(None));
+    }
+    let images = background_images(raw, Style::initial().color, Some(static_length_context()))?;
+    Some(Value::MaskImages(Some(images)))
+}
+
+fn mask_position_value(raw: &str) -> Option<Value> {
+    let context = static_length_context();
+    for part in top_level_split(raw, b',', MAX_BACKGROUND_GEOMETRY_VALUES)? {
+        background_position(&components(part)?, context)?;
+    }
+    Some(Value::MaskPosition(background_positions(raw, None)))
+}
+
+fn mask_size_value(raw: &str) -> Option<Value> {
+    let context = static_length_context();
+    for part in top_level_split(raw, b',', MAX_BACKGROUND_GEOMETRY_VALUES)? {
+        parse_background_size(part, context)?;
+    }
+    if background_sizes::contains_math(raw) {
+        return None;
+    }
+    Some(Value::MaskSize(background_sizes(raw, None)))
+}
+
+fn mask_repeat_value(repeats: Arc<[[BackgroundRepeat; 2]]>) -> Value {
+    let initial = repeats.iter().all(|repeat| *repeat == [BackgroundRepeat::Repeat; 2]);
+    Value::MaskRepeat((!initial).then_some(repeats))
+}
+
+/// Maps the css-masking geometry boxes onto the boxes an HTML element has.
+/// `fill-box` is the content box and `stroke-box`/`view-box` the border box;
+/// `no-clip` (clip only) paints without a clip, which the border box
+/// approximates because mask layers never extend beyond it.
+fn mask_box_keyword(token: &str, clip: bool) -> Option<&'static str> {
+    match &*ascii_lower(token) {
+        "border-box" | "stroke-box" | "view-box" => Some("border-box"),
+        "padding-box" => Some("padding-box"),
+        "content-box" | "fill-box" => Some("content-box"),
+        "no-clip" if clip => Some("border-box"),
+        _ => None,
+    }
+}
+
+fn mask_boxes_value(slot: usize, raw: &str) -> Option<Value> {
+    let clip = slot == 262;
+    let mut boxes = Vec::new();
+    for part in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
+        let tokens = components(part)?;
+        let [token] = tokens.as_slice() else { return None };
+        boxes.push(parse_background_box(mask_box_keyword(token, clip)?)?);
+    }
+    let initial = boxes.iter().all(|value| *value == BackgroundBox::Border);
+    Some(Value::MaskBoxes(slot, (!initial).then(|| boxes.into())))
+}
+
+fn mask_modes_value(raw: &str) -> Option<Value> {
+    let modes = mask_modes(raw)?;
+    let initial = modes.iter().all(|mode| *mode == MaskMode::MatchSource);
+    Some(Value::MaskModes((!initial).then_some(modes)))
+}
+
+struct MaskShorthand {
+    images: String,
+    positions: String,
+    sizes: String,
+    repeats: Vec<[BackgroundRepeat; 2]>,
+    origins: Vec<BackgroundBox>,
+    clips: Vec<BackgroundBox>,
+    modes: Vec<MaskMode>,
+}
+
+/// `mask` shorthand. Mask layers share the background layer grammar apart
+/// from the mode/composite keywords, which are split off first, and from the
+/// initial box, which is `border-box` for both origin and clip.
+fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
+    let mut layers = Vec::new();
+    let mut modes = Vec::new();
+    for layer in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
+        let mut mode = None;
+        let mut tokens = Vec::new();
+        let mut boxes = 0;
+        for token in components(layer)? {
+            match &*ascii_lower(token) {
+                "match-source" | "alpha" | "luminance" => {
+                    if mode.replace(mask_modes(token)?[0]).is_some() {
+                        return None;
+                    }
+                }
+                "add" | "subtract" | "intersect" | "exclude" => {}
+                _ => match mask_box_keyword(token, true) {
+                    Some(keyword) => {
+                        boxes += 1;
+                        tokens.push(keyword);
+                    }
+                    None => tokens.push(token),
+                },
+            }
+        }
+        if boxes == 0 {
+            tokens.push("border-box");
+        }
+        layers.push(tokens.join(" "));
+        modes.push(mode.unwrap_or_default());
+    }
+    let parts = background_shorthand(&layers.join(","))?;
+    if parts.color.is_some() {
+        return None;
+    }
+    Some(MaskShorthand {
+        images: parts.images,
+        positions: parts.positions,
+        sizes: parts.sizes,
+        repeats: parts.repeats?,
+        origins: parts.origins,
+        clips: parts.clips,
+        modes,
+    })
+}
+
+fn mask_shorthand(raw: &str) -> Option<Vec<Value>> {
+    let parts = mask_shorthand_parts(raw)?;
+    let modes: Arc<[MaskMode]> = parts.modes.into();
+    let origins: Arc<[BackgroundBox]> = parts.origins.into();
+    let clips: Arc<[BackgroundBox]> = parts.clips.into();
+    let initial = |boxes: &[BackgroundBox]| boxes.iter().all(|value| *value == BackgroundBox::Border);
+    Some(alloc::vec![
+        mask_image_value(&parts.images)?,
+        mask_position_value(&parts.positions)?,
+        mask_size_value(&parts.sizes)?,
+        mask_repeat_value(parts.repeats.into()),
+        Value::MaskBoxes(261, (!initial(&origins)).then_some(origins)),
+        Value::MaskBoxes(262, (!initial(&clips)).then_some(clips)),
+        Value::MaskModes((!modes.iter().all(|mode| *mode == MaskMode::MatchSource)).then_some(modes)),
+    ])
+}
+
+fn mask_declaration_values(name: &str, raw: &str) -> Option<Vec<Value>> {
+    let raw = raw.trim();
+    Some(alloc::vec![match name {
+        "mask" => return mask_shorthand(raw),
+        "mask-image" => mask_image_value(raw)?,
+        "mask-position" => mask_position_value(raw)?,
+        "mask-size" => mask_size_value(raw)?,
+        "mask-repeat" => mask_repeat_value(background_repeats(raw)?),
+        "mask-origin" => mask_boxes_value(261, raw)?,
+        "mask-clip" => mask_boxes_value(262, raw)?,
+        "mask-mode" => mask_modes_value(raw)?,
+        _ => return None,
+    }])
 }
 
 /// A parsed `background` shorthand: comma-joined image/position/size layer
@@ -16928,6 +17183,12 @@ fn append_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_variable
                 for value in [width, paint, Value::ColumnRuleStyle(style.border_style())] {
                     out.push(Declaration { value, important });
                 }
+            }
+            continue;
+        }
+        if let Some(mask) = mask_property(name) {
+            if let Some(values) = mask_declaration_values(mask, raw) {
+                out.extend(values.into_iter().map(|value| Declaration { value, important }));
             }
             continue;
         }
@@ -26041,6 +26302,10 @@ fn compute_for_named_registered_mode(
                     style.background_images = images
                         .as_ref()
                         .map(|images| resolve_background_images(images, source_url.as_deref()));
+                } else if let Value::MaskImages(images) = &declaration.value {
+                    style.mask_images = images
+                        .as_ref()
+                        .map(|images| resolve_background_images(images, source_url.as_deref()));
                 } else if let Value::GeneratedContent(GeneratedContent::Items(items)) =
                     &declaration.value
                 {
@@ -29852,6 +30117,68 @@ mod tests {
             (style.overflow_x, style.overflow_y),
             (Overflow::Hidden, Overflow::Hidden)
         );
+    }
+
+    #[test]
+    fn mask_longhands_parse_aliases_and_computed_values() {
+        let index = StyleIndex::new(Vec::new());
+        let style = compute(
+            &element("-webkit-mask-image:url(a.svg),none;mask-size:50% auto,cover;mask-repeat:no-repeat;mask-position:center;mask-origin:content-box;mask-clip:padding-box,no-clip;mask-mode:luminance"),
+            None,
+            &index,
+        )
+        .unwrap();
+        assert!(style.has_mask() && style.paints_as_group());
+        assert_eq!(style.mask_images.as_ref().unwrap().len(), 2);
+        assert_eq!(style.mask_size.as_ref().unwrap().len(), 2);
+        assert_eq!(style.mask_repeat.as_ref().unwrap()[0], [BackgroundRepeat::NoRepeat; 2]);
+        assert_eq!(style.mask_origin.as_ref().unwrap().as_ref(), &[BackgroundBox::Content]);
+        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Padding, BackgroundBox::Border]);
+        assert_eq!(style.mask_mode.as_ref().unwrap().as_ref(), &[MaskMode::Luminance]);
+        let initial = compute(&element("color:red"), None, &index).unwrap();
+        assert!(!initial.has_mask() && initial.mask_images.is_none() && !initial.paints_as_group());
+        let mask = compute(&element("mask-image:url(a.svg)"), None, &index).unwrap();
+        let child = compute(&element("color:red"), Some(&mask), &index).unwrap();
+        assert!(!child.has_mask(), "mask-image is not inherited");
+        let reset = compute(&element("mask-image:url(a.svg);mask-image:initial"), None, &index).unwrap();
+        assert!(!reset.has_mask());
+        let invalid = compute(&element("mask-image:url(a.svg);mask-size:bogus;mask-repeat:sideways"), None, &index).unwrap();
+        assert!(invalid.mask_size.is_none() && invalid.mask_repeat.is_none());
+    }
+
+    #[test]
+    fn mask_shorthand_resets_longhands_and_defaults_boxes_to_border_box() {
+        let index = StyleIndex::new(Vec::new());
+        let style = compute(
+            &element("mask-mode:luminance;-webkit-mask:url(a.svg) center / contain no-repeat content-box add"),
+            None,
+            &index,
+        )
+        .unwrap();
+        assert!(style.has_mask());
+        assert_eq!(style.mask_origin.as_ref().unwrap().as_ref(), &[BackgroundBox::Content]);
+        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Content]);
+        assert!(style.mask_mode.is_none(), "shorthand resets mask-mode");
+        let plain = compute(&element("mask:url(a.svg) luminance"), None, &index).unwrap();
+        assert!(plain.mask_origin.is_none() && plain.mask_clip.is_none());
+        assert_eq!(plain.mask_mode.as_ref().unwrap().as_ref(), &[MaskMode::Luminance]);
+        let none = compute(&element("mask-image:url(a.svg);mask:none"), None, &index).unwrap();
+        assert!(!none.has_mask());
+        assert!(compute(&element("mask:url(a.svg) red"), None, &index).unwrap().mask_images.is_none());
+    }
+
+    #[test]
+    fn mask_properties_are_supported_by_supports_queries() {
+        for property in ["mask-image", "-webkit-mask-image"] {
+            assert!(supports_declaration(property, "url(a.svg)"), "{property}");
+            assert!(supports_declaration(property, "linear-gradient(red, blue)"), "{property}");
+            assert!(!supports_declaration(property, "bogus"), "{property}");
+        }
+        assert!(supports_declaration("mask", "url(a.svg) no-repeat center / 20px"));
+        assert!(supports_declaration("-webkit-mask-size", "contain"));
+        assert!(supports_declaration("mask-mode", "alpha"));
+        assert!(supports_condition("(mask-image: url(a.svg))"));
+        assert!(supports_condition("(-webkit-mask-image: url(a.svg))"));
     }
 
     #[test]

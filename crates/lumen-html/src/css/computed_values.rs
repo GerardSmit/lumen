@@ -1965,6 +1965,39 @@ impl Style {
                     })
                 },
             )?,
+            "mask-image" | "-webkit-mask-image" => self.mask_images.as_deref().map_or_else(
+                || Some("none".into()),
+                |values| list(values, MAX_BACKGROUND_LAYERS, ", ", |value| image(value, 0)),
+            )?,
+            "mask-position" | "-webkit-mask-position" => background_positions_css_value(self.mask_position.as_deref())?,
+            "mask-size" | "-webkit-mask-size" => background_sizes_css_value(self.mask_size.as_deref())?,
+            "mask-repeat" | "-webkit-mask-repeat" => self.mask_repeat.as_deref().map_or_else(
+                || Some("repeat".into()),
+                |values| {
+                    list(values, MAX_BACKGROUND_LAYERS, ", ", |value| {
+                        Some(declaration_block::serialize_background_repeat_pair(*value))
+                    })
+                },
+            )?,
+            "mask-origin" | "-webkit-mask-origin" | "mask-clip" | "-webkit-mask-clip" => {
+                let values = if name.ends_with("origin") { &self.mask_origin } else { &self.mask_clip };
+                values.as_deref().map_or_else(
+                    || Some("border-box".into()),
+                    |values| list(values, MAX_BACKGROUND_LAYERS, ", ", |value| Some(background_box(*value))),
+                )?
+            }
+            "mask-mode" => self.mask_mode.as_deref().map_or_else(
+                || Some("match-source".into()),
+                |values| {
+                    list(values, MAX_BACKGROUND_LAYERS, ", ", |value| {
+                        Some(match value {
+                            MaskMode::MatchSource => "match-source",
+                            MaskMode::Alpha => "alpha",
+                            MaskMode::Luminance => "luminance",
+                        }.into())
+                    })
+                },
+            )?,
             "background" => self.computed_background(context.resolved)?,
             "box-shadow" => if context.resolved {
                 match self.source_shadow_list(58) {

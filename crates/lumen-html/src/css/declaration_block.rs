@@ -231,6 +231,15 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
             "background-origin",
             "background-clip",
         ],
+        "mask" | "-webkit-mask" => &[
+            "mask-image",
+            "mask-position",
+            "mask-size",
+            "mask-repeat",
+            "mask-origin",
+            "mask-clip",
+            "mask-mode",
+        ],
         "list-style" => &["list-style-position", "list-style-image", "list-style-type"],
         "outline" => &["outline-color", "outline-style", "outline-width"],
         "border-width" => &[
@@ -533,7 +542,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
         let value = match name.as_ref() {
             "order" | "z-index" | "column-count" | "orphans" | "widows" | "column-span" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" | "x" | "y" | "cx" | "cy" | "r" | "rx" | "ry" => super::serialize_cssom_property_value(&name,raw),
             "contain-intrinsic-width"|"contain-intrinsic-height"|"contain-intrinsic-inline-size"|"contain-intrinsic-block-size" => super::intrinsic_override::specified(raw),
-            "background-image" => super::image_source::serialize(raw),
+            "background-image" | "mask-image" => super::image_source::serialize(raw),
             "filter" => super::serialize_color_filter_declaration(raw),
             "transform"=>super::typed_transforms::specified(raw),
             "translate"|"rotate"|"scale"=>super::individual_transforms::specified(match name.as_ref(){"translate"=>239,"rotate"=>240,_=>241},raw),
@@ -690,6 +699,35 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
         }
         return Ok(Some(entries));
     }
+    if name.as_ref() == "mask" {
+        let Some(parts) = super::mask_shorthand_parts(raw) else {
+            return Ok(None);
+        };
+        let Some(images) = super::image_source::serialize(&parts.images) else {
+            return Ok(None);
+        };
+        let values = [
+            images,
+            parts.positions,
+            parts.sizes,
+            join_css_components(parts.repeats.into_iter().map(serialize_background_repeat_pair)),
+            join_css_components(parts.origins.into_iter().map(serialize_background_box)),
+            join_css_components(parts.clips.into_iter().map(serialize_background_box)),
+            join_css_components(parts.modes.into_iter().map(|mode| match mode {
+                MaskMode::MatchSource => "match-source",
+                MaskMode::Alpha => "alpha",
+                MaskMode::Luminance => "luminance",
+            })),
+        ];
+        for (&target, value) in targets.iter().zip(values) {
+            entries.push(Entry {
+                name: Arc::from(target),
+                value: Specified::Text(Arc::from(value)),
+                important,
+            });
+        }
+        return Ok(Some(entries));
+    }
     for &target in targets {
         // Border resets these properties even though it cannot specify them.
         // Retain their specified identities without manufacturing renderer slots.
@@ -786,7 +824,19 @@ fn specified_border_width(value: f32, raw: &str, origin: &str, target: &str) -> 
 
 /// Canonical CSSOM identity of legacy property aliases.
 pub fn canonical_alias(name: &str) -> &str {
-    match name {"word-wrap" => "overflow-wrap", "font-stretch" => "font-width", "-webkit-appearance" => "appearance", _ => name}
+    match name {
+        "word-wrap" => "overflow-wrap",
+        "font-stretch" => "font-width",
+        "-webkit-appearance" => "appearance",
+        "-webkit-mask" => "mask",
+        "-webkit-mask-image" => "mask-image",
+        "-webkit-mask-position" => "mask-position",
+        "-webkit-mask-size" => "mask-size",
+        "-webkit-mask-repeat" => "mask-repeat",
+        "-webkit-mask-origin" => "mask-origin",
+        "-webkit-mask-clip" => "mask-clip",
+        _ => name,
+    }
 }
 
 fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Option<String> {
