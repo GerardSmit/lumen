@@ -443,6 +443,23 @@ impl Lexer<'_> {
     #[inline]
     fn step(&mut self, c: char) -> Result<(), LexError> {
         self.tok_start = self.pos;
+        if c.is_ascii() {
+            match ASCII_CLASS[c as usize] {
+                CLASS_IDENT => return self.read_ident(),
+                CLASS_SPACE => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                CLASS_NEWLINE => {
+                    self.nl_pending = true;
+                    self.pos += 1;
+                    self.line += 1;
+                    return Ok(());
+                }
+                CLASS_PUNCT => return self.read_punct(),
+                _ => {}
+            }
+        }
         if is_line_terminator(c) {
             self.nl_pending = true;
             self.bump();
@@ -566,7 +583,7 @@ impl Lexer<'_> {
             let from = self.pos;
             let mut end = from;
             while let Some(&c) = self.bytes.get(end) {
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+                if IDENT_BYTE[c as usize] {
                     end += 1;
                 } else {
                     break;
@@ -1318,13 +1335,49 @@ impl Lexer<'_> {
                 )))
             }
         };
-        for _ in 0..p.len() {
-            self.bump();
-        }
+        self.pos += p.len();
         self.push(Tok::Punct(p));
         Ok(())
     }
 }
+
+/// ASCII IdentifierPart bytes (letters, digits, `_`, `$`).
+static IDENT_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        t[i] = b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        i += 1;
+    }
+    t
+};
+
+const CLASS_OTHER: u8 = 0;
+const CLASS_IDENT: u8 = 1;
+const CLASS_SPACE: u8 = 2;
+const CLASS_NEWLINE: u8 = 3;
+/// A punctuator that can never start a comment, regex, number, string, template or JSX element.
+const CLASS_PUNCT: u8 = 4;
+
+/// What [`Lexer::step`] can decide from an ASCII byte alone; everything else takes the general path.
+const ASCII_CLASS: [u8; 128] = {
+    let mut t = [CLASS_OTHER; 128];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        t[i] = match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' | b'#' => CLASS_IDENT,
+            b' ' | b'\t' => CLASS_SPACE,
+            b'\n' => CLASS_NEWLINE,
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b',' | b':' | b'~' | b'?' | b'='
+            | b'!' | b'*' | b'%' | b'^' | b'&' | b'|' | b'+' | b'>' | b'@' => CLASS_PUNCT,
+            _ => CLASS_OTHER,
+        };
+        i += 1;
+    }
+    t
+};
 
 fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
@@ -1350,6 +1403,16 @@ fn prop_has(name: &str, c: char) -> bool {
 }
 /// The reserved word spelled `s` (one of `token::KEYWORDS`).
 fn keyword(s: &str) -> Option<&'static str> {
+    // Every reserved word is 2..=10 lowercase letters starting with one of these.
+    let first = *s.as_bytes().first()?;
+    if !(2..=10).contains(&s.len())
+        || !matches!(
+            first,
+            b'b' | b'c' | b'd' | b'e' | b'f' | b'i' | b'n' | b'r' | b's' | b't' | b'v' | b'w'
+        )
+    {
+        return None;
+    }
     Some(match s {
         "break" => "break",
         "case" => "case",

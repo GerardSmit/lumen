@@ -3,10 +3,11 @@
 
 use crate::ast::*;
 use crate::lexer::{tokenize_opts, LexOpts};
-use crate::token::{RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
+use crate::token::{Name, RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
 mod jsx;
+mod preparse;
 mod ts;
 pub use crate::parser_support::*;
 pub(crate) use ts::error_span as ts_error_span;
@@ -1021,14 +1022,101 @@ impl Body {
 
 #[derive(Default)]
 struct DeclScope {
-    lexical: Vec<String>,
-    var: Vec<String>,
+    lexical: Vec<Name>,
+    var: Vec<Name>,
     /// Sloppy-mode plain function declarations in this block (Annex B): duplicates among
     /// themselves are fine, but they conflict with same-block lexicals and vars.
-    fn_lexical: Vec<String>,
+    fn_lexical: Vec<Name>,
     /// A `var` hoists up to (and conflicts with lexicals only up to) the nearest such boundary — the
     /// program/function top. Block / `for` / `switch` scopes are not boundaries.
     fn_boundary: bool,
+}
+
+/// Whether the directive prologue starting at token `from` contains a "use strict" directive.
+/// The prologue is the leading run of string-literal expression statements (terminated by `;`
+/// or ASI) — a later directive still makes the earlier prologue strings strict.
+fn prologue_has_use_strict_in(toks: &TokVec, from: usize) -> bool {
+    let mut i = from;
+    loop {
+        let Some(tok) = toks.get(i) else {
+            return false;
+        };
+        let Tok::Str(str_val) = &tok.kind else {
+            return false;
+        };
+        let next = toks.get(i + 1);
+        let semi = matches!(next.map(|t| &t.kind), Some(Tok::Punct(";")));
+        let asi = next.is_none_or(|t| t.nl_before || matches!(t.kind, Tok::Punct("}") | Tok::Eof));
+        if !semi && !asi {
+            return false;
+        }
+        // The directive must be the exact code units `use strict` — a string that used
+        // escapes or line continuations does not count.
+        if &**str_val == "use strict" && !tok.escaped {
+            return true;
+        }
+        i += if semi { 2 } else { 1 };
+    }
+}
+
+/// Close the innermost scope. VarDeclaredNames accumulate through block scopes (vars hoist), so
+/// declarations in an enclosing block still conflict with them.
+fn scope_pop(scopes: &mut Vec<DeclScope>) -> Option<DeclScope> {
+    let s = scopes.pop()?;
+    if !s.fn_boundary {
+        if let Some(parent) = scopes.last_mut() {
+            parent.var.extend(s.var.iter().cloned());
+        }
+    }
+    Some(s)
+}
+
+/// Declare a function in the innermost scope; `false` on a redeclaration conflict. In a block a
+/// strict, async or generator function is lexical; a sloppy plain one keeps Annex B var-like
+/// semantics (duplicates among block functions are fine, but they conflict with same-block
+/// lexicals and vars). At a function/program top level every function declaration is var-like.
+fn scope_declare_fn(
+    scopes: &mut [DeclScope],
+    name: &Name,
+    is_async: bool,
+    is_generator: bool,
+    strict: bool,
+) -> bool {
+    let in_block = !scopes.last().unwrap().fn_boundary;
+    if in_block && (strict || is_async || is_generator) {
+        scope_declare_lexical(scopes, name)
+    } else if in_block {
+        let s = scopes.last_mut().unwrap();
+        if s.lexical.contains(name) || s.var.contains(name) {
+            return false;
+        }
+        s.fn_lexical.push(name.clone());
+        true
+    } else {
+        scope_declare_var(scopes, name, false)
+    }
+}
+
+fn scope_declare_lexical(scopes: &mut [DeclScope], name: &Name) -> bool {
+    let s = scopes.last_mut().unwrap();
+    if s.lexical.contains(name) || s.var.contains(name) || s.fn_lexical.contains(name) {
+        return false;
+    }
+    s.lexical.push(name.clone());
+    true
+}
+
+fn scope_declare_var(scopes: &mut [DeclScope], name: &Name, hoist_through: bool) -> bool {
+    for scope in scopes.iter().rev() {
+        if scope.lexical.contains(name) || scope.fn_lexical.contains(name) {
+            return false;
+        }
+        if scope.fn_boundary || !hoist_through {
+            break;
+        }
+    }
+    scopes.last_mut().unwrap().var.push(name.clone());
+    true
 }
 
 impl Parser {
@@ -1223,29 +1311,11 @@ impl Parser {
         is_async: bool,
         is_generator: bool,
     ) -> Result<(), ParseError> {
-        let in_block = !self.decl_scopes.last().unwrap().fn_boundary;
-        if in_block && (self.strict || is_async || is_generator) {
-            // Block-level functions are lexical; only sloppy plain functions get the Annex B
-            // var-like treatment (which permits duplicates and shadowing).
-            self.declare_lexical(name)
-        } else if in_block {
-            // Annex B block function: duplicates with other block functions are allowed, but the
-            // name must not collide with a lexical or var declared in the same block.
-            let clash = {
-                let s = self.decl_scopes.last().unwrap();
-                s.lexical.iter().any(|n| n == name) || s.var.iter().any(|n| n == name)
-            };
-            if clash {
-                return self.err_semantic(format!("Identifier '{name}' has already been declared"));
-            }
-            self.decl_scopes
-                .last_mut()
-                .unwrap()
-                .fn_lexical
-                .push(name.to_string());
+        let name = Name(Rc::from(name));
+        if scope_declare_fn(&mut self.decl_scopes, &name, is_async, is_generator, self.strict) {
             Ok(())
         } else {
-            self.declare_var(name, false)
+            self.err_semantic(format!("Identifier '{name}' has already been declared"))
         }
     }
 
@@ -1283,54 +1353,28 @@ impl Parser {
         });
     }
     fn pop_decl_scope(&mut self) {
-        if let Some(s) = self.decl_scopes.pop() {
-            // VarDeclaredNames accumulate through block scopes (vars hoist), so declarations in
-            // an enclosing block still conflict with them.
-            if !s.fn_boundary {
-                if let Some(parent) = self.decl_scopes.last_mut() {
-                    parent.var.extend(s.var);
-                }
-            }
-        }
+        scope_pop(&mut self.decl_scopes);
     }
     /// Record a lexical (`let`/`const`/`class`) binding; error on redeclaration in this scope.
     fn declare_lexical(&mut self, name: &str) -> Result<(), ParseError> {
-        let conflict = {
-            let s = self.decl_scopes.last().unwrap();
-            s.lexical.iter().any(|n| n == name)
-                || s.var.iter().any(|n| n == name)
-                || s.fn_lexical.iter().any(|n| n == name)
-        };
-        if conflict {
-            return self.err_semantic(format!("Identifier '{name}' has already been declared"));
+        let name = Name(Rc::from(name));
+        if scope_declare_lexical(&mut self.decl_scopes, &name) {
+            Ok(())
+        } else {
+            self.err_semantic(format!("Identifier '{name}' has already been declared"))
         }
-        self.decl_scopes
-            .last_mut()
-            .unwrap()
-            .lexical
-            .push(name.to_string());
-        Ok(())
     }
     /// Record a `var`/function binding. A `var` (`hoist_through = true`) conflicts with a lexical of
     /// the same name in any block scope it hoists through — from here up to (and including) the
     /// nearest function/program boundary. A block-level *function* declaration (`hoist_through =
     /// false`) only conflicts in its own scope (Annex B.3.3 lets it shadow an enclosing lexical).
     fn declare_var(&mut self, name: &str, hoist_through: bool) -> Result<(), ParseError> {
-        for scope in self.decl_scopes.iter().rev() {
-            if scope.lexical.iter().any(|n| n == name) || scope.fn_lexical.iter().any(|n| n == name)
-            {
-                return self.err_semantic(format!("Identifier '{name}' has already been declared"));
-            }
-            if scope.fn_boundary || !hoist_through {
-                break;
-            }
+        let name = Name(Rc::from(name));
+        if scope_declare_var(&mut self.decl_scopes, &name, hoist_through) {
+            Ok(())
+        } else {
+            self.err_semantic(format!("Identifier '{name}' has already been declared"))
         }
-        self.decl_scopes
-            .last_mut()
-            .unwrap()
-            .var
-            .push(name.to_string());
-        Ok(())
     }
 
     fn has_use_strict_prologue(&self) -> bool {
@@ -1338,31 +1382,8 @@ impl Parser {
     }
 
     /// Whether the directive prologue starting at token `from` contains a "use strict" directive.
-    /// The prologue is the leading run of string-literal expression statements (terminated by `;`
-    /// or ASI) — a later directive still makes the earlier prologue strings strict.
     fn prologue_has_use_strict(&self, from: usize) -> bool {
-        let mut i = from;
-        loop {
-            let Some(tok) = self.toks.get(i) else {
-                return false;
-            };
-            let Tok::Str(str_val) = &tok.kind else {
-                return false;
-            };
-            let next = self.toks.get(i + 1);
-            let semi = matches!(next.map(|t| &t.kind), Some(Tok::Punct(";")));
-            let asi =
-                next.is_none_or(|t| t.nl_before || matches!(t.kind, Tok::Punct("}") | Tok::Eof));
-            if !semi && !asi {
-                return false;
-            }
-            // The directive must be the exact code units `use strict` — a string that used
-            // escapes or line continuations does not count.
-            if &**str_val == "use strict" && !tok.escaped {
-                return true;
-            }
-            i += if semi { 2 } else { 1 };
-        }
+        prologue_has_use_strict_in(&self.toks, from)
     }
 
     fn parse_stmts_until_eof(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -4759,6 +4780,7 @@ impl Parser {
         let ctx = self.lazy_context(is_arrow);
         let private_scope = self.private_scope.clone();
         let mut skipped = None;
+        let mut skipped_close = 0;
         if self.lazy && !(self.eager_outermost && self.fn_depth == 0) {
             if let Some(close) = self.matching_brace(open) {
                 let next = |i: usize| self.toks.get(i).map(|t| &t.kind);
@@ -4788,6 +4810,7 @@ impl Parser {
                         return Ok((Body::Lazy(lazy, None), ctx.strict));
                     }
                     skipped = Some(lazy);
+                    skipped_close = close;
                 }
             }
         }
@@ -4813,7 +4836,7 @@ impl Parser {
         self.switch_depth = 0;
         self.next_scope_is_fn_boundary = true;
         let body = match &skipped {
-            Some(lazy) => self.check_block_body(lazy.line).map(Err),
+            Some(lazy) => self.check_skipped_body(open, skipped_close, lazy.line),
             None => self.parse_block_body().map(Ok),
         };
         self.checking = saved_checking;
@@ -4854,6 +4877,31 @@ impl Parser {
             return Ok((Body::Reloadable(lazy, body), result_strict));
         }
         Ok((Body::Eager(body), result_strict))
+    }
+
+    /// Check a body about to be skipped for its early errors: syntax-only first, and only when
+    /// that is not sure the full parse that builds (and drops) each statement's AST. Leaves the
+    /// cursor after the closing `}`.
+    fn check_skipped_body(
+        &mut self,
+        open: usize,
+        close: usize,
+        line: u32,
+    ) -> Result<Result<Vec<Stmt>, Vec<String>>, ParseError> {
+        let pre = self.preparse_body(open, close);
+        if let Some(done) = pre {
+            self.pos = close + 1;
+            self.next_scope_is_fn_boundary = false;
+            if !done.private.is_empty() {
+                self.pending_private.push(PendingPrivate {
+                    scope: self.private_scope.clone(),
+                    names: done.private,
+                    line,
+                });
+            }
+            return Ok(Err(done.lexical));
+        }
+        self.check_block_body(line).map(Err)
     }
 
     /// Parse a function body only for its early errors, dropping each statement once checked.

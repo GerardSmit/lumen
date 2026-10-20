@@ -126,7 +126,7 @@ use value::Value;
 #[cfg(feature = "bench")]
 pub mod bench_api {
     pub use crate::ast::Stmt;
-    pub use crate::lexer::tokenize;
+    pub use crate::lexer::{tokenize, tokenize_goal};
     pub use crate::parser::{parse_module, parse_module_jsx, parse_module_ts, parse_script};
     pub use crate::snapshot::{decode, encode};
 }
