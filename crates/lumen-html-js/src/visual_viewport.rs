@@ -31,8 +31,13 @@ impl DomVisualViewport {
         if realm.layout_flusher.borrow().is_none() && realm.session.borrow().viewport_size().is_none() {
             return Ok((0.0, 0.0));
         }
-        realm.flush_layout()?;
-        let (width, height) = realm.session.borrow().viewport_size().unwrap_or((0, 0));
+        let (width, height) = match realm.settled_viewport() {
+            Some(size) => size,
+            None => {
+                realm.flush_layout()?;
+                realm.session.borrow().viewport_size().unwrap_or((0, 0))
+            }
+        };
         Ok((f64::from(width), f64::from(height)))
     }
 

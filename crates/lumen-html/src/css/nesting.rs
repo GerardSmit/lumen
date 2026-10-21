@@ -86,6 +86,7 @@ pub fn source_rule_ranges(
         return Err(error(0, "CSS input too large"));
     }
     let mut result = Vec::new();
+    let item_limit = if inside_style { MAX_DECLARATIONS } else { MAX_RULES };
     let mut position = 0;
     while position < text.len() {
         if skip_css_space_comments(text, &mut position).is_none() {
@@ -114,7 +115,7 @@ pub fn source_rule_ranges(
             if let Some(end) = declaration_end(rest)? {
                 position += end;
                 result.push((start, position, None, None));
-                if result.len() > MAX_RULES {
+                if result.len() > item_limit {
                     return Err(error(start, "too many CSS source items"));
                 }
                 continue;
@@ -133,7 +134,7 @@ pub fn source_rule_ranges(
             Some(RuleBoundary::Discard(end)) => position += end,
             None => break,
         }
-        if result.len() > MAX_RULES {
+        if result.len() > item_limit {
             return Err(error(start, "too many CSS source items"));
         }
     }

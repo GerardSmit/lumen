@@ -29,7 +29,7 @@ pub(crate) const DOCUMENT: u8 = 32;
 /// (see `InvalidationSets::anchors`).
 pub(crate) const ANCHORED: u8 = 64;
 /// The element and its ancestors: what the validity of a form or fieldset
-/// depends on.
+/// depends on. Combined with other bits, those apply from each ancestor.
 pub(crate) const ANCESTORS: u8 = 128;
 
 /// Bound on the anchor and sibling-key lists; beyond it tree changes are not
@@ -229,7 +229,22 @@ fn form_element(document: &Document, node: NodeId) -> bool {
     matches!(
         crate::forms::html_element_local_name(document, node),
         Some("input" | "select" | "option" | "optgroup" | "textarea" | "button" | "fieldset" | "form" | "label" | "output" | "datalist")
-    )
+    ) || document.is_form_associated_custom_element(node)
+}
+
+/// Every form-associated element of the document, shadow trees included: the
+/// elements whose state live form values change.
+pub(crate) fn form_controls(document: &Document) -> Vec<NodeId> {
+    let root = document.root();
+    let mut controls = Vec::new();
+    let mut current = crate::selector::next_shadow_including_descendant(document, root, root).ok().flatten();
+    while let Some(node) = current {
+        if form_element(document, node) {
+            controls.push(node);
+        }
+        current = crate::selector::next_shadow_including_descendant(document, root, node).ok().flatten();
+    }
+    controls
 }
 
 #[derive(Default)]
@@ -249,6 +264,11 @@ pub(crate) struct InvalidationSets {
     any_id_subjects: Features,
     /// Positions of pseudo-classes reading state that attribute writes change.
     state: u8,
+    /// Subject features of the compounds reached through `state` in an
+    /// ancestor position, so a state change below narrows its descendant reach.
+    state_subjects: Features,
+    /// A selector reads `:state()`, which no element-based bound covers.
+    custom_states: bool,
     /// Positions of structural pseudo-classes and of compounds reached
     /// through sibling combinators: a child list change moves siblings.
     siblings: u8,
@@ -390,6 +410,9 @@ impl InvalidationSets {
             || !selector.languages.is_empty()
         {
             self.state |= reach;
+            if wide {
+                self.state_subjects.merge(subject);
+            }
         }
         for pseudo in &selector.structural {
             match pseudo {
@@ -398,8 +421,11 @@ impl InvalidationSets {
                     self.empty |= reach;
                 }
                 StructuralPseudo::Valid | StructuralPseudo::Invalid => {
-                    self.children |= ANCESTORS;
-                    self.state |= ANCESTORS;
+                    self.children |= reach | ANCESTORS;
+                    self.state |= reach | ANCESTORS;
+                    if wide {
+                        self.state_subjects.merge(subject);
+                    }
                 }
                 StructuralPseudo::Nth { a, b, of_type, reverse, of } => {
                     let edge = match (*a, *b, *of_type, *reverse, of.is_none()) {
@@ -463,7 +489,10 @@ impl InvalidationSets {
                         self.add(&relative.selector, inner, subject);
                     }
                 }
-                LogicalPseudo::State(..) => self.state |= reach,
+                LogicalPseudo::State(..) => {
+                    self.state |= reach;
+                    self.custom_states = true;
+                }
                 LogicalPseudo::Heading(_) | LogicalPseudo::InvalidNesting => {}
             }
         }
@@ -627,14 +656,7 @@ impl InvalidationSets {
     /// The elements whose styles the journaled mutations can change, or
     /// `None` when that is not bounded by their tree positions.
     pub(crate) fn affected(&self, document: &Document, mutations: &[Mutation]) -> Option<Vec<NodeId>> {
-        let limit = (document.node_count() / 2).clamp(MIN_TARGETS, MAX_TARGETS);
-        let relatives = Relatives {
-            keys: &self.relative_keys,
-            unkeyed: self.unkeyed_relatives,
-            siblings: self.unkeyed_relatives || self.relative_keys.iter().any(|(_, siblings)| *siblings),
-        };
-        let work_limit = limit * 16 + document.node_count() * 8;
-        let mut collector = Collector { document, anchors: &self.anchors, relatives, seen: BTreeSet::new(), nodes: Vec::new(), limit, work: 0, work_limit };
+        let mut collector = self.collector(document);
         for mutation in mutations {
             if document.kind(mutation.target).is_err() {
                 continue;
@@ -765,6 +787,55 @@ impl InvalidationSets {
                     }
                 }
                 MutationKind::FullRebuild => return None,
+            }
+        }
+        Some(collector.nodes)
+    }
+
+    fn collector<'a>(&'a self, document: &'a Document) -> Collector<'a> {
+        let limit = (document.node_count() / 2).clamp(MIN_TARGETS, MAX_TARGETS);
+        let relatives = Relatives {
+            keys: &self.relative_keys,
+            unkeyed: self.unkeyed_relatives,
+            siblings: self.unkeyed_relatives || self.relative_keys.iter().any(|(_, siblings)| *siblings),
+        };
+        let work_limit = limit * 16 + document.node_count() * 8;
+        Collector { document, anchors: &self.anchors, relatives, seen: BTreeSet::new(), nodes: Vec::new(), limit, work: 0, work_limit }
+    }
+
+    /// The elements whose styles a change of element state can change: each
+    /// of `nodes`, and each of `chains` together with its ancestors, since
+    /// `:hover` and `:focus-within` hold along the whole chain. `None` when
+    /// that is not bounded by tree position.
+    pub(crate) fn affected_by_state(&self, document: &Document, nodes: &[NodeId], chains: &[NodeId]) -> Option<Vec<NodeId>> {
+        if self.custom_states || self.scoped {
+            return None;
+        }
+        let mut collector = self.collector(document);
+        if self.state != 0 {
+            let state_reach = |collector: &mut Collector<'_>, node: NodeId| -> Option<()> {
+                let mut spread = Spread::default();
+                let reach = spread.narrow(self.state, Some(&self.state_subjects));
+                collector.reach(node, reach)?;
+                collector.spread(node, &spread)?;
+                if reach & ANCESTORS != 0 && !spread.is_empty() {
+                    let mut ancestor = document.composed_parent(node).ok().flatten();
+                    while let Some(id) = ancestor {
+                        collector.spread(id, &spread)?;
+                        ancestor = document.composed_parent(id).ok().flatten();
+                    }
+                }
+                Some(())
+            };
+            for &node in nodes {
+                state_reach(&mut collector, node)?;
+            }
+            for &start in chains {
+                let mut current = Some(start);
+                while let Some(node) = current {
+                    state_reach(&mut collector, node)?;
+                    current = document.composed_parent(node).ok().flatten();
+                }
             }
         }
         Some(collector.nodes)
@@ -909,10 +980,19 @@ impl Collector<'_> {
             }
         }
         if reach & ANCESTORS != 0 {
+            let from_ancestor = reach & !(ANCESTORS | SELF | SUBTREE);
             let mut current = Some(node);
+            let mut outermost = node;
             while let Some(id) = current {
                 self.add(id)?;
+                if id != node && from_ancestor != 0 {
+                    self.reach(id, from_ancestor)?;
+                }
+                outermost = id;
                 current = self.document.composed_parent(id).ok().flatten();
+            }
+            if reach & SUBTREE != 0 {
+                self.descendants(outermost, None)?;
             }
         }
         let relatives = reach & RELATIVES != 0;

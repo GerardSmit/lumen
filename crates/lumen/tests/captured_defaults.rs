@@ -65,3 +65,27 @@ fn hoist_conflicts_and_effectful_defaults_preserve_order() {
     "#,
     );
 }
+
+#[test]
+fn outer_locals_used_only_in_destructured_parameter_defaults_are_captured() {
+    check(
+        r#"
+        function t1(){var X=7; return function({t=X}={}){return t}}
+        function t2(){var X=7; return function({q:t=X}={}){return t}}
+        function t3(){var X=7; return function([t=X]=[]){return t}}
+        function t4(){var X=7; return ({t=X}={})=>t}
+        function t5(){var X=7; return function({a:{b=X}={}}={}){return b}}
+        function t6(){var K='k',V=9; return function({[K]:v=V}={}){return v}}
+        function t7(){var K='k'; return function({[K]:v}={k:5}){return v}}
+        for(let i=0;i<100;i++) {
+            assert(t1()()===7 && t1()({})===7 && t1()({t:1})===1);
+            assert(t2()()===7 && t2()({})===7);
+            assert(t3()()===7 && t3()([])===7);
+            assert(t4()()===7 && t4()({})===7);
+            assert(t5()()===7 && t5()({a:{}})===7);
+            assert(t6()()===9 && t6()({})===9);
+            assert(t7()()===5);
+        }
+    "#,
+    );
+}

@@ -386,7 +386,7 @@ impl DomStyle {
             let style = self.resolved_style(&mut self.realm.session.borrow_mut(),fonts.as_ref())
                 .map_err(|error| OpError::new("InvalidStateError", format!("computed style failed: {error:?}")))?;
             return Ok(style.custom_properties().iter().filter(|(_, value)| value.is_some())
-                .nth(index - names.len()).map(|(name, _)| name.clone()));
+                .nth(index - names.len()).map(|(name, _)| name.to_string()));
         }
         Ok(self.read_declaration_block()?.names().nth(index).map(str::to_owned))
     }

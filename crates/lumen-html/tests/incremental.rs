@@ -1497,6 +1497,62 @@ fn transition_snapshot_follows_structural_changes_and_rule_changes() {
     assert!(stats.transition_snapshots_full >= 2, "a new stylesheet rebuilds the snapshot");
 }
 
+#[test]
+fn transition_declarations_are_found_in_rules_keyframes_and_inline_styles() {
+    let mut session = snapshot_session(20, "");
+    assert!(!session.may_declare_transitions());
+    attr(&mut session, "#p3", "style", "color:red");
+    assert!(!session.may_declare_transitions());
+    attr(&mut session, "#p3", "style", "opacity:0;Transition:opacity 1s");
+    assert!(session.may_declare_transitions());
+    assert!(snapshot_session(20, "p{transition:opacity 1s}").may_declare_transitions());
+    assert!(snapshot_session(20, "p{transition-duration:var(--d)}").may_declare_transitions());
+    assert!(snapshot_session(20, "@keyframes spin{to{opacity:0}}").may_declare_transitions());
+    let mut added = snapshot_session(20, "");
+    assert!(!added.may_declare_transitions());
+    add(&mut added, "#w", "p", &[("style", "transition:none")], Some("new"), None);
+    assert!(added.may_declare_transitions());
+    let mut sheet = snapshot_session(20, "");
+    add(&mut sheet, "#w", "style", &[], Some("p{transition-duration:1s}"), None);
+    render(&mut sheet);
+    assert!(sheet.may_declare_transitions());
+}
+
+#[test]
+fn transition_snapshot_after_a_stylesheet_change_restyles_only_the_rule_subjects() {
+    let mut session = snapshot_session(1000, "");
+    let first = snapshot_after(&mut session, None);
+    add(&mut session, "#w", "style", &[], Some("#p300{color:red}"), None);
+    let before = session.invalidation_stats();
+    let second = snapshot_after(&mut session, Some(&first));
+    let after = session.invalidation_stats();
+    assert_eq!(after.transition_snapshots_incremental, before.transition_snapshots_incremental + 1);
+    assert_eq!(after.transition_snapshots_full, before.transition_snapshots_full);
+    assert!(after.transition_styles_computed - before.transition_styles_computed < 20,
+        "styles computed: {}", after.transition_styles_computed - before.transition_styles_computed);
+    let node = q(&session, "#p300");
+    let color = |snapshot: &TransitionSnapshot| snapshot.nodes.iter()
+        .find(|input| input.node == node && input.pseudo.is_none()).unwrap().style.color;
+    assert!(color(&first) != color(&second));
+    assert_snapshot_matches_fresh(&mut session, &second);
+}
+
+#[test]
+fn transition_snapshot_after_two_stylesheet_rebuilds_stays_incremental() {
+    let mut session = snapshot_session(500, "");
+    let first = snapshot_after(&mut session, None);
+    add(&mut session, "#w", "style", &[], Some("#p10{color:red}"), None);
+    session.computed_style(q(&session, "#p10")).unwrap();
+    add(&mut session, "#w", "style", &[], Some("#p20{color:blue}"), None);
+    session.computed_style(q(&session, "#p20")).unwrap();
+    let before = session.invalidation_stats();
+    let third = snapshot_after(&mut session, Some(&first));
+    let after = session.invalidation_stats();
+    assert_eq!(after.transition_snapshots_full, before.transition_snapshots_full);
+    assert!(after.transition_styles_computed - before.transition_styles_computed < 20);
+    assert_snapshot_matches_fresh(&mut session, &third);
+}
+
 diff!(
     ancestor_selector_filter_follows_ancestor_changes,
     "<style>body{margin:0}p{height:20px}.on .inner p{color:red;height:40px}#box > .inner > p{background:#eee}\

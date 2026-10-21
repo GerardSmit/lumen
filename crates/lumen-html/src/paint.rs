@@ -1193,7 +1193,7 @@ impl BackgroundPaint {
         match self {
             Self::Solid(_) => 0,
             Self::Border(value)=>core::mem::size_of::<BorderImagePaint>()+value.image.payload_bytes()+header,
-            Self::Image(i) => core::mem::size_of::<ImageData>() + i.pixels.capacity() + header,
+            Self::Image(_) => core::mem::size_of::<ImageData>() + header,
             Self::Worklet(image) => core::mem::size_of::<PaintWorkletImage>()
                 + image.request.name.len()
                 + image.request.arguments.iter().map(|value| value.len()).sum::<usize>()
@@ -1452,6 +1452,13 @@ mod affine_tests {
         .is_none());
     }
     #[test]
+    fn image_commands_and_backgrounds_charge_only_their_handle() {
+        let image = Arc::new(ImageData { width: 1024, height: 1024, pixels: alloc::vec![0u8; 1024 * 1024 * 4].into() });
+        let rect = Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+        assert!(Command::Image { rect, image: image.clone() }.referenced_bytes() < 1024);
+        assert!(BackgroundPaint::Image(image).payload_bytes() < 1024);
+    }
+    #[test]
     fn transform_scope_requires_matching_pop() {
         assert_eq!(
             DisplayList(alloc::vec![
@@ -1681,11 +1688,11 @@ impl Command {
                 + gradient.angular.as_ref().map_or(0, |metadata| metadata.checked_retained_bytes().unwrap_or(usize::MAX / 2))
                 + gradient.color.as_ref().map_or(0, |metadata|metadata.checked_retained_bytes().unwrap_or(usize::MAX/2))
         };
-        let image_bytes = |image: &ImageData| {
-            core::mem::size_of::<ImageData>()
-                .saturating_add(image.pixels.capacity())
-                .saturating_add(arc_header)
-        };
+        // Commands share decoded pixels with the image source that owns and
+        // budgets them (session bitmaps, decoders, reserved leases), so a
+        // reference costs only its handle. Charging the pixels here made two
+        // large page images exceed the whole display-list budget.
+        let image_bytes = |_: &ImageData| core::mem::size_of::<ImageData>().saturating_add(arc_header);
         let payload = match self {
             Self::GlyphRun { glyphs, .. } => {
                 glyphs.len() * core::mem::size_of::<Glyph>() + arc_header

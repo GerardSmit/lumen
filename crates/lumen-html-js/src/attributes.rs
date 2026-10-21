@@ -6,7 +6,7 @@
 //! directly from the live Element each time.
 
 use super::{dom_error, error_reporting, event_content_handlers, forms, DomNode, DomRealm};
-use lumen::embed::{Ctx, Nullable, OpError, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, Nullable, OpError, OpResult, This, Value, WeakValue};
 use lumen_html::{Error, Namespace, NodeId, NodeKind};
 use std::rc::Rc;
 
@@ -189,6 +189,11 @@ impl DomNamedNodeMap {
         Ok(attribute.map_or(Value::Undefined, |attribute| {
             self.realm.wrap(ctx, attribute)
         }))
+    }
+
+    #[proto(iter)]
+    fn values(&self, this: This<Value>) -> crate::collections::DomCollectionIterator {
+        crate::collections::DomCollectionIterator::over(this.0)
     }
 
     fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {

@@ -736,6 +736,12 @@ impl TransitionInputEpoch {
             && self.validity_generation == other.validity_generation
             && self.interaction_generation == other.interaction_generation && self.environment == other.environment
     }
+
+    /// Like `differs_only_in_document`, but the rules may also differ.
+    fn differs_only_in_document_and_rules(&self, other: &Self) -> bool {
+        self.font_generation == other.font_generation && self.validity_generation == other.validity_generation
+            && self.interaction_generation == other.interaction_generation && self.environment == other.environment
+    }
 }
 
 pub struct TransitionStyleInput {
@@ -773,6 +779,12 @@ pub struct TransitionSnapshot {
     pub nodes:Vec<TransitionStyleInput>,
 }
 
+/// The elements a held transition snapshot no longer describes: those, and
+/// everything below them, were restyled while no transition could start.
+pub struct HeldSnapshotStale {
+    nodes:alloc::collections::BTreeSet<u128>,
+}
+
 pub struct RenderSession {
     document: Document,
     rules: Option<StyleIndex>,
@@ -805,6 +817,9 @@ pub struct RenderSession {
     font_generation: u64,
     validity_generation: u64,
     interaction_generation: u64,
+    /// Interaction state and top layer, target and form shape as of the last
+    /// `synchronize_form_state`, to tell which elements a generation bump moved.
+    synced_interaction: (crate::interaction::InteractionState, u64),
     auto_directionality_scan: Option<(u64, bool)>,
     node_bitmaps: Vec<(NodeId, Arc<ImageData>, crate::responsive_images::ImageMetadata)>,
     embedded_bitmaps: Vec<(NodeId, Arc<crate::render_capture::ReservedImageData>)>,
@@ -877,6 +892,20 @@ pub struct RenderSession {
     snapshot_dirty: ReadDirty,
     /// Journal entries up to this version are accounted for in `snapshot_dirty`.
     snapshot_noted_version: u64,
+    /// Subjects of the rules rebuilds since `snapshot_basis`; unbounded when a
+    /// rebuild changed more than rules with bounded subjects.
+    snapshot_rule_subjects: Vec<NodeId>,
+    snapshot_rules_unbounded: bool,
+    /// Set while the transition snapshot the host retains is deliberately not
+    /// refreshed (nothing declares a transition): the elements whose style it
+    /// no longer describes.
+    held_snapshot_stale: Option<alloc::collections::BTreeSet<u128>>,
+    /// Whether the rules of this `rules_generation` can set transitions or animations.
+    transition_declarations: Option<(u64, bool)>,
+    /// Document version through which inline styles were scanned for
+    /// transitions, and whether one was found (sticky).
+    inline_transition_scan: Option<u64>,
+    inline_transition_seen: bool,
     /// The retained frame needs a layout although its document is unchanged.
     layout_stale: bool,
     verify_incremental: bool,
@@ -884,6 +913,8 @@ pub struct RenderSession {
     damage_pending: Option<Vec<Rect>>,
     frame_damage: Option<Vec<Rect>>,
     invalidation_stats: InvalidationStats,
+    /// Parses of the installed stylesheets, reused by every rules rebuild.
+    stylesheet_parses: css::StylesheetParseCache,
     /// The rules a stylesheet installation replaced, kept until the rebuild
     /// it starts compares them with its result.
     previous_rules: Option<css::StyleIndex>,
@@ -913,6 +944,9 @@ pub struct InvalidationStats {
     /// Boxes laid out (retained fragments replayed are not counted).
     pub boxes_laid_out: u64,
     pub fragments_replayed: u64,
+    /// Retained-fragment lookups that missed, by what differed: no fragment
+    /// was retained, its constraints, its style, its parent style, its position.
+    pub fragment_misses: [u64; 5],
     /// Intrinsic sizes computed, and served from the retained sizes.
     pub intrinsics_measured: u64,
     pub intrinsics_reused: u64,
@@ -941,6 +975,10 @@ pub struct InvalidationStats {
     pub transition_styles_computed: u64,
     /// Element styles transition snapshots carried over from the previous snapshot.
     pub transition_styles_reused: u64,
+    /// Stylesheet graphs and texts parsed, and reused from an earlier parse
+    /// by a rules rebuild or an installation check.
+    pub stylesheets_parsed: u64,
+    pub stylesheet_parses_reused: u64,
 }
 
 /// Nodes a stretch of journaled mutations can have restyled, for a cache of
@@ -1023,6 +1061,22 @@ struct ReadStyleKey {
     interaction_generation: u64,
     animation_epoch: u64,
     environment: css::MediaEnvironment,
+}
+
+fn inline_style_declares_transition(document: &Document, node: NodeId) -> bool {
+    let Ok(NodeKind::Element { attributes, .. }) = document.kind(node) else { return false };
+    attributes.iter().any(|(key, value)| key.as_str().eq_ignore_ascii_case("style") && {
+        let style: &str = value;
+        ["transition", "animation"].iter().any(|word| style.as_bytes().windows(word.len()).any(|window| window.eq_ignore_ascii_case(word.as_bytes())))
+    })
+}
+
+/// What an interaction generation bump can move besides the interaction
+/// targets: the `:target` element and the top layer.
+fn interaction_shape(document: &Document) -> u64 {
+    let fold = |hash: u64, key: u128| (hash ^ key as u64 ^ (key >> 64) as u64).wrapping_mul(0x100_0000_01b3);
+    let hash = document.target_element().map_or(0, |node| fold(0xcbf2_9ce4_8422_2325, node.key()));
+    document.top_layer_entries().fold(hash, |hash, (node, _, _)| fold(hash, node.key()))
 }
 
 pub(crate) fn style_with_query_context(
@@ -1172,6 +1226,7 @@ impl RenderSession {
     }
     pub fn new(document: Document) -> Self {
         let interaction_generation = document.interaction_generation();
+        let (document_interaction, document_shape) = (document.interaction_state(), interaction_shape(&document));
         let stylesheet_mutation_version = document.version();
         Self {
             document,
@@ -1198,6 +1253,7 @@ impl RenderSession {
             font_generation: 0,
             validity_generation: 0,
             interaction_generation,
+            synced_interaction: (document_interaction, document_shape),
             auto_directionality_scan: None,
             node_bitmaps: Vec::new(),
             embedded_bitmaps:Vec::new(),
@@ -1254,11 +1310,18 @@ impl RenderSession {
             snapshot_basis: None,
             snapshot_dirty: ReadDirty::default(),
             snapshot_noted_version: 0,
+            snapshot_rule_subjects: Vec::new(),
+            snapshot_rules_unbounded: true,
+            held_snapshot_stale: None,
+            transition_declarations: None,
+            inline_transition_scan: None,
+            inline_transition_seen: false,
             layout_stale: false,
             verify_incremental: false,
             damage_pending: None,
             frame_damage: None,
             invalidation_stats: InvalidationStats::default(),
+            stylesheet_parses: css::StylesheetParseCache::default(),
             previous_rules: None,
             rule_subjects: None,
             rules_reset: false,
@@ -1293,6 +1356,7 @@ impl RenderSession {
         if let Some(property)=self.document.registered_custom_properties.last_mut() {property.source_url=self.document_base_url.clone();}
         if let Some(rules) = &mut self.rules { rules.set_registered_properties(&self.document.registered_custom_properties); }
         self.rules_generation = self.rules_generation.wrapping_add(1);
+        self.snapshot_rules_unbounded = true;
         self.style_cache.borrow_mut().clear();
         self.read_style_cache.clear();
         self.read_style_key = None;
@@ -1604,6 +1668,10 @@ impl RenderSession {
         }
         self.validity_generation = validity_generation;
         self.interaction_generation = interaction_generation;
+        let interaction_before = core::mem::replace(
+            &mut self.synced_interaction,
+            (self.document.interaction_state(), interaction_shape(&self.document)),
+        );
         let has_selector_dependencies = self
             .rules
             .as_ref()
@@ -1621,12 +1689,53 @@ impl RenderSession {
         {
             return;
         }
+        if has_selector_dependencies && !(validity_changed && self.has_auto_directionality_controls()) {
+            if let Some(targets) = self.state_change_targets(validity_changed, interaction_changed, interaction_before) {
+                self.rule_subjects.get_or_insert_with(Vec::new).extend(targets.into_iter().map(|node| (node, true)));
+                self.animation_snapshot = None;
+                if !live_value_changed {
+                    self.paint_revision = self.paint_revision.wrapping_add(1);
+                    self.frame_id = self.frame_id.wrapping_add(1);
+                }
+                return;
+            }
+        }
         self.style_cache.borrow_mut().clear();
         self.animation_snapshot = None;
         if !live_value_changed {
             self.invalidate_paint();
             self.frame_id = self.frame_id.wrapping_add(1);
         }
+    }
+
+    /// The elements a generation bump can have restyled: the form controls
+    /// for live values, the old and new targets of each interaction state
+    /// with their ancestors. `None` when the bump moved anything else (the
+    /// target or the top layer), or the selectors do not bound it.
+    fn state_change_targets(&self, validity_changed: bool, interaction_changed: bool, before: (crate::interaction::InteractionState, u64)) -> Option<Vec<NodeId>> {
+        let rules = self.rules.as_ref()?;
+        let mut chains = Vec::new();
+        if interaction_changed {
+            let (now, shape) = &self.synced_interaction;
+            if before.1 != *shape {
+                return None;
+            }
+            let moved = [
+                (before.0.focused, now.focused),
+                (before.0.focus_visible, now.focus_visible),
+                (before.0.hover, now.hover),
+                (before.0.active[0], now.active[0]),
+                (before.0.active[1], now.active[1]),
+            ];
+            for (old, new) in moved.into_iter().filter(|(old, new)| old != new) {
+                chains.extend(old);
+                chains.extend(new);
+            }
+            if chains.is_empty() && !validity_changed {
+                return None;
+            }
+        }
+        rules.state_restyle_targets(&self.document, validity_changed, &chains)
     }
     pub fn style_cache_stats(&self) -> css::StyleCacheStats {
         self.style_cache.borrow().stats()
@@ -1769,7 +1878,7 @@ impl RenderSession {
                     return Err(LayoutError::InvalidTree);
                 }
             }
-            css::parse_graph(source, self.media_environment()).map_err(LayoutError::Css)?;
+            self.stylesheet_parses.parse_graph(source, self.media_environment(), None, &[]).map_err(LayoutError::Css)?;
         }
         if source.is_some() { self.stylesheet_sources.try_reserve(1).map_err(|_| LayoutError::InvalidTree)?; }
         let next_linked = match (&identity, &source) { (layout::StylesheetIdentity::Link(href), Some(source)) => Some((node, href.clone(), String::from(source.text.as_ref()))), _ => None };
@@ -1835,7 +1944,7 @@ impl RenderSession {
             || self.stylesheet_sources[index].source.url!=source.url {return Err(LayoutError::InvalidTree)}
         css::parse_graph(&source,self.media_environment()).map_err(LayoutError::Css)?;
         let previous=core::mem::replace(&mut self.stylesheet_sources[index].source,source);
-        self.rules=None;
+        self.stash_rules();
         if let Err(error)=self.refresh_rules() {
             self.stylesheet_sources[index].source=previous;self.rules=None;
             let _=self.refresh_rules();return Err(error)
@@ -1987,7 +2096,7 @@ impl RenderSession {
         let target = self.stylesheet_sources.iter_mut().find(|loaded| loaded.owner == node)
             .and_then(|loaded| import_source_mut(&mut loaded.source, parent))
             .and_then(|parent| parent.imports.get_mut(index));
-        match target { Some(import) if import.source.is_none() => { import.source = Some(source); self.rules = None; self.invalidate_paint(); Ok(()) }, _ => Err(source) }
+        match target { Some(import) if import.source.is_none() => { import.source = Some(source); self.stash_rules(); self.invalidate_paint(); Ok(()) }, _ => Err(source) }
     }
 
     fn imported_stylesheet_at(&self, node: NodeId, path: &[usize]) -> Option<&css::StylesheetSource> {
@@ -2084,7 +2193,7 @@ impl RenderSession {
         if changes.is_empty() {return Ok(0)}
         let index=self.stylesheet_sources.iter().position(|entry|entry.owner==owner).ok_or(LayoutError::InvalidTree)?;
         let valid=css::parse_graph_with_topology(&self.stylesheet_sources[index].source,self.media_environment(),css::StylesheetIdentity::Dom(owner),&self.cssom_topology_overrides).map_err(LayoutError::Css);
-        self.rules=None;
+        self.stash_rules();
         let result=valid.and_then(|_|self.refresh_rules());
         if let Err(error)=result {
             for (path,previous) in changes.into_iter().rev() {if let Some(rule)=import_rule_mut(&mut self.stylesheet_sources[index].source,&path) {rule.source=previous;}}
@@ -2163,8 +2272,22 @@ impl RenderSession {
         }
         all |= !observed;
         let protected = self.stylesheet_owned_write.map(|(owner, _)| owner);
+        // A summarized journal (or none) names no owner, but a sheet whose owner is still
+        // connected with the identity it was fetched or parsed for was not replaced: a large
+        // DOM change elsewhere must not unload every stylesheet of the page.
+        let unchanged: Vec<NodeId> = if all {
+            let document = &self.document;
+            let current = |owner: NodeId, identity: &layout::StylesheetIdentity| document.is_connected_element(owner)
+                && layout::stylesheet_identity(document, owner).ok().flatten().as_ref() == Some(identity);
+            self.stylesheet_sources.iter().filter(|loaded| current(loaded.owner, &loaded.identity)).map(|loaded| loaded.owner)
+                .chain(self.linked_stylesheets.iter().filter(|(owner, href, _)| current(*owner, &layout::StylesheetIdentity::Link(href.clone()))).map(|(owner, _, _)| *owner))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let document = &self.document;
-        let affected = |owner: NodeId| document.kind(owner).is_err() || owners.contains(&owner) || (all && protected != Some(owner));
+        let affected = |owner: NodeId| document.kind(owner).is_err() || owners.contains(&owner)
+            || (all && protected != Some(owner) && !unchanged.contains(&owner));
         self.stylesheet_graph_leases.retain(|(_, _, lease)| lease.strong_count() != 0);
         for loaded in self.stylesheet_sources.extract_if(.., |loaded| affected(loaded.owner)) {
             let owner = loaded.owner;
@@ -2303,7 +2426,7 @@ impl RenderSession {
             if let Some(index) = loaded_index {
                 self.stylesheet_sources[index].identity = layout::StylesheetIdentity::Inline(text.into());
             }
-            self.rules = None;
+            self.stash_rules();
             self.refresh_rules()?;
             Ok(text_node)
         })();
@@ -2357,7 +2480,7 @@ impl RenderSession {
             return Err(LayoutError::Css(error));
         }
         let previous = core::mem::replace(&mut self.linked_stylesheets[linked_index].2, text.into());
-        self.rules = None;
+        self.stash_rules();
         if let Err(error) = self.refresh_rules() {
             if let Some((_, _, linked)) = self.linked_stylesheets.iter_mut().find(|(owner, _, _)| *owner == node) { *linked = previous; }
             if let Some(loaded) = self.stylesheet_sources.iter_mut().find(|loaded| loaded.owner == node) { edit.rollback(&mut loaded.source); }
@@ -2389,7 +2512,7 @@ impl RenderSession {
         let previous=source.disabled;
         if previous==disabled {return Ok(());}
         source.disabled=disabled;
-        self.rules=None;
+        self.stash_rules();
         if let Err(error)=self.refresh_rules() {
             if let Some(source)=import_source_mut(&mut self.stylesheet_sources[index].source,&path) {source.disabled=previous;}
             self.rules=None;let _=self.refresh_rules();return Err(error);
@@ -2411,7 +2534,7 @@ impl RenderSession {
             edit.rollback(import_source_mut(&mut self.stylesheet_sources[source_index].source, path).unwrap());
             return Err(LayoutError::Css(error));
         }
-        self.rules = None;
+        self.stash_rules();
         if let Err(error) = self.refresh_rules() {
             if let Some(loaded) = self.stylesheet_sources.iter_mut().find(|loaded| loaded.owner == node) {
                 if let Some(child) = import_source_mut(&mut loaded.source, path) { edit.rollback(child); }
@@ -2573,7 +2696,7 @@ impl RenderSession {
         if previous == self.linked_stylesheets {
             return Ok(());
         }
-        self.rules = None;
+        self.stash_rules();
         if let Err(error) = self.refresh_rules() {
             self.linked_stylesheets = previous;
             self.rules = None;
@@ -2672,7 +2795,7 @@ impl RenderSession {
                 return Ok(());
             }
             self.adopted_stylesheets.push((scope, stylesheets));
-            self.rules = None;
+            self.stash_rules();
             if let Err(error) = self.refresh_rules() {
                 self.adopted_stylesheets.pop();
                 self.rules = None;
@@ -2687,7 +2810,7 @@ impl RenderSession {
             return Ok(());
         }
         let previous = core::mem::replace(&mut self.adopted_stylesheets[index].1, stylesheets);
-        self.rules = None;
+        self.stash_rules();
         if let Err(error) = self.refresh_rules() {
             self.adopted_stylesheets[index].1 = previous;
             self.rules = None;
@@ -3068,6 +3191,97 @@ impl RenderSession {
         })
     }
 
+    /// Whether a style change could start a transition or animation: installed
+    /// effect samples, a rule that sets a transition or animation property or an
+    /// `@keyframes`, or an inline style that mentions one. When this is false the
+    /// before-change snapshot has nothing to compare and need not be built.
+    pub fn may_declare_transitions(&mut self)->bool {
+        let Some(rules)=self.rules.as_ref() else {return true};
+        if rules.has_effect_declarations() {return true;}
+        let generation=self.rules_generation;
+        let declared=match self.transition_declarations {
+            Some((cached,declared)) if cached==generation=>declared,
+            _=>{let declared=rules.declares_transitions();self.transition_declarations=Some((generation,declared));declared}
+        };
+        declared || self.inline_styles_declare_transitions()
+    }
+
+    /// Keeps `held`, the snapshot of the last style change, as the before-change
+    /// style of the next one without refreshing it while nothing declares a
+    /// transition. Returns false when it can no longer serve (the cascade
+    /// inputs other than the document changed, or the restyled elements are not
+    /// bounded); the caller then takes a fresh snapshot.
+    pub fn hold_transition_snapshot(&mut self,held:&Arc<TransitionSnapshot>)->bool {
+        self.held_snapshot_stale=None;
+        let Ok(epoch)=self.transition_input_epoch() else {return false};
+        let basis_matches=self.snapshot_basis.is_some_and(|basis|basis.version==held.epoch.document_version);
+        if !basis_matches || self.snapshot_rules_unbounded || !held.epoch.differs_only_in_document(&epoch) {return false;}
+        if self.rules.as_ref().is_some_and(|rules|rules.has_counter_data() || rules.has_quote_content() || rules.has_list_item_data()) {return false;}
+        self.note_snapshot_dirty();
+        if self.snapshot_dirty.all
+            || (self.snapshot_dirty.tree_changed && held.nodes.iter().any(|input|input.style.sibling_position_dependent)) {return false;}
+        let nodes=self.snapshot_dirty.nodes.iter().chain(&self.snapshot_dirty.subtrees).chain(&self.snapshot_rule_subjects)
+            .map(|node|node.key()).collect();
+        self.held_snapshot_stale=Some(nodes);
+        true
+    }
+
+    /// Whether the host's transition snapshot is being held rather than kept current.
+    pub fn has_held_transition_snapshot(&self)->bool {self.held_snapshot_stale.is_some()}
+
+    /// Hands out what the held snapshot misses; the next snapshot supersedes it.
+    pub fn take_held_snapshot_stale(&mut self)->Option<HeldSnapshotStale> {
+        self.held_snapshot_stale.take().map(|nodes|HeldSnapshotStale{nodes})
+    }
+
+    /// Whether `node`, or an ancestor whose style `ancestor_changed` reports
+    /// as different, was restyled after the held snapshot was taken. An
+    /// ancestor whose style stayed the same passed nothing new down, so its
+    /// descendants' held styles are still their before-change styles.
+    pub fn held_snapshot_covers(&self,stale:&HeldSnapshotStale,node:NodeId,ancestor_changed:impl Fn(NodeId)->bool)->bool {
+        let mut current=Some(node);
+        let mut depth=0;
+        while let Some(id)=current {
+            if depth>=4096 || stale.nodes.contains(&id.key()) && (id==node || ancestor_changed(id)) {return true;}
+            depth+=1;
+            current=match self.document.composed_parent(id) {Ok(parent)=>parent,Err(_)=>return true};
+        }
+        false
+    }
+
+    /// Scans the inline styles added or changed since the last scan; the
+    /// answer stays true once an inline style has mentioned a transition.
+    fn inline_styles_declare_transitions(&mut self)->bool {
+        if self.inline_transition_seen {return true;}
+        let version=self.document.version();
+        let since=self.inline_transition_scan;
+        if since==Some(version) {return false;}
+        let document=&self.document;
+        let subtree=|root:NodeId|->bool {
+            let mut cursor=Some(root);
+            while let Some(node)=cursor {
+                if inline_style_declares_transition(document,node) {return true;}
+                cursor=crate::selector::next_shadow_including_descendant(document,root,node).ok().flatten();
+            }
+            false
+        };
+        let mutations=document.mutations();
+        let seen=match since {
+            Some(since) if document.mutations_cover(since) && !mutations.iter().any(|mutation|mutation.version>since && matches!(mutation.kind,MutationKind::FullRebuild))=>{
+                let first=mutations.partition_point(|mutation|mutation.version<=since);
+                mutations[first..].iter().any(|mutation|match &mutation.kind {
+                    MutationKind::Attribute(name)=>name.as_str().eq_ignore_ascii_case("style") && inline_style_declares_transition(document,mutation.target),
+                    MutationKind::Tree{added:Some(added),..}=>subtree(*added),
+                    _=>false,
+                })
+            }
+            _=>subtree(document.root()),
+        };
+        self.inline_transition_scan=Some(version);
+        self.inline_transition_seen=seen;
+        seen
+    }
+
     /// One document walk at each real style-change event. Shared ancestor Arc
     /// styles preserve DOM inheritance and cached principal-parent provenance.
     ///
@@ -3102,6 +3316,13 @@ impl RenderSession {
         *payload_bytes=payload;nodes.push(input);Ok(())
     }
 
+    /// A provenance record over its bound is an admission failure like the
+    /// snapshot quota: the document stays unsnapshotted instead of erroring.
+    fn snapshot_style_error(error:css::CssError,quota_exceeded:&mut bool)->LayoutError {
+        if error.message==css::TRANSITION_PROVENANCE_LIMIT_MESSAGE {*quota_exceeded=true;LayoutError::CommandLimit}
+        else {LayoutError::Css(error)}
+    }
+
     pub fn transition_snapshot(&mut self) -> Result<Arc<TransitionSnapshot>,LayoutError> {
         self.transition_snapshot_with_text(None)
     }
@@ -3133,6 +3354,9 @@ impl RenderSession {
             self.snapshot_basis=Some(basis);
             self.snapshot_dirty=ReadDirty::default();
             self.snapshot_noted_version=basis.version;
+            self.snapshot_rule_subjects.clear();
+            self.snapshot_rules_unbounded=false;
+            self.held_snapshot_stale=None;
             if incremental {self.invalidation_stats.transition_snapshots_incremental+=1;}
             else {self.invalidation_stats.transition_snapshots_full+=1;}
         }
@@ -3146,7 +3370,9 @@ impl RenderSession {
     fn snapshot_extension<'a>(&mut self,previous:&'a Arc<TransitionSnapshot>,epoch:&TransitionInputEpoch,basis:SnapshotBasis)->Option<SnapshotBase<'a>> {
         let held=self.snapshot_basis?;
         if held.version!=previous.epoch.document_version || held.text_generation!=basis.text_generation
-            || held.had_effects || basis.had_effects || !previous.epoch.differs_only_in_document(epoch) {return None;}
+            || held.had_effects || basis.had_effects
+            || !(previous.epoch.differs_only_in_document(epoch)
+                || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {return None;}
         let tree_changed=self.snapshot_dirty.tree_changed
             || self.document.mutations().iter()
                 .any(|mutation|mutation.version>self.snapshot_noted_version && matches!(mutation.kind,MutationKind::Tree{..}));
@@ -3166,7 +3392,7 @@ impl RenderSession {
             start=end;
         }
         Some(SnapshotBase{previous,ranges,
-            dirty:self.snapshot_dirty.nodes.iter().map(|node|node.key()).collect(),
+            dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key()).collect(),
             subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
     }
 
@@ -3226,6 +3452,9 @@ impl RenderSession {
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
         let mut forced_nodes=alloc::collections::BTreeSet::<u128>::new();
         let (mut computed_styles,mut reused_styles)=(0u64,0u64);
+        // Replaying an old style needs provenance only for elements an effect
+        // can reach: those that may run one and everything below them, or all
+        // of them while samples are installed or a selection asks for it.
         // Counter, quote and list marker output depends on preceding siblings,
         // so generated-content styles are never carried over after a change.
         let generated_context_changed=base.is_some()
@@ -3255,7 +3484,8 @@ impl RenderSession {
                         }).map(|(current,_)|Some(current)),
                     };
                     let unchanged=earlier[0].parent==inherited_parent && !earlier.iter().any(|input|
-                        input.style.has_query_container_dependencies() || input.style.has_inherited_query_container_dependencies());
+                        input.style.has_query_container_dependencies() || input.style.has_inherited_query_container_dependencies()
+                        );
                     if let (true,Some(parent))=(unchanged,parent) {
                         let own_display=earlier[0].style.display;
                         let parent_rendered=parent.as_ref().is_none_or(|parent:&Arc<Style>|parent.display != css::Display::None);
@@ -3295,7 +3525,7 @@ impl RenderSession {
                     if !matches!(self.document.kind(id),Ok(NodeKind::Element{..})) { continue; }
                     let parent_rendered=parent.as_ref().is_none_or(|parent:&Arc<Style>|parent.display != css::Display::None);
                     let (computed,eligible)=rules.compute_transition_snapshot_cached(&self.document,id,parent.as_deref(),None,text,
-                        &mut cache,false).map_err(LayoutError::Css)?;
+                        &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?;
                     parent=Some(computed); eligibility.insert(id.key(),eligible);
                     let ancestor_rendered=self.document.composed_parent(id).ok().flatten()
                         .and_then(|id|rendered_nodes.get(&id.key()).copied()).unwrap_or(parent_rendered);
@@ -3335,7 +3565,7 @@ impl RenderSession {
                         if !requested && !origin_present {continue;}
                         if !requested && !rules.has_transition_pseudo_rules(pseudo) && !(pseudo.is_marker() && pseudo_origin.is_list_item()) && !(quote && !pseudo.is_marker()) {continue;}
                         let (mut generated,mut eligible)=rules.compute_transition_snapshot_cached(&self.document,node,Some(pseudo_origin),Some(pseudo),text,
-                            &mut cache,false).map_err(LayoutError::Css)?;
+                            &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?;
                         if generated.has_query_container_dependencies() || generated.has_inherited_query_container_dependencies() {
                             let context=match query {Some(context)=>context,None=>style_with_query_context(&self.document,node,rules,&mut cache,geometry,text,true)?.1};
                             Arc::make_mut(&mut generated).resolve_query_context_with_text(context,text);eligible.set_query_context(context);
@@ -3379,7 +3609,12 @@ impl RenderSession {
     fn refresh_rules_only(&mut self) -> Result<(), LayoutError> {
         self.reclaim_stale_stylesheet_sources();
         let version = self.document.version();
-        let metadata_changed=self.rules.is_none() || self.rules_version!=version && self.document.mutations().iter().any(|mutation|match &mutation.kind {
+        // Entries the last rules refresh already saw cannot change the rules
+        // again; only those after it are scanned while the journal covers it.
+        let scanned=self.rules_version;
+        let covered=self.document.mutations_cover(scanned);
+        let unseen=move |mutation:&&crate::Mutation|!covered || mutation.version>scanned;
+        let metadata_changed=self.rules.is_none() || self.rules_version!=version && self.document.mutations().iter().filter(unseen).any(|mutation|match &mutation.kind {
             MutationKind::FullRebuild=>true,
             MutationKind::Attribute(name) if matches!(name.as_str(),"name"|"content")=>matches!(self.document.kind(mutation.target),Ok(NodeKind::Element{namespace:crate::Namespace::Html,name,..}) if crate::svg::local_name(name)=="meta"),
             MutationKind::Tree{added,removed,..}=>added.is_some_and(|node|css::color_scheme::subtree_has_meta(&self.document,node)) || removed.is_some_and(|node|css::color_scheme::subtree_has_meta(&self.document,node)),
@@ -3434,6 +3669,7 @@ impl RenderSession {
                     .document
                     .mutations()
                     .iter()
+                    .filter(unseen)
                     .any(|mutation| match &mutation.kind {
                         MutationKind::FullRebuild => true,
                         MutationKind::CharacterData => in_style(&self.document, mutation.target),
@@ -3457,6 +3693,7 @@ impl RenderSession {
                     .map(|rules| rules.environment)
                     .or(self.style_environment)
                     .unwrap_or_default();
+                self.stylesheet_parses.begin_rebuild();
                 let (mut rules, mut font_faces) = layout::stylesheets_with_source_topologies(
                     &self.document,
                     &self.linked_stylesheets,
@@ -3468,7 +3705,9 @@ impl RenderSession {
                     &self.cssom_stylesheet_texts,
                     &self.disabled_stylesheets,
                     self.preferred_stylesheet_set.as_deref(),
+                    &self.stylesheet_parses,
                 )?;
+                self.stylesheet_parses.finish_rebuild();
                 rules.apply_cssom_rule_overrides(&self.cssom_rule_overrides).map_err(LayoutError::Css)?;
                 rules.environment = environment;
                 self.animated_styles
@@ -3495,19 +3734,40 @@ impl RenderSession {
                     }
                 }
                 let previous = self.rules.take().or_else(|| self.previous_rules.take());
+                let fonts_changed = font_faces != self.font_face_rules;
                 let subjects = previous
                     .as_ref()
-                    .filter(|_| !self.rules_reset && font_faces == self.font_face_rules)
+                    .filter(|_| !self.rules_reset && !fonts_changed)
                     .and_then(|previous| rules.changed_rule_subjects(previous, &self.document, &self.style_cache.borrow()));
+                // Layout's own bookkeeping may already have given up on bounding the
+                // change; the transition snapshot keeps its own account.
+                let snapshot_subjects = if self.rules_reset && !fonts_changed && !self.snapshot_rules_unbounded {
+                    previous.as_ref().and_then(|previous| rules.changed_rule_subjects(previous, &self.document, &self.style_cache.borrow()))
+                } else {
+                    subjects.clone()
+                };
                 drop(previous);
                 self.rules = Some(rules);
                 self.rules_generation = self.rules_generation.wrapping_add(1);
                 self.font_face_rules = font_faces;
                 self.font_face_generation = self.font_face_generation.wrapping_add(1);
+                if fonts_changed {
+                    self.layout_cache.invalidate_fonts();
+                    self.paint_revision = self.paint_revision.wrapping_add(1);
+                    self.frame_id = self.frame_id.wrapping_add(1);
+                }
+                match &snapshot_subjects {
+                    Some(subjects) if !self.snapshot_rules_unbounded
+                        && self.snapshot_rule_subjects.len()+subjects.len()<=self.document.node_count()/2+64 =>
+                        self.snapshot_rule_subjects.extend(subjects.iter().map(|&(node,_)|node)),
+                    _ => self.snapshot_rules_unbounded=true,
+                }
                 match subjects {
                     Some(subjects) => self.rule_subjects.get_or_insert_with(Vec::new).extend(subjects),
                     None => {
-                        self.invalidation_stats.full_restyle_causes[4] += 1;
+                        if !self.rules_reset {
+                            self.invalidation_stats.full_restyle_causes[4] += 1;
+                        }
                         self.style_cache.borrow_mut().clear();
                         self.rule_subjects = None;
                         self.rules_reset = true;
@@ -4517,6 +4777,7 @@ impl RenderSession {
     pub fn invalidation_stats(&self) -> InvalidationStats {
         let mut stats = self.invalidation_stats;
         stats.fragment_clears = self.layout_cache.clear_count();
+        (stats.stylesheets_parsed, stats.stylesheet_parses_reused) = self.stylesheet_parses.counts();
         stats
     }
 
@@ -5093,7 +5354,13 @@ impl RenderSession {
         }
         // Intrinsic sizes measured around images keep the answers of the
         // generation they were measured in.
-        if unversioned_pending || self.cached.as_ref().is_some_and(|cached| cached.image_generation != image_generation) {
+        // Arrivals alone keep them: a size measured around a loading image
+        // revalidates itself against the lookups it made.
+        let images_replaced = self.cached.as_ref().is_some_and(|cached| {
+            cached.image_generation != image_generation
+                && !matches!((cached.image_generation, images), (Some(painted), Some(images)) if images.arrivals_only_since(painted))
+        });
+        if unversioned_pending || images_replaced {
             self.layout_cache.clear_intrinsics();
         }
         if unversioned_pending || self.cached.as_ref().is_some_and(|cached| {
@@ -5474,6 +5741,9 @@ impl RenderSession {
             stats.styles_computed += styles.computed_styles as u64;
             stats.boxes_laid_out += self.layout_cache.boxes_laid_out() as u64;
             stats.fragments_replayed += self.layout_cache.stats().hits as u64;
+            for (total, misses) in stats.fragment_misses.iter_mut().zip(self.layout_cache.miss_reasons()) {
+                *total += misses as u64;
+            }
             let (measured, reused) = self.layout_cache.intrinsics_measured();
             stats.intrinsics_measured += measured as u64;
             stats.intrinsics_reused += reused as u64;
@@ -6132,6 +6402,80 @@ mod tests {
         assert_eq!(session.complete_stylesheet_import_occurrences(owner,vec![(second,leaf(88))]).unwrap(),0);
         assert_eq!(session.computed_style(target).unwrap().width,Some(11.));
         assert!(!root.is_detached(),"completion retains canonical CSSOM root");
+    }
+
+    #[test]
+    fn stylesheet_installs_parse_only_the_new_or_edited_sheet() {
+        let document = crate::html::parse("<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><div class=box></div>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (a, b, target) = (find("#a"), find("#b"), find(".box"));
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let mut session = RenderSession::new(document);
+        session.set_stylesheet_source(a, Some(sheet("https://x.test/a.css", ".box{width:7px;height:3px}"))).unwrap();
+        let after_a = session.invalidation_stats();
+        session.set_stylesheet_source(b, Some(sheet("https://x.test/b.css", ".box{width:9px}"))).unwrap();
+        let after_b = session.invalidation_stats();
+        assert_eq!(after_b.stylesheets_parsed - after_a.stylesheets_parsed, 1, "the first sheet is not parsed again");
+        assert!(after_b.stylesheet_parses_reused - after_a.stylesheet_parses_reused >= 2);
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(9.0), Some(3.0)));
+        session.set_stylesheet_source(b, Some(sheet("https://x.test/b.css", ".box{width:11px}"))).unwrap();
+        let after_edit = session.invalidation_stats();
+        assert_eq!(after_edit.stylesheets_parsed - after_b.stylesheets_parsed, 1, "an edited sheet misses its old entry");
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(11.0), Some(3.0)));
+        session.set_stylesheet_source(a, Some(sheet("https://x.test/a.css", ".box{width:7px;height:5px}"))).unwrap();
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(11.0), Some(5.0)), "document order, not install order, decides the cascade");
+    }
+
+    #[test]
+    fn full_rebuild_journal_keeps_sheets_whose_owner_is_unchanged() {
+        let document = crate::html::parse("<style>.a{width:5px}</style><link id=l rel=stylesheet href=l.css><div class=a></div><div class=b></div>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (style, link, a, b) = (find("style"), find("#l"), find(".a"), find(".b"));
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let mut session = RenderSession::new(document);
+        session.set_stylesheet_source(style, Some(sheet("https://x.test/inline.css", ".a{width:5px}"))).unwrap();
+        session.set_stylesheet_source(link, Some(sheet("https://x.test/l.css", ".b{width:9px}"))).unwrap();
+        session.display_list(100, 80, &NoText).unwrap();
+        assert_eq!((session.computed_style(a).unwrap().width, session.computed_style(b).unwrap().width), (Some(5.0), Some(9.0)));
+        let read: Rc<dyn Fn(&crate::Document, NodeId) -> Option<crate::forms::FormSelectorState>> = Rc::new(|_, _| None);
+        session.document_mut().set_form_selector_state_resolver(read);
+        assert!(session.document().mutations().iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)));
+        session.reclaim_stale_stylesheet_sources();
+        assert!(session.stylesheet_source(style).is_some() && session.stylesheet_source(link).is_some());
+        session.display_list(100, 80, &NoText).unwrap();
+        assert_eq!((session.computed_style(a).unwrap().width, session.computed_style(b).unwrap().width), (Some(5.0), Some(9.0)));
+    }
+
+    #[test]
+    fn full_rebuild_journal_still_drops_sheets_of_replaced_owners() {
+        let document = crate::html::parse("<style>.a{width:5px}</style><div class=a></div>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (style, a) = (find("style"), find(".a"));
+        let mut session = RenderSession::new(document);
+        session.set_stylesheet_source(style, Some(css::StylesheetSource { disabled: false, url: Arc::from("https://x.test/inline.css"), text: Arc::from(".a{width:5px}"), imports: Vec::new() })).unwrap();
+        assert_eq!(session.computed_style(a).unwrap().width, Some(5.0));
+        session.document_mut().remove(style).unwrap();
+        let read: Rc<dyn Fn(&crate::Document, NodeId) -> Option<crate::forms::FormSelectorState>> = Rc::new(|_, _| None);
+        session.document_mut().set_form_selector_state_resolver(read);
+        session.reclaim_stale_stylesheet_sources();
+        assert!(session.stylesheet_source(style).is_none());
+        assert_eq!(session.computed_style(a).unwrap().width, None);
+    }
+
+    #[test]
+    fn many_large_bitmaps_do_not_exhaust_the_display_list_budget() {
+        let document = crate::html::parse("<body style='margin:0'><img id=a src=a.png style='width:10px;display:block'><img id=b src=b.png style='width:10px;display:block'></body>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (a, b) = (find("#a"), find("#b"));
+        let mut session = RenderSession::new(document);
+        let bitmap = |value: u8| Arc::new(ImageData { width: 1700, height: 1600, pixels: alloc::vec![value; 1700 * 1600 * 4].into() });
+        session.set_node_bitmap(a, Some(bitmap(1))).unwrap();
+        session.set_node_bitmap(b, Some(bitmap(2))).unwrap();
+        let list = session.display_list(100, 100, &NoText).unwrap();
+        assert_eq!(list.0.iter().filter(|command| matches!(command, crate::paint::Command::Image { .. })).count(), 2);
     }
 
     #[test]

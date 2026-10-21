@@ -357,7 +357,7 @@ impl Style {
                 .custom_properties()
                 .iter()
                 .find(|(property, _)| property == name)
-                .and_then(|(_, value)| value.clone());
+                .and_then(|(_, value)| value.as_ref().map(String::from));
         }
         // CSSOM resolved color special cases expose the used float color.
         // Computed/Typed OM serialization retains the inherited expression.

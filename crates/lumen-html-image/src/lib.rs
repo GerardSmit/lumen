@@ -29,6 +29,7 @@ const GLYPH_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const GLYPH_CACHE_ENTRIES: usize = 4096;
 const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LAYER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GPUI_PRIMITIVE_BYTES: usize = 64 * 1024 * 1024;
 const ASSET_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PNG_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -1604,13 +1605,17 @@ fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
         if width > u32::MAX as f32 || height > u32::MAX as f32 {
             return Err(ImageError::TooLarge);
         }
-        let allocation = lumen_common::limits::size::repeat(
+        // Primitive rasters for one frame coexist, so they share a frame
+        // budget rather than one layer's. A primitive past it stays a vector
+        // command for the consumer instead of failing the whole frame.
+        let Ok(allocation) = lumen_common::limits::size::repeat(
             width as usize,
             height as usize,
-            (MAX_LAYER_BYTES - bytes) / 4,
-        )
-        .map_err(|_| ImageError::TooLarge)?
-            * 4;
+            MAX_GPUI_PRIMITIVE_BYTES.saturating_sub(bytes) / 4,
+        ) else {
+            continue;
+        };
+        let allocation = allocation * 4;
         bytes += allocation;
         let (x, y) = (left / scale, top / scale);
         let mut translated = command.clone();
@@ -3238,6 +3243,22 @@ fn resolve_layers_region(
     result
 }
 
+/// The local-space bounds that `matrix` maps onto `region`, grown by two
+/// source-raster pixels so bilinear sampling at the region edge keeps its
+/// neighbors.
+fn transform_region_to_local(region:Rect,matrix:Affine,scale:f32)->Option<Rect>{
+    let inverse=matrix.inverse()?;
+    let corners=[(region.x,region.y),(region.x+region.width,region.y),(region.x,region.y+region.height),(region.x+region.width,region.y+region.height)]
+        .map(|(x,y)|inverse.apply(x,y));
+    let margin=2.0/scale;
+    let left=corners.iter().map(|p|p.0).fold(f32::INFINITY,f32::min)-margin;
+    let top=corners.iter().map(|p|p.1).fold(f32::INFINITY,f32::min)-margin;
+    let right=corners.iter().map(|p|p.0).fold(f32::NEG_INFINITY,f32::max)+margin;
+    let bottom=corners.iter().map(|p|p.1).fold(f32::NEG_INFINITY,f32::max)+margin;
+    let local=Rect{x:left,y:top,width:right-left,height:bottom-top};
+    [local.x,local.y,local.width,local.height].iter().all(|v|v.is_finite()).then_some(local).filter(|local|local.width>0.0&&local.height>0.0)
+}
+
 fn resolve_layers_region_in_operation(
     list:&[Command],scale:f32,font:Option<&dyn FontProvider>,cache:&mut GlyphCache,bytes:&mut usize,
     spatial_source:bool,region:Option<Rect>,scene:&mut SourceScopeAnalysis,view:SourceScopeView,
@@ -3339,10 +3360,14 @@ fn resolve_layers_region_in_operation(
                     .extend(resolve_layers_region_in_operation(&child, scale, font, cache, bytes,spatial_source,region,scene,SourceScopeView{start:view.start+start,translation:[view.translation[0]+matrix.e,view.translation[1]+matrix.f]})?.0);
                 continue;
             }
-            // Nonintegral transforms sample a complete isolated source.
-            // Independently transforming local source tiles would lose
-            // bilinear neighbors at their seams and alter vector coverage.
-            let mut child = resolve_layers_region_in_operation(&list[start..end], scale, font, cache, bytes,spatial_source,None,scene,SourceScopeView{start:view.start+start,..view})?;
+            // Nonintegral transforms sample one isolated source rather than
+            // independently transformed tiles, which would lose bilinear
+            // neighbors at their seams and alter vector coverage. That source
+            // only needs the visible region mapped back into local space, plus
+            // a sampling margin; nested layers otherwise rasterize their whole
+            // content and a page-sized group exceeds the layer budget.
+            let local_region=region.and_then(|region|transform_region_to_local(region,matrix,scale));
+            let mut child = resolve_layers_region_in_operation(&list[start..end], scale, font, cache, bytes,spatial_source,local_region,scene,SourceScopeView{start:view.start+start,..view})?;
             if matrix.b == 0.0
                 && matrix.c == 0.0
                 && child.0.iter().all(|command| {
@@ -4508,6 +4533,56 @@ fn settle_pass(
 mod tests {
     use super::*;
     use lumen_html::paint::TextShaper;
+
+    #[test]
+    fn transform_region_to_local_inverts_the_matrix_and_grows_by_two_raster_pixels() {
+        let matrix=Affine{a:2.0,d:2.0,e:21.0,..Affine::IDENTITY};
+        let region=Rect{x:25.0,y:10.0,width:40.0,height:20.0};
+        let local=transform_region_to_local(region,matrix,4.0).unwrap();
+        let inverse=matrix.inverse().unwrap();
+        for (x,y) in [(25.0,10.0),(65.0,10.0),(25.0,30.0),(65.0,30.0)] {
+            let (lx,ly)=inverse.apply(x,y);
+            assert!(local.x<=lx && lx<=local.x+local.width && local.y<=ly && ly<=local.y+local.height);
+            assert!(lx-local.x>=0.5-1e-4 && local.x+local.width-lx>=0.5-1e-4 && ly-local.y>=0.5-1e-4 && local.y+local.height-ly>=0.5-1e-4);
+        }
+        for (actual,expected) in [(local.x,1.5),(local.y,4.5),(local.width,21.0),(local.height,11.0)] {
+            assert!((actual-expected).abs()<1e-4,"{local:?}");
+        }
+        assert!(transform_region_to_local(region,Affine{a:0.0,b:0.0,..Affine::IDENTITY},1.0).is_none());
+    }
+
+    #[test]
+    fn gpui_primitive_rasters_share_a_frame_budget_and_overflow_stays_vector() {
+        use lumen_html::paint::{Gradient,GradientKind,GradientStop};
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let stop=|r,b|GradientStop{color:Rgba{r,g:0,b,a:255},position:None};
+        let gradient=Arc::new(Gradient{kind:GradientKind::Linear{angle:180.0,corner:None},repeating:false,
+            stops:vec![stop(255,0),stop(0,255)].into(),angular:None,color:None});
+        let rect=Rect{x:0.0,y:0.0,width:1920.0,height:1080.0};
+        for count in [4,9] {
+            let list=DisplayList((0..count).map(|_|Command::FillGradient{rect,radius:0.0,gradient:gradient.clone()}).collect());
+            let image=render_with_mode_cached(&list,1920,1080,1.0,RasterizationMode::Gpui,&font,&mut GlyphCache::default()).unwrap();
+            assert_eq!((image.width,image.height),(1920,1080));
+            assert_eq!(image.pixels[3],255,"{count} gradients");
+        }
+    }
+
+    #[test]
+    fn gpui_layer_inside_fractional_transform_renders_a_tall_rect_without_a_whole_layer_raster() {
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let tall=Rect{x:0.0,y:0.0,width:1000.0,height:20000.0};
+        let list=DisplayList(vec![
+            Command::PushTransform(Affine{e:0.5,f:0.25,..Affine::IDENTITY}),
+            Command::PushLayer{svg_clip:None,filters:None,corners:None,rect:tall,radius:0.0,opacity:0.5,clip:false},
+            Command::FillRect{rect:tall,color:Rgba{r:0,g:128,b:0,a:255}},
+            Command::PopLayer,
+            Command::PopTransform,
+        ]);
+        let image=render_with_mode_cached(&list,800,600,1.0,RasterizationMode::Gpui,&font,&mut GlyphCache::default()).unwrap();
+        assert_eq!((image.width,image.height),(800,600));
+        let center=(300*800+400)*4;
+        assert_eq!(&image.pixels[center..center+4],&[0,128,0,128],"half-opaque green layer");
+    }
 
     #[test]
     fn specification_svg_metadata_free_page_negotiates_default_but_root_uses_owner_preference() {

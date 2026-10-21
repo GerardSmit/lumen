@@ -170,9 +170,24 @@ pub(crate) fn position(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<(f64, f64
     if realm.layout_flusher.borrow().is_none() && realm.session.borrow().viewport_size().is_none() {
         return Ok((0.0, 0.0));
     }
+    // A position of zero lies inside every clamping range, so a pending
+    // layout cannot change it.
+    if realm.session.borrow().scroll_offset(node) == (0.0, 0.0) {
+        return Ok((0.0, 0.0));
+    }
     realm.flush_layout()?;
     let (x, y) = realm.session.borrow().scroll_offset(node);
     Ok((f64::from(x), f64::from(y)))
+}
+
+/// Whether `element` is an ordinary element resting at its scroll origin, whose
+/// `scrollTop`/`scrollLeft` are zero whatever the layout is: neither the root
+/// nor `body`, which can stand for the viewport.
+pub(crate) fn rests_at_scroll_origin(realm: &Rc<DomRealm>, element: NodeId) -> bool {
+    let session = realm.session.borrow();
+    let ordinary = matches!(session.document().kind(element),
+        Ok(NodeKind::Element { name, .. }) if !matches!(lumen_html::svg::local_name(name), "html" | "body"));
+    ordinary && session.scroll_offset(element) == (0.0, 0.0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

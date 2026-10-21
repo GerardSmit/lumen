@@ -17,6 +17,8 @@ pub use animation_controls::{AnonymousProgressTimeline,parse_anonymous_progress_
 use transition_controls::values as transition_values;
 mod identifier;
 pub mod nesting;
+mod parse_cache;
+pub use parse_cache::StylesheetParseCache;
 pub mod namespaces;
 pub mod selector_serialization;
 pub mod font_feature_values;
@@ -3099,7 +3101,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
 #[derive(Clone, Debug)]
 pub struct Style {
     extras: Option<Arc<StyleExtras>>,
-    custom: Option<Arc<[(String, Option<String>)]>>,
+    custom: Option<Arc<CustomProperties>>,
     pub display: Display,
     pub opacity: f32,
     pub color: Rgba,
@@ -4102,8 +4104,9 @@ impl Style {
             bytes=bytes.checked_add(header)?.checked_add(core::mem::size_of_val(origins.as_ref()))?;
         }
         if let Some(custom)=&self.custom {
-            bytes=bytes.checked_add(header.checked_add(core::mem::size_of_val(custom.as_ref()))?)?;
-            for (name,value) in custom.iter() {bytes=bytes.checked_add(name.capacity())?.checked_add(value.as_ref().map_or(0,String::capacity))?;}
+            bytes=bytes.checked_add(header.checked_add(core::mem::size_of_val(custom.as_ref()))?)?
+                .checked_add(custom.len().checked_mul(core::mem::size_of::<CustomEntry>())?)?;
+            for (name,value) in custom.iter() {bytes=bytes.checked_add(name.len())?.checked_add(value.as_ref().map_or(0,|value|value.len()))?;}
         }
         let corners=self.border_corner_radii.iter().flat_map(|corners|corners.iter())
             .chain(self.logical_border_radius_corners.iter().flatten());
@@ -4115,8 +4118,8 @@ impl Style {
         Some(bytes)
     }
 
-    pub fn custom_properties(&self) -> &[(String, Option<String>)] {
-        self.custom.as_deref().unwrap_or(&[])
+    pub fn custom_properties(&self) -> &CustomProperties {
+        self.custom.as_deref().unwrap_or(&NO_CUSTOM)
     }
     pub(crate) fn clear_individual_transform_effects(&mut self){
         if self.individual_transforms.iter().any(Option::is_some){self.individual_transforms=[None,None,None];}
@@ -6819,12 +6822,20 @@ pub struct StyleIndex {
     transition_pseudo_rules: u8,
     /// Quote functions in pseudo content need one ordered tree-context pass.
     has_quote_content: bool,
+    /// Indices of the rules behind `has_quote_content`.
+    quote_rules: Vec<usize>,
     /// Counter declarations or generated counter functions need one bounded
     /// composed-tree evaluation before visual layout.
     has_counter_data: bool,
     /// CSS list-item display or marker rules may need the implicit list-item
     /// counter even when no author counter declaration is present.
     has_list_item_data: bool,
+    /// `::before`/`::after` rules (and their `::marker`s), bucketed like the
+    /// cascade, so an element none of them can match skips pseudo computation.
+    generated_pseudo_rules: PseudoRuleBuckets,
+    /// The subset of those rules which declare counter operations, counter
+    /// functions or a list-item display; only these matter to the counter walk.
+    counter_pseudo_rules: PseudoRuleBuckets,
     /// Live form-state changes only invalidate retained styles when a selector
     /// can observe validity through a direct or nested pseudo-class.
     has_validity_data: bool,
@@ -6840,6 +6851,9 @@ pub struct StyleIndex {
     uses_ancestor_bloom: bool,
     #[cfg(test)]
     bloom_rejects: core::cell::Cell<usize>,
+    /// Generated-pseudo cascades run, for tests of the gates in front of them.
+    #[cfg(test)]
+    pseudo_cascades: core::cell::Cell<usize>,
     /// No rule depends on anything but the element itself, its ancestors and
     /// its attributes, so siblings with equal elements compute equal styles.
     pub(crate) siblings_share: bool,
@@ -6856,15 +6870,19 @@ pub struct StyleIndex {
     /// Query text is reparsed on every evaluation, and the cascade asks once
     /// per candidate rule per element.
     media_results: core::cell::RefCell<(Option<MediaEnvironment>, Vec<u8>)>,
+    /// Identity of the registration set that settledness recorded in custom property maps refers to.
+    registration_epoch: core::cell::RefCell<RegistrationEpoch>,
+    /// Substituted `var()` declarations keyed by source text and custom property map.
+    deferred_expansions: core::cell::RefCell<DeferredExpansions>,
     pub(crate) keyframes: Vec<KeyframesRuleText>,
     invalidation: invalidation::InvalidationSets,
     layer_order: LayerCanonicalizer,
     last_layers: Option<Arc<[String]>>,
 }
 
-pub(crate) const MAX_RULES: usize = 4096;
+pub(crate) const MAX_RULES: usize = 1 << 18;
 const MAX_DECLARATIONS: usize = 4096;
-const MAX_SELECTOR_BYTES: usize = 256;
+const MAX_SELECTOR_BYTES: usize = 16 * 1024;
 const MAX_SELECTOR_NESTING: usize = 32;
 const MAX_SELECTOR_COMPOUNDS: usize = 64;
 const MAX_SELECTOR_MATCH_DEPTH: usize = 128;
@@ -6877,6 +6895,74 @@ const MAX_CSS_GRAPH_DEPTH: usize = 32;
 struct LayerCanonicalizer {
     names: Vec<String>,
     sheets: usize,
+}
+
+/// Rules that can make generated content with quotes. A `content: var(..)`
+/// always counts: the custom property can come from an inline style, a script
+/// or a registration, none of which a scan of the rules sees. So does a
+/// `content` that is inherited or reverted, which brings in the content of
+/// another element.
+fn quote_rules(rules: &[Rule]) -> Vec<usize> {
+    rules.iter().enumerate().filter(|(_, rule)| rule.declarations.iter().any(|declaration| match &declaration.value {
+        Value::GeneratedContent(GeneratedContent::Items(items)) => generated_items_have_quotes(items),
+        Value::Deferred(name, _) => &**name == "content",
+        Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
+        _ => false,
+    })).map(|(index, _)| index).collect()
+}
+
+/// Rule indices bucketed by the rightmost compound's tag, id and first class,
+/// the same way the cascade buckets all rules.
+#[derive(Default)]
+struct PseudoRuleBuckets {
+    tags: Vec<usize>,
+    ids: Vec<usize>,
+    classes: Vec<usize>,
+    universal: Vec<usize>,
+}
+
+impl PseudoRuleBuckets {
+    fn new(rules: &[Rule], keep: impl Fn(&Rule) -> bool) -> Self {
+        let mut buckets = Self::default();
+        index_rules_where(rules, 0, keep, &mut buckets.tags, &mut buckets.ids, &mut buckets.classes, &mut buckets.universal);
+        buckets
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.ids.is_empty() && self.classes.is_empty() && self.universal.is_empty()
+    }
+}
+
+fn is_generated_pseudo_rule(rule: &Rule) -> bool {
+    matches!(rule.selector.pseudo_element,
+        Some(PseudoElement::Before | PseudoElement::After | PseudoElement::BeforeMarker | PseudoElement::AfterMarker))
+}
+
+/// A generated-pseudo rule whose pseudo-element can take part in counter
+/// scoping: it changes counters, prints one, or becomes a list item with a
+/// marker of its own.
+fn is_counter_pseudo_rule(rule: &Rule) -> bool {
+    is_generated_pseudo_rule(rule) && rule.declarations.iter().any(|declaration| match &declaration.value {
+        Value::CounterReset(value) | Value::CounterIncrement(value) | Value::CounterSet(value) => value.is_some(),
+        Value::GeneratedContent(GeneratedContent::Items(items)) => generated_items_have_counters(items),
+        Value::Display(Display::ListItem)
+        | Value::DisplayComponents { principal: Display::ListItem, .. }
+        | Value::DisplayComponents { list_item: true, .. } => true,
+        Value::Deferred(name, _) => matches!(&**name, "content" | "counter-reset" | "counter-increment" | "counter-set" | "all" | "display"),
+        Value::Default(158 | 160..=162, _) | Value::Revert(158 | 160..=162) | Value::RevertLayer(158 | 160..=162) => true,
+        _ => false,
+    })
+}
+
+fn generated_items_have_quotes(items: &[GeneratedContentItem]) -> bool {
+    items.iter().any(|item| match item {
+        GeneratedContentItem::OpenQuote
+        | GeneratedContentItem::CloseQuote
+        | GeneratedContentItem::NoOpenQuote
+        | GeneratedContentItem::NoCloseQuote => true,
+        GeneratedContentItem::AlternativeText(items) => generated_items_have_quotes(items),
+        _ => false,
+    })
 }
 
 fn generated_items_have_counters(items: &[GeneratedContentItem]) -> bool {
@@ -6973,30 +7059,7 @@ impl RuleFlags {
                         )
                 })
         });
-        let has_quote_content = rules.iter().any(|rule| {
-            rule.selector.pseudo_element.is_some()
-                && rule
-                    .declarations
-                    .iter()
-                    .any(|declaration| match &declaration.value {
-                        Value::GeneratedContent(GeneratedContent::Items(items)) => {
-                            items.iter().any(|item| {
-                                matches!(
-                                    item,
-                                    GeneratedContentItem::OpenQuote
-                                        | GeneratedContentItem::CloseQuote
-                                        | GeneratedContentItem::NoOpenQuote
-                                        | GeneratedContentItem::NoCloseQuote
-                                )
-                            })
-                        }
-                        Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
-                        Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => {
-                            true
-                        }
-                        _ => false,
-                    })
-        });
+        let has_quote_content = !quote_rules(rules).is_empty();
         let has_counter_data = rules.iter().any(|rule| {
             rule.declarations
                 .iter()
@@ -7007,8 +7070,8 @@ impl RuleFlags {
                     Value::GeneratedContent(GeneratedContent::Items(items)) => {
                         generated_items_have_counters(items)
                     }
-                    Value::Deferred(name, _) => matches!(&**name, "content" | "all"),
-                    Value::Default(158, _) | Value::Revert(158) | Value::RevertLayer(158) => true,
+                    Value::Deferred(name, _) => matches!(&**name, "content" | "counter-reset" | "counter-increment" | "counter-set" | "all"),
+                    Value::Default(158 | 160..=162, _) | Value::Revert(158 | 160..=162) | Value::RevertLayer(158 | 160..=162) => true,
                     _ => false,
                 })
         });
@@ -7082,7 +7145,11 @@ fn rule_shares_siblings(rule: &Rule) -> bool {
 /// Add `rules[from..]` to the tag, id, class and universal buckets and keep
 /// each bucket sorted by its key; ties stay in rule order.
 fn index_rules(rules: &[Rule], from: usize, tags: &mut Vec<usize>, ids: &mut Vec<usize>, classes: &mut Vec<usize>, universal: &mut Vec<usize>) {
-    for (index, rule) in rules.iter().enumerate().skip(from) {
+    index_rules_where(rules, from, |_| true, tags, ids, classes, universal);
+}
+
+fn index_rules_where(rules: &[Rule], from: usize, keep: impl Fn(&Rule) -> bool, tags: &mut Vec<usize>, ids: &mut Vec<usize>, classes: &mut Vec<usize>, universal: &mut Vec<usize>) {
+    for (index, rule) in rules.iter().enumerate().skip(from).filter(|(_, rule)| keep(rule)) {
         if rule.selector.part.is_some() {
             universal.push(index);
         } else if rule.selector.id.is_some() {
@@ -7261,8 +7328,11 @@ impl StyleIndex {
             has_typographic_content,
             transition_pseudo_rules,
             has_quote_content,
+            quote_rules: quote_rules(&rules),
             has_counter_data,
             has_list_item_data,
+            generated_pseudo_rules: PseudoRuleBuckets::new(&rules, is_generated_pseudo_rule),
+            counter_pseudo_rules: PseudoRuleBuckets::new(&rules, is_counter_pseudo_rule),
             has_validity_data,
             rules,
             font_scope_chains: core::cell::RefCell::new(Vec::new()),
@@ -7274,6 +7344,8 @@ impl StyleIndex {
             uses_ancestor_bloom,
             #[cfg(test)]
             bloom_rejects: core::cell::Cell::new(0),
+            #[cfg(test)]
+            pseudo_cascades: core::cell::Cell::new(0),
             siblings_share,
             rules_siblings_share: siblings_share,
             document_base_url,
@@ -7282,6 +7354,8 @@ impl StyleIndex {
             registered_properties: None,
             registration_snapshot: core::cell::RefCell::new(None),
             media_results: core::cell::RefCell::new((None, Vec::new())),
+            registration_epoch: core::cell::RefCell::new(RegistrationEpoch::default()),
+            deferred_expansions: core::cell::RefCell::new(DeferredExpansions::default()),
             keyframes: Vec::new(),
             invalidation,
             layer_order,
@@ -7324,6 +7398,12 @@ impl StyleIndex {
 
     pub(crate) fn has_quote_content(&self) -> bool {
         self.has_quote_content
+    }
+
+    /// Whether some rule that can generate quotes matches the element, so
+    /// that its `::before` and `::after` are worth computing for quote depth.
+    pub(crate) fn may_generate_quotes(&self, document: &Document, node: NodeId) -> bool {
+        self.quote_rules.iter().any(|&index| self.rules[index].matches_at(document, node))
     }
 
     pub(crate) fn has_counter_data(&self) -> bool {
@@ -7418,8 +7498,11 @@ impl StyleIndex {
         let style = Arc::new(compute_for_named_mode(kind, parent, self, Some((document, node)), bloom,
             text, pseudo, None, Some(role), starting, false, Some(&mut eligibility), None)?);
         if !eligibility.dependent.is_empty() { eligibility.sources=Some(core::mem::take(&mut eligibility.dependent).into()); }
-        if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>2*1024*1024) {
-            return Err(CssError{offset:0,message:"CSS transition snapshot provenance exceeds limit"});
+        if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+            eligibility.drop_unregistered_custom_sources();
+            if eligibility.checked_retained_bytes().is_none_or(|bytes|bytes>TRANSITION_PROVENANCE_LIMIT) {
+                return Err(CssError{offset:0,message:TRANSITION_PROVENANCE_LIMIT_MESSAGE});
+            }
         }
         if pseudo.is_none() && !starting { cache.store_unattributed(document, node, role, &style); }
         Ok((style, eligibility))
@@ -7429,6 +7512,22 @@ impl StyleIndex {
     /// snapshot of every element they reach then depends on their samples.
     pub(crate) fn has_effect_declarations(&self) -> bool {
         !self.effect_declarations.is_empty()
+    }
+
+    /// Whether any rule can set a transition or animation property, or an
+    /// `@keyframes` exists. Without one, and without inline styles or
+    /// installed effects doing the same, no style change can start a transition.
+    pub(crate) fn declares_transitions(&self) -> bool {
+        fn named(name: &str) -> bool {
+            name == "all" || name.starts_with("transition") || name.starts_with("animation")
+        }
+        !self.keyframes.is_empty() || self.rules.iter().any(|rule| rule.declarations.iter().any(|declaration| match &declaration.value {
+            Value::TransitionTimes(..) | Value::TransitionTimesRaw(..) | Value::TransitionProperty(_)
+            | Value::TransitionTimingFunction(_) | Value::TransitionBehavior(_) | Value::Animation(..) => true,
+            Value::Deferred(name, _) => named(name),
+            Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => named(&group.property),
+            _ => false,
+        }))
     }
 
     /// Records a style carried over from an earlier snapshot, so later
@@ -7508,6 +7607,7 @@ impl StyleIndex {
     pub(crate) fn compute_pseudo_cached(&self, document: &Document, origin: NodeId,
         origin_style: &Style, pseudo: PseudoElement, text: Option<&dyn TextShaper>,
         cache: &mut StyleCache) -> Result<Option<GeneratedStyle>, CssError> {
+        let marker_of_list_item = matches!(pseudo, PseudoElement::BeforeMarker | PseudoElement::AfterMarker) && origin_style.is_list_item();
         cache.prepare_text_context(text);
         let role = self.box_children_context(document, origin, origin_style, text, cache)?;
         let token = cache.parent_token(Some(origin_style));
@@ -7516,6 +7616,11 @@ impl StyleIndex {
                 cache.replay_viewport_read(origin, 2);
                 return Ok(generated);
             }
+        }
+        // The gate runs selector matching, so its answer is cached like a computed pseudo.
+        if !marker_of_list_item && !self.generated_pseudo_may_exist(document, origin, pseudo) {
+            if let Some(token) = token { cache.store_pseudo(document, origin, pseudo, token, role, &None); }
+            return Ok(None);
         }
         let window = cache.begin_viewport_window();
         let generated = self.compute_pseudo_in_context(document, origin, origin_style, pseudo, text, role);
@@ -7556,6 +7661,8 @@ impl StyleIndex {
         if !self.has_generated_content && !html_q && !pseudo.is_marker() {
             return Ok(None);
         }
+        #[cfg(test)]
+        self.pseudo_cascades.set(self.pseudo_cascades.get() + 1);
         let style = compute_for_named(
             kind,
             Some(origin_style),
@@ -7686,6 +7793,15 @@ impl StyleIndex {
     /// when they are not bounded by tree position (restyle everything).
     pub(crate) fn mutation_restyle_targets(&self, document: &Document, mutations: &[crate::Mutation]) -> Option<Vec<NodeId>> {
         self.invalidation.affected(document, mutations)
+    }
+
+    /// The elements a change of live element state (see
+    /// `InvalidationSets::affected_by_state`) can restyle: the form controls
+    /// when `form_values` changed, and the chains of nodes whose interaction
+    /// state changed; `None` when not bounded by tree position.
+    pub(crate) fn state_restyle_targets(&self, document: &Document, form_values: bool, chains: &[NodeId]) -> Option<Vec<NodeId>> {
+        let controls = if form_values { invalidation::form_controls(document) } else { Vec::new() };
+        self.invalidation.affected_by_state(document, &controls, chains)
     }
 
     /// The elements a rebuild from `previous` to this index can restyle: the
@@ -7885,7 +8001,9 @@ impl StyleIndex {
         self.transition_pseudo_rules |= flags.transition_pseudo_rules;
         self.has_z_index |= flags.has_z_index;
         self.has_generated_content |= flags.has_generated_content;
-        self.has_quote_content |= flags.has_quote_content;
+        let appended_quotes = quote_rules(&rules);
+        self.has_quote_content |= !appended_quotes.is_empty();
+        self.quote_rules.extend(appended_quotes.into_iter().map(|index| from + index));
         self.has_counter_data |= flags.has_counter_data;
         self.has_list_item_data |= flags.has_list_item_data;
         self.has_validity_data |= flags.has_validity_data;
@@ -7901,6 +8019,8 @@ impl StyleIndex {
         self.invalidation.extend(&rules);
         self.rules.extend(rules);
         index_rules(&self.rules, from, &mut self.tags, &mut self.ids, &mut self.classes, &mut self.universal);
+        self.generated_pseudo_rules = PseudoRuleBuckets::new(&self.rules, is_generated_pseudo_rule);
+        self.counter_pseudo_rules = PseudoRuleBuckets::new(&self.rules, is_counter_pseudo_rule);
         *self.media_results.borrow_mut() = (None, Vec::new());
         *self.registration_snapshot.borrow_mut() = None;
     }
@@ -7920,10 +8040,66 @@ impl StyleIndex {
     }
 
     fn matches_tag<'a>(&'a self, key: &str) -> &'a [usize] {
+        self.matches_tag_in(&self.tags, key)
+    }
+
+    fn matches_tag_in<'a>(&'a self, entries: &'a [usize], key: &str) -> &'a [usize] {
         let tag = |index: usize| self.rules[index].selector.tag.as_deref().unwrap();
-        let start = self.tags.partition_point(|&index| ascii_ci_cmp(tag(index), key).is_lt());
-        let end = start + self.tags[start..].partition_point(|&index| ascii_ci_cmp(tag(index), key).is_eq());
-        &self.tags[start..end]
+        let start = entries.partition_point(|&index| ascii_ci_cmp(tag(index), key).is_lt());
+        let end = start + entries[start..].partition_point(|&index| ascii_ci_cmp(tag(index), key).is_eq());
+        &entries[start..end]
+    }
+
+    /// Whether a rule of `buckets` for `pseudo` can apply to the element: the
+    /// cascade's candidate lookup with the cheap rejects, without declarations.
+    fn pseudo_rule_may_match(&self, buckets: &PseudoRuleBuckets, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
+        if buckets.is_empty() { return false; }
+        let Ok(NodeKind::Element { namespace, name, attributes, .. }) = document.kind(origin) else { return true; };
+        let test = |order: usize| {
+            let rule = &self.rules[order];
+            rule.selector.pseudo_element == Some(pseudo) && self.rule_media_matches(order) && rule.matches_at(document, origin)
+        };
+        if buckets.universal.iter().any(|&order| test(order)) { return true; }
+        let local_name = crate::svg::local_name(name);
+        if self.matches_tag_in(&buckets.tags, local_name).iter().any(|&order| {
+            (namespace == &Namespace::Html || self.rules[order].selector.tag.as_deref() == Some(local_name)) && test(order)
+        }) { return true; }
+        if buckets.ids.is_empty() && buckets.classes.is_empty() { return false; }
+        let html_attribute_names = namespace == &Namespace::Html && document.is_html_document();
+        attributes.iter().any(|(key, value)| {
+            let is = |wanted: &str| if html_attribute_names { key.as_str().eq_ignore_ascii_case(wanted) } else { key.as_str() == wanted };
+            (is("id") && self.matches(&buckets.ids, value, 1).iter().any(|&order| test(order)))
+                || (is("class") && value.split_ascii_whitespace().any(|class|
+                    self.matches(&buckets.classes, class, 2).iter().any(|&order| test(order))))
+        })
+    }
+
+    /// Whether `::before`/`::after` (or the marker of one) of the element can
+    /// exist. False only when no rule can match it and nothing else (a quote
+    /// element, an animation effect, a transition snapshot) supplies content.
+    fn generated_pseudo_may_exist(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
+        if !matches!(pseudo, PseudoElement::Before | PseudoElement::After | PseudoElement::BeforeMarker | PseudoElement::AfterMarker) {
+            return true;
+        }
+        if !self.snapshot_declarations.is_empty() || self.effect_declarations.iter().any(|effect| effect.pseudo == Some(pseudo)) {
+            return true;
+        }
+        if matches!(document.kind(origin), Ok(NodeKind::Element { name, namespace: Namespace::Html, .. }) if crate::svg::local_name(name) == "q") {
+            return true;
+        }
+        self.pseudo_rule_may_match(&self.generated_pseudo_rules, document, origin, pseudo)
+    }
+
+    /// Whether `::before`/`::after` of the element can carry counter state: a
+    /// rule that matches it declares counter operations, prints a counter or
+    /// makes the pseudo-element a list item.
+    #[cfg(test)]
+    pub(crate) fn pseudo_cascades(&self) -> usize {
+        self.pseudo_cascades.get()
+    }
+
+    pub(crate) fn may_have_counter_pseudo(&self, document: &Document, origin: NodeId, pseudo: PseudoElement) -> bool {
+        self.pseudo_rule_may_match(&self.counter_pseudo_rules, document, origin, pseudo)
     }
 }
 
@@ -23490,7 +23666,7 @@ const MAX_VARIABLE_BYTES: usize = 8192;
 
 fn expand_variables(
     raw: &str,
-    properties: &[(String, Option<String>)],
+    properties: &[CustomEntry],
     stack: &mut Vec<String>,
 ) -> Option<String> {
     expand_variables_mode(raw, properties, stack, false)
@@ -23499,7 +23675,7 @@ fn expand_variables(
 // CSSOM checks var() grammar before substitution; unresolved names are valid.
 fn expand_variables_mode(
     raw: &str,
-    properties: &[(String, Option<String>)],
+    properties: &[CustomEntry],
     stack: &mut Vec<String>,
     syntax_only: bool,
 ) -> Option<String> {
@@ -23508,7 +23684,7 @@ fn expand_variables_mode(
 
 fn expand_variables_bounded(
     raw: &str,
-    properties: &[(String, Option<String>)],
+    properties: &[CustomEntry],
     stack: &mut Vec<String>,
     syntax_only: bool,
     max_bytes: usize,
@@ -23518,11 +23694,59 @@ fn expand_variables_bounded(
 
 fn expand_variables_indexed(
     raw: &str,
-    properties: &[(String, Option<String>)],
+    properties: &[CustomEntry],
     stack: &mut Vec<String>,
     syntax_only: bool,
     max_bytes: usize,
     index: &NameIndex,
+) -> Option<String> {
+    expand_variables_in(raw, &IndexedCustom(properties, index), stack, syntax_only, max_bytes)
+}
+
+/// Name to value lookup shared by variable expansion and cycle detection, so an
+/// element that declares a few custom properties can resolve them against its
+/// inherited map without copying that map.
+trait CustomNames {
+    /// The value of `name`; `None` when it is absent or holds the guaranteed-invalid value.
+    fn value(&self, name: &str) -> Option<&CustomText>;
+}
+
+struct IndexedCustom<'a>(&'a [CustomEntry], &'a NameIndex);
+
+impl CustomNames for IndexedCustom<'_> {
+    fn value(&self, name: &str) -> Option<&CustomText> {
+        self.1.find(self.0, name).and_then(|position| self.0[position].1.as_ref())
+    }
+}
+
+/// Declared entries shadow the inherited map, including with the guaranteed-invalid value.
+struct LayeredCustom<'a> {
+    overlay: &'a [CustomEntry],
+    index: &'a NameIndex,
+    base: Option<&'a dyn CustomNames>,
+}
+
+impl CustomNames for LayeredCustom<'_> {
+    fn value(&self, name: &str) -> Option<&CustomText> {
+        match self.index.find(self.overlay, name) {
+            Some(position) => self.overlay[position].1.as_ref(),
+            None => self.base.and_then(|base| base.value(name)),
+        }
+    }
+}
+
+impl CustomNames for CustomProperties {
+    fn value(&self, name: &str) -> Option<&CustomText> {
+        self.get(name).and_then(Option::as_ref)
+    }
+}
+
+fn expand_variables_in(
+    raw: &str,
+    names: &dyn CustomNames,
+    stack: &mut Vec<String>,
+    syntax_only: bool,
+    max_bytes: usize,
 ) -> Option<String> {
     if stack.len() >= MAX_VARIABLE_DEPTH || raw.len() > max_bytes {
         return None;
@@ -23564,7 +23788,7 @@ fn expand_variables_indexed(
             if syntax_only {
                 if let Some(fallback) = fallback {
                     stack.push(name);
-                    let valid = expand_variables_indexed(fallback, properties, stack, true, MAX_VARIABLE_BYTES, index);
+                    let valid = expand_variables_in(fallback, names, stack, true, MAX_VARIABLE_BYTES);
                     stack.pop();
                     valid?;
                 }
@@ -23575,17 +23799,16 @@ fn expand_variables_indexed(
             let value = if stack.iter().any(|v| v == &name) {
                 None
             } else {
-                index.find(properties, &name)
-                    .and_then(|position| properties[position].1.as_ref())
+                names.value(&name)
                     .and_then(|value| {
                         stack.push(name.into());
-                        let result = expand_variables_indexed(value, properties, stack, false, MAX_VARIABLE_BYTES, index);
+                        let result = expand_variables_in(value, names, stack, false, MAX_VARIABLE_BYTES);
                         stack.pop();
                         result
                     })
             };
             let value = value.or_else(|| {
-                fallback.and_then(|fallback| expand_variables_indexed(fallback, properties, stack, false, MAX_VARIABLE_BYTES, index))
+                fallback.and_then(|fallback| expand_variables_in(fallback, names, stack, false, MAX_VARIABLE_BYTES))
             })?;
             if out.len() + value.len() > max_bytes {
                 return None;
@@ -23616,10 +23839,9 @@ fn needs_expansion(raw: &str) -> bool {
 
 fn custom_cycle(
     name: &str,
-    properties: &[(String, Option<String>)],
+    names: &dyn CustomNames,
     stack: &mut Vec<String>,
     budget: &mut usize,
-    index: &NameIndex,
 ) -> bool {
     if stack.len() >= MAX_VARIABLE_DEPTH || *budget == 0 {
         return true;
@@ -23628,9 +23850,7 @@ fn custom_cycle(
     if stack.iter().any(|v| v == name) {
         return stack.first().is_some_and(|root| root == name);
     }
-    let Some(raw) = index.find(properties, name)
-        .and_then(|position| properties[position].1.as_ref())
-    else {
+    let Some(raw) = names.value(name) else {
         return false;
     };
     stack.push(name.into());
@@ -23670,12 +23890,12 @@ fn custom_cycle(
                 stack.pop();
                 return true;
             };
-            if custom_cycle(&dependency, properties, stack, budget, index) {
+            if custom_cycle(&dependency, names, stack, budget) {
                 stack.pop();
                 return true;
             }
             if fallback
-                .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget, index))
+                .is_some_and(|fallback| custom_value_cycle(fallback, names, stack, budget))
             {
                 stack.pop();
                 return true;
@@ -23699,10 +23919,9 @@ fn custom_cycle(
 
 fn custom_value_cycle(
     raw: &str,
-    properties: &[(String, Option<String>)],
+    names: &dyn CustomNames,
     stack: &mut Vec<String>,
     budget: &mut usize,
-    index: &NameIndex,
 ) -> bool {
     if *budget == 0 {
         return true;
@@ -23741,9 +23960,9 @@ fn custom_value_cycle(
             let Some((end, dependency, fallback)) = variable_reference(raw, position + 3) else {
                 return true;
             };
-            if custom_cycle(&dependency, properties, stack, budget, index)
+            if custom_cycle(&dependency, names, stack, budget)
                 || fallback
-                    .is_some_and(|fallback| custom_value_cycle(fallback, properties, stack, budget, index))
+                    .is_some_and(|fallback| custom_value_cycle(fallback, names, stack, budget))
             {
                 return true;
             }
@@ -23787,7 +24006,7 @@ impl CascadeOrigin {
 struct RegisteredQuerySources {
     provenance: EffectEligibility,
     registrations: Arc<[registered_properties::RegisteredCustomProperty]>,
-    inherited_custom: Option<Arc<[(String, Option<String>)]>>,
+    inherited_custom: Option<Arc<CustomProperties>>,
     owner: Option<(Arc<str>, Arc<str>)>,
     sibling: (usize,usize),
     svg_instance_root: bool,
@@ -23828,8 +24047,9 @@ impl RegisteredQuerySources {
         let mut bytes = core::mem::size_of::<Self>().checked_add(self.provenance.checked_retained_bytes()?)?
             .checked_add(checked_registration_snapshot_bytes(&self.registrations)?)?;
         if let Some(custom) = &self.inherited_custom {
-            bytes = bytes.checked_add(core::mem::size_of_val(custom.as_ref()))?;
-            for (name, value) in custom.iter() { bytes = bytes.checked_add(name.capacity())?.checked_add(value.as_ref().map_or(0, String::capacity))?; }
+            bytes = bytes.checked_add(core::mem::size_of_val(custom.as_ref()))?
+                .checked_add(custom.len().checked_mul(core::mem::size_of::<CustomEntry>())?)?;
+            for (name, value) in custom.iter() { bytes = bytes.checked_add(name.len())?.checked_add(value.as_ref().map_or(0, |value| value.len()))?; }
         }
         bytes = bytes.checked_add(core::mem::size_of_val(self.query_custom.as_ref()))?;
         for name in self.query_custom.iter() { bytes = bytes.checked_add(name.capacity())?; }
@@ -23845,7 +24065,6 @@ pub struct EffectEligibility {
     slots: [u64; (PROPERTY_COUNT + 63) / 64],
     inherited: [u64; (PROPERTY_COUNT + 63) / 64],
     protected_custom: Vec<Arc<str>>,
-    inherited_custom: Vec<Arc<str>>,
     dependent: Vec<SnapshotDeclaration>,
     sources: Option<Arc<[SnapshotDeclaration]>>,
     registrations: Option<Arc<[registered_properties::RegisteredCustomProperty]>>,
@@ -23862,7 +24081,7 @@ pub struct EffectEligibility {
     query_context: Option<ContainerUnitContext>,
 }
 impl Default for EffectEligibility {
-    fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), inherited_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
+    fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
         baseline_inherited: core::array::from_fn(|word| {
             let mut flags = 0; for bit in 0..64 { let slot = word * 64 + bit; if slot < PROPERTY_COUNT && inherited_property(slot) { flags |= 1 << bit; } } flags
         }), baseline_font_scale: None, baseline_font_smaller: false, baseline_bolder: false, root: false,
@@ -23895,10 +24114,8 @@ impl EffectEligibility {
         let mut bytes=core::mem::size_of::<Self>();
         if let Some(registrations)=&self.registrations {bytes=bytes.checked_add(checked_registration_snapshot_bytes(registrations)?)?;}
         if let Some(baseline)=&self.baseline {bytes=bytes.checked_add(crate::layout::checked_style_retained_bytes(baseline)?)?;}
-        for names in [&self.protected_custom,&self.inherited_custom] {
-            bytes=bytes.checked_add(names.capacity().checked_mul(core::mem::size_of::<Arc<str>>())?)?;
-            for name in names {bytes=bytes.checked_add(header.checked_add(name.len())?)?;}
-        }
+        bytes=bytes.checked_add(self.protected_custom.capacity().checked_mul(core::mem::size_of::<Arc<str>>())?)?;
+        for name in &self.protected_custom {bytes=bytes.checked_add(header.checked_add(name.len())?)?;}
         bytes=bytes.checked_add(self.dependent.capacity().checked_mul(core::mem::size_of::<SnapshotDeclaration>())?)?;
         let sources=self.sources.as_deref().unwrap_or(&self.dependent);
         if let Some(sources)=&self.sources {bytes=bytes.checked_add(header.checked_add(core::mem::size_of_val(sources.as_ref()))?)?;}
@@ -23925,6 +24142,20 @@ impl EffectEligibility {
         }
         Some(bytes)
     }
+    /// Unregistered custom properties never interpolate, so an element that
+    /// declares thousands of them keeps provenance only for the registered
+    /// ones and the ordinary properties. Replay then resolves `var()` chains
+    /// through unregistered names from the old computed values.
+    fn drop_unregistered_custom_sources(&mut self) {
+        let Some(sources)=self.sources.take() else {return;};
+        let registrations=self.registrations.clone();
+        let kept:Vec<SnapshotDeclaration>=sources.iter().filter(|source|match &source.declaration.value {
+            Value::Custom(name,_) if source.target.is_none() =>
+                registrations.as_deref().is_some_and(|registrations|registrations.iter().any(|registration|registration.name.as_str()==&**name)),
+            _=>true,
+        }).cloned().collect();
+        self.sources=Some(kept.into());
+    }
     pub fn all() -> Self { Self { slots: [u64::MAX; (PROPERTY_COUNT + 63) / 64], ..Self::default() } }
     pub fn allows(&self, property: &str) -> bool {
         if property.starts_with("--") {
@@ -23935,6 +24166,9 @@ impl EffectEligibility {
         !ids.is_empty() && ids.iter().all(|id| self.slots[*id / 64] & (1 << (*id % 64)) != 0)
     }
 }
+
+const TRANSITION_PROVENANCE_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) const TRANSITION_PROVENANCE_LIMIT_MESSAGE: &str = "CSS transition snapshot provenance exceeds limit";
 
 type Priority = (CascadeOrigin, [usize; 8], (u16, u16, u16, u16), (usize, usize));
 
@@ -24178,6 +24412,10 @@ impl NameIndex {
 
     fn new<K: AsRef<str>, V>(list: &[(K, V)], lookups: usize) -> Self {
         if lookups < Self::INDEX_THRESHOLD { return Self(None); }
+        Self::indexed(list)
+    }
+
+    fn indexed<K: AsRef<str>, V>(list: &[(K, V)]) -> Self {
         let mut map = alloc::collections::BTreeMap::new();
         for (index, (name, _)) in list.iter().enumerate() { map.entry(name.as_ref().to_string()).or_insert(index); }
         Self(Some(map))
@@ -24195,7 +24433,503 @@ impl NameIndex {
     }
 }
 
+/// A custom property name or value, shared by reference count so the many
+/// elements that inherit a large custom property list do not copy its text.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct CustomText(Arc<str>);
+
+pub type CustomEntry = (CustomText, Option<CustomText>);
+
+impl CustomText {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+impl core::ops::Deref for CustomText {
+    type Target = str;
+    fn deref(&self) -> &str { &self.0 }
+}
+impl AsRef<str> for CustomText {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+impl core::borrow::Borrow<str> for CustomText {
+    fn borrow(&self) -> &str { &self.0 }
+}
+impl core::fmt::Debug for CustomText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Debug::fmt(&*self.0, f) }
+}
+impl core::fmt::Display for CustomText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::Display::fmt(&*self.0, f) }
+}
+impl From<String> for CustomText {
+    fn from(value: String) -> Self { Self(Arc::from(value)) }
+}
+impl From<&str> for CustomText {
+    fn from(value: &str) -> Self { Self(Arc::from(value)) }
+}
+impl From<&String> for CustomText {
+    fn from(value: &String) -> Self { Self(Arc::from(value.as_str())) }
+}
+impl From<Arc<str>> for CustomText {
+    fn from(value: Arc<str>) -> Self { Self(value) }
+}
+impl From<&CustomText> for String {
+    fn from(value: &CustomText) -> Self { value.0.to_string() }
+}
+impl PartialEq<str> for CustomText {
+    fn eq(&self, other: &str) -> bool { &*self.0 == other }
+}
+impl PartialEq<&str> for CustomText {
+    fn eq(&self, other: &&str) -> bool { &*self.0 == *other }
+}
+impl PartialEq<String> for CustomText {
+    fn eq(&self, other: &String) -> bool { &*self.0 == other.as_str() }
+}
+impl PartialEq<CustomText> for str {
+    fn eq(&self, other: &CustomText) -> bool { self == &*other.0 }
+}
+impl PartialEq<CustomText> for String {
+    fn eq(&self, other: &CustomText) -> bool { self.as_str() == &*other.0 }
+}
+
+/// The resolved custom properties of an element, shared by every element that inherits them.
+///
+/// A flat map holds every entry in order and indexes its names once. An element that redefines or
+/// adds a few names refines the flat map of its ancestors instead of copying it: the refinement
+/// keeps the redefined entries, sorted by name, and the added entries, in insertion order, and
+/// refers to the flat map as its root. Refinements are cumulative, so a lookup visits the
+/// refinement and the root at most, and a refinement that outgrows its root's share becomes a flat
+/// map itself. Iteration order is the root's order with redefined values in place, then the added
+/// names, exactly the order of the equivalent flat list.
+///
+/// A refinement is canonical: a redefinition equal to the root's entry is dropped, and a name is
+/// either redefined or added, so two refinements of one root are equal exactly when their local
+/// entries are.
+pub struct CustomProperties {
+    root: Option<Arc<CustomProperties>>,
+    overrides: Vec<CustomEntry>,
+    added: Vec<CustomEntry>,
+    names: NameIndex,
+    len: usize,
+    substitution: bool,
+    settled: core::sync::atomic::AtomicU64,
+}
+
+static NO_CUSTOM: CustomProperties = CustomProperties::empty();
+
+impl CustomProperties {
+    const LAYER_MAX_ENTRIES: usize = 64;
+    const LAYER_ROOT_SHARE: usize = 8;
+
+    const fn empty() -> Self {
+        Self { root: None, overrides: Vec::new(), added: Vec::new(), names: NameIndex(None), len: 0,
+            substitution: false, settled: core::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn flat(entries: Vec<CustomEntry>) -> Self {
+        let names = NameIndex::new(&entries, entries.len());
+        let substitution = entries.iter().any(|(_, value)| value.as_deref().is_some_and(needs_expansion));
+        let len = entries.len();
+        Self { names, len, substitution, added: entries, ..Self::empty() }
+    }
+
+    /// `base` with `changes` applied: a changed name keeps its position, a new one is appended.
+    fn derive(base: &Arc<Self>, changes: Vec<CustomEntry>) -> Result<Arc<Self>, CssError> {
+        let root = base.root.as_ref().unwrap_or(base);
+        let (mut overrides, mut added) = if base.root.is_some() {
+            (base.overrides.clone(), base.added.clone())
+        } else { (Vec::new(), Vec::new()) };
+        let mut substitution = base.substitution;
+        for (name, value) in changes {
+            substitution |= value.as_deref().is_some_and(needs_expansion);
+            if let Some(entry) = added.iter_mut().find(|(key, _)| *key == name) {
+                entry.1 = value;
+                continue;
+            }
+            let redefined = overrides.binary_search_by(|(key, _)| key.as_str().cmp(name.as_str()));
+            match (root.find_added(&name), redefined) {
+                (Some(inherited), Ok(at)) => {
+                    if *inherited == value { overrides.remove(at); } else { overrides[at].1 = value; }
+                }
+                (Some(inherited), Err(at)) => {
+                    if *inherited != value { overrides.insert(at, (name, value)); }
+                }
+                (None, _) => added.push((name, value)),
+            }
+        }
+        let local = overrides.len() + added.len();
+        if local == 0 { return Ok(root.clone()); }
+        if local > Self::LAYER_MAX_ENTRIES && local * Self::LAYER_ROOT_SHARE > root.len {
+            let mut entries = Vec::new();
+            entries.try_reserve_exact(root.len + added.len())
+                .map_err(|_| CssError { offset: 0, message: "CSS custom properties exceed limit" })?;
+            entries.extend(root.added.iter().map(|entry| {
+                overrides.binary_search_by(|(key, _)| key.as_str().cmp(entry.0.as_str()))
+                    .map_or(entry, |at| &overrides[at])
+            }).cloned());
+            entries.extend(added);
+            return Ok(Arc::new(Self::flat(entries)));
+        }
+        let names = NameIndex::new(&added, added.len());
+        let len = root.len + added.len();
+        Ok(Arc::new(Self { root: Some(root.clone()), overrides, added, names, len, substitution,
+            settled: core::sync::atomic::AtomicU64::new(0) }))
+    }
+
+    pub fn len(&self) -> usize { self.len }
+
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    /// The value of `name`; the outer `None` means the map has no such entry.
+    pub fn get(&self, name: &str) -> Option<&Option<CustomText>> {
+        let Some(root) = &self.root else { return self.find_added(name); };
+        if let Ok(at) = self.overrides.binary_search_by(|(key, _)| key.as_str().cmp(name)) {
+            return Some(&self.overrides[at].1);
+        }
+        self.find_added(name).or_else(|| root.find_added(name))
+    }
+
+    fn find_added(&self, name: &str) -> Option<&Option<CustomText>> {
+        self.names.find(&self.added, name).map(|position| &self.added[position].1)
+    }
+
+    /// The entries in order.
+    pub fn iter(&self) -> alloc::vec::IntoIter<&CustomEntry> {
+        let mut entries: Vec<&CustomEntry> = Vec::with_capacity(self.len);
+        match &self.root {
+            None => entries.extend(self.added.iter()),
+            Some(root) if self.overrides.is_empty() => {
+                entries.extend(root.added.iter());
+                entries.extend(self.added.iter());
+            }
+            Some(root) => {
+                entries.extend(root.added.iter().map(|entry| {
+                    self.overrides.binary_search_by(|(key, _)| key.as_str().cmp(entry.0.as_str()))
+                        .map_or(entry, |at| &self.overrides[at])
+                }));
+                entries.extend(self.added.iter());
+            }
+        }
+        entries.into_iter()
+    }
+
+    fn to_vec(&self) -> Vec<CustomEntry> { self.iter().cloned().collect() }
+
+    fn matches(&self, entries: &[CustomEntry]) -> bool {
+        self.len == entries.len() && self.iter().zip(entries).all(|(a, b)| a == b)
+    }
+
+    /// Whether any value may still hold a `var()` reference or comment, so the cascade has to scan
+    /// for substitution at all.
+    fn needs_substitution(&self) -> bool { self.substitution }
+
+    /// Whether the registration set named by `epoch` leaves every registered property in this map settled.
+    fn settled(&self, epoch: u64) -> Option<bool> {
+        let recorded = self.settled.load(core::sync::atomic::Ordering::Relaxed);
+        (epoch != 0 && recorded >> 1 == epoch).then_some(recorded & 1 == 1)
+    }
+
+    fn record_settled(&self, epoch: u64, settled: bool) {
+        self.settled.store(epoch << 1 | u64::from(settled), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for CustomProperties {
+    fn eq(&self, other: &Self) -> bool {
+        if core::ptr::eq(self, other) { return true; }
+        if self.len != other.len { return false; }
+        match (&self.root, &other.root) {
+            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => self.overrides == other.overrides && self.added == other.added,
+            (Some(root), None) if core::ptr::eq(&**root, other) => false,
+            (None, Some(root)) if core::ptr::eq(&**root, self) => false,
+            _ => self.iter().zip(other.iter()).all(|(a, b)| a == b),
+        }
+    }
+}
+
+impl core::fmt::Debug for CustomProperties {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 static LINEAR_NAMES: NameIndex = NameIndex(None);
+
+type CustomContext = (LengthContext, ContainerUnitContext, SourceColor);
+
+fn registered_initial(registrations: &[registered_properties::RegisteredCustomProperty],
+    context: &CustomContext, name: &str) -> Option<CustomText> {
+    registrations.iter().find(|property| property.name == name)
+        .and_then(|property| property.initial_value.as_deref().and_then(|value|
+            registered_properties::compute_value_with_source(&property.syntax, value,
+                context.0, context.1, &context.2, property.source_url.as_deref())
+            .map(CustomText::from)))
+}
+
+/// The parent's value of an inherited name; the outer `None` means the parent has no such entry.
+fn inherited_custom(parent: Option<&Style>, name: &str) -> Option<Option<CustomText>> {
+    parent.and_then(|style| style.custom_properties().get(name)).cloned()
+}
+
+fn registered_default(registrations: &[registered_properties::RegisteredCustomProperty],
+    parent: Option<&Style>, context: &CustomContext, name: &str) -> Option<CustomText> {
+    match registrations.iter().find(|property| property.name == name) {
+        Some(property) if !property.inherits => registered_initial(registrations, context, name),
+        _ => inherited_custom(parent, name).unwrap_or_else(|| registered_initial(registrations, context, name)),
+    }
+}
+
+/// Whether one registered property already holds the value its element would recompute: an
+/// inheriting one is present, and a non-inheriting one is at its initial value.
+fn registration_settled(registration: &registered_properties::RegisteredCustomProperty,
+    value: &Option<CustomText>, context: &CustomContext) -> bool {
+    let initial = || registration.initial_value.as_deref().and_then(|value|
+        registered_properties::compute_value_with_source(&registration.syntax, value,
+            context.0, context.1, &context.2, registration.source_url.as_deref()));
+    if registration.inherits { value.is_some() || initial().is_none() } else { value.as_deref() == initial().as_deref() }
+}
+
+/// Whether an element that declares no custom property of its own computes exactly this map:
+/// every registered property is already present and settled, so the per-element
+/// registered-property pass would be a no-op.
+fn registrations_settled(map: &CustomProperties, registrations: &[registered_properties::RegisteredCustomProperty],
+    context: &CustomContext) -> bool {
+    registrations.iter().all(|registration| map.get(&registration.name)
+        .is_some_and(|value| registration_settled(registration, value, context)))
+}
+
+static NEXT_REGISTRATION_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Names the registration set that the settledness recorded in custom property maps refers to.
+/// Every new set gets a process-unique epoch, so a map computed under an earlier set never
+/// reports stale facts.
+#[derive(Default)]
+struct RegistrationEpoch {
+    registrations: Option<Arc<[registered_properties::RegisteredCustomProperty]>>,
+    epoch: u64,
+}
+
+impl RegistrationEpoch {
+    fn bind(&mut self, registrations: &Arc<[registered_properties::RegisteredCustomProperty]>) -> u64 {
+        if !self.registrations.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, registrations)) {
+            self.epoch = NEXT_REGISTRATION_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            self.registrations = Some(registrations.clone());
+        }
+        self.epoch
+    }
+}
+
+/// The names an element changes over its inherited custom property map, in the order it first
+/// touches them.
+struct CustomDraft<'a> {
+    base: &'a CustomProperties,
+    entries: Vec<CustomEntry>,
+    index: NameIndex,
+    appended: usize,
+}
+
+impl<'a> CustomDraft<'a> {
+    fn new(base: &'a CustomProperties, lookups: usize) -> Self {
+        Self { base, entries: Vec::new(), index: NameIndex::new::<CustomText, Option<CustomText>>(&[], lookups), appended: 0 }
+    }
+
+    fn current(&self, name: &str) -> Option<&Option<CustomText>> {
+        match self.index.find(&self.entries, name) {
+            Some(position) => Some(&self.entries[position].1),
+            None => self.base.get(name),
+        }
+    }
+
+    /// A name the inherited map lacks is dropped once the map is full.
+    fn set(&mut self, name: &str, value: Option<CustomText>) {
+        if let Some(position) = self.index.find(&self.entries, name) {
+            self.entries[position].1 = value;
+            return;
+        }
+        if self.base.get(name).is_none() {
+            if self.base.len() + self.appended >= MAX_CUSTOM_PROPERTIES { return; }
+            self.appended += 1;
+        }
+        self.index.appended(name, self.entries.len());
+        self.entries.push((CustomText::from(name), value));
+    }
+}
+
+/// An element computes its custom properties as its inherited map with only the names it changes
+/// replaced, and shares the inherited map when no value changes. Entries it does not declare are
+/// already resolved and, for registered properties, already computed, so neither expansion nor
+/// registered computation revisits them. Returns `None` when the flat cascade is needed:
+/// registered properties combined with provenance, a baseline, blocked names, `revert-layer`,
+/// many declarations, or a map the registration set has not settled.
+fn cascade_custom_layer(
+    parent: Option<&Style>,
+    baseline: Option<&Style>,
+    candidates: &[Candidate<'_>],
+    registrations: &[registered_properties::RegisteredCustomProperty],
+    mut provenance: Option<&mut EffectEligibility>,
+    compute_context: &CustomContext,
+    sibling: (usize, usize),
+    blocked: &[String],
+    settled_epoch: Option<u64>,
+) -> Result<Option<Option<Arc<CustomProperties>>>, CssError> {
+    const MAX_REGISTERED_DECLARATIONS: usize = 64;
+    let declared = || candidates.iter().filter_map(|(_, declaration, _)| match &declaration.value {
+        Value::Custom(name, raw) => Some((name, raw)),
+        _ => None,
+    });
+    let count = declared().count();
+    let has_revert_layer = declared().any(|(_, raw)| &**raw == "revert-layer");
+    let shared = baseline.or(parent).and_then(|style| style.custom.as_ref());
+    let base: &CustomProperties = shared.map_or(&NO_CUSTOM, |map| &**map);
+    if !registrations.is_empty() {
+        if provenance.is_some() || baseline.is_some() || !blocked.is_empty() || has_revert_layer
+            || count > MAX_REGISTERED_DECLARATIONS { return Ok(None); }
+        let Some(map) = shared else { return Ok(None); };
+        let known = settled_epoch.and_then(|epoch| map.settled(epoch));
+        let settled = match known {
+            Some(settled) => settled,
+            None => {
+                let settled = registrations_settled(base, registrations, compute_context);
+                if let Some(epoch) = settled_epoch { map.record_settled(epoch, settled); }
+                settled
+            }
+        };
+        if !settled { return Ok(None); }
+    }
+    if count == 0 && blocked.is_empty() { return Ok(Some(shared.cloned())); }
+
+    let lookups = count + blocked.len();
+    let mut draft = CustomDraft::new(base, lookups);
+    let mut computed_index = NameIndex::new::<String, Option<Arc<str>>>(&[], lookups);
+    let mut sources_index = NameIndex::new::<Arc<str>, usize>(&[], lookups);
+    let mut computed_sources: Vec<(String, Option<Arc<str>>)> = Vec::new();
+    let mut baseline_urls: Vec<(String, Option<Arc<str>>)> = Vec::new();
+    let mut custom_sources: Vec<(Arc<str>, usize)> = Vec::new();
+    let mut baseline_sources: Vec<(Arc<str>, usize)> = Vec::new();
+    let mut snapshot: Vec<CustomEntry> = Vec::new();
+    let mut custom_layer = None;
+    let inherited = |name: &str| inherited_custom(parent, name);
+    let initial = |name: &str| registered_initial(registrations, compute_context, name);
+    let default_value = |name: &str| registered_default(registrations, parent, compute_context, name);
+    for (order, (priority, declaration, source_url)) in candidates.iter().enumerate() {
+        if has_revert_layer && custom_layer != Some((priority.0, priority.1)) {
+            custom_layer = Some((priority.0, priority.1));
+            snapshot.clone_from(&draft.entries);
+            baseline_urls.clone_from(&computed_sources);
+            if provenance.is_some() { baseline_sources.clone_from(&custom_sources); }
+        }
+        let Value::Custom(name, raw) = &declaration.value else { continue; };
+        if !registrations.is_empty() {
+            let url = if raw.as_ref() == "revert-layer" {
+                baseline_urls.iter().find(|(key, _)| key.as_str() == &**name).and_then(|(_, url)| url.clone())
+            } else { source_url.clone() };
+            if let Some(position) = computed_index.find(&computed_sources, name) { computed_sources[position].1 = url; }
+            else {
+                computed_index.appended(name, computed_sources.len());
+                computed_sources.push((name.to_string(), url));
+            }
+        }
+        if provenance.is_some() && !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
+            let source = if raw.as_ref() == "revert-layer" {
+                baseline_sources.iter().find(|(key, _)| key == name).map_or(0, |(_, source)| *source)
+            } else { order + 1 };
+            if let Some(position) = sources_index.find(&custom_sources, name) { custom_sources[position].1 = source; }
+            else if custom_sources.len() < MAX_CUSTOM_PROPERTIES {
+                custom_sources.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                sources_index.appended(name, custom_sources.len());
+                custom_sources.push((name.clone(), source));
+            }
+        }
+        let value = match &**raw {
+            "initial" => initial(name),
+            "inherit" => inherited(name).unwrap_or_else(|| initial(name)),
+            "unset" | "revert" => default_value(name),
+            "revert-layer" => snapshot.iter().find(|(key, _)| key.as_str() == &**name).map(|(_, value)| value.clone())
+                .or_else(|| base.get(name).cloned())
+                .unwrap_or_else(|| default_value(name)),
+            _ => Some(CustomText::from(&**raw)),
+        };
+        draft.set(name, value);
+    }
+    if let Some(provenance) = provenance.as_deref_mut() {
+        // Only names this element's own cascade declared carry provenance; the
+        // inherited remainder (thousands on large sites) is never enumerated.
+        for (name, source) in &custom_sources {
+            if *source == 0 { continue; }
+            let (priority, declaration, source_url) = &candidates[*source - 1];
+            if priority.0.important() {
+                provenance.protected_custom.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                provenance.protected_custom.push(name.clone());
+            }
+            if !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
+                provenance.dependent.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                provenance.dependent.push(SnapshotDeclaration { priority: *priority, reference_scope:None, declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
+            }
+        }
+    }
+    for name in blocked {
+        if draft.current(name).is_some() { draft.set(name, None); }
+    }
+    let CustomDraft { entries: mut overlay, index, .. } = draft;
+
+    let needs_work = |value: &Option<CustomText>| value.as_deref().is_some_and(needs_expansion);
+    if overlay.iter().any(|(_, value)| needs_work(value)) {
+        let cyclic: Vec<bool> = {
+            let names = LayeredCustom { overlay: &overlay, index: &index, base: Some(base) };
+            overlay.iter().map(|(name, value)| needs_work(value)
+                && custom_cycle(name, &names, &mut Vec::new(), &mut 4096)).collect()
+        };
+        for ((_, value), cyclic) in overlay.iter_mut().zip(cyclic) {
+            if cyclic { *value = None; }
+        }
+        if registrations.is_empty() {
+            let expanded: Vec<Option<Option<CustomText>>> = {
+                let names = LayeredCustom { overlay: &overlay, index: &index, base: Some(base) };
+                overlay.iter().map(|(_, value)| match value.as_deref() {
+                    Some(value) if needs_expansion(value) => Some(expand_variables_in(value, &names,
+                        &mut Vec::new(), false, MAX_VARIABLE_BYTES).map(CustomText::from)),
+                    _ => None,
+                }).collect()
+            };
+            for ((_, value), expanded) in overlay.iter_mut().zip(expanded) {
+                if let Some(expanded) = expanded { *value = expanded; }
+            }
+        }
+    }
+    if !registrations.is_empty() {
+        let registered = |name: &CustomText| registrations.iter().any(|registration| registration.name == *name);
+        let defaults: Vec<CustomEntry> = overlay.iter().filter(|(name, _)| registered(name))
+            .map(|(name, _)| (name.clone(), default_value(name))).collect();
+        for (name, value) in &mut overlay {
+            if value.is_none() && registered(name) { *value = default_value(name); }
+        }
+        registered_properties::resolve_computed(&mut overlay, Some(base), registrations, &defaults, &computed_sources,
+            compute_context.0, compute_context.1, &compute_context.2, sibling)
+            .ok_or(CssError { offset: 0, message: "registered custom property dependency exceeds limit" })?;
+        for registration in registrations {
+            if registration.syntax.trim() == "*" { continue; }
+            if let Some((_, value)) = overlay.iter_mut().find(|(name, _)| *name == registration.name) {
+                if value.as_ref().is_none_or(|value| !registered_properties::accepts_value(&registration.syntax, value)) {
+                    *value = default_value(&registration.name);
+                }
+            }
+        }
+    }
+
+    let unchanged = overlay.iter().all(|(name, value)| base.get(name).is_some_and(|inherited| inherited == value));
+    if unchanged { return Ok(Some(shared.cloned())); }
+    let settled = overlay.iter().all(|(name, value)| registrations.iter().find(|registration| registration.name == *name)
+        .is_none_or(|registration| registration_settled(registration, value, compute_context)));
+    let map = match shared {
+        Some(shared) => CustomProperties::derive(shared, overlay)?,
+        None => Arc::new(CustomProperties::flat(overlay)),
+    };
+    if let Some(epoch) = settled_epoch.filter(|_| !registrations.is_empty()) { map.record_settled(epoch, settled); }
+    if baseline.is_some() {
+        if let Some(inherited) = parent.and_then(|parent| parent.custom.as_ref()).filter(|inherited| **inherited == map) {
+            return Ok(Some(Some(inherited.clone())));
+        }
+    }
+    Ok(Some(Some(map)))
+}
 
 fn cascade_custom_properties(
     parent: Option<&Style>,
@@ -24206,8 +24940,9 @@ fn cascade_custom_properties(
     compute_context: (LengthContext, ContainerUnitContext, SourceColor),
     sibling:(usize,usize),
     blocked: &[String],
-    raw_sources: Option<&mut Option<Arc<[(String, Option<String>)]>>>,
-) -> Result<Option<Arc<[(String, Option<String>)]>>, CssError> {
+    raw_sources: Option<&mut Option<Arc<[CustomEntry]>>>,
+    settled_epoch: Option<u64>,
+) -> Result<Option<Arc<CustomProperties>>, CssError> {
     if provenance.is_none() && registrations.is_empty() && !candidates
         .iter().any(|(_, declaration, _)| matches!(declaration.value, Value::Custom(..))) {
         return Ok(baseline.or(parent).and_then(|v| v.custom.clone()));
@@ -24215,47 +24950,40 @@ fn cascade_custom_properties(
     let custom_declarations = candidates.iter().filter(|(_, declaration, _)| matches!(declaration.value, Value::Custom(..))).count();
     if registrations.is_empty() && custom_declarations == 0 && blocked.is_empty() && raw_sources.is_none() {
         // Nothing declares or rewrites a custom property: the inherited list is
-        // already resolved, so share it and only record its provenance.
-        let shared = baseline.or(parent).and_then(|v| v.custom.clone());
-        if let (Some(provenance), Some(list)) = (provenance.as_deref_mut(), shared.as_ref()) {
-            provenance.inherited_custom.try_reserve(list.len()).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-            for (name, _) in list.iter() { provenance.inherited_custom.push(Arc::from(name.as_str())); }
-        }
-        return Ok(shared);
+        // already resolved, so share it. Inherited names carry no provenance.
+        return Ok(baseline.or(parent).and_then(|v| v.custom.clone()));
     }
     if provenance.is_none() && registrations.is_empty() && blocked.is_empty() && raw_sources.is_none() {
-        let base = baseline.or(parent).map_or(&[][..], |v| v.custom_properties());
+        let base = baseline.or(parent).map_or(&NO_CUSTOM, |v| v.custom_properties());
         let redeclares_inherited = candidates.iter().all(|(_, declaration, _)| match &declaration.value {
             Value::Custom(name, raw) => !needs_expansion(raw)
                 && !matches!(&**raw, "initial" | "inherit" | "unset" | "revert" | "revert-layer")
-                && base.iter().any(|(key, value)| key.as_str() == &**name && value.as_deref() == Some(&**raw)),
+                && base.get(name).is_some_and(|value| value.as_deref() == Some(&**raw)),
             _ => true,
         });
         if redeclares_inherited {
             return Ok(baseline.or(parent).and_then(|v| v.custom.clone()));
         }
     }
-    let mut custom_properties = baseline.or(parent)
-        .map(|v| v.custom_properties().to_vec())
-        .unwrap_or_default();
+    if raw_sources.is_none() {
+        if let Some(shared) = cascade_custom_layer(parent, baseline, candidates, registrations, provenance.as_deref_mut(),
+            &compute_context, sibling, blocked, settled_epoch)? {
+            return Ok(shared);
+        }
+    }
+    let base = baseline.or(parent).map_or(&NO_CUSTOM, |v| v.custom_properties());
+    let mut custom_properties = base.to_vec();
     let lookups = custom_declarations + registrations.len() + blocked.len();
     let mut custom_index = NameIndex::new(&custom_properties, lookups);
     let mut computed_index = NameIndex::new::<String, Option<Arc<str>>>(&[], lookups);
     let mut sources_index = NameIndex::new::<Arc<str>, usize>(&[], lookups);
-    let inherited = |name: &str| parent.and_then(|style| style.custom_properties().iter()
-        .find(|(key, _)| key == name)).map(|(_, value)| value.clone());
-    let initial = |name: &str| registrations.iter().find(|property| property.name == name)
-        .and_then(|property| property.initial_value.as_deref().and_then(|value|
-            registered_properties::compute_value_with_source(&property.syntax, value,
-                compute_context.0, compute_context.1, &compute_context.2,property.source_url.as_deref())));
-    let default_value = |name: &str| match registrations.iter().find(|property| property.name == name) {
-        Some(property) if !property.inherits => initial(name),
-        _ => inherited(name).unwrap_or_else(|| initial(name)),
-    };
+    let inherited = |name: &str| inherited_custom(parent, name);
+    let initial = |name: &str| registered_initial(registrations, &compute_context, name);
+    let default_value = |name: &str| registered_default(registrations, parent, &compute_context, name);
     for registration in registrations {
         let value = default_value(&registration.name);
         if let Some(position) = custom_index.find(&custom_properties, &registration.name) { if baseline.is_none(){custom_properties[position].1 = value;} }
-        else if custom_properties.len() < MAX_CUSTOM_PROPERTIES { custom_index.appended(&registration.name, custom_properties.len()); custom_properties.push((registration.name.clone(), value)); }
+        else if custom_properties.len() < MAX_CUSTOM_PROPERTIES { custom_index.appended(&registration.name, custom_properties.len()); custom_properties.push((registration.name.as_str().into(), value)); }
     }
     let mut custom_layer = None;
     let has_custom_revert_layer = candidates.iter().any(
@@ -24300,40 +25028,29 @@ fn cascade_custom_properties(
                 "unset" | "revert" => default_value(name),
                 "revert-layer" => custom_baseline.iter().find(|(key, _)| key.as_str() == &**name)
                     .map(|(_, value)| value.clone()).unwrap_or_else(|| default_value(name)),
-                _ => Some(raw.to_string()),
+                _ => Some(CustomText::from(&**raw)),
             };
             if let Some(position) = custom_index.find(&custom_properties, name) {
                 custom_properties[position].1 = value;
             } else if custom_properties.len() < MAX_CUSTOM_PROPERTIES {
                 custom_index.appended(name, custom_properties.len());
-                custom_properties.push((name.to_string(), value));
+                custom_properties.push((CustomText::from(&**name), value));
             }
         }
     }
     if let Some(provenance) = provenance.as_deref_mut() {
-        for (name, _) in &custom_properties {
-            let source = sources_index.find(&custom_sources, name).map_or(0, |position| custom_sources[position].1);
-            let registration = registrations.iter().find(|registration| registration.name == *name);
-            let inherited = if source == 0 { registration.is_none_or(|registration| registration.inherits) }
-                else { match &candidates[source - 1].1.value {
-                    Value::Custom(_, raw) if raw.as_ref() == "inherit" => true,
-                    Value::Custom(_, raw) if matches!(raw.as_ref(), "unset" | "revert") => registration.is_none_or(|registration| registration.inherits),
-                    _ => false,
-                }};
-            if inherited {
-                provenance.inherited_custom.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-                provenance.inherited_custom.push(Arc::from(name.as_str()));
+        // Only names this element's own cascade declared carry provenance; the
+        // inherited remainder (thousands on large sites) is never enumerated.
+        for (name, source) in &custom_sources {
+            if *source == 0 { continue; }
+            let (priority, declaration, source_url) = &candidates[*source - 1];
+            if priority.0.important() {
+                provenance.protected_custom.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                provenance.protected_custom.push(name.clone());
             }
-            if source != 0 {
-                let (priority, declaration, source_url) = &candidates[source - 1];
-                if priority.0.important() {
-                    provenance.protected_custom.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-                    provenance.protected_custom.push(Arc::from(name.as_str()));
-                }
-                if !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
-                    provenance.dependent.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
-                    provenance.dependent.push(SnapshotDeclaration { priority: *priority, reference_scope:None, declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
-                }
+            if !matches!(priority.0, CascadeOrigin::Animation | CascadeOrigin::Transition) {
+                provenance.dependent.try_reserve(1).map_err(|_| CssError { offset: 0, message: "CSS custom snapshot sources exceed limit" })?;
+                provenance.dependent.push(SnapshotDeclaration { priority: *priority, reference_scope:None, declaration: declaration.as_ref().clone(), source_url: source_url.clone(), target: None });
             }
         }
     }
@@ -24343,14 +25060,18 @@ fn cascade_custom_properties(
             custom_properties[position].1 = if registrations.iter().any(|registration|registration.name==*name){initial(name)}else{None};
         }
     }
-    let needs_work = |value: &Option<String>| value.as_deref().is_some_and(needs_expansion);
-    if custom_properties.iter().any(|(_, value)| needs_work(value)) {
+    let needs_work = |value: &Option<CustomText>| value.as_deref().is_some_and(needs_expansion);
+    // Inherited values are already resolved: only the inherited maps' own flags or a declared value can need work.
+    let may_need_work = base.needs_substitution()
+        || parent.is_some_and(|parent| parent.custom_properties().needs_substitution())
+        || candidates.iter().any(|(_, declaration, _)| matches!(&declaration.value, Value::Custom(_, raw) if needs_expansion(raw)));
+    if may_need_work && custom_properties.iter().any(|(_, value)| needs_work(value)) {
         let lookup_index = NameIndex::new(&custom_properties, custom_properties.len());
         let cyclic: Vec<bool> = custom_properties
             .iter()
             .map(|(name, value)| {
                 needs_work(value)
-                    && custom_cycle(name, &custom_properties, &mut Vec::new(), &mut 4096, &lookup_index)
+                    && custom_cycle(name, &IndexedCustom(&custom_properties, &lookup_index), &mut Vec::new(), &mut 4096)
             })
             .collect();
         for ((_, value), cyclic) in custom_properties.iter_mut().zip(cyclic) {
@@ -24359,11 +25080,11 @@ fn cascade_custom_properties(
             }
         }
         if registrations.is_empty() {
-        let expanded: Vec<Option<Option<String>>> = custom_properties
+        let expanded: Vec<Option<Option<CustomText>>> = custom_properties
             .iter()
             .map(|(_, value)| match value.as_deref() {
                 Some(value) if needs_expansion(value) => {
-                    Some(expand_variables_indexed(value, &custom_properties, &mut Vec::new(), false, MAX_VARIABLE_BYTES, &lookup_index))
+                    Some(expand_variables_indexed(value, &custom_properties, &mut Vec::new(), false, MAX_VARIABLE_BYTES, &lookup_index).map(CustomText::from))
                 }
                 _ => None,
             })
@@ -24375,11 +25096,11 @@ fn cascade_custom_properties(
     }
     if !registrations.is_empty() {
         let defaults: Vec<_> = registrations.iter().map(|registration|
-            (registration.name.clone(), default_value(&registration.name))).collect();
+            (CustomText::from(registration.name.as_str()), default_value(&registration.name))).collect();
         for (name, value) in &mut custom_properties {
             if value.is_none() && registrations.iter().any(|registration| registration.name == *name) { *value = default_value(name); }
         }
-        registered_properties::resolve_computed(&mut custom_properties, registrations, &defaults, &computed_sources,
+        registered_properties::resolve_computed(&mut custom_properties, None, registrations, &defaults, &computed_sources,
             compute_context.0, compute_context.1, &compute_context.2,sibling)
             .ok_or(CssError { offset: 0, message: "registered custom property dependency exceeds limit" })?;
     }
@@ -24395,17 +25116,17 @@ fn cascade_custom_properties(
         return Ok(None);
     }
     if let Some(inherited) =
-        parent.filter(|v| v.custom_properties() == custom_properties.as_slice())
+        parent.and_then(|v| v.custom.as_ref()).filter(|v| v.matches(&custom_properties))
     {
-        return Ok(inherited.custom.clone());
+        return Ok(Some(inherited.clone()));
     }
-    Ok(Some(Arc::from(custom_properties)))
+    Ok(Some(Arc::new(CustomProperties::flat(custom_properties))))
 }
 
-fn registered_font_dependencies(raw: &str, sources: &[(String, Option<String>)],
+fn registered_font_dependencies(raw: &str, sources: &[CustomEntry],
     registrations: &[registered_properties::RegisteredCustomProperty],
     font_slot: usize, root: bool, blocked: &mut Vec<String>, depth: usize) -> bool {
-    fn visit(components: &[component_values::UnparsedComponent], sources: &[(String, Option<String>)],
+    fn visit(components: &[component_values::UnparsedComponent], sources: &[CustomEntry],
         registrations: &[registered_properties::RegisteredCustomProperty], font_slot: usize,
         root: bool, blocked: &mut Vec<String>, depth: usize) -> bool {
         if depth >= MAX_VARIABLE_DEPTH { return true; }
@@ -24441,16 +25162,98 @@ fn registered_font_dependencies(raw: &str, sources: &[(String, Option<String>)],
         visit(&components, sources, registrations, font_slot, root, blocked, depth))
 }
 
-fn resolve_registered_deferred_slot(source: &Declaration, slot: usize,
-    custom: &[(String, Option<String>)]) -> Declaration {
+const DEFERRED_EXPANSIONS: usize = 64;
+const DEFERRED_PARSES_PER_EXPANSION: usize = 8;
+/// Substituted `var()` text and its parsed declarations, keyed by the identity of the rule text
+/// and of the custom property map it was substituted against. Elements that share a rule and an
+/// inherited map (nearly all of them on a page with thousands of custom properties) reuse one
+/// substitution and one parse. Each entry keeps its key alive so the pointers cannot be reused.
+#[derive(Default)]
+struct DeferredExpansions {
+    entries: Vec<DeferredExpansion>,
+}
+
+struct DeferredExpansion {
+    raw: Arc<str>,
+    custom: Option<Arc<CustomProperties>>,
+    expanded: Option<Arc<str>>,
+    declarations: Vec<(Arc<str>, Option<(usize, usize)>, Arc<[Declaration]>)>,
+}
+
+impl DeferredExpansions {
+    /// Moves the entry for `raw` and `custom` to the end, returning whether it exists.
+    fn touch(&mut self, raw: &Arc<str>, custom: &Option<Arc<CustomProperties>>) -> bool {
+        let Some(position) = self.entries.iter().position(|entry| Arc::ptr_eq(&entry.raw, raw)
+            && match (&entry.custom, custom) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }) else { return false; };
+        let entry = self.entries.remove(position);
+        self.entries.push(entry);
+        true
+    }
+
+    fn lookup(&mut self, raw: &Arc<str>, custom: &Option<Arc<CustomProperties>>) -> Option<&mut DeferredExpansion> {
+        if !self.touch(raw, custom) { return None; }
+        self.entries.last_mut()
+    }
+
+    fn insert(&mut self, raw: &Arc<str>, custom: &Option<Arc<CustomProperties>>, expanded: Option<Arc<str>>) {
+        if self.entries.len() >= DEFERRED_EXPANSIONS { self.entries.remove(0); }
+        self.entries.push(DeferredExpansion { raw: raw.clone(), custom: custom.clone(), expanded, declarations: Vec::new() });
+    }
+}
+
+/// `raw` with its `var()` references substituted from `custom`; `None` when substitution is invalid.
+fn expanded_custom_text(index: &StyleIndex, raw: &Arc<str>, custom: &Option<Arc<CustomProperties>>) -> Option<Arc<str>> {
+    if let Some(entry) = index.deferred_expansions.borrow_mut().lookup(raw, custom) {
+        return entry.expanded.clone();
+    }
+    let names: &dyn CustomNames = custom.as_deref().unwrap_or(&NO_CUSTOM);
+    let expanded: Option<Arc<str>> = expand_variables_in(raw, names, &mut Vec::new(), false, MAX_VARIABLE_BYTES)
+        .map(Arc::from);
+    index.deferred_expansions.borrow_mut().insert(raw, custom, expanded.clone());
+    expanded
+}
+
+/// The declarations `property: raw` parses to once its `var()` references are substituted from
+/// `custom`, with sibling-index functions resolved for `sibling` when given.
+fn deferred_declarations(index: &StyleIndex, property: &Arc<str>, raw: &Arc<str>,
+    custom: &Option<Arc<CustomProperties>>, sibling: Option<(usize, usize)>) -> Arc<[Declaration]> {
+    if let Some(entry) = index.deferred_expansions.borrow_mut().lookup(raw, custom) {
+        if let Some((_, _, parsed)) = entry.declarations.iter()
+            .find(|(name, at, _)| **name == **property && *at == sibling) {
+            return parsed.clone();
+        }
+    }
+    let parsed: Arc<[Declaration]> = expanded_custom_text(index, raw, custom)
+        .and_then(|text| {
+            let text = match sibling {
+                Some((position, count)) => typed_numeric::substitute_sibling_functions(&text, position, count)?.0.into_owned(),
+                None => text.to_string(),
+            };
+            declarations_with_variables(&alloc::format!("{property}:{text}"), 0, false).ok()
+        })
+        .unwrap_or_default()
+        .into();
+    if let Some(entry) = index.deferred_expansions.borrow_mut().lookup(raw, custom) {
+        if entry.declarations.len() < DEFERRED_PARSES_PER_EXPANSION {
+            entry.declarations.push((property.clone(), sibling, parsed.clone()));
+        }
+    }
+    parsed
+}
+
+fn resolve_registered_deferred_slot(index: &StyleIndex, source: &Declaration, slot: usize,
+    custom: &Option<Arc<CustomProperties>>) -> Declaration {
     let (property, raw) = match &source.value {
-        Value::Deferred(property, raw) => (property.as_ref(), raw.as_ref()),
-        Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => (group.property.as_ref(), group.value.as_ref()),
+        Value::Deferred(property, raw) => (property, raw),
+        Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => (&group.property, &group.value),
         _ => return source.clone(),
     };
-    expand_variables(raw, custom, &mut Vec::new())
-        .and_then(|raw| declarations_with_variables(&alloc::format!("{property}:{raw}"), 0, false).ok())
-        .and_then(|declarations| declarations.into_iter().find(|declaration| declaration.value.slot() == slot))
+    deferred_declarations(index, property, raw, custom, None).iter()
+        .find(|declaration| declaration.value.slot() == slot).cloned()
         .unwrap_or(Declaration { value: Value::Default(slot, inherited_property(slot)), important: source.important })
 }
 
@@ -25406,6 +26209,12 @@ fn restyle_one(
         }
         damage = damage.max(changed);
     }
+    // A pseudo-element no rule could match was never computed, so it has no
+    // retained entry to compare with.
+    if damage != StyleDamage::Layout && [PseudoElement::Before, PseudoElement::After].into_iter().any(|pseudo|
+        !old_pseudos.iter().any(|(kind, _)| *kind == pseudo) && index.generated_pseudo_may_exist(document, node, pseudo)) {
+        damage = StyleDamage::Layout;
+    }
     // First-line and first-letter styles are computed during layout and
     // retained nowhere, so a change to them cannot be compared.
     if index.has_typographic_content {
@@ -25755,7 +26564,7 @@ fn compute_for_named_registered_mode(
     box_parent: Option<BoxParentContext>,
     starting_style: bool,
     include_transitions: bool,
-    mut incoming_eligibility: Option<&mut EffectEligibility>,
+    incoming_eligibility: Option<&mut EffectEligibility>,
     style_seed: Option<(&Style, &EffectEligibility)>,
     registration_override: Option<&[registered_properties::RegisteredCustomProperty]>,
     registered_query: Option<ContainerUnitContext>,
@@ -25763,12 +26572,54 @@ fn compute_for_named_registered_mode(
     svg_instance_root: bool,
     instance_frames: &[SvgInstanceFrame],
 ) -> Result<Style, CssError> {
+    if incoming_eligibility.is_some() || registered_query.is_some() {
+        return compute_for_named_registered_inner(kind, parent, index, context, ancestor_bloom, text,
+            pseudo_target, highlight_name, box_parent, starting_style, include_transitions,
+            incoming_eligibility, style_seed, registration_override, registered_query, sibling_override,
+            svg_instance_root, instance_frames, None);
+    }
+    // Registered documents only need the query-replay provenance for the few
+    // elements whose registered values depend on container units, so capture it
+    // on a second pass for those instead of paying for it on every element.
+    let needs_provenance = core::cell::Cell::new(false);
+    let style = compute_for_named_registered_inner(kind, parent, index, context, ancestor_bloom, text,
+        pseudo_target, highlight_name, box_parent, starting_style, include_transitions,
+        None, style_seed, registration_override, registered_query, sibling_override,
+        svg_instance_root, instance_frames, Some(&needs_provenance))?;
+    if !needs_provenance.get() { return Ok(style); }
+    compute_for_named_registered_inner(kind, parent, index, context, ancestor_bloom, text,
+        pseudo_target, highlight_name, box_parent, starting_style, include_transitions,
+        None, style_seed, registration_override, registered_query, sibling_override,
+        svg_instance_root, instance_frames, None)
+}
+
+fn compute_for_named_registered_inner(
+    kind: &NodeKind,
+    parent: Option<&Style>,
+    index: &StyleIndex,
+    context: Option<(&Document, NodeId)>,
+    ancestor_bloom: AncestorBloom,
+    text: Option<&dyn TextShaper>,
+    pseudo_target: Option<PseudoElement>,
+    highlight_name: Option<&str>,
+    box_parent: Option<BoxParentContext>,
+    starting_style: bool,
+    include_transitions: bool,
+    mut incoming_eligibility: Option<&mut EffectEligibility>,
+    style_seed: Option<(&Style, &EffectEligibility)>,
+    registration_override: Option<&[registered_properties::RegisteredCustomProperty]>,
+    registered_query: Option<ContainerUnitContext>,
+    sibling_override:Option<(usize,usize)>,
+    svg_instance_root: bool,
+    instance_frames: &[SvgInstanceFrame],
+    lazy_provenance: Option<&core::cell::Cell<bool>>,
+) -> Result<Style, CssError> {
     let registration_snapshot = index.registered_snapshot();
     let registrations = registration_override.unwrap_or(&registration_snapshot);
-    // Registered query replay shares the existing canonical source/provenance
-    // machinery. Its transient capture is confined to registered documents.
+    let custom_cache = registration_override.is_none()
+        .then(|| index.registration_epoch.borrow_mut().bind(&registration_snapshot));
     let mut owned_registered_provenance = (!registrations.is_empty() && registered_query.is_none()
-        && incoming_eligibility.is_none()).then(EffectEligibility::default);
+        && incoming_eligibility.is_none() && lazy_provenance.is_none()).then(EffectEligibility::default);
     let mut eligibility = incoming_eligibility.as_deref_mut().or(owned_registered_provenance.as_mut());
     if registration_override.is_none() && !registration_snapshot.is_empty() {
         if let Some(provenance)=eligibility.as_deref_mut(){provenance.registrations=Some(registration_snapshot.clone());}
@@ -26705,8 +27556,8 @@ fn compute_for_named_registered_mode(
     candidates.sort_by_key(|(priority, _, _)| *priority);
     let sibling_dependent=candidates.iter().any(|(_,declaration,_)|{
         if value_depends_on_sibling_position(&declaration.value){return true;}
-        let raw=match &declaration.value{Value::Deferred(_,raw)|Value::Custom(_,raw)=>Some(raw.as_ref()),Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>Some(group.value.as_ref()),_=>None};
-        raw.filter(|raw|needs_expansion(raw)).and_then(|raw|parent.and_then(|parent|expand_variables(raw,parent.custom_properties(),&mut Vec::new())))
+        let raw=match &declaration.value{Value::Deferred(_,raw)|Value::Custom(_,raw)=>Some(raw),Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>Some(&group.value),_=>None};
+        raw.filter(|raw|needs_expansion(raw)).and_then(|raw|parent.and_then(|parent|expanded_custom_text(index,raw,&parent.custom)))
             .is_some_and(|raw|typed_numeric::substitute_sibling_functions(&raw,1,1).is_some_and(|(_,dependent)|dependent))
     });
     let sibling=sibling_override.unwrap_or_else(||if sibling_dependent{context.map(|(document,node)|
@@ -26718,8 +27569,11 @@ fn compute_for_named_registered_mode(
     let track_originals = eligibility.is_some() || !registrations.is_empty();
     let mut registered_raw_sources = None;
     let mut blocked_registered = Vec::new();
+    // Raw sources feed query replay (eligibility present) and font-cycle detection; the latter
+    // asks for them on demand, so the common cascade can share the inherited map by pointer.
+    let want_raw_sources = !registrations.is_empty() && eligibility.is_some();
     style.custom = cascade_custom_properties(parent, custom_baseline, &candidates, registrations, eligibility.as_deref_mut(),
-        (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, (!registrations.is_empty()).then_some(&mut registered_raw_sources))?;
+        (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, want_raw_sources.then_some(&mut registered_raw_sources), custom_cache)?;
     let root = pseudo_target.is_none() && style_seed.map_or_else(|| context.map_or(parent.is_none(), |(document, node)| {
         document.parent(node).ok().flatten().is_some_and(|parent| matches!(document.kind(parent), Ok(NodeKind::Document)))
     }), |(_, provenance)| provenance.root);
@@ -26749,7 +27603,7 @@ fn compute_for_named_registered_mode(
         candidates
     } else {
         let mut expanded: Vec<Candidate<'_>> = Vec::new();
-        let mut pending_cache: Vec<(Arc<declaration_block::Pending>, Vec<Declaration>)> =
+        let mut pending_cache: Vec<(Arc<declaration_block::Pending>, Arc<[Declaration]>)> =
             Vec::new();
         for (priority, declaration, source_url) in candidates {
             let target = snapshot_targets.binary_search_by_key(&(declaration.as_ref() as *const Declaration as usize), |(identity, _)| *identity)
@@ -26779,21 +27633,7 @@ fn compute_for_named_registered_mode(
                     {
                         position
                     } else {
-                        let parsed = expand_variables(
-                            &group.value,
-                            style.custom_properties(),
-                            &mut Vec::new(),
-                        )
-                        .and_then(|raw| {
-                            let (raw,_)=typed_numeric::substitute_sibling_functions(&raw,sibling.0,sibling.1)?;
-                            declarations_with_variables(
-                                &alloc::format!("{}:{raw}", group.property),
-                                0,
-                                false,
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_default();
+                        let parsed = deferred_declarations(index, &group.property, &group.value, &style.custom, Some(sibling));
                         pending_cache.try_reserve(1).map_err(|_| CssError {
                             offset: 0,
                             message: "CSS expansion exceeds limit",
@@ -26827,18 +27667,10 @@ fn compute_for_named_registered_mode(
                     projected
                 }
                 Value::Deferred(name, raw) => {
-                    let resolved =
-                        expand_variables(raw, style.custom_properties(), &mut Vec::new());
-                    let parsed = resolved
-                        // Substitution has already processed variable functions.
-                        // A quoted literal containing `var(` must now be parsed
-                        // as a normal value, rather than deferred a second time.
-                        .and_then(|raw| {
-                            let (raw,_)=typed_numeric::substitute_sibling_functions(&raw,sibling.0,sibling.1)?;
-                            declarations_with_variables(&alloc::format!("{name}:{raw}"), 0, false)
-                                .ok()
-                        })
-                        .unwrap_or_default();
+                    // Substitution has already processed variable functions.
+                    // A quoted literal containing `var(` must now be parsed
+                    // as a normal value, rather than deferred a second time.
+                    let parsed = deferred_declarations(index, name, raw, &style.custom, Some(sibling));
                     if parsed.is_empty() {
                         slots(name)
                             .iter()
@@ -26848,7 +27680,7 @@ fn compute_for_named_registered_mode(
                             })
                             .collect()
                     } else {
-                        parsed
+                        parsed.to_vec()
                     }
                 }
                 _ => {
@@ -26924,7 +27756,7 @@ fn compute_for_named_registered_mode(
         }
         if matches!(pass, 4 | 5 | 6) && !registrations.is_empty() {
             style.custom = cascade_custom_properties(parent, custom_baseline, &registered_candidates, registrations, None,
-                (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, None)?;
+                (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)), sibling, &blocked_registered, None, custom_cache)?;
         }
         let font_pass = pass == 0;
         if !font_pass && root && style.font_size != style.root_font_size {
@@ -26942,6 +27774,11 @@ fn compute_for_named_registered_mode(
             let cycle_default;
             let cycle = if ((pass == 0 && slot == 7) || (pass == 4 && slot == 13))
                 && registered_font_sources.as_ref().is_some_and(|sources| sources[slot] == order + 1) {
+                if registered_raw_sources.is_none() {
+                    cascade_custom_properties(parent, custom_baseline, &registered_candidates, registrations, None,
+                        (style_length_context(text, &style, index.environment, None), query, style.resolved_source_color(1, style.color)),
+                        sibling, &[], Some(&mut registered_raw_sources), custom_cache)?;
+                }
                 expanded_originals.get(order).and_then(Option::as_ref).is_some_and(|original| {
                     let raw = match &original.value {
                         Value::Deferred(_, raw) => Some(raw.as_ref()),
@@ -26957,7 +27794,7 @@ fn compute_for_named_registered_mode(
                 &cycle_default
             } else if pass >= 4 && !registrations.is_empty() {
                 if let Some(original) = expanded_originals.get(order).and_then(Option::as_ref) {
-                    refreshed = resolve_registered_deferred_slot(original, slot, style.custom_properties());
+                    refreshed = resolve_registered_deferred_slot(index, original, slot, &style.custom);
                     &refreshed
                 } else { declaration.as_ref() }
             } else { declaration.as_ref() };
@@ -27782,6 +28619,7 @@ fn compute_for_named_registered_mode(
         && (registered_candidates.iter().any(|(_, declaration, _)| matches!(&declaration.value,
                 Value::Custom(_, raw) if animation_shadow_query_dependent(raw)))
             || style.font_query_context_pending()) {
+        if let (None, Some(lazy)) = (eligibility.as_deref(), lazy_provenance) { lazy.set(true); }
         if let Some(provenance) = eligibility.as_deref_mut() {
             if !provenance.dependent.is_empty() {
                 provenance.sources = Some(core::mem::take(&mut provenance.dependent).into());
@@ -27814,7 +28652,7 @@ fn compute_for_named_registered_mode(
             let query_custom: Arc<[String]> = sources.iter().filter_map(|(name, raw)| {
                 let raw = raw.as_deref()?;
                 let expanded = if needs_expansion(raw) { expand_variables(raw, sources, &mut Vec::new())? } else { raw.to_string() };
-                (registered_query_axes(&expanded) != 0).then(|| name.clone())
+                (registered_query_axes(&expanded) != 0).then(|| name.to_string())
             }).collect();
             for (at, (_, declaration, _)) in expanded.iter().enumerate() {
                 let raw = expanded_originals.get(at).and_then(Option::as_ref).and_then(|source| match &source.value {
@@ -27851,6 +28689,24 @@ fn compute_for_named_registered_mode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_content_flags_follow_the_rules_that_can_produce_quotes_and_counters() {
+        let index = |css: &str| StyleIndex::new(parse_stylesheet(css).unwrap().rules);
+        assert!(!index("a::before{content:\"x\"}").has_quote_content());
+        assert!(index("a::before{content:var(--x)}").has_quote_content(),"an unresolved var() may produce a quote");
+        assert!(index("a::before{content:var(--x)}").has_counter_data(),"an unresolved var() may produce a counter");
+        assert!(index("a::before{content:inherit}").has_quote_content(),"inherited content may bring a quote");
+        assert!(index("a::before{content:open-quote}").has_quote_content());
+        assert!(index("a::before{content:var(--x)} :root{--x:close-quote}").has_quote_content());
+        assert!(index("a::before{content:var(--x)} :root{--x:counter(c)}").has_counter_data());
+        assert!(index("a::before{content:counter(c)}").has_counter_data());
+        let quotes = index("b::after{content:no-close-quote}");
+        let document = crate::html::parse("<a></a><b></b>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        assert!(!quotes.may_generate_quotes(&document, find("a")));
+        assert!(quotes.may_generate_quotes(&document, find("b")));
+    }
+
     #[test]
     fn style_index_reports_child_state_dependence_through_combinators_scopes_and_appends() {
         let depends = |css: &str| StyleIndex::new(parse_stylesheet(css).unwrap().rules).depends_on_children();
@@ -35717,7 +36573,7 @@ mod tests {
     }
 
     fn custom_value(style: &Style, name: &str) -> Option<String> {
-        style.custom_properties().iter().find(|(key, _)| key == name).and_then(|(_, value)| value.clone())
+        style.custom_properties().iter().find(|(key, _)| key == name).and_then(|(_, value)| value.as_ref().map(|value| value.to_string()))
     }
 
     #[test]
@@ -35754,6 +36610,231 @@ mod tests {
         assert_eq!(custom_value(&other_style, "--extra").as_deref(), Some("1px"));
         assert_eq!(custom_value(&other_style, "--tone").as_deref(), Some("red"));
         assert_eq!(custom_value(&top_style, "--extra"), None);
+    }
+
+    const CUSTOM_CHAIN: &str = "<div id=top><div id=mid><div id=leaf><div id=tail><div id=end></div></div></div></div></div>";
+
+    /// Styles of the nested `ids`, each computed with the previous one as its parent.
+    fn custom_chain(stylesheet: &str, ids: &[&str]) -> Vec<Style> {
+        let document = crate::html::parse(CUSTOM_CHAIN, 16).unwrap();
+        let index = StyleIndex::new(parse(stylesheet).unwrap());
+        let mut styles: Vec<Style> = Vec::new();
+        for id in ids {
+            let node = crate::selector::query_selector(&document, document.root(), id).unwrap().unwrap();
+            let style = compute_node(&document, node, styles.last(), &index).unwrap();
+            styles.push(style);
+        }
+        styles
+    }
+
+    fn shares_custom_map(a: &Style, b: &Style) -> bool {
+        match (&a.custom, &b.custom) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn custom_property_map_is_shared_by_pointer_without_custom_declarations() {
+        let styles = custom_chain("#top{--tone:red;--wide:blue}", &["#top", "#mid", "#leaf"]);
+        assert!(shares_custom_map(&styles[0], &styles[1]));
+        assert!(shares_custom_map(&styles[1], &styles[2]));
+        assert_eq!(custom_value(&styles[2], "--tone").as_deref(), Some("red"));
+        assert_eq!(custom_value(&styles[2], "--wide").as_deref(), Some("blue"));
+    }
+
+    #[test]
+    fn custom_property_override_with_the_inherited_value_keeps_sharing_the_map() {
+        let styles = custom_chain("#top{--tone:red;--wide:blue}#mid{--tone:red}#leaf{--wide:blue;--tone:red}",
+            &["#top", "#mid", "#leaf"]);
+        assert!(shares_custom_map(&styles[0], &styles[1]));
+        assert!(shares_custom_map(&styles[1], &styles[2]));
+        let registered = custom_chain("@property --len{syntax:'<length>';inherits:true;initial-value:1px}\
+            #top{--len:5px;--tone:red}#mid{--tone:red}#leaf{--len:5px}", &["#top", "#mid", "#leaf"]);
+        assert!(shares_custom_map(&registered[0], &registered[1]));
+        assert!(shares_custom_map(&registered[1], &registered[2]));
+        assert_eq!(custom_value(&registered[2], "--len").as_deref(), Some("5px"));
+    }
+
+    #[test]
+    fn custom_property_override_copies_the_map_only_for_the_declaring_element() {
+        let styles = custom_chain("#top{--tone:red;--wide:blue}#mid{--tone:green;--extra:1px}", &["#top", "#mid", "#leaf"]);
+        assert!(!shares_custom_map(&styles[0], &styles[1]));
+        assert!(shares_custom_map(&styles[1], &styles[2]));
+        assert_eq!(custom_value(&styles[0], "--tone").as_deref(), Some("red"));
+        assert_eq!(custom_value(&styles[0], "--extra"), None);
+        assert_eq!(custom_value(&styles[1], "--tone").as_deref(), Some("green"));
+        assert_eq!(custom_value(&styles[1], "--wide").as_deref(), Some("blue"));
+        assert_eq!(custom_value(&styles[1], "--extra").as_deref(), Some("1px"));
+        assert_eq!(styles[1].custom_properties().iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["--tone", "--wide", "--extra"], "inherited order is kept and new names are appended");
+    }
+
+    fn custom_entry(name: &str, value: &str) -> CustomEntry { (name.into(), Some(value.into())) }
+
+    fn custom_names(map: &CustomProperties) -> Vec<&str> { map.iter().map(|(name, _)| name.as_str()).collect() }
+
+    /// Styles of `levels` nested elements, each declaring `--v<level>` and computed against its parent.
+    fn nested_custom_styles(levels: usize, extra: &str) -> Vec<Style> {
+        let mut html = String::new();
+        for level in 0..levels { html.push_str(&alloc::format!("<div id=l{level}>")); }
+        for _ in 0..levels { html.push_str("</div>"); }
+        let mut sheet = String::from(extra);
+        for level in 0..levels { sheet.push_str(&alloc::format!("#l{level}{{--v{level}:{level}px}}")); }
+        let document = crate::html::parse(&html, 4096).unwrap();
+        let index = StyleIndex::new(parse(&sheet).unwrap());
+        let mut styles: Vec<Style> = Vec::new();
+        for level in 0..levels {
+            let node = crate::selector::query_selector(&document, document.root(), &alloc::format!("#l{level}")).unwrap().unwrap();
+            let style = compute_node(&document, node, styles.last(), &index).unwrap();
+            styles.push(style);
+        }
+        styles
+    }
+
+    #[test]
+    fn custom_property_refinements_keep_the_flat_order_and_equal_the_flat_map() {
+        let root = Arc::new(CustomProperties::flat(alloc::vec![
+            custom_entry("--a", "1"), custom_entry("--b", "2"), custom_entry("--c", "3")]));
+        let child = CustomProperties::derive(&root, alloc::vec![custom_entry("--b", "20"), custom_entry("--d", "4")]).unwrap();
+        assert!(child.root.is_some());
+        assert_eq!(custom_names(&child), ["--a", "--b", "--c", "--d"], "inherited order is kept and new names are appended");
+        assert_eq!(child.get("--b"), Some(&Some("20".into())));
+        assert_eq!(child.get("--c"), Some(&Some("3".into())));
+        assert_eq!(child.get("--missing"), None);
+        assert_eq!(child.len(), 4);
+        let flat = CustomProperties::flat(alloc::vec![
+            custom_entry("--a", "1"), custom_entry("--b", "20"), custom_entry("--c", "3"), custom_entry("--d", "4")]);
+        assert_eq!(*child, flat);
+        assert_eq!(flat, *child);
+        let other = CustomProperties::flat(alloc::vec![
+            custom_entry("--a", "1"), custom_entry("--b", "21"), custom_entry("--c", "3"), custom_entry("--d", "4")]);
+        assert_ne!(*child, other);
+        let reordered = CustomProperties::flat(alloc::vec![
+            custom_entry("--a", "1"), custom_entry("--b", "20"), custom_entry("--d", "4"), custom_entry("--c", "3")]);
+        assert_ne!(*child, reordered, "entry order is part of the map");
+
+        let grandchild = CustomProperties::derive(&child, alloc::vec![
+            custom_entry("--d", "40"), custom_entry("--e", "5"), custom_entry("--a", "10")]).unwrap();
+        assert!(Arc::ptr_eq(grandchild.root.as_ref().unwrap(), &root), "refinements stay one level above the flat root");
+        assert_eq!(custom_names(&grandchild), ["--a", "--b", "--c", "--d", "--e"]);
+        assert_eq!(grandchild.get("--a"), Some(&Some("10".into())));
+        assert_eq!(grandchild.get("--b"), Some(&Some("20".into())));
+        assert_eq!(grandchild.get("--d"), Some(&Some("40".into())));
+        assert_eq!(grandchild.get("--e"), Some(&Some("5".into())));
+
+        let restored = CustomProperties::derive(&child, alloc::vec![custom_entry("--b", "2")]).unwrap();
+        let direct = CustomProperties::derive(&root, alloc::vec![custom_entry("--d", "4")]).unwrap();
+        assert_eq!(*restored, *direct, "a redefinition equal to the root's entry is dropped");
+        assert!(Arc::ptr_eq(&CustomProperties::derive(&root, alloc::vec![custom_entry("--a", "1")]).unwrap(), &root));
+        let invalid = CustomProperties::derive(&root, alloc::vec![("--b".into(), None)]).unwrap();
+        assert_eq!(invalid.get("--b"), Some(&None), "the guaranteed-invalid value shadows the inherited one");
+        assert_eq!(invalid.len(), 3);
+    }
+
+    #[test]
+    fn custom_property_maps_flag_values_that_need_substitution() {
+        let clean = Arc::new(CustomProperties::flat(alloc::vec![custom_entry("--a", "1px")]));
+        assert!(!clean.needs_substitution());
+        assert!(!CustomProperties::derive(&clean, alloc::vec![custom_entry("--b", "2px")]).unwrap().needs_substitution());
+        assert!(CustomProperties::derive(&clean, alloc::vec![custom_entry("--b", "var(--a)")]).unwrap().needs_substitution());
+        assert!(CustomProperties::flat(alloc::vec![custom_entry("--a", "1px /* note */")]).needs_substitution());
+        assert!(!NO_CUSTOM.needs_substitution());
+    }
+
+    #[test]
+    fn custom_property_chain_of_twenty_levels_resolves_and_matches_the_flat_map() {
+        let styles = nested_custom_styles(20, "#l10{--v3:over}");
+        let last = styles.last().unwrap();
+        for level in 0..20 {
+            let expected = if level == 3 { "over".to_string() } else { alloc::format!("{level}px") };
+            assert_eq!(custom_value(last, &alloc::format!("--v{level}")).as_deref(), Some(expected.as_str()), "--v{level}");
+        }
+        for (level, style) in styles.iter().enumerate() {
+            assert_eq!(style.custom_properties().len(), level + 1);
+            let expected: Vec<String> = (0..=level).map(|name| alloc::format!("--v{name}")).collect();
+            assert_eq!(custom_names(style.custom_properties()), expected.iter().map(String::as_str).collect::<Vec<_>>());
+        }
+        assert_eq!(custom_value(&styles[9], "--v3").as_deref(), Some("3px"), "ancestors keep their own values");
+        assert_eq!(custom_value(&styles[10], "--v3").as_deref(), Some("over"));
+        let flat = CustomProperties::flat(last.custom_properties().to_vec());
+        assert_eq!(*last.custom_properties(), flat);
+        assert_eq!(flat, *last.custom_properties());
+        let mut changed = flat.to_vec();
+        changed[19].1 = Some("other".into());
+        assert_ne!(*last.custom_properties(), CustomProperties::flat(changed));
+    }
+
+    #[test]
+    fn custom_property_chain_flattens_once_the_refinement_outgrows_its_root() {
+        let styles = nested_custom_styles(70, "");
+        assert!(styles[64].custom.as_ref().unwrap().root.is_some());
+        let flattened = styles[65].custom.as_ref().unwrap();
+        assert!(flattened.root.is_none(), "the 65th local entry flattens into a new root");
+        assert_eq!(flattened.len(), 66);
+        let last = styles.last().unwrap();
+        assert_eq!(last.custom_properties().len(), 70);
+        for level in 0..70 {
+            assert_eq!(custom_value(last, &alloc::format!("--v{level}")).as_deref(), Some(alloc::format!("{level}px").as_str()));
+        }
+        let expected: Vec<String> = (0..70).map(|name| alloc::format!("--v{name}")).collect();
+        assert_eq!(custom_names(last.custom_properties()), expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(*styles[69].custom_properties(), CustomProperties::flat(styles[69].custom_properties().to_vec()));
+    }
+
+    #[test]
+    fn custom_property_substitution_resolves_against_the_inherited_map() {
+        let styles = custom_chain(
+            "#top{--base:4px;--tone:red}#mid{--gap:var(--base);--tone:var(--tone-alt,blue)}#leaf{--twice:var(--gap) var(--gap);--self:var(--tone)}",
+            &["#top", "#mid", "#leaf"]);
+        assert_eq!(custom_value(&styles[1], "--gap").as_deref(), Some("4px"));
+        assert_eq!(custom_value(&styles[1], "--tone").as_deref(), Some("blue"));
+        assert_eq!(custom_value(&styles[2], "--twice").as_deref(), Some("4px 4px"));
+        assert_eq!(custom_value(&styles[2], "--self").as_deref(), Some("blue"));
+        assert_eq!(custom_value(&styles[0], "--tone").as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn custom_property_cycles_stay_invalid_when_declared_over_an_inherited_map() {
+        let styles = custom_chain("#top{--tone:red}#mid{--a:var(--b);--b:var(--a);--c:var(--a, red);--tone:var(--tone)}",
+            &["#top", "#mid", "#leaf"]);
+        assert_eq!(custom_value(&styles[1], "--a"), None);
+        assert_eq!(custom_value(&styles[1], "--b"), None);
+        assert_eq!(custom_value(&styles[1], "--c").as_deref().map(str::trim), Some("red"));
+        assert_eq!(custom_value(&styles[1], "--tone"), None, "a self-reference is invalid, not the inherited value");
+        assert!(shares_custom_map(&styles[1], &styles[2]));
+    }
+
+    #[test]
+    fn registered_custom_properties_reset_or_inherit_over_a_shared_map() {
+        let styles = custom_chain(
+            "@property --len{syntax:'<length>';inherits:false;initial-value:1px}\
+             @property --kept{syntax:'<length>';inherits:true;initial-value:2px}\
+             #top{--len:9px;--kept:8px}#mid{--other:3px}#tail{--len:7px}",
+            &["#top", "#mid", "#leaf", "#tail", "#end"]);
+        assert_eq!(custom_value(&styles[0], "--len").as_deref(), Some("9px"));
+        assert_eq!(custom_value(&styles[1], "--len").as_deref(), Some("1px"), "non-inherited registered property resets");
+        assert_eq!(custom_value(&styles[1], "--kept").as_deref(), Some("8px"));
+        assert_eq!(custom_value(&styles[1], "--other").as_deref(), Some("3px"));
+        assert!(shares_custom_map(&styles[1], &styles[2]), "settled registered map is inherited by pointer");
+        assert_eq!(custom_value(&styles[3], "--len").as_deref(), Some("7px"));
+        assert!(!shares_custom_map(&styles[2], &styles[3]));
+        assert_eq!(custom_value(&styles[4], "--len").as_deref(), Some("1px"), "the declared value does not reach the child");
+        assert_eq!(custom_value(&styles[4], "--kept").as_deref(), Some("8px"));
+    }
+
+    #[test]
+    fn var_substitution_is_not_reused_across_different_custom_property_maps() {
+        let document = crate::html::parse("<div id=top><div id=a class=c></div><div id=over class=c></div><div id=b class=c></div></div>", 16).unwrap();
+        let index = StyleIndex::new(parse("#top{--tone:red}.c{color:var(--tone)}#over{--tone:blue}").unwrap());
+        let find = |id: &str| crate::selector::query_selector(&document, document.root(), id).unwrap().unwrap();
+        let top = compute_node(&document, find("#top"), None, &index).unwrap();
+        let [a, over, b] = ["#a", "#over", "#b"].map(|id| compute_node(&document, find(id), Some(&top), &index).unwrap());
+        assert_eq!(a.color, color("red").unwrap());
+        assert_eq!(over.color, color("blue").unwrap());
+        assert_eq!(b.color, color("red").unwrap());
+        assert!(shares_custom_map(&top, &a) && shares_custom_map(&top, &b));
+        assert!(!shares_custom_map(&top, &over));
     }
 
     #[test]
@@ -36331,12 +37412,13 @@ mod tests {
 
     #[test]
     fn specification_selector_lists_bound_members_independently_and_preserve_resource_admission() {
-        let source = (0..32).map(|index| alloc::format!(".outer{index} > .inner{index}"))
+        let members = 1024;
+        let source = (0..members).map(|index| alloc::format!(".outer{index} > .inner{index}"))
             .collect::<Vec<_>>().join(", ");
         assert!(source.len() > MAX_SELECTOR_BYTES);
         let rules = parse(&alloc::format!("{source} {{ width: 19px }}")).unwrap();
-        assert_eq!(rules.len(), 32);
-        let document = crate::html::parse("<main class='outer31'><i class='inner31' id='target'></i></main>", 16).unwrap();
+        assert_eq!(rules.len(), members);
+        let document = crate::html::parse("<main class='outer1023'><i class='inner1023' id='target'></i></main>", 16).unwrap();
         let target = crate::selector::query_selector(&document, document.root(), "#target").unwrap().unwrap();
         let index = StyleIndex::new(rules);
         assert_eq!(compute_node(&document, target, None, &index).unwrap().width, Some(19.0));
@@ -36346,8 +37428,8 @@ mod tests {
         assert_eq!(parse_selector_list(&too_long, 0).unwrap_err().message, "selector too large");
         assert_eq!(parse_selector_list(&alloc::format!("i, {too_long}"), 0).unwrap_err().message, "selector too large");
         assert_eq!(parse_selector_list(&" ".repeat(MAX_CSS_BYTES + 1), 0).unwrap_err().message, "selector list too large");
-        assert_eq!(parse_relative_selector_list_depth(&source, 0, 0, false, &NamespaceMap::default()).unwrap().len(), 32);
-        assert_eq!(parse_nested_selector_list_depth(&source, 0, 0, false, &NamespaceMap::default()).unwrap().len(), 32);
+        assert_eq!(parse_relative_selector_list_depth(&source, 0, 0, false, &NamespaceMap::default()).unwrap().len(), members);
+        assert_eq!(parse_nested_selector_list_depth(&source, 0, 0, false, &NamespaceMap::default()).unwrap().len(), members);
     }
 
     #[test]

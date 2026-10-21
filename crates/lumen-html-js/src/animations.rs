@@ -1585,6 +1585,26 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     }
     if !completed_display && hub.borrow().transition_snapshots.get(&realm_key).is_some_and(|(owner,previous)|
         owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && previous.epoch==epoch) {return Ok(());}
+    // Nothing declares a transition or animation and none is running, so no
+    // style change can start one and the snapshot need not follow it. It is
+    // held as it is: a script that declares a transition and changes a style in
+    // one task still starts it, from the style the held snapshot recorded. The
+    // session remembers which elements were restyled since, whose held style
+    // is not their before-change style. Without a snapshot to hold, one is
+    // taken now.
+    if !completed_display {
+        let idle={
+            let state=hub.borrow();
+            state.records.is_empty() && !state.running_transitions.keys().any(|key|key.0==realm_key)
+                && !state.completed_transitions.keys().any(|key|key.0==realm_key)
+        };
+        if idle && !realm.session.borrow_mut().may_declare_transitions() {
+            if hub.borrow().transition_over_budget.contains_key(&realm_key) {return Ok(());}
+            let held=hub.borrow().transition_snapshots.get(&realm_key)
+                .filter(|(owner,_)|owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm))).map(|(_,snapshot)|snapshot.clone());
+            if held.is_some_and(|held|realm.session.borrow_mut().hold_transition_snapshot(&held)) {return Ok(());}
+        }
+    }
     // An unchanged cascade input epoch needs lifecycle reconciliation above,
     // but no BEFORE stack publication. The caller samples its actual demand.
     // Genuine style changes still advance old effects against their captured
@@ -1602,14 +1622,17 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
     let text=fonts.as_ref().map(|fonts|&**fonts as &dyn lumen_html::paint::TextShaper);
     let earlier=hub.borrow().transition_snapshots.get(&realm_key)
         .filter(|(owner,_)|owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm))).map(|(_,snapshot)|snapshot.clone());
+    let stale=realm.session.borrow_mut().take_held_snapshot_stale();
     let snapshot=realm.session.borrow_mut().transition_snapshot_after(text,earlier.as_ref());
     drop(earlier);
     let mut snapshot=match snapshot {
         Ok(snapshot)=>snapshot,
-        Err(lumen_html::layout::LayoutError::CommandLimit)=>{
-            // An oversized document gets no CSS transitions rather than an
-            // error on every animation frame. The marker keeps later frames
-            // at the same input epoch from repeating the failed capture.
+        Err(error)=>{
+            // Transitions start as a side effect of a style change event, so a
+            // document Lumen cannot snapshot gets no CSS transitions rather
+            // than an exception from every animation frame. The marker keeps
+            // later frames at the same input epoch from repeating the failed
+            // capture.
             let first={
                 let mut state=hub.borrow_mut();
                 state.transition_snapshots.remove(&realm_key);
@@ -1618,7 +1641,11 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
                 state.transition_budget_reported.insert(realm_key)
             };
             if first {
-                eprintln!("lumen: document exceeds the transition style snapshot budget; CSS transitions are disabled for it");
+                if matches!(error,lumen_html::layout::LayoutError::CommandLimit) {
+                    eprintln!("lumen: document exceeds the transition style snapshot budget; CSS transitions are disabled for it");
+                }else{
+                    eprintln!("lumen: transition style snapshot failed ({error:?}); CSS transitions are disabled for it");
+                }
             }
             let running=hub.borrow().running_transitions.iter().filter(|(target,_)|target.0==realm_key)
                 .map(|(target,id)|(target.clone(),*id)).collect::<Vec<_>>();
@@ -1626,7 +1653,6 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
             apply_realm(hub,realm,now)?;
             return Ok(());
         }
-        Err(error)=>return Err(OpError::new("InvalidStateError",format!("transition style snapshot failed: {error:?}"))),
     };
     let registrations=realm.session.borrow().registered_custom_property_snapshot();
     let previous=hub.borrow().transition_snapshots.get(&realm_key).map(|(_,snapshot)|snapshot.clone());
@@ -1663,6 +1689,11 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         if !rendered {continue;}
         let times=input.style.transition_property().map_or(1,|properties|properties.len());
         if running.is_none() && !(0..times).any(|index|transition_parameters(&input.style,index).0.combined_duration()>0.0) {continue;} 
+        if stale.as_ref().is_some_and(|stale|previous_nodes.contains_key(&(input.node,input.pseudo)) && realm.session.borrow().held_snapshot_covers(stale,input.node,|ancestor|
+            match (previous_nodes.get(&(ancestor,None)),after_nodes.get(&(ancestor,None))) {
+                (Some(old),Some(new))=>!Arc::ptr_eq(&old.style,&new.style) && old.style!=new.style,
+                _=>true,
+            })) {continue;}
         let starting=if old.is_none() {
             let parent_id=input.parent;
             let parent=parent_id.and_then(|id|after_nodes.get(&(id,None)).copied());
@@ -1790,7 +1821,15 @@ fn refresh_css_animations(
         if epoch.is_some_and(|epoch|hub.borrow().animation_over_budget.get(&realm_key).is_some_and(|(owner,over)|
             owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)) && *over==epoch)) {return Ok(());}
     }
-    let source=hub.borrow().transition_snapshots.get(&realm_key).map(|(_,snapshot)|snapshot.clone());
+    let held=realm.session.borrow().has_held_transition_snapshot();
+    let source=if held {None} else {hub.borrow().transition_snapshots.get(&realm_key).map(|(_,snapshot)|snapshot.clone())};
+    // No rule, inline style or installed effect can start an animation and none
+    // runs, so there is no style to snapshot.
+    if !hub.borrow().css_records.keys().any(|key|key.0==realm_key)
+        && !realm.session.borrow_mut().may_declare_transitions() {
+        hub.borrow_mut().css_generations.remove(&realm_key);
+        return Ok(());
+    }
     let snapshot = {let mut session=realm.session.borrow_mut();match source {
         Some(source)=>session.animation_snapshot_from_transition(&source),None=>session.animation_snapshot(),
     }};
@@ -5799,6 +5838,48 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
     }
 
     #[test]
+    fn css_transitions_with_thousands_of_custom_properties_never_throw_from_animation_frames() {
+        let unregistered:String=(0..3500).map(|index|format!("--c{index}:value-{index};")).collect();
+        let registered_rules:String=(0..400).map(|index|format!("@property --r{index}{{syntax:'*';inherits:false}}")).collect();
+        let registered:String=(0..400).map(|index|format!("--r{index}:{};",format!("{index}").repeat(700))).collect();
+        for (rules,declarations) in [(String::new(),unregistered),(registered_rules,registered)] {
+            let mut engine=Engine::new();
+            let markup=format!("<style>{rules}:root{{{declarations}}}#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(300));
+            let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+            progress_layout(&realm);advance(engine.ctx(),0.0).unwrap();
+            eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+            advance(engine.ctx(),16.0).unwrap();
+            advance(engine.ctx(),32.0).unwrap();
+            assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length<=1"),Value::Bool(true)));
+        }
+    }
+
+    #[test]
+    fn css_transition_starts_after_a_stylesheet_restyles_the_whole_document() {
+        let mut engine=Engine::new();
+        let declarations:String=(0..1500).map(|index|format!("--c{index}:value-{index};")).collect();
+        let markup=format!("<style>:root{{{declarations}}}#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(500));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.sheet=document.createElement('style');sheet.textContent='p{margin-left:1px}';document.head.appendChild(sheet)");
+        progress_layout(&realm);advance(engine.ctx(),16.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),32.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_beside_many_elements_without_transitions() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(300));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),16.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
     fn css_transition_snapshots_restyle_only_changed_elements_and_idle_frames_do_no_work() {
         let mut engine=Engine::new();
         let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(2000));
@@ -5817,6 +5898,104 @@ if(!replacement)throw Error('retarget missing transition after mixed old stack')
         assert_eq!(changed.transition_snapshots_incremental,still.transition_snapshots_incremental+1,"full {} -> {}",still.transition_snapshots_full,changed.transition_snapshots_full);
         assert!(changed.transition_styles_computed-still.transition_styles_computed<20,"styles computed: {}",changed.transition_styles_computed-still.transition_styles_computed);
         assert!(changed.transition_styles_reused-still.transition_styles_reused>2000);
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_snapshots_are_not_refreshed_when_nothing_declares_a_transition() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(300));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        let first=realm.session.borrow().invalidation_stats();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        for frame in 1..=10 {
+            advance(engine.ctx(),16.0*frame as f64).unwrap();
+            eval_ok(&mut engine,"target.setAttribute('data-n',String(Math.random()))");
+        }
+        let stats=realm.session.borrow().invalidation_stats();
+        assert_eq!(stats.transition_styles_computed,first.transition_styles_computed);
+        assert_eq!(stats.transition_snapshots_full+stats.transition_snapshots_incremental,first.transition_snapshots_full+first.transition_snapshots_incremental);
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===0"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_when_a_script_declares_it_and_changes_the_style_in_one_task() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(100));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"document.body.setAttribute('data-n','1')");
+        advance(engine.ctx(),16.0).unwrap();
+        advance(engine.ctx(),32.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.style.transition='opacity 100s linear';target.style.opacity='0'");
+        advance(engine.ctx(),48.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_when_a_script_inserts_a_stylesheet_and_toggles_a_class_in_one_task() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(100));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"document.body.setAttribute('data-n','1')");
+        advance(engine.ctx(),16.0).unwrap();
+        advance(engine.ctx(),32.0).unwrap();
+        eval_ok(&mut engine,"globalThis.sheet=document.createElement('style');sheet.textContent='#target{transition:opacity 100s linear}';document.head.appendChild(sheet);globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),48.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_after_a_stylesheet_first_declares_transitions() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0}}#target.end{{opacity:1}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(100));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.sheet=document.createElement('style');sheet.textContent='#target{transition:opacity 100s linear}';document.head.appendChild(sheet)");
+        advance(engine.ctx(),16.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),32.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_starts_after_an_inline_style_first_declares_one() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0}}</style><div id=target></div>{}","<p><span>x</span></p>".repeat(100));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        advance(engine.ctx(),0.0).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.style.transition='opacity 100s linear'");
+        advance(engine.ctx(),16.0).unwrap();
+        eval_ok(&mut engine,"target.style.opacity='1'");
+        advance(engine.ctx(),32.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_transition_snapshot_follows_a_stylesheet_without_transitions_incrementally() {
+        let mut engine=Engine::new();
+        let markup=format!("<style>#target{{opacity:0;transition:opacity 100s linear}}#target.end{{opacity:1}}</style><div id=target></div><div id=other></div>{}","<p><span>x</span></p>".repeat(1000));
+        let realm=crate::install(engine.ctx(),&markup,10_000).unwrap();
+        progress_layout(&realm);
+        eval_ok(&mut engine,"document.body.getBoundingClientRect().height");
+        advance(engine.ctx(),0.0).unwrap();
+        let idle=realm.session.borrow().invalidation_stats();
+        eval_ok(&mut engine,"globalThis.sheet=document.createElement('style');sheet.textContent='#other{margin-left:1px}';document.head.appendChild(sheet)");
+        progress_layout(&realm);
+        advance(engine.ctx(),16.0).unwrap();
+        let after=realm.session.borrow().invalidation_stats();
+        assert_eq!(after.transition_snapshots_full,idle.transition_snapshots_full,"a stylesheet that changes few elements does not rebuild the snapshot");
+        assert_eq!(after.transition_snapshots_incremental,idle.transition_snapshots_incremental+1);
+        assert!(after.transition_styles_computed-idle.transition_styles_computed<20,"styles computed: {}",after.transition_styles_computed-idle.transition_styles_computed);
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');target.className='end'");
+        advance(engine.ctx(),32.0).unwrap();
         assert!(matches!(eval_ok(&mut engine,"target.getAnimations().length===1 && target.getAnimations()[0] instanceof CSSTransition"),Value::Bool(true)));
     }
 

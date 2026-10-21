@@ -439,10 +439,13 @@ pub(super) fn font_dependency(syntax: &str, value: &str, slot: usize, root: bool
 
 /// Resolve dependencies before substitution so a registered property contributes
 /// its computed serialization even through an unregistered token-list alias.
+/// With `base`, `values` holds only the entries an element declares; every other
+/// name is read from the already resolved inherited map and left untouched.
 pub(super) fn resolve_computed(
-    values: &mut [(String, Option<String>)],
+    values: &mut [CustomEntry],
+    base: Option<&dyn CustomNames>,
     registrations: &[RegisteredCustomProperty],
-    defaults: &[(String, Option<String>)],
+    defaults: &[CustomEntry],
     sources: &[(String, Option<Arc<str>>)],
     context: LengthContext,
     query: ContainerUnitContext,
@@ -475,10 +478,11 @@ pub(super) fn resolve_computed(
     fn resolve(
         at: usize,
         depth: usize,
-        values: &mut [(String, Option<String>)],
+        values: &mut [CustomEntry],
+        base: Option<&dyn CustomNames>,
         states: &mut [u8],
         registrations: &[RegisteredCustomProperty],
-        defaults: &[(String, Option<String>)],
+        defaults: &[CustomEntry],
         sources: &[(String, Option<Arc<str>>)],
         context: LengthContext,
         query: ContainerUnitContext,
@@ -486,6 +490,12 @@ pub(super) fn resolve_computed(
         sibling:(usize,usize),
     ) -> Option<()> {
         if states[at] == 2 {
+            return Some(());
+        }
+        let registered = registrations.iter()
+            .any(|registration| registration.name == values[at].0 && registration.syntax.trim() != "*");
+        if !registered && !values[at].1.as_deref().is_some_and(needs_expansion) {
+            states[at] = 2;
             return Some(());
         }
         if states[at] == 1 || depth >= MAX_VARIABLE_DEPTH {
@@ -505,6 +515,7 @@ pub(super) fn resolve_computed(
                         dependency,
                         depth + 1,
                         values,
+                        base,
                         states,
                         registrations,
                         defaults,
@@ -519,7 +530,7 @@ pub(super) fn resolve_computed(
         }
         let expanded = raw.as_deref().and_then(|raw| {
             if needs_expansion(raw) {
-                expand_variables(raw, values, &mut Vec::new())
+                expand_variables_in(raw, &LayeredCustom { overlay: values, index: &LINEAR_NAMES, base }, &mut Vec::new(), false, MAX_VARIABLE_BYTES)
             } else {
                 Some(raw.to_string())
             }
@@ -533,6 +544,7 @@ pub(super) fn resolve_computed(
                 .and_then(|value| {
                     let (value,_)=typed_numeric::substitute_sibling_functions(value,sibling.0,sibling.1)?;
                     compute_value_with_source(&registration.syntax, &value, context, query, foreground, sources.iter().find(|(name,_)| name==&values[at].0).and_then(|(_,url)|url.as_deref()))
+                        .map(CustomText::from)
                 })
                 .or_else(|| {
                     defaults
@@ -540,7 +552,7 @@ pub(super) fn resolve_computed(
                         .find(|(key, _)| *key == values[at].0)
                         .and_then(|(_, value)| value.clone())
                 }),
-            _ => expanded,
+            _ => expanded.map(CustomText::from),
         };
         states[at] = 2;
         Some(())
@@ -551,6 +563,7 @@ pub(super) fn resolve_computed(
             at,
             0,
             values,
+            base,
             &mut states,
             registrations,
             defaults,

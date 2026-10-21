@@ -740,6 +740,39 @@ mod tests {
     }
 
     #[test]
+    fn viewport_reads_use_the_shared_viewport_without_laying_out() {
+        let mut engine = lumen::Engine::new();
+        let realm = super::super::install(engine.ctx(), "<body><p id=a></p></body>", 128).unwrap();
+        let layouts = Rc::new(std::cell::Cell::new(0u32));
+        let counted = layouts.clone();
+        realm.set_layout_flusher(Rc::new(move |session| {
+            counted.set(counted.get() + 1);
+            session.display_list(30, 30, &NoText).map(|_| ()).map_err(|error| format!("{error:?}"))
+        }));
+        let viewport = Rc::new(std::cell::Cell::new((30u32, 30u32)));
+        realm.set_viewport_source(viewport.clone());
+        let read = |engine: &mut lumen::Engine, script: &str| match engine.eval_value(script) {
+            Ok(Ok(Value::Bool(true))) => (),
+            _ => panic!("viewport script failed: {script}"),
+        };
+        read(&mut engine, "window.innerWidth === 30 && window.innerHeight === 30 && visualViewport.width === 30");
+        assert_eq!(layouts.get(), 0, "viewport reads must not lay out");
+        read(&mut engine, "document.getElementById('a').setAttribute('title', 'changed'); window.innerWidth === 30");
+        assert_eq!(layouts.get(), 0, "a dirty document does not force layout for innerWidth");
+        read(&mut engine, "document.getElementById('a').scrollTop === 0 && document.getElementById('a').scrollLeft === 0 && window.scrollY === 0 && window.scrollX === 0");
+        assert_eq!(layouts.get(), 0, "scroll offsets resting at the origin do not force layout");
+        viewport.set((60, 45));
+        read(&mut engine, "window.innerWidth === 60 && window.innerHeight === 45");
+        assert_eq!(layouts.get(), 0);
+        read(&mut engine, "document.getElementById('a').getBoundingClientRect().width > 0");
+        assert!(layouts.get() >= 1, "geometry reads still lay out");
+        let before = layouts.get();
+        realm.set_layout_flusher(Rc::new(|session| session.display_list(70, 50, &NoText).map(|_| ()).map_err(|error| format!("{error:?}"))));
+        read(&mut engine, "window.innerWidth === 70");
+        assert_eq!(before, layouts.get());
+    }
+
+    #[test]
     fn document_point_queries_use_live_layout_pointer_events_and_root_fallback() {
         let mut engine = lumen::Engine::new();
         let realm = super::super::install(engine.ctx(), "<style>body{margin:0}#outer{width:20px;height:20px}#inner{width:5px;height:5px}</style><div id=outer><div id=inner></div></div>", 128).unwrap();

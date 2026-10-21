@@ -158,6 +158,9 @@ impl DomWindow {
         {
             return Ok((0, 0));
         }
+        if let Some(size) = realm.settled_viewport() {
+            return Ok(size);
+        }
         realm.flush_layout()?;
         let size = realm.session.borrow().viewport_size().unwrap_or((0, 0));
         Ok(size)

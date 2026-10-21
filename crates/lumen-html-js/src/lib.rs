@@ -845,6 +845,9 @@ pub struct DomRealm {
     module_activations: RefCell<VecDeque<PendingScriptActivation>>,
     dataset_intrinsics: RefCell<Option<dataset::ProxyIntrinsics>>,
     layout_flusher: RefCell<Option<LayoutFlusher>>,
+    /// The embedder's current layout viewport, when it shares one: reading
+    /// the viewport size then needs no layout.
+    viewport_source: RefCell<Option<Rc<Cell<(u32,u32)>>>>,
     device_pixel_ratio: Cell<f64>,
     font_loading: font_loading::FontLoading,
     font_preloads: font_preload::State,
@@ -1584,6 +1587,10 @@ impl DomRealm {
     /// The fallback base URL, before any HTML `<base href>` element applies.
     fn fallback_base_url(&self) -> String {
         let document_url = self.document_url().unwrap_or_else(|| "about:blank".into());
+        let head = document_url.trim_start_matches(|c: char| c <= ' ');
+        if !head.get(..6).is_some_and(|scheme| scheme.eq_ignore_ascii_case("about:")) {
+            return document_url;
+        }
         let Some(parsed) = lumen_common::url::parse(&document_url, None).ok() else {
             return document_url;
         };
@@ -2550,6 +2557,15 @@ impl DomRealm {
         callback: Rc<dyn Fn(&mut RenderSession) -> Result<(), String>>,
     ) {
         *self.layout_flusher.borrow_mut() = Some(LayoutFlusher::Direct(callback));
+        *self.viewport_source.borrow_mut() = None;
+    }
+
+    /// Share the viewport the layout flusher lays out at, so `innerWidth` and
+    /// the other viewport reads answer without laying out (Blink reads the
+    /// frame view's size the same way). Call after `set_layout_flusher`,
+    /// which forgets any earlier source.
+    pub fn set_viewport_source(&self, viewport: Rc<Cell<(u32,u32)>>) {
+        *self.viewport_source.borrow_mut() = Some(viewport);
     }
 
     /// Prepare owner geometry before acquiring this document's render session.
@@ -3112,6 +3128,15 @@ impl DomRealm {
     }
 
     fn flush_layout_frame(&self)->OpResult<()> {self.flush_layout_frame_mode(true)}
+
+    /// The viewport of this document's own frame when the embedder shares it
+    /// and it does not depend on an owner document's layout. `None` when a
+    /// layout is needed to learn it.
+    pub(crate) fn settled_viewport(&self)->Option<(u32,u32)> {
+        if !matches!(&*self.layout_flusher.borrow(),Some(LayoutFlusher::Direct(_))) {return None;}
+        let (width,height)=self.viewport_source.borrow().as_ref()?.get();
+        (width!=0&&height!=0).then_some((width,height))
+    }
 
     fn flush_layout_frame_mode(&self,forced:bool)->OpResult<()> {
         let callback = self.layout_flusher.borrow().clone();
@@ -6352,6 +6377,9 @@ custom_elements::bind_element_aria! {
 
     #[getter]
     fn scroll_left(&self) -> OpResult<f64> {
+        if scrolling::rests_at_scroll_origin(&self.base.realm, self.base.id) {
+            return Ok(0.0);
+        }
         let Some(node) = scrolling::element_scroll_target(
             &self.base.realm,
             self.base.id,
@@ -6365,6 +6393,9 @@ custom_elements::bind_element_aria! {
 
     #[getter]
     fn scroll_top(&self) -> OpResult<f64> {
+        if scrolling::rests_at_scroll_origin(&self.base.realm, self.base.id) {
+            return Ok(0.0);
+        }
         let Some(node) = scrolling::element_scroll_target(
             &self.base.realm,
             self.base.id,
@@ -13453,6 +13484,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             module_activations: RefCell::new(VecDeque::new()),
             dataset_intrinsics: RefCell::new(None),
             layout_flusher: RefCell::new(None),
+            viewport_source: RefCell::new(None),
             device_pixel_ratio: Cell::new(1.0),
             cookie_host: RefCell::new(None),
             cookie_source_url: RefCell::new(None),

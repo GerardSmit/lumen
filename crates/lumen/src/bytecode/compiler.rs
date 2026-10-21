@@ -355,11 +355,13 @@ impl CaptureScan {
         }
         self.declare_lexicals(&body, &mut names);
         self.push_scope(names);
-        // Parameter defaults evaluate in the function scope.
+        // Parameter defaults, and the defaults and computed keys inside destructured
+        // parameters, evaluate in the function scope.
         for p in &func.params {
             if let Some(d) = &p.default {
                 self.expr(d)?;
             }
+            self.pat_decl_exprs(&p.pattern)?;
         }
         for s in body.iter() {
             self.stmt(s)?;

@@ -1538,6 +1538,12 @@ pub struct DomCollectionIterator {
     index: Cell<usize>,
 }
 
+impl DomCollectionIterator {
+    pub(crate) fn over(collection: Value) -> Self {
+        Self { collection, index: Cell::new(0) }
+    }
+}
+
 #[lumen_bind::methods]
 impl DomCollectionIterator {
     #[proto(iter)]

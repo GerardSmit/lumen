@@ -1692,6 +1692,11 @@ struct IntrinsicProvenance {
     /// Viewport axes read: bit 0 width, bit 1 height.
     axes: u8,
     context: Option<IntrinsicContext>,
+    /// Loading images the measurement ran around, and the resolver generation
+    /// they were last known to be loading at. The entry is reused while they
+    /// all still load, like a retained fragment (`pending_images`).
+    pending: Option<Arc<[(PendingLookup, bool)]>>,
+    pending_generation: u64,
 }
 
 /// A rectangle's size at the origin: intrinsic sizes resolve against the size
@@ -1769,15 +1774,18 @@ pub(crate) struct RetainedLayoutCache {
     clock: u64,
     hits: usize,
     misses: usize,
+    /// Misses of the frame by what differed: no fragment, its constraints,
+    /// its style, its parent style, its position.
+    miss_reasons: [usize; 5],
     /// Boxes laid out since `begin_frame`, other than retained replays.
     laid_out: usize,
     clears: u64,
     /// Counter and quote values of the last layout; the next layout drops
     /// what depended on the values that changed since.
     generated: Option<(Vec<CounterNodeValues>, Vec<QuoteNodePosition>)>,
-    /// `generated` still holds the quote positions of the current document:
-    /// nothing that can move a quote has changed since it was taken.
-    quotes_current: bool,
+    /// `generated` still holds the counter and quote positions of the current
+    /// document: nothing that can move one has changed since it was taken.
+    generated_current: bool,
     scan: GeneratedScan,
     parent_styles: Vec<Arc<Style>>,
     /// Retained fragments per distinct style (by pointer) with the style's
@@ -1790,7 +1798,7 @@ impl RetainedLayoutCache {
         self.clear_fragments();
         self.intrinsics.clear();
         self.generated = None;
-        self.quotes_current = false;
+        self.generated_current = false;
         self.scan = GeneratedScan::default();
     }
 
@@ -1811,7 +1819,7 @@ impl RetainedLayoutCache {
     /// sizes elsewhere validate themselves by style and constraints, and are
     /// replayed translated when only their position differs.
     pub(crate) fn invalidate_changed(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId], paint: &[NodeId]) {
-        if !layout.is_empty() || !subtrees.is_empty() { self.quotes_current = false; }
+        if !layout.is_empty() || !subtrees.is_empty() { self.generated_current = false; }
         self.note_scan_changes(document, layout, subtrees);
         let mut fragments: BTreeSet<RetainedNodeKey> = BTreeSet::new();
         let mut sizes: BTreeSet<RetainedNodeKey> = BTreeSet::new();
@@ -1904,7 +1912,7 @@ impl RetainedLayoutCache {
                 snapshot_quotes.extend_from_slice(quotes);
                 (snapshot_counters, snapshot_quotes)
             });
-        self.quotes_current = self.generated.is_some();
+        self.generated_current = self.generated.is_some();
     }
 
     pub(crate) fn clear_count(&self) -> u64 {
@@ -1923,13 +1931,13 @@ impl RetainedLayoutCache {
     /// Drop the retained fragments for a viewport size change. Intrinsic
     /// sizes stay unless they read a changed viewport axis.
     pub(crate) fn clear_for_resize(&mut self, width_changed: bool, height_changed: bool) {
-        self.quotes_current = false;
+        self.generated_current = false;
         self.clear_fragments();
         self.intrinsics.retain_for_resize(width_changed, height_changed);
     }
 
     pub(crate) fn clear_intrinsics(&mut self) {
-        self.quotes_current = false;
+        self.generated_current = false;
         self.intrinsics.clear();
     }
 
@@ -1943,11 +1951,17 @@ impl RetainedLayoutCache {
         self.bytes = 0;
         self.hits = 0;
         self.misses = 0;
+        self.miss_reasons = [0; 5];
+    }
+
+    pub(crate) fn miss_reasons(&self) -> [usize; 5] {
+        self.miss_reasons
     }
 
     pub(crate) fn begin_frame(&mut self) {
         self.hits = 0;
         self.misses = 0;
+        self.miss_reasons = [0; 5];
         self.laid_out = 0;
         self.clock = self.clock.saturating_add(1);
         self.intrinsics.begin_frame();
@@ -1966,7 +1980,7 @@ impl RetainedLayoutCache {
     /// every ancestor of a text-bearing fragment because ancestors replay
     /// their descendants' commands.
     pub(crate) fn invalidate_fonts(&mut self) {
-        self.quotes_current = false;
+        self.generated_current = false;
         self.intrinsics.clear();
         if !self.entries.iter().any(|entry| entry.has_text) {
             return;
@@ -1976,7 +1990,7 @@ impl RetainedLayoutCache {
     }
 
     pub(crate) fn invalidate_text_targets(&mut self, document: &Document, targets: &[NodeId]) {
-        self.quotes_current = false;
+        self.generated_current = false;
         self.intrinsics.clear();
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
@@ -1988,7 +2002,7 @@ impl RetainedLayoutCache {
     }
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
-        self.quotes_current = false;
+        self.generated_current = false;
         self.intrinsics.clear();
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
@@ -2011,9 +2025,14 @@ impl RetainedLayoutCache {
         at: (f32, f32),
     ) -> Option<(Rc<RetainedFragment>, (f32, f32))> {
         self.clock = self.clock.saturating_add(1);
+        let mut reason = 0;
         if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
             let entry = &self.entries[slot];
-            if entry.key == *key && *entry.style == *style && *entry.parent_style == *parent_style {
+            reason = if entry.key != *key { 1 }
+                else if *entry.style != *style { 2 }
+                else if *entry.parent_style != *parent_style { 3 }
+                else { 4 };
+            if reason == 4 {
                 if let Some(shift) = entry.shift_to(at, key.cull) {
                     entry.last_used.set(self.clock);
                     self.hits = self.hits.saturating_add(1);
@@ -2022,6 +2041,7 @@ impl RetainedLayoutCache {
             }
         }
         self.misses = self.misses.saturating_add(1);
+        self.miss_reasons[reason] = self.miss_reasons[reason].saturating_add(1);
         None
     }
 
@@ -3260,6 +3280,7 @@ pub(crate) fn stylesheets_with_sources(
         &[],
         &[],
         None,
+        &css::StylesheetParseCache::default(),
     )
 }
 
@@ -3274,6 +3295,7 @@ pub(crate) fn stylesheets_with_source_topologies(
     cssom_texts: &[CssomStylesheetText],
     disabled_sheets:&[NodeId],
     preferred_set:Option<&str>,
+    parse_cache: &css::StylesheetParseCache,
 ) -> Result<(StyleIndex, Vec<css::FontFaceRule>), LayoutError> {
     let parse_local = |owner, text: &str| {
         let boundaries = topologies
@@ -3285,7 +3307,7 @@ pub(crate) fn stylesheets_with_source_topologies(
                     && entry.source_url.is_none()
             })
             .map_or(&[][..], |entry| entry.boundaries.as_ref());
-        css::parse_stylesheet_with_boundaries(text, boundaries).map_err(LayoutError::Css)
+        parse_cache.parse_text(text, boundaries).map_err(LayoutError::Css)
     };
     let parse_inline_owner=|id:NodeId,document_scope:bool|->Result<Option<css::ParsedStylesheets>,LayoutError> {
         if disabled_sheets.contains(&id) {return Ok(None);}
@@ -3298,7 +3320,7 @@ pub(crate) fn stylesheets_with_source_topologies(
         let StylesheetIdentity::Inline(authored)=&identity else {return Ok(None);};
         if !document.inline_stylesheet_allowed(id,authored) {return Ok(None);}
         let mut parsed=if let Some(source)=sources.iter().find(|source|source.owner==id && source.identity==identity) {
-            css::parse_graph_with_topology(&source.source,environment,css::StylesheetIdentity::Dom(id),topologies).map_err(LayoutError::Css)?
+            parse_cache.parse_graph(&source.source,environment,Some(css::StylesheetIdentity::Dom(id)),topologies).map_err(LayoutError::Css)?
         }else {
             let effective=cssom_texts.iter().find(|entry|entry.owner==id && entry.identity==identity).map_or(authored.as_str(),|entry|entry.text.as_ref());
             parse_local(css::StylesheetIdentity::Dom(id),effective)?
@@ -3339,10 +3361,10 @@ pub(crate) fn stylesheets_with_source_topologies(
                                     ))
                                 && source.source.text.as_ref() == text
                         }) {
-                            css::parse_graph_with_topology(
+                            parse_cache.parse_graph(
                                 &source.source,
                                 environment,
-                                css::StylesheetIdentity::Dom(id),
+                                Some(css::StylesheetIdentity::Dom(id)),
                                 topologies,
                             )
                             .map_err(LayoutError::Css)?
@@ -3379,7 +3401,7 @@ pub(crate) fn stylesheets_with_source_topologies(
                     })?;
                     if instruction.as_ref().is_some_and(|instruction|instruction.css_supported()
                         && matches!(&loaded.identity,StylesheetIdentity::Link(href) if instruction.href()==Some(href.as_str()))) {
-                        let mut parsed=css::parse_graph_with_topology(&loaded.source,environment,css::StylesheetIdentity::Dom(id),topologies).map_err(LayoutError::Css)?;
+                        let mut parsed=parse_cache.parse_graph(&loaded.source,environment,Some(css::StylesheetIdentity::Dom(id)),topologies).map_err(LayoutError::Css)?;
                         if let Some(metadata)=&loaded.metadata {
                             append_stylesheet_media(&mut parsed,&metadata.media.borrow());
                         }
@@ -3484,7 +3506,7 @@ pub(crate) fn stylesheets_with_source_topologies(
             let text=&source.text;
             let owner=css::StylesheetIdentity::Adopted{scope:*scope,index};
             let mut parsed=if let Some(url)=&source.base_url {
-                css::parse_graph_with_topology(&css::StylesheetSource{disabled:false, url:url.clone(),text:Arc::from(text.as_str()),imports:Vec::new()},environment,owner,topologies).map_err(LayoutError::Css)?
+                parse_cache.parse_graph(&css::StylesheetSource{disabled:false, url:url.clone(),text:Arc::from(text.as_str()),imports:Vec::new()},environment,Some(owner),topologies).map_err(LayoutError::Css)?
             } else {parse_local(owner,text)?};
             if !source.media.is_empty() {
                 for rule in &mut parsed.rules {let mut media=rule.media.to_vec();media.push(source.media.clone());rule.media=media.into();}
@@ -4421,7 +4443,7 @@ impl Layout<'_> {
 
     fn prepare_quote_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
         if let Some((_, quotes)) = self.retained_fragments.as_deref()
-            .filter(|cache| cache.quotes_current).and_then(|cache| cache.generated.as_ref()) {
+            .filter(|cache| cache.generated_current).and_then(|cache| cache.generated.as_ref()) {
             self.quote_positions = Cow::Owned(quotes.clone());
             return Ok(());
         }
@@ -4451,6 +4473,11 @@ impl Layout<'_> {
     }
 
     fn prepare_counter_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
+        if let Some((counters, _)) = self.retained_fragments.as_deref()
+            .filter(|cache| cache.generated_current).and_then(|cache| cache.generated.as_ref()) {
+            self.counter_positions = Cow::Owned(counters.clone());
+            return Ok(());
+        }
         if !self.rules.has_counter_data()
             && !self.rules.has_list_item_data()
             && !self.document_has_list_items(root)?
@@ -8471,12 +8498,12 @@ fn collect_quote_positions(
     {
         return Ok(());
     }
-    // Without quote content in any rule, only the user agent's own `q`
-    // generated content can carry quotes.
-    let generates_quotes = rules.has_quote_content() || matches!(
+    // Only an element a rule with quote content matches, or the user agent's
+    // own `q` generated content, can carry quotes.
+    let generates_quotes = is_element && (matches!(
         kind,
         NodeKind::Element { name, namespace: Namespace::Html, .. } if crate::svg::local_name(name) == "q"
-    );
+    ) || (rules.has_quote_content() && rules.may_generate_quotes(document, node)));
     let outer_quote_depth = style.as_ref().filter(|style| style_contains_generated_effects(style)).map(|_| *quote_depth);
     let language = if is_element {
         quote_language(document, node)?.or_else(|| parent_language.cloned())
@@ -8489,7 +8516,7 @@ fn collect_quote_positions(
     );
     let mut has_quotes = false;
     let mut marker_quote_depth = *quote_depth;
-    if let Some(style) = style.as_ref().filter(|_| generates_quotes) {
+    if let Some(style) = style.as_ref().filter(|style| generates_quotes && style.is_list_item()) {
         let generated = rules
             .compute_pseudo_cached(
                 document,
@@ -9008,7 +9035,7 @@ fn collect_counter_positions(
     let contained = style.as_ref().is_some_and(style_contains_generated_effects);
     let child_floor = if contained { active.len() } else { mutation_floor };
     let mut marker = None;
-    if let Some(style) = style.as_ref() {
+    if let Some(style) = style.as_ref().filter(|style| style.is_list_item()) {
         let generated = rules
             .compute_pseudo_cached(
                 document,
@@ -9034,7 +9061,9 @@ fn collect_counter_positions(
     }
     let mut before = None;
     let mut before_marker = None;
-    if let Some(style) = style.as_ref() {
+    // `::before` and `::after` carry counter state only when a rule matching
+    // the element declares counters or a list-item display for them.
+    if let Some(style) = style.as_ref().filter(|_| rules.may_have_counter_pseudo(document, node, css::PseudoElement::Before)) {
         let generated = rules
             .compute_pseudo_cached(
                 document,
@@ -9095,7 +9124,7 @@ fn collect_counter_positions(
 
     let mut after = None;
     let mut after_marker = None;
-    if let Some(style) = style.as_ref() {
+    if let Some(style) = style.as_ref().filter(|_| rules.may_have_counter_pseudo(document, node, css::PseudoElement::After)) {
         let generated = rules
             .compute_pseudo_cached(document, node, style, css::PseudoElement::After, Some(text), &mut style_cache.borrow_mut())
             .map_err(LayoutError::Css)?
@@ -11604,14 +11633,13 @@ fn grid_track_sizes(
 
     // Growth limits start at the resolved base. Intrinsic maximum functions
     // then absorb max-content (or min-content for min-content maxima) span
-    // constraints, while fixed and fit-content maxima remain hard ceilings.
+    // constraints, while fixed maxima are growth limits from the start. A
+    // fit-content track starts like an auto track and is capped by its limit
+    // (CSS Grid §12.4, §12.5), so free space never grows it past its content.
     let mut growth_limits = sizes;
     for index in 0..count {
         let track = definitions.get(index).copied().unwrap_or(T::Auto);
         if let Some(cap) = fixed(track.maximum()) {
-            growth_limits[index] = cap.max(sizes[index]);
-        }
-        if let Some(cap) = fit_cap(track) {
             growth_limits[index] = cap.max(sizes[index]);
         }
     }
@@ -20008,6 +20036,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         };
         let mut provenance = intrinsics.provenance.borrow_mut();
         let entry = provenance.get_mut(slot)?;
+        if let Some(pending) = entry.pending.as_deref() {
+            let images = self.images?;
+            let generation = images.generation();
+            if !(generation != 0 && generation == entry.pending_generation)
+                && !pending.iter().all(|(lookup, _)| images.still_pending(lookup)) {
+                return None;
+            }
+        }
         if entry.frame != intrinsics.frame.get() {
             let current = self.intrinsic_context();
             let same = match (&entry.context, &current) {
@@ -20016,6 +20052,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             if !same { return None; }
             entry.frame = intrinsics.frame.get();
+        }
+        if let (Some(pending), Some(images)) = (entry.pending.as_deref(), self.images) {
+            images.replay_pending(pending);
         }
         intrinsics.viewport_read((), entry.axes);
         intrinsics.reused.set(intrinsics.reused.get().saturating_add(1));
@@ -20066,7 +20105,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
         }
         if css::viewport_read_counts() != mark.css { axes = 3; }
-        let unchanged_images = self.images.map(|images| images.pending_mark()) == mark.pending;
+        let pending = match (self.images, mark.pending) {
+            (Some(images), Some(since)) if images.pending_mark() != since => {
+                let mut distinct: Vec<(PendingLookup, bool)> = Vec::new();
+                for entry in images.pending_since(since) {
+                    if !distinct.contains(&entry) { distinct.push(entry); }
+                }
+                (!distinct.is_empty()).then(|| (Arc::<[(PendingLookup, bool)]>::from(distinct), images.generation()))
+            }
+            _ => None,
+        };
         let mut cache = intrinsics.sizes.borrow_mut();
         if cache.len() <= slot { cache.resize_with(slot + 1, || None); }
         let previous = cache[slot].replace((style.clone(), size));
@@ -20078,7 +20126,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let previous_provenance = core::mem::replace(&mut provenance[slot], IntrinsicProvenance {
             frame: intrinsics.frame.get(),
             axes,
-            context: mark.context.clone().filter(|_| unchanged_images),
+            context: mark.context.clone(),
+            pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+            pending: pending.map(|(lookups, _)| lookups),
         });
         let mut others = intrinsics.others.borrow_mut();
         if let Some(ways) = others.get_mut(slot) {
@@ -31896,6 +31946,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let mut markers=Vec::new();markers.try_reserve(self.overflow_lines.len()).map_err(|_|LayoutError::CommandLimit)?;
         markers.extend(self.overflow_lines.iter().map(|line|line.marker));markers.sort_unstable();
         if let Some(geometry)=self.geometry.as_mut(){geometry.scroll_regions.retain(|region|{
+            // Viewport-anchored records hold no scrolled overflow line.
+            if region.anchor.is_some() {return true;}
             let index=markers.partition_point(|marker|*marker<region.commands.start);
             markers.get(index).is_none_or(|marker|*marker>=region.commands.end)
         });}
@@ -33674,22 +33726,35 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     }
 
     fn transparent_stacking_parts(entry:StackingEscape,children:&[StackingEscape])->Result<Vec<StackingEscape>,LayoutError> {
-        let mut parts=Vec::new();let(mut command,mut hit)=(entry.2,entry.4);
-        let mut append=|command:usize,hit:usize,end_command:usize,end_hit:usize|->Result<(),LayoutError>{
-            if command<end_command || hit<end_hit {
-                if parts.len()==MAX_DISPLAY_COMMANDS {return Err(LayoutError::CommandLimit);}
-                parts.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                let mut part=entry;(part.2,part.3,part.4,part.5)=(command,end_command,hit,end_hit);parts.push(part);
-            }Ok(())
-        };
         // Only outermost child intervals are removed: nested auto wrappers
         // own no context and can contain another independently queued box.
-        for child in children.iter().filter(|_|entry.9) {
-            if child.2<command || child.4<hit {continue;}
-            append(command,hit,child.2,child.4)?;
-            command=child.3;hit=child.5;
+        // Commands and hits are cut independently: raised flow chunks can
+        // order sibling escapes differently in the two streams, and a child
+        // skipped in one stream would leave its range inside the parent's.
+        let gaps=|start:usize,end:usize,bounds:&dyn Fn(&StackingEscape)->(usize,usize)|->Result<Vec<Range<usize>>,LayoutError>{
+            let mut cuts=Vec::new();cuts.try_reserve(children.len()).map_err(|_|LayoutError::CommandLimit)?;
+            cuts.extend(children.iter().filter(|_|entry.9).map(bounds));cuts.sort_unstable();
+            let mut output=Vec::new();output.try_reserve(cuts.len()+1).map_err(|_|LayoutError::CommandLimit)?;
+            let mut cursor=start;
+            for (from,to) in cuts {
+                if from<cursor {continue;}
+                if cursor<from {output.push(cursor..from);}
+                cursor=to;
+            }
+            if cursor<end {output.push(cursor..end);}
+            Ok(output)
+        };
+        let commands=gaps(entry.2,entry.3,&|child|(child.2,child.3))?;
+        let hits=gaps(entry.4,entry.5,&|child|(child.4,child.5))?;
+        let count=commands.len().max(hits.len());
+        if count>MAX_DISPLAY_COMMANDS {return Err(LayoutError::CommandLimit);}
+        let mut parts=Vec::new();parts.try_reserve(count).map_err(|_|LayoutError::CommandLimit)?;
+        // Padding sits empty at the parent's end, so parts still sort, and
+        // so move, in stream order on both sides.
+        for at in 0..count {
+            let command=commands.get(at).cloned().unwrap_or(entry.3..entry.3);let hit=hits.get(at).cloned().unwrap_or(entry.5..entry.5);
+            let mut part=entry;(part.2,part.3,part.4,part.5)=(command.start,command.end,hit.start,hit.end);parts.push(part);
         }
-        append(command,hit,entry.3,entry.5)?;
         Ok(parts)
     }
 
@@ -40334,6 +40399,35 @@ fn laid_out_display_list(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn transparent_stacking_parts_cut_command_and_hit_streams_independently(){
+        let document=crate::html::parse("<div></div>",8).unwrap();
+        let id=(document.root(),None);
+        let escape=|commands:Range<usize>,hits:Range<usize>,order:u64,transparent:bool|(0usize,0usize,commands.start,commands.end,hits.start,hits.end,0i32,id,order,transparent);
+        let entry=escape(0..20,0..50,1,true);
+        let first=escape(5..8,30..40,2,true);
+        let second=escape(10..15,10..25,3,true);
+        let parts=Layout::transparent_stacking_parts(entry,&[first,second]).unwrap();
+        let overlaps=|a:Range<usize>,b:Range<usize>|a.start<b.end && b.start<a.end;
+        for part in &parts {
+            for child in [first,second] {
+                assert!(!overlaps(part.2..part.3,child.2..child.3),"command part {:?} overlaps child {:?}",(part.2,part.3),(child.2,child.3));
+                assert!(!overlaps(part.4..part.5,child.4..child.5),"hit part {:?} overlaps child {:?}",(part.4,part.5),(child.4,child.5));
+            }
+        }
+        let covered=|parts:&[(usize,usize)],children:[(usize,usize);2],total:usize|{
+            let mut seen=alloc::vec![0u8;total];
+            for (from,to) in parts.iter().copied().chain(children) {for slot in &mut seen[from..to] {*slot+=1;}}
+            seen.iter().all(|count|*count==1)
+        };
+        let commands:Vec<_>=parts.iter().map(|part|(part.2,part.3)).collect();
+        let hits:Vec<_>=parts.iter().map(|part|(part.4,part.5)).collect();
+        assert!(covered(&commands,[(5,8),(10,15)],20),"commands {commands:?}");
+        assert!(covered(&hits,[(30,40),(10,25)],50),"hits {hits:?}");
+        assert!(parts.iter().all(|part|part.8==1 && part.9));
+        let opaque=Layout::transparent_stacking_parts(escape(0..20,0..50,1,false),&[first,second]).unwrap();
+        assert_eq!(opaque.iter().map(|part|(part.2,part.3,part.4,part.5)).collect::<Vec<_>>(),alloc::vec![(0,20,0,50)]);
+    }
+    #[test]
     fn specification_individual_transform_used_eligibility_for_inline_boxes(){
         let document=crate::html::parse("<style>html,body{margin:0}span{scale:2}</style><span>x</span>",64).unwrap();
         let list=display_list(&document,200,100,&FixedText).unwrap();
@@ -42033,18 +42127,18 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
-    fn display_list_rejects_referenced_image_payload_over_the_byte_budget() {
-        let document = crate::html::parse("<img src='large.png'>", 32).unwrap();
+    fn display_list_references_decoded_images_without_charging_their_pixels() {
+        // The image source owns and budgets decoded pixels; a list naming the
+        // same 16 MiB bitmap twice still fits the display-list byte budget.
+        let document = crate::html::parse("<style>img{width:10px;height:10px}</style><img src='large.png'><img src='large.png'>", 64).unwrap();
         let image = Arc::new(ImageData {
             width: 2048,
             height: 2048,
             pixels: alloc::vec![0; 16 * 1024 * 1024],
         });
         let images = |_: &str| ImageState::Ready(image.clone());
-        assert_eq!(
-            display_list_with_images(&document, 100, 100, &FixedText, &images),
-            Err(LayoutError::CommandLimit)
-        );
+        let list = display_list_with_images(&document, 100, 100, &FixedText, &images).unwrap();
+        assert_eq!(list.0.iter().filter(|command| matches!(command, Command::Image { image: painted, .. } if Arc::ptr_eq(painted, &image))).count(), 2);
     }
 
     #[test]
@@ -44835,6 +44929,15 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn grid_fit_content_track_with_free_space_stops_at_its_content() {
+        let narrow = "<div style='width:50px;height:10px;background:red'></div>";
+        assert_eq!(
+            grid_column_extents("fit-content(300px) 100px", "width:800px;", narrow, 900),
+            [(0.0, 50.0), (0.0, 50.0), (50.0, 100.0)]
+        );
+    }
+
+    #[test]
     fn grid_fit_content_track_keeps_the_content_minimum_above_its_limit() {
         assert_eq!(
             grid_column_extents("fit-content(300px) 100px", "width:800px;", WIDE_CHILD, 900),
@@ -44870,8 +44973,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         for (name, rows, extra, item, expected) in [
             ("minmax", "grid-auto-rows:minmax(auto,40px);", "", tall, [(0.0, 40.0), (40.0, 40.0)]),
             ("minmax wrap", "grid-auto-rows:minmax(auto,40px);", "", wrap, [(0.0, 40.0), (40.0, 40.0)]),
-            ("fit-content", "grid-template-rows:fit-content(25px) fit-content(100px);", "", tall, [(0.0, 70.0), (70.0, 100.0)]),
-            ("fit-content wrap", "grid-template-rows:fit-content(25px) auto;", "", wrap, [(0.0, 25.0), (25.0, 10.0)]),
+            ("fit-content", "grid-template-rows:fit-content(25px) fit-content(100px);", "", tall, [(0.0, 70.0), (70.0, 10.0)]),
+            ("fit-content wrap", "grid-template-rows:fit-content(25px) auto;", "", wrap, [(0.0, 10.0), (10.0, 10.0)]),
             ("wrap auto", "", "", wrap, [(0.0, 10.0), (10.0, 10.0)]),
             ("auto tall", "", "", tall, [(0.0, 70.0), (70.0, 10.0)]),
             ("scroll", "", "", scroll, [(0.0, 70.0), (70.0, 10.0)]),
@@ -53830,6 +53933,56 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         assert_eq!(shaped.concat(), "7", "shapes: {shaped:?}");
     }
 
+    fn counter_walk_pseudo_cascades(style: &str, body: &str) -> (usize, usize) {
+        let markup = alloc::format!("<style>{style}</style><body>{body}</body>");
+        let document = crate::html::parse(&markup, 4096).unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let html = crate::selector::query_selector(&document, document.root(), "html").unwrap().unwrap();
+        let text = RecordingText::default();
+        let styles = core::cell::RefCell::new(css::StyleCache::default());
+        let uses = core::cell::Cell::new(0);
+        let mut layout = Layout::new(&document, &text, &uses, &rules, None,
+            Rect { x: 0.0, y: 0.0, width: 120.0, height: 200.0 }, None, &[], &styles, None);
+        let before = rules.pseudo_cascades();
+        layout.prepare_counter_positions(html).unwrap();
+        (rules.pseudo_cascades() - before, layout.counter_positions.len())
+    }
+
+    #[test]
+    fn counter_walk_computes_no_pseudo_styles_without_counter_rules() {
+        let body = "<div><p>a</p><p>b</p></div>".repeat(150);
+        let (cascades, positions) = counter_walk_pseudo_cascades(
+            "li{list-style:square}p::before{content:'x'}div::after{content:'y';color:red}", &body);
+        assert_eq!((cascades, positions), (0, 0), "generated content without counters is not the walk's business");
+        let (cascades, positions) = counter_walk_pseudo_cascades(
+            "li{list-style:square}p::before{content:'x'}div::after{content:'y'}div{counter-reset:c}", &body);
+        assert_eq!((cascades, positions), (0, 0), "counter operations on elements need no pseudo styles");
+        let (cascades, positions) = counter_walk_pseudo_cascades(
+            "div{counter-reset:c}p::before{counter-increment:c;content:counter(c)}", &body);
+        assert!(cascades > 0 && positions > 0, "counter pseudos are computed: {cascades} {positions}");
+        let (cascades, _) = counter_walk_pseudo_cascades(
+            "p.n::before{counter-increment:c;content:counter(c)}", &body);
+        assert_eq!(cascades, 0, "no element matches the only counter rule");
+    }
+
+    #[test]
+    fn counters_in_pseudos_survive_unrelated_pseudo_rules() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}body{counter-reset:c}p::before{content:'x'}.n::before{counter-increment:c;content:counter(c)}</style><div class=n></div><p></p><div class=n></div>");
+        let mut runs: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| !run.is_empty()).collect();
+        runs.sort_unstable();
+        assert_eq!(runs, ["1", "2", "x"], "{shaped:?}");
+    }
+
+    #[test]
+    fn nested_lists_number_independently() {
+        let shaped = painted_text_runs(
+            "<style>body,ol{margin:0}ol{padding-left:24px}</style><ol><li>a<ol><li>b</li><li>c</li></ol></li><li>d</li></ol>");
+        let mut markers: Vec<&str> = shaped.iter().map(String::as_str).filter(|run| run.ends_with('.')).collect();
+        markers.sort_unstable();
+        assert_eq!(markers, ["1.", "1.", "2.", "2."], "{shaped:?}");
+    }
+
     #[test]
     fn display_contents_inline_descendants_join_the_parent_paragraph() {
         let document = crate::html::parse(
@@ -56600,7 +56753,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             sizes.sizes.borrow_mut().push(Some((Style::initial(), (slot as f32, 1.0))));
             sizes.margins.borrow_mut().push(None);
             sizes.provenance.borrow_mut().push(IntrinsicProvenance {
-                frame: 100 - slot as u32, axes: 0, context: None });
+                frame: 100 - slot as u32, axes: 0, context: None, ..Default::default() });
         }
         sizes.retain_newest(4);
         let kept: Vec<usize> = sizes.sizes.borrow().iter().enumerate()
