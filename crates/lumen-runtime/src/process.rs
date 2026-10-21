@@ -50,14 +50,11 @@ pub(crate) fn install_data_props(
         _ => unreachable!("install() defined the process namespace"),
     };
 
+    // An embedder usually forwards its own OS environment, so its vars carry the same hidden
+    // Windows entries and get the same filter.
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
-        Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (
-            startup_args().to_vec(),
-            std::env::vars()
-                .filter(|(key, _)| public_environment_key(key))
-                .collect(),
-        ),
+        Some((argv, env)) => (argv.to_vec(), public_environment(env.iter().cloned())),
+        None => (startup_args().to_vec(), public_environment(std::env::vars())),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -122,6 +119,10 @@ fn public_environment_key(key: &str) -> bool {
     !cfg!(windows) || !key.starts_with('=')
 }
 
+fn public_environment(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.filter(|(key, _)| public_environment_key(key)).collect()
+}
+
 #[cfg(test)]
 mod startup_environment_tests {
     #[test]
@@ -129,6 +130,18 @@ mod startup_environment_tests {
         assert!(super::public_environment_key("PATH"));
         assert!(super::public_environment_key("LUMEN_TEST"));
         assert_eq!(super::public_environment_key("=C:"), !cfg!(windows));
+    }
+
+    #[test]
+    fn windows_hidden_entries_from_an_embedder_are_dropped() {
+        let vars = [("=D:", "D:\\work"), ("=ExitCode", "00000000"), ("PATH", "/bin")]
+            .map(|(key, value)| (key.to_string(), value.to_string()));
+        let public = super::public_environment(vars.clone().into_iter());
+        if cfg!(windows) {
+            assert_eq!(public, vec![vars[2].clone()]);
+        } else {
+            assert_eq!(public, vars.to_vec());
+        }
     }
 }
 
