@@ -184,6 +184,9 @@ pub fn concat(a: &str, b: &str) -> String {
 /// high surrogate ending `a` meeting a smuggled low starting `b` — see [`concat`]). Callers
 /// building the result allocation directly must take the slow [`concat`] path when this holds.
 pub fn needs_join_fixup(a: &str, b: &str) -> bool {
+    if b.as_bytes().first() != Some(&0xF4) {
+        return false;
+    }
     match (a.chars().next_back(), b.chars().next()) {
         (Some(last), Some(first)) => smuggled_high(last).is_some() && smuggled_low(first).is_some(),
         _ => false,

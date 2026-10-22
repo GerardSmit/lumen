@@ -6142,6 +6142,11 @@ impl Interp {
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
         let buflen = self.array_buffers.get(&info.buffer)?.len();
+        Self::ta_len_in(info, buflen)
+    }
+
+    /// [`Interp::ta_len`] given the buffer's current byte length.
+    pub(crate) fn ta_len_in(info: &TaInfo, buflen: usize) -> Option<usize> {
         span_len(
             buflen,
             info.offset,

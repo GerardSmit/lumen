@@ -111,8 +111,7 @@ impl NamePath {
         {
             return None;
         }
-        global_value(interp, &interp.global, *shape, *slot)?;
-        Some(*slot)
+        global_data_entry(interp, &interp.global, *shape, *slot).then_some(*slot)
     }
 
     fn read(&self, interp: &Interp, env: &Env) -> Option<Value> {
@@ -253,6 +252,18 @@ fn global_value(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> Option
     }
     let property = object.props.entry_at(slot)?;
     (!property.accessor()).then(|| property.value())
+}
+
+/// [`global_value`] without producing the value: whether `slot` is still a data property of an
+/// ordinary `object` at `shape`.
+fn global_data_entry(interp: &Interp, object: &Gc, shape: u32, slot: usize) -> bool {
+    if !interp.ordinary_get_ptr(Gc::as_ptr(object) as usize) {
+        return false;
+    }
+    let object = object.borrow();
+    matches!(object.exotic, Exotic::None)
+        && object.props.shape() == shape
+        && object.props.entry_at(slot).is_some_and(|p| !p.accessor())
 }
 
 /// Write `value` to the global object's entry `slot` when it is a writable data property of an

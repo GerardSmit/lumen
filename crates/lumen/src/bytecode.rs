@@ -4538,6 +4538,9 @@ impl Chunk {
             if env.try_borrow().ok()?.vars.generation() != ic.gen {
                 return None;
             }
+            if !i.ordinary_get_ptr(Gc::as_ptr(&i.global) as usize) {
+                return None;
+            }
             let g = i.global.try_borrow().ok()?;
             if !matches!(g.exotic, crate::value::Exotic::None)
                 || g.props.shape() != (ic.binding >> 32) as u32

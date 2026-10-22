@@ -1191,9 +1191,6 @@ pub(crate) unsafe extern "C" fn glob_ptr(
     let Some(slot) = slot else {
         return std::ptr::null_mut();
     };
-    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
-        return std::ptr::null_mut();
-    }
     let Ok(mut g) = i.global.try_borrow_mut() else {
         return std::ptr::null_mut();
     };
@@ -3135,8 +3132,10 @@ unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     if !i.shared_buffers.is_empty() && i.shared_buffers.contains_key(&info.buffer) {
         return 0;
     }
-    let Some(len) = i.ta_len(&info) else { return 0 };
     let Some(buf) = i.array_buffers.get(&info.buffer) else {
+        return 0;
+    };
+    let Some(len) = crate::interpreter::Interp::ta_len_in(&info, buf.len()) else {
         return 0;
     };
     if write != 0 && buf.is_readonly() {
@@ -3527,9 +3526,14 @@ pub(crate) unsafe extern "C" fn append_local(f: *mut JitFrame, d: u32, y: *const
         return 0;
     }
     let slots = std::slice::from_raw_parts_mut((*f).slots, chunk.n_slots);
-    // `y` may be another slot: read it before the slots are borrowed mutably.
-    let y = (*y).clone();
-    crate::bytecode::append_to_slot(slots, d, &y) as u32
+    let base = (*f).slots as usize;
+    let span = chunk.n_slots * std::mem::size_of::<Value>();
+    if (y as usize).wrapping_sub(base) < span {
+        // `y` is a slot: read it before the slots are borrowed mutably.
+        let y = (*y).clone();
+        return crate::bytecode::append_to_slot(slots, d, &y) as u32;
+    }
+    crate::bytecode::append_to_slot(slots, d, &*y) as u32
 }
 
 pub(crate) unsafe extern "C" fn elem_get(
