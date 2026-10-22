@@ -43,6 +43,11 @@ fn pins(ctx: &mut Ctx) -> &mut Pins {
     ctx.host_mut::<Pins>().expect("installed above")
 }
 
+/// Whether a connection with listeners is still open and may deliver events.
+pub fn connections_live(ctx: &mut Ctx) -> bool {
+    ctx.host_mut::<Pins>().is_some_and(|pins| !pins.held.is_empty())
+}
+
 /// A key for [`set_pin`].
 pub(crate) fn new_pin_key(ctx: &mut Ctx) -> u64 {
     let pins = pins(ctx);

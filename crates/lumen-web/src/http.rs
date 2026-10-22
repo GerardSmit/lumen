@@ -588,6 +588,34 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+static UNROUTED_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Requests refused so far because the configuration requires routes and none matched the URL's
+/// host and port. A host that supplies a partial set of routes (the static WPT mode) reads it to
+/// tell "the server this test needs is not there" from an engine hang.
+pub(crate) fn unrouted_request_count() -> u64 {
+    UNROUTED_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The configured route for `u`, or an error when the configuration requires routes and none
+/// matches.
+pub(crate) fn resolve_route(
+    config: &crate::FetchConfig,
+    u: &url::Url,
+    port: u16,
+) -> Result<Option<crate::FetchRoute>, String> {
+    let route = config.route_for(u.hostname(), port);
+    if route.is_none() && config.requires_routes() {
+        UNROUTED_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(format!(
+            "no fixture route configured for {}:{}",
+            u.hostname(),
+            port
+        ));
+    }
+    Ok(route)
+}
+
 fn one_request(
     method: &str,
     u: &url::Url,
@@ -601,15 +629,8 @@ fn one_request(
         return Err("fetch: invalid HTTP method".into());
     }
     let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
-    let route = config.route_for(u.hostname(), port);
-    if route.is_none() && config.requires_routes() {
-        return Err(format!(
-            "fetch '{}': no fixture route configured for {}:{}",
-            u.href(),
-            u.hostname(),
-            port
-        ));
-    }
+    let route = resolve_route(config, u, port)
+        .map_err(|error| format!("fetch '{}': {error}", u.href()))?;
     let stream = match route.as_ref() {
         Some(route) => {
             lumen_os::net::connect_socket_addr_cancellable(route.address, TIMEOUT, cancellation)

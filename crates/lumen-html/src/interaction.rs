@@ -63,6 +63,31 @@ impl InteractionSet {
     pub(crate) const fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+/// Bits of the interaction pseudo-classes no element of `document` can match
+/// right now because their anchor is unset. A selector requiring any of them
+/// cannot match.
+pub(crate) fn unmatchable(document: &Document) -> u8 {
+    let state = document.interaction_state();
+    let mut mask = 0;
+    if state.focused.is_none() {
+        mask |= InteractionPseudo::Focus.bit() | InteractionPseudo::FocusWithin.bit();
+    }
+    if state.focus_visible.is_none() {
+        mask |= InteractionPseudo::FocusVisible.bit();
+    }
+    if state.hover.is_none() {
+        mask |= InteractionPseudo::Hover.bit();
+    }
+    if state.active.iter().all(Option::is_none) {
+        mask |= InteractionPseudo::Active.bit();
+    }
+    mask
 }
 
 pub(crate) fn matches(document: &Document, node: NodeId, pseudo: InteractionPseudo) -> bool {

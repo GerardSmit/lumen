@@ -6,6 +6,8 @@ use lumen_common::performance::Timeline;
 use std::cell::RefCell;
 
 const RESOURCE_PUBLISHER: &str = "#lumen_resource_timeline\u{1}publisher";
+const PAINT_ENABLER: &str = "#lumen_paint_timeline\u{1}enable";
+const PAINT_PUBLISHER: &str = "#lumen_paint_timeline\u{1}publisher";
 
 #[lumen_bind::module(name = "__performance_timeline")]
 pub mod bindings {
@@ -15,6 +17,13 @@ pub mod bindings {
     pub fn install_resource_publisher(ctx:&mut Ctx,callback:lumen::embed::JsFunction)->OpResult<()> {
         let global=ctx.global_object();
         ctx.define_native_internal_value_slot(&global,RESOURCE_PUBLISHER,callback.into_value()).map_err(OpError::thrown)
+    }
+
+    #[op]
+    pub fn install_paint_hooks(ctx:&mut Ctx,enable:lumen::embed::JsFunction,publish:lumen::embed::JsFunction)->OpResult<()> {
+        let global=ctx.global_object();
+        ctx.define_native_internal_value_slot(&global,PAINT_ENABLER,enable.into_value()).map_err(OpError::thrown)?;
+        ctx.define_native_internal_value_slot(&global,PAINT_PUBLISHER,publish.into_value()).map_err(OpError::thrown)
     }
 
     #[class(name = "Timeline", hint(js(invalid_this)))]
@@ -92,6 +101,25 @@ pub fn record_resource(ctx:&mut Ctx,name:&str,initiator:&str,start:f64,end:f64,e
     let Some(callback)=ctx.native_private_value_slot(&global,RESOURCE_PUBLISHER) else {return Ok(())};
     let args=[Value::from_string(name.into()),Value::from_string(initiator.into()),Value::Num(start),Value::Num(end),
         Value::Num(encoded as f64),Value::Num(decoded as f64),Value::Bool(timing_allowed)];
+    ctx.invoke(callback,Value::Undefined,&args).map_err(OpError::thrown)?;
+    Ok(())
+}
+
+/// Expose `PerformancePaintTiming` and the `paint` entry type on a Window realm. Realms without
+/// the timeline facade ignore the call.
+pub fn enable_paint(ctx:&mut Ctx)->OpResult<()> {
+    let global=ctx.global_object();
+    let Some(callback)=ctx.native_private_value_slot(&global,PAINT_ENABLER) else {return Ok(())};
+    ctx.invoke(callback,Value::Undefined,&[]).map_err(OpError::thrown)?;
+    Ok(())
+}
+
+/// Publish a `first-paint` or `first-contentful-paint` entry through the realm's original
+/// timeline provider, so author changes to the public performance methods cannot intercept it.
+pub fn record_paint(ctx:&mut Ctx,name:&str,start:f64)->OpResult<()> {
+    let global=ctx.global_object();
+    let Some(callback)=ctx.native_private_value_slot(&global,PAINT_PUBLISHER) else {return Ok(())};
+    let args=[Value::from_string(name.into()),Value::Num(start)];
     ctx.invoke(callback,Value::Undefined,&args).map_err(OpError::thrown)?;
     Ok(())
 }

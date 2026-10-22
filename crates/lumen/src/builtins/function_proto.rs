@@ -228,16 +228,18 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
     if crate::native_ops::dynamic_code_disabled() {
         return Err(i.make_error("EvalError", "dynamic code is not available in an AOT build"));
     }
-    let (params, body) = if args.is_empty() {
-        (String::new(), String::new())
+    let (params, body): (String, crate::lstr::LStr) = if args.is_empty() {
+        (String::new(), crate::lstr::LStr::from(""))
     } else {
         // The parameters are stringified left to right BEFORE the body.
-        let mut ps = Vec::new();
-        for a in &args[..args.len() - 1] {
-            ps.push(ab(i.to_string(a))?.to_string());
+        let mut params = String::new();
+        for (n, a) in args[..args.len() - 1].iter().enumerate() {
+            if n > 0 {
+                params.push(',');
+            }
+            params.push_str(&ab(i.to_string(a))?);
         }
-        let body = ab(i.to_string(args.last().unwrap()))?.to_string();
-        (ps.join(","), body)
+        (params, ab(i.to_string(args.last().unwrap()))?)
     };
     // The parameter text must parse as FormalParameters ON ITS OWN — a "/*" or "//" in it must
     // not be able to swallow the synthesized ") {" (spec: ParseText(P, FormalParameters)).
@@ -246,9 +248,14 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
         crate::parser::parse_script(&probe, false)
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
     }
-    let src = format!("{prefix} anonymous({params}\n) {{\n{body}\n}}");
-    let program = crate::parser::parse_dynamic_function(&src)
-        .map_err(|e| i.make_error("SyntaxError", e.message))?;
+    let src = crate::srctext::Src::dynamic(prefix, &params, body);
+    // The parse over the segmented source reports no error of its own: a failure is re-parsed
+    // over the flat text, so messages and lines are exactly those of a single string.
+    let program = match crate::parser::parse_dynamic_function_shared(src.clone()) {
+        Ok(program) => program,
+        Err(_) => crate::parser::parse_dynamic_function(&src.text())
+            .map_err(|e| i.make_error("SyntaxError", e.message))?,
+    };
     match program.into_iter().next() {
         Some(crate::ast::Stmt::FuncDecl(f)) => {
             // CreateDynamicFunction reports a body that does not parse at creation.

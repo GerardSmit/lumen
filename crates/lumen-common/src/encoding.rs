@@ -1,6 +1,6 @@
 //! Bounded WHATWG streaming byte decoding, independent of a language or OS.
 use alloc::string::String;
-use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoder, Encoding, REPLACEMENT};
+use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoder, EncoderResult, Encoding, REPLACEMENT};
 
 mod html;
 pub use html::prescan_html_encoding;
@@ -99,6 +99,40 @@ impl OutputEncoder {
                     return Err(DecodeError::ResourceLimit);
                 }
                 CoderResult::OutputFull => {}
+            }
+        }
+    }
+}
+
+/// The URL standard's query encoding for a non-UTF-8 document: `text` is encoded with the
+/// label's output encoding, unmappable code points become `%26%23<decimal>%3B`, and the other
+/// bytes are percent-encoded per `escape`. `None` when the label is unknown or UTF-8 applies.
+pub fn percent_encode_query(label: &str, text: &str, escape: impl Fn(u8) -> bool) -> Option<String> {
+    let encoding = Encoding::for_label(label.as_bytes())?.output_encoding();
+    if encoding == encoding_rs::UTF_8 {
+        return None;
+    }
+    let mut encoder = encoding.new_encoder();
+    let mut out = String::with_capacity(text.len());
+    let mut scratch = [0u8; 256];
+    let mut rest = text;
+    loop {
+        let (result, read, written) = encoder.encode_from_utf8_without_replacement(rest, &mut scratch, true);
+        for &byte in &scratch[..written] {
+            if escape(byte) {
+                crate::codec::push_percent_escape(&mut out, byte);
+            } else {
+                out.push(byte as char);
+            }
+        }
+        rest = &rest[read..];
+        match result {
+            EncoderResult::InputEmpty => return Some(out),
+            EncoderResult::OutputFull => {}
+            EncoderResult::Unmappable(c) => {
+                out.push_str("%26%23");
+                out.push_str(&alloc::format!("{}", c as u32));
+                out.push_str("%3B");
             }
         }
     }
@@ -238,6 +272,22 @@ impl TextDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_encoding_uses_the_document_encoding_with_url_error_mode() {
+        let set = |c: u8| c < 0x21 || c > 0x7e || matches!(c, b'"' | b'#' | b'<' | b'>');
+        let q = |label: &str, text: &str| percent_encode_query(label, text, set);
+        assert_eq!(q("big5", "\u{a7}").as_deref(), Some("%A1%B1"));
+        assert_eq!(q("big5", "\u{1F600}").as_deref(), Some("%26%23128512%3B"));
+        assert_eq!(q("euc-kr", "\u{AC00}").as_deref(), Some("%B0%A1"));
+        assert_eq!(q("shift_jis", "\u{3042}").as_deref(), Some("%82%A0"));
+        assert_eq!(q("shift_jis", "\u{AC00}").as_deref(), Some("%26%2344032%3B"));
+        assert_eq!(q("Shift_JIS", "a b").as_deref(), Some("a%20b"));
+        assert_eq!(q("iso-2022-jp", "\u{3042}").as_deref(), Some("%1B$B$%22%1B(B"));
+        assert_eq!(q("utf-8", "\u{a7}"), None);
+        assert_eq!(q("utf-16le", "\u{a7}"), None);
+        assert_eq!(q("nonsense", "x"), None);
+    }
 
     #[test]
     fn output_encoder_streams_legacy_characters_references_and_final_state_with_exact_budget() {

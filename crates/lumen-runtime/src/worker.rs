@@ -131,6 +131,9 @@ struct WorkerEntry {
     /// The worker loop's waker, set once its realm exists: whoever raises `stop` wakes the loop,
     /// which blocks with no timeout while idle.
     wake: WakeSlot,
+    /// Set by the worker's loop while it waits with nothing in flight and nothing armed: only a
+    /// message from another agent can make it run again.
+    parked: Arc<AtomicBool>,
     node: Option<NodeLink>,
 }
 
@@ -158,6 +161,24 @@ struct NodeLink {
     inbox_task: Option<TaskId>,
 }
 
+/// True when every worker this realm started (and every shared worker it is connected to) is
+/// parked, so none can report anything unless this realm sends first.
+pub(crate) fn all_parked(ctx: &mut Ctx) -> bool {
+    let Some(registry) = ctx.host_mut::<WorkerRegistry>() else {
+        return true;
+    };
+    registry
+        .workers
+        .values()
+        .all(|worker| worker.parked.load(Ordering::SeqCst))
+        && (registry.shared_clients.is_empty()
+            || shared_workers()
+                .lock()
+                .unwrap()
+                .values()
+                .all(|host| host.parked.load(Ordering::SeqCst)))
+}
+
 type SharedWorkerKey = lumen_common::worker::SharedWorkerKey;
 
 struct SharedClient {
@@ -168,6 +189,7 @@ struct SharedClient {
 struct SharedWorkerHost {
     stop: Arc<AtomicBool>,
     kill: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
     /// The worker realm's control: `Connect` for each client, and a wake to stop.
     scope: Control,
     clients: Mutex<HashMap<u64, SharedClient>>,
@@ -306,18 +328,29 @@ struct WorkerSpec {
     scope_control: Option<Control>,
     /// Node mode: the control whose closing wakes the loop when the parent terminates.
     node_wake: Option<Control>,
+    parked: Arc<AtomicBool>,
 }
 
 /// Normalize a web Worker constructor URL and enforce the same-origin rule before starting its
 /// thread. The dedicated worker's strict resource loader enforces this origin on every redirect
 /// hop and the worker thread checks the final response URL again before it runs any script.
+/// `url` with `fragment` appended, unless it already has one. The script is fetched without the
+/// fragment, but the worker's `location` keeps the one the constructor's URL carried, as a
+/// response URL inherits its request's fragment.
+fn with_fragment(url: &str, fragment: Option<&str>) -> String {
+    match fragment {
+        Some(fragment) if !url.contains('#') => format!("{url}#{fragment}"),
+        _ => url.to_owned(),
+    }
+}
+
 fn prepare_web_worker_entry(
     raw_url: &str,
     owner_origin: &str,
 ) -> NativeResult<(String, bool, Option<String>, Option<String>)> {
     let mut url = lumen_common::url::parse(raw_url, None)
         .map_err(|_| NativeError::named("SyntaxError", "invalid Worker script URL"))?;
-    url.fragment = None;
+    let fragment = url.fragment.take();
     match url.scheme.as_str() {
         "http" | "https" => {
             if !url.username.is_empty() || !url.password.is_empty() {
@@ -337,7 +370,8 @@ fn prepare_web_worker_entry(
                 ));
             }
             let href = url.href();
-            Ok((href.clone(), true, Some(worker_origin), Some(href)))
+            let location = with_fragment(&href, fragment.as_deref());
+            Ok((href, true, Some(worker_origin), Some(location)))
         }
         "file" => {
             if !owner_origin.is_empty() && owner_origin != "null" {
@@ -428,6 +462,7 @@ impl WorkerBackend for ThreadBackend {
         let kill = Arc::new(AtomicBool::new(false));
         let wake = WakeSlot::default();
         let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
+        let parked = Arc::new(AtomicBool::new(false));
         let worker = WorkerSpec {
             entry,
             is_module: spec.module,
@@ -456,6 +491,7 @@ impl WorkerBackend for ThreadBackend {
             inside: Some(spec.inside),
             scope_control: None,
             node_wake: None,
+            parked: Arc::clone(&parked),
         };
         let id = {
             let reg = registry(ctx);
@@ -467,6 +503,7 @@ impl WorkerBackend for ThreadBackend {
                     stop: Arc::clone(&stop),
                     kill: Arc::clone(&kill),
                     wake: Arc::clone(&wake),
+                    parked,
                     node: None,
                 },
             );
@@ -550,6 +587,7 @@ fn get_or_start_shared_worker(
     let host = Arc::new(SharedWorkerHost {
         stop: Arc::clone(&stop),
         kill: Arc::clone(&kill),
+        parked: Arc::new(AtomicBool::new(false)),
         scope: scope.clone(),
         clients: Mutex::new(HashMap::new()),
     });
@@ -585,6 +623,7 @@ fn get_or_start_shared_worker(
         inside: None,
         scope_control: Some(scope),
         node_wake: None,
+        parked: Arc::clone(&host.parked),
     };
     if let Err(error) = start_thread(
         format!("lumen-shared-worker-{thread_id}"),
@@ -875,6 +914,9 @@ fn run_worker(
         Runtime::new_browser_worker(spec.embedding.clone())
     };
     let _ = wake.set(rt.waker());
+    if !spec.is_node {
+        rt.set_parked_flag(Arc::clone(&spec.parked));
+    }
     // The extension installs a default FetchConfig in every Runtime. Replace it before any
     // worker bootstrap or module entry can issue requests, using the parent's captured snapshot.
     rt.engine().ctx().op_state().put(spec.fetch_config.clone());
@@ -990,9 +1032,14 @@ fn run_worker(
     let booted = if spec.is_node {
         boot_node_worker(&mut rt, &mut spec)
     } else {
+        let requested_fragment = spec
+            .location_href
+            .as_deref()
+            .and_then(|href| href.split_once('#'))
+            .map(|(_, fragment)| fragment.to_owned());
         let location = remote_entry
             .as_ref()
-            .map(|resource| resource.url.clone())
+            .map(|resource| with_fragment(&resource.url, requested_fragment.as_deref()))
             .or_else(|| spec.location_href.clone())
             .unwrap_or_else(|| spec.entry.clone());
         let storage_key = spec.origin.clone().unwrap_or_else(|| {
@@ -1378,6 +1425,7 @@ mod worker_ops {
                     stop: Arc::clone(&stop),
                     kill: Arc::clone(&kill),
                     wake: Arc::clone(&wake),
+                    parked: Arc::new(AtomicBool::new(false)),
                     node: Some(NodeLink {
                         to_worker: to_worker.clone(),
                         events: events.clone(),
@@ -1425,6 +1473,7 @@ mod worker_ops {
             inside: None,
             scope_control: None,
             node_wake: Some(to_worker),
+            parked: Arc::new(AtomicBool::new(false)),
         };
         start_thread(
             format!("lumen-worker-{thread_id}"),

@@ -896,20 +896,14 @@ mod tests {
 #[cfg(feature="compress")]
 pub fn decode_content_codings(headers:&[(String,String)],mut body:Vec<u8>,limit:usize)->Result<Vec<u8>,String> {
     if body.len()>limit {return Err(String::from(crate::compress::OUTPUT_LIMIT))}
-    let mut codings=Vec::new();
-    for (_,value) in headers.iter().filter(|(name,_)|name.eq_ignore_ascii_case("content-encoding")) {
-        for coding in value.split(',').map(|value|value.trim_matches(|c|matches!(c,' '| '\t'))).filter(|value|!value.is_empty()) {
-            if codings.len()==128 {return Err(String::from("HTTP content-coding depth exceeded"))}
-            codings.push(coding);
-        }
-    }
+    let codings=crate::compress::content_codings(headers.iter().filter(|(name,_)|name.eq_ignore_ascii_case("content-encoding")).map(|(_,value)|value.as_str()))?;
     for coding in codings.into_iter().rev() {
-        body=if coding.eq_ignore_ascii_case("identity") {body}
-        else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {crate::compress::gzip_decompress_limited(&body,limit)?}
-        else if coding.eq_ignore_ascii_case("deflate") {crate::compress::zlib_decompress_limited(&body,limit)?}
-        else if coding.eq_ignore_ascii_case("br") {crate::compress::brotli_decompress_limited(&body,limit)?}
-        else if coding.eq_ignore_ascii_case("zstd") {crate::compress::zstd_decompress_limited(&body,limit)?}
-        else {return Err(String::from("unsupported HTTP content coding"))};
+        body=match coding {
+            crate::compress::ContentCoding::Gzip=>crate::compress::gzip_decompress_limited(&body,limit)?,
+            crate::compress::ContentCoding::Deflate=>crate::compress::zlib_decompress_limited(&body,limit)?,
+            crate::compress::ContentCoding::Brotli=>crate::compress::brotli_decompress_limited(&body,limit)?,
+            crate::compress::ContentCoding::Zstd=>crate::compress::zstd_decompress_limited(&body,limit)?,
+        };
     }
     Ok(body)
 }

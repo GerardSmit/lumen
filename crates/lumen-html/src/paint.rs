@@ -667,11 +667,33 @@ impl Iterator for CapsExpansions<'_> {
 
 pub use lumen_common::raster::Rgba8Image as ImageData;
 
+/// A text shaper that may be shared between threads: borrowed when the
+/// shaper itself is `Sync`, otherwise a snapshot of its fonts.
+pub enum ParallelText<'a> {
+    Borrowed(&'a (dyn TextShaper + Sync)),
+    Shared(Arc<dyn TextShaper + Send + Sync>),
+}
+
+impl<'a> core::ops::Deref for ParallelText<'a> {
+    type Target = dyn TextShaper + Sync + 'a;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(text) => *text,
+            Self::Shared(text) => &**text,
+        }
+    }
+}
+
 pub trait TextShaper {
     /// SVG2 object bounds use full glyph cells: native horizontal advance
     /// and the face's ascent/descent, before raster coverage or filter ink.
     /// Opaque providers may decline instead of guessing from visible pixels.
     fn glyph_cell_bounds(&self,_face:u64,_id:u16,_size:f32)->Option<Rect>{None}
+
+    /// A view of this shaper that may be used from several threads at once,
+    /// with the same `generation` and the same font metrics; parallel style
+    /// resolution only runs when it is available.
+    fn parallel_view(&self)->Option<ParallelText<'_>>{None}
 
 
     /// None means the provider has no metric authority. Some(None) means

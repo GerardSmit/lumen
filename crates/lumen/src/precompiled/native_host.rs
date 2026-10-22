@@ -194,7 +194,7 @@ impl CompiledUnit {
         keep: impl Fn(&str) -> bool,
     ) -> Result<(Self, Vec<String>, Vec<String>), String> {
         use crate::ast::{FnSource, Stmt};
-        use crate::token::{Tok, TokVec, TplPart};
+        use crate::token::{Punct, Tok, TokVec, TplPart};
         if self.kind != crate::SourceKind::Module {
             return Ok((self.clone(), Vec::new(), vec!["global/CommonJS bindings are retained because their dynamic namespace is observable".into()]));
         }
@@ -219,6 +219,7 @@ impl CompiledUnit {
                 vec!["module function source positions unavailable; declarations retained".into()],
             ));
         };
+        let src = src.text();
         fn refs(
             tokens: &TokVec,
             spans: &[(u32, u32)],
@@ -255,7 +256,7 @@ impl CompiledUnit {
             })
             .collect::<Vec<_>>();
         let mut reachable = std::collections::BTreeSet::new();
-        let tokens = crate::lexer::tokenize_goal(src, false).map_err(|error| error.message)?;
+        let tokens = crate::lexer::tokenize_goal(&src, false).map_err(|error| error.message)?;
         refs(&tokens, &spans, &mut reachable);
         for (name, _) in &candidates {
             if keep(name) {
@@ -327,10 +328,10 @@ impl CompiledUnit {
         });
         let dynamic = (0..tokens.len()).any(|index| match &tokens[index].kind {
             Tok::Ident(name) => matches!(name.as_str(), "Reflect" | "eval" | "Function"),
-            Tok::Punct("[") if index > 0 && index + 1 < tokens.len() => {
+            Tok::Punct(Punct::LBracket) if index > 0 && index + 1 < tokens.len() => {
                 matches!(
                     &tokens[index - 1].kind,
-                    Tok::Ident(_) | Tok::Punct(")" | "]")
+                    Tok::Ident(_) | Tok::Punct(Punct::RParen | Punct::RBracket)
                 ) && !matches!(&tokens[index + 1].kind, Tok::Str(_) | Tok::Num(_))
             }
             _ => false,
@@ -386,12 +387,13 @@ impl CompiledUnit {
         let FnSource::Range { src, .. } = &function.source else {
             return Err("snapshot entry requires original host source positions".into());
         };
+        let src = src.text();
         fn called(
             tokens: &crate::token::TokVec,
             name: &str,
             functions: &[Rc<crate::ast::Function>],
         ) -> bool {
-            use crate::token::{Tok, TplPart};
+            use crate::token::{Punct, Tok, TplPart};
             for index in 0..tokens.len() {
                 let token = &tokens[index];
                 if functions.iter().any(|function| matches!(&function.source,
@@ -404,33 +406,33 @@ impl CompiledUnit {
                     }
                 }
                 if !matches!(&token.kind, Tok::Ident(identifier) if identifier.as_str() == name)
-                    || index > 0 && matches!(&tokens[index - 1].kind, Tok::Punct("." | "?."))
+                    || index > 0 && matches!(&tokens[index - 1].kind, Tok::Punct(Punct::Dot | Punct::OptChain))
                 {
                     continue;
                 }
                 let mut next = index + 1;
                 while tokens
                     .get(next)
-                    .is_some_and(|token| matches!(&token.kind, Tok::Punct(")")))
+                    .is_some_and(|token| matches!(&token.kind, Tok::Punct(Punct::RParen)))
                 {
                     next += 1;
                 }
                 if tokens
                     .get(next)
-                    .is_some_and(|token| matches!(&token.kind, Tok::Punct("(")))
+                    .is_some_and(|token| matches!(&token.kind, Tok::Punct(Punct::LParen)))
                     || tokens
                         .get(next)
-                        .is_some_and(|token| matches!(&token.kind, Tok::Punct("?.")))
+                        .is_some_and(|token| matches!(&token.kind, Tok::Punct(Punct::OptChain)))
                         && tokens
                             .get(next + 1)
-                            .is_some_and(|token| matches!(&token.kind, Tok::Punct("(")))
+                            .is_some_and(|token| matches!(&token.kind, Tok::Punct(Punct::LParen)))
                 {
                     return true;
                 }
             }
             false
         }
-        let tokens = crate::lexer::tokenize_goal(src, self.kind != crate::SourceKind::Module)
+        let tokens = crate::lexer::tokenize_goal(&src, self.kind != crate::SourceKind::Module)
             .map_err(|error| error.message)?;
         if called(&tokens, name, &self.native_funcs) {
             return Err(format!(

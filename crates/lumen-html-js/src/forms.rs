@@ -2743,7 +2743,6 @@ fn finish_submission(
     metadata.encoding = encoding.to_owned();
     drop(session);
     let has_document_url = realm.document_url().is_some();
-    let base = realm.base_url();
     if metadata.method == "dialog" {
         metadata.action.clear();
     } else if metadata.action.is_empty() && !has_document_url {
@@ -2752,7 +2751,7 @@ fn finish_submission(
             "the browser has not supplied this document's URL",
         ));
     } else {
-        let resolved = lumen_common::url::parse(&metadata.action, Some(&base))
+        let resolved = realm.parse_document_url(&metadata.action)
             .map_err(|_| OpError::new("SyntaxError", "form action URL could not be resolved"))?;
         metadata.action = resolved.href();
     }
@@ -3027,6 +3026,64 @@ pub fn trusted_pointer_click(
     trusted_pointer_move(ctx, realm, &mut state, node, client_x, client_y, modifiers)?;
     trusted_pointer_down(ctx, realm, &mut state, node, modifiers)?;
     trusted_pointer_up(ctx, realm, &mut state, node, modifiers)
+}
+
+/// Dispatch the trusted primary-button `click` of a press and release the host
+/// saw on `node`, focusing it first as a pointer press does. The pointer
+/// events themselves are the host's; this runs the activation behavior
+/// (links, form submission, checkboxes, labels) that a bare event does not.
+pub fn trusted_click_at(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    client_x: f64,
+    client_y: f64,
+    detail: i32,
+) -> OpResult<()> {
+    if !client_x.is_finite() || !client_y.is_finite() {
+        return Err(OpError::type_error("pointer coordinates must be finite"));
+    }
+    let node = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut target = node;
+        while !matches!(document.kind(target), Ok(lumen_html::NodeKind::Element { .. })) {
+            match document.parent(target) {
+                Ok(Some(parent)) => target = parent,
+                _ => break,
+            }
+        }
+        target
+    };
+    if !connected_pointer_target(realm, node) {
+        return Err(OpError::new("InvalidStateError", "pointer target is no longer connected to its document"));
+    }
+    if core_forms::is_disabled(realm.session.borrow().document(), node) {
+        return Ok(());
+    }
+    realm.focus_from_pointer(ctx, Some(node))?;
+    if !connected_pointer_target(realm, node) {
+        return Ok(());
+    }
+    let click = super::ui_events::user_agent_pointer_event_with_properties(
+        ctx,
+        "click",
+        pointer_view(realm),
+        client_x,
+        client_y,
+        0,
+        0,
+        detail,
+        0.0,
+        true,
+        true,
+        Value::Null,
+        super::ui_events::UserAgentModifiers::default(),
+        0.0,
+        0.0,
+        super::ui_events::UserAgentPointerProperties::default(),
+    )?;
+    click_with_event(ctx, realm, &DomEventTarget::node(realm, node), node, click, true, true, false)
 }
 
 /// Persistent pointer state used by the bounded WebDriver Actions profile. It stores native
@@ -5211,7 +5268,7 @@ mod tests {
                 .unwrap();
             let foreign_input = document
                 .create(NodeKind::Element {
-                    namespace: Namespace::Other(std::rc::Rc::from("urn:foreign")),
+                    namespace: Namespace::Other(std::sync::Arc::from("urn:foreign")),
                     name: lumen_html::Name::new("input"),
                     attributes: Vec::new(),
                 })

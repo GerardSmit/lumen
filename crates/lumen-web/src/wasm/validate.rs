@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use super::parse::{
     ExportKind, FuncType, GlobalType, ImportKind, Module, Reader, TableType, ValType,
 };
+use super::simd::{self, Imm, V128_CONST};
 
 /// The most targets a `br_table` may list (V8's `kV8MaxWasmFunctionBrTableSize`).
 pub const MAX_BR_TABLE_SIZE: u32 = 65520;
@@ -126,13 +127,18 @@ fn ty(m: &Module, t: u32) -> R<&FuncType> {
 }
 
 fn is_ref(t: ValType) -> bool {
-    matches!(t, ValType::FuncRef | ValType::ExternRef)
+    matches!(
+        t,
+        ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::EqRef
+    )
 }
 
 fn ref_type(b: u8) -> R<ValType> {
     match b {
         0x70 => Ok(ValType::FuncRef),
         0x6f => Ok(ValType::ExternRef),
+        0x6e => Ok(ValType::AnyRef),
+        0x6d => Ok(ValType::EqRef),
         _ => Err(format!("wasm: bad reference type 0x{b:x}")),
     }
 }
@@ -143,8 +149,11 @@ fn val_type(b: u8) -> Option<ValType> {
         0x7e => ValType::I64,
         0x7d => ValType::F32,
         0x7c => ValType::F64,
+        0x7b => ValType::V128,
         0x70 => ValType::FuncRef,
         0x6f => ValType::ExternRef,
+        0x6e => ValType::AnyRef,
+        0x6d => ValType::EqRef,
         _ => return None,
     })
 }
@@ -172,6 +181,13 @@ impl Env<'_> {
                 0x44 => {
                     r.bytes(8)?;
                     stack.push(ValType::F64);
+                }
+                0xfd => {
+                    if r.u32()? != V128_CONST {
+                        return Err("wasm: opcode 0xfd is not constant".into());
+                    }
+                    r.bytes(16)?;
+                    stack.push(ValType::V128);
                 }
                 0x23 => {
                     let i = r.u32()? as usize;
@@ -671,7 +687,44 @@ impl<'e, 'm> Func<'e, 'm> {
                 self.push(FuncRef);
             }
             0xfc => self.op_fc(r)?,
+            0xfd => self.op_simd(r)?,
             other => return Err(format!("wasm: unknown opcode 0x{other:x}")),
+        }
+        Ok(())
+    }
+
+    fn op_simd(&mut self, r: &mut Reader) -> R<()> {
+        let op = r.u32()?;
+        let info = simd::info(op).ok_or_else(|| format!("wasm: unknown 0xfd opcode {op}"))?;
+        match info.imm {
+            Imm::None => {}
+            Imm::Mem { align } => self.memarg(r, align)?,
+            Imm::MemLane { align, lanes } => {
+                self.memarg(r, align)?;
+                Self::lane(r, lanes)?;
+            }
+            Imm::Lane(lanes) => Self::lane(r, lanes)?,
+            Imm::Const => {
+                r.bytes(16)?;
+            }
+            Imm::Shuffle => {
+                for &lane in r.bytes(16)? {
+                    if lane >= 32 {
+                        return Err("wasm: shuffle lane index out of range".into());
+                    }
+                }
+            }
+        }
+        self.pop_all(info.pops)?;
+        if let Some(t) = info.push {
+            self.push(t);
+        }
+        Ok(())
+    }
+
+    fn lane(r: &mut Reader, lanes: u8) -> R<()> {
+        if r.byte()? >= lanes {
+            return Err("wasm: lane index out of range".into());
         }
         Ok(())
     }

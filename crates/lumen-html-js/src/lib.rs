@@ -25,6 +25,7 @@ use style::DomStyle;
 pub(crate) mod animations;
 mod animation_worklet;
 mod paint_worklet;
+mod paint_timing;
 mod browser_services;
 mod browsing_context;
 mod realm_services;
@@ -58,6 +59,7 @@ pub(crate) mod dialog_popover;
 pub use cookies::CookieHost;
 mod document_utilities;
 mod editing;
+mod editing_commands;
 mod focus;
 pub use focus::ScriptBlockingStylesheet;
 mod editing_history;
@@ -100,6 +102,8 @@ mod command_events;
 mod element_reflection;
 mod image_loading;
 pub mod stylesheet_loading;
+mod preload_scanner;
+pub use preload_scanner::{PreloadHint, PreloadKind};
 pub mod object_loading;
 pub mod keyboard_automation;
 mod labels;
@@ -842,6 +846,7 @@ pub struct DomRealm {
     module_activations_enabled: Cell<bool>,
     script_capabilities: Rc<ScriptCapabilities>,
     classic_resource_activations_enabled: Cell<bool>,
+    stream_scripts: RefCell<StreamScripts>,
     module_activations: RefCell<VecDeque<PendingScriptActivation>>,
     dataset_intrinsics: RefCell<Option<dataset::ProxyIntrinsics>>,
     layout_flusher: RefCell<Option<LayoutFlusher>>,
@@ -1112,6 +1117,7 @@ impl DomRealm {
                 self.with_xml_parser_documents(ctx,|parser,documents|parser.resume(documents))?
             }
         } else if let Some(source) = source {
+            self.run_preload_scan(&source);
             let options = html::ParseOptions {
                 allow_declarative_shadow_roots: true,
                 scripting_enabled: true,
@@ -1606,6 +1612,12 @@ impl DomRealm {
         document_url
     }
 
+    /// Resolves a URL reference against the document base URL, encoding the query of a special
+    /// URL with the document's character encoding as the URL standard requires.
+    pub fn parse_document_url(&self, input: &str) -> Result<lumen_common::url::Url, String> {
+        lumen_common::url::parse_with_encoding(input, Some(&self.base_url()), self.document_encoding())
+    }
+
     pub fn base_url(&self) -> String {
         let initialized = self.document_base_url.borrow().initialized;
         if !initialized {
@@ -1877,8 +1889,10 @@ impl DomRealm {
         // stream when document.open() is called from a parser-inserted script.
         self.parser_generation
             .set(self.parser_generation.get().wrapping_add(1));
+        *self.stream_scripts.borrow_mut() = StreamScripts { opened: true, ..StreamScripts::default() };
         self.document_parser.borrow_mut().take();
         self.document_parser_retention.borrow_mut().clear();
+        self.adopt_entry_document_url(ctx);
 
         let options = {
             let session = self.session.borrow();
@@ -1907,6 +1921,20 @@ impl DomRealm {
         let root = self.session.borrow().document().root();
         self.dispatch(ctx, root, "readystatechange", false, false, &[])
             .map(|_| ())
+    }
+
+    /// The document.open() algorithm gives the document the URL of the entry
+    /// settings object's responsible document.
+    fn adopt_entry_document_url(self: &Rc<Self>, ctx: &mut Ctx) {
+        let caller = ctx.invocation_host_realm();
+        let entry = ctx
+            .with_host_realm(&caller, |ctx| window_globals::current_dom_realm(ctx))
+            .ok()
+            .flatten();
+        let Some(url) = entry.filter(|entry| !Rc::ptr_eq(entry, self)).and_then(|entry| entry.document_url()) else {
+            return;
+        };
+        self.set_same_document_url(url);
     }
 
     fn erase_document_open_listeners(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<()> {
@@ -1961,13 +1989,15 @@ impl DomRealm {
         if self.document_parser.borrow().is_none() {
             self.open_document_stream(ctx)?;
         }
-        let active_script = self.current_script.get();
-        let paused_for_script = self
+        // While the parser is yielded at a script, the insertion point is defined for any writer:
+        // the script itself, its load/error event handlers (where currentScript is null) and
+        // callbacks that run while the parser waits for the script.
+        let paused_script = self
             .document_parser
             .borrow()
             .as_ref()
-            .is_some_and(html::HtmlDocumentParser::is_paused_for_script);
-        if let (Some(parent_script), true) = (active_script, paused_for_script) {
+            .and_then(html::HtmlDocumentParser::paused_script);
+        if let Some(parent_script) = paused_script {
             let (_,parent_script)=self.current_parser_identity(parent_script);
             let script=self.with_html_parser_documents(ctx,|parser,documents| {
                 parser.write_at_script_position_until_script(documents,parent_script,chunks,append_newline)
@@ -2015,14 +2045,150 @@ impl DomRealm {
                 self.stylesheet_links.parser_script.set(Some(stylesheet_loading::PendingParserScript{node,generation,document_write:true,insertion_parent:None}));
                 return Ok(());
             }
-            self.execute_document_parser_script(ctx, node)?;
-
+            match self.activate_stream_external_script(node, generation)? {
+                Some(true) => return Ok(()),
+                Some(false) => {}
+                None => self.execute_document_parser_script(ctx, node)?,
+            }
 
             if self.parser_generation.get() != generation {
                 return Ok(());
             }
             script=self.with_html_parser_documents(ctx,|parser,documents|parser.resume_until_script(documents))?;
         }
+    }
+
+    fn queue_stream_script_activation(self: &Rc<Self>, node: NodeId, mut script: ScriptDescriptor) {
+        script.parser_inserted = false;
+        let pending = PendingScriptActivation {
+            classic_context: self.classic_script_context(node, None),
+            script,
+            base_url: self.base_url(),
+            target: DomEventTarget::node(self, node).data_handle(),
+            retention: NodeRetention::new(self, node),
+        };
+        self.module_activations.borrow_mut().push_back(pending);
+    }
+
+    /// External classic scripts of a document.open() stream are fetched by the
+    /// embedder. Returns None when the script is not handled here, Some(true)
+    /// when the parser must wait for its terminal event and Some(false) when
+    /// the parser continues without waiting.
+    fn activate_stream_external_script(
+        self: &Rc<Self>,
+        node: NodeId,
+        generation: u64,
+    ) -> OpResult<Option<bool>> {
+        if !self.classic_resource_activations_enabled.get() || !self.stream_scripts.borrow().opened {
+            return Ok(None);
+        }
+        let (owner, node) = self.current_parser_identity(node);
+        if !Rc::ptr_eq(&owner, self) {
+            return Ok(None);
+        }
+        let active = self.has_browsing_context
+            && self.browsing_context().is_some_and(|context| browsing_context::is_active_document(&context, self));
+        let eligible = {
+            let session = self.session.borrow();
+            let document = session.document();
+            active
+                && document.scripting_enabled()
+                && script_loading::is_connected(document, node)
+                && matches!(
+                    script_loading::prepare_kind(document, node, self.is_html_document),
+                    Some(script_loading::ScriptKind::Unhandled(UnhandledScriptReason::ExternalSource, _))
+                )
+        };
+        if !eligible {
+            return Ok(None);
+        }
+        self.retain_document_parser_nodes()?;
+        self.scripts.borrow_mut().register_parser_script(node);
+        let script = {
+            let session = self.session.borrow();
+            let scripts = self.scripts.borrow();
+            script_loading::descriptor(session.document(), node, self.is_html_document, scripts.force_async(node), true)
+        };
+        let Some(script) = script else {
+            return Ok(None);
+        };
+        self.scripts.borrow_mut().mark_started(node);
+        if script.is_async {
+            self.queue_stream_script_activation(node, script);
+            return Ok(Some(false));
+        }
+        if script.defer {
+            self.stream_scripts.borrow_mut().deferred.push(node);
+            return Ok(Some(false));
+        }
+        self.queue_stream_script_activation(node, script);
+        self.stream_scripts.borrow_mut().blocking = Some((node, generation));
+        Ok(Some(true))
+    }
+
+    fn activate_deferred_stream_scripts(self: &Rc<Self>, generation: u64) -> bool {
+        let nodes = std::mem::take(&mut self.stream_scripts.borrow_mut().deferred);
+        let mut waiting = Vec::new();
+        for node in nodes {
+            let script = {
+                let session = self.session.borrow();
+                let document = session.document();
+                if script_loading::is_connected(document, node) {
+                    script_loading::descriptor(document, node, self.is_html_document, false, false)
+                } else {
+                    None
+                }
+            };
+            let Some(script) = script.filter(|script| script.src.is_some()) else {
+                continue;
+            };
+            self.queue_stream_script_activation(node, script);
+            waiting.push(node);
+        }
+        if waiting.is_empty() {
+            return false;
+        }
+        let mut state = self.stream_scripts.borrow_mut();
+        state.waiting = waiting;
+        state.generation = generation;
+        true
+    }
+
+    fn stream_script_finished(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> OpResult<()> {
+        let (blocking, deferred_done) = {
+            let mut state = self.stream_scripts.borrow_mut();
+            let blocking = state.blocking.filter(|(pending, _)| *pending == node);
+            if blocking.is_some() {
+                state.blocking = None;
+            }
+            let waited = state.waiting.iter().position(|waiting| *waiting == node);
+            if let Some(index) = waited {
+                state.waiting.remove(index);
+            }
+            let done = waited.is_some() && state.waiting.is_empty();
+            (blocking, done.then_some(state.generation))
+        };
+        if let Some((_, generation)) = blocking {
+            if generation == self.parser_generation.get() && self.document_parser.borrow().is_some() {
+                let script = self.with_html_parser_documents(ctx, |parser, documents| parser.resume_until_script(documents))?;
+                self.run_document_parser_scripts(ctx, script)?;
+            }
+        }
+        if let Some(generation) = deferred_done {
+            self.complete_document_stream(ctx, generation)?;
+        }
+        Ok(())
+    }
+
+    fn complete_document_stream(self: &Rc<Self>, ctx: &mut Ctx, generation: u64) -> OpResult<()> {
+        if self.parser_generation.get() != generation {
+            return Ok(());
+        }
+        self.set_document_ready_state(ctx, DocumentReadyState::Interactive)?;
+        if self.parser_generation.get() != generation {
+            return Ok(());
+        }
+        self.set_document_ready_state(ctx, DocumentReadyState::Complete)
     }
 
     fn run_inserted_parser_scripts(
@@ -2426,11 +2592,10 @@ impl DomRealm {
         }
         self.document_parser.borrow_mut().take();
         self.document_parser_retention.borrow_mut().clear();
-        self.set_document_ready_state(ctx, DocumentReadyState::Interactive)?;
-        if self.parser_generation.get() != generation {
+        if self.activate_deferred_stream_scripts(generation) {
             return Ok(());
         }
-        self.set_document_ready_state(ctx, DocumentReadyState::Complete)
+        self.complete_document_stream(ctx, generation)
     }
 
     pub fn set_file_picker_host(
@@ -2730,7 +2895,9 @@ impl DomRealm {
     }
 
     pub fn media_reload(&self, ctx: &mut Ctx, node: NodeId) -> u64 {
-        let generation = self.media.borrow_mut().reload(ctx, node);
+        let (src, sources) = self.media_resource_nodes(node);
+        let has_resource = src.is_some() || !sources.is_empty();
+        let generation = self.media.borrow_mut().reload(ctx, node, has_resource);
         if matches!(self.session.borrow().document().kind(node), Ok(NodeKind::Element { name, namespace: Namespace::Html, .. }) if name == "video")
         {
             let _ = self.session.borrow_mut().set_node_bitmap(node, None);
@@ -2816,7 +2983,7 @@ impl DomRealm {
 
     pub fn queue_media_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
         let events = self.media.borrow_mut().take_events();
-        let count = events.len();
+        let mut count = events.len();
         for (node, generation, kind) in events {
             if self.session.borrow().document().kind(node).is_err() {
                 continue;
@@ -2830,6 +2997,25 @@ impl DomRealm {
                     && realm.session.borrow().document().kind(node).is_ok()
                 {
                     realm.dispatch_user_agent(ctx, node, &kind, false, false, &[])?;
+                }
+                Ok(())
+            })?;
+        }
+        let source_errors = self.media.borrow_mut().take_source_errors();
+        count += source_errors.len();
+        for (source, owner, generation) in source_errors {
+            if self.session.borrow().document().kind(source).is_err() {
+                continue;
+            }
+            let wrapper = self.wrap(ctx, source);
+            let retention = NodeRetention::new(self, source);
+            let realm = self.clone();
+            scheduling::queue_task(ctx, move |ctx| {
+                let (_wrapper, _retention) = (wrapper, retention);
+                if realm.media_snapshot(owner).generation == generation
+                    && realm.session.borrow().document().kind(source).is_ok()
+                {
+                    realm.dispatch_user_agent(ctx, source, "error", false, false, &[])?;
                 }
                 Ok(())
             })?;
@@ -2941,6 +3127,7 @@ impl DomRealm {
     pub fn queue_image_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
         let base = self.base_url();
         self.prepare_image_selection(&base)?;
+        self.settle_image_decodes(ctx);
         let completions = {
             let session = self.session.borrow();
             self.images.queue_completions(session.document(), &base)
@@ -2996,6 +3183,46 @@ impl DomRealm {
             return Err(OpError::new("QuotaExceededError","input image request metadata budget exhausted"));
         }
         Ok(count)
+    }
+
+    /// Whether this document is the active document of its browsing context. A document with no
+    /// browsing context (a detached or script-only realm) has nothing that could deactivate it.
+    pub(crate) fn is_fully_active(&self) -> bool {
+        !self.has_browsing_context
+            || self
+                .browsing_context()
+                .is_some_and(|context| browsing_context::is_active_document(&context, self))
+    }
+
+    /// Settle `HTMLImageElement.decode()` promises whose request completed, broke or whose
+    /// document stopped being fully active.
+    fn settle_image_decodes(&self, ctx: &mut Ctx) {
+        let waiting = self.images.take_decode_waiters();
+        if waiting.is_empty() {
+            return;
+        }
+        let base = self.base_url();
+        let fully_active = self.is_fully_active();
+        for (node, deferred) in waiting {
+            let outcome = if !fully_active {
+                Some(false)
+            } else {
+                let session = self.session.borrow();
+                if session.document().kind(node).is_err() {
+                    Some(false)
+                } else {
+                    self.images.decode_outcome(session.document(), node, &base)
+                }
+            };
+            match outcome {
+                Some(true) => deferred.resolve(ctx, Value::Undefined),
+                Some(false) => deferred.reject(
+                    ctx,
+                    OpError::new("EncodingError", "the image could not be decoded"),
+                ),
+                None => self.images.add_decode_waiter(node, deferred),
+            }
+        }
     }
 
     fn queue_image_event(self:&Rc<Self>,ctx:&mut Ctx,node:NodeId,completion:image_loading::QueuedImageEvent)->OpResult<()> {
@@ -3397,6 +3624,7 @@ impl DomRealm {
         self.canvases.update_drawable_paint(ctx,self)?;
         scrolling::queue_normalized_scroll_events(ctx,self)?;
         view_transition::rendering_checkpoint(ctx, self)?;
+        paint_timing::update(ctx, self)?;
         if let Some(node) = self.focused.get() {
             let epoch = |session: &RenderSession| (node, session.document().version(), session.document().interaction_generation(), session.paint_revision());
             if self.rendered_focus_epoch.get() == Some(epoch(&self.session.borrow())) { return Ok(()); }
@@ -4651,6 +4879,7 @@ impl DomRealm {
                     base: node,
                     realm: self.clone(),
                     fonts: RefCell::new(None),
+            editing: RefCell::new(None),
                 }),
                 Ok(NodeKind::Element {
                     namespace: Namespace::Html,
@@ -4884,6 +5113,19 @@ fn insert_dom_node(
     child: Value,
     before: Value,
 ) -> OpResult<Value> {
+    insert_dom_node_upgrading(ctx, realm, parent, child, before, true)
+}
+
+/// `upgrade` is false only while building the detached fragment of "convert
+/// nodes into a node", whose members upgrade when that fragment is inserted.
+fn insert_dom_node_upgrading(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    parent: NodeId,
+    child: Value,
+    before: Value,
+    upgrade: bool,
+) -> OpResult<Value> {
     // Extract identity before adoption. Migrating an existing wrapper may
     // rebind its native payload, so no projection can remain borrowed.
     let (source, source_id) =
@@ -4906,7 +5148,7 @@ fn insert_dom_node(
         realm.session.borrow_mut().document_mut().insert_fragment_roots(parent, roots.clone(), reference).map_err(dom_error)?;
         apply_select_mutation(realm, selectedness)?;
         realm.invalidate_textarea_ancestor(parent);
-        upgrade_inserted_roots(ctx, realm, &roots, None)?;
+        if upgrade { upgrade_inserted_roots(ctx, realm, &roots, None)?; }
         realm.flush_script_activations(ctx)?;
         return Ok(child);
     }
@@ -5001,7 +5243,7 @@ fn insert_dom_node(
         }
     }
     realm.invalidate_textarea_ancestor(parent);
-    upgrade_inserted_roots(ctx, realm, &[id], inserted)?;
+    if upgrade { upgrade_inserted_roots(ctx, realm, &[id], inserted)?; }
     realm.flush_script_activations(ctx)?;
     Ok(child)
 }
@@ -5363,8 +5605,8 @@ fn namespace_from_uri(namespace_uri: Option<&str>) -> Namespace {
         Some("http://www.w3.org/1999/xhtml") => Namespace::Html,
         Some("http://www.w3.org/2000/svg") => Namespace::Svg,
         Some("http://www.w3.org/1998/Math/MathML") => Namespace::MathMl,
-        Some(uri) => Namespace::Other(Rc::from(uri)),
-        None => Namespace::Other(Rc::from("")),
+        Some(uri) => Namespace::Other(std::sync::Arc::from(uri)),
+        None => Namespace::Other(std::sync::Arc::from("")),
     }
 }
 
@@ -5488,7 +5730,7 @@ fn converted_dom_node(ctx: &mut Ctx, owner: &DomNode, mut values: Vec<NodeOrDOMS
     let converted = ConvertedDomNode { value: owner.realm.wrap(ctx, fragment), _keep: NodeRetention::new(&owner.realm, fragment), _source: owner.realm.clone() };
     for node in values {
         let NodeOrDOMString::Node(node) = node else { unreachable!("converted strings") };
-        insert_dom_node(ctx, &owner.realm, fragment, node.value.clone(), Value::Null)?;
+        insert_dom_node_upgrading(ctx, &owner.realm, fragment, node.value.clone(), Value::Null, false)?;
     }
     Ok(converted)
 }
@@ -7291,6 +7533,18 @@ impl DomHtmlImageElement {
         self.image_snapshot().complete
     }
 
+    fn decode(&self, ctx: &mut Ctx) -> Value {
+        let deferred = lumen::embed::Deferred::new(ctx);
+        let promise = deferred.promise();
+        let (realm, node) = self.image_node().realm.resolve_adopted_node(self.image_node().id);
+        if !realm.is_fully_active() {
+            deferred.reject(ctx, OpError::new("EncodingError", "the image's document is not fully active"));
+            return promise;
+        }
+        realm.images.add_decode_waiter(node, deferred);
+        promise
+    }
+
     #[getter(rename(js = "naturalWidth"))]
     fn natural_width(&self) -> u32 {
         self.image_snapshot().natural_width
@@ -8565,7 +8819,8 @@ impl DomTextAreaElement {
     }
     #[getter]
     fn wrap(&self) -> OpResult<String> {
-        Ok(self.base.base.base.get_null_attribute("wrap")?.unwrap_or_default())
+        let hard = self.base.base.base.get_null_attribute("wrap")?.is_some_and(|value| value.eq_ignore_ascii_case("hard"));
+        Ok(String::from(if hard { "hard" } else { "soft" }))
     }
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_wrap(&self, value: &str) -> OpResult<()> {
@@ -9267,9 +9522,9 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     }
 
     #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_popover(&self, value: &str) -> OpResult<()> {
+    fn set_popover(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
         let node = &self.base.base;
-        dialog_popover::set_popover_value(&node.realm, node.id, value)
+        dialog_popover::change_popover_value(ctx, &node.realm, node.id, value)
     }
 
     #[method(name = "showPopover")]
@@ -10171,6 +10426,7 @@ pub struct DomDocument {
     base: DomNode,
     realm: Rc<DomRealm>,
     fonts: RefCell<Option<Value>>,
+    editing: RefCell<Option<Value>>,
 }
 
 impl lumen::embed::NativeIdentityOwner for DomDocument {
@@ -10181,6 +10437,7 @@ impl lumen::embed::NativeIdentityOwner for DomDocument {
     fn trace_native_values(&self, visit:&mut dyn FnMut(&Value)) {
         lumen::embed::NativeIdentityOwner::trace_native_values(&self.base,visit);
         if let Some(fonts)=self.fonts.borrow().as_ref() {visit(fonts);}
+        if let Some(editing)=self.editing.borrow().as_ref() {visit(editing);}
     }
 }
 
@@ -10449,6 +10706,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
             },
             realm: realm.clone(),
             fonts: RefCell::new(None),
+            editing: RefCell::new(None),
         };
         Ok(NodeConstructorResult::from_native(native, realm, root))
     }
@@ -11126,6 +11384,42 @@ event_content_handlers::bind_node_handlers! { DomDocument {
             .is_some_and(|context| browsing_context::is_active_document(&context, &self.realm))
     }
 
+    #[method(name = "execCommand")]
+    fn exec_command(
+        &self,
+        ctx: &mut Ctx,
+        command: Value,
+        #[default(Value::Undefined)] show_ui: Value,
+        #[default(Value::Undefined)] value: Value,
+    ) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "execCommand", &[command, show_ui, value])
+    }
+
+    #[method(name = "queryCommandEnabled")]
+    fn query_command_enabled(&self, ctx: &mut Ctx, command: Value) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "queryCommandEnabled", &[command])
+    }
+
+    #[method(name = "queryCommandIndeterm")]
+    fn query_command_indeterm(&self, ctx: &mut Ctx, command: Value) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "queryCommandIndeterm", &[command])
+    }
+
+    #[method(name = "queryCommandState")]
+    fn query_command_state(&self, ctx: &mut Ctx, command: Value) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "queryCommandState", &[command])
+    }
+
+    #[method(name = "queryCommandSupported")]
+    fn query_command_supported(&self, ctx: &mut Ctx, command: Value) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "queryCommandSupported", &[command])
+    }
+
+    #[method(name = "queryCommandValue")]
+    fn query_command_value(&self, ctx: &mut Ctx, command: Value) -> OpResult<Value> {
+        editing_commands::call(self, ctx, "queryCommandValue", &[command])
+    }
+
     #[getter(name="designMode")]
     fn design_mode(&self)->&'static str {
         if self.realm.session.borrow().document().design_mode_enabled(self.base.id) {"on"}else{"off"}
@@ -11274,7 +11568,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
             // while unnamespaced createElement calls still use the HTML namespace.
             (Namespace::Html, name.to_owned())
         } else {
-            (Namespace::Other(Rc::from("")), name.to_owned())
+            (Namespace::Other(std::sync::Arc::from("")), name.to_owned())
         };
         let required = self.realm.session.borrow().document().element_creation_allocation_count(&namespace, &name, true);
         self.realm.prepare_allocation(ctx, required)?;
@@ -13481,6 +13775,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             module_activations_enabled: Cell::new(false),
             script_capabilities: Rc::new(ScriptCapabilities::default()),
             classic_resource_activations_enabled: Cell::new(false),
+            stream_scripts: RefCell::new(StreamScripts::default()),
             module_activations: RefCell::new(VecDeque::new()),
             dataset_intrinsics: RefCell::new(None),
             layout_flusher: RefCell::new(None),
@@ -13650,6 +13945,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             },
             realm: self.clone(),
             fonts: RefCell::new(None),
+            editing: RefCell::new(None),
         };
         let document = match self.document_interface {
             DocumentInterface::Document if self.is_html_document => ctx.new_instance(DomHtmlDocument { base: document }),
@@ -13721,6 +14017,15 @@ struct ResourceRequestRoot {
     retention: NodeRetention,
 }
 
+#[derive(Default)]
+struct StreamScripts {
+    opened: bool,
+    blocking: Option<(NodeId, u64)>,
+    deferred: Vec<NodeId>,
+    waiting: Vec<NodeId>,
+    generation: u64,
+}
+
 struct PendingScriptActivation {
     classic_context: Rc<lumen::ClassicScriptContext>,
     script: ScriptDescriptor,
@@ -13753,7 +14058,9 @@ impl ScriptActivation {
         let event = DomEvent::new(ctx, kind, None)?;
         let event = lumen::embed::JsObject::from_value(ctx.new_instance(event))
             .expect("native script Event object");
-        events::dispatch_user_agent_event(ctx, lumen_bind::This(self._wrapper.clone()), event)
+        let dispatched = events::dispatch_user_agent_event(ctx, lumen_bind::This(self._wrapper.clone()), event)?;
+        self.realm.stream_script_finished(ctx, self.script.node)?;
+        Ok(dispatched)
     }
 
     /// The current native owner/id for hosts which need the live element after
@@ -14159,6 +14466,9 @@ fn install_document_with_context_metadata(
     let window_target = DomEventTarget::window(&realm);
     *realm.window_target.borrow_mut() = Some(window_target.data_handle());
     realm.font_loading.capture_dom_exception(ctx);
+    if has_browsing_context {
+        lumen_host::performance_timeline::enable_paint(ctx).map_err(|_| InstallError::Global)?;
+    }
     ctx.attach_instance(
         &global,
         window_globals::DomWindow::from_target(window_target),
@@ -14292,6 +14602,7 @@ fn install_document_with_context_metadata(
             "HTMLMediaElement",
             ctx.class_constructor::<media::DomHtmlMediaElement>(),
         ),
+        ("MediaError", ctx.class_constructor::<media::DomMediaError>()),
         ("DOMStringMap", ctx.class_constructor::<DomDomStringMap>()),
         (
             "Animation",
@@ -15314,6 +15625,8 @@ mod tests {
             256,
         )
         .unwrap();
+        // An about:blank iframe is skipped when an ancestor navigable is itself at about:blank.
+        realm.set_document_url("https://parent.example.test/page");
         realm.process_initial_iframe_post_connections(engine.ctx());
         realm.process_initial_iframe_post_connections(engine.ctx());
         assert!(matches!(
@@ -15387,7 +15700,7 @@ mod tests {
                 }
               });
               document.body.appendChild(adopted);
-              const callbackAdoptionWasSafe = adoptedLoads === 2 &&
+              const callbackAdoptionWasSafe = adoptedLoads === 1 &&
                 adopted.ownerDocument === destinationDocument && adopted.contentDocument !== null;
 
               const failures = [];
@@ -15403,7 +15716,7 @@ mod tests {
               if (loads !== 3) failures.push('unexpected blank load count');
               if (!trusted) failures.push('initial blank load was not trusted');
               if (!rightTarget) failures.push('initial blank load target/currentTarget mismatch');
-              if (!callbackAdoptionWasSafe) failures.push('load callback adoption did not rehome one fresh navigable');
+              if (!callbackAdoptionWasSafe) failures.push('load callback adoption did not rehome the iframe into a fresh navigable');
               return failures.join('; ') || 'ok';
             })()
             "#,
@@ -15904,7 +16217,7 @@ mod tests {
                         invalidAttrName instanceof NativeDOMException &&
                         invalidAttrName.name === 'InvalidCharacterError');
                     let invalidQName;
-                    try { input.setAttributeNS('urn:lookalike', 'x:y:z', 'x'); }
+                    try { input.setAttributeNS('urn:lookalike', 'x:y z', 'x'); }
                     catch (error) { invalidQName = error; }
                     check('setAttributeNS validates QNames',
                         invalidQName instanceof NativeDOMException &&
@@ -16009,7 +16322,7 @@ mod tests {
                     removedReplacement === replacement && replacement.parentNode === null &&
                     sameNode === foreign && foreign.parentNode === main &&
                     foreign.ownerDocument === document &&
-                    foreignFragment.ownerDocument === document && foreignFragment.childNodes.length === 0 &&
+                    foreignFragment.ownerDocument === foreignDocument && foreignFragment.childNodes.length === 0 &&
                     foreignDocument.getElementById('foreign') === null &&
                     fragment.childNodes.length === 0 && main.childNodes.length === 3 &&
                     main.childNodes[0] === foreign && main.childNodes[1].data === 'x' &&
@@ -19063,7 +19376,7 @@ mod tests {
             64,
         )
         .unwrap();
-        let value = engine.eval_value("const main = document.querySelector('main'); const list = main.querySelectorAll('b'); const b = list[0]; const style = b.style; style.width = '12px'; style.setProperty('height','8px','important'); const computed = getComputedStyle(b); main.innerHTML = ''; style instanceof CSSStyleDeclaration && style === b.style && style.width === '12px' && style.getPropertyPriority('height') === 'important' && computed.width === '12px' && computed.color === 'rgb(255, 0, 0)' && list.length === 1 && list[0] === b && b.textContent === 'old'").unwrap().ok().unwrap();
+        let value = engine.eval_value("const main = document.querySelector('main'); const list = main.querySelectorAll('b'); const b = list[0]; const style = b.style; style.width = '12px'; style.setProperty('height','8px','important'); const computed = getComputedStyle(b); const liveWidth = computed.width, liveColor = computed.color; main.innerHTML = ''; style instanceof CSSStyleDeclaration && style === b.style && style.width === '12px' && style.getPropertyPriority('height') === 'important' && liveWidth === '12px' && liveColor === 'rgb(255, 0, 0)' && list.length === 1 && list[0] === b && b.textContent === 'old'").unwrap().ok().unwrap();
         assert!(matches!(value, Value::Bool(true)));
         assert!(realm.wrapper_count() < 10);
     }
@@ -19072,7 +19385,7 @@ mod tests {
     fn variadic_mutations_validate_before_moving_nodes() {
         let mut engine = Engine::new();
         install(engine.ctx(), "<main><i></i></main>", 64).unwrap();
-        let value = engine.eval_value("const main = document.querySelector('main'); const old = main.firstChild; const a = document.createElement('a'); const b = document.createElement('b'); let types = false; let hierarchy = false; try { main.append(a, {toString(){throw new Error('string coercion failed');}}); } catch(e) { types = true; } try { main.append(b, main); } catch(e) { hierarchy = true; } const unchanged = a.parentNode === null && b.parentNode === null && main.firstChild === old; main.replaceChildren(a, b); types && hierarchy && unchanged && main.firstChild === a && main.lastChild === b && old.parentNode === null && main.childNodes.length === 2").unwrap().ok().unwrap();
+        let value = engine.eval_value("const main = document.querySelector('main'); const old = main.firstChild; const a = document.createElement('a'); const b = document.createElement('b'); let types = false; let hierarchy = false; try { main.append(a, {toString(){throw new Error('string coercion failed');}}); } catch(e) { types = true; } try { main.append(b, main); } catch(e) { hierarchy = true; } const unchanged = a.parentNode === null && b.parentNode !== null && b.parentNode.nodeType === 11 && main.firstChild === old; main.replaceChildren(a, b); types && hierarchy && unchanged && main.firstChild === a && main.lastChild === b && old.parentNode === null && main.childNodes.length === 2").unwrap().ok().unwrap();
         assert!(matches!(value, Value::Bool(true)));
     }
 
@@ -20097,7 +20410,11 @@ mod tests {
             )
             .unwrap()
         });
-        engine.eval_value("document.querySelector('head').innerHTML = '<style>div{width:20px;height:20px;background:blue}</style>'").unwrap().ok().unwrap();
+        engine.eval_value("document.querySelector('head').innerHTML = '<style>div{width:20px;height:20px;background:blue}</style>'").unwrap().unwrap_or_else(|exception| {
+            let description = engine.ctx().member_get(&exception, "stack").ok()
+                .and_then(|value| engine.ctx().coerce_string(&value).ok()).map(|value| value.to_string()).unwrap_or_default();
+            panic!("head innerHTML replacement threw: {description}");
+        });
         assert!(realm
             .session
             .borrow()
@@ -20532,7 +20849,7 @@ mod tests {
             const returnedFragment = target.appendChild(fragment);
             const valid = appended === attached && inserted === orphan &&
                 returnedFragment === fragment && fragment.childNodes.length === 0 &&
-                fragment.ownerDocument === document && text.ownerDocument === document &&
+                fragment.ownerDocument === donorDocument && text.ownerDocument === document &&
                 text.parentNode === target && orphan.ownerDocument === document &&
                 attached.ownerDocument === document && target.firstChild === orphan && events === 1;
 
@@ -20661,7 +20978,8 @@ mod tests {
               Promise.resolve().then(() => {
                 globalThis.adoptionDone = immediate && adopted === element &&
                   lifecycle.map(entry => entry[0]).join(',') === 'connected,disconnected,adopted,connected' &&
-                  lifecycle.every(entry => entry[1] === true);
+                  lifecycle.map(entry => entry.join(':')).join('|') ===
+                    'connected:false:true:true|disconnected:true:true:false|adopted:true:true|connected:true:true:false';
               });
             });
             true

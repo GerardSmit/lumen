@@ -226,6 +226,7 @@ mod tests {
                 Err(error) => panic!("font fixture accept: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
         let mut request = Vec::new();
         let mut chunk = [0; 512];

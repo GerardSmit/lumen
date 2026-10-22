@@ -296,7 +296,7 @@ impl Document {
         &mut self,
         sink: Option<Rc<dyn Fn(&Document, DetailsTransition)>>,
     ) {
-        self.details_sink = sink;
+        self.details_sink = crate::css::Hook::new(sink);
     }
 
     pub fn details_open_state(&self, id: NodeId) -> Option<bool> {
@@ -309,7 +309,7 @@ impl Document {
     }
 
     fn details_notify(&self, id: NodeId, old_open: bool, new_open: bool) {
-        if let Some(sink) = &self.details_sink {
+        if let Some(sink) = self.details_sink.get(&self.host_gate) {
             sink(self, DetailsTransition { node: id, old_open, new_open });
         }
     }

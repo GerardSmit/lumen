@@ -921,6 +921,9 @@ impl Interp {
 
 pub struct Interp {
     pub(crate) global: Gc,
+    /// The `[[IsHTMLDDA]]` objects (`document.all`, `$262.IsHTMLDDA`): `typeof` "undefined", falsy,
+    /// loosely equal to null and undefined. Each has a clear `ic_plain`.
+    pub(crate) html_dda: Vec<crate::value::WeakGc>,
     /// The realm's published global-this value. Usually this is the backing global; host realms
     /// may use a registered WindowProxy while name resolution still targets `global`.
     pub(crate) global_this: Value,
@@ -1985,6 +1988,7 @@ impl Interp {
         let global_env = new_var_scope(None);
         Interp {
             global: global.clone(),
+            html_dda: Vec::new(),
             global_this: Value::Obj(global.clone()),
             global_env,
             #[cfg(feature = "aot-native")]
@@ -5377,16 +5381,18 @@ impl Interp {
     /// equal to `null` and `undefined` (HTML's `document.all`).
     pub fn mark_html_dda(&mut self, value: &Value) {
         if let Value::Obj(object) = value {
-            let object = object.borrow();
-            object.html_dda.set(true);
-            object.ic_plain.set(false);
+            object.borrow().ic_plain.set(false);
+            self.html_dda.retain(|d| d.strong_count() > 0);
+            if !self.html_dda.iter().any(|d| d.as_ptr() == Gc::as_ptr(object)) {
+                self.html_dda.push(Gc::downgrade(object));
+            }
         }
     }
 
     /// Whether `v` is the [[IsHTMLDDA]] object.
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
         match v {
-            Value::Obj(o) => o.borrow().html_dda.get(),
+            Value::Obj(o) => self.html_dda.iter().any(|d| d.as_ptr() == Gc::as_ptr(o)),
             _ => false,
         }
     }

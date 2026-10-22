@@ -986,7 +986,7 @@ pub(crate) fn namespace_from_uri(uri: Option<&str>) -> Namespace {
         "http://www.w3.org/1999/xhtml" => Namespace::Html,
         "http://www.w3.org/2000/svg" => Namespace::Svg,
         "http://www.w3.org/1998/Math/MathML" => Namespace::MathMl,
-        value => Namespace::Other(Rc::from(value)),
+        value => Namespace::Other(alloc::sync::Arc::from(value)),
     }
 }
 
@@ -1848,7 +1848,7 @@ mod tests {
         let mut document = Document::new(16);
         let element = document
             .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("")),
                 name: Name::new("root"),
                 attributes: Vec::new(),
             })
@@ -2012,14 +2012,14 @@ mod tests {
             ),
             ("<h:template xmlns:h='urn:foreign'/>", false),
         ] {
-            let document = parse(markup, 3).unwrap();
+            let document = parse(markup, 4).unwrap();
             let root = root_element(&document);
             assert_eq!(
                 document.template_content(root).unwrap().is_some(),
                 is_template
             );
-            assert_eq!(document.node_count(), if is_template { 3 } else { 2 });
-            assert_eq!(parse(markup, 2).is_err(), is_template);
+            assert_eq!(document.node_count(), if is_template { 4 } else { 2 });
+            assert_eq!(parse(markup, 3).is_err(), is_template);
         }
     }
 
@@ -2263,7 +2263,7 @@ mod tests {
         let root = root_element(&document);
         let child = document
             .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("")),
                 name: Name::new("bad name"),
                 attributes: Vec::new(),
             })
@@ -2292,21 +2292,21 @@ mod tests {
 
         let numeric_prefix = document
             .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("urn:numeric-prefix")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("urn:numeric-prefix")),
                 name: Name::new("1:item"),
                 attributes: Vec::new(),
             })
             .unwrap();
         let multiple_colons = document
             .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("urn:multiple-colons")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("urn:multiple-colons")),
                 name: Name::new("p:local:part"),
                 attributes: Vec::new(),
             })
             .unwrap();
         let literal_colon = document
             .create_unprefixed_element(
-                Namespace::Other(Rc::from("")),
+                Namespace::Other(alloc::sync::Arc::from("")),
                 Name::new("literal:element"),
                 Vec::new(),
             )
@@ -2345,7 +2345,7 @@ mod tests {
             .unwrap();
         let child = lookalike_declaration
             .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("urn:lookalike")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("urn:lookalike")),
                 name: Name::new("p:child"),
                 attributes: Vec::new(),
             })

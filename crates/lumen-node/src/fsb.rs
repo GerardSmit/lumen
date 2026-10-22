@@ -458,13 +458,11 @@ pub(crate) mod bindings {
 
     /// A whole file decoded as UTF-8 (invalid sequences become U+FFFD), for `readFileSync(p, 'utf8')`.
     #[op(name = "readFileUtf8")]
-    fn op_read_file_utf8(path: &str, flags: i32) -> Result<String, OpError> {
-        let bytes = fs().read_file(path, flags).uv()?;
-        let s = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        };
-        Ok(crate::codec::canonical(s))
+    fn op_read_file_utf8(path: &str, flags: i32) -> Result<Value, OpError> {
+        let value = lumen_os::vfs::read_file_with(fs(), path, flags, |size, read| {
+            Value::from_utf8_reader(size, read)
+        });
+        Ok(value.uv()?)
     }
 
     /// Whole-file write by path: `flags` are Node's numeric open flags.

@@ -377,6 +377,7 @@ fn side_table_keys_are_file_offsets() {
     let FnSource::Range { src: rc, .. } = &f.source else {
         panic!("no range")
     };
+    let rc = rc.flat();
     // Blanked in place, same bytes.
     assert_eq!(rc.len(), src.len());
     assert!(!rc.contains("number"));
@@ -405,6 +406,7 @@ fn js_docs_are_recorded() {
     let FnSource::Range { src: rc, .. } = &f.source else {
         panic!("no range")
     };
+    let rc = rc.flat();
     let t = side_table_for(rc).expect("side table");
     assert_eq!(t.docs, vec![(0, 24)]);
     let at = src.find("function").unwrap() as u32;

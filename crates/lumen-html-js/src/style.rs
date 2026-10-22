@@ -280,6 +280,7 @@ pub(crate) fn install_css_property_aliases(ctx: &mut Ctx) -> OpResult<()> {
 }
 
 fn camel_case_alias(property: &str) -> Option<String> {
+    if property == "float" { return Some(String::from("cssFloat")); }
     let out = css_property_to_idl(property, false);
     (out != property).then_some(out)
 }
@@ -918,7 +919,7 @@ mod tests {
             selection.setBaseAndExtent(many,0,many,1);eq(selection.toString(),'a');
             many.data='h';eq(math.innerText,'𝑎ℎ');
             target.style.textTransform='math-auto full-width';eq(target.style.textTransform,'uppercase full-width full-size-kana');
-            target.style.all='initial';eq(target.style.textTransform,'uppercase full-width full-size-kana');eq(getComputedStyle(target).textTransform,'none');
+            target.style.all='initial';eq(target.style.textTransform,'initial');eq(getComputedStyle(target).textTransform,'none');
             return true;
         })()"#).unwrap().unwrap_or_else(|error|panic!("modern transform projection: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));
         assert!(matches!(result,Value::Bool(true)));
@@ -1238,18 +1239,18 @@ mod tests {
             expect(computed.alignContent,'normal'); expect(computed.justifyContent,'normal');
             expect(computed.placeItems,'normal'); expect(computed.placeSelf,'auto');
             element.style.cssText='place-items:flex-start normal;place-self:normal flex-end;align-content:safe flex-end;justify-content:unsafe flex-start';
-            expect(computed.alignItems,'flex-start'); expect(computed.justifyItems,'normal');
-            expect(computed.alignSelf,'normal'); expect(computed.justifySelf,'flex-end');
-            expect(computed.placeItems,'flex-start normal'); expect(computed.placeSelf,'normal flex-end');
-            expect(computed.alignContent,'safe flex-end'); expect(computed.justifyContent,'unsafe flex-start');
+            expect(computed.alignItems,'flow-start'); expect(computed.justifyItems,'normal');
+            expect(computed.alignSelf,'normal'); expect(computed.justifySelf,'flow-end');
+            expect(computed.placeItems,'flow-start normal'); expect(computed.placeSelf,'normal flow-end');
+            expect(computed.alignContent,'safe flow-end'); expect(computed.justifyContent,'unsafe flow-start');
             element.style.alignItems='start'; element.style.justifyItems='stretch';
             expect(computed.placeItems,'start stretch');
-            element.style.placeItems='flex-end'; expect(computed.placeItems,'flex-end');
-            element.style.justifyItems='end'; expect(computed.placeItems,'flex-end end');
+            element.style.placeItems='flex-end'; expect(computed.placeItems,'flow-end');
+            element.style.justifyItems='end'; expect(computed.placeItems,'flow-end end');
             parent.style.cssText='place-items:normal flex-start;place-self:flex-end normal;align-content:unsafe flex-start;justify-content:safe flex-end';
             element.style.cssText='place-items:inherit;place-self:inherit;align-content:inherit;justify-content:inherit';
-            expect(computed.placeItems,'normal flex-start'); expect(computed.placeSelf,'flex-end normal');
-            expect(computed.alignContent,'unsafe flex-start'); expect(computed.justifyContent,'safe flex-end');
+            expect(computed.placeItems,'normal flow-start'); expect(computed.placeSelf,'flow-end normal');
+            expect(computed.alignContent,'unsafe flow-start'); expect(computed.justifyContent,'safe flow-end');
             element.style.cssText='place-items:initial;place-self:unset;align-content:initial;justify-content:unset';
             expect(computed.placeItems,'normal'); expect(computed.placeSelf,'auto');
             expect(computed.alignContent,'normal'); expect(computed.justifyContent,'normal');
@@ -1579,7 +1580,7 @@ mod tests {
             eq(getComputedStyle(staticBox).top, '10%'); eq(getComputedStyle(staticBox).left, '25%');
             relative.style.display = 'none'; eq(computed.left, '20%'); eq(computed.right, 'auto');
             const detached = document.createElement('div'); detached.style.cssText = 'position:relative;left:30%';
-            eq(getComputedStyle(detached).left, '30%'); eq(getComputedStyle(detached).right, 'auto');
+            eq(getComputedStyle(detached).left, ''); eq(getComputedStyle(detached).right, '');
             const rule = document.styleSheets[0].cssRules[1];
             eq(rule.style.gridTemplateRows, '[head] auto [tail]'); eq(rule.style.gridTemplateColumns, '1em 2fr');
             const element = document.querySelector('.grid'); element.style.cssText = 'grid:auto-flow 1em / 20px;font-size:20px';

@@ -25,6 +25,9 @@ const MAX_WRAPPED_NAMESPACE_VALUES: usize = 256;
 const UNSUPPORTED_NAMESPACE_LIMIT: &str = "WPT testdriver namespace cache limit was reached";
 const UNSUPPORTED_ACTION_PROFILE: &str =
     "WPT testdriver Actions input profile is not implemented by the native host";
+const UNSUPPORTED_DRAG: &str =
+    "WPT testdriver pointer actions started a drag-and-drop operation, which the native host does not implement";
+const DRAG_START_DISTANCE: f64 = 3.0;
 const MAX_PENDING_ACTION_COMMANDS: usize = 64;
 const MAX_ACTION_SOURCES: usize = 8;
 // The per-command simultaneous-source limit is distinct from the bounded
@@ -129,6 +132,8 @@ struct ActionPointerState {
     id: String,
     kind: PointerKind,
     state: forms::TrustedPointerState,
+    /// Where the primary button went down on a drag source; cleared on release.
+    drag_origin: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1197,6 +1202,7 @@ fn prepare_pointer_sources(
                 id: source.id.clone(),
                 kind: source.kind,
                 state: pointer,
+                drag_origin: None,
             });
             index
         };
@@ -1757,7 +1763,20 @@ fn run_action_tick(
                     )?;
                 }
                 forms::trusted_pointer_down(ctx, &realm, &mut next, target, modifiers)?;
+                let drag_origin = (next.properties.pointer_type == "mouse"
+                    && next.down_target.is_some()
+                    && next.compatibility_mouse_allowed
+                    && is_drag_source_target(&realm, target))
+                .then_some((next.x, next.y));
                 set_action_pointer_state(bridge, pointer_state_index, next)?;
+                if let Some(pointer) = bridge
+                    .borrow_mut()
+                    .action_state
+                    .pointers
+                    .get_mut(pointer_state_index)
+                {
+                    pointer.drag_origin = drag_origin;
+                }
             }
             PlannedAction::PointerUp { pointer_slot } => {
                 let pointer_state_index =
@@ -1786,6 +1805,14 @@ fn run_action_tick(
                     ctx, &realm, &mut next, target, modifiers, detail,
                 )?;
                 set_action_pointer_state(bridge, pointer_state_index, next)?;
+                if let Some(pointer) = bridge
+                    .borrow_mut()
+                    .action_state
+                    .pointers
+                    .get_mut(pointer_state_index)
+                {
+                    pointer.drag_origin = None;
+                }
                 if clicked && next.properties.pointer_type == "mouse" {
                     remember_click(&bridge, target, next.x, next.y, detail);
                 }
@@ -1848,9 +1875,62 @@ fn perform_pointer_move(
             "pointer point is outside the document viewport",
         )
     })?;
+    check_drag_start(bridge, pointer_state_index, &state, x, y)?;
     let mut next = state;
     forms::trusted_pointer_move(ctx, realm, &mut next, target, x, y, modifiers)?;
     set_action_pointer_state(bridge, pointer_state_index, next)
+}
+
+/// Whether pressing the primary button on `target` begins a drag-and-drop source selection:
+/// the nearest ancestor with `draggable` enabled, unless a form control that handles its own
+/// pointer drags is hit first.
+fn is_drag_source_target(realm: &Rc<DomRealm>, target: NodeId) -> bool {
+    let session = realm.session.borrow();
+    let document = session.document();
+    let mut node = Some(target);
+    while let Some(current) = node {
+        if matches!(
+            lumen_html::forms::html_element_local_name(document, current),
+            Some("select" | "option" | "input" | "textarea")
+        ) {
+            return false;
+        }
+        if lumen_html::element_metadata::draggable_enabled(document, current, false) {
+            return true;
+        }
+        node = document.parent(current).ok().flatten();
+    }
+    false
+}
+
+/// The native host has no DataTransfer or drag-and-drop session. Moving a pressed mouse over a
+/// drag source would start one in a browser, so fail observably instead of leaving the awaited
+/// `dragstart`/`drop` events pending.
+fn check_drag_start(
+    bridge: &Rc<RefCell<RealmBridge>>,
+    pointer_state_index: usize,
+    state: &forms::TrustedPointerState,
+    x: f64,
+    y: f64,
+) -> OpResult<()> {
+    if state.buttons & 1 == 0 {
+        return Ok(());
+    }
+    let mut bridge = bridge.borrow_mut();
+    let Some(pointer) = bridge.action_state.pointers.get_mut(pointer_state_index) else {
+        return Ok(());
+    };
+    let Some((origin_x, origin_y)) = pointer.drag_origin else {
+        return Ok(());
+    };
+    if (x - origin_x).hypot(y - origin_y) <= DRAG_START_DISTANCE {
+        return Ok(());
+    }
+    pointer.drag_origin = None;
+    let case = bridge.case.clone();
+    drop(bridge);
+    case.record_unsupported(UNSUPPORTED_DRAG);
+    Err(OpError::new("NotSupportedError", UNSUPPORTED_DRAG))
 }
 
 fn perform_wheel_scroll(

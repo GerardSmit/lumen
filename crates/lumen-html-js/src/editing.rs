@@ -1524,7 +1524,44 @@ mod tests {
             );
             let unchanged = session.display_list(300, 100, fonts).unwrap().clone();
             assert_eq!(after, unchanged);
-            let mut fresh = lumen_html::session::RenderSession::new(session.document().clone_document(true).unwrap());
+            let mut fresh_document = session.document().clone_document(true).unwrap();
+            let validity_forms = std::rc::Rc::downgrade(&realm.forms);
+            let generation_forms = validity_forms.clone();
+            fresh_document.set_validity_resolver(
+                std::rc::Rc::new(move |document, node| {
+                    let state = validity_forms.upgrade()?;
+                    let state = state.borrow();
+                    Some(lumen_html::forms::validity_with_view(document, node, &*state))
+                }),
+                std::rc::Rc::new(move || generation_forms.upgrade().map_or(0, |state| state.borrow().validity_generation())),
+            );
+            fn map_clone(
+                original: &lumen_html::Document,
+                clone: &lumen_html::Document,
+                from: lumen_html::NodeId,
+                to: lumen_html::NodeId,
+                out: &mut std::collections::HashMap<lumen_html::NodeId, lumen_html::NodeId>,
+            ) {
+                out.insert(to, from);
+                let mut left = original.first_child(from).unwrap();
+                let mut right = clone.first_child(to).unwrap();
+                while let (Some(a), Some(b)) = (left, right) {
+                    map_clone(original, clone, a, b, out);
+                    left = original.next_sibling(a).unwrap();
+                    right = clone.next_sibling(b).unwrap();
+                }
+            }
+            let mut originals = std::collections::HashMap::new();
+            map_clone(session.document(), &fresh_document, session.document().root(), fresh_document.root(), &mut originals);
+            let value_forms = std::rc::Rc::downgrade(&realm.forms);
+            fresh_document.set_form_value_resolver(std::rc::Rc::new(move |node, read| match (value_forms.upgrade(), originals.get(&node)) {
+                (Some(state), Some(original)) => {
+                    let state = state.borrow();
+                    read(crate::forms::presentation_value(&state, *original));
+                }
+                _ => read(None),
+            }));
+            let mut fresh = lumen_html::session::RenderSession::new(fresh_document);
             let fresh_list = fresh.display_list(300, 100, fonts).unwrap().clone();
             assert_eq!(
                 after, fresh_list,

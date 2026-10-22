@@ -134,8 +134,9 @@ fn resolved_element_directionality_with_budget(
     node: NodeId,
     budget: &mut DirectionalityBudget,
 ) -> Direction {
-    let live_value_direction = document
-        .form_selector_state(node)
+    let live_value_direction = is_auto_directionality_form_associated(document, node)
+        .then(|| document.form_selector_state(node))
+        .flatten()
         .and_then(|state| state.auto_value_directionality);
     element_directionality_with_budget(document, node, live_value_direction, budget)
 }

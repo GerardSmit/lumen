@@ -542,7 +542,7 @@ pub(crate) fn script_child_text_bounded(document:&Document,node:NodeId,limit:usi
     Ok(text)
 }
 
-fn type_from_attributes(attribute: impl Fn(&str) -> Option<String>) -> DeclaredScriptType {
+pub(crate) fn type_from_attributes(attribute: impl Fn(&str) -> Option<String>) -> DeclaredScriptType {
     let kind = match attribute("type") {
         Some(value) if value.is_empty() => "text/javascript".to_owned(),
         Some(value) => value

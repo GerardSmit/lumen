@@ -427,7 +427,8 @@ impl ContextGroup {
     }
 
     fn register(&self, context: &Rc<BrowsingContext>) {
-        let mut histories = self.history.contexts.borrow_mut();
+        let store = context.history_store().unwrap_or_else(|| self.history.clone());
+        let mut histories = store.contexts.borrow_mut();
         histories.retain(|_, context| context.strong_count() != 0);
         histories.insert(context.history_id(), Rc::downgrade(context));
         drop(histories);
@@ -573,6 +574,7 @@ fn remove_group(ctx: &mut Ctx, root_key: usize) {
 /// object retains the active document and its host realm for child contexts.
 pub(crate) struct BrowsingContext {
     pub(crate) history: RefCell<Option<Rc<super::history::NavigableHistory>>>,
+    own_history: Option<Rc<super::history::HistoryStore>>,
     history_navigation: RefCell<Option<Rc<super::history::Entry>>>,
     committed_history_entry: RefCell<Option<Rc<super::history::Entry>>>,
     pending_post_resource: RefCell<Option<Rc<NavigationPostResource>>>,
@@ -1457,7 +1459,15 @@ impl BrowsingContext {
         self.navigation_generation.set(self.navigation_generation.get().wrapping_add(1));
         self.beforeunload_generation.set(Some(self.navigation_generation.get()));
     }
-    pub(crate) fn history_store(&self) -> Option<Rc<super::history::HistoryStore>> { self.group.upgrade().map(|group| group.history.clone()) }
+    /// Each top-level traversable owns its session history: the group's store
+    /// serves the primary top-level context, every auxiliary context has its own.
+    pub(crate) fn history_store(&self) -> Option<Rc<super::history::HistoryStore>> {
+        if let Some(store) = &self.own_history { return Some(store.clone()); }
+        match self.parent.as_ref() {
+            Some(parent) => parent.upgrade()?.history_store(),
+            None => self.group.upgrade().map(|group| group.history.clone()),
+        }
+    }
     pub(crate) fn history_id(&self) -> u64 { self.insertion_order }
     pub(crate) fn next_transition_generation(&self) -> OpResult<u64> {
         let group=self.group.upgrade().ok_or_else(||OpError::new("InvalidStateError","document browsing context no longer available"))?;
@@ -1540,6 +1550,7 @@ impl BrowsingContext {
         let proxy_metadata = Rc::new(RefCell::new(metadata.clone()));
         let context = Rc::new(Self {
             history: RefCell::new(None),
+            own_history: None,
             history_navigation: RefCell::new(None),
             committed_history_entry: RefCell::new(None),
             pending_post_resource: RefCell::new(None),
@@ -2267,7 +2278,7 @@ impl DomRealm {
         let parsed = ctx.with_host_realm(&child_realm, |ctx| {
             let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
             let document = html::parse_with_options_initialized(&source, max_nodes,
-                html::ParseOptions { allow_declarative_shadow_roots: true, ..Default::default() },
+                html::ParseOptions { allow_declarative_shadow_roots: true, scripting_enabled: true },
                 |document| controller.attach(document))
                 .map_err(|error| OpError::error(format!("{error:?}")))?;
             Ok::<_, OpError>((document, controller))
@@ -2303,6 +2314,7 @@ impl DomRealm {
         let proxy_metadata = Rc::new(RefCell::new(metadata.clone()));
         let child = Rc::new(BrowsingContext {
             history: RefCell::new(None),
+            own_history: node.is_none().then(|| Rc::new(super::history::HistoryStore::for_root(insertion_order))),
             history_navigation: RefCell::new(None),
             committed_history_entry: RefCell::new(None),
             pending_post_resource: RefCell::new(None),
@@ -3045,6 +3057,73 @@ mod tests {
             "popup===open('', 'replacement') && popup.document.querySelector('#result').textContent==='actual replacement' && popup.document.URL==='about:blank' && popup.parent===popup && popup.opener===window"), Value::Bool(true)));
     }
 
+    #[test]
+    fn auxiliary_context_owns_a_separate_session_history() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<body></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        assert!(matches!(eval(&mut engine, "globalThis.popup = open('', 'history-popup'); popup !== null"), Value::Bool(true)));
+        let frame = parent.auxiliary_contexts().remove(0);
+        let request = frame.request_host_navigation("https://parent.example.test/popup").unwrap();
+        frame.install_response_for_request(engine.ctx(), &request, "https://parent.example.test/popup",
+            "text/html", "<body></body>", 128).unwrap();
+        let parent_store = parent.browsing_context().unwrap().history_store().unwrap();
+        let popup_store = frame.inner.history_store().unwrap();
+        assert!(!Rc::ptr_eq(&parent_store, &popup_store));
+        let handle = frame.realm_handle();
+        let result = engine.eval_value_in_host_realm(&handle,
+            "history.pushState(1, '', '#a'); history.pushState(2, '', '#b'); history.length === 3", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        assert!(matches!(eval(&mut engine, "history.length === 1 && popup.history.length === 3"), Value::Bool(true)));
+        let result = engine.eval_value_in_host_realm(&handle,
+            "globalThis.popped = []; addEventListener('popstate', e => popped.push(e.state)); history.back(); true", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        for _ in 0..8 {
+            assert!(super::super::scheduling::run_navigation_tasks(&mut engine, 64).is_empty());
+            assert!(super::super::scheduling::run_tasks(&mut engine, 64).is_empty());
+        }
+        let result = engine.eval_value_in_host_realm(&handle,
+            "popped.join() === '1' && location.hash === '#a' && history.length === 3", false).unwrap();
+        assert!(matches!(result, Ok(Value::Bool(true))));
+        assert!(matches!(eval(&mut engine, "history.length === 1"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn document_open_adopts_entry_url_and_parser_waits_for_external_stream_scripts() {
+        let mut runtime = lumen_runtime::Runtime::new_browser();
+        let mut engine = runtime.engine();
+        let parent = crate::install(engine.ctx(), "<iframe id='child'></iframe>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/dir/page.html");
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let child = frame.current_document().unwrap();
+        child.enable_resource_script_activations();
+        assert!(matches!(eval(&mut engine, r#"
+            globalThis.doc = document.getElementById('child').contentDocument;
+            doc.open();
+            doc.write('<script src="blocking.js"></script><p id="after"></p><script defer src="deferred.js"></script>');
+            doc.close();
+            doc.URL === 'https://parent.example.test/dir/page.html' &&
+            doc.baseURI === 'https://parent.example.test/dir/page.html' &&
+            doc.getElementById('after') === null && doc.readyState === 'loading'
+        "#), Value::Bool(true)));
+        let handle = frame.realm_handle();
+        let mut activations = child.drain_script_activations(engine.ctx());
+        assert_eq!(activations.len(), 1);
+        let blocking = activations.remove(0);
+        assert_eq!(blocking.script.src.as_deref(), Some("blocking.js"));
+        assert!(!blocking.script.parser_inserted);
+        assert_eq!(blocking.base_url, "https://parent.example.test/dir/page.html");
+        engine.ctx().with_host_realm(&handle, |ctx| blocking.dispatch_terminal(ctx, "load")).unwrap().unwrap();
+        assert!(matches!(eval(&mut engine, "doc.getElementById('after') !== null && doc.readyState === 'loading'"), Value::Bool(true)));
+        let mut activations = child.drain_script_activations(engine.ctx());
+        assert_eq!(activations.len(), 1);
+        let deferred = activations.remove(0);
+        assert_eq!(deferred.script.src.as_deref(), Some("deferred.js"));
+        engine.ctx().with_host_realm(&handle, |ctx| deferred.dispatch_terminal(ctx, "load")).unwrap().unwrap();
+        assert!(matches!(eval(&mut engine, "doc.readyState === 'complete'"), Value::Bool(true)));
+    }
+
     fn set_attribute(realm: &Rc<DomRealm>, node: NodeId, name: &str, value: &str) {
         realm.with_session(|session| {
             session
@@ -3052,6 +3131,15 @@ mod tests {
                 .set_attribute(node, name, value)
                 .expect("valid test attribute");
         });
+    }
+
+    fn leave_initial_about_blank(engine: &mut Engine, parent: &Rc<DomRealm>, frame: &FrameContext) {
+        set_attribute(parent, frame.owner_node(), "src", "https://parent.example.test/initial");
+        let request = frame.navigation_request();
+        frame
+            .install_response_for_request(engine.ctx(), &request, "https://parent.example.test/initial",
+                "text/html", "<body>initial</body>", 128)
+            .expect("leave the initial about:blank document");
     }
 
     fn node_by_id(realm: &Rc<DomRealm>, wanted: &str) -> NodeId {
@@ -3088,7 +3176,9 @@ mod tests {
         let parent = crate::install(engine.ctx(),
             "<iframe id='child' srcdoc='<details id=\"moving\"></details>'></iframe>", 128).unwrap();
         let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
-        let child = frame.current_document().unwrap();
+        let request = frame.navigation_request();
+        let child = frame.install_response_for_request(engine.ctx(), &request, "about:srcdoc", "text/html",
+            "<details id=\"moving\"></details>", 128).unwrap();
         let child_handle = active_child_handle(&child);
         eval(&mut engine, "globalThis.frameAdoptionSteps=[];globalThis.normalChildTaskRan=false;globalThis.recordFrameAdoptionStep=step=>frameAdoptionSteps.push(step);");
         let queue_parent_step = |engine: &mut Engine, step: &'static str| {
@@ -3145,7 +3235,9 @@ mod tests {
         let parent = crate::install(engine.ctx(),
             "<iframe id='child' srcdoc='<details open></details>'></iframe>", 128).unwrap();
         let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
-        let initial = frame.current_document().unwrap();
+        let request = frame.navigation_request();
+        let initial = frame.install_response_for_request(engine.ctx(), &request, "about:srcdoc", "text/html",
+            "<details open></details>", 128).unwrap();
         let script = "globalThis.frameToggles=[];document.querySelector('details').addEventListener('toggle',e=>frameToggles.push(e instanceof ToggleEvent&&e.isTrusted&&e.oldState==='closed'&&e.newState==='open'&&e.target.ownerDocument===document));";
         let initial_handle = active_child_handle(&initial);
         assert!(engine.eval_value_in_host_realm(&initial_handle, script, false).unwrap().is_ok());
@@ -3174,10 +3266,11 @@ mod tests {
         let parent = crate::install(engine.ctx(), "<iframe id='child'></iframe>", 128).unwrap();
         let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
         let request = frame.navigation_request();
-        assert!(matches!(frame.prepare_response_for_request(engine.ctx(), &request,
+        let malformed = frame.prepare_response_for_request(engine.ctx(), &request,
             "about:blank", "application/xhtml+xml",
-            "<details xmlns='http://www.w3.org/1999/xhtml' open=''><bad></details>", 128),
-            Err(FrameInstallError::Parse(_))));
+            "<details xmlns='http://www.w3.org/1999/xhtml' open=''><bad></details>", 128)
+            .expect("XML well-formedness errors surface through the live document parser");
+        for realm in malformed.discard(engine.ctx()) { dispose_compat_realm(engine.ctx(), &realm); }
         assert!(!super::super::scheduling::task_pending(engine.ctx()));
         let mut prepared = frame.prepare_response_for_request(engine.ctx(), &request,
             "about:blank", "text/html", "<details open></details>", 128).unwrap();
@@ -3186,9 +3279,14 @@ mod tests {
         // The already admitted real notification must wait for its native lease.
         assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
         assert!(!super::super::scheduling::task_pending(engine.ctx()));
-        frame.initialize_prepared_document(engine.ctx(), &mut prepared).unwrap();
-        assert!(super::super::scheduling::task_pending(engine.ctx()));
+        let initialized = frame.initialize_prepared_document(engine.ctx(), &mut prepared).unwrap();
         let handle = prepared.realm_handle();
+        engine.ctx().with_host_realm(&handle, |ctx| {
+            while initialized.has_live_document_parser() {
+                initialized.next_document_parser_script(ctx).unwrap();
+            }
+        }).unwrap();
+        assert!(super::super::scheduling::task_pending(engine.ctx()));
         assert!(engine.eval_value_in_host_realm(&handle,
             "globalThis.stagedDetailsCount=0;document.querySelector('details').addEventListener('toggle',()=>stagedDetailsCount++);",
             false).unwrap().is_ok());
@@ -3468,6 +3566,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("one iframe");
+        leave_initial_about_blank(&mut engine, &parent, &frame);
         let initial_handle = frame.realm_handle();
         let proxy = frame.window_proxy().expect("initial WindowProxy");
         let initial_document = frame
@@ -3584,6 +3683,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("one iframe");
+        leave_initial_about_blank(&mut engine, &parent, &frame);
         let active_realm = frame.realm_handle();
         let active_document = frame.current_document().expect("initial document");
         let proxy = frame.window_proxy().expect("stable WindowProxy");

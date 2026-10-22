@@ -1,6 +1,6 @@
 //! DOM queries backed by the cascade's selector matcher.
 use crate::{css, Document, Error, NodeId, NodeKind};
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -9,7 +9,7 @@ const SELECTOR_CACHE_ENTRIES: usize = 32;
 fn cached_selector_list(
     document: &Document,
     source: &str,
-) -> Result<Rc<Vec<css::Selector>>, css::CssError> {
+) -> Result<Arc<Vec<css::Selector>>, css::CssError> {
     let mut cache = document.selector_cache.borrow_mut();
     if let Some(position) = cache.iter().position(|(text, _)| text == source) {
         let entry = cache.remove(position);
@@ -17,7 +17,7 @@ fn cached_selector_list(
         cache.push(entry);
         return Ok(parsed);
     }
-    let parsed = Rc::new(css::parse_selector_list(source, 0)?);
+    let parsed = Arc::new(css::parse_selector_list(source, 0)?);
     if cache.len() >= SELECTOR_CACHE_ENTRIES {
         cache.remove(0);
     }
@@ -715,7 +715,10 @@ mod tests {
             query_selector(&doc, root, "[data-label~='a']").unwrap(),
             Some(container)
         );
-        assert!(query_selector(&doc, root, "[data-label").is_err());
+        assert_eq!(
+            query_selector(&doc, root, "[data-label").unwrap(),
+            query_selector(&doc, root, "[data-label]").unwrap()
+        );
     }
 
     #[test]

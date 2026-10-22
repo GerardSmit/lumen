@@ -26,11 +26,47 @@ pub(crate) fn draw_quad(
     ];
     let center = [rect.x * sink.scale + half[0], rect.y * sink.scale + half[1]];
     let r = radius * sink.scale;
+    // Pixels whose distance is below -0.5 - MARGIN have coverage exactly 1; MARGIN absorbs
+    // float rounding of the signed-distance expression.
+    const MARGIN: f32 = 0.05;
+    let corner_reach = r.max(0.5) + MARGIN;
+    let origin_x = sink.device_origin[0] as f64;
     for y in y0..y1 {
-        for x in x0..x1 {
+        let pixel_y = (i64::from(y) + sink.device_origin[1]) as f32;
+        let mut solid = x0..x0;
+        if border.is_none() {
+            let vertical = (pixel_y + 0.5 - center[1]).abs() - half[1];
+            let reach = if vertical <= -corner_reach {
+                Some(half[0] - 0.5 - MARGIN)
+            } else if vertical <= -(0.5 + MARGIN) {
+                Some(half[0] - corner_reach)
+            } else {
+                None
+            };
+            if let Some(reach) = reach.filter(|reach| *reach >= 0.0) {
+                let first = (f64::from(center[0] - reach - 0.5).ceil() - origin_x).max(f64::from(x0));
+                let last = (f64::from(center[0] + reach - 0.5).floor() + 1.0 - origin_x).min(f64::from(x1));
+                if last > first {
+                    solid = first as u32..last as u32;
+                }
+            }
+        }
+        if !solid.is_empty() {
+            let row = y as usize * sink.image.width as usize;
+            let span = (row + solid.start as usize) * 4..(row + solid.end as usize) * 4;
+            for target in sink.image.pixels[span].chunks_exact_mut(4) {
+                if color.a == 255 {
+                    target.copy_from_slice(&[color.r, color.g, color.b, 255]);
+                } else {
+                    super::composite_native(target, color, 1.0, 1.0);
+                }
+            }
+        }
+        for x in (x0..solid.start).chain(solid.end.max(x0)..x1) {
+            let pixel_x = (i64::from(x) + sink.device_origin[0]) as f32;
             let corner = [
-                (x as f32 + 0.5 - center[0]).abs() - half[0],
-                (y as f32 + 0.5 - center[1]).abs() - half[1],
+                (pixel_x + 0.5 - center[0]).abs() - half[0],
+                (pixel_y + 0.5 - center[1]).abs() - half[1],
             ];
             let q = [corner[0] + r, corner[1] + r];
             let outer = if r == 0.0 {

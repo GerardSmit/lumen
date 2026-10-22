@@ -1,5 +1,5 @@
 //! Interned element and attribute names.
-use alloc::{rc::Rc, string::String};
+use alloc::{string::String, sync::Arc};
 use core::{
     borrow::Borrow,
     cmp::Ordering,
@@ -362,14 +362,14 @@ static ATOMS: &[&str] = &[
 #[derive(Clone)]
 pub enum Name {
     Atom(u16),
-    Heap(Rc<str>),
+    Heap(Arc<str>),
 }
 
 impl Name {
     pub fn new(name: &str) -> Self {
         match ATOMS.binary_search_by(|probe| probe.as_bytes().cmp(name.as_bytes())) {
             Ok(index) => Self::Atom(index as u16),
-            Err(_) => Self::Heap(Rc::from(name)),
+            Err(_) => Self::Heap(Arc::from(name)),
         }
     }
 
@@ -417,7 +417,7 @@ impl PartialEq for Name {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Atom(a), Self::Atom(b)) => a == b,
-            (Self::Heap(a), Self::Heap(b)) => Rc::ptr_eq(a, b) || a == b,
+            (Self::Heap(a), Self::Heap(b)) => Arc::ptr_eq(a, b) || a == b,
             _ => false,
         }
     }
@@ -495,7 +495,7 @@ impl From<String> for Name {
     fn from(name: String) -> Self {
         match ATOMS.binary_search_by(|probe| probe.as_bytes().cmp(name.as_bytes())) {
             Ok(index) => Self::Atom(index as u16),
-            Err(_) => Self::Heap(Rc::from(name)),
+            Err(_) => Self::Heap(Arc::from(name)),
         }
     }
 }

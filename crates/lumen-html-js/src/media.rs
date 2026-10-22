@@ -82,13 +82,21 @@ struct State {
     muted_override: Option<bool>,
     promises: Vec<Deferred>,
     video_frame: Option<VideoFrameSnapshot>,
+    /// `source` children whose candidate already failed for the current load.
+    tried: std::collections::HashSet<NodeId>,
+    /// Children-mode selection announced `loadstart` for the current load.
+    selecting: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct MediaController {
     states: HashMap<NodeId, State>,
     events: VecDeque<(NodeId, u64, String)>,
+    /// `error` events at rejected `source` candidates: (source, media element, load generation).
+    source_errors: VecDeque<(NodeId, NodeId, u64)>,
     detached: std::collections::HashSet<NodeId>,
+    /// Media element list keyed by document root, document version and detached-element count.
+    scan: Option<(NodeId, u64, usize, Rc<[NodeId]>)>,
 }
 
 impl MediaController {
@@ -181,6 +189,13 @@ impl MediaController {
         let deferred = Deferred::new(ctx);
         let promise = deferred.promise();
         let state = self.states.entry(node).or_default();
+        if state.snapshot.error.is_some() {
+            deferred.reject(
+                ctx,
+                OpError::new("NotSupportedError", "the media resource is not supported"),
+            );
+            return promise;
+        }
         if state.snapshot.ended {
             state.snapshot.current_time = 0.0;
             state.snapshot.seek_generation = state.snapshot.seek_generation.wrapping_add(1).max(1);
@@ -279,6 +294,8 @@ impl MediaController {
         if state.snapshot.source != source {
             state.snapshot.generation = state.snapshot.generation.wrapping_add(1).max(1);
             state.snapshot.source = source;
+            state.tried.clear();
+            state.selecting = false;
             state.snapshot.current_time = 0.0;
             state.snapshot.duration = f64::NAN;
             state.snapshot.ready_state = ReadyState::HaveNothing;
@@ -301,7 +318,9 @@ impl MediaController {
         state.snapshot.generation
     }
 
-    pub(crate) fn reload(&mut self, ctx: &mut Ctx, node: NodeId) -> u64 {
+    /// The media element load algorithm up to resource selection. An element with neither a
+    /// `src` attribute nor `source` children stays `NETWORK_EMPTY` and announces nothing.
+    pub(crate) fn reload(&mut self, ctx: &mut Ctx, node: NodeId, has_resource: bool) -> u64 {
         let state = self.states.entry(node).or_default();
         for promise in state.promises.drain(..) {
             promise.reject(
@@ -309,11 +328,23 @@ impl MediaController {
                 OpError::new("AbortError", "the media resource was reloaded"),
             );
         }
+        let previous_network_state = state.snapshot.network_state;
+        let previous_time = state.snapshot.current_time;
         state.snapshot.generation = state.snapshot.generation.wrapping_add(1).max(1);
+        let generation = state.snapshot.generation;
+        if previous_network_state == 1 || previous_network_state == 2 {
+            self.events.push_back((node, generation, "abort".into()));
+        }
+        if previous_network_state != 0 {
+            self.events.push_back((node, generation, "emptied".into()));
+            if previous_time != 0.0 {
+                self.events.push_back((node, generation, "timeupdate".into()));
+            }
+        }
         state.snapshot.current_time = 0.0;
         state.snapshot.duration = f64::NAN;
         state.snapshot.ready_state = ReadyState::HaveNothing;
-        state.snapshot.network_state = 2;
+        state.snapshot.network_state = if has_resource { 2 } else { 0 };
         state.snapshot.video_width = 0;
         state.snapshot.video_height = 0;
         state.snapshot.origin_clean = false;
@@ -322,14 +353,61 @@ impl MediaController {
         state.snapshot.ended = false;
         state.snapshot.paused = true;
         state.snapshot.wants_play = false;
+        state.tried.clear();
+        state.selecting = has_resource;
         if state.snapshot.playback_rate != state.snapshot.default_playback_rate {
             state.snapshot.playback_rate = state.snapshot.default_playback_rate;
             self.events
                 .push_back((node, state.snapshot.generation, "ratechange".into()));
         }
-        self.events
-            .push_back((node, state.snapshot.generation, "loadstart".into()));
+        if has_resource {
+            self.events
+                .push_back((node, state.snapshot.generation, "loadstart".into()));
+        }
         state.snapshot.generation
+    }
+
+    /// Record the absolute URL chosen by resource selection for a load already announced by
+    /// [`Self::reload`], without starting another load.
+    pub(crate) fn resolve_current_source(&mut self, node: NodeId, source: String) {
+        self.states.entry(node).or_default().snapshot.source = source;
+    }
+
+    /// Children-mode selection for a host that can decode nothing: announce `loadstart` once per
+    /// load, fire `error` at each not-yet-tried candidate in order, then wait with
+    /// `NETWORK_NO_SOURCE` for further `source` children. Returns how many candidates were rejected.
+    pub(crate) fn reject_source_candidates(&mut self, ctx: &mut Ctx, node: NodeId, candidates: &[NodeId]) -> usize {
+        let state = self.states.entry(node).or_default();
+        let fresh: Vec<NodeId> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| !state.tried.contains(candidate))
+            .collect();
+        if state.snapshot.network_state == 3 && fresh.is_empty() {
+            return 0;
+        }
+        let generation = state.snapshot.generation;
+        if !state.selecting {
+            state.selecting = true;
+            state.snapshot.network_state = 2;
+            self.events.push_back((node, generation, "loadstart".into()));
+        }
+        for candidate in &fresh {
+            state.tried.insert(*candidate);
+            self.source_errors.push_back((*candidate, node, generation));
+        }
+        state.snapshot.network_state = 3;
+        for promise in state.promises.drain(..) {
+            promise.reject(
+                ctx,
+                OpError::new("NotSupportedError", "the media resource is not supported"),
+            );
+        }
+        fresh.len().max(1)
+    }
+
+    pub(crate) fn take_source_errors(&mut self) -> Vec<(NodeId, NodeId, u64)> {
+        self.source_errors.drain(..).collect()
     }
 
     pub(crate) fn loaded(&mut self, node: NodeId, generation: u64, duration: f64) {
@@ -415,6 +493,167 @@ impl MediaController {
         self.states
             .get_mut(&node)
             .filter(|state| state.snapshot.generation == generation)
+    }
+}
+
+#[lumen_bind::class(name = "MediaError", hint(js(webidl)))]
+pub struct DomMediaError {
+    code: u16,
+    message: String,
+}
+
+#[lumen_bind::methods]
+impl DomMediaError {
+    #[constant(name = "MEDIA_ERR_ABORTED")]
+    const MEDIA_ERR_ABORTED: u16 = 1;
+    #[constant(name = "MEDIA_ERR_NETWORK")]
+    const MEDIA_ERR_NETWORK: u16 = 2;
+    #[constant(name = "MEDIA_ERR_DECODE")]
+    const MEDIA_ERR_DECODE: u16 = 3;
+    #[constant(name = "MEDIA_ERR_SRC_NOT_SUPPORTED")]
+    const MEDIA_ERR_SRC_NOT_SUPPORTED: u16 = 4;
+
+    #[getter]
+    fn code(&self) -> u16 {
+        self.code
+    }
+
+    #[getter]
+    fn message(&self) -> String {
+        self.message.clone()
+    }
+}
+
+/// Every recorded media failure is a resource that could not be fetched or decoded, which the
+/// element reports as `MEDIA_ERR_SRC_NOT_SUPPORTED`.
+fn media_error_value(ctx: &mut Ctx, error: Option<String>) -> Value {
+    let Some(message) = error else {
+        return Value::Null;
+    };
+    let _ = ctx.class_constructor::<DomMediaError>();
+    ctx.new_instance(DomMediaError { code: 4, message })
+}
+
+const UNSUPPORTED_MEDIA: &str = "the host has no decoder for this media resource";
+
+impl DomRealm {
+    /// The `src` attribute value and the `source` element children that feed resource selection.
+    pub(crate) fn media_resource_nodes(&self, node: NodeId) -> (Option<String>, Vec<NodeId>) {
+        let session = self.session.borrow();
+        let document = session.document();
+        let src = document
+            .get_attribute_ns_ref(node, None, "src")
+            .ok()
+            .flatten()
+            .map(str::to_owned);
+        let mut sources = Vec::new();
+        let mut child = document.first_child(node).ok().flatten();
+        while let Some(id) = child {
+            if matches!(
+                document.kind(id),
+                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name.eq_ignore_ascii_case("source")
+            ) {
+                sources.push(id);
+            }
+            child = document.next_sibling(id).ok().flatten();
+        }
+        (src, sources)
+    }
+
+    fn media_element_nodes(&self) -> Rc<[NodeId]> {
+        let (root, version) = {
+            let session = self.session.borrow();
+            (session.document().root(), session.document().version())
+        };
+        let detached = self.media.borrow().detached_count();
+        if let Some((cached_root, cached_version, cached_detached, nodes)) = &self.media.borrow().scan {
+            if *cached_root == root && *cached_version == version && *cached_detached == detached {
+                return Rc::clone(nodes);
+            }
+        }
+        let mut found = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        {
+            let session = self.session.borrow();
+            let document = session.document();
+            let is_media = |node: NodeId| {
+                matches!(
+                    document.kind(node),
+                    Ok(NodeKind::Element { namespace: Namespace::Html, name, .. })
+                        if name.eq_ignore_ascii_case("audio") || name.eq_ignore_ascii_case("video")
+                )
+            };
+            for node in self.media.borrow().detached_nodes() {
+                if visited.insert(node) && is_media(node) {
+                    found.push(node);
+                }
+            }
+            let mut stack = vec![document.root()];
+            while let Some(node) = stack.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                if is_media(node) {
+                    found.push(node);
+                }
+                let mut child = document.first_child(node).ok().flatten();
+                while let Some(id) = child {
+                    stack.push(id);
+                    child = document.next_sibling(id).ok().flatten();
+                }
+            }
+        }
+        let nodes: Rc<[NodeId]> = found.into();
+        self.media.borrow_mut().scan = Some((root, version, detached, Rc::clone(&nodes)));
+        nodes
+    }
+
+    /// Resource selection for a host that cannot decode any media resource. Every candidate fails
+    /// as the HTML media element load algorithm specifies: an `src` attribute produces the
+    /// media element's `error` (`MEDIA_ERR_SRC_NOT_SUPPORTED`), `source` children each receive an
+    /// `error` event and the element then waits with `NETWORK_NO_SOURCE`. Returns the number of
+    /// loads that were rejected.
+    pub fn media_fail_unsupported(&self, ctx: &mut Ctx) -> usize {
+        let mut rejected = 0;
+        for &node in self.media_element_nodes().iter() {
+            let (src, sources) = self.media_resource_nodes(node);
+            let snapshot = self.media_snapshot(node);
+            if let Some(raw) = src {
+                let target = if raw.is_empty() {
+                    raw
+                } else {
+                    let base = self.base_url();
+                    lumen_common::url::parse(&raw, Some(&base))
+                        .map(|url| url.href())
+                        .unwrap_or(raw)
+                };
+                let announced = snapshot.generation != 0
+                    && snapshot.network_state == 2
+                    && snapshot.error.is_none();
+                let pending = if announced {
+                    self.media.borrow_mut().resolve_current_source(node, target);
+                    true
+                } else if snapshot.generation == 0 || snapshot.source != target {
+                    if target.is_empty() {
+                        self.media_reload(ctx, node);
+                    } else {
+                        self.media_select_source(node, target);
+                    }
+                    true
+                } else {
+                    false
+                };
+                if pending {
+                    let generation = self.media_snapshot(node).generation;
+                    self.media_failed(node, generation, UNSUPPORTED_MEDIA.into());
+                    self.media_reject_play(ctx, node, UNSUPPORTED_MEDIA);
+                    rejected += 1;
+                }
+            } else if !sources.is_empty() {
+                rejected += self.media.borrow_mut().reject_source_candidates(ctx, node, &sources);
+            }
+        }
+        rejected
     }
 }
 
@@ -707,10 +946,8 @@ impl DomHtmlVideoElement {
         realm.media_set_muted(node, value);
     }
     #[getter]
-    fn error(&self) -> Value {
-        self.snapshot()
-            .error
-            .map_or(Value::Null, Value::from_string)
+    fn error(&self, ctx: &mut Ctx) -> Value {
+        media_error_value(ctx, self.snapshot().error)
     }
 
     #[method(coerce)]
@@ -810,11 +1047,7 @@ impl DomHtmlAudioElement {
     }
 
     fn load(&self, ctx: &mut Ctx) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .reload(ctx, self.node().id);
+        self.node().realm.media_reload(ctx, self.node().id);
     }
 
     #[getter]
@@ -882,10 +1115,8 @@ impl DomHtmlAudioElement {
     }
 
     #[getter]
-    fn error(&self) -> Value {
-        self.snapshot()
-            .error
-            .map_or(Value::Null, Value::from_string)
+    fn error(&self, ctx: &mut Ctx) -> Value {
+        media_error_value(ctx, self.snapshot().error)
     }
 
     #[method(coerce)]

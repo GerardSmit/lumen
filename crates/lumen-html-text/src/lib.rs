@@ -299,6 +299,10 @@ pub trait FontProvider: TextShaper {
     fn shape_cache_stats(&self) -> ShapeCacheStats {
         ShapeCacheStats::default()
     }
+    /// An immutable provider equal to this one for rasterizing the current frame on other threads.
+    fn raster_snapshot(&self) -> Option<Arc<dyn FontProvider + Send + Sync>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3165,6 +3169,9 @@ impl FontFace {
 }
 
 impl TextShaper for FontFace {
+    fn parallel_view(&self) -> Option<lumen_html::paint::ParallelText<'_>> {
+        Some(lumen_html::paint::ParallelText::Borrowed(self))
+    }
     fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
         if !self.owns_key(face){return None;}
         let oblique=self.is_oblique_key(face);
@@ -3467,6 +3474,9 @@ impl FontProvider for FontFace {
 }
 
 impl TextShaper for FontSet {
+    fn parallel_view(&self) -> Option<lumen_html::paint::ParallelText<'_>> {
+        Some(lumen_html::paint::ParallelText::Borrowed(self))
+    }
     fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
         self.face_by_identity(face)?.glyph_cell_bounds(face,id,size)
     }

@@ -1,6 +1,7 @@
 //! The abstract syntax tree. Deliberately small: one `Stmt` enum and one `Expr` enum, with shared
 //! sub-structures for functions and patterns. The interpreter walks this tree directly.
 
+use crate::srctext::Src;
 use std::rc::Rc;
 
 pub type P<T> = Box<T>;
@@ -160,7 +161,7 @@ pub enum FnSource {
     None,
     Text(Rc<str>),
     Range {
-        src: Rc<str>,
+        src: Src,
         start: u32,
         end: u32,
     },
@@ -192,14 +193,19 @@ impl FnSource {
         match self {
             FnSource::None => None,
             FnSource::Text(s) => Some(s.clone()),
-            FnSource::Range { .. } | FnSource::Kept { .. } => self.as_str().map(Rc::from),
+            FnSource::Range { src, start, end } => {
+                src.slice(*start as usize, *end as usize).map(|t| Rc::from(&*t))
+            }
+            FnSource::Kept { .. } => self.as_str().map(Rc::from),
         }
     }
+    /// The text borrowed; `None` without a source, or for a range of a dynamic function source
+    /// that spans its synthesized head or tail (use [`FnSource::text`]).
     pub fn as_str(&self) -> Option<&str> {
         match self {
             FnSource::None => None,
             FnSource::Text(s) => Some(s),
-            FnSource::Range { src, start, end } => src.get(*start as usize..*end as usize),
+            FnSource::Range { src, start, end } => src.get(*start as usize, *end as usize),
             FnSource::Kept { text, start, end } => text.slice(*start, *end),
         }
     }
@@ -215,7 +221,7 @@ impl FnSource {
 /// parsed again (see [`Function::release_cold_body`]).
 #[derive(Clone)]
 pub struct LazyBody {
-    pub src: Rc<str>,
+    pub src: Src,
     pub start: u32,
     pub end: u32,
     pub line: u32,

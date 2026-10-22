@@ -439,6 +439,7 @@ mod tests {
         layout(&realm);
         assert!(realm.next_document_parser_script(engine.ctx()).unwrap().is_some());
         assert!(scheduling::run_navigation_tasks(&mut engine,64).is_empty());
+        assert!(scheduling::run_tasks(&mut engine,64).is_empty());
         assert!(!scheduling::task_pending(engine.ctx()),"paused parser retry must be gated rather than busy-looping");
         assert!(realm.next_document_parser_script(engine.ctx()).unwrap().is_some());
         check(&mut engine,"window.scrollY===200 && document.activeElement===document.getElementById('late') && document.getElementById('late').matches(':target')");

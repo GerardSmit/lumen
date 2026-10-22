@@ -154,3 +154,33 @@ mod hardening {
         assert!(decode(&m).is_err());
     }
 }
+
+#[test]
+fn any_and_eq_reference_types_decode_in_signatures() {
+    use crate::wasm::test_util as t;
+    let m = t::module(&[(
+        1,
+        t::vec(&[
+            t::func_type(&[0x7f], &[0x6e]),
+            t::func_type(&[0x6d, 0x6d], &[0x7f]),
+        ]),
+    )]);
+    let parsed = decode(&m).unwrap();
+    assert_eq!(parsed.types[0].results, [ValType::AnyRef]);
+    assert_eq!(parsed.types[1].params, [ValType::EqRef, ValType::EqRef]);
+    let bad = t::module(&[(1, t::vec(&[t::func_type(&[0x6c], &[])]))]);
+    assert!(decode(&bad).is_err());
+}
+
+#[test]
+fn v128_globals_with_a_vector_constant_decode() {
+    let mut init = vec![1, 0x7b, 0, 0xfd, 0x0c];
+    init.extend(1u8..=16);
+    init.push(0x0b);
+    let parsed = decode(&module(&[(6, &init)])).unwrap();
+    assert_eq!(parsed.globals[0].ty.val, ValType::V128);
+    assert_eq!(parsed.globals[0].init.len(), 19);
+
+    init[4] = 0x0d; // i8x16.shuffle is not a constant instruction
+    assert!(decode(&module(&[(6, &init)])).is_err());
+}

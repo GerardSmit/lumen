@@ -144,7 +144,7 @@ impl Lexer<'_> {
                     }
                     Some('{') => {
                         let tokens = self.jsx_container()?;
-                        if !matches!(tokens.0.get(0).map(|t| &t.kind), Some(Tok::Punct("..."))) {
+                        if !matches!(tokens.0.get(0).map(|t| &t.kind), Some(Tok::Punct(Punct::Ellipsis))) {
                             return Err(
                                 self.jsx_error("JSX spread attribute must begin with '...'")
                             );
@@ -233,7 +233,7 @@ impl Lexer<'_> {
                 Some('{') => {
                     let tokens = self.jsx_container()?;
                     let spread =
-                        matches!(tokens.0.get(0).map(|t| &t.kind), Some(Tok::Punct("...")));
+                        matches!(tokens.0.get(0).map(|t| &t.kind), Some(Tok::Punct(Punct::Ellipsis)));
                     children.push(if spread {
                         JsxChild::Spread(tokens)
                     } else {

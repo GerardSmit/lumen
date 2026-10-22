@@ -32,7 +32,6 @@ pub(super) fn draw(
     let pixels = lumen_common::limits::size::repeat(width, height, MAX_LAYER_BYTES / 2)
         .map_err(|_| ImageError::TooLarge)?;
     validate_blur_budget(width,height,shadow.blur,raster.scale,raster.source_reserved.unwrap_or(0))?;
-    let mut mask = vec![0u8; pixels];
     let spread = if shadow.inset {
         -shadow.spread
     } else {
@@ -60,39 +59,89 @@ pub(super) fn draw(
             })
         })
     });
-    for (y, row) in mask.chunks_exact_mut(width).enumerate() {
-        for (x, value) in row.iter_mut().enumerate() {
-            *value = (coverage(
-                shape,
-                shape_radius,
-                shape_corners.as_ref(),
-                left + x as f32,
-                top + y as f32,
-                raster.scale,
-                raster.antialias,
-            ) * 255.0)
-                .round() as u8;
+    let key = MaskKey::new(
+        [width, height],
+        [left, top, raster.scale, shadow.blur, shape_radius],
+        shape,
+        shape_corners.as_ref(),
+        raster.antialias,
+    );
+    let mask = match raster.cache.shadow_mask(&key) {
+        Some(mask) => mask,
+        None => {
+            let mut mask = vec![0u8; pixels];
+            let mut uniform_source = None;
+            for y in 0..height {
+                if shape_corners.is_none() && row_independent(shape, shape_radius, top + y as f32, raster.scale) {
+                    match uniform_source {
+                        Some(source) => {
+                            mask.copy_within(source * width..(source + 1) * width, y * width);
+                            continue;
+                        }
+                        None => uniform_source = Some(y),
+                    }
+                }
+                let row = &mut mask[y * width..(y + 1) * width];
+                for (x, value) in row.iter_mut().enumerate() {
+                    *value = (coverage(
+                        shape,
+                        shape_radius,
+                        shape_corners.as_ref(),
+                        left + x as f32,
+                        top + y as f32,
+                        raster.scale,
+                        raster.antialias,
+                    ) * 255.0)
+                        .round() as u8;
+                }
+            }
+            blur_alpha_mask(&mut mask, width, height, shadow.blur, raster.scale, raster.source_reserved.unwrap_or(0))?;
+            let mask: std::sync::Arc<[u8]> = mask.into();
+            raster.cache.insert_shadow_mask(key, mask.clone());
+            mask
         }
-    }
-    blur_alpha_mask(&mut mask, width, height, shadow.blur, raster.scale, raster.source_reserved.unwrap_or(0))?;
+    };
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let transparent = if shadow.inset { 255 } else { 0 };
+    let mut original_row: Option<Vec<f32>> = None;
     for y in y0..y1 {
+        let device_y = (i64::from(y) + raster.device_origin[1]) as f32;
+        let uniform = corners.is_none() && row_independent(rect, radius, device_y, raster.scale);
+        if uniform && original_row.is_none() {
+            original_row = Some(
+                (x0..x1)
+                    .map(|x| {
+                        coverage(
+                            rect,
+                            radius,
+                            None,
+                            (i64::from(x) + raster.device_origin[0]) as f32,
+                            device_y,
+                            raster.scale,
+                            raster.antialias,
+                        )
+                    })
+                    .collect(),
+            );
+        }
         for x in x0..x1 {
             let mask_offset = ((i64::from(y)+raster.device_origin[1]) as f32 - top) as usize * width + ((i64::from(x)+raster.device_origin[0]) as f32 - left) as usize;
             let level = mask[mask_offset];
             if level == transparent {
                 continue;
             }
-            let original = coverage(
-                rect,
-                radius,
-                corners,
-                (i64::from(x)+raster.device_origin[0]) as f32,
-                (i64::from(y)+raster.device_origin[1]) as f32,
-                raster.scale,
-                raster.antialias,
-            );
+            let original = match (&original_row, uniform) {
+                (Some(row), true) => row[(x - x0) as usize],
+                _ => coverage(
+                    rect,
+                    radius,
+                    corners,
+                    (i64::from(x)+raster.device_origin[0]) as f32,
+                    device_y,
+                    raster.scale,
+                    raster.antialias,
+                ),
+            };
             let alpha = level as f32 / 255.0;
             let alpha = if shadow.inset {
                 (1.0 - alpha) * original
@@ -111,6 +160,35 @@ pub(super) fn draw(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct MaskKey {
+    size: [usize; 2],
+    scalars: [u32; 5],
+    shape: [u32; 4],
+    corners: Option<[u32; 8]>,
+    antialias: bool,
+}
+
+impl MaskKey {
+    fn new(
+        size: [usize; 2],
+        scalars: [f32; 5],
+        shape: Rect,
+        corners: Option<&[[f32; 2]; 4]>,
+        antialias: bool,
+    ) -> Self {
+        Self {
+            size,
+            scalars: scalars.map(f32::to_bits),
+            shape: [shape.x, shape.y, shape.width, shape.height].map(f32::to_bits),
+            corners: corners.map(|c| {
+                [c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1], c[3][0], c[3][1]].map(f32::to_bits)
+            }),
+            antialias,
+        }
+    }
 }
 
 /// Return the three box widths and padding used to approximate a Gaussian blur.
@@ -165,11 +243,7 @@ pub(super) fn blur_alpha_mask(
         .try_fold(0usize, |sum, size| sum.checked_add(*size))
         .and_then(|sum| sum.checked_mul(LANES))
         .ok_or(ImageError::TooLarge)?;
-    let mut scratch = Vec::new();
-    scratch
-        .try_reserve_exact(pixels)
-        .map_err(|_| ImageError::TooLarge)?;
-    scratch.resize(pixels, 0);
+    let mut scratch = super::pool::take_zeroed(pixels)?;
     let mut ring = Vec::new();
     ring.try_reserve_exact(ring_len)
         .map_err(|_| ImageError::TooLarge)?;
@@ -189,6 +263,7 @@ pub(super) fn blur_alpha_mask(
         let lanes = LANES.min(width - x0);
         scan_columns(&scratch, mask, width, height, x0, lanes, sizes, &mut ring);
     }
+    super::pool::recycle(scratch);
     Ok(())
 }
 
@@ -228,6 +303,13 @@ pub(super) fn validate_blur_budget(
         return Err(ImageError::TooLarge);
     }
     Ok(())
+}
+
+/// True when `coverage` of a corner-less shape is the same for every pixel row at device row `y`:
+/// the whole row lies in the vertical middle where the rounded ends have no effect.
+fn row_independent(rect: Rect, radius: f32, y: f32, scale: f32) -> bool {
+    let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
+    y / scale >= rect.y + radius && (y + 1.0) / scale <= rect.y + rect.height - radius
 }
 
 fn coverage(
@@ -302,6 +384,7 @@ fn scan(
     let mut cursors = [0; 3];
     let mut sums = [0u64; 3];
     let divisor = sizes.iter().map(|n| *n as u64).product::<u64>();
+    let divide = RoundedDivide::new(divisor);
     let padding = (sizes.iter().sum::<usize>() - 3) / 2;
     for index in 0..length + padding {
         let mut value = if index < length {
@@ -321,12 +404,42 @@ fn scan(
             }
         }
         if index >= padding {
-            output[(index - padding) * stride] = ((value + divisor / 2) / divisor) as u8;
+            output[(index - padding) * stride] = divide.apply(value);
         }
     }
 }
 
 const LANES: usize = 16;
+
+/// `(value + divisor / 2) / divisor` for box sums of 8-bit samples (`value <= 255 * divisor`),
+/// as a multiply and shift when the divisor is small enough for the reciprocal to be exact.
+struct RoundedDivide {
+    divisor: u64,
+    reciprocal: u64,
+}
+
+const RECIPROCAL_SHIFT: u32 = 40;
+
+impl RoundedDivide {
+    fn new(divisor: u64) -> Self {
+        let reciprocal = if divisor <= 4096 {
+            ((1u64 << RECIPROCAL_SHIFT) + divisor - 1) / divisor
+        } else {
+            0
+        };
+        Self { divisor, reciprocal }
+    }
+
+    #[inline]
+    fn apply(&self, value: u64) -> u8 {
+        let rounded = value + self.divisor / 2;
+        if self.reciprocal != 0 {
+            ((rounded * self.reciprocal) >> RECIPROCAL_SHIFT) as u8
+        } else {
+            (rounded / self.divisor) as u8
+        }
+    }
+}
 
 // Column-wise `scan` over `lanes` adjacent columns at once, so every row read touches
 // contiguous bytes. ring holds `LANES` entries per slot.
@@ -346,6 +459,7 @@ fn scan_columns(
     let mut cursors = [0; 3];
     let mut sums = [[0u64; LANES]; 3];
     let divisor = sizes.iter().map(|n| *n as u64).product::<u64>();
+    let divide = RoundedDivide::new(divisor);
     let padding = (sizes.iter().sum::<usize>() - 3) / 2;
     for index in 0..height + padding {
         let mut value = [0u64; LANES];
@@ -373,7 +487,7 @@ fn scan_columns(
         if index >= padding {
             let out = &mut output[(index - padding) * width + x0..][..lanes];
             for (byte, total) in out.iter_mut().zip(&value) {
-                *byte = ((total + divisor / 2) / divisor) as u8;
+                *byte = divide.apply(*total);
             }
         }
     }
@@ -383,6 +497,35 @@ fn scan_columns(
 mod tests {
     use super::*;
     use lumen_html::paint::{Command, DisplayList, Rgba};
+
+    #[test]
+    fn reciprocal_rounded_divide_equals_integer_division() {
+        for divisor in 1..=4100u64 {
+            let divide = RoundedDivide::new(divisor);
+            let limit = 255 * divisor;
+            let step = if divisor <= 64 { 1 } else { divisor / 3 + 1 };
+            let mut values: Vec<u64> = (0..=limit).step_by(step as usize).collect();
+            for quotient in [0u64, 1, 2, 127, 128, 254, 255] {
+                for offset in [0, 1, divisor / 2, divisor.saturating_sub(1)] {
+                    for base in [quotient * divisor, quotient * divisor + divisor / 2] {
+                        for value in [base.saturating_sub(offset), base + offset] {
+                            if value <= limit {
+                                values.push(value);
+                            }
+                        }
+                    }
+                }
+            }
+            values.push(limit);
+            for value in values {
+                assert_eq!(
+                    u64::from(divide.apply(value)),
+                    (value + divisor / 2) / divisor,
+                    "divisor {divisor} value {value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rolling_three_box_filter_is_centered_and_normalized() {
@@ -494,5 +637,32 @@ mod tests {
             crate::render(&list, 10, 10, 1.0, true),
             Err(ImageError::TooLarge)
         );
+    }
+
+    #[test]
+    fn cached_shadow_mask_renders_identically_to_uncached() {
+        let font = lumen_html_text::FontFace::new(std::sync::Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let shadow = BoxShadow {
+            offset_x: 3.0,
+            offset_y: 4.0,
+            blur: 9.0,
+            spread: 2.0,
+            color: Rgba { r: 10, g: 20, b: 30, a: 200 },
+            inset: false,
+        };
+        let list = DisplayList(vec![Command::BoxShadow {
+            corners: None,
+            rect: Rect { x: 10.0, y: 12.0, width: 40.0, height: 30.0 },
+            radius: 6.0,
+            shadow,
+        }]);
+        let uncached = crate::render_with_font(&list, 80, 70, 1.5, true, &font).unwrap();
+        let mut cache = crate::GlyphCache::default();
+        let first = crate::render_with_font_cached(&list, 80, 70, 1.5, true, &font, &mut cache).unwrap();
+        assert_eq!(cache.shadow_masks.len(), 1);
+        let second = crate::render_with_font_cached(&list, 80, 70, 1.5, true, &font, &mut cache).unwrap();
+        assert_eq!(cache.shadow_masks.len(), 1);
+        assert_eq!(first, uncached);
+        assert_eq!(second, uncached);
     }
 }

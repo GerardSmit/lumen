@@ -64,6 +64,7 @@ mod jstr;
 #[cfg(feature = "compiler")]
 mod lexer;
 mod lstr;
+mod srctext;
 mod modules;
 #[cfg(feature = "parallel")]
 pub mod parallel;

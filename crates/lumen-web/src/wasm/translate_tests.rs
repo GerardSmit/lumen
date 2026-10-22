@@ -206,7 +206,7 @@ fn val_bits(v: Val) -> u64 {
         Val::I64(x) => x as u64,
         Val::F32(x) => x.to_bits() as u64,
         Val::F64(x) => x.to_bits(),
-        Val::Ref(_) => panic!("ref"),
+        Val::Ref(_) | Val::V128(_) => panic!("ref"),
     }
 }
 

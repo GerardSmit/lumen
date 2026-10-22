@@ -1,4 +1,3 @@
-use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
@@ -40,7 +39,7 @@ impl Default for JsxOptions {
 #[derive(Default)]
 pub(crate) struct TemplateSites {
     state: std::cell::RefCell<(
-        crate::fasthash::FastMap<(usize, u32, u64), (std::rc::Weak<str>, u32)>,
+        crate::fasthash::FastMap<(usize, u32, u64), (crate::srctext::SrcWeak, u32)>,
         u32,
     )>,
 }
@@ -62,7 +61,7 @@ pub(crate) fn enter_template_sites(
 }
 
 pub(crate) fn template_site(
-    src: &Rc<str>,
+    src: &crate::srctext::Src,
     offset: u32,
     quasis: &[(Option<String>, String)],
 ) -> u32 {
@@ -71,7 +70,7 @@ pub(crate) fn template_site(
     for (_, raw) in quasis {
         raw.hash(&mut h);
     }
-    let key = (Rc::as_ptr(src) as *const u8 as usize, offset, h.finish());
+    let key = (src.key(), offset, h.finish());
     TEMPLATE_SITES.with(|t| {
         let registry = t.borrow();
         let (map, next) = &mut *registry.state.borrow_mut();
@@ -79,7 +78,7 @@ pub(crate) fn template_site(
             Some((live, id)) if live.strong_count() != 0 => *id,
             _ => {
                 *next += 1;
-                map.insert(key, (Rc::downgrade(src), *next));
+                map.insert(key, (src.downgrade(), *next));
                 *next
             }
         }

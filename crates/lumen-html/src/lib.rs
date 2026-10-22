@@ -23,6 +23,7 @@ pub mod interaction;
 pub mod labels;
 pub mod language;
 pub mod html;
+pub mod preload_scan;
 pub mod parser_documents;
 pub mod layout;
 mod name;
@@ -49,7 +50,7 @@ pub mod xml_stylesheet;
 pub use name::Name;
 pub use shadow::{ShadowMode, ShadowOptions, SlotAssignmentMode};
 
-use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -79,7 +80,7 @@ pub enum Namespace {
     Html,
     Svg,
     MathMl,
-    Other(Rc<str>),
+    Other(Arc<str>),
 }
 
 /// The HTML parsing mode selected by the document's doctype.
@@ -99,7 +100,7 @@ pub enum NodeKind {
     /// attribute node is requested; attached Attr nodes are indexed by the owning Element's
     /// sparse `attribute_nodes` sidecar and are not part of the ordinary child tree.
     Attribute {
-        namespace_uri: Option<Box<Rc<str>>>,
+        namespace_uri: Option<Box<Arc<str>>>,
         qualified_name: Name,
         value: String,
         // Only materialized attached attributes pay for this uncommon payload.
@@ -229,7 +230,7 @@ pub struct Document {
     pub(crate) highlights: Vec<highlights::Highlight>,
     id: u64,
     nodes: Vec<Node>,
-    attribute_namespaces: Vec<(NodeId, Vec<(usize, Rc<str>)>)>,
+    attribute_namespaces: Vec<(NodeId, Vec<(usize, Arc<str>)>)>,
     /// Lazily materialized Attr nodes, aligned with each Element's compact attribute vector.
     /// No sidecar is allocated for parser-created attributes until the host requests a Node.
     // Only materialized Attr identities are stored here. Keep each owner's entries sparse so
@@ -241,8 +242,8 @@ pub struct Document {
     literal_colon_names: Vec<NodeId>,
     /// Immutable HTML custom-element birth values. Ordinary elements have no
     /// entry; clones share strings and adoption moves entries with their IDs.
-    custom_element_is_values: Vec<(NodeId, Rc<str>)>,
-    cryptographic_nonces: Vec<(NodeId, Rc<str>)>,
+    custom_element_is_values: Vec<(NodeId, Arc<str>)>,
+    cryptographic_nonces: Vec<(NodeId, Arc<str>)>,
     cryptographic_nonce_bytes: usize,
     hide_connected_nonces: bool,
     /// One lazily created inert HTML document shares this arena. Only detached
@@ -253,9 +254,9 @@ pub struct Document {
     design_mode_documents: Vec<NodeId>,
     /// Parsed declarations exist only for CSSOM-mutated elements. Shared pending
     /// shorthand values cannot always round-trip through the style attribute.
-    inline_cssom_styles: Vec<(NodeId, Rc<css::DeclarationBlock>)>,
+    inline_cssom_styles: Vec<(NodeId, css::ReadOnlyRc<css::DeclarationBlock>)>,
     /// One ordinary attribute parse shared by read-only CSSOM operations.
-    inline_cssom_read_cache: Option<(NodeId, Rc<css::DeclarationBlock>)>,
+    inline_cssom_read_cache: Option<(NodeId, css::ReadOnlyRc<css::DeclarationBlock>)>,
     doctype_identifiers: Vec<(NodeId, String, String)>,
     document_mode: DocumentMode,
     is_html_document: bool,
@@ -266,39 +267,39 @@ pub struct Document {
     live_nodes: usize,
     version: u64,
     max_nodes: usize,
-    allocation_budget: Option<Rc<dyn Fn(&Document, usize, usize) -> Result<(), Error>>>,
-    template_ancestor_resolver: Option<Rc<dyn Fn(&Document, NodeId, NodeId) -> Result<bool, Error>>>,
-    allocation_budget_group: Option<Rc<()>>,
-    node_count_tracking: Option<Rc<core::cell::Cell<usize>>>,
+    allocation_budget: css::Hook<Rc<dyn Fn(&Document, usize, usize) -> Result<(), Error>>>,
+    template_ancestor_resolver: css::Hook<Rc<dyn Fn(&Document, NodeId, NodeId) -> Result<bool, Error>>>,
+    allocation_budget_group: css::Hook<Rc<()>>,
+    node_count_tracking: css::Hook<Rc<core::cell::Cell<usize>>>,
     journal: Vec<Mutation>,
     /// The class or id value each journaled `class`/`id` mutation replaced,
     /// by the mutation's version, for selector invalidation.
-    replaced_identities: Vec<(u64, Option<Rc<str>>)>,
+    replaced_identities: Vec<(u64, Option<Arc<str>>)>,
     journal_compact_at: usize,
     journal_base: u64,
     /// The class and id of the element an attribute write is about to change.
-    identity_snapshot: Option<(NodeId, Option<Rc<str>>, Option<Rc<str>>)>,
-    mutation_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
-    mutation_observer_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
-    details_sink: Option<Rc<dyn Fn(&Document, details::DetailsTransition)>>,
-    shadow_mutation_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
-    validity_resolver: Option<ValidityResolver>,
-    custom_state_resolver: Option<Rc<dyn Fn(NodeId, &str) -> bool>>,
+    identity_snapshot: Option<(NodeId, Option<Arc<str>>, Option<Arc<str>>)>,
+    mutation_sink: css::Hook<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
+    mutation_observer_sink: css::Hook<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
+    details_sink: css::Hook<Rc<dyn Fn(&Document, details::DetailsTransition)>>,
+    shadow_mutation_sink: css::Hook<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
+    validity_resolver: css::Hook<ValidityResolver>,
+    custom_state_resolver: css::Hook<Rc<dyn Fn(NodeId, &str) -> bool>>,
     form_selector_state_resolver:
-        Option<Rc<dyn Fn(&Document, NodeId) -> Option<forms::FormSelectorState>>>,
+        css::Hook<Rc<dyn Fn(&Document, NodeId) -> Option<forms::FormSelectorState>>>,
     /// An embedding registry can reject shadow attachment from its compact
     /// custom-element definition policy; the callback contains no script values.
-    shadow_host_policy: Option<Rc<dyn Fn(&Document, NodeId) -> bool>>,
-    inline_stylesheet_policy: Option<Rc<dyn Fn(&Document, NodeId, &str) -> bool>>,
-    inline_style_attribute_policy: Option<Rc<dyn Fn(&Document, NodeId, &str) -> Result<bool, Error>>>,
-    parser_element_completion_sink: Option<Rc<dyn Fn(&Document, NodeId)>>,
-    parser_style_block_sink: Option<Rc<dyn Fn(&Document, NodeId) -> Result<(), Error>>>,
-    parser_custom_element_predicate: Option<Rc<dyn Fn(&Document, NodeId, &str, Option<&str>) -> bool>>,
-    parser_element_birth_sink: Option<Rc<dyn Fn(&Document, NodeId, NodeId, bool) -> Result<(), Error>>>,
+    shadow_host_policy: css::Hook<Rc<dyn Fn(&Document, NodeId) -> bool>>,
+    inline_stylesheet_policy: css::Hook<Rc<dyn Fn(&Document, NodeId, &str) -> bool>>,
+    inline_style_attribute_policy: css::Hook<Rc<dyn Fn(&Document, NodeId, &str) -> Result<bool, Error>>>,
+    parser_element_completion_sink: css::Hook<Rc<dyn Fn(&Document, NodeId)>>,
+    parser_style_block_sink: css::Hook<Rc<dyn Fn(&Document, NodeId) -> Result<(), Error>>>,
+    parser_custom_element_predicate: css::Hook<Rc<dyn Fn(&Document, NodeId, &str, Option<&str>) -> bool>>,
+    parser_element_birth_sink: css::Hook<Rc<dyn Fn(&Document, NodeId, NodeId, bool) -> Result<(), Error>>>,
     interaction_state: interaction::InteractionState,
     target_element: Option<NodeId>,
-    parser_form_owners: core::cell::RefCell<Vec<(NodeId, NodeId)>>,
-    target_element_resolver: Option<Rc<dyn Fn(&Document) -> Option<NodeId>>>,
+    parser_form_owners: css::SyncRefCell<Vec<(NodeId, NodeId)>>,
+    target_element_resolver: css::Hook<Rc<dyn Fn(&Document) -> Option<NodeId>>>,
     interaction_generation: u64,
     top_layer_elements: Vec<top_layer::Entry>,
     /// The topmost Auto popover hit by the preceding trusted pointerdown, or
@@ -312,8 +313,9 @@ pub struct Document {
     shadow_hosts_by_root: Vec<(NodeId, NodeId)>,
     foreign_template_links: Vec<(NodeId, NodeId)>,
     manual_assignments: Vec<(NodeId, Vec<NodeId>)>,
-    selector_cache: core::cell::RefCell<Vec<(String, Rc<Vec<css::Selector>>)>>,
-    id_index: core::cell::RefCell<IdIndex>,
+    selector_cache: css::SyncRefCell<Vec<(String, Arc<Vec<css::Selector>>)>>,
+    id_index: css::SyncRefCell<IdIndex>,
+    host_gate: css::HostGate,
 }
 
 /// First element per `id` in the connected light tree, valid for one document version.
@@ -364,33 +366,33 @@ impl Document {
             live_nodes: 1,
             version: 0,
             max_nodes: max_nodes.max(1),
-            allocation_budget: None,
-            template_ancestor_resolver: None,
-            allocation_budget_group: None,
-            node_count_tracking: None,
+            allocation_budget: css::Hook::none(),
+            template_ancestor_resolver: css::Hook::none(),
+            allocation_budget_group: css::Hook::none(),
+            node_count_tracking: css::Hook::none(),
             journal: Vec::new(),
             replaced_identities: Vec::new(),
             journal_compact_at: MAX_JOURNAL,
             journal_base: 0,
             identity_snapshot: None,
-            mutation_sink: None,
-            mutation_observer_sink: None,
-            details_sink: None,
-            shadow_mutation_sink: None,
-            validity_resolver: None,
-            form_selector_state_resolver: None,
-            custom_state_resolver: None,
-            shadow_host_policy: None,
-            inline_stylesheet_policy: None,
-            inline_style_attribute_policy: None,
-            parser_element_completion_sink: None,
-            parser_style_block_sink: None,
-            parser_custom_element_predicate: None,
-            parser_element_birth_sink: None,
+            mutation_sink: css::Hook::none(),
+            mutation_observer_sink: css::Hook::none(),
+            details_sink: css::Hook::none(),
+            shadow_mutation_sink: css::Hook::none(),
+            validity_resolver: css::Hook::none(),
+            form_selector_state_resolver: css::Hook::none(),
+            custom_state_resolver: css::Hook::none(),
+            shadow_host_policy: css::Hook::none(),
+            inline_stylesheet_policy: css::Hook::none(),
+            inline_style_attribute_policy: css::Hook::none(),
+            parser_element_completion_sink: css::Hook::none(),
+            parser_style_block_sink: css::Hook::none(),
+            parser_custom_element_predicate: css::Hook::none(),
+            parser_element_birth_sink: css::Hook::none(),
             interaction_state: interaction::InteractionState::default(),
             target_element: None,
-            parser_form_owners: core::cell::RefCell::new(Vec::new()),
-            target_element_resolver: None,
+            parser_form_owners: css::SyncRefCell::new(Vec::new()),
+            target_element_resolver: css::Hook::none(),
             interaction_generation: 0,
             top_layer_elements: Vec::new(),
             popover_pointerdown_target: None,
@@ -399,8 +401,9 @@ impl Document {
             shadow_hosts_by_root: Vec::new(),
             foreign_template_links: Vec::new(),
             manual_assignments: Vec::new(),
-            selector_cache: core::cell::RefCell::new(Vec::new()),
-            id_index: core::cell::RefCell::new(IdIndex::default()),
+            selector_cache: css::SyncRefCell::new(Vec::new()),
+            id_index: css::SyncRefCell::new(IdIndex::default()),
+            host_gate: css::HostGate::default(),
         }
     }
 
@@ -489,41 +492,45 @@ impl Document {
         read: Rc<dyn Fn(&Document, NodeId) -> Option<forms::ValidityState>>,
         generation: Rc<dyn Fn() -> u64>,
     ) {
-        self.validity_resolver = Some(ValidityResolver { read, generation, value: None });
+        self.validity_resolver = css::Hook::new(Some(ValidityResolver { read, generation, value: None }));
         self.mark_dirty(self.root(), Dirty::STYLE, MutationKind::FullRebuild);
     }
 
     /// Live validity when the document has a host state source. A missing or
     /// expired source lets callers use the shared attribute-backed algorithms.
     pub fn validity_state(&self, node: NodeId) -> Option<forms::ValidityState> {
+        if self.validity_resolver.gated(&self.host_gate) { return self.host_gate.validity(node); }
         self.validity_resolver
-            .as_ref()
+            .get(&self.host_gate)
             .and_then(|source| (source.read)(self, node))
     }
 
     pub fn validity_generation(&self) -> u64 {
         self.validity_resolver
-            .as_ref()
+            .get(&self.host_gate)
             .map_or(0, |source| (source.generation)())
     }
 
     /// Borrow the existing host live value only for the duration of a read.
     /// The callback stores no strings or node state in the shared document.
     pub fn set_form_value_resolver(&mut self, read: Rc<dyn Fn(NodeId, &mut dyn FnMut(Option<&str>))>) {
-        if let Some(resolver) = self.validity_resolver.as_mut() {
+        if let Some(resolver) = self.validity_resolver.get_mut() {
             resolver.value = Some(read);
             self.mark_dirty(self.root(), Dirty::LAYOUT, MutationKind::FullRebuild);
         }
     }
 
     pub fn has_form_value_resolver(&self) -> bool {
-        self.validity_resolver.as_ref().is_some_and(|resolver| resolver.value.is_some())
+        self.validity_resolver.get(&self.host_gate).is_some_and(|resolver| resolver.value.is_some())
     }
 
     pub fn with_form_value<R>(&self, node: NodeId, read: impl FnOnce(Option<&str>) -> R) -> R {
+        if self.validity_resolver.gated(&self.host_gate) {
+            return read(self.host_gate.form_value(node).as_deref());
+        }
         let mut read = Some(read);
         let mut result = None;
-        if let Some(source) = self.validity_resolver.as_ref().and_then(|resolver| resolver.value.as_ref()) {
+        if let Some(source) = self.validity_resolver.get(&self.host_gate).and_then(|resolver| resolver.value.as_ref()) {
             source(node, &mut |value| {
                 if let Some(read) = read.take() { result = Some(read(value)); }
             });
@@ -539,24 +546,26 @@ impl Document {
     /// so retained CSS styles observe live control state without DOM copies.
 /// Host custom states are sparse native data; the document stores only a weak resolver.
 pub fn set_custom_state_resolver(&mut self, read: Rc<dyn Fn(NodeId, &str) -> bool>) {
-    self.custom_state_resolver = Some(read);
+    self.custom_state_resolver = css::Hook::new(Some(read));
 }
 pub fn has_custom_state(&self, node: NodeId, name: &str) -> bool {
-    self.custom_state_resolver.as_ref().is_some_and(|read| read(node, name))
+    if self.custom_state_resolver.gated(&self.host_gate) { return self.host_gate.custom_state(node, name); }
+    self.custom_state_resolver.get(&self.host_gate).is_some_and(|read| read(node, name))
 }
 
     pub fn set_form_selector_state_resolver(
         &mut self,
         read: Rc<dyn Fn(&Document, NodeId) -> Option<forms::FormSelectorState>>,
     ) {
-        self.form_selector_state_resolver = Some(read);
+        self.form_selector_state_resolver = css::Hook::new(Some(read));
         self.mark_dirty(self.root(), Dirty::STYLE, MutationKind::FullRebuild);
     }
 
     /// Read host-owned selector state for one candidate node, if available.
     pub fn form_selector_state(&self, node: NodeId) -> Option<forms::FormSelectorState> {
+        if self.form_selector_state_resolver.gated(&self.host_gate) { return self.host_gate.form_state(node); }
         self.form_selector_state_resolver
-            .as_ref()
+            .get(&self.host_gate)
             .and_then(|read| read(self, node))
     }
 /// Classification shares the host's sparse form state, never a node field.
@@ -594,14 +603,15 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     /// HTML's document target is retained independently of transient focus or
     /// pointer state. DOM removal does not itself select a different fragment.
     pub fn target_element(&self) -> Option<NodeId> {
-        self.target_element_resolver.as_ref().map_or(self.target_element,|resolve|resolve(self))
+        if self.target_element_resolver.gated(&self.host_gate) { return self.host_gate.target(); }
+        self.target_element_resolver.get(&self.host_gate).map_or(self.target_element,|resolve|resolve(self))
     }
 
     /// Embeddings with stable cross-document node identities can resolve the
     /// remembered target without transferring another document's target state.
     /// The resolver must not run script or re-enter this document's session.
     pub fn set_target_element_resolver(&mut self, resolve: Option<Rc<dyn Fn(&Document) -> Option<NodeId>>>) {
-        self.target_element_resolver = resolve;
+        self.target_element_resolver = css::Hook::new(resolve);
         self.interaction_generation = self.interaction_generation.wrapping_add(1);
     }
 
@@ -610,7 +620,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             if !matches!(self.kind(node)?, NodeKind::Element { .. }) { return Err(Error::InvalidNode); }
         }
         let changed = self.target_element_resolver.is_some() || self.target_element != target;
-        self.target_element_resolver = None;
+        self.target_element_resolver = css::Hook::none();
         if changed {
             self.target_element = target;
             self.interaction_generation = self.interaction_generation.wrapping_add(1);
@@ -1068,25 +1078,25 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     /// Admission for a document participating in an embedder's aggregate arena
     /// budget. Runs before allocation and must not execute script or mutate DOM.
     pub fn set_allocation_budget(&mut self, budget: Option<Rc<dyn Fn(&Document, usize, usize) -> Result<(), Error>>>) {
-        self.allocation_budget = budget;
+        self.allocation_budget = css::Hook::new(budget);
     }
 
-    pub fn set_allocation_budget_group(&mut self, group: Rc<()>) { self.allocation_budget_group = Some(group); }
+    pub fn set_allocation_budget_group(&mut self, group: Rc<()>) { self.allocation_budget_group = css::Hook::new(Some(group)); }
 
     pub fn set_node_count_tracking(&mut self, tracking: Rc<core::cell::Cell<usize>>) {
         tracking.set(self.live_nodes);
-        self.node_count_tracking = Some(tracking);
+        self.node_count_tracking = css::Hook::new(Some(tracking));
     }
 
     fn update_tracked_node_count(&self) {
-        if let Some(tracking) = &self.node_count_tracking { tracking.set(self.live_nodes); }
+        if let Some(tracking) = self.node_count_tracking.get(&self.host_gate) { tracking.set(self.live_nodes); }
     }
 
     pub fn set_mutation_sink(
         &mut self,
         sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
     ) {
-        self.mutation_sink = sink;
+        self.mutation_sink = css::Hook::new(sink);
     }
 
     pub(crate) fn associate_parser_form(&self, control: NodeId, form: NodeId) -> Result<(), Error> {
@@ -1127,23 +1137,23 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
                     .is_some_and(|(control_root, form_root)| control_root == form_root));
         }
         if !self.shadow_trees.is_empty() {
-            if let Some(sink) = &self.shadow_mutation_sink {
+            if let Some(sink) = self.shadow_mutation_sink.get(&self.host_gate) {
                 sink(self, mutation);
             }
         }
-        if let Some(sink) = &self.mutation_sink {
+        if let Some(sink) = self.mutation_sink.get(&self.host_gate) {
             sink(self, mutation);
         }
     }
 
     fn notify_observer(&self, mutation: &observe::ObservedMutation) {
-        if let Some(sink) = &self.mutation_observer_sink { sink(self, mutation); }
+        if let Some(sink) = self.mutation_observer_sink.get(&self.host_gate) { sink(self, mutation); }
     }
 
     /// Observer records can be suppressed independently of internal removal,
     /// range, insertion, and lifecycle steps by compound DOM algorithms.
     pub fn set_mutation_observer_sink(&mut self, sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>) {
-        self.mutation_observer_sink = sink;
+        self.mutation_observer_sink = css::Hook::new(sink);
     }
 
     /// Receives mutations affecting slot assignment without enabling observer
@@ -1152,7 +1162,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         &mut self,
         sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
     ) {
-        self.shadow_mutation_sink = sink;
+        self.shadow_mutation_sink = css::Hook::new(sink);
     }
 
     fn observing_mutations(&self) -> bool {
@@ -1194,7 +1204,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         }
         self.identity_snapshot = match self.kind(id) {
             Ok(NodeKind::Element { attributes, .. }) => {
-                let value = |name: &str| attributes.iter().find(|(key, _)| key.as_str() == name).map(|(_, value)| Rc::<str>::from(value.as_str()));
+                let value = |name: &str| attributes.iter().find(|(key, _)| key.as_str() == name).map(|(_, value)| Arc::<str>::from(value.as_str()));
                 Some((id, value("class"), value("id")))
             }
             _ => None,
@@ -1218,23 +1228,23 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     pub fn set_parser_custom_element_predicate(&mut self, predicate: Option<Rc<dyn Fn(&Document, NodeId, &str, Option<&str>) -> bool>>) {
-        self.parser_custom_element_predicate = predicate;
+        self.parser_custom_element_predicate = css::Hook::new(predicate);
     }
 
     /// Record a parser-created element's registry before connection or script.
     pub fn set_inline_stylesheet_policy(&mut self, policy: Option<Rc<dyn Fn(&Document, NodeId, &str) -> bool>>) {
-        self.inline_stylesheet_policy = policy;
+        self.inline_stylesheet_policy = css::Hook::new(policy);
     }
 
     pub fn inline_stylesheet_allowed(&self, node: NodeId, text: &str) -> bool {
-        self.inline_stylesheet_policy.as_ref().is_none_or(|policy| policy(self, node, text))
+        self.inline_stylesheet_policy.get(&self.host_gate).is_none_or(|policy| policy(self, node, text))
     }
     pub fn has_inline_stylesheet_policy(&self)->bool {self.inline_stylesheet_policy.is_some()}
 
     /// Evaluate authored style attributes when they change, rather than
     /// rechecking later policies on every layout or retaining their text twice.
     pub fn set_inline_style_attribute_policy(&mut self, policy: Option<Rc<dyn Fn(&Document, NodeId, &str) -> Result<bool, Error>>>) {
-        self.inline_style_attribute_policy = policy;
+        self.inline_style_attribute_policy = css::Hook::new(policy);
     }
 
     pub fn inline_style_attribute_allowed(&self, node: NodeId) -> bool {
@@ -1242,7 +1252,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     fn initialize_inline_style_attribute(&mut self, node: NodeId) -> Result<(), Error> {
-        let allowed = match (&self.inline_style_attribute_policy, self.get_attribute_ns_ref(node, None, "style").ok().flatten()) {
+        let allowed = match (self.inline_style_attribute_policy.get(&self.host_gate), self.get_attribute_ns_ref(node, None, "style").ok().flatten()) {
             (Some(policy), Some(text)) => policy(self, node, text)?,
             _ => true,
         };
@@ -1253,45 +1263,45 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     /// Observe actual tree-builder retirement without running author code.
     /// The parser may still hold its document borrow while this sink runs.
     pub fn set_parser_element_completion_sink(&mut self, sink: Option<Rc<dyn Fn(&Document, NodeId)>>) {
-        self.parser_element_completion_sink = sink;
+        self.parser_element_completion_sink = css::Hook::new(sink);
     }
 
     pub(crate) fn record_parser_element_completion(&self, node: NodeId) {
-        if let Some(sink) = &self.parser_element_completion_sink { sink(self, node); }
+        if let Some(sink) = self.parser_element_completion_sink.get(&self.host_gate) { sink(self, node); }
     }
 
     pub fn set_parser_style_block_sink(&mut self, sink: Option<Rc<dyn Fn(&Document, NodeId) -> Result<(), Error>>>) {
-        self.parser_style_block_sink = sink;
+        self.parser_style_block_sink = css::Hook::new(sink);
     }
 
     pub fn record_parser_style_block_update(&self, node: NodeId) -> Result<(), Error> {
-        if let Some(sink) = &self.parser_style_block_sink { sink(self, node)?; }
+        if let Some(sink) = self.parser_style_block_sink.get(&self.host_gate) { sink(self, node)?; }
         Ok(())
     }
 
     pub fn set_parser_element_birth_sink(&mut self, sink: Option<Rc<dyn Fn(&Document, NodeId, NodeId, bool) -> Result<(), Error>>>) {
-        self.parser_element_birth_sink = sink;
+        self.parser_element_birth_sink = css::Hook::new(sink);
     }
 
     pub(crate) fn record_parser_element_birth(&self, element: NodeId, intended_parent: NodeId, document_parser: bool) -> Result<(), Error> {
-        if let Some(sink) = &self.parser_element_birth_sink { sink(self, element, intended_parent, document_parser)?; }
+        if let Some(sink) = self.parser_element_birth_sink.get(&self.host_gate) { sink(self, element, intended_parent, document_parser)?; }
         Ok(())
     }
 
     pub(crate) fn parser_custom_element_defined(&self, context: NodeId, local_name: &str, is_value: Option<&str>) -> bool {
-        self.parser_custom_element_predicate.as_ref().is_some_and(|predicate| predicate(self, context, local_name, is_value))
+        self.parser_custom_element_predicate.get(&self.host_gate).is_some_and(|predicate| predicate(self, context, local_name, is_value))
     }
 
     pub(crate) fn initialize_parser_is_value(&mut self, node: NodeId, is_value: Option<&str>) -> Result<(), Error> {
         self.kind(node)?;
-        if let Some(value) = is_value { self.insert_custom_element_is(node, Rc::from(value)); }
+        if let Some(value) = is_value { self.insert_custom_element_is(node, Arc::from(value)); }
         Ok(())
     }
 
-    fn authored_is_value(kind: &NodeKind) -> Option<Rc<str>> {
+    fn authored_is_value(kind: &NodeKind) -> Option<Arc<str>> {
         match kind {
             NodeKind::Element { namespace: Namespace::Html, attributes, .. } =>
-                attributes.iter().find(|(name, _)| name == "is").map(|(_, value)| Rc::from(value.as_str())),
+                attributes.iter().find(|(name, _)| name == "is").map(|(_, value)| Arc::from(value.as_str())),
             _ => None,
         }
     }
@@ -1300,18 +1310,18 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     /// content attribute. Non-HTML nodes cannot have custom-element state.
     pub fn create_with_is_value(&mut self, kind: NodeKind, is_value: Option<&str>) -> Result<NodeId, Error> {
         let is_value = if matches!(kind, NodeKind::Element { namespace: Namespace::Html, .. }) {
-            is_value.map(Rc::from)
+            is_value.map(Arc::from)
         } else { None };
         self.create_with_is_rc(kind, is_value)
     }
 
-    fn create_with_is_rc(&mut self, kind: NodeKind, is_value: Option<Rc<str>>) -> Result<NodeId, Error> {
+    fn create_with_is_rc(&mut self, kind: NodeKind, is_value: Option<Arc<str>>) -> Result<NodeId, Error> {
         let id = self.create_with_is_rc_without_details(kind, is_value)?;
         self.details_created(id)?;
         Ok(id)
     }
 
-    fn create_with_is_rc_without_details(&mut self, kind: NodeKind, is_value: Option<Rc<str>>) -> Result<NodeId, Error> {
+    fn create_with_is_rc_without_details(&mut self, kind: NodeKind, is_value: Option<Arc<str>>) -> Result<NodeId, Error> {
         if is_value.is_some() { self.custom_element_is_values.try_reserve(1).map_err(|_| Error::LimitExceeded)?; }
         let id = self.create_without_details_steps(kind)?;
         if let Some(value) = is_value { self.insert_custom_element_is(id, value); }
@@ -1321,7 +1331,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     fn includes_nonce(&self,node:NodeId)->Result<bool,Error> {
         Ok(matches!(self.kind(node)?,NodeKind::Element {namespace:Namespace::Html|Namespace::Svg|Namespace::MathMl,..}))
     }
-    fn nonce_rc(&self,node:NodeId)->Option<&Rc<str>> {
+    fn nonce_rc(&self,node:NodeId)->Option<&Arc<str>> {
         self.cryptographic_nonces.binary_search_by_key(&node.index,|(id,_)|id.index).ok()
             .and_then(|index|{let(id,value)=&self.cryptographic_nonces[index];(*id==node).then_some(value)})
     }
@@ -1332,7 +1342,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     pub fn set_cryptographic_nonce(&mut self,node:NodeId,value:&str)->Result<(),Error> {
         if !self.includes_nonce(node)? {return Err(Error::WrongKind);}
         self.reserve_nonce(value.len(),self.nonce_rc(node).map_or(0,|value|value.len()))?;
-        self.store_nonce(node,(!value.is_empty()).then(||Rc::from(value)));Ok(())
+        self.store_nonce(node,(!value.is_empty()).then(||Arc::from(value)));Ok(())
     }
     fn reserve_nonce(&mut self,new:usize,old:usize)->Result<(),Error> {
         let bytes=self.cryptographic_nonce_bytes.checked_sub(old).and_then(|bytes|bytes.checked_add(new)).ok_or(Error::LimitExceeded)?;
@@ -1340,11 +1350,11 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let required=self.cryptographic_nonces.len().checked_add(additional).ok_or(Error::LimitExceeded)?;
         let capacity=self.cryptographic_nonces.capacity();
         let slots=if required>capacity {required.max(capacity.checked_mul(2).ok_or(Error::LimitExceeded)?).max(4)} else {capacity};
-        if slots.checked_mul(core::mem::size_of::<(NodeId,Rc<str>)>()).and_then(|storage|storage.checked_add(bytes)).is_none_or(|bytes|bytes>html::MAX_HTML_BYTES) {return Err(Error::LimitExceeded);}
+        if slots.checked_mul(core::mem::size_of::<(NodeId,Arc<str>)>()).and_then(|storage|storage.checked_add(bytes)).is_none_or(|bytes|bytes>html::MAX_HTML_BYTES) {return Err(Error::LimitExceeded);}
         if additional!=0 {self.cryptographic_nonces.try_reserve(additional).map_err(|_|Error::LimitExceeded)?;}
         Ok(())
     }
-    fn store_nonce(&mut self,node:NodeId,value:Option<Rc<str>>) {
+    fn store_nonce(&mut self,node:NodeId,value:Option<Arc<str>>) {
         let value=value.filter(|value|!value.is_empty());
         match self.cryptographic_nonces.binary_search_by_key(&node.index,|(id,_)|id.index) {
             Ok(index)=>{
@@ -1383,13 +1393,13 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         Ok(())
     }
 
-    fn insert_custom_element_is(&mut self, id: NodeId, value: Rc<str>) {
+    fn insert_custom_element_is(&mut self, id: NodeId, value: Arc<str>) {
         let index = self.custom_element_is_values.binary_search_by_key(&id.index, |(owner, _)| owner.index)
             .unwrap_or_else(|index| index);
         self.custom_element_is_values.insert(index, (id, value));
     }
 
-    fn custom_element_is_rc(&self, id: NodeId) -> Option<&Rc<str>> {
+    fn custom_element_is_rc(&self, id: NodeId) -> Option<&Arc<str>> {
         self.custom_element_is_values.binary_search_by_key(&id.index, |(owner, _)| owner.index).ok()
             .and_then(|index| { let (owner, value) = &self.custom_element_is_values[index]; (*owner == id).then_some(value) })
     }
@@ -1410,7 +1420,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 
     fn create_node_without_details(&mut self, kind: NodeKind, internal_document: bool, literal_colon: bool) -> Result<NodeId, Error> {
         let nonce=match &kind {
-            NodeKind::Element {namespace:Namespace::Html|Namespace::Svg|Namespace::MathMl,attributes,..}=>attributes.iter().find(|(name,_)|name=="nonce").map(|(_,value)|Rc::<str>::from(value.as_str())).filter(|value|!value.is_empty()),
+            NodeKind::Element {namespace:Namespace::Html|Namespace::Svg|Namespace::MathMl,attributes,..}=>attributes.iter().find(|(name,_)|name=="nonce").map(|(_,value)|Arc::<str>::from(value.as_str())).filter(|value|!value.is_empty()),
             _=>None,
         };
         if let Some(value)=&nonce {self.reserve_nonce(value.len(),0)?;}
@@ -1423,7 +1433,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         if self.max_nodes.saturating_sub(self.live_nodes) < required {
             return Err(Error::LimitExceeded);
         }
-        if let Some(budget) = &self.allocation_budget { budget(self, required, required)?; }
+        if let Some(budget) = self.allocation_budget.get(&self.host_gate) { budget(self, required, required)?; }
         if self.nodes.len().checked_add(required.saturating_sub(self.free.len()))
             .is_none_or(|total| total > u32::MAX as usize) {
             return Err(Error::LimitExceeded);
@@ -1622,12 +1632,13 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     pub fn set_template_ancestor_resolver(&mut self, resolver: Rc<dyn Fn(&Document, NodeId, NodeId) -> Result<bool, Error>>) {
-        self.template_ancestor_resolver = Some(resolver);
+        self.template_ancestor_resolver = css::Hook::new(Some(resolver));
     }
 
     pub fn is_host_including_inclusive_ancestor(&self, ancestor: NodeId, mut node: NodeId) -> Result<bool, Error> {
         if !self.foreign_template_links.is_empty() {
-            if let Some(resolve) = &self.template_ancestor_resolver { return resolve(self, ancestor, node); }
+            if self.template_ancestor_resolver.gated(&self.host_gate) { return self.host_gate.template_ancestor(ancestor, node); }
+            if let Some(resolve) = self.template_ancestor_resolver.get(&self.host_gate) { return resolve(self, ancestor, node); }
         }
         for _ in 0..=self.node_count() {
             if node == ancestor { return Ok(true); }
@@ -2114,7 +2125,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     pub fn ensure_clone_capacity(&self, count: usize) -> Result<(), Error> {
-        if let Some(budget) = &self.allocation_budget { budget(self, count, count)?; }
+        if let Some(budget) = self.allocation_budget.get(&self.host_gate) { budget(self, count, count)?; }
         if self
             .live_nodes
             .checked_add(count)
@@ -2347,8 +2358,8 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             && originals.iter().any(|id| source.template_content(*id).ok().flatten().is_some());
         let count = originals.len();
         let allocation_count = count.checked_add(usize::from(needs_template_owner)).ok_or(Error::LimitExceeded)?;
-        if let Some(budget) = &self.allocation_budget {
-            let shared = self.allocation_budget_group.as_ref().zip(source.allocation_budget_group.as_ref())
+        if let Some(budget) = self.allocation_budget.get(&self.host_gate) {
+            let shared = self.allocation_budget_group.get(&self.host_gate).zip(source.allocation_budget_group.get(&source.host_gate))
                 .is_some_and(|(destination, source)| Rc::ptr_eq(destination, source));
             budget(self, allocation_count, if shared { usize::from(needs_template_owner) } else { allocation_count })?;
         }
@@ -2483,7 +2494,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let required=self.cryptographic_nonces.len().checked_add(moved_nonces).ok_or(Error::LimitExceeded)?;
         let capacity=self.cryptographic_nonces.capacity();
         let slots=if required>capacity {required.max(capacity.checked_mul(2).ok_or(Error::LimitExceeded)?).max(4)} else {capacity};
-        let slots=slots.checked_mul(core::mem::size_of::<(NodeId,Rc<str>)>()).and_then(|bytes|bytes.checked_add(self.cryptographic_nonce_bytes)).and_then(|bytes|bytes.checked_add(moved_nonce_bytes)).ok_or(Error::LimitExceeded)?;
+        let slots=slots.checked_mul(core::mem::size_of::<(NodeId,Arc<str>)>()).and_then(|bytes|bytes.checked_add(self.cryptographic_nonce_bytes)).and_then(|bytes|bytes.checked_add(moved_nonce_bytes)).ok_or(Error::LimitExceeded)?;
         if slots>html::MAX_HTML_BYTES {return Err(Error::LimitExceeded);}
         self.cryptographic_nonces.try_reserve(moved_nonces).map_err(|_|Error::LimitExceeded)?;
         let mut remaining_nonces=Vec::new();remaining_nonces.try_reserve(source.cryptographic_nonces.len()-moved_nonces).map_err(|_|Error::LimitExceeded)?;
@@ -2839,11 +2850,11 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 
     pub fn create_unprefixed_element_with_is_value(&mut self, namespace: Namespace, name: Name,
         attributes: Vec<(Name, String)>, is_value: Option<&str>) -> Result<NodeId, Error> {
-        let is_value = if namespace == Namespace::Html { is_value.map(Rc::from) } else { None };
+        let is_value = if namespace == Namespace::Html { is_value.map(Arc::from) } else { None };
         self.create_unprefixed_with_is_rc(NodeKind::Element { namespace, name, attributes }, is_value)
     }
 
-    fn create_unprefixed_with_is_rc(&mut self, kind: NodeKind, is_value: Option<Rc<str>>) -> Result<NodeId, Error> {
+    fn create_unprefixed_with_is_rc(&mut self, kind: NodeKind, is_value: Option<Arc<str>>) -> Result<NodeId, Error> {
         let NodeKind::Element { name, .. } = &kind else { return Err(Error::WrongKind); };
         let literal_colon = name.contains(':');
         if literal_colon {
@@ -2894,7 +2905,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             .map(|(_, uri)| uri.as_ref())
     }
 
-    pub(crate) fn attribute_namespace_metadata(&self, id: NodeId) -> &[(usize, Rc<str>)] {
+    pub(crate) fn attribute_namespace_metadata(&self, id: NodeId) -> &[(usize, Arc<str>)] {
         self.attribute_namespaces.iter().find(|(owner, _)| *owner == id)
             .map_or(&[], |(_, namespaces)| namespaces.as_slice())
     }
@@ -3012,7 +3023,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             (
                 name.clone(),
                 value.clone(),
-                self.attribute_namespace_uri_at(id, index).map(Rc::from),
+                self.attribute_namespace_uri_at(id, index).map(Arc::from),
             )
         };
         if let Some(existing) = self
@@ -3119,7 +3130,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         self.create(NodeKind::Attribute {
             namespace_uri: namespace_uri
                 .filter(|uri| !uri.is_empty())
-                .map(|uri| Box::new(Rc::from(uri))),
+                .map(|uri| Box::new(Arc::from(uri))),
             qualified_name: Name::new(qualified_name),
             value: String::from(value),
             owner_element: None,
@@ -3227,7 +3238,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let observing = self.observing_mutations();
         if style_changed {
             let allowed = if qualified_name == "style" && namespace_uri.is_none() {
-                match &self.inline_style_attribute_policy {
+                match self.inline_style_attribute_policy.get(&self.host_gate) {
                     Some(policy) => policy(self, element, &value)?,
                     None => true,
                 }
@@ -3373,7 +3384,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let style_attribute = matches!(self.kind(attribute)?, NodeKind::Attribute { qualified_name, namespace_uri, .. }
             if qualified_name == "style" && namespace_uri.is_none());
         let style_changed = if style_attribute {
-            let allowed = match &self.inline_style_attribute_policy {
+            let allowed = match self.inline_style_attribute_policy.get(&self.host_gate) {
                 Some(policy) => policy(self, owner, value)?,
                 None => true,
             };
@@ -3514,8 +3525,8 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             owner_element,
         } = &mut self.node_mut(attribute).kind
         {
-            let namespace: Option<Rc<str>> =
-                namespace_uri.filter(|uri| !uri.is_empty()).map(Rc::from);
+            let namespace: Option<Arc<str>> =
+                namespace_uri.filter(|uri| !uri.is_empty()).map(Arc::from);
             if let (Some(current), Some(namespace)) =
                 (current_namespace.as_deref_mut(), namespace.as_ref())
             {
@@ -3567,15 +3578,15 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         {
             metadata.retain(|(known, _)| *known != index);
             if let Some(uri) = uri {
-                metadata.push((index, Rc::from(uri)));
+                metadata.push((index, Arc::from(uri)));
             }
         } else if let Some(uri) = uri {
             self.attribute_namespaces
-                .push((id, alloc::vec![(index, Rc::from(uri))]));
+                .push((id, alloc::vec![(index, Arc::from(uri))]));
         }
     }
 
-    fn attribute_namespace_rc_at(&self, id: NodeId, index: usize) -> Option<Rc<str>> {
+    fn attribute_namespace_rc_at(&self, id: NodeId, index: usize) -> Option<Arc<str>> {
         self.attribute_namespaces
             .iter()
             .find(|(owner, _)| *owner == id)
@@ -4622,7 +4633,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         }
         self.nonce_attribute_changed(id,namespace_uri.as_deref(),name,Some(value))?;
         let cssom_changed = if name == "style" && namespace_uri.is_none() {
-            let allowed = match &self.inline_style_attribute_policy {
+            let allowed = match self.inline_style_attribute_policy.get(&self.host_gate) {
                 Some(policy) => policy(self, id, value)?,
                 None => true,
             };
@@ -4850,7 +4861,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         self.inline_cssom_styles.binary_search_by_key(&id.index, |(owner, _)| owner.index)
             .ok().and_then(|position| {
                 let (owner, block) = &self.inline_cssom_styles[position];
-                (*owner == id).then_some(block.as_ref())
+                (*owner == id).then_some(&**block)
             })
     }
 
@@ -4859,15 +4870,15 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     pub fn read_inline_cssom_style(&mut self, id: NodeId) -> Result<Option<Rc<css::DeclarationBlock>>, css::CssError> {
         if !matches!(self.kind(id), Ok(NodeKind::Element { .. })) { return Ok(None); }
         if let Ok(position) = self.inline_cssom_styles.binary_search_by_key(&id.index, |(owner, _)| owner.index) {
-            let (owner, block) = &self.inline_cssom_styles[position];
-            if *owner == id { return Ok(Some(block.clone())); }
+            let (owner, block) = &mut self.inline_cssom_styles[position];
+            if *owner == id { return Ok(Some(block.share())); }
         }
-        if let Some((owner, block)) = &self.inline_cssom_read_cache {
-            if *owner == id { return Ok(Some(block.clone())); }
+        if let Some((owner, block)) = &mut self.inline_cssom_read_cache {
+            if *owner == id { return Ok(Some(block.share())); }
         }
         let raw = self.get_attribute_ns_ref(id, None, "style").ok().flatten().unwrap_or("");
         let block = Rc::new(css::DeclarationBlock::parse(raw)?);
-        self.inline_cssom_read_cache = Some((id, block.clone()));
+        self.inline_cssom_read_cache = Some((id, css::ReadOnlyRc::new(block.clone())));
         Ok(Some(block))
     }
 
@@ -4891,11 +4902,11 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
                 if self.inline_cssom_styles[position].0 == id && *self.inline_cssom_styles[position].1 == *block {
                     return false;
                 }
-                self.inline_cssom_styles[position] = (id, block);
+                self.inline_cssom_styles[position] = (id, css::ReadOnlyRc::new(block));
                 true
             }
             (Err(position), Some(block)) => {
-                self.inline_cssom_styles.insert(position, (id, block));
+                self.inline_cssom_styles.insert(position, (id, css::ReadOnlyRc::new(block)));
                 true
             }
             (Ok(position), None) => { self.inline_cssom_styles.remove(position); true }
@@ -4938,7 +4949,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         if style_attribute {
             // CSSOM updates carry the declaration block's updating flag. They
             // are actual property edits, not a new authored attribute parse.
-            let allowed = block.is_some() || match &self.inline_style_attribute_policy {
+            let allowed = block.is_some() || match self.inline_style_attribute_policy.get(&self.host_gate) {
                 Some(policy) => policy(self, id, value)?,
                 None => true,
             };
@@ -5162,8 +5173,36 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 
     /// Append CharacterData using UTF-16-aware concatenation.
     pub fn append_data(&mut self, id: NodeId, data: &str) -> Result<(), Error> {
+        // Without smuggled scalars on either side the UTF-16 round trip is the
+        // identity, so the data is appended in place; the parser appends
+        // every text continuation this way.
+        if !lumen_common::smuggle::may_contain(data) && !lumen_common::smuggle::may_contain(self.character_data_value(id)?) {
+            return self.append_plain_character_data(id, data);
+        }
         let offset = self.character_data_length(id)?;
         self.replace_data_range(id, offset, 0, data)
+    }
+
+    fn append_plain_character_data(&mut self, id: NodeId, data: &str) -> Result<(), Error> {
+        let observing = self.observing_mutations();
+        let kind = &mut self.node_mut_checked(id)?.kind;
+        let text = match kind {
+            NodeKind::Text(text) | NodeKind::CData(text) | NodeKind::Comment(text) => text,
+            NodeKind::ProcessingInstruction { data, .. } => data,
+            _ => return Err(Error::WrongKind),
+        };
+        let recorded = observing.then(|| (text.clone(), lumen_common::smuggle::utf16_unit_len(text)));
+        if !data.is_empty() {
+            text.push_str(data);
+            self.mark_dirty(id, Dirty::STYLE, MutationKind::CharacterData);
+        }
+        if let Some((old_value, offset)) = recorded {
+            self.notify(observe::ObservedMutation {
+                target: id,
+                kind: observe::ObservedKind::CharacterData { old_value, offset, removed: 0, inserted: lumen_common::smuggle::utf16_unit_len(data) },
+            });
+        }
+        Ok(())
     }
 
     /// Insert CharacterData at a UTF-16 code-unit offset.
@@ -5203,6 +5242,9 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
 fn split_qualified_name(name: &str) -> (&str, &str) {
     name.split_once(':').unwrap_or(("", name))
 }
+
+#[cfg(test)]
+mod type_sizes_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6253,8 +6295,9 @@ mod tests {
         assert!(names.template_content(qualified).unwrap().is_some());
         let mut xml = Document::new(8);
         let xml_template = xml.create(element("template")).unwrap();
-        assert_eq!(xml.node_document(xml.template_content(xml_template).unwrap().unwrap()), Ok(xml.root()));
-        assert!(xml.template_owner_document.is_none());
+        let xml_owner = xml.node_document(xml.template_content(xml_template).unwrap().unwrap()).unwrap();
+        assert_ne!(xml_owner, xml.root());
+        assert!(xml.is_template_owner_document(xml_owner));
     }
 
     #[test]
@@ -6792,4 +6835,20 @@ mod tests {
         assert!(source.cryptographic_nonces.is_empty());assert_eq!(source.cryptographic_nonce_bytes,0);
     }
 
+    #[test]
+    fn appending_character_data_without_surrogates_extends_in_place() {
+        let mut doc = Document::new(8);
+        let text = doc.create(NodeKind::Text(String::from("h\u{e9}llo"))).unwrap();
+        doc.append_data(text, " w\u{f6}rld \u{1f4a9}").unwrap();
+        doc.append_data(text, "").unwrap();
+        assert_eq!(doc.substring_data(text, 0, usize::MAX).unwrap(), "h\u{e9}llo w\u{f6}rld \u{1f4a9}");
+        assert_eq!(doc.character_data_length(text), Ok(14));
+        let root = doc.root();
+        assert_eq!(doc.append_data(root, "x"), Err(Error::WrongKind));
+        let parsed = html::parse("<p>a < b < c &amp; d</p>", 32).unwrap();
+        let paragraph = selector::query_selector(&parsed, parsed.root(), "p").unwrap().unwrap();
+        let only = parsed.first_child(paragraph).unwrap().unwrap();
+        assert_eq!(parsed.next_sibling(only).unwrap(), None);
+        assert_eq!(parsed.substring_data(only, 0, usize::MAX).unwrap(), "a < b < c & d");
+    }
 }

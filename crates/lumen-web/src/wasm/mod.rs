@@ -1,11 +1,13 @@
 //! WebAssembly: a from-scratch, std-only engine — binary decoder (`parse`), a bytecode interpreter
 //! (`exec`), and the JS `WebAssembly.*` API bound natively in `wasm_ops.rs`.
 //! Supports the MVP instruction set plus common post-MVP ops (multi-value, sign-extension,
-//! saturating conversions, bulk memory). Not supported: SIMD, threads/atomics, exceptions, GC.
+//! saturating conversions, bulk memory) and fixed-width SIMD (`v128`, interpreted only). Not
+//! supported: relaxed SIMD, threads/atomics, exceptions, GC.
 
 pub mod exec;
 pub mod native;
 pub mod parse;
+pub mod simd;
 #[cfg(test)]
 mod test_util;
 pub mod translate;

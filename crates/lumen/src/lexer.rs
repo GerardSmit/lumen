@@ -2,7 +2,9 @@
 //! token list up front and resolves the classic `/`-is-it-a-regex-or-division ambiguity by
 //! tracking whether the previously emitted token can end an expression.
 
-use crate::token::{Name, RegexTok, SubToks, Tok, TokVec, Token, TplPart};
+use crate::token::{
+    Keyword, Name, Num, Packed, Punct, RegexTok, SubToks, Tok, TokVec, Token, TplPart,
+};
 use std::rc::Rc;
 
 mod jsx;
@@ -14,6 +16,227 @@ pub struct LexError {
     /// The lexer ran out of input mid-construct (unterminated template/comment/...). A REPL uses
     /// this to keep reading lines instead of reporting a SyntaxError.
     pub at_eof: bool,
+}
+
+/// Tokens of a skimmed body kept before its middle is dropped as the lexer goes, and the
+/// trailing tokens always kept for the lexer's look-behind.
+const SKIM_WINDOW: usize = 512;
+const SKIM_TAIL: usize = 48;
+
+#[cfg(test)]
+thread_local! {
+    /// The most tokens any lexer on this thread held at once.
+    pub(crate) static PEAK_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bodies [`Lexer::skip_body`] jumped over on this thread.
+    pub(crate) static SKIPPED_BODIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The body being skimmed: where its `{` sits in the output and the source.
+#[derive(Clone, Copy)]
+struct SkimMark {
+    brace_depth: usize,
+    out_len: usize,
+    line: u32,
+    start: u32,
+}
+
+/// What the previous token says about a following `/`, `{` or `function`.
+#[derive(Clone, Copy, PartialEq)]
+enum Prev {
+    /// No token yet.
+    Start,
+    /// A literal, or the `Eof`/`Skim` stand-ins: an operand has ended.
+    Operand,
+    Ident,
+    Await,
+    Yield,
+    Kw(Keyword),
+    Punct(Punct),
+}
+
+impl Prev {
+    fn of(kind: &Tok) -> Prev {
+        match kind {
+            Tok::Num(_)
+            | Tok::BigInt(_)
+            | Tok::Str(_)
+            | Tok::Template(_)
+            | Tok::Jsx(_)
+            | Tok::Regex(_)
+            | Tok::Skim
+            | Tok::Eof => Prev::Operand,
+            Tok::Ident(w) => Prev::of_ident(w),
+            Tok::Keyword(k) => Prev::Kw(*k),
+            Tok::Punct(p) => Prev::Punct(*p),
+        }
+    }
+
+    fn of_ident(word: &str) -> Prev {
+        match word {
+            "await" => Prev::Await,
+            "yield" => Prev::Yield,
+            _ => Prev::Ident,
+        }
+    }
+
+    /// Whether a `/` after this token begins a regex literal (we are at the start of an
+    /// expression) rather than a division.
+    fn regex_allowed(self, start_div: bool, br: &Brackets) -> bool {
+        match self {
+            Prev::Start => !start_div,
+            Prev::Operand | Prev::Ident => false,
+            // `await`/`yield` are contextual: when they are keywords (module top level, async or
+            // generator bodies) they prefix an expression, so a following `/` starts a regex. They
+            // are identifiers here since the lexer lacks that context; allow the regex form —
+            // division right after a bare `await`/`yield` identifier is vanishingly rare.
+            Prev::Await | Prev::Yield => true,
+            Prev::Kw(k) => !matches!(
+                k,
+                Keyword::This | Keyword::Super | Keyword::True | Keyword::False | Keyword::Null
+            ),
+            // Calls/grouping and brackets produce values; a control header ends a statement
+            // prefix. Braces distinguish a block (regex) from an object literal (division).
+            Prev::Punct(Punct::RParen) => br.last_close_control,
+            Prev::Punct(Punct::RBracket) => false,
+            Prev::Punct(Punct::RBrace) => br.last_close_block,
+            Prev::Punct(_) => true,
+        }
+    }
+
+    /// Whether a `function`/`class` keyword after this token sits at statement position (a
+    /// declaration, whose body's closing `}` ends a statement).
+    fn at_statement_start(self, br: &Brackets) -> bool {
+        match self {
+            Prev::Start => true,
+            Prev::Punct(Punct::Semi | Punct::LBrace) => true,
+            Prev::Punct(Punct::RBrace) => br.last_close_block,
+            Prev::Kw(k) => matches!(
+                k,
+                Keyword::Else
+                    | Keyword::Do
+                    | Keyword::Try
+                    | Keyword::Finally
+                    | Keyword::Export
+                    | Keyword::Default
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether a `{` after this token (other than a `)`) opens a block or control body rather
+    /// than an object literal.
+    fn block_follows(self) -> bool {
+        match self {
+            Prev::Start => true,
+            Prev::Punct(p) => matches!(p, Punct::Semi | Punct::LBrace | Punct::RBrace | Punct::Arrow),
+            Prev::Kw(k) => matches!(k, Keyword::Else | Keyword::Do | Keyword::Try | Keyword::Finally),
+            _ => false,
+        }
+    }
+
+    /// Whether a `(` after this token (and `before` it) opens a control-statement header.
+    fn opens_control_paren(self, before: Prev) -> bool {
+        match self {
+            Prev::Kw(
+                Keyword::If
+                | Keyword::For
+                | Keyword::While
+                | Keyword::With
+                | Keyword::Switch
+                | Keyword::Catch,
+            ) => !matches!(before, Prev::Punct(Punct::Dot | Punct::OptChain)),
+            Prev::Await => before == Prev::Kw(Keyword::For),
+            _ => false,
+        }
+    }
+}
+
+/// The open brackets as far as the `/` ambiguity needs them.
+#[derive(Default)]
+struct Brackets {
+    /// One entry per open `{`: `true` if it opened a block/function body (statement position),
+    /// `false` if an object literal (expression position). Used to disambiguate a `/` after `}`.
+    braces: Vec<bool>,
+    /// One entry per open `(`: it opens a control header. Call/grouping parentheses produce
+    /// values; a following slash must tell those apart before scanning a regex body.
+    parens: Vec<bool>,
+    /// One entry per `function` keyword whose body has not opened yet: `true` if the function is
+    /// an *expression* (so its body `}` is followed by division), `false` if a *declaration*
+    /// (its `}` ends a statement, so a `/` after it is a regex).
+    pending_fn: Vec<bool>,
+    /// Set by a `class` keyword: the next `{` is the class body, classified by whether the class
+    /// is a declaration (statement position) or an expression.
+    pending_class: Option<bool>,
+    /// A `/` after a block-closing `}` begins a regex; after an object-literal-closing `}` it is
+    /// division.
+    last_close_block: bool,
+    last_close_control: bool,
+}
+
+/// Where [`Brackets`] stood, to rewind to.
+struct BracketsMark {
+    lens: [usize; 3],
+    pending_class: Option<bool>,
+    last_close: [bool; 2],
+}
+
+impl Brackets {
+    fn mark(&self) -> BracketsMark {
+        BracketsMark {
+            lens: [self.braces.len(), self.parens.len(), self.pending_fn.len()],
+            pending_class: self.pending_class,
+            last_close: [self.last_close_block, self.last_close_control],
+        }
+    }
+
+    /// Back to `mark`, provided nothing below it was popped since.
+    fn rewind(&mut self, mark: &BracketsMark) {
+        self.braces.truncate(mark.lens[0]);
+        self.parens.truncate(mark.lens[1]);
+        self.pending_fn.truncate(mark.lens[2]);
+        self.pending_class = mark.pending_class;
+        [self.last_close_block, self.last_close_control] = mark.last_close;
+    }
+
+    fn open_paren(&mut self, prev: Prev, before: Prev) {
+        self.parens.push(prev.opens_control_paren(before));
+    }
+
+    fn close_paren(&mut self) {
+        self.last_close_control = self.parens.pop().unwrap_or(false);
+    }
+
+    fn function_keyword(&mut self, prev: Prev) {
+        let is_expr = !prev.at_statement_start(self);
+        self.pending_fn.push(is_expr);
+    }
+
+    fn class_keyword(&mut self, prev: Prev) {
+        self.pending_class = Some(prev.at_statement_start(self));
+    }
+
+    /// Classify an opening `{` (about to be pushed): does the matching `}` end at statement
+    /// position (a block, control body, or function *declaration* body → a following `/` is a
+    /// regex) or at value position (an object literal or function *expression* body → division)?
+    /// Returns whether it opens a class body.
+    fn open_brace(&mut self, prev: Prev) -> bool {
+        let class_body = self.pending_class.is_some();
+        let ends_stmt = match self.pending_class.take() {
+            Some(is_decl) => is_decl,
+            None if prev == Prev::Punct(Punct::RParen) => {
+                // A body after `)` — either a function body (classified by `pending_fn`) or a
+                // control block / method (statement position).
+                self.pending_fn.pop().map_or(true, |is_expr| !is_expr)
+            }
+            None => prev.block_follows(),
+        };
+        self.braces.push(ends_stmt);
+        class_body
+    }
+
+    fn close_brace(&mut self) {
+        self.last_close_block = self.braces.pop().unwrap_or(false);
+    }
 }
 
 struct Lexer<'a> {
@@ -30,25 +253,20 @@ struct Lexer<'a> {
     pending_legacy: bool,
     /// Set while reading a string that contained a lone (unpaired) surrogate `\u` escape.
     pending_lone_surrogate: bool,
-    /// One entry per open `{`: `true` if it opened a block/function body (statement position),
-    /// `false` if an object literal (expression position). Used to disambiguate a `/` after `}`.
-    brace_stack: Vec<bool>,
     /// Byte offset where the token currently being scanned began.
     tok_start: usize,
-    /// Classification of the most recently closed `}` (`true` = a block). A `/` after a block-closing
-    /// `}` begins a regex; after an object-literal-closing `}` it is division.
-    last_close_block: bool,
-    /// Parenthesized control headers end at statement position; call/grouping parentheses
-    /// produce values. A following slash must distinguish those before scanning a regex body.
-    paren_stack: Vec<bool>,
-    last_close_control: bool,
-    /// One entry per `function` keyword whose body has not opened yet: `true` if the function is an
-    /// *expression* (so its body `}` is followed by division), `false` if a *declaration* (its `}`
-    /// ends a statement, so a `/` after it is a regex).
-    pending_fn: Vec<bool>,
-    /// Set when a `class` keyword is pushed: the next `{` is the class body, classified by
-    /// whether the class was a declaration (statement position) or an expression.
-    pending_class: Option<bool>,
+    br: Brackets,
+    /// Parallel to `br.parens`: the `(` opens the parameter list of a `function`.
+    fn_paren_stack: Vec<bool>,
+    last_close_fn_head: bool,
+    /// Parallel to `br.braces`: the `{` opens a `function` body.
+    fn_brace_stack: Vec<bool>,
+    /// `function` bodies currently open.
+    fn_depth: u32,
+    /// Replace the tokens of each `function` body nested in at least this many others with
+    /// [`Tok::Skim`] (see [`LexOpts::skim_min_depth`]).
+    skim_min_depth: Option<u32>,
+    skim_open: Option<SkimMark>,
     /// TypeScript source: a postfix non-null `!` (`x!`) ends an expression, so a `/` after it is
     /// a division.
     ts: bool,
@@ -108,6 +326,13 @@ pub(crate) struct LexOpts {
     pub start_div: bool,
     /// Added to every token's byte offsets (the range starts this far into the parser's source).
     pub offset: u32,
+    /// Keep no tokens for the body of a `function` nested in at least this many other function
+    /// bodies: the lexer still lexes it (so its errors surface), then replaces its tokens with a
+    /// single [`Tok::Skim`] spanning the braces. The parser re-lexes the range when it reaches the
+    /// body, so a huge script never holds the tokens of all its function bodies at once. The
+    /// tokens of a body being skimmed are dropped as they are lexed, so even one huge body is
+    /// never held whole.
+    pub skim_min_depth: Option<u32>,
 }
 
 /// [`tokenize_range`] with [`LexOpts`]; also returns the recorded JSDoc comment ranges.
@@ -117,35 +342,99 @@ pub(crate) fn tokenize_opts(
     line: u32,
     opts: LexOpts,
 ) -> Result<Lexed, LexError> {
+    tokenize_pieces(&[src], html_comments, line, opts)
+}
+
+/// [`tokenize_range`] over a range held as consecutive pieces (see `Src::pieces`): the lexer
+/// carries its state from one piece to the next, so the tokens are those of the concatenation,
+/// with offsets counted across the pieces. A token must not span two pieces.
+pub(crate) fn tokenize_range_pieces(
+    pieces: &[&str],
+    html_comments: bool,
+    line: u32,
+) -> Result<TokVec, LexError> {
+    tokenize_pieces(pieces, html_comments, line, LexOpts::default()).map(|l| l.tokens)
+}
+
+/// Most identifier names a [`LexScratch`] keeps between lexes.
+const SCRATCH_IDENTS: usize = 32 * 1024;
+
+/// What a parser re-lexing many ranges of one source (the skimmed function bodies) carries from
+/// one lex to the next, so each does not start from nothing: the interned identifier names, which
+/// then are one allocation per name rather than per name per body, and the first token chunk.
+#[derive(Default)]
+pub(crate) struct LexScratch {
+    idents: crate::fasthash::FastSet<Name>,
+    chunk: Option<Vec<Token>>,
+}
+
+impl LexScratch {
+    /// Keep the allocation of `tokens`, which the caller is done with, for the next lex.
+    pub(crate) fn recycle(&mut self, tokens: TokVec) {
+        if let Some(chunk) = tokens.into_first_chunk() {
+            if self.chunk.as_ref().map_or(true, |c| c.capacity() < chunk.capacity()) {
+                self.chunk = Some(chunk);
+            }
+        }
+    }
+}
+
+pub(crate) fn tokenize_pieces<'a>(
+    pieces: &[&'a str],
+    html_comments: bool,
+    line: u32,
+    opts: LexOpts,
+) -> Result<Lexed, LexError> {
+    tokenize_pieces_with(pieces, html_comments, line, opts, &mut LexScratch::default())
+}
+
+pub(crate) fn tokenize_pieces_with<'a>(
+    pieces: &[&'a str],
+    html_comments: bool,
+    line: u32,
+    opts: LexOpts,
+    scratch: &mut LexScratch,
+) -> Result<Lexed, LexError> {
+    let src = pieces.first().copied().unwrap_or("");
+    if scratch.idents.len() > SCRATCH_IDENTS {
+        scratch.idents.clear();
+    }
+    let out = match scratch.chunk.take() {
+        Some(chunk) => TokVec::from_chunk(chunk),
+        // About one token per six bytes of ordinary source.
+        None => TokVec::with_capacity(pieces.iter().map(|p| p.len()).sum::<usize>() / 6 + 16),
+    };
     let mut lx = Lexer {
         src,
         bytes: src.as_bytes(),
         pos: 0,
         line,
-        // About one token per six bytes of ordinary source.
-        out: TokVec::with_capacity(src.len() / 6 + 16),
+        out,
         nl_pending: false,
         html_comments,
         pending_legacy: false,
         pending_lone_surrogate: false,
-        brace_stack: Vec::new(),
+        br: Brackets::default(),
         tok_start: 0,
-        last_close_block: false,
-        paren_stack: Vec::new(),
-        last_close_control: false,
-        pending_fn: Vec::new(),
-        pending_class: None,
+        fn_paren_stack: Vec::new(),
+        last_close_fn_head: false,
+        fn_brace_stack: Vec::new(),
+        fn_depth: 0,
+        skim_min_depth: opts.skim_min_depth,
+        skim_open: None,
         ts: opts.ts,
         jsx: opts.jsx,
         docs: opts.docs.then(Vec::new),
         start_div: opts.start_div,
-        idents: Default::default(),
+        idents: std::mem::take(&mut scratch.idents),
         offset: opts.offset,
     };
-    let soft_err = match lx.run() {
+    let ran = lx.run(pieces);
+    scratch.idents = std::mem::take(&mut lx.idents);
+    let soft_err = match ran {
         Ok(()) => None,
         Err(e) if lx.ts => {
-            lx.tok_start = lx.pos.min(src.len());
+            lx.tok_start = lx.pos.min(lx.src.len());
             lx.push(Tok::Eof);
             Some(e)
         }
@@ -158,7 +447,7 @@ pub(crate) fn tokenize_opts(
     })
 }
 
-impl Lexer<'_> {
+impl<'a> Lexer<'a> {
     /// The token `k` places before the last one pushed (`0` = the last).
     fn tok_back(&self, k: usize) -> Option<&Token> {
         self.out.get(self.out.len().checked_sub(k + 1)?)
@@ -217,33 +506,16 @@ impl Lexer<'_> {
     /// start of an expression). After a value-producing token (`)`, `]`, identifier, number, etc.)
     /// a `/` is division; otherwise it begins a regex.
     fn regex_allowed(&self) -> bool {
-        match self.tok_back(0).map(|t| &t.kind) {
-            None => !self.start_div,
-            Some(
-                Tok::Num(_)
-                | Tok::BigInt(_)
-                | Tok::Str(_)
-                | Tok::Template(_)
-                | Tok::Jsx(_)
-                | Tok::Regex(_),
-            ) => false,
-            // `await`/`yield` are contextual: when they are keywords (module top level, async or
-            // generator bodies) they prefix an expression, so a following `/` starts a regex. They
-            // are `Ident` tokens here since the lexer lacks that context; allow the regex form —
-            // division right after a bare `await`/`yield` *identifier* is vanishingly rare.
-            Some(Tok::Ident(w)) => matches!(&**w, "await" | "yield"),
-            Some(Tok::Keyword(k)) => !matches!(*k, "this" | "super" | "true" | "false" | "null"),
-            // Calls/grouping and brackets produce values; a control header ends a statement
-            // prefix. Braces distinguish a block (regex) from an object literal (division).
-            Some(Tok::Punct(p)) => match *p {
-                ")" => self.last_close_control,
-                "]" => false,
-                "}" => self.last_close_block,
-                "!" if self.ts => !self.bang_is_postfix(),
-                _ => true,
-            },
-            Some(Tok::Eof) => false,
+        let prev = self.prev(0);
+        if self.ts && prev == Prev::Punct(Punct::Bang) {
+            return !self.bang_is_postfix();
         }
+        prev.regex_allowed(self.start_div, &self.br)
+    }
+
+    /// The class of the token `k` places before the last one pushed.
+    fn prev(&self, k: usize) -> Prev {
+        self.tok_back(k).map_or(Prev::Start, |t| Prev::of(&t.kind))
     }
 
     /// Certain declarations end at a line break before a JSX expression. In those cases
@@ -252,7 +524,7 @@ impl Lexer<'_> {
     fn jsx_after_asi_declaration(&self) -> bool {
         let lexical_declaration = matches!(
             self.tok_back(1).map(|token| &token.kind),
-            Some(Tok::Keyword("const" | "var"))
+            Some(Tok::Keyword(Keyword::Const | Keyword::Var))
         ) || matches!(
             self.tok_back(1).map(|token| &token.kind),
             Some(Tok::Ident(word)) if word == "let"
@@ -269,7 +541,7 @@ impl Lexer<'_> {
                     .any(|index| {
                         self.out
                             .get(index)
-                            .is_some_and(|token| matches!(&token.kind, Tok::Keyword("import")))
+                            .is_some_and(|token| matches!(&token.kind, Tok::Keyword(Keyword::Import)))
                     });
         let bare_binding = matches!(
             self.tok_back(0).map(|token| &token.kind),
@@ -284,155 +556,348 @@ impl Lexer<'_> {
         let (Some(last), Some(before)) = (self.tok_back(0), self.tok_back(1)) else {
             return false;
         };
-        if last.nl_before {
+        if last.nl_before() {
             return false;
         }
         match &before.kind {
             Tok::Ident(_) | Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) => true,
-            Tok::Keyword(k) => matches!(*k, "this" | "super" | "null" | "true" | "false"),
-            Tok::Punct(p) => matches!(*p, ")" | "]" | "!"),
-            _ => false,
-        }
-    }
-
-    /// Classify an opening `{` (about to be pushed): does the matching `}` end at statement position
-    /// (a block, control body, or function *declaration* body → a following `/` is a regex) or at
-    /// value position (an object literal or function *expression* body → division)?
-    fn brace_ends_statement(&mut self) -> bool {
-        let prev_is_paren = matches!(self.tok_back(0).map(|t| &t.kind), Some(Tok::Punct(")")));
-        if prev_is_paren {
-            // A body after `)` — either a function body (classified by `pending_fn`) or a control
-            // block / method (statement position).
-            return match self.pending_fn.pop() {
-                Some(is_expr) => !is_expr,
-                None => true,
-            };
-        }
-        match self.tok_back(0).map(|t| &t.kind) {
-            None => true,
-            Some(Tok::Punct(p)) => matches!(*p, ";" | "{" | "}" | "=>"),
-            Some(Tok::Keyword(k)) => matches!(*k, "else" | "do" | "try" | "finally"),
-            _ => false,
-        }
-    }
-
-    /// Whether a `class` keyword (about to be pushed) sits in statement position (a declaration —
-    /// so its body's closing `}` ends a statement and a following `/` starts a regex).
-    fn class_is_declaration(&self) -> bool {
-        match self.tok_back(0).map(|t| &t.kind) {
-            None => true,
-            Some(Tok::Punct(p)) => match *p {
-                ";" | "{" => true,
-                "}" => self.last_close_block,
-                _ => false,
-            },
-            Some(Tok::Keyword(k)) => {
-                matches!(*k, "else" | "do" | "try" | "finally" | "export" | "default")
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether a `function` keyword (about to be pushed) sits in statement position (a declaration)
-    /// rather than expression position.
-    fn function_is_declaration(&self) -> bool {
-        match self.tok_back(0).map(|t| &t.kind) {
-            None => true,
-            Some(Tok::Punct(p)) => match *p {
-                ";" | "{" => true,
-                "}" => self.last_close_block,
-                _ => false,
-            },
-            Some(Tok::Keyword(k)) => {
-                matches!(*k, "else" | "do" | "try" | "finally" | "export" | "default")
-            }
+            Tok::Keyword(k) => matches!(k.as_str(), "this" | "super" | "null" | "true" | "false"),
+            Tok::Punct(p) => matches!(p.as_str(), ")" | "]" | "!"),
             _ => false,
         }
     }
 
     fn push(&mut self, kind: Tok) {
+        let mut skim_here = false;
         match &kind {
-            Tok::Punct("(") => {
-                let last = self.tok_back(0).map(|t| &t.kind);
-                let before = self.tok_back(1).map(|t| &t.kind);
-                let control = matches!(
-                    last,
-                    Some(Tok::Keyword(
-                        "if" | "for" | "while" | "with" | "switch" | "catch"
-                    ))
-                ) && !matches!(before, Some(Tok::Punct("." | "?.")))
-                    || matches!(last, Some(Tok::Ident(word)) if &**word == "await")
-                        && matches!(before, Some(Tok::Keyword("for")));
-                self.paren_stack.push(control);
+            Tok::Punct(Punct::LParen) => {
+                let (prev, before) = (self.prev(0), self.prev(1));
+                self.br.open_paren(prev, before);
+                if self.skim_min_depth.is_some() {
+                    let head = self.paren_opens_function_params();
+                    self.fn_paren_stack.push(head);
+                }
             }
-            Tok::Punct(")") => {
-                self.last_close_control = self.paren_stack.pop().unwrap_or(false);
+            Tok::Punct(Punct::RParen) => {
+                self.br.close_paren();
+                if self.skim_min_depth.is_some() {
+                    self.last_close_fn_head = self.fn_paren_stack.pop().unwrap_or(false);
+                }
             }
-            Tok::Keyword(k) if *k == "function" => {
-                let is_expr = !self.function_is_declaration();
-                self.pending_fn.push(is_expr);
+            Tok::Keyword(Keyword::Function) => {
+                let prev = self.prev(0);
+                self.br.function_keyword(prev);
             }
-            Tok::Keyword(k) if *k == "class" => {
-                self.pending_class = Some(self.class_is_declaration());
+            Tok::Keyword(Keyword::Class) => {
+                let prev = self.prev(0);
+                self.br.class_keyword(prev);
             }
-            Tok::Punct(p) if *p == "{" => {
-                // A pending `class` head claims this `{` as its body: the closing `}` sits at
-                // statement position exactly when the class is a declaration.
-                let ends_stmt = match self.pending_class.take() {
-                    Some(is_decl) => is_decl,
-                    None => self.brace_ends_statement(),
-                };
-                self.brace_stack.push(ends_stmt);
+            Tok::Punct(Punct::LBrace) => {
+                let prev = self.prev(0);
+                let brace_depth = self.br.braces.len();
+                let class_body = self.br.open_brace(prev);
+                if let Some(min) = self.skim_min_depth {
+                    let fn_body = !class_body
+                        && self.last_close_fn_head
+                        && prev == Prev::Punct(Punct::RParen);
+                    self.fn_brace_stack.push(fn_body);
+                    if fn_body {
+                        if self.skim_open.is_none() && self.fn_depth >= min {
+                            self.skim_open = Some(SkimMark {
+                                brace_depth,
+                                out_len: self.out.len() + 1,
+                                line: self.line,
+                                start: self.tok_start as u32 + self.offset,
+                            });
+                            skim_here = true;
+                        }
+                        self.fn_depth += 1;
+                    }
+                }
             }
-            Tok::Punct(p) if *p == "}" => {
-                self.last_close_block = self.brace_stack.pop().unwrap_or(false);
+            Tok::Punct(Punct::RBrace) => {
+                self.br.close_brace();
+                if self.skim_min_depth.is_some() && self.fn_brace_stack.pop().unwrap_or(false) {
+                    self.fn_depth = self.fn_depth.saturating_sub(1);
+                    if let Some(mark) = self.skim_open.filter(|m| m.brace_depth == self.br.braces.len()) {
+                        self.skim_open = None;
+                        self.out.truncate(mark.out_len);
+                        self.out.push(Token::new(
+                            Tok::Skim,
+                            mark.line,
+                            mark.start,
+                            self.pos as u32 + self.offset,
+                            false,
+                        ));
+                    }
+                }
             }
             _ => {}
         }
         let nl = self.nl_pending;
         self.nl_pending = false;
-        self.out.push(Token {
+        self.out.push(Token::new(
             kind,
-            line: self.line,
-            start: self.tok_start as u32 + self.offset,
-            end: self.pos as u32 + self.offset,
-            nl_before: nl,
-            legacy_octal: false,
-            escaped: false,
-            lone_surrogate: false,
-        });
+            self.line,
+            self.tok_start as u32 + self.offset,
+            self.pos as u32 + self.offset,
+            nl,
+        ));
+        #[cfg(test)]
+        PEAK_TOKENS.with(|p| p.set(p.get().max(self.out.len())));
+        if skim_here {
+            self.skip_body();
+        } else if let Some(mark) = self.skim_open {
+            let len = self.out.len();
+            if len - mark.out_len >= SKIM_WINDOW + SKIM_TAIL {
+                self.out.splice(mark.out_len..len - SKIM_TAIL, None);
+            }
+        }
+    }
+
+    /// With the cursor just past the `{` of a body being skimmed, jump to its closing `}` (left
+    /// for the ordinary lexer to produce the [`Tok::Skim`]) without building tokens. Anything the
+    /// byte scan is not sure about (a construct that looks malformed, non-ASCII code, HTML-like
+    /// comments, running out of input) leaves the cursor and bracket state as they were, so the
+    /// body is lexed token by token and any lex error comes out as it always did.
+    fn skip_body(&mut self) {
+        let start = self.pos;
+        let mark = self.br.mark();
+        let docs = self.docs.as_ref().map(Vec::len);
+        let mut nl = false;
+        if self.skip_to_close(Prev::Punct(Punct::LBrace), &mut nl).is_none() {
+            self.br.rewind(&mark);
+            if let (Some(found), Some(len)) = (self.docs.as_mut(), docs) {
+                found.truncate(len);
+            }
+            self.pos = start;
+            return;
+        }
+        self.line += self.bytes[start..self.pos].iter().filter(|&&b| b == b'\n').count() as u32;
+        self.nl_pending = nl;
+        #[cfg(test)]
+        SKIPPED_BODIES.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Advance to the `}` that closes the brace level the lexer is at (not consuming it),
+    /// tracking just enough of the token stream to tell a regex from a division. `nl` ends up
+    /// whether a line terminator separates the last token from that `}`. Line numbers are left
+    /// to the caller.
+    fn skip_to_close(&mut self, start: Prev, nl: &mut bool) -> Option<()> {
+        let (bytes, src) = (self.bytes, self.src);
+        let (base_braces, base_parens, base_fns) =
+            (self.br.braces.len(), self.br.parens.len(), self.br.pending_fn.len());
+        let (mut prev, mut before) = (start, Prev::Start);
+        let mut pos = self.pos;
+        macro_rules! token {
+            ($class:expr) => {{
+                before = prev;
+                prev = $class;
+                *nl = false;
+            }};
+        }
+        loop {
+            let b = *bytes.get(pos)?;
+            match b {
+                b' ' | b'\t' | 0x0B | 0x0C => pos += 1,
+                b'\n' | b'\r' => {
+                    *nl = true;
+                    pos += 1;
+                }
+                b'"' | b'\'' => {
+                    pos = string_end(bytes, pos)?;
+                    token!(Prev::Operand);
+                }
+                b'`' => {
+                    self.pos = pos + 1;
+                    self.skip_template()?;
+                    pos = self.pos;
+                    token!(Prev::Operand);
+                }
+                b'0'..=b'9' => {
+                    pos = number_end(bytes, pos);
+                    token!(Prev::Operand);
+                }
+                b'.' if bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) => {
+                    pos = number_end(bytes, pos + 1);
+                    token!(Prev::Operand);
+                }
+                b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
+                    let from = if b == b'#' { pos + 1 } else { pos };
+                    if !bytes.get(from).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'$')) {
+                        return None;
+                    }
+                    let end = ident_end(bytes, from);
+                    if bytes.get(end).is_some_and(|&c| c == b'\\' || c >= 0x80) {
+                        return None;
+                    }
+                    let word = &src[pos..end];
+                    pos = end;
+                    let class = match keyword(word).filter(|_| b != b'#') {
+                        Some(kw) => {
+                            match kw {
+                                Keyword::Function => self.br.function_keyword(prev),
+                                Keyword::Class => self.br.class_keyword(prev),
+                                _ => {}
+                            }
+                            Prev::Kw(kw)
+                        }
+                        None => Prev::of_ident(word),
+                    };
+                    token!(class);
+                }
+                b'/' if bytes.get(pos + 1) == Some(&b'/') => pos = line_comment_end(bytes, pos),
+                b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                    let (end, has_nl) = block_comment_end(bytes, pos)?;
+                    if let Some(docs) = &mut self.docs {
+                        if bytes.get(pos + 2) == Some(&b'*') && end - pos > 4 {
+                            docs.push((pos as u32, end as u32));
+                        }
+                    }
+                    *nl |= has_nl;
+                    pos = end;
+                }
+                b'/' if prev.regex_allowed(false, &self.br) => {
+                    pos = regex_end(bytes, pos)?;
+                    token!(Prev::Operand);
+                }
+                b'<' if self.html_comments && bytes[pos..].starts_with(b"<!--") => return None,
+                b'-' if self.html_comments
+                    && bytes[pos..].starts_with(b"-->")
+                    && (*nl || prev == Prev::Start) =>
+                {
+                    return None
+                }
+                0xE2 if is_ls_ps(bytes, pos) => {
+                    *nl = true;
+                    pos += 3;
+                }
+                b if b < 0x80 => {
+                    let p = scan_punct(&bytes[pos..])?;
+                    match p {
+                        Punct::LParen => self.br.open_paren(prev, before),
+                        Punct::RParen => {
+                            if self.br.parens.len() <= base_parens {
+                                return None;
+                            }
+                            self.br.close_paren();
+                        }
+                        Punct::LBrace => {
+                            let pops_outer_fn = prev == Prev::Punct(Punct::RParen)
+                                && self.br.pending_class.is_none()
+                                && base_fns > 0
+                                && self.br.pending_fn.len() <= base_fns;
+                            if pops_outer_fn {
+                                return None;
+                            }
+                            self.br.open_brace(prev);
+                        }
+                        Punct::RBrace => {
+                            if self.br.braces.len() == base_braces {
+                                self.pos = pos;
+                                return (self.br.parens.len() == base_parens).then_some(());
+                            }
+                            self.br.close_brace();
+                        }
+                        _ => {}
+                    }
+                    pos += p.as_str().len();
+                    token!(Prev::Punct(p));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Skip a template literal's body, the cursor just past its opening backtick. Each `${ }`
+    /// hole is a lexing context of its own, as in [`Lexer::read_template_sub`].
+    fn skip_template(&mut self) -> Option<()> {
+        loop {
+            let at = self
+                .bytes
+                .get(self.pos..)?
+                .iter()
+                .position(|&b| matches!(b, b'\\' | b'`' | b'$'))?
+                + self.pos;
+            match self.bytes[at] {
+                b'\\' => self.pos = at + 2,
+                b'`' => {
+                    self.pos = at + 1;
+                    return Some(());
+                }
+                _ if self.bytes.get(at + 1) == Some(&b'{') => {
+                    if crate::stack::exhausted() {
+                        return None;
+                    }
+                    self.pos = at + 2;
+                    let outer = std::mem::take(&mut self.br);
+                    let closed = self.skip_to_close(Prev::Start, &mut false);
+                    self.br = outer;
+                    closed?;
+                    self.pos += 1;
+                }
+                _ => self.pos = at + 1,
+            }
+        }
+    }
+
+    /// Whether the `(` about to be pushed opens the parameter list of a `function` (`function (`,
+    /// `function name(`, `function* name(`), not a property named `function`.
+    fn paren_opens_function_params(&self) -> bool {
+        let is_function = |back: usize| {
+            matches!(self.tok_back(back).map(|t| &t.kind), Some(Tok::Keyword(Keyword::Function)))
+                && !matches!(
+                    self.tok_back(back + 1).map(|t| &t.kind),
+                    Some(Tok::Punct(Punct::Dot | Punct::OptChain))
+                )
+        };
+        let is_star = |back: usize| {
+            matches!(self.tok_back(back).map(|t| &t.kind), Some(Tok::Punct(Punct::Star)))
+        };
+        let is_ident = matches!(self.tok_back(0).map(|t| &t.kind), Some(Tok::Ident(_)));
+        is_function(0)
+            || (is_star(0) && is_function(1))
+            || (is_ident && (is_function(1) || (is_star(1) && is_function(2))))
     }
     /// Flag the most recently pushed token as having contained a `\u` escape.
     fn mark_escaped(&mut self) {
         if let Some(t) = self.out.last_mut() {
-            t.escaped = true;
+            t.set_escaped(true);
         }
     }
     /// Flag the most recently pushed token as containing a lone surrogate.
     fn mark_lone_surrogate(&mut self) {
         if let Some(t) = self.out.last_mut() {
-            t.lone_surrogate = true;
+            t.set_lone_surrogate(true);
         }
     }
     /// Flag the most recently pushed token as a legacy-octal construct.
     fn mark_legacy_octal(&mut self) {
         if let Some(t) = self.out.last_mut() {
-            t.legacy_octal = true;
+            t.set_legacy_octal(true);
         }
     }
 
-    fn run(&mut self) -> Result<(), LexError> {
-        // Hashbang comment: `#!...` only at the very start of the source.
-        if self.peek() == Some('#') && self.peek2() == Some('!') {
-            while let Some(c) = self.peek() {
-                if is_line_terminator(c) {
-                    break;
-                }
-                self.bump();
+    fn run(&mut self, pieces: &[&'a str]) -> Result<(), LexError> {
+        for (k, piece) in pieces.iter().enumerate() {
+            if k > 0 {
+                self.offset += self.src.len() as u32;
+                self.src = piece;
+                self.bytes = piece.as_bytes();
+                self.pos = 0;
             }
-        }
-        while let Some(c) = self.peek() {
-            self.step(c)?;
+            // Hashbang comment: `#!...` only at the very start of the source.
+            if k == 0 && self.peek() == Some('#') && self.peek2() == Some('!') {
+                while let Some(c) = self.peek() {
+                    if is_line_terminator(c) {
+                        break;
+                    }
+                    self.bump();
+                }
+            }
+            while let Some(c) = self.peek() {
+                self.step(c)?;
+            }
         }
         self.tok_start = self.pos;
         self.push(Tok::Eof);
@@ -495,10 +960,10 @@ impl Lexer<'_> {
             let element = self.read_jsx_element()?;
             self.tok_start = start;
             self.nl_pending = nl;
-            self.push(Tok::Jsx(Rc::new(element)));
+            self.push(Tok::Jsx(Packed::new(Rc::new(element))));
             if let Some(token) = self.out.last_mut() {
                 if let Tok::Jsx(element) = &token.kind {
-                    token.line = element.line;
+                    token.set_line(element.line);
                 }
             }
         } else if c == '/' && self.regex_allowed() {
@@ -661,7 +1126,7 @@ impl Lexer<'_> {
         if let Some(n) = self.idents.get(name) {
             return n.clone();
         }
-        let n = Name(Rc::from(name));
+        let n = Name::new(name);
         self.idents.insert(n.clone());
         n
     }
@@ -699,10 +1164,28 @@ impl Lexer<'_> {
 
     fn read_string(&mut self, quote: char) -> Result<(), LexError> {
         self.bump();
-        let mut s = String::new();
-        let mut had_escape = false;
         self.pending_legacy = false;
         self.pending_lone_surrogate = false;
+        let from = self.pos;
+        let end = self.bytes[from..]
+            .iter()
+            .position(|&b| matches!(b, b'\\' | b'\n' | b'\r') || b == quote as u8)
+            .map(|n| from + n);
+        // No escape or line break before the closing quote: the literal is a plain source slice.
+        // The quote is ASCII, so `from` and `end` lie on char boundaries.
+        if let Some(end) = end.filter(|&e| self.bytes[e] == quote as u8) {
+            let text = &self.src[from..end];
+            let value = if text.len() <= 24 {
+                self.intern(text)
+            } else {
+                Name::new(text)
+            };
+            self.pos = end + 1;
+            self.push(Tok::Str(value));
+            return Ok(());
+        }
+        let mut s = String::new();
+        let mut had_escape = false;
         loop {
             match self.bump() {
                 None => return Err(self.err("unterminated string literal")),
@@ -719,7 +1202,7 @@ impl Lexer<'_> {
                 Some(c) => s.push(c),
             }
         }
-        self.push(Tok::Str(Rc::from(s)));
+        self.push(Tok::Str(Name::new(&s)));
         // A directive prologue string that used escapes never matches "use strict".
         if had_escape {
             self.mark_escaped();
@@ -740,7 +1223,7 @@ impl Lexer<'_> {
         let parts = self.read_template_parts()?;
         self.tok_start = start;
         self.nl_pending = nl;
-        self.push(Tok::Template(Box::new(parts)));
+        self.push(Tok::Template(Packed::new(Box::new(parts))));
         Ok(())
     }
 
@@ -826,18 +1309,19 @@ impl Lexer<'_> {
         }
         let saved = (
             std::mem::replace(&mut self.out, TokVec::with_capacity(16)),
-            std::mem::take(&mut self.brace_stack),
-            std::mem::take(&mut self.paren_stack),
-            std::mem::take(&mut self.pending_fn),
-            self.pending_class.take(),
-            self.last_close_block,
-            self.last_close_control,
+            std::mem::take(&mut self.br),
             std::mem::take(&mut self.start_div),
+            std::mem::take(&mut self.fn_paren_stack),
+            std::mem::take(&mut self.fn_brace_stack),
+            std::mem::take(&mut self.fn_depth),
+            self.skim_min_depth.take(),
+            self.skim_open.take(),
+            self.last_close_fn_head,
         );
         let r = loop {
             match self.peek() {
                 None => break Err(self.err("unterminated template substitution")),
-                Some('}') if self.brace_stack.is_empty() => {
+                Some('}') if self.br.braces.is_empty() => {
                     self.tok_start = self.pos;
                     self.push(Tok::Eof);
                     self.bump();
@@ -851,13 +1335,14 @@ impl Lexer<'_> {
             }
         };
         let toks = std::mem::replace(&mut self.out, saved.0);
-        self.brace_stack = saved.1;
-        self.paren_stack = saved.2;
-        self.pending_fn = saved.3;
-        self.pending_class = saved.4;
-        self.last_close_block = saved.5;
-        self.last_close_control = saved.6;
-        self.start_div = saved.7;
+        self.br = saved.1;
+        self.start_div = saved.2;
+        self.fn_paren_stack = saved.3;
+        self.fn_brace_stack = saved.4;
+        self.fn_depth = saved.5;
+        self.skim_min_depth = saved.6;
+        self.skim_open = saved.7;
+        self.last_close_fn_head = saved.8;
         r.map(|()| TplPart::Sub(SubToks(Rc::new(toks))))
     }
 
@@ -1126,12 +1611,12 @@ impl Lexer<'_> {
                 self.bump();
                 let n = crate::bigint::JsBigInt::parse_radix(&digits, radix)
                     .ok_or_else(|| self.err("invalid BigInt literal"))?;
-                self.push(Tok::BigInt(n));
+                self.push(Tok::BigInt(Packed::new(Box::new(n))));
                 return Ok(());
             }
             let n = u64::from_str_radix(&digits, radix)
                 .map_err(|_| self.err("invalid numeric literal"))?;
-            self.push(Tok::Num(n as f64));
+            self.push(Tok::Num(Num::new(n as f64)));
             return Ok(());
         }
         // Decimal: integer . fraction e exponent
@@ -1151,12 +1636,12 @@ impl Lexer<'_> {
             let text = &self.src[start..self.pos];
             if text.chars().all(|c| ('0'..='7').contains(&c)) {
                 let n = i64::from_str_radix(text, 8).unwrap_or(0);
-                self.push(Tok::Num(n as f64));
+                self.push(Tok::Num(Num::new(n as f64)));
                 self.mark_legacy_octal();
                 return Ok(());
             } else if text.chars().all(|c| c.is_ascii_digit()) {
                 let n: f64 = text.parse().unwrap_or(0.0);
-                self.push(Tok::Num(n));
+                self.push(Tok::Num(Num::new(n)));
                 self.mark_legacy_octal();
                 return Ok(());
             }
@@ -1175,7 +1660,7 @@ impl Lexer<'_> {
             self.bump(); // n
             let n = crate::bigint::JsBigInt::parse_radix(&text, 10)
                 .ok_or_else(|| self.err("invalid BigInt literal"))?;
-            self.push(Tok::BigInt(n));
+            self.push(Tok::BigInt(Packed::new(Box::new(n))));
             return Ok(());
         }
         if self.peek() == Some('.') {
@@ -1194,14 +1679,14 @@ impl Lexer<'_> {
             }
         }
         self.validate_seps(start, self.pos, 10)?;
-        let text: String = self.src[start..self.pos]
-            .chars()
-            .filter(|c| *c != '_')
-            .collect();
-        let n: f64 = text
-            .parse()
-            .map_err(|_| self.err("invalid numeric literal"))?;
-        self.push(Tok::Num(n));
+        let raw = &self.src[start..self.pos];
+        let parsed = if raw.contains('_') {
+            raw.chars().filter(|c| *c != '_').collect::<String>().parse()
+        } else {
+            raw.parse()
+        };
+        let n: f64 = parsed.map_err(|_| self.err("invalid numeric literal"))?;
+        self.push(Tok::Num(Num::new(n)));
         Ok(())
     }
 
@@ -1247,98 +1732,210 @@ impl Lexer<'_> {
                 break;
             }
         }
-        self.push(Tok::Regex(Box::new(RegexTok { body, flags })));
+        self.push(Tok::Regex(Packed::new(Box::new(RegexTok { body, flags }))));
         Ok(())
     }
 
     fn read_punct(&mut self) -> Result<(), LexError> {
-        // `?.` followed by a digit is `?` then `.` (a conditional like `x ? .5 : .3`), not optional
-        // chaining.
-        if self.peek() == Some('?')
-            && self.peek2() == Some('.')
-            && self
-                .bytes
-                .get(self.pos + 2)
-                .is_some_and(|c| c.is_ascii_digit())
-        {
-            self.bump();
-            self.push(Tok::Punct("?"));
-            return Ok(());
-        }
-        // The longest punctuator at `pos` (the same maximal munch as scanning `PUNCTUATORS`,
-        // which lists longer spellings first).
-        let at = |k: usize| self.byte_at(k).unwrap_or('\0');
-        let (c0, c1, c2, c3) = (at(0), at(1), at(2), at(3));
-        let p: &'static str = match (c0, c1, c2, c3) {
-            ('>', '>', '>', '=') => ">>>=",
-            ('.', '.', '.', _) => "...",
-            ('=', '=', '=', _) => "===",
-            ('!', '=', '=', _) => "!==",
-            ('*', '*', '=', _) => "**=",
-            ('<', '<', '=', _) => "<<=",
-            ('>', '>', '=', _) => ">>=",
-            ('>', '>', '>', _) => ">>>",
-            ('&', '&', '=', _) => "&&=",
-            ('|', '|', '=', _) => "||=",
-            ('?', '?', '=', _) => "??=",
-            ('=', '>', _, _) => "=>",
-            ('=', '=', _, _) => "==",
-            ('!', '=', _, _) => "!=",
-            ('<', '=', _, _) => "<=",
-            ('>', '=', _, _) => ">=",
-            ('&', '&', _, _) => "&&",
-            ('|', '|', _, _) => "||",
-            ('?', '?', _, _) => "??",
-            ('?', '.', _, _) => "?.",
-            ('+', '+', _, _) => "++",
-            ('-', '-', _, _) => "--",
-            ('+', '=', _, _) => "+=",
-            ('-', '=', _, _) => "-=",
-            ('*', '=', _, _) => "*=",
-            ('/', '=', _, _) => "/=",
-            ('%', '=', _, _) => "%=",
-            ('&', '=', _, _) => "&=",
-            ('|', '=', _, _) => "|=",
-            ('^', '=', _, _) => "^=",
-            ('*', '*', _, _) => "**",
-            ('<', '<', _, _) => "<<",
-            ('>', '>', _, _) => ">>",
-            ('{', ..) => "{",
-            ('}', ..) => "}",
-            ('(', ..) => "(",
-            (')', ..) => ")",
-            ('[', ..) => "[",
-            (']', ..) => "]",
-            ('.', ..) => ".",
-            (';', ..) => ";",
-            (',', ..) => ",",
-            ('<', ..) => "<",
-            ('>', ..) => ">",
-            ('+', ..) => "+",
-            ('-', ..) => "-",
-            ('*', ..) => "*",
-            ('/', ..) => "/",
-            ('%', ..) => "%",
-            ('&', ..) => "&",
-            ('|', ..) => "|",
-            ('^', ..) => "^",
-            ('!', ..) => "!",
-            ('~', ..) => "~",
-            ('?', ..) => "?",
-            (':', ..) => ":",
-            ('=', ..) => "=",
-            ('@', ..) => "@",
-            _ => {
-                return Err(self.err(format!(
-                    "unexpected character {:?}",
-                    self.peek().unwrap_or('\0')
-                )))
-            }
+        let Some(p) = scan_punct(&self.bytes[self.pos..]) else {
+            return Err(self.err(format!(
+                "unexpected character {:?}",
+                self.peek().unwrap_or('\0')
+            )));
         };
-        self.pos += p.len();
+        self.pos += p.as_str().len();
         self.push(Tok::Punct(p));
         Ok(())
     }
+}
+
+/// The longest punctuator at the start of `b` (maximal munch, the same as scanning `PUNCTUATORS`,
+/// which lists longer spellings first). `?.` followed by a digit is `?` then `.` (a conditional
+/// like `x ? .5 : .3`), not optional chaining.
+fn scan_punct(b: &[u8]) -> Option<Punct> {
+    let c0 = *b.first()?;
+    let at = |k: usize| b.get(k).copied().unwrap_or(0);
+    let (c1, c2) = (at(1), at(2));
+    Some(match c0 {
+        b'{' => Punct::LBrace,
+        b'}' => Punct::RBrace,
+        b'(' => Punct::LParen,
+        b')' => Punct::RParen,
+        b'[' => Punct::LBracket,
+        b']' => Punct::RBracket,
+        b';' => Punct::Semi,
+        b',' => Punct::Comma,
+        b'~' => Punct::Tilde,
+        b':' => Punct::Colon,
+        b'@' => Punct::At,
+        b'.' if c1 == b'.' && c2 == b'.' => Punct::Ellipsis,
+        b'.' => Punct::Dot,
+        b'=' => match (c1, c2) {
+            (b'=', b'=') => Punct::StrictEq,
+            (b'>', _) => Punct::Arrow,
+            (b'=', _) => Punct::EqEq,
+            _ => Punct::Assign,
+        },
+        b'!' => match (c1, c2) {
+            (b'=', b'=') => Punct::StrictNe,
+            (b'=', _) => Punct::NotEq,
+            _ => Punct::Bang,
+        },
+        b'*' => match (c1, c2) {
+            (b'*', b'=') => Punct::PowAssign,
+            (b'*', _) => Punct::Pow,
+            (b'=', _) => Punct::MulAssign,
+            _ => Punct::Star,
+        },
+        b'<' => match (c1, c2) {
+            (b'<', b'=') => Punct::ShlAssign,
+            (b'<', _) => Punct::Shl,
+            (b'=', _) => Punct::LtEq,
+            _ => Punct::Lt,
+        },
+        b'>' => match (c1, c2) {
+            (b'>', b'>') if at(3) == b'=' => Punct::UShrAssign,
+            (b'>', b'>') => Punct::UShr,
+            (b'>', b'=') => Punct::ShrAssign,
+            (b'>', _) => Punct::Shr,
+            (b'=', _) => Punct::GtEq,
+            _ => Punct::Gt,
+        },
+        b'&' => match (c1, c2) {
+            (b'&', b'=') => Punct::AndAssign,
+            (b'&', _) => Punct::AndAnd,
+            (b'=', _) => Punct::BitAndAssign,
+            _ => Punct::Amp,
+        },
+        b'|' => match (c1, c2) {
+            (b'|', b'=') => Punct::OrAssign,
+            (b'|', _) => Punct::OrOr,
+            (b'=', _) => Punct::BitOrAssign,
+            _ => Punct::Pipe,
+        },
+        b'?' => match (c1, c2) {
+            (b'.', d) if d.is_ascii_digit() => Punct::Question,
+            (b'?', b'=') => Punct::NullishAssign,
+            (b'?', _) => Punct::Nullish,
+            (b'.', _) => Punct::OptChain,
+            _ => Punct::Question,
+        },
+        b'+' => match c1 {
+            b'+' => Punct::Inc,
+            b'=' => Punct::AddAssign,
+            _ => Punct::Plus,
+        },
+        b'-' => match c1 {
+            b'-' => Punct::Dec,
+            b'=' => Punct::SubAssign,
+            _ => Punct::Minus,
+        },
+        b'/' => match c1 {
+            b'=' => Punct::DivAssign,
+            _ => Punct::Slash,
+        },
+        b'%' => match c1 {
+            b'=' => Punct::RemAssign,
+            _ => Punct::Percent,
+        },
+        b'^' => match c1 {
+            b'=' => Punct::BitXorAssign,
+            _ => Punct::Caret,
+        },
+        _ => return None,
+    })
+}
+
+/// Whether `bytes[at]` and the two bytes after it are U+2028 or U+2029.
+fn is_ls_ps(bytes: &[u8], at: usize) -> bool {
+    bytes[at] == 0xE2 && bytes.get(at + 1) == Some(&0x80) && matches!(bytes.get(at + 2), Some(0xA8 | 0xA9))
+}
+
+/// The end of the ASCII identifier run starting at `from`.
+fn ident_end(bytes: &[u8], from: usize) -> usize {
+    from + bytes[from..].iter().take_while(|&&c| IDENT_BYTE[c as usize]).count()
+}
+
+/// The end of the number literal starting at `from`: a run of digits, letters (hex digits,
+/// exponent, `n`), `_` and `.`. Not validated; the token-by-token lexer reports a malformed one.
+fn number_end(bytes: &[u8], from: usize) -> usize {
+    from + bytes[from..]
+        .iter()
+        .take_while(|&&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+        .count()
+}
+
+/// Just past the string literal starting at `at`; `None` if it hits a line break or the end.
+fn string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let quote = bytes[at];
+    let mut i = at + 1;
+    loop {
+        let rest = bytes.get(i..)?;
+        i += rest
+            .iter()
+            .position(|&b| matches!(b, b'\\' | b'\n' | b'\r') || b == quote)?;
+        match bytes[i] {
+            b'\\' => i += if bytes[i + 1..].starts_with(b"\r\n") { 3 } else { 2 },
+            b'\n' | b'\r' => return None,
+            _ => return Some(i + 1),
+        }
+    }
+}
+
+/// The line terminator (or end) that ends the `//` comment starting at `at`.
+fn line_comment_end(bytes: &[u8], at: usize) -> usize {
+    let mut i = at;
+    loop {
+        i += bytes[i..]
+            .iter()
+            .position(|&b| matches!(b, b'\n' | b'\r' | 0xE2))
+            .unwrap_or(bytes.len() - i);
+        if i >= bytes.len() || bytes[i] != 0xE2 || is_ls_ps(bytes, i) {
+            return i;
+        }
+        i += 1;
+    }
+}
+
+/// Just past the `/* */` comment starting at `at`, and whether it holds a line terminator.
+fn block_comment_end(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
+    let mut i = at + 2;
+    let mut nl = false;
+    loop {
+        match *bytes.get(i)? {
+            b'*' if bytes.get(i + 1) == Some(&b'/') => return Some((i + 2, nl)),
+            b'\n' | b'\r' => nl = true,
+            0xE2 => nl |= is_ls_ps(bytes, i),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Just past the regex literal (and its flags) starting at `at`; `None` if it hits a line
+/// terminator, the end, or flags the byte scan cannot vouch for.
+fn regex_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    let mut in_class = false;
+    loop {
+        match *bytes.get(i)? {
+            b'\n' | b'\r' => return None,
+            0xE2 if is_ls_ps(bytes, i) => return None,
+            b'\\' => {
+                i += 1;
+                if matches!(*bytes.get(i)?, b'\n' | b'\r') || is_ls_ps(bytes, i) {
+                    return None;
+                }
+            }
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let end = ident_end(bytes, i + 1);
+    (!bytes.get(end).is_some_and(|&c| c == b'\\' || c >= 0x80)).then_some(end)
 }
 
 /// ASCII IdentifierPart bytes (letters, digits, `_`, `$`).
@@ -1402,7 +1999,7 @@ fn prop_has(name: &str, c: char) -> bool {
         .unwrap_or(false)
 }
 /// The reserved word spelled `s` (one of `token::KEYWORDS`).
-fn keyword(s: &str) -> Option<&'static str> {
+fn keyword(s: &str) -> Option<Keyword> {
     // Every reserved word is 2..=10 lowercase letters starting with one of these.
     let first = *s.as_bytes().first()?;
     if !(2..=10).contains(&s.len())
@@ -1414,42 +2011,42 @@ fn keyword(s: &str) -> Option<&'static str> {
         return None;
     }
     Some(match s {
-        "break" => "break",
-        "case" => "case",
-        "catch" => "catch",
-        "class" => "class",
-        "const" => "const",
-        "continue" => "continue",
-        "debugger" => "debugger",
-        "default" => "default",
-        "delete" => "delete",
-        "do" => "do",
-        "else" => "else",
-        "enum" => "enum",
-        "export" => "export",
-        "extends" => "extends",
-        "false" => "false",
-        "finally" => "finally",
-        "for" => "for",
-        "function" => "function",
-        "if" => "if",
-        "import" => "import",
-        "in" => "in",
-        "instanceof" => "instanceof",
-        "new" => "new",
-        "null" => "null",
-        "return" => "return",
-        "super" => "super",
-        "switch" => "switch",
-        "this" => "this",
-        "throw" => "throw",
-        "true" => "true",
-        "try" => "try",
-        "typeof" => "typeof",
-        "var" => "var",
-        "void" => "void",
-        "while" => "while",
-        "with" => "with",
+        "break" => Keyword::Break,
+        "case" => Keyword::Case,
+        "catch" => Keyword::Catch,
+        "class" => Keyword::Class,
+        "const" => Keyword::Const,
+        "continue" => Keyword::Continue,
+        "debugger" => Keyword::Debugger,
+        "default" => Keyword::Default,
+        "delete" => Keyword::Delete,
+        "do" => Keyword::Do,
+        "else" => Keyword::Else,
+        "enum" => Keyword::Enum,
+        "export" => Keyword::Export,
+        "extends" => Keyword::Extends,
+        "false" => Keyword::False,
+        "finally" => Keyword::Finally,
+        "for" => Keyword::For,
+        "function" => Keyword::Function,
+        "if" => Keyword::If,
+        "import" => Keyword::Import,
+        "in" => Keyword::In,
+        "instanceof" => Keyword::Instanceof,
+        "new" => Keyword::New,
+        "null" => Keyword::Null,
+        "return" => Keyword::Return,
+        "super" => Keyword::Super,
+        "switch" => Keyword::Switch,
+        "this" => Keyword::This,
+        "throw" => Keyword::Throw,
+        "true" => Keyword::True,
+        "try" => Keyword::Try,
+        "typeof" => Keyword::Typeof,
+        "var" => Keyword::Var,
+        "void" => Keyword::Void,
+        "while" => Keyword::While,
+        "with" => Keyword::With,
         _ => return None,
     })
 }
@@ -1477,7 +2074,7 @@ mod tests {
     #[test]
     fn keyword_match_covers_the_table() {
         for k in KEYWORDS {
-            assert_eq!(keyword(k), Some(*k));
+            assert_eq!(keyword(k).map(|w| w.as_str()), Some(*k));
         }
         assert_eq!(keyword("let"), None);
         assert_eq!(keyword("functions"), None);
@@ -1489,16 +2086,171 @@ mod tests {
             // A trailing space ends the token; `/` alone would start a regex in this position.
             let src = format!("x {p} ");
             let toks = tokenize(&src).unwrap();
-            assert!(matches!(toks[1].kind, Tok::Punct(q) if q == *p), "{p}");
+            assert!(matches!(toks[1].kind, Tok::Punct(q) if q.as_str() == *p), "{p}");
         }
         let toks = tokenize("a>>>=b?.5:.3").unwrap();
         let puncts: Vec<&str> = toks
             .iter()
             .filter_map(|t| match t.kind {
-                Tok::Punct(p) => Some(p),
+                Tok::Punct(p) => Some(p.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(puncts, [">>>=", "?", ":"]);
+    }
+
+    fn skim_kinds(src: &str, min_depth: u32) -> Vec<String> {
+        let opts = LexOpts {
+            skim_min_depth: Some(min_depth),
+            ..LexOpts::default()
+        };
+        let lexed = tokenize_opts(src, true, 1, opts).unwrap();
+        lexed
+            .tokens
+            .iter_from(0)
+            .map(|t| match &t.kind {
+                Tok::Skim => format!("skim:{}..{}", t.start, t.end),
+                Tok::Punct(p) => p.as_str().to_string(),
+                Tok::Keyword(k) => k.as_str().to_string(),
+                Tok::Ident(n) => n.to_string(),
+                Tok::Eof => "eof".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skim_replaces_function_bodies_only() {
+        let src = "function f(a) { if (a) { g(); } return /x/.test(a); } if (z) { y(); } o = { function() { 1 } };";
+        let kinds = skim_kinds(src, 0);
+        let skims = kinds.iter().filter(|k| k.starts_with("skim:")).count();
+        assert_eq!(skims, 2, "{kinds:?}");
+        assert_eq!(&kinds[..7], ["function", "f", "(", "a", ")", "{", "skim:14..53"], "{kinds:?}");
+        assert!(kinds.windows(3).any(|w| w == ["if", "(", "z"]));
+        assert!(kinds.contains(&"y".to_string()));
+    }
+
+    #[test]
+    fn skim_keeps_the_outermost_body_at_depth_one() {
+        let src = "function outer() { function inner() { return 1; } return inner; }";
+        let kept = skim_kinds(src, 1);
+        assert!(kept.contains(&"inner".to_string()));
+        assert_eq!(kept.iter().filter(|k| k.starts_with("skim:")).count(), 1, "{kept:?}");
+        let all = skim_kinds(src, 0);
+        assert_eq!(all.iter().filter(|k| k.starts_with("skim:")).count(), 1, "{all:?}");
+        assert!(!all.contains(&"inner".to_string()));
+    }
+
+    #[test]
+    fn skim_ignores_property_named_function_and_regex_after_body() {
+        let kinds = skim_kinds("a.function(1); if (b) { c(); }\nfunction f() {}\n/re/.test(d);", 0);
+        assert_eq!(kinds.iter().filter(|k| k.starts_with("skim:")).count(), 1, "{kinds:?}");
+        assert!(kinds.contains(&"c".to_string()));
+    }
+
+    fn describe(t: &Token) -> (String, u32, bool) {
+        let text = match &t.kind {
+            Tok::Punct(p) => p.as_str().to_string(),
+            Tok::Keyword(k) => k.as_str().to_string(),
+            Tok::Ident(n) => n.to_string(),
+            Tok::Eof => "eof".to_string(),
+            other => format!("{other:?}"),
+        };
+        (text, t.line(), t.nl_before())
+    }
+
+    /// The tokens from the first body's closing `}` on, lexed with and without skimming; asserts
+    /// the byte scan (not the token-by-token fallback) skipped `skipped` bodies.
+    fn tails_after_first_body(src: &str, skipped: usize) -> (Vec<(String, u32, bool)>, Vec<(String, u32, bool)>) {
+        SKIPPED_BODIES.with(|n| n.set(0));
+        let opts = LexOpts {
+            skim_min_depth: Some(0),
+            ..LexOpts::default()
+        };
+        let skimmed = tokenize_opts(src, true, 1, opts).unwrap().tokens;
+        assert_eq!(SKIPPED_BODIES.with(|n| n.get()), skipped, "{src:?}");
+        let skim = skimmed.iter_from(0).find(|t| matches!(t.kind, Tok::Skim)).expect("a skim");
+        assert_eq!(skim.line(), 1);
+        let from = skim.end - 1;
+        let tail = |toks: &TokVec| -> Vec<_> {
+            toks.iter_from(0).filter(|t| t.start >= from).map(describe).collect()
+        };
+        let full = tokenize_goal(src, true).unwrap();
+        (tail(&skimmed), tail(&full))
+    }
+
+    fn assert_skips_like_full_lex(body: &str) {
+        let src = format!("function f() {{{body}}}\nafter(1);\n/re/.test(2);\n");
+        let (skimmed, full) = tails_after_first_body(&src, 1);
+        assert_eq!(skimmed, full, "{body:?}");
+        assert!(skimmed.len() > 8, "{skimmed:?}");
+    }
+
+    #[test]
+    fn skipper_handles_regexes_with_braces_and_slashes() {
+        assert_skips_like_full_lex(" var r = /[/}]+\\}\\//g; var s = a / b / c; ");
+        assert_skips_like_full_lex(" var r = /[\\]}]/; ");
+        assert_skips_like_full_lex(" x = a ? /}/ : 1; ");
+    }
+
+    #[test]
+    fn skipper_tells_division_from_regex() {
+        assert_skips_like_full_lex(" var d = (a) / 2 / g; var e = x / y; ");
+        assert_skips_like_full_lex(" if (a) /}/.test(b); while (c) /{/.exec(d); ");
+        assert_skips_like_full_lex(" return /}/.test(a); ");
+        assert_skips_like_full_lex(" var v = function () { return 1 } / 2 / 3; ");
+        assert_skips_like_full_lex(" function g() {} /}/.test(1); ");
+        assert_skips_like_full_lex(" var o = {} / 2; if (z) {} /}/.test(1); ");
+        assert_skips_like_full_lex(" a = b[0] / 2 / c; x = typeof /}/; y = this / 2; ");
+        assert_skips_like_full_lex(" for await (x of y) /}/.test(x); ");
+    }
+
+    #[test]
+    fn skipper_handles_templates_with_nested_braces() {
+        assert_skips_like_full_lex(" var t = `a${ {a: 1}.a + \"}\" }b${`${ '}' }`}`; ");
+        assert_skips_like_full_lex(" var t = `\\${ } \\` ${ /}/.source } `; ");
+        assert_skips_like_full_lex(" var t = `${ function () { return `}` }() }`; ");
+    }
+
+    #[test]
+    fn skipper_handles_comments_and_strings() {
+        assert_skips_like_full_lex(" // }\n/* } { \n */ x(); // {\n");
+        assert_skips_like_full_lex(" var q = \"\\\"}\" + '\\'{' + \"\\\\\"; ");
+        assert_skips_like_full_lex(" var q = \"a\\\nb}\"; ");
+        assert_skips_like_full_lex(" /** doc } */ x(); ");
+    }
+
+    #[test]
+    fn skipper_counts_lines_like_the_lexer() {
+        assert_skips_like_full_lex(" a();\r\nb();\r\n/* x\r\n y */ c(); ");
+        assert_skips_like_full_lex(" a();\u{2028}b();\u{2029}// c\u{2028}d(); \"e\u{2028}f\"; ");
+        assert_skips_like_full_lex(" a();\rb();\r");
+        assert_skips_like_full_lex("\n a();\n\n`x\ny\n${\n1\n}`;\n");
+        assert_skips_like_full_lex(" a();\n");
+        assert_skips_like_full_lex(" a(); // c\n");
+        assert_skips_like_full_lex(" a(); /* c */ ");
+    }
+
+    #[test]
+    fn skipper_falls_back_on_what_it_cannot_vouch_for() {
+        for body in [" var é = 1; ", " x = 1; <!-- c\n y(); ", " \u{a0} a(); "] {
+            let src = format!("function f() {{{body}}}\nafter(1);\n");
+            let (skimmed, full) = tails_after_first_body(&src, 0);
+            assert_eq!(skimmed, full, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn lex_error_in_a_skimmed_body_is_the_same() {
+        for body in [" var s = \"abc;\n x(); ", " x = /abc\n/; ", " x = `abc ", " /* "] {
+            let src = format!("function f() {{{body}}}\n");
+            let opts = LexOpts {
+                skim_min_depth: Some(0),
+                ..LexOpts::default()
+            };
+            let skimmed = tokenize_opts(&src, true, 1, opts).err().expect("error");
+            let full = tokenize_goal(&src, true).err().expect("error");
+            assert_eq!((skimmed.message, skimmed.line, skimmed.at_eof), (full.message, full.line, full.at_eof), "{body:?}");
+        }
     }
 }

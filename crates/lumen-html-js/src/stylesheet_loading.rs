@@ -103,6 +103,9 @@ pub(crate) fn register_document(ctx:&mut Ctx,realm:&Rc<DomRealm>) {
     })));
 
     if realm.stylesheet_links.created_at.get().is_none() {realm.stylesheet_links.created_at.set(Some(lumen_host::perf::web_now_ms()));}
+    // Style blocks parsed before this document had its sinks never saw the
+    // parser-pop hook; the first task turn captures them.
+    realm.stylesheet_links.scan.set(true);
     let Some((factory,documents))=ctx.op_state().get::<StylesheetEnvironment>()
         .map(|environment|(environment.factory.clone(),environment.documents.clone())) else {return};
     if !realm.has_stylesheet_resource_loader() {realm.set_stylesheet_resource_loader(factory(ctx));}
@@ -225,7 +228,8 @@ struct InlineBlock {
 pub(crate) struct PendingParserScript {pub node:NodeId,pub generation:u64,pub document_write:bool,pub insertion_parent:Option<NodeId>}
 #[derive(Default)]
 pub(crate) struct StylesheetLinks {
-    provider: RefCell<Option<Rc<dyn StylesheetResourceLoader>>>,
+    pub(crate) provider: RefCell<Option<Rc<dyn StylesheetResourceLoader>>>,
+    pub(crate) speculative: super::preload_scanner::SpeculativeState,
     entries: RefCell<HashMap<NodeId, Entry>>,
     dirty: RefCell<HashSet<NodeId>>,
     import_dirty:RefCell<HashSet<NodeId>>,
@@ -241,6 +245,7 @@ pub(crate) struct StylesheetLinks {
     inline_bytes:Cell<usize>,
     render_count:Cell<usize>,
     created_at:Cell<Option<f64>>,
+    block_timeout_ms:Cell<Option<f64>>,
     deferred_complete: Cell<bool>,
     deferred_load: Cell<bool>,
     pub(crate) parser_script:Cell<Option<PendingParserScript>>,
@@ -334,6 +339,7 @@ impl StylesheetLinks {
         let mut old=self.provider.borrow_mut();
         if old.as_ref().is_some_and(|current|Rc::ptr_eq(current,&provider)) { return; }
         if let Some(old)=old.as_ref() {
+            self.cancel_speculative(old.as_ref());
             for entry in self.entries.borrow_mut().values_mut() {
                 if let Some(pending)=entry.pending.take() { if let Some(ticket)=pending.ticket {old.cancel(ticket);} }
                 entry.selection=None;
@@ -344,6 +350,7 @@ impl StylesheetLinks {
     }
     pub(crate) fn retire(&self) {
         if let Some(provider)=self.provider.borrow().as_ref() {
+            self.cancel_speculative(provider.as_ref());
             for entry in self.entries.borrow_mut().values_mut() {
                 if let Some(pending)=entry.pending.take() { if let Some(ticket)=pending.ticket {provider.cancel(ticket);} }
             }
@@ -597,23 +604,67 @@ source,policy_blocked,base:self.effective_base_url_from_cache().unwrap_or_else(|
             candidates
         };
         candidates.sort_unstable_by_key(|(generation,_)| *generation);
+        let mut prepared = Vec::new();
+        let mut failure = None;
         for (_,node) in candidates {
-            self.ensure_inline_stylesheet(ctx, node)?;
+            match self.prepare_inline_root(ctx, node) {
+                Ok(InlinePrep::Install(source)) => prepared.push((node, source)),
+                Ok(InlinePrep::Done(_)) => {}
+                Err(error) => {failure = Some(error); break;}
+            }
         }
+        self.install_inline_stylesheets(prepared)?;
+        if let Some(error) = failure {return Err(error);}
         self.stylesheet_links.inline_publication_pending.set(false);
         Ok(())
+    }
+
+    /// Installs the prepared roots with one rule rebuild instead of one per sheet.
+    fn install_inline_stylesheets(self: &Rc<Self>, prepared: Vec<(NodeId, Option<lumen_html::css::StylesheetSource>)>) -> OpResult<()> {
+        let has_source: Vec<(NodeId, bool)> = prepared.iter().map(|(node, source)| (*node, source.is_some())).collect();
+        let batch: Vec<_> = prepared.into_iter().filter_map(|(node, source)| source.map(|source| (node, Some(source)))).collect();
+        let mut results = self.session.borrow_mut().set_stylesheet_sources(batch).into_iter();
+        // One failed sheet must not leave the rest of the batch unfinished.
+        let mut first_error = None;
+        for (node, had_source) in has_source {
+            if had_source {
+                let installed = match results.next() {
+                    Some(Ok(_)) => Ok(()),
+                    Some(Err(error)) => Err(OpError::new("InvalidStateError", format!("inline stylesheet creation: {error:?}"))),
+                    None => Err(OpError::new("InvalidStateError", "inline stylesheet creation")),
+                };
+                if let Err(error) = installed {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            }
+            if let Err(error) = self.finish_inline_stylesheet(node) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// CSSOM reads create the root sheet synchronously; import completion must
     /// update that same sheet, preserving its source epoch and root rule identity.
     pub(crate) fn ensure_inline_stylesheet(self:&Rc<Self>,ctx:&mut Ctx,node:NodeId)->OpResult<bool> {
+        match self.prepare_inline_root(ctx,node)? {
+            InlinePrep::Done(installed)=>Ok(installed),
+            InlinePrep::Install(source)=>{
+                self.install_inline_stylesheets(vec![(node,source)])?;
+                Ok(true)
+            }
+        }
+    }
+    fn prepare_inline_root(self:&Rc<Self>,ctx:&mut Ctx,node:NodeId)->OpResult<InlinePrep> {
+        if self.session.borrow().document().kind(node).is_err() {return Ok(InlinePrep::Done(false))}
         let missing=self.stylesheet_links.entries.borrow().get(&node).is_none_or(|entry|entry.inline.is_none() && !entry.parser_open);
         if missing {
             let session=self.session.borrow();self.capture_inline_stylesheet(session.document(),node,false).map_err(dom_error)?;
         }
-        let pending={let mut entries=self.stylesheet_links.entries.borrow_mut();let Some(entry)=entries.get_mut(&node) else{return Ok(false)};
-            let Some(inline)=entry.inline.as_mut() else{return Ok(false)};
-            if inline.installed {return Ok(inline.source.is_some())}
+        let pending={let mut entries=self.stylesheet_links.entries.borrow_mut();let Some(entry)=entries.get_mut(&node) else{return Ok(InlinePrep::Done(false))};
+            let Some(inline)=entry.inline.as_mut() else{return Ok(InlinePrep::Done(false))};
+            if inline.installed {return Ok(InlinePrep::Done(inline.source.is_some()))}
             (inline.source.clone(),inline.base.clone(),core::mem::take(&mut inline.violations),inline.policy_blocked)};
         for violation in pending.2 {self.queue_csp_violation(ctx,violation,Some(node))?;}
         let mut session=self.session.borrow_mut();
@@ -629,13 +680,15 @@ source,policy_blocked,base:self.effective_base_url_from_cache().unwrap_or_else(|
             drop(session);
             if pending.3 {self.queue_inline_style_failure(ctx,node)?;}
             if let Some(inline)=self.stylesheet_links.entries.borrow_mut().get_mut(&node).and_then(|entry|entry.inline.as_mut()) {inline.installed=true;}
-            return Ok(false)
+            return Ok(InlinePrep::Done(false))
         };
-        if !installed_graph {
-            let imports=lumen_html::css::imports(&text).map_err(|error|OpError::new("SyntaxError",format!("inline CSS parse: {error:?}")))?;
-            let source=lumen_html::css::StylesheetSource{disabled:false, url:Arc::from(pending.1),text,imports:imports.into_iter().map(|rule|lumen_html::css::LoadedImport{rule,source:None}).collect()};
-            session.set_stylesheet_source(node,Some(source)).map_err(|error|OpError::new("InvalidStateError",format!("inline stylesheet creation: {error:?}")))?;
-        }
+        if installed_graph {return Ok(InlinePrep::Install(None))}
+        let imports=lumen_html::css::imports(&text).map_err(|error|OpError::new("SyntaxError",format!("inline CSS parse: {error:?}")))?;
+        let source=lumen_html::css::StylesheetSource{disabled:false, url:Arc::from(pending.1),text,imports:imports.into_iter().map(|rule|lumen_html::css::LoadedImport{rule,source:None}).collect()};
+        Ok(InlinePrep::Install(Some(source)))
+    }
+    fn finish_inline_stylesheet(self:&Rc<Self>,node:NodeId)->OpResult<()> {
+        let mut session=self.session.borrow_mut();
         session.set_stylesheet_disabled(node,false).map_err(|error|OpError::new("InvalidStateError",format!("inline stylesheet enable: {error:?}")))?;
         let token=session.stylesheet_change_token(node).map_err(|error|OpError::new("QuotaExceededError",format!("inline stylesheet identity: {error:?}")))?;
         let flag_lease=session.stylesheet_root_lease(node).map_err(|error|OpError::new("QuotaExceededError",format!("stylesheet flag identity: {error:?}")))?;
@@ -643,7 +696,7 @@ source,policy_blocked,base:self.effective_base_url_from_cache().unwrap_or_else(|
         if let Some(entry)=self.stylesheet_links.entries.borrow_mut().get_mut(&node) {entry.change_token=Some(token);entry.flag_lease=Some(flag_lease);}
         self.add_inline_stylesheet_set(node)?;
         if let Some(inline)=self.stylesheet_links.entries.borrow_mut().get_mut(&node).and_then(|entry|entry.inline.as_mut()) {inline.installed=true;}
-        Ok(true)
+        Ok(())
     }
     fn queue_inline_style_failure(self:&Rc<Self>,ctx:&mut Ctx,node:NodeId)->OpResult<()> {
         // Match browser style-block processing failure notifications. This is
@@ -678,6 +731,13 @@ source,policy_blocked,base:self.effective_base_url_from_cache().unwrap_or_else(|
     }
 }
 
+/// Outcome of preparing an inline style block: finished already, or ready for
+/// its source to be installed (None when the host attached the graph).
+enum InlinePrep {
+    Done(bool),
+    Install(Option<lumen_html::css::StylesheetSource>),
+}
+
 fn admit_candidate(candidates:&mut HashSet<NodeId>,node:NodeId)->OpResult<()> {
     if !candidates.contains(&node) {
         if candidates.len()>=LINK_REQUEST_LIMIT {return Err(OpError::new("QuotaExceededError","stylesheet candidate limit"))}
@@ -700,8 +760,17 @@ impl DomRealm {
     pub fn rendering_blocked(&self)->bool {
         self.rendering_blocked_at(lumen_host::perf::web_now_ms())
     }
+    /// Shortens the render-blocking deadline (default ten seconds) for hosts
+    /// that would rather paint a partly styled page than wait.
+    pub fn set_rendering_block_timeout_ms(&self,timeout:f64) {
+        self.stylesheet_links.block_timeout_ms.set(Some(timeout));
+    }
+    /// Whether the document has not reached `readyState` "complete".
+    pub fn document_loading(&self)->bool {
+        self.ready_state.get()!=DocumentReadyState::Complete
+    }
     pub(crate) fn rendering_blocked_at(&self,now:f64)->bool {
-        self.stylesheet_links.created_at.get().is_some_and(|created|now-created<10_000.)
+        self.stylesheet_links.created_at.get().is_some_and(|created|now-created<self.stylesheet_links.block_timeout_ms.get().unwrap_or(10_000.))
             && (self.allows_render_blocking() || self.rendering_stylesheet_pending())
     }
 
@@ -786,6 +855,9 @@ impl DomRealm {
             (!self.import_completion_waits(*node)).then(||entry.ready.take().map(|ready|(*node,entry.generation,*ready))).flatten()).collect::<Vec<_>>()};
         for (node,generation,(lease,result)) in ready {self.queue_stylesheet_completion(ctx,node,generation,lease,result)?;count+=1;}
         self.finish_stylesheet_load(ctx)?;
+        if !self.has_live_document_parser() && self.stylesheet_links.dirty.borrow().is_empty() {
+            if let Some(provider)=provider.as_ref() {self.stylesheet_links.cancel_speculative(provider.as_ref());}
+        }
         Ok(count)
     }
 
@@ -1201,7 +1273,10 @@ impl DomRealm {
                     origin_metadata:Arc::from([]),violations:Vec::new(),timings:Vec::new()}));
         }
         let provider=provider.ok_or_else(||OpError::new("InvalidStateError","stylesheet resource loader unavailable"))?;
-        let ticket=provider.start(request).map_err(|message|OpError::new("QuotaExceededError",message))?;
+        let ticket=match self.stylesheet_links.take_speculative(&request) {
+            Some(ticket)=>ticket,
+            None=>provider.start(request).map_err(|message|OpError::new("QuotaExceededError",message))?,
+        };
 
         if let Some(entry)=self.stylesheet_links.entries.borrow_mut().get_mut(&node) {
             self.stylesheet_links.load_count.set(count);
@@ -1593,6 +1668,85 @@ mod tests {
         assert!(!realm.rendering_blocked());
         assert!(scheduling::run_animation_frame(&mut engine).is_empty());
         check(&mut engine,"if(!frame||!ran||!document.getElementById('tail'))throw Error('parser/rendering did not resume');true");
+    }
+    #[test]
+    fn render_blocked_while_head_stylesheet_pending_then_released() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),
+            "<!doctype html><link rel=stylesheet href=/a.css><script></script><p>x</p>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::BlockedOnStylesheets));
+        assert!(realm.rendering_blocked());
+        provider.complete(1,"p{color:green}");realm.queue_stylesheet_tasks(engine.ctx()).unwrap();
+        assert!(scheduling::run_tasks(&mut engine,64).is_empty());
+        let DocumentParserStep::Script(script)=realm.next_document_parser_step(engine.ctx()).unwrap() else {panic!("pending script was lost")};
+        realm.execute_document_parser_script(engine.ctx(),script.node).unwrap();
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::Complete));
+        assert!(!realm.rendering_blocked());
+    }
+    fn requested_urls(provider:&ManualProvider)->Vec<String> {provider.requests.borrow().iter().map(|request|request.url.clone()).collect()}
+    #[test]
+    fn preload_scan_starts_later_stylesheet_before_blocked_parser_reaches_it_and_adopts_it() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),
+            "<!doctype html><link rel=stylesheet href=/a.css><script>/*inline*/</script><link rel=stylesheet href=/b.css><p>x</p>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::BlockedOnStylesheets));
+        assert_eq!(requested_urls(&provider),["https://styles.test/a.css","https://styles.test/b.css"],"b.css requested while a.css still pending");
+        assert!(realm.script_blocking_stylesheets_pending());
+        provider.complete(1,"p{color:red}");turn(&mut engine,&realm);
+        let DocumentParserStep::Script(script)=realm.next_document_parser_step(engine.ctx()).unwrap() else {panic!("pending script was lost")};
+        realm.execute_document_parser_script(engine.ctx(),script.node).unwrap();
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::Complete));
+        turn(&mut engine,&realm);
+        assert_eq!(provider.requests.borrow().len(),2,"parser reaching b.css adopts the speculative request");
+        assert!(provider.cancelled.borrow().is_empty());
+        assert!(realm.stylesheet_links.speculative.stylesheets.borrow().is_empty());
+        assert!(realm.stylesheet_resources_pending());
+        provider.complete(2,"p{color:blue}");turn(&mut engine,&realm);
+        assert!(!realm.stylesheet_resources_pending());
+    }
+    #[test]
+    fn preload_scan_skips_inert_content_and_non_matching_media_and_honours_base() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),
+            "<!doctype html><base href=/base/><link rel=stylesheet href=a.css><template><link rel=stylesheet href=/t.css></template>\
+             <link rel=stylesheet media=print href=/print.css><noscript><link rel=stylesheet href=/n.css></noscript>\
+             <link rel=stylesheet href='data:text/css,p{}'><link rel=preload as=style href=/pre.css>\
+             <script async src=/app.js></script><script type=module src=/m.js></script><img src=/i.png>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::Script(_)|DocumentParserStep::Complete|DocumentParserStep::BlockedOnStylesheets));
+        assert_eq!(requested_urls(&provider),["https://styles.test/base/a.css","https://styles.test/pre.css"]);
+        let hints=realm.take_preload_hints();
+        assert_eq!(hints.iter().map(|hint|(hint.url.as_str(),hint.kind)).collect::<Vec<_>>(),[
+            ("https://styles.test/app.js",crate::PreloadKind::ClassicScript),("https://styles.test/m.js",crate::PreloadKind::ModuleScript),
+            ("https://styles.test/i.png",crate::PreloadKind::Image)]);
+    }
+    #[test]
+    fn preload_scan_unused_speculative_requests_are_cancelled_when_document_retires() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),"<!doctype html><link rel=stylesheet href=/x.css>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::Complete));
+        assert_eq!(provider.requests.borrow().len(),1);
+        realm.stylesheet_links.retire();
+        assert_eq!(*provider.cancelled.borrow(),[1]);
+        assert!(realm.stylesheet_links.speculative.stylesheets.borrow().is_empty());
+    }
+    #[test]
+    fn render_blocked_released_after_configured_deadline() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),
+            "<!doctype html><link rel=stylesheet href=/a.css><script></script><p>x</p>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        assert!(matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::BlockedOnStylesheets));
+        realm.set_rendering_block_timeout_ms(1_500.);
+        let now=lumen_host::perf::web_now_ms();
+        assert!(realm.rendering_blocked_at(now));
+        assert!(!realm.rendering_blocked_at(now+1_600.));
+    }
+    #[test]
+    fn render_not_blocked_by_non_matching_media_stylesheet() {
+        let mut engine=Engine::new();let realm=crate::install_live_html(engine.ctx(),
+            "<!doctype html><link rel=stylesheet media=print href=/print.css><p>x</p>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        while !matches!(realm.next_document_parser_step(engine.ctx()).unwrap(),DocumentParserStep::Complete|DocumentParserStep::BlockedOnStylesheets) {}
+        assert!(!realm.rendering_blocked());
     }
     #[test]
     fn specification_stylesheet_retirement_cancels_actual_pending_owners_without_late_events() {

@@ -202,6 +202,7 @@ fn relative(body:&str,name:&str,depth:u8,current:Color,context:LengthContext,que
         let raw=head[start+index];
         let direct=identifier(raw).and_then(|name|keywords.iter().position(|key|name==*key));
         if missing(raw) {mask|=1<<index;}
+        else if space.hue()==Some(index) && is_percentage(raw)==Some(true) {return None;}
         else if let Some(source_index)=direct {coordinates[index]=source.components[source_index]*multiplier(source_index)/multiplier(index);
             if source.missing&(1<<source_index)!=0 {mask|=1<<index;}}
         else {coordinates[index]=if let Some(value)=channel_expression(raw,&named,scale(index),context,query) {value/multiplier(index)}

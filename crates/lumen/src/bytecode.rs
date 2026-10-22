@@ -1912,7 +1912,7 @@ fn call_error(i: &mut Interp, chunk: &Chunk, pc: usize, callee: &Value, e: Abrup
     }
     jit::sync_frames(i);
     let desc = i.innermost_source().and_then(|src| {
-        crate::interpreter::stack_trace::describe_callee_text(&src, chunk.call_site_pos(pc))
+        crate::interpreter::stack_trace::describe_callee_text(&src.text(), chunk.call_site_pos(pc))
     });
     match desc {
         Some(d) => i.throw("TypeError", format!("{d} is not a function")),

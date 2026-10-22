@@ -19,6 +19,36 @@ pub(super) fn rounded(
     rounded_corners(x, y, left, top, right, bottom, [[radius, radius]; 4])
 }
 
+/// Pixel columns `[start, end)` of row `y` whose coverage is exactly 1 by the
+/// same interior tests `rounded_corners` applies, so callers skip the call there.
+pub(super) fn full_span(
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radii: [[f32; 2]; 4],
+) -> (i64, i64) {
+    if !(y >= top && y + 1.0 <= bottom) {
+        return (0, 0);
+    }
+    let square = radii.iter().all(|r| r[0] == 0.0 || r[1] == 0.0)
+        || y >= top + radii[0][1].max(radii[1][1]) && y + 1.0 <= bottom - radii[2][1].max(radii[3][1]);
+    let (lo, hi) = if square {
+        (left, right)
+    } else {
+        (
+            left + radii[0][0].max(radii[3][0]),
+            right - radii[1][0].max(radii[2][0]),
+        )
+    };
+    let (lo, hi) = (lo.max(left).ceil(), hi.min(right).floor());
+    if !(hi > lo) {
+        return (0, 0);
+    }
+    (lo as i64, hi as i64)
+}
+
 pub(super) fn rounded_corners(
     x: f32,
     y: f32,

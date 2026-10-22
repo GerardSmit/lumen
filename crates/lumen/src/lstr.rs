@@ -167,6 +167,16 @@ fn layout(cap: u32) -> Layout {
         .expect("string too large")
 }
 
+/// `bytes` as text when they are valid UTF-8 the engine holds as is. A 0xF4 byte may start a
+/// character it spells as a surrogate pair (see [`lumen_common::smuggle`]), so those go the
+/// long way round.
+pub(crate) fn plain_utf8(bytes: &[u8]) -> Option<&str> {
+    if bytes.contains(&0xF4) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
 impl LStr {
     /// Allocate with `cap` bytes of capacity, seeding `content` (must fit).
     fn alloc(content: &str, cap: u32) -> LStr {
@@ -188,6 +198,74 @@ impl LStr {
             std::ptr::copy_nonoverlapping(content.as_ptr(), data, content.len());
             LStr { p }
         }
+    }
+
+    /// A string filled straight from `read` (the `read(2)` shape: bytes written, 0 at the end),
+    /// so the bytes exist once, in the string. `size_hint` is the expected length; a source that
+    /// turns out longer grows the buffer. Content that is not valid UTF-8 (or holds characters
+    /// the engine spells as surrogate pairs) is decoded lossily through a temporary copy.
+    pub fn from_utf8_reader<E>(
+        size_hint: usize,
+        mut read: impl FnMut(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<LStr, E> {
+        let cap = size_hint.saturating_add(1);
+        assert!(cap <= CAP_MASK as usize, "string too large");
+        let mut s = unsafe {
+            let p = std::alloc::alloc_zeroed(layout(cap as u32)) as *mut Header;
+            let p = NonNull::new(p).expect("allocation failed");
+            p.as_ptr().write(Header {
+                strong: Cell::new(1),
+                len: Cell::new(0),
+                cap: Cell::new(cap as u32),
+                _spare: 0,
+            });
+            LStr { p }
+        };
+        let mut len = 0usize;
+        loop {
+            let cap = (s.hdr().cap.get() & CAP_MASK) as usize;
+            if len == cap {
+                s.grow_zeroed(cap);
+            }
+            let cap = (s.hdr().cap.get() & CAP_MASK) as usize;
+            let buf = unsafe { std::slice::from_raw_parts_mut(s.data_mut().add(len), cap - len) };
+            let n = read(buf)?;
+            if n == 0 {
+                break;
+            }
+            len += n;
+        }
+        Ok(s.finish_utf8(len))
+    }
+
+    /// Double the capacity of a flag-free, uniquely owned string; the new bytes are zero.
+    fn grow_zeroed(&mut self, cap: usize) {
+        let grown = (cap * 2).min(CAP_MASK as usize);
+        assert!(grown > cap, "string too large");
+        unsafe {
+            let p = std::alloc::realloc(self.p.as_ptr() as *mut u8, layout(cap as u32), HDR + grown);
+            self.p = NonNull::new(p as *mut Header).expect("allocation failed");
+            self.hdr().cap.set(grown as u32);
+            std::ptr::write_bytes(self.data_mut().add(cap), 0, grown - cap);
+        }
+    }
+
+    #[inline]
+    fn data_mut(&mut self) -> *mut u8 {
+        unsafe { (self.p.as_ptr() as *mut u8).add(HDR) }
+    }
+
+    fn finish_utf8(self, len: usize) -> LStr {
+        let bytes = unsafe { std::slice::from_raw_parts((self.p.as_ptr() as *const u8).add(HDR), len) };
+        if let Some(text) = plain_utf8(bytes) {
+            self.hdr().len.set(len as u32);
+            if text.is_ascii() {
+                self.mark_ascii();
+            }
+            return self;
+        }
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        LStr::from(lumen_common::smuggle::utf16_text_owned(text))
     }
 
     /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]).
@@ -655,6 +733,64 @@ pub fn view_stats() -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_chunks(data: &[u8], chunk: usize) -> impl FnMut(&mut [u8]) -> Result<usize, ()> + '_ {
+        let mut at = 0;
+        move |buf| {
+            let n = chunk.min(buf.len()).min(data.len() - at);
+            buf[..n].copy_from_slice(&data[at..at + n]);
+            at += n;
+            Ok(n)
+        }
+    }
+
+    fn from_reader(hint: usize, data: &[u8], chunk: usize) -> LStr {
+        LStr::from_utf8_reader(hint, read_chunks(data, chunk)).unwrap()
+    }
+
+    #[test]
+    fn reader_builds_the_same_string_as_decoding() {
+        let ascii = "plain ascii text\nline two";
+        let s = from_reader(ascii.len(), ascii.as_bytes(), 7);
+        assert_eq!((&*s, s.ascii_hint()), (ascii, true));
+
+        let multi = "h\u{e9}llo \u{4e16}\u{754c} \u{1f600}";
+        let s = from_reader(multi.len(), multi.as_bytes(), 3);
+        assert_eq!((&*s, s.ascii_hint()), (multi, false));
+
+        let s = from_reader(0, b"", 8);
+        assert_eq!((&*s, s.len()), ("", 0));
+
+        let bad = [b'a', 0xF0, 0x9F, b'b', 0xC0, 0x80, 0xFF];
+        let s = from_reader(bad.len(), &bad, 2);
+        assert_eq!(&*s, String::from_utf8_lossy(&bad));
+    }
+
+    #[test]
+    fn reader_survives_a_source_that_changes_size() {
+        let text = "x\u{e9}".repeat(5000);
+        let grown = from_reader(10, text.as_bytes(), 1000);
+        assert_eq!(&*grown, text.as_str());
+        let shrunk = from_reader(text.len() * 3, text.as_bytes(), 4096);
+        assert_eq!(&*shrunk, text.as_str());
+        let mut s = LStr::from_utf8_reader(0, read_chunks(text.as_bytes(), 777)).unwrap();
+        assert!(s.append_in_place("tail") || { s = s.concat_grown("tail"); true });
+        assert!(s.ends_with("tail") && s.len() == text.len() + 4);
+    }
+
+    #[test]
+    fn reader_respells_characters_above_the_smuggle_base() {
+        let high = "a\u{10FFFF}b";
+        let s = from_reader(high.len(), high.as_bytes(), 16);
+        assert_eq!(&*s, lumen_common::smuggle::utf16_text_owned(high.to_string()));
+        assert_ne!(&*s, high);
+    }
+
+    #[test]
+    fn reader_error_frees_the_partial_string() {
+        let r = LStr::from_utf8_reader(8, |_: &mut [u8]| Err::<usize, _>("eio"));
+        assert_eq!(r.err(), Some("eio"));
+    }
 
     #[test]
     fn views_share_and_compact() {

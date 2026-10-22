@@ -6,6 +6,9 @@ pub enum Alignment {
     Center,
     End,
     Nearest,
+    /// No scroll for a wholly visible target, `Nearest` for a partly visible one and `Center`
+    /// for a hidden one (what browsers do for `focus()`).
+    CenterIfNeeded,
 }
 
 /// Physical displacement needed to align an interval. `reverse` maps logical
@@ -38,6 +41,20 @@ pub fn alignment_delta(
             }
         }
         Alignment::Center => start + (target_size - port_size) / 2.0,
+        Alignment::CenterIfNeeded => {
+            if target_end <= port_start || target_start >= port_end {
+                start + (target_size - port_size) / 2.0
+            } else {
+                alignment_delta(
+                    target_start,
+                    target_end,
+                    port_start,
+                    port_end,
+                    Alignment::Nearest,
+                    reverse,
+                )
+            }
+        }
         Alignment::Nearest => {
             let before = target_start < port_start;
             let after = target_end > port_end;
@@ -71,5 +88,15 @@ mod tests {
             alignment_delta(20.0, 40.0, 0.0, 100.0, Alignment::Start, true),
             -60.0
         );
+    }
+
+    #[test]
+    fn center_if_needed_keeps_visible_targets_and_centers_hidden_ones() {
+        let align = |a, b| alignment_delta(a, b, 0.0, 100.0, Alignment::CenterIfNeeded, false);
+        assert_eq!(align(20.0, 40.0), 0.0);
+        assert_eq!(align(90.0, 120.0), 20.0);
+        assert_eq!(align(-20.0, 10.0), -20.0);
+        assert_eq!(align(200.0, 220.0), 160.0);
+        assert_eq!(align(-220.0, -200.0), -260.0);
     }
 }

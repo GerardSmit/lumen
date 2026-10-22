@@ -109,12 +109,17 @@ pub(crate) fn connect_stream(
         .get::<SpawnHandle>()
         .expect("runtime installs the spawn handle")
         .clone();
+    let config = ctx
+        .op_state()
+        .get::<crate::FetchConfig>()
+        .cloned()
+        .unwrap_or_default();
     let target = target.to_string();
     let last_event_id = last_event_id.to_string();
     spawn.spawn_blocking(task, move || {
         Box::new(ConnectResult {
             id,
-            outcome: open_stream(&target, &last_event_id),
+            outcome: open_stream(&target, &last_event_id, &config),
         })
     });
     Ok(id)
@@ -138,7 +143,11 @@ pub(crate) fn close_stream(ctx: &mut Ctx, id: u64) {
 
 /// GET `target` with the SSE request headers, following redirects, and validate the response is
 /// a `text/event-stream` 200 — returning the still-open stream positioned at the body start.
-fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn NbStream>, ConnectError> {
+fn open_stream(
+    target: &str,
+    last_event_id: &str,
+    config: &crate::FetchConfig,
+) -> Result<Box<dyn NbStream>, ConnectError> {
     let mut target = target.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let u = url::parse(&target, None).map_err(ConnectError::Fatal)?;
@@ -150,14 +159,22 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn NbStream>, C
         }
         let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
         let host = u.hostname().trim_matches(['[', ']']);
-        let tcp = TcpStream::connect((host, port))
-            .map_err(|e| ConnectError::Retriable(format!("connect: {e}")))?;
+        let route = crate::http::resolve_route(config, &u, port).map_err(ConnectError::Fatal)?;
+        let tcp = match &route {
+            Some(route) => TcpStream::connect(route.address),
+            None => TcpStream::connect((host, port)),
+        }
+        .map_err(|e| ConnectError::Retriable(format!("connect: {e}")))?;
         tcp.set_nodelay(true).ok();
         tcp.set_read_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
         tcp.set_write_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
 
         let mut stream = if u.scheme == "https" {
-            Stream::Tls(lumen_tls::TlsStream::connect(tcp, host).map_err(ConnectError::Retriable)?)
+            let tls = match route.as_ref().and_then(|route| route.extra_ca_pem.as_deref()) {
+                Some(extra_roots) => lumen_tls::TlsStream::connect_with_extra_roots(tcp, host, extra_roots),
+                None => lumen_tls::TlsStream::connect(tcp, host),
+            };
+            Stream::Tls(tls.map_err(ConnectError::Retriable)?)
         } else {
             Stream::Plain(tcp)
         };

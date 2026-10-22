@@ -418,6 +418,7 @@ impl BrowserRejectionPolicy {
     pub fn set_sink(&mut self, engine: &mut lumen::Engine, owner: &RealmHandle, sink: BrowserRejectionSink) {
         self.enable(engine);
         if let (Some(key), Some(global)) = (browser_realm_key(engine, owner), engine.ctx().weak_value(&owner.global())) {
+            self.delivery.0.borrow_mut().cancelled_realms.retain(|(cancelled, _)| *cancelled != key);
             self.sinks.borrow_mut().insert(key, (global, sink));
         }
     }

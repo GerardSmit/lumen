@@ -105,9 +105,12 @@ struct Split {
 }
 
 impl Writer {
-    fn is_unit_src(&mut self, src: &Rc<str>) -> bool {
+    fn is_unit_src(&mut self, src: &crate::srctext::Src) -> bool {
         let Some((unit, seen)) = &mut self.unit_src else {
             return true;
+        };
+        let crate::srctext::Src::Flat(src) = src else {
+            return false;
         };
         *seen
             .entry(src.as_ptr())
@@ -561,7 +564,7 @@ fn decode_inner(bytes: &[u8], src: Rc<str>, collect: bool) -> R<Decoded> {
     }
     r.src = src;
     let body = dec_stmts(&mut r)?;
-    crate::interpreter::stack_trace::note_parsed_source(r.src.clone(), None);
+    crate::interpreter::stack_trace::note_parsed_source(r.src.clone().into(), None);
     Ok((body, r.funcs))
 }
 
@@ -765,7 +768,7 @@ impl SplitUnit {
             return Err("snapshot: trailing data in a function header".into());
         }
         let lazy = LazyBody {
-            src: self.src.clone(),
+            src: self.src.clone().into(),
             start: 0,
             end: 0,
             line: 0,
@@ -1926,7 +1929,7 @@ fn dec_fnsource(r: &mut Reader) -> R<FnSource> {
         2 => {
             let (start, end) = r.range()?;
             FnSource::Range {
-                src: r.src.clone(),
+                src: r.src.clone().into(),
                 start,
                 end,
             }
@@ -2027,7 +2030,7 @@ fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
         in_field_init: bits & 512 != 0,
     };
     Ok(LazyBody {
-        src: r.src.clone(),
+        src: r.src.clone().into(),
         start,
         end,
         line,
@@ -2508,7 +2511,7 @@ mod tests {
             let l = f.lazy.borrow();
             let l = l.as_ref().expect("lazy record");
             assert_eq!(
-                &l.src[l.start as usize..l.end as usize],
+                l.src.get(l.start as usize, l.end as usize).unwrap(),
                 if f.is_arrow {
                     "{ return 2; }"
                 } else {
@@ -2522,7 +2525,7 @@ mod tests {
             srcs.push(s.clone());
         }
         assert!(
-            srcs.windows(2).all(|w| std::rc::Rc::ptr_eq(&w[0], &w[1])),
+            srcs.windows(2).all(|w| w[0].key() == w[1].key()),
             "one shared copy"
         );
         assert_eq!(
@@ -2655,14 +2658,8 @@ function fine() { return 'ok'; }";
         };
         let first_source = first_fn.lazy.borrow();
         let second_source = second_fn.lazy.borrow();
-        assert!(Rc::ptr_eq(
-            &first_source.as_ref().expect("lazy source is retained").src,
-            &src
-        ));
-        assert!(Rc::ptr_eq(
-            &second_source.as_ref().expect("lazy source is retained").src,
-            &src
-        ));
+        assert!(first_source.as_ref().expect("lazy source is retained").src.is_rc(&src));
+        assert!(second_source.as_ref().expect("lazy source is retained").src.is_rc(&src));
     }
 
     #[test]

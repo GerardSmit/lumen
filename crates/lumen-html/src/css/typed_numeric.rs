@@ -2406,12 +2406,20 @@ pub(crate) fn computed_f32(value:f64)->f32 {
     if value.is_nan()||value==0.0{0.0}else{value.clamp(-f64::from(f32::MAX),f64::from(f32::MAX)) as f32}
 }
 
+/// Whether tokenizing `input` could find a sibling-context function: an escape
+/// can spell the name, otherwise the name appears literally.
+pub(super) fn may_name_sibling_function(input:&str)->bool {
+    let bytes=input.as_bytes();
+    bytes.contains(&b'\\')||bytes.windows(8).any(|window|window.eq_ignore_ascii_case(b"sibling-"))
+}
+
 /// Resolve the same numeric tree functions inside any CSS component value.
 /// Syntax owns strings/comments/URLs, escaped names and block bounds. Ordinary
 /// values stay borrowed; output allocates only after a real owner dependency.
 pub(super) fn substitute_sibling_functions(input:&str,index:usize,count:usize)->Option<(alloc::borrow::Cow<'_,str>,bool)> {
     use super::syntax::{Cursor,TokenKind};
     if input.len()>super::MAX_VARIABLE_BYTES{return None;}
+    if !may_name_sibling_function(input){return Some((alloc::borrow::Cow::Borrowed(input),false));}
     let mut cursor=Cursor::new(input,0).ok()?;let mut output=String::new();let mut copied=0;let mut changed=false;
     while let Some(token)=cursor.next(){
         if token.kind!=TokenKind::Other||input.as_bytes().get(token.end)!=Some(&b'('){continue;}

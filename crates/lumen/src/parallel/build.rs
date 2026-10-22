@@ -675,15 +675,15 @@ impl Builder {
             }
         }
         let text = match &function.source {
-            crate::ast::FnSource::Range { src, .. } => &**src,
-            _ => function.source.as_str().unwrap_or(""),
+            crate::ast::FnSource::Range { src, .. } => src.text(),
+            _ => std::borrow::Cow::Borrowed(function.source.as_str().unwrap_or("")),
         };
         let snapshot =
-            crate::snapshot::encode(&[crate::ast::Stmt::FuncDecl(function.clone())], text);
+            crate::snapshot::encode(&[crate::ast::Stmt::FuncDecl(function.clone())], &text);
         self.charge(interp, snapshot.len().saturating_add(text.len()))?;
         let decoded = {
             let _entered = HeapGuard::enter(&self.parcel.heap);
-            crate::snapshot::decode(&snapshot, text)
+            crate::snapshot::decode(&snapshot, &text)
         }
         .map_err(|message| interp.make_error("DataCloneError", message))?;
         let crate::ast::Stmt::FuncDecl(decoded) =

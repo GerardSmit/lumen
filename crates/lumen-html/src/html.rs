@@ -1351,7 +1351,7 @@ fn numeric_entity(input: &str) -> Option<(char, usize)> {
     Some((lumen_common::entities::html_char(reference.value), reference.len))
 }
 
-fn decode_entities(input: &str, attribute: bool) -> Cow<'_, str> {
+pub(crate) fn decode_entities(input: &str, attribute: bool) -> Cow<'_, str> {
     let Some(first) = input.find('&') else {
         return Cow::Borrowed(input);
     };
@@ -2228,6 +2228,11 @@ impl HtmlDocumentParser {
         self.paused_script.is_some()
     }
 
+    /// The parser-inserted script the tree builder yielded at, while it is still paused there.
+    pub fn paused_script(&self) -> Option<NodeId> {
+        self.paused_script
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }
@@ -2836,7 +2841,7 @@ fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn comment_end(bytes: &[u8], body_start: usize) -> Option<usize> {
+pub(crate) fn comment_end(bytes: &[u8], body_start: usize) -> Option<usize> {
     let rest = bytes.get(body_start..)?;
     let mut from = 0;
     while let Some(found) = rest.get(from..)?.windows(2).position(|pair| pair == b"--") {
@@ -2853,7 +2858,7 @@ fn comment_end(bytes: &[u8], body_start: usize) -> Option<usize> {
     None
 }
 
-fn raw_text_end_in(input: &str, start: usize, name: &str) -> usize {
+pub(crate) fn raw_text_end_in(input: &str, start: usize, name: &str) -> usize {
     let bytes = &input.as_bytes()[start..];
     let appropriate = |index: usize, prefix: &[u8]| {
         bytes

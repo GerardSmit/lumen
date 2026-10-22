@@ -589,7 +589,7 @@ fn combine_sequences<T>(a:&[T],b:&[T],operation:registered_properties::ComputedV
     Some(if output.is_empty(){"none".into()}else{output})
 }
 
-pub(super) fn computed_matrix(input:&str,reference:Option<[f64;2]>)->Option<lumen_common::dom_geometry::Matrix> {
+pub fn computed_matrix(input:&str,reference:Option<[f64;2]>)->Option<lumen_common::dom_geometry::Matrix> {
     computed_functions(input)?.iter().try_fold(lumen_common::dom_geometry::Matrix::default(),|matrix,function|Some(matrix.multiply(function.matrix(reference)?)))
 }
 pub(super) fn matrix_css_value(matrix:lumen_common::dom_geometry::Matrix)->Option<String> {

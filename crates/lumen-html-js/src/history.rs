@@ -65,6 +65,7 @@ enum HistoryOperation {
 
 pub(crate) struct HistoryStore {
     root: RefCell<Option<Rc<NavigableHistory>>>,
+    root_id: Cell<u64>,
     pub contexts: RefCell<HashMap<u64, std::rc::Weak<browsing_context::BrowsingContext>>>,
     current_step: Cell<u64>,
     next_entry: Cell<u64>,
@@ -144,8 +145,16 @@ if let Some(document)=context.document() {
 
 impl Default for HistoryStore {
     fn default() -> Self {
-        Self { root: RefCell::new(None), contexts: RefCell::new(HashMap::new()), current_step: Cell::new(0),
+        Self { root: RefCell::new(None), root_id: Cell::new(0), contexts: RefCell::new(HashMap::new()), current_step: Cell::new(0),
             next_entry: Cell::new(1), operations: RefCell::new(std::collections::VecDeque::new()), scheduled: Cell::new(false), traversal: RefCell::new(None), traversing: Cell::new(false) }
+    }
+}
+
+impl HistoryStore {
+    pub(crate) fn for_root(id: u64) -> Self {
+        let store = Self::default();
+        store.root_id.set(id);
+        store
     }
 }
 
@@ -156,7 +165,7 @@ impl Drop for QueueLease { fn drop(&mut self) { self.0.scheduled.set(false); } }
 fn schedule(ctx: &mut Ctx, store: &Rc<HistoryStore>) -> OpResult<()> {
     if store.scheduled.replace(true) { return Ok(()); }
     let lease = QueueLease(store.clone());
-    let root = store.contexts.borrow().get(&0).and_then(std::rc::Weak::upgrade)
+    let root = store.contexts.borrow().get(&store.root_id.get()).and_then(std::rc::Weak::upgrade)
         .ok_or_else(|| OpError::new("InvalidStateError", "history traversable is destroyed"))?;
     ctx.with_host_realm(&root.realm_handle(), |ctx| super::scheduling::queue_navigation_task(ctx, move |ctx| {
         let store = lease.begin();
@@ -1039,6 +1048,7 @@ mod tests {
             catch (error) {rejected = error instanceof DOMException && error.name === 'SecurityError';}
             if (!rejected || history.state !== previous || document.URL !== 'about:blank#allowed') throw new Error('opaque URL rewrite rules');
             globalThis.retainedOldHistory = history;
+            globalThis.sharedHistoryLength = history.length;
             return true;
         })()"#);
         assert_eq!(origin, realm.document_origin());
@@ -1051,8 +1061,11 @@ mod tests {
                 () => retainedOldHistory.replaceState(null, '', '/inactive')]) {
                 try {access();} catch (error) {if (error instanceof DOMException && error.name === 'SecurityError') ++failures;}
             }
-            if (failures !== 4 || history === retainedOldHistory || history.length !== 1 ||
-                document.URL !== 'https://history.test/new-document.html') throw new Error('active document history isolation');
+            if (failures !== 4 || history === retainedOldHistory || history.length !== sharedHistoryLength ||
+                document.URL !== 'https://history.test/new-document.html') {
+                throw new Error('active document history isolation: failures=' + failures + ' same=' + (history === retainedOldHistory) +
+                    ' length=' + history.length + '/' + sharedHistoryLength + ' url=' + document.URL);
+            }
             return true;
         })()"#);
         assert_eq!(realm.document_url().as_deref(), Some("about:blank#allowed"));

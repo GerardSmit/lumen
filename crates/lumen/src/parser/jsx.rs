@@ -763,7 +763,7 @@ impl Parser {
                     .src
                     .byte_range(element.start, element.start)
                     .map_or(element.start, |(s, _)| s) as usize;
-                let source = &self.src.src[..start.min(self.src.src.len())];
+                let source = &self.src.src.flat()[..start.min(self.src.src.len())];
                 let column = source
                     .rsplit('\n')
                     .next()

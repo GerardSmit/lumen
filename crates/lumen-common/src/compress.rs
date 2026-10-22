@@ -7,10 +7,14 @@
 #[cfg(feature = "compress")]
 pub mod bz2;
 #[cfg(feature = "compress")]
+mod content_decoder;
+#[cfg(feature = "compress")]
 mod modern;
 #[cfg(feature = "lzma")]
 pub mod xz;
 
+#[cfg(feature = "compress")]
+pub use content_decoder::*;
 #[cfg(feature = "compress")]
 pub use modern::*;
 

@@ -7,7 +7,7 @@
 //! on the JS thread when it finishes (see `lumen::embed::AsyncHost`), so a 100k-iteration PBKDF2
 //! or an 8 MB file read no longer blocks timers and I/O.
 
-use lumen::embed::SendError;
+use lumen::embed::{SendError, Value};
 use lumen_common::search;
 
 use crate::codec;
@@ -28,10 +28,10 @@ pub(crate) mod bindings {
 
     /// `buf.toString(encoding, start, end)` over `bytes[start..end]` (clamped).
     #[op]
-    fn decode(bytes: &[u8], enc: u32, start: u32, end: u32) -> String {
+    fn decode(bytes: &[u8], enc: u32, start: u32, end: u32) -> Value {
         let end = (end as usize).min(bytes.len());
         let start = (start as usize).min(end);
-        codec::decode(&bytes[start..end], enc)
+        codec::decode_value(&bytes[start..end], enc)
     }
 
     #[op(name = "byteLength")]

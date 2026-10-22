@@ -451,6 +451,7 @@ pub(super) fn resolve_computed(
     query: ContainerUnitContext,
     foreground: &SourceColor,
     sibling:(usize,usize),
+    tables: &super::parallel::SyncRefCell<CustomTables>,
 ) -> Option<()> {
     fn dependencies(
         components: &[component_values::UnparsedComponent],
@@ -475,10 +476,26 @@ pub(super) fn resolve_computed(
         }
         Some(())
     }
+    fn raw_dependencies(raw: &CustomText, tables: &super::parallel::SyncRefCell<CustomTables>) -> Option<Arc<[String]>> {
+        let identity = arc_identity(&raw.0);
+        if let Some((_, known)) = tables.borrow().dependencies.get(&identity) { return known.clone(); }
+        let parsed = component_values::parse_unparsed_value(raw).ok().and_then(|components| {
+            let mut names = Vec::new();
+            dependencies(&components, &mut names)?;
+            Some(Arc::<[String]>::from(names))
+        });
+        let mut tables = tables.borrow_mut();
+        if tables.dependencies.len() >= CUSTOM_DEPENDENCIES { tables.dependencies.clear(); }
+        tables.dependencies.insert(identity, (raw.0.clone(), parsed.clone()));
+        parsed
+    }
     fn resolve(
         at: usize,
         depth: usize,
         values: &mut [CustomEntry],
+        positions: &(core::cell::OnceCell<NameIndex>, core::cell::Cell<usize>),
+        registered: &[Option<usize>],
+        tables: &super::parallel::SyncRefCell<CustomTables>,
         base: Option<&dyn CustomNames>,
         states: &mut [u8],
         registrations: &[RegisteredCustomProperty],
@@ -492,9 +509,8 @@ pub(super) fn resolve_computed(
         if states[at] == 2 {
             return Some(());
         }
-        let registered = registrations.iter()
-            .any(|registration| registration.name == values[at].0 && registration.syntax.trim() != "*");
-        if !registered && !values[at].1.as_deref().is_some_and(needs_expansion) {
+        let expands = custom_needs_work(&values[at].1);
+        if !expands && !registered[at].is_some_and(|found| registrations[found].syntax.trim() != "*") {
             states[at] = 2;
             return Some(());
         }
@@ -505,16 +521,24 @@ pub(super) fn resolve_computed(
         }
         states[at] = 1;
         let raw = values[at].1.clone();
-        if let Some(raw) = raw.as_deref().filter(|raw| needs_expansion(raw)) {
-            let components = component_values::parse_unparsed_value(raw).ok()?;
-            let mut names = Vec::new();
-            dependencies(&components, &mut names)?;
-            for name in names {
-                if let Some(dependency) = values.iter().position(|(key, _)| *key == name) {
+        if let Some(raw) = raw.as_ref().filter(|_| expands) {
+            let names = raw_dependencies(raw, tables)?;
+            for name in names.iter() {
+                // Indexing every inherited name costs more than a few linear lookups.
+                positions.1.set(positions.1.get() + 1);
+                let found = match positions.0.get() {
+                    Some(index) => index.find(values, name),
+                    None if positions.1.get() > 32 => positions.0.get_or_init(|| NameIndex::indexed(values)).find(values, name),
+                    None => values.iter().position(|(key, _)| key.as_ref() == name.as_str()),
+                };
+                if let Some(dependency) = found {
                     resolve(
                         dependency,
                         depth + 1,
                         values,
+                        positions,
+                        registered,
+                        tables,
                         base,
                         states,
                         registrations,
@@ -528,16 +552,16 @@ pub(super) fn resolve_computed(
                 }
             }
         }
-        let expanded = raw.as_deref().and_then(|raw| {
-            if needs_expansion(raw) {
-                expand_variables_in(raw, &LayeredCustom { overlay: values, index: &LINEAR_NAMES, base }, &mut Vec::new(), false, MAX_VARIABLE_BYTES)
+        let expanded: Option<alloc::borrow::Cow<str>> = raw.as_deref().and_then(|raw| {
+            if expands {
+                let index: &NameIndex = if values.len() > 32 { positions.0.get_or_init(|| NameIndex::indexed(values)) } else { &LINEAR_NAMES };
+                expand_variables_in(raw, &LayeredCustom { overlay: values, index, base }, &mut Vec::new(), false, MAX_VARIABLE_BYTES)
+                    .map(alloc::borrow::Cow::Owned)
             } else {
-                Some(raw.to_string())
+                Some(alloc::borrow::Cow::Borrowed(raw))
             }
         });
-        let registration = registrations
-            .iter()
-            .find(|registration| registration.name == values[at].0);
+        let registration = registered[at].map(|found| &registrations[found]);
         values[at].1 = match registration {
             Some(registration) if registration.syntax.trim() != "*" => expanded
                 .as_deref()
@@ -552,17 +576,23 @@ pub(super) fn resolve_computed(
                         .find(|(key, _)| *key == values[at].0)
                         .and_then(|(_, value)| value.clone())
                 }),
-            _ => expanded.map(CustomText::from),
+            _ => expanded.map(|value| CustomText::from(value.into_owned())),
         };
         states[at] = 2;
         Some(())
     }
     let mut states = alloc::vec![0; values.len()];
+    let positions = (core::cell::OnceCell::new(), core::cell::Cell::new(0));
+    let registered: Vec<Option<usize>> = values.iter()
+        .map(|(name, _)| registrations.iter().position(|registration| registration.name == *name)).collect();
     for at in 0..values.len() {
         resolve(
             at,
             0,
             values,
+            &positions,
+            &registered,
+            tables,
             base,
             &mut states,
             registrations,

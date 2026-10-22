@@ -2477,8 +2477,8 @@ mod tests {
     fn computed_values_animation_lists_reuse_component_boundaries() {
         let style = styled("animation:spin 2s cubic-bezier(.1,.2,.3,.4), pulse 3s steps(2,end)");
         let serialized = value(&style, "animation");
-        assert!(serialized.contains("cubic-bezier(.1,.2,.3,.4)"));
-        assert!(serialized.contains("steps(2,end)"));
+        assert!(serialized.contains("cubic-bezier(0.1, 0.2, 0.3, 0.4)"), "{serialized}");
+        assert!(serialized.contains("steps(2)"), "{serialized}");
         assert_eq!(top_level_split(&serialized, b',', 64).unwrap().len(), 2);
         let mismatched = styled("animation-name:spin,pulse;animation-duration:2s");
         assert!(mismatched

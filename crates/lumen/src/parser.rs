@@ -2,8 +2,9 @@
 //! tree. Any failure is a [`ParseError`], which the engine reports as a SyntaxError (parse phase).
 
 use crate::ast::*;
-use crate::lexer::{tokenize_opts, LexOpts};
-use crate::token::{Name, RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
+use crate::lexer::{tokenize_pieces, tokenize_pieces_with, tokenize_range_pieces, LexOpts, LexScratch};
+use crate::srctext::Src;
+use crate::token::{Keyword, Name, Punct, RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
 mod jsx;
@@ -54,6 +55,25 @@ pub fn parse_script_lazy(src: &str) -> Result<Vec<Stmt>, ParseError> {
 /// syntax errors are reported at creation — while the functions inside it stay lazy.
 pub fn parse_dynamic_function(src: &str) -> Result<Vec<Stmt>, ParseError> {
     parse_script_inner(src, false, false, false, &[], lazy_bodies(), true)
+}
+
+/// [`parse_dynamic_function`] taking ownership of the source, which the parser then shares
+/// rather than copies.
+pub fn parse_dynamic_function_shared(src: Src) -> Result<Vec<Stmt>, ParseError> {
+    parse_script_shared(
+        "",
+        Some(src),
+        false,
+        false,
+        false,
+        &[],
+        lazy_bodies(),
+        true,
+        false,
+        false,
+        None,
+    )
+    .map(|r| r.0)
 }
 
 /// Whether function bodies are skipped at parse time and parsed on first call. Off with
@@ -125,6 +145,10 @@ fn parse_script_inner(
     .map(|r| r.0)
 }
 
+/// Sources at least this long are lexed with their `function` bodies skimmed (see
+/// [`LexOpts::skim_min_depth`]); a smaller token list is not worth the second lex.
+const SKIM_MIN_BYTES: usize = 256 * 1024;
+
 /// What lexing a whole source produced (see [`lex_source`]).
 struct Lexed {
     tokens: TokVec,
@@ -134,16 +158,28 @@ struct Lexed {
 
 /// Lex a whole source for a parse, in TypeScript mode when `ts`. JSDoc comment spans are
 /// recorded only with the `typed` feature.
-fn lex_source(src: &str, html: bool, ts: bool, jsx: bool) -> Result<Lexed, ParseError> {
-    crate::bytecode::reflect::note_source(src);
+fn lex_source(
+    pieces: &[&str],
+    html: bool,
+    ts: bool,
+    jsx: bool,
+    lazy: bool,
+    eager_outermost: bool,
+) -> Result<Lexed, ParseError> {
+    for piece in pieces {
+        crate::bytecode::reflect::note_source(piece);
+    }
+    let len: usize = pieces.iter().map(|p| p.len()).sum();
+    let skim = lazy && !ts && !jsx && len >= SKIM_MIN_BYTES;
     let opts = LexOpts {
         ts,
         jsx,
         docs: cfg!(feature = "typed"),
         start_div: false,
         offset: 0,
+        skim_min_depth: skim.then_some(u32::from(eager_outermost)),
     };
-    let lexed = tokenize_opts(src, html, 1, opts).map_err(|e| ParseError {
+    let lexed = tokenize_pieces(pieces, html, 1, opts).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         at_eof: e.at_eof,
@@ -216,12 +252,52 @@ fn parse_script_impl(
     cjs: bool,
     jsx_options: Option<&JsxOptions>,
 ) -> Result<(Vec<Stmt>, Option<String>, bool), ParseError> {
+    parse_script_shared(
+        src,
+        None,
+        strict,
+        allow_new_target,
+        allow_super,
+        private_names,
+        lazy,
+        eager_outermost,
+        ts,
+        cjs,
+        jsx_options,
+    )
+}
+
+/// [`parse_script_impl`] over a source already held as a [`Src`] (`shared`; `src` is then
+/// ignored), so the parser records function text against it instead of copying the whole source.
+#[allow(clippy::too_many_arguments)]
+fn parse_script_shared(
+    src: &str,
+    shared: Option<Src>,
+    strict: bool,
+    allow_new_target: bool,
+    allow_super: bool,
+    private_names: &[String],
+    lazy: bool,
+    eager_outermost: bool,
+    ts: bool,
+    cjs: bool,
+    jsx_options: Option<&JsxOptions>,
+) -> Result<(Vec<Stmt>, Option<String>, bool), ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let whole;
+    let pieces: &[&str] = match &shared {
+        Some(s) => {
+            whole = s.pieces(0, s.len()).expect("whole source");
+            &whole
+        }
+        None => std::slice::from_ref(&src),
+    };
+    let src_len: usize = pieces.iter().map(|p| p.len()).sum();
     let Lexed {
         tokens,
         ts: ts_state,
         docs,
-    } = lex_source(src, true, ts, jsx_options.is_some())?;
+    } = lex_source(pieces, true, ts, jsx_options.is_some(), lazy, eager_outermost)?;
     let private_scope = (!private_names.is_empty()).then(|| {
         Rc::new(PrivateScope {
             names: std::cell::OnceCell::from(private_names.to_vec()),
@@ -232,8 +308,9 @@ fn parse_script_impl(
         jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
+        lex_scratch: Default::default(),
         pos: 0,
-        src: SrcMap::whole(src),
+        src: shared.map_or_else(|| SrcMap::whole(src), SrcMap::whole_src),
         lazy,
         eager_outermost,
         private_scope,
@@ -314,7 +391,7 @@ fn parse_script_impl(
     // The caller running this script names its stack-trace frames after this source.
     crate::interpreter::stack_trace::note_parsed_source(p.src.src.clone(), None);
     drop(p);
-    release_parse_scratch(src.len());
+    release_parse_scratch(src_len);
     Ok((body, text, strict_prologue))
 }
 
@@ -479,11 +556,12 @@ fn parse_module_impl(
         tokens,
         ts: ts_state,
         docs,
-    } = lex_source(src, false, ts, jsx_options.is_some())?;
+    } = lex_source(&[src], false, ts, jsx_options.is_some(), lazy, false)?;
     let mut p = Parser {
         jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
+        lex_scratch: Default::default(),
         pos: 0,
         src: SrcMap::whole(src),
         lazy,
@@ -721,17 +799,24 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
-    let tokens = crate::lexer::tokenize_range(&lazy.src[s..e], lazy.html_comments, lazy.line)
-        .map_err(|e| ParseError {
+    let pieces = lazy.src.pieces(s, e).ok_or_else(|| ParseError {
+        message: "function body range lies outside its source".into(),
+        line: lazy.line,
+        at_eof: false,
+    })?;
+    let tokens = tokenize_range_pieces(&pieces, lazy.html_comments, lazy.line).map_err(|e| {
+        ParseError {
             message: e.message,
             line: e.line,
             at_eof: false,
-        })?;
+        }
+    })?;
     let ctx = lazy.ctx;
     let mut p = Parser {
         jsx: None,
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
+        lex_scratch: Default::default(),
         pos: 0,
         src: SrcMap::new(lazy.src.clone(), lazy.start, lazy.end),
         lazy: true,
@@ -821,7 +906,7 @@ const CHAIN_LINK_BYTES: usize = 4 * 1024;
 /// A lazily parsed body lexes only its own `{ ... }` slice, so its tokens' byte offsets count
 /// from `base`.
 struct SrcMap {
-    src: Rc<str>,
+    src: Src,
     base: u32,
     /// End of the lexed slice in `src`.
     end: u32,
@@ -829,10 +914,13 @@ struct SrcMap {
 
 impl SrcMap {
     fn whole(src: &str) -> Self {
-        let len = src.len() as u32;
-        Self::new(Rc::from(src), 0, len)
+        Self::whole_src(Src::Flat(Rc::from(src)))
     }
-    fn new(src: Rc<str>, start: u32, end: u32) -> Self {
+    fn whole_src(src: Src) -> Self {
+        let len = src.len() as u32;
+        Self::new(src, 0, len)
+    }
+    fn new(src: Src, start: u32, end: u32) -> Self {
         SrcMap {
             src,
             base: start,
@@ -848,12 +936,22 @@ impl SrcMap {
     }
 }
 
+struct BracketTable {
+    /// For each open bracket token, the index of the closer matching it (`u32::MAX` if none).
+    m: Vec<u32>,
+    /// A closer met an opener of another kind, or none: `{`/`}` pairs may then differ from a
+    /// braces-only match.
+    mismatched: bool,
+}
+
 struct Parser {
     jsx: Option<Rc<jsx::JsxState>>,
     /// Shared with the template token a substitution's parser was made from (see `TplPart::Sub`).
     toks: Rc<TokVec>,
-    /// See [`Parser::bracket_match`]: `[mixed brackets, braces only]`.
-    bracket_tables: [std::cell::OnceCell<Vec<u32>>; 2],
+    /// See [`Parser::bracket_match`].
+    bracket_tables: std::cell::OnceCell<BracketTable>,
+    /// Carried across the re-lexes of skimmed function bodies.
+    lex_scratch: LexScratch,
     pos: usize,
     /// The source, for slicing function text by token offsets.
     src: SrcMap,
@@ -1045,14 +1143,14 @@ fn prologue_has_use_strict_in(toks: &TokVec, from: usize) -> bool {
             return false;
         };
         let next = toks.get(i + 1);
-        let semi = matches!(next.map(|t| &t.kind), Some(Tok::Punct(";")));
-        let asi = next.is_none_or(|t| t.nl_before || matches!(t.kind, Tok::Punct("}") | Tok::Eof));
+        let semi = matches!(next.map(|t| &t.kind), Some(Tok::Punct(Punct::Semi)));
+        let asi = next.is_none_or(|t| t.nl_before() || matches!(t.kind, Tok::Punct(Punct::RBrace) | Tok::Eof));
         if !semi && !asi {
             return false;
         }
         // The directive must be the exact code units `use strict` — a string that used
         // escapes or line continuations does not count.
-        if &**str_val == "use strict" && !tok.escaped {
+        if &**str_val == "use strict" && !tok.escaped() {
             return true;
         }
         i += if semi { 2 } else { 1 };
@@ -1145,7 +1243,7 @@ impl Parser {
         let named = at > 0
             && matches!(
                 self.toks[at - 1].kind,
-                Tok::Ident(_) | Tok::Keyword("super")
+                Tok::Ident(_) | Tok::Keyword(Keyword::Super)
             );
         self.tok_pos(if named { at - 1 } else { self.pos })
     }
@@ -1174,7 +1272,7 @@ impl Parser {
         idx > 0
             && matches!(
                 self.toks[idx - 1].kind,
-                Tok::Punct("(" | "!" | "~" | "+" | "-") | Tok::Keyword("void")
+                Tok::Punct(Punct::LParen | Punct::Bang | Punct::Tilde | Punct::Plus | Punct::Minus) | Tok::Keyword(Keyword::Void)
             )
     }
 
@@ -1186,14 +1284,14 @@ impl Parser {
         Rc::make_mut(&mut self.toks)
     }
     fn line(&self) -> u32 {
-        self.toks[self.pos].line
+        self.toks[self.pos].line()
     }
     fn nl_before(&self) -> bool {
-        self.toks[self.pos].nl_before
+        self.toks[self.pos].nl_before()
     }
     /// Whether the current token contained a `\u` escape (so it can't be a contextual keyword).
     fn cur_escaped(&self) -> bool {
-        self.toks[self.pos].escaped
+        self.toks[self.pos].escaped()
     }
     fn at_eof(&self) -> bool {
         matches!(self.cur(), Tok::Eof)
@@ -1240,6 +1338,7 @@ impl Parser {
             Tok::Keyword(word) => format!("Unexpected token '{word}'"),
             Tok::Punct(p) => format!("Unexpected token '{p}'"),
             Tok::Regex(_) => "Unexpected regular expression".to_string(),
+            Tok::Skim => "Unexpected token '{'".to_string(),
         }
     }
 
@@ -1259,12 +1358,12 @@ impl Parser {
     }
 
     fn is_punct(&self, p: &str) -> bool {
-        matches!(self.cur(), Tok::Punct(x) if *x == p)
+        matches!(self.cur(), Tok::Punct(x) if x.as_str() == p)
     }
     fn is_kw(&self, k: &str) -> bool {
         // An escaped spelling (`d\u006f`) is never usable AS the keyword (only as e.g. a
         // property name, which matches `Tok::Keyword` directly).
-        matches!(self.cur(), Tok::Keyword(x) if *x == k) && !self.cur_escaped()
+        matches!(self.cur(), Tok::Keyword(x) if x.as_str() == k) && !self.cur_escaped()
     }
     /// True for a contextual keyword (`let`, `of`, `async`, ...) carried as an `Ident`.
     fn is_ident_word(&self, w: &str) -> bool {
@@ -1311,7 +1410,7 @@ impl Parser {
         is_async: bool,
         is_generator: bool,
     ) -> Result<(), ParseError> {
-        let name = Name(Rc::from(name));
+        let name = Name::new(name);
         if scope_declare_fn(&mut self.decl_scopes, &name, is_async, is_generator, self.strict) {
             Ok(())
         } else {
@@ -1357,7 +1456,7 @@ impl Parser {
     }
     /// Record a lexical (`let`/`const`/`class`) binding; error on redeclaration in this scope.
     fn declare_lexical(&mut self, name: &str) -> Result<(), ParseError> {
-        let name = Name(Rc::from(name));
+        let name = Name::new(name);
         if scope_declare_lexical(&mut self.decl_scopes, &name) {
             Ok(())
         } else {
@@ -1369,7 +1468,7 @@ impl Parser {
     /// nearest function/program boundary. A block-level *function* declaration (`hoist_through =
     /// false`) only conflicts in its own scope (Annex B.3.3 lets it shadow an enclosing lexical).
     fn declare_var(&mut self, name: &str, hoist_through: bool) -> Result<(), ParseError> {
-        let name = Name(Rc::from(name));
+        let name = Name::new(name);
         if scope_declare_var(&mut self.decl_scopes, &name, hoist_through) {
             Ok(())
         } else {
@@ -1427,17 +1526,17 @@ impl Parser {
         let in_case = std::mem::take(&mut self.in_case_clause);
         let single_stmt = std::mem::take(&mut self.single_stmt);
         match self.cur().clone() {
-            Tok::Punct("{") => {
+            Tok::Punct(Punct::LBrace) => {
                 self.advance();
                 let body = self.parse_block_body()?;
                 Ok(Stmt::Block(body))
             }
-            Tok::Punct(";") => {
+            Tok::Punct(Punct::Semi) => {
                 self.advance();
                 Ok(Stmt::Empty)
             }
-            Tok::Keyword("var") => self.parse_var_decl(DeclKind::Var),
-            Tok::Keyword("const") => self.parse_var_decl(DeclKind::Const),
+            Tok::Keyword(Keyword::Var) => self.parse_var_decl(DeclKind::Var),
+            Tok::Keyword(Keyword::Const) => self.parse_var_decl(DeclKind::Const),
             // In a single-statement (substatement) body only `let [` commits to a declaration —
             // ExpressionStatement's lookahead restriction is `let [` alone, so a bare `let` there
             // is an identifier reference (with ASI before a newline-separated binding name).
@@ -1445,7 +1544,7 @@ impl Parser {
                 if w == "let"
                     && !self.cur_escaped()
                     && self.starts_let_decl()
-                    && (!single_stmt || matches!(self.peek_kind(1), Tok::Punct("["))) =>
+                    && (!single_stmt || matches!(self.peek_kind(1), Tok::Punct(Punct::LBracket))) =>
             {
                 self.parse_var_decl(DeclKind::Let)
             }
@@ -1457,7 +1556,7 @@ impl Parser {
                 self.check_using_context(at_top, in_case)?;
                 self.parse_var_decl(DeclKind::AwaitUsing)
             }
-            Tok::Keyword("function") => {
+            Tok::Keyword(Keyword::Function) => {
                 let f = self.parse_function(false, false, self.cur_start())?;
                 // An Annex B substatement-position function (`if (x) function f(){}`) binds in
                 // its own implicit block: its name never conflicts with enclosing declarations.
@@ -1472,11 +1571,11 @@ impl Parser {
             Tok::Ident(w)
                 if w == "async"
                     && !self.cur_escaped()
-                    && matches!(self.peek_kind(1), Tok::Keyword("function"))
+                    && matches!(self.peek_kind(1), Tok::Keyword(Keyword::Function))
                     && !self
                         .toks
                         .get(self.pos + 1)
-                        .map(|t| t.nl_before)
+                        .map(|t| t.nl_before())
                         .unwrap_or(true) =>
             {
                 let start = self.cur_start();
@@ -1489,19 +1588,19 @@ impl Parser {
                 }
                 Ok(Stmt::FuncDecl(self.rc_fn(f)))
             }
-            Tok::Keyword("class") | Tok::Punct("@") => {
+            Tok::Keyword(Keyword::Class) | Tok::Punct(Punct::At) => {
                 let c = self.parse_class()?;
                 if let Some(n) = &c.name {
                     self.declare_lexical(n)?;
                 }
                 Ok(Stmt::ClassDecl(Rc::new(c)))
             }
-            Tok::Keyword("if") => self.parse_if(),
-            Tok::Keyword("while") => self.parse_while(),
-            Tok::Keyword("with") => self.parse_with(),
-            Tok::Keyword("do") => self.parse_do_while(),
-            Tok::Keyword("for") => self.parse_for(),
-            Tok::Keyword("return") => {
+            Tok::Keyword(Keyword::If) => self.parse_if(),
+            Tok::Keyword(Keyword::While) => self.parse_while(),
+            Tok::Keyword(Keyword::With) => self.parse_with(),
+            Tok::Keyword(Keyword::Do) => self.parse_do_while(),
+            Tok::Keyword(Keyword::For) => self.parse_for(),
+            Tok::Keyword(Keyword::Return) => {
                 self.advance();
                 if self.fn_depth == 0 {
                     return self.err("'return' outside of a function");
@@ -1514,7 +1613,7 @@ impl Parser {
                 self.consume_semicolon()?;
                 Ok(Stmt::Return(arg))
             }
-            Tok::Keyword("break") => {
+            Tok::Keyword(Keyword::Break) => {
                 self.advance();
                 let label = self.parse_opt_label();
                 match &label {
@@ -1529,7 +1628,7 @@ impl Parser {
                 self.consume_semicolon()?;
                 Ok(Stmt::Break(label))
             }
-            Tok::Keyword("continue") => {
+            Tok::Keyword(Keyword::Continue) => {
                 self.advance();
                 let label = self.parse_opt_label();
                 match &label {
@@ -1548,7 +1647,7 @@ impl Parser {
                 self.consume_semicolon()?;
                 Ok(Stmt::Continue(label))
             }
-            Tok::Keyword("throw") => {
+            Tok::Keyword(Keyword::Throw) => {
                 self.advance();
                 if self.nl_before() {
                     return self.err("illegal newline after throw");
@@ -1557,44 +1656,44 @@ impl Parser {
                 self.consume_semicolon()?;
                 Ok(Stmt::Throw(arg))
             }
-            Tok::Keyword("try") => self.parse_try(),
+            Tok::Keyword(Keyword::Try) => self.parse_try(),
             // `import …` declaration (but `import(` / `import.meta` are expressions).
-            Tok::Keyword("import")
+            Tok::Keyword(Keyword::Import)
                 if at_top
                     && self.module
-                    && !matches!(self.peek_kind(1), Tok::Punct("(") | Tok::Punct(".")) =>
+                    && !matches!(self.peek_kind(1), Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Dot)) =>
             {
                 self.parse_import()
             }
-            Tok::Keyword("export") if at_top && self.module => self.parse_export(),
+            Tok::Keyword(Keyword::Export) if at_top && self.module => self.parse_export(),
             // An `export`/`import` declaration nested in a statement position is a SyntaxError.
-            Tok::Keyword("export")
-                if !matches!(self.peek_kind(1), Tok::Punct("(") | Tok::Punct(".")) =>
+            Tok::Keyword(Keyword::Export)
+                if !matches!(self.peek_kind(1), Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Dot)) =>
             {
                 self.err("'export' declaration may only appear at the top level of a module")
             }
-            Tok::Keyword("import")
+            Tok::Keyword(Keyword::Import)
                 if self.module
-                    && !matches!(self.peek_kind(1), Tok::Punct("(") | Tok::Punct(".")) =>
+                    && !matches!(self.peek_kind(1), Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Dot)) =>
             {
                 self.err("'import' declaration may only appear at the top level of a module")
             }
-            Tok::Keyword("switch") => self.parse_switch(),
-            Tok::Keyword("debugger") => {
+            Tok::Keyword(Keyword::Switch) => self.parse_switch(),
+            Tok::Keyword(Keyword::Debugger) => {
                 self.advance();
                 self.consume_semicolon()?;
                 Ok(Stmt::Debugger)
             }
             // Labeled statement: `ident :` with the ident not being a known expression start that
             // would otherwise consume the colon.
-            Tok::Ident(name) if matches!(self.peek_kind(1), Tok::Punct(":")) => {
+            Tok::Ident(name) if matches!(self.peek_kind(1), Tok::Punct(Punct::Colon)) => {
                 // Collect the whole label chain, so an Annex B labelled FunctionDeclaration is
                 // recognized through any number of labels.
                 let _ = &name;
                 let mut chain: Vec<String> = Vec::new();
                 loop {
                     let n = match self.cur() {
-                        Tok::Ident(n) if matches!(self.peek_kind(1), Tok::Punct(":")) => n.clone(),
+                        Tok::Ident(n) if matches!(self.peek_kind(1), Tok::Punct(Punct::Colon)) => n.clone(),
                         _ => break,
                     };
                     if let Err(e) = self.check_label_name(&n) {
@@ -1618,7 +1717,7 @@ impl Parser {
                 // over) an iteration statement.
                 let iter_ahead = matches!(
                     self.cur(),
-                    Tok::Keyword("for") | Tok::Keyword("while") | Tok::Keyword("do")
+                    Tok::Keyword(Keyword::For) | Tok::Keyword(Keyword::While) | Tok::Keyword(Keyword::Do)
                 );
                 if iter_ahead {
                     for l in &chain {
@@ -1677,14 +1776,14 @@ impl Parser {
     fn starts_let_decl(&self) -> bool {
         matches!(
             self.peek_kind(1),
-            Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{")
+            Tok::Ident(_) | Tok::Punct(Punct::LBracket) | Tok::Punct(Punct::LBrace)
         )
     }
     /// Whether token `pos + ahead` is preceded by a line terminator.
     fn nl_at(&self, ahead: usize) -> bool {
         self.toks
             .get(self.pos + ahead)
-            .map(|t| t.nl_before)
+            .map(|t| t.nl_before())
             .unwrap_or(false)
     }
     /// `using x` is a declaration when an identifier follows on the same line (no `[no LT]` break);
@@ -1821,8 +1920,8 @@ impl Parser {
     /// A binding target: a plain identifier, or an array/object destructuring pattern.
     fn parse_binding_pattern(&mut self) -> Result<Pattern, ParseError> {
         match self.cur() {
-            Tok::Punct("[") => self.nested(Self::parse_array_pattern),
-            Tok::Punct("{") => self.nested(Self::parse_object_pattern),
+            Tok::Punct(Punct::LBracket) => self.nested(Self::parse_array_pattern),
+            Tok::Punct(Punct::LBrace) => self.nested(Self::parse_object_pattern),
             _ => self.parse_binding_ident(),
         }
     }
@@ -2040,7 +2139,7 @@ impl Parser {
         } else if self.is_ident_word("using")
             && self.starts_using_decl()
             && (!matches!(self.peek_kind(1), Tok::Ident(w) if w == "of")
-                || matches!(self.peek_kind(2), Tok::Punct("=")))
+                || matches!(self.peek_kind(2), Tok::Punct(Punct::Assign)))
         {
             // `for (using of = ...)` declares a resource named `of`; any other `for (using of`
             // keeps `using` as a plain for-of left side.
@@ -2296,7 +2395,7 @@ impl Parser {
         match self.cur().clone() {
             Tok::Str(s) => {
                 // A StringLiteral ModuleExportName must be well-formed Unicode (no lone surrogates).
-                if self.toks[self.pos].lone_surrogate {
+                if self.toks[self.pos].lone_surrogate() {
                     return self.err("module export name must be well-formed Unicode");
                 }
                 self.advance();
@@ -2321,7 +2420,7 @@ impl Parser {
         let spec = match self.cur().clone() {
             Tok::Str(s) => {
                 self.advance();
-                s
+                Rc::from(s.as_str())
             }
             _ => return self.err("expected a module specifier string"),
         };
@@ -2338,7 +2437,7 @@ impl Parser {
         // The legacy `assert { … }` clause has [no LineTerminator here] before `assert` — a
         // next-line `assert.sameValue(...)` statement is not an attributes clause.
         if self.is_ident_word("assert")
-            && (self.nl_before() || !matches!(self.peek_kind(1), Tok::Punct("{")))
+            && (self.nl_before() || !matches!(self.peek_kind(1), Tok::Punct(Punct::LBrace)))
         {
             return Ok(None);
         }
@@ -2395,7 +2494,7 @@ impl Parser {
                         // Bare import: `import "spec";`
         if let Tok::Str(s) = self.cur().clone() {
             self.advance();
-            let source = s;
+            let source: Rc<str> = Rc::from(s.as_str());
             let attr_type = self.parse_import_attributes()?;
             self.consume_semicolon()?;
             return Ok(Stmt::Import(ImportDecl {
@@ -2428,7 +2527,7 @@ impl Parser {
         // `import defer * as ns from "spec"` — a deferred namespace import.
         if self.is_ident_word("defer")
             && !self.cur_escaped()
-            && matches!(self.peek_kind(1), Tok::Punct("*"))
+            && matches!(self.peek_kind(1), Tok::Punct(Punct::Star))
         {
             self.advance(); // defer
             self.expect_punct("*")?;
@@ -2505,7 +2604,7 @@ impl Parser {
             let stmt = if self.is_kw("function")
                 || (self.is_ident_word("async")
                     && !self.cur_escaped()
-                    && matches!(self.peek_kind(1), Tok::Keyword("function")))
+                    && matches!(self.peek_kind(1), Tok::Keyword(Keyword::Function)))
             {
                 let start = self.cur_start();
                 let is_async = self.eat_ident_word("async");
@@ -2736,9 +2835,9 @@ impl Parser {
         let Tok::Regex(re) = self.cur().clone() else {
             return;
         };
-        let RegexTok { body, flags } = *re;
+        let RegexTok { body, flags } = (*re).clone();
         let tok = &self.toks[self.pos];
-        let (line, start, end) = (tok.line, tok.start, tok.end);
+        let (line, start, end) = (tok.line(), tok.start, tok.end);
         let rest = format!("{body}/{flags}");
         let Ok(mut relexed) = crate::lexer::tokenize(&rest) else {
             return;
@@ -2746,21 +2845,12 @@ impl Parser {
         // Drop the sub-lex's EOF token — splicing it mid-stream would truncate the program.
         relexed.retain(|t| !matches!(t.kind, Tok::Eof));
         for t in &mut relexed {
-            t.line = line;
+            t.set_line(line);
             t.start = start;
             t.end = end;
-            t.nl_before = false;
+            t.set_nl_before(false);
         }
-        let mut spliced = vec![Token {
-            kind: Tok::Punct("/"),
-            line,
-            start,
-            end,
-            nl_before: false,
-            legacy_octal: false,
-            escaped: false,
-            lone_surrogate: false,
-        }];
+        let mut spliced = vec![Token::new(Tok::Punct(Punct::Slash), line, start, end, false)];
         spliced.extend(relexed);
         let pos = self.pos;
         self.toks_mut().splice(pos..pos + 1, spliced);
@@ -2850,7 +2940,7 @@ impl Parser {
         let mut left = self.parse_cond()?;
         let left_paren = self.last_paren;
         if let Tok::Punct(op) = self.cur() {
-            let op = *op;
+            let op = op.as_str();
             if is_assign_op(op) {
                 // `undefined` is an ordinary identifier as an assignment target: the write fails
                 // at runtime (strict TypeError on the non-writable global), not at parse.
@@ -2929,7 +3019,7 @@ impl Parser {
         let no_arg = (!delegate && self.nl_before())
             || matches!(
                 self.cur(),
-                Tok::Punct(";" | ")" | "]" | "}" | "," | ":") | Tok::Eof
+                Tok::Punct(Punct::Semi | Punct::RParen | Punct::RBracket | Punct::RBrace | Punct::Comma | Punct::Colon) | Tok::Eof
             );
         let arg = if no_arg {
             None
@@ -3057,11 +3147,11 @@ impl Parser {
     /// Returns (operator, precedence, right-associative, is-logical) for the current token.
     fn binary_op(&self) -> Option<(&'static str, u8, bool, bool)> {
         let op = match self.cur() {
-            Tok::Punct(p) => *p,
-            Tok::Keyword("instanceof") => "instanceof",
+            Tok::Punct(p) => p.as_str(),
+            Tok::Keyword(Keyword::Instanceof) => "instanceof",
             // `in` is not an operator in a `[NoIn]` context (the head of a `for` statement).
-            Tok::Keyword("in") if self.no_in => return None,
-            Tok::Keyword("in") => "in",
+            Tok::Keyword(Keyword::In) if self.no_in => return None,
+            Tok::Keyword(Keyword::In) => "in",
             _ => return None,
         };
         let (prec, right, logical) = match op {
@@ -3159,8 +3249,8 @@ impl Parser {
             return self.ts_angle_assertion();
         }
         let op = match self.cur() {
-            Tok::Punct(p @ ("+" | "-" | "!" | "~")) => Some(*p),
-            Tok::Keyword(k @ ("typeof" | "void" | "delete")) => Some(*k),
+            Tok::Punct(p @ (Punct::Plus | Punct::Minus | Punct::Bang | Punct::Tilde)) => Some(p.as_str()),
+            Tok::Keyword(k @ (Keyword::Typeof | Keyword::Void | Keyword::Delete)) => Some(k.as_str()),
             _ => None,
         };
         if let Some(op) = op {
@@ -3281,7 +3371,7 @@ impl Parser {
                 }
                 // A template immediately after an expression is a tagged template.
                 self.advance();
-                expr = self.build_tagged_template(expr, *parts)?;
+                expr = self.build_tagged_template(expr, (*parts).clone())?;
             } else if self.eat_punct("?.") {
                 had_optional = true;
                 if self.is_punct("(") {
@@ -3403,7 +3493,7 @@ impl Parser {
                 // A tagged template is itself a MemberExpression: `new tag\`t\`` invokes the
                 // tag and constructs its result.
                 self.advance();
-                base = self.build_tagged_template(base, *parts)?;
+                base = self.build_tagged_template(base, (*parts).clone())?;
             } else if self.eat_punct("[") {
                 let index = self.parse_expr_allow_in()?;
                 self.expect_punct("]")?;
@@ -3457,7 +3547,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.last_paren = false;
         // Legacy octal numbers and octal/`\8`/`\9` string escapes are SyntaxErrors in strict mode.
-        if self.strict && self.toks[self.pos].legacy_octal {
+        if self.strict && self.toks[self.pos].legacy_octal() {
             return self.err("legacy octal literals are not allowed in strict mode");
         }
         if self.ts.is_some() && (self.is_punct("/") || self.is_punct("/=")) {
@@ -3477,21 +3567,22 @@ impl Parser {
             }
             Tok::Num(n) => {
                 self.advance();
-                Ok(Expr::Num(n))
+                Ok(Expr::Num(n.get()))
             }
             Tok::BigInt(n) => {
                 self.advance();
-                Ok(Expr::BigInt(n))
+                Ok(Expr::BigInt((*n).clone()))
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(Expr::Str(Rc::from(s.as_str())))
             }
             Tok::Template(parts) => {
                 self.advance();
-                self.build_template(*parts)
+                self.build_template((*parts).clone())
             }
             Tok::Jsx(element) => {
+                let element = element.into_inner();
                 self.advance();
                 self.jsx
                     .as_ref()
@@ -3503,7 +3594,7 @@ impl Parser {
             }
             Tok::Regex(re) => {
                 self.advance();
-                let RegexTok { body, flags } = *re;
+                let RegexTok { body, flags } = (*re).clone();
                 // A regex literal is validated when parsed: an invalid pattern/flags is an early
                 // (parse-phase) SyntaxError, not a runtime one.
                 if let Err(msg) = crate::regex::Regex::new(&body, &flags) {
@@ -3514,7 +3605,7 @@ impl Parser {
                     flags: Rc::from(flags.as_str()),
                 })
             }
-            Tok::Keyword(k @ ("true" | "false" | "null")) => {
+            Tok::Keyword(k @ (Keyword::True | Keyword::False | Keyword::Null)) => {
                 // A keyword spelled with `\u` escapes is never the keyword (nor a usable
                 // identifier, since the name is reserved).
                 if self.cur_escaped() {
@@ -3522,24 +3613,24 @@ impl Parser {
                 }
                 self.advance();
                 Ok(match k {
-                    "true" => Expr::Bool(true),
-                    "false" => Expr::Bool(false),
+                    Keyword::True => Expr::Bool(true),
+                    Keyword::False => Expr::Bool(false),
                     _ => Expr::Null,
                 })
             }
-            Tok::Keyword("this") => {
+            Tok::Keyword(Keyword::This) => {
                 self.advance();
                 Ok(Expr::This)
             }
-            Tok::Keyword("function") => {
+            Tok::Keyword(Keyword::Function) => {
                 let f = self.parse_function(false, true, self.cur_start())?;
                 Ok(Expr::Func(self.rc_fn(f)))
             }
-            Tok::Keyword("class") | Tok::Punct("@") => {
+            Tok::Keyword(Keyword::Class) | Tok::Punct(Punct::At) => {
                 let c = self.parse_class()?;
                 Ok(Expr::Class(Rc::new(c)))
             }
-            Tok::Keyword("super") => {
+            Tok::Keyword(Keyword::Super) => {
                 self.advance();
                 // `super` is only valid as a SuperProperty (`super.x` / `super[e]`) or a SuperCall
                 // (`super(...)`). A SuperProperty requires a method/field/static-block context; a bare
@@ -3561,7 +3652,7 @@ impl Parser {
             }
             // `import(specifier)` (dynamic import), `import.meta`, or the phased forms
             // `import.source(specifier)` / `import.defer(specifier)`.
-            Tok::Keyword("import") => {
+            Tok::Keyword(Keyword::Import) => {
                 // Neither `import` in an ImportCall/ImportMeta nor the `meta` after it may be
                 // spelled with escape sequences.
                 if self.cur_escaped() {
@@ -3606,12 +3697,12 @@ impl Parser {
             Tok::Ident(name)
                 if name == "async"
                     && !self.cur_escaped()
-                    && matches!(self.peek_kind(1), Tok::Keyword("function"))
+                    && matches!(self.peek_kind(1), Tok::Keyword(Keyword::Function))
                     // No line terminator is allowed between `async` and `function`.
                     && !self
                         .toks
                         .get(self.pos + 1)
-                        .map(|t| t.nl_before)
+                        .map(|t| t.nl_before())
                         .unwrap_or(true) =>
             {
                 let start = self.cur_start();
@@ -3646,7 +3737,7 @@ impl Parser {
                     _ => Ok(Expr::Ident(name.to_string())),
                 }
             }
-            Tok::Punct("(") => {
+            Tok::Punct(Punct::LParen) => {
                 self.advance();
                 let e = self.parse_expr_allow_in()?;
                 self.expect_punct(")")?;
@@ -3660,18 +3751,18 @@ impl Parser {
                     e => e,
                 })
             }
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 let e = self.parse_array();
                 // An inner parenthesized element must not mark the literal itself as covered.
                 self.last_paren = false;
                 e
             }
-            Tok::Punct("{") => {
+            Tok::Punct(Punct::LBrace) => {
                 let e = self.parse_object();
                 self.last_paren = false;
                 e
             }
-            Tok::Punct("%") if crate::builtins::natives::syntax_allowed() => {
+            Tok::Punct(Punct::Percent) if crate::builtins::natives::syntax_allowed() => {
                 self.parse_native_call()
             }
             other => self.err(format!("unexpected token {other:?}")),
@@ -3712,6 +3803,7 @@ impl Parser {
             jsx: self.jsx.clone(),
             toks: toks.0.clone(),
             bracket_tables: Default::default(),
+            lex_scratch: Default::default(),
             pos: 0,
             src: SrcMap::new(self.src.src.clone(), self.src.base, self.src.base + end),
             lazy: self.lazy,
@@ -3901,7 +3993,7 @@ impl Parser {
                 && !self.cur_escaped()
                 && !matches!(
                     self.peek_kind(1),
-                    Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("}") | Tok::Punct("(")
+                    Tok::Punct(Punct::Colon) | Tok::Punct(Punct::Comma) | Tok::Punct(Punct::RBrace) | Tok::Punct(Punct::LParen)
                 )
             {
                 let is_get = self.is_ident_word("get");
@@ -3930,11 +4022,11 @@ impl Parser {
                 && !self.cur_escaped()
                 && !matches!(
                     self.peek_kind(1),
-                    Tok::Punct(":")
-                        | Tok::Punct(",")
-                        | Tok::Punct("}")
-                        | Tok::Punct("(")
-                        | Tok::Punct("=")
+                    Tok::Punct(Punct::Colon)
+                        | Tok::Punct(Punct::Comma)
+                        | Tok::Punct(Punct::RBrace)
+                        | Tok::Punct(Punct::LParen)
+                        | Tok::Punct(Punct::Assign)
                 );
             if is_async {
                 self.advance();
@@ -4044,11 +4136,11 @@ impl Parser {
             }
             Tok::Str(s) => {
                 self.advance();
-                Ok(PropKey::Str(s))
+                Ok(PropKey::Str(Rc::from(s.as_str())))
             }
             Tok::Num(n) => {
                 self.advance();
-                Ok(PropKey::Num(n))
+                Ok(PropKey::Num(n.get()))
             }
             // A BigInt literal property key (`{1n: x}`) uses its integer string as the key.
             Tok::BigInt(n) => {
@@ -4058,7 +4150,7 @@ impl Parser {
                     None => self.err("Invalid string length"),
                 }
             }
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 self.advance();
                 // A computed key is `AssignmentExpression[+In]` — `in` is always allowed inside the
                 // brackets, even in a `for` head's `[NoIn]` context.
@@ -4255,7 +4347,7 @@ impl Parser {
             && first > 0
             && matches!(
                 self.toks[first - 1].kind,
-                Tok::Keyword("export" | "default")
+                Tok::Keyword(Keyword::Export | Keyword::Default)
             )
         {
             // Node (swc) rejects `export @dec abstract class` (decorators go before `export`).
@@ -4378,9 +4470,9 @@ impl Parser {
     fn next_is_member_terminator(&self, ahead: usize) -> bool {
         matches!(
             self.peek_kind(ahead),
-            Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(";") | Tok::Punct("}")
+            Tok::Punct(Punct::LParen) | Tok::Punct(Punct::Assign) | Tok::Punct(Punct::Semi) | Tok::Punct(Punct::RBrace)
         ) || (self.ts.is_some()
-            && matches!(self.peek_kind(ahead), Tok::Punct("?" | "!" | ":" | "<")))
+            && matches!(self.peek_kind(ahead), Tok::Punct(Punct::Question | Punct::Bang | Punct::Colon | Punct::Lt)))
     }
 
     /// A method's parameter list starts here (`(`, or TypeScript type parameters).
@@ -4503,7 +4595,7 @@ impl Parser {
             && !self.cur_escaped()
             && !self.next_is_member_terminator(1)
             // `get` followed by `*` is a *field* named get and a generator method (ASI).
-            && !matches!(self.peek_kind(1), Tok::Punct("*"))
+            && !matches!(self.peek_kind(1), Tok::Punct(Punct::Star))
         {
             kind = if self.is_ident_word("get") {
                 MemberKind::Get
@@ -4763,6 +4855,78 @@ impl Parser {
         is_arrow: bool,
         call_prefix: bool,
     ) -> Result<(Body, bool), ParseError> {
+        let skimmed = self.is_punct("{")
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(Tok::Skim));
+        if skimmed {
+            return self.parse_skimmed_body(params_simple, is_arrow, call_prefix);
+        }
+        self.parse_function_body_in(params_simple, is_arrow, call_prefix, None)
+    }
+
+    /// [`parse_function_body`](Parser::parse_function_body) for a body the lexer kept no tokens
+    /// for (`{`, [`Tok::Skim`], `}`): re-lex its range into a token list of its own, parse the
+    /// body from that list as if it had been in the stream, then resume after the closing `}`.
+    /// A range of [`SKIM_MIN_BYTES`] or more is skimmed in turn, so the nested function bodies
+    /// of a huge body are re-lexed one at a time as the parse reaches them. The tokens are
+    /// dropped again when the body is done.
+    fn parse_skimmed_body(
+        &mut self,
+        params_simple: bool,
+        is_arrow: bool,
+        call_prefix: bool,
+    ) -> Result<(Body, bool), ParseError> {
+        let open = self.pos;
+        let stub = &self.toks[open + 1];
+        let (start, end, line) = (stub.start, stub.end, stub.line());
+        let after = |i: usize| self.toks.get(i).map(|t| &t.kind);
+        let tail = (
+            matches!(after(open + 3), Some(Tok::Punct(Punct::LParen))),
+            matches!(after(open + 3), Some(Tok::Punct(Punct::RParen)))
+                && matches!(after(open + 4), Some(Tok::Punct(Punct::LParen | Punct::Dot))),
+        );
+        let (s, e) = self
+            .src
+            .byte_range(start, end)
+            .expect("skimmed range lies inside the lexed source");
+        let opts = LexOpts {
+            offset: start,
+            skim_min_depth: ((e - s) as usize >= SKIM_MIN_BYTES).then_some(0),
+            ..LexOpts::default()
+        };
+        let pieces = self
+            .src
+            .src
+            .pieces(s as usize, e as usize)
+            .expect("skimmed range lies inside the source");
+        let lexed = tokenize_pieces_with(&pieces, !self.module, line, opts, &mut self.lex_scratch)
+            .map_err(|e| ParseError {
+                message: e.message,
+                line: e.line,
+                at_eof: false,
+            })?;
+        let outer_toks = std::mem::replace(&mut self.toks, Rc::new(lexed.tokens));
+        let outer_tables = std::mem::take(&mut self.bracket_tables);
+        self.pos = 0;
+        let result = self.parse_function_body_in(params_simple, is_arrow, call_prefix, Some(tail));
+        let body_toks = std::mem::replace(&mut self.toks, outer_toks);
+        if let Ok(tokens) = Rc::try_unwrap(body_toks) {
+            self.lex_scratch.recycle(tokens);
+        }
+        self.bracket_tables = outer_tables;
+        self.pos = open + 3;
+        result
+    }
+
+    /// The body of [`parse_function_body`](Parser::parse_function_body) over the current token
+    /// list. `tail` is `(`-follows and `)`-then-`(`/`.`-follows for the closing brace when the
+    /// list holds only the body (see [`parse_skimmed_body`](Parser::parse_skimmed_body)).
+    fn parse_function_body_in(
+        &mut self,
+        params_simple: bool,
+        is_arrow: bool,
+        call_prefix: bool,
+        tail: Option<(bool, bool)>,
+    ) -> Result<(Body, bool), ParseError> {
         self.expect_punct("{")?;
         let open = self.pos - 1;
         let saved_strict = self.strict;
@@ -4784,10 +4948,15 @@ impl Parser {
         if self.lazy && !(self.eager_outermost && self.fn_depth == 0) {
             if let Some(close) = self.matching_brace(open) {
                 let next = |i: usize| self.toks.get(i).map(|t| &t.kind);
-                let called_after = matches!(next(close + 1), Some(Tok::Punct("(")))
-                    || (call_prefix
-                        && matches!(next(close + 1), Some(Tok::Punct(")")))
-                        && matches!(next(close + 2), Some(Tok::Punct("(" | "."))));
+                let called_after = match tail {
+                    Some((call, wrapped_call)) => call || (call_prefix && wrapped_call),
+                    None => {
+                        matches!(next(close + 1), Some(Tok::Punct(Punct::LParen)))
+                            || (call_prefix
+                                && matches!(next(close + 1), Some(Tok::Punct(Punct::RParen)))
+                                && matches!(next(close + 2), Some(Tok::Punct(Punct::LParen | Punct::Dot))))
+                    }
+                };
                 // A body checked only for its early errors keeps no AST, even an IIFE's.
                 if !called_after || self.checking {
                     let (start, end) = self
@@ -4798,7 +4967,7 @@ impl Parser {
                         src: self.src.src.clone(),
                         start,
                         end,
-                        line: self.toks[open].line,
+                        line: self.toks[open].line(),
                         html_comments: !self.module,
                         ctx,
                         private_scope: self.private_scope.clone(),
@@ -4868,7 +5037,7 @@ impl Parser {
                 src: self.src.src.clone(),
                 start,
                 end,
-                line: self.toks[open].line,
+                line: self.toks[open].line(),
                 html_comments: !self.module,
                 ctx,
                 private_scope,
@@ -4983,15 +5152,15 @@ impl Parser {
             && !self
                 .toks
                 .get(self.pos + 1)
-                .map(|t| t.nl_before)
+                .map(|t| t.nl_before())
                 .unwrap_or(true)
-            && matches!(self.peek_kind(1), Tok::Ident(_) | Tok::Punct("("));
+            && matches!(self.peek_kind(1), Tok::Ident(_) | Tok::Punct(Punct::LParen));
         let base = if async_arrow { 1 } else { 0 };
 
         // `ident => ...`
         if let Tok::Ident(name) = self.peek_kind(base) {
-            if matches!(self.peek_kind(base + 1), Tok::Punct("=>"))
-                && !self.toks[self.pos + base + 1].nl_before
+            if matches!(self.peek_kind(base + 1), Tok::Punct(Punct::Arrow))
+                && !self.toks[self.pos + base + 1].nl_before()
             {
                 for _ in 0..=base {
                     self.advance(); // (async) ident
@@ -5024,12 +5193,12 @@ impl Parser {
             }
         }
         // `( params ) => ...`
-        if matches!(self.peek_kind(base), Tok::Punct("(")) {
+        if matches!(self.peek_kind(base), Tok::Punct(Punct::LParen)) {
             if let Some(close) = self.matching_paren(self.pos + base) {
                 if matches!(
                     self.toks.get(close + 1).map(|t| &t.kind),
-                    Some(Tok::Punct("=>"))
-                ) && !self.toks[close + 1].nl_before
+                    Some(Tok::Punct(Punct::Arrow))
+                ) && !self.toks[close + 1].nl_before()
                 {
                     if async_arrow {
                         self.advance();
@@ -5111,7 +5280,7 @@ impl Parser {
             }
         } else {
             let expression_start = self.cur_start();
-            let expression_line = self.toks[self.pos].line;
+            let expression_line = self.toks[self.pos].line();
             let ctx = self.lazy_context(true);
             let private_scope = self.private_scope.clone();
             let expr = self.nested(Self::parse_assign)?;
@@ -5162,64 +5331,77 @@ impl Parser {
 
     /// Index of the `}` matching the `{` at `open`.
     fn matching_brace(&self, open: usize) -> Option<usize> {
-        if !matches!(self.toks.get(open).map(|t| &t.kind), Some(Tok::Punct("{"))) {
-            let mut depth = 0i32;
-            for (i, t) in self.toks.iter_from(open).enumerate() {
-                match &t.kind {
-                    Tok::Punct("{") => depth += 1,
-                    Tok::Punct("}") => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(open + i);
-                        }
-                    }
-                    Tok::Eof => return None,
-                    _ => {}
-                }
+        if matches!(self.toks.get(open).map(|t| &t.kind), Some(Tok::Punct(Punct::LBrace))) {
+            let table = self.bracket_table();
+            if !table.mismatched {
+                return self.bracket_match(open);
             }
-            return None;
+            // Brackets of another kind interleave unevenly: braces alone must be matched.
         }
-        self.bracket_match(open, true)
+        let mut depth = 0i32;
+        for (i, t) in self.toks.iter_from(open).enumerate() {
+            match &t.kind {
+                Tok::Punct(Punct::LBrace) => depth += 1,
+                Tok::Punct(Punct::RBrace) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                Tok::Eof => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Index of the `)` matching the `(` at `open`, scanning balanced brackets.
     fn matching_paren(&self, open: usize) -> Option<usize> {
         if !matches!(
             self.toks.get(open).map(|t| &t.kind),
-            Some(Tok::Punct("(" | "[" | "{"))
+            Some(Tok::Punct(Punct::LParen | Punct::LBracket | Punct::LBrace))
         ) {
             return self.matching_paren_scan(open);
         }
-        self.bracket_match(open, false)
+        self.bracket_match(open)
     }
 
-    /// Bracket matches come from tables built once per token list, so nested lookaheads (arrow
-    /// heads, skipped bodies) stay linear overall.
-    fn bracket_match(&self, open: usize, braces_only: bool) -> Option<usize> {
-        let table = self.bracket_tables[usize::from(braces_only)].get_or_init(|| {
+    /// One table per token list (one `u32` per token), so nested lookaheads (arrow heads,
+    /// skipped bodies) stay linear overall.
+    fn bracket_table(&self) -> &BracketTable {
+        self.bracket_tables.get_or_init(|| {
             let mut m = vec![u32::MAX; self.toks.len()];
-            let mut stack = Vec::new();
-            for (i, t) in self.toks.iter_from(0).enumerate() {
-                match &t.kind {
-                    Tok::Punct("{") => stack.push(i),
-                    Tok::Punct("(" | "[") if !braces_only => stack.push(i),
-                    Tok::Punct("}") => {
-                        if let Some(o) = stack.pop() {
-                            m[o] = i as u32;
+            let mut mismatched = false;
+            let mut stack: Vec<(usize, bool)> = Vec::new();
+            let mut base = 0;
+            'scan: for chunk in self.toks.chunk_slices() {
+                for (k, t) in chunk.iter().enumerate() {
+                    let i = base + k;
+                    match &t.kind {
+                        Tok::Punct(Punct::LBrace) => stack.push((i, true)),
+                        Tok::Punct(Punct::LParen | Punct::LBracket) => stack.push((i, false)),
+                        Tok::Punct(close @ (Punct::RBrace | Punct::RParen | Punct::RBracket)) => {
+                            match stack.pop() {
+                                Some((o, brace)) => {
+                                    mismatched |= brace != (*close == Punct::RBrace);
+                                    m[o] = i as u32;
+                                }
+                                None => mismatched = true,
+                            }
                         }
+                        Tok::Eof => break 'scan,
+                        _ => {}
                     }
-                    Tok::Punct(")" | "]") if !braces_only => {
-                        if let Some(o) = stack.pop() {
-                            m[o] = i as u32;
-                        }
-                    }
-                    Tok::Eof => break,
-                    _ => {}
                 }
+                base += chunk.len();
             }
-            m
-        });
-        table
+            BracketTable { m, mismatched }
+        })
+    }
+
+    fn bracket_match(&self, open: usize) -> Option<usize> {
+        self.bracket_table()
+            .m
             .get(open)
             .filter(|&&c| c != u32::MAX)
             .map(|&c| c as usize)
@@ -5229,8 +5411,8 @@ impl Parser {
         let mut depth = 0i32;
         for (i, t) in self.toks.iter_from(open).enumerate() {
             match &t.kind {
-                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
-                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => {
+                Tok::Punct(Punct::LParen) | Tok::Punct(Punct::LBracket) | Tok::Punct(Punct::LBrace) => depth += 1,
+                Tok::Punct(Punct::RParen) | Tok::Punct(Punct::RBracket) | Tok::Punct(Punct::RBrace) => {
                     depth -= 1;
                     if depth == 0 {
                         return Some(open + i);
@@ -6273,7 +6455,7 @@ mod reloadable_expression_body_tests {
             let guard = function.lazy.borrow();
             let lazy = guard.as_ref().unwrap();
             assert_eq!(
-                &lazy.src[lazy.start as usize..lazy.end as usize],
+                lazy.src.get(lazy.start as usize, lazy.end as usize).unwrap(),
                 "({text: 'é', value: value + 3})"
             );
         }
@@ -6321,5 +6503,138 @@ mod reloadable_expression_body_tests {
             )
             .unwrap();
         assert!(matches!(value, crate::Completion::Value(value) if value == "66"));
+    }
+}
+
+#[cfg(test)]
+mod skimmed_body_tests {
+    use super::*;
+
+    fn big_source(extra: &str) -> String {
+        let mut src = String::from("var seed = 0;\n");
+        let mut i = 0;
+        while src.len() < SKIM_MIN_BYTES + 1024 {
+            src.push_str(&format!(
+                "function f{i}(a, b) {{ \"use strict\"; var r = /x{i}/.test(a) ? [1, 2].map(function (v) {{ return v * b; }}) : `t${{a}}`; return r; }}\n"
+            ));
+            i += 1;
+        }
+        src.push_str(extra);
+        src
+    }
+
+    fn lazy_text(f: &Function) -> String {
+        let guard = f.lazy.borrow();
+        let lazy = guard.as_ref().expect("lazy body");
+        lazy.src.get(lazy.start as usize, lazy.end as usize).unwrap().to_string()
+    }
+
+    #[test]
+    fn large_script_bodies_stay_lazy_with_exact_ranges() {
+        let src = big_source("(function () { return seed; })();\n");
+        let program = parse_script_lazy(&src).unwrap();
+        let Stmt::FuncDecl(first) = &program[1] else {
+            panic!("function declaration")
+        };
+        let text = lazy_text(first);
+        assert!(text.starts_with("{ \"use strict\"; var r = /x0/"), "{text}");
+        assert!(text.ends_with("return r; }"), "{text}");
+        assert!(program.iter().skip(1).filter(|s| matches!(s, Stmt::FuncDecl(_))).count() > 100);
+    }
+
+    #[test]
+    fn large_script_body_errors_are_reported_at_load() {
+        let src = big_source("function bad() { let a; let a; }\n");
+        assert!(parse_script_lazy(&src).is_err());
+        let src = big_source("function bad() { return @; }\n");
+        assert!(parse_script_lazy(&src).is_err());
+    }
+
+    #[test]
+    fn lex_errors_in_a_skimmed_lazy_body_match_the_unskimmed_ones() {
+        for bad in [
+            "function bad() { var s = \"abc;\n return 1; }\n",
+            "function bad() { return /abc\n/; }\n",
+            "function bad() { return `abc; }\n",
+            "function bad() { return \"\\u{zz}\"; }\n",
+            "function bad() { return 08n; }\n",
+        ] {
+            let small = parse_script_lazy(&format!("var a;\n{bad}")).err().expect("small error");
+            let src = big_source(bad);
+            let before = src[..src.len() - bad.len()].matches('\n').count();
+            let big = parse_script_lazy(&src).err().expect("large error");
+            assert_eq!(big.message, small.message, "{bad:?}");
+            assert_eq!(big.line as usize, small.line as usize - 1 + before, "{bad:?}");
+        }
+    }
+
+    fn padding(tag: &str) -> String {
+        let mut pad = String::new();
+        let mut i = 0;
+        while pad.len() < SKIM_MIN_BYTES + 1024 {
+            pad.push_str(&format!("function {tag}{i}(a, b) {{ return a * {i} + b; }}\n"));
+            i += 1;
+        }
+        pad
+    }
+
+    fn nested_source(innermost: &str) -> String {
+        let (p1, p2, p3) = (padding("p"), padding("q"), padding("r"));
+        format!(
+            "var out;\n(function l1() {{\n{p1}\n(function l2() {{\n{p2}\n(function l3() {{\n{p3}\n{innermost}\n}})();\n}})();\n}})();\n"
+        )
+    }
+
+    #[test]
+    fn skim_nests_three_levels_and_keeps_function_text() {
+        let src = nested_source("out = function inner( x ) { return x * 2; };");
+        let mut engine = crate::Engine::new();
+        let value = engine
+            .eval(&format!("{src}[out.toString(), out(21)].join('|');"), false)
+            .unwrap();
+        assert!(
+            matches!(value, crate::Completion::Value(value) if value == "function inner( x ) { return x * 2; }|42")
+        );
+    }
+
+    #[test]
+    fn early_error_deep_in_nested_skimmed_bodies_is_reported() {
+        let src = nested_source("out = function inner() { let a; let a; };");
+        assert!(parse_script_lazy(&src).is_err());
+        let (p1, p2, p3) = (padding("p"), padding("q"), padding("r"));
+        let src = format!(
+            "var l1 = function () {{\n{p1}\nvar l2 = function () {{\n{p2}\nvar l3 = function () {{\n{p3}\nlet a; let a;\n}};\n}};\n}};\n"
+        );
+        assert!(parse_script_lazy(&src).is_err());
+        let ok = src.replace("let a; let a;", "let a; let b;");
+        assert!(parse_script_lazy(&ok).is_ok());
+    }
+
+    #[test]
+    fn huge_function_argument_never_holds_all_its_tokens() {
+        let mut body = String::new();
+        let mut i = 0;
+        while body.len() < SKIM_MIN_BYTES + 1024 {
+            body.push_str(&format!(
+                "function g{i}(a, b) {{ var r = 0; {} return r; }}\n",
+                "r += a * b + 1; ".repeat(20)
+            ));
+            i += 1;
+        }
+        let src = format!("f(function () {{\n{body}}});\n");
+        let total = crate::lexer::tokenize(&src).unwrap().len();
+        crate::lexer::PEAK_TOKENS.with(|p| p.set(0));
+        parse_script_lazy(&src).unwrap();
+        let peak = crate::lexer::PEAK_TOKENS.with(|p| p.get());
+        assert!(peak > 0);
+        assert!(peak * 4 < total, "peak {peak} of {total} tokens");
+    }
+
+    #[test]
+    fn large_dynamic_function_parses_outer_body_eagerly() {
+        let body = big_source("");
+        let wrapped = format!("(function anonymous(\n) {{\n{body}\n}})");
+        let program = parse_dynamic_function(&wrapped).unwrap();
+        assert!(!program.is_empty());
     }
 }

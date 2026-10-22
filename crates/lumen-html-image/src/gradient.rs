@@ -1,4 +1,4 @@
-use super::{composite, Raster};
+use super::{blend_colors, blend_solid_span, composite, Raster, SourceCache, BLEND_RUN};
 use lumen_common::color::{Color, ColorSpace, HueInterpolation, InterpolationMethod, PreparedPair};
 use lumen_html::paint::{
     Gradient, GradientKind, GradientPosition, RadialShape, RadialSize, Rect, Rgba,
@@ -329,12 +329,8 @@ impl<'a> Prepared<'a> {
             Geometry::Conic { y, .. } => py - y,
         }
     }
-    /// `hint` caches the last stop segment; it only skips the search, never changes the result.
-    pub(super) fn color_at(&self, px: f32, row: f32, hint: &mut usize) -> Rgba {
-        if let Some(color) = self.solid {
-            return color;
-        }
-        let mut position = match self.geometry {
+    fn position(&self, px: f32, row: f32) -> f32 {
+        match self.geometry {
             Geometry::Linear { x, dx, length, .. } => 0.5 + ((px - x) * dx + row) / length,
             Geometry::Radial { x, rx, .. } => ((px - x) / rx).hypot(row),
             // CSS degrees: zero points up, angles sweep clockwise.
@@ -343,7 +339,14 @@ impl<'a> Prepared<'a> {
                 let angle = dx.atan2(-row).to_degrees().rem_euclid(360.0);
                 ((angle - from).rem_euclid(360.0)) / 360.0
             }
-        };
+        }
+    }
+    /// `hint` caches the last stop segment; it only skips the search, never changes the result.
+    pub(super) fn color_at(&self, px: f32, row: f32, hint: &mut usize) -> Rgba {
+        if let Some(color) = self.solid {
+            return color;
+        }
+        let mut position = self.position(px, row);
         let count = self.gradient.stops.len();
         if self.gradient.repeating {
             position = (position - self.offsets[0])
@@ -362,19 +365,151 @@ impl<'a> Prepared<'a> {
         } else if end == count {
             self.gradient.stops[count - 1].color
         } else {
-            let mut mix = ((position - self.offsets[end - 1])
+            let mix = ((position - self.offsets[end - 1])
                 / (self.offsets[end] - self.offsets[end - 1])).clamp(0.0, 1.0);
-            let exponent = self.hints[end];
-            if !exponent.is_nan() && exponent != 1.0 {
-                mix = if exponent == 0.0 { 1.0 }
-                    else if exponent.is_infinite() { 0.0 }
-                    else { mix.powf(exponent) };
-            }
-            if let Some(pair)=self.pairs[end] {
-                let [r,g,b,a]=pair.sample(mix).to_rgba8();Rgba{r,g,b,a}
-            } else {interpolate(self.gradient.stops[end-1].color,self.gradient.stops[end].color,mix)}
+            self.segment_color(end, mix)
         }
     }
+    fn segment_color(&self, end: usize, mut mix: f32) -> Rgba {
+        let exponent = self.hints[end];
+        if !exponent.is_nan() && exponent != 1.0 {
+            mix = if exponent == 0.0 { 1.0 }
+                else if exponent.is_infinite() { 0.0 }
+                else { mix.powf(exponent) };
+        }
+        if let Some(pair)=self.pairs[end] {
+            let [r,g,b,a]=pair.sample(mix).to_rgba8();Rgba{r,g,b,a}
+        } else {interpolate(self.gradient.stops[end-1].color,self.gradient.stops[end].color,mix)}
+    }
+    pub(super) fn lut(&self, pixels: usize) -> Lut {
+        Lut { enabled: pixels >= LUT_MIN_PIXELS, tables: vec![Vec::new(); self.gradient.stops.len()] }
+    }
+    pub(super) fn axis(&self) -> GradientAxis {
+        if self.solid.is_some() {
+            return GradientAxis::Vertical;
+        }
+        match self.geometry {
+            Geometry::Linear { dy, .. } if dy.abs() < AXIS_EPSILON => GradientAxis::Horizontal,
+            Geometry::Linear { dx, .. } if dx.abs() < AXIS_EPSILON => GradientAxis::Vertical,
+            _ => GradientAxis::Free,
+        }
+    }
+    /// Same result as `color_at` up to the table's mix quantization (at most one level per channel).
+    /// Fills `out` with `color_lut` of each position (transparent for `None`), keeping the geometry
+    /// dispatch and table checks out of the per-pixel loop.
+    pub(super) fn color_lut_run(&self, lut: &mut Lut, columns: &[Option<f32>], row: f32, hint: &mut usize, out: &mut [Rgba]) {
+        if !lut.enabled || self.solid.is_some() {
+            for (slot, px) in out.iter_mut().zip(columns) {
+                *slot = px.map_or(Rgba { r: 0, g: 0, b: 0, a: 0 }, |px| self.color_at(px, row, hint));
+            }
+            return;
+        }
+        match self.geometry {
+            Geometry::Linear { x, dx, length, .. } => {
+                self.lut_run(lut, columns, hint, out, |px| 0.5 + ((px - x) * dx + row) / length)
+            }
+            Geometry::Radial { x, rx, .. } => self.lut_run(lut, columns, hint, out, |px| ((px - x) / rx).hypot(row)),
+            Geometry::Conic { x, from, .. } => self.lut_run(lut, columns, hint, out, |px| {
+                let dx = px - x;
+                let angle = dx.atan2(-row).to_degrees().rem_euclid(360.0);
+                ((angle - from).rem_euclid(360.0)) / 360.0
+            }),
+        }
+    }
+    #[inline(always)]
+    fn lut_run(&self, lut: &mut Lut, columns: &[Option<f32>], hint: &mut usize, out: &mut [Rgba], position: impl Fn(f32) -> f32) {
+        let count = self.gradient.stops.len();
+        let first = self.offsets[0];
+        let period = self.offsets[count - 1] - first;
+        let mut end = *hint;
+        for (slot, px) in out.iter_mut().zip(columns) {
+            let Some(px) = *px else {
+                *slot = Rgba { r: 0, g: 0, b: 0, a: 0 };
+                continue;
+            };
+            let mut position = position(px);
+            if self.gradient.repeating {
+                position = (position - first).rem_euclid(period) + first;
+            }
+            if !((end == 0 || self.offsets[end - 1] <= position)
+                && (end == count || self.offsets[end] > position))
+            {
+                end = self.offsets[..count].partition_point(|offset| *offset <= position);
+                *hint = end;
+            }
+            *slot = if end == 0 {
+                self.gradient.stops[0].color
+            } else if end == count {
+                self.gradient.stops[count - 1].color
+            } else {
+                let mix = ((position - self.offsets[end - 1])
+                    / (self.offsets[end] - self.offsets[end - 1])).clamp(0.0, 1.0);
+                let exponent = self.hints[end];
+                if !exponent.is_nan() && exponent != 1.0 {
+                    self.segment_color(end, mix)
+                } else {
+                    let table = &mut lut.tables[end];
+                    if table.is_empty() {
+                        table.extend((0..LUT_STEPS).map(|i| self.segment_color(end, i as f32 / (LUT_STEPS - 1) as f32)));
+                    }
+                    table[(mix * (LUT_STEPS - 1) as f32 + 0.5) as usize]
+                }
+            };
+        }
+    }
+    pub(super) fn color_lut(&self, lut: &mut Lut, px: f32, row: f32, hint: &mut usize) -> Rgba {
+        if !lut.enabled || self.solid.is_some() {
+            return self.color_at(px, row, hint);
+        }
+        let mut position = self.position(px, row);
+        let count = self.gradient.stops.len();
+        if self.gradient.repeating {
+            position = (position - self.offsets[0])
+                .rem_euclid(self.offsets[count - 1] - self.offsets[0])
+                + self.offsets[0];
+        }
+        let mut end = *hint;
+        if !((end == 0 || self.offsets[end - 1] <= position)
+            && (end == count || self.offsets[end] > position))
+        {
+            end = self.offsets[..count].partition_point(|offset| *offset <= position);
+            *hint = end;
+        }
+        if end == 0 {
+            return self.gradient.stops[0].color;
+        }
+        if end == count {
+            return self.gradient.stops[count - 1].color;
+        }
+        let mix = ((position - self.offsets[end - 1])
+            / (self.offsets[end] - self.offsets[end - 1])).clamp(0.0, 1.0);
+        let exponent = self.hints[end];
+        if !exponent.is_nan() && exponent != 1.0 {
+            return self.segment_color(end, mix);
+        }
+        let table = &mut lut.tables[end];
+        if table.is_empty() {
+            table.extend((0..LUT_STEPS).map(|i| self.segment_color(end, i as f32 / (LUT_STEPS - 1) as f32)));
+        }
+        table[(mix * (LUT_STEPS - 1) as f32 + 0.5) as usize]
+    }
+}
+
+const LUT_STEPS: usize = 512;
+const LUT_MIN_PIXELS: usize = 2048;
+const AXIS_EPSILON: f32 = 1e-6;
+
+pub(super) struct Lut {
+    enabled: bool,
+    tables: Vec<Vec<Rgba>>,
+}
+
+/// Whether the gradient color depends on the column only, the row only, or both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GradientAxis {
+    Horizontal,
+    Vertical,
+    Free,
 }
 
 pub(super) fn fill(raster: &mut Raster<'_>, rect: Rect, radius: f32, gradient: &Gradient) {
@@ -386,20 +521,49 @@ pub(super) fn fill(raster: &mut Raster<'_>, rect: Rect, radius: f32, gradient: &
     };
     let scale = raster.scale;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (left, top, right, bottom) = (
+        raster.device_x(rect.x),
+        raster.device_y(rect.y),
+        raster.device_x(rect.x + rect.width),
+        raster.device_y(rect.y + rect.height),
+    );
+    let device_radius = (radius * scale)
+        .max(0.0)
+        .min((right - left) * 0.5)
+        .min((bottom - top) * 0.5);
+    let radii = [[device_radius; 2]; 4];
+    let mut lut = prepared.lut((x1 - x0) as usize * (y1 - y0) as usize);
+    let axis = prepared.axis();
     let mut hint = 0;
+    let xs: Vec<f32> = (x0..x1).map(|x| raster.css_x(x as f32 + 0.5)).collect();
+    let first_row = prepared.row_term(raster.css_y(y0 as f32 + 0.5));
+    let columns: Vec<Rgba> = if axis == GradientAxis::Horizontal {
+        xs.iter().map(|px| prepared.color_lut(&mut lut, *px, first_row, &mut hint)).collect()
+    } else {
+        Vec::new()
+    };
+    let width = raster.image.width as usize;
     for y in y0..y1 {
         let row = prepared.row_term(raster.css_y(y as f32 + 0.5));
-        for x in x0..x1 {
+        let row_color = if axis == GradientAxis::Vertical {
+            Some(prepared.color_lut(&mut lut, xs[0], row, &mut hint))
+        } else {
+            None
+        };
+        let (full_start, full_end) = if raster.antialias {
+            super::coverage::full_span(y as f32, left, top, right, bottom, radii)
+        } else {
+            (0, 0)
+        };
+        let full_start = full_start.clamp(i64::from(x0), i64::from(x1)) as u32;
+        let full_end = full_end.clamp(i64::from(full_start), i64::from(x1)) as u32;
+        let (full_start, full_end) = if full_end > full_start { (full_start, full_end) } else { (x1, x1) };
+        for x in (x0..full_start).chain(full_end..x1) {
             let coverage = if raster.antialias {
-                super::coverage::rounded(
-                    x as f32,
-                    y as f32,
-                    raster.device_x(rect.x),
-                    raster.device_y(rect.y),
-                    raster.device_x(rect.x + rect.width),
-                    raster.device_y(rect.y + rect.height),
-                    radius * scale,
-                )
+                super::coverage::rounded(x as f32, y as f32, left, top, right, bottom, radius * scale)
             } else {
                 rect.contains_rounded(raster.css_x(x as f32 + 0.5), raster.css_y(y as f32 + 0.5), radius)
                     as u8 as f32
@@ -407,13 +571,44 @@ pub(super) fn fill(raster: &mut Raster<'_>, rect: Rect, radius: f32, gradient: &
             if !(coverage > 0.0) {
                 continue;
             }
-            let color = prepared.color_at(raster.css_x(x as f32 + 0.5), row, &mut hint);
-            let offset = (y as usize * raster.image.width as usize + x as usize) * 4;
+            let index = (x - x0) as usize;
+            let color = match axis {
+                GradientAxis::Horizontal => columns[index],
+                GradientAxis::Vertical => row_color.unwrap(),
+                GradientAxis::Free => prepared.color_lut(&mut lut, xs[index], row, &mut hint),
+            };
+            let offset = (y as usize * width + x as usize) * 4;
             let pixel = &mut raster.image.pixels[offset..offset + 4];
             if coverage == 1.0 && color.a == 255 {
                 pixel.copy_from_slice(&[color.r, color.g, color.b, 255]);
             } else {
                 composite(pixel, color, coverage);
+            }
+        }
+        if full_end > full_start {
+            let base = (y as usize * width + full_start as usize) * 4;
+            let target = &mut raster.image.pixels[base..base + (full_end - full_start) as usize * 4];
+            let range = (full_start - x0) as usize..(full_end - x0) as usize;
+            match axis {
+                GradientAxis::Horizontal => {
+                    blend_colors(target, &columns[range], &mut SourceCache::new());
+                }
+                GradientAxis::Vertical => {
+                    blend_solid_span(target, row_color.unwrap());
+                }
+                GradientAxis::Free => {
+                    let mut staged = [Rgba { r: 0, g: 0, b: 0, a: 0 }; BLEND_RUN];
+                    let mut cache = SourceCache::new();
+                    let mut positions = [None; BLEND_RUN];
+                    for (pixels, xs) in target.chunks_mut(BLEND_RUN * 4).zip(xs[range].chunks(BLEND_RUN)) {
+                        for (position, px) in positions.iter_mut().zip(xs) {
+                            *position = Some(*px);
+                        }
+                        let out = &mut staged[..xs.len()];
+                        prepared.color_lut_run(&mut lut, &positions[..xs.len()], row, &mut hint, out);
+                        blend_colors(pixels, out, &mut cache);
+                    }
+                }
             }
         }
     }
@@ -706,5 +901,73 @@ mod tests {
             crate::render(&list, 8, 8, 2.0, true).unwrap(),
             crate::render(&sprites, 8, 8, 2.0, true).unwrap()
         );
+    }
+
+    fn stop(r: u8, g: u8, b: u8, a: u8, position: Option<GradientPosition>) -> GradientStop {
+        GradientStop { color: Rgba { r, g, b, a }, position }
+    }
+
+    #[test]
+    fn lut_matches_per_pixel_gradient_within_one_level() {
+        let half = lumen_html::paint::LengthPercentage { pixels: 0.0, fraction: 0.5 };
+        let kinds = [
+            (GradientKind::Linear { angle: 63.0, corner: None }, false),
+            (GradientKind::Linear { angle: 180.0, corner: None }, false),
+            (GradientKind::Linear { angle: 90.0, corner: None }, false),
+            (GradientKind::Linear { angle: 30.0, corner: None }, true),
+            (
+                GradientKind::Radial {
+                    shape: RadialShape::Ellipse,
+                    size: RadialSize::FarthestCorner,
+                    center: [half, half],
+                },
+                false,
+            ),
+            (GradientKind::Conic { from: 20.0, center: [half, half] }, false),
+        ];
+        let rect = Rect { x: 3.0, y: 5.0, width: 300.0, height: 200.0 };
+        for (case, (kind, repeating)) in kinds.into_iter().enumerate() {
+            let gradient = Gradient {
+                angular: None,
+                color: None,
+                kind,
+                repeating,
+                stops: Arc::from([
+                    stop(255, 0, 0, 255, None),
+                    stop(0, 200, 40, 128, Some(GradientPosition::Fraction(0.4))),
+                    stop(10, 20, 250, 255, Some(GradientPosition::Fraction(0.4))),
+                    stop(255, 255, 0, 255, Some(GradientPosition::Fraction(0.8))),
+                ]),
+            };
+            let prepared = Prepared::new(&gradient, rect).unwrap();
+            let mut lut = prepared.lut(usize::MAX);
+            let (mut hint_a, mut hint_b) = (0, 0);
+            for y in 0..200 {
+                let row = prepared.row_term(5.5 + y as f32);
+                for x in 0..300 {
+                    let px = 3.5 + x as f32;
+                    let exact = prepared.color_at(px, row, &mut hint_a);
+                    let fast = prepared.color_lut(&mut lut, px, row, &mut hint_b);
+                    for (a, b) in [(exact.r, fast.r), (exact.g, fast.g), (exact.b, fast.b), (exact.a, fast.a)] {
+                        assert!(a.abs_diff(b) <= 1, "case {case} ({x},{y}): {exact:?} vs {fast:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_aligned_gradients_report_their_axis() {
+        let gradient = |angle: f32| Gradient {
+            angular: None,
+            color: None,
+            kind: GradientKind::Linear { angle, corner: None },
+            repeating: false,
+            stops: Arc::from([stop(0, 0, 0, 255, None), stop(255, 255, 255, 255, None)]),
+        };
+        let rect = Rect { x: 0.0, y: 0.0, width: 50.0, height: 40.0 };
+        assert!(Prepared::new(&gradient(180.0), rect).unwrap().axis() == GradientAxis::Vertical);
+        assert!(Prepared::new(&gradient(90.0), rect).unwrap().axis() == GradientAxis::Horizontal);
+        assert!(Prepared::new(&gradient(45.0), rect).unwrap().axis() == GradientAxis::Free);
     }
 }

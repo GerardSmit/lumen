@@ -12,7 +12,7 @@ pub(crate) fn window_open(ctx: &mut Ctx, source: &Rc<DomRealm>, url: &str, targe
     let Some(context)=source.browsing_context().filter(|context|context.is_active()) else{return Ok(Value::Null)};
     // HTML window-open steps parse before choosing or creating a target.
     let url = if url.is_empty() { None } else {
-        Some(lumen_common::url::parse(url, Some(&source.base_url()))
+        Some(source.parse_document_url(url)
             .map_err(|_| crate::error_reporting::dom_exception(ctx, "SyntaxError", "Invalid window URL"))?.href())
     };
     let features=features.to_ascii_lowercase();
@@ -224,8 +224,10 @@ crate::event_content_handlers::bind_window_handlers! {
     }
 
     #[method]
-    fn close(&self,ctx:&mut Ctx) {
-        if let Some(context)=self.base.associated_realm().and_then(|realm|realm.browsing_context()){context.close_auxiliary(ctx);}
+    fn close(ctx:&mut Ctx,this:lumen_bind::This<Value>)->OpResult<()> {
+        let realm=window_attribute_realm(ctx,this.0)?;
+        if let Some(context)=realm.and_then(|realm|realm.browsing_context()){context.close_auxiliary(ctx);}
+        Ok(())
     }
 
     #[method]
@@ -1396,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn location_is_document_backed_and_rejects_unsupported_top_level_navigation() {
+    fn location_is_document_backed_and_defers_top_level_navigation() {
         let mut engine = Engine::new();
         let realm = crate::install(engine.ctx(), "<main></main>", 32).unwrap();
         realm.set_document_url("https://origin.example.test/dir/page.html?x=1#top");
@@ -1408,10 +1410,10 @@ mod tests {
               location.href === 'https://origin.example.test/dir/page.html?x=1#top' &&
               location.origin === 'https://origin.example.test' &&
               location.pathname === '/dir/page.html' && location.search === '?x=1' && location.hash === '#top';
-            let rejected = false;
-            try { location.assign('/next.html'); }
-            catch (error) { rejected = error.name === 'NotSupportedError'; }
-            locationIsShared && initial && rejected && location.href === document.URL
+            let deferred = false;
+            try { location.assign('/next.html'); deferred = true; }
+            catch (error) { deferred = false; }
+            locationIsShared && initial && deferred && location.href === document.URL
             "#,
         );
         assert!(matches!(result, Value::Bool(true)));
@@ -1542,7 +1544,17 @@ mod tests {
         let frame = parent
             .ensure_frame_context(engine.ctx(), iframe)
             .expect("create the same-origin iframe realm");
-        let child = frame.current_document().expect("install srcdoc");
+        let request = frame.navigation_request();
+        let child = frame
+            .install_response_for_request(
+                engine.ctx(),
+                &request,
+                "about:srcdoc",
+                "text/html",
+                "<style>html,body{margin:0}body{height:300px}</style>",
+                32,
+            )
+            .expect("install srcdoc");
         child.set_layout_flusher(Rc::new(|session| {
             session
                 .display_list(100, 80, &NoText)

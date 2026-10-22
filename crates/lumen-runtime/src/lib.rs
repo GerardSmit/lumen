@@ -301,6 +301,8 @@ pub struct Runtime {
     browser_stylesheet_documents: Rc<RefCell<Vec<std::rc::Weak<lumen_html_js::DomRealm>>>>,
     /// Worker globals admit rejection notifications as tasks of their own loop.
     worker_rejection_tasks: Rc<RefCell<VecDeque<lumen_html_js::BrowserRejectionTask>>>,
+    /// A web worker's flag, raised while its loop waits for a message with nothing else to do.
+    parked_flag: Option<Arc<AtomicBool>>,
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
@@ -744,6 +746,7 @@ impl Runtime {
             browser_rejections: lumen_html_js::BrowserRejectionPolicy::default(),
             browser_stylesheet_documents,
             worker_rejection_tasks: Rc::new(RefCell::new(VecDeque::new())),
+            parked_flag: None,
             fatal_exit: None,
             fatal_error: None,
             #[cfg(feature = "aot-native")]
@@ -1472,7 +1475,15 @@ impl Runtime {
                 }
                 None => None,
             };
-            if self.block(timeout).is_none() {
+            let parked = self.parked_flag.clone().filter(|_| self.parkable());
+            if let Some(flag) = &parked {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let woke = self.block(timeout);
+            if let Some(flag) = &parked {
+                flag.store(false, Ordering::SeqCst);
+            }
+            if woke.is_none() {
                 return;
             }
             #[cfg(test)]
@@ -2073,7 +2084,39 @@ impl Runtime {
     }
 
     fn idle(&mut self) -> bool {
-        if self.browser_stylesheet_documents.borrow().iter().any(|entry|entry.upgrade().is_some_and(|document|!document.is_document_destroyed() && (document.stylesheet_resources_pending() || document.object_resources_pending()))) {return false}
+        self.idle_with(false)
+    }
+
+    /// Nothing but a due-later timer can make progress: no queued work, loads, workers or live
+    /// connections. Sources that cannot be inspected count as busy.
+    pub fn quiescent(&mut self) -> bool {
+        self.idle_inner(true, true)
+            && worker::all_parked(self.engine.ctx())
+            && !lumen_web::connections_live(self.engine.ctx())
+    }
+
+    /// The worker loop is about to wait for a message and nothing it owns can make progress
+    /// without one.
+    fn parkable(&mut self) -> bool {
+        self.idle_inner(false, true)
+            && worker::all_parked(self.engine.ctx())
+            && !lumen_web::connections_live(self.engine.ctx())
+    }
+
+    pub(crate) fn set_parked_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.parked_flag = Some(flag);
+    }
+
+    fn idle_with(&mut self, ignore_timers: bool) -> bool {
+        self.idle_inner(ignore_timers, false)
+    }
+
+    /// `mailbox_waits` ignores the listeners of worker mailboxes, which stay registered for the
+    /// life of a worker but only wake when another agent sends a message.
+    fn idle_inner(&mut self, ignore_timers: bool, mailbox_waits: bool) -> bool {
+        // Stylesheet and object completions finish as HTML tasks, which only a browser loop runs.
+        if self.root_providers == RootProviders::Browser
+            && self.browser_stylesheet_documents.borrow().iter().any(|entry|entry.upgrade().is_some_and(|document|!document.is_document_destroyed() && (document.stylesheet_resources_pending() || document.object_resources_pending()))) {return false}
         if self.root_providers == RootProviders::Browser
             && lumen_html_js::scheduling::task_pending(self.engine.ctx())
         {
@@ -2092,11 +2135,15 @@ impl Runtime {
         let timers_pending = state
             .get::<lumen_timers::Timers>()
             .is_some_and(|t| t.has_pending());
-        let tasks_pending = state
-            .get::<TaskRegistry>()
-            .is_some_and(|r| r.has_ref_pending());
+        let tasks_pending = state.get::<TaskRegistry>().is_some_and(|r| {
+            if mailbox_waits {
+                r.has_oneshot_ref_pending()
+            } else {
+                r.has_ref_pending()
+            }
+        });
         !callbacks_queued
-            && !timers_pending
+            && (ignore_timers || !timers_pending)
             && !tasks_pending
             && self.worker_rejection_tasks.borrow().is_empty()
     }

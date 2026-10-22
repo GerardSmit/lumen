@@ -96,6 +96,33 @@ pub fn serialize_source_shadow_list(property:&str,source:&crate::css::SourceShad
     serialize_source_shadow_values(property,&source.shadows,&colors)
 }
 
+/// Text shadow lists add by concatenation and accumulate entry by entry; the
+/// entries of the longer list that have no counterpart are kept.
+pub fn compose_source_text_shadow_lists(a:&crate::css::SourceShadowList,b:&crate::css::SourceShadowList,accumulate:bool)->Option<String> {
+    let count=if accumulate {a.shadows.len().max(b.shadows.len())} else {a.shadows.len().checked_add(b.shadows.len())?};
+    if count>64 {return None;}
+    let mut shadows=Vec::new();shadows.try_reserve_exact(count).ok()?;
+    let mut colors=Vec::new();colors.try_reserve_exact(count).ok()?;
+    if accumulate {
+        for index in 0..count {
+            match (a.shadows.get(index),b.shadows.get(index)) {
+                (Some(x),Some(y))=>{
+                    shadows.push(BoxShadow{offset_x:x.offset_x+y.offset_x,offset_y:x.offset_y+y.offset_y,blur:x.blur+y.blur,spread:x.spread+y.spread,color:y.color,inset:y.inset});
+                    colors.push(b.color(index)?);
+                }
+                (Some(x),None)=>{shadows.push(*x);colors.push(a.color(index)?);}
+                (None,Some(y))=>{shadows.push(*y);colors.push(b.color(index)?);}
+                (None,None)=>return None,
+            }
+        }
+    } else {
+        for index in 0..a.shadows.len() {shadows.push(a.shadows[index]);colors.push(a.color(index)?);}
+        for index in 0..b.shadows.len() {shadows.push(b.shadows[index]);colors.push(b.color(index)?);}
+    }
+    if shadows.iter().any(|shadow|!(shadow.offset_x.is_finite()&&shadow.offset_y.is_finite()&&shadow.blur.is_finite()&&shadow.spread.is_finite())) {return None;}
+    serialize_source_shadow_values("text-shadow",&shadows,&colors)
+}
+
 fn border_slot(property:&str)->Option<usize> {match property {"border-image-slice"=>Some(228),"border-image-width"=>Some(229),"border-image-outset"=>Some(230),_=>None}}
 fn border_values(property:&str,a:&crate::css::BorderImage,b:&crate::css::BorderImage,left:f64,right:f64)->Option<String> {
     use crate::css::{BorderImageDimension as D,DecorationLength as L};

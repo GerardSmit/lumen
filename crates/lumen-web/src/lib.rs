@@ -213,6 +213,7 @@ mod url;
 mod websocket;
 mod eventsource_class;
 mod net_class;
+pub use net_class::connections_live;
 mod websocket_class;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -776,6 +777,11 @@ impl FetchConfig {
 
     pub(crate) fn requires_routes(&self) -> bool {
         self.require_routes
+    }
+
+    /// How many requests this process refused because routes were required and none matched.
+    pub fn unrouted_request_count() -> u64 {
+        http::unrouted_request_count()
     }
 
     /// Route a logical URL host and port to a concrete socket address.

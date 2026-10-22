@@ -405,6 +405,13 @@ fn is_style_source_element(namespace: &crate::Namespace, name: &crate::Name) -> 
         || (*namespace == crate::Namespace::Svg && local == "style")
 }
 
+/// Attributes of a style source that never change its sheet: script
+/// loaders toggle `data-*` markers on `<link>` elements while chunks load.
+fn inert_stylesheet_attribute(name: &str) -> bool {
+    let lower = |prefix: &str| name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
+    lower("data-") || lower("aria-") || ["id", "class", "style"].iter().any(|inert| name.eq_ignore_ascii_case(inert))
+}
+
 fn in_style(document: &Document, mut id: NodeId) -> bool {
     loop {
         match document.kind(id) {
@@ -506,7 +513,8 @@ fn layout_inert_attribute(document: &Document, node: NodeId, name: &str) -> bool
         || matches!(name, "class" | "style" | "title" | "role" | "tabindex" | "accesskey" | "draggable"
         | "spellcheck" | "translate" | "autocapitalize" | "enterkeyhint" | "inputmode" | "nonce"
         | "itemprop" | "itemscope" | "itemtype" | "itemid" | "itemref" | "rel" | "target"
-        | "download" | "hreflang" | "referrerpolicy" | "ping")
+        | "download" | "hreflang" | "referrerpolicy" | "ping" | "crossorigin" | "integrity" | "fetchpriority"
+        | "decoding" | "autocomplete" | "as" | "blocking")
         || name.starts_with("aria-")
         || name.starts_with("data-")
         || (name.starts_with("on") && name.len() > 2)
@@ -737,6 +745,14 @@ impl TransitionInputEpoch {
             && self.interaction_generation == other.interaction_generation && self.environment == other.environment
     }
 
+    /// Whether both epochs see the same rules and media environment. A
+    /// document whose snapshot exceeded its budget stays over it until one of
+    /// them changes, so later DOM or interaction changes do not repeat the
+    /// failed capture.
+    pub fn same_rules_and_environment(&self, other: &Self) -> bool {
+        self.rules_generation == other.rules_generation && self.environment == other.environment
+    }
+
     /// Like `differs_only_in_document`, but the rules may also differ.
     fn differs_only_in_document_and_rules(&self, other: &Self) -> bool {
         self.font_generation == other.font_generation && self.validity_generation == other.validity_generation
@@ -788,6 +804,7 @@ pub struct HeldSnapshotStale {
 pub struct RenderSession {
     document: Document,
     rules: Option<StyleIndex>,
+    style_parallelism: Option<Arc<dyn css::StyleParallelism>>,
     font_face_rules: Vec<css::FontFaceRule>,
     font_face_generation: u64,
     font_face_descriptor_overrides: Vec<(css::FontFaceIdentity, css::FontFaceDescriptors)>,
@@ -859,6 +876,17 @@ pub struct RenderSession {
     // Only deterministic provenance-budget rejection is memoized. The rare
     // record has no DOM roots and includes actual font and paint inputs.
     rejected_transition_snapshot: Option<Box<(TransitionInputEpoch, Option<u64>, u64)>>,
+    // The shape of the last capture the budget rejected: whether it was
+    // sparse, how many nodes it planned to cover, and its media environment.
+    // A later capture of the same shape that is at least as large is refused
+    // without styling it again, since rule and DOM changes that keep a
+    // document this large rarely bring it under the budget.
+    rejected_snapshot_size: Option<(bool, usize, css::MediaEnvironment)>,
+    // The inputs of the last sparse capture the budget rejected. A whole-document
+    // capture of the same inputs styles a superset of those elements, so it is
+    // refused without styling them again.
+    rejected_sparse_epoch: Option<TransitionInputEpoch>,
+    effects_wait_for_first_render: bool,
     animation_generation: u64,
     animation_epoch: u64,
     pending_animation_nodes: Vec<NodeId>,
@@ -896,12 +924,18 @@ pub struct RenderSession {
     /// rebuild changed more than rules with bounded subjects.
     snapshot_rule_subjects: Vec<NodeId>,
     snapshot_rules_unbounded: bool,
+    /// Effect targets whose sampled declarations changed since the last snapshot.
+    snapshot_effect_nodes: alloc::collections::BTreeSet<u128>,
+    snapshot_effects_unbounded: bool,
     /// Set while the transition snapshot the host retains is deliberately not
     /// refreshed (nothing declares a transition): the elements whose style it
     /// no longer describes.
     held_snapshot_stale: Option<alloc::collections::BTreeSet<u128>>,
     /// Whether the rules of this `rules_generation` can set transitions or animations.
     transition_declarations: Option<(u64, bool)>,
+    /// Subjects of the transition-declaring rules of this `rules_generation`;
+    /// `None` inside when the rules reach elements that keying cannot name.
+    transition_candidates: Option<((u64, css::MediaEnvironment), Option<Arc<css::TransitionCandidates>>)>,
     /// Document version through which inline styles were scanned for
     /// transitions, and whether one was found (sticky).
     inline_transition_scan: Option<u64>,
@@ -915,6 +949,14 @@ pub struct RenderSession {
     invalidation_stats: InvalidationStats,
     /// Parses of the installed stylesheets, reused by every rules rebuild.
     stylesheet_parses: css::StylesheetParseCache,
+    /// The document-tree sheets the current rules were built from, when those
+    /// are all of them; lets an appended sheet extend the rules without
+    /// collecting the earlier sheets again.
+    rule_stamps: Vec<layout::SheetStamp>,
+    #[cfg(test)]
+    rule_extensions: usize,
+    #[cfg(test)]
+    prefix_collects: usize,
     /// The rules a stylesheet installation replaced, kept until the rebuild
     /// it starts compares them with its result.
     previous_rules: Option<css::StyleIndex>,
@@ -975,6 +1017,8 @@ pub struct InvalidationStats {
     pub transition_styles_computed: u64,
     /// Element styles transition snapshots carried over from the previous snapshot.
     pub transition_styles_reused: u64,
+    /// Snapshot styles taken from the layout's retained styles instead of computed.
+    pub transition_styles_from_layout: u64,
     /// Stylesheet graphs and texts parsed, and reused from an earlier parse
     /// by a rules rebuild or an installation check.
     pub stylesheets_parsed: u64,
@@ -1039,6 +1083,48 @@ impl ReadDirty {
     }
 }
 
+/// Nodes reachable from the document root; detached subtrees stay live in the
+/// arena while scripts hold them, so `node_count` does not shrink on removal.
+fn connected_node_count(document: &Document) -> usize {
+    let mut count = 0;
+    let mut stack = alloc::vec![document.root()];
+    while let Some(node) = stack.pop() {
+        count += 1;
+        let mut child = document.first_child(node).ok().flatten();
+        while let Some(id) = child {
+            stack.push(id);
+            child = document.next_sibling(id).ok().flatten();
+        }
+    }
+    count
+}
+
+const SNAPSHOT_LEAN_MIN_NODES:usize=512;
+
+/// Which elements of a large document's snapshot need effect provenance.
+struct LeanScope {
+    keep:alloc::collections::BTreeSet<u128>,
+    effects:alloc::collections::BTreeSet<u128>,
+    heavy:alloc::collections::BTreeSet<u128>,
+}
+
+impl LeanScope {
+    fn hinted(&self,node:NodeId,parent:Option<NodeId>)->bool {
+        self.keep.contains(&node.key()) || self.effects.contains(&node.key()) || parent.is_some_and(|parent|self.heavy.contains(&parent.key()))
+    }
+
+    fn wants(&self,node:NodeId,parent:Option<NodeId>,style:&Style)->bool {
+        self.hinted(node,parent) || style_declares_effect(style)
+    }
+}
+
+/// Whether a style can start a transition or animation.
+fn style_declares_effect(style:&Style)->bool {
+    let nonzero=|times:&Option<Arc<[css::typed_numeric::NumericValue]>>|times.as_deref().is_some_and(|times|times.iter().any(|time|time.value!=0.0));
+    nonzero(&style.transition_duration) || nonzero(&style.transition_delay)
+        || style.animation[0].as_deref().is_some_and(|names|names.split(',').any(|name|{let name=name.trim();!name.is_empty() && !name.eq_ignore_ascii_case("none")}))
+}
+
 /// The document version, text shaper and effect state of the last whole
 /// document transition snapshot, which the next one can build on.
 #[derive(Clone, Copy, PartialEq)]
@@ -1068,6 +1154,18 @@ fn inline_style_declares_transition(document: &Document, node: NodeId) -> bool {
     attributes.iter().any(|(key, value)| key.as_str().eq_ignore_ascii_case("style") && {
         let style: &str = value;
         ["transition", "animation"].iter().any(|word| style.as_bytes().windows(word.len()).any(|window| window.eq_ignore_ascii_case(word.as_bytes())))
+    })
+}
+
+/// Like `inline_style_declares_transition`, and an `all` declaration, which can
+/// inherit a transition.
+fn inline_style_may_transition(document: &Document, node: NodeId) -> bool {
+    if inline_style_declares_transition(document, node) { return true; }
+    let Ok(NodeKind::Element { attributes, .. }) = document.kind(node) else { return false };
+    attributes.iter().any(|(key, value)| key.as_str().eq_ignore_ascii_case("style") && {
+        let style = value.as_bytes();
+        style.windows(3).enumerate().any(|(at, window)| window.eq_ignore_ascii_case(b"all")
+            && style[at + 3..].iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b':'))
     })
 }
 
@@ -1172,6 +1270,18 @@ pub struct RetainedOverflowClip {
     pub corners: Option<[[f32; 2]; 4]>,
     pub radius: f32,
     pub transforms: Vec<Affine>,
+}
+
+struct StylesheetInstall {
+    previous_disabled: bool,
+    source_index: Option<usize>,
+    previous: Option<layout::LoadedStylesheet>,
+    linked_index: Option<usize>,
+    previous_linked: Option<(NodeId, String, String)>,
+    previous_overrides: Vec<css::RuleDeclarationOverride>,
+    previous_topologies: Vec<css::RuleTopologyOverride>,
+    overlay_index: Option<usize>,
+    previous_overlay: Option<layout::CssomStylesheetText>,
 }
 
 impl RenderSession {
@@ -1290,6 +1400,9 @@ impl RenderSession {
             forced_layout:false,
             timeline_layout_stale:false,
             rejected_transition_snapshot: None,
+            rejected_snapshot_size: None,
+            rejected_sparse_epoch: None,
+            effects_wait_for_first_render: false,
             animation_generation: 0,
             animation_epoch: 0,
             pending_animation_nodes: Vec::new(),
@@ -1312,8 +1425,11 @@ impl RenderSession {
             snapshot_noted_version: 0,
             snapshot_rule_subjects: Vec::new(),
             snapshot_rules_unbounded: true,
+            snapshot_effect_nodes: alloc::collections::BTreeSet::new(),
+            snapshot_effects_unbounded: false,
             held_snapshot_stale: None,
             transition_declarations: None,
+            transition_candidates: None,
             inline_transition_scan: None,
             inline_transition_seen: false,
             layout_stale: false,
@@ -1322,7 +1438,13 @@ impl RenderSession {
             frame_damage: None,
             invalidation_stats: InvalidationStats::default(),
             stylesheet_parses: css::StylesheetParseCache::default(),
+            rule_stamps: Vec::new(),
+            #[cfg(test)]
+            rule_extensions: 0,
+            #[cfg(test)]
+            prefix_collects: 0,
             previous_rules: None,
+            style_parallelism: None,
             rule_subjects: None,
             rules_reset: false,
             svg_use_cache: Cell::new(None),
@@ -1335,6 +1457,16 @@ impl RenderSession {
     /// Host invalidation includes paint changes that do not mutate the DOM.
     pub fn paint_revision(&self) -> u64 {
         self.paint_revision
+    }
+
+    /// Install a fork-join provider so style resolution can run on several threads.
+    ///
+    /// # Safety
+    ///
+    /// See `css::StyleParallelism`.
+    pub unsafe fn set_style_parallelism(&mut self, parallelism: Option<Arc<dyn css::StyleParallelism>>) {
+        if let Some(rules) = self.rules.as_mut() { unsafe { rules.set_parallelism(parallelism.clone()); } }
+        self.style_parallelism = parallelism;
     }
 
     pub fn set_highlights(&mut self, mut highlights: Vec<crate::highlights::Highlight>) {
@@ -1594,7 +1726,7 @@ impl RenderSession {
             // An arrival that sizes boxes changes only the boxes around its
             // elements; retained fragments elsewhere stay valid.
             self.discard_frame();
-            self.layout_cache.invalidate_changed(&self.document, &nodes, &[], &[]);
+            self.layout_cache.invalidate_changed(&self.document, &nodes, &[], &[], &|_| false);
             self.paint_revision = self.paint_revision.wrapping_add(1);
             self.frame_id = self.frame_id.wrapping_add(1);
             return Vec::new();
@@ -1845,6 +1977,7 @@ impl RenderSession {
         self.origin_refused = false;
         self.window_reduced = None;
         self.rules = None;
+        self.previous_rules = None;
         self.invalidate_paint();
         self.frame_id = self.frame_id.wrapping_add(1);
     }
@@ -1857,6 +1990,77 @@ impl RenderSession {
         node: NodeId,
         source: Option<css::StylesheetSource>,
     ) -> Result<(), LayoutError> {
+        let Some(install) = self.install_stylesheet_source(node, source)? else { return Ok(()); };
+        if let Err(error) = self.refresh_rules() {
+            self.rollback_stylesheet_install(node, install);
+            self.rules = None;
+            let _ = self.refresh_rules();
+            return Err(error);
+        }
+        self.finish_stylesheet_install(node, install);
+        Ok(())
+    }
+
+    /// Hands in the result of [`css::parse_graph`] on `source`, computed off
+    /// the session's thread. A later install of an equal source then finds
+    /// its parse in the cache instead of parsing again.
+    pub fn insert_preparsed_stylesheet(&mut self, source: &css::StylesheetSource, parsed: css::ParsedStylesheets) {
+        self.stylesheet_parses.insert_graph(source, parsed);
+    }
+
+    /// Install several stylesheet sources with one rules refresh. Each entry
+    /// has the semantics of `set_stylesheet_source`; if the combined refresh
+    /// fails, every install is rolled back and replayed one at a time so the
+    /// error lands on the sheet that caused it.
+    pub fn set_stylesheet_sources(
+        &mut self,
+        batch: Vec<(NodeId, Option<css::StylesheetSource>)>,
+    ) -> Vec<Result<(), LayoutError>> {
+        if batch.len() <= 1 {
+            return batch.into_iter().map(|(node, source)| self.set_stylesheet_source(node, source)).collect();
+        }
+        let replay: Vec<(NodeId, Option<css::StylesheetSource>)> = batch.clone();
+        let mut results: Vec<Result<(), LayoutError>> = Vec::with_capacity(batch.len());
+        let mut installs: Vec<(usize, NodeId, StylesheetInstall)> = Vec::new();
+        for (position, (node, source)) in batch.into_iter().enumerate() {
+            match self.install_stylesheet_source(node, source) {
+                Ok(Some(install)) => {
+                    installs.push((position, node, install));
+                    results.push(Ok(()));
+                }
+                Ok(None) => results.push(Ok(())),
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        if installs.is_empty() {
+            return results;
+        }
+        if self.refresh_rules().is_ok() {
+            for (_, node, install) in installs {
+                self.finish_stylesheet_install(node, install);
+            }
+            return results;
+        }
+        let positions: Vec<usize> = installs.iter().map(|(position, _, _)| *position).collect();
+        while let Some((_, node, install)) = installs.pop() {
+            self.rollback_stylesheet_install(node, install);
+        }
+        self.rules = None;
+        let _ = self.refresh_rules();
+        let mut replay: Vec<Option<(NodeId, Option<css::StylesheetSource>)>> = replay.into_iter().map(Some).collect();
+        for position in positions {
+            if let Some((node, source)) = replay[position].take() {
+                results[position] = self.set_stylesheet_source(node, source);
+            }
+        }
+        results
+    }
+
+    fn install_stylesheet_source(
+        &mut self,
+        node: NodeId,
+        source: Option<css::StylesheetSource>,
+    ) -> Result<Option<StylesheetInstall>, LayoutError> {
         self.reclaim_stale_stylesheet_sources();
         let previous_disabled = self.stylesheet_disabled(node);
         let source_index = self.stylesheet_sources.iter().position(|loaded| loaded.owner == node);
@@ -1871,14 +2075,14 @@ impl RenderSession {
             },
         };
         if source_index.map(|index| &self.stylesheet_sources[index].source) == source.as_ref()
-            && source_index.is_none_or(|index| self.stylesheet_sources[index].identity == identity) && linked_unchanged { return Ok(()); }
+            && source_index.is_none_or(|index| self.stylesheet_sources[index].identity == identity) && linked_unchanged { return Ok(None); }
         if let Some(source) = &source {
             if let layout::StylesheetIdentity::Inline(text) = &identity {
                 if source.text.as_ref() != text {
                     return Err(LayoutError::InvalidTree);
                 }
             }
-            self.stylesheet_parses.parse_graph(source, self.media_environment(), None, &[]).map_err(LayoutError::Css)?;
+            self.stylesheet_parses.ensure_graph(source, self.media_environment()).map_err(LayoutError::Css)?;
         }
         if source.is_some() { self.stylesheet_sources.try_reserve(1).map_err(|_| LayoutError::InvalidTree)?; }
         let next_linked = match (&identity, &source) { (layout::StylesheetIdentity::Link(href), Some(source)) => Some((node, href.clone(), String::from(source.text.as_ref()))), _ => None };
@@ -1901,19 +2105,39 @@ impl RenderSession {
         if let Some(linked) = next_linked { self.linked_stylesheets.push(linked); }
         if let Some(source) = source { self.stylesheet_sources.push(layout::LoadedStylesheet { owner: node, identity, source, link_state: None, metadata: None }); }
         // CSSOM edits of the replaced sheet are not in its rules' sources.
-        self.previous_rules = self.rules.take().filter(|_| previous_overrides.is_empty() && previous_topologies.is_empty() && previous_overlay.is_none());
-        if let Err(error) = self.refresh_rules() {
-            self.stylesheet_sources.retain(|loaded| loaded.owner != node);
-            self.linked_stylesheets.retain(|(owner, _, _)| *owner != node);
-            if let (Some(index), Some(previous)) = (source_index, previous) { self.stylesheet_sources.insert(index, previous); }
-            if let (Some(index), Some(previous)) = (linked_index, previous_linked) { self.linked_stylesheets.insert(index, previous); }
-            self.cssom_rule_overrides.extend(previous_overrides);
-            self.cssom_topology_overrides.extend(previous_topologies);
-            if let (Some(index), Some(previous)) = (overlay_index, previous_overlay) { self.cssom_stylesheet_texts.insert(index, previous); }
+        if previous_overrides.is_empty() && previous_topologies.is_empty() && previous_overlay.is_none() {
+            self.stash_rules();
+        } else {
             self.rules = None;
-            let _ = self.refresh_rules();
-            return Err(error);
+            self.previous_rules = None;
         }
+        Ok(Some(StylesheetInstall {
+            previous_disabled,
+            source_index,
+            previous,
+            linked_index,
+            previous_linked,
+            previous_overrides,
+            previous_topologies,
+            overlay_index,
+            previous_overlay,
+        }))
+    }
+
+    fn rollback_stylesheet_install(&mut self, node: NodeId, install: StylesheetInstall) {
+        let StylesheetInstall { source_index, previous, linked_index, previous_linked, previous_overrides, previous_topologies, overlay_index, previous_overlay, .. } = install;
+        self.stylesheet_sources.retain(|loaded| loaded.owner != node);
+        self.linked_stylesheets.retain(|(owner, _, _)| *owner != node);
+        if let (Some(index), Some(previous)) = (source_index, previous) { self.stylesheet_sources.insert(index, previous); }
+        if let (Some(index), Some(previous)) = (linked_index, previous_linked) { self.linked_stylesheets.insert(index, previous); }
+        self.cssom_rule_overrides.extend(previous_overrides);
+        self.cssom_topology_overrides.extend(previous_topologies);
+        if let (Some(index), Some(previous)) = (overlay_index, previous_overlay) { self.cssom_stylesheet_texts.insert(index, previous); }
+        self.rules = None;
+    }
+
+    fn finish_stylesheet_install(&mut self, node: NodeId, install: StylesheetInstall) {
+        let StylesheetInstall { previous_disabled, previous, previous_linked, previous_overlay, .. } = install;
         let replacing = previous.is_some() || previous_linked.is_some() || previous_overlay.is_some();
         if replacing {
             let token = self.stylesheet_change_tokens.iter().find(|(owner, _)| *owner == node).and_then(|(_, token)| token.upgrade());
@@ -1931,7 +2155,6 @@ impl RenderSession {
         }
         self.invalidate_for_rules();
         self.frame_id = self.frame_id.wrapping_add(1);
-        Ok(())
     }
 
     /// Update applicability without replacing the sheet or its CSSOM source epoch.
@@ -2365,6 +2588,7 @@ impl RenderSession {
         let linked_index = self.linked_stylesheets.iter().position(|(owner, _, _)| *owner == node);
         let previous_linked = linked_index.map(|index| core::mem::replace(&mut self.linked_stylesheets[index].2, String::from(text.as_ref())));
         self.rules = None;
+        self.previous_rules = None;
         if let Err(error) = self.refresh_rules() {
             if let Some(index) = index { self.cssom_stylesheet_texts[index] = previous.unwrap(); } else { self.cssom_stylesheet_texts.pop(); }
             if let (Some(index), Some(previous)) = (linked_index, previous_linked) { self.linked_stylesheets[index].2 = previous; }
@@ -2750,6 +2974,7 @@ impl RenderSession {
         self.cssom_rule_overrides = overrides;
         self.cssom_topology_overrides = topologies;
         self.rules = None;
+        self.previous_rules = None;
         self.style_cache.borrow_mut().clear();
         self.read_style_cache.clear();
         self.read_style_key = None;
@@ -2827,7 +3052,7 @@ impl RenderSession {
         if sources==self.adopted_stylesheets {return Ok(());}
         for (scope,sheets) in &sources {for sheet in sheets {css::parse_scoped(&sheet.text,*scope).map_err(LayoutError::Css)?;}}
         let previous=core::mem::replace(&mut self.adopted_stylesheets,sources);
-        self.rules=None;
+        self.stash_rules();
         if let Err(error)=self.refresh_rules() {self.adopted_stylesheets=previous;self.rules=None;let _=self.refresh_rules();return Err(error);}
         self.invalidate_paint();self.frame_id+=1;Ok(())
     }
@@ -2864,6 +3089,13 @@ impl RenderSession {
             }
             changed_declarations_paint_only(previous, &declarations)
         };
+        if self.snapshot_basis.is_some() && !self.snapshot_effects_unbounded {
+            self.snapshot_effect_nodes.insert(node.key());
+            if self.snapshot_effect_nodes.len()>4096 {
+                self.snapshot_effect_nodes.clear();
+                self.snapshot_effects_unbounded=true;
+            }
+        }
         match position {
             Some(index) if declarations.is_empty() => { self.animated_styles.remove(index); },
             Some(index) => self.animated_styles[index].3 = declarations.clone(),
@@ -2944,8 +3176,10 @@ impl RenderSession {
             self.reset_read_style_cache();
             return;
         }
+        let tree_changed = self.read_dirty.tree_changed;
         let dependent = self.read_style_cache.nodes_with_style(|style| {
             style.has_query_container_dependencies() || style.has_inherited_query_container_dependencies()
+                || tree_changed && style.sibling_position_dependent
         });
         let Some(dependent) = dependent else {
             self.reset_read_style_cache();
@@ -3191,6 +3425,19 @@ impl RenderSession {
         })
     }
 
+    /// Makes CSS transitions and animations wait for the first rendered frame.
+    /// Before it no element has been displayed, so a host that paints the page
+    /// itself can skip the before-change snapshot, which styles the elements
+    /// effects can reach a second time, on the way to its first frame.
+    pub fn defer_effects_until_first_render(&mut self) {
+        self.effects_wait_for_first_render = self.cached.is_none();
+    }
+
+    /// Whether CSS effects still wait for the first rendered frame.
+    pub fn effects_wait_for_first_render(&self) -> bool {
+        self.effects_wait_for_first_render
+    }
+
     /// Whether a style change could start a transition or animation: installed
     /// effect samples, a rule that sets a transition or animation property or an
     /// `@keyframes`, or an inline style that mentions one. When this is false the
@@ -3303,9 +3550,18 @@ impl RenderSession {
                 None => {recent.insert(0,input.style.clone());recent.truncate(RECENT_STYLES);}
             }
         }
-        let style_bytes=if charged.contains(&(Arc::as_ptr(&input.style) as usize)) {Some(0)} else {layout::checked_style_retained_bytes(&input.style)};
+        // Descendants share the custom property map and every element shares
+        // the registration list, so each allocation is charged once.
+        fn shared(charged:&mut alloc::collections::BTreeSet<usize>,payload:Option<(usize,usize)>)->usize {
+            payload.map_or(0,|(address,bytes)|if charged.insert(address) {0} else {bytes})
+        }
+        let style_bytes=if charged.contains(&(Arc::as_ptr(&input.style) as usize)) {Some(0)} else {
+            let repeated=shared(charged,input.style.shared_custom_payload());
+            layout::checked_style_retained_bytes(&input.style).and_then(|bytes|bytes.checked_sub(repeated))
+        };
+        let repeated=shared(charged,input.eligibility.shared_registration_payload());
         let charge=style_bytes.and_then(|bytes|
-            input.eligibility.checked_retained_bytes().and_then(|eligibility|bytes.checked_add(eligibility)))
+            input.eligibility.checked_retained_bytes().and_then(|eligibility|eligibility.checked_sub(repeated)).and_then(|eligibility|bytes.checked_add(eligibility)))
             .ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?;
         let payload=payload_bytes.checked_add(charge).ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?;
         let capacity=if nodes.len()==nodes.capacity() {nodes.capacity().max(4).checked_mul(2).ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?}else{nodes.capacity()};
@@ -3336,6 +3592,19 @@ impl RenderSession {
     /// elements below one whose style changed, are styled again; every other
     /// element keeps its earlier style and eligibility.
     pub fn transition_snapshot_after(&mut self,text:Option<&dyn TextShaper>,previous:Option<&Arc<TransitionSnapshot>>)->Result<Arc<TransitionSnapshot>,LayoutError> {
+        self.capture_snapshot_after(text,previous,None)
+    }
+
+    /// Like `transition_snapshot_after`, but a large document is captured only
+    /// for the elements that a rule, an inline style or `keep` (the targets of
+    /// running or completed transitions) lets start a transition or animation,
+    /// and their ancestors. Every other element keeps its initial transition
+    /// and animation values, so it has no entry and starts nothing.
+    pub fn transition_snapshot_sparse(&mut self,text:Option<&dyn TextShaper>,previous:Option<&Arc<TransitionSnapshot>>,keep:&[NodeId])->Result<Arc<TransitionSnapshot>,LayoutError> {
+        self.capture_snapshot_after(text,previous,Some(keep))
+    }
+
+    fn capture_snapshot_after(&mut self,text:Option<&dyn TextShaper>,previous:Option<&Arc<TransitionSnapshot>>,keep:Option<&[NodeId]>)->Result<Arc<TransitionSnapshot>,LayoutError> {
         let epoch=self.transition_input_epoch()?;
         let key=(epoch,text.map(TextShaper::generation),self.paint_revision);
         if self.rejected_transition_snapshot.as_deref()==Some(&key) {
@@ -3348,19 +3617,99 @@ impl RenderSession {
         // Allocation/parse/text failures remain retryable; admission checks
         // alone set this flag, so an unchanged oversized tree is walked once.
         let mut quota_exceeded=false;
-        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None,base.as_ref());
+        if keep.is_none() && self.rejected_sparse_epoch==Some(epoch) {
+            self.rejected_transition_snapshot=Some(Box::new(key));
+            return Err(LayoutError::CommandLimit);
+        }
+        let only=match keep {Some(keep)=>self.snapshot_candidates(keep)?,None=>None};
+        let size=(only.is_some(),only.as_ref().map_or_else(||connected_node_count(&self.document),Vec::len),epoch.environment);
+        if self.rejected_snapshot_size.is_some_and(|(sparse,planned,environment)|sparse==size.0 && size.1>=planned && environment==size.2) {
+            self.rejected_transition_snapshot=Some(Box::new(key));
+            return Err(LayoutError::CommandLimit);
+        }
+        let result=self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,None,None,base.as_ref(),only.as_deref(),keep);
         self.rejected_transition_snapshot=if quota_exceeded {Some(Box::new(key))} else {None};
+        if quota_exceeded {
+            self.rejected_snapshot_size=Some(size);
+            if only.is_some() {self.rejected_sparse_epoch=Some(epoch);}
+        }
+        else if result.is_ok() {self.rejected_snapshot_size=None;}
         if result.is_ok() {
             self.snapshot_basis=Some(basis);
             self.snapshot_dirty=ReadDirty::default();
             self.snapshot_noted_version=basis.version;
             self.snapshot_rule_subjects.clear();
             self.snapshot_rules_unbounded=false;
+            self.snapshot_effect_nodes.clear();
+            self.snapshot_effects_unbounded=false;
             self.held_snapshot_stale=None;
             if incremental {self.invalidation_stats.transition_snapshots_incremental+=1;}
             else {self.invalidation_stats.transition_snapshots_full+=1;}
         }
         result
+    }
+
+    /// The elements, in document order, a sparse snapshot covers: those a
+    /// transition- or animation-declaring rule or an inline style can reach,
+    /// the `keep` targets, and every ancestor of those. `None` captures the
+    /// whole document: it is small, effect samples are installed, or a rule
+    /// reaches elements that cannot be named.
+    fn snapshot_candidates(&mut self,keep:&[NodeId])->Result<Option<Vec<NodeId>>,LayoutError> {
+        const SPARSE_MIN_NODES:usize=512;
+        if self.document.node_count()<=SPARSE_MIN_NODES || self.rules.as_ref().is_none_or(css::StyleIndex::has_effect_declarations) {return Ok(None);}
+        let Some(candidates)=self.cached_transition_candidates() else {return Ok(None)};
+        let rules=self.rules.as_ref().ok_or(LayoutError::InvalidTree)?;
+        let document=&self.document;
+        let root=document.root();
+        let keep:alloc::collections::BTreeSet<u128>=keep.iter().map(|node|node.key()).collect();
+        let mut elements=Vec::new();
+        let mut included=alloc::collections::BTreeSet::new();
+        let mut cursor=Some(root);
+        while let Some(node)=cursor {
+            if matches!(document.kind(node),Ok(NodeKind::Element{..})) {
+                elements.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                elements.push(node);
+                if keep.contains(&node.key()) || inline_style_may_transition(document,node) || candidates.matches(rules,document,node) {
+                    let mut current=Some(node);
+                    while let Some(id)=current {
+                        if !included.insert(id.key()) {break;}
+                        current=document.composed_parent(id).map_err(|_|LayoutError::InvalidTree)?;
+                    }
+                }
+            }
+            cursor=crate::selector::next_shadow_including_descendant(document,root,node).map_err(|_|LayoutError::InvalidTree)?;
+        }
+        elements.retain(|node|included.contains(&node.key()));
+        Ok(Some(elements))
+    }
+
+    fn cached_transition_candidates(&mut self)->Option<Arc<css::TransitionCandidates>> {
+        let generation=(self.rules_generation,self.rules.as_ref().map_or_else(Default::default,|rules|rules.environment));
+        if let Some((cached,found))=&self.transition_candidates {
+            if *cached==generation {return found.clone();}
+        }
+        let found=self.rules.as_ref().and_then(css::StyleIndex::transition_candidates).map(Arc::new);
+        self.transition_candidates=Some((generation,found.clone()));
+        found
+    }
+
+    /// An appended stylesheet leaves the earlier rules as they were, so what
+    /// was derived from them for the previous generation extends to the new one.
+    fn extend_transition_caches(&mut self,previous:u64,from:usize) {
+        let Some(rules)=self.rules.as_ref() else {return};
+        let generation=self.rules_generation;
+        if let Some((cached,declared))=self.transition_declarations {
+            if cached==previous {self.transition_declarations=Some((generation,declared || rules.declares_transitions_from(from)));}
+        }
+        if let Some((key,found))=self.transition_candidates.take() {
+            if key.0==previous && key.1==rules.environment {
+                let extended=match found {
+                    None=>Some(None),
+                    Some(found)=>if found.rules_len()==from {Some(rules.extend_transition_candidates((*found).clone(),from).map(Arc::new))} else {None},
+                };
+                if let Some(extended)=extended {self.transition_candidates=Some(((generation,rules.environment),extended));}
+            }
+        }
     }
 
     /// What `previous` still gives the next snapshot, or `None` when it must
@@ -3370,7 +3719,7 @@ impl RenderSession {
     fn snapshot_extension<'a>(&mut self,previous:&'a Arc<TransitionSnapshot>,epoch:&TransitionInputEpoch,basis:SnapshotBasis)->Option<SnapshotBase<'a>> {
         let held=self.snapshot_basis?;
         if held.version!=previous.epoch.document_version || held.text_generation!=basis.text_generation
-            || held.had_effects || basis.had_effects
+            || held.had_effects!=basis.had_effects || basis.had_effects && self.snapshot_effects_unbounded
             || !(previous.epoch.differs_only_in_document(epoch)
                 || !self.snapshot_rules_unbounded && previous.epoch.differs_only_in_document_and_rules(epoch)) {return None;}
         let tree_changed=self.snapshot_dirty.tree_changed
@@ -3393,7 +3742,7 @@ impl RenderSession {
         }
         Some(SnapshotBase{previous,ranges,
             dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key()).collect(),
-            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
+            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).chain(self.snapshot_effect_nodes.iter().copied()).collect()})
     }
 
     /// Capture current effect-underlying author provenance only for the supplied
@@ -3431,19 +3780,34 @@ impl RenderSession {
             if let Some(pseudo)=pseudo{*selection.selected.get_mut(&node.key()).ok_or(LayoutError::InvalidTree)?|=1u16<<(pseudo as u8);}
         }
         let mut quota_exceeded=false;
-        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection),None,None)
+        self.capture_transition_snapshot_with_text(text,epoch,&mut quota_exceeded,Some(&selection),None,None,None,None)
     }
 
     fn capture_transition_snapshot_with_text(&mut self,text:Option<&dyn TextShaper>,epoch:TransitionInputEpoch,
         quota_exceeded:&mut bool,selection:Option<&EffectStyleSelection>,completed_geometry:Option<&layout::LayoutGeometry>,
-        base:Option<&SnapshotBase>)->Result<Arc<TransitionSnapshot>,LayoutError> {
-
+        base:Option<&SnapshotBase>,only:Option<&[NodeId]>,keep:Option<&[NodeId]>)->Result<Arc<TransitionSnapshot>,LayoutError> {
+        // A large document under the refresh path keeps effect provenance only
+        // for elements that declare a transition or animation, are the target of
+        // a running or completed one or of an installed effect, and everything
+        // below them. Replaying an old style reads it for no other element.
+        let lean=selection.is_none() && keep.is_some() && self.document.node_count()>SNAPSHOT_LEAN_MIN_NODES;
+        let candidates=if lean {self.cached_transition_candidates()} else {None};
+        let mut lean_scope=lean.then(||LeanScope {
+            keep:keep.unwrap_or_default().iter().map(|node|node.key()).collect(),
+            effects:self.animated_styles.iter().map(|(node,..)|node.key()).collect(),
+            heavy:alloc::collections::BTreeSet::new(),
+        });
         let rules=self.rules.as_ref().expect("stylesheets initialized");
         let geometry=completed_geometry.or_else(||self.cached.as_ref().map(|frame| &frame.geometry));
         let mut cache=match selection {Some(selection)=>css::StyleCache::selected(&selection.nodes).ok_or(LayoutError::CommandLimit)?,None=>css::StyleCache::default()};
         let root=self.document.root();
         let mut selected_index=0;
-        let mut cursor=selection.map_or(Some(root),|selection|selection.nodes.first().copied());
+        let mut only_index=0;
+        let mut cursor=match (selection,only) {
+            (Some(selection),_)=>selection.nodes.first().copied(),
+            (None,Some(only))=>only.first().copied(),
+            (None,None)=>Some(root),
+        };
         let mut nodes=Vec::new();
         let mut payload_bytes=selection.map_or(0,|selection|selection.retained_bytes);
         let mut charged_styles=alloc::collections::BTreeSet::<usize>::new();
@@ -3452,6 +3816,8 @@ impl RenderSession {
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
         let mut forced_nodes=alloc::collections::BTreeSet::<u128>::new();
         let (mut computed_styles,mut reused_styles)=(0u64,0u64);
+        let layout_current=lean && self.layout_styles_current(text);
+        let mut layout_reused=0u64;
         // Replaying an old style needs provenance only for elements an effect
         // can reach: those that may run one and everything below them, or all
         // of them while samples are installed or a selection asks for it.
@@ -3483,7 +3849,9 @@ impl RenderSession {
                             Arc::ptr_eq(current,old) || **current==**old
                         }).map(|(current,_)|Some(current)),
                     };
-                    let unchanged=earlier[0].parent==inherited_parent && !earlier.iter().any(|input|
+                    let needs_provenance=lean_scope.as_ref().is_some_and(|scope|scope.wants(node,inherited_parent,&earlier[0].style));
+                    let provenance_missing=earlier[0].eligibility.is_light() && (lean_scope.is_none() || needs_provenance);
+                    let unchanged=!provenance_missing && earlier[0].parent==inherited_parent && !earlier.iter().any(|input|
                         input.style.has_query_container_dependencies() || input.style.has_inherited_query_container_dependencies()
                         );
                     if let (true,Some(parent))=(unchanged,parent) {
@@ -3504,6 +3872,7 @@ impl RenderSession {
                                 node,parent:input.pseudo.map_or(inherited_parent,|_|Some(node)),pseudo:input.pseudo,style:input.style.clone(),
                                 rendered:Cell::new(pseudo_rendered),eligibility:input.eligibility.clone()},quota_exceeded)?;
                         }
+                        if needs_provenance {if let Some(scope)=lean_scope.as_mut() {scope.heavy.insert(node.key());}}
                         reused_styles+=1;
                         carried=true;
                     }
@@ -3514,8 +3883,9 @@ impl RenderSession {
                 let mut ancestors=Vec::new();
                 let mut current=Some(node);
                 let mut parent=None;
+                let mut parent_key=None;
                 while let Some(id)=current {
-                    if let Some(style)=cache.node_style(id) { parent=Some(style); break; }
+                    if let Some(style)=cache.node_style(id) { parent=Some(style); parent_key=Some(id); break; }
                     if ancestors.len() >= 512 { return Err(LayoutError::DepthLimit); }
                     ancestors.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
                     ancestors.push(id);
@@ -3524,8 +3894,30 @@ impl RenderSession {
                 for id in ancestors.into_iter().rev() {
                     if !matches!(self.document.kind(id),Ok(NodeKind::Element{..})) { continue; }
                     let parent_rendered=parent.as_ref().is_none_or(|parent:&Arc<Style>|parent.display != css::Display::None);
-                    let (computed,eligible)=rules.compute_transition_snapshot_cached(&self.document,id,parent.as_deref(),None,text,
-                        &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?;
+                    let plain=match lean_scope.as_mut() {
+                        Some(scope) if !scope.hinted(id,parent_key)=>{
+                            let retained=if layout_current {self.style_cache.borrow().retained_style_under(id,parent.as_deref())} else {None};
+                            let plain=match retained {
+                                Some(style)=>{
+                                    rules.seed_transition_snapshot(&self.document,id,parent.as_deref(),text,&mut cache,&style).map_err(LayoutError::Css)?;
+                                    layout_reused+=1;
+                                    style
+                                },
+                                None=>rules.compute_transition_style_plain(&self.document,id,parent.as_deref(),text,&mut cache).map_err(LayoutError::Css)?,
+                            };
+                            if style_declares_effect(&plain) {None} else {Some((plain,css::EffectEligibility::light()))}
+                        },
+                        _=>None,
+                    };
+                    let (computed,eligible)=match plain {
+                        Some(plain)=>plain,
+                        None=>{
+                            if let Some(scope)=lean_scope.as_mut() {scope.heavy.insert(id.key());}
+                            rules.compute_transition_snapshot_cached(&self.document,id,parent.as_deref(),None,text,
+                                &mut cache,false).map_err(|error|Self::snapshot_style_error(error,quota_exceeded))?
+                        }
+                    };
+                    parent_key=Some(id);
                     parent=Some(computed); eligibility.insert(id.key(),eligible);
                     let ancestor_rendered=self.document.composed_parent(id).ok().flatten()
                         .and_then(|id|rendered_nodes.get(&id.key()).copied()).unwrap_or(parent_rendered);
@@ -3556,6 +3948,7 @@ impl RenderSession {
                         css::PseudoElement::ViewTransitionOld,css::PseudoElement::ViewTransitionNew] {
                         let requested=selection.is_some_and(|selection|selection.selected.get(&node.key()).is_some_and(|bits|bits&(1u16<<(pseudo as u8))!=0));
                         if selection.is_some()&&!requested{continue;}
+                        if candidates.as_ref().is_some_and(|found|!found.declares_pseudo(pseudo)) && !rules.has_effect_pseudo(pseudo) {continue;}
                         if selection.is_none()&&!matches!(pseudo,css::PseudoElement::Marker|css::PseudoElement::Before|css::PseudoElement::After|css::PseudoElement::BeforeMarker|css::PseudoElement::AfterMarker){continue;}
                         let generated_origin = pseudo.marker_origin().map(|parent| rules.compute_pseudo_cached(
                             &self.document, node, &style, parent, text, &mut cache)).transpose().map_err(LayoutError::Css)?.flatten();
@@ -3582,11 +3975,29 @@ impl RenderSession {
                 }
             }
             cursor=if let Some(selection)=selection{selected_index+=1;selection.nodes.get(selected_index).copied()}
+                else if let Some(only)=only{only_index+=1;only.get(only_index).copied()}
                 else{crate::selector::next_shadow_including_descendant(&self.document,root,node).map_err(|_|LayoutError::InvalidTree)?};
         }
         self.invalidation_stats.transition_styles_computed+=computed_styles;
         self.invalidation_stats.transition_styles_reused+=reused_styles;
+        self.invalidation_stats.transition_styles_from_layout+=layout_reused;
         Ok(Arc::new(TransitionSnapshot {epoch,nodes}))
+    }
+
+    /// Whether the layout style cache describes the current document, rules,
+    /// environment and effect samples, so a retained style of an element no
+    /// effect reaches equals its after-change style.
+    fn layout_styles_current(&self,text:Option<&dyn TextShaper>)->bool {
+        let version=self.document.version();
+        let Some(rules)=self.rules.as_ref() else {return false};
+        self.cached.as_ref().is_some_and(|frame|frame.document_version==version && frame.rules_generation==self.rules_generation)
+            && self.style_version==version
+            && !self.rules_reset && self.rule_subjects.is_none()
+            && !self.pending_animation_full && self.pending_animation_nodes.is_empty()
+            && self.style_environment==Some(rules.environment)
+            && self.validity_generation==self.document.validity_generation()
+            && self.interaction_generation==self.document.interaction_generation()
+            && self.style_cache.borrow().built_for_text(text)
     }
 
     pub fn transition_starting_style(&mut self,node:NodeId,pseudo:Option<css::PseudoElement>,
@@ -3683,7 +4094,7 @@ impl RenderSession {
                                 || added.is_some_and(|id| subtree_has_style(&self.document, id))
                                 || removed.is_some_and(|id| subtree_has_style(&self.document, id))
                         }
-                        MutationKind::Attribute(_) => in_style(&self.document, mutation.target),
+                        MutationKind::Attribute(name) => !inert_stylesheet_attribute(name.as_str()) && in_style(&self.document, mutation.target),
                     });
             if rules_changed {
                 self.animation_snapshot = None;
@@ -3693,21 +4104,75 @@ impl RenderSession {
                     .map(|rules| rules.environment)
                     .or(self.style_environment)
                     .unwrap_or_default();
+                let extendable = self.cssom_rule_overrides.is_empty() && self.animated_styles.is_empty();
+                let held = self.rules.as_ref().or(self.previous_rules.as_ref());
+                let prefix = held
+                    .filter(|index| extendable && !self.rule_stamps.is_empty() && index.can_extend(&self.document_base_url)
+                        && index.rule_count() == self.rule_stamps.iter().map(layout::SheetStamp::rules).sum::<usize>())
+                    .map(|_| self.rule_stamps.as_slice());
                 self.stylesheet_parses.begin_rebuild();
-                let (mut rules, mut font_faces) = layout::stylesheets_with_source_topologies(
+                let mut collected = layout::collect_stylesheets(
                     &self.document,
                     &self.linked_stylesheets,
                     &self.stylesheet_sources,
                     &self.adopted_stylesheets,
-                    self.document_base_url.clone(),
                     environment,
                     &self.cssom_topology_overrides,
                     &self.cssom_stylesheet_texts,
                     &self.disabled_stylesheets,
                     self.preferred_stylesheet_set.as_deref(),
                     &self.stylesheet_parses,
+                    prefix,
                 )?;
+                if prefix.is_some() && !collected.prefix_reused {
+                    collected = layout::collect_stylesheets(
+                        &self.document,
+                        &self.linked_stylesheets,
+                        &self.stylesheet_sources,
+                        &self.adopted_stylesheets,
+                        environment,
+                        &self.cssom_topology_overrides,
+                        &self.cssom_stylesheet_texts,
+                        &self.disabled_stylesheets,
+                        self.preferred_stylesheet_set.as_deref(),
+                        &self.stylesheet_parses,
+                        None,
+                    )?;
+                }
                 self.stylesheet_parses.finish_rebuild();
+                let mut previous = self.rules.take().or_else(|| self.previous_rules.take());
+                let mut appended = None;
+                let mut extended = None;
+                if extendable {
+                    if let Some(mut index) = previous.take() {
+                        if collected.prefix_reused {
+                            appended = Some(index.extend_tail_segmented(core::mem::take(&mut collected.rules), &collected.segments));
+                            extended = Some(index);
+                        } else {
+                            match index.extend_with_segments(core::mem::take(&mut collected.rules), &self.document_base_url, &collected.segments) {
+                                Ok(delta) => {
+                                    appended = Some(delta);
+                                    extended = Some(index);
+                                }
+                                Err(rules) => {
+                                    collected.rules = rules;
+                                    previous = Some(index);
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(test)]
+                {
+                    self.rule_extensions += usize::from(appended.is_some());
+                    self.prefix_collects += usize::from(collected.prefix_reused);
+                }
+                self.rule_stamps = if collected.scoped || !extendable { Vec::new() } else { core::mem::take(&mut collected.stamps) };
+                let index = match extended {
+                    Some(index) => index,
+                    None => StyleIndex::new_with_segments(core::mem::take(&mut collected.rules), self.document_base_url.clone(), &collected.segments),
+                };
+                let (mut rules, mut font_faces) = layout::finish_style_index(index, collected, &self.document, self.document_base_url.clone(), environment)?;
                 rules.apply_cssom_rule_overrides(&self.cssom_rule_overrides).map_err(LayoutError::Css)?;
                 rules.environment = environment;
                 self.animated_styles
@@ -3733,22 +4198,27 @@ impl RenderSession {
                         }
                     }
                 }
-                let previous = self.rules.take().or_else(|| self.previous_rules.take());
                 let fonts_changed = font_faces != self.font_face_rules;
-                let subjects = previous
-                    .as_ref()
-                    .filter(|_| !self.rules_reset && !fonts_changed)
-                    .and_then(|previous| rules.changed_rule_subjects(previous, &self.document, &self.style_cache.borrow()));
+                let changed_subjects = |rules: &StyleIndex| match (&appended, &previous) {
+                    (Some(appended), _) => rules.appended_rule_subjects(appended, &self.document, &self.style_cache.borrow()),
+                    (None, Some(previous)) => rules.changed_rule_subjects(previous, &self.document, &self.style_cache.borrow()),
+                    (None, None) => None,
+                };
+                let subjects = if !self.rules_reset && !fonts_changed { changed_subjects(&rules) } else { None };
                 // Layout's own bookkeeping may already have given up on bounding the
                 // change; the transition snapshot keeps its own account.
                 let snapshot_subjects = if self.rules_reset && !fonts_changed && !self.snapshot_rules_unbounded {
-                    previous.as_ref().and_then(|previous| rules.changed_rule_subjects(previous, &self.document, &self.style_cache.borrow()))
+                    changed_subjects(&rules)
                 } else {
                     subjects.clone()
                 };
                 drop(previous);
+                let previous_generation = self.rules_generation;
+                // SAFETY: the host promised the `StyleParallelism` contract in `set_style_parallelism`.
+                unsafe { rules.set_parallelism(self.style_parallelism.clone()); }
                 self.rules = Some(rules);
                 self.rules_generation = self.rules_generation.wrapping_add(1);
+                if let Some(delta) = &appended { self.extend_transition_caches(previous_generation, delta.from); }
                 self.font_face_rules = font_faces;
                 self.font_face_generation = self.font_face_generation.wrapping_add(1);
                 if fonts_changed {
@@ -4720,7 +5190,7 @@ impl RenderSession {
             let changed=self.timeline_transform_values.is_some();self.timeline_transform_values=None;return Ok(changed);
         };
         let epoch=self.transition_input_epoch()?;let mut quota=false;
-        let source=self.capture_transition_snapshot_with_text(Some(text),epoch,&mut quota,None,Some(geometry),None)?;
+        let source=self.capture_transition_snapshot_with_text(Some(text),epoch,&mut quota,None,Some(geometry),None,None,None)?;
         let snapshot=self.animation_snapshot_from_transition(&source)?;
         let mut values=timelines::TransformTimelineValues::default();let mut changed=false;
         for input in sources.values.values() {
@@ -4772,6 +5242,12 @@ impl RenderSession {
     /// Bound the retained layout fragments by count and bytes.
     pub fn set_layout_budget(&mut self, max_entries: usize, max_bytes: usize) {
         self.layout_cache.set_budget(layout::RetainedLayoutBudget { max_entries, max_bytes });
+    }
+
+    /// Do not retain layout fragments of at most `commands` paint commands:
+    /// replaying them saves less than they cost to hold.
+    pub fn set_layout_min_fragment_commands(&mut self, commands: usize) {
+        self.layout_cache.set_min_commands(commands);
     }
 
     pub fn invalidation_stats(&self) -> InvalidationStats {
@@ -5138,7 +5614,10 @@ impl RenderSession {
             }
             // Stylesheet changes reach styles through the rules rebuild,
             // which kept the retained styles (`rules_reset` is clear).
-            if mutations.iter().any(|mutation| matches!(mutation.kind, MutationKind::FullRebuild)) {
+            if mutations.iter().any(|mutation| {
+                matches!(mutation.kind, MutationKind::FullRebuild)
+                    && !css::invalidation::shadow_host(&self.document, mutation.target)
+            }) {
                 self.invalidation_stats.bails[2] += 1;
                 return;
             }
@@ -5159,7 +5638,7 @@ impl RenderSession {
                         }
                     }
                     MutationKind::Tree { added, removed, .. } => structural.push((mutation.target, *added, *removed, false)),
-                    MutationKind::FullRebuild => {}
+                    MutationKind::FullRebuild => subtrees.push(mutation.target),
                 }
             }
         }
@@ -5206,6 +5685,8 @@ impl RenderSession {
                 return;
             }
         };
+        let custom_rebases = self.style_cache.borrow_mut().take_custom_rebases();
+        self.layout_cache.note_custom_rebases(custom_rebases);
         // Elements added without a box (`display: none`, such as a stylesheet
         // appended to `head`) have no retained style to compare with, but lay
         // out nothing.
@@ -5245,7 +5726,7 @@ impl RenderSession {
                 css::StyleDamage::Layout if fresh_hidden.contains(&node.key()) || hidden_new.contains(&node.key()) => {}
                 css::StyleDamage::Layout => changed.push(node),
                 css::StyleDamage::Paint => paint.push(node),
-                css::StyleDamage::None => {}
+                css::StyleDamage::Custom | css::StyleDamage::None => {}
             }
         }
         {
@@ -5285,7 +5766,10 @@ impl RenderSession {
         self.invalidation_stats.partial_restyles += 1;
         self.invalidation_stats.invalidated_styles += targets.len() as u64;
         if !changed.is_empty() || !subtrees.is_empty() || !paint.is_empty() {
-            self.layout_cache.invalidate_changed(&self.document, &changed, &subtrees, &paint);
+            let styles = self.style_cache.borrow();
+            let size_boundary = |node: NodeId| styles.node_style(node).is_some_and(|style| style.is_intrinsic_size_boundary());
+            self.layout_cache.invalidate_changed(&self.document, &changed, &subtrees, &paint, &size_boundary);
+            drop(styles);
             if !mutations_pending {
                 self.mark_layout_stale();
                 self.paint_revision = self.paint_revision.wrapping_add(1);
@@ -5429,6 +5913,7 @@ impl RenderSession {
             }
             self.failed_frame = None;
         }
+        self.effects_wait_for_first_render = false;
         Ok(&self.cached.as_ref().expect("cached after layout").list)
     }
 
@@ -5447,13 +5932,6 @@ impl RenderSession {
             height: height as f32,
             ..rules.environment
         };
-        let canvas_background=if self.canvas_background_is_default {
-            let environment=self.media_environment();
-            let scheme=if let Some(root)=crate::selector::document_element(&self.document) {
-                self.computed_style_with_text(root,Some(text))?.used_color_scheme(environment).scheme
-            }else {environment.color_schemes.page().scheme};
-            if self.embedding_color_scheme==Some(scheme) {None}else{css::color_scheme::system_color("canvas",scheme)}
-        }else {self.canvas_background};
         let rules = self.rules.as_ref().expect("stylesheets initialized");
         let only_text_mutations = !self.document.mutations().is_empty()
             && self.document.mutations().iter().all(|mutation| {
@@ -5566,6 +6044,21 @@ impl RenderSession {
             }
         }
         self.style_cache.borrow_mut().begin_frame();
+        rules.prestyle(&self.document, &mut self.style_cache.borrow_mut(), text);
+        // The root is usually prestyled already; computing it again through the read cache costs a
+        // full custom-property cascade on pages with large `:root` token sets.
+        let canvas_background=if self.canvas_background_is_default {
+            let environment=self.media_environment();
+            let root=crate::selector::document_element(&self.document);
+            let prestyled=root.and_then(|root| self.style_cache.borrow().node_entry(root).map(|(_, _, _, style)| style.used_color_scheme(environment).scheme));
+            let scheme=match (prestyled, root) {
+                (Some(scheme), _) => scheme,
+                (None, Some(root)) => self.computed_style_with_text(root,Some(text))?.used_color_scheme(environment).scheme,
+                (None, None) => environment.color_schemes.page().scheme,
+            };
+            if self.embedding_color_scheme==Some(scheme) {None}else{css::color_scheme::system_color("canvas",scheme)}
+        }else {self.canvas_background};
+        let rules = self.rules.as_ref().expect("stylesheets initialized");
         let style_epoch = self.style_cache.borrow().epoch();
         if self.intrinsic_style_epoch != Some(style_epoch) {
             self.layout_cache.clear_intrinsics();
@@ -5911,6 +6404,9 @@ fn document_has_svg_use(document: &Document) -> bool {
 }
 
 #[cfg(test)]
+mod parallel_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -6055,6 +6551,130 @@ mod tests {
         assert_eq!((rect.width,rect.height),(20.0,10.0),"source removal clears transform paint and geometry");
     }
 
+    fn sparse_snapshot_session(rules:&str,target:&str)->(RenderSession,NodeId) {
+        let document=crate::html::parse(&alloc::format!("<style>{rules}</style>{target}{}","<p><span>x</span></p>".repeat(400)),16_384).unwrap();
+        let node=crate::selector::query_selector(&document,document.root(),"#target").unwrap().unwrap();
+        (RenderSession::new(document),node)
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_computes_no_styles_when_nothing_declares_a_transition() {
+        let (mut session,_)=sparse_snapshot_session("#target{color:red}","<div id=target></div>");
+        let before=session.invalidation_stats().transition_styles_computed;
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.is_empty());
+        assert_eq!(session.invalidation_stats().transition_styles_computed,before);
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_covers_matched_elements_their_ancestors_and_running_targets() {
+        let (mut session,target)=sparse_snapshot_session(".x{transition:color 1s}","<div id=target class=x></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==target&&input.pseudo.is_none()));
+        assert!(snapshot.nodes.len()<10,"{} entries",snapshot.nodes.len());
+        let parent=snapshot.nodes.iter().find(|input|input.node==target).and_then(|input|input.parent).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==parent&&input.pseudo.is_none()));
+
+        let (mut session,target)=sparse_snapshot_session("#target{color:red}","<div id=target></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[target]).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==target));
+        assert!(snapshot.nodes.len()<10,"{} entries",snapshot.nodes.len());
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_takes_plain_styles_from_the_rendered_layout() {
+        let rules=".x{transition:color 1s} html,body{color:green;font-size:17px}";
+        let (mut rendered,_)=sparse_snapshot_session(rules,"<div id=target class=x></div>");
+        rendered.display_list(200,100,&NoText).unwrap();
+        let (mut fresh,_)=sparse_snapshot_session(rules,"<div id=target class=x></div>");
+        let from_layout=rendered.transition_snapshot_sparse(Some(&NoText),None,&[]).unwrap();
+        let computed=fresh.transition_snapshot_sparse(Some(&NoText),None,&[]).unwrap();
+        assert!(rendered.invalidation_stats().transition_styles_from_layout>0);
+        assert_eq!(fresh.invalidation_stats().transition_styles_from_layout,0);
+        assert_eq!(from_layout.nodes.len(),computed.nodes.len());
+        for (a,b) in from_layout.nodes.iter().zip(computed.nodes.iter()) {
+            assert!(a.pseudo==b.pseudo && *a.style==*b.style && a.eligibility.is_light()==b.eligibility.is_light());
+        }
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_ignores_layout_styles_after_a_mutation() {
+        let (mut session,target)=sparse_snapshot_session(".x{transition:color 1s} body{color:green} body.on{color:red}","<div id=target class=x></div>");
+        session.display_list(200,100,&NoText).unwrap();
+        let body=crate::selector::query_selector(session.document(),session.document().root(),"body").unwrap().unwrap();
+        session.document_mut().set_attribute(body,"class","on").unwrap();
+        let before=session.invalidation_stats().transition_styles_from_layout;
+        let snapshot=session.transition_snapshot_sparse(Some(&NoText),None,&[target]).unwrap();
+        assert_eq!(session.invalidation_stats().transition_styles_from_layout,before);
+        let styled=snapshot.nodes.iter().find(|input|input.node==body).unwrap();
+        assert_eq!(styled.style.color,Rgba{r:255,g:0,b:0,a:255});
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_keeps_var_inline_and_all_inheriting_declarations() {
+        for (rules,target) in [
+            (".x{--d:1s;transition:color var(--d)}","<div id=target class=x></div>"),
+            (".x{transition-duration:var(--d)}","<div id=target class=x></div>"),
+            (".x{all:inherit}","<div id=target class=x></div>"),
+            ("","<div id=target style=\"transition: color 1s\"></div>"),
+            ("","<div id=target style=\"ALL : inherit\"></div>"),
+        ] {
+            let (mut session,target)=sparse_snapshot_session(rules,target);
+            let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+            assert!(snapshot.nodes.iter().any(|input|input.node==target),"{rules}");
+            assert!(snapshot.nodes.len()<10,"{rules}: {} entries",snapshot.nodes.len());
+        }
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_keeps_provenance_only_for_declaring_elements_and_what_is_below_them() {
+        let (mut session,target)=sparse_snapshot_session("p{transition:color 1s}","<div id=target></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        let declaring:Vec<_>=snapshot.nodes.iter().filter(|input|input.pseudo.is_none() && input.style.transition_duration.is_some()).collect();
+        assert!(!declaring.is_empty());
+        assert!(declaring.iter().all(|input|!input.eligibility.is_light()),"declaring elements keep provenance");
+        let spans:Vec<_>=snapshot.nodes.iter().filter(|input|input.pseudo.is_none() && matches!(session.document().kind(input.node),Ok(NodeKind::Element{name,..}) if name=="span")).collect();
+        assert!(spans.iter().all(|input|!input.eligibility.is_light()),"descendants of a declaring element keep provenance");
+        let ancestors:Vec<_>=snapshot.nodes.iter().filter(|input|input.pseudo.is_none() && input.style.transition_duration.is_none()).collect();
+        assert!(!ancestors.is_empty() && ancestors.iter().all(|input|input.eligibility.is_light()),"ancestors that declare nothing carry none");
+        assert!(snapshot.nodes.iter().all(|input|input.node!=target));
+
+        let (mut session,target)=sparse_snapshot_session("#target{color:red}","<div id=target></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[target]).unwrap();
+        let kept=snapshot.nodes.iter().find(|input|input.node==target).unwrap();
+        assert!(!kept.eligibility.is_light(),"the target of a running transition keeps provenance");
+    }
+
+    #[test]
+    fn sparse_transition_snapshot_skips_pseudo_elements_no_transition_rule_reaches() {
+        let (mut session,target)=sparse_snapshot_session(".x{transition:color 1s}.x::before{content:'a'}","<div id=target class=x></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==target&&input.pseudo.is_none()));
+        assert!(snapshot.nodes.iter().all(|input|input.pseudo.is_none()),"a ::before that declares no transition has no entry");
+
+        let (mut session,target)=sparse_snapshot_session(".x{transition:color 1s}.x::before{content:'a';transition:color 1s}","<div id=target class=x></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==target&&input.pseudo==Some(css::PseudoElement::Before)));
+    }
+
+    #[test]
+    fn appended_stylesheet_extends_the_transition_candidates_instead_of_recomputing_them() {
+        let (mut session,target)=sparse_snapshot_session(".nothing{color:red}","<div id=target class=x></div>");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.is_empty());
+        let head=crate::selector::query_selector(session.document(),session.document().root(),"head").unwrap().unwrap();
+        let document=session.document_mut();
+        let style=document.create(NodeKind::Element{namespace:crate::Namespace::Html,name:"style".into(),attributes:Vec::new()}).unwrap();
+        document.append(head,style).unwrap();
+        let rules=document.create(NodeKind::Text(".x{transition:color 1s}".into())).unwrap();
+        document.append(style,rules).unwrap();
+        session.transition_input_epoch().unwrap();
+        let generation=session.rules_generation;
+        assert!(session.transition_candidates.as_ref().is_some_and(|(key,found)|key.0==generation && found.is_some()),"candidates follow the append");
+        let snapshot=session.transition_snapshot_sparse(None,None,&[]).unwrap();
+        assert!(snapshot.nodes.iter().any(|input|input.node==target&&input.pseudo.is_none()));
+    }
+
     #[test]
     fn specification_effect_underlying_snapshot_selects_ordered_lineage_and_requested_pseudos() {
         let document=crate::html::parse("<style>#parent{font-size:20px;color:red}#leaf{width:2em}#leaf::before{content:'x';color:blue}</style><section id=parent><div id=leaf></div><aside id=other></aside></section>",64).unwrap();
@@ -6115,6 +6735,22 @@ mod tests {
         assert!(recovered.nodes.iter().zip(&expected.nodes).all(|(actual,expected)|actual.pseudo==expected.pseudo && actual.was_rendered()==expected.was_rendered() && actual.style.display==expected.style.display && actual.style.font_size==expected.style.font_size && actual.style.color==expected.style.color));
     }
 
+
+    #[test]
+    fn specification_rejected_sparse_snapshot_refuses_whole_capture_without_styling() {
+        let source = alloc::format!("<style>div{{transition:opacity 1s}}</style><section>{}</section>",(0..8_000).map(|width|alloc::format!("<div style=\"width:{}px\"></div>",width+1)).collect::<String>());
+        let document = crate::html::parse(&source,24_000).unwrap();
+        let mut session = RenderSession::new(document);
+        assert!(matches!(session.transition_snapshot_sparse(None,None,&[]),Err(LayoutError::CommandLimit)));
+        assert!(session.rejected_sparse_epoch.is_some(),"the sparse capture was rejected by the budget");
+        let computed = session.invalidation_stats.transition_styles_computed;
+        assert!(matches!(session.transition_snapshot(),Err(LayoutError::CommandLimit)));
+        assert_eq!(session.invalidation_stats.transition_styles_computed,computed,"the whole capture styled nothing");
+        let section = crate::selector::query_selector(session.document(),session.document().root(),"section").unwrap().unwrap();
+        session.document_mut().set_attribute(section,"title","x").unwrap();
+        let epoch = session.transition_input_epoch().unwrap();
+        assert!(session.rejected_sparse_epoch!=Some(epoch),"a changed document retries");
+    }
 
     #[test]
     fn specification_used_color_scheme_meta_preferences_branches_and_inheritance() {
@@ -6405,6 +7041,137 @@ mod tests {
     }
 
     #[test]
+    fn batched_stylesheet_installs_equal_sequential_installs() {
+        let html = "<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><link id=c rel=stylesheet href=c.css><div class=box></div>";
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let sources = |nodes: [NodeId; 3]| vec![
+            (nodes[2], Some(sheet("https://x.test/c.css", ".box{height:4px}"))),
+            (nodes[0], Some(sheet("https://x.test/a.css", ".box{width:7px;height:3px}"))),
+            (nodes[1], Some(sheet("https://x.test/b.css", ".box{width:9px}"))),
+        ];
+        let find = |document: &Document, selector| crate::selector::query_selector(document, document.root(), selector).unwrap().unwrap();
+
+        let document = crate::html::parse(html, 32).unwrap();
+        let nodes = [find(&document, "#a"), find(&document, "#b"), find(&document, "#c")];
+        let target = find(&document, ".box");
+        let mut sequential = RenderSession::new(document);
+        for (node, source) in sources(nodes) { sequential.set_stylesheet_source(node, source).unwrap(); }
+
+        let document = crate::html::parse(html, 32).unwrap();
+        let nodes = [find(&document, "#a"), find(&document, "#b"), find(&document, "#c")];
+        let batched_target = find(&document, ".box");
+        let mut batched = RenderSession::new(document);
+        let results = batched.set_stylesheet_sources(sources(nodes));
+        assert!(results.iter().all(Result::is_ok));
+
+        let (left, right) = (sequential.computed_style(target).unwrap(), batched.computed_style(batched_target).unwrap());
+        assert_eq!((left.width, left.height), (right.width, right.height));
+        assert_eq!((right.width, right.height), (Some(9.0), Some(4.0)));
+        assert_eq!(sequential.stylesheet_sources.len(), batched.stylesheet_sources.len());
+        let linked = |session: &RenderSession| session.linked_stylesheets.iter().map(|(node, url, text)| (node.index, url.clone(), text.clone())).collect::<Vec<_>>();
+        assert_eq!(linked(&sequential), linked(&batched));
+    }
+
+    #[test]
+    fn layered_sheets_installed_in_document_order_equal_a_full_rebuild() {
+        let html = "<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><link id=c rel=stylesheet href=c.css><div class=box></div>";
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let texts = [
+            ("https://x.test/a.css", "@layer base, theme; @layer base{.box{width:1px;height:1px}} @layer theme{.box{width:2px}}"),
+            ("https://x.test/b.css", "@layer extra, base; @layer extra{.box{height:5px}} @layer base{.box{width:9px}} .box{margin-left:3px}"),
+            ("https://x.test/c.css", "@layer{.box{height:7px}} @layer theme{.box{height:8px}}"),
+        ];
+        let find = |document: &Document, selector| crate::selector::query_selector(document, document.root(), selector).unwrap().unwrap();
+        let run = |order: [usize; 3]| {
+            let document = crate::html::parse(html, 32).unwrap();
+            let nodes = [find(&document, "#a"), find(&document, "#b"), find(&document, "#c")];
+            let target = find(&document, ".box");
+            let mut session = RenderSession::new(document);
+            for at in order {
+                session.set_stylesheet_source(nodes[at], Some(sheet(texts[at].0, texts[at].1))).unwrap();
+                session.computed_style(target).unwrap();
+            }
+            let style = session.computed_style(target).unwrap();
+            (style.width, style.height, style.margin_sides)
+        };
+        assert_eq!(run([0, 1, 2]), run([2, 1, 0]));
+    }
+
+    #[test]
+    fn sheets_appended_in_document_order_extend_the_rules_and_equal_a_full_install() {
+        let html = "<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><link id=c rel=stylesheet href=c.css><link id=d rel=stylesheet href=d.css><div class=box></div>";
+        let sheet = |url: &str, text: &str, imports: Vec<css::LoadedImport>| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports };
+        let property = |initial: &str| alloc::format!("@property --w{{syntax:\"<length>\";inherits:false;initial-value:{initial}}}");
+        let c_text = "@import 'i.css';@media (min-width:1px){.box{height:7px}} @layer theme{.box{width:8px}}";
+        let sources = || {
+            let import = css::LoadedImport {
+                rule: css::imports(c_text).unwrap().remove(0),
+                source: Some(Box::new(sheet("https://x.test/i.css", ".box{margin-right:4px}", Vec::new()))),
+            };
+            [
+                sheet("https://x.test/a.css", "@layer base, theme; @layer base{.box{width:1px;height:1px}} .box{margin-top:2px}", Vec::new()),
+                sheet("https://x.test/b.css", &alloc::format!("{} .box{{margin-left:var(--w)}}", property("5px")), Vec::new()),
+                sheet("https://x.test/c.css", c_text, vec![import]),
+                sheet("https://x.test/d.css", &alloc::format!("{} .box{{margin-left:var(--w);margin-bottom:var(--w)}}", property("6px")), Vec::new()),
+            ]
+        };
+        let find = |document: &Document, selector| crate::selector::query_selector(document, document.root(), selector).unwrap().unwrap();
+        let nodes = |document: &Document| [find(document, "#a"), find(document, "#b"), find(document, "#c"), find(document, "#d")];
+
+        let document = crate::html::parse(html, 64).unwrap();
+        let (owners, target) = (nodes(&document), find(&document, ".box"));
+        let mut stepwise = RenderSession::new(document);
+        for (owner, source) in owners.into_iter().zip(sources()) {
+            stepwise.set_stylesheet_source(owner, Some(source)).unwrap();
+        }
+        let document = crate::html::parse(html, 64).unwrap();
+        let (owners, full_target) = (nodes(&document), find(&document, ".box"));
+        let mut full = RenderSession::new(document);
+        assert!(full.set_stylesheet_sources(owners.into_iter().zip(sources()).map(|(owner, source)| (owner, Some(source))).collect()).iter().all(Result::is_ok));
+
+        assert_eq!(stepwise.rule_extensions, 3);
+        assert_eq!(stepwise.prefix_collects, 3);
+        assert_eq!(full.rule_extensions, 0);
+        let (left, right) = (stepwise.computed_style(target).unwrap(), full.computed_style(full_target).unwrap());
+        assert_eq!((left.width, left.height, left.margin_sides), (right.width, right.height, right.margin_sides));
+        assert_eq!((right.width, right.height), (Some(8.0), Some(7.0)));
+    }
+
+    #[test]
+    fn a_changed_leading_sheet_is_not_skipped_when_collecting_rules() {
+        let html = "<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><div class=box></div>";
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let document = crate::html::parse(html, 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (a, b, target) = (find("#a"), find("#b"), find(".box"));
+        let mut session = RenderSession::new(document);
+        session.set_stylesheet_source(a, Some(sheet("https://x.test/a.css", ".box{width:1px}"))).unwrap();
+        session.set_stylesheet_source(a, Some(sheet("https://x.test/a.css", ".box{width:2px}"))).unwrap();
+        assert_eq!(session.computed_style(target).unwrap().width, Some(2.0));
+        session.set_stylesheet_source(b, Some(sheet("https://x.test/b.css", ".box{height:3px}"))).unwrap();
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(2.0), Some(3.0)));
+        assert_eq!(session.prefix_collects, 1);
+    }
+
+    #[test]
+    fn a_failing_sheet_in_a_batch_does_not_drop_the_others() {
+        let document = crate::html::parse("<link id=a rel=stylesheet href=a.css><style id=s>.box{width:1px}</style><link id=b rel=stylesheet href=b.css><div class=box></div>", 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (a, s, b, target) = (find("#a"), find("#s"), find("#b"), find(".box"));
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let mut session = RenderSession::new(document);
+        let results = session.set_stylesheet_sources(vec![
+            (a, Some(sheet("https://x.test/a.css", ".box{height:3px}"))),
+            (s, Some(sheet("https://x.test/s.css", ".box{width:99px}"))),
+            (b, Some(sheet("https://x.test/b.css", ".box{width:9px}"))),
+        ]);
+        assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(9.0), Some(3.0)));
+    }
+
+    #[test]
     fn stylesheet_installs_parse_only_the_new_or_edited_sheet() {
         let document = crate::html::parse("<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><div class=box></div>", 32).unwrap();
         let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
@@ -6427,6 +7194,33 @@ mod tests {
         session.set_stylesheet_source(a, Some(sheet("https://x.test/a.css", ".box{width:7px;height:5px}"))).unwrap();
         let style = session.computed_style(target).unwrap();
         assert_eq!((style.width, style.height), (Some(11.0), Some(5.0)), "document order, not install order, decides the cascade");
+    }
+
+    #[test]
+    fn installing_preparsed_sheets_in_a_batch_parses_nothing_and_later_installs_reuse_them() {
+        let html = "<link id=a rel=stylesheet href=a.css><link id=b rel=stylesheet href=b.css><link id=c rel=stylesheet href=c.css><div class=box></div>";
+        let sheet = |url: &str, text: &str| css::StylesheetSource { disabled: false, url: Arc::from(url), text: Arc::from(text), imports: Vec::new() };
+        let document = crate::html::parse(html, 32).unwrap();
+        let find = |selector| crate::selector::query_selector(&document, document.root(), selector).unwrap().unwrap();
+        let (a, b, c, target) = (find("#a"), find("#b"), find("#c"), find(".box"));
+        let (sheet_a, sheet_b) = (sheet("https://x.test/a.css", ".box{width:7px;height:3px}"), sheet("https://x.test/b.css", ".box{width:9px}"));
+        let mut session = RenderSession::new(document);
+        for source in [&sheet_a, &sheet_b] {
+            let parsed = css::parse_graph(source, css::MediaEnvironment::default()).unwrap();
+            session.insert_preparsed_stylesheet(source, parsed);
+        }
+        let before = session.invalidation_stats();
+        let results = session.set_stylesheet_sources(vec![(a, Some(sheet_a)), (b, Some(sheet_b))]);
+        assert!(results.iter().all(Result::is_ok));
+        let installed = session.invalidation_stats();
+        assert_eq!(installed.stylesheets_parsed, before.stylesheets_parsed, "preparsed sheets hit the cache on install");
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(9.0), Some(3.0)));
+        assert_eq!(session.invalidation_stats().stylesheets_parsed, before.stylesheets_parsed, "the rebuild after the install does not parse either");
+        session.set_stylesheet_source(c, Some(sheet("https://x.test/c.css", ".box{height:5px}"))).unwrap();
+        let style = session.computed_style(target).unwrap();
+        assert_eq!((style.width, style.height), (Some(9.0), Some(5.0)));
+        assert_eq!(session.invalidation_stats().stylesheets_parsed - before.stylesheets_parsed, 1, "only the new sheet is parsed");
     }
 
     #[test]
@@ -6690,10 +7484,12 @@ mod tests {
         assert!(Arc::ptr_eq(&pixels, published));
         session.set_node_bitmap(image_node, None).unwrap();
         assert_ne!(session.frame_id(), frame);
-        assert_eq!(
-            session.display_list(10, 10, &NoText),
-            Err(LayoutError::ImageFailed)
-        );
+        assert!(!session
+            .display_list(10, 10, &NoText)
+            .unwrap()
+            .0
+            .iter()
+            .any(|command| matches!(command, crate::paint::Command::Image { .. })));
     }
 
     #[test]
@@ -9183,6 +9979,68 @@ mod tests {
         assert_eq!(updated, reference_list(&rows_source(120, Some(60)), 200, 2000));
     }
 
+    fn custom_rows_source(rows: usize, marked: bool) -> String {
+        let class = if marked { " class=theme" } else { "" };
+        let mut source = String::from("<style>body{margin:0}p{height:10px;margin:0;background:blue}.theme{--accent:red}.unused{--other:1}</style>");
+        source.push_str(&alloc::format!("<div{class}>"));
+        for index in 0..rows {
+            source.push_str(&alloc::format!("<p id=p{index}>row {index}</p>"));
+        }
+        source.push_str("</div>");
+        source
+    }
+
+    #[test]
+    fn unread_custom_property_change_neither_restyles_nor_relays_out_descendants() {
+        let document = crate::html::parse(&custom_rows_source(120, false), 4096).unwrap();
+        let target = find(&document, "div");
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 2000, &NoText).unwrap();
+        let before = session.invalidation_stats();
+        session.document_mut().set_attribute(target, "class", "theme").unwrap();
+        let updated = session.display_list(200, 2000, &NoText).unwrap().clone();
+        let after = session.invalidation_stats();
+        assert_eq!(after.full_restyles, before.full_restyles);
+        assert!(after.styles_computed - before.styles_computed < 20, "{} styles", after.styles_computed - before.styles_computed);
+        assert!(after.boxes_laid_out - before.boxes_laid_out < 20, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
+        assert_eq!(updated, reference_list(&custom_rows_source(120, true), 200, 2000));
+        session.document_mut().set_attribute(target, "class", "").unwrap();
+        let reverted = session.display_list(200, 2000, &NoText).unwrap().clone();
+        assert_eq!(reverted, reference_list(&custom_rows_source(120, false), 200, 2000));
+    }
+
+    #[test]
+    fn color_change_inside_a_contained_box_keeps_the_page_correct() {
+        let source = |marked: bool| alloc::format!(
+            "<style>body{{margin:0}}#box{{contain:size;width:100px;height:50px;overflow:hidden}}p{{margin:0;height:10px;background:blue}}p.on{{background:red}}</style><div id=above>above</div><div id=box><p id=a{}>a</p><p>b</p></div><div id=below>below</div>",
+            if marked { " class=on" } else { "" });
+        let document = crate::html::parse(&source(false), 4096).unwrap();
+        let target = find(&document, "#a");
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 400, &NoText).unwrap();
+        let before = session.invalidation_stats();
+        session.document_mut().set_attribute(target, "class", "on").unwrap();
+        let updated = session.display_list(200, 400, &NoText).unwrap().clone();
+        let after = session.invalidation_stats();
+        assert_eq!(after.full_restyles, before.full_restyles);
+        assert!(after.boxes_laid_out - before.boxes_laid_out < 12, "{} boxes", after.boxes_laid_out - before.boxes_laid_out);
+        assert_eq!(updated, reference_list(&source(true), 200, 400));
+    }
+
+    #[test]
+    fn attaching_a_shadow_root_restyles_partially() {
+        let document = crate::html::parse(&rows_source(120, None), 4096).unwrap();
+        let target = find(&document, "#p60");
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 2000, &NoText).unwrap();
+        let before = session.invalidation_stats();
+        session.document_mut().attach_shadow(target, crate::ShadowMode::Open).unwrap();
+        session.display_list(200, 2000, &NoText).unwrap();
+        let after = session.invalidation_stats();
+        assert_eq!(after.full_restyles, before.full_restyles);
+        assert_eq!(after.partial_restyles, before.partial_restyles + 1);
+    }
+
     #[test]
     fn class_toggle_damages_only_the_toggled_row() {
         let document = crate::html::parse(&rows_source(30, None), 4096).unwrap();
@@ -9231,6 +10089,24 @@ mod tests {
         document.append(style, rules).unwrap();
         session.display_list(200, 400, &NoText).unwrap();
         assert_eq!(session.layout_count(), layouts);
+        assert_eq!(session.invalidation_stats().full_restyles, before.full_restyles);
+    }
+
+    #[test]
+    fn replacing_adopted_stylesheets_keeps_the_previous_rules_to_bound_the_restyle() {
+        let document = crate::html::parse(&rows_source(10, None), 4096).unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(200, 400, &NoText).unwrap();
+        session.set_adopted_stylesheets(None, vec![String::from(".nothing{color:red}")]).unwrap();
+        session.display_list(200, 400, &NoText).unwrap();
+        let before = session.invalidation_stats();
+        session
+            .replace_adopted_stylesheet_sources(vec![(
+                None,
+                vec![String::from(".nothing{color:red}").into(), String::from(".other{color:blue}").into()],
+            )])
+            .unwrap();
+        session.display_list(200, 400, &NoText).unwrap();
         assert_eq!(session.invalidation_stats().full_restyles, before.full_restyles);
     }
 
@@ -9372,7 +10248,7 @@ mod tests {
     #[test]
     fn stylesheet_text_mutation_rebuilds_rules() {
         let document = crate::html::parse(
-            "<head><style>p{color:red}</style></head><body><p>x</p></body>",
+            "<head><style>p{height:5px;background:red}</style></head><body><p>x</p></body>",
             10,
         )
         .unwrap();
@@ -9388,10 +10264,10 @@ mod tests {
         let text = session.document().first_child(style).unwrap().unwrap();
         session
             .document_mut()
-            .replace_data(text, "p{color:blue}")
+            .replace_data(text, "p{height:5px;background:blue}")
             .unwrap();
         let list = session.display_list(30, 30, &NoText).unwrap();
-        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::GlyphRun { color, .. } if color.b == 255 && color.r == 0)));
+        assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::FillRect { color, .. } if color.b == 255 && color.r == 0)));
     }
 
     #[test]

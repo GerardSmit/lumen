@@ -244,7 +244,8 @@ pub(crate) fn side_analysis(
 
 /// Record JSDoc comment spans (bytes in the lexed text) for a JavaScript source.
 pub(super) fn note_js_docs(src: &SrcMap, docs: &[(u32, u32)]) {
-    if docs.is_empty() {
+    // A `new Function` body is never type-checked, so its JSDoc is not needed.
+    if docs.is_empty() || matches!(src.src, crate::srctext::Src::Dyn(_)) {
         return;
     }
     let docs = docs
@@ -252,7 +253,7 @@ pub(super) fn note_js_docs(src: &SrcMap, docs: &[(u32, u32)]) {
         .filter_map(|&(s, e)| src.byte_range(s, e))
         .collect();
     register_side_table(
-        &src.src,
+        src.src.flat(),
         SideTable {
             docs,
             ..Default::default()
@@ -560,12 +561,12 @@ impl Parser {
     fn pw(&self, k: usize, w: &str) -> bool {
         match self.toks.get(self.pos + k).map(|t| &t.kind) {
             Some(Tok::Ident(x)) => x == w,
-            Some(Tok::Keyword(x)) => *x == w,
+            Some(Tok::Keyword(x)) => x.as_str() == w,
             _ => false,
         }
     }
     fn pp(&self, k: usize, p: &str) -> bool {
-        matches!(self.toks.get(self.pos + k).map(|t| &t.kind), Some(Tok::Punct(x)) if *x == p)
+        matches!(self.toks.get(self.pos + k).map(|t| &t.kind), Some(Tok::Punct(x)) if x.as_str() == p)
     }
     fn ident_at(&self, k: usize) -> bool {
         matches!(
@@ -591,7 +592,7 @@ impl Parser {
     fn member_name_ends(&self, k: usize) -> bool {
         matches!(
             self.tok_at(k),
-            Tok::Punct("(" | "=" | ";" | ":" | "?" | "!" | "}" | "<") | Tok::Eof
+            Tok::Punct(Punct::LParen | Punct::Assign | Punct::Semi | Punct::Colon | Punct::Question | Punct::Bang | Punct::RBrace | Punct::Lt) | Tok::Eof
         ) || self.nl_at(k)
     }
 
@@ -714,12 +715,12 @@ impl Parser {
     pub(super) fn ts_relex(&mut self, regex: bool) -> Result<(), ParseError> {
         let (c, line, nl) = {
             let t = &self.toks[self.pos];
-            (t.start as usize, t.line, t.nl_before)
+            (t.start as usize, t.line(), t.nl_before())
         };
         let (base, end) = (self.src.base as usize, self.src.end as usize);
         let html = self.tss().html;
         let lexed = {
-            let src = self.src.src.clone();
+            let src = self.src.src.flat().clone();
             tokenize_opts(
                 src.get(base + c..end).unwrap_or(""),
                 html,
@@ -730,6 +731,7 @@ impl Parser {
                     docs: false,
                     start_div: !regex,
                     offset: c as u32,
+                    skim_min_depth: None,
                 },
             )
         }
@@ -740,7 +742,7 @@ impl Parser {
         })?;
         let mut toks = lexed.tokens.into_vec();
         if let Some(t) = toks.first_mut() {
-            t.nl_before = nl;
+            t.set_nl_before(nl);
         }
         let pos = self.pos;
         self.toks_mut().truncate(pos);
@@ -752,15 +754,15 @@ impl Parser {
     /// Consume a `>` closing type arguments/parameters, splitting a `>>`/`>=`/… token.
     fn ts_eat_gt(&mut self) -> bool {
         let rest = match self.cur() {
-            Tok::Punct(">") => {
+            Tok::Punct(Punct::Gt) => {
                 self.advance();
                 return true;
             }
-            Tok::Punct(">>") => ">",
-            Tok::Punct(">=") => "=",
-            Tok::Punct(">>=") => ">=",
-            Tok::Punct(">>>") => ">>",
-            Tok::Punct(">>>=") => ">>=",
+            Tok::Punct(Punct::Shr) => Punct::Gt,
+            Tok::Punct(Punct::GtEq) => Punct::Assign,
+            Tok::Punct(Punct::ShrAssign) => Punct::GtEq,
+            Tok::Punct(Punct::UShr) => Punct::Shr,
+            Tok::Punct(Punct::UShrAssign) => Punct::ShrAssign,
             _ => return false,
         };
         // Split in place: the token becomes its tail and stays current (inserting a token
@@ -771,7 +773,7 @@ impl Parser {
         let tail = &mut self.toks_mut()[idx];
         tail.kind = Tok::Punct(rest);
         tail.start += 1;
-        tail.nl_before = false;
+        tail.set_nl_before(false);
         let t = self.tss();
         t.undo.push((idx, orig));
         t.split_gt = Some((idx, gt_end));
@@ -833,26 +835,26 @@ impl Parser {
     }
 
     fn is_fn_type_start(&self) -> bool {
-        if matches!(self.tok_at(1), Tok::Punct(")" | "...")) {
+        if matches!(self.tok_at(1), Tok::Punct(Punct::RParen | Punct::Ellipsis)) {
             return true;
         }
         let mut k = 1;
         while matches!(self.tok_at(k), Tok::Ident(w) if matches!(w.as_str(), "public" | "private" | "protected" | "readonly"))
-            && matches!(self.tok_at(k + 1), Tok::Ident(_) | Tok::Punct("[" | "{"))
+            && matches!(self.tok_at(k + 1), Tok::Ident(_) | Tok::Punct(Punct::LBracket | Punct::LBrace))
         {
             k += 1;
         }
         match self.tok_at(k) {
-            Tok::Ident(_) | Tok::Keyword("this") => k += 1,
-            Tok::Punct("[" | "{") => match self.matching_paren(self.pos + k) {
+            Tok::Ident(_) | Tok::Keyword(Keyword::This) => k += 1,
+            Tok::Punct(Punct::LBracket | Punct::LBrace) => match self.matching_paren(self.pos + k) {
                 Some(close) => k = close + 1 - self.pos,
                 None => return false,
             },
             _ => return false,
         }
         match self.tok_at(k) {
-            Tok::Punct(":" | "," | "?" | "=") => true,
-            Tok::Punct(")") => self.pp(k + 1, "=>"),
+            Tok::Punct(Punct::Colon | Punct::Comma | Punct::Question | Punct::Assign) => true,
+            Tok::Punct(Punct::RParen) => self.pp(k + 1, "=>"),
             _ => false,
         }
     }
@@ -892,7 +894,7 @@ impl Parser {
         if self.cw("keyof")
             && !matches!(
                 self.tok_at(1),
-                Tok::Punct(")" | "]" | "," | ">" | ";" | "=" | "|" | "&" | "}" | "?" | ":" | ".")
+                Tok::Punct(Punct::RParen | Punct::RBracket | Punct::Comma | Punct::Gt | Punct::Semi | Punct::Assign | Punct::Pipe | Punct::Amp | Punct::RBrace | Punct::Question | Punct::Colon | Punct::Dot)
                     | Tok::Eof
             )
         {
@@ -907,7 +909,7 @@ impl Parser {
         if self.cw("readonly")
             && matches!(
                 self.tok_at(1),
-                Tok::Ident(_) | Tok::Keyword(_) | Tok::Punct("(" | "[" | "{")
+                Tok::Ident(_) | Tok::Keyword(_) | Tok::Punct(Punct::LParen | Punct::LBracket | Punct::LBrace)
             )
         {
             self.advance();
@@ -954,7 +956,7 @@ impl Parser {
                 self.advance();
                 Ok(())
             }
-            Tok::Punct("-") => {
+            Tok::Punct(Punct::Minus) => {
                 self.advance();
                 match self.cur() {
                     Tok::Num(_) | Tok::BigInt(_) => {
@@ -964,14 +966,14 @@ impl Parser {
                     _ => self.err("Number expected"),
                 }
             }
-            Tok::Punct("{") => self.object_type(),
-            Tok::Punct("[") => self.tuple_type(),
-            Tok::Punct("(") => {
+            Tok::Punct(Punct::LBrace) => self.object_type(),
+            Tok::Punct(Punct::LBracket) => self.tuple_type(),
+            Tok::Punct(Punct::LParen) => {
                 self.advance();
                 self.ty_cond(true)?;
                 self.expect_punct(")")
             }
-            Tok::Keyword("typeof") => {
+            Tok::Keyword(Keyword::Typeof) => {
                 self.advance();
                 if self.cw("import") {
                     return self.import_type();
@@ -985,8 +987,8 @@ impl Parser {
                 }
                 Ok(())
             }
-            Tok::Keyword("import") => self.import_type(),
-            Tok::Keyword("void" | "null" | "this" | "true" | "false") => {
+            Tok::Keyword(Keyword::Import) => self.import_type(),
+            Tok::Keyword(Keyword::Void | Keyword::Null | Keyword::This | Keyword::True | Keyword::False) => {
                 self.advance();
                 Ok(())
             }
@@ -1075,7 +1077,7 @@ impl Parser {
         self.expect_punct("{")?;
         // Mapped type: `{ [K in T]: U }`.
         let mut k = 0;
-        while matches!(self.tok_at(k), Tok::Punct("+" | "-")) || self.pw(k, "readonly") {
+        while matches!(self.tok_at(k), Tok::Punct(Punct::Plus | Punct::Minus)) || self.pw(k, "readonly") {
             k += 1;
         }
         if self.pp(k, "[") && self.ident_at(k + 1) && self.pw(k + 2, "in") {
@@ -1137,7 +1139,7 @@ impl Parser {
                 self.advance();
                 Ok(())
             }
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 let close = self
                     .matching_paren(self.pos)
                     .map_or_else(|| self.err("']' expected"), Ok)?;
@@ -1205,7 +1207,7 @@ impl Parser {
 
     fn ts_return_type_inner(&mut self) -> Result<(), ParseError> {
         let param_like =
-            |p: &Self, k: usize| p.ident_at(k) || matches!(p.tok_at(k), Tok::Keyword("this"));
+            |p: &Self, k: usize| p.ident_at(k) || matches!(p.tok_at(k), Tok::Keyword(Keyword::This));
         if self.cw("asserts") && param_like(self, 1) && !self.nl_at(1) {
             self.advance();
             self.advance();
@@ -1249,7 +1251,7 @@ impl Parser {
             self.tss().semis.push(start);
         } else if idx > 0 && self.ts_asi_hazard() {
             let (prev_start, _) = self.tb(idx - 1);
-            if !matches!(self.toks[idx - 1].kind, Tok::Punct(";")) {
+            if !matches!(self.toks[idx - 1].kind, Tok::Punct(Punct::Semi)) {
                 self.tss().semis.push(start);
             } else if self
                 .tss()
@@ -1267,7 +1269,7 @@ impl Parser {
     fn ts_asi_hazard(&self) -> bool {
         matches!(
             self.cur(),
-            Tok::Punct("(" | "[" | "+" | "-" | "/" | "/=") | Tok::Regex(_) | Tok::Template(_)
+            Tok::Punct(Punct::LParen | Punct::LBracket | Punct::Plus | Punct::Minus | Punct::Slash | Punct::DivAssign) | Tok::Regex(_) | Tok::Template(_)
         )
     }
 
@@ -1284,7 +1286,7 @@ impl Parser {
                 {
                     Some("declare")
                 }
-                "abstract" if same_line && matches!(self.tok_at(k + 1), Tok::Keyword("class")) => {
+                "abstract" if same_line && matches!(self.tok_at(k + 1), Tok::Keyword(Keyword::Class)) => {
                     Some("abstract")
                 }
                 "namespace" | "module"
@@ -1295,8 +1297,8 @@ impl Parser {
                 }
                 _ => None,
             },
-            Tok::Keyword("enum") if self.ident_at(k + 1) => Some("enum"),
-            Tok::Keyword("const") if self.pw(k + 1, "enum") && self.ident_at(k + 2) => {
+            Tok::Keyword(Keyword::Enum) if self.ident_at(k + 1) => Some("enum"),
+            Tok::Keyword(Keyword::Const) if self.pw(k + 1, "enum") && self.ident_at(k + 2) => {
                 Some("const enum")
             }
             _ => None,
@@ -1316,14 +1318,14 @@ impl Parser {
             return Ok(Some(Stmt::Empty));
         }
         match self.cur().clone() {
-            Tok::Keyword("import") if !matches!(self.tok_at(1), Tok::Punct("(" | ".")) => {
+            Tok::Keyword(Keyword::Import) if !matches!(self.tok_at(1), Tok::Punct(Punct::LParen | Punct::Dot)) => {
                 self.ts_import(idx)
             }
-            Tok::Keyword("export") => self.ts_export(idx),
-            Tok::Keyword("function") => self.ts_overload(idx),
+            Tok::Keyword(Keyword::Export) => self.ts_export(idx),
+            Tok::Keyword(Keyword::Function) => self.ts_overload(idx),
             Tok::Ident(w)
                 if w == "async"
-                    && matches!(self.tok_at(1), Tok::Keyword("function"))
+                    && matches!(self.tok_at(1), Tok::Keyword(Keyword::Function))
                     && !self.nl_at(1) =>
             {
                 self.ts_overload(idx)
@@ -1454,7 +1456,7 @@ impl Parser {
                 let open = self.pos;
                 self.advance();
                 while !self.is_punct("}") && !self.at_eof() {
-                    let k = usize::from(matches!(self.cur(), Tok::Keyword("export")));
+                    let k = usize::from(matches!(self.cur(), Tok::Keyword(Keyword::Export)));
                     match self.ts_decl_at(k) {
                         Some(d @ ("type" | "interface")) => {
                             self.pos += k;
@@ -1489,7 +1491,7 @@ impl Parser {
         if module_kw && !string_name {
             // Node's span: `module` and the first name.
             self.unsupported(start, MSG_MODULE);
-            let src = &self.src.src;
+            let src = &**self.src.src.flat();
             let mut end = start as usize + "module".len();
             end += src[end..].len() - src[end..].trim_start().len();
             end += src[end..]
@@ -1507,7 +1509,7 @@ impl Parser {
     fn ts_declare(&mut self) -> Result<(), ParseError> {
         self.advance(); // declare
         match self.cur().clone() {
-            Tok::Keyword("var" | "const") | Tok::Ident(_)
+            Tok::Keyword(Keyword::Var | Keyword::Const) | Tok::Ident(_)
                 if self.cw("var") || self.cw("const") || self.cw("let") || self.cw("using") =>
             {
                 if self.cw("const") && self.pw(1, "enum") {
@@ -1537,14 +1539,14 @@ impl Parser {
                 }
                 self.consume_semicolon()
             }
-            Tok::Keyword("function") | Tok::Ident(_) if self.cw("function") || self.cw("async") => {
+            Tok::Keyword(Keyword::Function) | Tok::Ident(_) if self.cw("function") || self.cw("async") => {
                 self.skip_fn_signature()?;
                 if self.is_punct("{") {
                     self.skip_braces()?;
                 }
                 self.consume_semicolon()
             }
-            Tok::Keyword("class") | Tok::Ident(_) if self.cw("class") || self.cw("abstract") => {
+            Tok::Keyword(Keyword::Class) | Tok::Ident(_) if self.cw("class") || self.cw("abstract") => {
                 if self.cw("abstract") {
                     self.advance();
                 }
@@ -1570,7 +1572,7 @@ impl Parser {
                 }
                 self.skip_braces()
             }
-            Tok::Keyword("enum") => self.ts_enum(None),
+            Tok::Keyword(Keyword::Enum) => self.ts_enum(None),
             Tok::Ident(w) if matches!(w.as_str(), "namespace" | "module" | "global") => {
                 self.ts_namespace(true).map(|_| ())
             }
@@ -1705,7 +1707,7 @@ impl Parser {
             )
         };
         let is = |p: &Self, i: usize, w: &str| matches!(p.toks.get(i).map(|t| &t.kind), Some(Tok::Ident(x)) if x == w);
-        let punct = |p: &Self, i: usize, q: &str| matches!(p.toks.get(i).map(|t| &t.kind), Some(Tok::Punct(x)) if *x == q);
+        let punct = |p: &Self, i: usize, q: &str| matches!(p.toks.get(i).map(|t| &t.kind), Some(Tok::Punct(x)) if x.as_str() == q);
         let mut i = open + 1;
         while i < close {
             let (type_only, len) =
@@ -1771,7 +1773,7 @@ impl Parser {
             self.consume_semicolon()?;
             return Ok(Some(Stmt::Empty));
         }
-        if matches!(self.tok_at(1), Tok::Keyword("import")) && self.ident_at(2) && self.pp(3, "=") {
+        if matches!(self.tok_at(1), Tok::Keyword(Keyword::Import)) && self.ident_at(2) && self.pp(3, "=") {
             self.take_stmt_flags();
             let at = self.tb(self.pos + 1).0;
             self.unsupported(at, MSG_IMPORT_EQ);
@@ -1804,7 +1806,7 @@ impl Parser {
             self.ts_strip_type_specifiers(self.pos + 1);
             return Ok(None);
         }
-        if matches!(self.tok_at(1), Tok::Keyword("default")) {
+        if matches!(self.tok_at(1), Tok::Keyword(Keyword::Default)) {
             if self.pw(2, "interface") && self.ident_at(3) {
                 self.take_stmt_flags();
                 self.advance();
@@ -1813,7 +1815,7 @@ impl Parser {
                 self.mark_type_only(idx);
                 return Ok(Some(Stmt::Empty));
             }
-            if self.pw(2, "abstract") && matches!(self.tok_at(3), Tok::Keyword("class")) {
+            if self.pw(2, "abstract") && matches!(self.tok_at(3), Tok::Keyword(Keyword::Class)) {
                 let (s, e) = self.tb(self.pos + 2);
                 self.erase(s, e);
                 self.ts_note_abstract_quirk((s, e));
@@ -1956,7 +1958,7 @@ impl Parser {
             if property {
                 self.unsupported(prop_at, MSG_PARAM_PROP);
             }
-            if matches!(self.cur(), Tok::Keyword("this")) && self.pp(1, ":") {
+            if matches!(self.cur(), Tok::Keyword(Keyword::This)) && self.pp(1, ":") {
                 self.advance();
                 self.advance();
                 sig.this = Some(self.ts_type()?);
@@ -2034,7 +2036,7 @@ impl Parser {
             return idx;
         };
         // Only type arguments and `!` end right before a call's `(`.
-        if idx == 0 || !matches!(self.toks[idx - 1].kind, Tok::Punct(">" | "!")) {
+        if idx == 0 || !matches!(self.toks[idx - 1].kind, Tok::Punct(Punct::Gt | Punct::Bang)) {
             return idx;
         }
         while idx > 0 {
@@ -2056,7 +2058,7 @@ impl Parser {
 
     /// `abstract` before `class` (after decorators): erased.
     pub(super) fn ts_erase_abstract(&mut self) {
-        if matches!(self.tok_at(1), Tok::Keyword("class")) {
+        if matches!(self.tok_at(1), Tok::Keyword(Keyword::Class)) {
             self.erase_tok();
         }
     }
@@ -2154,7 +2156,7 @@ impl Parser {
                 while k > 0 && erased(self, self.tb(k - 1).0) {
                     k -= 1;
                 }
-                if k > 0 && !matches!(self.toks[k - 1].kind, Tok::Punct(";" | "{" | "}")) {
+                if k > 0 && !matches!(self.toks[k - 1].kind, Tok::Punct(Punct::Semi | Punct::LBrace | Punct::RBrace)) {
                     self.tss().semis.push(anchor);
                 }
             }
@@ -2269,13 +2271,13 @@ impl Parser {
             && (self.pp(1, "(") || self.pp(1, "<"));
         let open = self.pos + usize::from(is_async);
         let candidate = match self.toks.get(open).map(|t| &t.kind) {
-            Some(Tok::Punct("(")) => self.matching_paren(open).is_some_and(|close| {
+            Some(Tok::Punct(Punct::LParen)) => self.matching_paren(open).is_some_and(|close| {
                 matches!(
                     self.toks.get(close + 1).map(|t| &t.kind),
-                    Some(Tok::Punct(":"))
+                    Some(Tok::Punct(Punct::Colon))
                 )
             }),
-            Some(Tok::Punct("<")) => true,
+            Some(Tok::Punct(Punct::Lt)) => true,
             _ => false,
         };
         if !candidate {
@@ -2304,11 +2306,11 @@ impl Parser {
             if has_ret {
                 // A line break between `)` and `=>` would be invalid JavaScript once the return
                 // type is gone: Node moves the `)` to the type's last character.
-                let broken = (close + 1..=self.pos).any(|i| self.toks[i].nl_before);
+                let broken = (close + 1..=self.pos).any(|i| self.toks[i].nl_before());
                 if broken {
                     let (cs, ce) = self.tb(close);
                     let last_end = self.prev_end_b() as usize;
-                    let last = self.src.src[..last_end]
+                    let last = self.src.src.flat()[..last_end]
                         .char_indices()
                         .next_back()
                         .map_or(0, |c| c.0);
@@ -2376,7 +2378,7 @@ impl Parser {
         }
         self.erase_from(start);
         // `a as T` ends the expression: a `(`/`[`/template on the next line would join it.
-        if self.nl_before() && matches!(self.cur(), Tok::Punct("(" | "[") | Tok::Template(_)) {
+        if self.nl_before() && matches!(self.cur(), Tok::Punct(Punct::LParen | Punct::LBracket) | Tok::Template(_)) {
             self.tss().semis.push(start);
         }
         Ok(true)
@@ -2406,10 +2408,10 @@ impl Parser {
 
     fn can_follow_type_args(&self) -> bool {
         match self.cur() {
-            Tok::Punct("<" | ">" | "+" | "-") => false,
+            Tok::Punct(Punct::Lt | Punct::Gt | Punct::Plus | Punct::Minus) => false,
             _ if self.nl_before() => true,
-            Tok::Punct(p) => is_binary_punct(p) || !starts_expr_punct(p),
-            Tok::Keyword(k) => matches!(*k, "in" | "instanceof"),
+            Tok::Punct(p) => is_binary_punct(p.as_str()) || !starts_expr_punct(p.as_str()),
+            Tok::Keyword(k) => matches!(k, Keyword::In | Keyword::Instanceof),
             Tok::Ident(w) => matches!(w.as_str(), "as" | "satisfies"),
             Tok::Eof => true,
             _ => false,
@@ -2432,7 +2434,7 @@ impl Parser {
     /// register the side table. Returns the stripped text when `want_text`.
     pub(super) fn ts_finish(&mut self, want_text: bool) -> Result<Option<String>, ParseError> {
         let st = self.ts.take().expect("TypeScript mode");
-        let rc = self.src.src.clone();
+        let rc = self.src.src.flat().clone();
         if let Some(&(at, end, msg)) = st.unsupported.iter().min_by_key(|u| u.0) {
             set_error_span(at, end);
             return Err(ParseError {

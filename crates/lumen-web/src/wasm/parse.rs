@@ -1,5 +1,5 @@
 //! WebAssembly binary-format decoder (the MVP + a few post-MVP proposals: multi-value results,
-//! sign-extension, non-trapping conversions, bulk memory). Produces a [`Module`] the interpreter in
+//! sign-extension, non-trapping conversions, bulk memory, fixed-width SIMD). Produces a [`Module`] the interpreter in
 //! `exec.rs` runs. Decoding ends with full validation (`validate.rs`), so every module the
 //! interpreter and the native tier see is well-typed.
 
@@ -11,8 +11,11 @@ pub enum ValType {
     I64,
     F32,
     F64,
+    V128,
     FuncRef,
     ExternRef,
+    AnyRef,
+    EqRef,
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +229,11 @@ fn val_type(b: u8) -> Result<ValType, String> {
         0x7e => Ok(ValType::I64),
         0x7d => Ok(ValType::F32),
         0x7c => Ok(ValType::F64),
+        0x7b => Ok(ValType::V128),
         0x70 => Ok(ValType::FuncRef),
         0x6f => Ok(ValType::ExternRef),
+        0x6e => Ok(ValType::AnyRef),
+        0x6d => Ok(ValType::EqRef),
         other => Err(format!("wasm: unknown value type 0x{other:x}")),
     }
 }
@@ -324,6 +330,12 @@ fn read_const_expr(r: &mut Reader) -> Result<Vec<u8>, String> {
             0x44 => {
                 r.bytes(8)?;
             } // f64.const
+            0xfd => {
+                if r.u32()? != super::simd::V128_CONST {
+                    return Err("wasm: unsupported vector opcode in const expr".into());
+                }
+                r.bytes(16)?;
+            } // v128.const
             0x23 => {
                 r.u32()?;
             } // global.get

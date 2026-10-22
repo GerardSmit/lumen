@@ -1569,3 +1569,58 @@ diff!(
         |s| unattr(s, "section", "class"),
     ]
 );
+
+fn flex_chain_source(depth: usize) -> String {
+    let mut open = String::new();
+    let mut close = String::new();
+    for level in 0..depth {
+        open.push_str(&format!("<div class=f id=f{level}><p id=p{level}>level {level} <b>bold</b> trailing words</p><span id=s{level}>tag {level}</span>"));
+        close.push_str("</div>");
+    }
+    format!(
+        "<style>body{{margin:0}}.f{{display:flex;flex-wrap:wrap}}p{{margin:0}}</style><div id=far style='height:10px'>x</div>{open}{close}<div id=after>tail</div>"
+    )
+}
+
+#[test]
+fn nested_flex_chain_measures_linearly_and_reuses_across_relayouts() {
+    let depth = 12;
+    let mut session = RenderSession::new(html::parse(&flex_chain_source(depth), MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    let (first, _) = measured_after(&mut session, |_| {});
+    assert!(first >= depth as u64 && first <= 24 * depth as u64, "first layout measured {first}");
+    let (shifted, _) = measured_after(&mut session, |s| attr(s, "#far", "style", "height:44px"));
+    assert_eq!(shifted, 0, "a shift above re-measured {shifted} boxes");
+    let (edited, _) = measured_after(&mut session, |s| text(s, "#p11", "an edited paragraph with quite a few more words"));
+    assert!(edited > 0 && edited <= first, "an edit re-measured {edited} of {first}");
+    let (restyled, _) = measured_after(&mut session, |s| attr(s, "#s6", "style", "padding:0 9px"));
+    assert!(restyled > 0 && restyled <= first, "a restyle re-measured {restyled} of {first}");
+}
+
+diff!(
+    flex_wrap_grid_percent_aspect_and_keyword_sizes_follow_edits,
+    "<style>body{margin:0}.row{display:flex;flex-wrap:wrap;width:140px;gap:3px}.row>*{border:1px solid red}\
+     .g{display:grid;grid-template-columns:auto 1fr min-content;width:220px}.pc{display:flex;width:300px}.pc>div{padding:2%}\
+     .ar{display:flex}.ar>div{border:1px solid blue}</style>\
+     <div id=far style='height:5px'>x</div>\
+     <div class=row id=row><span id=a>alpha beta gamma</span><p id=b style='margin:0'>delta <b>epsilon</b> zeta eta</p><span id=c>x</span>\
+     <div id=d style='flex:1 1 30px'>theta iota kappa</div></div>\
+     <div class=g id=grid><div id=g0>one two three</div><div id=g1>four <i>five</i> six</div><div id=g2>seven eight</div><div id=g3>nine</div></div>\
+     <div class=pc id=pc><div id=h style='width:50%'>half width text here</div><div id=r style='flex:1'>rest <b>of</b> the row</div></div>\
+     <div class=ar id=ar><div id=t style='aspect-ratio:2/1;height:30px'>tall <i>t</i></div><div id=u style='aspect-ratio:1;width:20px'>words words</div></div>\
+     <div id=mc style='width:min-content'>min content <i>wraps</i> words</div>\
+     <div id=fc style='float:left;width:fit-content'>fit <b>content</b> float text</div>\
+     <div id=xc style='display:flex;width:max-content'><div id=x0>max <b>content</b> row</div><div id=x1>second</div></div>",
+    [
+        |s| text(s, "#a", "a much longer first item that has to wrap inside the flex row"),
+        |s| text(s, "#g1", "four five six seven"),
+        |s| attr(s, "#row", "style", "width:90px"),
+        |s| text(s, "#h", "short"),
+        |s| attr(s, "#t", "style", "aspect-ratio:3/1;height:20px"),
+        |s| text(s, "#mc", "min"),
+        |s| attr(s, "#xc", "style", "display:flex;width:min-content"),
+        |s| attr(s, "#far", "style", "height:25px"),
+        |s| text(s, "#a", "alpha"),
+        |s| attr(s, "#grid", "class", "g fit"),
+    ]
+);

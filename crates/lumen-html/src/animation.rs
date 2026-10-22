@@ -1382,7 +1382,9 @@ fn specification_animation_context_numeric_math_preserves_percentage_basis_and_a
             interpolate_numeric("0px", "10px", 0.25).as_deref(),
             Some("2.5px")
         );
-        assert!(interpolate_numeric("0px", "1em", 0.5).is_none());
+        let mixed = interpolate_numeric("0px", "1em", 0.5).unwrap();
+        assert!(mixed.starts_with("calc(") && mixed.contains("em"), "{mixed}");
+        assert!(interpolate_numeric("1px", "1s", 0.5).is_none());
     }
 
     #[test]

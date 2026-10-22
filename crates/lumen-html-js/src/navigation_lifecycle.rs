@@ -8,6 +8,7 @@ use lumen_bind::Host;
 #[derive(Default)]
 pub(crate) struct DocumentLifecycle {
     pub(crate) times: crate::legacy_timing::NavigationTimes,
+    pub(crate) paint: crate::paint_timing::PaintTimingState,
     pub(crate) unload_counter: Cell<u32>,
     pub(crate) page_showing: Cell<bool>,
     pub(crate) destroyed: Cell<bool>,

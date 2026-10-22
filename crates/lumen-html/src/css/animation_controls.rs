@@ -335,8 +335,8 @@ pub(super) fn shorthand_with_resolution(values:&[&str],resolved_duration:bool)->
         let serialize=|included:&[bool;9]| {
             let mut parts=Vec::new();
             for column in 0..7 {if included[column]{parts.push(expected[column]);}}
-            if included[8]{parts.push(expected[8]);}
             if included[7]{parts.push(expected[7]);}
+            if included[8]{parts.push(expected[8]);}
 
 
             if parts.is_empty(){String::from("none")}else{parts.join(" ")}
@@ -352,7 +352,7 @@ pub(super) fn shorthand_with_resolution(values:&[&str],resolved_duration:bool)->
         // At most nine bounded parser passes per item; no matching-rule pool or
         // permanent serialization cache is retained.
         let defaults=["auto","ease","0s","1","normal","none","running","none","auto"];
-        for column in [7,8,6,5,4,3,2,1,0] {
+        for column in [8,7,6,5,4,3,2,1,0] {
             if expected[column]!=defaults[column]&&!(column==0&&resolved_duration&&expected[column]=="0s"){continue;}
             included[column]=false;
 

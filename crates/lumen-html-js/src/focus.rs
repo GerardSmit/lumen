@@ -37,8 +37,8 @@ pub(crate) fn focus_element(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, o
     if !options.prevent_scroll {
         scrolling::into_view_inner(ctx, &realm, node, scrolling::IntoViewOptions {
             behavior: scrolling::ScrollBehavior::Auto,
-            block: scrolling::ScrollAlignment::Center,
-            inline: scrolling::ScrollAlignment::Center,
+            block: scrolling::ScrollAlignment::CenterIfNeeded,
+            inline: scrolling::ScrollAlignment::CenterIfNeeded,
             nearest_container: false,
         })?;
     }

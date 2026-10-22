@@ -3,9 +3,8 @@
 //! A lazily parsed body must still report its early errors at load. The full parser does that by
 //! building (and dropping) the whole AST of every body; this pass walks the same grammar over the
 //! token vector without building anything. It only ever answers "valid" or "not sure": anything
-//! it does not model exactly (classes, labels, destructuring assignment, `super`, ...) or any
-//! error it finds returns `None`, and the caller runs the full checking parse, which also
-//! produces the precise error. So the rules here must accept a subset of what the full parser
+//! it does not model exactly (classes, `super`, ...) or any error it finds returns `None`, and
+//! the caller runs the full checking parse, which also produces the precise error. So the rules here must accept a subset of what the full parser
 //! accepts and may never accept more.
 
 use super::*;
@@ -130,22 +129,33 @@ struct Pre<'a> {
 const MAX_DEPTH: u32 = 600;
 const MAX_CHAIN: u32 = 96;
 
-fn binary_prec(op: &str) -> Option<(u8, bool)> {
-    Some(match op {
-        "??" => (1, false),
-        "||" => (2, false),
-        "&&" => (3, false),
-        "|" => (4, false),
-        "^" => (5, false),
-        "&" => (6, false),
-        "==" | "!=" | "===" | "!==" => (7, false),
-        "<" | ">" | "<=" | ">=" | "instanceof" | "in" => (8, false),
-        "<<" | ">>" | ">>>" => (9, false),
-        "+" | "-" => (10, false),
-        "*" | "/" | "%" => (11, false),
-        "**" => (12, true),
-        _ => return None,
-    })
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinOp {
+    Nullish,
+    Logical,
+    Other,
+}
+
+fn is_assign_punct(p: Punct) -> bool {
+    matches!(
+        p,
+        Punct::Assign
+            | Punct::AddAssign
+            | Punct::SubAssign
+            | Punct::MulAssign
+            | Punct::DivAssign
+            | Punct::RemAssign
+            | Punct::PowAssign
+            | Punct::ShlAssign
+            | Punct::ShrAssign
+            | Punct::UShrAssign
+            | Punct::BitAndAssign
+            | Punct::BitOrAssign
+            | Punct::BitXorAssign
+            | Punct::AndAssign
+            | Punct::OrAssign
+            | Punct::NullishAssign
+    )
 }
 
 impl<'a> Pre<'a> {
@@ -194,30 +204,31 @@ impl<'a> Pre<'a> {
         toks.get(self.pos + ahead).map(|t| &t.kind)
     }
     fn nl_at(&self, ahead: usize) -> bool {
-        self.toks.get(self.pos + ahead).is_some_and(|t| t.nl_before)
+        self.toks.get(self.pos + ahead).is_some_and(|t| t.nl_before())
     }
     #[inline]
     fn advance(&mut self) {
         let t = self.tok();
-        if (t.escaped && !matches!(t.kind, Tok::Str(_))) || (t.legacy_octal && self.strict) {
+        if (t.escaped() && !matches!(t.kind, Tok::Str(_))) || (t.legacy_octal() && self.strict) {
             self.bad = true;
         }
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
     }
-    #[inline]
+    #[inline(always)]
     fn is_p(&self, p: &str) -> bool {
-        matches!(self.kind(), Tok::Punct(x) if *x == p)
+        matches!(self.kind(), Tok::Punct(x) if x.as_str() == p)
     }
-    #[inline]
+    #[inline(always)]
     fn is_kw(&self, k: &str) -> bool {
-        matches!(self.kind(), Tok::Keyword(x) if *x == k)
+        matches!(self.kind(), Tok::Keyword(x) if x.as_str() == k)
     }
     #[inline]
     fn is_word(&self, w: &str) -> bool {
         matches!(self.kind(), Tok::Ident(x) if x == w)
     }
+    #[inline(always)]
     fn eat_p(&mut self, p: &str) -> bool {
         if self.is_p(p) {
             self.advance();
@@ -226,6 +237,7 @@ impl<'a> Pre<'a> {
             false
         }
     }
+    #[inline(always)]
     fn eat_kw(&mut self, k: &str) -> bool {
         if self.is_kw(k) {
             self.advance();
@@ -234,6 +246,7 @@ impl<'a> Pre<'a> {
             false
         }
     }
+    #[inline(always)]
     fn expect_p(&mut self, p: &str) -> Option<()> {
         self.eat_p(p).then_some(())
     }
@@ -241,7 +254,7 @@ impl<'a> Pre<'a> {
         matches!(self.kind(), Tok::Eof)
     }
     fn can_end_stmt(&self) -> bool {
-        self.is_p(";") || self.is_p("}") || self.at_eof() || self.tok().nl_before
+        self.is_p(";") || self.is_p("}") || self.at_eof() || self.tok().nl_before()
     }
     fn semicolon(&mut self) -> Option<()> {
         if self.eat_p(";") || self.can_end_stmt() {
@@ -256,8 +269,8 @@ impl<'a> Pre<'a> {
             let mut depth = 0i32;
             for (i, t) in self.toks.iter_from(open).enumerate() {
                 match &t.kind {
-                    Tok::Punct("(" | "[" | "{") => depth += 1,
-                    Tok::Punct(")" | "]" | "}") => {
+                    Tok::Punct(Punct::LParen | Punct::LBracket | Punct::LBrace) => depth += 1,
+                    Tok::Punct(Punct::RParen | Punct::RBracket | Punct::RBrace) => {
                         depth -= 1;
                         if depth == 0 {
                             return Some(open + i);
@@ -287,7 +300,7 @@ impl<'a> Pre<'a> {
 
     fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH || crate::stack::exhausted() {
+        if self.depth > MAX_DEPTH || (self.depth & 3 == 1 && crate::stack::exhausted()) {
             return None;
         }
         let r = f(self);
@@ -321,27 +334,27 @@ impl<'a> Pre<'a> {
             return None;
         }
         match self.kind() {
-            Tok::Punct("{") => {
+            Tok::Punct(Punct::LBrace) => {
                 self.advance();
                 self.block_rest()?;
                 Some(S::Plain)
             }
-            Tok::Punct(";") => {
+            Tok::Punct(Punct::Semi) => {
                 self.advance();
                 Some(S::Plain)
             }
-            Tok::Keyword("var") => {
+            Tok::Keyword(Keyword::Var) => {
                 self.var_decl(DeclKind::Var)?;
                 Some(S::Plain)
             }
-            Tok::Keyword("const") => {
+            Tok::Keyword(Keyword::Const) => {
                 self.var_decl(DeclKind::Const)?;
                 Some(S::Lexical)
             }
             Tok::Ident(w)
                 if w == "let"
-                    && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct("[" | "{")))
-                    && (!single || matches!(self.peek(1), Some(Tok::Punct("[")))) =>
+                    && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct(Punct::LBracket | Punct::LBrace)))
+                    && (!single || matches!(self.peek(1), Some(Tok::Punct(Punct::LBracket)))) =>
             {
                 self.var_decl(DeclKind::Let)?;
                 Some(S::Lexical)
@@ -354,7 +367,7 @@ impl<'a> Pre<'a> {
             {
                 None
             }
-            Tok::Keyword("function") => {
+            Tok::Keyword(Keyword::Function) => {
                 let f = self.function(false, false)?;
                 let name = f.name?;
                 if !single {
@@ -366,7 +379,7 @@ impl<'a> Pre<'a> {
             }
             Tok::Ident(w)
                 if w == "async"
-                    && matches!(self.peek(1), Some(Tok::Keyword("function")))
+                    && matches!(self.peek(1), Some(Tok::Keyword(Keyword::Function)))
                     && !self.nl_at(1) =>
             {
                 self.advance();
@@ -377,8 +390,8 @@ impl<'a> Pre<'a> {
                 }
                 Some(S::Func { plain: false })
             }
-            Tok::Keyword("class" | "import" | "export") | Tok::Punct("@") => None,
-            Tok::Keyword("if") => {
+            Tok::Keyword(Keyword::Class | Keyword::Import | Keyword::Export) | Tok::Punct(Punct::At) => None,
+            Tok::Keyword(Keyword::If) => {
                 self.advance();
                 self.expect_p("(")?;
                 self.expr()?;
@@ -389,7 +402,7 @@ impl<'a> Pre<'a> {
                 }
                 Some(S::Plain)
             }
-            Tok::Keyword("while") => {
+            Tok::Keyword(Keyword::While) => {
                 self.advance();
                 self.expect_p("(")?;
                 self.expr()?;
@@ -397,7 +410,7 @@ impl<'a> Pre<'a> {
                 self.loop_body()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("with") => {
+            Tok::Keyword(Keyword::With) => {
                 if self.strict {
                     return None;
                 }
@@ -408,7 +421,7 @@ impl<'a> Pre<'a> {
                 self.substatement(false)?;
                 Some(S::Plain)
             }
-            Tok::Keyword("do") => {
+            Tok::Keyword(Keyword::Do) => {
                 self.advance();
                 self.loop_body()?;
                 if !self.eat_kw("while") {
@@ -420,13 +433,13 @@ impl<'a> Pre<'a> {
                 self.eat_p(";");
                 Some(S::Plain)
             }
-            Tok::Keyword("for") => {
+            Tok::Keyword(Keyword::For) => {
                 self.push_scope(false);
                 self.for_inner()?;
                 self.pop_scope()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("return") => {
+            Tok::Keyword(Keyword::Return) => {
                 self.advance();
                 if !self.can_end_stmt() {
                     self.expr()?;
@@ -434,7 +447,7 @@ impl<'a> Pre<'a> {
                 self.semicolon()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("break") => {
+            Tok::Keyword(Keyword::Break) => {
                 self.advance();
                 match self.opt_label() {
                     Some(label) => {
@@ -451,7 +464,7 @@ impl<'a> Pre<'a> {
                 self.semicolon()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("continue") => {
+            Tok::Keyword(Keyword::Continue) => {
                 self.advance();
                 match self.opt_label() {
                     Some(label) => {
@@ -468,29 +481,29 @@ impl<'a> Pre<'a> {
                 self.semicolon()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("throw") => {
+            Tok::Keyword(Keyword::Throw) => {
                 self.advance();
-                if self.tok().nl_before {
+                if self.tok().nl_before() {
                     return None;
                 }
                 self.expr()?;
                 self.semicolon()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("try") => {
+            Tok::Keyword(Keyword::Try) => {
                 self.try_stmt()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("switch") => {
+            Tok::Keyword(Keyword::Switch) => {
                 self.switch_stmt()?;
                 Some(S::Plain)
             }
-            Tok::Keyword("debugger") => {
+            Tok::Keyword(Keyword::Debugger) => {
                 self.advance();
                 self.semicolon()?;
                 Some(S::Plain)
             }
-            Tok::Ident(_) if matches!(self.peek(1), Some(Tok::Punct(":"))) => self.labeled(),
+            Tok::Ident(_) if matches!(self.peek(1), Some(Tok::Punct(Punct::Colon))) => self.labeled(),
             _ => {
                 self.expr()?;
                 self.semicolon()?;
@@ -500,7 +513,7 @@ impl<'a> Pre<'a> {
     }
 
     fn opt_label(&mut self) -> Option<Name> {
-        if self.tok().nl_before {
+        if self.tok().nl_before() {
             return None;
         }
         let Tok::Ident(name) = self.kind() else {
@@ -536,7 +549,7 @@ impl<'a> Pre<'a> {
             let Tok::Ident(name) = self.kind() else {
                 break;
             };
-            if !matches!(self.peek(1), Some(Tok::Punct(":"))) {
+            if !matches!(self.peek(1), Some(Tok::Punct(Punct::Colon))) {
                 break;
             }
             self.check_label(name)?;
@@ -549,7 +562,7 @@ impl<'a> Pre<'a> {
             self.labels.push(name.clone());
             chain.push(name);
         }
-        let iter_ahead = matches!(self.kind(), Tok::Keyword("for" | "while" | "do"));
+        let iter_ahead = matches!(self.kind(), Tok::Keyword(Keyword::For | Keyword::While | Keyword::Do));
         if iter_ahead {
             self.iter_labels.extend(chain.iter().cloned());
         }
@@ -730,7 +743,7 @@ impl<'a> Pre<'a> {
             self.advance();
             Some(DeclKind::Const)
         } else if self.is_word("let")
-            && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct("[" | "{")))
+            && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct(Punct::LBracket | Punct::LBrace)))
         {
             self.advance();
             Some(DeclKind::Let)
@@ -850,11 +863,11 @@ impl<'a> Pre<'a> {
     /// A binding target; `true` when it is a plain identifier.
     fn binding_pattern(&mut self, names: &mut Vec<Name>) -> Option<bool> {
         match self.kind() {
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 self.nested(|s| s.array_pattern(names))?;
                 Some(false)
             }
-            Tok::Punct("{") => {
+            Tok::Punct(Punct::LBrace) => {
                 self.nested(|s| s.object_pattern(names))?;
                 Some(false)
             }
@@ -977,12 +990,12 @@ impl<'a> Pre<'a> {
         if let Some(arrow) = self.try_arrow()? {
             return Some(arrow);
         }
-        if matches!(self.kind(), Tok::Punct("[" | "{")) {
+        if matches!(self.kind(), Tok::Punct(Punct::LBracket | Punct::LBrace)) {
             // A literal followed by `=` is a destructuring assignment target.
             let close = self.matching_paren(self.pos)?;
             if matches!(
                 self.toks.get(close + 1).map(|t| &t.kind),
-                Some(Tok::Punct("="))
+                Some(Tok::Punct(Punct::Assign))
             ) {
                 self.assign_pattern()?;
                 self.expect_p("=")?;
@@ -992,7 +1005,7 @@ impl<'a> Pre<'a> {
         }
         let left = self.cond()?;
         if let Tok::Punct(op) = self.kind() {
-            if is_assign_op(op) {
+            if is_assign_punct(*op) {
                 match left {
                     K::Ident(Id::Normal | Id::Undefined) | K::Member(_) | K::Index => {}
                     K::Ident(Id::EvalArgs) if !self.strict => {}
@@ -1027,11 +1040,11 @@ impl<'a> Pre<'a> {
     }
 
     fn pattern_target(&mut self) -> Option<()> {
-        if matches!(self.kind(), Tok::Punct("[" | "{")) {
+        if matches!(self.kind(), Tok::Punct(Punct::LBracket | Punct::LBrace)) {
             let close = self.matching_paren(self.pos)?;
             if matches!(
                 self.toks.get(close + 1).map(|t| &t.kind),
-                Some(Tok::Punct("=" | "," | "]" | "}"))
+                Some(Tok::Punct(Punct::Assign | Punct::Comma | Punct::RBracket | Punct::RBrace))
             ) {
                 return self.assign_pattern();
             }
@@ -1107,11 +1120,11 @@ impl<'a> Pre<'a> {
             return None;
         }
         self.advance();
-        let delegate = !self.tok().nl_before && self.eat_p("*");
-        let no_arg = (!delegate && self.tok().nl_before)
+        let delegate = !self.tok().nl_before() && self.eat_p("*");
+        let no_arg = (!delegate && self.tok().nl_before())
             || matches!(
                 self.kind(),
-                Tok::Punct(";" | ")" | "]" | "}" | "," | ":") | Tok::Eof
+                Tok::Punct(Punct::Semi | Punct::RParen | Punct::RBracket | Punct::RBrace | Punct::Comma | Punct::Colon) | Tok::Eof
             );
         if !no_arg {
             self.nested(Self::assign)?;
@@ -1135,15 +1148,29 @@ impl<'a> Pre<'a> {
         self.chained(|s| s.binary_chain(min_prec))
     }
 
-    fn binary_op(&self) -> Option<(&'static str, u8, bool)> {
-        let op = match self.kind() {
-            Tok::Punct(p) => *p,
-            Tok::Keyword("instanceof") => "instanceof",
-            Tok::Keyword("in") if self.no_in => return None,
-            Tok::Keyword("in") => "in",
+    #[inline]
+    fn binary_op(&self) -> Option<(BinOp, u8, bool)> {
+        Some(match self.kind() {
+            Tok::Punct(p) => match p {
+                Punct::Nullish => (BinOp::Nullish, 1, false),
+                Punct::OrOr => (BinOp::Logical, 2, false),
+                Punct::AndAnd => (BinOp::Logical, 3, false),
+                Punct::Pipe => (BinOp::Other, 4, false),
+                Punct::Caret => (BinOp::Other, 5, false),
+                Punct::Amp => (BinOp::Other, 6, false),
+                Punct::EqEq | Punct::NotEq | Punct::StrictEq | Punct::StrictNe => (BinOp::Other, 7, false),
+                Punct::Lt | Punct::Gt | Punct::LtEq | Punct::GtEq => (BinOp::Other, 8, false),
+                Punct::Shl | Punct::Shr | Punct::UShr => (BinOp::Other, 9, false),
+                Punct::Plus | Punct::Minus => (BinOp::Other, 10, false),
+                Punct::Star | Punct::Slash | Punct::Percent => (BinOp::Other, 11, false),
+                Punct::Pow => (BinOp::Other, 12, true),
+                _ => return None,
+            },
+            Tok::Keyword(Keyword::Instanceof) => (BinOp::Other, 8, false),
+            Tok::Keyword(Keyword::In) if self.no_in => return None,
+            Tok::Keyword(Keyword::In) => (BinOp::Other, 8, false),
             _ => return None,
-        };
-        binary_prec(op).map(|(prec, right)| (op, prec, right))
+        })
     }
 
     fn binary_chain(&mut self, min_prec: u8) -> Option<K> {
@@ -1152,7 +1179,7 @@ impl<'a> Pre<'a> {
         if let Tok::Ident(n) = self.kind() {
             if n.starts_with('#') {
                 // `#x in obj`: the brand check, valid only as the left operand of `in`.
-                if min_prec > 8 || self.no_in || !matches!(self.peek(1), Some(Tok::Keyword("in"))) {
+                if min_prec > 8 || self.no_in || !matches!(self.peek(1), Some(Tok::Keyword(Keyword::In))) {
                     return None;
                 }
                 self.private.push(n.clone());
@@ -1175,7 +1202,7 @@ impl<'a> Pre<'a> {
             if prec < min_prec {
                 break;
             }
-            let nullish = op == "??";
+            let nullish = op == BinOp::Nullish;
             if nullish && !left_paren && left == K::AndOr {
                 return None;
             }
@@ -1188,7 +1215,7 @@ impl<'a> Pre<'a> {
             }
             left_paren = false;
             self.last_paren = false;
-            left = if op == "&&" || op == "||" {
+            left = if op == BinOp::Logical {
                 K::AndOr
             } else {
                 K::Other
@@ -1214,8 +1241,8 @@ impl<'a> Pre<'a> {
             return Some(K::Other);
         }
         let op = match self.kind() {
-            Tok::Punct(p @ ("+" | "-" | "!" | "~")) => Some(*p),
-            Tok::Keyword(k @ ("typeof" | "void" | "delete")) => Some(*k),
+            Tok::Punct(p @ (Punct::Plus | Punct::Minus | Punct::Bang | Punct::Tilde)) => Some(p.as_str()),
+            Tok::Keyword(k @ (Keyword::Typeof | Keyword::Void | Keyword::Delete)) => Some(k.as_str()),
             _ => None,
         };
         if let Some(op) = op {
@@ -1239,7 +1266,7 @@ impl<'a> Pre<'a> {
             return Some(K::Other);
         }
         let expr = self.lhs()?;
-        if !self.tok().nl_before && (self.is_p("++") || self.is_p("--")) {
+        if !self.tok().nl_before() && (self.is_p("++") || self.is_p("--")) {
             self.advance();
             self.update_target(expr)?;
             return Some(K::Other);
@@ -1265,11 +1292,11 @@ impl<'a> Pre<'a> {
         loop {
             self.chain_link()?;
             match self.kind() {
-                Tok::Punct("(") => {
+                Tok::Punct(Punct::LParen) => {
                     self.args()?;
                     k = K::Call;
                 }
-                Tok::Punct(".") => {
+                Tok::Punct(Punct::Dot) => {
                     self.advance();
                     let private = self.property_name()?;
                     if private && k == K::Super {
@@ -1277,7 +1304,7 @@ impl<'a> Pre<'a> {
                     }
                     k = K::Member(private);
                 }
-                Tok::Punct("[") => {
+                Tok::Punct(Punct::LBracket) => {
                     self.advance();
                     self.expr_allow_in()?;
                     self.expect_p("]")?;
@@ -1291,7 +1318,7 @@ impl<'a> Pre<'a> {
                     self.template(parts, true)?;
                     k = K::Other;
                 }
-                Tok::Punct("?.") => {
+                Tok::Punct(Punct::OptChain) => {
                     had_optional = true;
                     self.advance();
                     if self.is_p("(") {
@@ -1338,7 +1365,7 @@ impl<'a> Pre<'a> {
         loop {
             self.chain_link()?;
             match self.kind() {
-                Tok::Punct(".") => {
+                Tok::Punct(Punct::Dot) => {
                     self.advance();
                     let private = self.property_name()?;
                     if private && k == K::Super {
@@ -1351,7 +1378,7 @@ impl<'a> Pre<'a> {
                     self.template(parts, true)?;
                     k = K::Other;
                 }
-                Tok::Punct("[") => {
+                Tok::Punct(Punct::LBracket) => {
                     self.advance();
                     self.expr_allow_in()?;
                     self.expect_p("]")?;
@@ -1413,11 +1440,11 @@ impl<'a> Pre<'a> {
                 crate::regex::Regex::new(&re.body, &re.flags).ok()?;
                 Some(K::Other)
             }
-            Tok::Keyword("true" | "false" | "null" | "this") => {
+            Tok::Keyword(Keyword::True | Keyword::False | Keyword::Null | Keyword::This) => {
                 self.advance();
                 Some(K::Other)
             }
-            Tok::Keyword("super") => {
+            Tok::Keyword(Keyword::Super) => {
                 self.advance();
                 let ok = if self.is_p(".") || self.is_p("[") {
                     self.super_prop_ok
@@ -1426,13 +1453,13 @@ impl<'a> Pre<'a> {
                 };
                 ok.then_some(K::Super)
             }
-            Tok::Keyword("function") => {
+            Tok::Keyword(Keyword::Function) => {
                 self.function(false, true)?;
                 Some(K::Other)
             }
             Tok::Ident(n)
                 if n == "async"
-                    && matches!(self.peek(1), Some(Tok::Keyword("function")))
+                    && matches!(self.peek(1), Some(Tok::Keyword(Keyword::Function)))
                     && !self.nl_at(1) =>
             {
                 self.advance();
@@ -1440,19 +1467,19 @@ impl<'a> Pre<'a> {
                 Some(K::Other)
             }
             Tok::Ident(_) => self.ident_ref(),
-            Tok::Punct("(") => {
+            Tok::Punct(Punct::LParen) => {
                 self.advance();
                 let inner = self.expr_allow_in()?;
                 self.expect_p(")")?;
                 self.last_paren = true;
                 Some(inner)
             }
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 self.array()?;
                 self.last_paren = false;
                 Some(K::Other)
             }
-            Tok::Punct("{") => {
+            Tok::Punct(Punct::LBrace) => {
                 self.object()?;
                 self.last_paren = false;
                 Some(K::Other)
@@ -1546,7 +1573,7 @@ impl<'a> Pre<'a> {
                 self.advance();
                 Some(Pk::Other)
             }
-            Tok::Punct("[") => {
+            Tok::Punct(Punct::LBracket) => {
                 self.advance();
                 self.assign_allow_in()?;
                 self.expect_p("]")?;
@@ -1569,7 +1596,7 @@ impl<'a> Pre<'a> {
                 continue;
             }
             let accessor = (self.is_word("get") || self.is_word("set"))
-                && !matches!(self.peek(1), Some(Tok::Punct(":" | "," | "}" | "(")));
+                && !matches!(self.peek(1), Some(Tok::Punct(Punct::Colon | Punct::Comma | Punct::RBrace | Punct::LParen)));
             if accessor {
                 let is_get = self.is_word("get");
                 self.advance();
@@ -1589,10 +1616,10 @@ impl<'a> Pre<'a> {
                 continue;
             }
             let is_async = self.is_word("async")
-                && !matches!(self.peek(1), Some(Tok::Punct(":" | "," | "}" | "(" | "=")));
+                && !matches!(self.peek(1), Some(Tok::Punct(Punct::Colon | Punct::Comma | Punct::RBrace | Punct::LParen | Punct::Assign)));
             if is_async {
                 self.advance();
-                if self.tok().nl_before && !self.is_p("*") {
+                if self.tok().nl_before() && !self.is_p("*") {
                     return None;
                 }
             }
@@ -1797,6 +1824,10 @@ impl<'a> Pre<'a> {
     /// directive or inherited).
     fn fn_body(&mut self, pnames: &[Name], params_simple: bool) -> Option<bool> {
         self.expect_p("{")?;
+        // A skimmed body has no tokens here; the full checking parse re-lexes it.
+        if matches!(self.kind(), Tok::Skim) {
+            return None;
+        }
         let inner_strict = prologue_has_use_strict_in(self.toks, self.pos);
         if inner_strict && !params_simple {
             return None;
@@ -1840,12 +1871,12 @@ impl<'a> Pre<'a> {
     /// `None` not valid.
     fn try_arrow(&mut self) -> Option<Option<K>> {
         let async_arrow = self.is_word("async")
-            && self.toks.get(self.pos + 1).is_some_and(|t| !t.nl_before)
-            && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct("(")));
+            && self.toks.get(self.pos + 1).is_some_and(|t| !t.nl_before())
+            && matches!(self.peek(1), Some(Tok::Ident(_) | Tok::Punct(Punct::LParen)));
         let base = usize::from(async_arrow);
         if let Some(Tok::Ident(name)) = self.peek(base) {
-            if matches!(self.peek(base + 1), Some(Tok::Punct("=>")))
-                && !self.toks[self.pos + base + 1].nl_before
+            if matches!(self.peek(base + 1), Some(Tok::Punct(Punct::Arrow)))
+                && !self.toks[self.pos + base + 1].nl_before()
             {
                 let name = name.clone();
                 for _ in 0..=base {
@@ -1862,14 +1893,14 @@ impl<'a> Pre<'a> {
                 return self.finish_arrow(&[name], true, async_arrow).map(Some);
             }
         }
-        if matches!(self.peek(base), Some(Tok::Punct("("))) {
+        if matches!(self.peek(base), Some(Tok::Punct(Punct::LParen))) {
             let Some(close) = self.matching_paren(self.pos + base) else {
                 return Some(None);
             };
             if matches!(
                 self.toks.get(close + 1).map(|t| &t.kind),
-                Some(Tok::Punct("=>"))
-            ) && !self.toks[close + 1].nl_before
+                Some(Tok::Punct(Punct::Arrow))
+            ) && !self.toks[close + 1].nl_before()
             {
                 if async_arrow {
                     self.advance();

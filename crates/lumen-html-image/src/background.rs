@@ -1,4 +1,4 @@
-use super::{composite, gradient::Prepared, Raster};
+use super::{blend_colors, composite, SourceCache, BLEND_RUN, gradient::{GradientAxis, Prepared}, Raster};
 use lumen_html::paint::{BackgroundPaint, BackgroundRepeat, ImageData, Rect, Rgba};
 
 enum MixedPaint<'a> {
@@ -226,17 +226,119 @@ pub(super) fn fill(
     let columns: Vec<Option<f32>> = (x0..x1)
         .map(|x| xaxis.sample(raster.css_x(x as f32 + 0.5)))
         .collect();
+    let (left, top, right, bottom) = (
+        raster.device_x(rect.x),
+        raster.device_y(rect.y),
+        raster.device_x(rect.x + rect.width),
+        raster.device_y(rect.y + rect.height),
+    );
+    let radii = match corners {
+        Some(corners) => corners.map(|r| [r[0] * scale, r[1] * scale]),
+        None => {
+            let radius = (radius * scale).max(0.0).min((right - left) * 0.5).min((bottom - top) * 0.5);
+            [[radius; 2]; 4]
+        }
+    };
+    let solid_interior = matches!(image, BackgroundPaint::Solid(_)) && columns.iter().all(Option::is_some);
     let mut hint = 0;
+    let mut lut = gradient
+        .as_ref()
+        .map(|g| g.lut((x1.saturating_sub(x0)) as usize * (y1.saturating_sub(y0)) as usize));
+    let axis = gradient.as_ref().map_or(GradientAxis::Free, |g| g.axis());
+    let transparent = Rgba { r: 0, g: 0, b: 0, a: 0 };
+    let column_colors: Vec<Rgba> = match (&gradient, &mut lut) {
+        (Some(g), Some(lut)) if axis == GradientAxis::Horizontal => {
+            let row = g.row_term(0.0);
+            columns
+                .iter()
+                .map(|px| px.map_or(transparent, |px| g.color_lut(lut, px, row, &mut hint)))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     for y in y0..y1 {
         let Some(py) = yaxis.sample(raster.css_y(y as f32 + 0.5)) else {
             continue;
         };
         let row = gradient.as_ref().map_or(0.0, |g| g.row_term(py));
-        for (x, px) in (x0..x1).zip(&columns) {
+        let row_color = match (&gradient, &mut lut) {
+            (Some(g), Some(lut)) if axis == GradientAxis::Vertical => {
+                Some(g.color_lut(lut, columns.iter().flatten().next().copied().unwrap_or(0.0), row, &mut hint))
+            }
+            _ => None,
+        };
+        let (full_start, full_end) = super::coverage::full_span(y as f32, left, top, right, bottom, radii);
+        let interior = (full_start.max(i64::from(x0)).min(i64::from(x1)) as u32)
+            ..(full_end.min(i64::from(x1)).max(i64::from(x0)) as u32);
+        let mut leading = x0..x1;
+        let mut trailing = x1..x1;
+        if solid_interior && interior.start < interior.end {
+            let row_start = y as usize * raster.image.width as usize;
+            let span = (row_start + interior.start as usize) * 4..(row_start + interior.end as usize) * 4;
+            if let BackgroundPaint::Solid(color) = image {
+                if color.a == 255 {
+                    let pixel = [color.r, color.g, color.b, 255];
+                    for target in raster.image.pixels[span].chunks_exact_mut(4) {
+                        target.copy_from_slice(&pixel);
+                    }
+                } else {
+                    super::blend_solid_span(&mut raster.image.pixels[span], *color);
+                }
+            }
+            leading = x0..interior.start;
+            trailing = interior.end..x1;
+        } else if interior.start < interior.end {
+            let row_start = y as usize * raster.image.width as usize;
+            let span = (row_start + interior.start as usize) * 4..(row_start + interior.end as usize) * 4;
+            let covered = &columns[(interior.start - x0) as usize..(interior.end - x0) as usize];
+            let base = (interior.start - x0) as usize;
+            let target = &mut raster.image.pixels[span];
+            let handled = match image {
+                BackgroundPaint::Gradient(_) => match axis {
+                    GradientAxis::Horizontal => {
+                        fill_span(target, covered, |i, _| column_colors[base + i]);
+                        true
+                    }
+                    GradientAxis::Vertical => {
+                        let color = row_color.unwrap();
+                        fill_span(target, covered, |_, _| color);
+                        true
+                    }
+                    GradientAxis::Free => {
+                        let g = gradient.as_ref().unwrap();
+                        let lut = lut.as_mut().unwrap();
+                        fill_span_runs(target, covered, |_, columns, out| g.color_lut_run(lut, columns, row, &mut hint, out));
+                        true
+                    }
+                },
+                BackgroundPaint::Image(image) => {
+                    fill_span(target, covered, |_, px| sample_image(image, px / xaxis.tile, py / yaxis.tile));
+                    true
+                }
+                BackgroundPaint::Worklet(image) => match &image.pixels {
+                    Some(pixels) => {
+                        fill_span(target, covered, |_, px| {
+                            sample_image(&pixels.image, px / xaxis.tile, py / yaxis.tile)
+                        });
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            };
+            if handled {
+                leading = x0..interior.start;
+                trailing = interior.end..x1;
+            }
+        }
+        for x in leading.chain(trailing) {
+            let px = &columns[(x - x0) as usize];
             let Some(px) = *px else {
                 continue;
             };
-            let coverage = if let Some(corners) = corners {
+            let coverage = if (x as i64) >= full_start && (x as i64) < full_end {
+                1.0
+            } else if let Some(corners) = corners {
                 if raster.antialias {
                     super::coverage::rounded_corners(
                         x as f32,
@@ -279,9 +381,11 @@ pub(super) fn fill(
                     };
                     paint.sample(px, py, xaxis.tile, yaxis.tile)
                 }
-                BackgroundPaint::Gradient(_) => {
-                    gradient.as_ref().unwrap().color_at(px, row, &mut hint)
-                }
+                BackgroundPaint::Gradient(_) => match axis {
+                    GradientAxis::Horizontal => column_colors[(x - x0) as usize],
+                    GradientAxis::Vertical => row_color.unwrap(),
+                    GradientAxis::Free => gradient.as_ref().unwrap().color_lut(lut.as_mut().unwrap(), px, row, &mut hint),
+                },
                 BackgroundPaint::Image(image) => {
                     sample_image(image, px / xaxis.tile, py / yaxis.tile)
                 }
@@ -300,6 +404,35 @@ pub(super) fn fill(
         }
     }
 }
+
+fn fill_span(target: &mut [u8], columns: &[Option<f32>], mut color: impl FnMut(usize, f32) -> Rgba) {
+    fill_span_runs(target, columns, |start, columns, out| {
+        for (index, (slot, px)) in out.iter_mut().zip(columns).enumerate() {
+            *slot = match *px {
+                Some(px) => color(start + index, px),
+                None => TRANSPARENT,
+            };
+        }
+    });
+}
+
+/// `colors` receives the run's start column, its sample positions and the colours to fill
+/// (transparent where a position is `None`).
+fn fill_span_runs(
+    target: &mut [u8],
+    columns: &[Option<f32>],
+    mut colors: impl FnMut(usize, &[Option<f32>], &mut [Rgba]),
+) {
+    let mut cache = SourceCache::new();
+    let mut staged = [TRANSPARENT; BLEND_RUN];
+    for (chunk, (pixels, columns)) in target.chunks_mut(BLEND_RUN * 4).zip(columns.chunks(BLEND_RUN)).enumerate() {
+        let out = &mut staged[..columns.len()];
+        colors(chunk * BLEND_RUN, columns, out);
+        blend_colors(pixels, out, &mut cache);
+    }
+}
+
+const TRANSPARENT: Rgba = Rgba { r: 0, g: 0, b: 0, a: 0 };
 
 fn sample_image(image: &ImageData, x: f32, y: f32) -> Rgba {
     if !image.is_valid() {

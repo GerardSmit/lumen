@@ -44,6 +44,9 @@ pub fn parse_script_lazy(_: &str) -> Result<Vec<Stmt>, ParseError> {
 pub fn parse_dynamic_function(_: &str) -> Result<Vec<Stmt>, ParseError> {
     unavailable()
 }
+pub fn parse_dynamic_function_shared(_: crate::srctext::Src) -> Result<Vec<Stmt>, ParseError> {
+    unavailable()
+}
 pub fn parse_script_eval(
     _: &str,
     _: bool,

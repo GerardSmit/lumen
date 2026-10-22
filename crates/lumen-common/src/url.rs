@@ -1144,6 +1144,13 @@ impl Url {
 
 /// The basic URL parser (ada's `parser::parse_url` for `ada::url`); `None` on failure.
 pub fn parse_url(user_input: &str, base: Option<&Url>) -> Option<Url> {
+    parse_url_encoded(user_input, base, None)
+}
+
+/// `parse_url` with the WHATWG "encoding" parameter: the query of a special, non-WebSocket URL is
+/// encoded with `query_encoding` (an Encoding Standard label, e.g. a document's character
+/// encoding) instead of UTF-8.
+pub fn parse_url_encoded(user_input: &str, base: Option<&Url>, query_encoding: Option<&str>) -> Option<Url> {
     let mut url = Url::default();
     let cleaned = remove_tab_newline(user_input.as_bytes());
     let mut data: &[u8] = &cleaned;
@@ -1362,7 +1369,8 @@ pub fn parse_url(user_input: &str, base: Option<&Url>) -> Option<Url> {
                 } else {
                     query_set
                 };
-                url.query = Some(percent_encode(&data[pos..], set));
+                let encoding = query_encoding.filter(|_| url.is_special() && !matches!(url.scheme.as_str(), "ws" | "wss"));
+                url.query = Some(encode_query(&data[pos..], set, encoding));
                 url.set_fragment(fragment);
                 return Some(url);
             }
@@ -1510,6 +1518,28 @@ pub fn parse_url(user_input: &str, base: Option<&Url>) -> Option<Url> {
     }
     url.set_fragment(fragment);
     Some(url)
+}
+
+fn encode_query(data: &[u8], set: EncodeSet, encoding: Option<&str>) -> String {
+    #[cfg(feature = "web-encoding")]
+    if let (Some(label), Ok(text)) = (encoding, core::str::from_utf8(data)) {
+        if let Some(encoded) = crate::encoding::percent_encode_query(label, text, set) {
+            return encoded;
+        }
+    }
+    let _ = encoding;
+    percent_encode(data, set)
+}
+
+/// `parse` whose query uses `query_encoding`; see `parse_url_encoded`.
+pub fn parse_with_encoding(input: &str, base: Option<&str>, query_encoding: &str) -> Result<Url, String> {
+    let Some(base) = base else {
+        return parse_url_encoded(input, None, Some(query_encoding)).ok_or_else(|| format!("invalid URL '{input}'"));
+    };
+    with_parsed_base(base, |parsed| match parsed {
+        Some(parsed) => parse_url_encoded(input, Some(parsed), Some(query_encoding)).ok_or_else(|| format!("invalid URL '{input}'")),
+        None => Err(format!("invalid base URL '{base}'")),
+    })
 }
 
 /// `input` parsed on its own, or against `base` when given. The error text is for Rust callers
@@ -1667,6 +1697,22 @@ pub fn form_urlencoded_serialize<'a>(pairs: impl IntoIterator<Item = (&'a str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "web-encoding")]
+    #[test]
+    fn query_uses_the_given_encoding_for_special_non_websocket_urls() {
+        let q = |input: &str, label: &str| parse_with_encoding(input, None, label).unwrap().query.unwrap();
+        assert_eq!(q("https://h/?\u{a7}", "big5"), "%A1%B1");
+        assert_eq!(q("https://h/?\u{1F600}", "big5"), "%26%23128512%3B");
+        assert_eq!(q("https://h/?\u{3042}", "shift_jis"), "%82%A0");
+        assert_eq!(q("https://h/?\u{AC00}", "euc-kr"), "%B0%A1");
+        assert_eq!(q("https://h/?\u{3042}", "iso-2022-jp"), "%1B$B$%22%1B(B");
+        assert_eq!(q("https://h/?\u{a7}", "utf-8"), "%C2%A7");
+        assert_eq!(q("https://h/?\u{a7}", "utf-16le"), "%C2%A7");
+        assert_eq!(q("wss://h/?\u{a7}", "big5"), "%C2%A7");
+        assert_eq!(q("foo://h/?\u{a7}", "big5"), "%C2%A7");
+        assert_eq!(parse("https://h/?\u{a7}", None).unwrap().query.unwrap(), "%C2%A7");
+    }
 
     fn href(s: &str) -> String {
         parse(s, None).unwrap().href()

@@ -21,6 +21,7 @@ pub mod canvas;
 mod coverage;
 mod gpui;
 mod gradient;
+mod pool;
 mod shadow;
 mod snap;
 mod transform;
@@ -167,7 +168,117 @@ pub fn render_region_with_mode_cached(
     for row in top as usize..bottom as usize {
         target.pixels[row * stride + left as usize * 4..row * stride + right as usize * 4].fill(0);
     }
-    replay_into(&replay, target, scale, true, true, Some(font), cache, clip)?;
+    let replayed = replay_into(&replay, target, scale, true, true, Some(font), cache, clip);
+    pool::recycle_layers(replay);
+    replayed?;
+    Ok(true)
+}
+
+/// Device-pixel bounds `[left, top, right, bottom]` of a CSS `region` in a
+/// `width`x`height` device frame, or `None` when the region is empty or a
+/// device edge cannot be clipped exactly at this scale.
+pub fn exact_device_bounds(region: Rect, scale: f32, width: u32, height: u32) -> Option<[u32; 4]> {
+    if !scale.is_finite() || scale <= 0.0 || ![region.x, region.y, region.width, region.height].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let left = ((region.x * scale).floor().max(0.0) as u32).min(width);
+    let top = ((region.y * scale).floor().max(0.0) as u32).min(height);
+    let right = (((region.x + region.width) * scale).ceil().max(0.0) as u32).min(width);
+    let bottom = (((region.y + region.height) * scale).ceil().max(0.0) as u32).min(height);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let exact = |pixel: u32| (pixel as f32 / scale) * scale == pixel as f32;
+    if (left != 0 && !exact(left)) || (top != 0 && !exact(top)) || (right != width && !exact(right)) || (bottom != height && !exact(bottom)) {
+        return None;
+    }
+    Some([left, top, right, bottom])
+}
+
+/// Draws the device rectangle `bounds` (`[left, top, right, bottom]`, as from
+/// `exact_device_bounds`) of a Gpui-mode frame into `rows`, which holds the
+/// full-width frame rows starting at device row `rows_top`. The pixels equal
+/// a whole-frame render's, so disjoint rectangles may be drawn on separate
+/// threads, each with its own `cache`. `Ok(false)` leaves `rows` untouched:
+/// the mode or the frame size does not allow it and the caller renders whole.
+pub fn render_device_rect_with_mode_cached(
+    list: &DisplayList,
+    width_css: u32,
+    height_css: u32,
+    scale: f32,
+    mode: RasterizationMode,
+    font: &dyn FontProvider,
+    cache: &mut GlyphCache,
+    bounds: [u32; 4],
+    rows: &mut [u8],
+    rows_top: u32,
+) -> Result<bool, ImageError> {
+    if mode != RasterizationMode::Gpui {
+        return Ok(false);
+    }
+    let _html_allocations = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::HTML);
+    if !scale.is_finite() || scale <= 0.0 || width_css == 0 || height_css == 0 {
+        return Err(ImageError::InvalidViewport);
+    }
+    let width = (width_css as f64 * scale as f64).round();
+    let height = (height_css as f64 * scale as f64).round();
+    if width < 1.0 || height < 1.0 || width > u32::MAX as f64 || height > u32::MAX as f64 {
+        return Err(ImageError::InvalidViewport);
+    }
+    let (width, height) = (width as u32, height as u32);
+    let [left, top, right, bottom] = bounds;
+    if right <= left || bottom <= top || right > width || bottom > height || top < rows_top {
+        return Err(ImageError::InvalidViewport);
+    }
+    let stride = width as usize * 4;
+    let first = (top - rows_top) as usize * stride;
+    if rows.len() < first + (bottom - top) as usize * stride {
+        return Err(ImageError::InvalidViewport);
+    }
+    let css_x = |pixel: u32, edge: u32, extent: u32| if pixel == 0 { 0.0 } else if pixel == edge { extent as f32 } else { pixel as f32 / scale };
+    let clip = Rect {
+        x: css_x(left, width, width_css),
+        y: css_x(top, height, height_css),
+        width: css_x(right, width, width_css) - css_x(left, width, width_css),
+        height: css_x(bottom, height, height_css) - css_x(top, height, height_css),
+    };
+    let keep = clip.expanded(2.0 / scale);
+    let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
+    let resolved = gpui_snapped(list, scale, font, cache, full, Some(keep))?;
+    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, full)?;
+    let (band_width, band_height) = (right - left, bottom - top);
+    let len = (band_width as usize)
+        .checked_mul(band_height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(ImageError::TooLarge)?;
+    let pixels = pool::take_zeroed(len)?;
+    let mut image = Rgba8Image { width: band_width, height: band_height, pixels };
+    let mut sink = Raster {
+        image: &mut image,
+        scale,
+        antialias: true,
+        gpui_coverage: true,
+        device_origin: [i64::from(left), i64::from(top)],
+        source_window: true,
+        source_reserved: None,
+        clips: vec![clip],
+        font: Some(font),
+        cache,
+        error: None,
+    };
+    let replayed = replay.replay(&mut sink).map_err(ImageError::DisplayList);
+    let error = sink.error.take();
+    pool::recycle_layers(replay);
+    replayed?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let band_stride = band_width as usize * 4;
+    for row in 0..band_height as usize {
+        let at = first + row * stride + left as usize * 4;
+        rows[at..at + band_stride].copy_from_slice(&image.pixels[row * band_stride..(row + 1) * band_stride]);
+    }
+    pool::recycle(image.pixels);
     Ok(true)
 }
 
@@ -504,6 +615,8 @@ pub struct GlyphCache {
     bytes: usize,
     hits: u64,
     misses: u64,
+    shadow_masks: HashMap<shadow::MaskKey, std::sync::Arc<[u8]>>,
+    shadow_bytes: usize,
 }
 
 /// Cumulative glyph coverage cache counters; callers diff two reads for a frame.
@@ -542,7 +655,27 @@ impl GlyphCache {
         Some(&*coverage)
     }
 
+    fn shadow_mask(&self, key: &shadow::MaskKey) -> Option<std::sync::Arc<[u8]>> {
+        self.shadow_masks.get(key).cloned()
+    }
+
+    fn insert_shadow_mask(&mut self, key: shadow::MaskKey, mask: std::sync::Arc<[u8]>) {
+        const SHADOW_MASK_BYTES: usize = 16 << 20;
+        const SHADOW_MASK_ENTRIES: usize = 64;
+        if mask.len() > SHADOW_MASK_BYTES / 4 {
+            return;
+        }
+        if self.shadow_bytes + mask.len() > SHADOW_MASK_BYTES || self.shadow_masks.len() >= SHADOW_MASK_ENTRIES {
+            self.shadow_masks.clear();
+            self.shadow_bytes = 0;
+        }
+        self.shadow_bytes += mask.len();
+        self.shadow_masks.insert(key, mask);
+    }
+
     pub fn clear(&mut self) {
+        self.shadow_masks.clear();
+        self.shadow_bytes = 0;
         self.glyphs.clear();
         self.recency.clear();
         self.bytes = 0;
@@ -818,18 +951,21 @@ impl ReplaySink for Raster<'_> {
             ..((bounds.x + bounds.width).floor().min(x1 as f32) as u32);
         for y in y0..y1 {
             let mut edges = (x0..x1, 0..0);
-            if color.a == 255
-                && self.antialias
+            if self.antialias
                 && !solid_columns.is_empty()
                 && bounds.y <= y as f32
                 && bounds.y + bounds.height >= y as f32 + 1.0
             {
-                let pixel = [color.r, color.g, color.b, 255];
                 let row = (y as usize * self.image.width as usize) * 4;
                 let span =
                     row + solid_columns.start as usize * 4..row + solid_columns.end as usize * 4;
-                for target in self.image.pixels[span].chunks_exact_mut(4) {
-                    target.copy_from_slice(&pixel);
+                if color.a == 255 {
+                    let pixel = [color.r, color.g, color.b, 255];
+                    for target in self.image.pixels[span].chunks_exact_mut(4) {
+                        target.copy_from_slice(&pixel);
+                    }
+                } else {
+                    blend_solid_span(&mut self.image.pixels[span], color);
                 }
                 edges = (x0..solid_columns.start, solid_columns.end..x1);
             }
@@ -937,12 +1073,12 @@ impl ReplaySink for Raster<'_> {
                 if start < end {
                     let row = y as usize * self.image.width as usize;
                     let span = (row + start as usize) * 4..(row + end as usize) * 4;
-                    for target in self.image.pixels[span].chunks_exact_mut(4) {
-                        if color.a == 255 {
+                    if color.a == 255 {
+                        for target in self.image.pixels[span].chunks_exact_mut(4) {
                             target.copy_from_slice(&[color.r, color.g, color.b, 255]);
-                        } else {
-                            composite(target, color, 1.0);
                         }
+                    } else {
+                        blend_solid_span(&mut self.image.pixels[span], color);
                     }
                     edges = (x0..start, end..x1);
                 }
@@ -1136,26 +1272,23 @@ impl ReplaySink for Raster<'_> {
                 ..(sy as usize + 1) * image.width as usize * 4];
             let start = (y as usize * self.image.width as usize + x0 as usize) * 4;
             let targets = &mut self.image.pixels[start..start + columns.len() * 4];
-            for (target, &(sx, left)) in targets.chunks_exact_mut(4).zip(&columns) {
-                let coverage = left * top;
-                if coverage == 0.0 {
-                    continue;
+            let mut cache = SourceCache::new();
+            let mut staged = [Rgba { r: 0, g: 0, b: 0, a: 0 }; BLEND_RUN];
+            for (targets, columns) in targets.chunks_mut(BLEND_RUN * 4).zip(columns.chunks(BLEND_RUN)) {
+                for ((target, &(sx, left)), staged) in targets.chunks_exact_mut(4).zip(columns).zip(staged.iter_mut()) {
+                    let coverage = left * top;
+                    let pixel = &source_row[sx..sx + 4];
+                    let color = Rgba { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
+                    *staged = if coverage == 1.0 {
+                        color
+                    } else {
+                        if coverage != 0.0 {
+                            composite(target, color, coverage);
+                        }
+                        Rgba { r: 0, g: 0, b: 0, a: 0 }
+                    };
                 }
-                let pixel = &source_row[sx..sx + 4];
-                if pixel[3] == 255 && coverage == 1.0 {
-                    target.copy_from_slice(pixel);
-                } else {
-                    composite(
-                        target,
-                        Rgba {
-                            r: pixel[0],
-                            g: pixel[1],
-                            b: pixel[2],
-                            a: pixel[3],
-                        },
-                        coverage,
-                    );
-                }
+                blend_colors(targets, &staged[..columns.len()], &mut cache);
             }
         }
     }
@@ -1407,7 +1540,178 @@ impl ReplaySink for Raster<'_> {
 // limits the crop and is not another antialiased mask.
 
 fn composite(dst: &mut [u8], src: Rgba, coverage: f32) {
-    composite_internal(dst, src, coverage, 1.0, true);
+    if coverage == 1.0 && src.a == 255 {
+        dst.copy_from_slice(&[src.r, src.g, src.b, 255]);
+        return;
+    }
+    if let Some(source) = PremultipliedSource::new(src, coverage_u8(coverage)) {
+        source.blend(dst);
+    }
+}
+
+fn coverage_u8(coverage: f32) -> u32 {
+    (coverage.clamp(0.0, 1.0) * 255.0 + 0.5) as u32
+}
+
+/// A straight-alpha colour scaled by an 8-bit coverage, ready for integer source-over onto
+/// straight-alpha RGBA8 pixels. Equals the f32 `composite_internal(.., true)` within one level
+/// per channel (coverage is quantized to 1/255 once).
+struct PremultipliedSource {
+    color: [u32; 3],
+    alpha: u32,
+    inverse: u32,
+}
+
+/// Reuses the premultiplied source while consecutive opaque-coverage pixels share one colour.
+struct SourceCache {
+    color: Rgba,
+    source: Option<PremultipliedSource>,
+    primed: bool,
+}
+
+impl SourceCache {
+    fn new() -> Self {
+        Self { color: Rgba { r: 0, g: 0, b: 0, a: 0 }, source: None, primed: false }
+    }
+
+    /// Equals `composite(dst, src, 1.0)`.
+    #[inline]
+    fn composite(&mut self, dst: &mut [u8], src: Rgba) {
+        if src.a == 255 {
+            dst.copy_from_slice(&[src.r, src.g, src.b, 255]);
+            return;
+        }
+        if !self.primed || self.color != src {
+            self.source = PremultipliedSource::new(src, 255);
+            self.color = src;
+            self.primed = true;
+        }
+        if let Some(source) = &self.source {
+            source.blend(dst);
+        }
+    }
+}
+
+impl PremultipliedSource {
+    fn new(src: Rgba, coverage: u32) -> Option<Self> {
+        if coverage == 0 || src.a == 0 {
+            return None;
+        }
+        let a = u32::from(src.a);
+        let channels = [src.r, src.g, src.b].map(u32::from);
+        let (alpha, color) = if coverage >= 255 {
+            (a, channels.map(|channel| div255(channel * a)))
+        } else {
+            (
+                div255(a * coverage),
+                channels.map(|channel| (channel * a * coverage + 32512) / 65025),
+            )
+        };
+        if alpha == 0 {
+            return None;
+        }
+        Some(Self { color, alpha, inverse: 255 - alpha })
+    }
+
+    #[inline]
+    fn blend(&self, pixel: &mut [u8]) {
+        let destination_alpha = u32::from(pixel[3]);
+        if self.alpha == 255 {
+            pixel.copy_from_slice(&[self.color[0] as u8, self.color[1] as u8, self.color[2] as u8, 255]);
+        } else if destination_alpha == 255 {
+            for (target, source) in pixel.iter_mut().zip(self.color) {
+                *target = (source + div255(u32::from(*target) * self.inverse)).min(255) as u8;
+            }
+        } else if destination_alpha == 0 {
+            pixel.copy_from_slice(&[
+                unpremultiply(self.color[0], self.alpha),
+                unpremultiply(self.color[1], self.alpha),
+                unpremultiply(self.color[2], self.alpha),
+                self.alpha as u8,
+            ]);
+        } else {
+            let alpha = self.alpha + div255(destination_alpha * self.inverse);
+            for (target, source) in pixel.iter_mut().zip(self.color) {
+                let destination = div255(u32::from(*target) * destination_alpha);
+                let color = source + div255(destination * self.inverse);
+                *target = ((color * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+            pixel[3] = alpha.min(255) as u8;
+        }
+    }
+}
+
+fn unpremultiply(color: u32, alpha: u32) -> u8 {
+    ((color * 255 + alpha / 2) / alpha).min(255) as u8
+}
+
+/// Source-over of one constant colour across whole pixels; each pixel equals `composite(.., 1.0)`.
+fn blend_solid_span(span: &mut [u8], src: Rgba) {
+    let Some(source) = PremultipliedSource::new(src, 255) else {
+        return;
+    };
+    if source.alpha == 255 {
+        let pixel = [source.color[0] as u8, source.color[1] as u8, source.color[2] as u8, 255];
+        for target in span.chunks_exact_mut(4) {
+            target.copy_from_slice(&pixel);
+        }
+        return;
+    }
+    let color = source.color.map(|channel| channel as u16);
+    let inverse = source.inverse as u16;
+    for run in span.chunks_mut(BLEND_RUN * 4) {
+        if run.chunks_exact(4).fold(255u8, |alpha, pixel| alpha & pixel[3]) == 255 {
+            for pixel in run.chunks_exact_mut(4) {
+                for channel in 0..3 {
+                    pixel[channel] = (color[channel] + div255_u16(u16::from(pixel[channel]) * inverse)).min(255) as u8;
+                }
+            }
+        } else {
+            for pixel in run.chunks_exact_mut(4) {
+                source.blend(pixel);
+            }
+        }
+    }
+}
+
+const BLEND_RUN: usize = 64;
+
+/// Source-over of straight-alpha `colors` onto whole pixels; a colour with alpha 0 leaves its
+/// pixel unchanged. Each pixel equals `SourceCache::composite`.
+fn blend_colors(span: &mut [u8], colors: &[Rgba], cache: &mut SourceCache) {
+    for (pixels, colors) in span.chunks_mut(BLEND_RUN * 4).zip(colors.chunks(BLEND_RUN)) {
+        let pixels = &mut pixels[..colors.len() * 4];
+        if pixels.chunks_exact(4).fold(255u8, |alpha, pixel| alpha & pixel[3]) == 255 {
+            for (pixel, color) in pixels.chunks_exact_mut(4).zip(colors) {
+                let alpha = u16::from(color.a);
+                let inverse = 255 - alpha;
+                let source = [color.r, color.g, color.b];
+                for channel in 0..3 {
+                    pixel[channel] = (div255_u16(u16::from(source[channel]) * alpha)
+                        + div255_u16(u16::from(pixel[channel]) * inverse))
+                    .min(255) as u8;
+                }
+            }
+        } else {
+            for (pixel, color) in pixels.chunks_exact_mut(4).zip(colors) {
+                if color.a != 0 {
+                    cache.composite(pixel, *color);
+                }
+            }
+        }
+    }
+}
+
+fn div255(value: u32) -> u32 {
+    let value = value + 128;
+    (value + (value >> 8)) >> 8
+}
+
+/// `div255` for products of two bytes, which keeps every intermediate within 16 bits.
+#[inline(always)]
+fn div255_u16(value: u16) -> u16 {
+    let value = value + 128;
+    (value + (value >> 8)) >> 8
 }
 
 fn composite_native(dst: &mut [u8], src: Rgba, coverage: f32, rgb_scale: f32) {
@@ -1446,6 +1750,22 @@ fn composite_disjoint_samples(dst: &mut [u8], colors: &[Rgba; 8], hits: &[u32; 8
 fn composite_premultiplied(dst: &mut [u8], source: [f32; 3], sa: f32, quantize_sources: bool) {
     if sa == 0.0 {
         return;
+    }
+    if quantize_sources {
+        if sa == 1.0 {
+            for (target, source) in dst.iter_mut().zip(source) {
+                *target = source.round().min(255.0) as u8;
+            }
+            dst[3] = 255;
+            return;
+        }
+        if dst[3] == 255 {
+            for (target, source) in dst.iter_mut().zip(source) {
+                let color = source.round() + (*target as f32 * (1.0 - sa)).round();
+                *target = color.min(255.0) as u8;
+            }
+            return;
+        }
     }
     let da = dst[3] as f32 / 255.0;
     let out_a = sa + da * (1.0 - sa);
@@ -1565,7 +1885,11 @@ fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
         return Err(ImageError::InvalidViewport);
     }
     let mut bytes = 0;
-    let mut resolved = resolve_layers_region(&list.0, scale, Some(font), cache, &mut bytes,false,region)?;
+    let layer_region = match (region, skip_outside) {
+        (Some(region), Some(keep)) => region.intersection(keep).or(Some(region)),
+        _ => region,
+    };
+    let mut resolved = resolve_layers_region(&list.0, scale, Some(font), cache, &mut bytes,false,layer_region)?;
     for command in &mut resolved.0 {
         let rect = match command {
             Command::FillGradient { rect, .. } => *rect,
@@ -1605,12 +1929,28 @@ fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
         if width > u32::MAX as f32 || height > u32::MAX as f32 {
             return Err(ImageError::TooLarge);
         }
+        // Only the part inside `keep` is rasterized, at the device offset it
+        // has in the whole primitive, so its pixels equal the whole raster's.
+        let (crop_left, crop_top, crop_width, crop_height) = match skip_outside {
+            Some(keep) => {
+                let crop_left = ((keep.x * scale).floor().max(left)).min(left + width);
+                let crop_top = ((keep.y * scale).floor().max(top)).min(top + height);
+                let crop_right = (((keep.x + keep.width) * scale).ceil().min(left + width)).max(crop_left);
+                let crop_bottom = (((keep.y + keep.height) * scale).ceil().min(top + height)).max(crop_top);
+                (crop_left, crop_top, crop_right - crop_left, crop_bottom - crop_top)
+            }
+            None => (left, top, width, height),
+        };
+        if crop_width <= 0.0 || crop_height <= 0.0 {
+            *command=Command::FillRect{rect:Rect{x:0.0,y:0.0,width:0.0,height:0.0},color:Rgba{r:0,g:0,b:0,a:0}};
+            continue;
+        }
         // Primitive rasters for one frame coexist, so they share a frame
         // budget rather than one layer's. A primitive past it stays a vector
         // command for the consumer instead of failing the whole frame.
         let Ok(allocation) = lumen_common::limits::size::repeat(
-            width as usize,
-            height as usize,
+            crop_width as usize,
+            crop_height as usize,
             MAX_GPUI_PRIMITIVE_BYTES.saturating_sub(bytes) / 4,
         ) else {
             continue;
@@ -1620,20 +1960,22 @@ fn rasterize_gpui_region(list:&DisplayList,scale:f32,font:&dyn FontProvider,
         let (x, y) = (left / scale, top / scale);
         let mut translated = command.clone();
         translate_command(&mut translated, -x, -y);
-        let raster = render_scaled_region(
+        let raster = render_scaled_region_at(
             &DisplayList(vec![translated]),
-            width as u32,
-            height as u32,
+            crop_width as u32,
+            crop_height as u32,
             scale,
             Some(font),
             cache,
+            [(crop_left - left) as i64, (crop_top - top) as i64],
+            None,
         )?;
         *command = Command::Image {
             rect: Rect {
-                x,
-                y,
-                width: width / scale,
-                height: height / scale,
+                x: crop_left / scale,
+                y: crop_top / scale,
+                width: crop_width / scale,
+                height: crop_height / scale,
             },
             image: Arc::new(ImageData {
                 width: raster.width,
@@ -1690,6 +2032,11 @@ fn filter_blur_padding(sigma: f32, scale: f32) -> Result<usize, ImageError> {
     let operating=sigma*scale;
     if !operating.is_finite() { return Err(ImageError::TooLarge); }
     if operating==0.0 || !operating.is_normal() { return Ok(0); }
+    if operating>DOWNSAMPLE_BLUR_SIGMA {
+        let factor=(1usize<<downsample_shift(sigma,scale)) as f32;
+        let low=shadow::blur_padding(operating*2.0/factor)?;
+        return low.checked_add(3).and_then(|blocks|blocks.checked_mul(factor as usize)).ok_or(ImageError::TooLarge);
+    }
     if operating>=2.0 { return shadow::blur_padding(operating*2.0); }
     // The maintained Gaussian's small-sigma kernel is contained within this
     // conservative support. Transparent padding makes its clamp edge zero.
@@ -1742,11 +2089,96 @@ fn filter_output_bounds(mut bounds:Option<Rect>,filters:&[lumen_common::filter::
     }Ok(bounds)
 }
 
-fn blur_filter_plane(mask:Vec<u8>,width:u32,height:u32,sigma:f32,scale:f32,reserved:usize)
+const DOWNSAMPLE_BLUR_SIGMA:f32=4.0;
+const MAX_BLUR_DOWNSAMPLE_SHIFT:u32=4;
+
+fn downsample_shift(sigma:f32,scale:f32)->u32 {
+    let mut shift=0;
+    while shift<MAX_BLUR_DOWNSAMPLE_SHIFT && sigma*scale/((1u32<<shift) as f32)>DOWNSAMPLE_BLUR_SIGMA {shift+=1;}
+    shift
+}
+
+fn blur_plane_downsampled(mask:Vec<u8>,width:u32,height:u32,sigma:f32,scale:f32,reserved:usize,origin:[i64;2])->Result<Vec<u8>,ImageError> {
+    let (w,h)=(width as usize,height as usize);
+    if w.checked_mul(h)!=Some(mask.len()) {return Err(ImageError::InvalidViewport);}
+    let shift=downsample_shift(sigma,scale);
+    let factor=1usize<<shift;
+    let f=factor as i64;
+    // Blocks and upsample taps live on the absolute device grid so planes with
+    // different origins agree wherever they overlap.
+    let first=[origin[0].div_euclid(f),origin[1].div_euclid(f)];
+    let last=[(origin[0]+w as i64-1).div_euclid(f),(origin[1]+h as i64-1).div_euclid(f)];
+    let (sw,sh)=((last[0]-first[0]+1) as usize,(last[1]-first[1]+1) as usize);
+    let small_len=sw.checked_mul(sh).ok_or(ImageError::TooLarge)?;
+    reserved.checked_add(mask.len()).and_then(|n|n.checked_add(small_len.checked_mul(2)?)).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+    let mut small=pool::take_empty(small_len)?;
+    let span=|block:usize,axis:usize,len:usize|{
+        let start=(first[axis]+block as i64)*f-origin[axis];
+        (start.max(0) as usize,((start+f).min(len as i64)) as usize)
+    };
+    for by in 0..sh {
+        let (y0,y1)=span(by,1,h);
+        for bx in 0..sw {
+            let (x0,x1)=span(bx,0,w);
+            let mut sum=0u32;
+            for y in y0..y1 {sum+=mask[y*w+x0..y*w+x1].iter().map(|v|u32::from(*v)).sum::<u32>();}
+            let count=(factor*factor) as u32;
+            small.push(((sum+count/2)/count) as u8);
+        }
+    }
+    shadow::blur_alpha_mask(&mut small,sw,sh,sigma*2.0/factor as f32,scale,reserved)?;
+    let denominator=2*factor as u32;
+    let position=|i:usize,axis:usize,len:usize|{
+        let numerator=2*(origin[axis]+i as i64)+1-f;
+        let at=numerator.div_euclid(2*f)-first[axis];
+        if at<0 {return (0,0,0);}
+        let low=at as usize;
+        if low>=len-1 {return (len-1,len-1,0);}
+        (low,low+1,numerator.rem_euclid(2*f) as u32)
+    };
+    let columns:Vec<(usize,usize,u32)>=(0..w).map(|x|position(x,0,sw)).collect();
+    // Horizontal interpolation of a small row is shared by the output rows between two block centres.
+    let mut rows:[(usize,Vec<u32>);2]=[(usize::MAX,vec![0;w]),(usize::MAX,vec![0;w])];
+    let shift=2*denominator.trailing_zeros();
+    let half=denominator*denominator/2;
+    let mut output=mask;output.clear();
+    for y in 0..h {
+        let (ya,yb,ty)=position(y,1,sh);
+        for want in [ya,yb] {
+            if rows[0].0==want || rows[1].0==want {continue;}
+            let slot=if rows[0].0!=ya && rows[0].0!=yb {0} else {1};
+            let source=&small[want*sw..(want+1)*sw];
+            rows[slot].0=want;
+            for (target,&(xa,xb,tx)) in rows[slot].1.iter_mut().zip(&columns) {
+                *target=u32::from(source[xa])*(denominator-tx)+u32::from(source[xb])*tx;
+            }
+        }
+        let a=&rows[usize::from(rows[0].0!=ya)].1;
+        let b=&rows[usize::from(rows[0].0!=yb)].1;
+        let (wa,wb)=(denominator-ty,ty);
+        output.extend(a.iter().zip(b.iter()).map(|(a,b)|((a*wa+b*wb+half)>>shift) as u8));
+    }
+    pool::recycle(small);
+    Ok(output)
+}
+
+/// Bilinear blend of `[top-left, top-right, bottom-left, bottom-right]` with weights `tx/denominator`
+/// and `ty/denominator` (denominator a power of two, at most 32). Equals the f32 bilinear form
+/// rounded with `+0.5` and truncated, since every weight is dyadic and the sums are exact in f32.
+#[cfg(test)]
+fn bilinear_fixed(samples:[u8;4],tx:u32,ty:u32,denominator:u32)->u8 {
+    let top=u32::from(samples[0])*(denominator-tx)+u32::from(samples[1])*tx;
+    let bottom=u32::from(samples[2])*(denominator-tx)+u32::from(samples[3])*tx;
+    let total=top*(denominator-ty)+bottom*ty;
+    ((total+denominator*denominator/2)>>(2*denominator.trailing_zeros())) as u8
+}
+
+fn blur_filter_plane(mask:Vec<u8>,width:u32,height:u32,sigma:f32,scale:f32,reserved:usize,origin:[i64;2])
     -> Result<Vec<u8>,ImageError> {
     filter_blur_padding(sigma,scale)?;
     let operating=sigma*scale;
     if operating==0.0 || !operating.is_normal() {return Ok(mask);}
+    if operating>DOWNSAMPLE_BLUR_SIGMA {return blur_plane_downsampled(mask,width,height,sigma,scale,reserved,origin);}
     if operating>=2.0 {
         let mut mask=mask;shadow::blur_alpha_mask(&mut mask,width as usize,height as usize,sigma*2.0,scale,reserved)?;
         return Ok(mask);
@@ -1957,7 +2389,7 @@ fn blur_resource_image(input:Rgba8Image,input_region:FilterPixelRegion,target:Fi
     resource_demultiply(&mut output,space);
     Ok(output)
 }
-fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter::FilterOperation],scale:f32,reserved:usize)
+fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter::FilterOperation],scale:f32,reserved:usize,origin:[i64;2])
     -> Result<(),ImageError> {
     use lumen_common::{color::Color,filter::{FilterOperation as F,ColorMatrix}};
     if filters.is_empty() || filters.len()>lumen_common::filter::MAX_COLOR_FILTERS
@@ -1990,23 +2422,24 @@ fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter:
         let plane_height=image.height.checked_add(extent).ok_or(ImageError::TooLarge)?;
         let plane_pixels=(plane_width as usize).checked_mul(plane_height as usize).ok_or(ImageError::TooLarge)?;
         reserved.checked_add(plane_pixels).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
-        let mut plane=Vec::new();plane.try_reserve_exact(plane_pixels).map_err(|_|ImageError::TooLarge)?;
-        reserved.checked_add(plane.capacity()).filter(|n|*n<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
+        let mut plane=pool::take_empty(plane_pixels)?;
         match &filters[index] {
             F::Blur(sigma) => {
                 let sigma=*sigma;
                 // Filter primitives convolve premultiplied sRGB components;
                 // process one plane at a time instead of four f32 images.
                 for pixel in image.pixels.chunks_exact_mut(4) {
+                    if pixel[3]==255 {continue;}
                     for channel in 0..3 {pixel[channel]=((u16::from(pixel[channel])*u16::from(pixel[3])+127)/255) as u8;}
                 }
                 for channel in 0..4 {
                     plane.clear();plane.extend(image.pixels.chunks_exact(4).map(|pixel|pixel[channel]));
-                    plane=blur_filter_plane(plane,image.width,image.height,sigma,scale,reserved)?;
+                    plane=blur_filter_plane(plane,image.width,image.height,sigma,scale,reserved,origin)?;
                     for (pixel,value) in image.pixels.chunks_exact_mut(4).zip(plane.iter()) {pixel[channel]=*value;}
                 }
                 for pixel in image.pixels.chunks_exact_mut(4) {
                     if pixel[3]==0 {pixel.fill(0);continue;}
+                    if pixel[3]==255 {continue;}
                     for channel in 0..3 {pixel[channel]=((u32::from(pixel[channel])*255+u32::from(pixel[3])/2)/u32::from(pixel[3])).min(255) as u8;}
                 }
             }
@@ -2016,7 +2449,7 @@ fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter:
                 for y in 0..image.height {for x in 0..image.width {
                     plane[((y+padding) as usize*plane_width as usize)+(x+padding) as usize]=image.pixels[(y as usize*image.width as usize+x as usize)*4+3];
                 }}
-                plane=blur_filter_plane(plane,plane_width,plane_height,sigma,scale,reserved)?;
+                plane=blur_filter_plane(plane,plane_width,plane_height,sigma,scale,reserved,[origin[0]-i64::from(padding),origin[1]-i64::from(padding)])?;
                 let color=color.to_rgba8();let rgba=Rgba{r:color[0],g:color[1],b:color[2],a:color[3]};
                 for y in 0..image.height {for x in 0..image.width {
                     let mut alpha=0.0;
@@ -2030,6 +2463,7 @@ fn apply_filter_operations(image:&mut Rgba8Image,filters:&[lumen_common::filter:
             F::Color(_) => unreachable!(),
             F::Url(_)|F::Resource(_)=>return Err(ImageError::Svg("resource filter requires the shared operation graph")),
         }
+        pool::recycle(plane);
         index+=1;
     }
     Ok(())
@@ -2803,7 +3237,7 @@ impl FilterRegionGraph {
             let first=filters.iter().rposition(|filter|!matches!(filter,F::Color(_))).map_or(0,|index|index+1);
             let mut image=self.input(inputs[0].unwrap(),source,all_filters,scale,font,cache,reserved,capture,scene,source_view)?;
             let working=self.occupied(reserved)?.checked_add(image.pixels.len()).ok_or(ImageError::TooLarge)?;
-            apply_filter_operations(&mut image,&filters[first..],scale,working)?;
+            apply_filter_operations(&mut image,&filters[first..],scale,working,[region.left,region.top])?;
             Ok(image)
         }
         F::Blur(sigma)=>{
@@ -2812,7 +3246,7 @@ impl FilterRegionGraph {
             let expanded=region.padded(padding)?;
             let mut image=self.input(inputs[0].unwrap(),source,all_filters,scale,font,cache,reserved,capture,scene,source_view)?;
             let working=self.occupied(reserved)?.checked_add(image.pixels.len()).ok_or(ImageError::TooLarge)?;
-            apply_filter_operations(&mut image,core::slice::from_ref(last),scale,working)?;
+            apply_filter_operations(&mut image,core::slice::from_ref(last),scale,working,[expanded.left,expanded.top])?;
             crop_filter_region(&image,expanded,region,self.occupied(reserved)?)
         }
         F::Resource(_)=>{
@@ -2831,7 +3265,7 @@ impl FilterRegionGraph {
             working.checked_add(pixels).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)?;
             let mut plane=Vec::new();plane.try_reserve_exact(pixels).map_err(|_|ImageError::TooLarge)?;
             plane.extend(image.pixels.chunks_exact(4).map(|pixel|pixel[3]));
-            let plane=blur_filter_plane(plane,image.width,image.height,shadow.sigma,scale,working)?;
+            let plane=blur_filter_plane(plane,image.width,image.height,shadow.sigma,scale,working,[input.left,input.top])?;
             let color=shadow.color.to_rgba8();let color=Rgba{r:color[0],g:color[1],b:color[2],a:color[3]};
             let dx=(region.left-input.left)as f64-f64::from(shadow.offset[0])*f64::from(scale);
             let dy=(region.top-input.top)as f64-f64::from(shadow.offset[1])*f64::from(scale);
@@ -3473,6 +3907,11 @@ fn resolve_layers_region_in_operation(
         if (clip && (rect.width == 0.0 || rect.height == 0.0)) || opacity == 0.0 {
             continue;
         }
+        if opacity==1.0 && !clip && filters.is_none() && svg_clip.is_none() && !spatial_source && region.is_none() {
+            let child = resolve_layers_region_in_operation(&list[start..end], scale, font, cache, bytes,false,None,scene,SourceScopeView{start:view.start+start,..view})?;
+            output.0.extend(child.0);
+            continue;
+        }
         let svg_object_box=svg_clip.as_ref().filter(|owner|owner.clip.units==lumen_html::paint::SvgGradientUnits::ObjectBoundingBox)
             .map(|owner|scene.svg_object_box(view.start+start-1,
                 Affine{e:owner.transform.e-view.translation[0],f:owner.transform.f-view.translation[1],..owner.transform},font,*bytes)).transpose()?;
@@ -3537,7 +3976,7 @@ fn resolve_layers_region_in_operation(
         let x = left / scale;
         let y = top / scale;
         let mut image = render_scaled_region_at(&child,width as u32,height as u32,scale,font,cache,[left as i64,top as i64],Some(*bytes-len))?;
-        if let Some(filters)=filters {apply_filter_operations(&mut image,filters,scale,*bytes)?;}
+        if let Some(filters)=filters {apply_filter_operations(&mut image,filters,scale,*bytes,[left as i64,top as i64])?;}
         apply_layer_result_coverage(&mut image,rect,radius,corners.as_deref().copied(),opacity,clip,
             svg_clip.as_deref(),svg_object_box,scale,left,top,*bytes)?;
         if let Some(mask)=svg_clip.as_ref().and_then(|owner|owner.mask.as_deref()) {
@@ -3767,7 +4206,7 @@ fn render_scaled_region_at(list:&DisplayList,width:u32,height:u32,scale:f32,font
     cache:&mut GlyphCache,device_origin:[i64;2],reserved:Option<usize>)->Result<Rgba8Image,ImageError> {
     let len=(width as usize).checked_mul(height as usize).and_then(|pixels|pixels.checked_mul(4)).ok_or(ImageError::TooLarge)?;
     let source_reserved=reserved.map(|reserved|reserved.checked_add(len).filter(|bytes|*bytes<=MAX_LAYER_BYTES).ok_or(ImageError::TooLarge)).transpose()?;
-    let mut image=Rgba8Image{width,height,pixels:vec![0;len]};
+    let mut image=Rgba8Image{width,height,pixels:pool::take_zeroed(len)?};
     let mut sink = Raster {
         image: &mut image,
         scale,
@@ -3905,7 +4344,9 @@ fn render_internal_mode(
         height,
         pixels: data,
     };
-    replay_into(&list, &mut image, scale, antialias, gpui_coverage, font, cache, full)?;
+    let replayed = replay_into(&list, &mut image, scale, antialias, gpui_coverage, font, cache, full);
+    pool::recycle_layers(list);
+    replayed?;
     Ok(image)
 }
 
@@ -4531,6 +4972,33 @@ fn settle_pass(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opaque_and_opaque_destination_composite_fast_paths_match_general_formula() {
+        let general = |dst: [u8; 4], source: [f32; 3], sa: f32| {
+            let da = dst[3] as f32 / 255.0;
+            let out_a = sa + da * (1.0 - sa);
+            let alpha = (out_a * 255.0).round();
+            let mut out = dst;
+            for (channel, source) in source.into_iter().enumerate() {
+                let destination = dst[channel] as f32 * da;
+                let color = source.round() + (destination.round() * (1.0 - sa)).round();
+                out[channel] = (color * 255.0 / alpha).round().min(255.0) as u8;
+            }
+            out[3] = alpha as u8;
+            out
+        };
+        for dst in [[10, 200, 99, 255], [0, 0, 0, 255], [255, 255, 255, 255], [40, 50, 60, 128]] {
+            for color in [[0u8, 0, 0], [255, 255, 255], [12, 130, 250], [255, 3, 77]] {
+                for alpha in [1.0f32, 0.9, 0.5, 0.2, 1.0 / 255.0] {
+                    let source = color.map(|c| c as f32 * alpha);
+                    let mut actual = dst;
+                    composite_premultiplied(&mut actual, source, alpha, true);
+                    assert_eq!(actual, general(dst, source, alpha), "{dst:?} {color:?} {alpha}");
+                }
+            }
+        }
+    }
+
     use super::*;
     use lumen_html::paint::TextShaper;
 
@@ -4564,6 +5032,87 @@ mod tests {
             let image=render_with_mode_cached(&list,1920,1080,1.0,RasterizationMode::Gpui,&font,&mut GlyphCache::default()).unwrap();
             assert_eq!((image.width,image.height),(1920,1080));
             assert_eq!(image.pixels[3],255,"{count} gradients");
+        }
+    }
+
+    #[test]
+    fn gpui_horizontal_bands_match_the_whole_frame_byte_for_byte() {
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let html="<style>html,body{margin:0;background:#fff}div{position:absolute}\
+            #t{left:10px;top:12px;font-size:22px;color:#123}\
+            #g{left:20px;top:60px;width:300px;height:180px;background:linear-gradient(135deg,#f80,#08f 60%,#0a4)}\
+            #r{left:60px;top:150px;width:200px;height:140px;border:9px solid #a33;border-radius:36px;background:#cde;box-shadow:12px 18px 24px rgba(0,0,0,.5)}\
+            #b{left:30px;top:230px;width:240px;height:150px;background:#4a8;filter:blur(7px)}\
+            #x{left:190px;top:300px;width:120px;height:90px;background:#c4c;transform:rotate(11deg) scale(1.2)}</style>\
+            <div id=t>Band seams text 0123456789</div><div id=g></div><div id=r></div><div id=b></div><div id=x></div>";
+        let document=lumen_html::html::parse(html,100_000).unwrap();
+        for scale in [1.0f32,2.0] {
+            let list=lumen_html::layout::display_list(&document,320,448,&font).unwrap();
+            let whole=render_with_mode_cached(&list,320,448,scale,RasterizationMode::Gpui,&font,&mut GlyphCache::default()).unwrap();
+            let (width,height)=(whole.width,whole.height);
+            let mut banded=vec![0u8;whole.pixels.len()];
+            let stride=width as usize*4;
+            let step=(height/4).next_multiple_of(64);
+            let mut top=0;
+            let mut caches:Vec<GlyphCache>=(0..4).map(|_|GlyphCache::default()).collect();
+            let mut index=0;
+            while top<height {
+                let bottom=(top+step).min(height);
+                let rows=&mut banded[top as usize*stride..bottom as usize*stride];
+                let drawn=render_device_rect_with_mode_cached(&list,320,448,scale,RasterizationMode::Gpui,&font,
+                    &mut caches[index],[0,top,width,bottom],rows,top).unwrap();
+                assert!(drawn);
+                top=bottom;index+=1;
+            }
+            let differing=whole.pixels.chunks_exact(4).zip(banded.chunks_exact(4)).enumerate().filter(|(_,(a,b))|a!=b).collect::<Vec<_>>();
+            if let Some((index,(a,b)))=differing.first() {
+                panic!("banded raster differs from the whole frame at scale {scale}: {} pixels, first at ({}, {}) whole={a:?} banded={b:?}",
+                    differing.len(),index%width as usize,index/width as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn gpui_bands_of_filtered_layers_shadows_and_gradients_match_one_band() {
+        use lumen_common::filter::{DropShadowFilter,FilterOperation as F};
+        use lumen_html::paint::{BoxShadow,Gradient,GradientKind,GradientStop};
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let stop=|r,g,b|GradientStop{color:Rgba{r,g,b,a:255},position:None};
+        let gradient=Arc::new(Gradient{kind:GradientKind::Linear{angle:160.0,corner:None},repeating:false,
+            stops:vec![stop(250,120,10),stop(10,120,250),stop(20,200,60)].into(),angular:None,color:None});
+        let page=Rect{x:0.0,y:0.0,width:200.0,height:240.0};
+        let layer=Rect{x:30.0,y:50.0,width:120.0,height:90.0};
+        let shadow=BoxShadow{offset_x:6.0,offset_y:9.0,blur:30.0,spread:3.0,color:Rgba{r:0,g:0,b:0,a:160},inset:false};
+        let list=DisplayList(vec![
+            Command::FillGradient{rect:page,radius:0.0,gradient:gradient.clone()},
+            Command::BoxShadow{corners:None,rect:Rect{x:20.0,y:150.0,width:150.0,height:70.0},radius:12.0,shadow},
+            Command::PushLayer{svg_clip:None,corners:None,rect:layer,radius:0.0,opacity:0.8,clip:false,
+                filters:Some(Arc::from([F::Blur(6.0),F::DropShadow(Arc::new(DropShadowFilter{offset:[14.0,31.0],sigma:5.0,
+                    color:lumen_common::color::Color::rgba8([0,0,255,192])}))]))},
+            Command::FillRect{rect:layer,color:Rgba{r:200,g:30,b:30,a:255}},
+            Command::PopLayer,
+        ]);
+        for scale in [1.0f32,2.0] {
+            let whole=render_with_mode_cached(&list,200,240,scale,RasterizationMode::Gpui,&font,&mut GlyphCache::default()).unwrap();
+            let (width,height)=(whole.width,whole.height);
+            let stride=width as usize*4;
+            for step in [height,height/2,64,40] {
+                let mut banded=vec![0u8;whole.pixels.len()];
+                let mut top=0;
+                while top<height {
+                    let bottom=(top+step).min(height);
+                    let rows=&mut banded[top as usize*stride..bottom as usize*stride];
+                    let drawn=render_device_rect_with_mode_cached(&list,200,240,scale,RasterizationMode::Gpui,&font,
+                        &mut GlyphCache::default(),[0,top,width,bottom],rows,top).unwrap();
+                    assert!(drawn);
+                    top=bottom;
+                }
+                let differing=whole.pixels.chunks_exact(4).zip(banded.chunks_exact(4)).enumerate().filter(|(_,(a,b))|a!=b).collect::<Vec<_>>();
+                if let Some((index,(a,b)))=differing.first() {
+                    panic!("bands of {step} rows differ at scale {scale}: {} pixels, first at ({}, {}) whole={a:?} banded={b:?}",
+                        differing.len(),index%width as usize,index/width as usize);
+                }
+            }
         }
     }
 
@@ -4868,7 +5417,7 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(lumen_html::layout::ImageResolver::generation(&images), 1);
-        let unsupported = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%3E%3Crect%20width='1'%20height='1'%20filter='url(%23missing)'/%3E%3C/svg%3E";
+        let unsupported = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%3E%3Crect%20width='1'%20height='1'%20paint-order='stroke'/%3E%3C/svg%3E";
         assert_eq!(
             lumen_html::layout::ImageResolver::resolve(&images, unsupported),
             ImageState::Failed
@@ -4917,7 +5466,7 @@ mod tests {
             decode_svg_image_with_limit(oversized, usize::MAX),
             Err(ImageError::TooLarge)
         ));
-        let unsupported = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" filter="url(#missing)"/></svg>"#;
+        let unsupported = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" paint-order="stroke"/></svg>"#;
         assert!(matches!(
             decode_svg_image_with_limit(unsupported, 16),
             Err(ImageError::UnsupportedSvg(_))
@@ -4962,7 +5511,7 @@ mod tests {
     #[test]
     fn html_inline_svg_maps_viewbox_and_rasterizes_primitive_fill() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='4' height='4' viewBox='0 0 2 2'><rect width='1' height='2' fill='red'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='4' height='4' viewBox='0 0 2 2'><rect width='1' height='2' fill='red'/></svg></body>",
             4,
             4,
             1.0,
@@ -4979,7 +5528,7 @@ mod tests {
     #[test]
     fn svg_linear_gradient_uses_stop_offsets_and_object_bounds() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='10' height='2' viewBox='0 0 10 2'><defs><linearGradient id='paint'><stop offset='0%' stop-color='red'/><stop offset='100%' stop-color='blue'/></linearGradient></defs><rect width='10' height='2' fill='url(#paint)'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='10' height='2' viewBox='0 0 10 2'><defs><linearGradient id='paint'><stop offset='0%' stop-color='red'/><stop offset='100%' stop-color='blue'/></linearGradient></defs><rect width='10' height='2' fill='url(#paint)'/></svg></body>",
             10,
             2,
             1.0,
@@ -4996,7 +5545,7 @@ mod tests {
     #[test]
     fn svg_user_space_gradient_applies_gradient_transform() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='8' height='2' viewBox='0 0 8 2'><defs><linearGradient id='paint' gradientUnits='userSpaceOnUse' x1='0' y1='0' x2='8' y2='0' gradientTransform='translate(2 0)'><stop offset='0' stop-color='red'/><stop offset='1' stop-color='blue'/></linearGradient></defs><rect width='8' height='2' fill='url(#paint)'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='8' height='2' viewBox='0 0 8 2'><defs><linearGradient id='paint' gradientUnits='userSpaceOnUse' x1='0' y1='0' x2='8' y2='0' gradientTransform='translate(2 0)'><stop offset='0' stop-color='red'/><stop offset='1' stop-color='blue'/></linearGradient></defs><rect width='8' height='2' fill='url(#paint)'/></svg></body>",
             8,
             2,
             1.0,
@@ -5013,7 +5562,7 @@ mod tests {
     #[test]
     fn invalid_singular_svg_gradient_uses_paint_fallback() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='4' height='2' viewBox='0 0 4 2'><defs><linearGradient id='bad' gradientTransform='scale(0)'><stop offset='0' stop-color='red'/><stop offset='1' stop-color='blue'/></linearGradient></defs><rect width='4' height='2' fill='url(#bad) lime'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='4' height='2' viewBox='0 0 4 2'><defs><linearGradient id='bad' gradientTransform='scale(0)'><stop offset='0' stop-color='red'/><stop offset='1' stop-color='blue'/></linearGradient></defs><rect width='4' height='2' fill='url(#bad) lime'/></svg></body>",
             4,
             2,
             1.0,
@@ -5025,7 +5574,7 @@ mod tests {
     #[test]
     fn svg_use_resolves_a_local_group_and_applies_percentage_position() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='8' height='4' viewBox='0 0 8 4'><defs><g id='shape' transform='translate(1 0)'><rect width='2' height='2' fill='red'/></g></defs><use href='#shape' x='25%' y='1'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='8' height='4' viewBox='0 0 8 4'><defs><g id='shape' transform='translate(1 0)'><rect width='2' height='2' fill='red'/></g></defs><use href='#shape' x='25%' y='1'/></svg></body>",
             8,
             4,
             1.0,
@@ -5044,7 +5593,7 @@ mod tests {
     #[test]
     fn svg_user_space_clip_path_unions_children_and_respects_even_odd_rule() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='8' height='4' viewBox='0 0 8 4'><defs><clipPath id='clip' transform='translate(1 0)'><rect width='1' height='4'/><rect x='6' width='1' height='4'/></clipPath><clipPath id='hole'><path clip-rule='evenodd' d='M0 0H4V4H0Z M1 1V3H3V1Z'/></clipPath></defs><rect width='8' height='4' fill='red' clip-path='url(#clip)'/><rect x='2' width='4' height='4' fill='blue' clip-path='url(#hole)'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='8' height='4' viewBox='0 0 8 4'><defs><clipPath id='clip' transform='translate(1 0)'><rect width='1' height='4'/><rect x='6' width='1' height='4'/></clipPath><clipPath id='hole'><path clip-rule='evenodd' d='M0 0H4V4H0Z M1 1V3H3V1Z'/></clipPath></defs><rect width='8' height='4' fill='red' clip-path='url(#clip)'/><rect x='2' width='4' height='4' fill='blue' clip-path='url(#hole)'/></svg></body>",
             8,
             4,
             1.0,
@@ -5066,7 +5615,7 @@ mod tests {
     #[test]
     fn svg_object_bounding_box_clip_scales_to_target_shape() {
         let image = render_html(
-            "<body style='margin:0;background:white'><svg width='8' height='4' viewBox='0 0 8 4'><defs><clipPath id='clip' clipPathUnits='objectBoundingBox'><rect width='.5' height='1'/></clipPath></defs><rect x='2' y='0' width='4' height='4' fill='red' clip-path='url(#clip)'/></svg></body>",
+            "<body style='margin:0;background:white'><svg style='display:block' width='8' height='4' viewBox='0 0 8 4'><defs><clipPath id='clip' clipPathUnits='objectBoundingBox'><rect width='.5' height='1'/></clipPath></defs><rect x='2' y='0' width='4' height='4' fill='red' clip-path='url(#clip)'/></svg></body>",
             8,
             4,
             1.0,
@@ -5085,7 +5634,7 @@ mod tests {
     #[test]
     fn svg_css_geometry_changes_rect_position_and_size() {
         let image = render_html(
-            "<body style='margin:0;background:white'><style>svg rect { x:2px; y:1px; width:2px; height:2px; fill:green }</style><svg width='8' height='4' viewBox='0 0 8 4'><rect width='1' height='1'/></svg></body>",
+            "<body style='margin:0;background:white'><style>svg rect { x:2px; y:1px; width:2px; height:2px; fill:green }</style><svg style='display:block' width='8' height='4' viewBox='0 0 8 4'><rect width='1' height='1'/></svg></body>",
             8,
             4,
             1.0,
@@ -5674,6 +6223,109 @@ mod tests {
     }
 
     #[test]
+    fn downsampled_blur_matches_exact_blur() {
+        let (w,h)=(160usize,120usize);
+        let mut plane=vec![0u8;w*h];
+        for y in 30..90 {for x in 40..110 {plane[y*w+x]=if (x/7+y/9)%2==0 {255} else {180};}}
+        let sigma=20.0;
+        let mut exact=plane.clone();
+        shadow::blur_alpha_mask(&mut exact,w,h,sigma*2.0,1.0,0).unwrap();
+        let fast=blur_filter_plane(plane,w as u32,h as u32,sigma,1.0,0,[0,0]).unwrap();
+        assert_eq!(fast.len(),exact.len());
+        let mut sum=0u64;let mut max=0u8;
+        for (a,b) in fast.iter().zip(&exact) {let d=a.abs_diff(*b);sum+=u64::from(d);max=max.max(d);}
+        assert!(max<=8 && (sum as f64/exact.len() as f64)<2.0,"max {max} mean {}",sum as f64/exact.len() as f64);
+    }
+
+    #[test]
+    fn opaque_destination_composite_matches_float_path() {
+        for alpha in 1..=254u8 {
+            for (channel,dest) in [(0u8,255u8),(77,13),(200,128),(255,1)] {
+                let src=Rgba{r:channel,g:255-channel,b:channel/2,a:alpha};
+                let mut fast=[dest,dest/2,255-dest,255];
+                let mut exact=fast;
+                composite(&mut fast,src,1.0);
+                composite_internal(&mut exact,src,1.0,1.0,true);
+                for i in 0..4 {assert!(fast[i].abs_diff(exact[i])<=1,"alpha {alpha} channel {i}: {} vs {}",fast[i],exact[i]);}
+            }
+        }
+    }
+
+    #[test]
+    fn integer_composite_tracks_float_path_for_any_destination_alpha_and_coverage() {
+        let mut worst_alpha=0u8;
+        for src_alpha in (1..=255u32).step_by(7).chain([254,255]) {
+            for coverage8 in (0..=255u32).step_by(5).chain([1,2,254,255]) {
+                for (r,g,b) in [(0u8,0u8,0u8),(255,255,255),(23,78,166),(200,10,90)] {
+                    for dest in [[0u8,0,0,0],[255,0,0,0],[10,200,30,1],[100,150,200,64],[250,3,77,128],[1,2,3,200],[90,91,92,254],[7,255,128,255]] {
+                        let src=Rgba{r,g,b,a:src_alpha as u8};
+                        let coverage=coverage8 as f32/255.0;
+                        let mut fast=dest;let mut exact=dest;
+                        composite(&mut fast,src,coverage);
+                        composite_internal(&mut exact,src,coverage,1.0,true);
+                        let alpha_difference=fast[3].abs_diff(exact[3]);
+                        worst_alpha=worst_alpha.max(alpha_difference);
+                        assert!(alpha_difference<=1,"src {src:?} cov {coverage8} dest {dest:?}: alpha {fast:?} vs {exact:?}");
+                        // Both paths round premultiplied channels and alpha once each; a one-level
+                        // difference in either scales by 255/alpha when un-premultiplied.
+                        let tolerance=1+2*((255+u32::from(exact[3])-1)/u32::from(exact[3].max(1)));
+                        for i in 0..3 {
+                            assert!(u32::from(fast[i].abs_diff(exact[i]))<=tolerance,
+                                "src {src:?} cov {coverage8} dest {dest:?}: {fast:?} vs {exact:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(worst_alpha<=1);
+    }
+
+    #[test]
+    fn integer_composite_is_exact_for_full_coverage_on_opaque_and_transparent_destinations() {
+        for alpha in 1..=254u8 {
+            let src=Rgba{r:23,g:78,b:166,a:alpha};
+            let mut opaque=[232,238,248,255];
+            let mut reference=opaque;
+            composite(&mut opaque,src,1.0);
+            let inverse=255-u32::from(alpha);
+            for (i,channel) in [src.r,src.g,src.b].into_iter().enumerate() {
+                reference[i]=(div255(u32::from(channel)*u32::from(alpha))+div255(u32::from(reference[i])*inverse)).min(255) as u8;
+            }
+            assert_eq!(opaque,reference,"alpha {alpha}");
+        }
+    }
+
+    #[test]
+    fn solid_span_blend_equals_per_pixel_composite() {
+        for alpha in [1u8,17,128,200,254] {
+            let src=Rgba{r:200,g:30,b:99,a:alpha};
+            let mut span=Vec::new();
+            for dest in [[0u8,0,0,0],[255,255,255,255],[40,50,60,100],[9,8,7,1],[1,2,3,254]] {span.extend_from_slice(&dest);}
+            let mut reference=span.clone();
+            for pixel in reference.chunks_exact_mut(4) {composite(pixel,src,1.0);}
+            blend_solid_span(&mut span,src);
+            assert_eq!(span,reference,"alpha {alpha}");
+        }
+    }
+
+    #[test]
+    fn fixed_point_bilinear_matches_float_upsample() {
+        let samples=[[0u8,255,17,200],[255,255,255,255],[3,250,128,1],[254,0,0,255],[100,101,102,103]];
+        for shift in 1..=4u32 {
+            let denominator=2u32<<shift;
+            for k in 0..denominator {for ky in 0..denominator {
+                for sample in samples {
+                    let (tx,ty)=(k as f32/denominator as f32,ky as f32/denominator as f32);
+                    let top=f32::from(sample[0])*(1.0-tx)+f32::from(sample[1])*tx;
+                    let bottom=f32::from(sample[2])*(1.0-tx)+f32::from(sample[3])*tx;
+                    let expected=(top*(1.0-ty)+bottom*ty+0.5) as u8;
+                    assert_eq!(bilinear_fixed(sample,k,ky,denominator),expected,"d {denominator} k {k} ky {ky} {sample:?}");
+                }
+            }}
+        }
+    }
+
+    #[test]
     fn specification_spatial_filter_source_clip_bounds_avoid_invisible_surface_allocation() {
         use lumen_common::filter::FilterOperation as F;
         let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
@@ -5692,10 +6344,10 @@ mod tests {
     #[test]
     fn specification_spatial_filter_scratch_is_bounded_and_large_sigma_reuses_shadow_kernel() {
         let mut source=vec![0;31*31];source[15*31+15]=255;
-        let actual=blur_filter_plane(source.clone(),31,31,2.5,1.0,0).unwrap();
+        let actual=blur_filter_plane(source.clone(),31,31,2.5,1.0,0,[0,0]).unwrap();
         let mut expected=source.clone();shadow::blur_alpha_mask(&mut expected,31,31,5.0,1.0,0).unwrap();
         assert_eq!(actual,expected);assert_eq!(filter_blur_padding(2.5,1.0).unwrap(),shadow::blur_padding(5.0).unwrap());
-        assert_eq!(blur_filter_plane(source,31,31,0.5,1.0,MAX_LAYER_BYTES),Err(ImageError::TooLarge));
+        assert_eq!(blur_filter_plane(source,31,31,0.5,1.0,MAX_LAYER_BYTES,[0,0]),Err(ImageError::TooLarge));
         for sigma in [-1.0,f32::NAN,f32::INFINITY] {assert!(filter_blur_padding(sigma,1.0).is_err());}
     }
 
@@ -5832,7 +6484,7 @@ mod tests {
                 composite(&mut expected.pixels[at..at+4],original,1.0);
             }}
             let mut actual=source.clone();
-            apply_filter_operations(&mut actual,&[F::DropShadow(Arc::new(DropShadowFilter{offset,sigma,color:shadow}))],scale,source.pixels.len()).unwrap();
+            apply_filter_operations(&mut actual,&[F::DropShadow(Arc::new(DropShadowFilter{offset,sigma,color:shadow}))],scale,source.pixels.len(),[0,0]).unwrap();
             assert_exact_spatial_pixels(&actual,&expected,&format!("finite alpha outside edgeMode:none source offset={offset:?} sigma={sigma} scale={scale}"));
         }}}
     }
@@ -6736,7 +7388,7 @@ mod tests {
         let mut bytes=0;
         resolve_layers_region(&list.0,1.0,Some(&font),&mut GlyphCache::default(),&mut bytes,false,
             Some(Rect{x:0.0,y:0.0,width:800.0,height:600.0})).unwrap();
-        assert!(bytes<=300*300*4,"no retained transparent gap between -1000px source and visible shadow: {bytes}");
+        assert!(bytes<=300*300*4+4096,"only filter graph metadata beyond the visible shadow pixels, no retained transparent gap between -1000px source and visible shadow: {bytes}");
     }
 
     #[test]
@@ -7196,12 +7848,13 @@ mod tests {
             render(&invalid, 8, 8, 1.0, true),
             Err(ImageError::DisplayList(ReplayError::UnbalancedClip))
         );
-        let huge = Rect {
-            width: 2048.0,
-            height: 2048.0,
-            ..rect
-        };
-        let large = DisplayList(vec![
+        let layer = |size: f32| {
+            let huge = Rect {
+                width: size,
+                height: size,
+                ..rect
+            };
+            DisplayList(vec![
             Command::PushLayer { svg_clip: None,
                 filters: None,
                 corners: None,
@@ -7220,8 +7873,11 @@ mod tests {
                 },
             },
             Command::PopLayer,
-        ]);
-        assert_eq!(render(&large, 8, 8, 1.0, true), Err(ImageError::TooLarge));
+            ])
+        };
+        let clipped = render(&layer(2048.0), 8, 8, 1.0, true).unwrap();
+        assert!(clipped.pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 128]));
+        assert_eq!(render(&layer(1100.0), 1100, 1100, 1.0, true), Err(ImageError::TooLarge));
     }
 
     #[test]
@@ -7761,7 +8417,7 @@ mod tests {
 
     #[test]
     fn img_uses_intrinsic_size_and_shared_image_command() {
-        let doc = lumen_html::html::parse("<body style='margin:0'><img src='tile.png'></body>", 8)
+        let doc = lumen_html::html::parse("<body style='margin:0'><img style='display:block' src='tile.png'></body>", 8)
             .unwrap();
         let font =
             FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
@@ -7780,7 +8436,7 @@ mod tests {
         let image = render_document_with_images(&doc, 2, 1, 1.0, &font, &assets).unwrap();
         assert_eq!(image.pixels, [255, 0, 0, 255, 0, 0, 255, 255]);
         let scaled = lumen_html::html::parse(
-            "<body style='margin:0'><img src='tile.png' width='4'></body>",
+            "<body style='margin:0'><img style='display:block' src='tile.png' width='4'></body>",
             8,
         )
         .unwrap();
@@ -7789,7 +8445,7 @@ mod tests {
         assert_eq!(&image.pixels[4 * 7..4 * 8], &[0, 0, 255, 255]);
         // Chrome's pixelated downsampling selects the lower texel at an exact tie.
         let downscaled = lumen_html::html::parse(
-            "<body style='margin:0'><img src='tile.png' width='1' height='1'></body>",
+            "<body style='margin:0'><img style='display:block' src='tile.png' width='1' height='1'></body>",
             8,
         )
         .unwrap();
@@ -7911,7 +8567,7 @@ mod tests {
         assert_eq!(&first.pixels[..], &[9, 8, 7, 255]);
         let font = FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap();
         let rendered = render_html_with_images(
-            "<body style='margin:0'><img src='tile.png'></body>",
+            "<body style='margin:0'><img style='display:block' src='tile.png'></body>",
             1,
             1,
             1.0,
@@ -8025,7 +8681,7 @@ mod tests {
     #[test]
     fn pending_images_settle_after_pump_and_fail_on_limit() {
         let document = lumen_html::html::parse(
-            "<body style='margin:0'><img src='later.png' width='1' height='1'></body>",
+            "<body style='margin:0'><img style='display:block' src='later.png' width='1' height='1'></body>",
             8,
         )
         .unwrap();

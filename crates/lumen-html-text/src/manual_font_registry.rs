@@ -454,6 +454,11 @@ impl ManualFontRegistry {
         {
             return Err("document CSS font face is missing its CSS identity");
         }
+        // Renderers resubmit the unchanged list every frame; the stored list
+        // already passed the budget check.
+        if self.document_css_faces.as_slice() == faces {
+            return Ok(false);
+        }
         let mut metadata_bytes = 0usize;
         for (index,rule) in faces.iter().enumerate() {
             if !rule.family_display.is_empty() && !faces[..index].iter().any(|old|Arc::ptr_eq(&old.family_display,&rule.family_display)) {
@@ -466,9 +471,6 @@ impl ManualFontRegistry {
             if metadata_bytes > MAX_DOCUMENT_CSS_BYTES {
                 return Err("document CSS font metadata budget exceeded");
             }
-        }
-        if self.document_css_faces.as_slice() == faces {
-            return Ok(false);
         }
         let mut snapshot = Vec::new();
         snapshot

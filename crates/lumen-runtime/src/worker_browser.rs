@@ -23,6 +23,10 @@ mod bindings {
 
 pub(crate) fn terminate_all(_ctx: &mut Ctx) {}
 
+pub(crate) fn all_parked(_ctx: &mut Ctx) -> bool {
+    true
+}
+
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",

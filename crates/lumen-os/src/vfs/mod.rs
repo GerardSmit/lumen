@@ -288,6 +288,29 @@ impl FileSystem for OsFs {
     }
 }
 
+/// Opens `path` and hands `consume` the file's size (0 when unknown) and a `read(2)`-shaped
+/// reader over it, so the caller can place the bytes directly (no intermediate `Vec`). The
+/// descriptor is closed afterwards; a directory is `EISDIR`.
+pub fn read_file_with<T>(
+    fs: &dyn FileSystem,
+    path: &str,
+    flags: i32,
+    consume: impl FnOnce(usize, &mut dyn FnMut(&mut [u8]) -> R<usize>) -> R<T>,
+) -> R<T> {
+    let fd = fs.open(path, flags, 0)?;
+    let size = match fs.fstat(fd) {
+        Ok(st) if st.mode & S_IFMT == S_IFDIR => {
+            let _ = fs.close(fd);
+            return Err(FsError("EISDIR"));
+        }
+        Ok(st) => st.size as usize,
+        Err(_) => 0,
+    };
+    let result = consume(size, &mut |buf| fs.read(fd, buf, None));
+    let _ = fs.close(fd);
+    result
+}
+
 /// The process's file system: the OS natively, the process-wide [`mem`] tree on targets
 /// without one (`wasm32-unknown-unknown`).
 pub fn host() -> &'static dyn FileSystem {
@@ -549,6 +572,27 @@ impl FileSystem for Overlay {
 mod tests {
     use super::*;
     use crate::fs::flags::O_RDWR;
+
+    #[test]
+    fn read_file_with_reports_size_and_reads_to_the_end() {
+        let fs = MemFs::new();
+        fs.write_file("/f", b"hello world", O_WRONLY | O_CREAT, 0o644).unwrap();
+        let (size, data) = read_file_with(&fs, "/f", 0, |size, read| {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 4];
+            loop {
+                match read(&mut chunk)? {
+                    0 => return Ok((size, out)),
+                    n => out.extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!((size, data.as_slice()), (11, &b"hello world"[..]));
+        fs.mkdir("/d", 0o755, false).unwrap();
+        assert_eq!(read_file_with(&fs, "/d", 0, |_, _| Ok(())), Err(FsError("EISDIR")));
+        assert_eq!(read_file_with(&fs, "/nope", 0, |_, _| Ok(())), Err(FsError("ENOENT")));
+    }
 
     #[test]
     fn overlay_serves_upper_read_only_and_defers_the_rest() {

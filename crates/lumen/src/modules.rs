@@ -146,7 +146,7 @@ pub(crate) struct ModuleRec {
     retired_eager_named: Option<Vec<ModuleKey>>,
     retired_eager_order: Option<Vec<ModuleKey>>,
     /// The source the body was parsed from, for its stack-trace frame (see `stack_trace`).
-    src: Option<Rc<str>>,
+    src: Option<crate::srctext::Src>,
     env: Env,
     pub ns: Value,
     meta: Value,
@@ -829,7 +829,16 @@ impl Interp {
         attr_type: Option<&str>,
     ) -> Result<crate::ModuleFetchResult, Abrupt> {
         let inherited = self.classic_script_context.clone();
-        let legacy = |key, source| crate::ModuleFetchResult { key, source, script_context: inherited.clone() };
+        let legacy = |key: String, source| {
+            let script_context = inherited.as_ref().map(|context| {
+                if key.contains("://") && context.base_url != key {
+                    Rc::new(crate::ClassicScriptContext { base_url: key.clone(), ..(**context).clone() })
+                } else {
+                    context.clone()
+                }
+            });
+            crate::ModuleFetchResult { key, source, script_context }
+        };
         let settings_key = Gc::as_ptr(&self.global) as usize;
         if let Some(loader) = self.module_fetch_loaders.get(&settings_key).cloned() {
             if attr_type==Some("css") && !self.module_synthetic_factories.get(&settings_key).is_some_and(|factories|factories.contains_key("css")) {
@@ -841,9 +850,6 @@ impl Interp {
                 attribute_type: attr_type.map(str::to_owned), script_context: inherited.clone(),
             };
             return loader(request).ok_or_else(|| self.throw("TypeError", format!("module fetch failed: {specifier} (imported from {referrer})")));
-        }
-        if self.import_maps.contains_key(&settings_key) {
-            return Err(self.throw("TypeError","no HTML module fetch loader is installed for these settings"));
         }
         #[cfg(feature = "parallel")]
         if specifier == "lumen:parallel" {
@@ -1518,7 +1524,7 @@ impl Interp {
                 result[5] += rec.body.capacity();
             }
             if let Some(source) = &rec.src {
-                if sources.insert(Rc::as_ptr(source) as *const u8 as usize) {
+                if sources.insert(source.key()) {
                     result[6] += source.len();
                 }
             }
@@ -2029,10 +2035,14 @@ impl Interp {
             },
             None => self.current_classic_script_context().map_or_else(|| self.module_api_base_for_host(), |context| context.base_url.clone()),
         };
-        let resolution = match self.resolve_module_specifier_for_host(specifier,&referrer) {
+        // Import maps apply only where an HTML module loader fetches; a document hosted in a
+        // plain runtime keeps the host's own (filesystem, node_modules) resolution.
+        let html_loader = self.module_fetch_loaders.contains_key(&settings_key)
+            || self.async_module_import_handlers.contains_key(&settings_key);
+        let resolution = if !html_loader { None } else { match self.resolve_module_specifier_for_host(specifier,&referrer) {
             Ok(resolution)=>resolution,
             Err(error)=>{ self.reject_promise(&promise,crate::interpreter::abrupt_value(error)); return promise; }
-        };
+        } };
         if let Some(handler) = self.async_module_import_handlers.get(&(Gc::as_ptr(&self.global) as usize)).cloned() {
             let id = self.next_async_module_import_id;
             self.next_async_module_import_id = id.wrapping_add(1).max(1);

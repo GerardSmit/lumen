@@ -1516,7 +1516,13 @@ impl Host for JsHost {
     }
 
     fn validate_receiver<T: Class>(cx: &ArgCx<'_>, value: &Value) -> Result<(), Value> {
-        validate_receiver_of(cx, value, TypeId::of::<T>())
+        validate_receiver_of(cx, value, TypeId::of::<T>()).map_err(|error| {
+            if T::DESC.hint("js", "invalid_this").is_some() {
+                cx.not_a_class(Slot::THIS, T::DESC)
+            } else {
+                error
+            }
+        })
     }
 
     /// JS has no keywords: named parameters are the arguments in declaration order. For optional
@@ -5378,7 +5384,7 @@ mod tests {
         "#).ok().expect("synchronously rejected subclass");
         let alias = native_eval(engine, "initializedPromises[0]").ok().expect("native source alias");
         let reason = native_eval(engine, "reason").ok().expect("subclass rejection reason");
-        assert_ne!(alias.object_identity(), promise.object_identity(), "the native promise is grafted onto the subclass instance");
+        assert_eq!(alias.object_identity(), promise.object_identity(), "the init hook sees the subclass instance itself");
         (promise, alias, reason)
     }
 

@@ -5114,7 +5114,7 @@ mod tests {
             .unwrap();
         let foreign_input = xml_document
             .create(NodeKind::Element {
-                namespace: Namespace::Other(alloc::rc::Rc::from("urn:foreign")),
+                namespace: Namespace::Other(alloc::sync::Arc::from("urn:foreign")),
                 name: Name::new("input"),
                 attributes: Vec::new(),
             })

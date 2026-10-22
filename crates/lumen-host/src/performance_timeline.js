@@ -142,7 +142,12 @@
   };
   tag(PerformanceMeasure);
 
-  const supported = Object.freeze(config.supported || ["mark", "measure", "resource"]);
+  class PerformancePaintTiming extends PerformanceEntry {
+    constructor(token, name, start) { super(token, name, "paint", start, 0, null); }
+  }
+  tag(PerformancePaintTiming);
+
+  let supported = Object.freeze(config.supported || ["mark", "measure", "resource"]);
   let flushQueued = false;
   const task = config.task || (callback => setTimeout(callback, 0));
   function queuePending() {
@@ -329,9 +334,19 @@
       if (name !== "constructor" && !name.startsWith("_")) Object.defineProperty(Class.prototype, name, { enumerable: true });
     }
   }
+  let paintEnabled = false;
+  function enablePaint() {
+    if (paintEnabled || node) return;
+    paintEnabled = true;
+    supported = Object.freeze([...supported, "paint"]);
+    Object.defineProperty(globalThis, "PerformancePaintTiming", { value: PerformancePaintTiming, writable: true, configurable: true });
+  }
+  function recordPaint(name, start) {
+    if (paintEnabled) record(new PerformancePaintTiming(kSkipThrow, name, start));
+  }
   return { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceResourceTiming,
-    PerformanceObserver, PerformanceObserverEntryList,
-    kSkipThrow, tag, methods, filterTimeline, enqueue,
+    PerformanceObserver, PerformanceObserverEntryList, PerformancePaintTiming,
+    kSkipThrow, tag, methods, filterTimeline, enqueue, enablePaint, recordPaint,
     recordResource(name, initiator, start, end, encoded, decoded, allowed) {
       return record(new PerformanceResourceTiming(kSkipThrow, name, initiator, start, end, encoded, decoded, allowed));
     } };
@@ -342,4 +357,6 @@
   for (const [name, value] of Object.entries(api.methods))
     Object.defineProperty(Performance.prototype, name, { value, writable: true, enumerable: true, configurable: true });
   binding.install_resource_publisher(api.recordResource);
+  binding.install_paint_hooks(api.enablePaint, api.recordPaint);
+  if (typeof globalThis.document !== "undefined") api.enablePaint();
 })();

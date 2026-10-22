@@ -26,7 +26,7 @@ impl<'a> Cursor<'a> {
         let byte = *bytes.get(start)?;
         let kind = match byte {
             b'/' if bytes.get(start + 1) == Some(&b'*') => {
-                let end = self.input[start + 2..].find("*/");
+                let end = find_comment_close(bytes, start + 2);
                 self.position = end.map_or(bytes.len(), |end| start + end + 4);
                 TokenKind::Comment { closed: end.is_some() }
             }
@@ -50,9 +50,13 @@ impl<'a> Cursor<'a> {
                                 self.position += self.input[self.position..].chars().next().unwrap().len_utf8();
                             }
                         }
-                        Some(_) => self.position += self.input[self.position..].chars().next().unwrap().len_utf8(),
+                        Some(byte) => self.position += utf8_len(self.input, self.position, byte),
                     }
                 }
+            }
+            b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b',' | b':' | b';' | b'!' | b'>' | b'=' | b'*' | b'%' => {
+                self.position += 1;
+                TokenKind::Other
             }
             b'(' | b'[' | b'{' => { self.position += 1; TokenKind::Open(byte) }
             b')' | b']' | b'}' => { self.position += 1; TokenKind::Close(byte) }
@@ -79,6 +83,7 @@ impl<'a> Cursor<'a> {
             }
             _ if starts_identifier(&self.input[start..]) => {
                 let mut escaped = false;
+                self.skip_ascii_name();
                 while let Some(character) = self.input[self.position..].chars().next() {
                     if character == '\0' || selector_name_character(character) { self.position += character.len_utf8(); }
                     else if character == '\\' && valid_css_escape_at_start(&self.input[self.position..]) {
@@ -100,11 +105,18 @@ impl<'a> Cursor<'a> {
                     } else { TokenKind::Other }
                 } else { TokenKind::Other }
             }
-            _ => { self.position += self.input[start..].chars().next().unwrap().len_utf8(); TokenKind::Other }
+            _ => { self.position += utf8_len(self.input, start, byte); TokenKind::Other }
         };
         Some(Token { start, end: self.position, kind })
     }
+    fn skip_ascii_name(&mut self) {
+        let bytes = self.input.as_bytes();
+        while bytes.get(self.position).is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) {
+            self.position += 1;
+        }
+    }
     fn consume_name(&mut self) {
+        self.skip_ascii_name();
         while let Some(character) = self.input[self.position..].chars().next() {
             if character == '\0' || selector_name_character(character) { self.position += character.len_utf8(); }
             else if character == '\\' && valid_css_escape_at_start(&self.input[self.position..]) {
@@ -136,9 +148,32 @@ impl<'a> Cursor<'a> {
                 continue;
             }
             bad |= matches!(byte, b'\'' | b'"' | b'(' | 1..=8 | 11 | 14..=31 | 127);
-            self.position += self.input[self.position..].chars().next().unwrap().len_utf8();
+            self.position += utf8_len(self.input, self.position, byte);
         }
     }
+}
+
+/// Offset from `from` of the first `*/`, without building a substring searcher.
+pub(super) fn find_comment_close(bytes: &[u8], from: usize) -> Option<usize> {
+    let tail = bytes.get(from..)?;
+    let mut at = 0;
+    while let Some(star) = tail[at..].iter().position(|&byte| byte == b'*') {
+        at += star;
+        if tail.get(at + 1) == Some(&b'/') {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// `str::contains("/*")` for short inputs, where building the searcher dominates.
+pub(super) fn contains_comment_open(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|pair| pair == b"/*")
+}
+
+fn utf8_len(input: &str, at: usize, byte: u8) -> usize {
+    if byte < 0x80 { 1 } else { input[at..].chars().next().unwrap().len_utf8() }
 }
 
 fn starts_identifier(input: &str) -> bool {
@@ -314,5 +349,57 @@ mod tests {
         assert_eq!(&source[1..end.content_end]," a(]x) ");
         assert!(block(&"(".repeat(MAX_COMPONENT_DEPTH+1),0).is_err());
         assert!(complete(&"(".repeat(MAX_COMPONENT_DEPTH+1)).is_err());
+    }
+
+    fn token_texts(input: &str) -> Vec<&str> {
+        let mut cursor = Cursor::new(input, 0).unwrap();
+        let mut texts = Vec::new();
+        while let Some(token) = cursor.next() {
+            texts.push(&input[token.start..token.end]);
+        }
+        texts
+    }
+
+    #[test]
+    fn ascii_fast_paths_keep_token_boundaries() {
+        assert_eq!(
+            token_texts("a-b_1:\u{e9}-x; margin : 10px !important"),
+            ["a-b_1", ":", "\u{e9}-x", ";", " ", "margin", " ", ":", " ", "10px", " ", "!", "important"]
+        );
+        assert_eq!(token_texts("--custom:1,2"), ["--custom", ":", "1", ",", "2"]);
+        assert_eq!(token_texts("a>b=\"\u{e9}x\"%"), ["a", ">", "b", "=", "\"\u{e9}x\"", "%"]);
+    }
+
+    #[test]
+    fn declaration_lists_parse_the_same_with_and_without_the_closed_span_shortcut() {
+        for input in [
+            "color:red; width: calc(1px + 2px);--x: {a:b}; margin:0 auto !important; background:url(a.png) no-repeat",
+            "font-family:'A B', serif; content:\"x\"; --y:1; transition: opacity .2s ease;",
+            "color:red;content:'abc",
+            "background:url(a.png;margin:0",
+            "width:10px;height:calc(1px",
+            "--a:b\0 c;color:blue",
+        ] {
+            let fast = declarations_with_variables(input, 0, true);
+            let mut slow = Vec::new();
+            let mut slow_result = Ok(());
+            for (start, end) in declaration_spans_with_recovery(input, true).unwrap() {
+                let Some((name, raw)) = declaration_pair(&input[start..end]) else { continue; };
+                slow_result = append_declaration_pair_values(name, raw, start, true, &mut slow);
+                if slow_result.is_err() { break; }
+            }
+            assert_eq!(fast.is_ok(), slow_result.is_ok(), "{input}");
+            assert_eq!(alloc::format!("{:?}", fast.unwrap_or_default()), alloc::format!("{slow:?}"), "{input}");
+        }
+    }
+
+    #[test]
+    fn unsupported_svg_properties_are_found_only_by_name() {
+        assert_eq!(
+            unsupported_svg_style_properties("fill:red;Stroke-Linecap:round;stroke-linecap:butt;marker-end:url(#a);mask:none"),
+            ["stroke-linecap", "marker-end", "mask"]
+        );
+        assert!(unsupported_svg_style_properties("color:red;width:1px").is_empty());
+        assert!(unsupported_svg_style_properties("content:'stroke-linecap';width:1px").is_empty());
     }
 }

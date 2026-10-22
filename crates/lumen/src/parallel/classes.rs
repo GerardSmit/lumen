@@ -476,8 +476,8 @@ impl Builder {
         let private_members = info.private_members.clone();
         let mut copied_fields = Vec::new();
         let text = match &function.source {
-            crate::ast::FnSource::Range { src, .. } => &**src,
-            _ => function.source.as_str().unwrap_or(""),
+            crate::ast::FnSource::Range { src, .. } => src.text(),
+            _ => std::borrow::Cow::Borrowed(function.source.as_str().unwrap_or("")),
         };
         for (index, (key, init, transforms)) in fields.into_iter().enumerate() {
             if Interp::is_sym_key(&key) {
@@ -525,11 +525,11 @@ impl Builder {
                         return Err(interp.make_error("TypeError", format!("parallel class captures '{name}' from the outer scope; pass it in args")));
                     }
                 }
-                let bytes = crate::snapshot::encode(&[Stmt::Expr(expr)], text);
+                let bytes = crate::snapshot::encode(&[Stmt::Expr(expr)], &text);
                 self.charge(interp, bytes.len() + text.len())?;
                 let body = {
                     let _entered = HeapGuard::enter(&self.parcel.heap);
-                    crate::snapshot::decode(&bytes, text)
+                    crate::snapshot::decode(&bytes, &text)
                 }
                 .map_err(|message| interp.make_error("DataCloneError", message))?;
                 let Some(Stmt::Expr(expr)) = body.into_iter().next() else {

@@ -130,7 +130,7 @@ impl Document {
     /// Share custom-element host eligibility between imperative attachment and
     /// the declarative parser. The owner should capture its registry weakly.
     pub fn set_shadow_host_policy(&mut self, policy: Option<Rc<dyn Fn(&Document, NodeId) -> bool>>) {
-        self.shadow_host_policy = policy;
+        self.shadow_host_policy = crate::css::Hook::new(policy);
     }
 
     pub fn attach_shadow(&mut self, host: NodeId, mode: ShadowMode) -> Result<NodeId, Error> {
@@ -175,7 +175,7 @@ impl Document {
         {
             return Err(Error::WrongKind);
         }
-        if self.shadow_host_policy.as_ref().is_some_and(|policy| !policy(self, host)) {
+        if self.shadow_host_policy.get(&self.host_gate).is_some_and(|policy| !policy(self, host)) {
             return Err(Error::WrongKind);
         }
         if let Ok(index) = self.shadow_trees.binary_search_by_key(&host.key(), |tree| tree.host.key()) {

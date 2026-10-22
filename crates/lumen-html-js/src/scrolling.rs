@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn document_scrolling_element_and_element_offsets_follow_standard_and_quirks_mapping() {
         let (mut standard, _) = setup(
-            "<!doctype html><style>html,body{margin:0}body{margin-top:100px;height:40px;width:40px;overflow:auto}#content{height:300px;width:300px}</style><div id=content></div>",
+            "<!doctype html><style>html,body{margin:0}html{overflow:hidden}body{margin-top:100px;height:40px;width:40px;overflow:auto}#content{height:300px;width:300px}</style><div id=content></div>",
         );
         let result = script(
             &mut standard,

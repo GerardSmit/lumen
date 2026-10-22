@@ -12072,3 +12072,59 @@ fn host_inline_module_separates_import_base_from_import_meta_url() {
         Err(error) => panic!("script parse: {}", error.message),
     }
 }
+
+#[test]
+fn dynamic_function_source_text_is_exact() {
+    assert_eq!(
+        run("new Function('a','b','return a+b').toString() === 'function anonymous(a,b\\n) {\\nreturn a+b\\n}'"),
+        "true"
+    );
+    assert_eq!(
+        run("Function().toString() === 'function anonymous(\\n) {\\n\\n}'"),
+        "true"
+    );
+    assert_eq!(
+        run("(function*(){}).constructor('a', 'yield a').toString() === 'function* anonymous(a\\n) {\\nyield a\\n}'"),
+        "true"
+    );
+    assert_eq!(
+        run("var f = new Function('return [function inner(x) { return x * 2 }, (y) => y + 1, class K { m() {} }]'); \
+             var r = f(); [r[0].toString(), r[0](21), r[1].toString(), r[2].toString()].join('|')"),
+        "function inner(x) { return x * 2 }|42|(y) => y + 1|class K { m() {} }"
+    );
+    assert_eq!(
+        run("var g = new Function('p = function dflt() { return 1 }', 'return p'); \
+             [g().toString(), g.toString() === 'function anonymous(p = function dflt() { return 1 }\\n) {\\nreturn p\\n}'].join('|')"),
+        "function dflt() { return 1 }|true"
+    );
+}
+
+#[test]
+fn dynamic_function_rejects_injection() {
+    assert_eq!(throws("new Function('/*', '*/){')"), "SyntaxError");
+    assert_eq!(throws("new Function('a', '}) , (function(){')"), "SyntaxError");
+    assert_eq!(throws("new Function('a', '}); (function(){ return 1')"), "SyntaxError");
+    assert_eq!(throws("new Function('a', 'var x = ;')"), "SyntaxError");
+    assert_eq!(throws("new Function('a', '/*')"), "SyntaxError");
+    assert_eq!(throws("new Function('a) {', '')"), "SyntaxError");
+}
+
+#[test]
+fn dynamic_function_large_body_skims_and_keeps_exact_text() {
+    assert_eq!(
+        run("var body = ''; \
+             for (var i = 0; i < 8000; i++) body += 'function f' + i + '(a) { return a + ' + i + '; }\\n'; \
+             body += 'return [f7999.toString(), f7999(1), f0.toString(), f4000(0)];'; \
+             var r = new Function(body)(); r.join('|')"),
+        "function f7999(a) { return a + 7999; }|8000|function f0(a) { return a + 0; }|4000"
+    );
+    assert_eq!(
+        run("var body = ''; \
+             for (var i = 0; i < 8000; i++) body += 'function f' + i + '(a) { return a + ' + i + '; }\\n'; \
+             var f = new Function('a', body + 'return a'); \
+             var t = f.toString(); \
+             [body.length > 262144, t.length === 'function anonymous(a\\n) {\\n'.length + body.length + 'return a'.length + 2, \
+              t.startsWith('function anonymous(a\\n) {\\nfunction f0(a)'), t.endsWith('return a\\n}')].join()"),
+        "true,true,true,true"
+    );
+}

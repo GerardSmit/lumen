@@ -119,7 +119,8 @@ fn ir_type(t: ValType) -> Result<Type, String> {
         ValType::I64 => Type::I64,
         ValType::F32 => Type::F32,
         ValType::F64 => Type::F64,
-        ValType::FuncRef | ValType::ExternRef => {
+        ValType::V128 => return Err("wasm jit: v128 is interpreted only".into()),
+        ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::EqRef => {
             return Err("wasm jit: reference types are not supported".into());
         }
     })
@@ -244,8 +245,11 @@ fn valtype(b: u8) -> Option<ValType> {
         0x7e => ValType::I64,
         0x7d => ValType::F32,
         0x7c => ValType::F64,
+        0x7b => ValType::V128,
         0x70 => ValType::FuncRef,
         0x6f => ValType::ExternRef,
+        0x6e => ValType::AnyRef,
+        0x6d => ValType::EqRef,
         _ => return None,
     })
 }
@@ -1042,6 +1046,7 @@ impl Translator<'_, '_> {
                     _ => return Err(format!("wasm jit: unsupported 0xfc op {sub}")),
                 }
             }
+            0xfd => return Err("wasm jit: v128 is interpreted only".into()),
             _ => {}
         }
         Ok(())

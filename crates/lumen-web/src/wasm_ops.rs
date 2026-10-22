@@ -13,7 +13,7 @@ use lumen_bind::Methods;
 use lumen_host::{Ctx, OpError, Value};
 
 use crate::wasm;
-use crate::wasm::exec::{Host, Imports, MemEntity, Store, Val};
+use crate::wasm::exec::{FuncImport, Host, Imports, MemEntity, Store, Val};
 use crate::wasm::parse::{Module as Parsed, ValType};
 
 pub(crate) struct WasmStore {
@@ -185,9 +185,16 @@ fn val_to_js(v: Val) -> Value {
         Val::I64(x) => Value::bigint_from_i64(x),
         Val::F32(x) => Value::Num(x as f64),
         Val::F64(x) => Value::Num(x),
-        Val::Ref(_) => Value::Null,
+        Val::Ref(_) | Val::V128(_) => Value::Null,
     }
 }
+
+/// Whether a signature mentions `v128`, which has no JS representation.
+fn uses_v128(ty: &wasm::parse::FuncType) -> bool {
+    ty.params.iter().chain(&ty.results).any(|&t| t == ValType::V128)
+}
+
+const V128_JS: &str = "WebAssembly: v128 values cannot be converted to or from JavaScript";
 
 fn js_to_val(ctx: &mut Ctx, v: &Value, ty: ValType) -> Val {
     match ty {
@@ -198,7 +205,8 @@ fn js_to_val(ctx: &mut Ctx, v: &Value, ty: ValType) -> Val {
         ),
         ValType::F32 => Val::F32(ctx.coerce_number(v).unwrap_or(0.0) as f32),
         ValType::F64 => Val::F64(ctx.coerce_number(v).unwrap_or(0.0)),
-        ValType::FuncRef | ValType::ExternRef => Val::Ref(None),
+        ValType::V128 => Val::V128([0, 0]),
+        ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::EqRef => Val::Ref(None),
     }
 }
 
@@ -253,6 +261,10 @@ impl CtxHost<'_> {
             .get(id)
             .cloned()
             .ok_or("wasm: bad import id")?;
+        if args.iter().any(|v| matches!(v, Val::V128(_))) || results.contains(&ValType::V128) {
+            self.error = Some(type_error(V128_JS).to_value(self.ctx));
+            return Err("wasm: v128 crossed into an imported function".into());
+        }
         let js_args: Vec<Value> = args.iter().map(|v| val_to_js(*v)).collect();
         let ret = match self.ctx.invoke(callback, Value::Undefined, &js_args) {
             Ok(v) => v,
@@ -376,6 +388,16 @@ fn u32_value(ctx: &mut Ctx, value: &Value, what: &str) -> OpResult<f64> {
     Ok(integer)
 }
 
+/// An enforced unsigned 64-bit integer for an `i64`-addressed descriptor: `ToBigInt`, then a
+/// range check. Sizes past `u32::MAX` fail later as too large.
+fn u64_bigint_value(value: &Value, what: &str) -> OpResult<f64> {
+    match value.bigint_as_i64() {
+        Some(n) if n >= 0 => Ok(n as f64),
+        Some(_) => Err(type_error(format!("{what} is outside the unsigned 64-bit range"))),
+        None => Err(type_error(format!("{what} must be a BigInt for an i64 address"))),
+    }
+}
+
 fn descriptor_object(value: &Value, what: &str) -> OpResult<()> {
     match value {
         Value::Obj(_) => Ok(()),
@@ -451,7 +473,11 @@ fn func_object(ctx: &mut Ctx, func_addr: usize) -> OpResult<Value> {
         }
     };
     let arity = ty.params.len();
+    let vector = uses_v128(&ty);
     let f = move |ctx: &mut Ctx, _this: Value, args: &[Value]| -> Result<Value, Value> {
+        if vector {
+            return Err(type_error(V128_JS).to_value(ctx));
+        }
         let vals = ty
             .params
             .iter()
@@ -667,14 +693,27 @@ fn new_table(ctx: &mut Ctx, descriptor: &Value) -> OpResult<usize> {
             }
         }
     }
-    let initial = match field(ctx, descriptor, "initial")? {
-        Value::Undefined => None,
-        value => Some(u32_value(ctx, &value, "WebAssembly.Table size")?),
+    let address64 = match field(ctx, descriptor, "address")? {
+        Value::Undefined => false,
+        address => match &*ctx.coerce_string(&address).map_err(thrown)? {
+            "i32" => false,
+            "i64" => true,
+            _ => {
+                return Err(type_error(
+                    "WebAssembly.Table(): Descriptor property 'address' must be 'i32' or 'i64'",
+                ))
+            }
+        },
     };
-    let maximum = match field(ctx, descriptor, "maximum")? {
-        Value::Undefined => None,
-        value => Some(u32_value(ctx, &value, "WebAssembly.Table size")?),
+    let size = |ctx: &mut Ctx, name: &str| -> OpResult<Option<f64>> {
+        match field(ctx, descriptor, name)? {
+            Value::Undefined => Ok(None),
+            value if address64 => u64_bigint_value(&value, "WebAssembly.Table size").map(Some),
+            value => u32_value(ctx, &value, "WebAssembly.Table size").map(Some),
+        }
     };
+    let initial = size(ctx, "initial")?;
+    let maximum = size(ctx, "maximum")?;
     let (min, max) = alloc_limits(initial, maximum, u32::MAX)?;
     if min > wasm::parse::MAX_TABLE_SIZE as usize {
         return Err(OpError::range_error("WebAssembly.Table: initial size too large"));
@@ -812,6 +851,9 @@ fn global_get(ctx: &mut Ctx, addr: usize) -> OpResult<Value> {
         .and_then(|ws| ws.store.globals.get(addr))
         .map(|g| g.get())
         .ok_or_else(|| OpError::error("wasm: bad global address"))?;
+    if matches!(v, Val::V128(_)) {
+        return Err(type_error(V128_JS));
+    }
     Ok(val_to_js(v))
 }
 
@@ -823,6 +865,7 @@ fn global_set(ctx: &mut Ctx, addr: usize, raw: &Value) -> OpResult<()> {
                 ValType::I64 => ValType::I64,
                 ValType::F32 => ValType::F32,
                 ValType::F64 => ValType::F64,
+                ValType::V128 => return Err(type_error(V128_JS)),
                 _ => ValType::I32,
             },
             None => return Err(OpError::error("wasm: bad global address")),
@@ -868,6 +911,7 @@ fn import_object(value: &Value) -> OpResult<Option<Value>> {
 
 enum Resolved {
     Func(Value, wasm::parse::FuncType),
+    Exported(usize),
     Mem(usize),
     Table(usize),
     Global(usize),
@@ -907,7 +951,11 @@ fn resolve_imports(
                 if !value.is_callable() {
                     return Err(fail(ctx, "function import requires a callable"));
                 }
-                Resolved::Func(value, module.types[*type_index as usize].clone())
+                let ty = module.types[*type_index as usize].clone();
+                match func_addr_of(ctx, &value) {
+                    Some(addr) => Resolved::Exported(addr),
+                    None => Resolved::Func(value, ty),
+                }
             }
             wasm::ImportKind::Memory(_) => {
                 match addr_of::<api::MemoryObject>(ctx, &value, |m| m.addr) {
@@ -970,8 +1018,9 @@ fn link(ctx: &mut Ctx, module: Rc<Parsed>, imports: Option<Value>) -> OpResult<V
                 Resolved::Func(f, ty) => {
                     let id = ws.host_funcs.len();
                     ws.host_funcs.push(f);
-                    linked.funcs.push((id, ty));
+                    linked.funcs.push(FuncImport::Host(id, ty));
                 }
+                Resolved::Exported(addr) => linked.funcs.push(FuncImport::Store(addr)),
                 Resolved::Mem(addr) => linked.mem_addr = Some(addr),
                 Resolved::Table(addr) => linked.table_addr = Some(addr),
                 Resolved::Global(addr) => linked.global_addrs.push(addr),

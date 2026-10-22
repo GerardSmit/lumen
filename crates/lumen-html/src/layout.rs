@@ -1271,12 +1271,18 @@ struct RetainedFragmentKey {
     parent_height: Option<f32>,
     containing_block: Option<Rect>,
     containing_block_node: Option<NodeId>,
-    fixed_containing_block: Option<Rect>,
-    fixed_containing_block_node: Option<NodeId>,
-    sticky_bounds: Option<Rect>,
     cull: Rect,
     viewport: Rect,
     container_units: ContainerUnitContextKey,
+    /// Inputs that are nearly always at their defaults.
+    rare: Option<Box<RetainedKeyRare>>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+struct RetainedKeyRare {
+    fixed_containing_block: Option<Rect>,
+    fixed_containing_block_node: Option<NodeId>,
+    sticky_bounds: Option<Rect>,
     scroll_hazards: usize,
     transform_depth: usize,
     svg_geometry_capture: bool,
@@ -1290,6 +1296,30 @@ struct RetainedFragmentKey {
     collapsed_bottom: Option<MarginStrut>,
     was_through: Option<MarginStrut>,
     decorations: Vec<TextDecoration>,
+}
+
+impl RetainedFragmentKey {
+    fn decorations(&self) -> &[TextDecoration] {
+        self.rare.as_deref().map_or(&[], |rare| &rare.decorations)
+    }
+}
+
+/// A shared immutable slice that is a null pointer when empty, so the many
+/// usually empty lists of a retained fragment cost one word and no allocation.
+#[derive(Clone)]
+struct SharedSlice<T>(Option<Arc<Box<[T]>>>);
+
+impl<T> core::ops::Deref for SharedSlice<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.0.as_ref().map_or(&[], |shared| &***shared)
+    }
+}
+
+impl<T> From<Vec<T>> for SharedSlice<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self((!values.is_empty()).then(|| Arc::new(values.into_boxed_slice())))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1389,16 +1419,16 @@ struct RetainedFragment {
     overflow: OverflowMetrics,
     commands: Arc<[Command]>,
     hits: Arc<[HitRegion]>,
-    hit_fragments: Arc<[HitFragments]>,
+    hit_fragments: SharedSlice<HitFragments>,
     transform_reference_boxes: Option<Arc<[(usize,TransformReferenceBox)]>>,
-    used_margins: Arc<[UsedMargins]>,
-    transforms: Arc<[HitTransform]>,
-    rounded_clips: Arc<[HitClip]>,
-    scroll_extents: Arc<[ScrollBounds]>,
-    scroll_ports: Arc<[ScrollPort]>,
-    viewport_fixed_nodes: Arc<[NodeId]>,
-    scroll_regions: Arc<[ScrollRegion]>,
-    control_text_runs: Arc<[ControlTextRun]>,
+    used_margins: SharedSlice<UsedMargins>,
+    transforms: SharedSlice<HitTransform>,
+    rounded_clips: SharedSlice<HitClip>,
+    scroll_extents: SharedSlice<ScrollBounds>,
+    scroll_ports: SharedSlice<ScrollPort>,
+    viewport_fixed_nodes: SharedSlice<NodeId>,
+    scroll_regions: SharedSlice<ScrollRegion>,
+    control_text_runs: SharedSlice<ControlTextRun>,
     overflow_lines: Option<Arc<[OverflowLinePaint]>>,
     paint_phases: Option<Arc<RetainedPaintPhases>>,
     rendered_text_collected: bool,
@@ -1428,11 +1458,164 @@ struct RetainedFragment {
 struct CountingShaper<'a> {
     inner: &'a dyn TextShaper,
     uses: core::cell::Cell<u64>,
+    memo: RefCell<ShapeMemo>,
+}
+
+const MAX_SHAPE_MEMO_ENTRIES: usize = 8192;
+const MAX_SHAPE_MEMO_BYTES: usize = 1 << 20;
+const MAX_SHAPE_MEMO_TEXT: usize = 2048;
+
+#[derive(Clone)]
+enum ShapeMemoValue {
+    Run(ShapedRun),
+    Detail(Option<crate::paint::ShapedRunWithClusterAdvances>),
+    Number(f32),
+}
+
+trait ShapeMemoResult: Sized {
+    fn store(&self) -> ShapeMemoValue;
+    fn heap_bytes(&self) -> usize;
+    fn load(value: &ShapeMemoValue) -> Option<Self>;
+}
+
+fn run_heap_bytes(run: &ShapedRun) -> usize {
+    run.glyphs.len() * core::mem::size_of::<Glyph>()
+}
+
+impl ShapeMemoResult for ShapedRun {
+    fn store(&self) -> ShapeMemoValue { ShapeMemoValue::Run(self.clone()) }
+    fn heap_bytes(&self) -> usize { run_heap_bytes(self) }
+    fn load(value: &ShapeMemoValue) -> Option<Self> {
+        match value { ShapeMemoValue::Run(run) => Some(run.clone()), _ => None }
+    }
+}
+
+impl ShapeMemoResult for Option<crate::paint::ShapedRunWithClusterAdvances> {
+    fn store(&self) -> ShapeMemoValue { ShapeMemoValue::Detail(self.clone()) }
+    fn heap_bytes(&self) -> usize {
+        self.as_ref().map_or(0, |detail| {
+            run_heap_bytes(&detail.run) + detail.clusters.len() * core::mem::size_of::<crate::paint::ShapedClusterAdvance>()
+        })
+    }
+    fn load(value: &ShapeMemoValue) -> Option<Self> {
+        match value { ShapeMemoValue::Detail(detail) => Some(detail.clone()), _ => None }
+    }
+}
+
+impl ShapeMemoResult for f32 {
+    fn store(&self) -> ShapeMemoValue { ShapeMemoValue::Number(*self) }
+    fn heap_bytes(&self) -> usize { 0 }
+    fn load(value: &ShapeMemoValue) -> Option<Self> {
+        match value { ShapeMemoValue::Number(number) => Some(*number), _ => None }
+    }
+}
+
+struct ShapeMemoEntry {
+    kind: ShapeKind,
+    text: String,
+    range: (usize, usize),
+    size: u32,
+    rtl: bool,
+    language: Option<String>,
+    font: FontSpec,
+    value: ShapeMemoValue,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum ShapeKind {
+    StyledContext,
+    ResolvedContext,
+    ResolvedContextDetail,
+    ResolvedSegment,
+    Styled,
+    Resolved,
+    MeasureStyled,
+    Ascent,
+    LineHeight,
+    NormalLineHeight,
+}
+
+/// Shaping and font-metric answers of one layout pass: intrinsic measurement
+/// and line layout ask the font provider for the same runs repeatedly.
+#[derive(Default)]
+struct ShapeMemo {
+    entries: BTreeMap<u64, Vec<ShapeMemoEntry>>,
+    count: usize,
+    bytes: usize,
+}
+
+struct ShapeQuery<'q> {
+    kind: ShapeKind,
+    text: &'q str,
+    range: (usize, usize),
+    size: f32,
+    rtl: bool,
+    font: &'q FontSpec,
+    language: Option<&'q str>,
+}
+
+impl ShapeQuery<'_> {
+    fn hash(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |bytes: &[u8]| {
+            for &byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3); }
+        };
+        mix(&[self.kind as u8, u8::from(self.rtl)]);
+        mix(&self.size.to_bits().to_le_bytes());
+        mix(&(self.range.0 as u64).to_le_bytes());
+        mix(&(self.range.1 as u64).to_le_bytes());
+        mix(&self.font.weight.to_le_bytes());
+        mix(&self.font.stretch.to_bits().to_le_bytes());
+        mix(self.language.map_or(&[0xff][..], str::as_bytes));
+        mix(self.text.as_bytes());
+        hash
+    }
+
+    fn matches(&self, entry: &ShapeMemoEntry) -> bool {
+        entry.kind == self.kind && entry.rtl == self.rtl && entry.range == self.range
+            && entry.size == self.size.to_bits()
+            && entry.language.as_deref() == self.language
+            && entry.text == self.text && entry.font == *self.font
+    }
 }
 
 impl CountingShaper<'_> {
     fn bump(&self) {
         self.uses.set(self.uses.get().wrapping_add(1));
+    }
+
+    fn memoized<T: ShapeMemoResult>(&self, query: ShapeQuery<'_>, compute: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
+        self.bump();
+        if query.text.len() > MAX_SHAPE_MEMO_TEXT { return compute(); }
+        let hash = query.hash();
+        let hit = self.memo.borrow().entries.get(&hash)
+            .and_then(|bucket| bucket.iter().find(|entry| query.matches(entry)))
+            .and_then(|entry| T::load(&entry.value));
+        if let Some(value) = hit { return Ok(value); }
+        let value = compute()?;
+        let mut memo = self.memo.borrow_mut();
+        let cost = query.text.len() + core::mem::size_of::<ShapeMemoEntry>() + value.heap_bytes();
+        if memo.count < MAX_SHAPE_MEMO_ENTRIES && memo.bytes + cost <= MAX_SHAPE_MEMO_BYTES {
+            memo.count += 1;
+            memo.bytes += cost;
+            memo.entries.entry(hash).or_default().push(ShapeMemoEntry {
+                kind: query.kind,
+                text: String::from(query.text),
+                range: query.range,
+                size: query.size.to_bits(),
+                rtl: query.rtl,
+                language: query.language.map(String::from),
+                font: query.font.clone(),
+                value: value.store(),
+            });
+        }
+        Ok(value)
+    }
+
+    fn memoized_metric(&self, kind: ShapeKind, size: f32, font: &FontSpec, compute: impl FnOnce() -> f32) -> f32 {
+        let query = ShapeQuery { kind, text: "", range: (0, 0), size, rtl: false, font, language: None };
+        self.memoized(query, || Ok(compute())).unwrap_or(0.0)
     }
 }
 
@@ -1440,16 +1623,20 @@ impl TextShaper for CountingShaper<'_> {
     fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<Rect>{self.inner.glyph_cell_bounds(face,id,size)}
     fn glyph_ink_bounds(&self,glyph:&Glyph,size:f32) -> Option<Rect> {self.inner.glyph_ink_bounds(glyph,size)}
     fn shape_styled_context(&self,text:&str,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<ShapedRun,()> {
-        self.bump();self.inner.shape_styled_context(text,size,rtl,font,language)
+        let query=ShapeQuery{kind:ShapeKind::StyledContext,text,range:(0,0),size,rtl,font,language};
+        self.memoized(query,||self.inner.shape_styled_context(text,size,rtl,font,language))
     }
     fn shape_resolved_context(&self,text:&str,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<ShapedRun,()> {
-        self.bump();self.inner.shape_resolved_context(text,size,rtl,font,language)
+        let query=ShapeQuery{kind:ShapeKind::ResolvedContext,text,range:(0,0),size,rtl,font,language};
+        self.memoized(query,||self.inner.shape_resolved_context(text,size,rtl,font,language))
     }
     fn shape_resolved_context_with_cluster_advances(&self,text:&str,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<Option<crate::paint::ShapedRunWithClusterAdvances>,()> {
-        self.bump();self.inner.shape_resolved_context_with_cluster_advances(text,size,rtl,font,language)
+        let query=ShapeQuery{kind:ShapeKind::ResolvedContextDetail,text,range:(0,0),size,rtl,font,language};
+        self.memoized(query,||self.inner.shape_resolved_context_with_cluster_advances(text,size,rtl,font,language))
     }
 fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usize>,size:f32,rtl:bool,font:&FontSpec,language:Option<&str>) -> Result<Option<crate::paint::ShapedRunWithClusterAdvances>,()> {
-    self.bump();self.inner.shape_resolved_segment_with_cluster_advances(text,source,size,rtl,font,language)
+    let query=ShapeQuery{kind:ShapeKind::ResolvedSegment,text,range:(source.start,source.end),size,rtl,font,language};
+    self.memoized(query,||self.inner.shape_resolved_segment_with_cluster_advances(text,source,size,rtl,font,language))
 }
     fn generation(&self) -> u64 {
         self.inner.generation()
@@ -1473,8 +1660,8 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
         rtl: bool,
         font: &FontSpec,
     ) -> Result<ShapedRun, ()> {
-        self.bump();
-        self.inner.shape_styled(text, size, rtl, font)
+        let query = ShapeQuery { kind: ShapeKind::Styled, text, range: (0, 0), size, rtl, font, language: None };
+        self.memoized(query, || self.inner.shape_styled(text, size, rtl, font))
     }
     fn shape_resolved(
         &self,
@@ -1483,24 +1670,21 @@ fn shape_resolved_segment_with_cluster_advances(&self,text:&str,source:Range<usi
         rtl: bool,
         font: &FontSpec,
     ) -> Result<ShapedRun, ()> {
-        self.bump();
-        self.inner.shape_resolved(text, size, rtl, font)
+        let query = ShapeQuery { kind: ShapeKind::Resolved, text, range: (0, 0), size, rtl, font, language: None };
+        self.memoized(query, || self.inner.shape_resolved(text, size, rtl, font))
     }
     fn measure_styled(&self, text: &str, size: f32, font: &FontSpec) -> Result<f32, ()> {
-        self.bump();
-        self.inner.measure_styled(text, size, font)
+        let query = ShapeQuery { kind: ShapeKind::MeasureStyled, text, range: (0, 0), size, rtl: false, font, language: None };
+        self.memoized(query, || self.inner.measure_styled(text, size, font))
     }
     fn ascent_styled(&self, size: f32, font: &FontSpec) -> f32 {
-        self.bump();
-        self.inner.ascent_styled(size, font)
+        self.memoized_metric(ShapeKind::Ascent, size, font, || self.inner.ascent_styled(size, font))
     }
     fn line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
-        self.bump();
-        self.inner.line_height_styled(size, font)
+        self.memoized_metric(ShapeKind::LineHeight, size, font, || self.inner.line_height_styled(size, font))
     }
     fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
-        self.bump();
-        self.inner.normal_line_height_styled(size, font)
+        self.memoized_metric(ShapeKind::NormalLineHeight, size, font, || self.inner.normal_line_height_styled(size, font))
     }
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         self.bump();
@@ -1562,16 +1746,10 @@ const MEASUREMENT_CULL: Rect = Rect { x: -f32::MAX * 0.25, y: -f32::MAX * 0.25,
 /// sizes across frames whose only input change is the viewport size; an
 /// entry from an earlier frame is then reused only in an equal
 /// `IntrinsicContext` and when it read no viewport axis that changed.
+/// Only measured slots are stored, so memory follows the entry count.
 #[derive(Default)]
 pub(crate) struct IntrinsicSizes {
-    sizes: RefCell<Vec<Option<(Style, (f32, f32))>>>,
-    /// Margin escapes of the block box measured into `sizes`, same slots.
-    margins: RefCell<Vec<Option<BlockMargins>>>,
-    provenance: RefCell<Vec<IntrinsicProvenance>>,
-    /// Earlier measurements of a slot with other styles, newest first: a
-    /// box is measured with its own style and with used variants of it
-    /// (stretched, min/max-content, table cell projections) in one frame.
-    others: RefCell<Vec<Vec<IntrinsicEntry>>>,
+    slots: RefCell<BTreeMap<usize, IntrinsicSlot>>,
     /// Content languages, which depend on the document only.
     languages: RefCell<crate::language::LanguageMemo>,
     frame: core::cell::Cell<u32>,
@@ -1582,74 +1760,111 @@ pub(crate) struct IntrinsicSizes {
     /// Measurements made and cache hits served since `begin_frame`.
     measured: core::cell::Cell<usize>,
     reused: core::cell::Cell<usize>,
+    /// Flow children built by a flex or grid container's first intrinsic
+    /// pass, kept for the other mode's pass of the same frame.
+    children: RefCell<Vec<IntrinsicChildren>>,
+    /// Source-ancestry computed styles of list items, which the marker
+    /// origin resolves in both intrinsic sizing and box layout.
+    tree_styles: RefCell<BTreeMap<u128, TreeStyleEntry>>,
 }
+
+/// The newest measurement of a slot and earlier ones with other styles,
+/// newest first: a box is measured with its own style and with used variants
+/// of it (stretched, min/max-content, table cell projections) in one frame.
+#[derive(Default)]
+struct IntrinsicSlot {
+    primary: Option<IntrinsicEntry>,
+    others: Vec<IntrinsicEntry>,
+}
+
+impl IntrinsicSlot {
+    fn is_empty(&self) -> bool {
+        self.primary.is_none() && self.others.is_empty()
+    }
+    /// Make the newest measurement with `style` the primary one, moving the
+    /// primary into the other ways.
+    fn promote(&mut self, style: &Style) -> bool {
+        let Some(way) = self.others.iter().position(|entry| same_measured_style(&entry.style, style)) else { return false };
+        let entry = self.others.remove(way);
+        if let Some(old) = self.primary.replace(entry) {
+            self.others.insert(0, old);
+        }
+        true
+    }
+}
+
+const MAX_TREE_STYLE_MEMO: usize = 2048;
+
+struct TreeStyleEntry {
+    units: ContainerUnitContextKey,
+    parent: Option<(u128, Arc<Style>)>,
+    axes: u8,
+    style: Arc<Style>,
+}
+
+/// Flattened children of one box, valid for a repeat build with an equal
+/// source style, available size and measurement context.
+struct IntrinsicChildren {
+    frame: u32,
+    id: NodeId,
+    grid: bool,
+    available: f32,
+    source: Style,
+    context: IntrinsicContext,
+    axes: u8,
+    children: Rc<Vec<FlattenedBoxChild>>,
+}
+
+const MAX_INTRINSIC_CHILDREN_MEMO: usize = 64;
 
 impl IntrinsicSizes {
     fn clear(&self) {
-        self.sizes.borrow_mut().clear();
-        self.margins.borrow_mut().clear();
-        self.provenance.borrow_mut().clear();
-        self.others.borrow_mut().clear();
+        self.children.borrow_mut().clear();
+        self.tree_styles.borrow_mut().clear();
+        *self.slots.borrow_mut() = BTreeMap::new();
         self.languages.borrow_mut().clear();
     }
     fn drop_slot(&self, slot: usize) {
-        if let Some(size) = self.sizes.borrow_mut().get_mut(slot) { *size = None; }
-        if let Some(margin) = self.margins.borrow_mut().get_mut(slot) { *margin = None; }
-        if let Some(entry) = self.provenance.borrow_mut().get_mut(slot) { *entry = IntrinsicProvenance::default(); }
-        if let Some(others) = self.others.borrow_mut().get_mut(slot) { others.clear(); }
+        self.slots.borrow_mut().remove(&slot);
     }
-    /// Make the newest measurement of `slot` with `style` the primary one,
-    /// moving the primary into the other ways.
-    fn promote(&self, slot: usize, style: &Style) -> bool {
-        let mut others = self.others.borrow_mut();
-        let Some(ways) = others.get_mut(slot) else { return false };
-        let Some(way) = ways.iter().position(|entry| entry.style == *style) else { return false };
-        let entry = ways.remove(way);
-        let mut sizes = self.sizes.borrow_mut();
-        let mut margins = self.margins.borrow_mut();
-        let mut provenance = self.provenance.borrow_mut();
-        let (Some(size), Some(margin), Some(origin)) = (sizes.get_mut(slot), margins.get_mut(slot), provenance.get_mut(slot)) else { return false };
-        if let Some((old_style, old_size)) = size.replace((entry.style, entry.size)) {
-            ways.insert(0, IntrinsicEntry {
-                style: old_style,
-                size: old_size,
-                margins: core::mem::replace(margin, entry.margins),
-                provenance: core::mem::replace(origin, entry.provenance),
-            });
-        } else {
-            *margin = entry.margins;
-            *origin = entry.provenance;
-        }
-        true
+    /// The margin escapes measured with the primary size of `slot`.
+    fn margins(&self, slot: usize) -> Option<BlockMargins> {
+        self.slots.borrow().get(&slot).and_then(|entry| entry.primary.as_ref()).and_then(|entry| entry.margins)
+    }
+    /// Whether this frame already measured `slot` with `style`.
+    fn measured_this_frame(&self, slot: usize, style: &Style) -> bool {
+        let frame = self.frame.get();
+        self.slots.borrow().get(&slot).is_some_and(|entry| {
+            entry.primary.as_ref().is_some_and(|entry| entry.provenance.frame == frame && same_measured_style(&entry.style, style))
+                || entry.others.iter().any(|entry| entry.provenance.frame == frame && same_measured_style(&entry.style, style))
+        })
     }
     fn begin_frame(&self) {
         self.measured.set(0);
         self.reused.set(0);
+        self.children.borrow_mut().clear();
+        self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
     }
     /// Keep at most `limit` retained sizes, dropping the oldest frames first.
     fn retain_newest(&self, limit: usize) {
-        {
-            let mut others = self.others.borrow_mut();
-            if others.iter().map(Vec::len).sum::<usize>() > limit { others.clear(); }
+        let mut slots = self.slots.borrow_mut();
+        if slots.values().map(|slot| slot.others.len()).sum::<usize>() > limit {
+            for slot in slots.values_mut() { slot.others = Vec::new(); }
         }
-        let mut sizes = self.sizes.borrow_mut();
-        let live = sizes.iter().filter(|size| size.is_some()).count();
-        if live <= limit { return; }
-        let mut margins = self.margins.borrow_mut();
-        let mut provenance = self.provenance.borrow_mut();
-        let mut order: Vec<(u32, usize)> = sizes.iter().enumerate()
-            .filter(|(_, size)| size.is_some())
-            .map(|(slot, _)| (provenance.get(slot).map_or(0, |entry| entry.frame), slot))
-            .collect();
-        order.sort_unstable();
-        for &(_, slot) in &order[..live - limit] {
-            sizes[slot] = None;
-            if let Some(margin) = margins.get_mut(slot) { *margin = None; }
-            if let Some(entry) = provenance.get_mut(slot) { *entry = IntrinsicProvenance::default(); }
+        let live = slots.values().filter(|slot| slot.primary.is_some()).count();
+        if live > limit {
+            let mut order: Vec<(u32, usize)> = slots.iter()
+                .filter_map(|(&slot, entry)| entry.primary.as_ref().map(|primary| (primary.provenance.frame, slot)))
+                .collect();
+            order.sort_unstable();
+            for &(_, slot) in &order[..live - limit] {
+                if let Some(entry) = slots.get_mut(&slot) { entry.primary = None; }
+            }
+            for slot in slots.values_mut() { slot.others = Vec::new(); }
         }
-        self.others.borrow_mut().clear();
+        slots.retain(|_, slot| !slot.is_empty());
     }
     /// Count a read of a value derived from the given viewport axes.
     fn viewport_read<T>(&self, value: T, axes: u8) -> T {
@@ -1661,26 +1876,83 @@ impl IntrinsicSizes {
     /// Drop the entries that read a viewport axis which changed.
     fn retain_for_resize(&self, width: bool, height: bool) {
         let changed = u8::from(width) | (u8::from(height) << 1);
-        let provenance = self.provenance.borrow();
-        let mut sizes = self.sizes.borrow_mut();
-        let mut margins = self.margins.borrow_mut();
-        for (slot, entry) in provenance.iter().enumerate() {
-            if entry.axes & changed != 0 || entry.context.is_none() {
-                if let Some(size) = sizes.get_mut(slot) { *size = None; }
-                if let Some(margin) = margins.get_mut(slot) { *margin = None; }
+        let mut slots = self.slots.borrow_mut();
+        for slot in slots.values_mut() {
+            if slot.primary.as_ref().is_some_and(|entry| entry.provenance.axes & changed != 0 || entry.provenance.context.is_none()) {
+                slot.primary = None;
             }
+            slot.others.retain(|entry| entry.provenance.axes & changed == 0 && entry.provenance.context.is_some());
+            if slot.others.is_empty() { slot.others = Vec::new(); }
         }
-        for ways in self.others.borrow_mut().iter_mut() {
-            ways.retain(|entry| entry.provenance.axes & changed == 0 && entry.provenance.context.is_some());
-        }
+        slots.retain(|_, slot| !slot.is_empty());
     }
 }
 
 /// Ways kept per slot in `IntrinsicSizes::others`.
-const INTRINSIC_OTHER_WAYS: usize = 3;
+const INTRINSIC_OTHER_WAYS: usize = 8;
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Paragraph measurements (collection, shaping and line layout) run by this thread.
+    static PARAGRAPH_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static PAIRED_INTRINSICS_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static INTRINSIC_CHILDREN_MEMO_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static INTRINSIC_CHILDREN_BUILDS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static TREE_STYLE_MEMO_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static TREE_STYLE_WALKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static TREE_STYLE_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static INTRINSIC_CHILDREN_REUSED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static FLEX_SHORTCUTS_DISABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static ANONYMOUS_TEXT_MEASUREMENTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn flex_shortcuts_enabled() -> bool {
+    !FLEX_SHORTCUTS_DISABLED.with(core::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn flex_shortcuts_enabled() -> bool {
+    true
+}
+
+/// Whether two styles measure alike. A box's own flex factors and basis are
+/// read only by its flex container, from the item's style, so a measurement
+/// made with other values of them is the same measurement.
+fn same_measured_style(cached: &Style, style: &Style) -> bool {
+    if cached == style { return true; }
+    if !flex_shortcuts_enabled() { return false; }
+    if cached.flex_grow == style.flex_grow && cached.flex_shrink == style.flex_shrink
+        && cached.flex_basis == style.flex_basis { return false; }
+    let mut probe = style.clone();
+    probe.flex_grow = cached.flex_grow;
+    probe.flex_shrink = cached.flex_shrink;
+    probe.flex_basis = cached.flex_basis;
+    *cached == probe
+}
+
+/// Whether a flex container ignores its items' cross sizes measured before
+/// layout: they only feed wrapped line sizes and a clamped automatic height.
+fn flex_ignores_measured_cross(container: &Style, row: bool) -> bool {
+    !container.flex_wrap && (!row || container.height.is_some()
+        || container.max_height.is_none() && constrained_height(container, 0.0) == 0.0)
+}
+
+#[cfg(test)]
+fn paired_intrinsics_enabled() -> bool {
+    !PAIRED_INTRINSICS_DISABLED.with(core::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn paired_intrinsics_enabled() -> bool {
+    true
+}
 
 struct IntrinsicEntry {
-    style: Style,
+    style: Arc<Style>,
     size: (f32, f32),
     margins: Option<BlockMargins>,
     provenance: IntrinsicProvenance,
@@ -1691,7 +1963,7 @@ struct IntrinsicProvenance {
     frame: u32,
     /// Viewport axes read: bit 0 width, bit 1 height.
     axes: u8,
-    context: Option<IntrinsicContext>,
+    context: Option<Arc<IntrinsicContext>>,
     /// Loading images the measurement ran around, and the resolver generation
     /// they were last known to be loading at. The entry is reused while they
     /// all still load, like a retained fragment (`pending_images`).
@@ -1746,7 +2018,7 @@ struct IntrinsicMark {
     reads: [u64; 2],
     css: (u64, u64),
     pending: Option<usize>,
-    context: Option<IntrinsicContext>,
+    context: Option<Arc<IntrinsicContext>>,
 }
 
 /// Whether the document may hold list items or quotes, so that counter and
@@ -1771,6 +2043,8 @@ pub(crate) struct RetainedLayoutCache {
     lru: BTreeMap<u64, RetainedNodeKey>,
     bytes: usize,
     budget: RetainedLayoutBudget,
+    /// Fragments with at most this many commands are not retained.
+    min_commands: usize,
     clock: u64,
     hits: usize,
     misses: usize,
@@ -1791,15 +2065,58 @@ pub(crate) struct RetainedLayoutCache {
     /// Retained fragments per distinct style (by pointer) with the style's
     /// bytes, which `bytes` counts once however many fragments share it.
     style_owners: BTreeMap<usize, (usize, usize)>,
+    /// Custom property maps restyles replaced without any rule reading them:
+    /// a fragment laid out with the old map is valid for a style that has
+    /// the new one and is otherwise equal.
+    custom_rebases: Vec<css::CustomRebase>,
+}
+
+fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
+    map.as_ref().map_or(0, |map| Arc::as_ptr(map) as usize)
 }
 
 impl RetainedLayoutCache {
+    pub(crate) fn note_custom_rebases(&mut self, rebases: Vec<css::CustomRebase>) {
+        if self.entries.is_empty() { return; }
+        self.custom_rebases.extend(rebases);
+        if self.custom_rebases.len() > 256 {
+            let excess = self.custom_rebases.len() - 128;
+            self.custom_rebases.drain(..excess);
+        }
+    }
+
+    /// Whether a style a fragment was laid out with stands for `current`.
+    fn same_style(&self, retained: &Style, current: &Style) -> bool {
+        if retained == current { return true; }
+        if self.custom_rebases.is_empty() { return false; }
+        let target = current.custom_identity();
+        let mut reached = Vec::from([retained.custom_identity()]);
+        if reached[0] == target { return false; }
+        for _ in 0..8 {
+            let mut grew = false;
+            for (old, new) in &self.custom_rebases {
+                let (old, new) = (custom_map_identity(old), custom_map_identity(new));
+                if reached.contains(&old) && !reached.contains(&new) {
+                    if new == target { return retained.equal_ignoring_custom(current); }
+                    reached.push(new);
+                    grew = true;
+                }
+            }
+            if !grew { break; }
+        }
+        false
+    }
+
     pub(crate) fn clear(&mut self) {
         self.clear_fragments();
         self.intrinsics.clear();
         self.generated = None;
         self.generated_current = false;
         self.scan = GeneratedScan::default();
+    }
+
+    pub(crate) fn set_min_commands(&mut self, min_commands: usize) {
+        self.min_commands = min_commands;
     }
 
     pub(crate) fn set_budget(&mut self, budget: RetainedLayoutBudget) {
@@ -1818,18 +2135,33 @@ impl RetainedLayoutCache {
     /// them are dropped, since their geometry is unchanged. Fragments and
     /// sizes elsewhere validate themselves by style and constraints, and are
     /// replayed translated when only their position differs.
-    pub(crate) fn invalidate_changed(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId], paint: &[NodeId]) {
+    ///
+    /// A node for which `size_boundary` holds has an outer size and intrinsic
+    /// contribution that its contents cannot change: the intrinsic sizes of its
+    /// ancestors stay, while their fragments, which replay its commands, go.
+    pub(crate) fn invalidate_changed(&mut self, document: &Document, layout: &[NodeId], subtrees: &[NodeId], paint: &[NodeId], size_boundary: &dyn Fn(NodeId) -> bool) {
         if !layout.is_empty() || !subtrees.is_empty() { self.generated_current = false; }
         self.note_scan_changes(document, layout, subtrees);
         let mut fragments: BTreeSet<RetainedNodeKey> = BTreeSet::new();
         let mut sizes: BTreeSet<RetainedNodeKey> = BTreeSet::new();
+        // A changed node may have just become, or stopped being, a boundary.
+        let changed: BTreeSet<RetainedNodeKey> = layout.iter().chain(subtrees).map(|&node| retained_node_key(node)).collect();
         for &node in layout.iter().chain(subtrees) {
             let mut current = Some(node);
             for _ in 0..=512 {
                 let Some(id) = current else { break };
-                let key = retained_node_key(id);
-                if !sizes.insert(key) { current = None; break; }
-                fragments.insert(key);
+                if !fragments.insert(retained_node_key(id)) { current = None; break; }
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() {
+                self.clear();
+                return;
+            }
+            let mut current = Some(node);
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                if !sizes.insert(retained_node_key(id)) { current = None; break; }
+                if size_boundary(id) && !changed.contains(&retained_node_key(id)) { current = None; break; }
                 current = document.composed_parent(id).ok().flatten();
             }
             if current.is_some() {
@@ -1898,7 +2230,7 @@ impl RetainedLayoutCache {
             Some((old_counters, old_quotes)) => {
                 let mut changed = changed_generated_nodes(&old_counters, counters, |value| (value.node.key(), value.pseudo as u8), |value| value.node);
                 changed.extend(changed_generated_nodes(&old_quotes, quotes, |value| (value.node.key(), 0), |value| value.node));
-                if !changed.is_empty() { self.invalidate_changed(document, &changed, &[], &[]); }
+                if !changed.is_empty() { self.invalidate_changed(document, &changed, &[], &[], &|_| false); }
             }
             None => {
                 if !self.entries.is_empty() { self.clear(); }
@@ -1943,7 +2275,8 @@ impl RetainedLayoutCache {
 
     fn clear_fragments(&mut self) {
         if !self.entries.is_empty() { self.clears += 1; }
-        self.entries.clear();
+        self.custom_rebases.clear();
+        self.entries = Vec::new();
         self.index.clear();
         self.lru.clear();
         self.parent_styles.clear();
@@ -1989,9 +2322,45 @@ impl RetainedLayoutCache {
         self.rebuild_indexes();
     }
 
+    /// Drop the intrinsic sizes of `targets` and of their composed ancestors,
+    /// whose contents contain them, and with `descendants` of everything inside
+    /// them. Sizes elsewhere validate themselves by style and context. False
+    /// when the walk gave up and the caller has to drop them all.
+    fn drop_intrinsics_around(&self, document: &Document, targets: &[NodeId], descendants: bool) -> bool {
+        let intrinsics = &*self.intrinsics;
+        let mut walked = 0usize;
+        let budget = document.node_count().saturating_mul(2).saturating_add(1024);
+        for &target in targets {
+            let mut current = Some(target);
+            for _ in 0..=512 {
+                let Some(id) = current else { break };
+                intrinsics.drop_slot(id.index() * 2);
+                intrinsics.drop_slot(id.index() * 2 + 1);
+                current = document.composed_parent(id).ok().flatten();
+            }
+            if current.is_some() { return false; }
+            if !descendants { continue; }
+            let mut pending = Vec::from([target]);
+            while let Some(node) = pending.pop() {
+                walked += 1;
+                if walked > budget { return false; }
+                intrinsics.drop_slot(node.index() * 2);
+                intrinsics.drop_slot(node.index() * 2 + 1);
+                let mut child = document.first_child(node).ok().flatten();
+                while let Some(id) = child {
+                    pending.push(id);
+                    child = document.next_sibling(id).ok().flatten();
+                }
+                if let Some(root) = document.shadow_root(node).ok().flatten() { pending.push(root); }
+            }
+        }
+        intrinsics.languages.borrow_mut().clear();
+        true
+    }
+
     pub(crate) fn invalidate_text_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.generated_current = false;
-        self.intrinsics.clear();
+        if !self.drop_intrinsics_around(document, targets, false) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
             !targets
@@ -2003,7 +2372,7 @@ impl RetainedLayoutCache {
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.generated_current = false;
-        self.intrinsics.clear();
+        if !self.drop_intrinsics_around(document, targets, true) { self.intrinsics.clear(); }
         self.scan = GeneratedScan::default();
         self.entries.retain(|entry| {
             document.kind(entry.key.node).is_ok()
@@ -2029,8 +2398,8 @@ impl RetainedLayoutCache {
         if let Some(&slot) = self.index.get(&retained_node_key(key.node)) {
             let entry = &self.entries[slot];
             reason = if entry.key != *key { 1 }
-                else if *entry.style != *style { 2 }
-                else if *entry.parent_style != *parent_style { 3 }
+                else if !self.same_style(&entry.style, style) { 2 }
+                else if !self.same_style(&entry.parent_style, parent_style) { 3 }
                 else { 4 };
             if reason == 4 {
                 if let Some(shift) = entry.shift_to(at, key.cull) {
@@ -2134,6 +2503,7 @@ impl RetainedLayoutCache {
             || charged > MAX_RETAINED_FRAGMENT_BYTES
             || charged > self.budget.max_bytes
             || self.budget.max_entries == 0
+            || (self.min_commands > 0 && fragment.commands.len() <= self.min_commands)
         {
             return;
         }
@@ -2167,6 +2537,7 @@ impl RetainedLayoutCache {
     }
 
     fn rebuild_indexes(&mut self) {
+        if self.entries.capacity() > self.entries.len().saturating_mul(2).max(64) { self.entries.shrink_to_fit(); }
         self.index.clear();
         self.lru.clear();
         self.bytes = 0;
@@ -2333,13 +2704,14 @@ fn retained_fragment_bytes(
     }
     add_retained_bytes(&mut bytes, core::mem::size_of::<RetainedFragment>())?;
     add_retained_bytes(&mut bytes, core::mem::size_of::<RetainedFragmentKey>())?;
+    if key.rare.is_some() { add_retained_bytes(&mut bytes, core::mem::size_of::<RetainedKeyRare>())?; }
     add_retained_bytes(
         &mut bytes,
-        key.decorations
+        key.decorations()
             .len()
             .checked_mul(core::mem::size_of::<TextDecoration>())?,
     )?;
-    for decoration in &key.decorations {
+    for decoration in key.decorations() {
         add_font_spec_bytes(&mut bytes, &decoration.font)?;
         add_style_payload_bytes(&mut bytes, &decoration.source)?;
     }
@@ -3168,8 +3540,16 @@ pub(crate) struct CssomStylesheetText {
 
 fn append_stylesheet_media(parsed:&mut css::ParsedStylesheets,media:&str) {
     if media.trim().is_empty() {return;}
-    let append=|conditions:&mut Arc<[Arc<str>]>| {
-        let mut next=conditions.to_vec();next.push(Arc::from(media));*conditions=next.into();
+    let media:Arc<str>=Arc::from(media);
+    let mut last:Option<(Arc<[Arc<str>]>,Arc<[Arc<str>]>)>=None;
+    let mut append=|conditions:&mut Arc<[Arc<str>]>| {
+        if let Some((from,to))=&last {
+            if Arc::ptr_eq(from,conditions) {*conditions=to.clone();return;}
+        }
+        let mut next=conditions.to_vec();next.push(media.clone());
+        let next:Arc<[Arc<str>]>=next.into();
+        last=Some((conditions.clone(),next.clone()));
+        *conditions=next;
     };
     for rule in &mut parsed.rules {append(&mut rule.media);}
     for face in &mut parsed.font_faces {append(&mut face.media);}
@@ -3284,6 +3664,72 @@ pub(crate) fn stylesheets_with_sources(
     )
 }
 
+pub(crate) struct CollectedStylesheets {
+    pub(crate) rules: Vec<css::Rule>,
+    /// Sheet-local index data of document-tree sheets' stretches of `rules`.
+    pub(crate) segments: Vec<css::RuleSegment>,
+    sheets: Vec<css::ParsedStylesheets>,
+    keyframes: Vec<css::KeyframesRuleText>,
+    /// One stamp per document-tree sheet, in rule order.
+    pub(crate) stamps: Vec<SheetStamp>,
+    /// Whether shadow-tree or adopted sheets contributed rules after the document sheets.
+    pub(crate) scoped: bool,
+    /// With a prefix given: whether its sheets were all unchanged, so `rules`
+    /// holds only the rules after them. Otherwise `rules` is incomplete.
+    pub(crate) prefix_reused: bool,
+}
+
+/// Everything that decides the rules of one document-tree sheet.
+#[derive(Clone, PartialEq)]
+enum SheetInput {
+    Source(css::StylesheetSource),
+    Text { len: usize, hash: u64 },
+    Opaque,
+}
+
+enum SheetInputRef<'a> {
+    Source(&'a css::StylesheetSource),
+    Text(&'a str),
+}
+
+impl SheetInputRef<'_> {
+    fn text_stamp(text: &str) -> SheetInput {
+        SheetInput::Text { len: text.len(), hash: lumen_common::fasthash::fnv1a64(lumen_common::fasthash::FNV1A64_OFFSET, text.as_bytes()) }
+    }
+
+    fn matches(&self, input: &SheetInput) -> bool {
+        match (self, input) {
+            (Self::Source(source), SheetInput::Source(known)) => *source == known,
+            (Self::Text(text), known @ SheetInput::Text { .. }) => Self::text_stamp(text) == *known,
+            _ => false,
+        }
+    }
+
+    fn owned(&self) -> SheetInput {
+        match self {
+            Self::Source(source) => SheetInput::Source((*source).clone()),
+            Self::Text(text) => Self::text_stamp(text),
+        }
+    }
+}
+
+/// A document-tree sheet as it was collected: lets a later collection skip the
+/// rules of unchanged leading sheets that the style index already holds.
+#[derive(Clone)]
+pub(crate) struct SheetStamp {
+    owner: NodeId,
+    input: SheetInput,
+    media: Option<String>,
+    rules: usize,
+    reused: bool,
+}
+
+impl SheetStamp {
+    pub(crate) fn rules(&self) -> usize {
+        self.rules
+    }
+}
+
 pub(crate) fn stylesheets_with_source_topologies(
     document: &Document,
     linked: &[(NodeId, String, String)],
@@ -3297,6 +3743,47 @@ pub(crate) fn stylesheets_with_source_topologies(
     preferred_set:Option<&str>,
     parse_cache: &css::StylesheetParseCache,
 ) -> Result<(StyleIndex, Vec<css::FontFaceRule>), LayoutError> {
+    let mut collected = collect_stylesheets(document, linked, sources, adopted, environment, topologies, cssom_texts, disabled_sheets, preferred_set, parse_cache, None)?;
+    let style_index = StyleIndex::new_with_segments(core::mem::take(&mut collected.rules), document_base.clone(), &collected.segments);
+    finish_style_index(style_index, collected, document, document_base, environment)
+}
+
+pub(crate) fn collect_stylesheets(
+    document: &Document,
+    linked: &[(NodeId, String, String)],
+    sources: &[LoadedStylesheet],
+    adopted: &[(Option<NodeId>, Vec<crate::session::AdoptedStylesheetSource>)],
+    environment: css::MediaEnvironment,
+    topologies: &[css::RuleTopologyOverride],
+    cssom_texts: &[CssomStylesheetText],
+    disabled_sheets:&[NodeId],
+    preferred_set:Option<&str>,
+    parse_cache: &css::StylesheetParseCache,
+    prefix: Option<&[SheetStamp]>,
+) -> Result<CollectedStylesheets, LayoutError> {
+    let stamps = RefCell::new(Vec::<SheetStamp>::new());
+    let scoped = core::cell::Cell::new(false);
+    // A leading sheet equal to the one the caller already holds contributes
+    // no rules, only its font faces and keyframes.
+    let stamped = |id: NodeId, input: SheetInputRef<'_>, media: Option<&str>, parse: &dyn Fn() -> Result<css::ParsedStylesheets, LayoutError>, shell: &dyn Fn() -> Option<css::ParsedStylesheets>| -> Result<css::ParsedStylesheets, LayoutError> {
+        if scoped.get() {
+            return parse();
+        }
+        let mut known = stamps.borrow_mut();
+        let prior = prefix.and_then(|prefix| prefix.get(known.len()));
+        if let Some(prior) = prior {
+            if prior.owner == id && prior.media.as_deref() == media && input.matches(&prior.input)
+                && !topologies.iter().any(|entry| entry.owner == css::StylesheetIdentity::Dom(id)) {
+                if let Some(parsed) = shell() {
+                    known.push(SheetStamp { owner: id, input: prior.input.clone(), media: prior.media.clone(), rules: prior.rules, reused: true });
+                    return Ok(parsed);
+                }
+            }
+        }
+        let parsed = parse()?;
+        known.push(SheetStamp { owner: id, input: input.owned(), media: media.map(String::from), rules: parsed.rules.len(), reused: false });
+        Ok(parsed)
+    };
     let parse_local = |owner, text: &str| {
         let boundaries = topologies
             .iter()
@@ -3319,13 +3806,18 @@ pub(crate) fn stylesheets_with_source_topologies(
         let Some(identity)=stylesheet_identity(document,id)? else {return Ok(None);};
         let StylesheetIdentity::Inline(authored)=&identity else {return Ok(None);};
         if !document.inline_stylesheet_allowed(id,authored) {return Ok(None);}
+        let media=crate::svg::attribute(attributes,"media");
         let mut parsed=if let Some(source)=sources.iter().find(|source|source.owner==id && source.identity==identity) {
-            parse_cache.parse_graph(&source.source,environment,Some(css::StylesheetIdentity::Dom(id)),topologies).map_err(LayoutError::Css)?
+            stamped(id,SheetInputRef::Source(&source.source),media,
+                &||parse_cache.parse_graph(&source.source,environment,Some(css::StylesheetIdentity::Dom(id)),topologies).map_err(LayoutError::Css),
+                &||parse_cache.parse_graph_shell(&source.source))?
         }else {
             let effective=cssom_texts.iter().find(|entry|entry.owner==id && entry.identity==identity).map_or(authored.as_str(),|entry|entry.text.as_ref());
-            parse_local(css::StylesheetIdentity::Dom(id),effective)?
+            stamped(id,SheetInputRef::Text(effective),media,
+                &||parse_local(css::StylesheetIdentity::Dom(id),effective),
+                &||parse_cache.parse_text_shell(effective))?
         };
-        if let Some(media)=crate::svg::attribute(attributes,"media") {append_stylesheet_media(&mut parsed,media);}
+        if let Some(media)=media {append_stylesheet_media(&mut parsed,media);}
         for rule in &mut parsed.rules {rule.stylesheet_owner=Some(css::StylesheetIdentity::Dom(id));}
         assign_css_font_face_identities(&mut parsed,css::FontFaceOwnerId::Element(id));
         Ok(Some(parsed))
@@ -3361,15 +3853,13 @@ pub(crate) fn stylesheets_with_source_topologies(
                                     ))
                                 && source.source.text.as_ref() == text
                         }) {
-                            parse_cache.parse_graph(
-                                &source.source,
-                                environment,
-                                Some(css::StylesheetIdentity::Dom(id)),
-                                topologies,
-                            )
-                            .map_err(LayoutError::Css)?
+                            stamped(id, SheetInputRef::Source(&source.source), attribute("media"),
+                                &|| parse_cache.parse_graph(&source.source, environment, Some(css::StylesheetIdentity::Dom(id)), topologies).map_err(LayoutError::Css),
+                                &|| parse_cache.parse_graph_shell(&source.source))?
                         } else {
-                            parse_local(css::StylesheetIdentity::Dom(id), text)?
+                            stamped(id, SheetInputRef::Text(text), attribute("media"),
+                                &|| parse_local(css::StylesheetIdentity::Dom(id), text),
+                                &|| parse_cache.parse_text_shell(text))?
                         };
                         if let Some(media)=attribute("media") {append_stylesheet_media(&mut parsed,media);}
                         for rule in &mut parsed.rules {
@@ -3385,6 +3875,7 @@ pub(crate) fn stylesheets_with_source_topologies(
         Ok(None)
     };
     let mut rules = Vec::new();
+    let mut segments = Vec::<css::RuleSegment>::new();
     let mut sheets = Vec::new();
     let mut scoped_keyframes = Vec::new();
     let mut pending = alloc::vec![document.root()];
@@ -3408,7 +3899,9 @@ pub(crate) fn stylesheets_with_source_topologies(
                         for rule in &mut parsed.rules {rule.stylesheet_owner=Some(css::StylesheetIdentity::Dom(id));}
                         assign_css_font_face_identities(&mut parsed,css::FontFaceOwnerId::Element(id));
                         if rules.len()+parsed.rules.len()>css::MAX_RULES {return Err(LayoutError::Css(css::CssError{offset:0,message:"too many rules"}));}
-                        rules.extend(parsed.rules.iter().cloned());sheets.push(parsed);
+                        stamps.borrow_mut().push(SheetStamp{owner:id,input:SheetInput::Opaque,media:None,rules:parsed.rules.len(),reused:false});
+                        if let Some(fragment)=parsed.take_rule_index() {segments.push(css::RuleSegment{start:rules.len(),fragment});}
+                        rules.append(&mut parsed.rules);sheets.push(parsed);
                     }
                 }
             }
@@ -3432,16 +3925,18 @@ pub(crate) fn stylesheets_with_source_topologies(
             }
             if matches!(tag,"style"|"link") && disabled_sheets.contains(&id) {continue}
             if *namespace == Namespace::Html && tag == "link" {
-                if let Some(parsed)=parse_link_owner(id)? {
+                if let Some(mut parsed)=parse_link_owner(id)? {
                     if rules.len()+parsed.rules.len()>css::MAX_RULES {return Err(LayoutError::Css(css::CssError{offset:0,message:"too many rules"}));}
-                    rules.extend(parsed.rules.iter().cloned());sheets.push(parsed);
+                    if let Some(fragment)=parsed.take_rule_index() {segments.push(css::RuleSegment{start:rules.len(),fragment});}
+                    rules.append(&mut parsed.rules);sheets.push(parsed);
                 }
                 continue;
             }
             if tag == "style" {
-                if let Some(parsed)=parse_inline_owner(id,true)? {
+                if let Some(mut parsed)=parse_inline_owner(id,true)? {
                     if rules.len()+parsed.rules.len()>css::MAX_RULES {return Err(LayoutError::Css(css::CssError{offset:0,message:"too many rules"}));}
-                    rules.extend(parsed.rules.iter().cloned());sheets.push(parsed);
+                    if let Some(fragment)=parsed.take_rule_index() {segments.push(css::RuleSegment{start:rules.len(),fragment});}
+                    rules.append(&mut parsed.rules);sheets.push(parsed);
                 }
                 continue;
             }
@@ -3458,6 +3953,8 @@ pub(crate) fn stylesheets_with_source_topologies(
     }
     // Shadow tree stylesheets are scoped: their rules apply only inside their
     // own tree (plus `:host`/`::slotted()` reaching outward).
+    scoped.set(true);
+    let document_rules = rules.len();
     for (_, root, _) in document.shadow_roots() {
         let mut pending = alloc::vec![root];
         while let Some(id) = pending.pop() {
@@ -3476,7 +3973,7 @@ pub(crate) fn stylesheets_with_source_topologies(
                             for keyframes in &mut parsed.keyframes {keyframes.scope=Some(root);}
                             if rules.len()+parsed.rules.len()>css::MAX_RULES {return Err(LayoutError::Css(css::CssError{offset:0,message:"too many rules"}));}
                             for family in &mut parsed.family_display {family.scope=Some(root);}
-                            rules.extend(parsed.rules.iter().cloned());scoped_keyframes.append(&mut parsed.keyframes);
+                            rules.append(&mut parsed.rules);scoped_keyframes.append(&mut parsed.keyframes);
                             sheets.push(parsed);
                         }
                         false
@@ -3541,7 +4038,7 @@ pub(crate) fn stylesheets_with_source_topologies(
             for rule in &mut parsed.rules {
                 rule.scope = *scope;
             }
-            rules.extend(parsed.rules.iter().cloned());
+            rules.append(&mut parsed.rules);
             for family in &mut parsed.family_display {family.scope=*scope;}
             for keyframe in &mut parsed.keyframes {keyframe.scope=*scope;}
             sheets.push(parsed);
@@ -3559,7 +4056,23 @@ pub(crate) fn stylesheets_with_source_topologies(
     for (order, keyframe) in keyframes.iter_mut().enumerate() {
         keyframe.source_order = order;
     }
-    let mut style_index = StyleIndex::new_with_document_base_url(rules, document_base.clone());
+    let stamps = stamps.into_inner();
+    let scoped = rules.len() > document_rules;
+    let prefix_reused = prefix.is_some_and(|prefix| !scoped && stamps.len() >= prefix.len() && stamps[..prefix.len()].iter().all(|stamp| stamp.reused));
+    if prefix_reused && rules.len() + stamps.iter().filter(|stamp| stamp.reused).map(|stamp| stamp.rules).sum::<usize>() > css::MAX_RULES {
+        return Err(LayoutError::Css(css::CssError{offset:0,message:"too many rules"}));
+    }
+    Ok(CollectedStylesheets { rules, segments, sheets, keyframes, stamps, scoped, prefix_reused })
+}
+
+pub(crate) fn finish_style_index(
+    mut style_index: StyleIndex,
+    collected: CollectedStylesheets,
+    document: &Document,
+    document_base: Option<Arc<str>>,
+    environment: css::MediaEnvironment,
+) -> Result<(StyleIndex, Vec<css::FontFaceRule>), LayoutError> {
+    let CollectedStylesheets { mut sheets, keyframes, .. } = collected;
     style_index.environment = environment;
     style_index.set_registered_properties(&document.registered_custom_properties);
     for sheet in &mut sheets {
@@ -3666,6 +4179,9 @@ struct Layout<'a> {
     // measurement forks start without it, and resolve their assigned basis.
     intrinsic_inline_axis: Option<bool>,
     intrinsic_minimum_atomics: bool,
+    /// Atomic inline widths resolved while collecting paragraphs; zero means
+    /// the collection did not read `intrinsic_minimum_atomics`.
+    atomic_width_resolutions: core::cell::Cell<u32>,
     flow_baselines: Option<FlowBaselines>,
     export_block_table_baselines: bool,
     vertical_inline_lr: bool,
@@ -3688,6 +4204,7 @@ struct Layout<'a> {
     overflow_lines: Vec<OverflowLinePaint>,
     overflow_line_bytes: usize,
     overflow_capture: bool,
+    deferred_inline_capture: bool,
     overflow_nested_sources: Vec<OverflowInlinePaint>,
     text_ink_capture: bool,
     measurement_glyphs: Option<Arc<[crate::paint::Glyph]>>,
@@ -3800,6 +4317,9 @@ struct Layout<'a> {
     /// The active DOM parent's computed values, before used box projections.
     /// Saved by formatter recursion, not retained per node or in layout fragments.
     computed_parent: Option<(NodeId, Arc<Style>)>,
+    /// The last DOM parent `computed_style` substituted for a used parent
+    /// style, under the container units it was resolved with.
+    inherited_parent: core::cell::RefCell<Option<(NodeId, css::ContainerUnitContext, Arc<Style>)>>,
     /// Cascade results for this run, keyed by node and parent style.
     style_cache: &'a core::cell::RefCell<css::StyleCache>,
     /// Quote nesting depths computed in one composed-tree preorder for all
@@ -3929,6 +4449,7 @@ impl<'a> Layout<'a> {
         retained_fragments: Option<&'a mut RetainedLayoutCache>) -> Self {
         Self {
         computed_parent: None,
+        inherited_parent: core::cell::RefCell::new(None),
         rendered_table_context: None,
         drawable_snapshot_root: None,
         timeline_values:None,
@@ -3941,6 +4462,7 @@ impl<'a> Layout<'a> {
         percentage_basis: None,
         intrinsic_inline_axis: None,
         intrinsic_minimum_atomics: false,
+        atomic_width_resolutions: core::cell::Cell::new(0),
         flow_baselines: None,
         export_block_table_baselines: true,
         vertical_inline_lr: false,
@@ -3963,6 +4485,7 @@ impl<'a> Layout<'a> {
         overflow_lines: Vec::new(),
         overflow_line_bytes: 0,
         overflow_capture: false,
+        deferred_inline_capture: false,
         overflow_nested_sources: Vec::new(),
         text_ink_capture: false,
         measurement_glyphs: None,
@@ -4441,6 +4964,36 @@ impl Layout<'_> {
         Ok(found)
     }
 
+    /// Whether any element can generate quotes: a `q`, or one that a rule with
+    /// quote content matches. Without one the quote walk has nothing to record,
+    /// so its style computations are skipped.
+    fn quote_generator_exists(&self, root: NodeId) -> Result<bool, LayoutError> {
+        let mut stack = Vec::new();
+        stack.try_reserve(64).map_err(|_| LayoutError::CommandLimit)?;
+        stack.push(root);
+        let mut visited = 0usize;
+        while let Some(node) = stack.pop() {
+            visited += 1;
+            if visited > self.document.node_count() {
+                return Err(LayoutError::DepthLimit);
+            }
+            if matches!(self.document.kind(node).map_err(|_| LayoutError::InvalidTree)?, NodeKind::Element { .. }) {
+                if matches!(
+                    self.document.kind(node),
+                    Ok(NodeKind::Element { name, namespace: Namespace::Html, .. }) if crate::svg::local_name(name) == "q"
+                ) || self.rules.may_generate_quotes(self.document, node) {
+                    return Ok(true);
+                }
+            }
+            let mut children = self.document.composed_children_iter(node).map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+                stack.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+                stack.push(child);
+            }
+        }
+        Ok(false)
+    }
+
     fn prepare_quote_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
         if let Some((_, quotes)) = self.retained_fragments.as_deref()
             .filter(|cache| cache.generated_current).and_then(|cache| cache.generated.as_ref()) {
@@ -4448,6 +5001,9 @@ impl Layout<'_> {
             return Ok(());
         }
         if !self.rules.has_quote_content() && !self.document_has_quotes(root)? {
+            return Ok(());
+        }
+        if !self.quote_generator_exists(root)? {
             return Ok(());
         }
         let mut positions = Vec::new();
@@ -4613,9 +5169,15 @@ impl Layout<'_> {
         // CSS inheritance consumes computed values. The formatter's parent
         // argument may already contain used percentages, intrinsic sizes or
         // anonymous-box projections; none of those are inheritable values.
-        let parent = self.computed_parent.as_ref()
-            .filter(|(id, _)| self.document.composed_parent(node).ok().flatten() == Some(*id))
-            .map_or(parent, |(_, style)| Some(style));
+        let composed = self.document.composed_parent(node).ok().flatten();
+        let inherited;
+        let parent = match self.computed_parent.as_ref().filter(|(id, _)| composed == Some(*id)) {
+            Some((_, style)) => Some(&**style),
+            None => {
+                inherited = parent.zip(composed).and_then(|(given, composed)| self.inherited_parent(composed, given));
+                inherited.as_deref().or(parent)
+            }
+        };
         let mut style = css::compute_node_cached_with_text(
             self.document,
             node,
@@ -4638,6 +5200,28 @@ impl Layout<'_> {
             }
         }
         Ok(style)
+    }
+
+    /// The computed values `node`'s children inherit, as `box_for` hands them
+    /// down, when `given` is a used projection of them: intrinsic sizing and
+    /// formatting pass styles with resolved percentages, which inheritance
+    /// must not see. `None` when `given` may be a different inheritance parent.
+    fn inherited_parent(&self, node: NodeId, given: &Style) -> Option<Arc<Style>> {
+        let units = self.container_units.get();
+        let remembered = self.inherited_parent.borrow().as_ref()
+            .filter(|(id, context, _)| *id == node && *context == units)
+            .map(|(_, _, style)| style.clone());
+        let origin = match remembered {
+            Some(origin) => origin,
+            None => {
+                let mut origin = (*self.style_cache.borrow_mut().snapshot_style(node)?).clone();
+                self.resolve_query_context(&mut origin);
+                let origin = Arc::new(origin);
+                *self.inherited_parent.borrow_mut() = Some((node, units, origin.clone()));
+                origin
+            }
+        };
+        origin.inherited_by_projection(given).then_some(origin)
     }
 
     fn apply_viewport_layout_style(&self, node: NodeId, style: &mut Style) {
@@ -5795,6 +6379,51 @@ impl Layout<'_> {
 
     fn computed_style_from_tree(&self, node: NodeId) -> Result<Style, LayoutError> {
         self.computed_style_from_tree_visiting(node, |_, _| {})
+    }
+
+    /// `computed_style_from_tree`, shared between callers of one frame that
+    /// resolve the same node in the same inheritance and unit context.
+    fn computed_style_from_tree_shared(&self, node: NodeId) -> Result<Arc<Style>, LayoutError> {
+        let units: ContainerUnitContextKey = self.container_units.get().into();
+        let parent = self.computed_parent.as_ref().map(|(id, style)| (id.key(), style.clone()));
+        #[cfg(test)]
+        let enabled = !TREE_STYLE_MEMO_DISABLED.with(core::cell::Cell::get);
+        #[cfg(not(test))]
+        let enabled = true;
+        let shareable = enabled && self.svg_geometry_operation.is_none() && self.drawable_snapshot_root.is_none();
+        let key = node.key();
+        if shareable {
+            let hit = self.intrinsics.tree_styles.borrow().get(&key)
+                .filter(|entry| entry.units == units
+                    && entry.parent.as_ref().map(|(id, _)| *id) == parent.as_ref().map(|(id, _)| *id)
+                    && match (&entry.parent, &parent) {
+                        (Some((_, stored)), Some((_, current))) => Arc::ptr_eq(stored, current) || **stored == **current,
+                        _ => true,
+                    })
+                .map(|entry| (entry.style.clone(), entry.axes));
+            if let Some((style, axes)) = hit {
+                self.intrinsics.viewport_read((), axes);
+                #[cfg(test)]
+                TREE_STYLE_REUSED.with(|runs| runs.set(runs.get() + 1));
+                return Ok(style);
+            }
+        }
+        #[cfg(test)]
+        TREE_STYLE_WALKS.with(|runs| runs.set(runs.get() + 1));
+        let reads = [self.intrinsics.reads[0].get(), self.intrinsics.reads[1].get()];
+        let css_reads = css::viewport_read_counts();
+        let style = Arc::new(self.computed_style_from_tree(node)?);
+        if shareable {
+            let mut axes = 0;
+            for (axis, count) in self.intrinsics.reads.iter().enumerate() {
+                if count.get() != reads[axis] { axes |= 1 << axis; }
+            }
+            if css::viewport_read_counts() != css_reads { axes = 3; }
+            let mut memo = self.intrinsics.tree_styles.borrow_mut();
+            if memo.len() >= MAX_TREE_STYLE_MEMO { memo.clear(); }
+            memo.insert(key, TreeStyleEntry { units, parent, axes, style: style.clone() });
+        }
+        Ok(style)
     }
 
     fn computed_style_from_tree_visiting(&self, node: NodeId,
@@ -8177,6 +8806,15 @@ impl LineStart {
 }
 
 
+/// Per-line outcome of the Quirks Mode line height calculation quirk.
+struct QuirkLine {
+    drop_strut: bool,
+    force: bool,
+    seed: (f32, f32),
+    skip: Vec<bool>,
+    trivial_frames: Vec<bool>,
+}
+
 #[derive(Default)]
 struct FloatLineMoves {
     shift: (f32, f32),
@@ -9036,26 +9674,30 @@ fn collect_counter_positions(
     let child_floor = if contained { active.len() } else { mutation_floor };
     let mut marker = None;
     if let Some(style) = style.as_ref().filter(|style| style.is_list_item()) {
-        let generated = rules
-            .compute_pseudo_cached(
-                document,
-                node,
-                style,
-                css::PseudoElement::Marker,
-                Some(text),
-                &mut style_cache.borrow_mut(),
-            )
-            .map_err(LayoutError::Css)?
-            .filter(|generated| generated.style.display != Display::None || generated.pseudo.is_marker());
-        if let Some(generated) = generated {
-            if let css::GeneratedContent::Items(items) = generated.content {
-                marker = resolve_counter_replacements(
-                    &items,
+        if let Some(items) = rules.plain_marker_items(document, node, style) {
+            marker = resolve_counter_replacements(&items, node, active, replacement_count, output_bytes)?;
+        } else {
+            let generated = rules
+                .compute_pseudo_cached(
+                    document,
                     node,
-                    active,
-                    replacement_count,
-                    output_bytes,
-                )?;
+                    style,
+                    css::PseudoElement::Marker,
+                    Some(text),
+                    &mut style_cache.borrow_mut(),
+                )
+                .map_err(LayoutError::Css)?
+                .filter(|generated| generated.style.display != Display::None || generated.pseudo.is_marker());
+            if let Some(generated) = generated {
+                if let css::GeneratedContent::Items(items) = generated.content {
+                    marker = resolve_counter_replacements(
+                        &items,
+                        node,
+                        active,
+                        replacement_count,
+                        output_bytes,
+                    )?;
+                }
             }
         }
     }
@@ -13888,9 +14530,10 @@ impl PaintOrderRope {
         let end=*self.anchors.get(source.1).ok_or(LayoutError::InvalidTree)?;
         let target=*self.anchors.get(destination).ok_or(LayoutError::InvalidTree)?;
         let first=self.rank(start)?;let last=self.rank(end)?+1;
-        if last<first{return Err(LayoutError::InvalidTree);}
         let target_rank=self.rank(target)?;
-        if first<=target_rank && target_rank<last{return Err(LayoutError::InvalidTree);}
+        // A destination boundary inside the moved range means the range already
+        // encloses its own anchor context: it is in place, so keep source order.
+        if last<first || (first<=target_rank && target_rank<last){return Ok(());}
         let(a,b)=self.split(self.root,first,0)?;let(moved,c)=self.split(b,last-first,0)?;
         self.root=self.merge(a,c,0)?;
         let target_rank=self.rank(target)?+usize::from(after);let(a,b)=self.split(self.root,target_rank,0)?;
@@ -15901,7 +16544,19 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
     }
 
     fn intrinsic_inline_paragraph(&self,paragraph:&mut InlineParagraph,style:&Style,depth:usize,minimum:bool) -> Result<(f32,f32),LayoutError> {
-        if !Self::inline_split_paragraph_has_content(paragraph){return Ok((0.0,0.0));}
+        let (_,width,block)=self.intrinsic_inline_paragraph_widths(paragraph,style,depth,minimum,None)?;
+        Ok((width,block))
+    }
+
+    /// Max-content width, the requested mode's width and the block extent of
+    /// one paragraph. The block extent is laid out at the max-content inline
+    /// size, so it does not depend on the mode: a min-content run therefore
+    /// also yields the max-content pair. A `block_hint` stands for the line
+    /// layout when the caller knows the extent already.
+    fn intrinsic_inline_paragraph_widths(&self,paragraph:&mut InlineParagraph,style:&Style,depth:usize,minimum:bool,block_hint:Option<f32>) -> Result<(f32,f32,f32),LayoutError> {
+        if !Self::inline_split_paragraph_has_content(paragraph){return Ok((0.0,0.0,0.0));}
+        #[cfg(test)]
+        PARAGRAPH_MEASUREMENTS.with(|runs|runs.set(runs.get()+1));
         let (maximum,width) = if self.rules.has_typographic_content() {
             let maximum = self.intrinsic_typographic_paragraph(paragraph,style,depth,false)?;
             let width = if minimum { self.intrinsic_typographic_paragraph(paragraph,style,depth,true)?.0 } else { maximum.0 };
@@ -15909,10 +16564,12 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         } else {
             self.transform_paragraph(paragraph)?;
             let axes=GridAxes::new(style);
-            let maximum=axes.logical(self.flex_intrinsic_size(self.document.root(),style,Some(paragraph),depth+1,false)?);
-            let width=if minimum {axes.logical(self.flex_intrinsic_size(self.document.root(),style,Some(paragraph),depth+1,true)?).0}else{maximum.0};
+            let (maximum,least)=self.anonymous_text_intrinsic(paragraph,style,true,minimum)?;
+            let maximum=axes.logical(maximum);
+            let width=if minimum {axes.logical(least).0}else{maximum.0};
             (maximum,width)
         };
+        if let Some(block)=block_hint {return Ok((maximum.0,width,block));}
         // Measure the real line boxes/atomic baselines through the same
         // headless paragraph walk as painting, at max-content inline size.
         let mut layout=self.measurement_layout();let mut block_style=style.clone();
@@ -15927,7 +16584,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         let (mut cursor,mut advance,mut height,mut trailing)=(0.0,0.0,0.0,0.0);let mut line=layout.line_start();
         layout.flow_inline_paragraph(paragraph,&block_style,0.0,available,&mut cursor,&mut advance,&mut height,0,&mut line,&mut trailing,depth+1)?;
         let block=if style.writing_mode==css::WritingMode::HorizontalTb {cursor+height}else{layout.last_vertical_paragraph_block_extent};
-        Ok((width,block))
+        Ok((maximum.0,width,block))
     }
 
     fn intrinsic_typographic_paragraph(&self,paragraph:&InlineParagraph,style:&Style,depth:usize,minimum:bool) -> Result<(f32,f32),LayoutError> {
@@ -15956,26 +16613,45 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
 
     fn intrinsic_normalized_flow<'b>(&self,children:impl IntoIterator<Item=&'b FlattenedBoxChild>,style:&Style,
         depth:usize,minimum:bool,prefix:(f32,f32),contain_floats:bool) -> Result<((f32,f32),BlockMargins),LayoutError> {
+        Ok(self.intrinsic_normalized_flow_pair(children,style,depth,minimum,prefix,contain_floats,false)?.0)
+    }
+
+    /// `intrinsic_normalized_flow`, which with `pair` also returns the other
+    /// mode's result when the whole flow is one inline run whose collection
+    /// did not depend on the mode.
+    fn intrinsic_normalized_flow_pair<'b>(&self,children:impl IntoIterator<Item=&'b FlattenedBoxChild>,style:&Style,
+        depth:usize,minimum:bool,prefix:(f32,f32),contain_floats:bool,pair:bool)
+        -> Result<(((f32,f32),BlockMargins),Option<((f32,f32),BlockMargins)>),LayoutError> {
         let mut children=children.into_iter().peekable();let first=children.next();
         // A standalone collapsing text source has no cross-source shaping or
         // line-break dependency. Keep its cached metric path allocation-light.
-        if !minimum&&prefix==(0.0,0.0)&&children.peek().is_none()
+        let mut single_line=None;
+        if prefix==(0.0,0.0)&&children.peek().is_none()
             && !self.rules.has_typographic_content()
             && style.text_transform==css::TextTransform::None
             && matches!(style.white_space,WhiteSpace::Normal|WhiteSpace::NoWrap) {
             if let Some(FlattenedBoxChild{kind:FlattenedBoxChildKind::Node(node),..})=first {
                 if let Ok(NodeKind::Text(value)|NodeKind::CData(value))=self.document.kind(*node) {
                     let value=formatted_text(value,style.white_space);
-                    if value.trim_matches(' ').is_empty(){return Ok(((0.0,0.0),BlockMargins::default()));}
-                    let advance=self.text_intrinsic_advance(&value,style,false,Some(*node))?;
-                    let axes=GridAxes::new(style);
-                    let preferred=axes.basis(style,true).unwrap_or(advance);
-                    let available=if axes.vertical {constrained_height(style,preferred)}else{constrained_width(style,preferred)};
-                    // Retain the allocation-light cache when the complete text
-                    // fits. A real inline constraint that causes wrapping must
-                    // consume the canonical paragraph's actual block extent.
-                    if style.white_space==WhiteSpace::NoWrap || advance<=available {
-                        return Ok(((advance,self.line_height(style)),BlockMargins::default()));
+                    if value.trim_matches(' ').is_empty(){
+                        if !minimum {return Ok((((0.0,0.0),BlockMargins::default()),None));}
+                    } else {
+                        let advance=if minimum {self.text_intrinsic_advance(&value,style,false,Some(*node)).ok()}
+                            else {Some(self.text_intrinsic_advance(&value,style,false,Some(*node))?)};
+                        if let Some(advance)=advance {
+                            let axes=GridAxes::new(style);
+                            let preferred=axes.basis(style,true).unwrap_or(advance);
+                            let available=if axes.vertical {constrained_height(style,preferred)}else{constrained_width(style,preferred)};
+                            // Retain the allocation-light cache when the complete text
+                            // fits. A real inline constraint that causes wrapping must
+                            // consume the canonical paragraph's actual block extent.
+                            if style.white_space==WhiteSpace::NoWrap || advance<=available {
+                                if !minimum {return Ok((((advance,self.line_height(style)),BlockMargins::default()),None));}
+                                // The block extent is laid out at the max-content
+                                // size, so this single line has it in both modes.
+                                if style.writing_mode==css::WritingMode::HorizontalTb && paired_intrinsics_enabled() {single_line=Some(self.line_height(style));}
+                            }
+                        }
                     }
                 }
             }
@@ -16002,6 +16678,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         } else { None };
         let mut paragraph=InlineParagraph::default();let mut frames=Vec::new();
         let mut case_context = None;
+        let mut inline_only=true;
         for child in first.into_iter().chain(children) {
             let computed=child.computed_style.as_ref().unwrap_or(&child.parent_style);
             let principal=match &child.kind {FlattenedBoxChildKind::Node(node)=>matches!(self.document.kind(*node),Ok(NodeKind::Element{..})),_=>true};
@@ -16011,6 +16688,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 collector.append_flattened_box_child_inline(child,available,&mut paragraph,&mut frames,depth+1)?;
                 continue;
             }
+            inline_only=false;
             self.prepare_case_context(&mut paragraph, &mut case_context)?;
             let (w,h)=self.intrinsic_inline_paragraph(&mut paragraph,style,depth+1,minimum)?;
             inline_width+=w;inline_height=inline_height.max(h);paragraph=InlineParagraph::default();frames.clear();
@@ -16031,17 +16709,17 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 if !minimum {push_intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,end,w)?;}
                 float_bottom=float_bottom.max(end);
                 side_bottom[usize::from(computed.float==Float::Right)]=side_bottom[usize::from(computed.float==Float::Right)].max(end);
-                let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(h).max(self.line_height(style)));
+                let overlap={let extent=inline_height.max(h);let extent=if float_bands.is_empty(){extent}else{extent.max(self.line_height(style))};intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,extent)};
                 width=width.max(w).max(intrinsic_inline_line_width(inline_width,overlap,minimum));
             } else if computed.is_inline_level() {
                 inline_width+=w;inline_height=inline_height.max(h);
             } else {
-                let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(self.line_height(style)));
+                let overlap={let extent=if float_bands.is_empty(){inline_height}else{inline_height.max(self.line_height(style))};intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,extent)};
                 width=width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)).max(w);
                 let margins=if collapse&&computed.writing_mode==css::WritingMode::HorizontalTb {
                     let (top,bottom)=(computed.margin_sides[0],computed.margin_sides[2]);
                     let inner=match &child.kind {
-                        FlattenedBoxChildKind::Node(node)=>self.intrinsics.margins.borrow().get(node.index()*2+usize::from(minimum)).copied().flatten().unwrap_or_default(),
+                        FlattenedBoxChildKind::Node(node)=>self.intrinsics.margins(node.index()*2+usize::from(minimum)).unwrap_or_default(),
                         _=>BlockMargins::default(),
                     };
                     let border_box=h-top-bottom-inner.lead_add-inner.trail_add;
@@ -16086,9 +16764,18 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             }
         }
         self.prepare_case_context(&mut paragraph, &mut case_context)?;
-        let (w,h)=self.intrinsic_inline_paragraph(&mut paragraph,style,depth+1,minimum)?;
+        let single_line=single_line.filter(|_|inline_only);
+        let paired=pair && inline_only && single_line.is_none() && collector.atomic_width_resolutions.get()==0 && paired_intrinsics_enabled();
+        let (w,h,other_w)=if paired {
+            let (maximum,least,block)=self.intrinsic_inline_paragraph_widths(&mut paragraph,style,depth+1,true,single_line)?;
+            if minimum {(least,block,Some(maximum))} else {(maximum,block,Some(least))}
+        } else {
+            let (_,w,h)=self.intrinsic_inline_paragraph_widths(&mut paragraph,style,depth+1,minimum,single_line)?;
+            (w,h,None)
+        };
+        let run_width=inline_width;
         inline_width+=w;inline_height=inline_height.max(h);
-        let overlap=intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,inline_height.max(self.line_height(style)));
+        let overlap={let extent=if float_bands.is_empty(){inline_height}else{inline_height.max(self.line_height(style))};intrinsic_float_inline_extent(&mut float_bands,&mut active_float_inline,height,extent)};
         let mut margins=BlockMargins::default();
         let content_height=if collapsed {
             if inline_height>0.0 {
@@ -16101,7 +16788,11 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 else {BlockMargins{lead:pending,lead_add:pending.value(),trail:pending,trail_add:0.0}};
             height
         } else {height+inline_height};
-        Ok(((width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)),if contain_floats {content_height.max(float_bottom)}else{content_height}),margins))
+        let result=((width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)),if contain_floats {content_height.max(float_bottom)}else{content_height}),margins);
+        // Only an inline run: no block, float or margin state, so the other
+        // mode differs in the run's width alone.
+        let other=other_w.map(|other_w|((width.max(intrinsic_inline_line_width(run_width+other_w,overlap,!minimum)),result.0.1),BlockMargins::default()));
+        Ok((result,other))
     }
 
     fn table_cell_child_used_style(&self, source: &Style, width: f32,
@@ -19041,6 +19732,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         minimum: bool,
         prepared_children: Option<Vec<FlattenedBoxChild>>,
     ) -> Result<(f32, f32), LayoutError> {
+        if origin.is_none() && prepared_children.is_none() {
+            if let Some(size) = self.cached_intrinsic(id.index() * 2 + usize::from(minimum), style) {
+                return Ok(size);
+            }
+        }
         if self.embed_nothing(id) {return Ok((0.0,0.0));}
         let replaced=self.replaced_table_role(id,origin.unwrap_or(style));
         let text_control=matches!(self.document.kind(id),Ok(NodeKind::Element{namespace:Namespace::Html,name,..})
@@ -19434,6 +20130,62 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok(axes.physical((inline, block)))
     }
 
+    /// The flattened children of a container for intrinsic sizing. A flex or
+    /// grid container is measured for min-content and max-content with the
+    /// same source style, so its second pass reuses the first pass's build.
+    fn intrinsic_flow_children(&self, id: NodeId, style: &Style, origin: Option<&Style>,
+        available: f32, depth: usize) -> Result<Rc<Vec<FlattenedBoxChild>>, LayoutError> {
+        let source = origin.unwrap_or(style);
+        let grid = style.display == Display::Grid || style.grid_lanes;
+        let build = || -> Result<Vec<FlattenedBoxChild>, LayoutError> {
+            #[cfg(test)]
+            INTRINSIC_CHILDREN_BUILDS.with(|runs| runs.set(runs.get() + 1));
+            if grid {
+                self.grid_box_children(id, source, available, depth + 1)
+            } else {
+                self.flow_box_children(id, source, available, depth + 1)
+            }
+        };
+        #[cfg(test)]
+        let enabled = !INTRINSIC_CHILDREN_MEMO_DISABLED.with(core::cell::Cell::get);
+        #[cfg(not(test))]
+        let enabled = true;
+        let memoizable = enabled && (style.display == Display::Flex || style.display == Display::Grid);
+        let context = if memoizable { self.intrinsic_context() } else { None };
+        let Some(context) = context else { return build().map(Rc::new); };
+        let intrinsics = &*self.intrinsics;
+        let frame = intrinsics.frame.get();
+        let hit = intrinsics.children.borrow().iter().find(|entry| entry.frame == frame
+            && entry.id == id && entry.grid == grid && entry.available == available
+            && entry.source == *source
+            && entry.context.same_for_slot(&context, id.index() * 2))
+            .map(|entry| (entry.children.clone(), entry.axes));
+        if let Some((children, axes)) = hit {
+            intrinsics.viewport_read((), axes);
+            #[cfg(test)]
+            INTRINSIC_CHILDREN_REUSED.with(|runs| runs.set(runs.get() + 1));
+            return Ok(children);
+        }
+        let mark = self.intrinsic_mark();
+        let children = Rc::new(build()?);
+        let mut axes = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes = 3; }
+        let settled = match (self.images, mark.pending) {
+            (Some(images), Some(since)) => images.pending_mark() == since,
+            _ => true,
+        };
+        if settled {
+            let mut memo = intrinsics.children.borrow_mut();
+            if memo.len() >= MAX_INTRINSIC_CHILDREN_MEMO { memo.remove(0); }
+            memo.push(IntrinsicChildren { frame, id, grid, available, source: source.clone(),
+                context, axes, children: children.clone() });
+        }
+        Ok(children)
+    }
+
     /// Intrinsic sizing of actual formatting sources, including generated
     /// principals. Host-language replacement and widget metrics stay outside.
     fn intrinsic_formatting_children(
@@ -19460,10 +20212,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         // the surrounding inline accumulator instead of becoming a synthetic
         // block boundary, and virtual before/after children contribute their
         // actual atomic or block box metrics without becoming DOM nodes.
-        let children = if let Some(children) = prepared_children { children } else if style.display == Display::Grid || style.grid_lanes {
-            self.grid_box_children(id, origin.unwrap_or(style), available, depth + 1)?
-        } else {
-            self.flow_box_children(id, origin.unwrap_or(style), available, depth + 1)?
+        let children = match prepared_children {
+            Some(children) => Rc::new(children),
+            None => self.intrinsic_flow_children(id, style, origin, available, depth)?,
         };
         if style.display == Display::Grid && !style.grid_lanes {
             let (w, h) = self.intrinsic_grid_children(&children, style, depth + 1, minimum)?;
@@ -19875,7 +20626,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let columns = columns.min(64);
             let mut sizes = Vec::new();
             let mut only_blocks = true;
-            for child in &children {
+            for child in children.iter() {
                 let computed = child.computed_style.as_ref().unwrap_or(&child.parent_style);
                 if computed.display == Display::None
                     || matches!(computed.position, Position::Absolute | Position::Fixed)
@@ -19960,7 +20711,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             // real composed-tree cascade, just as the painting path does.
             let marker_origin_style = self
                 .resolve_style_percentages(
-                    &self.computed_style_from_tree(id)?,
+                    &*self.computed_style_from_tree_shared(id)?,
                     available,
                     self.parent_height,
                 );
@@ -19982,37 +20733,49 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }
         }
-        let (logical, mut margins) = self.intrinsic_normalized_flow(children.iter(), style, depth + 1, minimum,
-            (inline_width, inline_height), establishes_formatting_context(style, style))?;
-        let natural = GridAxes::new(style).physical(logical);
-        let size = (
-            constrained_width(
-                style,
-                style
-                    .width
-                    .map(|value| content_dimension(style, value))
-                    .unwrap_or(natural.0),
-            ) + edges,
-            constrained_height(
-                style,
-                style
-                    .height
-                    .map(|value| content_height_dimension(style, value))
-                    .unwrap_or(natural.1),
-            ) + vertical_edges,
-        );
+        let other_slot = slot ^ 1;
+        let pair = origin.is_none() && has_children && !self.intrinsics.measured_this_frame(other_slot, style);
+        let ((logical, margins), other) = self.intrinsic_normalized_flow_pair(children.iter(), style, depth + 1, minimum,
+            (inline_width, inline_height), establishes_formatting_context(style, style), pair)?;
+        let finish = |logical: (f32, f32), mut margins: BlockMargins| {
+            let natural = GridAxes::new(style).physical(logical);
+            let size = (
+                constrained_width(
+                    style,
+                    style
+                        .width
+                        .map(|value| content_dimension(style, value))
+                        .unwrap_or(natural.0),
+                ) + edges,
+                constrained_height(
+                    style,
+                    style
+                        .height
+                        .map(|value| content_height_dimension(style, value))
+                        .unwrap_or(natural.1),
+                ) + vertical_edges,
+            );
+            if origin.is_none() && has_children {
+                let widths = border_widths(style);
+                let block = matches!(style.display, Display::Block | Display::ListItem)
+                    && style.writing_mode == css::WritingMode::HorizontalTb
+                    && !margin_context_root(self.document, id, style, style);
+                let open_top = block && widths[0] == 0.0 && style.padding_sides[0] == 0.0;
+                let open_bottom = open_top && widths[2] == 0.0 && style.padding_sides[2] == 0.0
+                    && style.height.is_none() && style.min_height == 0.0 && style.min_height_intrinsic.is_none()
+                    && constrained_height(style, natural.1) == natural.1;
+                if !open_top { margins.lead = MarginStrut::default(); margins.lead_add = 0.0; }
+                if !open_bottom { margins.trail = MarginStrut::default(); margins.trail_add = 0.0; }
+                if style.height.is_some() || constrained_height(style, natural.1) != natural.1 { margins.lead_add = 0.0; }
+            }
+            (size, margins)
+        };
+        let (size, margins) = finish(logical, margins);
         if origin.is_none() && has_children {
-            let widths = border_widths(style);
-            let block = matches!(style.display, Display::Block | Display::ListItem)
-                && style.writing_mode == css::WritingMode::HorizontalTb
-                && !margin_context_root(self.document, id, style, style);
-            let open_top = block && widths[0] == 0.0 && style.padding_sides[0] == 0.0;
-            let open_bottom = open_top && widths[2] == 0.0 && style.padding_sides[2] == 0.0
-                && style.height.is_none() && style.min_height == 0.0 && style.min_height_intrinsic.is_none()
-                && constrained_height(style, natural.1) == natural.1;
-            if !open_top { margins.lead = MarginStrut::default(); margins.lead_add = 0.0; }
-            if !open_bottom { margins.trail = MarginStrut::default(); margins.trail_add = 0.0; }
-            if style.height.is_some() || constrained_height(style, natural.1) != natural.1 { margins.lead_add = 0.0; }
+            if let Some((logical, margins)) = other {
+                let (other_size, other_margins) = finish(logical, margins);
+                self.store_intrinsic(other_slot, style, other_size, Some(other_margins), &mark);
+            }
             self.store_intrinsic(slot, style, size, Some(margins), &mark);
         }
         Ok(size)
@@ -20025,17 +20788,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     /// the viewport reads its measurement made toward enclosing measurements.
     fn cached_intrinsic(&self, slot: usize, style: &Style) -> Option<(f32, f32)> {
         let intrinsics = &*self.intrinsics;
-        let primary = match intrinsics.sizes.borrow().get(slot) {
-            Some(Some((cached, size))) if cached == style => Some(*size),
-            _ => None,
-        };
-        let size = match primary {
-            Some(size) => size,
-            None if intrinsics.promote(slot, style) => intrinsics.sizes.borrow()[slot].as_ref().map(|(_, size)| *size)?,
-            None => return None,
-        };
-        let mut provenance = intrinsics.provenance.borrow_mut();
-        let entry = provenance.get_mut(slot)?;
+        let mut slots = intrinsics.slots.borrow_mut();
+        let slot_entry = slots.get_mut(&slot)?;
+        if !slot_entry.primary.as_ref().is_some_and(|entry| same_measured_style(&entry.style, style))
+            && !slot_entry.promote(style) {
+            return None;
+        }
+        let record = slot_entry.primary.as_mut()?;
+        let size = record.size;
+        let entry = &mut record.provenance;
         if let Some(pending) = entry.pending.as_deref() {
             let images = self.images?;
             let generation = images.generation();
@@ -20067,7 +20828,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             reads: [self.intrinsics.reads[0].get(), self.intrinsics.reads[1].get()],
             css: css::viewport_read_counts(),
             pending: self.images.map(|images| images.pending_mark()),
-            context: self.intrinsic_context(),
+            context: self.intrinsic_context().map(Arc::new),
         }
     }
 
@@ -20115,30 +20876,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             _ => None,
         };
-        let mut cache = intrinsics.sizes.borrow_mut();
-        if cache.len() <= slot { cache.resize_with(slot + 1, || None); }
-        let previous = cache[slot].replace((style.clone(), size));
-        let mut table = intrinsics.margins.borrow_mut();
-        if table.len() <= slot { table.resize_with(slot + 1, || None); }
-        let previous_margins = core::mem::replace(&mut table[slot], margins);
-        let mut provenance = intrinsics.provenance.borrow_mut();
-        if provenance.len() <= slot { provenance.resize_with(slot + 1, IntrinsicProvenance::default); }
-        let previous_provenance = core::mem::replace(&mut provenance[slot], IntrinsicProvenance {
-            frame: intrinsics.frame.get(),
-            axes,
-            context: mark.context.clone(),
-            pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
-            pending: pending.map(|(lookups, _)| lookups),
+        let mut slots = intrinsics.slots.borrow_mut();
+        let slot_entry = slots.entry(slot).or_default();
+        let shared = slot_entry.primary.as_ref().filter(|entry| *entry.style == *style).map(|entry| entry.style.clone());
+        let previous = slot_entry.primary.replace(IntrinsicEntry {
+            style: shared.unwrap_or_else(|| Arc::new(style.clone())),
+            size,
+            margins,
+            provenance: IntrinsicProvenance {
+                frame: intrinsics.frame.get(),
+                axes,
+                context: mark.context.clone(),
+                pending_generation: pending.as_ref().map_or(0, |(_, generation)| *generation),
+                pending: pending.map(|(lookups, _)| lookups),
+            },
         });
-        let mut others = intrinsics.others.borrow_mut();
-        if let Some(ways) = others.get_mut(slot) {
-            ways.retain(|entry| entry.style != *style);
-        }
-        if let Some((previous_style, previous_size)) = previous.filter(|(previous_style, _)| previous_style != style) {
-            if others.len() <= slot { others.resize_with(slot + 1, Vec::new); }
-            let ways = &mut others[slot];
-            ways.insert(0, IntrinsicEntry { style: previous_style, size: previous_size, margins: previous_margins, provenance: previous_provenance });
-            ways.truncate(INTRINSIC_OTHER_WAYS);
+        slot_entry.others.retain(|entry| !same_measured_style(&entry.style, style));
+        if let Some(previous) = previous.filter(|previous| !same_measured_style(&previous.style, style)) {
+            slot_entry.others.insert(0, previous);
+            slot_entry.others.truncate(INTRINSIC_OTHER_WAYS);
         }
     }
 
@@ -21989,6 +22745,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 let alignment = item.style.self_alignment(style, !row);
                 let natural_lane = if row { item.natural.1 } else { item.natural.0 };
                 let free = lane_size - natural_lane;
+                let reverse_lane = if row {
+                    axes.reverse_block
+                } else {
+                    axes.reverse_inline
+                };
                 let (start_margin, end_margin) = if !lane_horizontal {
                     (item.style.margin_auto[0], item.style.margin_auto[2])
                 } else {
@@ -22006,14 +22767,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     // Baseline alignment positions the item through the
                     // shared group below. Its safe self-start/end fallback
                     // must not be added as a second free-space offset.
-                    0.0
+                    // The group offset counts from the lane's flow-start
+                    // edge, which is its far physical edge when reversed.
+                    if reverse_lane {
+                        free
+                    } else {
+                        0.0
+                    }
                 } else {
                     alignment.offset(free, style, &item.style, lane_horizontal, false)
-                };
-                let reverse_lane = if row {
-                    axes.reverse_block
-                } else {
-                    axes.reverse_inline
                 };
                 let cross = if reverse_lane {
                     lane_area - cross - lane_size
@@ -23669,25 +24431,45 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let Some(paragraph) = anonymous_text else {
             return self.intrinsic_size_mode(node, style, depth, minimum);
         };
+        let (maximum, least) = self.anonymous_text_intrinsic(paragraph, style, !minimum, minimum)?;
+        Ok(if minimum { least } else { maximum })
+    }
+
+    /// Max-content and min-content sizes of an anonymous text run. Both share
+    /// one bidi resolution and shaping preparation; only the requested ones
+    /// are measured, the other is returned as zero width.
+    fn anonymous_text_intrinsic(
+        &self,
+        paragraph: &InlineParagraph,
+        style: &Style,
+        want_maximum: bool,
+        want_minimum: bool,
+    ) -> Result<((f32, f32), (f32, f32)), LayoutError> {
+        #[cfg(test)]
+        ANONYMOUS_TEXT_MEASUREMENTS.with(|runs| runs.set(runs.get() + 1));
         if paragraph.text.is_empty() {
-            return Ok((0.0, self.line_height(style)));
+            let empty = (0.0, self.line_height(style));
+            return Ok((empty, empty));
         }
         let bidi = self.paragraph_bidi(paragraph,&paragraph.text,style)?;
         self.prepare_inline_shaping(paragraph,&bidi,false)?;
-        let mut width = 0.0f32;
+        let mut maximum_width = 0.0f32;
+        let mut minimum_width = 0.0f32;
         for (paragraph_index, bidi_paragraph) in bidi.paragraphs.iter().enumerate() {
             let range = bidi_paragraph.range.clone();
             if range.start >= range.end {
                 continue;
             }
-            if !minimum {
+            if want_maximum {
                 let visible_end = Self::paragraph_hanging_end(paragraph, range.clone(), true, true);
-                width = width.max(self.inline_paragraph_edge_width(
+                maximum_width = maximum_width.max(self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
                     range.clone(),visible_end,
                 )?);
+            }
+            if !want_minimum {
                 continue;
             }
             let text = paragraph.text.get(range.clone()).ok_or(LayoutError::Text)?;
@@ -23706,7 +24488,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
                 let segment = segment_start..segment_end;
                 let visible_end = Self::paragraph_visible_end(paragraph, segment.clone(), true);
-                width = width.max(self.inline_paragraph_edge_width(
+                minimum_width = minimum_width.max(self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
@@ -23717,7 +24499,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if segment_start < range.end {
                 let visible_end =
                     Self::paragraph_visible_end(paragraph, segment_start..range.end, true);
-                width = width.max(self.inline_paragraph_edge_width(
+                minimum_width = minimum_width.max(self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
@@ -23731,7 +24513,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             .map(|span| self.line_height(&span.style))
             .fold(self.line_height(style), f32::max);
         let lines = paragraph.hard_breaks.len().saturating_add(1) as f32;
-        Ok(GridAxes::new(style).physical((width, line_height * lines)))
+        let axes = GridAxes::new(style);
+        Ok((axes.physical((maximum_width, line_height * lines)), axes.physical((minimum_width, line_height * lines))))
     }
 
     fn push_flex_item(
@@ -23767,9 +24550,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 },
             )?;
         }
-        let (w, h) =
-            self.flex_intrinsic_size(node, &item_style, anonymous_text.as_ref(), depth + 1, false)?;
-        if matches!(item_style.position, Position::Absolute | Position::Fixed) {
+        let absolute = matches!(item_style.position, Position::Absolute | Position::Fixed);
+        let shortcuts = flex_shortcuts_enabled();
+        let minimum_needed = row && item_style.min_width_auto && !item_style.overflow_x.scroll_container()
+            || !row && item_style.min_height_auto && !item_style.overflow_y.scroll_container();
+        let main_from_measure = item_style.flex_basis.is_none() && !item_style.flex_basis_content
+            && item_style.flex_basis_intrinsic.is_none();
+        let mut text_minimum = None;
+        let (w, h) = if shortcuts && !absolute && !main_from_measure && flex_ignores_measured_cross(container_style, row) {
+            (0.0, 0.0)
+        } else if shortcuts && !absolute && minimum_needed && anonymous_text.is_some()
+            && if row { item_style.width.is_none() } else { item_style.height.is_none() } {
+            let paragraph = anonymous_text.as_ref().ok_or(LayoutError::InvalidTree)?;
+            let (maximum, least) = self.anonymous_text_intrinsic(paragraph, &item_style, true, true)?;
+            text_minimum = Some(least);
+            maximum
+        } else {
+            self.flex_intrinsic_size(node, &item_style, anonymous_text.as_ref(), depth + 1, false)?
+        };
+        if absolute {
             if positioned.len() >= MAX_DISPLAY_COMMANDS {
                 return Err(LayoutError::CommandLimit);
             }
@@ -23844,8 +24643,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             constrained_height(&item_style, (main - edges).max(0.0)) + edges
         };
         let min_main =
-            if row && item_style.min_width_auto && !item_style.overflow_x.scroll_container()
-                || !row && item_style.min_height_auto && !item_style.overflow_y.scroll_container()
+            if minimum_needed
             {
                 let mut minimum_style = item_style.clone();
                 let specified_suggestion = if row {
@@ -23859,13 +24657,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         .height
                         .map(|value| content_height_dimension(&item_style, value) + edges)
                 };
-                let minimum = self.flex_intrinsic_size(
-                    node,
-                    &minimum_style,
-                    anonymous_text.as_ref(),
-                    depth + 1,
-                    true,
-                )?;
+                let minimum = match text_minimum {
+                    Some(least) => least,
+                    None => self.flex_intrinsic_size(
+                        node,
+                        &minimum_style,
+                        anonymous_text.as_ref(),
+                        depth + 1,
+                        true,
+                    )?,
+                };
                 let content_minimum = if row { minimum.0 } else { minimum.1 };
                 specified_suggestion.map_or(content_minimum, |suggestion| {
                     content_minimum.min(suggestion)
@@ -25099,8 +25900,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         pseudo: css::PseudoElement,
         available: f32,
     ) -> Result<Option<VirtualGeneratedChild>, LayoutError> {
-        if matches!(pseudo,css::PseudoElement::Before|css::PseudoElement::After)
-            && self.generated_origin_replaced(origin,origin_style)? {return Ok(None);}
         let Some(generated) = self
             .rules
             .compute_pseudo_cached(self.document, origin, origin_style, pseudo, Some(self.text), &mut self.style_cache.borrow_mut())
@@ -25108,6 +25907,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         else {
             return Ok(None);
         };
+        if matches!(pseudo,css::PseudoElement::Before|css::PseudoElement::After)
+            && self.generated_origin_replaced(origin,origin_style)? {return Ok(None);}
         if generated.style.display == Display::None && !pseudo.is_marker() {
             return Ok(None);
         }
@@ -26185,7 +26986,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             return Ok(true);
         }
-        if (self.generated_origin_replaced(node, &style)? || tag == "img") && style.display == Display::Inline
+        if style.display == Display::Inline && (self.generated_origin_replaced(node, &style)? || tag == "img")
             || style.is_atomic_inline()
         {
             // Atomic interiors already use the ordinary box painter, which
@@ -26934,7 +27735,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             return Ok(());
         }
-        let image_alternative = if tag == "img" && style.is_inline_level() && !style.is_atomic_inline() {
+        let image_alternative = if tag == "img" && style.is_inline_level() && !style.is_atomic_inline()
+            && self.html_image_may_present_text(attributes, &style) {
             match self.html_image_presentation(node, attributes, &style) {
                 HtmlImagePresentation::Text(text) => Some(text),
                 _ => None,
@@ -27708,11 +28510,16 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         let bytes=shaped.glyphs.len()*core::mem::size_of::<Glyph>()+boundaries.len()*core::mem::size_of::<(usize,f32)>()+(glyph_ranges.len()+paint_sources.len())*core::mem::size_of::<Range<usize>>();
         lumen_common::limits::size::check(bytes,MAX_DISPLAY_LIST_BYTES).map_err(|_|LayoutError::CommandLimit)?;
         let group=Arc::new(InlineShapeGroup{range,rtl,shaped,clusters:detail.clusters,boundaries,glyph_ranges,paint_sources});
+        Self::register_inline_shaping_group(paragraph,&group,bytes)?;
+        Ok(Some(group))
+    }
+
+    fn register_inline_shaping_group(paragraph:&InlineParagraph,group:&Arc<InlineShapeGroup>,bytes:usize) -> Result<(),LayoutError> {
         if paragraph.preparing_shaping.get(){if let Some(groups)=paragraph.shaping.borrow_mut().as_mut(){
             let bytes=lumen_common::limits::size::sum(paragraph.shaping_bytes.get(),bytes+group.clusters.len()*core::mem::size_of::<crate::paint::ShapedClusterAdvance>()+core::mem::size_of::<InlineShapeGroup>(),MAX_DISPLAY_LIST_BYTES).map_err(|_|LayoutError::CommandLimit)?;
             groups.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;groups.push(group.clone());paragraph.shaping_bytes.set(bytes);
         }}
-        Ok(Some(group))
+        Ok(())
     }
 
     fn prepare_inline_shaping(&self,paragraph:&InlineParagraph,bidi:&lumen_common::bidi::BidiInfo<'_>,break_candidates:bool) -> Result<(),LayoutError> {
@@ -27921,6 +28728,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         backgrounds:&[(usize,Range<usize>)], parent:&Style, cursor:f32,
         previous_ascent:f32,previous_height:f32,height:&mut f32,
         active_frames:&[Option<(f32,f32)>],frame_baselines:&mut Vec<(usize,f32)>,
+        quirk:Option<&QuirkLine>,
     )->Result<f32,LayoutError> {
         #[derive(Clone,Copy,Default)]
         struct FrameAlignment {index:usize,above:f32,below:f32,shift:f32,baseline:f32}
@@ -27936,15 +28744,22 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             let frame=&paragraph.frames[index];let style=&frame.style;
             let inherited=frame.parent.map_or(parent,|index|&paragraph.frames[index].style);
             let baseline=self.line_alignment_baseline(style);let extent=self.line_height(style);
+            if quirk.is_some_and(|quirk|quirk.trivial_frames.get(index).copied().unwrap_or(false)) {
+                frames.push(FrameAlignment{index,above:0.0,below:0.0,shift:0.0,baseline:0.0});
+                continue;
+            }
             frames.push(FrameAlignment{index,above:baseline,below:extent-baseline,
                 shift:self.inline_alignment_ascent(style,inherited,extent,baseline)
                     .map_or(0.0,|above|above-baseline),baseline:0.0});
         }
-        let mut ascent=self.line_alignment_baseline(parent).max(previous_ascent);
-        let mut descent=(self.line_height(parent)-self.line_alignment_baseline(parent))
-            .max(previous_height-previous_ascent);
+        let (mut ascent,mut descent)=match quirk.filter(|quirk|quirk.drop_strut) {
+            Some(quirk)=>quirk.seed,
+            None=>(self.line_alignment_baseline(parent).max(previous_ascent),
+                (self.line_height(parent)-self.line_alignment_baseline(parent))
+                    .max(previous_height-previous_ascent)),
+        };
         let mut edge_height=0.0f32;
-        for token in tokens.iter_mut() {
+        for (token_index,token) in tokens.iter_mut().enumerate() {
             let owner=token.advance_frame.or_else(||token.frames.last().copied());
             let style=token.atom.map(|index|&paragraph.atoms[index].style)
                 .or(token.style.as_ref()).or_else(||owner.map(|index|&paragraph.frames[index].style)).unwrap_or(parent);
@@ -27952,6 +28767,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 token.actual_height=self.line_height(style)+token.extra_height;
                 token.baseline_offset=self.line_alignment_baseline(style);
             }
+            if quirk.is_some_and(|quirk|quirk.skip[token_index]) {continue;}
             // Anonymous text belongs to its frame. Its computed style does
             // not generate another box with another vertical-align shift.
             let above=if let Some(atom)=token.atom {
@@ -28018,6 +28834,101 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         Ok(ascent)
     }
 
+    fn inline_axis_edges(style: &Style) -> bool {
+        let sides = if style.writing_mode == css::WritingMode::HorizontalTb { [1, 3] } else { [0, 2] };
+        let padding = style.padding_sides();
+        let border = border_widths(style);
+        sides.iter().any(|&side| padding[side] != 0.0 || border[side] != 0.0)
+    }
+
+    fn line_height_quirk_applies(&self, paragraph: &InlineParagraph, block_style: &Style) -> bool {
+        matches!(self.document.document_mode(), crate::DocumentMode::Quirks | crate::DocumentMode::LimitedQuirks)
+            && block_style.display != Display::ListItem
+            && paragraph.control_node.is_none()
+            && !self.vertical_paragraph
+    }
+
+    /// Quirks Mode Standard, "The line height calculation quirk" and "The
+    /// blocks ignore line-height quirk": inline boxes without text or
+    /// inline-axis padding/border have a line-height of zero, and the block
+    /// strut only exists for a line holding text directly in the block.
+    fn quirk_line(
+        &self,
+        paragraph: &InlineParagraph,
+        tokens: &[InlineToken],
+        visible_end: usize,
+        block_style: &Style,
+        line: &LineStart,
+        line_height: f32,
+    ) -> Result<Option<QuirkLine>, LayoutError> {
+        if !self.line_height_quirk_applies(paragraph, block_style) {
+            return Ok(None);
+        }
+        let mut skip = Vec::new();
+        skip.try_reserve_exact(tokens.len()).map_err(|_| LayoutError::CommandLimit)?;
+        skip.resize(tokens.len(), false);
+        let mut trivial_frames = Vec::new();
+        trivial_frames.try_reserve_exact(paragraph.frames.len()).map_err(|_| LayoutError::CommandLimit)?;
+        trivial_frames.resize(paragraph.frames.len(), true);
+        let mut root_text = false;
+        let mut contributor = false;
+        for (index, token) in tokens.iter().enumerate() {
+            if token.atom.is_some() {
+                contributor = true;
+                continue;
+            }
+            let Some(range) = token.source_range.as_ref().filter(|_| token.advance_frame.is_none()) else {
+                continue;
+            };
+            let text = paragraph.text.get(range.clone()).unwrap_or("");
+            let in_frame = !token.frames.is_empty();
+            let forced_break = !text.is_empty()
+                && text.chars().all(|character| character == '\u{200b}')
+                && paragraph.hard_breaks.binary_search_by_key(&range.end, |value| value.offset as usize).is_ok();
+            let collapsed = range.start >= visible_end
+                && token.style.as_ref().is_some_and(|style| matches!(style.white_space,
+                    WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine));
+            if collapsed || forced_break && !in_frame {
+                skip[index] = true;
+            } else if in_frame {
+                contributor = true;
+                for &frame in &token.frames {
+                    let mut current = Some(frame);
+                    while let Some(at) = current {
+                        let Some(flag) = trivial_frames.get_mut(at) else { break; };
+                        *flag = false;
+                        current = paragraph.frames[at].parent;
+                    }
+                }
+            } else {
+                root_text = true;
+            }
+        }
+        for (flag, frame) in trivial_frames.iter_mut().zip(&paragraph.frames) {
+            if Self::inline_axis_edges(&frame.style) {
+                *flag = false;
+            }
+        }
+        let mut force = false;
+        for (index, token) in tokens.iter().enumerate() {
+            if token.atom.is_none() && token.advance_frame.is_some_and(|frame| trivial_frames[frame]) {
+                skip[index] = true;
+                force = true;
+            }
+        }
+        let drop_strut = contributor && !root_text;
+        if !drop_strut && !force && !trivial_frames.iter().any(|flag| *flag) {
+            return Ok(None);
+        }
+        Ok(Some(QuirkLine {
+            drop_strut,
+            force,
+            seed: (line.ascent.max(0.0), (line_height - line.ascent.max(0.0)).max(0.0)),
+            skip,
+            trivial_frames,
+        }))
+    }
+
     fn align_atomic_inline_line(
         &mut self,
         paragraph: &InlineParagraph,
@@ -28029,17 +28940,23 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         previous_height: f32,
         height: &mut f32,
         active_frames:&[Option<(f32,f32)>],frame_baselines:&mut Vec<(usize,f32)>,
+        quirk: Option<&QuirkLine>,
     ) -> Result<f32, LayoutError> {
         if tokens.iter().any(|token|token.frames.iter().copied().chain(token.advance_frame)
             .any(|index|paragraph.frames[index].style.vertical_align!=css::VerticalAlign::Baseline)) {
             return self.align_inline_frame_subtrees(paragraph,tokens,fragment_backgrounds,parent,cursor,
-                previous_ascent,previous_height,height,active_frames,frame_baselines);
+                previous_ascent,previous_height,height,active_frames,frame_baselines,quirk);
         }
-        let mut ascent = self.line_alignment_baseline(parent).max(previous_ascent);
-        let mut descent = (self.line_height(parent) - self.line_alignment_baseline(parent))
-            .max(previous_height - previous_ascent);
+        let (mut ascent, mut descent) = match quirk.filter(|quirk| quirk.drop_strut) {
+            Some(quirk) => quirk.seed,
+            None => (
+                self.line_alignment_baseline(parent).max(previous_ascent),
+                (self.line_height(parent) - self.line_alignment_baseline(parent))
+                    .max(previous_height - previous_ascent),
+            ),
+        };
         let mut edge_height = 0.0f32;
-        for token in tokens.iter_mut() {
+        for (token_index, token) in tokens.iter_mut().enumerate() {
             let (style, inherited) = if let Some(index) = token.atom {
                 (
                     &paragraph.atoms[index].style,
@@ -28062,6 +28979,9 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             if token.atom.is_none() && token.style.is_none() {
                 token.actual_height = self.line_height(style) + token.extra_height;
                 token.baseline_offset = self.line_alignment_baseline(style);
+            }
+            if quirk.is_some_and(|quirk| quirk.skip[token_index]) {
+                continue;
             }
             if let Some(above) = self.inline_alignment_ascent(
                 style,
@@ -29906,14 +30826,17 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 return Ok(());
             }
             let x = left + *advance + paragraph.first_line_indent;
-            let mut height = self.line_height(block_style);
+            let quirk = self.line_height_quirk_applies(paragraph, block_style);
+            let mut height = if quirk { 0.0 } else { self.line_height(block_style) };
             // A decoration-only prefix can be kept by an inline ancestor even
             // though it has no shaped advance. Its own line-height still
             // participates in the empty line box; the block strut alone would
             // incorrectly collapse a `line-height:40px` wrapper to the
             // parent's default line-height.
             for frame in &paragraph.frames {
-                height = height.max(self.line_height(&frame.style));
+                if !quirk || Self::inline_axis_edges(&frame.style) {
+                    height = height.max(self.line_height(&frame.style));
+                }
             }
             #[repr(C)]
             #[derive(Clone, Copy)]
@@ -29947,7 +30870,9 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                     .map_or(self.line_height(block_style), |frame| {
                         self.line_height(&frame.style)
                     });
-                height = height.max(advance_line_height + advance.extra_height);
+                if !quirk || paragraph.frames.get(advance.frame).is_none_or(|frame| Self::inline_axis_edges(&frame.style)) {
+                    height = height.max(advance_line_height + advance.extra_height);
+                }
                 total_width += advance.width;
             }
             if !total_width.is_finite() {
@@ -30005,7 +30930,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             *line_height = (*line_height).max(height);
             return Ok(());
         }
-        if self.source_capture_depth == 0 && !paragraph.frames.iter().any(|frame|frame.style.has_spatial_filters()) && self.geometry.is_none() && !self.collects_rendered_text() && self.transform_depth == 0 && !paragraph.spans.iter().any(|span|span.style.text_shadows.is_some()) && (*cursor >= self.cull_bottom() || left >= self.cull_right())
+        if self.source_capture_depth == 0 && !paragraph.frames.iter().any(|frame|frame.style.has_spatial_filters()) && self.geometry.is_none() && !self.collects_rendered_text() && self.transform_depth == 0 && !paragraph.spans.iter().any(|span|span.style.text_shadows.is_some()) && self.paragraph_column_flow.as_ref().is_none_or(|flow|flow.measuring) && (*cursor >= self.cull_bottom() || left >= self.cull_right())
         {
             *line_height = (*line_height).max(self.line_height(block_style));
             return Ok(());
@@ -30285,7 +31210,8 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                 let visual_fragments=if bidi.levels.iter().any(|level|level.is_rtl()) {
                     Self::inline_visual_fragments(paragraph,&tokens,|token|token.x)?
                 } else {Vec::new()};
-                let has_atomic = tokens.iter().any(|token| token.atom.is_some()
+                let quirk_line = self.quirk_line(paragraph, &tokens, visible_end, block_style, line, *line_height)?;
+                let has_atomic = quirk_line.as_ref().is_some_and(|quirk| quirk.force) || tokens.iter().any(|token| token.atom.is_some()
                     || token.style.as_ref().is_some_and(|style| style.font_size != block_style.font_size
                         || style.line_height != block_style.line_height || style.font != block_style.font
                         || style.vertical_align != css::VerticalAlign::Baseline)
@@ -30525,6 +31451,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                             let saved_capture = self.overflow_capture;
                             let actual_atomic = atom.style.is_atomic_inline() || self.uses_button_layout(atom.node);
                             self.overflow_capture = !actual_atomic && (saved_capture || paragraph.collect_text_overflow);
+                            self.deferred_inline_capture = self.overflow_capture && Self::paragraph_deferred_inline_style(&atom.style, &atom.parent_style);
                             self.pending_overflow_moves=true;self.pending_overflow_placement=Some((token.layout_x,self.local_cursor(*cursor)));
                             let roots = (self.stacking_roots.len(), self.surface_roots.len());
                             let containing = (self.containing_block, self.containing_block_node,
@@ -30580,6 +31507,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                             (self.containing_block, self.containing_block_node,
                                 self.fixed_containing_block, self.fixed_containing_block_node) = containing;
                             self.inline_containing_origins.truncate(containing_origins);
+                            self.deferred_inline_capture = false;
                             self.overflow_capture = saved_capture;
                             self.paragraph_column_flow=saved_column_flow;
                             let (actual_width, actual_height) = rendered?;
@@ -30723,6 +31651,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         *line_height,
                         &mut height,
                         &frame_line,&mut frame_baselines,
+                        quirk_line.as_ref(),
                     )?;
                     let baseline_ascent = self.atomic_line_baseline_ascent(
                         paragraph,
@@ -32511,7 +33440,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     if let Some(hit) = geometry.hits.get_mut(absolute) {
                         let slot = floats.partition_point(|range| range.hit_end <= absolute);
                         if floats.get(slot).is_some_and(|range| range.hit_start <= absolute && absolute < range.hit_end) { continue; }
-                        if hit.rect.y >= y && hit.rect.y + hit.rect.height <= y + height {
+                        // A content area may extend beyond a line box with negative
+                        // half-leading, so the line owns a hit by its vertical center.
+                        let center = hit.rect.y + hit.rect.height * 0.5;
+                        if center >= y && center <= y + height {
                             hit.rect.x += offset;
                         }
                     }
@@ -32531,6 +33463,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         if !style.is_atomic_inline() || style.width.is_some() {
             return Ok(());
         }
+        self.atomic_width_resolutions.set(self.atomic_width_resolutions.get().saturating_add(1));
         let available = if self.intrinsic_minimum_atomics { 0.0 } else { available };
         let minimum = self.intrinsic_size_mode(id, style, depth + 1, true)?.0;
         let preferred = self.intrinsic_size_mode(id, style, depth + 1, false)?.0;
@@ -34187,21 +35120,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             || self.sticky_bounds.is_some()
             || !self.inline_containing_origins.is_empty())
         .then_some((x, y));
-        Some(RetainedFragmentKey {
-            node: id,
-            anchored,
-            available,
-            floats_above,
-            depth,
-            parent_height: self.parent_height,
-            containing_block: self.containing_block,
-            containing_block_node: self.containing_block_node,
+        let rare = RetainedKeyRare {
             fixed_containing_block: self.fixed_containing_block,
             fixed_containing_block_node: self.fixed_containing_block_node,
             sticky_bounds: self.sticky_bounds,
-            cull: self.cull(),
-            viewport: self.viewport_rect(),
-            container_units: self.container_units.get().into(),
             scroll_hazards: self.scroll_hazards,
             transform_depth: self.transform_depth,
             svg_geometry_capture: self.svg_geometry_capture,
@@ -34215,6 +35137,21 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             collapsed_bottom: self.collapsed_bottom,
             was_through: self.was_through,
             decorations: self.decorations.clone(),
+        };
+        let rare = (rare != RetainedKeyRare::default()).then(|| Box::new(rare));
+        Some(RetainedFragmentKey {
+            node: id,
+            anchored,
+            available,
+            floats_above,
+            depth,
+            parent_height: self.parent_height,
+            containing_block: self.containing_block,
+            containing_block_node: self.containing_block_node,
+            cull: self.cull(),
+            viewport: self.viewport_rect(),
+            container_units: self.container_units.get().into(),
+            rare,
         })
     }
 
@@ -34518,19 +35455,19 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             hit_fragments.try_reserve(1).ok()?;
             hit_fragments.push(HitFragments{hit:entry.hit.checked_sub(hit_start)?,rects:clone_vec(&entry.rects)?});
         }
-        let hit_fragments:Arc<[HitFragments]>=Arc::from(hit_fragments.into_boxed_slice());
+        let hit_fragments=SharedSlice::from(hit_fragments);
         let mut reference_boxes=Vec::new();
         if let Some(entries)=geometry.transform_reference_boxes.as_deref(){
             for (index,value) in entries.by_hit.range(hit_start..){reference_boxes.try_reserve(1).ok()?;reference_boxes.push((index.checked_sub(hit_start)?,*value));}
         }
         let transform_reference_boxes=(!reference_boxes.is_empty()).then(||Arc::from(reference_boxes.into_boxed_slice()));
-        let used_margins = clone_arc_slice(geometry.used_margins.get(used_margin_start..)?)?;
+        let used_margins = SharedSlice::from(clone_vec(geometry.used_margins.get(used_margin_start..)?)?);
         let mut transforms = clone_vec(geometry.transforms.get(transform_start..)?)?;
         let mut rounded_clips = clone_vec(geometry.rounded_clips.get(clip_start..)?)?;
-        let scroll_extents = clone_arc_slice(geometry.scroll_extents.get(extent_start..)?)?;
+        let scroll_extents = SharedSlice::from(clone_vec(geometry.scroll_extents.get(extent_start..)?)?);
         let mut scroll_ports = clone_vec(geometry.scroll_ports.get(port_start..)?)?;
         let viewport_fixed_nodes =
-            clone_arc_slice(geometry.viewport_fixed_nodes.get(viewport_fixed_start..)?)?;
+            SharedSlice::from(clone_vec(geometry.viewport_fixed_nodes.get(viewport_fixed_start..)?)?);
         let mut scroll_regions = clone_vec(geometry.scroll_regions.get(region_start..)?)?;
         let mut control_text_runs = clone_vec(geometry.control_text_runs.get(run_start..)?)?;
         let rendered_text_boxes = if geometry.collect_rendered_text { Some(clone_arc_slice(geometry.rendered_text_boxes.get(rendered_box_start..)?)?) } else { None };
@@ -34565,12 +35502,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 run.command_index = Some(index.checked_sub(command_start)?);
             }
         }
-        let transforms: Arc<[HitTransform]> = Arc::from(transforms.into_boxed_slice());
-        let rounded_clips: Arc<[HitClip]> = Arc::from(rounded_clips.into_boxed_slice());
-        let scroll_ports: Arc<[ScrollPort]> = Arc::from(scroll_ports.into_boxed_slice());
-        let scroll_regions: Arc<[ScrollRegion]> = Arc::from(scroll_regions.into_boxed_slice());
-        let control_text_runs: Arc<[ControlTextRun]> =
-            Arc::from(control_text_runs.into_boxed_slice());
+        let transforms = SharedSlice::from(transforms);
+        let rounded_clips = SharedSlice::from(rounded_clips);
+        let scroll_ports = SharedSlice::from(scroll_ports);
+        let scroll_regions = SharedSlice::from(scroll_regions);
+        let control_text_runs = SharedSlice::from(control_text_runs);
 
         let bytes = retained_fragment_bytes(
             &key,
@@ -35191,7 +36127,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             style.has_principal_box() && (style.is_atomic_inline() || style.float != Float::None || matches!(style.position, Position::Absolute | Position::Fixed)));
         let inherited_decorations = decoration_boundary.then(|| core::mem::take(&mut self.decorations));
         let saved_overflow_capture=self.overflow_capture;
-        if computed.as_ref().is_some_and(|style|!matches!(style.display,Display::Inline|Display::Contents)) {self.overflow_capture=false;}
+        let keep_capture = core::mem::take(&mut self.deferred_inline_capture);
+        if !keep_capture && computed.as_ref().is_some_and(|style|!matches!(style.display,Display::Inline|Display::Contents)) {self.overflow_capture=false;}
         let saved_initial_margin_origin=self.initial_margin_origin.take();
         self.box_depth += 1;
         let box_depth = self.box_depth;
@@ -35260,6 +36197,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
         }
         if let (Some(key), Some(starts)) = (key, geometry_start) {
+            let no_rare = RetainedKeyRare::default();
+            let rare = key.rare.as_deref().unwrap_or(&no_rare);
             // Timeline-bearing fragments are sampled by the current source
             // operation. Retain unrelated fragments, without freezing rare
             // descendant map matrices or allocating per-fragment provenance.
@@ -35272,14 +36211,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 && stacking_before.as_ref() == Some(&self.stacking_roots)
                 && self.parent_height == key.parent_height
                 && self.containing_block == key.containing_block
-                && self.fixed_containing_block == key.fixed_containing_block
-                && self.sticky_bounds == key.sticky_bounds
+                && self.fixed_containing_block == rare.fixed_containing_block
+                && self.sticky_bounds == rare.sticky_bounds
                 && self.cull() == key.cull
-                && self.transform_depth == key.transform_depth
-                && self.canvas_background_source == key.canvas_background_source
-                && self.viewport_overflow_source == key.viewport_overflow_source
-                && self.viewport_scroll_axes == key.viewport_scroll_axes
-                && self.decorations == key.decorations;
+                && self.transform_depth == rare.transform_depth
+                && self.canvas_background_source == rare.canvas_background_source
+                && self.viewport_overflow_source == rare.viewport_overflow_source
+                && self.viewport_scroll_axes == rare.viewport_scroll_axes
+                && self.decorations == rare.decorations;
             if let (true, Some((Some(style), typographic_start, positioned_uses))) = (stable, retained_capture) {
                 if let Some(mut fragment) = self.capture_retained_fragment(
                     key,
@@ -35565,6 +36504,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 ) && style.writing_mode == css::WritingMode::HorizontalTb
                     && parent_style.writing_mode == css::WritingMode::HorizontalTb
                     && style.justify_self.is_none()
+                    && !matches!(parent_style.justify_items_keyword, Some(
+                        css::AlignmentKeyword::LegacyLeft | css::AlignmentKeyword::LegacyRight | css::AlignmentKeyword::LegacyCenter))
                     && (generated.is_some() || matches!(
                         self.document.kind(id),
                         Ok(NodeKind::Element {
@@ -36075,6 +37016,16 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let presentation=self.html_image_presentation_with_dimensions(id,attributes,style.width.is_some()||style.height.is_some());
         if let (Some(images),Some(previous))=(self.images,previous){images.set_paint_only(previous);}
         presentation
+    }
+    /// Whether an `<img>` can present its alternative text, which needs its
+    /// load state. An `<img>` without alt text, or sized in quirks mode, never
+    /// does, so it must not be requested just to find that out.
+    fn html_image_may_present_text(&self,attributes:&[(crate::Name,String)],style:&Style)->bool {
+        if crate::svg::attribute(attributes,"alt").is_none_or(str::is_empty){return false;}
+        let has_dimensions=style.width.is_some()||style.height.is_some()
+            ||["width","height"].iter().any(|name|crate::svg::attribute(attributes,name)
+                .and_then(crate::forms::parse_nonnegative_integer).is_some());
+        !(self.document.document_mode()==crate::DocumentMode::Quirks&&has_dimensions)
     }
     fn html_image_presentation_with_dimensions<'b>(
         &self,id:NodeId,attributes:&'b [(crate::Name,String)],has_style_dimensions:bool,
@@ -36938,7 +37889,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         // actual parent values in those formatting contexts.
         let marker_origin_style = if !virtual_parent && style.is_list_item() {
             self.resolve_style_percentages(
-                &self.computed_style_from_tree(id)?,
+                &*self.computed_style_from_tree_shared(id)?,
                 available,
                 self.parent_height,
             )
@@ -37459,7 +38410,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         {
             Some(self.reserve_side_border_commands(Rect { x: outer_x, y: outer_y, width: box_width, height: 0.0 }, &style)?)
         } else { None };
-        if !virtual_parent && !display_contents && depth>0 && !self_is_stacking_context
+        if (!virtual_parent||generated_box) && !display_contents && depth>0 && !self_is_stacking_context
             && style.position==Position::Static && style.float==Float::None
             && matches!(style.display,Display::Block|Display::FlowRoot|Display::ListItem) {
             self.record_block_surface(box_source,block_surface_start..self.commands.len(),hit)?;
@@ -38851,7 +39802,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     });
                 let mut child_y = cursor;
                 if multicol_column.is_none() {
-                    let avoids=computed.as_ref().map(|child|self.generated_origin_replaced(current,child)
+                    let avoids=computed.as_ref().filter(|_|self.floats.len()>float_start).map(|child|self.generated_origin_replaced(current,child)
                         .map(|replaced|replaced || establishes_formatting_context(child,&style))).transpose()?.unwrap_or(false);
                     if let Some(child) = computed.as_ref().filter(|_| avoids && self.floats.len()>float_start) {
                         let frame = if vertical_block_flow {
@@ -39685,7 +40636,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         // Flex's natural line measurements size auto boxes; final movable
             // child projections, not pre-alignment measurements, own overflow.
             let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),content_extent_height.max(content_height))};
-            if let Some(rect)=OverflowRect::new(local_x+f64::from(padding_left),local_y+f64::from(padding_top),extent.0,extent.1){frame.include(rect);}
+            // Overflowing content of a scroll container keeps its end padding
+            // reachable (CSS Overflow 3 §2.2).
+            let reverse=scroll_reverse(&style);
+            let end_x=if scroll_x_container&&!reverse.0&&!projected_column_box&&extent.0>content_width {padding_right}else{0.0};
+            let end_y=if scroll_y_container&&!reverse.1&&!projected_column_box&&extent.1>content_height {padding_bottom}else{0.0};
+            if let Some(rect)=OverflowRect::new(local_x+f64::from(padding_left),local_y+f64::from(padding_top),extent.0+end_x,extent.1+end_y){frame.include(rect);}
 
         }
         let content_command_end=self.commands.len();
@@ -40080,6 +41036,7 @@ fn laid_out_display_list(
     let counting = CountingShaper {
         inner: text,
         uses: core::cell::Cell::new(0),
+        memo: RefCell::default(),
     };
     let mut layout = Layout::new(document, &counting, &counting.uses, rules, images,
         viewport, geometry, scrolls, style_cache, retained_fragments);
@@ -40398,6 +41355,45 @@ fn laid_out_display_list(
 
 #[cfg(test)]
 mod tests {
+    fn rope_anchors(spans:&[(usize,usize,usize)])->Vec<PaintOrderAnchor>{
+        let mut anchors=Vec::new();
+        for (index,&(start,end,level)) in spans.iter().enumerate(){
+            anchors.push(PaintOrderAnchor{position:start,start,end,level,opening:true,id:index*2});
+            anchors.push(PaintOrderAnchor{position:end,start,end,level,opening:false,id:index*2+1});
+        }
+        anchors
+    }
+
+    #[test]
+    fn paint_order_move_relative_places_owned_range_after_context_open(){
+        let mut rope=PaintOrderRope::new(10,rope_anchors(&[(0,10,0),(6,8,1)])).unwrap();
+        rope.move_relative((2,3),0,true).unwrap();
+        assert_eq!(rope.ranges().unwrap(),[6..8,0..6,8..10]);
+    }
+
+    #[test]
+    fn paint_order_move_relative_keeps_order_when_destination_is_inside_range(){
+        let mut rope=PaintOrderRope::new(10,rope_anchors(&[(3,6,0),(0,10,1)])).unwrap();
+        rope.move_relative((2,3),0,true).unwrap();
+        rope.move_relative((2,3),1,false).unwrap();
+        assert_eq!(rope.ranges().unwrap(),[0..3,3..6,6..10]);
+    }
+
+    #[test]
+    fn nested_stacking_contexts_with_sticky_and_negative_children_render_in_order(){
+        let doc=crate::html::parse(
+            "<style>html,body{margin:0}#hd{position:sticky;top:0;z-index:2;height:30px;background:#ff0000}#iso{isolation:isolate;position:relative;z-index:1;height:40px;background:#00ff00}#neg{position:absolute;z-index:-1;left:0;top:0;width:20px;height:20px;background:#0000ff}#pos{position:relative;z-index:3;height:10px;background:#ffff00}#inner{position:relative;z-index:0;height:50px;background:#00ffff}#inner>i{position:absolute;z-index:-2;left:0;top:0;width:10px;height:10px;background:#ff00ff;display:block}</style><div id=hd><div id=pos></div></div><div id=iso><div id=neg></div><div id=inner><i></i></div></div>",
+            64,
+        ).unwrap();
+        let list=display_list(&doc,200,200,&FixedText).unwrap();
+        let index_of=|r:u8,g:u8,b:u8|list.0.iter().position(|command|matches!(command,Command::FillRect{color,..} if (color.r,color.g,color.b)==(r,g,b))).expect("painted");
+        // A stacking context paints its own background before its negative z-index children.
+        assert!(index_of(0,255,0)<index_of(0,0,255),"negative child paints above its context background");
+        assert!(index_of(0,255,255)<index_of(255,0,255),"nested negative child paints above its context background");
+        assert!(index_of(0,255,0)<index_of(255,0,0),"z-index 2 header paints above z-index 1 context");
+        assert!(index_of(255,0,0)<index_of(255,255,0),"child of the header paints after the header background");
+    }
+
     #[test]
     fn transparent_stacking_parts_cut_command_and_hit_streams_independently(){
         let document=crate::html::parse("<div></div>",8).unwrap();
@@ -41599,13 +42595,14 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn svg_capability_query_detects_applied_unsupported_css_and_elements() {
         let document = crate::html::parse(
-            "<style>svg rect { filter: blur(1px) }</style><svg><rect width='2' height='2'/><use href='https://example.test/shape.svg#shape'/></svg>",
+            "<style>svg rect { paint-order: stroke } svg circle { filter: blur(1px) }</style><svg><rect width='2' height='2'/><circle r='1'/><use href='https://example.test/shape.svg#shape'/></svg>",
             128,
         )
         .unwrap();
         let rules = stylesheets(&document).unwrap();
         let unsupported = unsupported_svg_features(&document, &rules).unwrap();
-        assert!(unsupported.contains(&SvgUnsupportedFeature::Attribute("filter".into())));
+        assert!(unsupported.contains(&SvgUnsupportedFeature::Attribute("paint-order".into())));
+        assert!(!unsupported.contains(&SvgUnsupportedFeature::Attribute("filter".into())), "implemented filter functions are not reported");
         assert!(unsupported.contains(&SvgUnsupportedFeature::Element("use-reference".into())));
     }
 
@@ -41644,7 +42641,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let rules = stylesheets(&document).unwrap();
         let unsupported = unsupported_svg_features(&document, &rules).unwrap();
         assert!(unsupported.contains(&SvgUnsupportedFeature::Element("use-reference".into())));
-        assert!(unsupported.contains(&SvgUnsupportedFeature::PaintServer));
+        assert!(!unsupported.contains(&SvgUnsupportedFeature::PaintServer), "container object-box clips are implemented");
+        let missing = crate::html::parse("<svg><g clip-path='url(#absent)'><rect width='4' height='4'/></g></svg>", 128).unwrap();
+        let rules = stylesheets(&missing).unwrap();
+        assert!(unsupported_svg_features(&missing, &rules).unwrap().contains(&SvgUnsupportedFeature::PaintServer));
     }
 
     #[test]
@@ -41676,7 +42676,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn offscreen_sized_image_skips_loading() {
         let document = crate::html::parse(
-            "<div style='height:100px'></div><img src='large.png' width='20' height='10'>",
+            "<div style='height:100px'></div><img style='display:block' src='large.png' width='20' height='10'>",
             64,
         )
         .unwrap();
@@ -42095,7 +43095,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             ("flow-root list-item", "flow-root"),
         ] {
             let mut widths=Vec::new();
-            for (display,generated) in [(principal,"#target::marker{content:'M'}"),(reference,"#target::before{content:'M '}")] {
+            for (display,generated) in [(principal,"#target::marker{content:'M'}"),(reference,"#target::before{content:'M'}")] {
                 let markup=alloc::format!("<!doctype html><style>body{{margin:0}}#target{{display:{display};width:max-content;list-style-position:inside}}{generated}</style><div id=target>Abc</div>");
                 let (document,geometry)=intrinsic_keyword_geometry(&markup);
                 widths.push(intrinsic_keyword_rect(&document,&geometry,"#target").width);
@@ -43118,7 +44118,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         for mode in ["horizontal-tb", "vertical-lr", "vertical-rl"] {
             for alignment in ["first baseline", "last baseline"] {
                 let markup = alloc::format!(
-                    "<style>html,body{{margin:0}}main{{display:grid;writing-mode:{mode};text-orientation:mixed;font-size:20px;line-height:1;width:100px;height:150px;grid-template-columns:50px 50px;grid-template-rows:100px;align-items:{alignment}}}</style>\n                     <main><div id=text>x</div><div id=broken><br><img id=inline-image src=a.png style='width:50px;height:50px'></div></main>\n                     <div id=whitespace style='display:flow-root;font-size:20px;line-height:1'> </div>\n                     <div id=block-control style='display:flow-root;width:50px;font-size:20px;line-height:1'><br><img id=block-image src=a.png style='display:block;width:50px;height:50px'></div>"
+                    "<!doctype html><style>html,body{{margin:0}}main{{display:grid;writing-mode:{mode};text-orientation:mixed;font-size:20px;line-height:1;width:100px;height:150px;grid-template-columns:50px 50px;grid-template-rows:100px;align-items:{alignment}}}</style>\n                     <main><div id=text>x</div><div id=broken><br><img id=inline-image src=a.png style='width:50px;height:50px'></div></main>\n                     <div id=whitespace style='display:flow-root;font-size:20px;line-height:1'> </div>\n                     <div id=block-control style='display:flow-root;width:50px;font-size:20px;line-height:1'><br><img id=block-image src=a.png style='display:block;width:50px;height:50px'></div>"
                 );
                 let document = crate::html::parse(&markup, 96).unwrap();
                 let rules = stylesheets(&document).unwrap();
@@ -43300,6 +44300,66 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         }
     }
 
+    /// Like `FixedText` but with one glyph per character, so paragraph text
+    /// reaches the display list as glyph runs.
+    struct GlyphFixedText;
+
+    /// Like `SizedText` but with one glyph per character.
+    struct GlyphSizedText;
+
+    fn advance_glyphs(text: &str, advance: f32) -> ShapedRun {
+        let mut x = 0.0;
+        let glyphs: Vec<Glyph> = text
+            .char_indices()
+            .map(|(cluster, character)| {
+                let glyph = Glyph {
+                    id: character as u32 as u16,
+                    face: 0,
+                    cluster: cluster as u32,
+                    caps_expansion: 0,
+                    x,
+                    y: 0.0,
+                    size_scale: 1.0,
+                };
+                x += advance;
+                glyph
+            })
+            .collect();
+        ShapedRun { glyphs: Arc::from(glyphs), width: x }
+    }
+
+    impl TextShaper for GlyphFixedText {
+        fn primary_character_widths_styled(&self, size: f32, font: &FontSpec) -> Option<crate::paint::PrimaryCharacterWidths> {
+            FixedText.primary_character_widths_styled(size, font)
+        }
+        fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+            let mut run = advance_glyphs(text, 2.0);
+            run.width = text.len() as f32 * 2.0;
+            Ok(run)
+        }
+        fn ascent(&self, _: f32) -> f32 {
+            2.0
+        }
+        fn line_height(&self, _: f32) -> f32 {
+            3.0
+        }
+    }
+
+    impl TextShaper for GlyphSizedText {
+        fn primary_character_widths_styled(&self, size: f32, font: &FontSpec) -> Option<crate::paint::PrimaryCharacterWidths> {
+            SizedText.primary_character_widths_styled(size, font)
+        }
+        fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()> {
+            Ok(advance_glyphs(text, size * 0.5))
+        }
+        fn ascent(&self, size: f32) -> f32 {
+            size * 0.8
+        }
+        fn line_height(&self, size: f32) -> f32 {
+            size
+        }
+    }
+
     /// Baseline points in final paint space, including nested paragraph and
     /// counter-rotated atomic-box transforms. This verifies layout metrics
     /// against the actual command stream rather than synthetic box heights.
@@ -43356,7 +44416,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                     &document,
                     100,
                     100,
-                    &SizedText,
+                    &GlyphSizedText,
                     &rules,
                     None,
                     Some(&mut geometry),
@@ -43397,7 +44457,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 &document,
                 100,
                 100,
-                &SizedText,
+                &GlyphSizedText,
                 &rules,
                 None,
                 Some(&mut geometry),
@@ -43604,7 +44664,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 &document,
                 120,
                 120,
-                &SizedText,
+                &GlyphSizedText,
                 &rules,
                 None,
                 Some(&mut geometry),
@@ -43674,7 +44734,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                         &document,
                         120,
                         120,
-                        &SizedText,
+                        &GlyphSizedText,
                         &rules,
                         None,
                         Some(&mut geometry),
@@ -43833,7 +44893,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 "<style>html,body{{margin:0}}main{{writing-mode:{writing_mode};text-orientation:sideways;width:60px;height:20px;font-size:10px;line-height:10px}}main::before{{content:'A '}}.contents{{display:contents}}</style><main><span>A </span><span class=contents>A </span>A</main>"
             );
             let document = crate::html::parse(&markup, 64).unwrap();
-            let list = display_list(&document, 100, 100, &SizedText).unwrap();
+            let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
             let points = painted_baseline_points(&list);
             assert!(points.len() >= 2);
             let expected = if writing_mode == "vertical-rl" {
@@ -43942,10 +45002,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 .map(|r| (r.x, r.y, r.width, r.height))
                 .collect::<Vec<_>>(),
             [
-                (2.0, 2.0, 17.0, 10.0),
-                (21.0, 2.0, 17.0, 4.0),
-                (21.0, 8.0, 17.0, 4.0),
-                (2.0, 14.0, 36.0, 6.0)
+                (2.0, 2.0, 17.0, 14.0),
+                (21.0, 2.0, 17.0, 6.0),
+                (21.0, 10.0, 17.0, 6.0),
+                (2.0, 18.0, 36.0, 8.0)
             ]
         );
     }
@@ -44320,9 +45380,9 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             .find(|rect| (rect.y - 30.0).abs() < 0.01 && (rect.x - 4.0).abs() < 0.01)
             .expect("row-spanning cell background");
         assert!(
-            row_span.width >= 30.0 && first_span.width > row_span.width + 4.0
+            row_span.width >= 30.0 && first_span.width >= row_span.width + 4.0 - 0.01
                 && (row_span.height - 28.0).abs() < 0.01,
-            "the spanning deficit grows both columns and rowspan retains internal spacing: {row_span:?}"
+            "the colspan track spans the first column plus one internal spacing, and the rowspan retains internal spacing: {row_span:?}"
         );
         // CSS 2.1 requires the span deficit to be spread across columns;
         // the exact distribution of extra table width is a UA choice.
@@ -44866,7 +45926,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             64,
         )
         .unwrap();
-        let list = display_list(&document, 40, 30, &FixedText).unwrap();
+        let list = display_list(&document, 40, 30, &GlyphFixedText).unwrap();
         let glyph_runs = list
             .0
             .iter()
@@ -45450,7 +46510,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         // The host composes: the light `b` is not rendered at all and the
         // document rule must not reach the shadow `i`.
         let mut document =
-            crate::html::parse("<style>b{background:blue}</style><div><b></b></div>", 32).unwrap();
+            crate::html::parse("<style>b{background:blue;display:block;height:5px}</style><div><b></b></div>", 32).unwrap();
         let host = crate::selector::query_selector(&document, document.root(), "div")
             .unwrap()
             .unwrap();
@@ -45458,7 +46518,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             .attach_shadow(host, crate::shadow::ShadowMode::Open)
             .unwrap();
         let shadow =
-            crate::html::parse_fragment(&mut document, "<style>i{background:red}</style><i></i>")
+            crate::html::parse_fragment(&mut document, "<style>i{background:red;display:block;height:5px}</style><i></i>")
                 .unwrap();
         document.append(root, shadow).unwrap();
         let list = display_list(&document, 100, 100, &FixedText).unwrap();
@@ -45478,7 +46538,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             .unwrap();
         let shadow = crate::html::parse_fragment(
             &mut document,
-            "<style>:host{background:red}div{background:blue}</style><span style='background:green'></span>",
+            "<style>:host{background:red}div{background:blue}</style><span style='background:green;display:block;height:5px'></span>",
         )
         .unwrap();
         document.append(root, shadow).unwrap();
@@ -45495,7 +46555,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn slotted_rules_style_assigned_light_children_only() {
         let mut document =
-            crate::html::parse("<div><b></b><i style='background:blue'></i></div>", 32).unwrap();
+            crate::html::parse("<div><b style='display:block;height:5px'></b><i style='background:blue;display:block;height:5px'></i></div>", 32).unwrap();
         let host = crate::selector::query_selector(&document, document.root(), "div")
             .unwrap()
             .unwrap();
@@ -45532,7 +46592,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         )
         .unwrap();
         document.append(root, shadow).unwrap();
-        let list = display_list(&document, 100, 100, &FixedText).unwrap();
+        let list = display_list(&document, 100, 100, &GlyphFixedText).unwrap();
         let green = list.0.iter().any(|command| {
             matches!(
                 command,
@@ -45722,7 +46782,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                     "<style>html,body{{margin:0}}main{{display:{display};width:100px;grid-template-columns:50px 50px;align-items:{alignment}}}main>div{{width:50px}}p{{margin:0;font-size:10px}}.second{{padding-top:2px;font-size:20px}}</style><main><div><p>a<br>b</p></div><div class=second>c</div></main><footer style='height:2px;background:red'></footer>"
                 );
                 let document = crate::html::parse(&markup, 64).unwrap();
-                let list = display_list(&document, 100, 100, &SizedText).unwrap();
+                let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
                 let baselines = list
                     .0
                     .iter()
@@ -45756,7 +46816,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let document = crate::html::parse(
             "<style>html,body{margin:0}main{display:flex;flex-wrap:wrap;width:100px;height:60px;align-items:baseline;align-content:stretch}main>div{width:50px;font-size:10px}p{margin:0}.large{padding-top:2px;font-size:20px}</style><main><div>a<br>b</div><div class=large>c</div><div>d</div><div>e</div></main><footer style='height:2px;background:red'></footer>", 64,
         ).unwrap();
-        let list = display_list(&document, 100, 100, &SizedText).unwrap();
+        let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
         let baselines = list
             .0
             .iter()
@@ -45788,7 +46848,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                     "<style>html,body{{margin:0}}main{{display:{display};width:100px;height:40px;grid-template-columns:50px 50px;grid-template-rows:40px;align-items:{self_alignment}}}main>div{{width:50px;height:40px;align-content:{alignment};background:red}}.small{{font-size:10px}}.large{{font-size:20px}}</style><main><div class=small>a</div><div class=large>b</div></main>"
                 );
                 let document = crate::html::parse(&markup, 64).unwrap();
-                let list = display_list(&document, 100, 100, &SizedText).unwrap();
+                let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
                 let baselines = list
                     .0
                     .iter()
@@ -45843,7 +46903,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 &document,
                 100,
                 100,
-                &SizedText,
+                &GlyphSizedText,
                 &rules,
                 None,
                 Some(&mut geometry),
@@ -45882,7 +46942,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 "<style>html,body{{margin:0}}main{{display:{display};grid-template-rows:auto;grid-template-columns:auto auto;grid-lanes-direction:row;font-size:16px;border:1px solid;align-items:baseline;flow-tolerance:0}}section{{display:grid;grid-template-rows:subgrid;align-items:baseline}}.outer{{margin-top:5px;border:2px solid blue}}.inner{{border:2px solid green;padding-top:5px}}</style><main><div>X</div><section class=outer><section class=inner><div>X</div></section></section></main>"
             );
             let document = crate::html::parse(&markup, 64).unwrap();
-            let list = display_list(&document, 100, 100, &SizedText).unwrap();
+            let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
             let baselines = list
                 .0
                 .iter()
@@ -46008,7 +47068,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 "<style>html,body{{margin:0}}main{{display:grid;width:100px;grid-template-columns:50px 50px;grid-template-rows:auto auto;align-items:{alignment}}}main>div{{grid-row:1/span 2;font-size:10px}}.large{{padding-top:2px;font-size:20px}}</style><main><div>a<br>b</div><div class=large>c</div></main><footer style='height:2px;background:red'></footer>"
             );
             let document = crate::html::parse(&markup, 64).unwrap();
-            let list = display_list(&document, 100, 100, &SizedText).unwrap();
+            let list = display_list(&document, 100, 100, &GlyphSizedText).unwrap();
             let baselines = list
                 .0
                 .iter()
@@ -46198,16 +47258,17 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             ("text-bottom", 10.0, 20.0),
             ("middle", 6.0, 20.0),
             ("3px", 3.0, 20.0),
-            ("super", 1.0, 20.0),
+            // Superscripts rise by font-size / 3 + 1 (7.67px), 1.67px above the strut.
+            ("super", 0.0, 20.0 + 20.0 / 3.0 - 5.0),
             ("sub", 11.0, 21.0),
         ] {
             for display in ["inline-block", "inline-grid", "inline grid-lanes"] {
                 let markup = alloc::format!(
-                    "<style>html,body{{margin:0}}main{{font-size:20px;line-height:20px}}</style><main><span style='display:{display};vertical-align:{alignment};width:5px;height:10px;background:red'></span></main><footer style='height:2px;background:blue'></footer>"
+                    "<!doctype html><style>html,body{{margin:0}}main{{font-size:20px;line-height:20px}}</style><main><span style='display:{display};vertical-align:{alignment};width:5px;height:10px;background:red'></span></main><footer style='height:2px;background:blue'></footer>"
                 );
                 let document = crate::html::parse(&markup, 64).unwrap();
                 let list = display_list(&document, 100, 100, &SizedText).unwrap();
-                let boxes = list
+                let mut boxes = list
                     .0
                     .iter()
                     .filter_map(|command| match command {
@@ -46219,6 +47280,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                // Atomic inline-level boxes paint after the block backgrounds that follow them.
+                boxes.sort_by(|a, b| a.y.total_cmp(&b.y));
                 assert_eq!(boxes.len(), 2, "{display} {alignment}");
                 assert!(
                     (boxes[0].y - top).abs() < 0.001,
@@ -46256,7 +47319,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 &document,
                 100,
                 100,
-                &SizedText,
+                &GlyphSizedText,
                 &rules,
                 None,
                 Some(&mut geometry),
@@ -46293,7 +47356,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
 
     #[test]
     fn inline_atomic_margins_wrapping_and_hidden_hits_keep_line_descent() {
-        let document=crate::html::parse("<style>html,body{margin:0}main{width:40px;font-size:20px;line-height:20px}span{display:inline-grid;width:20px;height:10px;margin-right:5px;margin-bottom:20px;background:red}</style><main><span id=first></span><span id=second style='visibility:hidden'></span></main><footer style='height:2px;background:blue'></footer>",64).unwrap();
+        let document=crate::html::parse("<!doctype html><style>html,body{margin:0}main{width:40px;font-size:20px;line-height:20px}span{display:inline-grid;width:20px;height:10px;margin-right:5px;margin-bottom:20px;background:red}</style><main><span id=first></span><span id=second style='visibility:hidden'></span></main><footer style='height:2px;background:blue'></footer>",64).unwrap();
         let rules = stylesheets(&document).unwrap();
         let mut geometry = LayoutGeometry::default();
         let list = display_list_with_styles(
@@ -46314,7 +47377,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             let hit = geometry.hits.iter().find(|hit| hit.node == node).unwrap();
             assert_eq!((hit.rect.y, hit.rect.height), (top, 10.0), "{selector}");
         }
-        let boxes = list
+        let mut boxes = list
             .0
             .iter()
             .filter_map(|command| match command {
@@ -46326,13 +47389,15 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // Atomic inline-level boxes paint after the block backgrounds that follow them.
+        boxes.sort_by(|a, b| a.y.total_cmp(&b.y));
         assert_eq!(boxes.len(), 2);
         assert_eq!(boxes[1].y, 68.0);
     }
 
     #[test]
     fn inline_atomic_line_growth_resizes_ancestor_background_and_hit_without_repainting_child() {
-        let document=crate::html::parse("<style>html,body{margin:0}main{font-size:20px;line-height:20px}</style><main><span id=wrapper style='background:blue'><span id=atomic style='display:inline-grid;width:5px;height:30px;background:red'></span></span></main>",64).unwrap();
+        let document=crate::html::parse("<!doctype html><style>html,body{margin:0}main{font-size:20px;line-height:20px}</style><main><span id=wrapper style='background:blue'><span id=atomic style='display:inline-grid;width:5px;height:30px;background:red'></span></span></main>",64).unwrap();
         let rules = stylesheets(&document).unwrap();
         let mut geometry = LayoutGeometry::default();
         let list = display_list_with_styles(
@@ -46358,13 +47423,122 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(boxes, [(255, 0.0, 34.0), (0, 0.0, 30.0)]);
-        for (selector, height) in [("#wrapper", 34.0), ("#atomic", 30.0)] {
+        assert_eq!(boxes, [(255, 14.0, 20.0), (0, 0.0, 30.0)]);
+        for (selector, top, height) in [("#wrapper", 14.0, 20.0), ("#atomic", 0.0, 30.0)] {
             let node = crate::selector::query_selector(&document, document.root(), selector)
                 .unwrap()
                 .unwrap();
             let hit = geometry.hits.iter().find(|hit| hit.node == node).unwrap();
-            assert_eq!((hit.rect.y, hit.rect.height), (0.0, height), "{selector}");
+            assert_eq!((hit.rect.y, hit.rect.height), (top, height), "{selector}");
+        }
+    }
+
+    const QUIRKS: &str = "";
+    const LIMITED_QUIRKS: &str = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+    const STANDARDS: &str = "<!doctype html>";
+
+    fn quirk_line_geometry(prefix: &str, markup: &str) -> (Document, LayoutGeometry) {
+        let markup = alloc::format!(
+            "{prefix}<style>html,body{{margin:0}}main,pre{{margin:0;font-size:20px;line-height:1}}.a{{display:inline-block;width:5px;height:10px}}</style>{markup}<footer id=f style='height:2px'></footer>"
+        );
+        let document = crate::html::parse(&markup, 96).unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        display_list_with_styles(&document, 200, 200, &GlyphSizedText, &rules, None, Some(&mut geometry), &[]).unwrap();
+        (document, geometry)
+    }
+
+    fn quirk_line_footer(prefix: &str, markup: &str) -> f32 {
+        let (document, geometry) = quirk_line_geometry(prefix, markup);
+        intrinsic_keyword_rect(&document, &geometry, "#f").y
+    }
+
+    #[test]
+    fn quirks_line_without_text_drops_the_block_strut_for_atomic_inlines() {
+        for (prefix, atom_top, footer) in [
+            (QUIRKS, 0.0, 10.0),
+            (LIMITED_QUIRKS, 0.0, 10.0),
+            (STANDARDS, 6.0, 20.0),
+        ] {
+            let (document, geometry) = quirk_line_geometry(prefix, "<main><span id=a class=a></span></main>");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#a").y, atom_top, "{prefix}");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#f").y, footer, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn quirks_line_with_root_text_or_preserved_space_keeps_the_strut() {
+        for prefix in [QUIRKS, LIMITED_QUIRKS, STANDARDS] {
+            let (document, geometry) = quirk_line_geometry(prefix, "<main>x<span id=a class=a></span></main>");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#a").y, 6.0, "{prefix}");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#f").y, 20.0, "{prefix}");
+            let (document, geometry) = quirk_line_geometry(prefix, "<pre><span id=a class=a></span> </pre>");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#a").y, 6.0, "{prefix} preserved space");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#f").y, 20.0, "{prefix} preserved space");
+        }
+    }
+
+    #[test]
+    fn quirks_trailing_collapsible_space_and_break_do_not_restore_the_strut() {
+        for (prefix, footer) in [(QUIRKS, 10.0), (STANDARDS, 20.0)] {
+            assert_eq!(quirk_line_footer(prefix, "<main><span class=a></span> </main>"), footer, "{prefix} space");
+            assert_eq!(quirk_line_footer(prefix, "<main><span class=a></span><br></main>"), footer, "{prefix} break");
+        }
+        for prefix in [QUIRKS, STANDARDS] {
+            assert_eq!(quirk_line_footer(prefix, "<main><br></main>"), 20.0, "{prefix} lone break keeps the strut");
+        }
+    }
+
+    #[test]
+    fn quirks_blocks_ignore_line_height_when_only_inline_boxes_hold_the_text() {
+        for (prefix, footer) in [(QUIRKS, 10.0), (LIMITED_QUIRKS, 10.0), (STANDARDS, 20.0)] {
+            assert_eq!(
+                quirk_line_footer(prefix, "<main><b style='font-size:10px;font-weight:normal'>x</b></main>"),
+                footer,
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn quirks_empty_inline_boxes_have_zero_line_height_unless_inline_edges_are_set() {
+        for (style, quirks_footer, standards_footer) in [
+            ("margin:1px", 0.0, 20.0),
+            ("margin:0 1px", 0.0, 20.0),
+            ("padding:1px 0", 0.0, f32::NAN),
+            ("margin:0 1px;padding:1px 0", 0.0, 20.0),
+            ("border-width:1px 0;border-style:solid", 0.0, f32::NAN),
+            ("border-width:1px;border-style:solid none", 0.0, f32::NAN),
+            ("padding-left:1px", 20.0, 20.0),
+            ("padding-right:1px", 20.0, 20.0),
+            ("border-left:1px solid", 20.0, 20.0),
+            ("border-right:1px solid", 20.0, 20.0),
+        ] {
+            let markup = alloc::format!("<main><span style='{style}'></span></main>");
+            assert_eq!(quirk_line_footer(QUIRKS, &markup), quirks_footer, "quirks {style}");
+            assert_eq!(quirk_line_footer(LIMITED_QUIRKS, &markup), quirks_footer, "limited {style}");
+            if !standards_footer.is_nan() {
+                assert_eq!(quirk_line_footer(STANDARDS, &markup), standards_footer, "standards {style}");
+            }
+        }
+    }
+
+    #[test]
+    fn quirks_empty_inline_box_does_not_contribute_its_line_height_next_to_root_text() {
+        let markup = "<style>main{line-height:0}span{margin:0 1px;line-height:normal}</style><main>x<span></span></main>";
+        assert_eq!(quirk_line_footer(QUIRKS, markup), 0.0);
+        assert_eq!(quirk_line_footer(STANDARDS, markup), 20.0);
+    }
+
+    #[test]
+    fn quirks_list_items_keep_the_strut() {
+        for prefix in [QUIRKS, STANDARDS] {
+            let (document, geometry) = quirk_line_geometry(
+                prefix,
+                "<main style='display:list-item;list-style:none'><span id=a class=a></span></main>",
+            );
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#a").y, 6.0, "{prefix}");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#f").y, 20.0, "{prefix}");
         }
     }
 
@@ -46386,7 +47560,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                     {
                         continue;
                     }
-                    let boxes = grid_boxes(&markup);
+                    // Grid items paint as atomic inline-level boxes, after the
+                    // block backgrounds that follow their container.
+                    let mut boxes = grid_boxes(&markup);
+                    boxes.sort_by(|a, b| a.y.total_cmp(&b.y));
                     assert_eq!(
                         (boxes[0].height, boxes[1].y),
                         (height, height),
@@ -46395,9 +47572,10 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 }
             }
         }
-        let boxes = grid_boxes(
+        let mut boxes = grid_boxes(
             "<style>body{margin:0}</style><main style='display:grid;width:20px;grid-template-columns:20px;align-items:start'><canvas width=10 height=30 style='width:10px;max-height:10px;background:red'></canvas></main><footer style='height:2px;background:blue'></footer>",
         );
+        boxes.sort_by(|a, b| a.y.total_cmp(&b.y));
         assert_eq!(
             (boxes[0].height, boxes[1].y),
             (10.0, 10.0),
@@ -49389,6 +50567,110 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         );
     }
 
+    fn nested_intrinsic_layout<'a>(document: &'a Document, rules: &'a StyleIndex, uses: &'a core::cell::Cell<u64>,
+        styles: &'a RefCell<css::StyleCache>) -> Layout<'a> {
+        Layout::new(document, &FixedText, uses, rules, None,
+            Rect { x:0.0,y:0.0,width:400.0,height:300.0 }, None, &[], styles, None)
+    }
+
+    #[test]
+    fn repeated_intrinsic_measurement_of_nested_flex_and_grid_is_served_from_the_cache() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=r style='display:flex'><div style='display:flex'><div style='display:grid'><div style='display:flex'><div style='width:10px;height:5px'></div></div><div>one two three</div></div><div style='width:20px;height:5px'></div></div><div style='display:grid'><div style='display:flex'>four five</div></div></div>", 32).unwrap();
+        let root = crate::selector::query_selector(&document, document.root(), "#r").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let layout = nested_intrinsic_layout(&document, &rules, &uses, &styles);
+        let style = layout.computed_style_from_tree(root).unwrap();
+        for minimum in [false, true] {
+            let first = layout.intrinsic_size_mode(root, &style, 0, minimum).unwrap();
+            let measured = layout.intrinsics.measured.get();
+            assert!(measured > 1, "nested boxes are measured once each");
+            let reused = layout.intrinsics.reused.get();
+            let second = layout.intrinsic_size_mode(root, &style, 0, minimum).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(layout.intrinsics.measured.get(), measured, "a repeated measurement computes nothing");
+            assert!(layout.intrinsics.reused.get() > reused);
+        }
+    }
+
+    #[test]
+    fn nested_flex_and_grid_measure_each_subtree_once_per_mode() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=r style='display:flex'><div style='display:flex'><div style='display:grid'><div style='display:flex'><div style='display:grid'><div style='width:10px'>x</div></div></div></div></div><div style='display:flex'><div style='display:grid'><div>y</div></div></div></div>", 32).unwrap();
+        let root = crate::selector::query_selector(&document, document.root(), "#r").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let layout = nested_intrinsic_layout(&document, &rules, &uses, &styles);
+        let style = layout.computed_style_from_tree(root).unwrap();
+        layout.intrinsic_size_mode(root, &style, 0, false).unwrap();
+        let boxes = layout.intrinsics.measured.get();
+        assert!(boxes <= 12, "max-content measures every box a bounded number of times, got {boxes}");
+        layout.intrinsic_size_mode(root, &style, 0, true).unwrap();
+        let both = layout.intrinsics.measured.get();
+        assert!(both <= boxes * 2 + 4, "min-content adds at most one more pass over the tree, got {both}");
+    }
+
+    struct CallCountingText {
+        shapes: core::cell::Cell<usize>,
+        metrics: core::cell::Cell<usize>,
+    }
+
+    impl TextShaper for CallCountingText {
+        fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
+            self.shapes.set(self.shapes.get() + 1);
+            Ok(ShapedRun { glyphs: Arc::from([]), width: text.len() as f32 * 2.0 })
+        }
+        fn ascent(&self, _: f32) -> f32 { 2.0 }
+        fn line_height(&self, _: f32) -> f32 {
+            self.metrics.set(self.metrics.get() + 1);
+            3.0
+        }
+    }
+
+    #[test]
+    fn counting_shaper_answers_repeated_queries_from_its_memo() {
+        let inner = CallCountingText { shapes: core::cell::Cell::new(0), metrics: core::cell::Cell::new(0) };
+        let counting = CountingShaper { inner: &inner, uses: core::cell::Cell::new(0), memo: RefCell::default() };
+        let font = FontSpec::default();
+        let first = counting.shape_styled("one two", 16.0, false, &font).unwrap();
+        let again = counting.shape_styled("one two", 16.0, false, &font).unwrap();
+        assert_eq!(first, again);
+        assert_eq!(inner.shapes.get(), 1);
+        counting.shape_styled("one two", 16.0, true, &font).unwrap();
+        counting.shape_styled("one two", 17.0, false, &font).unwrap();
+        counting.shape_styled("one", 16.0, false, &font).unwrap();
+        assert_eq!(inner.shapes.get(), 4, "direction, size and text are part of the key");
+        assert_eq!(counting.measure_styled("one two", 16.0, &font), Ok(first.width));
+        assert_eq!(counting.measure_styled("one two", 16.0, &font), Ok(first.width));
+        assert_eq!(inner.shapes.get(), 5);
+        let mut bold = font.clone();
+        bold.weight = 700;
+        counting.shape_styled("one two", 16.0, false, &bold).unwrap();
+        assert_eq!(inner.shapes.get(), 6, "the font is part of the key");
+        assert_eq!(counting.line_height_styled(16.0, &font), 3.0);
+        assert_eq!(counting.line_height_styled(16.0, &font), 3.0);
+        assert_eq!(inner.metrics.get(), 1);
+        assert_eq!(counting.uses.get(), 10, "memo hits still count as font uses");
+    }
+
+    #[test]
+    fn cached_intrinsic_sizes_skip_the_box_classification() {
+        let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=r style='display:flex'><div style='display:flex'><span>one two</span><div style='width:20px;height:5px'></div></div><div>three four</div></div>", 32).unwrap();
+        let root = crate::selector::query_selector(&document, document.root(), "#r").unwrap().unwrap();
+        let rules = stylesheets(&document).unwrap(); let styles = RefCell::default();
+        let uses = core::cell::Cell::new(0);
+        let layout = nested_intrinsic_layout(&document, &rules, &uses, &styles);
+        let style = layout.computed_style_from_tree(root).unwrap();
+        for minimum in [false, true] {
+            let first = layout.intrinsic_size_mode_inner(root, &style, None, 0, minimum, None).unwrap();
+            let measured = layout.intrinsics.measured.get();
+            let reused = layout.intrinsics.reused.get();
+            let second = layout.intrinsic_size_mode_inner(root, &style, None, 0, minimum, None).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(layout.intrinsics.measured.get(), measured);
+            assert_eq!(layout.intrinsics.reused.get(), reused + 1, "one lookup serves the repeat");
+        }
+    }
+
     #[test]
     fn intrinsic_margin_escapes_share_the_intrinsic_cache_lifecycle() {
         let document = crate::html::parse("<!doctype html><style>html,body{margin:0}</style><div id=p><div id=b><div style='margin:20px 0;height:10px'></div></div></div>", 32).unwrap();
@@ -49400,11 +50682,11 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let style = layout.computed_style_from_tree(b).unwrap();
         layout.intrinsic_size_mode(b, &style, 0, false).unwrap();
         let slot = b.index() * 2;
-        let measured = layout.intrinsics.margins.borrow().get(slot).copied().flatten();
+        let measured = layout.intrinsics.margins(slot);
         let adds = |margins: Option<BlockMargins>| margins.map(|margins| (margins.lead_add, margins.trail_add));
         assert!(adds(measured).is_some_and(|(lead, _)| lead > 0.0));
         layout.intrinsic_size_mode_inner(b, &style, Some(&style), 0, false, None).unwrap();
-        assert_eq!(adds(layout.intrinsics.margins.borrow().get(slot).copied().flatten()), adds(measured),
+        assert_eq!(adds(layout.intrinsics.margins(slot)), adds(measured),
             "an origin-qualified measurement leaves the cached size and its margins untouched");
     }
 
@@ -49718,11 +51000,11 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let plain = crate::html::parse("<p>a b</p>", 16).unwrap();
         let spaced = crate::html::parse("<p> \t a\n\r  b</p>", 16).unwrap();
         assert_eq!(
-            display_list(&plain, 100, 30, &FixedText).unwrap(),
-            display_list(&spaced, 100, 30, &FixedText).unwrap()
+            display_list(&plain, 100, 30, &GlyphFixedText).unwrap(),
+            display_list(&spaced, 100, 30, &GlyphFixedText).unwrap()
         );
         let nbsp = crate::html::parse("<p style='width:6px'>a&nbsp;b</p>", 16).unwrap();
-        let list = display_list(&nbsp, 100, 30, &FixedText).unwrap();
+        let list = display_list(&nbsp, 100, 30, &GlyphFixedText).unwrap();
         assert_eq!(
             list.0
                 .iter()
@@ -49738,17 +51020,17 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         for (markup, expected) in [
             (
                 "<style>body{margin:0}</style><p>a<br>b</p>",
-                &[(0.0, 2.0), (0.0, 5.0)][..],
+                &[(0.0, 18.0), (0.0, 21.0)][..],
             ),
             (
                 "<style>body{margin:0}</style><p>a<br style='display:none'>b</p>",
                 // A display:none break has no paragraph effect, so adjacent
                 // same-style text is shaped as one run.
-                &[(0.0, 2.0)][..],
+                &[(0.0, 18.0)][..],
             ),
         ] {
             let document = crate::html::parse(markup, 16).unwrap();
-            let list = display_list(&document, 100, 30, &FixedText).unwrap();
+            let list = display_list(&document, 100, 30, &GlyphFixedText).unwrap();
             let runs: Vec<_> = list
                 .0
                 .iter()
@@ -49768,11 +51050,11 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn unitless_line_height_inherits_and_centers_glyphs() {
         let document = crate::html::parse(
-            "<style>body{margin:0}</style><div style='line-height:2'><p style='font-size:4px'>a<br>b</p></div>",
+            "<style>body{margin:0}</style><div style='line-height:2'><p style='font-size:4px;margin:0'>a<br>b</p></div>",
             16,
         )
         .unwrap();
-        let list = display_list(&document, 100, 30, &FixedText).unwrap();
+        let list = display_list(&document, 100, 30, &GlyphFixedText).unwrap();
         let baselines: Vec<_> = list
             .0
             .iter()
@@ -49791,7 +51073,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             24,
         )
         .unwrap();
-        let list = display_list(&document, 100, 30, &FixedText).unwrap();
+        let list = display_list(&document, 100, 30, &GlyphFixedText).unwrap();
         let runs: Vec<_> = list
             .0
             .iter()
@@ -49806,7 +51088,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             .collect();
         // The inert template contributes no boundary; the two adjacent text
         // nodes retain one shaping run.
-        assert_eq!(runs, [(0.0, 2.0)]);
+        assert_eq!(runs, [(0.0, 18.0)]);
         assert!(!list.0.iter().any(|command| matches!(command, Command::FillRect { color, .. } if color.r == 255 && color.g == 0)));
     }
 
@@ -51402,10 +52684,12 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
 
         let plain_empty_fragment = marker_y("line-height:40px");
         let padded_empty_fragment = marker_y("line-height:40px;padding:1px");
-        assert_eq!(plain_empty_fragment, 10.0);
-        assert_eq!(
-            padded_empty_fragment, 50.0,
-            "nonzero inline padding keeps the empty prefix line box and its line-height"
+        // The marker's box is its font's content area: half the (40 - 16)px
+        // leading below the top of its line.
+        assert_eq!(plain_empty_fragment, 22.0);
+        assert!(
+            (padded_empty_fragment - 62.0).abs() < 0.001,
+            "nonzero inline padding keeps the empty prefix line box and its line-height: {padded_empty_fragment}"
         );
     }
 
@@ -53770,7 +55054,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
 
     #[test]
     fn list_item_counter_operations_change_the_marker_sequence() {
-        let markup = "<style>body,ol{margin:0}ol{padding-left:24px}</style><ol><li></li><li style='counter-increment:list-item 3'></li><li></li><fieldset style='display:list-item;counter-set:list-item 42'></fieldset><li></li></ol>";
+        let markup = "<style>body,ol{margin:0}ol{padding-left:24px}</style><ol><li></li><li style='counter-increment:list-item 3'></li><li></li><div style='display:list-item;counter-set:list-item 42'></div><li></li></ol>";
         let runs = painted_text_runs(markup);
         for marker in ["1.", "4.", "5.", "42.", "43."] {
             assert!(
@@ -53963,6 +55247,15 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let (cascades, _) = counter_walk_pseudo_cascades(
             "p.n::before{counter-increment:c;content:counter(c)}", &body);
         assert_eq!(cascades, 0, "no element matches the only counter rule");
+    }
+
+    #[test]
+    fn counter_walk_skips_marker_cascade_without_marker_rules() {
+        let body = "<ol><li>a</li><li>b</li></ol><ul><li>c</li></ul>".repeat(50);
+        let (cascades, positions) = counter_walk_pseudo_cascades("*::before,*::after{box-sizing:border-box}", &body);
+        assert_eq!((cascades, positions), (0, 100), "default markers and content-free pseudo rules need no cascade");
+        let (cascades, positions) = counter_walk_pseudo_cascades("li::marker{color:red}", &body);
+        assert!(cascades > 0 && positions == 100, "marker rules are cascaded: {cascades} {positions}");
     }
 
     #[test]
@@ -54270,7 +55563,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         );
         assert_eq!(
             boxes.iter().map(|r| (r.y, r.height)).collect::<Vec<_>>(),
-            [(0.0, 20.0), (20.0, 10.0)]
+            [(20.0, 10.0), (0.0, 20.0)],
+            "in-flow block backgrounds paint before floats (CSS 2.1 Appendix E)"
         );
     }
 
@@ -54287,10 +55581,11 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 .map(|r| (r.x, r.y, r.width, r.height))
                 .collect::<Vec<_>>(),
             [
-                (0.0, 0.0, 20.0, 30.0),
                 (20.0, 0.0, 40.0, 10.0),
-                (0.0, 30.0, 60.0, 10.0)
-            ]
+                (0.0, 30.0, 60.0, 10.0),
+                (0.0, 0.0, 20.0, 30.0)
+            ],
+            "in-flow block backgrounds paint before floats (CSS 2.1 Appendix E)"
         );
     }
 
@@ -54916,7 +56211,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                 let rules=stylesheets(&document).unwrap();let mut geometry=LayoutGeometry::default();
                 let list=display_list_with_styles(&document,200,200,&RecordingText::default(),&rules,None,Some(&mut geometry),&[]).unwrap();
                 let text=geometry.hits.iter().find(|hit|hit.node==text_node&&!hit.virtual_generated).unwrap().rect;
-                assert_eq!(text.y,0.0,"encountered float preserves the existing line");
+                assert_eq!(text.y,-3.0,"encountered float preserves the existing line: the content area sits half the (10 - 16)px leading above it");
                 assert_eq!(text.x,if side=="left"{20.0}else{0.0},"ordinary and generated floats shorten the same current line");
                 let mut session=crate::session::RenderSession::new(document);
                 let retained=session.display_list(200,200,&RecordingText::default()).unwrap().clone();
@@ -54951,7 +56246,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         assert_eq!(rect("#two").x,10.0);
         assert!(rect("#u").x>=32.0);
         assert_eq!(rect("#v").x,20.0,"real BR ends the old line but retains float occupancy");
-        assert!(rect("#v").y>=10.0);
+        assert!(rect("#v").y>=7.0,"second line starts at 10px; its content area sits 3px above");
         let document=crate::html::parse("<style>body{margin:0}p{margin:0;width:30px;font:10px/10px monospace}i{float:left;width:25px;height:30px}</style><p><span id=t>AB</span><i id=f></i></p>",64).unwrap();
         let rules=stylesheets(&document).unwrap();let mut geometry=LayoutGeometry::default();
         display_list_with_styles(&document,200,200,&RecordingText::default(),&rules,None,Some(&mut geometry),&[]).unwrap();
@@ -55751,7 +57046,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             "<style>div{counter-reset:reversed(chapter)}div::before{content:counter(chapter)}</style><div></div>",
             "<style>div::before{content:counter(chapter,symbols(cyclic 'x' 'y'))}</style><div></div>",
             "<style>div::before{content:leader(dotted)}</style><div></div>",
-            "<style>div::before{content:'x';display:inline-block}</style><div></div>",
+            "<style>div::before{content:'x';display:inline-block;position:sticky}</style><div></div>",
         ] {
             let document = crate::html::parse(markup, 128).unwrap();
             assert!(
@@ -55918,7 +57213,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             &document,
             100,
             60,
-            &FixedText,
+            &GlyphFixedText,
             &rules,
             None,
             Some(&mut geometry),
@@ -56015,11 +57310,11 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
     #[test]
     fn inline_text_and_elements_share_a_line() {
         let document = crate::html::parse(
-            "<style>body{margin:0}</style><p>Hello <strong>world</strong>!</p><div>next</div>",
+            "<style>body,p{margin:0}</style><p>Hello <strong>world</strong>!</p><div>next</div>",
             16,
         )
         .unwrap();
-        let list = display_list(&document, 100, 30, &FixedText).unwrap();
+        let list = display_list(&document, 100, 30, &GlyphFixedText).unwrap();
         let runs: Vec<_> = list
             .0
             .iter()
@@ -56232,7 +57527,8 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                 .iter()
                 .map(|rect| (rect.x, rect.y, rect.width, rect.height))
                 .collect::<Vec<_>>(),
-            [(0.0, 0.0, 6.0, 3.0), (0.0, 3.0, 4.0, 3.0)]
+            [(0.0, 0.0, 4.0, 3.0), (0.0, 3.0, 4.0, 3.0)],
+            "the collapsible space that ends a wrapped line is removed and not painted"
         );
     }
 
@@ -56243,7 +57539,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             16,
         )
         .unwrap();
-        let list = display_list(&document, 40, 30, &FixedText).unwrap();
+        let list = display_list(&document, 40, 30, &GlyphFixedText).unwrap();
         let runs = list
             .0
             .iter()
@@ -56287,11 +57583,11 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
     #[test]
     fn text_and_inline_elements_wrap_at_box_width() {
         let document = crate::html::parse(
-            "<style>body{margin:0}</style><p style='width:10px'>aaa <strong>bbbb</strong> cccc</p>",
+            "<style>body,p{margin:0}</style><p style='width:10px'>aaa <strong>bbbb</strong> cccc</p>",
             12,
         )
         .unwrap();
-        let list = display_list(&document, 40, 30, &FixedText).unwrap();
+        let list = display_list(&document, 40, 30, &GlyphFixedText).unwrap();
         let runs: Vec<_> = list
             .0
             .iter()
@@ -56304,7 +57600,8 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                 _ => None,
             })
             .collect();
-        assert_eq!(runs, [(0.0, 2.0), (0.0, 5.0), (8.0, 5.0), (0.0, 8.0)]);
+        // The collapsible space after </strong> ends line two and is removed.
+        assert_eq!(runs, [(0.0, 2.0), (0.0, 5.0), (0.0, 8.0)]);
     }
 
     #[test]
@@ -56750,17 +58047,21 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
     fn retained_intrinsic_sizes_are_capped_dropping_the_oldest_frames() {
         let sizes = IntrinsicSizes::default();
         for slot in 0..10usize {
-            sizes.sizes.borrow_mut().push(Some((Style::initial(), (slot as f32, 1.0))));
-            sizes.margins.borrow_mut().push(None);
-            sizes.provenance.borrow_mut().push(IntrinsicProvenance {
-                frame: 100 - slot as u32, axes: 0, context: None, ..Default::default() });
+            sizes.slots.borrow_mut().insert(slot, IntrinsicSlot {
+                primary: Some(IntrinsicEntry {
+                    style: Arc::new(Style::initial()),
+                    size: (slot as f32, 1.0),
+                    margins: None,
+                    provenance: IntrinsicProvenance { frame: 100 - slot as u32, axes: 0, context: None, ..Default::default() },
+                }),
+                others: Vec::new(),
+            });
         }
         sizes.retain_newest(4);
-        let kept: Vec<usize> = sizes.sizes.borrow().iter().enumerate()
-            .filter(|(_, size)| size.is_some()).map(|(slot, _)| slot).collect();
+        let kept: Vec<usize> = sizes.slots.borrow().keys().copied().collect();
         assert_eq!(kept, [0, 1, 2, 3], "the four newest frames survive");
         sizes.retain_newest(4);
-        assert_eq!(sizes.sizes.borrow().iter().flatten().count(), 4);
+        assert_eq!(sizes.slots.borrow().len(), 4);
     }
 
     fn retained_frame(document: &Document, cache: &mut RetainedLayoutCache) -> (DisplayList, LayoutGeometry) {
@@ -56802,13 +58103,13 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         retained_frame(&document, &mut cache);
         let first_boxes = cache.boxes_laid_out();
         document.set_attribute(a, "style", "height:30px").unwrap();
-        cache.invalidate_changed(&document, &[a], &[], &[]);
+        cache.invalidate_changed(&document, &[a], &[], &[], &|_| false);
         let second = retained_frame(&document, &mut cache);
         assert!(cache.stats().hits >= 3, "the siblings below the resized block replay: {:?}", cache.stats());
         assert!(cache.boxes_laid_out() < first_boxes);
         assert_same_frame(&second, &fresh_frame(&document));
         document.set_attribute(a, "style", "height:5px").unwrap();
-        cache.invalidate_changed(&document, &[a], &[], &[]);
+        cache.invalidate_changed(&document, &[a], &[], &[], &|_| false);
         let third = retained_frame(&document, &mut cache);
         assert!(cache.stats().hits >= 3);
         assert_same_frame(&third, &fresh_frame(&document));
@@ -56821,7 +58122,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         let mut cache = RetainedLayoutCache::default();
         retained_frame(&document, &mut cache);
         document.set_attribute(b, "style", "height:40px;padding:3px").unwrap();
-        cache.invalidate_changed(&document, &[b], &[], &[]);
+        cache.invalidate_changed(&document, &[b], &[], &[], &|_| false);
         let second = retained_frame(&document, &mut cache);
         let stats = cache.stats();
         assert!(stats.hits >= 3 && stats.misses >= 1, "{stats:?}");
@@ -56836,7 +58137,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         let mut cache = RetainedLayoutCache::default();
         retained_frame(&document, &mut cache);
         document.replace_data(text, "a much longer word that wraps onto several lines of the narrow block").unwrap();
-        cache.invalidate_changed(&document, &[text], &[], &[]);
+        cache.invalidate_changed(&document, &[text], &[], &[], &|_| false);
         let second = retained_frame(&document, &mut cache);
         assert!(cache.stats().hits >= 2, "{:?}", cache.stats());
         assert_same_frame(&second, &fresh_frame(&document));
@@ -56850,10 +58151,10 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         retained_frame(&document, &mut cache);
         let full = cache.stats().entries;
         assert!(full >= 5, "{full}");
-        cache.invalidate_changed(&document, &[], &[], &[bold]);
+        cache.invalidate_changed(&document, &[], &[], &[bold], &|_| false);
         let after_paint = cache.stats().entries;
         assert!(after_paint < full && after_paint >= full - 2, "only the box holding the node goes: {full} -> {after_paint}");
-        cache.invalidate_changed(&document, &[], &[list], &[]);
+        cache.invalidate_changed(&document, &[], &[list], &[], &|_| false);
         assert!(cache.stats().entries <= after_paint - 3, "the list and its items go");
         let rebuilt = retained_frame(&document, &mut cache);
         assert_same_frame(&rebuilt, &fresh_frame(&document));
@@ -56877,5 +58178,331 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
         let third = retained_frame(&document, &mut cache);
         assert_eq!(cache.stats().entries, 0, "no fragment fits the byte budget");
         assert_same_frame(&third, &fresh_frame(&document));
+    }
+
+    fn nested_flex_page(depth: usize) -> String {
+        let mut open = String::new();
+        let mut close = String::new();
+        for level in 0..depth {
+            open.push_str(&alloc::format!("<div class=f><p id=p{level}>para {level} <b>bold</b> tail words</p>"));
+            close.push_str("</div>");
+        }
+        alloc::format!("<!doctype html><style>html,body{{margin:0}}.f{{display:flex;flex-wrap:wrap}}p{{margin:0}}</style><div id=far style='height:10px'></div>{open}{close}")
+    }
+
+    fn rows_page(rows: usize) -> String {
+        let mut markup = String::from("<!doctype html><style>html,body{margin:0}.r{display:flex;width:160px}p{margin:0}</style><div id=far style='height:10px'></div>");
+        for row in 0..rows {
+            markup.push_str(&alloc::format!("<div class=r><p id=p{row}>row {row} <i>text</i> and more words</p><span>tag</span></div>"));
+        }
+        markup
+    }
+
+    fn with_pairing_disabled<T>(run: impl FnOnce() -> T) -> T {
+        PAIRED_INTRINSICS_DISABLED.with(|flag| flag.set(true));
+        let value = run();
+        PAIRED_INTRINSICS_DISABLED.with(|flag| flag.set(false));
+        value
+    }
+
+    #[test]
+    fn paired_intrinsic_measurement_renders_like_separate_measurement() {
+        let pages = [
+            "<style>html,body{margin:0}.row{display:flex;flex-wrap:wrap;width:120px;gap:4px}.row>*{border:1px solid red}</style>\
+             <div class=row><span>alpha beta gamma</span><p style='margin:0'>delta <b>epsilon</b> zeta eta</p><span>x</span>\
+             <div style='flex:1 1 30px'>theta iota kappa</div></div>",
+            "<style>html,body{margin:0}.g{display:grid;grid-template-columns:auto 1fr min-content;width:200px;gap:2px}.fit{float:left;display:grid;grid-template-columns:max-content auto}</style>\
+             <div class=g><div>one two three</div><div>four <i>five</i> six</div><div>seven eight</div><div>nine</div></div>\
+             <div class=fit><div>left cell words</div><div>right <b>cell</b> words here</div></div>",
+            "<style>html,body{margin:0}.f{display:flex;width:300px}.f>div{padding:2%}</style>\
+             <div class=f><div style='width:50%'>half width text here</div><div style='flex:1'>rest <b>of</b> the row</div></div>\
+             <div style='float:left'><div style='width:40%'>percent child words</div>shrink to fit</div>",
+            "<style>html,body{margin:0}.f{display:flex}.f>div{border:1px solid blue}</style>\
+             <div class=f><div style='aspect-ratio:2/1;height:30px'>tall <i>t</i></div><div style='aspect-ratio:1;width:20px'>words words</div><div>plain <b>text</b></div></div>",
+            "<style>html,body{margin:0}div{border:1px solid green}</style>\
+             <div style='display:flex;width:max-content'><div>max <b>content</b> row</div><div>second</div></div>\
+             <div style='width:min-content'>min content <i>wraps</i> words</div>\
+             <div style='float:left;width:fit-content'>fit <b>content</b> float text</div>",
+            "<style>html,body{margin:0}</style><p style='float:left'>text <span style='display:inline-block'>atomic words</span> more <img width=5 height=5></p>\
+             <ul style='float:left'><li>one two</li><li>three <b>four</b></li></ul>",
+            "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:90px}</style>\
+             <div class=f><div>column item <b>one</b> text</div><span>two words</span><div style='min-width:min-content'>three <i>w</i></div></div>",
+        ];
+        for markup in pages {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let paired = fresh_frame(&document);
+            let separate = with_pairing_disabled(|| fresh_frame(&document));
+            assert_same_frame(&paired, &separate);
+        }
+    }
+
+    #[test]
+    fn paired_intrinsic_measurement_shapes_each_inline_run_once_per_style() {
+        let document = crate::html::parse(&nested_flex_page(6), 4096).unwrap();
+        let runs = |disabled: bool| {
+            PARAGRAPH_MEASUREMENTS.with(|runs| runs.set(0));
+            if disabled { with_pairing_disabled(|| fresh_frame(&document)); } else { fresh_frame(&document); }
+            PARAGRAPH_MEASUREMENTS.with(core::cell::Cell::get)
+        };
+        let paired = runs(false);
+        let separate = runs(true);
+        assert!(paired > 0 && paired <= 6 * 3, "paired runs: {paired}");
+        assert!(paired * 3 <= separate * 2, "paired {paired}, separate {separate}");
+    }
+
+    fn with_layout_memos_disabled<T>(run: impl FnOnce() -> T) -> T {
+        INTRINSIC_CHILDREN_MEMO_DISABLED.with(|flag| flag.set(true));
+        TREE_STYLE_MEMO_DISABLED.with(|flag| flag.set(true));
+        let value = run();
+        INTRINSIC_CHILDREN_MEMO_DISABLED.with(|flag| flag.set(false));
+        TREE_STYLE_MEMO_DISABLED.with(|flag| flag.set(false));
+        value
+    }
+
+    fn memo_counters() -> [usize; 4] {
+        [
+            INTRINSIC_CHILDREN_BUILDS.with(core::cell::Cell::get),
+            INTRINSIC_CHILDREN_REUSED.with(core::cell::Cell::get),
+            TREE_STYLE_WALKS.with(core::cell::Cell::get),
+            TREE_STYLE_REUSED.with(core::cell::Cell::get),
+        ]
+    }
+
+    fn reset_memo_counters() {
+        INTRINSIC_CHILDREN_BUILDS.with(|runs| runs.set(0));
+        INTRINSIC_CHILDREN_REUSED.with(|runs| runs.set(0));
+        TREE_STYLE_WALKS.with(|runs| runs.set(0));
+        TREE_STYLE_REUSED.with(|runs| runs.set(0));
+    }
+
+    #[test]
+    fn layout_memos_render_like_unmemoized_layout() {
+        let pages = [
+            "<style>html,body{margin:0}.row{display:flex;flex-wrap:wrap;width:140px;gap:4px}.row>*{border:1px solid red}</style>\
+             <div class=row><span>alpha beta gamma</span><p style='margin:0'>delta <b>epsilon</b> zeta eta</p>\
+             <div style='flex:1 1 30px'>theta iota kappa</div></div>",
+            "<style>html,body{margin:0}.g{display:grid;grid-template-columns:auto 1fr min-content;width:220px}</style>\
+             <div class=g><div>one two three</div><div>four <i>five</i> six</div><div>seven eight</div></div>",
+            "<style>html,body{margin:0}.f{display:flex;float:left}</style>\
+             <div class=f><ul><li>one two</li><li>three <b>four</b> five</li></ul><div style='letter-spacing:1px'>spaced words</div></div>",
+            "<style>html,body{margin:0}</style><ol style='float:left'><li>first item</li><li>second <i>item</i></li></ol>\
+             <div style='display:flex;width:max-content'><div>max <b>content</b></div><div>second</div></div>",
+        ];
+        for markup in pages {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let memoized = fresh_frame(&document);
+            let plain = with_layout_memos_disabled(|| fresh_frame(&document));
+            assert_same_frame(&memoized, &plain);
+        }
+    }
+
+    fn with_flex_shortcuts_disabled<T>(run: impl FnOnce() -> T) -> T {
+        FLEX_SHORTCUTS_DISABLED.with(|flag| flag.set(true));
+        let value = run();
+        FLEX_SHORTCUTS_DISABLED.with(|flag| flag.set(false));
+        value
+    }
+
+    fn measured_in_first_frame(document: &Document) -> usize {
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(document, &mut cache);
+        cache.intrinsics_measured().0
+    }
+
+    const FLEX_SHORTCUT_PAGES: [&str; 6] = [
+        "<style>html,body{margin:0}.f{display:flex;width:300px}.f>div{flex:1 1 20px}p{margin:0}</style>\
+         <div class=f><div><p>aa bb cc</p><p>dd ee</p></div><div style='display:flex'><p>ff gg</p><p>hh ii jj</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-direction:column;width:120px;height:200px}.f>*{flex:1 1 30px}</style>\
+         <div class=f><div>one two three</div><section style='display:grid;grid-template-columns:auto auto'><i>a b</i><i>c d</i></section></div>",
+        "<style>html,body{margin:0}.f{display:flex;float:left}.f>div{flex:1 1 50%}p{margin:0}</style>\
+         <div class=f><div><p>left words here</p></div><div><p>right</p><p>more words</p></div></div>",
+        "<style>html,body{margin:0}.f{display:flex;width:200px}</style>\
+         <div class=f>alpha beta gamma<span>x</span>delta epsilon<b style='flex:none'>z</b></div>",
+        "<style>html,body{margin:0}.f{display:flex;flex-wrap:wrap;width:150px}.f>div{flex:1 1 60px}</style>\
+         <div class=f><div>wrapped one</div><div>wrapped <b>two</b> words</div><div>three</div></div>",
+        "<style>html,body{margin:0}.f{display:flex;min-height:80px;width:260px}.f>div{flex:0 0 90px;border:1px solid red}</style>\
+         <div class=f><div>tall <i>item</i></div><div style='position:absolute'>abs</div><div>last one</div></div>",
+    ];
+
+    #[test]
+    fn flex_measurement_shortcuts_render_like_full_measurement() {
+        for markup in FLEX_SHORTCUT_PAGES {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let shortcut = fresh_frame(&document);
+            let full = with_flex_shortcuts_disabled(|| fresh_frame(&document));
+            assert_same_frame(&shortcut, &full);
+            let plain = with_layout_memos_disabled(|| with_flex_shortcuts_disabled(|| fresh_frame(&document)));
+            assert_same_frame(&shortcut, &plain);
+        }
+    }
+
+    #[test]
+    fn flex_items_with_a_given_basis_skip_their_max_content_measurement() {
+        let document = crate::html::parse(FLEX_SHORTCUT_PAGES[0], 4096).unwrap();
+        let shortcut = measured_in_first_frame(&document);
+        let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+        assert!(shortcut < full, "shortcut {shortcut}, full {full}");
+        for markup in FLEX_SHORTCUT_PAGES {
+            let document = crate::html::parse(markup, 4096).unwrap();
+            let shortcut = measured_in_first_frame(&document);
+            let full = with_flex_shortcuts_disabled(|| measured_in_first_frame(&document));
+            assert!(shortcut <= full, "shortcut {shortcut}, full {full}: {markup}");
+        }
+    }
+
+    #[test]
+    fn anonymous_flex_text_is_measured_once_for_both_modes() {
+        let document = crate::html::parse(FLEX_SHORTCUT_PAGES[3], 4096).unwrap();
+        let runs = |disabled: bool| {
+            ANONYMOUS_TEXT_MEASUREMENTS.with(|runs| runs.set(0));
+            if disabled { with_flex_shortcuts_disabled(|| fresh_frame(&document)); } else { fresh_frame(&document); }
+            ANONYMOUS_TEXT_MEASUREMENTS.with(core::cell::Cell::get)
+        };
+        let shortcut = runs(false);
+        let full = runs(true);
+        assert!(shortcut > 0 && shortcut < full, "shortcut {shortcut}, full {full}");
+    }
+
+    #[test]
+    fn flex_and_grid_containers_build_their_intrinsic_children_once_per_style() {
+        let document = crate::html::parse(
+            "<style>html,body{margin:0}.f{display:flex;flex-wrap:wrap;width:120px}</style>\
+             <div class=f><div style='display:flex'><span>alpha beta</span><span>gamma delta</span></div>\
+             <div style='display:grid;grid-template-columns:auto auto'><span>eps zeta</span><span>eta theta</span></div></div>",
+            4096).unwrap();
+        reset_memo_counters();
+        fresh_frame(&document);
+        let memoized = memo_counters();
+        reset_memo_counters();
+        with_layout_memos_disabled(|| fresh_frame(&document));
+        let plain = memo_counters();
+        assert!(memoized[1] > 0, "no children reuse: {memoized:?}");
+        assert!(memoized[0] < plain[0], "memoized builds {memoized:?}, plain {plain:?}");
+    }
+
+    #[test]
+    fn list_item_marker_origins_resolve_the_source_ancestry_once() {
+        let document = crate::html::parse(
+            "<style>html,body{margin:0}</style><div style='display:flex;float:left'><ul><li>one two</li><li>three</li></ul></div>",
+            4096).unwrap();
+        reset_memo_counters();
+        fresh_frame(&document);
+        let memoized = memo_counters();
+        reset_memo_counters();
+        with_layout_memos_disabled(|| fresh_frame(&document));
+        let plain = memo_counters();
+        assert!(memoized[3] > 0, "no ancestry reuse: {memoized:?}");
+        assert!(memoized[2] < plain[2], "memoized walks {memoized:?}, plain {plain:?}");
+    }
+
+    #[test]
+    fn nested_flex_measurements_stay_linear_in_depth() {
+        extern crate std;
+        // Unoptimized frames of nested flex measurement exceed the test thread's stack.
+        std::thread::Builder::new().stack_size(64 << 20).spawn(|| {
+            let mut counts = Vec::new();
+            for depth in [6usize, 12] {
+                let document = crate::html::parse(&nested_flex_page(depth), 4096).unwrap();
+                let mut cache = RetainedLayoutCache::default();
+                retained_frame(&document, &mut cache);
+                let (measured, _) = cache.intrinsics_measured();
+                assert!(measured <= depth * 12, "depth {depth} measured {measured}");
+                counts.push(measured);
+            }
+            assert!(counts[1] <= counts[0] * 3, "doubling the depth multiplied measurements: {counts:?}");
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn intrinsic_sizes_survive_unrelated_changes_and_follow_edited_items() {
+        let mut document = crate::html::parse(&rows_page(24), 4096).unwrap();
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        let (first, _) = cache.intrinsics_measured();
+        assert!(first >= 24, "first layout measured {first}");
+
+        let far = retained_node(&document, "#far");
+        document.set_attribute(far, "style", "height:30px").unwrap();
+        cache.invalidate_changed(&document, &[far], &[], &[], &|_| false);
+        let shifted = retained_frame(&document, &mut cache);
+        assert_same_frame(&shifted, &fresh_frame(&document));
+        let (after_shift, _) = cache.intrinsics_measured();
+        assert!(after_shift * 4 <= first, "an unrelated change re-measured {after_shift} of {first}");
+
+        let paragraph = retained_node(&document, "#p7");
+        let text = document.first_child(paragraph).unwrap().unwrap();
+        document.replace_data(text, "an edited and much longer run of words for this item").unwrap();
+        cache.invalidate_changed(&document, &[text], &[], &[], &|_| false);
+        let edited = retained_frame(&document, &mut cache);
+        assert_same_frame(&edited, &fresh_frame(&document));
+        let (after_edit, _) = cache.intrinsics_measured();
+        assert!(after_edit > 0 && after_edit * 4 <= first, "a text edit measured {after_edit} of {first}");
+
+        document.set_attribute(paragraph, "style", "font-size:30px").unwrap();
+        cache.invalidate_changed(&document, &[paragraph], &[], &[], &|_| false);
+        let restyled = retained_frame(&document, &mut cache);
+        assert_same_frame(&restyled, &fresh_frame(&document));
+        let (after_style, _) = cache.intrinsics_measured();
+        assert!(after_style > 0 && after_style * 4 <= first, "a style change measured {after_style} of {first}");
+    }
+
+    #[test]
+    fn text_and_subtree_invalidation_keep_unrelated_intrinsic_sizes() {
+        let mut document = crate::html::parse(&rows_page(24), 4096).unwrap();
+        let mut cache = RetainedLayoutCache::default();
+        retained_frame(&document, &mut cache);
+        let (first, _) = cache.intrinsics_measured();
+
+        let paragraph = retained_node(&document, "#p3");
+        let text = document.first_child(paragraph).unwrap().unwrap();
+        document.replace_data(text, "short").unwrap();
+        cache.invalidate_text_targets(&document, &[text]);
+        let edited = retained_frame(&document, &mut cache);
+        assert_same_frame(&edited, &fresh_frame(&document));
+        let (after_text, _) = cache.intrinsics_measured();
+        assert!(after_text > 0 && after_text * 4 <= first, "a text edit measured {after_text} of {first}");
+
+        let row = document.parent(retained_node(&document, "#p9")).unwrap().unwrap();
+        document.set_attribute(row, "style", "width:90px").unwrap();
+        cache.invalidate_subtree_targets(&document, &[row]);
+        let restyled = retained_frame(&document, &mut cache);
+        assert_same_frame(&restyled, &fresh_frame(&document));
+        let (after_subtree, _) = cache.intrinsics_measured();
+        assert!(after_subtree * 4 <= first, "a subtree change measured {after_subtree} of {first}");
+    }
+}
+
+#[cfg(test)]
+mod type_sizes {
+    extern crate std;
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    macro_rules! sizes {
+        ($($ty:ty),+ $(,)?) => {
+            $(std::println!("{:<58} size {:>5}  align {}", stringify!($ty), size_of::<$ty>(), align_of::<$ty>());)+
+        };
+    }
+
+    #[test]
+    fn print_type_sizes_layout() {
+        std::println!("--- layout memos (per node slot / per retained box)");
+        sizes!(
+            Option<BlockMargins>,
+            IntrinsicProvenance,
+            IntrinsicSlot,
+            IntrinsicEntry,
+            IntrinsicContext,
+            IntrinsicChildren,
+            TreeStyleEntry,
+            RetainedFragment,
+            RetainedFragmentKey
+        );
+        sizes!(FlexItem, FlattenedBoxChild, InlineParagraph, InlineAtom, InlineToken, InlineFrame);
+        sizes!(FlowBaselines, FlowContentRanges, OverflowMetrics, MarginStrut, BlockChild);
+        std::println!(
+            "retained slots: IntrinsicSizes holds one {} B IntrinsicSlot per measured (node*2) slot plus one {} B shared Style per way",
+            size_of::<IntrinsicSlot>(), size_of::<Style>()
+        );
     }
 }

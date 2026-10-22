@@ -171,7 +171,7 @@ fn parser_error_document(offset: usize, message: &str) -> lumen_html::Document {
     let root = document.root();
     let error = document
         .create(NodeKind::Element {
-            namespace: Namespace::Other(std::rc::Rc::from(
+            namespace: Namespace::Other(std::sync::Arc::from(
                 "http://www.mozilla.org/newlayout/xml/parsererror.xml",
             )),
             name: lumen_html::Name::new("parsererror"),

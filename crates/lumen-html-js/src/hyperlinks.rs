@@ -1,6 +1,6 @@
 //! Hyperlink URL reflection uses the shared URL parser and the live document base.
 use super::*;
-use lumen_common::url::{self, Url};
+use lumen_common::url::Url;
 
 /// Capture the activation element from the dispatch path, then read its live
 /// document, attributes and URL after listeners have run. Retaining the actual
@@ -45,7 +45,7 @@ pub(crate) fn activation_behavior(ctx: &mut Ctx, receiver: &Value, event: &Value
         // The embedded host does not offer a download destination. A requested
         // download therefore cannot be converted into a document navigation.
         if download { return Ok(()); }
-        let Ok(parsed) = url::parse(&href, Some(&realm.base_url())) else { return Ok(()); };
+        let Ok(parsed) = realm.parse_document_url(&href) else { return Ok(()); };
         let mut destination = parsed.href();
         if is_anchor {
             let original_target = ctx.with_instance::<DomEvent, _>(&event, |event| event.target_for_retarget())
@@ -104,7 +104,7 @@ fn hyperlink_url(node: &DomNode) -> OpResult<Option<Url>> {
         .document()
         .get_attribute_ns_ref(node.id, None, "href")
         .map_err(dom_error)?;
-    Ok(raw.and_then(|href| url::parse(href, Some(&node.realm.base_url())).ok()))
+    Ok(raw.and_then(|href| node.realm.parse_document_url(href).ok()))
 }
 
 #[cfg(test)]
@@ -162,7 +162,7 @@ fn href(node: &DomNode) -> OpResult<String> {
     else {
         return Ok(String::new());
     };
-    Ok(url::parse(raw, Some(&node.realm.base_url()))
+    Ok(node.realm.parse_document_url(raw)
         .map(|url| url.href())
         .unwrap_or_else(|_| raw.to_owned()))
 }
@@ -418,6 +418,25 @@ mod tests {
                 base.href===document.location.href && !base.hasAttribute('href') &&
                 document.implementation.createHTMLDocument('detached').location===null;
         })()"#).unwrap().ok().unwrap();
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn hyperlink_query_uses_the_document_encoding_for_special_urls_only() {
+        let mut engine = lumen::Engine::new();
+        let realm = install(engine.ctx(), "<a id=a></a>", 64).unwrap();
+        realm.set_document_url("https://origin.test/page.html");
+        assert!(realm.set_document_encoding("big5"));
+        let result = engine.eval_value(r#"(() => {
+            const a = document.getElementById('a');
+            const search = value => { a.href = 'https://example.com/?' + value; return a.search; };
+            const ok = search('\u00a7') === '?%A1%B1' && search('\u{1F600}') === '?%26%23128512%3B' && search('\u00a7%41') === '?%A1%B1%41';
+            a.href = 'foo://example.com/?\u00a7';
+            return ok && a.search === '?%C2%A7';
+        })()"#).unwrap().unwrap_or_else(|error| panic!("{}", engine.ctx().coerce_string(&error).map(|v| v.to_string()).unwrap_or_default()));
+        assert!(matches!(result, Value::Bool(true)));
+        assert!(realm.set_document_encoding("utf-8"));
+        let result = engine.eval_value(r#"(() => { const a = document.getElementById('a'); a.href = 'https://example.com/?\u00a7'; return a.search === '?%C2%A7'; })()"#).unwrap().ok().unwrap();
         assert!(matches!(result, Value::Bool(true)));
     }
 

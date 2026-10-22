@@ -85,3 +85,22 @@ pub fn func(params: &[u8], results: &[u8], code: &[u8]) -> Vec<u8> {
 
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
+pub const V128: u8 = 0x7b;
+
+/// A vector instruction: the 0xFD prefix, the LEB128 sub-opcode, then its immediates.
+pub fn simd(op: u32, imm: &[u8]) -> Vec<u8> {
+    let mut code = vec![0xfd];
+    uleb(op as u64, &mut code);
+    code.extend_from_slice(imm);
+    code
+}
+
+/// `v128.const` of the given 32-bit lanes.
+pub fn i32x4(lanes: [u32; 4]) -> Vec<u8> {
+    simd(0x0c, &lanes.iter().flat_map(|l| l.to_le_bytes()).collect::<Vec<_>>())
+}
+
+/// Concatenated instruction byte strings.
+pub fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
+    parts.concat()
+}

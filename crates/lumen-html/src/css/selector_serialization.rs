@@ -12,10 +12,15 @@ fn push(output: &mut String, value: &str) -> Result<(), CssError> {
 pub fn serialize(input: &str, map: &NamespaceMap, nesting: bool) -> Result<String, CssError> {
     list(input, map, nesting, false, false, false, 0)
 }
+/// Serializes a relative selector list such as `> .child`, which `@scope`
+/// style rules keep unabsolutized.
+pub fn serialize_relative(input: &str, map: &NamespaceMap) -> Result<String, CssError> {
+    list(input, map, true, true, false, false, 0)
+}
 fn list(input: &str, map: &NamespaceMap, nesting: bool, relative: bool, forgiving: bool, logical_subject: bool, depth: usize) -> Result<String, CssError> {
     if depth > MAX_SELECTOR_NESTING { return Err(selector_error(0, "selector nesting limit exceeded")); }
     let completed = syntax::complete(input)?.ok_or_else(|| selector_error(0, "invalid selector component"))?;
-    let clean = completed.contains("/*").then(|| strip_selector_comments(&completed, 0)).transpose()?;
+    let clean = syntax::contains_comment_open(&completed).then(|| strip_selector_comments(&completed, 0)).transpose()?;
     let input = clean.as_deref().unwrap_or(&completed);
     let mut output = String::new();
     for (start, end) in selector_list_spans(input, 0, forgiving)? {

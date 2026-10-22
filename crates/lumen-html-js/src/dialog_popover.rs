@@ -849,6 +849,30 @@ pub(crate) fn set_popover_value(realm: &Rc<DomRealm>, node: NodeId, value: &str)
         .map_err(super::dom_error)
 }
 
+/// The `popover` IDL setter. HTML's popover attribute change steps hide a showing popover whose
+/// type changes, so the new type's light-dismiss behaviour never applies to a popover that was
+/// shown under the old one.
+pub(crate) fn change_popover_value(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, value: &str) -> OpResult<()> {
+    let (realm, node) = realm.resolve_adopted_node(node);
+    let (old_state, was_showing) = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        (
+            top_layer::reflected_popover_value(document, node),
+            top_layer::popover_visibility(document, node) == top_layer::PopoverVisibility::Showing,
+        )
+    };
+    set_popover_value(&realm, node, value)?;
+    if !was_showing {
+        return Ok(());
+    }
+    let new_state = top_layer::reflected_popover_value(realm.session.borrow().document(), node);
+    if new_state.is_some() && new_state != old_state {
+        hide_popover(ctx, &realm, node)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> OpResult<()> {
     show_popover_with_source(ctx, realm, node, Value::Null)
 }

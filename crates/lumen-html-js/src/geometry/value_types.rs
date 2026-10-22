@@ -57,7 +57,7 @@ fn matrix_constructor(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
         if !RealmServices::<GeometryContext>::current(ctx).is_some_and(|context|context.window) {return Err(OpError::type_error("CSS matrix strings are only available in Window"))}
         let source=ctx.coerce_string(value).map_err(OpError::thrown)?;
         if source.trim().is_empty()||source.trim().eq_ignore_ascii_case("none") {return Ok(Matrix::default())}
-        return Err(OpError::new("NotSupportedError","CSS string matrix parsing is not implemented; numeric sequences are supported"));
+        return lumen_html::css::typed_transforms::computed_matrix(&source,None).ok_or_else(||OpError::new("SyntaxError","Invalid CSS transform list for DOMMatrix"));
     }
     matrix_sequence(ctx,value)
 }

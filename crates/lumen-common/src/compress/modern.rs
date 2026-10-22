@@ -231,3 +231,85 @@ impl BrotliDecoder {
         (status, in_off, out_off)
     }
 }
+
+/// A Zstandard decompressor fed in pieces: `zstd`'s streaming context, or `ruzstd`'s frame
+/// decoder on the targets that have no C library (it buffers input until a whole block is there).
+#[cfg(not(any(target_arch = "wasm32", target_os = "none", target_env = "musl")))]
+pub struct ZstdDecoder {
+    inner: zstd::stream::raw::Decoder<'static>,
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "none", target_env = "musl")))]
+impl ZstdDecoder {
+    pub fn new() -> Result<Self, String> {
+        Ok(ZstdDecoder {
+            inner: zstd::stream::raw::Decoder::new().map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Returns `(consumed, produced, finished)`; `finished` once the frame is complete and every
+    /// byte of it has been handed out. `input_ended` says no further input will follow.
+    pub fn run(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        _input_ended: bool,
+    ) -> Result<(usize, usize, bool), String> {
+        use zstd::stream::raw::{InBuffer, OutBuffer, Operation};
+        let mut source = InBuffer::around(input);
+        let mut sink = OutBuffer::around(output);
+        let hint = self
+            .inner
+            .run(&mut source, &mut sink)
+            .map_err(|e| e.to_string())?;
+        Ok((source.pos(), sink.pos(), hint == 0))
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", target_os = "none", target_env = "musl"))]
+pub struct ZstdDecoder {
+    frame: ruzstd::decoding::FrameDecoder,
+    pending: Vec<u8>,
+    started: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", target_os = "none", target_env = "musl"))]
+impl ZstdDecoder {
+    /// Largest block (128 KiB) plus its header and the largest frame header.
+    const WINDOW: usize = (128 << 10) + 3 + 18;
+
+    pub fn new() -> Result<Self, String> {
+        Ok(ZstdDecoder {
+            frame: ruzstd::decoding::FrameDecoder::new(),
+            pending: Vec::new(),
+            started: false,
+        })
+    }
+
+    /// As the `zstd` build's `run`. All of `input` is taken in; at most one block window of it is
+    /// decoded per call, so the output of a step stays bounded by what that window can expand to.
+    pub fn run(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        input_ended: bool,
+    ) -> Result<(usize, usize, bool), String> {
+        self.pending.extend_from_slice(input);
+        loop {
+            let window = &self.pending[..self.pending.len().min(Self::WINDOW)];
+            if !self.started && !input_ended && window.len() < 18 {
+                return Ok((input.len(), 0, false));
+            }
+            let (read, written) = self
+                .frame
+                .decode_from_to(window, output)
+                .map_err(|e| e.to_string())?;
+            self.started = true;
+            self.pending.drain(..read);
+            let finished = self.frame.is_finished() && self.frame.can_collect() == 0;
+            if written > 0 || read == 0 || finished {
+                return Ok((input.len(), written, finished));
+            }
+        }
+    }
+}

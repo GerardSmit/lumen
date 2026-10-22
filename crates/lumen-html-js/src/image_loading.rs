@@ -154,6 +154,8 @@ pub(crate) struct ImageLoader {
     pending_scratch: RefCell<Vec<NodeId>>,
     input_fetches: RefCell<Option<InputFetches>>,
     input_budget_failed: Cell<bool>,
+    /// `HTMLImageElement.decode()` promises waiting for the element's request to settle.
+    decode_waiters: RefCell<Vec<(NodeId, lumen::embed::Deferred)>>,
 }
 
 /// Image discovery results reused while the tree, image attributes and base
@@ -659,6 +661,36 @@ impl ImageLoader {
         self.request_natural_dimensions(node,self.requests.borrow().get(&node)?,scheme)
     }
 
+    pub(crate) fn add_decode_waiter(&self, node: NodeId, deferred: lumen::embed::Deferred) {
+        self.decode_waiters.borrow_mut().push((node, deferred));
+    }
+
+    pub(crate) fn take_decode_waiters(&self) -> Vec<(NodeId, lumen::embed::Deferred)> {
+        std::mem::take(&mut *self.decode_waiters.borrow_mut())
+    }
+
+    /// `Some(true)` once the element's request is completely available, `Some(false)` when it is
+    /// broken or there is no source to decode, `None` while a request is still in flight.
+    pub(crate) fn decode_outcome(&self, document: &Document, node: NodeId, base: &str) -> Option<bool> {
+        if !self.synchronize_node(document, node, base) {
+            return Some(false);
+        }
+        let requests = self.requests.borrow();
+        let Some(request) = requests.get(&node) else {
+            return Some(false);
+        };
+        match request.selected_source.as_ref() {
+            None | Some(None) => Some(false),
+            Some(Some(source)) if source.is_empty() => Some(false),
+            Some(Some(_)) if request.pending.is_some() => None,
+            Some(Some(_)) => match request.current.state {
+                RequestState::Available => Some(true),
+                RequestState::Broken => Some(false),
+                RequestState::Unavailable | RequestState::Loading => None,
+            },
+        }
+    }
+
     pub(crate) fn canvas_image_state(&self, node: NodeId) -> CanvasImageState {
         let requests = self.requests.borrow();
         let Some(request) = requests.get(&node) else {
@@ -710,7 +742,10 @@ impl ImageLoader {
                 // Rediscovery invalidates the observation proof, without
                 // turning unrelated tree changes into new load events.
                 request.observed_version=None;
-                if base_changed && request.selected_source.is_some() && lumen_html::forms::html_element_local_name(document,node)!=Some("input"){request.selection_dirty=true;}
+                // A base URL change is not a relevant mutation: a request that already
+                // produced an image keeps its URL, only one that has not loaded yet follows the new base.
+                if base_changed && request.selected_source.is_some() && request.current.state==RequestState::Unavailable
+                    && lumen_html::forms::html_element_local_name(document,node)!=Some("input"){request.selection_dirty=true;}
             }
             self.has_dirty.set(true);
             discovery.key = Some(key);

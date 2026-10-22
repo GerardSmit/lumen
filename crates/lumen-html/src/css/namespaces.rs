@@ -63,8 +63,13 @@ impl NamespaceMap {
         self.entries.iter().rev().find(|rule|rule.prefix.as_deref()==prefix).map(|rule|rule.uri.clone())
     }
     pub fn from_stylesheet(input:&str)->Result<Self,CssError> {
+        Ok(Self::from_ranges(input,&nesting::source_rule_ranges(input,false)?))
+    }
+
+    /// `ranges` are `nesting::source_rule_ranges(input, false)`.
+    pub fn from_ranges(input:&str,ranges:&[nesting::SourceRuleRange])->Self {
         let mut map=Self::default();let mut phase=0u8;
-        for (start,end,open,_) in nesting::source_rule_ranges(input,false)? {
+        for &(start,end,open,_) in ranges {
             let prelude=input[start..open.unwrap_or(end)].trim().trim_end_matches(';');
             if open.is_none() {
                 if let Some(rule)=parse_prelude(prelude) {
@@ -84,7 +89,7 @@ impl NamespaceMap {
                 phase=3;
             }
         }
-        Ok(map)
+        map
     }
 }
 
@@ -97,7 +102,7 @@ impl NamespaceConstraint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn kind(uri:&str)->NodeKind {NodeKind::Element {namespace:Namespace::Other(alloc::rc::Rc::from(uri)),name:"item".into(),attributes:vec![("class".into(),"x".into()),("flag".into(),"yes".into())]}}
+    fn kind(uri:&str)->NodeKind {NodeKind::Element {namespace:Namespace::Other(alloc::sync::Arc::from(uri)),name:"item".into(),attributes:vec![("class".into(),"x".into()),("flag".into(),"yes".into())]}}
     fn matches(input:&str,map:&NamespaceMap,uri:&str)->bool {parse_selector_depth(input,0,0,false,map).unwrap().matches(&kind(uri))}
     #[test]
     fn specification_css_namespaces_literal_grammar_scope_and_default_subjects() {

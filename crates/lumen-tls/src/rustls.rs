@@ -100,19 +100,46 @@ fn runtime_provider() -> Result<Arc<CryptoProvider>, String> {
 }
 
 /// Construct a verified Rustls client config from the bundled Mozilla roots plus caller roots.
-/// Certificate verification uses the clock installed by [`install_runtime_crypto`].
+/// Certificate verification uses the clock installed by [`install_runtime_crypto`]. Configs
+/// without caller roots are shared per ALPN list, so the trust store is built once and TLS
+/// sessions are resumed across connections through the config's session cache.
 pub fn client_config_with_roots(
     protocols: &[String],
     extra_roots: &[Vec<u8>],
 ) -> Result<Arc<ClientConfig>, String> {
     validate_alpn(protocols)?;
-    let provider = runtime_provider()?;
     let runtime = RUNTIME_CRYPTO
         .get()
         .ok_or_else(|| String::from("TLS runtime entropy and clock providers are unavailable"))?;
     if (runtime.unix_time)().is_none() {
         return Err(String::from("TLS requires a synchronized wall clock"));
     }
+    if !extra_roots.is_empty() {
+        return build_client_config(protocols, extra_roots);
+    }
+    type Shared = std::sync::Mutex<std::collections::HashMap<Vec<String>, Arc<ClientConfig>>>;
+    static SHARED: OnceLock<Shared> = OnceLock::new();
+    let shared = SHARED.get_or_init(Default::default);
+    if let Some(config) = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(protocols)
+    {
+        return Ok(config.clone());
+    }
+    let config = build_client_config(protocols, extra_roots)?;
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(protocols.to_vec(), config.clone());
+    Ok(config)
+}
+
+fn build_client_config(
+    protocols: &[String],
+    extra_roots: &[Vec<u8>],
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = runtime_provider()?;
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for root in extra_roots {

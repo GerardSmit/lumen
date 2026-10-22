@@ -3733,11 +3733,11 @@ mod tests {
             orderedTemplate.innerHTML='<x-ordered-birth id="a"></x-ordered-birth><x-ordered-birth id="b"></x-ordered-birth>';
             var repeated=orderedTemplate.content, explicitA=repeated.firstChild;
             main.append(...Array(64).fill(repeated),explicitA,repeated);
-            require(insertionVisits.join(',')==='a,b' && main.lastChild.id==='b' && !repeated.firstChild,'repeated-fragment-final-order');
+            require(insertionVisits.join(',')==='b,a' && main.lastChild.id==='a' && !repeated.firstChild,'repeated-fragment-final-order');
             orderedTemplate.innerHTML='<x-ordered-birth id="c"></x-ordered-birth><x-ordered-birth id="d"></x-ordered-birth>';
             var mixed=orderedTemplate.content, explicitC=mixed.firstChild;
             main.append(mixed,explicitC);
-            require(insertionVisits.join(',')==='a,b,d,c' && main.lastChild.id==='c' && !mixed.firstChild,'mixed-fragment-child-final-order');
+            require(insertionVisits.join(',')==='b,a,d,c' && main.lastChild.id==='c' && !mixed.firstChild,'mixed-fragment-child-final-order');
             var ownerConstructions=0;
             class OwnerBirth extends HTMLElement {constructor(){super();ownerConstructions++}}
             customElements.define('x-owner-birth',OwnerBirth);

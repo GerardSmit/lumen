@@ -28,7 +28,7 @@ pub(in crate::precompiled) fn entry_body(body: &[Stmt], source: &str) -> Result<
                         .filter_map(|index| tokens.get(index))
                         .find_map(|token| {
                             matches!(&token.kind,
-                        crate::token::Tok::Str(value) if value.as_ref() == import.source.as_ref())
+                        crate::token::Tok::Str(value) if value.as_str() == &*import.source)
                             .then_some(token.start)
                         })
                         .unwrap_or(0);

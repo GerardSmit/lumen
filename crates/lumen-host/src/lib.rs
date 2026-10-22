@@ -1149,6 +1149,11 @@ impl TaskRegistry {
     pub fn has_ref_pending(&self) -> bool {
         self.map.len() > self.unref_count
     }
+    /// Whether any ref'd one-shot task is pending: work in flight that will complete by itself.
+    /// Stream entries (mailbox listeners) only wake when another agent sends something.
+    pub fn has_oneshot_ref_pending(&self) -> bool {
+        self.map.values().any(|e| !e.persistent && !e.unref)
+    }
 }
 
 /// Register native I/O with its admitting async context. Raw callbacks, decoders and promise

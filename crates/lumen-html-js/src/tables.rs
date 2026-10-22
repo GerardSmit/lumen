@@ -9,7 +9,7 @@ pub(crate) fn node_at(realm: &Rc<DomRealm>, id: NodeId) -> DomNode {
 
 fn create(node: &DomNode, ctx: &mut Ctx, local: &str) -> OpResult<Value> {
     let owner = node.realm.session.borrow().document().node_document(node.id).map_err(dom_error)?;
-    let document = DomDocument { base: node_at(&node.realm, owner), realm: node.realm.clone(), fonts: RefCell::new(None) };
+    let document = DomDocument { base: node_at(&node.realm, owner), realm: node.realm.clone(), fonts: RefCell::new(None), editing: RefCell::new(None) };
     document.create_element_ns(ctx, Some("http://www.w3.org/1999/xhtml"), local, None)
 }
 

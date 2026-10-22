@@ -1319,7 +1319,7 @@ impl UnitData {
             .lines
             .clone()
             .map(|b| std::rc::Rc::new(crate::interpreter::stack_trace::LineTable::lazy(b)));
-        crate::interpreter::stack_trace::note_parsed_source(unit.src.clone(), table);
+        crate::interpreter::stack_trace::note_parsed_source(unit.src.clone().into(), table);
         Ok(unit)
     }
 }

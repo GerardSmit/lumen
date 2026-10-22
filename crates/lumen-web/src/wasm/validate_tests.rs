@@ -360,3 +360,67 @@ fn mutated_modules_never_panic() {
         "too few mutants decoded ({decoded}) to be meaningful"
     );
 }
+
+mod simd {
+    use super::*;
+    use crate::wasm::test_util::{V128, i32x4, seq, simd};
+
+    fn with_memory(results: &[u8], code: &[u8]) -> Vec<u8> {
+        t::funcs(&[(&[], results, code)], true)
+    }
+
+    #[test]
+    fn lane_indices_must_be_in_range() {
+        let extract = |op: u32, lane: u8| seq(&[i32x4([0; 4]), simd(op, &[lane])]);
+        ok(&t::func(&[], &[I32], &extract(0x15, 15)));
+        invalid(&t::func(&[], &[I32], &extract(0x15, 16)));
+        ok(&t::func(&[], &[I32], &extract(0x1b, 3)));
+        invalid(&t::func(&[], &[I32], &extract(0x1b, 4)));
+        ok(&t::func(&[], &[I64], &extract(0x1d, 1)));
+        invalid(&t::func(&[], &[I64], &extract(0x1d, 2)));
+        let replace = |lane: u8| seq(&[i32x4([0; 4]), vec![0x41, 0], simd(0x1c, &[lane])]);
+        ok(&t::func(&[], &[V128], &replace(3)));
+        invalid(&t::func(&[], &[V128], &replace(4)));
+    }
+
+    #[test]
+    fn shuffle_selectors_address_two_vectors() {
+        let shuffle = |top: u8| {
+            let mut sel = [0u8; 16];
+            sel[15] = top;
+            seq(&[i32x4([0; 4]), i32x4([0; 4]), simd(0x0d, &sel)])
+        };
+        ok(&t::func(&[], &[V128], &shuffle(31)));
+        invalid(&t::func(&[], &[V128], &shuffle(32)));
+    }
+
+    #[test]
+    fn memory_alignment_may_not_exceed_the_natural_alignment() {
+        let load = |op: u32, align: u8| seq(&[vec![0x41, 0], simd(op, &[align, 0])]);
+        ok(&with_memory(&[V128], &load(0x00, 4)));
+        invalid(&with_memory(&[V128], &load(0x00, 5)));
+        ok(&with_memory(&[V128], &load(0x07, 0)));
+        invalid(&with_memory(&[V128], &load(0x07, 1)));
+        ok(&with_memory(&[V128], &load(0x01, 3)));
+        invalid(&with_memory(&[V128], &load(0x01, 4)));
+        let lane = |align: u8, lane: u8| {
+            seq(&[vec![0x41, 0], i32x4([0; 4]), simd(0x56, &[align, 0, lane])])
+        };
+        ok(&with_memory(&[V128], &lane(2, 3)));
+        invalid(&with_memory(&[V128], &lane(3, 3)));
+        invalid(&with_memory(&[V128], &lane(2, 4)));
+        invalid(&t::func(&[], &[V128], &lane(2, 0)));
+    }
+
+    #[test]
+    fn vector_operands_are_type_checked() {
+        let add = seq(&[i32x4([1; 4]), i32x4([2; 4]), simd(0xae, &[])]);
+        ok(&t::func(&[], &[V128], &add));
+        invalid(&t::func(&[], &[I32], &add));
+        invalid(&t::func(&[], &[V128], &seq(&[i32x4([1; 4]), vec![0x41, 2], simd(0xae, &[])])));
+        invalid(&t::func(&[], &[V128], &seq(&[i32x4([1; 4]), simd(0xa2, &[])])));
+        // Relaxed SIMD opcodes are not part of this engine.
+        invalid(&t::func(&[], &[V128], &seq(&[i32x4([1; 4]), simd(0x100, &[])])));
+        ok(&t::func(&[V128, V128], &[V128], &[0x20, 0, 0x20, 1, 0xfd, 0xae, 0x01]));
+    }
+}

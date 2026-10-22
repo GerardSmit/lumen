@@ -20,6 +20,8 @@ pub enum Val {
     F32(f32),
     F64(f64),
     Ref(Option<u32>), // funcref/externref: a function index or null
+    /// A `v128` as its low and high 64 bits (24-byte values keep the scalar stack compact).
+    V128([u64; 2]),
 }
 
 impl Val {
@@ -47,6 +49,15 @@ impl Val {
             _ => 0.0,
         }
     }
+    pub fn v128(self) -> u128 {
+        match self {
+            Val::V128([lo, hi]) => lo as u128 | (hi as u128) << 64,
+            _ => 0,
+        }
+    }
+    pub fn from_v128(v: u128) -> Val {
+        Val::V128([v as u64, (v >> 64) as u64])
+    }
     /// Raw bits as native code stores them: integers and floats zero-extended to 64 bits,
     /// references as their index (`u64::MAX` for null).
     pub fn to_bits(self) -> u64 {
@@ -56,6 +67,7 @@ impl Val {
             Val::F32(v) => v.to_bits() as u64,
             Val::F64(v) => v.to_bits(),
             Val::Ref(r) => r.map_or(u64::MAX, |i| i as u64),
+            Val::V128([lo, _]) => lo,
         }
     }
     pub fn from_bits(t: ValType, b: u64) -> Val {
@@ -64,7 +76,10 @@ impl Val {
             ValType::I64 => Val::I64(b as i64),
             ValType::F32 => Val::F32(f32::from_bits(b as u32)),
             ValType::F64 => Val::F64(f64::from_bits(b)),
-            ValType::FuncRef | ValType::ExternRef => Val::Ref((b != u64::MAX).then_some(b as u32)),
+            ValType::V128 => Val::V128([b, 0]),
+            ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::EqRef => {
+                Val::Ref((b != u64::MAX).then_some(b as u32))
+            }
         }
     }
     pub fn ty(self) -> ValType {
@@ -74,6 +89,7 @@ impl Val {
             Val::F32(_) => ValType::F32,
             Val::F64(_) => ValType::F64,
             Val::Ref(_) => ValType::FuncRef,
+            Val::V128(_) => ValType::V128,
         }
     }
     pub fn default_for(t: ValType) -> Val {
@@ -82,7 +98,8 @@ impl Val {
             ValType::I64 => Val::I64(0),
             ValType::F32 => Val::F32(0.0),
             ValType::F64 => Val::F64(0.0),
-            ValType::FuncRef | ValType::ExternRef => Val::Ref(None),
+            ValType::V128 => Val::V128([0, 0]),
+            ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::EqRef => Val::Ref(None),
         }
     }
 }
@@ -284,7 +301,7 @@ impl std::ops::DerefMut for LinearMem {
 /// tiers see one copy.
 pub struct GlobalEntity {
     ty: ValType,
-    cell: Box<std::cell::UnsafeCell<u64>>,
+    cell: Box<std::cell::UnsafeCell<[u64; 2]>>,
     pub mutable: bool,
 }
 
@@ -292,23 +309,40 @@ impl GlobalEntity {
     pub fn new(val: Val, mutable: bool) -> GlobalEntity {
         GlobalEntity {
             ty: val.ty(),
-            cell: Box::new(std::cell::UnsafeCell::new(val.to_bits())),
+            cell: Box::new(std::cell::UnsafeCell::new(match val {
+                Val::V128(lanes) => lanes,
+                other => [other.to_bits(), 0],
+            })),
             mutable,
         }
     }
     pub fn get(&self) -> Val {
-        Val::from_bits(self.ty, unsafe { *self.cell.get() })
+        let [lo, hi] = unsafe { *self.cell.get() };
+        match self.ty {
+            ValType::V128 => Val::V128([lo, hi]),
+            ty => Val::from_bits(ty, lo),
+        }
     }
     pub fn set(&mut self, v: Val) {
-        *self.cell.get_mut() = v.to_bits();
+        *self.cell.get_mut() = match v {
+            Val::V128(lanes) => lanes,
+            other => [other.to_bits(), 0],
+        };
     }
     pub fn ty(&self) -> ValType {
         self.ty
     }
     /// The cell's stable address.
     pub fn cell(&self) -> *mut u64 {
-        self.cell.get()
+        self.cell.get().cast()
     }
+}
+
+/// A resolved function import: a host callback, or a function already in the store (an exported
+/// wasm function, which is called directly rather than through the host).
+pub enum FuncImport {
+    Host(usize, FuncType),
+    Store(usize),
 }
 
 /// Import values resolved by the op layer, as store addresses (for memory/table/globals — whether
@@ -316,7 +350,7 @@ impl GlobalEntity {
 /// imported JS functions). In module-import order per kind.
 #[derive(Default)]
 pub struct Imports {
-    pub funcs: Vec<(usize, FuncType)>,
+    pub funcs: Vec<FuncImport>,
     pub mem_addr: Option<usize>,
     pub table_addr: Option<usize>,
     pub global_addrs: Vec<usize>,
@@ -424,7 +458,7 @@ fn imm<const N: usize>(code: &[u8], ip: &mut usize) -> Result<[u8; N], String> {
 
 fn skip_blocktype(code: &[u8], ip: &mut usize) -> Result<(), String> {
     let b = *code.get(*ip).ok_or("wasm: truncated blocktype")?;
-    if b == 0x40 || matches!(b, 0x7f | 0x7e | 0x7d | 0x7c | 0x70 | 0x6f) {
+    if b == 0x40 || matches!(b, 0x7f | 0x7e | 0x7d | 0x7c | 0x7b | 0x70 | 0x6f | 0x6e | 0x6d) {
         *ip += 1;
     } else {
         // s33 type index (signed LEB)
@@ -433,7 +467,7 @@ fn skip_blocktype(code: &[u8], ip: &mut usize) -> Result<(), String> {
     Ok(())
 }
 
-fn read_uleb(code: &[u8], ip: &mut usize) -> Result<u64, String> {
+pub(super) fn read_uleb(code: &[u8], ip: &mut usize) -> Result<u64, String> {
     let mut result = 0u64;
     let mut shift = 0;
     loop {
@@ -530,6 +564,7 @@ fn skip_immediates(code: &[u8], op: u8, ip: &mut usize) -> Result<(), String> {
             *ip += 1; // memory.size / memory.grow (reserved byte)
             Ok(())
         }
+        0xfd => super::simd::skip_immediates(code, ip),
         0xfc => {
             let sub = read_uleb(code, ip)?;
             match sub {
@@ -845,6 +880,7 @@ impl Store {
                 0xfc => {
                     self.op_fc(mem_addr, code, &mut ip, &mut stack)?;
                 }
+                0xfd => self.op_simd(mem_addr, code, &mut ip, &mut stack)?,
                 _ => numeric(op, &mut stack)?,
             }
         }
@@ -942,10 +978,24 @@ impl Store {
         let mut imp_globals = imports.global_addrs.into_iter();
         for imp in &module.imports {
             match &imp.kind {
-                crate::wasm::ImportKind::Func(_) => {
-                    let (id, ty) = host_funcs.next().ok_or("wasm: missing function import")?;
-                    self.funcs.push(FuncEntity::Host { id, ty });
-                    func_addrs.push(self.funcs.len() - 1);
+                crate::wasm::ImportKind::Func(type_index) => {
+                    match host_funcs.next().ok_or("wasm: missing function import")? {
+                        FuncImport::Host(id, ty) => {
+                            self.funcs.push(FuncEntity::Host { id, ty });
+                            func_addrs.push(self.funcs.len() - 1);
+                        }
+                        FuncImport::Store(addr) => {
+                            let actual = self.funcs.get(addr).ok_or("wasm: bad function import")?;
+                            let expected = module
+                                .types
+                                .get(*type_index as usize)
+                                .ok_or("wasm: bad type index")?;
+                            if !same_type(expected, &actual.ty()) {
+                                return Err("wasm: imported function type mismatch".into());
+                            }
+                            func_addrs.push(addr);
+                        }
+                    }
                 }
                 crate::wasm::ImportKind::Table(_) => {
                     let a = imports.table_addr.ok_or("wasm: missing table import")?;
@@ -1103,7 +1153,7 @@ impl Store {
         Some((e.kind, addr))
     }
 
-    fn mem_effective_addr(
+    pub(super) fn mem_effective_addr(
         mem_len: usize,
         code: &[u8],
         ip: &mut usize,
@@ -1311,7 +1361,7 @@ fn block_arity(module: &Module, code: &[u8], ip: &mut usize) -> Result<(usize, u
     if b == 0x40 {
         *ip += 1;
         Ok((0, 0))
-    } else if matches!(b, 0x7f | 0x7e | 0x7d | 0x7c | 0x70 | 0x6f) {
+    } else if matches!(b, 0x7f | 0x7e | 0x7d | 0x7c | 0x7b | 0x70 | 0x6f | 0x6e | 0x6d) {
         *ip += 1;
         Ok((0, 1))
     } else {
@@ -1325,7 +1375,7 @@ fn same_type(a: &FuncType, b: &FuncType) -> bool {
     a.params == b.params && a.results == b.results
 }
 
-fn sat_i32(v: f64) -> i32 {
+pub(super) fn sat_i32(v: f64) -> i32 {
     if v.is_nan() {
         0
     } else if v <= i32::MIN as f64 {
@@ -1336,7 +1386,7 @@ fn sat_i32(v: f64) -> i32 {
         v as i32
     }
 }
-fn sat_u32(v: f64) -> u32 {
+pub(super) fn sat_u32(v: f64) -> u32 {
     if v.is_nan() || v <= 0.0 {
         0
     } else if v >= u32::MAX as f64 {
@@ -1588,7 +1638,7 @@ fn conv(stack: &mut Vec<Val>, f: impl Fn(Val) -> Val) -> Result<(), String> {
     Ok(())
 }
 
-fn pop(stack: &mut Vec<Val>) -> Result<Val, String> {
+pub(super) fn pop(stack: &mut Vec<Val>) -> Result<Val, String> {
     stack
         .pop()
         .ok_or_else(|| "wasm: operand stack underflow".into())
@@ -1598,7 +1648,7 @@ fn pop(stack: &mut Vec<Val>) -> Result<Val, String> {
 // and leave the sign of zero unspecified).
 macro_rules! wasm_minmax {
     ($name:ident, $t:ty, $min:expr) => {
-        fn $name(a: $t, b: $t) -> $t {
+        pub(super) fn $name(a: $t, b: $t) -> $t {
             if a.is_nan() || b.is_nan() {
                 <$t>::NAN
             } else if a == b {
@@ -1617,10 +1667,10 @@ wasm_minmax!(wasm_min_f64, f64, true);
 wasm_minmax!(wasm_max_f64, f64, false);
 
 // Ties-to-even rounding that keeps the sign of zero (`nearest(-0.5)` is -0.0).
-fn round_ties_even_f32(a: f32) -> f32 {
+pub(super) fn round_ties_even_f32(a: f32) -> f32 {
     a.round_ties_even()
 }
-fn round_ties_even_f64(a: f64) -> f64 {
+pub(super) fn round_ties_even_f64(a: f64) -> f64 {
     a.round_ties_even()
 }
 
@@ -1703,6 +1753,12 @@ pub fn eval_const_expr(code: &[u8], globals: &[Val]) -> Result<Val, String> {
             }
             0x44 => {
                 result = Val::F64(f64::from_le_bytes(imm(code, &mut ip)?));
+            }
+            0xfd => {
+                if read_uleb(code, &mut ip)? != super::simd::V128_CONST as u64 {
+                    return Err("wasm: bad const expr vector opcode".into());
+                }
+                result = Val::from_v128(u128::from_le_bytes(imm(code, &mut ip)?));
             }
             0x23 => {
                 let g = read_uleb(code, &mut ip)? as usize;

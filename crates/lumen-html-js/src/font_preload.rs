@@ -1,5 +1,7 @@
-//! Font preload fetches use the normal asynchronous transport. They do not
-//! create a FontFace: successful preload means the resource bytes were fetched.
+//! Font and image preload fetches use the normal asynchronous transport. They do
+//! not create a FontFace or decode an image: successful preload means the
+//! resource bytes were fetched, which is what the link element's load event
+//! reports. Only font bytes are retained for later FontFace use.
 use super::*;
 use lumen_host::net::{self, Credentials, Mode, Redirect, RequestControl, RequestSpec};
 use lumen_common::csp::{Destination, PolicySet};
@@ -11,7 +13,7 @@ const MAX_ACTIVE:usize=1;
 const MAX_CACHED_BYTES:usize=16*1024*1024;
 
 #[derive(Clone,PartialEq,Eq,Hash)]
-struct Selection {url:String,crossorigin:Option<String>,integrity:String}
+struct Selection {url:String,crossorigin:Option<String>,integrity:String,destination:Destination}
 struct Entry {selection:Selection,generation:u64,control:Option<RequestControl>,body:Option<net::ResourceBodyControl>,root:Option<ResourceRequestRoot>}
 struct Cached {bytes:Arc<[u8]>,url:String,redirected:bool}
 pub(crate) struct State {
@@ -145,14 +147,19 @@ fn select(document:&lumen_html::Document,node:NodeId,base:Option<&lumen_common::
         || !script_loading::is_connected(document,node){return Ok(None)}
     let attr=|name|document.get_attribute_ns_ref(node,None,name).ok().flatten();
     if !attr("rel").unwrap_or("").split_ascii_whitespace().any(|token|token.eq_ignore_ascii_case("preload"))
-        || !attr("as").unwrap_or("").eq_ignore_ascii_case("font"){return Ok(None)}
+    {return Ok(None)}
+    let destination=match attr("as").unwrap_or("") {
+        value if value.eq_ignore_ascii_case("font")=>Destination::Font,
+        value if value.eq_ignore_ascii_case("image")=>Destination::Image,
+        _=>return Ok(None),
+    };
     let Some(href)=attr("href").filter(|href|!href.is_empty())else{return Ok(None)};
     if href.len()>8192{return Err(OpError::new("QuotaExceededError","Font preload URL exceeds bounds"))}
     let Some(mut url)=lumen_common::url::parse_url(href,base)else{return Ok(None)};url.set_hash("");
     let crossorigin=attr("crossorigin").map(|value|if value.eq_ignore_ascii_case("use-credentials"){"use-credentials".to_owned()}else{String::new()});
     let integrity=attr("integrity").unwrap_or("").to_owned();
     if integrity.len()>8192{return Err(OpError::new("QuotaExceededError","Font preload integrity exceeds bounds"))}
-    Ok(Some(Selection{url:url.href(),crossorigin,integrity}))
+    Ok(Some(Selection{url:url.href(),crossorigin,integrity,destination}))
 }
 
 pub(crate) fn pump(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<usize> {
@@ -191,10 +198,10 @@ pub(crate) fn pump(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<usize> {
         count+=1;
         let policies:Arc<PolicySet>=realm.module_fetch_policy_snapshot()?;
         let document_url=realm.document_url().unwrap_or_else(||"about:blank".into());
-        let weak=Rc::downgrade(realm);let original=selection.url.clone();
+        let weak=Rc::downgrade(realm);let original=selection.url.clone();let destination=selection.destination;
         let policy={let policies=policies.clone();let document_url=document_url.clone();Rc::new(move|ctx:&mut Ctx,url:&str,redirected:bool|{
             let Some(realm)=weak.upgrade()else{return false};
-            report_decision(ctx,&realm,policies.check_resource_redirect(&original,url,&document_url,Destination::Font,"","",false,u32::from(redirected)),node)
+            report_decision(ctx,&realm,policies.check_resource_redirect(&original,url,&document_url,destination,"","",false,u32::from(redirected)),node)
         })};
         let (mode,credentials)=match selection.crossorigin.as_deref() {
             None=>(Mode::NoCors,Credentials::Include),
@@ -205,11 +212,11 @@ pub(crate) fn pump(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<usize> {
         let weak=Rc::downgrade(realm);let original=selection.url.clone();
         let control=net::start_resource(ctx,&document_url.clone(),spec,policy,move|ctx,result|{
             let Some(realm)=weak.upgrade()else{if let Ok(response)=result {response.body.cancel(ctx);}return};
-            let Ok(response)=result else{cache_result(&realm,selection,Err("Font preload network failure".into()),String::new(),false);complete(ctx,weak,node,generation,false);return};
+            let Ok(response)=result else{if destination==Destination::Font{cache_result(&realm,selection,Err("Font preload network failure".into()),String::new(),false);}complete(ctx,weak,node,generation,false);return};
             let current=realm.font_preloads.entries.borrow().get(&node).is_some_and(|entry|entry.generation==generation);
             if !current {response.body.cancel(ctx);return}
-            let allowed=report_decision(ctx,&realm,policies.check_resource_response(&original,&response.url,&document_url,Destination::Font,"","",false,u32::from(response.redirected)),node);
-            if !allowed {response.body.cancel(ctx);cache_result(&realm,selection,Err("Font preload blocked by document policy".into()),String::new(),false);complete(ctx,weak,node,generation,false);return}
+            let allowed=report_decision(ctx,&realm,policies.check_resource_response(&original,&response.url,&document_url,destination,"","",false,u32::from(response.redirected)),node);
+            if !allowed {response.body.cancel(ctx);if destination==Destination::Font{cache_result(&realm,selection,Err("Font preload blocked by document policy".into()),String::new(),false);}complete(ctx,weak,node,generation,false);return}
             let integrity_eligible=response.kind!=net::ResponseKind::Opaque || selection.integrity.is_empty();
             let final_url=response.url;let redirected=response.redirected;
             let body_weak=weak.clone();
@@ -221,7 +228,7 @@ pub(crate) fn pump(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<usize> {
                     Ok(_)=>Err("Font preload integrity verification failed".into()),
                     Err(_)=>Err("Font preload response body failed".into()),
                 };
-                let success=cache_result(&realm,selection,result,final_url,redirected);complete(ctx,weak,node,generation,success);
+                let success=if destination==Destination::Font{cache_result(&realm,selection,result,final_url,redirected)}else{result.is_ok()};complete(ctx,weak,node,generation,success);
             });
             if let Some(realm)=body_weak.upgrade() {
                 if let Some(entry)=realm.font_preloads.entries.borrow_mut().get_mut(&node) {
@@ -276,6 +283,31 @@ mod tests {
         assert!(matches!(verdict,Ok(Ok(Value::Bool(true)))),"{details}");
         drain(&mut runtime,&realm);
         assert!(matches!(runtime.engine().eval_value("events.length===4 && requests.length===3"),Ok(Ok(Value::Bool(true)))));
+    }
+    #[test]
+    fn image_preloads_fetch_without_caching_and_dispatch_load_and_error() {
+        let mut runtime=lumen_runtime::Runtime::new_browser();
+        let realm=crate::install(runtime.engine().ctx(),"<head></head><body></body>",256).unwrap();
+        realm.set_document_url("https://example.test/page");
+        let transport=runtime.engine().eval_value(r#"globalThis.requests=[];globalThis.events=[];
+          ({request(method,url,headers,body,resolve,reject,redirect,options){
+            requests.push(url);
+            if(url.endsWith('/missing.png'))reject(new Error('network'));
+            else resolve({status:200,url,headers:[],body:new Uint8Array([1,2,3])});
+            return {abort(){}};
+          }})"#).unwrap().ok().expect("transport");
+        net::Transport::install(runtime.engine().ctx(),transport,Value::Undefined,Value::Undefined).unwrap();
+        assert!(matches!(runtime.engine().eval_value(r#"
+          for (const id of ['ok','missing']) {
+            let link=document.createElement('link');link.id=id;link.rel='preload';link.as='image';link.href='https://example.test/'+id+'.png';
+            link.onload=()=>events.push(id+':load');link.onerror=()=>events.push(id+':error');document.head.append(link);
+          }
+          true
+        "#),Ok(Ok(Value::Bool(true)))));
+        drain(&mut runtime,&realm);
+        let verdict=runtime.engine().eval_value("events.includes('ok:load') && events.includes('missing:error') && events.length===2");
+        assert!(matches!(verdict,Ok(Ok(Value::Bool(true)))));
+        assert!(realm.font_preloads.cache.borrow().is_empty());
     }
     #[test]
     fn internal_resource_body_budget_cancels_before_unbounded_accumulation() {

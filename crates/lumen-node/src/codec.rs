@@ -20,6 +20,7 @@ pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
 use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, Spelling};
+use lumen::embed::Value;
 use lumen_common::utf;
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -262,6 +263,16 @@ pub fn decode(bytes: &[u8], enc: u32) -> String {
         UTF16LE => utf16le_decode(bytes),
         _ => utf8_decode(bytes),
     }
+}
+
+/// [`decode`] as an engine string, copying valid UTF-8 straight into it.
+pub fn decode_value(bytes: &[u8], enc: u32) -> Value {
+    if !matches!(enc, LATIN1 | ASCII | HEX | BASE64 | BASE64URL | UTF16LE) {
+        if let Some(text) = Value::from_valid_utf8(bytes) {
+            return text;
+        }
+    }
+    Value::from_string(decode(bytes, enc))
 }
 
 pub fn byte_length(s: &str, enc: u32) -> usize {

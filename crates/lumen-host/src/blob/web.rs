@@ -242,6 +242,9 @@ fn decode_text(bytes: &[u8]) -> OpResult<Value> {
             "decoded text exceeds the host resource limit",
         ));
     }
+    if let Some(text) = Value::from_valid_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)) {
+        return Ok(text);
+    }
     let mut decoder = TextDecoder::new("utf-8", false, false)
         .map_err(|_: DecodeError| OpError::type_error("UTF-8 decoding is unavailable"))?;
     let text = decoder

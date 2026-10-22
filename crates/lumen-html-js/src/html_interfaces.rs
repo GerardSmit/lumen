@@ -450,7 +450,7 @@ define_plain_html_interfaces! {
         fn src(&self) -> OpResult<String> {
             let node=&self.base.base.base;
             let Some(value)=node.get_null_attribute("src")? else{return Ok(String::new())};
-            Ok(lumen_common::url::parse(&value,Some(&node.realm.base_url())).map(|url|url.href()).unwrap_or(value))
+            Ok(node.realm.parse_document_url(&value).map(|url|url.href()).unwrap_or(value))
         }
         #[setter(hint(js(ce_reactions)))]
         fn set_src(&self,#[default(lumen_host::webidl::Usv(String::from("undefined")))] value:lumen_host::webidl::Usv)->OpResult<()> {
@@ -895,7 +895,7 @@ define_plain_html_interfaces! {
         fn data(&self) -> OpResult<String> {
             let node = &self.base.base.base;
             let Some(value) = node.get_null_attribute("data")? else { return Ok(String::new()); };
-            Ok(lumen_common::url::parse(&value, Some(&node.realm.base_url()))
+            Ok(node.realm.parse_document_url(&value)
                 .map(|url| url.href()).unwrap_or(value))
         }
         #[setter(hint(js(ce_reactions)))]
@@ -1186,7 +1186,7 @@ pub(super) fn reflected_keyword(node: &DomNode, attribute: &str, keywords: &[&st
 pub(super) fn reflected_url_value(node:&DomNode,attribute:&str)->OpResult<String> {
     let Some(value)=node.get_null_attribute(attribute)? else{return Ok(String::new());};
     let (owner,_)=node.realm.resolve_adopted_node(node.id);
-    Ok(lumen_common::url::parse(&value,Some(&owner.base_url())).map(|url|url.href()).unwrap_or(value))
+    Ok(owner.parse_document_url(&value).map(|url|url.href()).unwrap_or(value))
 }
 
 pub(super) fn reflected_usv_value(node:&DomNode,attribute:&str)->OpResult<String> {
@@ -1201,7 +1201,7 @@ pub(super) fn reflected_usv_url_value(node:&DomNode,attribute:&str)->OpResult<St
     let Some(value)=node.get_null_attribute(attribute)? else{return Ok(String::new());};
     let value=lumen::well_formed_utf8(&value);
     let (owner,_)=node.realm.resolve_adopted_node(node.id);
-    Ok(lumen_common::url::parse(&value,Some(&owner.base_url())).map(|url|url.href()).unwrap_or_else(|_|value.into_owned()))
+    Ok(owner.parse_document_url(&value).map(|url|url.href()).unwrap_or_else(|_|value.into_owned()))
 }
 
 pub(crate) fn form_action_value(node: &DomNode) -> OpResult<String> {
@@ -1221,8 +1221,7 @@ pub(crate) fn action_attribute_value(node: &DomNode, attribute: &str) -> OpResul
             .unwrap_or_else(|| "about:blank".into()));
     }
     let action = lumen::well_formed_utf8(&action);
-    let base = owner.base_url();
-    Ok(lumen_common::url::parse(&action, Some(&base))
+    Ok(owner.parse_document_url(&action)
         .map(|url| url.href())
         .unwrap_or_else(|_| action.into_owned()))
 }
@@ -1676,14 +1675,14 @@ mod tests {
                     inside.formAction = 'http://[bad';
                     check(inside.formAction === 'http://[bad', 'invalid-action-retains-content');
 
-                    check(button.formMethod === 'post' && inside.formMethod === 'get', 'method-default-and-normalization');
+                    check(button.formMethod === 'post' && inside.formMethod === '', 'method-default-and-normalization');
                     button.formMethod = 'dialog';
                     check(button.getAttribute('formmethod') === 'dialog' && button.formMethod === 'dialog',
                         'method-reflection');
                     inside.setAttribute('formmethod', 'unknown');
                     check(inside.formMethod === 'get', 'invalid-method-default');
                     check(button.formEnctype === 'multipart/form-data' &&
-                        inside.formEnctype === 'application/x-www-form-urlencoded', 'enctype-default-and-reflection');
+                        inside.formEnctype === '', 'enctype-default-and-reflection');
                     inside.formEnctype = 'text/plain';
                     check(inside.getAttribute('formenctype') === 'text/plain' && inside.formEnctype === 'text/plain',
                         'enctype-setter');

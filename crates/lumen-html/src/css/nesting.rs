@@ -82,6 +82,22 @@ pub fn source_rule_ranges(
     text: &str,
     inside_style: bool,
 ) -> Result<Vec<SourceRuleRange>, CssError> {
+    scan_source_rules(text, inside_style, false).map(|(ranges, _)| ranges)
+}
+
+/// `source_rule_ranges` for the body of an enclosing block whose text runs on
+/// past the block: stops at the first unmatched `}` and returns its offset.
+pub fn source_rule_ranges_until_close(
+    text: &str,
+) -> Result<(Vec<SourceRuleRange>, Option<usize>), CssError> {
+    scan_source_rules(text, false, true)
+}
+
+fn scan_source_rules(
+    text: &str,
+    inside_style: bool,
+    stop_at_close: bool,
+) -> Result<(Vec<SourceRuleRange>, Option<usize>), CssError> {
     if text.len() > MAX_CSS_BYTES {
         return Err(error(0, "CSS input too large"));
     }
@@ -131,14 +147,19 @@ pub fn source_rule_ranges(
                 position += (end + 1).min(rest.len());
                 result.push((start, position, None, None));
             }
-            Some(RuleBoundary::Discard(end)) => position += end,
+            Some(RuleBoundary::Discard(end)) => {
+                if stop_at_close {
+                    return Ok((result, Some(start + end - 1)));
+                }
+                position += end;
+            }
             None => break,
         }
         if result.len() > item_limit {
             return Err(error(start, "too many CSS source items"));
         }
     }
-    Ok(result)
+    Ok((result, None))
 }
 
 fn declaration_end(input:&str)->Result<Option<usize>,CssError> {
@@ -273,7 +294,7 @@ pub fn parse_source_rules(
     let namespaces=NamespaceMap::from_stylesheet(text)?;
     let mut parent = None;
     for selector in parent_context { parent = Some(resolve_selectors(selector, 0, parent.as_ref(), &namespaces)?); }
-    parse_body(text, 0, parent.as_ref(), false, strict, 0, &mut 0, false, &namespaces)
+    parse_body(text, 0, parent.as_ref(), false, strict, 0, &mut 0, false, &namespaces, None)
 }
 
 pub fn parse_source_rules_in_context(text:&str,parent_context:&[NestingContext<'_>],strict:bool)->Result<Vec<SourceRule>,CssError> {
@@ -282,6 +303,12 @@ pub fn parse_source_rules_in_context(text:&str,parent_context:&[NestingContext<'
 }
 
 fn parse_source_rules_in_namespace_context(text: &str, parent_context: &[NestingContext<'_>], strict: bool, namespaces: &NamespaceMap) -> Result<Vec<SourceRule>, CssError> {
+    parse_source_rules_with_top(text, parent_context, strict, namespaces, None)
+}
+
+/// `top` is `source_rule_ranges(text, false)` when the caller already scanned
+/// the top level; it only applies without a parent context.
+fn parse_source_rules_with_top(text: &str, parent_context: &[NestingContext<'_>], strict: bool, namespaces: &NamespaceMap, top: Option<Vec<SourceRuleRange>>) -> Result<Vec<SourceRule>, CssError> {
     if text.len() > MAX_CSS_BYTES || parent_context.len() >= 32 {
         return Err(error(0, "CSS rule nesting limit"));
     }
@@ -296,7 +323,8 @@ fn parse_source_rules_in_namespace_context(text: &str, parent_context: &[Nesting
         });
     }
     let mut count = 0;
-    parse_body(text, 0, parent.as_ref(), false, strict, 0, &mut count, starting_context, namespaces)
+    let top = top.filter(|_| parent.is_none());
+    parse_body(text, 0, parent.as_ref(), false, strict, 0, &mut count, starting_context, namespaces, top)
 }
 
 /// Sparse live CSSOM topology that serialization alone cannot preserve.
@@ -324,6 +352,17 @@ pub fn parse_source_rules_with_boundaries_in_namespace_context(
     boundaries:&[DeclarationBoundary],namespaces:&NamespaceMap,
 )->Result<Vec<SourceRule>,CssError> {
     parse_with_boundaries(text,boundaries,||parse_source_rules_in_namespace_context(text,parent_context,strict,namespaces))
+}
+
+/// Top-level parse of a stylesheet whose top-level ranges were already
+/// scanned (for its namespace map).
+pub fn parse_stylesheet_source_rules_with_boundaries(
+    text: &str,
+    boundaries: &[DeclarationBoundary],
+    namespaces: &NamespaceMap,
+    top: Vec<SourceRuleRange>,
+) -> Result<Vec<SourceRule>, CssError> {
+    parse_with_boundaries(text, boundaries, || parse_source_rules_with_top(text, &[], false, namespaces, Some(top)))
 }
 
 pub fn parse_source_rules_with_boundaries_in_context(
@@ -681,13 +720,18 @@ fn parse_body(
     count: &mut usize,
     starting_context: bool,
     namespaces: &NamespaceMap,
+    top: Option<Vec<SourceRuleRange>>,
 ) -> Result<Vec<SourceRule>, CssError> {
     if depth >= 32 && !style_body {
         return Err(error(base, "CSS rule nesting limit"));
     }
     let mut output = Vec::new();
     let mut pending = Vec::new();
-    for (start, end, open, close) in source_rule_ranges(&text[base..], parent.is_some())? {
+    let ranges = match top {
+        Some(ranges) => ranges,
+        None => source_rule_ranges(&text[base..], parent.is_some())?,
+    };
+    for (start, end, open, close) in ranges {
         // This function is called with a bounded body slice below; translating
         // its ranges once avoids rescanning ancestors for source-path lookup.
         let start = base + start;
@@ -849,6 +893,7 @@ fn parse_body(
                     count,
                     starting_context || at_rule(prelude, "@starting-style"),
                     namespaces,
+                    None,
                 )?;
                 if kind == SourceRuleKind::Style
                     && node
@@ -1856,10 +1901,23 @@ mod tests {
             "@media screen {".repeat(33),
             "}".repeat(33)
         );
-        assert_eq!(parse(&deep).unwrap_err().message, "CSS rule nesting limit");
+        assert_eq!(parse(&deep).unwrap_err().message, "CSS component nesting limit");
         let block =
             DeclarationBlock::parse("color: blue; @media screen { color:red; } color: orange;")
                 .unwrap();
         assert_eq!(block.value("color").unwrap().0, "orange");
+    }
+
+    #[test]
+    fn top_level_ranges_scanned_for_namespaces_are_reused_by_the_source_parse() {
+        let text = "@namespace svg url(urn:x); @layer a, b; .a{color:red} @media screen{.b{width:1px}} svg|rect{fill:red} .c{x:y;.d{z:w}}";
+        let top = source_rule_ranges(text, false).unwrap();
+        let namespaces = NamespaceMap::from_ranges(text, &top);
+        let reused = parse_stylesheet_source_rules_with_boundaries(text, &[], &namespaces, top).unwrap();
+        let fresh = parse_source_rules_with_boundaries_in_namespace_context(
+            text, &[], false, &[], &NamespaceMap::from_stylesheet(text).unwrap(),
+        ).unwrap();
+        assert_eq!(alloc::format!("{reused:?}"), alloc::format!("{fresh:?}"));
+        assert!(!reused.is_empty());
     }
 }

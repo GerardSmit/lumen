@@ -199,6 +199,11 @@ fn local_part(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
+/// Whether `node` is an element hosting a shadow root.
+pub(crate) fn shadow_host(document: &Document, node: NodeId) -> bool {
+    matches!(document.kind(node), Ok(NodeKind::Element { .. })) && document.shadow_root(node).ok().flatten().is_some()
+}
+
 /// Whether `node` is in the document tree, shadow trees included.
 fn connected(document: &Document, node: NodeId) -> bool {
     let mut current = node;
@@ -267,6 +272,14 @@ pub(crate) struct InvalidationSets {
     /// Subject features of the compounds reached through `state` in an
     /// ancestor position, so a state change below narrows its descendant reach.
     state_subjects: Features,
+    /// The part of `state` attribute writes can change: form, top-layer,
+    /// directionality and language state, but not interaction (`:hover`,
+    /// `:focus`), which only `affected_by_state` reaches. `:target` reads the
+    /// id, so it is kept in `target`.
+    attribute_state: u8,
+    attribute_state_subjects: Features,
+    target: u8,
+    target_subjects: Features,
     /// A selector reads `:state()`, which no element-based bound covers.
     custom_states: bool,
     /// Positions of structural pseudo-classes and of compounds reached
@@ -285,7 +298,11 @@ pub(crate) struct InvalidationSets {
     /// Per compound with a key whose match reads its siblings (structural
     /// pseudo-classes, sibling combinators): the key and the compound's
     /// reach. A child list change restyles the children with that key.
-    sibling_keys: Vec<(AnchorKey, u8, SiblingEdge)>,
+    sibling_keys: SiblingKeys,
+    /// Per unkeyed compound after `+` or `~` whose left compound has a key:
+    /// that key and the compound's reach. A child list change restyles the
+    /// children only when the parent has, or loses, a child with the key.
+    following_keys: SiblingKeys,
     /// Positions of unkeyed `:first-child`, `:last-child` and `:only-child`:
     /// a child list change restyles only the first or last two children.
     first_edge: u8,
@@ -299,6 +316,10 @@ pub(crate) struct InvalidationSets {
     /// A subject `:has()` has no key, or there are too many: a change reaches
     /// all its relatives.
     unkeyed_relatives: bool,
+    /// While `add` walks the arguments of `:is()`, `:not()`, `:where()` or
+    /// nesting: the key of the compound holding them, which every element
+    /// the arguments are matched against has.
+    enclosing_key: Option<AnchorKey>,
 }
 
 /// The subject keys of `:has()` arguments, as seen by a `Collector`.
@@ -317,6 +338,64 @@ enum SiblingEdge {
     Last,
     Both,
     All,
+}
+
+/// Keyed compounds whose match reads their siblings, by key: the reaches and
+/// edges recorded for each.
+#[derive(Default)]
+struct SiblingKeys {
+    ids: BTreeMap<String, Vec<(u8, SiblingEdge)>>,
+    classes: BTreeMap<String, Vec<(u8, SiblingEdge)>>,
+    tags: BTreeMap<String, Vec<(u8, SiblingEdge)>>,
+}
+
+impl SiblingKeys {
+    fn insert(&mut self, key: AnchorKey, reach: u8, edge: SiblingEdge) {
+        let entries = match key {
+            AnchorKey::Id(id) => self.ids.entry(id),
+            AnchorKey::Class(class) => self.classes.entry(class),
+            AnchorKey::Tag(tag) => self.tags.entry(tag),
+        }
+        .or_default();
+        if !entries.contains(&(reach, edge)) {
+            entries.push((reach, edge));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.classes.is_empty() && self.tags.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        [&self.ids, &self.classes, &self.tags].iter().flat_map(|map| map.values()).map(Vec::len).sum()
+    }
+
+    /// Calls `found` with each entry whose key `node` has.
+    fn for_each_match(&self, document: &Document, node: NodeId, mut found: impl FnMut(u8, SiblingEdge) -> Option<()>) -> Option<()> {
+        let Ok(NodeKind::Element { name, attributes, .. }) = document.kind(node) else { return Some(()) };
+        let mut visit = |entries: Option<&Vec<(u8, SiblingEdge)>>| -> Option<()> {
+            for &(reach, edge) in entries.into_iter().flatten() {
+                found(reach, edge)?;
+            }
+            Some(())
+        };
+        if !self.tags.is_empty() {
+            visit(self.tags.get(crate::svg::local_name(name).to_ascii_lowercase().as_str()))?;
+        }
+        for (key, value) in attributes {
+            if key.as_str().eq_ignore_ascii_case("id") {
+                if !self.ids.is_empty() {
+                    visit(self.ids.get(&**value))?;
+                }
+            } else if key.as_str().eq_ignore_ascii_case("class") && !self.classes.is_empty() {
+                for class in value.split_ascii_whitespace() {
+                    visit(self.classes.get(class))?;
+                }
+            }
+        }
+        Some(())
+    }
 }
 
 /// The id, a class or the tag every element an anchor compound matches has.
@@ -356,6 +435,18 @@ impl InvalidationSets {
         sets
     }
 
+    /// ASCII-lowercase local names of the attributes some selector reads,
+    /// `id` included when a selector tests an id.
+    pub(crate) fn tested_attributes(&self) -> BTreeSet<String> {
+        let mut names: BTreeSet<String> = self.attributes.keys()
+            .map(|name| name.rsplit(['|', ':']).next().unwrap_or(name).to_ascii_lowercase())
+            .collect();
+        if self.any_id != 0 || self.target != 0 || !self.ids.is_empty() {
+            names.insert(String::from("id"));
+        }
+        names
+    }
+
     /// Add the selectors of rules appended after the ones already recorded.
     pub(crate) fn extend(&mut self, rules: &[Rule]) {
         for rule in rules {
@@ -363,37 +454,33 @@ impl InvalidationSets {
             let subject = Features::of_subject(&rule.selector);
             self.add(&rule.selector, Position::Subject, &subject);
         }
-        self.any_class = self.classes.values().fold(0, |reach, value| reach | value);
-        self.any_id = self.ids.values().fold(0, |reach, value| reach | value);
-        let union = |sets: &BTreeMap<String, Features>| {
-            let mut all = Features::default();
-            for features in sets.values() {
-                all.merge(features);
-            }
-            all
-        };
-        self.any_class_subjects = union(&self.class_subjects);
-        self.any_id_subjects = union(&self.id_subjects);
     }
 
     /// Record the selectors of one rule. `subject` holds the features of the
     /// rule's subject compound, which a change in an ancestor position
     /// reaches.
     fn add(&mut self, selector: &Selector, position: Position, subject: &Features) {
-        // `:host`, `::slotted()` and `::part()` cross tree scopes.
-        let position = if selector.host || selector.slotted || selector.part.is_some() { Position::Document } else { position };
+        // `:host`, `::slotted()` and `::part()` cross tree scopes. A lone
+        // `:host` subject compound matches only the host element itself.
+        let lone_host = selector.host && position == Position::Subject && selector.ancestor.is_none();
+        let crosses = selector.host && !lone_host || selector.slotted || selector.part.is_some();
+        let position = if crosses { Position::Document } else { position };
         let reach = position.reach();
         let wide = reach & (SUBTREE | SIBLING_SUBTREES) != 0;
         for class in &selector.classes {
             *self.classes.entry(class.clone()).or_default() |= reach;
+            self.any_class |= reach;
             if wide {
                 self.class_subjects.entry(class.clone()).or_default().merge(subject);
+                self.any_class_subjects.merge(subject);
             }
         }
         if let Some(id) = &selector.id {
             *self.ids.entry(id.clone()).or_default() |= reach;
+            self.any_id |= reach;
             if wide {
                 self.id_subjects.entry(id.clone()).or_default().merge(subject);
+                self.any_id_subjects.merge(subject);
             }
         }
         for attribute in &selector.attributes {
@@ -403,15 +490,26 @@ impl InvalidationSets {
             }
             *self.attributes.entry(name).or_default() |= reach;
         }
-        if !selector.form_state.is_empty()
-            || !selector.interaction_state.is_empty()
+        let attribute_state = !selector.form_state.is_empty()
             || selector.top_layer_state != 0
             || selector.directionality_mask != 0
-            || !selector.languages.is_empty()
-        {
+            || !selector.languages.is_empty();
+        if attribute_state || !selector.interaction_state.is_empty() {
             self.state |= reach;
             if wide {
                 self.state_subjects.merge(subject);
+            }
+        }
+        if attribute_state {
+            self.attribute_state |= reach;
+            if wide {
+                self.attribute_state_subjects.merge(subject);
+            }
+        }
+        if selector.interaction_state.contains(crate::interaction::InteractionPseudo::Target) {
+            self.target |= reach;
+            if wide {
+                self.target_subjects.merge(subject);
             }
         }
         for pseudo in &selector.structural {
@@ -423,8 +521,10 @@ impl InvalidationSets {
                 StructuralPseudo::Valid | StructuralPseudo::Invalid => {
                     self.children |= reach | ANCESTORS;
                     self.state |= reach | ANCESTORS;
+                    self.attribute_state |= reach | ANCESTORS;
                     if wide {
                         self.state_subjects.merge(subject);
+                        self.attribute_state_subjects.merge(subject);
                     }
                 }
                 StructuralPseudo::Nth { a, b, of_type, reverse, of } => {
@@ -446,14 +546,20 @@ impl InvalidationSets {
         for pseudo in &selector.logical {
             match pseudo {
                 LogicalPseudo::Not(list) | LogicalPseudo::Is(list) | LogicalPseudo::Where(list) => {
+                    let enclosing = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone());
+                    let saved = core::mem::replace(&mut self.enclosing_key, enclosing);
                     for inner in list {
                         self.add(inner, position, subject);
                     }
+                    self.enclosing_key = saved;
                 }
                 LogicalPseudo::Nesting(list) => {
+                    let enclosing = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone());
+                    let saved = core::mem::replace(&mut self.enclosing_key, enclosing);
                     for inner in list.iter() {
                         self.add(inner, position, subject);
                     }
+                    self.enclosing_key = saved;
                 }
                 LogicalPseudo::Has(relatives) => {
                     let relatives: &[RelativeSelector] = relatives;
@@ -466,7 +572,7 @@ impl InvalidationSets {
                         Position::SiblingAncestor => Some(SIBLING_SUBTREES),
                         _ => None,
                     }
-                    .and_then(|reach| AnchorKey::of(selector).map(|key| (key, reach)));
+                    .and_then(|reach| AnchorKey::of(selector).or_else(|| self.enclosing_key.clone()).map(|key| (key, reach)));
                     let inner = match anchored {
                         _ if position == Position::Subject => {
                             self.relative(selector, relatives);
@@ -485,9 +591,11 @@ impl InvalidationSets {
                         None => Position::Document,
                     };
                     self.children |= inner.reach();
+                    let saved = self.enclosing_key.take();
                     for relative in relatives {
                         self.add(&relative.selector, inner, subject);
                     }
+                    self.enclosing_key = saved;
                 }
                 LogicalPseudo::State(..) => {
                     self.state |= reach;
@@ -499,9 +607,21 @@ impl InvalidationSets {
         if let Some((relation, ancestor)) = &selector.ancestor {
             let next = position.through(relation);
             if matches!(relation, Relation::Adjacent | Relation::Following) {
-                self.sibling(selector, position, SiblingEdge::All, subject);
+                let keyed_position = matches!(position, Position::Subject | Position::Sibling | Position::Ancestor | Position::SiblingAncestor);
+                let left = AnchorKey::of(ancestor).filter(|_| keyed_position && AnchorKey::of(selector).is_none() && self.enclosing_key.is_none());
+                match left {
+                    Some(key) => {
+                        if position.reach() & (SUBTREE | SIBLING_SUBTREES) != 0 {
+                            self.structural_subjects.merge(subject);
+                        }
+                        self.following_keys.insert(key, position.reach(), SiblingEdge::All);
+                    }
+                    None => self.sibling(selector, position, SiblingEdge::All, subject),
+                }
             }
+            let saved = self.enclosing_key.take();
             self.add(ancestor, next, subject);
+            self.enclosing_key = saved;
         }
     }
 
@@ -521,7 +641,7 @@ impl InvalidationSets {
             }
             false
         });
-        let Some(key) = AnchorKey::of(selector) else {
+        let Some(key) = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone()) else {
             self.unkeyed_relatives = true;
             return;
         };
@@ -541,20 +661,13 @@ impl InvalidationSets {
             self.structural_subjects.merge(subject);
         }
         let keyed = match position {
-            Position::Subject | Position::Sibling | Position::Ancestor | Position::SiblingAncestor => AnchorKey::of(selector),
+            Position::Subject | Position::Sibling | Position::Ancestor | Position::SiblingAncestor => {
+                AnchorKey::of(selector).or_else(|| self.enclosing_key.clone())
+            }
             Position::Relative | Position::Anchored | Position::Document => None,
         };
         match keyed {
-            Some(key) => {
-                let entry = (key, position.reach(), edge);
-                if !self.sibling_keys.contains(&entry) {
-                    if self.sibling_keys.len() < MAX_KEYED_ENTRIES {
-                        self.sibling_keys.push(entry);
-                    } else {
-                        self.siblings |= DOCUMENT;
-                    }
-                }
-            }
+            Some(key) => self.sibling_keys.insert(key, position.reach(), edge),
             None => match (edge, position) {
                 (_, Position::Relative | Position::Anchored | Position::Document) | (SiblingEdge::All, _) => self.siblings |= position.reach(),
                 (SiblingEdge::First, _) => self.first_edge |= position.reach(),
@@ -600,7 +713,9 @@ impl InvalidationSets {
         match name {
             "class" => reach |= self.class_reach(replaced.map_or(None, |value| Some(value.unwrap_or(""))), current("class"), spread),
             "id" => {
-                reach |= self.id_key(current("id"), spread) | self.state;
+                reach |= self.id_key(current("id"), spread)
+                    | spread.narrow(self.attribute_state, Some(&self.attribute_state_subjects))
+                    | spread.narrow(self.target, Some(&self.target_subjects));
                 reach |= match replaced {
                     Some(old) => self.id_key(old, spread),
                     None => spread.narrow(self.any_id, Some(&self.any_id_subjects)),
@@ -613,8 +728,8 @@ impl InvalidationSets {
                     reach |= spread.narrow(*keyed, self.attribute_subjects.get(lower.as_str()));
                 }
                 if state_attribute(lower.as_str()) {
-                    reach |= self.state;
-                    if self.state != 0 && form_element(document, node) {
+                    reach |= spread.narrow(self.attribute_state, Some(&self.attribute_state_subjects));
+                    if self.attribute_state != 0 && form_element(document, node) {
                         reach |= self.form_reach(document, node, lower.as_str(), spread);
                     }
                 }
@@ -671,6 +786,16 @@ impl InvalidationSets {
                     let reach = self.attribute_reach(document, mutation.target, name.as_str(), replaced, &mut spread);
                     collector.reach(mutation.target, reach)?;
                     collector.spread(mutation.target, &spread)?;
+                    // As in `affected_by_state`: a state read in an ancestor
+                    // position (`:invalid` on a form) reaches the narrowed
+                    // descendants of each ancestor.
+                    if reach & ANCESTORS != 0 && !spread.is_empty() {
+                        let mut ancestor = document.composed_parent(mutation.target).ok().flatten();
+                        while let Some(id) = ancestor {
+                            collector.spread(id, &spread)?;
+                            ancestor = document.composed_parent(id).ok().flatten();
+                        }
+                    }
                 }
                 MutationKind::CharacterData => {
                     if self.empty != 0 {
@@ -711,6 +836,28 @@ impl InvalidationSets {
                         }
                         if self.siblings & (RELATIVES | ANCHORED | DOCUMENT) != 0 {
                             collector.reach(parent, self.siblings & (RELATIVES | ANCHORED | DOCUMENT))?;
+                        }
+                    }
+                    if !self.following_keys.is_empty() {
+                        let mut reach = 0;
+                        let mut child = document.first_child(parent).ok().flatten();
+                        for node in removed.iter().copied().chain(core::iter::from_fn(|| {
+                            let node = child?;
+                            child = document.next_sibling(node).ok().flatten();
+                            Some(node)
+                        })) {
+                            self.following_keys.for_each_match(document, node, |found, _| {
+                                reach |= found;
+                                Some(())
+                            })?;
+                        }
+                        if reach != 0 {
+                            let children = if reach & (SUBTREE | SIBLING_SUBTREES) != 0 { SELF | SUBTREE } else { SELF };
+                            let mut child = document.first_child(parent).ok().flatten();
+                            while let Some(node) = child {
+                                self.structural_reach(&mut collector, node, children)?;
+                                child = document.next_sibling(node).ok().flatten();
+                            }
                         }
                     }
                     if self.first_edge | self.last_edge != 0 || !self.sibling_keys.is_empty() {
@@ -755,17 +902,18 @@ impl InvalidationSets {
                         let at_last = |node: NodeId| last == Some(node) || second_last == Some(node) || neighbour(node);
                         let mut child = first;
                         while let Some(node) = child {
-                            for (key, reach, edge) in &self.sibling_keys {
+                            self.sibling_keys.for_each_match(document, node, |reach, edge| {
                                 let affected = match edge {
                                     SiblingEdge::All => true,
                                     SiblingEdge::First => at_first(node),
                                     SiblingEdge::Last => at_last(node),
                                     SiblingEdge::Both => at_first(node) || at_last(node),
                                 };
-                                if affected && key.matches(document, node) {
-                                    self.structural_reach(&mut collector, node, SELF | *reach)?;
+                                if affected {
+                                    self.structural_reach(&mut collector, node, SELF | reach)?;
                                 }
-                            }
+                                Some(())
+                            })?;
                             child = element(document.next_sibling(node).ok().flatten(), true);
                         }
                     }
@@ -785,6 +933,11 @@ impl InvalidationSets {
                             }
                         }
                     }
+                }
+                // Attaching a shadow root or assigning slots manually changes
+                // only the host's flat tree, which no light-tree selector reads.
+                MutationKind::FullRebuild if shadow_host(document, mutation.target) => {
+                    collector.reach(mutation.target, SELF | SUBTREE)?;
                 }
                 MutationKind::FullRebuild => return None,
             }
@@ -860,6 +1013,7 @@ impl InvalidationSets {
         self.state | self.children | self.siblings | self.first_edge | self.last_edge == 0
             && self.anchors.is_empty()
             && self.sibling_keys.is_empty()
+            && self.following_keys.is_empty()
             && !self.scoped
     }
 }
@@ -1295,6 +1449,81 @@ mod tests {
         let affected = sets.affected(&document, document.mutations()).unwrap();
         assert!(affected.contains(&elements(&document, "p")[0]));
         assert!(!affected.contains(&elements(&document, "p")[1]) && !affected.contains(&elements(&document, "i")[0]));
+    }
+
+    #[test]
+    fn many_keyed_sibling_compounds_keep_child_list_changes_bounded() {
+        let css: String = (0..300).map(|at| format!(".k{at} + .y {{ color: red }} ")).collect();
+        let (mut document, sets) = setup("<div id=w><p>1</p><p>2</p></div>", &css);
+        let wrapper = elements(&document, "div")[0];
+        let added = element_with(&mut document, "span", &[]);
+        document.insert_before(wrapper, added, None).unwrap();
+        assert!(sets.affected(&document, document.mutations()).is_some());
+    }
+
+    #[test]
+    fn has_inside_not_anchors_on_the_enclosing_compound() {
+        let (mut document, sets) = setup("<div id=w><p>1</p></div><section><b>2</b></section>", ".x:not(:has(.a)) .b { color: red }");
+        let wrapper = elements(&document, "div")[0];
+        let added = element_with(&mut document, "span", &[]);
+        document.insert_before(wrapper, added, None).unwrap();
+        assert!(sets.affected(&document, document.mutations()).is_some());
+    }
+
+    #[test]
+    fn href_write_does_not_reach_interaction_state_subjects() {
+        let html = "<div class=p><a id=l>x</a><span class=q></span></div><section><i class=q></i></section>";
+        let (mut document, sets) = setup(html, ".p:hover .q { color: red } a:any-link { color: blue }");
+        let link = elements(&document, "a")[0];
+        document.set_attribute(link, "href", "/x").unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        assert!(affected.contains(&link));
+        assert!(!affected.contains(&elements(&document, "span")[0]));
+        assert!(!affected.contains(&elements(&document, "i")[0]));
+    }
+
+    #[test]
+    fn id_write_still_reaches_target_descendants() {
+        let (mut document, sets) = setup("<div class=t id=a><p class=u>1</p></div><p class=u>2</p>", ".t:target .u { color: red }");
+        let target = elements(&document, "div")[0];
+        document.set_attribute(target, "id", "b").unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        let paragraphs = elements(&document, "p");
+        assert!(affected.contains(&paragraphs[0]));
+        assert!(!affected.contains(&paragraphs[1]));
+    }
+
+    #[test]
+    fn following_sibling_rule_with_unkeyed_subject_needs_a_matching_child_to_restyle_siblings() {
+        let html = "<div id=a><input class=trigger><p><i class=x></i></p><p><i class=x></i></p></div>\
+                    <div id=b><p><i class=x></i></p><p><i class=x></i></p></div>";
+        let css = ".trigger:checked ~ * .x { color: red }";
+        let (mut document, sets) = setup(html, css);
+        let parents = elements(&document, "div");
+        let inner = elements(&document, "i");
+        let added = element_with(&mut document, "span", &[]);
+        let first = document.first_child(parents[1]).unwrap();
+        document.insert_before(parents[1], added, first).unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        assert!(!inner[2..].iter().any(|node| affected.contains(node)));
+
+        document.clear_mutations();
+        let added = element_with(&mut document, "span", &[]);
+        let first = document.first_child(parents[0]).unwrap();
+        document.insert_before(parents[0], added, first).unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        assert!(inner[..2].iter().all(|node| affected.contains(node)));
+        assert!(!inner[2..].iter().any(|node| affected.contains(node)));
+    }
+
+    #[test]
+    fn attaching_a_shadow_root_reaches_the_host_and_is_bounded() {
+        let (mut document, sets) = setup("<div id=h><p>1</p></div><section><b>2</b></section>", ".a { color: red }");
+        let host = elements(&document, "div")[0];
+        document.attach_shadow(host, crate::ShadowMode::Open).unwrap();
+        let affected = sets.affected(&document, document.mutations()).expect("bounded");
+        assert!(affected.contains(&host));
+        assert!(!affected.contains(&elements(&document, "b")[0]));
     }
 
 }

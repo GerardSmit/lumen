@@ -1348,7 +1348,7 @@ impl DomCssKeywordValue {
 impl DomCssNumericValue {
     #[classmethod(coerce)]
     fn parse(ctx: &mut Ctx, _class: This<Value>, css_text: &str) -> OpResult<Value> {
-        let Some(mut expression) = css::typed_numeric::parse_numeric_expression(css_text) else {
+        let Some(expression) = css::typed_numeric::parse_numeric_expression(css_text) else {
             return Err(crate::error_reporting::dom_exception(
                 ctx,
                 "SyntaxError",
@@ -1362,7 +1362,6 @@ impl DomCssNumericValue {
                 "CSS numeric expression has an unsupported or incompatible type",
             ));
         }
-        expression.simplify_absolute_units();
         reify_numeric_expression(ctx, &expression)
     }
 
@@ -2540,7 +2539,7 @@ impl CssStyleSheetText {
             return Err(css::CssError { offset: 0, message: "invalid selector list" });
         }
         let selector = implicit_nested_selector(selector, matches!(context.iter().rev().find(|context| !matches!(context, css::nesting::NestingContext::StartingStyle)), Some(css::nesting::NestingContext::Style(_))));
-        let selector=css::selector_serialization::serialize(&selector,&namespaces,!context.is_empty())?;
+        let selector=serialize_rule_selector(&selector,&namespaces,!context.is_empty())?;
         self.mutate_rule(path, |rule| {
             if rule.selector_text.is_none() {
                 return Ok(());
@@ -2845,7 +2844,7 @@ fn source_rules_to_cssom_with_namespaces(text:&str,source:&[css::nesting::Source
             else if matches!(node.kind, SourceRuleKind::Style | SourceRuleKind::NestedDeclarations) { CssDeclaration::parse(&node.declaration_text(text)) }
             else { CssDeclaration::default() };
         let selector_text = match node.kind {
-            SourceRuleKind::Style => Some(css::selector_serialization::serialize(&implicit_nested_selector(prelude,has_parent),namespaces,has_parent)?),
+            SourceRuleKind::Style => Some(serialize_rule_selector(&implicit_nested_selector(prelude,has_parent),namespaces,has_parent)?),
             SourceRuleKind::Keyframe => frame.map(|frame| frame.key_text),
             _ => None,
         };
@@ -2897,6 +2896,13 @@ fn parse_group_child(text: &str, parent_context: &[css::nesting::NestingContext<
     Ok(rule)
 }
 
+fn serialize_rule_selector(selector: &str, namespaces: &css::namespaces::NamespaceMap, nesting: bool) -> Result<String, css::CssError> {
+    if !selector.trim_start().starts_with(['>', '+', '~']) {
+        return css::selector_serialization::serialize(selector, namespaces, nesting);
+    }
+    css::selector_serialization::serialize_relative(selector, namespaces)
+}
+
 fn implicit_nested_selector(selector: &str, has_parent: bool) -> String {
     if has_parent { css::nesting::absolutize_nested_selector(selector) } else { selector.into() }
 }
@@ -2922,6 +2928,10 @@ fn serialize_rule_into(
                 return;
             }
         }
+    }
+    if starts_css_at_rule(&rule.css_text, "@property") && rule.nested.is_empty() {
+        output.push_str(&rule.css_text);
+        return;
     }
     // Descriptors were validated in their own grammar. The ordinary property
     // serializer would drop src, unicode-range, and descriptor ranges.
@@ -6846,9 +6856,9 @@ mod tests {
     #[test]
     fn specification_sibling_numeric_typed_om_and_owner_values() {
         let mut runtime=lumen_runtime::Runtime::new_browser();let engine=runtime.engine();
-        let realm=crate::install(engine.ctx(),"<section style='--tokens:sibling-index()'><div></div>text<div id=target></div></section>",128).unwrap();install_cssom_layout(&realm);
+        let realm=crate::install(engine.ctx(),"<section style='--tokens:sibling-index()'><div></div>text<div id=target></div></section>",128).unwrap();realm.set_layout_flusher(Rc::new(|session|session.display_list(300,200,crate::canvas::canvas_fallback_fonts()).map(|_|()).map_err(|error|format!("{error:?}"))));
         let result=engine.eval_value(r#"(()=>{const target=document.getElementById('target');target.style.cssText='width:calc(10px * var(--tokens));height:calc(10px * sibling-count());background-image:image-set(url("x") calc(1dppx * sibling-index()))';if(getComputedStyle(target).width!=='20px'||getComputedStyle(target).height!=='20px')throw Error('owner index/count');if(!target.style.backgroundImage.includes('sibling-index()'))throw Error('specified unresolved image');const value=CSSStyleValue.parse('width','calc(10px * sibling-index())');if(!(value instanceof CSSStyleValue)||value instanceof CSSNumericValue||!String(value).includes('sibling-index()'))throw Error('typed unresolved source');let threw=false;try{CSSNumericValue.parse('sibling-index()')}catch(e){threw=e.name==='SyntaxError'}if(!threw)throw Error('numeric context-free parser');target.parentNode.appendChild(document.createElement('div'));if(getComputedStyle(target).height!=='30px')throw Error('sibling mutation');return true})()"#);
-        assert!(matches!(result,Ok(Ok(Value::Bool(true)))));
+        assert_script_true(engine, result, "sibling numeric typed om");
     }
 
     #[test]
@@ -6924,7 +6934,7 @@ owner.disabled=true;check(owner.disabled && sheet.disabled && getComputedStyle(r
 sheet.disabled=false;check(!owner.disabled && getComputedStyle(rect).fill==='rgb(255, 0, 0)','sheet and owner share disabled source');
 owner.media='not all';check(getComputedStyle(rect).fill==='rgb(0, 0, 0)','media mutation deactivates actual source');owner.removeAttribute('media');check(getComputedStyle(rect).fill==='rgb(255, 0, 0)','media removal restores source');
 sheet.cssRules[0].style.fill='blue';check(getComputedStyle(rect).fill==='rgb(0, 0, 255)','shared CSSOM declaration edit drives renderer');
-owner.type='no/mime';check(owner.sheet===null && document.styleSheets.length===0 && getComputedStyle(rect).fill==='rgb(0, 0, 0)','type mutation removes association');owner.type='text/css';check(owner.sheet instanceof CSSStyleSheet && document.styleSheets.length===1 && getComputedStyle(rect).fill==='rgb(255, 0, 0)','valid type rebuilds authored source');
+owner.type='no/mime';check(owner.sheet===sheet,'type attribute alone does not run the style update');owner.textContent='.target {fill:red}';check(owner.sheet===null && document.styleSheets.length===0 && getComputedStyle(rect).fill==='rgb(0, 0, 0)','unsupported type removes association on update');owner.type='text/css';check(owner.sheet===null && document.styleSheets.length===0,'type attribute alone does not rebuild');owner.textContent='.target {fill:red}';check(owner.sheet instanceof CSSStyleSheet && document.styleSheets.length===1 && getComputedStyle(rect).fill==='rgb(255, 0, 0)','valid type rebuilds authored source on update');
 const prefixed=document.createElementNS(ns,'s:style');prefixed.textContent='.target{stroke:green}';svg.append(prefixed);check(prefixed.sheet instanceof CSSStyleSheet && prefixed.sheet===document.styleSheets[1] && getComputedStyle(rect).stroke==='rgb(0, 128, 0)','prefixed XML style shares maintained owner classification');prefixed.remove();check(document.styleSheets.length===1 && getComputedStyle(rect).stroke==='none','prefixed source removal follows the same lifecycle');
 owner.remove();check(owner.sheet===null && document.styleSheets.length===0 && getComputedStyle(rect).fill==='rgb(0, 0, 0)','detached source cannot control live rendering');svg.prepend(owner);check(owner.sheet===document.styleSheets[0] && getComputedStyle(rect).fill==='rgb(255, 0, 0)','reconnection restores shared lifecycle');
 return true;})()"#).unwrap();
@@ -7240,9 +7250,9 @@ return true;})()"#).unwrap();
             error({name:'ordinary'},'SyntaxError');error({name:'--invalid',syntax:'**'},'SyntaxError');
             CSS.registerProperty({name:'--typed',syntax:'<length>',initialValue:'1px'});
             check(getComputedStyle(child).getPropertyValue('--typed')==='1px','typed length initial value');
-            error({name:'--unsupported-typed',syntax:'<transform-list>',initialValue:'none'},'NotSupportedError');
+            error({name:'--transform-none',syntax:'<transform-list>',initialValue:'none'},'SyntaxError');
             error({name:'--invalid-value',initialValue:'var(--ordinary)'},'SyntaxError');
-            error({name:'--unbalanced',initialValue:'('},'SyntaxError');error({},'TypeError');
+            error({name:'--unbalanced',initialValue:')'},'SyntaxError');error({},'TypeError');
             document.querySelector('#rules').textContent+=' #target{height:10px}';
             check(getComputedStyle(target).display==='none','registration persists stylesheet rebuild');
             return true;
@@ -7295,7 +7305,7 @@ return true;})()"#).unwrap();
             eq(getComputedStyle(target).width,'7px','API precedence');
             return true;
         })()"#);
-        assert!(matches!(result,Ok(Ok(Value::Bool(true)))),"property native guard failed");
+        assert_script_true(engine, result, "property native guard failed");
     }
 
     #[test]
@@ -7375,6 +7385,18 @@ return true;})()"#).unwrap();
         realm.set_layout_flusher(Rc::new(|session| {
             session.display_list(300, 200, &NoText).map(|_| ()).map_err(|error| format!("{error:?}"))
         }));
+    }
+    fn assert_script_true(engine: &mut lumen::Engine, result: Result<Result<Value, Value>, lumen::ParseError>, label: &str) {
+        match result {
+            Ok(Ok(Value::Bool(true))) => {}
+            Ok(Ok(_)) => panic!("{label}: script did not return true"),
+            Ok(Err(error)) => {
+                let message = engine.ctx().coerce_string(&error).map(|message| message.to_string())
+                    .unwrap_or_else(|_| "unknown JavaScript exception".into());
+                panic!("{label}: {message}");
+            }
+            Err(error) => panic!("{label}: script failed to parse: {}", error.message),
+        }
     }
 
     #[test]
@@ -9168,7 +9190,7 @@ return true;})()"#).unwrap();
                     const target = document.querySelector('main');
                     target.attributeStyleMap.set('width', inner);
                     check('style map uses live child values',
-                        target.style.getPropertyValue('width') === 'calc(3px + 2px)');
+                        target.style.getPropertyValue('width') === 'calc(5px)');
 
                     const clamp = new CSSMathClamp(CSS.px(0), CSS.px(5), CSS.px(10));
                     const negated = new CSSMathNegate(clamp.value);

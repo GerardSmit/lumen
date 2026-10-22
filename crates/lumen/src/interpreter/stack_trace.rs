@@ -39,6 +39,7 @@ use super::frames::{
 };
 use super::Interp;
 use crate::ast::{FnSource, Function, NO_POS};
+use crate::srctext::Src;
 use crate::value::{Callable, Exotic, Gc, Object, Property, Value, WeakGc};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -66,25 +67,25 @@ thread_local! {
     /// The source the last top-level parse / precompiled decode on this thread read from (and,
     /// for a precompiled unit, its line table): what a caller about to run that code takes with
     /// [`take_parsed_source`] to name its pseudo frame and register the source.
-    static PARSED: RefCell<Option<(Rc<str>, Option<Rc<LineTable>>)>> = const { RefCell::new(None) };
+    static PARSED: RefCell<Option<(Src, Option<Rc<LineTable>>)>> = const { RefCell::new(None) };
     /// Inside an `Error.prepareStackTrace` call: a nested format uses the default text (V8).
     static IN_PREPARE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Note the source a top-level parse read (see [`take_parsed_source`]).
-pub(crate) fn note_parsed_source(src: Rc<str>, table: Option<Rc<LineTable>>) {
+pub(crate) fn note_parsed_source(src: Src, table: Option<Rc<LineTable>>) {
     PARSED.with(|p| *p.borrow_mut() = Some((src, table)));
 }
 
 /// The source of the parse / decode that just ran on this thread (see [`note_parsed_source`]).
-pub(crate) fn take_parsed_source() -> Option<(Rc<str>, Option<Rc<LineTable>>)> {
+pub(crate) fn take_parsed_source() -> Option<(Src, Option<Rc<LineTable>>)> {
     PARSED.with(|p| p.borrow_mut().take())
 }
 
 /// A top-level activation (script, module or eval code): a stack-trace line without a function.
 pub(crate) struct ScriptFrame {
     /// The source its positions are offsets into (a [`Sources`] key).
-    pub(crate) src: Rc<str>,
+    pub(crate) src: Src,
     pub(crate) eval: bool,
 }
 
@@ -138,36 +139,62 @@ impl LineTable {
 
     /// The table of `text`. Line terminators are ECMAScript's: LF, CR, CRLF, U+2028, U+2029.
     pub(crate) fn build(text: &str) -> LineTable {
+        Self::build_pieces(&[text])
+    }
+
+    pub(crate) fn build_src(src: &Src) -> LineTable {
+        match src.pieces(0, src.len()) {
+            Some(pieces) => Self::build_pieces(&pieces),
+            None => Self::build(""),
+        }
+    }
+
+    /// The table of the concatenation of `pieces`, whose offsets run on from piece to piece.
+    fn build_pieces(pieces: &[&str]) -> LineTable {
         let _mem = crate::memstats::enter(crate::memstats::Cat::StackTrace);
-        let b = text.as_bytes();
         let (mut starts, mut wide, mut extra) = (vec![0u32], Vec::new(), 0u32);
-        let mut i = 0;
-        while i < b.len() {
-            let c = b[i];
-            if c < 0x80 {
-                i += 1;
-                if c == b'\n' {
-                    starts.push(i as u32);
-                } else if c == b'\r' {
-                    if b.get(i) == Some(&b'\n') {
-                        i += 1;
-                    }
-                    starts.push(i as u32);
+        let mut base = 0usize;
+        let mut skip_lf = false;
+        for text in pieces {
+            let b = text.as_bytes();
+            let mut i = 0;
+            if skip_lf {
+                skip_lf = false;
+                if b.first() == Some(&b'\n') {
+                    i = 1;
+                    *starts.last_mut().expect("a start") = (base + 1) as u32;
                 }
-                continue;
             }
-            let ch = text[i..].chars().next().unwrap_or('\0');
-            i += ch.len_utf8();
-            extra += (ch.len_utf8() - ch.len_utf16()) as u32;
-            wide.push((i as u32, extra));
-            if matches!(ch, '\u{2028}' | '\u{2029}') {
-                starts.push(i as u32);
+            while i < b.len() {
+                let c = b[i];
+                if c < 0x80 {
+                    i += 1;
+                    if c == b'\n' {
+                        starts.push((base + i) as u32);
+                    } else if c == b'\r' {
+                        if b.get(i) == Some(&b'\n') {
+                            i += 1;
+                        } else if i == b.len() {
+                            skip_lf = true;
+                        }
+                        starts.push((base + i) as u32);
+                    }
+                    continue;
+                }
+                let ch = text[i..].chars().next().unwrap_or('\0');
+                i += ch.len_utf8();
+                extra += (ch.len_utf8() - ch.len_utf16()) as u32;
+                wide.push(((base + i) as u32, extra));
+                if matches!(ch, '\u{2028}' | '\u{2029}') {
+                    starts.push((base + i) as u32);
+                }
             }
+            base += b.len();
         }
         LineTable {
             starts,
             wide,
-            len: b.len() as u32,
+            len: base as u32,
             encoded: None,
             decoded: std::cell::OnceCell::new(),
         }
@@ -279,7 +306,7 @@ impl LineTable {
 pub(crate) struct SourceInfo {
     /// Pins the key's allocation (so the address cannot be reused while the entry exists) and
     /// tells whether the source is still alive.
-    src: std::rc::Weak<str>,
+    src: crate::srctext::SrcWeak,
     name: Value,
     /// Byte offset where the file's own text begins (after a synthesized wrapper header).
     body_start: u32,
@@ -302,13 +329,10 @@ pub(crate) struct Sources {
     prune_at: usize,
 }
 
-fn key_of(src: &Rc<str>) -> usize {
-    Rc::as_ptr(src) as *const u8 as usize
-}
 
 impl Sources {
-    fn entry(&mut self, src: &Rc<str>) -> &mut SourceInfo {
-        let key = key_of(src);
+    fn entry(&mut self, src: &Src) -> &mut SourceInfo {
+        let key = src.key();
         let live = self.map.get(&key).is_some_and(|e| e.src.strong_count() > 0);
         if !live {
             if self.map.len() >= self.prune_at {
@@ -318,7 +342,7 @@ impl Sources {
             self.map.insert(
                 key,
                 SourceInfo {
-                    src: Rc::downgrade(src),
+                    src: src.downgrade(),
                     name: Value::str("<anonymous>"),
                     body_start: 0,
                     wrapper: 0,
@@ -335,7 +359,7 @@ impl Sources {
     /// line table (each `None` / 0 keeps what the entry has).
     fn register(
         &mut self,
-        src: &Rc<str>,
+        src: &Src,
         name: Option<&str>,
         body_start: Option<u32>,
         wrapper: usize,
@@ -358,14 +382,14 @@ impl Sources {
 
     /// The display name of `src`, the line and column of `pos` in it (relative to its body
     /// start; `None` without a position) and its wrapper function.
-    fn describe(&mut self, src: &Rc<str>, pos: u32) -> (Value, Option<(u32, u32)>, usize) {
+    fn describe(&mut self, src: &Src, pos: u32) -> (Value, Option<(u32, u32)>, usize) {
         let e = self.entry(src);
         let lc = if pos == NO_POS {
             None
         } else {
             let t = e
                 .table
-                .get_or_insert_with(|| Rc::new(LineTable::build(src)))
+                .get_or_insert_with(|| Rc::new(LineTable::build_src(src)))
                 .clone();
             match (t.line_col(pos), t.line_col(e.body_start)) {
                 (Some((l, c)), Some((bl, bc))) if pos >= e.body_start => Some(if l == bl {
@@ -392,7 +416,7 @@ impl Sources {
 }
 
 /// The source text a function's positions are offsets into.
-fn source_of(func: &Function) -> Option<Rc<str>> {
+fn source_of(func: &Function) -> Option<Src> {
     if let Some(l) = func.lazy.borrow().as_ref() {
         return Some(l.src.clone());
     }
@@ -697,7 +721,7 @@ impl Interp {
     /// Register `src` for stack traces (see [`Sources::register`]).
     pub(crate) fn register_source(
         &self,
-        src: &Rc<str>,
+        src: &Src,
         name: Option<&str>,
         body_start: Option<u32>,
         wrapper: usize,
@@ -709,11 +733,11 @@ impl Interp {
     }
 
     /// Shift the reported lines (and first-line columns) of `src` by `vm`'s offsets.
-    pub(crate) fn set_source_offsets(&self, src: &Rc<str>, line: i32, column: i32) {
+    pub(crate) fn set_source_offsets(&self, src: &Src, line: i32, column: i32) {
         self.sources.borrow_mut().entry(src).offsets = (line, column);
     }
 
-    pub(crate) fn set_source_script_context(&self, src: &Rc<str>, context: Rc<crate::ClassicScriptContext>) {
+    pub(crate) fn set_source_script_context(&self, src: &Src, context: Rc<crate::ClassicScriptContext>) {
         self.sources.borrow_mut().entry(src).classic_script = Some(context);
     }
 
@@ -723,7 +747,7 @@ impl Interp {
         &self,
         name: Option<&str>,
         body_start: u32,
-    ) -> Option<Rc<str>> {
+    ) -> Option<Src> {
         let (src, table) = take_parsed_source()?;
         if let Some(context) = &self.classic_script_context {
             self.sources.borrow_mut().entry(&src).classic_script = Some(context.clone());
@@ -805,7 +829,7 @@ impl Interp {
         };
         // The body starts after the synthesized `function anonymous(<params>\n) {\n` (a
         // precompiled wrapper, whose text is not kept, registered its own start at load).
-        let body_start = src.find("\n) {\n").map(|at| (at + 5) as u32);
+        let body_start = src.body_start();
         self.register_source(
             &src,
             Some(filename),
@@ -819,7 +843,7 @@ impl Interp {
     /// Run `f` under a pseudo frame for top-level code of `src` (nothing pushed without one).
     pub(crate) fn with_script_frame<T>(
         &mut self,
-        src: Option<Rc<str>>,
+        src: Option<Src>,
         eval: bool,
         f: impl FnOnce(&mut Interp) -> T,
     ) -> T {
@@ -944,7 +968,7 @@ impl Interp {
     }
 
     /// The resume frame for a module body with top-level `await`.
-    pub(crate) fn resume_frame_script(src: Option<Rc<str>>, settings: usize) -> ResumeFrame {
+    pub(crate) fn resume_frame_script(src: Option<Src>, settings: usize) -> ResumeFrame {
         ResumeFrame::Script(Box::new(ModuleResumeFrame { source:src.map(|src|Rc::new(ScriptFrame {src,eval:false})),settings }))
     }
 
@@ -1513,7 +1537,7 @@ impl Interp {
 
     /// The source text the innermost frame's call-site positions are offsets into: a function
     /// frame's source, or a script/eval pseudo frame's.
-    pub(crate) fn innermost_source(&self) -> Option<Rc<str>> {
+    pub(crate) fn innermost_source(&self) -> Option<Src> {
         let fr = self.fn_frames.last()?;
         if fr.fn_ptr == 0 {
             return fr.extra.as_ref()?.script.as_ref().map(|sf| sf.src.clone());
@@ -1530,7 +1554,7 @@ impl Interp {
     /// functions parsed from that script. Uses the existing weak source table.
     pub fn current_classic_script_context(&self) -> Option<Rc<crate::ClassicScriptContext>> {
         if let Some(source) = self.innermost_source() {
-            if let Some(context) = self.sources.borrow().map.get(&key_of(&source))
+            if let Some(context) = self.sources.borrow().map.get(&source.key())
                 .and_then(|entry| entry.classic_script.clone()) {
                 return Some(context);
             }

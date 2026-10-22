@@ -1033,6 +1033,18 @@ impl Value {
     pub fn from_string(s: String) -> Value {
         Value::Str(s.into())
     }
+    /// `bytes` as a string in one copy, when they are valid UTF-8 that needs no re-spelling
+    /// (`None`: decode them the long way).
+    pub fn from_valid_utf8(bytes: &[u8]) -> Option<Value> {
+        crate::lstr::plain_utf8(bytes).map(Value::str)
+    }
+    /// A string read straight into its own storage (see [`crate::lstr::LStr::from_utf8_reader`]).
+    pub fn from_utf8_reader<E>(
+        size_hint: usize,
+        read: impl FnMut(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<Value, E> {
+        crate::lstr::LStr::from_utf8_reader(size_hint, read).map(Value::Str)
+    }
     /// A BigInt from an `i64` (for the embedder's 64-bit integer bridge, e.g. wasm i64).
     pub fn bigint_from_i64(v: i64) -> Value {
         Value::BigInt(crate::bigint::JsBigInt::from(v))
@@ -1274,9 +1286,6 @@ pub struct Object {
     /// caches check this byte on the receiver and take the checked path when clear, so ONE proxy
     /// existing somewhere doesn't disable the caches for every plain object in the program.
     pub(crate) ic_plain: Cell<bool>,
-    /// `[[IsHTMLDDA]]` brand (`document.all`, `$262.IsHTMLDDA`): `typeof` "undefined", falsy,
-    /// loosely equal to null and undefined. Always set together with a clear `ic_plain`.
-    pub(crate) html_dda: Cell<bool>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
     /// GC scratch: the internal-reference count (low bits) and mark bit ([`GC_MARK`]) while
@@ -1507,7 +1516,6 @@ impl Object {
                 exotic: Exotic::None,
                 extensible: true,
                 ic_plain: Cell::new(true),
-                html_dda: Cell::new(false),
                 is_constructor: false,
                 gc_internal: Cell::new(0),
             }));
@@ -1554,7 +1562,6 @@ impl Object {
                 exotic: Exotic::Array,
                 extensible: true,
                 ic_plain: Cell::new(true),
-                html_dda: Cell::new(false),
                 is_constructor: false,
                 gc_internal: Cell::new(0),
             }));
@@ -1730,8 +1737,7 @@ impl Object {
                     exotic,
                     extensible: true,
                     ic_plain: Cell::new(true),
-                    html_dda: Cell::new(false),
-                    is_constructor: false,
+                        is_constructor: false,
                     gc_internal: Cell::new(0),
                 },
                 class,
