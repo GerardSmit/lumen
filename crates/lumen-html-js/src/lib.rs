@@ -7447,10 +7447,17 @@ impl DomHtmlImageElement {
     fn image_snapshot(&self) -> image_loading::ImageSnapshot {image_node_snapshot(self.image_node())}
 }
 
+/// A node outside the document has no computed style, so computing one would only revalidate the
+/// whole document's style cache.
+fn detached_aware_color_scheme(realm:&DomRealm,id:NodeId)->lumen_html::css::UsedColorScheme {
+    if !realm.session.borrow().document().is_connected_element(id) {return lumen_html::css::UsedColorScheme::Light;}
+    realm.embedding_color_scheme(id).unwrap_or(lumen_html::css::UsedColorScheme::Light)
+}
+
 fn image_node_snapshot(node:&DomNode) -> image_loading::ImageSnapshot {
     let (realm,id)=node.realm.resolve_adopted_node(node.id);
     let base=realm.base_url();let _=realm.prepare_image_selection(&base);
-    let scheme=realm.embedding_color_scheme(id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
+    let scheme=detached_aware_color_scheme(&realm,id);
     let snapshot={let session=realm.session.borrow();realm.images.snapshot(session.document(),id,&base,scheme)};
     let _=realm.sync_image_bitmaps();snapshot
 }
@@ -7460,12 +7467,13 @@ fn image_dimension(node:&DomNode,vertical:bool)->OpResult<u32> {
     if lumen_html::forms::html_element_local_name(realm.session.borrow().document(),id)==Some("input")
         &&lumen_html::forms::input_type_state(realm.session.borrow().document(),id)!="image" {return Ok(0);}
     let base=realm.base_url();realm.prepare_image_selection(&base)?;
-    let rendered=if realm.layout_flusher.borrow().is_some()||realm.session.borrow().viewport_size().is_some() {
+    let connected=realm.session.borrow().document().is_connected_element(id);
+    let rendered=if connected&&(realm.layout_flusher.borrow().is_some()||realm.session.borrow().viewport_size().is_some()) {
         realm.flush_layout()?;
         geometry::content_box_size(&mut realm.session.borrow_mut(),id).map(|(width,height)|(f64::from(width),f64::from(height)))
     }else{None};
     let natural=if rendered.is_none(){
-        let scheme=realm.embedding_color_scheme(id).unwrap_or(lumen_html::css::UsedColorScheme::Light);
+        let scheme=detached_aware_color_scheme(&realm,id);
         let session=realm.session.borrow();realm.images.natural_dimensions(session.document(),id,&base,scheme)
     }else{None};
     let (width,height)=lumen_html::forms::image_dimensions(realm.session.borrow().document(),id,natural,rendered);

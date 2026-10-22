@@ -68,3 +68,25 @@ fn csp_image_report_only_allows_decode_and_new_policy_blocks_available_reuse() {
     assert_eq!(calls.get(),1,"blocked cached reuse must not access provider");
     assert!(matches!(runtime.engine().eval_value("imageLoads===1 && imageErrors===1 && imageReports===3 && reusableImage.naturalWidth===0 && reusableImage.complete"),Ok(Ok(Value::Bool(true)))));
 }
+
+#[test]
+fn detached_image_dimensions_skip_layout_but_attached_images_flush() {
+    struct Pixel;
+    impl lumen_html::layout::ImageResolver for Pixel {
+        fn resolve(&self,_source:&str)->ImageState{ImageState::Ready(Arc::new(lumen_html::paint::ImageData{width:7,height:5,pixels:vec![0;7*5*4]}))}
+    }
+    let mut runtime=lumen_runtime::Runtime::new_browser();let engine=runtime.engine();
+    let realm=crate::install(engine.ctx(),"<head></head><body></body>",256).unwrap();realm.set_document_url("https://example.test/page");
+    realm.set_image_resolver(Rc::new(Pixel));
+    let flushes=Rc::new(Cell::new(0u32));let counter=flushes.clone();
+    realm.set_layout_flusher(Rc::new(move |_session|{counter.set(counter.get()+1);Ok(())}));
+    assert!(matches!(engine.eval_value("globalThis.detached=new Image();detached.src='https://example.test/a.png';"),Ok(Ok(_))));
+    realm.queue_image_tasks(engine.ctx()).unwrap();assert!(scheduling::run_tasks(runtime.engine(),16).is_empty());
+    let before=flushes.get();
+    assert!(matches!(runtime.engine().eval_value("detached.width===7 && detached.height===5 && detached.naturalWidth===7"),Ok(Ok(Value::Bool(true)))));
+    assert_eq!(flushes.get(),before,"detached image dimensions must not lay out");
+    assert!(matches!(runtime.engine().eval_value("globalThis.sized=new Image();sized.width=3;sized.src='https://example.test/b.png';sized.width===3"),Ok(Ok(Value::Bool(true)))));
+    assert_eq!(flushes.get(),before);
+    assert!(matches!(runtime.engine().eval_value("globalThis.attached=new Image();attached.src='https://example.test/c.png';document.body.appendChild(attached);attached.width>=0"),Ok(Ok(Value::Bool(true)))));
+    assert!(flushes.get()>before,"attached image width must flush layout");
+}

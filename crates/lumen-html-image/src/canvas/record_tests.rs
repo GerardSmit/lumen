@@ -403,13 +403,13 @@ fn source_canvas_mutated_after_being_recorded_into_another_keeps_the_old_pixels(
 fn unchanged_canvas_hands_out_one_snapshot() {
     let mut canvas = recorded();
     canvas.fill_rect(0.0, 0.0, 3.0, 3.0).unwrap();
-    let (CanvasSource::Pixels(first), CanvasSource::Pixels(second)) = (canvas.source(), canvas.source()) else {
+    let (CanvasSource::Premultiplied(first), CanvasSource::Premultiplied(second)) = (canvas.source(), canvas.source()) else {
         panic!("a drawn canvas yields pixels");
     };
     assert!(Arc::ptr_eq(&first, &second));
     canvas.state_mut().fill = [0, 0, 0, 255];
     canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
-    let CanvasSource::Pixels(third) = canvas.source() else { panic!() };
+    let CanvasSource::Premultiplied(third) = canvas.source() else { panic!() };
     assert!(!Arc::ptr_eq(&first, &third));
 }
 
@@ -630,4 +630,62 @@ fn disabled_recording_draws_immediately() {
     canvas.fill_rect(0.0, 0.0, 2.0, 2.0).unwrap();
     assert_eq!(canvas.pending_operations(), 0);
     assert!(canvas.has_pixmap());
+}
+
+#[test]
+fn premultiplied_storage_survives_straight_round_trip() {
+    for alpha in 0..=255u8 {
+        for channel in 0..=alpha {
+            let color = tiny_skia::PremultipliedColorU8::from_rgba(channel, channel, channel, alpha).unwrap();
+            let straight = color.demultiply();
+            assert_eq!(premultiply_channel(straight.red(), alpha), channel, "c={channel} a={alpha}");
+        }
+    }
+}
+
+fn painted_source() -> CanvasSurface {
+    let mut surface = immediate();
+    surface.state_mut().fill = [200, 30, 90, 77];
+    surface.fill_path(&circle(), FillRule::Winding).unwrap();
+    surface.state_mut().fill = [10, 220, 40, 200];
+    surface.fill_rect(2.0, 3.0, 9.0, 7.0).unwrap();
+    surface
+}
+
+#[test]
+fn premultiplied_canvas_source_draws_like_straight_pixels() {
+    let geometries = [
+        scaled(1.0, 2.0, 20.0, 11.0),
+        scaled(3.5, 1.5, 7.25, 9.0),
+        scaled(10.0, 8.0, -9.0, -6.0),
+        SourceGeometry::Crop { sx: 2.0, sy: 3.0, sw: 11.0, sh: 9.0, dx: 4.0, dy: 2.0, dw: 15.0, dh: 12.0 },
+        SourceGeometry::Crop { sx: -3.0, sy: 1.0, sw: 40.0, sh: 30.0, dx: 0.0, dy: 0.0, dw: 24.0, dh: 16.0 },
+    ];
+    for geometry in geometries {
+        for recording in [false, true] {
+            let mut source = painted_source();
+            let premultiplied = source.source();
+            assert!(matches!(premultiplied, CanvasSource::Premultiplied(_)));
+            let straight = CanvasSource::Pixels(Arc::new(source.snapshot()));
+            let mut left = if recording { recorded() } else { immediate() };
+            let mut right = if recording { recorded() } else { immediate() };
+            for target in [&mut left, &mut right] {
+                target.state_mut().fill = [5, 5, 200, 255];
+                target.fill_rect(0.0, 0.0, W as f32, H as f32).unwrap();
+            }
+            left.draw_source(&premultiplied, geometry, true).unwrap();
+            right.draw_source(&straight, geometry, true).unwrap();
+            assert_eq!(left.snapshot().pixels, right.snapshot().pixels, "{geometry:?} recording={recording}");
+        }
+    }
+}
+
+#[test]
+fn premultiplied_source_is_shared_until_the_canvas_changes() {
+    let mut source = painted_source();
+    let (CanvasSource::Premultiplied(first), CanvasSource::Premultiplied(second)) = (source.source(), source.source()) else {
+        panic!("expected premultiplied sources");
+    };
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.straight().pixels, source.snapshot().pixels);
 }

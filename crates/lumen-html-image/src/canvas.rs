@@ -8,7 +8,7 @@ use std::{cell::RefCell, rc::Rc};
 mod record;
 pub use record::{
     canvas_stats, reset_canvas_stats, set_canvas_recording_enabled, set_canvas_recording_limits,
-    CanvasSource, CanvasStats, SourceGeometry, TextSource,
+    CanvasSource, CanvasStats, PremultipliedImage, SourceGeometry, TextSource,
 };
 use record::Recorder;
 use tiny_skia::{
@@ -955,7 +955,7 @@ pub struct CanvasSurface {
     has_alpha: bool,
     replaying: bool,
     frozen: Option<Rc<DrawingState>>,
-    source_cache: Option<(u64, std::sync::Weak<Rgba8Image>)>,
+    source_cache: Option<(u64, std::sync::Weak<record::PremultipliedImage>)>,
     state: DrawingState,
     saved: Vec<DrawingState>,
     generation: u64,
@@ -1023,7 +1023,16 @@ impl CanvasSurface {
 
     fn materialize(&mut self) -> Result<(), ImageError> {
         if self.lazy {
-            let aliased = self.alias.take().and_then(|source| source.pixels());
+            let alias = self.alias.take();
+            if let Some(record::CanvasSource::Premultiplied(image)) = &alias {
+                if image.pixmap().width() == self.width && image.pixmap().height() == self.height {
+                    record::count_materialized_alias();
+                    self.bitmap = Some(image.pixmap().clone());
+                    self.lazy = false;
+                    return Ok(());
+                }
+            }
+            let aliased = alias.and_then(|source| source.pixels());
             self.bitmap = match aliased {
                 Some(image) if image.width == self.width && image.height == self.height => {
                     record::count_materialized_alias();
@@ -1236,10 +1245,21 @@ impl CanvasSurface {
         } else {
             (y, height)
         };
-        self.materialize()?;
         let source = premultiplied_pixmap(image)?;
-        let sx = width / image.width as f32;
-        let sy = height / image.height as f32;
+        self.draw_pixmap_source(&source, x, y, width, height)
+    }
+
+    pub(super) fn draw_pixmap_source(
+        &mut self,
+        source: &Pixmap,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<(), ImageError> {
+        self.materialize()?;
+        let sx = width / source.width() as f32;
+        let sy = height / source.height() as f32;
         let transform = self.state.transform;
         let destination_transform = |transform: Transform| {
             Transform::from_row(
@@ -1315,6 +1335,38 @@ impl CanvasSurface {
     ) -> Result<(), ImageError> {
         self.flush();
         self.draw_image_crop_now(image, [sx, sy, sw, sh, dx, dy, dw, dh])
+    }
+
+    pub(super) fn draw_pixmap_geometry(&mut self, source: &Pixmap, geometry: record::SourceGeometry) -> Result<(), ImageError> {
+        match geometry {
+            record::SourceGeometry::Scaled { x, y, width, height } => {
+                if ![x, y, width, height].iter().all(|v| v.is_finite()) || width == 0.0 || height == 0.0 {
+                    return Ok(());
+                }
+                if source.width() == 0 || source.height() == 0 {
+                    return Ok(());
+                }
+                let (x, width) = if width < 0.0 { (x + width, -width) } else { (x, width) };
+                let (y, height) = if height < 0.0 { (y + height, -height) } else { (y, height) };
+                self.draw_pixmap_source(source, x, y, width, height)
+            }
+            record::SourceGeometry::Crop { sx, sy, sw, sh, dx, dy, dw, dh } => {
+                let rects = [sx, sy, sw, sh, dx, dy, dw, dh];
+                if !rects.iter().all(|v| v.is_finite()) || sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
+                    return Ok(());
+                }
+                let Some(crop) = crop_geometry(source.width(), source.height(), rects) else {
+                    return Ok(());
+                };
+                if crop.width == 0 || crop.height == 0 {
+                    return Ok(());
+                }
+                let rect = tiny_skia::IntRect::from_xywh(crop.x0 as i32, crop.y0 as i32, crop.width, crop.height)
+                    .ok_or(ImageError::InvalidViewport)?;
+                let cropped = source.clone_rect(rect).ok_or(ImageError::InvalidViewport)?;
+                self.draw_pixmap_geometry(&cropped, record::SourceGeometry::Scaled { x: crop.dx, y: crop.dy, width: crop.dw, height: crop.dh })
+            }
+        }
     }
 
     fn draw_image_crop_now(&mut self, image: &Rgba8Image, rects: [f32; 8]) -> Result<(), ImageError> {

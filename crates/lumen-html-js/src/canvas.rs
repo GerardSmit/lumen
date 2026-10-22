@@ -254,6 +254,8 @@ pub fn prune_dead_thread_handles() {
     });
 }
 
+static REMOTE_CANVAS_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Default)]
 pub struct CanvasRegistry {
     surfaces: RefCell<HashMap<NodeId, Rc<RefCell<CanvasData>>>>,
@@ -1000,7 +1002,8 @@ impl CanvasRegistry {
         let mut pending = core::mem::take(&mut *self.pending_publish.borrow_mut());
         // Worker publication crosses only a bounded latest-bitmap mailbox. The
         // document owner adopts it at its normal rendering boundary.
-        for (&node, state) in self.surfaces.borrow().iter() {
+        let remote = REMOTE_CANVAS_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        for (&node, state) in self.surfaces.borrow().iter().filter(|_| remote) {
             let mut data = state.borrow_mut();
             let Some(mailbox) = data.remote_inbound.clone() else { continue; };
             let publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
@@ -1011,18 +1014,20 @@ impl CanvasRegistry {
             }
         }
         if publish {
+            let mut queued: std::collections::HashSet<NodeId> = pending.iter().copied().collect();
             for node in core::mem::take(&mut *self.unpublished.borrow_mut()) {
-                if !pending.contains(&node) { pending.push(node); }
+                if queued.insert(node) { pending.push(node); }
             }
-        } else {
+        } else if !pending.is_empty() {
             let surfaces = self.surfaces.borrow();
             let mut unpublished = self.unpublished.borrow_mut();
+            let mut known: std::collections::HashSet<NodeId> = unpublished.iter().copied().collect();
             pending.retain(|node| {
                 let defers = surfaces.get(node).is_some_and(|state| {
                     let data = state.borrow();
                     !data.transferred && data.remote_inbound.is_none()
                 });
-                if defers && !unpublished.contains(node) { unpublished.push(*node); }
+                if defers && known.insert(*node) { unpublished.push(*node); }
                 !defers
             });
         }
@@ -5658,6 +5663,7 @@ fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec
             let _ = ctx.with_instance::<DomOffscreenCanvas, _>(value, |canvas| {
                 canvas.detached.set(true);
                 if canvas.placeholder.is_some() {
+                    REMOTE_CANVAS_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
                     canvas.data.borrow_mut().remote_inbound = payload.publication.clone();
                 }
             });

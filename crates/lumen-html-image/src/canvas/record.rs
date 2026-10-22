@@ -8,7 +8,7 @@ use super::*;
 use lumen_html::layout::LazyImageHandle;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 pub const DEFAULT_MAX_RECORDED_OP_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_PINNED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -82,14 +82,46 @@ pub(super) fn count_pixmap() {
 #[derive(Clone)]
 pub enum CanvasSource {
     Pixels(Arc<Rgba8Image>),
+    Premultiplied(Arc<PremultipliedImage>),
     Lazy(LazyImageHandle),
     Transparent { width: u32, height: u32 },
+}
+
+/// A canvas snapshot kept as the premultiplied pixels the canvas stores, so drawing it onto
+/// another canvas needs no conversion; the straight-alpha image is made once, on first request.
+pub struct PremultipliedImage {
+    pixmap: Pixmap,
+    straight: std::sync::OnceLock<Arc<Rgba8Image>>,
+}
+
+impl PremultipliedImage {
+    pub fn new(pixmap: Pixmap) -> Self {
+        Self { pixmap, straight: std::sync::OnceLock::new() }
+    }
+
+    pub fn pixmap(&self) -> &Pixmap {
+        &self.pixmap
+    }
+
+    pub fn straight(&self) -> Arc<Rgba8Image> {
+        self.straight
+            .get_or_init(|| {
+                let mut pixels = Vec::with_capacity(self.pixmap.data().len());
+                for pixel in self.pixmap.pixels() {
+                    let c = pixel.demultiply();
+                    pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+                }
+                Arc::new(Rgba8Image { width: self.pixmap.width(), height: self.pixmap.height(), pixels })
+            })
+            .clone()
+    }
 }
 
 impl CanvasSource {
     pub fn width(&self) -> u32 {
         match self {
             Self::Pixels(image) => image.width,
+            Self::Premultiplied(image) => image.pixmap.width(),
             Self::Lazy(lazy) => lazy.width(),
             Self::Transparent { width, .. } => *width,
         }
@@ -98,6 +130,7 @@ impl CanvasSource {
     pub fn height(&self) -> u32 {
         match self {
             Self::Pixels(image) => image.height,
+            Self::Premultiplied(image) => image.pixmap.height(),
             Self::Lazy(lazy) => lazy.height(),
             Self::Transparent { height, .. } => *height,
         }
@@ -107,6 +140,7 @@ impl CanvasSource {
     pub fn pixels(&self) -> Option<Arc<Rgba8Image>> {
         match self {
             Self::Pixels(image) => Some(image.clone()),
+            Self::Premultiplied(image) => Some(image.straight()),
             Self::Lazy(lazy) => lazy.pixels(),
             Self::Transparent { width, height } => {
                 let bytes = pixel_bytes(*width, *height).ok()?;
@@ -119,6 +153,7 @@ impl CanvasSource {
     pub fn is_opaque(&self) -> Option<bool> {
         match self {
             Self::Pixels(image) => Some(image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255)),
+            Self::Premultiplied(image) => Some(image.pixmap.pixels().iter().all(|pixel| pixel.alpha() == 255)),
             Self::Lazy(lazy) => lazy.is_opaque(),
             Self::Transparent { .. } => Some(false),
         }
@@ -127,6 +162,7 @@ impl CanvasSource {
     fn identity(&self) -> usize {
         match self {
             Self::Pixels(image) => Arc::as_ptr(image) as usize,
+            Self::Premultiplied(image) => Arc::as_ptr(image) as usize,
             Self::Lazy(lazy) => lazy.id(),
             Self::Transparent { .. } => 0,
         }
@@ -373,6 +409,9 @@ impl CanvasSurface {
             OpKind::FillPath(path, rule) => self.fill_path_now(&path, rule),
             OpKind::StrokePath(path) => self.stroke_path_now(&path),
             OpKind::Image { source, geometry } => {
+                if let CanvasSource::Premultiplied(image) = &source {
+                    return self.draw_pixmap_geometry(image.pixmap(), geometry);
+                }
                 let Some(image) = source.pixels() else {
                     return Ok(());
                 };
@@ -504,6 +543,10 @@ impl CanvasSurface {
         premultiply_alpha: bool,
     ) -> Result<(), ImageError> {
         if !premultiply_alpha || !self.recording() {
+            if let (true, CanvasSource::Premultiplied(image)) = (premultiply_alpha, source) {
+                self.flush();
+                return self.draw_pixmap_geometry(image.pixmap(), geometry);
+            }
             let image = source.pixels().ok_or(ImageError::InvalidViewport)?;
             return match geometry {
                 SourceGeometry::Scaled { x, y, width, height } => {
@@ -589,13 +632,20 @@ impl CanvasSurface {
         if let Some((generation, cached)) = &self.source_cache {
             if *generation == self.generation {
                 if let Some(image) = cached.upgrade() {
-                    return CanvasSource::Pixels(image);
+                    return CanvasSource::Premultiplied(image);
                 }
             }
         }
-        let image = Arc::new(self.snapshot());
-        self.source_cache = Some((self.generation, Arc::downgrade(&image) as Weak<Rgba8Image>));
-        CanvasSource::Pixels(image)
+        let published = self.layers.first().map_or(&self.bitmap, |layer| &layer.bitmap);
+        let image = match published {
+            Some(bitmap) => Arc::new(PremultipliedImage::new(bitmap.clone())),
+            None => {
+                let snapshot = Arc::new(self.snapshot());
+                return CanvasSource::Pixels(snapshot);
+            }
+        };
+        self.source_cache = Some((self.generation, Arc::downgrade(&image)));
+        CanvasSource::Premultiplied(image)
     }
 
     /// `putImageData`: a direct pixel copy that ignores the drawing state.

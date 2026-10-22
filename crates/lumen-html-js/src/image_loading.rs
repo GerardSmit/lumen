@@ -156,6 +156,8 @@ pub(crate) struct ImageLoader {
     discovery: RefCell<Discovery>,
     needs_scan: Cell<bool>,
     has_dirty: Cell<bool>,
+    dirty_all: Cell<bool>,
+    dirty_nodes: RefCell<Vec<NodeId>>,
     loading_remaining: Cell<bool>,
     polled_generation: Cell<Option<u64>>,
     pending_scratch: RefCell<Vec<NodeId>>,
@@ -240,7 +242,7 @@ type ResponsePolicy=Rc<dyn Fn(&str,&str,u32)->Result<lumen_common::csp::Decision
 impl ImageLoader {
     pub(crate) fn invalidate_environment(&self) {
         for request in self.requests.borrow_mut().values_mut(){request.environment_dirty=true;}
-        self.has_dirty.set(true);self.mark_scan_needed();
+        self.mark_dirty(None);self.mark_scan_needed();
     }
     /// Rendering supplies all selection inputs. Warm requests reuse their
     /// parsed/request state until actual environment or auto-size inputs change.
@@ -256,7 +258,7 @@ impl ImageLoader {
             let connected=session.document().is_connected_element(node);
             let width=if connected{session.image_auto_sizes_width(node)}else{None};
             let next=if connected{width.or(request.auto_width)}else{None};
-            if next!=request.auto_width {request.auto_width=next;request.environment_dirty=true;self.has_dirty.set(true);self.mark_scan_needed();}
+            if next!=request.auto_width {request.auto_width=next;request.environment_dirty=true;self.mark_dirty(Some(node));self.mark_scan_needed();}
             if next.is_none()&&!lumen_html::responsive_images::allows_auto_sizes(session.document(),node){dropped.push(node);}
         }
         if !dropped.is_empty(){let mut auto_nodes=self.auto_nodes.borrow_mut();for node in dropped{auto_nodes.remove(&node);}}
@@ -384,7 +386,7 @@ impl ImageLoader {
         let unchanged=request.selected_source.as_ref().is_some_and(|selected|selected.as_deref()==source);
         request.observed_version=None;
         if !unchanged {request.selection_dirty=true;}
-        self.has_dirty.set(true);self.bump_tree_generation();self.mark_scan_needed();
+        self.mark_dirty(Some(node));self.bump_tree_generation();self.mark_scan_needed();
     }
 
     fn note_source_change(&self, document: &Document, node: NodeId) {
@@ -401,7 +403,7 @@ impl ImageLoader {
         // rather than reusing the previous request's base. Even assigning the
         // same relative src can select a new URL after a base change.
         request.selection_dirty = true;
-        self.has_dirty.set(true);
+        self.mark_dirty(Some(node));
         self.tree_generation.set(self.tree_generation.get().wrapping_add(1));
         self.mark_scan_needed();
         // Invalidate any completion task already queued for the previous
@@ -434,6 +436,15 @@ impl ImageLoader {
             .is_some_and(|request| request.selection_dirty||request.environment_dirty)
     }
 
+    fn mark_dirty(&self, node: Option<NodeId>) {
+        self.has_dirty.set(true);
+        match node {
+            Some(node) if !self.dirty_all.get() => self.dirty_nodes.borrow_mut().push(node),
+            Some(_) => {}
+            None => self.dirty_all.set(true),
+        }
+    }
+
     pub(crate) fn has_dirty_requests(&self) -> bool {
         self.has_dirty.get()
     }
@@ -444,12 +455,20 @@ impl ImageLoader {
         if !self.has_dirty.replace(false) {
             return;
         }
-        let dirty = self
-            .requests
-            .borrow()
-            .iter()
-            .filter_map(|(&node, request)| (request.selection_dirty||request.environment_dirty||request.observed_version.is_none()).then_some(node))
-            .collect::<Vec<_>>();
+        let all = self.dirty_all.replace(false);
+        let listed = std::mem::take(&mut *self.dirty_nodes.borrow_mut());
+        let dirty = if all {
+            self.requests
+                .borrow()
+                .iter()
+                .filter_map(|(&node, request)| (request.selection_dirty||request.environment_dirty||request.observed_version.is_none()).then_some(node))
+                .collect::<Vec<_>>()
+        } else {
+            let requests = self.requests.borrow();
+            listed.into_iter()
+                .filter(|node| requests.get(node).is_some_and(|request| request.selection_dirty||request.environment_dirty||request.observed_version.is_none()))
+                .collect::<Vec<_>>()
+        };
         for node in dirty {
             self.synchronize_node(document, node, base);
         }
@@ -754,7 +773,7 @@ impl ImageLoader {
                     entry.insert(Request::default());
                     self.track_auto(document,node);
                     discovery.seen.insert(node);
-                    self.has_dirty.set(true);
+                    self.mark_dirty(Some(node));
                 }
             }
             discovery.key = Some(key);
@@ -794,7 +813,7 @@ impl ImageLoader {
                 if base_changed && request.selected_source.is_some() && request.current.state==RequestState::Unavailable
                     && lumen_html::forms::html_element_local_name(document,node)!=Some("input"){request.selection_dirty=true;}
             }
-            self.has_dirty.set(true);
+            self.mark_dirty(None);
             discovery.key = Some(key);
             discovery.base.clear();
             discovery.base.push_str(base);
@@ -912,7 +931,7 @@ impl ImageLoader {
                 false
             };
             if completed {
-                if request.environment_dirty {self.has_dirty.set(true);self.mark_scan_needed();}
+                if request.environment_dirty {self.mark_dirty(None);self.mark_scan_needed();}
                 self.stage_current_image(request, node);
                 queued.push(QueuedImageEvent {
                     node,
@@ -956,12 +975,12 @@ impl ImageLoader {
     pub(crate) fn pending_blob_sources(&self,document:&Document,base:&str)->Vec<String> {
         self.refresh_discovery(document,base);
         self.synchronize_dirty(document,base);
-        let mut sources=Vec::new();
+        let mut sources=Vec::new();let mut seen=std::collections::HashSet::new();
         for request in self.requests.borrow().values() {
             let loading=request.pending.iter().chain(std::iter::once(&request.current))
                 .filter(|image|image.state==RequestState::Loading&&image.current_src.starts_with("blob:"));
             for image in loading {
-                if !sources.contains(&image.current_src) {sources.push(image.current_src.clone());}
+                if seen.insert(image.current_src.as_str()) {sources.push(image.current_src.clone());}
             }
         }
         sources
