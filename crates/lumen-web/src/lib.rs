@@ -196,6 +196,12 @@ mod cookies;
 #[cfg(not(target_arch = "wasm32"))]
 pub use cookies::BrowserCookies;
 #[cfg(not(target_arch = "wasm32"))]
+mod body_pump;
+#[cfg(not(target_arch = "wasm32"))]
+mod http_cache;
+#[cfg(not(target_arch = "wasm32"))]
+pub use http_cache::CacheMode;
+#[cfg(not(target_arch = "wasm32"))]
 mod http_body;
 #[cfg(target_arch = "wasm32")]
 #[path = "browser_body.rs"]
@@ -742,6 +748,11 @@ pub struct FetchConfig {
     response_body_limit: Option<u64>,
     /// The ceiling for ordinary Fetch/XHR response bodies when the embedder raises or lowers it.
     max_response_body: Option<u64>,
+    http_cache: Option<std::sync::Arc<http_cache::HttpCache>>,
+    /// The `Request.cache` mode of the request this configuration was cloned for.
+    cache_mode: http_cache::CacheMode,
+    /// The mode applied to requests whose own mode is `default`.
+    http_cache_default_mode: http_cache::CacheMode,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -753,6 +764,26 @@ pub(crate) struct FetchRoute {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FetchConfig {
+    /// Store HTTP responses in `dir` (created on demand) and serve them under browser cache
+    /// rules, for `fetch`, `XMLHttpRequest` and the resource loaders alike.
+    pub fn set_http_cache_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        let max = self.http_cache.as_ref().map_or(http_cache::DEFAULT_MAX_BYTES, |cache| cache.max_bytes());
+        self.http_cache = Some(std::sync::Arc::new(http_cache::HttpCache::new(dir.into(), max)));
+    }
+
+    /// The least-recently-used entries beyond this many bytes are evicted (default 1 GiB).
+    pub fn set_http_cache_max_bytes(&mut self, max_bytes: u64) {
+        if let Some(cache) = self.http_cache.take() {
+            self.http_cache = Some(std::sync::Arc::new(http_cache::HttpCache::new(cache.dir().to_path_buf(), max_bytes)));
+        }
+    }
+
+    /// The cache mode of requests that do not choose one. `NoCache` revalidates every stored
+    /// response, so a set of related files never mixes versions.
+    pub fn set_http_cache_default_mode(&mut self, mode: http_cache::CacheMode) {
+        self.http_cache_default_mode = mode;
+    }
+
     /// Attach the embedding browser's jar and trusted top-level browsing context.
     pub fn set_browser_cookies(&mut self, cookies: BrowserCookies, context: lumen_common::cookies::Context) {
         self.cookies = Some(cookies);
@@ -1299,6 +1330,7 @@ mod http_ops {
             }
             fetch_config.manual_redirect = mode == "manual";
         }
+        fetch_config.cache_mode = Default::default();
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_http);
         let cancellation = lumen_os::net::TcpCancellation::default();
         let worker_cancellation = cancellation.clone();
@@ -1308,6 +1340,9 @@ mod http_ops {
         let report_upload_progress = match fetch_options.filter(|value| value.as_obj().is_some()) {
             Some(options) => {
                 fetch_config.cookies_disabled = !matches!(ctx.get_member(&options, "cookiesAllowed"), Ok(Value::Bool(true)));
+                if let Ok(Value::Str(name)) = ctx.get_member(&options, "cache") {
+                    fetch_config.cache_mode = CacheMode::parse(name.as_ref()).unwrap_or_default();
+                }
                 matches!(ctx.get_member(&options, "uploadProgress"), Ok(Value::Bool(true)))
             },
             None => false,

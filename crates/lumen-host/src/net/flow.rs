@@ -147,6 +147,7 @@ struct Flow {
     redirect: Redirect,
     observe_upload: bool,
     force_preflight: bool,
+    cache: String,
     upload_assigned: bool,
     starting: bool,
     internal_response: bool,
@@ -168,7 +169,18 @@ pub fn start(
     spec: RequestSpec,
     done: impl FnOnce(&mut Ctx, Result<Response, Failure>) + 'static,
 ) -> RequestControl {
-    start_internal(ctx,spec,None,false,None,done)
+    start_internal(ctx,spec,None,false,None,"default",done)
+}
+
+/// [`start`] with the request's `RequestCache` mode (`default`, `no-store`, `reload`, `no-cache`,
+/// `force-cache` or `only-if-cached`), which the transport's HTTP cache honors.
+pub fn start_cached(
+    ctx: &mut Ctx,
+    spec: RequestSpec,
+    cache: &str,
+    done: impl FnOnce(&mut Ctx, Result<Response, Failure>) + 'static,
+) -> RequestControl {
+    start_internal(ctx,spec,None,false,None,cache,done)
 }
 
 /// Fetch a user-agent resource without exposing an opaque response to script.
@@ -182,7 +194,7 @@ pub fn start_resource(ctx:&mut Ctx,document_url:&str,spec:RequestSpec,policy:Res
         defer(ctx,move|ctx|done(ctx,Err(type_error("Invalid resource client URL"))));
         return RequestControl::default();
     };
-    start_internal(ctx,spec,Some((origin,false)),true,Some(policy),done)
+    start_internal(ctx,spec,Some((origin,false)),true,Some(policy),"default",done)
 }
 
 /// Send a fixed user-agent CSP report through the same asynchronous request driver.
@@ -197,7 +209,7 @@ pub fn start_policy_report(ctx: &mut Ctx, document_url: &str, url: &str, body: V
     let spec=RequestSpec {method:"POST".into(),url:url.into(),headers:Vec::new(),body:Some(body),
         mode:Mode::NoCors,credentials:Credentials::SameOrigin,redirect:Redirect::Error,
         observe_upload:false,force_preflight:false};
-    start_internal(ctx,spec,origin.map(|origin|(origin,true)),false,None,done)
+    start_internal(ctx,spec,origin.map(|origin|(origin,true)),false,None,"default",done)
 }
 
 /// Reporting API delivery uses normal CORS and same-origin credentials, with
@@ -210,10 +222,10 @@ pub fn start_reporting_report(ctx:&mut Ctx,document_url:&str,url:&str,body:Vec<u
     }
     let spec=RequestSpec{method:"POST".into(),url:url.into(),headers:vec![("content-type".into(),"application/reports+json".into())],body:Some(body),
         mode:Mode::Cors,credentials:Credentials::SameOrigin,redirect:Redirect::Follow,observe_upload:false,force_preflight:true};
-    start_internal(ctx,spec,origin.map(|origin|(origin,false)),false,None,done)
+    start_internal(ctx,spec,origin.map(|origin|(origin,false)),false,None,"default",done)
 }
 
-fn start_internal(ctx:&mut Ctx,spec:RequestSpec,report_origin:Option<(String,bool)>,internal_response:bool,resource_policy:Option<ResourcePolicy>,
+fn start_internal(ctx:&mut Ctx,spec:RequestSpec,report_origin:Option<(String,bool)>,internal_response:bool,resource_policy:Option<ResourcePolicy>,cache:&str,
     done:impl FnOnce(&mut Ctx,Result<Response,Failure>)+'static)->RequestControl {
     let control = RequestControl::default();
     let Some(transport) = Transport::current(ctx) else {
@@ -247,6 +259,7 @@ fn start_internal(ctx:&mut Ctx,spec:RequestSpec,report_origin:Option<(String,boo
         redirect: spec.redirect,
         observe_upload: spec.observe_upload,
         force_preflight: spec.force_preflight,
+        cache: cache.to_owned(),
         upload_assigned: false,
         starting: true,
         internal_response,
@@ -389,6 +402,7 @@ fn send(
             redirect: state.redirect,
             upload_progress: observe || state.force_preflight,
             force_preflight: state.force_preflight,
+            cache: state.cache.clone(),
         };
         (state.transport.clone(), state.control.clone(), options, observe)
     };

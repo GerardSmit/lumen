@@ -3,7 +3,7 @@
 //! redirects followed up to 5 hops. HTTPS goes through lumen-tls (the dynamically loaded system
 //! OpenSSL on Unix, rustls on Windows) with CA and hostname verification.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
 
 use crate::url;
@@ -43,28 +43,72 @@ pub(crate) struct OpenHttpResponse {
 }
 
 pub(crate) struct OpenHttpBody {
-    reader: Option<BodyReader<BufReader<Box<dyn ReadWrite>>>>,
+    reader: Option<BodyReader<Box<dyn BufRead + Send>>>,
     pub cancellation: lumen_os::net::TcpCancellation,
+    tee: Option<crate::http_cache::Tee>,
 }
+
+/// What one read asks the transport for; a buffer this size lets a fast connection return it whole.
+const READ_BUFFER: usize = 256 << 10;
 
 impl OpenHttpBody {
     pub fn is_empty(&self) -> bool {
         self.reader.as_ref().is_none_or(|reader| !reader.has_body())
     }
+
+    pub(crate) fn from_source(
+        source: Box<dyn BufRead + Send>,
+        framing: lumen_os::http_body::Framing,
+        limit: u64,
+        cancellation: lumen_os::net::TcpCancellation,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: Some(BodyReader::new(source, framing, limit)?),
+            cancellation,
+            tee: None,
+        })
+    }
+
     pub fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         let result = if self.cancellation.is_cancelled() {
             Err(std::io::ErrorKind::Interrupted.into())
         } else {
             match self.reader.as_mut() {
-                Some(reader) => reader.read_chunk(64 << 10),
+                Some(reader) => reader.read_chunk(READ_BUFFER),
                 None => Ok(None),
             }
         };
+        match &result {
+            Ok(Some(chunk)) => {
+                if let Some(tee) = self.tee.as_mut() {
+                    if !tee.write(chunk) {
+                        self.tee = None;
+                    }
+                }
+            }
+            Ok(None) => {
+                if let Some(tee) = self.tee.take() {
+                    tee.commit();
+                }
+            }
+            Err(_) => self.tee = None,
+        }
         if !matches!(result, Ok(Some(_))) {
             self.reader = None;
             self.cancellation.detach();
         }
         result
+    }
+}
+
+impl OpenHttpResponse {
+    pub(crate) fn with_tee(mut self, tee: crate::http_cache::Tee) -> Self {
+        if self.body.is_empty() {
+            tee.commit();
+        } else {
+            self.body.tee = Some(tee);
+        }
+        self
     }
 }
 
@@ -454,7 +498,7 @@ fn open_request_cancellable_with_redirect_origin(
                 if !value.is_empty() { headers.push(("Cookie".into(), value)); }
             }
         }
-        let result = one_request(
+        let result = one_request_through_cache(
             &method,
             &u,
             &headers,
@@ -616,6 +660,30 @@ pub(crate) fn resolve_route(
     Ok(route)
 }
 
+fn one_request_through_cache(
+    method: &str,
+    u: &url::Url,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    cancellation: &lumen_os::net::TcpCancellation,
+    config: &crate::FetchConfig,
+    upload: Option<&lumen_common::http_body::UploadProgress>,
+) -> Result<OpenHttpResponse, String> {
+    let Some(cache) = config.http_cache.as_ref() else {
+        return one_request(method, u, headers, body, cancellation, config, upload);
+    };
+    let settings = crate::http_cache::Settings {
+        cache,
+        mode: config.cache_mode,
+        embedder_default: config.http_cache_default_mode,
+        cancellation,
+        body_limit: config.response_body_limit(),
+    };
+    crate::http_cache::request(&settings, method, u, headers, &mut |headers| {
+        one_request(method, u, headers, body, cancellation, config, upload)
+    })
+}
+
 fn one_request(
     method: &str,
     u: &url::Url,
@@ -703,7 +771,7 @@ fn one_request(
         upload.mark_complete();
     }
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::with_capacity(READ_BUFFER, stream);
     let mut header_budget = MAX_HEADER_BYTES;
     let (status, status_text, headers_out) = loop {
         let mut bytes = Vec::new();
@@ -730,16 +798,19 @@ fn one_request(
 
     let framing = lumen_os::http_body::framing(method, status, &headers_out)
         .map_err(|error| format!("fetch '{}': framing: {error}", u.href()))?;
-    let reader = BodyReader::new(reader, framing, config.response_body_limit())
-        .map_err(|error| format!("fetch '{}': body: {error}", u.href()))?;
+    let source: Box<dyn BufRead + Send> = Box::new(reader);
+    let body = OpenHttpBody::from_source(
+        source,
+        framing,
+        config.response_body_limit(),
+        cancellation.clone(),
+    )
+    .map_err(|error| format!("fetch '{}': body: {error}", u.href()))?;
     Ok(OpenHttpResponse {
         status,
         status_text,
         headers: headers_out,
-        body: OpenHttpBody {
-            reader: Some(reader),
-            cancellation: cancellation.clone(),
-        },
+        body,
         url: String::new(), // stamped by the redirect loop
     })
 }

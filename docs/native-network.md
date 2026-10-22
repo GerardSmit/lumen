@@ -216,6 +216,31 @@ same module exists and the operations throw `unsupported`.
   connection as such.
 - `Lumen.serve` throws `RangeError` for a `port` outside 0..65535.
 
+## Response bodies and the HTTP cache (desktop)
+
+- A streamed response body is read by one dedicated thread per body (`lumen-web/src/body_pump.rs`),
+  started on the first `read()`. It reads the socket with a 256 KiB buffer into a queue (stopping at
+  4 MiB unconsumed); each `read()` promise settles through a `Completer` with everything queued, up
+  to 1 MiB, so a fast connection costs few loop turns and `progress` events, and no thread is spawned
+  per read.
+- `FetchConfig::set_http_cache_dir(dir)` turns on a disk cache under the shared transport
+  (`lumen-web/src/http_cache.rs`, an RFC 9111 subset), so `fetch`, `XMLHttpRequest` and the
+  resource loaders (`load_resource_with_config`, ...) all use it. `GET` 200 responses are stored
+  as `<key>.meta` plus `<key>.<nonce>.body` (temporary file, then rename; the body is teed to disk
+  while it streams and committed when it ends cleanly). Freshness is `max-age`, `Expires`, then
+  10 % of `Date - Last-Modified` capped at a day; `no-store` is never stored, `no-cache` always
+  revalidates, `Vary` selects the stored response (`Vary: *` is not stored). Stale entries with
+  `ETag`/`Last-Modified` are revalidated; a 304 refreshes the stored headers and serves the stored
+  body, a 200 replaces the entry. `Request.cache` (`default`, `no-store`, `reload`, `no-cache`,
+  `force-cache`, `only-if-cached`) reaches the transport as the `cache` fetch option; conditional or
+  `Cache-Control: no-cache` request headers imply `no-store`/`no-cache` as in Fetch. Unsafe methods
+  invalidate the URL's entry. The directory is capped (`set_http_cache_max_bytes`, 1 GiB by
+  default) with least-recently-used eviction; unparsable, short or CRC-failing entries are
+  ignored and deleted. `set_http_cache_default_mode(CacheMode::NoCache)` revalidates every stored
+  response for requests that do not choose a mode, which keeps related files on one version.
+- Bodies are stored as the transport delivers them (transfer-decoded); `Content-Encoding` is not
+  removed by the cache.
+
 ## Still JavaScript
 
 None in `lumen-web`: it has no JS glue left ([native-events.md](native-events.md)), and the service-worker and

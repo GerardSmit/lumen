@@ -119,6 +119,7 @@ pub(crate) struct SendOptions {
     pub redirect: Redirect,
     pub upload_progress: bool,
     pub force_preflight: bool,
+    pub cache: String,
 }
 
 pub(crate) fn mode_name(mode: Mode) -> &'static str {
@@ -399,6 +400,7 @@ impl Transport {
             ("redirect", Value::str(redirect_name(options.redirect))),
             ("uploadProgress", Value::Bool(options.upload_progress)),
             ("forcePreflight", Value::Bool(options.force_preflight)),
+            ("cache", Value::str(&options.cache)),
         ] {
             let _ = ctx.member_set(&option_object, key, value);
         }

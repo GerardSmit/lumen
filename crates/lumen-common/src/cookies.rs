@@ -419,6 +419,12 @@ impl CookieJar {
     }
 }
 
+/// An HTTP date (IMF-fixdate, RFC 850 or asctime) as Unix seconds, parsed with the lenient cookie
+/// date algorithm, which accepts all three forms.
+pub fn parse_http_date(value: &str) -> Option<i64> {
+    cookie_date(value)
+}
+
 /// RFC cookie dates are tokenized independently of HTTP's strict IMF-fixdate.
 /// The shared Gregorian implementation supplies epoch arithmetic.
 fn cookie_date(value: &str) -> Option<i64> {

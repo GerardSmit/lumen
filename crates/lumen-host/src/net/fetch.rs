@@ -15,7 +15,7 @@ use super::fetch_body::{
     body_used, clone_body, failure_value, is_null, is_readable_stream, read_all, stream_disturbed,
     stream_locked, stream_value, transfer, unusable, Body, BodyCell, Drain, NetBody, Source,
 };
-use super::flow::{start, RequestControl, RequestSpec, Response as Head, ResponseKind};
+use super::flow::{start_cached, RequestControl, RequestSpec, Response as Head, ResponseKind};
 use super::headers::{
     byte_string, fill, usv, ByteStr, Guard, HeaderError, HeadersData, SharedHeaders,
 };
@@ -697,8 +697,9 @@ fn run_fetch(ctx: &mut Ctx, request: bindings::Request) -> OpResult<Value> {
         observe_upload: false,
         force_preflight: false,
     };
+    let cache = request.extra.cache.clone();
     if is_null(&request.body) {
-        launch(ctx, &state, spec);
+        launch(ctx, &state, spec, cache);
         return Ok(promise);
     }
     let waiting = state.clone();
@@ -709,7 +710,7 @@ fn run_fetch(ctx: &mut Ctx, request: bindings::Request) -> OpResult<Value> {
             Ok(bytes) => {
                 let mut spec = spec;
                 spec.body = Some(bytes);
-                launch(ctx, &waiting, spec);
+                launch(ctx, &waiting, spec, cache);
             }
             Err(reason) => waiting.reject(ctx, reason),
         }),
@@ -718,12 +719,12 @@ fn run_fetch(ctx: &mut Ctx, request: bindings::Request) -> OpResult<Value> {
     Ok(promise)
 }
 
-fn launch(ctx: &mut Ctx, state: &Rc<FetchState>, spec: RequestSpec) {
+fn launch(ctx: &mut Ctx, state: &Rc<FetchState>, spec: RequestSpec, cache: String) {
     if state.aborted.get() || state.deferred.borrow().is_none() {
         return;
     }
     let owner = state.clone();
-    let control = start(ctx, spec, move |ctx, result| on_head(ctx, &owner, result));
+    let control = start_cached(ctx, spec, &cache, move |ctx, result| on_head(ctx, &owner, result));
     *state.control.borrow_mut() = Some(control);
 }
 

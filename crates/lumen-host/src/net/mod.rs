@@ -27,7 +27,7 @@ use crate::events::DomException;
 use lumen::embed::{Ctx, OpError, Value};
 
 pub use body::{extract_body, ExtractedBody};
-pub use flow::{start, start_policy_report, start_reporting_report, start_resource, ResourcePolicy, RequestControl, RequestSpec, Response, ResponseKind};
+pub use flow::{start, start_cached, start_policy_report, start_reporting_report, start_resource, ResourcePolicy, RequestControl, RequestSpec, Response, ResponseKind};
 pub use lumen_common::cors::{Credentials, Mode, Redirect};
 pub use transport::{
     cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, SyncResponse, Transport,
