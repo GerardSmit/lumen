@@ -1065,6 +1065,9 @@ pub struct Interp {
     /// Default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub(crate) import_base: String,
     pub(crate) classic_script_context: Option<Rc<crate::ClassicScriptContext>>,
+    /// Persistent body caches of the classic scripts run through `run_classic_script_cached`
+    /// with recording on, by base URL.
+    pub(crate) script_caches: Vec<(String, Rc<crate::snapshot::BodyCache>)>,
     /// Loaded module namespace objects, keyed by canonical specifier (for `import()` + caching).
     pub(crate) modules: crate::modules::SettingsModuleMap<Value>,
     /// Names explicitly supplied by the host's fingerprinted native module table.
@@ -2081,6 +2084,7 @@ impl Interp {
             import_meta: None,
             import_base: String::new(),
             classic_script_context: None,
+            script_caches: Vec::new(),
             modules: Default::default(),
             native_module_names: Default::default(),
             native_bindings: Default::default(),

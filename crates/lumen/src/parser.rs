@@ -808,6 +808,19 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::LazyParse);
+    let Some(cache) = &lazy.body_cache else {
+        return parse_lazy_body_text(lazy, func);
+    };
+    if let Some(body) = cache.lookup(lazy, func.expr_body) {
+        return Ok(body);
+    }
+    let _scope = crate::snapshot::BodyCacheScope::enter(Some(cache.clone()));
+    let body = parse_lazy_body_text(lazy, func)?;
+    cache.record(lazy, func.expr_body, &body);
+    Ok(body)
+}
+
+fn parse_lazy_body_text(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let (s, e) = (lazy.start as usize, lazy.end as usize);
     let pieces = lazy.src.pieces(s, e).ok_or_else(|| ParseError {
         message: "function body range lies outside its source".into(),
@@ -4995,6 +5008,7 @@ impl Parser {
                         ctx,
                         private_scope: self.private_scope.clone(),
                         aot: None,
+                        body_cache: crate::snapshot::current_body_cache(),
                     };
                     if !self.check_skipped {
                         self.pos = close + 1;
@@ -5065,6 +5079,7 @@ impl Parser {
                 ctx,
                 private_scope,
                 aot: None,
+                body_cache: crate::snapshot::current_body_cache(),
             };
             return Ok((Body::Reloadable(lazy, body), result_strict));
         }
@@ -5321,6 +5336,7 @@ impl Parser {
                     ctx,
                     private_scope,
                     aot: None,
+                    body_cache: crate::snapshot::current_body_cache(),
                 }))
             } else {
                 None

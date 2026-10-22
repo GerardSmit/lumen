@@ -1613,7 +1613,8 @@ impl Interp {
     /// and hash, snapshot format) the script's AST is decoded from it instead of parsed, with
     /// function bodies still parsed lazily on first call. Otherwise the source is parsed and,
     /// when `record` is set, the blob for it is returned for the embedder to store. A blob from
-    /// another source or build only costs the failed check.
+    /// another source or build only costs the failed check. Function bodies parsed later are
+    /// recorded in the script's cache, retrievable through [`finish_script_cache`](Self::finish_script_cache).
     pub fn run_classic_script_cached(
         &mut self,
         source: &str,
@@ -1625,14 +1626,24 @@ impl Interp {
             return (Err(self.throw("EvalError", "dynamic code is unavailable in native execution")), None);
         }
         let mut fresh = None;
-        let parsed = match cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, source)) {
-            Some(hit) => Ok(hit),
-            None => crate::parser::parse_classic_script(source).map(|(body, strict)| {
-                if record {
-                    fresh = Some(crate::snapshot::encode_script_cache(&body, strict, source));
-                }
-                (body, strict)
-            }),
+        let mut body_cache = None;
+        let hit = cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, source, record));
+        let parsed = match hit {
+            Some((body, strict, cache)) => {
+                body_cache = Some(cache);
+                Ok((body, strict))
+            }
+            None => {
+                let cache = record.then(|| crate::snapshot::BodyCache::new(true));
+                let _scope = crate::snapshot::BodyCacheScope::enter(cache.clone());
+                crate::parser::parse_classic_script(source).map(|(body, strict)| {
+                    if let Some(cache) = &cache {
+                        fresh = Some(crate::snapshot::encode_script_cache(&body, strict, source, cache));
+                    }
+                    body_cache = cache;
+                    (body, strict)
+                })
+            }
         };
         let (body, strict) = match parsed {
             Ok(parsed) => parsed,
@@ -1642,6 +1653,10 @@ impl Interp {
             }
         };
         let source_context = context.clone();
+        if let Some(cache) = body_cache.filter(|_| record) {
+            self.script_caches.retain(|(url, _)| *url != source_context.base_url);
+            self.script_caches.push((source_context.base_url.clone(), cache));
+        }
         let previous = self.classic_script_context.replace(context);
         let previous_strict = std::mem::replace(&mut self.strict, strict);
         let name = (!source_context.base_url.is_empty()).then_some(source_context.base_url.as_str());
@@ -1649,6 +1664,16 @@ impl Interp {
         self.strict = previous_strict;
         self.classic_script_context = previous;
         (result, fresh)
+    }
+
+    /// Closes the body cache of the script [`run_classic_script_cached`](Self::run_classic_script_cached)
+    /// ran under `base_url` with `record` set, freeing its memory, and returns the refreshed
+    /// blob: the same top level with every function body parsed so far (those the blob already
+    /// held and those parsed since). `None` when nothing was parsed since the blob the embedder
+    /// holds was produced, or when there is no open cache. Bodies parsed afterwards are not recorded.
+    pub fn finish_script_cache(&mut self, base_url: &str) -> Option<Vec<u8>> {
+        let at = self.script_caches.iter().position(|(url, _)| url == base_url)?;
+        self.script_caches.swap_remove(at).1.finish()
     }
 }
 

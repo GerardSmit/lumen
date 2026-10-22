@@ -86,6 +86,9 @@ struct Writer {
     /// Split mode (see [`encode_split`]): each function is written where it occurs as its
     /// local index, and its header and body go to buffers of their own.
     split: Option<Split>,
+    /// Set when a lazy body refers to a source other than the unit's: its range means nothing
+    /// against the unit text, so the encoding must not be reused.
+    foreign: bool,
 }
 
 /// The per-function output of split mode, by function index, plus the stream being written.
@@ -329,6 +332,7 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
         deps: None,
         unit_src: Some((Rc::from(src), HashMap::new())),
         split: None,
+        foreign: false,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -369,6 +373,7 @@ fn encode_stripped_inner(body: &[Stmt], collect: bool) -> (Vec<u8>, Option<Vec<R
         deps: None,
         unit_src: None,
         split: None,
+        foreign: false,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -425,6 +430,7 @@ fn encode_stripped_inner_keep(
             deps: None,
             unit_src: unit_src.clone().map(|s| (s, HashMap::new())),
             split: None,
+            foreign: false,
         };
         enc_stmts(&mut w, body);
         let (m, text) = KeepMap::build(src, w.ranges.as_deref().unwrap_or(&[]), skip);
@@ -441,6 +447,7 @@ fn encode_stripped_inner_keep(
         deps: Some(Deps::default()),
         unit_src: unit_src.map(|s| (s, HashMap::new())),
         split: split.then(Split::default),
+        foreign: false,
     };
     if !split {
         w.uv(MAGIC as u64);
@@ -512,36 +519,323 @@ pub(crate) fn encode_split(
     encode_stripped_inner_keep(body, keep, true)
 }
 
-/// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
-/// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
-/// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
-const SCRIPT_CACHE_MAGIC: &[u8; 8] = b"LUMENSC1";
+const SCRIPT_CACHE_MAGIC: &[u8; 8] = b"LUMENSC2";
+/// An encoded function body above this is not worth keeping: it would dominate the blob.
+const MAX_BODY_BYTES: usize = 32 << 20;
+/// Cap on the bodies recorded in one run.
+const MAX_FRESH_BYTES: usize = 256 << 20;
 
-/// A persistent parse cache entry for a classic script: header (magic, snapshot version, source
-/// length, strictness) then the [`encode`]d top-level AST, which checks the source hash itself.
-pub(crate) fn encode_script_cache(body: &[Stmt], strict: bool, src: &str) -> Vec<u8> {
-    let snapshot = encode(body, src);
-    let mut out = Vec::with_capacity(21 + snapshot.len());
-    out.extend_from_slice(SCRIPT_CACHE_MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&(src.len() as u64).to_le_bytes());
-    out.push(strict as u8);
-    out.extend_from_slice(&snapshot);
-    out
+#[derive(Clone, Copy)]
+struct BodyLoc {
+    off: u32,
+    len: u32,
+    fresh: bool,
 }
 
-/// The AST and strictness [`encode_script_cache`] stored for exactly this `src`, or `None`.
-pub(crate) fn decode_script_cache(blob: &[u8], src: &str) -> Option<(Vec<Stmt>, bool)> {
+/// The parsed function bodies of one cached classic script, by source range. Every [`LazyBody`]
+/// of the script (and of the functions inside its decoded or parsed bodies) holds the same
+/// `Rc`, so a first call can decode its body from the cache instead of parsing it, and a body
+/// parsed for the first time is recorded for the next blob (see
+/// [`BodyCache::finish`]).
+pub struct BodyCache {
+    record: bool,
+    closed: std::cell::Cell<bool>,
+    state: RefCell<BodyState>,
+}
+
+#[derive(Default)]
+struct BodyState {
+    src_len: u64,
+    strict: bool,
+    /// The encoded top-level AST, kept as it was when the script was parsed (execution
+    /// materialises and rewrites the live tree).
+    top: Vec<u8>,
+    /// The bodies section of the blob this cache was loaded from, and the bodies recorded since.
+    base: Vec<u8>,
+    fresh: Vec<u8>,
+    index: HashMap<(u32, u32), BodyLoc>,
+    /// Ranges not worth recording (over the size cap), so a re-parse does not encode them again.
+    skipped: std::collections::HashSet<(u32, u32)>,
+    dirty: bool,
+}
+
+thread_local! {
+    static CURRENT: RefCell<Option<Rc<BodyCache>>> = const { RefCell::new(None) };
+}
+
+/// The cache the parse or decode running on this thread attaches to the lazy bodies it creates.
+pub(crate) fn current_body_cache() -> Option<Rc<BodyCache>> {
+    CURRENT.with(|c| c.borrow().clone())
+}
+
+/// Makes `cache` the one new lazy bodies are attached to until dropped.
+pub(crate) struct BodyCacheScope(Option<Rc<BodyCache>>);
+
+impl BodyCacheScope {
+    pub(crate) fn enter(cache: Option<Rc<BodyCache>>) -> Self {
+        BodyCacheScope(CURRENT.with(|c| c.replace(cache)))
+    }
+}
+
+impl Drop for BodyCacheScope {
+    fn drop(&mut self) {
+        CURRENT.with(|c| *c.borrow_mut() = self.0.take());
+    }
+}
+
+fn ctx_bits(c: &LazyCtx) -> u16 {
+    (c.strict as u16)
+        | (c.in_generator as u16) << 1
+        | (c.in_async as u16) << 2
+        | (c.module as u16) << 3
+        | (c.allow_new_target as u16) << 4
+        | (c.super_prop_ok as u16) << 5
+        | (c.super_call_ok as u16) << 6
+        | (c.in_derived_class as u16) << 7
+        | (c.no_arguments_refs as u16) << 8
+        | (c.in_field_init as u16) << 9
+}
+
+/// What a body's bytes must agree with before they stand in for a parse of that range.
+fn enc_body_header(w: &mut Writer, lazy: &LazyBody, expr_body: bool) {
+    w.uv(lazy.line as u64);
+    w.bool(lazy.html_comments);
+    w.uv(ctx_bits(&lazy.ctx) as u64);
+    w.bool(expr_body);
+}
+
+fn encode_body(body: &[Stmt], lazy: &LazyBody, src: &Rc<str>, expr_body: bool) -> Option<Vec<u8>> {
+    let mut w = Writer {
+        buf: Vec::new(),
+        scopes: HashMap::new(),
+        strip: false,
+        funcs: None,
+        ranges: None,
+        keep: None,
+        deps: None,
+        unit_src: Some((src.clone(), HashMap::new())),
+        split: None,
+        foreign: false,
+    };
+    // The body's own private scope is the decoder's scope 0, so its nested functions keep
+    // sharing it with the function they are written in.
+    if let Some(scope) = &lazy.private_scope {
+        w.scopes.insert(Rc::as_ptr(scope), 0);
+    }
+    enc_body_header(&mut w, lazy, expr_body);
+    enc_stmts(&mut w, body);
+    (!w.foreign).then_some(w.buf)
+}
+
+fn decode_body(bytes: &[u8], lazy: &LazyBody, src: &Rc<str>, expr_body: bool) -> R<Vec<Stmt>> {
+    let mut r = Reader {
+        buf: bytes,
+        pos: 0,
+        src: src.clone(),
+        scopes: lazy.private_scope.iter().cloned().collect(),
+        funcs: None,
+        split: None,
+    };
+    if r.uv()? != lazy.line as u64
+        || r.bool()? != lazy.html_comments
+        || r.uv()? != ctx_bits(&lazy.ctx) as u64
+        || r.bool()? != expr_body
+    {
+        return Err("snapshot: cached body does not match its function".into());
+    }
+    let body = dec_stmts(&mut r)?;
+    if r.pos != r.buf.len() {
+        return Err("snapshot: trailing data in a cached body".into());
+    }
+    Ok(body)
+}
+
+impl BodyCache {
+    pub(crate) fn new(record: bool) -> Rc<BodyCache> {
+        Rc::new(BodyCache { record, closed: std::cell::Cell::new(false), state: RefCell::new(BodyState::default()) })
+    }
+
+    /// Set once the script's top level is parsed: the encoding later blobs carry unchanged.
+    pub(crate) fn set_top(&self, top: Vec<u8>, strict: bool, src_len: usize) {
+        let mut st = self.state.borrow_mut();
+        st.top = top;
+        st.strict = strict;
+        st.src_len = src_len as u64;
+    }
+
+    /// The decoded body of `lazy`, exactly as parsing its range would give, if the cache holds
+    /// it and it decodes.
+    pub(crate) fn lookup(self: &Rc<Self>, lazy: &LazyBody, expr_body: bool) -> Option<Vec<Stmt>> {
+        if self.closed.get() {
+            return None;
+        }
+        let crate::srctext::Src::Flat(src) = &lazy.src else {
+            return None;
+        };
+        let key = (lazy.start, lazy.end);
+        let decoded = {
+            let st = self.state.borrow();
+            let loc = *st.index.get(&key)?;
+            let store = if loc.fresh { &st.fresh } else { &st.base };
+            let bytes = store.get(loc.off as usize..loc.off as usize + loc.len as usize)?;
+            let _scope = BodyCacheScope::enter(Some(self.clone()));
+            decode_body(bytes, lazy, src, expr_body)
+        };
+        match decoded {
+            Ok(body) => Some(body),
+            Err(_) => {
+                // A body that does not decode is dropped so the parse that follows records a good one.
+                self.state.borrow_mut().index.remove(&key);
+                None
+            }
+        }
+    }
+
+    /// Remember the body just parsed for `lazy`, unless the cache already holds that range.
+    pub(crate) fn record(&self, lazy: &LazyBody, expr_body: bool, body: &[Stmt]) {
+        if !self.record || self.closed.get() {
+            return;
+        }
+        let crate::srctext::Src::Flat(src) = &lazy.src else {
+            return;
+        };
+        let key = (lazy.start, lazy.end);
+        {
+            let st = self.state.borrow();
+            if st.index.contains_key(&key) || st.skipped.contains(&key) {
+                return;
+            }
+        }
+        let bytes = encode_body(body, lazy, src, expr_body);
+        let mut st = self.state.borrow_mut();
+        match bytes {
+            Some(b) if b.len() <= MAX_BODY_BYTES && st.fresh.len() + b.len() <= MAX_FRESH_BYTES => {
+                let off = st.fresh.len() as u32;
+                st.fresh.extend_from_slice(&b);
+                st.index.insert(key, BodyLoc { off, len: b.len() as u32, fresh: true });
+                st.dirty = true;
+            }
+            _ => {
+                st.skipped.insert(key);
+            }
+        }
+    }
+
+    /// The blob for this script as it stands: the top level plus every body known.
+    pub(crate) fn blob(&self) -> Vec<u8> {
+        let st = self.state.borrow();
+        let mut entries: Vec<(&(u32, u32), &BodyLoc)> = st.index.iter().collect();
+        entries.sort_unstable_by_key(|(k, _)| **k);
+        let bodies: usize = entries.iter().map(|(_, l)| l.len as usize + 12).sum();
+        let mut out = Vec::with_capacity(29 + st.top.len() + 4 + bodies);
+        out.extend_from_slice(SCRIPT_CACHE_MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&st.src_len.to_le_bytes());
+        out.push(st.strict as u8);
+        out.extend_from_slice(&(st.top.len() as u64).to_le_bytes());
+        out.extend_from_slice(&st.top);
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for ((start, end), loc) in entries {
+            out.extend_from_slice(&start.to_le_bytes());
+            out.extend_from_slice(&end.to_le_bytes());
+            out.extend_from_slice(&loc.len.to_le_bytes());
+            let store = if loc.fresh { &st.fresh } else { &st.base };
+            out.extend_from_slice(&store[loc.off as usize..(loc.off + loc.len) as usize]);
+        }
+        out
+    }
+
+    /// A new blob if bodies were recorded since the last one handed out (or since the script
+    /// was parsed), else `None`.
+    pub(crate) fn take_update(&self) -> Option<Vec<u8>> {
+        if !self.record || !std::mem::take(&mut self.state.borrow_mut().dirty) {
+            return None;
+        }
+        Some(self.blob())
+    }
+
+    /// The final update, if any, after which the cache holds nothing and every lookup misses.
+    pub(crate) fn finish(&self) -> Option<Vec<u8>> {
+        let update = self.take_update();
+        self.closed.set(true);
+        *self.state.borrow_mut() = BodyState::default();
+        update
+    }
+
+    fn load(&self, top: &[u8], strict: bool, src_len: usize, bodies: &[u8], index: HashMap<(u32, u32), BodyLoc>) {
+        let mut st = self.state.borrow_mut();
+        st.top = top.to_vec();
+        st.strict = strict;
+        st.src_len = src_len as u64;
+        st.base = bodies.to_vec();
+        st.index = index;
+    }
+}
+
+/// A persistent parse cache entry for a classic script: header (magic, snapshot version, source
+/// length, strictness), the length-prefixed [`encode`]d top-level AST (which checks the source
+/// hash itself), then the bodies section: a count and, per body, its source range, length and
+/// [`encode_body`] bytes.
+pub(crate) fn encode_script_cache(body: &[Stmt], strict: bool, src: &str, cache: &BodyCache) -> Vec<u8> {
+    cache.set_top(encode(body, src), strict, src.len());
+    cache.blob()
+}
+
+/// The bodies section's index, `None` unless it is well formed and its ranges lie in `src_len`.
+fn read_body_index(mut bodies: &[u8], src_len: usize) -> Option<HashMap<(u32, u32), BodyLoc>> {
+    u32::try_from(bodies.len()).ok()?;
+    let total = bodies.len();
+    let (count, rest) = bodies.split_first_chunk::<4>()?;
+    bodies = rest;
+    let count = u32::from_le_bytes(*count) as usize;
+    if count > total / 12 {
+        return None;
+    }
+    let mut index = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let (head, rest) = bodies.split_first_chunk::<12>()?;
+        let start = u32::from_le_bytes(head[0..4].try_into().ok()?);
+        let end = u32::from_le_bytes(head[4..8].try_into().ok()?);
+        let len = u32::from_le_bytes(head[8..12].try_into().ok()?);
+        if start > end || end as usize > src_len || len as usize > rest.len() {
+            return None;
+        }
+        let off = (total - rest.len()) as u32;
+        index.insert((start, end), BodyLoc { off, len, fresh: false });
+        bodies = &rest[len as usize..];
+    }
+    bodies.is_empty().then_some(index)
+}
+
+/// The AST, strictness and body cache [`encode_script_cache`] stored for exactly this `src`, or
+/// `None`. Offsets in the index count from the start of the bodies section.
+pub(crate) fn decode_script_cache(blob: &[u8], src: &str, record: bool) -> Option<(Vec<Stmt>, bool, Rc<BodyCache>)> {
     let rest = blob.strip_prefix(SCRIPT_CACHE_MAGIC)?;
     let (version, rest) = rest.split_first_chunk::<4>()?;
     let (len, rest) = rest.split_first_chunk::<8>()?;
-    let (&strict, snapshot) = rest.split_first()?;
+    let (&strict, rest) = rest.split_first()?;
+    let (top_len, rest) = rest.split_first_chunk::<8>()?;
     if u32::from_le_bytes(*version) != VERSION || u64::from_le_bytes(*len) != src.len() as u64 || strict > 1 {
         return None;
     }
-    decode(snapshot, src).ok().map(|body| (body, strict == 1))
+    let top_len = usize::try_from(u64::from_le_bytes(*top_len)).ok()?;
+    if top_len > rest.len() {
+        return None;
+    }
+    let (top, bodies) = rest.split_at(top_len);
+    let index = read_body_index(bodies, src.len())?;
+    let cache = BodyCache::new(record);
+    let body = {
+        let _scope = BodyCacheScope::enter(Some(cache.clone()));
+        decode(top, src).ok()?
+    };
+    cache.load(top, strict == 1, src.len(), bodies, index);
+    Some((body, strict == 1, cache))
 }
 
+/// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
+/// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
+/// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
     decode_shared(bytes, Rc::from(src))
 }
@@ -817,6 +1111,7 @@ impl SplitUnit {
                 unit: self.clone(),
                 idx: i,
             })),
+            body_cache: None,
         };
         let f = Rc::new(Function {
             name,
@@ -2025,17 +2320,7 @@ fn enc_lazy(w: &mut Writer, l: &LazyBody) {
     w.uv(l.end as u64);
     w.uv(l.line as u64);
     w.bool(l.html_comments);
-    let c = &l.ctx;
-    let bits = (c.strict as u16)
-        | (c.in_generator as u16) << 1
-        | (c.in_async as u16) << 2
-        | (c.module as u16) << 3
-        | (c.allow_new_target as u16) << 4
-        | (c.super_prop_ok as u16) << 5
-        | (c.super_call_ok as u16) << 6
-        | (c.in_derived_class as u16) << 7
-        | (c.no_arguments_refs as u16) << 8
-        | (c.in_field_init as u16) << 9;
+    let bits = ctx_bits(&l.ctx);
     w.uv(bits as u64);
     enc_scope(w, &l.private_scope);
 }
@@ -2065,6 +2350,7 @@ fn dec_lazy(r: &mut Reader) -> R<LazyBody> {
         ctx,
         private_scope: dec_scope(r)?,
         aot: None,
+        body_cache: current_body_cache(),
     })
 }
 
@@ -2102,6 +2388,9 @@ fn enc_function(w: &mut Writer, f: &Rc<Function>) {
     let lazy = f.lazy.borrow();
     match lazy.as_ref() {
         Some(l) => {
+            if !w.is_unit_src(&l.src) {
+                w.foreign = true;
+            }
             w.u8(1);
             enc_lazy(w, l);
         }

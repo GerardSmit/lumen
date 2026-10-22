@@ -233,6 +233,9 @@ pub struct LazyBody {
     /// An ahead-of-time function's body: encoded statements in the blob, decoded (instead of
     /// parsed from `src`, which is then empty) on first use — see `crate::precompiled`.
     pub aot: Option<Rc<crate::precompiled::AotBody>>,
+    /// The persistent body cache of the classic script this body belongs to, shared by all of
+    /// its bodies: a first call decodes the body from it when it holds the range.
+    pub body_cache: Option<Rc<crate::snapshot::BodyCache>>,
 }
 
 impl std::fmt::Debug for LazyBody {
