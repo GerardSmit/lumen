@@ -14,10 +14,33 @@ pub fn random_bytes(n: usize) -> Result<Vec<u8>, OpError> {
     Ok(buffer)
 }
 
-/// A random (version 4) UUID in canonical text form.
+const POOL_BYTES: usize = 4096;
+
+struct Pool {
+    bytes: [u8; POOL_BYTES],
+    next: usize,
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Pool> = const {
+        std::cell::RefCell::new(Pool { bytes: [0; POOL_BYTES], next: POOL_BYTES })
+    };
+}
+
+/// A random (version 4) UUID in canonical text form. Entropy comes from the OS in pooled 4 KiB
+/// reads, so creating thousands of UUIDs does not cost a system call each.
 pub fn random_uuid() -> Result<String, OpError> {
     let mut bytes = [0u8; 16];
-    fill_random(&mut bytes)?;
+    POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.next + bytes.len() > POOL_BYTES {
+            fill_random(&mut pool.bytes)?;
+            pool.next = 0;
+        }
+        bytes.copy_from_slice(&pool.bytes[pool.next..pool.next + 16]);
+        pool.next += 16;
+        Ok::<(), OpError>(())
+    })?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -49,5 +72,13 @@ mod tests {
             assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'));
             assert!(uuid.bytes().all(|b| b == b'-' || b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         }
+    }
+
+    #[test]
+    fn pooled_uuids_stay_unique_across_pool_refills() {
+        let all: std::collections::HashSet<String> = (0..3 * super::POOL_BYTES / 16 + 7)
+            .map(|_| random_uuid().unwrap())
+            .collect();
+        assert_eq!(all.len(), 3 * super::POOL_BYTES / 16 + 7);
     }
 }

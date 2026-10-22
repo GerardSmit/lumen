@@ -823,6 +823,10 @@ pub(crate) fn max_listeners_warning(
     size: usize,
     kind: &str,
 ) -> OpResult<()> {
+    // A first listener only exceeds a fractional limit below one, which Node's own limits never are.
+    if size <= 1 {
+        return Ok(());
+    }
     let max_key = ctx.symbol_for(MAX_LISTENERS);
     let warned_key = ctx.symbol_for(MAX_LISTENERS_WARNED);
     let max = match ctx
