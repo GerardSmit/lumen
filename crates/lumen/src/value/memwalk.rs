@@ -17,6 +17,13 @@ pub(crate) struct HeapWalk {
     /// Owned property entries (len, capacity) — shared template blocks excluded.
     pub prop_len: usize,
     pub prop_cap: usize,
+    /// Slack (capacity - len) of inline entries and of heap-owned entry vectors.
+    pub inline_slack: usize,
+    pub heap_slack: usize,
+    /// Inline objects by (slot capacity, named entries used).
+    pub inline_hist: [[usize; 9]; 9],
+    /// Heap-owned vectors by (capacity, len), both clamped to 16.
+    pub heap_hist: [[usize; 17]; 17],
     pub scopes: usize,
     pub scope_bytes: usize,
     pub shapes: usize,
@@ -67,6 +74,14 @@ pub(crate) fn walk() -> HeapWalk {
         if !c.entries_shared {
             w.prop_len += c.entries_len;
             w.prop_cap += c.entries_cap;
+            let slack = c.entries_cap - c.entries_len;
+            if c.entries_inline {
+                w.inline_slack += slack;
+                w.inline_hist[c.entries_cap.min(8)][c.entries_len.min(8)] += 1;
+            } else {
+                w.heap_slack += slack;
+                w.heap_hist[c.entries_cap.min(16)][c.entries_len.min(16)] += 1;
+            }
         }
         if let Callable::User(u) = &b.call {
             w.user_fns += 1;

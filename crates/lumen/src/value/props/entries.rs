@@ -76,6 +76,10 @@ impl EntryVec {
         self.cap == 0 && self.len != 0
     }
 
+    pub(in crate::value) fn is_inline_storage(&self) -> bool {
+        self.is_inline()
+    }
+
     #[inline(always)]
     fn is_inline(&self) -> bool {
         self.cap & INLINE_FLAG != 0

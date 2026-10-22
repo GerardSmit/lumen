@@ -694,6 +694,21 @@ impl crate::interpreter::Interp {
             fmt_bytes(w.prop_cap * p),
             fmt_bytes((w.prop_cap - w.prop_len) * p)
         );
+        eprintln!(
+            "[mem]   entry slack: inline {}, heap vectors {}",
+            fmt_bytes(w.inline_slack * p),
+            fmt_bytes(w.heap_slack * p)
+        );
+        for cap in [1, 2, 4, 8] {
+            let row: Vec<String> = (0..=cap).map(|n| w.inline_hist[cap][n].to_string()).collect();
+            eprintln!("[mem]     inline cap {cap} by len 0..: {}", row.join(" "));
+        }
+        for cap in 1..=16 {
+            if w.heap_hist[cap].iter().sum::<usize>() > 0 {
+                let row: Vec<String> = (0..=cap).map(|n| w.heap_hist[cap][n].to_string()).collect();
+                eprintln!("[mem]     heap cap {cap} by len 0..: {}", row.join(" "));
+            }
+        }
         if w.split_views > 0 {
             eprintln!(
                 "[mem]   split views {}: offsets {}, distinct sources {}",
@@ -743,6 +758,24 @@ impl crate::interpreter::Interp {
             fmt_bytes(c.positions),
             fmt_bytes(c.header),
             fmt_bytes(c.slack)
+        );
+        let ic: Vec<String> = c.ic_parts.iter().map(|&b| fmt_bytes(b)).collect();
+        eprintln!(
+            "[mem]     ics: props/objmaps/names/paths/pins/caps/cappins/switch = {}",
+            ic.join(" / ")
+        );
+        eprintln!(
+            "[mem]     property cache sites {}, ever filled {}, with a mid hop {}",
+            c.ic_sites, c.ic_filled, c.ic_deep
+        );
+        eprintln!(
+            "[mem]     chunks with property caches never filled: {} ({})",
+            c.ic_idle_chunks,
+            fmt_bytes(c.ic_idle_bytes)
+        );
+        eprintln!(
+            "[mem]     cache pages touched / total: 8: {}/{}, 16: {}/{}, 32: {}/{}",
+            c.ic_pages[0], c.ic_page_total[0], c.ic_pages[1], c.ic_page_total[1], c.ic_pages[2], c.ic_page_total[2]
         );
         eprintln!(
             "[mem]   precompiled chunks registered, not decoded: {}",

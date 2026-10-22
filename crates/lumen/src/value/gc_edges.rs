@@ -56,7 +56,13 @@ impl Props {
         f: &mut impl FnMut(&Gc),
     ) -> Option<usize> {
         let packed = self.elems.packed_ref().unwrap_or(&[]);
-        let entries = &self.entries[..];
+        // A shared block's references belong to the block, not to each map sharing it: counting
+        // them per map would overstate the edges into the (realm-owned) objects they name.
+        let entries = if self.entries.is_shared() {
+            &[]
+        } else {
+            &self.entries[..]
+        };
         let total = packed.len() + entries.len();
         let end = total.min(from.saturating_add(limit));
         for i in from..end {

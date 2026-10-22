@@ -333,6 +333,111 @@ pub(crate) fn own_props(i: &Interp) -> Option<[(&'static str, Property); 2]> {
     ])
 }
 
+/// The finished map of one legacy function's closures: the function's template with this realm's
+/// `arguments` / `caller` accessors in place, held as a shared entry block so a closure owns no
+/// entries until something writes to it. Kept per realm (not in the AST, which must not retain
+/// realm values). The collector does not count a shared block's references (see
+/// `Props::visit_object_refs`): they are the realm's own intrinsics, which it keeps anyway.
+pub(crate) struct LegacyFnProps {
+    func: std::rc::Weak<Function>,
+    plain: crate::value::Props,
+    named: Option<(Rc<str>, crate::value::Props)>,
+}
+
+/// [`Interp::legacy_fn_props`]' per-function cache. Entries for dead functions are dropped
+/// whenever the map doubles.
+#[derive(Default)]
+pub(crate) struct LegacyFnCache {
+    map: crate::fasthash::FastMap<usize, LegacyFnProps>,
+    prune_at: usize,
+}
+
+impl LegacyFnCache {
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.prune_at = 0;
+    }
+}
+
+impl Interp {
+    /// The shared map for a closure of the legacy function `func` whose template is `base` (the
+    /// non-eager `fn_map`, holding the accessor placeholders), with its inferred `name` when one
+    /// is given and the function has none. The flag says whether the name was applied. `None`
+    /// when the realm has no legacy properties yet or `base` has no placeholders.
+    pub(crate) fn legacy_fn_props(
+        &self,
+        func: &Rc<Function>,
+        base: &crate::value::Props,
+        name: Option<&str>,
+    ) -> Option<(crate::value::Props, bool)> {
+        let own = own_props(self)?;
+        let mut cache = self.legacy_fn_cache.borrow_mut();
+        let key = Rc::as_ptr(func) as usize;
+        if !cache.map.contains_key(&key) {
+            if !(base.contains("arguments") && base.contains("caller")) {
+                return None;
+            }
+            if cache.map.len() >= cache.prune_at.max(1024) {
+                cache.map.retain(|_, e| e.func.strong_count() > 0);
+                cache.prune_at = cache.map.len() * 2;
+            }
+            let mut plain = base.clone();
+            for (key, property) in &own {
+                *plain.get_mut(key)? = property.clone();
+            }
+            plain.share_entries();
+            cache.map.insert(
+                key,
+                LegacyFnProps {
+                    func: Rc::downgrade(func),
+                    plain,
+                    named: None,
+                },
+            );
+        }
+        let entry = cache.map.get_mut(&key)?;
+        let Some(name) = name else {
+            return Some((entry.plain.clone(), false));
+        };
+        let (cached, named) = entry.named.get_or_insert_with(|| {
+            let mut p = entry.plain.clone();
+            p.insert(
+                crate::value::fn_key(1),
+                Property::data(Value::str(name), false, false, true),
+            );
+            p.share_entries();
+            (Rc::from(name), p)
+        });
+        Some(if &**cached == name {
+            (named.clone(), true)
+        } else {
+            (entry.plain.clone(), false)
+        })
+    }
+
+    /// For NamedEvaluation of a closure that still shares its function's legacy map `current`:
+    /// the shared map carrying `name`, so closures of one site keep sharing.
+    pub(crate) fn legacy_named_props(
+        &self,
+        func: &Rc<Function>,
+        current: &crate::value::Props,
+        name: &str,
+    ) -> Option<crate::value::Props> {
+        let shares = self
+            .legacy_fn_cache
+            .borrow()
+            .map
+            .get(&(Rc::as_ptr(func) as usize))
+            .is_some_and(|e| current.shares_entries_with(&e.plain));
+        if !shares {
+            return None;
+        }
+        let base = func.fn_maps.get()?.fn_map.clone();
+        self.legacy_fn_props(func, &base, Some(name))
+            .and_then(|(p, done)| done.then_some(p))
+    }
+}
+
 pub(crate) fn own_props_ready(i:&Interp)->bool {
     i.extra_protos.contains_key(OWN_PROPS)
 }
@@ -407,5 +512,93 @@ mod tests {
                 assert_eq!(got, want, "{tier:?}");
             }
         }
+    }
+
+    fn global(e: &Engine, name: &str) -> crate::value::Gc {
+        match e.interp.global.borrow().props.get(name).map(|p| p.value()) {
+            Some(crate::value::Value::Obj(o)) => o,
+            _ => panic!("{name} is not an object"),
+        }
+    }
+
+    #[test]
+    fn closures_of_one_legacy_function_share_one_entry_block() {
+        let mut e = Engine::new();
+        e.eval(
+            "function mk() { return function () {}; }
+             function named() { return { f: function () {} }; }
+             var a = mk(), b = mk(), c = named().f, d = named().f;",
+            false,
+        )
+        .unwrap();
+        let (a, b, c, d) = (global(&e, "a"), global(&e, "b"), global(&e, "c"), global(&e, "d"));
+        assert!(a.borrow().props.shares_entries_with(&b.borrow().props));
+        assert!(c.borrow().props.shares_entries_with(&d.borrow().props));
+        assert_eq!(a.borrow().props.shape(), c.borrow().props.shape());
+        let name = |o: &crate::value::Gc| match o.borrow().props.get("name").map(|p| p.value()) {
+            Some(crate::value::Value::Str(s)) => s.to_string(),
+            _ => panic!("name"),
+        };
+        assert_eq!(name(&a), "");
+        assert_eq!(name(&c), "f");
+    }
+
+    #[test]
+    fn writing_to_a_shared_legacy_closure_leaves_its_siblings_alone() {
+        let src = r#"
+            function mk() { return function () {}; }
+            var a = mk(), b = mk(), out = [];
+            out.push(Object.getOwnPropertyNames(a).join());
+            a.extra = 1;
+            Object.defineProperty(b, "name", { value: "renamed" });
+            var c = mk();
+            out.push(a.extra, b.name, c.name === "", "extra" in c, Object.getOwnPropertyNames(c).join());
+            var ga = Object.getOwnPropertyDescriptor(a, "arguments").get;
+            var gc = Object.getOwnPropertyDescriptor(c, "arguments").get;
+            out.push(ga === gc, delete c.name, c.name, c.hasOwnProperty("name"));
+            var o = { m: function () {}, n: function () {} };
+            out.push(o.m.name, o.n.name, Object.getOwnPropertyNames(o.m).join(),
+                     Object.getOwnPropertyDescriptor(o.m, "arguments").configurable);
+            o.m.arguments = 1;
+            out.push(o.m.arguments, o.n.arguments, (function () {}).prototype !== undefined);
+            out.join("|")
+        "#;
+        let want = "length,name,arguments,caller,prototype|1|renamed|true|false|\
+                    length,name,arguments,caller,prototype|true|true||false|m|n|\
+                    length,name,arguments,caller,prototype|false|||true";
+        for tier in [Tier::Interp, Tier::Bytecode] {
+            assert_eq!(run(src, tier), want, "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn shared_legacy_maps_survive_collections_of_closure_cycles() {
+        let mut e = Engine::new();
+        e.eval(
+            "function mk() { var f = function () { return f; }; f.self = f; return f; }
+             var keep = mk(), n = 0;
+             for (var i = 0; i < 2000; i++) { mk(); n++; }",
+            false,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            e.interp.gc_collect();
+        }
+        let out = e
+            .eval(
+                "var g = Object.getOwnPropertyDescriptor(keep, 'arguments').get;
+                 for (var i = 0; i < 2000; i++) { mk(); }
+                 [typeof g, g.call(keep), keep.arguments, keep.caller, n].join()",
+                false,
+            )
+            .unwrap();
+        for _ in 0..3 {
+            e.interp.gc_collect();
+        }
+        assert!(matches!(&out, Completion::Value(v) if v == "function,,,,2000"));
+        assert!(matches!(
+            e.eval("(function () {}).arguments === null", false).unwrap(),
+            Completion::Value(v) if v == "true"
+        ));
     }
 }

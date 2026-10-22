@@ -226,3 +226,29 @@ fn getters_run_in_sender_heap_and_partial_parcel_cleans_up() {
     }
     assert!(Arc::ptr_eq(&gc_state_handle(), &sender));
 }
+
+#[test]
+fn mid_inline_class_holds_five_and_six_properties_in_the_box() {
+    assert_eq!(heap::SlotClass::inline_for(5), heap::SlotClass::Inline6);
+    assert_eq!(heap::SlotClass::inline_for(6), heap::SlotClass::Inline6);
+    assert_eq!(heap::SlotClass::inline_for(7), heap::SlotClass::Inline8);
+    assert!(heap::SlotClass::Inline6.size() < heap::SlotClass::Inline8.size());
+    let _entered = Enter::new(GcState::new());
+    for wanted in [5usize, 6, 7, 8, 9] {
+        let object = Object::new_with_capacity(None, wanted);
+        for i in 0..wanted {
+            object.borrow_mut().props.insert(
+                format!("k{i}"),
+                Property::data(Value::Num(i as f64), true, true, true),
+            );
+        }
+        let borrowed = object.borrow();
+        for i in 0..wanted {
+            let got = borrowed.props.get(&format!("k{i}")).map(|p| p.value());
+            assert!(matches!(got, Some(Value::Num(n)) if n == i as f64));
+        }
+        let keys: Vec<_> = borrowed.props.keys().into_iter().map(|k| k.to_string()).collect();
+        let expected: Vec<_> = (0..wanted).map(|i| format!("k{i}")).collect();
+        assert_eq!(keys, expected);
+    }
+}

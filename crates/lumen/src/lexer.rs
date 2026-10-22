@@ -365,17 +365,6 @@ pub(crate) fn tokenize_opts(
     tokenize_pieces(&[src], html_comments, line, opts)
 }
 
-/// [`tokenize_range`] over a range held as consecutive pieces (see `Src::pieces`): the lexer
-/// carries its state from one piece to the next, so the tokens are those of the concatenation,
-/// with offsets counted across the pieces. A token must not span two pieces.
-pub(crate) fn tokenize_range_pieces(
-    pieces: &[&str],
-    html_comments: bool,
-    line: u32,
-) -> Result<TokVec, LexError> {
-    tokenize_pieces(pieces, html_comments, line, LexOpts::default()).map(|l| l.tokens)
-}
-
 /// Most identifier names a [`LexScratch`] keeps between lexes.
 const SCRATCH_IDENTS: usize = 32 * 1024;
 

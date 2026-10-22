@@ -1499,6 +1499,16 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool, force_
     let cap_cache_len = c.names.len();
     let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
     let positions = positions::encode(&c.ops, &c.sites);
+    c.ops.shrink_to_fit();
+    c.consts.shrink_to_fit();
+    c.names.shrink_to_fit();
+    c.slot_names.shrink_to_fit();
+    c.var_force_resets.shrink_to_fit();
+    c.funcs.shrink_to_fit();
+    c.classes.shrink_to_fit();
+    c.cap_inits.shrink_to_fit();
+    c.caches.shrink_to_fit();
+    c.name_caches.shrink_to_fit();
     Some(jit::track_chunk(Rc::new(Chunk {
         debug_name: func.name.clone().unwrap_or_else(|| "<anonymous>".into()),
         ops: c.ops,

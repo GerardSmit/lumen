@@ -39,6 +39,8 @@ const SLOTS_OFF: usize = 64;
 pub(crate) const INLINE_PROPS_NARROW: usize = 2;
 /// Property slots trailing a [`SlotClass::Inline`] box.
 pub(crate) const INLINE_PROPS: usize = 4;
+/// Property slots trailing a [`SlotClass::Inline6`] box.
+pub(crate) const INLINE_PROPS_MID: usize = 6;
 /// Property slots trailing a [`SlotClass::Inline8`] box.
 pub(crate) const INLINE_PROPS_WIDE: usize = 8;
 /// Named-property slots of an array box: its `length` (more named keys spill to the heap).
@@ -46,10 +48,10 @@ pub(crate) const ARRAY_NAMED: usize = 1;
 /// The most element slots an array box carries ([`SlotClass::Array4`]).
 pub(crate) const ARRAY_SLOTS_MAX: usize = 4;
 /// Number of slot classes.
-pub(crate) const CLASSES: usize = 7;
+pub(crate) const CLASSES: usize = 8;
 /// Slot class names, by index (the `LUMEN_MEM_STATS` report).
 pub(crate) const CLASS_NAMES: [&str; CLASSES] = [
-    "plain", "inline2", "inline4", "inline8", "array0", "array2", "array4",
+    "plain", "inline2", "inline4", "inline8", "array0", "array2", "array4", "inline6",
 ];
 /// How long empty chunks must stay unused before [`ObjHeap::trim_if_emptied`] returns them.
 const PURGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -102,7 +104,7 @@ pub(super) enum SlotClass {
     Inline2 = 1,
     /// A [`GcBox`] followed by [`INLINE_PROPS`] uninitialized [`Property`] slots.
     Inline = 2,
-    /// A [`GcBox`] followed by [`INLINE_PROPS_WIDE`] property slots: objects of five to
+    /// A [`GcBox`] followed by [`INLINE_PROPS_WIDE`] property slots: objects of seven or
     /// eight properties (a literal or constructor template that size) in one block.
     Inline8 = 3,
     /// An array: a [`GcBox`], [`ARRAY_NAMED`] property slot and the element sidecar
@@ -113,6 +115,10 @@ pub(super) enum SlotClass {
     Array2 = 5,
     /// As [`Array2`](SlotClass::Array2) with [`ARRAY_SLOTS_MAX`] element slots.
     Array4 = 6,
+    /// A [`GcBox`] followed by [`INLINE_PROPS_MID`] property slots: objects of five or six
+    /// properties (a six-field value class such as a matrix) without the two spare slots of
+    /// [`Inline8`](SlotClass::Inline8).
+    Inline6 = 7,
 }
 
 impl SlotClass {
@@ -122,6 +128,7 @@ impl SlotClass {
             SlotClass::Inline2 => inline_size(INLINE_PROPS_NARROW),
             SlotClass::Inline => inline_size(INLINE_PROPS),
             SlotClass::Inline8 => inline_size(INLINE_PROPS_WIDE),
+            SlotClass::Inline6 => inline_size(INLINE_PROPS_MID),
             SlotClass::Array0 | SlotClass::Array2 | SlotClass::Array4 => {
                 array_size(self.array_slots())
             }
@@ -138,6 +145,7 @@ impl SlotClass {
             SlotClass::Inline2 => INLINE_PROPS_NARROW,
             SlotClass::Inline => INLINE_PROPS,
             SlotClass::Inline8 => INLINE_PROPS_WIDE,
+            SlotClass::Inline6 => INLINE_PROPS_MID,
             SlotClass::Array0 | SlotClass::Array2 | SlotClass::Array4 => ARRAY_NAMED,
         }
     }
@@ -160,6 +168,8 @@ impl SlotClass {
             SlotClass::Inline2
         } else if n <= INLINE_PROPS {
             SlotClass::Inline
+        } else if n <= INLINE_PROPS_MID {
+            SlotClass::Inline6
         } else {
             SlotClass::Inline8
         }
@@ -222,7 +232,8 @@ const _: () = assert!(SlotClass::Inline8.size().is_multiple_of(SLOT_ALIGN));
 const _: () = assert!(SlotClass::Array0.size().is_multiple_of(SLOT_ALIGN_ALL));
 const _: () = assert!(SlotClass::Array4.size().is_multiple_of(SLOT_ALIGN_ALL));
 const _: () = assert!(SLOTS_OFF.is_multiple_of(SLOT_ALIGN_ALL));
-const _: () = assert!(SlotClass::Array4 as usize + 1 == CLASSES);
+const _: () = assert!(SlotClass::Inline6 as usize + 1 == CLASSES);
+const _: () = assert!(SlotClass::Inline6.size().is_multiple_of(SLOT_ALIGN));
 // Inline storage must stay within `EntryVec`'s reach check (see `props::entries`).
 const _: () = assert!(INLINE_OFF <= 224);
 

@@ -1348,6 +1348,8 @@ pub struct Interp {
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
+    /// Shared maps of legacy function closures, per function (see `reflect::LegacyFnProps`).
+    pub(crate) legacy_fn_cache: std::cell::RefCell<crate::bytecode::reflect::LegacyFnCache>,
     /// Finished `arguments` maps by `2 * argc + unmapped` (small counts): indices, `length`,
     /// `@@iterator` and `callee` laid out once; each activation clones one and patches the
     /// argument values (and a mapped one's `callee`, at the recorded slot) in place. Tagged with
@@ -2201,6 +2203,7 @@ impl Interp {
             deferred_ns: Default::default(),
             deferred_ns_objs: Default::default(),
             mapped_arguments: Default::default(),
+            legacy_fn_cache: Default::default(),
             args_tpls: Vec::new(),
             module_source_objs: Default::default(),
             weak: Default::default(),
@@ -3594,7 +3597,19 @@ impl Interp {
         let lazy = lazy_kind && !self.multi_realm();
         let eager = has_prototype && !lazy;
         let mut named_done = false;
-        let props = match name {
+        let legacy = crate::bytecode::reflect::is_legacy(&func);
+        let shared_legacy = if legacy && !eager {
+            let want = name.filter(|_| func.name.as_deref().is_none_or(str::is_empty));
+            self.legacy_fn_props(&func, fn_map, want)
+        } else {
+            None
+        };
+        let hit = shared_legacy.is_some();
+        let props = if let Some((p, done)) = shared_legacy {
+            named_done = done;
+            p
+        } else {
+            match name {
             Some(n) if !eager && func.name.as_deref().is_none_or(str::is_empty) => {
                 let (cached, p) = &**named.get_or_init(|| {
                     let mut p = fn_map.clone();
@@ -3616,9 +3631,10 @@ impl Interp {
                 Some(e) if eager => e.clone(),
                 _ => fn_map.clone(),
             },
+            }
         };
         let mut props=props;
-        if crate::bytecode::reflect::is_legacy(&func) {
+        if legacy && !hit {
             for (key,property) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
                 props.insert(key,property);
             }

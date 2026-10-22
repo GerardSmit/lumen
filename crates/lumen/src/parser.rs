@@ -3,7 +3,7 @@
 
 use crate::ast::*;
 use crate::lexer::{
-    tokenize_pieces, tokenize_pieces_with, tokenize_range_pieces, LexOpts, LexScratch, SkimHints,
+    tokenize_pieces, tokenize_pieces_with, LexOpts, LexScratch, SkimHints,
 };
 use crate::srctext::Src;
 use crate::token::{Keyword, Name, Punct, RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
@@ -811,19 +811,26 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         line: lazy.line,
         at_eof: false,
     })?;
-    let tokens = tokenize_range_pieces(&pieces, lazy.html_comments, lazy.line).map_err(|e| {
+    let skim = e - s >= SKIM_MIN_BYTES;
+    let opts = LexOpts {
+        skim_min_depth: skim.then_some(0),
+        record_hints: skim,
+        ..LexOpts::default()
+    };
+    let lexed = tokenize_pieces(&pieces, lazy.html_comments, lazy.line, opts).map_err(|e| {
         ParseError {
             message: e.message,
             line: e.line,
             at_eof: false,
         }
     })?;
+    let tokens = lexed.tokens;
     let ctx = lazy.ctx;
     let mut p = Parser {
         jsx: None,
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
-        lex_scratch: Default::default(),
+        lex_scratch: LexScratch::with_hints(lexed.skim_hints),
         pos: 0,
         src: SrcMap::new(lazy.src.clone(), lazy.start, lazy.end),
         lazy: true,
@@ -6643,6 +6650,39 @@ mod skimmed_body_tests {
         let peak = crate::lexer::PEAK_TOKENS.with(|p| p.get());
         assert!(peak > 0);
         assert!(peak * 4 < total, "peak {peak} of {total} tokens");
+    }
+
+    #[test]
+    fn huge_lazy_body_never_holds_all_its_tokens() {
+        let mut body = String::new();
+        let mut count = 0;
+        while body.len() < SKIM_MIN_BYTES + 1024 {
+            body.push_str(&format!(
+                "function g{count}(a, b) {{ var r = 0; {} return r; }}\n",
+                "r += a * b + 1; ".repeat(20)
+            ));
+            count += 1;
+        }
+        let src = format!("var w = function () {{\n{body}}};\n");
+        let total = crate::lexer::tokenize(&src).unwrap().len();
+        let program = parse_script_lazy(&src).unwrap();
+        let Stmt::VarDecl { decls, .. } = &program[0] else {
+            panic!("var declaration")
+        };
+        let Some(Expr::Func(w)) = &decls[0].1 else {
+            panic!("function expression")
+        };
+        let lazy = w.lazy.borrow().clone().expect("lazy body");
+        crate::lexer::PEAK_TOKENS.with(|p| p.set(0));
+        let stmts = parse_lazy_body(&lazy, w).unwrap();
+        let peak = crate::lexer::PEAK_TOKENS.with(|p| p.get());
+        assert_eq!(stmts.len(), count);
+        assert!(peak > 0);
+        assert!(peak * 4 < total, "peak {peak} of {total} tokens");
+        let Stmt::FuncDecl(g) = &stmts[3] else {
+            panic!("function declaration")
+        };
+        assert!(lazy_text(g).ends_with("return r; }"));
     }
 
     #[test]

@@ -437,6 +437,7 @@ impl Interp {
         if vm_realms {
             // Per-realm `arguments` templates are rebuilt on demand; they must not pin a realm.
             self.args_tpls.clear();
+            self.legacy_fn_cache.borrow_mut().clear();
             for r in self.realms.values().filter(|r| r.collectable) {
                 r.for_each_object(|o| o.gc_add_ref());
                 counts.add(Rc::as_ptr(&r.global_env));

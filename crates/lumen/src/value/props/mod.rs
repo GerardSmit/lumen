@@ -27,6 +27,8 @@ pub struct PropsCensus {
     /// Owned capacity; zero for a map sharing a template's entry block.
     pub entries_cap: usize,
     pub entries_shared: bool,
+    /// The entries live in the object's own box (their capacity is a slot class, not a heap block).
+    pub entries_inline: bool,
     pub named_len: usize,
     pub has_sidecar: bool,
     pub owned_shape_keys: usize,
@@ -291,6 +293,7 @@ impl Props {
             entries_len: self.entries.len(),
             entries_cap: self.entries.capacity(),
             entries_shared: self.entries.is_shared(),
+            entries_inline: self.entries.is_inline_storage(),
             named_len: self.named_len(),
             has_sidecar: self.elems.is_present(),
             owned_shape_keys: self

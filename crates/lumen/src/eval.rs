@@ -2914,6 +2914,12 @@ impl Interp {
             // A pristine closure still shares its function's template block: take (or build)
             // the template's named variant so closures of one site keep sharing.
             if let Callable::User(u) = &b.call {
+                if crate::bytecode::reflect::is_legacy(&u.func) {
+                    if let Some(p) = self.legacy_named_props(&u.func, &b.props, name) {
+                        b.props = p;
+                        return;
+                    }
+                }
                 if let Some(maps) = u.func.fn_maps.get() {
                     if b.props.shares_entries_with(&maps.fn_map) {
                         let (cached, named) = &**maps.named.get_or_init(|| {
