@@ -828,6 +828,18 @@ mod tests {
     }
 
     #[test]
+    fn response_body_ceiling_is_embedder_configurable() {
+        let mut config = crate::FetchConfig::default();
+        assert_eq!(config.response_body_limit(), MAX_BODY);
+        config.set_max_response_body(MAX_BODY * 4);
+        assert_eq!(config.response_body_limit(), MAX_BODY * 4);
+        config.set_response_body_limit((MAX_BODY * 8) as usize);
+        assert_eq!(config.response_body_limit(), MAX_BODY * 4);
+        config.set_response_body_limit(1024);
+        assert_eq!(config.response_body_limit(), 1024);
+    }
+
+    #[test]
     fn header_budget_is_shared_across_lines() {
         let raw = b"aaaa\r\nbbbb\r\n";
         let mut r = std::io::Cursor::new(&raw[..]);

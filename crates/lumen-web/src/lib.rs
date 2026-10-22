@@ -740,6 +740,8 @@ pub struct FetchConfig {
     manual_redirect: bool,
     /// A caller-specific cap, enforced by the streaming HTTP body reader.
     response_body_limit: Option<u64>,
+    /// The ceiling for ordinary Fetch/XHR response bodies when the embedder raises or lowers it.
+    max_response_body: Option<u64>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -763,11 +765,21 @@ impl FetchConfig {
     /// Restrict a resource request before allocating its response body. Clones retain the cap
     /// across redirects; ordinary Fetch keeps its existing global limit.
     pub fn set_response_body_limit(&mut self, limit: usize) {
-        self.response_body_limit = Some((limit as u64).min(http::MAX_BODY));
+        self.response_body_limit = Some((limit as u64).min(self.max_response_body()));
+    }
+
+    /// The largest response body ordinary `fetch` and `XMLHttpRequest` accept. Browsers bound it
+    /// by memory only, so an embedder that loads large game or media archives raises it.
+    pub fn set_max_response_body(&mut self, limit: u64) {
+        self.max_response_body = Some(limit);
+    }
+
+    pub fn max_response_body(&self) -> u64 {
+        self.max_response_body.unwrap_or(http::MAX_BODY)
     }
 
     pub(crate) fn response_body_limit(&self) -> u64 {
-        self.response_body_limit.unwrap_or(http::MAX_BODY)
+        self.response_body_limit.unwrap_or_else(|| self.max_response_body())
     }
     /// Restrict requests, including redirected requests, to explicitly configured routes.
     /// Ordinary runtimes allow system DNS by default; fixture runtimes opt into this policy.
