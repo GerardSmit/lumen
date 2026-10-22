@@ -245,3 +245,37 @@ fn indexed_db_upgrade_handler_exception_reports_and_aborts_schema() {
         };
     "#, "done && log.join(',')==='reported,retry'");
 }
+
+#[test]
+fn indexed_db_exposes_interface_globals_with_prototype_members() {
+    run(r#"
+        globalThis.done=false;globalThis.log=[];
+        const check=(ok,message)=>{if(!ok)throw new Error(message)};
+        for(const name of ['IDBCursor','IDBCursorWithValue','IDBDatabase','IDBIndex','IDBObjectStore','IDBRequest','IDBOpenDBRequest','IDBTransaction','IDBKeyRange','IDBFactory','IDBVersionChangeEvent'])
+            check(typeof globalThis[name]==='function',name+' global');
+        check(Object.getPrototypeOf(IDBCursorWithValue)===IDBCursor && IDBCursorWithValue.prototype instanceof IDBCursor,'cursor inheritance');
+        for(const name of ['advance','continue','continuePrimaryKey','update','delete'])
+            check(typeof IDBCursor.prototype[name]==='function',name+' on IDBCursor.prototype');
+        for(const name of ['source','direction','key','primaryKey','request'])
+            check(typeof Object.getOwnPropertyDescriptor(IDBCursor.prototype,name).get==='function',name+' getter');
+        check('value' in IDBCursorWithValue.prototype && !Object.prototype.hasOwnProperty.call(IDBCursor.prototype,'value'),'value getter');
+        for(const [type,member] of [[IDBIndex,'get'],[IDBObjectStore,'put'],[IDBTransaction,'abort'],[IDBDatabase,'close'],[IDBFactory,'open']])
+            check(typeof type.prototype[member]==='function',member);
+        for(const type of [IDBCursor,IDBCursorWithValue,IDBDatabase,IDBIndex,IDBObjectStore,IDBRequest,IDBOpenDBRequest,IDBTransaction,IDBFactory]){
+            let thrown=null;try{new type()}catch(e){thrown=e}
+            check(thrown instanceof TypeError,'illegal constructor '+type.name);
+        }
+        check(typeof IDBKeyRange.bound==='function' && IDBKeyRange.only(1).includes(1),'IDBKeyRange statics');
+        const patched=['advance','continue','continuePrimaryKey'].filter(name=>name in IDBCursor.prototype);
+        check(patched.length===3,'firebase-style prototype probe');
+        const opening=indexedDB.open('interfaces',1);
+        opening.onupgradeneeded=()=>{
+            const store=opening.result.createObjectStore('s');
+            store.createIndex('i','x');
+            check(opening.result instanceof IDBDatabase && store instanceof IDBObjectStore && store.index('i') instanceof IDBIndex,'instance brands');
+            check(opening.transaction instanceof IDBTransaction && indexedDB instanceof IDBFactory,'transaction and factory brands');
+            log.push('brands');
+        };
+        opening.onsuccess=()=>{opening.result.close();done=true};
+    "#, "done && log.join(',')==='brands'");
+}

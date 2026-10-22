@@ -341,6 +341,10 @@ pub mod bindings {
     pub struct IDBObjectStore { name: String, pub(super) state: Rc<TransactionState> }
     #[class(name = "IDBIndex", hint(js(webidl, invalid_this)))]
     pub struct IDBIndex { name: String, store: String, pub(super) object_store: Value, pub(super) state: Rc<TransactionState> }
+    #[class(name = "IDBCursor", hint(js(webidl, invalid_this)))]
+    pub struct IDBCursor { pub(super) source: Value, pub(super) request: Value }
+    #[class(name = "IDBCursorWithValue", extends = IDBCursor, hint(js(webidl, invalid_this)))]
+    pub struct IDBCursorWithValue { pub(super) base: IDBCursor, pub(super) value: Value }
     #[class(name = "IDBVersionChangeEvent", extends = Event, hint(js(webidl, invalid_this)))]
     pub struct IDBVersionChangeEvent { pub(super) base: Event, pub(super) old: u64, pub(super) new: Option<u64> }
     #[class(name = "IDBKeyRange", hint(js(webidl, invalid_this)))]
@@ -616,6 +620,27 @@ pub mod bindings {
                 match result { None => Ok(Value::Undefined), Some((key, _)) if primary_only => Ok(key_value(ctx, &key)), Some((_, bytes)) => crate::structured_clone::deserialize_for_storage(ctx, &bytes) }
             })
         }
+    }
+    #[methods]
+    impl IDBCursor {
+        #[getter] fn source(&self) -> Value { self.source.clone() }
+        #[getter] fn direction(&self) -> String { "next".into() }
+        #[getter] fn key(&self) -> Value { Value::Undefined }
+        #[getter] fn primary_key(&self) -> Value { Value::Undefined }
+        #[getter] fn request(&self) -> Value { self.request.clone() }
+        fn advance(&self, ctx: &mut Ctx, count: u32) -> OpResult<()> {
+            if count == 0 { return Err(OpError::new("TypeError", "advance count must be greater than zero")); }
+            Err(error(ctx, core::Error::InvalidState))
+        }
+        #[method(rename(js = "continue"))]
+        fn continue_(&self, ctx: &mut Ctx, #[default(Value::Undefined)] _key: Value) -> OpResult<()> { Err(error(ctx, core::Error::InvalidState)) }
+        fn continue_primary_key(&self, ctx: &mut Ctx, _key: Value, _primary_key: Value) -> OpResult<()> { Err(error(ctx, core::Error::InvalidState)) }
+        fn update(&self, ctx: &mut Ctx, _value: Value) -> OpResult<Value> { Err(error(ctx, core::Error::InvalidState)) }
+        fn delete(&self, ctx: &mut Ctx) -> OpResult<Value> { Err(error(ctx, core::Error::InvalidState)) }
+    }
+    #[methods]
+    impl IDBCursorWithValue {
+        #[getter] fn value(&self) -> Value { self.value.clone() }
     }
     #[methods]
     impl IDBKeyRange {
