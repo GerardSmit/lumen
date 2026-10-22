@@ -3,36 +3,81 @@
 
 use crate::ir::{Block, Function};
 
+/// Per-block lists in one allocation, indexed by block number.
+pub struct Adj {
+    ranges: Vec<(u32, u32)>,
+    items: Vec<Block>,
+}
+
+impl Adj {
+    fn with_blocks(n: usize) -> Adj {
+        Adj {
+            ranges: vec![(0, 0); n],
+            items: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Adj {
+    type Output = [Block];
+    #[inline]
+    fn index(&self, i: usize) -> &[Block] {
+        let (start, len) = self.ranges[i];
+        &self.items[start as usize..(start + len) as usize]
+    }
+}
+
 pub struct Cfg {
     /// Reachable blocks in reverse postorder from the entry.
     pub rpo: Vec<Block>,
     /// Position of each block in `rpo`, or `usize::MAX` when unreachable.
     pub rpo_index: Vec<usize>,
-    pub preds: Vec<Vec<Block>>,
-    pub succs: Vec<Vec<Block>>,
+    pub preds: Adj,
+    pub succs: Adj,
     /// Immediate dominator; the entry is its own, unreachable blocks have `None`.
     pub idom: Vec<Option<Block>>,
-    /// Loop nesting depth (0 outside loops).
+    /// Loop nesting depth (0 outside loops); filled by [`Cfg::with_loops`].
     pub loop_depth: Vec<u32>,
+    /// Preorder number and subtree size of each block in the dominator tree.
+    dom_pre: Vec<u32>,
+    dom_size: Vec<u32>,
+}
+
+/// The blocks the entry reaches, indexed by block number.
+pub fn reachable(func: &Function) -> Vec<bool> {
+    let mut seen = vec![false; func.blocks.len()];
+    if func.layout.is_empty() {
+        return seen;
+    }
+    let entry = func.entry();
+    seen[entry.index()] = true;
+    let mut work = vec![entry];
+    while let Some(b) = work.pop() {
+        for s in func.successors(b) {
+            if !seen[s.index()] {
+                seen[s.index()] = true;
+                work.push(s);
+            }
+        }
+    }
+    seen
 }
 
 impl Cfg {
+    /// Blocks, edges and dominators.
     pub fn new(func: &Function) -> Cfg {
         let n = func.blocks.len();
-        let mut succs = vec![Vec::new(); n];
+        let mut succs = Adj::with_blocks(n);
         for &b in &func.layout {
-            let mut s = func.successors(b);
-            s.dedup();
-            let mut uniq = Vec::new();
-            for x in s {
-                if !uniq.contains(&x) {
-                    uniq.push(x);
+            let start = succs.items.len();
+            for x in func.successors(b) {
+                if !succs.items[start..].contains(&x) {
+                    succs.items.push(x);
                 }
             }
-            succs[b.index()] = uniq;
+            succs.ranges[b.index()] = (start as u32, (succs.items.len() - start) as u32);
         }
 
-        // Iterative DFS for postorder.
         let mut rpo = Vec::new();
         let mut visited = vec![false; n];
         if !func.layout.is_empty() {
@@ -58,10 +103,24 @@ impl Cfg {
             rpo_index[b.index()] = i;
         }
 
-        let mut preds = vec![Vec::new(); n];
+        let mut preds = Adj::with_blocks(n);
         for &b in &rpo {
             for &s in &succs[b.index()] {
-                preds[s.index()].push(b);
+                preds.ranges[s.index()].1 += 1;
+            }
+        }
+        let mut total = 0u32;
+        for r in &mut preds.ranges {
+            r.0 = total;
+            total += r.1;
+            r.1 = 0;
+        }
+        preds.items = vec![Block(0); total as usize];
+        for &b in &rpo {
+            for &s in &succs[b.index()] {
+                let r = &mut preds.ranges[s.index()];
+                preds.items[(r.0 + r.1) as usize] = b;
+                r.1 += 1;
             }
         }
 
@@ -90,14 +149,38 @@ impl Cfg {
             }
         }
 
-        let mut cfg = Cfg {
+        // A dominator precedes what it dominates in reverse postorder, so subtree sizes
+        // accumulate backwards and preorder numbers forwards.
+        let mut dom_size = vec![1u32; n];
+        for &b in rpo.iter().skip(1).rev() {
+            if let Some(d) = idom[b.index()] {
+                dom_size[d.index()] += dom_size[b.index()];
+            }
+        }
+        let mut dom_pre = vec![0u32; n];
+        let mut next = vec![1u32; n];
+        for &b in rpo.iter().skip(1) {
+            if let Some(d) = idom[b.index()] {
+                dom_pre[b.index()] = dom_pre[d.index()] + next[d.index()];
+                next[d.index()] += dom_size[b.index()];
+            }
+        }
+
+        Cfg {
             rpo,
             rpo_index,
             preds,
             succs,
             idom,
             loop_depth: vec![0; n],
-        };
+            dom_pre,
+            dom_size,
+        }
+    }
+
+    /// [`Cfg::new`] plus loop nesting depths.
+    pub fn with_loops(func: &Function) -> Cfg {
+        let mut cfg = Cfg::new(func);
         cfg.compute_loops();
         cfg
     }
@@ -107,24 +190,16 @@ impl Cfg {
     }
 
     /// Whether `a` dominates `b` (reflexive).
-    pub fn dominates(&self, a: Block, mut b: Block) -> bool {
+    #[inline]
+    pub fn dominates(&self, a: Block, b: Block) -> bool {
         if !self.is_reachable(b) {
             return true;
         }
-        // A dominator precedes what it dominates in reverse postorder: this answers nearly every
-        // query (forward edges, unrelated blocks) without walking a possibly deep idom chain.
-        if self.rpo_index[a.index()] > self.rpo_index[b.index()] {
+        if !self.is_reachable(a) {
             return false;
         }
-        loop {
-            if a == b {
-                return true;
-            }
-            match self.idom[b.index()] {
-                Some(d) if d != b => b = d,
-                _ => return false,
-            }
-        }
+        let (pa, pb) = (self.dom_pre[a.index()], self.dom_pre[b.index()]);
+        pa <= pb && pb < pa + self.dom_size[a.index()]
     }
 
     /// Children of each block in the dominator tree, in RPO order.
@@ -133,6 +208,32 @@ impl Cfg {
         for &b in self.rpo.iter().skip(1) {
             if let Some(d) = self.idom[b.index()] {
                 ch[d.index()].push(b);
+            }
+        }
+        ch
+    }
+
+    /// Children of each block in the dominator tree, in RPO order.
+    pub fn dom_children_adj(&self) -> Adj {
+        let n = self.idom.len();
+        let mut ch = Adj::with_blocks(n);
+        for &b in self.rpo.iter().skip(1) {
+            if let Some(d) = self.idom[b.index()] {
+                ch.ranges[d.index()].1 += 1;
+            }
+        }
+        let mut total = 0u32;
+        for r in &mut ch.ranges {
+            r.0 = total;
+            total += r.1;
+            r.1 = 0;
+        }
+        ch.items = vec![Block(0); total as usize];
+        for &b in self.rpo.iter().skip(1) {
+            if let Some(d) = self.idom[b.index()] {
+                let r = &mut ch.ranges[d.index()];
+                ch.items[(r.0 + r.1) as usize] = b;
+                r.1 += 1;
             }
         }
         ch

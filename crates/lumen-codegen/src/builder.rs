@@ -14,6 +14,8 @@ use crate::ir::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Variable(pub u32);
 
+const NO_DEF: u32 = u32::MAX;
+
 struct BlockState {
     sealed: bool,
     /// Whether the block is in the layout yet (`switch_to_block` appends it once).
@@ -22,7 +24,7 @@ struct BlockState {
     /// this block twice.
     preds: Vec<(Block, Inst)>,
     /// Current definition of each variable at the end of the block (as far as built).
-    defs: Vec<Option<Value>>,
+    defs: Vec<u32>,
     /// Parameters created while unsealed, completed by `seal_block`.
     incomplete: Vec<(Variable, Value)>,
     /// Parameters the front end declared itself (these come first).
@@ -50,7 +52,9 @@ pub struct FunctionBuilder<'a> {
     /// Constants defined so far, each once at the top of the entry block (which dominates every
     /// use). The backends rematerialize constants at their uses, so sharing one definition
     /// costs no register pressure and keeps large functions' IR small.
-    consts: std::collections::HashMap<(Type, u64), Value>,
+    consts: lumen_common::fasthash::FastMap<(Type, u64), Value>,
+    /// Blocks `read` walked through, reused between calls.
+    walked: Vec<Block>,
     /// How many of the entry block's first instructions are pooled constants.
     n_consts: usize,
 }
@@ -64,7 +68,8 @@ impl<'a> FunctionBuilder<'a> {
             cur: None,
             var_types: Vec::new(),
             blocks,
-            consts: std::collections::HashMap::new(),
+            consts: Default::default(),
+            walked: Vec::new(),
             n_consts: 0,
         }
     }
@@ -186,22 +191,21 @@ impl<'a> FunctionBuilder<'a> {
         let defs = &mut self.blocks[block.index()].defs;
         let i = var.0 as usize;
         if defs.len() <= i {
-            defs.resize(i + 1, None);
+            defs.resize(self.var_types.len().max(i + 1), NO_DEF);
         }
-        defs[i] = Some(val);
+        defs[i] = val.0;
     }
 
     fn local_def(&self, block: Block, var: Variable) -> Option<Value> {
-        self.blocks[block.index()]
-            .defs
-            .get(var.0 as usize)
-            .copied()
-            .flatten()
+        match self.blocks[block.index()].defs.get(var.0 as usize) {
+            Some(&d) if d != NO_DEF => Some(Value(d)),
+            _ => None,
+        }
     }
 
     fn read(&mut self, mut block: Block, var: Variable) -> Value {
         // Walk single-predecessor chains iteratively; record the result on every block visited.
-        let mut visited = Vec::new();
+        let base = self.walked.len();
         let val = loop {
             if let Some(v) = self.local_def(block, var) {
                 break v;
@@ -221,7 +225,7 @@ impl<'a> FunctionBuilder<'a> {
                     break v;
                 }
                 1 => {
-                    visited.push(block);
+                    self.walked.push(block);
                     block = st.preds[0].0;
                 }
                 _ => {
@@ -232,9 +236,10 @@ impl<'a> FunctionBuilder<'a> {
                 }
             }
         };
-        for b in visited {
-            self.set_def(b, var, val);
+        for k in base..self.walked.len() {
+            self.set_def(self.walked[k], var, val);
         }
+        self.walked.truncate(base);
         val
     }
 
@@ -254,14 +259,14 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Append the argument for SSA parameter `param` (for `var`) to every predecessor's branch.
     fn add_param_args(&mut self, block: Block, var: Variable, param: Value) {
-        let preds = self.blocks[block.index()].preds.clone();
-        for (pred, term) in preds {
+        for k in 0..self.blocks[block.index()].preds.len() {
+            let (pred, term) = self.blocks[block.index()].preds[k];
             let arg = self.read(pred, var);
-            for call in self.func.insts[term.index()].successors_mut() {
+            self.func.insts[term.index()].for_each_successor_mut(|call| {
                 if call.block == block {
                     call.args.push(arg);
                 }
-            }
+            });
         }
         let _ = param;
     }
@@ -275,16 +280,15 @@ impl<'a> FunctionBuilder<'a> {
             "emitting into a filled block {block}"
         );
         let term = data.is_terminator();
-        let succs: Vec<Block> = data.successors().iter().map(|c| c.block).collect();
         let inst = self.func.make_inst(data);
         self.func.blocks[block.index()].insts.push(inst);
         if term {
-            let mut seen = Vec::new();
-            for s in succs {
-                if seen.contains(&s) {
+            let succs = self.func.insts[inst.index()].successors();
+            for (k, c) in succs.iter().enumerate() {
+                let s = c.block;
+                if succs.iter().take(k).any(|p| p.block == s) {
                     continue;
                 }
-                seen.push(s);
                 debug_assert!(!self.blocks[s.index()].sealed, "branch to sealed {s}");
                 self.blocks[s.index()].preds.push((block, inst));
             }

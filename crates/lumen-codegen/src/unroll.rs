@@ -68,7 +68,7 @@ struct Plan {
 }
 
 fn unroll_one(func: &mut Function) -> bool {
-    let cfg = Cfg::new(func);
+    let cfg = Cfg::with_loops(func);
     // Innermost loops first: deepest headers first.
     let mut headers: Vec<Block> = cfg
         .rpo
@@ -279,13 +279,13 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
                 {
                     let (bmap, vmap) = &copies[k];
                     data.map_args(|v| *vmap.get(&v).unwrap_or(&v));
-                    for c in data.successors_mut() {
+                    data.for_each_successor_mut(|c| {
                         c.block = if c.block == h {
                             next_h
                         } else {
                             *bmap.get(&c.block).unwrap_or(&c.block)
                         };
-                    }
+                    });
                 }
                 let ni = func.make_inst(data);
                 let olds = func.results(inst).to_vec();
@@ -322,11 +322,11 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
             continue;
         }
         if let Some(t) = func.terminator(p) {
-            for c in func.insts[t.index()].successors_mut() {
+            func.insts[t.index()].for_each_successor_mut(|c| {
                 if c.block == h {
                     c.block = h0;
                 }
-            }
+            });
         }
     }
     // Code after the exit read the header's values: now the last copy's.

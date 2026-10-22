@@ -25,11 +25,10 @@ pub struct Legal {
 
 pub fn legalize(func: &mut Function, legal: Legal) {
     // Work over a snapshot of placed instructions; expansions queue what they create.
-    let mut work: Vec<Inst> = func
-        .layout
-        .iter()
-        .flat_map(|&b| func.blocks[b.index()].insts.clone())
-        .collect();
+    let mut work: Vec<Inst> = Vec::with_capacity(func.insts.len());
+    for &b in &func.layout {
+        work.extend_from_slice(&func.blocks[b.index()].insts);
+    }
     work.reverse();
     // The block each placed instruction was in (a hint: expansions move instructions, which
     // `locate` then finds by a full scan).
@@ -40,10 +39,10 @@ pub fn legalize(func: &mut Function, legal: Legal) {
         }
     }
     while let Some(inst) = work.pop() {
-        let data = func.inst(inst).clone();
-        if !needs_rewrite(&data, legal) {
+        if !needs_rewrite(func.inst(inst), legal) {
             continue;
         }
+        let data = func.inst(inst).clone();
         let hint = home.get(inst.index()).copied().flatten();
         let Some((block, pos)) = locate(func, inst, hint) else {
             continue;
@@ -752,7 +751,7 @@ pub fn split_critical_edges(func: &mut Function) {
             out.push(s);
             let j = func.make_inst(InstData::Jump { dest: call });
             func.blocks[s.index()].insts.push(j);
-            *func.insts[term.index()].successors_mut()[slot] = BlockCall {
+            *func.insts[term.index()].successor_mut(slot) = BlockCall {
                 block: s,
                 args: vec![],
             };

@@ -128,6 +128,9 @@ fn views_on() -> bool {
 pub(crate) struct ViewRegistry {
     roots: std::cell::RefCell<crate::fasthash::FastMap<usize, Root>>,
     native_stacks: Cell<usize>,
+    generation: Cell<u32>,
+    scanned: Cell<u32>,
+    skipped: Cell<u32>,
 }
 impl ViewRegistry {
     pub(crate) fn start_native_stack(&self) {
@@ -160,6 +163,34 @@ fn with_roots<R>(
     f: impl FnOnce(&std::cell::RefCell<crate::fasthash::FastMap<usize, Root>>) -> R,
 ) -> R {
     ROOTS.with(|state| f(&state.borrow().roots))
+}
+
+fn bump_generation() {
+    ROOTS.with(|state| {
+        let s = state.borrow();
+        s.generation.set(s.generation.get().wrapping_add(1));
+    });
+}
+
+const RESCAN_EVERY: u32 = 32;
+
+/// Whether a compaction scan is worth its cost: the registry changed since the last one, or
+/// enough calls passed that a root may have become eligible through plain string drops.
+pub(crate) fn scan_due() -> bool {
+    ROOTS.with(|state| {
+        let s = state.borrow();
+        if s.roots.borrow().is_empty() {
+            return false;
+        }
+        let skipped = s.skipped.get();
+        if s.generation.get() == s.scanned.get() && skipped < RESCAN_EVERY {
+            s.skipped.set(skipped + 1);
+            return false;
+        }
+        s.scanned.set(s.generation.get());
+        s.skipped.set(0);
+        true
+    })
 }
 
 fn layout(cap: u32) -> Layout {
@@ -367,6 +398,7 @@ impl LStr {
             let v = alloc(Layout::new::<ViewHdr>()) as *mut ViewHdr;
             let v = NonNull::new(v).expect("allocation failed");
             let slot = with_roots(|r| {
+                bump_generation();
                 let mut r = r.borrow_mut();
                 let e = r.entry(root.as_ptr() as usize).or_insert_with(|| Root {
                     views: Vec::new(),
@@ -425,6 +457,7 @@ impl LStr {
     unsafe fn drop_view(&mut self) {
         let v = self.p.as_ptr() as *mut ViewHdr;
         let (root, slot, len) = ((*v).root, (*v).slot as usize, (*v).h.len.get() as usize);
+        bump_generation();
         with_roots(|r| {
             let mut r = r.borrow_mut();
             let key = root.as_ptr() as usize;

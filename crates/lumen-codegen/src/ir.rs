@@ -616,26 +616,150 @@ impl InstData {
     }
 
     /// The branch targets of a terminator.
-    pub fn successors(&self) -> Vec<&BlockCall> {
+    pub fn successors(&self) -> Successors<'_> {
         match self {
-            InstData::Jump { dest } => vec![dest],
-            InstData::Brif { then, else_, .. } => vec![then, else_],
+            InstData::Jump { dest } => Successors {
+                first: Some(dest),
+                second: None,
+                rest: &[],
+                last: None,
+            },
+            InstData::Brif { then, else_, .. } => Successors {
+                first: Some(then),
+                second: Some(else_),
+                rest: &[],
+                last: None,
+            },
             InstData::BrTable {
                 targets, default, ..
-            } => targets.iter().chain(std::iter::once(default)).collect(),
-            _ => Vec::new(),
+            } => Successors {
+                first: None,
+                second: None,
+                rest: targets,
+                last: Some(default),
+            },
+            _ => Successors {
+                first: None,
+                second: None,
+                rest: &[],
+                last: None,
+            },
         }
     }
 
-    pub fn successors_mut(&mut self) -> Vec<&mut BlockCall> {
+    pub fn successor_mut(&mut self, slot: usize) -> &mut BlockCall {
         match self {
-            InstData::Jump { dest } => vec![dest],
-            InstData::Brif { then, else_, .. } => vec![then, else_],
+            InstData::Jump { dest } => dest,
+            InstData::Brif { then, else_, .. } => {
+                if slot == 0 {
+                    then
+                } else {
+                    else_
+                }
+            }
             InstData::BrTable {
                 targets, default, ..
-            } => targets.iter_mut().chain(std::iter::once(default)).collect(),
-            _ => Vec::new(),
+            } => match targets.get_mut(slot) {
+                Some(t) => t,
+                None => default,
+            },
+            _ => panic!("not a branch"),
         }
+    }
+
+    pub fn for_each_successor_mut(&mut self, mut f: impl FnMut(&mut BlockCall)) {
+        match self {
+            InstData::Jump { dest } => f(dest),
+            InstData::Brif { then, else_, .. } => {
+                f(then);
+                f(else_);
+            }
+            InstData::BrTable {
+                targets, default, ..
+            } => {
+                targets.iter_mut().for_each(&mut f);
+                f(default);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The branch targets of a terminator, in slot order, without allocating.
+#[derive(Clone, Copy)]
+pub struct Successors<'a> {
+    first: Option<&'a BlockCall>,
+    second: Option<&'a BlockCall>,
+    rest: &'a [BlockCall],
+    last: Option<&'a BlockCall>,
+}
+
+impl<'a> Successors<'a> {
+    pub fn len(&self) -> usize {
+        self.first.is_some() as usize
+            + self.second.is_some() as usize
+            + self.rest.len()
+            + self.last.is_some() as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> SuccessorIter<'a> {
+        SuccessorIter { s: *self }
+    }
+}
+
+impl std::ops::Index<usize> for Successors<'_> {
+    type Output = BlockCall;
+    fn index(&self, mut i: usize) -> &BlockCall {
+        for single in [self.first, self.second].into_iter().flatten() {
+            if i == 0 {
+                return single;
+            }
+            i -= 1;
+        }
+        if i < self.rest.len() {
+            return &self.rest[i];
+        }
+        self.last.expect("successor slot")
+    }
+}
+
+pub struct SuccessorIter<'a> {
+    s: Successors<'a>,
+}
+
+impl<'a> Iterator for SuccessorIter<'a> {
+    type Item = &'a BlockCall;
+    fn next(&mut self) -> Option<&'a BlockCall> {
+        if let Some(c) = self.s.first.take() {
+            return Some(c);
+        }
+        if let Some(c) = self.s.second.take() {
+            return Some(c);
+        }
+        if let Some((c, rest)) = self.s.rest.split_first() {
+            self.s.rest = rest;
+            return Some(c);
+        }
+        self.s.last.take()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.s.len();
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for SuccessorIter<'_> {}
+
+impl<'a> IntoIterator for Successors<'a> {
+    type Item = &'a BlockCall;
+    type IntoIter = SuccessorIter<'a>;
+    fn into_iter(self) -> SuccessorIter<'a> {
+        self.iter()
     }
 }
 
@@ -678,6 +802,9 @@ pub struct Function {
     pub layout: Vec<Block>,
     pub sigs: Vec<Signature>,
     pub funcs: Vec<ExtFunc>,
+    /// Some operand may still name an alias: set by [`Function::replace_uses`], cleared by
+    /// [`Function::resolve_aliases`].
+    pending_aliases: bool,
 }
 
 impl Function {
@@ -741,43 +868,52 @@ impl Function {
         Value(self.values.len() as u32 - 1)
     }
 
-    /// The types an instruction produces.
-    pub fn result_types(&self, data: &InstData) -> Vec<Type> {
+    /// The types an instruction produces: up to two directly, or a signature's results.
+    fn result_types(&self, data: &InstData) -> ([Option<Type>; 2], Option<usize>) {
         let ty = |v: Value| self.value_type(v);
+        let one = |t: Type| ([Some(t), None], None);
         match data {
-            InstData::Vzero | InstData::VectorBinary { .. } => vec![Type::V128],
-            InstData::Iconst { ty, .. } => vec![*ty],
-            InstData::SymbolAddr { .. } => vec![Type::I64],
-            InstData::F32const { .. } => vec![Type::F32],
-            InstData::F64const { .. } => vec![Type::F64],
-            InstData::Unary { op, arg } => vec![if *op == UnaryOp::Eqz {
+            InstData::Vzero | InstData::VectorBinary { .. } => one(Type::V128),
+            InstData::Iconst { ty, .. } => one(*ty),
+            InstData::SymbolAddr { .. } => one(Type::I64),
+            InstData::F32const { .. } => one(Type::F32),
+            InstData::F64const { .. } => one(Type::F64),
+            InstData::Unary { op, arg } => one(if *op == UnaryOp::Eqz {
                 Type::I32
             } else {
                 ty(*arg)
-            }],
-            InstData::Binary { args, .. } => vec![ty(args[0])],
-            InstData::CheckedBinary { .. } => vec![Type::I32, Type::I32],
-            InstData::IntCmp { .. } | InstData::FloatCmp { .. } => vec![Type::I32],
-            InstData::Select { if_true, .. } => vec![ty(*if_true)],
-            InstData::Convert { to, .. } => vec![*to],
-            InstData::Load { kind, .. } => vec![kind.ty()],
-            InstData::Call { func, .. } => self.sigs[self.funcs[func.index()].sig.index()]
-                .results
-                .clone(),
-            InstData::CallIndirect { sig, .. } => self.sigs[sig.index()].results.clone(),
-            _ => Vec::new(),
+            }),
+            InstData::Binary { args, .. } => one(ty(args[0])),
+            InstData::CheckedBinary { .. } => ([Some(Type::I32), Some(Type::I32)], None),
+            InstData::IntCmp { .. } | InstData::FloatCmp { .. } => one(Type::I32),
+            InstData::Select { if_true, .. } => one(ty(*if_true)),
+            InstData::Convert { to, .. } => one(*to),
+            InstData::Load { kind, .. } => one(kind.ty()),
+            InstData::Call { func, .. } => ([None, None], Some(self.funcs[func.index()].sig.index())),
+            InstData::CallIndirect { sig, .. } => ([None, None], Some(sig.index())),
+            _ => ([None, None], None),
         }
     }
 
     /// Create an instruction (not yet placed in a block) and its result values.
     pub fn make_inst(&mut self, data: InstData) -> Inst {
-        let tys = self.result_types(&data);
+        let (fixed, sig) = self.result_types(&data);
         let inst = Inst(self.insts.len() as u32);
         self.insts.push(data);
         self.inst_results.push(self.result_pool.len() as u32);
-        for (i, t) in tys.into_iter().enumerate() {
-            let v = self.make_value(t, ValueDef::Result(inst, i as u32));
+        let mut n = 0;
+        for t in fixed.into_iter().flatten() {
+            let v = self.make_value(t, ValueDef::Result(inst, n));
             self.result_pool.push(v);
+            n += 1;
+        }
+        if let Some(sig) = sig {
+            for i in 0..self.sigs[sig].results.len() {
+                let t = self.sigs[sig].results[i];
+                let v = self.make_value(t, ValueDef::Result(inst, n));
+                self.result_pool.push(v);
+                n += 1;
+            }
         }
         inst
     }
@@ -795,15 +931,27 @@ impl Function {
         debug_assert_eq!(self.value_type(from), self.value_type(to));
         debug_assert_ne!(self.resolve(to), from, "alias cycle");
         self.values[from.index()].def = ValueDef::Alias(to);
+        self.pending_aliases = true;
+    }
+
+    pub fn has_pending_aliases(&self) -> bool {
+        self.pending_aliases
     }
 
     /// Rewrite every operand through its alias chain.
     pub fn resolve_aliases(&mut self) {
-        let resolved: Vec<Value> = (0..self.values.len() as u32)
-            .map(|v| self.resolve(Value(v)))
-            .collect();
+        if !self.pending_aliases {
+            return;
+        }
+        self.pending_aliases = false;
+        let values = &self.values;
         for data in &mut self.insts {
-            data.map_args(|v| resolved[v.index()]);
+            data.map_args(|mut v| {
+                while let ValueDef::Alias(to) = values[v.index()].def {
+                    v = to;
+                }
+                v
+            });
         }
     }
 
@@ -813,15 +961,11 @@ impl Function {
         self.insts[last.index()].is_terminator().then_some(last)
     }
 
-    pub fn successors(&self, block: Block) -> Vec<Block> {
-        match self.terminator(block) {
-            Some(t) => self.insts[t.index()]
-                .successors()
-                .iter()
-                .map(|c| c.block)
-                .collect(),
-            None => Vec::new(),
-        }
+    pub fn successors(&self, block: Block) -> impl Iterator<Item = Block> + '_ {
+        self.terminator(block)
+            .into_iter()
+            .flat_map(|t| self.insts[t.index()].successors().iter())
+            .map(|c| c.block)
     }
 
     /// Predecessor lists for every block (duplicates kept per edge).

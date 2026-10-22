@@ -54,120 +54,168 @@ fn def_pos(i: usize) -> u32 {
     2 * i as u32 + 1
 }
 
+/// `pairs` grouped by key (`0..n`) into one allocation, each group in input order.
+struct Groups<T> {
+    offsets: Vec<u32>,
+    items: Vec<T>,
+}
+
+impl<T: Copy + Default> Groups<T> {
+    fn new(n: usize, pairs: &[(u32, T)]) -> Groups<T> {
+        let mut offsets = vec![0u32; n + 1];
+        for &(k, _) in pairs {
+            offsets[k as usize + 1] += 1;
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        let mut items = vec![T::default(); pairs.len()];
+        let mut next = offsets.clone();
+        for &(k, t) in pairs {
+            items[next[k as usize] as usize] = t;
+            next[k as usize] += 1;
+        }
+        Groups { offsets, items }
+    }
+
+    #[inline]
+    fn of(&self, k: usize) -> &[T] {
+        &self.items[self.offsets[k] as usize..self.offsets[k + 1] as usize]
+    }
+}
+
+const NONE: u32 = u32::MAX;
+
 pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
     let nv = code.vreg_class.len();
     let nb = code.blocks.len();
 
     // ----- per-block gen/kill and liveness -----
-    // Upward-exposed uses (gen) and defs (kill) per block, as lists. Only a value in some
-    // block's gen can be live into (and so out of) any block: liveness is solved over those
-    // "global" values alone (most values are block-local).
-    let mut ops = Vec::new();
-    let mut gen_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
-    let mut kill_l: Vec<Vec<u32>> = vec![Vec::new(); nb];
-    let mut kill_at = vec![u32::MAX; nv];
-    let mut gen_at = vec![u32::MAX; nv];
+    // Upward-exposed uses (gen) and defs (kill) per block, as (block, value) pairs in block
+    // order. Only a value in some block's gen can be live into (and so out of) any block:
+    // liveness is solved over those "global" values alone (most values are block-local).
+    // Every instruction's operands are collected once and read again below.
+    let mut ops: Vec<Operand> = Vec::with_capacity(code.insts.len() * 3);
+    let mut op_start: Vec<u32> = Vec::with_capacity(code.insts.len() + 1);
+    let mut gen_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut kill_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut kill_at = vec![NONE; nv];
+    let mut gen_at = vec![NONE; nv];
     for (bi, b) in code.blocks.iter().enumerate() {
         let bu = bi as u32;
         for &p in &b.params {
             if kill_at[p.index()] != bu {
                 kill_at[p.index()] = bu;
-                kill_l[bi].push(p.0);
+                kill_pairs.push((bu, p.0));
             }
         }
         for i in b.start..b.end {
-            ops.clear();
+            debug_assert_eq!(op_start.len(), i);
+            op_start.push(ops.len() as u32);
+            let first = ops.len();
             code.insts[i].operands(&mut ops);
-            for o in &ops {
+            let these = &ops[first..];
+            for o in these {
                 let v = o.vreg.index();
                 if o.kind != OperandKind::Def && kill_at[v] != bu && gen_at[v] != bu {
                     gen_at[v] = bu;
-                    gen_l[bi].push(o.vreg.0);
+                    gen_pairs.push((bu, o.vreg.0));
                 }
             }
-            for o in &ops {
+            for o in these {
                 let v = o.vreg.index();
                 if o.kind != OperandKind::Use && kill_at[v] != bu {
                     kill_at[v] = bu;
-                    kill_l[bi].push(o.vreg.0);
+                    kill_pairs.push((bu, o.vreg.0));
                 }
             }
         }
     }
+    op_start.push(ops.len() as u32);
     drop((kill_at, gen_at));
     // Liveness per global value by path exploration: from each block where it is upward-exposed,
     // walk predecessors (live out of each) until a block that defines it. Linear in the total
     // size of the live ranges, where dense per-block bitsets were blocks x globals per pass.
-    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    let mut pred_pairs: Vec<(u32, u32)> = Vec::new();
     for (bi, b) in code.blocks.iter().enumerate() {
         for &s in &b.succs {
-            preds[s].push(bi as u32);
+            pred_pairs.push((s as u32, bi as u32));
         }
     }
-    let mut gen_of: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    let preds = Groups::new(nb, &pred_pairs);
+    drop(pred_pairs);
+    let mut is_global = vec![false; nv];
     let mut globals: Vec<u32> = Vec::new();
-    for (bi, l) in gen_l.iter().enumerate() {
-        for &v in l {
-            if gen_of[v as usize].is_empty() {
-                globals.push(v);
-            }
-            gen_of[v as usize].push(bi as u32);
+    for &(_, v) in &gen_pairs {
+        if !std::mem::replace(&mut is_global[v as usize], true) {
+            globals.push(v);
         }
     }
-    let mut kill_of: Vec<Vec<u32>> = vec![Vec::new(); nv];
-    for (bi, l) in kill_l.iter().enumerate() {
-        for &v in l {
-            if !gen_of[v as usize].is_empty() {
-                kill_of[v as usize].push(bi as u32);
-            }
-        }
-    }
-    drop((gen_l, kill_l));
-    let mut live_in: Vec<Vec<u32>> = vec![Vec::new(); nb];
-    let mut live_out: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    let gen_of = Groups::new(
+        nv,
+        &gen_pairs.iter().map(|&(b, v)| (v, b)).collect::<Vec<_>>(),
+    );
+    let kill_of = Groups::new(
+        nv,
+        &kill_pairs
+            .iter()
+            .filter(|&&(_, v)| is_global[v as usize])
+            .map(|&(b, v)| (v, b))
+            .collect::<Vec<_>>(),
+    );
+    drop((gen_pairs, kill_pairs, is_global));
+    let mut live_in_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut live_out_pairs: Vec<(u32, u32)> = Vec::new();
     // `mark[b] == stamp` flags for the value being walked (one stamp per value).
     let (mut in_mark, mut out_mark) = (vec![0u32; nb], vec![0u32; nb]);
     let mut kill_mark = vec![0u32; nb];
     let mut work: Vec<u32> = Vec::new();
     for (gi, &v) in globals.iter().enumerate() {
         let stamp = gi as u32 + 1;
-        for &b in &kill_of[v as usize] {
+        for &b in kill_of.of(v as usize) {
             kill_mark[b as usize] = stamp;
         }
-        for &b in &gen_of[v as usize] {
+        for &b in gen_of.of(v as usize) {
             if in_mark[b as usize] != stamp {
                 in_mark[b as usize] = stamp;
-                live_in[b as usize].push(v);
+                live_in_pairs.push((b, v));
                 work.push(b);
             }
         }
         while let Some(b) = work.pop() {
-            for &p in &preds[b as usize] {
+            for &p in preds.of(b as usize) {
                 let pi = p as usize;
                 if out_mark[pi] == stamp {
                     continue;
                 }
                 out_mark[pi] = stamp;
-                live_out[pi].push(v);
+                live_out_pairs.push((p, v));
                 if kill_mark[pi] != stamp && in_mark[pi] != stamp {
                     in_mark[pi] = stamp;
-                    live_in[pi].push(v);
+                    live_in_pairs.push((p, v));
                     work.push(p);
                 }
             }
         }
     }
+    let live_in = Groups::new(nb, &live_in_pairs);
+    let live_out = Groups::new(nb, &live_out_pairs);
     drop((gen_of, kill_of, preds, in_mark, out_mark, kill_mark));
+    drop((live_in_pairs, live_out_pairs));
 
     // ----- intervals: per-block live segments (lifetime holes) -----
-    let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nv];
+    // Segments per value as linked entries (value-order is block order, so each list arrives
+    // sorted; adjacent ones merge), flattened once complete.
+    let mut seg_head = vec![NONE; nv];
+    let mut seg_tail = vec![NONE; nv];
+    let mut seg_pool: Vec<(u32, u32, u32)> = Vec::with_capacity(nv + nv / 2);
     let mut weight = vec![0f64; nv];
     let mut hint: Vec<Option<PReg>> = vec![None; nv];
     // Values that want to share a register: copy source/destination, jump argument/parameter.
-    let mut related: Vec<Vec<VReg>> = vec![Vec::new(); nv];
+    let mut related_pairs: Vec<(u32, VReg)> = Vec::new();
     // Clobber positions per physical register (sorted, since instructions are visited in order).
     let mut clobbers: Vec<Vec<u32>> = vec![Vec::new(); 64];
-    // Per block: the (lo, hi) of each value touched in it, then flushed into `segs`.
+    // Per block: the (lo, hi) of each value touched in it, then flushed into the segments.
     let mut lo = vec![u32::MAX; nv];
     let mut hi = vec![0u32; nv];
     let mut touched: Vec<VReg> = Vec::new();
@@ -186,17 +234,15 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             touch(p, entry, &mut lo, &mut hi, &mut touched);
             weight[p.index()] += w;
         }
-        for (set, pos) in [(&live_in[bi], entry), (&live_out[bi], exit)] {
+        for (set, pos) in [(live_in.of(bi), entry), (live_out.of(bi), exit)] {
             for &v in set {
                 touch(VReg(v), pos, &mut lo, &mut hi, &mut touched);
             }
         }
         for i in b.start..b.end {
             let inst = &code.insts[i];
-            ops.clear();
-            inst.operands(&mut ops);
             let mut clob = inst.clobbers();
-            for o in &ops {
+            for o in &ops[op_start[i] as usize..op_start[i + 1] as usize] {
                 let v = o.vreg;
                 weight[v.index()] += w;
                 match o.kind {
@@ -216,13 +262,13 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 }
             }
             if let Some((dst, src)) = inst.as_move() {
-                related[dst.index()].push(src);
-                related[src.index()].push(dst);
+                related_pairs.push((dst.0, src));
+                related_pairs.push((src.0, dst));
             }
             if let Some((t, args)) = inst.jump_args() {
                 for (&a, &p) in args.iter().zip(&code.blocks[t].params) {
-                    related[a.index()].push(p);
-                    related[p.index()].push(a);
+                    related_pairs.push((a.0, p));
+                    related_pairs.push((p.0, a));
                 }
             }
             for r in clob.iter() {
@@ -230,34 +276,104 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             }
         }
         for v in touched.drain(..) {
-            let s = &mut segs[v.index()];
-            let (l, h) = (lo[v.index()], hi[v.index()]);
-            // Blocks are visited in order, so segments arrive sorted; merge adjacent ones.
-            match s.last_mut() {
-                Some(last) if last.1 + 1 >= l => last.1 = last.1.max(h),
-                _ => s.push((l, h)),
+            let vi = v.index();
+            let (l, h) = (lo[vi], hi[vi]);
+            let tail = seg_tail[vi];
+            if tail != NONE && seg_pool[tail as usize].1 + 1 >= l {
+                let last = &mut seg_pool[tail as usize];
+                last.1 = last.1.max(h);
+            } else {
+                let at = seg_pool.len() as u32;
+                seg_pool.push((l, h, NONE));
+                if tail == NONE {
+                    seg_head[vi] = at;
+                } else {
+                    seg_pool[tail as usize].2 = at;
+                }
+                seg_tail[vi] = at;
             }
-            lo[v.index()] = u32::MAX;
-            hi[v.index()] = 0;
+            lo[vi] = u32::MAX;
+            hi[vi] = 0;
         }
     }
+    drop((live_in, live_out, ops, op_start));
+    let related = Groups::new(nv, &related_pairs);
+    drop(related_pairs);
+    let mut seg_offsets = Vec::with_capacity(nv + 1);
+    let mut seg_items: Vec<(u32, u32)> = Vec::with_capacity(seg_pool.len());
+    for &head in &seg_head {
+        seg_offsets.push(seg_items.len() as u32);
+        let mut at = head;
+        while at != NONE {
+            let (l, h, next) = seg_pool[at as usize];
+            seg_items.push((l, h));
+            at = next;
+        }
+    }
+    seg_offsets.push(seg_items.len() as u32);
+    drop((seg_head, seg_tail, seg_pool));
+    let segs = |v: usize| &seg_items[seg_offsets[v] as usize..seg_offsets[v + 1] as usize];
 
-    let mut order: Vec<usize> = (0..nv).filter(|&v| !segs[v].is_empty()).collect();
-    order.sort_by_key(|&v| (segs[v][0].0, v));
+    // Values by first position (ties by number): a counting sort over the positions.
+    let order: Vec<usize> = {
+        let positions = 2 * code.insts.len() + 2;
+        let mut count = vec![0u32; positions + 1];
+        let mut n = 0;
+        for v in 0..nv {
+            if !segs(v).is_empty() {
+                count[segs(v)[0].0 as usize + 1] += 1;
+                n += 1;
+            }
+        }
+        for i in 0..positions {
+            count[i + 1] += count[i];
+        }
+        let mut order = vec![0usize; n];
+        for v in 0..nv {
+            if !segs(v).is_empty() {
+                let at = &mut count[segs(v)[0].0 as usize];
+                order[*at as usize] = v;
+                *at += 1;
+            }
+        }
+        order
+    };
 
+    // Registers a call clobbers all share one position list: look each distinct list up once
+    // per value.
+    let clobber_class: Vec<u8> = (0..64)
+        .map(|r| (0..=r).find(|&q| clobbers[q] == clobbers[r]).unwrap() as u8)
+        .collect();
+    let clobber_memo: [std::cell::Cell<(u32, bool)>; 64] =
+        [const { std::cell::Cell::new((0, false)) }; 64];
     // Whether register `r` is overwritten strictly inside `(s, e]` of one of `v`'s segments.
     let clobbered = |r: PReg, v: usize| -> bool {
-        let list = &clobbers[r.bit() as usize];
-        segs[v].iter().any(|&(s, e)| {
+        let class = clobber_class[r.bit() as usize] as usize;
+        let (stamp, known) = clobber_memo[class].get();
+        if stamp == v as u32 + 1 {
+            return known;
+        }
+        let list = &clobbers[class];
+        let hit = segs(v).iter().any(|&(s, e)| {
             let i = list.partition_point(|&p| p <= s);
             i < list.len() && list[i] <= e
+        });
+        clobber_memo[class].set((v as u32 + 1, hit));
+        hit
+    };
+    // Whether any of register `r`'s segments overlaps value `v`.
+    let overlaps = |assigned: &[Vec<(u32, u32, u32)>], r: PReg, v: usize| -> bool {
+        let list = &assigned[r.bit() as usize];
+        segs(v).iter().any(|&(s, e)| {
+            let i = list.partition_point(|x| x.1 < s);
+            i < list.len() && list[i].0 <= e
         })
     };
     // Owners of register `r`'s segments that overlap value `v`.
     let overlapping = |assigned: &[Vec<(u32, u32, u32)>], r: PReg, v: usize| -> Vec<u32> {
         let list = &assigned[r.bit() as usize];
         let mut out = Vec::new();
-        for &(s, e) in &segs[v] {
+        for &(s, e) in segs(v) {
             let mut i = list.partition_point(|x| x.1 < s);
             while i < list.len() && list[i].0 <= e {
                 if !out.contains(&list[i].2) {
@@ -272,16 +388,17 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
     // ----- allocation: greedy over values in start order; registers hold disjoint segments -----
     let mut locs = vec![Loc::None; nv];
     let mut used_callee_saved = RegSet::EMPTY;
+    let allowed = [RegSet::of(&info.order[0]), RegSet::of(&info.order[1])];
     // Segments assigned to each physical register, sorted and disjoint: (start, end, vreg).
     let mut assigned: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 64];
     for &v in &order {
         let class = code.class(VReg(v as u32));
         let ci = class_index(class);
-        let usable = |r: PReg| r.class == class && info.order[ci].contains(&r) && !clobbered(r, v);
+        let usable = |r: PReg| r.class == class && allowed[ci].contains(r) && !clobbered(r, v);
         let free = |assigned: &[Vec<(u32, u32, u32)>], r: PReg| {
-            usable(r) && overlapping(assigned, r, v).is_empty()
+            usable(r) && !overlaps(assigned, r, v)
         };
-        let related_reg = related[v].iter().find_map(|s| match locs[s.index()] {
+        let related_reg = related.of(v).iter().find_map(|s| match locs[s.index()] {
             Loc::Reg(r) if free(&assigned, r) => Some(r),
             _ => None,
         });
@@ -289,7 +406,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             .or(hint[v].filter(|&r| free(&assigned, r)))
             .or_else(|| info.order[ci].iter().copied().find(|&r| free(&assigned, r)));
         if choice.is_none() {
-            // Evict the cheapest set of values occupying one register, if cheaper than `v`.
+                // Evict the cheapest set of values occupying one register, if cheaper than `v`.
             let best = info.order[ci]
                 .iter()
                 .copied()
@@ -302,7 +419,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 .min_by(|x, y| x.2.total_cmp(&y.2));
             if let Some((r, owners, cost)) = best {
                 if cost < weight[v] {
-                    assigned[r.bit() as usize].retain(|x| !owners.contains(&x.2));
+                                            assigned[r.bit() as usize].retain(|x| !owners.contains(&x.2));
                     for o in owners {
                         locs[o as usize] = Loc::Stack(u32::MAX);
                     }
@@ -317,7 +434,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                     used_callee_saved.insert(r);
                 }
                 let list = &mut assigned[r.bit() as usize];
-                for &(s, e) in &segs[v] {
+                for &(s, e) in segs(v) {
                     let i = list.partition_point(|x| x.0 < s);
                     list.insert(i, (s, e, v as u32));
                 }
@@ -330,12 +447,11 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
     // arguments, a copy's ends) when their segments are disjoint, which turns the edge move
     // between two spilled values into nothing; otherwise a slot whose values all ended before
     // it starts.
-    let mut spilled: Vec<usize> = order
+    let spilled: Vec<usize> = order
         .iter()
         .copied()
         .filter(|&v| matches!(locs[v], Loc::Stack(_)))
         .collect();
-    spilled.sort_by_key(|&v| (segs[v][0].0, v));
     let mut slot_segs: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut slot_end: Vec<u32> = Vec::new();
     let mut slot_free: Vec<bool> = Vec::new();
@@ -343,7 +459,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
         std::collections::BinaryHeap::new();
     let mut free_slots: Vec<u32> = Vec::new();
     for v in spilled {
-        let (start, end) = (segs[v][0].0, segs[v].last().unwrap().1);
+        let (start, end) = (segs(v)[0].0, segs(v).last().unwrap().1);
         while let Some(&std::cmp::Reverse((e, slot))) = busy.peek() {
             if e >= start {
                 break;
@@ -355,12 +471,12 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
             }
         }
         let fits = |list: &Vec<(u32, u32)>| {
-            segs[v].iter().all(|&(s, e)| {
+            segs(v).iter().all(|&(s, e)| {
                 let i = list.partition_point(|x| x.1 < s);
                 i >= list.len() || list[i].0 > e
             })
         };
-        let mut slot = related[v].iter().find_map(|r| match locs[r.index()] {
+        let mut slot = related.of(v).iter().find_map(|r| match locs[r.index()] {
             Loc::Stack(s) if s != u32::MAX && fits(&slot_segs[s as usize]) => Some(s),
             _ => None,
         });
@@ -381,7 +497,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
         let si = slot as usize;
         slot_free[si] = false;
         let list = &mut slot_segs[si];
-        for &(s, e) in &segs[v] {
+        for &(s, e) in segs(v) {
             let i = list.partition_point(|x| x.0 < s);
             list.insert(i, (s, e));
         }

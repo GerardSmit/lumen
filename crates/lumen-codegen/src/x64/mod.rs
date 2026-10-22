@@ -199,7 +199,7 @@ pub fn compile_owned_aligned(
     );
     crate::opt::remove_unreachable(&mut f);
     split_critical_edges(&mut f);
-    let graph = Cfg::new(&f);
+    let graph = Cfg::with_loops(&f);
     let lowered = lower::lower(&f, &graph, &cfg.abi, &cfg.features)?;
     // The IR is no longer needed: free it before the allocator's tables are built.
     let ctx_first = f.sig.params.first() == Some(&Type::I64);

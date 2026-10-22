@@ -94,7 +94,7 @@ impl fmt::Debug for RegSet {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VReg(pub u32);
 
 impl VReg {

@@ -1127,7 +1127,7 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
         for &i in &f.blocks[b.index()].insts {
             l.inst(i)?;
         }
-        let succs = f.successors(b).iter().map(|s| l.bmap[s.index()]).collect();
+        let succs = f.successors(b).map(|s| l.bmap[s.index()]).collect();
         l.vc.blocks.push(VBlock {
             params,
             start,

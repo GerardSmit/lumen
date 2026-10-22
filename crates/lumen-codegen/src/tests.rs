@@ -582,3 +582,46 @@ fn values_only_exits_read_are_computed_in_the_exits() {
         assert_eq!(run(&f, &mut e, &[n]).unwrap(), want, "n={n}");
     }
 }
+
+#[test]
+fn gvn_merges_only_along_dominance() {
+    // a*3 in the entry dominates both arms; a+7 appears in each arm but neither dominates the other.
+    let mut f = Function::new(
+        "g",
+        Signature::new(vec![Type::I64, Type::I32], vec![Type::I64]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (a, c) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let three = b.iconst(Type::I64, 3);
+    let seven = b.iconst(Type::I64, 7);
+    let top = b.binary(BinaryOp::Imul, a, three);
+    let (l, r) = (b.create_block(), b.create_block());
+    b.brif(c, l, &[], r, &[]);
+    b.seal_block(l);
+    b.seal_block(r);
+    b.switch_to_block(l);
+    let dup = b.binary(BinaryOp::Imul, a, three);
+    let lhs = b.binary(BinaryOp::Iadd, a, seven);
+    let lv = b.binary(BinaryOp::Iadd, lhs, dup);
+    b.ret(&[lv]);
+    b.switch_to_block(r);
+    let rhs = b.binary(BinaryOp::Iadd, a, seven);
+    let rv = b.binary(BinaryOp::Iadd, rhs, top);
+    b.ret(&[rv]);
+    b.finish();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    let count = |op: BinaryOp| {
+        f.layout
+            .iter()
+            .flat_map(|blk| f.blocks[blk.index()].insts.iter().copied())
+            .filter(|i| matches!(f.inst(*i), InstData::Binary { op: o, .. } if *o == op))
+            .count()
+    };
+    assert_eq!(count(BinaryOp::Imul), 1, "{f}");
+    assert_eq!(count(BinaryOp::Iadd), 4, "{f}");
+    let mut e = env();
+    assert_eq!(run(&f, &mut e, &[5, 1]).unwrap(), vec![27]);
+    assert_eq!(run(&f, &mut e, &[5, 0]).unwrap(), vec![27]);
+}

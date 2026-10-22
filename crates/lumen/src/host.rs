@@ -13,7 +13,7 @@ use std::rc::Rc;
 /// each keep their state (timer heap, fd table, ...) under their own type.
 #[derive(Default)]
 pub struct OpState {
-    map: HashMap<TypeId, Box<dyn Any>>,
+    map: crate::fasthash::FastMap<TypeId, Box<dyn Any>>,
     pub resources: ResourceTable,
 }
 

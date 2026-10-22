@@ -1536,7 +1536,7 @@ impl Engine {
         // bytes. Its driver is active, but moving those bytes would invalidate the borrow.
         // This registry count includes both generators and ordinary async coroutines
         // retained by promise data; no heap scan or generator-only ownership assumption.
-        if crate::lstr::views_can_compact() {
+        if crate::lstr::views_can_compact() && crate::lstr::scan_due() {
             crate::lstr::compact_views();
         }
     }
