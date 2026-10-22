@@ -144,6 +144,9 @@ pub(crate) struct ImageLoader {
     selection_environment:Cell<Option<(lumen_html::css::MediaEnvironment,f64)>>,
     auto_inputs_epoch:Cell<Option<(u64,u64,usize,u64)>>,
     requests: RefCell<HashMap<NodeId, Request>>,
+    /// Superset of the nodes whose request is loading or owes a ready event; completion passes
+    /// walk only these, and drop the ones that settled.
+    active: RefCell<HashSet<NodeId>>,
     bitmap_updates: RefCell<HashMap<NodeId, (Option<NodeBitmap>,lumen_html::responsive_images::ImageMetadata)>>,
     /// Images which may take their width from the rendered box (`sizes=auto`): the only requests
     /// whose auto width is re-measured when the frame changes.
@@ -616,6 +619,7 @@ impl ImageLoader {
             request.selection_generation = self.allocate_generation();
             request.ready_event = Some(ImageEventKind::Load);
             request.current.event_queued = true;
+            self.active.borrow_mut().insert(node);
             request.current.density=density;
             request.selected_source = Some(Some(source));
             request.selected_crossorigin = Some(crossorigin);
@@ -631,6 +635,7 @@ impl ImageLoader {
         request.selected_source = Some(Some(source.clone()));
         request.selected_crossorigin = Some(crossorigin);
         request.base = base.to_owned();
+        self.active.borrow_mut().insert(node);
         let mut next = ImageRequest::loading(current_src, self.allocate_generation(), force_error);
         next.density=density;
         next.parameters=if input_image {lumen_html::layout::ImageRequestParameters::image_button()}else{lumen_html::layout::ImageRequestParameters::html_image(crossorigin)};
@@ -857,7 +862,11 @@ impl ImageLoader {
         let mut queued = Vec::new();
         let mut discovery = self.discovery.borrow_mut();
         discovery.pending.clear();
-        for (&node, request) in self.requests.borrow_mut().iter_mut() {
+        let mut requests = self.requests.borrow_mut();
+        self.active.borrow_mut().retain(|&node| {
+            let Some(request) = requests.get_mut(&node) else {
+                return false;
+            };
             if let Some(kind) = request.ready_event.take() {
                 queued.push(QueuedImageEvent {
                     node,
@@ -885,7 +894,9 @@ impl ImageLoader {
                     parameters:selected.parameters,
                 });
             }
-        }
+            request.is_loading()
+        });
+        drop(requests);
         for PendingLoad {
             node,
             generation,
@@ -976,13 +987,16 @@ impl ImageLoader {
         self.refresh_discovery(document,base);
         self.synchronize_dirty(document,base);
         let mut sources=Vec::new();let mut seen=std::collections::HashSet::new();
-        for request in self.requests.borrow().values() {
+        let requests=self.requests.borrow();
+        self.active.borrow_mut().retain(|node| {
+            let Some(request)=requests.get(node) else {return false};
             let loading=request.pending.iter().chain(std::iter::once(&request.current))
                 .filter(|image|image.state==RequestState::Loading&&image.current_src.starts_with("blob:"));
             for image in loading {
                 if seen.insert(image.current_src.as_str()) {sources.push(image.current_src.clone());}
             }
-        }
+            request.is_loading()||request.ready_event.is_some()
+        });
         sources
     }
 
@@ -1031,7 +1045,8 @@ impl ImageLoader {
         *self.pending_scratch.borrow_mut()=scratch;
     }
     fn append_pending_nodes(&self,nodes:&mut Vec<NodeId>) {
-        nodes.extend(self.requests.borrow().iter().filter_map(|(&node,request)|request.is_loading().then_some(node)));
+        let requests=self.requests.borrow();
+        nodes.extend(self.active.borrow().iter().filter(|node|requests.get(node).is_some_and(Request::is_loading)).copied());
         if let Some(fetches)=self.input_fetches.borrow().as_ref() {
             nodes.extend(fetches.records.as_slice().iter().filter_map(|slot|slot.completed_node.or_else(||slot.fetch.as_ref().map(|fetch|fetch.node))));
         }
@@ -1101,6 +1116,7 @@ impl ImageLoader {
                 request.observed_version=None;
                 request.published_image=None;request.published_metadata=None;
                 target.stage_current_image(&mut request,new);
+                if request.is_loading()||request.ready_event.is_some() {target.active.borrow_mut().insert(new);}
                 destination.insert(new,request);
             }
         }
@@ -1291,6 +1307,24 @@ mod responsive_request_tests {
         session.display_list(600,400,crate::canvas::canvas_fallback_fonts()).unwrap();
         loader.configure_selection(&mut session,1.0,base);
         assert_eq!(loader.requests.borrow()[&node].auto_width,Some(100.0));
+    }
+
+    #[test]
+    fn completion_passes_visit_only_loading_requests() {
+        let document=lumen_html::html::parse("<img src='blob:a'><img src='blob:b'><img src='plain.png'>",16).unwrap();
+        let loader=ImageLoader::default();let base="https://images.test/page.html";
+        let mut nodes=Vec::new();collect_image_nodes(&document,&mut nodes);
+        for &node in &nodes {loader.snapshot(&document,node,base,lumen_html::css::UsedColorScheme::Light);}
+        assert_eq!(loader.active.borrow().len(),3);
+        let mut sources=loader.pending_blob_sources(&document,base);sources.sort();
+        assert_eq!(sources,vec!["blob:a".to_string(),"blob:b".to_string()]);
+        assert_eq!(loader.pending_nodes().len(),3);
+        assert_eq!(loader.queue_completions(&document,base).len(),1,"only the resolver-less plain source settles; blob sources wait to be provided");
+        for source in sources {loader.provide_blob_image(source,ImageState::Failed);}
+        assert_eq!(loader.queue_completions(&document,base).len(),2);
+        assert!(loader.pending_blob_sources(&document,base).is_empty());
+        assert!(loader.active.borrow().is_empty(),"settled requests leave the active set");
+        assert!(loader.pending_nodes().is_empty());
     }
 
 }

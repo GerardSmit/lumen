@@ -302,12 +302,27 @@ fn decompress_with(
     what: &str,
     limit: usize,
 ) -> Result<Vec<u8>, String> {
+    decompress_sized(window_bits, data, what, limit, data.len().saturating_mul(3))
+}
+
+/// [`decompress_with`] expecting `expected` output bytes: the output is allocated once at that
+/// size (plus the byte that lets the stream end be seen) and the first step decodes it whole. A
+/// wrong estimate costs only the usual stepwise growth.
+fn decompress_sized(
+    window_bits: i32,
+    data: &[u8],
+    what: &str,
+    limit: usize,
+    expected: usize,
+) -> Result<Vec<u8>, String> {
     let mut z = ZStream::inflate(window_bits).map_err(|_| format!("{what}: init failed"))?;
-    let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(limit));
+    let mut out = Vec::with_capacity(expected.min(limit).saturating_add(1));
     let mut consumed = 0;
+    let mut want = expected.saturating_add(1).max(1);
     loop {
         let start = out.len();
-        out.resize(start + step_window(start, 16384.max(data.len()), limit), 0);
+        out.resize(start + step_window(start, want, limit), 0);
+        want = 16384.max(data.len());
         let step = z.run(0, &data[consumed..], &mut out[start..]);
         consumed += step.consumed;
         out.truncate(start + step.produced);
@@ -361,6 +376,20 @@ pub fn inflate_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
 }
 pub fn zlib_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     decompress_with(15, data, "zlib", limit)
+}
+/// The uncompressed length a gzip member declares in its trailer (its low 32 bits), when `data`
+/// is long enough to have one and the figure is possible for that much input.
+pub fn gzip_declared_len(data: &[u8]) -> Option<usize> {
+    const MAX_DEFLATE_RATIO: usize = 1032;
+    let trailer: [u8; 4] = data.get(data.len().checked_sub(4)?..)?.try_into().ok()?;
+    let declared = u32::from_le_bytes(trailer) as usize;
+    (declared <= data.len().saturating_mul(MAX_DEFLATE_RATIO)).then_some(declared)
+}
+
+/// [`gzip_decompress`] for input whose output size is known or guessed, such as
+/// [`gzip_declared_len`]: one allocation of exactly that size when the guess is right.
+pub fn gzip_decompress_sized(data: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+    decompress_sized(31, data, "gzip", usize::MAX, expected)
 }
 pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     decompress_with(31, data, "gzip", limit)
@@ -420,4 +449,25 @@ mod tests {
         assert_eq!(status, BrotliStatus::Success);
         assert_eq!(&out[..n], &data[..]);
     }
+    #[test]
+    fn sized_gzip_decode_matches_and_survives_wrong_estimates() {
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i % 253) as u8).collect();
+        let gz = gzip_compress(&data);
+        assert_eq!(gzip_declared_len(&gz), Some(data.len()));
+        let exact = gzip_decompress_sized(&gz, data.len()).unwrap();
+        assert_eq!(exact, data);
+        assert_eq!(exact.capacity(), data.len() + 1);
+        assert_eq!(gzip_decompress_sized(&gz, 10).unwrap(), data);
+        assert_eq!(gzip_decompress_sized(&gz, data.len() * 4).unwrap(), data);
+        assert_eq!(gzip_decompress_sized(&gz, 0).unwrap(), data);
+        assert!(gzip_decompress_sized(&gz[..gz.len() - 9], data.len()).is_err());
+    }
+
+    #[test]
+    fn declared_gzip_length_rejects_impossible_figures() {
+        assert_eq!(gzip_declared_len(&[1, 2]), None);
+        assert_eq!(gzip_declared_len(&[0, 0, 0, 0xff, 0xff, 0xff, 0xff]), None);
+        assert_eq!(gzip_declared_len(&[0; 5]), Some(0));
+    }
+
 }

@@ -842,8 +842,9 @@ fn response_value(ctx: &mut Ctx, core: &Rc<Core>) -> OpResult<Value> {
     };
     let value = match kind {
         Kind::ArrayBuffer => {
-            let array = ctx.make_uint8array(&bytes).map_err(OpError::thrown)?;
-            ctx.member_get(&array, "buffer").map_err(OpError::thrown)?
+            let mut bytes = bytes;
+            bytes.shrink_to_fit();
+            ctx.make_array_buffer_from(bytes)
         }
         Kind::Blob => new_blob(ctx, bytes, &mime),
         _ => {

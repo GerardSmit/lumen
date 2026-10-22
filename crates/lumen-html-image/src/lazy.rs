@@ -8,12 +8,16 @@ use lumen_html::layout::{ImageState, LazyImage, LazyImageHandle};
 use lumen_html::paint::ImageData;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub const DEFAULT_DECODED_IMAGE_BUDGET: usize = 256 * 1024 * 1024;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static HITS: AtomicU64 = AtomicU64::new(0);
+static DECODES: AtomicU64 = AtomicU64::new(0);
+static DECODED_BYTES: AtomicU64 = AtomicU64::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 static CACHE: OnceLock<Mutex<ByteLru<u64, Arc<ImageData>>>> = OnceLock::new();
 
 fn cache() -> MutexGuard<'static, ByteLru<u64, Arc<ImageData>>> {
@@ -34,11 +38,23 @@ pub struct DecodedImageCacheStats {
     pub entries: usize,
     pub bytes: usize,
     pub budget: usize,
+    pub hits: u64,
+    pub decodes: u64,
+    pub decoded_bytes: u64,
+    pub peak_bytes: usize,
 }
 
 pub fn decoded_image_cache_stats() -> DecodedImageCacheStats {
     let cache = cache();
-    DecodedImageCacheStats { entries: cache.len(), bytes: cache.bytes(), budget: cache.budget() }
+    DecodedImageCacheStats {
+        entries: cache.len(),
+        bytes: cache.bytes(),
+        budget: cache.budget(),
+        hits: HITS.load(Ordering::Relaxed),
+        decodes: DECODES.load(Ordering::Relaxed),
+        decoded_bytes: DECODED_BYTES.load(Ordering::Relaxed),
+        peak_bytes: PEAK_BYTES.load(Ordering::Relaxed),
+    }
 }
 
 /// A still raster image: encoded bytes, header size, and on-demand decoded pixels.
@@ -95,6 +111,7 @@ impl LazyImage for EncodedImage {
 
     fn pixels(&self) -> Option<Arc<ImageData>> {
         if let Some(hit) = cache().get(&self.id) {
+            HITS.fetch_add(1, Ordering::Relaxed);
             return Some(hit);
         }
         if self.failed.get() {
@@ -112,7 +129,12 @@ impl LazyImage for EncodedImage {
             self.opaque.set(Some(image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255)));
         }
         let image = Arc::new(image);
-        cache().insert(self.id, image.clone(), bytes);
+        DECODES.fetch_add(1, Ordering::Relaxed);
+        DECODED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        let mut cache = cache();
+        cache.insert(self.id, image.clone(), bytes);
+        PEAK_BYTES.fetch_max(cache.bytes(), Ordering::Relaxed);
+        drop(cache);
         Some(image)
     }
 }
@@ -270,4 +292,19 @@ mod tests {
         assert_eq!(lazy_image_state(b"not an image".to_vec()), ImageState::Failed);
         assert!(matches!(lazy_image_state(png(2, 2, [1, 1, 1, 255])), ImageState::Lazy(_)));
     }
+    #[test]
+    fn stats_count_decodes_hits_and_the_cache_high_water_mark() {
+        let _serial = serial();
+        let before = decoded_image_cache_stats();
+        let lazy = EncodedImage::probe(png(8, 8, [1, 2, 3, 255])).unwrap();
+        lazy.pixels().unwrap();
+        lazy.pixels().unwrap();
+        lazy.pixels().unwrap();
+        let after = decoded_image_cache_stats();
+        assert_eq!(after.decodes - before.decodes, 1);
+        assert_eq!(after.hits - before.hits, 2);
+        assert_eq!(after.decoded_bytes - before.decoded_bytes, 8 * 8 * 4);
+        assert!(after.peak_bytes >= after.bytes && after.bytes >= 8 * 8 * 4);
+    }
+
 }
