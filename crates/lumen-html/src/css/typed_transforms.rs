@@ -496,6 +496,13 @@ pub(super) fn resolved_argument_scalar(expression:&typed_numeric::NumericExpress
     Some(if value.is_finite(){if value==0.0{0.0}else{value}}else{f64::from(typed_numeric::computed_f32(value))})
 }
 
+pub(super) fn resolved_angle_in_context(expression:&typed_numeric::NumericExpression,length:LengthContext,query:ContainerUnitContext)->Option<f64> {
+    use typed_numeric::{NumericType as T,NumericUnit as U};
+    if expression.numeric_type()?!=T::from_unit(U::Deg)||expression.contains_unit(|unit|unit==U::Percent){return None;}
+    let value=expression.evaluate(&mut FontAngleContext{length:Some(length),query,percent_scale:1.0})?;
+    Some(if value.is_finite(){if value==0.0{0.0}else{value}}else{f64::from(typed_numeric::computed_f32(value))})
+}
+
 fn computed_functions(input:&str)->Option<Vec<ComputedFunction>> {
     if decoded_css_keyword(input.trim(),"none"){return Some(Vec::new());}
     validated_function_tokens(input)?.into_iter().map(ComputedFunction::from_token).collect()

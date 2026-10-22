@@ -1252,6 +1252,9 @@ pub(crate) fn apply_block(style: &mut Style, text: &str) {
         return;
     };
     for declaration in parsed {
+        if declaration.important {
+            continue;
+        }
         let slot = declaration.value.slot();
         if let Some(entries) = style.anchored.clone() {
             if entries.iter().any(|(existing, _)| *existing == slot) && !matches!(declaration.value, Value::Anchor(..)) {
@@ -1468,6 +1471,8 @@ pub fn resolve(text: &str, env: &AnchorEnvironment<'_>) -> Option<String> {
 
 /// Applies `longhand: value` to a computed style.
 pub(crate) fn apply_resolved(style: &mut Style, longhand: &str, value: &str) {
+    let physical = physical_side(longhand, &style.logical_sides()).map(|(margin, side)| physical_name(margin, side));
+    let longhand = physical.as_deref().unwrap_or(longhand);
     if let Ok(parsed) = declarations_with_variables(&alloc::format!("{longhand}:{value}"), 0, false) {
         for declaration in parsed {
             apply_value(style, declaration.value);

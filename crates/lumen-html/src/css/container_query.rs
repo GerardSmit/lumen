@@ -208,20 +208,20 @@ fn parse_condition(segment: &str) -> Option<Condition> {
         }
         String::new()
     } else {
-        serialize_query(rest)?
+        serialize_query(rest, false)?
     };
     Some(Condition { name, query })
 }
 
-fn serialize_query(tokens: &[Token<'_>]) -> Option<String> {
+fn serialize_query(tokens: &[Token<'_>], style: bool) -> Option<String> {
     let first = tokens.first()?;
     if keyword(first, "not") {
         if tokens.len() != 2 {
             return None;
         }
-        return Some(alloc::format!("not {}", serialize_in_parens(&tokens[1])?));
+        return Some(alloc::format!("not {}", serialize_in_parens(&tokens[1], style)?));
     }
-    let mut output = serialize_in_parens(first)?;
+    let mut output = serialize_in_parens(first, style)?;
     if tokens.len() == 1 {
         return Some(output);
     }
@@ -242,7 +242,7 @@ fn serialize_query(tokens: &[Token<'_>]) -> Option<String> {
         output.push(' ');
         output.push_str(connective);
         output.push(' ');
-        output.push_str(&serialize_in_parens(&pair[1])?);
+        output.push_str(&serialize_in_parens(&pair[1], style)?);
     }
     Some(output)
 }
@@ -251,18 +251,21 @@ pub(super) fn inner(token: &Token<'_>, prefix: usize) -> String {
     token.text[prefix + 1..token.text.len() - 1].trim().into()
 }
 
-fn serialize_in_parens(token: &Token<'_>) -> Option<String> {
+fn serialize_in_parens(token: &Token<'_>, style: bool) -> Option<String> {
     match token.kind {
-        Kind::Paren => Some(alloc::format!("({})", serialize_feature_or_query(&inner(token, 0)))),
+        Kind::Paren => {
+            let content = if style { token.text[1..token.text.len() - 1].into() } else { inner(token, 0) };
+            Some(alloc::format!("({})", serialize_feature_or_query(&content, style)))
+        }
         Kind::Function => {
             let open = token.text.find('(')?;
             let name = &token.text[..open];
             let content = inner(token, open);
             if name.eq_ignore_ascii_case("style") {
-                Some(alloc::format!("style({})", serialize_feature_or_query(&content)))
+                Some(alloc::format!("style({})", serialize_feature_or_query(&content, true)))
             } else if name.eq_ignore_ascii_case("scroll-state") || name.eq_ignore_ascii_case("anchored") {
                 let name = name.to_ascii_lowercase();
-                Some(alloc::format!("{name}({})", serialize_feature_or_query(&content)))
+                Some(alloc::format!("{name}({})", serialize_feature_or_query(&content, false)))
             } else {
                 Some(collapse_whitespace(token.text))
             }
@@ -271,16 +274,37 @@ fn serialize_in_parens(token: &Token<'_>) -> Option<String> {
     }
 }
 
-fn serialize_feature_or_query(content: &str) -> String {
+fn serialize_feature_or_query(content: &str, style: bool) -> String {
     if let Some(tokens) = tokenize(content) {
         let condition_like = tokens.first().is_some_and(|first| {
             first.kind == Kind::Paren
                 || (keyword(first, "not") && tokens.get(1).is_some_and(|next| matches!(next.kind, Kind::Paren | Kind::Function)))
         });
         if condition_like {
-            if let Some(query) = serialize_query(&tokens) {
+            if let Some(query) = serialize_query(&tokens, style) {
                 return query;
             }
+        }
+    }
+    if style {
+        serialize_style_feature(content)
+    } else {
+        serialize_feature(content)
+    }
+}
+
+/// A style feature keeps the author's value text: a custom property
+/// declaration is normalized around the colon only, and a declaration of
+/// anything else is general-enclosed text kept as written.
+fn serialize_style_feature(content: &str) -> String {
+    let trimmed = content.trim();
+    if let Some(colon) = trimmed.find(':') {
+        let name = trimmed[..colon].trim();
+        if !name.contains(['<', '>', '=', '(']) {
+            if name.starts_with("--") {
+                return alloc::format!("{name}: {}", trimmed[colon + 1..].trim());
+            }
+            return content.into();
         }
     }
     serialize_feature(content)

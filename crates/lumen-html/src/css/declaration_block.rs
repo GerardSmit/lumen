@@ -1420,6 +1420,7 @@ impl DeclarationBlock {
     }
     pub fn len(&self)->usize{self.views().count()}
     pub fn retain_properties(&mut self,keep:impl Fn(&str)->bool){self.entries.retain(|entry|keep(&entry.name));}
+    pub fn retain_declarations(&mut self,keep:impl Fn(&str,bool)->bool){self.entries.retain(|entry|keep(&entry.name,entry.important));}
     pub fn is_empty(&self)->bool{self.entries.is_empty()}
 
     pub fn value(&self, name: &str) -> Option<(String, bool)> {

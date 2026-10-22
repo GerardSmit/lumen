@@ -2189,6 +2189,7 @@ pub(crate) struct RetainedLayoutCache {
     /// a fragment laid out with the old map is valid for a style that has
     /// the new one and is otherwise equal.
     custom_rebases: Vec<css::CustomRebase>,
+    last_successful: anchor_layout::LastSuccessful,
 }
 
 fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
@@ -2196,6 +2197,9 @@ fn custom_map_identity(map: &Option<Arc<css::CustomProperties>>) -> usize {
 }
 
 impl RetainedLayoutCache {
+    pub(crate) fn commit_position_fallbacks(&self) {
+        self.last_successful.borrow_mut().commit();
+    }
     pub(crate) fn note_custom_rebases(&mut self, rebases: Vec<css::CustomRebase>) {
         if self.entries.is_empty() { return; }
         self.custom_rebases.extend(rebases);
@@ -4358,6 +4362,7 @@ struct Layout<'a> {
     initial_margin_origin: Option<f32>,
     initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,f32)>>,
     anchor_index: RefCell<anchor_layout::AnchorIndex>,
+    last_successful: anchor_layout::LastSuccessful,
     canvas_background_source: Option<NodeId>,
     viewport_overflow_source: Option<NodeId>,
     viewport_scroll_axes: (bool, bool),
@@ -4641,6 +4646,7 @@ impl<'a> Layout<'a> {
         initial_margin_origin: None,
         initial_float_measurements: RefCell::new(BTreeMap::new()),
         anchor_index: RefCell::new(anchor_layout::AnchorIndex::default()),
+        last_successful: retained_fragments.as_deref().map_or_else(Default::default, |cache| Rc::clone(&cache.last_successful)),
         viewport,
         geometry,
         scrolls,
@@ -8085,6 +8091,7 @@ struct FlexItem {
     anonymous_text: Option<InlineParagraph>,
     style: Style,
     main: f32,
+    base_main: f32,
     min_main: f32,
     shrink_base: f32,
     source_order: usize,
@@ -8097,6 +8104,7 @@ struct FlexItem {
     first_hit: usize,
     last_hit: usize,
     baselines: Option<FlowBaselines>,
+    main_baselines: Option<FlowBaselines>,
     cross_shift: f32,
     content_ranges: Option<FlowContentRanges>,
 }
@@ -8117,6 +8125,66 @@ impl FlowContentRanges {
             hit_end: self.hit_end + hits,
         }
     }
+}
+
+/// Intrinsic flex-basis keywords size the item's inline axis; along its block
+/// axis they behave like `content`.
+struct FlexBaselineParticipant {
+    slot: usize,
+    far: bool,
+    position: f32,
+    content_only: bool,
+}
+
+/// Cross-axis baseline of a flex item, measured from the left/top margin edge,
+/// together with the physical side its baseline-sharing group aligns to.
+fn flex_cross_baseline(
+    item: &Style,
+    baselines: Option<FlowBaselines>,
+    cross: f32,
+    container: &Style,
+    row: bool,
+) -> Option<FlexBaselineParticipant> {
+    let (group, content_only) = baseline_participation(
+        item,
+        container,
+        !row,
+        container.flex_wrap_reverse,
+        baselines.is_some(),
+    )?;
+    let container_vertical = container.writing_mode != css::WritingMode::HorizontalTb;
+    let item_vertical = item.writing_mode != css::WritingMode::HorizontalTb;
+    let cross_horizontal = !row;
+    if container_vertical != cross_horizontal && item_vertical != cross_horizontal {
+        return None;
+    }
+    let (before, after) = if row { (0, 2) } else { (3, 1) };
+    if item.margin_auto[before] || item.margin_auto[after] {
+        return None;
+    }
+    let position = baselines
+        .map(|value| if group == 0 { value.first } else { value.last })
+        .unwrap_or_else(|| {
+            if row {
+                (cross - item.margin_sides[2]).max(0.0)
+            } else if container.used_text_orientation() == css::TextOrientation::Sideways {
+                item.margin_sides[3]
+            } else {
+                (item.margin_sides[3] + cross - item.margin_sides[1]) * 0.5
+            }
+        });
+    let start_far = if item_vertical == cross_horizontal {
+        item.logical_sides()[2] == 1
+    } else {
+        container.axis_start_is_far(cross_horizontal)
+    };
+    let far = (group == 1) ^ start_far ^ container.flex_wrap_reverse;
+    Some(FlexBaselineParticipant {
+        slot: group * 2 + usize::from(far),
+        far,
+        position,
+        content_only,
+    })
 }
 
 fn baseline_participation(
@@ -11669,6 +11737,24 @@ impl LayoutGeometry {
         }
     }
 
+    /// Runs of text whose box was recorded before their paragraph was
+    /// oriented are outside the paragraph's hit range; they still follow the
+    /// paragraph's writing-mode frame.
+    fn refresh_text_run_orientations(&mut self, start: usize) {
+        let transforms = &self.transforms;
+        for run in self.control_text_runs.iter_mut().skip(start) {
+            run.transform = run
+                .hit_index
+                .map_or(crate::paint::Affine::IDENTITY, |index| {
+                    transforms
+                        .iter()
+                        .filter(|transform| transform.hits.contains(&index))
+                        .fold(crate::paint::Affine::IDENTITY, |matrix, transform| matrix.then(transform.matrix))
+                })
+                .then(run.orientation);
+        }
+    }
+
     fn refresh_control_run_transforms(&mut self, hits: Range<usize>) {
         let transforms = &self.transforms;
         for run in &mut self.control_text_runs {
@@ -12441,9 +12527,16 @@ fn grid_item_automatic_minimum(style: &Style, horizontal: bool, value: f32) -> O
     if automatic {
         return Some(GridItemMinimum { value, automatic: true });
     }
-    if !auto_size || percentage {
+    if !auto_size {
         return None;
     }
+    let zero_basis;
+    let style = if percentage {
+        zero_basis = style.resolve_grid_intrinsic_percentages(0.0, Some(0.0));
+        &zero_basis
+    } else {
+        style
+    };
     let minimum = if horizontal {
         content_dimension(style, style.min_width) + box_edges(style, true)
     } else {
@@ -12638,24 +12731,6 @@ fn grid_track_sizes(
                 &base_ceilings,
                 start,
                 span,
-                contribution.min_content,
-                gap,
-                &flex_weight,
-                |index| {
-                    index >= start
-                        && index < end
-                        && receives(index)
-                        && matches!(
-                            definitions.get(index).copied().unwrap_or(T::Auto).minimum(),
-                            B::MinContent
-                        )
-                },
-            );
-            distribute_base_range_weighted(
-                &mut sizes,
-                &base_ceilings,
-                start,
-                span,
                 match contribution.automatic_minimum {
                     Some(minimum) if minimum.automatic && flex_only && span > 1 => 0.0,
                     Some(minimum) => minimum.value,
@@ -12672,10 +12747,28 @@ fn grid_track_sizes(
                     index >= start
                         && index < end
                         && receives(index)
-                        && (matches!(minimum, B::Auto)
+                        && (matches!(minimum, B::Auto | B::MinContent | B::MaxContent)
                             || matches!(minimum, B::Percentage(_)) && available.is_none()
                             || matches!(minimum, B::Length(_, percent)
                                 if available.is_none() && percent != 0.0))
+                },
+            );
+            distribute_base_range_weighted(
+                &mut sizes,
+                &base_ceilings,
+                start,
+                span,
+                contribution.min_content,
+                gap,
+                &flex_weight,
+                |index| {
+                    index >= start
+                        && index < end
+                        && receives(index)
+                        && matches!(
+                            definitions.get(index).copied().unwrap_or(T::Auto).minimum(),
+                            B::MinContent | B::MaxContent
+                        )
                 },
             );
             distribute_base_range(
@@ -13087,10 +13180,14 @@ fn auto_repeat_count_bound(
         return Ok(maximum_repetitions.min(1));
     };
     let extent = |track: GridTrack| {
-        definite_breadth(track.maximum(), available)
-            .or_else(|| definite_breadth(track.minimum(), available))
-            .unwrap_or(0.0)
-            .max(0.0)
+        let maximum = definite_breadth(track.maximum(), available);
+        let minimum = definite_breadth(track.minimum(), available);
+        let extent = match (maximum, minimum) {
+            (Some(maximum), Some(minimum)) => maximum.max(minimum),
+            (Some(value), None) | (None, Some(value)) => value,
+            (None, None) => 0.0,
+        };
+        extent.max(0.0)
     };
     let outside_size = auto
         .prefix_tracks
@@ -23828,7 +23925,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if definite_area
                 && !axes.vertical
                 && computed.height.is_none()
-                && (!intrinsic_rows || definite_height.is_some())
+                && (!intrinsic_rows || (definite_height.is_some() && item.natural.0 <= cw))
                 && computed.height_intrinsic.is_none()
                 && computed.align_self.unwrap_or(style.align_items) == AlignItems::Stretch
                 && !computed.margin_auto[0]
@@ -25115,6 +25212,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 },
             )
         });
+        let base_main = main.max(edges);
         let mut main = if row {
             constrained_width(&item_style, (main - edges).max(0.0)) + edges
         } else {
@@ -25152,8 +25250,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             anonymous_text: None,
             style: item_style,
             main,
+            base_main,
             min_main,
-            shrink_base: (main - edges).max(0.0),
+            shrink_base: (base_main - edges).max(0.0),
             source_order,
             cross: if row { natural.1 } else { natural.0 },
             edges,
@@ -25164,6 +25263,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             first_hit: 0,
             last_hit: 0,
             baselines: None,
+            main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
         })
@@ -25266,6 +25366,48 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok((axes.physical((maximum_width, line_height * lines)), axes.physical((minimum_width, line_height * lines))))
     }
 
+    /// A stretched item of a single-line flex container with a definite cross
+    /// size has that size as its definite cross size, which a replaced
+    /// element's aspect ratio then transfers to its main size.
+    fn stretched_ratio_measurement(
+        &self,
+        node: NodeId,
+        item: &Style,
+        container: &Style,
+        row: bool,
+        container_width: f32,
+    ) -> Option<Style> {
+        let replaced = self.object_replaced(node)
+            || matches!(
+                self.document.kind(node),
+                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. })
+                    if matches!(name.as_str(), "img" | "video" | "canvas")
+            );
+        if container.flex_wrap
+            || !(replaced || item.aspect_ratio.is_some())
+            || item.self_alignment(container, false).alignment != AlignItems::Stretch
+            || item.width.is_some()
+            || item.height.is_some()
+            || item.width_intrinsic.is_some()
+            || item.height_intrinsic.is_some()
+        {
+            return None;
+        }
+        let (before, after) = if row { (0, 2) } else { (3, 1) };
+        if item.margin_auto[before] || item.margin_auto[after] {
+            return None;
+        }
+        let cross_edges = box_edges(item, !row);
+        let mut measured = item.clone();
+        if row {
+            let height = container.height.map(|height| content_height_dimension(container, height))?;
+            measured.height = Some(specified_height(item, (height - cross_edges).max(0.0)));
+        } else {
+            measured.width = Some(specified_dimension(item, (container_width - cross_edges).max(0.0)));
+        }
+        Some(measured)
+    }
+
     fn push_flex_item(
         &mut self,
         items: &mut Vec<FlexItem>,
@@ -25327,7 +25469,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             text_minimum = Some(least);
             maximum
         } else {
-            self.flex_intrinsic_size(node, &item_style, anonymous_text.as_ref(), depth + 1, false)?
+            let stretched = if anonymous_text.is_none() && !absolute {
+                self.stretched_ratio_measurement(node, &item_style, container_style, row, width)
+            } else {
+                None
+            };
+            self.flex_intrinsic_size(node, stretched.as_ref().unwrap_or(&item_style), anonymous_text.as_ref(), depth + 1, false)?
         };
         if absolute {
             if positioned.len() >= MAX_DISPLAY_COMMANDS {
@@ -25398,6 +25545,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 },
             )
         });
+        let base_main = main.max(edges);
         let mut main = if row {
             constrained_width(&item_style, (main - edges).max(0.0)) + edges
         } else {
@@ -25448,8 +25596,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             anonymous_text,
             style: item_style,
             main,
+            base_main,
             min_main,
-            shrink_base: (main - edges).max(0.0),
+            shrink_base: (base_main - edges).max(0.0),
             source_order: *source_order,
             cross: if row { h } else { w },
             edges,
@@ -25460,6 +25609,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             first_hit: 0,
             last_hit: 0,
             baselines: None,
+            main_baselines: None,
             cross_shift: 0.0,
             content_ranges: None,
         });
@@ -25711,6 +25861,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 0.0
             };
         let mut total_main = 0.0f32;
+        let total_items = items.len();
+        let total_basis: f32 = items.iter().map(|item| item.main).sum();
         for line_index in 0..lines.len() {
             let (line_start, line_end, line_cross) = lines[line_index];
             let items = &mut items[line_start..line_end];
@@ -25722,57 +25874,90 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             let gaps = main_gap * items.len().saturating_sub(1) as f32;
             let basis: f32 = items.iter().map(|item| item.main).sum();
+            let wrapped_basis = if style.flex_wrap && !row && lines.len() > 1 {
+                total_basis + main_gap * (total_items - 1) as f32
+            } else {
+                basis + gaps
+            };
             let available = if row {
                 width
             } else {
                 style
                     .height
                     .map(|height| content_height_dimension(style, height))
-                    .unwrap_or_else(|| if style.has_min_height_percentage() { basis + gaps } else { constrained_height(style, basis + gaps) })
+                    .unwrap_or_else(|| if style.has_min_height_percentage() { basis + gaps } else { constrained_height(style, wrapped_basis) })
             };
-            // honey: at most one freezing pass per item; optimize if very large flex lines recur.
-            loop {
-                let free = available - items.iter().map(|item| item.main).sum::<f32>() - gaps;
-                let factor: f32 = items
+            let growing = items.iter().map(|item| item.main).sum::<f32>() + gaps < available;
+            for item in items.iter_mut() {
+                let factor = if growing { item.style.flex_grow } else { item.style.flex_shrink };
+                item.frozen = factor == 0.0
+                    || (growing && item.base_main > item.main)
+                    || (!growing && item.base_main < item.main);
+            }
+            let used_space = |items: &[FlexItem]| -> f32 {
+                items
+                    .iter()
+                    .map(|item| if item.frozen { item.main } else { item.base_main })
+                    .sum::<f32>()
+            };
+            let initial_free = available - gaps - used_space(items);
+            let mut freeze_passes = 0usize;
+            while freeze_passes <= items.len() && items.iter().any(|item| !item.frozen) {
+                freeze_passes += 1;
+                let mut free = available - gaps - used_space(items);
+                let factor_sum: f32 = items
                     .iter()
                     .filter(|item| !item.frozen)
-                    .map(|item| {
-                        if free >= 0.0 {
-                            item.style.flex_grow
-                        } else {
-                            item.style.flex_shrink * item.shrink_base
-                        }
-                    })
+                    .map(|item| if growing { item.style.flex_grow } else { item.style.flex_shrink })
                     .sum();
-                if factor <= 0.0 {
-                    break;
+                if factor_sum < 1.0 && (initial_free * factor_sum).abs() < free.abs() {
+                    free = initial_free * factor_sum;
                 }
-                let mut froze = false;
-                for item in items.iter_mut() {
-                    if item.frozen {
-                        continue;
-                    }
-                    let weight = if free >= 0.0 {
+                let weight = |item: &FlexItem| {
+                    if growing {
                         item.style.flex_grow
                     } else {
                         item.style.flex_shrink * item.shrink_base
-                    };
-                    let proposed = (item.main
-                        + free * weight / if free >= 0.0 { factor.max(1.0) } else { factor })
+                    }
+                };
+                let weight_sum: f32 = items.iter().filter(|item| !item.frozen).map(weight).sum();
+                let mut violation = 0.0f32;
+                let mut outcomes = Vec::new();
+                outcomes
+                    .try_reserve(items.len())
+                    .map_err(|_| LayoutError::CommandLimit)?;
+                for item in items.iter() {
+                    if item.frozen {
+                        outcomes.push((item.main, 0.0f32));
+                        continue;
+                    }
+                    let proposed = if free == 0.0 || weight_sum <= 0.0 {
+                        item.base_main
+                    } else {
+                        item.base_main + free * weight(item) / weight_sum
+                    }
                     .max(item.edges);
-                    item.main = if row {
+                    let clamped = if row {
                         constrained_width(&item.style, proposed - item.edges) + item.edges
                     } else {
                         constrained_height(&item.style, proposed - item.edges) + item.edges
                     }
                     .max(item.min_main);
-                    if item.main != proposed {
-                        item.frozen = true;
-                        froze = true;
-                    }
+                    violation += clamped - proposed;
+                    outcomes.push((clamped, clamped - proposed));
                 }
-                if !froze {
-                    break;
+                for (item, (clamped, adjustment)) in items.iter_mut().zip(outcomes) {
+                    if item.frozen {
+                        continue;
+                    }
+                    item.main = clamped;
+                    if !violation.is_finite()
+                        || violation == 0.0
+                        || (violation > 0.0 && adjustment > 0.0)
+                        || (violation < 0.0 && adjustment < 0.0)
+                    {
+                        item.frozen = true;
+                    }
                 }
             }
             let remaining = available - gaps - items.iter().map(|item| item.main).sum::<f32>();
@@ -25877,6 +26062,17 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             (cross_extent - item.cross_edges).max(0.0),
                         ));
                     }
+                }
+                if !row
+                    && computed.width.is_none()
+                    && !cross_auto
+                    && item.cross > 0.0
+                    && computed.self_alignment(style, false).is_baseline()
+                {
+                    computed.width = Some(specified_dimension(
+                        &computed,
+                        (item.cross.min(width) - item.cross_edges).max(0.0),
+                    ));
                 }
                 item.first_command = self.commands.len();
                 item.first_hit = self
@@ -26046,10 +26242,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         }
                     }
                 }
-                item.baselines = self
-                    .flow_baselines
-                    .take()
+                let item_flow_baselines = self.flow_baselines.take();
+                item.baselines = item_flow_baselines
                     .and_then(|value| value.axis(!row))
+                    .map(|value| value.translated(-x, -y));
+                item.main_baselines = item_flow_baselines
+                    .and_then(|value| value.axis(row))
                     .map(|value| value.translated(-x, -y));
                 self.flow_baselines = saved_baselines;
                 item.content_ranges = self
@@ -26083,32 +26281,19 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else {
                 width
             };
-            let mut baseline_ascent = [0.0f32; 2];
-            let mut baseline_descent = [0.0f32; 2];
-            if row {
-                for item in items.iter() {
-                    let Some((group, _)) = baseline_participation(
-                        &item.style,
-                        style,
-                        false,
-                        style.flex_wrap_reverse,
-                        item.baselines.is_some(),
-                    ) else {
-                        continue;
-                    };
-                    if item.style.margin_auto[0] || item.style.margin_auto[2] {
-                        continue;
-                    }
-                    let baseline = item
-                        .baselines
-                        .map(|value| if group == 0 { value.first } else { value.last })
-                        .unwrap_or((item.cross - item.style.margin_sides[2]).max(0.0));
-                    baseline_ascent[group] = baseline_ascent[group].max(baseline);
-                    baseline_descent[group] = baseline_descent[group].max(item.cross - baseline);
-                }
+            let mut baseline_lead = [0.0f32; 4];
+            let mut baseline_trail = [0.0f32; 4];
+            for item in items.iter() {
+                let Some(participant) = flex_cross_baseline(&item.style, item.baselines, item.cross, style, row) else {
+                    continue;
+                };
+                baseline_lead[participant.slot] = baseline_lead[participant.slot].max(participant.position);
+                baseline_trail[participant.slot] =
+                    baseline_trail[participant.slot].max(item.cross - participant.position);
             }
-            let baseline_extent = (baseline_ascent[0] + baseline_descent[0])
-                .max(baseline_ascent[1] + baseline_descent[1]);
+            let baseline_extent = (0..4)
+                .map(|slot| baseline_lead[slot] + baseline_trail[slot])
+                .fold(0.0f32, f32::max);
             let align_extent = if style.flex_wrap || (row && style.height.is_none()) {
                 align_extent.max(baseline_extent)
             } else {
@@ -26143,39 +26328,28 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 } else if item.style.margin_auto[cross_end] {
                     0.0
                 } else {
-                    let participation = baseline_participation(
-                        &item.style,
-                        style,
-                        !row,
-                        style.flex_wrap_reverse,
-                        item.baselines.is_some(),
-                    )
-                    .filter(|_| row);
-                    if let Some((group, content_only)) = participation {
-                        let baseline = item
-                            .baselines
-                            .map(|value| if group == 0 { value.first } else { value.last })
-                            .unwrap_or((item.cross - item.style.margin_sides[2]).max(0.0));
-                        let from_start = (group == 0) != style.flex_wrap_reverse;
-                        let target = if from_start {
-                            baseline_ascent[group]
+                    if let Some(participant) = flex_cross_baseline(&item.style, item.baselines, item.cross, style, row) {
+                        let position = if participant.far {
+                            align_extent - baseline_trail[participant.slot] - participant.position
                         } else {
-                            align_extent - baseline_descent[group]
+                            baseline_lead[participant.slot] - participant.position
                         };
-                        if content_only {
+                        if participant.content_only {
                             let outer = alignment.offset(
                                 free,
                                 style,
                                 &item.style,
-                                false,
+                                !row,
                                 style.flex_wrap_reverse,
                             );
-                            let padding = target - baseline - outer;
-                            self.move_baseline_contents(item.content_ranges, padding);
-                            item.baselines = item.baselines.map(|value| value.shifted(padding));
+                            let padding = position - outer;
+                            let (pad_x, pad_y) = if row { (0.0, padding) } else { (padding, 0.0) };
+                            self.move_baseline_contents_axis(item.content_ranges, pad_x, pad_y);
+                            item.baselines = item.baselines.map(|value| value.translated(pad_x, pad_y));
+                            item.main_baselines = item.main_baselines.map(|value| value.translated(pad_x, pad_y));
                             outer
                         } else {
-                            target - baseline
+                            position
                         }
                     } else {
                         alignment.offset(free, style, &item.style, !row, style.flex_wrap_reverse)
@@ -26194,6 +26368,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 } else {
                     item.cross_shift += dy;
                 }
+                item.main_baselines = item.main_baselines.map(|value| value.translated(dx, dy));
             }
             lines[line_index].2 = align_extent;
             total_main = total_main.max(available);
@@ -26234,13 +26409,22 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             (0.0, 0.0)
         };
-        // Flexbox §8.5: when no item of the first line has a baseline, the
-        // container's baseline is synthesized from the first item's border box.
-        let mut synthesize_first_baseline = lines
-            .first()
-            .filter(|&&(start, end, _)| row && !items[start..end].iter().any(|item| item.baselines.is_some()))
-            .map(|&(start, _, _)| start);
-        for &(start, end, base_extent) in &lines {
+        let export_vertical = style.writing_mode != css::WritingMode::HorizontalTb;
+        let export_on_cross = export_vertical == !row;
+        let direction_reversed = matches!(
+            style.flex_direction,
+            FlexDirection::RowReverse | FlexDirection::ColumnReverse
+        );
+        let (first_line, last_line) = if style.flex_wrap_reverse {
+            (lines.len() - 1, 0)
+        } else {
+            (0, lines.len() - 1)
+        };
+        let mut first_participant: Option<FlowBaselines> = None;
+        let mut first_startmost: Option<FlowBaselines> = None;
+        let mut last_participant: Option<FlowBaselines> = None;
+        let mut last_endmost: Option<FlowBaselines> = None;
+        for (line_index, &(start, end, base_extent)) in lines.iter().enumerate() {
             let extent = base_extent + final_stretch;
             let position = if style.flex_wrap && cross_reverse {
                 cross_limit.unwrap_or(natural_cross) - line_origin - extent
@@ -26296,6 +26480,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             let padding = baseline_offset - offset;
                             self.move_baseline_contents(item.content_ranges, padding);
                             item.baselines = item.baselines.map(|value| value.shifted(padding));
+                            item.main_baselines = item.main_baselines.map(|value| value.shifted(padding));
                         } else {
                             offset = baseline_offset;
                         }
@@ -26309,6 +26494,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         geometry.move_hits(item.first_hit..item.last_hit, 0.0, offset);
                     }
                     item.baselines = item.baselines.map(|value| value.shifted(offset));
+                    item.main_baselines = item.main_baselines.map(|value| value.shifted(offset));
                     self.refresh_transform(
                         item.node,item.generated.as_ref().map(|generated|generated.pseudo),
                         &item.style,
@@ -26328,21 +26514,53 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.first_hit..item.last_hit, dx, dy);
                     geometry.move_hits(item.first_hit..item.last_hit, dx, dy);
                 }
-                let exported = item.baselines.or_else(|| {
-                    if synthesize_first_baseline != Some(start + item_index) {
-                        return None;
-                    }
-                    synthesize_first_baseline = None;
-                    Some(FlowBaselines { first: border_box_end, last: border_box_end, horizontal: false, reverse: false })
+                let exported = if export_on_cross { item.baselines } else { item.main_baselines }.or_else(|| {
+                    (row && !export_vertical).then_some(FlowBaselines {
+                        first: border_box_end,
+                        last: border_box_end,
+                        horizontal: false,
+                        reverse: false,
+                    })
                 });
                 if let Some(baselines) = exported {
-                    FlowBaselines::include(
-                        &mut self.flow_baselines,
-                        baselines.translated(x + dx, y + dy),
-                    );
+                    let baselines = baselines.translated(x + dx, y + dy);
+                    let line_len = end - start;
+                    let startmost = if direction_reversed { line_len - 1 } else { 0 };
+                    let endmost = line_len - 1 - startmost;
+                    let participation = if export_on_cross {
+                        flex_cross_baseline(&item.style, item.baselines, item.cross, style, row)
+                            .map(|participant| participant.slot / 2)
+                    } else {
+                        None
+                    };
+                    if line_index == first_line {
+                        if participation == Some(0) && first_participant.is_none() {
+                            first_participant = Some(baselines);
+                        }
+                        if item_index == startmost {
+                            first_startmost = Some(baselines);
+                        }
+                    }
+                    if line_index == last_line {
+                        if participation == Some(1) && last_participant.is_none() {
+                            last_participant = Some(baselines);
+                        }
+                        if item_index == endmost {
+                            last_endmost = Some(baselines);
+                        }
+                    }
                 }
             }
             line_origin += extent + cross_gap + final_gap;
+        }
+        let first_source = first_participant.or(first_startmost);
+        let last_source = last_participant.or(last_endmost);
+        if let Some(source) = first_source.or(last_source) {
+            let last_source = last_source.unwrap_or(source);
+            FlowBaselines::include(
+                &mut self.flow_baselines,
+                FlowBaselines { first: source.first, last: last_source.last, ..source },
+            );
         }
         let cross_offset = if style.flex_wrap {
             cross_limit.unwrap_or(natural_cross)
@@ -30393,6 +30611,10 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             .geometry
             .as_ref()
             .map_or(0, |geometry| geometry.rounded_clips.len());
+        let text_run_start = self
+            .geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.control_text_runs.len());
         self.push_command(Command::PushTransform(Affine::IDENTITY))?;
         let saved_baselines = self.flow_baselines.take();
         let saved_lr = self.vertical_inline_lr;
@@ -30486,7 +30708,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         self.replace_command(command_start, Command::PushTransform(matrix))?;
         self.push_command(Command::PopTransform)?;
         let local_matrix=Affine{e:if sideways_lr {0.0}else if lr {0.0}else{width},f:if sideways_lr {available}else{0.0},..matrix};let hit_end=self.geometry.as_ref().map_or(hit_start,|geometry|geometry.hits.len());self.orient_overflow_contributions(hit_start..hit_end,local_matrix,overflow_scope.0);
-        self.orient_inline_geometry(hit_start, transform_start, clip_start, matrix);
+        self.orient_inline_geometry(hit_start, transform_start, clip_start, text_run_start, matrix);
         if let Some(measured) = measured {
             let (first, last) = if sideways_lr {
                 (measured.first, measured.last)
@@ -30541,6 +30763,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         hit_start: usize,
         transform_start: usize,
         clip_start: usize,
+        text_run_start: usize,
         matrix: Affine,
     ) {
         let Some(geometry) = self.geometry.as_mut() else {
@@ -30582,12 +30805,12 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 };
             }
         }
-        for run in &mut geometry.control_text_runs {
-            if run.hit_index.is_some_and(|index| hits.contains(&index)) {
-                run.orientation = matrix.then(run.orientation);
-            }
+        let text_run_start = text_run_start.min(geometry.control_text_runs.len());
+        for run in &mut geometry.control_text_runs[text_run_start..] {
+            run.orientation = matrix.then(run.orientation);
         }
         geometry.refresh_control_run_transforms(hits.clone());
+        geometry.refresh_text_run_orientations(text_run_start);
         // Scroll replay translates a physical command suffix. Rotated suffixes
         // need their logical-axis scroll inputs resolved again; retain hits and
         // ports, but use the existing relayout path for these regions.
@@ -32950,7 +33173,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
             if starts.binary_search(&(glyph.cluster as usize)).is_ok() {
                 if boundaries.len() >= MAX_DISPLAY_COMMANDS { return Err(LayoutError::CommandLimit); }
                 boundaries.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
-                boundaries.push(glyph.x);
+                boundaries.push(glyph.x - glyph.x_offset);
             }
         }
         boundaries.try_reserve(2).map_err(|_| LayoutError::CommandLimit)?;
@@ -34328,6 +34551,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             .geometry
             .as_ref()
             .map_or(0, |geometry| geometry.rounded_clips.len());
+        let text_run_start = self
+            .geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.control_text_runs.len());
         self.push_command(Command::PushTransform(Affine::IDENTITY))?;
         let saved_lr = self.vertical_inline_lr;
         let sideways_lr = self.vertical_sideways_lr;
@@ -34354,7 +34581,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.replace_command(command_start, Command::PushTransform(matrix))?;
         self.push_command(Command::PopTransform)?;
         let local_matrix=self.vertical_replaced_inline_transform(0.0,0.0,width,height);let hit_end=self.geometry.as_ref().map_or(hit_start,|geometry|geometry.hits.len());self.orient_overflow_contributions(hit_start..hit_end,local_matrix,overflow_scope.0);
-        self.orient_inline_geometry(hit_start, transform_start, clip_start, matrix);
+        self.orient_inline_geometry(hit_start, transform_start, clip_start, text_run_start, matrix);
         if let Some(measured) = measured.and_then(|baseline| baseline.axis(true)) {
             FlowBaselines::include(
                 &mut self.flow_baselines,
@@ -34462,6 +34689,10 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             .geometry
             .as_ref()
             .map_or(0, |geometry| geometry.rounded_clips.len());
+        let text_run_start = self
+            .geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.control_text_runs.len());
         self.push_command(Command::PushTransform(Affine::IDENTITY))?;
         let saved = self.vertical_paragraph;
         let saved_lr = self.vertical_inline_lr;
@@ -34489,7 +34720,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.replace_command(command_start, Command::PushTransform(matrix))?;
         self.push_command(Command::PopTransform)?;
         let local_matrix=self.vertical_replaced_inline_transform(0.0,0.0,width,height);let hit_end=self.geometry.as_ref().map_or(hit_start,|geometry|geometry.hits.len());self.orient_overflow_contributions(hit_start..hit_end,local_matrix,overflow_scope.0);
-        self.orient_inline_geometry(hit_start, transform_start, clip_start, matrix);
+        self.orient_inline_geometry(hit_start, transform_start, clip_start, text_run_start, matrix);
         if let Some(measured) = measured.and_then(|baseline| baseline.axis(true)) {
             FlowBaselines::include(
                 &mut self.flow_baselines,
@@ -35402,22 +35633,70 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
 
     fn paint_positioned_box_source(&mut self, source: PositionedBoxSource, parent:&Style,
         style:Style, x:f32, y:f32, available:f32, depth:usize, _order:u64) -> Result<(),LayoutError> {
+        let mut fell_back = false;
         let style = match &source {
-            PositionedBoxSource::Node(node) => self.position_fallback_style(*node, &style, depth).unwrap_or(style),
+            PositionedBoxSource::Node(node) => match self.position_fallback_style(*node, &style, depth) {
+                Some(fallback) => {
+                    fell_back = true;
+                    fallback
+                }
+                None => style,
+            },
             PositionedBoxSource::Generated(_) => style,
         };
+        let mut style = style;
+        if let PositionedBoxSource::Node(node) = &source {
+            if self.position_visibility_hidden(*node, &style, depth) {
+                style.opacity = 0.0;
+            }
+        }
         let area = match &source {
             PositionedBoxSource::Node(node) => self.position_area_placement(*node, &style),
             PositionedBoxSource::Generated(_) => None,
         };
-        let Some((area, adjusted)) = area else {
-            return self.paint_positioned_box_in_place(source, parent, style, x, y, available, depth);
+        let Some((area, mut adjusted)) = area else {
+            let node = match &source {
+                PositionedBoxSource::Node(node) => Some(*node),
+                PositionedBoxSource::Generated(_) => None,
+            };
+            let recorded = fell_back.then(|| style.clone());
+            let result = self.paint_positioned_box_in_place(source, parent, style, x, y, available, depth);
+            if let (Some(node), Some(recorded), Ok(())) = (node, recorded, &result) {
+                self.record_fallback_insets(node, &recorded)?;
+            }
+            return result;
         };
+        let node = match &source {
+            PositionedBoxSource::Node(node) => Some(*node),
+            PositionedBoxSource::Generated(_) => None,
+        };
+        let filled = [
+            style.top.is_none() && adjusted.top.is_some(),
+            style.right.is_none() && adjusted.right.is_some(),
+            style.bottom.is_none() && adjusted.bottom.is_some(),
+            style.left.is_none() && adjusted.left.is_some(),
+        ];
+        let had_auto_margin = adjusted.margin_auto.iter().any(|auto| *auto);
+        for side in 0..4 {
+            if adjusted.margin_auto[side] {
+                adjusted.margin_auto[side] = false;
+                adjusted.margin_sides[side] = 0.0;
+            }
+        }
+        let used_margins = adjusted.margin_sides;
         let fixed = style.position == Position::Fixed;
         let saved = (self.containing_block, self.fixed_containing_block);
         if fixed { self.fixed_containing_block = Some(area); } else { self.containing_block = Some(area); }
         let result = self.paint_positioned_box_in_place(source, parent, adjusted, x, y, available, depth);
         (self.containing_block, self.fixed_containing_block) = saved;
+        if let (Some(node), Ok(())) = (node, &result) {
+            self.record_filled_insets(node, filled)?;
+            if had_auto_margin {
+                let mut recorded = style;
+                recorded.margin_sides = used_margins;
+                self.record_used_margins(node, &recorded, used_margins, true)?;
+            }
+        }
         result
     }
 
@@ -36830,6 +37109,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         output_rect: Option<&mut Rect>,
     ) -> Result<f32, LayoutError> {
         let mut anchored_insets = None;
+        let mut anchored_margins = None;
         let computed = self
             .opacity_style(id, parent_style, computed)?
             .map(|style| {
@@ -36842,15 +37122,20 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 };
                 let original = style.anchored.is_some().then(|| style.clone());
                 let style = self.resolve_anchored_style(id, style, containing);
-                anchored_insets = original.and_then(|original| anchor_layout::changed_insets(&original, &style));
-                self.resolve_style_percentages(
+                let resolved = self.resolve_style_percentages(
                     &style,
                     containing.map_or(available, |rect| rect.width),
                     containing.map_or(self.parent_height, |rect| Some(rect.height)),
-                )
+                );
+                anchored_margins = original.as_ref().filter(|original| original.margin_sides != resolved.margin_sides).map(|original| original.margin_sides);
+                anchored_insets = original.and_then(|original| anchor_layout::changed_insets(&original, &resolved));
+                resolved
             });
         if let Some(insets) = anchored_insets {
             self.record_used_insets(id, insets)?;
+        }
+        if let (Some(computed_sides), Some(style)) = (anchored_margins, computed.as_ref()) {
+            self.record_used_margins(id, style, computed_sides, false)?;
         }
         let placement=self.pending_overflow_placement.take().unwrap_or_else(||self.overflow_placement(x,y));
         let retain_to_parent=core::mem::take(&mut self.pending_overflow_moves);
@@ -37255,7 +37540,12 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                         |measurement, minimum| self.intrinsic_virtual_generated_size_impl(source, measurement, minimum))?;
                 }
             } else {
-            self.resolve_intrinsic_dimensions_for_box(
+            let collapsed = stretch_collapsed_margins(parent_style, style);
+            let margins = style.margin_sides;
+            for side in collapsed {
+                style.margin_sides[side] = 0.0;
+            }
+            let resolved = self.resolve_intrinsic_dimensions_for_box(
                 id,
                 style,
                 if positioned {
@@ -37279,7 +37569,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 },
                 depth,
                 child_override.as_ref().is_some_and(|source| source.anonymous),
-            )?;
+            );
+            style.margin_sides = margins;
+            resolved?;
             }
             if !positioned
                 && style.float == Float::None
@@ -37477,10 +37769,56 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 };
                 let mut aligned_x = None;
                 let mut aligned_y = None;
+                let mut anchor_center_x = None;
+                let mut anchor_center_y = None;
                 if let Some(container) = alignment_container.as_deref() {
                     let container_vertical = container.writing_mode != css::WritingMode::HorizontalTb;
                     let horizontal = style.self_alignment(container, !container_vertical);
                     let vertical = style.self_alignment(container, container_vertical);
+                    let anchor_centered = |alignment: css::ItemAlignment| alignment.keyword == Some(css::AlignmentKeyword::AnchorCenter);
+                    if anchor_centered(horizontal) || anchor_centered(vertical) {
+                        if let Some(anchor) = self.default_anchor_box(id, style) {
+                            let mut filled = [false; 4];
+                            let mut had_auto_margin = false;
+                            for (centered, edges, margins) in [
+                                (anchor_centered(horizontal), [3, 1], [3, 1]),
+                                (anchor_centered(vertical), [0, 2], [0, 2]),
+                            ] {
+                                if !centered {
+                                    continue;
+                                }
+                                for edge in edges {
+                                    let inset = match edge {
+                                        0 => &mut style.top,
+                                        1 => &mut style.right,
+                                        2 => &mut style.bottom,
+                                        _ => &mut style.left,
+                                    };
+                                    if inset.is_none() {
+                                        *inset = Some(0.0);
+                                        filled[edge] = true;
+                                    }
+                                }
+                                for side in margins {
+                                    if style.margin_auto[side] {
+                                        style.margin_auto[side] = false;
+                                        style.margin_sides[side] = 0.0;
+                                        had_auto_margin = true;
+                                    }
+                                }
+                            }
+                            if anchor_centered(horizontal) {
+                                anchor_center_x = Some(anchor[0] + anchor[2] * 0.5);
+                            }
+                            if anchor_centered(vertical) {
+                                anchor_center_y = Some(anchor[1] + anchor[3] * 0.5);
+                            }
+                            self.record_filled_insets(id, filled)?;
+                            if had_auto_margin {
+                                margin_solver_input = Some((style.margin_sides, true));
+                            }
+                        }
+                    }
                     let grid_area = parent_style.display == Display::Grid && container.display == Display::Grid;
                     if (grid_area && style.left.is_some() == style.right.is_some() || style.left.is_some() && style.right.is_some()) && horizontal.alignment != AlignItems::Stretch
                         && !style.margin_auto[1] && !style.margin_auto[3] && !style.display.is_table() {
@@ -37616,7 +37954,8 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     }
                 }
                 if let (Some(alignment), Some(container)) = (aligned_x, alignment_container.as_deref()) {
-                    let width = content_dimension(style, style.width.unwrap_or(0.0)) + box_edges(style, true);
+                    let width = constrained_width(style, content_dimension(style, style.width.unwrap_or(0.0))) + box_edges(style, true)
+                        - style.margin_sides[1] - style.margin_sides[3];
                     let axis = crate::positioned_alignment::PositionedAxis {
                         cb_start: containing.x - containing_block_scroll.0,
                         cb_size: containing.width,
@@ -37626,6 +37965,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         margin_end: style.margin_sides[1],
                         size: width,
                         horizontal: true,
+                        anchor_center: anchor_center_x,
                     };
                     let start = axis.aligned_start(alignment, container, style);
                     overflow_origin.0 += f64::from(start - origin.0);
@@ -37633,10 +37973,10 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 }
                 if let (Some(alignment), Some(container)) = (aligned_y, alignment_container.as_deref()) {
                     let height = if let Some(height) = style.height {
-                        content_height_dimension(style, height) + box_edges(style, false)
+                        constrained_height(style, content_height_dimension(style, height)) + box_edges(style, false)
                     } else {
                         self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?.1
-                    };
+                    } - style.margin_sides[0] - style.margin_sides[2];
                     let axis = crate::positioned_alignment::PositionedAxis {
                         cb_start: containing.y - containing_block_scroll.1,
                         cb_size: containing.height,
@@ -37646,6 +37986,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         margin_end: style.margin_sides[2],
                         size: height,
                         horizontal: false,
+                        anchor_center: anchor_center_y,
                     };
                     let start = axis.aligned_start(alignment, container, style);
                     overflow_origin.1 += f64::from(start - origin.1);
@@ -39420,7 +39761,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         } else { None };
         if (!virtual_parent||generated_box) && !display_contents && depth>0 && !self_is_stacking_context
             && style.position==Position::Static && style.float==Float::None
-            && matches!(style.display,Display::Block|Display::FlowRoot|Display::ListItem) {
+            && (matches!(style.display,Display::Block|Display::FlowRoot|Display::ListItem)
+                || style.display==Display::Flex && !style.is_inline_level()) {
             self.record_block_surface(box_source,block_surface_start..self.commands.len(),hit)?;
         }
         let block_surface_end=self.commands.len();
@@ -45465,7 +45807,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                     id: character as u32 as u16,
                     face: 0,
                     cluster: cluster as u32,
-                    caps_expansion: 0,
+                    caps_expansion: 0, x_offset: 0.0,
                     x,
                     y: 0.0,
                     size_scale: 1.0,
@@ -49156,7 +49498,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             fn shape(&self,text:&str,_size:f32)->Result<ShapedRun,()> {
                 let count=text.chars().count();
                 Ok(ShapedRun { glyphs:text.char_indices().enumerate().map(|(index,(at,ch))|crate::paint::Glyph {
-                    id:ch as u16+count as u16*10,face:0,cluster:at as u32,caps_expansion:0,
+                    id:ch as u16+count as u16*10,face:0,cluster:at as u32,caps_expansion: 0, x_offset: 0.0,
                     x:index as f32*6.0,y:0.0,size_scale:1.0,
                 }).collect::<Vec<_>>().into(),width:count as f32*6.0 })
             }
@@ -53167,7 +53509,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                         id: u16::try_from(character as u32).unwrap_or(0xfffd),
                         face: 0,
                         cluster: cluster as u32,
-                        caps_expansion: 0,
+                        caps_expansion: 0, x_offset: 0.0,
                         x: index as f32 * 6.0,
                         y: 0.0,
                         size_scale: 1.0,
@@ -58434,7 +58776,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             Ok(ShapedRun {
                 glyphs: text.char_indices().map(|(cluster, character)| crate::paint::Glyph {
                     id: u16::try_from(character as u32).unwrap_or(0xfffd), face: 0,
-                    cluster: cluster as u32, caps_expansion: 0, x: cluster as f32 * 2.0,
+                    cluster: cluster as u32, caps_expansion: 0, x_offset: 0.0, x: cluster as f32 * 2.0,
                     y: 0.0, size_scale: 1.0,
                 }).collect::<Vec<_>>().into(),
                 width: text.len() as f32 * 2.0,
@@ -58565,7 +58907,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                                     id: 'S' as u16,
                                     face: 0,
                                     cluster: cluster as u32,
-                                    caps_expansion: extra,
+                                    caps_expansion: extra, x_offset: 0.0,
                                     x,
                                     y: 0.0,
                                     size_scale: 0.8,
@@ -58579,7 +58921,7 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
                                 id: character as u16,
                                 face: 0,
                                 cluster: cluster as u32,
-                                caps_expansion: expansion,
+                                caps_expansion: expansion, x_offset: 0.0,
                                 x: if mark { x - 6.0 } else { x },
                                 y: 0.0,
                                 size_scale: 1.0,

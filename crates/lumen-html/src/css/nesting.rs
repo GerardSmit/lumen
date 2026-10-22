@@ -10,6 +10,8 @@ pub enum SourceRuleKind {
     FontFace,
     Property,
     PositionTry,
+    Page,
+    MarginBox,
     CounterStyle,
     FontFeatureValues,
     FontPaletteValues,
@@ -811,6 +813,9 @@ fn parse_body(
             && (parent.is_none() || scope_body || starting_context)
         {
             SourceRuleKind::Keyframes
+        } else if page_rules::page_prelude_tail(prelude).is_some_and(|tail| page_rules::selector_list(tail).is_some())
+            && (parent.is_none() || scope_body || starting_context) {
+            SourceRuleKind::Page
         } else if prelude.starts_with('@') {
             continue;
         } else {
@@ -932,6 +937,7 @@ fn parse_body(
                 }
             }
             SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
+            SourceRuleKind::Page => page_rules::fill_body(text, open, close, &mut node, count)?,
             SourceRuleKind::Keyframes => {
                 for (frame_start, frame_end, frame_open, frame_close) in
                     source_rule_ranges(&text[open + 1..close], false)?

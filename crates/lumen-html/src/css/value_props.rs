@@ -75,6 +75,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("font-language-override", true, "normal", "normal | <string>"),
     prop("font-optical-sizing", true, "auto", "auto | none"),
     prop("font-palette", true, "normal", "normal | light | dark | <dashed-ident>"),
+    prop("dynamic-range-limit", true, "no-limit", "standard | no-limit | constrained"),
     prop("font-presentation", true, "auto", "auto | text | emoji"),
     prop("font-synthesis-weight", true, "auto", "auto | none"),
     prop("font-synthesis-style", true, "auto", "auto | none | oblique-only"),
@@ -159,6 +160,9 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("vector-effect", false, "none", "none | non-scaling-stroke"),
     prop("white-space-trim", false, "none", "none | [ discard-before || discard-after || discard-inner ]"),
     typed(prop("will-change", false, "auto", "auto | [ scroll-position | contents | <will-change-ident> ]#"), "auto"),
+    prop("forced-color-adjust", true, "auto", "auto | none | preserve-parent-color"),
+    prop("image-orientation", true, "from-image", "from-image | none"),
+    prop("link-parameters", false, "none", "none | <param>#"),
 ];
 
 pub(crate) const COUNT: usize = PROPS.len();
@@ -217,6 +221,7 @@ enum Leaf {
     IntegerMin1,
     Flex,
     ResolvedColor,
+    Param,
 }
 
 #[derive(Debug)]
@@ -383,6 +388,7 @@ fn leaf_named(name: &str) -> Leaf {
         "integer-min1" => Leaf::IntegerMin1,
         "flex" => Leaf::Flex,
         "color-resolved" => Leaf::ResolvedColor,
+        "param" => Leaf::Param,
         _ => panic!("unknown value-definition leaf"),
     }
 }
@@ -652,6 +658,7 @@ impl Matcher<'_> {
                 let value = number.parse::<f64>().ok().filter(|value| value.is_finite() && *value >= 0.0)?;
                 Some(alloc::format!("{}fr", computed_values::number(value as f32)))
             }
+            Leaf::Param => param_function(word),
             Leaf::ResolvedColor => {
                 if self.computed {
                     self.compute("<color>", word)
@@ -661,6 +668,44 @@ impl Matcher<'_> {
             }
         }
     }
+}
+
+fn param_function(word: &str) -> Option<String> {
+    let word = word.trim();
+    let open = word.find('(')?;
+    if !word[..open].eq_ignore_ascii_case("param") || !word.ends_with(')') {
+        return None;
+    }
+    let inner = &word[open + 1..word.len() - 1];
+    let comma = syntax::top_level_find(inner, b',')??;
+    let (head, value) = (inner[..comma].trim(), inner[comma + 1..].trim());
+    let tokens = components(head)?;
+    let (name, kind) = match tokens.as_slice() {
+        [name] => (*name, None),
+        [name, kind] => (*name, Some(*kind)),
+        _ => return None,
+    };
+    let mut at = 0;
+    if !name.starts_with("--") || consume_selector_identifier(name, &mut at).is_none_or(|_| at != name.len()) {
+        return None;
+    }
+    let kind = match kind {
+        None => None,
+        Some(kind) if kind.starts_with('<') && kind.ends_with('>') && registered_properties::valid_typed_syntax(kind) => Some(String::from(kind)),
+        Some(kind) if kind.len() > 6 && kind.as_bytes()[..5].eq_ignore_ascii_case(b"type(") && kind.ends_with(')') => {
+            let syntax = kind[5..kind.len() - 1].trim();
+            if !registered_properties::valid_typed_syntax(syntax) {
+                return None;
+            }
+            let single = syntax.starts_with('<') && syntax.ends_with('>') && !syntax.contains(['|', ' ']);
+            Some(if single { String::from(syntax) } else { alloc::format!("type({syntax})") })
+        }
+        Some(_) => return None,
+    };
+    Some(match kind {
+        Some(kind) => alloc::format!("param({name} {kind}, {value})"),
+        None => alloc::format!("param({name}, {value})"),
+    })
 }
 
 fn path_function(word: &str) -> Option<String> {
@@ -809,6 +854,9 @@ fn evaluate(index: usize, raw: &str, context: LengthContext, foreground: Rgba, c
     if prop.name == "font-palette" && super::palette_mix::is_palette_mix(raw) {
         return super::palette_mix::canonicalize(raw, computed);
     }
+    if prop.name == "dynamic-range-limit" && super::dynamic_range_limit::is_mix(raw) {
+        return super::dynamic_range_limit::canonicalize(raw, computed, context);
+    }
     let tokens = tokenize(raw)?;
     if tokens.is_empty() {
         return None;
@@ -845,6 +893,9 @@ pub(crate) fn interpolate(index: usize, from: &str, to: &str, progress: f64) -> 
     if PROPS[index].name == "font-palette" {
         return super::palette_mix::interpolate(from, to, progress);
     }
+    if PROPS[index].name == "dynamic-range-limit" {
+        return super::dynamic_range_limit::interpolate(from, to, progress);
+    }
     if is_discrete(index) {
         return None;
     }
@@ -868,6 +919,9 @@ pub(crate) fn is_discrete(index: usize) -> bool {
     let syntax = PROPS[index].syntax;
     if PROPS[index].name == "overflow-clip-margin" {
         return true;
+    }
+    if PROPS[index].name == "dynamic-range-limit" {
+        return false;
     }
     if syntax == "<color>" {
         return false;
@@ -893,6 +947,7 @@ fn contains_keyword(node: &Node, keyword: &str) -> bool {
         Node::Seq(items) | Node::Alt(items) | Node::AnyOf(items) | Node::AllOf(items) => items.iter().any(|item| contains_keyword(item, keyword)),
         Node::Optional(inner) => contains_keyword(inner, keyword),
         Node::Repeat { node, .. } => contains_keyword(node, keyword),
+        Node::Leaf(Leaf::PaintOrder) => matches!(keyword, "fill" | "stroke" | "markers"),
         Node::Leaf(_) | Node::Comma => false,
     }
 }

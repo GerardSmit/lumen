@@ -1557,6 +1557,7 @@ fn specified_track_tokens(tokens: &[&str]) -> Option<String> {
                 append(&mut result, &inner)?;
                 append(&mut result, ")")?;
             }
+            None if token == "0" => append(&mut result, "0px")?,
             None => append(&mut result, token)?,
         }
     }

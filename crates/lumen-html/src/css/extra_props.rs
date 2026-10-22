@@ -665,6 +665,9 @@ pub(crate) fn serialize_specified(slot: usize, raw: &str) -> Option<String> {
         Kind::TabSize | Kind::Perspective if !length_independent(raw) || math_function(raw) => {
             typed_numeric::parse_numeric_expression(raw)?.serialize_specified()
         }
+        Kind::TabSize | Kind::Perspective if typed_numeric::parse_numeric_expression(raw).is_some() => {
+            typed_numeric::parse_numeric_expression(raw)?.serialize_specified()
+        }
         Kind::TextSizeAdjust if math_function(raw) => typed_numeric::parse_numeric_expression(raw)?.serialize_specified(),
         Kind::Position => background_positions::position_specified(raw),
         Kind::Anchor => anchor::specified(prop.name, raw),

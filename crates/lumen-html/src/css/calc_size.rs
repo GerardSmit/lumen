@@ -747,11 +747,13 @@ pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
     }
     let mut basis: Option<Basis> = None;
     let mut total = Lin::length();
+    let mut percentage_basis = false;
     for &(text, weight) in values {
         if !weight.is_finite() {
             return None;
         }
         let side = side(text, keywords)?;
+        percentage_basis |= side.basis.is_none() && side.lin.pct.is_some() && starts_calc_size(text.trim());
         match (basis, side.basis) {
             (Some(left), Some(right)) if left != right => return None,
             (None, Some(right)) => basis = Some(right),
@@ -759,7 +761,7 @@ pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
         }
         total = total.add(&side.lin.scaled(weight))?;
     }
-    if !total.finite() {
+    if !total.finite() || percentage_basis && basis.is_some() {
         return None;
     }
     Some(flat_text(&Flat { basis, lin: total }))

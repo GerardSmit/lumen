@@ -78,9 +78,13 @@ fn replace_window_attribute(ctx: &mut Ctx, receiver: Value, name: &str, value: V
 fn scroll_window_receiver(
     ctx: &mut Ctx,
     receiver: &Value,
-    args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    args: scrolling::ScrollArgs,
     relative: bool,
 ) -> OpResult<Promise<Value>> {
+    let args = match args.0 {
+        Ok(args) => args,
+        Err(error) => return Ok(Promise::rejected(OpError::thrown(error))),
+    };
     // Web IDL's global-interface operations use their relevant global for
     // null/undefined this. Publish its WindowProxy before projecting the
     // native receiver so original-caller authorization still runs.
@@ -355,7 +359,7 @@ crate::event_content_handlers::bind_window_handlers! {
     fn scroll(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, false)
     }
@@ -364,7 +368,7 @@ crate::event_content_handlers::bind_window_handlers! {
     fn scroll_to(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, false)
     }
@@ -373,7 +377,7 @@ crate::event_content_handlers::bind_window_handlers! {
     fn scroll_by(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, true)
     }
@@ -1110,8 +1114,12 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     for &name in event_content_handlers::WINDOW_IDL_HANDLERS {
         let key=Value::str(name);
         let descriptor=ctx.reflect_get_own_property_descriptor(&prototype,&key).map_err(OpError::thrown)?;
+        if matches!(descriptor,Value::Undefined) {continue;}
         if !ctx.reflect_define_property(&global,&key,&descriptor).map_err(OpError::thrown)? {
             return Err(OpError::type_error("Window handler attribute could not be installed"));
+        }
+        if !ctx.delete_member(&prototype,name).map_err(OpError::thrown)? {
+            return Err(OpError::type_error("Window handler attribute is still on the prototype"));
         }
     }
     for name in ["scroll","scrollTo","scrollBy","moveTo","moveBy","resizeTo","resizeBy"] {
@@ -1590,8 +1598,8 @@ mod tests {
             if (window.scrollX !== 15 || window.scrollY !== 21 || window.scroll.length !== 0)
               throw new Error('missing dictionary or Web IDL arity');
             let invalidDictionary = false;
-            try { window.scrollTo(20); } catch(error) { invalidDictionary = error.name === 'TypeError'; }
-            if (!invalidDictionary) throw new Error('primitive dictionary accepted');
+            try { invalidDictionary = window.scrollTo(20) instanceof Promise; } catch(error) { invalidDictionary = false; }
+            if (!invalidDictionary) throw new Error('primitive dictionary must reject the returned promise');
 
             window.scrollTo({left: 12});
             if (window.scrollX !== 12 || window.scrollY !== 21)

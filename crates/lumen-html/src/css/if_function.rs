@@ -153,7 +153,7 @@ impl IfScope<'_> {
         }
     }
 
-    fn declared(&self, name: &str, wanted: Option<&str>) -> Option<bool> {
+    pub(super) fn declared(&self, name: &str, wanted: Option<&str>) -> Option<bool> {
         let registration = self.registration(name);
         let current = self.value_of(self.names, name, registration)
             .or_else(|| if self.names.value(name).is_none() { self.initial(registration) } else { None });

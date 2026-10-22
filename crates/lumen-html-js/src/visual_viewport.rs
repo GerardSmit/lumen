@@ -107,6 +107,16 @@ impl DomVisualViewport {
     fn set_onscroll(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
         self.base.set_event_handler(ctx, &this.0, "scroll", callback);
     }
+
+    #[getter]
+    fn onscrollend(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        self.base.handler_value(ctx, &this.0, "scrollend")
+    }
+
+    #[setter]
+    fn set_onscrollend(&self, ctx: &mut Ctx, this: This<Value>, callback: crate::events::EventHandler) {
+        self.base.set_event_handler(ctx, &this.0, "scrollend", callback);
+    }
 }
 
 /// Creates `window.visualViewport` for a document realm.

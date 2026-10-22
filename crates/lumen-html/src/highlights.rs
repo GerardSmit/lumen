@@ -35,7 +35,7 @@ mod tests {
         fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
             Ok(ShapedRun { width: text.chars().count() as f32 * 10.0,
                 glyphs: text.char_indices().enumerate().map(|(position, (cluster, ch))| Glyph {
-                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0,
+                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0, x_offset: 0.0,
                     x: position as f32 * 10.0, y: 0.0, size_scale: 1.0,
                 }).collect::<Vec<_>>().into() })
         }

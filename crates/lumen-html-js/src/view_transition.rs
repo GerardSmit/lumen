@@ -164,20 +164,33 @@ impl NativeIdentityOwner for DomViewTransition {
 #[lumen_bind::methods]
 impl DomViewTransition {
     #[getter]
-    fn ready(&self) -> Value {
-        self.state.borrow().ready.promise.clone()
+    fn ready(ctx: &mut Ctx, this: This<Value>) -> Value {
+        promise_attribute(ctx, &this.0, |state| state.ready.promise.clone())
     }
     #[getter]
-    fn update_callback_done(&self) -> Value {
-        self.state.borrow().update_done.promise.clone()
+    fn update_callback_done(ctx: &mut Ctx, this: This<Value>) -> Value {
+        promise_attribute(ctx, &this.0, |state| state.update_done.promise.clone())
     }
     #[getter]
-    fn finished(&self) -> Value {
-        self.state.borrow().finished.promise.clone()
+    fn finished(ctx: &mut Ctx, this: This<Value>) -> Value {
+        promise_attribute(ctx, &this.0, |state| state.finished.promise.clone())
     }
 
     fn skip_transition(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<()> {
         skip(ctx, &this.0, "AbortError", "View transition skipped")
+    }
+}
+
+/// A promise-typed attribute read on a foreign receiver rejects instead of throwing.
+fn promise_attribute(ctx: &mut Ctx, this: &Value, read: impl FnOnce(&TransitionState) -> Value) -> Value {
+    match ctx.with_instance::<DomViewTransition, _>(this, |transition| read(&transition.state.borrow())) {
+        Ok(promise) => promise,
+        Err(error) => {
+            let deferred = Deferred::new(ctx);
+            let promise = deferred.promise();
+            deferred.reject(ctx, error);
+            promise
+        }
     }
 }
 

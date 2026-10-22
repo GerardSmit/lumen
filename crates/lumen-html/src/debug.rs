@@ -136,7 +136,7 @@ mod tests {
                     id: 1,
                     face: self.0,
                     cluster: 0,
-                    caps_expansion: 0,
+                    caps_expansion: 0, x_offset: 0.0,
                     x: 0.0,
                     y: 0.0,
                     size_scale: 1.0,

@@ -207,8 +207,41 @@ pub(crate) fn computed_property_value(
     .property_value(property, false)
 }
 
-pub(crate) fn check_visibility(realm: &Rc<DomRealm>, node: NodeId, opacity: bool, visibility: bool) -> OpResult<bool> {
+fn content_visibility_skips(realm: &Rc<DomRealm>, node: NodeId, auto: bool) -> OpResult<bool> {
+    let mut current = realm.session.borrow().document().flat_tree_parent(node).ok().flatten();
+    while let Some(id) = current {
+        let is_element = matches!(realm.session.borrow().document().kind(id), Ok(NodeKind::Element { .. }));
+        if is_element {
+            match computed_property_value(realm, id, "content-visibility")?.as_str() {
+                "hidden" => return Ok(true),
+                "auto" if auto => {
+                    realm.flush_layout()?;
+                    let session = realm.session.borrow();
+                    let rect = session.bounding_client_rect(id);
+                    if let (Some(rect), Some((width, height))) = (rect, session.viewport_size()) {
+                        let (margin_x, margin_y) = (width as f32 / 2.0, height as f32 / 2.0);
+                        let outside = rect.x + rect.width < -margin_x
+                            || rect.y + rect.height < -margin_y
+                            || rect.x > width as f32 + margin_x
+                            || rect.y > height as f32 + margin_y;
+                        if outside {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = realm.session.borrow().document().flat_tree_parent(id).ok().flatten();
+    }
+    Ok(false)
+}
+
+pub(crate) fn check_visibility(realm: &Rc<DomRealm>, node: NodeId, opacity: bool, visibility: bool, content_visibility_auto: bool) -> OpResult<bool> {
     if !rendered_ancestry(realm, node, true)? {
+        return Ok(false);
+    }
+    if content_visibility_skips(realm, node, content_visibility_auto)? {
         return Ok(false);
     }
     if visibility && computed_property_value(realm, node, "visibility")? != "visible" {
@@ -357,7 +390,7 @@ fn define_css_property_accessor(
     property: &'static str,
 ) {
     let getter = ctx.new_native_fn(
-        "get",
+        &format!("get {name}"),
         0,
         std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, _args: &[Value]| {
             let method = ctx
@@ -367,7 +400,7 @@ fn define_css_property_accessor(
         }),
     );
     let setter = ctx.new_native_fn(
-        "set",
+        &format!("set {name}"),
         1,
         std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, args: &[Value]| {
             let method = ctx
@@ -495,6 +528,11 @@ impl DomStyle {
     fn indexed(&self,ctx:&mut Ctx, index: usize) -> OpResult<Value> {
         if self.computed {crate::animations::flush_css_transitions_for(ctx,&self.realm,Some(self.node))?;}
         Ok(self.property_name(index)?.map_or(Value::Undefined, Value::from_string))
+    }
+
+    #[getter(name = "parentRule")]
+    fn parent_rule(&self) -> Value {
+        Value::Null
     }
 
     #[getter]

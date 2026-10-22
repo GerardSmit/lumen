@@ -345,6 +345,7 @@ enum Position {
     LegacyLeft,
     LegacyRight,
     LegacyCenter,
+    AnchorCenter,
 }
 #[derive(Clone, Copy)]
 struct Parsed {
@@ -378,6 +379,7 @@ impl Parsed {
             Position::LegacyLeft => "legacy left",
             Position::LegacyRight => "legacy right",
             Position::LegacyCenter => "legacy center",
+            Position::AnchorCenter => "anchor-center",
         };
         with_safety(text, self.safe)
     }
@@ -397,6 +399,7 @@ impl Parsed {
             Position::LegacyLeft => Some(Keyword::LegacyLeft),
             Position::LegacyRight => Some(Keyword::LegacyRight),
             Position::LegacyCenter => Some(Keyword::LegacyCenter),
+            Position::AnchorCenter => Some(Keyword::AnchorCenter),
             _ => None,
         };
         if matches!(slot, 15 | 49) {
@@ -428,7 +431,9 @@ impl Parsed {
                 | Position::SelfEnd
                 | Position::Right
                 | Position::LegacyRight => Some(AlignItems::End),
-                Position::Center | Position::LegacyCenter => Some(AlignItems::Center),
+                Position::Center | Position::LegacyCenter | Position::AnchorCenter => {
+                    Some(AlignItems::Center)
+                }
                 Position::Baseline | Position::LastBaseline => Some(AlignItems::Baseline),
                 _ => Some(AlignItems::Start),
             };
@@ -521,6 +526,8 @@ fn parse_axis(name: &str, tokens: &mut Tokens<'_>) -> Option<Parsed> {
         Position::SelfStart
     } else if is("self-end") && !content {
         Position::SelfEnd
+    } else if is("anchor-center") && self_axis {
+        Position::AnchorCenter
     } else if is("left") && justify {
         Position::Left
     } else if is("right") && justify {
@@ -579,6 +586,7 @@ fn parse_axis(name: &str, tokens: &mut Tokens<'_>) -> Option<Parsed> {
                 | Position::FlowEnd
                 | Position::SelfStart
                 | Position::SelfEnd
+                | Position::AnchorCenter
                 | Position::Left
                 | Position::Right
         )

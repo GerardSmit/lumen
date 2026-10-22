@@ -313,7 +313,7 @@ fn parse_ray(inner: &str, env: Env) -> Option<Shape> {
                 if angle.is_some() {
                     return None;
                 }
-                angle = Some(parse_angle(token)?);
+                angle = Some(parse_angle(token, env)?);
             }
         }
         index += 1;

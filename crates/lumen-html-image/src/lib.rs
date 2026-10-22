@@ -21,6 +21,7 @@ pub mod canvas;
 mod coverage;
 mod gpui;
 mod lazy;
+mod profiled;
 mod gradient;
 mod pool;
 mod shadow;
@@ -29,7 +30,7 @@ mod transform;
 
 pub use lazy::{
     DEFAULT_DECODED_IMAGE_BUDGET, DecodedImageCacheStats, EncodedImage, decoded_image_cache_stats,
-    lazy_image_state, set_decoded_image_budget,
+    embedded_profile_pixels, lazy_image_state, set_decoded_image_budget,
 };
 
 const GLYPH_CACHE_BYTES: usize = 2 * 1024 * 1024;
@@ -4376,6 +4377,11 @@ pub fn render_png(
 }
 
 pub fn encode_png(image: &Rgba8Image) -> Vec<u8> {
+    encode_png_with_icc_profile(image, None)
+}
+
+/// Encode a PNG that embeds `icc_profile` as its iCCP chunk.
+pub fn encode_png_with_icc_profile(image: &Rgba8Image, icc_profile: Option<&[u8]>) -> Vec<u8> {
     let stride = image.width as usize * 4;
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::with_capacity(13);
@@ -4383,6 +4389,11 @@ pub fn encode_png(image: &Rgba8Image) -> Vec<u8> {
     header.extend_from_slice(&image.height.to_be_bytes());
     header.extend_from_slice(&[8, 6, 0, 0, 0]);
     chunk(&mut png, b"IHDR", &header);
+    if let Some(profile) = icc_profile {
+        let mut payload = b"ICC Profile\0\0".to_vec();
+        payload.extend_from_slice(&lumen_common::compress::zlib_compress(profile));
+        chunk(&mut png, b"iCCP", &payload);
+    }
     let mut compressor = lumen_common::compress::ZStream::deflate(6, 15, 8, 0)
         .expect("zlib compressor initialization");
     let mut scanline = Vec::with_capacity(stride + 1);
@@ -4418,6 +4429,24 @@ pub fn encode_png(image: &Rgba8Image) -> Vec<u8> {
     }
     chunk(&mut png, b"IEND", &[]);
     png
+}
+
+/// Like `encode_canvas_image` for a bitmap whose samples are Display P3: PNG output carries the
+/// Display P3 profile so decoders interpret it correctly. Other formats are encoded unprofiled.
+pub fn encode_canvas_image_display_p3(
+    image: &Rgba8Image,
+    requested_type: Option<&str>,
+    quality: Option<f64>,
+) -> Result<(Vec<u8>, &'static str), ImageError> {
+    let wants_png = requested_type.map_or(true, |kind| {
+        !matches!(kind.to_ascii_lowercase().as_str(), "image/jpeg" | "image/webp")
+    });
+    if wants_png {
+        if let Ok(profile) = moxcms::ColorProfile::new_display_p3().encode() {
+            return Ok((encode_png_with_icc_profile(image, Some(&profile)), "image/png"));
+        }
+    }
+    encode_canvas_image(image, requested_type, quality)
 }
 
 /// Encode a canvas bitmap using an implemented Canvas serialization format.
@@ -4505,7 +4534,9 @@ pub fn decode_raster_image_with_limit(
     bytes: &[u8],
     max_bytes: usize,
 ) -> Result<Rgba8Image, ImageError> {
-    decode_raster_image_bounded(bytes, true, max_bytes.min(MAX_IMAGE_BYTES))
+    let mut image = decode_raster_image_bounded(bytes, true, max_bytes.min(MAX_IMAGE_BYTES))?;
+    profiled::color_manage_to_srgb(bytes, &mut image);
+    Ok(image)
 }
 
 /// Decode a still image, using the shared XML/cascade/vector renderer for SVG.
@@ -4672,11 +4703,30 @@ pub fn raster_image_convert_to_srgb(
     raster_image_convert_to_srgb_profile(image, &source)
 }
 
+/// Convert straight RGBA samples from an embedded profile into Display P3.
+pub fn raster_image_convert_to_display_p3(
+    image: &mut Rgba8Image,
+    icc_profile: &[u8],
+) -> Result<(), ImageError> {
+    let source = moxcms::ColorProfile::new_from_slice(icc_profile)
+        .map_err(|_| ImageError::Png("invalid embedded ICC profile"))?;
+    raster_image_convert_between_profiles(image, &source, &moxcms::ColorProfile::new_display_p3())
+}
+
 /// Transform image samples through a parsed ICC profile. This is exposed so
 /// callers with an already parsed profile can reuse the same pixel contract.
 pub fn raster_image_convert_to_srgb_profile(
     image: &mut Rgba8Image,
     source: &moxcms::ColorProfile,
+) -> Result<(), ImageError> {
+    raster_image_convert_between_profiles(image, source, &moxcms::ColorProfile::new_srgb())
+}
+
+/// Transform straight RGBA samples from one parsed profile into another.
+pub fn raster_image_convert_between_profiles(
+    image: &mut Rgba8Image,
+    source: &moxcms::ColorProfile,
+    destination: &moxcms::ColorProfile,
 ) -> Result<(), ImageError> {
     let expected_len = (image.width as usize)
         .checked_mul(image.height as usize)
@@ -4688,11 +4738,10 @@ pub fn raster_image_convert_to_srgb_profile(
     if source.color_space != moxcms::DataColorSpace::Rgb {
         return Err(ImageError::Png("unsupported non-RGB embedded ICC profile"));
     }
-    let destination = moxcms::ColorProfile::new_srgb();
     let transform = source
         .create_transform_8bit(
             moxcms::Layout::Rgba,
-            &destination,
+            destination,
             moxcms::Layout::Rgba,
             moxcms::TransformOptions::default(),
         )

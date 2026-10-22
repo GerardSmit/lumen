@@ -49,6 +49,16 @@ impl<'a> FromArg<'a, JsHost> for ScrollToOptions {
     }
 }
 
+/// Arguments of the promise-returning `scroll*` operations. A conversion
+/// failure rejects the returned promise instead of throwing.
+pub(crate) struct ScrollArgs(pub Result<lumen_bind::OneOrNumberPair<ScrollToOptions>, Value>);
+
+impl<'a> lumen_bind::FromRest<'a, JsHost> for ScrollArgs {
+    fn from_rest(cx: &'a lumen::embed::ArgCx<'_>, values: &'a [Value], first: u32) -> Result<Self, Value> {
+        Ok(Self(<lumen_bind::OneOrNumberPair<ScrollToOptions> as lumen_bind::FromRest<'a, JsHost>>::from_rest(cx, values, first)))
+    }
+}
+
 fn optional_scroll_coordinate(
     ctx: &mut Ctx,
     options: &Value,
@@ -965,6 +975,25 @@ pub(crate) fn into_view(
 /// Rebuild the original target's geometry for each scroll step. In particular,
 /// an ancestor scroll changes the embedded viewport's position, not the target
 /// identity. Affine composition precedes bounds construction.
+/// Top, right, bottom and left lengths of a `scroll-margin` or `scroll-padding`
+/// property family; percentages resolve against `basis` (width, height).
+fn scroll_edge_lengths(realm: &Rc<DomRealm>, node: NodeId, prefix: &str, basis: (f32, f32)) -> OpResult<[f32; 4]> {
+    let mut lengths = [0.0; 4];
+    for (index, side) in ["top", "right", "bottom", "left"].into_iter().enumerate() {
+        let value = crate::style::computed_property_value(realm, node, &format!("{prefix}-{side}"))?;
+        let value = value.trim();
+        let reference = if index % 2 == 0 { basis.1 } else { basis.0 };
+        lengths[index] = if let Some(pixels) = value.strip_suffix("px") {
+            pixels.trim().parse().unwrap_or(0.0)
+        } else if let Some(percent) = value.strip_suffix('%') {
+            percent.trim().parse::<f32>().map_or(0.0, |percent| reference * percent / 100.0)
+        } else {
+            0.0
+        };
+    }
+    Ok(lengths)
+}
+
 fn target_bounds_in_scroll_space(
     original: &Rc<DomRealm>, target: NodeId, destination: &Rc<DomRealm>,
     inverse_scroll_space: lumen_html::paint::Affine,
@@ -1105,6 +1134,25 @@ fn into_view_waiting(
             };
             if let Some((port, inverse, (x, y), writing_mode, direction, behavior)) = geometry {
                 let Some(bounds) = target_bounds_in_scroll_space(&original, target, &current, inverse, &projected)? else { break; };
+                let margin = scroll_edge_lengths(&original, target, "scroll-margin", (0.0, 0.0))?;
+                let padding_node = if node == current.session.borrow().document().root() {
+                    selector::document_element(current.session.borrow().document()).unwrap_or(node)
+                } else {
+                    node
+                };
+                let padding = scroll_edge_lengths(&current, padding_node, "scroll-padding", (port.width, port.height))?;
+                let bounds = lumen_html::paint::Rect {
+                    x: bounds.x - margin[3],
+                    y: bounds.y - margin[0],
+                    width: bounds.width + margin[1] + margin[3],
+                    height: bounds.height + margin[0] + margin[2],
+                };
+                let port = lumen_html::paint::Rect {
+                    x: port.x + padding[3],
+                    y: port.y + padding[0],
+                    width: (port.width - padding[1] - padding[3]).max(0.0),
+                    height: (port.height - padding[0] - padding[2]).max(0.0),
+                };
                 use lumen_common::scroll::alignment_delta;
                 use lumen_html::css::{Direction, WritingMode};
                 let rtl = direction == Direction::Rtl;

@@ -10,6 +10,8 @@ mod component_eof;
 #[cfg(test)]
 mod custom_cascade_tests;
 mod syntax;
+mod token_join;
+pub mod page_rules;
 mod var_template;
 pub mod registered_properties;
 mod parallel;
@@ -43,6 +45,7 @@ mod color_layers;
 mod opacity_values;
 mod owner_values;
 mod palette_mix;
+mod dynamic_range_limit;
 mod value_props;
 mod value_shorthands;
 mod shorthand_rules;
@@ -83,6 +86,7 @@ pub fn is_grid_track_list_property(name:&str)->bool{grid_tracks::is_track_list_p
 pub fn interpolate_grid_track_list(property:&str,from:&str,to:&str,progress:f64)->Option<String>{grid_tracks::interpolate(property,from,to,progress)}
 pub fn compose_grid_track_list(property:&str,base:&str,value:&str)->Option<String>{grid_tracks::compose(property,base,value)}
 pub fn typed_keyword_allowed(name:&str,identifier:&str)->Option<bool>{value_props::typed_keyword(name,identifier)}
+pub fn substitute_element_functions(raw:&str,document:&Document,node:NodeId,property:&str)->Option<String>{owner_values::substitute_for_element(raw,document,node,property)}
 pub fn compose_extra_property(name:&str,base:&str,value:&str,accumulate:bool)->Option<String>{extra_props::compose(name,base,value,accumulate)}
 pub fn interpolate_extra_property(name:&str,from:&str,to:&str,progress:f64)->Option<String>{extra_props::interpolate(name,from,to,progress)}
 /// `caret-color: auto` computes to the resolved text color but is not an
@@ -748,6 +752,7 @@ pub enum AlignmentKeyword {
     LegacyLeft,
     LegacyRight,
     LegacyCenter,
+    AnchorCenter,
 }
 impl AlignmentKeyword {
     pub fn as_str(self) -> &'static str {
@@ -765,6 +770,7 @@ impl AlignmentKeyword {
             Self::LegacyLeft => "legacy left",
             Self::LegacyRight => "legacy right",
             Self::LegacyCenter => "legacy center",
+            Self::AnchorCenter => "anchor-center",
         }
     }
 }
@@ -2006,6 +2012,7 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
         rest = rest[end + 1..].trim_start();
     }
     let mut areas: Vec<GridArea> = Vec::new();
+    let mut cells: Vec<usize> = Vec::new();
     for (y, row) in rows.iter().enumerate() {
         for (x, name) in row.iter().enumerate() {
             if name.bytes().all(|v| v == b'.') {
@@ -2014,13 +2021,19 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
             if name.len() > 128
                 || !name
                     .bytes()
-                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_') || v >= 0x80)
             {
                 return None;
             }
-            if let Some(area) = areas.iter_mut().find(|area| area.name.as_ref() == *name) {
-                area.columns = area.columns.max(x + 1 - area.column);
-                area.rows = area.rows.max(y + 1 - area.row);
+            if let Some(index) = areas.iter().position(|area| area.name.as_ref() == *name) {
+                let area = &mut areas[index];
+                let right = (area.column + area.columns).max(x + 1);
+                let bottom = (area.row + area.rows).max(y + 1);
+                area.column = area.column.min(x);
+                area.row = area.row.min(y);
+                area.columns = right - area.column;
+                area.rows = bottom - area.row;
+                cells[index] += 1;
             } else {
                 if areas.len() == MAX_GRID_TRACKS {
                     return None;
@@ -2032,18 +2045,16 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
                     columns: 1,
                     rows: 1,
                 });
+                cells.push(1);
             }
         }
     }
-    for area in &areas {
-        for row in &rows[area.row..area.row + area.rows] {
-            if row[area.column..area.column + area.columns]
-                .iter()
-                .any(|name| *name != area.name.as_ref())
-            {
-                return None;
-            }
-        }
+    if areas
+        .iter()
+        .zip(&cells)
+        .any(|(area, count)| area.columns * area.rows != *count)
+    {
+        return None;
     }
     Some((areas.into(), [rows.first()?.len() as u8, rows.len() as u8]))
 }
@@ -5141,18 +5152,22 @@ fn adjust_specificity(
     )
 }
 
-fn language_argument_values(input:&str)->Option<Vec<String>> {
+fn language_argument_tokens(input:&str)->Option<Vec<(String,bool)>> {
     let mut position=0;let mut ranges=Vec::new();
     loop {
         if ranges.len()==8{return None;}
         skip_css_space_comments(input,&mut position)?;
-        let value=if input.as_bytes().get(position).is_some_and(|byte|matches!(byte,b'\''|b'"')) {
+        let quoted=input.as_bytes().get(position).is_some_and(|byte|matches!(byte,b'\''|b'"'));
+        let value=if quoted {
             let end=quoted_css_end(input,position)?;let value=css_string(&input[position..end])?;position=end;value
         }else{consume_selector_identifier(input,&mut position)?};
-        ranges.push(value);skip_css_space_comments(input,&mut position)?;
+        ranges.push((value,quoted));skip_css_space_comments(input,&mut position)?;
         if position==input.len(){return Some(ranges);}
         if input.as_bytes()[position]!=b','{return None;}position+=1;
     }
+}
+fn language_argument_values(input:&str)->Option<Vec<String>> {
+    language_argument_tokens(input).map(|tokens|tokens.into_iter().map(|(value,_)|value).collect())
 }
 fn language_ranges(input:&str)->Option<Vec<String>> {
     language_argument_values(input).map(|values|values.into_iter().map(|value|value.to_ascii_lowercase()).collect())
@@ -10342,7 +10357,7 @@ fn parse_simple_selector_depth(
             let pseudo_element = rest.starts_with("::") && !rest.starts_with(":::");
             let ParsedPseudoSource{name,args,end,args_offset}=parse_pseudo_source(rest,offset+start)?;
             let name=name.as_str();
-            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new")) || (!pseudo_element && matches!(name,"marker"|"placeholder")) {
+            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
                 return Err(selector_error(offset+start,"invalid pseudo selector colon syntax"));
             }
 
@@ -10375,6 +10390,17 @@ fn parse_simple_selector_depth(
                 if !wildcard {
                     selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 }
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && name == "backdrop" {
+                if args.is_some() {
+                    return Err(selector_error(offset + start, "::backdrop is not functional"));
+                }
+                // No backdrop box is generated, so the selector is valid and matches nothing.
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 start += end;
                 continue;
             }
@@ -11656,6 +11682,7 @@ fn value_depends_on_sibling_position(value: &Value) -> bool {
         Value::ColorRaw(_, raw) | Value::Deferred(_,raw) | Value::Custom(_,raw) => {
             typed_numeric::substitute_sibling_functions(raw, 1, 1).is_some_and(|(_, replaced)| replaced)
                 || matches!(value, Value::Deferred(..)) && owner_values::may_use(raw)
+                || matches!(value, Value::Custom(..)) && (owner_values::uses_attr(raw) || owner_values::uses_random(raw))
         }
         Value::ContextLength(_,raw,_)=>typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent),
         Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>typed_numeric::substitute_sibling_functions(&group.value,1,1).is_some_and(|(_,dependent)|dependent)
@@ -13613,6 +13640,7 @@ property_registry! {
     "font-language-override" => [extra_props::VALUE_BASE + value_props::const_index("font-language-override")], true, true;
     "font-optical-sizing" => [extra_props::VALUE_BASE + value_props::const_index("font-optical-sizing")], true, true;
     "font-palette" => [extra_props::VALUE_BASE + value_props::const_index("font-palette")], true, true;
+    "dynamic-range-limit" => [extra_props::VALUE_BASE + value_props::const_index("dynamic-range-limit")], true, true;
     "font-presentation" => [extra_props::VALUE_BASE + value_props::const_index("font-presentation")], true, true;
     "font-synthesis-weight" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-weight")], true, true;
     "font-synthesis-style" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-style")], true, true;
@@ -13691,6 +13719,9 @@ property_registry! {
     "transform-style" => [extra_props::VALUE_BASE + value_props::const_index("transform-style")], false, true;
     "vector-effect" => [extra_props::VALUE_BASE + value_props::const_index("vector-effect")], false, true;
     "will-change" => [extra_props::VALUE_BASE + value_props::const_index("will-change")], false, true;
+    "forced-color-adjust" => [extra_props::VALUE_BASE + value_props::const_index("forced-color-adjust")], true, true;
+    "image-orientation" => [extra_props::VALUE_BASE + value_props::const_index("image-orientation")], true, true;
+    "link-parameters" => [extra_props::VALUE_BASE + value_props::const_index("link-parameters")], false, true;
     "font-synthesis-position" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-position")], true, true;
     "font-variant-position" => [extra_props::VALUE_BASE + value_props::const_index("font-variant-position")], true, true;
     "baseline-source" => [extra_props::VALUE_BASE + value_props::const_index("baseline-source")], false, true;
@@ -18925,7 +18956,7 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
         if defer_variables && name != "content" && owner_values::has_unmatched_closer(raw) {
             continue;
         }
-        if defer_variables && name != "content" && owner_values::may_use(raw) {
+        if defer_variables && owner_values::may_use(raw) {
             if !slots(name).is_empty() {
                 let admitted = match owner_values::admission(raw) {
                     owner_values::Admission::Invalid => false,
@@ -27568,13 +27599,13 @@ fn substitution_depends_on_sibling(index: &StyleIndex, raw: &Arc<str>, custom: &
 }
 
 fn resolve_registered_deferred_slot(index: &StyleIndex, source: &Declaration, slot: usize,
-    custom: &Option<Arc<CustomProperties>>) -> Declaration {
+    custom: &Option<Arc<CustomProperties>>, element: Option<(&Document, NodeId)>) -> Declaration {
     let (property, raw) = match &source.value {
         Value::Deferred(property, raw) => (property, raw),
         Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => (&group.property, &group.value),
         _ => return source.clone(),
     };
-    deferred_declarations(index, property, raw, custom, None, None).iter()
+    deferred_declarations(index, property, raw, custom, None, element).iter()
         .find(|declaration| declaration.value.slot() == slot).cloned()
         .unwrap_or(Declaration { value: Value::Default(slot, inherited_property(slot)), important: source.important })
 }
@@ -28860,7 +28891,8 @@ fn restyle_one(
     };
     let style = compute_node_cached_impl(document, node, parent.as_deref(), index, cache, Some(text))?;
     let mut damage = style_damage_modulo_custom(index, &mut cache.custom_rebases, &old_style, &style);
-    let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| matches!(&generated.content,
+    let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| generated.style.sibling_position_dependent
+        || matches!(&generated.content,
         GeneratedContent::Items(items) if items.iter().any(|item| matches!(item, GeneratedContentItem::Attribute { .. }))));
     for (position, (pseudo, generated)) in old_pseudos.iter().enumerate() {
         if old_pseudos[..position].iter().any(|(earlier, _)| earlier == pseudo) { continue; }
@@ -30610,6 +30642,15 @@ fn compute_for_named_registered_inner(
         }
     }
     candidates.sort_by_key(|(priority, _, _)| *priority);
+    for (_, declaration, _) in candidates.iter_mut() {
+        let Value::Custom(name, raw) = &declaration.value else { continue; };
+        let registered_random = owner_values::uses_random(raw) && registrations.iter().any(|registration| registration.name.as_str() == &**name);
+        if !owner_values::uses_attr(raw) && !registered_random { continue; }
+        let owner = owner_values::Owner { element: context, property: name };
+        let substituted: Arc<str> = owner_values::substitute(raw, &owner).map_or_else(|| Arc::from("unset"), |text| Arc::from(text.trim()));
+        let replacement = Declaration { value: Value::Custom(name.clone(), substituted), important: declaration.important };
+        *declaration = alloc::borrow::Cow::Owned(replacement);
+    }
     let sibling_dependent=candidates.iter().any(|(_,declaration,_)|{
         if value_depends_on_sibling_position(&declaration.value){return true;}
         let raw=match &declaration.value{Value::Deferred(_,raw)|Value::Custom(_,raw)=>Some(raw),Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>Some(&group.value),_=>None};
@@ -30884,7 +30925,7 @@ fn compute_for_named_registered_inner(
                 &cycle_default
             } else if pass >= 4 && !registrations.is_empty() {
                 if let Some(original) = expanded_originals.get(order).and_then(Option::as_ref) {
-                    refreshed = resolve_registered_deferred_slot(index, original, slot, &style.custom);
+                    refreshed = resolve_registered_deferred_slot(index, original, slot, &style.custom, context);
                     &refreshed
                 } else { declaration.as_ref() }
             } else { declaration.as_ref() };
@@ -42600,8 +42641,7 @@ mod tests {
         };
         assert!(matches!(
             items.get(1),
-            Some(GeneratedContentItem::Attribute { name, fallback: Some(fallback) })
-                if &**name == "data-label" && &**fallback == "fallback"
+            Some(GeneratedContentItem::String(text)) if &**text == "card"
         ));
         assert!(matches!(
             items.get(2),
@@ -42651,7 +42691,13 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(refreshed.content, before.content);
+        let GeneratedContent::Items(refreshed_items) = &refreshed.content else {
+            panic!("refreshed before should have typed content");
+        };
+        assert!(matches!(
+            refreshed_items.get(1),
+            Some(GeneratedContentItem::String(text)) if &**text == "changed"
+        ));
         assert!(
             matches!(document.kind(target), Ok(NodeKind::Element { attributes, .. })
             if attributes.iter().any(|(name, value)| name == "data-label" && value == "changed"))

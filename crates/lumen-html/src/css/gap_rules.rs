@@ -588,7 +588,10 @@ fn mix_element(part: Part, from: &str, to: &str, progress: f64) -> Option<String
             if unit_a != "px" || unit_b != "px" {
                 return None;
             }
-            Some(super::computed_values::px(extra::mix(a, b, progress).max(0.0) as f32))
+            let width = extra::mix(a, b, progress).max(0.0);
+            // Interpolated widths snap like border widths; the epsilon absorbs float error such as 6.9999.
+            let snapped = if width > 0.0 && width < 1.0 { 1.0 } else { (width + 1e-6).floor() };
+            Some(super::computed_values::px(snapped as f32))
         }
         Part::Color => {
             let current = color_values::from_rgba(Style::initial().color);

@@ -243,7 +243,7 @@ fn parse_command(chunk: &str, env: Env) -> Option<Cmd> {
                     "large" | "small" if size.is_none() => size = Some(rest[index].eq_ignore_ascii_case("large")),
                     "rotate" if rotation.is_none() => {
                         index += 1;
-                        rotation = Some(parse_angle(rest.get(index)?)?);
+                        rotation = Some(parse_angle(rest.get(index)?, env)?);
                     }
                     _ => return None,
                 }

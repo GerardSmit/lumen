@@ -3516,6 +3516,7 @@ pub(crate) fn trusted_pointer_down(
         }
     }
     super::dialog_popover::record_popover_pointerdown_target(ctx, realm, target)?;
+    super::dialog_popover::record_dialog_pointerdown(realm, target, state.x, state.y);
     let pointer_allowed = dispatch_pointer_state_event(
         ctx,
         realm,
@@ -3652,7 +3653,7 @@ pub(crate) fn trusted_pointer_up_with_click_detail(
     if down_target.is_none() {
         // The press ended at pointerdown (its target left the document): no light dismiss.
         super::dialog_popover::clear_popover_pointerdown_target(realm);
-    } else if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target) {
+    } else if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target, state.x, state.y) {
         super::dialog_popover::clear_popover_pointerdown_target(realm);
         return Err(error);
     }

@@ -621,8 +621,8 @@ pub fn parse_rules(prelude: &str, input: &str) -> Result<Vec<RegisteredCustomPro
         let Some(name) = consume_selector_identifier(raw_name, &mut at).filter(|name| at == raw_name.len() && name.starts_with("--") && name.len() > 2) else { return Ok(Vec::new()); };
         if !names.contains(&name) { names.push(name); }
     }
-    let mut syntax = "*".to_string();
-    let mut inherits = true;
+    let mut syntax_descriptor: Option<String> = None;
+    let mut inherits_descriptor: Option<bool> = None;
     let mut initials = Vec::new();
     let mut initial_bytes=0usize;
     for (start, end) in declaration_spans_with_recovery(input, true)? {
@@ -636,8 +636,8 @@ pub fn parse_rules(prelude: &str, input: &str) -> Result<Vec<RegisteredCustomPro
         };
         let raw = cleaned.trim();
         match name.as_ref().to_ascii_lowercase().as_str() {
-            "syntax" => if let Some(value) = css_string(raw).filter(|value| value == "*" || valid_typed_syntax(value)) { syntax = value; },
-            "inherits" => match raw.to_ascii_lowercase().as_str() { "true" => inherits = true, "false" => inherits = false, _ => {} },
+            "syntax" => if let Some(value) = css_string(raw).filter(|value| value == "*" || valid_typed_syntax(value)) { syntax_descriptor = Some(value); },
+            "inherits" => match raw.to_ascii_lowercase().as_str() { "true" => inherits_descriptor = Some(true), "false" => inherits_descriptor = Some(false), _ => {} },
             "initial-value" => {
                 initial_bytes=initial_bytes.checked_add(raw.len()).unwrap_or(usize::MAX);
                 if initial_bytes>MAX_CSS_BYTES{return Ok(Vec::new());}
@@ -647,10 +647,12 @@ pub fn parse_rules(prelude: &str, input: &str) -> Result<Vec<RegisteredCustomPro
             _ => {}
         }
     }
+    let (Some(syntax), Some(inherits)) = (syntax_descriptor, inherits_descriptor) else { return Ok(Vec::new()); };
     // Invalid descriptors are ignored; choose the last initial which validates
     // against the winning syntax descriptor, regardless of descriptor order.
     let initial_value=initials.into_iter().rev().find(|value|value.len()<=MAX_VARIABLE_BYTES
         && accepts_value(&syntax,value) && (syntax.trim()=="*" || computationally_independent(&syntax,value)) && !has_variables(value));
+    if syntax.trim() != "*" && initial_value.is_none() { return Ok(Vec::new()); }
     let mut parsed = Vec::new();
     for name in names {
         if register(&mut parsed, name, &syntax, inherits, initial_value.clone()).is_err() { return Ok(Vec::new()); }
@@ -869,24 +871,24 @@ mod tests {
 
     #[test]
     fn specification_property_modern_defaults_names_escapes_and_independent_viewport() {
-        let rules = parse_rules(r"@pr\6f perty --one, --two", r#"syntax: nope; inherits: nonsense"#).unwrap();
+        assert!(parse_rules(r"@pr\6f perty --one, --two", r#"syntax: nope; inherits: nonsense"#).unwrap().is_empty());
+        let rules = parse_rules(r"@pr\6f perty --one, --two", r#"syntax: "*"; inherits: true"#).unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].name, "--one");
         assert_eq!(rules[1].name, "--two");
         assert_eq!(rules[0].syntax, "*");
         assert!(rules[0].inherits);
         assert!(rules[0].initial_value.is_none());
-        let typed = parse_rules("@property --missing", r#"syntax:"<length>""#).unwrap();
-        assert!(typed[0].initial_value.is_none());
-        let invalid_initial=parse_rules("@property --invalid-initial",r#"initial-value:1px;initial-value:red;syntax:"<length>""#).unwrap();
+        assert!(parse_rules("@property --missing", r#"syntax:"<length>""#).unwrap().is_empty());
+        let invalid_initial=parse_rules("@property --invalid-initial",r#"initial-value:1px;initial-value:red;syntax:"<length>";inherits:true"#).unwrap();
         assert_eq!(invalid_initial[0].initial_value.as_deref(),Some("1px"));
-        let invalid_initial=parse_rules("@property --invalid-initial",r#"initial-value:red;syntax:"<length>""#).unwrap();
-        assert!(invalid_initial[0].initial_value.is_none());
+        let invalid_initial=parse_rules("@property --invalid-initial",r#"initial-value:red;syntax:"<length>";inherits:true"#).unwrap();
+        assert!(invalid_initial.is_empty());
         let mut api = Vec::new();
         register(&mut api, "--viewport".into(), "<length>", true, Some("2svw".into())).unwrap();
         register(&mut api, "--missing".into(), "<length>", true, None).unwrap();
         assert_eq!(register(&mut api, "--font".into(), "<length>", true, Some("2em".into())), Err(RegistrationError::InvalidInitialValue));
-        let index = StyleIndex::new(parse(r#"@pr\6f perty --one, --two {initial-value:green}"#).unwrap());
+        let index = StyleIndex::new(parse(r#"@pr\6f perty --one, --two {syntax:"*";inherits:true;initial-value:green}"#).unwrap());
         assert_eq!(index.registered_snapshot().len(), 2);
     }
 

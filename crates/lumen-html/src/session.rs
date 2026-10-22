@@ -1904,6 +1904,11 @@ impl RenderSession {
     pub fn read_style_cache_stats(&self)->css::StyleCacheStats {
         self.read_style_cache.stats()
     }
+    /// Record the position-try fallbacks the latest layout used as the last
+    /// successful options; called at each rendering update.
+    pub fn commit_position_fallbacks(&mut self) {
+        self.layout_cache.commit_position_fallbacks();
+    }
     pub fn layout_cache_stats(&self) -> layout::RetainedLayoutCacheStats {
         self.layout_cache.stats()
     }
@@ -3386,9 +3391,35 @@ impl RenderSession {
         let ordinary=self.computed_style_with_text(node,text)?;
         let mut style=self.rules.as_ref().expect("stylesheets initialized")
             .compute_pseudo_computed(&self.document,node,&ordinary,pseudo,text).map_err(LayoutError::Css)?;
-        let query=self.query_container_context(node)?;
+        let query=self.pseudo_query_container_context(node)?;
         style.resolve_query_context_with_text(query,text);
         Ok(style)
+    }
+
+    /// The container-unit context of a pseudo-element: the originating
+    /// element is itself a candidate query container.
+    fn pseudo_query_container_context(&mut self,node:NodeId)->Result<css::ContainerUnitContext,LayoutError> {
+        self.synchronize_form_state();
+        if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+            return Err(LayoutError::InvalidTree);
+        }
+        self.refresh_rules()?;
+        let rules = self.rules.as_ref().ok_or(LayoutError::Css(css::CssError {
+            offset: 0,
+            message: "stylesheets not initialized",
+        }))?;
+        let geometry = self.cached.as_ref().and_then(|frame| {
+            (frame.document_version == self.document.version()
+                && frame.width as f32 == rules.environment.width
+                && frame.height as f32 == rules.environment.height)
+                .then_some(&frame.geometry)
+        });
+        let mut cache = css::StyleCache::default();
+        let (style, context) = style_with_query_context(&self.document, node, rules, &mut cache, geometry,None,false)?;
+        Ok(match geometry.and_then(|geometry| geometry.container_context_for(node)) {
+            Some(measured) => measured,
+            None => layout::mark_unmeasured_container_units(context, &style),
+        })
     }
 
     /// Return the used container-unit context surrounding `node`. Eligible
@@ -9715,7 +9746,7 @@ mod tests {
     impl TextShaper for Mono {
         fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
             let glyphs: Vec<crate::paint::Glyph> = text.char_indices()
-                .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x: at as f32, y: 0.0, size_scale: 1.0 })
+                .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x_offset: 0.0, x: at as f32, y: 0.0, size_scale: 1.0 })
                 .collect();
             Ok(ShapedRun { glyphs: Arc::from(glyphs), width: text.len() as f32 })
         }

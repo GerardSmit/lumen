@@ -14,7 +14,7 @@ impl TextShaper for Font {
                     id: character as u16,
                     face: 0,
                     cluster: cluster as u32,
-                    caps_expansion: 0,
+                    caps_expansion: 0, x_offset: 0.0,
                     x: index as f32 * 8.0,
                     y: 0.0,
                     size_scale: 1.0,

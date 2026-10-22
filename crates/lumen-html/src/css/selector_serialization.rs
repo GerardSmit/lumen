@@ -137,8 +137,8 @@ fn arguments(name: &str, input: &str, map: &NamespaceMap, nesting: bool, depth: 
             } Ok(output)
         },
         "lang" => {
-            let values = language_argument_values(input).ok_or_else(|| selector_error(0, "invalid language range"))?;
-            Ok(values.iter().map(|value| serialize_string(value)).collect::<Vec<_>>().join(", "))
+            let values = language_argument_tokens(input).ok_or_else(|| selector_error(0, "invalid language range"))?;
+            Ok(values.iter().map(|(value, quoted)| if *quoted { serialize_string(value) } else { serialize_identifier(value) }).collect::<Vec<_>>().join(", "))
         },
         "dir" => Ok(if directionality_argument(input,0)?==1{String::from("ltr")}else{String::from("rtl")}),
         "state" => Ok(serialize_identifier(&custom_state_argument(input).ok_or_else(|| selector_error(0, "invalid state identifier"))?)),
@@ -190,7 +190,7 @@ mod tests {
             (":has(> *.class + other|e)",":has(> .class + other|e)"),
             (":nth-child(odd of *.class,other|e)",":nth-child(2n+1 of .class, other|e)"),
             (":nth-last-of-type(-1n - 0)",":nth-last-of-type(-n)"),
-            (r":l\61 ng(EN-us, 'a b')",":lang(\"EN-us\", \"a b\")"),
+            (r":l\61 ng(EN-us, 'a b')",":lang(EN-us, \"a b\")"),
             (r":d\69 r( r\74 l )",":dir(rtl)"),
             (":before","::before"),
         ];

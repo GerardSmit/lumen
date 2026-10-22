@@ -130,14 +130,59 @@ pub fn plan_hide(document: &Document, node: NodeId) -> Result<Vec<NodeId>, State
     }
 }
 
-/// The nearest showing popover of one stack containing `node`, or `node` itself.
+/// The popover a button names through `popovertarget`, or through `commandfor` with a popover
+/// command, whether or not it was the one that opened the popover.
+fn invoked_popover(document: &Document, node: NodeId) -> Option<NodeId> {
+    if !crate::invokers::is_button(document, node) || crate::forms::is_disabled(document, node) {
+        return None;
+    }
+    let attribute = |name| document.get_attribute_ns_ref(node, None, name).ok().flatten();
+    let id = match attribute("popovertarget") {
+        Some(id) => id,
+        None => {
+            let command = crate::invokers::Command::parse(attribute("command")?);
+            if !matches!(
+                command,
+                crate::invokers::Command::TogglePopover
+                    | crate::invokers::Command::ShowPopover
+                    | crate::invokers::Command::HidePopover
+            ) {
+                return None;
+            }
+            attribute("commandfor")?
+        }
+    };
+    if id.is_empty() {
+        return None;
+    }
+    let root = document.root_node(node, false).ok()?;
+    crate::selector::get_element_by_id(document, root, id).ok().flatten()
+}
+
+/// The nearest showing popover of one stack containing `node`, or `node` itself. An invoking
+/// button counts as part of the popover it invokes.
 fn nearest_open(
     document: &Document,
     node: NodeId,
     mode: PopoverMode,
 ) -> Result<Option<NodeId>, StateError> {
     let list = stack(document, mode);
-    Ok(nearest_inclusive(document, node, &list)?.map(|index| list[index]))
+    let mut current = node;
+    for _ in 0..MAX_ANCESTOR_STEPS {
+        if let Some(index) = list.iter().position(|entry| *entry == current) {
+            return Ok(Some(list[index]));
+        }
+        if let Some(index) = invoked_popover(document, current)
+            .and_then(|target| list.iter().position(|entry| *entry == target))
+        {
+            return Ok(Some(list[index]));
+        }
+        let Some(parent) = document.composed_parent(current).map_err(StateError::Dom)? else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+    Err(StateError::ResourceLimit)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

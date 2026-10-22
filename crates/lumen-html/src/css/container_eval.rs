@@ -453,6 +453,17 @@ fn scan_top_level(text: &str) -> Operators {
     found
 }
 
+fn strip_important(value: &str) -> &str {
+    let Some(bang) = value.rfind('!') else {
+        return value;
+    };
+    if value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+        value[..bang].trim_end()
+    } else {
+        value
+    }
+}
+
 fn custom_name(text: &str) -> bool {
     text.len() > 2 && text.starts_with("--") && !text.contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '+' | '*' | '/' | '<' | '>' | '='))
 }
@@ -466,9 +477,12 @@ fn eval_style(content: &str, subject: &Subject<'_>) -> Truth {
         if !custom_name(name) {
             return Truth::Unknown;
         }
-        let wanted = text[colon + 1..].trim();
+        let wanted = strip_important(text[colon + 1..].trim());
         let Some(wanted) = var_template::expand_variables_in(wanted, subject.custom, MAX_EXPANDED) else {
-            return Truth::False;
+            return match subject.declared {
+                Some(declared) => declared(name, None).map_or(Truth::Unknown, |present| Truth::known(!present)),
+                None => Truth::known(subject.custom.value(name).is_none()),
+            };
         };
         if let Some(declared) = subject.declared {
             return declared(name, Some(&wanted)).map_or(Truth::Unknown, Truth::known);
@@ -490,6 +504,65 @@ fn eval_style(content: &str, subject: &Subject<'_>) -> Truth {
     style_range(text, &found.spans, subject)
 }
 
+/// Whether `raw` is a single custom property, keyword, function or numeric term, so that a
+/// failure to evaluate it makes the comparison false rather than unknown.
+fn style_operand_syntax(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if custom_name(raw) || typed_numeric::parse_numeric_expression(raw).is_some() {
+        return true;
+    }
+    container_query::tokenize(raw).is_some_and(|tokens| tokens.len() == 1 && matches!(tokens[0].kind, Kind::Ident | Kind::Function))
+}
+
+fn substitute_environment(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let boundary = index == 0 || !(bytes[index - 1].is_ascii_alphanumeric() || matches!(bytes[index - 1], b'-' | b'_'));
+        if boundary && bytes[index..].len() >= 4 && bytes[index..index + 4].eq_ignore_ascii_case(b"env(") {
+            if let Some(end) = safe_area_environment_end(bytes, index + 4) {
+                output.push_str(&text[copied..index]);
+                output.push_str("0px");
+                copied = end;
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+/// End offset (after the closing parenthesis) of a `safe-area-inset-*` environment
+/// variable reference whose name starts at `start`.
+fn safe_area_environment_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let skip = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let name_start = skip(start);
+    let mut name_end = name_start;
+    while name_end < bytes.len() && (bytes[name_end].is_ascii_alphanumeric() || matches!(bytes[name_end], b'-' | b'_')) {
+        name_end += 1;
+    }
+    let name = &bytes[name_start..name_end];
+    let known = ["top", "right", "bottom", "left"].iter().any(|side| {
+        name.len() == "safe-area-inset-".len() + side.len()
+            && name[.."safe-area-inset-".len()].eq_ignore_ascii_case(b"safe-area-inset-")
+            && name["safe-area-inset-".len()..].eq_ignore_ascii_case(side.as_bytes())
+    });
+    let close = skip(name_end);
+    (known && bytes.get(close) == Some(&b')')).then_some(close + 1)
+}
+
 fn style_operand(raw: &str, subject: &Subject<'_>) -> Option<(f64, typed_numeric::NumericType)> {
     let raw = raw.trim();
     let text: String = if custom_name(raw) {
@@ -497,6 +570,7 @@ fn style_operand(raw: &str, subject: &Subject<'_>) -> Option<(f64, typed_numeric
     } else {
         var_template::expand_variables_in(raw, subject.custom, MAX_EXPANDED)?
     };
+    let text = substitute_environment(&text);
     let expression = typed_numeric::parse_numeric_expression(text.trim())?;
     let kind = expression.numeric_type()?;
     let context = (subject.length)();
@@ -530,11 +604,19 @@ fn style_range(text: &str, spans: &[(usize, usize)], subject: &Subject<'_>) -> T
     }
     bounds.push(text.len());
     let mut operands = Vec::new();
+    let mut unevaluable = false;
     for pair in bounds.chunks_exact(2) {
-        let Some(operand) = style_operand(&text[pair[0]..pair[1]], subject) else {
+        let raw = &text[pair[0]..pair[1]];
+        if !style_operand_syntax(raw) {
             return Truth::Unknown;
-        };
-        operands.push(operand);
+        }
+        match style_operand(raw, subject) {
+            Some(operand) => operands.push(operand),
+            None => unevaluable = true,
+        }
+    }
+    if unevaluable {
+        return Truth::False;
     }
     let mut result = true;
     for (index, operator) in operators.iter().enumerate() {
@@ -545,7 +627,7 @@ fn style_range(text: &str, spans: &[(usize, usize)], subject: &Subject<'_>) -> T
             || (left_type == number && left == 0.0 && right_type == length)
             || (right_type == number && right == 0.0 && left_type == length);
         if !comparable {
-            return Truth::Unknown;
+            return Truth::False;
         }
         let Some(holds) = compare(left, operator, right, false) else {
             return Truth::Unknown;
@@ -596,6 +678,8 @@ pub struct Entry {
     length: LengthContext,
     units: ContainerUnitContext,
     custom: CustomRef,
+    parent_custom: CustomRef,
+    color: SourceColor,
 }
 
 impl Entry {
@@ -670,6 +754,10 @@ pub fn build_oracle(
             length: style_length_context(text, &style, environment, None),
             units: outer_units(document, node, measured, &style, environment),
             custom: CustomRef(style.custom.clone()),
+            parent_custom: CustomRef(
+                document.composed_parent(node).ok().flatten().and_then(style_of).and_then(|parent| parent.custom.clone()),
+            ),
+            color: style.current_color_source(),
         });
     }
     Oracle(entries)
@@ -809,7 +897,18 @@ impl StyleIndex {
             };
             let environment = self.environment;
             let length = || style_length_context(text, parent, environment, None);
-            let subject = Subject { entry: None, custom: parent.custom_properties(), length: &length, declared: None };
+            let registrations = self.registered_snapshot();
+            let context = (length(), ContainerUnitContext::no_container(environment), parent.current_color_source());
+            let scope = if_function::IfScope {
+                names: parent.custom_properties(),
+                base: None,
+                registrations: &registrations,
+                context: &context,
+                environment,
+                current: None,
+            };
+            let declared = |name: &str, wanted: Option<&str>| scope.declared(name, wanted);
+            let subject = Subject { entry: None, custom: parent.custom_properties(), length: &length, declared: Some(&declared) };
             return eval(root, &subject) == Truth::True;
         }
         if oracle.0.is_empty() {
@@ -831,7 +930,18 @@ impl StyleIndex {
             return true;
         };
         let length = || entry.length;
-        let subject = Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None };
+        let registrations = self.registered_snapshot();
+        let context = (entry.length, entry.units, entry.color.clone());
+        let scope = if_function::IfScope {
+            names: entry.custom.names(),
+            base: Some(entry.parent_custom.names()),
+            registrations: &registrations,
+            context: &context,
+            environment: self.environment,
+            current: None,
+        };
+        let declared = |name: &str, wanted: Option<&str>| scope.declared(name, wanted);
+        let subject = Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: Some(&declared) };
         eval(root, &subject) == Truth::True
     }
 
@@ -872,6 +982,8 @@ mod tests {
             length: static_length_context(),
             units: ContainerUnitContext::no_container(static_length_context().viewport),
             custom: CustomRef(None),
+            parent_custom: CustomRef(None),
+            color: Style::initial().current_color_source(),
         }
     }
 

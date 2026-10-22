@@ -15,7 +15,7 @@ impl TextShaper for Text {
                     id: c as u16,
                     face: 0,
                     cluster: cluster as u32,
-                    caps_expansion: 0,
+                    caps_expansion: 0, x_offset: 0.0,
                     x: i as f32 * 6.,
                     y: 0.,
                     size_scale: 1.,

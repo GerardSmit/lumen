@@ -76,7 +76,7 @@ fn slot(ctx:&mut Ctx,this:&Value,name:&str)->OpResult<Value>{
 fn set_slot(ctx:&mut Ctx,this:&Value,name:&str,value:Value,dimension:Option<Dimension>)->OpResult<()> {
     let kind=ctx.with_instance::<DomCssTransformComponent,_>(this,|value|value.kind)?;
     let value=if kind==Kind::Perspective{perspective(ctx,value)?}else if let Some(dimension)=dimension {
-        if matches!(dimension,Dimension::Number){numberish(ctx,value)?}
+        if matches!(dimension,Dimension::Number){let value=numberish(ctx,value)?;numeric(ctx,&value,Dimension::Number)?;value}
         else{numeric(ctx,&value,dimension)?;value}
     }else{crate::geometry::validate_mutable_matrix(ctx,&value)?;value};
     let data=slots(ctx,this)?;ctx.create_data_property(&data,name,value).map_err(OpError::thrown)?;Ok(())

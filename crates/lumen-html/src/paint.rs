@@ -118,6 +118,9 @@ pub struct Glyph {
     /// offsets stay intact while spacing can distinguish e.g. the two S's in ß.
     pub caps_expansion: u8,
     pub x: f32,
+    /// The part of `x` that is the shaper's horizontal placement adjustment.
+    /// It moves ink but not the pen, so `x - x_offset` is the pen position.
+    pub x_offset: f32,
     pub y: f32,
     /// Raster scale relative to the computed CSS font size. CSS font fallback
     /// can adjust each selected face independently while shaped advances and

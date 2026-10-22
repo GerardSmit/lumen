@@ -91,6 +91,9 @@ fn without_comments(source:&str)->String {
 fn matrix_constructor(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
     if matches!(value,Value::Undefined) {return Ok(Matrix::default())}
     if let Some(method)=iterator_method(ctx,value)? {return matrix_sequence(ctx,value,method)}
+    matrix_from_transform_list(ctx,value)
+}
+fn matrix_from_transform_list(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
     if !RealmServices::<GeometryContext>::current(ctx).is_some_and(|context|context.window) {return Err(OpError::type_error("CSS matrix strings are only available in Window"))}
     let source=ctx.coerce_string(value).map_err(OpError::thrown)?;
     if source.is_empty() {return Ok(Matrix::default())}
@@ -289,6 +292,10 @@ impl DomMatrix {
     fn multiply_self(&self,ctx:&mut Ctx,this:This<Value>,#[default(Value::Undefined)]other:Value)->OpResult<Value> {self.base.matrix.set(self.base.matrix.get().multiply(matrix_dictionary(ctx,&other)?));Ok(this.0)}
     fn pre_multiply_self(&self,ctx:&mut Ctx,this:This<Value>,#[default(Value::Undefined)]other:Value)->OpResult<Value> {self.base.matrix.set(matrix_dictionary(ctx,&other)?.multiply(self.base.matrix.get()));Ok(this.0)}
     fn invert_self(&self,this:This<Value>)->Value {self.base.matrix.set(self.base.matrix.get().inverse());this.0}
+    fn set_matrix_value(&self,ctx:&mut Ctx,this:This<Value>,transform_list:Value)->OpResult<Value> {
+        self.base.matrix.set(matrix_from_transform_list(ctx,&transform_list)?);
+        Ok(this.0)
+    }
     #[method(coerce)] fn translate_self(&self,this:This<Value>,#[default(0.0)]x:f64,#[default(0.0)]y:f64,#[default(0.0)]z:f64)->Value {self.base.matrix.set(self.base.matrix.get().translated(x,y,z));this.0}
     #[method(coerce)] fn scale_self(&self,this:This<Value>,#[default(1.0)]x:f64,y:Option<f64>,#[default(1.0)]z:f64,#[default(0.0)]ox:f64,#[default(0.0)]oy:f64,#[default(0.0)]oz:f64)->Value {self.base.matrix.set(self.base.matrix.get().scaled(x,y.unwrap_or(x),z,Point([ox,oy,oz,1.0])));this.0}
     #[method(coerce,name="scale3dSelf")] fn scale_3d_self(&self,this:This<Value>,#[default(1.0)]scale:f64,#[default(0.0)]ox:f64,#[default(0.0)]oy:f64,#[default(0.0)]oz:f64)->Value {self.base.matrix.set(self.base.matrix.get().scaled(scale,scale,scale,Point([ox,oy,oz,1.0])));this.0}

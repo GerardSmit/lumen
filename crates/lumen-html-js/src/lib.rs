@@ -53,6 +53,7 @@ pub use canvas::{
 };
 mod cookies;
 mod cssom;
+mod css_pseudo;
 mod custom_elements;
 pub use custom_elements::effective_aria_attribute;
 pub(crate) mod dialog_popover;
@@ -820,6 +821,7 @@ pub struct DomRealm {
     csp_overflow: Cell<bool>,
     reflected_elements: RefCell<element_reflection::ReflectedElements>,
     dialog_requests: RefCell<HashMap<NodeId, Rc<dialog_popover::DialogRequest>>>,
+    dialog_light_dismiss: RefCell<dialog_popover::LightDismissState>,
     document_referrer: RefCell<String>,
     document_base_url: RefCell<DocumentBaseUrlCache>,
     cookie_host: RefCell<Option<Rc<dyn CookieHost>>>,
@@ -6045,9 +6047,13 @@ fn element_scroll(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     element: NodeId,
-    args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+    args: scrolling::ScrollArgs,
     relative: bool,
 ) -> lumen::embed::Promise<Value> {
+    let args = match args.0 {
+        Ok(args) => args,
+        Err(error) => return lumen::embed::Promise::rejected(OpError::thrown(error)),
+    };
     match scrolling::element_scroll_target(realm, element, scrolling::ElementScrollPurpose::Method)
     {
         Ok(Some(node)) => window_globals::scroll_node(ctx, realm.clone(), node, args, relative),
@@ -6324,6 +6330,26 @@ custom_elements::bind_element_aria! {
         let target = ctx.member_get(&this.0, "classList").map_err(OpError::thrown)?;
         if ctx.object_addr(&target).is_none() {
             return Err(OpError::type_error("classList forwarding target must be an object"));
+        }
+        ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
+        Ok(())
+    }
+
+    #[method(coerce)]
+    fn pseudo(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, kind: &str) -> OpResult<Value> {
+        css_pseudo::element_pseudo(ctx, &this.0, kind)
+    }
+
+    #[getter]
+    fn part(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.token_list(ctx, this.0, "part", "part", None)
+    }
+
+    #[setter]
+    fn set_part(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        let target = ctx.member_get(&this.0, "part").map_err(OpError::thrown)?;
+        if ctx.object_addr(&target).is_none() {
+            return Err(OpError::type_error("part forwarding target must be an object"));
         }
         ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
         Ok(())
@@ -6705,8 +6731,9 @@ custom_elements::bind_element_aria! {
             || ui_events::dictionary_boolean(ctx, &options, "opacityProperty", false)?;
         let visibility = ui_events::dictionary_boolean(ctx, &options, "checkVisibilityCSS", false)?
             || ui_events::dictionary_boolean(ctx, &options, "visibilityProperty", false)?;
+        let content_visibility_auto = ui_events::dictionary_boolean(ctx, &options, "contentVisibilityAuto", false)?;
         self.flush_style_for_geometry(ctx)?;
-        style::check_visibility(&self.base.realm, self.base.id, opacity, visibility)
+        style::check_visibility(&self.base.realm, self.base.id, opacity, visibility, content_visibility_auto)
     }
 
     #[getter]
@@ -6837,7 +6864,7 @@ custom_elements::bind_element_aria! {
     fn scroll(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
@@ -6846,7 +6873,7 @@ custom_elements::bind_element_aria! {
     fn scroll_to(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
@@ -6855,7 +6882,7 @@ custom_elements::bind_element_aria! {
     fn scroll_by(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, true)
     }
@@ -7508,6 +7535,13 @@ impl DomHtmlImageElement {
     }
 
     fn image_snapshot(&self) -> image_loading::ImageSnapshot {image_node_snapshot(self.image_node())}
+
+    fn layout_origin(&self) -> OpResult<(i32, i32)> {
+        let node = self.image_node();
+        node.realm.flush_layout()?;
+        let rect = node.realm.session.borrow().layout_rect(node.id);
+        Ok(rect.map_or((0, 0), |rect| (rect.x.round() as i32, rect.y.round() as i32)))
+    }
 }
 
 /// A node outside the document has no computed style, so computing one would only revalidate the
@@ -7693,6 +7727,16 @@ impl DomHtmlImageElement {
         }
         realm.images.add_decode_waiter(node, deferred);
         promise
+    }
+
+    #[getter]
+    fn x(&self) -> OpResult<i32> {
+        Ok(self.layout_origin()?.0)
+    }
+
+    #[getter]
+    fn y(&self) -> OpResult<i32> {
+        Ok(self.layout_origin()?.1)
     }
 
     #[getter(rename(js = "naturalWidth"))]
@@ -14057,6 +14101,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             csp_overflow: Cell::new(false),
             reflected_elements: RefCell::new(element_reflection::ReflectedElements::default()),
             dialog_requests: RefCell::new(HashMap::new()),
+            dialog_light_dismiss: RefCell::new(dialog_popover::LightDismissState::default()),
             document_referrer: RefCell::new(String::new()),
             document_base_url: RefCell::new(DocumentBaseUrlCache::default()),
             document_interface,
