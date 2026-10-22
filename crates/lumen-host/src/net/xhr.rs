@@ -1459,3 +1459,99 @@ pub mod bindings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{install, lazy_globals, owner_loop, Engine, Extension};
+    use std::sync::Arc;
+
+    fn engine() -> Engine {
+        let mut engine = Engine::new();
+        owner_loop::install(engine.ctx(), Arc::new(|| {}));
+        install(
+            &mut engine,
+            &[Extension {
+                name: "test-xhr",
+                modules: &[
+                    lazy_globals::<crate::events::bindings::Module>,
+                    lazy_globals::<super::bindings::Module>,
+                ],
+                state_init: None,
+                js_init: None,
+                js_init_snapshot: None,
+                lazy_globals: &[],
+            }],
+        );
+        eval(&mut engine, "globalThis.document = { URL: 'https://example.test/' }; globalThis.location = { href: 'https://example.test/' }; 0");
+        let ctx = engine.ctx();
+        let global = ctx.global_object();
+        let transport = ctx
+            .eval_in_realm(
+                &global,
+                "({ request(method, url, headers, body, resolve) {
+                    Promise.resolve().then(() => {
+                        let left = 8;
+                        resolve({ status: 200, statusText: 'OK', url, headers: [], bodyReader: {
+                            read() { return Promise.resolve(left-- > 0 ? new Uint8Array(1 << 17) : null); },
+                            cancel() {},
+                        } });
+                    });
+                } })",
+            )
+            .ok()
+            .expect("transport");
+        Transport::install(ctx, transport.clone(), transport.clone(), transport).expect("install");
+        engine
+    }
+
+    fn eval(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("parse") {
+            lumen::Completion::Value(v) => v,
+            lumen::Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+        }
+    }
+
+    fn settle(engine: &mut Engine) {
+        for _ in 0..8 {
+            assert!(owner_loop::pump(engine, 1024).is_empty());
+            engine.collect_garbage();
+        }
+    }
+
+    fn response_released(keep_request: bool) -> bool {
+        let mut engine = engine();
+        eval(
+            &mut engine,
+            "globalThis.done = false;
+             globalThis.xhr = new XMLHttpRequest();
+             xhr.open('GET', 'https://example.test/pak'); xhr.responseType = 'arraybuffer';
+             xhr.addEventListener('readystatechange', function () { this.readyState; });
+             xhr.addEventListener('progress', function () { this.readyState; });
+             xhr.addEventListener('loadend', function () { this.status; });
+             xhr.onreadystatechange = () => { xhr.readyState; };
+             xhr.onload = () => { globalThis.buffer = xhr.response; globalThis.view = new Uint8Array(buffer); globalThis.done = true; };
+             xhr.send(); 0",
+        );
+        settle(&mut engine);
+        assert_eq!(eval(&mut engine, "String(done && buffer.byteLength)"), "1048576");
+        let buffer = {
+            let global = engine.global_this();
+            engine.ctx().get_member(&global, "buffer").map_err(|_| ()).unwrap()
+        };
+        let weak = engine.ctx().weak_value(&buffer).unwrap();
+        drop(buffer);
+        eval(
+            &mut engine,
+            if keep_request { "globalThis.buffer = null; 0" } else { "globalThis.buffer = null; globalThis.view = null; globalThis.xhr = null; 0" },
+        );
+        engine.collect_garbage();
+        engine.collect_garbage();
+        weak.upgrade().is_none()
+    }
+
+    #[test]
+    fn a_finished_request_that_is_unreachable_releases_its_response() {
+        assert!(response_released(false));
+    }
+}
