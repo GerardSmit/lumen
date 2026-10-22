@@ -81,7 +81,8 @@ probes! {
     template_parts_near_budget: "'`' + '${b}'.repeat(150) + '`'" => ANY;
 }
 
-/// Parse times of `f(n)` and `f(4n)`: linear is ~4x, quadratic ~16x.
+/// Parse times of `f(n)` and `f(4n)`: linear is ~4x, quadratic ~16x. The bound sits between the
+/// two with room for loaded CI runners, where linear runs have measured up to ~8.5x.
 fn assert_linear(f: impl Fn(usize) -> String, n: usize) {
     let time = |src: String| {
         std::thread::Builder::new()
@@ -102,11 +103,11 @@ fn assert_linear(f: impl Fn(usize) -> String, n: usize) {
             .join()
             .unwrap()
     };
-    let best = |n: usize| (0..3).map(|_| time(f(n))).min().unwrap();
+    let best = |n: usize| (0..5).map(|_| time(f(n))).min().unwrap();
     let small = best(n);
     let large = best(n * 4);
     assert!(
-        large < small * 7 + Duration::from_millis(2),
+        large < small * 11 + Duration::from_millis(2),
         "parse time not linear: {small:?} at {n}, {large:?} at {}",
         n * 4
     );

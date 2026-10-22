@@ -531,21 +531,17 @@ impl Backend for OpenSsl {
     }
 
     fn dh_compute(&self, params: &DhParams, private: &[u8], peer: &[u8]) -> Result<Vec<u8>> {
+        // `peer^x mod p` directly: `DH_compute_key` rejects or mangles moduli below OpenSSL's
+        // minimum size, which Node's own test vectors use. The peer key is validated by the caller.
         self.clear_errors();
-        let dh = self.dh(params, Some(private))?;
-        let peer = self.bn(peer)?;
         unsafe {
-            let size = (self.api.DH_size)(dh.ptr());
-            if size <= 0 {
-                return Err(self.take_error("Failed to compute DH key"));
-            }
-            let mut out = vec![0u8; size as usize];
-            let written = (self.api.DH_compute_key)(out.as_mut_ptr(), peer.ptr(), dh.ptr());
-            if written < 0 {
-                return Err(self.take_error("Failed to compute DH key"));
-            }
-            out.truncate(written as usize);
-            Ok(pad_be(&out, size as usize))
+            let (y, x, p) = (self.bn(peer)?, self.bn(private)?, self.bn(&params.p)?);
+            (self.api.BN_set_flags)(x.ptr(), BN_FLG_CONSTTIME);
+            let ctx = self.handle((self.api.BN_CTX_new)(), self.api.BN_CTX_free, "BN_CTX_new failed")?;
+            let out = self.handle((self.api.BN_new)(), self.api.BN_free, "BN_new failed")?;
+            self.check((self.api.BN_mod_exp)(out.ptr(), y.ptr(), x.ptr(), p.ptr(), ctx.ptr()), "Failed to compute DH key")?;
+            let size = params.p.iter().skip_while(|&&b| b == 0).count();
+            Ok(pad_be(&self.bn_bytes(out.ptr()), size))
         }
     }
 

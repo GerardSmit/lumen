@@ -475,8 +475,28 @@ extern "C" fn h_call_slow(vm: *mut VmCtx) -> i32 {
 /// Headroom kept below native frames for helpers, host calls and the interpreter.
 const STACK_MARGIN: u64 = 256 * 1024;
 
+/// The machine stack pointer. A local's address is not usable: under AddressSanitizer's
+/// `detect_stack_use_after_return`, locals live on a heap-allocated fake stack.
+#[inline(always)]
+pub fn stack_pointer() -> u64 {
+    let sp: u64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        sp = std::hint::black_box(&0u8) as *const u8 as u64;
+    }
+    sp
+}
+
 fn stack_limit() -> u64 {
-    let here = &0u8 as *const u8 as u64;
+    let here = stack_pointer();
     match stack_low() {
         Some(low) if low + STACK_MARGIN < here => low + STACK_MARGIN,
         Some(_) => here,

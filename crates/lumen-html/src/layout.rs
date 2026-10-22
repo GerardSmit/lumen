@@ -8931,8 +8931,8 @@ impl ColumnPrincipalSource {
             self.constraints=[Some(used),Some(used)];self.clone_constraints=[border_box && numeric;2];
         }else{
             self.constraints=[Some(minimum),maximum];
-            self.clone_constraints=[border_box && self.numeric_constraints[1],border_box
-                && if style.max_height.is_some_and(|height|content_height_dimension(style,height)<minimum){self.numeric_constraints[1]}else{self.numeric_constraints[2]}];
+            self.clone_constraints=[border_box && self.numeric_constraints[1],
+                border_box && if style.max_height.is_some_and(|height|content_height_dimension(style,height)<minimum){self.numeric_constraints[1]}else{self.numeric_constraints[2]}];
         }
     }
 }
@@ -10886,6 +10886,17 @@ pub(crate) fn deferred_image_command(commands: &[Command], deferred: &DeferredIm
 
 /// The command which paints `deferred` now that its image has arrived, or
 /// `None` when it did not arrive as a valid image (that needs a layout).
+/// The smallest range covering every non-empty range in `ranges` (`0..0` when there is none).
+fn covering_glyph_range(ranges: &[core::ops::Range<usize>]) -> core::ops::Range<usize> {
+    ranges
+        .iter()
+        .filter(|range| !range.is_empty())
+        .fold(None, |cover: Option<core::ops::Range<usize>>, range| {
+            Some(cover.map_or(range.clone(), |c| c.start.min(range.start)..c.end.max(range.end)))
+        })
+        .unwrap_or(0..0)
+}
+
 pub(crate) fn rebuild_deferred(deferred: &DeferredImage, images: &dyn ImageResolver, old: &Command) -> Option<Command> {
     match &deferred.paint {
         DeferredPaint::Image { node, base, source, scheme } => {
@@ -29162,16 +29173,12 @@ let context_range=before.start.min(after.start)..before.end.max(after.end);
                 let width=finish-begin;
                 let lo=group.paint_sources.partition_point(|source|source.end<=local.start);
                 let hi=group.paint_sources.partition_point(|source|source.start<local.end);
-                let mut glyph_range=usize::MAX..0;
-                for range in &group.glyph_ranges[lo..hi] {if range.start!=range.end{glyph_range.start=glyph_range.start.min(range.start);glyph_range.end=glyph_range.end.max(range.end);}}
-                if glyph_range.start==usize::MAX {glyph_range=0..0;}
+                let mut glyph_range=covering_glyph_range(&group.glyph_ranges[lo..hi]);
 if shared_paint {
     // A zero-advance prefix can be in a different source span;
     // the first painted scalar owns this cluster's glyphs.
     let owned_lo=lo+usize::from(lo<hi && group.paint_sources[lo].start<local.start);
-    glyph_range=usize::MAX..0;
-    for range in &group.glyph_ranges[owned_lo..hi] {if range.start!=range.end {glyph_range.start=glyph_range.start.min(range.start);glyph_range.end=glyph_range.end.max(range.end);}}
-    if glyph_range.start==usize::MAX {glyph_range=0..0;}
+    glyph_range=covering_glyph_range(&group.glyph_ranges[owned_lo..hi]);
 }
                 let mut glyphs=Vec::new();glyphs.try_reserve(glyph_range.len()).map_err(|_|LayoutError::CommandLimit)?;
                 let mut strips=[None,None];
@@ -47493,6 +47500,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn specification_paint_scope_adoption_rejects_invalid_ownership_before_payload_moves() {
         let rect=Rect{x:0.0,y:0.0,width:10.0,height:10.0};
         let source=alloc::vec![Command::FillRect{rect,color:Rgba{r:255,g:0,b:0,a:255}},

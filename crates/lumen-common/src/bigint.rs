@@ -1188,7 +1188,10 @@ fn to_radix_dc(x: &[u64], width: Option<usize>, ctx: &RadixCtx, out: &mut Vec<u8
 /// `Err(TooLarge)` past [`MAX_BITS`].
 fn parse_mag(text: &str, radix: u32) -> Result<Option<Vec<u64>>, BigIntError> {
     let mut digits = Vec::with_capacity(text.len());
-    for c in text.chars() {
+    for (i, c) in text.chars().enumerate() {
+        if i & 0xffff == 0xffff && poll() {
+            return Ok(Some(Vec::new()));
+        }
         match c.to_digit(radix) {
             Some(d) => digits.push(d as u8),
             None => return Ok(None),

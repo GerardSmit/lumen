@@ -6,10 +6,20 @@ use std::time::{Duration, Instant};
 /// Run `src` with an interrupt raised after `delay`; returns how long the engine kept running
 /// after the flag was set, and the completion.
 fn run_interrupted(src: &'static str, delay: Duration) -> (Duration, Completion) {
+    run_interrupted_after("", src, delay)
+}
+
+/// Like [`run_interrupted`], with `setup` evaluated to completion before the interrupt is armed.
+fn run_interrupted_after(
+    setup: &'static str,
+    src: &'static str,
+    delay: Duration,
+) -> (Duration, Completion) {
     std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(move || {
             let mut engine = Engine::new();
+            assert!(matches!(engine.eval(setup, false), Ok(Completion::Value(_))), "setup failed");
             let flag = Arc::new(AtomicBool::new(false));
             engine.set_interrupt(Arc::clone(&flag));
             let setter = std::thread::spawn(move || {
@@ -92,11 +102,14 @@ fn interrupt_stops_long_bigint_operations() {
         "(3n ** 6000000n).toString()",
         "const a = 7n ** 3000000n; a * a",
         "const a = 7n ** 2000000n; (a * a * a) / (a + 1n)",
-        "BigInt('9'.repeat(8000000))",
+        "BigInt(digits)",
         "const a = 5n ** 3000000n; a.toString(7)",
     ];
     for src in cases {
-        let (after, completion) = run_interrupted(src, Duration::from_millis(50));
+        // Building the digit string is a single native call that never polls; keep it out of
+        // the measured window.
+        let setup = "var digits = '9'.repeat(8000000)";
+        let (after, completion) = run_interrupted_after(setup, src, Duration::from_millis(50));
         if let Completion::Value(v) = &completion {
             panic!("{src}: expected the termination, got {v}");
         }

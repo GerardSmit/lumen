@@ -1,0 +1,2 @@
+# Expected-output fixtures are compared byte for byte; keep LF on Windows checkouts.
+*.expected text eol=lf

@@ -98,6 +98,4 @@ api! {
     DH_generate_parameters_ex(Ptr, c_int, c_int, Ptr) -> c_int;
     DH_check(CPtr, *mut c_int) -> c_int;
     DH_check_pub_key(CPtr, CPtr, *mut c_int) -> c_int;
-    DH_compute_key(*mut u8, CPtr, Ptr) -> c_int;
-    DH_size(CPtr) -> c_int;
 }

@@ -427,14 +427,13 @@ mod native {
         let table: Vec<*mut u64> = (0..cells.len())
             .map(|i| &mut cells[i] as *mut u64)
             .collect();
-        let here = 0u8;
         let mut vm = VmCtx {
             mem_base: std::ptr::null_mut(),
             mem_len: 0,
             globals: table.as_ptr(),
             entry_sp: 0,
             // Leave plenty of the test thread's stack for the host.
-            stack_limit: &here as *const u8 as u64 - 512 * 1024,
+            stack_limit: crate::wasm::native::stack_pointer() - 512 * 1024,
             mem: &mut *mem,
         };
         unsafe { sync(&mut vm) };

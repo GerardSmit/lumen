@@ -1,3 +1,4 @@
+# corpus: only macos
 import os
 import termios
 import tty

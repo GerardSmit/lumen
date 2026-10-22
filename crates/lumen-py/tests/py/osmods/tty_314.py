@@ -1,3 +1,4 @@
+# corpus: only macos
 import fcntl
 import os
 import select

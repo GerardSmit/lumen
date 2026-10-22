@@ -2,6 +2,9 @@
 //! `lumen-py` binary and compares stdout (and, when `X.err` exists, the exit code
 //! and last stderr line) with the committed expected files. No `X.err` means exit 0.
 //!
+//! A script whose output is platform-specific starts with `# corpus: only <os>` (`<os>` as in
+//! `std::env::consts::OS`, e.g. `macos`) and is skipped on every other platform.
+//!
 //! Every failing script must be listed in `tests/py/expected-failures.txt` as
 //! `path  # reason`, one per line; a listed script without a reason fails the run.
 //!
@@ -39,9 +42,17 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = e.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if path.extension().is_some_and(|x| x == "py") {
+        } else if path.extension().is_some_and(|x| x == "py") && runs_here(&path) {
             out.push(path);
         }
+    }
+}
+
+fn runs_here(script: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(script) else { return true };
+    match text.lines().next().and_then(|l| l.strip_prefix("# corpus: only ")) {
+        Some(os) => os.trim() == std::env::consts::OS,
+        None => true,
     }
 }
 

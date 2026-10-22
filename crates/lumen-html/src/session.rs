@@ -6275,10 +6275,10 @@ impl RenderSession {
                 // less often each time it is reduced again.
                 let retrying = full.is_some() && self.window_reduced.is_some_and(|(at, _)| version >= at);
                 let mut window = if retrying { full } else { self.scroll_window };
-                let list = loop {
+                let list = 'list: {
                     let list = lay_out(window, &mut geometry);
                     let (Err(LayoutError::CommandLimit), Some(screens)) = (&list, window) else {
-                        break list?;
+                        break 'list list?;
                     };
                     // Only the window may be too dense: try smaller ones, and
                     // then the viewport alone, which fails like a layout without
@@ -6300,11 +6300,11 @@ impl RenderSession {
                     match smaller {
                         Some((list, screens)) => {
                             window = Some(screens);
-                            break list;
+                            list
                         }
                         None => {
                             window = None;
-                            break lay_out(None, &mut geometry)?;
+                            lay_out(None, &mut geometry)?
                         }
                     }
                 };
