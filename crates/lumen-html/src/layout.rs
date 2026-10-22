@@ -204,6 +204,14 @@ pub trait LazyImage {
     fn height(&self) -> u32;
     /// The decoded pixels; `None` when the body is corrupt.
     fn pixels(&self) -> Option<Arc<ImageData>>;
+    /// Whether every pixel is opaque, when that is known without decoding (or after a decode).
+    fn is_opaque(&self) -> Option<bool> {
+        None
+    }
+    /// Whether decoding is already known to have failed.
+    fn is_known_corrupt(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -221,6 +229,16 @@ impl LazyImageHandle {
     }
     pub fn pixels(&self) -> Option<Arc<ImageData>> {
         self.0.pixels()
+    }
+    pub fn is_opaque(&self) -> Option<bool> {
+        self.0.is_opaque()
+    }
+    pub fn is_known_corrupt(&self) -> bool {
+        self.0.is_known_corrupt()
+    }
+    /// A stable identity for the underlying resource, shared by clones of the handle.
+    pub fn id(&self) -> usize {
+        Rc::as_ptr(&self.0) as *const () as usize
     }
     pub fn is_same(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)

@@ -3371,7 +3371,8 @@ impl DomRealm {
     fn flush_layout_mode(&self,forced:bool)->OpResult<()> {
         self.refresh_embedded_intrinsic_sizes()?;
         self.sync_image_bitmaps()?;
-        self.sync_canvas()?;
+        highlight::synchronize(self);
+        self.canvases.sync_for_layout(self)?;
         self.flush_layout_frame_mode(forced)
     }
 
@@ -3408,6 +3409,13 @@ impl DomRealm {
             ));
         }
         Ok(())
+    }
+
+    /// Publishes attached canvases to the render session only when `sync_canvas` asks (before
+    /// painting or capturing) instead of at every layout flush, so a canvas nobody looks at is
+    /// never rasterized just to be laid out.
+    pub fn set_canvas_publication_on_demand(&self, on_demand: bool) {
+        self.canvases.set_on_demand_publication(on_demand);
     }
 
     /// Publish bitmap changes queued by DOM mutations before borrowing the render session.

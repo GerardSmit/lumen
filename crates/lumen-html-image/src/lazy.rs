@@ -50,6 +50,7 @@ pub struct EncodedImage {
     width: u32,
     height: u32,
     failed: Cell<bool>,
+    opaque: Cell<Option<bool>>,
 }
 
 impl EncodedImage {
@@ -59,12 +60,14 @@ impl EncodedImage {
         if width == 0 || height == 0 {
             return Err(ImageError::InvalidViewport);
         }
+        let opaque = header_is_opaque(bytes.as_ref());
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             bytes: Box::new(bytes),
             width,
             height,
             failed: Cell::new(false),
+            opaque: Cell::new(opaque),
         })
     }
 
@@ -82,6 +85,14 @@ impl LazyImage for EncodedImage {
         self.height
     }
 
+    fn is_opaque(&self) -> Option<bool> {
+        self.opaque.get()
+    }
+
+    fn is_known_corrupt(&self) -> bool {
+        self.failed.get()
+    }
+
     fn pixels(&self) -> Option<Arc<ImageData>> {
         if let Some(hit) = cache().get(&self.id) {
             return Some(hit);
@@ -97,10 +108,40 @@ impl LazyImage for EncodedImage {
             return None;
         };
         let bytes = image.pixels.len();
+        if self.opaque.get().is_none() {
+            self.opaque.set(Some(image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255)));
+        }
         let image = Arc::new(image);
         cache().insert(self.id, image.clone(), bytes);
         Some(image)
     }
+}
+
+/// Opacity that the container format guarantees: JPEG, and PNG colour types without alpha and
+/// without a transparency chunk. `None` when only the pixels can tell.
+fn header_is_opaque(bytes: &[u8]) -> Option<bool> {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return Some(true);
+    }
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if !bytes.starts_with(&PNG_SIGNATURE) {
+        return None;
+    }
+    let mut position = PNG_SIGNATURE.len();
+    let mut has_alpha_channel = None;
+    while let Some(header) = bytes.get(position..position + 8) {
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let kind = &header[4..8];
+        let body = position + 8;
+        match kind {
+            b"IHDR" => has_alpha_channel = Some(matches!(bytes.get(body + 9)?, 4 | 6)),
+            b"tRNS" => return None,
+            b"IDAT" | b"IEND" => break,
+            _ => {}
+        }
+        position = body.checked_add(length)?.checked_add(4)?;
+    }
+    (has_alpha_channel? == false).then_some(true)
 }
 
 impl Drop for EncodedImage {

@@ -11,7 +11,6 @@ use lumen_html::{
     Document, Namespace, NodeId, NodeKind,
     layout::{ImageResolver, ImageState, NodeBitmap},
     observe::{ObservedKind, ObservedMutation},
-    paint::ImageData,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -59,7 +58,7 @@ pub(crate) struct ImageSnapshot {
 /// requests are unusable without being broken; a decoded current image stays
 /// usable while a replacement request is pending.
 pub(crate) enum CanvasImageState {
-    Available(Arc<ImageData>, bool),
+    Available(NodeBitmap),
     Unavailable,
     Broken,
 }
@@ -723,9 +722,9 @@ impl ImageLoader {
         };
         match request.current.state {
             RequestState::Broken => CanvasImageState::Broken,
-            RequestState::Available => match request.current.image.as_ref().filter(|image| image.is_valid()).map(NodeBitmap::state) {
-                Some(ImageState::Ready(image)) => CanvasImageState::Available(image, request.current.origin_clean),
-                Some(_) => CanvasImageState::Broken,
+            RequestState::Available => match request.current.image.as_ref().filter(|image| image.is_valid()) {
+                Some(NodeBitmap::Lazy(lazy)) if lazy.is_known_corrupt() => CanvasImageState::Broken,
+                Some(image) => CanvasImageState::Available(image.clone()),
                 None => CanvasImageState::Unavailable,
             },
             RequestState::Unavailable | RequestState::Loading => CanvasImageState::Unavailable,
@@ -1212,6 +1211,7 @@ pub(crate) fn resolved_url(source: &str, base: &str) -> String {
 #[cfg(test)]
 mod responsive_request_tests {
     use super::*;
+    use lumen_html::paint::ImageData;
     #[test]
     fn specification_canvas_source_dimensions_precede_webidl_projection() {
         let document=lumen_html::html::parse("<img src='actual.png'>",16).unwrap();

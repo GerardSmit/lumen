@@ -4,8 +4,9 @@ use lumen::embed::{Deferred, JsFunction, TaKind};
 use lumen_html::paint::{FontSpec, FontStyle, Rgba, TextShaper};
 use lumen_html_image::{
     canvas::{
-        CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSurface,
-        ParsedSvgPath, CanvasPublication, OffscreenCanvasTransfer,
+        CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSource,
+        CanvasSurface, ParsedSvgPath, CanvasPublication, OffscreenCanvasTransfer, SourceGeometry,
+        TextSource,
     },
     Rgba8Image,
 };
@@ -70,6 +71,14 @@ impl CanvasFontSource {
             }
         }
         Ok(())
+    }
+    /// The font set a draw issued now uses, for operations that draw later.
+    fn text_source(&self)->TextSource {
+        let _=self.refresh_fonts();
+        match self {
+            Self::Static(fonts)=>TextSource::Static(*fonts),
+            Self::Realm(_,_,current,_)=>TextSource::Shared(current.borrow().clone()),
+        }
     }
     fn visit_fonts<R>(&self,visit:impl FnOnce(&FontSet)->R)->R {
         match self {Self::Static(fonts)=>visit(fonts),Self::Realm(_,_,current,_)=>visit(&current.borrow())}
@@ -249,6 +258,9 @@ pub fn prune_dead_thread_handles() {
 pub struct CanvasRegistry {
     surfaces: RefCell<HashMap<NodeId, Rc<RefCell<CanvasData>>>>,
     pending_publish: RefCell<Vec<NodeId>>,
+    /// Attached canvases whose pixels have not been handed to the render session, by choice.
+    unpublished: RefCell<Vec<NodeId>>,
+    on_demand_publication: Cell<bool>,
     pending_detach: RefCell<Vec<NodeId>>,
     paint_requests: RefCell<Vec<NodeId>>,
     drawable_epochs: RefCell<HashMap<NodeId,u64>>,
@@ -539,12 +551,23 @@ impl CanvasData {
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
         }
-        Ok(data.borrow().snapshot())
+        Ok(data.borrow_mut().snapshot())
+    }
+
+    /// The current bitmap as a drawing source: the very image for a canvas that only shows one,
+    /// and a shared snapshot for a canvas that has not changed since its last use as a source.
+    pub fn source_for_read(data: &Rc<RefCell<Self>>) -> OpResult<CanvasSource> {
+        data.borrow().ensure_bitmap_available()?;
+        let synchronize = data.borrow().snapshot_synchronizer.clone();
+        if let Some(synchronize) = synchronize {
+            synchronize().map_err(|message| OpError::new("OperationError", message))?;
+        }
+        Ok(data.borrow_mut().source())
     }
 
     fn new(width: u32, height: u32) -> OpResult<Self> {
         check_dimensions(width, height)?;
-        let surface = CanvasSurface::new(width, height).map_err(|_| {
+        let surface = CanvasSurface::new_recorded(width, height).map_err(|_| {
             OpError::new("IndexSizeError", "canvas bitmap dimensions are too large")
         })?;
         Ok(Self {
@@ -649,11 +672,11 @@ impl CanvasData {
         }
     }
 
-    fn snapshot(&self) -> Rgba8Image {
-        let mut image = self
-            .bitmap_output
-            .clone()
-            .unwrap_or_else(|| self.surface.snapshot());
+    fn snapshot(&mut self) -> Rgba8Image {
+        let mut image = match &self.bitmap_output {
+            Some(image) => image.clone(),
+            None => self.surface.snapshot(),
+        };
         if self.context_mode == Some("bitmaprenderer") && !self.bitmap_alpha {
             make_image_opaque(&mut image.pixels);
         }
@@ -661,6 +684,15 @@ impl CanvasData {
             make_image_opaque(&mut image.pixels);
         }
         image
+    }
+
+    fn source(&mut self) -> CanvasSource {
+        let forced_opaque = (self.context_mode == Some("bitmaprenderer") && !self.bitmap_alpha)
+            || (self.context_mode == Some("2d") && !self.alpha);
+        if self.bitmap_output.is_some() || forced_opaque && !self.surface.is_image_alias() {
+            return CanvasSource::Pixels(Arc::new(self.snapshot()));
+        }
+        self.surface.source()
     }
 }
 
@@ -723,6 +755,7 @@ impl CanvasRegistry {
             }
             requests=ordered;
         }
+        self.sync(realm)?;
         let provider = self.snapshot_provider.borrow().clone().ok_or_else(|| OpError::new("NotSupportedError", "Host does not provide drawable rendering"))?;
         // Complete a child canvas's actual snapshot/event before its ancestor consumes its pixels.
         for canvas in requests.into_iter().rev() {
@@ -950,6 +983,20 @@ impl CanvasRegistry {
     /// Publish mutation-driven resizes once the session's mutation callback has
     /// returned. Embedders call this before building or exposing a new frame.
     pub fn sync(&self, realm: &DomRealm) -> OpResult<()> {
+        self.sync_publishing(realm, true)
+    }
+
+    /// Sync before a layout flush. With on-demand publication, attached canvases stay unpublished
+    /// (their recordings unrasterized) until the embedder syncs for painting.
+    pub fn sync_for_layout(&self, realm: &DomRealm) -> OpResult<()> {
+        self.sync_publishing(realm, !self.on_demand_publication.get())
+    }
+
+    pub fn set_on_demand_publication(&self, on_demand: bool) {
+        self.on_demand_publication.set(on_demand);
+    }
+
+    fn sync_publishing(&self, realm: &DomRealm, publish: bool) -> OpResult<()> {
         let mut pending = core::mem::take(&mut *self.pending_publish.borrow_mut());
         // Worker publication crosses only a bounded latest-bitmap mailbox. The
         // document owner adopts it at its normal rendering boundary.
@@ -962,6 +1009,22 @@ impl CanvasRegistry {
                 data.bitmap_output = publication.image.clone();
                 if !pending.contains(&node) { pending.push(node); }
             }
+        }
+        if publish {
+            for node in core::mem::take(&mut *self.unpublished.borrow_mut()) {
+                if !pending.contains(&node) { pending.push(node); }
+            }
+        } else {
+            let surfaces = self.surfaces.borrow();
+            let mut unpublished = self.unpublished.borrow_mut();
+            pending.retain(|node| {
+                let defers = surfaces.get(node).is_some_and(|state| {
+                    let data = state.borrow();
+                    !data.transferred && data.remote_inbound.is_none()
+                });
+                if defers && !unpublished.contains(node) { unpublished.push(*node); }
+                !defers
+            });
         }
         let detached = core::mem::take(&mut *self.pending_detach.borrow_mut());
         if pending.is_empty() && detached.is_empty() {
@@ -996,7 +1059,7 @@ impl CanvasRegistry {
                 let Some(state) = surfaces.get(&node) else {
                     continue;
                 };
-                let data = state.borrow();
+                let mut data = state.borrow_mut();
                 if let Some(error) = &data.pending_error {
                     errors.push(error.clone());
                 }
@@ -1114,7 +1177,7 @@ fn check_dimensions(width: u32, height: u32) -> OpResult<()> {
 
 fn offscreen_surface(width: u64, height: u64) -> OpResult<(CanvasSurface, bool)> {
     let empty_surface = || {
-        CanvasSurface::new(0, 0)
+        CanvasSurface::new_recorded(0, 0)
             .map_err(|_| OpError::new("IndexSizeError", "canvas bitmap dimensions are too large"))
     };
     let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
@@ -1123,7 +1186,7 @@ fn offscreen_surface(width: u64, height: u64) -> OpResult<(CanvasSurface, bool)>
     if check_dimensions(width, height).is_err() {
         return Ok((empty_surface()?, false));
     }
-    match CanvasSurface::new(width, height) {
+    match CanvasSurface::new_recorded(width, height) {
         Ok(surface) => Ok((surface, true)),
         Err(_) => Ok((empty_surface()?, false)),
     }
@@ -1253,8 +1316,8 @@ fn image_data(image: Rgba8Image) -> Option<Arc<lumen_html::paint::ImageData>> {
     })
 }
 
-fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &CanvasData) -> OpResult<()> {
-    if let Some(mailbox) = &data.remote_outbound {
+fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &mut CanvasData) -> OpResult<()> {
+    if let Some(mailbox) = data.remote_outbound.clone() {
         let image = data.snapshot();
         let mut publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
         publication.image = Some(image);
@@ -2015,7 +2078,7 @@ fn set_dom_dimension(
     let attr_result = node.set_attribute(ctx, name, &value.to_string());
     data.borrow_mut().suppress_dimension_mutation = false;
     attr_result?;
-    publish(Some(&node.realm), Some(node.id), &data.borrow())
+    publish(Some(&node.realm), Some(node.id), &mut data.borrow_mut())
 }
 
 fn node_width(node: &DomNode) -> u32 {
@@ -2066,7 +2129,7 @@ impl DomOffscreenCanvas {
         self.ensure_attached()?;
         let height = self.data.borrow().logical_height;
         resize_offscreen(&self.data, width, height)?;
-        publish(self.realm.as_ref(), self.placeholder, &self.data.borrow())
+        publish(self.realm.as_ref(), self.placeholder, &mut self.data.borrow_mut())
     }
     #[getter]
     fn height(&self) -> f64 {
@@ -2078,7 +2141,7 @@ impl DomOffscreenCanvas {
         self.ensure_attached()?;
         let width = self.data.borrow().logical_width;
         resize_offscreen(&self.data, width, height)?;
-        publish(self.realm.as_ref(), self.placeholder, &self.data.borrow())
+        publish(self.realm.as_ref(), self.placeholder, &mut self.data.borrow_mut())
     }
 
     fn get_context(
@@ -2285,6 +2348,7 @@ fn context_value(
         if let Some(settings) = context_settings {
             let mut data = data.borrow_mut();
             data.alpha = settings.alpha;
+            data.surface.set_has_alpha(settings.alpha);
             data.color_space = settings.color_space;
             data.desynchronized = settings.desynchronized;
             data.will_read_frequently = settings.will_read_frequently;
@@ -2389,7 +2453,7 @@ fn gpu_canvas_target(
                     pixels,
                 });
                 data.borrow_mut().origin_clean = true;
-                publish(realm.as_ref(), node, &data.borrow())
+                publish(realm.as_ref(), node, &mut data.borrow_mut())
                     .map_err(|_| "GPU canvas bitmap publication failed".to_owned())
             },
         ) as Rc<dyn Fn(u64, u64, u32, u32, Vec<u8>) -> Result<(), String>>
@@ -2473,7 +2537,7 @@ impl DomImageBitmapRenderingContext {
         if data.bitmap_output.is_none() {
             data.surface.clear_bitmap();
         }
-        publish(self.realm.as_ref(), self.node, &data)
+        publish(self.realm.as_ref(), self.node, &mut data)
     }
 }
 
@@ -2526,7 +2590,7 @@ pub(crate) fn paint_context(ctx: &mut Ctx, width: u32, height: u32, alpha: bool,
         .ok_or_else(||OpError::new("QuotaExceededError","paint surface dimensions exceed budget"))?;
     let reservation=budget.reserve(bytes).ok_or_else(||OpError::new("QuotaExceededError","paint surface budget exhausted"))?;
     let mut data=CanvasData::new(width,height)?;
-    data.context_mode=Some("2d");data.alpha=alpha;
+    data.context_mode=Some("2d");data.alpha=alpha;data.surface.set_has_alpha(alpha);
     if !alpha {data.surface.clear_bitmap();}
     Ok(ctx.new_instance(DomPaintRenderingContext2D {data:Rc::new(RefCell::new(data)),realm:None,
         node:None,canvas_in_private_slot:false,_reservation:std::sync::Arc::new(reservation)}))
@@ -2538,7 +2602,7 @@ pub(crate) fn paint_context_snapshot(ctx: &mut Ctx, value: &Value,
     let bytes=(data.borrow().logical_width as usize).checked_mul(data.borrow().logical_height as usize)
         .and_then(|pixels|pixels.checked_mul(4)).ok_or_else(||OpError::new("QuotaExceededError","paint snapshot dimensions exceed budget"))?;
     let reservation=budget.reserve(bytes).ok_or_else(||OpError::new("QuotaExceededError","paint snapshot budget exhausted"))?;
-    let image=data.borrow().snapshot();
+    let image=data.borrow_mut().snapshot();
     lumen_html::render_capture::ReservedImageData::new(lumen_html::paint::ImageData {
         width:image.width,height:image.height,pixels:image.pixels},reservation)
         .ok_or_else(||OpError::new("QuotaExceededError","paint snapshot exceeded reservation"))
@@ -3028,8 +3092,8 @@ macro_rules! impl_canvas_2d_methods {
                 let origin_x = x as f32 - width * text_anchor(&text_state);
                 let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
                 data.surface
-                    .fill_text(
-                        &fonts,
+                    .fill_text_with(
+                        &fonts.text_source(),
                         text,
                         text_state.size,
                         &text_state.spec,
@@ -3047,7 +3111,7 @@ macro_rules! impl_canvas_2d_methods {
                         )
                     })?;
                 fonts.queue_demand_task(ctx)?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             #[method(name = "strokeText")]
             fn stroke_text(
@@ -3102,8 +3166,8 @@ macro_rules! impl_canvas_2d_methods {
                 let origin_x = x as f32 - width * anchor;
                 let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
                 data.surface
-                    .stroke_text(
-                        &fonts,
+                    .stroke_text_with(
+                        &fonts.text_source(),
                         text,
                         text_state.size,
                         &text_state.spec,
@@ -3121,7 +3185,7 @@ macro_rules! impl_canvas_2d_methods {
                         )
                     })?;
                 fonts.queue_demand_task(ctx)?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
 
             #[method(name = "createLinearGradient")]
@@ -3201,7 +3265,6 @@ macro_rules! impl_canvas_2d_methods {
                     None => return Ok(Value::Null),
                 };
                 let source_clean = canvas_source_origin_clean(ctx, &source);
-                let image=source_image.pixels;
                 let repetition = match repetition.unwrap_or("repeat") {
                     "repeat" => CanvasPatternRepetition::Repeat,
                     "repeat-x" => CanvasPatternRepetition::RepeatX,
@@ -3214,9 +3277,13 @@ macro_rules! impl_canvas_2d_methods {
                         ));
                     }
                 };
-                if image.width == 0 || image.height == 0 || source_image.natural.0==0.0 || source_image.natural.1==0.0 {
+                if source_image.source.width() == 0 || source_image.source.height() == 0 || source_image.natural.0==0.0 || source_image.natural.1==0.0 {
                     return Ok(Value::Null);
                 }
+                let image = source_image.source.pixels().ok_or_else(|| OpError::new(
+                    "InvalidStateError",
+                    "image source has a broken current request",
+                ))?;
                 let pattern = CanvasPattern::with_natural_size(&image, repetition,source_image.natural.0,source_image.natural.1).map_err(|_| {
                     OpError::new(
                         "InvalidStateError",
@@ -3290,7 +3357,7 @@ macro_rules! impl_canvas_2d_methods {
                     }
                     if let Some(text) = data.saved_text.pop() { data.text = text; }
                 }
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn fill_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
@@ -3305,13 +3372,13 @@ macro_rules! impl_canvas_2d_methods {
                             format!("canvas shadow rendering failed: {error:?}"),
                         )
                     })?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn clear_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
                 data.surface
                     .clear_rect(x as f32, y as f32, width as f32, height as f32);
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn stroke_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
                 if ![x, y, width, height].iter().all(|value| value.is_finite())
@@ -3339,7 +3406,7 @@ macro_rules! impl_canvas_2d_methods {
                         )
                     })?;
                 }
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn begin_path(&self) {
                 self.data.borrow_mut().current_path = CanvasPath::default();
@@ -3509,7 +3576,7 @@ macro_rules! impl_canvas_2d_methods {
                         )
                     })?;
                 }
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn stroke(&self, ctx: &mut Ctx, path_data: Option<Value>) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
@@ -3531,7 +3598,7 @@ macro_rules! impl_canvas_2d_methods {
                         )
                     })?;
                 }
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
             fn clip(
                 &self,
@@ -3614,7 +3681,7 @@ macro_rules! impl_canvas_2d_methods {
                 image_data_storage(width, height, settings.pixel_format)?;
                 let mut image = self
                     .data
-                    .borrow()
+                    .borrow_mut()
                     .surface
                     .read_pixels(
                         if sw < 0 {
@@ -3738,11 +3805,11 @@ macro_rules! impl_canvas_2d_methods {
                     return Ok(());
                 };
                 self.data.borrow().ensure_bitmap_available()?;
-                let pixels = image.read_pixels(ctx)?;
+                let pixels = Arc::new(image.read_pixels(ctx)?);
                 let mut data = self.data.borrow_mut();
                 data.surface
-                    .write_pixels_region(
-                        &pixels,
+                    .put_pixels(
+                        pixels,
                         i64::from(dx) + i64::from(source_x),
                         i64::from(dy) + i64::from(source_y),
                         source_x,
@@ -3751,7 +3818,7 @@ macro_rules! impl_canvas_2d_methods {
                         height,
                     )
                     .map_err(|_| OpError::new("IndexSizeError", "invalid image data"))?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
 
             #[method(name = "drawElementImage")]
@@ -3835,7 +3902,7 @@ macro_rules! impl_canvas_2d_methods {
                         "drawImage could not rasterize the source",
                     )
                 })?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
 
             #[method(name = "drawImage")]
@@ -3860,7 +3927,7 @@ macro_rules! impl_canvas_2d_methods {
                     return Ok(());
                 };
                 let source_origin_clean = canvas_source_origin_clean(ctx, &source);
-                let image=source_image.pixels;
+                let image=source_image.source;
                 let natural=source_image.natural;
                 if natural.0<=0.0 || natural.1<=0.0 || !natural.0.is_finite() || !natural.1.is_finite(){return Ok(());}
                 if matches!((c,d,e,f,g,h),(Some(sw),Some(sh),Some(_),Some(_),Some(_),Some(_)) if sw==0.0 || sh==0.0){return Ok(());}
@@ -3868,55 +3935,44 @@ macro_rules! impl_canvas_2d_methods {
                 if !source_origin_clean {
                     data.origin_clean = false;
                 }
-                match (c, d, e, f, g, h) {
-                    (None, None, None, None, None, None) => {
-                        data.surface.draw_image_with_alpha_behavior(
-                            &image,
-                            a as f32,
-                            b as f32,
-                            natural.0 as f32,
-                            natural.1 as f32,
-                            premultiply_alpha,
-                        )
-                    }
-                    (Some(width), Some(height), None, None, None, None) => {
-                        data.surface.draw_image_with_alpha_behavior(
-                            &image,
-                            a as f32,
-                            b as f32,
-                            width as f32,
-                            height as f32,
-                            premultiply_alpha,
-                        )
-                    }
-                    (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => {
-                        data.surface.draw_image_crop_with_alpha_behavior(
-                            &image,
-                            (a*f64::from(image.width)/natural.0) as f32,
-                            (b*f64::from(image.height)/natural.1) as f32,
-                            (sw*f64::from(image.width)/natural.0) as f32,
-                            (sh*f64::from(image.height)/natural.1) as f32,
-                            dx as f32,
-                            dy as f32,
-                            dw as f32,
-                            dh as f32,
-                            premultiply_alpha,
-                        )
-                    }
+                let geometry = match (c, d, e, f, g, h) {
+                    (None, None, None, None, None, None) => SourceGeometry::Scaled {
+                        x: a as f32,
+                        y: b as f32,
+                        width: natural.0 as f32,
+                        height: natural.1 as f32,
+                    },
+                    (Some(width), Some(height), None, None, None, None) => SourceGeometry::Scaled {
+                        x: a as f32,
+                        y: b as f32,
+                        width: width as f32,
+                        height: height as f32,
+                    },
+                    (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => SourceGeometry::Crop {
+                        sx: (a*f64::from(image.width())/natural.0) as f32,
+                        sy: (b*f64::from(image.height())/natural.1) as f32,
+                        sw: (sw*f64::from(image.width())/natural.0) as f32,
+                        sh: (sh*f64::from(image.height())/natural.1) as f32,
+                        dx: dx as f32,
+                        dy: dy as f32,
+                        dw: dw as f32,
+                        dh: dh as f32,
+                    },
                     _ => {
                         return Err(OpError::new(
                             "TypeError",
                             "drawImage expects 3, 5, or 9 arguments",
                         ));
                     }
-                }
+                };
+                data.surface.draw_source(&image, geometry, premultiply_alpha)
                 .map_err(|_| {
                     OpError::new(
                         "InvalidStateError",
                         "drawImage could not rasterize the source",
                     )
                 })?;
-                self.publish_data(&data)
+                self.publish_data(&mut data)
             }
         }
     };
@@ -4149,7 +4205,10 @@ fn create_image_bitmap(
         data.borrow().read_pixels(ctx)?
     } else {
         match canvas_source_image(ctx, source) {
-            Ok(Some(image)) => image.pixels.into_owned(),
+            Ok(Some(image)) => match image.source.pixels() {
+                Some(pixels) => Arc::try_unwrap(pixels).unwrap_or_else(|shared| (*shared).clone()),
+                None => return Ok(rejected_image_bitmap(ctx, "Image source is not fully decodable")),
+            },
             Ok(None) => {
                 return Ok(rejected_image_bitmap(
                     ctx,
@@ -4572,43 +4631,36 @@ fn rejected_image_bitmap(ctx: &mut Ctx, message: &str) -> Value {
     promise
 }
 
-/// Original decoded pixels and their coordinate-space dimensions are kept
-/// together only for this consumer operation, never as a second image cache.
-struct CanvasSourceImage {pixels:SourcePixels,natural:(f64,f64)}
+/// A drawing source and its coordinate-space dimensions, held only for this consumer operation.
+/// An `<img>` stays undecoded until its pixels are needed.
+struct CanvasSourceImage {source:CanvasSource,natural:(f64,f64)}
 
-/// An `<img>` draws straight from the shared decoded pixels; every other source owns a snapshot.
-enum SourcePixels {Shared(Arc<Rgba8Image>),Owned(Rgba8Image)}
-impl std::ops::Deref for SourcePixels {
-    type Target=Rgba8Image;
-    fn deref(&self)->&Rgba8Image {match self {Self::Shared(image)=>image,Self::Owned(image)=>image}}
-}
-impl SourcePixels {
-    fn into_owned(self)->Rgba8Image {match self {Self::Shared(image)=>Arc::try_unwrap(image).unwrap_or_else(|shared|(*shared).clone()),Self::Owned(image)=>image}}
-}
 fn canvas_source_image(ctx:&mut Ctx,source:Value)->OpResult<Option<CanvasSourceImage>> {
     let natural=ctx.with_instance::<DomHtmlImageElement,_>(&source,|image|image.image_snapshot().natural_size).ok().flatten();
-    Ok(canvas_source_pixels(ctx,source)?.map(|pixels|{
-        let natural=natural.unwrap_or((f64::from(pixels.width),f64::from(pixels.height)));
-        CanvasSourceImage{pixels,natural}
+    Ok(canvas_source_pixels(ctx,source)?.map(|source|{
+        let natural=natural.unwrap_or((f64::from(source.width()),f64::from(source.height())));
+        CanvasSourceImage{source,natural}
     }))
 }
 
-fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourcePixels>> {
+fn owned_source(image:Rgba8Image)->CanvasSource {CanvasSource::Pixels(Arc::new(image))}
+
+fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<CanvasSource>> {
     if let Ok(image)=ctx.with_instance::<DomElementImage,_>(&source,|image|image.image.borrow().clone()) {
-        return image.map(|image|Some(SourcePixels::Owned(image.image.clone()))).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
+        return image.map(|image|Some(owned_source(image.image.clone()))).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
     }
     if let Ok(image) = ctx.with_instance::<DomCanvasElement, _>(&source, |canvas| {
         canvas
             .data()
-            .and_then(|data| CanvasData::snapshot_for_read(&data))
+            .and_then(|data| CanvasData::source_for_read(&data))
     }) {
-        return nonempty_canvas_snapshot(image?).map(|image|image.map(SourcePixels::Owned));
+        return nonempty_canvas_source(image?).map(Some);
     }
     if let Ok(image) = ctx.with_instance::<DomOffscreenCanvas, _>(&source, |canvas| {
         canvas.ensure_attached()?;
-        CanvasData::snapshot_for_read(&canvas.data)
+        CanvasData::source_for_read(&canvas.data)
     }) {
-        return nonempty_canvas_snapshot(image?).map(|image|image.map(SourcePixels::Owned));
+        return nonempty_canvas_source(image?).map(Some);
     }
     if let Some(bitmap) = ctx.instance_data::<DomImageBitmap>(&source) {
         return bitmap
@@ -4616,7 +4668,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourceP
             .image
             .borrow()
             .clone()
-            .map(|image| Some(SourcePixels::Owned(image)))
+            .map(|image| Some(owned_source(image)))
             .ok_or_else(|| OpError::new("InvalidStateError", "ImageBitmap is closed"));
     }
     if let Ok((realm, node)) = ctx.with_instance::<DomHtmlImageElement, _>(&source, |image| {
@@ -4624,7 +4676,15 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourceP
         (node.realm.clone(), node.id)
     }) {
         return match realm.images.canvas_image_state(node) {
-            image_loading::CanvasImageState::Available(image, _) => Ok(Some(SourcePixels::Shared(image))),
+            image_loading::CanvasImageState::Available(bitmap) => Ok(Some(match bitmap {
+                lumen_html::layout::NodeBitmap::Decoded(image) => CanvasSource::Pixels(image),
+                lumen_html::layout::NodeBitmap::Lazy(lazy) => {
+                    if lazy.is_known_corrupt() || lazy.pixels().is_none() {
+                        return Err(OpError::new("InvalidStateError", "image source has a broken current request"));
+                    }
+                    CanvasSource::Lazy(lazy)
+                }
+            })),
             image_loading::CanvasImageState::Unavailable => Ok(None),
             image_loading::CanvasImageState::Broken => Err(OpError::new(
                 "InvalidStateError",
@@ -4640,7 +4700,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourceP
         let frame = realm
             .media_video_frame(node)
             .ok_or_else(|| OpError::new("InvalidStateError", "video has no current frame"))?;
-        return Ok(Some(SourcePixels::Owned(Rgba8Image {
+        return Ok(Some(owned_source(Rgba8Image {
             width: frame.width,
             height: frame.height,
             pixels: frame.rgba.as_ref().clone(),
@@ -4705,21 +4765,21 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourceP
             "canvas source pixels have an invalid length",
         ));
     }
-    Ok(Some(SourcePixels::Owned(Rgba8Image {
+    Ok(Some(owned_source(Rgba8Image {
         width,
         height,
         pixels: bytes,
     })))
 }
 
-fn nonempty_canvas_snapshot(image: Rgba8Image) -> OpResult<Option<Rgba8Image>> {
-    if image.width == 0 || image.height == 0 {
+fn nonempty_canvas_source(source: CanvasSource) -> OpResult<CanvasSource> {
+    if source.width() == 0 || source.height() == 0 {
         Err(OpError::new(
             "InvalidStateError",
             "canvas image source has zero dimensions",
         ))
     } else {
-        Ok(Some(image))
+        Ok(source)
     }
 }
 
@@ -4774,7 +4834,7 @@ fn pattern_origin_clean(ctx: &mut Ctx, pattern: &Value) -> Option<bool> {
 macro_rules! impl_canvas_2d_helpers {
     ($context:ident) => {
         impl $context {
-            fn publish_data(&self, data: &CanvasData) -> OpResult<()> {
+            fn publish_data(&self, data: &mut CanvasData) -> OpResult<()> {
                 data.ensure_bitmap_available()?;
                 publish(self.realm.as_ref(), self.node, data)
             }
@@ -5731,7 +5791,7 @@ mod tests {
             }
             inherited.getContext('2d').direction==='inherit'
         "#));
-        let pixels=|name:&str|{let node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),&format!("#{name}")).unwrap().unwrap());realm.canvases.data_for(&realm,node).unwrap().borrow().snapshot().pixels};
+        let pixels=|name:&str|{let node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),&format!("#{name}")).unwrap().unwrap());realm.canvases.data_for(&realm,node).unwrap().borrow_mut().snapshot().pixels};
         assert_eq!(pixels("inherited"),pixels("explicit"));
         assert_ne!(pixels("inherited"),pixels("ltr"));
         assert!(eval_bool(&mut engine,"var standalone=new OffscreenCanvas(100,40);standalone.getContext('2d').fillText('ABC!',60,25);true"));
@@ -5941,7 +6001,7 @@ mod tests {
         assert!(eval_bool(&mut engine,"document.getElementById('placeholder').width===200 && document.getElementById('placeholder').height===200"));
         let node = realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#placeholder").unwrap().unwrap());
         let data = realm.canvases.data_for(&realm,node).unwrap();
-        let image = data.borrow().snapshot();
+        let image = data.borrow_mut().snapshot();
         let pixel = |x:usize,y:usize| &image.pixels[(y*200+x)*4..(y*200+x)*4+4];
         assert_eq!(pixel(60,60),[128,0,128,255]);
         assert_eq!(pixel(40,40),[0,0,0,0],"unclosed worker layer stays isolated");
@@ -5974,7 +6034,7 @@ mod tests {
         realm.sync_canvas().unwrap();
         let node=realm.with_session(|session|selector::query_selector(session.document(),session.document().root(),"#placeholder").unwrap().unwrap());
         let data=realm.canvases.data_for(&realm,node).unwrap();
-        let snapshot=data.borrow().snapshot();
+        let snapshot=data.borrow_mut().snapshot();
         assert_eq!((snapshot.width,snapshot.height),(3,2));
         assert!(snapshot.pixels.chunks_exact(4).all(|pixel|pixel==[0,128,0,255]));
         assert!(eval_bool(&mut engine,"document.getElementById('placeholder').width===3 && document.getElementById('placeholder').height===2"));
@@ -7206,5 +7266,76 @@ mod tests {
             &mut engine,
             "globalThis.__colorModesReady===true"
         ));
+    }
+
+    fn recorded_realm(engine: &mut Engine) {
+        crate::install(engine.ctx(), "<canvas id=a width=8 height=8></canvas><canvas id=b width=8 height=8></canvas>", 64).unwrap();
+    }
+
+    #[test]
+    fn recorded_canvas_source_keeps_the_pixels_it_had_when_drawn() {
+        let mut engine = Engine::new();
+        recorded_realm(&mut engine);
+        assert!(eval_bool(&mut engine, "\
+            var a=document.getElementById('a').getContext('2d'),b=document.getElementById('b').getContext('2d');\
+            a.fillStyle='rgb(255,0,0)';a.fillRect(0,0,8,8);\
+            b.drawImage(document.getElementById('a'),0,0);\
+            a.fillStyle='rgb(0,255,0)';a.fillRect(0,0,8,8);\
+            var p=b.getImageData(1,1,1,1).data,q=a.getImageData(1,1,1,1).data;\
+            p[0]===255&&p[1]===0&&q[0]===0&&q[1]===255"));
+    }
+
+    #[test]
+    fn recorded_canvas_drawn_into_itself_uses_prior_contents() {
+        let mut engine = Engine::new();
+        recorded_realm(&mut engine);
+        assert!(eval_bool(&mut engine, "\
+            var c=document.getElementById('a'),a=c.getContext('2d');\
+            a.fillStyle='rgb(255,0,0)';a.fillRect(0,0,4,8);\
+            a.drawImage(c,4,0);\
+            a.fillStyle='rgb(0,0,255)';a.fillRect(0,0,2,8);\
+            var l=a.getImageData(0,0,1,1).data,m=a.getImageData(3,0,1,1).data,r=a.getImageData(5,0,1,1).data;\
+            l[2]===255&&m[0]===255&&r[0]===255&&r[2]===0"));
+    }
+
+    #[test]
+    fn clear_and_resize_discard_recorded_drawing() {
+        let mut engine = Engine::new();
+        recorded_realm(&mut engine);
+        assert!(eval_bool(&mut engine, "\
+            var c=document.getElementById('a'),a=c.getContext('2d');\
+            a.fillRect(0,0,8,8);a.clearRect(0,0,8,8);\
+            var cleared=a.getImageData(0,0,1,1).data[3]===0;\
+            a.fillRect(0,0,8,8);c.width=8;\
+            cleared&&a.getImageData(0,0,1,1).data[3]===0"));
+    }
+
+    #[test]
+    fn opaque_context_composites_a_transparent_image_over_black() {
+        let mut engine = Engine::new();
+        recorded_realm(&mut engine);
+        assert!(eval_bool(&mut engine, "\
+            var src=document.createElement('canvas');src.width=8;src.height=8;\
+            var s=src.getContext('2d');s.fillStyle='rgba(255,255,255,0.5)';s.fillRect(0,0,8,8);\
+            var o=document.createElement('canvas');o.width=8;o.height=8;\
+            var g=o.getContext('2d',{alpha:false});g.drawImage(src,0,0);\
+            var p=g.getImageData(0,0,1,1).data;\
+            p[3]===255&&p[0]>=127&&p[0]<=129"));
+    }
+
+    #[test]
+    fn same_size_canvas_copy_reads_back_identically_and_mutation_is_isolated() {
+        let mut engine = Engine::new();
+        recorded_realm(&mut engine);
+        assert!(eval_bool(&mut engine, "\
+            var src=document.getElementById('a'),s=src.getContext('2d');\
+            s.fillStyle='rgba(10,200,30,0.6)';s.fillRect(0,0,8,8);\
+            var one=document.getElementById('b'),two=document.createElement('canvas');two.width=8;two.height=8;\
+            var x=one.getContext('2d'),y=two.getContext('2d');\
+            x.drawImage(src,0,0);y.drawImage(src,0,0);\
+            var before=Array.from(x.getImageData(0,0,8,8).data).join();\
+            var same=before===Array.from(s.getImageData(0,0,8,8).data).join();\
+            x.fillStyle='red';x.fillRect(0,0,8,8);\
+            same&&Array.from(y.getImageData(0,0,8,8).data).join()===before&&Array.from(s.getImageData(0,0,8,8).data).join()===before"));
     }
 }

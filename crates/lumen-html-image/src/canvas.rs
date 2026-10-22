@@ -4,6 +4,13 @@ use super::{ImageError, Rgba8Image, MAX_IMAGE_BYTES, MAX_LAYER_BYTES};
 use lumen_html::paint::{FontSpec, ShapedRun};
 use lumen_html_text::{CanvasTextOptions, FontProvider, GlyphOutlineCommand};
 use std::{cell::RefCell, rc::Rc};
+
+mod record;
+pub use record::{
+    canvas_stats, reset_canvas_stats, set_canvas_recording_enabled, set_canvas_recording_limits,
+    CanvasSource, CanvasStats, SourceGeometry, TextSource,
+};
+use record::Recorder;
 use tiny_skia::{
     BlendMode, Color, FillRule, FilterQuality, GradientStop, LinearGradient,
     Mask, MaskType, Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient,
@@ -407,7 +414,7 @@ pub struct DrawingState {
     pub stroke_gradient: Option<CanvasGradient>,
     pub fill_pattern: Option<CanvasPattern>,
     pub stroke_pattern: Option<CanvasPattern>,
-    clip: Option<Mask>,
+    clip: Option<std::sync::Arc<Mask>>,
 }
 
 impl Default for DrawingState {
@@ -940,8 +947,15 @@ pub struct CanvasSurface {
     height: u32,
     bitmap: Option<Pixmap>,
     /// A non-empty canvas whose pixmap is not allocated yet: it reads as transparent black
-    /// and is allocated by the first operation that draws.
+    /// (or as `alias`) and is allocated by the first operation that draws.
     lazy: bool,
+    /// While the pixmap is unallocated, the canvas shows exactly this image.
+    alias: Option<CanvasSource>,
+    recorder: Option<Recorder>,
+    has_alpha: bool,
+    replaying: bool,
+    frozen: Option<Rc<DrawingState>>,
+    source_cache: Option<(u64, std::sync::Weak<Rgba8Image>)>,
     state: DrawingState,
     saved: Vec<DrawingState>,
     generation: u64,
@@ -962,6 +976,12 @@ impl CanvasSurface {
             height,
             bitmap: None,
             lazy: width != 0 && height != 0,
+            alias: None,
+            recorder: None,
+            has_alpha: true,
+            replaying: false,
+            frozen: None,
+            source_cache: None,
             state: DrawingState::default(),
             saved: Vec::new(),
             generation: 0,
@@ -979,6 +999,7 @@ impl CanvasSurface {
         &self.state
     }
     pub fn state_mut(&mut self) -> &mut DrawingState {
+        self.frozen = None;
         &mut self.state
     }
 
@@ -986,10 +1007,13 @@ impl CanvasSurface {
     /// including when the new dimensions equal the previous ones.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), ImageError> {
         pixel_bytes(width, height)?;
+        self.discard_recording(record::Discard::Reset);
         self.width = width;
         self.height = height;
         self.bitmap = None;
         self.lazy = width != 0 && height != 0;
+        self.frozen = None;
+        self.source_cache = None;
         self.state = DrawingState::default();
         self.saved.clear();
         self.layers.clear();
@@ -999,7 +1023,17 @@ impl CanvasSurface {
 
     fn materialize(&mut self) -> Result<(), ImageError> {
         if self.lazy {
-            self.bitmap = allocate(self.width, self.height)?;
+            let aliased = self.alias.take().and_then(|source| source.pixels());
+            self.bitmap = match aliased {
+                Some(image) if image.width == self.width && image.height == self.height => {
+                    record::count_materialized_alias();
+                    Some(premultiplied_pixmap(&image)?)
+                }
+                _ => {
+                    record::count_pixmap();
+                    allocate(self.width, self.height)?
+                }
+            };
             self.lazy = false;
         }
         Ok(())
@@ -1014,6 +1048,7 @@ impl CanvasSurface {
         }
         if let Some(state) = self.saved.pop() {
             self.state = state;
+            self.frozen = None;
             return true;
         }
         false
@@ -1027,8 +1062,10 @@ impl CanvasSurface {
             .is_none_or(|bytes| bytes > MAX_IMAGE_BYTES) {
             return Err(ImageError::TooLarge);
         }
+        self.flush();
         self.materialize()?;
         let bitmap = allocate(self.width, self.height)?;
+        self.frozen = None;
         self.layers.push(CanvasLayer {
             bitmap: std::mem::replace(&mut self.bitmap, bitmap),
             state: self.state.clone(),
@@ -1047,6 +1084,7 @@ impl CanvasSurface {
         let source = std::mem::replace(&mut self.bitmap, layer.bitmap);
         self.saved.truncate(layer.saved_depth);
         self.state = layer.state;
+        self.frozen = None;
         if let (Some(target), Some(source)) = (&mut self.bitmap, source) {
             let paint = tiny_skia::PixmapPaint {
                 opacity: self.state.alpha,
@@ -1054,17 +1092,40 @@ impl CanvasSurface {
                 quality: FilterQuality::Nearest,
             };
             target.draw_pixmap(0, 0, source.as_ref(), &paint,
-                Transform::identity(), self.state.clip.as_ref());
+                Transform::identity(), self.state.clip.as_deref());
         }
         self.changed();
         Some(layer.saved_depth)
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) -> Result<(), ImageError> {
-        self.rect(x, y, width, height, false)
+        if !self.recording() {
+            return self.rect(x, y, width, height, false);
+        }
+        if let Some(rect) = rectangle(x, y, width, height) {
+            if self.opaque_fill_covers_canvas(rect) {
+                self.discard_recording(record::Discard::Overdraw);
+            }
+            self.push(record::OpKind::FillRect(rect), 0);
+        }
+        Ok(())
     }
     pub fn clear_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
-        let _ = self.rect(x, y, width, height, true);
+        if !self.recording() {
+            let _ = self.rect(x, y, width, height, true);
+            return;
+        }
+        let Some(rect) = rectangle(x, y, width, height) else {
+            return;
+        };
+        if self.is_blank() {
+            self.changed();
+        } else if self.clear_covers_canvas(rect) {
+            self.discard_recording(record::Discard::Overdraw);
+            self.changed();
+        } else {
+            self.push(record::OpKind::ClearRect(rect), 0);
+        }
     }
 
     /// Draw an RGBA image into the destination rectangle using the current
@@ -1077,6 +1138,7 @@ impl CanvasSurface {
         width: f32,
         height: f32,
     ) -> Result<(), ImageError> {
+        self.flush();
         self.draw_image_legacy_impl(image, x, y, width, height)
     }
 
@@ -1092,6 +1154,7 @@ impl CanvasSurface {
         height: f32,
         premultiply_alpha: bool,
     ) -> Result<(), ImageError> {
+        self.flush();
         if premultiply_alpha {
             return self.draw_image_legacy_impl(image, x, y, width, height);
         }
@@ -1138,54 +1201,12 @@ impl CanvasSurface {
         if premultiply_alpha {
             return self.draw_image_crop(image, sx, sy, sw, sh, dx, dy, dw, dh);
         }
-        if ![sx, sy, sw, sh, dx, dy, dw, dh]
-            .iter()
-            .all(|value| value.is_finite())
-        {
+        self.flush();
+        let Some(geometry) = crop_geometry(image.width, image.height, [sx, sy, sw, sh, dx, dy, dw, dh]) else {
             return Ok(());
-        }
-        if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
-            return Ok(());
-        }
-        let left = sx.min(sx + sw).max(0.0);
-        let top = sy.min(sy + sh).max(0.0);
-        let right = sx.max(sx + sw).min(image.width as f32);
-        let bottom = sy.max(sy + sh).min(image.height as f32);
-        if right <= left || bottom <= top {
-            return Ok(());
-        }
-        let x0 = left.floor() as u32;
-        let y0 = top.floor() as u32;
-        let x1 = right.ceil().min(image.width as f32) as u32;
-        let y1 = bottom.ceil().min(image.height as f32) as u32;
-        let crop_width = x1 - x0;
-        let crop_height = y1 - y0;
-        let mut crop = Rgba8Image {
-            width: crop_width,
-            height: crop_height,
-            pixels: vec![0; pixel_bytes(crop_width, crop_height)?],
         };
-        for row in 0..crop_height {
-            let source = ((y0 + row) as usize * image.width as usize + x0 as usize) * 4;
-            let destination = row as usize * crop_width as usize * 4;
-            let bytes = crop_width as usize * 4;
-            crop.pixels[destination..destination + bytes]
-                .copy_from_slice(&image.pixels[source..source + bytes]);
-        }
-        let source_width = sw.abs();
-        let source_height = sh.abs();
-        let left_ratio = ((left - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
-        let top_ratio = ((top - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
-        let right_ratio = ((right - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
-        let bottom_ratio = ((bottom - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
-        self.draw_image_with_alpha_behavior(
-            &crop,
-            dx + dw * left_ratio,
-            dy + dh * top_ratio,
-            dw * (right_ratio - left_ratio),
-            dh * (bottom_ratio - top_ratio),
-            false,
-        )
+        let crop = crop_pixels(image, &geometry)?;
+        self.draw_image_with_alpha_behavior(&crop, geometry.dx, geometry.dy, geometry.dw, geometry.dh, false)
     }
 
     fn draw_image_legacy_impl(
@@ -1270,7 +1291,7 @@ impl CanvasSurface {
                 source.as_ref(),
                 &paint,
                 destination_transform(transform),
-                self.state.clip.as_ref(),
+                self.state.clip.as_deref(),
             );
             self.changed();
         }
@@ -1292,56 +1313,22 @@ impl CanvasSurface {
         dw: f32,
         dh: f32,
     ) -> Result<(), ImageError> {
-        if ![sx, sy, sw, sh, dx, dy, dw, dh]
-            .iter()
-            .all(|v| v.is_finite())
-        {
-            return Ok(());
-        }
-        if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
+        self.flush();
+        self.draw_image_crop_now(image, [sx, sy, sw, sh, dx, dy, dw, dh])
+    }
+
+    fn draw_image_crop_now(&mut self, image: &Rgba8Image, rects: [f32; 8]) -> Result<(), ImageError> {
+        if !rects.iter().all(|v| v.is_finite()) || rects[2] == 0.0 || rects[3] == 0.0 || rects[6] == 0.0 || rects[7] == 0.0 {
             return Ok(());
         }
         if image.pixels.len() != pixel_bytes(image.width, image.height)? {
             return Err(ImageError::InvalidViewport);
         }
-        let left = sx.min(sx + sw).max(0.0);
-        let top = sy.min(sy + sh).max(0.0);
-        let right = sx.max(sx + sw).min(image.width as f32);
-        let bottom = sy.max(sy + sh).min(image.height as f32);
-        if right <= left || bottom <= top {
+        let Some(geometry) = crop_geometry(image.width, image.height, rects) else {
             return Ok(());
-        }
-        let x0 = left.floor() as u32;
-        let y0 = top.floor() as u32;
-        let x1 = right.ceil().min(image.width as f32) as u32;
-        let y1 = bottom.ceil().min(image.height as f32) as u32;
-        let crop_width = x1 - x0;
-        let crop_height = y1 - y0;
-        let mut crop = Rgba8Image {
-            width: crop_width,
-            height: crop_height,
-            pixels: vec![0; pixel_bytes(crop_width, crop_height)?],
         };
-        for row in 0..crop_height {
-            let source = ((y0 + row) as usize * image.width as usize + x0 as usize) * 4;
-            let destination = row as usize * crop_width as usize * 4;
-            let bytes = crop_width as usize * 4;
-            crop.pixels[destination..destination + bytes]
-                .copy_from_slice(&image.pixels[source..source + bytes]);
-        }
-        let source_width = sw.abs();
-        let source_height = sh.abs();
-        let left_ratio = ((left - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
-        let top_ratio = ((top - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
-        let right_ratio = ((right - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
-        let bottom_ratio = ((bottom - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
-        self.draw_image(
-            &crop,
-            dx + dw * left_ratio,
-            dy + dh * top_ratio,
-            dw * (right_ratio - left_ratio),
-            dh * (bottom_ratio - top_ratio),
-        )
+        let crop = crop_pixels(image, &geometry)?;
+        self.draw_image_legacy_impl(&crop, geometry.dx, geometry.dy, geometry.dw, geometry.dh)
     }
 
     /// Shapes and rasterizes one Canvas text run through the shared font
@@ -1360,6 +1347,7 @@ impl CanvasSurface {
         max_width: Option<f32>,
         options: &CanvasTextOptions,
     ) -> Result<f32, ImageError> {
+        self.flush();
         if !x.is_finite() || !baseline_y.is_finite() || !size.is_finite() || size <= 0.0 {
             return Ok(0.0);
         }
@@ -1538,7 +1526,7 @@ impl CanvasSurface {
                 + local_x as usize;
             mask.data_mut()[canvas_index] = pixel.alpha();
         }
-        if let Some(clip) = pattern_clip.as_ref().or(self.state.clip.as_ref()) {
+        if let Some(clip) = pattern_clip.as_ref().or(self.state.clip.as_deref()) {
             for (coverage, clip_coverage) in mask.data_mut().iter_mut().zip(clip.data()) {
                 *coverage = ((*coverage as u16 * *clip_coverage as u16 + 127) / 255) as u8;
             }
@@ -1568,6 +1556,7 @@ impl CanvasSurface {
         max_width: Option<f32>,
         options: &CanvasTextOptions,
     ) -> Result<f32, ImageError> {
+        self.flush();
         if !origin_x.is_finite() || !baseline_y.is_finite() || !size.is_finite() || size <= 0.0 {
             return Ok(0.0);
         }
@@ -1691,7 +1680,7 @@ impl CanvasSurface {
                 &paint,
                 &self.state.line,
                 transform,
-                pattern_clip.as_ref().or(self.state.clip.as_ref()),
+                pattern_clip.as_ref().or(self.state.clip.as_deref()),
             );
             self.changed();
         }
@@ -1721,7 +1710,7 @@ impl CanvasSurface {
         let Some(rect) = rectangle(x, y, width, height) else {
             return Ok(());
         };
-        if clear && self.lazy {
+        if clear && self.lazy && self.alias.is_none() {
             self.changed();
             return Ok(());
         }
@@ -1785,7 +1774,7 @@ impl CanvasSurface {
                 rect,
                 &paint,
                 self.state.transform,
-                pattern_clip.as_ref().or(self.state.clip.as_ref()),
+                pattern_clip.as_ref().or(self.state.clip.as_deref()),
             );
             self.changed();
         }
@@ -1793,6 +1782,22 @@ impl CanvasSurface {
     }
 
     pub fn fill_path(&mut self, path: &Path, rule: FillRule) -> Result<(), ImageError> {
+        if self.recording() {
+            self.push(record::OpKind::FillPath(path.clone(), rule), record::path_bytes(path));
+            return Ok(());
+        }
+        self.fill_path_now(path, rule)
+    }
+
+    pub fn stroke_path(&mut self, path: &Path) -> Result<(), ImageError> {
+        if self.recording() {
+            self.push(record::OpKind::StrokePath(path.clone()), record::path_bytes(path));
+            return Ok(());
+        }
+        self.stroke_path_now(path)
+    }
+
+    fn fill_path_now(&mut self, path: &Path, rule: FillRule) -> Result<(), ImageError> {
         self.materialize()?;
         let gradient_image = self
             .state
@@ -1836,15 +1841,16 @@ impl CanvasSurface {
                 &paint,
                 rule,
                 self.state.transform,
-                pattern_clip.as_ref().or(self.state.clip.as_ref()),
+                pattern_clip.as_ref().or(self.state.clip.as_deref()),
             );
             self.changed();
         }
         Ok(())
     }
-    pub(crate) fn clip_alpha(&self)->Option<&[u8]> {self.state.clip.as_ref().map(Mask::data)}
+    pub(crate) fn clip_alpha(&self)->Option<&[u8]> {self.state.clip.as_deref().map(Mask::data)}
 
     pub(crate) fn source_path_bounded(&mut self,path:&Path,rule:FillRule,stroke:bool,max_bytes:usize)->Result<(),ImageError> {
+        self.flush();
         if self.state.shadow_color[3]!=0 || self.state.fill_pattern.is_some() || self.state.stroke_pattern.is_some() {return Err(ImageError::InvalidViewport);}
         self.materialize()?;
         let gradient=if stroke{self.state.stroke_gradient.as_ref()}else{self.state.fill_gradient.as_ref()};
@@ -1853,13 +1859,13 @@ impl CanvasSurface {
         let paint=Self::paint_with_budget(self.state.blend,self.state.alpha,if stroke{self.state.stroke}else{self.state.fill},gradient,None,self.state.transform,custom.as_ref(),Some(remaining))?;
         let remaining=remaining.checked_sub(paint.shader.allocated_bytes()).ok_or(ImageError::TooLarge)?;
         if let Some(bitmap)=&mut self.bitmap {
-            if stroke {bitmap.stroke_path_bounded(path,&paint,&self.state.line,self.state.transform,self.state.clip.as_ref(),remaining).map_err(|_|ImageError::TooLarge)?;}
-            else{bitmap.fill_path_bounded(path,&paint,rule,self.state.transform,self.state.clip.as_ref(),remaining).map_err(|_|ImageError::TooLarge)?;}
+            if stroke {bitmap.stroke_path_bounded(path,&paint,&self.state.line,self.state.transform,self.state.clip.as_deref(),remaining).map_err(|_|ImageError::TooLarge)?;}
+            else{bitmap.fill_path_bounded(path,&paint,rule,self.state.transform,self.state.clip.as_deref(),remaining).map_err(|_|ImageError::TooLarge)?;}
         }
         drop(paint);self.changed();Ok(())
     }
 
-    pub fn stroke_path(&mut self, path: &Path) -> Result<(), ImageError> {
+    fn stroke_path_now(&mut self, path: &Path) -> Result<(), ImageError> {
         self.materialize()?;
         let gradient_image = self
             .state
@@ -1922,18 +1928,19 @@ impl CanvasSurface {
                 &paint,
                 &self.state.line,
                 self.state.transform,
-                pattern_clip.as_ref().or(self.state.clip.as_ref()),
+                pattern_clip.as_ref().or(self.state.clip.as_deref()),
             );
             self.changed();
         }
         Ok(())
     }
     pub fn clip_path(&mut self, path: &Path, rule: FillRule) {
+        self.frozen = None;
         if let Some(clip) = &mut self.state.clip {
-            clip.intersect_path(path, rule, true, self.state.transform);
+            std::sync::Arc::make_mut(clip).intersect_path(path, rule, true, self.state.transform);
         } else if let Some(mut clip) = Mask::new(self.width, self.height) {
             clip.fill_path(path, rule, true, self.state.transform);
-            self.state.clip = Some(clip);
+            self.state.clip = Some(std::sync::Arc::new(clip));
         }
     }
 
@@ -1977,12 +1984,14 @@ impl CanvasSurface {
         } else {
             union
         };
-        self.state.clip = Some(combined);
+        self.frozen = None;
+        self.state.clip = Some(std::sync::Arc::new(combined));
         Ok(())
     }
 
     /// Snapshot in the straight-alpha format used by ImageData and HTML images.
-    pub fn snapshot(&self) -> Rgba8Image {
+    pub fn snapshot(&mut self) -> Rgba8Image {
+        self.flush();
         let mut pixels = Vec::new();
         let published = self.layers.first().map_or(&self.bitmap, |layer| &layer.bitmap);
         if let Some(bitmap) = published {
@@ -1995,8 +2004,15 @@ impl CanvasSurface {
                 pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
             }
         } else if self.lazy {
+            let aliased = self.alias.as_ref().and_then(CanvasSource::pixels);
             pixels.reserve_exact(self.width as usize * self.height as usize * 4);
-            pixels.resize(self.width as usize * self.height as usize * 4, 0);
+            match aliased {
+                Some(image) if image.width == self.width && image.height == self.height => {
+                    record::count_alias_read();
+                    pixels.extend(image.pixels.chunks_exact(4).flat_map(stored_pixel));
+                }
+                _ => pixels.resize(self.width as usize * self.height as usize * 4, 0),
+            }
         }
         Rgba8Image {
             width: self.width,
@@ -2008,24 +2024,25 @@ impl CanvasSurface {
     /// Clears the bitmap for `transferToImageBitmap` without resetting the
     /// context's drawing state.
     pub fn clear_bitmap(&mut self) {
-        if self.lazy {
-            self.changed();
+        self.discard_recording(record::Discard::Cleared);
+        if self.bitmap.is_some() {
+            self.bitmap = None;
+            self.lazy = self.width != 0 && self.height != 0;
         }
-        if let Some(bitmap) = &mut self.bitmap {
-            bitmap.fill(Color::TRANSPARENT);
-            self.changed();
-        }
+        self.alias = None;
+        self.changed();
     }
 
     /// Pixel reads bypass the transform and clip. Samples outside the bitmap
     /// are transparent black, as required by ImageData readback.
     pub fn read_pixels(
-        &self,
+        &mut self,
         x: i64,
         y: i64,
         width: u32,
         height: u32,
     ) -> Result<Rgba8Image, ImageError> {
+        self.flush();
         let bytes = pixel_bytes(width, height)?;
         let mut pixels = Vec::new();
         pixels
@@ -2037,7 +2054,29 @@ impl CanvasSurface {
             height,
             pixels,
         };
-        if let Some(bitmap) = &self.bitmap {
+        let aliased = if self.bitmap.is_none() && self.lazy {
+            self.alias
+                .as_ref()
+                .and_then(CanvasSource::pixels)
+                .filter(|image| image.width == self.width && image.height == self.height)
+        } else {
+            None
+        };
+        if let Some(image) = aliased {
+            record::count_alias_read();
+            for row in 0..height {
+                for col in 0..width {
+                    let sx = x.saturating_add(i64::from(col));
+                    let sy = y.saturating_add(i64::from(row));
+                    if sx < 0 || sy < 0 || sx >= i64::from(self.width) || sy >= i64::from(self.height) {
+                        continue;
+                    }
+                    let source = (sy as usize * self.width as usize + sx as usize) * 4;
+                    let offset = (row as usize * width as usize + col as usize) * 4;
+                    output.pixels[offset..offset + 4].copy_from_slice(&stored_pixel(&image.pixels[source..source + 4]));
+                }
+            }
+        } else if let Some(bitmap) = &self.bitmap {
             for row in 0..height {
                 for col in 0..width {
                     let sx = x.saturating_add(i64::from(col));
@@ -2080,6 +2119,20 @@ impl CanvasSurface {
     /// Copy a source rectangle directly, without compositing, transform, or clip.
     /// The source and destination are clipped without allocating intermediate pixels.
     pub fn write_pixels_region(
+        &mut self,
+        image: &Rgba8Image,
+        destination_x: i64,
+        destination_y: i64,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ImageError> {
+        self.flush();
+        self.write_pixels_region_now(image, destination_x, destination_y, source_x, source_y, width, height)
+    }
+
+    fn write_pixels_region_now(
         &mut self,
         image: &Rgba8Image,
         destination_x: i64,
@@ -2274,17 +2327,98 @@ impl CanvasSurface {
     }
 }
 
+/// The part of a source image a nine-argument `drawImage` reads, and where it lands: the crop is
+/// clipped to the image and the destination shrinks by the same proportions.
+struct CropGeometry {
+    x0: u32,
+    y0: u32,
+    width: u32,
+    height: u32,
+    dx: f32,
+    dy: f32,
+    dw: f32,
+    dh: f32,
+}
+
+fn crop_geometry(image_width: u32, image_height: u32, rects: [f32; 8]) -> Option<CropGeometry> {
+    let [sx, sy, sw, sh, dx, dy, dw, dh] = rects;
+    if !rects.iter().all(|value| value.is_finite()) || sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
+        return None;
+    }
+    let left = sx.min(sx + sw).max(0.0);
+    let top = sy.min(sy + sh).max(0.0);
+    let right = sx.max(sx + sw).min(image_width as f32);
+    let bottom = sy.max(sy + sh).min(image_height as f32);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let x0 = left.floor() as u32;
+    let y0 = top.floor() as u32;
+    let x1 = right.ceil().min(image_width as f32) as u32;
+    let y1 = bottom.ceil().min(image_height as f32) as u32;
+    let source_width = sw.abs();
+    let source_height = sh.abs();
+    let left_ratio = ((left - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
+    let top_ratio = ((top - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
+    let right_ratio = ((right - sx.min(sx + sw)) / source_width).clamp(0.0, 1.0);
+    let bottom_ratio = ((bottom - sy.min(sy + sh)) / source_height).clamp(0.0, 1.0);
+    Some(CropGeometry {
+        x0,
+        y0,
+        width: x1 - x0,
+        height: y1 - y0,
+        dx: dx + dw * left_ratio,
+        dy: dy + dh * top_ratio,
+        dw: dw * (right_ratio - left_ratio),
+        dh: dh * (bottom_ratio - top_ratio),
+    })
+}
+
+fn crop_pixels(image: &Rgba8Image, geometry: &CropGeometry) -> Result<Rgba8Image, ImageError> {
+    let mut crop = Rgba8Image {
+        width: geometry.width,
+        height: geometry.height,
+        pixels: vec![0; pixel_bytes(geometry.width, geometry.height)?],
+    };
+    let bytes = geometry.width as usize * 4;
+    for row in 0..geometry.height {
+        let source = ((geometry.y0 + row) as usize * image.width as usize + geometry.x0 as usize) * 4;
+        let destination = row as usize * bytes;
+        crop.pixels[destination..destination + bytes].copy_from_slice(&image.pixels[source..source + bytes]);
+    }
+    Ok(crop)
+}
+
+/// What a canvas reads back for a straight-alpha pixel it was given: the pixel as stored
+/// premultiplied, then demultiplied again.
+fn stored_pixel(pixel: &[u8]) -> [u8; 4] {
+    let alpha = pixel[3];
+    let premultiplied = tiny_skia::PremultipliedColorU8::from_rgba(
+        premultiply_channel(pixel[0], alpha),
+        premultiply_channel(pixel[1], alpha),
+        premultiply_channel(pixel[2], alpha),
+        alpha,
+    );
+    premultiplied.map_or([0; 4], |color| {
+        let color = color.demultiply();
+        [color.red(), color.green(), color.blue(), color.alpha()]
+    })
+}
+
+fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
+    ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
+}
+
 fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
     if image.pixels.len() != pixel_bytes(image.width, image.height)? {
         return Err(ImageError::InvalidViewport);
     }
     let mut premultiplied = Vec::with_capacity(image.pixels.len());
     for pixel in image.pixels.chunks_exact(4) {
-        let alpha = u16::from(pixel[3]);
         premultiplied.extend_from_slice(&[
-            ((u16::from(pixel[0]) * alpha + 127) / 255) as u8,
-            ((u16::from(pixel[1]) * alpha + 127) / 255) as u8,
-            ((u16::from(pixel[2]) * alpha + 127) / 255) as u8,
+            premultiply_channel(pixel[0], pixel[3]),
+            premultiply_channel(pixel[1], pixel[3]),
+            premultiply_channel(pixel[2], pixel[3]),
             pixel[3],
         ]);
     }
@@ -2325,6 +2459,9 @@ fn rectangle(x: f32, y: f32, width: f32, height: f32) -> Option<Rect> {
         height.abs(),
     )
 }
+
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod tests {
