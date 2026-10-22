@@ -791,9 +791,28 @@ impl DomRealm {
     }
     pub fn stylesheet_resources_pending(&self) -> bool { self.stylesheet_links.pending() }
 
+    /// Whether `queue_stylesheet_tasks` would find nothing to do: no dirty owners, no outstanding
+    /// or completed loads, no import occurrences, no deferred parser or lifecycle continuation.
+    fn stylesheet_work_idle(&self) -> bool {
+        let links = &self.stylesheet_links;
+        !links.processing_failed.get()
+            && !links.scan.get()
+            && !links.flags_dirty.get()
+            && !links.deferred_complete.get()
+            && !links.deferred_load.get()
+            && links.parser_script.get().is_none()
+            && links.dirty.borrow().is_empty()
+            && links.import_dirty.borrow().is_empty()
+            && links.imports.borrow().is_empty()
+            && links.speculative.stylesheets.borrow().is_empty()
+            && !self.csp.borrow().has_pending_inline_attributes()
+            && links.entries.borrow().values().all(|entry| entry.pending.is_none() && entry.ready.is_none())
+    }
+
     /// Run preparation and consume completions on the owning main thread. No
     /// session borrow crosses provider admission, task admission or author code.
     pub fn queue_stylesheet_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
+        if self.stylesheet_work_idle() {return Ok(0)}
         self.queue_style_attribute_violations(ctx)?;
         if self.stylesheet_links.processing_failed.replace(false) {return Err(OpError::new("QuotaExceededError","inline stylesheet processing admission"))}
         let provider = self.stylesheet_links.provider.borrow().clone();
@@ -1632,6 +1651,35 @@ mod tests {
         provider.ready.borrow_mut().insert(4,Err(StylesheetFailure{message:"wrong response MIME".into(),violations:Vec::new(),timings:Vec::new()}));
         turn(&mut engine,&realm);
         check(&mut engine,"if(link.sheet!==null||events.join()!=='load,load,error')throw Error('failed replacement completion');true");
+        assert!(!realm.stylesheet_resources_pending());
+    }
+    #[test]
+    fn idle_stylesheet_turn_is_noop_and_new_work_is_still_queued() {
+        let mut engine=Engine::new();let realm=crate::install(engine.ctx(),"<!doctype html><body></body>",128).unwrap();
+        realm.set_document_url("https://styles.test/page");let provider=Rc::new(ManualProvider::default());realm.set_stylesheet_resource_loader(provider.clone());
+        turn(&mut engine,&realm);
+        assert!(realm.stylesheet_work_idle());
+        assert_eq!(realm.queue_stylesheet_tasks(engine.ctx()).unwrap(),0);
+        assert!(provider.requests.borrow().is_empty());
+        check(&mut engine,"globalThis.link=document.createElement('link');link.rel='stylesheet';link.href='/late.css';document.head.append(link);globalThis.loaded=false;link.onload=()=>loaded=true;true");
+        assert!(!realm.stylesheet_work_idle());
+        turn(&mut engine,&realm);
+        assert_eq!(provider.requests.borrow().len(),1);
+        assert!(!realm.stylesheet_work_idle(),"outstanding load keeps the turn active");
+        provider.complete(1,"p{color:green}");
+        turn(&mut engine,&realm);
+        check(&mut engine,"if(!loaded||!link.sheet)throw Error('late link did not complete');true");
+        turn(&mut engine,&realm);
+        assert!(realm.stylesheet_work_idle());
+        check(&mut engine,"globalThis.inline=document.createElement('style');inline.textContent='@import url(/imported.css); p{color:red}';document.head.append(inline);true");
+        assert!(!realm.stylesheet_work_idle());
+        turn(&mut engine,&realm);
+        assert_eq!(provider.requests.borrow().len(),2,"inline sheet import is requested after an idle period");
+        assert!(!realm.stylesheet_work_idle());
+        provider.complete(2,"p{color:blue}");
+        turn(&mut engine,&realm);
+        turn(&mut engine,&realm);
+        assert_eq!(provider.requests.borrow().len(),2);
         assert!(!realm.stylesheet_resources_pending());
     }
     #[test]

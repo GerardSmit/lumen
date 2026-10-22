@@ -1220,6 +1220,10 @@ pub struct Interp {
     /// Embedder host state (typed slots + resource table); see [`crate::host`]. Reached from
     /// native fns via [`Interp::op_state`] — the only way, since `NativeFn` cannot capture.
     pub(crate) host_state: crate::host::OpState,
+    /// Jobs native mutation sinks enqueued without borrowing the interpreter; see
+    /// [`Interp::deferred_microtasks`].
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    pub(crate) deferred_microtask_queue: Option<Rc<RefCell<Vec<Value>>>>,
     /// Live generator coroutines, keyed by the generator object's pointer. Each owns an OS thread
     /// that runs the body and parks at every `yield` (see [`crate::coroutine`]).
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
@@ -1540,6 +1544,51 @@ pub struct RealmState {
     pub collectable: bool,
     /// Realm was created through the native host realm API and can be retired there.
     pub host_managed: bool,
+}
+
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+fn same_proto_map(
+    a: &crate::fasthash::FastMap<&'static str, Gc>,
+    b: &crate::fasthash::FastMap<&'static str, Gc>,
+) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|((ka, va), (kb, vb))| ka == kb && Gc::ptr_eq(va, vb))
+}
+
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
+fn same_opt_gc(a: &Option<Gc>, b: &Option<Gc>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Gc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl RealmState {
+    /// Whether the active realm's intrinsics are exactly what this snapshot holds.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    pub(crate) fn matches_active(&self, it: &Interp) -> bool {
+        let this_same = match (&self.global_this, &it.global_this) {
+            (Value::Obj(a), Value::Obj(b)) => Gc::ptr_eq(a, b),
+            _ => false,
+        };
+        this_same
+            && Gc::ptr_eq(&self.global, &it.global)
+            && Rc::ptr_eq(&self.global_env, &it.global_env)
+            && Gc::ptr_eq(&self.object_proto, &it.object_proto)
+            && Gc::ptr_eq(&self.function_proto, &it.function_proto)
+            && Gc::ptr_eq(&self.array_proto, &it.array_proto)
+            && Gc::ptr_eq(&self.string_proto, &it.string_proto)
+            && Gc::ptr_eq(&self.number_proto, &it.number_proto)
+            && Gc::ptr_eq(&self.boolean_proto, &it.boolean_proto)
+            && Gc::ptr_eq(&self.symbol_proto, &it.symbol_proto)
+            && same_opt_gc(&self.eval_fn, &it.eval_fn)
+            && same_opt_gc(&self.global_proxy, &it.global_proxy)
+            && same_proto_map(&self.error_protos, &it.error_protos)
+            && same_proto_map(&self.extra_protos, &it.extra_protos)
+    }
 }
 
 impl Interp {
@@ -2105,6 +2154,7 @@ impl Interp {
             microtasks: std::collections::VecDeque::new(),
             async_context: Value::Undefined,
             host_state: Default::default(),
+            deferred_microtask_queue: None,
             generators: Default::default(),
             gc_next: GC_TRIGGER,
             gc_tick: 0,

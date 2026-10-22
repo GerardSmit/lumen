@@ -2173,14 +2173,14 @@ impl OpError {
     }
 }
 
-struct DeferredMicrotasks(Rc<RefCell<Vec<Value>>>);
-
 pub(crate) fn flush_deferred_microtasks(ctx: &mut Interp) {
-    let pending = ctx
-        .host_state
-        .get::<DeferredMicrotasks>()
-        .map(|queue| std::mem::take(&mut *queue.0.borrow_mut()))
-        .unwrap_or_default();
+    let Some(queue) = &ctx.deferred_microtask_queue else {
+        return;
+    };
+    if queue.borrow().is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut *queue.borrow_mut());
     for callback in pending {
         ctx.queue_microtask(callback);
     }
@@ -2189,14 +2189,8 @@ pub(crate) fn flush_deferred_microtasks(ctx: &mut Interp) {
 impl Interp {
     /// Native mutation sinks can enqueue jobs without borrowing the interpreter.
     pub fn deferred_microtasks(&mut self) -> Rc<RefCell<Vec<Value>>> {
-        if !self.host_state.has::<DeferredMicrotasks>() {
-            self.host_state
-                .put(DeferredMicrotasks(Rc::new(RefCell::new(Vec::new()))));
-        }
-        self.host_state
-            .get::<DeferredMicrotasks>()
-            .unwrap()
-            .0
+        self.deferred_microtask_queue
+            .get_or_insert_with(|| Rc::new(RefCell::new(Vec::new())))
             .clone()
     }
 }

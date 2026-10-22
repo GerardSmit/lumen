@@ -523,12 +523,17 @@ impl Interp {
             .as_obj()
             .map(|object| Gc::as_ptr(object) as usize)
             .expect("active realm has an object global");
-        let mut snapshot = self.snapshot_realm();
-        if let Some(previous) = self.realms.get(&key) {
-            snapshot.collectable = previous.collectable;
-            snapshot.host_managed = previous.host_managed;
+        match self.realms.get(&key) {
+            Some(previous) if previous.matches_active(self) => {}
+            previous => {
+                let mut snapshot = self.snapshot_realm();
+                if let Some(previous) = previous {
+                    snapshot.collectable = previous.collectable;
+                    snapshot.host_managed = previous.host_managed;
+                }
+                self.realms.insert(key, snapshot);
+            }
         }
-        self.realms.insert(key, snapshot);
         RealmHandle { owner, global, key }
     }
 
@@ -1361,6 +1366,62 @@ mod tests {
         engine.run_microtasks();
         engine.collect_garbage();
         assert!(weak.upgrade().is_none(),"released namespace and cancelled requests cannot pin retired settings");
+    }
+
+    #[test]
+    fn current_host_realm_skips_snapshot_while_unchanged_and_resnapshots_on_change() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        let first = ctx.current_host_realm();
+        let key = first.key;
+        let stored = Rc::as_ptr(&ctx.global_env);
+        assert!(ctx.realms.get(&key).expect("registered").matches_active(ctx));
+        let second = ctx.current_host_realm();
+        assert!(first.same_realm(&second));
+        assert!(Rc::ptr_eq(&ctx.realms.get(&key).unwrap().global_env, &ctx.global_env));
+        assert_eq!(Rc::as_ptr(&ctx.global_env), stored);
+
+        let proto = ctx.object_proto.clone();
+        ctx.extra_protos.insert("CurrentRealmProbe", proto);
+        assert!(!ctx.realms.get(&key).unwrap().matches_active(ctx));
+        ctx.current_host_realm();
+        assert!(ctx.realms.get(&key).unwrap().extra_protos.contains_key("CurrentRealmProbe"));
+        assert!(ctx.realms.get(&key).unwrap().matches_active(ctx));
+    }
+
+    #[test]
+    fn current_host_realm_in_retired_realm_keeps_retirement_flags() {
+        let mut engine = Engine::new();
+        let child = engine.ctx().create_host_realm();
+        let inside = engine.ctx().with_host_realm(&child, |ctx| ctx.current_host_realm()).expect("enter child");
+        assert!(inside.same_realm(&child));
+        engine.ctx().dispose_host_realm(&child).expect("retire child");
+        let again = engine.ctx().with_host_realm(&child, |ctx| {
+            let handle = ctx.current_host_realm();
+            let state = ctx.realms.get(&handle.key).expect("retired realm stays registered while live");
+            (handle, state.collectable, state.host_managed)
+        }).expect("retained retired realm");
+        assert!(again.0.same_realm(&child));
+        assert!(again.1 && again.2, "retired realm stays collectable and host managed");
+        let main = engine.ctx().current_host_realm();
+        assert!(!main.same_realm(&child));
+        assert!(!engine.ctx().realms.get(&main.key).unwrap().collectable);
+    }
+
+    #[test]
+    fn deferred_microtasks_flush_runs_queued_callbacks_and_empty_flush_is_noop() {
+        let mut engine = Engine::new();
+        engine.ctx().drain_microtasks_for_host();
+        let queue = engine.ctx().deferred_microtasks();
+        assert!(Rc::ptr_eq(&queue, &engine.ctx().deferred_microtasks()));
+        let callback = engine.eval_value("globalThis.deferredRan = 0; () => { globalThis.deferredRan++; }")
+            .expect("parses").ok().expect("evaluates");
+        queue.borrow_mut().push(callback);
+        engine.ctx().drain_microtasks_for_host();
+        assert!(queue.borrow().is_empty());
+        assert!(matches!(engine.eval_value("deferredRan"), Ok(Ok(Value::Num(1.0)))));
+        engine.ctx().drain_microtasks_for_host();
+        assert!(matches!(engine.eval_value("deferredRan"), Ok(Ok(Value::Num(1.0)))));
     }
 
     #[test]

@@ -360,6 +360,7 @@ pub(crate) fn start(
     ctx.with_instance::<DomViewTransition, _>(&wrapper, |transition| {
         transition.state.borrow_mut().owner = Some(Rc::downgrade(document));
     })?;
+    document.view_transition_started.set(true);
     let owner = document.document_value(ctx);
     let active = slot(ctx, &owner, ACTIVE)?;
     if active.as_obj().is_some() {
@@ -594,6 +595,9 @@ fn overlay(document: &Rc<DomRealm>, image: Arc<ReservedImageData>) {
 /// HTML pending-transition operations run after the ordinary style/layout
 /// update. Capture providers deliberately exclude this presentation overlay.
 pub(crate) fn rendering_checkpoint(ctx: &mut Ctx, document: &Rc<DomRealm>) -> OpResult<()> {
+    if !document.view_transition_started.get() {
+        return Ok(());
+    }
     let document_wrapper = document.document_value(ctx);
     let wrapper = slot(ctx, &document_wrapper, ACTIVE)?;
     if wrapper.as_obj().is_none() {
@@ -1129,6 +1133,18 @@ mod tests {
                     .unwrap_or_else(|_| "unprintable thrown value".into());
                 panic!("view-transition evaluation failed: {message}");
             })
+    }
+
+    #[test]
+    fn rendering_checkpoint_is_skipped_until_a_transition_starts() {
+        let mut engine = lumen::Engine::new();
+        let realm = crate::install(engine.ctx(), "<body><div id=target></div></body>", 128).unwrap();
+        assert!(!realm.view_transition_started.get());
+        realm.update_rendered_focus(engine.ctx()).unwrap();
+        assert!(!realm.view_transition_started.get());
+        evaluate(&mut engine, "globalThis.t = document.startViewTransition(() => {}); t.ready.catch(() => {}); t.finished.catch(() => {}); t");
+        assert!(realm.view_transition_started.get());
+        realm.update_rendered_focus(engine.ctx()).unwrap();
     }
 
     fn viewport(engine: &mut lumen::Engine) -> (Rc<DomRealm>, Rc<lumen_html_text::FontFace>) {

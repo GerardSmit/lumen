@@ -129,7 +129,9 @@ pub(crate) struct ViewRegistry {
     roots: std::cell::RefCell<crate::fasthash::FastMap<usize, Root>>,
     native_stacks: Cell<usize>,
     generation: Cell<u32>,
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     scanned: Cell<u32>,
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     skipped: Cell<u32>,
 }
 impl ViewRegistry {
@@ -172,10 +174,12 @@ fn bump_generation() {
     });
 }
 
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 const RESCAN_EVERY: u32 = 32;
 
 /// Whether a compaction scan is worth its cost: the registry changed since the last one, or
 /// enough calls passed that a root may have become eligible through plain string drops.
+#[cfg_attr(not(feature = "embed"), allow(dead_code))]
 pub(crate) fn scan_due() -> bool {
     ROOTS.with(|state| {
         let s = state.borrow();

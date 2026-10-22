@@ -14,6 +14,9 @@ struct PendingInlineAttribute {
     violations: Vec<Violation>,
     lease: ByteLease,
 }
+impl State {
+    pub(crate) fn has_pending_inline_attributes(&self) -> bool { !self.inline_attributes.is_empty() }
+}
 impl Default for State {
     fn default() -> Self {
         Self { policies: Default::default(), meta: Default::default(), inline_attributes: Vec::new(),

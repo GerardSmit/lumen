@@ -904,6 +904,7 @@ pub struct DomRealm {
     focused: Cell<Option<NodeId>>,
     focus_visible: Cell<Option<NodeId>>,
     rendered_focus_epoch: Cell<Option<(NodeId, u64, u64, u64)>>,
+    pub(crate) view_transition_started: Cell<bool>,
     hover_target: Cell<Option<NodeId>>,
     active_targets: Cell<[Option<NodeId>; 2]>,
     keyboard_modality: Cell<bool>,
@@ -13913,6 +13914,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             focused: Cell::new(None),
             focus_visible: Cell::new(None),
             rendered_focus_epoch: Cell::new(None),
+            view_transition_started: Cell::new(false),
             hover_target: Cell::new(None),
             active_targets: Cell::new([None, None]),
             // Before a pointing-device interaction, programmatic focus follows

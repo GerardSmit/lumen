@@ -222,6 +222,10 @@ pub(crate) fn install(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
 pub(crate) fn update(ctx:&mut Ctx,realm:&Rc<DomRealm>)->OpResult<()> {
     let Some(state)=RealmServices::<RefCell<PaintState>>::current(ctx)else{return Ok(());};
     if !state.borrow().owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm)){return Ok(());}
+    if state.borrow().definitions.is_empty() {
+        state.borrow_mut().failures.clear();
+        return Ok(());
+    }
     let requests=realm.session.borrow().paint_worklet_requests();
     state.borrow_mut().failures.retain(|request|requests.contains(request));
     let mut completed=Vec::new();
@@ -353,6 +357,27 @@ mod tests {
         }).unwrap();
         engine.ctx().drain_microtasks_for_host();
         assert!(matches!(eval(&mut engine,"loaded"),Value::Bool(true)));
+        frame(&mut engine,&realm,1016.0);
+        assert_eq!(pixel(&pixels(&realm),2,2),[0,128,0,255]);
+    }
+    #[test]
+    fn paint_worklet_update_without_definitions_is_a_noop_until_registration() {
+        let (mut engine,realm)=setup_module("await new Promise(resolve=>globalThis.resume=resolve);registerPaint('late',class{paint(ctx,size){ctx.fillStyle='green';ctx.fillRect(0,0,size.width,size.height)}})",false);
+        eval(&mut engine,"document.getElementById('target').style.backgroundImage='paint(late)'");
+        frame(&mut engine,&realm,1000.0);
+        let revision=realm.with_session(|session|session.paint_revision());
+        for _ in 0..3 {
+            update(engine.ctx(),&realm).unwrap();
+            assert_eq!(realm.with_session(|session|session.paint_revision()),revision);
+        }
+        assert!(realm.with_session(|session|!session.paint_worklet_requests().is_empty()),"unregistered painter request stays pending");
+        let scope=service(engine.ctx()).unwrap().borrow().scope.clone().unwrap();
+        engine.ctx().with_host_realm(&scope,|ctx|{
+            let global=ctx.global_object();
+            let resume=ctx.member_get(&global,"resume").unwrap_or_else(|_|panic!("resolver lookup failed"));
+            ctx.call(resume,Value::Undefined,&[]).unwrap_or_else(|_|panic!("resolver call failed"));
+        }).unwrap();
+        engine.ctx().drain_microtasks_for_host();
         frame(&mut engine,&realm,1016.0);
         assert_eq!(pixel(&pixels(&realm),2,2),[0,128,0,255]);
     }
