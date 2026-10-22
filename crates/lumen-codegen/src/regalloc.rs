@@ -326,18 +326,22 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
         }
     }
 
-    // Spill slots are shared by values whose lifetime spans are disjoint (interval colouring
-    // over `[first segment start, last segment end]`).
+    // Spill slots: a value takes the slot of a related value (a block parameter and its
+    // arguments, a copy's ends) when their segments are disjoint, which turns the edge move
+    // between two spilled values into nothing; otherwise a slot whose values all ended before
+    // it starts.
     let mut spilled: Vec<usize> = order
         .iter()
         .copied()
         .filter(|&v| matches!(locs[v], Loc::Stack(_)))
         .collect();
     spilled.sort_by_key(|&v| (segs[v][0].0, v));
+    let mut slot_segs: Vec<Vec<(u32, u32)>> = Vec::new();
+    let mut slot_end: Vec<u32> = Vec::new();
+    let mut slot_free: Vec<bool> = Vec::new();
     let mut busy: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
         std::collections::BinaryHeap::new();
     let mut free_slots: Vec<u32> = Vec::new();
-    let mut num_slots = 0u32;
     for v in spilled {
         let (start, end) = (segs[v][0].0, segs[v].last().unwrap().1);
         while let Some(&std::cmp::Reverse((e, slot))) = busy.peek() {
@@ -345,15 +349,47 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 break;
             }
             busy.pop();
-            free_slots.push(slot);
+            if slot_end[slot as usize] == e && !slot_free[slot as usize] {
+                slot_free[slot as usize] = true;
+                free_slots.push(slot);
+            }
         }
-        let slot = free_slots.pop().unwrap_or_else(|| {
-            num_slots += 1;
-            num_slots - 1
+        let fits = |list: &Vec<(u32, u32)>| {
+            segs[v].iter().all(|&(s, e)| {
+                let i = list.partition_point(|x| x.1 < s);
+                i >= list.len() || list[i].0 > e
+            })
+        };
+        let mut slot = related[v].iter().find_map(|r| match locs[r.index()] {
+            Loc::Stack(s) if s != u32::MAX && fits(&slot_segs[s as usize]) => Some(s),
+            _ => None,
         });
+        if slot.is_none() {
+            while let Some(s) = free_slots.pop() {
+                if slot_free[s as usize] {
+                    slot = Some(s);
+                    break;
+                }
+            }
+        }
+        let slot = slot.unwrap_or_else(|| {
+            slot_segs.push(Vec::new());
+            slot_end.push(0);
+            slot_free.push(false);
+            slot_segs.len() as u32 - 1
+        });
+        let si = slot as usize;
+        slot_free[si] = false;
+        let list = &mut slot_segs[si];
+        for &(s, e) in &segs[v] {
+            let i = list.partition_point(|x| x.0 < s);
+            list.insert(i, (s, e));
+        }
+        slot_end[si] = slot_end[si].max(end);
+        busy.push(std::cmp::Reverse((slot_end[si], slot)));
         locs[v] = Loc::Stack(slot);
-        busy.push(std::cmp::Reverse((end, slot)));
     }
+    let num_slots = slot_segs.len() as u32;
 
     Allocation {
         locs,

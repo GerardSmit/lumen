@@ -55,6 +55,15 @@ fn typed_array_numeric_keys_follow_integer_indexed_semantics() {
 }
 
 #[test]
+fn do_while_evaluates_its_test_once_per_iteration() {
+    agree_on_every_tier(
+        include_str!("switch_tests/dw1.js"),
+        include_str!("switch_tests/dw1.expected"),
+        false,
+    );
+}
+
+#[test]
 fn loop_with_a_switch_table_compiles_whole() {
     let src = "function f(n){var m=0,a=0;for(var i=0;i<n;i++){switch(m){case 0:a+=1;m=1;break;case 1:a+=2;m=2;break;case 2:a+=3;m=3;break;case 3:a+=4;m=0;break;default:a=-1}}return a}f(5000)";
     let program = crate::parser::parse_script(src, false).unwrap();

@@ -3556,6 +3556,45 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// `x - 2^32 * floor(x / 2^32)` (exact) brings it into [0, 2^32) first. NaN and ±Infinity
     /// come out of that reduction as NaN, which saturates to 0 — ToInt32's answer.
     fn to_int32(&mut self, x: V) -> V {
+        if let Some(i) = self.int32_of(x) {
+            return i;
+        }
+        if let Some(i) = self.int32_sum(x) {
+            return i;
+        }
+        self.to_int32_raw(x)
+    }
+
+    /// ToInt32 of `a + b` / `a - b` where both operands are exact int32s (converted integers
+    /// or integral constants): the sum is exact in an F64, so ToInt32 is the wrapping integer
+    /// operation.
+    fn int32_sum(&mut self, x: V) -> Option<V> {
+        let lumen_codegen::InstData::Binary { op, args: [a, b] } = self.def_data(x)? else {
+            return None;
+        };
+        let op = match op {
+            BinaryOp::Fadd => BinaryOp::Iadd,
+            BinaryOp::Fsub => BinaryOp::Isub,
+            _ => return None,
+        };
+        let a = self.int32_operand(a)?;
+        let b = self.int32_operand(b)?;
+        Some(self.fb.binary(op, a, b))
+    }
+
+    fn int32_operand(&mut self, v: V) -> Option<V> {
+        if let Some(i) = self.int32_of(v) {
+            return Some(i);
+        }
+        match self.def_data(v)? {
+            lumen_codegen::InstData::F64const { bits } => {
+                Kind::int32(f64::from_bits(bits)).map(|i| self.i32c(i as i64))
+            }
+            _ => None,
+        }
+    }
+
+    fn to_int32_raw(&mut self, x: V) -> V {
         #[cfg(target_arch = "aarch64")]
         {
             return self.fb.convert(ConvOp::ToJsInt32, Type::I32, x);
@@ -6430,10 +6469,7 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// ToInt32 of F64 `v`, reusing the integer it was converted from.
     fn to_int32_fast(&mut self, v: V) -> V {
-        match self.int32_of(v) {
-            Some(x) => x,
-            None => self.to_int32(v),
-        }
+        self.to_int32(v)
     }
 
     /// Reverse the bytes of the low `bytes` (2, 4 or 8) bytes of `x` (I32, or I64 for 8); for 2
@@ -7052,6 +7088,9 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     fn int32_or_exit(&mut self, x: V, pc: usize) -> V {
+        if let Some(i) = self.int32_of(x) {
+            return i;
+        }
         let (i, bad) = self.int32_parts(x);
         let snap = self.stack.clone();
         self.exit_if(bad, pc, EXIT_RESUME, &snap, snap.len());
@@ -8083,6 +8122,12 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// After a fast path's hit block jumped to `join` and the slow path left a Boxed result at
     /// `at`: forward it to `join` (as F64 when `want`, exiting after the op otherwise).
     fn slow_to_join(&mut self, pc: usize, at: usize, want: bool, join: Block) {
+        self.slow_to_join_as(pc, at, want, false, join);
+    }
+
+    /// [`Tr::slow_to_join`] where `join` takes an I32 (`int`): a result that is not an exact
+    /// int32 exits after the op.
+    fn slow_to_join_as(&mut self, pc: usize, at: usize, want: bool, int: bool, join: Block) {
         if want {
             self.num_exits.push(pc + 1);
             let post = self.stack.clone();
@@ -8091,10 +8136,29 @@ impl<'a, 'f> Tr<'a, 'f> {
             let bad = self.fb.icmp(IntCC::Ne, tag, four);
             self.exit_if(bad, pc + 1, EXIT_RESUME, &post, post.len());
             let f = self.stack_num(at);
-            self.fb.jump(join, &[f]);
+            if int {
+                let (i, bad) = self.int32_parts(f);
+                self.exit_if(bad, pc + 1, EXIT_RESUME, &post, post.len());
+                self.fb.jump(join, &[i]);
+            } else {
+                self.fb.jump(join, &[f]);
+            }
         } else {
             self.fb.jump(join, &[]);
         }
+    }
+
+    /// The I32 of F64 `x` when it is an exact int32, else to `miss`.
+    fn int_or_miss(&mut self, x: V, miss: Block) -> V {
+        if let Some(i) = self.int32_of(x) {
+            return i;
+        }
+        let (i, bad) = self.int32_parts(x);
+        let ok = self.fb.create_block();
+        self.fb.brif(bad, miss, &[], ok, &[]);
+        self.fb.seal_block(ok);
+        self.fb.switch_to_block(ok);
+        i
     }
 
     /// `obj[key]` with the result at stack index `at`. `drop`: the stack index of a consumed
@@ -8113,10 +8177,19 @@ impl<'a, 'f> Tr<'a, 'f> {
         src: Option<Src>,
     ) {
         let ta_first = self.ta_first(src) || helpers::ta_hot(self.chunk, pc);
+        // A typed array of an int32 element kind at a Number-consuming site: the result joins
+        // as an I32 (so consumers see an exact integer); anything else leaves to the slow path.
+        let ikind = want
+            && ta_first
+            && matches!(src, Some(Src::Slot(s)) if self.ta_kinds.get(s as usize).is_some_and(|&k| {
+                use helpers::ta_code as tc;
+                matches!(k, tc::I8 | tc::U8 | tc::U8C | tc::I16 | tc::U16 | tc::I32)
+            }));
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
-        let param = want.then(|| self.fb.append_block_param(join, Type::F64));
+        let param_ty = if ikind { Type::I32 } else { Type::F64 };
+        let param = want.then(|| self.fb.append_block_param(join, param_ty));
         let fact = fact.and_then(|k| Some((*self.idx_vars.get(&k)?, *self.arr_vars.get(&k.0)?)));
         if let Some((ok_var, a)) = fact {
             // `key` is an integer inside the array's element-storage view: load it directly.
@@ -8131,6 +8204,11 @@ impl<'a, 'f> Tr<'a, 'f> {
             let ii = self.to_index(key);
             let x = layout::view_elem_num(&mut self.fb, kind, base, ii, checked);
             self.seal_current();
+            let x = if ikind {
+                self.int_or_miss(x, checked)
+            } else {
+                x
+            };
             if let Some(i) = drop {
                 self.drop_at(i);
             }
@@ -8152,7 +8230,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         };
         if ta_first {
             let ord = self.fb.create_block();
-            if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b, src) {
+            if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b, src, ikind) {
                 self.read_hit(drop, want, at, join, x);
             }
             self.fb.seal_block(ord);
@@ -8173,13 +8251,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         } else {
             let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
             self.seal_current();
+            let x = if ikind {
+                self.int_or_miss(x, miss)
+            } else {
+                x
+            };
             self.read_hit(drop, want, at, join, x);
         }
         if !ta_first {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
             self.stack = pre.clone();
-            if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b, src) {
+            if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b, src, false) {
                 self.read_hit(drop, want, at, join, x);
             }
         }
@@ -8244,12 +8327,13 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.switch_to_block(gen);
         }
         if self.slow_path(pc, slow) {
-            self.slow_to_join(pc, at, want, join);
+            self.slow_to_join_as(pc, at, want, ikind, join);
         }
         self.fb.seal_block(join);
         self.fb.switch_to_block(join);
         self.stack = pre[..at].to_vec();
         self.stack.push(match param {
+            Some(p) if ikind => Entry::Num(self.fb.convert(ConvOp::FromSint, Type::F64, p)),
             Some(p) => Entry::Num(p),
             None => Entry::Boxed,
         });
@@ -8331,7 +8415,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         if ta_first {
             let ord = self.fb.create_block();
             if self
-                .ta_access(pc, obj, key, Some(vf), ord, slow_b, src)
+                .ta_access(pc, obj, key, Some(vf), ord, slow_b, src, false)
                 .is_some()
             {
                 self.write_hit(drop, keep && boxed, base, join, vf);
@@ -8353,7 +8437,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.switch_to_block(miss);
             self.stack = pre.clone();
             if self
-                .ta_access(pc, obj, key, Some(vf), slow_b, slow_b, src)
+                .ta_access(pc, obj, key, Some(vf), slow_b, slow_b, src, false)
                 .is_some()
             {
                 self.write_hit(drop, keep && boxed, base, join, vf);
@@ -8453,6 +8537,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         other: Block,
         slow: Block,
         src: Option<Src>,
+        int_res: bool,
     ) -> Option<V> {
         use helpers::ta_code as tc;
         let cache = self.ta_vars.get(&pc).copied();
@@ -8556,15 +8641,16 @@ impl<'a, 'f> Tr<'a, 'f> {
         let none = self.fb.icmp(IntCC::Eq, k, z);
         self.fb.brif(none, slow, &[], have, &[k, data, len]);
         let done = self.fb.create_block();
+        let res_ty = if int_res { Type::I32 } else { Type::F64 };
         let res = store
             .is_none()
-            .then(|| self.fb.append_block_param(done, Type::F64));
+            .then(|| self.fb.append_block_param(done, res_ty));
         // The specialized access.
         if let Some((fb_, fd, fl)) = fast {
             self.fb.seal_block(fb_);
             self.fb.switch_to_block(fb_);
             self.ta_bounds(i, exact, fl, slow);
-            self.ta_elem(want, fd, i, store, done);
+            self.ta_elem(want, fd, i, store, done, int_res, slow);
         }
         // Any kind: dispatch on it.
         self.fb.seal_block(have);
@@ -8577,7 +8663,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         for (n, &b) in blocks.iter().enumerate() {
             self.fb.seal_block(b);
             self.fb.switch_to_block(b);
-            self.ta_elem(n as u32 + 1, hd, i, store, done);
+            self.ta_elem(n as u32 + 1, hd, i, store, done, int_res, slow);
         }
         self.fb.seal_block(done);
         self.fb.switch_to_block(done);
@@ -8603,9 +8689,19 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// Element `i` of kind `code` at `data`: loaded (F64, to `done`'s parameter) or, with
     /// `store`, stored with the kind's conversion; then jumps to `done`.
-    fn ta_elem(&mut self, code: u32, data: V, i: V, store: Option<V>, done: Block) {
+    #[allow(clippy::too_many_arguments)]
+    fn ta_elem(
+        &mut self,
+        code: u32,
+        data: V,
+        i: V,
+        store: Option<V>,
+        done: Block,
+        int_res: bool,
+        slow: Block,
+    ) {
         use helpers::ta_code as tc;
-        let (mk, es) = match code {
+        let (mk, es): (MemKind, i64) = match code {
             tc::I8 => (MemKind::I32S8, 1),
             tc::U8 | tc::U8C => (MemKind::I32U8, 1),
             tc::I16 => (MemKind::I32S16, 2),
@@ -8618,11 +8714,19 @@ impl<'a, 'f> Tr<'a, 'f> {
         let at = if es == 1 {
             self.fb.binary(BinaryOp::Iadd, data, i)
         } else {
-            let c = self.fb.iconst(PTR, es);
-            let off = self.fb.binary(BinaryOp::Imul, i, c);
+            let c = self.fb.iconst(PTR, es.trailing_zeros() as i64);
+            let off = self.fb.binary(BinaryOp::Ishl, i, c);
             self.fb.binary(BinaryOp::Iadd, data, off)
         };
         match store {
+            None if int_res => {
+                if matches!(code, tc::F64 | tc::F32 | tc::U32) {
+                    self.fb.jump(slow, &[]);
+                } else {
+                    let x = self.fb.load(mk, at, 0);
+                    self.fb.jump(done, &[x]);
+                }
+            }
             None => {
                 let x = self.fb.load(mk, at, 0);
                 let f = match code {

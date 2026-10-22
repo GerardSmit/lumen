@@ -224,8 +224,28 @@ fn bin_imm(fb: &mut FunctionBuilder, op: BinaryOp, ty: Type, a: IrValue, imm: i6
 
 /// `base + i * size` (all `PTR`).
 fn scaled(fb: &mut FunctionBuilder, base: IrValue, i: IrValue, size: i64) -> IrValue {
-    let off = bin_imm(fb, BinaryOp::Imul, PTR, i, size);
+    let off = if size > 0 && size & (size - 1) == 0 {
+        bin_imm(fb, BinaryOp::Ishl, PTR, i, size.trailing_zeros() as i64)
+    } else {
+        bin_imm(fb, BinaryOp::Imul, PTR, i, size)
+    };
     fb.binary(BinaryOp::Iadd, base, off)
+}
+
+/// The I32 `x` when F64 `v` is `x` converted (so `v` is an exact int32).
+pub(crate) fn int32_source(fb: &FunctionBuilder, v: IrValue) -> Option<IrValue> {
+    let f = &*fb.func;
+    match f.values[f.resolve(v).index()].def {
+        lumen_codegen::ValueDef::Result(inst, 0) => match f.inst(inst) {
+            lumen_codegen::InstData::Convert {
+                op: ConvOp::FromSint,
+                arg,
+                ..
+            } if f.value_type(*arg) == Type::I32 => Some(*arg),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// No layout: jump to `miss` and continue in an unreachable block (the caller keeps emitting
@@ -287,6 +307,13 @@ fn exotic_is(fb: &mut FunctionBuilder, l: &Layout, gc: IrValue, kinds: &[Exotic]
 /// every unsigned bounds check later, which also caps them below 2^32 like `fast_get_elem`'s
 /// range test.
 fn index_ptr(fb: &mut FunctionBuilder, index: IrValue, miss: Block) -> IrValue {
+    if let Some(x) = int32_source(fb, index) {
+        return if PTR == Type::I64 {
+            fb.convert(ConvOp::Sext, PTR, x)
+        } else {
+            x
+        };
+    }
     let i = fb.convert(ConvOp::ToSintSat, PTR, index);
     let back = fb.convert(ConvOp::FromSint, Type::F64, i);
     let exact = fb.fcmp(FloatCC::Eq, back, index);

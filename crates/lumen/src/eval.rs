@@ -792,16 +792,17 @@ impl Interp {
         env: &Env,
         labels: &[&str],
     ) -> Completion {
-        let mut first = true;
+        let mut test_pending = false;
         self.run_loop(labels, env, |me, env| {
-            if !first {
+            if test_pending {
                 let t = me.eval(test, env)?;
                 if !me.to_boolean(&t) {
                     return Ok(LoopStep::Done(Value::Empty));
                 }
             }
-            first = false;
+            test_pending = true;
             let bv = me.exec_stmt(body, env)?;
+            test_pending = false;
             let t = me.eval(test, env)?;
             if !me.to_boolean(&t) {
                 Ok(LoopStep::Done(bv))
