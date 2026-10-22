@@ -1099,7 +1099,10 @@ fn a_signal_reaches_the_child_realms_listener() {
          child.on('exit', (code, signal) => console.log('exit', code, signal));",
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "up\nwinch\nhandled SIGTERM\nexit 3 null\n");
+    // The child's last message and its exit race in the parent's loop, as in Node.
+    let mut lines: Vec<&str> = ran.stdout.lines().collect();
+    lines[2..].sort_unstable();
+    assert_eq!(lines, ["up", "winch", "exit 3 null", "handled SIGTERM"], "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
