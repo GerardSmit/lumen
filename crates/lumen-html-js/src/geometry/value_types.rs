@@ -5,8 +5,10 @@ use lumen_bind::This;
 use lumen_common::dom_geometry::{self as core, Matrix, Point};
 use lumen_host::realm_services::RealmServices;
 use std::cell::Cell;
+use std::rc::Rc;
 
 struct GeometryContext { window: bool }
+fn shared_point(point:Point)->Rc<Cell<Point>> {Rc::new(Cell::new(point))}
 fn dictionary(value:&Value)->OpResult<()> {
     if matches!(value,Value::Obj(_)|Value::Undefined|Value::Null) {Ok(())}else{Err(OpError::type_error("Expected a geometry dictionary"))}
 }
@@ -43,23 +45,43 @@ fn matrix_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
     if matrix.is_2d&&!is_2d {return Err(OpError::type_error("A 2D matrix cannot have 3D components"))}
     Ok(matrix)
 }
-fn matrix_sequence(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
-    let values=ctx.convert_iterable(value,4096,|ctx,value|ctx.coerce_number(&value).map_err(OpError::thrown))?;
+fn matrix_sequence(ctx:&mut Ctx,value:&Value,method:Value)->OpResult<Matrix> {
+    let values=ctx.convert_iterable_with_method(value,method,4096,|ctx,value|ctx.coerce_number(&value).map_err(OpError::thrown))?;
     match values.len() {
         6=>Ok(Matrix::from_affine(values.try_into().expect("verified sequence length"))),
         16=>Ok(Matrix{values:values.try_into().expect("verified sequence length"),is_2d:false}),
         _=>Err(OpError::type_error("A matrix sequence must contain six or sixteen elements")),
     }
 }
+fn iterator_method(ctx:&mut Ctx,value:&Value)->OpResult<Option<Value>> {
+    if !matches!(value,Value::Obj(_)) {return Ok(None)}
+    let key=ctx.well_known_symbol("iterator").expect("installed iterator symbol");
+    let method=ctx.reflect_get(value,&key,value).map_err(OpError::thrown)?;
+    Ok((!matches!(method,Value::Undefined|Value::Null)).then_some(method))
+}
+fn without_comments(source:&str)->String {
+    let mut out=String::with_capacity(source.len());
+    let mut rest=source;
+    while let Some(start)=rest.find("/*") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        match rest[start+2..].find("*/") {
+            Some(end)=>rest=&rest[start+2+end+2..],
+            None=>{rest="";break}
+        }
+    }
+    out.push_str(rest);
+    out
+}
 fn matrix_constructor(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
     if matches!(value,Value::Undefined) {return Ok(Matrix::default())}
-    if !matches!(value,Value::Obj(_)) {
-        if !RealmServices::<GeometryContext>::current(ctx).is_some_and(|context|context.window) {return Err(OpError::type_error("CSS matrix strings are only available in Window"))}
-        let source=ctx.coerce_string(value).map_err(OpError::thrown)?;
-        if source.trim().is_empty()||source.trim().eq_ignore_ascii_case("none") {return Ok(Matrix::default())}
-        return lumen_html::css::typed_transforms::computed_matrix(&source,None).ok_or_else(||OpError::new("SyntaxError","Invalid CSS transform list for DOMMatrix"));
-    }
-    matrix_sequence(ctx,value)
+    if let Some(method)=iterator_method(ctx,value)? {return matrix_sequence(ctx,value,method)}
+    if !RealmServices::<GeometryContext>::current(ctx).is_some_and(|context|context.window) {return Err(OpError::type_error("CSS matrix strings are only available in Window"))}
+    let source=ctx.coerce_string(value).map_err(OpError::thrown)?;
+    if source.is_empty() {return Ok(Matrix::default())}
+    let cleaned=without_comments(&source);
+    if cleaned.trim().eq_ignore_ascii_case("none") {return Ok(Matrix::default())}
+    lumen_html::css::typed_transforms::computed_matrix(&cleaned,None).ok_or_else(||crate::error_reporting::dom_exception(ctx,"SyntaxError","Invalid CSS transform list for DOMMatrix"))
 }
 fn matrix_from_array(ctx:&mut Ctx,value:&Value,expected:TaKind)->OpResult<Matrix> {
     let length=match ctx.clone_brand(value) {CloneBrand::TypedArray{kind,length:Some(length),..} if kind==expected=>length,_=>return Err(OpError::type_error("Expected an attached floating-point typed array"))};
@@ -90,11 +112,11 @@ fn matrix_json(ctx:&mut Ctx,matrix:Matrix)->OpResult<Value> {
 }
 
 #[lumen_bind::class(name="DOMPointReadOnly",hint(js(webidl,invalid_this)))]
-pub struct DomPointReadOnly { point:Cell<Point> }
+pub struct DomPointReadOnly { point:Rc<Cell<Point>> }
 #[lumen_bind::methods]
 impl DomPointReadOnly {
-    #[constructor(coerce)] fn new(#[default(0.0)]x:f64,#[default(0.0)]y:f64,#[default(0.0)]z:f64,#[default(1.0)]w:f64)->Self {Self{point:Cell::new(Point([x,y,z,w]))}}
-    fn from_point(ctx:&mut Ctx,#[default(Value::Undefined)]other:Value)->OpResult<Self> {Ok(Self{point:Cell::new(point_dictionary(ctx,&other)?)})}
+    #[constructor(coerce)] fn new(#[default(0.0)]x:f64,#[default(0.0)]y:f64,#[default(0.0)]z:f64,#[default(1.0)]w:f64)->Self {Self{point:shared_point(Point([x,y,z,w]))}}
+    fn from_point(ctx:&mut Ctx,#[default(Value::Undefined)]other:Value)->OpResult<Self> {Ok(Self{point:shared_point(point_dictionary(ctx,&other)?)})}
     #[getter] fn x(&self)->f64 {self.point.get().0[0]}
     #[getter] fn y(&self)->f64 {self.point.get().0[1]}
     #[getter] fn z(&self)->f64 {self.point.get().0[2]}
@@ -104,7 +126,7 @@ impl DomPointReadOnly {
 }
 #[lumen_bind::class(name="DOMPoint",extends=DomPointReadOnly,hint(js(webidl,invalid_this)))]
 pub struct DomPoint { base:DomPointReadOnly }
-impl DomPoint {fn value(point:Point)->Self {Self{base:DomPointReadOnly{point:Cell::new(point)}}}}
+impl DomPoint {fn value(point:Point)->Self {Self{base:DomPointReadOnly{point:shared_point(point)}}}}
 #[lumen_bind::methods]
 impl DomPoint {
     #[constructor(coerce)] fn new(#[default(0.0)]x:f64,#[default(0.0)]y:f64,#[default(0.0)]z:f64,#[default(1.0)]w:f64)->Self {Self::value(Point([x,y,z,w]))}
@@ -170,6 +192,14 @@ impl DomMatrixReadOnly {
     fn to_float32_array(&self,ctx:&mut Ctx)->OpResult<Value> {float_array(ctx,self.matrix.get(),TaKind::F32)}
     fn to_float64_array(&self,ctx:&mut Ctx)->OpResult<Value> {float_array(ctx,self.matrix.get(),TaKind::F64)}
     #[method(name="toJSON")] fn to_json(&self,ctx:&mut Ctx)->OpResult<Value> {matrix_json(ctx,self.matrix.get())}
+    #[method(name="toString")] fn stringify(&self,ctx:&mut Ctx)->OpResult<String> {
+        let matrix=self.matrix.get();
+        if !matrix.values.iter().all(|value|value.is_finite()) {return Err(crate::error_reporting::dom_exception(ctx,"InvalidStateError","Cannot serialize a matrix with non-finite values"))}
+        let indices:&[usize]=if matrix.is_2d {&[0,1,4,5,12,13]}else{&[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]};
+        let mut parts=Vec::with_capacity(indices.len());
+        for &index in indices {parts.push(ctx.coerce_string(&Value::Num(matrix.values[index])).map_err(OpError::thrown)?.to_string());}
+        Ok(format!("{}({})",if matrix.is_2d{"matrix"}else{"matrix3d"},parts.join(", ")))
+    }
 }
 /// Shared branded matrix access for native consumers such as Typed OM.
 pub(crate) fn matrix_native_value(ctx:&mut Ctx,value:&Value)->OpResult<Matrix>{
@@ -254,6 +284,72 @@ impl DomMatrix {
     #[method(coerce)] fn skew_y_self(&self,this:This<Value>,#[default(0.0)]angle:f64)->Value {self.base.matrix.set(self.base.matrix.get().skewed(0.0,angle));this.0}
 }
 
+pub(super) fn rect_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<[f64;4]> {
+    dictionary(value)?;
+    let height=optional_number(ctx,value,"height")?.unwrap_or(0.0);
+    let width=optional_number(ctx,value,"width")?.unwrap_or(0.0);
+    let x=optional_number(ctx,value,"x")?.unwrap_or(0.0);
+    let y=optional_number(ctx,value,"y")?.unwrap_or(0.0);
+    Ok([x,y,width,height])
+}
+pub(super) fn nan_min(a:f64,b:f64)->f64 {if a.is_nan()||b.is_nan() {f64::NAN}else{a.min(b)}}
+pub(super) fn nan_max(a:f64,b:f64)->f64 {if a.is_nan()||b.is_nan() {f64::NAN}else{a.max(b)}}
+const QUAD_SLOTS:[&str;4]=["#lumen_quad\u{1}p1","#lumen_quad\u{1}p2","#lumen_quad\u{1}p3","#lumen_quad\u{1}p4"];
+
+#[lumen_bind::class(name="DOMQuad",hint(js(webidl,invalid_this)))]
+pub struct DomQuad { points:[Rc<Cell<Point>>;4] }
+impl DomQuad {
+    fn value(points:[Point;4])->Self {Self{points:points.map(shared_point)}}
+    fn corners(&self)->[Point;4] {self.points.each_ref().map(|point|point.get())}
+    fn point(&self,ctx:&mut Ctx,this:&Value,index:usize)->OpResult<Value> {
+        if let Some(existing)=ctx.native_private_value_slot(this,QUAD_SLOTS[index]) {return Ok(existing)}
+        let wrapper=ctx.new_instance(DomPoint{base:DomPointReadOnly{point:self.points[index].clone()}});
+        ctx.set_native_internal_value_slot(this,QUAD_SLOTS[index],wrapper.clone()).map_err(OpError::thrown)?;
+        Ok(wrapper)
+    }
+}
+#[lumen_bind::methods]
+impl DomQuad {
+    #[constructor] fn new(ctx:&mut Ctx,#[default(Value::Undefined)]p1:Value,#[default(Value::Undefined)]p2:Value,#[default(Value::Undefined)]p3:Value,#[default(Value::Undefined)]p4:Value)->OpResult<Self> {
+        Ok(Self::value([point_dictionary(ctx,&p1)?,point_dictionary(ctx,&p2)?,point_dictionary(ctx,&p3)?,point_dictionary(ctx,&p4)?]))
+    }
+    fn from_rect(ctx:&mut Ctx,#[default(Value::Undefined)]other:Value)->OpResult<Self> {
+        let [x,y,width,height]=rect_dictionary(ctx,&other)?;
+        let at=|x:f64,y:f64|Point([x,y,0.0,1.0]);
+        Ok(Self::value([at(x,y),at(x+width,y),at(x+width,y+height),at(x,y+height)]))
+    }
+    fn from_quad(ctx:&mut Ctx,#[default(Value::Undefined)]other:Value)->OpResult<Self> {
+        dictionary(&other)?;
+        let mut points=[Point::default();4];
+        for (index,name) in ["p1","p2","p3","p4"].into_iter().enumerate() {
+            let member=if matches!(other,Value::Undefined|Value::Null) {Value::Undefined}else{ctx.member_get(&other,name).map_err(OpError::thrown)?};
+            points[index]=point_dictionary(ctx,&member)?;
+        }
+        Ok(Self::value(points))
+    }
+    #[getter] fn p1(&self,ctx:&mut Ctx,this:This<Value>)->OpResult<Value> {self.point(ctx,&this.0,0)}
+    #[getter] fn p2(&self,ctx:&mut Ctx,this:This<Value>)->OpResult<Value> {self.point(ctx,&this.0,1)}
+    #[getter] fn p3(&self,ctx:&mut Ctx,this:This<Value>)->OpResult<Value> {self.point(ctx,&this.0,2)}
+    #[getter] fn p4(&self,ctx:&mut Ctx,this:This<Value>)->OpResult<Value> {self.point(ctx,&this.0,3)}
+    fn get_bounds(&self)->DomRect {
+        let corners=self.corners();
+        let xs=corners.map(|point|point.0[0]);
+        let ys=corners.map(|point|point.0[1]);
+        let bounds=|values:[f64;4]|(values.into_iter().fold(f64::INFINITY,nan_min),values.into_iter().fold(f64::NEG_INFINITY,nan_max));
+        let (left,right)=bounds(xs);
+        let (top,bottom)=bounds(ys);
+        DomRect{base:DomRectReadOnly{x:left,y:top,width:right-left,height:bottom-top}}
+    }
+    #[method(name="toJSON")] fn to_json(&self,ctx:&mut Ctx,this:This<Value>)->OpResult<Value> {
+        let object=Value::Obj(ctx.new_object());
+        for (index,name) in ["p1","p2","p3","p4"].into_iter().enumerate() {
+            let point=self.point(ctx,&this.0,index)?;
+            ctx.create_data_property(&object,name,point).map_err(OpError::thrown)?;
+        }
+        Ok(object)
+    }
+}
+
 trait GeometryCodec: lumen_bind::Methods<JsHost>+Sized+'static {
     const KIND:&'static str;
     const MAX_BYTES:usize;
@@ -282,20 +378,23 @@ fn decode_matrix(bytes:&[u8])->Option<Matrix> {
 impl GeometryCodec for DomMatrix {const KIND:&'static str="DOMMatrix";const MAX_BYTES:usize=129;fn encode(&self)->Vec<u8>{encode_matrix(self.base.matrix.get())}fn decode(bytes:&[u8])->Option<Self>{decode_matrix(bytes).map(Self::value)}}
 impl GeometryCodec for DomMatrixReadOnly {const KIND:&'static str="DOMMatrixReadOnly";const MAX_BYTES:usize=129;fn encode(&self)->Vec<u8>{encode_matrix(self.matrix.get())}fn decode(bytes:&[u8])->Option<Self>{decode_matrix(bytes).map(Self::value)}}
 impl GeometryCodec for DomPoint {const KIND:&'static str="DOMPoint";const MAX_BYTES:usize=32;fn encode(&self)->Vec<u8>{core::encode_numbers(self.base.point.get().0)}fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<4>(bytes).map(|values|Self::value(Point(values)))}}
-impl GeometryCodec for DomPointReadOnly {const KIND:&'static str="DOMPointReadOnly";const MAX_BYTES:usize=32;fn encode(&self)->Vec<u8>{core::encode_numbers(self.point.get().0)}fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<4>(bytes).map(|values|Self{point:Cell::new(Point(values))})}}
+impl GeometryCodec for DomPointReadOnly {const KIND:&'static str="DOMPointReadOnly";const MAX_BYTES:usize=32;fn encode(&self)->Vec<u8>{core::encode_numbers(self.point.get().0)}fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<4>(bytes).map(|values|Self{point:shared_point(Point(values))})}}
+impl GeometryCodec for DomQuad {const KIND:&'static str="DOMQuad";const MAX_BYTES:usize=128;
+    fn encode(&self)->Vec<u8>{{let corners=self.corners();core::encode_numbers(std::array::from_fn::<f64,16,_>(|index|corners[index/4].0[index%4]))}}
+    fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<16>(bytes).map(|values|Self::value([0,4,8,12].map(|start|Point([values[start],values[start+1],values[start+2],values[start+3]]))))}}
 impl GeometryCodec for DomRect {const KIND:&'static str="DOMRect";const MAX_BYTES:usize=32;fn encode(&self)->Vec<u8>{core::encode_numbers([self.base.x,self.base.y,self.base.width,self.base.height])}fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<4>(bytes).map(|[x,y,width,height]|Self{base:DomRectReadOnly{x,y,width,height}})}}
 impl GeometryCodec for DomRectReadOnly {const KIND:&'static str="DOMRectReadOnly";const MAX_BYTES:usize=32;fn encode(&self)->Vec<u8>{core::encode_numbers([self.x,self.y,self.width,self.height])}fn decode(bytes:&[u8])->Option<Self>{core::decode_numbers::<4>(bytes).map(|[x,y,width,height]|Self{x,y,width,height})}}
 
 pub(super) fn install(ctx:&mut Ctx,window:bool)->OpResult<()> {
     RealmServices::replace_current(ctx,GeometryContext{window});
     let global=ctx.global_object();
-    for (name,value) in [("DOMPointReadOnly",ctx.class_constructor::<DomPointReadOnly>()),("DOMPoint",ctx.class_constructor::<DomPoint>()),("DOMMatrixReadOnly",ctx.class_constructor::<DomMatrixReadOnly>()),("DOMMatrix",ctx.class_constructor::<DomMatrix>())] {
+    for (name,value) in [("DOMPointReadOnly",ctx.class_constructor::<DomPointReadOnly>()),("DOMPoint",ctx.class_constructor::<DomPoint>()),("DOMMatrixReadOnly",ctx.class_constructor::<DomMatrixReadOnly>()),("DOMMatrix",ctx.class_constructor::<DomMatrix>()),("DOMQuad",ctx.class_constructor::<DomQuad>())] {
         crate::install_interface(ctx,&global,name,value).map_err(OpError::thrown)?;
     }
     // Mutable brands precede their readonly base brands in matching order.
     register::<DomPoint>(ctx);register::<DomPointReadOnly>(ctx);
     register::<DomMatrix>(ctx);register::<DomMatrixReadOnly>(ctx);
-    register::<DomRect>(ctx);register::<DomRectReadOnly>(ctx);
+    register::<DomQuad>(ctx);register::<DomRect>(ctx);register::<DomRectReadOnly>(ctx);
     if window {
         for (name,value) in [("SVGPoint",ctx.class_constructor::<DomPoint>()),("SVGMatrix",ctx.class_constructor::<DomMatrix>()),("WebKitCSSMatrix",ctx.class_constructor::<DomMatrix>()),("SVGRect",ctx.class_constructor::<DomRect>())] {
             crate::install_interface(ctx,&global,name,value).map_err(OpError::thrown)?;

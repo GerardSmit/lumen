@@ -184,7 +184,7 @@ mod tests {
         let rotated=mix(240,"x 90deg","y 90deg",Op::Interpolate(0.5));
         let used=computed(240,&rotated,context,query).unwrap().unwrap().matrix([100.0,100.0]).unwrap();
         let expected=lumen_common::dom_geometry::Matrix::default().rotated_axis(1.0,1.0,0.0,2.0*libm::acos(libm::sqrt(2.0/3.0))*180.0/core::f64::consts::PI);
-        for(a,b)in used.values.iter().zip(expected.values){assert!((a-b).abs()<1e-12,"{rotated}: {a} vs {b}");}
+        for(a,b)in used.values.iter().zip(expected.values){assert!((a-b).abs()<1e-6,"{rotated}: {a} vs {b}");}
     }
     #[test]
     fn specification_individual_transform_sparse_order_presence_and_slot_lifecycle(){

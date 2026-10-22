@@ -33,6 +33,7 @@ impl DomStyle {
             } else {super::canvas::initialized_realm_font_source(&self.realm)?};
             let needs_container_context = if needs_layout { false } else {
                 let mut session = self.realm.session.borrow_mut();
+                if session.has_container_queries() { true } else {
                 let inherited = css::property_inherits_query_context(&property);
                 let mut current = Some(self.node);
                 let mut pending = false;
@@ -49,6 +50,7 @@ impl DomStyle {
                     current = session.document().composed_parent(node).map_err(dom_error)?;
                 }
                 pending
+                }
             };
             if (needs_layout || needs_container_context)
                 && (self.realm.layout_flusher.borrow().is_some()
@@ -197,6 +199,46 @@ pub(crate) fn computed_property_value(
     .property_value(property, false)
 }
 
+pub(crate) fn check_visibility(realm: &Rc<DomRealm>, node: NodeId, opacity: bool, visibility: bool) -> OpResult<bool> {
+    if !rendered_ancestry(realm, node, true)? {
+        return Ok(false);
+    }
+    if visibility && computed_property_value(realm, node, "visibility")? != "visible" {
+        return Ok(false);
+    }
+    if opacity {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let is_element = matches!(realm.session.borrow().document().kind(id), Ok(NodeKind::Element { .. }));
+            if is_element && computed_property_value(realm, id, "opacity")?.parse::<f64>() == Ok(0.0) {
+                return Ok(false);
+            }
+            current = realm.session.borrow().document().flat_tree_parent(id).ok().flatten();
+        }
+    }
+    Ok(true)
+}
+
+/// The product of the computed `zoom` of an element and its ancestors.
+pub(crate) fn effective_zoom(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<f64> {
+    if !rendered_ancestry(realm, node, true)? {
+        return Ok(1.0);
+    }
+    let mut zoom = 1.0;
+    let mut current = Some(node);
+    while let Some(id) = current {
+        let is_element = matches!(realm.session.borrow().document().kind(id), Ok(NodeKind::Element { .. }));
+        if is_element {
+            let value = computed_property_value(realm, id, "zoom")?;
+            if let Ok(factor) = value.trim_end_matches('%').parse::<f64>() {
+                zoom *= if value.ends_with('%') { factor / 100.0 } else { factor };
+            }
+        }
+        current = realm.session.borrow().document().flat_tree_parent(id).ok().flatten();
+    }
+    Ok(zoom)
+}
+
 /// One operation's canonical computed style and registration epoch. Iteration
 /// reads every longhand, so font and rare query context are initialized once.
 pub(crate) struct ComputedPropertyMapSnapshot {
@@ -279,7 +321,7 @@ pub(crate) fn install_css_property_aliases(ctx: &mut Ctx) -> OpResult<()> {
     Ok(())
 }
 
-fn camel_case_alias(property: &str) -> Option<String> {
+pub(crate) fn camel_case_alias(property: &str) -> Option<String> {
     if property == "float" { return Some(String::from("cssFloat")); }
     let out = css_property_to_idl(property, false);
     (out != property).then_some(out)

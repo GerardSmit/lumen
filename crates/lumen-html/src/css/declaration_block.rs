@@ -39,7 +39,7 @@ impl AllGroup {
     }
 }
 fn all_target(name:&str)->bool {
-    PROPERTIES.iter().find(|property|property.name==name).is_some_and(|property|
+    registry_index(name).map(|index|&PROPERTIES[index]).is_some_and(|property|
         property.in_all && longhands(name).is_empty() && canonical_alias(name)==name)
 }
 fn same_specified(left:&Specified,right:&Specified)->bool{
@@ -159,6 +159,20 @@ pub struct DeclarationBlock {
     entries: Vec<Entry>,
 }
 
+fn push_text_entries<N: AsRef<str>, V: AsRef<str>>(
+    entries: &mut Vec<Entry>,
+    values: impl IntoIterator<Item = (N, V)>,
+    important: bool,
+) {
+    for (name, value) in values {
+        entries.push(Entry {
+            name: Arc::from(name.as_ref()),
+            value: Specified::Text(Arc::from(value.as_ref())),
+            important,
+        });
+    }
+}
+
 fn limit() -> CssError {
     CssError {
         offset: 0,
@@ -169,9 +183,45 @@ fn limit() -> CssError {
 /// CSS longhand identities, deliberately separate from renderer state slots.
 /// A longhand can update several internal slots, while aggregate slots are not
 /// author-visible CSS properties.
+const FLAG_KNOWN: u8 = 1;
+const FLAG_SHORTHAND: u8 = 2;
+const FLAG_ALIAS: u8 = 4;
+const NAME_FLAG_SLOTS: usize = 1024;
+const _: () = assert!(PROPERTY_NAMES.len() <= NAME_FLAG_SLOTS);
+static NAME_FLAGS: [core::sync::atomic::AtomicU8; NAME_FLAG_SLOTS] = [const { core::sync::atomic::AtomicU8::new(0) }; NAME_FLAG_SLOTS];
+
+/// Shorthand and alias facts of a registered name, computed once per name.
+fn name_flags(name: &str) -> Option<u8> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let cell = NAME_FLAGS.get(registry_index(name)?)?;
+    let flags = cell.load(Relaxed);
+    if flags != 0 {
+        return Some(flags);
+    }
+    let flags = FLAG_KNOWN
+        | if longhands_uncached(name).is_empty() { 0 } else { FLAG_SHORTHAND }
+        | if canonical_alias_uncached(name) == name { 0 } else { FLAG_ALIAS };
+    cell.store(flags, Relaxed);
+    Some(flags)
+}
+
+pub fn has_longhands(name: &str) -> bool {
+    match name_flags(name) {
+        Some(flags) => flags & FLAG_SHORTHAND != 0,
+        None => !longhands_uncached(name).is_empty(),
+    }
+}
+
 pub fn longhands(name: &str) -> &'static [&'static str] {
+    if name_flags(name).is_some_and(|flags| flags & FLAG_SHORTHAND == 0) {
+        return &[];
+    }
+    longhands_uncached(name)
+}
+
+fn longhands_uncached(name: &str) -> &'static [&'static str] {
     match name {
-        "columns"=>&["column-width","column-count"],
+        "columns"=>&["column-width","column-count","column-height","column-wrap"],
         "page-break-before"=>&["break-before"],"page-break-after"=>&["break-after"],"page-break-inside"=>&["break-inside"],
         "contain-intrinsic-size" => &["contain-intrinsic-width","contain-intrinsic-height"],
         "transition" => &["transition-property","transition-duration","transition-timing-function","transition-delay","transition-behavior"],
@@ -180,6 +230,8 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
         "place-self" => &["align-self", "justify-self"],
         "place-content" => &["align-content", "justify-content"],
         "gap" => &["row-gap", "column-gap"],
+        "position-try" => &["position-try-order", "position-try-fallbacks"],
+        "offset" => &["offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"],
         "flex-flow" => &["flex-direction", "flex-wrap"],
         "flex" => &["flex-grow", "flex-shrink", "flex-basis"],
         "margin" => &["margin-top", "margin-right", "margin-bottom", "margin-left"],
@@ -224,7 +276,8 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
         "background" => &[
             "background-color",
             "background-image",
-            "background-position",
+            "background-position-x",
+            "background-position-y",
             "background-size",
             "background-repeat",
             "background-attachment",
@@ -239,6 +292,7 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
             "mask-origin",
             "mask-clip",
             "mask-mode",
+            "mask-composite",
         ],
         "list-style" => &["list-style-position", "list-style-image", "list-style-type"],
         "outline" => &["outline-color", "outline-style", "outline-width"],
@@ -349,7 +403,15 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
             "column-rule-style",
             "column-rule-color",
         ],
-        "font-variant" => &["font-variant-ligatures", "font-variant-caps", "font-variant-alternates"],
+        "font-variant" => &[
+            "font-variant-ligatures",
+            "font-variant-caps",
+            "font-variant-alternates",
+            "font-variant-numeric",
+            "font-variant-east-asian",
+            "font-variant-position",
+            "font-variant-emoji",
+        ],
         "font" => &[
             "font-style",
             "font-variant-caps",
@@ -362,7 +424,15 @@ pub fn longhands(name: &str) -> &'static [&'static str] {
             "font-variant-ligatures",
             "font-variant-alternates",
             "font-feature-settings",
+            "font-variant-numeric",
+            "font-variant-east-asian",
+            "font-variant-position",
+            "font-variant-emoji",
         ],
+        name if super::extra_props::is_shorthand(name) => super::extra_props::shorthand_longhands(name),
+        name if super::corner_radii::is_shorthand(name) => super::corner_radii::longhands(name),
+        name if super::grid_lines::is_shorthand(name) => super::grid_lines::longhands(name),
+        name if super::text_props::is_shorthand(name) => super::text_props::longhands(name),
         _ => &[],
     }
 }
@@ -379,6 +449,7 @@ pub fn is_shorthand(name: &str) -> bool {
                 | "background-position"
                 | "background-repeat"
                 | "border-radius"
+                | "-webkit-border-radius"
                 | "columns"
                 | "font-variant"
                 | "grid"
@@ -432,11 +503,11 @@ pub(super) fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declarati
                 .iter()
                 .any(|part| matches!(part, component_values::UnparsedComponent::Variable { .. }))
         });
-    let owner_dependent=typed_numeric::substitute_sibling_functions(raw,1,1)
+    let owner_dependent=anchor::applies(name,raw)||typed_numeric::substitute_sibling_functions(raw,1,1)
         .is_some_and(|(_,dependent)|dependent);
     let mut parsed=Vec::new();
     append_declaration_pair_values(name,raw,0,has_variables||owner_dependent,&mut parsed)?;
-    if parsed.is_empty() || expand_variables_mode(raw, &[], &mut Vec::new(), true).is_none() {
+    if parsed.is_empty() || !references_parse(raw, MAX_VARIABLE_BYTES) {
         return Ok(None);
     }
     Ok(Some(parsed))
@@ -464,6 +535,23 @@ fn push_entry(entries: &mut Vec<Entry>, entry: Entry) -> Result<(), CssError> {
 fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<Entry>>, CssError> {
     let Some(completed) = syntax::complete(raw)? else { return Ok(None); };
     let raw = completed.as_ref().trim();
+    let anchored;
+    let raw = match anchor::canonicalize(&name, raw) {
+        None => raw,
+        Some(None) => return Ok(None),
+        Some(Some(canonical)) => {
+            anchored = canonical;
+            anchored.as_str()
+        }
+    };
+    let numeric;
+    let raw = match super::numeric_tokens::canonicalize(&name, raw) {
+        Some(canonical) => {
+            numeric = canonical;
+            numeric.as_str()
+        }
+        None => raw,
+    };
     if name.as_ref()=="all" {
         let completed=strip_component_comments(raw,0,true)?;
         let completed=completed.trim();let mut position=0;
@@ -525,13 +613,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
         entries
             .try_reserve_exact(values.len())
             .map_err(|_| limit())?;
-        for (target, value) in values {
-            entries.push(Entry {
-                name: Arc::from(target),
-                value: Specified::Text(Arc::from(value)),
-                important,
-            });
-        }
+        push_text_entries(&mut entries, values, important);
         return Ok(Some(entries));
     }
     let Some(parsed) = parsed_value(&name, raw)? else {
@@ -543,6 +625,21 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "order" | "z-index" | "column-count" | "orphans" | "widows" | "column-span" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" | "x" | "y" | "cx" | "cy" | "r" | "rx" | "ry" => super::serialize_cssom_property_value(&name,raw),
             "contain-intrinsic-width"|"contain-intrinsic-height"|"contain-intrinsic-inline-size"|"contain-intrinsic-block-size" => super::intrinsic_override::specified(raw),
             "background-image" | "mask-image" => super::image_source::serialize(raw),
+            "background-size" | "mask-size" => super::background_sizes::specified(raw),
+            "mask-repeat" => super::background_repeats(raw).map(|repeats| join_css_components(repeats.iter().map(|repeat| serialize_background_repeat_pair(*repeat)))),
+            "border-radius" => super::corner_radii::specified_border_radius(raw),
+            "text-indent" => super::text_indent::specified(raw),
+            "mask-position" => super::background_positions::shorthand_lists(raw).and_then(|(x, y)| super::background_positions::join_axes(&x, &y)),
+            "background-clip" => top_level_split(raw, b',', MAX_BACKGROUND_LAYERS).and_then(|layers| {
+                let layers: Option<Vec<String>> = layers.iter().map(|layer| {
+                    let tokens = components(layer)?;
+                    Some(match tokens.as_slice() {
+                        [a, b] if a.eq_ignore_ascii_case("text") && b.eq_ignore_ascii_case("border-area") => String::from("border-area text"),
+                        _ => tokens.join(" ").to_ascii_lowercase(),
+                    })
+                }).collect();
+                Some(layers?.join(", "))
+            }),
             "filter" => super::serialize_color_filter_declaration(raw),
             "transform"=>super::typed_transforms::specified(raw),
             "translate"|"rotate"|"scale"=>super::individual_transforms::specified(match name.as_ref(){"translate"=>239,"rotate"=>240,_=>241},raw),
@@ -589,8 +686,16 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                     None
                 }
             }),
+            _ if super::extra_props::property_index(&name).is_some() => parsed.iter().rev().find_map(|declaration| match &declaration.value {
+                Value::ExtraRaw(slot, text) => super::extra_props::serialize_specified(*slot, text),
+                _ => None,
+            }),
             "color-interpolation-filters"=>parsed.iter().find_map(|declaration|
                 if let Value::SvgFilterColorSpace(value)=declaration.value {Some(value.css_keyword().into())}else{None}),
+            "aspect-ratio" if !raw.trim().to_ascii_lowercase().starts_with("var(")=>super::sizing_values::aspect_ratio_specified(raw),
+            "outline-width" | "outline-offset" if raw.trim() == "0" => Some("0px".into()),
+            _ if super::calc_size::unitless_zero(&name,raw).is_some()=>super::calc_size::unitless_zero(&name,raw),
+            _ if super::calc_size::applies(&name,raw)=>super::calc_size::specified(&name,raw),
             _ if super::animation_color_property(&name)=>super::serialize_cssom_property_value(&name,raw),
             _ => parsed.iter().find_map(|declaration| match &declaration.value {
                 Value::FontSizeKeyword(value) => Some(value.as_str().into()),
@@ -652,14 +757,34 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
         }
         return Ok(Some(entries));
     }
+    if name.as_ref() == "offset" {
+        let Some(values) = super::shapes::offset_longhands(raw) else {
+            return Ok(None);
+        };
+        push_text_entries(&mut entries, values, important);
+        return Ok(Some(entries));
+    }
+    if name.as_ref() == "position-try" {
+        let Some(values) = anchor::position_try_longhands(raw) else {
+            return Ok(None);
+        };
+        push_text_entries(&mut entries, values, important);
+        return Ok(Some(entries));
+    }
+    if let Some(values) = super::grid_lines::expand(&name, raw) {
+        push_text_entries(&mut entries, values, important);
+        return Ok(Some(entries));
+    }
+    if let Some(values) = super::extra_props::expand_shorthand(&name, raw).or_else(|| super::corner_radii::expand(&name, raw)) {
+        push_text_entries(&mut entries, values, important);
+        return Ok(Some(entries));
+    }
+    if let Some(values) = super::text_props::expand(&name, raw) {
+        push_text_entries(&mut entries, values, important);
+        return Ok(Some(entries));
+    }
     if let Some(values) = specified_alignment_expansion(&name, raw) {
-        for (name, value) in values {
-            entries.push(Entry {
-                name: Arc::from(name),
-                value: Specified::Text(Arc::from(value)),
-                important,
-            });
-        }
+        push_text_entries(&mut entries, values, important);
         return Ok(Some(entries));
     }
     if name.as_ref() == "background" {
@@ -674,13 +799,20 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             .unwrap_or(raw);
         let color = match parts.color {
             Some(value) => {let Some(value)=serialize_typed(&value,last_layer,"background","background-color") else {return Ok(None);};value},
-            None => "transparent".into(),
+            None => "rgba(0, 0, 0, 0)".into(),
+        };
+        let Some((position_x, position_y)) = super::background_positions::shorthand_lists(&parts.positions) else {
+            return Ok(None);
         };
         let values = [
             color,
             match super::image_source::serialize(&parts.images){Some(value)=>value,None=>return Ok(None)},
-            parts.positions,
-            parts.sizes,
+            position_x,
+            position_y,
+            match super::background_sizes::specified(&parts.sizes) {
+                Some(sizes) => sizes,
+                None => return Ok(None),
+            },
             join_css_components(repeats.into_iter().map(serialize_background_repeat_pair)),
             join_css_components(parts.attachments.into_iter().map(|value| match value {
                 BackgroundAttachment::Scroll => "scroll",
@@ -718,6 +850,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                 MaskMode::Alpha => "alpha",
                 MaskMode::Luminance => "luminance",
             })),
+            join_css_components(parts.composites),
         ];
         for (&target, value) in targets.iter().zip(values) {
             entries.push(Entry {
@@ -824,8 +957,18 @@ fn specified_border_width(value: f32, raw: &str, origin: &str, target: &str) -> 
 
 /// Canonical CSSOM identity of legacy property aliases.
 pub fn canonical_alias(name: &str) -> &str {
+    if name_flags(name).is_some_and(|flags| flags & FLAG_ALIAS == 0) {
+        return name;
+    }
+    canonical_alias_uncached(name)
+}
+
+fn canonical_alias_uncached(name: &str) -> &str {
     match name {
         "word-wrap" => "overflow-wrap",
+        "grid-gap" => "gap",
+        "grid-row-gap" => "row-gap",
+        "grid-column-gap" => "column-gap",
         "font-stretch" => "font-width",
         "-webkit-appearance" => "appearance",
         "-webkit-mask" => "mask",
@@ -835,7 +978,7 @@ pub fn canonical_alias(name: &str) -> &str {
         "-webkit-mask-repeat" => "mask-repeat",
         "-webkit-mask-origin" => "mask-origin",
         "-webkit-mask-clip" => "mask-clip",
-        _ => name,
+        _ => super::corner_radii::alias(name).unwrap_or(name),
     }
 }
 
@@ -868,7 +1011,9 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::FontSizeKeyword(value) => value.as_str().into(),
         Value::ContainerType(value) => value.as_str().into(),
         Value::ColumnSpan(value)=>value.serialize(),
+        Value::ExtraRaw(slot,raw)=>super::extra_props::serialize_specified(*slot,raw)?,
         Value::BoxDecorationBreak(value)=>value.serialize(),
+        Value::TransformOrigin(..)|Value::TransformOriginRaw(_)=>super::transform_origin::specified(raw)?,
         Value::SvgFilterColorSpace(value)=>value.css_keyword().into(),
         Value::LineBreakCount(_,value)=>value.to_string(),
         Value::BreakControl(_,value)=>super::break_control::serialize(target,*value)?.into(),
@@ -877,7 +1022,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::ContainIntrinsic(_,_)=>super::intrinsic_override::specified_component(origin,target,raw)?,
         Value::ContextLength(slot,value,_) if (234..=237).contains(slot)=>super::intrinsic_override::specified(value)?,
         Value::ContextLength(slot, value, _) if matches!(slot,214|215) => serialize_decoration_length(value)?,
-        Value::ContextLength(slot, value, _) if matches!(slot,48|74|75|244|245|255) => super::typed_numeric::parse_numeric_expression(value)?.serialize_specified()?,
+        Value::ContextLength(slot, value, _) if matches!(slot,48|74|75|130|244|245|255) => super::typed_numeric::parse_numeric_expression(value)?.serialize_specified()?,
         Value::ContextLength(_, value, _) => value.to_string(),
         Value::ColorRaw(_,value)=>super::color_values::serialize_declared(value,0)?,
         Value::GapRaw(_,value)=>value.to_string(),
@@ -899,11 +1044,15 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::FontStyle(value) => specified_font_style(*value, raw),
         Value::FontStyleExpression(expression) => alloc::format!("oblique {}", expression.serialize()?),
         Value::FontWeight(value) => match value {
-            400 => "normal".into(),
-            700 => "bold".into(),
+            400_000 => "normal".into(),
+            700_000 => "bold".into(),
             -1 => "bolder".into(),
             -2 => "lighter".into(),
-            value => value.to_string(),
+            value => {
+                let mut weight = FontSpec::default();
+                weight.set_weight_milli(*value as u32);
+                weight.weight_text()
+            }
         },
         Value::FontStretch(value) if origin == "font" => font_stretch_percentage_keyword(*value)?.into(),
         Value::FontStretch(value) => font_stretch_keyword(raw).map(String::from).unwrap_or_else(|| alloc::format!("{}%", computed_values::number(*value))),
@@ -1096,7 +1245,7 @@ impl DeclarationBlock {
             // Compact those source declarations too, without increasing the
             // ordinary entry allowance or allocating one retained Arc per name.
             if source && compact_wide && all_target(&entry.name) && matches!(&entry.value,Specified::Text(value) if ["initial","inherit","unset","revert","revert-layer"].contains(&value.as_ref())) {
-                let index=PROPERTIES.iter().position(|property|property.name==entry.name.as_ref()).ok_or_else(limit)?;
+                let index=registry_index(entry.name.as_ref()).ok_or_else(limit)?;
                 let mut group=AllGroup::full(entry.value)?;
                 for target in 0..PROPERTIES.len(){if target!=index{group.clear(target);}}
                 group.reset_metadata=false;
@@ -1113,7 +1262,7 @@ impl DeclarationBlock {
                             else{group.clear(index);}
                         }}
                         if !source{previous.value=group.value.clone();old.important=entry.important;}
-                    }else if let Some(index)=PROPERTIES.iter().position(|property|property.name==old.name.as_ref()){
+                    }else if let Some(index)=registry_index(old.name.as_ref()){
                         if !group.contains(index){continue;}
                         if source{if old.important&&!entry.important{group.clear(index);}else{old.name=Arc::from("");}}
                         else{old.value=group.value.clone();old.important=entry.important;group.clear(index);}
@@ -1128,7 +1277,7 @@ impl DeclarationBlock {
             if let Some(position)=position{
                 if source&&entries[position].important&&!entry.important{continue;}
                 if let Specified::All(group)=&entries[position].value{
-                    let index=PROPERTIES.iter().position(|property|property.name==entry.name.as_ref()).ok_or_else(limit)?;
+                    let index=registry_index(entry.name.as_ref()).ok_or_else(limit)?;
                     let mut before=(**group).clone();let mut after=before.clone();
                     if source{before.clear(index);if before.empty(){entries.remove(position);}else{entries[position].value=Specified::All(Arc::new(before));}}
                     else{
@@ -1230,6 +1379,7 @@ impl DeclarationBlock {
         })
     }
     pub fn len(&self)->usize{self.views().count()}
+    pub fn retain_properties(&mut self,keep:impl Fn(&str)->bool){self.entries.retain(|entry|keep(&entry.name));}
     pub fn is_empty(&self)->bool{self.entries.is_empty()}
 
     pub fn value(&self, name: &str) -> Option<(String, bool)> {
@@ -1273,8 +1423,10 @@ impl DeclarationBlock {
             return None;
         }
         if let Specified::Pending(group) = &entries[0].value {
-            return (group.property == name && entries.iter().all(|entry| matches!(&entry.value, Specified::Pending(other) if Arc::ptr_eq(group, other))))
-                .then(|| (group.value.to_string(), important));
+            if !entries.iter().all(|entry| matches!(&entry.value, Specified::Pending(other) if Arc::ptr_eq(group, other))) {
+                return None;
+            }
+            return Some(if group.property == name { (group.value.to_string(), important) } else { (String::new(), important) });
         }
         let mut values = [""; 17];
         for (index, entry) in entries.iter().enumerate() {
@@ -1437,9 +1589,14 @@ const SHORTHANDS: &[&str] = &[
     "border",
     "font",
     "background",
+    "background-position",
+    "mask",
     "grid",
     "grid-template",
     "grid-lanes",
+    "grid-area",
+    "grid-row",
+    "grid-column",
     "border-inline-width",
     "border-inline-style",
     "border-inline-color",
@@ -1473,10 +1630,51 @@ const SHORTHANDS: &[&str] = &[
     "place-self",
     "place-content",
     "gap",
+    "position-try",
+    "offset",
     "flex",
     "flex-flow",
     "columns",
     "column-rule",
+    "row-rule",
+    "rule",
+    "rule-width",
+    "rule-color",
+    "rule-style",
+    "rule-break",
+    "rule-visibility-items",
+    "column-rule-inset",
+    "row-rule-inset",
+    "rule-inset",
+    "column-rule-inset-cap",
+    "row-rule-inset-cap",
+    "rule-inset-cap",
+    "column-rule-inset-junction",
+    "row-rule-inset-junction",
+    "rule-inset-junction",
+    "column-rule-inset-start",
+    "row-rule-inset-start",
+    "rule-inset-start",
+    "column-rule-inset-end",
+    "row-rule-inset-end",
+    "rule-inset-end",
+    "border-top-radius",
+    "border-right-radius",
+    "border-bottom-radius",
+    "border-left-radius",
+    "border-block-start-radius",
+    "border-block-end-radius",
+    "border-inline-start-radius",
+    "border-inline-end-radius",
+    "corner-shape",
+    "corner-top-shape",
+    "corner-right-shape",
+    "corner-bottom-shape",
+    "corner-left-shape",
+    "corner-inline-start-shape",
+    "corner-inline-end-shape",
+    "corner-block-start-shape",
+    "corner-block-end-shape",
     "list-style",
     "overflow",
 ];
@@ -1496,13 +1694,33 @@ pub fn serialize_box_sides(values: [&str; 4]) -> String {
 }
 
 fn synthesize(name: &str, values: &[&str]) -> Option<String> {
+    if name == "offset" {
+        let &[position, path, distance, rotate, anchor] = values else { return None };
+        return super::shapes::offset_shorthand_text([position, path, distance, rotate, anchor]);
+    }
+    if name == "position-try" {
+        let &[order, fallbacks] = values else { return None };
+        return Some(anchor::serialize_position_try(order, fallbacks));
+    }
+    if super::extra_props::is_shorthand(name) {
+        return super::extra_props::synthesize_shorthand(name, values);
+    }
+    if super::corner_radii::is_shorthand(name) {
+        return super::corner_radii::synthesize(name, values);
+    }
+    if super::grid_lines::is_shorthand(name) {
+        return super::grid_lines::synthesize(name, values);
+    }
+    if super::text_props::is_shorthand(name) {
+        return super::text_props::shorthand_value(name, values);
+    }
     if let Some(slot)=super::break_control::slot(name).filter(|_|name.starts_with("page-")) {
         let [value]=values else{return None;};
         let target=match slot{247=>"break-before",248=>"break-after",_=>"break-inside"};
         if ["initial","inherit","unset","revert","revert-layer"].contains(value){return Some((*value).into());}
         return Some(super::break_control::serialize(name,super::break_control::parse(target,value)?)?.into());
     }
-    if name=="columns" {return match values{[width,count]=>Some(super::columns::shorthand_value(width,count)),_=>None};}
+    if name=="columns" {return match values{[width,count,height,"auto"]=>Some(super::columns::shorthand_with_height(width,count,height)),_=>None};}
     if name=="contain-intrinsic-size" {return match values{[a,b]=>Some(if a==b{(*a).into()}else{alloc::format!("{a} {b}")}),_=>None};}
     if name=="animation" {return animation_controls::shorthand(values);}
     if name=="animation-range" {return animation_controls::range_shorthand(values);}
@@ -1533,6 +1751,9 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
     if name == "background" {
         return serialize_background(values);
     }
+    if name == "mask" {
+        return super::mask_shorthand::synthesize(values);
+    }
     if name == "list-style" {
         let mut result = [""; 3];
         let mut count = 0;
@@ -1558,7 +1779,7 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
     }
     if name == "outline" {
         return Some(serialize_outline_components(
-            values[0], values[1], values[2],
+            values[2], values[1], values[0],
         ));
     }
     if name == "border" {
@@ -1598,10 +1819,10 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         return Some(serialize_border_components(values[0], values[1], values[2]));
     }
     if name == "font-variant" {
-        return serialize_font_variant(FontVariantCaps::parse(values[1])?, font_ligatures(values[0])?, font_feature_values::parse_alternates(values[2])?.as_deref());
+        return super::font_variant::serialize(FontVariantCaps::parse(values[1])?, font_ligatures(values[0])?, font_feature_values::parse_alternates(values[2])?.as_deref(), [values[3], values[4], values[5], values[6]]);
     }
     if name == "font" {
-        if values[10] != "normal" || values[9] != "normal" || values[8] != "normal" || values[7] != "none" || values[1] != "normal" && values[1] != "small-caps" {
+        if values[10] != "normal" || values[9] != "normal" || values[8] != "normal" || values[11..15].iter().any(|value| *value != "normal") || values[7] != "none" || values[1] != "normal" && values[1] != "small-caps" {
             return None;
         }
         let mut parts = Vec::new();
@@ -1674,6 +1895,9 @@ pub(super) fn serialize_background_box(value: BackgroundBox) -> &'static str {
 }
 
 fn serialize_background(values: &[&str]) -> Option<String> {
+    let &[color, image, position_x, position_y, size, repeat, attachment, origin, clip] = values else { return None };
+    let positions = super::background_positions::synthesize("background-position", &[position_x, position_y])?;
+    let values = [color, image, positions.as_str(), size, repeat, attachment, origin, clip];
     let mut components: [Vec<&str>; 7] = core::array::from_fn(|_| Vec::new());
     for (list, value) in components.iter_mut().zip(&values[1..]) {
         *list = top_level_split(value, b',', MAX_BACKGROUND_LAYERS)?;
@@ -1713,12 +1937,15 @@ fn serialize_background(values: &[&str]) -> Option<String> {
             append(attachment);
         }
         if origin != "padding-box" || clip != "border-box" {
-            append(origin);
+            let special_clip = clip.starts_with("border-area") || clip == "text";
+            if !(special_clip && origin == "border-box") {
+                append(origin);
+            }
             if clip != origin {
                 append(clip);
             }
         }
-        if layer + 1 == count && values[0] != "transparent" {
+        if layer + 1 == count && !matches!(values[0], "transparent" | "rgba(0, 0, 0, 0)") {
             append(values[0]);
         }
         if output.len() == start {
@@ -1734,8 +1961,8 @@ fn serialize_background(values: &[&str]) -> Option<String> {
 fn serialize_border_components(width: &str, style: &str, color: &str) -> String {
     serialize_stroke_components([(width, "medium"), (style, "none"), (color, "currentcolor")])
 }
-pub(super) fn serialize_outline_components(color: &str, style: &str, width: &str) -> String {
-    serialize_stroke_components([(color, "currentcolor"), (style, "none"), (width, "medium")])
+fn serialize_outline_components(width: &str, style: &str, color: &str) -> String {
+    serialize_stroke_components([(width, "medium"), (style, "none"), (color, "currentcolor")])
 }
 fn serialize_stroke_components(components: [(&str, &str); 3]) -> String {
     let mut values = [""; 3];
@@ -2014,7 +2241,7 @@ mod tests {
             "outline-width:2px;outline-style:dotted;outline-color:blue;outline-offset:-1px",
         )
         .unwrap();
-        assert_eq!(block.value("outline").unwrap().0, "blue dotted 2px");
+        assert_eq!(block.value("outline").unwrap().0, "2px dotted blue");
         assert_eq!(
             DeclarationBlock::parse(&block.serialize().unwrap())
                 .unwrap()
@@ -2166,9 +2393,9 @@ mod tests {
         let block = DeclarationBlock::parse("background:url(\"a,b.png\") 1em 20% / 2em auto no-repeat fixed content-box border-box, red").unwrap();
         assert_eq!(
             block.value("background-position").unwrap().0,
-            "1em 20%,0% 0%"
+            "1em 20%, 0% 0%"
         );
-        assert_eq!(block.value("background-size").unwrap().0, "2em auto,auto");
+        assert_eq!(block.value("background-size").unwrap().0, "2em auto, auto");
         let text = block.serialize().unwrap();
         let roundtrip = DeclarationBlock::parse(&text).unwrap();
         for name in longhands("background") {
@@ -2623,7 +2850,7 @@ mod tests {
             assert!(!is_shorthand(longhand), "{longhand}");
         }
         assert!(slots("width").len() > 1);
-        assert_eq!(slots("columns").len(), 2);
+        assert_eq!(slots("columns").len(), 4);
     }
     #[test]
     fn specification_appearance_legacy_alias_has_one_canonical_declaration_identity() {

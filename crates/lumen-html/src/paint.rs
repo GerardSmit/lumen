@@ -286,7 +286,7 @@ pub fn font_match_rank(
     actual_weight: u16,
     actual_stretch: f32,
 ) -> Option<FontMatchRank> {
-    if requested.unresolved_style.is_some() || requested.unresolved_stretch.is_some() || !(1..=1000).contains(&requested.weight)
+    if requested.unresolved_style.is_some() || requested.unresolved_stretch.is_some()
         || !(1..=1000).contains(&actual_weight)
         || !requested.stretch.is_finite()
         || requested.stretch < 0.0
@@ -311,7 +311,7 @@ pub fn font_match_rank(
     } else {
         (1, u32::MAX - bits)
     };
-    let (weight_group, weight_order) = font_weight_rank(requested.weight, actual_weight);
+    let (weight_group, weight_order) = font_weight_rank(requested.weight.clamp(1, 1000), actual_weight);
     let (style_group, style_order) = font_style_rank(requested.style, actual_style);
     Some(FontMatchRank {
         stretch_group,
@@ -369,8 +369,9 @@ pub fn font_match_style_range_rank(
     {
         return None;
     }
-    let weights = if (weight_range[0]..=weight_range[1]).contains(&requested.weight) {
-        [Some(requested.weight), None]
+    let requested_weight = requested.weight.clamp(1, 1000);
+    let weights = if (weight_range[0]..=weight_range[1]).contains(&requested_weight) {
+        [Some(requested_weight), None]
     } else {
         [Some(weight_range[0]), Some(weight_range[1])]
     };
@@ -565,6 +566,8 @@ pub struct FontSpec {
     /// Shared declaration-origin shadow roots, nearest first; None is document scope.
     pub family_scope: Option<Arc<[crate::NodeId]>>,
     pub weight: u16,
+    /// Thousandths added to `weight`; zero for integral weights.
+    pub weight_fraction: u16,
     pub style: FontStyle,
     /// Valid angle math awaiting an owner's real query-container context.
     /// The bounded tree is shared; unresolved values must not select a face.
@@ -589,6 +592,7 @@ impl Default for FontSpec {
             families: None,
             family_scope: None,
             weight: 400,
+            weight_fraction: 0,
             style: FontStyle::Normal,
             unresolved_style: None,
             unresolved_stretch: None,
@@ -601,6 +605,28 @@ impl Default for FontSpec {
             disable_optional_ligatures: false,
             synthesize_small_caps: true,
         }
+    }
+}
+
+impl FontSpec {
+    pub fn weight_milli(&self) -> u32 {
+        u32::from(self.weight) * 1000 + u32::from(self.weight_fraction)
+    }
+
+    pub fn set_weight_milli(&mut self, milli: u32) {
+        let milli = milli.clamp(1000, 1_000_000);
+        self.weight = (milli / 1000) as u16;
+        self.weight_fraction = (milli % 1000) as u16;
+    }
+
+    pub fn weight_text(&self) -> alloc::string::String {
+        let mut text = alloc::format!("{}", self.weight);
+        if self.weight_fraction != 0 {
+            let fraction = alloc::format!("{:03}", self.weight_fraction);
+            text.push('.');
+            text.push_str(fraction.trim_end_matches('0'));
+        }
+        text
     }
 }
 

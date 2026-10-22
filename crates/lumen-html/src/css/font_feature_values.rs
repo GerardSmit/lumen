@@ -139,7 +139,9 @@ pub fn serialize_family_names(families:&[Arc<str>])->String {
 pub fn serialize_rule(families:&[Arc<str>],display:Option<FontDisplay>,aliases:&[FeatureAlias])->String{
     let mut text=alloc::format!("@font-feature-values {} {{",serialize_family_names(families));
     if let Some(display)=display {let mut descriptor=FontFaceDescriptors::default();descriptor.display=display;text.push_str(&alloc::format!(" font-display: {};",descriptor.get("display").unwrap()));}
-    for kind in FeatureKind::ALL {let mut values=aliases.iter().filter(|alias|alias.kind==kind).collect::<Vec<_>>();if values.is_empty(){continue;}values.sort_by(|a,b|a.name.cmp(&b.name));text.push_str(&alloc::format!(" @{} {{",kind.name()));for alias in values{text.push_str(&alloc::format!(" {}: {};",serialize_identifier(&alias.name),alias.indices.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")));}text.push_str(" }");}
+    let mut kinds:Vec<FeatureKind>=Vec::new();
+    for alias in aliases {if !kinds.contains(&alias.kind){kinds.push(alias.kind);}}
+    for kind in kinds {let values=aliases.iter().filter(|alias|alias.kind==kind).collect::<Vec<_>>();text.push_str(&alloc::format!(" @{} {{",kind.name()));for alias in values{text.push_str(&alloc::format!(" {}: {};",serialize_identifier(&alias.name),alias.indices.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")));}text.push_str(" }");}
     text.push_str(" }");text
 }
 
@@ -154,7 +156,7 @@ mod tests {
         assert_eq!(aliases.iter().map(|alias|alias.name.as_ref()).collect::<Vec<_>>(),[":first","middle",":last"]);
         let text=serialize_rule(&parsed.family_display[0].families,None,aliases);
         let again=parse_stylesheet(&text).unwrap();
-        assert_eq!(again.family_display[0].aliases.iter().map(|alias|alias.name.as_ref()).collect::<Vec<_>>(),[":first",":last","middle"],"canonical serialization sorts aliases");
+        assert_eq!(again.family_display[0].aliases.iter().map(|alias|alias.name.as_ref()).collect::<Vec<_>>(),[":first","middle",":last"],"serialization keeps source order");
         for alias in aliases.iter() {
             assert_eq!(again.family_display[0].aliases.iter().find(|next|next.name==alias.name),Some(alias));
         }

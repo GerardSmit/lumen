@@ -85,7 +85,7 @@ impl NamespaceMap {
                 // Other invalid/unknown statements are ignored.
                 continue;
             }
-            if !prelude.starts_with('@') || ["@media","@supports","@layer","@scope","@font-face","@keyframes","@starting-style"].iter().any(|name|nesting::at_rule(prelude,name)) {
+            if !prelude.starts_with('@') || ["@media","@supports","@layer","@scope","@font-face","@keyframes","@starting-style","@container"].iter().any(|name|nesting::at_rule(prelude,name)) {
                 phase=3;
             }
         }

@@ -15,21 +15,57 @@ fn length(raw:&str,environment:MediaEnvironment)->Option<f64> {
     let value=expression.evaluate(&mut FontAngleContext{length:Some(context),query:ContainerUnitContext::no_container(environment),percent_scale:0.01})?;
     value.is_finite().then_some(value)
 }
+const DEVICE_WIDTH:f64=1280.0;
+const DEVICE_HEIGHT:f64=720.0;
 fn actual(name:&str,environment:MediaEnvironment)->Option<f64> {
-    match name {"width"=>Some(f64::from(environment.width)),"height"=>Some(f64::from(environment.height)),"resolution"=>Some(f64::from(environment.resolution)),"aspect-ratio"=>Some(f64::from(environment.width)/f64::from(environment.height)),_=>None}
+    match name {
+        "width"=>Some(f64::from(environment.width)),"height"=>Some(f64::from(environment.height)),
+        "resolution"=>Some(f64::from(environment.resolution)),"aspect-ratio"=>Some(f64::from(environment.width)/f64::from(environment.height)),
+        "device-width"=>Some(DEVICE_WIDTH),"device-height"=>Some(DEVICE_HEIGHT),"device-aspect-ratio"=>Some(DEVICE_WIDTH/DEVICE_HEIGHT),
+        "color"=>Some(8.0),"color-index"|"monochrome"|"grid"=>Some(0.0),
+        _=>None,
+    }
+}
+/// Discrete features: the accepted keywords and the value of the reference display.
+fn discrete(name:&str)->Option<(&'static [&'static str],&'static str)> {
+    Some(match name {
+        "hover"|"any-hover"=>(&["none","hover"],"hover"),
+        "pointer"|"any-pointer"=>(&["none","coarse","fine"],"fine"),
+        "overflow-block"=>(&["none","scroll","paged"],"scroll"),
+        "overflow-inline"=>(&["none","scroll"],"scroll"),
+        "update"=>(&["none","slow","fast"],"fast"),
+        "scan"=>(&["interlace","progressive"],"none"),
+        "prefers-reduced-motion"|"prefers-reduced-data"|"prefers-reduced-transparency"=>(&["no-preference","reduce"],"no-preference"),
+        "prefers-contrast"=>(&["no-preference","more","less","custom"],"no-preference"),
+        "forced-colors"=>(&["none","active"],"none"),
+        "inverted-colors"=>(&["none","inverted"],"none"),
+        "scripting"=>(&["none","initial-only","enabled"],"enabled"),
+        "display-mode"=>(&["fullscreen","standalone","minimal-ui","browser","picture-in-picture","window-controls-overlay"],"browser"),
+        "dynamic-range"|"video-dynamic-range"=>(&["standard","high"],"standard"),
+        "color-gamut"=>(&["srgb","p3","rec2020"],"srgb"),
+        "navigation-controls"=>(&["none","back-button"],"none"),
+        _=>return None,
+    })
+}
+fn integer(raw:&str)->Option<f64> {
+    let digits=raw.trim().strip_prefix(['+','-']).unwrap_or(raw.trim());
+    if digits.is_empty()||!digits.bytes().all(|byte|byte.is_ascii_digit()){return None;}
+    raw.trim().parse::<f64>().ok()
 }
 fn expected(name:&str,raw:&str,environment:MediaEnvironment)->Option<f64> {
     match name {
-        "width"|"height"=>length(raw,environment),
+        "width"|"height"|"device-width"|"device-height"=>length(raw,environment),
+        "color"|"color-index"|"monochrome"=>integer(raw),
+        "grid"=>integer(raw).filter(|value|*value==0.0||*value==1.0),
         "resolution"=>{
             let mut expression=typed_numeric::parse_numeric_expression(raw)?;
             expression.simplify_absolute_units();
             if expression.numeric_type()?!=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Dppx){return None;}
             let mut context=static_length_context();context.viewport=environment;
             let value=expression.evaluate(&mut FontAngleContext{length:Some(context),query:ContainerUnitContext::no_container(environment),percent_scale:0.01})?;
-            value.is_finite().then_some(value)
+            (value.is_finite()&&value>=0.0).then_some(value)
         },
-        "aspect-ratio"=>{let (a,b)=raw.split_once('/').unwrap_or((raw,"1"));let a=typed_numeric::parse_numeric_value(a.trim())?;let b=typed_numeric::parse_numeric_value(b.trim())?;(a.unit==typed_numeric::NumericUnit::Number&&b.unit==typed_numeric::NumericUnit::Number&&a.value>=0.0&&b.value>0.0).then_some(a.value/b.value)},
+        "aspect-ratio"|"device-aspect-ratio"=>{let (a,b)=raw.split_once('/').unwrap_or((raw,"1"));let a=typed_numeric::parse_numeric_value(a.trim())?;let b=typed_numeric::parse_numeric_value(b.trim())?;(a.unit==typed_numeric::NumericUnit::Number&&b.unit==typed_numeric::NumericUnit::Number&&a.value>=0.0&&b.value>=0.0).then_some(if b.value==0.0{if a.value==0.0{f64::NAN}else{f64::INFINITY}}else{a.value/b.value})},
         _=>None,
     }
 }
@@ -51,6 +87,9 @@ fn feature(body:&str,environment:MediaEnvironment)->Option<Truth> {
     if let Some(colon)=colon {
         if !operators.is_empty(){return None;}
         let name=keyword_value(body[..colon].trim())?;let value=body[colon+1..].trim();
+        if let Some((accepted,current))=discrete(&name) {
+            return Some(match keyword_value(value) {Some(value) if accepted.contains(&value.as_str())=>Truth::Known(value==current),_=>Truth::Unknown});
+        }
         if name=="prefers-color-scheme" {return Some(match keyword_value(value).as_deref(){Some("light")=>Truth::Known(environment.color_schemes.page().scheme==UsedColorScheme::Light),Some("dark")=>Truth::Known(environment.color_schemes.page().scheme==UsedColorScheme::Dark),_=>Truth::Unknown});}
         if name=="orientation" {return Some(match keyword_value(value).as_deref(){Some("portrait")=>Truth::Known(environment.height>=environment.width),Some("landscape")=>Truth::Known(environment.width>environment.height),_=>Truth::Unknown});}
         let (name,op)=if let Some(name)=name.strip_prefix("min-"){(name,">=")}else if let Some(name)=name.strip_prefix("max-"){(name,"<=")}else{(name.as_str(),"=")};
@@ -58,6 +97,7 @@ fn feature(body:&str,environment:MediaEnvironment)->Option<Truth> {
     }
     if operators.is_empty(){
         let Some(name)=keyword_value(body)else{return Some(Truth::Unknown);};
+        if let Some((_,current))=discrete(&name) {return Some(Truth::Known(!matches!(current,"none"|"no-preference")));}
         return Some(actual(&name,environment).map_or_else(||if matches!(name.as_str(),"orientation"|"prefers-color-scheme"){Truth::Known(true)}else{Truth::Unknown},|value|Truth::Known(value!=0.0)));
     }
     let first=operators[0];let left=body[..first.0].trim();let middle=body[first.1..operators.get(1).map_or(body.len(),|op|op.0)].trim();
@@ -82,8 +122,9 @@ fn condition(raw:&str,environment:MediaEnvironment,depth:usize)->Option<Truth> {
     let parts=components(raw)?;if parts.is_empty(){return None;}
     if decoded_css_keyword(parts[0],"not") {if parts.len()!=2{return None;}return condition(parts[1],environment,depth+1).map(Truth::not);}
     if parts.len()==1 {
-        let inner=parts[0].strip_prefix('(')?.strip_suffix(')')?;
-        if let Some(value)=condition(inner,environment,depth+1){return Some(value);}
+        let Some(inner)=parts[0].strip_prefix('(').and_then(|value|value.strip_suffix(')')) else {return Some(Truth::Unknown);};
+        let nested=components(inner).is_some_and(|parts|parts.len()!=1||parts[0].starts_with('('));
+        if nested {if let Some(value)=condition(inner,environment,depth+1){return Some(value);}}
         return feature(inner,environment);
     }
     if parts.len()%2==0{return None;}
@@ -97,7 +138,9 @@ fn condition(raw:&str,environment:MediaEnvironment,depth:usize)->Option<Truth> {
 }
 pub(super) fn condition_matches(raw:&str,environment:MediaEnvironment)->bool {condition(raw,environment,0).is_some_and(Truth::matches)}
 pub(super) fn query_matches(raw:&str,environment:MediaEnvironment)->bool {
-    if raw.trim().is_empty(){return true;}
+    if raw.trim().is_empty()||container_eval::is_marker(raw){return true;}
+    let normalized=media_query_text::serialize_list(raw);
+    let raw=normalized.as_str();
     let Some(alternatives)=top_level_split(raw,b',',64)else{return false;};
     alternatives.iter().any(|query|{
         let Some(parts)=components(query)else{return false;};if parts.is_empty(){return false;}

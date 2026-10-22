@@ -109,6 +109,8 @@ pub struct GeometrySnapshot {
     pub offset_width: f32,
     pub offset_height: f32,
     pub border_box_size: (f32, f32),
+    pub client_top: f32,
+    pub client_left: f32,
     pub client_width: f32,
     pub client_height: f32,
     pub content_width: f32,
@@ -129,7 +131,7 @@ pub struct DomRectReadOnly {
 
 #[lumen_bind::methods]
 impl DomRectReadOnly {
-    #[constructor]
+    #[constructor(coerce)]
     fn new(
         #[default(0.0)] x: f64,
         #[default(0.0)] y: f64,
@@ -142,6 +144,11 @@ impl DomRectReadOnly {
             width,
             height,
         }
+    }
+
+    fn from_rect(ctx: &mut Ctx, #[default(Value::Undefined)] other: Value) -> OpResult<Self> {
+        let [x, y, width, height] = value_types::rect_dictionary(ctx, &other)?;
+        Ok(Self { x, y, width, height })
     }
 
     #[getter]
@@ -162,19 +169,19 @@ impl DomRectReadOnly {
     }
     #[getter]
     fn top(&self) -> f64 {
-        self.y.min(self.y + self.height)
+        value_types::nan_min(self.y, self.y + self.height)
     }
     #[getter]
     fn right(&self) -> f64 {
-        self.x.max(self.x + self.width)
+        value_types::nan_max(self.x, self.x + self.width)
     }
     #[getter]
     fn bottom(&self) -> f64 {
-        self.y.max(self.y + self.height)
+        value_types::nan_max(self.y, self.y + self.height)
     }
     #[getter]
     fn left(&self) -> f64 {
-        self.x.min(self.x + self.width)
+        value_types::nan_min(self.x, self.x + self.width)
     }
 
     #[method(name = "toJSON")]
@@ -204,7 +211,7 @@ pub struct DomRect {
 
 #[lumen_bind::methods]
 impl DomRect {
-    #[constructor]
+    #[constructor(coerce)]
     fn new(
         #[default(0.0)] x: f64,
         #[default(0.0)] y: f64,
@@ -220,6 +227,11 @@ impl DomRect {
             },
         }
     }
+    fn from_rect(ctx: &mut Ctx, #[default(Value::Undefined)] other: Value) -> OpResult<Self> {
+        let [x, y, width, height] = value_types::rect_dictionary(ctx, &other)?;
+        Ok(Self { base: DomRectReadOnly { x, y, width, height } })
+    }
+
     #[getter]
     fn x(&self) -> f64 {
         self.base.x
@@ -260,15 +272,13 @@ pub struct DomRectList {
 }
 #[lumen_bind::methods]
 impl DomRectList {
-    #[constructor]
-    fn new() -> Self {
-        Self { rects: Vec::new() }
-    }
     #[getter]
     fn length(&self) -> usize {
         self.rects.len()
     }
-    fn item(&self, ctx: &mut Ctx, index: usize) -> Value {
+    #[method(coerce)]
+    fn item(&self, ctx: &mut Ctx, index: f64) -> Value {
+        let index = if index.is_finite() { index.trunc().rem_euclid(4294967296.0) as usize } else { usize::MAX };
         self.rects
             .get(index)
             .copied()
@@ -568,6 +578,8 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
         offset_width: layout_box.width.round(),
         offset_height: layout_box.height.round(),
         border_box_size: (layout_box.width, layout_box.height),
+        client_top: if client_size == (0.0, 0.0) { 0.0 } else { metrics.border[0].round() },
+        client_left: if client_size == (0.0, 0.0) { 0.0 } else { metrics.border[3].round() },
         client_width: client_size.0,
         client_height: client_size.1,
         content_width: metrics.content_width,

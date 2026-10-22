@@ -1,13 +1,26 @@
 use lumen_html::{
     html, layout,
-    paint::{self, Command, Rect, ShapedRun, TextShaper},
+    paint::{self, Command, Glyph, Rect, ShapedRun, TextShaper},
 };
 
 struct Font;
 impl TextShaper for Font {
     fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
         Ok(ShapedRun {
-            glyphs: Vec::new().into(),
+            glyphs: text
+                .char_indices()
+                .enumerate()
+                .map(|(index, (cluster, character))| Glyph {
+                    id: character as u16,
+                    face: 0,
+                    cluster: cluster as u32,
+                    caps_expansion: 0,
+                    x: index as f32 * 8.0,
+                    y: 0.0,
+                    size_scale: 1.0,
+                })
+                .collect::<Vec<_>>()
+                .into(),
             width: text.len() as f32 * 8.0,
         })
     }
@@ -73,9 +86,12 @@ fn absolute_bottom_uses_auto_height_ancestor() {
 #[test]
 fn float_sides_and_clear() {
     let rects = boxes("<style>body{margin:0}div{background:red;height:30px;width:40px}#a{float:left}#b{float:right}#c{clear:both}</style><div id=a></div><div id=b></div><div id=c></div>");
-    assert_eq!(rects[0].x, 0.0);
-    assert_eq!(rects[1].x, 280.0);
-    assert_eq!(rects[2].y, 30.0);
+    // Floats paint after the in-flow block surfaces (CSS 2 Appendix E), so the
+    // cleared block's background comes first.
+    assert_eq!(rects.len(), 3);
+    assert_eq!((rects[0].x, rects[0].y), (0.0, 30.0));
+    assert_eq!((rects[1].x, rects[1].y), (0.0, 0.0));
+    assert_eq!((rects[2].x, rects[2].y), (280.0, 0.0));
 }
 #[test]
 fn asymmetric_boxes_and_sibling_margins() {

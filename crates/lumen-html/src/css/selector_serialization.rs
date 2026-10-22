@@ -147,6 +147,11 @@ fn arguments(name: &str, input: &str, map: &NamespaceMap, nesting: bool, depth: 
             let name = consume_selector_identifier(input, &mut position).filter(|_| position == input.len()).ok_or_else(|| selector_error(0, "invalid highlight identifier"))?;
             Ok(serialize_identifier(&name))
         },
+        "view-transition-group" | "view-transition-image-pair" | "view-transition-old" | "view-transition-new" => {
+            super::view_transition_selector::parse_argument(input)
+                .map(|argument| argument.serialize())
+                .ok_or_else(|| selector_error(0, "invalid view transition name"))
+        },
         "part" => Ok(input.split_ascii_whitespace().map(serialize_identifier).collect::<Vec<_>>().join(" ")),
         "heading" => {
             let values = comma_components(input, MAX_SELECTOR_COMPOUNDS).ok_or_else(|| selector_error(0, "invalid heading list"))?;

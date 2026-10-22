@@ -320,6 +320,9 @@ pub(crate) struct InvalidationSets {
     /// nesting: the key of the compound holding them, which every element
     /// the arguments are matched against has.
     enclosing_key: Option<AnchorKey>,
+    /// The next `add` is a selector with combinators inside a `:has()`
+    /// argument's nested list: its ancestor chain is unscoped.
+    free_chain: bool,
 }
 
 /// The subject keys of `:has()` arguments, as seen by a `Collector`.
@@ -428,6 +431,33 @@ impl AnchorKey {
     }
 }
 
+/// Whether matching `selector` (a compound chain) can look at siblings of
+/// elements, through its own combinators or those inside logical arguments.
+fn reads_siblings(selector: &Selector) -> bool {
+    let mut compound = Some(selector);
+    while let Some(current) = compound {
+        for pseudo in &current.logical {
+            let nested = match pseudo {
+                LogicalPseudo::Not(list) | LogicalPseudo::Is(list) | LogicalPseudo::Where(list) => list.iter().any(reads_siblings),
+                LogicalPseudo::Nesting(list) => list.iter().any(reads_siblings),
+                LogicalPseudo::Has(relatives) => relatives.iter().any(|relative| {
+                    matches!(relative.relation, Relation::Adjacent | Relation::Following) || reads_siblings(&relative.selector)
+                }),
+                _ => false,
+            };
+            if nested {
+                return true;
+            }
+        }
+        compound = match &current.ancestor {
+            Some((Relation::Adjacent | Relation::Following, _)) => return true,
+            Some((_, next)) => Some(&**next),
+            None => None,
+        };
+    }
+    false
+}
+
 impl InvalidationSets {
     pub(crate) fn new(rules: &[Rule]) -> Self {
         let mut sets = Self::default();
@@ -460,6 +490,7 @@ impl InvalidationSets {
     /// rule's subject compound, which a change in an ancestor position
     /// reaches.
     fn add(&mut self, selector: &Selector, position: Position, subject: &Features) {
+        let free_chain = core::mem::take(&mut self.free_chain);
         // `:host`, `::slotted()` and `::part()` cross tree scopes. A lone
         // `:host` subject compound matches only the host element itself.
         let lone_host = selector.host && position == Position::Subject && selector.ancestor.is_none();
@@ -549,7 +580,7 @@ impl InvalidationSets {
                     let enclosing = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone());
                     let saved = core::mem::replace(&mut self.enclosing_key, enclosing);
                     for inner in list {
-                        self.add(inner, position, subject);
+                        self.add_nested(inner, position, subject);
                     }
                     self.enclosing_key = saved;
                 }
@@ -557,7 +588,7 @@ impl InvalidationSets {
                     let enclosing = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone());
                     let saved = core::mem::replace(&mut self.enclosing_key, enclosing);
                     for inner in list.iter() {
-                        self.add(inner, position, subject);
+                        self.add_nested(inner, position, subject);
                     }
                     self.enclosing_key = saved;
                 }
@@ -601,11 +632,19 @@ impl InvalidationSets {
                     self.state |= reach;
                     self.custom_states = true;
                 }
-                LogicalPseudo::Heading(_) | LogicalPseudo::InvalidNesting => {}
+                LogicalPseudo::Heading(_) => {
+                    // A heading's level reads `headingoffset` and
+                    // `headingreset` on itself and every ancestor.
+                    for name in ["headingoffset", "headingreset"] {
+                        self.attribute_subjects.entry(String::from(name)).or_default().merge(subject);
+                        *self.attributes.entry(String::from(name)).or_default() |= reach | SUBTREE;
+                    }
+                }
+                LogicalPseudo::InvalidNesting => {}
             }
         }
         if let Some((relation, ancestor)) = &selector.ancestor {
-            let next = position.through(relation);
+            let next = if free_chain { Position::Document } else { position.through(relation) };
             if matches!(relation, Relation::Adjacent | Relation::Following) {
                 let keyed_position = matches!(position, Position::Subject | Position::Sibling | Position::Ancestor | Position::SiblingAncestor);
                 let left = AnchorKey::of(ancestor).filter(|_| keyed_position && AnchorKey::of(selector).is_none() && self.enclosing_key.is_none());
@@ -625,21 +664,22 @@ impl InvalidationSets {
         }
     }
 
+    /// `add` for a selector inside `:is()`, `:not()`, `:where()` or nesting.
+    /// Inside a `:has()` argument those are not scoped to the anchor: the
+    /// compounds left of a combinator can be anywhere around the element the
+    /// argument matches, so a change to them is not bounded by tree position.
+    fn add_nested(&mut self, selector: &Selector, position: Position, subject: &Features) {
+        if matches!(position, Position::Relative | Position::Anchored) && selector.ancestor.is_some() {
+            self.free_chain = true;
+            self.children |= DOCUMENT;
+        }
+        self.add(selector, position, subject);
+    }
+
     /// Record the key of a subject compound holding a `:has()`.
     fn relative(&mut self, selector: &Selector, relatives: &[RelativeSelector]) {
         let siblings = relatives.iter().any(|relative| {
-            let mut compound = Some(&relative.selector);
-            let mut sibling = matches!(relative.relation, Relation::Adjacent | Relation::Following);
-            while let Some(current) = compound {
-                if sibling {
-                    return true;
-                }
-                compound = current.ancestor.as_ref().map(|(relation, next)| {
-                    sibling = matches!(relation, Relation::Adjacent | Relation::Following);
-                    &**next
-                });
-            }
-            false
+            matches!(relative.relation, Relation::Adjacent | Relation::Following) || reads_siblings(&relative.selector)
         });
         let Some(key) = AnchorKey::of(selector).or_else(|| self.enclosing_key.clone()) else {
             self.unkeyed_relatives = true;
@@ -720,8 +760,15 @@ impl InvalidationSets {
                     Some(old) => self.id_key(old, spread),
                     None => spread.narrow(self.any_id, Some(&self.any_id_subjects)),
                 };
+                if let Some(keyed) = self.attributes.get("id") {
+                    reach |= spread.narrow(*keyed, self.attribute_subjects.get("id"));
+                }
             }
-            "style" => {}
+            "style" => {
+                if let Some(keyed) = self.attributes.get("style") {
+                    reach |= spread.narrow(*keyed, self.attribute_subjects.get("style"));
+                }
+            }
             _ => {
                 let lower = name.to_ascii_lowercase();
                 if let Some(keyed) = self.attributes.get(lower.as_str()) {

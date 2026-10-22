@@ -29,7 +29,7 @@ impl Default for BorderImage {
 }
 impl BorderImageDimension {
     pub fn used(&self,border:f32,area:f32,automatic:f32)->f32 {match self {Self::Number(value)=>value*border,Self::Length(value)=>value.used(area).unwrap_or(0.0).max(0.0),Self::Auto=>automatic}}
-    fn serialize(&self)->String {match self {Self::Number(value)=>computed_values::number(*value),Self::Length(value)=>value.computed(),Self::Auto=>"auto".into()}}
+    fn serialize(&self)->String {match self {Self::Number(value)=>computed_values::number(*value),Self::Length(value)=>{let text=value.computed();if text.starts_with('-')&&text.ends_with("px")&&!text.contains(' '){"0px".into()}else{text}},Self::Auto=>"auto".into()}}
 }
 fn quad<T:Clone>(values:&[T])->Option<[T;4]> {Some(match values {[a]=>[a.clone(),a.clone(),a.clone(),a.clone()],[a,b]=>[a.clone(),b.clone(),a.clone(),b.clone()],[a,b,c]=>[a.clone(),b.clone(),c.clone(),b.clone()],[a,b,c,d]=>[a.clone(),b.clone(),c.clone(),d.clone()],_=>return None})}
 fn scalar(raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<BorderImageSlice> {

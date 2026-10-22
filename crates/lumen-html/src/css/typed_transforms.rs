@@ -507,6 +507,7 @@ fn combine_scalar(a:f64,b:f64,operation:registered_properties::ComputedValueOper
 }
 fn combine_function(a:&ComputedFunction,b:&ComputedFunction,operation:registered_properties::ComputedValueOperation)->Option<ComputedFunction> {
     use registered_properties::ComputedValueOperation as Op;
+    if a.name=="perspective"&&b.name=="perspective"{return combine_perspective(a,b,operation);}
     if matches!(a.name.as_str(),"matrix"|"matrix3d"|"perspective"|"transform-interpolate")||matches!(b.name.as_str(),"matrix"|"matrix3d"|"perspective"|"transform-interpolate"){return None;}
     let (mut a,mut b)=if a.name==b.name&&a.arguments.len()==b.arguments.len(){(a.clone(),b.clone())}
         else if a.family()==b.family(){let three=a.three_dimensional()||b.three_dimensional();(a.primitive(three)?,b.primitive(three)?)}else{return None;};
@@ -532,6 +533,22 @@ fn combine_function(a:&ComputedFunction,b:&ComputedFunction,operation:registered
         }?;
     }
     Some(a)
+}
+/// Perspective lengths combine through their reciprocal, with `none` as zero;
+/// a non-positive reciprocal is no perspective at all.
+fn combine_perspective(a:&ComputedFunction,b:&ComputedFunction,operation:registered_properties::ComputedValueOperation)->Option<ComputedFunction> {
+    use registered_properties::ComputedValueOperation as Op;
+    if let Op::Interpolate(progress)=operation {
+        if progress==0.0{return Some(a.clone());}
+        if progress==1.0{return Some(b.clone());}
+    }
+    let reciprocal=|function:&ComputedFunction|->Option<f64>{
+        if function.arguments.first().map(String::as_str)==Some("none"){return Some(0.0);}
+        Some(1.0/function.scalar(0,None)?.max(1.0))
+    };
+    let value=combine_scalar(reciprocal(a)?,reciprocal(b)?,operation,0.0)?;
+    let length=if value>0.0{typed_numeric::serialize_numeric_value(1.0/value,typed_numeric::NumericUnit::Px)}else{"none".into()};
+    Some(ComputedFunction{name:"perspective".into(),arguments:alloc::vec![length]})
 }
 fn append_function(output:&mut String,value:&str)->Option<()> {
     let extra=value.len().checked_add(usize::from(!output.is_empty()))?;
@@ -587,6 +604,13 @@ fn combine_sequences<T>(a:&[T],b:&[T],operation:registered_properties::ComputedV
         break;
     }
     Some(if output.is_empty(){"none".into()}else{output})
+}
+
+/// Whether a transition may run between two computed transform lists. Lists
+/// whose matrices cannot be decomposed (a singular endpoint) do not interpolate.
+pub fn pair_interpolable(from:&str,to:&str)->bool {
+    if computed_functions(from).is_none()||computed_functions(to).is_none(){return true;}
+    combine_computed(from,to,registered_properties::ComputedValueOperation::Interpolate(0.5),true,None).is_some()
 }
 
 pub fn computed_matrix(input:&str,reference:Option<[f64;2]>)->Option<lumen_common::dom_geometry::Matrix> {

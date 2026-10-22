@@ -70,7 +70,11 @@ impl Matrix {
         let length = x.hypot(y).hypot(z);
         if length == 0.0 { return self; }
         let (x,y,z) = (x/length,y/length,z/length); let (s,c) = sin_cos_degrees(degrees); let t=1.0-c;
-        let rotation = Self { values: [t*x*x+c,t*x*y+s*z,t*x*z-s*y,0.0, t*x*y-s*z,t*y*y+c,t*y*z+s*x,0.0, t*x*z+s*y,t*y*z-s*x,t*z*z+c,0.0, 0.0,0.0,0.0,1.0], is_2d };
+        let mut rotation = Self { values: [t*x*x+c,t*x*y+s*z,t*x*z-s*y,0.0, t*x*y-s*z,t*y*y+c,t*y*z+s*x,0.0, t*x*z+s*y,t*y*z-s*x,t*z*z+c,0.0, 0.0,0.0,0.0,1.0], is_2d };
+        if is_2d {
+            // A z-axis rotation leaves z untouched; t*z*z+c rounds off one.
+            rotation.values[10] = 1.0;
+        }
         self.multiply(rotation)
     }
     pub fn rotated(self, x: f64, y: f64, z: f64) -> Self {

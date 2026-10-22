@@ -374,6 +374,85 @@ crate::event_content_handlers::bind_window_handlers! {
         scroll_window_receiver(ctx, &this.0, args, true)
     }
 
+    #[method]
+    fn move_to(_this: lumen_bind::This<Value>, _x: i32, _y: i32) {}
+
+    #[method]
+    fn move_by(_this: lumen_bind::This<Value>, _x: i32, _y: i32) {}
+
+    #[method]
+    fn resize_to(_this: lumen_bind::This<Value>, _width: i32, _height: i32) {}
+
+    #[method]
+    fn resize_by(_this: lumen_bind::This<Value>, _x: i32, _y: i32) {}
+
+    #[getter(hint(js(global)))]
+    fn screen_x(_this: lumen_bind::This<Value>) -> i32 {
+        0
+    }
+
+    #[getter(hint(js(global)))]
+    fn screen_y(_this: lumen_bind::This<Value>) -> i32 {
+        0
+    }
+
+    #[getter(hint(js(global)))]
+    fn screen_left(_this: lumen_bind::This<Value>) -> i32 {
+        0
+    }
+
+    #[getter(hint(js(global)))]
+    fn screen_top(_this: lumen_bind::This<Value>) -> i32 {
+        0
+    }
+
+    #[getter(hint(js(global)))]
+    fn outer_width(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<u32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.viewport_size().map(|size|size.0))?
+    }
+
+    #[getter(hint(js(global)))]
+    fn outer_height(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<u32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.viewport_size().map(|size|size.1))?
+    }
+
+    #[setter(name = "screenX")]
+    fn set_screen_x(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "screenX", value)
+    }
+
+    #[setter(name = "screenY")]
+    fn set_screen_y(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "screenY", value)
+    }
+
+    #[setter(name = "screenLeft")]
+    fn set_screen_left(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "screenLeft", value)
+    }
+
+    #[setter(name = "screenTop")]
+    fn set_screen_top(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "screenTop", value)
+    }
+
+    #[setter(name = "outerWidth")]
+    fn set_outer_width(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "outerWidth", value)
+    }
+
+    #[setter(name = "outerHeight")]
+    fn set_outer_height(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "outerHeight", value)
+    }
+
+    #[setter(name = "visualViewport")]
+    fn set_visual_viewport(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "visualViewport", value)
+    }
+
     #[getter(hint(js(global)))]
     fn origin(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<String> {
         let realm=window_attribute_realm(ctx,this.0)?;
@@ -1029,6 +1108,13 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         let descriptor=ctx.reflect_get_own_property_descriptor(&prototype,&key).map_err(OpError::thrown)?;
         if !ctx.reflect_define_property(&global,&key,&descriptor).map_err(OpError::thrown)? {
             return Err(OpError::type_error("Window handler attribute could not be installed"));
+        }
+    }
+    for name in ["scroll","scrollTo","scrollBy","moveTo","moveBy","resizeTo","resizeBy"] {
+        let key=Value::str(name);
+        let descriptor=ctx.reflect_get_own_property_descriptor(&prototype,&key).map_err(OpError::thrown)?;
+        if !ctx.reflect_define_property(&global,&key,&descriptor).map_err(OpError::thrown)? {
+            return Err(OpError::type_error("Window operation could not be installed"));
         }
     }
     for (name,callback) in initial_handlers {

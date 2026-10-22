@@ -64,6 +64,16 @@ pub(crate) fn number(value: f32) -> String {
         value.to_string()
     }
 }
+fn snapped_outline_width(width: f32) -> f32 {
+    if width >= 1.0 {
+        width.floor()
+    } else if width > 0.0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 pub(crate) fn px(value: f32) -> String {
     alloc::format!("{}px", number(value))
 }
@@ -131,8 +141,8 @@ fn overflow(value: Overflow) -> &'static str {
         Overflow::Scroll => "scroll",
     }
 }
-fn intrinsic(value: IntrinsicSizing) -> &'static str {
-    value.as_str()
+fn intrinsic(value: IntrinsicSizing) -> String {
+    value.to_css()
 }
 fn side(name: &str) -> Option<usize> {
     if name.contains("-top") {
@@ -186,7 +196,7 @@ fn relative(style: &Style, slot: usize) -> Option<String> {
         .relative_lengths
         .iter()
         .find(|(key, _)| *key == slot)
-        .map(|(_, value)| percentage(value.pixels, value.percent))
+        .map(|(_, value)| if value.pixels == 0.0 && value.percent == 0.0 { String::from("0%") } else { percentage(value.pixels, value.percent) })
         .or_else(|| {
             style
                 .relative_expressions
@@ -307,6 +317,7 @@ pub(super) fn list_type(value: &ListStyleType) -> String {
         ListStyleType::UpperAlpha => "upper-alpha".into(),
         ListStyleType::None => "none".into(),
         ListStyleType::String(value) => serialize_css_string(value),
+        ListStyleType::Unsupported(value) if value.contains('(') => value.to_string(),
         ListStyleType::Unsupported(value) => serialize_identifier(value),
     }
 }
@@ -325,6 +336,38 @@ fn svg_paint(value: &SvgPaint, current: Rgba) -> Option<String> {
         }
         SvgPaint::Unsupported(_) => return None,
     })
+}
+
+pub(crate) fn filters_css_value(
+    filters: Option<&[lumen_common::filter::FilterOperation]>,
+    mut shadow_color: impl FnMut(usize, lumen_common::color::Color) -> Option<String>,
+) -> String {
+    use lumen_common::filter::ColorFilter as F;
+    let Some(filters) = filters else { return "none".into() };
+    let mut shadow_index = 0;
+    filters.iter().map(|filter| {
+        let filter = match filter {
+            lumen_common::filter::FilterOperation::Color(filter) => *filter,
+            lumen_common::filter::FilterOperation::Blur(sigma) => return alloc::format!("blur({})", px(*sigma)),
+            lumen_common::filter::FilterOperation::Url(url) => return super::serialize_url(&url.href),
+            lumen_common::filter::FilterOperation::Resource(resource) => return super::serialize_url(&resource.url),
+            lumen_common::filter::FilterOperation::DropShadow(shadow) => {
+                let color = shadow.color;
+                let offset = shadow.offset;
+                let sigma = shadow.sigma;
+                let color = shadow_color(shadow_index, color).unwrap_or_else(|| "transparent".into());
+                shadow_index += 1;
+                return alloc::format!("drop-shadow({color} {} {} {})", px(offset[0]), px(offset[1]), px(sigma));
+            }
+        };
+        let (name, value, suffix) = match filter {
+            F::Brightness(v) => ("brightness", v, ""), F::Contrast(v) => ("contrast", v, ""),
+            F::Grayscale(v) => ("grayscale", v, ""), F::HueRotate(v) => ("hue-rotate", v, "deg"),
+            F::Invert(v) => ("invert", v, ""), F::Opacity(v) => ("opacity", v, ""),
+            F::Saturate(v) => ("saturate", v, ""), F::Sepia(v) => ("sepia", v, ""),
+        };
+        alloc::format!("{name}({}{suffix})", number(value))
+    }).collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn background_positions_css_value(values: Option<&[[LengthPercentage; 2]]>) -> Option<String> {
@@ -369,6 +412,15 @@ impl Style {
         if slots(name).is_empty() {
             return None;
         }
+        if name == "position-try" {
+            return anchor::computed_position_try(self);
+        }
+        if name == "offset" {
+            return shapes::computed_offset(self);
+        }
+        if let Some(value) = extra_props::computed(self, name) {
+            return Some(value);
+        }
         let resolved = context
             .percentage_basis
             .filter(|_| !self.relative_lengths.is_empty() || !self.relative_expressions.is_empty())
@@ -411,30 +463,7 @@ impl Style {
             "color" => style_color(self,1,self.color),
             "background-color" => style_color(self,2,self.background),
             "opacity" => number(self.opacity),
-            "filter" => self.filters.as_ref().map_or_else(|| "none".into(), |filters| {
-                use lumen_common::filter::ColorFilter as F;
-                let mut shadow_index=0;
-                filters.iter().map(|filter| {
-                    let filter = match filter {
-                        lumen_common::filter::FilterOperation::Color(filter) => *filter,
-                        lumen_common::filter::FilterOperation::Blur(sigma) => return alloc::format!("blur({})",px(*sigma)),
-                        lumen_common::filter::FilterOperation::Url(url)=>return super::serialize_url(&url.href),
-                        lumen_common::filter::FilterOperation::Resource(resource)=>return super::serialize_url(&resource.url),
-                        lumen_common::filter::FilterOperation::DropShadow(shadow) => {
-                            let color=shadow.color;let offset=shadow.offset;let sigma=shadow.sigma;
-                            let color=self.filter_shadow_color_value(shadow_index,color).unwrap_or_else(||"transparent".into());shadow_index+=1;
-                            return alloc::format!("drop-shadow({color} {} {} {})",px(offset[0]),px(offset[1]),px(sigma));
-                        }
-                    };
-                    let (name, value, suffix) = match filter {
-                        F::Brightness(v) => ("brightness", v, ""), F::Contrast(v) => ("contrast", v, ""),
-                        F::Grayscale(v) => ("grayscale", v, ""), F::HueRotate(v) => ("hue-rotate", v, "deg"),
-                        F::Invert(v) => ("invert", v, ""), F::Opacity(v) => ("opacity", v, ""),
-                        F::Saturate(v) => ("saturate", v, ""), F::Sepia(v) => ("sepia", v, ""),
-                    };
-                    alloc::format!("{name}({}{suffix})", number(value))
-                }).collect::<Vec<_>>().join(" ")
-            }),
+            "filter" => filters_css_value(self.filters.as_deref(), |index, color| self.filter_shadow_color_value(index, color)),
 
             "width" => size(self, used, true, context),
             "height" => size(self, used, false, context),
@@ -549,12 +578,13 @@ impl Style {
             }
             "outline-color" => style_color(self,187,self.outline.color.unwrap_or(self.color)),
             "outline-style" => self.outline.style.as_str().into(),
-            "outline-width" => px(self.outline.used_width()),
+            "outline-width" => px(snapped_outline_width(self.outline.width)),
             "outline-offset" => px(self.outline.offset),
-            "outline" => declaration_block::serialize_outline_components(
-                &style_color(self,187,self.outline.color.unwrap_or(self.color)),
+            "outline" => alloc::format!(
+                "{} {} {}",
+                px(snapped_outline_width(self.outline.width)),
                 self.outline.style.as_str(),
-                &px(self.outline.used_width()),
+                style_color(self,187,self.outline.color.unwrap_or(self.color)),
             ),
             "border-width" => four(used.used_border_widths().map(px)),
             "border-style" => four(self.border_styles().map(|value| value.as_str().into())),
@@ -616,7 +646,7 @@ impl Style {
                 || "sans-serif".into(),
                 |value| serialize_font_families(value),
             ),
-            "font-weight" => self.font.weight.to_string(),
+            "font-weight" => self.font.weight_text(),
             "font-width" | "font-stretch" => { if self.font.unresolved_stretch.is_some() { return None; } alloc::format!("{}%", number(self.font.stretch)) },
             "font-style" => {
                 if self.font.unresolved_style.is_some() { return None; }
@@ -628,7 +658,11 @@ impl Style {
             },
             "font-variant-alternates" => font_feature_values::serialize_alternates(self.font.alternates.as_deref()),
             "font-variant-ligatures" => serialize_font_ligatures(self.font.ligatures),
-            "font-variant" => serialize_font_variant(self.font.caps,self.font.ligatures,self.font.alternates.as_deref())?,
+            "font-variant" => {
+                let rest = ["font-variant-numeric", "font-variant-east-asian", "font-variant-position", "font-variant-emoji"]
+                    .map(|name| extra_props::computed(self, name).unwrap_or_else(|| String::from("normal")));
+                font_variant::serialize(self.font.caps, self.font.ligatures, self.font.alternates.as_deref(), [&rest[0], &rest[1], &rest[2], &rest[3]])?
+            }
             "font-variant-caps" => self.font.caps.as_str().into(),
             "font-synthesis-small-caps" => if self.font.synthesize_small_caps {
                 "auto"
@@ -685,18 +719,18 @@ impl Style {
                 self.computed_css_value("flex-direction", context)?,
                 self.computed_css_value("flex-wrap", context)?
             ),
-            "row-gap" => {
+            "row-gap" | "grid-row-gap" => {
                 if self.row_gap_normal {
                     "normal".into()
                 } else {
                     percentage(self.gap, self.row_gap_fraction * 100.0)
                 }
             }
-            "column-gap" => self.column_gap.map_or_else(
+            "column-gap" | "grid-column-gap" => self.column_gap.map_or_else(
                 || "normal".into(),
                 |value| percentage(value, self.column_gap_fraction * 100.0),
             ),
-            "gap" => pair(
+            "gap" | "grid-gap" => pair(
                 self.computed_css_value("row-gap", context)?,
                 self.computed_css_value("column-gap", context)?,
             ),
@@ -736,7 +770,9 @@ impl Style {
             }
             .into(),
             "column-width"=>self.column_width.serialize()?,
-            "columns"=>super::columns::shorthand_value(&self.column_width.serialize()?,&self.column_count.map_or_else(||"auto".into(),|value|value.to_string())),
+            "columns"=>if super::extra_props::stored(self,"column-wrap").as_deref()==Some("auto"){
+                super::columns::shorthand_with_height(&self.column_width.serialize()?,&self.column_count.map_or_else(||"auto".into(),|value|value.to_string()),&super::extra_props::stored(self,"column-height")?)
+            }else{String::new()},
             "aspect-ratio" => self.aspect_ratio_components.or_else(|| self.aspect_ratio.map(|value| [value, 1.0])).map_or_else(
                 || "auto".into(),
                 |value| alloc::format!("{}{} / {}", if self.aspect_ratio_auto { "auto " } else { "" },
@@ -793,7 +829,7 @@ impl Style {
                 "hidden"
             }
             .into(),
-            "user-select" | "-webkit-user-select" => self.user_select.as_str().into(),
+            "user-select" | "-webkit-user-select" => self.user_select_declared.as_str().into(),
             "pointer-events" => if self.pointer_events_auto {
                 "auto"
             } else {
@@ -847,21 +883,10 @@ impl Style {
                 TextAlign::JustifyAll => "justify-all",
             }
             .into(),
-            "text-indent" => lp(self.text_indent),
+            "text-indent" => alloc::format!("{}{}", lp(self.text_indent), super::text_indent::keywords(self.text_indent_mode)),
             "letter-spacing" => self.letter_spacing.map_or_else(|| "normal".into(), px),
             "word-spacing" => lp(self.word_spacing),
-            "vertical-align" => match self.vertical_align {
-                VerticalAlign::Baseline => "baseline".into(),
-                VerticalAlign::Sub => "sub".into(),
-                VerticalAlign::Super => "super".into(),
-                VerticalAlign::TextTop => "text-top".into(),
-                VerticalAlign::Middle => "middle".into(),
-                VerticalAlign::BaselineMiddle => "-webkit-baseline-middle".into(),
-                VerticalAlign::Top => "top".into(),
-                VerticalAlign::Bottom => "bottom".into(),
-                VerticalAlign::TextBottom => "text-bottom".into(),
-                VerticalAlign::Length(value) => lp(value),
-            },
+            "vertical-align" => value_shorthands::computed_shorthand(self, "vertical-align"),
             "text-decoration" => {
                 let line = serialize_text_decoration_line(self.text_decoration);
                 let mut result = String::new();
@@ -1044,6 +1069,7 @@ impl Style {
     }
     fn computed_font(&self, context: ComputedValueContext<'_>) -> Option<String> {
         if !self.font.ligatures.is_normal() || self.font.feature_settings.is_some() || self.font.size_adjust.is_some()
+            || font_variant::RESET_LONGHANDS.iter().any(|name| extra_props::computed(self, name).is_some_and(|value| value != "normal"))
             || !matches!(
                 self.font.caps,
                 FontVariantCaps::Normal | FontVariantCaps::SmallCaps
@@ -1062,8 +1088,8 @@ impl Style {
             result.push_str(self.font.caps.as_str());
             result.push(' ');
         }
-        if self.font.weight != 400 {
-            result.push_str(&self.font.weight.to_string());
+        if self.font.weight != 400 || self.font.weight_fraction != 0 {
+            result.push_str(&self.font.weight_text());
             result.push(' ');
         }
         if self.font.stretch != 100.0 {
@@ -1130,10 +1156,14 @@ fn background_size(value: &BackgroundSize) -> String {
     match value.kind {
         BackgroundSizeKind::Cover => "cover".into(),
         BackgroundSizeKind::Contain => "contain".into(),
-        BackgroundSizeKind::Explicit => pair(
-            value.width.map_or_else(|| "auto".into(), lp),
-            value.height.map_or_else(|| "auto".into(), lp),
-        ),
+        BackgroundSizeKind::Explicit => match (value.width, value.height) {
+            (None, None) => "auto".into(),
+            (width, height) => alloc::format!(
+                "{} {}",
+                width.map_or_else(|| "auto".into(), lp),
+                height.map_or_else(|| "auto".into(), lp)
+            ),
+        },
     }
 }
 fn gradient_color(value:&Gradient,index:usize)->Option<String> {
@@ -1482,7 +1512,7 @@ pub(super) fn specified_grid_tracks(raw: &str) -> Option<String> {
 pub(super) fn serialize_grid_flow(flow: GridAutoFlow) -> String {
     match (flow.column, flow.dense) {
         (false, false) => "row",
-        (false, true) => "row dense",
+        (false, true) => "dense",
         (true, false) => "column",
         (true, true) => "column dense",
     }
@@ -2000,6 +2030,14 @@ impl Style {
                 },
             )?,
             "background" => self.computed_background(context.resolved)?,
+            "mask" => {
+                let mut values = Vec::with_capacity(super::mask_shorthand::LONGHANDS.len());
+                for longhand in super::mask_shorthand::LONGHANDS {
+                    values.push(self.computed_css_value(longhand, context)?);
+                }
+                let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                super::mask_shorthand::synthesize(&values)?
+            }
             "box-shadow" => if context.resolved {
                 match self.source_shadow_list(58) {
                     Some(source) if source.colors.is_some()=>crate::animation::transition_values::serialize_source_shadow_list(name,&source)?,
@@ -2009,17 +2047,20 @@ impl Style {
             "text-shadow" => self.source_shadows_css_value(name)?,
             "transform-origin" => {
                 let values = self.transform_origin;
+                let depth = if self.transform_origin_z == 0.0 { String::new() } else { alloc::format!(" {}", px(self.transform_origin_z)) };
                 if let Some(rect) = transform_reference(self,context) {
                     alloc::format!(
-                        "{} {}",
+                        "{} {}{}",
                         px(values[0].resolve(rect.width)),
-                        px(values[1].resolve(rect.height))
+                        px(values[1].resolve(rect.height)),
+                        depth
                     )
                 } else {
                     alloc::format!(
-                        "{} {}",
+                        "{} {}{}",
                         percentage(values[0].pixels, values[0].percent),
-                        percentage(values[1].pixels, values[1].percent)
+                        percentage(values[1].pixels, values[1].percent),
+                        depth
                     )
                 }
             }
@@ -2171,14 +2212,14 @@ mod tests {
             b: 255,
             a: 255,
         };
-        assert_eq!(value(&style, "outline-width"), "0px");
+        assert_eq!(value(&style, "outline-width"), "3px");
         style.outline = Outline {
             width: 2.0,
             style: OutlineStyle::Border(BorderStyle::Dotted),
             color: None,
             offset: -1.0,
         };
-        assert_eq!(value(&style, "outline"), "rgb(0, 0, 255) dotted 2px");
+        assert_eq!(value(&style, "outline"), "2px dotted rgb(0, 0, 255)");
         assert_eq!(value(&style, "outline-offset"), "-1px");
         style.outline.style = OutlineStyle::Auto;
         assert_eq!(value(&style, "outline-style"), "auto");
@@ -2333,7 +2374,7 @@ mod tests {
         }
         assert_eq!(value(&styled("font-size:xxx-large"), "font-size"), "48px");
         assert_eq!(value(&styled("font-size:calc(10px - 2em)"), "font-size"), "0px");
-        assert_eq!(value(&styled("font:small-caps large/0 sans-serif"), "font"), "small-caps 19.2px / 0px sans-serif");
+        assert_eq!(value(&styled("font:small-caps large/0 sans-serif"), "font"), "small-caps 18px / 0px sans-serif");
     }
 
     #[test]
@@ -2571,7 +2612,10 @@ mod tests {
         let style = Style::initial();
         for property in cssom_property_names()
             .into_iter()
-            .filter(|property| !declaration_block::is_shorthand(property))
+            .filter(|property| {
+                !declaration_block::is_shorthand(property)
+                    && declaration_block::canonical_alias(property) == *property
+            })
         {
             assert!(
                 style

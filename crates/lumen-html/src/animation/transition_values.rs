@@ -2,6 +2,7 @@
 //! or font/layout lookup runs while sampling these immutable computed values.
 use crate::{css::{Style, computed_values}, paint::{BackgroundSize, BackgroundSizeKind, BoxShadow, LengthPercentage, Rgba}};
 use alloc::{vec::Vec, string::String};
+use lumen_common::numeric::lcm_capped;
 
 fn mix(a: f32, b: f32, progress: f64) -> Option<f32> {
     let value = (f64::from(a) + (f64::from(b) - f64::from(a)) * progress) as f32;
@@ -10,14 +11,6 @@ fn mix(a: f32, b: f32, progress: f64) -> Option<f32> {
 
 fn length(a: LengthPercentage, b: LengthPercentage, progress: f64) -> Option<LengthPercentage> {
     Some(LengthPercentage { pixels: mix(a.pixels, b.pixels, progress)?, fraction: mix(a.fraction, b.fraction, progress)? })
-}
-
-fn list_length(a: usize, b: usize) -> Option<usize> {
-    if a == 0 || b == 0 { return None; }
-    let (mut x, mut y) = (a, b);
-    while y != 0 { (x, y) = (y, x % y); }
-    let count = (a / x).checked_mul(b)?;
-    (count <= crate::css::MAX_BACKGROUND_GEOMETRY_VALUES).then_some(count)
 }
 
 fn empty_shadow(inset: bool) -> BoxShadow {
@@ -99,6 +92,11 @@ pub fn serialize_source_shadow_list(property:&str,source:&crate::css::SourceShad
 /// Text shadow lists add by concatenation and accumulate entry by entry; the
 /// entries of the longer list that have no counterpart are kept.
 pub fn compose_source_text_shadow_lists(a:&crate::css::SourceShadowList,b:&crate::css::SourceShadowList,accumulate:bool)->Option<String> {
+    compose_source_shadow_lists("text-shadow",a,b,accumulate)
+}
+
+/// Shadow lists of either property compose the same way.
+pub fn compose_source_shadow_lists(property:&str,a:&crate::css::SourceShadowList,b:&crate::css::SourceShadowList,accumulate:bool)->Option<String> {
     let count=if accumulate {a.shadows.len().max(b.shadows.len())} else {a.shadows.len().checked_add(b.shadows.len())?};
     if count>64 {return None;}
     let mut shadows=Vec::new();shadows.try_reserve_exact(count).ok()?;
@@ -120,7 +118,7 @@ pub fn compose_source_text_shadow_lists(a:&crate::css::SourceShadowList,b:&crate
         for index in 0..b.shadows.len() {shadows.push(b.shadows[index]);colors.push(b.color(index)?);}
     }
     if shadows.iter().any(|shadow|!(shadow.offset_x.is_finite()&&shadow.offset_y.is_finite()&&shadow.blur.is_finite()&&shadow.spread.is_finite())) {return None;}
-    serialize_source_shadow_values("text-shadow",&shadows,&colors)
+    serialize_source_shadow_values(property,&shadows,&colors)
 }
 
 fn border_slot(property:&str)->Option<usize> {match property {"border-image-slice"=>Some(228),"border-image-width"=>Some(229),"border-image-outset"=>Some(230),_=>None}}
@@ -179,7 +177,8 @@ pub fn interpolate_compound_transition(
             let initial=crate::css::BorderImage::default();
             interpolate_border_image(property,from.border_image.as_deref().unwrap_or(&initial),to.border_image.as_deref().unwrap_or(&initial),progress)
         },
-        "text-indent" => Some(computed_values::lp(length(from.text_indent,to.text_indent,progress)?)),
+        "text-indent" => (from.text_indent_mode==to.text_indent_mode).then_some(())
+            .and_then(|_|Some(alloc::format!("{}{}",computed_values::lp(length(from.text_indent,to.text_indent,progress)?),crate::css::text_indent_keywords(from.text_indent_mode)))),
         "word-spacing" => Some(computed_values::lp(length(from.word_spacing,to.word_spacing,progress)?)),
         "text-decoration-thickness" => from.text_decoration_thickness.interpolate_css_value(&to.text_decoration_thickness,progress),
         "text-underline-offset" => from.text_underline_offset.interpolate_css_value(&to.text_underline_offset,progress),
@@ -191,11 +190,12 @@ pub fn interpolate_compound_transition(
                 interpolate_source_shadow_lists(property,a.as_ref().unwrap_or(&empty),b.as_ref().unwrap_or(&empty),progress)
             }else{interpolate_shadow_lists(property,a.as_ref().map_or(&[],|list|list.shadows.as_ref()),b.as_ref().map_or(&[],|list|list.shadows.as_ref()),progress,color)}
         },
-        "background-position" => {
+        "background-position" | "mask-position" => {
             let default = [[LengthPercentage::default(); 2]];
-            let a = from.background_position.as_deref().unwrap_or(&default);
-            let b = to.background_position.as_deref().unwrap_or(&default);
-            let count = list_length(a.len(),b.len())?;
+            let masked = property == "mask-position";
+            let a = (if masked { from.mask_position.as_deref() } else { from.background_position.as_deref() }).unwrap_or(&default);
+            let b = (if masked { to.mask_position.as_deref() } else { to.background_position.as_deref() }).unwrap_or(&default);
+            let count = lcm_capped(a.len(),b.len(),crate::css::MAX_BACKGROUND_GEOMETRY_VALUES)?;
             let mut values = Vec::new();
             values.try_reserve_exact(count).ok()?;
             for index in 0..count {
@@ -211,7 +211,7 @@ pub fn interpolate_compound_transition(
             let default = [BackgroundSize::AUTO];
             let a = from.background_size.as_deref().unwrap_or(&default);
             let b = to.background_size.as_deref().unwrap_or(&default);
-            let count = list_length(a.len(),b.len())?;
+            let count = lcm_capped(a.len(),b.len(),crate::css::MAX_BACKGROUND_GEOMETRY_VALUES)?;
             let mut values = Vec::new();
             values.try_reserve_exact(count).ok()?;
             for index in 0..count {

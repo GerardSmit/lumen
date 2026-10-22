@@ -868,6 +868,8 @@ pub struct RenderSession {
     intrinsic_style_epoch: Option<u64>,
     style_version: u64,
     style_environment: Option<css::MediaEnvironment>,
+    /// Inputs of the last layout whose container-query oracle was already stable.
+    container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>)>,
     presentation_root: Option<NodeId>,
     animation_snapshot: Option<Arc<AnimationSnapshot>>,
     timeline_transform_values:Option<Arc<crate::animation::progress_timelines::TransformTimelineValues>>,
@@ -927,10 +929,17 @@ pub struct RenderSession {
     /// Effect targets whose sampled declarations changed since the last snapshot.
     snapshot_effect_nodes: alloc::collections::BTreeSet<u128>,
     snapshot_effects_unbounded: bool,
+    /// Elements scripts touched or read; sparse snapshots always record them.
+    snapshot_watch: alloc::collections::BTreeSet<u128>,
+    /// A watch request did not fit; the next snapshot must cover every element.
+    snapshot_watch_overflowed: bool,
     /// Set while the transition snapshot the host retains is deliberately not
     /// refreshed (nothing declares a transition): the elements whose style it
     /// no longer describes.
     held_snapshot_stale: Option<alloc::collections::BTreeSet<u128>>,
+    /// Elements whose Animation-origin samples `with_animation_effect_overrides`
+    /// has replaced for the capture it is running.
+    effect_override_nodes: alloc::collections::BTreeSet<u128>,
     /// Whether the rules of this `rules_generation` can set transitions or animations.
     transition_declarations: Option<(u64, bool)>,
     /// Subjects of the transition-declaring rules of this `rules_generation`;
@@ -1100,6 +1109,7 @@ fn connected_node_count(document: &Document) -> usize {
 }
 
 const SNAPSHOT_LEAN_MIN_NODES:usize=512;
+const MAX_SNAPSHOT_WATCH:usize=16384;
 
 /// Which elements of a large document's snapshot need effect provenance.
 struct LeanScope {
@@ -1135,6 +1145,8 @@ struct SnapshotBasis {
 }
 
 const READ_DIRTY_LIMIT: usize = 4096;
+/// Layouts one frame may repeat while `@container` conditions still change with container sizes.
+const MAX_CONTAINER_PASSES: u8 = 4;
 const MAX_DAMAGE_RECTS: usize = 64;
 
 /// Inputs that validate cached live computed-style reads; any difference
@@ -1147,6 +1159,7 @@ struct ReadStyleKey {
     interaction_generation: u64,
     animation_epoch: u64,
     environment: css::MediaEnvironment,
+    container_epoch: u64,
 }
 
 fn inline_style_declares_transition(document: &Document, node: NodeId) -> bool {
@@ -1394,6 +1407,7 @@ impl RenderSession {
             intrinsic_style_epoch: None,
             style_version: 0,
             style_environment: None,
+            container_oracle_stable: None,
             presentation_root: None,
             animation_snapshot: None,
             timeline_transform_values:None,
@@ -1427,7 +1441,10 @@ impl RenderSession {
             snapshot_rules_unbounded: true,
             snapshot_effect_nodes: alloc::collections::BTreeSet::new(),
             snapshot_effects_unbounded: false,
+            snapshot_watch: alloc::collections::BTreeSet::new(),
+            snapshot_watch_overflowed: false,
             held_snapshot_stale: None,
+            effect_override_nodes: alloc::collections::BTreeSet::new(),
             transition_declarations: None,
             transition_candidates: None,
             inline_transition_scan: None,
@@ -2842,7 +2859,7 @@ impl RenderSession {
         if rules.environment == environment && self.style_environment == Some(environment) {
             return Ok(());
         }
-        rules.environment = environment;
+        rules.set_environment(environment);
         self.layout_cache.clear();
         // Cached styles were resolved in the previous environment. Publish the
         // new identity only after discarding those computed values.
@@ -3190,6 +3207,7 @@ impl RenderSession {
         }
         let dirty = core::mem::take(&mut self.read_dirty);
         for node in dirty.nodes {
+            self.read_style_cache.refresh_bloom(&self.document, node);
             self.read_style_cache.invalidate_node(node);
         }
         let mut visited = 0usize;
@@ -3201,6 +3219,7 @@ impl RenderSession {
                 self.reset_read_style_cache();
                 return;
             }
+            self.read_style_cache.refresh_bloom(&self.document, node);
             self.read_style_cache.invalidate_node(node);
             let mut child = self.document.first_child(node).ok().flatten();
             while let Some(id) = child {
@@ -3249,6 +3268,11 @@ impl RenderSession {
         self.snapshot_noted_version = version;
     }
 
+    /// Whether any style rule waits on `@container` conditions, which only a finished layout can decide.
+    pub fn has_container_queries(&mut self) -> bool {
+        self.refresh_rules().is_ok() && self.rules.as_ref().is_some_and(|rules| rules.has_container_rules())
+    }
+
     pub fn computed_style(&mut self, node: NodeId) -> Result<Style, LayoutError> {
         self.computed_style_with_text(node,None)
     }
@@ -3274,6 +3298,7 @@ impl RenderSession {
             interaction_generation: self.interaction_generation,
             animation_epoch: self.animation_epoch,
             environment: self.rules.as_ref().expect("stylesheets initialized").environment,
+            container_epoch: self.rules.as_ref().expect("stylesheets initialized").container_epoch(),
         };
         let stamp = (self.document.version(), self.frame_id);
         if self.read_style_key != Some(key) {
@@ -3658,6 +3683,20 @@ impl RenderSession {
         const SPARSE_MIN_NODES:usize=512;
         if self.document.node_count()<=SPARSE_MIN_NODES || self.rules.as_ref().is_none_or(css::StyleIndex::has_effect_declarations) {return Ok(None);}
         let Some(candidates)=self.cached_transition_candidates() else {return Ok(None)};
+        if core::mem::take(&mut self.snapshot_watch_overflowed) {
+            self.snapshot_watch.clear();
+            return Ok(None);
+        }
+        // A script can declare a transition on an element it has just touched, and the
+        // change then starts from the style the previous snapshot recorded for it.
+        if let Some(since)=self.snapshot_basis.map(|basis|basis.version) {
+            let Some(touched)=self.touched_elements_since(since) else {return Ok(None)};
+            if self.snapshot_watch.len().saturating_add(touched.len())>MAX_SNAPSHOT_WATCH {
+                self.snapshot_watch.clear();
+                return Ok(None);
+            }
+            self.snapshot_watch.extend(touched);
+        }
         let rules=self.rules.as_ref().ok_or(LayoutError::InvalidTree)?;
         let document=&self.document;
         let root=document.root();
@@ -3669,7 +3708,7 @@ impl RenderSession {
             if matches!(document.kind(node),Ok(NodeKind::Element{..})) {
                 elements.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
                 elements.push(node);
-                if keep.contains(&node.key()) || inline_style_may_transition(document,node) || candidates.matches(rules,document,node) {
+                if keep.contains(&node.key()) || self.snapshot_watch.contains(&node.key()) || inline_style_may_transition(document,node) || candidates.matches(rules,document,node) {
                     let mut current=Some(node);
                     while let Some(id)=current {
                         if !included.insert(id.key()) {break;}
@@ -3681,6 +3720,60 @@ impl RenderSession {
         }
         elements.retain(|node|included.contains(&node.key()));
         Ok(Some(elements))
+    }
+
+    /// Marks `node` as an element whose style a script may be about to change
+    /// with a transition, so sparse snapshots keep recording it.
+    pub fn watch_transition_target(&mut self,node:NodeId) {
+        if self.snapshot_watch.len()<MAX_SNAPSHOT_WATCH {self.snapshot_watch.insert(node.key());}
+        else if !self.snapshot_watch.contains(&node.key()) {self.snapshot_watch_overflowed=true;}
+    }
+
+    /// The connected elements attribute writes and insertions since document
+    /// version `since` touched; `None` when the journal cannot bound them.
+    fn touched_elements_since(&self,since:u64)->Option<Vec<u128>> {
+        const LIMIT:usize=8192;
+        let document=&self.document;
+        if !document.mutations_cover(since) {return None;}
+        let mutations=document.mutations();
+        let first=mutations.partition_point(|mutation|mutation.version<=since);
+        let mut seen=alloc::collections::BTreeSet::new();
+        let mut expanded=alloc::collections::BTreeSet::new();
+        let mut touched=Vec::new();
+        let mut add=|node:NodeId,touched:&mut Vec<u128>|->bool {
+            if matches!(document.kind(node),Ok(NodeKind::Element{..})) && seen.insert(node.key()) {
+                if touched.len()>=LIMIT {return false;}
+                touched.push(node.key());
+            }
+            true
+        };
+        for mutation in &mutations[first..] {
+            let subtree_root=match &mutation.kind {
+                MutationKind::FullRebuild=>return None,
+                MutationKind::CharacterData=>continue,
+                MutationKind::Attribute(_)=>{
+                    if document.is_connected_element(mutation.target) && !add(mutation.target,&mut touched) {return None;}
+                    continue;
+                }
+                MutationKind::Tree{added,removed,..}=>{
+                    if mutation.is_subtree_summary() || added.is_none() && removed.is_none() {mutation.target}
+                    else if let Some(added)=added {*added}
+                    else {continue}
+                }
+            };
+            let mut stack=alloc::vec![subtree_root];
+            while let Some(node)=stack.pop() {
+                if !expanded.insert(node.key()) {continue;}
+                if !add(node,&mut touched) {return None;}
+                let mut child=document.first_child(node).ok().flatten();
+                while let Some(id)=child {
+                    stack.push(id);
+                    child=document.next_sibling(id).ok().flatten();
+                }
+                if stack.len()>LIMIT {return None;}
+            }
+        }
+        Some(touched)
     }
 
     fn cached_transition_candidates(&mut self)->Option<Arc<css::TransitionCandidates>> {
@@ -3794,7 +3887,7 @@ impl RenderSession {
         let candidates=if lean {self.cached_transition_candidates()} else {None};
         let mut lean_scope=lean.then(||LeanScope {
             keep:keep.unwrap_or_default().iter().map(|node|node.key()).collect(),
-            effects:self.animated_styles.iter().map(|(node,..)|node.key()).collect(),
+            effects:self.animated_styles.iter().map(|(node,..)|node.key()).chain(self.effect_override_nodes.iter().copied()).collect(),
             heavy:alloc::collections::BTreeSet::new(),
         });
         let rules=self.rules.as_ref().expect("stylesheets initialized");
@@ -3816,7 +3909,7 @@ impl RenderSession {
         let mut rendered_nodes=alloc::collections::BTreeMap::<u128,bool>::new();
         let mut forced_nodes=alloc::collections::BTreeSet::<u128>::new();
         let (mut computed_styles,mut reused_styles)=(0u64,0u64);
-        let layout_current=lean && self.layout_styles_current(text);
+        let layout_current=lean && self.effect_override_nodes.is_empty() && self.layout_styles_current(text);
         let mut layout_reused=0u64;
         // Replaying an old style needs provenance only for elements an effect
         // can reach: those that may run one and everything below them, or all
@@ -4174,7 +4267,7 @@ impl RenderSession {
                 };
                 let (mut rules, mut font_faces) = layout::finish_style_index(index, collected, &self.document, self.document_base_url.clone(), environment)?;
                 rules.apply_cssom_rule_overrides(&self.cssom_rule_overrides).map_err(LayoutError::Css)?;
-                rules.environment = environment;
+                rules.set_environment(environment);
                 self.animated_styles
                     .retain(|(node, _, _, _)| self.document.kind(*node).is_ok());
                 for (node, pseudo, origin, declarations) in &self.animated_styles {
@@ -4984,7 +5077,7 @@ impl RenderSession {
                 .geometry
                 .scroll_extents
                 .iter()
-                .find(|extent| extent.node == node)
+                .find(|extent| extent.node == node && extent.scrollable)
                 .map(|extent| (extent.min_x,extent.max_x,extent.min_y,extent.max_y))
         });
         // The viewport records no extent when its content fits, but a stale offset
@@ -5009,7 +5102,7 @@ impl RenderSession {
         }
         updates.sort_unstable_by_key(|update| update.node.key());
         if let Some(frame) = self.cached.as_ref().filter(|frame| frame.document_version == self.document.version()) {
-            let root_extent = frame.geometry.scroll_extents.iter().find(|extent| extent.node == self.document.root());
+            let root_extent = frame.geometry.scroll_extents.iter().find(|extent| extent.node == self.document.root() && extent.scrollable);
             for update in updates.iter_mut().filter(|update| update.node == self.document.root()) {
                 if let Some(extent) = root_extent {
                     update.x = update.x.clamp(extent.min_x, extent.max_x);
@@ -5017,7 +5110,7 @@ impl RenderSession {
                 } else { update.x = 0.0; update.y = 0.0; }
                 update.admitted = true;
             }
-            for extent in &frame.geometry.scroll_extents {
+            for extent in frame.geometry.scroll_extents.iter().filter(|extent| extent.scrollable) {
                 let key = extent.node.key();
                 let mut index = updates.partition_point(|update| update.node.key() < key);
                 while let Some(update) = updates.get_mut(index).filter(|update| update.node == extent.node) {
@@ -5927,11 +6020,11 @@ impl RenderSession {
     ) -> Result<(), LayoutError> {
         self.refresh_rules()?;
         let rules = self.rules.as_mut().expect("stylesheets initialized");
-        rules.environment = css::MediaEnvironment {
+        rules.set_environment(css::MediaEnvironment {
             width: width as f32,
             height: height as f32,
             ..rules.environment
-        };
+        });
         let rules = self.rules.as_ref().expect("stylesheets initialized");
         let only_text_mutations = !self.document.mutations().is_empty()
             && self.document.mutations().iter().all(|mutation| {
@@ -6074,6 +6167,7 @@ impl RenderSession {
         let mut corrected = false;
         let mut sampled_timelines=false;
         let mut timeline_corrected=false;
+        let mut container_passes = 0u8;
         let mut pending_images = self.images_pending;
         let mut pending_lookups: Vec<(layout::PendingLookup, bool)>;
         let mut culled_images: Vec<NodeId>;
@@ -6178,7 +6272,7 @@ impl RenderSession {
             };
             let mut changed = false;
             if !corrected {for scroll in &mut self.scrolls {
-                let bounds = geometry.scroll_extents.iter().find(|bounds| bounds.node == scroll.node);
+                let bounds = geometry.scroll_extents.iter().find(|bounds| bounds.node == scroll.node && bounds.scrollable);
                 let (x, y) = bounds.map_or((0.0, 0.0), |bounds| (
                     scroll.x.clamp(bounds.min_x, bounds.max_x),
                     scroll.y.clamp(bounds.min_y, bounds.max_y),
@@ -6205,6 +6299,35 @@ impl RenderSession {
                 sampled_timelines=true;
                 timeline_corrected=self.sample_transform_timeline_values(&geometry,text)?;
                 changed|=timeline_corrected;
+            }
+            if !changed && container_passes < MAX_CONTAINER_PASSES {
+                let rules = self.rules.as_ref().expect("stylesheets initialized");
+                let oracle_key = (version, self.rules_version, self.style_cache.borrow().epoch(), self.font_generation,
+                    images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits));
+                if rules.has_container_rules() && self.container_oracle_stable != Some(oracle_key) {
+                    let installed = {
+                        let styles = self.style_cache.borrow();
+                        let oracle = css::container_eval::build_oracle(
+                            &self.document,
+                            &|node| styles.node_entry(node).map(|(_, _, _, style)| style.clone()),
+                            &|node| geometry.container_context_for(node),
+                            rules.environment,
+                            Some(text),
+                        );
+                        rules.replace_container_oracle(oracle)
+                    };
+                    self.container_oracle_stable = if installed { None } else { Some(oracle_key) };
+                    if installed {
+                        container_passes += 1;
+                        let mut styles = self.style_cache.borrow_mut();
+                        styles.clear();
+                        styles.begin_frame();
+                        rules.prestyle(&self.document, &mut styles, text);
+                        self.intrinsic_style_epoch = Some(styles.epoch());
+                        self.layout_cache.clear_intrinsics();
+                        changed = true;
+                    }
+                }
             }
             if !changed {break (list,geometry);}
             self.layout_cache.clear();
@@ -6402,6 +6525,8 @@ fn document_has_svg_use(document: &Document) -> bool {
     }
     false
 }
+
+mod effect_staging;
 
 #[cfg(test)]
 mod parallel_tests;

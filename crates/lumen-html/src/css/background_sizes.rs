@@ -30,6 +30,38 @@ pub(super) fn uses_font(raw: &str) -> bool {
     })
 }
 
+/// Specified-value serialization: a lone width gains its implicit `auto` height
+/// and `auto auto` collapses to `auto`.
+pub(super) fn specified(raw: &str) -> Option<String> {
+    let mut layers = Vec::new();
+    for part in top_level_split(raw, b',', MAX_BACKGROUND_GEOMETRY_VALUES)? {
+        let tokens = components(part)?;
+        let lower = |token: &str| -> Option<String> {
+            if token.eq_ignore_ascii_case("auto") {
+                return Some(String::from("auto"));
+            }
+            if token == "0" {
+                return Some(String::from("0px"));
+            }
+            typed_numeric::parse_numeric_expression(token)?.serialize_specified()
+        };
+        layers.push(match tokens.as_slice() {
+            [value] if value.eq_ignore_ascii_case("cover") => String::from("cover"),
+            [value] if value.eq_ignore_ascii_case("contain") => String::from("contain"),
+            [width] => {
+                let width = lower(width)?;
+                if width == "auto" { width } else { alloc::format!("{width} auto") }
+            }
+            [width, height] => {
+                let (width, height) = (lower(width)?, lower(height)?);
+                if width == "auto" && height == "auto" { width } else { alloc::format!("{width} {height}") }
+            }
+            _ => return None,
+        });
+    }
+    Some(layers.join(", "))
+}
+
 fn computed_sizes(
     raw: &str,
     context: LengthContext,
@@ -59,7 +91,12 @@ fn computed_sizes(
             if negative_length_primitive(token) {
                 return None;
             }
-            Some(Some(decoration_length_with_context(token, context, query)?))
+            Some(Some(match decoration_length_with_context(token, context, query)? {
+                DecorationLength::Length(value) if value.percent == 0.0 && value.pixels < 0.0 => {
+                    DecorationLength::Length(TransformLength { pixels: 0.0, percent: 0.0 })
+                }
+                other => other,
+            }))
         };
         let (width, height) = if kind == BackgroundSizeKind::Explicit {
             (axis(tokens.first())?, axis(tokens.get(1))?)
@@ -89,7 +126,7 @@ fn computed_sizes(
             height,
         });
     }
-    let auto = sizes.iter().all(|value| *value == BackgroundSize::AUTO);
+    let auto = sizes.len() == 1 && sizes[0] == BackgroundSize::AUTO;
     Some((
         (!auto).then(|| Arc::from(sizes)),
         nonlinear.then(|| Arc::from(math)),
@@ -198,17 +235,7 @@ impl Style {
             },
             |values| values.len(),
         );
-        let mut gcd = a_len;
-        let mut remainder = b_len;
-        while remainder != 0 {
-            let next = gcd % remainder;
-            gcd = remainder;
-            remainder = next;
-        }
-        let count = a_len.checked_div(gcd)?.checked_mul(b_len)?;
-        if count > MAX_BACKGROUND_GEOMETRY_VALUES {
-            return None;
-        }
+        let count = lumen_common::numeric::lcm_capped(a_len, b_len, MAX_BACKGROUND_GEOMETRY_VALUES)?;
         let value = |style: &Self, index: usize| -> BackgroundSizeMath {
             if let Some(values) = style.background_size_math.as_deref() {
                 return values[index % values.len()].clone();

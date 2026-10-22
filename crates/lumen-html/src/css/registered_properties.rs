@@ -555,7 +555,7 @@ pub(super) fn resolve_computed(
         let expanded: Option<alloc::borrow::Cow<str>> = raw.as_deref().and_then(|raw| {
             if expands {
                 let index: &NameIndex = if values.len() > 32 { positions.0.get_or_init(|| NameIndex::indexed(values)) } else { &LINEAR_NAMES };
-                expand_variables_in(raw, &LayeredCustom { overlay: values, index, base }, &mut Vec::new(), false, MAX_VARIABLE_BYTES)
+                expand_variables_in(raw, &LayeredCustom { overlay: values, index, base }, MAX_VARIABLE_BYTES)
                     .map(alloc::borrow::Cow::Owned)
             } else {
                 Some(alloc::borrow::Cow::Borrowed(raw))
@@ -631,7 +631,7 @@ pub fn parse_rules(prelude: &str, input: &str) -> Result<Vec<RegisteredCustomPro
         let Some(raw) = syntax::complete(raw)? else { continue; };
         if important_value(&raw).1 { continue; }
         let cleaned = if needs_expansion(&raw) { raw.into_owned() } else {
-            let Some(cleaned) = expand_variables_bounded(&raw, &[], &mut Vec::new(), false, MAX_VARIABLE_BYTES) else { continue; };
+            let Some(cleaned) = expand_variables_bounded(&raw, &[], MAX_VARIABLE_BYTES) else { continue; };
             cleaned
         };
         let raw = cleaned.trim();

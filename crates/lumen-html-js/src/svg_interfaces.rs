@@ -4,7 +4,7 @@ use super::{dom_error, DomElement, DomNode};
 use lumen::embed::{Ctx, OpResult, Value};
 use lumen_html::{selector, svg_dom, NodeId};
 
-trait FromNode {
+pub(crate) trait FromNode {
     fn from_node(node: DomNode) -> Self;
 }
 
@@ -125,11 +125,11 @@ macro_rules! svg_element_classes {
                 "svg" => ctx.cached_instance(id, || DomSvgSvgElement::from_node(node)),
                 "style" => ctx.cached_instance(id, || DomSvgStyleElement::from_node(node)),
                 $( $tag => ctx.cached_instance(id, || $ty::from_node(node)), )+
-                _ => ctx.cached_instance(id, || DomSvgElement::from_node(node)),
+                _ => crate::svg_filter_interfaces::wrap(ctx, id, node, local),
             }
         }
         pub(crate) fn constructors(ctx: &mut Ctx) -> Vec<(&'static str, Value)> {
-            vec![
+            let mut constructors = vec![
                 ("SVGElement", ctx.class_constructor::<DomSvgElement>()),
                 ("SVGGraphicsElement", ctx.class_constructor::<DomSvgGraphicsElement>()),
                 ("SVGGeometryElement", ctx.class_constructor::<DomSvgGeometryElement>()),
@@ -139,7 +139,9 @@ macro_rules! svg_element_classes {
                 ("SVGSVGElement", ctx.class_constructor::<DomSvgSvgElement>()),
                 ("SVGStyleElement", ctx.class_constructor::<DomSvgStyleElement>()),
                 $( ($interface, ctx.class_constructor::<$ty>()), )+
-            ]
+            ];
+            constructors.extend(crate::svg_filter_interfaces::constructors(ctx));
+            constructors
         }
     };
 }

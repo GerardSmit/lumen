@@ -37,9 +37,8 @@ impl ItemAlignment {
             Some(Keyword::SelfEnd | Keyword::LastBaseline) => !subject_end,
             Some(Keyword::Left | Keyword::LegacyLeft) if horizontal => false,
             Some(Keyword::Right | Keyword::LegacyRight) if horizontal => true,
-            Some(Keyword::Left | Keyword::LegacyLeft | Keyword::Right | Keyword::LegacyRight) => {
-                container_end
-            }
+            Some(Keyword::Left | Keyword::LegacyLeft) => container.writing_mode == WritingMode::SidewaysLr,
+            Some(Keyword::Right | Keyword::LegacyRight) => container.writing_mode != WritingMode::SidewaysLr,
             _ if self.is_baseline() => subject_end,
             _ if self.alignment == AlignItems::Stretch => container_end ^ flow_reversed,
             _ => {
@@ -127,6 +126,19 @@ fn start_is_far(style: &Style, horizontal: bool) -> bool {
 }
 
 impl Style {
+    /// Whether the start side of the writing-mode-relative axis lying along
+    /// the given physical axis is its far (right or bottom) edge.
+    pub(crate) fn axis_start_is_far(&self, horizontal: bool) -> bool {
+        start_is_far(self, horizontal)
+    }
+    /// Whether a flex container's main axis runs along the physical x axis.
+    pub(crate) fn flex_main_axis_horizontal(&self) -> bool {
+        let row = matches!(
+            self.flex_direction,
+            super::FlexDirection::Row | super::FlexDirection::RowReverse
+        );
+        row != (self.writing_mode != WritingMode::HorizontalTb)
+    }
     pub fn item_alignment(&self, horizontal: bool) -> ItemAlignment {
         if horizontal {
             ItemAlignment {

@@ -46,7 +46,7 @@ pub(super) struct ShareKeys {
 impl ShareKeys {
     fn of(index: &StyleIndex) -> Self {
         let mut keys = Self { rules: index.rules.len(), usable: false, tested: BTreeSet::new(), revalidated: Vec::new() };
-        if index.rules.iter().any(|rule| rule.scope.is_some() || rule.css_scope.is_some()) { return keys; }
+        if index.rules.iter().any(|rule| rule.scope.is_some() || rule.css_scope.is_some()) || index.has_container_rules() { return keys; }
         for (order, rule) in index.rules.iter().enumerate() {
             let selector = &*rule.selector;
             if rule.registration.is_some() || rule.starting_style || selector.pseudo_element.is_some()

@@ -301,15 +301,12 @@ pub(super) fn longhands(raw:&str)->Vec<Arc<str>> {
     if property.as_ref()=="none" {return Vec::new();}
     if property.starts_with("--") {return vec![property];}
     if property.as_ref()=="all" {
-        return PROPERTIES.iter().filter(|entry|entry.name!="all" && declaration_block::canonical_alias(entry.name)==entry.name && !declaration_block::is_shorthand(entry.name)
-                && !entry.ids.iter().any(|slot|is_logical_property_slot(*slot))
-                && transition_value_kind(entry.name)!=TransitionValueKind::NotAnimatable)
-            .map(|entry|Arc::from(entry.name)).collect();
+        return transition_all_longhands().map(Arc::from).collect();
     }
     let property:Arc<str>=Arc::from(declaration_block::canonical_alias(&property));
     let longhands=declaration_block::longhands(&property);
     if !longhands.is_empty() {return longhands.iter().map(|name|Arc::from(*name)).collect();}
-    if PROPERTIES.iter().any(|entry|entry.name==property.as_ref()) {vec![property]} else {Vec::new()}
+    if registry_index(&property).is_some() {vec![property]} else {Vec::new()}
 }
 
 #[cfg(test)]

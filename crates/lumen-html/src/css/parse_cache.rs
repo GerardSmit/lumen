@@ -87,6 +87,9 @@ fn shell(parsed: &ParsedStylesheets) -> ParsedStylesheets {
         font_faces: parsed.font_faces.clone(),
         family_display: parsed.family_display.clone(),
         keyframes: parsed.keyframes.clone(),
+        position_try: parsed.position_try.clone(),
+        counter_styles: parsed.counter_styles.clone(),
+        functions: parsed.functions.clone(),
         layers: parsed.layers.clone(),
         rule_index: None,
     }

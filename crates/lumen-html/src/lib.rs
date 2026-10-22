@@ -26,6 +26,7 @@ pub mod html;
 pub mod preload_scan;
 pub mod parser_documents;
 pub mod layout;
+mod positioned_alignment;
 mod name;
 mod named_colors;
 pub mod observe;
@@ -72,6 +73,11 @@ impl NodeId {
     /// identity without depending on `NodeId`.
     pub const fn key(self) -> u128 {
         ((self.document as u128) << 64) | ((self.index as u128) << 32) | self.generation as u128
+    }
+
+    /// The node `key` was taken from; the document still decides whether it is live.
+    pub(crate) const fn from_key(key: u128) -> Self {
+        Self { document: (key >> 64) as u64, index: (key >> 32) as u32, generation: key as u32 }
     }
 }
 

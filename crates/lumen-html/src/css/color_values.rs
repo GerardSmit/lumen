@@ -1,5 +1,6 @@
 //! CSS syntax adapter for the shared, unclipped color authority.
 use super::*;
+use super::color_layers;
 use lumen_common::color::{Color, ColorSpace, HueInterpolation, InterpolationMethod, PreparedPair};
 
 pub(super) fn from_rgba(value:Rgba)->Color { Color::rgba8([value.r,value.g,value.b,value.a]) }
@@ -109,6 +110,16 @@ pub(super) fn endpoint_with_current(raw:&str,depth:u8,current:Color,context:Leng
             }
             return Some(source);
         }
+        if name=="color-layers" {
+            let (mode,layers)=layers_arguments(body)?;
+            let mut colors=Vec::new();colors.try_reserve(layers.len()).ok()?;
+            for layer in layers {colors.push(endpoint_with_current(layer,depth+1,current,context,query)?);}
+            return color_layers::composite(mode,&colors);
+        }
+        if name=="contrast-color" {
+            let origin=endpoint_with_current(body,depth+1,current,context,query)?;
+            return Some(contrast(origin));
+        }
         if name=="light-dark" {
             let parts=top_level_split(body,b',',2)?;let [light,dark]=parts.as_slice() else{return None;};
             let light=endpoint_with_current(light,depth+1,current,context,query)?;
@@ -120,6 +131,24 @@ pub(super) fn endpoint_with_current(raw:&str,depth:u8,current:Color,context:Leng
         }
     }
     Some(from_rgba(color_depth(raw,depth)?))
+}
+fn layers_arguments(body:&str)->Option<(&'static str,Vec<&str>)> {
+    let mut parts=top_level_split(body,b',',65)?;
+    let mode=match identifier(parts.first()?.trim()).and_then(|keyword|color_layers::blend_mode(&keyword)) {
+        Some(mode)=>{parts.remove(0);mode}
+        None=>"normal",
+    };
+    if parts.is_empty() || parts.len()>64 {return None;}
+    Some((mode,parts))
+}
+/// Black or white, whichever has the larger WCAG contrast ratio against the
+/// origin's sRGB coordinates (clamped to the gamut).
+fn contrast(origin:Color)->Color {
+    let linear=|value:f32|{let value=value.clamp(0.0,1.0);if value<=0.04045 {value/12.92}else {libm::powf((value+0.055)/1.055,2.4)}};
+    let [r,g,b]=origin.srgb();
+    let luminance=0.2126*linear(r)+0.7152*linear(g)+0.0722*linear(b);
+    let channel=if (luminance+0.05)/0.05>=1.05/(luminance+0.05) {0} else {255};
+    Color::rgba8([channel,channel,channel,255])
 }
 fn weighted_color<'a>(tokens:&[&'a str])->Option<(&'a str,Option<&'a str>)> {
     match tokens {
@@ -152,7 +181,7 @@ fn mix_with_current(body:&str,depth:u8,current:Color,context:LengthContext,query
     let alpha_multiplier=total.min(1.0) as f32;
     let mut iter=items.into_iter();let (mut color,weight)=iter.next()?;
     let mut accumulated=f64::from(weight.unwrap_or(missing));
-    if iter.len()==0 {color=color.to(method.space);}
+    if iter.len()==0 {color=color.to_with_missing(method.space);}
     else {for (next,weight) in iter {
         let weight=f64::from(weight.unwrap_or(missing));let combined=accumulated+weight;
         // CSS Color5 §3.3 specifies this ordered stack reduction; polar
@@ -318,6 +347,15 @@ fn serialize_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUn
     }
     result.push(')');Some(result)
 }
+fn serialize_relative_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
+    if computed.is_some() {return serialize_source(raw,depth,computed);}
+    let Some((name,body))=raw.trim().split_once('(') else{return serialize_source(raw,depth,None);};
+    let name=identifier(name)?;
+    let resolved=matches!(name.as_ref(),"rgb"|"rgba"|"hsl"|"hsla"|"hwb"|"lab"|"lch"|"oklab"|"oklch"|"color");
+    let relative=components(body.strip_suffix(')')?).is_some_and(|parts|parts.first().is_some_and(|part|decoded_css_keyword(part,"from")));
+    if !resolved || relative {return serialize_source(raw,depth,None);}
+    serialize(endpoint(raw,depth)?,!legacy(raw))
+}
 fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
     if depth>=8 {return None;}
     let raw=raw.trim();
@@ -376,10 +414,7 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
             },"alpha"=>("alpha",2,&["alpha"]),_=>return None,
         };
         if head.len()!=start+usize::from(name!="alpha")*3 {return None;}
-        if name=="alpha" && !uses_current_color(raw) && super::image_numeric_dependencies(raw)==(false,false) {
-            return serialize(endpoint(raw,depth)?,true);
-        }
-        let mut result=alloc::format!("{name}(from {}",serialize_origin(origin,depth+1,computed)?);
+        let mut result=alloc::format!("{name}(from {}",serialize_relative_origin(origin,depth+1,computed)?);
         if name=="color" {result.push(' ');result.push_str(ColorSpace::named(identifier(head[2])?.as_ref())?.name());}
         for channel in &head[start..] {result.push(' ');result.push_str(&serialize_channel(channel,channels,computed)?);}
         if let Some(alpha)=head_parts.get(1) {
@@ -389,6 +424,19 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         }
         result.push(')');return Some(result);
     }
+    if name=="color-layers" && computed.is_none() {
+        let (mode,layers)=layers_arguments(body)?;
+        let mut result=String::from("color-layers(");
+        if mode!="normal" {result.push_str(mode);result.push_str(", ");}
+        for (index,layer) in layers.iter().enumerate() {
+            if index!=0 {result.push_str(", ");}
+            result.push_str(&serialize_source(layer.trim(),depth+1,None)?);
+        }
+        result.push(')');return Some(result);
+    }
+    if name=="contrast-color" && computed.is_none() {
+        return Some(alloc::format!("contrast-color({})",serialize_source(body,depth+1,None)?));
+    }
     if name=="light-dark" {
         let parts=top_level_split(body,b',',2)?;let [light,dark]=parts.as_slice() else{return None;};
         if let Some((context,_))=computed {
@@ -396,7 +444,45 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         }
         return Some(alloc::format!("light-dark({}, {})",serialize_source(light,depth+1,computed)?,serialize_source(dark,depth+1,computed)?));
     }
+    if computed.is_none() {
+        if let Some(text)=serialize_math_channels(&name,body,depth) {return Some(text);}
+    }
     serialize(endpoint(raw,depth)?,!legacy(raw))
+}
+
+/// Non-legacy color functions keep math-function channels in their specified
+/// value; the remaining channels use the resolved color's coordinates.
+fn serialize_math_channels(name:&str,body:&str,depth:u8)->Option<String> {
+    if !matches!(name,"lab"|"lch"|"oklab"|"oklch"|"color") || top_level_split(body,b',',4)?.len()>1 {return None;}
+    let mut parts=color_components(body)?;
+    let profile=if name=="color" {
+        let profile=identifier(parts.first()?)?.into_owned();
+        parts.remove(0);Some(profile)
+    }else {None};
+    if !(3..=4).contains(&parts.len()) || !parts.iter().any(|part|part.contains('(') && !missing(part)) {return None;}
+    let head=profile.as_ref().map_or_else(||alloc::format!("{name}("),|profile|alloc::format!("color({profile} "));
+    let mut probe=head.clone();
+    for (index,part) in parts.iter().enumerate() {
+        if index==3 {probe.push_str(" / ");}else if index!=0 {probe.push(' ');}
+        probe.push_str(if part.contains('(') && !missing(part) {"0"}else {part});
+    }
+    probe.push(')');
+    let value=endpoint(&probe,depth)?;
+    let mut result=if profile.is_some() {alloc::format!("color({} ",value.space.name())}else {head};
+    for index in 0..3 {
+        if index!=0 {result.push(' ');}
+        if missing(parts[index]) {result.push_str("none");continue;}
+        if parts[index].contains('(') {result.push_str(&serialize_channel(parts[index],&[],None)?);continue;}
+        let mut component=value.components[index];
+        if value.space.hue()==Some(index) {component=decimal_scaled(component,360.0);}
+        result.push_str(&super::computed_values::number(component));
+    }
+    if let Some(alpha)=parts.get(3) {
+        if missing(alpha) {result.push_str(" / none");}
+        else if alpha.contains('(') {result.push_str(" / ");result.push_str(&serialize_channel(alpha,&[],None)?);}
+        else if value.alpha!=1.0 {result.push_str(" / ");result.push_str(&super::computed_values::number(value.alpha));}
+    }
+    result.push(')');Some(result)
 }
 
 pub(super) fn take_method(tokens:&mut Vec<&str>)->Option<(InterpolationMethod,bool)> {
@@ -425,7 +511,7 @@ pub(super) fn metadata(method:InterpolationMethod,colors:Option<Vec<Color>>,hint
 
 pub(super) fn structured(raw:&str)->bool {
     let Some((name,body))=raw.split_once('(') else{return false;};
-    identifier(name).is_some_and(|name|matches!(name.as_ref(),"color-mix"|"alpha"|"light-dark")) ||
+    identifier(name).is_some_and(|name|matches!(name.as_ref(),"color-mix"|"alpha"|"light-dark"|"contrast-color"|"color-layers")) ||
         components(body.strip_suffix(')').unwrap_or(body)).is_some_and(|parts|parts.first().is_some_and(|part|decoded_css_keyword(part,"from")))
 }
 pub(super) fn uses_current_color(raw:&str)->bool {
@@ -455,20 +541,25 @@ pub(super) fn color_function_in_scheme(raw:&str,scheme:UsedColorScheme,current:b
 }
 pub(super) fn legacy(raw:&str)->bool {
     let Some((name,body))=raw.split_once('(') else {return true;};
-    identifier(name).is_some_and(|name|matches!(name.as_ref(),"rgb"|"rgba"|"hsl"|"hsla"|"hwb"))
+    identifier(name).is_some_and(|name|matches!(name.as_ref(),"rgb"|"rgba"|"hsl"|"hsla"|"hwb"|"contrast-color"))
         && !components(body.strip_suffix(')').unwrap_or(body)).is_some_and(|parts|parts.first().is_some_and(|part|decoded_css_keyword(part,"from")))
 }
 pub(super) fn default_method(method:InterpolationMethod,explicit:bool,legacy:bool)->InterpolationMethod {
     if !explicit && legacy {InterpolationMethod{space:ColorSpace::Srgb,hue:HueInterpolation::Shorter}} else {method}
+}
+fn decimal_scaled(value:f32,scale:f64)->f32 {
+    let scaled=f64::from(value)*scale;
+    ((scaled*1e5).round()/1e5) as f32
 }
 pub(super) fn serialize(value:Color,color_function:bool)->Option<String> {
     use super::computed_values::number;
     if !value.is_finite() {return None;}
     if matches!(value.space,ColorSpace::Srgb|ColorSpace::Hsl|ColorSpace::Hwb) && value.missing==0 && !color_function {
         let rgb=value.srgb();
-        let channels=rgb.map(|v|number(v.clamp(0.0,1.0)*255.0));
-        return Some(if value.alpha==1.0 {alloc::format!("rgb({}, {}, {})",channels[0],channels[1],channels[2])}
-            else {alloc::format!("rgba({}, {}, {}, {})",channels[0],channels[1],channels[2],number(value.alpha))});
+        let channels=rgb.map(|v|number((f64::from(v.clamp(0.0,1.0))*255.0+1e-4).round() as f32));
+        let alpha=value.alpha.clamp(0.0,1.0);
+        return Some(if alpha==1.0 {alloc::format!("rgb({}, {}, {})",channels[0],channels[1],channels[2])}
+            else {alloc::format!("rgba({}, {}, {}, {})",channels[0],channels[1],channels[2],number(alpha))});
     }
     let direct=matches!(value.space,ColorSpace::Lab|ColorSpace::Lch|ColorSpace::Oklab|ColorSpace::Oklch|ColorSpace::Hsl|ColorSpace::Hwb);
     let mut result=if direct {alloc::format!("{}(",value.space.name())} else {alloc::format!("color({} ",value.space.name())};
@@ -476,8 +567,8 @@ pub(super) fn serialize(value:Color,color_function:bool)->Option<String> {
         if index!=0 {result.push(' ');}
         if value.missing&(1<<index)!=0 {result.push_str("none");continue;}
         let mut component=value.components[index];
-        if value.space.hue()==Some(index) {component*=360.0;}
-        if matches!(value.space,ColorSpace::Hsl|ColorSpace::Hwb) && index!=0 {component*=100.0;}
+        if value.space.hue()==Some(index) {component=decimal_scaled(component,360.0);}
+        if matches!(value.space,ColorSpace::Hsl|ColorSpace::Hwb) && index!=0 {component=decimal_scaled(component,100.0);}
         result.push_str(&number(component));
         if matches!(value.space,ColorSpace::Hsl|ColorSpace::Hwb) && index!=0 {result.push('%');}
     }

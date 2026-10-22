@@ -112,6 +112,8 @@ mod media_capture;
 mod option_factory;
 pub(crate) mod scrolling;
 mod svg_interfaces;
+mod svg_filter_interfaces;
+mod media_query_list_event;
 pub mod testdriver;
 mod webaudio;
 mod webrtc;
@@ -6047,7 +6049,12 @@ fn element_scroll(
 }
 
 impl DomElement {
-    fn offset_left(&self) -> OpResult<f64> {
+    fn flush_style_for_geometry(&self, ctx: &mut Ctx) -> OpResult<()> {
+        animations::flush_css_transitions_for_property(ctx, &self.base.realm, Some(self.base.id), Some("width"))
+    }
+
+    fn offset_left(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6055,7 +6062,8 @@ impl DomElement {
         )
     }
 
-    fn offset_top(&self) -> OpResult<f64> {
+    fn offset_top(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6063,7 +6071,8 @@ impl DomElement {
         )
     }
 
-    fn offset_width(&self) -> OpResult<f64> {
+    fn offset_width(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6071,7 +6080,8 @@ impl DomElement {
         )
     }
 
-    fn offset_height(&self) -> OpResult<f64> {
+    fn offset_height(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6590,6 +6600,7 @@ custom_elements::bind_element_aria! {
     }
 
     fn get_bounding_client_rect(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(geometry::bounding_client_rect_value(
             ctx,
@@ -6599,6 +6610,7 @@ custom_elements::bind_element_aria! {
     }
 
     fn get_client_rects(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(geometry::client_rect_list_value(
             ctx,
@@ -6608,7 +6620,44 @@ custom_elements::bind_element_aria! {
     }
 
     #[getter]
-    fn client_width(&self) -> OpResult<f64> {
+    fn client_top(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.client_top)),
+        )
+    }
+
+    #[getter(name = "currentCSSZoom")]
+    fn current_css_zoom(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
+        style::effective_zoom(&self.base.realm, self.base.id)
+    }
+
+    #[method(name = "checkVisibility")]
+    fn check_visibility(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<bool> {
+        let opacity = ui_events::dictionary_boolean(ctx, &options, "checkOpacity", false)?
+            || ui_events::dictionary_boolean(ctx, &options, "opacityProperty", false)?;
+        let visibility = ui_events::dictionary_boolean(ctx, &options, "checkVisibilityCSS", false)?
+            || ui_events::dictionary_boolean(ctx, &options, "visibilityProperty", false)?;
+        self.flush_style_for_geometry(ctx)?;
+        style::check_visibility(&self.base.realm, self.base.id, opacity, visibility)
+    }
+
+    #[getter]
+    fn client_left(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
+        self.base.realm.flush_layout()?;
+        Ok(
+            geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
+                .map_or(0.0, |geometry| f64::from(geometry.client_left)),
+        )
+    }
+
+    #[getter]
+    fn client_width(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6617,7 +6666,8 @@ custom_elements::bind_element_aria! {
     }
 
     #[getter]
-    fn client_height(&self) -> OpResult<f64> {
+    fn client_height(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6626,7 +6676,8 @@ custom_elements::bind_element_aria! {
     }
 
     #[getter]
-    fn scroll_width(&self) -> OpResult<f64> {
+    fn scroll_width(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -6635,7 +6686,8 @@ custom_elements::bind_element_aria! {
     }
 
     #[getter]
-    fn scroll_height(&self) -> OpResult<f64> {
+    fn scroll_height(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.flush_style_for_geometry(ctx)?;
         self.base.realm.flush_layout()?;
         Ok(
             geometry::snapshot(&mut self.base.realm.session.borrow_mut(), self.base.id)
@@ -9392,23 +9444,23 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     }
 
     #[getter]
-    fn offset_left(&self) -> OpResult<f64> {
-        self.base.offset_left()
+    fn offset_left(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.base.offset_left(ctx)
     }
 
     #[getter]
-    fn offset_top(&self) -> OpResult<f64> {
-        self.base.offset_top()
+    fn offset_top(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.base.offset_top(ctx)
     }
 
     #[getter]
-    fn offset_width(&self) -> OpResult<f64> {
-        self.base.offset_width()
+    fn offset_width(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.base.offset_width(ctx)
     }
 
     #[getter]
-    fn offset_height(&self) -> OpResult<f64> {
-        self.base.offset_height()
+    fn offset_height(&self, ctx: &mut Ctx) -> OpResult<f64> {
+        self.base.offset_height(ctx)
     }
 
     #[getter]
@@ -14530,6 +14582,7 @@ fn install_document_with_context_metadata(
         ("PageRevealEvent", ctx.class_constructor::<navigation_lifecycle::DomPageRevealEvent>()),
         ("PopStateEvent", ctx.class_constructor::<navigation_lifecycle::DomPopStateEvent>()),
         ("HashChangeEvent", ctx.class_constructor::<navigation_lifecycle::DomHashChangeEvent>()),
+        ("MediaQueryListEvent", ctx.class_constructor::<media_query_list_event::DomMediaQueryListEvent>()),
         ("HTMLAllCollection", ctx.class_constructor::<collections::DomHtmlAllCollection>()),
         ("Storage", ctx.class_constructor::<web_storage::DomStorage>()),
         ("StorageEvent", ctx.class_constructor::<web_storage::DomStorageEvent>()),

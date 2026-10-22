@@ -1,6 +1,8 @@
 //! Shared Web Animations effect timing and CSS-value interpolation.
 pub mod transition_values;
 pub mod progress_timelines;
+pub mod filter_values;
+pub mod value_range;
 
 use alloc::{borrow::ToOwned, boxed::Box, format, string::String, vec, vec::Vec};
 
@@ -694,6 +696,7 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
 /// Unsupported CSS syntax can use discrete keyframe sampling in the adapter.
 pub fn interpolate_numeric(from: &str, to: &str, progress: f64) -> Option<String> {
     if !progress.is_finite() {return None;}
+    if let Some(value)=crate::css::calc_size::interpolate(from,to,progress,false) {return Some(value);}
     if let (Some((a,unit_a)),Some((b,unit_b)))=(numeric_unit(from),numeric_unit(to)) {
         if unit_a==unit_b {
             if progress==0.0{return Some(from.to_owned());}
@@ -711,11 +714,12 @@ pub fn interpolate_numeric(from: &str, to: &str, progress: f64) -> Option<String
     combine_numeric_values(&[(from,1.0-progress),(to,progress)])
 }
 
-fn serialize_numeric(value:f64,unit:&str)->Option<String> {
+pub(crate) fn serialize_numeric(value:f64,unit:&str)->Option<String> {
     if !value.is_finite(){return None;}
     let mut result=format!("{value:.6}");
     while result.contains('.') && result.ends_with('0'){result.pop();}
     if result.ends_with('.'){result.pop();}
+    if result=="-0"{result=String::from("0");}
     result.push_str(unit);Some(result)
 }
 
@@ -725,6 +729,7 @@ fn serialize_numeric(value:f64,unit:&str)->Option<String> {
 pub fn combine_numeric_values(values:&[(&str,f64)])->Option<String> {
     use crate::css::typed_numeric::{NumericExpression as E,NumericValue,NumericUnit,parse_numeric_expression};
     if values.is_empty() || values.len()>3{return None;}
+    if let Some(value)=crate::css::calc_size::combine(values,false) {return Some(value);}
     let mut terms=Vec::new();terms.try_reserve_exact(values.len()).ok()?;
     for &(value,weight) in values {
         if !weight.is_finite(){return None;}
@@ -736,6 +741,7 @@ pub fn combine_numeric_values(values:&[(&str,f64)])->Option<String> {
     let mut expression=E::Sum(terms);
     expression.numeric_type()?;
     if !expression.within_limits(){return None;}
+    if let Some(value)=crate::css::linear_numeric::serialize_flat(&expression){return Some(value);}
     expression.simplify_absolute_units();
     if let Some(value)=expression.computed_percentage_dimension_mix(){expression=E::Value(value);}
     if expression.single_numeric_value().is_none(){expression=E::Calc(Box::new(expression));}
@@ -831,12 +837,8 @@ pub fn add_numeric_values(base: &str, value: &str, delta: Option<(&str, u64)>) -
 }
 
 fn numeric_unit(value: &str) -> Option<(f64, &str)> {
-    let value = value.trim();
-    let split = value
-        .find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
-        .unwrap_or(value.len());
-    let number = value[..split].parse::<f64>().ok()?;
-    number.is_finite().then_some((number, &value[split..]))
+    let (number, unit) = lumen_common::numeric::split_number_unit(value.trim())?;
+    number.is_finite().then_some((number, unit))
 }
 
 pub fn sample_keyframes(keyframes: &[Keyframe], progress: f64) -> Vec<(String, String)> {

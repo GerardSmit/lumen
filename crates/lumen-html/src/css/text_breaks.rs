@@ -6,6 +6,31 @@ use super::{OverflowWrap, Style, WhiteSpace, WordBreak};
 use lumen_common::ucd::{self, BreakClass, BreakOpportunity};
 use lumen_common::bidi::{Script, UnicodeScript};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineBreak {
+    #[default]
+    Auto,
+    Loose,
+    Normal,
+    Strict,
+    Anywhere,
+}
+
+/// Per-unit line breaking policy: the cascaded properties of the containing
+/// inline box plus whether its language is Japanese or Chinese.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BreakPolicy {
+    pub word_break: WordBreak,
+    pub overflow_wrap: OverflowWrap,
+    pub line_break: LineBreak,
+    pub east_asian: bool,
+}
+
+pub fn east_asian_language(tag: &str) -> bool {
+    let primary = tag.split('-').next().unwrap_or("");
+    primary.eq_ignore_ascii_case("ja") || primary.eq_ignore_ascii_case("zh")
+}
+
 impl Style {
     pub fn emergency_wrap(&self) -> bool {
         !matches!(self.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
@@ -13,12 +38,38 @@ impl Style {
                 || self.overflow_wrap != OverflowWrap::Normal)
     }
 
+    pub fn line_break(&self) -> LineBreak {
+        match super::extra_props::keyword(self, "line-break") {
+            Some("loose") => LineBreak::Loose,
+            Some("normal") => LineBreak::Normal,
+            Some("strict") => LineBreak::Strict,
+            Some("anywhere") => LineBreak::Anywhere,
+            _ => LineBreak::Auto,
+        }
+    }
+
+    pub fn break_policy(&self, east_asian: bool) -> BreakPolicy {
+        BreakPolicy {
+            word_break: self.word_break,
+            overflow_wrap: self.overflow_wrap,
+            line_break: self.line_break(),
+            east_asian,
+        }
+    }
+
+    pub fn needs_break_tailoring(&self, min_content: bool) -> bool {
+        needs_tailoring(self.word_break, self.overflow_wrap, min_content)
+            || self.line_break() == LineBreak::Anywhere
+    }
+
     pub fn text_line_breaks<'a>(
         &self,
         text: &'a str,
         min_content: bool,
+        east_asian: bool,
     ) -> impl Iterator<Item = (usize, BreakOpportunity)> + 'a {
-        opportunities(text, self.word_break, self.overflow_wrap, min_content)
+        let policy = self.break_policy(east_asian);
+        opportunities_with(text, min_content, self.needs_break_tailoring(min_content), move |_| policy)
     }
 }
 
@@ -41,11 +92,12 @@ pub fn opportunities(
     overflow_wrap: OverflowWrap,
     min_content: bool,
 ) -> impl Iterator<Item = (usize, BreakOpportunity)> + '_ {
+    let policy = BreakPolicy { word_break, overflow_wrap, line_break: LineBreak::Strict, east_asian: false };
     opportunities_with(
         text,
         min_content,
         needs_tailoring(word_break, overflow_wrap, min_content),
-        move |_| (word_break, overflow_wrap),
+        move |_| policy,
     )
 }
 
@@ -93,18 +145,94 @@ fn lexical_unit(cluster: &str) -> bool {
         .is_some_and(lexical_character)
 }
 
+const CJ_EXTRA: [char; 2] = ['\u{30fc}', '\u{ff70}'];
+const ITERATION_MARKS: [char; 6] = ['\u{3005}', '\u{303b}', '\u{309d}', '\u{309e}', '\u{30fd}', '\u{30fe}'];
+const HYPHENS: [char; 4] = ['\u{2010}', '\u{2013}', '\u{301c}', '\u{30a0}'];
+const CENTERED_PUNCTUATION: [char; 10] = [
+    '\u{30fb}', '\u{ff1a}', '\u{ff1b}', '\u{ff65}', '\u{203c}', '\u{2047}', '\u{2048}', '\u{2049}',
+    '\u{ff01}', '\u{ff1f}',
+];
+
+fn wide_east_asian_width(ch: char) -> bool {
+    matches!(ucd::props(ch as u32, ucd::Version::Current).east_asian_width, "A" | "F" | "W")
+}
+
+fn line_break_tailorable(ch: char) -> bool {
+    if ch.is_ascii() {
+        return false;
+    }
+    match ucd::break_property(ch as u32) {
+        BreakClass::ConditionalJapaneseStarter | BreakClass::Inseparable | BreakClass::Prefix
+        | BreakClass::Postfix => true,
+        _ => {
+            CJ_EXTRA.contains(&ch)
+                || ITERATION_MARKS.contains(&ch)
+                || HYPHENS.contains(&ch)
+                || CENTERED_PUNCTUATION.contains(&ch)
+        }
+    }
+}
+
+pub fn requires_line_break_tailoring(text: &str) -> bool {
+    !text.is_ascii() && text.chars().any(line_break_tailorable)
+}
+
+/// Whether UAX #14 would allow a break between `left` and an ideograph, which
+/// is how the tailored classes below behave after `left`.
+fn ideograph_break_after(left: char) -> bool {
+    let mut buffer = [0u8; 8];
+    let left_len = left.len_utf8();
+    left.encode_utf8(&mut buffer);
+    '\u{6587}'.encode_utf8(&mut buffer[left_len..]);
+    let probe = core::str::from_utf8(&buffer[..left_len + 3]).unwrap_or("");
+    let allowed = ucd::line_breaks(probe).any(|(at, kind)| at == left_len && kind == BreakOpportunity::Allowed);
+    allowed
+}
+
+/// CSS Text §5.1 `line-break` tailoring of the boundary between `left` and
+/// `right`: `Some(true)` allows a break that UAX #14 prohibits, `Some(false)`
+/// prohibits one it allows.
+fn line_break_tailoring(mode: LineBreak, east_asian: bool, left: char, right: char) -> Option<bool> {
+    let relaxed = matches!(mode, LineBreak::Auto | LineBreak::Normal | LineBreak::Loose);
+    if !relaxed && !east_asian {
+        return None;
+    }
+    let loose = mode == LineBreak::Loose;
+    let class = ucd::break_property(right as u32);
+    let small_kana = class == BreakClass::ConditionalJapaneseStarter || CJ_EXTRA.contains(&right);
+    let allow = if small_kana {
+        relaxed
+    } else if ITERATION_MARKS.contains(&right) || class == BreakClass::Inseparable {
+        loose
+    } else if HYPHENS.contains(&right) {
+        east_asian && (loose || matches!(right, '\u{301c}' | '\u{30a0}') && relaxed)
+    } else if CENTERED_PUNCTUATION.contains(&right) {
+        east_asian && loose
+    } else if class == BreakClass::Postfix && wide_east_asian_width(right) {
+        east_asian && loose
+    } else if class == BreakClass::Prefix && wide_east_asian_width(right) {
+        if east_asian && !loose && ucd::break_property(left as u32) == BreakClass::Ideographic {
+            return Some(false);
+        }
+        false
+    } else {
+        false
+    };
+    (allow && ideograph_break_after(left)).then_some(true)
+}
+
 /// The policy callback selects the containing inline style for each unit.
 /// Untailored paragraphs never invoke it or traverse the grapheme iterator.
 pub fn opportunities_with<'a>(
     text: &'a str,
     min_content: bool,
     tailored: bool,
-    mut policy: impl FnMut(usize) -> (WordBreak, OverflowWrap) + 'a,
+    mut policy: impl FnMut(usize) -> BreakPolicy + 'a,
 ) -> impl Iterator<Item = (usize, BreakOpportunity)> + 'a {
     // AutoPhrase deliberately stays on the Normal opportunity path: this UA
     // has no language-specific phrase detector, for which CSS Text requires
     // the normal fallback.
-    let tailored = tailored || requires_lexical_fallback(text);
+    let tailored = tailored || requires_lexical_fallback(text) || requires_line_break_tailoring(text);
     let mut ordinary = ucd::line_breaks(text).peekable();
     let mut clusters = ucd::graphemes(text).peekable();
     core::iter::from_fn(move || {
@@ -114,9 +242,10 @@ pub fn opportunities_with<'a>(
         loop {
             let (start, cluster) = clusters.next()?;
             let end = start + cluster.len();
-            let (word_break, overflow_wrap) = policy(start);
-            let intrinsic_anywhere = min_content
-                && (overflow_wrap == OverflowWrap::Anywhere || word_break == WordBreak::BreakWord);
+            let BreakPolicy { word_break, overflow_wrap, line_break, east_asian } = policy(start);
+            let intrinsic_anywhere = (min_content
+                && (overflow_wrap == OverflowWrap::Anywhere || word_break == WordBreak::BreakWord))
+                || line_break == LineBreak::Anywhere;
             let mut kind = None;
             while ordinary.peek().is_some_and(|&(offset, _)| offset <= end) {
                 let (offset, opportunity) = ordinary.next()?;
@@ -126,6 +255,15 @@ pub fn opportunities_with<'a>(
             }
             if kind == Some(BreakOpportunity::Mandatory) {
                 return Some((end, BreakOpportunity::Mandatory));
+            }
+            if let (Some(left), Some((_, right))) = (cluster.chars().next(), clusters.peek()) {
+                if let Some(right) = right.chars().next() {
+                    match line_break_tailoring(line_break, east_asian, left, right) {
+                        Some(true) if kind.is_none() => kind = Some(BreakOpportunity::Allowed),
+                        Some(false) => kind = None,
+                        _ => {}
+                    }
+                }
             }
             // The shared UAX #14 provider resolves SA (ComplexContext) to AL
             // and has no lexical-analysis database. `manual` therefore keeps

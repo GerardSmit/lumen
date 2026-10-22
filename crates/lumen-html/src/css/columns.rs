@@ -32,6 +32,7 @@ impl ColumnWidth {
         Self::Auto=>None,Self::Length(_)=>self.numeric(available),
         Self::Stretch=>available,Self::Intrinsic(IntrinsicSizing::MinContent)=>Some(minimum),
         Self::Intrinsic(IntrinsicSizing::MaxContent)=>Some(maximum),
+        Self::Intrinsic(IntrinsicSizing::Stretch|IntrinsicSizing::CalcSize(_))=>available,
         Self::Intrinsic(IntrinsicSizing::FitContent)=>Some(minimum.max(available.unwrap_or(maximum)).min(maximum)),
         Self::FitContent(_)=>Some(minimum.max(self.numeric(available).unwrap_or(maximum)).min(maximum)),
     }}
@@ -75,8 +76,20 @@ fn width_declaration(raw:&str)->Option<Value> {
 pub(super) fn resolve(raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<Value> {width(raw,Some((context,query))).map(Value::ColumnWidth)}
 pub(super) fn declarations(name:&str,raw:&str,important:bool)->Option<Vec<Declaration>> {
     if name=="column-width"{return Some(alloc::vec![Declaration{value:width_declaration(raw)?,important}]);}
-    let (width,count)=parts(raw)?;
-    Some(alloc::vec![Declaration{value:width_declaration(width.unwrap_or("auto"))?,important},Declaration{value:column_count_value(count.unwrap_or("auto"))?,important}])
+    let (head,height)=split_height(raw)?;
+    let (width,count)=parts(head)?;
+    let mut out=alloc::vec![Declaration{value:width_declaration(width.unwrap_or("auto"))?,important},Declaration{value:column_count_value(count.unwrap_or("auto"))?,important}];
+    for (longhand,value) in [("column-height",height.unwrap_or("auto")),("column-wrap","auto")] {
+        out.extend(extra_props::declarations(longhand,value)?.into_iter().map(|value|Declaration{value,important}));
+    }
+    Some(out)
+}
+fn split_height(raw:&str)->Option<(&str,Option<&str>)> {
+    match top_level_split(raw,b'/',3)?.as_slice() {
+        [head]=>Some((head,None)),
+        [head,height] if !head.is_empty() && !height.is_empty()=>Some((head,Some(height))),
+        _=>None,
+    }
 }
 fn parts(raw:&str)->Option<(Option<&str>,Option<&str>)> {
     let tokens=components(raw).filter(|tokens|(1..=2).contains(&tokens.len()))?;
@@ -97,12 +110,18 @@ fn source_width(raw:&str)->Option<String> {Some(match width(raw,None)? {
 pub(super) fn shorthand_value(width:&str,count:&str)->String {
     if width=="auto" {count.into()}else if count=="auto"{width.into()}else{alloc::format!("{width} {count}")}
 }
+pub(super) fn shorthand_with_height(width:&str,count:&str,height:&str)->String {
+    let base=shorthand_value(width,count);
+    if height=="auto"{base}else{alloc::format!("{base} / {height}")}
+}
 pub(super) fn specified(name:&str,raw:&str)->Option<String> {
     if let Some(keyword)=["initial","inherit","unset","revert","revert-layer"].into_iter().find(|keyword|decoded_css_keyword(raw,keyword)){return Some(keyword.into());}
     if name=="column-width"{return source_width(raw);}
     if name=="column-count"{return count_source(raw);}
-    let (w,c)=parts(raw)?;
-    Some(shorthand_value(&source_width(w.unwrap_or("auto"))?,&count_source(c.unwrap_or("auto"))?))
+    let (head,height)=split_height(raw)?;
+    let (w,c)=parts(head)?;
+    let height=match height {Some(height)=>extra_props::serialize_specified(extra_props::slot_of("column-height")?,height)?,None=>"auto".into()};
+    Some(shorthand_with_height(&source_width(w.unwrap_or("auto"))?,&count_source(c.unwrap_or("auto"))?,&height))
 }
 fn count_source(raw:&str)->Option<String> {
     if decoded_css_keyword(raw,"auto"){Some("auto".into())}
@@ -110,7 +129,7 @@ fn count_source(raw:&str)->Option<String> {
 }
 pub(super) fn specified_component(origin:&str,target:&str,raw:&str)->Option<String> {
     if origin!="columns"{return specified(target,raw);}
-    let (w,c)=parts(raw)?;
+    let (w,c)=parts(split_height(raw)?.0)?;
     if target=="column-width"{source_width(w.unwrap_or("auto"))}else{count_source(c.unwrap_or("auto"))}
 }
 /// CSS Multicol §3.4. Cap only the renderer's used work, preserving valid
@@ -126,8 +145,12 @@ pub(crate) fn used(style:&Style,available:f32,minimum:f32,maximum:f32,gap:f32)->
 
 /// Multicol applies to block containers, including flow list items and table
 /// cells/captions. Table wrappers, flex and grid keep their own layout models.
+///
+/// Only horizontal writing modes are fragmented into columns; a vertical
+/// container lays its content out in a single column.
 pub(crate) fn active(style:&Style)->bool {
     matches!(style.display,Display::Block|Display::FlowRoot|Display::InlineBlock|Display::ListItem|Display::TableCell|Display::TableCaption)
+        && style.writing_mode==WritingMode::HorizontalTb
         && (style.column_count.is_some() || !matches!(style.column_width,ColumnWidth::Auto))
 }
 pub(crate) fn clear(style:&mut Style) {

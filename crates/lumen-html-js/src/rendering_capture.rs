@@ -128,13 +128,30 @@ impl DomRealm {
             .ok_or_else(|| OpError::new("InvalidStateError", "Render capture returned invalid pixel storage"))
     }
 
+    /// The backend is stateless over the session it is given, so an embedded
+    /// document without its own installation rasterizes through its owner's.
+    fn inherited_render_capture_provider(&self) -> Option<RenderCaptureProvider> {
+        if let Some(provider) = self.browser_services.render_capture.provider.borrow().clone() {
+            return Some(provider);
+        }
+        let mut owner = self.browsing_context()?.container_document()?;
+        for _ in 0..32 {
+            if let Some(provider) = owner.browser_services.render_capture.provider.borrow().clone() {
+                return Some(provider);
+            }
+            let next = owner.browsing_context()?.container_document()?;
+            owner = next;
+        }
+        None
+    }
+
     /// Capture through the installed host backend with the requested dimensions.
     pub(crate) fn render_capture(&self, request: &RenderCaptureRequest)
         -> OpResult<lumen_html_image::Rgba8Image> {
         self.render_capture_at(request,0)
     }
     fn render_capture_at(&self,request:&RenderCaptureRequest,depth:usize)->OpResult<lumen_html_image::Rgba8Image> {
-        let provider = self.browser_services.render_capture.provider.borrow().clone()
+        let provider = self.inherited_render_capture_provider()
             .ok_or_else(|| OpError::new("NotSupportedError", "Host does not provide render capture"))?;
         let mut image = provider(&mut self.session.borrow_mut(), request)
             .map_err(|error| OpError::new("InvalidStateError", error))?;

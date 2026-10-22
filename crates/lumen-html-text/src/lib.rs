@@ -35,6 +35,10 @@ use lumen_html::paint::{
 static NEXT_FACE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SHAPE_TEXT_BYTES: usize = 64 * 1024;
+/// Shaping and outlines scale linearly, so they accept any size a page can compute.
+const MAX_SHAPE_FONT_SIZE: f32 = 16384.0;
+/// Coverage bitmaps grow with the square of the size; larger glyphs are not rasterized.
+const MAX_RASTER_FONT_SIZE: f32 = 2048.0;
 const RUN_CACHE_SLOTS: usize = 16384;
 const MAX_RUN_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// A font set's own shaped runs hold whole-paragraph segments with cluster
@@ -634,7 +638,7 @@ fn finish_cluster_advances(
 }
 
 fn validate_shape_input(text: &str, size: f32) -> Result<(), &'static str> {
-    if !size.is_finite() || size <= 0.0 || size > 512.0 {
+    if !size.is_finite() || size <= 0.0 || size > MAX_SHAPE_FONT_SIZE {
         return Err("invalid font size");
     }
     if text.len() > MAX_SHAPE_TEXT_BYTES {
@@ -1247,9 +1251,6 @@ impl FontSet {
 
     fn face_order(&self, spec: &FontSpec) -> Result<Vec<usize>, &'static str> {
         if spec.unresolved_style.is_some() || spec.unresolved_stretch.is_some() { return Err("font style or width requires query-container context"); }
-        if !(1..=1000).contains(&spec.weight) {
-            return Err("invalid requested font weight");
-        }
         if !spec.stretch.is_finite() || spec.stretch < 0.0 {
             return Err("invalid requested font stretch");
         }
@@ -3101,7 +3102,7 @@ impl FontFace {
     }
 
     fn with_rasterizer<R>(&self,id:u16,size:f32,visit:impl Fn(&fontdue::Font)->R) -> Result<R,&'static str> {
-        if !size.is_finite() || size <= 0.0 || size > 512.0 {
+        if !size.is_finite() || size <= 0.0 || size > MAX_RASTER_FONT_SIZE {
             return Err("invalid font size");
         }
         if id >= self.glyph_count {
@@ -3128,7 +3129,7 @@ impl FontFace {
     }
 
     pub fn outline(&self, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
-        if !size.is_finite() || size <= 0.0 || size > 512.0 {
+        if !size.is_finite() || size <= 0.0 || size > MAX_SHAPE_FONT_SIZE {
             return Err("invalid font size");
         }
         let mut builder = GlyphOutlineBuilder {
@@ -3434,7 +3435,7 @@ impl FontProvider for FontFace {
         size: f32,
     ) -> Result<GlyphCoverage, &'static str> {
         if self.is_invisible_key(face) {
-            if !size.is_finite() || size<=0.0 || size>512.0 {return Err("invalid font size");}
+            if !size.is_finite() || size<=0.0 || size>MAX_RASTER_FONT_SIZE {return Err("invalid font size");}
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphCoverage {x_min:0,y_min:0,width:0,height:0,alpha:Vec::new()});
         }
@@ -3449,7 +3450,7 @@ impl FontProvider for FontFace {
 
     fn outline_glyph(&self, face: u64, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
         if self.is_invisible_key(face) {
-            if !size.is_finite() || size<=0.0 || size>512.0 {return Err("invalid font size");}
+            if !size.is_finite() || size<=0.0 || size>MAX_SHAPE_FONT_SIZE {return Err("invalid font size");}
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphOutline {commands:Vec::new()});
         }

@@ -186,22 +186,14 @@ fn starts_number(bytes: &[u8]) -> bool {
     bytes.first().is_some_and(u8::is_ascii_digit)
         || bytes.first() == Some(&b'.') && bytes.get(1).is_some_and(u8::is_ascii_digit)
 }
-fn number_end(bytes: &[u8], mut at: usize) -> usize {
-    if matches!(bytes.get(at), Some(b'+' | b'-')) { at += 1; }
-    while bytes.get(at).is_some_and(u8::is_ascii_digit) { at += 1; }
-    if bytes.get(at) == Some(&b'.') && bytes.get(at+1).is_some_and(u8::is_ascii_digit) {
-        at += 1;
-        while bytes.get(at).is_some_and(u8::is_ascii_digit) { at += 1; }
-    }
-    if matches!(bytes.get(at), Some(b'e' | b'E')) {
-        let exponent = at+1;
-        let digits = exponent + usize::from(matches!(bytes.get(exponent), Some(b'+' | b'-')));
-        if bytes.get(digits).is_some_and(u8::is_ascii_digit) {
-            at = digits+1;
-            while bytes.get(at).is_some_and(u8::is_ascii_digit) { at += 1; }
-        }
-    }
-    at
+pub(super) use lumen_common::numeric::{number_end, split_number_unit};
+/// Bytes that continue a CSS name (ASCII alphanumerics, `-`, `_` and every non-ASCII byte).
+pub(super) fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') || byte >= 0x80
+}
+
+pub(super) fn is_name_char(ch: char) -> bool {
+    !ch.is_ascii() || is_name_byte(ch as u8)
 }
 
 pub(super) fn closing(open: u8) -> u8 { match open { b'(' => b')', b'[' => b']', _ => b'}' } }
@@ -402,4 +394,68 @@ mod tests {
         assert!(unsupported_svg_style_properties("color:red;width:1px").is_empty());
         assert!(unsupported_svg_style_properties("content:'stroke-linecap';width:1px").is_empty());
     }
+}
+
+/// Offset of the bracket closing the block opened at `open`, or `None` when the
+/// block is unclosed or `open` is not a bracket.
+pub(super) fn matching_close(input: &str, open: usize) -> Option<usize> {
+    let end = block(input, open).ok()?;
+    end.closed.then_some(end.content_end)
+}
+
+/// Splits `raw` at top-level `separator` bytes (outside blocks, strings and
+/// comments) without trimming. A piece containing a stray closer, a bad string or url,
+/// or an unclosed block is `None`; the whole result is `None` for more than `max`
+/// pieces or input over `max_bytes`.
+pub(super) fn split_top_level_recovering(raw: &str, separator: u8, max: usize, max_bytes: usize) -> Option<Vec<Option<&str>>> {
+    if raw.len() > max_bytes || max == 0 { return None; }
+    let mut cursor = Cursor::new(raw, 0).ok()?;
+    let mut start = 0;
+    let mut bad = false;
+    let mut pieces = Vec::new();
+    while let Some(token) = cursor.next() {
+        match token.kind {
+            TokenKind::Open(_) => match block(raw, token.start) {
+                Ok(end) => cursor.position = end.after,
+                Err(_) => {
+                    bad = true;
+                    break;
+                }
+            },
+            TokenKind::Close(_) | TokenKind::BadString | TokenKind::BadUrl => bad = true,
+            TokenKind::Other if raw.as_bytes()[token.start] == separator => {
+                pieces.push((!bad).then(|| &raw[start..token.start]));
+                if pieces.len() >= max { return None; }
+                start = token.end;
+                bad = false;
+            }
+            _ => {}
+        }
+    }
+    pieces.push((!bad).then(|| &raw[start..]));
+    Some(pieces)
+}
+
+/// Like [`split_top_level_recovering`], but `None` when any piece is malformed.
+pub(super) fn split_top_level(raw: &str, separator: u8, max: usize, max_bytes: usize) -> Option<Vec<&str>> {
+    split_top_level_recovering(raw, separator, max, max_bytes)?.into_iter().collect()
+}
+
+/// Offset of the first top-level `needle` byte. The outer `None` means the text is
+/// malformed (stray or unclosed bracket, bad string or url); `Some(None)` means absent.
+pub(super) fn top_level_find(raw: &str, needle: u8) -> Option<Option<usize>> {
+    let mut cursor = Cursor::new(raw, 0).ok()?;
+    while let Some(token) = cursor.next() {
+        match token.kind {
+            TokenKind::Open(_) => {
+                let end = block(raw, token.start).ok()?;
+                if !end.closed { return None; }
+                cursor.position = end.after;
+            }
+            TokenKind::Close(_) | TokenKind::BadString | TokenKind::BadUrl => return None,
+            TokenKind::Other if raw.as_bytes()[token.start] == needle => return Some(Some(token.start)),
+            _ => {}
+        }
+    }
+    Some(None)
 }

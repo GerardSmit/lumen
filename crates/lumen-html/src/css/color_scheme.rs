@@ -92,9 +92,22 @@ pub(super) fn select_branches(raw:&str,scheme:UsedColorScheme)->Option<alloc::bo
 
 /// The UA palette is shared by named-color resolution, initial foreground,
 /// form controls and the canvas. Author color functions keep precise channels.
+/// CSS Color 4 deprecated system colors and the current keyword each one
+/// computes like.
+fn deprecated_system_color(name:&str)->&str {
+    match name {
+        "activeborder"|"inactiveborder"|"threeddarkshadow"|"threedhighlight"|"threedlightshadow"|"threedshadow"|"windowframe"=>"buttonborder",
+        "activecaption"|"appworkspace"|"background"|"inactivecaption"|"infobackground"|"menu"|"scrollbar"|"window"=>"canvas",
+        "buttonhighlight"|"buttonshadow"=>"buttonface",
+        "captiontext"|"infotext"|"menutext"|"windowtext"=>"canvastext",
+        "inactivecaptiontext"=>"graytext",
+        _=>name,
+    }
+}
+
 pub fn system_color(name:&str,scheme:UsedColorScheme)->Option<Rgba> {
     let dark=scheme==UsedColorScheme::Dark;
-    let (r,g,b)=match name {
+    let (r,g,b)=match deprecated_system_color(name) {
         "canvas"|"field"=>if dark{(18,18,18)}else{(255,255,255)},
         "canvastext"|"buttontext"|"fieldtext"|"highlighttext"|"selecteditemtext"|"buttonborder"|"marktext"=>if dark{(255,255,255)}else{(0,0,0)},
         "linktext"=>if dark{(158,158,255)}else{(0,0,238)},

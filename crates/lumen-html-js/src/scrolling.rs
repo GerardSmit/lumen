@@ -331,7 +331,7 @@ pub(crate) fn element_scroll_target(
     if session.layout_rect(node).is_none() {
         return Ok(None);
     }
-    if purpose != ElementScrollPurpose::Getter && session.scroll_extent(node).is_none() {
+    if purpose != ElementScrollPurpose::Getter && session.scroll_bounds(node).is_none() {
         return Ok(None);
     }
     Ok(Some(node))

@@ -1079,9 +1079,9 @@ pub fn parse_numeric_expression_with<B: NumericExpressionBuilder>(
 
 // The dependency gate and length grammar share the parser's supported function
 // dispatch. Unsupported functions are not silently admitted as computable math.
-const NUMERIC_MATH_FUNCTIONS: [(&str,u8);24] = [
+const NUMERIC_MATH_FUNCTIONS: [(&str,u8);25] = [
     ("calc(",0),("min(",1),("max(",2),("clamp(",3),("sign(",4),
-    ("sin(",5),("cos(",6),("tan(",7),("asin(",8),("acos(",9),("atan(",10),("atan2(",11),("pow(",12),("sqrt(",13),("hypot(",14),("log(",15),("exp(",16),("abs(",17),("mod(",18),("rem(",19),("round(",20),("progress(",21),("sibling-index(",22),("sibling-count(",23),
+    ("sin(",5),("cos(",6),("tan(",7),("asin(",8),("acos(",9),("atan(",10),("atan2(",11),("pow(",12),("sqrt(",13),("hypot(",14),("log(",15),("exp(",16),("abs(",17),("mod(",18),("rem(",19),("round(",20),("progress(",21),("sibling-index(",22),("sibling-count(",23),("calc-mix(",24),
 ];
 pub(super) fn is_numeric_math_function(name:&str)->bool {
     NUMERIC_MATH_FUNCTIONS.iter().any(|(function,_)|
@@ -1172,6 +1172,64 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
         self.builder.finish_product(values, operated)
     }
 
+    /// `calc-mix()` with constant weights folds into a weighted sum: weights clamp to 0..=100%, missing
+    /// ones share what the explicit weights leave over, and totals above 100% are scaled down.
+    fn calc_mix(&mut self, depth: usize) -> Option<B::Expr> {
+        let mut items: Vec<(B::Expr, Option<f64>)> = Vec::new();
+        loop {
+            if items.len() >= MAX_NUMERIC_EXPRESSION_ARGS {
+                return None;
+            }
+            let value = self.sum(depth + 1)?;
+            self.space();
+            let mut weight = None;
+            if !matches!(self.input.as_bytes().get(self.position), Some(b',') | Some(b')')) {
+                let mut sub = NumericExpressionParser {
+                    input: self.input, position: self.position, nodes: self.nodes, builder: &mut NumericExpressionTreeBuilder,
+                };
+                let mut expression = sub.sum(depth + 1)?;
+                self.position = sub.position;
+                self.nodes = sub.nodes;
+                weight = Some(mix_weight(&mut expression)?);
+                self.space();
+            }
+            items.try_reserve(1).ok()?;
+            items.push((value, weight));
+            match self.input.as_bytes().get(self.position) {
+                Some(b',') => self.position += 1,
+                Some(b')') => {
+                    self.position += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        self.count_node()?;
+        let weights = mix_weights(&items.iter().map(|(_, weight)| *weight).collect::<Vec<_>>());
+        let positive = weights.iter().any(|weight| *weight > 0.0);
+        let mut terms = Vec::new();
+        for (index, ((value, _), weight)) in items.into_iter().zip(weights).enumerate() {
+            if positive && weight <= 0.0 || !positive && index > 0 {
+                continue;
+            }
+            self.count_node()?;
+            let mut product = self.builder.begin_product(value)?;
+            let factor = self.builder.value(NumericValue { value: weight, unit: NumericUnit::Number })?;
+            self.builder.push_product(&mut product, factor, false)?;
+            terms.push(self.builder.finish_product(product, true)?);
+        }
+        let mut terms = terms.into_iter();
+        let first = terms.next()?;
+        let mut sum = self.builder.begin_sum(first)?;
+        let mut operated = false;
+        for term in terms {
+            self.builder.push_sum(&mut sum, term, false)?;
+            operated = true;
+        }
+        let total = self.builder.finish_sum(sum, operated)?;
+        self.builder.calc(total)
+    }
+
     fn atom(&mut self, depth: usize) -> Option<B::Expr> {
         if depth > MAX_NUMERIC_EXPRESSION_DEPTH {
             return None;
@@ -1188,6 +1246,9 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
             let escaped_length = escaped.as_ref().filter(|(decoded,_)| decoded.eq_ignore_ascii_case(&name[..name.len()-1])).map(|(_,length)| *length);
             if rest.get(..name.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(name)) || escaped_length.is_some() {
                 self.position += escaped_length.unwrap_or(name.len());
+                if kind==24 {
+                    return self.calc_mix(depth);
+                }
                 if kind>=5 {
                     let mut function=match kind {5=>MathFunction::Sin,6=>MathFunction::Cos,7=>MathFunction::Tan,8=>MathFunction::Asin,9=>MathFunction::Acos,10=>MathFunction::Atan,11=>MathFunction::Atan2,12=>MathFunction::Pow,13=>MathFunction::Sqrt,14=>MathFunction::Hypot,15=>MathFunction::Log,16=>MathFunction::Exp,17=>MathFunction::Abs,18=>MathFunction::Mod,19=>MathFunction::Rem,20=>MathFunction::Round(RoundingStrategy::Nearest),21=>MathFunction::Progress{clamp:true},22=>MathFunction::SiblingIndex,23=>MathFunction::SiblingCount,_=>return None};
                     if kind==22||kind==23 {
@@ -1324,6 +1385,31 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
         self.count_node()?;
         self.builder.value(value)
     }
+}
+
+/// The percentage of a `calc-mix()` weight, clamped to 0..=100% when computed by `calc()`; a bare
+/// percentage outside that range is invalid.
+fn mix_weight(expression: &mut NumericExpression) -> Option<f64> {
+    if let NumericExpression::Value(value) = expression {
+        return (value.unit == NumericUnit::Percent && (0.0..=100.0).contains(&value.value)).then_some(value.value);
+    }
+    expression.simplify_absolute_units();
+    let value = expression.single_numeric_value().filter(|value| value.unit == NumericUnit::Percent)?;
+    value.value.is_finite().then(|| value.value.clamp(0.0, 100.0))
+}
+
+fn mix_weights(given: &[Option<f64>]) -> Vec<f64> {
+    let known: f64 = given.iter().flatten().sum();
+    let missing = given.iter().filter(|weight| weight.is_none()).count();
+    let fill = if missing > 0 { (100.0 - known).max(0.0) / missing as f64 } else { 0.0 };
+    let mut weights: Vec<f64> = given.iter().map(|weight| weight.unwrap_or(fill)).collect();
+    let total: f64 = weights.iter().sum();
+    if total > 100.0 {
+        for weight in &mut weights {
+            *weight *= 100.0 / total;
+        }
+    }
+    weights.into_iter().map(|weight| weight / 100.0).collect()
 }
 
 struct NumericExpressionTreeBuilder;
@@ -2039,6 +2125,7 @@ pub fn is_list_valued_property(property: &str) -> bool {
         "animation-timing-function",
         "background",
         "background-attachment",
+        "background-blend-mode",
         "background-clip",
         "background-image",
         "background-origin",
@@ -2071,6 +2158,16 @@ pub fn is_list_valued_property(property: &str) -> bool {
     LIST_PROPERTIES.contains(&property.as_str())
 }
 
+/// Serialized numbers keep six fractional digits, which absorbs the binary
+/// rounding noise of trigonometric and exponential results.
+fn without_rounding_noise(value: f64) -> f64 {
+    if value.abs() >= 1e9 {
+        return value;
+    }
+    let rounded = libm::round(value * 1e6) / 1e6;
+    if rounded == 0.0 { value } else { rounded }
+}
+
 /// Serialize a number and unit using CSS numeric-value formatting.
 pub fn serialize_numeric_value(value: f64, unit: NumericUnit) -> String {
     if !value.is_finite() {
@@ -2080,7 +2177,7 @@ pub fn serialize_numeric_value(value: f64, unit: NumericUnit) -> String {
     let number = if value == 0.0 {
         String::from("0")
     } else {
-        alloc::format!("{value}")
+        alloc::format!("{}", without_rounding_noise(value))
     };
     match unit {
         NumericUnit::Number => number,

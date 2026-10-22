@@ -135,6 +135,7 @@ fn image(raw:&str,depth:u8,computed:Option<Computation<'_>>)->Option<String>{
         }
     }
     if decoded_css_keyword(raw,"none"){return Some("none".into());}
+    if let Some(url)=background_url(raw) {return Some(alloc::format!("url({})",serialize_css_string(&url)));}
     let Some((name,body))=raw.split_once('(') else{return Some(raw.to_owned());};
     let name=keyword(name)?;let body=body.strip_suffix(')')?;
     if matches!(name.as_str(),"linear-gradient"|"repeating-linear-gradient"|"radial-gradient"|"repeating-radial-gradient"|"conic-gradient"|"repeating-conic-gradient"){return gradient(raw,&name,body,computed);}

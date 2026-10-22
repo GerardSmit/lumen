@@ -50,6 +50,10 @@ pub mod executable;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
 pub mod fasthash;
+pub mod name_table;
+pub mod lazy_index_table;
+pub mod numeric;
+pub mod generations;
 pub mod float;
 pub mod float16;
 pub mod fmtspec;
