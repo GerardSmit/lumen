@@ -10,6 +10,14 @@ pub(super) struct AnchorIndex {
     by_name: BTreeMap<String, Vec<(NodeId, usize)>>,
 }
 
+/// The insets `anchor()` resolution replaced, as top, right, bottom, left.
+pub(super) fn changed_insets(original: &Style, resolved: &Style) -> Option<[Option<f32>; 4]> {
+    let before = [original.top, original.right, original.bottom, original.left];
+    let after = [resolved.top, resolved.right, resolved.bottom, resolved.left];
+    let changed: [Option<f32>; 4] = core::array::from_fn(|edge| if before[edge] != after[edge] { after[edge] } else { None });
+    changed.iter().any(Option::is_some).then_some(changed)
+}
+
 impl Layout<'_> {
     pub(super) fn resolve_anchored_style(&self, id: NodeId, style: Style, containing: Option<Rect>) -> Style {
         let (Some(entries), Some(containing)) = (style.anchored.clone(), containing) else {
@@ -72,7 +80,83 @@ impl Layout<'_> {
         }
         index.last_node = checked;
         index.scanned = geometry.hits.len();
-        index.by_name.get(name)?.iter().rev().find(|(node, _)| *node != target).and_then(|(_, at)| geometry.hits.get(*at)).map(|hit| [hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height])
+        let target_scope = self.anchor_scope_of(target, name);
+        let candidates = index.by_name.get(name)?;
+        let usable = |node: NodeId| node != target && self.anchor_scope_of(node, name) == target_scope && self.acceptable_anchor(node, target, geometry, 0);
+        let mut ancestor = self.document.composed_parent(target).ok().flatten();
+        let mut chosen = None;
+        for _ in 0..4096 {
+            let Some(node) = ancestor else { break };
+            if let Some((_, at)) = candidates.iter().rev().find(|(candidate, _)| *candidate == node) {
+                if usable(node) {
+                    chosen = Some(*at);
+                    break;
+                }
+            }
+            ancestor = self.document.composed_parent(node).ok().flatten();
+        }
+        let at = chosen.or_else(|| candidates.iter().rev().find(|(node, _)| usable(*node)).map(|(_, at)| *at))?;
+        geometry.hits.get(at).map(|hit| [hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height])
+    }
+
+    /// The implicit anchor of a popover: the element that invoked it.
+    fn implicit_popover_anchor_box(&self, target: NodeId) -> Option<[f32; 4]> {
+        let trigger = self.document.popover_trigger(target)?;
+        let geometry = self.geometry.as_deref()?;
+        let hit = geometry.hits.iter().rev().find(|hit| hit.node == trigger && hit.pseudo.is_none() && !hit.virtual_generated)?;
+        Some([hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height])
+    }
+
+    /// The element generating the containing block of `node`; `None` for the
+    /// initial containing block.
+    fn anchor_containing_block(&self, node: NodeId) -> Option<NodeId> {
+        let style = self.computed_style_from_tree_shared(node).ok()?;
+        let mut current = self.document.composed_parent(node).ok().flatten();
+        for _ in 0..4096 {
+            let candidate = current?;
+            let ancestor = self.computed_style_from_tree_shared(candidate).ok()?;
+            let establishes = match style.position {
+                Position::Absolute => establishes_absolute_containing_block(&ancestor),
+                Position::Fixed => establishes_fixed_containing_block(&ancestor),
+                _ => !matches!(ancestor.display, Display::Inline | Display::Contents),
+            };
+            if establishes {
+                return Some(candidate);
+            }
+            current = self.document.composed_parent(candidate).ok().flatten();
+        }
+        None
+    }
+
+    /// css-anchor-position-1 §2.3: the anchor is laid out strictly before
+    /// the target, directly or through the element generating its containing block.
+    fn acceptable_anchor(&self, anchor: NodeId, target: NodeId, geometry: &LayoutGeometry, depth: usize) -> bool {
+        let anchor_block = self.anchor_containing_block(anchor);
+        if anchor_block == self.anchor_containing_block(target) {
+            let positioned = self.computed_style_from_tree_shared(anchor).is_ok_and(|style| matches!(style.position, Position::Absolute | Position::Fixed));
+            return !positioned || geometry.hits.iter().any(|hit| hit.node == anchor && hit.pseudo.is_none());
+        }
+        match anchor_block {
+            Some(block) if depth < 64 => self.acceptable_anchor(block, target, geometry, depth + 1),
+            _ => false,
+        }
+    }
+
+    /// The nearest inclusive flat-tree ancestor whose `anchor-scope` covers
+    /// `name`; an anchor is only visible to targets sharing its scope.
+    fn anchor_scope_of(&self, node: NodeId, name: &str) -> Option<NodeId> {
+        let mut current = Some(node);
+        for _ in 0..4096 {
+            let candidate = current?;
+            if let Ok(style) = self.computed_style_from_tree_shared(candidate) {
+                let scope = css::extra_props::computed(&style, "anchor-scope").unwrap_or_default();
+                if scope == "all" || scope.split(',').any(|scoped| scoped.trim() == name) {
+                    return Some(candidate);
+                }
+            }
+            current = self.document.composed_parent(candidate).ok().flatten();
+        }
+        None
     }
 
     /// The containing block and style adjustments `position-area` implies for
@@ -100,8 +184,10 @@ impl Layout<'_> {
         let containing_sides = container_node
             .and_then(|node| self.computed_style_from_tree_shared(node).ok())
             .map_or([3, 1, 0, 2], |container| container.logical_sides());
-        let name = css::extra_props::computed(style, "position-anchor").filter(|name| name.starts_with("--"))?;
-        let anchor = self.anchor_box(id, &name)?;
+        let anchor = match css::extra_props::computed(style, "position-anchor").filter(|name| name.starts_with("--")) {
+            Some(name) => self.anchor_box(id, &name)?,
+            None => self.implicit_popover_anchor_box(id)?,
+        };
         let own_sides = style.logical_sides();
         let tracks = css::anchor::area_tracks(&value, &own_sides, &containing_sides)?;
         let origin = (containing.x - scroll.0, containing.y - scroll.1);

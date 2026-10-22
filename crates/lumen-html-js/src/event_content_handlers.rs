@@ -430,11 +430,7 @@ handler_bindings! {$; strict[
 (onpointercancel,set_onpointercancel,"onpointercancel","pointercancel"),
 (oncompositionstart,set_oncompositionstart,"oncompositionstart","compositionstart"),
 (oncompositionupdate,set_oncompositionupdate,"oncompositionupdate","compositionupdate"),
-(oncompositionend,set_oncompositionend,"oncompositionend","compositionend"),
-(ontouchstart,set_ontouchstart,"ontouchstart","touchstart"),
-(ontouchend,set_ontouchend,"ontouchend","touchend"),
-(ontouchmove,set_ontouchmove,"ontouchmove","touchmove"),
-(ontouchcancel,set_ontouchcancel,"ontouchcancel","touchcancel")
+(oncompositionend,set_oncompositionend,"oncompositionend","compositionend")
 ];lenient[
 (onmouseenter,set_onmouseenter,"onmouseenter","mouseenter"),
 (onmouseleave,set_onmouseleave,"onmouseleave","mouseleave")

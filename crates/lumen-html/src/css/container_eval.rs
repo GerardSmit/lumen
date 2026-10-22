@@ -256,7 +256,7 @@ fn compare(left: f64, operator: &str, right: f64, lengths: bool) -> Option<bool>
     })
 }
 
-fn length_value(raw: &str, context: LengthContext) -> Option<f64> {
+fn length_value(raw: &str, context: LengthContext, units: ContainerUnitContext) -> Option<f64> {
     let expression = typed_numeric::parse_numeric_expression(raw)?;
     let pixels = typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Px);
     let zero = typed_numeric::parse_numeric_value(raw).is_some_and(|value| value.unit == typed_numeric::NumericUnit::Number && value.value == 0.0);
@@ -265,7 +265,7 @@ fn length_value(raw: &str, context: LengthContext) -> Option<f64> {
     }
     let value = expression.evaluate(&mut FontAngleContext {
         length: Some(context),
-        query: ContainerUnitContext::no_container(context.viewport),
+        query: units,
         percent_scale: 0.01,
     })?;
     value.is_finite().then_some(value)
@@ -288,7 +288,7 @@ fn expected(feature: Feature, raw: &str, entry: &Entry) -> Option<f64> {
     match feature {
         Feature::Aspect => ratio_value(raw),
         Feature::Orientation => None,
-        _ => length_value(raw, entry.length),
+        _ => length_value(raw, entry.length, entry.units),
     }
 }
 
@@ -594,6 +594,7 @@ pub struct Entry {
     width: Option<f32>,
     height: Option<f32>,
     length: LengthContext,
+    units: ContainerUnitContext,
     custom: CustomRef,
 }
 
@@ -645,7 +646,7 @@ pub fn build_oracle(
             _ => Vec::new(),
         };
         let kind = style.container_type;
-        let context = if kind == ContainerType::Normal { None } else { measured(node) };
+        let context = if kind == ContainerType::Normal || !style.can_hold_size_containment() { None } else { measured(node) };
         if kind == ContainerType::Normal && names.is_empty() {
             continue;
         }
@@ -667,10 +668,50 @@ pub fn build_oracle(
             width,
             height,
             length: style_length_context(text, &style, environment, None),
+            units: outer_units(document, node, measured, &style, environment),
             custom: CustomRef(style.custom.clone()),
         });
     }
     Oracle(entries)
+}
+
+impl Style {
+    /// Inline boxes and internal table boxes cannot apply size containment, so
+    /// their size queries stay unknown even though `container-type` computes.
+    pub(crate) fn can_hold_size_containment(&self) -> bool {
+        !matches!(
+            self.display,
+            Display::None
+                | Display::Contents
+                | Display::Inline
+                | Display::Table
+                | Display::InlineTable
+                | Display::TableCell
+                | Display::TableCaption
+        )
+    }
+}
+
+/// Container-relative units in a query prelude resolve against the container
+/// surrounding the queried one, not the queried container itself.
+fn outer_units(
+    document: &Document,
+    node: NodeId,
+    measured: &dyn Fn(NodeId) -> Option<ContainerUnitContext>,
+    style: &Style,
+    environment: MediaEnvironment,
+) -> ContainerUnitContext {
+    let mut current = document.composed_parent(node).ok().flatten();
+    for _ in 0..MAX_ANCESTORS {
+        let Some(ancestor) = current else {
+            break;
+        };
+        if let Some(context) = measured(ancestor) {
+            return context.for_writing_mode(style.writing_mode);
+        }
+        current = document.composed_parent(ancestor).ok().flatten();
+    }
+    ContainerUnitContext::no_container(environment).for_writing_mode(style.writing_mode)
 }
 
 /// Per-index state: the parsed `@container` preludes and the latest oracle.
@@ -829,6 +870,7 @@ mod tests {
             width: Some(width),
             height: Some(height),
             length: static_length_context(),
+            units: ContainerUnitContext::no_container(static_length_context().viewport),
             custom: CustomRef(None),
         }
     }

@@ -49,7 +49,7 @@ pub fn interpolate_components(from: &str, to: &str, progress: f64, repeatable: b
 /// Component-wise addition of whitespace separated components and comma
 /// separated lists of them; lists repeat to their least common multiple.
 /// `delta` repeats an added iteration value `count` times.
-/// transform-origin takes an optional z length; the shorter operand gets `0px`.
+/// transform-origin operands are resolved to their computed form with an explicit z length.
 pub fn pad_origin(property: &str, a: &str, b: &str) -> Option<(String, String)> {
     if property.starts_with("border-") && property.ends_with("-radius") {
         let (parts_a, parts_b) = (split_components(a), split_components(b));
@@ -62,12 +62,16 @@ pub fn pad_origin(property: &str, a: &str, b: &str) -> Option<(String, String)> 
     if property != "transform-origin" {
         return None;
     }
-    let (na, nb) = (a.split_whitespace().count(), b.split_whitespace().count());
-    if na == nb || !(2..=3).contains(&na) || !(2..=3).contains(&nb) {
-        return None;
+    let normalize = |v: &str| crate::css::transform_origin_endpoint(v).unwrap_or_else(|| v.trim().to_owned());
+    let (mut a_computed, mut b_computed) = (normalize(a), normalize(b));
+    let (na, nb) = (crate::css::components(&a_computed)?.len(), crate::css::components(&b_computed)?.len());
+    if na != nb {
+        if !(2..=3).contains(&na) || !(2..=3).contains(&nb) {
+            return None;
+        }
+        if na < nb { a_computed.push_str(" 0px") } else { b_computed.push_str(" 0px") }
     }
-    let pad = |v: &str, n: usize| if n == 2 { format!("{} 0px", v.trim()) } else { v.to_owned() };
-    Some((pad(a, na), pad(b, nb)))
+    (a_computed != a.trim() || b_computed != b.trim()).then_some((a_computed, b_computed))
 }
 
 /// `text-indent` adds its length; the `hanging`/`each-line` keywords must agree.

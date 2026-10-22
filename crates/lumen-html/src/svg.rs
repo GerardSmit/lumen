@@ -239,26 +239,70 @@ pub fn root_size_with_view(
     available_height: Option<f32>,
     view: Option<ViewSpec>,
 ) -> (f32, f32) {
+    root_size_in_flow(attributes, css_width, css_height, css_width.is_some(), css_height.is_some(), false, available_width, available_height, view)
+}
+
+/// CSS 2 §10.3.2/§10.6.2 sizing of an inline `svg` replaced element. A
+/// declared but unresolvable size (a percentage of an indefinite container)
+/// computes as `auto`, and then only the absolute `width`/`height` attributes
+/// act as intrinsic dimensions. `fill_available` lets a ratio-only box take
+/// the containing block width, as the inline replaced element rules suggest.
+pub fn root_size_in_flow(
+    attributes: &[(Name, String)],
+    css_width: Option<f32>,
+    css_height: Option<f32>,
+    width_declared: bool,
+    height_declared: bool,
+    fill_available: bool,
+    available_width: f32,
+    available_height: Option<f32>,
+    view: Option<ViewSpec>,
+) -> (f32, f32) {
     let view_box = view
         .and_then(|view| view.view_box)
         .or_else(|| attribute(attributes, "viewBox").and_then(parse_view_box));
-    let width = css_width.or_else(|| {
-        attribute(attributes, "width").and_then(|value| dimension(value, available_width))
-    });
-    let height = css_height.or_else(|| {
-        attribute(attributes, "height")
-            .and_then(|value| dimension(value, available_height.unwrap_or(150.0)))
-    });
-    let ratio = view_box
+    let finite = |value: Option<f32>| value.filter(|value| value.is_finite() && *value >= 0.0);
+    let width_attribute = attribute(attributes, "width");
+    let height_attribute = attribute(attributes, "height");
+    let width = finite(css_width.or_else(|| {
+        if width_declared { return None; }
+        width_attribute.and_then(|value| dimension(value, available_width))
+    }));
+    let height = finite(css_height.or_else(|| {
+        if height_declared { return None; }
+        height_attribute.and_then(|value| dimension(value, available_height.unwrap_or(150.0)))
+    }));
+    let absolute = |value: Option<&str>| value
+        .filter(|value| !value.trim().ends_with('%'))
+        .and_then(|value| dimension(value, 0.0))
+        .filter(|value| *value > 0.0);
+    let intrinsic_width = absolute(width_attribute);
+    let intrinsic_height = absolute(height_attribute);
+    let view_ratio = view_box
         .map(|view_box| view_box.width / view_box.height)
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let width = width.filter(|width| width.is_finite() && *width >= 0.0);
-    let height = height.filter(|height| height.is_finite() && *height >= 0.0);
+    let ratio = match (intrinsic_width, intrinsic_height) {
+        (Some(width), Some(height)) => Some(width / height),
+        _ => view_ratio,
+    };
+    let (intrinsic_width, intrinsic_height) = match (intrinsic_width, intrinsic_height, ratio) {
+        (None, Some(height), Some(ratio)) => (Some(height * ratio), Some(height)),
+        (Some(width), None, Some(ratio)) => (Some(width), Some(width / ratio)),
+        pair => (pair.0, pair.1),
+    };
     let (width, height) = match (width, height) {
         (Some(width), Some(height)) => (width, height),
-        (Some(width), None) => (width, ratio.map_or(150.0, |ratio| width / ratio)),
-        (None, Some(height)) => (ratio.map_or(300.0, |ratio| height * ratio), height),
-        (None, None) => (300.0, 150.0),
+        (Some(width), None) => (width, ratio.map(|ratio| width / ratio).or(intrinsic_height).unwrap_or(150.0)),
+        (None, Some(height)) => (ratio.map(|ratio| height * ratio).or(intrinsic_width).unwrap_or(300.0), height),
+        (None, None) => {
+            let width = intrinsic_width
+                .or_else(|| (fill_available && ratio.is_some()).then_some(available_width))
+                .unwrap_or(300.0);
+            let height = intrinsic_height
+                .or_else(|| if fill_available { ratio.map(|ratio| width / ratio) } else { None })
+                .unwrap_or(150.0);
+            (width, height)
+        }
     };
     (width.max(0.0), height.max(0.0))
 }

@@ -21,9 +21,19 @@ fn parse(value: &str) -> Option<Axes> {
     Some(axes)
 }
 
+/// Sampled progress values carry single-precision noise; six significant digits
+/// are what a computed axis value can represent.
+fn significant(number: f64) -> f64 {
+    if number == 0.0 || !number.is_finite() {
+        return number;
+    }
+    let scale = libm::pow(10.0, 5.0 - libm::floor(libm::log10(number.abs())));
+    libm::round(number * scale) / scale
+}
+
 fn serialize(axes: &[(String, f64)]) -> String {
     axes.iter()
-        .map(|(tag, number)| alloc::format!("\"{tag}\" {}", super::computed_values::number((*number) as f32)))
+        .map(|(tag, number)| alloc::format!("\"{tag}\" {}", super::computed_values::number(significant(*number) as f32)))
         .collect::<Vec<_>>()
         .join(", ")
 }

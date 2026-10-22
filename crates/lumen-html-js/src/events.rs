@@ -169,12 +169,16 @@ impl TargetHooks for HtmlTarget {
             closed: Self::closed_roots(realm.session.borrow().document(), node)?,
             related: related.clone(),
         }];
+        // A user-agent command event is composed so its source retargets across shadow
+        // boundaries, but its path never leaves the shadow tree of its target.
+        let path_composed = event.composed_flag()
+            && !(event.trusted_dispatch() && event.kind().as_str() == "command");
         loop {
             let parent = realm
                 .session
                 .borrow()
                 .document()
-                .event_parent(node, event.composed_flag(), origin_root)
+                .event_parent(node, path_composed, origin_root)
                 .map_err(|_| OpError::new("InvalidStateError", "event target was removed"))?;
             let Some(parent) = parent else {
                 break;
@@ -232,6 +236,17 @@ impl TargetHooks for HtmlTarget {
                     closed: Vec::new(),
                     related: related_adjusted,
                 });
+            }
+        }
+        if event.trusted_dispatch() && matches!(event.kind().as_str(), "mousedown" | "mouseup" | "click") {
+            let session = realm.session.borrow();
+            let blocked = entries.iter().position(|entry| {
+                Self::of(&entry.target)
+                    .and_then(|target| target.node.get())
+                    .is_some_and(|node| super::forms::is_disabled_form_control(session.document(), node))
+            });
+            if let Some(index) = blocked.filter(|index| *index > 0) {
+                entries.truncate(index);
             }
         }
         if entries.iter().map(|entry| entry.closed.len()).sum::<usize>() > 4096 {

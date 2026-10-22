@@ -230,6 +230,7 @@ fn longhands_uncached(name: &str) -> &'static [&'static str] {
         "place-self" => &["align-self", "justify-self"],
         "place-content" => &["align-content", "justify-content"],
         "gap" => &["row-gap", "column-gap"],
+        "size" => &["width", "height"],
         "position-try" => &["position-try-order", "position-try-fallbacks"],
         "offset" => &["offset-position", "offset-path", "offset-distance", "offset-rotate", "offset-anchor"],
         "flex-flow" => &["flex-direction", "flex-wrap"],
@@ -428,6 +429,10 @@ fn longhands_uncached(name: &str) -> &'static [&'static str] {
             "font-variant-east-asian",
             "font-variant-position",
             "font-variant-emoji",
+            "font-kerning",
+            "font-optical-sizing",
+            "font-variation-settings",
+            "font-language-override",
         ],
         name if super::extra_props::is_shorthand(name) => super::extra_props::shorthand_longhands(name),
         name if super::corner_radii::is_shorthand(name) => super::corner_radii::longhands(name),
@@ -504,7 +509,7 @@ pub(super) fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declarati
                 .any(|part| matches!(part, component_values::UnparsedComponent::Variable { .. }))
         });
     let owner_dependent=anchor::applies(name,raw)||typed_numeric::substitute_sibling_functions(raw,1,1)
-        .is_some_and(|(_,dependent)|dependent);
+        .is_some_and(|(_,dependent)|dependent)||!name.starts_with("--")&&super::owner_values::may_use(raw);
     let mut parsed=Vec::new();
     append_declaration_pair_values(name,raw,0,has_variables||owner_dependent,&mut parsed)?;
     if parsed.is_empty() || !references_parse(raw, MAX_VARIABLE_BYTES) {
@@ -616,12 +621,31 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
         push_text_entries(&mut entries, values, important);
         return Ok(Some(entries));
     }
+    if name.as_ref() == "size"
+        && !raw.as_bytes().windows(4).any(|bytes| bytes.eq_ignore_ascii_case(b"var("))
+        && !["initial", "inherit", "unset", "revert", "revert-layer"].iter().any(|keyword| raw.eq_ignore_ascii_case(keyword))
+    {
+        let Some(parts) = components(raw).filter(|parts| (1..=2).contains(&parts.len())) else {
+            return Ok(None);
+        };
+        let mut entries = Vec::new();
+        for (longhand, token) in [("width", parts[0]), ("height", parts.get(1).copied().unwrap_or(parts[0]))] {
+            let Some(part) = expansion(Arc::from(longhand), token, important)? else {
+                return Ok(None);
+            };
+            for entry in part {
+                push_entry(&mut entries, entry)?;
+            }
+        }
+        return Ok(Some(entries));
+    }
     let Some(parsed) = parsed_value(&name, raw)? else {
         return Ok(None);
     };
     let targets = longhands(&name);
     if targets.is_empty() {
         let value = match name.as_ref() {
+            _ if !name.starts_with("--") && super::owner_values::may_use(raw) => super::owner_values::specified(&name, raw),
             "order" | "z-index" | "column-count" | "orphans" | "widows" | "column-span" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" | "x" | "y" | "cx" | "cy" | "r" | "rx" | "ry" => super::serialize_cssom_property_value(&name,raw),
             "contain-intrinsic-width"|"contain-intrinsic-height"|"contain-intrinsic-inline-size"|"contain-intrinsic-block-size" => super::intrinsic_override::specified(raw),
             "background-image" | "mask-image" => super::image_source::serialize(raw),
@@ -629,6 +653,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "mask-repeat" => super::background_repeats(raw).map(|repeats| join_css_components(repeats.iter().map(|repeat| serialize_background_repeat_pair(*repeat)))),
             "border-radius" => super::corner_radii::specified_border_radius(raw),
             "text-indent" => super::text_indent::specified(raw),
+            "white-space" => super::text_props::white_space_specified(raw),
             "mask-position" => super::background_positions::shorthand_lists(raw).and_then(|(x, y)| super::background_positions::join_axes(&x, &y)),
             "background-clip" => top_level_split(raw, b',', MAX_BACKGROUND_LAYERS).and_then(|layers| {
                 let layers: Option<Vec<String>> = layers.iter().map(|layer| {
@@ -693,7 +718,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "color-interpolation-filters"=>parsed.iter().find_map(|declaration|
                 if let Value::SvgFilterColorSpace(value)=declaration.value {Some(value.css_keyword().into())}else{None}),
             "aspect-ratio" if !raw.trim().to_ascii_lowercase().starts_with("var(")=>super::sizing_values::aspect_ratio_specified(raw),
-            "outline-width" | "outline-offset" if raw.trim() == "0" => Some("0px".into()),
+            "outline-width" | "outline-offset" | "row-gap" | "column-gap" if raw.trim() == "0" => Some("0px".into()),
             _ if super::calc_size::unitless_zero(&name,raw).is_some()=>super::calc_size::unitless_zero(&name,raw),
             _ if super::calc_size::applies(&name,raw)=>super::calc_size::specified(&name,raw),
             _ if super::animation_color_property(&name)=>super::serialize_cssom_property_value(&name,raw),
@@ -909,11 +934,7 @@ fn css_color(value: Rgba, raw: &str) -> String {
 }
 
 fn length_percentage(value: LengthPercentage) -> String {
-    match (value.pixels, value.fraction) {
-        (pixels, 0.0) => alloc::format!("{pixels}px"),
-        (0.0, fraction) => alloc::format!("{}%", fraction * 100.0),
-        (pixels, fraction) => alloc::format!("calc({pixels}px + {}%)", fraction * 100.0),
-    }
+    computed_values::lp(value)
 }
 
 fn specified_border_width(value: f32, raw: &str, origin: &str, target: &str) -> String {
@@ -978,6 +999,18 @@ fn canonical_alias_uncached(name: &str) -> &str {
         "-webkit-mask-repeat" => "mask-repeat",
         "-webkit-mask-origin" => "mask-origin",
         "-webkit-mask-clip" => "mask-clip",
+        "-webkit-align-content" => "align-content",
+        "-webkit-align-items" => "align-items",
+        "-webkit-align-self" => "align-self",
+        "-webkit-flex" => "flex",
+        "-webkit-flex-basis" => "flex-basis",
+        "-webkit-flex-direction" => "flex-direction",
+        "-webkit-flex-flow" => "flex-flow",
+        "-webkit-flex-grow" => "flex-grow",
+        "-webkit-flex-shrink" => "flex-shrink",
+        "-webkit-flex-wrap" => "flex-wrap",
+        "-webkit-justify-content" => "justify-content",
+        "-webkit-order" => "order",
         _ => super::corner_radii::alias(name).unwrap_or(name),
     }
 }
@@ -1413,7 +1446,7 @@ impl DeclarationBlock {
                 });
         }
         let first=self.views().find(|entry|entry.name==targets[0])?;
-        let mut entries = [first; 17];
+        let mut entries = [first; 24];
         for (index, target) in targets.iter().enumerate() {
             entries[index]=self.views().find(|entry|entry.name==*target)?;
         }
@@ -1428,7 +1461,7 @@ impl DeclarationBlock {
             }
             return Some(if group.property == name { (group.value.to_string(), important) } else { (String::new(), important) });
         }
-        let mut values = [""; 17];
+        let mut values = [""; 24];
         for (index, entry) in entries.iter().enumerate() {
             values[index] = match &entry.value {
                 Specified::Text(text) => text.as_ref(),
@@ -1526,7 +1559,7 @@ impl DeclarationBlock {
                 let Some((value, important)) = (if shorthand=="all" {all_value.clone()}else{self.value(shorthand)}) else {
                     continue;
                 };
-                let mut local_indices=[0;17];let mut expanded_indices=Vec::new();
+                let mut local_indices=[0;24];let mut expanded_indices=Vec::new();
                 let indices:&mut[usize]=if targets.len()<=local_indices.len(){&mut local_indices[..targets.len()]}else{
                     expanded_indices.try_reserve_exact(targets.len()).map_err(|_|limit())?;expanded_indices.resize(targets.len(),0);&mut expanded_indices
                 };
@@ -1721,7 +1754,7 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         return Some(super::break_control::serialize(name,super::break_control::parse(target,value)?)?.into());
     }
     if name=="columns" {return match values{[width,count,height,"auto"]=>Some(super::columns::shorthand_with_height(width,count,height)),_=>None};}
-    if name=="contain-intrinsic-size" {return match values{[a,b]=>Some(if a==b{(*a).into()}else{alloc::format!("{a} {b}")}),_=>None};}
+    if matches!(name,"contain-intrinsic-size"|"size") {return match values{[a,b]=>Some(if a==b{(*a).into()}else{alloc::format!("{a} {b}")}),_=>None};}
     if name=="animation" {return animation_controls::shorthand(values);}
     if name=="animation-range" {return animation_controls::range_shorthand(values);}
     if name=="animation-delay" {return animation_controls::delay_shorthand(values);}
@@ -1822,7 +1855,7 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         return super::font_variant::serialize(FontVariantCaps::parse(values[1])?, font_ligatures(values[0])?, font_feature_values::parse_alternates(values[2])?.as_deref(), [values[3], values[4], values[5], values[6]]);
     }
     if name == "font" {
-        if values[10] != "normal" || values[9] != "normal" || values[8] != "normal" || values[11..15].iter().any(|value| *value != "normal") || values[7] != "none" || values[1] != "normal" && values[1] != "small-caps" {
+        if values[10] != "normal" || values[9] != "normal" || values[8] != "normal" || values[11..15].iter().any(|value| *value != "normal") || values[15] != "auto" || values[16] != "auto" || values[17] != "normal" || values[18] != "normal" || values[7] != "none" || values[1] != "normal" && values[1] != "small-caps" {
             return None;
         }
         let mut parts = Vec::new();
@@ -1847,6 +1880,15 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         result.push(' ');
         result.push_str(values[6]);
         return Some(result);
+    }
+    if name == "flex-flow" && values.len() == 2 {
+        let direction = (values[0] != "row").then_some(values[0]);
+        let wrap = (values[1] != "nowrap").then_some(values[1]);
+        return Some(match (direction, wrap) {
+            (None, None) => "row".to_owned(),
+            (Some(value), None) | (None, Some(value)) => value.to_owned(),
+            (Some(direction), Some(wrap)) => alloc::format!("{direction} {wrap}"),
+        });
     }
     if values.len() == 2 && !matches!(name, "flex-flow") && values[0] == values[1] {
         return Some(values[0].to_owned());
@@ -2282,7 +2324,7 @@ mod tests {
         );
         assert_eq!(
             block.value("grid-template-columns").unwrap().0,
-            "repeat(2,1fr)"
+            "repeat(2, 1fr)"
         );
         assert_eq!(
             block.value("grid-template-areas").unwrap().0,

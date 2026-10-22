@@ -85,6 +85,10 @@ pub fn site(url: &Url) -> Option<String> {
     }
     Some(format!("{}://{}", url.scheme, registrable_host(host)))
 }
+/// Whether two scheme/host pairs share a scheme and registrable domain.
+pub fn same_site_host(scheme_a: &str, host_a: &str, scheme_b: &str, host_b: &str) -> bool {
+    scheme_a == scheme_b && registrable_host(host_a) == registrable_host(host_b)
+}
 fn registrable_host(host: &str) -> &str {
     if host.parse::<core::net::IpAddr>().is_ok() || host.starts_with('[') {
         host

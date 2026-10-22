@@ -7,6 +7,9 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Basis {
+    /// `calc-size(any, ...)`: no intrinsic basis; the value is a plain length
+    /// that keeps its calc-size identity for interpolation.
+    Any,
     Auto,
     MinContent,
     MaxContent,
@@ -21,6 +24,7 @@ pub enum Basis {
 impl Basis {
     pub fn keyword(self) -> &'static str {
         match self {
+            Self::Any => "any",
             Self::Auto => "auto",
             Self::MinContent => "min-content",
             Self::MaxContent => "max-content",
@@ -44,6 +48,10 @@ pub struct CalcSizeValue {
     pub px: f32,
     pub frac: f32,
     pub k: f32,
+    /// Whether the source calculation wrote a `size` term (even with a zero
+    /// coefficient) or a length term, so serialization keeps its shape.
+    pub size_term: bool,
+    pub px_term: bool,
 }
 
 impl CalcSizeValue {
@@ -53,7 +61,7 @@ impl CalcSizeValue {
         if self.basis == Basis::FitContentArgument {
             return Some(size);
         }
-        let percent = if self.frac == 0.0 { 0.0 } else { self.frac * containing? };
+        let percent = self.frac * containing.unwrap_or(0.0);
         Some((self.px + percent + self.k * size).max(0.0))
     }
     /// The `fit-content()` argument against its percentage basis. An
@@ -74,11 +82,13 @@ impl CalcSizeValue {
             return format!("fit-content({})", lin.text(true));
         }
         let mut lin = Lin::length();
-        lin.units.push((String::from("px"), f64::from(self.px)));
+        if self.px_term || (self.frac == 0.0 && !self.size_term) {
+            lin.units.push((String::from("px"), f64::from(self.px)));
+        }
         if self.frac != 0.0 {
             lin.pct = Some(f64::from(self.frac) * 100.0);
         }
-        lin.size = true;
+        lin.size = self.size_term;
         lin.k = f64::from(self.k);
         format!("calc-size({}, {})", self.basis.keyword(), lin.text(false))
     }
@@ -564,6 +574,7 @@ fn spec_text(spec: &Spec) -> String {
 fn flat_text(flat: &Flat) -> String {
     match flat.basis {
         Some(basis) => format!("calc-size({}, {})", basis.keyword(), flat.lin.text(false)),
+        None if flat.lin.pct.is_none() && !flat.lin.size => format!("calc-size(any, {})", flat.lin.text(false)),
         None => flat.lin.text(true),
     }
 }
@@ -612,9 +623,17 @@ pub(super) fn parse_declaration(name: &str, raw: &str) -> Option<Option<Value>> 
     Some(declaration_value(kind, slot, raw))
 }
 
+fn any_length(slot: usize, lin: &Lin) -> bool {
+    matches!(slot, 3 | 4 | 23 | 24 | 51 | 52) && lin.pct.is_none() && !lin.size
+}
+
 fn declaration_value(kind: Kind, slot: usize, raw: &str) -> Option<Value> {
     let flat = flatten(&parse_spec(raw, kind)?);
     match flat.basis {
+        None if any_length(slot, &flat.lin) => {
+            let text = format!("calc-size(any, {})", flat.lin.text(false));
+            Some(Value::CalcSize(slot, text.into()))
+        }
         None => parse_context_length(slot, &flat.lin.calc_text(), true),
         Some(basis) => {
             let text = format!("calc-size({}, {})", basis.keyword(), flat.lin.text(false));
@@ -663,7 +682,12 @@ pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: Co
         (Basis::FitContentArgument, lin)
     } else {
         let flat = flatten(&parse_spec(text, kind_of_slot(slot)?)?);
-        (flat.basis?, flat.lin)
+        let basis = match flat.basis {
+            Some(basis) => basis,
+            None if any_length(slot, &flat.lin) => Basis::Any,
+            None => return None,
+        };
+        (basis, flat.lin)
     };
     let mut px = 0.0f32;
     for (unit, value) in &lin.units {
@@ -674,6 +698,8 @@ pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: Co
         px,
         frac: (lin.pct.unwrap_or(0.0) / 100.0) as f32,
         k: lin.k as f32,
+        size_term: lin.size && basis != Basis::FitContentArgument,
+        px_term: !lin.units.is_empty(),
     };
     let sizing = IntrinsicSizing::CalcSize(value);
     Some(if slot == 20 { Value::FlexBasisIntrinsic(sizing) } else { Value::IntrinsicSize(slot, sizing) })
@@ -706,7 +732,7 @@ fn side(text: &str, allow_keywords: bool) -> Option<Side> {
 /// Weighted sum of sizing values where at least one operand is a
 /// `calc-size()` (or, with `allow_keywords`, an intrinsic keyword). Operands
 /// with different keyword bases do not combine.
-pub(crate) fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
+pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
     let has_function = |text: &str| {
         text.len() <= MAX_INPUT
             && text.as_bytes().windows("calc-size(".len()).any(|window| window.eq_ignore_ascii_case(b"calc-size("))
@@ -801,6 +827,18 @@ mod tests {
         assert!(serialize("max-width", "calc-size(auto, size)").is_none());
         assert!(serialize("width", "calc-size(0, 0px)").is_none());
         assert!(serialize("width", "calc-size(content, size)").is_none());
+    }
+
+    #[test]
+    fn any_basis_keeps_calc_size_identity() {
+        let value = resolve(3, "calc-size(any, 50px)", static_length_context(), ContainerUnitContext::default());
+        let Some(Value::IntrinsicSize(3, IntrinsicSizing::CalcSize(calc))) = value else { panic!("expected an any-basis value") };
+        assert_eq!(calc.basis, Basis::Any);
+        assert_eq!(calc.serialize(), "calc-size(any, 50px)");
+        assert_eq!(
+            interpolate("calc-size(any, 20px)", "calc-size(any, 60px)", 0.5, false).as_deref(),
+            Some("calc-size(any, 40px)")
+        );
     }
 
     #[test]

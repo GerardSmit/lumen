@@ -204,8 +204,7 @@ fn mix_component(a: &Comp, b: &Comp, progress: f64) -> Option<Comp> {
     match (a, b) {
         (Comp::Lp(a), Comp::Lp(b)) => Some(Comp::Lp(clamp_length(mix_lp(a, b, progress)?))),
         (Comp::Fr(a), Comp::Fr(b)) => Some(Comp::Fr(mix(*a, *b, progress).max(0.0))),
-        (Comp::Kw(_) | Comp::Fr(_), Comp::Kw(_) | Comp::Fr(_)) => Some(flip(a, b, progress)),
-        _ => None,
+        _ => Some(flip(a, b, progress)),
     }
 }
 
@@ -213,11 +212,16 @@ fn mix_track(a: &Track, b: &Track, progress: f64) -> Option<Track> {
     match (a, b) {
         (Track::Fit(a), Track::Fit(b)) => return Some(Track::Fit(clamp_length(mix_lp(a, b, progress)?))),
         (Track::Fit(_), Track::Kw(_)) | (Track::Kw(_), Track::Fit(_)) => return Some(flip(a, b, progress)),
-        (Track::Fit(_), _) | (_, Track::Fit(_)) => return None,
+        (Track::Fit(_), _) | (_, Track::Fit(_)) => return Some(flip(a, b, progress)),
         _ => {}
     }
     let (min_a, max_a) = view(a)?;
     let (min_b, max_b) = view(b)?;
+    let one_minmax = matches!(a, Track::Minmax(..)) != matches!(b, Track::Minmax(..));
+    let same_kind = |x: &Comp, y: &Comp| core::mem::discriminant(x) == core::mem::discriminant(y);
+    if one_minmax && !(same_kind(&min_a, &min_b) && same_kind(&max_a, &max_b)) {
+        return Some(flip(a, b, progress));
+    }
     let min = mix_component(&min_a, &min_b, progress)?;
     let max = mix_component(&max_a, &max_b, progress)?;
     Some(match (a, b) {
@@ -354,7 +358,8 @@ mod tests {
     fn interpolates_matching_lists_and_flips_incompatible_tracks() {
         assert_eq!(interpolate("grid-template-columns", "1fr 1fr 1fr", "2fr auto 2fr", 0.4).as_deref(), Some("1.4fr 1fr 1.4fr"));
         assert_eq!(interpolate("grid-template-columns", "1fr 1fr 1fr", "2fr auto 2fr", 0.6).as_deref(), Some("1.6fr auto 1.6fr"));
-        assert_eq!(interpolate("grid-template-columns", "10px 10px", "1fr 1fr", 0.5), None);
+        assert_eq!(interpolate("grid-template-columns", "10px 10px", "1fr 1fr", 0.4).as_deref(), Some("10px 10px"));
+        assert_eq!(interpolate("grid-template-columns", "10px 10px", "1fr 1fr", 0.6).as_deref(), Some("1fr 1fr"));
         assert_eq!(interpolate("grid-template-columns", "10px 20px", "20px", 0.5), None);
         assert_eq!(
             interpolate("grid-template-columns", "1fr [a b] 1fr [d] 1fr", "2fr [c] auto 2fr", 0.6).as_deref(),

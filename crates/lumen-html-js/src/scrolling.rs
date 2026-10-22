@@ -1,7 +1,7 @@
 //! Shared CSSOM scroll option conversion and DOM scrolling operations.
 use super::*;
 use crate::realm_services::RealmServices;
-use lumen::embed::{JsHost, Promise, Slot};
+use lumen::embed::{Deferred, JsHost, Promise, Slot};
 use lumen_bind::{FromArg, Host};
 use std::collections::HashMap;
 
@@ -483,6 +483,21 @@ struct SmoothScroll {
     end_ms: f64,
     generation: u64,
     moved: bool,
+    waiter: Rc<RefCell<Option<Deferred>>>,
+}
+
+pub(crate) fn scroll_result(ctx: &mut Ctx, interrupted: bool) -> Value {
+    let result = Value::Obj(ctx.new_object());
+    let _ = ctx.create_data_property(&result, "interrupted", Value::Bool(interrupted));
+    result
+}
+
+fn settle_waiter(ctx: &mut Ctx, waiter: &RefCell<Option<Deferred>>, interrupted: bool) {
+    let deferred = waiter.borrow_mut().take();
+    if let Some(deferred) = deferred {
+        let result = scroll_result(ctx, interrupted);
+        deferred.resolve(ctx, result);
+    }
 }
 
 #[derive(Default)]
@@ -516,11 +531,15 @@ pub(crate) fn rebind_scroll_document(ctx: &mut Ctx) {
 }
 
 fn abort_smooth_scroll(ctx: &mut Ctx, node: NodeId) -> Option<SmoothScroll> {
-    RealmServices::<RefCell<SmoothScrolls>>::current(ctx)
+    let record = RealmServices::<RefCell<SmoothScrolls>>::current(ctx)
         .and_then(|state| {
             let record = state.borrow_mut().active.remove(&node);
             record
-        })
+        });
+    if let Some(record) = &record {
+        settle_waiter(ctx, &record.waiter, true);
+    }
+    record
 }
 
 fn release_idle_smooth_scroll_buffers(ctx: &mut Ctx) {
@@ -534,7 +553,7 @@ fn release_idle_smooth_scroll_buffers(ctx: &mut Ctx) {
     }
 }
 
-fn start_smooth_scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, from: (f32, f32), to: (f32, f32), moved: bool, inherited_end: Option<f64>) -> OpResult<()> {
+fn start_smooth_scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, from: (f32, f32), to: (f32, f32), moved: bool, inherited_end: Option<f64>, waiter: Rc<RefCell<Option<Deferred>>>) -> OpResult<()> {
     let state = match RealmServices::<RefCell<SmoothScrolls>>::current(ctx) {
         Some(state) => state,
         None => {
@@ -543,6 +562,7 @@ fn start_smooth_scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, from: 
             state
         }
     };
+    let waiter = Rc::new(RefCell::new(waiter.borrow_mut().take()));
     let mut state = state.borrow_mut();
     state.active.try_reserve(1).map_err(|_| OpError::new("QuotaExceededError", "smooth scroll allocation failed"))?;
     state.generation = state.generation.checked_add(1)
@@ -555,7 +575,7 @@ fn start_smooth_scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, from: 
     // duration. Preserve the active buffers across replacement as well.
     let end_ms = inherited_end.unwrap_or(start_ms + SMOOTH_SCROLL_DURATION_MS).max(start_ms);
     state.active.insert(node, SmoothScroll { owner: Rc::downgrade(realm), from, to,
-        start_ms, end_ms, generation, moved });
+        start_ms, end_ms, generation, moved, waiter });
     Ok(())
 }
 
@@ -616,11 +636,19 @@ pub(crate) fn advance_smooth_scrolls(ctx: &mut Ctx, timestamp_ms: f64) -> OpResu
                 let (moved, complete) = {
                     let mut state = state.borrow_mut();
                     let Some(record) = state.active.get_mut(&update.node) else { continue; };
-                    if !update.has_scroll_box() { state.active.remove(&update.node); continue; }
+                    if !update.has_scroll_box() {
+                        let removed = state.active.remove(&update.node);
+                        drop(state);
+                        if let Some(removed) = removed { settle_waiter(ctx, &removed.waiter, true); }
+                        continue;
+                    }
                     let finished = timestamp_ms >= record.end_ms;
                     let complete = finished && (update.changed || record.moved);
                     record.moved |= update.changed;
+                    let finished_waiter = if finished { Some(record.waiter.clone()) } else { None };
                     if finished { state.active.remove(&update.node); }
+                    drop(state);
+                    if let Some(waiter) = finished_waiter { settle_waiter(ctx, &waiter, false); }
                     (update.changed, complete)
                 };
                 if moved || complete { queue_scroll_notification(ctx, &owner, update.node, moved, complete)?; }
@@ -664,8 +692,20 @@ pub(crate) fn set_offset(
     x: f64,
     y: f64,
     behavior: ScrollBehavior,
-) -> Promise<()> {
-    Promise::ready(apply_offset(ctx, realm, node, x, y, behavior))
+) -> Promise<Value> {
+    let deferred = Deferred::new(ctx);
+    let promise = Promise::pending(&deferred);
+    let waiter = Rc::new(RefCell::new(Some(deferred)));
+    match apply_offset_waiting(ctx, realm, node, x, y, behavior, waiter.clone()) {
+        Ok(()) => settle_waiter(ctx, &waiter, false),
+        Err(error) => {
+            let deferred = waiter.borrow_mut().take();
+            if let Some(deferred) = deferred {
+                deferred.reject(ctx, error);
+            }
+        }
+    }
+    promise
 }
 
 fn resolved_scroll_behavior(requested: ScrollBehavior, computed: lumen_html::css::ScrollBehavior) -> ScrollBehavior {
@@ -683,6 +723,20 @@ pub(crate) fn apply_offset(
     x: f64,
     y: f64,
     behavior: ScrollBehavior,
+) -> OpResult<()> {
+    apply_offset_waiting(ctx, realm, node, x, y, behavior, Rc::default())
+}
+
+/// A smooth scroll takes the deferred out of `waiter` and settles it when the
+/// motion finishes or is replaced; every other outcome leaves it for the caller.
+fn apply_offset_waiting(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    x: f64,
+    y: f64,
+    behavior: ScrollBehavior,
+    waiter: Rc<RefCell<Option<Deferred>>>,
 ) -> OpResult<()> {
     if realm.has_browsing_context && !realm.browsing_context().is_some_and(|context| browsing_context::is_active_document(&context, realm)) {
         return Ok(());
@@ -729,7 +783,7 @@ pub(crate) fn apply_offset(
         }
         if behavior == ScrollBehavior::Smooth {
             let inherited_end = stopped.filter(|record| record.to == to).map(|record| record.end_ms);
-            let result = start_smooth_scroll(ctx, realm, node, from, to, stopped_motion, inherited_end);
+            let result = start_smooth_scroll(ctx, realm, node, from, to, stopped_motion, inherited_end, waiter.clone());
             if result.is_err() { release_idle_smooth_scroll_buffers(ctx); }
             return result;
         }
@@ -892,8 +946,20 @@ pub(crate) fn into_view(
     realm: &Rc<DomRealm>,
     target: NodeId,
     options: IntoViewOptions,
-) -> Promise<()> {
-    Promise::ready(into_view_inner(ctx, realm, target, options))
+) -> Promise<Value> {
+    let deferred = Deferred::new(ctx);
+    let promise = Promise::pending(&deferred);
+    let waiter = Rc::new(RefCell::new(Some(deferred)));
+    match into_view_waiting(ctx, realm, target, options, waiter.clone()) {
+        Ok(()) => settle_waiter(ctx, &waiter, false),
+        Err(error) => {
+            let deferred = waiter.borrow_mut().take();
+            if let Some(deferred) = deferred {
+                deferred.reject(ctx, error);
+            }
+        }
+    }
+    promise
 }
 
 /// Rebuild the original target's geometry for each scroll step. In particular,
@@ -956,6 +1022,16 @@ pub(crate) fn into_view_inner(
     realm: &Rc<DomRealm>,
     target: NodeId,
     options: IntoViewOptions,
+) -> OpResult<()> {
+    into_view_waiting(ctx, realm, target, options, Rc::default())
+}
+
+fn into_view_waiting(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    target: NodeId,
+    options: IntoViewOptions,
+    waiter: Rc<RefCell<Option<Deferred>>>,
 ) -> OpResult<()> {
     if realm.has_browsing_context && !realm.browsing_context().is_some_and(|context| browsing_context::is_active_document(&context, realm)) {
         return Ok(());
@@ -1055,13 +1131,14 @@ pub(crate) fn into_view_inner(
                     y_align,
                     y_reverse,
                 );
-                apply_offset(
+                apply_offset_waiting(
                     ctx,
                     &current,
                     node,
                     f64::from(x) + dx,
                     f64::from(y) + dy,
                     behavior,
+                    waiter.clone(),
                 )?;
                 if behavior == ScrollBehavior::Smooth {
                     let destination = |ctx: &mut Ctx| RealmServices::<RefCell<SmoothScrolls>>::current(ctx)

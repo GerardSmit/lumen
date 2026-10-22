@@ -46,7 +46,8 @@ pub(super) fn easing(raw: &str) -> Option<String> {
     for part in parts {
         let value = typed_numeric::parse_numeric_value(part.trim())?;
         if value.unit != typed_numeric::NumericUnit::Number {return None;}
-        numbers.push(typed_numeric::serialize_numeric_value(value.value,value.unit));
+        if !value.value.is_finite() {return None;}
+        numbers.push(if value.value==0.0 {String::from("0")} else {alloc::format!("{}",value.value)});
     }
     Some(alloc::format!("cubic-bezier({})",numbers.join(", ")))
 }

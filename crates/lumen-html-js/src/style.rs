@@ -67,6 +67,7 @@ impl DomStyle {
                     .map_err(|error| OpError::new("InvalidStateError", format!("computed style failed: {error:?}")))?;
                 let margin = property.starts_with("margin");
                 let used_margins = (self.pseudo.is_none() && needs_layout && margin).then(|| session.layout_used_margins(self.node)).flatten();
+                let used_insets = (self.pseudo.is_none() && needs_layout && !margin).then(|| session.layout_used_insets(self.node)).flatten();
                 let (border_box, replaced_element) = if needs_layout && !margin {
                     match self.pseudo {
                         Some(pseudo) => (session.pseudo_layout_rect(self.node,pseudo), false),
@@ -87,6 +88,7 @@ impl DomStyle {
                         .map(|(rect,svg)|if svg {rect}else{style.css_transform_reference_box(rect)})}else{None},
                     percentage_basis: (needs_layout && used_margins.is_none()).then(|| match self.pseudo {Some(pseudo)=>session.pseudo_layout_percentage_basis(self.node,pseudo),None=>session.layout_percentage_basis(self.node)}).flatten(),
                     used_margins,
+                    used_insets,
                     used_line_height: if resolved && matches!(self.pseudo,None|Some(css::PseudoElement::Placeholder)) && matches!(property.as_ref(), "line-height" | "font") {
                         fonts.as_ref().and_then(|text| {
                             let origin = placeholder_line_origin.as_ref().unwrap_or(&style);
@@ -100,7 +102,13 @@ impl DomStyle {
                     ..Default::default()
                 };
                 let grid_tracks = if resolved && matches!(property.as_ref(), "grid-template-columns" | "grid-template-rows" | "grid-template" | "grid" | "grid-lanes") { session.layout_grid_tracks(self.node) } else { None };
+                let subgrid_ignored = resolved && self.pseudo.is_none()
+                    && matches!(property.as_ref(), "grid-template-columns" | "grid-template-rows")
+                    && style.display == css::Display::Grid
+                    && (style.grid_columns_subgrid || style.grid_rows_subgrid)
+                    && !session.parent_is_grid_container(self.node);
                 let timeline_source=if resolved&&property.as_ref()=="transform"{session.used_transform_timeline_source(self.node,self.pseudo,&style)}else{None};
+                let context = css::computed_values::ComputedValueContext { subgrid_ignored, ..context };
                 (style, context, grid_tracks,timeline_source)
             };
             context.transform_timeline_source=timeline_source.as_deref();
@@ -386,6 +394,27 @@ impl DomStyle {
         session.document_mut().read_inline_cssom_style(self.node).map_err(css_error)?
             .ok_or_else(|| OpError::new("TypeError", "style requires an element"))
     }
+    pub(crate) fn set_property(&self, name: &str, value: &str, priority: Option<&str>) -> OpResult<()> {
+        if self.computed {
+            return Err(OpError::new(
+                "NoModificationAllowedError",
+                "computed styles are read-only",
+            ));
+        }
+        // CSSOM ignores invalid values and unsupported properties atomically.
+        // An empty value removes the declaration even when priority is invalid.
+        let priority = priority.unwrap_or("");
+        if !value.is_empty() && !priority.is_empty() && !priority.eq_ignore_ascii_case("important")
+        {
+            return Ok(());
+        }
+        let mut block = self.declaration_block()?;
+        let Ok(changed) = block.set(name, value, !priority.is_empty()) else {
+            return Ok(());
+        };
+        if changed { self.write_block(block)?; }
+        Ok(())
+    }
     pub(crate) fn declaration_block(&self) -> OpResult<css::DeclarationBlock> {
         Ok(self.read_declaration_block()?.as_ref().clone())
     }
@@ -504,27 +533,9 @@ impl DomStyle {
         }
         .into())
     }
-    #[method(coerce, hint(js(ce_reactions)))]
-    fn set_property(&self, name: &str, value: &str, priority: Option<&str>) -> OpResult<()> {
-        if self.computed {
-            return Err(OpError::new(
-                "NoModificationAllowedError",
-                "computed styles are read-only",
-            ));
-        }
-        // CSSOM ignores invalid values and unsupported properties atomically.
-        // An empty value removes the declaration even when priority is invalid.
-        let priority = priority.unwrap_or("");
-        if !value.is_empty() && !priority.is_empty() && !priority.eq_ignore_ascii_case("important")
-        {
-            return Ok(());
-        }
-        let mut block = self.declaration_block()?;
-        let Ok(changed) = block.set(name, value, !priority.is_empty()) else {
-            return Ok(());
-        };
-        if changed { self.write_block(block)?; }
-        Ok(())
+    #[method(name = "setProperty", coerce, hint(js(ce_reactions)))]
+    fn set_property_from_script(&self, name: &str, value: lumen_host::webidl::LegacyNullToEmptyString<'_>, priority: Option<&str>) -> OpResult<()> {
+        self.set_property(name, value.0, priority)
     }
     #[method(coerce, hint(js(ce_reactions)))]
     fn remove_property(&self, ctx:&mut Ctx, name: &str) -> OpResult<String> {
@@ -1207,7 +1218,7 @@ mod tests {
             expect(computed.gridLanesPack,'normal');
             expect(computed.flowTolerance,'normal');
             return true;
-        })()"#).unwrap().unwrap_or_else(|_| panic!("Grid Lanes computed CSS contract"));
+        })()"#).unwrap().unwrap_or_else(|error| panic!("Grid Lanes computed CSS contract: {}", engine.ctx().coerce_string(&error).map(|value| value.to_string()).unwrap_or_default()));
         assert!(matches!(result, Value::Bool(true)));
     }
 

@@ -585,6 +585,8 @@ pub struct FontSpec {
     /// specified ligature property so CSSOM still reports its computed value.
     pub disable_optional_ligatures: bool,
     pub synthesize_small_caps: bool,
+    /// Computed `text-spacing-trim`, mirrored here because it selects font features.
+    pub spacing_trim: SpacingTrim,
 }
 impl Default for FontSpec {
     fn default() -> Self {
@@ -604,6 +606,30 @@ impl Default for FontSpec {
             alternates: None,
             disable_optional_ligatures: false,
             synthesize_small_caps: true,
+            spacing_trim: SpacingTrim::Normal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SpacingTrim {
+    SpaceAll,
+    #[default]
+    Normal,
+    SpaceFirst,
+    TrimStart,
+    TrimBoth,
+    TrimAll,
+}
+impl SpacingTrim {
+    pub fn from_keyword(keyword: &str) -> Self {
+        match keyword {
+            "space-all" => Self::SpaceAll,
+            "space-first" => Self::SpaceFirst,
+            "trim-start" => Self::TrimStart,
+            "trim-both" => Self::TrimBoth,
+            "trim-all" => Self::TrimAll,
+            _ => Self::Normal,
         }
     }
 }

@@ -780,17 +780,10 @@ impl DomRealm {
             current = parent;
         }
     }
-    /// A textarea that was never written through the value setter or a selection API
-    /// starts with its caret at the start; other text controls start at the end.
-    fn initial_caret(&self, node: NodeId, length: usize) -> usize {
-        let session = self.session.borrow();
-        if lumen_html::forms::html_element_local_name(session.document(), node)
-            == Some("textarea")
-        {
-            0
-        } else {
-            length
-        }
+    /// A text control that was never written through the value setter or a
+    /// selection API has its caret at the start.
+    fn initial_caret(&self, _node: NodeId, _length: usize) -> usize {
+        0
     }
 
     fn control_edit_value(&self, node: NodeId) -> OpResult<String> {
@@ -972,6 +965,7 @@ impl DomRealm {
         };
         let inserted_end = range.0.saturating_add(replacement_units.len());
 
+        let selection_before = self.selection(node)?;
         forms::set_control_value(self, &mut self.forms.borrow_mut(), node, &new_value)?;
 
         let (selection_start, selection_end) = match selection_mode {
@@ -983,30 +977,25 @@ impl DomRealm {
                 let delta = replacement_units.len() as isize - old_length as isize;
                 let mut selection_start = current_selection.0;
                 let mut selection_end = current_selection.1;
-                if use_current_selection {
-                    if selection_start > range.1 {
-                        selection_start = selection_start.saturating_add_signed(delta);
-                    } else if selection_start > range.0 {
-                        selection_start = range.0;
-                    }
-                    if selection_end > range.1 {
-                        selection_end = selection_end.saturating_add_signed(delta);
-                    } else if selection_end > range.0 {
-                        selection_end = inserted_end;
-                    }
-                } else {
-                    if selection_start > range.0 {
-                        selection_start = range.0;
-                    }
-                    if selection_end > range.0 {
-                        selection_end = inserted_end;
-                    }
+                if selection_start > range.1 {
+                    selection_start = selection_start.saturating_add_signed(delta);
+                } else if selection_start > range.0 {
+                    selection_start = range.0;
+                }
+                if selection_end > range.1 {
+                    selection_end = selection_end.saturating_add_signed(delta);
+                } else if selection_end > range.0 {
+                    selection_end = inserted_end;
                 }
                 (selection_start, selection_end)
             }
             _ => unreachable!("selection mode was checked above"),
         };
-        self.set_selection_and_queue_event(ctx, node, selection_start, selection_end, "none")
+        self.set_selection(node, selection_start, selection_end, "none")?;
+        if self.selection(node)? != selection_before {
+            self.queue_select_event(ctx, node)?;
+        }
+        Ok(())
     }
 
     fn queue_select_event(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> OpResult<()> {
@@ -1615,7 +1604,7 @@ mod tests {
     fn paste_beforeinput_and_history_events_follow_host_order_and_cancel_rules() {
         let mut engine = Engine::new();
         let realm = install(engine.ctx(), "<input id=field value=x>", 64).unwrap();
-        engine.eval_value("const field=document.getElementById('field');field.focus();const events=[];for(const type of ['paste','beforeinput','input'])field.addEventListener(type,e=>events.push(type+':'+(e.inputType||'')+':'+e.cancelable));").unwrap().ok().unwrap();
+        engine.eval_value("const field=document.getElementById('field');field.focus();field.setSelectionRange(1,1);const events=[];for(const type of ['paste','beforeinput','input'])field.addEventListener(type,e=>events.push(type+':'+(e.inputType||'')+':'+e.cancelable));").unwrap().ok().unwrap();
         let node = realm.focused_node().unwrap();
         assert!(realm.host_paste(engine.ctx(), node, "y").unwrap());
         assert_eq!(realm.control_value(node).unwrap(), "xy");
@@ -1836,7 +1825,7 @@ mod tests {
                 field.setSelectionRange(5, 6);
                 field.setRangeText('P', 1, 2, 'preserve');
                 const explicitPreserveMode = field.value === 'aPXef' &&
-                    field.selectionStart === 1 && field.selectionEnd === 2;
+                    field.selectionStart === 5 && field.selectionEnd === 5;
                 return [
                     ['one-argument preserve', oneArgumentPreserves],
                     ['start mode', startMode],

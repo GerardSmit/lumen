@@ -11,6 +11,7 @@ enum Post {
     ScrollSnapType,
     TextEmphasisPosition,
     OverflowClipMargin,
+    ScrollMarkerGroup,
     Dasharray,
     TextEdge,
     EmphasisStyle,
@@ -49,6 +50,8 @@ macro_rules! blend_modes {
 }
 
 pub(crate) const PROPS: &[Prop] = &[
+    prop("interest-delay-start", false, "normal", "normal | <time-nn>"),
+    prop("interest-delay-end", false, "normal", "normal | <time-nn>"),
     prop("alignment-baseline", false, "baseline", "baseline | text-bottom | alphabetic | ideographic | middle | central | mathematical | text-top"),
     prop("backface-visibility", false, "visible", "visible | hidden"),
     prop("border-clip", false, "normal", "normal | [ <length-percentage-nn> | <flex> ]+"),
@@ -94,7 +97,14 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("mix-blend-mode", false, "normal", blend_modes!()),
     prop("object-fit", false, "fill", "fill | contain | cover | none | scale-down"),
     prop("overflow-anchor", false, "auto", "auto | none"),
-    post(prop("overflow-clip-margin", false, "0px", "[ content-box | padding-box | border-box ] || <length-nn>"), Post::OverflowClipMargin),
+    prop("scroll-axis-lock", false, "auto", "auto | none"),
+    post(prop("scroll-marker-group", false, "none", "none | [ before | after ] [ links | tabs ]? | [ links | tabs ]"), Post::ScrollMarkerGroup),
+    prop("scroll-target-group", false, "none", "none | auto"),
+    prop("block-ellipsis", true, "no-ellipsis", "no-ellipsis | ellipsis | <string>"),
+    prop("max-lines", false, "auto", "auto | <integer-min1> auto?"),
+    prop("continue", false, "normal", "normal | discard | collapse | -webkit-legacy"),
+    prop("-webkit-line-clamp", false, "none", "none | <integer-min1>"),
+    post(prop("overflow-clip-margin", false, "0px", "[ content-box | padding-box | border-box ] || <length>"), Post::OverflowClipMargin),
     prop("overscroll-behavior-x", false, "auto", "contain | none | auto"),
     prop("overscroll-behavior-y", false, "auto", "contain | none | auto"),
     prop("page", false, "auto", "auto | <custom-ident>"),
@@ -189,6 +199,7 @@ enum Leaf {
     LengthNn,
     LengthPercentage,
     LengthPercentageNn,
+    TimeNn,
     NumberNn,
     NumberPx,
     NumberPxNn,
@@ -354,6 +365,7 @@ fn leaf_named(name: &str) -> Leaf {
         "length-nn" => Leaf::LengthNn,
         "length-percentage" => Leaf::LengthPercentage,
         "length-percentage-nn" => Leaf::LengthPercentageNn,
+        "time-nn" => Leaf::TimeNn,
         "number" => Leaf::Number,
         "number-nn" => Leaf::NumberNn,
         "number-px" => Leaf::NumberPx,
@@ -590,6 +602,7 @@ impl Matcher<'_> {
             Leaf::LengthNn => self.numeric("<length>", word, true),
             Leaf::LengthPercentage => self.numeric("<length-percentage>", word, false),
             Leaf::LengthPercentageNn => self.numeric("<length-percentage>", word, true),
+            Leaf::TimeNn => self.numeric("<time>", word, true),
             Leaf::Number => self.numeric("<number>", word, false),
             Leaf::NumberNn => self.numeric("<number>", word, true),
             Leaf::NumberPx | Leaf::NumberPxNn => {
@@ -730,9 +743,20 @@ fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
                 parts.pop();
             }
         }
+        Post::ScrollMarkerGroup => {
+            if parts.len() == 2 && parts[1] == "links" && !computed {
+                parts.pop();
+            } else if parts.len() == 1 && matches!(parts[0].as_str(), "before" | "after") && computed {
+                parts.push(String::from("links"));
+            }
+        }
         Post::OverflowClipMargin => {
+            parts.retain(|part| part != "padding-box");
             if parts.len() == 2 && parts[1] == "0px" {
                 parts.pop();
+            }
+            if parts.is_empty() {
+                parts.push(String::from("0px"));
             }
         }
         Post::Dasharray => {
@@ -815,11 +839,24 @@ pub(crate) fn interpolate(index: usize, from: &str, to: &str, progress: f64) -> 
     if PROPS[index].name == "text-decoration-inset" {
         return super::text_decoration_inset::interpolate(from, to, progress);
     }
+    if PROPS[index].syntax == "<color>" {
+        return super::text_props::interpolate_color(from, to, progress);
+    }
+    if PROPS[index].name == "font-palette" {
+        return super::palette_mix::interpolate(from, to, progress);
+    }
     if is_discrete(index) {
         return None;
     }
     let (a, unit_a) = syntax::split_number_unit(from)?;
     let (b, unit_b) = syntax::split_number_unit(to)?;
+    if PROPS[index].syntax.contains("<time") {
+        if unit_a != "s" || unit_b != "s" {
+            return None;
+        }
+        let value = extra::mix(a, b, progress).max(0.0);
+        return Some(alloc::format!("{}s", super::computed_values::number(value as f32)));
+    }
     if unit_a != "px" || unit_b != "px" {
         return None;
     }
@@ -829,7 +866,13 @@ pub(crate) fn interpolate(index: usize, from: &str, to: &str, progress: f64) -> 
 
 pub(crate) fn is_discrete(index: usize) -> bool {
     let syntax = PROPS[index].syntax;
-    syntax.contains("-min1>") || !(syntax.contains("<length") || syntax.contains("<number"))
+    if PROPS[index].name == "overflow-clip-margin" {
+        return true;
+    }
+    if syntax == "<color>" {
+        return false;
+    }
+    syntax.contains("-min1>") || !(syntax.contains("<length") || syntax.contains("<number") || syntax.contains("<time"))
 }
 
 /// Whether a lone identifier reifies as a `CSSKeywordValue` for this property; `None` for

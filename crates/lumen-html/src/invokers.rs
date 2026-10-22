@@ -3,13 +3,14 @@ use crate::{Document, NodeId};
 use crate::forms::html_element_local_name;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command { Unknown, Custom, TogglePopover, ShowPopover, HidePopover, Close, RequestClose, ShowModal }
+pub enum Command { Unknown, Custom, TogglePopover, ShowPopover, HidePopover, Close, RequestClose, ShowModal, Toggle, Open, StepUp, StepDown }
 
 impl Command {
     pub fn parse(value: &str) -> Self {
         if value.starts_with("--") { return Self::Custom; }
         for (keyword, command) in [("toggle-popover", Self::TogglePopover), ("show-popover", Self::ShowPopover),
-            ("hide-popover", Self::HidePopover), ("close", Self::Close), ("request-close", Self::RequestClose), ("show-modal", Self::ShowModal)] {
+            ("hide-popover", Self::HidePopover), ("close", Self::Close), ("request-close", Self::RequestClose), ("show-modal", Self::ShowModal),
+            ("toggle", Self::Toggle), ("open", Self::Open), ("step-up", Self::StepUp), ("step-down", Self::StepDown)] {
             if value.eq_ignore_ascii_case(keyword) { return command; }
         }
         Self::Unknown
@@ -19,6 +20,7 @@ impl Command {
             Self::Unknown => "", Self::Custom => value,
             Self::TogglePopover => "toggle-popover", Self::ShowPopover => "show-popover", Self::HidePopover => "hide-popover",
             Self::Close => "close", Self::RequestClose => "request-close", Self::ShowModal => "show-modal",
+            Self::Toggle => "toggle", Self::Open => "open", Self::StepUp => "step-up", Self::StepDown => "step-down",
         }
     }
     pub fn valid_for(self, document: &Document, target: NodeId) -> bool {
@@ -26,7 +28,14 @@ impl Command {
             Self::Unknown => false,
             Self::Custom => true,
             Self::TogglePopover | Self::ShowPopover | Self::HidePopover => html_element_local_name(document, target).is_some(),
-            Self::Close | Self::RequestClose | Self::ShowModal => html_element_local_name(document, target) == Some("dialog"),
+            Self::RequestClose | Self::ShowModal => html_element_local_name(document, target) == Some("dialog"),
+            Self::Close => matches!(html_element_local_name(document, target), Some("dialog" | "details")),
+            Self::Toggle | Self::Open => html_element_local_name(document, target) == Some("details"),
+            Self::StepUp | Self::StepDown => {
+                html_element_local_name(document, target) == Some("input")
+                    && document.get_attribute_ns_ref(target, None, "type").ok().flatten()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("number"))
+            }
         }
     }
 }

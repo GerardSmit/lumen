@@ -19,16 +19,6 @@ pub(crate) enum Prop {
 }
 
 impl Prop {
-    pub(crate) fn initial(self) -> &'static str {
-        match self {
-            Prop::ClipPath | Prop::ShapeOutside | Prop::OffsetPath | Prop::ObjectViewBox | Prop::BorderShape => "none",
-            Prop::ShapeMargin | Prop::OffsetDistance => "0px",
-            Prop::ShapeImageThreshold => "0",
-            Prop::OffsetRotate | Prop::OffsetAnchor | Prop::Clip => "auto",
-            Prop::OffsetPosition => "normal",
-        }
-    }
-
     fn default_box(self) -> &'static str {
         match self {
             Prop::ShapeOutside => "margin-box",
@@ -113,7 +103,9 @@ fn parse_source(prop: Prop, token: &str, env: Env) -> Option<Source> {
         return parse_shape(token, env, allow).map(Source::Shape);
     }
     if prop == Prop::ShapeOutside {
-        if !token.contains('(') {
+        let (name, _) = split_function(token)?;
+        if !matches!(name.as_str(), "linear-gradient" | "repeating-linear-gradient" | "radial-gradient" | "repeating-radial-gradient"
+            | "conic-gradient" | "repeating-conic-gradient" | "cross-fade" | "image-set" | "-webkit-image-set" | "image" | "element" | "paint" | "url" | "src") {
             return None;
         }
         let specified = image_source::serialize(token)?;

@@ -111,7 +111,7 @@ pub(crate) const NAMED_COLORS: &[(&str, u32)] = &[
     ("orchid", 0xda70d6),
     ("palegoldenrod", 0xeee8aa),
     ("palegreen", 0x98fb98),
-    ("paleturquoise", 0xafeee6),
+    ("paleturquoise", 0xafeeee),
     ("palevioletred", 0xdb7093),
     ("papayawhip", 0xffefd5),
     ("peachpuff", 0xffdab9),

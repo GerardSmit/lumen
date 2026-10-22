@@ -23,6 +23,7 @@ pub(crate) enum DescendantFilter {
     Class(Vec<String>),
     Name(String),
     WindowNamed(String),
+    DocumentNamed(String),
     FormNamedImages(NodeId, String),
     /// `document.links`: `a` and `area` elements with an `href`.
     Links,
@@ -75,6 +76,7 @@ impl DescendantFilter {
                 matches!(namespace, Namespace::Html)
                     && document.get_attribute_ns_ref(id, None, "name")? == Some(wanted.as_str())
             }
+            Self::DocumentNamed(wanted) => crate::document_named::matches(document, id, wanted)?,
             Self::WindowNamed(wanted) => {
                 if wanted.is_empty() {
                     false

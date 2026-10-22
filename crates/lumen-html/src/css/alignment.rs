@@ -185,6 +185,25 @@ impl Style {
         };
         value
     }
+    /// `normal` self-alignment resolves to `start` for grid items that have a
+    /// preferred aspect ratio or natural size, so they are not stretched.
+    pub(crate) fn grid_normal_alignment_as_start(&mut self, container: &Style) {
+        for horizontal in [true, false] {
+            let value = self.self_alignment(container, horizontal);
+            if value.alignment != AlignItems::Stretch || value.keyword != Some(Keyword::Normal) {
+                continue;
+            }
+            if horizontal {
+                self.justify_self = Some(AlignItems::Start);
+                self.justify_self_keyword = None;
+                self.justify_self_safe = None;
+            } else {
+                self.align_self = Some(AlignItems::Start);
+                self.align_self_keyword = None;
+                self.align_self_safe = None;
+            }
+        }
+    }
     pub fn content_alignment(&self, horizontal: bool) -> ContentAlignment {
         if horizontal {
             ContentAlignment {

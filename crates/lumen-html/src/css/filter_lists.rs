@@ -172,6 +172,9 @@ pub(crate) fn interpolate(from: &str, to: &str, progress: f64) -> Option<String>
     }
     let mut a = parse_list(from)?;
     let mut b = parse_list(to)?;
+    if a.iter().chain(b.iter()).any(|function| matches!(function, Function::Url(_))) {
+        return None;
+    }
     let common = a.len().min(b.len());
     if !a.iter().zip(b.iter()).take(common).all(|(x, y)| same_kind(x, y)) {
         return None;
@@ -205,37 +208,60 @@ pub(crate) fn interpolate(from: &str, to: &str, progress: f64) -> Option<String>
     Some(serialize_list(&out))
 }
 
+fn bound_amounts(list: &mut [Function]) {
+    for function in list {
+        if let Function::Amount { name, value } = function {
+            *value = clamp_amount(name, *value);
+        }
+    }
+}
+
+fn add_colors(a: Rgba, b: Rgba) -> Rgba {
+    let (a_alpha, b_alpha) = (f64::from(a.a) / 255.0, f64::from(b.a) / 255.0);
+    let alpha = (a_alpha + b_alpha).clamp(0.0, 1.0);
+    if alpha <= 0.0 {
+        return Rgba { r: 0, g: 0, b: 0, a: 0 };
+    }
+    let channel = |x: u8, y: u8| libm::floor((f64::from(x) * a_alpha + f64::from(y) * b_alpha) / alpha + 0.5).clamp(0.0, 255.0) as u8;
+    Rgba { r: channel(a.r, b.r), g: channel(a.g, b.g), b: channel(a.b, b.b), a: libm::floor(alpha * 255.0 + 0.5) as u8 }
+}
+
 pub(crate) fn compose(base: &str, value: &str, accumulate: bool) -> Option<String> {
     let mut base = parse_list(base)?;
-    let value = parse_list(value)?;
+    let mut value = parse_list(value)?;
+    bound_amounts(&mut base);
+    bound_amounts(&mut value);
     if !accumulate {
         base.extend(value);
         return Some(serialize_list(&base));
     }
-    let matching = base.iter().zip(value.iter()).take_while(|(x, y)| same_kind(x, y) && !matches!(x, Function::Url(_))).count();
+    let shared = base.len().min(value.len());
+    let mismatched = base.iter().zip(value.iter()).take(shared).any(|(x, y)| !same_kind(x, y) || matches!(x, Function::Url(_)));
+    if mismatched || base.iter().chain(value.iter()).any(|function| matches!(function, Function::Url(_))) {
+        return Some(serialize_list(&value));
+    }
     let mut out = Vec::with_capacity(base.len().max(value.len()));
     for (index, function) in base.iter().enumerate() {
-        out.push(if index < matching {
-            match (function, &value[index]) {
-                (Function::Amount { name, value: x }, Function::Amount { value: y, .. }) => {
+        out.push(match value.get(index) {
+            Some(Function::Amount { value: y, .. }) => match function {
+                Function::Amount { name, value: x } => {
                     let identity = AMOUNTS.iter().find(|(candidate, _)| candidate == name).map_or(0.0, |(_, value)| *value);
-                    Function::Amount { name, value: clamp_amount(name, x + y - identity) }
+                    Function::Amount { name, value: x + y - identity }
                 }
-                (
-                    Function::DropShadow { color: ca, x: xa, y: ya, blur: ba },
-                    Function::DropShadow { color: cb, x: xb, y: yb, blur: bb },
-                ) => Function::DropShadow {
-                    color: mix_color(*ca, *cb, 0.5),
+                _ => function.clone(),
+            },
+            Some(Function::DropShadow { color: cb, x: xb, y: yb, blur: bb }) => match function {
+                Function::DropShadow { color: ca, x: xa, y: ya, blur: ba } => Function::DropShadow {
+                    color: add_colors(*ca, *cb),
                     x: xa + xb,
                     y: ya + yb,
                     blur: ba + bb,
                 },
                 _ => function.clone(),
-            }
-        } else {
-            function.clone()
+            },
+            _ => function.clone(),
         });
     }
-    out.extend(value.into_iter().skip(matching));
+    out.extend(value.into_iter().skip(shared));
     Some(serialize_list(&out))
 }

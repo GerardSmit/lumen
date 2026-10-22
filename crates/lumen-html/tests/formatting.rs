@@ -288,3 +288,42 @@ fn ancestor_text_decoration_reaches_inline_text() {
     assert_eq!(rects[1].width, 16.0);
     assert!(rects[1].y < rects[0].y);
 }
+
+#[test]
+fn closed_details_renders_only_its_summary_whatever_its_display() {
+    let source = |attrs: &str, display: &str| format!(
+        "<style>body{{margin:0}}details{{display:{display}}}summary{{list-style:none}}\
+         #c{{background:red;width:50px;height:10px}}</style>\
+         <details {attrs}><summary>caches</summary><div id=c></div></details>");
+    for display in ["block", "inline-block", "inline", "flex"] {
+        assert!(boxes(&source("", display)).is_empty(), "{display}");
+        assert_eq!(boxes(&source("open", display)).len(), 1, "{display}");
+    }
+}
+
+#[test]
+fn closed_inline_block_details_stays_on_the_line_with_its_summary() {
+    let rects = boxes(
+        "<style>body{margin:0}details{display:inline-block}i{display:inline-block;background:red;width:5px;height:5px}</style>\
+         <i></i><details><summary>caches</summary><ul><li>Archive.org Ghostarchive Megalodon Wayback</li></ul></details><i></i>");
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].y, rects[1].y);
+    assert!(rects[1].x < 120.0, "{rects:?}");
+}
+
+#[test]
+fn center_element_and_div_align_center_block_children() {
+    for source in [
+        "<center><div style='background:red;width:100px;height:10px'></div></center>",
+        "<div align=center><div style='background:red;width:100px;height:10px'></div></div>",
+        "<center><table style='width:100px;height:10px;background:red'><tr><td></td></tr></table></center>",
+    ] {
+        let rects = boxes(&format!("<style>body{{margin:0}}</style>{source}"));
+        assert_eq!(rects.len(), 1, "{source}");
+        assert_eq!(rects[0].x, 110.0, "{source}");
+    }
+    let right = boxes("<style>body{margin:0}</style><div align=right><div style='background:red;width:100px;height:10px'></div></div>");
+    assert_eq!(right[0].x, 220.0);
+    let explicit = boxes("<style>body{margin:0}center{text-align:left}</style><center><div style='background:red;width:100px;height:10px'></div></center>");
+    assert_eq!(explicit[0].x, 0.0);
+}

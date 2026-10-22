@@ -415,9 +415,6 @@ const SVG_UNSUPPORTED_ATTRIBUTES: &[&str] = &[
     "shape-rendering",
     "stroke-dasharray",
     "stroke-dashoffset",
-    "stroke-linecap",
-    "stroke-linejoin",
-    "stroke-miterlimit",
     "text-anchor",
     "textLength",
     "text-rendering",
@@ -4808,18 +4805,7 @@ impl Layout<'_> {
         has_principal_box: bool,
     ) -> css::ContainerUnitContext {
         let mut context = self.container_units.get();
-        if !has_principal_box
-            || matches!(
-                style.display,
-                Display::None
-                    | Display::Contents
-                    | Display::Inline
-                    | Display::Table
-                | Display::InlineTable
-                    | Display::TableCell
-                    | Display::TableCaption
-            )
-        {
+        if !has_principal_box || !style.can_hold_size_containment() {
             return context;
         }
         let horizontal = style.writing_mode == css::WritingMode::HorizontalTb;
@@ -4871,16 +4857,7 @@ impl Layout<'_> {
     ) -> Result<(), LayoutError> {
         if !has_principal_box
             || style.container_type == css::ContainerType::Normal
-            || matches!(
-                style.display,
-                Display::None
-                    | Display::Contents
-                    | Display::Inline
-                    | Display::Table
-                | Display::InlineTable
-                    | Display::TableCell
-                    | Display::TableCaption
-            )
+            || !style.can_hold_size_containment()
         {
             return Ok(());
         }
@@ -4954,13 +4931,22 @@ impl Layout<'_> {
             OverflowRoute::ViewportFixed=>None,
         }
     }
-    fn include_local_overflow(&mut self,rect:Option<OverflowRect>,mut placement:(f64,f64),route:OverflowRoute,hits:Range<usize>,movable:bool)->Result<(),LayoutError> {
+    fn include_local_overflow(&mut self,rect:Option<OverflowRect>,placement:(f64,f64),route:OverflowRoute,hits:Range<usize>,movable:bool)->Result<(),LayoutError> {
+        self.include_local_overflow_with_margin(rect,None,placement,route,hits,movable)
+    }
+    fn include_local_overflow_with_margin(&mut self,rect:Option<OverflowRect>,margin:Option<OverflowRect>,mut placement:(f64,f64),route:OverflowRoute,hits:Range<usize>,movable:bool)->Result<(),LayoutError> {
         let Some(rect)=rect else{return Ok(())};
         let Some(target)=self.overflow_target(route)else{return Ok(())};
         for frame in &self.overflow_frames[target+1..] {placement.0+=frame.placement.0;placement.1+=frame.placement.1;}
         let frame_capacity=self.overflow_frames.capacity();let frame=&mut self.overflow_frames[target];
-        let rect=rect.shifted(placement.0+f64::from(frame.scroll_adjust.0),placement.1+f64::from(frame.scroll_adjust.1));
-        if !movable || hits.is_empty() {frame.include(rect);return Ok(());}
+        let shift=(placement.0+f64::from(frame.scroll_adjust.0),placement.1+f64::from(frame.scroll_adjust.1));
+        let rect=rect.shifted(shift.0,shift.1);
+        let margin=margin.map(|margin|margin.shifted(shift.0,shift.1));
+        if !movable || hits.is_empty() {
+            frame.include(rect);
+            if let Some(margin)=margin {frame.item_margins=Some(frame.item_margins.map_or(margin,|old|old.union(margin)));}
+            return Ok(());
+        }
         // Charge a conservative envelope for both Vec capacity and BTree nodes;
         // this bounds sparse placement state separately from retained payloads.
         let count=self.overflow_contribution_count.checked_add(1).ok_or(LayoutError::CommandLimit)?;
@@ -4973,7 +4959,7 @@ impl Layout<'_> {
         self.next_overflow_token=token.checked_add(1).ok_or(LayoutError::CommandLimit)?;
         let key=(hits.start,token);
         self.overflow_move_index.insert(key,(target,frame.children.len()));
-        frame.children.push(OverflowContribution{rect,hits,key,paint_owner:None});
+        frame.children.push(OverflowContribution{rect,margin,hits,key,paint_owner:None});
         self.overflow_contribution_count+=1;
         Ok(())
     }
@@ -5044,6 +5030,7 @@ impl Layout<'_> {
                 if let Some(value)=frames.get_mut(owner).and_then(|frame|frame.children.get_mut(slot)) {
                     if Self::overflow_selection_contains(value,owners,selected.clone()) {
                         value.rect=value.rect.shifted(dx,dy);
+                        value.margin=value.margin.map(|margin|margin.shifted(dx,dy));
                     }
                 }
             }
@@ -5077,6 +5064,8 @@ impl Layout<'_> {
             let scroll=(f64::from(frame.scroll_adjust.0),f64::from(frame.scroll_adjust.1));
             let value=&mut frame.children[slot];
             if Self::overflow_selection_contains(value,self.flow_paint_owners.as_deref(),core::iter::once(hits.clone())) {
+                value.margin=value.margin.and_then(|margin|margin.shifted(-scroll.0-path.0,-scroll.1-path.1).transformed(matrix))
+                    .map(|margin|margin.shifted(point.0+path.0+scroll.0,point.1+path.1+scroll.1));
                 if let Some(rect)=value.rect.shifted(-scroll.0-path.0,-scroll.1-path.1).transformed(matrix) {
                     value.rect=rect.shifted(point.0+path.0+scroll.0,point.1+path.1+scroll.1);
                 }
@@ -5124,7 +5113,7 @@ impl Layout<'_> {
                     return Ok(true);
                 }
             }
-            let mut children = self.document.composed_children_iter(node).map_err(|_| LayoutError::InvalidTree)?;
+            let mut children = self.document.rendered_children_iter(node).map_err(|_| LayoutError::InvalidTree)?;
             while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
                 stack.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
                 stack.push(child);
@@ -5818,7 +5807,7 @@ impl Layout<'_> {
             .then(|| parent_style.display_contents_child_style());
         let mut children = self
             .document
-            .composed_children_iter(parent)
+            .rendered_children_iter(parent)
             .map_err(|_| LayoutError::InvalidTree)?;
         while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
             let kind = self
@@ -7449,6 +7438,7 @@ impl Layout<'_> {
         depth: usize,
         marker: Option<&VirtualGeneratedChild>,
     ) -> Result<f32, LayoutError> {
+        let (width_declared, height_declared) = (style.width.is_some(), style.height.is_some());
         let resolved_style =
             self.resolve_style_percentages(style, available, self.parent_height);
         let style = &resolved_style;
@@ -7462,10 +7452,13 @@ impl Layout<'_> {
         let active_view=if self.document.document_element_at(self.document.root()).ok().flatten()==Some(id) {
             self.images.and_then(|images|images.svg_fragment()).and_then(|fragment|fragment.resolve(self.document))
         } else {None};
-        let (intrinsic_width, intrinsic_height) = crate::svg::root_size_with_view(
+        let (intrinsic_width, intrinsic_height) = crate::svg::root_size_in_flow(
             attributes,
             attr_width,
             attr_height,
+            width_declared,
+            height_declared,
+            self.document.document_element_at(self.document.root()).ok().flatten() != Some(id),
             available,
             self.parent_height,
             active_view,
@@ -8093,6 +8086,7 @@ struct FlexItem {
     style: Style,
     main: f32,
     min_main: f32,
+    shrink_base: f32,
     source_order: usize,
     cross: f32,
     edges: f32,
@@ -9314,7 +9308,7 @@ fn contains_html_quote_element(
         return Ok(true);
     }
     let mut children = document
-        .composed_children_iter(node)
+        .rendered_children_iter(node)
         .map_err(|_| LayoutError::InvalidTree)?;
     while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
         if contains_html_quote_element(document, child, depth + 1)? {
@@ -9442,7 +9436,7 @@ fn collect_quote_positions(
 
     let child_parent_style = style.as_ref().or(parent_style);
     let mut children = document
-        .composed_children_iter(node)
+        .rendered_children_iter(node)
         .map_err(|_| LayoutError::InvalidTree)?;
     while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
         collect_quote_positions(
@@ -9639,7 +9633,7 @@ pub(crate) fn contains_list_item_candidate(
             }
         }
         let mut children = document
-            .composed_children_iter(node)
+            .rendered_children_iter(node)
             .map_err(|_| LayoutError::InvalidTree)?;
         while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
             pending
@@ -9940,7 +9934,7 @@ fn collect_counter_positions(
 
     let child_parent_style = style.as_ref().or(parent_style);
     let mut children = document
-        .composed_children_iter(node)
+        .rendered_children_iter(node)
         .map_err(|_| LayoutError::InvalidTree)?;
     while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
         collect_counter_positions(
@@ -10693,19 +10687,19 @@ impl OverflowRect {
 }
 
 #[derive(Clone, Copy, Default)]
-struct OverflowMetrics { parent:Option<OverflowRect>,border:Option<OverflowRect> }
+struct OverflowMetrics { parent:Option<OverflowRect>,border:Option<OverflowRect>,margin:Option<OverflowRect> }
 #[derive(Clone, Copy)]
 enum OverflowRoute { Parent,ContainingBlock(NodeId),Root,ViewportFixed }
-struct OverflowContribution { rect:OverflowRect,hits:Range<usize>,key:(usize,usize),paint_owner:Option<core::num::NonZeroU32> }
+struct OverflowContribution { rect:OverflowRect,margin:Option<OverflowRect>,hits:Range<usize>,key:(usize,usize),paint_owner:Option<core::num::NonZeroU32> }
 struct OverflowFrame {
-    node:NodeId,extent:Option<OverflowRect>,padding_box:Option<OverflowRect>,
+    node:NodeId,extent:Option<OverflowRect>,padding_box:Option<OverflowRect>,margin_box:Option<OverflowRect>,item_margins:Option<OverflowRect>,
     paint_origin:(f32,f32),placement:(f64,f64),format_offset:(f64,f64),containing_origin:Option<(f64,f64)>,border_box:Option<OverflowRect>,projection_clip:Option<OverflowRect>,
     children:Vec<OverflowContribution>,retain_to_parent:bool,content_anchor:Option<((f32,f32),(f64,f64))>,flow_cursor:Option<(f32,f64)>,block_cursor:Option<(f32,f64)>,
     clip_x:bool,clip_y:bool,scroll_adjust:(f32,f32),scroll_container:bool,scroll_reverse:(bool,bool),route:OverflowRoute,
 }
 impl OverflowFrame {
     fn new(node:NodeId,clip_x:bool,clip_y:bool,scroll_adjust:(f32,f32),scroll_container:bool,route:OverflowRoute)->Self {
-        Self {node,extent:None,padding_box:None,paint_origin:(0.0,0.0),placement:(0.0,0.0),format_offset:(0.0,0.0),containing_origin:None,border_box:None,projection_clip:None,children:Vec::new(),retain_to_parent:false,content_anchor:None,flow_cursor:None,block_cursor:None,clip_x,clip_y,scroll_adjust,scroll_container,scroll_reverse:(false,false),route}
+        Self {node,extent:None,padding_box:None,margin_box:None,item_margins:None,paint_origin:(0.0,0.0),placement:(0.0,0.0),format_offset:(0.0,0.0),containing_origin:None,border_box:None,projection_clip:None,children:Vec::new(),retain_to_parent:false,content_anchor:None,flow_cursor:None,block_cursor:None,clip_x,clip_y,scroll_adjust,scroll_container,scroll_reverse:(false,false),route}
     }
     fn viewport(node:NodeId,viewport:Rect,scroll_adjust:(f32,f32))->Self {
         let rect=OverflowRect::new(0.0,0.0,viewport.width,viewport.height);
@@ -10715,8 +10709,11 @@ impl OverflowFrame {
     fn combined_extent(&self)->Option<OverflowRect> {
         self.children.iter().fold(self.extent,|old,value|Some(old.map_or(value.rect,|old|old.union(value.rect))))
     }
+    fn item_margin_extent(&self)->Option<OverflowRect> {
+        self.children.iter().filter_map(|value|value.margin).fold(self.item_margins,|old,value|Some(old.map_or(value,|old|old.union(value))))
+    }
     fn set_padding_box(&mut self,rect:OverflowRect) {self.padding_box=Some(rect);self.include(rect);}
-    fn translate(&mut self,dx:f32,dy:f32) {let (x,y)=(f64::from(dx),f64::from(dy));self.extent=self.extent.map(|rect|rect.shifted(x,y));self.padding_box=self.padding_box.map(|rect|rect.shifted(x,y));for value in &mut self.children {value.rect=value.rect.shifted(x,y);}}
+    fn translate(&mut self,dx:f32,dy:f32) {let (x,y)=(f64::from(dx),f64::from(dy));self.extent=self.extent.map(|rect|rect.shifted(x,y));self.padding_box=self.padding_box.map(|rect|rect.shifted(x,y));self.item_margins=self.item_margins.map(|rect|rect.shifted(x,y));for value in &mut self.children {value.rect=value.rect.shifted(x,y);value.margin=value.margin.map(|rect|rect.shifted(x,y));}}
     fn metrics(&self,transform:Option<crate::paint::Affine>)->OverflowMetrics {
         let mut parent=self.combined_extent();
         if let Some(clip)=self.projection_clip {parent=parent.and_then(|rect|rect.intersection(clip));}
@@ -10738,7 +10735,7 @@ impl OverflowFrame {
             let Some(value)=parent.transformed(matrix)else{return OverflowMetrics::default()};
             parent=parent.union(value);
         }
-        OverflowMetrics {parent:Some(parent),border:self.border_box}
+        OverflowMetrics {parent:Some(parent),border:self.border_box,margin:self.margin_box}
     }
 
 }
@@ -11704,13 +11701,26 @@ pub(crate) struct HitRegion {
 pub(crate) struct UsedMargins {
     pub node: NodeId,
     pub sides: [f32; 4],
+    /// Whether `sides` holds recorded used margins; an entry may exist only
+    /// to carry anchor-resolved insets.
+    pub has_margins: bool,
+    /// Used top, right, bottom and left insets resolved from `anchor()`
+    /// or `position-area`; NaN where layout resolved none.
+    pub insets: [f32; 4],
 }
 
 impl LayoutGeometry {
     pub(crate) fn used_margins_for(&self, node: NodeId) -> Option<[f32; 4]> {
         let index = *self.used_margin_index.get(&node.key())?;
         let used = self.used_margins.get(index)?;
-        (used.node == node).then_some(used.sides)
+        (used.node == node && used.has_margins).then_some(used.sides)
+    }
+
+    pub(crate) fn used_insets_for(&self, node: NodeId) -> Option<[Option<f32>; 4]> {
+        let index = *self.used_margin_index.get(&node.key())?;
+        let used = self.used_margins.get(index)?;
+        (used.node == node && used.insets.iter().any(|inset| !inset.is_nan()))
+            .then(|| used.insets.map(|inset| (!inset.is_nan()).then_some(inset)))
     }
 }
 
@@ -11917,7 +11927,17 @@ struct GridTrackContribution {
     /// The min-content contribution after the item's automatic minimum-size
     /// clamp. Baseline shims are included in this value, while their edge and
     /// shim floor stays outside a fixed maximum track cap.
-    automatic_minimum: Option<f32>,
+    automatic_minimum: Option<GridItemMinimum>,
+}
+
+/// The minimum contribution of an item whose preferred size is `auto`, other
+/// than its min-content size. An automatic minimum (`min-width: auto`) is
+/// treated as zero when the item spans several flexible tracks; a definite
+/// `min-width` is a plain minimum contribution that always applies.
+#[derive(Clone, Copy, Debug)]
+struct GridItemMinimum {
+    value: f32,
+    automatic: bool,
 }
 
 /// Select a grid-lane group without allocating per-item occupancy state.
@@ -12185,6 +12205,33 @@ fn push_grid_track_contribution(
 /// Resolve the definite track range used by an absolutely-positioned grid
 /// area's containing block. Invalid/out-of-grid line placements follow the
 /// Grid rule and behave like auto rather than manufacturing implicit tracks.
+/// Start and size of the area between the lines of one axis, with a missing
+/// line standing for the container's padding edge.
+fn positioned_grid_axis_area(
+    lines: css::AbsoluteGridLines,
+    sizes: &[f32],
+    gap: f32,
+    offset: f32,
+    extent: f32,
+    padding_before: f32,
+    padding_after: f32,
+) -> (f32, f32) {
+    let count = sizes.len();
+    let track_start = |index: usize| offset + sizes[..index].iter().sum::<f32>() + gap * index as f32;
+    let track_end = |index: usize| track_start(index) + sizes[index];
+    let start = match lines.start {
+        Some(line) if line < count => track_start(line),
+        Some(line) if count > 0 && line == count => track_end(count - 1),
+        _ => -padding_before,
+    };
+    let end = match lines.end {
+        Some(0) => track_start(0),
+        Some(line) if line <= count => track_end(line - 1),
+        _ => extent + padding_after,
+    };
+    (start, (end - start).max(0.0))
+}
+
 fn positioned_grid_track_range(
     placement: css::GridPlacement,
     count: usize,
@@ -12206,6 +12253,21 @@ fn distribute_track_range(
     gap: f32,
     eligible: impl Fn(usize) -> bool,
 ) {
+    distribute_track_range_weighted(values, ceilings, start, span, target, gap, |_| 1.0, eligible);
+}
+
+/// `distribute_track_range` sharing space in proportion to a per-track weight.
+/// When every growing track has a zero weight the space is shared equally.
+fn distribute_track_range_weighted(
+    values: &mut [f32],
+    ceilings: &[f32],
+    start: usize,
+    span: usize,
+    target: f32,
+    gap: f32,
+    weight: impl Fn(usize) -> f32,
+    eligible: impl Fn(usize) -> bool,
+) {
     if span == 0 { return; }
     let current = values[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
     let mut extra = (target - current).max(0.0);
@@ -12213,20 +12275,33 @@ fn distribute_track_range(
         if extra <= 0.0 {
             break;
         }
-        let growing = (start..start + span)
-            .filter(|&index| eligible(index) && values[index] < ceilings[index])
-            .count();
-        if growing == 0 {
+        let growing = |index: usize| eligible(index) && values[index] < ceilings[index];
+        let count = (start..start + span).filter(|&index| growing(index)).count();
+        if count == 0 {
             break;
         }
-        let share = extra / growing as f32;
+        let total: f32 = (start..start + span)
+            .filter(|&index| growing(index))
+            .map(|index| weight(index).max(0.0))
+            .sum();
+        let share = |index: usize| {
+            if total > 0.0 {
+                extra * weight(index).max(0.0) / total
+            } else {
+                extra / count as f32
+            }
+        };
         let mut distributed = 0.0;
+        let mut added_by_index = [0.0f32; css::MAX_GRID_TRACKS];
         for index in start..start + span {
-            if eligible(index) && values[index] < ceilings[index] {
-                let added = share.min(ceilings[index] - values[index]);
-                values[index] += added;
+            if growing(index) {
+                let added = share(index).min(ceilings[index] - values[index]);
+                added_by_index[index - start] = added;
                 distributed += added;
             }
+        }
+        for index in start..start + span {
+            values[index] += added_by_index[index - start];
         }
         if distributed <= 0.0 {
             break;
@@ -12247,15 +12322,28 @@ fn distribute_base_range(
     gap: f32,
     eligible: impl Fn(usize) -> bool,
 ) {
+    distribute_base_range_weighted(values, limits, start, span, target, gap, |_| 1.0, eligible);
+}
+
+fn distribute_base_range_weighted(
+    values: &mut [f32],
+    limits: &[f32],
+    start: usize,
+    span: usize,
+    target: f32,
+    gap: f32,
+    weight: impl Fn(usize) -> f32,
+    eligible: impl Fn(usize) -> bool,
+) {
     let unbounded = [f32::INFINITY; css::MAX_GRID_TRACKS];
     if span > 1 {
-        distribute_track_range(values, limits, start, span, target, gap, &eligible);
+        distribute_track_range_weighted(values, limits, start, span, target, gap, &weight, &eligible);
         let current = values[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
         if current + 0.001 >= target {
             return;
         }
     }
-    distribute_track_range(values, &unbounded, start, span, target, gap, eligible);
+    distribute_track_range_weighted(values, &unbounded, start, span, target, gap, weight, eligible);
 }
 
 /// Sum a span's fixed maximum sizing functions. An intrinsic or flexible
@@ -12298,6 +12386,16 @@ fn explicit_stretch(alignment: css::ItemAlignment) -> bool {
     alignment.alignment == AlignItems::Stretch && alignment.keyword != Some(css::AlignmentKeyword::Normal)
 }
 
+/// Fit-content extent of a grid item's margin box when its measured contribution
+/// used different (percentage-resolved) margin, border and padding edges than
+/// the final grid area gives it.
+fn grid_fit_extent(natural: f32, minimum: f32, available: f32, measured_edges: f32, used_edges: f32) -> f32 {
+    (natural - measured_edges)
+        .min(available - used_edges)
+        .max(minimum - measured_edges)
+        + used_edges
+}
+
 fn grid_has_percentage_track(definitions: &[css::GridTrack]) -> bool {
     use css::{GridBreadth as B, GridTrack as T};
     definitions.iter().any(|track| {
@@ -12315,6 +12413,32 @@ fn automatic_clamp(style: &Style, horizontal: bool, fixed_maximum: Option<f32>) 
         style.height.is_none() && style.min_height_auto
     };
     fixed_maximum.filter(|_| automatic)
+}
+
+/// An `auto` minimum is the content-based automatic minimum (CSS Grid §6.6);
+/// a definite length on an `auto`-sized item is its minimum contribution
+/// directly. A content keyword is the plain min-content contribution.
+fn grid_item_automatic_minimum(style: &Style, horizontal: bool, value: f32) -> Option<GridItemMinimum> {
+    let (keyword, automatic, auto_size, percentage) = if horizontal {
+        (style.min_width_intrinsic.is_some(), style.min_width_auto, style.width.is_none(), style.has_min_width_percentage())
+    } else {
+        (style.min_height_intrinsic.is_some(), style.min_height_auto, style.height.is_none(), style.has_min_height_percentage())
+    };
+    if keyword {
+        return None;
+    }
+    if automatic {
+        return Some(GridItemMinimum { value, automatic: true });
+    }
+    if !auto_size || percentage {
+        return None;
+    }
+    let minimum = if horizontal {
+        content_dimension(style, style.min_width) + box_edges(style, true)
+    } else {
+        content_height_dimension(style, style.min_height) + box_edges(style, false)
+    };
+    Some(GridItemMinimum { value: minimum, automatic: false })
 }
 
 /// Clamp only the content part of an automatic minimum. Border/padding and a
@@ -12422,8 +12546,8 @@ fn grid_track_sizes(
             max_content,
             automatic_minimum: contribution
                 .automatic_minimum
-                .filter(|value| value.is_finite())
-                .map(|value| value.max(0.0)),
+                .filter(|minimum| minimum.value.is_finite())
+                .map(|minimum| GridItemMinimum { value: minimum.value.max(0.0), ..minimum }),
         })
     });
 
@@ -12476,6 +12600,15 @@ fn grid_track_sizes(
             base_ceilings[index] = limit;
         }
     }
+    let is_flexible = |index: usize| {
+        matches!(
+            definitions.get(index).copied().unwrap_or(T::Auto).maximum(),
+            B::Fraction(_)
+        )
+    };
+    let spans_flexible = |contribution: &GridTrackContribution| {
+        (contribution.start..contribution.start + contribution.span).any(is_flexible)
+    };
     for span in 1..=count {
         for contribution in contributions
             .clone()
@@ -12483,31 +12616,42 @@ fn grid_track_sizes(
         {
             let start = contribution.start;
             let end = start + span;
-            distribute_base_range(
+            let flex_only = spans_flexible(&contribution);
+            let receives = |index: usize| !flex_only || is_flexible(index);
+            let flex_weight = |index: usize| match definitions.get(index).copied().unwrap_or(T::Auto).maximum() {
+                B::Fraction(factor) if flex_only => factor,
+                _ => 1.0,
+            };
+            distribute_base_range_weighted(
                 &mut sizes,
                 &base_ceilings,
                 start,
                 span,
                 contribution.min_content,
                 gap,
+                &flex_weight,
                 |index| {
                     index >= start
                         && index < end
+                        && receives(index)
                         && matches!(
                             definitions.get(index).copied().unwrap_or(T::Auto).minimum(),
                             B::MinContent
                         )
                 },
             );
-            distribute_base_range(
+            distribute_base_range_weighted(
                 &mut sizes,
                 &base_ceilings,
                 start,
                 span,
-                contribution
-                    .automatic_minimum
-                    .unwrap_or(contribution.min_content),
+                match contribution.automatic_minimum {
+                    Some(minimum) if minimum.automatic && flex_only && span > 1 => 0.0,
+                    Some(minimum) => minimum.value,
+                    None => contribution.min_content,
+                },
                 gap,
+                &flex_weight,
                 |index| {
                     let minimum = definitions
                         .get(index)
@@ -12516,6 +12660,7 @@ fn grid_track_sizes(
                         .minimum();
                     index >= start
                         && index < end
+                        && receives(index)
                         && (matches!(minimum, B::Auto)
                             || matches!(minimum, B::Percentage(_)) && available.is_none()
                             || matches!(minimum, B::Length(_, percent)
@@ -12532,6 +12677,7 @@ fn grid_track_sizes(
                 |index| {
                     index >= start
                         && index < end
+                        && receives(index)
                         && matches!(
                             definitions.get(index).copied().unwrap_or(T::Auto).minimum(),
                             B::MaxContent
@@ -12566,7 +12712,7 @@ fn grid_track_sizes(
     for span in 1..=count {
         for contribution in contributions
             .clone()
-            .filter(|contribution| contribution.span == span)
+            .filter(|contribution| contribution.span == span && !spans_flexible(contribution))
         {
             let start = contribution.start;
             let end = start + span;
@@ -14612,6 +14758,7 @@ impl IntrinsicAxisSizes {
     fn calc_basis(self, calc: css::calc_size::CalcSizeValue, available: Option<f32>, containing: Option<f32>) -> Option<f32> {
         use css::calc_size::Basis;
         match calc.basis {
+            Basis::Any => Some(0.0),
             Basis::FitContentArgument => Some(calc.fit_content_limit(containing).max(self.minimum).min(self.maximum)),
             Basis::MinContent => Some(self.minimum),
             Basis::MaxContent | Basis::Content => Some(self.maximum),
@@ -15296,6 +15443,15 @@ struct FieldsetLayout {
     spill: f32,
 }
 
+/// A legend does not take its inline alignment from the legacy `-webkit-*` text-align
+/// alignment inherited through the fieldset; only its own alignment or auto margins apply.
+fn fieldset_legend_alignment(legend: &Style, fieldset: &Style) -> css::ItemAlignment {
+    let inherited_legacy = legend.justify_self.is_none()
+        && matches!(fieldset.justify_items_keyword, Some(css::AlignmentKeyword::LegacyLeft
+            | css::AlignmentKeyword::LegacyRight | css::AlignmentKeyword::LegacyCenter));
+    if inherited_legacy { legend.self_alignment(&Style::initial(), true) } else { legend.self_alignment(fieldset, true) }
+}
+
 fn fieldset_legend_style(style: &Style) -> Style {
     let mut used = style.clone();
     used.display = used.display.blockified();
@@ -15463,6 +15619,10 @@ fn float_edges(
     (start, (end - start).max(0.0))
 }
 
+/// Percentage widths and margins that sum to 100% overshoot by a few f32 ulps;
+/// browsers resolve them on a 1/64 px grid, so floats within that grid still fit.
+const FLOAT_FIT_TOLERANCE:f32=1.0/64.0;
+
 // One occupancy solver serves both hypothetical initial-margin admission and
 // the real encounter pass. Iterator copies contain only rectangle metadata.
 fn place_float_in<I: Iterator<Item=(Rect,Float)>+Clone>(floats:I,left:f32,width:f32,
@@ -15478,9 +15638,9 @@ fn place_float_in<I: Iterator<Item=(Rect,Float)>+Clone>(floats:I,left:f32,width:
         let next=floats.clone().filter_map(|(rect,earlier_side)|{
             if rect.y>=y+1.0 || rect.y+rect.height<=y{return None;}
             let right=x+extent;
-            let opposite=x<rect.x+rect.width&&right>rect.x&&earlier_side!=side;
-            let precedes=earlier_side==side && if side==Float::Left{rect.x+rect.width<=x}else{rect.x>=right};
-            let edge_blocks=precedes && if side==Float::Left{right>left+width}else{x<left};
+            let opposite=x+FLOAT_FIT_TOLERANCE<rect.x+rect.width&&right>rect.x+FLOAT_FIT_TOLERANCE&&earlier_side!=side;
+            let precedes=earlier_side==side && if side==Float::Left{rect.x+rect.width<=x+FLOAT_FIT_TOLERANCE}else{rect.x+FLOAT_FIT_TOLERANCE>=right};
+            let edge_blocks=precedes && if side==Float::Left{right>left+width+FLOAT_FIT_TOLERANCE}else{x+FLOAT_FIT_TOLERANCE<left};
             (opposite||edge_blocks).then_some(rect.y+rect.height)
         }).min_by(f32::total_cmp);
         match next {Some(next)=>y=next,None=>return (x,y)}
@@ -15615,18 +15775,28 @@ fn establishes_formatting_context(style: &Style, parent: &Style) -> bool {
         || css::columns::active(style)
 }
 
+/// Physical sides (top 0, right 1, bottom 2, left 3) whose margins on a
+/// `stretch` block-axis box would collapse through its parent and therefore do
+/// not reduce the stretched size (CSS Sizing 4).
+fn stretch_collapsed_margins(parent: &Style, style: &Style) -> Vec<usize> {
+    let horizontal = parent.writing_mode != css::WritingMode::HorizontalTb;
+    let stretches = style.intrinsic_size_keywords(horizontal).contains(&Some(css::IntrinsicSizing::Stretch));
+    if !stretches
+        || style.float != Float::None
+        || matches!(style.position, Position::Absolute | Position::Fixed)
+        || !matches!(parent.display, Display::Block | Display::ListItem)
+        || parent.display_inline
+        || establishes_formatting_context(parent, &Style::initial())
+    {
+        return Vec::new();
+    }
+    let borders = border_widths(parent);
+    let sides = if horizontal { [3, 1] } else { [0, 2] };
+    sides.into_iter().filter(|side| parent.padding_sides[*side] == 0.0 && borders[*side] == 0.0).collect()
+}
+
 fn establishes_container_formatting_context(style: &Style) -> bool {
-    style.container_type != css::ContainerType::Normal
-        && !matches!(
-            style.display,
-            Display::None
-                | Display::Contents
-                | Display::Inline
-                | Display::Table
-                | Display::InlineTable
-                | Display::TableCell
-                | Display::TableCaption
-        )
+    style.container_type != css::ContainerType::Normal && style.can_hold_size_containment()
 }
 
 impl Layout<'_> {
@@ -19650,6 +19820,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         items.sort_unstable_by_key(|item| (item.order, item.source));
         (columns, rows) = grid_auto_place(&mut items, columns, rows, style.grid_auto_flow);
+        if items.is_empty() {
+            columns = column_tracks.len();
+            rows = row_tracks.len();
+        }
         let solve = |horizontal: bool| {
             let mut definitions = [GridTrack::Auto; MAX_GRID_TRACKS];
             let count = if horizontal { columns } else { rows };
@@ -19797,6 +19971,41 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         self.resolve_intrinsic_dimensions_for_box(id, style, width, height, depth, false)
     }
 
+    /// Block-size keywords measure content at the inline size the box will
+    /// really get, not at its max-content width.
+    fn block_axis_measure_width(&self, id: NodeId, style: &Style, width: f32, depth: usize)
+        -> Result<Option<f32>, LayoutError> {
+        if style.width.is_some()
+            || style.writing_mode != css::WritingMode::HorizontalTb
+            || style.intrinsic_size_keywords(false).iter().all(Option::is_none)
+            || !matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem
+                | Display::InlineBlock | Display::Flex | Display::Grid)
+        {
+            return Ok(None);
+        }
+        let replaced = matches!(self.document.kind(id), Ok(NodeKind::Element { name, .. })
+            if matches!(name.as_str(), "img" | "canvas" | "video" | "audio" | "iframe" | "object"
+                | "embed" | "textarea" | "select" | "button" | "input" | "svg"));
+        if replaced {
+            return Ok(None);
+        }
+        let edges = box_edges(style, true);
+        let positioned = matches!(style.position, Position::Absolute | Position::Fixed);
+        let shrink = style.float != Float::None
+            || style.display == Display::InlineBlock
+            || positioned && !(style.left.is_some() && style.right.is_some());
+        let content = if shrink {
+            let measured = style.intrinsic_measurement_style(false);
+            IntrinsicAxisSizes::measure(&measured, true, true, true, |measurement, minimum| {
+                self.intrinsic_size_mode(id, measurement, depth + 1, minimum)
+            })?
+            .choose(css::IntrinsicSizing::FitContent, Some((width - edges).max(0.0)))
+        } else {
+            (width - edges).max(0.0)
+        };
+        Ok(Some(specified_dimension(style, constrained_width(style, content))))
+    }
+
     fn resolve_intrinsic_dimensions_for_box(&self, id: NodeId, style: &mut Style, width: f32,
         height: Option<f32>, depth: usize, anonymous: bool) -> Result<(), LayoutError> {
         if !anonymous { self.apply_widget_layout_style(id, style); }
@@ -19810,7 +20019,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
         }
         self.resolve_intrinsic_axis(id, style, true, Some(width), depth)?;
+        let measure_width = self.block_axis_measure_width(id, style, width, depth)?;
+        let authored_width = style.width;
+        if let Some(measured) = measure_width {
+            style.width = Some(measured);
+        }
         self.resolve_intrinsic_axis(id, style, false, height, depth)?;
+        if measure_width.is_some() {
+            style.width = authored_width;
+        }
         if self.uses_button_layout(id) && !matches!(style.display, Display::None | Display::Contents) {
             // Button layout uses fit-content in its logical inline axis even
             // for block outer display, and replaced sizing when positioned.
@@ -19853,6 +20070,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         node: Option<NodeId>,
     ) -> Result<f32, LayoutError> {
         let measure = |text: &str| -> Result<f32, LayoutError> {
+            let untrimmed = text;
             let text = if matches!(
                 style.white_space,
                 WhiteSpace::Normal
@@ -19867,7 +20085,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let language=node.and_then(|node|self.content_language(node).ok().flatten());
             let advance=if style.font_size==0.0 {0.0} else if language.is_none_or(str::is_empty){self.measure_styled_text(text,style)?}
                 else {self.text.shape_styled_context(text,style.font_size,style.used_direction() ==Direction::Rtl,&style.font,language).map_err(|_|LayoutError::Text)?.width};
-            Ok(advance + self.text_spacing_delta(text, style)?)
+            // Line layout spaces every character but the last one of the line; a
+            // hanging space that trimming removed here is that last character.
+            let hangs = untrimmed.len() > text.len() && untrimmed.ends_with(' ');
+            let trailing = if text.is_empty() || !hangs { 0.0 } else { style.letter_spacing.unwrap_or(0.0) };
+            Ok(advance + self.text_spacing_delta(text, style)? + trailing)
         };
         if !minimum || matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
             return measure(text);
@@ -21713,6 +21935,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok(())
     }
 
+    fn is_sized_replaced_element(&self, node: NodeId) -> bool {
+        matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. })
+            if matches!(name.as_str(), "img" | "video" | "canvas" | "svg"))
+    }
+
+    fn has_natural_aspect_ratio(&self, node: NodeId, style: &Style) -> bool {
+        style.aspect_ratio.is_some() || self.is_sized_replaced_element(node)
+    }
+
     fn grid_children(
         &mut self,
         parent: NodeId,
@@ -21987,6 +22218,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     items
                         .try_reserve(1)
                         .map_err(|_| LayoutError::CommandLimit)?;
+                    if anonymous_text.is_none() && self.has_natural_aspect_ratio(node, &computed) {
+                        computed.grid_normal_alignment_as_start(style);
+                    }
                     items.push(Item {
                         node,
                         style: computed,
@@ -22078,6 +22312,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             items
                 .try_reserve(1)
                 .map_err(|_| LayoutError::CommandLimit)?;
+            if computed.aspect_ratio.is_some() {
+                computed.grid_normal_alignment_as_start(style);
+            }
             items.push(Item {
                 node: child.origin,
                 style: computed,
@@ -22124,10 +22361,31 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     this.flex_intrinsic_size(item.node, &sizing_style, item.anonymous_text.as_ref(), depth + 1, true)?,
                 )
             };
+            let mut minimum = minimum;
+            if item.generated.is_none()
+                && item.anonymous_text.is_none()
+                && this.is_sized_replaced_element(item.node)
+            {
+                if item.style.has_width_percentage() || item.style.has_max_width_percentage() {
+                    minimum.0 = minimum.0.min(box_edges(&sizing_style, true));
+                }
+                if item.style.has_height_percentage() || item.style.has_max_height_percentage() {
+                    minimum.1 = minimum.1.min(box_edges(&sizing_style, false));
+                }
+            }
             item.natural = axes.logical(natural);
             item.minimum = axes.logical(minimum);
             item.measured = true;
             Ok(())
+        };
+        let measured_edges = |this: &Self, item: &Item, horizontal: bool| -> f32 {
+            box_edges(
+                &item.style.resolve_grid_intrinsic_percentages(
+                    physical_width,
+                    style.height.or(this.parent_height),
+                ),
+                horizontal,
+            )
         };
         if style.grid_lanes {
             for item in &mut items {
@@ -22377,7 +22635,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         span,
                         min_content: (if row { item.minimum.1 } else { item.minimum.0 }).max(0.0),
                         max_content: (if row { item.natural.1 } else { item.natural.0 }).max(0.0),
-                        automatic_minimum: Some(grid_automatic_minimum(
+                        automatic_minimum: grid_item_automatic_minimum(&item.style, lane_horizontal, grid_automatic_minimum(
                             if row { item.minimum.1 } else { item.minimum.0 },
                             box_edges(&item.style, lane_horizontal),
                             0.0, automatic_clamp(&item.style, lane_horizontal, fixed_grid_maximum_range(
@@ -22957,7 +23215,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         span: item.cols,
                         min_content: minimum + shim,
                         max_content: natural + shim,
-                        automatic_minimum: Some(grid_automatic_minimum(
+                        automatic_minimum: grid_item_automatic_minimum(&item.style, lane_horizontal, grid_automatic_minimum(
                             minimum + shim,
                             box_edges(&item.style, lane_horizontal),
                             shim, automatic_clamp(&item.style, lane_horizontal, fixed_grid_maximum_range(
@@ -23000,7 +23258,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                                 .max(0.0),
                             max_content: (if row { item.natural.1 } else { item.natural.0 })
                                 .max(0.0),
-                            automatic_minimum: Some(grid_automatic_minimum(
+                            automatic_minimum: grid_item_automatic_minimum(&item.style, lane_horizontal, grid_automatic_minimum(
                                 if row { item.minimum.1 } else { item.minimum.0 },
                                 box_edges(&item.style, lane_horizontal),
                                 0.0, automatic_clamp(&item.style, lane_horizontal, fixed_grid_maximum_range(
@@ -23375,7 +23633,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         span: item.cols,
                         min_content: item.minimum.0,
                         max_content: item.natural.0,
-                        automatic_minimum: Some(grid_automatic_minimum(
+                        automatic_minimum: grid_item_automatic_minimum(&item.style, !axes.vertical, grid_automatic_minimum(
                             item.minimum.0,
                             box_edges(&item.style, !axes.vertical),
                             0.0, automatic_clamp(&item.style, !axes.vertical, fixed_grid_maximum_range(
@@ -23412,7 +23670,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         span: item.rows,
                         min_content: item.minimum.1,
                         max_content: item.natural.1,
-                        automatic_minimum: Some(grid_automatic_minimum(
+                        automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
                             item.minimum.1,
                             box_edges(&item.style, axes.vertical),
                             0.0, automatic_clamp(&item.style, axes.vertical, fixed_grid_maximum_range(
@@ -23550,9 +23808,13 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             // laying out descendants. Stretching only the outer background
             // afterward leaves nested flex/grid contents with an indefinite
             // zero height even when the row is explicitly sized.
+            let intrinsic_rows = row_definitions[item.row..item.row + item.rows].iter().any(|track| {
+                !matches!(track, GridTrack::Pixels(_) | GridTrack::Fraction(_) | GridTrack::Percentage(_) | GridTrack::Length(..))
+            });
             if definite_area
                 && !axes.vertical
                 && computed.height.is_none()
+                && (!intrinsic_rows || definite_height.is_some())
                 && computed.height_intrinsic.is_none()
                 && computed.align_self.unwrap_or(style.align_items) == AlignItems::Stretch
                 && !computed.margin_auto[0]
@@ -23560,7 +23822,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             {
                 computed.height = Some(specified_height(
                     &computed,
-                    (area_height - box_edges(&computed, false)).max(0.0),
+                    constrained_height(&computed, (area_height - box_edges(&computed, false)).max(0.0)),
                 ));
             }
             if computed.grid_columns_subgrid || computed.grid_rows_subgrid {
@@ -23622,11 +23884,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             computed.blockify_display();
             let resolved_alignment = computed.self_alignment(style, true);
-            let alignment = resolved_alignment.alignment;
+            let automatic_inline_margin = axes.automatic_margin(&computed, true);
+            let automatic_block_margin = axes.automatic_margin(&computed, false);
+            let stretches = |alignment: AlignItems, automatic_margin: bool| {
+                if automatic_margin { AlignItems::Start } else { alignment }
+            };
+            let alignment = stretches(resolved_alignment.alignment, automatic_inline_margin);
             let sizes_from_content = if axes.vertical {
                 (computed.height.is_none() && alignment != AlignItems::Stretch)
                     || (computed.width.is_none()
-                        && computed.self_alignment(style, false).alignment != AlignItems::Stretch)
+                        && stretches(computed.self_alignment(style, false).alignment, automatic_block_margin) != AlignItems::Stretch)
             } else {
                 computed.width.is_none() && alignment != AlignItems::Stretch
             };
@@ -23643,7 +23910,13 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         ((if alignment == AlignItems::Stretch {
                             cw
                         } else {
-                            item.natural.0.min(cw).max(item.minimum.0)
+                            grid_fit_extent(
+                                item.natural.0,
+                                item.minimum.0,
+                                cw,
+                                measured_edges(self, item, false),
+                                box_edges(&computed, false),
+                            )
                         }) - box_edges(&computed, false))
                         .max(0.0),
                     )));
@@ -23652,19 +23925,23 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     let block_alignment = computed.self_alignment(style, false);
                     computed.width = Some(specified_dimension(
                         &computed,
-                        ((if block_alignment.alignment == AlignItems::Stretch {
+                        ((if stretches(block_alignment.alignment, automatic_block_margin) == AlignItems::Stretch {
                             area_height
                         } else {
-                            item.natural.1.min(area_height).max(item.minimum.1)
+                            grid_fit_extent(
+                                item.natural.1,
+                                item.minimum.1,
+                                area_height,
+                                measured_edges(self, item, true),
+                                box_edges(&computed, true),
+                            )
                         }) - box_edges(&computed, true))
                         .max(0.0),
                     ));
                 }
                 let free = cw
                     - content_height_dimension(&computed, computed.height.unwrap_or(0.0))
-                    - box_edges(&computed, false)
-                    - computed.margin_sides[0]
-                    - computed.margin_sides[2];
+                    - box_edges(&computed, false);
                 let offset = if computed.margin_auto[0] {
                     if computed.margin_auto[2] {
                         free.max(0.0) * 0.5
@@ -23686,7 +23963,13 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         ((if alignment == AlignItems::Stretch {
                             cw
                         } else {
-                            item.natural.0.min(cw).max(item.minimum.0)
+                            grid_fit_extent(
+                                item.natural.0,
+                                item.minimum.0,
+                                cw,
+                                measured_edges(self, item, true),
+                                box_edges(&computed, true),
+                            )
                         }) - box_edges(&computed, true))
                         .max(0.0),
                     )));
@@ -23713,10 +23996,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let painted_width = computed
                 .width
                 .map(|value| {
-                    content_dimension(&computed, value)
-                        + box_edges(&computed, true)
-                        + computed.margin_sides[1]
-                        + computed.margin_sides[3]
+                    content_dimension(&computed, value) + box_edges(&computed, true)
                 })
                 .unwrap_or(paint_width);
             item.commands.start = self.commands.len();
@@ -23892,7 +24172,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     span: item.cols,
                     min_content: item.minimum.0 + shim,
                     max_content: item.natural.0 + shim,
-                    automatic_minimum: Some(grid_automatic_minimum(
+                    automatic_minimum: grid_item_automatic_minimum(&item.style, !axes.vertical, grid_automatic_minimum(
                         item.minimum.0 + shim,
                         box_edges(&item.style, !axes.vertical),
                         shim, automatic_clamp(&item.style, !axes.vertical, fixed_grid_maximum_range(
@@ -23965,6 +24245,18 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             baseline_descent[group][anchor] =
                 baseline_descent[group][anchor].max(item.natural.1 - baseline);
         }
+        // Block-axis min-content equals the height at the final inline size
+        // for items whose block axis is the grid's; orthogonal items and
+        // percentage-height items keep their measured minimum.
+        let block_minimum = |item: &Item| -> f32 {
+            let parallel = (item.style.writing_mode == css::WritingMode::HorizontalTb)
+                == (style.writing_mode == css::WritingMode::HorizontalTb);
+            if !axes.vertical && parallel && !item.style.has_cyclic_size_percentage(false) {
+                item.natural.1
+            } else {
+                item.minimum.1
+            }
+        };
         let baseline_contributions = items.iter().filter_map(|item| {
             let (group, _) = baseline_participation(
                 &item.style,
@@ -24003,10 +24295,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             Some(GridTrackContribution {
                 start: item.row,
                 span: item.rows,
-                min_content: item.minimum.1 + shim,
+                min_content: block_minimum(item) + shim,
                 max_content: item.natural.1 + shim,
-                automatic_minimum: Some(grid_automatic_minimum(
-                    item.minimum.1 + shim,
+                automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
+                    block_minimum(item) + shim,
                     box_edges(&item.style, axes.vertical),
                     shim, automatic_clamp(&item.style, axes.vertical, fixed_grid_maximum_range(
                         &row_definitions,
@@ -24024,10 +24316,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .map(|item| GridTrackContribution {
                     start: item.row,
                     span: item.rows,
-                    min_content: item.minimum.1,
+                    min_content: block_minimum(item),
                     max_content: item.natural.1,
-                    automatic_minimum: Some(grid_automatic_minimum(
-                        item.minimum.1,
+                    automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
+                        block_minimum(item),
                         box_edges(&item.style, axes.vertical),
                         0.0, automatic_clamp(&item.style, axes.vertical, fixed_grid_maximum_range(
                             &row_definitions,
@@ -24198,8 +24490,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 && !item.style.margin_auto[0]
                 && !item.style.margin_auto[2]
             {
-                let height =
+                let stretched =
                     (ch - item.style.margin_sides[0] - item.style.margin_sides[2]).max(0.0);
+                let vertical_insets = {
+                    let insets = used_box_insets(&item.style);
+                    insets[0] + insets[2]
+                };
+                let height = constrained_height(&item.style, (stretched - vertical_insets).max(0.0))
+                    + vertical_insets;
                 let paints = if has_background(&item.style) {
                     background_paints(&item.style)
                 } else {
@@ -24431,32 +24729,60 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 FlowBaselines::include(&mut self.flow_baselines, baselines.translated(dx, dy));
             }
         }
-        for (node, child_style, column, row_placement) in positioned {
-            let column_range = positioned_grid_track_range(column, columns);
-            let row_range = positioned_grid_track_range(row_placement, rows);
-            let area = if column_range.is_some() || row_range.is_some() {
-                let (column_start, column_span) = column_range.unwrap_or((0, columns));
-                let (row_start, row_span) = row_range.unwrap_or((0, rows));
-                let inline_start = column_offset
-                    + widths[..column_start].iter().sum::<f32>()
-                    + (column_gap + column_extra) * column_start as f32;
-                let inline_size = widths[column_start..column_start + column_span]
-                    .iter()
-                    .sum::<f32>()
-                    + (column_gap + column_extra) * column_span.saturating_sub(1) as f32;
-                let block_start = row_offset
-                    + heights[..row_start].iter().sum::<f32>()
-                    + (placement_row_gap + row_extra) * row_start as f32;
-                let block_size = heights[row_start..row_start + row_span]
-                    .iter()
-                    .sum::<f32>()
-                    + (placement_row_gap + row_extra) * row_span.saturating_sub(1) as f32;
+        for (node, child_style, _, _) in positioned {
+            let areas = style.grid_areas.as_deref().unwrap_or(&[]);
+            let column_lines = css::absolute_grid_lines(
+                child_style.grid_column,
+                child_style.grid_column_spec.as_deref(),
+                &column_names_storage,
+                explicit_column_count,
+                areas,
+                true,
+                columns,
+            );
+            let row_lines = css::absolute_grid_lines(
+                child_style.grid_row,
+                child_style.grid_row_spec.as_deref(),
+                &row_names_storage,
+                explicit_row_count,
+                areas,
+                false,
+                rows,
+            );
+            let placed = |placement: css::GridPlacement, spec: Option<&str>| {
+                placement.start.is_some() || placement.span != 1 || spec.is_some_and(|spec| spec.trim() != "auto")
+            };
+            let area = if !column_lines.is_auto()
+                || !row_lines.is_auto()
+                || placed(child_style.grid_column, child_style.grid_column_spec.as_deref())
+                || placed(child_style.grid_row, child_style.grid_row_spec.as_deref())
+            {
+                let block_area = definite_height.or(percent_intrinsic).unwrap_or(used_height);
+                let paddings = style.padding_sides();
+                let sides = style.logical_sides();
+                let (inline_start, inline_size) = positioned_grid_axis_area(
+                    column_lines,
+                    &widths[..columns],
+                    column_gap + column_extra,
+                    column_offset,
+                    column_area,
+                    paddings[sides[0]],
+                    paddings[sides[1]],
+                );
+                let (block_start, block_size) = positioned_grid_axis_area(
+                    row_lines,
+                    &heights[..rows],
+                    placement_row_gap + row_extra,
+                    row_offset,
+                    block_area,
+                    paddings[sides[2]],
+                    paddings[sides[3]],
+                );
                 let inline_start = if axes.reverse_inline {
                     column_area - inline_start - inline_size
                 } else {
                     inline_start
                 };
-                let block_area = definite_height.or(percent_intrinsic).unwrap_or(used_height);
                 let block_start = if axes.reverse_block {
                     block_area - block_start - block_size
                 } else {
@@ -24483,14 +24809,62 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let Some((area,area_local)) = area else {
                 let child_position = child_style.position;
                 let child_z_index = child_style.z_index;
+                let block_area = definite_height.or(percent_intrinsic).unwrap_or(used_height);
+                let inline_alignment = child_style.self_alignment(style, true);
+                let block_alignment = child_style.self_alignment(style, false);
+                let aligns = |free: f32| {
+                    (
+                        inline_alignment.offset(free, style, &child_style, !axes.vertical, false),
+                        block_alignment.offset(free, style, &child_style, axes.vertical, false),
+                    )
+                };
+                let (static_dx, static_dy) = if aligns(1.0) == (0.0, 0.0) && aligns(-1.0) == (0.0, 0.0) {
+                    (0.0, 0.0)
+                } else {
+                    let paddings = style.padding_sides();
+                    let (containing_width, containing_height) = axes.physical((column_area, block_area));
+                    let sized = self.resolve_style_percentages(
+                        &child_style,
+                        containing_width + paddings[1] + paddings[3],
+                        Some(containing_height + paddings[0] + paddings[2]),
+                    );
+                    let (outer_width, outer_height) =
+                        self.flex_intrinsic_size(node, &sized, None, depth + 1, false)?;
+                    let (outer_inline, outer_block) = axes.logical((outer_width, outer_height));
+                    let inline_offset = inline_alignment.offset(
+                        column_area - outer_inline,
+                        style,
+                        &child_style,
+                        !axes.vertical,
+                        false,
+                    );
+                    let block_offset = block_alignment.offset(
+                        block_area - outer_block,
+                        style,
+                        &child_style,
+                        axes.vertical,
+                        false,
+                    );
+                    if axes.vertical {
+                        (block_offset, inline_offset)
+                    } else {
+                        (inline_offset, block_offset)
+                    }
+                };
+                if static_dx != 0.0 || static_dy != 0.0 {
+                    let local = self.content_overflow_origin(x, y);
+                    self.pending_overflow_moves = true;
+                    self.pending_overflow_placement =
+                        Some((local.0 + f64::from(static_dx), local.1 + f64::from(static_dy)));
+                }
                 let command_start = self.commands.len();
                 let hit_start = self.geometry.as_ref().map_or(0, |g| g.hits.len());
                 self.box_for(
                     node,
                     style,
                     Some(child_style),
-                    x,
-                    y,
+                    x + static_dx,
+                    y + static_dy,
                     physical_width,
                     depth + 1,
                 )?;
@@ -24534,8 +24908,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             )?;
         }
         Ok(axes.physical((
-            widths[..columns].iter().sum::<f32>() + column_gap * columns.saturating_sub(1) as f32,
-            percent_intrinsic.unwrap_or(heights[..rows].iter().sum::<f32>() + row_gap * rows.saturating_sub(1) as f32),
+            widths[..retained_columns].iter().sum::<f32>() + column_gap * retained_columns.saturating_sub(1) as f32,
+            percent_intrinsic.unwrap_or(heights[..retained_rows].iter().sum::<f32>() + row_gap * retained_rows.saturating_sub(1) as f32),
         )))
     }
 
@@ -24760,6 +25134,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             style: item_style,
             main,
             min_main,
+            shrink_base: (main - edges).max(0.0),
             source_order,
             cross: if row { natural.1 } else { natural.0 },
             edges,
@@ -24885,6 +25260,18 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         source_order: &mut usize,
         depth: usize,
     ) -> Result<(), LayoutError> {
+        let cross_auto_margin = if row {
+            item_style.margin_auto[0] || item_style.margin_auto[2]
+        } else {
+            item_style.margin_auto[1] || item_style.margin_auto[3]
+        };
+        if !cross_auto_margin
+            && container_style.flex_wrap
+            && !matches!(item_style.position, Position::Absolute | Position::Fixed)
+            && item_style.self_alignment(container_style, false).alignment == AlignItems::Stretch
+        {
+            item_style.defer_stretch_keywords(!row);
+        }
         for horizontal in [true, false] {
             resolve_intrinsic_axis_with(
                 &mut item_style,
@@ -25043,6 +25430,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             style: item_style,
             main,
             min_main,
+            shrink_base: (main - edges).max(0.0),
             source_order: *source_order,
             cross: if row { h } else { w },
             edges,
@@ -25210,6 +25598,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
             let mut item_style = computed_style.unwrap_or(parent_style);
+            let percent_basis = item_style.flex_basis_is_percentage();
             let basis = item_style.resolve_flex_basis_percentage(if row {
                 Some(width)
             } else {
@@ -25217,6 +25606,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             });
             item_style = self.resolve_style_percentages(&item_style, width, self.parent_height);
             item_style.flex_basis = basis;
+            if basis.is_none() && percent_basis {
+                item_style.flex_basis_content = true;
+            }
             if !matches!(
                 kind,
                 NodeKind::Element { .. }
@@ -25252,6 +25644,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             style
                 .height
+                .or(style.max_height)
                 .map(|height| content_height_dimension(style, height))
         };
         let mut line_start = 0;
@@ -25316,7 +25709,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 style
                     .height
                     .map(|height| content_height_dimension(style, height))
-                    .unwrap_or(basis + gaps)
+                    .unwrap_or_else(|| if style.has_min_height_percentage() { basis + gaps } else { constrained_height(style, basis + gaps) })
             };
             // honey: at most one freezing pass per item; optimize if very large flex lines recur.
             loop {
@@ -25328,7 +25721,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         if free >= 0.0 {
                             item.style.flex_grow
                         } else {
-                            item.style.flex_shrink * item.main
+                            item.style.flex_shrink * item.shrink_base
                         }
                     })
                     .sum();
@@ -25343,7 +25736,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     let weight = if free >= 0.0 {
                         item.style.flex_grow
                     } else {
-                        item.style.flex_shrink * item.main
+                        item.style.flex_shrink * item.shrink_base
                     };
                     let proposed = (item.main
                         + free * weight / if free >= 0.0 { factor.max(1.0) } else { factor })
@@ -27106,6 +27499,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             float_start,
             depth + 1,
         )?;
+        let advance = if clearance.is_some() && self.was_through.take().is_some() {
+            self.collapsed_top.map_or(margin_top, MarginStrut::value)
+                + self.collapsed_bottom.map_or(margin_bottom, MarginStrut::value)
+        } else { advance };
         let actual_top = self.collapsed_top.unwrap_or(MarginStrut::new(margin_top));
         let correction = if preceding_margin != MarginStrut::default() {
             preceding_margin.merge(actual_top).value() - preceding_margin.value() - actual_top.value()
@@ -27258,7 +27655,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         // its graphics descendants do not enter CSS inline position layout.
         if is_svg_root_element(kind){return Ok(false);}
         if crate::control_appearance::presentation(self.document,node,&style).is_some_and(|control|control.replaced){return Ok(false);}
-        let mut children=self.document.composed_children_iter(node).map_err(|_|LayoutError::InvalidTree)?;
+        let mut children=self.document.rendered_children_iter(node).map_err(|_|LayoutError::InvalidTree)?;
         while let Some(child)=children.next().map_err(|_|LayoutError::InvalidTree)? {
             if self.paragraph_filter_has_positioned_source(child,&style,None,available,depth+1)? {return Ok(true);}
         }
@@ -28960,6 +29357,25 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             .map(|token|token.width).sum())
     }
 
+    fn record_used_insets(&mut self, node: NodeId, insets: [Option<f32>; 4]) -> Result<(), LayoutError> {
+        let Some(geometry) = self.geometry.as_deref_mut() else {
+            return Ok(());
+        };
+        let insets = insets.map(|inset| inset.unwrap_or(f32::NAN));
+        if let Some(&index) = geometry.used_margin_index.get(&node.key()) {
+            let existing = geometry.used_margins.get_mut(index).filter(|existing| existing.node == node).ok_or(LayoutError::InvalidTree)?;
+            existing.insets = insets;
+            return Ok(());
+        }
+        if geometry.used_margins.len() >= MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        geometry.used_margins.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+        geometry.used_margin_index.insert(node.key(), geometry.used_margins.len());
+        geometry.used_margins.push(UsedMargins { node, sides: [0.0; 4], has_margins: false, insets });
+        Ok(())
+    }
+
     fn record_used_margins(
         &mut self,
         node: NodeId,
@@ -28983,6 +29399,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                 return Err(LayoutError::InvalidTree);
             }
             existing.sides = style.margin_sides;
+            existing.has_margins = true;
             return Ok(());
         }
         if geometry.used_margins.len() >= MAX_DISPLAY_COMMANDS {
@@ -28996,6 +29413,8 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         geometry.used_margins.push(UsedMargins {
             node,
             sides: style.margin_sides,
+            has_margins: true,
+            insets: [f32::NAN; 4],
         });
         geometry.used_margin_index.insert(node.key(), index);
         Ok(())
@@ -29069,11 +29488,24 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         })
     }
 
+    /// The UA clips input boxes with `overflow: clip`; their baseline must not follow
+    /// placeholder lines, so they keep the scroll container rule.
+    fn baseline_overflow(&self, node: NodeId, overflow: css::Overflow) -> css::Overflow {
+        let input = overflow == css::Overflow::Clip
+            && matches!(self.document.kind(node), Ok(NodeKind::Element { name, namespace: Namespace::Html, .. })
+                if crate::svg::local_name(name) == "input");
+        if input { css::Overflow::Hidden } else { overflow }
+    }
+
     /// CSS 2.1 §10.8.1: a non-replaced atomic inline exports its line
     /// baseline, or the bottom margin edge when no applicable line exists.
     fn atomic_inline_baseline(display: Display, overflow_y: css::Overflow,
-        measured: Option<FlowBaselines>, origin: f32, height: f32) -> f32 {
-        if display == Display::InlineBlock && overflow_y != css::Overflow::Visible {
+        measured: Option<FlowBaselines>, origin: f32, height: f32, source: Option<&str>) -> f32 {
+        if let (Some(source @ ("first" | "last")), Some(baseline)) = (source, measured) {
+            return (if source == "first" { baseline.first } else { baseline.last }) - origin;
+        }
+        // Only scroll containers take their bottom margin edge as baseline; `clip` does not.
+        if display == Display::InlineBlock && !matches!(overflow_y, css::Overflow::Visible | css::Overflow::Clip) {
             height
         } else {
             measured.map_or(height, |baseline| {
@@ -31885,7 +32317,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 token.baseline_offset = if replaced {
                                     self.replaced_inline_baseline(block_style, actual_height)
                                 } else {
-                                    Self::atomic_inline_baseline(atom.style.display, atom.style.overflow_y, measured, *cursor, actual_height)
+                                    Self::atomic_inline_baseline(atom.style.display, self.baseline_overflow(atom.node, atom.style.overflow_y), measured, *cursor, actual_height, css::extra_props::keyword(&atom.style, "baseline-source"))
                                 };
                             }
                             token.actual_height = actual_height;
@@ -32518,7 +32950,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
             return 0.0;
         }
         let free = available - used;
-        let right = match style.text_align {
+        let right = match style.text_align.line_alignment() {
             TextAlign::Right => true,
             TextAlign::Start => style.used_direction() == Direction::Rtl,
             TextAlign::End => style.used_direction() == Direction::Ltr,
@@ -32527,7 +32959,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
         };
         if right {
             free
-        } else if style.text_align == TextAlign::Center {
+        } else if style.text_align.line_alignment() == TextAlign::Center {
             free * 0.5
         } else {
             0.0
@@ -33744,7 +34176,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // Right/start and centered alignment retain negative free space: an
         // overflowing line still aligns its end or center with the line box.
         let free = available.min(first.available) - used;
-        let right = match style.text_align {
+        let right = match style.text_align.line_alignment() {
             TextAlign::Right => true,
             TextAlign::Start => style.used_direction() == Direction::Rtl,
             TextAlign::End => style.used_direction() == Direction::Ltr,
@@ -33753,7 +34185,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let offset = if right {
             free
-        } else if style.text_align == TextAlign::Center {
+        } else if style.text_align.line_alignment() == TextAlign::Center {
             free * 0.5
         } else {
             0.0
@@ -34102,13 +34534,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let resolved_width = style.width.map(|value| {
                 constrained_width(style, content_dimension(style, value)) + box_edges(style, true)
             });
-            let baseline_style = (style.display, style.overflow_y);
+            let baseline_style = (style.display, self.baseline_overflow(id, style.overflow_y), css::extra_props::keyword(style, "baseline-source").map(String::from));
             let previous_baselines = self.flow_baselines.take();
             let result = self.box_for(id, parent_style, computed, x, y, available, depth);
             let measured = self.flow_baselines.take();
             self.flow_baselines = previous_baselines;
             let height = result?;
-            self.record_flow_baseline(y + Self::atomic_inline_baseline(baseline_style.0, baseline_style.1, measured, y, height));
+            self.record_flow_baseline(y + Self::atomic_inline_baseline(baseline_style.0, baseline_style.1, measured, y, height, baseline_style.2.as_deref()));
             // The margin-box advance belongs to the resolved box, even when
             // that box has no background, border, or retained hit geometry.
             let width = resolved_width
@@ -34475,7 +34907,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         let mut children = self
             .document
-            .composed_children_iter(id)
+            .rendered_children_iter(id)
             .map_err(|_| LayoutError::InvalidTree)?;
         while let Some(current) = children.next().map_err(|_| LayoutError::InvalidTree)? {
             self.pending_overflow_moves=true;self.pending_overflow_placement=Some((inline_origin.0+f64::from(margin_left)+f64::from(inset_left)+f64::from(advance),inline_origin.1));
@@ -34891,7 +35323,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     ) -> Result<(), LayoutError> {
         let mut children = self
             .document
-            .composed_children_iter(id)
+            .rendered_children_iter(id)
             .map_err(|_| LayoutError::InvalidTree)?;
         while let Some(current) = children.next().map_err(|_| LayoutError::InvalidTree)? {
             if !matches!(
@@ -35296,12 +35728,12 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 *order+=1;Ok(())
             };
             visit(root,false,&mut order)?;
-            walk.push((root,self.document.composed_children_iter(root).map_err(|_|LayoutError::InvalidTree)?));
+            walk.push((root,self.document.rendered_children_iter(root).map_err(|_|LayoutError::InvalidTree)?));
             while let Some((node,children))=walk.last_mut() {
                 if let Some(child)=children.next().map_err(|_|LayoutError::InvalidTree)? {
                     if walk.len()>=512 {return Err(LayoutError::DepthLimit);}
                     visit(child,false,&mut order)?;
-                    walk.push((child,self.document.composed_children_iter(child).map_err(|_|LayoutError::InvalidTree)?));
+                    walk.push((child,self.document.rendered_children_iter(child).map_err(|_|LayoutError::InvalidTree)?));
                 } else {let node=*node;walk.pop();visit(node,true,&mut order)?;}
             }
             self.negative_source_order=Some(ranks);
@@ -35656,7 +36088,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 if existing.node != used.node {
                     return Err(LayoutError::InvalidTree);
                 }
-                existing.sides = used.sides;
+                if used.has_margins {
+                    existing.sides = used.sides;
+                    existing.has_margins = true;
+                }
+                if used.insets.iter().any(|inset| !inset.is_nan()) {
+                    existing.insets = used.insets;
+                }
             } else {
                 if geometry.used_margins.len() >= MAX_DISPLAY_COMMANDS {
                     return Err(LayoutError::CommandLimit);
@@ -35772,7 +36210,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         self.collapsed_top = fragment.collapsed_top;
         self.collapsed_bottom = fragment.collapsed_bottom;
         self.was_through = fragment.was_through;
-        self.include_local_overflow(fragment.overflow.parent,placement,OverflowRoute::Parent,hit_base..hit_end,movable)?;
+        self.include_local_overflow_with_margin(fragment.overflow.parent,fragment.overflow.margin,placement,OverflowRoute::Parent,hit_base..hit_end,movable)?;
         Ok(())
     }
 
@@ -36376,6 +36814,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         child_override: Option<BoxChildOverride>,
         output_rect: Option<&mut Rect>,
     ) -> Result<f32, LayoutError> {
+        let mut anchored_insets = None;
         let computed = self
             .opacity_style(id, parent_style, computed)?
             .map(|style| {
@@ -36386,13 +36825,18 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 } else {
                     None
                 };
+                let original = style.anchored.is_some().then(|| style.clone());
                 let style = self.resolve_anchored_style(id, style, containing);
+                anchored_insets = original.and_then(|original| anchor_layout::changed_insets(&original, &style));
                 self.resolve_style_percentages(
                     &style,
                     containing.map_or(available, |rect| rect.width),
                     containing.map_or(self.parent_height, |rect| Some(rect.height)),
                 )
             });
+        if let Some(insets) = anchored_insets {
+            self.record_used_insets(id, insets)?;
+        }
         let placement=self.pending_overflow_placement.take().unwrap_or_else(||self.overflow_placement(x,y));
         let retain_to_parent=core::mem::take(&mut self.pending_overflow_moves);
         let key = if computed.as_ref().is_some_and(|style|style.transform_timeline_source().is_some()) || child_override.is_some() || self.table_cell_projection.is_some_and(|(node, level, _)| node == id && level == depth) {
@@ -36800,12 +37244,21 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 id,
                 style,
                 if positioned {
-                    basis.width - style.left.unwrap_or(0.0) - style.right.unwrap_or(0.0)
+                    let static_start = if style.left.is_none() && style.right.is_none()
+                        && parent_style.display != Display::Grid
+                        && parent_style.used_direction() == Direction::Ltr {
+                        (x - basis.x).max(0.0)
+                    } else { 0.0 };
+                    basis.width - style.left.unwrap_or(static_start) - style.right.unwrap_or(0.0)
                 } else {
                     basis.width
                 },
                 if positioned {
-                    Some(basis.height - style.top.unwrap_or(0.0) - style.bottom.unwrap_or(0.0))
+                    let static_start = if style.top.is_none() && style.bottom.is_none()
+                        && parent_style.display != Display::Grid {
+                        (y - basis.y).max(0.0)
+                    } else { 0.0 };
+                    Some(basis.height - style.top.unwrap_or(static_start) - style.bottom.unwrap_or(0.0))
                 } else {
                     saved_height
                 },
@@ -37014,15 +37467,17 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     let horizontal = style.self_alignment(container, !container_vertical);
                     let vertical = style.self_alignment(container, container_vertical);
                     let grid_area = parent_style.display == Display::Grid && container.display == Display::Grid;
-                    if (grid_area || style.left.is_some() && style.right.is_some()) && horizontal.alignment != AlignItems::Stretch
+                    if (grid_area && style.left.is_some() == style.right.is_some() || style.left.is_some() && style.right.is_some()) && horizontal.alignment != AlignItems::Stretch
                         && !style.margin_auto[1] && !style.margin_auto[3] && !style.display.is_table() {
                         aligned_x = Some(horizontal);
                     }
-                    if (grid_area || style.top.is_some() && style.bottom.is_some()) && vertical.alignment != AlignItems::Stretch
+                    if (grid_area && style.top.is_some() == style.bottom.is_some() || style.top.is_some() && style.bottom.is_some()) && vertical.alignment != AlignItems::Stretch
                         && !style.margin_auto[0] && !style.margin_auto[2] && !style.display.is_table() {
                         aligned_y = Some(vertical);
                     }
                 }
+                let had_definite_width = style.width.is_some();
+                let had_definite_height = style.height.is_some();
                 if style.width.is_none() {
                     let table_fit = style.display.is_table()
                         && !(style.justify_self == Some(AlignItems::Stretch)
@@ -37031,7 +37486,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     if aligned_x.is_some() {
                         let left = style.left.unwrap_or(0.0);
                         let right = style.right.unwrap_or(0.0);
-                        let room = (containing.width - left - right - style.margin_sides[1] - style.margin_sides[3]).max(0.0);
+                        let room = (containing.width - left - right).max(0.0);
                         let (maximum, _) = self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?;
                         let fit = if maximum > room {
                             let (minimum, _) = self.box_source_intrinsic_size(id, style, depth + 1, true, generated)?;
@@ -37064,8 +37519,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 if style.height.is_none() && !table_block_fit {
                     if aligned_y.is_some() {
                         if style.writing_mode != css::WritingMode::HorizontalTb {
-                            let room = (containing.height - style.top.unwrap_or(0.0) - style.bottom.unwrap_or(0.0)
-                                - style.margin_sides[0] - style.margin_sides[2]).max(0.0);
+                            let room = (containing.height - style.top.unwrap_or(0.0) - style.bottom.unwrap_or(0.0)).max(0.0);
                             let (_, maximum) = self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?;
                             let fit = if maximum > room {
                                 let (_, minimum) = self.box_source_intrinsic_size(id, style, depth + 1, true, generated)?;
@@ -37079,6 +37533,39 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                             (containing.height - top - bottom - box_edges(style, false)).max(0.0),
                         ));
                     }
+                }
+                if style.margin_auto.iter().any(|auto| *auto) {
+                    let computed_margins = style.margin_sides;
+                    let rtl = style.used_direction() == Direction::Rtl;
+                    for horizontal in [true, false] {
+                        let (start, end) = if horizontal { (3, 1) } else { (0, 2) };
+                        let (inset_start, inset_end, size, extent, definite) = if horizontal {
+                            (style.left, style.right,
+                                style.width.map_or(0.0, |width| content_dimension(style, width) + box_edges(style, true)),
+                                containing.width, had_definite_width)
+                        } else {
+                            (style.top, style.bottom,
+                                style.height.map_or(0.0, |height| content_height_dimension(style, height) + box_edges(style, false)),
+                                containing.height, had_definite_height)
+                        };
+                        let (Some(inset_start), Some(inset_end)) = (inset_start, inset_end) else { continue };
+                        if !definite || !(style.margin_auto[start] || style.margin_auto[end]) {
+                            continue;
+                        }
+                        let fixed_start = if style.margin_auto[start] { 0.0 } else { style.margin_sides[start] };
+                        let fixed_end = if style.margin_auto[end] { 0.0 } else { style.margin_sides[end] };
+                        let free = extent - inset_start - inset_end - size - fixed_start - fixed_end;
+                        let (used_start, used_end) = match (style.margin_auto[start], style.margin_auto[end]) {
+                            (true, true) if free >= 0.0 => (free * 0.5, free * 0.5),
+                            (true, true) if horizontal && rtl => (free, 0.0),
+                            (true, true) => (0.0, free),
+                            (true, false) => (free, fixed_end),
+                            _ => (fixed_start, free),
+                        };
+                        style.margin_sides[start] = used_start;
+                        style.margin_sides[end] = used_end;
+                    }
+                    margin_solver_input = Some((computed_margins, true));
                 }
                 overflow_origin.0=style.left.map_or(0.0,|left|precise_containing.0+f64::from(left)-f64::from(containing_block_scroll.0));
                 overflow_origin.1=style.top.map_or(0.0,|top|precise_containing.1+f64::from(top)-f64::from(containing_block_scroll.1));
@@ -37491,11 +37978,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     frame.projection_clip=frame.border_box;
                 }
             }
-            let metrics = frame.metrics(overflow_transform);
+            let mut metrics = frame.metrics(overflow_transform);
+            if out_of_flow||!matches!(frame.route,OverflowRoute::Parent) {metrics.margin=None;}
             self.last_overflow_box=frame.border_box.map(|border|(border,frame.placement));
             Self::retire_overflow_tokens(&mut self.overflow_move_index,&frame);
             self.overflow_contribution_count=self.overflow_contribution_count.saturating_sub(frame.children.len());
-            self.include_local_overflow(metrics.parent,frame.placement,frame.route,first_hit..self.geometry.as_ref().map_or(first_hit,|geometry|geometry.hits.len()),frame.retain_to_parent)?;
+            self.include_local_overflow_with_margin(metrics.parent,metrics.margin,frame.placement,frame.route,first_hit..self.geometry.as_ref().map_or(first_hit,|geometry|geometry.hits.len()),frame.retain_to_parent)?;
             metrics
         } else {
             OverflowMetrics::default()
@@ -38099,6 +38587,11 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 width,
                 height: line_height,
             };
+            if !multiline && style.writing_mode == css::WritingMode::HorizontalTb {
+                let content_height = style.height.map_or(line_height, |height| content_height_dimension(style, height));
+                let text_top = top + ((content_height - line_height) * 0.5).max(0.0);
+                self.record_flow_baseline(text_top + self.baseline(style));
+            }
             if style.visibility_visible
                 && self.geometry.is_some()
                 && (self.source_capture_depth != 0 || self.transform_depth > 0 || line_rect.intersection(self.cull).is_some())
@@ -38329,7 +38822,18 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             if !(virtual_parent && uses_fieldset_layout(self.document, id, &style)) {
                 self.apply_widget_layout_style(id, &mut style);
             }
-            self.resolve_intrinsic_dimensions_for_box(id, &mut style, available, self.parent_height, depth, virtual_parent)?;
+            let collapsed = stretch_collapsed_margins(parent_style, &style);
+            if collapsed.is_empty() {
+                self.resolve_intrinsic_dimensions_for_box(id, &mut style, available, self.parent_height, depth, virtual_parent)?;
+            } else {
+                let margins = style.margin_sides;
+                for side in collapsed {
+                    style.margin_sides[side] = 0.0;
+                }
+                let resolved = self.resolve_intrinsic_dimensions_for_box(id, &mut style, available, self.parent_height, depth, virtual_parent);
+                style.margin_sides = margins;
+                resolved?;
+            }
         }
         let fieldset_origin = if is_fieldset {
             let mut source = style.clone();
@@ -38919,7 +39423,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             None
         };
         let (scroll_x, scroll_y) = scroll.map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
-        let clip_index = if clip_x || clip_y {
+        let legacy_clip = css::clip_rect::rect_offsets(&style).is_some();
+        let clip_index = if clip_x || clip_y || legacy_clip {
             let index = self.commands.len();
             if self.overflow_clip_commands.len()>=MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
             self.overflow_clip_commands.insert(index,box_source);
@@ -39320,7 +39825,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     let (auto_start,auto_end)=(legend_style.margin_auto[0],legend_style.margin_auto[2]);
                     let offset = if free >= 0.0 && (auto_start || auto_end) {
                         if auto_start {if auto_end {free * 0.5}else{free}}else{0.0}
-                    } else {legend_style.self_alignment(&fieldset.origin,true).offset(free,&fieldset.origin,&legend_style,false,false)};
+                    } else {fieldset_legend_alignment(&legend_style,&fieldset.origin).offset(free,&fieldset.origin,&legend_style,false,false)};
                     let used_top = legend_style.margin_sides[0] + offset;
                     let legend = Rect {
                         x: physical_borders[0] + inline_padding + used_top,
@@ -39351,7 +39856,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     let (auto_start, auto_end) = (legend_style.margin_auto[3], legend_style.margin_auto[1]);
                     let offset = if free >= 0.0 && (auto_start || auto_end) {
                         if auto_start { if auto_end { free * 0.5 } else { free } } else { 0.0 }
-                    } else { legend_style.self_alignment(&fieldset.origin, true)
+                    } else { fieldset_legend_alignment(&legend_style, &fieldset.origin)
                         .offset(free, &fieldset.origin, &legend_style, true, false) };
                     let computed_margins = legend_style.margin_sides;
                     let rect = Rect { x: content_x + inline_padding + legend_style.margin_sides[3] + offset,
@@ -40181,6 +40686,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.set_layout_cursor(&mut cursor,multicol_cursors[column],multicol_local_cursors[column]);
                 }
                 if non_block_since { previous_margin = MarginStrut::default(); }
+                let mut cleared = false;
                 let (margin, margin_bottom, through_candidate) = match &computed {
                     Some(child_style) => {
                         if child_style.clear != Clear::None {
@@ -40232,6 +40738,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                             } else {self.inflow_block_clearance(frame,float_start,
                                 child_style.clear,block,previous_margin,leading_margin)};
                             if let Some(next) = clearance {
+                                cleared = !vertical_block_flow;
                                 if vertical_block_flow {
                                     vertical_block_cursor = frame.physical(Rect { x:0.0, y:next, width:0.0, height:0.0 }).x;
                                 } else {let local=self.local_cursor(cursor)+f64::from(next)-f64::from(cursor);self.set_layout_cursor(&mut cursor,next,local);}
@@ -40375,6 +40882,26 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 let first_float = self.floats.len();
                 self.collapsed_top = None; self.was_through = None;
                 self.collapsed_bottom = None;
+                let mut orthogonal_natural = None;
+                if vertical_block_flow && multicol_column.is_none() && anonymous_table.is_none() {
+                    let flow_extent = constrained_height(&style, style
+                        .height
+                        .map(|height| content_height_dimension(&style, height))
+                        .or(self.parent_height)
+                        .unwrap_or(self.viewport_height()));
+                    if let Some(child) = computed.as_mut().filter(|child| {
+                        child.height.is_none()
+                            && child.writing_mode == css::WritingMode::HorizontalTb
+                            && child.float == Float::None
+                            && !matches!(child.position, Position::Absolute | Position::Fixed)
+                    }) {
+                        if explicit_stretch(child.self_alignment(&style, true)) {
+                            child.height = Some(specified_height(child, (flow_extent - box_edges(child, false)).max(0.0)));
+                        } else {
+                            orthogonal_natural = Some(self.intrinsic_size(current, child, depth + 1)?.1);
+                        }
+                    }
+                }
                 let child_inline_extent = computed.as_ref().map_or(0.0, |child| {
                     child.height.map_or(0.0, |height| {
                         content_height_dimension(child, height)
@@ -40382,9 +40909,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     }) + if child.height.is_none() { child.margin_sides[0] + child.margin_sides[2] } else { 0.0 }
                 });
                 if vertical_block_flow && multicol_column.is_none()
-                    && computed.as_ref().is_some_and(|child| child.height.is_some())
+                    && computed.as_ref().is_some_and(|child| child.height.is_some() || orthogonal_natural.is_some())
                 {
                     let child = computed.as_ref().unwrap();
+                    let child_inline_extent = orthogonal_natural.unwrap_or(child_inline_extent);
                     let flow_top = outer_y + border_top + padding_top + cell_content_y - scroll_y;
                     let flow_extent = constrained_height(&style, style
                         .height
@@ -40395,7 +40923,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         .offset(flow_extent - child_inline_extent, &style, child, false, false);
                     child_y = if GridAxes::new(&style).reverse_inline { flow_top + offset } else { child_y + offset };
                 }
-                let shares_child_margins = computed.as_ref().is_some_and(|child|
+                let shares_child_margins = !vertical_block_flow && computed.as_ref().is_some_and(|child|
                     matches!(child.display, Display::Block | Display::ListItem)
                         && !establishes_formatting_context(child, &style));
                 let local_child_x=if vertical_block_flow {
@@ -40412,6 +40940,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 } else {
                     self.box_for(current, &style, computed, child_x, child_y, child_width, depth + 1)?
                 };
+                // Clearance separates a box from the margins above it and from its own
+                // collapse-through chain, so an empty cleared box keeps its margins.
+                let advance = if cleared && self.was_through.take().is_some() {
+                    self.collapsed_top.map_or(margin, MarginStrut::value)
+                        + self.collapsed_bottom.map_or(margin_bottom, MarginStrut::value)
+                } else { advance };
                 let actual_top = if shares_child_margins { self.collapsed_top } else { None }
                     .unwrap_or(MarginStrut::new(margin));
                 let correction = if previous_margin != MarginStrut::default() {
@@ -40865,7 +41399,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         ) {
             // Block content alignment precedes donation to the parent baseline
             // group. Its fallback also applies when no sharing group exists.
-            let alignment = style.content_alignment(false);
+            let mut alignment = style.content_alignment(false);
+            alignment.safe = alignment.safe.or(Some(true));
             let horizontal = style.writing_mode != css::WritingMode::HorizontalTb;
             let free = if horizontal {
                 content_width - content_extent_width
@@ -41000,7 +41535,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 width: (box_width - border_left - border_right).max(0.0),
                 height: (box_height - border_top - border_bottom).max(0.0),
             };
-            let clip = overflow_clip_rect(padding, clip_x, clip_y);
+            let mut clip = overflow_clip_rect(padding, clip_x, clip_y);
+            if legacy_clip {
+                let border_box = Rect { x: outer_x, y: outer_y, width: box_width, height: box_height };
+                if let Some(legacy) = css::clip_rect::apply(&style, border_box, clip) {
+                    clip = legacy;
+                }
+            }
             let clip_radius = if clip_x && clip_y {
                 (style.border_radius - border_width).max(0.0)
             } else {
@@ -41140,8 +41681,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 height: content_height + padding_top + padding_bottom,
             }};
             frame.border_box=OverflowRect::new(frame.format_offset.0+f64::from(margin_left)+f64::from(hit_rect.x-outer_x),frame.format_offset.1+f64::from(margin_top)+f64::from(admitted_top)+f64::from(paint_shift)+f64::from(hit_rect.y-paint_y),hit_rect.width,hit_rect.height);
+            frame.margin_box=frame.border_box.map(|border|OverflowRect {left:border.left-f64::from(margin_left),top:border.top-f64::from(margin_top),right:border.right+f64::from(style.margin_sides[1]),bottom:border.bottom+f64::from(style.margin_sides[2])});
             let local_x=frame.format_offset.0+f64::from(margin_left)+f64::from(padding_box.x-outer_x);
             let local_y=frame.format_offset.1+f64::from(margin_top)+f64::from(admitted_top)+f64::from(padding_box.y-paint_y)+f64::from(paint_shift);
+            let item_overflow=frame.combined_extent();
             if let Some(rect)=OverflowRect::new(local_x,local_y,padding_box.width,padding_box.height){frame.set_padding_box(rect);}
                         // Flex's natural line measurements size auto boxes; final movable
             // child projections, not pre-alignment measurements, own overflow.
@@ -41149,10 +41692,28 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             // Overflowing content of a scroll container keeps its end padding
             // reachable (CSS Overflow 3 §2.2).
             let reverse=scroll_reverse(&style);
-            let end_x=if scroll_x_container&&!reverse.0&&!projected_column_box&&extent.0>content_width {padding_right}else{0.0};
-            let end_y=if scroll_y_container&&!reverse.1&&!projected_column_box&&extent.1>content_height {padding_bottom}else{0.0};
+            // Layout containment gives overflow:visible boxes the same scrollable overflow.
+            let (pads_x,pads_y)=(scroll_x_container||style.contain_layout,scroll_y_container||style.contain_layout);
+            let end_x=if pads_x&&!reverse.0&&!projected_column_box&&extent.0>content_width {padding_right}else{0.0};
+            let end_y=if pads_y&&!reverse.1&&!projected_column_box&&extent.1>content_height {padding_bottom}else{0.0};
             if let Some(rect)=OverflowRect::new(local_x+f64::from(padding_left),local_y+f64::from(padding_top),extent.0+end_x,extent.1+end_y){frame.include(rect);}
-
+            if style.display==Display::Flex && !projected_column_box && (pads_x||pads_y) {
+                if let Some(content)=OverflowRect::new(local_x+f64::from(padding_left),local_y+f64::from(padding_top),content_width,content_height) {
+                    if let Some(items)=frame.item_margin_extent().or(item_overflow) {
+                        let mut grown=items;
+                        let mut padded=false;
+                        if pads_x {
+                            if reverse.0 {if items.left<content.left-0.01 {grown.left=items.left-f64::from(padding_left);padded=true;}}
+                            else if items.right>content.right+0.01 {grown.right=items.right+f64::from(padding_right);padded=true;}
+                        }
+                        if pads_y {
+                            if reverse.1 {if items.top<content.top-0.01 {grown.top=items.top-f64::from(padding_top);padded=true;}}
+                            else if items.bottom>content.bottom+0.01 {grown.bottom=items.bottom+f64::from(padding_bottom);padded=true;}
+                        }
+                        if padded {frame.include(grown);}
+                    }
+                }
+            }
         }
         let content_command_end=self.commands.len();
         let projected_decoration=self.paint_column_block_decoration(box_source,&style,outer_x,box_width,
@@ -46635,7 +47196,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 .collect::<Vec<_>>()
         };
         assert_eq!(spanning("100px minmax(0,1fr)"), [(0.0, 400.0), (0.0, 500.0), (0.0, 100.0)]);
-        assert_eq!(spanning("100px 1fr"), [(0.0, 500.0), (0.0, 500.0), (0.0, 100.0)]);
+        assert_eq!(spanning("100px 1fr"), [(0.0, 400.0), (0.0, 500.0), (0.0, 100.0)]);
+        assert_eq!(spanning("100px auto"), [(0.0, 500.0), (0.0, 500.0), (0.0, 100.0)]);
     }
 
     #[test]
@@ -46767,8 +47329,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         let mut layout=Layout::new(&document,&text,&uses,&rules,None,Rect{x:0.0,y:0.0,width:100.0,height:100.0},None,&[],&cache,None);
         let rect=OverflowRect::new(1.0,2.0,10.0,20.0).unwrap();
         let mut frame=OverflowFrame::new(document.root(),false,false,(0.0,0.0),false,OverflowRoute::Root);
-        frame.children.push(OverflowContribution{rect,hits:1..3,key:(1,7),paint_owner:None});
-        frame.children.push(OverflowContribution{rect,hits:3..4,key:(3,8),paint_owner:None});
+        frame.children.push(OverflowContribution{rect,margin:None,hits:1..3,key:(1,7),paint_owner:None});
+        frame.children.push(OverflowContribution{rect,margin:None,hits:3..4,key:(3,8),paint_owner:None});
         layout.overflow_frames.push(frame);
         // Move the second half of the atomic contribution beyond its sibling.
         let map=PaintPermutation::new(5,5,&[2..3]).unwrap();

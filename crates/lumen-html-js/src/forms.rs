@@ -616,7 +616,17 @@ fn html_local_name<'a>(document: &'a lumen_html::Document, node: NodeId) -> Opti
 }
 
 fn is_input_state_attribute(name: &str) -> bool {
-    ["type", "min", "max", "step", "multiple", "value", "checked"]
+    [
+        "type",
+        "min",
+        "max",
+        "step",
+        "multiple",
+        "value",
+        "checked",
+        "colorspace",
+        "alpha",
+    ]
         .iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
@@ -688,6 +698,10 @@ pub fn set_control_value_from_user(
 }
 
 
+fn normalize_newlines(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn set_control_value_inner(
     realm: &DomRealm,
     state: &mut FormState,
@@ -754,18 +768,21 @@ fn set_control_value_inner(
         })
         .map_err(dom_error)?;
     } else if is_textarea {
+        let unchanged = control_value_with_state(realm, state, node)
+            .is_ok_and(|previous| normalize_newlines(&previous) == normalize_newlines(value));
         state.live_values.insert(node, value.to_owned());
         state.live_dirty.insert(node);
         state.dirty.insert(node);
         state.bump_validity_generation();
         if invalidate_editing {
             realm.invalidate_editing_for_value_change(node);
-            // The value setter moves the text entry cursor to the end.
-            let length = lumen_common::smuggle::utf16_unit_len(value);
-            realm
-                .selections
-                .borrow_mut()
-                .insert(node, (length, length, "none".into()));
+            if !unchanged {
+                let length = lumen_common::smuggle::utf16_unit_len(value);
+                realm
+                    .selections
+                    .borrow_mut()
+                    .insert(node, (length, length, "none".into()));
+            }
         }
         return Ok(());
     } else {
@@ -777,19 +794,37 @@ fn set_control_value_inner(
                     let kind = null_attribute(document, node, "type")
                         .unwrap_or("text")
                         .to_ascii_lowercase();
-                    let sanitized = core_forms::sanitize_input_value_with_attributes(
-                        &kind,
-                        value,
-                        null_attribute(document, node, "min"),
-                        null_attribute(document, node, "max"),
-                        null_attribute(document, node, "step"),
-                        null_attribute(document, node, "value"),
-                        has_null_attribute(document, node, "multiple"),
-                    );
+                    let sanitized = if kind == "color" {
+                        let (display_p3, alpha) = core_forms::color_input_options(
+                            null_attribute(document, node, "colorspace"),
+                            has_null_attribute(document, node, "alpha"),
+                        );
+                        lumen_html::css::color_input::sanitize_input_color(value, display_p3, alpha)
+                    } else {
+                        core_forms::sanitize_input_value_with_attributes(
+                            &kind,
+                            value,
+                            null_attribute(document, node, "min"),
+                            null_attribute(document, node, "max"),
+                            null_attribute(document, node, "step"),
+                            null_attribute(document, node, "value"),
+                            has_null_attribute(document, node, "multiple"),
+                        )
+                    };
+                    let changed = control_value_with_state(realm, state, node)
+                        .map_or(true, |previous| previous != sanitized);
+                    let selection_length = lumen_common::smuggle::utf16_unit_len(&sanitized);
+                    let selectable = core_forms::supports_text_selection(document, node);
                     state.live_values.insert(node, sanitized);
                     state.live_dirty.insert(node);
                     if invalidate_editing {
                         realm.invalidate_editing_for_value_change(node);
+                        if changed && selectable {
+                            realm.selections.borrow_mut().insert(
+                                node,
+                                (selection_length, selection_length, "none".into()),
+                            );
+                        }
                     }
                     state.dirty.insert(node);
                     state.bump_validity_generation();
@@ -1104,7 +1139,7 @@ pub fn resanitize_input_after_attribute_change(
     if !state.live_values.contains_key(&node) {
         return Ok(());
     }
-    let (kind, min, max, step, value_attribute, multiple) = {
+    let (kind, min, max, step, value_attribute, multiple, color_options) = {
         let session = realm.session.borrow();
         let document = session.document();
         let get = |key: &str| null_attribute(document, node, key);
@@ -1115,28 +1150,37 @@ pub fn resanitize_input_after_attribute_change(
             get("step").map(str::to_owned),
             get("value").map(str::to_owned),
             get("multiple").is_some(),
+            core_forms::color_input_options(get("colorspace"), get("alpha").is_some()),
         )
     };
     let use_attribute_value =
-        changed_attribute.eq_ignore_ascii_case("value") && !state.live_dirty.contains(&node);
+        ["value", "colorspace", "alpha"]
+            .iter()
+            .any(|name| changed_attribute.eq_ignore_ascii_case(name))
+            && !state.live_dirty.contains(&node);
     let current = state
         .live_values
         .get(&node)
         .map(String::as_str)
         .unwrap_or("");
-    let sanitized = core_forms::sanitize_input_value_with_attributes(
-        &kind,
-        if use_attribute_value {
-            value_attribute.as_deref().unwrap_or("")
-        } else {
-            current
-        },
-        min.as_deref(),
-        max.as_deref(),
-        step.as_deref(),
-        value_attribute.as_deref(),
-        multiple,
-    );
+    let source = if use_attribute_value {
+        value_attribute.as_deref().unwrap_or("")
+    } else {
+        current
+    };
+    let sanitized = if kind == "color" {
+        lumen_html::css::color_input::sanitize_input_color(source, color_options.0, color_options.1)
+    } else {
+        core_forms::sanitize_input_value_with_attributes(
+            &kind,
+            source,
+            min.as_deref(),
+            max.as_deref(),
+            step.as_deref(),
+            value_attribute.as_deref(),
+            multiple,
+        )
+    };
     state.live_values.insert(node, sanitized);
     Ok(())
 }
@@ -1435,8 +1479,12 @@ pub fn control_value_with_state(
             return Ok(value.clone());
         }
     }
-    default_control_value(document, node)
-        .ok_or_else(|| OpError::new("TypeError", "value requires a form control"))
+    let value = default_control_value(document, node)
+        .ok_or_else(|| OpError::new("TypeError", "value requires a form control"))?;
+    if html_local_name(document, node) == Some("textarea") {
+        return Ok(normalize_newlines(&value));
+    }
+    Ok(value)
 }
 
 fn output_text_content(realm: &DomRealm, node: NodeId) -> OpResult<String> {
@@ -2321,6 +2369,8 @@ fn append_custom_form_entries(ctx:&mut Ctx,data:&Value,before:usize,entries:&mut
 }
 
 pub fn set_custom_validity(state: &mut FormState, node: NodeId, message: &str) {
+    let normalized = normalize_newlines(message);
+    let message = normalized.as_str();
     let previous = state.custom_messages.get(&node).map(String::as_str);
     if previous == Some(message) || (previous.is_none() && message.is_empty()) {
         return;
@@ -2336,6 +2386,25 @@ pub fn set_custom_validity(state: &mut FormState, node: NodeId, message: &str) {
 #[lumen_bind::class(name = "FileList", hint(js(webidl)))]
 pub struct DomFileList {
     data: Rc<RefCell<FileListData>>,
+}
+
+impl lumen::embed::NativeIdentityOwner for DomFileList {
+    const TRACES_NATIVE_VALUES: bool = true;
+    fn trace_native_identities(&self, _: u64, _: &mut dyn FnMut(&Value)) {}
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
+        for value in &self.data.borrow().values {
+            visit(value);
+        }
+    }
+}
+
+/// A `FileList` snapshot over `files`, which the caller keeps alive through its own owner.
+pub(crate) fn file_list_from_values(ctx: &mut Ctx, files: Vec<Value>) -> OpResult<Value> {
+    let data = Rc::new(RefCell::new(FileListData { values: files, wrapper: None }));
+    let value = ctx.new_instance(DomFileList { data: data.clone() });
+    ctx.set_native_identity_owner::<DomFileList>(&value)?;
+    data.borrow_mut().wrapper = ctx.weak_value(&value);
+    Ok(value)
 }
 
 #[lumen_bind::methods]
@@ -3094,6 +3163,10 @@ pub(crate) struct TrustedPointerState {
     pub y: f64,
     pub hover_target: Option<NodeId>,
     pub down_target: Option<NodeId>,
+    pub down_position: (f64, f64),
+    /// A release after a drag reaches a disabled form control's mouseup listeners even though
+    /// the press did not.
+    pub drag_release_allowed: bool,
     pub buttons: u16,
     /// Whether pointerdown permitted compatibility mouse events. Canceling pointerdown suppresses
     /// mousedown/mouseup, while click dispatch remains governed by target continuity.
@@ -3112,6 +3185,8 @@ impl Default for TrustedPointerState {
             y: 0.0,
             hover_target: None,
             down_target: None,
+            down_position: (0.0, 0.0),
+            drag_release_allowed: false,
             buttons: 0,
             compatibility_mouse_allowed: false,
             down_allowed: false,
@@ -3470,7 +3545,7 @@ pub(crate) fn trusted_pointer_down(
         realm.publish_active_targets(None, None);
         return Ok(());
     }
-    let mouse_allowed = if pointer_allowed && !touch {
+    let mouse_allowed = if pointer_allowed && !touch && !disabled_form_control_target(realm, target) {
         realm.mark_user_activation();
         dispatch_mouse_state_event(
             ctx,
@@ -3503,11 +3578,27 @@ pub(crate) fn trusted_pointer_down(
         realm.focus_from_pointer(ctx, Some(target))?;
     }
     state.down_target = Some(target);
-    state.compatibility_mouse_allowed = pointer_allowed && !touch;
+    state.down_position = (state.x, state.y);
+    state.drag_release_allowed = pointer_allowed && !touch;
+    state.compatibility_mouse_allowed =
+        pointer_allowed && !touch && !disabled_form_control_target(realm, target);
     // PointerEvent.preventDefault() suppresses compatibility mouse events, but it does not
     // suppress the later click. Keep this separate from target continuity.
     state.down_allowed = true;
     Ok(())
+}
+
+/// Trusted mouse events never reach a disabled form control: they are not dispatched at one,
+/// and bubbling from a descendant stops below it.
+pub(crate) fn is_disabled_form_control(document: &lumen_html::Document, node: NodeId) -> bool {
+    match html_local_name(document, node) {
+        Some("button" | "input" | "select" | "textarea") => core_forms::is_disabled(document, node),
+        _ => document.is_form_associated_custom_element(node) && core_forms::is_disabled(document, node),
+    }
+}
+
+fn disabled_form_control_target(realm: &Rc<DomRealm>, node: NodeId) -> bool {
+    is_disabled_form_control(realm.session.borrow().document(), node)
 }
 
 pub(crate) fn trusted_pointer_up(
@@ -3558,7 +3649,10 @@ pub(crate) fn trusted_pointer_up_with_click_detail(
     state.down_target = None;
     state.compatibility_mouse_allowed = false;
     state.down_allowed = false;
-    if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target) {
+    if down_target.is_none() {
+        // The press ended at pointerdown (its target left the document): no light dismiss.
+        super::dialog_popover::clear_popover_pointerdown_target(realm);
+    } else if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target) {
         super::dialog_popover::clear_popover_pointerdown_target(realm);
         return Err(error);
     }
@@ -3592,7 +3686,12 @@ pub(crate) fn trusted_pointer_up_with_click_detail(
         0.0,
         state.properties,
     )?;
-    if compatibility_mouse_allowed && connected_pointer_target(realm, target) {
+    let dragged = state.drag_release_allowed && (state.x, state.y) != state.down_position;
+    state.drag_release_allowed = false;
+    if (compatibility_mouse_allowed || dragged)
+        && connected_pointer_target(realm, target)
+        && (dragged || !disabled_form_control_target(realm, target))
+    {
         dispatch_mouse_state_event(
             ctx,
             realm,
@@ -3614,7 +3713,7 @@ pub(crate) fn trusted_pointer_up_with_click_detail(
     let touch = state.properties.pointer_type == "touch";
     let mut clicked = false;
     if was_allowed && down_target == Some(target) && connected_pointer_target(realm, target) {
-        if !core_forms::is_disabled(realm.session.borrow().document(), target) {
+        if !disabled_form_control_target(realm, target) {
             let click = super::ui_events::user_agent_pointer_event_with_properties(
                 ctx,
                 "click",

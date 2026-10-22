@@ -105,6 +105,11 @@ fn deprecated_system_color(name:&str)->&str {
     }
 }
 
+/// Whether `name` (lowercase) is a CSS Color 4 system color keyword, including `currentcolor`.
+pub fn is_system_color(name:&str)->bool {
+    name=="currentcolor"||system_color(name,UsedColorScheme::Light).is_some()
+}
+
 pub fn system_color(name:&str,scheme:UsedColorScheme)->Option<Rgba> {
     let dark=scheme==UsedColorScheme::Dark;
     let (r,g,b)=match deprecated_system_color(name) {

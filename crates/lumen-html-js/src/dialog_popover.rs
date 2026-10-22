@@ -12,7 +12,7 @@ use super::{
 use lumen::embed::{Ctx, JsHost, OpError, OpResult, Value};
 use lumen_bind::{CtorRet, Host};
 use lumen_common::toggle_task::{PrepareError, Prepared, ToggleTasks};
-use lumen_html::{selector, top_layer, NodeId};
+use lumen_html::{popover_stack, selector, top_layer, NodeId};
 use std::{cell::RefCell, rc::Rc, vec::Vec};
 
 #[lumen_bind::class(
@@ -103,7 +103,7 @@ impl DomToggleEvent {
 }
 
 pub(crate) fn constructors(ctx: &mut Ctx) -> Vec<(&'static str, Value)> {
-    vec![("ToggleEvent", ctx.class_constructor::<DomToggleEvent>()), ("CommandEvent", ctx.class_constructor::<super::command_events::DomCommandEvent>())]
+    vec![("ToggleEvent", ctx.class_constructor::<DomToggleEvent>()), ("CommandEvent", ctx.class_constructor::<super::command_events::DomCommandEvent>()), ("InterestEvent", ctx.class_constructor::<super::interest_events::DomInterestEvent>())]
 }
 
 fn nullable_element(ctx: &mut Ctx, value: Value) -> OpResult<Value> {
@@ -294,10 +294,11 @@ pub(crate) fn show_dialog_with_source(
     if !still_valid {
         return Ok(());
     }
-    if mode == top_layer::DialogMode::Modal {
+    {
         let peers = {
             let session = realm.session.borrow();
-            top_layer::all_popovers_to_close(session.document(), node)
+            popover_stack::plan_show(session.document(), node, top_layer::PopoverMode::Auto, None)
+                .map(|plan| plan.close)
         }
         .map_err(|error| state_error(ctx, error))?;
         for &peer in &peers {
@@ -328,7 +329,7 @@ pub(crate) fn show_dialog_with_source(
                 )?;
             }
             (realm, node) = realm.resolve_adopted_node(node);
-            if !has_active_browsing_context(&realm) {
+            if mode == top_layer::DialogMode::Modal && !has_active_browsing_context(&realm) {
                 return Err(state_error(ctx, top_layer::StateError::InvalidState));
             }
         }
@@ -831,92 +832,85 @@ fn queue_close_event(ctx: &mut Ctx, realm: Rc<DomRealm>, node: NodeId) -> OpResu
     })
 }
 
-pub(crate) fn popover_value(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<String> {
+pub(crate) fn popover_value(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Option<String>> {
     let session = realm.session.borrow();
-    Ok(
-        lumen_html::top_layer::reflected_popover_value(session.document(), node)
-            .unwrap_or_default()
-            .to_owned(),
+    Ok(lumen_html::top_layer::reflected_popover_value(session.document(), node).map(str::to_owned))
+}
+
+/// The `popover` IDL setter. `None` removes the content attribute.
+pub(crate) fn change_popover_value(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, value: Option<&str>) -> OpResult<()> {
+    let (realm, node) = realm.resolve_adopted_node(node);
+    let snapshot = popover_snapshot(&realm, node);
+    {
+        let mut session = realm.session.borrow_mut();
+        let document = session.document_mut();
+        match value {
+            Some(value) => document.set_attribute_ns(node, None, "popover", value),
+            None => document.remove_attribute_ns(node, None, "popover"),
+        }
+        .map_err(super::dom_error)?;
+    }
+    popover_attribute_changed(ctx, &realm, node, snapshot)
+}
+
+pub(crate) fn popover_snapshot(realm: &Rc<DomRealm>, node: NodeId) -> (Option<&'static str>, bool) {
+    let session = realm.session.borrow();
+    let document = session.document();
+    (
+        top_layer::reflected_popover_value(document, node),
+        top_layer::popover_visibility(document, node) == top_layer::PopoverVisibility::Showing,
     )
 }
 
-pub(crate) fn set_popover_value(realm: &Rc<DomRealm>, node: NodeId, value: &str) -> OpResult<()> {
-    realm
-        .session
-        .borrow_mut()
-        .document_mut()
-        .set_attribute_ns(node, None, "popover", value)
-        .map_err(super::dom_error)
-}
-
-/// The `popover` IDL setter. HTML's popover attribute change steps hide a showing popover whose
-/// type changes, so the new type's light-dismiss behaviour never applies to a popover that was
-/// shown under the old one.
-pub(crate) fn change_popover_value(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, value: &str) -> OpResult<()> {
-    let (realm, node) = realm.resolve_adopted_node(node);
-    let (old_state, was_showing) = {
-        let session = realm.session.borrow();
-        let document = session.document();
-        (
-            top_layer::reflected_popover_value(document, node),
-            top_layer::popover_visibility(document, node) == top_layer::PopoverVisibility::Showing,
-        )
-    };
-    set_popover_value(&realm, node, value)?;
+/// HTML's popover attribute change steps: a showing popover whose type changed is hidden,
+/// firing `beforetoggle` but never restoring focus or throwing.
+pub(crate) fn popover_attribute_changed(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    (old_state, was_showing): (Option<&'static str>, bool),
+) -> OpResult<()> {
     if !was_showing {
         return Ok(());
     }
-    let new_state = top_layer::reflected_popover_value(realm.session.borrow().document(), node);
-    if new_state.is_some() && new_state != old_state {
-        hide_popover(ctx, &realm, node)?;
+    let (mut realm, mut node) = realm.resolve_adopted_node(node);
+    if top_layer::reflected_popover_value(realm.session.borrow().document(), node) == old_state {
+        return Ok(());
+    }
+    if top_layer::validate_hide_popover(realm.session.borrow().document(), node).is_err() {
+        return Ok(());
+    }
+    let above = {
+        let session = realm.session.borrow();
+        popover_stack::plan_hide(session.document(), node).unwrap_or_default()
+    };
+    hide_popover_batch(ctx, &realm, above)?;
+    (realm, node) = realm.resolve_adopted_node(node);
+    if top_layer::popover_visibility(realm.session.borrow().document(), node)
+        != top_layer::PopoverVisibility::Showing
+    {
+        return Ok(());
+    }
+    dispatch_popover_close_beforetoggle(ctx, &realm, node)?;
+    (realm, node) = realm.resolve_adopted_node(node);
+    let removed = {
+        let mut session = realm.session.borrow_mut();
+        if top_layer::popover_visibility(session.document(), node)
+            != top_layer::PopoverVisibility::Showing
+        {
+            None
+        } else {
+            session.document_mut().remove_top_layer_element_with_state(node)
+        }
+    };
+    if removed.is_some() {
+        queue_toggle_task(ctx, realm, node, ToggleTaskKind::Popover, "open", "closed", Value::Null)?;
     }
     Ok(())
 }
 
-pub(crate) fn show_popover(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> OpResult<()> {
-    show_popover_with_source(ctx, realm, node, Value::Null)
-}
-
-pub(crate) fn show_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<()> {
-    let (mut realm, mut node) = realm.resolve_adopted_node(node);
-    {
-        let session = realm.session.borrow();
-        top_layer::validate_show_popover(session.document(), node)
-    }
-    .map_err(|error| state_error(ctx, error))?;
-    if !dispatch_toggle(
-        ctx,
-        &realm,
-        node,
-        "beforetoggle",
-        "closed",
-        "open",
-        true,
-        source.clone(),
-    )? {
-        return Ok(());
-    }
-    (realm, node) = realm.resolve_adopted_node(node);
-    let mode_after_callbacks = {
-        let session = realm.session.borrow();
-        if top_layer::popover_visibility(session.document(), node)
-            == top_layer::PopoverVisibility::Showing
-        {
-            return Ok(());
-        }
-        top_layer::validate_show_popover(session.document(), node)
-    }
-    .map_err(|error| state_error(ctx, error))?;
-    let before_peers = {
-        let session = realm.session.borrow();
-        if mode_after_callbacks == top_layer::PopoverMode::Auto {
-            top_layer::auto_popovers_to_close(session.document(), node)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-    .map_err(|error| state_error(ctx, error))?;
-    for peer in before_peers {
+fn hide_popover_batch(ctx: &mut Ctx, realm: &Rc<DomRealm>, nodes: Vec<NodeId>) -> OpResult<()> {
+    for peer in nodes {
         let (peer_realm, peer_node) = realm.resolve_adopted_node(peer);
         dispatch_popover_close_beforetoggle(ctx, &peer_realm, peer_node)?;
         let (peer_realm, peer_node) = peer_realm.resolve_adopted_node(peer_node);
@@ -943,14 +937,78 @@ pub(crate) fn show_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node
                 Value::Null,
             )?;
         }
-        (realm, node) = realm.resolve_adopted_node(node);
     }
+    Ok(())
+}
+
+pub(crate) fn show_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<()> {
+    show_popover_checked(ctx, realm, node, source, true)
+}
+
+/// The invoker algorithms run show popover without throwing exceptions: a popover whose type
+/// changed during a peer's `beforetoggle` is silently left hidden.
+pub(crate) fn show_popover_without_throwing(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value) -> OpResult<()> {
+    show_popover_checked(ctx, realm, node, source, false)
+}
+
+fn show_popover_checked(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, source: Value, throw_exceptions: bool) -> OpResult<()> {
+    let (mut realm, mut node) = realm.resolve_adopted_node(node);
+    {
+        let session = realm.session.borrow();
+        if top_layer::popover_visibility(session.document(), node)
+            == top_layer::PopoverVisibility::Showing
+        {
+            return Ok(());
+        }
+        top_layer::validate_show_popover(session.document(), node)
+    }
+    .map_err(|error| state_error(ctx, error))?;
+    if !dispatch_toggle(
+        ctx,
+        &realm,
+        node,
+        "beforetoggle",
+        "closed",
+        "open",
+        true,
+        source.clone(),
+    )? {
+        return Ok(());
+    }
+    (realm, node) = realm.resolve_adopted_node(node);
+    let mode_after_callbacks = {
+        let session = realm.session.borrow();
+        if top_layer::popover_visibility(session.document(), node)
+            == top_layer::PopoverVisibility::Showing
+        {
+            return Ok(());
+        }
+        top_layer::validate_show_popover(session.document(), node)
+    }
+    .map_err(|error| state_error(ctx, error))?;
+    let invoker = ctx
+        .with_instance::<super::DomElement, _>(&source, |element| {
+            element.base.realm.resolve_adopted_node(element.base.id)
+        })
+        .ok()
+        .filter(|(owner, _)| Rc::ptr_eq(owner, &realm))
+        .map(|(_, node)| node);
+    let plan = {
+        let session = realm.session.borrow();
+        popover_stack::plan_show(session.document(), node, mode_after_callbacks, invoker)
+    }
+    .map_err(|error| state_error(ctx, error))?;
+    hide_popover_batch(ctx, &realm, plan.close)?;
+    (realm, node) = realm.resolve_adopted_node(node);
     let mode_after_peer_callbacks = {
         let session = realm.session.borrow();
         top_layer::validate_show_popover(session.document(), node)
     }
     .map_err(|error| state_error(ctx, error))?;
     if mode_after_peer_callbacks != mode_after_callbacks {
+        if !throw_exceptions {
+            return Ok(());
+        }
         return Err(error_reporting::dom_exception(
             ctx,
             "InvalidStateError",
@@ -969,27 +1027,15 @@ pub(crate) fn show_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node
         });
         no_auto_popover.then(|| realm.focused_node()).flatten()
     };
-    let transition = top_layer::show_popover_with_focus(
+    let transition = top_layer::show_popover_in_stack(
         realm.session.borrow_mut().document_mut(),
         node,
+        plan.stack,
         restore_focus,
     )
     .map_err(|error| state_error(ctx, error))?;
-    for peer in transition.closed_auto_popover_nodes {
-        queue_toggle_task(
-            ctx,
-            realm.clone(),
-            peer,
-            ToggleTaskKind::Popover,
-            "open",
-            "closed",
-            Value::Null,
-        )?;
-    }
     if transition.changed {
-        let trigger=ctx.with_instance::<super::DomElement,_>(&source,|element|element.base.realm.resolve_adopted_node(element.base.id)).ok()
-            .filter(|(owner,_)|Rc::ptr_eq(owner,&realm)).map(|(_,node)|node);
-        realm.session.borrow_mut().document_mut().set_popover_trigger(node,trigger);
+        realm.session.borrow_mut().document_mut().set_popover_trigger(node,invoker);
         queue_toggle_task(
             ctx,
             realm.clone(),
@@ -1026,6 +1072,18 @@ pub(crate) fn hide_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node
     if !showing {
         return Ok(());
     }
+    let above = {
+        let session = realm.session.borrow();
+        popover_stack::plan_hide(session.document(), node)
+    }
+    .map_err(|error| state_error(ctx, error))?;
+    hide_popover_batch(ctx, &realm, above)?;
+    (realm, node) = realm.resolve_adopted_node(node);
+    if top_layer::popover_visibility(realm.session.borrow().document(), node)
+        != top_layer::PopoverVisibility::Showing
+    {
+        return Ok(());
+    }
     dispatch_popover_close_beforetoggle_with_source(ctx, &realm, node, source.clone())?;
     (realm, node) = realm.resolve_adopted_node(node);
     let (changed, restore_focus) =
@@ -1050,11 +1108,52 @@ pub(crate) fn hide_popover_with_source(ctx: &mut Ctx, realm: &Rc<DomRealm>, node
     Ok(())
 }
 
+/// The `source` member of `ShowPopoverOptions` or `TogglePopoverOptions`.
+fn popover_options_source(ctx: &mut Ctx, options: &Option<Value>) -> OpResult<Value> {
+    match ui_events::dictionary_member(ctx, options, "source")? {
+        None => Ok(Value::Null),
+        Some(Value::Null) => Err(OpError::type_error("source must be an Element")),
+        Some(value) => {
+            if ctx.with_instance::<DomElement, _>(&value, |_| ()).is_ok() {
+                Ok(value)
+            } else {
+                Err(OpError::type_error("source must be an Element"))
+            }
+        }
+    }
+}
+
+pub(crate) fn show_popover_options(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    options: Option<Value>,
+) -> OpResult<()> {
+    let source = popover_options_source(ctx, &options)?;
+    show_popover_with_source(ctx, realm, node, source)
+}
+
+pub(crate) fn toggle_popover_options(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    options: Option<Value>,
+) -> OpResult<bool> {
+    if let Some(Value::Bool(force)) = options {
+        return toggle_popover(ctx, realm, node, Some(force), Value::Null);
+    }
+    let force = ui_events::dictionary_member(ctx, &options, "force")?
+        .map(|value| ctx.to_boolean(&value));
+    let source = popover_options_source(ctx, &options)?;
+    toggle_popover(ctx, realm, node, force, source)
+}
+
 pub(crate) fn toggle_popover(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     node: NodeId,
     force: Option<bool>,
+    source: Value,
 ) -> OpResult<bool> {
     let (realm, node) = realm.resolve_adopted_node(node);
     let showing = {
@@ -1067,9 +1166,9 @@ pub(crate) fn toggle_popover(
         return Ok(showing);
     }
     if should_show {
-        show_popover(ctx, &realm, node)?;
+        show_popover_with_source(ctx, &realm, node, source)?;
     } else {
-        hide_popover(ctx, &realm, node)?;
+        hide_popover_with_source(ctx, &realm, node, source)?;
     }
     let (realm, node) = realm.resolve_adopted_node(node);
     let session = realm.session.borrow();
@@ -1119,7 +1218,7 @@ pub(crate) fn dismiss_popovers_for_pointer_up(
 
     for candidate in plan.popovers_to_hide {
         let (popover_realm, popover_node) = realm.resolve_adopted_node(candidate);
-        let (endpoint_realm, endpoint) = plan
+        let (endpoint_realm, _) = plan
             .endpoint
             .map(|endpoint| realm.resolve_adopted_node(endpoint))
             .map_or((realm.clone(), None), |(realm, node)| (realm, Some(node)));
@@ -1127,8 +1226,7 @@ pub(crate) fn dismiss_popovers_for_pointer_up(
             && Rc::ptr_eq(&endpoint_realm, &realm)
         {
             let session = popover_realm.session.borrow();
-            top_layer::should_hide_auto_popover_until(session.document(), popover_node, endpoint)
-                .map_err(|error| state_error(ctx, error))?
+            popover_stack::should_hide_until(session.document(), popover_node, plan.endpoints)
         } else {
             false
         };
@@ -1138,7 +1236,7 @@ pub(crate) fn dismiss_popovers_for_pointer_up(
 
         let _ = dispatch_popover_close_beforetoggle(ctx, &popover_realm, popover_node)?;
         let (popover_realm, popover_node) = popover_realm.resolve_adopted_node(popover_node);
-        let (endpoint_realm, endpoint) = plan
+        let (endpoint_realm, _) = plan
             .endpoint
             .map(|endpoint| realm.resolve_adopted_node(endpoint))
             .map_or((realm.clone(), None), |(realm, node)| (realm, Some(node)));
@@ -1147,12 +1245,8 @@ pub(crate) fn dismiss_popovers_for_pointer_up(
         }
         let closed = {
             let mut session = popover_realm.session.borrow_mut();
-            let should_close = top_layer::should_hide_auto_popover_until(
-                session.document(),
-                popover_node,
-                endpoint,
-            )
-            .map_err(|error| state_error(ctx, error))?;
+            let should_close =
+                popover_stack::should_hide_until(session.document(), popover_node, plan.endpoints);
             if should_close {
                 top_layer::hide_popover(session.document_mut(), popover_node)
                     .map_err(|error| state_error(ctx, error))?

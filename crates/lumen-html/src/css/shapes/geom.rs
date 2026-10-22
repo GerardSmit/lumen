@@ -102,10 +102,6 @@ impl Len {
         Len::new(op(self.px, other.px), op(self.pct, other.pct), self.percentage_aware() || other.percentage_aware())
     }
 
-    pub(super) fn plus(&self, other: &Len) -> Len {
-        self.map2(other, &|a, b| a + b)
-    }
-
     pub(super) fn minus(&self, other: &Len) -> Len {
         self.map2(other, &|a, b| a - b)
     }
@@ -232,10 +228,6 @@ impl Axis {
             Axis::Edged(side, len) => alloc::format!("{} {}", keyword(*side), len.text(form)),
         }
     }
-
-    pub(super) fn is_plain(&self) -> bool {
-        matches!(self, Axis::Plain(_))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,10 +256,6 @@ impl Pos {
     pub(super) fn computed(&self) -> Pos {
         let (x, y) = self.lens();
         Pos::from_lens(x, y)
-    }
-
-    pub(super) fn plain_pair(&self) -> bool {
-        self.x.is_plain() && self.y.is_plain()
     }
 }
 

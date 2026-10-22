@@ -280,6 +280,11 @@ pub mod bindings {
             .ok_or_else(|| invalid_this("URL"))
     }
 
+    /// The parsed URL behind a `URL` instance, or `None` for any other value.
+    pub fn url_of_instance(ctx: &Ctx, value: &Value) -> Option<url::Url> {
+        ctx.instance_data::<WebUrl>(value).map(|url| url.borrow().state.borrow().url.clone())
+    }
+
     fn read<R>(ctx: &Ctx, this: &Value, read: impl FnOnce(&url::Url) -> R) -> OpResult<R> {
         let state = state_of(ctx, this)?;
         let state = state.borrow();

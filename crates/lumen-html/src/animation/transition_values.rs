@@ -169,7 +169,7 @@ pub fn compose_border_image(property:&str,a:&crate::css::BorderImage,b:&crate::c
 /// implementation dependencies outside the HTML/layout core.
 pub fn interpolate_compound_transition(
     property: &str, from: &Style, to: &Style, progress: f64,
-    color: impl Fn(Rgba, Rgba, f32) -> Rgba,
+    _color: impl Fn(Rgba, Rgba, f32) -> Rgba,
 ) -> Option<String> {
     if !progress.is_finite() { return None; }
     match property {
@@ -186,9 +186,7 @@ pub fn interpolate_compound_transition(
             let slot=if property=="text-shadow"{219}else{58};
             let empty=crate::css::SourceShadowList{shadows:alloc::sync::Arc::from([]),colors:None};
             let a=from.source_shadow_list(slot);let b=to.source_shadow_list(slot);
-            if a.as_ref().is_some_and(|list|list.colors.is_some())||b.as_ref().is_some_and(|list|list.colors.is_some()){
-                interpolate_source_shadow_lists(property,a.as_ref().unwrap_or(&empty),b.as_ref().unwrap_or(&empty),progress)
-            }else{interpolate_shadow_lists(property,a.as_ref().map_or(&[],|list|list.shadows.as_ref()),b.as_ref().map_or(&[],|list|list.shadows.as_ref()),progress,color)}
+            interpolate_source_shadow_lists(property,a.as_ref().unwrap_or(&empty),b.as_ref().unwrap_or(&empty),progress)
         },
         "background-position" | "mask-position" => {
             let default = [[LengthPercentage::default(); 2]];
@@ -219,7 +217,12 @@ pub fn interpolate_compound_transition(
                 if a.kind != b.kind { return None; }
                 if a.kind != BackgroundSizeKind::Explicit { values.push(a); continue; }
                 let axis = |a,b| match (a,b) {
-                    (Some(a),Some(b)) => Some(Some(length(a,b,progress)?)),
+                    (Some(a),Some(b)) => {
+                        let mut mixed=length(a,b,progress)?;
+                        if mixed.fraction==0.0 {mixed.pixels=mixed.pixels.max(0.0);}
+                        else if mixed.pixels==0.0 {mixed.fraction=mixed.fraction.max(0.0);}
+                        Some(Some(mixed))
+                    },
                     (None,None) => Some(None),
                     _ => None,
                 };

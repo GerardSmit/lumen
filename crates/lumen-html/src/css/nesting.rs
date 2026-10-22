@@ -12,6 +12,7 @@ pub enum SourceRuleKind {
     PositionTry,
     CounterStyle,
     FontFeatureValues,
+    FontPaletteValues,
     Keyframes,
     Keyframe,
     Statement,
@@ -794,6 +795,8 @@ fn parse_body(
             SourceRuleKind::CounterStyle
         } else if at_rule(prelude, "@font-feature-values") && (parent.is_none() || scope_body || starting_context) {
             SourceRuleKind::FontFeatureValues
+        } else if at_rule(prelude, "@font-palette-values") && (parent.is_none() || scope_body || starting_context) {
+            SourceRuleKind::FontPaletteValues
         } else if at_rule(prelude, "@scope") {
             SourceRuleKind::Scope
         } else if at_rule(prelude, "@media")
@@ -821,6 +824,7 @@ fn parse_body(
         if kind == SourceRuleKind::Property && registered_properties::parse_rules(prelude, &text[open + 1..close])?.is_empty() { continue; }
         if kind == SourceRuleKind::PositionTry && anchor::position_try_name(prelude).is_none() { continue; }
         if kind == SourceRuleKind::CounterStyle && counter_styles::rule_name(prelude).is_none() { continue; }
+        if kind == SourceRuleKind::FontPaletteValues && font_palette_values::rule_name(prelude).is_none() { continue; }
         if kind == SourceRuleKind::Group && at_rule(prelude, "@starting-style")
             && !prelude[15..].trim().is_empty() { continue; }
         if kind == SourceRuleKind::Group
@@ -890,7 +894,7 @@ fn parse_body(
             range: start..end,
             prelude: start..open,
             body: Some(open + 1..close),
-            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle)
+            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues)
                 .then_some(open + 1),
             declaration_ranges: Vec::new(),
             children: Vec::new(),
@@ -927,7 +931,7 @@ fn parse_body(
                     node.declaration_ranges = leading.declaration_ranges;
                 }
             }
-            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
+            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
             SourceRuleKind::Keyframes => {
                 for (frame_start, frame_end, frame_open, frame_close) in
                     source_rule_ranges(&text[open + 1..close], false)?

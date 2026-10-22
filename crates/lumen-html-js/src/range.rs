@@ -427,6 +427,14 @@ impl DomAbstractRange {
     }
 }
 
+pub(crate) fn collapsed_range_at(ctx: &mut Ctx, realm: &Rc<DomRealm>, point: Boundary) -> OpResult<Value> {
+    let root = realm.session.borrow().document().root();
+    let range = DomRange::new_at(realm.clone(), realm.ranges.clone(), root);
+    range.set_boundary_in(realm, point, true)?;
+    range.set_boundary_in(realm, point, false)?;
+    Ok(range.into_value(ctx))
+}
+
 #[lumen_bind::class(name = "Range", extends = DomAbstractRange, hint(js(webidl)))]
 pub struct DomRange {
     base: DomAbstractRange,
@@ -635,6 +643,14 @@ impl DomRange {
             },
             false,
         )
+    }
+    fn get_client_rects(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let rects = self.client_rect_list(ctx)?;
+        Ok(geometry::client_rects_value(ctx, &rects))
+    }
+    fn get_bounding_client_rect(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let rects = self.client_rect_list(ctx)?;
+        Ok(geometry::rect_value(ctx, geometry::union(&rects)))
     }
     #[method(coerce)]
     fn compare_boundary_points(&self, how: u16, source: &DomRange) -> OpResult<i16> {
@@ -870,6 +886,11 @@ fn strip_contextual_xml_scaffolding(document: &mut lumen_html::Document, fragmen
 }
 
 impl DomRange {
+    fn client_rect_list(&self, ctx: &mut Ctx) -> OpResult<Vec<lumen_html::paint::Rect>> {
+        let realm = self.data.current_realm()?;
+        geometry::range_client_rects(ctx, &realm, self.data.start.get(), self.data.end.get())
+    }
+
     fn check_realm(&self, realm: &Rc<DomRealm>) -> OpResult<()> {
         if Rc::ptr_eq(&self.data.current_realm()?, realm) {
             Ok(())

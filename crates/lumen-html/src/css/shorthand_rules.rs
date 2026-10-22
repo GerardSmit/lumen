@@ -13,10 +13,6 @@ fn specified(longhand: &str, raw: &str) -> Option<String> {
     value_props::serialize_specified(value_props::index_of(longhand)?, raw)
 }
 
-pub(super) fn is_rule_shorthand(name: &str) -> bool {
-    matches!(name, "text-box" | "text-emphasis" | "font-synthesis" | "-webkit-text-stroke" | "vertical-align")
-}
-
 pub(super) fn expand(name: &str, raw: &str, arity: usize) -> Option<Vec<String>> {
     let tokens = components(raw)?;
     if tokens.len() == 1 {

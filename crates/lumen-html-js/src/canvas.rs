@@ -5,8 +5,8 @@ use lumen_html::paint::{FontSpec, FontStyle, Rgba, TextShaper};
 use lumen_html_image::{
     canvas::{
         CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSource,
-        CanvasSurface, ParsedSvgPath, CanvasPublication, OffscreenCanvasTransfer, SourceGeometry,
-        TextSource,
+        CanvasSurface, ParsedSvgPath, CanvasPublication, OffscreenCanvasTransfer, SmoothingQuality,
+        SourceGeometry, TextSource,
     },
     Rgba8Image,
 };
@@ -23,6 +23,11 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Path, PathBuilder, Rect, Transform};
+
+#[path = "canvas_path.rs"]
+mod canvas_path;
+#[path = "canvas_text_metrics.rs"]
+mod canvas_text_metrics;
 
 const DEFAULT_WIDTH: u32 = 300;
 const DEFAULT_HEIGHT: u32 = 150;
@@ -312,6 +317,8 @@ pub struct CanvasData {
     color_space: CanvasColorSpace,
     desynchronized: bool,
     will_read_frequently: bool,
+    float16_color_type: bool,
+    extended_tone_mapping: bool,
     current_path: CanvasPath,
     context_wrapper: Option<WeakValue>,
     suppress_dimension_mutation: bool,
@@ -337,6 +344,8 @@ enum CanvasColorSpace {
     #[default]
     Srgb,
     DisplayP3,
+    SrgbLinear,
+    DisplayP3Linear,
 }
 
 impl CanvasColorSpace {
@@ -344,6 +353,37 @@ impl CanvasColorSpace {
         match self {
             Self::Srgb => "srgb",
             Self::DisplayP3 => "display-p3",
+            Self::SrgbLinear => "srgb-linear",
+            Self::DisplayP3Linear => "display-p3-linear",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "srgb" => Some(Self::Srgb),
+            "display-p3" => Some(Self::DisplayP3),
+            "srgb-linear" => Some(Self::SrgbLinear),
+            "display-p3-linear" => Some(Self::DisplayP3Linear),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Srgb => 0,
+            Self::DisplayP3 => 1,
+            Self::SrgbLinear => 2,
+            Self::DisplayP3Linear => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Srgb),
+            1 => Some(Self::DisplayP3),
+            2 => Some(Self::SrgbLinear),
+            3 => Some(Self::DisplayP3Linear),
+            _ => None,
         }
     }
 }
@@ -354,6 +394,8 @@ struct Canvas2dSettings {
     color_space: CanvasColorSpace,
     desynchronized: bool,
     will_read_frequently: bool,
+    float16_color_type: bool,
+    extended_tone_mapping: bool,
 }
 
 impl Default for Canvas2dSettings {
@@ -363,6 +405,8 @@ impl Default for Canvas2dSettings {
             color_space: CanvasColorSpace::Srgb,
             desynchronized: false,
             will_read_frequently: false,
+            float16_color_type: false,
+            extended_tone_mapping: false,
         }
     }
 }
@@ -382,16 +426,9 @@ fn parse_canvas_2d_settings(ctx: &mut Ctx, options: Option<&Value>) -> OpResult<
         .map_err(OpError::thrown)?;
     if !matches!(color_space, Value::Undefined) {
         let color_space = ctx.coerce_string(&color_space).map_err(OpError::thrown)?;
-        settings.color_space = match color_space.as_ref() {
-            "srgb" => CanvasColorSpace::Srgb,
-            "display-p3" => CanvasColorSpace::DisplayP3,
-            _ => {
-                return Err(OpError::new(
-                    "TypeError",
-                    "CanvasRenderingContext2D colorSpace is invalid",
-                ));
-            }
-        };
+        settings.color_space = CanvasColorSpace::parse(color_space.as_ref()).ok_or_else(|| {
+            OpError::new("TypeError", "CanvasRenderingContext2D colorSpace is invalid")
+        })?;
     }
     let desynchronized = ctx
         .member_get(options, "desynchronized")
@@ -404,6 +441,43 @@ fn parse_canvas_2d_settings(ctx: &mut Ctx, options: Option<&Value>) -> OpResult<
         .map_err(OpError::thrown)?;
     if !matches!(will_read_frequently, Value::Undefined) {
         settings.will_read_frequently = ctx.to_boolean(&will_read_frequently);
+    }
+    let color_type = ctx
+        .member_get(options, "colorType")
+        .map_err(OpError::thrown)?;
+    if !matches!(color_type, Value::Undefined) {
+        let color_type = ctx.coerce_string(&color_type).map_err(OpError::thrown)?;
+        settings.float16_color_type = match color_type.as_ref() {
+            "unorm8" => false,
+            "float16" => true,
+            _ => {
+                return Err(OpError::new(
+                    "TypeError",
+                    "CanvasRenderingContext2D colorType is invalid",
+                ));
+            }
+        };
+    }
+    let tone_mapping = ctx
+        .member_get(options, "toneMapping")
+        .map_err(OpError::thrown)?;
+    if matches!(tone_mapping, Value::Obj(_)) {
+        let mode = ctx
+            .member_get(&tone_mapping, "mode")
+            .map_err(OpError::thrown)?;
+        if !matches!(mode, Value::Undefined) {
+            let mode = ctx.coerce_string(&mode).map_err(OpError::thrown)?;
+            settings.extended_tone_mapping = match mode.as_ref() {
+                "standard" => false,
+                "extended" => true,
+                _ => {
+                    return Err(OpError::new(
+                        "TypeError",
+                        "CanvasRenderingContext2D toneMapping mode is invalid",
+                    ));
+                }
+            };
+        }
     }
     Ok(settings)
 }
@@ -475,13 +549,8 @@ fn parse_image_data_settings_with_default(
         .map_err(OpError::thrown)?;
     if !matches!(color_space, Value::Undefined) {
         let color_space = ctx.coerce_string(&color_space).map_err(OpError::thrown)?;
-        settings.color_space = match color_space.as_ref() {
-            "srgb" => CanvasColorSpace::Srgb,
-            "display-p3" => CanvasColorSpace::DisplayP3,
-            _ => {
-                return Err(OpError::new("TypeError", "ImageData colorSpace is invalid"));
-            }
-        };
+        settings.color_space = CanvasColorSpace::parse(color_space.as_ref())
+            .ok_or_else(|| OpError::new("TypeError", "ImageData colorSpace is invalid"))?;
     }
     let pixel_format = ctx
         .member_get(options, "pixelFormat")
@@ -572,6 +641,7 @@ impl CanvasData {
     /// Read the current drawing buffer without holding a borrow across backend work.
     pub fn snapshot_for_read(data: &Rc<RefCell<Self>>) -> OpResult<Rgba8Image> {
         data.borrow().ensure_bitmap_available()?;
+        data.borrow().ensure_no_open_layers()?;
         let synchronize = data.borrow().snapshot_synchronizer.clone();
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
@@ -583,6 +653,7 @@ impl CanvasData {
     /// and a shared snapshot for a canvas that has not changed since its last use as a source.
     pub fn source_for_read(data: &Rc<RefCell<Self>>) -> OpResult<CanvasSource> {
         data.borrow().ensure_bitmap_available()?;
+        data.borrow().ensure_no_open_layers()?;
         let synchronize = data.borrow().snapshot_synchronizer.clone();
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
@@ -612,6 +683,8 @@ impl CanvasData {
             color_space: CanvasColorSpace::Srgb,
             desynchronized: false,
             will_read_frequently: false,
+            float16_color_type: false,
+            extended_tone_mapping: false,
             current_path: CanvasPath::default(),
             context_wrapper: None,
             suppress_dimension_mutation: false,
@@ -684,6 +757,14 @@ impl CanvasData {
         self.saved_stroke_styles.clear();
         self.text = LazyText::default();
         self.saved_text.clear();
+    }
+
+    fn ensure_no_open_layers(&self) -> OpResult<()> {
+        if self.surface.has_open_layers() {
+            Err(OpError::new("InvalidStateError", "canvas has open layers"))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_bitmap_available(&self) -> OpResult<()> {
@@ -1428,34 +1509,45 @@ impl CanvasPath {
                     subpath_start = current;
                 }
                 PathCommand::Line(x, y) => {
-                    if !has_subpath {
+                    if has_subpath {
+                        builder.line_to(x, y);
+                    } else {
+                        builder.move_to(x, y);
                         has_subpath = true;
-                        current = (0.0, 0.0);
-                        subpath_start = current;
+                        subpath_start = (x, y);
                     }
-                    builder.line_to(x, y);
                     current = (x, y);
                 }
                 PathCommand::Quad(x1, y1, x, y) => {
                     if !has_subpath {
+                        builder.move_to(x1, y1);
                         has_subpath = true;
-                        current = (0.0, 0.0);
-                        subpath_start = current;
+                        subpath_start = (x1, y1);
                     }
                     builder.quad_to(x1, y1, x, y);
                     current = (x, y);
                 }
                 PathCommand::Cubic(x1, y1, x2, y2, x, y) => {
                     if !has_subpath {
+                        builder.move_to(x1, y1);
                         has_subpath = true;
-                        current = (0.0, 0.0);
-                        subpath_start = current;
+                        subpath_start = (x1, y1);
                     }
                     builder.cubic_to(x1, y1, x2, y2, x, y);
                     current = (x, y);
                 }
                 PathCommand::Rect(x, y, width, height) => {
-                    if let Some(rect) = Rect::from_xywh(x, y, width, height) {
+                    let finite = [x, y, width, height].iter().all(|v| v.is_finite());
+                    if finite && (width < 0.0 || height < 0.0) {
+                        builder.move_to(x, y);
+                        builder.line_to(x + width, y);
+                        builder.line_to(x + width, y + height);
+                        builder.line_to(x, y + height);
+                        builder.close();
+                        has_subpath = true;
+                        current = (x, y);
+                        subpath_start = current;
+                    } else if let Some(rect) = Rect::from_xywh(x, y, width, height) {
                         builder.push_rect(rect);
                         has_subpath = true;
                         current = (x, y);
@@ -1549,23 +1641,35 @@ impl DomPath2D {
         self.path.borrow_mut().commands.push(PathCommand::Close);
     }
     fn move_to(&self, x: f64, y: f64) {
+        if !canvas_path::all_finite(&[x, y]) {
+            return;
+        }
         self.path
             .borrow_mut()
             .commands
             .push(PathCommand::Move(x as f32, y as f32));
     }
     fn line_to(&self, x: f64, y: f64) {
+        if !canvas_path::all_finite(&[x, y]) {
+            return;
+        }
         self.path
             .borrow_mut()
             .commands
             .push(PathCommand::Line(x as f32, y as f32));
     }
     fn quadratic_curve_to(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
+        if !canvas_path::all_finite(&[cpx, cpy, x, y]) {
+            return;
+        }
         self.path.borrow_mut().commands.push(PathCommand::Quad(
             cpx as f32, cpy as f32, x as f32, y as f32,
         ));
     }
     fn bezier_curve_to(&self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
+        if !canvas_path::all_finite(&[cp1x, cp1y, cp2x, cp2y, x, y]) {
+            return;
+        }
         self.path.borrow_mut().commands.push(PathCommand::Cubic(
             cp1x as f32,
             cp1y as f32,
@@ -1650,6 +1754,21 @@ impl DomPath2D {
             counterclockwise: counterclockwise.unwrap_or(false),
         });
         Ok(())
+    }
+    fn arc_to(&self, x1: f64, y1: f64, x2: f64, y2: f64, radius: f64) -> OpResult<()> {
+        self.path.borrow_mut().arc_to(x1, y1, x2, y2, radius)
+    }
+    fn round_rect(
+        &self,
+        ctx: &mut Ctx,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: Option<Value>,
+    ) -> OpResult<()> {
+        let radii = canvas_path::parse_radii(ctx, radii)?;
+        self.path.borrow_mut().round_rect(x, y, width, height, &radii)
     }
     #[method(name = "addPath")]
     fn add_path(&self, ctx: &mut Ctx, source: Value, transform: Option<Value>) -> OpResult<()> {
@@ -2380,6 +2499,8 @@ fn context_value(
             data.color_space = settings.color_space;
             data.desynchronized = settings.desynchronized;
             data.will_read_frequently = settings.will_read_frequently;
+            data.float16_color_type = settings.float16_color_type;
+            data.extended_tone_mapping = settings.extended_tone_mapping;
         }
         data.borrow_mut().context_mode = Some("2d");
         value
@@ -2655,7 +2776,7 @@ macro_rules! impl_canvas_2d_methods {
             fn global_alpha(&self) -> f32 {
                 self.data.borrow().surface.state().alpha
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_global_alpha(&self, value: f32) {
                 if value.is_finite() && (0.0..=1.0).contains(&value) {
                     self.data.borrow_mut().surface.state_mut().alpha = value;
@@ -2739,7 +2860,7 @@ macro_rules! impl_canvas_2d_methods {
             fn line_width(&self) -> f32 {
                 self.data.borrow().surface.state().line.width
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_line_width(&self, width: f32) {
                 if width.is_finite() && width > 0.0 {
                     self.data.borrow_mut().surface.state_mut().line.width = width;
@@ -2753,7 +2874,7 @@ macro_rules! impl_canvas_2d_methods {
                     LineCap::Square => "square",
                 }
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_line_cap(&self, value: &str) {
                 let line_cap = match value {
                     "butt" => LineCap::Butt,
@@ -2771,7 +2892,7 @@ macro_rules! impl_canvas_2d_methods {
                     LineJoin::Bevel => "bevel",
                 }
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_line_join(&self, value: &str) {
                 let line_join = match value {
                     "miter" => LineJoin::Miter,
@@ -2785,7 +2906,7 @@ macro_rules! impl_canvas_2d_methods {
             fn miter_limit(&self) -> f64 {
                 self.data.borrow().surface.state().miter_limit
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_miter_limit(&self, value: f64) {
                 if value.is_finite() && value > 0.0 {
                     let mut data = self.data.borrow_mut();
@@ -2795,10 +2916,68 @@ macro_rules! impl_canvas_2d_methods {
                 }
             }
             #[getter]
+            fn image_smoothing_enabled(&self) -> bool {
+                self.data.borrow().surface.state().image_smoothing
+            }
+            #[setter(coerce)]
+            fn set_image_smoothing_enabled(&self, value: bool) {
+                self.data.borrow_mut().surface.state_mut().image_smoothing = value;
+            }
+            #[getter]
+            fn image_smoothing_quality(&self) -> &'static str {
+                match self.data.borrow().surface.state().smoothing_quality {
+                    SmoothingQuality::Low => "low",
+                    SmoothingQuality::Medium => "medium",
+                    SmoothingQuality::High => "high",
+                }
+            }
+            #[setter(coerce)]
+            fn set_image_smoothing_quality(&self, value: &str) {
+                let quality = match value {
+                    "low" => SmoothingQuality::Low,
+                    "medium" => SmoothingQuality::Medium,
+                    "high" => SmoothingQuality::High,
+                    _ => return,
+                };
+                self.data.borrow_mut().surface.state_mut().smoothing_quality = quality;
+            }
+            #[method(name = "setLineDash", coerce)]
+            fn set_line_dash(&self, segments: Vec<f64>) {
+                if segments.iter().any(|value| !value.is_finite() || *value < 0.0) {
+                    return;
+                }
+                let mut pattern: Vec<f32> = segments.iter().map(|value| *value as f32).collect();
+                if pattern.len() % 2 == 1 {
+                    pattern.extend_from_within(..);
+                }
+                self.data.borrow_mut().surface.state_mut().set_line_dash(pattern);
+            }
+            #[method(name = "getLineDash")]
+            fn get_line_dash(&self) -> Vec<f64> {
+                self.data
+                    .borrow()
+                    .surface
+                    .state()
+                    .line_dash
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .collect()
+            }
+            #[getter]
+            fn line_dash_offset(&self) -> f64 {
+                self.data.borrow().surface.state().line_dash_offset
+            }
+            #[setter(coerce)]
+            fn set_line_dash_offset(&self, value: f64) {
+                if value.is_finite() {
+                    self.data.borrow_mut().surface.state_mut().set_line_dash_offset(value);
+                }
+            }
+            #[getter]
             fn shadow_color(&self) -> String {
                 color_string(self.data.borrow().surface.state().shadow_color)
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_shadow_color(&self, value: &str) {
                 if let Some(color) = lumen_html::css::parse_animation_color(
                     value,
@@ -2812,7 +2991,7 @@ macro_rules! impl_canvas_2d_methods {
             fn shadow_blur(&self) -> f64 {
                 self.data.borrow().surface.state().shadow_blur
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_shadow_blur(&self, value: f64) {
                 if value.is_finite() && value >= 0.0 {
                     self.data.borrow_mut().surface.state_mut().shadow_blur = value;
@@ -2822,7 +3001,7 @@ macro_rules! impl_canvas_2d_methods {
             fn shadow_offset_x(&self) -> f64 {
                 self.data.borrow().surface.state().shadow_offset_x
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_shadow_offset_x(&self, value: f64) {
                 if value.is_finite() {
                     self.data.borrow_mut().surface.state_mut().shadow_offset_x = value;
@@ -2832,7 +3011,7 @@ macro_rules! impl_canvas_2d_methods {
             fn shadow_offset_y(&self) -> f64 {
                 self.data.borrow().surface.state().shadow_offset_y
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_shadow_offset_y(&self, value: f64) {
                 if value.is_finite() {
                     self.data.borrow_mut().surface.state_mut().shadow_offset_y = value;
@@ -2842,7 +3021,7 @@ macro_rules! impl_canvas_2d_methods {
             fn global_composite_operation(&self) -> String {
                 composite_name(self.data.borrow().surface.state().blend).into()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_global_composite_operation(&self, value: &str) {
                 if let Some(mode) = composite_mode(value) {
                     self.data.borrow_mut().surface.state_mut().blend = mode;
@@ -2853,7 +3032,7 @@ macro_rules! impl_canvas_2d_methods {
             fn font(&self) -> String {
                 self.data.borrow().text.font.clone()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_font(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
                 let (font_owner,font_node)=match (self.realm.as_ref(),self.node) {
                     (Some(realm),Some(node))=>{let (owner,node)=realm.resolve_adopted_node(node);(Some(owner),Some(node))},
@@ -2918,7 +3097,7 @@ macro_rules! impl_canvas_2d_methods {
             fn font_stretch(&self) -> String {
                 stretch_value(self.data.borrow().text.spec.stretch)
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_font_stretch(&self, value: &str) {
                 if let Some(stretch) = parse_stretch(value) {
                     self.data.borrow_mut().text.spec.stretch = stretch;
@@ -2932,7 +3111,7 @@ macro_rules! impl_canvas_2d_methods {
                     CanvasFontKerning::None => "none",
                 }
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_font_kerning(&self, value: &str) {
                 let value = match value {
                     "auto" => CanvasFontKerning::Auto,
@@ -2946,7 +3125,7 @@ macro_rules! impl_canvas_2d_methods {
             fn font_variant_caps(&self) -> &'static str {
                 self.data.borrow().text.font_variant_caps.as_str()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_font_variant_caps(&self, value: &str) {
                 let Some(value) = CanvasFontVariantCaps::parse(value) else { return; };
                 let mut data = self.data.borrow_mut();
@@ -2962,7 +3141,7 @@ macro_rules! impl_canvas_2d_methods {
                     CanvasTextRendering::GeometricPrecision => "geometricPrecision",
                 }
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_text_rendering(&self, value: &str) {
                 let value = match value {
                     "auto" => CanvasTextRendering::Auto,
@@ -2977,7 +3156,7 @@ macro_rules! impl_canvas_2d_methods {
             fn letter_spacing(&self) -> String {
                 css_spacing_string(self.data.borrow().text.letter_spacing)
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_letter_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
@@ -2994,7 +3173,7 @@ macro_rules! impl_canvas_2d_methods {
             fn word_spacing(&self) -> String {
                 css_spacing_string(self.data.borrow().text.word_spacing)
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_word_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
@@ -3011,7 +3190,7 @@ macro_rules! impl_canvas_2d_methods {
             fn text_align(&self) -> String {
                 self.data.borrow().text.align.clone()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_text_align(&self, value: &str) {
                 if matches!(value, "start" | "end" | "left" | "right" | "center") {
                     self.data.borrow_mut().text.align = value.into();
@@ -3021,7 +3200,7 @@ macro_rules! impl_canvas_2d_methods {
             fn text_baseline(&self) -> String {
                 self.data.borrow().text.baseline.clone()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_text_baseline(&self, value: &str) {
                 if matches!(
                     value,
@@ -3034,7 +3213,7 @@ macro_rules! impl_canvas_2d_methods {
             fn direction(&self) -> String {
                 self.data.borrow().text.direction.clone()
             }
-            #[setter]
+            #[setter(coerce)]
             fn set_direction(&self, value: &str) {
                 if matches!(value, "inherit" | "ltr" | "rtl") {
                     self.data.borrow_mut().text.direction = value.into();
@@ -3063,9 +3242,21 @@ macro_rules! impl_canvas_2d_methods {
                             format!("text shaping failed: {error:?}"),
                         )
                     })?;
-                let metrics = text_metrics(&fonts, &run, font_size, &spec)?;
+                let (anchor, baseline_shift) = {
+                    let data = self.data.borrow();
+                    let mut state = data.text.clone();
+                    state.direction = if rtl { "rtl" } else { "ltr" }.into();
+                    let ascent = fonts.ascent_styled(font_size, &spec);
+                    let descent = (fonts.line_height_styled(font_size, &spec) - ascent).max(0.0);
+                    (
+                        run.width * text_anchor(&state),
+                        text_baseline(&state, 0.0, ascent, descent),
+                    )
+                };
+                let (metrics, layout) =
+                    text_metrics(&fonts, &run, text, font_size, &spec, anchor, baseline_shift)?;
                 fonts.queue_demand_task(ctx)?;
-                let value = ctx.new_instance(DomTextMetrics { metrics });
+                let value = ctx.new_instance(DomTextMetrics { metrics, layout: Rc::new(layout) });
                 Ok(value)
             }
             #[method(name = "fillText")]
@@ -3228,7 +3419,6 @@ macro_rules! impl_canvas_2d_methods {
                 if ![x0, y0, x1, y1]
                     .iter()
                     .all(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX))
-                    || (x0 == x1 && y0 == y1)
                 {
                     return Err(OpError::new(
                         "IndexSizeError",
@@ -3241,6 +3431,28 @@ macro_rules! impl_canvas_2d_methods {
                     CanvasGradient::new(CanvasGradientKind::Linear {
                         start: [x0 as f32, y0 as f32],
                         end: [x1 as f32, y1 as f32],
+                        transform,
+                    }),
+                )
+            }
+
+            #[method(name = "createConicGradient")]
+            fn create_conic_gradient(
+                &self,
+                ctx: &mut Ctx,
+                start_angle: f64,
+                x: f64,
+                y: f64,
+            ) -> OpResult<Value> {
+                if ![start_angle, x, y].iter().all(|value| value.is_finite()) {
+                    return Err(OpError::type_error("conic gradient arguments must be finite"));
+                }
+                let transform = self.data.borrow().surface.state().transform;
+                new_gradient(
+                    ctx,
+                    CanvasGradient::new(CanvasGradientKind::Conic {
+                        center: [x as f32, y as f32],
+                        start_angle: start_angle as f32,
                         transform,
                     }),
                 )
@@ -3286,20 +3498,34 @@ macro_rules! impl_canvas_2d_methods {
                 &self,
                 ctx: &mut Ctx,
                 source: Value,
-                repetition: Option<&str>,
+                repetition: lumen_bind::Passed<Value>,
             ) -> OpResult<Value> {
+                let repetition = match repetition.0 {
+                    None => {
+                        return Err(OpError::type_error(
+                            "createPattern requires a repetition argument",
+                        ))
+                    }
+                    Some(Value::Null) => String::new(),
+                    Some(value) => ctx
+                        .coerce_string(&value)
+                        .map_err(OpError::thrown)?
+                        .as_ref()
+                        .to_owned(),
+                };
                 let source_image = match canvas_source_image(ctx, source.clone())? {
                     Some(image) => image,
                     None => return Ok(Value::Null),
                 };
                 let source_clean = canvas_source_origin_clean(ctx, &source);
-                let repetition = match repetition.unwrap_or("repeat") {
-                    "repeat" => CanvasPatternRepetition::Repeat,
+                let repetition = match repetition.as_str() {
+                    "" | "repeat" => CanvasPatternRepetition::Repeat,
                     "repeat-x" => CanvasPatternRepetition::RepeatX,
                     "repeat-y" => CanvasPatternRepetition::RepeatY,
                     "no-repeat" => CanvasPatternRepetition::NoRepeat,
                     _ => {
-                        return Err(OpError::new(
+                        return Err(crate::error_reporting::dom_exception(
+                            ctx,
                             "SyntaxError",
                             "invalid CanvasPattern repetition",
                         ));
@@ -3339,9 +3565,12 @@ macro_rules! impl_canvas_2d_methods {
                 let text = data.text.clone();
                 data.saved_text.push(text);
             }
-            fn restore(&self) {
+            fn restore(&self) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
-                if !data.surface.restore() { return; }
+                if data.surface.restore_crosses_layer() {
+                    return Err(OpError::new("InvalidStateError", "restore() would leave the open layer"));
+                }
+                if !data.surface.restore() { return Ok(()); }
                 if let Some((gradient, pattern, pattern_clean)) = data.saved_fill_styles.pop() {
                     data.fill_gradient_value = gradient;
                     data.fill_pattern_value = pattern;
@@ -3355,19 +3584,29 @@ macro_rules! impl_canvas_2d_methods {
                 if let Some(text) = data.saved_text.pop() {
                     data.text = text;
                 }
+                Ok(())
             }
-            fn begin_layer(&self) -> OpResult<()> {
+            fn begin_layer(&self, options: Option<Value>) -> OpResult<()> {
+                if options
+                    .as_ref()
+                    .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null | Value::Obj(_)))
+                {
+                    return Err(OpError::type_error("beginLayer options must be an object"));
+                }
                 // The entry save holds native state and traced JS style values.
                 self.save();
                 let result = self.data.borrow_mut().surface.begin_layer();
                 if result.is_err() {
-                    self.restore();
+                    let _ = self.restore();
                     return Err(OpError::new("QuotaExceededError", "Canvas layer budget exceeded"));
                 }
                 Ok(())
             }
             fn end_layer(&self) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
+                if data.surface.layer_has_unmatched_save() {
+                    return Err(OpError::new("InvalidStateError", "endLayer() with unmatched save()"));
+                }
                 let depth = data.surface.end_layer().ok_or_else(|| {
                     OpError::new("InvalidStateError", "No Canvas layer is open")
                 })?;
@@ -3447,41 +3686,49 @@ macro_rules! impl_canvas_2d_methods {
                     .push(PathCommand::Close);
             }
             fn move_to(&self, x: f64, y: f64) {
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Move(x as f32, y as f32));
+                if !canvas_path::all_finite(&[x, y]) {
+                    return;
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.push_mapped(ctm, PathCommand::Move(x as f32, y as f32));
             }
             fn line_to(&self, x: f64, y: f64) {
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Line(x as f32, y as f32));
+                if !canvas_path::all_finite(&[x, y]) {
+                    return;
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.push_mapped(ctm, PathCommand::Line(x as f32, y as f32));
             }
             fn quadratic_curve_to(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Quad(
-                        cpx as f32, cpy as f32, x as f32, y as f32,
-                    ));
+                if !canvas_path::all_finite(&[cpx, cpy, x, y]) {
+                    return;
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.push_mapped(
+                    ctm,
+                    PathCommand::Quad(cpx as f32, cpy as f32, x as f32, y as f32),
+                );
             }
             fn bezier_curve_to(&self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Cubic(
+                if !canvas_path::all_finite(&[cp1x, cp1y, cp2x, cp2y, x, y]) {
+                    return;
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.push_mapped(
+                    ctm,
+                    PathCommand::Cubic(
                         cp1x as f32,
                         cp1y as f32,
                         cp2x as f32,
                         cp2y as f32,
                         x as f32,
                         y as f32,
-                    ));
+                    ),
+                );
             }
             #[method(name = "arc")]
             fn arc(
@@ -3493,23 +3740,22 @@ macro_rules! impl_canvas_2d_methods {
                 end_angle: f64,
                 counterclockwise: Option<bool>,
             ) -> OpResult<()> {
-                if radius < 0.0 {
-                    return Err(OpError::new(
-                        "IndexSizeError",
-                        "arc radius must be non-negative",
-                    ));
-                }
                 let values = [x, y, radius, start_angle, end_angle];
                 if !values.iter().all(|value| value.is_finite())
                     || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
                 {
                     return Ok(());
                 }
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Arc {
+                if radius < 0.0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "arc radius must be non-negative",
+                    ));
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.append_in_user_space(ctm, |path| {
+                    path.commands.push(PathCommand::Arc {
                         cx: x as f32,
                         cy: y as f32,
                         rx: radius as f32,
@@ -3519,7 +3765,8 @@ macro_rules! impl_canvas_2d_methods {
                         end: end_angle as f32,
                         counterclockwise: counterclockwise.unwrap_or(false),
                     });
-                Ok(())
+                    Ok(())
+                })
             }
             #[method(name = "ellipse")]
             fn ellipse(
@@ -3533,23 +3780,22 @@ macro_rules! impl_canvas_2d_methods {
                 end_angle: f64,
                 counterclockwise: Option<bool>,
             ) -> OpResult<()> {
-                if radius_x < 0.0 || radius_y < 0.0 {
-                    return Err(OpError::new(
-                        "IndexSizeError",
-                        "ellipse radii must be non-negative",
-                    ));
-                }
                 let values = [x, y, radius_x, radius_y, rotation, start_angle, end_angle];
                 if !values.iter().all(|value| value.is_finite())
                     || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
                 {
                     return Ok(());
                 }
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Arc {
+                if radius_x < 0.0 || radius_y < 0.0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "ellipse radii must be non-negative",
+                    ));
+                }
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path.append_in_user_space(ctm, |path| {
+                    path.commands.push(PathCommand::Arc {
                         cx: x as f32,
                         cy: y as f32,
                         rx: radius_x as f32,
@@ -3559,19 +3805,121 @@ macro_rules! impl_canvas_2d_methods {
                         end: end_angle as f32,
                         counterclockwise: counterclockwise.unwrap_or(false),
                     });
-                Ok(())
+                    Ok(())
+                })
             }
             fn rect(&self, x: f64, y: f64, width: f64, height: f64) {
-                self.data
-                    .borrow_mut()
-                    .current_path
-                    .commands
-                    .push(PathCommand::Rect(
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                let _ = data.current_path.append_in_user_space(ctm, |path| {
+                    path.commands.push(PathCommand::Rect(
                         x as f32,
                         y as f32,
                         width as f32,
                         height as f32,
                     ));
+                    Ok(())
+                });
+            }
+            fn arc_to(&self, x1: f64, y1: f64, x2: f64, y2: f64, radius: f64) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path
+                    .append_in_user_space(ctm, |path| path.arc_to(x1, y1, x2, y2, radius))
+            }
+            fn round_rect(
+                &self,
+                ctx: &mut Ctx,
+                x: f64,
+                y: f64,
+                width: f64,
+                height: f64,
+                radii: Option<Value>,
+            ) -> OpResult<()> {
+                let radii = canvas_path::parse_radii(ctx, radii)?;
+                let mut data = self.data.borrow_mut();
+                let ctm = data.surface.state().transform;
+                data.current_path
+                    .append_in_user_space(ctm, |path| path.round_rect(x, y, width, height, &radii))
+            }
+            #[method(name = "isPointInPath")]
+            fn is_point_in_path(
+                &self,
+                ctx: &mut Ctx,
+                first: Value,
+                second: Value,
+                third: lumen_bind::Passed<Value>,
+                fourth: lumen_bind::Passed<Value>,
+            ) -> OpResult<bool> {
+                let (path, x, y, rule) = hit_test_arguments(ctx, first, second, third.0, fourth.0)?;
+                let rule = match rule {
+                    None | Some(Value::Undefined) => parse_fill_rule(None)?,
+                    Some(value) => {
+                        let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
+                        parse_fill_rule(Some(text.as_ref()))?
+                    }
+                };
+                let data = self.data.borrow();
+                let Some((x, y)) = user_space_point(&data, x, y) else {
+                    return Ok(false);
+                };
+                let built = built_path(&data, path.as_ref());
+                Ok(built.is_some_and(|built| canvas_path::fill_contains(&built, x, y, rule)))
+            }
+            #[method(name = "isPointInStroke")]
+            fn is_point_in_stroke(
+                &self,
+                ctx: &mut Ctx,
+                first: Value,
+                second: Value,
+                third: Option<Value>,
+            ) -> OpResult<bool> {
+                let (path, x, y, _) = hit_test_arguments(ctx, first, second, third, None)?;
+                let data = self.data.borrow();
+                let Some((x, y)) = user_space_point(&data, x, y) else {
+                    return Ok(false);
+                };
+                let built = built_path(&data, path.as_ref());
+                let stroke = data.surface.state().line.clone();
+                Ok(built.is_some_and(|built| canvas_path::stroke_contains(&built, &stroke, x, y)))
+            }
+            fn reset(&self) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                data.ensure_bitmap_available()?;
+                let (width, height) = data.surface.dimensions();
+                data.surface.resize(width, height).map_err(|_| {
+                    OpError::new("InvalidStateError", "canvas could not be reset")
+                })?;
+                data.reset_after_resize();
+                self.publish_data(&mut data)
+            }
+            fn is_context_lost(&self) -> bool {
+                false
+            }
+            fn get_context_attributes(&self, ctx: &mut Ctx) -> Value {
+                let (alpha, color_space, desynchronized, will_read, float16, extended) = {
+                    let data = self.data.borrow();
+                    (
+                        data.alpha,
+                        data.color_space.as_str(),
+                        data.desynchronized,
+                        data.will_read_frequently,
+                        data.float16_color_type,
+                        data.extended_tone_mapping,
+                    )
+                };
+                let tone_mapping = ctx.plain_object(&[(
+                    "mode",
+                    Value::str(if extended { "extended" } else { "standard" }),
+                )]);
+                ctx.plain_object(&[
+                    ("alpha", Value::Bool(alpha)),
+                    ("colorSpace", Value::str(color_space)),
+                    ("desynchronized", Value::Bool(desynchronized)),
+                    ("willReadFrequently", Value::Bool(will_read)),
+                    ("colorType", Value::str(if float16 { "float16" } else { "unorm8" })),
+                    ("toneMapping", tone_mapping),
+                ])
             }
             fn fill(
                 &self,
@@ -3592,10 +3940,7 @@ macro_rules! impl_canvas_2d_methods {
                     None => (None, fill_rule.map(str::to_owned)),
                 };
                 let rule = parse_fill_rule(rule_text.as_deref())?;
-                let path = path_data
-                    .as_ref()
-                    .unwrap_or(&data.current_path)
-                    .build(Transform::identity());
+                let path = built_path(&data, path_data.as_ref());
                 if let Some(path) = path {
                     data.surface.fill_path(&path, rule).map_err(|error| {
                         OpError::new(
@@ -3614,10 +3959,7 @@ macro_rules! impl_canvas_2d_methods {
                 let path_data = path_data
                     .map(|value| clone_path2d(ctx, &value))
                     .transpose()?;
-                let path = path_data
-                    .as_ref()
-                    .unwrap_or(&data.current_path)
-                    .build(Transform::identity());
+                let path = built_path(&data, path_data.as_ref());
                 if let Some(path) = path {
                     data.surface.stroke_path(&path).map_err(|error| {
                         OpError::new(
@@ -3644,10 +3986,7 @@ macro_rules! impl_canvas_2d_methods {
                     None => (None, fill_rule.map(str::to_owned)),
                 };
                 let rule = parse_fill_rule(rule_text.as_deref())?;
-                let path = path_data
-                    .as_ref()
-                    .unwrap_or(&data.current_path)
-                    .build(Transform::identity());
+                let path = built_path(&data, path_data.as_ref());
                 if let Some(path) = path {
                     data.surface.clip_path(&path, rule);
                 }
@@ -3655,23 +3994,75 @@ macro_rules! impl_canvas_2d_methods {
             }
 
             fn translate(&self, x: f64, y: f64) {
-                self.transform(Transform::from_translate(x as f32, y as f32));
+                self.concat_transform(Transform::from_translate(x as f32, y as f32));
             }
             fn scale(&self, x: f64, y: f64) {
-                self.transform(Transform::from_scale(x as f32, y as f32));
+                self.concat_transform(Transform::from_scale(x as f32, y as f32));
+            }
+            fn transform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
+                if canvas_path::all_finite(&[a, b, c, d, e, f]) {
+                    self.concat_transform(Transform::from_row(
+                        a as f32, b as f32, c as f32, d as f32, e as f32, f as f32,
+                    ));
+                }
+            }
+            fn get_transform(&self, ctx: &mut Ctx) -> Value {
+                let t = self.data.borrow().surface.state().transform;
+                let matrix = lumen_common::dom_geometry::Matrix::from_affine(
+                    [t.sx, t.ky, t.kx, t.sy, t.tx, t.ty].map(f64::from),
+                );
+                crate::geometry::matrix_native_instance(ctx, matrix)
             }
             fn rotate(&self, angle: f64) {
                 if angle.is_finite() {
                     let (s, c) = (angle.sin() as f32, angle.cos() as f32);
-                    self.transform(Transform::from_row(c, s, -s, c, 0.0, 0.0));
+                    self.concat_transform(Transform::from_row(c, s, -s, c, 0.0, 0.0));
                 }
             }
-            fn set_transform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
-                if [a, b, c, d, e, f].iter().all(|n| n.is_finite()) {
-                    self.data.borrow_mut().surface.state_mut().transform = Transform::from_row(
-                        a as f32, b as f32, c as f32, d as f32, e as f32, f as f32,
-                    );
-                }
+            fn set_transform(
+                &self,
+                ctx: &mut Ctx,
+                a: Option<Value>,
+                b: Option<Value>,
+                c: Option<Value>,
+                d: Option<Value>,
+                e: Option<Value>,
+                f: Option<Value>,
+            ) -> OpResult<()> {
+                let transform = match (b, c, d, e, f) {
+                    (None, None, None, None, None) => match a {
+                        None | Some(Value::Undefined | Value::Null) => Transform::identity(),
+                        Some(value @ Value::Obj(_)) => parse_dom_matrix(ctx, &value)?,
+                        Some(_) => {
+                            return Err(OpError::new(
+                                "TypeError",
+                                "setTransform expects a matrix or six numbers",
+                            ));
+                        }
+                    },
+                    (Some(b), Some(c), Some(d), Some(e), Some(f)) => {
+                        let Some(a) = a else {
+                            return Err(OpError::new("TypeError", "setTransform argument a is required"));
+                        };
+                        let mut values = [0.0f64; 6];
+                        for (slot, value) in values.iter_mut().zip([a, b, c, d, e, f]) {
+                            *slot = ctx.coerce_number(&value).map_err(OpError::thrown)?;
+                        }
+                        if !canvas_path::all_finite(&values) {
+                            return Ok(());
+                        }
+                        let [a, b, c, d, e, f] = values.map(|v| v as f32);
+                        Transform::from_row(a, b, c, d, e, f)
+                    }
+                    _ => {
+                        return Err(OpError::new(
+                            "TypeError",
+                            "setTransform expects a matrix or six numbers",
+                        ));
+                    }
+                };
+                self.data.borrow_mut().surface.state_mut().transform = transform;
+                Ok(())
             }
             fn reset_transform(&self) {
                 self.data.borrow_mut().surface.state_mut().transform = Transform::identity();
@@ -3698,6 +4089,7 @@ macro_rules! impl_canvas_2d_methods {
                 )?;
                 ensure_origin_clean(&self.data.borrow())?;
                 self.data.borrow().ensure_bitmap_available()?;
+                self.data.borrow().ensure_no_open_layers()?;
                 if sw == 0 || sh == 0 {
                     return Err(OpError::new(
                         "IndexSizeError",
@@ -3833,6 +4225,7 @@ macro_rules! impl_canvas_2d_methods {
                     return Ok(());
                 };
                 self.data.borrow().ensure_bitmap_available()?;
+                self.data.borrow().ensure_no_open_layers()?;
                 let pixels = Arc::new(image.read_pixels(ctx)?);
                 let mut data = self.data.borrow_mut();
                 data.surface
@@ -4087,8 +4480,11 @@ impl DomCanvasGradient {
             "CanvasGradient cannot be constructed directly",
         ))
     }
-    #[method(name = "addColorStop")]
-    fn add_color_stop(&self, offset: f64, color: &str) -> OpResult<()> {
+    #[method(name = "addColorStop", coerce)]
+    fn add_color_stop(&self, ctx: &mut Ctx, offset: f64, color: &str) -> OpResult<()> {
+        if !offset.is_finite() {
+            return Err(OpError::type_error("gradient stop offset must be finite"));
+        }
         let value = Value::Str(color.into());
         // Gradients are canvas-neutral, so there is no element color to inherit.
         let color = parse_style_color(
@@ -4100,7 +4496,7 @@ impl DomCanvasGradient {
                 a: 255,
             },
         )
-        .ok_or_else(|| OpError::new("SyntaxError", "invalid gradient color"))?;
+        .ok_or_else(|| crate::error_reporting::dom_exception(ctx, "SyntaxError", "invalid gradient color"))?;
         self.handle
             .gradient
             .add_color_stop(offset as f32, color)
@@ -4867,7 +5263,10 @@ macro_rules! impl_canvas_2d_helpers {
                 publish(self.realm.as_ref(), self.node, data)
             }
 
-            fn transform(&self, transform: Transform) {
+            fn concat_transform(&self, transform: Transform) {
+                if !transform.is_finite() {
+                    return;
+                }
                 let mut data = self.data.borrow_mut();
                 let current = data.surface.state().transform;
                 data.surface.state_mut().transform = current.pre_concat(transform);
@@ -4889,11 +5288,14 @@ struct CanvasTextMetricsData {
     actual_descent: f64,
     font_ascent: f64,
     font_descent: f64,
+    em_ascent: f64,
+    em_descent: f64,
 }
 
 #[lumen_bind::class(name = "TextMetrics", hint(js(webidl)))]
 struct DomTextMetrics {
     metrics: CanvasTextMetricsData,
+    layout: Rc<canvas_text_metrics::TextLayout>,
 }
 
 #[lumen_bind::methods]
@@ -4934,12 +5336,54 @@ impl DomTextMetrics {
     }
     #[getter]
     fn em_height_ascent(&self) -> f64 {
-        self.metrics.font_ascent
+        self.metrics.em_ascent
     }
     #[getter]
     fn em_height_descent(&self) -> f64 {
-        self.metrics.font_descent
+        self.metrics.em_descent
     }
+    #[method(name = "getIndexFromOffset", coerce)]
+    fn get_index_from_offset(&self, offset: f64) -> u32 {
+        self.layout.index_from_offset(offset)
+    }
+    #[method(name = "getSelectionRects", coerce)]
+    fn get_selection_rects(&self, ctx: &mut Ctx, start: f64, end: f64) -> OpResult<Value> {
+        let start = text_index(start)?;
+        let end = text_index(end)?;
+        let length = self.layout.utf16_len();
+        if start > length || end > length {
+            return Err(OpError::new("IndexSizeError", "text index out of range"));
+        }
+        let rects = self.layout.selection_rects(start, end);
+        let values: Vec<Value> = rects.into_iter().map(|rect| crate::geometry::rect_value(ctx, rect)).collect();
+        Ok(<lumen::embed::JsHost as lumen_bind::Host>::from_list(ctx, values))
+    }
+    #[method(name = "getActualBoundingBox", coerce)]
+    fn get_actual_bounding_box(&self, ctx: &mut Ctx, start: f64, end: f64) -> OpResult<Value> {
+        let start = text_index(start)?;
+        let end = text_index(end)?;
+        if start > end || end > self.layout.utf16_len() {
+            return Err(OpError::new("IndexSizeError", "text index out of range"));
+        }
+        let (first, last) = self.layout.byte_range(start, end);
+        let bounds = self.layout.ink_bounds(Some((first, last)));
+        Ok(crate::geometry::rect_value(
+            ctx,
+            lumen_html::paint::Rect {
+                x: bounds.left,
+                y: bounds.top,
+                width: bounds.right - bounds.left,
+                height: bounds.bottom - bounds.top,
+            },
+        ))
+    }
+}
+
+fn text_index(value: f64) -> OpResult<u32> {
+    if !value.is_finite() || value < 0.0 || value > f64::from(u32::MAX) {
+        return Err(OpError::type_error("text index is out of range for unsigned long"));
+    }
+    Ok(value as u32)
 }
 
 fn canvas_node_font_source(ctx:&mut Ctx,realm:Option<&Rc<DomRealm>>,node:Option<NodeId>)->OpResult<CanvasFontSource> {
@@ -5169,44 +5613,38 @@ fn css_spacing_string(value: f32) -> String {
 fn text_metrics(
     font: &dyn FontProvider,
     run: &lumen_html::paint::ShapedRun,
+    text: &str,
     size: f32,
     spec: &FontSpec,
-) -> OpResult<CanvasTextMetricsData> {
-    let mut metrics = CanvasTextMetricsData {
+    anchor_shift: f32,
+    baseline_shift: f32,
+) -> OpResult<(CanvasTextMetricsData, canvas_text_metrics::TextLayout)> {
+    let ascent = font.ascent_styled(size, spec);
+    let descent = (font.line_height_styled(size, spec) - ascent).max(0.0);
+    let layout = canvas_text_metrics::TextLayout::build(&canvas_text_metrics::LayoutInput {
+        font,
+        run,
+        text,
+        size,
+        anchor_shift,
+        baseline_shift,
+        font_ascent: ascent - baseline_shift,
+        font_descent: descent + baseline_shift,
+    })?;
+    let ink = layout.ink_bounds(None);
+    let em_ascent = if ascent + descent > 0.0 { size * ascent / (ascent + descent) } else { 0.0 };
+    let metrics = CanvasTextMetricsData {
+        em_ascent: f64::from(em_ascent - baseline_shift),
+        em_descent: f64::from(size - em_ascent + baseline_shift),
         width: f64::from(run.width),
-        font_ascent: f64::from(font.ascent_styled(size, spec)),
-        font_descent: f64::from(
-            (font.line_height_styled(size, spec) - font.ascent_styled(size, spec)).max(0.0),
-        ),
-        ..CanvasTextMetricsData::default()
+        font_ascent: f64::from(ascent - baseline_shift),
+        font_descent: f64::from(descent + baseline_shift),
+        actual_left: f64::from(-ink.left),
+        actual_right: f64::from(ink.right),
+        actual_ascent: f64::from(-ink.top),
+        actual_descent: f64::from(ink.bottom),
     };
-    let (mut left, mut right, mut top, mut bottom) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-    for glyph in run.glyphs.iter() {
-        let coverage = font
-            .rasterize_glyph(glyph.face, glyph.id, size * glyph.size_scale)
-            .map_err(|error| {
-                OpError::new(
-                    "InvalidStateError",
-                    format!("font rasterization failed: {error}"),
-                )
-            })?;
-        if coverage.width == 0 || coverage.height == 0 {
-            continue;
-        }
-        let glyph_left = glyph.x + coverage.x_min as f32;
-        let glyph_right = glyph_left + coverage.width as f32;
-        let glyph_top = -glyph.y - coverage.y_min as f32 - coverage.height as f32;
-        let glyph_bottom = glyph_top + coverage.height as f32;
-        left = left.min(glyph_left);
-        right = right.max(glyph_right);
-        top = top.min(glyph_top);
-        bottom = bottom.max(glyph_bottom);
-    }
-    metrics.actual_left = f64::from((-left).max(0.0));
-    metrics.actual_right = f64::from(right.max(0.0));
-    metrics.actual_ascent = f64::from((-top).max(0.0));
-    metrics.actual_descent = f64::from(bottom.max(0.0));
-    Ok(metrics)
+    Ok((metrics, layout))
 }
 
 fn current_canvas_color(realm: &Option<Rc<DomRealm>>, node: Option<NodeId>) -> Rgba {
@@ -5237,21 +5675,19 @@ fn parse_style_color(value: &Value, current: Rgba) -> Option<[u8; 4]> {
 
 fn color_string(color: [u8; 4]) -> String {
     if color[3] == 255 {
-        format!("rgb({}, {}, {})", color[0], color[1], color[2])
-    } else {
-        format!(
-            "rgba({}, {}, {}, {})",
-            color[0],
-            color[1],
-            color[2],
-            color[3] as f32 / 255.0
-        )
+        return format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
     }
+    let alpha = f64::from(color[3]) / 255.0;
+    let mut rounded = (alpha * 100.0).round() / 100.0;
+    if (rounded * 255.0).round() as u8 != color[3] {
+        rounded = (alpha * 1000.0).round() / 1000.0;
+    }
+    format!("rgba({}, {}, {}, {})", color[0], color[1], color[2], rounded)
 }
 
 fn composite_name(mode: BlendMode) -> &'static str {
     match mode {
-        BlendMode::Clear => "copy",
+        BlendMode::Clear => "clear",
         BlendMode::Source => "copy",
         BlendMode::Destination => "destination-over",
         BlendMode::DestinationOver => "destination-over",
@@ -5286,6 +5722,7 @@ fn composite_mode(name: &str) -> Option<BlendMode> {
     Some(match name {
         "source-over" => BlendMode::SourceOver,
         "copy" => BlendMode::Source,
+        "clear" => BlendMode::Clear,
         "destination-over" => BlendMode::DestinationOver,
         "source-in" => BlendMode::SourceIn,
         "destination-in" => BlendMode::DestinationIn,
@@ -5312,6 +5749,59 @@ fn composite_mode(name: &str) -> Option<BlendMode> {
         "luminosity" => BlendMode::Luminosity,
         _ => return None,
     })
+}
+
+type HitTestArguments = (Option<CanvasPath>, f64, f64, Option<Value>);
+
+/// Resolve the `(path, x, y, rule)` and `(x, y, rule)` overloads of isPointInPath/isPointInStroke.
+fn hit_test_arguments(
+    ctx: &mut Ctx,
+    first: Value,
+    second: Value,
+    third: Option<Value>,
+    fourth: Option<Value>,
+) -> OpResult<HitTestArguments> {
+    let path = ctx
+        .with_instance::<DomPath2D, _>(&first, |path| path.path.borrow().clone())
+        .ok();
+    let (path, x, y, rule) = if path.is_some() || fourth.is_some() {
+        let Some(path) = path else {
+            return Err(OpError::new("TypeError", "argument 1 must be a Path2D"));
+        };
+        let Some(y) = third else {
+            return Err(OpError::new("TypeError", "isPointInPath requires x and y"));
+        };
+        (Some(path), second, y, fourth)
+    } else {
+        (None, first, second, third)
+    };
+    let x = ctx.coerce_number(&x).map_err(OpError::thrown)?;
+    let y = ctx.coerce_number(&y).map_err(OpError::thrown)?;
+    Ok((path, x, y, rule))
+}
+
+/// The path to draw: a Path2D as given, or the context's device-space current path
+/// mapped back through the current transformation matrix.
+fn built_path(data: &CanvasData, path: Option<&CanvasPath>) -> Option<Path> {
+    if let Some(path) = path {
+        return path.build(Transform::identity());
+    }
+    let built = data.current_path.build(Transform::identity())?;
+    let ctm = data.surface.state().transform;
+    if ctm.is_identity() {
+        return Some(built);
+    }
+    built.transform(ctm.invert()?)
+}
+
+fn user_space_point(data: &CanvasData, x: f64, y: f64) -> Option<(f64, f64)> {
+    if !canvas_path::all_finite(&[x, y]) {
+        return None;
+    }
+    let inverse = data.surface.state().transform.invert()?;
+    let mut point = tiny_skia::Point::from_xy(x as f32, y as f32);
+    inverse.map_point(&mut point);
+    Some((f64::from(point.x), f64::from(point.y)))
 }
 
 fn parse_fill_rule(rule: Option<&str>) -> OpResult<FillRule> {
@@ -5420,15 +5910,14 @@ impl DomImageData {
         match ctx.typed_array_kind(&data_or_width) {
             Some(TaKind::U8Clamped | TaKind::F16) => {
                 let width = height.as_ref().ok_or_else(|| {
-                    OpError::new("TypeError", "ImageData requires width and height")
-                })?;
-                let height = data_height_or_settings.as_ref().ok_or_else(|| {
-                    OpError::new("TypeError", "ImageData requires width and height")
+                    OpError::new("TypeError", "ImageData requires a width")
                 })?;
                 let width = webidl_unsigned_long(ctx, width)?;
-                let height = webidl_unsigned_long(ctx, height)?;
+                let declared_height = match data_height_or_settings.as_ref() {
+                    None | Some(Value::Undefined) => None,
+                    Some(value) => Some(webidl_unsigned_long(ctx, value)?),
+                };
                 let parsed = parse_image_data_settings(ctx, settings.as_ref())?;
-                let (_, byte_len) = image_data_storage(width, height, parsed.pixel_format)?;
                 let actual_kind = ctx.typed_array_kind(&data_or_width);
                 if actual_kind != Some(parsed.pixel_format.typed_array_kind()) {
                     return Err(OpError::new(
@@ -5436,12 +5925,33 @@ impl DomImageData {
                         "ImageData pixelFormat does not match its pixel array",
                     ));
                 }
-                if ctx.typed_array_byte_len(&data_or_width) != Some(byte_len) {
+                let pixel_bytes = 4 * parsed.pixel_format.bytes_per_component();
+                let byte_len = ctx.typed_array_byte_len(&data_or_width).unwrap_or(0);
+                if byte_len == 0 || byte_len % pixel_bytes != 0 {
                     return Err(OpError::new(
                         "InvalidStateError",
-                        "ImageData array is detached or its length does not match its dimensions",
+                        "ImageData array is detached or has an invalid length",
                     ));
                 }
+                if width == 0 {
+                    return Err(OpError::new("IndexSizeError", "ImageData width cannot be zero"));
+                }
+                let pixels = byte_len / pixel_bytes;
+                if pixels % width as usize != 0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "ImageData array length is not a multiple of its width",
+                    ));
+                }
+                let height = u32::try_from(pixels / width as usize)
+                    .map_err(|_| OpError::new("IndexSizeError", "ImageData is too large"))?;
+                if declared_height.is_some_and(|declared| declared != height) {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "ImageData height does not match its array length",
+                    ));
+                }
+                image_data_storage(width, height, parsed.pixel_format)?;
                 Ok(Self {
                     image: None,
                     width,
@@ -5451,17 +5961,7 @@ impl DomImageData {
                     pixels: RefCell::new(Some(data_or_width)),
                 })
             }
-            Some(_) => Err(OpError::new(
-                "TypeError",
-                "ImageData requires a Uint8ClampedArray or Float16Array",
-            )),
-            None => {
-                if matches!(data_or_width, Value::Obj(_)) {
-                    return Err(OpError::new(
-                        "TypeError",
-                        "ImageData expects an image-data array or numeric dimensions",
-                    ));
-                }
+            _ => {
                 let height = height.ok_or_else(|| {
                     OpError::new("TypeError", "ImageData expects width and height")
                 })?;
@@ -5581,38 +6081,25 @@ fn clone_path2d(ctx: &mut Ctx, value: &Value) -> OpResult<CanvasPath> {
 }
 
 fn parse_dom_matrix(ctx: &mut Ctx, value: &Value) -> OpResult<Transform> {
-    let component = |ctx: &mut Ctx, name: &str, default: f64| -> OpResult<f32> {
-        let value = ctx
-            .get_member(value, name)
-            .map_err(|_| OpError::new("TypeError", "Path2D transform is unreadable"))?;
-        let value = match value {
-            Value::Undefined => default,
-            Value::Num(value) if value.is_finite() => value,
-            _ => {
-                return Err(OpError::new(
-                    "TypeError",
-                    "Path2D transform must be a finite matrix",
-                ));
-            }
-        };
-        let value = value as f32;
-        if value.is_finite() {
-            Ok(value)
-        } else {
-            Err(OpError::new(
+    let components = crate::geometry::matrix_2d_init(ctx, value)?;
+    let mut narrowed = [0.0f32; 6];
+    for (slot, component) in narrowed.iter_mut().zip(components) {
+        if !component.is_finite() {
+            return Err(OpError::new(
+                "TypeError",
+                "Path2D transform must be a finite matrix",
+            ));
+        }
+        *slot = component as f32;
+        if !slot.is_finite() {
+            return Err(OpError::new(
                 "TypeError",
                 "Path2D transform is out of range",
-            ))
+            ));
         }
-    };
-    Ok(Transform::from_row(
-        component(ctx, "a", 1.0)?,
-        component(ctx, "b", 0.0)?,
-        component(ctx, "c", 0.0)?,
-        component(ctx, "d", 1.0)?,
-        component(ctx, "e", 0.0)?,
-        component(ctx, "f", 0.0)?,
-    ))
+    }
+    let [a, b, c, d, e, f] = narrowed;
+    Ok(Transform::from_row(a, b, c, d, e, f))
 }
 
 #[lumen_bind::class(name = "ElementImage", hint(js(webidl)))]
@@ -5706,6 +6193,71 @@ fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec
     }
 }
 
+fn image_bitmap_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCodec {
+    use lumen_host::clone_transfer::NativeGraphValueCodec;
+    NativeGraphValueCodec {
+        // The clone layer caps native payloads at 64 MiB, so the 10-byte header comes out of
+        // the pixel budget.
+        kind: "ImageBitmap", max_bytes: MAX_IMAGE_DATA_BYTES, max_children: 0,
+        matches: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |_| ()).is_ok(),
+        serialize: |ctx, value| {
+            let (width, height, pixels, premultiply, clean) = ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
+                bitmap.image.borrow().as_ref().map(|image| (image.width, image.height, image.pixels.clone(), bitmap.premultiply_alpha, bitmap.origin_clean))
+            })?.ok_or_else(|| OpError::new("DataCloneError", "ImageBitmap is detached"))?;
+            if !clean {
+                return Err(OpError::new("DataCloneError", "ImageBitmap is not origin-clean"));
+            }
+            if pixels.len() > MAX_IMAGE_DATA_BYTES - 10 {
+                return Err(OpError::new("DataCloneError", "ImageBitmap is too large to clone"));
+            }
+            let mut bytes = Vec::with_capacity(pixels.len() + 10);
+            bytes.extend_from_slice(&width.to_le_bytes());
+            bytes.extend_from_slice(&height.to_le_bytes());
+            bytes.push(u8::from(premultiply));
+            bytes.push(u8::from(clean));
+            bytes.extend_from_slice(&pixels);
+            Ok((bytes, Vec::new()))
+        },
+        create: |ctx, bytes| {
+            if bytes.len() < 10 { return Err(OpError::new("DataCloneError", "Invalid ImageBitmap metadata")); }
+            let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            let image = Rgba8Image { width, height, pixels: bytes[10..].to_vec() };
+            new_image_bitmap_with_origin(ctx, image, bytes[8] != 0, bytes[9] != 0)
+                .map_err(|_| OpError::new("DataCloneError", "Invalid ImageBitmap pixels"))
+        },
+        populate: |_, _, _| Ok(()),
+    }
+}
+
+fn image_bitmap_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec {
+    lumen_host::clone_transfer::NativeTransferCodec {
+        kind: "ImageBitmap",
+        matches: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |_| ()).is_ok(),
+        validate: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
+            if bitmap.image.borrow().is_none() {
+                Err(OpError::new("DataCloneError", "ImageBitmap is detached"))
+            } else {
+                Ok(())
+            }
+        })?,
+        export: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
+            let image = bitmap.image.borrow().as_ref().expect("validated ImageBitmap").clone();
+            Box::new((image, bitmap.premultiply_alpha, bitmap.origin_clean)) as Box<dyn std::any::Any + Send>
+        }),
+        detach: |ctx, value, _| {
+            let _ = ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
+                bitmap.image.borrow_mut().take();
+            });
+        },
+        import: |ctx, payload| {
+            let payload = payload.downcast::<(Rgba8Image, bool, bool)>().map_err(|_| OpError::new("DataCloneError", "Invalid ImageBitmap attachment"))?;
+            let (image, premultiply, clean) = *payload;
+            new_image_bitmap_with_origin(ctx, image, premultiply, clean)
+        },
+    }
+}
+
 fn image_data_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCodec {
     use lumen_host::clone_transfer::NativeGraphValueCodec;
     NativeGraphValueCodec {
@@ -5722,7 +6274,7 @@ fn image_data_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCodec
             let mut bytes = Vec::with_capacity(10);
             bytes.extend_from_slice(&image.width.to_le_bytes());
             bytes.extend_from_slice(&image.height.to_le_bytes());
-            bytes.push(match image.color_space { CanvasColorSpace::Srgb => 0, CanvasColorSpace::DisplayP3 => 1 });
+            bytes.push(image.color_space.code());
             bytes.push(match image.pixel_format { ImageDataPixelFormat::RgbaUnorm8 => 0, ImageDataPixelFormat::RgbaFloat16 => 1 });
             Ok((bytes, vec![pixels]))
         },
@@ -5730,7 +6282,7 @@ fn image_data_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCodec
             if bytes.len() != 10 { return Err(OpError::new("DataCloneError", "Invalid ImageData metadata")); }
             let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            let color_space = match bytes[8] { 0 => CanvasColorSpace::Srgb, 1 => CanvasColorSpace::DisplayP3, _ => return Err(OpError::new("DataCloneError", "Invalid ImageData color space")) };
+            let color_space = CanvasColorSpace::from_code(bytes[8]).ok_or_else(|| OpError::new("DataCloneError", "Invalid ImageData color space"))?;
             let pixel_format = match bytes[9] { 0 => ImageDataPixelFormat::RgbaUnorm8, 1 => ImageDataPixelFormat::RgbaFloat16, _ => return Err(OpError::new("DataCloneError", "Invalid ImageData pixel format")) };
             image_data_storage(width, height, pixel_format).map_err(|_| OpError::new("DataCloneError", "Invalid ImageData dimensions"))?;
             Ok(ctx.new_instance(DomImageData { image: None, width, height, color_space, pixel_format, pixels: RefCell::new(None) }))
@@ -5754,6 +6306,8 @@ fn install_canvas_apis(ctx: &mut Ctx, include_window_context: bool) -> OpResult<
     lumen_host::clone_transfer::register_native_codec(ctx, offscreen_transfer_codec());
     lumen_host::clone_transfer::register_native_codec(ctx, element_image_transfer_codec());
     lumen_host::clone_transfer::register_native_graph_value_codec(ctx, image_data_value_codec());
+    lumen_host::clone_transfer::register_native_graph_value_codec(ctx, image_bitmap_value_codec());
+    lumen_host::clone_transfer::register_native_codec(ctx, image_bitmap_transfer_codec());
     let global = ctx.global_object();
     let _bitmap_decode_job_constructor = ctx.class_constructor::<DomBitmapDecodeJob>();
     for (name, constructor) in [
@@ -6188,7 +6742,7 @@ mod tests {
                 context.shadowOffsetY = 6;
                 context.restore();
                 const restored = context.lineCap === 'round' && context.lineJoin === 'bevel' &&
-                    context.miterLimit === 3.5 && context.shadowColor === 'rgb(0, 0, 255)' &&
+                    context.miterLimit === 3.5 && context.shadowColor === '#0000ff' &&
                     context.shadowBlur === 2 && context.shadowOffsetX === 3 &&
                     context.shadowOffsetY === -1;
                 context.shadowBlur = 0;
@@ -6793,6 +7347,7 @@ mod tests {
                 x.beginLayer(); x.fillStyle='red'; x.font='24px serif';
                 x.save(); x.fillRect(0,0,1,1);
                 x.beginLayer(); x.fillStyle='lime'; x.fillRect(1,0,1,1); x.endLayer();
+                x.restore();
                 x.endLayer();
                 if (x.fillStyle !== beforeStyle || x.font !== '12px serif' || x.globalAlpha !== .5) throw Error('layer entry styles not restored');
                 const pixels=x.getImageData(0,0,2,1).data;

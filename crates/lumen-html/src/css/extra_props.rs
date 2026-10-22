@@ -246,6 +246,7 @@ pub(crate) fn copy_slot(slot: usize, from: &Style, to: &mut Style) {
     if to.generic.get(index) != value.as_ref() {
         mirror_svg_reference(slot, value.as_deref().unwrap_or(prop_at(index).initial), to);
         to.generic.set(index, value);
+        mirror_spacing_trim(slot, to);
         mirror_grid_lines(slot, to);
         mirror_background_position(slot, to);
     }
@@ -336,56 +337,6 @@ pub(super) fn integer(raw: &str, context: LengthContext) -> Option<i64> {
     css_integer_with_context(raw, Some(context), query_for(context)).map(i64::from)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum PositionToken {
-    Horizontal,
-    Vertical,
-    Center,
-    Offset,
-}
-
-fn position_token(token: &str) -> PositionToken {
-    match lower(token).as_ref() {
-        "left" | "right" => PositionToken::Horizontal,
-        "top" | "bottom" => PositionToken::Vertical,
-        "center" => PositionToken::Center,
-        _ => PositionToken::Offset,
-    }
-}
-
-/// `<position>` takes one, two or four components; keyword order is fixed
-/// unless both axes are named by keywords.
-fn position_order_valid(tokens: &[&str]) -> bool {
-    use PositionToken::*;
-    let kinds: Vec<PositionToken> = tokens.iter().map(|token| position_token(token)).collect();
-    match kinds[..] {
-        [_] => true,
-        [first, second] => {
-            matches!(first, Horizontal | Center | Offset) && matches!(second, Vertical | Center | Offset)
-                || matches!(first, Vertical | Center) && matches!(second, Horizontal | Center)
-        }
-        [first, first_offset, second, second_offset] => {
-            first_offset == Offset
-                && second_offset == Offset
-                && matches!((first, second), (Horizontal, Vertical) | (Vertical, Horizontal))
-        }
-        _ => false,
-    }
-}
-
-fn position(raw: &str, context: LengthContext) -> Option<String> {
-    let tokens = components(raw)?;
-    if !position_order_valid(&tokens) {
-        return None;
-    }
-    let [x, y] = background_position_with_query(&tokens, context, query_for(context))?;
-    Some(alloc::format!(
-        "{} {}",
-        computed_values::percentage(x.pixels, x.fraction * 100.0),
-        computed_values::percentage(y.pixels, y.fraction * 100.0)
-    ))
-}
-
 fn hyphen_chars(raw: &str, context: LengthContext) -> Option<String> {
     let tokens = components(raw)?;
     if tokens.is_empty() || tokens.len() > 3 {
@@ -439,7 +390,7 @@ fn parse_hyphen_chars(value: &str) -> Option<[Option<i64>; 3]> {
     Some([first, second, third])
 }
 
-pub(crate) fn compute(slot: usize, raw: &str, context: LengthContext, current: Rgba) -> Option<Arc<str>> {
+pub(super) fn compute(slot: usize, raw: &str, context: LengthContext, current: Rgba) -> Option<Arc<str>> {
     let prop = prop_get(slot.checked_sub(BASE)?)?;
     let raw = raw.trim();
     let value = match prop.kind {
@@ -491,8 +442,7 @@ pub(crate) fn compute(slot: usize, raw: &str, context: LengthContext, current: R
                 computed_values::px(value.max(0.0) as f32)
             }
         }
-        Kind::Position if prop.name == "object-position" => background_positions::position_compute(raw, context)?,
-        Kind::Position => position(raw, context)?,
+        Kind::Position => background_positions::position_compute(raw, context)?,
         Kind::HyphenChars => hyphen_chars(raw, context)?,
         Kind::HyphenLines => {
             if decoded_css_keyword(raw, "no-limit") {
@@ -550,7 +500,7 @@ pub(crate) fn compute(slot: usize, raw: &str, context: LengthContext, current: R
     Some(Arc::from(value))
 }
 
-pub(crate) fn apply(slot: usize, raw: &str, context: LengthContext, style: &mut Style) {
+pub(super) fn apply(slot: usize, raw: &str, context: LengthContext, style: &mut Style) {
     if let Some(value) = compute(slot, raw, context, style.color) {
         if text_props::apply_white_space(prop_at(slot - BASE).name, &value, style) {
             return;
@@ -561,8 +511,18 @@ pub(crate) fn apply(slot: usize, raw: &str, context: LengthContext, style: &mut 
         if style.generic.get(slot - BASE) != value.as_ref() {
             style.generic.set(slot - BASE, value);
         }
+        mirror_spacing_trim(slot, style);
         mirror_grid_lines(slot, style);
         mirror_background_position(slot, style);
+    }
+}
+
+fn mirror_spacing_trim(slot: usize, style: &mut Style) {
+    if prop_get(slot - BASE).is_some_and(|prop| prop.name == "text-spacing-trim") {
+        let trim = crate::paint::SpacingTrim::from_keyword(style.generic.get(slot - BASE).map_or("normal", |value| &**value));
+        if style.font.spacing_trim != trim {
+            style.font.spacing_trim = trim;
+        }
     }
 }
 
@@ -598,8 +558,8 @@ pub(crate) fn compose(name: &str, base: &str, value: &str, accumulate: bool) -> 
             crate::animation::transition_values::compose_border_image(MASK_BORDER_PROXY[component - 1], &a, &b)
         }
         Kind::Text if text_props::is_color(name) => text_props::compose_color(base, value),
-        Kind::BgPos(_) => background_positions::compose(base, value),
-        Kind::Position if name == "object-position" => background_positions::compose_position(base, value),
+        Kind::BgPos(axis) => background_positions::compose(axis, base, value),
+        Kind::Position => background_positions::compose_position(base, value),
         Kind::Value(_) if name == "font-variation-settings" => font_variations::compose(base, value),
         Kind::Value(_) if name == "text-decoration-inset" => text_decoration_inset::compose(base, value),
         _ => None,
@@ -665,7 +625,7 @@ fn computed_longhand(style: &Style, name: &str, index: usize) -> Option<String> 
     stored(style, name)
 }
 
-pub(crate) fn declarations(name: &str, raw: &str) -> Option<Vec<Value>> {
+pub(super) fn declarations(name: &str, raw: &str) -> Option<Vec<Value>> {
     if grid_lines::is_shorthand(name) {
         return grid_lines::shorthand_declarations(name, raw);
     }
@@ -706,7 +666,7 @@ pub(crate) fn serialize_specified(slot: usize, raw: &str) -> Option<String> {
             typed_numeric::parse_numeric_expression(raw)?.serialize_specified()
         }
         Kind::TextSizeAdjust if math_function(raw) => typed_numeric::parse_numeric_expression(raw)?.serialize_specified(),
-        Kind::Position if prop.name == "object-position" => background_positions::position_specified(raw),
+        Kind::Position => background_positions::position_specified(raw),
         Kind::Anchor => anchor::specified(prop.name, raw),
         Kind::Gap(part) => gap_rules::specified(part, raw),
         Kind::Corner => corner_shapes::specified(raw),
@@ -780,11 +740,7 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
             Some(computed_values::px(mix(a, b, progress).max(0.0) as f32))
         }
         Kind::Position => {
-            let (from, to) = if prop_at(index).name == "object-position" {
-                (background_positions::position_endpoint(from)?, background_positions::position_endpoint(to)?)
-            } else {
-                (from.to_owned(), to.to_owned())
-            };
+            let (from, to) = (background_positions::position_endpoint(from)?, background_positions::position_endpoint(to)?);
             let (from, to) = (from.as_str(), to.as_str());
             let tokens = components(from)?;
             let (from_x, from_y) = (*tokens.first()?, *tokens.get(1)?);
@@ -836,7 +792,7 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
         Kind::Shape(shape) => shapes::interpolate(shape, from, to, progress),
         Kind::Gap(part) => gap_rules::interpolate(part, from, to, progress),
         Kind::Corner => corner_shapes::interpolate(from, to, progress),
-        Kind::BgPos(_) => background_positions::interpolate(from, to, progress),
+        Kind::BgPos(axis) => background_positions::interpolate(axis, from, to, progress),
         Kind::Text if text_props::is_color(name) => text_props::interpolate_color(from, to, progress),
         Kind::Value(value) => value_props::interpolate(value, from, to, progress),
         Kind::Text | Kind::MaskBorder(_) | Kind::Keywords(_) | Kind::Anchor | Kind::GridLine => None,

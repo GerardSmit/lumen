@@ -59,3 +59,25 @@ impl Style {
         self.contain_size |= size;
     }
 }
+
+impl Style {
+    /// Drops `stretch` size keywords on one physical axis, returning whether
+    /// any were present. Used where the keyword resolves against a flex line
+    /// that is only known after the item itself was measured.
+    pub(crate) fn defer_stretch_keywords(&mut self, horizontal: bool) -> bool {
+        let physical = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
+        let logical = if horizontal == (self.writing_mode == WritingMode::HorizontalTb) {
+            [87, 91, 92]
+        } else {
+            [88, 93, 94]
+        };
+        let mut found = false;
+        for slot in physical.into_iter().chain(logical) {
+            if self.intrinsic_size_keyword(slot) == Some(IntrinsicSizing::Stretch) {
+                self.set_intrinsic_size_keyword(slot, None);
+                found = true;
+            }
+        }
+        found
+    }
+}

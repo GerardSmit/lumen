@@ -88,6 +88,19 @@ fn parse_component(part: &str) -> Option<(FontFaceSource, Arc<str>)> {
     Some((FontFaceSource::Local(name.clone()), Arc::from("")))
 }
 
+const LOADABLE_FORMATS: [&str; 5] = ["collection", "opentype", "truetype", "woff", "woff2"];
+
+/// Whether a source's `format()` hint (absent counts as loadable) names a
+/// font container this engine can decode; `-variations` forms are legacy aliases.
+pub(super) fn format_loadable(suffix: &str) -> bool {
+    let Some(start) = suffix.find("format(") else { return true };
+    let inner = &suffix[start + "format(".len()..];
+    let Some(end) = inner.find(')') else { return false };
+    let name = inner[..end].trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+    let name = name.strip_suffix("-variations").unwrap_or(&name);
+    LOADABLE_FORMATS.contains(&name)
+}
+
 pub(super) fn parse(raw: &str) -> Option<ParsedSources> {
     let mut sources = Vec::new();
     let mut suffixes = Vec::new();

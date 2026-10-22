@@ -1151,7 +1151,7 @@ struct SnapshotBasis {
 
 const READ_DIRTY_LIMIT: usize = 4096;
 /// Layouts one frame may repeat while `@container` conditions still change with container sizes.
-const MAX_CONTAINER_PASSES: u8 = 4;
+const MAX_CONTAINER_PASSES: u8 = 10;
 const MAX_DAMAGE_RECTS: usize = 64;
 
 /// Inputs that validate cached live computed-style reads; any difference
@@ -1843,7 +1843,9 @@ impl RenderSession {
             self.invalidate_paint();
             self.frame_id = self.frame_id.wrapping_add(1);
         }
+        let shape_changed = interaction_changed && interaction_before.1 != self.synced_interaction.1;
         if !has_selector_dependencies
+            && !shape_changed
             && !(validity_changed && self.has_auto_directionality_controls())
         {
             return;
@@ -4617,6 +4619,24 @@ impl RenderSession {
         })
     }
 
+    /// Rendered border-box fragments of `node` in layout coordinates, each with
+    /// the transforms that carry it to viewport coordinates in application order.
+    pub fn client_fragment_boxes(&self, node: NodeId) -> Vec<(Rect, Vec<crate::paint::Affine>)> {
+        let Some(frame) = self.cached.as_ref().filter(|frame| frame.document_version == self.document.version()
+            && self.document.kind(node).is_ok()) else { return Vec::new(); };
+        let mut fragments = Vec::new();
+        for (index, hit) in frame.geometry.hits.iter().enumerate() {
+            if hit.node != node || hit.virtual_generated || !hit.rect.is_valid() { continue; }
+            let transforms: Vec<_> = frame.geometry.transforms.iter()
+                .filter(|transform| transform.hits.contains(&index))
+                .map(|transform| transform.matrix).collect();
+            for rect in frame.geometry.hit_rects(index) {
+                fragments.push((*rect, transforms.clone()));
+            }
+        }
+        fragments
+    }
+
     /// Map coordinates in an embedded viewport to its owner's content box.
     pub fn content_viewport_transform(&mut self, node: NodeId) -> Option<crate::paint::Affine> {
         let style = self.computed_style(node).ok()?;
@@ -4730,6 +4750,15 @@ impl RenderSession {
 
     /// The current principal box's used formatting, retained with its actual
     /// geometry. Host-language blockification does not change computed display.
+    /// Whether the parent element generates a grid container box.
+    pub fn parent_is_grid_container(&mut self, node: NodeId) -> bool {
+        let Some(parent) = self.document.parent(node).ok().flatten() else {
+            return false;
+        };
+        self.computed_style_with_text(parent, None)
+            .is_ok_and(|style| style.display == css::Display::Grid)
+    }
+
     pub fn layout_used_display(&self, node: NodeId) -> Option<css::Display> {
         let frame=self.cached.as_ref().filter(|frame| frame.document_version==self.document.version()
             && self.document.kind(node).is_ok())?;
@@ -4808,6 +4837,14 @@ impl RenderSession {
         // scanning every hit region for each CSSOM margin read would add an
         // O(hit-count) lookup to an O(log used-margins) path.
         frame.geometry.used_margins_for(node)
+    }
+
+    /// Used insets that `anchor()` resolution produced for a positioned box.
+    pub fn layout_used_insets(&self, node: NodeId) -> Option<[Option<f32>; 4]> {
+        let frame = self.cached.as_ref().filter(|frame| {
+            frame.document_version == self.document.version() && self.document.kind(node).is_ok()
+        })?;
+        frame.geometry.used_insets_for(node)
     }
 
     /// Measured Grid/Lanes track breadths from the current untransformed frame.
@@ -7670,7 +7707,7 @@ mod tests {
         let computed=session.computed_style(button).unwrap();
         assert_eq!(computed.appearance,crate::css::Appearance::None);
         assert_eq!(computed.used_border_widths(),[0.0;4],"image buttons do not acquire text-widget chrome");
-        assert_eq!((computed.width,computed.height),(None,None),"13px primitive-control defaults do not override image dimensions");
+        assert_eq!((computed.width,computed.height),(Some(30.0),Some(20.0)),"dimension attributes, not 13px primitive-control defaults, size the image button");
         let image=Arc::new(ImageData{width:4,height:2,pixels:alloc::vec![0,128,0,255].repeat(8)});
         session.set_node_bitmap(button,Some(image.clone())).unwrap();session.set_node_bitmap(reference,Some(image.clone())).unwrap();
         let first=session.display_list(400,200,&NoText).unwrap().clone();

@@ -596,6 +596,28 @@ impl Document {
             })
         }
     }
+    /// The children that generate boxes: the composed children, except that a
+    /// closed `details` renders only its first summary (the content slot is
+    /// `content-visibility: hidden` whatever the details element's display).
+    /// Without a summary the content keeps its boxes so layout APIs still see it.
+    pub fn rendered_children_iter(&self, node: NodeId) -> Result<ComposedChildren<'_>, Error> {
+        if self.details_open_state(node) == Some(false) && !self.composes(node)? {
+            let mut kept = Vec::new();
+            let mut child = self.first_child(node)?;
+            while let Some(candidate) = child {
+                if matches!(self.kind(candidate)?, NodeKind::Element {
+                    namespace: Namespace::Html, name, .. } if crate::svg::local_name(name) == "summary") {
+                    kept.push(candidate);
+                    break;
+                }
+                child = self.next_sibling(candidate)?;
+            }
+            if !kept.is_empty() {
+                return Ok(ComposedChildren { document: self, source: ComposedSource::List(kept.into_iter()) });
+            }
+        }
+        self.composed_children_iter(node)
+    }
     pub fn event_parent(
         &self,
         node: NodeId,

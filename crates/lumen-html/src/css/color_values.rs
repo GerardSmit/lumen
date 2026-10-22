@@ -33,7 +33,7 @@ fn hue(raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<f32> {
     let degrees=if expression.numeric_type()?==typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Number) {
         css_scalar_with_length_context(raw,false,context,query)?.0
     } else {conic_angle_value(raw,false,context,query)?.1};
-    Some((degrees/360.0).rem_euclid(1.0))
+    Some((f64::from(degrees).rem_euclid(360.0)/360.0) as f32)
 }
 pub(super) fn absolute_with_context(raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<Color> {
     let (name,body)=raw.trim().split_once('(')?; let name=identifier(name)?;
@@ -101,11 +101,12 @@ pub(super) fn endpoint_with_current(raw:&str,depth:u8,current:Color,context:Leng
             let [from,color]=origin.as_slice() else {return None;};
             if !decoded_css_keyword(from,"from") {return None;}
             let mut source=endpoint_with_current(color,depth+1,current,context,query)?;
+            if parts.len()!=2 {return None;}
             if let Some(alpha)=parts.get(1) {
                 if missing(alpha.trim()) {source.alpha=0.0;source.missing|=8;}
                 else if !decoded_css_keyword(alpha.trim(),"alpha") {
                     let named=[("alpha",typed_numeric::NumericValue{value:f64::from(if source.missing&8!=0 {0.0}else {source.alpha}),unit:typed_numeric::NumericUnit::Number})];
-                    source.alpha=channel_expression(alpha.trim(),&named,1.0,context,query)?.clamp(0.0,1.0);source.missing&=!8;
+                    source.alpha=channel_expression(alpha.trim(),&named,1.0,false,context,query)?.clamp(0.0,1.0);source.missing&=!8;
                 }
             }
             return Some(source);
@@ -192,12 +193,43 @@ fn mix_with_current(body:&str,depth:u8,current:Color,context:LengthContext,query
     color.alpha*=alpha_multiplier;
     Some(if matches!(color.space,ColorSpace::Hsl|ColorSpace::Hwb) && color.missing==0 {color.to(ColorSpace::Srgb)}else {color})
 }
-fn channel_expression(raw:&str,names:&[(&str,typed_numeric::NumericValue)],scale:f32,context:LengthContext,query:ContainerUnitContext)->Option<f32> {
+fn channel_expression(raw:&str,names:&[(&'static str,typed_numeric::NumericValue)],scale:f32,angle:bool,context:LengthContext,query:ContainerUnitContext)->Option<f32> {
     let mut values=LengthValueBuilder {query,context:Some(LengthContext{percent:Some(scale),..context}),
         allow_viewport:true,scalar:true,sign_input_depth:0,context_dependent:false};
     let mut builder=typed_numeric::NamedNumericBuilder{inner:&mut values,values:names};
-    let (value,_)=typed_numeric::parse_numeric_expression_with(raw,&mut builder)?;
-    value.is_finite().then_some(value)
+    if let Some((value,_))=typed_numeric::parse_numeric_expression_with(raw,&mut builder) {
+        if value.is_finite() {return Some(value);}
+    }
+    let keywords:Vec<&'static str>=names.iter().map(|(name,_)|*name).collect();
+    let expression=typed_numeric::parse_channel_expression(raw,&keywords)?;
+    let kind=expression.numeric_type()?;
+    let number=typed_numeric::NumericType::default();
+    let percent=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Percent);
+    let degrees=typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Deg);
+    if kind!=number && kind!=percent && !(angle && kind==degrees) {return None;}
+    let mut evaluation=ChannelEvaluation{lengths:super::FontAngleContext{length:Some(context),query,percent_scale:f64::from(scale)/100.0},names};
+    let value=expression.evaluate(&mut evaluation)?;
+    Some(if value.is_nan() {0.0} else {value.clamp(-f64::from(f32::MAX),f64::from(f32::MAX)) as f32})
+}
+/// Evaluates the full calculation tree, including trigonometric and power
+/// functions, with the origin color's channel keywords bound to numbers.
+struct ChannelEvaluation<'a> {
+    lengths:super::FontAngleContext,
+    names:&'a [(&'static str,typed_numeric::NumericValue)],
+}
+impl typed_numeric::NumericExpressionContext for ChannelEvaluation<'_> {
+    type Value=f64;
+    fn unit(&mut self,value:typed_numeric::NumericValue)->Option<f64> {typed_numeric::NumericExpressionContext::unit(&mut self.lengths,value)}
+    fn identifier(&mut self,name:&str)->Option<f64> {self.names.iter().find(|(key,_)|*key==name).map(|(_,value)|value.value)}
+    fn add(&mut self,left:f64,right:f64)->Option<f64> {Some(left+right)}
+    fn multiply(&mut self,left:f64,right:f64)->Option<f64> {Some(left*right)}
+    fn minimum(&mut self,left:f64,right:f64)->Option<f64> {Some(typed_numeric::numeric_minimum(left,right))}
+    fn maximum(&mut self,left:f64,right:f64)->Option<f64> {Some(typed_numeric::numeric_maximum(left,right))}
+    fn clamp(&mut self,lower:f64,value:f64,upper:f64)->Option<f64> {Some(typed_numeric::numeric_maximum(lower,typed_numeric::numeric_minimum(value,upper)))}
+    fn negate(&mut self,value:f64)->Option<f64> {Some(-value)}
+    fn invert(&mut self,value:f64)->Option<f64> {Some(1.0/value)}
+    fn sign(&mut self,value:f64)->Option<f64> {Some(if value==0.0 {value} else {value.signum()})}
+    fn function(&mut self,function:typed_numeric::MathFunction,values:Vec<f64>,types:Vec<typed_numeric::NumericType>)->Option<f64> {function.evaluate(&values,&types)}
 }
 fn relative(body:&str,name:&str,depth:u8,current:Color,context:LengthContext,query:ContainerUnitContext)->Option<Color> {
     let parts=top_level_split(body,b'/',2)?;let head=components(parts[0])?;
@@ -234,13 +266,19 @@ fn relative(body:&str,name:&str,depth:u8,current:Color,context:LengthContext,que
         else if space.hue()==Some(index) && is_percentage(raw)==Some(true) {return None;}
         else if let Some(source_index)=direct {coordinates[index]=source.components[source_index]*multiplier(source_index)/multiplier(index);
             if source.missing&(1<<source_index)!=0 {mask|=1<<index;}}
-        else {coordinates[index]=if let Some(value)=channel_expression(raw,&named,scale(index),context,query) {value/multiplier(index)}
+        else {coordinates[index]=if let Some(value)=channel_expression(raw,&named,scale(index),space.hue()==Some(index),context,query) {value/multiplier(index)}
             else if space.hue()==Some(index) {hue(raw,context,query)?} else {return None;};}
+        coordinates[index]=match space {
+            ColorSpace::Lab|ColorSpace::Lch if index==0=>coordinates[index].clamp(0.0,100.0),
+            ColorSpace::Oklab|ColorSpace::Oklch if index==0=>coordinates[index].clamp(0.0,1.0),
+            ColorSpace::Lch|ColorSpace::Oklch if index==1=>coordinates[index].max(0.0),
+            _=>coordinates[index],
+        };
         if space.hue()==Some(index) {coordinates[index]=coordinates[index].rem_euclid(1.0);}
     }
     let alpha=if let Some(raw)=parts.get(1) {let raw=raw.trim();
         if missing(raw) {mask|=8;0.0} else if decoded_css_keyword(raw,"alpha") {mask|=source.missing&8;source.alpha}
-        else {channel_expression(raw,&named,1.0,context,query)?.clamp(0.0,1.0)}
+        else {channel_expression(raw,&named,1.0,false,context,query)?.clamp(0.0,1.0)}
     } else {mask|=source.missing&8;source.alpha};
     let color=Color::new(space,coordinates,alpha.clamp(0.0,1.0),mask);
     // Color5 preserves HSL/HWB notation when a component is missing; otherwise
@@ -281,6 +319,7 @@ fn serialize_channel(raw:&str,names:&[&'static str],computed:Option<(LengthConte
         let mut evaluation=super::FontAngleContext{length:Some(context),query,percent_scale:1.0};
         expression.map_numeric_values(|value| {
             if value.unit==typed_numeric::NumericUnit::Percent {return Some(value);}
+            if !value.value.is_finite() {return Some(value);}
             if let Some((unit,factor))=value.unit.canonical_unit_and_factor() {
                 let value=value.value*factor;return value.is_finite().then_some(typed_numeric::NumericValue{value,unit});
             }
@@ -290,6 +329,7 @@ fn serialize_channel(raw:&str,names:&[&'static str],computed:Option<(LengthConte
     }
     if computed.is_none() {
         expression.map_numeric_values(|value| {
+            if !value.value.is_finite() {return Some(value);}
             if let Some((unit,factor))=value.unit.canonical_unit_and_factor() {
                 let value=value.value*factor;value.is_finite().then_some(typed_numeric::NumericValue{value,unit})
             }else {Some(value)}
@@ -322,7 +362,12 @@ fn serialize_source(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUn
         }
     }
     if let Some((context,query))=computed.filter(|_|!uses_current_color(raw)) {
-        return serialize(endpoint_with_current(raw,depth,from_rgba(super::Style::initial().color),context,query)?,!legacy(raw));
+        if let Some((name,body))=raw.trim().split_once('(') {
+            if let (Some(name),Some(body))=(identifier(name),body.strip_suffix(')')) {
+                if let Some(text)=serialize_math_channels(&name,body,depth,true) {return Some(text);}
+            }
+        }
+        return serialize_nested(endpoint_with_current(raw,depth,from_rgba(super::Style::initial().color),context,query)?,!legacy(raw),depth>0);
     }
     serialize_source_inner(raw,depth,computed).filter(|value|value.len()<=super::MAX_CSS_BYTES)
 }
@@ -385,7 +430,7 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         }
         let omitted_weight=if omitted==0 {0.0}else {(100.0-sum.min(100.0))/f64::from(omitted)};
         let equal=arguments.first().map(|(_,_,weight)|weight.unwrap_or(omitted_weight))?;
-        let omit_weights=!unknown && equal>=100.0/arguments.len() as f64 && arguments.iter().all(|(_,_,weight)|weight.unwrap_or(omitted_weight)==equal);
+        let omit_weights=!unknown && (equal-100.0/arguments.len() as f64).abs()<1e-9 && arguments.iter().all(|(_,_,weight)|weight.unwrap_or(omitted_weight)==equal);
         let mut result=String::from("color-mix(");
         if method.space!=ColorSpace::Oklab {
             result.push_str("in ");result.push_str(method.space.name());
@@ -445,26 +490,33 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         return Some(alloc::format!("light-dark({}, {})",serialize_source(light,depth+1,computed)?,serialize_source(dark,depth+1,computed)?));
     }
     if computed.is_none() {
-        if let Some(text)=serialize_math_channels(&name,body,depth) {return Some(text);}
+        if let Some(text)=serialize_math_channels(&name,body,depth,false) {return Some(text);}
     }
-    serialize(endpoint(raw,depth)?,!legacy(raw))
+    serialize_nested(endpoint(raw,depth)?,!legacy(raw),depth>0 && computed.is_some())
 }
 
 /// Non-legacy color functions keep math-function channels in their specified
-/// value; the remaining channels use the resolved color's coordinates.
-fn serialize_math_channels(name:&str,body:&str,depth:u8)->Option<String> {
-    if !matches!(name,"lab"|"lch"|"oklab"|"oklch"|"color") || top_level_split(body,b',',4)?.len()>1 {return None;}
+/// value; legacy rgb/hsl/hwb keep only channels whose value depends on a font
+/// or container unit. The remaining channels use the resolved coordinates.
+fn serialize_math_channels(name:&str,body:&str,depth:u8,nonfinite_only:bool)->Option<String> {
+    let legacy_name=matches!(name,"rgb"|"rgba"|"hsl"|"hsla"|"hwb");
+    if nonfinite_only && legacy_name {return None;}
+    if !legacy_name && (!matches!(name,"lab"|"lch"|"oklab"|"oklch"|"color") || top_level_split(body,b',',4)?.len()>1) {return None;}
     let mut parts=color_components(body)?;
     let profile=if name=="color" {
         let profile=identifier(parts.first()?)?.into_owned();
         parts.remove(0);Some(profile)
     }else {None};
-    if !(3..=4).contains(&parts.len()) || !parts.iter().any(|part|part.contains('(') && !missing(part)) {return None;}
-    let head=profile.as_ref().map_or_else(||alloc::format!("{name}("),|profile|alloc::format!("color({profile} "));
+    let keeps=|part:&str|part.contains('(') && !missing(part) && if nonfinite_only {
+        serialize_channel(part,&[],None).is_some_and(|text|text.contains("infinity") || text.contains("NaN"))
+    } else {!legacy_name || image_numeric_dependencies(part)!=(false,false)};
+    if !(3..=4).contains(&parts.len()) || !parts.iter().any(|part|keeps(part)) {return None;}
+    let canonical=match name {"rgba"=>"rgb","hsla"=>"hsl",_=>name};
+    let head=profile.as_ref().map_or_else(||alloc::format!("{canonical}("),|profile|alloc::format!("color({profile} "));
     let mut probe=head.clone();
     for (index,part) in parts.iter().enumerate() {
         if index==3 {probe.push_str(" / ");}else if index!=0 {probe.push(' ');}
-        probe.push_str(if part.contains('(') && !missing(part) {"0"}else {part});
+        probe.push_str(if keeps(part) {"0"}else {part});
     }
     probe.push(')');
     let value=endpoint(&probe,depth)?;
@@ -472,15 +524,17 @@ fn serialize_math_channels(name:&str,body:&str,depth:u8)->Option<String> {
     for index in 0..3 {
         if index!=0 {result.push(' ');}
         if missing(parts[index]) {result.push_str("none");continue;}
-        if parts[index].contains('(') {result.push_str(&serialize_channel(parts[index],&[],None)?);continue;}
+        if keeps(parts[index]) {result.push_str(&serialize_channel(parts[index],&[],None)?);continue;}
         let mut component=value.components[index];
         if value.space.hue()==Some(index) {component=decimal_scaled(component,360.0);}
-        result.push_str(&super::computed_values::number(component));
+        else if legacy_name && value.space==ColorSpace::Srgb {component=decimal_scaled(component,255.0);}
+        else if legacy_name {component=decimal_scaled(component,100.0);}
+        result.push_str(&short_number(component));
     }
     if let Some(alpha)=parts.get(3) {
         if missing(alpha) {result.push_str(" / none");}
-        else if alpha.contains('(') {result.push_str(" / ");result.push_str(&serialize_channel(alpha,&[],None)?);}
-        else if value.alpha!=1.0 {result.push_str(" / ");result.push_str(&super::computed_values::number(value.alpha));}
+        else if keeps(alpha) {result.push_str(" / ");result.push_str(&serialize_channel(alpha,&[],None)?);}
+        else if value.alpha!=1.0 {result.push_str(" / ");result.push_str(&short_number(value.alpha));}
     }
     result.push(')');Some(result)
 }
@@ -547,18 +601,47 @@ pub(super) fn legacy(raw:&str)->bool {
 pub(super) fn default_method(method:InterpolationMethod,explicit:bool,legacy:bool)->InterpolationMethod {
     if !explicit && legacy {InterpolationMethod{space:ColorSpace::Srgb,hue:HueInterpolation::Shorter}} else {method}
 }
+/// Color coordinates serialize with six significant digits, so f32 noise from
+/// scaling (0.24000001) does not leak into the canonical text.
+fn short_number(value:f32)->String {
+    if value.abs()<5e-7 || !value.is_finite() {return super::computed_values::number(0.0);}
+    let rounded=alloc::format!("{:.5e}",f64::from(value)).parse::<f64>().unwrap_or(f64::from(value));
+    if rounded==0.0 {String::from("0")} else {rounded.to_string()}
+}
 fn decimal_scaled(value:f32,scale:f64)->f32 {
     let scaled=f64::from(value)*scale;
     ((scaled*1e5).round()/1e5) as f32
 }
+/// A color nested inside another color function (a relative-color origin or a
+/// color-mix endpoint) is re-parsed from text when the cascade runs, so the
+/// 8-bit legacy serialization must not quantize it. Inexact sources keep
+/// fractional rgb channels; sources whose hue or saturation would be lost keep
+/// their own function.
+fn serialize_nested(value:Color,color_function:bool,nested:bool)->Option<String> {
+    if !nested || color_function || value.missing!=0 || !matches!(value.space,ColorSpace::Srgb|ColorSpace::Hsl|ColorSpace::Hwb) || !value.is_finite() {
+        return serialize(value,color_function);
+    }
+    let degenerate=match value.space {
+        ColorSpace::Hsl=>value.components[1]<1e-3 || value.components[2]<1e-3 || value.components[2]>1.0-1e-3,
+        ColorSpace::Hwb=>value.components[1]+value.components[2]>1.0-1e-3,
+        _=>false,
+    };
+    if degenerate {return serialize(value,true);}
+    let rgb=value.srgb().map(|channel|f64::from(channel.clamp(0.0,1.0))*255.0);
+    if rgb.iter().all(|scaled|(scaled-scaled.round()).abs()<=2e-3) {return serialize(value,false);}
+    let channels=rgb.map(|scaled|short_number(scaled as f32));
+    let alpha=value.alpha.clamp(0.0,1.0);
+    Some(if alpha>=254.5/255.0 {alloc::format!("rgb({}, {}, {})",channels[0],channels[1],channels[2])}
+        else {alloc::format!("rgba({}, {}, {}, {})",channels[0],channels[1],channels[2],short_number(alpha))})
+}
 pub(super) fn serialize(value:Color,color_function:bool)->Option<String> {
-    use super::computed_values::number;
+    let number=short_number;
     if !value.is_finite() {return None;}
     if matches!(value.space,ColorSpace::Srgb|ColorSpace::Hsl|ColorSpace::Hwb) && value.missing==0 && !color_function {
         let rgb=value.srgb();
         let channels=rgb.map(|v|number((f64::from(v.clamp(0.0,1.0))*255.0+1e-4).round() as f32));
         let alpha=value.alpha.clamp(0.0,1.0);
-        return Some(if alpha==1.0 {alloc::format!("rgb({}, {}, {})",channels[0],channels[1],channels[2])}
+        return Some(if alpha>=254.5/255.0 {alloc::format!("rgb({}, {}, {})",channels[0],channels[1],channels[2])}
             else {alloc::format!("rgba({}, {}, {}, {})",channels[0],channels[1],channels[2],number(alpha))});
     }
     let direct=matches!(value.space,ColorSpace::Lab|ColorSpace::Lch|ColorSpace::Oklab|ColorSpace::Oklch|ColorSpace::Hsl|ColorSpace::Hwb);
@@ -572,7 +655,7 @@ pub(super) fn serialize(value:Color,color_function:bool)->Option<String> {
         result.push_str(&number(component));
         if matches!(value.space,ColorSpace::Hsl|ColorSpace::Hwb) && index!=0 {result.push('%');}
     }
-    if value.alpha!=1.0 || value.missing&8!=0 {
+    if value.alpha<0.99999 || value.alpha>1.00001 || value.missing&8!=0 {
         result.push_str(" / ");if value.missing&8!=0 {result.push_str("none");} else {result.push_str(&number(value.alpha));}
     }
     result.push(')');Some(result)

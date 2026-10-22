@@ -41,6 +41,7 @@ pub struct MediaSnapshot {
     pub video_width: u32,
     pub video_height: u32,
     pub origin_clean: bool,
+    pub preserves_pitch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +73,7 @@ impl Default for MediaSnapshot {
             video_width: 0,
             video_height: 0,
             origin_clean: false,
+            preserves_pitch: true,
         }
     }
 }
@@ -238,7 +240,10 @@ impl MediaController {
     }
 
     pub(crate) fn set_volume(&mut self, node: NodeId, volume: f64) -> OpResult<()> {
-        if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+        if !volume.is_finite() {
+            return Err(OpError::type_error("volume must be a finite number"));
+        }
+        if !(0.0..=1.0).contains(&volume) {
             return Err(OpError::new(
                 "IndexSizeError",
                 "volume must be between 0 and 1",
@@ -251,6 +256,10 @@ impl MediaController {
                 .push_back((node, state.snapshot.generation, "volumechange".into()));
         }
         Ok(())
+    }
+
+    pub(crate) fn set_preserves_pitch(&mut self, node: NodeId, preserves: bool) {
+        self.states.entry(node).or_default().snapshot.preserves_pitch = preserves;
     }
 
     pub(crate) fn set_default_playback_rate(&mut self, node: NodeId, rate: f64) -> OpResult<()> {
@@ -670,6 +679,24 @@ impl DomHtmlMediaElement {
 
 #[lumen_bind::methods]
 impl DomHtmlMediaElement {
+    #[constant(name = "NETWORK_EMPTY")]
+    const NETWORK_EMPTY: u16 = 0;
+    #[constant(name = "NETWORK_IDLE")]
+    const NETWORK_IDLE: u16 = 1;
+    #[constant(name = "NETWORK_LOADING")]
+    const NETWORK_LOADING: u16 = 2;
+    #[constant(name = "NETWORK_NO_SOURCE")]
+    const NETWORK_NO_SOURCE: u16 = 3;
+    #[constant(name = "HAVE_NOTHING")]
+    const HAVE_NOTHING: u16 = 0;
+    #[constant(name = "HAVE_METADATA")]
+    const HAVE_METADATA: u16 = 1;
+    #[constant(name = "HAVE_CURRENT_DATA")]
+    const HAVE_CURRENT_DATA: u16 = 2;
+    #[constant(name = "HAVE_FUTURE_DATA")]
+    const HAVE_FUTURE_DATA: u16 = 3;
+    #[constant(name = "HAVE_ENOUGH_DATA")]
+    const HAVE_ENOUGH_DATA: u16 = 4;
     #[getter]
     fn src(&self) -> OpResult<String> { crate::html_interfaces::reflected_usv_url_value(self.node(), "src") }
     #[setter(hint(js(ce_reactions)))]
@@ -733,6 +760,18 @@ impl DomHtmlMediaElement {
         let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
         let result = realm.media.borrow_mut().set_default_playback_rate(node, value);
         result
+    }
+
+    #[getter(name = "preservesPitch")]
+    fn preserves_pitch(&self) -> bool {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node).preserves_pitch
+    }
+
+    #[setter(name = "preservesPitch", coerce)]
+    fn set_preserves_pitch(&self, value: bool) {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media.borrow_mut().set_preserves_pitch(node, value);
     }
 
     #[getter(rename(js = "playbackRate"))]

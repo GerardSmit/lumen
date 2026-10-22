@@ -11,6 +11,7 @@ mod default_faces;
 pub use default_faces::{default_faces, set_font_directory, DefaultFaces, FILES as DEFAULT_FACE_FILES};
 
 mod manual_font_registry;
+mod spacing_trim;
 pub use manual_font_registry::{
     FontFaceStatus, FontLoadRequest, FontRegistryContext, FontRegistrySnapshot, ManualFontFace,
     ManualFontFaceState, ManualFontRegistry, ManualFontSource, MAX_MANUAL_FONT_BYTES_PER_FACE,
@@ -20,7 +21,7 @@ pub use lumen_common::ucd::{
     graphemes, line_breaks, next_grapheme_boundary, previous_grapheme_boundary, BreakOpportunity,
 };
 
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -730,10 +731,11 @@ struct ShapeContext<'a> {
     surrounding: Option<&'a str>,
     start: usize,
     end: usize,
+    variations: &'a [rustybuzz::Variation],
 }
 impl<'a> ShapeContext<'a> {
     fn language(language: Option<&'a str>) -> Self {
-        Self { language, surrounding: None, start: 0, end: 0 }
+        Self { language, surrounding: None, start: 0, end: 0, variations: &[] }
     }
     fn subrange(self, start: usize, end: usize) -> Self {
         Self { start: self.start + start, end: self.start + end, ..self }
@@ -743,7 +745,8 @@ impl<'a> ShapeContext<'a> {
 fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelection,
     features: &[rustybuzz::Feature], context: ShapeContext<'_>) -> Result<rustybuzz::GlyphBuffer, &'static str> {
         let language = context.language;
-    let face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
+    let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
+    face.set_variations(context.variations);
     let script=resolve_script(&face,script,context);
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     // UAX #9 has already consumed directional controls before a resolved
@@ -1397,7 +1400,7 @@ impl FontSet {
 
     fn face_by_identity(&self,identity:u64)->Option<&Arc<FontFace>> {
         if identity==0 {return self.faces.first().map(|font|&font.face);}
-        self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity)).map(|font|&font.face)
+        self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity) || font.face.is_variation_key(identity)).map(|font|&font.face)
     }
 
     fn append_resolved_range(
@@ -1413,7 +1416,7 @@ impl FontSet {
         x: &mut f32,
         advances: Option<&mut Vec<RawClusterAdvance>>,
     ) -> Result<(), &'static str> {
-        self.append_resolved_range_context(text,text_offset,size,rtl,order,spec,features,glyphs,x,advances,ShapeContext {language:None,surrounding:Some(text),start:0,end:text.len()})
+        self.append_resolved_range_context(text,text_offset,size,rtl,order,spec,features,glyphs,x,advances,ShapeContext {language:None,surrounding:Some(text),start:0,end:text.len(),variations:&[]})
     }
 
     fn append_resolved_range_context(&self,text:&str,text_offset:usize,size:f32,rtl:bool,
@@ -1504,6 +1507,22 @@ impl FontSet {
             merged.extend_from_slice(features);
             merged.as_slice()
         } else { features };
+        let mut trim_features = Vec::new();
+        let features = {
+            let slice = &text[run.start..run.end];
+            if spacing_trim::needs_features(spec.spacing_trim, slice) {
+                trim_features.extend_from_slice(features);
+                let whole = context.surrounding.unwrap_or("");
+                let begin = context.start + run.start;
+                let finish = context.start + run.end;
+                let before = whole.get(..begin).and_then(|head| head.chars().next_back());
+                let after = whole.get(finish..).and_then(|tail| tail.chars().next());
+                spacing_trim::features(spec.spacing_trim, registered.face.spacing_features, slice, before, after, &mut trim_features);
+                trim_features.as_slice()
+            } else {
+                features
+            }
+        };
         let size_scale = self.size_adjust_scale(spec, run.face);
         if size_scale == 0.0 {
             if let Some(advances) = advances {
@@ -1516,7 +1535,24 @@ impl FontSet {
             && registered.style == FontStyle::Normal
             && descriptor.oblique_range.is_none()
             && spec.style.angle().is_none_or(|angle| angle != 0.0);
-        let glyph_face=if run.invisible {face.invisible_key()?}else if synthetic_oblique {face.oblique_key()?}else{face.id()};
+        let coordinates = if run.invisible {
+            None
+        } else {
+            self.font_match_instance(spec, run.face)
+                .and_then(|(weight, stretch, _)| face.variation_coordinates(weight, stretch, size * size_scale))
+        };
+        let variation = match coordinates {
+            Some(coords) => {
+                let key = face.variation_key(&coords, synthetic_oblique)?;
+                Some((coords, key))
+            }
+            None => None,
+        };
+        let glyph_face=if run.invisible {face.invisible_key()?}else if let Some((_, key)) = &variation {*key}else if synthetic_oblique {face.oblique_key()?}else{face.id()};
+        let context = ShapeContext {
+            variations: variation.as_ref().map_or(&[][..], |(coords, _)| &coords[..]),
+            ..context
+        };
         face.shape_caps_into_context(
             &text[run.start..run.end],
             size * size_scale,
@@ -1812,7 +1848,7 @@ impl<V: CachedValue,const SLOTS:usize,const BYTES:usize> RunCache<V,SLOTS,BYTES>
             feed(&spec.ligatures.cache_key());
             if let Some(chain)=&spec.family_scope {for root in chain.iter(){feed(&root.key().to_le_bytes());}}
             if let Some(value)=&spec.alternates {feed(&[u8::from(value.historical)]);for request in value.requests.iter(){feed(&[request.kind as u8]);for name in request.names.iter(){feed(&name.len().to_le_bytes());feed(name.as_bytes());}}}
-            feed(&[u8::from(spec.disable_optional_ligatures)]);
+            feed(&[u8::from(spec.disable_optional_ligatures), spec.spacing_trim as u8]);
             if let Some(values) = spec.feature_settings.as_ref().and_then(|settings| settings.resolved()) {
                 for feature in values { feed(&feature.tag); feed(&feature.value.to_le_bytes()); }
             }
@@ -2203,9 +2239,244 @@ pub struct FontFace {
     metric_glyph_coverage:u8,
     primary_character_widths: Option<PrimaryCharacterWidths>,
     caps_features: u8,
+    spacing_features: u8,
+    variable_axes: Arc<[VariationAxisInfo]>,
+    variation_keys: VariationKeys,
+    variation_rasters: VariationGlyphCache<Arc<GlyphCoverage>>,
+    variation_advances: VariationGlyphCache<f32>,
     shapes: RunCache<ShapedRun>,
     widths: RunCache<f32>,
     rasterizers: RasterizerCache,
+}
+
+/// A registered variation axis that CSS drives without author settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VariationAxisInfo {
+    tag: ttf_parser::Tag,
+    min: f32,
+    default: f32,
+    max: f32,
+}
+
+const MAX_VARIATION_KEYS: usize = 256;
+
+/// Optical size granularity: nearby sizes share one instance, key and raster.
+const OPTICAL_SIZE_STEP: f32 = 0.5;
+
+/// Axis coordinates for one weight, width and font size; axes at their
+/// default are left out so the default instance keeps the plain identity.
+fn variation_settings(axes: &[VariationAxisInfo], weight: f32, stretch: f32, size: f32) -> Vec<rustybuzz::Variation> {
+    let mut settings = Vec::new();
+    for axis in axes {
+        let requested = if axis.tag == ttf_parser::Tag::from_bytes(b"wght") {
+            weight
+        } else if axis.tag == ttf_parser::Tag::from_bytes(b"wdth") {
+            stretch
+        } else if axis.tag == ttf_parser::Tag::from_bytes(b"opsz") {
+            (size / OPTICAL_SIZE_STEP).round() * OPTICAL_SIZE_STEP
+        } else {
+            continue;
+        };
+        if !requested.is_finite() || axis.min > axis.max {
+            continue;
+        }
+        let value = requested.max(axis.min).min(axis.max);
+        if (value - axis.default).abs() >= 0.001 {
+            settings.push(rustybuzz::Variation { tag: axis.tag, value });
+        }
+    }
+    settings
+}
+
+struct VariationKeyEntry {
+    id: u64,
+    oblique: bool,
+    coordinates: Arc<[rustybuzz::Variation]>,
+}
+
+#[derive(Default)]
+struct VariationKeyTable {
+    entries: Vec<VariationKeyEntry>,
+    by_id: BTreeMap<u64, usize>,
+}
+
+/// Contended acquisitions give up after this many spins; critical sections
+/// only scan or push a bounded table.
+const VARIATION_LOCK_SPINS: u32 = 1 << 16;
+
+/// Stable glyph identities for the variation instances of one face.
+struct VariationKeys {
+    busy: AtomicBool,
+    table: UnsafeCell<VariationKeyTable>,
+}
+
+// SAFETY: the table is only read or changed while `busy` is held.
+unsafe impl Sync for VariationKeys {}
+
+impl VariationKeys {
+    const fn new() -> Self {
+        Self { busy: AtomicBool::new(false), table: UnsafeCell::new(VariationKeyTable { entries: Vec::new(), by_id: BTreeMap::new() }) }
+    }
+
+    fn locked<R>(&self, visit: impl FnOnce(&mut VariationKeyTable) -> R) -> Option<R> {
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let mut spins = 0;
+        while self.busy.swap(true, Ordering::Acquire) {
+            spins += 1;
+            if spins > VARIATION_LOCK_SPINS {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+        let _release = Release(&self.busy);
+        // SAFETY: `busy` grants exclusive access until Release drops.
+        Some(visit(unsafe { &mut *self.table.get() }))
+    }
+}
+
+const MAX_VARIATION_GLYPHS: usize = 1024;
+const MAX_VARIATION_GLYPH_BYTES: usize = 8 << 20;
+
+struct VariationGlyphEntry<V> {
+    last_used: u64,
+    bytes: usize,
+    value: V,
+}
+
+struct VariationGlyphState<V> {
+    entries: BTreeMap<(u64, u16, u32), VariationGlyphEntry<V>>,
+    bytes: usize,
+}
+
+/// Bounded least-recently-used cache of per-instance glyph data keyed by
+/// (variation identity, glyph, size bits). Contention is a miss.
+struct VariationGlyphCache<V> {
+    busy: AtomicBool,
+    clock: AtomicU64,
+    state: UnsafeCell<VariationGlyphState<V>>,
+}
+
+// SAFETY: the state is only read or changed while `busy` is held.
+unsafe impl<V: Send> Sync for VariationGlyphCache<V> {}
+
+impl<V: Clone> VariationGlyphCache<V> {
+    const fn new() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            clock: AtomicU64::new(1),
+            state: UnsafeCell::new(VariationGlyphState { entries: BTreeMap::new(), bytes: 0 }),
+        }
+    }
+
+    fn locked<R>(&self, visit: impl FnOnce(&mut VariationGlyphState<V>) -> R) -> Option<R> {
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self.busy.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        let _release = Release(&self.busy);
+        // SAFETY: `busy` grants exclusive access until Release drops.
+        Some(visit(unsafe { &mut *self.state.get() }))
+    }
+
+    fn get(&self, key: (u64, u16, u32)) -> Option<V> {
+        let used = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.locked(|state| {
+            state.entries.get_mut(&key).map(|entry| {
+                entry.last_used = used;
+                entry.value.clone()
+            })
+        })
+        .flatten()
+    }
+
+    fn insert(&self, key: (u64, u16, u32), value: V, bytes: usize) {
+        if bytes > MAX_VARIATION_GLYPH_BYTES {
+            return;
+        }
+        let used = self.clock.fetch_add(1, Ordering::Relaxed);
+        self.locked(|state| {
+            if let Some(previous) = state.entries.remove(&key) {
+                state.bytes -= previous.bytes;
+            }
+            while state.entries.len() >= MAX_VARIATION_GLYPHS || state.bytes + bytes > MAX_VARIATION_GLYPH_BYTES {
+                let Some(oldest) = state.entries.iter().min_by_key(|(_, entry)| entry.last_used).map(|(key, _)| *key) else { break };
+                if let Some(evicted) = state.entries.remove(&oldest) {
+                    state.bytes -= evicted.bytes;
+                }
+            }
+            state.bytes += bytes;
+            state.entries.insert(key, VariationGlyphEntry { last_used: used, bytes, value });
+        });
+    }
+}
+
+/// Largest glyph raster edge in pixels; outlines scaled past two rasterizable
+/// em squares are rejected instead of allocated.
+const MAX_COVERAGE_EDGE: f32 = 2.0 * MAX_RASTER_FONT_SIZE;
+
+/// Fills an outline already scaled to pixels (y up) with the nonzero winding
+/// rule, anti-aliased by tiny-skia, into the same top-down alpha layout as the
+/// fontdue path.
+fn coverage_from_outline(outline: &GlyphOutline) -> Result<GlyphCoverage, &'static str> {
+    let empty = GlyphCoverage { x_min: 0, y_min: 0, width: 0, height: 0, alpha: Vec::new() };
+    let mut builder = tiny_skia::PathBuilder::new();
+    let mut open = false;
+    for command in &outline.commands {
+        match *command {
+            GlyphOutlineCommand::MoveTo(x, y) => {
+                builder.move_to(x, y);
+                open = true;
+            }
+            GlyphOutlineCommand::LineTo(x, y) if open => builder.line_to(x, y),
+            GlyphOutlineCommand::QuadTo(x1, y1, x, y) if open => builder.quad_to(x1, y1, x, y),
+            GlyphOutlineCommand::CurveTo(x1, y1, x2, y2, x, y) if open => builder.cubic_to(x1, y1, x2, y2, x, y),
+            GlyphOutlineCommand::Close if open => builder.close(),
+            _ => {}
+        }
+    }
+    let Some(path) = builder.finish() else { return Ok(empty) };
+    let Some(bounds) = path.compute_tight_bounds() else { return Ok(empty) };
+    let (left, bottom) = (bounds.left().floor(), bounds.top().floor());
+    let (right, top) = (bounds.right().ceil(), bounds.bottom().ceil());
+    if right - left > MAX_COVERAGE_EDGE || top - bottom > MAX_COVERAGE_EDGE {
+        return Err("glyph raster too large");
+    }
+    let (width, height) = ((right - left) as u32, (top - bottom) as u32);
+    if width == 0 || height == 0 {
+        return Ok(empty);
+    }
+    let length = width as usize * height as usize;
+    let mut scratch = Vec::new();
+    scratch.try_reserve_exact(length).map_err(|_| "glyph raster allocation failed")?;
+    scratch.resize(length, 0u8);
+    let size = tiny_skia::IntSize::from_wh(width, height).ok_or("glyph raster too large")?;
+    let mut mask = tiny_skia::Mask::from_vec(scratch, size).ok_or("glyph raster too large")?;
+    mask.fill_path(
+        &path,
+        tiny_skia::FillRule::Winding,
+        true,
+        tiny_skia::Transform::from_row(1.0, 0.0, 0.0, -1.0, -left, top),
+    );
+    let mut alpha = Vec::new();
+    alpha.try_reserve_exact(length).map_err(|_| "glyph raster allocation failed")?;
+    alpha.extend_from_slice(mask.data());
+    Ok(GlyphCoverage {
+        x_min: left as i32,
+        y_min: bottom as i32,
+        width: width as usize,
+        height: height as usize,
+        alpha,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2295,9 +2566,29 @@ impl FontFace {
                 }
             }
         }
+        let spacing_features = face.tables().gpos.map_or(0, |table| {
+            u8::from(table.features.find(ttf_parser::Tag::from_bytes(b"chws")).is_some()) * spacing_trim::FACE_CHWS
+        });
         if rustybuzz::Face::from_slice(&bytes, 0).is_none() {
             return Err("font cannot be shaped");
         }
+        let variable_axes: Arc<[VariationAxisInfo]> = face
+            .variation_axes()
+            .into_iter()
+            .filter(|axis| {
+                [b"wght", b"wdth", b"opsz"].iter().any(|tag| axis.tag == ttf_parser::Tag::from_bytes(tag))
+                    && axis.min_value.is_finite()
+                    && axis.def_value.is_finite()
+                    && axis.max_value.is_finite()
+            })
+            .map(|axis| VariationAxisInfo {
+                tag: axis.tag,
+                min: axis.min_value,
+                default: axis.def_value,
+                max: axis.max_value,
+            })
+            .collect::<Vec<_>>()
+            .into();
         let id = NEXT_FACE_ID
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
@@ -2319,6 +2610,11 @@ impl FontFace {
             metric_glyph_coverage,
             primary_character_widths,
             caps_features,
+            spacing_features,
+            variable_axes,
+            variation_keys: VariationKeys::new(),
+variation_rasters: VariationGlyphCache::new(),
+variation_advances: VariationGlyphCache::new(),
             shapes: RunCache::new(),
             widths: RunCache::new(),
             rasterizers: RasterizerCache::new(),
@@ -2355,7 +2651,58 @@ impl FontFace {
         identity!=0 && identity==self.oblique_id.load(Ordering::Relaxed)
     }
     fn owns_key(&self,identity:u64)->bool {
-        identity==0 || identity==self.id || self.is_invisible_key(identity) || self.is_oblique_key(identity)
+        identity==0 || identity==self.id || self.is_invisible_key(identity) || self.is_oblique_key(identity) || self.is_variation_key(identity)
+    }
+
+    /// CSS-driven axis coordinates (`wght`, `wdth`, automatic `opsz`) for the
+    /// matched weight and width at a font size; `None` for the default instance.
+    fn variation_coordinates(&self, weight: u16, stretch: f32, size: f32) -> Option<Arc<[rustybuzz::Variation]>> {
+        if self.variable_axes.is_empty() {
+            return None;
+        }
+        let settings = variation_settings(&self.variable_axes, f32::from(weight), stretch, size);
+        (!settings.is_empty()).then(|| Arc::from(settings))
+    }
+
+    /// Glyph identity of one variation instance, optionally with the synthetic
+    /// oblique slant. Shaping data and bytes stay shared; outlines and rasters
+    /// follow the coordinates stored under the identity.
+    fn variation_key(&self, coordinates: &Arc<[rustybuzz::Variation]>, oblique: bool) -> Result<u64, &'static str> {
+        self.variation_keys
+            .locked(|table| {
+                if let Some(entry) = table.entries.iter().find(|entry| entry.oblique == oblique && entry.coordinates == *coordinates) {
+                    return Ok(entry.id);
+                }
+                if table.entries.len() >= MAX_VARIATION_KEYS {
+                    return Err("font variation identities exhausted");
+                }
+                let id = NEXT_FACE_ID
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                    .map_err(|_| "font face identity exhausted")?;
+                table.entries.try_reserve(1).map_err(|_| "font allocation failed")?;
+                table.entries.push(VariationKeyEntry { id, oblique, coordinates: coordinates.clone() });
+                table.by_id.insert(id, table.entries.len() - 1);
+                Ok(id)
+            })
+            .unwrap_or(Err("font variation identities busy"))
+    }
+
+    fn variation_entry(&self, identity: u64) -> Option<(Arc<[rustybuzz::Variation]>, bool)> {
+        if identity == 0 || identity == self.id {
+            return None;
+        }
+        self.variation_keys
+            .locked(|table| {
+                let entry = &table.entries[*table.by_id.get(&identity)?];
+                Some((entry.coordinates.clone(), entry.oblique))
+            })
+            .flatten()
+    }
+
+    fn is_variation_key(&self, identity: u64) -> bool {
+        identity != 0
+            && identity != self.id
+            && self.variation_keys.locked(|table| table.by_id.contains_key(&identity)).unwrap_or(false)
     }
 
     /// Override CSS font metrics in em units without modifying glyph outlines.
@@ -3101,6 +3448,36 @@ impl FontFace {
         self.with_rasterizer(id,size,|font|rasterize_coverage(font,id,size))
     }
 
+    fn rasterize_with_variations(&self, key: u64, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Result<Arc<GlyphCoverage>, &'static str> {
+        if !size.is_finite() || size <= 0.0 || size > MAX_RASTER_FONT_SIZE {
+            return Err("invalid font size");
+        }
+        if id >= self.glyph_count {
+            return Err("glyph id out of range");
+        }
+        let cache_key = (key, id, size.to_bits());
+        if let Some(hit) = self.variation_rasters.get(cache_key) {
+            return Ok(hit);
+        }
+        let coverage = Arc::new(coverage_from_outline(&self.outline_with_variations(id, size, variations)?)?);
+        self.variation_rasters.insert(cache_key, coverage.clone(), core::mem::size_of::<GlyphCoverage>() + coverage.alpha.len());
+        Ok(coverage)
+    }
+
+    fn advance_with_variations(&self, key: u64, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Option<f32> {
+        let cache_key = (key, id, size.to_bits());
+        if let Some(hit) = self.variation_advances.get(cache_key) {
+            return Some(hit);
+        }
+        let mut face = ttf_parser::Face::parse(&self.bytes, 0).ok()?;
+        for variation in variations {
+            face.set_variation(variation.tag, variation.value);
+        }
+        let advance = f32::from(face.glyph_hor_advance(ttf_parser::GlyphId(id))?) * size / self.units_per_em;
+        self.variation_advances.insert(cache_key, advance, core::mem::size_of::<f32>());
+        Some(advance)
+    }
+
     fn with_rasterizer<R>(&self,id:u16,size:f32,visit:impl Fn(&fontdue::Font)->R) -> Result<R,&'static str> {
         if !size.is_finite() || size <= 0.0 || size > MAX_RASTER_FONT_SIZE {
             return Err("invalid font size");
@@ -3129,6 +3506,10 @@ impl FontFace {
     }
 
     pub fn outline(&self, id: u16, size: f32) -> Result<GlyphOutline, &'static str> {
+        self.outline_with_variations(id, size, &[])
+    }
+
+    fn outline_with_variations(&self, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Result<GlyphOutline, &'static str> {
         if !size.is_finite() || size <= 0.0 || size > MAX_SHAPE_FONT_SIZE {
             return Err("invalid font size");
         }
@@ -3136,7 +3517,10 @@ impl FontFace {
             commands: Vec::new(),
             overflowed: false,
         };
-        let face = ttf_parser::Face::parse(&self.bytes, 0).map_err(|_| "invalid font")?;
+        let mut face = ttf_parser::Face::parse(&self.bytes, 0).map_err(|_| "invalid font")?;
+        for variation in variations {
+            face.set_variation(variation.tag, variation.value);
+        }
         let _bounds = face.outline_glyph(ttf_parser::GlyphId(id), &mut builder);
         if builder.overflowed {
             return Err("glyph outline exceeds the command limit");
@@ -3175,6 +3559,16 @@ impl TextShaper for FontFace {
     }
     fn glyph_cell_bounds(&self,face:u64,id:u16,size:f32)->Option<lumen_html::paint::Rect> {
         if !self.owns_key(face){return None;}
+        if let Some((variations,oblique))=self.variation_entry(face) {
+            if !size.is_finite() || size<=0.0 || size>MAX_RASTER_FONT_SIZE || id>=self.glyph_count {return None;}
+            let advance=self.advance_with_variations(face,id,size,&variations)?;
+            let (ascent,descent)=(self.ascent*size,self.descent*size);
+            if oblique {
+                return Some(lumen_html::paint::Rect{x:SYNTHETIC_OBLIQUE_SLANT*descent,y:-ascent,
+                    width:advance+SYNTHETIC_OBLIQUE_SLANT*(ascent-descent),height:ascent-descent});
+            }
+            return Some(lumen_html::paint::Rect{x:0.0,y:-ascent,width:advance,height:ascent-descent});
+        }
         let oblique=self.is_oblique_key(face);
         self.with_rasterizer(id,size,|font| {
             let metrics=font.metrics_indexed(id,size);
@@ -3195,7 +3589,18 @@ impl TextShaper for FontFace {
         self.primary_character_widths(size, self.size_adjust_scale(font.size_adjust, self))
     }
     fn glyph_ink_bounds(&self,glyph:&Glyph,size:f32) -> Option<lumen_html::paint::Rect> {
-        if glyph.face!=0 && glyph.face!=self.id && !self.is_oblique_key(glyph.face) {return None;}
+        if glyph.face!=0 && glyph.face!=self.id && !self.is_oblique_key(glyph.face) && !self.is_variation_key(glyph.face) {return None;}
+        if let Some((variations,oblique))=self.variation_entry(glyph.face) {
+            let coverage=self.rasterize_with_variations(glyph.face,glyph.id,size*glyph.size_scale,&variations).ok()?;
+            let (mut left,mut width)=(coverage.x_min as f32,coverage.width as f32);
+            if oblique {
+                let bottom=SYNTHETIC_OBLIQUE_SLANT*coverage.y_min as f32;
+                let top=SYNTHETIC_OBLIQUE_SLANT*(coverage.y_min as f32+coverage.height as f32);
+                width+=bottom.max(top)-bottom.min(top);
+                left+=bottom.min(top);
+            }
+            return Some(lumen_html::paint::Rect{x:glyph.x+left,y:glyph.y-coverage.y_min as f32-coverage.height as f32,width,height:coverage.height as f32});
+        }
         let oblique=self.is_oblique_key(glyph.face);
         self.with_rasterizer(glyph.id,size*glyph.size_scale,|font| {
             let metrics=font.metrics_indexed(glyph.id,size*glyph.size_scale);
@@ -3237,7 +3642,7 @@ let full=&full[before..after];
 let source=source.start-before..source.end-before;
 let text=&full[source.clone()];
 
-    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end};
+    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[]};
 let language=language.filter(|value|!value.is_empty());
 let key=Some((source.start,source.end));
 if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,Some(font),language,key) {
@@ -3439,6 +3844,10 @@ impl FontProvider for FontFace {
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphCoverage {x_min:0,y_min:0,width:0,height:0,alpha:Vec::new()});
         }
+        if let Some((variations, oblique)) = self.variation_entry(face) {
+            let coverage = self.rasterize_with_variations(face, id, size, &variations)?;
+            return Ok(if oblique { shear_coverage((*coverage).clone(), SYNTHETIC_OBLIQUE_SLANT) } else { (*coverage).clone() });
+        }
         if self.is_oblique_key(face) {
             return self.rasterize(id, size).map(|coverage| shear_coverage(coverage, SYNTHETIC_OBLIQUE_SLANT));
         }
@@ -3454,6 +3863,13 @@ impl FontProvider for FontFace {
             if id>=self.glyph_count {return Err("glyph id out of range");}
             return Ok(GlyphOutline {commands:Vec::new()});
         }
+        if let Some((variations, oblique)) = self.variation_entry(face) {
+            let mut outline = self.outline_with_variations(id, size, &variations)?;
+            if oblique {
+                shear_outline(&mut outline, SYNTHETIC_OBLIQUE_SLANT);
+            }
+            return Ok(outline);
+        }
         if self.is_oblique_key(face) {
             let mut outline = self.outline(id, size)?;
             shear_outline(&mut outline, SYNTHETIC_OBLIQUE_SLANT);
@@ -3466,7 +3882,7 @@ impl FontProvider for FontFace {
     }
 
     fn face_key(&self, face: u64) -> Result<u64, &'static str> {
-        if self.is_invisible_key(face) || self.is_oblique_key(face) {Ok(face)} else if face == 0 || face == self.id {
+        if self.is_invisible_key(face) || self.is_oblique_key(face) || self.is_variation_key(face) {Ok(face)} else if face == 0 || face == self.id {
             Ok(self.id)
         } else {
             Err("font face identity mismatch")
@@ -3521,7 +3937,7 @@ let full=&full[before..after];
 let source=source.start-before..source.end-before;
 let text=&full[source.clone()];
 
-    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end};
+    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[]};
 let language=language.filter(|value|!value.is_empty());
 let key=Some((source.start,source.end));
 if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,Some(font),language,key) {
@@ -3804,6 +4220,68 @@ mod tests {
     use alloc::format;
     use alloc::vec;
 
+    fn axis(tag: &[u8; 4], min: f32, default: f32, max: f32) -> VariationAxisInfo {
+        VariationAxisInfo { tag: ttf_parser::Tag::from_bytes(tag), min, default, max }
+    }
+
+    #[test]
+    fn css_drives_weight_width_and_optical_size_axes_within_their_ranges() {
+        let axes = [axis(b"wght", 100.0, 400.0, 900.0), axis(b"wdth", 75.0, 100.0, 125.0), axis(b"opsz", 14.0, 14.0, 32.0)];
+        assert!(variation_settings(&axes, 400.0, 100.0, 14.0).is_empty());
+        let value = |settings: &[rustybuzz::Variation], tag: &[u8; 4]| {
+            settings.iter().find(|setting| setting.tag == ttf_parser::Tag::from_bytes(tag)).map(|setting| setting.value)
+        };
+        let heading = variation_settings(&axes, 1200.0, 60.0, 64.0);
+        assert_eq!(value(&heading, b"wght"), Some(900.0));
+        assert_eq!(value(&heading, b"wdth"), Some(75.0));
+        assert_eq!(value(&heading, b"opsz"), Some(32.0));
+        let text = variation_settings(&axes, 400.0, 100.0, 16.26);
+        assert_eq!(value(&text, b"wght"), None);
+        assert_eq!(value(&text, b"opsz"), Some(16.5));
+        assert!(variation_settings(&[axis(b"slnt", -10.0, 0.0, 0.0)], 700.0, 50.0, 40.0).is_empty());
+    }
+
+    #[test]
+    fn variation_identities_are_stable_distinct_and_resolve_to_their_face() {
+        let face = FontFace::new(Arc::from(TEST_FONT_BYTES)).unwrap();
+        let narrow: Arc<[rustybuzz::Variation]> = Arc::from([rustybuzz::Variation { tag: ttf_parser::Tag::from_bytes(b"wdth"), value: 80.0 }]);
+        let wide: Arc<[rustybuzz::Variation]> = Arc::from([rustybuzz::Variation { tag: ttf_parser::Tag::from_bytes(b"wdth"), value: 120.0 }]);
+        let first = face.variation_key(&narrow, false).unwrap();
+        assert_eq!(face.variation_key(&narrow, false).unwrap(), first);
+        assert_ne!(face.variation_key(&wide, false).unwrap(), first);
+        assert_ne!(face.variation_key(&narrow, true).unwrap(), first);
+        assert!(face.owns_key(first) && face.is_variation_key(first));
+        assert_eq!(face.face_key(first), Ok(first));
+        assert!(!face.is_variation_key(face.id()));
+        assert!(face.rasterize_glyph(first, 40, 24.0).is_ok());
+    }
+
+    #[test]
+    fn outline_coverage_matches_the_font_rasterizer_mass() {
+        let face = FontFace::new(Arc::from(TEST_FONT_BYTES)).unwrap();
+        let glyph = face.shape("H", 48.0).unwrap().glyphs[0].id;
+        let reference = face.rasterize(glyph, 48.0).unwrap();
+        let outline = face.outline(glyph, 48.0).unwrap();
+        let drawn = coverage_from_outline(&outline).unwrap();
+        let mass = |coverage: &GlyphCoverage| coverage.alpha.iter().map(|value| u32::from(*value)).sum::<u32>() as f32;
+        assert!((mass(&drawn) - mass(&reference)).abs() < 0.03 * mass(&reference));
+        assert!((drawn.width as i32 - reference.width as i32).abs() <= 1);
+        assert!((drawn.height as i32 - reference.height as i32).abs() <= 1);
+        assert!((drawn.x_min - reference.x_min).abs() <= 1);
+        assert!((drawn.y_min - reference.y_min).abs() <= 1);
+    }
+
+    #[test]
+    fn outline_coverage_fills_interior_and_leaves_empty_outlines_blank() {
+        use GlyphOutlineCommand::{Close, LineTo, MoveTo};
+        let square = GlyphOutline { commands: vec![MoveTo(1.0, 2.0), LineTo(5.0, 2.0), LineTo(5.0, 6.5), LineTo(1.0, 6.5), Close] };
+        let coverage = coverage_from_outline(&square).unwrap();
+        assert_eq!((coverage.x_min, coverage.y_min, coverage.width, coverage.height), (1, 2, 4, 5));
+        assert!(coverage.alpha[..4].iter().all(|value| (120..=136).contains(value)));
+        assert!(coverage.alpha[4..].iter().all(|value| *value >= 250));
+        assert_eq!(coverage_from_outline(&GlyphOutline { commands: Vec::new() }).unwrap().width, 0);
+    }
+
     #[test]
     fn specification_primary_font_control_metadata_tracks_selection_and_size_adjust() {
         use read_fonts::TableProvider;
@@ -4076,7 +4554,7 @@ mod tests {
         let decoded=rustybuzz::Face::from_slice(&face.bytes,0).unwrap();
         for (base,expected) in [("ع",Script::Arabic),("ܐ",Script::Syriac)] {
             let full=format!("{base}{text}");
-            let context=ShapeContext{language:None,surrounding:Some(&full),start:base.len(),end:full.len()};
+            let context=ShapeContext{language:None,surrounding:Some(&full),start:base.len(),end:full.len(),variations:&[]};
             assert!(resolve_script(&decoded,selection,context)==expected,"only eligible surrounding script resolves the ambiguous set");
         }
     }
@@ -5232,7 +5710,7 @@ fn joining_context_preserves_font_item_clusters_and_exact_cache_identity() {
         let fallback_id = platform.face.id();
         let web_id = web.face.id();
         let fonts = FontSet::new_with_unicode_ranges(
-            vec![platform, web],
+            vec![platform.clone(), web.clone()],
             vec![None, Some(Arc::from([(0x41, 0x5a)]))],
         )
         .unwrap();
@@ -5249,8 +5727,11 @@ fn joining_context_preserves_font_item_clusters_and_exact_cache_identity() {
                 .face,
             web_id
         );
-        let mut with_space = fonts;
-        with_space.unicode_ranges[1] = Some(Arc::from([(0x20, 0x5a)]));
+        let with_space = FontSet::new_with_unicode_ranges(
+            vec![platform, web],
+            vec![None, Some(Arc::from([(0x20, 0x5a)]))],
+        )
+        .unwrap();
         assert_eq!(with_space.metric_face(&spec).id(), web_id);
     }
 

@@ -57,7 +57,7 @@ fn construct(ctx: &mut Ctx, base: DomEvent, command: String, source: Option<Valu
 }
 
 pub(crate) fn dispatch(ctx: &mut Ctx, realm: &Rc<DomRealm>, target: NodeId, command: &str, source: Value) -> OpResult<bool> {
-    let base = DomEvent::from_init("command", lumen_host::events::EventInit { cancelable: true, ..Default::default() });
+    let base = DomEvent::from_init("command", lumen_host::events::EventInit { cancelable: true, composed: true, ..Default::default() });
     let event = construct(ctx, base, command.to_owned(), Some(source)).into_instance(ctx).map_err(OpError::thrown)?;
     let target_value = realm.wrap(ctx, target);
     realm.dispatch_event_to_target(ctx, target, target_value, event, true)

@@ -553,7 +553,17 @@ pub(crate) fn type_from_attributes(attribute: impl Fn(&str) -> Option<String>) -
             _ => "text/javascript".to_owned(),
         },
     };
-    declared_script_type(&kind.to_ascii_lowercase(), attribute("nomodule").is_some())
+    let kind = declared_script_type(&kind.to_ascii_lowercase(), attribute("nomodule").is_some());
+    if kind == DeclaredScriptType::Classic {
+        if let (Some(target), Some(event)) = (attribute("for"), attribute("event")) {
+            let trim = |value: &str| value.trim_matches(['\t', '\n', '\u{000C}', '\r', ' ']).to_ascii_lowercase();
+            let event = trim(&event);
+            if trim(&target) != "window" || !matches!(event.as_str(), "onload" | "onload()") {
+                return DeclaredScriptType::SuppressedClassic;
+            }
+        }
+    }
+    kind
 }
 
 pub(crate) fn declared_script_type(essence: &str, has_nomodule: bool) -> DeclaredScriptType {

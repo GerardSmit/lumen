@@ -15,6 +15,18 @@ const POSITION: &[&str] = &["sub", "super"];
 pub(super) const RESET_LONGHANDS: [&str; 4] =
     ["font-variant-numeric", "font-variant-east-asian", "font-variant-position", "font-variant-emoji"];
 
+/// Longhands the `font` shorthand resets without being able to express them.
+pub(super) const FONT_RESETS: [(&str, &str); 4] = [
+    ("font-kerning", "auto"),
+    ("font-optical-sizing", "auto"),
+    ("font-variation-settings", "normal"),
+    ("font-language-override", "normal"),
+];
+
+pub(super) fn font_resets() -> Vec<Value> {
+    FONT_RESETS.iter().flat_map(|(name, initial)| extra::declarations(name, initial).unwrap_or_default()).collect()
+}
+
 pub(super) fn normal_resets() -> Vec<Value> {
     RESET_LONGHANDS.iter().flat_map(|name| extra::declarations(name, "normal").unwrap_or_default()).collect()
 }

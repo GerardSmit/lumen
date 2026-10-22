@@ -33,6 +33,7 @@ static TABLE: &[Short] = &[
     Short { name: "scroll-padding-block", longhands: &["scroll-padding-block-start", "scroll-padding-block-end"], shape: Shape::Pair },
     Short { name: "scroll-padding-inline", longhands: &["scroll-padding-inline-start", "scroll-padding-inline-end"], shape: Shape::Pair },
     Short { name: "overscroll-behavior", longhands: &["overscroll-behavior-x", "overscroll-behavior-y"], shape: Shape::Pair },
+    Short { name: "interest-delay", longhands: &["interest-delay-start", "interest-delay-end"], shape: Shape::Pair },
     Short { name: "container", longhands: &["container-name", "container-type"], shape: Shape::NameSlashType },
     Short { name: "text-box", longhands: &["text-box-trim", "text-box-edge"], shape: Shape::Rule },
     Short { name: "text-emphasis", longhands: &["text-emphasis-style", "text-emphasis-color"], shape: Shape::Rule },

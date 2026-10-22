@@ -2,7 +2,9 @@
 use super::*;
 use lumen_html::{paint::Rect, session::RenderSession, NodeId};
 mod value_types;
-pub(crate) use value_types::{matrix_native_value, matrix_native_instance, validate_mutable_matrix};
+mod utils;
+pub(crate) use utils::{convert_point, convert_quad, convert_rect, collapsed_range_rect, get_box_quads, range_client_rects, Subject};
+pub(crate) use value_types::{matrix_2d_init, matrix_native_value, matrix_native_instance, validate_mutable_matrix};
 
 /// Resolve one visible element without allocating a result list or dedup table.
 pub(crate) fn element_from_point_in_tree(
@@ -83,7 +85,20 @@ fn visit_elements_from_point(
             return true;
         };
         if matches!(document.kind(node), Ok(NodeKind::Element { .. })) {
-            stopped = !visit(node, false);
+            let area = session.bounding_client_rect(node).and_then(|rect| {
+                lumen_html::image_map::area_at(
+                    document,
+                    node,
+                    x - f64::from(rect.x),
+                    y - f64::from(rect.y),
+                )
+            });
+            if let Some(area) = area {
+                stopped = !visit(area, false);
+            }
+            if !stopped {
+                stopped = !visit(node, false);
+            }
         }
         !stopped
     });
@@ -347,6 +362,7 @@ pub fn install(ctx: &mut Ctx) -> OpResult<()> {
         .map_err(|_| OpError::new("Error", "DOMRect installation failed"))?;
     crate::install_interface(ctx, &global, "DOMRectList", list)
         .map_err(|_| OpError::new("Error", "DOMRectList installation failed"))?;
+    crate::caret_position::install(ctx)?;
     value_types::install(ctx, true)
 }
 
@@ -359,7 +375,7 @@ pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
     value_types::install(ctx, false)
 }
 
-fn union(rects: &[Rect]) -> Rect {
+pub(crate) fn union(rects: &[Rect]) -> Rect {
     let Some(first) = rects.first().copied() else {
         return Rect {
             x: 0.0,

@@ -82,6 +82,9 @@ impl Color {
                 (ColorSpace::Srgb,ColorSpace::Hsl)=>rgb_to_hsl(values),
                 (ColorSpace::Hsl,ColorSpace::Srgb)=>hsl_to_rgb(values),
                 (ColorSpace::Hwb,ColorSpace::Srgb)=>hwb_to_rgb(values),
+                (ColorSpace::Srgb,ColorSpace::Hwb)=>rgb_to_hwb(values),
+                (ColorSpace::Hsl,ColorSpace::Hwb)=>rgb_to_hwb(hsl_to_rgb(values)),
+                (ColorSpace::Hwb,ColorSpace::Hsl)=>rgb_to_hsl(hwb_to_rgb(values)),
                 (ColorSpace::Srgb,ColorSpace::SrgbLinear)=>values.map(srgb_to_linear),
                 (ColorSpace::SrgbLinear,ColorSpace::Srgb)=>values.map(linear_to_srgb),
                 (ColorSpace::Srgb,ColorSpace::Oklab)=>linear_rgb_to_oklab(values.map(srgb_to_linear)),
@@ -116,17 +119,18 @@ impl Color {
         if self.space == target { return self; }
         // Carry is classified from the original missing mask before conversion
         // performs its source and destination powerless-component handling.
+        let source_missing = self.missing | self.powerless();
         let src = self.space.categories(); let dst = target.categories();
         let mut matched_src = 0u8; let mut matched_dst = 0u8; let mut carry = self.missing & 8;
         for (i, category) in src.iter().enumerate() {
             if *category == 0 { continue; }
             if let Some(j) = dst.iter().position(|other| other == category) {
                 matched_src |= 1 << i; matched_dst |= 1 << j;
-                if self.missing & (1 << i) != 0 { carry |= 1 << j; }
+                if source_missing & (1 << i) != 0 { carry |= 1 << j; }
             }
         }
         let remaining_src = 7 & !matched_src;
-        if remaining_src != 0 && self.missing & remaining_src == remaining_src { carry |= 7 & !matched_dst; }
+        if remaining_src != 0 && source_missing & remaining_src == remaining_src { carry |= 7 & !matched_dst; }
         let mut result=self.to(target);result.missing=carry | result.missing;
         result
 
@@ -170,12 +174,12 @@ impl PreparedPair {
         Self {method, left: a, right: b, missing}
     }
     pub fn sample(self, t: f32) -> Color {
-        let alpha = self.left[3]*(1.0-t)+self.right[3]*t;
+        let alpha = (self.left[3]*(1.0-t)+self.right[3]*t).clamp(0.0, 1.0);
         let mut values = [0.0; 3];
         for (i, value) in values.iter_mut().enumerate() {
             *value = self.left[i]*(1.0-t)+self.right[i]*t;
             if self.method.space.hue() == Some(i) { *value = value.rem_euclid(1.0); }
-            else if self.missing&8==0 && alpha != 0.0 { *value /= alpha; }
+            else if self.missing&8==0 { *value = if alpha > 0.0 { *value / alpha } else { 0.0 }; }
         }
         Color::new(self.method.space, values, alpha, self.missing)
     }
@@ -383,6 +387,15 @@ fn rgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
     if saturation < 0.0 { saturation = -saturation; hue += 0.5; }
     [hue.rem_euclid(1.0), saturation, lightness]
 }
+/// HWB keeps the hue of the rgb triple itself; unlike HSL it does not rotate
+/// by 180 degrees for out-of-gamut colors, so extended sRGB round-trips.
+fn rgb_to_hwb(rgb: [f32; 3]) -> [f32; 3] {
+    let [r,g,b] = rgb; let max = r.max(g).max(b); let min = r.min(g).min(b); let delta = max - min;
+    let hue = if delta == 0.0 { 0.0 } else {
+        (if max == r { ((g-b)/delta).rem_euclid(6.0) } else if max == g { (b-r)/delta+2.0 } else { (r-g)/delta+4.0 }) / 6.0
+    };
+    [hue.rem_euclid(1.0), min, 1.0 - max]
+}
 fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
     let [h,s,l] = hsl; let a = s * l.min(1.0-l);
     let channel = |n: f32| { let k = (n+h*12.0).rem_euclid(12.0); l-a*(-1.0f32).max((k-3.0).min(9.0-k).min(1.0)) };
@@ -423,10 +436,7 @@ fn from_xyz(xyz: [f32; 3], space: ColorSpace) -> [f32; 3] {
         ColorSpace::Oklab => linear_rgb_to_oklab(xyz_to_linear_rgb(xyz)),
         ColorSpace::Oklch => polar(linear_rgb_to_oklab(xyz_to_linear_rgb(xyz))),
         ColorSpace::Hsl => rgb_to_hsl(xyz_to_linear_rgb(xyz).map(linear_to_srgb)),
-        ColorSpace::Hwb => {
-            let rgb=xyz_to_linear_rgb(xyz).map(linear_to_srgb);
-            [rgb_to_hsl(rgb)[0],rgb[0].min(rgb[1]).min(rgb[2]),1.0-rgb[0].max(rgb[1]).max(rgb[2])]
-        },
+        ColorSpace::Hwb => rgb_to_hwb(xyz_to_linear_rgb(xyz).map(linear_to_srgb)),
         _ => xyz_to_profile(xyz,space),
     }
 }

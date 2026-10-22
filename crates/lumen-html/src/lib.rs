@@ -19,6 +19,8 @@ pub mod focus;
 pub mod graph;
 pub mod headings;
 pub mod top_layer;
+pub mod image_map;
+pub mod popover_stack;
 pub mod interaction;
 pub mod labels;
 pub mod language;

@@ -219,3 +219,23 @@ mod tests {
         assert!(canonicalize("palette-mix(in oklab, dark -10%, light 40%)", false).is_none());
     }
 }
+
+/// Interpolation of two plain palettes: before the start or after the end the
+/// nearest endpoint is kept, in between the result is an `oklab` palette mix.
+pub fn interpolate(from: &str, to: &str, progress: f64) -> Option<String> {
+    let (from, to) = (from.trim(), to.trim());
+    if is_palette_mix(from) || is_palette_mix(to) || !progress.is_finite() {
+        return None;
+    }
+    if from == to || progress <= 0.0 {
+        return Some(String::from(from));
+    }
+    if progress >= 1.0 {
+        return Some(String::from(to));
+    }
+    if progress == 0.5 {
+        return Some(format!("palette-mix(in oklab, {from}, {to})"));
+    }
+    let percent = crate::animation::serialize_numeric(progress * 100.0, "%")?;
+    Some(format!("palette-mix(in oklab, {from}, {to} {percent})"))
+}

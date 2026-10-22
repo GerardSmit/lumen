@@ -45,6 +45,11 @@ crate::event_content_handlers::bind_namespace_handlers! { DomSvgElement {
         self.base.base.set_style(value)
     }
 
+    #[getter(name = "attributeStyleMap")]
+    fn attribute_style_map(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.attribute_style_map(ctx, this)
+    }
+
     #[getter(name = "ownerSVGElement")]
     fn owner_svg_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let node = &self.base.base;
@@ -78,6 +83,11 @@ impl DomSvgSvgElement {
         let found = selector::get_element_by_id(node.realm.session.borrow().document(), node.id, id)
             .map_err(dom_error)?;
         Ok(node.realm.wrap_option(ctx, found))
+    }
+
+    #[method(name = "createSVGRect")]
+    fn create_svg_rect(&self, ctx: &mut Ctx) -> Value {
+        crate::geometry::rect_value(ctx, lumen_html::paint::Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 })
     }
 }
 

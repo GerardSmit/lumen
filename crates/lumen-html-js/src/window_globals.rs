@@ -57,6 +57,10 @@ fn window_attribute_realm(ctx: &mut Ctx, receiver: Value) -> OpResult<Option<Rc<
     ctx.with_instance::<DomWindow,_>(&receiver,|window|window.base.associated_realm())
 }
 
+pub(crate) fn window_realm_of(ctx: &mut Ctx, value: &Value) -> Option<Rc<DomRealm>> {
+    window_attribute_realm(ctx, value.clone()).ok().flatten()
+}
+
 fn window_attribute_metadata(ctx: &mut Ctx, realm: &Option<Rc<DomRealm>>) -> Option<Rc<browsing_context::RealmMetadata>> {
     let handle=realm.as_ref()?.relevant_host_realm(ctx)?;
     browsing_context::metadata_for_realm(ctx,&handle)
@@ -76,7 +80,7 @@ fn scroll_window_receiver(
     receiver: &Value,
     args: OneOrNumberPair<scrolling::ScrollToOptions>,
     relative: bool,
-) -> OpResult<Promise<()>> {
+) -> OpResult<Promise<Value>> {
     // Web IDL's global-interface operations use their relevant global for
     // null/undefined this. Publish its WindowProxy before projecting the
     // native receiver so original-caller authorization still runs.
@@ -104,7 +108,7 @@ pub(crate) fn scroll_node(
     node: NodeId,
     args: OneOrNumberPair<scrolling::ScrollToOptions>,
     relative: bool,
-) -> Promise<()> {
+) -> Promise<Value> {
     let (current_x, current_y) = match scrolling::position(&realm, node) {
         Ok(position) => position,
         Err(error) => return Promise::rejected(error),
@@ -352,7 +356,7 @@ crate::event_content_handlers::bind_window_handlers! {
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
         #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> OpResult<Promise<()>> {
+    ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, false)
     }
 
@@ -361,7 +365,7 @@ crate::event_content_handlers::bind_window_handlers! {
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
         #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> OpResult<Promise<()>> {
+    ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, false)
     }
 
@@ -370,7 +374,7 @@ crate::event_content_handlers::bind_window_handlers! {
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
         #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> OpResult<Promise<()>> {
+    ) -> OpResult<Promise<Value>> {
         scroll_window_receiver(ctx, &this.0, args, true)
     }
 

@@ -966,11 +966,7 @@ pub fn radio_group_members(document: &Document, node: NodeId) -> Vec<NodeId> {
 /// Return the root of the control's current tree. Form association also works
 /// for a detached subtree, such as a script-created form before insertion.
 fn tree_root(document: &Document, node: NodeId) -> NodeId {
-    let mut root = node;
-    while let Ok(Some(parent)) = document.parent(root) {
-        root = parent;
-    }
-    root
+    document.root_node(node, false).unwrap_or(node)
 }
 
 fn attribute<'a>(document: &'a Document, node: NodeId, name: &str) -> Option<&'a str> {
@@ -1104,6 +1100,19 @@ fn html_element_parts(document: &Document, node: NodeId) -> Result<Option<(&str,
         }
         _ => Ok(None),
     }
+}
+
+/// Concatenation of the direct Text children, as used by textarea's raw value.
+fn child_text_content(document: &Document, root: NodeId) -> String {
+    let mut text = String::new();
+    let mut child = document.first_child(root).ok().flatten();
+    while let Some(node) = child {
+        if let Ok(NodeKind::Text(value) | NodeKind::CData(value)) = document.kind(node) {
+            text.push_str(value);
+        }
+        child = document.next_sibling(node).ok().flatten();
+    }
+    text
 }
 
 fn text_content(document: &Document, root: NodeId) -> String {
@@ -1323,6 +1332,13 @@ fn control_value(document: &Document, node: NodeId, name: &str) -> String {
             InputValueMode::Default => value.unwrap_or("").to_owned(),
             InputValueMode::DefaultOn => value.unwrap_or("on").to_owned(),
             InputValueMode::Filename => String::new(),
+            InputValueMode::Value if kind == "color" => {
+                let (display_p3, alpha) = color_input_options(
+                    attribute(document, node, "colorspace"),
+                    attribute(document, node, "alpha").is_some(),
+                );
+                crate::css::color_input::sanitize_input_color(value.unwrap_or(""), display_p3, alpha)
+            }
             InputValueMode::Value => sanitize_input_value_with_attributes(
                 &kind,
                 value.unwrap_or(""),
@@ -1335,12 +1351,21 @@ fn control_value(document: &Document, node: NodeId, name: &str) -> String {
         };
     }
     if name == "textarea" {
-        text_content(document, node)
+        child_text_content(document, node)
     } else if let Some(value) = attribute(document, node, "value") {
         value.to_owned()
     } else {
         String::new()
     }
+}
+
+/// Resolve the `colorspace` and `alpha` attributes of a color input into
+/// `(display_p3, alpha)`.
+pub fn color_input_options(color_space: Option<&str>, alpha: bool) -> (bool, bool) {
+    (
+        color_space.is_some_and(|value| value.eq_ignore_ascii_case("display-p3")),
+        alpha,
+    )
 }
 
 /// Apply input value sanitization for the numeric and date/time states used by
@@ -1394,11 +1419,11 @@ pub fn sanitize_input_value_with_attributes(
         if multiple {
             return value
                 .split(',')
-                .map(|part| part.trim_matches(is_ascii_whitespace))
+                .map(|part| email_domain_to_ascii(part.trim_matches(is_ascii_whitespace)))
                 .collect::<Vec<_>>()
                 .join(",");
         }
-        return value.trim_matches(is_ascii_whitespace).to_owned();
+        return email_domain_to_ascii(value.trim_matches(is_ascii_whitespace));
     }
     if matches!(
         kind,
@@ -1412,6 +1437,25 @@ pub fn sanitize_input_value_with_attributes(
     } else {
         value.to_owned()
     }
+}
+
+/// Convert a non-ASCII domain of an e-mail address to its punycode form.
+fn email_domain_to_ascii(address: &str) -> String {
+    if address.is_ascii() {
+        return address.to_owned();
+    }
+    let Some((local, domain)) = address.rsplit_once('@') else {
+        return address.to_owned();
+    };
+    let ascii = lumen_common::url::domain_to_ascii(domain);
+    if ascii.is_empty() {
+        return address.to_owned();
+    }
+    let mut converted = String::with_capacity(local.len() + 1 + ascii.len());
+    converted.push_str(local);
+    converted.push('@');
+    converted.push_str(&ascii);
+    converted
 }
 
 fn is_simple_color(value: &str) -> bool {
@@ -1579,7 +1623,7 @@ pub fn default_value(document: &Document, node: NodeId) -> Option<String> {
     // A textarea's default value is its text content. A `value` attribute is
     // not part of HTMLTextAreaElement's value model.
     if name == "textarea" {
-        return Some(text_content(document, node));
+        return Some(child_text_content(document, node));
     }
     // An output's reset default is its descendant text content. Its live value
     // is also text content, but the DOM adapter tracks the optional
@@ -3640,8 +3684,11 @@ fn select_value_missing(document: &Document, select: NodeId, view: &dyn Validity
         }
         true
     });
+    let display_size_one = attribute(document, select, "size")
+        .and_then(parse_nonnegative_integer)
+        .is_none_or(|size| size <= 1);
     let selected = selected.or_else(|| {
-        (!multiple && !has_override)
+        (!multiple && display_size_one && !has_override)
             .then_some(first_enabled)
             .flatten()
     });
@@ -3649,7 +3696,9 @@ fn select_value_missing(document: &Document, select: NodeId, view: &dyn Validity
         return true;
     };
     !multiple
+        && display_size_one
         && first_option == Some(selected)
+        && document.parent(selected).ok().flatten() == Some(select)
         && option_value(document, selected).is_some_and(|value| value.is_empty())
 }
 

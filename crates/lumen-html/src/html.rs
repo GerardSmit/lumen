@@ -239,7 +239,6 @@ pub fn is_known_html_element_name(name: &str) -> bool {
             | "mark"
             | "marquee"
             | "menu"
-            | "menuitem"
             | "meta"
             | "meter"
             | "nav"
@@ -511,7 +510,7 @@ fn parse_doctype(raw: &str, terminated: bool) -> ParsedDoctype {
                 b'"' | b'\'' => {
                     system_id = Some(String::new());
                     state = DoctypeState::SystemId(byte);
-                    true
+                    false
                 }
                 _ => {
                     force_quirks = true;
@@ -1118,7 +1117,6 @@ impl Tag {
                 | Tag::Input
                 | Tag::Frame
                 | Tag::Keygen
-                | Tag::Menuitem
                 | Tag::Link
                 | Tag::Meta
                 | Tag::Param
@@ -1328,6 +1326,8 @@ impl Tag {
                 | Tag::Summary
                 | Tag::Table
                 | Tag::Ul
+                | Tag::Xmp
+                | Tag::Plaintext
         )
     }
 
@@ -1349,6 +1349,10 @@ impl Tag {
 fn numeric_entity(input: &str) -> Option<(char, usize)> {
     let reference = lumen_common::entities::char_ref(input)?;
     Some((lumen_common::entities::html_char(reference.value), reference.len))
+}
+
+fn decode_text(text: &str, predecoded: bool) -> Cow<'_, str> {
+    if predecoded { Cow::Borrowed(text) } else { decode_entities(text, false) }
 }
 
 pub(crate) fn decode_entities(input: &str, attribute: bool) -> Cow<'_, str> {
@@ -1444,7 +1448,6 @@ pub(crate) fn serializes_void(name: &str) -> bool {
             | "keygen"
             | "link"
             | "meta"
-            | "menuitem"
             | "param"
             | "source"
             | "track"
@@ -3938,6 +3941,26 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         }
     }
 
+    /// An end tag is processed by the foreign-content rules even when the current node is an
+    /// integration point, so `</title>` closes an SVG `title` instead of being matched against
+    /// HTML elements only.
+    fn close_matching_integration_point(&mut self, name: &str) -> bool {
+        if !self.current_foreign_integration_point() {
+            return false;
+        }
+        let Some(index) = self.stack.len().checked_sub(1) else { return false };
+        let open = self.stack[index];
+        let matches_name = matches!(
+            self.document.kind(open.id),
+            Ok(NodeKind::Element { namespace, name: open_name, .. })
+                if *namespace != Namespace::Html && open_name.eq_ignore_ascii_case(name)
+        );
+        if matches_name {
+            self.close_at(index);
+        }
+        matches_name
+    }
+
     fn foreign_end_tag(&mut self, name: &str) {
         for index in (0..self.stack.len()).rev() {
             let open = self.stack[index];
@@ -3972,9 +3995,14 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
     }
 
     fn fragment_context_mode_active(&self, contexts: &[Tag]) -> bool {
+        let foreign_current = self.stack.len() > 1
+            && self.current_namespace() != Namespace::Html
+            && !self.current_foreign_integration_point();
         self.in_fragment_context(contexts)
+            && !foreign_current
             && !self.stack.iter().skip(1).any(|open| {
-                matches!(
+                matches!(self.document.kind(open.id), Ok(NodeKind::Element { namespace: Namespace::Html, .. }))
+                    && matches!(
                     open.tag,
                     Tag::Table
                         | Tag::Caption
@@ -4434,7 +4462,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             }
             if matches!(
                 open.tag,
-                Tag::Caption
+                Tag::Applet
+                    | Tag::Caption
+                    | Tag::Marquee
                     | Tag::Html
                     | Tag::Object
                     | Tag::Table
@@ -5017,6 +5047,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
  }
         let tag = Tag::classify(&name);
         let namespace = self.adjusted_current_namespace();
+        if namespace != Namespace::Html && self.close_matching_integration_point(&name) {
+            return Ok(());
+        }
         if namespace != Namespace::Html && !self.current_foreign_integration_point() {
             if matches!(name.as_ref(), "br" | "p") {
                 self.pop_foreign_for_html();
@@ -5395,8 +5428,11 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if matches!(
                 tag,
                 Tag::Base
+                    | Tag::Basefont
+                    | Tag::Bgsound
                     | Tag::Link
                     | Tag::Meta
+                    | Tag::Noframes
                     | Tag::Style
                     | Tag::Script
                     | Tag::Title
@@ -5620,13 +5656,17 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 self.pop_open_element();
             }
         }
-        if tag.closes_paragraph() {
+        if tag.closes_paragraph()
+            && !(tag == Tag::Table && self.document.document_mode() == crate::DocumentMode::Quirks)
+        {
             self.close_in_scope(
                 &[Tag::P],
                 &[
+                    Tag::Applet,
                     Tag::Button,
                     Tag::Caption,
                     Tag::Html,
+                    Tag::Marquee,
                     Tag::Object,
                     Tag::Table,
                     Tag::Td,
@@ -5704,6 +5744,12 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 }
             }
             Tag::A => self.start_anchor()?,
+            Tag::Nobr => {
+                self.reconstruct_formatting()?;
+                if self.in_scope(Tag::Nobr) {
+                    self.end_formatting(Tag::Nobr)?;
+                }
+            }
             _ => {}
         }
         let formatting = tag.is_formatting();
@@ -5931,8 +5977,13 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         let foreign_content = self.adjusted_current_namespace() != Namespace::Html
             && !self.current_foreign_integration_point()
             && !self.current_mathml_text_integration_point();
+        // A U+0000 inside a character reference breaks the reference, and is
+        // only dropped from the decoded text afterwards.
+        let predecoded = !foreign_content && source.as_bytes().contains(&0);
         let raw = if foreign_content {
             replace_nulls(source)
+        } else if predecoded {
+            Cow::Owned(remove_nulls(&decode_entities(source, false)).into_owned())
         } else {
             remove_nulls(source)
         };
@@ -5953,7 +6004,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if self.in_head {
                 if whitespace {
                     return self.append_text_at(
-                        decode_entities(content, false),
+                        decode_text(content, predecoded),
                         self.head.unwrap_or(self.body),
                         None,
                         start,
@@ -5962,7 +6013,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 let split = content.bytes().take_while(u8::is_ascii_whitespace).count();
                 if split != 0 {
                     self.append_text_at(
-                        decode_entities(&content[..split], false),
+                        decode_text(&content[..split], predecoded),
                         self.head.unwrap_or(self.body),
                         None,
                         start,
@@ -5972,7 +6023,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             } else if self.after_head {
                 if whitespace {
                     return self.append_text_at(
-                        decode_entities(content, false),
+                        decode_text(content, predecoded),
                         self.html.unwrap_or(self.body),
                         (self.scaffold_attached & 4 != 0).then_some(self.body),
                         start,
@@ -5981,7 +6032,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 let split = content.bytes().take_while(u8::is_ascii_whitespace).count();
                 if split != 0 {
                     self.append_text_at(
-                        decode_entities(&content[..split], false),
+                        decode_text(&content[..split], predecoded),
                         self.html.unwrap_or(self.body),
                         (self.scaffold_attached & 4 != 0).then_some(self.body),
                         start,
@@ -6005,7 +6056,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         if !content_whitespace || !self.parent_tag().is_table_context() {
             self.reconstruct_formatting()?;
         }
-        self.append_text(decode_entities(content, false), start)
+        self.append_text(decode_text(content, predecoded), start)
     }
 
     fn name(&mut self) -> Result<Cow<'a, str>, ParseError> {

@@ -119,6 +119,55 @@ pub fn draggable_enabled(document:&Document,node:NodeId,object_represents_image:
     }
 }
 
+fn inherits_form_text_input_state(document: &Document, node: NodeId) -> Option<NodeId> {
+    if !html(document, node) { return None; }
+    match crate::forms::html_element_local_name(document, node) {
+        Some("button" | "fieldset" | "input" | "output" | "select" | "textarea") => crate::forms::form_owner(document, node),
+        _ => None,
+    }
+}
+
+/// The `writingSuggestions` state: only a missing attribute inherits from the parent element.
+pub fn writing_suggestions_enabled(document: &Document, mut node: NodeId) -> bool {
+    loop {
+        if let Some(raw) = attribute(document, node, "writingsuggestions") {
+            return !raw.eq_ignore_ascii_case("false");
+        }
+        match parent_element(document, node) { Some(parent) => node = parent, None => return true }
+    }
+}
+
+/// The `autocapitalize` IDL value: own keyword, else the form owner's for form controls.
+pub fn autocapitalize_keyword(document: &Document, node: NodeId) -> &'static str {
+    let own = attribute(document, node, "autocapitalize").filter(|raw| !raw.is_empty());
+    let raw = match own {
+        Some(raw) => raw,
+        None => match inherits_form_text_input_state(document, node).and_then(|form| attribute(document, form, "autocapitalize")) {
+            Some(raw) => raw,
+            None => return "",
+        },
+    };
+    if raw.is_empty() { return ""; }
+    if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("off") { "none" }
+    else if raw.eq_ignore_ascii_case("characters") { "characters" }
+    else if raw.eq_ignore_ascii_case("words") { "words" }
+    else { "sentences" }
+}
+
+/// The `autocorrect` IDL value: an explicit `off` disables; a missing attribute inherits from the form owner.
+pub fn autocorrect_enabled(document: &Document, node: NodeId) -> bool {
+    if crate::forms::html_element_local_name(document, node) == Some("input")
+        && matches!(crate::forms::input_type_state(document, node), "password" | "email" | "url") {
+        return false;
+    }
+    match attribute(document, node, "autocorrect") {
+        Some(raw) => !raw.eq_ignore_ascii_case("off"),
+        None => match inherits_form_text_input_state(document, node).and_then(|form| attribute(document, form, "autocorrect")) {
+            Some(raw) => !raw.eq_ignore_ascii_case("off"),
+            None => true,
+        },
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

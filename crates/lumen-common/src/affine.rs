@@ -6,9 +6,11 @@ struct Parts {
     translation: [f64; 2],
     scale: [f64; 2],
     angle: f64,
-    remainder: [f64; 4],
+    skew: f64,
 }
 
+/// CSS Transforms 2D matrix decomposition: the second column is split into
+/// a component along the rotated x axis (the skew) and one orthogonal to it.
 fn decompose(m: [f64; 6]) -> Option<Parts> {
     if !m.iter().all(|v| v.is_finite()) {
         return None;
@@ -19,48 +21,36 @@ fn decompose(m: [f64; 6]) -> Option<Parts> {
         return None;
     }
     let mut sx = a.hypot(b);
-    let mut sy = c.hypot(d);
-    if det < 0.0 {
-        if a < d {
-            sx = -sx;
-        } else {
-            sy = -sy;
-        }
+    if det < 0.0 && a < d {
+        sx = -sx;
     }
-    let (a, b, c, d) = (a / sx, b / sx, c / sy, d / sy);
-    let angle = b.atan2(a);
-    let (sin, cos) = angle.sin_cos();
+    let (ux, uy) = (a / sx, b / sx);
+    let sy = det / sx;
+    let along = ux * c + uy * d;
     Some(Parts {
         translation: [e, f],
         scale: [sx, sy],
-        angle,
-        // Remove rotation before retaining the normalized shear remainder.
-        remainder: [
-            cos * a + sin * b,
-            -sin * a + cos * b,
-            cos * c + sin * d,
-            -sin * c + cos * d,
-        ],
+        angle: uy.atan2(ux),
+        skew: along / sy,
     })
 }
 
 fn recompose(parts: Parts) -> Option<[f64; 6]> {
     let [sx, sy] = parts.scale;
-    let r = parts.remainder;
     let (sin, cos) = parts.angle.sin_cos();
     let result = [
-        (cos * r[0] - sin * r[1]) * sx,
-        (sin * r[0] + cos * r[1]) * sx,
-        (cos * r[2] - sin * r[3]) * sy,
-        (sin * r[2] + cos * r[3]) * sy,
+        cos * sx,
+        sin * sx,
+        sy * (parts.skew * cos - sin),
+        sy * (parts.skew * sin + cos),
         parts.translation[0],
         parts.translation[1],
     ];
     result.iter().all(|v| v.is_finite()).then_some(result)
 }
 
-/// Accumulate decomposed parameters, using a delta from one for scale and
-/// diagonal remainder entries, and a delta from zero for other parameters.
+/// Accumulate decomposed parameters, using a delta from one for scale
+/// and a delta from zero for the other parameters.
 pub fn accumulate(from: [f64; 6], to: [f64; 6]) -> Option<[f64; 6]> {
     accumulate_weighted(from,to,1.0)
 }
@@ -74,9 +64,7 @@ pub fn accumulate_weighted(from:[f64;6],to:[f64;6],count:f64)->Option<[f64;6]> {
         translation: core::array::from_fn(|i| count*a.translation[i] + b.translation[i]),
         scale: core::array::from_fn(|i| count*(a.scale[i]-1.0)+b.scale[i]),
         angle: count*a.angle + b.angle,
-        remainder: core::array::from_fn(|i| {
-            count*(a.remainder[i]-if i == 0 || i == 3 { 1.0 } else { 0.0 })+b.remainder[i]
-        }),
+        skew: count*a.skew+b.skew,
     })
 }
 
@@ -111,7 +99,7 @@ pub fn interpolate(from: [f64; 6], to: [f64; 6], progress: f64) -> Option<[f64; 
         translation: core::array::from_fn(|i| lerp(a.translation[i], b.translation[i])),
         scale: core::array::from_fn(|i| lerp(a.scale[i], b.scale[i])),
         angle: lerp(a.angle, b.angle),
-        remainder: core::array::from_fn(|i| lerp(a.remainder[i], b.remainder[i])),
+        skew: lerp(a.skew, b.skew),
     })
 }
 

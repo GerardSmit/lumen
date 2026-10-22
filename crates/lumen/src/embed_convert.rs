@@ -1221,6 +1221,16 @@ impl Interp {
         format!("#\u{0}native_slot_{}", self.accessor_seq)
     }
 
+    /// Slots live on the native instance itself; the engine-created indexed
+    /// wrapper forwards its reads to that target.
+    fn native_slot_object(&self, object: &crate::value::Gc) -> crate::value::Gc {
+        let key = Gc::as_ptr(object) as usize;
+        match self.proxies.get(&key) {
+            Some((Value::Obj(target), _)) if host_entry_key(self, &Value::Obj(object.clone())).is_some() => target.clone(),
+            _ => object.clone(),
+        }
+    }
+
     fn native_private_slot_owner(
         &mut self,
         target: &Value,
@@ -1233,6 +1243,7 @@ impl Interp {
         let Some(target) = target.as_obj().cloned() else {
             return Err(self.make_error("TypeError", "native slot owner must be an object"));
         };
+        let target = self.native_slot_object(&target);
         {
             let target = target.borrow();
             if require_extensible && !target.extensible || target.props.get(key).is_some() {
@@ -1271,6 +1282,7 @@ impl Interp {
     pub fn set_native_internal_value_slot(&mut self, target: &Value, key: &str, value: Value) -> Result<(), Value> {
         if !Self::is_private_key(key) { return Err(self.make_error("TypeError", "native slot key is not private")); }
         let Some(target) = target.as_obj().cloned() else { return Err(self.make_error("TypeError", "native slot owner must be an object")); };
+        let target = self.native_slot_object(&target);
         target.borrow_mut().props.insert(key, Property::data(value, false, false, false));
         Ok(())
     }
@@ -1306,7 +1318,8 @@ impl Interp {
         if !Self::is_private_key(key) {
             return None;
         }
-        let target = target.as_obj()?.borrow();
+        let target = self.native_slot_object(target.as_obj()?);
+        let target = target.borrow();
         let slot = target.props.get(key)?;
         (!slot.accessor()).then(|| slot.value())
     }
@@ -3889,6 +3902,14 @@ fn sweep(i: &mut Interp) -> usize {
     dead.len()
 }
 
+fn no_indexed_item(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Undefined)
+}
+
+fn no_indexed_length(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(0.0))
+}
+
 fn illegal_constructor(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
     Err(i.make_error("TypeError", "Illegal constructor"))
 }
@@ -3974,8 +3995,8 @@ fn class_entry_erased(i: &mut Interp, ty: TypeId, ops: &ClassOps) -> (Value, Gc)
             .iter()
             .find(|m| m.desc.role == Role::Proto("setitem")),
     );
-    if named_properties && (indexed_members.0.is_none() || indexed_members.1.is_none()) {
-        panic!("named native properties require indexed getter and length hooks");
+    if named_properties && indexed_members.0.is_none() != indexed_members.1.is_none() {
+        panic!("named native properties require both indexed getter and length hooks, or neither");
     }
     let named_hooks = if named_properties {
         let hook = |key| {
@@ -4011,15 +4032,22 @@ fn class_entry_erased(i: &mut Interp, ty: TypeId, ops: &ClassOps) -> (Value, Gc)
     } else {
         None
     };
-    if let (Some(item), Some(length), setter) = indexed_members {
+    // A class with named properties but no indexed ones (`HTMLDocument`) still needs the
+    // exotic handler; it gets an empty index space.
+    let indexed_entries = match indexed_members {
+        (Some(item), Some(length), setter) => Some((item.entry, length.entry, setter.map(|setter| setter.entry))),
+        _ if named_hooks.is_some() => Some((no_indexed_item as NativeFn, no_indexed_length as NativeFn, None)),
+        _ => None,
+    };
+    if let Some((item, length, setter)) = indexed_entries {
         if !i.host_state.has::<IndexedClasses>() {
             i.host_state.put(IndexedClasses::default());
         }
         let handler = indexed_handler(
             i,
-            item.entry,
-            length.entry,
-            setter.map(|setter| setter.entry),
+            item,
+            length,
+            setter,
             named_hooks,
             ops.desc.hint("js", "indexed_missing_undefined").is_some(),
         );

@@ -486,6 +486,18 @@ impl RenderSession {
         self.position_in(&frame, &found)
     }
 
+    /// Like [`caret_position_from_point`](Self::caret_position_from_point), but
+    /// text under `user-select: none` still yields a position.
+    pub fn text_position_from_point(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
+        let frame = self.frame()?;
+        let hit = self.painted_hit_test(x, y)?;
+        if self.takes_the_press(hit) {
+            return None;
+        }
+        let found = self.nearest_run(&frame, (x, y), Some(hit), false, Some(REACH))?;
+        self.position_in(&frame, &found)
+    }
+
     /// The text position nearest the point among the selectable text, for
     /// extending a selection a drag is making, wherever the pointer is.
     pub fn nearest_caret_position(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
@@ -572,6 +584,23 @@ impl RenderSession {
     /// is covered by its bounding box.
     pub fn selection_rects(&self) -> Vec<Rect> {
         let Some(selection) = self.selection_state() else { return Vec::new() };
+        self.covered_rects(selection)
+    }
+
+    /// The rectangles the text between two ordered boundaries covers, as for a
+    /// selection over the same text.
+    pub fn range_client_rects(&self, start: Boundary, end: Boundary) -> Vec<Rect> {
+        self.covered_rects((start, end))
+    }
+
+    /// The rectangles covered by all the text of a text node.
+    pub fn text_node_client_rects(&self, node: NodeId) -> Vec<Rect> {
+        let Ok(NodeKind::Text(text) | NodeKind::CData(text)) = self.document().kind(node) else { return Vec::new() };
+        let end = Boundary { container: node, offset: text.encode_utf16().count() };
+        self.covered_rects((Boundary { container: node, offset: 0 }, end))
+    }
+
+    fn covered_rects(&self, selection: (Boundary, Boundary)) -> Vec<Rect> {
         let Some(frame) = self.frame() else { return Vec::new() };
         let Some(coverage) = Coverage::new(self.document(), selection, frame.fresh) else { return Vec::new() };
         let mut memo = Memo::default();

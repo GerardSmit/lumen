@@ -189,6 +189,10 @@ define_plain_html_interfaces! {
         fn command_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { super::element_reflection::get(ctx, this.0, "commandfor") }
         #[setter(name = "commandForElement", hint(js(ce_reactions)))]
         fn set_command_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> { super::element_reflection::set(ctx, this.0, "commandfor", value) }
+        #[getter(name = "interestForElement")]
+        fn interest_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::element_reflection::get(ctx, this.0, "interestfor") }
+        #[setter(name = "interestForElement", hint(js(ce_reactions)))]
+        fn set_interest_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> { crate::element_reflection::set(ctx, this.0, "interestfor", value) }
         #[getter(name = "popoverTargetElement")]
         fn popover_target_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { super::element_reflection::get(ctx, this.0, "popovertarget") }
         #[setter(name = "popoverTargetElement", hint(js(ce_reactions)))]
@@ -1100,6 +1104,104 @@ define_plain_html_interfaces! {
         }
     };
     DomHtmlSpanElement, "HTMLSpanElement" => ["span"];
+    DomHtmlCameraElement, "HTMLCameraElement" => ["camera"] {
+        #[getter]
+        fn track(&self) -> Value { Value::Null }
+        #[getter]
+        fn error(&self) -> Value { Value::Null }
+        #[method(name = "setConstraints")]
+        fn set_constraints(_this: lumen_bind::This<Value>, #[default(Value::Undefined)] _constraints: Value) {}
+        #[getter(name = "ontrack")]
+        fn ontrack(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlCameraElement>(ctx, &this.0, "track", false) }
+        #[setter(name = "ontrack")]
+        fn set_ontrack(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlCameraElement>(ctx, &this.0, "track", callback, false) }
+        #[getter(name = "onerror")]
+        fn onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlCameraElement>(ctx, &this.0, "error", false) }
+        #[setter(name = "onerror")]
+        fn set_onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlCameraElement>(ctx, &this.0, "error", callback, false) }
+        #[getter(name = "oncancel")]
+        fn oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlCameraElement>(ctx, &this.0, "cancel", false) }
+        #[setter(name = "oncancel")]
+        fn set_oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlCameraElement>(ctx, &this.0, "cancel", callback, false) }
+    };
+    DomHtmlMicrophoneElement, "HTMLMicrophoneElement" => ["microphone"] {
+        #[getter]
+        fn track(&self) -> Value { Value::Null }
+        #[getter]
+        fn error(&self) -> Value { Value::Null }
+        #[method(name = "setConstraints")]
+        fn set_constraints(_this: lumen_bind::This<Value>, #[default(Value::Undefined)] _constraints: Value) {}
+        #[getter(name = "ontrack")]
+        fn ontrack(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlMicrophoneElement>(ctx, &this.0, "track", false) }
+        #[setter(name = "ontrack")]
+        fn set_ontrack(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlMicrophoneElement>(ctx, &this.0, "track", callback, false) }
+        #[getter(name = "onerror")]
+        fn onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlMicrophoneElement>(ctx, &this.0, "error", false) }
+        #[setter(name = "onerror")]
+        fn set_onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlMicrophoneElement>(ctx, &this.0, "error", callback, false) }
+        #[getter(name = "oncancel")]
+        fn oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlMicrophoneElement>(ctx, &this.0, "cancel", false) }
+        #[setter(name = "oncancel")]
+        fn set_oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlMicrophoneElement>(ctx, &this.0, "cancel", callback, false) }
+    };
+    DomHtmlUserMediaElement, "HTMLUserMediaElement" => ["usermedia"] {
+        #[getter]
+        fn stream(&self) -> Value { Value::Null }
+        #[getter]
+        fn error(&self) -> Value { Value::Null }
+        #[method(name = "setConstraints")]
+        fn set_constraints(_this: lumen_bind::This<Value>, #[default(Value::Undefined)] _constraints: Value) {}
+        #[getter(name = "onstream")]
+        fn onstream(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlUserMediaElement>(ctx, &this.0, "stream", false) }
+        #[setter(name = "onstream")]
+        fn set_onstream(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlUserMediaElement>(ctx, &this.0, "stream", callback, false) }
+        #[getter(name = "onerror")]
+        fn onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlUserMediaElement>(ctx, &this.0, "error", false) }
+        #[setter(name = "onerror")]
+        fn set_onerror(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlUserMediaElement>(ctx, &this.0, "error", callback, false) }
+        #[getter(name = "oncancel")]
+        fn oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlUserMediaElement>(ctx, &this.0, "cancel", false) }
+        #[setter(name = "oncancel")]
+        fn set_oncancel(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlUserMediaElement>(ctx, &this.0, "cancel", callback, false) }
+    };
+    DomHtmlGeolocationElement, "HTMLGeolocationElement" => ["geolocation"] {
+        #[getter]
+        fn position(&self) -> Value { Value::Null }
+        #[getter]
+        fn error(&self) -> Value { Value::Null }
+        #[getter]
+        fn autolocate(&self) -> OpResult<bool> { self.base.base.base.has_null_attribute("autolocate") }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_autolocate(&self, value: bool) -> OpResult<()> { if value { self.base.base.base.set_attribute_core("autolocate", "") } else { self.base.base.base.remove_attribute_core("autolocate") } }
+        #[getter]
+        fn watch(&self) -> OpResult<bool> { self.base.base.base.has_null_attribute("watch") }
+        #[setter(coerce, hint(js(ce_reactions)))]
+        fn set_watch(&self, value: bool) -> OpResult<()> { if value { self.base.base.base.set_attribute_core("watch", "") } else { self.base.base.base.remove_attribute_core("watch") } }
+        #[getter(name = "isValid")]
+        fn is_valid(&self) -> bool { false }
+        #[getter(name = "invalidReason")]
+        fn invalid_reason(&self) -> String { String::from("recently_attached") }
+        #[getter(name = "initialPermissionStatus")]
+        fn initial_permission_status(&self) -> String { String::from("prompt") }
+        #[getter(name = "permissionStatus")]
+        fn permission_status(&self) -> String { String::from("prompt") }
+        #[getter(name = "onlocation")]
+        fn onlocation(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlGeolocationElement>(ctx, &this.0, "location", false) }
+        #[setter(name = "onlocation")]
+        fn set_onlocation(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlGeolocationElement>(ctx, &this.0, "location", callback, false) }
+        #[getter(name = "onpromptaction")]
+        fn onpromptaction(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlGeolocationElement>(ctx, &this.0, "promptaction", false) }
+        #[setter(name = "onpromptaction")]
+        fn set_onpromptaction(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlGeolocationElement>(ctx, &this.0, "promptaction", callback, false) }
+        #[getter(name = "onpromptdismiss")]
+        fn onpromptdismiss(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlGeolocationElement>(ctx, &this.0, "promptdismiss", false) }
+        #[setter(name = "onpromptdismiss")]
+        fn set_onpromptdismiss(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlGeolocationElement>(ctx, &this.0, "promptdismiss", callback, false) }
+        #[getter(name = "onvalidationstatuschange")]
+        fn onvalidationstatuschange(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::event_content_handlers::node_handler_get::<DomHtmlGeolocationElement>(ctx, &this.0, "validationstatuschange", false) }
+        #[setter(name = "onvalidationstatuschange")]
+        fn set_onvalidationstatuschange(ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: crate::events::EventHandler) -> OpResult<()> { crate::event_content_handlers::node_handler_set::<DomHtmlGeolocationElement>(ctx, &this.0, "validationstatuschange", callback, false) }
+    };
     DomHtmlTimeElement, "HTMLTimeElement" => ["time"] {
         #[getter(name = "dateTime")]
         fn date_time(&self) -> OpResult<String> {

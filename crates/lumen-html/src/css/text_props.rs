@@ -118,6 +118,42 @@ pub(super) fn white_space_shorthand(raw: &str) -> Option<WhiteSpace> {
     Some(white_space_from_parts(collapse.unwrap_or("collapse"), wrap.unwrap_or("wrap")))
 }
 
+/// Canonical specified `white-space`: the legacy keyword for the longhand
+/// combination when one exists, otherwise `<collapse> <wrap>`.
+pub(super) fn white_space_specified(raw: &str) -> Option<String> {
+    let words = idents(raw)?;
+    if words.len() == 1 && matches!(words[0].as_ref(), "normal" | "nowrap" | "pre" | "pre-wrap" | "pre-line" | "break-spaces") {
+        return Some(String::from(words[0].as_ref()));
+    }
+    white_space_shorthand(raw)?;
+    let mut collapse = "collapse";
+    let mut wrap = "wrap";
+    for word in &words {
+        match word.as_ref() {
+            "wrap" | "nowrap" => wrap = if word.as_ref() == "nowrap" { "nowrap" } else { "wrap" },
+            "collapse" | "preserve" | "preserve-breaks" | "break-spaces" => {
+                collapse = match word.as_ref() {
+                    "preserve" => "preserve",
+                    "preserve-breaks" => "preserve-breaks",
+                    "break-spaces" => "break-spaces",
+                    _ => "collapse",
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(String::from(match (collapse, wrap) {
+        ("collapse", "wrap") => "normal",
+        ("collapse", _) => "nowrap",
+        ("preserve", "wrap") => "pre-wrap",
+        ("preserve", _) => "pre",
+        ("preserve-breaks", "wrap") => "pre-line",
+        ("break-spaces", "wrap") => "break-spaces",
+        ("preserve-breaks", _) => "preserve-breaks nowrap",
+        _ => "break-spaces nowrap",
+    }))
+}
+
 fn text_wrap(raw: &str) -> Option<(&'static str, &'static str)> {
     let words = idents(raw)?;
     if words.len() > 2 {
@@ -504,7 +540,12 @@ fn absolute_pair(value: &str) -> Option<Vec<Color>> {
     if tokens.is_empty() || tokens.len() > 2 {
         return None;
     }
-    tokens.into_iter().map(color_values::absolute).collect()
+    tokens.into_iter().map(|token| {
+        if decoded_css_keyword(token, "currentcolor") || decoded_css_keyword(token, "auto") {
+            return None;
+        }
+        color_token(token, Rgba { r: 0, g: 0, b: 0, a: 255 })
+    }).collect()
 }
 
 pub(super) fn interpolate_color(from: &str, to: &str, progress: f64) -> Option<String> {

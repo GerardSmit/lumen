@@ -615,7 +615,8 @@ pub(super) fn fill(raster: &mut Raster<'_>, rect: Rect, radius: f32, gradient: &
 }
 
 pub(crate) fn interpolate(from: Rgba, to: Rgba, mix: f32) -> Rgba {
-    let alpha = from.a as f32 * (1.0 - mix) + to.a as f32 * mix;
+    let mix = f64::from(mix);
+    let alpha = f64::from(from.a) * (1.0 - mix) + f64::from(to.a) * mix;
     if alpha == 0.0 {
         return Rgba {
             r: 0,
@@ -625,7 +626,7 @@ pub(crate) fn interpolate(from: Rgba, to: Rgba, mix: f32) -> Rgba {
         };
     }
     let channel = |a: u8, b: u8| {
-        ((a as f32 * from.a as f32 * (1.0 - mix) + b as f32 * to.a as f32 * mix) / alpha).round()
+        ((f64::from(a) * f64::from(from.a) * (1.0 - mix) + f64::from(b) * f64::from(to.a) * mix) / alpha).round()
             as u8
     };
     Rgba {

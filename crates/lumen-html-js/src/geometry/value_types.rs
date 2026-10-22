@@ -17,7 +17,7 @@ fn optional_number(ctx:&mut Ctx,value:&Value,name:&str)->OpResult<Option<f64>> {
     let value=ctx.member_get(value,name).map_err(OpError::thrown)?;
     if matches!(value,Value::Undefined) {Ok(None)}else{ctx.coerce_number(&value).map(Some).map_err(OpError::thrown)}
 }
-fn point_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<Point> {
+pub(super) fn point_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<Point> {
     dictionary(value)?;
     // WebIDL dictionaries convert their members in alphabetical order.
     let w=optional_number(ctx,value,"w")?.unwrap_or(1.0);
@@ -44,6 +44,21 @@ fn matrix_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<Matrix> {
     matrix.is_2d=if matches!(flag,Value::Undefined) {is_2d}else{ctx.to_boolean(&flag)};
     if matrix.is_2d&&!is_2d {return Err(OpError::type_error("A 2D matrix cannot have 3D components"))}
     Ok(matrix)
+}
+/// DOMMatrix2DInit: the six 2D components, with each `m` member a conflicting alias of its letter.
+pub(crate) fn matrix_2d_init(ctx:&mut Ctx,value:&Value)->OpResult<[f64;6]> {
+    dictionary(value)?;
+    let mut aliases=[None;6];
+    for (index,name) in ["a","b","c","d","e","f"].into_iter().enumerate() {aliases[index]=optional_number(ctx,value,name)?;}
+    let mut elements=[None;6];
+    for (slot,name) in ["m11","m12","m21","m22","m41","m42"].into_iter().enumerate() {elements[slot]=optional_number(ctx,value,name)?;}
+    let identity=[1.0,0.0,0.0,1.0,0.0,0.0];
+    let mut out=identity;
+    for slot in 0..6 {
+        if let (Some(a),Some(b))=(aliases[slot],elements[slot]) {if a!=b && !(a.is_nan()&&b.is_nan()) {return Err(OpError::type_error("Conflicting matrix alias members"))}}
+        out[slot]=elements[slot].or(aliases[slot]).unwrap_or(identity[slot]);
+    }
+    Ok(out)
 }
 fn matrix_sequence(ctx:&mut Ctx,value:&Value,method:Value)->OpResult<Matrix> {
     let values=ctx.convert_iterable_with_method(value,method,4096,|ctx,value|ctx.coerce_number(&value).map_err(OpError::thrown))?;
@@ -291,6 +306,22 @@ pub(super) fn rect_dictionary(ctx:&mut Ctx,value:&Value)->OpResult<[f64;4]> {
     let x=optional_number(ctx,value,"x")?.unwrap_or(0.0);
     let y=optional_number(ctx,value,"y")?.unwrap_or(0.0);
     Ok([x,y,width,height])
+}
+pub(super) fn quad_init(ctx:&mut Ctx,value:&Value)->OpResult<[[f64;2];4]> {
+    dictionary(value)?;
+    let mut corners=[[0.0;2];4];
+    for (index,name) in ["p1","p2","p3","p4"].into_iter().enumerate() {
+        let member=if matches!(value,Value::Undefined|Value::Null) {Value::Undefined}else{ctx.member_get(value,name).map_err(OpError::thrown)?};
+        let point=point_dictionary(ctx,&member)?;
+        corners[index]=[point.0[0],point.0[1]];
+    }
+    Ok(corners)
+}
+pub(super) fn new_quad(ctx:&mut Ctx,corners:[[f64;2];4])->Value {
+    ctx.new_instance(DomQuad::value(corners.map(|[x,y]|Point([x,y,0.0,1.0]))))
+}
+pub(super) fn new_point(ctx:&mut Ctx,x:f64,y:f64)->Value {
+    ctx.new_instance(DomPoint::value(Point([x,y,0.0,1.0])))
 }
 pub(super) fn nan_min(a:f64,b:f64)->f64 {if a.is_nan()||b.is_nan() {f64::NAN}else{a.min(b)}}
 pub(super) fn nan_max(a:f64,b:f64)->f64 {if a.is_nan()||b.is_nan() {f64::NAN}else{a.max(b)}}

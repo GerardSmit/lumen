@@ -159,10 +159,6 @@ enum Word {
     Offset,
 }
 
-fn word(token: &str) -> Option<Word> {
-    word_with(token, false)
-}
-
 fn word_with(token: &str, logical: bool) -> Option<Word> {
     if decoded_css_keyword(token, "center") {
         Some(Word::Center)
@@ -273,7 +269,7 @@ pub(crate) fn compose_position(base: &str, value: &str) -> Option<String> {
     let (base, value) = (position_endpoint(base)?, position_endpoint(value)?);
     let (base, value) = (components(&base)?, components(&value)?);
     let (&[bx, by], &[vx, vy]) = (&base[..], &value[..]) else { return None };
-    Some(alloc::format!("{} {}", compose(bx, vx)?, compose(by, vy)?))
+    Some(alloc::format!("{} {}", compose(Axis::X, bx, vx)?, compose(Axis::Y, by, vy)?))
 }
 
 /// `stored` with its logical keywords turned physical for the given writing mode, then computed.
@@ -392,8 +388,10 @@ struct Mixed {
     percent_form: bool,
 }
 
-fn mixed(token: &str) -> Option<Mixed> {
+fn mixed(axis: Axis, token: &str) -> Option<Mixed> {
     let context = static_length_context();
+    let resolved = compute(axis, token, context)?;
+    let token = resolved.as_str();
     let value = transform_length_with_query(token, context, extra::query_for(context))?;
     Some(Mixed { value, percent_form: token.contains('%') })
 }
@@ -401,23 +399,25 @@ fn mixed(token: &str) -> Option<Mixed> {
 fn serialize(pixels: f32, percent: f32, percent_form: bool) -> String {
     if pixels == 0.0 && percent_form {
         alloc::format!("{}%", computed_values::number(percent))
+    } else if percent == 0.0 && percent_form {
+        alloc::format!("calc(0% {} {}px)", if pixels < 0.0 { "-" } else { "+" }, computed_values::number(pixels.abs()))
     } else {
         computed_values::percentage(pixels, percent)
     }
 }
 
-pub(crate) fn interpolate(from: &str, to: &str, progress: f64) -> Option<String> {
+pub(crate) fn interpolate(axis: Axis, from: &str, to: &str, progress: f64) -> Option<String> {
     cycle(from, to, &|a, b| {
-        let (a, b) = (mixed(a)?, mixed(b)?);
+        let (a, b) = (mixed(axis, a)?, mixed(axis, b)?);
         let mix = |a: f32, b: f32| extra::mix(f64::from(a), f64::from(b), progress) as f32;
         Some(serialize(mix(a.value.pixels, b.value.pixels), mix(a.value.percent, b.value.percent), a.percent_form || b.percent_form))
     })
 }
 
 /// Addition and accumulation agree for lengths: the endpoints sum.
-pub(crate) fn compose(base: &str, value: &str) -> Option<String> {
+pub(crate) fn compose(axis: Axis, base: &str, value: &str) -> Option<String> {
     cycle(base, value, &|a, b| {
-        let (a, b) = (mixed(a)?, mixed(b)?);
+        let (a, b) = (mixed(axis, a)?, mixed(axis, b)?);
         Some(serialize(a.value.pixels + b.value.pixels, a.value.percent + b.value.percent, a.percent_form || b.percent_form))
     })
 }
@@ -454,6 +454,6 @@ mod tests {
     #[test]
     fn mismatched_lists_repeat_to_common_length() {
         assert_eq!(join_axes("1px, 2px", "3px").as_deref(), Some("1px 3px, 2px 3px"));
-        assert_eq!(interpolate("0px, 10px", "20px", 0.5).as_deref(), Some("10px, 15px"));
+        assert_eq!(interpolate(Axis::X, "0px, 10px", "20px", 0.5).as_deref(), Some("10px, 15px"));
     }
 }

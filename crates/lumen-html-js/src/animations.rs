@@ -760,6 +760,7 @@ fn discard_invalid_keyframe_values(frames: &mut [Keyframe]) {
 }
 
 fn base_css_value(style:&lumen_html::css::Style,name:&str)->Option<String> {
+    if let Some(auto)=lumen_html::css::auto_extra_property_value(style,name) {return Some(auto);}
     style.computed_css_value(name,lumen_html::css::computed_values::ComputedValueContext::default())
 }
 
@@ -799,11 +800,17 @@ fn composite_value(
     if let Some((base,value))=animation::value_range::pad_origin(property,base,value) {
         return composite_value(property,&base,&value,iteration_delta);
     }
+    if let Some((base,value))=resolve_line_width_keywords(property,base,value) {
+        return composite_value(property,&base,&value,iteration_delta);
+    }
     if property=="text-indent" {
         return animation::value_range::add_text_indent(base,value,iteration_delta).or_else(||Some(value.to_owned()));
     }
     // CSS Values defines nonadditive values, including colors and shadows,
     // to compose as V_B. Numeric values keep their specified addition.
+    if iteration_delta.is_none() {
+        if let Some(composed)=lumen_html::css::compose_font_property(property,base,value) {return Some(composed);}
+    }
     animation::add_numeric_values(base, value, iteration_delta)
         .or_else(|| animation::value_range::add_components(base, value, iteration_delta))
         .or_else(|| Some(value.to_owned()))
@@ -1429,9 +1436,38 @@ fn transition_parameters(style:&lumen_html::css::Style,index:usize)->(animation:
         delay_ms:time(style.transition_delay.as_deref())},Rc::from(easing),discrete)
 }
 
+fn resolve_line_width_keywords(property:&str,a:&str,b:&str)->Option<(String,String)> {
+    if !property.ends_with("-width") || !(property.starts_with("border-") || property.starts_with("outline-") || property.starts_with("column-rule-")) {return None;}
+    let pixels=|value:&str|match value.trim().to_ascii_lowercase().as_str() {"thin"=>Some("1px"),"medium"=>Some("3px"),"thick"=>Some("5px"),_=>None};
+    if pixels(a).is_none() && pixels(b).is_none() {return None;}
+    Some((pixels(a).unwrap_or(a).to_owned(),pixels(b).unwrap_or(b).to_owned()))
+}
+
 fn interpolate_transition_value(property:&str,from:&str,to:&str,progress:f64)->Option<String> {
     use lumen_html::css::TransitionValueKind::*;
     if let Some((from,to))=animation::value_range::pad_origin(property,from,to) {
+        return interpolate_transition_value(property,&from,&to,progress);
+    }
+    if let Some(result)=lumen_html::css::interpolate_font_property(property,from,to,progress) {return result;}
+    if matches!(property,"letter-spacing"|"word-spacing") && (from.trim()=="normal" || to.trim()=="normal") {
+        if from.trim()==to.trim() || property=="letter-spacing" && progress==0.0 {return Some(from.to_owned());}
+        if property=="letter-spacing" && progress==1.0 {return Some(to.to_owned());}
+        let length=|value:&'_ str|if value.trim()=="normal" {"0px".to_owned()} else {value.to_owned()};
+        return interpolate_transition_value(property,&length(from),&length(to),progress);
+    }
+    if property=="font-size" {
+        if let Some((from,to))=lumen_html::css::resolve_font_size_keywords(from,to) {
+            return interpolate_transition_value(property,&from,&to,progress);
+        }
+    }
+    if property=="outline-offset" {
+        let mixed=animation::interpolate_numeric(from,to,progress)?;
+        let Some(pixels)=mixed.strip_suffix("px").and_then(|value|value.parse::<f64>().ok()) else {return Some(mixed);};
+        let magnitude=pixels.abs();
+        let snapped=if magnitude>0.0 && magnitude<1.0 {1.0} else {magnitude.floor()};
+        return Some(format!("{}px",(snapped.copysign(pixels)) as i64));
+    }
+    if let Some((from,to))=resolve_line_width_keywords(property,from,to) {
         return interpolate_transition_value(property,&from,&to,progress);
     }
     if property=="font-weight" {
@@ -1461,15 +1497,13 @@ fn interpolate_transition_value(property:&str,from:&str,to:&str,progress:f64)->O
     }
 }
 
-fn size_keyword_value(value:&str)->bool {
-    let value=value.trim();
-    value.get(..10).is_some_and(|prefix|prefix.eq_ignore_ascii_case("calc-size("))
-        || ["auto","min-content","max-content","fit-content","stretch"].iter().any(|keyword|value.eq_ignore_ascii_case(keyword))
+fn is_calc_size_value(value:&str)->bool {
+    value.trim().get(..10).is_some_and(|prefix|prefix.eq_ignore_ascii_case("calc-size("))
 }
 
 fn transition_pair_eligible(property:&str,from:&str,to:&str,allow_discrete:bool,allow_size_keywords:bool)->bool {
     use lumen_html::css::TransitionValueKind::*;
-    if allow_size_keywords && lumen_html::css::calc_size::interpolate_keywords(property,from,to,0.5).is_some() {return true;}
+    if (allow_size_keywords || is_calc_size_value(from) || is_calc_size_value(to)) && lumen_html::css::calc_size::interpolate_keywords(property,from,to,0.5).is_some() {return true;}
     match lumen_html::css::transition_value_kind(property) {
         NotAnimatable=>false,
         Transform=>lumen_html::css::typed_transforms::pair_interpolable(from,to) || allow_discrete,
@@ -1488,6 +1522,22 @@ fn interpolate_transform_animation(from:&str,to:&str,progress:f64,
     let from=lumen_html::css::parse_animation_transforms(from,style,*viewport,None)?;
     let to=lumen_html::css::parse_animation_transforms(to,style,*viewport,None)?;
     animation::interpolate_transforms(&from,&to,progress,rect.width,rect.height)
+}
+
+/// An inherited value that changes only because an ancestor is transitioning the
+/// same property follows that transition instead of starting its own.
+fn inherited_from_transitioning_ancestor(hub:&Rc<RefCell<AnimationHub>>,realm_key:usize,mut ancestor:Option<NodeId>,
+    nodes:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>),&lumen_html::session::TransitionStyleInput>,
+    property:&str,before:&str,after:&str)->bool {
+    let state=hub.borrow();
+    while let Some(node) = ancestor {
+        let key=(realm_key,node,None,property.to_string());
+        if let Some(transition)=state.running_transitions.get(&key).and_then(|id|state.transitions.get(id)) {
+            return transition.state.end_value==after && transition.state.start_value==before;
+        }
+        ancestor=nodes.get(&(node,None)).and_then(|input|input.parent);
+    }
+    false
 }
 
 fn sampled_transition_progress(record:&Record,now:f64)->f64 {
@@ -1890,6 +1940,8 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
             let before_value=before.computed_css_value(&property,lumen_html::css::computed_values::ComputedValueContext::default());
             let (Some(after),Some(before_value))=(after,before_value) else {continue;};
             let id=hub.borrow().running_transitions.get(&key).copied();
+            if id.is_none() && index!=usize::MAX && input.pseudo.is_none()
+                && inherited_from_transitioning_ancestor(hub,realm_key,input.parent,&after_nodes,property,&before_value,&after) {continue;}
             let completed=hub.borrow().completed_transitions.get(&key).cloned();
             let old=hub.borrow();
             let running=id.and_then(|id|old.transitions.get(&id).zip(old.records.get(&id)));
@@ -3191,7 +3243,7 @@ let property_pass=|name:&str| {
                     let mut shadow_query=lumen_html::css::ContainerUnitContext::default();
                     let color_context=pass==1 && keyframes_need_color_context(&record.keyframes);
                     let allow_size_keywords=record.keyframes.iter().any(|frame|frame.declarations.iter().any(|(name,value)|
-                            lumen_html::css::calc_size::is_size_property(name) && size_keyword_value(value)))
+                            lumen_html::css::calc_size::is_size_property(name) && !value.trim().is_empty()))
                         && {
                             let mut session=realm.session.borrow_mut();
                             match record.pseudo {
@@ -3366,6 +3418,9 @@ let property_pass=|name:&str| {
                                     Some(value.to_owned())
                                 } else if lumen_html::css::is_grid_track_list_property(property) {
                                     lumen_html::css::compose_grid_track_list(property,base,value).or_else(||Some(value.to_owned()))
+                                } else if allow_size_keywords && lumen_html::css::calc_size::is_size_property(property) {
+                                    lumen_html::css::calc_size::combine(&[(base,1.0),(value,1.0)],true)
+                                        .or_else(||composite_value(property,base,value,None))
                                 } else if lumen_html::css::is_extra_property(property) {
                                     lumen_html::css::compose_extra_property(property,base,value,mode==CompositeMode::Accumulate)
                                         .or_else(||composite_value(property, base, value, None))
@@ -4133,8 +4188,14 @@ fn pseudo_name(pseudo:Option<lumen_html::css::PseudoElement>)->&'static str {
         Some(ViewTransitionImagePair)=>"::view-transition-image-pair",Some(ViewTransitionOld)=>"::view-transition-old",
         Some(ViewTransitionNew)=>"::view-transition-new"}
 }
+/// `vertical-align` is a shorthand whose only transitionable longhand is `baseline-shift`, but
+/// authors and events observe it under the name they transition.
+fn reported_transition_property(property:&str)->&str {
+    if property=="baseline-shift" {"vertical-align"} else {property}
+}
 fn dispatch_transition_event(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,id:u32,sample:animation::CssEvent,owner:&Rc<DomRealm>,node:NodeId,
     pseudo:&str,property:&str)->OpResult<()> {
+    let property=reported_transition_property(property);
     let (owner,node)=owner.resolve_adopted_node(node);
     let dispatch=|ctx:&mut Ctx|->OpResult<()> {
         let init=ctx.new_object_with_proto(&Value::Null);
@@ -4422,7 +4483,7 @@ impl DomCssTransition {
         let hub=hub(ctx)?;
         let property=hub.borrow().transitions.get(&self.base.id).map(|record|record.property.clone())
             .ok_or_else(||OpError::new("InvalidStateError","transition record is unavailable"))?;
-        Ok(property)
+        Ok(reported_transition_property(&property).to_owned())
     }
 }
 
@@ -5136,6 +5197,42 @@ impl DomAnimation {
             record.playback_rate=-record.playback_rate;record.hold_time_ms=current;record.start_resolved=false;
         }
         request_pending_task(ctx,&hub,self.id,PlaybackState::Running,true)
+    }
+    fn commit_styles(&self, ctx: &mut Ctx) -> OpResult<()> {
+        let (hub,record)=record_state(ctx,self.id)?;
+        let Some(effect)=record.effect_id.and_then(|id|hub.borrow().effect_records.get(&id).cloned()) else {return Ok(());};
+        let Some(node)=effect.node else {return Ok(());};
+        if effect.pseudo.is_some() {
+            return Err(OpError::new("NoModificationAllowedError","cannot commit styles to a pseudo-element"));
+        }
+        let Some(realm)=effect.realm.upgrade() else {return Ok(());};
+        if !realm.session.borrow().document().is_connected_element(node) {
+            return Err(OpError::new("InvalidStateError","cannot commit styles of an element that is not rendered"));
+        }
+        apply_realm_target(&hub,&realm,hub_time(&hub),Some(node))?;
+        let mut animated=Vec::<String>::new();
+        for (name,value) in record.keyframes.iter().flat_map(|frame|frame.declarations.iter()) {
+            if !name.starts_with("--") && name!="all" && lumen_html::css::declaration_block::is_shorthand(name) {
+                if let Ok(pairs)=lumen_html::css::parse_keyframe_declarations(&format!("{name}:{value}")) {
+                    animated.extend(pairs.into_iter().map(|(longhand,_)|longhand));
+                }
+            }
+            animated.push(name.clone());
+        }
+        let committed=[lumen_html::css::EffectOrigin::Animation,lumen_html::css::EffectOrigin::Transition].into_iter().flat_map(|origin|{
+            let session=realm.session.borrow();
+            session.sampled_effect_declarations(origin).filter(|(target,pseudo,_)|*target==node && pseudo.is_none())
+                .flat_map(|(_,_,pairs)|pairs.to_vec()).collect::<Vec<_>>()
+        }).filter(|(name,_)|animated.iter().any(|animated|animated==name)).collect::<Vec<_>>();
+        if committed.is_empty() {return Ok(());}
+        let style=crate::style::DomStyle {realm:realm.clone(),node,computed:false,pseudo:None,invalid_pseudo:false,_owner:Value::Undefined};
+        let mut block=style.declaration_block()?;
+        let mut changed=false;
+        for (name,value) in committed {
+            if let Ok(updated)=block.set(&name,&value,false) {changed|=updated;}
+        }
+        if changed {style.write_block(block)?;}
+        Ok(())
     }
 
 }

@@ -38,8 +38,10 @@ mod view_transition_selector;
 mod font_face_source;
 pub mod media_query_text;
 pub(crate) mod extra_props;
+pub(crate) mod clip_rect;
 mod color_layers;
 mod opacity_values;
+mod owner_values;
 mod palette_mix;
 mod value_props;
 mod value_shorthands;
@@ -49,12 +51,21 @@ mod corner_shapes;
 mod background_positions;
 mod corner_radii;
 mod text_indent;
+mod popover_ua;
+mod html_text_ua;
 mod mask_shorthand;
 mod text_decoration_inset;
 pub(crate) fn text_indent_keywords(mode: u8) -> &'static str { text_indent::keywords(mode) }
 pub(crate) fn split_text_indent(raw: &str) -> Option<(&str, u8)> { text_indent::split(raw) }
 mod font_variations;
+mod font_animation;
+pub mod font_palette_values;
+pub fn interpolate_font_property(name:&str,from:&str,to:&str,progress:f64)->Option<Option<String>>{font_animation::interpolate(name,from,to,progress)}
+pub fn compose_font_property(name:&str,base:&str,value:&str)->Option<String>{font_animation::compose(name,base,value)}
+pub fn resolve_font_size_keywords(from:&str,to:&str)->Option<(String,String)>{font_animation::font_size_endpoints(from,to)}
 mod font_variant;
+mod grid_abspos;
+pub use grid_abspos::{absolute_grid_lines, AbsoluteGridLines};
 mod grid_lines;
 mod grid_tracks;
 mod shapes;
@@ -66,12 +77,21 @@ pub mod function_eval;
 mod if_function;
 mod filter_lists;
 pub fn is_extra_property(name:&str)->bool{extra_props::animates_here(name)}
+pub fn transform_origin_endpoint(raw:&str)->Option<String>{transform_origin::endpoint(raw)}
+pub fn top_level_component_count(raw:&str)->Option<usize>{components(raw).map(|items|items.len())}
 pub fn is_grid_track_list_property(name:&str)->bool{grid_tracks::is_track_list_property(name)}
 pub fn interpolate_grid_track_list(property:&str,from:&str,to:&str,progress:f64)->Option<String>{grid_tracks::interpolate(property,from,to,progress)}
 pub fn compose_grid_track_list(property:&str,base:&str,value:&str)->Option<String>{grid_tracks::compose(property,base,value)}
 pub fn typed_keyword_allowed(name:&str,identifier:&str)->Option<bool>{value_props::typed_keyword(name,identifier)}
 pub fn compose_extra_property(name:&str,base:&str,value:&str,accumulate:bool)->Option<String>{extra_props::compose(name,base,value,accumulate)}
 pub fn interpolate_extra_property(name:&str,from:&str,to:&str,progress:f64)->Option<String>{extra_props::interpolate(name,from,to,progress)}
+/// `caret-color: auto` computes to the resolved text color but is not an
+/// interpolable color, so animations start from the stored keyword.
+pub fn auto_extra_property_value(style:&Style,name:&str)->Option<String>{
+    if name!="caret-color" {return None;}
+    let stored=extra_props::stored(style,name)?;
+    components(&stored)?.first().is_some_and(|token|decoded_css_keyword(token,"auto")).then_some(stored)
+}
 pub mod font_feature_values;
 pub mod counter_styles;
 pub(crate) const FALLBACK_NO_COLUMNS: u8 = 1;
@@ -81,6 +101,7 @@ use namespaces::{NamespaceMap,NamespaceConstraint};
 pub mod typed_numeric;
 mod color_values;
 pub mod typed_colors;
+pub mod color_input;
 mod image_source;
 mod media_queries;
 pub(crate) mod columns;
@@ -878,11 +899,25 @@ pub enum TextAlign {
     Justify,
     MatchParent,
     JustifyAll,
+    WebkitLeft,
+    WebkitRight,
+    WebkitCenter,
 }
 
 impl TextAlign {
     pub const fn justifies(self) -> bool {
         matches!(self, Self::Justify | Self::JustifyAll)
+    }
+
+    /// Alignment of the lines themselves: the `-webkit-` keywords align like
+    /// their plain counterparts and additionally align block-level children.
+    pub const fn line_alignment(self) -> Self {
+        match self {
+            Self::WebkitLeft => Self::Left,
+            Self::WebkitRight => Self::Right,
+            Self::WebkitCenter => Self::Center,
+            other => other,
+        }
     }
 }
 /// Computed `user-select` keyword. `auto` and `contain` are kept distinct from `text` so they
@@ -1804,6 +1839,93 @@ fn grid_line_spec(raw: &str, max_segments: usize) -> bool {
     })
 }
 
+pub(crate) fn parse_grid_line_reference(
+    raw: &str,
+    end: bool,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+) -> Option<(Option<usize>, usize, bool)> {
+    if raw.trim() == "auto" {
+        return Some((None, 1, false));
+    }
+    let mut count = None;
+    let mut name = None;
+    let mut span = false;
+    for word in raw.split_ascii_whitespace() {
+        if word == "span" {
+            span = true;
+        } else if let Some(value) = grid_integer(word) {
+            count = Some(if value.negative {
+                -(value.magnitude as i16)
+            } else {
+                value.magnitude as i16
+            });
+        } else {
+            name = Some(word);
+        }
+    }
+    if span {
+        return Some((None, count.unwrap_or(1) as usize, true));
+    }
+    let explicit_count = count.is_some();
+    let count = count.unwrap_or(1);
+    let line = if let Some(name) = name {
+        let edge = if !explicit_count && !names.iter().any(|line| line.name.as_ref() == name) {
+            let wanted = alloc::format!("{name}{}", if end { "-end" } else { "-start" });
+            names.iter().filter(|line| line.name.as_ref() == wanted).map(|line| line.line).min()
+        } else {
+            None
+        };
+        if let Some(edge) = edge {
+            return Some((Some(edge.min(MAX_GRID_TRACKS)), 1, false));
+        }
+        let mut candidates = 0u128;
+        for line in names.iter().filter(|line| line.name.as_ref() == name) {
+            candidates |= 1u128 << line.line.min(MAX_GRID_TRACKS);
+        }
+        if candidates != 0 {
+            let ordinal = count.unsigned_abs() as usize;
+            if ordinal == 0 || ordinal > candidates.count_ones() as usize {
+                return None;
+            }
+            for _ in 1..ordinal {
+                if count > 0 {
+                    candidates &= candidates - 1;
+                } else {
+                    candidates &= !(1u128 << (127 - candidates.leading_zeros()));
+                }
+            }
+            if count > 0 {
+                candidates.trailing_zeros() as usize
+            } else {
+                (127 - candidates.leading_zeros()) as usize
+            }
+        } else if let Some(area) = areas.iter().find(|area| area.name.as_ref() == name) {
+            let start = if horizontal { area.column } else { area.row };
+            start.saturating_add(if end {
+                if horizontal {
+                    area.columns
+                } else {
+                    area.rows
+                }
+            } else {
+                0
+            })
+        } else {
+            explicit.saturating_add(count.max(1) as usize)
+        }
+    } else if count > 0 {
+        count as usize - 1
+    } else {
+        explicit
+            .saturating_add(1)
+            .saturating_sub(count.unsigned_abs() as usize)
+    };
+    Some((Some(line.min(MAX_GRID_TRACKS)), 1, false))
+}
+
 pub fn resolve_grid_placement(
     fallback: GridPlacement,
     raw: Option<&str>,
@@ -1818,75 +1940,7 @@ pub fn resolve_grid_placement(
     let mut parts = raw.split('/');
     let first = parts.next()?;
     let second = parts.next().unwrap_or("auto");
-    let parse = |raw: &str, end: bool| -> Option<(Option<usize>, usize, bool)> {
-        if raw.trim() == "auto" {
-            return Some((None, 1, false));
-        }
-        let mut count = None;
-        let mut name = None;
-        let mut span = false;
-        for word in raw.split_ascii_whitespace() {
-            if word == "span" {
-                span = true;
-            } else if let Some(value) = grid_integer(word) {
-                count = Some(if value.negative {
-                    -(value.magnitude as i16)
-                } else {
-                    value.magnitude as i16
-                });
-            } else {
-                name = Some(word);
-            }
-        }
-        if span {
-            return Some((None, count.unwrap_or(1) as usize, true));
-        }
-        let count = count.unwrap_or(1);
-        let line = if let Some(name) = name {
-            let mut candidates = 0u128;
-            for line in names.iter().filter(|line| line.name.as_ref() == name) {
-                candidates |= 1u128 << line.line.min(MAX_GRID_TRACKS);
-            }
-            if candidates != 0 {
-                let ordinal = count.unsigned_abs() as usize;
-                if ordinal == 0 || ordinal > candidates.count_ones() as usize {
-                    return None;
-                }
-                for _ in 1..ordinal {
-                    if count > 0 {
-                        candidates &= candidates - 1;
-                    } else {
-                        candidates &= !(1u128 << (127 - candidates.leading_zeros()));
-                    }
-                }
-                if count > 0 {
-                    candidates.trailing_zeros() as usize
-                } else {
-                    (127 - candidates.leading_zeros()) as usize
-                }
-            } else if let Some(area) = areas.iter().find(|area| area.name.as_ref() == name) {
-                let start = if horizontal { area.column } else { area.row };
-                start.saturating_add(if end {
-                    if horizontal {
-                        area.columns
-                    } else {
-                        area.rows
-                    }
-                } else {
-                    0
-                })
-            } else {
-                explicit.saturating_add(count.max(1) as usize)
-            }
-        } else if count > 0 {
-            count as usize - 1
-        } else {
-            explicit
-                .saturating_add(1)
-                .saturating_sub(count.unsigned_abs() as usize)
-        };
-        Some((Some(line.min(MAX_GRID_TRACKS)), 1, false))
-    };
+    let parse = |raw: &str, end: bool| parse_grid_line_reference(raw, end, names, explicit, areas, horizontal);
     let (start, start_span, start_is_span) = parse(first, false)?;
     let (end, end_span, end_is_span) = parse(second, true)?;
     let placement = match (start, end) {
@@ -2105,8 +2159,11 @@ fn grid_placement(raw: &str) -> Option<GridPlacement> {
     } else {
         1
     };
-    if let Some(end) = parts.next() {
-        let end = end.trim();
+    let end = parts.next().map(str::trim);
+    if start.is_some() && end.is_none_or(|end| end == "auto") {
+        return None;
+    }
+    if let Some(end) = end {
         span = if let Some(v) = end.strip_prefix("span ") {
             line(v.trim())?
         } else {
@@ -3022,6 +3079,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
         size_adjust: None,
         caps: FontVariantCaps::Normal,
         synthesize_small_caps: true,
+        spacing_trim: crate::paint::SpacingTrim::Normal,
     },
     min_width_auto: true,
     min_height_auto: true,
@@ -4449,6 +4507,10 @@ impl Style {
             self.flex_basis
         }
     }
+    pub fn flex_basis_is_percentage(&self) -> bool {
+        self.relative_lengths.iter().any(|(slot, _)| *slot == 20)
+            || self.relative_expressions.iter().any(|expression| expression.slot == 20 && expression.raw.contains('%'))
+    }
     fn cyclic_percentage_slot(&self, slot: usize) -> bool {
         self.relative_lengths.iter().any(|(key, length)| *key == slot && length.percent != 0.0)
             || self.relative_expressions.iter().any(|expression| expression.slot == slot && expression.raw.contains('%'))
@@ -4528,6 +4590,18 @@ impl Style {
     ) -> Style {
         let mut result = self.resolve_percentages(width, height);
         self.project_intrinsic_percentage_axes(&mut result, axes);
+        // A cyclic percentage inside a minimum size still contributes its
+        // length part: it resolves against a zero basis.
+        let cyclic_minimums = [(axes[0], 23), (axes[1], 51)];
+        if cyclic_minimums.iter().any(|(enabled, slot)| *enabled && self.cyclic_percentage_slot(*slot)) {
+            let zero = self.resolve_percentages(0.0, Some(0.0));
+            if axes[0] && self.cyclic_percentage_slot(23) {
+                result.min_width = zero.min_width;
+            }
+            if axes[1] && self.cyclic_percentage_slot(51) {
+                result.min_height = zero.min_height;
+            }
+        }
         result
     }
 
@@ -6291,7 +6365,7 @@ impl Value {
             Self::MaskModes(v) => style.mask_mode = v.clone(),
 
             Self::HtmlDimension(slot, dimension) => {
-                if dimension.percent != 0.0 {
+                if dimension.percent != 0.0 || dimension.percent.is_sign_negative() {
                     style.relative_lengths.push((*slot, *dimension));
                 }
                 if let Some(value) = length_value(*slot, dimension.pixels) { value.apply(style); }
@@ -6537,6 +6611,8 @@ impl Value {
                 style.row_gap_normal = *v == 0.0;
             }
             Self::GapLength(slot, value) => {
+                let clamped = LengthPercentage { pixels: if value.fraction == 0.0 { value.pixels.max(0.0) } else { value.pixels }, fraction: value.fraction.max(0.0) };
+                let value = if *slot == 184 { value } else { &clamped };
                 if *slot == 184 {
                     style.flow_tolerance = FlowTolerance::Length(*value);
                 } else if *slot == 17 {
@@ -6656,12 +6732,16 @@ impl Value {
             }
             Self::IntrinsicSize(slot, value) => {
                 style.set_intrinsic_size_keyword(*slot, Some(*value));
+                let any = match value {
+                    IntrinsicSizing::CalcSize(calc) if calc.basis == calc_size::Basis::Any => calc.resolve(0.0, Some(0.0)),
+                    _ => None,
+                };
                 match slot {
-                    3 => style.width = None, 4 => style.height = None,
-                    23 => { style.min_width = 0.0; style.min_width_auto = false; }
-                    24 => style.max_width = None,
-                    51 => { style.min_height = 0.0; style.min_height_auto = false; }
-                    52 => style.max_height = None,
+                    3 => style.width = any, 4 => style.height = any,
+                    23 => { style.min_width = any.unwrap_or(0.0); style.min_width_auto = false; }
+                    24 => style.max_width = any,
+                    51 => { style.min_height = any.unwrap_or(0.0); style.min_height_auto = false; }
+                    52 => style.max_height = any,
                     87 => style.logical_inline_size = None, 88 => style.logical_block_size = None,
                     91 | 93 => style.logical_min_size[usize::from(*slot == 93)] = None,
                     92 | 94 => style.logical_max_size[usize::from(*slot == 94)] = None,
@@ -6947,6 +7027,17 @@ impl ScopeContext {
             outer.visit_roots(document, subject, shadow, owner, validity, depth + 1, work,
                 &mut |root, _, work| in_outer(Some(root), work));
         } else { in_outer(None, work); }
+    }
+}
+
+/// Parent for combinator matching. The children of a shadow root have the
+/// shadow host as their parent, which is how `:host(...) x` reaches the host.
+fn selector_parent(document: &SelectorDocument<'_>, node: NodeId, shadow_root: Option<NodeId>) -> Option<NodeId> {
+    let parent = document.parent(node).ok().flatten()?;
+    if shadow_root == Some(parent) {
+        document.shadow_host(parent).ok().flatten()
+    } else {
+        Some(parent)
     }
 }
 
@@ -10354,6 +10445,22 @@ fn parse_simple_selector_depth(
                 start += end;
                 continue;
             }
+            if matches!(name, "link" | "any-link" | "visited" | "local-link") && args.is_none() && !pseudo_element {
+                // Visited state is never exposed, so :visited and :local-link
+                // match nothing; the others are hyperlink elements with href.
+                let mut selectors = if matches!(name, "link" | "any-link") {
+                    parse_selector_list_depth("a[href],area[href]", offset + start, depth + 1, false, false, namespaces)?
+                } else {
+                    Vec::new()
+                };
+                for subject in &mut selectors {
+                    subject.namespace = NamespaceConstraint::Any;
+                }
+                selector.logical.push(LogicalPseudo::Is(selectors));
+                selector.specificity.1 += 1;
+                start += end;
+                continue;
+            }
             if matches!(name, "not" | "is" | "where") {
                 if pseudo_element {
                     return Err(selector_error(
@@ -10563,7 +10670,15 @@ fn parse_simple_selector_depth(
                             depth + 1,
                             allow_nesting,
                          namespaces)?;
-                        merge_compound(&mut selector, inner)?;
+                        // :has() inside the :host() argument looks at the host's light tree.
+                        if inner.logical.iter().any(|pseudo| matches!(pseudo, LogicalPseudo::Has(_))) {
+                            let mut merged = inner.clone();
+                            merged.logical.retain(|pseudo| !matches!(pseudo, LogicalPseudo::Has(_)));
+                            merge_compound(&mut selector, merged)?;
+                            selector.logical.push(LogicalPseudo::Is(vec![inner]));
+                        } else {
+                            merge_compound(&mut selector, inner)?;
+                        }
                     }
                     start += end;
                     continue;
@@ -11540,9 +11655,11 @@ fn value_depends_on_sibling_position(value: &Value) -> bool {
     match value {
         Value::ColorRaw(_, raw) | Value::Deferred(_,raw) | Value::Custom(_,raw) => {
             typed_numeric::substitute_sibling_functions(raw, 1, 1).is_some_and(|(_, replaced)| replaced)
+                || matches!(value, Value::Deferred(..)) && owner_values::may_use(raw)
         }
         Value::ContextLength(_,raw,_)=>typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent),
-        Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>typed_numeric::substitute_sibling_functions(&group.value,1,1).is_some_and(|(_,dependent)|dependent),
+        Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>typed_numeric::substitute_sibling_functions(&group.value,1,1).is_some_and(|(_,dependent)|dependent)
+            || owner_values::may_use(&group.value),
         Value::TransitionTimingFunction(values)=>values.iter().any(|value|transition_controls::timing_dependencies(value).2),
         Value::Animation(166,raw)=>transition_controls::timing_dependencies(raw).2,
         _ => false,
@@ -11596,9 +11713,11 @@ pub fn parse_animation_unclipped_color(input:&str,current:lumen_common::color::C
 /// Interpolation preserves source coordinates until the actual paint boundary.
 pub fn interpolate_source_colors(from:&SourceColor,to:&SourceColor,progress:f32)->SourceColor {
     use lumen_common::color::{ColorSpace,InterpolationMethod,PreparedPair};
-    if progress==0.0{return from.clone();}
-    if progress==1.0{return to.clone();}
     let modern=from.color_function || to.color_function || !matches!(from.value.space,ColorSpace::Srgb|ColorSpace::Hsl|ColorSpace::Hwb) || !matches!(to.value.space,ColorSpace::Srgb|ColorSpace::Hsl|ColorSpace::Hwb);
+    if !modern {
+        if progress==0.0{return from.clone();}
+        if progress==1.0{return to.clone();}
+    }
     let method=if modern {InterpolationMethod::default()}else {InterpolationMethod{space:ColorSpace::Srgb,..InterpolationMethod::default()}};
     SourceColor{value:PreparedPair::new(from.value,to.value,method).sample(progress),color_function:modern,expression:None}
 }
@@ -11610,6 +11729,11 @@ pub fn animation_color_property(property:&str)->bool {let properties=slots(prope
 pub fn animation_color_needs_context(input:&str)->bool {color_values::uses_current_color(input)||image_numeric_dependencies(input)!=(false,false)}
 
 fn color_value(slot: usize, input: &str) -> Option<Value> {
+    let uncommented;
+    let input = if syntax::contains_comment_open(input) {
+        uncommented = strip_component_comments(input, 0, true).ok()?;
+        uncommented.trim()
+    } else { input };
     let (validation_input, sibling_dependent) = sibling_context_colors(input, 1, 1)?;
     let context=static_length_context();
     color_values::endpoint_with_current(&validation_input,0,color_values::from_rgba(Style::initial().color),context,ContainerUnitContext::no_container(context.viewport))?;
@@ -11943,9 +12067,6 @@ const SVG_UNSUPPORTED_CSS_PROPERTIES: &[&str] = &[
     "shape-rendering",
     "stroke-dasharray",
     "stroke-dashoffset",
-    "stroke-linecap",
-    "stroke-linejoin",
-    "stroke-miterlimit",
     "text-anchor",
     "textlength",
     "text-rendering",
@@ -13115,6 +13236,7 @@ property_registry! {
     "text-decoration-line" => [57], false, true;
     "width" => [3, 147], false, true;
     "height" => [4, 148], false, true;
+    "size" => [3, 4, 147, 148], false, true;
     "margin" => [5, 39, 40, 41, 42], false, true;
     "padding" => [6, 43, 44, 45, 46], false, true;
     "font-size" => [7], true, true;
@@ -13124,7 +13246,7 @@ property_registry! {
     "font-width" => [139], true, true;
     "font-stretch" => [139], true, true;
     "font-size-adjust" => [140], true, true;
-    "font" => [131,130,139,140,7,13,129,185,199,200,221,extra_props::VALUE_BASE + value_props::const_index("font-variant-numeric"),extra_props::VALUE_BASE + value_props::const_index("font-variant-east-asian"),extra_props::VALUE_BASE + value_props::const_index("font-variant-position"),extra_props::VALUE_BASE + value_props::const_index("font-variant-emoji")], true, true;
+    "font" => [131,130,139,140,7,13,129,185,199,200,221,extra_props::VALUE_BASE + value_props::const_index("font-variant-numeric"),extra_props::VALUE_BASE + value_props::const_index("font-variant-east-asian"),extra_props::VALUE_BASE + value_props::const_index("font-variant-position"),extra_props::VALUE_BASE + value_props::const_index("font-variant-emoji"),extra_props::VALUE_BASE + value_props::const_index("font-kerning"),extra_props::VALUE_BASE + value_props::const_index("font-optical-sizing"),extra_props::VALUE_BASE + value_props::const_index("font-variation-settings"),extra_props::VALUE_BASE + value_props::const_index("font-language-override")], true, true;
     "font-variant-caps" => [185], true, true;
     "font-variant" => [199,185,221,extra_props::VALUE_BASE + value_props::const_index("font-variant-numeric"),extra_props::VALUE_BASE + value_props::const_index("font-variant-east-asian"),extra_props::VALUE_BASE + value_props::const_index("font-variant-position"),extra_props::VALUE_BASE + value_props::const_index("font-variant-emoji")], true, true;
     "font-variant-alternates" => [221], true, true;
@@ -13470,6 +13592,9 @@ property_registry! {
     "scroll-padding-inline" => [extra_props::VALUE_BASE + value_props::const_index("scroll-padding-inline-start"), extra_props::VALUE_BASE + value_props::const_index("scroll-padding-inline-end")], false, true;
     "overscroll-behavior" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-x"), extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-y")], false, true;
     "marker" => [extra_props::VALUE_BASE + value_props::const_index("marker-start"), extra_props::VALUE_BASE + value_props::const_index("marker-mid"), extra_props::VALUE_BASE + value_props::const_index("marker-end")], true, true;
+    "interest-delay-start" => [extra_props::VALUE_BASE + value_props::const_index("interest-delay-start")], false, true;
+    "interest-delay-end" => [extra_props::VALUE_BASE + value_props::const_index("interest-delay-end")], false, true;
+    "interest-delay" => [extra_props::VALUE_BASE + value_props::const_index("interest-delay-start"), extra_props::VALUE_BASE + value_props::const_index("interest-delay-end")], false, true;
     "alignment-baseline" => [extra_props::VALUE_BASE + value_props::const_index("alignment-baseline")], false, true;
     "backface-visibility" => [extra_props::VALUE_BASE + value_props::const_index("backface-visibility")], false, true;
     "background-blend-mode" => [extra_props::VALUE_BASE + value_props::const_index("background-blend-mode")], false, true;
@@ -13506,6 +13631,13 @@ property_registry! {
     "mix-blend-mode" => [extra_props::VALUE_BASE + value_props::const_index("mix-blend-mode")], false, true;
     "object-fit" => [extra_props::VALUE_BASE + value_props::const_index("object-fit")], false, true;
     "overflow-anchor" => [extra_props::VALUE_BASE + value_props::const_index("overflow-anchor")], false, true;
+    "scroll-axis-lock" => [extra_props::VALUE_BASE + value_props::const_index("scroll-axis-lock")], false, true;
+    "scroll-marker-group" => [extra_props::VALUE_BASE + value_props::const_index("scroll-marker-group")], false, true;
+    "scroll-target-group" => [extra_props::VALUE_BASE + value_props::const_index("scroll-target-group")], false, true;
+    "block-ellipsis" => [extra_props::VALUE_BASE + value_props::const_index("block-ellipsis")], true, true;
+    "max-lines" => [extra_props::VALUE_BASE + value_props::const_index("max-lines")], false, true;
+    "continue" => [extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
+    "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-line-clamp")], false, true;
     "overflow-clip-margin" => [extra_props::VALUE_BASE + value_props::const_index("overflow-clip-margin")], false, true;
     "overscroll-behavior-x" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-x")], false, true;
     "overscroll-behavior-y" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-y")], false, true;
@@ -13585,8 +13717,14 @@ property_registry! {
 pub fn cssom_property_names() -> Vec<&'static str> {
     // `all` is the registry's special reset projection rather than a row
     // with duplicated slots, but it still has a CSSStyleDeclaration accessor.
+    const LEGACY_FLEX_ALIASES: [&str; 12] = [
+        "-webkit-align-content", "-webkit-align-items", "-webkit-align-self", "-webkit-flex",
+        "-webkit-flex-basis", "-webkit-flex-direction", "-webkit-flex-flow", "-webkit-flex-grow",
+        "-webkit-flex-shrink", "-webkit-flex-wrap", "-webkit-justify-content", "-webkit-order",
+    ];
     PROPERTIES.iter().map(|property| property.name)
         .filter(|name| !name.starts_with("-lumen-"))
+        .chain(LEGACY_FLEX_ALIASES)
         .chain(core::iter::once("all")).collect()
 }
 
@@ -13645,7 +13783,7 @@ fn transition_value_kind_of(name: &str) -> TransitionValueKind {
         | "animation-timeline" | "animation-range" | "animation-range-start" | "animation-range-end" | "animation-delay-start" | "animation-delay-end" | "scroll-timeline-name" | "scroll-timeline-axis"
         | "view-timeline-name" | "view-timeline-axis" | "view-timeline-inset" | "transition-property"
         | "transition-duration" | "transition-delay" | "transition-timing-function"
-        | "transition-behavior" => NotAnimatable,
+        | "transition-behavior" | "interpolate-size" => NotAnimatable,
         name if extra_props::is_discrete(name) => Discrete,
         "appearance" | "-webkit-appearance" | "field-sizing" | "break-before" | "break-after" | "break-inside" | "column-span" | "box-decoration-break" => Discrete,
         "transform" | "translate" | "rotate" | "scale" => Transform,
@@ -18161,6 +18299,15 @@ fn font_shorthand(raw: &str) -> Option<Vec<Value>> {
                 seen_stretch = true;
                 index += 1;
             }
+            _ if !seen_weight && math_function(token)
+                && typed_numeric::parse_numeric_expression(token).and_then(|expression| expression.numeric_type()) == Some(typed_numeric::NumericType::default()) => {
+                weight = match font_weight_with_context(token, static_length_context(), ContainerUnitContext::no_container(MediaEnvironment::default()))? {
+                    Value::FontWeight(milli) => milli,
+                    _ => return None,
+                };
+                seen_weight = true;
+                index += 1;
+            }
             _ if !seen_weight && font_weight(&keyword).is_some() => {
                 weight = font_weight(&keyword)?;
                 seen_weight = true;
@@ -18218,6 +18365,7 @@ fn font_shorthand(raw: &str) -> Option<Vec<Value>> {
         Value::FontAlternates(None),
     ];
     out.extend(font_variant::normal_resets());
+    out.extend(font_variant::font_resets());
     out.extend(size.into_iter().map(|v| v.value));
     out.extend(height.into_iter().map(|v| v.value));
     out.push(Value::FontFamily(family));
@@ -18774,6 +18922,22 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             }
             continue;
         }
+        if defer_variables && name != "content" && owner_values::has_unmatched_closer(raw) {
+            continue;
+        }
+        if defer_variables && name != "content" && owner_values::may_use(raw) {
+            if !slots(name).is_empty() {
+                let admitted = match owner_values::admission(raw) {
+                    owner_values::Admission::Invalid => false,
+                    owner_values::Admission::Unchecked => true,
+                    owner_values::Admission::Probe(probe) => !declarations_with_variables(&alloc::format!("{name}:{probe}"), offset, false)?.is_empty(),
+                };
+                if admitted {
+                    out.push(Declaration { value: Value::Deferred(name.into(), raw.into()), important });
+                }
+            }
+            continue;
+        }
         if defer_variables&&typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent) {
             let Some((validation,_))=typed_numeric::substitute_sibling_functions(raw,1,1)else{continue;};
             if !declarations_with_variables(&alloc::format!("{name}:{validation}"),offset,false)?.is_empty(){
@@ -18988,6 +19152,27 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             }
             continue;
         }
+        if name == "size" {
+            if let Some(parts) = components(raw).filter(|parts| (1..=2).contains(&parts.len())) {
+                let mut pair = Vec::new();
+                let mut valid = true;
+                for (longhand, token) in [("width", parts[0]), ("height", parts.get(1).copied().unwrap_or(parts[0]))] {
+                    let before = pair.len();
+                    append_closed_declaration_pair_values(longhand, token, offset, defer_variables, false, &mut pair)?;
+                    if pair.len() == before {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    for mut declaration in pair {
+                        declaration.important = important;
+                        out.push(declaration);
+                    }
+                }
+            }
+            continue;
+        }
         if matches!(name, "gap" | "grid-gap") {
             if let Some(parts) = components(raw).filter(|parts| (1..=2).contains(&parts.len())) {
                 if let (Some(row), Some(column)) = (
@@ -19089,6 +19274,9 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
                         } else {
                             Value::TransformRaw(raw.into())
                         }
+                    }).or_else(|| {
+                        let lower = ascii_lower(raw);
+                        (lower.contains("nan") || lower.contains("infinity")).then(|| typed_transforms::validated_function_tokens(raw)).flatten().map(|_| Value::TransformRaw(raw.into()))
                     })
                 }
             } else {
@@ -19539,6 +19727,9 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
                 let mut converted = String::new();
                 let mut basis = None;
                 let mut invalid = false;
+                let numbers_only = !tokens.is_empty()
+                    && tokens.len() <= 2
+                    && tokens.iter().all(|token| css_scalar(token, false).is_some());
                 for token in tokens {
                     if let Some(value @ Value::ContextLength(_, _, _)) =
                         parse_context_length(20, token, true)
@@ -19556,6 +19747,10 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
                 }
                 if invalid {
                     continue;
+                }
+                if numbers_only && basis.is_none() {
+                    basis = parse_context_length(20, "0%", true);
+                    converted.push_str("0px ");
                 }
                 if let Some(basis) = basis {
                     let parsed = typed_declarations("flex", &converted, offset)?;
@@ -21000,6 +21195,9 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 "justify" => Some(Value::TextAlign(TextAlign::Justify)),
                 "match-parent" => Some(Value::TextAlign(TextAlign::MatchParent)),
                 "justify-all" => Some(Value::TextAlign(TextAlign::JustifyAll)),
+                "-webkit-left" => Some(Value::TextAlign(TextAlign::WebkitLeft)),
+                "-webkit-right" => Some(Value::TextAlign(TextAlign::WebkitRight)),
+                "-webkit-center" => Some(Value::TextAlign(TextAlign::WebkitCenter)),
                 _ => None,
             },
             "unicode-bidi" => match raw {
@@ -21814,6 +22012,8 @@ pub struct FontFaceDescriptors {
     pub stretch_expressions: Option<Arc<[typed_numeric::NumericExpression; 2]>>,
     pub style: crate::paint::FontStyle,
     pub oblique_range: Option<[f32; 2]>,
+    /// Canonical specified text when it carries more than the numeric range.
+    pub style_text: Option<Arc<str>>,
     pub unicode_range: Option<Arc<str>>,
     pub display: FontDisplay,
     /// Authored auto overrides family defaults; omission does not.
@@ -21842,6 +22042,7 @@ impl Default for FontFaceDescriptors {
             stretch_expressions: None,
             style: crate::paint::FontStyle::Normal,
             oblique_range: None,
+            style_text: None,
             unicode_range: None,
             display: FontDisplay::Auto,
             display_specified: false,
@@ -21879,12 +22080,11 @@ impl FontFaceDescriptors {
                 }
             }
             "src" => font_face_source::serialize(&self.sources, &self.source_suffixes),
-            "weight" if self.weight_range[0] == self.weight_range[1] => self
+            "weight" => self
                 .weight_keyword
                 .as_deref()
                 .map(String::from)
                 .unwrap_or_else(|| serialize_weight_range(self.weight_range)),
-            "weight" => serialize_weight_range(self.weight_range),
             "stretch" if self.stretch_expressions.is_some() => {
                 let expressions = self.stretch_expressions.as_ref()?;
                 let first = expressions[0].serialize()?;
@@ -21893,7 +22093,8 @@ impl FontFaceDescriptors {
             },
             "stretch" if self.stretch_keyword.is_some() => self.stretch_keyword.as_ref()?.to_string(),
             "stretch" => serialize_stretch_range(self.stretch_range),
-            "style" => serialize_font_face_style(self.style, self.oblique_range),
+            "style" => self.style_text.as_deref().map(String::from)
+                .unwrap_or_else(|| serialize_font_face_style(self.style, self.oblique_range)),
             "unicode-range" => self
                 .unicode_range
                 .as_deref()
@@ -21932,19 +22133,19 @@ impl FontFaceDescriptors {
                 let Some(parsed) = font_face_source::parse(value) else {
                     return Err(invalid());
                 };
+                if !parsed.suffixes.iter().any(|suffix| font_face_source::format_loadable(suffix)) {
+                    return Err(invalid());
+                }
                 self.sources = parsed.sources.into();
                 self.source_suffixes = parsed.suffixes.into();
             }
             "weight" => {
-                let Some(range) = parse_font_weight_range(value) else {
+                let Some((range, text)) = parse_font_face_weight(value) else {
                     return Err(invalid());
                 };
                 self.weight_range = range;
                 self.weight = range[0];
-                let lowered = ascii_lower(value);
-                self.weight_keyword = (range[0] == range[1]
-                    && matches!(&*lowered, "normal" | "bold"))
-                .then(|| Arc::from(lowered.as_ref()));
+                self.weight_keyword = Some(Arc::from(text));
             }
             "stretch" => {
                 let Some((range, expressions)) = parse_font_width_range(value) else { return Err(invalid()); };
@@ -21954,8 +22155,8 @@ impl FontFaceDescriptors {
                 let lowered = ascii_lower(value);
                 self.stretch_keyword = if self.stretch_expressions.is_some() { None }
                     else if lowered == "auto" { Some(Arc::from("auto")) }
-                    else { Some(Arc::from(components(value).ok_or_else(invalid)?.iter().map(|raw|
-                        font_stretch_keyword(raw).map(String::from).unwrap_or_else(|| serialize_percent(font_stretch(raw).unwrap()))).collect::<Vec<_>>().join(" "))) };
+                    else { Some(Arc::from(join_distinct_pair(components(value).ok_or_else(invalid)?.iter().map(|raw|
+                        font_stretch_keyword(raw).map(String::from).unwrap_or_else(|| serialize_percent(font_stretch(raw).unwrap()))).collect::<Vec<_>>()))) };
             }
             "style" => {
                 let Some((style, range)) = parse_font_face_style(value) else {
@@ -21963,6 +22164,7 @@ impl FontFaceDescriptors {
                 };
                 self.style = style;
                 self.oblique_range = range;
+                self.style_text = font_face_style_text(value).map(Arc::from);
             }
             "unicode-range" => {
                 let Some(ranges) = parse_unicode_ranges(value) else {
@@ -22215,22 +22417,58 @@ fn serialize_css_string(value: &str) -> String {
     serialize_string(value)
 }
 
+#[cfg(test)]
 fn parse_font_face_sources(raw: &str) -> Option<Vec<FontFaceSource>> {
     font_face_source::parse(raw).map(|parsed| parsed.sources)
 }
 
-fn parse_font_weight_range(raw: &str) -> Option<[u16; 2]> {
+fn join_distinct_pair(parts: Vec<String>) -> String {
+    match parts.as_slice() {
+        [first, second] if first == second => first.clone(),
+        _ => parts.join(" "),
+    }
+}
+
+/// `@font-face` weight descriptor: `auto`, or one or two numbers or `calc()`
+/// expressions in `[1, 1000]`; bounds may be out of order. Returns the numeric
+/// range used for matching and the canonical specified text.
+fn parse_font_face_weight(raw: &str) -> Option<([u16; 2], String)> {
     let values = components(raw)?;
     if !(1..=2).contains(&values.len()) {
         return None;
     }
-    let parse = |value: &str| {
-        let weight = font_weight(&ascii_lower(value))?;
-        (weight > 0).then_some(((weight + 500) / 1000) as u16)
-    };
-    let first = parse(values[0])?;
-    let last = values.get(1).map_or(Some(first), |value| parse(value))?;
-    (first <= last).then_some([first, last])
+    if values.len() == 1 && values[0].eq_ignore_ascii_case("auto") {
+        return Some(([400, 400], String::from("auto")));
+    }
+    let mut numbers = Vec::new();
+    let mut texts = Vec::new();
+    for value in &values {
+        let lowered = ascii_lower(value);
+        let (number, text) = if math_function(value) {
+            let expression = typed_numeric::parse_numeric_expression(value)?;
+            if expression.numeric_type()? != typed_numeric::NumericType::default() {
+                return None;
+            }
+            let number = expression.evaluate(&mut FontAngleContext {length: None, query: ContainerUnitContext::default(), percent_scale: 1.0})?;
+            (number, expression.serialize()?)
+        } else if matches!(&*lowered, "normal" | "bold") {
+            let number = if &*lowered == "normal" { 400.0 } else { 700.0 };
+            (number, if values.len() == 1 { String::from(lowered.as_ref()) } else { alloc::format!("{number}") })
+        } else {
+            let milli = font_weight_number(&lowered)?;
+            let number = f64::from(milli) / 1000.0;
+            (number, alloc::format!("{number}"))
+        };
+        if !number.is_finite() {
+            return None;
+        }
+        numbers.push(number.clamp(1.0, 1000.0));
+        texts.push(text);
+    }
+    let rounded = |number: f64| (number + 0.5).floor() as u16;
+    let first = rounded(numbers[0]);
+    let last = numbers.get(1).map_or(first, |number| rounded(*number));
+    Some(([first.min(last), first.max(last)], join_distinct_pair(texts)))
 }
 
 fn parse_font_width_range(raw: &str) -> Option<([f32; 2], Option<Arc<[typed_numeric::NumericExpression; 2]>>)> {
@@ -22299,7 +22537,7 @@ fn parse_angle_degrees(raw: &str) -> Option<f32> {
 fn parse_font_face_style(raw: &str) -> Option<(crate::paint::FontStyle, Option<[f32; 2]>)> {
     let values = components(raw)?;
     match values.as_slice() {
-        [value] if value.eq_ignore_ascii_case("normal") => {
+        [value] if value.eq_ignore_ascii_case("normal") || value.eq_ignore_ascii_case("auto") => {
             Some((crate::paint::FontStyle::Normal, None))
         }
         [value] if value.eq_ignore_ascii_case("italic") => {
@@ -22310,14 +22548,46 @@ fn parse_font_face_style(raw: &str) -> Option<(crate::paint::FontStyle, Option<[
         }
         [kind, start] if kind.eq_ignore_ascii_case("oblique") => {
             let start = parse_angle_degrees(start)?;
+            if start == 0.0 {
+                return Some((crate::paint::FontStyle::Normal, None));
+            }
             Some((crate::paint::FontStyle::Oblique, Some([start, start])))
         }
         [kind, start, end] if kind.eq_ignore_ascii_case("oblique") => {
-            let range = [parse_angle_degrees(start)?, parse_angle_degrees(end)?];
-            (range[0] <= range[1]).then_some((crate::paint::FontStyle::Oblique, Some(range)))
+            let (start, end) = (parse_angle_degrees(start)?, parse_angle_degrees(end)?);
+            if start == 0.0 && end == 0.0 {
+                return Some((crate::paint::FontStyle::Normal, None));
+            }
+            Some((crate::paint::FontStyle::Oblique, Some([start.min(end), start.max(end)])))
         }
         _ => None,
     }
+}
+
+/// Canonical specified text of a valid `@font-face` style descriptor: bounds
+/// keep their authored order, `calc()` angles survive unclamped and a zero
+/// angle is `normal`.
+fn font_face_style_text(raw: &str) -> Option<String> {
+    let values = components(raw)?;
+    if values.len() == 1 {
+        return Some(ascii_lower(values[0]).into_owned());
+    }
+    let mut angles = Vec::new();
+    for value in &values[1..] {
+        if math_function(value) {
+            let expression = font_angle_expression(value)?;
+            let degrees = expression.evaluate(&mut FontAngleContext {length: None, query: ContainerUnitContext::default(), percent_scale: 1.0})?;
+            angles.push((degrees == 0.0, expression.serialize()?));
+        } else {
+            let degrees = parse_angle_degrees(value)?;
+            angles.push((degrees == 0.0, alloc::format!("{degrees}deg")));
+        }
+    }
+    if angles.iter().all(|(zero, _)| *zero) {
+        return Some(String::from("normal"));
+    }
+    let texts = angles.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
+    Some(alloc::format!("oblique {}", join_distinct_pair(texts)))
 }
 
 fn serialize_weight_range(range: [u16; 2]) -> String {
@@ -23889,7 +24159,7 @@ fn emit_source_rules(
             }
             continue;
         }
-        if node.kind == SourceRuleKind::CounterStyle {
+        if matches!(node.kind, SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues) {
             continue;
         }
         if node.kind == SourceRuleKind::FontFeatureValues {
@@ -24797,17 +25067,28 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let any = match pseudo {
                 LogicalPseudo::Heading(levels)=>crate::headings::computed_heading_level(document,node).ok().flatten().is_some_and(|level|levels&(1u16<<u32::from(level))!=0),
                 LogicalPseudo::State(name, _) => document.has_custom_state(node, name),
-                LogicalPseudo::Has(relative) => relative.iter().any(|selector| {
-                    selector.matches_from(
-                        document,
-                        node,
-                        logical_shadow,
-                        scope_root,
-                        depth + 1,
-                        validity,
-                        quota,
-                    )
-                }),
+                LogicalPseudo::Has(relative) => {
+                    // In a shadow tree's own style, `:host:has()` looks at the
+                    // shadow tree, whose top-level nodes are the root's children.
+                    let tree = if self.host {
+                        shadow_root.filter(|root| document.shadow_host(*root) == Ok(Some(node)))
+                    } else { None };
+                    let (anchor, context) = match tree {
+                        Some(root) => (root, tree),
+                        None => (node, logical_shadow),
+                    };
+                    relative.iter().any(|selector| {
+                        selector.matches_from(
+                            document,
+                            anchor,
+                            context,
+                            scope_root,
+                            depth + 1,
+                            validity,
+                            quota,
+                        )
+                    })
+                }
                 _ => pseudo.selectors().iter().any(|selector| {
                     selector.matches_in_context_with_quota(
                         document,
@@ -24990,7 +25271,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             });
         };
         match relation {
-            Relation::Child => document.parent(node).ok().flatten().is_some_and(|parent| {
+            Relation::Child => selector_parent(document, node, shadow_root).is_some_and(|parent| {
                 ancestor.matches_in_context_with_anchor_and_validity(
                     document,
                     parent,
@@ -25003,7 +25284,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 )
             }),
             Relation::Descendant => {
-                let mut current = document.parent(node).ok().flatten();
+                let mut current = selector_parent(document, node, shadow_root);
                 while let Some(id) = current {
                     if !take_selector_work(quota) { return false; }
                     if ancestor.matches_in_context_with_anchor_and_validity(
@@ -25018,7 +25299,10 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                     ) {
                         return true;
                     }
-                    current = document.parent(id).ok().flatten();
+                    if shadow_root.is_some_and(|root| document.shadow_host(root) == Ok(Some(id))) {
+                        return false;
+                    }
+                    current = selector_parent(document, id, shadow_root);
                 }
                 false
             }
@@ -25967,6 +26251,32 @@ fn html_list_ancestry(context:Option<(&Document,NodeId)>)->(usize,bool,bool) {
     (depth,margin_list,item)
 }
 
+/// A parent's `text-align: -webkit-left|right|center` also aligns its
+/// block-level children whose inline margins are both definite, as if the
+/// margin on the opposite side (or both sides) were `auto`. A `justify-self`
+/// other than `normal` takes precedence.
+fn align_block_level_child(style: &mut Style, parent: &Style) {
+    if !matches!(parent.text_align, TextAlign::WebkitLeft | TextAlign::WebkitRight | TextAlign::WebkitCenter)
+        || !matches!(parent.display, Display::Block | Display::FlowRoot | Display::ListItem | Display::TableCell)
+        || parent.writing_mode != WritingMode::HorizontalTb
+        || !matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem | Display::Table)
+        || style.float != Float::None
+        || !matches!(style.position, Position::Static | Position::Relative)
+        || style.margin_auto[1]
+        || style.margin_auto[3]
+        || style.self_alignment(parent, true).keyword != Some(AlignmentKeyword::Normal)
+    {
+        return;
+    }
+    let (left, right) = match parent.text_align {
+        TextAlign::WebkitLeft => (false, true),
+        TextAlign::WebkitRight => (true, false),
+        _ => (true, true),
+    };
+    style.margin_auto[3] = left;
+    style.margin_auto[1] = right;
+}
+
 fn html_flow_list_defaults(kind:&NodeKind,context:Option<(&Document,NodeId)>,parent:Option<&Style>,style:&mut Style,mut provenance:Option<&mut EffectEligibility>)->Option<f32> {
     let NodeKind::Element{namespace:Namespace::Html,name,attributes}=kind else{return None;};
     let tag=crate::svg::local_name(name);
@@ -25978,6 +26288,9 @@ fn html_flow_list_defaults(kind:&NodeKind,context:Option<(&Document,NodeId)>,par
         if let Some(color)=color_with_context("ThreeDFace",style.color) {Value::BorderColor(color).apply(style);}
         Value::IntrinsicSize(91,IntrinsicSizing::MinContent).apply(style);
         if let Some(provenance)=provenance.as_deref_mut(){provenance.ua_override(&[9,10,11,91]);}
+    } else if tag=="iframe" {
+        Value::BorderWidth(2.0).apply(style);Value::BorderStyle(BorderStyle::Inset).apply(style);
+        if let Some(provenance)=provenance.as_deref_mut(){provenance.ua_override(&[9,10]);}
     } else if tag=="legend" {
         style.logical_padding_inline=[Some(2.0);2];
         let align=match context {
@@ -27194,10 +27507,23 @@ fn expanded_custom_text(index: &StyleIndex, raw: &Arc<str>, custom: &Option<Arc<
 /// The declarations `property: raw` parses to once its `var()` references are substituted from
 /// `custom`, with sibling-index functions resolved for `sibling` when given.
 fn deferred_declarations(index: &StyleIndex, property: &Arc<str>, raw: &Arc<str>,
-    custom: &Option<Arc<CustomProperties>>, sibling: Option<(usize, usize)>) -> Arc<[Declaration]> {
+    custom: &Option<Arc<CustomProperties>>, sibling: Option<(usize, usize)>, element: Option<(&Document, NodeId)>) -> Arc<[Declaration]> {
     let known = index.deferred_expansions.borrow_mut().substituted(raw, custom);
     if let Some(declarations) = known.and_then(|entry| entry.declarations(property)) { return declarations; }
     let Some(text) = expanded_custom_text(index, raw, custom) else { return Vec::new().into() };
+    if owner_values::may_use(&text) {
+        let owner = owner_values::Owner { element, property };
+        let Some(substituted) = owner_values::substitute(&text, &owner) else { return Vec::new().into() };
+        let source = match sibling {
+            Some((position, count)) => typed_numeric::substitute_sibling_functions(&substituted, position, count)
+                .map(|(value, _)| value.into_owned()),
+            None => Some(substituted),
+        };
+        return source
+            .and_then(|source| declarations_with_variables(&alloc::format!("{property}:{source}"), 0, false).ok())
+            .unwrap_or_default()
+            .into();
+    }
     let remember = |declarations: &Arc<[Declaration]>| {
         if function_rule::contains_call(raw) { return; }
         index.deferred_expansions.borrow_mut().remember_substituted(raw, custom, Some((property, declarations)));
@@ -27248,7 +27574,7 @@ fn resolve_registered_deferred_slot(index: &StyleIndex, source: &Declaration, sl
         Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => (&group.property, &group.value),
         _ => return source.clone(),
     };
-    deferred_declarations(index, property, raw, custom, None).iter()
+    deferred_declarations(index, property, raw, custom, None, None).iter()
         .find(|declaration| declaration.value.slot() == slot).cloned()
         .unwrap_or(Declaration { value: Value::Default(slot, inherited_property(slot)), important: source.important })
 }
@@ -27954,7 +28280,7 @@ fn html_dimension_hint(raw: &str, nonzero: bool) -> Option<RelativeLength> {
             pixels: value.min(f64::from(f32::MAX)) as f32, percent: 0.0, nonnegative: true,
         },
         lumen_common::html_numbers::Dimension::Percentage(value) => RelativeLength {
-            pixels: 0.0, percent: value.min(f64::from(f32::MAX)) as f32, nonnegative: true,
+            pixels: 0.0, percent: if value == 0.0 { -0.0 } else { value.min(f64::from(f32::MAX)) as f32 }, nonnegative: true,
         },
     })
 }
@@ -27984,22 +28310,26 @@ fn html_presentational_hints(kind: &NodeKind, context: Option<(&Document, NodeId
             if align.eq_ignore_ascii_case("left") { hint(Value::Float(Float::Left)); }
             else if align.eq_ignore_ascii_case("right") { hint(Value::Float(Float::Right)); }
             else {
-                let vertical = if align.eq_ignore_ascii_case("top") { Some(VerticalAlign::Top) }
-                    else if align.eq_ignore_ascii_case("baseline") { Some(VerticalAlign::Baseline) }
-                    else if align.eq_ignore_ascii_case("texttop") { Some(VerticalAlign::TextTop) }
-                    else if align.eq_ignore_ascii_case("absmiddle") || align.eq_ignore_ascii_case("abscenter") { Some(VerticalAlign::Middle) }
-                    else if align.eq_ignore_ascii_case("bottom") { Some(VerticalAlign::Bottom) }
-                    else if align.eq_ignore_ascii_case("center") || align.eq_ignore_ascii_case("middle") {
-                        Some(VerticalAlign::BaselineMiddle)
-                    } else { None };
-                if let Some(vertical) = vertical { hint(Value::VerticalAlign(vertical)); }
+                let keyword = match align.to_ascii_lowercase().as_str() {
+                    "top" => Some("top"),
+                    "baseline" | "bottom" => Some("baseline"),
+                    "texttop" => Some("text-top"),
+                    "absmiddle" | "abscenter" => Some("middle"),
+                    "absbottom" => Some("bottom"),
+                    _ => None,
+                };
+                if let Some(keyword) = keyword {
+                    for value in value_shorthands::shorthand_declarations("vertical-align", keyword).into_iter().flatten() { hint(value); }
+                } else if align.eq_ignore_ascii_case("center") || align.eq_ignore_ascii_case("middle") {
+                    hint(Value::VerticalAlign(VerticalAlign::BaselineMiddle));
+                }
             }
         }
-        if tag != "iframe" {
-            for (attribute, sides) in [("hspace", [1, 3]), ("vspace", [0, 2])] {
-                if let Some(dimension) = html_rendering_attribute(attributes, context, attribute).and_then(|raw| html_dimension_hint(raw, false)) {
-                    for side in sides { hint(Value::HtmlDimension(39 + side, dimension)); }
-                }
+    }
+    if (embedded && tag != "iframe") || tag == "marquee" {
+        for (attribute, sides) in [("hspace", [1, 3]), ("vspace", [0, 2])] {
+            if let Some(dimension) = html_rendering_attribute(attributes, context, attribute).and_then(|raw| html_dimension_hint(raw, false)) {
+                for side in sides { hint(Value::HtmlDimension(39 + side, dimension)); }
             }
         }
     }
@@ -29646,12 +29976,6 @@ fn compute_for_named_registered_inner(
         {
             let tag = crate::svg::local_name(name);
             if *namespace == Namespace::Html {
-                if tag == "center" {
-                    if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[55]);}
-                    style.justify_items = AlignItems::Center;
-                    style.justify_items_keyword = Some(AlignmentKeyword::LegacyCenter);
-                    Value::TextAlign(TextAlign::Center).apply(&mut style);
-                }
                 if matches!(tag, "abbr" | "acronym") && attributes.iter().any(|(name,_)| name == "title") {
                     style.text_decoration = 1;
                     style.text_decoration_style = TextDecorationStyle::Dotted;
@@ -29694,6 +30018,11 @@ fn compute_for_named_registered_inner(
                         Value::FontStyle(FontStyle::Italic).apply(&mut style);
                         if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[131]);}
                     }
+                    "a" | "area" if crate::svg::attribute(attributes, "href").is_some() => {
+                        html_text_ua::link(&mut style, index.environment.color_schemes.page().scheme);
+                    }
+                    "u" | "ins" => html_text_ua::decoration(&mut style, "underline"),
+                    "s" | "strike" | "del" => html_text_ua::decoration(&mut style, "line-through"),
                     "pre" => {Value::WhiteSpace(WhiteSpace::Pre).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[54]);}}
                     "nobr" => {Value::WhiteSpace(WhiteSpace::NoWrap).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[54]);}}
                     "input" => {
@@ -29725,6 +30054,7 @@ fn compute_for_named_registered_inner(
                             size_adjust: None,
                             caps: FontVariantCaps::Normal,
                             synthesize_small_caps: true,
+                            spacing_trim: style.font.spacing_trim,
                         };
                         style.line_height = LineHeight::Normal;
                         style.border_solid = true;
@@ -29775,6 +30105,7 @@ fn compute_for_named_registered_inner(
                             size_adjust: None,
                             caps: FontVariantCaps::Normal,
                             synthesize_small_caps: true,
+                            spacing_trim: style.font.spacing_trim,
                         };
                         style.line_height = LineHeight::Normal;
                         Value::WhiteSpace(WhiteSpace::PreWrap).apply(&mut style);
@@ -29902,6 +30233,7 @@ fn compute_for_named_registered_inner(
                         style.vertical_align = if direct_table { VerticalAlign::Middle }
                             else { parent.map_or(VerticalAlign::Baseline, |parent| parent.vertical_align) };
                     }
+                    "center" => {Value::TextAlign(TextAlign::WebkitCenter).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[55]);}}
                     "caption" => {Value::TextAlign(TextAlign::Center).apply(&mut style);if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[55]);}}
                     _ => {}
                 }
@@ -29914,8 +30246,10 @@ fn compute_for_named_registered_inner(
                     }
                 }
                 for (axis, attribute) in ["width", "height"].iter().enumerate() {
-                    let mapped = if axis == 0 { matches!(tag, "table" | "col" | "td" | "th" | "hr" | "iframe" | "embed" | "object" | "video" | "img") }
-                        else { matches!(tag, "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "iframe" | "embed" | "object" | "video" | "img") };
+                    let image_button = tag == "input" && html_rendering_attribute(attributes, context, "type")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("image"));
+                    let mapped = image_button || if axis == 0 { matches!(tag, "table" | "col" | "td" | "th" | "hr" | "iframe" | "embed" | "object" | "video" | "img" | "marquee") }
+                        else { matches!(tag, "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "iframe" | "embed" | "object" | "video" | "img" | "marquee") };
                     let nonzero = (axis == 0 && tag == "table") || matches!(tag, "td" | "th");
                     if mapped {
                         html_dimensions[axis] = html_rendering_attribute(attributes, if tag=="img"{image_dimensions.or(context)}else{context}, attribute)
@@ -29923,6 +30257,11 @@ fn compute_for_named_registered_inner(
                     }
                 }
                 if let Some(align) = html_rendering_attribute(attributes, context, "align") {
+                    if tag == "div" {
+                        html_text_align_hint = if align.eq_ignore_ascii_case("left") { Some(TextAlign::WebkitLeft) }
+                            else if align.eq_ignore_ascii_case("right") { Some(TextAlign::WebkitRight) }
+                            else if align.eq_ignore_ascii_case("center") { Some(TextAlign::WebkitCenter) } else { None };
+                    }
                     if matches!(tag, "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
                         | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
                         html_text_align_hint = if align.eq_ignore_ascii_case("left") { Some(TextAlign::Left) }
@@ -29964,9 +30303,14 @@ fn compute_for_named_registered_inner(
                 if tag == "dialog"
                     && context.is_some_and(|(document, node)| {
                         !crate::top_layer::dialog_is_open(document, node)
+                            && !(crate::top_layer::popover_mode(document, node).is_some()
+                                && crate::top_layer::matches_popover_open(document, node))
                     })
                 {
                     style.display = Display::None;
+                }
+                if context.is_some_and(|(document, node)| crate::top_layer::popover_mode(document, node).is_some()) {
+                    popover_ua::apply(&mut style, index.environment.color_schemes.page().scheme);
                 }
                 if context.is_some_and(|(document, node)| {
                     crate::top_layer::popover_mode(document, node).is_some()
@@ -30357,7 +30701,7 @@ fn compute_for_named_registered_inner(
                     let parsed = match pending_cache.iter().find(|(key, _)| *key == group_key) {
                         Some((_, parsed)) => parsed.clone(),
                         None => {
-                            let parsed = deferred_declarations(index, &group.property, &group.value, &style.custom, Some(sibling));
+                            let parsed = deferred_declarations(index, &group.property, &group.value, &style.custom, Some(sibling), context);
                             pending_cache.push((group_key, parsed.clone()));
                             parsed
                         }
@@ -30379,7 +30723,7 @@ fn compute_for_named_registered_inner(
                     // Substitution has already processed variable functions.
                     // A quoted literal containing `var(` must now be parsed
                     // as a normal value, rather than deferred a second time.
-                    let parsed = deferred_declarations(index, name, raw, &style.custom, Some(sibling));
+                    let parsed = deferred_declarations(index, name, raw, &style.custom, Some(sibling), context);
                     if parsed.is_empty() {
                         for &slot in slots(name) {
                             emit!(Declaration {
@@ -31296,6 +31640,11 @@ fn compute_for_named_registered_inner(
         // CSS Display3 2.8: the root always has a principal block box
         // when authored contents would otherwise suppress its own box.
         if root && style.display == Display::Contents { style.display = Display::Block; }
+        if style.display == Display::Contents && pseudo_target.is_none() && context.is_some_and(|(document, node)| {
+            matches!(document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if crate::svg::local_name(name) == "input")
+        }) {
+            style.display = Display::None;
+        }
         if positioned || style.float != Float::None || root
             || box_parent.map_or_else(|| parent.is_some_and(|parent| matches!(parent.display, Display::Flex | Display::Grid)), |role| role==BoxParentContext::Item) {
             style.blockify_display();
@@ -31448,6 +31797,9 @@ fn compute_for_named_registered_inner(
         }
     }
     style.apply_content_visibility_containment();
+    if let Some(parent) = parent {
+        align_block_level_child(&mut style, parent);
+    }
     style.refresh_used_source_colors();
     style.refresh_used_shadow_colors();
     style.refresh_current_color_images();
@@ -34155,7 +34507,8 @@ mod tests {
         let rule = invalid_family.to_rule(None);
         assert!(rule.sources.is_empty());
         assert!(rule.identity.is_none());
-        assert!(FontFaceDescriptors::parse("Lato", &[("weight", "1000 300")]).is_err());
+        assert!(FontFaceDescriptors::parse("Lato", &[("weight", "1000 300")]).unwrap().get("weight").is_some());
+        assert!(FontFaceDescriptors::parse("Lato", &[("weight", "bolder")]).is_err());
         assert!(
             FontFaceDescriptors::parse("Lato", &[("variationSettings", "\"wght\" NaN")]).is_err()
         );
@@ -41236,7 +41589,7 @@ mod tests {
         );
         assert_eq!(style.border_color, style.color);
         assert_eq!(color("hsl(from red 120 s l)"), color("lime"));
-        assert_eq!(color("alpha(from blue)"), color("blue"));
+        assert_eq!(color("alpha(from blue / alpha)"), color("blue"));
         assert_eq!(color("light-dark(red, blue)"), color("red"));
         assert_eq!(color("contrast-color(white)"), color("black"));
         assert_eq!(color("hwb(from red 120 w b / alpha)"), color("lime"));

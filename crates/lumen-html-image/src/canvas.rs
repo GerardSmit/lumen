@@ -151,6 +151,11 @@ pub enum CanvasGradientKind {
         end_radius: f32,
         transform: Transform,
     },
+    Conic {
+        center: [f32; 2],
+        start_angle: f32,
+        transform: Transform,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -263,6 +268,12 @@ impl CanvasGradient {
             return Ok(Some(Shader::SolidColor(Color::from_rgba8(0,0,0,0))));
         }
         let shader=match self.kind {
+            CanvasGradientKind::Linear { start, end, .. } if start == end => {
+                return Ok(Some(Shader::SolidColor(Color::from_rgba8(0,0,0,0))));
+            }
+            CanvasGradientKind::Conic { .. } => {
+                return Ok(Some(Shader::SolidColor(Color::from_rgba8(0,0,0,0))));
+            }
             CanvasGradientKind::Linear {
                 start,
                 end,
@@ -326,19 +337,12 @@ impl CanvasGradient {
         self.equal_radial_bitmap_with_budget(width,height,None).ok().flatten()
     }
     fn equal_radial_bitmap_with_budget(&self,width:u32,height:u32,budget:Option<usize>)->Result<Option<Pixmap>,ImageError> {
-        let CanvasGradientKind::Radial {
-            start,
-            end,
-            start_radius,
-            end_radius,
-            transform,
-        } = &self.kind
-        else {
-            return Ok(None);
+        let transform = match &self.kind {
+            CanvasGradientKind::Radial { start_radius, end_radius, transform, .. }
+                if start_radius == end_radius => transform,
+            CanvasGradientKind::Conic { transform, .. } => transform,
+            _ => return Ok(None),
         };
-        if start_radius != end_radius {
-            return Ok(None);
-        }
         let Some(inverse)=transform.invert()else{return Ok(None);};
         let image_bytes=(width as usize).checked_mul(height as usize).and_then(|pixels|pixels.checked_mul(4)).ok_or(ImageError::TooLarge)?;
         let lookup_width=4096u32;let lookup_bytes=lookup_width as usize*4;
@@ -365,33 +369,50 @@ impl CanvasGradient {
         }else{lookup.fill_rect(rect,&paint,Transform::identity(),None);}
         drop(paint);
         let mut image=Pixmap::new(width,height).ok_or(ImageError::TooLarge)?;
-        let dx = end[0] - start[0];
-        let dy = end[1] - start[1];
-        let a = dx * dx + dy * dy;
-        if *start_radius == 0.0 || a <= f32::EPSILON {
-            return Ok(Some(image));
-        }
-        let radius_squared = *start_radius * *start_radius;
-        for y in 0..height {
-            for x in 0..width {
-                let mut point = Point::from_xy(x as f32 + 0.5, y as f32 + 0.5);
-                inverse.map_point(&mut point);
-                let qx = point.x - start[0];
-                let qy = point.y - start[1];
-                let b = -2.0 * (qx * dx + qy * dy);
-                let c = qx * qx + qy * qy - radius_squared;
-                let discriminant = b * b - 4.0 * a * c;
-                if !discriminant.is_finite() || discriminant < 0.0 {
-                    continue;
+        let lookup_at = |t: f32| lookup.pixels()[(t.clamp(0.0, 1.0) * (lookup_width - 1) as f32).round() as usize];
+        match &self.kind {
+            CanvasGradientKind::Conic { center, start_angle, .. } => {
+                for y in 0..height {
+                    for x in 0..width {
+                        let mut point = Point::from_xy(x as f32 + 0.5, y as f32 + 0.5);
+                        inverse.map_point(&mut point);
+                        let angle = (point.y - center[1]).atan2(point.x - center[0]) - start_angle;
+                        let t = angle.rem_euclid(core::f32::consts::TAU) / core::f32::consts::TAU;
+                        image.pixels_mut()[y as usize * width as usize + x as usize] = lookup_at(t);
+                    }
                 }
-                let t = (-b + discriminant.sqrt()) / (2.0 * a);
-                if !t.is_finite() || t < 0.0 {
-                    continue;
-                }
-                let index = (t.clamp(0.0, 1.0) * (lookup_width - 1) as f32).round() as u32;
-                let source = lookup.pixels()[index as usize];
-                image.pixels_mut()[y as usize * width as usize + x as usize] = source;
             }
+            CanvasGradientKind::Radial { start, end, start_radius, .. } => {
+                let dx = end[0] - start[0];
+                let dy = end[1] - start[1];
+                let a = dx * dx + dy * dy;
+                if *start_radius == 0.0 || a <= f32::EPSILON {
+                    return Ok(Some(image));
+                }
+                let radius_squared = *start_radius * *start_radius;
+                for y in 0..height {
+                    for x in 0..width {
+                        let mut point = Point::from_xy(x as f32 + 0.5, y as f32 + 0.5);
+                        inverse.map_point(&mut point);
+                        let qx = point.x - start[0];
+                        let qy = point.y - start[1];
+                        let b = -2.0 * (qx * dx + qy * dy);
+                        let c = qx * qx + qy * qy - radius_squared;
+                        let discriminant = b * b - 4.0 * a * c;
+                        if !discriminant.is_finite() || discriminant < 0.0 {
+                            continue;
+                        }
+                        let t = (-b + discriminant.sqrt()) / (2.0 * a);
+                        if !t.is_finite() || t < 0.0 {
+                            continue;
+                        }
+                        let index = (t.clamp(0.0, 1.0) * (lookup_width - 1) as f32).round() as u32;
+                        let source = lookup.pixels()[index as usize];
+                        image.pixels_mut()[y as usize * width as usize + x as usize] = source;
+                    }
+                }
+            }
+            _ => return Ok(None),
         }
         Ok(Some(image))
     }
@@ -406,6 +427,11 @@ pub struct DrawingState {
     pub blend: BlendMode,
     pub line: Stroke,
     pub miter_limit: f64,
+    pub line_dash: Vec<f32>,
+    pub line_dash_offset: f64,
+    pub image_smoothing: bool,
+    pub smoothing_quality: SmoothingQuality,
+    pub shadow_blend: Option<BlendMode>,
     pub shadow_color: [u8; 4],
     pub shadow_blur: f64,
     pub shadow_offset_x: f64,
@@ -415,6 +441,39 @@ pub struct DrawingState {
     pub fill_pattern: Option<Box<CanvasPattern>>,
     pub stroke_pattern: Option<Box<CanvasPattern>>,
     clip: Option<std::sync::Arc<Mask>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothingQuality {
+    Low,
+    Medium,
+    High,
+}
+
+impl DrawingState {
+    pub fn image_filter_quality(&self) -> FilterQuality {
+        match (self.image_smoothing, self.smoothing_quality) {
+            (false, _) => FilterQuality::Nearest,
+            (true, SmoothingQuality::High) => FilterQuality::Bicubic,
+            (true, _) => FilterQuality::Bilinear,
+        }
+    }
+
+    /// Stores the (already even-length) dash pattern and rebuilds the stroker's dash.
+    pub fn set_line_dash(&mut self, pattern: Vec<f32>) {
+        self.line_dash = pattern;
+        self.apply_line_dash();
+    }
+
+    pub fn set_line_dash_offset(&mut self, offset: f64) {
+        self.line_dash_offset = offset;
+        self.apply_line_dash();
+    }
+
+    fn apply_line_dash(&mut self) {
+        self.line.dash =
+            tiny_skia::StrokeDash::new(self.line_dash.clone(), self.line_dash_offset as f32);
+    }
 }
 
 impl Default for DrawingState {
@@ -431,6 +490,11 @@ impl Default for DrawingState {
                 ..Stroke::default()
             },
             miter_limit: 10.0,
+            line_dash: Vec::new(),
+            line_dash_offset: 0.0,
+            image_smoothing: true,
+            smoothing_quality: SmoothingQuality::Low,
+            shadow_blend: None,
             shadow_color: [0, 0, 0, 0],
             shadow_blur: 0.0,
             shadow_offset_x: 0.0,
@@ -464,7 +528,10 @@ where
         || (state.shadow_blur == 0.0
             && state.shadow_offset_x == 0.0
             && state.shadow_offset_y == 0.0)
-        || matches!(state.blend, BlendMode::Clear | BlendMode::Source)
+        || matches!(
+            state.shadow_blend.unwrap_or(state.blend),
+            BlendMode::Clear | BlendMode::Source
+        )
     {
         return Ok(());
     }
@@ -561,7 +628,7 @@ where
     }
     if let Some(bitmap) = bitmap.as_mut() {
         let paint = PixmapPaint {
-            blend_mode: state.blend,
+            blend_mode: state.shadow_blend.unwrap_or(state.blend),
             quality: FilterQuality::Nearest,
             ..PixmapPaint::default()
         };
@@ -1048,6 +1115,16 @@ impl CanvasSurface {
         Ok(())
     }
 
+    pub fn has_open_layers(&self) -> bool {
+        !self.layers.is_empty()
+    }
+    pub fn restore_crosses_layer(&self) -> bool {
+        self.layers.last().is_some_and(|layer| self.saved.len() <= layer.saved_depth)
+    }
+    pub fn layer_has_unmatched_save(&self) -> bool {
+        self.layers.last().is_some_and(|layer| self.saved.len() > layer.saved_depth)
+    }
+
     pub fn save(&mut self) {
         self.saved.push(self.state.clone());
     }
@@ -1084,6 +1161,84 @@ impl CanvasSurface {
         self.state.blend = BlendMode::SourceOver;
         self.state.shadow_color = [0, 0, 0, 0];
         Ok(())
+    }
+
+    fn unbounded_blend(&self) -> bool {
+        matches!(
+            self.state.blend,
+            BlendMode::Source
+                | BlendMode::SourceIn
+                | BlendMode::SourceOut
+                | BlendMode::DestinationIn
+                | BlendMode::DestinationAtop
+        )
+    }
+
+    /// Operators whose result depends on the source even where it is transparent
+    /// affect the whole clip region: draw the shape into an empty layer, then
+    /// composite that layer over the entire canvas.
+    fn composite_unbounded<R>(
+        &mut self,
+        mut draw: impl FnMut(&mut Self) -> Result<R, ImageError>,
+    ) -> Result<R, ImageError> {
+        self.materialize()?;
+        let blend = self.state.blend;
+        let shadow_active = self.state.shadow_color[3] != 0
+            && (self.state.shadow_blur != 0.0
+                || self.state.shadow_offset_x != 0.0
+                || self.state.shadow_offset_y != 0.0)
+            && blend != BlendMode::Source;
+        if !shadow_active {
+            return self.composite_unbounded_layer(blend, &mut draw);
+        }
+        self.state.blend = BlendMode::Destination;
+        self.state.shadow_blend = Some(BlendMode::SourceOver);
+        let shadow = self.composite_unbounded_layer(blend, &mut draw);
+        self.state.blend = blend;
+        self.state.shadow_blend = None;
+        shadow?;
+        let saved_shadow = self.state.shadow_color;
+        self.state.shadow_color = [0, 0, 0, 0];
+        let result = self.composite_unbounded_layer(blend, &mut draw);
+        self.state.shadow_color = saved_shadow;
+        result
+    }
+
+    fn composite_unbounded_layer<R>(
+        &mut self,
+        blend: BlendMode,
+        draw: &mut impl FnMut(&mut Self) -> Result<R, ImageError>,
+    ) -> Result<R, ImageError> {
+        let draw_blend = self.state.blend;
+        let layer = allocate(self.width, self.height)?;
+        let target = std::mem::replace(&mut self.bitmap, layer);
+        let clip = self.state.clip.take();
+        if draw_blend != BlendMode::Destination {
+            self.state.blend = BlendMode::SourceOver;
+        }
+        self.frozen = None;
+        let result = draw(self);
+        self.state.blend = draw_blend;
+        self.state.clip = clip;
+        self.frozen = None;
+        let layer = std::mem::replace(&mut self.bitmap, target);
+        if let (Some(target), Some(layer)) = (&mut self.bitmap, layer) {
+            let paint = tiny_skia::PixmapPaint {
+                opacity: 1.0,
+                blend_mode: blend,
+                quality: FilterQuality::Nearest,
+            };
+            target.draw_pixmap(
+                0,
+                0,
+                layer.as_ref(),
+                &paint,
+                Transform::identity(),
+                self.state.clip.as_deref(),
+            );
+            self.changed();
+        }
+        result
     }
 
     /// Composite a completed layer once with its entry alpha and blend mode,
@@ -1257,6 +1412,9 @@ impl CanvasSurface {
         width: f32,
         height: f32,
     ) -> Result<(), ImageError> {
+        if self.unbounded_blend() {
+            return self.composite_unbounded(|surface| surface.draw_pixmap_source(source, x, y, width, height));
+        }
         self.materialize()?;
         let sx = width / source.width() as f32;
         let sy = height / source.height() as f32;
@@ -1302,7 +1460,7 @@ impl CanvasSurface {
         let paint = PixmapPaint {
             opacity: self.state.alpha,
             blend_mode: self.state.blend,
-            quality: FilterQuality::Bilinear,
+            quality: self.state.image_filter_quality(),
         };
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.draw_pixmap(
@@ -1400,6 +1558,11 @@ impl CanvasSurface {
         options: &CanvasTextOptions,
     ) -> Result<f32, ImageError> {
         self.flush();
+        if self.unbounded_blend() {
+            return self.composite_unbounded(|surface| {
+                surface.fill_text(font, text, size, font_spec, rtl, x, scale_anchor_x, baseline_y, max_width, options)
+            });
+        }
         if !x.is_finite() || !baseline_y.is_finite() || !size.is_finite() || size <= 0.0 {
             return Ok(0.0);
         }
@@ -1609,6 +1772,11 @@ impl CanvasSurface {
         options: &CanvasTextOptions,
     ) -> Result<f32, ImageError> {
         self.flush();
+        if self.unbounded_blend() {
+            return self.composite_unbounded(|surface| {
+                surface.stroke_text(font, text, size, font_spec, rtl, origin_x, scale_anchor_x, baseline_y, max_width, options)
+            });
+        }
         if !origin_x.is_finite() || !baseline_y.is_finite() || !size.is_finite() || size <= 0.0 {
             return Ok(0.0);
         }
@@ -1762,6 +1930,9 @@ impl CanvasSurface {
         let Some(rect) = rectangle(x, y, width, height) else {
             return Ok(());
         };
+        if !clear && self.unbounded_blend() {
+            return self.composite_unbounded(|surface| surface.rect(x, y, width, height, false));
+        }
         if clear && self.lazy && self.alias.is_none() {
             self.changed();
             return Ok(());
@@ -1850,6 +2021,9 @@ impl CanvasSurface {
     }
 
     fn fill_path_now(&mut self, path: &Path, rule: FillRule) -> Result<(), ImageError> {
+        if self.unbounded_blend() {
+            return self.composite_unbounded(|surface| surface.fill_path_now(path, rule));
+        }
         self.materialize()?;
         let gradient_image = self
             .state
@@ -1918,6 +2092,9 @@ impl CanvasSurface {
     }
 
     fn stroke_path_now(&mut self, path: &Path) -> Result<(), ImageError> {
+        if self.unbounded_blend() {
+            return self.composite_unbounded(|surface| surface.stroke_path_now(path));
+        }
         self.materialize()?;
         let gradient_image = self
             .state

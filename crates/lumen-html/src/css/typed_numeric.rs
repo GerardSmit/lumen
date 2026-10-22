@@ -1096,6 +1096,24 @@ struct NumericExpressionParser<'a, 'b, B> {
 }
 
 impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
+    /// Consumes a `none` bound of `clamp()` when it stands alone as an argument.
+    fn clamp_bound_none(&mut self) -> bool {
+        self.space();
+        let rest = &self.input.as_bytes()[self.position..];
+        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case(b"none") {
+            return false;
+        }
+        let mut end = self.position + 4;
+        while self.input.as_bytes().get(end).is_some_and(|byte| is_css_whitespace(*byte)) {
+            end += 1;
+        }
+        if !matches!(self.input.as_bytes().get(end), Some(b',' | b')')) {
+            return false;
+        }
+        self.position += 4;
+        true
+    }
+
     fn space(&mut self) {
         loop {
             while self.input.as_bytes().get(self.position).is_some_and(|byte| matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')) { self.position += 1; }
@@ -1317,7 +1335,7 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
                     }
                 }
                 if kind == 3 {
-                    let lower = self.sum(depth + 1)?;
+                    let lower = if self.clamp_bound_none() { None } else { Some(self.sum(depth + 1)?) };
                     self.space();
                     if self.input.as_bytes().get(self.position) != Some(&b',') {
                         return None;
@@ -1329,14 +1347,27 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
                         return None;
                     }
                     self.position += 1;
-                    let upper = self.sum(depth + 1)?;
+                    let upper = if self.clamp_bound_none() { None } else { Some(self.sum(depth + 1)?) };
                     self.space();
                     if self.input.as_bytes().get(self.position) != Some(&b')') {
                         return None;
                     }
                     self.position += 1;
                     self.count_node()?;
-                    return self.builder.clamp(lower, value, upper);
+                    return match (lower, upper) {
+                        (Some(lower), Some(upper)) => self.builder.clamp(lower, value, upper),
+                        (Some(bound), None) => {
+                            let mut values = self.builder.begin_max(bound)?;
+                            self.builder.push_max(&mut values, value)?;
+                            self.builder.finish_max(values)
+                        }
+                        (None, Some(bound)) => {
+                            let mut values = self.builder.begin_min(value)?;
+                            self.builder.push_min(&mut values, bound)?;
+                            self.builder.finish_min(values)
+                        }
+                        (None, None) => Some(value),
+                    };
                 }
                 if kind == 4 {
                     self.builder.begin_sign_input();
@@ -1375,7 +1406,7 @@ impl<B: NumericExpressionBuilder> NumericExpressionParser<'_, '_, B> {
             self.position=self.position.checked_add(consumed)?;
             self.count_node()?;
             if depth>0 {
-                let constant=match name.to_ascii_lowercase().as_str(){"infinity"=>Some(f64::INFINITY),"-infinity"=>Some(f64::NEG_INFINITY),"nan"=>Some(f64::NAN),_=>None};
+                let constant=match name.to_ascii_lowercase().as_str(){"infinity"=>Some(f64::INFINITY),"-infinity"=>Some(f64::NEG_INFINITY),"nan"=>Some(f64::NAN),"e"=>Some(core::f64::consts::E),"pi"=>Some(core::f64::consts::PI),_=>None};
                 if let Some(value)=constant{return self.builder.value(NumericValue{value,unit:NumericUnit::Number});}
             }
             return self.builder.identifier(&name);

@@ -219,8 +219,8 @@ fn construct(ctx: &mut Ctx, family: Family, channels: [Value; 3], alpha: Option<
 }
 
 fn set_channel(ctx: &mut Ctx, this: &Value, name: &str, channel: Channel, value: Value) -> OpResult<()> {
-    let value = coerce(ctx, &value, channel)?;
     let object = data(ctx, this)?;
+    let value = coerce(ctx, &value, channel)?;
     ctx.create_data_property(&object, name, value).map_err(OpError::thrown)?;
     refresh(ctx, this)
 }

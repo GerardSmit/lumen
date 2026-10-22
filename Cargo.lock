@@ -1542,6 +1542,7 @@ dependencies = [
  "lumen-html",
  "read-fonts",
  "rustybuzz",
+ "tiny-skia",
  "ttf-parser",
 ]
 

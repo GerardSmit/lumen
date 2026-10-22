@@ -307,6 +307,7 @@ fn this_sum(ctx: &mut Ctx, this: &Value) -> OpResult<Vec<SumItem>> {
 }
 
 pub(super) fn to(ctx: &mut Ctx, this: &Value, unit: &str) -> OpResult<Value> {
+    ctx.with_instance::<DomCssNumericValue, _>(this, |_| ())?;
     let target = parse_unit(ctx, unit)?;
     let items = this_sum(ctx, this)?;
     let [item] = items.as_slice() else {
@@ -318,6 +319,7 @@ pub(super) fn to(ctx: &mut Ctx, this: &Value, unit: &str) -> OpResult<Value> {
 }
 
 pub(super) fn to_sum(ctx: &mut Ctx, this: &Value, units: Vec<String>) -> OpResult<Value> {
+    ctx.with_instance::<DomCssNumericValue, _>(this, |_| ())?;
     let mut targets = Vec::with_capacity(units.len());
     for unit in &units {
         targets.push(parse_unit(ctx, unit)?);

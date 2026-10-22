@@ -29,8 +29,7 @@ fn keyword(token: &str, values: &'static [&'static str]) -> Option<&'static str>
 }
 
 /// A borrowed processing result. Parsing allocates nothing and retains no DOM
-/// state. Field and credential spelling follow the processing algorithm; only
-/// section, contact and address prefixes are normalized in exposed strings.
+/// state. Exposed strings are ASCII-lowercased; `field_name` keeps the authored spelling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Autofill<'a> {
     pub field_name: &'a str,
@@ -54,11 +53,10 @@ impl Autofill<'_> {
         let count=tokens.iter().flatten().count();
         let bytes=tokens.iter().flatten().map(|token|token.len()).sum::<usize>()+count.saturating_sub(1);
         let mut value=String::with_capacity(bytes);
-        for (index,token) in tokens.into_iter().enumerate() {
+        for token in tokens {
             let Some(token)=token else {continue};
             if !value.is_empty(){value.push(' ');}
-            if index==0 {value.extend(token.chars().map(|character|character.to_ascii_lowercase()));}
-            else {value.push_str(token);}
+            value.extend(token.chars().map(|character|character.to_ascii_lowercase()));
         }
         value
     }
@@ -113,13 +111,13 @@ mod tests {
     #[test]
     fn specification_autofill_order_case_mantles_and_default_fields() {
         let result=parse(Some("  SECTION-ÄBC\tBILLING\nWORK\remail\x0cWebAuthn "),false,false);
-        assert_eq!(result.idl_value(),"section-Äbc billing work email WebAuthn");
+        assert_eq!(result.idl_value(),"section-Äbc billing work email webauthn");
         assert_eq!(result.scope(),"section-Äbc billing work");
         assert_eq!(result.field_name,"WebAuthn");
         assert_eq!(result.credential_type,Some("webauthn"));
-        assert_eq!(parse(Some("NaMe"),false,false).idl_value(),"NaMe");
+        assert_eq!(parse(Some("NaMe"),false,false).idl_value(),"name");
         assert_eq!(parse(Some("OFF"),false,false).idl_value(),"off");
-        assert_eq!(parse(Some("WebAuthn"),true,true).idl_value(),"WebAuthn");
+        assert_eq!(parse(Some("WebAuthn"),true,true).idl_value(),"webauthn");
         for raw in ["home name","shipping section-a email","section-a home shipping tel",
             "section-a billing work home tel","name off","on webauthn","home webauthn",
             "section-a email webauthn webauthn","section-a section-b email","email\u{a0}","email\x0b"] {

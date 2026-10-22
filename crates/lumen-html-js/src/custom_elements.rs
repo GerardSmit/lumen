@@ -647,7 +647,7 @@ impl<'a> lumen_bind::FromArg<'a,JsHost> for AriaStringArgument {
         cx.before_js();cx.with_ctx(|ctx|ctx.coerce_string(value).map(|value|Self(Some(value.to_string()))))
     }
 }
-struct AriaElementArgument(Option<Vec<Value>>);
+pub(crate) struct AriaElementArgument(pub(crate) Option<Vec<Value>>);
 impl<'a> lumen_bind::FromArg<'a,JsHost> for AriaElementArgument {
     fn from_arg(cx:&'a lumen::embed::ArgCx<'_>,value:&'a Value,_:lumen_bind::Slot)->Result<Self,Value>{
         if matches!(value,Value::Null|Value::Undefined){return Ok(Self(None));}
@@ -655,7 +655,7 @@ impl<'a> lumen_bind::FromArg<'a,JsHost> for AriaElementArgument {
         Ok(Self(Some(vec![value.clone()])))
     }
 }
-struct AriaElementsArgument(Option<Vec<Value>>);
+pub(crate) struct AriaElementsArgument(pub(crate) Option<Vec<Value>>);
 impl<'a> lumen_bind::FromArg<'a,JsHost> for AriaElementsArgument {
     fn from_arg(cx:&'a lumen::embed::ArgCx<'_>,value:&'a Value,_:lumen_bind::Slot)->Result<Self,Value>{
         if matches!(value,Value::Null|Value::Undefined){return Ok(Self(None));}
@@ -667,11 +667,48 @@ impl<'a> lumen_bind::FromArg<'a,JsHost> for AriaElementsArgument {
         })
     }
 }
+const ARIA_ENUMS:&[(&str,&[&str],Option<&str>)]=&[
+    ("aria-atomic",&["true","false"],Some("false")),
+    ("aria-autocomplete",&["inline","list","both","none"],Some("none")),
+    ("aria-busy",&["true","false"],Some("false")),
+    ("aria-checked",&["true","false","mixed"],None),
+    ("aria-current",&["page","step","location","date","time","true","false"],Some("true")),
+    ("aria-disabled",&["true","false"],Some("false")),
+    ("aria-expanded",&["true","false"],None),
+    ("aria-haspopup",&["true","false","menu","dialog","listbox","tree","grid"],Some("false")),
+    ("aria-hidden",&["true","false"],Some("false")),
+    ("aria-invalid",&["true","false","spelling","grammar"],Some("true")),
+    ("aria-live",&["polite","assertive","off"],Some("off")),
+    ("aria-modal",&["true","false"],Some("false")),
+    ("aria-multiline",&["true","false"],Some("false")),
+    ("aria-multiselectable",&["true","false"],Some("false")),
+    ("aria-orientation",&["horizontal","vertical"],None),
+    ("aria-pressed",&["true","false","mixed"],None),
+    ("aria-readonly",&["true","false"],Some("false")),
+    ("aria-required",&["true","false"],Some("false")),
+    ("aria-selected",&["true","false"],None),
+    ("aria-sort",&["ascending","descending","other","none"],Some("none")),
+];
+pub(crate) fn aria_enum_canonical(attribute:&str,value:Option<String>)->Option<String> {
+    let Some((_,keywords,invalid))=ARIA_ENUMS.iter().find(|entry|entry.0==attribute) else{return value;};
+    let value=value?;
+    match keywords.iter().find(|keyword|keyword.eq_ignore_ascii_case(&value)) {
+        Some(keyword)=>Some((*keyword).to_owned()),
+        None=>invalid.map(str::to_owned),
+    }
+}
+fn aria_enum_value(value:Value,attribute:&str)->Value {
+    if !ARIA_ENUMS.iter().any(|entry|entry.0==attribute){return value;}
+    match value {
+        Value::Str(text)=>aria_enum_canonical(attribute,Some(text.as_str().to_owned())).map_or(Value::Null,Value::from_string),
+        other=>other,
+    }
+}
 macro_rules! aria_properties {
     ($d:tt; strings[$(($getter:ident,$setter:ident,$idl:literal,$attribute:literal)),* $(,)?]; references[$(($rg:ident,$rs:ident,$rid:literal,$ra:literal,$argument:ty)),* $(,)?]; internals{$($internals:tt)*})=>{
         #[lumen_bind::methods]
         impl DomElementInternals {
-            $(#[getter(name=$idl)] fn $getter(&self)->Value {self.aria_value($attribute)}
+            $(#[getter(name=$idl)] fn $getter(&self)->Value {aria_enum_value(self.aria_value($attribute),$attribute)}
               #[setter(name=$idl)] fn $setter(&self,value:AriaStringArgument)->OpResult<()> {self.set_aria_value($attribute,value.0.map(Value::from_string))})*
             $(#[getter(name=$rid)] fn $rg(&self,ctx:&mut Ctx)->OpResult<Value> {self.aria_reference_value(ctx,$ra,stringify!($argument)=="AriaElementsArgument")}
               #[setter(name=$rid)] fn $rs(&self,ctx:&mut Ctx,value:$argument)->OpResult<()> {self.set_aria_reference(ctx,$ra,value.0)})*
@@ -681,7 +718,7 @@ macro_rules! aria_properties {
             ($d($d base:tt)*)=>{
                 #[lumen_bind::methods]
                 impl DomElement {
-                    $(#[getter(name=$idl)] fn $getter(&self)->OpResult<Nullable<String>> {self.base.get_attribute($attribute)}
+                    $(#[getter(name=$idl)] fn $getter(&self)->OpResult<Nullable<String>> {self.base.get_attribute($attribute).map(|value|Nullable(custom_elements::aria_enum_canonical($attribute,value.0)))}
                       #[setter(name=$idl,hint(js(ce_reactions)))] fn $setter(&self,ctx:&mut Ctx,value:custom_elements::AriaStringArgument)->OpResult<()> {
                         if let Some(value)=value.0 {self.base.set_attribute(ctx,$attribute,&value)}else{self.base.remove_attribute(ctx,$attribute)}
                       })*
@@ -3926,14 +3963,16 @@ mod tests {
             require(derived instanceof DerivedImage && derived instanceof HTMLImageElement && derived.width===7,'factory-new-target');
             derived.id='factory-image';document.querySelector('main').appendChild(derived);
             require(document.getElementById('factory-image')===derived,'factory-identity');
-            var audio=new Audio('tone.wav'), audioCalled=Audio(), audioEmpty=Audio('');
+            var audio=new Audio('tone.wav'), audioCalled=new Audio(), audioEmpty=new Audio('');
+            var audioCallThrows=false;try{Audio()}catch(e){audioCallThrows=e instanceof TypeError}
+            require(audioCallThrows,'audio-call-throws');
             require(audio instanceof HTMLAudioElement && audio instanceof HTMLMediaElement && audio.getAttribute('src')==='tone.wav' && audio.getAttribute('preload')==='auto','audio-source');
             require(!audioCalled.hasAttribute('src') && audioEmpty.getAttribute('src')==='','audio-optional');
             class DerivedAudio extends Audio {}
             var derivedAudio=new DerivedAudio('other.wav');
             require(derivedAudio instanceof DerivedAudio && derivedAudio instanceof HTMLAudioElement,'audio-new-target');
             var relevantDocument=document;globalThis.document=null;
-            var relevantImage=Image(), relevantAudio=Audio();globalThis.document=relevantDocument;
+            var relevantImage=Image(), relevantAudio=new Audio();globalThis.document=relevantDocument;
             require(relevantImage.ownerDocument===relevantDocument && relevantAudio.ownerDocument===relevantDocument,'factory-relevant-document');
             var foreignImage=Reflect.construct(Image,[],foreignFactoryTarget);
             var foreignAudio=Reflect.construct(Audio,[],foreignFactoryTarget);

@@ -59,7 +59,7 @@ fn forms_batch69_name_button_textarea_object_and_select_reflection() {
             const textarea = document.getElementById('ta');
             check(textarea.type === 'textarea' && textarea.maxLength === -1 &&
                 textarea.minLength === -1, 'textarea-type-and-limit-defaults');
-            check(textarea.rows === 2 && textarea.cols === 20 && textarea.wrap === 'soft',
+            check(textarea.rows === 2 && textarea.cols === 20 && textarea.wrap === 'off',
                 'textarea-size-and-wrap-normalization');
             textarea.value = 'A😀';
             check(textarea.textLength === 3, 'textarea-text-length-utf16');

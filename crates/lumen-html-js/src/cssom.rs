@@ -6,6 +6,8 @@
 use super::*;
 #[path="cssom_font_features.rs"]
 mod font_features;
+#[path="cssom_font_palette.rs"]
+mod font_palette;
 #[path="cssom_transforms.rs"]
 mod transforms;
 #[path="cssom_numeric_ops.rs"]
@@ -475,6 +477,15 @@ fn style_values_from_text(
     if property=="transform" && !has_variable_component(&components) && !css_identifier_value(css_text.trim()).is_some_and(|keyword|matches!(keyword.to_ascii_lowercase().as_str(),"none"|"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
         return Ok(vec![transforms::parse(ctx,css_text)?]);
     }
+    let range_clamped;
+    let css_text = if !css::supports_declaration(&property, css_text) && !css_text.trim_start().starts_with("calc(")
+        && !is_plain_negative_literal(css_text)
+        && css::supports_declaration(&property, &format!("calc({})", css_text.trim())) {
+        range_clamped = format!("calc({})", css_text.trim());
+        range_clamped.as_str()
+    } else {
+        css_text
+    };
     if !css::supports_declaration(&property, css_text) {
         return Err(OpError::type_error(
             "CSS text is invalid for the requested property",
@@ -501,7 +512,75 @@ fn style_values_from_text(
     Ok(values)
 }
 
+/// A negative literal without an exponent is out of range for the property,
+/// unlike an overflowing literal, which clamps like a math function result.
+fn is_plain_negative_literal(css_text: &str) -> bool {
+    let Some(rest) = css_text.trim().strip_prefix('-') else { return false; };
+    let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    let has_number = digits.len() < rest.len();
+    let exponent = digits.strip_prefix(['e', 'E']).is_some_and(|tail| {
+        let tail = tail.strip_prefix(['+', '-']).unwrap_or(tail);
+        tail.starts_with(|c: char| c.is_ascii_digit())
+    });
+    has_number && !exponent
+}
+
+const PAIR_SHORTHANDS: [&str; 18] = [
+    "margin-block", "margin-inline", "padding-block", "padding-inline", "inset-block", "inset-inline",
+    "border-block-width", "border-inline-width", "border-block-style", "border-inline-style",
+    "border-block-color", "border-inline-color", "scroll-margin-block", "scroll-margin-inline",
+    "scroll-padding-block", "scroll-padding-inline", "overflow-clip-margin-block", "overflow-clip-margin-inline",
+];
+
+/// A logical pair shorthand written with a single component sets both sides to
+/// the same value and reifies like its first longhand.
+fn pair_shorthand_longhand(property: &str, css_text: &str) -> Option<String> {
+    if !PAIR_SHORTHANDS.contains(&property) || css::top_level_component_count(css_text.trim())? != 1 {
+        return None;
+    }
+    match property.rsplit_once('-') {
+        Some((head, tail @ ("width" | "style" | "color"))) if property.starts_with("border-") => Some(format!("{head}-start-{tail}")),
+        _ => Some(format!("{property}-start")),
+    }
+}
+
+/// Computed values the Typed OM cannot reify as a single value.
+fn computed_unsupported(property: &str) -> bool {
+    matches!(property, "border-image-outset" | "border-image-width" | "border-image-slice" | "column-rule-width")
+        || matches!(property, "border-top-left-radius" | "border-top-right-radius" | "border-bottom-left-radius" | "border-bottom-right-radius")
+}
+
+/// Identifiers that are keywords of the property's grammar only through a
+/// custom-ident production reify as unsupported values.
+fn custom_ident_unsupported(property: &str, keyword: &str) -> bool {
+    if matches!(keyword.to_ascii_lowercase().as_str(), "initial" | "inherit" | "unset" | "revert" | "revert-layer") {
+        return false;
+    }
+    if keyword.eq_ignore_ascii_case("none") && matches!(property, "counter-reset" | "counter-set" | "counter-increment" | "transition-property") {
+        return false;
+    }
+    match property {
+        "font-family" | "counter-reset" | "counter-set" | "counter-increment" | "transition-property" => true,
+        "font-palette" => !matches!(keyword.to_ascii_lowercase().as_str(), "normal" | "light" | "dark"),
+        "grid-row-start" | "grid-row-end" | "grid-column-start" | "grid-column-end" => !keyword.eq_ignore_ascii_case("auto"),
+        _ => false,
+    }
+}
+
+fn named_color_keyword(property: &str, keyword: &str) -> bool {
+    !keyword.eq_ignore_ascii_case("currentcolor") && css::supports_declaration("color", keyword) && css::supports_declaration(property, "#000")
+}
+
 fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> OpResult<Value> {
+    if let Some(longhand) = pair_shorthand_longhand(property, css_text) {
+        return style_value_from_iteration(ctx, &longhand, css_text);
+    }
+    if matches!(property, "grid-row-start" | "grid-row-end" | "grid-column-start" | "grid-column-end")
+        && css_identifier_value(css_text.trim()).is_none_or(|keyword| custom_ident_unsupported(property, &keyword)) {
+        return Ok(ctx.new_instance(DomCssStyleValue {
+            serialized_value: RefCell::new(css::serialize_cssom_property_value(property, css_text).unwrap_or_else(|| css_text.trim().to_owned())),
+        }));
+    }
     if css::declaration_block::is_shorthand(property) {
         if let Some(keyword)=css_identifier_value(css_text.trim()).filter(|keyword|
             matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
@@ -523,7 +602,8 @@ fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> 
     }
     if let Some(value) = css_identifier_value(css_text.trim()) {
         let wide = matches!(value.to_ascii_lowercase().as_str(), "initial" | "inherit" | "unset" | "revert" | "revert-layer");
-        if wide || css::typed_keyword_allowed(property, &value).unwrap_or(true) {
+        if wide || css::typed_keyword_allowed(property, &value).unwrap_or(true)
+            && !custom_ident_unsupported(property, &value) && !named_color_keyword(property, &value) {
             return Ok(ctx.new_instance(keyword_value(value)));
         }
     }
@@ -2075,6 +2155,9 @@ fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
             entries.iter().find(|entry| entry.name == property)).map(|entry| entry.syntax.as_str());
         return registered_style_values(ctx, property, text, syntax, multiple);
     }
+    if computed_unsupported(property) {
+        return Ok(vec![ctx.new_instance(DomCssStyleValue { serialized_value: RefCell::new(text.trim().to_owned()) })]);
+    }
     style_values_from_text(ctx, property, text, multiple)
 }
 
@@ -2154,6 +2237,9 @@ fn style_map_value_text(ctx: &mut Ctx, property: &str, value: &Value) -> OpResul
     if ctx.with_instance::<DomCssNumericValue, _>(value, |_| ()).is_ok() {
         let (is_math, unit) = ctx.with_instance::<DomCssNumericValue, _>(value, |numeric| (numeric.expression.is_some(), numeric.unit))?;
         let text = numeric_value_text(ctx, value)?;
+        if css::declaration_block::is_shorthand(property) && !PAIR_SHORTHANDS.contains(&property) {
+            return Err(invalid());
+        }
         if !is_math && unit == css::typed_numeric::NumericUnit::Number && !css::supports_declaration(property, "1") {
             return Err(invalid());
         }
@@ -3132,6 +3218,12 @@ fn serialize_rule_into(
     parent: Option<(usize, usize)>,
     boundaries: &mut Vec<css::nesting::DeclarationBoundary>,
 ) {
+    if starts_css_at_rule(&rule.css_text,"@font-palette-values") {
+        if let Some(values)=css::font_palette_values::parse(&rule.css_text) {
+            output.push_str(&values.serialize());
+            return;
+        }
+    }
     if starts_css_at_rule(&rule.css_text,"@font-feature-values") {
         if let Ok(parsed)=css::parse_stylesheet(&rule.css_text) {
             if let Some(values)=parsed.family_display.first() {
@@ -4085,6 +4177,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.class_constructor::<DomCssFunctionDescriptors>();
     ctx.class_constructor::<DomCssPropertyRule>();
     font_features::install(ctx)?;
+    font_palette::install(ctx)?;
     ctx.class_constructor::<DomCssKeyframesRule>();
     ctx.class_constructor::<DomCssKeyframeRule>();
     ctx.class_constructor::<DomCssImportRule>();
@@ -4201,6 +4294,9 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     let sheet_constructor = ctx.class_constructor::<DomCssStyleSheet>();
     crate::install_interface(ctx, &global, "CSSStyleSheet", sheet_constructor)
         .map_err(|_| OpError::new("Error", "CSSStyleSheet installation failed"))?;
+    let sheet_list_constructor = ctx.class_constructor::<DomStyleSheetList>();
+    crate::install_interface(ctx, &global, "StyleSheetList", sheet_list_constructor)
+        .map_err(|_| OpError::new("Error", "StyleSheetList installation failed"))?;
     let property_map_readonly_constructor = ctx.class_constructor::<DomStylePropertyMapReadOnly>();
     ctx.set_member(
         &global,
@@ -4219,6 +4315,8 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         .map_err(|_| OpError::new("Error", "matchMedia installation failed"))?;
     crate::visual_viewport::install(ctx, realm)?;
     crate::screen::install(ctx, realm)?;
+    crate::origin_api::install(ctx)?;
+    crate::data_transfer::install(ctx)?;
     Ok(())
 }
 
@@ -5507,7 +5605,7 @@ impl DomCssStyleSheet {
             .map_or(Value::Null, |href| Value::Str(href.into()))
     }
 
-    pub(crate) fn media_parts(&self)->(Rc<DomRealm>,SheetSource,Value) {
+    fn media_parts(&self)->(Rc<DomRealm>,SheetSource,Value) {
         (self.realm.clone(),self.source.clone(),self.owner_rule.clone())
     }
     pub(crate) fn disabled(&self)->OpResult<bool> {
@@ -5951,6 +6049,8 @@ impl DomCssRuleList {
             (ctx.new_instance(DomCssNamespaceRule {base}),10)
         } else if starts_css_at_rule(&rule.css_text,"@font-feature-values") {
             (font_features::wrap(ctx,base)?,14)
+        } else if starts_css_at_rule(&rule.css_text,"@font-palette-values") {
+            (font_palette::wrap(ctx,base),15)
         } else if starts_css_at_rule(&rule.css_text, "@property") {
             (ctx.new_instance(DomCssPropertyRule { base }), 0)
         } else if rule.font_face {
@@ -6388,6 +6488,7 @@ fn hide_unsupported_position_try_properties(ctx: &mut Ctx, constructor: &Value) 
     let prototype = ctx
         .get_member(constructor, "prototype")
         .map_err(|_| OpError::new("Error", "CSSPositionTryDescriptors prototype unavailable"))?;
+    reparent_position_try_descriptors(ctx, constructor, &prototype)?;
     for property in css::cssom_property_names() {
         if property.starts_with("--") || css::anchor::position_try_property(property) {
             continue;
@@ -6396,6 +6497,50 @@ fn hide_unsupported_position_try_properties(ctx: &mut Ctx, constructor: &Value) 
         for name in core::iter::once(property.to_owned()).chain(camel) {
             define_data_property(ctx, &prototype, Value::from_string(name), Value::Undefined, true, false, true)
                 .map_err(OpError::thrown)?;
+        }
+    }
+    Ok(())
+}
+
+/// Web IDL derives `CSSPositionTryDescriptors` directly from
+/// `CSSStyleDeclaration` and gives it its own descriptor attributes. The
+/// rule-bound overrides of `CSSRuleStyleDeclaration` and the supported
+/// property accessors become own members of the descriptors prototype.
+fn reparent_position_try_descriptors(ctx: &mut Ctx, constructor: &Value, prototype: &Value) -> OpResult<()> {
+    let rule_constructor = ctx.class_constructor::<DomCssRuleStyle>();
+    let style_constructor = ctx.class_constructor::<DomStyle>();
+    let unavailable = |_| OpError::new("Error", "CSSStyleDeclaration prototype unavailable");
+    let rule_prototype = ctx.get_member(&rule_constructor, "prototype").map_err(unavailable)?;
+    let style_prototype = ctx.get_member(&style_constructor, "prototype").map_err(unavailable)?;
+    let mut keys = ctx.reflect_own_keys(&rule_prototype).map_err(OpError::thrown)?;
+    for property in css::cssom_property_names() {
+        if property.starts_with("--") || !css::anchor::position_try_property(property) {
+            continue;
+        }
+        keys.push(Value::str(property));
+        if let Some(camel) = super::style::camel_case_alias(property) {
+            keys.push(Value::from_string(camel));
+        }
+    }
+    for key in keys {
+        if matches!(&key, Value::Str(name) if name.as_ref() == "constructor") {
+            continue;
+        }
+        let existing = ctx.reflect_get_own_property_descriptor(prototype, &key).map_err(OpError::thrown)?;
+        if !matches!(existing, Value::Undefined) {
+            continue;
+        }
+        let mut descriptor = ctx.reflect_get_own_property_descriptor(&rule_prototype, &key).map_err(OpError::thrown)?;
+        if matches!(descriptor, Value::Undefined) {
+            descriptor = ctx.reflect_get_own_property_descriptor(&style_prototype, &key).map_err(OpError::thrown)?;
+        }
+        if !matches!(descriptor, Value::Undefined) {
+            ctx.reflect_define_property(prototype, &key, &descriptor).map_err(OpError::thrown)?;
+        }
+    }
+    for (target, parent) in [(prototype, &style_prototype), (constructor, &style_constructor)] {
+        if !ctx.reflect_set_prototype_of(target, parent).map_err(OpError::thrown)? {
+            return Err(OpError::new("Error", "CSSPositionTryDescriptors prototype could not be set"));
         }
     }
     Ok(())

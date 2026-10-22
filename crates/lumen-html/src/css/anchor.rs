@@ -4,25 +4,6 @@
 use super::typed_numeric::{self, NumericExpression, NumericType, NumericUnit};
 use super::*;
 
-/// Properties introduced by this specification, in `extra_props` order.
-pub(crate) const PROPERTIES: [&str; 7] = [
-    "anchor-name",
-    "anchor-scope",
-    "position-anchor",
-    "position-area",
-    "position-try-fallbacks",
-    "position-try-order",
-    "position-visibility",
-];
-
-pub(crate) fn initial(property: &str) -> &'static str {
-    match property {
-        "position-anchor" | "position-try-order" => "normal",
-        "position-visibility" => "anchor-visible",
-        _ => "none",
-    }
-}
-
 /// Which functions a property admits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Context {
@@ -1191,9 +1172,20 @@ pub(crate) fn flip_style(style: &mut Style, permutation: &[usize; 4]) {
         style.margin_sides[side] = margins[permutation[side]];
         style.margin_auto[side] = autos[permutation[side]];
     }
+    let swap_axes = permutation[3] == 0 || permutation[3] == 2;
     let remap = |slot: usize| match slot {
         35..=38 => 35 + permutation[slot - 35],
         39..=42 => 39 + permutation[slot - 39],
+        3 | 4 | 23 | 24 | 51 | 52 | 147 | 148 if swap_axes => match slot {
+            3 => 4,
+            4 => 3,
+            23 => 51,
+            51 => 23,
+            24 => 52,
+            52 => 24,
+            147 => 148,
+            _ => 147,
+        },
         other => other,
     };
     for (slot, _) in style.relative_lengths.iter_mut() {
@@ -1238,7 +1230,14 @@ pub(crate) fn flip_style(style: &mut Style, permutation: &[usize; 4]) {
         style.align_self = alignment;
         style.align_self_keyword = keyword;
     }
-    if permutation[3] == 0 || permutation[3] == 2 {
+    if swap_axes {
+        (style.width, style.height) = (style.height, style.width);
+        (style.min_width, style.min_height) = (style.min_height, style.min_width);
+        (style.max_width, style.max_height) = (style.max_height, style.max_width);
+        (style.min_width_auto, style.min_height_auto) = (style.min_height_auto, style.min_width_auto);
+        (style.width_intrinsic, style.height_intrinsic) = (style.height_intrinsic, style.width_intrinsic);
+        (style.min_width_intrinsic, style.min_height_intrinsic) = (style.min_height_intrinsic, style.min_width_intrinsic);
+        (style.max_width_intrinsic, style.max_height_intrinsic) = (style.max_height_intrinsic, style.max_width_intrinsic);
         let justify = (style.justify_self, style.justify_self_keyword);
         style.justify_self = style.align_self;
         style.justify_self_keyword = style.align_self_keyword;

@@ -6,7 +6,7 @@
 use crate::{Document, Error, Namespace, NodeId, NodeKind};
 use alloc::vec::Vec;
 
-const MAX_ANCESTOR_STEPS: usize = 65_536;
+pub(crate) const MAX_ANCESTOR_STEPS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DialogMode {
@@ -145,6 +145,7 @@ pub struct DialogCloseTransition {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PointerUpLightDismissPlan {
     pub endpoint: Option<NodeId>,
+    pub endpoints: crate::popover_stack::Endpoints,
     pub popovers_to_hide: Vec<NodeId>,
 }
 
@@ -387,6 +388,32 @@ pub fn show_popover_with_focus(
     })
 }
 
+/// Commit `node` as a showing popover of `stack`, which may differ from its own type when an
+/// Auto popover opens from inside a hint. Closing other popovers is the caller's job.
+pub fn show_popover_in_stack(
+    document: &mut Document,
+    node: NodeId,
+    stack: PopoverMode,
+    restore_focus: Option<NodeId>,
+) -> Result<PopoverTransition, StateError> {
+    validate_show_popover(document, node)?;
+    document
+        .push_top_layer_element_with_focus(node, Kind::Popover(stack), restore_focus)
+        .map_err(|error| {
+            if error == Error::LimitExceeded {
+                StateError::ResourceLimit
+            } else {
+                StateError::Dom(error)
+            }
+        })?;
+    Ok(PopoverTransition {
+        changed: true,
+        closed_auto_popovers: 0,
+        closed_auto_popover_nodes: Vec::new(),
+        is_open: true,
+    })
+}
+
 pub fn validate_show_popover(document: &Document, node: NodeId) -> Result<PopoverMode, StateError> {
     let mode = popover_mode(document, node).ok_or(StateError::NotSupported)?;
     if !is_connected(document, node)? {
@@ -399,9 +426,6 @@ pub fn validate_show_popover(document: &Document, node: NodeId) -> Result<Popove
         PopoverVisibility::Showing => return Err(StateError::InvalidState),
         PopoverVisibility::NotPopover => return Err(StateError::NotSupported),
         PopoverVisibility::Hidden => {}
-    }
-    if mode == PopoverMode::Hint {
-        return Err(StateError::UnsupportedState);
     }
     if dialog_modal_state(document, node) == DialogModalState::Modal {
         return Err(StateError::InvalidState);
@@ -458,14 +482,11 @@ pub fn toggle_popover(
 /// popover is a valid no-op; connectivity and pending close transitions still
 /// apply to both force values.
 pub fn validate_toggle_popover(document: &Document, node: NodeId) -> Result<bool, StateError> {
-    let mode = popover_mode(document, node).ok_or(StateError::NotSupported)?;
+    popover_mode(document, node).ok_or(StateError::NotSupported)?;
     if !is_connected(document, node)? || document.any_popover_transitioning() {
         return Err(StateError::InvalidState);
     }
     let showing = popover_visibility(document, node) == PopoverVisibility::Showing;
-    if !showing && mode == PopoverMode::Hint {
-        return Err(StateError::UnsupportedState);
-    }
     Ok(showing)
 }
 
@@ -511,10 +532,10 @@ pub fn record_popover_pointerdown_target(
     document: &mut Document,
     target: NodeId,
 ) -> Result<(), StateError> {
-    if !has_open_auto_popover(document) {
+    if !crate::popover_stack::has_light_dismissable(document) {
         return Ok(());
     }
-    let endpoint = nearest_inclusive_open_auto_popover(document, target)?;
+    let endpoint = crate::popover_stack::endpoints(document, target)?.topmost(document);
     document.set_popover_pointerdown_target(endpoint);
     Ok(())
 }
@@ -533,114 +554,24 @@ pub fn popovers_to_hide_on_pointerup(
     document: &mut Document,
     target: NodeId,
 ) -> Result<Option<PointerUpLightDismissPlan>, StateError> {
-    if !has_open_auto_popover(document) {
+    if !crate::popover_stack::has_light_dismissable(document) {
         return Ok(None);
     }
 
-    let endpoint = nearest_inclusive_open_auto_popover(document, target)?;
+    let endpoints = crate::popover_stack::endpoints(document, target)?;
+    let endpoint = endpoints.topmost(document);
     let same_target = endpoint == document.popover_pointerdown_target();
     document.set_popover_pointerdown_target(None);
     let popovers_to_hide = if same_target {
-        auto_popovers_to_hide_until(document, endpoint)?
+        crate::popover_stack::plan_light_dismiss(document, endpoints)
     } else {
         Vec::new()
     };
     Ok(Some(PointerUpLightDismissPlan {
         endpoint,
+        endpoints,
         popovers_to_hide,
     }))
-}
-
-/// Whether `popover` is still an Auto-stack entry that lies above `endpoint`.
-/// Adapters call this after synchronous `beforetoggle` callbacks before each
-/// removal, so stale snapshots cannot close a popover that is now an ancestor
-/// of the endpoint or has already been hidden.
-pub fn should_hide_auto_popover_until(
-    document: &Document,
-    popover: NodeId,
-    endpoint: Option<NodeId>,
-) -> Result<bool, StateError> {
-    if document.top_layer_kind(popover) != Some(Kind::Popover(PopoverMode::Auto)) {
-        return Ok(false);
-    }
-    let mut popover_index = None;
-    let mut endpoint_index = None;
-    let mut index = 0usize;
-    for (node, kind, _) in document.top_layer_entries() {
-        if kind != Kind::Popover(PopoverMode::Auto) {
-            continue;
-        }
-        if node == popover {
-            popover_index = Some(index);
-        }
-        if Some(node) == endpoint {
-            endpoint_index = Some(index);
-        }
-        index += 1;
-    }
-    let Some(popover_index) = popover_index else {
-        return Ok(false);
-    };
-    Ok(endpoint_index.is_none_or(|endpoint_index| popover_index > endpoint_index))
-}
-
-fn has_open_auto_popover(document: &Document) -> bool {
-    document
-        .top_layer_entries()
-        .any(|(_, kind, _)| kind == Kind::Popover(PopoverMode::Auto))
-}
-
-fn nearest_inclusive_open_auto_popover(
-    document: &Document,
-    node: NodeId,
-) -> Result<Option<NodeId>, StateError> {
-    let mut current = node;
-    for _ in 0..MAX_ANCESTOR_STEPS {
-        if document.top_layer_kind(current) == Some(Kind::Popover(PopoverMode::Auto)) {
-            return Ok(Some(current));
-        }
-        let Some(parent) = document.composed_parent(current).map_err(StateError::Dom)? else {
-            return Ok(None);
-        };
-        current = parent;
-    }
-    Err(StateError::ResourceLimit)
-}
-
-fn auto_popovers_to_hide_until(
-    document: &Document,
-    endpoint: Option<NodeId>,
-) -> Result<Vec<NodeId>, StateError> {
-    let endpoint_index = endpoint.and_then(|endpoint| {
-        document
-            .top_layer_entries()
-            .filter(|(_, kind, _)| *kind == Kind::Popover(PopoverMode::Auto))
-            .position(|(node, _, _)| node == endpoint)
-    });
-    // The standard keeps the endpoint itself: a stack position is one-based,
-    // and the hide slice begins at endpoint-index + 1. If the endpoint is not
-    // in the current Auto list, the index defaults to zero and the whole list
-    // is hidden.
-    let first_to_hide = endpoint_index.map_or(0, |index| index + 1);
-    let mut nodes = Vec::new();
-    let count = document
-        .top_layer_entries()
-        .filter(|(_, kind, _)| *kind == Kind::Popover(PopoverMode::Auto))
-        .count();
-    nodes
-        .try_reserve(count.saturating_sub(first_to_hide))
-        .map_err(|_| StateError::ResourceLimit)?;
-    for (index, (node, _, _)) in document
-        .top_layer_entries()
-        .filter(|(_, kind, _)| *kind == Kind::Popover(PopoverMode::Auto))
-        .enumerate()
-    {
-        if index >= first_to_hide {
-            nodes.push(node);
-        }
-    }
-    nodes.reverse();
-    Ok(nodes)
 }
 
 /// Return every currently showing popover that must be removed before a modal

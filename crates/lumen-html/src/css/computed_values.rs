@@ -16,6 +16,8 @@ pub struct ComputedValueContext<'a> {
     /// Sparse used margin values recorded when layout resolved `auto` margins
     /// or adjusted a resolved side for its formatting constraint.
     pub used_margins: Option<[f32; 4]>,
+    /// Top, right, bottom and left insets layout resolved from `anchor()`.
+    pub used_insets: Option<[Option<f32>; 4]>,
     pub replaced_element: bool,
     /// Actual box formatting controls whether resolved dimensions apply.
     /// This carrier never changes serialized computed display.
@@ -27,6 +29,8 @@ pub struct ComputedValueContext<'a> {
     pub grid_rows: Option<&'a [f32]>,
     pub grid_column_names: Option<&'a [GridNamedLine]>,
     pub grid_row_names: Option<&'a [GridNamedLine]>,
+    /// A grid container whose parent is not a grid container ignores `subgrid`.
+    pub subgrid_ignored: bool,
 }
 
 pub fn needs_layout(name: &str) -> bool {
@@ -46,6 +50,7 @@ pub fn needs_layout(name: &str) -> bool {
             | "max-block-size"
             | "transform"
             | "transform-origin"
+            | "perspective-origin"
             | "grid-template-columns"
             | "grid-template-rows"
             | "grid-template"
@@ -96,15 +101,19 @@ pub(crate) fn color(value: Rgba) -> String {
         number(alpha)
     )
 }
+fn percent_number(percent: f32) -> String {
+    let rounded = (f64::from(percent) * 1e4).round() / 1e4;
+    if rounded == 0.0 { String::from("0") } else { alloc::format!("{rounded}") }
+}
 pub(crate) fn percentage(pixels: f32, percent: f32) -> String {
     if percent == 0.0 {
         px(pixels)
     } else if pixels == 0.0 {
-        alloc::format!("{}%", number(percent))
+        alloc::format!("{}%", percent_number(percent))
     } else {
         alloc::format!(
             "calc({}% {} {}px)",
-            number(percent),
+            percent_number(percent),
             if pixels < 0.0 { "-" } else { "+" },
             number(pixels.abs())
         )
@@ -120,6 +129,12 @@ fn transform_reference(style:&Style,context:ComputedValueContext<'_>)->Option<Re
         .filter(|_|!style.relative_lengths.is_empty() || !style.relative_expressions.is_empty())
         .map(|(width,height)|style.resolve_percentages(width,height));
     Some(resolved.as_ref().unwrap_or(style).css_transform_reference_box(border))
+}
+
+fn resolved_origin(value: &str, rect: Rect) -> Option<String> {
+    let context = static_length_context();
+    let [x, y] = transform_origin_with_query(value, context, ContainerUnitContext::no_container(context.viewport))?;
+    Some(alloc::format!("{} {}", px(x.resolve(rect.width)), px(y.resolve(rect.height))))
 }
 
 fn pair(a: String, b: String) -> String {
@@ -237,6 +252,9 @@ fn offset(style: &Style, used: &Style, edge: usize, context: ComputedValueContex
         }
         return [style.top, style.right, style.bottom, style.left][edge]
             .map_or_else(|| "auto".into(), px);
+    }
+    if let Some(inset) = context.used_insets.and_then(|insets| insets[edge]) {
+        return px(inset);
     }
     if style.position == Position::Relative {
         return px(used.relative_insets()[edge]);
@@ -419,6 +437,11 @@ impl Style {
             return shapes::computed_offset(self);
         }
         if let Some(value) = extra_props::computed(self, name) {
+            if name == "perspective-origin" && context.resolved {
+                if let Some(rect) = transform_reference(self, context) {
+                    return Some(resolved_origin(&value, rect).unwrap_or(value));
+                }
+            }
             return Some(value);
         }
         let resolved = context
@@ -881,6 +904,9 @@ impl Style {
                 TextAlign::Justify => "justify",
                 TextAlign::MatchParent => "match-parent",
                 TextAlign::JustifyAll => "justify-all",
+                TextAlign::WebkitLeft => "-webkit-left",
+                TextAlign::WebkitRight => "-webkit-right",
+                TextAlign::WebkitCenter => "-webkit-center",
             }
             .into(),
             "text-indent" => alloc::format!("{}{}", lp(self.text_indent), super::text_indent::keywords(self.text_indent_mode)),
@@ -1070,6 +1096,8 @@ impl Style {
     fn computed_font(&self, context: ComputedValueContext<'_>) -> Option<String> {
         if !self.font.ligatures.is_normal() || self.font.feature_settings.is_some() || self.font.size_adjust.is_some()
             || font_variant::RESET_LONGHANDS.iter().any(|name| extra_props::computed(self, name).is_some_and(|value| value != "normal"))
+            || font_variant::FONT_RESETS.iter().any(|(name, initial)| extra_props::computed(self, name).is_some_and(|value| value != *initial))
+            || self.font.alternates.is_some()
             || !matches!(
                 self.font.caps,
                 FontVariantCaps::Normal | FontVariantCaps::SmallCaps
@@ -1486,8 +1514,24 @@ pub(super) fn named_line_groups(names: &[GridNamedLine], count: usize) -> Option
     Some(result)
 }
 pub(super) fn specified_grid_tracks(raw: &str) -> Option<String> {
+    let tokens = grid_components(raw)?;
+    let result = if tokens.first().is_some_and(|token| token.eq_ignore_ascii_case("subgrid")) {
+        specified_subgrid_tracks(&tokens[1..])?
+    } else {
+        specified_track_tokens(&tokens)?
+    };
+    Some(if result.is_empty() {
+        "none".into()
+    } else {
+        result
+    })
+}
+fn specified_track_tokens(tokens: &[&str]) -> Option<String> {
     let mut result = String::new();
-    for token in grid_components(raw)? {
+    for &token in tokens {
+        if token.starts_with("/*") && token.ends_with("*/") {
+            continue;
+        }
         if let Some(names) = token
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
@@ -1496,18 +1540,65 @@ pub(super) fn specified_grid_tracks(raw: &str) -> Option<String> {
                 continue;
             }
             grid_append_line_names(&mut result, token)?;
-        } else {
-            if !result.is_empty() {
-                append(&mut result, " ")?;
+            continue;
+        }
+        if !result.is_empty() {
+            append(&mut result, " ")?;
+        }
+        match grid_function_args(token, "repeat").and_then(|args| {
+            let parts = comma_components(args, 2)?;
+            (parts.len() == 2).then_some(parts)
+        }) {
+            Some(parts) => {
+                let inner = specified_track_tokens(&grid_components(parts[1])?)?;
+                append(&mut result, "repeat(")?;
+                append(&mut result, &parts[0].trim().to_ascii_lowercase())?;
+                append(&mut result, ", ")?;
+                append(&mut result, &inner)?;
+                append(&mut result, ")")?;
             }
-            append(&mut result, token)?;
+            None => append(&mut result, token)?,
         }
     }
-    Some(if result.is_empty() {
-        "none".into()
-    } else {
-        result
-    })
+    Some(result)
+}
+fn specified_line_group(token: &str) -> Option<String> {
+    let names = token.strip_prefix('[')?.strip_suffix(']')?;
+    let mut group = String::from("[");
+    for (index, word) in grid_word_slices(names, 256)?.into_iter().enumerate() {
+        if index != 0 {
+            append(&mut group, " ")?;
+        }
+        append(&mut group, word)?;
+    }
+    append(&mut group, "]")?;
+    Some(group)
+}
+fn specified_subgrid_tracks(tokens: &[&str]) -> Option<String> {
+    let mut result = String::from("subgrid");
+    for &token in tokens {
+        append(&mut result, " ")?;
+        match grid_function_args(token, "repeat") {
+            Some(args) => {
+                let parts = comma_components(args, 2)?;
+                if parts.len() != 2 {
+                    return None;
+                }
+                append(&mut result, "repeat(")?;
+                append(&mut result, &parts[0].trim().to_ascii_lowercase())?;
+                append(&mut result, ", ")?;
+                for (index, group) in grid_components(parts[1])?.into_iter().enumerate() {
+                    if index != 0 {
+                        append(&mut result, " ")?;
+                    }
+                    append(&mut result, &specified_line_group(group)?)?;
+                }
+                append(&mut result, ")")?;
+            }
+            None => append(&mut result, &specified_line_group(token)?)?,
+        }
+    }
+    Some(result)
 }
 pub(super) fn serialize_grid_flow(flow: GridAutoFlow) -> String {
     match (flow.column, flow.dense) {
@@ -1700,10 +1791,8 @@ pub(super) fn serialize_grid_lanes(values: &[&str]) -> Option<String> {
         append(&mut result, " ")?;
     }
     append(&mut result, if row { rows } else { columns })?;
-    if parsed.row != Some(false) || parsed.fill_reverse || parsed.track_reverse {
-        append(&mut result, " ")?;
-        append(&mut result, direction)?;
-    }
+    append(&mut result, " ")?;
+    append(&mut result, direction)?;
     Some(result)
 }
 impl Style {
@@ -1712,6 +1801,7 @@ impl Style {
         horizontal: bool,
         used: Option<&[f32]>,
         used_names: Option<&[GridNamedLine]>,
+        subgrid_ignored: bool,
     ) -> Option<String> {
         let (tracks, names, subgrid, repeated) = if horizontal {
             (
@@ -1728,6 +1818,9 @@ impl Style {
                 self.grid_rows_auto.as_ref(),
             )
         };
+        if subgrid && subgrid_ignored {
+            return Some("none".into());
+        }
         if subgrid {
             let mut result = String::from("subgrid");
             if let Some(used) = used {
@@ -1867,10 +1960,10 @@ impl Style {
             "animation" => self.computed_animation(context.resolved)?,
 
             "grid-template-columns" => {
-                self.computed_grid_tracks(true, context.grid_columns, context.grid_column_names)?
+                self.computed_grid_tracks(true, context.grid_columns, context.grid_column_names, context.subgrid_ignored)?
             }
             "grid-template-rows" => {
-                self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names)?
+                self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names, context.subgrid_ignored)?
             }
             "grid-auto-columns" => named_tracks(
                 self.grid_auto_columns
@@ -1907,11 +2000,12 @@ impl Style {
             }
             "grid-template" | "grid" => {
                 let rows =
-                    self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names)?;
+                    self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names, false)?;
                 let columns = self.computed_grid_tracks(
                     true,
                     context.grid_columns,
                     context.grid_column_names,
+                    false,
                 )?;
                 let areas = self.computed_grid_areas()?;
                 if name == "grid-template" {
@@ -1941,11 +2035,12 @@ impl Style {
             }
             "grid-lanes" => {
                 let rows =
-                    self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names)?;
+                    self.computed_grid_tracks(false, context.grid_rows, context.grid_row_names, false)?;
                 let columns = self.computed_grid_tracks(
                     true,
                     context.grid_columns,
                     context.grid_column_names,
+                    false,
                 )?;
                 serialize_grid_lanes(&[
                     &rows,

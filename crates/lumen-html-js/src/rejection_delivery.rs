@@ -553,10 +553,12 @@ pub fn queue_document_rejection_events(
     realm: &Rc<DomRealm>,
 ) -> Result<(), String> {
     register_document_rejection_sink(policy, engine, realm)?;
-    let owner = realm
-        .child_realm_handle()
-        .map_err(|error| format!("resolve rejection-event realm: {error:?}"))?
-        .unwrap_or_else(|| engine.ctx().current_host_realm());
+    // A document whose browsing context was discarded (a removed or moved iframe, a closed
+    // window) has no realm left to receive rejection events.
+    let Ok(owner) = realm.child_realm_handle() else {
+        return Ok(());
+    };
+    let owner = owner.unwrap_or_else(|| engine.ctx().current_host_realm());
     let notifications = policy.take_events_for_realm(engine, &owner);
     admit_document_rejection_events(engine.ctx(), realm, notifications, policy.delivery())
 }

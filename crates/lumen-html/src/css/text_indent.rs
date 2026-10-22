@@ -39,6 +39,10 @@ pub(super) fn keywords(mode: u8) -> &'static str {
 
 pub(super) fn specified(raw: &str) -> Option<alloc::string::String> {
     let (length, mode) = split(raw)?;
+    if super::math_function(length) {
+        let length = super::typed_numeric::parse_numeric_expression(length)?.serialize_specified()?;
+        return Some(alloc::format!("{length}{}", keywords(mode)));
+    }
     Some(alloc::format!("{length}{}", keywords(mode)))
 }
 

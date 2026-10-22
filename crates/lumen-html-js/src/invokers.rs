@@ -49,6 +49,24 @@ pub(crate) fn button_activation(ctx: &mut Ctx, source: Value, event_target: Valu
             let action = match state { Command::HidePopover => PopoverAction::Hide, Command::ShowPopover => PopoverAction::Show, _ => PopoverAction::Toggle };
             run_popover_action(ctx, &target_realm, target_node, action, source)?;
         }
+        Command::Toggle | Command::Open | Command::Close
+            if lumen_html::forms::html_element_local_name(target_realm.session.borrow().document(), target_node) == Some("details") =>
+        {
+            let open = target_realm.session.borrow().document().get_attribute_ns_ref(target_node, None, "open")
+                .map_err(dom_error)?.is_some();
+            let node = tables::node_at(&target_realm, target_node);
+            match state {
+                Command::Open if !open => node.set_attribute_core("open", "")?,
+                Command::Close if open => node.remove_attribute_core("open")?,
+                Command::Toggle if open => node.remove_attribute_core("open")?,
+                Command::Toggle => node.set_attribute_core("open", "")?,
+                _ => {},
+            }
+        }
+        Command::StepUp | Command::StepDown => {
+            let direction = if state == Command::StepUp { lumen_html::forms::InputStepDirection::Up } else { lumen_html::forms::InputStepDirection::Down };
+            let _ = forms::step_input_value(ctx, &target_realm, target_node, 1, direction);
+        }
         Command::Close | Command::RequestClose | Command::ShowModal => {
             let session = target_realm.session.borrow();
             let document = session.document();
@@ -126,7 +144,7 @@ fn run_popover_action(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, action:
         if valid { dialog_popover::hide_popover_with_source(ctx, realm, node, source)?; }
     } else {
         let valid = top_layer::validate_show_popover(realm.session.borrow().document(), node).is_ok();
-        if valid { dialog_popover::show_popover_with_source(ctx, realm, node, source)?; }
+        if valid { dialog_popover::show_popover_without_throwing(ctx, realm, node, source)?; }
     }
     Ok(())
 }
@@ -151,7 +169,7 @@ mod tests {
         check(r#"(() => {
             const b=document.createElement('button'),d=document.createElement('dialog');document.body.append(b,d);
             b.commandForElement=d;b.command='--Custom';let calls=0;
-            d.oncommand=e=>{if(!(e instanceof CommandEvent)||!e.isTrusted||!e.cancelable||e.bubbles||e.composed||e.command!=='--Custom'||e.source!==b)throw Error('command metadata');calls++;};
+            d.oncommand=e=>{if(!(e instanceof CommandEvent)||!e.isTrusted||!e.cancelable||e.bubbles||!e.composed||e.command!=='--Custom'||e.source!==b)throw Error('command metadata');calls++;};
             b.click();if(calls!==1||d.open||b.type!=='button')throw Error('auto command dispatch');
             b.command='show-modal';d.oncommand=e=>{e.preventDefault();};b.click();if(d.open)throw Error('canceled command activated');
             d.oncommand=e=>{b.command='close';};b.click();if(!d.open||!d.matches(':modal'))throw Error('command must be captured before dispatch');d.close();

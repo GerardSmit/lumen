@@ -206,6 +206,10 @@ macro_rules! hyperlink_element {
             fn kind(&self) -> OpResult<String> { Ok((&self.base.base.base).get_null_attribute("type")?.unwrap_or_default()) }
             #[setter(name = "type", coerce, hint(js(ce_reactions)))]
             fn set_kind(&self, value: &str) -> OpResult<()> { (&self.base.base.base).set_attribute_core("type", value) }
+            #[getter(name = "interestForElement")]
+            fn interest_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { crate::element_reflection::get(ctx, this.0, "interestfor") }
+            #[setter(name = "interestForElement", hint(js(ce_reactions)))]
+            fn set_interest_for_element(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> { crate::element_reflection::set(ctx, this.0, "interestfor", value) }
             $($members)*
             #[constructor]
             fn new(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<crate::custom_elements::HtmlElementCtor> {

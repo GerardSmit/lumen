@@ -99,6 +99,7 @@ mod browser_timers;
 mod tables;
 mod invokers;
 mod command_events;
+mod interest_events;
 mod element_reflection;
 mod image_loading;
 pub mod stylesheet_loading;
@@ -165,7 +166,12 @@ pub use rejection_delivery::{
 pub mod scheduling;
 mod shadow;
 mod templates;
+mod caret_position;
 mod screen;
+mod origin_api;
+mod data_transfer;
+mod document_named;
+mod scroll_parent;
 mod visual_viewport;
 mod legacy_timing;
 mod web_storage;
@@ -6041,11 +6047,14 @@ fn element_scroll(
     element: NodeId,
     args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
     relative: bool,
-) -> lumen::embed::Promise<()> {
+) -> lumen::embed::Promise<Value> {
     match scrolling::element_scroll_target(realm, element, scrolling::ElementScrollPurpose::Method)
     {
         Ok(Some(node)) => window_globals::scroll_node(ctx, realm.clone(), node, args, relative),
-        Ok(None) => lumen::embed::Promise::ready::<OpError>(Ok(())),
+        Ok(None) => {
+            let result = scrolling::scroll_result(ctx, false);
+            lumen::embed::Promise::ready::<OpError>(Ok(result))
+        }
         Err(error) => lumen::embed::Promise::rejected(error),
     }
 }
@@ -6124,6 +6133,11 @@ event_content_handlers::bind_namespace_handlers! { DomMathMlElement {
     fn set_style(&self, value: &str) -> OpResult<()> {
         self.base.base.set_style(value)
     }
+
+    #[getter(name = "attributeStyleMap")]
+    fn attribute_style_map(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.attribute_style_map(ctx, this)
+    }
 } }
 
 #[lumen_bind::class(name = "Element", extends = DomNode, hint(js(webidl)))]
@@ -6131,6 +6145,38 @@ pub struct DomElement {
     base: DomNode,
 }
 custom_elements::bind_element_aria! {
+    #[getter(name = "ariaActiveDescendantElement")]
+    fn aria_active_descendant_element(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get(ctx, this.0, "aria-activedescendant") }
+    #[setter(name = "ariaActiveDescendantElement", hint(js(ce_reactions)))]
+    fn set_aria_active_descendant_element(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> { element_reflection::set(ctx, this.0, "aria-activedescendant", value) }
+    #[getter(name = "ariaControlsElements")]
+    fn aria_controls_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-controls") }
+    #[setter(name = "ariaControlsElements", hint(js(ce_reactions)))]
+    fn set_aria_controls_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-controls", value.0) }
+    #[getter(name = "ariaDescribedByElements")]
+    fn aria_described_by_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-describedby") }
+    #[setter(name = "ariaDescribedByElements", hint(js(ce_reactions)))]
+    fn set_aria_described_by_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-describedby", value.0) }
+    #[getter(name = "ariaDetailsElements")]
+    fn aria_details_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-details") }
+    #[setter(name = "ariaDetailsElements", hint(js(ce_reactions)))]
+    fn set_aria_details_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-details", value.0) }
+    #[getter(name = "ariaErrorMessageElements")]
+    fn aria_error_message_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-errormessage") }
+    #[setter(name = "ariaErrorMessageElements", hint(js(ce_reactions)))]
+    fn set_aria_error_message_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-errormessage", value.0) }
+    #[getter(name = "ariaFlowToElements")]
+    fn aria_flow_to_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-flowto") }
+    #[setter(name = "ariaFlowToElements", hint(js(ce_reactions)))]
+    fn set_aria_flow_to_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-flowto", value.0) }
+    #[getter(name = "ariaLabelledByElements")]
+    fn aria_labelled_by_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-labelledby") }
+    #[setter(name = "ariaLabelledByElements", hint(js(ce_reactions)))]
+    fn set_aria_labelled_by_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-labelledby", value.0) }
+    #[getter(name = "ariaOwnsElements")]
+    fn aria_owns_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> { element_reflection::get_list(ctx, this.0, "aria-owns") }
+    #[setter(name = "ariaOwnsElements", hint(js(ce_reactions)))]
+    fn set_aria_owns_elements(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: custom_elements::AriaElementsArgument) -> OpResult<()> { element_reflection::set_list(ctx, this.0, "aria-owns", value.0) }
     #[getter]
     fn custom_element_registry(&self, ctx: &mut Ctx) -> Value {
         custom_elements::registry_value_for_node(ctx,&self.base.realm,self.base.id)
@@ -6589,7 +6635,7 @@ custom_elements::bind_element_aria! {
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
         options: Option<scrolling::IntoViewOptions>,
-    ) -> OpResult<lumen::embed::Promise<()>> {
+    ) -> OpResult<lumen::embed::Promise<Value>> {
         let (realm, node) = ctx.with_instance::<Self, _>(&this.0, |element| {
             (element.base.realm.clone(), element.base.id)
         })?;
@@ -6619,6 +6665,22 @@ custom_elements::bind_element_aria! {
             &self.base.realm,
             self.base.id,
         ))
+    }
+
+    fn get_box_quads(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Vec<Value>> {
+        geometry::get_box_quads(ctx, &self.base.realm, geometry::Subject::Element(self.base.id), options)
+    }
+
+    fn convert_quad_from_node(&self, ctx: &mut Ctx, quad: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_quad(ctx, &self.base.realm, geometry::Subject::Element(self.base.id), quad, from, options)
+    }
+
+    fn convert_rect_from_node(&self, ctx: &mut Ctx, rect: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_rect(ctx, &self.base.realm, geometry::Subject::Element(self.base.id), rect, from, options)
+    }
+
+    fn convert_point_from_node(&self, ctx: &mut Ctx, point: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_point(ctx, &self.base.realm, geometry::Subject::Element(self.base.id), point, from, options)
     }
 
     #[getter]
@@ -6776,7 +6838,7 @@ custom_elements::bind_element_aria! {
         &self,
         ctx: &mut Ctx,
         #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> lumen::embed::Promise<()> {
+    ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
 
@@ -6785,7 +6847,7 @@ custom_elements::bind_element_aria! {
         &self,
         ctx: &mut Ctx,
         #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> lumen::embed::Promise<()> {
+    ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
 
@@ -6794,7 +6856,7 @@ custom_elements::bind_element_aria! {
         &self,
         ctx: &mut Ctx,
         #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
-    ) -> lumen::embed::Promise<()> {
+    ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, true)
     }
 
@@ -7220,7 +7282,7 @@ impl DomHtmlLinkElement {
     #[getter(name="as")]
     fn as_(&self)->OpResult<String> {
         let value=self.base.base.base.get_null_attribute("as")?.unwrap_or_default().to_ascii_lowercase();
-        Ok(if matches!(value.as_str(),"audio"|"document"|"embed"|"fetch"|"font"|"image"|"object"|"script"|"style"|"track"|"video"|"worker") {value}else{String::new()})
+        Ok(if matches!(value.as_str(),"audio"|"document"|"embed"|"fetch"|"font"|"image"|"manifest"|"object"|"report"|"script"|"sharedworker"|"style"|"track"|"video"|"worker"|"xslt") {value}else{String::new()})
     }
     #[setter(name="as",coerce,hint(js(ce_reactions)))]
     fn set_as(&self,value:&str)->OpResult<()> {self.base.base.base.set_attribute_core("as",value)}
@@ -8281,6 +8343,21 @@ pub struct DomSelectElement {
     base: DomHtmlElement,
 }
 
+/// `HTMLSelectElement.remove(index)` and `HTMLOptionsCollection.remove(index)`: removes the
+/// option at `index` from its parent, ignoring out-of-range indexes.
+fn remove_select_option_at(realm: &Rc<DomRealm>, select: NodeId, index: i32) -> OpResult<()> {
+    let (realm, select) = realm.resolve_adopted_node(select);
+    let Ok(index) = usize::try_from(index) else { return Ok(()); };
+    let option = {
+        let session = realm.session.borrow();
+        lumen_html::forms::select_option_at(session.document(), select, index).map_err(dom_error)?
+    };
+    match option {
+        Some(option) => remove_dom_node(&realm, option),
+        None => Ok(()),
+    }
+}
+
 #[lumen_bind::class(
     name = "HTMLOptionsCollection",
     extends = DomHtmlCollection,
@@ -8357,6 +8434,11 @@ impl DomHtmlOptionsCollection {
             (collection.realm.clone(), collection.select)
         })?;
         forms::add_select_element(ctx, &realm, select, element, before)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn remove(&self, index: i32) -> OpResult<()> {
+        remove_select_option_at(&self.realm, self.select, index)
     }
 
     // Lumen's indexed native-object hooks are registered on the concrete class,
@@ -8623,6 +8705,15 @@ impl DomSelectElement {
             (node.realm.clone(), node.id)
         })?;
         forms::add_select_element(ctx, &realm, select, element, before)
+    }
+
+    #[method(hint(js(ce_reactions)))]
+    fn remove(&self, index: Option<i32>) -> OpResult<()> {
+        let node = &self.base.base.base;
+        match index {
+            Some(index) => remove_select_option_at(&node.realm, node.id, index),
+            None => node.remove(),
+        }
     }
 }
 
@@ -8907,8 +8998,7 @@ impl DomTextAreaElement {
     }
     #[getter]
     fn wrap(&self) -> OpResult<String> {
-        let hard = self.base.base.base.get_null_attribute("wrap")?.is_some_and(|value| value.eq_ignore_ascii_case("hard"));
-        Ok(String::from(if hard { "hard" } else { "soft" }))
+        Ok(self.base.base.base.get_null_attribute("wrap")?.unwrap_or_default())
     }
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_wrap(&self, value: &str) -> OpResult<()> {
@@ -9362,6 +9452,33 @@ impl DomInputElement {
     fn set_form_target(&self, value: &str) -> OpResult<()> {
         self.base.base.base.set_attribute_core("formtarget", value)
     }
+    #[getter(name = "switch")]
+    fn switch_attribute(&self) -> OpResult<bool> {
+        self.base.base.base.has_null_attribute("switch")
+    }
+    #[setter(name = "switch", coerce, hint(js(ce_reactions)))]
+    fn set_switch_attribute(&self, value: bool) -> OpResult<()> {
+        let node = &self.base.base.base;
+        if value {
+            node.set_attribute_core("switch", "")
+        } else {
+            node.remove_attribute_core("switch")
+        }
+    }
+    #[getter(name = "colorSpace")]
+    fn color_space(&self) -> OpResult<String> {
+        let value = self.base.base.base.get_null_attribute("colorspace")?;
+        Ok(if value.is_some_and(|value| value.eq_ignore_ascii_case("display-p3")) {
+            "display-p3"
+        } else {
+            "limited-srgb"
+        }
+        .to_owned())
+    }
+    #[setter(name = "colorSpace", coerce, hint(js(ce_reactions)))]
+    fn set_color_space(&self, value: &str) -> OpResult<()> {
+        self.base.base.base.set_attribute_core("colorspace", value)
+    }
     fn show_picker(&self, ctx: &mut Ctx) -> OpResult<()> {
         let node = &self.base.base.base;
         node.realm.request_file_picker(ctx, node.id)
@@ -9395,12 +9512,28 @@ impl DomTemplateElement {
         let graph = template_graph::ArenaGraph::new(&node.realm)?;
         Ok(graph.owner(content)?.wrap(ctx, content))
     }
+    #[getter(name = "htmlFor")]
+    fn html_for(&self) -> OpResult<String> { Ok(self.base.base.base.get_null_attribute("for")?.unwrap_or_default()) }
+    #[setter(name = "htmlFor", coerce, hint(js(ce_reactions)))]
+    fn set_html_for(&self, value: &str) -> OpResult<()> { self.base.base.base.set_attribute_core("for", value) }
 }
 event_content_handlers::bind_node_handlers! { DomHtmlElement {
     #[getter(name = "inputMode")]
     fn input_mode(&self) -> OpResult<String> { html_interfaces::reflected_keyword(&self.base.base, "inputmode", &["none","text","tel","url","email","numeric","decimal","search"], "", "") }
     #[setter(name = "inputMode", coerce, hint(js(ce_reactions)))]
     fn set_input_mode(&self, value: &str) -> OpResult<()> { self.base.base.set_attribute_core("inputmode", value) }
+    #[getter(name = "writingSuggestions")]
+    fn writing_suggestions(&self)->String {String::from(if read_element_metadata(&self.base.base,lumen_html::element_metadata::writing_suggestions_enabled) {"true"}else{"false"})}
+    #[setter(name = "writingSuggestions", coerce, hint(js(ce_reactions)))]
+    fn set_writing_suggestions(&self, value: &str) -> OpResult<()> { self.base.base.set_attribute_core("writingsuggestions", value) }
+    #[getter]
+    fn autocapitalize(&self)->String {read_element_metadata(&self.base.base,lumen_html::element_metadata::autocapitalize_keyword).to_owned()}
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autocapitalize(&self, value: &str) -> OpResult<()> { self.base.base.set_attribute_core("autocapitalize", value) }
+    #[getter]
+    fn autocorrect(&self)->bool {read_element_metadata(&self.base.base,lumen_html::element_metadata::autocorrect_enabled)}
+    #[setter(coerce, hint(js(ce_reactions)))]
+    fn set_autocorrect(&self, value: bool) -> OpResult<()> { self.base.base.set_attribute_core("autocorrect", if value {"on"}else{"off"}) }
     #[getter(name = "enterKeyHint")]
     fn enter_key_hint(&self) -> OpResult<String> { html_interfaces::reflected_keyword(&self.base.base, "enterkeyhint", &["enter","done","go","next","previous","search","send"], "", "") }
     #[setter(name = "enterKeyHint", coerce, hint(js(ce_reactions)))]
@@ -9478,6 +9611,12 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
         self.base.offset_parent(ctx)
     }
 
+    fn scroll_parent(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let node = &self.base.base;
+        let parent = scroll_parent::scroll_parent(&node.realm, node.id)?;
+        Ok(node.realm.wrap_option(ctx, parent))
+    }
+
     #[getter]
     fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
         self.base.base.style(ctx, this)
@@ -9486,6 +9625,11 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_style(&self, value: &str) -> OpResult<()> {
         self.base.base.set_style(value)
+    }
+
+    #[getter(name = "attributeStyleMap")]
+    fn attribute_style_map(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.attribute_style_map(ctx, this)
     }
 
     #[getter]
@@ -9604,24 +9748,28 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     }
 
     #[getter]
-    fn popover(&self) -> OpResult<String> {
+    fn popover(&self) -> OpResult<Nullable<String>> {
         let node = &self.base.base;
-        dialog_popover::popover_value(&node.realm, node.id)
+        Ok(Nullable(dialog_popover::popover_value(&node.realm, node.id)?))
     }
 
-    #[setter(coerce, hint(js(ce_reactions)))]
-    fn set_popover(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+    #[setter(hint(js(ce_reactions)))]
+    fn set_popover(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
         let node = &self.base.base;
-        dialog_popover::change_popover_value(ctx, &node.realm, node.id, value)
+        let text = match value {
+            Value::Null | Value::Undefined => None,
+            other => Some(ctx.coerce_string(&other).map_err(OpError::thrown)?.to_string()),
+        };
+        dialog_popover::change_popover_value(ctx, &node.realm, node.id, text.as_deref())
     }
 
     #[method(name = "showPopover")]
-    fn show_popover(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<()> {
+    fn show_popover(ctx: &mut Ctx, this: lumen_bind::This<Value>, options: Option<Value>) -> OpResult<()> {
         let (realm, node) = ctx.with_instance::<DomHtmlElement, _>(&this.0, |element| {
             let node = &element.base.base;
             node.realm.resolve_adopted_node(node.id)
         })?;
-        dialog_popover::show_popover(ctx, &realm, node)
+        dialog_popover::show_popover_options(ctx, &realm, node, options)
     }
 
     #[method(name = "hidePopover")]
@@ -9637,13 +9785,13 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     fn toggle_popover(
         ctx: &mut Ctx,
         this: lumen_bind::This<Value>,
-        force: Option<bool>,
+        options: Option<Value>,
     ) -> OpResult<bool> {
         let (realm, node) = ctx.with_instance::<DomHtmlElement, _>(&this.0, |element| {
             let node = &element.base.base;
             node.realm.resolve_adopted_node(node.id)
         })?;
-        dialog_popover::toggle_popover(ctx, &realm, node, force)
+        dialog_popover::toggle_popover_options(ctx, &realm, node, options)
     }
 
     fn click(&self, ctx: &mut Ctx) -> OpResult<()> {
@@ -9804,7 +9952,8 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
         Ok(Nullable(Some(node.realm.selection(node.id)?.0)))
     }
     #[setter]
-    fn set_selection_start(&self, ctx: &mut Ctx, start: usize) -> OpResult<()> {
+    fn set_selection_start(&self, ctx: &mut Ctx, start: u32) -> OpResult<()> {
+        let start = start as usize;
         let node = &self.base.base;
         let (_, end, direction) = node.realm.selection(node.id)?;
         node.realm
@@ -9819,7 +9968,8 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
         Ok(Nullable(Some(node.realm.selection(node.id)?.1)))
     }
     #[setter]
-    fn set_selection_end(&self, ctx: &mut Ctx, end: usize) -> OpResult<()> {
+    fn set_selection_end(&self, ctx: &mut Ctx, end: u32) -> OpResult<()> {
+        let end = end as usize;
         let node = &self.base.base;
         let (start, _, direction) = node.realm.selection(node.id)?;
         node.realm
@@ -9844,10 +9994,11 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     fn set_selection_range(
         &self,
         ctx: &mut Ctx,
-        start: usize,
-        end: usize,
+        start: u32,
+        end: u32,
         direction: Option<String>,
     ) -> OpResult<()> {
+        let (start, end) = (start as usize, end as usize);
         let node = &self.base.base;
         node.realm.set_selection_and_queue_event(
             ctx,
@@ -9862,8 +10013,8 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
         &self,
         ctx: &mut Ctx,
         replacement: &str,
-        start: lumen_bind::Passed<usize>,
-        end: lumen_bind::Passed<usize>,
+        start: lumen_bind::Passed<u32>,
+        end: lumen_bind::Passed<u32>,
         selection_mode: lumen_bind::Passed<Value>,
     ) -> OpResult<()> {
         let mode = match selection_mode.0 {
@@ -9879,8 +10030,8 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
             ctx,
             node.id,
             replacement,
-            start.0,
-            end.0,
+            start.0.map(|value| value as usize),
+            end.0.map(|value| value as usize),
             use_current_selection,
             &mode,
         )
@@ -10082,6 +10233,26 @@ impl DomText {
         let split = node.realm.session.borrow_mut().document_mut().split_text(node.id, offset as usize).map_err(dom_error)?;
         node.realm.invalidate_textarea_ancestor(node.id);
         Ok(node.realm.wrap(ctx, split))
+    }
+
+    fn get_box_quads(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Vec<Value>> {
+        let node = &self.base.base;
+        geometry::get_box_quads(ctx, &node.realm, geometry::Subject::Text(node.id), options)
+    }
+
+    fn convert_quad_from_node(&self, ctx: &mut Ctx, quad: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        let node = &self.base.base;
+        geometry::convert_quad(ctx, &node.realm, geometry::Subject::Text(node.id), quad, from, options)
+    }
+
+    fn convert_rect_from_node(&self, ctx: &mut Ctx, rect: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        let node = &self.base.base;
+        geometry::convert_rect(ctx, &node.realm, geometry::Subject::Text(node.id), rect, from, options)
+    }
+
+    fn convert_point_from_node(&self, ctx: &mut Ctx, point: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        let node = &self.base.base;
+        geometry::convert_point(ctx, &node.realm, geometry::Subject::Text(node.id), point, from, options)
     }
 
     #[getter]
@@ -10367,13 +10538,20 @@ fn construct_legacy_image(
         .map_err(OpError::thrown)
 }
 
-#[lumen_bind::op(name = "Audio", coerce)]
+#[lumen_bind::op(name = "Audio")]
 fn construct_legacy_audio(
     ctx: &mut Ctx,
     this: lumen_bind::This<Value>,
-    source: lumen_bind::Passed<&str>,
+    source: lumen_bind::Passed<Value>,
 ) -> OpResult<Value> {
-    media::legacy_audio_factory(ctx, source.0)?
+    if !ctx.is_constructing() {
+        return Err(OpError::type_error("Failed to construct 'Audio': Please use the 'new' operator"));
+    }
+    let source = match source.0 {
+        None | Some(Value::Undefined) => None,
+        Some(value) => Some(ctx.coerce_string(&value).map_err(OpError::thrown)?.to_string()),
+    };
+    media::legacy_audio_factory(ctx, source.as_deref())?
         .into_factory(ctx, this.0)
         .map_err(OpError::thrown)
 }
@@ -10583,7 +10761,7 @@ impl DomXmlDocument {}
 
 /// The interface of HTML documents; `Document` itself stays the interface of other documents
 /// (`new Document()`).
-#[lumen_bind::class(name = "HTMLDocument", extends = DomDocument, hint(js(webidl)))]
+#[lumen_bind::class(name = "HTMLDocument", extends = DomDocument, hint(js(webidl, named_properties)))]
 pub struct DomHtmlDocument {
     base: DomDocument,
 }
@@ -10598,7 +10776,22 @@ impl lumen::embed::NativeIdentityOwner for DomHtmlDocument {
     }
 }
 #[lumen_bind::methods]
-impl DomHtmlDocument {}
+impl DomHtmlDocument {
+    #[method(hint(js(named_supported)))]
+    fn named_supported(&self, name: &str) -> OpResult<bool> {
+        document_named::supported(&self.base.realm, self.base.base.id, name)
+    }
+
+    #[method(hint(js(named_names)))]
+    fn named_names(&self) -> OpResult<Vec<String>> {
+        document_named::names(&self.base.realm, self.base.base.id)
+    }
+
+    #[method(hint(js(named_getter)))]
+    fn named_getter(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, name: &str) -> OpResult<Value> {
+        document_named::value(ctx, &self.base.realm, self.base.base.id, this.0, name)
+    }
+}
 
 impl DomDocument {
     fn body_node_id(&self) -> OpResult<Option<NodeId>> {
@@ -10772,6 +10965,33 @@ event_content_handlers::bind_node_handlers! { DomDocument {
             .into_iter()
             .map(|node| self.realm.wrap(ctx, node))
             .collect())
+    }
+
+    #[method(name = "caretPositionFromPoint", coerce)]
+    fn caret_position_from_point(&self, ctx: &mut Ctx, x: f64, y: f64, options: Option<Value>) -> OpResult<Value> {
+        let _ = options;
+        caret_position::caret_position_from_point(ctx, &self.realm, x, y)
+    }
+
+    #[method(name = "caretRangeFromPoint", coerce)]
+    fn caret_range_from_point(&self, ctx: &mut Ctx, #[default(0.0)] x: f64, #[default(0.0)] y: f64) -> OpResult<Value> {
+        caret_position::caret_range_from_point(ctx, &self.realm, x, y)
+    }
+
+    fn get_box_quads(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Vec<Value>> {
+        geometry::get_box_quads(ctx, &self.realm, geometry::Subject::Document, options)
+    }
+
+    fn convert_quad_from_node(&self, ctx: &mut Ctx, quad: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_quad(ctx, &self.realm, geometry::Subject::Document, quad, from, options)
+    }
+
+    fn convert_rect_from_node(&self, ctx: &mut Ctx, rect: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_rect(ctx, &self.realm, geometry::Subject::Document, rect, from, options)
+    }
+
+    fn convert_point_from_node(&self, ctx: &mut Ctx, point: Value, from: Value, options: Option<Value>) -> OpResult<Value> {
+        geometry::convert_point(ctx, &self.realm, geometry::Subject::Document, point, from, options)
     }
 
     #[constructor]
@@ -12382,7 +12602,12 @@ impl DomNode {
             .document()
             .attribute_namespace_uri(self.id, name.as_ref())
             .map_err(dom_error)?;
+        let popover = (namespace_uri.is_none() && name.as_ref() == "popover")
+            .then(|| dialog_popover::popover_snapshot(&self.realm, self.id));
         self.set_attribute_by_name_core(name.as_ref(), value)?;
+        if let Some(snapshot) = popover {
+            dialog_popover::popover_attribute_changed(ctx, &self.realm, self.id, snapshot)?;
+        }
         event_content_handlers::attribute_changed(
             ctx,
             &self.realm,
@@ -12404,7 +12629,12 @@ impl DomNode {
             .document()
             .attribute_namespace_uri(self.id, name.as_ref())
             .map_err(dom_error)?;
+        let popover = (existed && namespace_uri.is_none() && name.as_ref() == "popover")
+            .then(|| dialog_popover::popover_snapshot(&self.realm, self.id));
         self.remove_attribute_by_name_core(name.as_ref())?;
+        if let Some(snapshot) = popover {
+            dialog_popover::popover_attribute_changed(ctx, &self.realm, self.id, snapshot)?;
+        }
         if existed {
             event_content_handlers::attribute_changed(
                 ctx,
@@ -18047,9 +18277,9 @@ mod tests {
                     catch (error) { failures.push(`pending image threw ${error.name}`); }
                     const unchanged = Array.from(imageContext.getImageData(0, 0, 1, 1).data).join(',');
                     if (unchanged !== '20,40,200,255') failures.push(`unavailable image changed canvas to ${unchanged}`);
-                    if (imageContext.createPattern(pendingImage) !== null) failures.push('pending pattern was not null');
+                    if (imageContext.createPattern(pendingImage, 'repeat') !== null) failures.push('pending pattern was not null');
                     let patternError;
-                    try { imageContext.createPattern(brokenImage); }
+                    try { imageContext.createPattern(brokenImage, 'repeat'); }
                     catch (error) { patternError = error.name; }
                     if (patternError !== 'InvalidStateError') failures.push(`broken pattern threw ${patternError}`);
                     let brokenDrawError;
