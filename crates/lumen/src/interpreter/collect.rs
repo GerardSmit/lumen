@@ -332,6 +332,7 @@ impl Interp {
     }
 
     fn gc_collect_cycles(&mut self) {
+        let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Gc);
         #[cfg(feature = "embed")]
         crate::embed_convert::retain_host_identities(self);
         self.str_units.clear();

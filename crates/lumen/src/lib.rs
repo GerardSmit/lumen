@@ -54,6 +54,7 @@ mod snapshot_cjs;
 pub use lumen_common::fastalloc;
 pub use lumen_common::limits;
 pub mod gc_log;
+pub mod cpuprof;
 use lumen_common::fasthash;
 mod host;
 mod interpreter;
@@ -575,6 +576,7 @@ thread_local! {
 /// engine on the thread is alive it may be mid-evaluation, so collection waits for the last one.
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.interp.cpuprof_flush_on_drop();
         let last = LIVE_ENGINES
             .try_with(|n| {
                 n.set(n.get().saturating_sub(1));
@@ -646,9 +648,25 @@ impl Engine {
         interpreter::sym_for_reset();
         let _mem = memstats::enter(memstats::Cat::Builtins);
         let _ = LIVE_ENGINES.try_with(|n| n.set(n.get() + 1));
-        Engine {
-            interp: Box::new(Interp::new()),
-        }
+        let mut interp = Box::new(Interp::new());
+        interp.cpuprof_auto_start();
+        Engine { interp }
+    }
+
+    /// Sample this engine's JS stack at about `hz` samples a second (see [`cpuprof`]).
+    /// `LUMEN_CPU_PROF=<path>` does this for the process's first engine.
+    pub fn start_cpu_profile(&mut self, path: Option<std::path::PathBuf>, hz: u32) {
+        self.interp.start_cpu_profile(path, hz);
+    }
+
+    /// Write the folded stacks to the profile's path and print the top-30 tables to stderr.
+    pub fn write_cpu_profile(&mut self) -> Option<std::path::PathBuf> {
+        self.interp.write_cpu_profile()
+    }
+
+    /// The folded stacks recorded so far (`frame;frame;frame count`, outermost first).
+    pub fn cpu_profile_folded(&self) -> Option<String> {
+        self.interp.cpu_profile_folded()
     }
 
     /// Run `src` as a spawned `$262.agent`: the agent may block in `Atomics.wait`, receives

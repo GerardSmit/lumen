@@ -3102,7 +3102,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let st = self.call_js(Helper::Safepoint, &[self.frame]);
         let stack = self.stack.clone();
         self.throw_if(st, to, &stack, stack.len());
-        let full = self.fb.iconst(Type::I64, SAFEPOINT_BUDGET);
+        let full = self.fb.iconst(Type::I64, safepoint_budget());
         self.fb.def_var(bv, full);
         self.fb.jump(cont, &[]);
         self.fb.seal_block(cont);

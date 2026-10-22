@@ -213,6 +213,17 @@ pub(crate) const PTR_MEM: lumen_codegen::MemKind = lumen_codegen::MemKind::I32;
 /// The budget [`JitFrame::budget`] is (re)set to.
 pub(crate) const SAFEPOINT_BUDGET: i64 = 1 << 12;
 
+/// The budget to start a frame with and to reset it to: shorter while the CPU profiler runs, so
+/// its samples are polled at loop turns often enough.
+#[inline(always)]
+pub(crate) fn safepoint_budget() -> i64 {
+    if crate::cpuprof::enabled() {
+        crate::cpuprof::JIT_BUDGET
+    } else {
+        SAFEPOINT_BUDGET
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<Value>() == VALUE_SIZE as usize);
 
 /// `size_of::<Value>()`.
@@ -933,6 +944,7 @@ fn compile(
     undef_ok: &[bool],
     this_val: &Value,
 ) -> Result<Native, String> {
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
     dump_ops(chunk);
     if stats_enabled() {
         eprintln!(
@@ -966,6 +978,7 @@ fn compile_fn(
     guess: bool,
     this_val: &Value,
 ) -> Result<Native, String> {
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
     dump_ops(chunk);
     if stats_enabled() {
         eprintln!("[jit-stats] fn of {} ops", chunk.ops.len());
@@ -1713,7 +1726,7 @@ fn enter(
         this_val: this_val as *const Value,
         exit_depth: 0,
         exception: Value::Undefined,
-        budget: SAFEPOINT_BUDGET,
+        budget: safepoint_budget(),
         exit_hset: 0,
         ta_data: std::ptr::null_mut(),
         ta_len: 0,
@@ -2132,7 +2145,7 @@ pub(crate) unsafe fn call_direct(
         shadow: sh,
         pad6: 0,
         exception: Value::Undefined,
-        budget: SAFEPOINT_BUDGET,
+        budget: safepoint_budget(),
         slots,
         exit_depth: 0,
         consts: chunk.consts.as_ptr(),

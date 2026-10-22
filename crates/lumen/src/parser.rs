@@ -289,6 +289,7 @@ fn parse_script_shared(
     jsx_options: Option<&JsxOptions>,
 ) -> Result<(Vec<Stmt>, Option<String>, bool), ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Parse);
     let whole;
     let pieces: &[&str] = match &shared {
         Some(s) => {
@@ -558,6 +559,7 @@ fn parse_module_impl(
     print_jsx: bool,
 ) -> Result<(Vec<Stmt>, Option<String>), ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Parse);
     let Lexed {
         tokens,
         ts: ts_state,
@@ -805,6 +807,7 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 /// early errors the eager path would have reported at load.
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Parse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
     let pieces = lazy.src.pieces(s, e).ok_or_else(|| ParseError {
         message: "function body range lies outside its source".into(),

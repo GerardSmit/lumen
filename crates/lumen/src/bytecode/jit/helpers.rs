@@ -1072,10 +1072,21 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
 }
 
 pub(crate) unsafe extern "C" fn safepoint(f: *mut JitFrame) -> u32 {
-    (*f).budget = SAFEPOINT_BUDGET;
+    (*f).budget = safepoint_budget();
+    let i = &mut *(*f).interp;
+    if crate::cpuprof::enabled() {
+        // The profiler shortens the budget: poll its flag every time, the full check every 16th.
+        i.gc_tick = i.gc_tick.wrapping_add(1);
+        if i.gc_tick & 15 != 0 {
+            if crate::cpuprof::pending() && i.cpu_prof.is_some() {
+                i.cpuprof_sample();
+            }
+            return STATUS_OK;
+        }
+    }
     // Native code already amortized (the budget), so this is the full check the interpreter's
-    // `gc_check_amortized` falls through to.
-    match (*(*f).interp).gc_check() {
+    // `gc_check` falls through to.
+    match i.gc_check() {
         Ok(()) => STATUS_OK,
         Err(e) => fail(f, e),
     }

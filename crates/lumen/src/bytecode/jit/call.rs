@@ -1964,7 +1964,7 @@ impl Tr<'_, '_> {
         // `TaView` probe before any read.)
         let z64 = self.i64c(0);
         self.fb.store(MemKind::I32U8, nf, z, FRAME_EXCEPTION);
-        let budget = self.i64c(SAFEPOINT_BUDGET);
+        let budget = self.i64c(safepoint_budget());
         self.fb.store(MemKind::I64, nf, budget, FRAME_BUDGET);
         self.fb.store(MemKind::I64, nf, z64, FRAME_EXIT_HSET);
         // The slots: arguments moved in, the rest `undefined`.

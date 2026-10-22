@@ -322,6 +322,7 @@ fn end_realm_or_process(ctx: &mut Ctx, code: i32) -> Result<(), NativeError> {
         if lumen::memstats::enabled() {
             ctx.mem_report();
         }
+        ctx.write_cpu_profile();
         std::process::exit(code);
     };
     realm.exit_code.get_or_insert(code);

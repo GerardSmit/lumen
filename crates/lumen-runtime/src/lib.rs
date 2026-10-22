@@ -425,6 +425,7 @@ impl Runtime {
         if code == 0 {
             lumen_node::shutdown_native_resources(self.engine.ctx());
         }
+        self.engine.write_cpu_profile();
         std::process::exit(code)
     }
 }

@@ -328,6 +328,7 @@ impl Interp {
     }
 }
 
+mod cpu_sample;
 pub(crate) mod frames;
 pub(crate) mod stack_trace;
 pub use frames::FnFrame;
@@ -1273,6 +1274,7 @@ pub struct Interp {
     /// Live user-function activations, oldest first: (fn ptr, fn object, arguments object,
     /// strict). Backs the legacy SpiderMonkey `fn.caller` / `fn.arguments` reflection.
     pub(crate) fn_frames: Vec<FnFrame>,
+    pub(crate) cpu_prof: Option<Box<crate::cpuprof::Profile>>,
     /// Newest pending JIT direct-call record (a `jit::JitFrame` on a shadow stack; 0 = none):
     /// frames native code called directly keep their `fn_frames` entry lazily, linked from
     /// here, logically above every `fn_frames` entry. Push to `fn_frames` only after
@@ -2174,6 +2176,7 @@ impl Interp {
             constructing: false,
             super_call_ok: false,
             fn_frames: Vec::new(),
+            cpu_prof: None,
             jit_frames: 0,
             jit_shadow: None,
             jit_stats: std::cell::Cell::new(crate::JitStats::default()),
@@ -6333,6 +6336,7 @@ impl Interp {
         if self.gc_tick & GC_CALL_POLL_MASK == 0
             || self.terminating
             || lumen_common::buffer::gc_pressure()
+            || (crate::cpuprof::pending() && self.cpu_prof.is_some())
         {
             self.gc_check()
         } else {
@@ -6343,6 +6347,9 @@ impl Interp {
     /// Allocation safe point. When live objects pass the floating threshold, run the cycle
     /// collector; if genuine retention still exceeds `MAX_LIVE`, throw rather than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
+        if crate::cpuprof::pending() {
+            self.cpuprof_sample();
+        }
         self.poll_interrupt()?;
         crate::bytecode::jit::trim_check(self);
         self.check_heap(0)?;

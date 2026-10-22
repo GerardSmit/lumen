@@ -977,6 +977,7 @@ fn compile_with_derived(func: &Function, force_derived: bool) -> Option<Rc<Chunk
     }
     serialize::note_compile();
     let _mem = crate::memstats::enter(crate::memstats::Cat::Compile);
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Compile);
     if !bail_log_enabled() {
         return compile_fresh(func, force_derived);
     }

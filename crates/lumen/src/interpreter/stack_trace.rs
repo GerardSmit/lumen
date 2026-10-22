@@ -382,7 +382,7 @@ impl Sources {
 
     /// The display name of `src`, the line and column of `pos` in it (relative to its body
     /// start; `None` without a position) and its wrapper function.
-    fn describe(&mut self, src: &Src, pos: u32) -> (Value, Option<(u32, u32)>, usize) {
+    pub(super) fn describe(&mut self, src: &Src, pos: u32) -> (Value, Option<(u32, u32)>, usize) {
         let e = self.entry(src);
         let lc = if pos == NO_POS {
             None
@@ -416,7 +416,7 @@ impl Sources {
 }
 
 /// The source text a function's positions are offsets into.
-fn source_of(func: &Function) -> Option<Src> {
+pub(super) fn source_of(func: &Function) -> Option<Src> {
     if let Some(l) = func.lazy.borrow().as_ref() {
         return Some(l.src.clone());
     }
