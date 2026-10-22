@@ -179,7 +179,7 @@ struct NodeImages<'a> {
     paint_definitions: &'a [(Arc<str>, Arc<[Arc<str>]>)],
     paint_registration_revision: u64,
     objects: &'a [(NodeId, crate::object::Representation, Option<crate::object::IntrinsicSize>)],
-    bitmaps: &'a [(NodeId, Arc<ImageData>, crate::responsive_images::ImageMetadata)],
+    bitmaps: &'a [(NodeId, layout::NodeBitmap, crate::responsive_images::ImageMetadata)],
     embedded: &'a [(NodeId, Arc<crate::render_capture::ReservedImageData>)],
     fallback: Option<&'a dyn ImageResolver>,
     /// Every lookup which answered `Pending`: that layout used placeholder
@@ -233,7 +233,7 @@ impl NodeImages<'_> {
             Lookup::NodeFrom(node, base, source) => images.resolve_node_from(*node, base, source),
             Lookup::Request(node, base, source, parameters) => Some(images.resolve_image_request(*node, base, source, *parameters)),
             Lookup::Node(node) => match self.bitmaps.binary_search_by_key(&node.key(), |(id, _, _)| id.key()) {
-                Ok(at) => Some(layout::ImageState::Ready(self.bitmaps[at].1.clone())),
+                Ok(at) => Some(self.bitmaps[at].1.state()),
                 Err(_) => images.resolve_node(*node),
             },
             Lookup::Unknown => None,
@@ -257,8 +257,8 @@ impl ImageResolver for NodeImages<'_> {
     fn svg_fragment(&self)->Option<&crate::svg::Fragment> {self.svg_fragment}
     fn svg_image_viewport(&self)->Option<(f32,f32)> {self.svg_image_viewport}
     fn resolve_viewport(&self,node:Option<NodeId>,base:&str,source:&str,natural:&Arc<crate::paint::ImageData>,width:f32,height:f32,scheme:css::UsedColorScheme)->Option<layout::ImageState> {
-        let committed=node.and_then(|node|self.bitmaps.binary_search_by_key(&node.key(),|(id,_,_)|id.key()).ok()).and_then(|at|Arc::ptr_eq(&self.bitmaps[at].1,natural).then_some(&self.bitmaps[at].2)).and_then(|metadata|metadata.source.as_deref());
-        self.note_optional(self.fallback.and_then(|images|images.resolve_viewport(node,base,committed.unwrap_or(source),natural,width,height,scheme)),||layout::PendingLookup::Unknown)
+        let committed=node.and_then(|node|self.bitmaps.binary_search_by_key(&node.key(),|(id,_,_)|id.key()).ok()).and_then(|at|self.bitmaps[at].1.holds(natural).then_some(&self.bitmaps[at].2)).and_then(|metadata|metadata.source.as_deref());
+        self.note_optional(self.fallback.and_then(|images|images.resolve_viewport(node,base,committed.unwrap_or(source),natural,width,height,scheme)).map(layout::ImageState::materialize),||layout::PendingLookup::Unknown)
     }
     fn paint_input_properties(&self, name: &str) -> Option<&[Arc<str>]> {
         self.paint_definitions.iter().find(|(candidate,_)|candidate.as_ref()==name).map(|(_,inputs)|inputs.as_ref())
@@ -275,7 +275,7 @@ impl ImageResolver for NodeImages<'_> {
     fn node_image_intrinsic_size(&self,node:NodeId,image:&Arc<ImageData>,scheme:css::UsedColorScheme)->Option<crate::object::IntrinsicSize> {
         let owner=self.fallback.and_then(|images|images.node_image_intrinsic_size(node,image,scheme));
         let metadata=self.bitmaps.binary_search_by_key(&node.key(),|(node,_,_)|node.key()).ok()
-            .and_then(|at|Arc::ptr_eq(&self.bitmaps[at].1,image).then_some(&self.bitmaps[at].2));
+            .and_then(|at|self.bitmaps[at].1.holds(image).then_some(&self.bitmaps[at].2));
         if let Some(metadata)=metadata {
             let raw=owner.or(metadata.intrinsic).unwrap_or(crate::object::IntrinsicSize{width:Some(image.width as f32),height:Some(image.height as f32),ratio:(image.height!=0).then(||image.width as f32/image.height as f32)});
             raw.density_corrected(metadata.density)
@@ -293,11 +293,11 @@ impl ImageResolver for NodeImages<'_> {
     }
     fn resolve(&self, source: &str) -> layout::ImageState {
         self.note(self.fallback
-            .map_or(layout::ImageState::Failed, |images| images.resolve(source)), || layout::PendingLookup::Source(source.into()))
+            .map_or(layout::ImageState::Failed, |images| images.resolve(source).materialize()), || layout::PendingLookup::Source(source.into()))
     }
     fn resolve_from(&self, base: &str, source: &str) -> layout::ImageState {
         self.note(self.fallback.map_or(layout::ImageState::Failed, |images| {
-            images.resolve_from(base, source)
+            images.resolve_from(base, source).materialize()
         }), || layout::PendingLookup::From(base.into(), source.into()))
     }
     fn origin_clean_from(&self, base: &str, source: &str) -> bool {
@@ -311,10 +311,10 @@ impl ImageResolver for NodeImages<'_> {
         source: &str,
     ) -> Option<layout::ImageState> {
         self.note_optional(self.fallback
-            .and_then(|images| images.resolve_node_from(node, base, source)), || layout::PendingLookup::NodeFrom(node, base.into(), source.into()))
+            .and_then(|images| images.resolve_node_from(node, base, source)).map(layout::ImageState::materialize), || layout::PendingLookup::NodeFrom(node, base.into(), source.into()))
     }
     fn resolve_image_request(&self,node:NodeId,base:&str,source:&str,parameters:layout::ImageRequestParameters)->layout::ImageState {
-        self.note(self.fallback.map_or(layout::ImageState::Failed,|images|images.resolve_image_request(node,base,source,parameters)), || layout::PendingLookup::Request(node, base.into(), source.into(), parameters))
+        self.note(self.fallback.map_or(layout::ImageState::Failed,|images|images.resolve_image_request(node,base,source,parameters).materialize()), || layout::PendingLookup::Request(node, base.into(), source.into(), parameters))
     }
     fn node_origin_clean(&self, node: NodeId, base: &str, source: &str) -> bool {
         self.fallback
@@ -322,8 +322,8 @@ impl ImageResolver for NodeImages<'_> {
     }
     fn resolve_node(&self, node: NodeId) -> Option<layout::ImageState> {
         self.bitmaps.binary_search_by_key(&node.key(),|(id,_,_)|id.key()).ok()
-            .map(|at|layout::ImageState::Ready(self.bitmaps[at].1.clone()))
-            .or_else(|| self.note_optional(self.fallback.and_then(|images| images.resolve_node(node)), || layout::PendingLookup::Node(node)))
+            .map(|at|self.bitmaps[at].1.state())
+            .or_else(|| self.note_optional(self.fallback.and_then(|images| images.resolve_node(node)).map(layout::ImageState::materialize), || layout::PendingLookup::Node(node)))
     }
     fn generation(&self) -> u64 {
         self.fallback
@@ -360,8 +360,12 @@ impl ImageResolver for NodeImages<'_> {
 struct SnapshotImages<'a>(&'a dyn ImageResolver, &'a Document);
 impl SnapshotImages<'_> {
     fn filtered(&self, state: layout::ImageState, readable: bool) -> layout::ImageState {
-        if readable { return state; }
+        if readable { return state.materialize(); }
         match state {
+            layout::ImageState::Lazy(lazy) => layout::ImageState::Ready(Arc::new(ImageData {
+                width: lazy.width(), height: lazy.height(),
+                pixels: alloc::vec![0; (lazy.width() as usize).saturating_mul(lazy.height() as usize).saturating_mul(4)],
+            })),
             layout::ImageState::Ready(image) => layout::ImageState::Ready(Arc::new(ImageData {
                 width: image.width, height: image.height, pixels: alloc::vec![0; image.pixels.len()],
             })),
@@ -838,7 +842,7 @@ pub struct RenderSession {
     /// `synchronize_form_state`, to tell which elements a generation bump moved.
     synced_interaction: (crate::interaction::InteractionState, u64),
     auto_directionality_scan: Option<(u64, bool)>,
-    node_bitmaps: Vec<(NodeId, Arc<ImageData>, crate::responsive_images::ImageMetadata)>,
+    node_bitmaps: Vec<(NodeId, layout::NodeBitmap, crate::responsive_images::ImageMetadata)>,
     embedded_bitmaps: Vec<(NodeId, Arc<crate::render_capture::ReservedImageData>)>,
     object_representations: Vec<(NodeId, crate::object::Representation, Option<crate::object::IntrinsicSize>)>,
     svg_fragment: Option<Box<crate::svg::Fragment>>,
@@ -1604,8 +1608,8 @@ impl RenderSession {
     pub fn embedded_document_intrinsic_size(&mut self, raster: bool, text: Option<&dyn TextShaper>) -> Result<Option<crate::object::IntrinsicSize>, LayoutError> {
         if raster {
             return Ok(self.node_bitmaps.first().map(|(_, image, _)| crate::object::IntrinsicSize {
-                width: Some(image.width as f32), height: Some(image.height as f32),
-                ratio: (image.height != 0).then(|| image.width as f32 / image.height as f32),
+                width: Some(image.width() as f32), height: Some(image.height() as f32),
+                ratio: (image.height() != 0).then(|| image.width() as f32 / image.height() as f32),
             }));
         }
         let root = self.document.document_element_at(self.document.root()).map_err(|_|LayoutError::InvalidTree)?;
@@ -1671,6 +1675,10 @@ impl RenderSession {
         self.set_node_bitmap_with_metadata(node,image,crate::responsive_images::ImageMetadata{intrinsic,..Default::default()})
     }
     pub fn set_node_bitmap_with_metadata(&mut self,node:NodeId,image:Option<Arc<ImageData>>,metadata:crate::responsive_images::ImageMetadata)->Result<(),LayoutError> {
+        self.set_node_bitmap_source(node,image.map(layout::NodeBitmap::Decoded),metadata)
+    }
+    /// Publishes a decoded or lazily decoded bitmap; a lazy one holds no pixels until layout asks.
+    pub fn set_node_bitmap_source(&mut self,node:NodeId,image:Option<layout::NodeBitmap>,metadata:crate::responsive_images::ImageMetadata)->Result<(),LayoutError> {
         if !metadata.is_valid() {return Err(LayoutError::ImageFailed);}
         // Image Button fetches retain their available image across type
         // changes. The canonical input owner may receive an in-flight result
@@ -1685,7 +1693,7 @@ impl RenderSession {
         let previous=at.ok().map(|at|&self.node_bitmaps[at]);
         if match (previous,image.as_ref()) {
             (None,None)=>true,
-            (Some((_,previous,old)),Some(image))=>Arc::ptr_eq(previous,image) && *old==metadata,
+            (Some((_,previous,old)),Some(image))=>previous.is_same(image) && *old==metadata,
             _=>false,
         } {return Ok(());}
         let first_arrival = previous.is_none() && image.is_some();
@@ -7649,7 +7657,7 @@ mod tests {
         assert_eq!((rect.width,rect.height),(88.0,35.0),"author CSS still controls the real replaced content box and edges");
         session.document_mut().remove_attribute(button,"src").unwrap();
         assert!(!session.display_list(400,200,&NoText).unwrap().0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))),"missing src represents a button rather than its retained image");
-        assert!(session.node_bitmaps.iter().any(|(node,published,_)|*node==button&&Arc::ptr_eq(published,&replacement)),"representation does not discard available request storage");
+        assert!(session.node_bitmaps.iter().any(|(node,published,_)|*node==button&&published.holds(&replacement)),"representation does not discard available request storage");
         session.document_mut().set_attribute(button,"src","actual.png").unwrap();
         assert!(session.display_list(400,200,&NoText).unwrap().0.iter().any(|command|matches!(command,crate::paint::Command::Image{image:published,..}if Arc::ptr_eq(published,&replacement))));
     }

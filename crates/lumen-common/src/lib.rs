@@ -12,6 +12,7 @@ pub mod audio;
 pub mod bidi;
 pub mod bigint;
 pub mod buffer;
+pub mod byte_lru;
 pub mod bytes;
 pub mod civil;
 pub mod codec;

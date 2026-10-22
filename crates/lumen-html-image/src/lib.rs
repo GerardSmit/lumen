@@ -20,11 +20,17 @@ mod border;
 pub mod canvas;
 mod coverage;
 mod gpui;
+mod lazy;
 mod gradient;
 mod pool;
 mod shadow;
 mod snap;
 mod transform;
+
+pub use lazy::{
+    DEFAULT_DECODED_IMAGE_BUDGET, DecodedImageCacheStats, EncodedImage, decoded_image_cache_stats,
+    lazy_image_state, set_decoded_image_budget,
+};
 
 const GLYPH_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const GLYPH_CACHE_ENTRIES: usize = 4096;
@@ -4741,11 +4747,11 @@ fn png_icc_profile(bytes: &[u8]) -> Result<Option<Vec<u8>>, ImageError> {
     Ok(None)
 }
 
-fn decode_raster_image_bounded(
+/// A reader positioned on a supported raster format whose decoded size fits `max_bytes`.
+fn raster_reader(
     bytes: &[u8],
-    apply_orientation: bool,
     max_bytes: usize,
-) -> Result<Rgba8Image, ImageError> {
+) -> Result<image::ImageReader<Cursor<&[u8]>>, ImageError> {
     let format = image::guess_format(bytes).map_err(|_| ImageError::Png("unknown image format"))?;
     if format == image::ImageFormat::Png {
         let dimensions = bytes
@@ -4765,7 +4771,45 @@ fn decode_raster_image_bounded(
     limits.max_image_height = Some(32_768);
     limits.max_alloc = Some(max_bytes as u64);
     reader.limits(limits);
-    let mut decoder = reader
+    Ok(reader)
+}
+
+fn orientation_swaps_axes(orientation: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation;
+    matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+/// The oriented size of a still raster read from its header alone, without decoding pixels.
+/// It agrees with the size `decode_raster_image` produces and applies the same size limits.
+pub fn probe_raster_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
+    let mut decoder = raster_reader(bytes, MAX_IMAGE_BYTES)?
+        .into_decoder()
+        .map_err(|_| ImageError::Png("raster image decoder unavailable"))?;
+    let (width, height) = decoder.dimensions();
+    lumen_common::limits::size::repeat(width as usize, height as usize, MAX_IMAGE_BYTES / 4)
+        .map_err(|_| ImageError::TooLarge)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    Ok(if orientation_swaps_axes(orientation) {
+        (height, width)
+    } else {
+        (width, height)
+    })
+}
+
+fn decode_raster_image_bounded(
+    bytes: &[u8],
+    apply_orientation: bool,
+    max_bytes: usize,
+) -> Result<Rgba8Image, ImageError> {
+    let mut decoder = raster_reader(bytes, max_bytes)?
         .into_decoder()
         .map_err(|_| ImageError::Png("raster image decoder unavailable"))?;
     let (width, height) = decoder.dimensions();
@@ -4782,7 +4826,7 @@ fn decode_raster_image_bounded(
         .map_err(|_| ImageError::Png("raster image decode failed"))?;
     decoded.apply_orientation(orientation);
     let (width, height) = (decoded.width(), decoded.height());
-    let pixels = decoded.to_rgba8().into_raw();
+    let pixels = decoded.into_rgba8().into_raw();
     if pixels.len() > max_bytes {
         return Err(ImageError::TooLarge);
     }

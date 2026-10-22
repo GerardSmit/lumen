@@ -3125,22 +3125,15 @@ impl DomRealm {
         self.font_loading.settle(ctx)
     }
 
-    /// Object URLs are interpreter state, so the realm reads and decodes their bytes for the
-    /// image requests that name them. A revoked URL or undecodable bytes fail the request.
+    /// Object URLs are interpreter state, so the realm reads their bytes for the image requests
+    /// that name them. A still raster keeps its bytes (shared with the blob, so a later revoke does
+    /// not drop them) and decodes its pixels on demand; a revoked URL or unreadable bytes fail it.
     fn decode_blob_images(&self, ctx: &mut Ctx, base: &str) {
-        const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
         let sources = self.images.pending_blob_sources(self.session.borrow().document(), base);
         for source in sources {
             let state = lumen_host::blob::object_url_resource(ctx, &source)
-                .and_then(|resource| {
-                    lumen_html_image::decode_image_with_limit(&resource.bytes, MAX_DECODED_BYTES).ok()
-                })
-                .map_or(lumen_html::layout::ImageState::Failed, |image| {
-                    lumen_html::layout::ImageState::Ready(std::sync::Arc::new(lumen_html::paint::ImageData {
-                        width: image.width,
-                        height: image.height,
-                        pixels: image.pixels,
-                    }))
+                .map_or(lumen_html::layout::ImageState::Failed, |resource| {
+                    lumen_html_image::lazy_image_state(resource.bytes)
                 });
             self.images.provide_blob_image(source, state);
         }
@@ -3361,7 +3354,7 @@ impl DomRealm {
             if session.document().kind(node).is_err() {
                 continue;
             }
-            session.set_node_bitmap_with_metadata(node, image, metadata).map_err(|_| {
+            session.set_node_bitmap_source(node, image, metadata).map_err(|_| {
                 OpError::new(
                     "InvalidStateError",
                     "could not publish the current image bitmap",
@@ -17311,6 +17304,94 @@ mod tests {
             Value::Bool(true)
         ));
         assert!(calls.borrow().is_empty(), "blob sources never reach the embedder resolver");
+    }
+
+    fn png_bytes_literal(width: u32, height: u32, pixels: Vec<u8>, truncate: usize) -> String {
+        let mut bytes = lumen_html_image::encode_png(&lumen_html::paint::ImageData { width, height, pixels });
+        bytes.truncate(bytes.len() - truncate);
+        format!("new Uint8Array([{}])", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(","))
+    }
+
+    #[test]
+    fn blob_images_keep_encoded_bytes_after_revoke_and_decode_again_after_eviction() {
+        use lumen_html::layout::LazyImage as _;
+        let mut engine = Engine::new();
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
+        assert!(lumen_host::lazy_globals::<lumen_host::url::bindings::Module>(engine.ctx()).is_ok());
+        let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
+        realm.set_document_url("https://images.test/page.html");
+        let pixels = vec![200, 10, 20, 255, 30, 220, 40, 255, 50, 60, 230, 255, 70, 80, 90, 255];
+        let expected = "200,10,20,255,30,220,40,255,50,60,230,255,70,80,90,255";
+        script(
+            &mut engine,
+            &format!(
+                "globalThis.png = {}; globalThis.loads = 0; globalThis.image = new Image();
+                 image.onload = () => {{ loads++; URL.revokeObjectURL(image.src); }};
+                 image.src = URL.createObjectURL(new Blob([png], {{ type: 'image/png' }}));",
+                png_bytes_literal(2, 2, pixels, 0)
+            ),
+        );
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(), 1);
+        assert!(scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(
+            script(&mut engine, "loads === 1 && image.complete && image.naturalWidth === 2 && image.naturalHeight === 2"),
+            Value::Bool(true)
+        ));
+        script(
+            &mut engine,
+            "globalThis.canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
+             globalThis.context = canvas.getContext('2d');
+             globalThis.readBack = () => { context.clearRect(0, 0, 2, 2); context.drawImage(image, 0, 0); return Array.from(context.getImageData(0, 0, 2, 2).data).join(','); };",
+        );
+        let first = script(&mut engine, "readBack()");
+        let Value::Str(first) = first else { panic!("pixels") };
+        assert_eq!(first.as_str(), expected);
+
+        let budget = lumen_html_image::decoded_image_cache_stats().budget;
+        lumen_html_image::set_decoded_image_budget(0);
+        let other = lumen_html_image::EncodedImage::probe(lumen_html_image::encode_png(&lumen_html::paint::ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 2, 3, 255],
+        }))
+        .unwrap();
+        other.pixels().unwrap();
+        let second = script(&mut engine, "readBack()");
+        lumen_html_image::set_decoded_image_budget(budget);
+        let Value::Str(second) = second else { panic!("pixels") };
+        assert_eq!(second.as_str(), expected, "an evicted image decodes again to the same pixels");
+    }
+
+    #[test]
+    fn corrupt_image_body_loads_from_its_header_and_fails_when_decoded() {
+        let mut engine = Engine::new();
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
+        assert!(lumen_host::lazy_globals::<lumen_host::url::bindings::Module>(engine.ctx()).is_ok());
+        let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
+        realm.set_document_url("https://images.test/page.html");
+        script(
+            &mut engine,
+            &format!(
+                "globalThis.events = []; globalThis.image = new Image();
+                 image.onload = () => events.push('load'); image.onerror = () => events.push('error');
+                 image.src = URL.createObjectURL(new Blob([{}], {{ type: 'image/png' }}));",
+                png_bytes_literal(4, 4, vec![99; 64], 20)
+            ),
+        );
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(), 1);
+        assert!(scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(
+            script(&mut engine, "events.join() === 'load' && image.complete && image.naturalWidth === 4 && image.naturalHeight === 4"),
+            Value::Bool(true)
+        ));
+        script(
+            &mut engine,
+            "globalThis.outcome = 'pending'; image.decode().then(() => outcome = 'resolved', error => outcome = error.name);
+             globalThis.drawn = (() => { try { document.createElement('canvas').getContext('2d').drawImage(image, 0, 0); return 'drew'; } catch (error) { return error.name; } })();",
+        );
+        realm.queue_image_tasks(engine.ctx()).unwrap();
+        engine.ctx().drain_microtasks_for_host();
+        assert!(matches!(script(&mut engine, "outcome === 'EncodingError' && drawn === 'InvalidStateError'"), Value::Bool(true)));
     }
 
     #[test]

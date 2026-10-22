@@ -2130,6 +2130,7 @@ impl OpError {
                         | "OperationError"
                         | "InvalidNodeTypeError"
                         | "DataCloneError"
+                        | "EncodingError"
                 );
                 let e = if dom {
                     let global = ctx.global_object();

@@ -179,8 +179,112 @@ pub fn canvas_dimension(input: Option<&str>, fallback: u32) -> u32 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImageState {
     Ready(Arc<ImageData>),
+    /// A loaded resource whose pixels are decoded on demand and may be evicted again.
+    /// `RenderSession` materializes it before layout sees it; code calling `layout`
+    /// directly with a resolver that returns it must call `ImageState::materialize`.
+    Lazy(LazyImageHandle),
     Pending,
     Failed,
+}
+
+impl ImageState {
+    /// Decodes a `Lazy` resource: `Ready` pixels, or `Failed` when its body does not decode.
+    pub fn materialize(self) -> ImageState {
+        match self {
+            ImageState::Lazy(lazy) => lazy.pixels().map_or(ImageState::Failed, ImageState::Ready),
+            other => other,
+        }
+    }
+}
+
+/// An image whose dimensions are known from its header while its pixels are decoded on
+/// demand, normally through a bounded cache that may evict and later decode them again.
+pub trait LazyImage {
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    /// The decoded pixels; `None` when the body is corrupt.
+    fn pixels(&self) -> Option<Arc<ImageData>>;
+}
+
+#[derive(Clone)]
+pub struct LazyImageHandle(Rc<dyn LazyImage>);
+
+impl LazyImageHandle {
+    pub fn new(image: Rc<dyn LazyImage>) -> Self {
+        Self(image)
+    }
+    pub fn width(&self) -> u32 {
+        self.0.width()
+    }
+    pub fn height(&self) -> u32 {
+        self.0.height()
+    }
+    pub fn pixels(&self) -> Option<Arc<ImageData>> {
+        self.0.pixels()
+    }
+    pub fn is_same(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl core::fmt::Debug for LazyImageHandle {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "LazyImage({}x{})", self.width(), self.height())
+    }
+}
+
+impl PartialEq for LazyImageHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_same(other)
+    }
+}
+
+/// A bitmap published for a node: decoded pixels, or a lazily decoded resource.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeBitmap {
+    Decoded(Arc<ImageData>),
+    Lazy(LazyImageHandle),
+}
+
+impl NodeBitmap {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Decoded(image) => image.width,
+            Self::Lazy(lazy) => lazy.width(),
+        }
+    }
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Decoded(image) => image.height,
+            Self::Lazy(lazy) => lazy.height(),
+        }
+    }
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Decoded(image) => image.is_valid(),
+            Self::Lazy(lazy) => lazy.width() != 0 && lazy.height() != 0,
+        }
+    }
+    pub fn state(&self) -> ImageState {
+        match self {
+            Self::Decoded(image) => ImageState::Ready(image.clone()),
+            Self::Lazy(lazy) => lazy.pixels().map_or(ImageState::Failed, ImageState::Ready),
+        }
+    }
+    /// Whether `image` is this bitmap's pixels (a lazy bitmap may have been decoded again since).
+    pub fn holds(&self, image: &Arc<ImageData>) -> bool {
+        match self {
+            Self::Decoded(own) => Arc::ptr_eq(own, image),
+            Self::Lazy(lazy) => lazy.width() == image.width && lazy.height() == image.height,
+        }
+    }
+    pub fn is_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Decoded(left), Self::Decoded(right)) => Arc::ptr_eq(left, right),
+            (Self::Lazy(left), Self::Lazy(right)) => left.is_same(right),
+            _ => false,
+        }
+    }
 }
 
 enum HtmlImagePresentation<'a> {

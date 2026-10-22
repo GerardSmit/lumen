@@ -87,6 +87,12 @@ impl Deref for Bytes {
     }
 }
 
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
 impl From<Vec<u8>> for Bytes {
     fn from(bytes: Vec<u8>) -> Bytes {
         Bytes::new(bytes)

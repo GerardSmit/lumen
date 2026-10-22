@@ -4149,7 +4149,7 @@ fn create_image_bitmap(
         data.borrow().read_pixels(ctx)?
     } else {
         match canvas_source_image(ctx, source) {
-            Ok(Some(image)) => image.pixels,
+            Ok(Some(image)) => image.pixels.into_owned(),
             Ok(None) => {
                 return Ok(rejected_image_bitmap(
                     ctx,
@@ -4574,7 +4574,17 @@ fn rejected_image_bitmap(ctx: &mut Ctx, message: &str) -> Value {
 
 /// Original decoded pixels and their coordinate-space dimensions are kept
 /// together only for this consumer operation, never as a second image cache.
-struct CanvasSourceImage {pixels:Rgba8Image,natural:(f64,f64)}
+struct CanvasSourceImage {pixels:SourcePixels,natural:(f64,f64)}
+
+/// An `<img>` draws straight from the shared decoded pixels; every other source owns a snapshot.
+enum SourcePixels {Shared(Arc<Rgba8Image>),Owned(Rgba8Image)}
+impl std::ops::Deref for SourcePixels {
+    type Target=Rgba8Image;
+    fn deref(&self)->&Rgba8Image {match self {Self::Shared(image)=>image,Self::Owned(image)=>image}}
+}
+impl SourcePixels {
+    fn into_owned(self)->Rgba8Image {match self {Self::Shared(image)=>Arc::try_unwrap(image).unwrap_or_else(|shared|(*shared).clone()),Self::Owned(image)=>image}}
+}
 fn canvas_source_image(ctx:&mut Ctx,source:Value)->OpResult<Option<CanvasSourceImage>> {
     let natural=ctx.with_instance::<DomHtmlImageElement,_>(&source,|image|image.image_snapshot().natural_size).ok().flatten();
     Ok(canvas_source_pixels(ctx,source)?.map(|pixels|{
@@ -4583,22 +4593,22 @@ fn canvas_source_image(ctx:&mut Ctx,source:Value)->OpResult<Option<CanvasSourceI
     }))
 }
 
-fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Image>> {
+fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<SourcePixels>> {
     if let Ok(image)=ctx.with_instance::<DomElementImage,_>(&source,|image|image.image.borrow().clone()) {
-        return image.map(|image|Some(image.image.clone())).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
+        return image.map(|image|Some(SourcePixels::Owned(image.image.clone()))).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
     }
     if let Ok(image) = ctx.with_instance::<DomCanvasElement, _>(&source, |canvas| {
         canvas
             .data()
             .and_then(|data| CanvasData::snapshot_for_read(&data))
     }) {
-        return nonempty_canvas_snapshot(image?);
+        return nonempty_canvas_snapshot(image?).map(|image|image.map(SourcePixels::Owned));
     }
     if let Ok(image) = ctx.with_instance::<DomOffscreenCanvas, _>(&source, |canvas| {
         canvas.ensure_attached()?;
         CanvasData::snapshot_for_read(&canvas.data)
     }) {
-        return nonempty_canvas_snapshot(image?);
+        return nonempty_canvas_snapshot(image?).map(|image|image.map(SourcePixels::Owned));
     }
     if let Some(bitmap) = ctx.instance_data::<DomImageBitmap>(&source) {
         return bitmap
@@ -4606,7 +4616,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Im
             .image
             .borrow()
             .clone()
-            .map(Some)
+            .map(|image| Some(SourcePixels::Owned(image)))
             .ok_or_else(|| OpError::new("InvalidStateError", "ImageBitmap is closed"));
     }
     if let Ok((realm, node)) = ctx.with_instance::<DomHtmlImageElement, _>(&source, |image| {
@@ -4614,11 +4624,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Im
         (node.realm.clone(), node.id)
     }) {
         return match realm.images.canvas_image_state(node) {
-            image_loading::CanvasImageState::Available(image, _) => Ok(Some(Rgba8Image {
-                width: image.width,
-                height: image.height,
-                pixels: image.pixels.clone(),
-            })),
+            image_loading::CanvasImageState::Available(image, _) => Ok(Some(SourcePixels::Shared(image))),
             image_loading::CanvasImageState::Unavailable => Ok(None),
             image_loading::CanvasImageState::Broken => Err(OpError::new(
                 "InvalidStateError",
@@ -4634,11 +4640,11 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Im
         let frame = realm
             .media_video_frame(node)
             .ok_or_else(|| OpError::new("InvalidStateError", "video has no current frame"))?;
-        return Ok(Some(Rgba8Image {
+        return Ok(Some(SourcePixels::Owned(Rgba8Image {
             width: frame.width,
             height: frame.height,
             pixels: frame.rgba.as_ref().clone(),
-        }));
+        })));
     }
     let get = |ctx: &mut Ctx, object: &Value, name: &str| {
         ctx.get_member(object, name)
@@ -4699,11 +4705,11 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<Rgba8Im
             "canvas source pixels have an invalid length",
         ));
     }
-    Ok(Some(Rgba8Image {
+    Ok(Some(SourcePixels::Owned(Rgba8Image {
         width,
         height,
         pixels: bytes,
-    }))
+    })))
 }
 
 fn nonempty_canvas_snapshot(image: Rgba8Image) -> OpResult<Option<Rgba8Image>> {
@@ -4734,10 +4740,7 @@ fn canvas_source_origin_clean(ctx: &mut Ctx, source: &Value) -> bool {
         let node = image.image_node();
         (node.realm.clone(), node.id)
     }) {
-        return matches!(
-            realm.images.canvas_image_state(node),
-            image_loading::CanvasImageState::Available(_, true)
-        );
+        return realm.images.canvas_image_origin_clean(node);
     }
     if let Ok((realm, node)) = ctx
         .with_instance::<crate::media::DomHtmlVideoElement, _>(source, |video| {

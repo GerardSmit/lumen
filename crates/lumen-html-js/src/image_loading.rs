@@ -1,13 +1,15 @@
 //! Host-backed image request state for HTMLImageElement.
 //!
 //! Resource bytes and decoding remain the embedder's responsibility through
-//! `ImageResolver`. This module tracks current and pending image requests,
-//! publishes the current decoded bitmap to the render session, and leaves
+//! `ImageResolver`; a resolver may return encoded bytes (`ImageState::Lazy`), in which
+//! case a request keeps only the header size and the pixels are decoded on demand into a
+//! bounded cache. This module tracks current and pending image requests,
+//! publishes the current bitmap to the render session, and leaves
 //! event dispatch to the realm's user-agent task queue.
 
 use lumen_html::{
     Document, Namespace, NodeId, NodeKind,
-    layout::{ImageResolver, ImageState},
+    layout::{ImageResolver, ImageState, NodeBitmap},
     observe::{ObservedKind, ObservedMutation},
     paint::ImageData,
 };
@@ -75,7 +77,7 @@ struct ImageRequest {
     current_src: String,
     generation: u64,
     state: RequestState,
-    image: Option<Arc<ImageData>>,
+    image: Option<NodeBitmap>,
     intrinsic:Option<lumen_html::object::IntrinsicSize>,
     density:f64,
     force_error: bool,
@@ -129,7 +131,7 @@ struct Request {
     // document's available-image list. That update still queues its own load
     // event, but does not need to resolve or decode the URL again.
     ready_event: Option<ImageEventKind>,
-    published_image: Option<Arc<ImageData>>,
+    published_image: Option<NodeBitmap>,
     published_metadata:Option<lumen_html::responsive_images::ImageMetadata>,
 }
 
@@ -143,7 +145,10 @@ pub(crate) struct ImageLoader {
     selection_environment:Cell<Option<(lumen_html::css::MediaEnvironment,f64)>>,
     auto_inputs_epoch:Cell<Option<(u64,u64,usize,u64)>>,
     requests: RefCell<HashMap<NodeId, Request>>,
-    bitmap_updates: RefCell<HashMap<NodeId, (Option<Arc<ImageData>>,lumen_html::responsive_images::ImageMetadata)>>,
+    bitmap_updates: RefCell<HashMap<NodeId, (Option<NodeBitmap>,lumen_html::responsive_images::ImageMetadata)>>,
+    /// Images which may take their width from the rendered box (`sizes=auto`): the only requests
+    /// whose auto width is re-measured when the frame changes.
+    auto_nodes: RefCell<HashSet<NodeId>>,
     next_generation: Cell<u64>,
     tree_generation: Cell<u64>,
     /// Bumped by changes that can alter which images the document owns or how they are
@@ -246,13 +251,16 @@ impl ImageLoader {
         if self.selection_environment.replace(Some((environment,dpr)))!=Some((environment,dpr)){self.invalidate_environment();}
         let epoch=(session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get());
         if self.auto_inputs_epoch.get()==Some(epoch){return;}
-        let nodes=self.requests.borrow().keys().copied().collect::<Vec<_>>();
-        for node in nodes {
-            let width=if session.document().is_connected_element(node){session.image_auto_sizes_width(node)}else{None};
-            let mut requests=self.requests.borrow_mut();let Some(request)=requests.get_mut(&node)else{continue};
-            let next=if session.document().is_connected_element(node){width.or(request.auto_width)}else{None};
+        let mut dropped=Vec::new();
+        for &node in self.auto_nodes.borrow().iter() {
+            let mut requests=self.requests.borrow_mut();let Some(request)=requests.get_mut(&node)else{dropped.push(node);continue};
+            let connected=session.document().is_connected_element(node);
+            let width=if connected{session.image_auto_sizes_width(node)}else{None};
+            let next=if connected{width.or(request.auto_width)}else{None};
             if next!=request.auto_width {request.auto_width=next;request.environment_dirty=true;self.has_dirty.set(true);self.mark_scan_needed();}
+            if next.is_none()&&!lumen_html::responsive_images::allows_auto_sizes(session.document(),node){dropped.push(node);}
         }
+        if !dropped.is_empty(){let mut auto_nodes=self.auto_nodes.borrow_mut();for node in dropped{auto_nodes.remove(&node);}}
         self.auto_inputs_epoch.set(Some((session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get())));
     }
     pub(crate) fn set_policy(&self,policy:Rc<dyn Fn(&str)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>) {
@@ -355,6 +363,9 @@ impl ImageLoader {
             _ => {}
         }
     }
+    fn track_auto(&self,document:&Document,node:NodeId) {
+        if lumen_html::responsive_images::allows_auto_sizes(document,node){self.auto_nodes.borrow_mut().insert(node);}
+    }
     fn note_picture_change(&self,document:&Document,parent:NodeId) {
         if !matches!(document.kind(parent),Ok(NodeKind::Element{namespace:Namespace::Html,name,..})if name=="picture"){return;}
         let mut current=document.first_child(parent).ok().flatten();let mut remaining=document.node_count();
@@ -386,6 +397,7 @@ impl ImageLoader {
         // Register it here so the host pump can retain and resolve it even
         // though it is not reachable from the document tree.
         let request = requests.entry(node).or_default();
+        self.track_auto(document,node);
         // Capture the effective base when the source update is processed,
         // rather than reusing the previous request's base. Even assigning the
         // same relative src can select a new URL after a base change.
@@ -622,7 +634,7 @@ impl ImageLoader {
         request.published_image=image.clone();request.published_metadata=Some(metadata.clone());
         self.bitmap_updates.borrow_mut().insert(node,(image,metadata));
     }
-    pub(crate) fn take_bitmap_updates(&self)->Vec<(NodeId,Option<Arc<ImageData>>,lumen_html::responsive_images::ImageMetadata)> {
+    pub(crate) fn take_bitmap_updates(&self)->Vec<(NodeId,Option<NodeBitmap>,lumen_html::responsive_images::ImageMetadata)> {
         self.bitmap_updates.borrow_mut().drain().map(|(node,(image,metadata))|(node,image,metadata)).collect()
     }
 
@@ -658,8 +670,11 @@ impl ImageLoader {
 
     fn request_natural_dimensions(&self,node:NodeId,request:&Request,scheme:lumen_html::css::UsedColorScheme)->Option<(f64,f64)> {
         let image=request.current.image.as_ref()?;
-        let intrinsic=self.resolver.borrow().as_ref().and_then(|resolver|resolver.node_image_intrinsic_size(node,image,scheme))
-            .or(request.current.intrinsic).unwrap_or(lumen_html::object::IntrinsicSize{width:Some(image.width as f32),height:Some(image.height as f32),ratio:None});
+        let owner=match image {
+            NodeBitmap::Decoded(image)=>self.resolver.borrow().as_ref().and_then(|resolver|resolver.node_image_intrinsic_size(node,image,scheme)),
+            NodeBitmap::Lazy(_)=>None,
+        };
+        let intrinsic=owner.or(request.current.intrinsic).unwrap_or(lumen_html::object::IntrinsicSize{width:Some(image.width() as f32),height:Some(image.height() as f32),ratio:None});
         Some(intrinsic.dimensions_at_density((300.0,150.0),request.current.density))
     }
     /// Width/height fallback does not materialize currentSrc or a full snapshot.
@@ -691,7 +706,10 @@ impl ImageLoader {
             Some(Some(source)) if source.is_empty() => Some(false),
             Some(Some(_)) if request.pending.is_some() => None,
             Some(Some(_)) => match request.current.state {
-                RequestState::Available => Some(true),
+                RequestState::Available => Some(match request.current.image.as_ref() {
+                    Some(NodeBitmap::Lazy(lazy))=>lazy.pixels().is_some(),
+                    _=>true,
+                }),
                 RequestState::Broken => Some(false),
                 RequestState::Unavailable | RequestState::Loading => None,
             },
@@ -705,17 +723,21 @@ impl ImageLoader {
         };
         match request.current.state {
             RequestState::Broken => CanvasImageState::Broken,
-            RequestState::Available => request
-                .current
-                .image
-                .as_ref()
-                .filter(|image| image.is_valid() && image.width != 0 && image.height != 0)
-                .cloned()
-                .map_or(CanvasImageState::Unavailable, |image| {
-                    CanvasImageState::Available(image, request.current.origin_clean)
-                }),
+            RequestState::Available => match request.current.image.as_ref().filter(|image| image.is_valid()).map(NodeBitmap::state) {
+                Some(ImageState::Ready(image)) => CanvasImageState::Available(image, request.current.origin_clean),
+                Some(_) => CanvasImageState::Broken,
+                None => CanvasImageState::Unavailable,
+            },
             RequestState::Unavailable | RequestState::Loading => CanvasImageState::Unavailable,
         }
+    }
+
+    /// Whether the node's available image may be read back, without decoding it.
+    pub(crate) fn canvas_image_origin_clean(&self, node: NodeId) -> bool {
+        self.requests.borrow().get(&node).is_some_and(|request|
+            request.current.state == RequestState::Available
+                && request.current.origin_clean
+                && request.current.image.as_ref().is_some_and(NodeBitmap::is_valid))
     }
 
     fn refresh_discovery(&self,document:&Document,base:&str) {
@@ -731,6 +753,7 @@ impl ImageLoader {
             for &node in &discovery.nodes {
                 if let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(node) {
                     entry.insert(Request::default());
+                    self.track_auto(document,node);
                     discovery.seen.insert(node);
                     self.has_dirty.set(true);
                 }
@@ -763,6 +786,7 @@ impl ImageLoader {
             let mut requests=self.requests.borrow_mut();
             for &node in &discovery.nodes {
                 let request=requests.entry(node).or_default();
+                self.track_auto(document,node);
                 // Rediscovery invalidates the observation proof, without
                 // turning unrelated tree changes into new load events.
                 request.observed_version=None;
@@ -786,7 +810,8 @@ impl ImageLoader {
         let epoch=(session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get());
         if self.auto_inputs_epoch.get()==Some(epoch)
             &&self.selection_environment.get().is_some_and(|(environment,_)|environment==session.media_environment()){return false;}
-        self.requests.borrow().keys().any(|&node|session.document().is_connected_element(node)
+        let requests=self.requests.borrow();
+        self.auto_nodes.borrow().iter().any(|&node|requests.contains_key(&node)&&session.document().is_connected_element(node)
             &&lumen_html::responsive_images::allows_auto_sizes(session.document(),node))
     }
 
@@ -854,18 +879,18 @@ impl ImageLoader {
         } in discovery.pending.drain(..)
         {
             let state=self.resolve_request(resolver.as_deref(),node,&base,&current_src,force_error,response_policy.as_ref(),parameters);
-            let (image, kind) = match state {
-                ImageState::Ready(image) if image.is_valid() => (Some(image), ImageEventKind::Load),
-                ImageState::Pending => {
+            let (image, kind) = match completed_bitmap(state) {
+                Some(Some(image)) => (Some(image), ImageEventKind::Load),
+                None => {
                     still_loading = true;
                     continue;
                 }
-                ImageState::Ready(_) | ImageState::Failed => (None, ImageEventKind::Error),
+                Some(None) => (None, ImageEventKind::Error),
             };
-            let intrinsic=image.as_ref().and_then(|image|resolver.as_ref().and_then(|resolver|resolver.node_image_intrinsic_size(node,image,lumen_html::css::UsedColorScheme::Light)));
-            let origin_clean = image.is_some() && resolver
+            let intrinsic=decoded_intrinsic(resolver.as_deref(),node,image.as_ref());
+            let origin_clean = image.is_some() && (current_src.starts_with("blob:") || resolver
                 .as_ref()
-                .is_some_and(|resolver| resolver.node_origin_clean(node, &base, &current_src));
+                .is_some_and(|resolver| resolver.node_origin_clean(node, &base, &current_src)));
             let mut requests = self.requests.borrow_mut();
             let Some(request) = requests.get_mut(&node) else {
                 continue;
@@ -906,17 +931,16 @@ impl ImageLoader {
                 let Some(fetch)=slot.fetch.as_ref()else{continue};
                 let state=self.resolve_request(resolver.as_deref(),fetch.node,fetch.base.as_str(),
                     &fetch.request.current_src,fetch.request.force_error,fetch.request.response_policy.as_ref(),fetch.request.parameters);
-                let (image,kind)=match state {
-                    ImageState::Pending=>{still_loading=true;continue;}
-                    ImageState::Ready(image)if image.is_valid()=>(Some(image),ImageEventKind::Load),
-                    ImageState::Ready(_)|ImageState::Failed=>(None,ImageEventKind::Error),
+                let (image,kind)=match completed_bitmap(state) {
+                    None=>{still_loading=true;continue;}
+                    Some(Some(image))=>(Some(image),ImageEventKind::Load),
+                    Some(None)=>(None,ImageEventKind::Error),
                 };
                 let fetch=slot.fetch.as_mut().expect("completed input fetch checked");
                 slot.completed_node=Some(fetch.node);
-                let intrinsic=image.as_ref().and_then(|image|resolver.as_ref().and_then(|resolver|
-                    resolver.node_image_intrinsic_size(fetch.node,image,lumen_html::css::UsedColorScheme::Light)));
-                let origin_clean=image.is_some()&&resolver.as_ref().is_some_and(|resolver|
-                    resolver.node_origin_clean(fetch.node,fetch.base.as_str(),&fetch.request.current_src));
+                let intrinsic=decoded_intrinsic(resolver.as_deref(),fetch.node,image.as_ref());
+                let origin_clean=image.is_some()&&(fetch.request.current_src.starts_with("blob:")||resolver.as_ref().is_some_and(|resolver|
+                    resolver.node_origin_clean(fetch.node,fetch.base.as_str(),&fetch.request.current_src)));
                 let generation=fetch.request.generation;
                 complete_request(&mut fetch.request,image,intrinsic,kind,origin_clean);
                 queued.push(QueuedImageEvent{node:fetch.node,generation,captured_input:true,kind,input_task:core::num::NonZeroUsize::new(index+1)});
@@ -1085,9 +1109,26 @@ pub(crate) fn natural_dimension(value:f64)->u32 {
     value.trunc().rem_euclid(4294967296.0) as u32
 }
 
+/// `None` while pending; otherwise the usable bitmap, or `None` inside for a failed or empty one.
+fn completed_bitmap(state:ImageState)->Option<Option<NodeBitmap>> {
+    let bitmap=match state {
+        ImageState::Pending=>return None,
+        ImageState::Ready(image)=>NodeBitmap::Decoded(image),
+        ImageState::Lazy(lazy)=>NodeBitmap::Lazy(lazy),
+        ImageState::Failed=>return Some(None),
+    };
+    Some(bitmap.is_valid().then_some(bitmap))
+}
+
+/// Only decoded pixels can carry resolver-defined natural sizes (SVG); lazy ones are plain rasters.
+fn decoded_intrinsic(resolver:Option<&dyn ImageResolver>,node:NodeId,image:Option<&NodeBitmap>)->Option<lumen_html::object::IntrinsicSize> {
+    let NodeBitmap::Decoded(image)=image? else{return None};
+    resolver?.node_image_intrinsic_size(node,image,lumen_html::css::UsedColorScheme::Light)
+}
+
 fn complete_request(
     request: &mut ImageRequest,
-    image: Option<Arc<ImageData>>,
+    image: Option<NodeBitmap>,
     intrinsic:Option<lumen_html::object::IntrinsicSize>,
     kind: ImageEventKind,
     origin_clean: bool,
@@ -1105,10 +1146,10 @@ fn complete_request(
     request.response_policy=None;
 }
 
-fn same_image(left: Option<&Arc<ImageData>>, right: Option<&Arc<ImageData>>) -> bool {
+fn same_image(left: Option<&NodeBitmap>, right: Option<&NodeBitmap>) -> bool {
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (Some(left), Some(right)) => left.is_same(right),
         _ => false,
     }
 }
@@ -1180,11 +1221,21 @@ mod responsive_request_tests {
         {
             let mut requests=loader.requests.borrow_mut();let request=requests.get_mut(&node).unwrap();
             request.current.state=RequestState::Available;request.current.density=4.0;
-            request.current.image=Some(Arc::new(ImageData{width:2,height:2,pixels:vec![0,128,0,255].repeat(4)}));
+            request.current.image=Some(NodeBitmap::Decoded(Arc::new(ImageData{width:2,height:2,pixels:vec![0,128,0,255].repeat(4)})));
         }
         let snapshot=loader.snapshot(&document,node,base,lumen_html::css::UsedColorScheme::Light);
         assert_eq!(snapshot.natural_size,Some((0.5,0.5)));
         assert_eq!((snapshot.natural_width,snapshot.natural_height),(0,0));
+    }
+
+    #[test]
+    fn auto_size_tracking_covers_only_sizes_auto_images() {
+        let document=lumen_html::html::parse("<!doctype html><body><img src='plain.png'><img loading=lazy sizes=auto srcset='a.png 400w'><img loading=lazy srcset='b.png 400w'></body>",32).unwrap();
+        let session=lumen_html::session::RenderSession::new(document);
+        let loader=ImageLoader::default();
+        assert!(loader.needs_auto_layout(&session,"https://images.test/page.html"));
+        assert_eq!(loader.requests.borrow().len(),3);
+        assert_eq!(loader.auto_nodes.borrow().len(),1);
     }
 
     #[test]

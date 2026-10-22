@@ -939,6 +939,9 @@ pub struct CanvasSurface {
     width: u32,
     height: u32,
     bitmap: Option<Pixmap>,
+    /// A non-empty canvas whose pixmap is not allocated yet: it reads as transparent black
+    /// and is allocated by the first operation that draws.
+    lazy: bool,
     state: DrawingState,
     saved: Vec<DrawingState>,
     generation: u64,
@@ -953,10 +956,12 @@ struct CanvasLayer {
 
 impl CanvasSurface {
     pub fn new(width: u32, height: u32) -> Result<Self, ImageError> {
+        pixel_bytes(width, height)?;
         Ok(Self {
             width,
             height,
-            bitmap: allocate(width, height)?,
+            bitmap: None,
+            lazy: width != 0 && height != 0,
             state: DrawingState::default(),
             saved: Vec::new(),
             generation: 0,
@@ -980,14 +985,23 @@ impl CanvasSurface {
     /// Setting either DOM bitmap dimension resets pixels and all drawing state,
     /// including when the new dimensions equal the previous ones.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), ImageError> {
-        let bitmap = allocate(width, height)?;
+        pixel_bytes(width, height)?;
         self.width = width;
         self.height = height;
-        self.bitmap = bitmap;
+        self.bitmap = None;
+        self.lazy = width != 0 && height != 0;
         self.state = DrawingState::default();
         self.saved.clear();
         self.layers.clear();
         self.changed();
+        Ok(())
+    }
+
+    fn materialize(&mut self) -> Result<(), ImageError> {
+        if self.lazy {
+            self.bitmap = allocate(self.width, self.height)?;
+            self.lazy = false;
+        }
         Ok(())
     }
 
@@ -1013,6 +1027,7 @@ impl CanvasSurface {
             .is_none_or(|bytes| bytes > MAX_IMAGE_BYTES) {
             return Err(ImageError::TooLarge);
         }
+        self.materialize()?;
         let bitmap = allocate(self.width, self.height)?;
         self.layers.push(CanvasLayer {
             bitmap: std::mem::replace(&mut self.bitmap, bitmap),
@@ -1095,14 +1110,14 @@ impl CanvasSurface {
         let target_width = (target_width as u32).max(1);
         let target_height = (target_height as u32).max(1);
         let filtered = if target_width == image.width && target_height == image.height {
-            image.clone()
+            std::borrow::Cow::Borrowed(image)
         } else {
-            resize_image_straight_with_quality(
+            std::borrow::Cow::Owned(resize_image_straight_with_quality(
                 image,
                 target_width,
                 target_height,
                 ImageResizeQuality::Medium,
-            )?
+            )?)
         };
         self.draw_image_legacy_impl(&filtered, x, y, width, height)
     }
@@ -1200,6 +1215,7 @@ impl CanvasSurface {
         } else {
             (y, height)
         };
+        self.materialize()?;
         let source = premultiplied_pixmap(image)?;
         let sx = width / image.width as f32;
         let sy = height / image.height as f32;
@@ -1350,9 +1366,10 @@ impl CanvasSurface {
         let run = font
             .shape_canvas_text(text, size, rtl, font_spec, options)
             .map_err(|_| ImageError::Font("text shaping failed"))?;
-        if run.glyphs.is_empty() || self.bitmap.is_none() {
+        if run.glyphs.is_empty() || self.width == 0 || self.height == 0 {
             return Ok(run.width);
         }
+        self.materialize()?;
         let horizontal_scale = max_width
             .filter(|width| width.is_finite() && *width >= 0.0 && run.width > *width)
             .map_or(1.0, |width| width / run.width);
@@ -1557,9 +1574,10 @@ impl CanvasSurface {
         let run = font
             .shape_canvas_text(text, size, rtl, font_spec, options)
             .map_err(|_| ImageError::Font("text shaping failed"))?;
-        if run.glyphs.is_empty() || self.bitmap.is_none() {
+        if run.glyphs.is_empty() || self.width == 0 || self.height == 0 {
             return Ok(run.width);
         }
+        self.materialize()?;
         let horizontal_scale = max_width
             .filter(|width| width.is_finite() && *width >= 0.0 && run.width > *width)
             .map_or(1.0, |width| width / run.width);
@@ -1703,6 +1721,11 @@ impl CanvasSurface {
         let Some(rect) = rectangle(x, y, width, height) else {
             return Ok(());
         };
+        if clear && self.lazy {
+            self.changed();
+            return Ok(());
+        }
+        self.materialize()?;
         let gradient_image = if clear {
             None
         } else {
@@ -1770,6 +1793,7 @@ impl CanvasSurface {
     }
 
     pub fn fill_path(&mut self, path: &Path, rule: FillRule) -> Result<(), ImageError> {
+        self.materialize()?;
         let gradient_image = self
             .state
             .fill_gradient
@@ -1822,6 +1846,7 @@ impl CanvasSurface {
 
     pub(crate) fn source_path_bounded(&mut self,path:&Path,rule:FillRule,stroke:bool,max_bytes:usize)->Result<(),ImageError> {
         if self.state.shadow_color[3]!=0 || self.state.fill_pattern.is_some() || self.state.stroke_pattern.is_some() {return Err(ImageError::InvalidViewport);}
+        self.materialize()?;
         let gradient=if stroke{self.state.stroke_gradient.as_ref()}else{self.state.fill_gradient.as_ref()};
         let custom=gradient.map(|gradient|gradient.equal_radial_bitmap_with_budget(self.width,self.height,Some(max_bytes))).transpose()?.flatten();
         let remaining=max_bytes.checked_sub(custom.as_ref().map_or(0,|bitmap|bitmap.data().len())).ok_or(ImageError::TooLarge)?;
@@ -1835,6 +1860,7 @@ impl CanvasSurface {
     }
 
     pub fn stroke_path(&mut self, path: &Path) -> Result<(), ImageError> {
+        self.materialize()?;
         let gradient_image = self
             .state
             .stroke_gradient
@@ -1968,6 +1994,9 @@ impl CanvasSurface {
                 let c = pixel.demultiply();
                 pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
             }
+        } else if self.lazy {
+            pixels.reserve_exact(self.width as usize * self.height as usize * 4);
+            pixels.resize(self.width as usize * self.height as usize * 4, 0);
         }
         Rgba8Image {
             width: self.width,
@@ -1979,6 +2008,9 @@ impl CanvasSurface {
     /// Clears the bitmap for `transferToImageBitmap` without resetting the
     /// context's drawing state.
     pub fn clear_bitmap(&mut self) {
+        if self.lazy {
+            self.changed();
+        }
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.fill(Color::TRANSPARENT);
             self.changed();
@@ -2090,6 +2122,7 @@ impl CanvasSurface {
         let end_col = u32::try_from(end_col).map_err(|_| ImageError::InvalidViewport)?;
         let end_row = u32::try_from(end_row).map_err(|_| ImageError::InvalidViewport)?;
         let mut changed = false;
+        self.materialize()?;
         if let Some(bitmap) = &mut self.bitmap {
             for row in first_row..end_row {
                 for col in first_col..end_col {
@@ -2245,12 +2278,15 @@ fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
     if image.pixels.len() != pixel_bytes(image.width, image.height)? {
         return Err(ImageError::InvalidViewport);
     }
-    let mut premultiplied = image.pixels.clone();
-    for pixel in premultiplied.chunks_exact_mut(4) {
+    let mut premultiplied = Vec::with_capacity(image.pixels.len());
+    for pixel in image.pixels.chunks_exact(4) {
         let alpha = u16::from(pixel[3]);
-        pixel[0] = ((u16::from(pixel[0]) * alpha + 127) / 255) as u8;
-        pixel[1] = ((u16::from(pixel[1]) * alpha + 127) / 255) as u8;
-        pixel[2] = ((u16::from(pixel[2]) * alpha + 127) / 255) as u8;
+        premultiplied.extend_from_slice(&[
+            ((u16::from(pixel[0]) * alpha + 127) / 255) as u8,
+            ((u16::from(pixel[1]) * alpha + 127) / 255) as u8,
+            ((u16::from(pixel[2]) * alpha + 127) / 255) as u8,
+            pixel[3],
+        ]);
     }
     let size =
         tiny_skia::IntSize::from_wh(image.width, image.height).ok_or(ImageError::TooLarge)?;
@@ -2451,6 +2487,45 @@ mod tests {
         canvas.state_mut().fill = [0, 255, 0, 255];
         canvas.restore();
         assert!(canvas.state().fill_gradient.is_some());
+    }
+
+    #[test]
+    fn pixmap_is_allocated_by_the_first_draw_and_untouched_canvases_read_transparent() {
+        let mut canvas = CanvasSurface::new(4, 3).unwrap();
+        assert!(canvas.bitmap.is_none() && canvas.lazy);
+        assert!(canvas.read_pixels(0, 0, 4, 3).unwrap().pixels.iter().all(|byte| *byte == 0));
+        let snapshot = canvas.snapshot();
+        assert_eq!((snapshot.width, snapshot.height, snapshot.pixels.len()), (4, 3, 48));
+        assert!(snapshot.pixels.iter().all(|byte| *byte == 0));
+        let generation = canvas.generation();
+        canvas.clear_rect(0.0, 0.0, 4.0, 3.0);
+        canvas.clear_bitmap();
+        assert!(canvas.bitmap.is_none() && canvas.lazy, "clearing a blank canvas allocates nothing");
+        assert!(canvas.generation() > generation);
+
+        canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
+        assert!(canvas.bitmap.is_some() && !canvas.lazy);
+        assert_eq!(canvas.read_pixels(0, 0, 2, 1).unwrap().pixels, vec![0, 0, 0, 255, 0, 0, 0, 0]);
+
+        canvas.resize(2, 2).unwrap();
+        assert!(canvas.bitmap.is_none() && canvas.lazy);
+        assert!(canvas.snapshot().pixels.iter().all(|byte| *byte == 0));
+        canvas.resize(0, 5).unwrap();
+        assert!(!canvas.lazy && canvas.snapshot().pixels.is_empty());
+    }
+
+    #[test]
+    fn writing_pixels_and_layers_allocate_the_pixmap_first() {
+        let mut canvas = CanvasSurface::new(2, 1).unwrap();
+        let source = Rgba8Image { width: 1, height: 1, pixels: vec![10, 20, 30, 255] };
+        canvas.write_pixels(&source, 1, 0).unwrap();
+        assert_eq!(canvas.read_pixels(0, 0, 2, 1).unwrap().pixels, vec![0, 0, 0, 0, 10, 20, 30, 255]);
+
+        let mut canvas = CanvasSurface::new(2, 1).unwrap();
+        canvas.begin_layer().unwrap();
+        canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
+        canvas.end_layer().unwrap();
+        assert_eq!(canvas.read_pixels(0, 0, 1, 1).unwrap().pixels, vec![0, 0, 0, 255]);
     }
 
     #[test]
