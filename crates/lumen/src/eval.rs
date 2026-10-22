@@ -1563,6 +1563,24 @@ impl Interp {
         Ok(())
     }
 
+    /// The elements a pristine Array iterates (see [`Interp::pristine_array_iteration`]).
+    fn pristine_array_values(&mut self, v: &Value, o: &Gc) -> Result<Vec<Value>, Abrupt> {
+        if let Some(out) = self.dense_array_values(o) {
+            return Ok(out);
+        }
+        let len = self.checked_array_len(o)?;
+        let mut out = Vec::with_capacity(len.min(1024));
+        // The Array Iterator re-reads `length` each step: a getter may grow or shrink it.
+        let mut i = 0;
+        while i < self.array_length(o) {
+            self.poll_native(i)?;
+            self.check_grow(&out)?;
+            out.push(self.get_member(v, &i.to_string())?);
+            i += 1;
+        }
+        Ok(out)
+    }
+
     /// Collect every value an iterable yields. Strings and plain arrays use a fast path; everything
     /// else goes through the `Symbol.iterator` protocol (call `@@iterator`, then drain `.next()`).
     pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
@@ -1583,20 +1601,7 @@ impl Interp {
             // A pristine Array iterates as its own elements (holes read through [[Get]], which
             // is what the intrinsic iterator does); any other Array uses the protocol.
             Value::Obj(o) if self.pristine_array_iteration(o) => {
-                if let Some(out) = self.dense_array_values(o) {
-                    return Ok(out);
-                }
-                let len = self.checked_array_len(o)?;
-                let mut out = Vec::with_capacity(len.min(1024));
-                // The Array Iterator re-reads `length` each step: a getter may grow or shrink it.
-                let mut i = 0;
-                while i < self.array_length(o) {
-                    self.poll_native(i)?;
-                    self.check_grow(&out)?;
-                    out.push(self.get_member(v, &i.to_string())?);
-                    i += 1;
-                }
-                return Ok(out);
+                return self.pristine_array_values(v, o);
             }
             _ => {}
         }
@@ -1642,6 +1647,11 @@ impl Interp {
     /// Drive the iterator protocol on `v` using an already-resolved `@@iterator` method `itfn`
     /// (so callers that fetched it via GetMethod don't re-read the property).
     pub(crate) fn iterate_with(&mut self, v: &Value, itfn: Value) -> Result<Vec<Value>, Abrupt> {
+        if let Value::Obj(o) = v {
+            if self.pristine_array_iteration_with(o, &itfn) {
+                return self.pristine_array_values(v, o);
+            }
+        }
         let iter = self.call(itfn, v.clone(), &[])?;
         let next = self.get_member(&iter, "next")?;
         if !next.is_callable() {

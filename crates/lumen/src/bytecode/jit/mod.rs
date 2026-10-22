@@ -739,6 +739,8 @@ mod evict_tests;
 mod int32_tests;
 #[cfg(test)]
 mod shadow_tests;
+#[cfg(test)]
+mod switch_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside

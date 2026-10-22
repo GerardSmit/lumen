@@ -1679,8 +1679,18 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 kind,
                 track: false,
             };
-            for (idx, item) in items.iter().enumerate() {
-                ab(i.ta_store(&info, idx, item))?;
+            if !kind.is_bigint() && items.iter().all(|v| matches!(v, Value::Num(_))) {
+                i.with_buffer_bytes_mut(bp, |buf| {
+                    for (chunk, item) in buf.chunks_exact_mut(es).zip(&items) {
+                        if let Value::Num(n) = item {
+                            kind.write(*n, chunk);
+                        }
+                    }
+                });
+            } else {
+                for (idx, item) in items.iter().enumerate() {
+                    ab(i.ta_store(&info, idx, item))?;
+                }
             }
             (bv, bp, 0, len, false)
         }
@@ -2317,7 +2327,7 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
             } else {
                 v
             };
-            ab(i.set_member(&ta, &k.to_string(), val))?;
+            ab(i.set_elem_slow(&ta, &Value::Num(k as f64), val))?;
         }
         return Ok(ta);
     }
@@ -2329,13 +2339,13 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     let ta = ab(i.construct(this, &len_args))?;
     let ta = ta_validate_created(i, ta, &len_args, true)?;
     for k in 0..len {
-        let v = ab(i.get_member(&src, &k.to_string()))?;
+        let v = ab(i.get_elem_slow(&src, &Value::Num(k as f64)))?;
         let val = if mapfn.is_callable() {
             ab(i.call(mapfn.clone(), this_arg.clone(), &[v, Value::Num(k as f64)]))?
         } else {
             v
         };
-        ab(i.set_member(&ta, &k.to_string(), val))?;
+        ab(i.set_elem_slow(&ta, &Value::Num(k as f64), val))?;
     }
     Ok(ta)
 }

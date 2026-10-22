@@ -2736,8 +2736,7 @@ fn run_vm_frames<const ONE: bool>(
                 if matches!(obj, Value::Undefined | Value::Null) {
                     return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
-                let k = i.to_property_key(&key)?;
-                let v = i.get_member(&obj, &k)?;
+                let v = i.get_elem_slow(&obj, &key)?;
                 stack.push(v);
             }
             Op::SetElem => {
@@ -2752,15 +2751,13 @@ fn run_vm_frames<const ONE: bool>(
                             continue;
                         }
                         Err(back) => {
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
+                            i.set_elem_slow(&obj, &key, back)?;
                             stack.push(ret);
                             continue;
                         }
                     }
                 }
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v.clone())?;
+                i.set_elem_slow(&obj, &key, v.clone())?;
                 stack.push(v);
             }
             Op::SetElemDrop => {
@@ -2771,14 +2768,12 @@ fn run_vm_frames<const ONE: bool>(
                     match i.fast_set_elem(o, *n, v) {
                         Ok(()) => continue,
                         Err(back) => {
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
+                            i.set_elem_slow(&obj, &key, back)?;
                             continue;
                         }
                     }
                 }
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v)?;
+                i.set_elem_slow(&obj, &key, v)?;
             }
             Op::ArgsLen(s, tag) => {
                 let v = virt_len(i, slots, s, tag)?;
@@ -2820,8 +2815,7 @@ fn run_vm_frames<const ONE: bool>(
                 if matches!(obj, Value::Undefined | Value::Null) {
                     return Err(i.throw("TypeError", i.null_read_message(&obj, Some(&key))));
                 }
-                let k = i.to_property_key(&key)?;
-                let v = i.get_member(&obj, &k)?;
+                let v = i.get_elem_slow(&obj, &key)?;
                 stack.push(v);
             }
             Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
@@ -2836,15 +2830,13 @@ fn run_vm_frames<const ONE: bool>(
                         Ok(()) => continue,
                         Err(back) => {
                             let obj = slots[s as usize].clone();
-                            let k = i.to_property_key(&key)?;
-                            i.set_member(&obj, &k, back)?;
+                            i.set_elem_slow(&obj, &key, back)?;
                             continue;
                         }
                     }
                 }
                 let obj = slots[s as usize].clone();
-                let k = i.to_property_key(&key)?;
-                i.set_member(&obj, &k, v)?;
+                i.set_elem_slow(&obj, &key, v)?;
             }
             Op::UpdateProp(n, c, kind) => {
                 let obj = pop!();
@@ -2937,10 +2929,7 @@ fn run_vm_frames<const ONE: bool>(
                 let m = if let (Value::Obj(o), Value::Num(n)) = (&obj, &key) {
                     match i.fast_get_elem(o, *n) {
                         Some(v) => v,
-                        None => {
-                            let k = i.to_property_key(&key)?;
-                            i.get_member(&obj, &k)?
-                        }
+                        None => i.get_elem_slow(&obj, &key)?,
                     }
                 } else {
                     if matches!(obj, Value::Undefined | Value::Null) {
@@ -4711,8 +4700,7 @@ impl Chunk {
             Op::ArrayCbGuard(_) => (2, 3),
             Op::ArrayCbHas => (2, 1),
             Op::ArrayCbDone(_) => (0, 0),
-            // A computed jump: the stack-depth analysis (and the JIT) stay off these chains.
-            Op::SwitchLK(..) => return None,
+            Op::SwitchLK(..) => (0, 0),
             // Derived-constructor ops: `super(…)` runs as a generic op, the return exits.
             Op::SuperCtor => (0, 2),
             Op::SuperCall(n) | Op::SuperCallSpread(n) => (*n as usize + 2, 1),

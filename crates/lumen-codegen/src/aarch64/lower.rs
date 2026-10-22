@@ -712,6 +712,7 @@ struct Lower<'a> {
     bmap: Vec<usize>,
     outgoing: u32,
     has_traps: bool,
+    has_v128: bool,
 }
 
 pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
@@ -1077,6 +1078,7 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
         bmap,
         outgoing: 0,
         has_traps: false,
+        has_v128: f.values.iter().any(|v| v.ty == Type::V128),
     };
 
     if pre_entry {
@@ -1548,7 +1550,7 @@ impl Lower<'_> {
             rets,
             clobbers: {
                 let mut clobbers = self.abi.call_clobbers;
-                if self.f.values.iter().any(|v| v.ty == Type::V128) {
+                if self.has_v128 {
                     // AAPCS64 preserves only the lower 64 bits of v8-v15.
                     for n in 8..=15 {
                         clobbers.insert(PReg::float(n));

@@ -97,6 +97,39 @@ pub(super) fn switch_pass(ops: &mut Vec<Op>) -> usize {
     tables as usize
 }
 
+/// The int32-valued Number cases of the covered chain behind the `SwitchLK` at `pc - 1`, as
+/// `(value, body pc)` in chain order with the first label of a value kept (what the table and
+/// the chain both pick). Native code dispatches on these and falls into the chain on any other
+/// discriminant.
+pub(super) fn int_cases(ops: &[Op], pc: usize, slot: u16, consts: &[Value]) -> Vec<(i32, u32)> {
+    let mut out: Vec<(i32, u32)> = Vec::new();
+    let mut p = pc;
+    while p + 1 < ops.len() {
+        let (Op::JumpIfNotCmpLK(CmpKind::StrictEq, s, k, next), Op::Jump(body)) =
+            (ops[p], ops[p + 1])
+        else {
+            break;
+        };
+        if s != slot || next as usize != p + 2 {
+            break;
+        }
+        match &consts[k as usize] {
+            Value::Num(x) => {
+                if x.fract() == 0.0 && x.abs() <= i32::MAX as f64 {
+                    let key = *x as i32;
+                    if !out.iter().any(|&(c, _)| c == key) {
+                        out.push((key, body));
+                    }
+                }
+            }
+            Value::Str(_) => {}
+            _ => break,
+        }
+        p += 2;
+    }
+    out
+}
+
 impl SwitchTable {
     /// Build from the chain following the `SwitchLK` at `pc - 1` (post-pass pcs). The covered
     /// prefix stops at the first case constant that is neither a Number nor a String.

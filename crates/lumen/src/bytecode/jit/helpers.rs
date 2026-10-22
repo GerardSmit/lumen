@@ -1003,10 +1003,15 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
             let i = &mut *(*f).interp;
             let object_value = (*object).clone();
             let key = std::ptr::replace((*f).stack.add(key_at), Value::Undefined);
-            let result = if matches!(object_value, Value::Undefined | Value::Null) {
-                Err(i.throw("TypeError", i.null_read_message(&object_value, Some(&key))))
-            } else {
-                i.to_property_key(&key).and_then(|key| i.get_member(&object_value, &key))
+            let result = match (&object_value, &key) {
+                (Value::Undefined | Value::Null, _) => {
+                    Err(i.throw("TypeError", i.null_read_message(&object_value, Some(&key))))
+                }
+                (Value::Obj(o), Value::Num(n)) => match i.fast_get_elem(o, *n) {
+                    Some(v) => Ok(v),
+                    None => i.get_elem_slow(&object_value, &key),
+                },
+                _ => i.get_elem_slow(&object_value, &key),
             };
             if consume { *object = Value::Undefined; }
             return match result {

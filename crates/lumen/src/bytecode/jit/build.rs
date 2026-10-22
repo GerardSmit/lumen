@@ -841,7 +841,7 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
                 back[t - header] += 1;
             }
         }
-        if (target.is_some() || !falls) && inr(pc + 1) {
+        if (target.is_some() || !falls || matches!(op, Op::SwitchLK(..))) && inr(pc + 1) {
             leader[pc + 1 - header] = true;
         }
         if falls && inr(pc + 1) {
@@ -2800,6 +2800,94 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
+    /// The `SwitchLK` at `pc`: a jump table over the integer cases of the chain behind it, when
+    /// the discriminant `s` is a Number local. A discriminant that is no listed integer (a
+    /// fraction, NaN, another case kind) continues into the chain, which stays the reference
+    /// semantics, so the table only ever skips tests that would fail.
+    fn switch_table(&mut self, pc: usize, s: u16) -> Result<(), String> {
+        let slot = s as usize;
+        if !self.stack.is_empty()
+            || !self.kinds[slot].is_num()
+            || self.tdz[slot].is_some()
+            || self.undef[slot].is_some()
+            || pc + 1 > self.backedge
+            || !self.is_leader(pc + 1)
+        {
+            return Ok(());
+        }
+        let cases = crate::bytecode::switch_table::int_cases(
+            &self.chunk.ops,
+            pc + 1,
+            s,
+            &self.chunk.consts,
+        );
+        let (Some(min), Some(max)) = (
+            cases.iter().map(|c| c.0).min(),
+            cases.iter().map(|c| c.0).max(),
+        ) else {
+            return Ok(());
+        };
+        let span = max as i64 - min as i64 + 1;
+        if cases.len() < 4
+            || span > 4096
+            || span > 8 * cases.len() as i64
+            || cases.iter().any(|&(_, body)| body as usize <= pc)
+        {
+            return Ok(());
+        }
+        let miss = self.edge(false, pc + 1)?;
+        let x = match self.opnd_i32(Opnd::Slot(s), pc) {
+            Some(x) => x,
+            None => {
+                let x = self.opnd_num(Opnd::Slot(s), pc).expect("Number local");
+                #[cfg(target_arch = "wasm32")]
+                let cv = ConvOp::ToSintSat;
+                #[cfg(not(target_arch = "wasm32"))]
+                let cv = ConvOp::ToSint;
+                let i = self.fb.convert(cv, Type::I32, x);
+                let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+                let exact = self.fb.fcmp(FloatCC::Eq, back, x);
+                let go = self.fb.create_block();
+                self.fb.brif(exact, go, &[], miss, &[]);
+                self.fb.seal_block(go);
+                self.fb.switch_to_block(go);
+                i
+            }
+        };
+        let base = self.i32c(min as i64);
+        let rel = self.fb.binary(BinaryOp::Isub, x, base);
+        let width = self.i32c(span);
+        let inb = self.fb.icmp(IntCC::Ult, rel, width);
+        let jump = self.fb.create_block();
+        self.fb.brif(inb, jump, &[], miss, &[]);
+        self.fb.seal_block(jump);
+        self.fb.switch_to_block(jump);
+        let mut dests: Vec<(u32, (Block, Option<usize>))> = Vec::new();
+        let mut targets = Vec::with_capacity(span as usize);
+        for k in 0..span {
+            let key = (min as i64 + k) as i32;
+            let block = match cases.iter().find(|c| c.0 == key) {
+                None => miss,
+                Some(&(_, body)) => match dests.iter().find(|d| d.0 == body) {
+                    Some(d) => d.1 .0,
+                    None => {
+                        let d = self.dest(pc, body as usize)?;
+                        dests.push((body, d));
+                        d.0
+                    }
+                },
+            };
+            targets.push((block, Vec::new()));
+        }
+        self.fb.br_table(rel, &targets, (miss, &[]));
+        self.flush_seals();
+        let st = self.stack.clone();
+        for (_, d) in dests {
+            self.fill_exit(d, &st);
+        }
+        Ok(())
+    }
+
     /// Branch on `cond` (nonzero → `then_pc`), both successors taking the current stack.
     fn branch(&mut self, pc: usize, cond: V, then_pc: usize, else_pc: usize) -> Result<(), String> {
         // A Ref materialized for one successor's merge would leak on the other: settle them.
@@ -3871,6 +3959,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         match op {
             // Region handlers are static (see `Analysis::hs`): nothing to emit.
             Op::PushHandler(_) | Op::PopHandler => {}
+            Op::SwitchLK(s, _) => self.switch_table(pc, s)?,
             Op::IterStepL(is, ns) => self.iter_step(pc, is as usize, ns as usize),
             // Runs with the op after it (above).
             Op::InEnv(_) => {}

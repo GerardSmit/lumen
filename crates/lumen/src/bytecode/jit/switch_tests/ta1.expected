@@ -1,0 +1,17 @@
+Int8Array 44 -5 1 2 0 127 112 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Uint8Array 44 251 1 2 0 127 112 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Uint8ClampedArray 255 0 2 2 0 0 255 255 1 255 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Int16Array 300 -5 1 2 0 -129 4464 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Uint16Array 300 65531 1 2 0 65407 4464 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Int32Array 300 -5 1 2 0 -129 70000 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Uint32Array 300 4294967291 1 2 0 4294967167 70000 3 1 0 0 7 1 0 0 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Float32Array 300.70001220703125 -5 1.5 2.5 NaN -129 70000 8589934592 1.100000023841858 Infinity -0 7 1 0 NaN 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+Float64Array 300.7 -5 1.5 2.5 NaN -129 70000 8589934595 1.1 Infinity -0 7 1 0 NaN 42 9 9 9 undefined undefined undefined undefined undefined undefined 9 undefined undefined undefined undefined undefined 5 undefined 8 undefined 01231.01e1 4 9,9,0,9
+BigInt64Array 5 1 0 undefined undefined undefined undefined -1 TypeError TypeErrorSyntaxError
+BigUint64Array 5 1 0 undefined undefined undefined undefined 18446744073709551615 TypeError TypeErrorSyntaxError
+coerce 40 3,0
+rs 4,4,2,undefined,0,0,0,undefined 8,4,6,8,7,7,7,0 8 0 2,0,0,undefined,undefined,undefined,undefined,undefined 6,4,4,0,0,0,0,0 1,0,0,undefined,undefined,undefined,undefined,undefined 1
+det undefined undefined 0 undefined undefined 8
+sab 5 undefined undefined
+arr nfundefinedundefined
+1,2,44,255,4/5,6,7/1.100000023841858,2,1,0,NaN/10,21,32/255,0,2,2,0/1,2/1,0,3/42

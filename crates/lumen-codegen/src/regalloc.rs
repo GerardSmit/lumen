@@ -271,7 +271,6 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
 
     // ----- allocation: greedy over values in start order; registers hold disjoint segments -----
     let mut locs = vec![Loc::None; nv];
-    let mut num_slots = 0u32;
     let mut used_callee_saved = RegSet::EMPTY;
     // Segments assigned to each physical register, sorted and disjoint: (start, end, vreg).
     let mut assigned: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 64];
@@ -305,8 +304,7 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                 if cost < weight[v] {
                     assigned[r.bit() as usize].retain(|x| !owners.contains(&x.2));
                     for o in owners {
-                        locs[o as usize] = Loc::Stack(num_slots);
-                        num_slots += 1;
+                        locs[o as usize] = Loc::Stack(u32::MAX);
                     }
                     choice = Some(r);
                 }
@@ -324,11 +322,37 @@ pub fn allocate<I: MachInst>(code: &VCode<I>, info: &RegInfo) -> Allocation {
                     list.insert(i, (s, e, v as u32));
                 }
             }
-            None => {
-                locs[v] = Loc::Stack(num_slots);
-                num_slots += 1;
-            }
+            None => locs[v] = Loc::Stack(u32::MAX),
         }
+    }
+
+    // Spill slots are shared by values whose lifetime spans are disjoint (interval colouring
+    // over `[first segment start, last segment end]`).
+    let mut spilled: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&v| matches!(locs[v], Loc::Stack(_)))
+        .collect();
+    spilled.sort_by_key(|&v| (segs[v][0].0, v));
+    let mut busy: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
+        std::collections::BinaryHeap::new();
+    let mut free_slots: Vec<u32> = Vec::new();
+    let mut num_slots = 0u32;
+    for v in spilled {
+        let (start, end) = (segs[v][0].0, segs[v].last().unwrap().1);
+        while let Some(&std::cmp::Reverse((e, slot))) = busy.peek() {
+            if e >= start {
+                break;
+            }
+            busy.pop();
+            free_slots.push(slot);
+        }
+        let slot = free_slots.pop().unwrap_or_else(|| {
+            num_slots += 1;
+            num_slots - 1
+        });
+        locs[v] = Loc::Stack(slot);
+        busy.push(std::cmp::Reverse((end, slot)));
     }
 
     Allocation {

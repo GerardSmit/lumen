@@ -223,6 +223,16 @@ impl Interp {
         self.pristine_iteration(arr, false)
     }
 
+    /// [`Interp::pristine_array_iteration`] where `itfn` (already fetched from `arr`) is the
+    /// intrinsic `Array.prototype.values`.
+    pub(crate) fn pristine_array_iteration_with(&self, arr: &Gc, itfn: &Value) -> bool {
+        let Some((values, _, _)) = self.iter_intrinsics() else {
+            return false;
+        };
+        matches!(itfn, Value::Obj(f) if Gc::as_ptr(f) as usize == values)
+            && self.pristine_array_iteration(arr)
+    }
+
     /// [`Interp::pristine_array_iteration`] for a lazy split view (see `crate::split_view`):
     /// iterating it yields exactly its pieces, in order, running no user code.
     pub(crate) fn pristine_view_iteration(&self, arr: &Gc) -> bool {

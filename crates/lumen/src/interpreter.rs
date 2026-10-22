@@ -4053,6 +4053,58 @@ impl Interp {
         Ok(())
     }
 
+    /// The element index a Number key denotes on a TypedArray (CanonicalNumericIndexString of
+    /// its string form): `None` for every key that is not an integer below the current length
+    /// (negative, fractional, NaN, infinite or past the end; `-0` is the key "0").
+    #[inline]
+    pub(crate) fn ta_num_index(&self, info: &TaInfo, n: f64) -> Option<usize> {
+        if n >= 0.0 && n.fract() == 0.0 && n < self.ta_len(info).unwrap_or(0) as f64 {
+            Some(n as usize)
+        } else {
+            None
+        }
+    }
+
+    /// `base[key]` after the element fast paths missed: a Number key on a TypedArray reads the
+    /// element (or `undefined`) directly, everything else goes through ToPropertyKey and [[Get]].
+    pub(crate) fn get_elem_slow(&mut self, base: &Value, key: &Value) -> Result<Value, Abrupt> {
+        if let (Value::Obj(o), Value::Num(n)) = (base, key) {
+            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied() {
+                return Ok(match self.ta_num_index(&info, *n) {
+                    Some(idx) => self.ta_read(&info, idx),
+                    None => Value::Undefined,
+                });
+            }
+        }
+        let k = self.to_property_key(key)?;
+        self.get_member(base, &k)
+    }
+
+    /// `base[key] = v` after the element fast paths missed (see [`Interp::get_elem_slow`]): a
+    /// Number key on a TypedArray coerces the value, then stores it or drops an invalid index.
+    pub(crate) fn set_elem_slow(
+        &mut self,
+        base: &Value,
+        key: &Value,
+        v: Value,
+    ) -> Result<(), Abrupt> {
+        if let (Value::Obj(o), Value::Num(n)) = (base, key) {
+            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied() {
+                let num = if info.kind.is_bigint() {
+                    Value::BigInt(self.to_bigint(&v)?)
+                } else {
+                    Value::Num(self.to_number(&v)?)
+                };
+                if let Some(idx) = self.ta_num_index(&info, *n) {
+                    self.ta_store(&info, idx, &num)?;
+                }
+                return Ok(());
+            }
+        }
+        let k = self.to_property_key(key)?;
+        self.set_member(base, &k, v)
+    }
+
     /// `o[n] = v` write fast path: overwrite an existing own writable dense data element.
     /// Correct regardless of the prototype chain — an own writable data property always wins
     /// OrdinarySet. Returns the value back on miss so the caller runs the generic path.
