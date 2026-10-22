@@ -16,6 +16,10 @@ use std::rc::Rc;
 /// Owned bytes allowed to accumulate before a collection is requested.
 const EXTERNAL_GC_MIN: usize = 256 << 20;
 
+/// Set once any thread raises its [`PRESSURE`] flag, so [`gc_pressure`] callers on the call hot
+/// path skip the thread-local read until some thread has ever been under pressure.
+static PRESSURE_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 thread_local! {
     static TRACKED: Cell<usize> = const { Cell::new(0) };
     static NEXT_GC: Cell<usize> = const { Cell::new(EXTERNAL_GC_MIN) };
@@ -27,6 +31,7 @@ fn track_add(n: usize) {
         let total = t.get().saturating_add(n);
         t.set(total);
         if total > NEXT_GC.with(Cell::get) {
+            PRESSURE_EVER.store(true, std::sync::atomic::Ordering::Relaxed);
             PRESSURE.with(|p| p.set(true));
         }
     });
@@ -44,6 +49,13 @@ pub fn tracked_bytes() -> usize {
 /// Whether this thread's owned buffer bytes grew past the budget since the last collection.
 #[inline]
 pub fn gc_pressure() -> bool {
+    PRESSURE_EVER.load(std::sync::atomic::Ordering::Relaxed) && thread_pressure()
+}
+
+// Out of line: inlined, the compiler hoists the thread-local lookup above the `PRESSURE_EVER`
+// test, so every call paid for it.
+#[inline(never)]
+fn thread_pressure() -> bool {
     PRESSURE.with(Cell::get)
 }
 

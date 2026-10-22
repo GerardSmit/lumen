@@ -1013,6 +1013,9 @@ pub struct Interp {
     /// check) defer to [`Interp::call`]; refreshed there from the native stack headroom (see
     /// [`Interp::stack_guard`]). 0 forces the next call through the checked path.
     pub(crate) depth_limit: u32,
+    /// Shared one-code-unit strings for units below 256, filled on first use (see
+    /// [`Interp::unit_lstr`]).
+    unit_strs: [Option<crate::lstr::LStr>; 256],
     /// Recursion ceiling for this realm; [`MAX_EVAL_DEPTH`] unless the embedder lowered it.
     pub(crate) max_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
@@ -2069,6 +2072,7 @@ impl Interp {
             strict: false,
             depth: 0,
             depth_limit: 0,
+            unit_strs: [const { None }; 256],
             max_depth: MAX_EVAL_DEPTH,
             class_info: Default::default(),
             #[cfg(feature = "aot-native")]
@@ -5180,7 +5184,7 @@ impl Interp {
                 if let Ok(i) = key.parse::<usize>() {
                     let s = s.clone();
                     return Ok(match self.unit_at(&s, i) {
-                        Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
+                        Some(u) => Value::Str(self.unit_lstr(u)),
                         None => Value::Undefined,
                     });
                 }
@@ -5235,7 +5239,7 @@ impl Interp {
                     }
                     if let Ok(i) = key.parse::<usize>() {
                         if let Some(u) = self.unit_at(&s, i) {
-                            return Ok(Value::Str(crate::jstr::unit_lstr(u)));
+                            return Ok(Value::Str(self.unit_lstr(u)));
                         }
                     }
                 }
@@ -6333,6 +6337,17 @@ impl Interp {
         Value::from_string(out)
     }
 
+    /// The engine string for one UTF-16 code unit; units below 256 share one buffer per engine.
+    #[inline]
+    pub(crate) fn unit_lstr(&mut self, unit: u16) -> crate::lstr::LStr {
+        match self.unit_strs.get_mut(unit as usize) {
+            Some(slot) => slot
+                .get_or_insert_with(|| crate::jstr::unit_str(unit).into())
+                .clone(),
+            None => crate::jstr::unit_str(unit).into(),
+        }
+    }
+
     /// [`gc_check`] amortized for calls.
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
@@ -6743,7 +6758,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.depth += 1;
-        if self.depth > self.max_depth || self.stack_guard() {
+        if self.depth > self.max_depth || (self.depth >= self.depth_limit && self.stack_guard()) {
             self.depth -= 1;
             return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
         }

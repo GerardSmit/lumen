@@ -8018,7 +8018,7 @@ pub(crate) fn nf_char_at(
         return Ok(Value::str(""));
     }
     Ok(match i.unit_at(&s, idx as usize) {
-        Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
+        Some(u) => Value::Str(i.unit_lstr(u)),
         None => Value::str(""),
     })
 }
@@ -8234,7 +8234,7 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
         return Ok(if idx < 0 || idx >= len {
             Value::Undefined
         } else {
-            Value::Str(crate::jstr::unit_lstr(s.as_bytes()[idx as usize] as u16))
+            Value::Str(i.unit_lstr(s.as_bytes()[idx as usize] as u16))
         });
     }
     let len = i.str_len(&s) as i64;
@@ -8246,7 +8246,7 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
         Value::Undefined
     } else {
         match i.unit_at(&s, idx as usize) {
-            Some(u) => Value::Str(crate::jstr::unit_lstr(u)),
+            Some(u) => Value::Str(i.unit_lstr(u)),
             None => Value::Undefined,
         }
     })
@@ -9178,8 +9178,8 @@ fn install_string(it: &mut Interp) {
             } else {
                 0
             };
-            if u < 0x80 {
-                return Ok(Value::Str(crate::jstr::unit_lstr(u)));
+            if u < 0x100 {
+                return Ok(Value::Str(i.unit_lstr(u)));
             }
         }
         let mut units: Vec<u16> = Vec::with_capacity(args.len());
@@ -9216,6 +9216,11 @@ fn install_string(it: &mut Interp) {
         Ok(Value::from_string(out))
     });
     it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
+        if let [Value::Num(n)] = args {
+            if *n >= 0.0 && *n < 256.0 && n.fract() == 0.0 {
+                return Ok(Value::Str(i.unit_lstr(*n as u16)));
+            }
+        }
         let mut s = String::new();
         for a in args {
             let n = ab(i.to_number(a))?;

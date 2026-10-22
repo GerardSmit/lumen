@@ -102,7 +102,13 @@ pub(crate) fn enabled() -> bool {
 /// Whether the sampler asked this thread for a sample.
 #[inline(always)]
 pub(crate) fn pending() -> bool {
-    enabled() && with_slot(|s| s.ticks.load(Relaxed) != 0).unwrap_or(false)
+    enabled() && slot_pending()
+}
+
+// Out of line so the thread-local lookup stays behind the `enabled` test on call hot paths.
+#[inline(never)]
+fn slot_pending() -> bool {
+    with_slot(|s| s.ticks.load(Relaxed) != 0).unwrap_or(false)
 }
 
 pub(crate) fn take_ticks() -> u32 {
