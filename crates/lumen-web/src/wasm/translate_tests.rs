@@ -433,7 +433,7 @@ mod native {
             globals: table.as_ptr(),
             entry_sp: 0,
             // Leave plenty of the test thread's stack for the host.
-            stack_limit: crate::wasm::native::stack_pointer() - 512 * 1024,
+            stack_limit: lumen_common::stack::stack_pointer() as u64 - 512 * 1024,
             mem: &mut *mem,
         };
         unsafe { sync(&mut vm) };

@@ -1,7 +1,7 @@
 //! Native stack bounds. Recursion guards count frames (`MAX_EVAL_DEPTH`) sized for the large
 //! stacks the CLI and workers run on; this adds a byte-based guard so an engine on a small stack
 //! (a default 2 MiB `std::thread`) throws a RangeError instead of overflowing. Like V8's
-//! `StackGuard` / QuickJS's `js_check_stack_overflow`: compare the address of a local against a
+//! `StackGuard` / QuickJS's `js_check_stack_overflow`: compare the stack pointer against a
 //! per-thread limit computed once from the thread's stack bounds.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -37,10 +37,30 @@ thread_local! {
     static EXPLICIT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
+/// The machine stack pointer. A local's address is not usable: under AddressSanitizer's
+/// `detect_stack_use_after_return`, locals live on a heap-allocated fake stack.
+#[inline(always)]
+pub fn stack_pointer() -> usize {
+    let sp: usize;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let x = 0u8;
+        sp = core::hint::black_box(&x) as *const u8 as usize;
+    }
+    sp
+}
+
 #[inline(always)]
 fn sp() -> usize {
-    let x = 0u8;
-    std::hint::black_box(&x) as *const u8 as usize
+    stack_pointer()
 }
 
 #[inline(always)]
