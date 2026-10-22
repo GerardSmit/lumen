@@ -5193,7 +5193,7 @@ impl Interp {
                     return Ok(s
                         .description
                         .clone()
-                        .map(|k| Value::Str(k.into()))
+                        .map(|k| Value::Str(crate::value::key_value(&k)))
                         .unwrap_or(Value::Undefined));
                 }
                 let proto = self.symbol_proto.clone();

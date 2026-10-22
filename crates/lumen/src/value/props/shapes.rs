@@ -487,6 +487,65 @@ impl Shape {
     }
 }
 
+/// A transition-table key: the parent shape and the key added. Lookups by `(id, &str)` go
+/// through [`TransitionParts`], so a dynamic key needs no allocation to find its child.
+struct TransitionKey {
+    parent: u32,
+    key: Rc<str>,
+}
+
+struct TransitionLookup<'a>(u32, &'a str);
+
+trait TransitionParts {
+    fn parts(&self) -> (u32, &str);
+}
+
+impl TransitionParts for TransitionKey {
+    fn parts(&self) -> (u32, &str) {
+        (self.parent, &self.key)
+    }
+}
+
+impl TransitionParts for TransitionLookup<'_> {
+    fn parts(&self) -> (u32, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn TransitionParts + 'a> for TransitionKey {
+    fn borrow(&self) -> &(dyn TransitionParts + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn TransitionParts + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl std::hash::Hash for TransitionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn TransitionParts + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn TransitionParts + '_ {}
+
+impl PartialEq for TransitionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for TransitionKey {}
+
 /// The object-shape transition tree plus the id → shape index. A
 /// shape id encodes an *ordered sequence of property keys* — two `Props` share an id exactly
 /// when they added the same keys in the same order. `transitions[(parent, key)] = child` is
@@ -504,7 +563,8 @@ impl Shape {
 /// run its generator bodies: objects flow between those threads, and a worker looking up a key on
 /// an object the driver built must find its shape here.
 pub(crate) struct ShapeTable {
-    transitions: crate::fasthash::FastMap<(u32, Rc<str>), Rc<Shape>>,
+    transitions: crate::fasthash::FastMap<TransitionKey, Rc<Shape>>,
+    keys: KeyTable,
     /// Shared shapes by id (`0` is the empty shape). Each holds one strong count here and one in
     /// `transitions` (the root: only here).
     by_id: crate::fasthash::FastMap<u32, Rc<Shape>>,
@@ -525,6 +585,70 @@ pub(crate) struct ShapeTable {
     exec_result: Option<Rc<Shape>>,
 }
 
+/// Interned property keys: every key stored in a shape is the table's `Rc<str>` for its
+/// content, so equal keys are pointer-equal (the fast path of [`key_eq`]) and a dynamic key
+/// needs no allocation once its content is known. The table holds one strong count per key;
+/// an amortized sweep drops the keys nothing else references, so it stays bounded by the keys
+/// that are alive.
+#[derive(Default)]
+struct KeyTable {
+    set: crate::fasthash::FastSet<Rc<str>>,
+    /// The string value handed out for an interned key (by key address), shared by every
+    /// enumeration of it instead of one copy per object.
+    values: crate::fasthash::FastMap<usize, crate::lstr::LStr>,
+    sweep_at: usize,
+}
+
+const KEY_SWEEP_MIN: usize = 8192;
+
+impl KeyTable {
+    fn intern(&mut self, key: &str) -> Rc<str> {
+        if let Some(k) = self.set.get(key) {
+            return k.clone();
+        }
+        if self.set.len() >= self.sweep_at.max(KEY_SWEEP_MIN) {
+            self.sweep();
+        }
+        let k: Rc<str> = Rc::from(key);
+        self.set.insert(k.clone());
+        k
+    }
+
+    fn value(&mut self, key: &Rc<str>) -> crate::lstr::LStr {
+        let ptr = key.as_ptr() as usize;
+        if let Some(v) = self.values.get(&ptr) {
+            return v.clone();
+        }
+        let v = crate::lstr::LStr::from(&**key);
+        if self.set.get(&**key).is_some_and(|k| Rc::ptr_eq(k, key)) {
+            self.values.insert(ptr, v.clone());
+        }
+        v
+    }
+
+    fn sweep(&mut self) {
+        let values = &mut self.values;
+        self.set.retain(|k| {
+            let keep = Rc::strong_count(k) > 1;
+            if !keep {
+                values.remove(&(k.as_ptr() as usize));
+            }
+            keep
+        });
+        self.sweep_at = (self.set.len() * 2).max(KEY_SWEEP_MIN);
+    }
+}
+
+/// The interned key for `key`'s content.
+pub(crate) fn intern_key(key: &str) -> Rc<str> {
+    with_shapes(|t| t.keys.intern(key))
+}
+
+/// The string value for property key `key`: one shared string per interned key.
+pub(crate) fn key_value(key: &Rc<str>) -> crate::lstr::LStr {
+    with_shapes(|t| t.keys.value(key))
+}
+
 /// Transitions one shape may have before further new keys detach objects to owned shapes
 /// (V8's `kMaxNumberOfTransitions`): objects keyed by unbounded data (`{[id]: v}`) would
 /// otherwise mint a shared shape per distinct key.
@@ -542,6 +666,7 @@ impl ShapeTable {
         by_id.insert(SHAPE_EMPTY, Rc::new(Shape::root()));
         ShapeTable {
             transitions: Default::default(),
+            keys: KeyTable::default(),
             by_id,
             next_id: SHAPE_EMPTY + 1,
             children: Default::default(),
@@ -568,10 +693,11 @@ impl ShapeTable {
     /// The memoized child of `parent` by `key`, created if absent. `None` when `capped` and
     /// `parent` already has [`MAX_TRANSITIONS`] children, or the id space is spent: the caller
     /// detaches to an owned shape.
-    fn transition(&mut self, parent: &Rc<Shape>, key: &Rc<str>, capped: bool) -> Option<Rc<Shape>> {
-        if let Some(c) = self.transitions.get(&(parent.id, key.clone())) {
+    fn transition(&mut self, parent: &Rc<Shape>, key: &str, capped: bool) -> Option<Rc<Shape>> {
+        if let Some(c) = self.transitions.get(&TransitionLookup(parent.id, key) as &dyn TransitionParts) {
             return Some(c.clone());
         }
+        let key = self.keys.intern(key);
         if self.by_id.len() > self.sweep_at {
             self.sweep();
         }
@@ -584,8 +710,13 @@ impl ShapeTable {
         self.next_id += 1;
         let child = Rc::new(Shape::child(parent, id, key.clone()));
         self.by_id.insert(id, child.clone());
-        self.transitions
-            .insert((parent.id, key.clone()), child.clone());
+        self.transitions.insert(
+            TransitionKey {
+                parent: parent.id,
+                key: key.clone(),
+            },
+            child.clone(),
+        );
         self.children.insert(parent.id, n + 1);
         Some(child)
     }
@@ -613,7 +744,8 @@ impl ShapeTable {
                 ..
             } = &shape.keys
             {
-                self.transitions.remove(&(p.id, key.clone()));
+                self.transitions
+                    .remove(&TransitionLookup(p.id, key) as &dyn TransitionParts);
                 if let std::collections::hash_map::Entry::Occupied(mut e) =
                     self.children.entry(p.id)
                 {
@@ -625,6 +757,7 @@ impl ShapeTable {
             }
         }
         self.sweep_at = (self.by_id.len() * 2).max(SWEEP_MIN);
+        self.keys.sweep();
     }
 }
 
@@ -635,7 +768,7 @@ fn with_shapes<R>(f: impl FnOnce(&mut ShapeTable) -> R) -> R {
 /// The child shape reached by adding `key` to shared shape `parent` (memoized so it is shared).
 /// `None` parent = the empty shape. `None` result: `parent` has too many transitions (see
 /// [`MAX_TRANSITIONS`]) and the object should detach to an owned shape.
-pub(super) fn shape_transition(parent: Option<&Rc<Shape>>, key: &Rc<str>) -> Option<Rc<Shape>> {
+pub(super) fn shape_transition(parent: Option<&Rc<Shape>>, key: &str) -> Option<Rc<Shape>> {
     with_shapes(|t| match parent {
         Some(p) => t.transition(p, key, true),
         None => {
@@ -691,7 +824,7 @@ pub(in crate::value) fn array_length_shape() -> Rc<Shape> {
             return s.clone();
         }
         let empty = t.root();
-        let s = t.transition(&empty, &fn_key(0), false).expect("uncapped");
+        let s = t.transition(&empty, "length", false).expect("uncapped");
         t.array_length = Some(s.clone());
         s
     })
@@ -707,7 +840,7 @@ pub(super) fn exec_result_shape() -> Rc<Shape> {
         }
         let mut s = s;
         for key in ["index", "input", "groups"] {
-            s = t.transition(&s, &Rc::from(key), false).expect("uncapped");
+            s = t.transition(&s, key, false).expect("uncapped");
         }
         t.exec_result = Some(s.clone());
         s
@@ -752,7 +885,7 @@ pub(crate) fn shape_table_census() -> ShapeTableCensus {
             }
         }
         let rc_box = std::mem::size_of::<Shape>() + 2 * std::mem::size_of::<usize>();
-        let transition = std::mem::size_of::<((u32, Rc<str>), Rc<Shape>)>();
+        let transition = std::mem::size_of::<(TransitionKey, Rc<Shape>)>();
         c.bytes = c.shapes * rc_box
             + c.flat_keys * std::mem::size_of::<Rc<str>>()
             + t.transitions.len() * transition;
@@ -799,9 +932,9 @@ mod tests {
     #[test]
     fn unreferenced_shapes_are_reclaimed_and_their_ids_never_reused() {
         std::thread::spawn(|| {
-            let key: Rc<str> = Rc::from("reclaim_probe");
-            let parent = shape_transition(None, &key).unwrap();
-            let child = shape_transition(Some(&parent), &Rc::from("second")).unwrap();
+            let key = "reclaim_probe";
+            let parent = shape_transition(None, key).unwrap();
+            let child = shape_transition(Some(&parent), "second").unwrap();
             let (pid, cid) = (parent.id, child.id);
             drop(parent);
             sweep();
@@ -809,7 +942,7 @@ mod tests {
             drop(child);
             sweep();
             assert!(shape_by_id(cid).is_none() && shape_by_id(pid).is_none());
-            let again = shape_transition(None, &key).unwrap();
+            let again = shape_transition(None, key).unwrap();
             assert!(again.id > cid, "a reclaimed id is not handed out again");
             // Compiled code embeds a pinned shape's handle: it outlives every other reference.
             let id = again.id;
@@ -826,19 +959,61 @@ mod tests {
     #[test]
     fn a_shape_mints_at_most_max_transitions_children() {
         std::thread::spawn(|| {
-            let parent = shape_transition(None, &Rc::from("cap_probe")).unwrap();
+            let parent = shape_transition(None, "cap_probe").unwrap();
             let held: Vec<_> = (0..MAX_TRANSITIONS)
-                .map(|i| shape_transition(Some(&parent), &Rc::from(format!("c{i}"))).unwrap())
+                .map(|i| shape_transition(Some(&parent), &format!("c{i}")).unwrap())
                 .collect();
-            assert!(shape_transition(Some(&parent), &Rc::from("one_more")).is_none());
+            assert!(shape_transition(Some(&parent), "one_more").is_none());
             // Existing transitions still resolve.
             assert!(Rc::ptr_eq(
-                &shape_transition(Some(&parent), &Rc::from("c0")).unwrap(),
+                &shape_transition(Some(&parent), "c0").unwrap(),
                 &held[0]
             ));
             drop(held);
             sweep();
-            assert!(shape_transition(Some(&parent), &Rc::from("one_more")).is_some());
+            assert!(shape_transition(Some(&parent), "one_more").is_some());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn equal_keys_share_one_allocation_and_unreferenced_ones_are_swept() {
+        std::thread::spawn(|| {
+            let a = intern_key("intern_probe");
+            let b = intern_key(&(String::from("intern_") + "probe"));
+            assert!(Rc::ptr_eq(&a, &b));
+            let shape = shape_transition(None, "intern_probe_shape").unwrap();
+            assert!(Rc::ptr_eq(
+                shape.last_key().unwrap(),
+                &intern_key("intern_probe_shape")
+            ));
+            let before = with_shapes(|t| t.keys.set.len());
+            for i in 0..100 {
+                intern_key(&format!("transient_{i}"));
+            }
+            assert_eq!(with_shapes(|t| t.keys.set.len()), before + 100);
+            with_shapes(|t| t.keys.sweep());
+            assert_eq!(with_shapes(|t| t.keys.set.len()), before);
+            assert!(Rc::ptr_eq(&a, &intern_key("intern_probe")));
+            assert!(Rc::ptr_eq(shape.last_key().unwrap(), &intern_key("intern_probe_shape")));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_keys_string_value_is_shared_until_the_key_goes() {
+        std::thread::spawn(|| {
+            let k = intern_key("value_probe");
+            let (v1, v2) = (key_value(&k), key_value(&k));
+            assert!(crate::lstr::LStr::ptr_eq(&v1, &v2) && &*v1 == "value_probe");
+            let loose: Rc<str> = Rc::from("value_probe");
+            assert!(!crate::lstr::LStr::ptr_eq(&key_value(&loose), &v1));
+            drop(k);
+            with_shapes(|t| t.keys.sweep());
+            assert_eq!(with_shapes(|t| t.keys.values.len()), 0);
+            assert_eq!(&*v1, "value_probe");
         })
         .join()
         .unwrap();

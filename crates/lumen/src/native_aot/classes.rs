@@ -305,10 +305,10 @@ fn make_strict(
         let key = match &member.key {
             MemberKey::Public(name) => name.clone(),
             MemberKey::Private(name) => i.resolve_private(name, &class_env),
-            MemberKey::Number(number) => i.to_property_key(&Value::Num(*number))?,
+            MemberKey::Number(number) => i.to_property_key(&Value::Num(*number))?.into_string(),
             MemberKey::Computed(index) => {
                 let value = super::call(i, program, *index, &class_env, Value::Undefined, &[])?;
-                i.to_property_key(&value)?
+                i.to_property_key(&value)?.into_string()
             }
         };
         if member.is_static && key == "prototype" && matches!(member.key, MemberKey::Computed(_)) {

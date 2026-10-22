@@ -5023,7 +5023,7 @@ fn intern_name(name: &str) -> Rc<str> {
         if let Some(n) = names.get(name) {
             return n.clone();
         }
-        let n: Rc<str> = Rc::from(name);
+        let n = crate::value::intern_key(name);
         names.insert(n.clone());
         n
     })
@@ -5187,29 +5187,25 @@ fn template_chain<'a>(left: &'a Expr, right: &'a Expr) -> Option<Vec<&'a Expr>> 
 
 /// `Op::Concat`: the Strings concatenated (a surrogate pair split across a seam is rejoined).
 pub(crate) fn concat_strs_fast(parts: &[Value]) -> Option<Value> {
-    let mut strs: Vec<&str> = Vec::with_capacity(parts.len());
+    let mut strs: Vec<&crate::lstr::LStr> = Vec::with_capacity(parts.len());
     for p in parts {
         match p {
-            Value::Str(s) => strs.push(s.as_str()),
+            Value::Str(s) => strs.push(s),
             _ => return None,
         }
     }
     let total: usize = strs.iter().map(|s| s.len()).sum();
-    if total > crate::interpreter::MAX_STR_LEN
-        || strs
-            .windows(2)
-            .any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
-    {
+    if total > crate::interpreter::MAX_STR_LEN {
         return None;
     }
-    Some(Value::Str(crate::lstr::LStr::concat_n(&strs)))
+    crate::lstr::LStr::concat_all(&strs).map(Value::Str)
 }
 
 pub(crate) fn concat_strs(i: &mut Interp, parts: &[Value]) -> Result<Value, Abrupt> {
-    let mut strs: Vec<&str> = Vec::with_capacity(parts.len());
+    let mut strs: Vec<&crate::lstr::LStr> = Vec::with_capacity(parts.len());
     for p in parts {
         match p {
-            Value::Str(s) => strs.push(s.as_str()),
+            Value::Str(s) => strs.push(s),
             _ => return Err(i.throw("TypeError", "internal: template part is not a string")),
         }
     }
@@ -5217,15 +5213,12 @@ pub(crate) fn concat_strs(i: &mut Interp, parts: &[Value]) -> Result<Value, Abru
     if total > crate::interpreter::MAX_STR_LEN {
         return Err(i.throw("RangeError", "Invalid string length"));
     }
-    if strs
-        .windows(2)
-        .any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
-    {
-        let mut acc = String::new();
-        for s in strs {
-            acc = crate::jstr::concat(&acc, s);
-        }
-        return Ok(Value::Str(acc.into()));
+    if let Some(joined) = crate::lstr::LStr::concat_all(&strs) {
+        return Ok(Value::Str(joined));
     }
-    Ok(Value::Str(crate::lstr::LStr::concat_n(&strs)))
+    let mut acc = String::new();
+    for s in strs {
+        acc = crate::jstr::concat(&acc, s);
+    }
+    Ok(Value::Str(acc.into()))
 }

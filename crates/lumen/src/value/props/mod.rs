@@ -18,7 +18,7 @@ mod storage;
 mod tests;
 pub(in crate::value) use shapes::{Shape, ShapeTable, array_length_shape};
 pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
-pub(crate) use shapes::{jit_shared_shape, proto_epoch_addr};
+pub(crate) use shapes::{intern_key, jit_shared_shape, key_value, proto_epoch_addr};
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
 /// named (shape-keyed), whether a dense sidecar exists, and whether the shape is owned by this
 /// object alone (its key list is then per-object memory).

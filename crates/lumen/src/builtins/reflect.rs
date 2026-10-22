@@ -117,7 +117,7 @@ pub(crate) fn reflect_set(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Valu
                 handler,
                 &[
                     ptarget.clone(),
-                    Value::from_string(key.clone()),
+                    key.clone().into_value(),
                     value.clone(),
                     receiver,
                 ],
@@ -285,7 +285,7 @@ pub(crate) fn reflect_own_keys(i: &mut Interp, _t: Value, a: &[Value]) -> Result
                 out.push(s);
             }
         } else {
-            out.push(Value::Str(k.into()));
+            out.push(Value::Str(crate::value::key_value(&k)));
         }
     }
     Ok(i.make_array(out))

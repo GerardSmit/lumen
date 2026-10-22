@@ -7,7 +7,6 @@
 //! not part of a shape, so each use re-reads the slot and re-checks identity/attributes.
 use crate::fasthash::FastMap;
 use crate::interpreter::Interp;
-use crate::lstr::LStr;
 use crate::value::{Exotic, Gc, Object, Property, Props, Value};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -566,7 +565,7 @@ impl Interp {
                     continue;
                 }
                 if b.props.get(&k).is_some_and(|p| p.enumerable()) {
-                    out.push(Value::Str(LStr::from(&*k)));
+                    out.push(Value::Str(crate::value::key_value(&k)));
                 }
             }
             return Some(out);
@@ -605,7 +604,7 @@ impl Interp {
                         if crate::value::canonical_index(k).is_some() {
                             return None; // named integer keys sort first: generic order
                         }
-                        l.push((slot as u32, Value::Str(LStr::from(&**k))));
+                        l.push((slot as u32, Value::Str(crate::value::key_value(k))));
                     }
                     let l: Rc<[(u32, Value)]> = l.into();
                     let mut m = self.lang.for_in.borrow_mut();

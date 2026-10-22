@@ -155,7 +155,7 @@ pub(super) fn init_method(
         Some(k) => k.to_string(),
         None => {
             let key = pop(stack);
-            i.to_property_key(&key)?
+            i.to_property_key(&key)?.into_string()
         }
     };
     let obj = literal_obj(stack);
@@ -245,7 +245,7 @@ pub(crate) fn super_get(
     let home = i.super_base(env)?;
     let key = match (key, idx) {
         (Some(k), _) => k.to_string(),
-        (None, Some(idx)) => i.to_property_key(&idx)?,
+        (None, Some(idx)) => i.to_property_key(&idx)?.into_string(),
         _ => unreachable!(),
     };
     if matches!(home, Value::Undefined | Value::Null) {
@@ -281,7 +281,7 @@ pub(crate) fn super_method(
     let home = pop(stack);
     let key = match (key, idx) {
         (Some(k), _) => k.to_string(),
-        (None, Some(idx)) => i.to_property_key(&idx)?,
+        (None, Some(idx)) => i.to_property_key(&idx)?.into_string(),
         _ => unreachable!(),
     };
     let f = i.get_member(&home, &key)?;

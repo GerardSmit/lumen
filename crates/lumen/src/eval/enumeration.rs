@@ -2,6 +2,7 @@
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Gc;
 use crate::value::Value;
+use std::rc::Rc;
 
 impl Interp {
     pub(crate) fn for_in_keys(&mut self, rhs: &Value) -> Result<Vec<Value>, Abrupt> {
@@ -24,18 +25,18 @@ impl Interp {
         }
         Ok(self
             .enum_keys(rhs)?
-            .into_iter()
-            .map(Value::from_string)
+            .iter()
+            .map(|k| Value::Str(crate::value::key_value(k)))
             .collect())
     }
 
-    fn enum_keys(&mut self, v: &Value) -> Result<Vec<String>, Abrupt> {
-        let mut seen = std::collections::HashSet::new();
+    fn enum_keys(&mut self, v: &Value) -> Result<Vec<Rc<str>>, Abrupt> {
+        let mut seen: std::collections::HashSet<Rc<str>> = std::collections::HashSet::new();
         let mut out = Vec::new();
         // A string primitive enumerates its index keys (ToObject makes them own properties).
         if let Value::Str(sv) = v {
             for k in 0..crate::jstr::unit_len(sv) {
-                out.push(k.to_string());
+                out.push(crate::value::intern_key(&k.to_string()));
             }
             return Ok(out);
         }
@@ -54,7 +55,7 @@ impl Interp {
                     .expect("WindowProxy key enumeration remains registered");
                 for key in keys {
                     if let Value::Str(key) = key {
-                        let key = key.to_string();
+                        let key = crate::value::intern_key(&key);
                         if seen.insert(key.clone()) {
                             out.push(key);
                         }
@@ -75,8 +76,9 @@ impl Interp {
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
                     if let Value::Str(ks) = k {
-                        if seen.insert(ks.to_string()) {
-                            out.push(ks.to_string());
+                        let ks = crate::value::intern_key(&ks);
+                        if seen.insert(ks.clone()) {
+                            out.push(ks);
                         }
                     }
                 }
@@ -92,7 +94,7 @@ impl Interp {
             // TypedArray elements enumerate first (they live outside the property map).
             if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
-                    let k = idx.to_string();
+                    let k = crate::value::intern_key(&idx.to_string());
                     if seen.insert(k.clone()) {
                         out.push(k);
                     }
@@ -100,14 +102,14 @@ impl Interp {
             }
             let (level, parent) = {
                 let b = o.borrow();
-                let level: Vec<(String, bool)> = b
+                let level: Vec<(Rc<str>, bool)> = b
                     .props
                     .ordered_keys()
                     .into_iter()
                     .filter(|k| !Interp::is_sym_key(k) && !Interp::is_private_key(k))
                     .map(|k| {
                         let e = b.props.get(&k).map(|p| p.enumerable()).unwrap_or(false);
-                        (k.to_string(), e)
+                        (k, e)
                     })
                     .collect();
                 (level, b.proto.clone())

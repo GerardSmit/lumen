@@ -12,6 +12,78 @@ use crate::value::*;
 use lumen_common::limits::size;
 use std::rc::Rc;
 
+/// A property key in string form: the string itself when the operand already was one (no copy),
+/// or the text of a symbol / number key.
+#[derive(Clone)]
+pub(crate) enum KeyStr {
+    Str(crate::lstr::LStr),
+    Owned(String),
+}
+
+impl std::ops::Deref for KeyStr {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        match self {
+            KeyStr::Str(s) => s,
+            KeyStr::Owned(s) => s,
+        }
+    }
+}
+
+impl From<String> for KeyStr {
+    fn from(s: String) -> KeyStr {
+        KeyStr::Owned(s)
+    }
+}
+
+impl AsRef<str> for KeyStr {
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl From<KeyStr> for crate::lstr::LStr {
+    fn from(k: KeyStr) -> crate::lstr::LStr {
+        match k {
+            KeyStr::Str(s) => s,
+            KeyStr::Owned(s) => s.into(),
+        }
+    }
+}
+
+impl KeyStr {
+    pub(crate) fn as_str(&self) -> &str {
+        self
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        match self {
+            KeyStr::Str(s) => s.to_string(),
+            KeyStr::Owned(s) => s,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        match self {
+            KeyStr::Str(s) => Value::Str(s),
+            KeyStr::Owned(s) => Value::str(s),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl PartialEq<str> for KeyStr {
+    fn eq(&self, other: &str) -> bool {
+        **self == *other
+    }
+}
+
 impl Interp {
     // ----- statements -------------------------------------------------------------------------
 
@@ -2055,7 +2127,7 @@ impl Interp {
         if let Some((t, h)) = crate::builtins::proxy_pair(self, &with) {
             let keys = crate::builtins::proxy_own_keys(self, &t, &h).map_err(Abrupt::Throw)?;
             for k in keys {
-                let pk = self.to_property_key(&k)?;
+                let pk = self.to_property_key(&k)?.into_string();
                 if Interp::is_sym_key(&pk) {
                     continue;
                 }
@@ -3050,7 +3122,7 @@ impl Interp {
             PropKey::Num(n) => Ok(self.num_to_str(*n)),
             PropKey::Computed(e) => {
                 let v = self.eval(e, env)?;
-                self.to_property_key(&v)
+                self.to_property_key(&v).map(KeyStr::into_string)
             }
         }
     }
@@ -6735,7 +6807,7 @@ impl Interp {
             PropKey::Num(n) => self.num_to_str(*n),
             PropKey::Computed(e) => {
                 let kv = self.eval(e, env)?;
-                self.to_property_key(&kv)?
+                self.to_property_key(&kv)?.into_string()
             }
         })
     }
@@ -6881,11 +6953,7 @@ impl Interp {
                 if size::sum(ls.len(), rs.len(), MAX_STR_LEN).is_err() {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
-                return Ok(Value::Str(if crate::jstr::needs_join_fixup(&ls, &rs) {
-                    crate::jstr::concat(&ls, &rs).into()
-                } else {
-                    crate::lstr::LStr::concat2(&ls, &rs)
-                }));
+                return Ok(Value::Str(crate::lstr::LStr::join(&ls, &rs)));
             }
             if matches!(lp, Value::BigInt(_)) || matches!(rp, Value::BigInt(_)) {
                 if let (Value::BigInt(x), Value::BigInt(y)) = (&lp, &rp) {
@@ -7395,19 +7463,22 @@ impl Interp {
         })
     }
 
-    pub(crate) fn to_property_key(&mut self, v: &Value) -> Result<String, Abrupt> {
+    pub(crate) fn to_property_key(&mut self, v: &Value) -> Result<KeyStr, Abrupt> {
         // A symbol key maps to its internal NUL-prefixed key; everything else is its string form.
         if let Value::Sym(s) = v {
-            return Ok(Interp::sym_key(s));
+            return Ok(Interp::sym_key(s).into());
+        }
+        if let Value::Str(s) = v {
+            return Ok(KeyStr::Str(s.clone()));
         }
         // ToPropertyKey: ToPrimitive(hint String) first — a Symbol result stays a symbol key (rather
         // than being stringified, which would throw), so `obj[wrapperWhoseToStringReturnsASymbol]`
         // is a symbol-keyed access.
         let prim = self.to_primitive(v, Hint::String)?;
         if let Value::Sym(s) = &prim {
-            return Ok(Interp::sym_key(s));
+            return Ok(Interp::sym_key(s).into());
         }
-        Ok(self.to_string(&prim)?.to_string())
+        Ok(KeyStr::Str(self.to_string(&prim)?))
     }
 
     /// The internal property key for a well-known symbol (e.g. `Symbol.toPrimitive`).
@@ -8403,7 +8474,7 @@ impl Interp {
             RefKey::Static(s) => Ok(s.clone()),
             RefKey::Raw(v) => {
                 let v = v.clone();
-                let k = self.to_property_key(&v)?;
+                let k = self.to_property_key(&v)?.into_string();
                 *key = RefKey::Static(k.clone());
                 Ok(k)
             }

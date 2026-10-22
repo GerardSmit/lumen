@@ -365,7 +365,7 @@ pub(crate) fn proxy_own_keys(
                     "ownKeys trap result must contain only strings and symbols",
                 ));
             }
-            key_strs.push(ab(i.to_property_key(k))?);
+            key_strs.push(ab(i.to_property_key(k))?.into_string());
         }
         // No duplicate keys.
         let result_set: std::collections::HashSet<&str> =
@@ -427,7 +427,7 @@ pub(crate) fn proxy_own_keys(
             .props
             .keys()
             .into_iter()
-            .map(|k| Value::Str(k.into()))
+            .map(|k| Value::Str(crate::value::key_value(&k)))
             .collect())
     } else {
         Ok(Vec::new())
@@ -1539,7 +1539,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             if enumerable == Some(true) {
                 let v = ab(i.get_member(o, &k))?;
                 out.push(if entries {
-                    i.make_array(vec![Value::Str(k.clone().into()), v])
+                    i.make_array(vec![Value::Str(crate::value::key_value(&k)), v])
                 } else {
                     v
                 });
@@ -1568,7 +1568,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             }
             let v = ab(i.get_member(o, &k))?;
             out.push(if entries {
-                i.make_array(vec![Value::Str(k.into()), v])
+                i.make_array(vec![Value::Str(crate::value::key_value(&k)), v])
             } else {
                 v
             });
@@ -2021,7 +2021,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
     let keys: Vec<String> = if let Some((t, h)) = &proxy {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, t, h)? {
-            ks.push(ab(i.to_property_key(&k))?);
+            ks.push(ab(i.to_property_key(&k))?.into_string());
         }
         ks
     } else {
@@ -2128,7 +2128,7 @@ fn object_define_properties(
     let keys: Vec<String> = if let Some((t, h)) = proxy_pair(i, &props) {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, &t, &h)? {
-            ks.push(ab(i.to_property_key(&k))?);
+            ks.push(ab(i.to_property_key(&k))?.into_string());
         }
         ks
     } else {
@@ -3704,7 +3704,7 @@ fn install_object(it: &mut Interp) {
                 Value::Undefined,
                 &[el.clone(), Value::Num(idx as f64)],
             ))?;
-            let key = ab(i.to_property_key(&key_v))?;
+            let key = ab(i.to_property_key(&key_v))?.into_string();
             match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some(g) => g.1.push(el),
                 None => groups.push((key, vec![el])),
@@ -3747,7 +3747,7 @@ fn install_object(it: &mut Interp) {
                     && k.parse::<usize>().is_err()
                     && !TA_META_KEYS.contains(&&*k)
                 {
-                    keys.push(Value::Str(k.into()));
+                    keys.push(Value::Str(crate::value::key_value(&k)));
                 }
             }
             return Ok(i.make_array(keys));
@@ -3759,7 +3759,7 @@ fn install_object(it: &mut Interp) {
             .ordered_keys()
             .into_iter()
             .filter(|k| !Interp::is_sym_key(k) && !Interp::is_private_key(k))
-            .map(|k| Value::Str(k.into()))
+            .map(|k| Value::Str(crate::value::key_value(&k)))
             .collect();
         Ok(i.make_array(keys))
     });
@@ -6779,7 +6779,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
         let all_keys: Vec<String> = if let Some((t, h)) = proxy_pair(i, &input) {
             let mut ks = Vec::new();
             for k in proxy_own_keys(i, &t, &h)? {
-                ks.push(ab(i.to_property_key(&k))?);
+                ks.push(ab(i.to_property_key(&k))?.into_string());
             }
             ks
         } else {
@@ -9273,7 +9273,7 @@ pub(crate) fn object_keys_array(i: &mut Interp, target: Value) -> Result<Value, 
         let mut keys: Vec<Value> = (0..n).map(|k| Value::from_string(k.to_string())).collect();
         for k in ordered_enum_keys(&o) {
             if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
-                keys.push(Value::Str(k.into()));
+                keys.push(Value::Str(crate::value::key_value(&k)));
             }
         }
         return Ok(i.make_array(keys));
@@ -9289,7 +9289,7 @@ pub(crate) fn object_keys_array(i: &mut Interp, target: Value) -> Result<Value, 
             }
         }
     }
-    let keys: Vec<Value> = names.into_iter().map(|k| Value::Str(k.into())).collect();
+    let keys: Vec<Value> = names.into_iter().map(|k| Value::Str(crate::value::key_value(&k))).collect();
     Ok(i.make_array(keys))
 }
 

@@ -1,7 +1,7 @@
 //! Property insertion, removal, and shape maintenance.
 use super::shapes::{
     OWNED_THRESHOLD, SHAPE_EMPTY, Shape, fresh_owned_id, shape_by_id, shape_owned_from,
-    shape_transition,
+    intern_key, shape_transition,
 };
 use super::{MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT, Props};
 use crate::value::{PackedValue, Property, Value, canonical_index};
@@ -25,7 +25,7 @@ impl Props {
         } else {
             let mut next = None;
             for key in old.keys() {
-                next = shape_transition(next.as_ref(), &Rc::from(&**key));
+                next = shape_transition(next.as_ref(), key);
                 if next.is_none() {
                     self.set_shape(shape_owned_from(Some(old)));
                     return;
@@ -76,16 +76,19 @@ impl Props {
     /// Add `key` to the shape: a tree transition while the shape is shared and small, else an
     /// in-place append on an owned shape (detaching first when the shared chain would grow past
     /// [`OWNED_THRESHOLD`] or the parent has too many transitions).
-    fn transition_key(&mut self, key: Rc<str>) {
+    fn transition_key(&mut self, key: &str) -> Rc<str> {
         let shared = self.shape_rc.as_ref().is_none_or(|s| !s.owned());
         if shared && self.named_len() < OWNED_THRESHOLD {
-            if let Some(child) = shape_transition(self.shape_rc.as_ref(), &key) {
+            if let Some(child) = shape_transition(self.shape_rc.as_ref(), key) {
+                let key = child.last_key().expect("transition adds a key").clone();
                 self.set_shape(child);
-                return;
+                return key;
             }
         }
-        self.detach_shape().push_key(key);
+        let key = intern_key(key);
+        self.detach_shape().push_key(key.clone());
         self.reid_owned_shape();
+        key
     }
 
     /// Make room for a new named property at slot `named_len` (the end of the named prefix):
@@ -122,7 +125,7 @@ impl Props {
         self.note_structural();
         let Some(child) = shape_by_id(new_shape) else {
             let slot = self.open_named_slot(prop);
-            self.transition_key(key.clone());
+            self.transition_key(&key);
             self.note_inserted(slot, &key);
             return false;
         };
@@ -134,9 +137,9 @@ impl Props {
         true
     }
 
-    pub(crate) fn insert(&mut self, key: impl Into<Rc<str>>, prop: Property) {
-        let key = key.into();
-        let index = canonical_index(&key);
+    pub(crate) fn insert(&mut self, key: impl AsRef<str>, prop: Property) {
+        let key = key.as_ref();
+        let index = canonical_index(key);
         if let Some(n) = index.filter(|_| self.elem_mode.get() && !self.has_far.get()) {
             self.unpack_for_sparse_fill(n);
         }
@@ -170,7 +173,7 @@ impl Props {
                 }
             }
         }
-        if let Some(i) = self.slot_of(&key) {
+        if let Some(i) = self.slot_of(key) {
             self.entries[i] = prop;
             if self.elems.mirror_flags() & MIRROR_OK != 0
                 && key.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
@@ -199,10 +202,10 @@ impl Props {
             self.entries.len() - 1
         } else {
             let slot = self.open_named_slot(prop);
-            self.transition_key(key.clone());
+            self.transition_key(key);
             slot
         };
-        self.note_inserted(slot, &key);
+        self.note_inserted(slot, key);
     }
 
     /// Remove `entries[slot]`, shifting later slots down and repointing the dense map. The

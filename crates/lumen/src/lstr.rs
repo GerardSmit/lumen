@@ -39,7 +39,8 @@ struct Header {
     strong: Cell<u32>,
     len: Cell<u32>,
     cap: Cell<u32>,
-    _spare: u32,
+    /// Concatenation nodes only: [`CONS_FIRST_LOW`] | [`CONS_LAST_HIGH`] | [`CONS_ASCII`].
+    spare: Cell<u32>,
     // `cap` bytes of UTF-8 follow.
 }
 
@@ -70,8 +71,17 @@ pub(crate) const ASCII_HINT: u32 = 1 << 31;
 pub(crate) const VIEW: u32 = 1 << 30;
 /// Bit 29 of `cap`: the string has been the root of views (it may be in the registry).
 const ROOT: u32 = 1 << 29;
+/// Bit 28 of `cap`: the header is a [`ConsHdr`], a lazy concatenation (capacity 0, never the
+/// [`ASCII_HINT`] bit: the optimizing tier reads that bit to decide it may read bytes inline).
+const CONS: u32 = 1 << 28;
 /// The capacity bits of `cap`.
-const CAP_MASK: u32 = ROOT - 1;
+const CAP_MASK: u32 = CONS - 1;
+/// The shortest result `a + b` is left as a lazy concatenation (a [`ConsHdr`]) instead of being
+/// copied. The optimizing tier's inline one-byte compare relies on this exceeding one byte.
+pub const CONS_MIN: usize = 256;
+const CONS_FIRST_LOW: u32 = 1;
+const CONS_LAST_HIGH: u32 = 2;
+const CONS_ASCII: u32 = 4;
 /// Offsets of a view's root pointer and byte offset (the JIT's inline `charCodeAt` on a view).
 pub(crate) const VIEW_ROOT_OFFSET: usize = std::mem::offset_of!(ViewHdr, root);
 pub(crate) const VIEW_OFF_OFFSET: usize = std::mem::offset_of!(ViewHdr, off);
@@ -99,6 +109,18 @@ impl ViewHdr {
     unsafe fn data(&self) -> *const u8 {
         (self.root.as_ptr() as *const u8).add(HDR + self.off as usize)
     }
+}
+
+/// A lazy concatenation: `left + right` until something reads the bytes, then a counted
+/// reference to the one flat buffer holding them (`left`/`right` released). `h.len` is the
+/// total byte length from the start. Chains are flattened and dropped iteratively, so a
+/// million-deep `s = s + x` history costs no stack.
+#[repr(C)]
+struct ConsHdr {
+    h: Header,
+    left: Cell<Option<NonNull<Header>>>,
+    right: Cell<Option<NonNull<Header>>>,
+    flat: Cell<Option<NonNull<Header>>>,
 }
 
 /// The registry entry of a root with views.
@@ -227,7 +249,7 @@ impl LStr {
                 strong: Cell::new(1),
                 len: Cell::new(content.len() as u32),
                 cap: Cell::new(cap | hint),
-                _spare: 0,
+                spare: Cell::new(0),
             });
             let data = (p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(content.as_ptr(), data, content.len());
@@ -252,7 +274,7 @@ impl LStr {
                 strong: Cell::new(1),
                 len: Cell::new(0),
                 cap: Cell::new(cap as u32),
-                _spare: 0,
+                spare: Cell::new(0),
             });
             LStr { p }
         };
@@ -306,13 +328,18 @@ impl LStr {
     /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]).
     #[inline]
     pub(crate) fn ascii_hint(&self) -> bool {
-        self.hdr().cap.get() & ASCII_HINT != 0
+        let h = self.hdr();
+        h.cap.get() & ASCII_HINT != 0 || h.cap.get() & CONS != 0 && h.spare.get() & CONS_ASCII != 0
     }
 
     /// Record content found to be all-ASCII (mutators clear the hint again as needed).
     pub(crate) fn mark_ascii(&self) {
         let h = self.hdr();
-        h.cap.set(h.cap.get() | ASCII_HINT);
+        if h.cap.get() & CONS != 0 {
+            h.spare.set(h.spare.get() | CONS_ASCII);
+        } else {
+            h.cap.set(h.cap.get() | ASCII_HINT);
+        }
     }
 
     #[inline]
@@ -362,13 +389,196 @@ impl LStr {
 
     #[inline]
     fn data(&self) -> *const u8 {
+        let cap = self.hdr().cap.get();
+        if cap & (VIEW | CONS) == 0 {
+            return unsafe { (self.p.as_ptr() as *const u8).add(HDR) };
+        }
+        self.data_indirect(cap)
+    }
+
+    #[inline(never)]
+    fn data_indirect(&self, cap: u32) -> *const u8 {
         unsafe {
-            if self.hdr().cap.get() & VIEW != 0 {
+            if cap & VIEW != 0 {
                 (*(self.p.as_ptr() as *const ViewHdr)).data()
             } else {
-                (self.p.as_ptr() as *const u8).add(HDR)
+                (self.flat_buffer().as_ptr() as *const u8).add(HDR)
             }
         }
+    }
+
+    #[inline]
+    fn is_cons(&self) -> bool {
+        self.hdr().cap.get() & CONS != 0
+    }
+
+    /// The flat buffer of a concatenation node, building it on the first read.
+    fn flat_buffer(&self) -> NonNull<Header> {
+        debug_assert!(self.is_cons());
+        let c = unsafe { &*(self.p.as_ptr() as *const ConsHdr) };
+        if let Some(f) = c.flat.get() {
+            return f;
+        }
+        let total = self.hdr().len.get() as usize;
+        let out = LStr::alloc("", total as u32);
+        unsafe {
+            let dst = (out.p.as_ptr() as *mut u8).add(HDR);
+            let mut at = 0;
+            let mut stack = vec![self.p];
+            while let Some(n) = stack.pop() {
+                let nh = n.as_ref();
+                let leaf = if nh.cap.get() & CONS != 0 {
+                    let nc = &*(n.as_ptr() as *const ConsHdr);
+                    match nc.flat.get() {
+                        Some(f) => f,
+                        None => {
+                            stack.push(nc.right.get().expect("unflattened node"));
+                            stack.push(nc.left.get().expect("unflattened node"));
+                            continue;
+                        }
+                    }
+                } else {
+                    n
+                };
+                let piece = std::mem::ManuallyDrop::new(LStr { p: leaf });
+                let bytes = piece.as_str().as_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(at), bytes.len());
+                at += bytes.len();
+            }
+            debug_assert_eq!(at, total);
+            out.hdr().len.set(total as u32);
+            if self.hdr().spare.get() & CONS_ASCII != 0 {
+                out.mark_ascii();
+            }
+            let (l, r) = (c.left.take(), c.right.take());
+            let flat = out.p;
+            std::mem::forget(out);
+            c.flat.set(Some(flat));
+            release_all([l, r]);
+            flat
+        }
+    }
+
+    /// `a + b` without copying when the result is long: a lazy concatenation, flattened on
+    /// first read. `None` when the result is short, one side is empty, or a smuggled surrogate
+    /// pair would form across the seam (the caller concatenates the flat bytes, with the join
+    /// fix-up).
+    pub fn cons(a: &LStr, b: &LStr) -> Option<LStr> {
+        let total = a.len().checked_add(b.len())?;
+        if total < CONS_MIN || a.is_empty() || b.is_empty() || a.last_high() && b.first_low() {
+            return None;
+        }
+        let total = u32::try_from(total).ok().filter(|&t| t <= CAP_MASK)?;
+        let mut spare = 0;
+        if a.first_low() {
+            spare |= CONS_FIRST_LOW;
+        }
+        if b.last_high() {
+            spare |= CONS_LAST_HIGH;
+        }
+        if a.ascii_hint() && b.ascii_hint() {
+            spare |= CONS_ASCII;
+        }
+        unsafe {
+            let p = alloc(Layout::new::<ConsHdr>()) as *mut ConsHdr;
+            let p = NonNull::new(p).expect("allocation failed");
+            bump(&a.hdr().strong);
+            bump(&b.hdr().strong);
+            p.as_ptr().write(ConsHdr {
+                h: Header {
+                    strong: Cell::new(1),
+                    len: Cell::new(total),
+                    cap: Cell::new(CONS),
+                    spare: Cell::new(spare),
+                },
+                left: Cell::new(Some(a.p)),
+                right: Cell::new(Some(b.p)),
+                flat: Cell::new(None),
+            });
+            Some(LStr { p: p.cast() })
+        }
+    }
+
+    /// The byte length (no flattening).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.hdr().len.get() as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the first character is a smuggled low surrogate.
+    fn first_low(&self) -> bool {
+        if self.is_cons() {
+            return self.hdr().spare.get() & CONS_FIRST_LOW != 0;
+        }
+        self.as_str()
+            .chars()
+            .next()
+            .is_some_and(|c| crate::jstr::smuggled_low(c).is_some())
+    }
+
+    /// Whether the last character is a smuggled high surrogate.
+    fn last_high(&self) -> bool {
+        if self.is_cons() {
+            return self.hdr().spare.get() & CONS_LAST_HIGH != 0;
+        }
+        self.as_str()
+            .chars()
+            .next_back()
+            .is_some_and(|c| crate::jstr::smuggled_high(c).is_some())
+    }
+
+    /// All of `parts` concatenated, `None` when a smuggled surrogate pair would form across a
+    /// seam. A long first part (a growing accumulator in `s = s + a + b`) stays a lazy
+    /// concatenation with the rest; everything else is one allocation.
+    pub fn concat_all(parts: &[&LStr]) -> Option<LStr> {
+        if parts.windows(2).any(|w| w[0].last_high() && w[1].first_low()) {
+            return None;
+        }
+        if let [first, rest @ ..] = parts {
+            if first.len() >= CONS_MIN && !rest.is_empty() {
+                let tail = match rest {
+                    [one] => (*one).clone(),
+                    _ => LStr::concat_lstrs(rest),
+                };
+                if let Some(c) = LStr::cons(first, &tail) {
+                    return Some(c);
+                }
+            }
+        }
+        Some(LStr::concat_lstrs(parts))
+    }
+
+    fn concat_lstrs(parts: &[&LStr]) -> LStr {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let s = LStr::alloc("", u32::try_from(total).expect("string too large"));
+        let mut at = 0;
+        unsafe {
+            let data = (s.p.as_ptr() as *mut u8).add(HDR);
+            for p in parts {
+                let p = p.as_str();
+                std::ptr::copy_nonoverlapping(p.as_ptr(), data.add(at), p.len());
+                at += p.len();
+            }
+            s.hdr().len.set(total as u32);
+        }
+        s.and_ascii(parts.iter().all(|p| p.ascii_hint() || p.is_ascii()));
+        s
+    }
+
+    /// `a + b` (ToString'd operands), a lazy concatenation when long.
+    pub fn join(a: &LStr, b: &LStr) -> LStr {
+        if let Some(c) = LStr::cons(a, b) {
+            return c;
+        }
+        if a.last_high() && b.first_low() {
+            return LStr::from(crate::jstr::concat(a, b));
+        }
+        LStr::concat2(a, b)
     }
 
     /// `piece` (a subslice of `self`) as a string: a view of `self`'s root when it is long
@@ -388,6 +598,8 @@ impl LStr {
         }
         let root = if self.is_view() {
             unsafe { (*(self.p.as_ptr() as *const ViewHdr)).root }
+        } else if self.is_cons() {
+            self.flat_buffer()
         } else {
             self.p
         };
@@ -417,7 +629,7 @@ impl LStr {
                     strong: Cell::new(1),
                     len: Cell::new(piece.len() as u32),
                     cap: Cell::new(VIEW | if ascii { ASCII_HINT } else { 0 }),
-                    _spare: 0,
+                    spare: Cell::new(0),
                 },
                 root,
                 off: (piece.as_ptr() as usize - (root.as_ptr() as usize + HDR)) as u32,
@@ -454,6 +666,15 @@ impl LStr {
         }
         let piece = whole.get(start..off + self.len())?;
         Some(root.sub(piece))
+    }
+
+    #[cold]
+    unsafe fn drop_indirect(&mut self, cap: u32) {
+        if cap & VIEW != 0 {
+            self.drop_view();
+        } else {
+            release_all([Some(self.p)]);
+        }
     }
 
     /// Free a view whose last reference is going: unregister it and release its root.
@@ -562,8 +783,8 @@ impl Drop for LStr {
         let s = h.strong.get();
         if s == 1 {
             let cap = h.cap.get();
-            if cap & VIEW != 0 {
-                unsafe { self.drop_view() };
+            if cap & (VIEW | CONS) != 0 {
+                unsafe { self.drop_indirect(cap) };
                 return;
             }
             unsafe { dealloc(self.p.as_ptr() as *mut u8, layout(cap & CAP_MASK)) };
@@ -572,6 +793,34 @@ impl Drop for LStr {
         }
     }
 }
+
+/// Release one reference to each of `nodes`, freeing the ones that were the last and, for a
+/// concatenation node, the references it held — iteratively, however deep the chain.
+unsafe fn release_all<const N: usize>(nodes: [Option<NonNull<Header>>; N]) {
+    let mut stack: Vec<NonNull<Header>> = nodes.into_iter().flatten().collect();
+    while let Some(n) = stack.pop() {
+        let h = n.as_ref();
+        let strong = h.strong.get();
+        if strong == STRONG_STICKY {
+            continue;
+        }
+        if strong > 1 {
+            h.strong.set(strong - 1);
+            continue;
+        }
+        let cap = h.cap.get();
+        if cap & CONS != 0 {
+            let c = &*(n.as_ptr() as *const ConsHdr);
+            stack.extend(c.left.take());
+            stack.extend(c.right.take());
+            stack.extend(c.flat.take());
+            dealloc(n.as_ptr() as *mut u8, Layout::new::<ConsHdr>());
+        } else {
+            drop(LStr { p: n });
+        }
+    }
+}
+
 
 #[inline(always)]
 fn bump(c: &Cell<u32>) {
@@ -865,5 +1114,69 @@ mod tests {
         drop(mid);
         drop(s);
         assert_eq!(view_stats(), (0, 0, 0));
+    }
+
+    fn long(c: char, n: usize) -> LStr {
+        LStr::from(c.to_string().repeat(n))
+    }
+
+    #[test]
+    fn long_concatenations_stay_lazy_and_flatten_once() {
+        let (a, b) = (long('a', 200), long('b', 100));
+        let c = LStr::join(&a, &b);
+        assert!(c.is_cons() && c.len() == 300 && c.ascii_hint());
+        assert!(c.hdr().cap.get() & ASCII_HINT == 0, "the optimizing tier must not see the hint");
+        assert_eq!(a.strong_count(), 2, "operands stay shared with the node");
+        let first = c.as_str().as_ptr();
+        assert_eq!(&c[198..202], "aabb");
+        assert_eq!(c.as_str().as_ptr(), first, "flattened in place, once");
+        assert_eq!(a.strong_count(), 1, "flattening releases the operands");
+        let short = LStr::join(&long('x', 10), &long('y', 10));
+        assert!(!short.is_cons());
+    }
+
+    #[test]
+    fn a_million_deep_chain_flattens_and_drops_without_recursion() {
+        let mut s = long('x', 300);
+        let piece = LStr::from("ab");
+        for _ in 0..1_000_000 {
+            s = LStr::join(&s, &piece);
+        }
+        assert_eq!(s.len(), 300 + 2_000_000);
+        assert!(s.starts_with("xxx") && &s[298..304] == "xxabab" && s.ends_with("abab"));
+        let mut t = long('y', 300);
+        for _ in 0..1_000_000 {
+            t = LStr::join(&piece, &t);
+        }
+        drop(t);
+    }
+
+    #[test]
+    fn views_of_a_concatenation_read_its_flat_bytes() {
+        let c = LStr::join(&long('a', 200), &long('b', 200));
+        let piece = c.sub(&c[190..260]);
+        assert!(piece.is_view() && piece.len() == 70);
+        drop(c);
+        assert_eq!(&piece[8..14], "aabbbb");
+    }
+
+    #[test]
+    fn smuggled_surrogates_join_across_a_lazy_seam() {
+        let high = LStr::from(crate::jstr::from_units(&[0xD83D]));
+        let low = LStr::from(crate::jstr::from_units(&[0xDE00]));
+        let pad = long('p', 300);
+        let left = LStr::join(&pad, &high);
+        let right = LStr::join(&low, &pad);
+        assert!(left.last_high() && right.first_low());
+        assert!(LStr::cons(&left, &right).is_none());
+        let joined = LStr::join(&left, &right);
+        assert_eq!(crate::jstr::unit_len(&joined), 602);
+        assert_eq!(joined.chars().filter(|&c| c == '\u{1F600}').count(), 1);
+        let apart = LStr::join(&left, &long('q', 5));
+        assert!(apart.is_cons() && apart.last_high() == false);
+        let parts = [&pad, &high, &low, &pad];
+        assert!(LStr::concat_all(&parts).is_none());
+        let ok = LStr::concat_all(&[&pad, &high, &pad]).unwrap();
+        assert_eq!(ok.len(), 604);
     }
 }

@@ -2656,7 +2656,7 @@ pub(crate) fn shape_count() -> usize {
     shape_table_census().shapes
 }
 pub(crate) use props::{MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, jit_props_layout};
-pub(crate) use props::{jit_shared_shape, proto_epoch_addr};
+pub(crate) use props::{intern_key, jit_shared_shape, key_value, proto_epoch_addr};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).
 #[inline(always)]

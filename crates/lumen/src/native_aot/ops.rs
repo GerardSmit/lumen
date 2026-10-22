@@ -196,7 +196,7 @@ fn execute(
                 function.names[a as usize].clone()
             } else {
                 let key = pop(frame)?;
-                i.to_property_key(&key)?
+                i.to_property_key(&key)?.into_string()
             };
             let object = pop(frame)?;
             let old = i.get_member(&object, &key)?;
@@ -366,7 +366,7 @@ fn execute(
                 function.names[a as usize].clone()
             } else {
                 let key = pop(frame)?;
-                i.to_property_key(&key)?
+                i.to_property_key(&key)?.into_string()
             };
             let object = pop(frame)?;
             let method = i.get_member(&object, &key)?;
@@ -648,7 +648,7 @@ fn execute(
         "InitMethod" => {
             let key = if b == u32::MAX {
                 let key = pop(frame)?;
-                i.to_property_key(&key)?
+                i.to_property_key(&key)?.into_string()
             } else {
                 function.names[b as usize].clone()
             };
