@@ -173,6 +173,29 @@ struct CanvasTextState {
     text_rendering: CanvasTextRendering,
 }
 
+/// Text state is allocated on first write: most canvases never draw text, and the default is shared.
+#[derive(Clone, Default)]
+struct LazyText(Option<Box<CanvasTextState>>);
+
+impl core::ops::Deref for LazyText {
+    type Target = CanvasTextState;
+    fn deref(&self) -> &CanvasTextState {
+        match &self.0 {
+            Some(state) => state,
+            None => {
+                static DEFAULT: std::sync::OnceLock<CanvasTextState> = std::sync::OnceLock::new();
+                DEFAULT.get_or_init(CanvasTextState::default)
+            }
+        }
+    }
+}
+
+impl core::ops::DerefMut for LazyText {
+    fn deref_mut(&mut self) -> &mut CanvasTextState {
+        self.0.get_or_insert_with(Default::default)
+    }
+}
+
 impl CanvasTextState {
     fn shaping_options(&self) -> CanvasTextOptions {
         CanvasTextOptions {
@@ -302,8 +325,8 @@ pub struct CanvasData {
     saved_fill_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     saved_stroke_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     origin_clean: bool,
-    text: CanvasTextState,
-    saved_text: Vec<CanvasTextState>,
+    text: LazyText,
+    saved_text: Vec<LazyText>,
     remote_inbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
     remote_outbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
     remote_generation: u64,
@@ -602,7 +625,7 @@ impl CanvasData {
             origin_clean: true,
             saved_fill_styles: Vec::new(),
             saved_stroke_styles: Vec::new(),
-            text: CanvasTextState::default(),
+            text: LazyText::default(),
             saved_text: Vec::new(),
             remote_inbound: None,
             remote_outbound: None,
@@ -659,7 +682,7 @@ impl CanvasData {
         }
         self.saved_fill_styles.clear();
         self.saved_stroke_styles.clear();
-        self.text = CanvasTextState::default();
+        self.text = LazyText::default();
         self.saved_text.clear();
     }
 
@@ -2660,7 +2683,7 @@ macro_rules! impl_canvas_2d_methods {
                     data.fill_pattern_origin_clean = true;
                 } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
                     let mut data = self.data.borrow_mut();
-                    data.surface.state_mut().fill_gradient = Some(gradient);
+                    data.surface.state_mut().fill_gradient = Some(Box::new(gradient));
                     data.surface.state_mut().fill_pattern = None;
                     data.fill_gradient_value = Some(value);
                     data.fill_pattern_value = None;
@@ -2669,7 +2692,7 @@ macro_rules! impl_canvas_2d_methods {
                     let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().fill_gradient = None;
-                    data.surface.state_mut().fill_pattern = Some(pattern);
+                    data.surface.state_mut().fill_pattern = Some(Box::new(pattern));
                     data.fill_gradient_value = None;
                     data.fill_pattern_value = Some(value);
                     data.fill_pattern_origin_clean = clean;
@@ -2697,7 +2720,7 @@ macro_rules! impl_canvas_2d_methods {
                     data.stroke_pattern_origin_clean = true;
                 } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
                     let mut data = self.data.borrow_mut();
-                    data.surface.state_mut().stroke_gradient = Some(gradient);
+                    data.surface.state_mut().stroke_gradient = Some(Box::new(gradient));
                     data.surface.state_mut().stroke_pattern = None;
                     data.stroke_gradient_value = Some(value);
                     data.stroke_pattern_value = None;
@@ -2706,7 +2729,7 @@ macro_rules! impl_canvas_2d_methods {
                     let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().stroke_gradient = None;
-                    data.surface.state_mut().stroke_pattern = Some(pattern);
+                    data.surface.state_mut().stroke_pattern = Some(Box::new(pattern));
                     data.stroke_gradient_value = None;
                     data.stroke_pattern_value = Some(value);
                     data.stroke_pattern_origin_clean = clean;
@@ -5781,6 +5804,25 @@ pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canvas_text_state_is_allocated_on_first_write_and_never_shared() {
+        let mut untouched = LazyText::default();
+        assert!(untouched.0.is_none());
+        assert_eq!(untouched.font, "10px sans-serif");
+        let mut written = untouched.clone();
+        written.letter_spacing = 3.0;
+        written.align = "center".into();
+        assert!(written.0.is_some() && untouched.0.is_none());
+        assert_eq!(untouched.letter_spacing, 0.0);
+        assert_eq!(untouched.align, "start");
+        let saved = written.clone();
+        written.align = "end".into();
+        assert_eq!(saved.align, "center");
+        untouched.size = 20.0;
+        assert_eq!(LazyText::default().size, 10.0);
+        assert!(core::mem::size_of::<CanvasData>() <= 1000, "{}", core::mem::size_of::<CanvasData>());
+    }
+
     use super::*;
 
     #[test]

@@ -271,6 +271,7 @@ pub struct Document {
     allow_declarative_shadow_roots: bool,
     free: Vec<u32>,
     live_nodes: usize,
+    node_retirements: u64,
     version: u64,
     max_nodes: usize,
     allocation_budget: css::Hook<Rc<dyn Fn(&Document, usize, usize) -> Result<(), Error>>>,
@@ -370,6 +371,7 @@ impl Document {
             allow_declarative_shadow_roots: false,
             free: Vec::new(),
             live_nodes: 1,
+            node_retirements: 0,
             version: 0,
             max_nodes: max_nodes.max(1),
             allocation_budget: css::Hook::none(),
@@ -423,6 +425,11 @@ impl Document {
 
     pub const fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Count of nodes ever destroyed or adopted away; stale `NodeId`s can only appear after it grows.
+    pub const fn node_retirements(&self) -> u64 {
+        self.node_retirements
     }
 
     /// Looks up the first connected light-tree element with `wanted` as its `id`.
@@ -1719,6 +1726,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             self.doctype_identifiers
                 .retain(|(owner, _, _)| *owner != id);
             self.live_nodes -= 1;
+            self.node_retirements += 1;
             self.update_tracked_node_count();
         }
         if self.cryptographic_nonces.is_empty() {self.cryptographic_nonces=Vec::new();}
@@ -2595,6 +2603,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
                 source.free.push(source_id.index as u32);
             }
             source.live_nodes -= 1;
+            source.node_retirements += 1;
             self.live_nodes += 1;
             source.update_tracked_node_count();
             self.update_tracked_node_count();

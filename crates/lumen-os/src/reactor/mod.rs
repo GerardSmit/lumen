@@ -260,6 +260,10 @@ impl Slab {
         slot.entry.as_mut()
     }
 
+    fn live(&self) -> usize {
+        self.slots.len() - self.free.len()
+    }
+
     fn remove(&mut self, token: u64) -> Option<Entry> {
         let (index, generation) = split(token);
         let slot = self.slots.get_mut(index)?;
@@ -320,6 +324,10 @@ impl Core {
         self.backend.fired(src, armed, ready);
         wake.wake();
         true
+    }
+
+    fn quiescent(&self) -> bool {
+        !cfg!(windows) && !self.armed.load(Ordering::Acquire) && lock(&self.slab).live() == 0
     }
 
     fn turn(&self, timeout: Option<Duration>) -> Result<usize, SchedError> {
@@ -410,6 +418,11 @@ impl Poller {
     /// are possible.
     pub fn turn(&self, timeout: Option<Duration>) -> Result<usize, SchedError> {
         self.core.turn(timeout)
+    }
+
+    /// Nothing is registered and no wake is pending, so a non-blocking `turn` cannot deliver anything.
+    pub fn quiescent(&self) -> bool {
+        self.core.quiescent()
     }
 
     #[cfg(test)]

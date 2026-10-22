@@ -1598,11 +1598,12 @@ impl Runtime {
         document: &Rc<lumen_html_js::DomRealm>,
     ) -> Result<(), String> {
         if document.rendering_blocked() {return Ok(())}
-        let owner = document.child_realm_handle().map_err(|error| format!("{error:?}"))?
-            .unwrap_or_else(|| self.engine.ctx().current_host_realm());
-        self.engine.ctx().with_host_realm(&owner, |ctx| document.update_rendered_focus(ctx))
-            .map_err(|error| format!("rendering realm failed: {error}"))?
-            .map_err(|error| format!("rendered focus update failed: {error:?}"))
+        let result = match document.child_realm_handle().map_err(|error| format!("{error:?}"))? {
+            Some(owner) => self.engine.ctx().with_host_realm(&owner, |ctx| document.update_rendered_focus(ctx))
+                .map_err(|error| format!("rendering realm failed: {error}"))?,
+            None => document.update_rendered_focus(self.engine.ctx()),
+        };
+        result.map_err(|error| format!("rendered focus update failed: {error:?}"))
     }
 
     /// Run every turn that is ready now (microtasks, queued callbacks, due timers, delivered
@@ -2060,15 +2061,21 @@ impl Runtime {
             let Some(document)=self.browser_stylesheet_documents.borrow()[index].upgrade() else {continue};
             if document.is_document_destroyed() {continue}
             let Ok(owner)=document.child_realm_handle() else {continue};
-            let owner=owner.unwrap_or_else(||self.engine.ctx().current_host_realm());
-            let result=self.engine.ctx().with_host_realm(&owner,|ctx| {
+            let work=|ctx:&mut lumen::embed::Ctx| {
                 let count = document.queue_stylesheet_tasks(ctx).map_err(|error|error.to_value(ctx))?;
                 let objects = document.queue_object_tasks(ctx).map_err(|error|error.to_value(ctx))?;
                 Ok::<_,Value>(count + objects)
-            });
+            };
+            let result=match &owner {
+                Some(owner)=>self.engine.ctx().with_host_realm(owner,work),
+                None=>Ok(work(self.engine.ctx())),
+            };
             match result {
                 Ok(Ok(count))=>progressed|=count!=0,
-                Ok(Err(error))=>self.report_uncaught_in_realm(&error,&owner),
+                Ok(Err(error))=>{
+                    let owner=owner.unwrap_or_else(||self.engine.ctx().current_host_realm());
+                    self.report_uncaught_in_realm(&error,&owner)
+                }
                 Err(_)=>{},
             }
         }

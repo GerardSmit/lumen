@@ -66,6 +66,7 @@ impl LoopReactor {
     /// poller exists.
     pub fn poll(&self) -> usize {
         match self.inner.poller.get() {
+            Some(Some(poller)) if poller.quiescent() => 0,
             Some(Some(poller)) => poller.turn(Some(Duration::ZERO)).unwrap_or(0),
             _ => 0,
         }

@@ -1485,7 +1485,7 @@ impl ReplaySink for Raster<'_> {
         }
         let gradients=(||Ok::<_,ImageError>((make_gradient(fill)?,make_gradient(stroke)?)))();
         let (fill_gradient,stroke_gradient)=match gradients {Ok(value)=>value,Err(error)=>{self.error=Some(error);return;}};
-        surface.state_mut().fill_gradient=fill_gradient;surface.state_mut().stroke_gradient=stroke_gradient;
+        surface.state_mut().fill_gradient=fill_gradient.map(Box::new);surface.state_mut().stroke_gradient=stroke_gradient.map(Box::new);
         let paint_budget=match paint_reserved.map(|occupied|MAX_LAYER_BYTES.checked_sub(occupied).and_then(|bytes|bytes.checked_sub(gradient_bytes)).ok_or(ImageError::TooLarge)).transpose() {
             Ok(budget)=>budget,Err(error)=>{self.error=Some(error);return;}
         };

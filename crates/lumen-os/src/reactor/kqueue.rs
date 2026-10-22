@@ -7,6 +7,7 @@ use crate::sched::SchedError;
 use std::time::Duration;
 
 const BATCH: usize = 256;
+const POLL_BATCH: usize = 16;
 const WAKE_IDENT: usize = 1;
 
 pub(super) struct KqueueBackend {
@@ -101,9 +102,19 @@ impl Backend for KqueueBackend {
     }
 
     fn wait(&self, timeout: Option<Duration>, out: &mut Vec<(u64, Ready)>) -> Result<bool, SchedError> {
+        if timeout == Some(Duration::ZERO) {
+            self.wait_batch::<POLL_BATCH>(timeout, out)
+        } else {
+            self.wait_batch::<BATCH>(timeout, out)
+        }
+    }
+}
+
+impl KqueueBackend {
+    fn wait_batch<const N: usize>(&self, timeout: Option<Duration>, out: &mut Vec<(u64, Ready)>) -> Result<bool, SchedError> {
         let ts = timeout.map(|d| (d.as_secs().min(i64::MAX as u64) as i64, i64::from(d.subsec_nanos())));
         // SAFETY: an all-zero kevent is valid.
-        let mut buf: [RawKevent; BATCH] = unsafe { std::mem::zeroed() };
+        let mut buf: [RawKevent; N] = unsafe { std::mem::zeroed() };
         let n = match event::kevent_into(self.kq, &[], &mut buf, ts) {
             Ok(n) => n,
             Err(e) if e.code() == "EINTR" => return Ok(false),

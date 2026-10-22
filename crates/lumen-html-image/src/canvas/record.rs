@@ -59,6 +59,7 @@ counters!(
     cow_materialized,
     cow_reads,
     pixmaps_allocated,
+    snapshots_recycled,
 );
 
 fn count(counter: &AtomicU64, by: u64) {
@@ -90,28 +91,81 @@ pub enum CanvasSource {
 /// A canvas snapshot kept as the premultiplied pixels the canvas stores, so drawing it onto
 /// another canvas needs no conversion; the straight-alpha image is made once, on first request.
 pub struct PremultipliedImage {
-    pixmap: Pixmap,
+    pixmap: Option<Pixmap>,
     straight: std::sync::OnceLock<Arc<Rgba8Image>>,
+}
+
+const SNAPSHOT_POOL_BUFFERS: usize = 4;
+const SNAPSHOT_POOL_BYTES: usize = 16 * 1024 * 1024;
+
+thread_local! {
+    static SNAPSHOT_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A copy of `source` that reuses the buffer of a dropped snapshot of the same size when there is
+/// one. A buffer enters the pool only when the last reference to its snapshot is dropped, so a
+/// live reader never sees it rewritten.
+pub fn pooled_copy(source: &Pixmap) -> Pixmap {
+    let len = source.data().len();
+    let recycled = SNAPSHOT_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let at = pool.iter().position(|buffer| buffer.len() == len)?;
+        Some(pool.swap_remove(at))
+    });
+    if let Some(mut buffer) = recycled {
+        buffer.copy_from_slice(source.data());
+        if let Some(size) = tiny_skia::IntSize::from_wh(source.width(), source.height()) {
+            if let Some(pixmap) = Pixmap::from_vec(buffer, size) {
+                count(&COUNTERS.snapshots_recycled, 1);
+                return pixmap;
+            }
+        }
+    }
+    source.clone()
+}
+
+fn recycle_buffer(buffer: Vec<u8>) {
+    SNAPSHOT_POOL.with(|pool| {
+        let Ok(mut pool) = pool.try_borrow_mut() else { return };
+        let held: usize = pool.iter().map(Vec::len).sum();
+        if pool.len() < SNAPSHOT_POOL_BUFFERS && held + buffer.len() <= SNAPSHOT_POOL_BYTES {
+            pool.push(buffer);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn pooled_snapshot_buffers() -> usize {
+    SNAPSHOT_POOL.with(|pool| pool.borrow().len())
+}
+
+impl Drop for PremultipliedImage {
+    fn drop(&mut self) {
+        if let Some(pixmap) = self.pixmap.take() {
+            recycle_buffer(pixmap.take());
+        }
+    }
 }
 
 impl PremultipliedImage {
     pub fn new(pixmap: Pixmap) -> Self {
-        Self { pixmap, straight: std::sync::OnceLock::new() }
+        Self { pixmap: Some(pixmap), straight: std::sync::OnceLock::new() }
     }
 
     pub fn pixmap(&self) -> &Pixmap {
-        &self.pixmap
+        self.pixmap.as_ref().expect("pixmap lives until drop")
     }
 
     pub fn straight(&self) -> Arc<Rgba8Image> {
         self.straight
             .get_or_init(|| {
-                let mut pixels = Vec::with_capacity(self.pixmap.data().len());
-                for pixel in self.pixmap.pixels() {
+                let pixmap = self.pixmap();
+                let mut pixels = Vec::with_capacity(pixmap.data().len());
+                for pixel in pixmap.pixels() {
                     let c = pixel.demultiply();
                     pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
                 }
-                Arc::new(Rgba8Image { width: self.pixmap.width(), height: self.pixmap.height(), pixels })
+                Arc::new(Rgba8Image { width: pixmap.width(), height: pixmap.height(), pixels })
             })
             .clone()
     }
@@ -121,7 +175,7 @@ impl CanvasSource {
     pub fn width(&self) -> u32 {
         match self {
             Self::Pixels(image) => image.width,
-            Self::Premultiplied(image) => image.pixmap.width(),
+            Self::Premultiplied(image) => image.pixmap().width(),
             Self::Lazy(lazy) => lazy.width(),
             Self::Transparent { width, .. } => *width,
         }
@@ -130,7 +184,7 @@ impl CanvasSource {
     pub fn height(&self) -> u32 {
         match self {
             Self::Pixels(image) => image.height,
-            Self::Premultiplied(image) => image.pixmap.height(),
+            Self::Premultiplied(image) => image.pixmap().height(),
             Self::Lazy(lazy) => lazy.height(),
             Self::Transparent { height, .. } => *height,
         }
@@ -153,7 +207,7 @@ impl CanvasSource {
     pub fn is_opaque(&self) -> Option<bool> {
         match self {
             Self::Pixels(image) => Some(image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255)),
-            Self::Premultiplied(image) => Some(image.pixmap.pixels().iter().all(|pixel| pixel.alpha() == 255)),
+            Self::Premultiplied(image) => Some(image.pixmap().pixels().iter().all(|pixel| pixel.alpha() == 255)),
             Self::Lazy(lazy) => lazy.is_opaque(),
             Self::Transparent { .. } => Some(false),
         }
@@ -309,10 +363,10 @@ impl DrawingState {
     /// objects cannot reach.
     fn detached(&self) -> Self {
         let mut state = self.clone();
-        state.fill_gradient = state.fill_gradient.as_ref().map(CanvasGradient::detached);
-        state.stroke_gradient = state.stroke_gradient.as_ref().map(CanvasGradient::detached);
-        state.fill_pattern = state.fill_pattern.as_ref().map(CanvasPattern::detached);
-        state.stroke_pattern = state.stroke_pattern.as_ref().map(CanvasPattern::detached);
+        state.fill_gradient = state.fill_gradient.as_deref().map(|gradient| Box::new(gradient.detached()));
+        state.stroke_gradient = state.stroke_gradient.as_deref().map(|gradient| Box::new(gradient.detached()));
+        state.fill_pattern = state.fill_pattern.as_deref().map(|pattern| Box::new(pattern.detached()));
+        state.stroke_pattern = state.stroke_pattern.as_deref().map(|pattern| Box::new(pattern.detached()));
         state
     }
 
@@ -638,7 +692,7 @@ impl CanvasSurface {
         }
         let published = self.layers.first().map_or(&self.bitmap, |layer| &layer.bitmap);
         let image = match published {
-            Some(bitmap) => Arc::new(PremultipliedImage::new(bitmap.clone())),
+            Some(bitmap) => Arc::new(PremultipliedImage::new(pooled_copy(bitmap))),
             None => {
                 let snapshot = Arc::new(self.snapshot());
                 return CanvasSource::Pixels(snapshot);

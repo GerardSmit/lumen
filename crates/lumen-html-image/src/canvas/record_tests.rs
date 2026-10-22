@@ -183,10 +183,10 @@ fn patterns_and_gradients_match_and_are_detached_from_later_mutation() {
         });
         gradient.add_color_stop(0.0, [255, 0, 0, 255]).unwrap();
         gradient.add_color_stop(1.0, [0, 0, 255, 255]).unwrap();
-        canvas.state_mut().fill_pattern = Some(pattern.clone());
+        canvas.state_mut().fill_pattern = Some(Box::new(pattern.clone()));
         canvas.fill_rect(0.0, 0.0, 12.0, H as f32).unwrap();
         canvas.state_mut().fill_pattern = None;
-        canvas.state_mut().fill_gradient = Some(gradient.clone());
+        canvas.state_mut().fill_gradient = Some(Box::new(gradient.clone()));
         canvas.fill_rect(12.0, 0.0, 12.0, H as f32).unwrap();
         pattern.set_transform(Transform::from_translate(1.0, 1.0));
         gradient.add_color_stop(0.5, [0, 255, 0, 255]).unwrap();
@@ -688,4 +688,56 @@ fn premultiplied_source_is_shared_until_the_canvas_changes() {
     };
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(first.straight().pixels, source.snapshot().pixels);
+}
+
+fn premultiplied_of(source: CanvasSource) -> Arc<PremultipliedImage> {
+    let CanvasSource::Premultiplied(image) = source else { panic!("expected a premultiplied source") };
+    image
+}
+
+#[test]
+fn dropped_snapshot_buffer_backs_the_next_generation() {
+    let mut canvas = painted_source();
+    let first = premultiplied_of(canvas.source());
+    let first_buffer = first.pixmap().data().as_ptr();
+    drop(first);
+    assert_eq!(record::pooled_snapshot_buffers(), 1);
+    canvas.state_mut().fill = [250, 10, 10, 255];
+    canvas.fill_rect(0.0, 0.0, 4.0, 4.0).unwrap();
+    let second = premultiplied_of(canvas.source());
+    assert_eq!(second.pixmap().data().as_ptr(), first_buffer);
+    assert_eq!(record::pooled_snapshot_buffers(), 0);
+    assert_eq!(second.straight().pixels, canvas.snapshot().pixels);
+}
+
+#[test]
+fn snapshot_held_by_a_reader_is_never_recycled() {
+    let mut canvas = painted_source();
+    let held = premultiplied_of(canvas.source());
+    let held_pixels = held.pixmap().data().to_vec();
+    canvas.state_mut().fill = [1, 2, 3, 255];
+    canvas.fill_rect(0.0, 0.0, W as f32, H as f32).unwrap();
+    let second = premultiplied_of(canvas.source());
+    assert_eq!(record::pooled_snapshot_buffers(), 0);
+    assert_ne!(second.pixmap().data().as_ptr(), held.pixmap().data().as_ptr());
+    drop(second);
+    assert_eq!(record::pooled_snapshot_buffers(), 1);
+    canvas.state_mut().fill = [9, 9, 9, 255];
+    canvas.fill_rect(0.0, 0.0, 5.0, 5.0).unwrap();
+    let third = premultiplied_of(canvas.source());
+    assert_ne!(third.pixmap().data().as_ptr(), held.pixmap().data().as_ptr());
+    assert_eq!(held.pixmap().data(), held_pixels.as_slice());
+}
+
+#[test]
+fn snapshot_pool_ignores_buffers_of_other_sizes() {
+    let mut small = painted_source();
+    drop(small.source());
+    assert_eq!(record::pooled_snapshot_buffers(), 1);
+    let mut other = CanvasSurface::new(W + 1, H).unwrap();
+    other.state_mut().fill = [7, 7, 7, 255];
+    other.fill_rect(0.0, 0.0, 3.0, 3.0).unwrap();
+    let image = premultiplied_of(other.source());
+    assert_eq!(image.pixmap().width(), W + 1);
+    assert_eq!(record::pooled_snapshot_buffers(), 1);
 }

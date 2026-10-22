@@ -410,10 +410,10 @@ pub struct DrawingState {
     pub shadow_blur: f64,
     pub shadow_offset_x: f64,
     pub shadow_offset_y: f64,
-    pub fill_gradient: Option<CanvasGradient>,
-    pub stroke_gradient: Option<CanvasGradient>,
-    pub fill_pattern: Option<CanvasPattern>,
-    pub stroke_pattern: Option<CanvasPattern>,
+    pub fill_gradient: Option<Box<CanvasGradient>>,
+    pub stroke_gradient: Option<Box<CanvasGradient>>,
+    pub fill_pattern: Option<Box<CanvasPattern>>,
+    pub stroke_pattern: Option<Box<CanvasPattern>>,
     clip: Option<std::sync::Arc<Mask>>,
 }
 
@@ -1027,7 +1027,7 @@ impl CanvasSurface {
             if let Some(record::CanvasSource::Premultiplied(image)) = &alias {
                 if image.pixmap().width() == self.width && image.pixmap().height() == self.height {
                     record::count_materialized_alias();
-                    self.bitmap = Some(image.pixmap().clone());
+                    self.bitmap = Some(record::pooled_copy(image.pixmap()));
                     self.lazy = false;
                     return Ok(());
                 }
@@ -1485,18 +1485,18 @@ impl CanvasSurface {
         let gradient_image = self
             .state
             .fill_gradient
-            .as_ref()
+            .as_deref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
         let paint = Self::paint(
             self.state.blend,
             self.state.alpha,
             self.state.fill,
-            self.state.fill_gradient.as_ref(),
-            self.state.fill_pattern.as_ref(),
+            self.state.fill_gradient.as_deref(),
+            self.state.fill_pattern.as_deref(),
             self.state.transform,
             gradient_image.as_ref(),
         );
-        let pattern_clip = self.pattern_clip(self.state.fill_pattern.as_ref());
+        let pattern_clip = self.pattern_clip(self.state.fill_pattern.as_deref());
         if self.state.shadow_color[3] != 0
             && (self.state.shadow_blur != 0.0
                 || self.state.shadow_offset_x != 0.0
@@ -1517,8 +1517,8 @@ impl CanvasSurface {
                     BlendMode::SourceOver,
                     self.state.alpha,
                     self.state.fill,
-                    self.state.fill_gradient.as_ref(),
-                    self.state.fill_pattern.as_ref(),
+                    self.state.fill_gradient.as_deref(),
+                    self.state.fill_pattern.as_deref(),
                     self.state.transform,
                     gradient_image.as_ref(),
                 );
@@ -1673,18 +1673,18 @@ impl CanvasSurface {
         let gradient_image = self
             .state
             .stroke_gradient
-            .as_ref()
+            .as_deref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
         let paint = Self::paint(
             self.state.blend,
             self.state.alpha,
             self.state.stroke,
-            self.state.stroke_gradient.as_ref(),
-            self.state.stroke_pattern.as_ref(),
+            self.state.stroke_gradient.as_deref(),
+            self.state.stroke_pattern.as_deref(),
             transform,
             gradient_image.as_ref(),
         );
-        let pattern_clip = self.pattern_clip(self.state.stroke_pattern.as_ref());
+        let pattern_clip = self.pattern_clip(self.state.stroke_pattern.as_deref());
         if let Some(mut bounds) = path.bounds().transform(transform) {
             let scale_x = transform.sx.hypot(transform.ky);
             let scale_y = transform.kx.hypot(transform.sy);
@@ -1707,8 +1707,8 @@ impl CanvasSurface {
                 BlendMode::SourceOver,
                 self.state.alpha,
                 self.state.stroke,
-                self.state.stroke_gradient.as_ref(),
-                self.state.stroke_pattern.as_ref(),
+                self.state.stroke_gradient.as_deref(),
+                self.state.stroke_pattern.as_deref(),
                 transform,
                 gradient_image.as_ref(),
             );
@@ -1772,7 +1772,7 @@ impl CanvasSurface {
         } else {
             self.state
                 .fill_gradient
-                .as_ref()
+                .as_deref()
                 .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height))
         };
         if !clear {
@@ -1781,8 +1781,8 @@ impl CanvasSurface {
                     BlendMode::SourceOver,
                     self.state.alpha,
                     self.state.fill,
-                    self.state.fill_gradient.as_ref(),
-                    self.state.fill_pattern.as_ref(),
+                    self.state.fill_gradient.as_deref(),
+                    self.state.fill_pattern.as_deref(),
                     self.state.transform,
                     gradient_image.as_ref(),
                 );
@@ -1810,8 +1810,8 @@ impl CanvasSurface {
                 self.state.blend,
                 self.state.alpha,
                 self.state.fill,
-                self.state.fill_gradient.as_ref(),
-                self.state.fill_pattern.as_ref(),
+                self.state.fill_gradient.as_deref(),
+                self.state.fill_pattern.as_deref(),
                 self.state.transform,
                 gradient_image.as_ref(),
             )
@@ -1819,7 +1819,7 @@ impl CanvasSurface {
         let pattern_clip = if clear {
             None
         } else {
-            self.pattern_clip(self.state.fill_pattern.as_ref())
+            self.pattern_clip(self.state.fill_pattern.as_deref())
         };
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.fill_rect(
@@ -1854,15 +1854,15 @@ impl CanvasSurface {
         let gradient_image = self
             .state
             .fill_gradient
-            .as_ref()
+            .as_deref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
         if let Some(bounds) = path.bounds().transform(self.state.transform) {
             let source_paint = Self::paint(
                 BlendMode::SourceOver,
                 self.state.alpha,
                 self.state.fill,
-                self.state.fill_gradient.as_ref(),
-                self.state.fill_pattern.as_ref(),
+                self.state.fill_gradient.as_deref(),
+                self.state.fill_pattern.as_deref(),
                 self.state.transform,
                 gradient_image.as_ref(),
             );
@@ -1881,12 +1881,12 @@ impl CanvasSurface {
             self.state.blend,
             self.state.alpha,
             self.state.fill,
-            self.state.fill_gradient.as_ref(),
-            self.state.fill_pattern.as_ref(),
+            self.state.fill_gradient.as_deref(),
+            self.state.fill_pattern.as_deref(),
             self.state.transform,
             gradient_image.as_ref(),
         );
-        let pattern_clip = self.pattern_clip(self.state.fill_pattern.as_ref());
+        let pattern_clip = self.pattern_clip(self.state.fill_pattern.as_deref());
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.fill_path(
                 path,
@@ -1905,7 +1905,7 @@ impl CanvasSurface {
         self.flush();
         if self.state.shadow_color[3]!=0 || self.state.fill_pattern.is_some() || self.state.stroke_pattern.is_some() {return Err(ImageError::InvalidViewport);}
         self.materialize()?;
-        let gradient=if stroke{self.state.stroke_gradient.as_ref()}else{self.state.fill_gradient.as_ref()};
+        let gradient=if stroke{self.state.stroke_gradient.as_deref()}else{self.state.fill_gradient.as_deref()};
         let custom=gradient.map(|gradient|gradient.equal_radial_bitmap_with_budget(self.width,self.height,Some(max_bytes))).transpose()?.flatten();
         let remaining=max_bytes.checked_sub(custom.as_ref().map_or(0,|bitmap|bitmap.data().len())).ok_or(ImageError::TooLarge)?;
         let paint=Self::paint_with_budget(self.state.blend,self.state.alpha,if stroke{self.state.stroke}else{self.state.fill},gradient,None,self.state.transform,custom.as_ref(),Some(remaining))?;
@@ -1922,7 +1922,7 @@ impl CanvasSurface {
         let gradient_image = self
             .state
             .stroke_gradient
-            .as_ref()
+            .as_deref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
         if let Some(mut bounds) = path.bounds().transform(self.state.transform) {
             let transform = self.state.transform;
@@ -1947,8 +1947,8 @@ impl CanvasSurface {
                 BlendMode::SourceOver,
                 self.state.alpha,
                 self.state.stroke,
-                self.state.stroke_gradient.as_ref(),
-                self.state.stroke_pattern.as_ref(),
+                self.state.stroke_gradient.as_deref(),
+                self.state.stroke_pattern.as_deref(),
                 self.state.transform,
                 gradient_image.as_ref(),
             );
@@ -1968,12 +1968,12 @@ impl CanvasSurface {
             self.state.blend,
             self.state.alpha,
             self.state.stroke,
-            self.state.stroke_gradient.as_ref(),
-            self.state.stroke_pattern.as_ref(),
+            self.state.stroke_gradient.as_deref(),
+            self.state.stroke_pattern.as_deref(),
             self.state.transform,
             gradient_image.as_ref(),
         );
-        let pattern_clip = self.pattern_clip(self.state.stroke_pattern.as_ref());
+        let pattern_clip = self.pattern_clip(self.state.stroke_pattern.as_deref());
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.stroke_path(
                 path,
@@ -2526,7 +2526,7 @@ mod tests {
         let pattern=CanvasPattern::with_natural_size(&image,CanvasPatternRepetition::NoRepeat,1.0,1.0).unwrap();
         assert_eq!(pattern.transform(),Transform::identity());
         let mut canvas=CanvasSurface::new(4,2).unwrap();
-        canvas.state_mut().fill_pattern=Some(pattern.clone());
+        canvas.state_mut().fill_pattern=Some(Box::new(pattern.clone()));
         canvas.fill_rect(0.0,0.0,4.0,2.0).unwrap();
         let pixels=canvas.snapshot().pixels;
         assert_eq!(&pixels[..4],&[0,128,0,255]);assert_eq!(&pixels[4..8],&[0,0,0,0]);
@@ -2666,7 +2666,7 @@ mod tests {
         gradient.add_color_stop(1.0, [0, 0, 255, 255]).unwrap();
         gradient.add_color_stop(0.0, [255, 0, 0, 255]).unwrap();
         let mut canvas = CanvasSurface::new(4, 1).unwrap();
-        canvas.state_mut().fill_gradient = Some(gradient);
+        canvas.state_mut().fill_gradient = Some(Box::new(gradient));
         canvas.fill_rect(0.0, 0.0, 4.0, 1.0).unwrap();
         let pixels = canvas.snapshot().pixels;
         assert!(pixels[0] > pixels[2]);

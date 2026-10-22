@@ -843,6 +843,7 @@ pub struct RenderSession {
     synced_interaction: (crate::interaction::InteractionState, u64),
     auto_directionality_scan: Option<(u64, bool)>,
     node_bitmaps: Vec<(NodeId, layout::NodeBitmap, crate::responsive_images::ImageMetadata)>,
+    retirements_pruned: Option<(u64, u64)>,
     embedded_bitmaps: Vec<(NodeId, Arc<crate::render_capture::ReservedImageData>)>,
     object_representations: Vec<(NodeId, crate::object::Representation, Option<crate::object::IntrinsicSize>)>,
     svg_fragment: Option<Box<crate::svg::Fragment>>,
@@ -1383,6 +1384,7 @@ impl RenderSession {
             synced_interaction: (document_interaction, document_shape),
             auto_directionality_scan: None,
             node_bitmaps: Vec::new(),
+            retirements_pruned: None,
             embedded_bitmaps:Vec::new(),
             object_representations: Vec::new(),
             svg_fragment: None,
@@ -5892,6 +5894,18 @@ impl RenderSession {
         }
     }
 
+    fn prune_retired_nodes(&mut self) {
+        let mark = Some((self.document.root().document_id(), self.document.node_retirements()));
+        if self.retirements_pruned == mark {
+            return;
+        }
+        self.retirements_pruned = mark;
+        self.scrolls.retain(|scroll| self.document.kind(scroll.node).is_ok());
+        self.normalized_scroll_events.retain(|node| self.document.kind(*node).is_ok());
+        self.node_bitmaps.retain(|(node, _, _)| self.document.kind(*node).is_ok());
+        self.object_representations.retain(|(node, _, _)| self.document.kind(*node).is_ok());
+    }
+
     fn render(
         &mut self,
         width: u32,
@@ -5908,12 +5922,7 @@ impl RenderSession {
             self.invalidate_fonts();
             self.font_generation = font_generation;
         }
-        self.scrolls
-            .retain(|scroll| self.document.kind(scroll.node).is_ok());
-        self.normalized_scroll_events.retain(|node|self.document.kind(*node).is_ok());
-        self.node_bitmaps
-            .retain(|(node, _, _)| self.document.kind(*node).is_ok());
-        self.object_representations.retain(|(node, _, _)| self.document.kind(*node).is_ok());
+        self.prune_retired_nodes();
         let version = self.document.version();
         let image_generation = images.map(ImageResolver::generation);
         let arrivals = self.resolve_bitmap_arrivals();
@@ -7576,6 +7585,30 @@ mod tests {
         assert_ne!(session.paint_revision(), revision);
         let list = session.display_list(10, 10, &NoText).unwrap();
         assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::Image { image, .. } if Arc::ptr_eq(image, &blue))));
+    }
+
+    #[test]
+    fn destroyed_node_bitmaps_are_pruned_only_when_nodes_retire() {
+        let document = crate::html::parse("<body style='margin:0'><img id=a src=a.png><img id=b src=b.png></body>", 32).unwrap();
+        let find = |document: &Document, selector: &str| crate::selector::query_selector(document, document.root(), selector).unwrap().unwrap();
+        let (a, b) = (find(&document, "#a"), find(&document, "#b"));
+        let mut session = RenderSession::new(document);
+        let pixels = Arc::new(ImageData { width: 1, height: 1, pixels: alloc::vec![1, 2, 3, 255].into() });
+        session.set_node_bitmap(a, Some(pixels.clone())).unwrap();
+        session.set_node_bitmap(b, Some(pixels)).unwrap();
+        session.display_list(10, 10, &NoText).unwrap();
+        assert_eq!(session.node_bitmaps.len(), 2);
+        let marker = session.retirements_pruned;
+        assert!(marker.is_some());
+        session.display_list(10, 10, &NoText).unwrap();
+        assert_eq!(session.retirements_pruned, marker);
+        let document = session.document_mut();
+        document.remove(a).unwrap();
+        document.destroy_subtree(a).unwrap();
+        session.display_list(10, 10, &NoText).unwrap();
+        assert_ne!(session.retirements_pruned, marker);
+        assert_eq!(session.node_bitmaps.len(), 1);
+        assert_eq!(session.node_bitmaps[0].0, b);
     }
 
     #[test]

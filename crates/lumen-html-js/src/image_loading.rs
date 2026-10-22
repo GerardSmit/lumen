@@ -119,9 +119,9 @@ struct Request {
     auto_width:Option<f32>,
     selection_dirty: bool,
     selection_generation: u64,
-    base: String,
+    base: Rc<str>,
     current: ImageRequest,
-    pending: Option<ImageRequest>,
+    pending: Option<Box<ImageRequest>>,
     // None is the img algorithm; input availability and representation differ.
     input_represents_current: Option<bool>,
     // Current-node retention proof, independent of original-client load blocking.
@@ -151,6 +151,7 @@ pub(crate) struct ImageLoader {
     /// Images which may take their width from the rendered box (`sizes=auto`): the only requests
     /// whose auto width is re-measured when the frame changes.
     auto_nodes: RefCell<HashSet<NodeId>>,
+    shared_base: RefCell<Rc<str>>,
     next_generation: Cell<u64>,
     tree_generation: Cell<u64>,
     /// Bumped by changes that can alter which images the document owns or how they are
@@ -243,6 +244,16 @@ impl Request {
 type ResponsePolicy=Rc<dyn Fn(&str,&str,u32)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>;
 
 impl ImageLoader {
+    /// Requests of one document share the base URL allocation instead of each owning a copy.
+    fn intern_base(&self, base: &str) -> Rc<str> {
+        let mut shared = self.shared_base.borrow_mut();
+        if &**shared != base {
+            *shared = Rc::from(base);
+        }
+        shared.clone()
+    }
+
+
     pub(crate) fn invalidate_environment(&self) {
         for request in self.requests.borrow_mut().values_mut(){request.environment_dirty=true;}
         self.mark_dirty(None);self.mark_scan_needed();
@@ -479,7 +490,7 @@ impl ImageLoader {
 
     fn synchronize_node(&self, document: &Document, node: NodeId, base: &str) -> bool {
         if !is_html_image(document,node){return false;}
-        if self.requests.borrow().get(&node).is_some_and(|request|!request.selection_dirty&&!request.environment_dirty&&request.observed_version==Some(document.version())&&request.base==base&&request.selected_source.is_some()){return true;}
+        if self.requests.borrow().get(&node).is_some_and(|request|!request.selection_dirty&&!request.environment_dirty&&request.observed_version==Some(document.version())&&&*request.base==base&&request.selected_source.is_some()){return true;}
         let (auto_width,deferred)=self.requests.borrow().get(&node).map_or((None,false),|request|(request.auto_width,request.environment_dirty&&!request.selection_dirty&&request.pending.is_some()));
         // HTML's environment algorithm leaves an in-flight pending selection
         // alone. Relevant source mutations can still replace that request.
@@ -527,13 +538,13 @@ impl ImageLoader {
                 request.selection_generation=self.allocate_generation();
                 request.selected_source=Some(None);request.selected_crossorigin=Some(None);
                 request.input_represents_current=Some(false);
-                request.base=base.to_owned();self.stage_current_image(request,node);return;
+                request.base=self.intern_base(base);self.stage_current_image(request,node);return;
             }
             request.selection_generation = self.allocate_generation();
             request.ready_event = None;
             request.selected_source = Some(None);
             request.selected_crossorigin = Some(crossorigin);
-            request.base = base.to_owned();
+            request.base = self.intern_base(base);
             request.current = ImageRequest::default();
             request.pending = None;
             self.stage_current_image(request, node);
@@ -552,7 +563,7 @@ impl ImageLoader {
             request.selection_generation=self.allocate_generation();
             request.selected_source=Some(Some(source));request.selected_crossorigin=Some(None);
             request.input_represents_current=Some(false);
-            request.base=base.to_owned();self.stage_current_image(request,node);return;
+            request.base=self.intern_base(base);self.stage_current_image(request,node);return;
         }
 
         if input_image {
@@ -563,7 +574,7 @@ impl ImageLoader {
             request.ready_event=None;
             request.selected_source=Some(Some(source));
             request.selected_crossorigin=Some(None);
-            request.base=base.to_owned();
+            request.base=self.intern_base(base);
             request.input_represents_current=Some(request.current.state==RequestState::Available
                 && request.current.current_src==current_src);
             self.stage_current_image(request,node);
@@ -596,7 +607,7 @@ impl ImageLoader {
                 request.ready_event = None;
                 request.selected_source = Some(Some(source));
                 request.selected_crossorigin = Some(crossorigin);
-                request.base = base.to_owned();
+                request.base = self.intern_base(base);
                 return;
             }
         }
@@ -623,7 +634,7 @@ impl ImageLoader {
             request.current.density=density;
             request.selected_source = Some(Some(source));
             request.selected_crossorigin = Some(crossorigin);
-            request.base = base.to_owned();
+            request.base = self.intern_base(base);
             request.pending = None;
             self.stage_current_image(request, node);
             return;
@@ -634,14 +645,14 @@ impl ImageLoader {
         self.mark_scan_needed();
         request.selected_source = Some(Some(source.clone()));
         request.selected_crossorigin = Some(crossorigin);
-        request.base = base.to_owned();
+        request.base = self.intern_base(base);
         self.active.borrow_mut().insert(node);
         let mut next = ImageRequest::loading(current_src, self.allocate_generation(), force_error);
         next.density=density;
         next.parameters=if input_image {lumen_html::layout::ImageRequestParameters::image_button()}else{lumen_html::layout::ImageRequestParameters::html_image(crossorigin)};
         next.response_policy=self.response_policy.borrow().as_ref().map(|capture|capture());
         if request.current.state == RequestState::Available {
-            request.pending = Some(next);
+            request.pending = Some(Box::new(next));
         } else {
             request.current = next;
             request.pending = None;
@@ -878,7 +889,7 @@ impl ImageLoader {
             }
             let selected = request
                 .pending
-                .as_ref()
+                .as_deref()
                 .filter(|image| image.state == RequestState::Loading)
                 .or_else(|| {
                     (request.current.state == RequestState::Loading).then_some(&request.current)
@@ -888,7 +899,7 @@ impl ImageLoader {
                     node,
                     generation: selected.generation,
                     current_src: selected.current_src.clone(),
-                    base: request.base.clone(),
+                    base: request.base.to_string(),
                     force_error: selected.force_error,
                     response_policy:selected.response_policy.clone(),
                     parameters:selected.parameters,
@@ -931,7 +942,7 @@ impl ImageLoader {
             {
                 let mut completed = request.pending.take().expect("pending request checked");
                 complete_request(&mut completed, image, intrinsic, kind, origin_clean);
-                request.current = completed;
+                request.current = *completed;
                 true
             } else if request.current.generation == generation
                 && request.current.state == RequestState::Loading
@@ -990,7 +1001,7 @@ impl ImageLoader {
         let requests=self.requests.borrow();
         self.active.borrow_mut().retain(|node| {
             let Some(request)=requests.get(node) else {return false};
-            let loading=request.pending.iter().chain(std::iter::once(&request.current))
+            let loading=request.pending.as_deref().into_iter().chain(std::iter::once(&request.current))
                 .filter(|image|image.state==RequestState::Loading&&image.current_src.starts_with("blob:"));
             for image in loading {
                 if seen.insert(image.current_src.as_str()) {sources.push(image.current_src.clone());}
@@ -1326,5 +1337,17 @@ mod responsive_request_tests {
         assert!(loader.active.borrow().is_empty(),"settled requests leave the active set");
         assert!(loader.pending_nodes().is_empty());
     }
-
+    #[test]
+    fn per_image_request_state_stays_slim() {
+        assert!(core::mem::size_of::<Request>() <= 320, "{}", core::mem::size_of::<Request>());
+        let document=lumen_html::html::parse("<img src='a.png'><img src='b.png'>",16).unwrap();
+        let loader=ImageLoader::default();let base="https://images.test/page.html";
+        let mut nodes=Vec::new();collect_image_nodes(&document,&mut nodes);
+        for &node in &nodes {loader.snapshot(&document,node,base,lumen_html::css::UsedColorScheme::Light);}
+        let requests=loader.requests.borrow();
+        let bases:Vec<_>=requests.values().map(|request|request.base.clone()).collect();
+        assert_eq!(bases.len(),2);
+        assert!(Rc::ptr_eq(&bases[0],&bases[1]),"requests share one base allocation");
+        assert_eq!(&*bases[0],base);
+    }
 }

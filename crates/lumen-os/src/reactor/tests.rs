@@ -233,6 +233,24 @@ macro_rules! backend_tests {
             }
 
             #[test]
+            fn quiescent_until_registered_or_woken() {
+                let poller = $make();
+                assert!(poller.quiescent());
+                let (r, w) = pipe();
+                let (_count, wake) = counter();
+                let reg = poller.register(Source::Fd(r), Interest::READ, wake).unwrap();
+                assert!(!poller.quiescent());
+                drop(reg);
+                assert!(poller.quiescent());
+                poller.waker().wake();
+                assert!(!poller.quiescent());
+                poller.turn(Some(SHORT)).unwrap();
+                assert!(poller.quiescent());
+                close(r);
+                close(w);
+            }
+
+            #[test]
             fn a_turn_times_out() {
                 let poller = $make();
                 let start = Instant::now();
