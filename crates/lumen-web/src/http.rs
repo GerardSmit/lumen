@@ -676,11 +676,36 @@ fn one_request_through_cache(
         cache,
         mode: config.cache_mode,
         embedder_default: config.http_cache_default_mode,
+        revalidate_once: config.http_cache_revalidate_once,
         cancellation,
         body_limit: config.response_body_limit(),
     };
     crate::http_cache::request(&settings, method, u, headers, &mut |headers| {
         one_request(method, u, headers, body, cancellation, config, upload)
+    })
+}
+
+/// Ask the origin whether the stored response for `target` is current (see
+/// `http_cache::revalidate`); a single hop, so a redirecting URL reports `NotCacheable`.
+pub(crate) fn revalidate_with_config(
+    target: &str,
+    config: &crate::FetchConfig,
+) -> Result<crate::http_cache::CacheValidation, String> {
+    let Some(cache) = config.http_cache.as_ref() else {
+        return Ok(crate::http_cache::CacheValidation::NotCacheable);
+    };
+    let u = url::parse(target, None)?;
+    let cancellation = lumen_os::net::TcpCancellation::default();
+    let settings = crate::http_cache::Settings {
+        cache,
+        mode: crate::http_cache::CacheMode::NoCache,
+        embedder_default: config.http_cache_default_mode,
+        revalidate_once: false,
+        cancellation: &cancellation,
+        body_limit: config.response_body_limit(),
+    };
+    crate::http_cache::revalidate(&settings, &u, &[], &mut |headers| {
+        one_request("GET", &u, headers, None, &cancellation, config, None)
     })
 }
 

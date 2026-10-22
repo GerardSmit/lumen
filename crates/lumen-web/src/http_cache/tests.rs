@@ -546,3 +546,134 @@ fn metadata_round_trips_and_rejects_damage() {
     assert!(Meta::parse(&text.replace("k.n.body", "../escape")).is_none(), "path traversal in the body name");
     assert!(Meta::parse("garbage").is_none());
 }
+
+fn validating_server() -> Server {
+    Server::start(|index, request| {
+        let request = request.to_ascii_lowercase();
+        if request.contains("if-none-match: \"v1\"") {
+            response(304, &[("ETag", "\"v1\"")], b"")
+        } else if index < 2 && !request.contains("if-none-match") {
+            response(200, &[("ETag", "\"v1\""), ("Cache-Control", "max-age=3600")], b"body-one")
+        } else {
+            response(200, &[("ETag", "\"v2\""), ("Cache-Control", "max-age=3600")], b"body-two")
+        }
+    })
+}
+
+fn once_config(dir: &TempDir) -> FetchConfig {
+    let mut config = config(dir);
+    config.set_http_cache_default_mode(CacheMode::NoCache);
+    config.set_http_cache_revalidate_once(true);
+    config
+}
+
+#[test]
+fn revalidate_once_reuses_a_confirmed_entry_for_the_rest_of_the_process() {
+    let dir = TempDir::new();
+    let server = validating_server();
+    let config = once_config(&dir);
+    let url = server.url("/once");
+    assert_eq!(get(&url, &config).body, b"body-one");
+    assert_eq!(get(&url, &config).body, b"body-one");
+    assert_eq!(get(&url, &config).body, b"body-one");
+    assert_eq!(server.count(), 1);
+}
+
+#[test]
+fn a_new_process_revalidates_once_then_reuses_the_entry() {
+    let dir = TempDir::new();
+    let server = validating_server();
+    let url = server.url("/restart");
+    assert_eq!(get(&url, &once_config(&dir)).body, b"body-one");
+    let next_process = once_config(&dir);
+    assert_eq!(get(&url, &next_process).body, b"body-one");
+    assert_eq!(server.count(), 2);
+    assert!(server.request(1).contains("if-none-match"));
+    assert_eq!(get(&url, &next_process).body, b"body-one");
+    assert_eq!(server.count(), 2);
+}
+
+#[test]
+fn requests_that_ask_to_revalidate_still_do() {
+    let dir = TempDir::new();
+    let server = validating_server();
+    let config = once_config(&dir);
+    let url = server.url("/forced");
+    assert_eq!(get(&url, &config).body, b"body-one");
+    assert_eq!(get_with(&url, &[("Cache-Control", "no-cache")], &config).body, b"body-one");
+    assert_eq!(server.count(), 2);
+    assert_eq!(get(&url, &with_mode(&config, CacheMode::NoCache)).body, b"body-one");
+    assert_eq!(server.count(), 3);
+    assert_eq!(get(&url, &config).body, b"body-one");
+    assert_eq!(server.count(), 3);
+}
+
+#[test]
+fn only_confirmed_urls_skip_revalidation() {
+    let dir = TempDir::new();
+    let server = validating_server();
+    let seed = config(&dir);
+    let (first, second) = (server.url("/one"), server.url("/two"));
+    get(&first, &seed);
+    get(&second, &seed);
+    let config = once_config(&dir);
+    assert_eq!(crate::revalidate_cached_resource(&first, &config), Ok(CacheValidation::Unchanged));
+    let before = server.count();
+    get(&first, &config);
+    assert_eq!(server.count(), before);
+    get(&second, &config);
+    assert_eq!(server.count(), before + 1);
+}
+
+#[test]
+fn revalidate_confirms_a_304_without_reading_the_body() {
+    let dir = TempDir::new();
+    let server = validating_server();
+    let url = server.url("/probe");
+    assert_eq!(get(&url, &config(&dir)).body, b"body-one");
+    let config = once_config(&dir);
+    assert_eq!(crate::revalidate_cached_resource(&url, &config), Ok(CacheValidation::Unchanged));
+    assert_eq!(server.count(), 2);
+    assert!(server.request(1).contains("if-none-match: \"v1\""));
+    let body = dir.files(".body").remove(0);
+    fs::write(&body, b"damaged!").unwrap();
+    assert_eq!(
+        crate::revalidate_cached_resource(&url, &config),
+        Ok(CacheValidation::Unchanged),
+        "the body is only verified when it is served"
+    );
+}
+
+#[test]
+fn revalidate_stores_a_changed_response_and_a_missing_one() {
+    let dir = TempDir::new();
+    let server = Server::start(|index, request| {
+        let request = request.to_ascii_lowercase();
+        if index == 0 {
+            response(200, &[("ETag", "\"v1\""), ("Cache-Control", "max-age=3600")], b"first")
+        } else {
+            assert!(request.contains("if-none-match: \"v1\"") || index > 1);
+            response(200, &[("ETag", "\"v2\""), ("Cache-Control", "max-age=3600")], b"second!")
+        }
+    });
+    let config = once_config(&dir);
+    let (changed, missing) = (server.url("/changed"), server.url("/missing"));
+    assert_eq!(get(&changed, &config).body, b"first");
+    let seeded = once_config(&dir);
+    assert_eq!(crate::revalidate_cached_resource(&changed, &seeded), Ok(CacheValidation::Updated));
+    assert_eq!(crate::revalidate_cached_resource(&missing, &seeded), Ok(CacheValidation::Updated));
+    let requests = server.count();
+    assert_eq!(get(&changed, &seeded).body, b"second!");
+    assert_eq!(get(&missing, &seeded).body, b"second!");
+    assert_eq!(server.count(), requests);
+    assert_eq!(dir.files(".body").len(), 2);
+}
+
+#[test]
+fn revalidate_reports_uncacheable_responses() {
+    let dir = TempDir::new();
+    let server = Server::start(|_, _| response(200, &[("Cache-Control", "no-store")], b"x"));
+    let config = once_config(&dir);
+    assert_eq!(crate::revalidate_cached_resource(&server.url("/ns"), &config), Ok(CacheValidation::NotCacheable));
+    assert!(dir.files(".meta").is_empty());
+}

@@ -20,13 +20,34 @@ pub fn random_uuid() -> Result<String, OpError> {
     fill_random(&mut bytes)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    ))
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        text.push(DIGITS[usize::from(byte >> 4)] as char);
+        text.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_is_canonical_version_four_text() {
+        for _ in 0..64 {
+            let uuid = random_uuid().unwrap();
+            let bytes = uuid.as_bytes();
+            assert_eq!(bytes.len(), 36);
+            for index in [8, 13, 18, 23] {
+                assert_eq!(bytes[index], b'-');
+            }
+            assert_eq!(bytes[14], b'4');
+            assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'));
+            assert!(uuid.bytes().all(|b| b == b'-' || b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        }
+    }
 }

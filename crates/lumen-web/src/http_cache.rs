@@ -315,6 +315,19 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub(crate) struct HttpCache {
     dir: PathBuf,
     max_bytes: u64,
+    /// URLs whose stored response was confirmed current by the origin during this process.
+    validated: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+/// What [`revalidate`] found out about a stored response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheValidation {
+    /// The origin answered `304`: the stored response is current and its body was not read.
+    Unchanged,
+    /// The origin sent a new response (or none was stored); it is now stored.
+    Updated,
+    /// The response cannot be stored (not a `200`, `no-store`, no freshness or validator).
+    NotCacheable,
 }
 
 struct Entry {
@@ -325,7 +338,17 @@ struct Entry {
 
 impl HttpCache {
     pub(crate) fn new(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes }
+        Self { dir, max_bytes, validated: Default::default() }
+    }
+
+    fn mark_validated(&self, url: &str) {
+        if let Ok(mut set) = self.validated.lock() {
+            set.insert(url.to_owned());
+        }
+    }
+
+    fn is_validated(&self, url: &str) -> bool {
+        self.validated.lock().is_ok_and(|set| set.contains(url))
     }
 
     pub(crate) fn dir(&self) -> &Path {
@@ -454,13 +477,7 @@ impl HttpCache {
         })
     }
 
-    fn refresh(
-        &self,
-        entry: &Entry,
-        not_modified: &[(String, String)],
-        cancellation: &lumen_os::net::TcpCancellation,
-        limit: u64,
-    ) -> Option<OpenHttpResponse> {
+    fn refresh_meta(&self, entry: &Entry, not_modified: &[(String, String)]) -> Entry {
         const KEEP: &[&str] = &["content-encoding", "content-length", "content-range"];
         let mut meta = entry.meta.clone();
         for (name, value) in stored_headers(not_modified) {
@@ -472,11 +489,22 @@ impl HttpCache {
         }
         meta.stored_at = now_secs();
         let _ = write_atomic(&entry.meta_path, meta.serialize().as_bytes());
-        let refreshed = Entry {
+        self.mark_validated(&meta.url);
+        Entry {
             meta,
             meta_path: entry.meta_path.clone(),
             body_path: entry.body_path.clone(),
-        };
+        }
+    }
+
+    fn refresh(
+        &self,
+        entry: &Entry,
+        not_modified: &[(String, String)],
+        cancellation: &lumen_os::net::TcpCancellation,
+        limit: u64,
+    ) -> Option<OpenHttpResponse> {
+        let refreshed = self.refresh_meta(entry, not_modified);
         let mut headers = refreshed.meta.headers.clone();
         headers.extend(
             not_modified
@@ -632,6 +660,7 @@ impl Tee {
         if let Some(previous) = previous.filter(|old| *old != self.meta.body_file) {
             let _ = fs::remove_file(cache.dir.join(previous));
         }
+        cache.mark_validated(&self.meta.url);
         cache.evict();
     }
 }
@@ -686,6 +715,7 @@ pub(crate) struct Settings<'a> {
     pub cache: &'a HttpCache,
     pub mode: CacheMode,
     pub embedder_default: CacheMode,
+    pub revalidate_once: bool,
     pub cancellation: &'a lumen_os::net::TcpCancellation,
     pub body_limit: u64,
 }
@@ -745,6 +775,10 @@ pub(crate) fn request(
     }
     let entry = cache.lookup(&key_url, headers);
     let now = now_secs();
+    let reuse_validated = settings.revalidate_once
+        && settings.mode == CacheMode::Default
+        && effective_mode(CacheMode::Default, CacheMode::Default, headers) == CacheMode::Default
+        && cache.is_validated(&key_url);
     let serve = |entry: &Entry| {
         cache.serve(
             entry,
@@ -760,6 +794,11 @@ pub(crate) fn request(
             }
         }
         (CacheMode::Default, Some(entry)) if entry.meta.fresh(now) => {
+            if let Some(response) = serve(entry) {
+                return Ok(response);
+            }
+        }
+        (CacheMode::NoCache, Some(entry)) if reuse_validated => {
             if let Some(response) = serve(entry) {
                 return Ok(response);
             }
@@ -790,6 +829,48 @@ pub(crate) fn request(
         return Ok(store(response));
     }
     network(&plain).map(store)
+}
+
+/// Confirm with the origin that the stored response for `url` is current, without reading its
+/// body when the origin answers `304`; a changed (or missing) response is fetched and stored.
+/// Either way the entry counts as validated for [`Settings::revalidate_once`].
+pub(crate) fn revalidate(
+    settings: &Settings<'_>,
+    url: &Url,
+    headers: &[(String, String)],
+    network: &mut Network<'_>,
+) -> Result<CacheValidation, String> {
+    let cache = settings.cache;
+    let key_url = cache_url(url);
+    let entry = cache.lookup(&key_url, headers);
+    let mut plain = headers.to_vec();
+    set_missing(&mut plain, "Cache-Control", "max-age=0");
+    let mut conditional = plain.clone();
+    if let Some(entry) = entry.as_ref().filter(|entry| entry.meta.has_validator()) {
+        if let Some(etag) = header(&entry.meta.headers, "etag") {
+            set_missing(&mut conditional, "If-None-Match", etag);
+        }
+        if let Some(modified) = header(&entry.meta.headers, "last-modified") {
+            set_missing(&mut conditional, "If-Modified-Since", modified);
+        }
+    }
+    let mut response = network(&conditional)?;
+    if response.status == 304 {
+        if let Some(entry) = &entry {
+            cache.refresh_meta(entry, &response.headers);
+            return Ok(CacheValidation::Unchanged);
+        }
+        response = network(&plain)?;
+    }
+    if response.status != 200 {
+        return Ok(CacheValidation::NotCacheable);
+    }
+    let Some(tee) = cache.begin_store(&key_url, headers, &response) else {
+        return Ok(CacheValidation::NotCacheable);
+    };
+    let mut response = response.with_tee(tee);
+    while response.body.read_chunk().map_err(|error| error.to_string())?.is_some() {}
+    Ok(CacheValidation::Updated)
 }
 
 #[cfg(test)]

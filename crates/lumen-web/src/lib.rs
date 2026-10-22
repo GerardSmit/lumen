@@ -200,7 +200,7 @@ mod body_pump;
 #[cfg(not(target_arch = "wasm32"))]
 mod http_cache;
 #[cfg(not(target_arch = "wasm32"))]
-pub use http_cache::CacheMode;
+pub use http_cache::{CacheMode, CacheValidation};
 #[cfg(not(target_arch = "wasm32"))]
 mod http_body;
 #[cfg(target_arch = "wasm32")]
@@ -753,6 +753,7 @@ pub struct FetchConfig {
     cache_mode: http_cache::CacheMode,
     /// The mode applied to requests whose own mode is `default`.
     http_cache_default_mode: http_cache::CacheMode,
+    http_cache_revalidate_once: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -782,6 +783,14 @@ impl FetchConfig {
     /// response, so a set of related files never mixes versions.
     pub fn set_http_cache_default_mode(&mut self, mode: http_cache::CacheMode) {
         self.http_cache_default_mode = mode;
+    }
+
+    /// With `NoCache` as the default mode, treat a stored response as current for the rest of the
+    /// process once the origin has confirmed it (a `304`, a fresh store, or
+    /// [`revalidate_cached_resource`]). Requests that choose their own cache mode or send
+    /// `Cache-Control: no-cache` still revalidate.
+    pub fn set_http_cache_revalidate_once(&mut self, once: bool) {
+        self.http_cache_revalidate_once = once;
     }
 
     /// Attach the embedding browser's jar and trusted top-level browsing context.
@@ -968,6 +977,17 @@ pub fn load_module_resource_with_config(
 ) -> Result<ModuleResource, String> {
     let response = load_resource_with_config(url, config)?;
     module_resource_from_response(response)
+}
+
+/// Confirm with the origin that the cached response for `url` is current without reading its
+/// body (a changed or missing one is downloaded and stored). Several URLs can be validated from
+/// parallel threads so their round trips overlap.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn revalidate_cached_resource(
+    url: &str,
+    config: &FetchConfig,
+) -> Result<CacheValidation, String> {
+    http::revalidate_with_config(url, config)
 }
 
 /// Fetch a resource with a captured routing/trust configuration, retaining

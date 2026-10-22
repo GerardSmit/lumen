@@ -823,9 +823,6 @@ pub(crate) fn max_listeners_warning(
     size: usize,
     kind: &str,
 ) -> OpResult<()> {
-    let Some((process, emit)) = process_emit_warning(ctx) else {
-        return Ok(());
-    };
     let max_key = ctx.symbol_for(MAX_LISTENERS);
     let warned_key = ctx.symbol_for(MAX_LISTENERS_WARNED);
     let max = match ctx
@@ -845,6 +842,9 @@ pub(crate) fn max_listeners_warning(
     if ctx.to_boolean(&warned) {
         return Ok(());
     }
+    let Some((process, emit)) = process_emit_warning(ctx) else {
+        return Ok(());
+    };
     set_data_property(ctx, receiver, warned_key, Value::Bool(true))?;
     let global = ctx.global_object();
     let inspect_key = ctx.symbol_for("lumen.inspect");
