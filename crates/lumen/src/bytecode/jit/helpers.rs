@@ -310,12 +310,17 @@ pub(crate) enum Helper {
     /// Prepare a guarded shared Int32/Uint32 atomic access; tagged pointer, zero on miss.
     AtomicPrepare,
     AtomicRelease,
+    /// `(frame, base: u32, argc: u32, flags: u32) -> status` — `New(argc)` with the callee at
+    /// `stack[base]` and the arguments following. Consumes all of them and leaves the result at
+    /// `stack[base]` (`Undefined` there on a throw). An ordinary compiled constructor function
+    /// runs in its own native code; everything else is `Interp::construct`.
+    Construct,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 81] = [
+pub(crate) const ALL: [Helper; 82] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -397,6 +402,7 @@ pub(crate) const ALL: [Helper; 81] = [
     Helper::ByteLength,
     Helper::AtomicPrepare,
     Helper::AtomicRelease,
+    Helper::Construct,
 ];
 
 /// The IR signature of `h`.
@@ -480,6 +486,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::ByteLength => (&[P, P], &[F64]),
         Helper::AtomicPrepare => (&[P, P, P, F64, I32], &[P]),
         Helper::AtomicRelease => (&[P], &[]),
+        Helper::Construct => (&[P, I32, I32, I32], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -569,6 +576,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::ByteLength => byte_length as *const () as usize,
         Helper::AtomicPrepare => atomic_prepare as *const () as usize,
         Helper::AtomicRelease => atomic_release as *const () as usize,
+        Helper::Construct => construct as *const () as usize,
     } as u64)
 }
 
@@ -1607,9 +1615,9 @@ unsafe fn dispatch_call(
             // A sloppy callee whose `f.arguments` may be read runs as a frame, which records
             // its activation (see `bytecode::reflect`).
             Some(native) if !(c.chunk.reflect_args && crate::bytecode::reflect::enabled()) => {
-                call_native(i, callee, this, argp, argc, c, native)
+                call_native(i, callee, this, argp, argc, c, native, None)
             }
-            _ => call_frame(i, callee, this, argp, argc, c),
+            _ => call_frame(i, callee, this, argp, argc, c, None),
         },
         None => {
             // The arguments stay owned by the frame's stack for the call (they root their
@@ -1643,6 +1651,87 @@ unsafe fn dispatch_call(
             STATUS_OK
         }
         Err(e) => fail(f, e),
+    }
+}
+
+/// [`Helper::Construct`]: `New(argc)` over `[callee, args...]` at `stack[base..]`. The
+/// interpreter's order — a constructor template, then an ordinary compiled constructor function
+/// as a frame (its body in native code once it has any), else `Interp::construct`.
+pub(crate) unsafe extern "C" fn construct(
+    f: *mut JitFrame,
+    base: u32,
+    argc: u32,
+    _flags: u32,
+) -> u32 {
+    let s = (*f).stack;
+    let (base, argc) = (base as usize, argc as usize);
+    let callee = std::ptr::replace(s.add(base), Value::Undefined);
+    let args = s.add(base + 1);
+    let i = &mut *(*f).interp;
+    let clear = |from: usize| {
+        for k in from..argc {
+            *args.add(k) = Value::Undefined;
+        }
+    };
+    let window = std::slice::from_raw_parts(args, argc);
+    let r = if let Some(r) =
+        crate::bytecode::ctor_plan::construct_with_plan(i, &callee, &callee, window)
+    {
+        clear(0);
+        r
+    } else if let Some(c) = crate::bytecode::inline_ctor(i, &callee) {
+        match new_instance(i, &callee) {
+            Ok(inst) => match super::native_code(&c.chunk) {
+                Some(native) if !(c.chunk.reflect_args && crate::bytecode::reflect::enabled()) => {
+                    call_native(i, callee, Value::Undefined, args, argc, c, native, Some(inst))
+                }
+                _ => call_frame(i, callee, Value::Undefined, args, argc, c, Some(inst)),
+            },
+            Err(e) => {
+                clear(0);
+                Err(e)
+            }
+        }
+    } else {
+        let r = i.construct(callee, window);
+        clear(0);
+        r
+    };
+    match r {
+        Ok(v) => {
+            std::ptr::write(s.add(base), v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+/// OrdinaryCreateFromConstructor for `callee`, an ordinary function constructor
+/// ([`crate::bytecode::inline_ctor`]): its `prototype` (an own data property; the realm
+/// fallback is the single realm's `%Object.prototype%`) and the learned instance capacity.
+fn new_instance(i: &mut Interp, callee: &Value) -> Result<crate::value::Gc, Abrupt> {
+    let Value::Obj(ctor) = callee else {
+        unreachable!("inline constructor is a function object")
+    };
+    i.materialize_fn(ctor);
+    let own = crate::bytecode::class_fields::own_prototype(ctor);
+    let proto = match own.map_or_else(|| i.get_member(callee, "prototype"), Ok)? {
+        Value::Obj(p) => p,
+        _ => i.object_proto.clone(),
+    };
+    let capacity = i.learned_construct_capacity(ctor);
+    Ok(crate::value::Object::new_with_capacity(Some(proto), capacity))
+}
+
+/// The result of a constructor call whose body completed with `v`: `v` if it is an object, else
+/// the instance (after recording the instance's size hint, as `construct_dispatch` does).
+fn construct_value(i: &mut Interp, ctor: &Value, inst: crate::value::Gc, v: Value) -> Value {
+    if let Value::Obj(c) = ctor {
+        i.observe_construct_capacity(c, &inst);
+    }
+    match v {
+        Value::Obj(_) => v,
+        _ => Value::Obj(inst),
     }
 }
 
@@ -1764,6 +1853,7 @@ unsafe fn call_frame(
     args: *mut Value,
     argc: usize,
     c: crate::bytecode::InlineCallee,
+    instance: Option<crate::value::Gc>,
 ) -> Result<Value, Abrupt> {
     use crate::bytecode::{drive_vm, enter_frame, leave_frame, VmStep};
     let clear = |from: usize| {
@@ -1779,7 +1869,7 @@ unsafe fn call_frame(
         return Err(e);
     }
     let mut rec = i.vm_frame_one.pop().unwrap_or_default();
-    let seed = enter_frame(i, &mut rec, callee, this, None, c, args, argc, true);
+    let seed = enter_frame(i, &mut rec, callee, this, instance.clone(), c, args, argc, true);
     clear(seed);
     let r = {
         let crate::bytecode::InlineFrame {
@@ -1801,6 +1891,10 @@ unsafe fn call_frame(
             Some(r) => r,
             None => drive_vm(i, chunk, env, slots, stack, pc, this_val, handlers, None),
         }
+    };
+    let r = match (r, instance) {
+        (Ok(VmStep::Done(v)), Some(inst)) => Ok(VmStep::Done(construct_value(i, &rec.callee, inst, v))),
+        (r, _) => r,
     };
     leave_frame(i, &mut rec);
     if i.vm_frame_one.len() < 64 {
@@ -1849,6 +1943,7 @@ unsafe fn call_native(
     argc: usize,
     c: crate::bytecode::InlineCallee,
     native: std::rc::Rc<super::Native>,
+    instance: Option<crate::value::Gc>,
 ) -> Result<Value, Abrupt> {
     use crate::bytecode::{drive_vm, drop_value_fast, VmStep};
     let clear = |from: usize| {
@@ -1865,11 +1960,25 @@ unsafe fn call_native(
     }
     let chunk: &Chunk = &c.chunk;
     // --- enter_frame (an ordinary call) ---
-    let saved_ctor = std::mem::replace(&mut i.constructing, false);
-    let saved_nt = if !c.arrow && !matches!(i.new_target, Value::Undefined) {
-        Some(std::mem::replace(&mut i.new_target, Value::Undefined))
-    } else {
-        None
+    let construct = instance.is_some();
+    let (saved_ctor, saved_nt, this) = match &instance {
+        // A construct leaves `constructing` alone and installs new.target = the callee (see
+        // `enter_frame`).
+        Some(inst) => {
+            let nt = std::mem::replace(&mut i.new_target, callee.clone());
+            drop_value_fast(std::mem::take(&mut i.pending_new_target));
+            drop_value_fast(this);
+            (i.constructing, Some(nt), Value::Obj(inst.clone()))
+        }
+        None => (
+            std::mem::replace(&mut i.constructing, false),
+            if !c.arrow && !matches!(i.new_target, Value::Undefined) {
+                Some(std::mem::replace(&mut i.new_target, Value::Undefined))
+            } else {
+                None
+            },
+            this,
+        ),
     };
     let fn_ptr = match &callee {
         Value::Obj(o) => crate::value::Gc::as_ptr(o) as usize,
@@ -1881,17 +1990,17 @@ unsafe fn call_native(
         coro: i.cur_coro,
         caller_site: std::mem::replace(&mut i.cur_site, crate::interpreter::frames::NO_SITE),
         strict: c.strict,
-        construct: false,
+        construct,
         extra: None,
     });
     let this_val = if chunk.uses_this() {
-        i.bind_compiled_this_flags(c.strict, chunk, this, false)
+        i.bind_compiled_this_flags(c.strict, chunk, this, construct)
     } else {
         drop_value_fast(this);
         Value::Undefined
     };
     let saved_strict = std::mem::replace(&mut i.strict, c.strict);
-    let saved_tco = std::mem::replace(&mut i.tco_ok, c.strict);
+    let saved_tco = std::mem::replace(&mut i.tco_ok, c.strict && !construct);
     let saved_field_init = i.in_field_init_code;
     let saved_agb = i.in_async_gen_body;
     if !c.arrow {
@@ -1974,12 +2083,15 @@ unsafe fn call_native(
     if let Some(nt) = saved_nt {
         drop_value_fast(std::mem::replace(&mut i.new_target, nt));
     }
-    drop_value_fast(callee);
     let mut r = match r {
-        Ok(VmStep::Done(v)) => Ok(v),
+        Ok(VmStep::Done(v)) => Ok(match instance {
+            Some(inst) => construct_value(i, &callee, inst, v),
+            None => v,
+        }),
         Ok(VmStep::Await(_)) => Err(i.throw("TypeError", "compiled code awaited in a call")),
         Err(e) => Err(e),
     };
+    drop_value_fast(callee);
     // A proper tail call unwound out of the callee (`Interp::call`'s trampoline).
     while r.is_ok() {
         match i.pending_tail.take() {

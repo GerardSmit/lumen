@@ -4348,6 +4348,17 @@ impl<'a, 'f> Tr<'a, 'f> {
             {
                 self.direct_call(pc, argc as usize, matches!(op, Op::CallWithThis(_)));
             }
+            Op::New(argc) => {
+                let base = d - argc as usize - 1;
+                self.box_from(base);
+                let (bv, av, fv) = (self.i32c(base as i64), self.i32c(argc as i64), self.i32c(0));
+                self.set_call_site(pc);
+                let st = self.call_js(Helper::Construct, &[self.frame, bv, av, fv]);
+                let below = self.stack[..base].to_vec();
+                self.throw_if(st, pc, &below, base);
+                self.stack.truncate(base);
+                self.stack.push(Entry::Boxed);
+            }
             // A proper tail call: directly within `TAIL_NEST` frames, a self tail call as a loop
             // where it can be. (Only a `this` method body that can neither call nor throw is
             // inlined, see `inline_this`: no frame to release, nothing observable.)

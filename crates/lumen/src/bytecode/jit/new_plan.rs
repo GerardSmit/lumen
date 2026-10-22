@@ -268,12 +268,13 @@ impl Tr<'_, '_> {
         self.fb.jump(join, &[st]);
         self.fb.seal_block(go);
         self.fb.switch_to_block(go);
-        let (r, bv, dv) = (
-            self.i32c(pc as i64),
+        let (bv, av, fv) = (
             self.i32c(base as i64),
-            self.i32c(d as i64),
+            self.i32c(argc as i64),
+            self.i32c(0),
         );
-        let st = self.call_status(Helper::Generic, &[self.frame, r, bv, dv]);
+        self.set_call_site(pc);
+        let st = self.call_status(Helper::Construct, &[self.frame, bv, av, fv]);
         self.fb.jump(join, &[st]);
 
         self.fb.seal_block(join);

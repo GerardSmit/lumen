@@ -751,6 +751,8 @@ mod int32_tests;
 #[cfg(test)]
 mod leak_tests;
 #[cfg(test)]
+mod new_tests;
+#[cfg(test)]
 mod shadow_tests;
 #[cfg(test)]
 mod switch_tests;

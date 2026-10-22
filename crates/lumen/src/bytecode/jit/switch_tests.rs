@@ -1,6 +1,6 @@
 use crate::{bytecode::Tier, Completion, Engine, JitMode};
 
-fn evaluate(src: &str, tier: Tier, mode: JitMode) -> (String, crate::JitStats) {
+pub(super) fn evaluate(src: &str, tier: Tier, mode: JitMode) -> (String, crate::JitStats) {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
@@ -11,7 +11,7 @@ fn evaluate(src: &str, tier: Tier, mode: JitMode) -> (String, crate::JitStats) {
     }
 }
 
-fn agree_on_every_tier(src: &str, expected: &str, all_compile: bool) {
+pub(super) fn agree_on_every_tier(src: &str, expected: &str, all_compile: bool) {
     for (tier, mode) in [
         (Tier::Interp, JitMode::Disabled),
         (Tier::Bytecode, JitMode::Disabled),
