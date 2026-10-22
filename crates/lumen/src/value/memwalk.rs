@@ -27,6 +27,8 @@ pub(crate) struct HeapWalk {
     /// Of those: nodes whose body is currently materialised, and their top-level statements.
     pub bodies: usize,
     pub body_stmts: usize,
+    /// `(top-level statements, name)` of every materialised body; the report prints the largest.
+    pub largest_bodies: Vec<(usize, String)>,
     /// Nodes with a compiled chunk, and the chunks' estimated bytes by part.
     pub chunks: usize,
     pub chunk: crate::bytecode::ChunkBytes,
@@ -110,6 +112,16 @@ pub(crate) fn walk() -> HeapWalk {
         if let Some(body) = f.parsed_body() {
             w.bodies += 1;
             w.body_stmts += body.len();
+            let tag = format!(
+                "{} lazy={} used={} rc={} code={} src={}",
+                f.name.clone().unwrap_or_default(),
+                f.lazy.borrow().is_some(),
+                f.body_used.get(),
+                Rc::strong_count(&body),
+                f.code.get().is_some(),
+                f.source.as_str().map_or(0, |t| t.len())
+            );
+            w.largest_bodies.push((body.len(), tag));
         }
         if let Some(Some(chunk)) = f.code.get() {
             w.chunks += 1;

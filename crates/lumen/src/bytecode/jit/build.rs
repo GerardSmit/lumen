@@ -3690,7 +3690,11 @@ impl<'a, 'f> Tr<'a, 'f> {
             Slow::Prop { n, c, obj } => {
                 // The result is the op's last push (`GetMethod` keeps its receiver below it).
                 let at = d - pops + pushes - 1;
-                self.box_from(at);
+                // A borrowed receiver at `at` is overwritten by the result, not cloned first:
+                // the helper stores into `at` without dropping what is there.
+                if matches!(obj, PropObj::Stack(_)) {
+                    self.box_from(at);
+                }
                 let (objp, consume) = match obj {
                     PropObj::Stack(i) => {
                         self.force(i);

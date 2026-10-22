@@ -3886,6 +3886,10 @@ fn sweep(i: &mut Interp) -> usize {
         drop_later.extend(t.map.remove(k));
     }
     t.sweep_at = t.map.len() * 2;
+    let capacity = t.map.capacity();
+    if capacity > 1024 && t.map.len() < capacity / 4 {
+        t.map.shrink_to(t.map.len() * 2);
+    }
     // Rust destructors run outside the table borrow.
     drop(drop_later);
     dead.len()

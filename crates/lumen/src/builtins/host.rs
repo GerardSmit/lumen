@@ -23,6 +23,9 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         i.gc_collect();
         Ok(Value::Undefined)
     });
+    it.def_method(&host, "liveObjects", 0, |_i, _t, _a| {
+        Ok(Value::Num(crate::value::live_objects() as f64))
+    });
     // $262.IsHTMLDDA: callable, returns null with no (or one string "") argument.
     {
         let ddda = it.make_native("IsHTMLDDA", 0, |_i, _t, a| match a.first() {

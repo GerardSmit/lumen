@@ -1772,6 +1772,8 @@ pub(crate) struct GcState {
     lazy_fns: RefCell<Vec<std::rc::Weak<crate::ast::Function>>>,
     /// `lazy_fns` length past which a registration prunes dead entries first.
     lazy_fns_next: Cell<usize>,
+    /// Source bytes of the lazy bodies materialised since the last flush pass.
+    body_bytes_since_flush: Cell<usize>,
     /// The object-shape transition tree for this heap (see [`props::ShapeTable`]): objects flow
     /// between the driver and its coroutine workers, so their shapes must resolve on either.
     pub(in crate::value) shapes: RefCell<props::ShapeTable>,
@@ -1798,6 +1800,7 @@ impl GcState {
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
             lazy_fns_next: Cell::new(LAZY_FNS_PRUNE_MIN),
+            body_bytes_since_flush: Cell::new(0),
             shapes: RefCell::new(props::ShapeTable::new()),
             scope_epoch: Cell::new(0),
             scope_serial: Cell::new(0),
@@ -2181,6 +2184,22 @@ pub(crate) fn register_lazy_function(f: &Rc<crate::ast::Function>) {
     });
 }
 
+/// Source bytes of materialised lazy bodies that make the next safe point flush cold bodies
+/// without waiting for a collection: a startup burst of first calls (each module initialiser
+/// parses its body) otherwise holds tens of megabytes of AST until the object count triggers one.
+const BODY_FLUSH_BYTES: usize = 2 << 20;
+
+pub(crate) fn note_body_materialised(source_bytes: usize) {
+    with_gc_state(|state| {
+        let n = state.body_bytes_since_flush.get().saturating_add(source_bytes);
+        state.body_bytes_since_flush.set(n);
+    });
+}
+
+pub(crate) fn cold_body_flush_due() -> bool {
+    with_gc_state(|state| state.body_bytes_since_flush.get() >= BODY_FLUSH_BYTES)
+}
+
 /// Release every registered function's body that no read touched since the previous pass, and
 /// drop the entries of functions that died. A flat pass over the registry with no allocation:
 /// the registry is one `Weak` per lazily-parsed function in the program (~100k for a large
@@ -2188,6 +2207,7 @@ pub(crate) fn register_lazy_function(f: &Rc<crate::ast::Function>) {
 /// bodies released.
 pub(crate) fn flush_cold_lazy_bodies() -> usize {
     with_gc_state(|state| {
+        state.body_bytes_since_flush.set(0);
         let mut reg = state.lazy_fns.borrow_mut();
         let mut released = 0;
         reg.retain(|w| match w.upgrade() {

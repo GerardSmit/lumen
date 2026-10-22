@@ -120,6 +120,17 @@ impl ScopeCounts {
     }
 }
 
+/// Record `parent` (an object address, or a scope address with the low bit set) as the first
+/// holder of the nodes the last trace step pushed.
+fn note_parents(parents: &mut FastMap<usize, usize>, parent: usize, tr: &Tracer, objects_from: usize, scopes_from: usize) {
+    for c in &tr.objects[objects_from.min(tr.objects.len())..] {
+        parents.entry(*c as usize).or_insert(parent);
+    }
+    for c in &tr.scopes[scopes_from.min(tr.scopes.len())..] {
+        parents.entry(*c as usize | 1).or_insert(parent);
+    }
+}
+
 #[derive(Default)]
 struct Tracer {
     // Native callable dispatch identifies its realm through Function.prototype.
@@ -357,6 +368,12 @@ impl Interp {
                 });
             }
         });
+        // A typed array's buffer object is one of its edges (traced when the view is marked).
+        for buffer in self.ta_buffer.values() {
+            if let Value::Obj(o) = buffer {
+                o.gc_add_ref();
+            }
+        }
         // A pin is bookkeeping, not a real holder: count it like an internal reference so a
         // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
         for o in self.gc_pins.values() {
@@ -493,14 +510,21 @@ impl Interp {
         // collections are gathered for the ephemeron pass: a WeakMap value (a WeakSet member)
         // is reachable only while its key is, however the value refers back to the key.
         let mut weak_live: Vec<usize> = Vec::new();
+        let retain_min = std::env::var("LUMEN_GC_RETAIN").ok().and_then(|v| v.parse::<usize>().ok());
+        let mut parents: Option<FastMap<usize, usize>> = retain_min.map(|_| FastMap::default());
         loop {
             if let Some(p) = tr.objects.pop() {
+                let (no, ns) = (tr.objects.len(), tr.scopes.len());
                 self.trace_object(p, &mut tr, &mut weak_live);
+                if let Some(par) = &mut parents {
+                    note_parents(par, p as usize, &tr, no, ns);
+                }
                 continue;
             }
             if let Some((p, from)) = tr.wide.pop() {
                 // SAFETY: as in `trace_object`.
                 let o = ManuallyDrop::new(unsafe { Gc::from_raw(p) });
+                let (no, ns) = (tr.objects.len(), tr.scopes.len());
                 let next = o
                     .borrow()
                     .props
@@ -508,15 +532,23 @@ impl Interp {
                 if let Some(next) = next {
                     tr.wide.push((p, next));
                 }
+                if let Some(par) = &mut parents {
+                    note_parents(par, p as usize, &tr, no, ns);
+                }
                 continue;
             }
             if let Some(p) = tr.scopes.pop() {
+                let (no, ns) = (tr.objects.len(), tr.scopes.len());
                 // SAFETY: a marked scope is alive and nothing is released during marking.
                 let b = unsafe { &*p }.borrow();
                 visit_scope_edges(&b, &mut |edge| match edge {
                     Edge::Obj(o) => tr.mark_obj(o),
                     Edge::Scope(e) => tr.mark_scope(Rc::as_ptr(e)),
                 });
+                drop(b);
+                if let Some(par) = &mut parents {
+                    note_parents(par, p as usize | 1, &tr, no, ns);
+                }
                 continue;
             }
             // A retained closure may keep a retired realm's global environment alive after its
@@ -554,9 +586,25 @@ impl Interp {
                     }
                 }
             }
+            for (view, buffer) in self.ta_buffer.iter() {
+                if let Value::Obj(b) = buffer {
+                    // SAFETY: a view with a side-table entry is pinned, so it is alive.
+                    let view = ManuallyDrop::new(unsafe { Gc::from_raw(*view as *const ObjCell) });
+                    if view.gc_marked() {
+                        let (no, ns) = (tr.objects.len(), tr.scopes.len());
+                        tr.mark_obj(b);
+                        if let Some(par) = &mut parents {
+                            note_parents(par, Gc::as_ptr(&view) as usize, &tr, no, ns);
+                        }
+                    }
+                }
+            }
             if tr.objects.is_empty() {
                 break;
             }
+        }
+        if let (Some(min), Some(parents)) = (retain_min, &parents) {
+            self.gc_dump_retainers(min, parents);
         }
         drop(tr.objects);
         drop(tr.wide);
@@ -687,6 +735,7 @@ impl Interp {
             b.call = Callable::None;
             b.exotic = Exotic::None;
         }
+        self.shrink_side_tables();
         // Sweep garbage scopes the same way: emptying them breaks env-involving cycles.
         for e in &dead_scopes {
             let imports = {
@@ -732,6 +781,78 @@ impl Interp {
         // checkpoints expose retained structures while the process is still alive.
         if crate::memstats::enabled() && std::env::var_os("LUMEN_MEM_GC").is_some() {
             self.mem_report();
+        }
+    }
+
+    /// Pointer-keyed side tables keep their peak capacity after a burst of short-lived buffers
+    /// or views; give the space back once they are mostly empty.
+    fn shrink_side_tables(&mut self) {
+        fn shrink<K: Eq + std::hash::Hash, V>(table: &mut FastMap<K, V>) {
+            let cap = table.capacity();
+            if cap > 1024 && table.len() < cap / 4 {
+                table.shrink_to(table.len() * 2);
+            }
+        }
+        shrink(&mut self.array_buffers);
+        shrink(&mut self.typed_arrays);
+        shrink(&mut self.ta_buffer);
+        shrink(&mut self.data_views);
+        shrink(&mut self.gc_pins);
+        shrink(&mut self.class_info);
+        shrink(&mut self.map_data);
+        shrink(&mut self.proxies);
+    }
+
+    /// Debug: `LUMEN_GC_RETAIN=<bytes>` prints, for every live ArrayBuffer of at least that many
+    /// bytes, the chain of holders that kept it reachable in the last mark (first-found path).
+    fn gc_dump_retainers(&self, min: usize, parents: &FastMap<usize, usize>) {
+        fn describe_obj(p: usize) -> String {
+            // SAFETY: a marked object is alive and nothing is released during marking.
+            let o = ManuallyDrop::new(unsafe { Gc::from_raw(p as *const ObjCell) });
+            let b = o.borrow();
+            let keys: Vec<Rc<str>> = b.props.iter().take(5).map(|(k, _)| k).collect();
+            let name = b.props.get("name").map(|pr| pr.value());
+            let kind = match &b.call {
+                Callable::None => "object",
+                Callable::User(_) => "function",
+                _ => "native",
+            };
+            match name {
+                Some(Value::Str(n)) if kind != "object" => format!("{kind} {n} {p:#x}"),
+                _ => format!("{kind} {p:#x} keys={keys:?}"),
+            }
+        }
+        for (ptr, store) in self.array_buffers.iter() {
+            if store.len() < min {
+                continue;
+            }
+            eprintln!("[gc-retain] ArrayBuffer {ptr:#x} {} bytes", store.len());
+            let mut cur = *ptr;
+            for _ in 0..80 {
+                let Some(&parent) = parents.get(&cur) else {
+                    eprintln!("[gc-retain]   <- root (external strong reference)");
+                    break;
+                };
+                if parent & 1 == 1 {
+                    // SAFETY: a marked scope is alive.
+                    let b = unsafe { &*((parent & !1) as ScopePtr) }.borrow();
+                    let via = b.vars.iter().find_map(|(k, bind)| match &bind.value {
+                        Value::Obj(o) if Gc::as_ptr(o) as usize == cur => Some(k.to_string()),
+                        _ => None,
+                    });
+                    let vars: Vec<&str> = b.vars.keys().take(8).map(|k| &**k).collect();
+                    eprintln!("[gc-retain]   <- scope {:#x} var {via:?} (vars {vars:?})", parent & !1);
+                } else {
+                    // SAFETY: as above.
+                    let o = ManuallyDrop::new(unsafe { Gc::from_raw(parent as *const ObjCell) });
+                    let via = o.borrow().props.iter().find_map(|(k, pr)| match pr.value() {
+                        Value::Obj(c) if Gc::as_ptr(&c) as usize == cur => Some(k.to_string()),
+                        _ => None,
+                    });
+                    eprintln!("[gc-retain]   <- {} prop {via:?}", describe_obj(parent));
+                }
+                cur = parent;
+            }
         }
     }
 

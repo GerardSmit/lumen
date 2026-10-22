@@ -663,7 +663,7 @@ impl crate::interpreter::Interp {
                 }
             }
         }
-        let w = crate::value::memwalk::walk();
+        let mut w = crate::value::memwalk::walk();
         eprintln!("[mem] ---- engine structures (estimated) ----");
         let names = crate::value::SLOT_CLASS_NAMES;
         let mut slab_total = 0;
@@ -717,6 +717,10 @@ impl crate::interpreter::Interp {
             w.body_stmts,
             w.lazy_registry
         );
+        w.largest_bodies.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (stmts, name) in w.largest_bodies.iter().take(8) {
+            eprintln!("[mem]     materialised body {name:?}: {stmts} top-level stmts");
+        }
         eprintln!(
             "[mem]     node sizes: Function {} B, Param {} B, Expr {} B, Stmt {} B, Pattern {} B, LazyBody {} B; params {} ({} in vec capacity)",
             std::mem::size_of::<crate::ast::Function>(),

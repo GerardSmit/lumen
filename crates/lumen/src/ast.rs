@@ -684,6 +684,7 @@ impl Function {
             *self.body.borrow_mut() = Some(Rc::new(Vec::new()));
             return Ok(());
         };
+        crate::value::note_body_materialised((lazy.end - lazy.start) as usize);
         let parsed = match &lazy.aot {
             Some(aot) => {
                 crate::precompiled::decode_body(aot).map_err(|message| crate::parser::ParseError {

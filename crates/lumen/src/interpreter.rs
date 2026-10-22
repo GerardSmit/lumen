@@ -6287,6 +6287,9 @@ impl Interp {
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
         }
         crate::value::gc_trim_emptied();
+        if crate::value::cold_body_flush_due() {
+            crate::value::flush_cold_lazy_bodies();
+        }
         let before = crate::value::live_objects();
         if before <= self.gc_next && !lumen_common::buffer::gc_pressure() {
             return Ok(());
