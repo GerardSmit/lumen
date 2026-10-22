@@ -497,3 +497,88 @@ fn small_constant_loops_unroll() {
         }
     }
 }
+
+#[test]
+fn values_only_exits_read_are_computed_in_the_exits() {
+    let mut f = Function::new("sink", Signature::new(vec![Type::I32], vec![Type::I32]));
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let n = b.block_params(entry)[0];
+    let i = b.declare_var(Type::I32);
+    let zero = b.iconst(Type::I32, 0);
+    b.def_var(i, zero);
+    let header = b.create_block();
+    let body = b.create_block();
+    let cont = b.create_block();
+    let found = b.create_block();
+    let done = b.create_block();
+    b.jump(header, &[]);
+
+    b.switch_to_block(header);
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, body, &[], done, &[]);
+    b.seal_block(body);
+    b.seal_block(done);
+
+    b.switch_to_block(body);
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::FromSint, Type::F64, iv);
+    let seven = b.iconst(Type::I32, 7);
+    let hit = b.icmp(IntCC::Eq, iv, seven);
+    b.brif(hit, found, &[], cont, &[]);
+    b.seal_block(found);
+    b.seal_block(cont);
+
+    b.switch_to_block(found);
+    let two = b.f64const(2.0);
+    let twice = b.binary(BinaryOp::Fmul, wide, two);
+    let back = b.convert(ConvOp::ToSintSat, Type::I32, twice);
+    b.ret(&[back]);
+
+    b.switch_to_block(cont);
+    let iv = b.use_var(i);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(header, &[]);
+    b.seal_block(header);
+
+    b.switch_to_block(done);
+    let minus = b.iconst(Type::I32, -1);
+    b.ret(&[minus]);
+    b.finish();
+
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    let converts: Vec<bool> = f
+        .layout
+        .iter()
+        .flat_map(|blk| {
+            let returns = f
+                .terminator(*blk)
+                .is_some_and(|t| matches!(f.inst(t), InstData::Return { .. }));
+            f.blocks[blk.index()]
+                .insts
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        f.inst(**i),
+                        InstData::Convert {
+                            op: ConvOp::FromSint,
+                            ..
+                        }
+                    )
+                })
+                .map(move |_| returns)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(converts, vec![true], "{f}");
+    let mut e = env();
+    for n in [0u64, 5, 7, 8, 100] {
+        let want = run(&original, &mut e, &[n]).unwrap();
+        assert_eq!(run(&f, &mut e, &[n]).unwrap(), want, "n={n}");
+    }
+}

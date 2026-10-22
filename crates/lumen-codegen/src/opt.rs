@@ -35,6 +35,7 @@ fn optimize_impl(func: &mut Function, unroll: bool) {
     gvn(func);
     remove_unreachable(func);
     simplify_params(func);
+    sink_into_exits(func);
     dce(func);
     debug_assert!(
         crate::verify::verify(func).is_ok(),
@@ -63,17 +64,24 @@ fn incoming_all(func: &Function) -> Vec<Vec<(Inst, usize)>> {
     out
 }
 
-/// Remove parameter `idx` of `block` and the matching argument on each of its incoming
-/// `edges`.
-fn remove_param(func: &mut Function, block: Block, idx: usize, edges: &[(Inst, usize)]) {
+/// Remove the parameters of `block` flagged in `drop` and the matching argument on each of its
+/// incoming `edges`.
+fn remove_params(func: &mut Function, block: Block, drop: &[bool], edges: &[(Inst, usize)]) {
+    let keep = |i: usize| !drop[i];
     for &(t, slot) in edges {
-        func.insts[t.index()].successors_mut()[slot]
-            .args
-            .remove(idx);
+        let args = &mut func.insts[t.index()].successors_mut()[slot].args;
+        let mut i = 0;
+        args.retain(|_| {
+            i += 1;
+            keep(i - 1)
+        });
     }
-    func.blocks[block.index()].params.remove(idx);
-    let params = func.blocks[block.index()].params.clone();
-    for (i, p) in params.into_iter().enumerate().skip(idx) {
+    let mut i = 0;
+    func.blocks[block.index()].params.retain(|_| {
+        i += 1;
+        keep(i - 1)
+    });
+    for (i, &p) in func.blocks[block.index()].params.iter().enumerate() {
         if let ValueDef::Param(_, n) = &mut func.values[p.index()].def {
             *n = i as u32;
         }
@@ -85,6 +93,7 @@ fn remove_param(func: &mut Function, block: Block, idx: usize, edges: &[(Inst, u
 pub fn simplify_params(func: &mut Function) {
     let entry = func.entry();
     let mut changed = true;
+    let mut drop: Vec<bool> = Vec::new();
     while changed {
         changed = false;
         // (Removing parameters leaves the edges themselves unchanged.)
@@ -95,8 +104,11 @@ pub fn simplify_params(func: &mut Function) {
                 continue;
             }
             let edges = &all[b.index()];
-            let mut i = 0;
-            while i < func.blocks[b.index()].params.len() {
+            let n = func.blocks[b.index()].params.len();
+            drop.clear();
+            drop.resize(n, false);
+            let mut any = false;
+            for i in 0..n {
                 let p = func.blocks[b.index()].params[i];
                 let mut same: Option<Value> = None;
                 let mut trivial = true;
@@ -111,14 +123,15 @@ pub fn simplify_params(func: &mut Function) {
                     }
                     same = Some(a);
                 }
-                match (trivial, same) {
-                    (true, Some(v)) => {
-                        func.replace_uses(p, v);
-                        remove_param(func, b, i, edges);
-                        changed = true;
-                    }
-                    _ => i += 1,
+                if let (true, Some(v)) = (trivial, same) {
+                    func.replace_uses(p, v);
+                    drop[i] = true;
+                    any = true;
                 }
+            }
+            if any {
+                remove_params(func, b, &drop, edges);
+                changed = true;
             }
         }
         func.resolve_aliases();
@@ -454,12 +467,83 @@ pub fn dce(func: &mut Function) {
         if b == entry {
             continue;
         }
-        let mut i = func.blocks[b.index()].params.len();
-        while i > 0 {
-            i -= 1;
-            if !live[func.blocks[b.index()].params[i].index()] {
-                remove_param(func, b, i, &edges[b.index()]);
+        let dead: Vec<bool> = func.blocks[b.index()]
+            .params
+            .iter()
+            .map(|p| !live[p.index()])
+            .collect();
+        if dead.iter().any(|&d| d) {
+            remove_params(func, b, &dead, &edges[b.index()]);
+        }
+    }
+}
+
+/// Move pure instructions whose results only exits (blocks from which every path ends the
+/// function, or marked cold) read into those exits, one copy per exit block that uses them:
+/// the hot path stops computing values (a Number materialized for a deoptimization snapshot) it never reads, and
+/// they stop occupying registers there.
+pub fn sink_into_exits(func: &mut Function) {
+    let cfg = Cfg::new(func);
+    let mut cold = crate::cfg::cold_blocks(func, &cfg, &cfg.rpo);
+    for &b in &cfg.rpo {
+        cold[b.index()] |= func.blocks[b.index()].cold;
+    }
+    if !cold.iter().any(|&c| c) {
+        return;
+    }
+    let mut uses: Vec<Vec<Block>> = vec![Vec::new(); func.values.len()];
+    for &b in &cfg.rpo {
+        for &i in &func.blocks[b.index()].insts {
+            func.inst(i).for_each_arg(|a| uses[a.index()].push(b));
+        }
+    }
+    for &b in cfg.rpo.iter().rev() {
+        if cold[b.index()] {
+            continue;
+        }
+        let insts = func.blocks[b.index()].insts.clone();
+        let mut removed = std::collections::HashSet::new();
+        for &i in insts.iter().rev() {
+            let data = func.inst(i).clone();
+            if !data.is_pure() || data.is_terminator() || func.results(i).len() != 1 {
+                continue;
             }
+            let r = func.results(i)[0];
+            let at = &uses[r.index()];
+            if at.is_empty() || at.iter().any(|&u| u == b || !cold[u.index()]) {
+                continue;
+            }
+            let mut targets: Vec<Block> = Vec::new();
+            for &u in at {
+                if !targets.contains(&u) {
+                    targets.push(u);
+                }
+            }
+            data.for_each_arg(|a| {
+                if let Some(p) = uses[a.index()].iter().position(|&x| x == b) {
+                    uses[a.index()].swap_remove(p);
+                }
+            });
+            for u in targets {
+                let copy = func.make_inst(data.clone());
+                let nv = func.results(copy)[0];
+                if uses.len() <= nv.index() {
+                    uses.resize(func.values.len(), Vec::new());
+                }
+                let block_insts = func.blocks[u.index()].insts.clone();
+                for j in block_insts {
+                    func.insts[j.index()].map_args(|v| if v == r { nv } else { v });
+                }
+                let moved = uses[r.index()].iter().filter(|&&x| x == u).count();
+                uses[nv.index()] = vec![u; moved];
+                uses[r.index()].retain(|&x| x != u);
+                data.for_each_arg(|a| uses[a.index()].push(u));
+                func.blocks[u.index()].insts.insert(0, copy);
+            }
+            removed.insert(i);
+        }
+        if !removed.is_empty() {
+            func.blocks[b.index()].insts.retain(|i| !removed.contains(i));
         }
     }
 }

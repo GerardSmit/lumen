@@ -1763,15 +1763,30 @@ fn enter(
                                 l.widen.resize(n, Widen::None);
                                 l.undef_ok.resize(n, false);
                             }
+                            // A new call enters the loop with its locals unset: the first failure
+                            // of any slot makes every Number local tolerate that, instead of
+                            // each further recompile (of a possibly huge loop) learning a few more.
+                            let first = !l.undef_ok.iter().any(|&u| u);
                             for (s, &k) in native.kinds.iter().enumerate() {
                                 match slots.get(s) {
                                     Some(Value::Undefined) if k.is_num() && !l.undef_ok[s] => {
                                         l.undef_ok[s] = true
                                     }
                                     Some(v) if k != Kind::Boxed && !k.accepts(v) => {
-                                        l.widen[s] = k.wider()
+                                        l.widen[s] = if k == Kind::Int32 && matches!(v, Value::Num(_)) {
+                                            Widen::Number
+                                        } else {
+                                            Widen::Boxed
+                                        }
                                     }
                                     _ => {}
+                                }
+                            }
+                            if first {
+                                for (s, &k) in native.kinds.iter().enumerate() {
+                                    if k.is_num() && s >= chunk.n_params {
+                                        l.undef_ok[s] = true;
+                                    }
                                 }
                             }
                             if log_enabled() {

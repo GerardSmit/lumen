@@ -123,6 +123,13 @@ impl<'a> FunctionBuilder<'a> {
         self.cur
     }
 
+    /// Mark the current block rarely executed.
+    pub fn mark_cold(&mut self) {
+        if let Some(b) = self.cur {
+            self.func.blocks[b.index()].cold = true;
+        }
+    }
+
     /// Whether the current block already ends in a terminator.
     pub fn is_filled(&self) -> bool {
         match self.cur {

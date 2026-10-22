@@ -193,10 +193,36 @@ fn intersect(idom: &[Option<Block>], rpo_index: &[usize], mut a: Block, mut b: B
 /// stays out of its way. Values a cold block defines are only used in blocks it dominates,
 /// which are cold too, so no hot block reads one.
 pub fn sink_cold(f: &Function, cfg: &Cfg, order: Vec<Block>) -> Vec<Block> {
+    let mut cold = cold_blocks(f, cfg, &order);
+    // Blocks dominated by one marked rarely executed (a slow path and what only it reaches)
+    // go last too: they read only values their dominators define, so no hot block reads one.
+    for &b in &order {
+        let mut x = b;
+        loop {
+            if f.blocks[x.index()].cold {
+                cold[b.index()] = true;
+                break;
+            }
+            match cfg.idom[x.index()] {
+                Some(d) if d != x => x = d,
+                _ => break,
+            }
+        }
+    }
+    let entry = f.entry();
+    let (mut hot, rest): (Vec<Block>, Vec<Block>) = order
+        .into_iter()
+        .partition(|&b| b == entry || !cold[b.index()]);
+    hot.extend(rest);
+    hot
+}
+
+/// The blocks from which every path ends the function (a return or trap), indexed by block.
+pub fn cold_blocks(f: &Function, cfg: &Cfg, order: &[Block]) -> Vec<bool> {
     use crate::ir::InstData;
     let n = f.blocks.len();
     let mut cold = vec![false; n];
-    for &b in &order {
+    for &b in order {
         if let Some(t) = f.terminator(b) {
             if matches!(f.inst(t), InstData::Return { .. } | InstData::Trap { .. }) {
                 cold[b.index()] = true;
@@ -216,10 +242,5 @@ pub fn sink_cold(f: &Function, cfg: &Cfg, order: Vec<Block>) -> Vec<Block> {
             break;
         }
     }
-    let entry = f.entry();
-    let (mut hot, rest): (Vec<Block>, Vec<Block>) = order
-        .into_iter()
-        .partition(|&b| b == entry || !cold[b.index()]);
-    hot.extend(rest);
-    hot
+    cold
 }

@@ -465,7 +465,7 @@ fn meta_word_num(fb: &mut FunctionBuilder, word: IrValue, meta: IrValue, miss: B
     let bits = fb.load(MemKind::I64, word, 0);
     let num = is_num_bits(fb, bits);
     guard(fb, num, miss);
-    fb.convert(ConvOp::Bitcast, Type::F64, bits)
+    fb.load(MemKind::F64, word, 0)
 }
 
 // ----- emitters --------------------------------------------------------------------------------
@@ -1264,7 +1264,9 @@ pub(crate) fn view_elem_num(
     let bits = fb.load(MemKind::I64, word, 0);
     let num = is_num_bits(fb, bits);
     guard(fb, num, miss);
-    let f = fb.convert(ConvOp::Bitcast, Type::F64, bits);
+    // A second load straight into a float register: moving `bits` across register files would
+    // sit on the dependency chain of whatever consumes the number.
+    let f = fb.load(MemKind::F64, word, 0);
     fb.jump(done, &[f]);
 
     fb.seal_block(done);

@@ -659,6 +659,8 @@ pub struct ValueData {
 pub struct BlockData {
     pub params: Vec<Value>,
     pub insts: Vec<Inst>,
+    /// Rarely executed (a slow path or exit): values only such blocks read are computed there.
+    pub cold: bool,
 }
 
 #[derive(Clone, Debug, Default)]

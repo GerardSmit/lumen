@@ -2866,6 +2866,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(cond, ex, &[], cont, &[]);
         self.fb.seal_block(ex);
         self.fb.switch_to_block(ex);
+        self.fb.mark_cold();
         self.emit_exit(pc, kind, stack, depth, None);
         self.fb.seal_block(cont);
         self.fb.switch_to_block(cont);
@@ -3678,6 +3679,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// Emit `slow` for the op at `pc` from the current (pre-op) stack. Returns false when it
     /// exited; otherwise the stack is the op's post state with Boxed results.
     fn slow_path(&mut self, pc: usize, slow: Slow) -> bool {
+        self.fb.mark_cold();
         let (pops, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
         let d = self.stack.len();
         match slow {
@@ -3738,6 +3740,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         if let Some(i) = self.int32_of(x) {
             return i;
         }
+        if let Some(i) = self.uint32_of(x) {
+            return i;
+        }
+        if let Some(c) = self.const_to_int32(x) {
+            return self.i32c(c as i64);
+        }
         if let Some(i) = self.int32_sum(x) {
             return i;
         }
@@ -3762,13 +3770,19 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     fn int32_operand(&mut self, v: V) -> Option<V> {
-        if let Some(i) = self.int32_of(v) {
+        if let Some(i) = self.int32_of(v).or_else(|| self.uint32_of(v)) {
             return Some(i);
         }
+        let n = self.f64_const_of(v)?;
+        if n.fract() == 0.0 && (-2147483648.0..4294967296.0).contains(&n) {
+            return Some(self.i32c(n as i64 as i32 as i64));
+        }
+        None
+    }
+
+    fn f64_const_of(&self, v: V) -> Option<f64> {
         match self.def_data(v)? {
-            lumen_codegen::InstData::F64const { bits } => {
-                Kind::int32(f64::from_bits(bits)).map(|i| self.i32c(i as i64))
-            }
+            lumen_codegen::InstData::F64const { bits } => Some(f64::from_bits(bits)),
             _ => None,
         }
     }
@@ -6639,6 +6653,34 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
+    /// The I32 `x` when F64 `v` is the unsigned reading of `x` (a `>>>` result): ToInt32 of it
+    /// is `x` again, bit for bit.
+    fn uint32_of(&self, v: V) -> Option<V> {
+        let lumen_codegen::InstData::Convert { op, arg, .. } = self.def_data(v)? else {
+            return None;
+        };
+        match op {
+            ConvOp::FromUint if self.fb.func.value_type(arg) == Type::I32 => Some(arg),
+            ConvOp::FromSint if self.fb.func.value_type(arg) == Type::I64 => {
+                match self.def_data(arg)? {
+                    lumen_codegen::InstData::Convert {
+                        op: ConvOp::Uext,
+                        arg: x,
+                        ..
+                    } => Some(x),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// ToInt32 of an integral F64 constant below 2^53 in magnitude.
+    fn const_to_int32(&self, v: V) -> Option<i32> {
+        let n = self.f64_const_of(v)?;
+        (n.fract() == 0.0 && n.abs() < 9007199254740992.0).then_some(n as i64 as i32)
+    }
+
     /// The I32 `x` when F64 `v` is `x` converted (then ToInt32(v) is `x`).
     fn int32_of(&self, v: V) -> Option<V> {
         match self.def_data(v)? {
@@ -8419,6 +8461,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.brif(valid, have, &[], refresh, &[]);
             self.fb.seal_block(refresh);
             self.fb.switch_to_block(refresh);
+            self.fb.mark_cold();
             let len = layout::length(&mut self.fb, obj, checked);
             self.seal_current();
             let (k, base, count) = layout::array_view(&mut self.fb, obj);
@@ -8833,6 +8876,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             self.fb.seal_block(refresh);
             self.fb.switch_to_block(refresh);
+            self.fb.mark_cold();
         }
         // An uncached site passes its pc: fed typed arrays often, it asks for a recompile
         // with a cache (exiting before the op).

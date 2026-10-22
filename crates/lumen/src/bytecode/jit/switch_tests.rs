@@ -111,3 +111,12 @@ fn switch_loop_with_hundreds_of_cases_compiles_within_the_frame_limit() {
     assert!(stats.compiled_units > 0);
     assert_eq!(stats.failed_compilations, 0);
 }
+
+#[test]
+fn unsigned_shift_results_stay_exact_in_every_use() {
+    agree_on_every_tier(
+        include_str!("switch_tests/u32.js"),
+        include_str!("switch_tests/u32.expected"),
+        false,
+    );
+}

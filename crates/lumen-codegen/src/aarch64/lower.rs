@@ -1014,6 +1014,21 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
         }
     }
 
+    // An I64 load only reinterpreted as an F64 reads straight into a float register.
+    for &b in &cfg.rpo {
+        for pair in f.blocks[b.index()].insts.windows(2) {
+            let (InstData::Load { kind: MemKind::I64, .. }, InstData::Convert { op: ConvOp::Bitcast, to: Type::F64, arg }) =
+                (f.inst(pair[0]), f.inst(pair[1]))
+            else {
+                continue;
+            };
+            let [loaded] = f.results(pair[0]) else { continue };
+            if loaded == arg && uses[loaded.index()] == 1 {
+                sunk[loaded.index()] = true;
+            }
+        }
+    }
+
     // Integer multiply-add/subtract wraps exactly like the two original operations.
     for &b in &cfg.rpo {
         for &i in &f.blocks[b.index()].insts {
@@ -1645,6 +1660,19 @@ impl Lower<'_> {
                         f: fv,
                     }
                 });
+            }
+            InstData::Convert {
+                op: ConvOp::Bitcast,
+                to: Type::F64,
+                arg,
+            } if self.sunk[arg.index()] => {
+                let Some(InstData::Load { addr, offset, .. }) = self.def(*arg).cloned() else {
+                    unreachable!("a sunk bitcast operand is its load")
+                };
+                let op = load_op(MemKind::F64);
+                let addr = self.amode(addr, offset, op);
+                let dst = self.vreg(res[0]);
+                self.push(MInst::Load { op, dst, addr });
             }
             InstData::Convert { op, to, arg } => self.convert(*op, *to, *arg, res[0])?,
             InstData::Load { kind, addr, offset } => {

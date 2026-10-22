@@ -748,6 +748,7 @@ pub fn split_critical_edges(func: &mut Function) {
                 continue;
             }
             let s = func.create_block();
+            func.blocks[s.index()].cold = func.blocks[call.block.index()].cold;
             out.push(s);
             let j = func.make_inst(InstData::Jump { dest: call });
             func.blocks[s.index()].insts.push(j);
