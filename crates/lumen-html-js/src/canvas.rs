@@ -1274,6 +1274,13 @@ fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &CanvasData
     if !attached {
         return Ok(());
     }
+    // A realm that owns layout runs `sync` before every layout flush, so a draw only marks the
+    // canvas dirty: copying the whole bitmap per draw call makes a frame of N draws cost N full
+    // snapshots.
+    if realm.layout_flusher.borrow().is_some() {
+        realm.canvases.queue_publish(node);
+        return Ok(());
+    }
     let image = image_data(data.snapshot());
     realm
         .session
@@ -5727,6 +5734,27 @@ mod tests {
         assert!(eval_bool(&mut engine,"var standalone=new OffscreenCanvas(100,40);standalone.getContext('2d').fillText('ABC!',60,25);true"));
         let value=engine.eval_value("standalone").unwrap().unwrap_or_else(|_|panic!("standalone query threw"));
         assert!(engine.ctx().with_instance::<DomOffscreenCanvas,_>(&value,|canvas|canvas.data.borrow().inherited_direction_rtl).unwrap());
+    }
+
+    #[test]
+    fn draws_publish_once_per_layout_flush_when_the_realm_owns_layout() {
+        struct NoText;
+        impl lumen_html::paint::TextShaper for NoText {
+            fn shape(&self, _: &str, _: f32) -> Result<lumen_html::paint::ShapedRun, ()> { Err(()) }
+            fn ascent(&self, size: f32) -> f32 { size * 0.8 }
+            fn line_height(&self, size: f32) -> f32 { size * 1.2 }
+        }
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<canvas id=c width=4 height=4></canvas>", 64).unwrap();
+        assert!(eval_bool(&mut engine, "var g=document.getElementById('c').getContext('2d');g.fillRect(0,0,1,1);true"));
+        assert!(realm.canvases.pending_publish.borrow().is_empty(), "without a layout provider a draw publishes immediately");
+        realm.set_layout_flusher(Rc::new(|session| {
+            session.display_list(8, 8, &NoText).map(|_| ()).map_err(|error| format!("{error:?}"))
+        }));
+        assert!(eval_bool(&mut engine, "g.fillRect(1,1,1,1);g.fillRect(2,2,1,1);g.fillRect(3,3,1,1);true"));
+        assert_eq!(realm.canvases.pending_publish.borrow().len(), 1, "draws queue one publication");
+        assert!(eval_bool(&mut engine, "document.getElementById('c').getBoundingClientRect().width>0"));
+        assert!(realm.canvases.pending_publish.borrow().is_empty(), "a layout flush publishes the canvas");
     }
 
     #[test]

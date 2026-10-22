@@ -146,6 +146,9 @@ pub(crate) struct ImageLoader {
     bitmap_updates: RefCell<HashMap<NodeId, (Option<Arc<ImageData>>,lumen_html::responsive_images::ImageMetadata)>>,
     next_generation: Cell<u64>,
     tree_generation: Cell<u64>,
+    /// Bumped by changes that can alter which images the document owns or how they are
+    /// selected; a plain `src` write on one image does not touch the others.
+    structure_generation: Cell<u64>,
     discovery: RefCell<Discovery>,
     needs_scan: Cell<bool>,
     has_dirty: Cell<bool>,
@@ -156,6 +159,9 @@ pub(crate) struct ImageLoader {
     input_budget_failed: Cell<bool>,
     /// `HTMLImageElement.decode()` promises waiting for the element's request to settle.
     decode_waiters: RefCell<Vec<(NodeId, lumen::embed::Deferred)>>,
+    /// Decoded `blob:` image resources for the current completion pass. Object URLs live in
+    /// interpreter state the embedder's resolver cannot reach, so the realm decodes them first.
+    blob_images: RefCell<HashMap<String, ImageState>>,
 }
 
 /// Image discovery results reused while the tree, image attributes and base
@@ -163,6 +169,7 @@ pub(crate) struct ImageLoader {
 #[derive(Default)]
 struct Discovery {
     key: Option<(u64, usize)>,
+    structure: Option<u64>,
     base: String,
     nodes: Vec<NodeId>,
     seen: HashSet<NodeId>,
@@ -384,7 +391,7 @@ impl ImageLoader {
         // same relative src can select a new URL after a base change.
         request.selection_dirty = true;
         self.has_dirty.set(true);
-        self.bump_tree_generation();
+        self.tree_generation.set(self.tree_generation.get().wrapping_add(1));
         self.mark_scan_needed();
         // Invalidate any completion task already queued for the previous
         // selection immediately. The next synchronization either preserves
@@ -715,7 +722,24 @@ impl ImageLoader {
         let mut discovery = self.discovery.borrow_mut();
         let discovery = &mut *discovery;
         let key = (self.tree_generation.get(), document.node_count());
+        let structure = self.structure_generation.get();
+        if discovery.key != Some(key) && discovery.structure == Some(structure) && discovery.base == base {
+            // Only sources were written or nodes were created: the images already known keep
+            // their selection proof, so a page creating thousands of `Image`s stays linear.
+            collect_image_nodes(document, &mut discovery.nodes);
+            let mut requests = self.requests.borrow_mut();
+            for &node in &discovery.nodes {
+                if let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(node) {
+                    entry.insert(Request::default());
+                    discovery.seen.insert(node);
+                    self.has_dirty.set(true);
+                }
+            }
+            discovery.key = Some(key);
+            return;
+        }
         if discovery.key != Some(key) || discovery.base != base {
+            discovery.structure = Some(structure);
             collect_image_nodes(document, &mut discovery.nodes);
             discovery.seen.clear();
             discovery.seen.extend(discovery.nodes.iter().copied());
@@ -905,8 +929,34 @@ impl ImageLoader {
         queued
     }
 
+    /// The `blob:` sources of loading requests, after applying pending source changes.
+    pub(crate) fn pending_blob_sources(&self,document:&Document,base:&str)->Vec<String> {
+        self.refresh_discovery(document,base);
+        self.synchronize_dirty(document,base);
+        let mut sources=Vec::new();
+        for request in self.requests.borrow().values() {
+            let loading=request.pending.iter().chain(std::iter::once(&request.current))
+                .filter(|image|image.state==RequestState::Loading&&image.current_src.starts_with("blob:"));
+            for image in loading {
+                if !sources.contains(&image.current_src) {sources.push(image.current_src.clone());}
+            }
+        }
+        sources
+    }
+
+    pub(crate) fn provide_blob_image(&self,source:String,state:ImageState) {
+        self.blob_images.borrow_mut().insert(source,state);
+    }
+
+    pub(crate) fn clear_blob_images(&self) {
+        self.blob_images.borrow_mut().clear();
+    }
+
     fn resolve_request(&self,resolver:Option<&dyn ImageResolver>,node:NodeId,base:&str,source:&str,
         force_error:bool,response_policy:Option<&ResponsePolicy>,parameters:lumen_html::layout::ImageRequestParameters)->ImageState {
+        if !force_error&&source.starts_with("blob:") {
+            return self.blob_images.borrow().get(source).cloned().unwrap_or(ImageState::Pending);
+        }
         // One provider/response-policy authority for img and input requests.
         let state=if force_error {ImageState::Failed}else{
             resolver.map_or(ImageState::Failed,|resolver|resolver.resolve_image_request(node,base,source,parameters))
@@ -1019,6 +1069,8 @@ impl ImageLoader {
     fn bump_tree_generation(&self) {
         self.tree_generation
             .set(self.tree_generation.get().wrapping_add(1));
+        self.structure_generation
+            .set(self.structure_generation.get().wrapping_add(1));
     }
 
     fn allocate_generation(&self) -> u64 {

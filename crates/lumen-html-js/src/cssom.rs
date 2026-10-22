@@ -3931,6 +3931,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.set_member(&global, "matchMedia", match_media)
         .map_err(|_| OpError::new("Error", "matchMedia installation failed"))?;
     crate::visual_viewport::install(ctx, realm)?;
+    crate::screen::install(ctx, realm)?;
     Ok(())
 }
 

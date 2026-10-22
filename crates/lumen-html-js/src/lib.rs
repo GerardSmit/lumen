@@ -163,6 +163,7 @@ pub use rejection_delivery::{
 pub mod scheduling;
 mod shadow;
 mod templates;
+mod screen;
 mod visual_viewport;
 mod legacy_timing;
 mod web_storage;
@@ -854,6 +855,7 @@ pub struct DomRealm {
     /// the viewport size then needs no layout.
     viewport_source: RefCell<Option<Rc<Cell<(u32,u32)>>>>,
     device_pixel_ratio: Cell<f64>,
+    screen: RefCell<screen::ScreenMetrics>,
     font_loading: font_loading::FontLoading,
     font_preloads: font_preload::State,
     images: image_loading::ImageLoader,
@@ -3121,17 +3123,41 @@ impl DomRealm {
         self.font_loading.settle(ctx)
     }
 
+    /// Object URLs are interpreter state, so the realm reads and decodes their bytes for the
+    /// image requests that name them. A revoked URL or undecodable bytes fail the request.
+    fn decode_blob_images(&self, ctx: &mut Ctx, base: &str) {
+        const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+        let sources = self.images.pending_blob_sources(self.session.borrow().document(), base);
+        for source in sources {
+            let state = lumen_host::blob::object_url_resource(ctx, &source)
+                .and_then(|resource| {
+                    lumen_html_image::decode_image_with_limit(&resource.bytes, MAX_DECODED_BYTES).ok()
+                })
+                .map_or(lumen_html::layout::ImageState::Failed, |image| {
+                    lumen_html::layout::ImageState::Ready(std::sync::Arc::new(lumen_html::paint::ImageData {
+                        width: image.width,
+                        height: image.height,
+                        pixels: image.pixels,
+                    }))
+                });
+            self.images.provide_blob_image(source, state);
+        }
+    }
+
     /// Resolve image requests whose sources have changed and enqueue their
     /// `load`/`error` events as user-agent tasks. Events are dispatched only
     /// when the host runs the existing scheduling task queue.
     pub fn queue_image_tasks(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<usize> {
         let base = self.base_url();
         self.prepare_image_selection(&base)?;
+        self.decode_blob_images(ctx, &base);
         self.settle_image_decodes(ctx);
         let completions = {
             let session = self.session.borrow();
             self.images.queue_completions(session.document(), &base)
-        }.into_iter().map(|mut completion| {
+        };
+        self.images.clear_blob_images();
+        let completions = completions.into_iter().map(|mut completion| {
             // Acquire completion cleanup before any later fallible host work.
             let lease=completion.input_task.take().map(|slot|InputCompletionTask {client:self.clone(),slot:slot.get()-1});
             (completion,lease)
@@ -13781,6 +13807,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             layout_flusher: RefCell::new(None),
             viewport_source: RefCell::new(None),
             device_pixel_ratio: Cell::new(1.0),
+            screen: RefCell::new(screen::ScreenMetrics::default()),
             cookie_host: RefCell::new(None),
             cookie_source_url: RefCell::new(None),
             font_loading: font_loading::FontLoading::default(),
@@ -14754,6 +14781,7 @@ fn install_document_with_context_metadata(
     Ok(realm)
 }
 
+pub use screen::{ScreenMetrics, ScreenOrientationKind};
 pub use visual_viewport::set_visual_viewport;
 pub use web_storage::set_local_storage_backend;
 pub use legacy_timing::performance_extension;
@@ -17194,6 +17222,70 @@ mod tests {
             "#,
         );
         assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn image_elements_load_from_blob_object_urls_without_the_embedder_resolver() {
+        let mut engine = Engine::new();
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
+        assert!(lumen_host::lazy_globals::<lumen_host::url::bindings::Module>(engine.ctx()).is_ok());
+        let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
+        realm.set_document_url("https://images.test/page.html");
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let recorded = calls.clone();
+        realm.set_image_resolver(Rc::new(move |source: &str| {
+            recorded.borrow_mut().push(source.to_owned());
+            lumen_html::layout::ImageState::Failed
+        }));
+        script(
+            &mut engine,
+            "globalThis.png = new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,218,99,252,207,192,80,15,0,4,133,1,128,132,169,140,33,0,0,0,0,73,69,78,68,174,66,96,130]); globalThis.events = [];
+             globalThis.good = new Image(); good.onload = () => events.push('good:' + good.naturalWidth + 'x' + good.naturalHeight); good.onerror = () => events.push('good:error');
+             globalThis.revoked = new Image(); revoked.onload = () => events.push('revoked:load'); revoked.onerror = () => events.push('revoked:error');
+             globalThis.junk = new Image(); junk.onload = () => events.push('junk:load'); junk.onerror = () => events.push('junk:error');
+             const revokedUrl = URL.createObjectURL(new Blob([png], { type: 'image/png' })); URL.revokeObjectURL(revokedUrl);
+             good.src = URL.createObjectURL(new Blob([png], { type: 'image/png' }));
+             revoked.src = revokedUrl;
+             junk.src = URL.createObjectURL(new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }));",
+        );
+        assert_eq!(realm.queue_image_tasks(engine.ctx()).unwrap(), 3);
+        assert!(scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(
+            script(
+                &mut engine,
+                "events.sort().join() === 'good:1x1,junk:error,revoked:error' && good.complete && good.width === 1"
+            ),
+            Value::Bool(true)
+        ));
+        assert!(calls.borrow().is_empty(), "blob sources never reach the embedder resolver");
+    }
+
+    #[test]
+    fn images_created_one_by_one_are_each_resolved_once() {
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<body></body>", 64).unwrap();
+        realm.set_document_url("https://images.test/page.html");
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let recorded = calls.clone();
+        realm.set_image_resolver(Rc::new(move |source: &str| {
+            recorded.borrow_mut().push(source.to_owned());
+            lumen_html::layout::ImageState::Failed
+        }));
+        script(&mut engine, "globalThis.loaded = 0; globalThis.keep = [];");
+        for index in 0..24 {
+            script(
+                &mut engine,
+                &format!("{{ const image = new Image(); image.onerror = () => loaded++; keep.push(image); image.src = '/img{index}.png'; }}"),
+            );
+            realm.queue_image_tasks(engine.ctx()).unwrap();
+            assert!(scheduling::run_tasks(&mut engine, 16).is_empty());
+        }
+        assert!(matches!(script(&mut engine, "loaded === 24"), Value::Bool(true)));
+        let mut seen = calls.borrow().clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 24);
+        assert_eq!(calls.borrow().len(), 24, "earlier images are not re-resolved by later ones");
     }
 
     #[test]
