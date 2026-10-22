@@ -13,10 +13,16 @@ default = ["bundled-fonts"]
 bundled-fonts = []
 # `default_faces()`: the shared fallback faces, bundled or read from a font directory.
 std = []
+# Opt-in use of the fonts installed on the host (`enable_system_fonts`): named families, the
+# generic families and per-character fallback. Reads font files, so it needs `std`.
+# Platform fonts such as macOS SF NS carry more than 32 variation tuples per glyph;
+# ttf-parser only reads those with gvar-alloc.
+system-fonts = ["std", "dep:lumen-os", "ttf-parser/gvar-alloc"]
 
 [dependencies]
 lumen-html = { path = "../lumen-html" }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
+lumen-os = { path = "../lumen-os", optional = true }
 fontdue = "0.9"
 read-fonts = { version = "0.37", default-features = false, features = ["libm"] }
 rustybuzz = { version = "0.20", default-features = false }

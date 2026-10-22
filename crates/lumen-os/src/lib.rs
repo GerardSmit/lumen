@@ -12,6 +12,7 @@ pub mod embedded;
 pub mod errno;
 pub mod event;
 pub mod fdctl;
+pub mod fonts;
 pub mod fs;
 pub mod http_body;
 pub mod ident;

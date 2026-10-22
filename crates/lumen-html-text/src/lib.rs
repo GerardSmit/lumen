@@ -10,6 +10,12 @@ mod default_faces;
 #[cfg(feature = "std")]
 pub use default_faces::{default_faces, set_font_directory, DefaultFaces, FILES as DEFAULT_FACE_FILES};
 
+mod sfnt;
+#[cfg(feature = "system-fonts")]
+mod system_fonts;
+#[cfg(feature = "system-fonts")]
+pub use system_fonts::{enable_system_fonts, system_fonts_enabled};
+
 mod manual_font_registry;
 mod spacing_trim;
 pub use manual_font_registry::{
@@ -35,6 +41,8 @@ use lumen_html::paint::{
 
 static NEXT_FACE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_FONT_BYTES: usize = 2 * 1024 * 1024;
+/// Installed fonts (CJK collections in particular) exceed the web-font limit.
+const MAX_SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHAPE_TEXT_BYTES: usize = 64 * 1024;
 /// Shaping and outlines scale linearly, so they accept any size a page can compute.
 const MAX_SHAPE_FONT_SIZE: f32 = 16384.0;
@@ -53,6 +61,8 @@ const MAX_REQUESTED_FAMILIES: usize = 64;
 const MAX_FAMILY_NAME_BYTES: usize = 256;
 const RASTERIZER_BLOCK_GLYPHS: u16 = 256;
 const RASTERIZER_CACHE_BLOCKS: usize = 2;
+/// Faces larger than this are never copied for a one-glyph rasterizer.
+const LARGE_FACE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Builds a temporary fontdue font whose cmap exposes only the requested
 /// glyph. Fontdue eagerly retains every mapped outline when it loads a face;
@@ -64,37 +74,7 @@ fn fontdue_bytes_for_glyph_range(
     first_glyph: u16,
     glyph_count: u16,
 ) -> Result<Vec<u8>, &'static str> {
-    fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
-        Some(u16::from_be_bytes(
-            bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
-        ))
-    }
-    fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-        Some(u32::from_be_bytes(
-            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
-        ))
-    }
-    fn write_u16(bytes: &mut [u8], at: usize, value: u16) -> Result<(), &'static str> {
-        bytes
-            .get_mut(at..at.checked_add(2).ok_or("invalid font table")?)
-            .ok_or("invalid font table")?
-            .copy_from_slice(&value.to_be_bytes());
-        Ok(())
-    }
-    fn write_u32(bytes: &mut [u8], at: usize, value: u32) -> Result<(), &'static str> {
-        bytes
-            .get_mut(at..at.checked_add(4).ok_or("invalid font table")?)
-            .ok_or("invalid font table")?
-            .copy_from_slice(&value.to_be_bytes());
-        Ok(())
-    }
-    fn checksum(bytes: &[u8]) -> u32 {
-        bytes.chunks(4).fold(0u32, |sum, word| {
-            let mut padded = [0; 4];
-            padded[..word.len()].copy_from_slice(word);
-            sum.wrapping_add(u32::from_be_bytes(padded))
-        })
-    }
+    use crate::sfnt::{be16 as read_u16, be32 as read_u32, checksum, write_be32 as write_u32};
     fn small_cmap(first_glyph: u16, glyph_count: u16) -> Result<[u8; 44], &'static str> {
         if glyph_count == 0 || glyph_count > RASTERIZER_BLOCK_GLYPHS {
             return Err("invalid glyph block");
@@ -133,7 +113,7 @@ fn fontdue_bytes_for_glyph_range(
         length: usize,
     }
 
-    if bytes.len() > MAX_FONT_BYTES {
+    if bytes.len() > MAX_SYSTEM_FONT_BYTES {
         return Err("font too large");
     }
     let sfnt_offset = if bytes.get(..4) == Some(b"ttcf") {
@@ -198,78 +178,38 @@ fn fontdue_bytes_for_glyph_range(
         });
     }
     let cmap_index = cmap_index.ok_or("font has no character map")?;
-    let table_count = u16::try_from(records.len()).map_err(|_| "font table limit")?;
-    let mut output = Vec::new();
-    let directory_end = 12usize
-        .checked_add(records.len().checked_mul(16).ok_or("font table limit")?)
-        .ok_or("font table limit")?;
-    output
-        .try_reserve(directory_end)
-        .map_err(|_| "font allocation failed")?;
-    output.resize(directory_end, 0);
-    output[..4].copy_from_slice(scaler);
-    write_u16(&mut output, 4, table_count)?;
-    let mut search_power = 1u16;
-    let mut selector = 0u16;
-    while search_power.saturating_mul(2) <= table_count {
-        search_power *= 2;
-        selector += 1;
-    }
-    let search_range = search_power.saturating_mul(16);
-    write_u16(&mut output, 6, search_range)?;
-    write_u16(&mut output, 8, selector)?;
-    write_u16(
-        &mut output,
-        10,
-        table_count.saturating_mul(16) - search_range,
+    let mut writer = crate::sfnt::SfntWriter::new(
+        scaler.try_into().map_err(|_| "invalid font table")?,
+        records.len(),
     )?;
-
     let cmap = small_cmap(first_glyph, glyph_count)?;
     let mut head_adjustment = None;
     for (index, record) in records.iter().enumerate() {
-        let aligned = output.len().checked_add(3).ok_or("font table limit")? & !3;
+        let source = bytes
+            .get(record.offset..record.offset + record.length)
+            .ok_or("invalid font table")?;
+        let mut head;
         let table = if index == cmap_index {
             cmap.as_slice()
-        } else {
-            bytes
-                .get(record.offset..record.offset + record.length)
-                .ok_or("invalid font table")?
-        };
-        let end = aligned.checked_add(table.len()).ok_or("font table limit")?;
-        if end > MAX_FONT_BYTES {
-            return Err("font too large");
-        }
-        output
-            .try_reserve(end.saturating_sub(output.len()))
-            .map_err(|_| "font allocation failed")?;
-        output.resize(aligned, 0);
-        output.extend_from_slice(table);
-        if &record.tag == b"head" {
-            if table.len() < 12 {
+        } else if &record.tag == b"head" {
+            if source.len() < 12 {
                 return Err("invalid font header");
             }
-            write_u32(&mut output, aligned + 8, 0)?;
+            head = source.to_vec();
+            head[8..12].fill(0);
+            head.as_slice()
+        } else {
+            source
+        };
+        let aligned = writer.push_table(index, record.tag, checksum(table), table)?;
+        if &record.tag == b"head" {
             head_adjustment = Some(aligned + 8);
         }
-        let entry = 12 + index * 16;
-        output[entry..entry + 4].copy_from_slice(&record.tag);
-        let table_checksum = checksum(&output[aligned..end]);
-        write_u32(&mut output, entry + 4, table_checksum)?;
-        write_u32(
-            &mut output,
-            entry + 8,
-            u32::try_from(aligned).map_err(|_| "font table limit")?,
-        )?;
-        write_u32(
-            &mut output,
-            entry + 12,
-            u32::try_from(table.len()).map_err(|_| "font table limit")?,
-        )?;
     }
     let adjustment = head_adjustment.ok_or("font has no header")?;
-    let check_sum_adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&output));
-    write_u32(&mut output, adjustment, check_sum_adjustment)?;
-    Ok(output)
+    let check_sum_adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(writer.bytes()));
+    write_u32(writer.bytes_mut(), adjustment, check_sum_adjustment)?;
+    Ok(writer.into_bytes())
 }
 
 /// Rasterization access for glyphs produced by a shaper.
@@ -715,6 +655,7 @@ fn resolve_script(face:&rustybuzz::Face<'_>,selection:ScriptSelection,context:Sh
     candidates.iter().find(|&script|supported(script)).or_else(||candidates.iter().next()).unwrap_or(Script::Common)
 }
 
+#[cfg(test)]
 fn shape_buffer(
     bytes: &[u8],
     text: &str,
@@ -732,14 +673,20 @@ struct ShapeContext<'a> {
     start: usize,
     end: usize,
     variations: &'a [rustybuzz::Variation],
+    points_per_em: Option<f32>,
 }
 impl<'a> ShapeContext<'a> {
     fn language(language: Option<&'a str>) -> Self {
-        Self { language, surrounding: None, start: 0, end: 0, variations: &[] }
+        Self { language, surrounding: None, start: 0, end: 0, variations: &[], points_per_em: None }
     }
     fn subrange(self, start: usize, end: usize) -> Self {
         Self { start: self.start + start, end: self.start + end, ..self }
     }
+}
+
+#[cfg(feature = "system-fonts")]
+fn is_private_use_cluster(cluster: &str) -> bool {
+    cluster.chars().any(|character| matches!(character as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD))
 }
 
 fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelection,
@@ -747,6 +694,7 @@ fn shape_buffer_context(bytes: &[u8], text: &str, rtl: bool, script: ScriptSelec
         let language = context.language;
     let mut face = rustybuzz::Face::from_slice(bytes, 0).ok_or("font cannot be shaped")?;
     face.set_variations(context.variations);
+    face.set_points_per_em(context.points_per_em);
     let script=resolve_script(&face,script,context);
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     // UAX #9 has already consumed directional controls before a resolved
@@ -1275,6 +1223,13 @@ impl FontSet {
 
         if let Some(families) = &spec.families {
             for requested in families.iter() {
+                #[cfg(feature = "system-fonts")]
+                if let Some(index) = self.system_family(requested, spec) {
+                    if !order.contains(&index) {
+                        order.push(index);
+                    }
+                    continue;
+                }
                 let Some(best) = self.best_candidate(spec, Some(requested), &order) else {
                     continue;
                 };
@@ -1350,10 +1305,10 @@ impl FontSet {
     }
 
     fn font_match_instance(&self, spec: &FontSpec, index: usize) -> Option<(u16, f32, FontStyle)> {
-        let descriptor = &self.descriptors[index];
+        let descriptor = self.descriptor(index);
         font_match_style_range_rank(
             spec,
-            self.faces[index].style,
+            self.font(index).style,
             descriptor.oblique_range,
             descriptor.weight_range,
             descriptor.stretch_range,
@@ -1362,45 +1317,137 @@ impl FontSet {
     }
 
     fn face_covers(&self, index: usize, cluster: &str) -> bool {
-        let face = &self.faces[index].face;
+        let face = &self.font(index).face;
         face.covers_cluster_with_properties(
             cluster,
-            self.unicode_ranges[index].as_deref(),
+            self.ranges(index),
             self.default_ignorable,
         )
     }
 
-    fn display_phase(&self,index:usize)->lumen_html::font_display::DisplayPhase {
-        self.display.as_ref().map_or(lumen_html::font_display::DisplayPhase::Loaded,|modes|modes[index])
+    /// The registered font behind a face index: a set member, or an installed system face.
+    fn font(&self, index: usize) -> &RegisteredFont {
+        #[cfg(feature = "system-fonts")]
+        if index >= system_fonts::SYSTEM_FACE_BASE {
+            return &system_fonts::face(index).font;
+        }
+        &self.faces[index]
     }
 
-    fn loaded_fallback(&self,cluster:&str,order:&[usize])->usize {
+    fn descriptor(&self, index: usize) -> &RegisteredFontDescriptors {
+        #[cfg(feature = "system-fonts")]
+        if index >= system_fonts::SYSTEM_FACE_BASE {
+            return &system_fonts::face(index).descriptors;
+        }
+        &self.descriptors[index]
+    }
+
+    /// Unicode-range coverage of web faces; platform and system faces have none.
+    fn ranges(&self, index: usize) -> Option<&[(u32, u32)]> {
+        self.unicode_ranges.get(index).and_then(|ranges| ranges.as_deref())
+    }
+
+    #[cfg(feature = "system-fonts")]
+    fn is_default_ignorable(&self, character: char) -> bool {
+        let codepoint = character as u32;
+        self.default_ignorable
+            .binary_search_by(|&(first, last)| {
+                if codepoint < first {
+                    CmpOrdering::Greater
+                } else if codepoint > last {
+                    CmpOrdering::Less
+                } else {
+                    CmpOrdering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// An installed face for a family the page names, when no downloaded font of that name exists.
+    #[cfg(feature = "system-fonts")]
+    fn system_family(&self, requested: &FontFamily, spec: &FontSpec) -> Option<usize> {
+        if !system_fonts::system_fonts_enabled() {
+            return None;
+        }
+        match requested {
+            FontFamily::Generic(generic) => system_fonts::generic(*generic, spec),
+            FontFamily::Named(name) => {
+                let downloaded = self.faces.iter().enumerate()
+                    .any(|(index, font)| self.unicode_ranges[index].is_some() && font.family.eq_ignore_ascii_case(name));
+                if downloaded { None } else { system_fonts::named(name, spec) }
+            }
+        }
+    }
+
+    /// An installed face with a glyph for every character of the cluster.
+    #[cfg(feature = "system-fonts")]
+    fn system_fallback(&self, cluster: &str, language: Option<&str>, spec: &FontSpec) -> Option<usize> {
+        if !system_fonts::system_fonts_enabled() {
+            return None;
+        }
+        if is_private_use_cluster(cluster) {
+            return None;
+        }
+        let base = cluster.chars().find(|&character| !character.is_control() && !self.is_default_ignorable(character))?;
+        let index = system_fonts::fallback(base, language, spec)?;
+        self.face_covers(index, cluster).then_some(index)
+    }
+
+    fn display_phase(&self,index:usize)->lumen_html::font_display::DisplayPhase {
+        self.display.as_ref().and_then(|modes|modes.get(index).copied()).unwrap_or(lumen_html::font_display::DisplayPhase::Loaded)
+    }
+
+    fn loaded_fallback(&self,cluster:&str,order:&[usize],system:Option<(Option<&str>,&FontSpec)>)->usize {
         use lumen_html::font_display::DisplayPhase;
-        order.iter().copied().find(|&index|self.display_phase(index)==DisplayPhase::Loaded
-            && self.face_covers(index,cluster)).unwrap_or_else(||order.iter().rev().copied()
-            .find(|&index|self.unicode_ranges[index].is_none()).expect("platform fallback validated"))
+        if let Some(index)=order.iter().copied().find(|&index|self.display_phase(index)==DisplayPhase::Loaded
+            && self.face_covers(index,cluster)) {return index;}
+        #[cfg(feature = "system-fonts")]
+        if let Some((language,spec))=system {
+            if let Some(index)=self.system_fallback(cluster,language,spec) {return index;}
+        }
+        #[cfg(not(feature = "system-fonts"))]
+        let _=system;
+        order.iter().rev().copied()
+            .find(|&index|index<self.faces.len() && self.unicode_ranges[index].is_none()).expect("platform fallback validated")
     }
 
     fn cluster_face(&self, cluster: &str, order: &[usize]) -> (usize,bool) {
+        self.cluster_face_with(cluster,order,None)
+    }
+
+    /// `system` names the language and style that let a cluster no listed face covers fall back
+    /// to an installed system face.
+    fn cluster_face_with(&self, cluster: &str, order: &[usize], system: Option<(Option<&str>,&FontSpec)>) -> (usize,bool) {
         use lumen_html::font_display::DisplayPhase;
+        // css-fonts-4 §5.4: private-use characters only match faces of named families; installed
+        // faces stand in for generic families here, so they are skipped.
+        #[cfg(feature = "system-fonts")]
+        let private_use = is_private_use_cluster(cluster);
         for &index in order {
+            #[cfg(feature = "system-fonts")]
+            if private_use && index >= system_fonts::SYSTEM_FACE_BASE {
+                continue;
+            }
             match self.display_phase(index) {
                 DisplayPhase::Loaded if self.face_covers(index,cluster)=>return (index,false),
                 phase @ (DisplayPhase::Block|DisplayPhase::Swap) if cluster.chars().all(|character|
                     character.is_control() || self.default_ignorable.binary_search_by(|&(first,last)| {
                         if (character as u32)<first {CmpOrdering::Greater} else if (character as u32)>last {CmpOrdering::Less} else {CmpOrdering::Equal}
-                    }).is_ok() || self.unicode_ranges[index].as_ref().is_none_or(|ranges|ranges.iter()
+                    }).is_ok() || self.ranges(index).is_none_or(|ranges|ranges.iter()
                         .any(|&(first,last)|first<=character as u32 && character as u32<=last)))=>
-                    return (self.loaded_fallback(cluster,order),phase==DisplayPhase::Block),
+                    return (self.loaded_fallback(cluster,order,system),phase==DisplayPhase::Block),
                 _=>{},
             }
         }
-        (self.loaded_fallback(cluster,order),false)
+        (self.loaded_fallback(cluster,order,system),false)
     }
 
     fn face_by_identity(&self,identity:u64)->Option<&Arc<FontFace>> {
         if identity==0 {return self.faces.first().map(|font|&font.face);}
-        self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity) || font.face.is_variation_key(identity)).map(|font|&font.face)
+        let own=self.faces.iter().find(|font|font.face.id()==identity || font.face.is_invisible_key(identity) || font.face.is_oblique_key(identity) || font.face.is_variation_key(identity)).map(|font|&font.face);
+        #[cfg(feature = "system-fonts")]
+        if own.is_none() {return system_fonts::by_identity(identity);}
+        own
     }
 
     fn append_resolved_range(
@@ -1416,7 +1463,7 @@ impl FontSet {
         x: &mut f32,
         advances: Option<&mut Vec<RawClusterAdvance>>,
     ) -> Result<(), &'static str> {
-        self.append_resolved_range_context(text,text_offset,size,rtl,order,spec,features,glyphs,x,advances,ShapeContext {language:None,surrounding:Some(text),start:0,end:text.len(),variations:&[]})
+        self.append_resolved_range_context(text,text_offset,size,rtl,order,spec,features,glyphs,x,advances,ShapeContext {language:None,surrounding:Some(text),start:0,end:text.len(),variations:&[],points_per_em:None})
     }
 
     fn append_resolved_range_context(&self,text:&str,text_offset:usize,size:f32,rtl:bool,
@@ -1427,7 +1474,7 @@ impl FontSet {
             let mut clusters = Vec::new();
             for (start, cluster) in graphemes(value) {
                 clusters.try_reserve(1).map_err(|_|"font fallback allocation failed")?;
-                let (face,invisible)=self.cluster_face(cluster,order);
+                let (face,invisible)=self.cluster_face_with(cluster,order,Some((context.language,spec)));
                 clusters.push(FontCluster {start,end:start+cluster.len(),face,invisible});
             }
             if rtl {
@@ -1495,9 +1542,9 @@ impl FontSet {
         advances: Option<&mut Vec<RawClusterAdvance>>,
         context: ShapeContext<'_>,
     ) -> Result<(), &'static str> {
-        let registered = &self.faces[run.face];
+        let registered = self.font(run.face);
         let mut merged = Vec::new();
-        let descriptor=&self.descriptors[run.face];
+        let descriptor=self.descriptor(run.face);
         let features = if descriptor.feature_settings.is_some() || spec.alternates.is_some() {
             append_feature_settings(&mut merged, descriptor.feature_settings.as_deref());
             let aliases=lumen_html::css::font_feature_values::resolve_features(spec.alternates.as_deref(),
@@ -1587,9 +1634,9 @@ impl FontSet {
         // after construction; a new resource snapshot owns a new bounded cache.
         let first=order.iter().copied().find(|&index|
             self.display_phase(index)==lumen_html::font_display::DisplayPhase::Loaded
-            && self.unicode_ranges[index].as_ref().is_none_or(|ranges|
+            && self.ranges(index).is_none_or(|ranges|
                 ranges.iter().any(|&(first,last)|first<=0x20&&0x20<=last))).unwrap_or(0);
-        let select=|glyph|self.cluster_face(glyph,&order).0;
+        let select=|glyph|self.cluster_face_with(glyph,&order,Some((None,spec))).0;
         let selection=FontMetricSelection {first,ch:select("0"),ic:select("水")};
         self.metric_selections.insert_styled("",0.0,None,0,Some(spec),selection);
         self.last_metric_selection.set(spec,selection);
@@ -1599,34 +1646,34 @@ impl FontSet {
 
     #[cfg(test)]
     fn metric_face(&self, spec: &FontSpec) -> &FontFace {
-        &self.faces[self.metric_face_index(spec)].face
+        &self.font(self.metric_face_index(spec)).face
     }
 
     /// Return a metric from the same first-available face used by CSS font
     /// selection, including family/descriptor matching and unicode-range.
     pub fn first_available_metric(&self, spec: &FontSpec, metric: FontMetric) -> Option<f32> {
         let index = self.metric_face_index(spec);
-        self.faces[index]
+        self.font(index)
             .face
             .metric_ratio(metric)
-            .map(|value| value * self.descriptors[index].size_adjust)
+            .map(|value| value * self.descriptor(index).size_adjust)
     }
 
     fn size_adjust_scale(&self, spec: &FontSpec, face_index: usize) -> f32 {
-        let face = &self.faces[face_index].face;
-        let face_scale = self.descriptors[face_index].size_adjust;
+        let face = &self.font(face_index).face;
+        let face_scale = self.descriptor(face_index).size_adjust;
         let Some(adjust) = spec.size_adjust else {
             return face_scale;
         };
         let reference_index = self.metric_face_index(spec);
-        let reference = &self.faces[reference_index].face;
+        let reference = &self.font(reference_index).face;
         let target = match adjust.value {
             FontSizeAdjustValue::Number(number) => number,
             FontSizeAdjustValue::FromFont => {
                 let Some(metric) = reference.metric(adjust.metric) else {
                     return face_scale;
                 };
-                metric * self.descriptors[reference_index].size_adjust
+                metric * self.descriptor(reference_index).size_adjust
             }
         };
         if target == 0.0 {
@@ -2238,6 +2285,7 @@ pub struct FontFace {
     // admission; metrics lookup must not reparse every font table per style.
     metric_glyph_coverage:u8,
     primary_character_widths: Option<PrimaryCharacterWidths>,
+    classic_mac_ascent: bool,
     caps_features: u8,
     spacing_features: u8,
     variable_axes: Arc<[VariationAxisInfo]>,
@@ -2495,13 +2543,17 @@ impl FontFace {
     }
 
     pub fn new(bytes: Arc<[u8]>) -> Result<Self, &'static str> {
-        if bytes.len() > MAX_FONT_BYTES {
+        Self::new_with_limit(bytes, MAX_FONT_BYTES)
+    }
+
+    pub(crate) fn new_with_limit(bytes: Arc<[u8]>, limit: usize) -> Result<Self, &'static str> {
+        if bytes.len() > limit {
             return Err("font too large");
         }
         let bytes = if bytes.starts_with(b"wOFF") {
-            Arc::from(lumen_common::font::decode_woff(&bytes, MAX_FONT_BYTES)?)
+            Arc::from(lumen_common::font::decode_woff(&bytes, limit)?)
         } else if bytes.starts_with(b"wOF2") {
-            Arc::from(lumen_common::font::decode_woff2(&bytes, MAX_FONT_BYTES)?)
+            Arc::from(lumen_common::font::decode_woff2(&bytes, limit)?)
         } else {
             bytes
         };
@@ -2513,7 +2565,12 @@ impl FontFace {
         let primary_character_widths = {
             use read_fonts::TableProvider;
             read_fonts::FontRef::new(&bytes).ok().and_then(|font| {
-                let average = font.os2().ok()?.x_avg_char_width() as f32 / units_per_em;
+                // Some platform faces (Courier, Menlo on macOS) have no OS/2 table; use the
+                // advance of "0" as the average width, as browsers do.
+                let average = match font.os2() {
+                    Ok(os2) => os2.x_avg_char_width() as f32,
+                    Err(_) => face.glyph_index('0').and_then(|glyph| face.glyph_hor_advance(glyph))? as f32,
+                } / units_per_em;
                 let maximum = font.hhea().ok()?.advance_width_max().to_u16() as f32 / units_per_em;
                 (average >= 0.0 && maximum >= 0.0).then_some(PrimaryCharacterWidths { average, maximum })
             })
@@ -2609,6 +2666,7 @@ impl FontFace {
             metrics,
             metric_glyph_coverage,
             primary_character_widths,
+            classic_mac_ascent: false,
             caps_features,
             spacing_features,
             variable_axes,
@@ -2945,6 +3003,7 @@ variation_advances: VariationGlyphCache::new(),
     fn shape_script_into_context(&self,text:&str,size:f32,rtl:bool,script:ScriptSelection,glyph_face:u64,
         size_scale:f32,cluster_offset:usize,features:&[rustybuzz::Feature],glyphs:&mut Vec<Glyph>,x:&mut f32,
         advances:Option<&mut Vec<RawClusterAdvance>>,context:ShapeContext<'_>) -> Result<(), &'static str> {
+        let context = ShapeContext { points_per_em: Some(size), ..context };
         let shaped = shape_buffer_context(&self.bytes, text, rtl, script, features,context)?;
         append_glyphs(
             shaped,
@@ -3141,6 +3200,7 @@ variation_advances: VariationGlyphCache::new(),
         } else {
             features
         };
+        let context = ShapeContext { points_per_em: Some(size), ..context };
         let shaped = shape_buffer_context(&self.bytes, &transformed, rtl, script, features,context)?;
         if glyphs.len().saturating_add(shaped.len()) > MAX_SHAPE_TEXT_BYTES {
             return Err("caps glyph run too large");
@@ -3203,9 +3263,10 @@ variation_advances: VariationGlyphCache::new(),
         mut visit: impl FnMut(rustybuzz::GlyphBuffer, usize) -> Result<(), &'static str>,
     ) -> Result<(), &'static str> {
         validate_shape_input(text, size)?;
+        let context = ShapeContext { points_per_em: Some(size), ..ShapeContext::language(None) };
         if text.is_ascii() && rtl != Some(true) {
             return visit(
-                shape_buffer(&self.bytes, text, false, Script::Latin.into(), features)?,
+                shape_buffer_context(&self.bytes, text, false, Script::Latin.into(), features, context)?,
                 0,
             );
         }
@@ -3217,12 +3278,13 @@ variation_advances: VariationGlyphCache::new(),
                 let value = &text[range.clone()];
                 for item in script_ranges(value, rtl)? {
                     visit(
-                        shape_buffer(
+                        shape_buffer_context(
                             &self.bytes,
                             &value[item.start..item.end],
                             rtl,
                             item.script,
                             features,
+                            context,
                         )?,
                         range.start + item.start,
                     )?;
@@ -3441,10 +3503,33 @@ variation_advances: VariationGlyphCache::new(),
         self.line_height(size) + (self.line_gap * size).round()
     }
     pub fn ascent(&self, size: f32) -> f32 {
-        (self.ascent * size).round()
+        let ascent = (self.ascent * size).round();
+        if !self.classic_mac_ascent {
+            return ascent;
+        }
+        // Chromium and Safari on macOS raise the ascent of Times, Helvetica and Courier by 15% of
+        // their height to match the vertical metrics of the Windows faces pages were written for.
+        let descent = (-self.descent * size).round();
+        ascent + ((ascent + descent) * 0.15 + 0.5).floor()
+    }
+
+    /// Applies the macOS ascent adjustment browsers give the classic Times, Helvetica and
+    /// Courier platform faces.
+    pub(crate) fn with_classic_mac_ascent(mut self) -> Self {
+        self.classic_mac_ascent = true;
+        self
     }
 
     pub fn rasterize(&self, id: u16, size: f32) -> Result<GlyphCoverage, &'static str> {
+        if self.bytes.len() > LARGE_FACE_BYTES {
+            if !size.is_finite() || size <= 0.0 || size > MAX_RASTER_FONT_SIZE {
+                return Err("invalid font size");
+            }
+            if id >= self.glyph_count {
+                return Err("glyph id out of range");
+            }
+            return coverage_from_outline(&self.outline_with_variations(id, size, &[])?);
+        }
         self.with_rasterizer(id,size,|font|rasterize_coverage(font,id,size))
     }
 
@@ -3642,7 +3727,7 @@ let full=&full[before..after];
 let source=source.start-before..source.end-before;
 let text=&full[source.clone()];
 
-    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[]};
+    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[],points_per_em:None};
 let language=language.filter(|value|!value.is_empty());
 let key=Some((source.start,source.end));
 if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,Some(font),language,key) {
@@ -3904,7 +3989,7 @@ impl TextShaper for FontSet {
     }
     fn primary_character_widths_styled(&self, size: f32, font: &FontSpec) -> Option<PrimaryCharacterWidths> {
         let index = self.metric_face_index(font);
-        self.faces[index].face.primary_character_widths(size, self.size_adjust_scale(font, index))
+        self.font(index).face.primary_character_widths(size, self.size_adjust_scale(font, index))
     }
     fn glyph_ink_bounds(&self,glyph:&Glyph,size:f32) -> Option<lumen_html::paint::Rect> {
         self.face_by_identity(glyph.face)?.glyph_ink_bounds(glyph,size)
@@ -3937,7 +4022,7 @@ let full=&full[before..after];
 let source=source.start-before..source.end-before;
 let text=&full[source.clone()];
 
-    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[]};
+    let context=ShapeContext {language,surrounding:Some(full),start:source.start,end:source.end,variations:&[],points_per_em:None};
 let language=language.filter(|value|!value.is_empty());
 let key=Some((source.start,source.end));
 if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,Some(font),language,key) {
@@ -4047,35 +4132,35 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
 
     fn ascent_styled(&self, size: f32, font: &FontSpec) -> f32 {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .ascent(size * self.size_adjust_scale(font, index))
     }
 
     fn line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .line_height(size * self.size_adjust_scale(font, index))
     }
 
     fn normal_line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .normal_line_height(size * self.size_adjust_scale(font, index))
     }
 
     fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .underline_metrics(size * self.size_adjust_scale(font, index))
     }
 
     fn strike_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .strike_metrics(size * self.size_adjust_scale(font, index))
     }
@@ -4084,7 +4169,7 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
         let selection=self.metric_selection(font);
         let metric = |name: FontMetric, glyph: Option<&str>| {
             let index=match glyph{Some("0")=>selection.ch,Some("水")=>selection.ic,_=>selection.first};
-            let face = &self.faces[index].face;
+            let face = &self.font(index).face;
             let ratio = match name {
                 FontMetric::ChWidth => face.metrics[if upright_zero { 5 } else { 2 }],
                 FontMetric::IcWidth => face.metrics[if vertical { 4 } else { 3 }],
@@ -4102,7 +4187,7 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
 
     fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> FontRelativeMetrics {
         let index = self.metric_face_index(font);
-        self.faces[index]
+        self.font(index)
             .face
             .relative_metrics(size, self.size_adjust_scale(font, index))
     }
@@ -4554,7 +4639,7 @@ mod tests {
         let decoded=rustybuzz::Face::from_slice(&face.bytes,0).unwrap();
         for (base,expected) in [("ع",Script::Arabic),("ܐ",Script::Syriac)] {
             let full=format!("{base}{text}");
-            let context=ShapeContext{language:None,surrounding:Some(&full),start:base.len(),end:full.len(),variations:&[]};
+            let context=ShapeContext{language:None,surrounding:Some(&full),start:base.len(),end:full.len(),variations:&[],points_per_em:None};
             assert!(resolve_script(&decoded,selection,context)==expected,"only eligible surrounding script resolves the ambiguous set");
         }
     }

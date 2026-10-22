@@ -1540,6 +1540,7 @@ dependencies = [
  "fontdue",
  "lumen-common",
  "lumen-html",
+ "lumen-os",
  "read-fonts",
  "rustybuzz",
  "tiny-skia",
