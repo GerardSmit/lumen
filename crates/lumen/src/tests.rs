@@ -12128,3 +12128,57 @@ fn dynamic_function_large_body_skims_and_keeps_exact_text() {
         "true,true,true,true"
     );
 }
+
+#[test]
+fn compound_string_append_of_a_call_result_is_amortized_and_ordered() {
+    // `s += f(x)` keeps the accumulator uniquely referenced so it grows in place; a quadratic
+    // copy of 600k steps would take minutes.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        run_bytecode(
+            "function build(n) {
+               var s = '', fcc = String.fromCharCode;
+               for (var i = 0; i < n; i++) s += fcc(97 + (i % 26));
+               return s;
+             }
+             var big = build(600000);
+             big.length + ':' + big.slice(0, 5) + ':' + big.slice(-3)"
+        ),
+        "600000:abcde:vwx"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "append loop is quadratic");
+    // The left value is read before the right side runs; an assignment inside the right side
+    // keeps the original ordering, and non-string accumulators still coerce normally.
+    assert_eq!(
+        run_bytecode(
+            "function f() {
+               var a = 'x'; a += (a = 'y', 'z');
+               var n = 1; n += Math.abs(-2);
+               var o = { valueOf() { return 5; } }; o += Math.abs(-1);
+               var u; u += String(1);
+               var t = 'k'; t += [1, 2].join('-');
+               return [a, n, o, u, t].join('|');
+             }
+             f()"
+        ),
+        "xz|3|6|undefined1|k1-2"
+    );
+    // A closure or a mapped `arguments` object can reassign the local while the right side runs;
+    // the left operand is still the value read before it.
+    assert_eq!(
+        run_bytecode(
+            "function h(p) {
+               var s = 'a'; function g() { s = 'b'; return 'c'; } s += g();
+               p += (arguments[0] = 'q', 'z');
+               var e = 'm'; e += eval(\"e = 'n'; 'o'\");
+               return [s, p, e].join('|');
+             }
+             h('p')"
+        ),
+        "ac|pz|mo"
+    );
+    assert_eq!(
+        run_bytecode("function g() { try { s += String(1); } catch (e) { return e.name; } let s = ''; } g()"),
+        "ReferenceError"
+    );
+}

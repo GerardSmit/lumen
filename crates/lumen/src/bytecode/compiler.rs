@@ -3383,6 +3383,25 @@ impl Compiler {
                     }
                     if op == "=" {
                         self.named_expr(value, name)?;
+                    } else if op == "+="
+                        && !self.tdz_pending.contains(&slot)
+                        && !matches!(
+                            value,
+                            Expr::Ident(_) | Expr::Str(_) | Expr::Num(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined
+                        )
+                        && no_assign_to(value, name)
+                    {
+                        // The right side lands in a temp first so the peephole fuses the
+                        // accumulator into `ArithLL`, which appends in place (a stack copy of
+                        // the left string would make every step copy the whole accumulation).
+                        // Reading the slot after the right side is unobservable: the right side
+                        // cannot reassign it.
+                        self.expr(value)?;
+                        let tmp = self.fresh_slot("");
+                        self.emit(Op::StoreLocal(tmp));
+                        self.emit(Op::LoadLocal(slot));
+                        self.emit(Op::LoadLocal(tmp));
+                        self.emit_compound(op)?;
                     } else {
                         self.emit(Op::LoadLocal(slot));
                         self.expr(value)?;
