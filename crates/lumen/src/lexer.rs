@@ -29,6 +29,8 @@ thread_local! {
     pub(crate) static PEAK_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The bodies [`Lexer::skip_body`] jumped over on this thread.
     pub(crate) static SKIPPED_BODIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bodies [`Lexer::skip_body`] jumped over on this thread by a recorded hint.
+    pub(crate) static HINTED_BODIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The body being skimmed: where its `{` sits in the output and the source.
@@ -281,7 +283,22 @@ struct Lexer<'a> {
     idents: crate::fasthash::FastSet<Name>,
     /// See [`LexOpts::offset`].
     offset: u32,
+    /// Where the function bodies a skim jumped over end, from the lex that already scanned them.
+    hints_in: Option<Rc<SkimHints>>,
+    /// The function bodies the skim scans cross, recorded for later re-lexes of enclosing bodies.
+    hints_out: Option<SkimHints>,
+    hints_paused: bool,
+    scan_heads: Vec<bool>,
+    scan_fns: Vec<(u32, u32)>,
 }
+
+/// The `function` bodies seen while skimming, sorted by the offset of their `{`: with each, the
+/// offset of its `}` shifted left once, with the low bit set if a line break precedes that `}`.
+/// A body re-lexed later jumps to the recorded `}` instead of scanning to it again.
+pub(crate) type SkimHints = Vec<(u32, u32)>;
+
+const HINT_OPEN: u32 = u32::MAX;
+const HINT_MIN_BYTES: u32 = 512;
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
 pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
@@ -308,6 +325,7 @@ pub(crate) struct Lexed {
     pub tokens: TokVec,
     /// Byte ranges of the `/** */` comments, when asked for.
     pub docs: Vec<(u32, u32)>,
+    pub skim_hints: SkimHints,
     /// TypeScript only: the error the lexer stopped at. The tokens end there (with an `Eof`), and
     /// the parser reports it unless re-lexing a mis-guessed `/` from an earlier token gets past
     /// it (a regex misread as a division can run into a string or template).
@@ -333,6 +351,8 @@ pub(crate) struct LexOpts {
     /// tokens of a body being skimmed are dropped as they are lexed, so even one huge body is
     /// never held whole.
     pub skim_min_depth: Option<u32>,
+    /// Record the bodies skimmed over (see [`SkimHints`]) in [`Lexed::skim_hints`].
+    pub record_hints: bool,
 }
 
 /// [`tokenize_range`] with [`LexOpts`]; also returns the recorded JSDoc comment ranges.
@@ -366,9 +386,18 @@ const SCRATCH_IDENTS: usize = 32 * 1024;
 pub(crate) struct LexScratch {
     idents: crate::fasthash::FastSet<Name>,
     chunk: Option<Vec<Token>>,
+    hints: Option<Rc<SkimHints>>,
 }
 
 impl LexScratch {
+    /// A scratch whose lexes jump over the bodies `hints` records.
+    pub(crate) fn with_hints(hints: SkimHints) -> Self {
+        LexScratch {
+            hints: (!hints.is_empty()).then(|| Rc::new(hints)),
+            ..Self::default()
+        }
+    }
+
     /// Keep the allocation of `tokens`, which the caller is done with, for the next lex.
     pub(crate) fn recycle(&mut self, tokens: TokVec) {
         if let Some(chunk) = tokens.into_first_chunk() {
@@ -428,6 +457,11 @@ pub(crate) fn tokenize_pieces_with<'a>(
         start_div: opts.start_div,
         idents: std::mem::take(&mut scratch.idents),
         offset: opts.offset,
+        hints_in: scratch.hints.clone(),
+        hints_out: opts.record_hints.then(Vec::new),
+        hints_paused: false,
+        scan_heads: Vec::new(),
+        scan_fns: Vec::new(),
     };
     let ran = lx.run(pieces);
     scratch.idents = std::mem::take(&mut lx.idents);
@@ -443,8 +477,15 @@ pub(crate) fn tokenize_pieces_with<'a>(
     Ok(Lexed {
         tokens: lx.out,
         docs: lx.docs.unwrap_or_default(),
+        skim_hints: lx.hints_out.take().map_or_else(Vec::new, finish_hints),
         soft_err,
     })
+}
+
+fn finish_hints(mut hints: SkimHints) -> SkimHints {
+    hints.retain(|&(open, close)| close != HINT_OPEN && (close >> 1) - open >= HINT_MIN_BYTES);
+    hints.shrink_to_fit();
+    hints
 }
 
 impl<'a> Lexer<'a> {
@@ -662,12 +703,30 @@ impl<'a> Lexer<'a> {
     /// body is lexed token by token and any lex error comes out as it always did.
     fn skip_body(&mut self) {
         let start = self.pos;
+        if let Some((close, nl)) = self.hinted_close() {
+            self.pos = close;
+            self.line += self.bytes[start..close].iter().filter(|&&b| b == b'\n').count() as u32;
+            self.nl_pending = nl;
+            #[cfg(test)]
+            {
+                SKIPPED_BODIES.with(|n| n.set(n.get() + 1));
+                HINTED_BODIES.with(|n| n.set(n.get() + 1));
+            }
+            return;
+        }
         let mark = self.br.mark();
         let docs = self.docs.as_ref().map(Vec::len);
+        let hints = self.hints_out.as_ref().map(Vec::len);
         let mut nl = false;
-        if self.skip_to_close(Prev::Punct(Punct::LBrace), &mut nl).is_none() {
+        let skipped = self.skip_to_close(Prev::Punct(Punct::LBrace), &mut nl);
+        self.scan_heads.clear();
+        self.scan_fns.clear();
+        if skipped.is_none() {
             self.br.rewind(&mark);
             if let (Some(found), Some(len)) = (self.docs.as_mut(), docs) {
+                found.truncate(len);
+            }
+            if let (Some(found), Some(len)) = (self.hints_out.as_mut(), hints) {
                 found.truncate(len);
             }
             self.pos = start;
@@ -679,52 +738,74 @@ impl<'a> Lexer<'a> {
         SKIPPED_BODIES.with(|n| n.set(n.get() + 1));
     }
 
+    /// The `}` (and whether a line break precedes it) that a previous scan found closing the body
+    /// whose `{` was just lexed.
+    fn hinted_close(&self) -> Option<(usize, bool)> {
+        let hints = self.hints_in.as_ref().filter(|_| self.docs.is_none())?;
+        let open = self.tok_start as u32 + self.offset;
+        let at = hints.binary_search_by_key(&open, |h| h.0).ok()?;
+        let packed = hints[at].1;
+        let close = ((packed >> 1).checked_sub(self.offset)?) as usize;
+        (close >= self.pos && self.bytes.get(close) == Some(&b'}')).then_some((close, packed & 1 == 1))
+    }
+
     /// Advance to the `}` that closes the brace level the lexer is at (not consuming it),
     /// tracking just enough of the token stream to tell a regex from a division. `nl` ends up
     /// whether a line terminator separates the last token from that `}`. Line numbers are left
     /// to the caller.
+    #[allow(unused_assignments)]
     fn skip_to_close(&mut self, start: Prev, nl: &mut bool) -> Option<()> {
         let (bytes, src) = (self.bytes, self.src);
         let (base_braces, base_parens, base_fns) =
             (self.br.braces.len(), self.br.parens.len(), self.br.pending_fn.len());
         let (mut prev, mut before) = (start, Prev::Start);
         let mut pos = self.pos;
+        let rec = self.hints_out.is_some()
+            && !self.hints_paused
+            && self.offset as usize + bytes.len() < 1 << 30;
+        // After `function`, `function *`, `function name` / `function * name`: 1, 2, 3.
+        let mut fn_head = 0u8;
+        let mut last_head = false;
         macro_rules! token {
             ($class:expr) => {{
                 before = prev;
                 prev = $class;
                 *nl = false;
+                fn_head = 0;
             }};
         }
         loop {
             let b = *bytes.get(pos)?;
-            match b {
-                b' ' | b'\t' | 0x0B | 0x0C => pos += 1,
-                b'\n' | b'\r' => {
+            match SCAN_CLASS[b as usize] {
+                SC_SPACE => {
+                    pos += 1;
+                    continue;
+                }
+                SC_NEWLINE => {
                     *nl = true;
                     pos += 1;
+                    continue;
                 }
-                b'"' | b'\'' => {
+                SC_QUOTE => {
                     pos = string_end(bytes, pos)?;
                     token!(Prev::Operand);
+                    continue;
                 }
-                b'`' => {
+                SC_TEMPLATE => {
                     self.pos = pos + 1;
                     self.skip_template()?;
                     pos = self.pos;
                     token!(Prev::Operand);
+                    continue;
                 }
-                b'0'..=b'9' => {
+                SC_DIGIT => {
                     pos = number_end(bytes, pos);
                     token!(Prev::Operand);
+                    continue;
                 }
-                b'.' if bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) => {
-                    pos = number_end(bytes, pos + 1);
-                    token!(Prev::Operand);
-                }
-                b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
-                    let from = if b == b'#' { pos + 1 } else { pos };
-                    if !bytes.get(from).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'$')) {
+                SC_IDENT | SC_HASH => {
+                    let from = pos + usize::from(b == b'#');
+                    if !bytes.get(from).is_some_and(|&c| IDENT_START_BYTE[c as usize]) {
                         return None;
                     }
                     let end = ident_end(bytes, from);
@@ -732,79 +813,144 @@ impl<'a> Lexer<'a> {
                         return None;
                     }
                     let word = &src[pos..end];
-                    pos = end;
-                    let class = match keyword(word).filter(|_| b != b'#') {
+                    let head = fn_head;
+                    let mut next_head = 0;
+                    let class = match (end - pos > 1 && b != b'#').then(|| keyword(word)).flatten() {
                         Some(kw) => {
                             match kw {
-                                Keyword::Function => self.br.function_keyword(prev),
+                                Keyword::Function => {
+                                    self.br.function_keyword(prev);
+                                    next_head = u8::from(!matches!(
+                                        prev,
+                                        Prev::Punct(Punct::Dot | Punct::OptChain)
+                                    ));
+                                }
                                 Keyword::Class => self.br.class_keyword(prev),
                                 _ => {}
                             }
                             Prev::Kw(kw)
                         }
-                        None => Prev::of_ident(word),
+                        None => {
+                            next_head = if matches!(head, 1 | 2) { 3 } else { 0 };
+                            if end - pos == 5 { Prev::of_ident(word) } else { Prev::Ident }
+                        }
                     };
-                    token!(class);
-                }
-                b'/' if bytes.get(pos + 1) == Some(&b'/') => pos = line_comment_end(bytes, pos),
-                b'/' if bytes.get(pos + 1) == Some(&b'*') => {
-                    let (end, has_nl) = block_comment_end(bytes, pos)?;
-                    if let Some(docs) = &mut self.docs {
-                        if bytes.get(pos + 2) == Some(&b'*') && end - pos > 4 {
-                            docs.push((pos as u32, end as u32));
-                        }
-                    }
-                    *nl |= has_nl;
                     pos = end;
+                    token!(class);
+                    fn_head = next_head;
+                    continue;
                 }
-                b'/' if prev.regex_allowed(false, &self.br) => {
-                    pos = regex_end(bytes, pos)?;
+                SC_DOT if bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) => {
+                    pos = number_end(bytes, pos + 1);
                     token!(Prev::Operand);
+                    continue;
                 }
-                b'<' if self.html_comments && bytes[pos..].starts_with(b"<!--") => return None,
-                b'-' if self.html_comments
-                    && bytes[pos..].starts_with(b"-->")
-                    && (*nl || prev == Prev::Start) =>
-                {
-                    return None
-                }
-                0xE2 if is_ls_ps(bytes, pos) => {
-                    *nl = true;
-                    pos += 3;
-                }
-                b if b < 0x80 => {
-                    let p = scan_punct(&bytes[pos..])?;
-                    match p {
-                        Punct::LParen => self.br.open_paren(prev, before),
-                        Punct::RParen => {
-                            if self.br.parens.len() <= base_parens {
-                                return None;
-                            }
-                            self.br.close_paren();
+                SC_SLASH => {
+                    match bytes.get(pos + 1) {
+                        Some(b'/') => {
+                            pos = line_comment_end(bytes, pos);
+                            continue;
                         }
-                        Punct::LBrace => {
-                            let pops_outer_fn = prev == Prev::Punct(Punct::RParen)
-                                && self.br.pending_class.is_none()
-                                && base_fns > 0
-                                && self.br.pending_fn.len() <= base_fns;
-                            if pops_outer_fn {
-                                return None;
+                        Some(b'*') => {
+                            let (end, has_nl) = block_comment_end(bytes, pos)?;
+                            if let Some(docs) = &mut self.docs {
+                                if bytes.get(pos + 2) == Some(&b'*') && end - pos > 4 {
+                                    docs.push((pos as u32, end as u32));
+                                }
                             }
-                            self.br.open_brace(prev);
-                        }
-                        Punct::RBrace => {
-                            if self.br.braces.len() == base_braces {
-                                self.pos = pos;
-                                return (self.br.parens.len() == base_parens).then_some(());
-                            }
-                            self.br.close_brace();
+                            *nl |= has_nl;
+                            pos = end;
+                            continue;
                         }
                         _ => {}
                     }
-                    pos += p.as_str().len();
-                    token!(Prev::Punct(p));
+                    if prev.regex_allowed(false, &self.br) {
+                        pos = regex_end(bytes, pos)?;
+                        token!(Prev::Operand);
+                        continue;
+                    }
                 }
-                _ => return None,
+                SC_LT if self.html_comments && bytes[pos..].starts_with(b"<!--") => return None,
+                SC_MINUS
+                    if self.html_comments
+                        && bytes[pos..].starts_with(b"-->")
+                        && (*nl || prev == Prev::Start) =>
+                {
+                    return None
+                }
+                SC_E2 => {
+                    if !is_ls_ps(bytes, pos) {
+                        return None;
+                    }
+                    *nl = true;
+                    pos += 3;
+                    continue;
+                }
+                SC_BAIL => return None,
+                _ => {}
+            }
+            let p = scan_punct(&bytes[pos..])?;
+            let head = fn_head;
+            match p {
+                Punct::LParen => {
+                    self.br.open_paren(prev, before);
+                    if rec {
+                        self.scan_heads.push(head != 0);
+                    }
+                }
+                Punct::RParen => {
+                    if self.br.parens.len() <= base_parens {
+                        return None;
+                    }
+                    self.br.close_paren();
+                    if rec {
+                        last_head = self.scan_heads.pop().unwrap_or(false);
+                    }
+                }
+                Punct::LBrace => {
+                    let pops_outer_fn = prev == Prev::Punct(Punct::RParen)
+                        && self.br.pending_class.is_none()
+                        && base_fns > 0
+                        && self.br.pending_fn.len() <= base_fns;
+                    if pops_outer_fn {
+                        return None;
+                    }
+                    let class_body = self.br.open_brace(prev);
+                    if rec {
+                        let fn_body = !class_body && last_head && prev == Prev::Punct(Punct::RParen);
+                        let slot = match (fn_body, self.hints_out.as_mut()) {
+                            (true, Some(found)) => {
+                                found.push((pos as u32 + self.offset, HINT_OPEN));
+                                found.len() as u32 - 1
+                            }
+                            _ => HINT_OPEN,
+                        };
+                        self.scan_fns.push((slot, self.br.parens.len() as u32));
+                    }
+                }
+                Punct::RBrace => {
+                    if self.br.braces.len() == base_braces {
+                        self.pos = pos;
+                        return (self.br.parens.len() == base_parens).then_some(());
+                    }
+                    self.br.close_brace();
+                    if rec {
+                        if let Some((slot, parens)) = self.scan_fns.pop() {
+                            if slot != HINT_OPEN && parens as usize == self.br.parens.len() {
+                                if let Some(found) = self.hints_out.as_mut() {
+                                    let close = (pos as u32 + self.offset) << 1 | u32::from(*nl);
+                                    found[slot as usize].1 = close;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            pos += p.len();
+            token!(Prev::Punct(p));
+            if p == Punct::Star && head == 1 {
+                fn_head = 2;
             }
         }
     }
@@ -831,7 +977,9 @@ impl<'a> Lexer<'a> {
                     }
                     self.pos = at + 2;
                     let outer = std::mem::take(&mut self.br);
+                    let paused = std::mem::replace(&mut self.hints_paused, true);
                     let closed = self.skip_to_close(Prev::Start, &mut false);
+                    self.hints_paused = paused;
                     self.br = outer;
                     closed?;
                     self.pos += 1;
@@ -922,6 +1070,26 @@ impl<'a> Lexer<'a> {
                     return Ok(());
                 }
                 CLASS_PUNCT => return self.read_punct(),
+                CLASS_QUOTE => return self.read_string(c),
+                CLASS_DIGIT => return self.read_number(),
+                CLASS_DOT => {
+                    return if self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit) {
+                        self.read_number()
+                    } else {
+                        self.read_punct()
+                    };
+                }
+                CLASS_ANGLE => {
+                    let next = self.bytes.get(self.pos + 1).copied();
+                    let special = if c == '<' {
+                        self.jsx || (self.html_comments && next == Some(b'!'))
+                    } else {
+                        self.html_comments && next == Some(b'-')
+                    };
+                    if !special {
+                        return self.read_punct();
+                    }
+                }
                 _ => {}
             }
         }
@@ -1028,6 +1196,22 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_ident(&mut self) -> Result<(), LexError> {
+        let from = self.pos;
+        if self.bytes.get(from).is_some_and(|&b| IDENT_START_BYTE[b as usize]) {
+            let end = ident_end(self.bytes, from + 1);
+            if !self.bytes.get(end).is_some_and(|&b| b == b'\\' || b >= 0x80) {
+                self.pos = end;
+                let text = &self.src[from..end];
+                match keyword(text) {
+                    Some(kw) => self.push(Tok::Keyword(kw)),
+                    None => {
+                        let name = self.intern(text);
+                        self.push(Tok::Ident(name));
+                    }
+                }
+                return Ok(());
+            }
+        }
         let mut s = String::new();
         // A leading `#` (private name) is part of the identifier but not an ident-continue char.
         if self.peek() == Some('#') {
@@ -1185,6 +1369,10 @@ impl<'a> Lexer<'a> {
             return Ok(());
         }
         let mut s = String::new();
+        if let Some(end) = end {
+            s.push_str(&self.src[from..end]);
+            self.pos = end;
+        }
         let mut had_escape = false;
         loop {
             match self.bump() {
@@ -1199,7 +1387,16 @@ impl<'a> Lexer<'a> {
                 Some(c) if is_line_terminator(c) => {
                     return Err(self.err("unterminated string literal"))
                 }
-                Some(c) => s.push(c),
+                Some(c) => {
+                    s.push(c);
+                    let rest = &self.bytes[self.pos..];
+                    let run = rest
+                        .iter()
+                        .position(|&b| matches!(b, b'\\' | b'\n' | b'\r') || b == quote as u8)
+                        .unwrap_or(rest.len());
+                    s.push_str(&self.src[self.pos..self.pos + run]);
+                    self.pos += run;
+                }
             }
         }
         self.push(Tok::Str(Name::new(&s)));
@@ -1460,7 +1657,26 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Four hex digits at the cursor, consumed.
+    fn take_hex4(&mut self) -> Option<u32> {
+        let digits = self.bytes.get(self.pos..self.pos + 4)?;
+        let mut n = 0;
+        for &d in digits {
+            n = n << 4 | (d as char).to_digit(16)?;
+        }
+        self.pos += 4;
+        Some(n)
+    }
+
     fn read_unicode_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+        let n = match self.take_hex4() {
+            Some(n) => n,
+            None => self.read_unicode_escape_digits()?,
+        };
+        self.finish_unicode_escape(n, out)
+    }
+
+    fn read_unicode_escape_digits(&mut self) -> Result<u32, LexError> {
         let mut hex = String::new();
         if self.peek() == Some('{') {
             self.bump();
@@ -1483,6 +1699,10 @@ impl<'a> Lexer<'a> {
         if n > 0x10FFFF {
             return Err(self.err("undefined Unicode code-point"));
         }
+        Ok(n)
+    }
+
+    fn finish_unicode_escape(&mut self, n: u32, out: &mut String) -> Result<(), LexError> {
         if n >= crate::jstr::SMUGGLE_BASE {
             crate::jstr::push_char_utf16(out, char::from_u32(n).unwrap_or('\u{FFFD}'));
             return Ok(());
@@ -1569,6 +1789,27 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_number(&mut self) -> Result<(), LexError> {
+        let start = self.pos;
+        let mut end = start;
+        let mut value = 0u64;
+        while let Some(d) = self.bytes.get(end).filter(|d| d.is_ascii_digit()) {
+            value = value * 10 + u64::from(d - b'0');
+            end += 1;
+            if end - start > 15 {
+                break;
+            }
+        }
+        let plain = end > start
+            && end - start <= 15
+            && (end - start == 1 || self.bytes[start] != b'0')
+            && !self.bytes.get(end).is_some_and(|&c| {
+                IDENT_BYTE[c as usize] || matches!(c, b'.' | b'\\') || c >= 0x80
+            });
+        if plain {
+            self.pos = end;
+            self.push(Tok::Num(Num::new(value as f64)));
+            return Ok(());
+        }
         self.read_number_inner()?;
         // The SourceCharacter following a NumericLiteral must not be an IdentifierStart or digit.
         if self
@@ -1743,7 +1984,7 @@ impl<'a> Lexer<'a> {
                 self.peek().unwrap_or('\0')
             )));
         };
-        self.pos += p.as_str().len();
+        self.pos += p.len();
         self.push(Tok::Punct(p));
         Ok(())
     }
@@ -1752,8 +1993,12 @@ impl<'a> Lexer<'a> {
 /// The longest punctuator at the start of `b` (maximal munch, the same as scanning `PUNCTUATORS`,
 /// which lists longer spellings first). `?.` followed by a digit is `?` then `.` (a conditional
 /// like `x ? .5 : .3`), not optional chaining.
+#[inline]
 fn scan_punct(b: &[u8]) -> Option<Punct> {
     let c0 = *b.first()?;
+    if let Some(Some(p)) = SINGLE_PUNCT.get(c0 as usize) {
+        return Some(*p);
+    }
     let at = |k: usize| b.get(k).copied().unwrap_or(0);
     let (c1, c2) = (at(1), at(2));
     Some(match c0 {
@@ -1845,6 +2090,23 @@ fn scan_punct(b: &[u8]) -> Option<Punct> {
         _ => return None,
     })
 }
+
+/// The punctuators that no longer spelling starts with.
+static SINGLE_PUNCT: [Option<Punct>; 128] = {
+    let mut t = [None; 128];
+    t[b'{' as usize] = Some(Punct::LBrace);
+    t[b'}' as usize] = Some(Punct::RBrace);
+    t[b'(' as usize] = Some(Punct::LParen);
+    t[b')' as usize] = Some(Punct::RParen);
+    t[b'[' as usize] = Some(Punct::LBracket);
+    t[b']' as usize] = Some(Punct::RBracket);
+    t[b';' as usize] = Some(Punct::Semi);
+    t[b',' as usize] = Some(Punct::Comma);
+    t[b'~' as usize] = Some(Punct::Tilde);
+    t[b':' as usize] = Some(Punct::Colon);
+    t[b'@' as usize] = Some(Punct::At);
+    t
+};
 
 /// Whether `bytes[at]` and the two bytes after it are U+2028 or U+2029.
 fn is_ls_ps(bytes: &[u8], at: usize) -> bool {
@@ -1950,12 +2212,73 @@ static IDENT_BYTE: [bool; 256] = {
     t
 };
 
+/// ASCII IdentifierStart bytes (letters, `_`, `$`).
+static IDENT_START_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        t[i] = b.is_ascii_alphabetic() || b == b'_' || b == b'$';
+        i += 1;
+    }
+    t
+};
+
+const SC_BAIL: u8 = 0;
+const SC_SPACE: u8 = 1;
+const SC_NEWLINE: u8 = 2;
+const SC_QUOTE: u8 = 3;
+const SC_TEMPLATE: u8 = 4;
+const SC_DIGIT: u8 = 5;
+const SC_IDENT: u8 = 6;
+const SC_HASH: u8 = 7;
+const SC_DOT: u8 = 8;
+const SC_SLASH: u8 = 9;
+const SC_LT: u8 = 10;
+const SC_MINUS: u8 = 11;
+const SC_E2: u8 = 12;
+const SC_PUNCT: u8 = 13;
+
+/// What [`Lexer::skip_to_close`] does with each byte; `SC_BAIL` bytes (non-ASCII text,
+/// backslashes, control characters) hand the body back to the token-by-token lexer.
+static SCAN_CLASS: [u8; 256] = {
+    let mut t = [SC_BAIL; 256];
+    let mut i = 0;
+    while i < 128 {
+        let b = i as u8;
+        t[i] = match b {
+            b' ' | b'\t' | 0x0B | 0x0C => SC_SPACE,
+            b'\n' | b'\r' => SC_NEWLINE,
+            b'"' | b'\'' => SC_QUOTE,
+            b'`' => SC_TEMPLATE,
+            b'0'..=b'9' => SC_DIGIT,
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => SC_IDENT,
+            b'#' => SC_HASH,
+            b'.' => SC_DOT,
+            b'/' => SC_SLASH,
+            b'<' => SC_LT,
+            b'-' => SC_MINUS,
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b',' | b':' | b'~' | b'@' | b'='
+            | b'!' | b'*' | b'%' | b'^' | b'&' | b'|' | b'+' | b'>' | b'?' => SC_PUNCT,
+            _ => SC_BAIL,
+        };
+        i += 1;
+    }
+    t[0xE2] = SC_E2;
+    t
+};
+
 const CLASS_OTHER: u8 = 0;
 const CLASS_IDENT: u8 = 1;
 const CLASS_SPACE: u8 = 2;
 const CLASS_NEWLINE: u8 = 3;
 /// A punctuator that can never start a comment, regex, number, string, template or JSX element.
 const CLASS_PUNCT: u8 = 4;
+const CLASS_QUOTE: u8 = 5;
+const CLASS_DIGIT: u8 = 6;
+const CLASS_DOT: u8 = 7;
+/// `-` and `<`, which can start an HTML-like comment (or `<` a JSX element).
+const CLASS_ANGLE: u8 = 8;
 
 /// What [`Lexer::step`] can decide from an ASCII byte alone; everything else takes the general path.
 const ASCII_CLASS: [u8; 128] = {
@@ -1965,6 +2288,10 @@ const ASCII_CLASS: [u8; 128] = {
         let b = i as u8;
         t[i] = match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' | b'#' => CLASS_IDENT,
+            b'"' | b'\'' => CLASS_QUOTE,
+            b'0'..=b'9' => CLASS_DIGIT,
+            b'.' => CLASS_DOT,
+            b'-' | b'<' => CLASS_ANGLE,
             b' ' | b'\t' => CLASS_SPACE,
             b'\n' => CLASS_NEWLINE,
             b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b',' | b':' | b'~' | b'?' | b'='
@@ -1998,16 +2325,21 @@ fn prop_has(name: &str, c: char) -> bool {
         })
         .unwrap_or(false)
 }
+/// Per first byte, a bit for each length (up to 14) of a reserved word starting with it.
+static KEYWORD_LENS: [u16; 128] = {
+    let mut t = [0u16; 128];
+    let mut i = 0;
+    while i < crate::token::KEYWORDS.len() {
+        let w = crate::token::KEYWORDS[i].as_bytes();
+        t[w[0] as usize] |= 1 << w.len();
+        i += 1;
+    }
+    t
+};
 /// The reserved word spelled `s` (one of `token::KEYWORDS`).
 fn keyword(s: &str) -> Option<Keyword> {
-    // Every reserved word is 2..=10 lowercase letters starting with one of these.
     let first = *s.as_bytes().first()?;
-    if !(2..=10).contains(&s.len())
-        || !matches!(
-            first,
-            b'b' | b'c' | b'd' | b'e' | b'f' | b'i' | b'n' | b'r' | b's' | b't' | b'v' | b'w'
-        )
-    {
+    if first >= 0x80 || KEYWORD_LENS[first as usize] & (1 << s.len().min(15)) == 0 {
         return None;
     }
     Some(match s {
@@ -2252,5 +2584,246 @@ mod tests {
             let full = tokenize_goal(&src, true).err().expect("error");
             assert_eq!((skimmed.message, skimmed.line, skimmed.at_eof), (full.message, full.line, full.at_eof), "{body:?}");
         }
+    }
+
+    #[test]
+    fn skipper_regex_after_keywords_and_control_headers() {
+        assert_skips_like_full_lex(" throw /}/; typeof /{/; void /}/; delete o[/}/]; x = a in /}/; ");
+        assert_skips_like_full_lex(" if (a) x(); else /}/.test(1); do /{/.test(1); while (0); ");
+        assert_skips_like_full_lex(" switch (a) { case /}/.source: break; default: /{/.test(a); } ");
+        assert_skips_like_full_lex(" x = f(a) / 2; y = (a + b) / 2 / c; z = a ? b : /}/; ");
+        assert_skips_like_full_lex(" for (;;) /}/.test(a); with (o) /{/.test(a); ");
+        assert_skips_like_full_lex(" z = [1] / 2; w = a.b / 2 / c; ");
+    }
+
+    #[test]
+    fn skipper_ignores_brackets_and_quotes_inside_comments() {
+        assert_skips_like_full_lex(" /* ' \" ` { ( [ */ x(); // \" ' ` } ) ]\n y(); ");
+        assert_skips_like_full_lex(" x = 1; /* } */ /* { */ y = 2; //}\n//{\nz = 3; ");
+        assert_skips_like_full_lex(" /**/ x(); /***/ y(); /*/ } /*/ z(); ");
+    }
+
+    #[test]
+    fn skipper_handles_script_end_tag_lookalikes() {
+        assert_skips_like_full_lex(" var s = '</script>'; var t = `</script>${1}</script>`; var r = /<\\/script>/; ");
+        assert_skips_like_full_lex(" x = a < b > c; y = a </ 2 /; ");
+        assert_skips_like_full_lex(" x = '<!--'; y = `-->`; z = /-->/; ");
+    }
+
+    #[test]
+    fn skipper_html_like_comments_follow_the_lexer() {
+        assert_skips_like_full_lex(" x = a-->b; y = a --> b; ");
+        let (skimmed, full) = tails_after_first_body("function f() { x();\n--> c }\n y(); }\nafter(1);\n", 0);
+        assert_eq!(skimmed, full);
+        let (skimmed, full) = tails_after_first_body("function f() { x = 1; <!-- }\n y(); }\nafter(1);\n", 0);
+        assert_eq!(skimmed, full);
+    }
+
+    #[test]
+    fn skipper_falls_back_on_escaped_identifiers() {
+        for body in [" var \\u0061b = 1; ", " x = a\\u0062c; ", " x = \\u{62}c; ", " o.\\u0061 = 1; "] {
+            let src = format!("function f() {{{body}}}\nafter(1);\n");
+            let (skimmed, full) = tails_after_first_body(&src, 0);
+            assert_eq!(skimmed, full, "{body:?}");
+        }
+        assert_skips_like_full_lex(" var s = '\\u0061'; var t = `\\u{62}`; var r = /\\u0063/; ");
+    }
+
+    #[test]
+    fn skipper_handles_deeply_nested_templates() {
+        assert_skips_like_full_lex(" `a${`b${`c${ {x: '}'}.x }${`d`}`}`}` + `${ [1, 2].map(function (v) { return `${v}`; }) }`; ");
+        assert_skips_like_full_lex(" `${ a / 2 }` / 3; `${ /}/.test(1) }`; `$` + `$$`+ `\\${}`; ");
+    }
+
+    #[test]
+    fn skipper_handles_classes_private_names_and_generators() {
+        assert_skips_like_full_lex(" class A { #x = 1; m() { return this.#x / 2; } static { y(); } } /}/.test(1); ");
+        assert_skips_like_full_lex(" var A = class { get x() { return 1; } }; var d = A / 2; ");
+        assert_skips_like_full_lex(" function* g() { yield /}/; } /}/.test(g); ");
+        assert_skips_like_full_lex(" x = async () => { await /}/; }; y = a => a / 2; ");
+    }
+
+    fn describe_full(t: &Token) -> (String, u32, bool, u32, u32) {
+        let (text, line, nl) = describe(t);
+        (text, line, nl, t.start, t.end)
+    }
+
+    /// Lex `src`'s outermost body with skim hints from a lex of the whole `src`, and without;
+    /// the tokens must agree, and `hits` bodies must have been jumped over by a hint.
+    fn assert_hints_replay(src: &str, hits: usize) {
+        let open = src.find('{').unwrap();
+        let body = &src[open..=src.rfind('}').unwrap()];
+        let opts = LexOpts {
+            skim_min_depth: Some(0),
+            record_hints: true,
+            ..LexOpts::default()
+        };
+        let hints = tokenize_opts(src, true, 1, opts).unwrap().skim_hints;
+        assert!(hints.windows(2).all(|w| w[0].0 < w[1].0), "{hints:?}");
+        let line = 1 + src[..open].matches('\n').count() as u32;
+        let relex = |scratch: &mut LexScratch| {
+            let opts = LexOpts {
+                skim_min_depth: Some(0),
+                offset: open as u32,
+                ..LexOpts::default()
+            };
+            tokenize_pieces_with(&[body], true, line, opts, scratch).unwrap().tokens
+        };
+        HINTED_BODIES.with(|n| n.set(0));
+        let plain = relex(&mut LexScratch::default());
+        assert_eq!(HINTED_BODIES.with(|n| n.get()), 0);
+        let hinted = relex(&mut LexScratch::with_hints(hints));
+        assert_eq!(HINTED_BODIES.with(|n| n.get()), hits, "{src:?}");
+        let tokens = |toks: &TokVec| -> Vec<_> { toks.iter_from(0).map(describe_full).collect() };
+        assert_eq!(tokens(&hinted), tokens(&plain), "{src:?}");
+    }
+
+    fn pad() -> String {
+        format!("/*{}*/", " ".repeat(HINT_MIN_BYTES as usize))
+    }
+
+    #[test]
+    fn skim_hints_replay_nested_bodies() {
+        let pad = pad();
+        assert_hints_replay(
+            &format!("function o() {{ function a(x) {{ {pad} return x / 2; }}\n function b() {{ {pad} }} a(1) }}"),
+            2,
+        );
+        assert_hints_replay(
+            &format!("function o() {{ var f = function* g() {{ {pad} yield /}}/; }}; var h = function () {{ {pad} \n}} }}"),
+            2,
+        );
+        assert_hints_replay(
+            &format!("function o() {{ if (a) {{ b(); }} for (;;) {{ c(); }} var x = function y(a, b) {{ {pad} if (a) {{ return `${{ function () {{ {pad} }} }}`; }} }} }}"),
+            1,
+        );
+        assert_hints_replay(
+            &format!("function o() {{ var k = {{ get a() {{ {pad} }}, b() {{ {pad} }}, function() {{ {pad} }} }}; var l = (m) => {{ {pad} }}; }}"),
+            1,
+        );
+        assert_hints_replay(
+            &format!("function o() {{ x = function () {{ {pad} }}\n/ 2 / 3; y = function () {{ {pad} }} / 2; }}"),
+            2,
+        );
+    }
+
+    #[test]
+    fn skim_hints_skip_small_and_unbalanced_bodies() {
+        let opts = LexOpts {
+            skim_min_depth: Some(0),
+            record_hints: true,
+            ..LexOpts::default()
+        };
+        let src = "function o() { function small() { return 1; } var t = function () { ( }; ) }";
+        let hints = tokenize_opts(src, true, 1, opts).unwrap().skim_hints;
+        assert!(hints.is_empty(), "{hints:?}");
+        let src = format!("function o() {{ function big() {{ {} (; }} ; )}} }}", pad());
+        let hints = tokenize_opts(&src, true, 1, opts).map(|l| l.skim_hints).unwrap_or_default();
+        assert!(hints.is_empty(), "{hints:?}");
+    }
+
+    #[test]
+    fn skim_hints_record_body_end_and_line_break() {
+        let opts = LexOpts {
+            skim_min_depth: Some(0),
+            record_hints: true,
+            ..LexOpts::default()
+        };
+        let src = format!("function o() {{ function a() {{ {}\n}} function b() {{ {} }} }}", pad(), pad());
+        let hints = tokenize_opts(&src, true, 1, opts).unwrap().skim_hints;
+        assert_eq!(hints.len(), 2);
+        let close_a = src.find("\n}").unwrap() + 1;
+        assert_eq!(hints[0], (src.find("{ /*").unwrap() as u32 + 0, (close_a as u32) << 1 | 1));
+        let close_b = src.rfind("} }").unwrap();
+        assert_eq!(hints[1].1, (close_b as u32) << 1);
+    }
+
+    fn num_values(src: &str) -> Vec<f64> {
+        tokenize(src)
+            .unwrap()
+            .iter()
+            .filter_map(|t| match t.kind {
+                Tok::Num(n) => Some(n.get()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_integer_literals_take_the_fast_path_and_agree_with_the_slow_one() {
+        assert_eq!(num_values("0 1 42 999999999999999 1000000000000000"), [0.0, 1.0, 42.0, 999999999999999.0, 1e15]);
+        assert_eq!(num_values("9007199254740993 12345678901234567890"), [9007199254740992.0, 12345678901234567890.0]);
+        assert_eq!(num_values("1.5 .5 1e3 1E-2 0x1F 0b11 0o17 1_000 010 08 1.e2"), [1.5, 0.5, 1000.0, 0.01, 31.0, 3.0, 15.0, 1000.0, 8.0, 8.0, 100.0]);
+        assert_eq!(num_values("a[1]+2;3,4)5"), [1.0, 2.0, 3.0, 4.0, 5.0]);
+        for bad in ["12abc", "1$", "0_1", "1\\u0061", "3in x", "5é"] {
+            assert!(tokenize(bad).is_err(), "{bad:?}");
+        }
+        assert!(tokenize("1n 0n 12345678901234567890n").is_ok());
+        assert!(tokenize("1 in x").is_ok());
+    }
+
+    fn str_values(src: &str) -> Vec<String> {
+        tokenize(src)
+            .unwrap()
+            .iter()
+            .filter_map(|t| match &t.kind {
+                Tok::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strings_with_escapes_copy_plain_runs_between_them() {
+        assert_eq!(
+            str_values(r#" "ab\ncd" 'x\'y' "\u0041\u{1F600}z" "é\tü" "a\
+b" "\ud83d\ude00!" "\x41\101" "tail\\" "#),
+            ["ab\ncd", "x'y", "A\u{1F600}z", "é\tü", "ab", "\u{1F600}!", "AA", "tail\\"]
+        );
+        assert_eq!(str_values("'\u{2028}a\\nb\u{2029}'"), ["\u{2028}a\nb\u{2029}"]);
+        let long = "x".repeat(200);
+        assert_eq!(str_values(&format!("\"{long}\\n{long}\"")), [format!("{long}\n{long}")]);
+        for bad in ["\"abc\\u12\"", "\"abc\\u12zz\"", "'a\nb'", "'abc\\", "\"\\u{110000}\""] {
+            assert!(tokenize(bad).is_err(), "{bad:?}");
+        }
+        let toks = tokenize("'a\\\nb'\nx").unwrap();
+        assert_eq!(toks[1].line(), 3);
+    }
+
+    #[test]
+    fn keyword_table_matches_the_word_list() {
+        for k in KEYWORDS {
+            for near in [format!("{k}x"), k[..k.len() - 1].to_string(), k.to_uppercase(), format!("_{k}")] {
+                assert!(keyword(&near).is_none() || KEYWORDS.contains(&near.as_str()), "{near}");
+            }
+        }
+        for word in ["a", "z", "of", "async", "let", "static", "yield", "await", "get", "set"] {
+            assert_eq!(keyword(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn punct_len_is_the_spelling_length() {
+        for p in PUNCTUATORS {
+            let toks = tokenize(&format!("x {p} ")).unwrap();
+            let Tok::Punct(q) = toks[1].kind else { panic!("{p}") };
+            assert_eq!(q.len(), q.as_str().len(), "{p}");
+        }
+    }
+
+    #[test]
+    fn dot_minus_and_angle_tokens_dispatch_like_the_general_path() {
+        let kinds = |src: &str, html: bool| -> Vec<String> {
+            tokenize_goal(src, html)
+                .unwrap()
+                .iter_from(0)
+                .map(|t| describe(t).0)
+                .collect()
+        };
+        assert_eq!(kinds("a.b ...c .5 a--b a-b a<b a<=b", true), ["a", ".", "b", "...", "c", "Num(0.5)", "a", "--", "b", "a", "-", "b", "a", "<", "b", "a", "<=", "b", "eof"]);
+        assert_eq!(kinds("a<!--b\nc", true), ["a", "c", "eof"]);
+        assert_eq!(kinds("a\n--> b\nc", true), ["a", "c", "eof"]);
+        assert_eq!(kinds("a<!--b", false), ["a", "<", "!", "--", "b", "eof"]);
+        assert_eq!(kinds("a\n--> b", false), ["a", "--", ">", "b", "eof"]);
     }
 }

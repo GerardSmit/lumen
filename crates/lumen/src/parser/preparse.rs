@@ -90,6 +90,7 @@ impl Parser {
             scopes: Vec::new(),
             private: Vec::new(),
             depth: 0,
+            stmts: 0,
             chain: 0,
             last_paren: false,
         };
@@ -121,6 +122,7 @@ struct Pre<'a> {
     scopes: Vec<DeclScope>,
     private: Vec<Name>,
     depth: u32,
+    stmts: u32,
     chain: u32,
     last_paren: bool,
 }
@@ -300,7 +302,7 @@ impl<'a> Pre<'a> {
 
     fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH || (self.depth & 3 == 1 && crate::stack::exhausted()) {
+        if self.depth > MAX_DEPTH || (self.depth & 15 == 1 && crate::stack::exhausted()) {
             return None;
         }
         let r = f(self);
@@ -330,7 +332,8 @@ impl<'a> Pre<'a> {
     // ----- statements -------------------------------------------------------------------------
 
     fn stmt(&mut self, single: bool) -> Option<S> {
-        if crate::stack::exhausted() {
+        self.stmts = self.stmts.wrapping_add(1);
+        if self.stmts & 7 == 0 && crate::stack::exhausted() {
             return None;
         }
         match self.kind() {

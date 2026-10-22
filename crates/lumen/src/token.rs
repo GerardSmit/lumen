@@ -348,6 +348,17 @@ pub enum Punct {
 }
 
 impl Punct {
+    /// The spelling's length in bytes (the variants are ordered longest first).
+    #[inline]
+    pub const fn len(self) -> usize {
+        match self as u8 {
+            0 => 4,
+            1..=10 => 3,
+            11..=32 => 2,
+            _ => 1,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Punct::UShrAssign => ">>>=",
@@ -657,6 +668,7 @@ impl TokVec {
         let i = self.len.checked_sub(1)?;
         Some(&mut self[i])
     }
+    #[inline]
     pub fn push(&mut self, t: Token) {
         match self.chunks.last_mut() {
             Some(c) if c.len() < CHUNK => {

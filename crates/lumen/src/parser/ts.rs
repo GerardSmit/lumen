@@ -732,6 +732,7 @@ impl Parser {
                     start_div: !regex,
                     offset: c as u32,
                     skim_min_depth: None,
+                    record_hints: false,
                 },
             )
         }

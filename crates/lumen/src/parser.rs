@@ -2,7 +2,9 @@
 //! tree. Any failure is a [`ParseError`], which the engine reports as a SyntaxError (parse phase).
 
 use crate::ast::*;
-use crate::lexer::{tokenize_pieces, tokenize_pieces_with, tokenize_range_pieces, LexOpts, LexScratch};
+use crate::lexer::{
+    tokenize_pieces, tokenize_pieces_with, tokenize_range_pieces, LexOpts, LexScratch, SkimHints,
+};
 use crate::srctext::Src;
 use crate::token::{Keyword, Name, Punct, RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
@@ -154,6 +156,7 @@ struct Lexed {
     tokens: TokVec,
     ts: Option<Box<ts::TsState>>,
     docs: Vec<(u32, u32)>,
+    skim_hints: SkimHints,
 }
 
 /// Lex a whole source for a parse, in TypeScript mode when `ts`. JSDoc comment spans are
@@ -178,6 +181,7 @@ fn lex_source(
         start_div: false,
         offset: 0,
         skim_min_depth: skim.then_some(u32::from(eager_outermost)),
+        record_hints: skim,
     };
     let lexed = tokenize_pieces(pieces, html, 1, opts).map_err(|e| ParseError {
         message: e.message,
@@ -193,6 +197,7 @@ fn lex_source(
         tokens: lexed.tokens,
         ts,
         docs: lexed.docs,
+        skim_hints: lexed.skim_hints,
     })
 }
 
@@ -297,6 +302,7 @@ fn parse_script_shared(
         tokens,
         ts: ts_state,
         docs,
+        skim_hints,
     } = lex_source(pieces, true, ts, jsx_options.is_some(), lazy, eager_outermost)?;
     let private_scope = (!private_names.is_empty()).then(|| {
         Rc::new(PrivateScope {
@@ -308,7 +314,7 @@ fn parse_script_shared(
         jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
-        lex_scratch: Default::default(),
+        lex_scratch: LexScratch::with_hints(skim_hints),
         pos: 0,
         src: shared.map_or_else(|| SrcMap::whole(src), SrcMap::whole_src),
         lazy,
@@ -556,12 +562,13 @@ fn parse_module_impl(
         tokens,
         ts: ts_state,
         docs,
+        skim_hints,
     } = lex_source(&[src], false, ts, jsx_options.is_some(), lazy, false)?;
     let mut p = Parser {
         jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
-        lex_scratch: Default::default(),
+        lex_scratch: LexScratch::with_hints(skim_hints),
         pos: 0,
         src: SrcMap::whole(src),
         lazy,
@@ -6608,6 +6615,14 @@ mod skimmed_body_tests {
         assert!(parse_script_lazy(&src).is_err());
         let ok = src.replace("let a; let a;", "let a; let b;");
         assert!(parse_script_lazy(&ok).is_ok());
+    }
+
+    #[test]
+    fn early_error_line_deep_in_hinted_bodies_is_exact() {
+        let src = nested_source("out = function inner() {\n\n let a;\n let a; };");
+        let want = src[..src.find("let a;\n let a;").unwrap()].matches('\n').count() as u32 + 1;
+        let err = parse_script_lazy(&src).err().expect("redeclaration");
+        assert_eq!(err.line, want + 1, "{}", err.message);
     }
 
     #[test]

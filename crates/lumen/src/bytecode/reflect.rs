@@ -86,7 +86,9 @@ pub(crate) fn note_source(src: &str) {
             .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
     }
     for name in ["arguments", "caller"] {
-        for (at, _) in src.match_indices(name) {
+        let mut from = 0;
+        while let Some(at) = lumen_common::search::find_from(src.as_bytes(), name.as_bytes(), from) {
+            from = at + name.len();
             let before = src[..at].trim_end().chars().next_back();
             let after = &src[at + name.len()..];
             if (before == Some('.') && ident_end(after))
