@@ -537,10 +537,10 @@ pub(crate) fn elem_get_num(
     let mptr = fb.load(PTR_MEM, c, l.mirror_ptr);
     let at = scaled(fb, mptr, i, 8);
     let bits = fb.load(MemKind::I64, at, 0);
-    let hole = fb.iconst(Type::I64, MIRROR_HOLE as i64);
-    let present = fb.icmp(IntCC::Ne, bits, hole);
     let f = fb.convert(ConvOp::Bitcast, Type::F64, bits);
-    fb.brif(present, done, &[f], classic, &[]);
+    // A hole is a NaN word: any NaN takes the property path.
+    let ordered = fb.fcmp(FloatCC::Eq, f, f);
+    fb.brif(ordered, done, &[f], classic, &[]);
     fb.seal_block(classic);
 
     // The mirror can't answer (off, short, or a hole): read the property itself.
@@ -1250,13 +1250,13 @@ pub(crate) fn view_elem_num(
     fb.seal_block(mirror);
     fb.seal_block(packed);
 
+    // A hole is a NaN word: any NaN (the hole, or a real NaN element) leaves to `miss`.
     fb.switch_to_block(mirror);
     let at = scaled(fb, base, ii, 8);
     let bits = fb.load(MemKind::I64, at, 0);
-    let hole = fb.iconst(Type::I64, MIRROR_HOLE as i64);
-    let present = fb.icmp(IntCC::Ne, bits, hole);
-    guard(fb, present, miss);
     let f = fb.convert(ConvOp::Bitcast, Type::F64, bits);
+    let ordered = fb.fcmp(FloatCC::Eq, f, f);
+    guard(fb, ordered, miss);
     fb.jump(done, &[f]);
 
     fb.switch_to_block(packed);

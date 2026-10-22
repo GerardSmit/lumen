@@ -2961,6 +2961,13 @@ pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write
                 return false;
             }
             *n = u32::MAX;
+            // Its sibling sites of the chunk that took views too turn hot with it: one
+            // recompile for all (they would otherwise each retire the code in turn).
+            for (k, v) in m.iter_mut() {
+                if k.0 == key.0 && *v != u32::MAX {
+                    *v = u32::MAX;
+                }
+            }
             true
         });
         if hot {

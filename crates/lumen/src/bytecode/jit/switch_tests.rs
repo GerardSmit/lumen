@@ -55,6 +55,15 @@ fn typed_array_numeric_keys_follow_integer_indexed_semantics() {
 }
 
 #[test]
+fn array_element_views_keep_holes_prototypes_and_mutation_semantics() {
+    agree_on_every_tier(
+        include_str!("switch_tests/vw1.js"),
+        include_str!("switch_tests/vw1.expected"),
+        false,
+    );
+}
+
+#[test]
 fn do_while_evaluates_its_test_once_per_iteration() {
     agree_on_every_tier(
         include_str!("switch_tests/dw1.js"),

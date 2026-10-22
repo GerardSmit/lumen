@@ -120,15 +120,18 @@ pub(crate) fn build(
     // locals of each new call unset, while a compile mid-loop saw them assigned).
     let mut fresh = vec![false; n_slots];
     let lenient = undef_ok.iter().any(|&u| u);
+    let unset = unset_at_entry(chunk, header, &an);
     for s in 0..n_slots {
         if an.touched[s] && widen.get(s) != Some(&Widen::Boxed) {
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
             let local = s >= chunk.n_params
                 && chunk.arguments_slot != Some(s as u16)
                 && chunk.rest_slot != Some(s as u16);
-            if (undef_ok.get(s).copied().unwrap_or(false) || (lenient && local))
+            let undef = undef_ok.get(s).copied().unwrap_or(false)
+                || (unset[s] && matches!(slots.get(s), Some(Value::Num(_))));
+            if (undef || (lenient && local))
                 && matches!(slots.get(s), Some(Value::Num(_) | Value::Undefined))
-                && (kinds[s] == Kind::Num || undef_ok.get(s).copied().unwrap_or(false))
+                && (kinds[s] == Kind::Num || undef)
             {
                 kinds[s] = Kind::Num;
                 fresh[s] = true;
@@ -200,6 +203,152 @@ pub(crate) fn build_fn(
         this_val,
         widen,
     )
+}
+
+/// The source of the receiver of the `GetElem` at `pc`, when a `LoadLocal` / `LoadName` /
+/// `LoadCap` in the same basic block produced it (the key and anything in between only add
+/// entries above it).
+fn elem_receiver(
+    chunk: &Chunk,
+    header: usize,
+    pc: usize,
+    lead: &impl Fn(usize) -> bool,
+    name_ref: impl Fn(usize) -> bool,
+) -> Option<Src> {
+    let mut at = 1usize;
+    let mut q = pc;
+    loop {
+        if q <= header || lead(q) {
+            return None;
+        }
+        q -= 1;
+        let (pops, pushes) = chunk.jit_stack_effect(q)?;
+        if at < pushes {
+            if pushes != 1 {
+                return None;
+            }
+            return match chunk.ops[q] {
+                Op::LoadLocal(s) => Some(Src::Slot(s)),
+                Op::LoadName(n, _) if name_ref(q) => Some(Src::Name(n)),
+                Op::LoadCap(n) => Some(Src::Cap(n)),
+                _ => None,
+            };
+        }
+        at = at - pushes + pops;
+    }
+}
+
+/// Per slot: the [`helpers::ta_code`] and whether it holds a typed array now, extended along the
+/// region's `LoadLocal(a); StoreLocal(b)` copies (`b` is fed typed arrays from `a`).
+fn ta_slot_info(
+    interp: &Interp,
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    slots: &[Value],
+    func_mode: bool,
+) -> (Vec<u32>, Vec<bool>) {
+    let n = chunk.n_slots;
+    let mut kinds: Vec<u32> = (0..n)
+        .map(|s| match slots.get(s) {
+            Some(Value::Obj(o)) => interp
+                .typed_arrays
+                .get(&(crate::value::Gc::as_ptr(o) as usize))
+                .map_or(0, |t| helpers::ta_code_of(t.kind)),
+            _ => 0,
+        })
+        .collect();
+    let mut is_ta: Vec<bool> = (0..n)
+        .map(|s| match slots.get(s) {
+            Some(Value::Obj(o)) => interp
+                .typed_arrays
+                .contains_key(&(crate::value::Gc::as_ptr(o) as usize)),
+            _ => false,
+        })
+        .collect();
+    if func_mode {
+        // The whole-function code compiles at entry, before the locals are set: use what the
+        // loop compiles of the chunk saw.
+        if let Some(TaSeen(seen)) = chunk.jit.fb_get::<TaSeen>(0) {
+            for (s, &k) in seen.iter().enumerate().take(n) {
+                if k != 0 && !is_ta[s] {
+                    is_ta[s] = true;
+                    kinds[s] = k;
+                }
+            }
+        }
+        return (kinds, is_ta);
+    }
+    if is_ta.iter().any(|&b| b) {
+        let end = backedge.min(chunk.ops.len().saturating_sub(1));
+        loop {
+            let mut changed = false;
+            for pc in header.max(1)..=end {
+                if let (Op::LoadLocal(a), Op::StoreLocal(b)) = (chunk.ops[pc - 1], chunk.ops[pc])
+                {
+                    let (a, b) = (a as usize, b as usize);
+                    if a < n && b < n && is_ta[a] && !is_ta[b] {
+                        is_ta[b] = true;
+                        if kinds[b] == 0 {
+                            kinds[b] = kinds[a];
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut seen = chunk
+            .jit
+            .fb_get::<TaSeen>(0)
+            .map_or_else(|| vec![0; n], |t| t.0);
+        seen.resize(n, 0);
+        for s in 0..n {
+            if is_ta[s] {
+                seen[s] = kinds[s].max(1);
+            }
+        }
+        chunk.jit.fb_put(0, TaSeen(seen));
+    }
+    (kinds, is_ta)
+}
+
+/// The slots that held typed arrays (with their [`helpers::ta_code`]) in any loop compile of a
+/// chunk; [`ChunkJit::fb_get`] feedback.
+#[derive(Clone)]
+struct TaSeen(Vec<u32>);
+
+/// Ops beyond which [`unset_at_entry`] does not scan the chunk.
+const MAX_UNSET_SCAN_OPS: usize = 8000;
+
+/// The locals of `chunk` that may still be `undefined` when the loop at `header` is entered from
+/// the chunk's start (a fresh call enters the loop with them unset, however many iterations the
+/// compile-triggering call had run): speculating them Number-only would fail the entry guards of
+/// the next call and recompile the loop.
+fn unset_at_entry(chunk: &Chunk, header: usize, region: &Analysis) -> Vec<bool> {
+    let n = chunk.ops.len();
+    let mut out = vec![false; chunk.n_slots];
+    if header == 0 || n > MAX_UNSET_SCAN_OPS {
+        return out;
+    }
+    let local: Vec<bool> = (0..chunk.n_slots)
+        .map(|s| {
+            region.touched[s]
+                && s >= chunk.n_params
+                && chunk.arguments_slot != Some(s as u16)
+                && chunk.rest_slot != Some(s as u16)
+        })
+        .collect();
+    let Ok(whole) = analyze(chunk, 0, n - 1, true) else {
+        return out;
+    };
+    let defd = Defd::new(chunk, 0, n - 1, &whole, &local, None);
+    for s in 0..chunk.n_slots {
+        out[s] = local[s] && defd.maybe_undef(s, header);
+    }
+    out
 }
 
 /// Whether the method-lookup inline cache `cache` (a `GetMethod`'s ways) resolved the name on
@@ -499,6 +648,8 @@ fn build_region(
             });
         }
 
+        let (ta_kinds_init, ta_slots_init) =
+            ta_slot_info(interp, chunk, header, backedge, slots, func_mode);
         let mut tr = Tr {
             prefetch: interp.jit_prefetch,
             pending_seal: Vec::new(),
@@ -544,23 +695,8 @@ fn build_region(
             dv_vars: HashMap::new(),
             bl_vars: HashMap::new(),
             push_vars: HashMap::new(),
-            ta_kinds: (0..n_slots)
-                .map(|s| match slots.get(s) {
-                    Some(Value::Obj(o)) => interp
-                        .typed_arrays
-                        .get(&(crate::value::Gc::as_ptr(o) as usize))
-                        .map_or(0, |t| helpers::ta_code_of(t.kind)),
-                    _ => 0,
-                })
-                .collect(),
-            ta_slots: (0..n_slots)
-                .map(|s| match slots.get(s) {
-                    Some(Value::Obj(o)) => interp
-                        .typed_arrays
-                        .contains_key(&(crate::value::Gc::as_ptr(o) as usize)),
-                    _ => false,
-                })
-                .collect(),
+            ta_kinds: ta_kinds_init,
+            ta_slots: ta_slots_init,
             hs_cur: Vec::new(),
             skip: None,
             chaining: false,
@@ -1732,6 +1868,49 @@ fn plan(
                 p.idx_facts.push((src, i));
             }
             if !p.arr_srcs.contains(&src) {
+                p.arr_srcs.push(src);
+            }
+        }
+    }
+    // Element reads of an array held in a local / binding, in a region that never calls out: a
+    // tracked element-storage view serves them (see `Tr::elem_read`).
+    let calls_out = ops[header..=backedge.min(ops.len() - 1)].iter().any(|op| {
+        matches!(
+            op,
+            Op::Call(_)
+                | Op::CallWithThis(_)
+                | Op::New(_)
+                | Op::CallSpread(_)
+                | Op::CallSpreadThis(_)
+                | Op::NewSpread(_)
+                | Op::ApplyArgs(..)
+                | Op::TailCall(..)
+                | Op::TailCallSpread(..)
+                | Op::SuperCall(_)
+                | Op::SuperCallSpread(_)
+        )
+    });
+    if !calls_out {
+        for pc in header..=backedge {
+            if !reach(pc) || helpers::ta_hot(chunk, pc) {
+                continue;
+            }
+            let src = match ops[pc] {
+                Op::GetElemLocal(s) if kinds[s as usize] == Kind::Boxed => Some(Src::Slot(s)),
+                Op::GetElem => elem_receiver(chunk, header, pc, &lead, |q| p.name_ref.contains(&q))
+                    .filter(|src| match src {
+                        Src::Slot(s) => kinds[*s as usize] == Kind::Boxed,
+                        _ => true,
+                    }),
+                _ => None,
+            };
+            let Some(src) = src else { continue };
+            let typed = match src {
+                Src::Slot(s) => matches!(slots.get(s as usize), Some(Value::Obj(o))
+                    if interp.typed_arrays.contains_key(&(crate::value::Gc::as_ptr(o) as usize))),
+                _ => false,
+            };
+            if !typed && !p.arr_srcs.contains(&src) {
                 p.arr_srcs.push(src);
             }
         }
@@ -3736,7 +3915,12 @@ impl<'a, 'f> Tr<'a, 'f> {
         let a = self.to_int32(x);
         let b = self.to_int32(y);
         let r = self.fb.binary(bop, a, b);
-        Ok(if kind == ArithKind::UShr {
+        // A shift by a nonzero constant leaves 31 bits: an int32 (so ToInt32 of it is itself).
+        let narrowed = matches!(
+            self.def_data(b),
+            Some(lumen_codegen::InstData::Iconst { imm, .. }) if imm & 31 != 0
+        );
+        Ok(if kind == ArithKind::UShr && !narrowed {
             let w = self.fb.convert(ConvOp::Uext, Type::I64, r);
             self.fb.convert(ConvOp::FromSint, Type::F64, w)
         } else {
@@ -8212,6 +8396,65 @@ impl<'a, 'f> Tr<'a, 'f> {
             if let Some(i) = drop {
                 self.drop_at(i);
             }
+            if want {
+                self.fb.jump(join, &[x]);
+            } else {
+                self.store_entry(at, Entry::Num(x));
+                self.fb.jump(join, &[]);
+            }
+            self.fb.seal_block(checked);
+            self.fb.switch_to_block(checked);
+        } else if let Some(a) = src
+            .and_then(|k| self.arr_vars.get(&k).copied())
+            .filter(|_| drop.is_none() && !ta_first)
+        {
+            // A tracked array: its element-storage view (refreshed here when stale) serves the
+            // read; a key outside it, a hole or a non-Number takes the ordinary path.
+            let checked = self.fb.create_block();
+            let have = self.fb.create_block();
+            let refresh = self.fb.create_block();
+            let kind = self.fb.use_var(a.kind);
+            let zero = self.i32c(0);
+            let valid = self.fb.icmp(IntCC::Ne, kind, zero);
+            self.fb.brif(valid, have, &[], refresh, &[]);
+            self.fb.seal_block(refresh);
+            self.fb.switch_to_block(refresh);
+            let len = layout::length(&mut self.fb, obj, checked);
+            self.seal_current();
+            let (k, base, count) = layout::array_view(&mut self.fb, obj);
+            self.fb.def_var(a.kind, k);
+            self.fb.def_var(a.base, base);
+            self.fb.def_var(a.count, count);
+            self.fb.def_var(a.len, len);
+            let zero = self.i32c(0);
+            let some = self.fb.icmp(IntCC::Ne, k, zero);
+            self.fb.brif(some, have, &[], checked, &[]);
+            self.fb.seal_block(have);
+            self.fb.switch_to_block(have);
+            let kind = self.fb.use_var(a.kind);
+            let base = self.fb.use_var(a.base);
+            let count = self.fb.use_var(a.count);
+            let ii = match self.int32_of(key) {
+                Some(x) if PTR == Type::I64 => self.fb.convert(ConvOp::Sext, PTR, x),
+                Some(x) => x,
+                None => {
+                    let i = self.to_index(key);
+                    let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+                    let exact = self.fb.fcmp(FloatCC::Eq, back, key);
+                    let go = self.fb.create_block();
+                    self.fb.brif(exact, go, &[], checked, &[]);
+                    self.fb.seal_block(go);
+                    self.fb.switch_to_block(go);
+                    i
+                }
+            };
+            let inb = self.fb.icmp(IntCC::Ult, ii, count);
+            let fast = self.fb.create_block();
+            self.fb.brif(inb, fast, &[], checked, &[]);
+            self.fb.seal_block(fast);
+            self.fb.switch_to_block(fast);
+            let x = layout::view_elem_num(&mut self.fb, kind, base, ii, checked);
+            self.seal_current();
             if want {
                 self.fb.jump(join, &[x]);
             } else {

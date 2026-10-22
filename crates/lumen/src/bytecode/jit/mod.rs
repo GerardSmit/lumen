@@ -1776,6 +1776,11 @@ fn enter(
                             }
                             if log_enabled() {
                                 eprintln!("[jit] loop {header}..={backedge} entry guards keep failing: recompiling");
+                                for (s, &k) in native.kinds.iter().enumerate() {
+                                    if let Some(v) = slots.get(s).filter(|v| k != Kind::Boxed && !k.accepts(v)) {
+                                        eprintln!("[jit]   slot {s}: {k:?} vs {}", v.type_of());
+                                    }
+                                }
                             }
                             l.code = None;
                         }
