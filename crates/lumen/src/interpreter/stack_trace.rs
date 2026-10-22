@@ -1607,6 +1607,49 @@ impl Interp {
         self.classic_script_context = previous;
         result
     }
+
+    /// [`run_classic_script`](Self::run_classic_script) with a persistent parse cache. `cached`
+    /// is a blob an earlier call returned for the same `source`: when it matches (source length
+    /// and hash, snapshot format) the script's AST is decoded from it instead of parsed, with
+    /// function bodies still parsed lazily on first call. Otherwise the source is parsed and,
+    /// when `record` is set, the blob for it is returned for the embedder to store. A blob from
+    /// another source or build only costs the failed check.
+    pub fn run_classic_script_cached(
+        &mut self,
+        source: &str,
+        context: Rc<crate::ClassicScriptContext>,
+        cached: Option<&[u8]>,
+        record: bool,
+    ) -> (Result<Value, super::Abrupt>, Option<Vec<u8>>) {
+        if crate::native_ops::dynamic_code_disabled() {
+            return (Err(self.throw("EvalError", "dynamic code is unavailable in native execution")), None);
+        }
+        let mut fresh = None;
+        let parsed = match cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, source)) {
+            Some(hit) => Ok(hit),
+            None => crate::parser::parse_classic_script(source).map(|(body, strict)| {
+                if record {
+                    fresh = Some(crate::snapshot::encode_script_cache(&body, strict, source));
+                }
+                (body, strict)
+            }),
+        };
+        let (body, strict) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let thrown = self.throw("SyntaxError", format!("{} (line {})", error.message, error.line));
+                return (Err(thrown), None);
+            }
+        };
+        let source_context = context.clone();
+        let previous = self.classic_script_context.replace(context);
+        let previous_strict = std::mem::replace(&mut self.strict, strict);
+        let name = (!source_context.base_url.is_empty()).then_some(source_context.base_url.as_str());
+        let result = self.run_program_named(&body, name).map_err(super::Abrupt::Throw);
+        self.strict = previous_strict;
+        self.classic_script_context = previous;
+        (result, fresh)
+    }
 }
 
 /// The tree-walker's description of a call's callee in its "… is not a function" TypeError

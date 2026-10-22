@@ -515,6 +515,33 @@ pub(crate) fn encode_split(
 /// Decode a snapshot blob back into a script body. `src` is the source it was encoded from; one
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
+const SCRIPT_CACHE_MAGIC: &[u8; 8] = b"LUMENSC1";
+
+/// A persistent parse cache entry for a classic script: header (magic, snapshot version, source
+/// length, strictness) then the [`encode`]d top-level AST, which checks the source hash itself.
+pub(crate) fn encode_script_cache(body: &[Stmt], strict: bool, src: &str) -> Vec<u8> {
+    let snapshot = encode(body, src);
+    let mut out = Vec::with_capacity(21 + snapshot.len());
+    out.extend_from_slice(SCRIPT_CACHE_MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&(src.len() as u64).to_le_bytes());
+    out.push(strict as u8);
+    out.extend_from_slice(&snapshot);
+    out
+}
+
+/// The AST and strictness [`encode_script_cache`] stored for exactly this `src`, or `None`.
+pub(crate) fn decode_script_cache(blob: &[u8], src: &str) -> Option<(Vec<Stmt>, bool)> {
+    let rest = blob.strip_prefix(SCRIPT_CACHE_MAGIC)?;
+    let (version, rest) = rest.split_first_chunk::<4>()?;
+    let (len, rest) = rest.split_first_chunk::<8>()?;
+    let (&strict, snapshot) = rest.split_first()?;
+    if u32::from_le_bytes(*version) != VERSION || u64::from_le_bytes(*len) != src.len() as u64 || strict > 1 {
+        return None;
+    }
+    decode(snapshot, src).ok().map(|body| (body, strict == 1))
+}
+
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
     decode_shared(bytes, Rc::from(src))
 }
