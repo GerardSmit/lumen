@@ -387,6 +387,12 @@ impl LexScratch {
         }
     }
 
+    /// This scratch with its skim hints replaced by `hints`.
+    pub(crate) fn with_new_hints(mut self, hints: SkimHints) -> Self {
+        self.hints = (!hints.is_empty()).then(|| Rc::new(hints));
+        self
+    }
+
     /// Keep the allocation of `tokens`, which the caller is done with, for the next lex.
     pub(crate) fn recycle(&mut self, tokens: TokVec) {
         if let Some(chunk) = tokens.into_first_chunk() {
@@ -395,6 +401,35 @@ impl LexScratch {
             }
         }
     }
+}
+
+/// Largest token chunk (in tokens) the lazy-body pool keeps between calls.
+const POOLED_CHUNK_MAX: usize = 8 * 1024;
+
+thread_local! {
+    static LAZY_SCRATCH: std::cell::Cell<Option<LexScratch>> = const { std::cell::Cell::new(None) };
+}
+
+/// The scratch left by the previous lazy body parse on this thread (empty if none).
+pub(crate) fn take_lazy_scratch() -> LexScratch {
+    LAZY_SCRATCH
+        .try_with(std::cell::Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Keep `scratch` for the next lazy body parse, unless its token chunk is large enough to be
+/// worth freeing rather than pinning.
+pub(crate) fn give_lazy_scratch(mut scratch: LexScratch) {
+    if scratch.chunk.as_ref().is_some_and(|c| c.capacity() > POOLED_CHUNK_MAX) {
+        scratch.chunk = None;
+    }
+    if scratch.idents.len() > SCRATCH_IDENTS {
+        scratch.idents.clear();
+    }
+    scratch.hints = None;
+    let _ = LAZY_SCRATCH.try_with(|c| c.set(Some(scratch)));
 }
 
 pub(crate) fn tokenize_pieces<'a>(
@@ -418,7 +453,11 @@ pub(crate) fn tokenize_pieces_with<'a>(
         scratch.idents.clear();
     }
     let out = match scratch.chunk.take() {
-        Some(chunk) => TokVec::from_chunk(chunk),
+        Some(mut chunk) => {
+            let est = pieces.iter().map(|p| p.len()).sum::<usize>() / 6 + 16;
+            chunk.reserve(est.min(POOLED_CHUNK_MAX));
+            TokVec::from_chunk(chunk)
+        }
         // About one token per six bytes of ordinary source.
         None => TokVec::with_capacity(pieces.iter().map(|p| p.len()).sum::<usize>() / 6 + 16),
     };

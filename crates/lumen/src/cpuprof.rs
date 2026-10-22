@@ -2,7 +2,7 @@
 //!
 //! ## Design
 //! A sampler thread ticks at the configured rate. A tick either lands in a *phase* the engine
-//! marked with [`phase`] (`(gc)`, `(parse)`, `(compile)`, `(jit-compile)`, `(idle)`), where the
+//! marked with [`phase`] (`(gc)`, `(parse)`, `(compile)`, `(jit-compile)`, `(idle)`, `(lazy-parse)`), where the
 //! engine thread cannot sample itself, and is counted there directly, or bumps the thread's
 //! pending tick count. The
 //! engine thread polls that counter at the safepoints that exist in every tier
@@ -39,15 +39,17 @@ pub enum Phase {
     Compile = 3,
     JitCompile = 4,
     Idle = 5,
+    LazyParse = 6,
 }
 
-const PHASE_NAMES: [&str; 6] = [
+const PHASE_NAMES: [&str; 7] = [
     "",
     "(gc)",
     "(parse)",
     "(compile)",
     "(jit-compile)",
     "(idle)",
+    "(lazy-parse)",
 ];
 
 /// JIT loop turns between safepoints while profiling (the low byte must stay 0, see `JitFrame`).
@@ -65,7 +67,7 @@ static SLOTS: Mutex<Vec<Weak<Slot>>> = Mutex::new(Vec::new());
 pub(crate) struct Slot {
     ticks: AtomicU32,
     phase: AtomicU8,
-    phase_ticks: [AtomicU64; 6],
+    phase_ticks: [AtomicU64; 7],
 }
 
 thread_local! {

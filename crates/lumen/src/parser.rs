@@ -807,7 +807,7 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 /// early errors the eager path would have reported at load.
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
-    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::Parse);
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::LazyParse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
     let pieces = lazy.src.pieces(s, e).ok_or_else(|| ParseError {
         message: "function body range lies outside its source".into(),
@@ -820,20 +820,20 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         record_hints: skim,
         ..LexOpts::default()
     };
-    let lexed = tokenize_pieces(&pieces, lazy.html_comments, lazy.line, opts).map_err(|e| {
-        ParseError {
+    let mut scratch = crate::lexer::take_lazy_scratch();
+    let lexed = tokenize_pieces_with(&pieces, lazy.html_comments, lazy.line, opts, &mut scratch)
+        .map_err(|e| ParseError {
             message: e.message,
             line: e.line,
             at_eof: false,
-        }
-    })?;
+        })?;
     let tokens = lexed.tokens;
     let ctx = lazy.ctx;
     let mut p = Parser {
         jsx: None,
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
-        lex_scratch: LexScratch::with_hints(lexed.skim_hints),
+        lex_scratch: scratch.with_new_hints(lexed.skim_hints),
         pos: 0,
         src: SrcMap::new(lazy.src.clone(), lazy.start, lazy.end),
         lazy: true,
@@ -902,7 +902,13 @@ pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, Pa
         line: lazy.line,
     })?;
     // A bundle's wrapper function body is the whole bundle, parsed here on first call.
+    let toks = std::mem::replace(&mut p.toks, Rc::new(TokVec::default()));
+    let mut scratch = std::mem::take(&mut p.lex_scratch);
     drop(p);
+    if let Ok(toks) = Rc::try_unwrap(toks) {
+        scratch.recycle(toks);
+    }
+    crate::lexer::give_lazy_scratch(scratch);
     release_parse_scratch(e - s);
     Ok(body)
 }
@@ -3551,11 +3557,11 @@ impl Parser {
         match self.cur().clone() {
             Tok::Ident(name) => {
                 self.advance();
-                Ok(name.to_string())
+                Ok(name.as_str().to_owned())
             }
             Tok::Keyword(k) => {
                 self.advance();
-                Ok(k.to_string())
+                Ok(k.as_str().to_owned())
             }
             _ => self.err("expected property name"),
         }
@@ -4145,11 +4151,11 @@ impl Parser {
         match self.cur().clone() {
             Tok::Ident(name) => {
                 self.advance();
-                Ok(PropKey::Ident(name.to_string()))
+                Ok(PropKey::Ident(name.as_str().to_owned()))
             }
             Tok::Keyword(k) => {
                 self.advance();
-                Ok(PropKey::Ident(k.to_string()))
+                Ok(PropKey::Ident(k.as_str().to_owned()))
             }
             Tok::Str(s) => {
                 self.advance();
