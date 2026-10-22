@@ -88,7 +88,7 @@ pub fn install(it: &mut Interp) {
     ] {
         let ctor = intl.borrow().props.get(svc).map(|p| p.value());
         if let Some(Value::Obj(c)) = ctor {
-            let key: &'static str = Box::leak(format!("%Intl.{svc}%").into_boxed_str());
+            let key: &'static str = lumen_common::static_str::intern(&format!("%Intl.{svc}%"));
             it.extra_protos.insert(key, c);
         }
     }
@@ -272,7 +272,7 @@ pub(crate) fn make_service(
         );
     }
     it.extra_protos.insert(
-        Box::leak(format!("Intl.{name}").into_boxed_str()),
+        lumen_common::static_str::intern(&format!("Intl.{name}")),
         proto.clone(),
     );
     set_builtin(ns, name, Value::Obj(ctor.clone()));

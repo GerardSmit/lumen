@@ -538,7 +538,7 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
             let slot = format!("__locale_{k}");
             set_builtin(
                 &obj,
-                Box::leak(slot.into_boxed_str()),
+                lumen_common::static_str::intern(&slot),
                 Value::from_string(types.join("-")),
             );
         }

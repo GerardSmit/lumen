@@ -96,6 +96,7 @@ pub mod search;
 pub mod siphash;
 pub mod smuggle;
 pub mod stack;
+pub mod static_str;
 pub mod toggle_task;
 pub mod strftime;
 pub mod target;

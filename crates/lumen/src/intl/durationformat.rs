@@ -152,12 +152,12 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 
         set_builtin(
             &obj,
-            Box::leak(format!("__df_u_{plural}").into_boxed_str()),
+            lumen_common::static_str::intern(&format!("__df_u_{plural}")),
             Value::from_string(style.clone()),
         );
         set_builtin(
             &obj,
-            Box::leak(format!("__df_d_{plural}").into_boxed_str()),
+            lumen_common::static_str::intern(&format!("__df_d_{plural}")),
             Value::from_string(display),
         );
         // prevStyle is updated only for hours..microseconds (nanoseconds and the calendar units do
@@ -693,7 +693,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         set_data(&res, plural, get(&format!("__df_u_{plural}")));
         set_data(
             &res,
-            Box::leak(format!("{plural}Display").into_boxed_str()),
+            lumen_common::static_str::intern(&format!("{plural}Display")),
             get(&format!("__df_d_{plural}")),
         );
     }
