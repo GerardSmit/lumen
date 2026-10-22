@@ -933,6 +933,13 @@ fn css_color(value: Rgba, raw: &str) -> String {
     computed_values::color(value)
 }
 
+fn display_color(value: &str) -> Option<String> {
+    if !color_values::structured(value) {
+        return None;
+    }
+    color_values::serialize_declared_display(value)
+}
+
 fn length_percentage(value: LengthPercentage) -> String {
     computed_values::lp(value)
 }
@@ -1526,6 +1533,31 @@ impl DeclarationBlock {
             self.entries = Vec::new();
         }
         Ok(old)
+    }
+
+    /// CSSOM readback of a property: stored structured colors keep exact nested
+    /// channels, and script observes their canonical 8-bit legacy serialization.
+    pub fn display_value(&self, name: &str) -> Option<(String, bool)> {
+        let (value, important) = self.value(name)?;
+        let value = match normalized_name(name) {
+            Some(name) if animation_color_property(&name) => display_color(&value).unwrap_or(value),
+            _ => value,
+        };
+        Some((value, important))
+    }
+
+    pub fn serialize_display(&self) -> Result<String, CssError> {
+        let mut block = self.clone();
+        for entry in &mut block.entries {
+            if let Specified::Text(text) = &mut entry.value {
+                if animation_color_property(&entry.name) {
+                    if let Some(display) = display_color(text) {
+                        *text = Arc::from(display);
+                    }
+                }
+            }
+        }
+        block.serialize()
     }
 
     pub fn serialize(&self) -> Result<String, CssError> {

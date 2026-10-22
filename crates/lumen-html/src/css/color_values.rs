@@ -341,23 +341,28 @@ fn serialize_channel(raw:&str,names:&[&'static str],computed:Option<(LengthConte
 /// Declared and unresolved-currentColor forms retain their canonical structure.
 /// Colors and channel math share the existing grammar and serializers.
 pub(super) fn serialize_declared(raw:&str,depth:u8)->Option<String> {
-    serialize_source(raw,depth,None)
+    serialize_source(raw,depth,None,true)
+}
+/// CSSOM readback form of a declared color: nested legacy colors use the 8-bit
+/// rgb serialization, while the stored declaration keeps their exact channels.
+pub(super) fn serialize_declared_display(raw:&str)->Option<String> {
+    serialize_source(raw,0,None,false)
 }
 /// Gradient/shadow declared endpoints preserve authored, unclipped channels.
 pub(super) fn serialize_declared_endpoint(raw:&str)->Option<String> {
-    serialize_origin(raw,0,None)
+    serialize_origin(raw,0,None,false)
 }
 pub(super) fn serialize_computed(raw:&str,context:LengthContext,query:ContainerUnitContext)->Option<String> {
-    serialize_source(raw,0,Some((context,query)))
+    serialize_source(raw,0,Some((context,query)),false)
 }
-fn serialize_source(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
+fn serialize_source(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>,exact:bool)->Option<String> {
     if raw.len()>super::MAX_CSS_BYTES {return None;}
     if let Some((context,_))=computed {
         if let Some((name,body))=raw.trim().split_once('(') {
             if identifier(name).is_some_and(|name|name=="light-dark") {
                 let parts=top_level_split(body.strip_suffix(')')?,b',',2)?;
                 let [light,dark]=parts.as_slice() else{return None;};
-                return serialize_source(if context.viewport.color_schemes.page().scheme==UsedColorScheme::Dark {dark}else{light},depth+1,computed);
+                return serialize_source(if context.viewport.color_schemes.page().scheme==UsedColorScheme::Dark {dark}else{light},depth+1,computed,exact);
             }
         }
     }
@@ -369,15 +374,15 @@ fn serialize_source(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUn
         }
         return serialize_nested(endpoint_with_current(raw,depth,from_rgba(super::Style::initial().color),context,query)?,!legacy(raw),depth>0);
     }
-    serialize_source_inner(raw,depth,computed).filter(|value|value.len()<=super::MAX_CSS_BYTES)
+    serialize_source_inner(raw,depth,computed,exact).filter(|value|value.len()<=super::MAX_CSS_BYTES)
 }
-fn serialize_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
-    if computed.is_some() {return serialize_source(raw,depth,computed);}
-    let Some((name,body))=raw.trim().split_once('(') else{return serialize_source(raw,depth,None);};
+fn serialize_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>,exact:bool)->Option<String> {
+    if computed.is_some() {return serialize_source(raw,depth,computed,exact);}
+    let Some((name,body))=raw.trim().split_once('(') else{return serialize_source(raw,depth,None,exact);};
     let name=identifier(name)?;
-    let canonical=match name.as_ref() {"rgba"=>"rgb","hsla"=>"hsl","rgb"|"hsl"|"hwb"|"lab"|"lch"|"oklab"|"oklch"|"color"=>name.as_ref(),_=>return serialize_source(raw,depth,None)};
+    let canonical=match name.as_ref() {"rgba"=>"rgb","hsla"=>"hsl","rgb"|"hsl"|"hwb"|"lab"|"lch"|"oklab"|"oklch"|"color"=>name.as_ref(),_=>return serialize_source(raw,depth,None,exact)};
     let body=body.strip_suffix(')')?;
-    if components(body)?.first().is_some_and(|token|decoded_css_keyword(token,"from")) {return serialize_source(raw,depth,None);}
+    if components(body)?.first().is_some_and(|token|decoded_css_keyword(token,"from")) {return serialize_source(raw,depth,None,exact);}
     endpoint(raw,depth)?;
     let mut values=color_components(body)?;
     let mut result=alloc::format!("{canonical}(");
@@ -392,16 +397,16 @@ fn serialize_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUn
     }
     result.push(')');Some(result)
 }
-fn serialize_relative_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
-    if computed.is_some() {return serialize_source(raw,depth,computed);}
-    let Some((name,body))=raw.trim().split_once('(') else{return serialize_source(raw,depth,None);};
+fn serialize_relative_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>,exact:bool)->Option<String> {
+    if computed.is_some() {return serialize_source(raw,depth,computed,exact);}
+    let Some((name,body))=raw.trim().split_once('(') else{return serialize_source(raw,depth,None,exact);};
     let name=identifier(name)?;
     let resolved=matches!(name.as_ref(),"rgb"|"rgba"|"hsl"|"hsla"|"hwb"|"lab"|"lch"|"oklab"|"oklch"|"color");
     let relative=components(body.strip_suffix(')')?).is_some_and(|parts|parts.first().is_some_and(|part|decoded_css_keyword(part,"from")));
-    if !resolved || relative {return serialize_source(raw,depth,None);}
-    serialize(endpoint(raw,depth)?,!legacy(raw))
+    if !resolved || relative {return serialize_source(raw,depth,None,exact);}
+    serialize_nested(endpoint(raw,depth)?,!legacy(raw),exact)
 }
-fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>)->Option<String> {
+fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUnitContext)>,exact:bool)->Option<String> {
     if depth>=8 {return None;}
     let raw=raw.trim();
     if decoded_css_keyword(raw,"currentcolor") {return Some("currentcolor".into());}
@@ -439,7 +444,7 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         }
         for (index,(color,weight,value)) in arguments.into_iter().enumerate() {
             if index!=0 {result.push_str(", ");}
-            result.push_str(&serialize_source(color,depth+1,computed)?);
+            result.push_str(&serialize_source(color,depth+1,computed,exact)?);
             if !omit_weights {
                 if let Some(raw)=weight {result.push(' ');result.push_str(&serialize_channel(raw,&[],computed)?);}
                 else if !unknown {result.push(' ');result.push_str(&typed_numeric::serialize_numeric_value(value.unwrap_or(omitted_weight),typed_numeric::NumericUnit::Percent));}
@@ -459,7 +464,7 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
             },"alpha"=>("alpha",2,&["alpha"]),_=>return None,
         };
         if head.len()!=start+usize::from(name!="alpha")*3 {return None;}
-        let mut result=alloc::format!("{name}(from {}",serialize_relative_origin(origin,depth+1,computed)?);
+        let mut result=alloc::format!("{name}(from {}",serialize_relative_origin(origin,depth+1,computed,exact)?);
         if name=="color" {result.push(' ');result.push_str(ColorSpace::named(identifier(head[2])?.as_ref())?.name());}
         for channel in &head[start..] {result.push(' ');result.push_str(&serialize_channel(channel,channels,computed)?);}
         if let Some(alpha)=head_parts.get(1) {
@@ -475,24 +480,24 @@ fn serialize_source_inner(raw:&str,depth:u8,computed:Option<(LengthContext,Conta
         if mode!="normal" {result.push_str(mode);result.push_str(", ");}
         for (index,layer) in layers.iter().enumerate() {
             if index!=0 {result.push_str(", ");}
-            result.push_str(&serialize_source(layer.trim(),depth+1,None)?);
+            result.push_str(&serialize_source(layer.trim(),depth+1,None,exact)?);
         }
         result.push(')');return Some(result);
     }
     if name=="contrast-color" && computed.is_none() {
-        return Some(alloc::format!("contrast-color({})",serialize_source(body,depth+1,None)?));
+        return Some(alloc::format!("contrast-color({})",serialize_source(body,depth+1,None,exact)?));
     }
     if name=="light-dark" {
         let parts=top_level_split(body,b',',2)?;let [light,dark]=parts.as_slice() else{return None;};
         if let Some((context,_))=computed {
-            return serialize_source(if context.viewport.color_schemes.page().scheme==UsedColorScheme::Dark {dark}else{light},depth+1,computed);
+            return serialize_source(if context.viewport.color_schemes.page().scheme==UsedColorScheme::Dark {dark}else{light},depth+1,computed,exact);
         }
-        return Some(alloc::format!("light-dark({}, {})",serialize_source(light,depth+1,computed)?,serialize_source(dark,depth+1,computed)?));
+        return Some(alloc::format!("light-dark({}, {})",serialize_source(light,depth+1,computed,exact)?,serialize_source(dark,depth+1,computed,exact)?));
     }
     if computed.is_none() {
         if let Some(text)=serialize_math_channels(&name,body,depth,false) {return Some(text);}
     }
-    serialize_nested(endpoint(raw,depth)?,!legacy(raw),depth>0 && computed.is_some())
+    serialize_nested(endpoint(raw,depth)?,!legacy(raw),depth>0 && (computed.is_some() || exact))
 }
 
 /// Non-legacy color functions keep math-function channels in their specified

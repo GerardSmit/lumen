@@ -21978,6 +21978,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             natural: (f32, f32),
             minimum: (f32, f32),
             measured: bool,
+            stretched_natural: Option<f32>,
             lane_position: f32,
             lane_extent: f32,
             baseline_origin: f32,
@@ -22234,6 +22235,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         natural: (0.0, 0.0),
                         minimum: (0.0, 0.0),
                         measured: false,
+                        stretched_natural: None,
                         lane_position: 0.0,
                         lane_extent: 0.0,
                         baseline_origin: 0.0,
@@ -22328,6 +22330,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 natural: (0.0, 0.0),
                 minimum: (0.0, 0.0),
                 measured: false,
+                stretched_natural: None,
                 lane_position: 0.0,
                 lane_extent: 0.0,
                 baseline_origin: 0.0,
@@ -23824,6 +23827,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     &computed,
                     constrained_height(&computed, (area_height - box_edges(&computed, false)).max(0.0)),
                 ));
+                item.stretched_natural = item.measured.then_some(item.natural.1);
             }
             if computed.grid_columns_subgrid || computed.grid_rows_subgrid {
                 let subrow_gap = if computed.gap_specified {
@@ -24246,16 +24250,20 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 baseline_descent[group][anchor].max(item.natural.1 - baseline);
         }
         // Block-axis min-content equals the height at the final inline size
-        // for items whose block axis is the grid's; orthogonal items and
-        // percentage-height items keep their measured minimum.
+        // for items whose block axis is the grid's; orthogonal, percentage-height
+        // and stretched items keep their measured sizes, because a stretched
+        // item was painted at the preliminary row height.
         let block_minimum = |item: &Item| -> f32 {
             let parallel = (item.style.writing_mode == css::WritingMode::HorizontalTb)
                 == (style.writing_mode == css::WritingMode::HorizontalTb);
-            if !axes.vertical && parallel && !item.style.has_cyclic_size_percentage(false) {
+            if !axes.vertical && parallel && item.stretched_natural.is_none() && !item.style.has_cyclic_size_percentage(false) {
                 item.natural.1
             } else {
                 item.minimum.1
             }
+        };
+        let block_natural = |item: &Item| -> f32 {
+            item.stretched_natural.unwrap_or(item.natural.1)
         };
         let baseline_contributions = items.iter().filter_map(|item| {
             let (group, _) = baseline_participation(
@@ -24296,7 +24304,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 start: item.row,
                 span: item.rows,
                 min_content: block_minimum(item) + shim,
-                max_content: item.natural.1 + shim,
+                max_content: block_natural(item) + shim,
                 automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
                     block_minimum(item) + shim,
                     box_edges(&item.style, axes.vertical),
@@ -24317,7 +24325,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     start: item.row,
                     span: item.rows,
                     min_content: block_minimum(item),
-                    max_content: item.natural.1,
+                    max_content: block_natural(item),
                     automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
                         block_minimum(item),
                         box_edges(&item.style, axes.vertical),

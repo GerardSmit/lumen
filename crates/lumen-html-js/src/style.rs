@@ -145,7 +145,7 @@ impl DomStyle {
     }
 
     fn declaration_value(&self, name: &str) -> OpResult<Option<(String, bool)>> {
-        Ok(self.read_declaration_block()?.value(name))
+        Ok(self.read_declaration_block()?.display_value(name))
     }
 
     pub(crate) fn adopt_node(&mut self, realm: Rc<DomRealm>, node: NodeId) {
@@ -419,7 +419,7 @@ impl DomStyle {
         Ok(self.read_declaration_block()?.as_ref().clone())
     }
     fn raw(&self) -> OpResult<String> {
-        self.read_declaration_block()?.serialize().map_err(css_error)
+        self.read_declaration_block()?.serialize_display().map_err(css_error)
     }
     pub(crate) fn write_block(&self, block: css::DeclarationBlock) -> OpResult<()> {
         if self.computed {
