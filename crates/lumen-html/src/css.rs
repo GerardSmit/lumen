@@ -18092,6 +18092,7 @@ fn border_edge_value(value: &Value, edge: usize) -> Option<Value> {
             Value::LogicalBorder(color_slot, LogicalBorderComponent::Color(*color))
         }
         Value::ColorRaw(10, raw) => Value::ColorRaw(color_slot, raw.clone()),
+        Value::SourceColor(10, source) => Value::SourceColor(color_slot, source.clone()),
         Value::BorderCurrentColor => {
             Value::LogicalBorder(color_slot, LogicalBorderComponent::CurrentColor)
         }
@@ -18763,12 +18764,13 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             };
             let Some((width,paint,style))=stroke_component_values(raw,9,10,false) else {continue;};
             let style=Value::BorderStyle(style.border_style());
+            let mut expanded=Vec::with_capacity(edges.len()*3);
             for &edge in edges {
                 for component in [&width,&paint,&style] {
-                    let Some(value)=border_edge_value(component,edge) else {unreachable!("canonical stroke component");};
-                    out.push(Declaration {value,important});
+                    if let Some(value)=border_edge_value(component,edge) {expanded.push(Declaration {value,important});}
                 }
             }
+            if expanded.len()==edges.len()*3 {out.extend(expanded);}
             continue;
         }
         if name == "column-rule" {
@@ -39612,6 +39614,29 @@ mod tests {
         for invalid in ["1px", "1.", "calc(1% + 1)", "clamp(0, 1)"] {
             assert!(!supports_declaration("opacity", invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn border_edge_shorthand_accepts_color_function_paint() {
+        let make = |raw: &str| NodeKind::Element {
+            namespace: Namespace::Html,
+            name: "div".into(),
+            attributes: alloc::vec![("style".into(), raw.into())],
+        };
+        let index = StyleIndex::new(Vec::new());
+        for raw in [
+            "border-bottom:1px solid color(display-p3 1 0 0)",
+            "border-top:2px dashed oklch(0.5 0.1 120)",
+            "border-inline-start:1px solid rgb(0 0 0 / 50%)",
+            "border:1px solid oklch(0.5 0.1 120)",
+        ] {
+            assert!(compute(&make(raw), None, &index).is_ok(), "{raw}");
+        }
+        let style = compute(&make("border-bottom:3px solid color(display-p3 1 0 0)"), None, &index).unwrap();
+        let named = compute(&make("border-bottom:3px solid red"), None, &index).unwrap();
+        assert_eq!(style.border_width_sides, named.border_width_sides);
+        assert_eq!(style.border_width, named.border_width);
+        assert_eq!(style.border_color_sides[2].is_some(), named.border_color_sides[2].is_some());
     }
 
     #[test]
