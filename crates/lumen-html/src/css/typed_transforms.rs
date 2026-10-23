@@ -516,6 +516,7 @@ fn combine_function(a:&ComputedFunction,b:&ComputedFunction,operation:registered
     use registered_properties::ComputedValueOperation as Op;
     if a.name=="perspective"&&b.name=="perspective"{return combine_perspective(a,b,operation);}
     if matches!(a.name.as_str(),"matrix"|"matrix3d"|"perspective"|"transform-interpolate")||matches!(b.name.as_str(),"matrix"|"matrix3d"|"perspective"|"transform-interpolate"){return None;}
+    if matches!((a.name.as_str(),b.name.as_str()),("skewx","skewy")|("skewy","skewx")){return None;}
     let (mut a,mut b)=if a.name==b.name&&a.arguments.len()==b.arguments.len(){(a.clone(),b.clone())}
         else if a.family()==b.family(){let three=a.three_dimensional()||b.three_dimensional();(a.primitive(three)?,b.primitive(three)?)}else{return None;};
     let start=if a.name=="rotate3d" {
@@ -575,7 +576,12 @@ pub(crate) fn combine_computed(from:&str,to:&str,operation:registered_properties
         return Some(if output.is_empty(){"none".into()}else{output});
     }
     let output=combine_sequences(&a,&b,operation,|function|function.identity(),
-        |a,b|combine_function(a,b,operation)?.serialize(),
+        |a,b|{
+            if matches!(a.name.as_str(),"matrix"|"matrix3d")&&matches!(b.name.as_str(),"matrix"|"matrix3d") {
+                return combine_matrices(a.matrix(reference)?,b.matrix(reference)?,operation);
+            }
+            combine_function(a,b,operation)?.serialize()
+        },
         |left,right|{
             let matrices=|functions:&[ComputedFunction]|functions.iter().try_fold(lumen_common::dom_geometry::Matrix::default(),|matrix,function|Some(matrix.multiply(function.matrix(reference)?)));
             if let (Some(a),Some(b))=(matrices(left),matrices(right)){return combine_matrices(a,b,operation);}
@@ -626,7 +632,7 @@ pub fn computed_matrix(input:&str,reference:Option<[f64;2]>)->Option<lumen_commo
 pub(super) fn matrix_css_value(matrix:lumen_common::dom_geometry::Matrix)->Option<String> {
     if !matrix.values.iter().all(|value|value.is_finite()){return None;}
     let values=if matrix.has_2d_components(){vec![matrix.values[0],matrix.values[1],matrix.values[4],matrix.values[5],matrix.values[12],matrix.values[13]]}else{matrix.values.to_vec()};
-    let args=values.into_iter().map(|value|typed_numeric::serialize_numeric_value(value,typed_numeric::NumericUnit::Number)).collect::<Vec<_>>();
+    let args=values.into_iter().map(super::computed_values::significant_digits_6).collect::<Vec<_>>();
     Some(alloc::format!("{}({})",if args.len()==6{"matrix"}else{"matrix3d"},args.join(", ")))
 }
 fn combine_matrices(left:lumen_common::dom_geometry::Matrix,right:lumen_common::dom_geometry::Matrix,operation:registered_properties::ComputedValueOperation)->Option<String> {
@@ -646,6 +652,10 @@ pub(crate) fn combine_resolved(from:&[Transform],to:&[Transform],operation:regis
     let scalar=|a:f32,b:f32,identity:f64|{let value=combine_scalar(a as f64,b as f64,operation,identity)? as f32;value.is_finite().then_some(value)};
     let length=|a:TransformLength,b:TransformLength|Some(TransformLength{pixels:scalar(a.pixels,b.pixels,0.0)?,percent:scalar(a.percent,b.percent,0.0)?});
     let pair=|a:&Transform,b:&Transform| {
+        if let (Transform::Matrix(left),Transform::Matrix(right))=(a,b) {
+            let matrix=|value:&crate::paint::Affine|Matrix::from_affine([value.a,value.b,value.c,value.d,value.e,value.f].map(f64::from));
+            return combine_matrices(matrix(left),matrix(right),operation);
+        }
         let result=match (*a,*b) {
             (Transform::Translate(ax,ay),Transform::Translate(bx,by))=>Transform::Translate(length(ax,bx)?,length(ay,by)?),
             (Transform::Scale(ax,ay),Transform::Scale(bx,by))=>Transform::Scale(scalar(ax,bx,1.0)?,scalar(ay,by,1.0)?),

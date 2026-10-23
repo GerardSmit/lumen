@@ -64,6 +64,25 @@ pub fn needs_layout(name: &str) -> bool {
         || matches!(name, "top" | "right" | "bottom" | "left")
 }
 
+/// Matrix coefficients serialize with six significant digits.
+pub(crate) fn matrix_number(value: f32) -> String {
+    significant_digits_6(f64::from(value))
+}
+
+pub(crate) fn round_significant_6(value: f64) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    let exponent = libm::floor(libm::log10(value.abs())) as i32 - 5;
+    let scale = libm::pow(10.0, f64::from(exponent.abs()));
+    if exponent >= 0 { libm::round(value / scale) * scale } else { libm::round(value * scale) / scale }
+}
+
+pub(crate) fn significant_digits_6(value: f64) -> String {
+    let rounded = round_significant_6(value);
+    if rounded == 0.0 || !rounded.is_finite() { String::from("0") } else { alloc::format!("{rounded}") }
+}
+
 pub(crate) fn number(value: f32) -> String {
     if value == 0.0 {
         String::from("0")
@@ -120,6 +139,10 @@ pub(crate) fn percentage(pixels: f32, percent: f32) -> String {
             number(pixels.abs())
         )
     }
+}
+/// A zero gradient center coordinate comes from `left`/`top` or `0%` far more often than `0px`.
+fn gradient_center(value: LengthPercentage) -> String {
+    if value.pixels == 0.0 && value.fraction == 0.0 { String::from("0%") } else { lp(value) }
 }
 pub(crate) fn lp(value: LengthPercentage) -> String {
     percentage(value.pixels, value.fraction * 100.0)
@@ -1304,7 +1327,7 @@ fn gradient(value: &Gradient) -> Option<String> {
             }
             if center!=[LengthPercentage {pixels:0.0,fraction:0.5};2] {
                 if !result.ends_with('(') {append(&mut result," ")?;}
-                append(&mut result,&alloc::format!("at {} {}",lp(center[0]),lp(center[1])))?;
+                append(&mut result,&alloc::format!("at {} {}",gradient_center(center[0]),gradient_center(center[1])))?;
             }
         }
         GradientKind::Conic { from, center } => {
@@ -1312,7 +1335,7 @@ fn gradient(value: &Gradient) -> Option<String> {
             if from != 0.0 { append(&mut result, &alloc::format!("from {}deg", number(from)))?; }
             if center != [LengthPercentage {pixels: 0.0, fraction: 0.5}; 2] {
                 if from != 0.0 { append(&mut result, " ")?; }
-                append(&mut result, &alloc::format!("at {} {}", lp(center[0]), lp(center[1])))?;
+                append(&mut result, &alloc::format!("at {} {}", gradient_center(center[0]), gradient_center(center[1])))?;
             }
             if let Some(method)=gradient_method(value) {
                 if !result.ends_with('(') {append(&mut result," ")?;}append(&mut result,&method)?;
@@ -2246,7 +2269,7 @@ impl Style {
                 else {
                     return Some("none".into());
                 };
-                if !context.resolved || (reference.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = reference.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(matrix.a), number(matrix.b), number(matrix.c), number(matrix.d), number(matrix.e), number(matrix.f)) }
+                if !context.resolved || (reference.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = reference.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", matrix_number(matrix.a), matrix_number(matrix.b), matrix_number(matrix.c), matrix_number(matrix.d), matrix_number(matrix.e), matrix_number(matrix.f)) }
             }
             _ => return None,
         })

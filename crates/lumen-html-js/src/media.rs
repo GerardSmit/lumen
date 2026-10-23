@@ -1,7 +1,7 @@
 //! HTML audio element state and its owner-local media command queue.
 
 use crate::events::HtmlTargetExt;
-use lumen::embed::{Ctx, Deferred, OpError, OpResult, Value};
+use lumen::embed::{Ctx, Deferred, OpError, OpResult, Value, WeakValue};
 use std::{
     collections::{HashMap, VecDeque},
     rc::Rc,
@@ -675,6 +675,31 @@ impl DomHtmlMediaElement {
     fn node(&self) -> &DomNode {
         &self.base.base.base
     }
+
+    fn snapshot(&self) -> MediaSnapshot {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node)
+    }
+
+    fn loaded_ranges(&self) -> Vec<(f64, f64)> {
+        let snapshot = self.snapshot();
+        if snapshot.ready_state == ReadyState::HaveNothing || !snapshot.duration.is_finite() {
+            Vec::new()
+        } else {
+            vec![(0.0, snapshot.duration)]
+        }
+    }
+
+    fn same_object(&self, ctx: &mut Ctx, key: &str, create: fn(&mut Ctx) -> Value) -> Value {
+        if let Some(existing) = self.node().collections.borrow().get(key).and_then(WeakValue::upgrade) {
+            return existing;
+        }
+        let value = create(ctx);
+        if let Some(weak) = ctx.weak_value(&value) {
+            self.node().collections.borrow_mut().insert(key.into(), weak);
+        }
+        value
+    }
 }
 
 #[lumen_bind::methods]
@@ -786,6 +811,203 @@ impl DomHtmlMediaElement {
         let result = realm.media.borrow_mut().set_playback_rate(node, value);
         result
     }
+
+    #[getter(rename(js = "currentSrc"))]
+    fn current_src(&self) -> String {
+        self.snapshot().source
+    }
+
+    fn play(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        if self.node().get_attribute("src")?.0.as_deref().unwrap_or("").is_empty() {
+            let kind = self.node().local_name()?.unwrap_or_default();
+            let deferred = Deferred::new(ctx);
+            let promise = deferred.promise();
+            deferred.reject(ctx, OpError::new("NotSupportedError", format!("{kind} element has no source")));
+            return Ok(promise);
+        }
+        Ok(self.node().realm.media.borrow_mut().play(ctx, self.node().id))
+    }
+
+    fn pause(&self, ctx: &mut Ctx) {
+        self.node().realm.media.borrow_mut().pause(ctx, self.node().id);
+    }
+
+    fn load(&self, ctx: &mut Ctx) {
+        self.node().realm.media_reload(ctx, self.node().id);
+    }
+
+    #[getter]
+    fn paused(&self) -> bool {
+        self.snapshot().paused
+    }
+
+    #[getter]
+    fn ended(&self) -> bool {
+        self.snapshot().ended
+    }
+
+    #[getter]
+    fn seeking(&self) -> bool {
+        false
+    }
+
+    #[getter(rename(js = "currentTime"))]
+    fn current_time(&self) -> f64 {
+        self.snapshot().current_time
+    }
+
+    #[setter(rename(js = "currentTime"), coerce)]
+    fn set_current_time(&self, value: f64) {
+        self.node().realm.media.borrow_mut().seek(self.node().id, value);
+    }
+
+    #[method(name = "fastSeek", coerce)]
+    fn fast_seek(&self, time: f64) {
+        self.node().realm.media.borrow_mut().seek(self.node().id, time);
+    }
+
+    #[getter]
+    fn duration(&self) -> f64 {
+        self.snapshot().duration
+    }
+
+    #[method(name = "getStartDate")]
+    fn get_start_date(&self, ctx: &mut Ctx) -> Value {
+        ctx.new_date_value(f64::NAN)
+    }
+
+    #[getter(rename(js = "readyState"))]
+    fn ready_state(&self) -> u8 {
+        self.snapshot().ready_state as u8
+    }
+
+    #[getter(rename(js = "networkState"))]
+    fn network_state(&self) -> u16 {
+        self.snapshot().network_state
+    }
+
+    #[getter]
+    fn buffered(&self, ctx: &mut Ctx) -> Value {
+        crate::media_extras::DomTimeRanges::new_value(ctx, self.loaded_ranges())
+    }
+
+    #[getter]
+    fn seekable(&self, ctx: &mut Ctx) -> Value {
+        crate::media_extras::DomTimeRanges::new_value(ctx, self.loaded_ranges())
+    }
+
+    #[getter]
+    fn played(&self, ctx: &mut Ctx) -> Value {
+        crate::media_extras::DomTimeRanges::new_value(ctx, Vec::new())
+    }
+
+    #[getter(name = "srcObject")]
+    fn src_object(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        ctx.native_private_value_slot(&this.0, SRC_OBJECT_SLOT).unwrap_or(Value::Null)
+    }
+
+    #[setter(name = "srcObject")]
+    fn set_src_object(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        let value = match value {
+            Value::Undefined | Value::Null => Value::Null,
+            Value::Obj(_) => value,
+            _ => return Err(OpError::type_error("srcObject must be a MediaStream, MediaSource, Blob or null")),
+        };
+        ctx.set_native_internal_value_slot(&this.0, SRC_OBJECT_SLOT, value).map_err(OpError::thrown)
+    }
+
+    #[getter(name = "audioTracks")]
+    fn audio_tracks(&self, ctx: &mut Ctx) -> Value {
+        self.same_object(ctx, "audioTracks", crate::media_extras::audio_track_list)
+    }
+
+    #[getter(name = "videoTracks")]
+    fn video_tracks(&self, ctx: &mut Ctx) -> Value {
+        self.same_object(ctx, "videoTracks", crate::media_extras::video_track_list)
+    }
+
+    #[getter]
+    fn volume(&self) -> f64 {
+        self.snapshot().volume
+    }
+
+    #[setter(coerce)]
+    fn set_volume(&self, value: f64) -> OpResult<()> {
+        self.node().realm.media.borrow_mut().set_volume(self.node().id, value)
+    }
+
+    #[getter]
+    fn muted(&self) -> bool {
+        self.snapshot().muted
+    }
+
+    #[setter(coerce)]
+    fn set_muted(&self, value: bool) {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_set_muted(node, value);
+    }
+
+    #[getter]
+    fn error(&self, ctx: &mut Ctx) -> Value {
+        media_error_value(ctx, self.snapshot().error)
+    }
+
+    #[method(name = "canPlayType", coerce)]
+    fn can_play_type(&self, mime: &str) -> OpResult<&'static str> {
+        Ok(if self.node().local_name()?.as_deref() == Some("audio") {
+            audio_support(mime)
+        } else {
+            video_support(mime)
+        })
+    }
+}
+
+const SRC_OBJECT_SLOT: &str = "#lumen_media\u{1}srcObject";
+
+fn audio_support(mime: &str) -> &'static str {
+    let mime = mime.split(';').next().unwrap_or("").trim();
+    if ["audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"]
+        .iter()
+        .any(|supported| mime.eq_ignore_ascii_case(supported))
+    {
+        "maybe"
+    } else {
+        ""
+    }
+}
+
+fn video_support(mime: &str) -> &'static str {
+    let mime = mime.trim().to_ascii_lowercase();
+    let Some((essence, parameters)) = mime.split_once(';') else {
+        return if mime == "video/mp4" { "maybe" } else { "" };
+    };
+    if essence.trim() != "video/mp4" {
+        return "";
+    }
+    let Some((name, value)) = parameters.trim().split_once('=') else {
+        return "";
+    };
+    if name.trim() != "codecs" {
+        return "";
+    }
+    let codecs = value.trim().trim_matches('"');
+    let mut has_avc = false;
+    for codec in codecs.split(',').map(str::trim) {
+        if codec.starts_with("avc1.") {
+            has_avc = true;
+        } else if codec == "mp4a.40.2" {
+            // AAC-LC is the only MP4 audio codec decoded by the current video pipeline.
+        } else {
+            // Other AAC profiles and all other codecs are unsupported; do not promise playback
+            // and then silently drop an MP4 audio track.
+            return "";
+        }
+    }
+    if has_avc {
+        "maybe"
+    } else {
+        ""
+    }
 }
 
 #[lumen_bind::class(name = "HTMLAudioElement", extends = DomHtmlMediaElement, hint(js(webidl)))]
@@ -801,11 +1023,6 @@ impl DomHtmlAudioElement {
 
     fn node(&self) -> &DomNode {
         &self.base.base.base.base
-    }
-
-    fn snapshot(&self) -> MediaSnapshot {
-        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
-        realm.media_snapshot(node)
     }
 
     fn create(realm: Rc<DomRealm>, source: Option<&str>) -> OpResult<Self> {
@@ -882,79 +1099,6 @@ impl DomHtmlVideoElement {
         crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
-    #[getter(rename(js = "currentSrc"))]
-    fn current_src(&self) -> String {
-        self.snapshot().source
-    }
-
-    fn play(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        if self
-            .node()
-            .get_attribute("src")?
-            .0
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            let deferred = Deferred::new(ctx);
-            let promise = deferred.promise();
-            deferred.reject(
-                ctx,
-                OpError::new("NotSupportedError", "video element has no source"),
-            );
-            return Ok(promise);
-        }
-        Ok(self
-            .node()
-            .realm
-            .media
-            .borrow_mut()
-            .play(ctx, self.node().id))
-    }
-
-    fn pause(&self, ctx: &mut Ctx) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .pause(ctx, self.node().id);
-    }
-    fn load(&self, ctx: &mut Ctx) {
-        self.node().realm.media_reload(ctx, self.node().id);
-    }
-
-    #[getter]
-    fn paused(&self) -> bool {
-        self.snapshot().paused
-    }
-    #[getter]
-    fn ended(&self) -> bool {
-        self.snapshot().ended
-    }
-    #[getter(rename(js = "currentTime"))]
-    fn current_time(&self) -> f64 {
-        self.snapshot().current_time
-    }
-    #[setter(rename(js = "currentTime"), coerce)]
-    fn set_current_time(&self, value: f64) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .seek(self.node().id, value);
-    }
-    #[getter]
-    fn duration(&self) -> f64 {
-        self.snapshot().duration
-    }
-    #[getter(rename(js = "readyState"))]
-    fn ready_state(&self) -> u8 {
-        self.snapshot().ready_state as u8
-    }
-    #[getter(rename(js = "networkState"))]
-    fn network_state(&self) -> u16 {
-        self.snapshot().network_state
-    }
     #[getter(rename(js = "videoWidth"))]
     fn video_width(&self) -> u32 {
         self.snapshot().video_width
@@ -963,68 +1107,7 @@ impl DomHtmlVideoElement {
     fn video_height(&self) -> u32 {
         self.snapshot().video_height
     }
-    #[getter]
-    fn volume(&self) -> f64 {
-        self.snapshot().volume
-    }
-    #[setter(coerce)]
-    fn set_volume(&self, value: f64) -> OpResult<()> {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .set_volume(self.node().id, value)
-    }
-    #[getter]
-    fn muted(&self) -> bool {
-        self.snapshot().muted
-    }
-    #[setter(coerce)]
-    fn set_muted(&self, value: bool) {
-        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
-        realm.media_set_muted(node, value);
-    }
-    #[getter]
-    fn error(&self, ctx: &mut Ctx) -> Value {
-        media_error_value(ctx, self.snapshot().error)
-    }
 
-    #[method(coerce)]
-    fn can_play_type(&self, mime: &str) -> &'static str {
-        let mime = mime.trim().to_ascii_lowercase();
-        let Some((essence, parameters)) = mime.split_once(';') else {
-            return if mime == "video/mp4" { "maybe" } else { "" };
-        };
-        if essence.trim() != "video/mp4" {
-            return "";
-        }
-        let Some((name, value)) = parameters.trim().split_once('=') else {
-            return "";
-        };
-        if name.trim() != "codecs" {
-            return "";
-        }
-        let codecs = value.trim().trim_matches('"');
-        let mut has_avc = false;
-        for codec in codecs.split(',').map(str::trim) {
-            if codec.starts_with("avc1.") {
-                has_avc = true;
-            } else if codec == "mp4a.40.2" {
-                // AAC-LC is the only MP4 audio codec decoded by the current
-                // video pipeline.
-            } else {
-                // Other AAC profiles and all other audio/video codecs are unsupported. In
-                // particular, do not promise playback then silently drop an
-                // MP4 audio track.
-                return "";
-            }
-        }
-        if has_avc {
-            "maybe"
-        } else {
-            ""
-        }
-    }
 }
 
 pub(crate) fn legacy_audio_factory(
@@ -1047,129 +1130,6 @@ impl DomHtmlAudioElement {
         crate::custom_elements::construct_customized_class::<Self>(ctx, this.0)
     }
 
-    #[getter(rename(js = "currentSrc"))]
-    fn current_src(&self) -> String {
-        self.snapshot().source
-    }
-
-    fn play(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        if self
-            .node()
-            .get_attribute("src")?
-            .0
-            .as_deref()
-            .unwrap_or("")
-            .is_empty()
-        {
-            let deferred = Deferred::new(ctx);
-            let promise = deferred.promise();
-            deferred.reject(
-                ctx,
-                OpError::new("NotSupportedError", "audio element has no source"),
-            );
-            return Ok(promise);
-        }
-        Ok(self
-            .node()
-            .realm
-            .media
-            .borrow_mut()
-            .play(ctx, self.node().id))
-    }
-
-    fn pause(&self, ctx: &mut Ctx) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .pause(ctx, self.node().id);
-    }
-
-    fn load(&self, ctx: &mut Ctx) {
-        self.node().realm.media_reload(ctx, self.node().id);
-    }
-
-    #[getter]
-    fn paused(&self) -> bool {
-        self.snapshot().paused
-    }
-
-    #[getter]
-    fn ended(&self) -> bool {
-        self.snapshot().ended
-    }
-
-    #[getter(rename(js = "currentTime"))]
-    fn current_time(&self) -> f64 {
-        self.snapshot().current_time
-    }
-
-    #[setter(rename(js = "currentTime"), coerce)]
-    fn set_current_time(&self, value: f64) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .seek(self.node().id, value);
-    }
-
-    #[getter]
-    fn duration(&self) -> f64 {
-        self.snapshot().duration
-    }
-
-    #[getter(rename(js = "readyState"))]
-    fn ready_state(&self) -> u8 {
-        self.snapshot().ready_state as u8
-    }
-
-    #[getter(rename(js = "networkState"))]
-    fn network_state(&self) -> u16 {
-        self.snapshot().network_state
-    }
-
-    #[getter]
-    fn volume(&self) -> f64 {
-        self.snapshot().volume
-    }
-
-    #[setter(coerce)]
-    fn set_volume(&self, value: f64) -> OpResult<()> {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .set_volume(self.node().id, value)
-    }
-
-    #[getter]
-    fn muted(&self) -> bool {
-        self.snapshot().muted
-    }
-
-    #[setter(coerce)]
-    fn set_muted(&self, value: bool) {
-        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
-        realm.media_set_muted(node, value);
-    }
-
-    #[getter]
-    fn error(&self, ctx: &mut Ctx) -> Value {
-        media_error_value(ctx, self.snapshot().error)
-    }
-
-    #[method(coerce)]
-    fn can_play_type(&self, mime: &str) -> &'static str {
-        let mime = mime.split(';').next().unwrap_or("").trim();
-        if ["audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"]
-            .iter()
-            .any(|supported| mime.eq_ignore_ascii_case(supported))
-        {
-            "maybe"
-        } else {
-            ""
-        }
-    }
 }
 
 #[cfg(test)]

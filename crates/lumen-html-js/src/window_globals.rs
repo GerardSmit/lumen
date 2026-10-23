@@ -199,7 +199,7 @@ impl DomWindow {
 }
 
 crate::event_content_handlers::bind_window_handlers! {
-    #[getter]
+    #[getter(hint(js(global)))]
     fn name(&self) -> String {
         self.base.associated_realm().and_then(|realm| realm.browsing_context())
             .filter(|context| context.is_active()).map_or_else(String::new, |context| context.target_name())
@@ -222,13 +222,13 @@ crate::event_content_handlers::bind_window_handlers! {
         crate::web_storage::window_storage(ctx, self.base.associated_realm().as_ref(), true)
     }
 
-    #[getter]
+    #[getter(hint(js(global)))]
     fn closed(&self) -> bool {
         self.base.associated_realm().and_then(|realm| realm.browsing_context())
             .is_none_or(|context| !context.is_active())
     }
 
-    #[getter]
+    #[getter(hint(js(global)))]
     fn opener(&self) -> Value {
         self.base.associated_realm().and_then(|realm|realm.browsing_context()).and_then(|context|context.opener_proxy()).unwrap_or(Value::Null)
     }
@@ -283,7 +283,7 @@ crate::event_content_handlers::bind_window_handlers! {
 
 
 
-    #[getter]
+    #[getter(hint(js(global)))]
     fn history(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let realm = self.base.associated_realm()
             .ok_or_else(|| crate::error_reporting::dom_exception(ctx, "SecurityError", "Window document is unavailable"))?;
@@ -600,7 +600,7 @@ crate::event_content_handlers::bind_window_handlers! {
         context.request_location_navigation_with_caller(ctx, &value.0, &entry_base)
     }
 
-    #[getter(name = "frameElement")]
+    #[getter(name = "frameElement", hint(js(global)))]
     fn frame_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let Some(context) = browsing_context::current_realm_context(ctx) else {
             return match browsing_context::current_realm_metadata(ctx) {
@@ -612,6 +612,118 @@ crate::event_content_handlers::bind_window_handlers! {
         };
         browsing_context::window_frame_element(ctx, &context)
     }
+
+    #[getter(hint(js(global)))]
+    fn status(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<String> {
+        crate::window_legacy::status(ctx, this.0)
+    }
+
+    #[setter(coerce)]
+    fn set_status(ctx: &mut Ctx, this: lumen_bind::This<Value>, value: String) -> OpResult<()> {
+        crate::window_legacy::set_status(ctx, this.0, value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn locationbar(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "locationbar")
+    }
+
+    #[setter(name = "locationbar")]
+    fn set_locationbar(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "locationbar", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn menubar(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "menubar")
+    }
+
+    #[setter(name = "menubar")]
+    fn set_menubar(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "menubar", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn personalbar(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "personalbar")
+    }
+
+    #[setter(name = "personalbar")]
+    fn set_personalbar(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "personalbar", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn scrollbars(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "scrollbars")
+    }
+
+    #[setter(name = "scrollbars")]
+    fn set_scrollbars(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "scrollbars", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn statusbar(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "statusbar")
+    }
+
+    #[setter(name = "statusbar")]
+    fn set_statusbar(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "statusbar", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn toolbar(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::bar(ctx, this.0, "toolbar")
+    }
+
+    #[setter(name = "toolbar")]
+    fn set_toolbar(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "toolbar", value)
+    }
+
+    #[getter(hint(js(global)))]
+    fn external(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        crate::window_legacy::external(ctx, this.0)
+    }
+
+    #[setter(name = "external")]
+    fn set_external(ctx: &mut Ctx, this: lumen_bind::This<Value>, #[default(Value::Undefined)] value: Value) -> OpResult<()> {
+        replace_window_attribute(ctx, this.0, "external", value)
+    }
+
+    #[getter(name = "originAgentCluster", hint(js(global)))]
+    fn origin_agent_cluster(&self) -> bool {
+        false
+    }
+
+    #[method]
+    fn stop(_this: lumen_bind::This<Value>) {}
+
+    #[method(coerce)]
+    fn alert(_this: lumen_bind::This<Value>, #[default(String::new())] _message: String) {}
+
+    #[method(coerce)]
+    fn confirm(_this: lumen_bind::This<Value>, #[default(String::new())] _message: String) -> bool {
+        false
+    }
+
+    #[method(coerce)]
+    fn prompt(
+        _this: lumen_bind::This<Value>,
+        #[default(String::new())] _message: String,
+        #[default(String::new())] _default: String,
+    ) -> Nullable<String> {
+        Nullable(None)
+    }
+
+    #[method(name = "captureEvents")]
+    fn capture_events(_this: lumen_bind::This<Value>) {}
+
+    #[method(name = "releaseEvents")]
+    fn release_events(_this: lumen_bind::This<Value>) {}
+
 
 
 
@@ -846,6 +958,17 @@ impl DomLocation {
     fn to_string(&self, ctx: &mut Ctx) -> OpResult<String> {
         self.href(ctx)
     }
+
+    #[getter(name = "ancestorOrigins")]
+    fn ancestor_origins(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        const SLOT: &str = "#lumen_location\u{1}ancestorOrigins";
+        if let Some(existing) = ctx.native_private_value_slot(&this.0, SLOT) {
+            return Ok(existing);
+        }
+        let list = ctx.new_instance(lumen_host::indexed_db::bindings::DOMStringList::from_names(Vec::new()));
+        ctx.set_native_internal_value_slot(&this.0, SLOT, list.clone()).map_err(OpError::thrown)?;
+        Ok(list)
+    }
 }
 
 pub(crate) fn location_value(
@@ -866,8 +989,16 @@ pub(crate) fn location_value(
         owner: RefCell::new(Rc::downgrade(realm)),
     });
     *realm.location_wrapper.borrow_mut() = ctx.weak_value(&location);
+    let prototype = ctx.prototype_of(&location);
+    crate::idl_shape::lock_member(ctx, &prototype, "toString")?;
+    crate::idl_shape::define_unforgeable_own(ctx, &location, LOCATION_UNFORGEABLE)?;
     Ok(location)
 }
+
+const LOCATION_UNFORGEABLE: &[&str] = &[
+    "href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+    "assign", "replace", "reload", "toString", "ancestorOrigins",
+];
 
 pub(crate) fn entry_base_url(
     ctx: &mut Ctx,
@@ -1139,6 +1270,17 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         }
         if !ctx.delete_member(&prototype,name).map_err(OpError::thrown)? {
             return Err(OpError::type_error("Window handler attribute is still on the prototype"));
+        }
+    }
+    for name in ["close","focus","blur","open","postMessage","stop","alert","confirm","prompt","captureEvents","releaseEvents"] {
+        let key=Value::str(name);
+        let descriptor=ctx.reflect_get_own_property_descriptor(&prototype,&key).map_err(OpError::thrown)?;
+        if matches!(descriptor,Value::Undefined) {continue;}
+        if !ctx.reflect_define_property(&global,&key,&descriptor).map_err(OpError::thrown)? {
+            return Err(OpError::type_error("Window operation could not be installed"));
+        }
+        if !ctx.delete_member(&prototype,name).map_err(OpError::thrown)? {
+            return Err(OpError::type_error("Window operation is still on the prototype"));
         }
     }
     for name in ["scroll","scrollTo","scrollBy","moveTo","moveBy","resizeTo","resizeBy"] {

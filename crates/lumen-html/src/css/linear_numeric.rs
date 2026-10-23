@@ -65,3 +65,21 @@ pub fn serialize_flat(expression: &E) -> Option<alloc::string::String> {
         None => flat.serialize(),
     }
 }
+
+/// Weighted sum of percentage and absolute-length operands in the canonical
+/// `calc(<percentage> + <length>)` pair; the percentage part is kept even when
+/// its weight is zero.
+pub fn weighted_pair(terms: &[(&E, f64)]) -> Option<E> {
+    let (mut percent, mut length) = (0.0, 0.0);
+    for (expression, weight) in terms {
+        if !weight.is_finite() { return None; }
+        collect(expression, *weight, &mut percent, &mut length)?;
+    }
+    if !percent.is_finite() || !length.is_finite() { return None; }
+    let value = |value, unit| E::Value(NumericValue { value, unit });
+    Some(if length == 0.0 {
+        value(percent, NumericUnit::Percent)
+    } else {
+        E::Calc(Box::new(E::Sum(vec![value(percent, NumericUnit::Percent), value(length, NumericUnit::Px)])))
+    })
+}

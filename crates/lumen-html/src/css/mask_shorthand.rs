@@ -31,6 +31,24 @@ fn box_pair(origin: &str, clip: &str) -> Option<alloc::string::String> {
     })
 }
 
+/// `mask-border-*` longhands in shorthand order with the initial value each `mask` resets them to.
+pub(super) const BORDER_LONGHANDS: [&str; 6] = [
+    "mask-border-source", "mask-border-slice", "mask-border-width", "mask-border-outset", "mask-border-repeat", "mask-border-mode",
+];
+
+pub(super) const BORDER_INITIALS: [&str; 6] = ["none", "0", "auto", "0", "stretch", "alpha"];
+
+/// The shorthand over the mask longhands followed by the mask-border longhands, which it can
+/// only express while they all hold their initial values.
+pub(super) fn synthesize_with_border(values: &[&str]) -> Option<alloc::string::String> {
+    let split = LONGHANDS.len().min(values.len());
+    let (mask, border) = values.split_at(split);
+    if border.iter().zip(BORDER_INITIALS).any(|(value, initial)| *value != initial) {
+        return None;
+    }
+    synthesize(mask)
+}
+
 pub(super) fn synthesize(values: &[&str]) -> Option<alloc::string::String> {
     let lists: alloc::vec::Vec<alloc::vec::Vec<&str>> = values.iter().map(|value| items(value)).collect();
     if lists.len() != LONGHANDS.len() || lists.iter().any(|list| list.is_empty()) {

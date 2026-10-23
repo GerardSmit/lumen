@@ -758,6 +758,27 @@ filter_element! {
     }
 }
 
+filter_element! {
+    DomSvgClipPathElement, "SVGClipPathElement", DomSvgElement,
+    {},
+    {
+        clip_path_units "clipPathUnits" => Anim::Enumeration("clipPathUnits", &["userSpaceOnUse", "objectBoundingBox"], 1);
+    }
+}
+
+filter_element! {
+    DomSvgMaskElement, "SVGMaskElement", DomSvgElement,
+    {},
+    {
+        mask_units "maskUnits" => Anim::Enumeration("maskUnits", &["userSpaceOnUse", "objectBoundingBox"], 2);
+        mask_content_units "maskContentUnits" => Anim::Enumeration("maskContentUnits", &["userSpaceOnUse", "objectBoundingBox"], 1);
+        x "x" => Anim::Length("x", "-10%");
+        y "y" => Anim::Length("y", "-10%");
+        width "width" => Anim::Length("width", "120%");
+        height "height" => Anim::Length("height", "120%");
+    }
+}
+
 const BLEND_MODES: &[&str] = &[
     "normal", "multiply", "screen", "darken", "lighten", "overlay", "color-dodge", "color-burn", "hard-light",
     "soft-light", "difference", "exclusion", "hue", "saturation", "color", "luminosity",
@@ -1072,6 +1093,8 @@ filter_primitive! {
 pub(crate) fn wrap(ctx: &mut Ctx, id: NodeId, node: DomNode, local: &str) -> Value {
     match local {
         "filter" => ctx.cached_instance(id, || DomSvgFilterElement::from_node(node)),
+        "clipPath" => ctx.cached_instance(id, || DomSvgClipPathElement::from_node(node)),
+        "mask" => ctx.cached_instance(id, || DomSvgMaskElement::from_node(node)),
         "feBlend" => ctx.cached_instance(id, || DomSvgFeBlendElement::from_node(node)),
         "feColorMatrix" => ctx.cached_instance(id, || DomSvgFeColorMatrixElement::from_node(node)),
         "feComponentTransfer" => ctx.cached_instance(id, || DomSvgFeComponentTransferElement::from_node(node)),
@@ -1116,6 +1139,8 @@ pub(crate) fn constructors(ctx: &mut Ctx) -> Vec<(&'static str, Value)> {
         ("SVGAnimatedPreserveAspectRatio", ctx.class_constructor::<DomSvgAnimatedPreserveAspectRatio>()),
         ("SVGPreserveAspectRatio", ctx.class_constructor::<DomSvgPreserveAspectRatio>()),
         ("SVGFilterElement", ctx.class_constructor::<DomSvgFilterElement>()),
+        ("SVGClipPathElement", ctx.class_constructor::<DomSvgClipPathElement>()),
+        ("SVGMaskElement", ctx.class_constructor::<DomSvgMaskElement>()),
         ("SVGFEBlendElement", ctx.class_constructor::<DomSvgFeBlendElement>()),
         ("SVGFEColorMatrixElement", ctx.class_constructor::<DomSvgFeColorMatrixElement>()),
         ("SVGFEComponentTransferElement", ctx.class_constructor::<DomSvgFeComponentTransferElement>()),

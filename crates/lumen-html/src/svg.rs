@@ -358,12 +358,20 @@ pub fn supports_length(input: &str) -> bool {
 
 fn coordinate_length(input: &str) -> Option<f32> {
     let input = input.trim();
-    let value = input
-        .strip_suffix("px")
-        .unwrap_or(input)
-        .trim()
-        .parse::<f32>()
-        .ok()?;
+    let split = input.len().checked_sub(2).filter(|at| input.is_char_boundary(*at));
+    let (number, factor) = match split.map(|at| (&input[..at], &input[at..])) {
+        Some((number, unit)) if unit.eq_ignore_ascii_case("px") => (number, 1.0),
+        Some((number, unit)) if unit.eq_ignore_ascii_case("cm") => (number, 96.0 / 2.54),
+        Some((number, unit)) if unit.eq_ignore_ascii_case("mm") => (number, 96.0 / 25.4),
+        Some((number, unit)) if unit.eq_ignore_ascii_case("in") => (number, 96.0),
+        Some((number, unit)) if unit.eq_ignore_ascii_case("pt") => (number, 96.0 / 72.0),
+        Some((number, unit)) if unit.eq_ignore_ascii_case("pc") => (number, 16.0),
+        _ => match input.strip_suffix(['Q', 'q']) {
+            Some(number) => (number, 96.0 / 101.6),
+            None => (input, 1.0),
+        },
+    };
+    let value = number.trim().parse::<f32>().ok()? * factor;
     value.is_finite().then_some(value)
 }
 
@@ -562,6 +570,13 @@ pub fn view_box_transform_with_aspect(
         },
         view_box,
     )
+}
+
+/// A transform attribute that is syntactically invalid applies no transform.
+/// Only lists beyond the bounded renderer limits cannot be represented.
+pub fn transform_unsupported(input: &str) -> bool {
+    parse_transform(input).is_none()
+        && (input.len() > MAX_TRANSFORM_BYTES || input.matches('(').count() > MAX_TRANSFORMS)
 }
 
 /// Parse a bounded SVG `transform` list. This supports the affine transforms

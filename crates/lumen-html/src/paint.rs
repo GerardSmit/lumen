@@ -1302,6 +1302,11 @@ pub enum BackgroundBox {
     Border,
     Padding,
     Content,
+    /// SVG geometry boxes and `no-clip`, which only `mask-origin` and `mask-clip` accept.
+    Fill,
+    Stroke,
+    View,
+    NoClip,
 }
 
 /// One `background-image` layer value. `None` layers paint nothing but still

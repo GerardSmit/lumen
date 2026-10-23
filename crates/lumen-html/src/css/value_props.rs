@@ -18,6 +18,7 @@ enum Post {
     StrokeWidth,
     InsetPair,
     OffsetPairs,
+    ObjectFit,
 }
 
 pub(crate) struct Prop {
@@ -96,7 +97,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("mask-composite", false, "add", "[ add | subtract | intersect | exclude ]#"),
     prop("mask-type", false, "luminance", "luminance | alpha"),
     prop("mix-blend-mode", false, "normal", blend_modes!()),
-    prop("object-fit", false, "fill", "fill | contain | cover | none | scale-down"),
+    post(prop("object-fit", false, "fill", "fill | none | [ contain | cover ] || scale-down"), Post::ObjectFit),
     prop("overflow-anchor", false, "auto", "auto | none"),
     prop("scroll-axis-lock", false, "auto", "auto | none"),
     post(prop("scroll-marker-group", false, "none", "none | [ before | after ] [ links | tabs ]? | [ links | tabs ]"), Post::ScrollMarkerGroup),
@@ -164,6 +165,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("forced-color-adjust", true, "auto", "auto | none | preserve-parent-color"),
     prop("image-orientation", true, "from-image", "from-image | none"),
     prop("link-parameters", false, "none", "none | <param>#"),
+    prop("image-resolution", true, "1dppx", "image-resolution"),
     prop("flex-line-count", false, "1", "<integer-min1>"),
 ];
 
@@ -749,6 +751,10 @@ fn join(parts: &[String], separator: &str) -> String {
     text
 }
 
+fn parts_has_scale_down(parts: &[String]) -> bool {
+    parts.iter().any(|part| part == "scale-down")
+}
+
 fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
     match prop.post {
         Post::None => {}
@@ -769,6 +775,11 @@ fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
                 grouped.append(&mut pair);
             }
             parts = grouped;
+        }
+        Post::ObjectFit => {
+            if parts_has_scale_down(&parts) {
+                parts.retain(|part| part != "contain");
+            }
         }
         Post::InsetPair => {
             if parts.len() == 2 && parts[0] == parts[1] {
@@ -858,6 +869,9 @@ fn evaluate(index: usize, raw: &str, context: LengthContext, foreground: Rgba, c
     }
     if prop.name == "dynamic-range-limit" && super::dynamic_range_limit::is_mix(raw) {
         return super::dynamic_range_limit::canonicalize(raw, computed, context);
+    }
+    if prop.name == "image-resolution" {
+        return super::image_resolution::canonicalize(raw);
     }
     let tokens = tokenize(raw)?;
     if tokens.is_empty() {

@@ -23,6 +23,9 @@ pub(super) fn num(value: f64) -> String {
         return String::from("0");
     }
     let mut value = value;
+    if value.abs() < 1e-6 {
+        value = 0.0;
+    }
     if value != 0.0 {
         let magnitude = libm::floor(libm::log10(value.abs())) as i32;
         let digits = 5 - magnitude;

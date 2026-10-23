@@ -174,6 +174,10 @@ mod templates;
 mod caret_position;
 mod screen;
 mod origin_api;
+mod navigator_extras;
+mod idl_shape;
+mod window_legacy;
+mod media_extras;
 mod data_transfer;
 mod document_named;
 mod scroll_parent;
@@ -918,6 +922,7 @@ pub struct DomRealm {
     focus_visible: Cell<Option<NodeId>>,
     rendered_focus_epoch: Cell<Option<(NodeId, u64, u64, u64)>>,
     pub(crate) view_transition_started: Cell<bool>,
+    pub(crate) view_transition_captures: RefCell<Vec<view_transition::ActiveCapture>>,
     hover_target: Cell<Option<NodeId>>,
     active_targets: Cell<[Option<NodeId>; 2]>,
     keyboard_modality: Cell<bool>,
@@ -3704,6 +3709,7 @@ impl DomRealm {
             self.flush_layout_mode(false)?;
         }
         if self.session.borrow().viewport_size().is_some() {
+            self.session.borrow_mut().update_remembered_sizes();
             layout_observers::rendering_checkpoint(ctx,self)?;
             container_query_list::notify(ctx,self)?;
         }
@@ -6713,6 +6719,19 @@ custom_elements::bind_element_aria! {
     fn get_animations(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
         let subtree = ui_events::dictionary_boolean(ctx, &options, "subtree", false)?;
         animations::for_element(ctx, &self.base.realm, self.base.id, subtree)
+    }
+
+    #[method(name = "startViewTransition")]
+    fn start_view_transition(&self, ctx: &mut Ctx, callback_options: Option<Value>) -> OpResult<Value> {
+        let handle = self.base.realm.relevant_host_realm(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "Element relevant realm is unavailable"))?;
+        ctx.with_host_realm(&handle, |ctx| view_transition::start_scoped(ctx, &self.base.realm, self.base.id, callback_options))
+            .map_err(|error| OpError::new("InvalidStateError", error.to_string()))?
+    }
+
+    #[getter(name = "activeViewTransition")]
+    fn active_view_transition(&self) -> Value {
+        Value::Null
     }
 
     #[method(name = "matchContainer", coerce)]
@@ -11099,11 +11118,16 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 
     #[method]
-    fn start_view_transition(&self, ctx: &mut Ctx, callback: Option<lumen::embed::JsFunction>) -> OpResult<Value> {
+    fn start_view_transition(&self, ctx: &mut Ctx, callback_options: Option<Value>) -> OpResult<Value> {
         let handle = self.realm.relevant_host_realm(ctx)
             .ok_or_else(|| OpError::new("InvalidStateError", "Document relevant realm is unavailable"))?;
-        ctx.with_host_realm(&handle, |ctx| view_transition::start(ctx, &self.realm, callback))
+        ctx.with_host_realm(&handle, |ctx| view_transition::start(ctx, &self.realm, callback_options))
             .map_err(|error| OpError::new("InvalidStateError", error.to_string()))?
+    }
+
+    #[getter(name = "activeViewTransition")]
+    fn active_view_transition(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        view_transition::active(ctx, &self.realm)
     }
 
     #[method(name = "elementFromPoint", coerce)]
@@ -14305,6 +14329,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             focus_visible: Cell::new(None),
             rendered_focus_epoch: Cell::new(None),
             view_transition_started: Cell::new(false),
+            view_transition_captures: RefCell::new(Vec::new()),
             hover_target: Cell::new(None),
             active_targets: Cell::new([None, None]),
             // Before a pointing-device interaction, programmatic focus follows
@@ -14975,6 +15000,7 @@ fn install_document_with_context_metadata(
         ),
         ("History", ctx.class_constructor::<history::DomHistory>()),
         ("ViewTransition", ctx.class_constructor::<view_transition::DomViewTransition>()),
+        ("ViewTransitionTypeSet", view_transition::type_set_constructor(ctx)),
         ("ElementInternals", ctx.class_constructor::<custom_elements::DomElementInternals>()),
         ("CustomStateSet", ctx.class_constructor::<custom_elements::DomCustomStateSet>()),
         ("Event", ctx.class_constructor::<DomEvent>()),
@@ -15132,6 +15158,14 @@ fn install_document_with_context_metadata(
             .map_err(|_| InstallError::Global)?;
     }
     for (name, constructor) in dialog_popover::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| InstallError::Global)?;
+    }
+    for (name, constructor) in media_extras::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| InstallError::Global)?;
+    }
+    for (name, constructor) in window_legacy::constructors(ctx) {
         crate::install_interface(ctx, &global, name, constructor)
             .map_err(|_| InstallError::Global)?;
     }

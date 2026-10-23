@@ -440,7 +440,14 @@ pub struct DrawingState {
     pub stroke_gradient: Option<Box<CanvasGradient>>,
     pub fill_pattern: Option<Box<CanvasPattern>>,
     pub stroke_pattern: Option<Box<CanvasPattern>>,
+    pub filter: Option<std::sync::Arc<CanvasFilter>>,
     clip: Option<std::sync::Arc<Mask>>,
+}
+
+/// A parsed `filter` value with the canonical text it serializes as.
+pub struct CanvasFilter {
+    pub operations: std::sync::Arc<[lumen_common::filter::FilterOperation]>,
+    pub text: Box<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +510,7 @@ impl Default for DrawingState {
             stroke_gradient: None,
             fill_pattern: None,
             stroke_pattern: None,
+            filter: None,
             clip: None,
         }
     }
@@ -1030,6 +1038,7 @@ pub struct CanvasSurface {
 }
 
 struct CanvasLayer {
+    filter: Option<std::sync::Arc<[lumen_common::filter::FilterOperation]>>,
     bitmap: Option<Pixmap>,
     state: DrawingState,
     saved_depth: usize,
@@ -1142,7 +1151,10 @@ impl CanvasSurface {
 
     /// Isolate drawing in a bounded transparent bitmap. Open layers never
     /// become visible through the canvas's published bitmap.
-    pub fn begin_layer(&mut self) -> Result<(), ImageError> {
+    pub fn begin_layer(
+        &mut self,
+        filter: Option<std::sync::Arc<[lumen_common::filter::FilterOperation]>>,
+    ) -> Result<(), ImageError> {
         let bytes = pixel_bytes(self.width, self.height)?;
         if self.layers.len() >= 64 || bytes.checked_mul(self.layers.len() + 2)
             .is_none_or(|bytes| bytes > MAX_IMAGE_BYTES) {
@@ -1153,6 +1165,7 @@ impl CanvasSurface {
         let bitmap = allocate(self.width, self.height)?;
         self.frozen = None;
         self.layers.push(CanvasLayer {
+            filter,
             bitmap: std::mem::replace(&mut self.bitmap, bitmap),
             state: self.state.clone(),
             saved_depth: self.saved.len(),
@@ -1160,11 +1173,43 @@ impl CanvasSurface {
         self.state.alpha = 1.0;
         self.state.blend = BlendMode::SourceOver;
         self.state.shadow_color = [0, 0, 0, 0];
+        self.state.filter = None;
+        Ok(())
+    }
+
+    fn filter_active(&self) -> bool {
+        self.state.filter.as_ref().is_some_and(|filter| !filter.operations.is_empty())
+    }
+
+    /// Applies an operation list to a premultiplied layer in place. The blur
+    /// scale follows the current transform so filter lengths track the CTM.
+    fn filter_pixmap(
+        &self,
+        layer: &mut Pixmap,
+        filters: &[lumen_common::filter::FilterOperation],
+        transform: Transform,
+    ) -> Result<(), ImageError> {
+        let mut image = Rgba8Image {
+            width: layer.width(),
+            height: layer.height(),
+            pixels: Vec::with_capacity(layer.data().len()),
+        };
+        for pixel in layer.pixels() {
+            let c = pixel.demultiply();
+            image.pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+        let determinant = f64::from(transform.sx) * f64::from(transform.sy)
+            - f64::from(transform.kx) * f64::from(transform.ky);
+        let scale = determinant.abs().sqrt() as f32;
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        crate::apply_filter_operations(&mut image, filters, scale, layer.data().len(), [0, 0])?;
+        *layer = premultiplied_pixmap(&image)?;
         Ok(())
     }
 
     fn unbounded_blend(&self) -> bool {
-        matches!(
+        self.filter_active()
+            || matches!(
             self.state.blend,
             BlendMode::Source
                 | BlendMode::SourceIn
@@ -1183,6 +1228,12 @@ impl CanvasSurface {
     ) -> Result<R, ImageError> {
         self.materialize()?;
         let blend = self.state.blend;
+        if self.filter_active() {
+            let saved_shadow = std::mem::replace(&mut self.state.shadow_color, [0, 0, 0, 0]);
+            let result = self.composite_unbounded_layer(blend, &mut draw);
+            self.state.shadow_color = saved_shadow;
+            return result;
+        }
         let shadow_active = self.state.shadow_color[3] != 0
             && (self.state.shadow_blur != 0.0
                 || self.state.shadow_offset_x != 0.0
@@ -1213,6 +1264,7 @@ impl CanvasSurface {
         let layer = allocate(self.width, self.height)?;
         let target = std::mem::replace(&mut self.bitmap, layer);
         let clip = self.state.clip.take();
+        let filter = self.state.filter.take();
         if draw_blend != BlendMode::Destination {
             self.state.blend = BlendMode::SourceOver;
         }
@@ -1220,8 +1272,14 @@ impl CanvasSurface {
         let result = draw(self);
         self.state.blend = draw_blend;
         self.state.clip = clip;
+        self.state.filter = filter.clone();
         self.frozen = None;
-        let layer = std::mem::replace(&mut self.bitmap, target);
+        let mut layer = std::mem::replace(&mut self.bitmap, target);
+        if let (Some(filters), Some(layer)) = (filter.as_ref().map(|filter| &*filter.operations), layer.as_mut()) {
+            if !filters.is_empty() && result.is_ok() {
+                self.filter_pixmap(layer, filters, self.state.transform)?;
+            }
+        }
         if let (Some(target), Some(layer)) = (&mut self.bitmap, layer) {
             let paint = tiny_skia::PixmapPaint {
                 opacity: 1.0,
@@ -1245,10 +1303,18 @@ impl CanvasSurface {
     /// restoring entry state and discarding unmatched inner save calls.
     pub fn end_layer(&mut self) -> Option<usize> {
         let layer = self.layers.pop()?;
-        let source = std::mem::replace(&mut self.bitmap, layer.bitmap);
+        let mut source = std::mem::replace(&mut self.bitmap, layer.bitmap);
         self.saved.truncate(layer.saved_depth);
         self.state = layer.state;
         self.frozen = None;
+        let state_filter = self.state.filter.as_ref().map(|filter| filter.operations.clone());
+        for filters in [layer.filter, state_filter].into_iter().flatten() {
+            if let Some(source) = source.as_mut() {
+                if !filters.is_empty() {
+                    let _ = self.filter_pixmap(source, &filters, self.state.transform);
+                }
+            }
+        }
         if let (Some(target), Some(source)) = (&mut self.bitmap, source) {
             let paint = tiny_skia::PixmapPaint {
                 opacity: self.state.alpha,
@@ -2762,12 +2828,12 @@ mod tests {
         canvas.state_mut().fill = [128, 0, 128, 255];
         canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
         canvas.state_mut().alpha = 0.5;
-        canvas.begin_layer().unwrap();
+        canvas.begin_layer(None).unwrap();
         canvas.state_mut().fill = [255, 0, 0, 255];
         canvas.fill_rect(1.0, 0.0, 1.0, 1.0).unwrap();
         assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 0, 0, 0]);
         assert!(!canvas.restore(), "restore must not cross a layer boundary");
-        canvas.begin_layer().unwrap();
+        canvas.begin_layer(None).unwrap();
         canvas.state_mut().fill = [0, 255, 0, 255];
         canvas.fill_rect(1.0, 0.0, 1.0, 1.0).unwrap();
         assert_eq!(canvas.end_layer(), Some(0));
@@ -2777,8 +2843,8 @@ mod tests {
         assert_eq!(canvas.state().fill, [128, 0, 128, 255]);
         assert_eq!(canvas.state().alpha, 0.5);
         assert_eq!(canvas.end_layer(), None);
-        for _ in 0..64 { canvas.begin_layer().unwrap(); }
-        assert!(canvas.begin_layer().is_err());
+        for _ in 0..64 { canvas.begin_layer(None).unwrap(); }
+        assert!(canvas.begin_layer(None).is_err());
         canvas.resize(2, 1).unwrap();
         assert_eq!(canvas.end_layer(), None);
         assert_eq!(canvas.snapshot().pixels, [0; 8]);
@@ -2888,7 +2954,7 @@ mod tests {
         assert_eq!(canvas.read_pixels(0, 0, 2, 1).unwrap().pixels, vec![0, 0, 0, 0, 10, 20, 30, 255]);
 
         let mut canvas = CanvasSurface::new(2, 1).unwrap();
-        canvas.begin_layer().unwrap();
+        canvas.begin_layer(None).unwrap();
         canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
         canvas.end_layer().unwrap();
         assert_eq!(canvas.read_pixels(0, 0, 1, 1).unwrap().pixels, vec![0, 0, 0, 255]);

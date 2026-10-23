@@ -44,6 +44,7 @@ pub mod selection;
 pub mod select_content;
 pub mod selector;
 pub mod session;
+mod remembered_size;
 pub mod stylesheet_loading;
 pub mod shadow;
 pub mod svg;
@@ -328,6 +329,7 @@ pub struct Document {
     manual_assignments: Vec<(NodeId, Vec<NodeId>)>,
     selector_cache: css::SyncRefCell<Vec<(String, Arc<Vec<css::Selector>>)>>,
     id_index: css::SyncRefCell<IdIndex>,
+    remembered_sizes: css::SyncRefCell<remembered_size::RememberedSizes>,
     host_gate: css::HostGate,
 }
 
@@ -418,6 +420,7 @@ impl Document {
             manual_assignments: Vec::new(),
             selector_cache: css::SyncRefCell::new(Vec::new()),
             id_index: css::SyncRefCell::new(IdIndex::default()),
+            remembered_sizes: css::SyncRefCell::new(remembered_size::RememberedSizes::default()),
             host_gate: css::HostGate::default(),
         }
     }

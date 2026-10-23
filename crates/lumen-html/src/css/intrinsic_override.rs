@@ -79,6 +79,22 @@ impl Style {
     pub(crate) fn contained_intrinsic_size(&self,horizontal:bool)->f32 {
         self.contained_intrinsic_override(horizontal).unwrap_or(0.0)
     }
+    pub(crate) fn has_auto_intrinsic_size(&self)->bool {
+        self.contain_intrinsic.as_deref().is_some_and(|axes|axes[..2].iter().any(|axis|axis.automatic))
+    }
+    pub(crate) fn skips_contents(&self)->bool {extra_props::keyword(self,"content-visibility")==Some("hidden")}
+    /// Maps a physical (width, height) pair to (inline, block) and back.
+    pub(crate) fn logical_axis_pair(&self,size:(f32,f32))->(f32,f32) {
+        if self.writing_mode==WritingMode::HorizontalTb {size}else{(size.1,size.0)}
+    }
+    pub(crate) fn apply_remembered_intrinsic_size(&mut self,logical:(f32,f32)) {
+        if !self.skips_contents() {return;}
+        let size=self.logical_axis_pair(logical);
+        for (slot,value) in [(234,size.0),(235,size.1)] {
+            let current=self.stored_intrinsic_override(slot);
+            if current.automatic {self.set_intrinsic_override(slot,IntrinsicOverride{automatic:true,size:Some(value)});}
+        }
+    }
     pub(crate) fn contained_intrinsic_override(&self,horizontal:bool)->Option<f32> {
         self.stored_intrinsic_override(if horizontal{234}else{235}).size
     }

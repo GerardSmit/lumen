@@ -8,6 +8,8 @@ use super::*;
 mod font_features;
 #[path="cssom_font_palette.rs"]
 mod font_palette;
+#[path="cssom_view_transition.rs"]
+mod view_transition_rule;
 #[path="cssom_transforms.rs"]
 mod transforms;
 #[path="cssom_numeric_ops.rs"]
@@ -3412,6 +3414,10 @@ fn serialize_rule_into(
             return;
         }
     }
+    if starts_css_at_rule(&rule.css_text,"@view-transition") {
+        output.push_str(&css::view_transition_rule::parse(&rule.css_text).serialize());
+        return;
+    }
     if starts_css_at_rule(&rule.css_text,"@font-feature-values") {
         if let Ok(parsed)=css::parse_stylesheet(&rule.css_text) {
             if let Some(values)=parsed.family_display.first() {
@@ -4400,6 +4406,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.class_constructor::<DomCssPropertyRule>();
     font_features::install(ctx)?;
     font_palette::install(ctx)?;
+    view_transition_rule::install(ctx)?;
     layer_counter::install(ctx)?;
     parser_api::install(ctx)?;
     crate::css_pseudo::install(ctx)?;
@@ -6452,6 +6459,8 @@ impl DomCssRuleList {
             (font_features::wrap(ctx,base)?,14)
         } else if starts_css_at_rule(&rule.css_text,"@font-palette-values") {
             (font_palette::wrap(ctx,base),15)
+        } else if starts_css_at_rule(&rule.css_text,"@view-transition") {
+            (view_transition_rule::wrap(ctx,base),0)
         } else if starts_css_at_rule(&rule.css_text, "@property") {
             (ctx.new_instance(DomCssPropertyRule { base }), 0)
         } else if rule.page_selector.is_some() {

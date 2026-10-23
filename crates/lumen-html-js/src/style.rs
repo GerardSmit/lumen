@@ -11,7 +11,8 @@ pub struct DomStyle {
     pub(crate) node: NodeId,
     pub(crate) computed: bool,
     pub(crate) pseudo: Option<css::PseudoElement>,
-    /// Cascade key of the highlight pseudo-element when `pseudo` is `Highlight`.
+    /// Cascade key of the highlight pseudo-element when `pseudo` is `Highlight`;
+    /// the capture name of a functional view-transition pseudo-element.
     pub(crate) highlight: Option<String>,
     pub(crate) invalid_pseudo: bool,
     pub(crate) _owner: Value,
@@ -148,12 +149,27 @@ impl DomStyle {
             Some(css::PseudoElement::Highlight) if self.highlight.is_some() => {
                 session.computed_highlight_style_with_text(self.node, self.highlight.as_deref().unwrap_or_default(), text)
             }
+            Some(pseudo) if pseudo.is_view_transition() => {
+                let fallback;
+                let shaper: &dyn lumen_html::paint::TextShaper = match text {
+                    Some(text) => text,
+                    None => {
+                        fallback = super::canvas::CanvasFontSource::Static(super::canvas::canvas_fallback_fonts());
+                        &fallback
+                    }
+                };
+                super::view_transition::computed_pseudo_style(&self.realm, session, self.node, pseudo, self.highlight.as_deref(), shaper)
+            }
             Some(pseudo) => session.computed_pseudo_style_with_text(self.node, pseudo,text),
             None => session.computed_style_with_text(self.node,text),
         }
     }
     fn computed_declarations_available(&self) -> OpResult<bool> {
         if self.invalid_pseudo { return Ok(false); }
+        if self.pseudo.is_some_and(css::PseudoElement::is_view_transition)
+            && self.realm.with_session(|session| selector::document_element(session.document())) != Some(self.node) {
+            return Ok(false);
+        }
         rendered_ancestry(&self.realm, self.node, false)
     }
 
@@ -767,6 +783,11 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
     };
     let highlight = if parsed.is_none() { css::highlight_pseudo_key(&pseudo) } else { None };
     let parsed = if highlight.is_some() { Some(css::PseudoElement::Highlight) } else { parsed };
+    let view_transition = if parsed.is_none() { css::parse_view_transition_pseudo(&pseudo) } else { None };
+    let (parsed, highlight) = match view_transition {
+        Some((view_transition, capture)) => (Some(view_transition), capture),
+        None => (parsed, highlight),
+    };
     if pseudo.starts_with("::part(") || pseudo.starts_with("::slotted(") {
         return Err(OpError::type_error("getComputedStyle does not accept part or slotted pseudo-elements"));
     }

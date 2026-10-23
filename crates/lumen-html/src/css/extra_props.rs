@@ -795,7 +795,11 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
             let (from_x, from_y) = (*tokens.first()?, *tokens.get(1)?);
             let tokens = components(to)?;
             let (to_x, to_y) = (*tokens.first()?, *tokens.get(1)?);
-            Some(alloc::format!("{} {}", mix_lp(from_x, to_x, progress)?, mix_lp(from_y, to_y, progress)?))
+            let axis = |a: &str, b: &str| {
+                let mixed = mix_lp(a, b, progress)?;
+                Some(if mixed == "0px" && (a.contains('%') || b.contains('%')) { String::from("0%") } else { mixed })
+            };
+            Some(alloc::format!("{} {}", axis(from_x, to_x)?, axis(from_y, to_y)?))
         }
         Kind::HyphenChars => {
             let a = parse_hyphen_chars(from)?;

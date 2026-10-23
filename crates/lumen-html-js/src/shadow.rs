@@ -419,7 +419,7 @@ mod tests {
         );
         check(
             &mut engine,
-            "var closed=document.getElementById('closed'),secret=closed.attachShadow({mode:'closed'}); secret.innerHTML='<slot></slot>'; closed.appendChild(document.createElement('b')); closed.shadowRoot===null && secret.mode==='closed' && closed.firstChild.assignedSlot===null && secret.querySelector('slot').assignedNodes()[0]===closed.firstChild",
+            "var closedHost=document.getElementById('closed'),secret=closedHost.attachShadow({mode:'closed'}); secret.innerHTML='<slot></slot>'; closedHost.appendChild(document.createElement('b')); closedHost.shadowRoot===null && secret.mode==='closed' && closedHost.firstChild.assignedSlot===null && secret.querySelector('slot').assignedNodes()[0]===closedHost.firstChild",
         );
         check(
             &mut engine,

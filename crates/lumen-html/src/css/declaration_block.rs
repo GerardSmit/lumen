@@ -294,6 +294,12 @@ fn longhands_uncached(name: &str) -> &'static [&'static str] {
             "mask-clip",
             "mask-mode",
             "mask-composite",
+            "mask-border-source",
+            "mask-border-slice",
+            "mask-border-width",
+            "mask-border-outset",
+            "mask-border-repeat",
+            "mask-border-mode",
         ],
         "list-style" => &["list-style-position", "list-style-image", "list-style-type"],
         "outline" => &["outline-color", "outline-style", "outline-width"],
@@ -683,7 +689,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             | "font-style" | "font-width" | "font-feature-settings" | "font-variant-alternates" | "text-transform"
             | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break" | "flex-wrap"
             | "border-image-source" | "box-shadow" | "text-shadow"
-            | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" => parsed.iter().find_map(|declaration|
+            | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" | "transform-origin" => parsed.iter().find_map(|declaration|
                 serialize_typed(&declaration.value, raw, &name, &name)),
             "font-family" => parsed.iter().find_map(|declaration| match &declaration.value {
                 Value::FontFamily(value) => Some(serialize_font_families(value)),
@@ -888,6 +894,12 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                 MaskMode::Luminance => "luminance",
             })),
             join_css_components(parts.composites),
+            String::from("none"),
+            String::from("0"),
+            String::from("auto"),
+            String::from("0"),
+            String::from("stretch"),
+            String::from("alpha"),
         ];
         for (&target, value) in targets.iter().zip(values) {
             entries.push(Entry {
@@ -1030,6 +1042,11 @@ fn canonical_alias_uncached(name: &str) -> &str {
         "-webkit-flex-wrap" => "flex-wrap",
         "-webkit-justify-content" => "justify-content",
         "-webkit-order" => "order",
+        "-webkit-transform" => "transform",
+        "-webkit-transform-origin" => "transform-origin",
+        "-webkit-perspective" => "perspective",
+        "-webkit-perspective-origin" => "perspective-origin",
+        "-webkit-backface-visibility" => "backface-visibility",
         _ => super::corner_radii::alias(name).unwrap_or(name),
     }
 }
@@ -1858,7 +1875,7 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         return serialize_background(values);
     }
     if name == "mask" {
-        return super::mask_shorthand::synthesize(values);
+        return super::mask_shorthand::synthesize_with_border(values);
     }
     if name == "list-style" {
         let mut result = [""; 3];
@@ -2006,6 +2023,10 @@ pub(super) fn serialize_background_box(value: BackgroundBox) -> &'static str {
         BackgroundBox::Text => "text",
         BackgroundBox::BorderArea => "border-area",
         BackgroundBox::BorderAreaText => "border-area text",
+        BackgroundBox::Fill => "fill-box",
+        BackgroundBox::Stroke => "stroke-box",
+        BackgroundBox::View => "view-box",
+        BackgroundBox::NoClip => "no-clip",
     }
 }
 

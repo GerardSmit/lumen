@@ -530,7 +530,7 @@ pub fn unsupported_svg_features(
                         }
                     }
                 }
-                if local == "transform" && crate::svg::parse_transform(value).is_none() {
+                if local == "transform" && crate::svg::transform_unsupported(value) {
                     features.insert(SvgUnsupportedFeature::Transform);
                 }
                 if local == "preserveAspectRatio" && !valid_preserve_aspect_ratio(value) {
@@ -904,7 +904,7 @@ fn svg_clip_reference_supported(
                     | "g" | "a" | "use" | "svg" | "text"
             ))
         || crate::svg::attribute(attributes, "transform")
-            .is_some_and(|value| crate::svg::parse_transform(value).is_none())
+            .is_some_and(|value| crate::svg::transform_unsupported(value))
     {
         return Ok(false);
     }
@@ -957,7 +957,7 @@ fn svg_clip_reference_supported(
             continue;
         }
         if crate::svg::attribute(attributes, "transform")
-            .is_some_and(|value| crate::svg::parse_transform(value).is_none())
+            .is_some_and(|value| crate::svg::transform_unsupported(value))
         {
             return Ok(false);
         }
@@ -1134,7 +1134,7 @@ fn svg_use_target_supported(
         if tag=="symbol" && matches!(local,"refX"|"refY") && !crate::svg::supports_symbol_reference(value,local=="refX") {return Ok(false);}
         if (SVG_UNSUPPORTED_ATTRIBUTES.contains(&local)
                     && !(local == "filter" && css::supports_property_value("filter", value)))
-            || (local == "transform" && crate::svg::parse_transform(value).is_none())
+            || (local == "transform" && crate::svg::transform_unsupported(value))
             || (svg_length_attribute(tag, local) && !svg_length_attribute_supported(tag,local,value))
         {
             return Ok(false);
@@ -5364,6 +5364,10 @@ impl Layout<'_> {
         self.resolve_query_context(&mut style);
         self.apply_widget_layout_style(node, &mut style);
         self.apply_viewport_layout_style(node, &mut style);
+        self.document.note_remembered_size_interest(node, &style);
+        if let Some(size) = self.document.remembered_intrinsic_size(node) {
+            style.apply_remembered_intrinsic_size(size);
+        }
         let fallback = self.rules.layout_fallback();
         if fallback & css::FALLBACK_NO_COLUMNS != 0 {
             css::columns::clear(&mut style);
@@ -11524,7 +11528,11 @@ impl LayoutGeometry {
         let Some(_) = self.hits.get(index) else {
             return false;
         };
-        if !self.hit_rects(index).iter().any(|rect|rect.contains_rounded(local_x, local_y, 0.0)) {
+        let slack = if self.transforms.iter().any(|transform| transform.hits.contains(&index)) { 1.0 / 256.0 } else { 0.0 };
+        if !self.hit_rects(index).iter().any(|rect| {
+            let rect = Rect { x: rect.x - slack, y: rect.y - slack, width: rect.width + 2.0 * slack, height: rect.height + 2.0 * slack };
+            rect.contains_rounded(local_x, local_y, 0.0)
+        }) {
             return false;
         }
         self.rounded_clips
@@ -13664,9 +13672,9 @@ fn background_box(rect: Rect, style: &Style, kind: BackgroundBox) -> Rect {
     match kind {
         // CSS 2.1 §14.2.1 paints beneath transparent as well as opaque borders.
         BackgroundBox::Text | BackgroundBox::BorderArea | BackgroundBox::BorderAreaText
-            | BackgroundBox::Border => rect,
+            | BackgroundBox::Border | BackgroundBox::Stroke | BackgroundBox::View | BackgroundBox::NoClip => rect,
         BackgroundBox::Padding => padding_box(rect, style),
-        BackgroundBox::Content => content_box(rect, style),
+        BackgroundBox::Content | BackgroundBox::Fill => content_box(rect, style),
     }
 }
 
@@ -20366,13 +20374,20 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 if style.height.is_none() {style.height=Some(specified_height(style,natural.1));}
             }
         }
+        let block_first = self.is_sized_replaced_element(id)
+            && style.intrinsic_size_keywords(false).iter().any(Option::is_some);
+        if block_first {
+            self.resolve_intrinsic_axis(id, style, false, height, depth)?;
+        }
         self.resolve_intrinsic_axis(id, style, true, Some(width), depth)?;
         let measure_width = self.block_axis_measure_width(id, style, width, depth)?;
         let authored_width = style.width;
         if let Some(measured) = measure_width {
             style.width = Some(measured);
         }
-        self.resolve_intrinsic_axis(id, style, false, height, depth)?;
+        if !block_first {
+            self.resolve_intrinsic_axis(id, style, false, height, depth)?;
+        }
         if measure_width.is_some() {
             style.width = authored_width;
         }
@@ -20729,7 +20744,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .any(Option::is_some)
         }) {
             let mut used = style.clone();
-            for horizontal in [true, false] {
+            let axis_order = if self.is_sized_replaced_element(id) { [false, true] } else { [true, false] };
+            for horizontal in axis_order {
                 resolve_intrinsic_axis_with(&mut used, horizontal, None, |measurement, mode| {
                     self.intrinsic_size_mode(id, measurement, depth + 1, mode)
                 })?;
@@ -20930,6 +20946,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .map(|height| content_height_dimension(style, height));
             let (width, height) = replaced_content_dimensions(style, width, height,
                 (natural_width, natural_height), natural_ratio);
+            let width = if minimum && aspect_ratio_layout::compressible_replaced(style) { 0.0 } else { width };
             return Ok((constrained_width(style, width) + edges, constrained_height(style, height) + vertical_edges));
         }
         if tag == "canvas" || tag == "video" {
@@ -20946,6 +20963,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let (width,height) = replaced_content_dimensions(style,
                 style.width.map(|value| content_dimension(style,value)),
                 style.height.map(|value| content_height_dimension(style,value)),natural,ratio);
+            let width = if minimum && aspect_ratio_layout::compressible_replaced(style) { 0.0 } else { width };
             return Ok((width + edges,height + vertical_edges));
         }
         self.intrinsic_formatting_children(id, style, origin, depth, minimum, prepared_children)
@@ -26043,7 +26061,20 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         {
             item_style.defer_stretch_keywords(!row);
         }
+        let stretches_cross = !row && !cross_auto_margin
+            && !matches!(item_style.position, Position::Absolute | Position::Fixed)
+            && item_style.writing_mode == css::WritingMode::HorizontalTb
+            && item_style.self_alignment(container_style, false).alignment == AlignItems::Stretch;
+        let mut stretched_cross_width = false;
         for horizontal in [true, false] {
+            if !horizontal && stretches_cross && item_style.width.is_none()
+                && !item_style.intrinsic_size_keywords(false).iter().all(Option::is_none) {
+                item_style.width = Some(specified_dimension(
+                    &item_style,
+                    (width - box_edges(&item_style, true)).max(0.0),
+                ));
+                stretched_cross_width = true;
+            }
             resolve_intrinsic_axis_with(
                 &mut item_style,
                 horizontal,
@@ -26062,6 +26093,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     )
                 },
             )?;
+        }
+        if stretched_cross_width {
+            item_style.width = None;
         }
         let absolute = matches!(item_style.position, Position::Absolute | Position::Fixed);
         let shortcuts = flex_shortcuts_enabled();
@@ -38729,6 +38763,28 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     fit_y = vertical.alignment != AlignItems::Stretch && style.top.is_some() && style.bottom.is_some()
                         && (style.margin_auto[0] || style.margin_auto[2]) && !tabular;
                 }
+                let positioned_ratio = self.positioned_ratio_applies(id, style);
+                let mut ratio_height_after_width = false;
+                if positioned_ratio {
+                    match (style.width, style.height) {
+                        (None, Some(height)) => style.width = ratio_width(style, height),
+                        (Some(width), None) => style.height = ratio_height(style, width),
+                        (None, None) => {
+                            let horizontal_stretch = style.left.is_some() && style.right.is_some();
+                            if let (Some(top), Some(bottom), false) = (style.top, style.bottom, horizontal_stretch) {
+                                let height = specified_height(
+                                    style,
+                                    (containing.height - top - bottom - box_edges(style, false)).max(0.0),
+                                );
+                                style.height = Some(height);
+                                style.width = ratio_width(style, height);
+                            } else {
+                                ratio_height_after_width = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let had_definite_width = style.width.is_some();
                 let had_definite_height = style.height.is_some();
                 if style.width.is_none() {
@@ -38774,6 +38830,18 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     if let Some(width) = style.width {
                         if minimum > content_dimension(style, width) + edges {
                             style.width = Some(specified_dimension(style, (minimum - edges).max(0.0)));
+                        }
+                    }
+                }
+                if ratio_height_after_width {
+                    if let Some(width) = style.width {
+                        let content = content_dimension(style, width);
+                        let transferred = aspect_ratio_layout::transferred_inline_size(style, content);
+                        if transferred != content {
+                            style.width = Some(specified_dimension(style, transferred));
+                        }
+                        if let Some(width) = style.width {
+                            style.height = ratio_height(style, width);
                         }
                     }
                 }
@@ -40261,11 +40329,25 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         }
         // CSS Sizing §6.1: aspect-ratio derives the auto dimension from the
         // definite one.
+        let mut ratio_block_derived = false;
+        let mut ratio_inline_derived = false;
+        let mut ratio_both_auto = false;
         if style.preferred_aspect_ratio(None).is_some() && !matches!(tag, "img" | "canvas" | "video")
             && !html_image_button(tag, attributes) && !object_image && replacement_source.is_none() {
+            let flow_ratio = parent_style.display != Display::Flex && parent_style.display != Display::Grid;
             match (style.width, style.height) {
-                (Some(width), None) => style.height = ratio_height(&style, width),
-                (None, Some(height)) => style.width = ratio_width(&style, height),
+                (Some(width), None) => {
+                    style.height = ratio_height(&style, width);
+                    ratio_block_derived = flow_ratio && style.height.is_some();
+                }
+                (None, Some(height)) => {
+                    style.width = ratio_width(&style, height);
+                    ratio_inline_derived = flow_ratio && style.width.is_some();
+                }
+                (None, None) => {
+                    ratio_both_auto = !virtual_parent && !display_contents
+                        && aspect_ratio_layout::block_flow_ratio_box(&style, parent_style, tag);
+                }
                 _ => {}
             }
         }
@@ -40324,6 +40406,25 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     specified_height(&style, (content_height_dimension(&style, height) - fieldset.spill).max(0.0)));
                 border_top += fieldset.spill;
             }
+        }
+        if ratio_inline_derived && !generated_box && style.min_width_auto && !style.overflow_x.scroll_container() {
+            let minimum = self.ratio_min_content_width(id, &style, depth)?;
+            let limit = style.max_width.map_or(f32::INFINITY, |maximum| content_dimension(&style, maximum));
+            let widened = minimum.min(limit);
+            if widened > content_width {
+                content_width = widened;
+                style.width = Some(specified_dimension(&style, widened));
+            }
+        }
+        if ratio_both_auto {
+            let width = aspect_ratio_layout::transferred_inline_size(&style, content_width);
+            if width != content_width {
+                content_width = width;
+                style.width = Some(specified_dimension(&style, width));
+            }
+            style.height = aspect_ratio_layout::ratio_content_height(&style, content_width)
+                .map(|height| specified_height(&style, height));
+            ratio_block_derived = style.height.is_some();
         }
         // Pseudos are children of this principal box. Their computed carriers
         // were captured before its used content dimensions were available;
@@ -40580,14 +40681,25 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     if style.visibility_visible
                         && (self.source_capture_depth != 0 || self.transform_depth > 0 || rect.intersection(self.cull).is_some())
                     {
+                        let scheme=style.used_color_scheme(self.media_environment()).scheme;
+                        let image_rect=match css::object_fit::ObjectFit::of(&style) {
+                            Some(fit)=>fit.destination(rect,image_natural_size(self.images,Some(id),&image,scheme)),
+                            None=>rect,
+                        };
                         let image=match (self.images,source) {
-                            (Some(images),Some(source))=>match images.resolve_viewport(Some(id),self.rules.document_base_url().unwrap_or(""),source,&image,rect.width,rect.height,style.used_color_scheme(self.media_environment()).scheme) {
+                            (Some(images),Some(source))=>match images.resolve_viewport(Some(id),self.rules.document_base_url().unwrap_or(""),source,&image,image_rect.width,image_rect.height,scheme) {
                                 Some(ImageState::Ready(viewport_image)) if viewport_image.is_valid()=>viewport_image,
                                 _=>image,
                             },
                             _=>image,
                         };
-                        self.push_command(Command::Image { rect, image })?;
+                        if image_rect==rect {
+                            self.push_command(Command::Image { rect, image })?;
+                        } else {
+                            self.push_command(Command::PushBoxClip(rect))?;
+                            self.push_command(Command::Image { rect: image_rect, image })?;
+                            self.push_command(Command::PopClip)?;
+                        }
                     }
                 } else if let Some(deferred) = deferred_image {
                     if style.visibility_visible
@@ -42726,6 +42838,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 owner.resolve_used_constraints(&style);
             }
         }
+        let ratio_minimum_height = if ratio_block_derived && style.min_height_auto && !style.overflow_y.scroll_container() {
+            content_extent_height.min(style.max_height.map_or(f32::INFINITY, |maximum| content_height_dimension(&style, maximum)))
+        } else { 0.0 };
         let content_height = constrained_height(
             &style,
             style.height.map_or(
@@ -42735,7 +42850,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 } else {
                     content_extent_height
                 },
-                |height| content_height_dimension(&style, height),
+                |height| content_height_dimension(&style, height).max(ratio_minimum_height),
             ),
         )
         .max(0.0);
@@ -43889,6 +44004,9 @@ fn laid_out_display_list_once(
 
 #[path = "layout_anchor.rs"]
 mod anchor_layout;
+
+#[path = "layout_aspect_ratio.rs"]
+mod aspect_ratio_layout;
 
 #[path = "layout_clamp.rs"]
 mod line_clamp;
@@ -55027,7 +55145,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 let first=session.display_list(400,300,&RecordingText::default()).unwrap().clone();
                 let reference=crate::html::parse(&reference,128).unwrap();
                 let expected=display_list(&reference,400,300,&RecordingText::default()).unwrap();
-                assert_eq!(paint(&first),paint(&expected),"canonical anonymous item: {display}; {sizing}");
+                assert_eq!(paint(&first),paint(&expected),"canonical anonymous item: {container}; {display}; {sizing}");
                 let host=crate::selector::query_selector(session.document(),session.document().root(),"#host").unwrap().unwrap();
                 assert_eq!(session.hit_test(6.0,6.0),Some(host),"generated principal keeps its actual originating hit owner: {container}; {display}; {sizing}");
                 assert_eq!(first,session.display_list(400,300,&RecordingText::default()).unwrap().clone());

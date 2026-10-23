@@ -2996,6 +2996,36 @@ macro_rules! impl_canvas_2d_methods {
                 }
             }
             #[getter]
+            fn filter(&self) -> String {
+                self.data
+                    .borrow()
+                    .surface
+                    .state()
+                    .filter
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |filter| filter.text.to_string())
+            }
+            #[setter]
+            fn set_filter(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
+                let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
+                let text: &str = text.as_ref();
+                let size = self.data.borrow().text.size;
+                let current = current_canvas_color(&self.realm, self.node);
+                if let Some(parsed) = lumen_html::css::canvas_filter::parse_canvas_filter(text, current, size) {
+                    let mut data = self.data.borrow_mut();
+                    let state = data.surface.state_mut();
+                    if parsed.operations.is_empty() {
+                        state.filter = None;
+                    } else {
+                        state.filter = Some(std::sync::Arc::new(lumen_html_image::canvas::CanvasFilter {
+                            operations: parsed.operations,
+                            text: parsed.text.into(),
+                        }));
+                    }
+                }
+                Ok(())
+            }
+            #[getter]
             fn fill_style(&self) -> Value {
                 let data = self.data.borrow();
                 data.fill_gradient_value
@@ -3822,16 +3852,29 @@ macro_rules! impl_canvas_2d_methods {
                 }
                 Ok(())
             }
-            fn begin_layer(&self, options: Option<Value>) -> OpResult<()> {
+            fn begin_layer(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<()> {
                 if options
                     .as_ref()
                     .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null | Value::Obj(_)))
                 {
                     return Err(OpError::type_error("beginLayer options must be an object"));
                 }
+                let mut layer_filter = None;
+                if let Some(options @ Value::Obj(_)) = &options {
+                    let value = ctx.member_get(options, "filter").map_err(OpError::thrown)?;
+                    if !matches!(value, Value::Undefined) {
+                        let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
+                        let text: &str = text.as_ref();
+                        let size = self.data.borrow().text.size;
+                        let current = current_canvas_color(&self.realm, self.node);
+                        layer_filter = lumen_html::css::canvas_filter::parse_canvas_filter(text, current, size)
+                            .map(|parsed| parsed.operations)
+                            .filter(|operations| !operations.is_empty());
+                    }
+                }
                 // The entry save holds native state and traced JS style values.
                 self.save();
-                let result = self.data.borrow_mut().surface.begin_layer();
+                let result = self.data.borrow_mut().surface.begin_layer(layer_filter);
                 if result.is_err() {
                     let _ = self.restore();
                     return Err(OpError::new("QuotaExceededError", "Canvas layer budget exceeded"));
@@ -3967,7 +4010,7 @@ macro_rules! impl_canvas_2d_methods {
                     ),
                 );
             }
-            #[method(name = "arc")]
+            #[method(name = "arc", coerce)]
             fn arc(
                 &self,
                 x: f64,
@@ -4005,7 +4048,7 @@ macro_rules! impl_canvas_2d_methods {
                     Ok(())
                 })
             }
-            #[method(name = "ellipse")]
+            #[method(name = "ellipse", coerce)]
             fn ellipse(
                 &self,
                 x: f64,
@@ -6069,11 +6112,22 @@ fn current_canvas_color(realm: &Option<Rc<DomRealm>>, node: Option<NodeId>) -> R
     })
 }
 
+/// CSS closes functions that are still open at the end of the input.
+fn close_open_functions(text: &str) -> std::borrow::Cow<'_, str> {
+    let open = text.bytes().filter(|byte| *byte == b'(').count();
+    let close = text.bytes().filter(|byte| *byte == b')').count();
+    if open > close {
+        std::borrow::Cow::Owned(format!("{text}{}", ")".repeat(open - close)))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn parse_style_color(value: &Value, current: Rgba) -> Option<[u8; 4]> {
     let Value::Str(value) = value else {
         return None;
     };
-    let color = lumen_html::css::parse_animation_color(value.as_str(), current)?;
+    let color = lumen_html::css::parse_animation_color(&close_open_functions(value.as_str()), current)?;
     Some([color.r, color.g, color.b, color.a])
 }
 
@@ -6094,7 +6148,7 @@ fn parse_canvas_color_exact(value: &Value, current: Rgba, space: CanvasColorSpac
         return None;
     };
     let current = lumen_common::color::Color::rgba8([current.r, current.g, current.b, current.a]);
-    let mut color = lumen_html::css::parse_animation_unclipped_color(text.as_str(), current)?.value;
+    let mut color = lumen_html::css::parse_animation_unclipped_color(&close_open_functions(text.as_str()), current)?.value;
     if color.space == lumen_common::color::ColorSpace::Srgb {
         color.components = color.components.map(|component| component.clamp(0.0, 1.0));
     }
@@ -6110,7 +6164,7 @@ fn color_function_text(value: &Value, current: Rgba) -> Option<String> {
         return None;
     };
     let current = lumen_common::color::Color::rgba8([current.r, current.g, current.b, current.a]);
-    let parsed = lumen_html::css::parse_animation_unclipped_color(text.as_str(), current)?;
+    let parsed = lumen_html::css::parse_animation_unclipped_color(&close_open_functions(text.as_str()), current)?;
     if parsed.color_function {
         parsed.serialize()
     } else {

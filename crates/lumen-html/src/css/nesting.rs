@@ -15,6 +15,7 @@ pub enum SourceRuleKind {
     CounterStyle,
     FontFeatureValues,
     FontPaletteValues,
+    ViewTransition,
     Keyframes,
     Keyframe,
     Statement,
@@ -799,6 +800,9 @@ fn parse_body(
             SourceRuleKind::FontFeatureValues
         } else if at_rule(prelude, "@font-palette-values") && (parent.is_none() || scope_body || starting_context) {
             SourceRuleKind::FontPaletteValues
+        } else if at_rule(prelude, "@view-transition") && prelude["@view-transition".len()..].trim().is_empty()
+            && (parent.is_none() || scope_body || starting_context) {
+            SourceRuleKind::ViewTransition
         } else if at_rule(prelude, "@scope") {
             SourceRuleKind::Scope
         } else if at_rule(prelude, "@media")
@@ -899,7 +903,7 @@ fn parse_body(
             range: start..end,
             prelude: start..open,
             body: Some(open + 1..close),
-            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues)
+            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition)
                 .then_some(open + 1),
             declaration_ranges: Vec::new(),
             children: Vec::new(),
@@ -936,7 +940,7 @@ fn parse_body(
                     node.declaration_ranges = leading.declaration_ranges;
                 }
             }
-            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
+            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
             SourceRuleKind::Page => page_rules::fill_body(text, open, close, &mut node, count)?,
             SourceRuleKind::Keyframes => {
                 for (frame_start, frame_end, frame_open, frame_close) in

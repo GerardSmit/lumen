@@ -260,6 +260,9 @@ pub struct DomNavigator {
     permissions: Value,
     user_activation: Value,
     languages: Value,
+    plugins: Value,
+    mime_types: Value,
+    window_controls_overlay: Value,
     /// `fetch` as it was when the document was installed; page script cannot replace it.
     fetch: Value,
     beacon_bytes: Rc<Cell<usize>>,
@@ -274,7 +277,7 @@ impl lumen::embed::NativeIdentityOwner for DomNavigator {
     const TRACES_NATIVE_VALUES: bool=true;
     fn trace_native_identities(&self,_:u64,_:&mut dyn FnMut(&Value)){}
     fn trace_native_values(&self,visit:&mut dyn FnMut(&Value)) {
-        visit(&self.clipboard);visit(&self.permissions);visit(&self.user_activation);visit(&self.languages);visit(&self.fetch);
+        visit(&self.clipboard);visit(&self.permissions);visit(&self.user_activation);visit(&self.languages);visit(&self.fetch);visit(&self.plugins);visit(&self.mime_types);visit(&self.window_controls_overlay);
     }
 }
 
@@ -445,6 +448,51 @@ impl DomNavigator {
     #[getter]
     fn user_activation(&self) -> Value {
         self.user_activation.clone()
+    }
+
+    #[getter]
+    fn plugins(&self) -> Value {
+        self.plugins.clone()
+    }
+
+    #[getter(name = "mimeTypes")]
+    fn mime_types(&self) -> Value {
+        self.mime_types.clone()
+    }
+
+    #[getter(name = "windowControlsOverlay")]
+    fn window_controls_overlay(&self) -> Value {
+        self.window_controls_overlay.clone()
+    }
+
+    #[getter]
+    fn oscpu(&self) -> String {
+        self.profile.platform.clone()
+    }
+
+    #[method(name = "taintEnabled")]
+    fn taint_enabled(&self) -> bool {
+        false
+    }
+
+    #[method(name = "registerProtocolHandler", coerce)]
+    fn register_protocol_handler(&self, scheme: &str, url: &str) -> OpResult<()> {
+        self.check_protocol_handler(scheme, url)
+    }
+
+    #[method(name = "unregisterProtocolHandler", coerce)]
+    fn unregister_protocol_handler(&self, scheme: &str, url: &str) -> OpResult<()> {
+        self.check_protocol_handler(scheme, url)
+    }
+}
+
+impl DomNavigator {
+    fn check_protocol_handler(&self, scheme: &str, url: &str) -> OpResult<()> {
+        let realm = self
+            .realm
+            .upgrade()
+            .ok_or_else(|| OpError::new("InvalidStateError", "the navigator realm has been destroyed"))?;
+        crate::navigator_extras::check_protocol_handler(&realm, scheme, url)
     }
 }
 
@@ -777,6 +825,9 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         permissions,
         user_activation,
         languages,
+        plugins: crate::navigator_extras::new_plugin_array(ctx),
+        mime_types: crate::navigator_extras::new_mime_type_array(ctx),
+        window_controls_overlay: crate::navigator_extras::new_window_controls_overlay(ctx),
         fetch,
         beacon_bytes: Rc::new(Cell::new(0)),
         profile,
@@ -794,10 +845,15 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.set_native_internal_value_slot(&global, window_globals::NAVIGATOR_OWNER, navigator.clone())
         .map_err(OpError::thrown)?;
     let navigator_constructor = ctx.class_constructor::<DomNavigator>();
+    for (name, constructor) in crate::navigator_extras::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| OpError::new("Error", "navigator interface installation failed"))?;
+    }
     let clipboard_constructor = ctx.class_constructor::<DomClipboard>();
     let permissions_constructor = ctx.class_constructor::<DomPermissions>();
     let status_constructor = ctx.class_constructor::<DomPermissionStatus>();
     let activation_constructor = ctx.class_constructor::<DomUserActivation>();
+    crate::idl_shape::make_root_interface(ctx, &navigator_constructor, &clipboard_constructor)?;
     crate::install_interface(ctx, &global, "Navigator", navigator_constructor)
         .and_then(|_| crate::install_interface(ctx, &global, "Clipboard", clipboard_constructor))
         .and_then(|_| {
@@ -967,14 +1023,14 @@ mod tests {
         }));
         eval(
             &mut engine,
-            "var status, changes=0, queryError=''; navigator.permissions.query({name:'clipboard-read'}).then(value=>{status=value;status.onchange=()=>changes++},error=>queryError=error.name)",
+            "var permissionStatus, changes=0, queryError=''; navigator.permissions.query({name:'clipboard-read'}).then(value=>{permissionStatus=value;permissionStatus.onchange=()=>changes++},error=>queryError=error.name)",
         );
         engine.ctx().drain_microtasks_for_host();
         assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
         assert!(matches!(
             eval(
                 &mut engine,
-                "navigator.permissions instanceof Permissions && status instanceof PermissionStatus && status instanceof EventTarget && status.name==='clipboard-read' && status.state==='prompt' && queryError===''"
+                "navigator.permissions instanceof Permissions && permissionStatus instanceof PermissionStatus && permissionStatus instanceof EventTarget && permissionStatus.name==='clipboard-read' && permissionStatus.state==='prompt' && queryError===''"
             ),
             Value::Bool(true)
         ));
@@ -984,12 +1040,12 @@ mod tests {
             .notify_clipboard_permissions_changed(engine.ctx())
             .unwrap();
         assert!(matches!(
-            eval(&mut engine, "status.state==='granted' && changes===0"),
+            eval(&mut engine, "permissionStatus.state==='granted' && changes===0"),
             Value::Bool(true)
         ));
         assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
         assert!(matches!(
-            eval(&mut engine, "status.state==='granted' && changes===1"),
+            eval(&mut engine, "permissionStatus.state==='granted' && changes===1"),
             Value::Bool(true)
         ));
 
@@ -1015,7 +1071,7 @@ mod tests {
             read_text: Rc::new(|| Ok(String::new())),
             write_text: Rc::new(|_| Ok(())),
         }));
-        eval(&mut engine, "var queryOrder=[]; navigator.permissions.query({name:'clipboard-read'}).then(status=>{queryOrder.push(status instanceof PermissionStatus && status.state==='granted' ? 'query' : 'bad');navigator.permissions.query({name:'clipboard-write'}).then(()=>queryOrder.push('nested'))});Promise.resolve().then(()=>queryOrder.push('microtask'))");
+        eval(&mut engine, "var queryOrder=[]; navigator.permissions.query({name:'clipboard-read'}).then(permissionStatus=>{queryOrder.push(permissionStatus instanceof PermissionStatus && permissionStatus.state==='granted' ? 'query' : 'bad');navigator.permissions.query({name:'clipboard-write'}).then(()=>queryOrder.push('nested'))});Promise.resolve().then(()=>queryOrder.push('microtask'))");
         engine.ctx().drain_microtasks_for_host();
         assert!(matches!(
             eval(&mut engine, "queryOrder.join(',')==='microtask'"),
@@ -1049,7 +1105,7 @@ mod tests {
             read_text: Rc::new(|| Ok(String::new())),
             write_text: Rc::new(|_| Ok(())),
         }));
-        eval(&mut engine, "var firstStatus,secondStatus,permissionOrder=[]; navigator.permissions.query({name:'clipboard-read'}).then(status=>{firstStatus=status;status.onchange=event=>{permissionOrder.push(event.isTrusted && !event.bubbles && !event.cancelable && event.target===status ? 'first' : 'bad');Promise.resolve().then(()=>permissionOrder.push('checkpoint'));throw new Error('listener failure')}}); navigator.permissions.query({name:'clipboard-write'}).then(status=>{secondStatus=status;status.addEventListener('change',event=>permissionOrder.push(event.isTrusted && event.currentTarget===status ? 'second' : 'bad'))})");
+        eval(&mut engine, "var firstStatus,secondStatus,permissionOrder=[]; navigator.permissions.query({name:'clipboard-read'}).then(permissionStatus=>{firstStatus=permissionStatus;permissionStatus.onchange=event=>{permissionOrder.push(event.isTrusted && !event.bubbles && !event.cancelable && event.target===permissionStatus ? 'first' : 'bad');Promise.resolve().then(()=>permissionOrder.push('checkpoint'));throw new Error('listener failure')}}); navigator.permissions.query({name:'clipboard-write'}).then(permissionStatus=>{secondStatus=permissionStatus;permissionStatus.addEventListener('change',event=>permissionOrder.push(event.isTrusted && event.currentTarget===permissionStatus ? 'second' : 'bad'))})");
         engine.ctx().drain_microtasks_for_host();
         assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
         permission.set(ClipboardPermission::Granted);
@@ -1113,12 +1169,12 @@ mod tests {
         realm.mark_user_activation();
         eval(
             &mut engine,
-            "var status, changes=0; navigator.permissions.query({name:'clipboard-read'}).then(value=>{status=value;status.onchange=()=>changes++})",
+            "var permissionStatus, changes=0; navigator.permissions.query({name:'clipboard-read'}).then(value=>{permissionStatus=value;permissionStatus.onchange=()=>changes++})",
         );
         engine.ctx().drain_microtasks_for_host();
         assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
         assert!(matches!(
-            eval(&mut engine, "status.state==='granted'"),
+            eval(&mut engine, "permissionStatus.state==='granted'"),
             Value::Bool(true)
         ));
 
@@ -1129,14 +1185,14 @@ mod tests {
         assert_eq!(realm.browser_services_delay_ms(), Some(0));
         realm.pump_browser_services(engine.ctx()).unwrap();
         assert!(matches!(
-            eval(&mut engine, "status.state==='prompt' && changes===0"),
+            eval(&mut engine, "permissionStatus.state==='prompt' && changes===0"),
             Value::Bool(true)
         ));
         assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
         assert!(matches!(
             eval(
                 &mut engine,
-                "status.state==='prompt' && changes===1 && !navigator.userActivation.isActive && navigator.userActivation.hasBeenActive"
+                "permissionStatus.state==='prompt' && changes===1 && !navigator.userActivation.isActive && navigator.userActivation.hasBeenActive"
             ),
             Value::Bool(true)
         ));

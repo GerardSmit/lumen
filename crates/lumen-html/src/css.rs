@@ -38,6 +38,9 @@ pub(crate) use rule_fragment::RuleSegment;
 pub mod namespaces;
 pub mod selector_serialization;
 mod view_transition_selector;
+mod view_transition_state;
+pub mod view_transition_rule;
+pub use view_transition_selector::parse_computed_target as parse_view_transition_pseudo;
 mod font_face_source;
 pub mod media_query_text;
 pub(crate) mod extra_props;
@@ -48,6 +51,8 @@ mod owner_values;
 mod palette_mix;
 mod dynamic_range_limit;
 mod value_props;
+mod image_resolution;
+pub(crate) mod object_fit;
 mod value_shorthands;
 mod shorthand_rules;
 mod gap_rules;
@@ -88,6 +93,7 @@ pub mod function_rule;
 pub mod function_eval;
 mod if_function;
 mod filter_lists;
+pub mod canvas_filter;
 pub fn is_extra_property(name:&str)->bool{extra_props::animates_here(name)}
 pub fn transform_origin_endpoint(raw:&str)->Option<String>{transform_origin::endpoint(raw)}
 pub fn top_level_component_count(raw:&str)->Option<usize>{components(raw).map(|items|items.len())}
@@ -131,6 +137,7 @@ pub(crate) mod color_scheme;
 pub use color_scheme::{ColorSchemeEnvironment,ColorSchemePreference,ColorSchemeSupport,UsedColorScheme,UsedScheme};
 pub mod typed_transforms;
 mod individual_transforms;
+mod backface_visibility;
 pub mod text_breaks;
 mod numeric_tokens;
 mod text_props;
@@ -4651,6 +4658,9 @@ impl Style {
     }
     pub(crate) fn transform_matrix_with_source(&self,rect:Rect,used_source:Option<&str>)->Option<Affine>{
         if !self.has_transform(){return None;}
+        if self.backface_hidden()&&self.transform_faces_away([rect.width as f64,rect.height as f64]){
+            return Some(Affine{a:0.0,b:0.0,c:0.0,d:0.0,e:0.0,f:0.0});
+        }
         let transforms = self.transforms.as_deref().unwrap_or(&[]);
         let mut matrix = Affine {
             a: 1.0,
@@ -8672,8 +8682,9 @@ fn rule_media_matches(&self, order: usize) -> bool {
             return Err(CssError { offset: 0, message: "invalid view transition pseudo target" });
         }
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid view transition origin" })?;
+        let key = name.map(serialize_css_identifier);
         compute_for_named(kind, inherited, self, Some((document, origin)), AncestorBloom::ALL,
-            Some(text), Some(pseudo), name, None)
+            Some(text), Some(pseudo), key.as_deref(), None)
     }
 
     /// The full computed style of a highlight pseudo-element, inheriting from
@@ -13627,8 +13638,8 @@ property_registry! {
     "background-repeat" => [70], false, true;
     "background-clip" => [71], false, true;
     "background-origin" => [72], false, true;
-    "mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite")], false, true;
-    "-webkit-mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite")], false, true;
+    "mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite"),277,278,279,280,281,282], false, true;
+    "-webkit-mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite"),277,278,279,280,281,282], false, true;
     "mask-image" => [257], false, true;
     "-webkit-mask-image" => [257], false, true;
     "mask-position" => [258], false, true;
@@ -14100,6 +14111,7 @@ property_registry! {
     "font-variant-numeric" => [extra_props::VALUE_BASE + value_props::const_index("font-variant-numeric")], true, true;
     "font-variation-settings" => [extra_props::VALUE_BASE + value_props::const_index("font-variation-settings")], true, true;
     "image-rendering" => [extra_props::VALUE_BASE + value_props::const_index("image-rendering")], true, true;
+    "image-resolution" => [extra_props::VALUE_BASE + value_props::const_index("image-resolution")], true, true;
     "isolation" => [extra_props::VALUE_BASE + value_props::const_index("isolation")], false, true;
     "lighting-color" => [extra_props::VALUE_BASE + value_props::const_index("lighting-color")], false, true;
     "marker-start" => [extra_props::VALUE_BASE + value_props::const_index("marker-start")], true, true;
@@ -14202,10 +14214,11 @@ property_registry! {
 pub fn cssom_property_names() -> Vec<&'static str> {
     // `all` is the registry's special reset projection rather than a row
     // with duplicated slots, but it still has a CSSStyleDeclaration accessor.
-    const LEGACY_FLEX_ALIASES: [&str; 12] = [
+    const LEGACY_FLEX_ALIASES: [&str; 17] = [
         "-webkit-align-content", "-webkit-align-items", "-webkit-align-self", "-webkit-flex",
         "-webkit-flex-basis", "-webkit-flex-direction", "-webkit-flex-flow", "-webkit-flex-grow",
         "-webkit-flex-shrink", "-webkit-flex-wrap", "-webkit-justify-content", "-webkit-order",
+        "-webkit-transform", "-webkit-transform-origin", "-webkit-perspective", "-webkit-perspective-origin", "-webkit-backface-visibility",
     ];
     PROPERTIES.iter().map(|property| property.name)
         .filter(|name| !name.starts_with("-lumen-"))
@@ -15811,6 +15824,7 @@ fn radial_gradient_with_source(
             fraction: 0.5,
         }; 2],
     );
+    let mut radius_percentage = false;
     let first_stop = if !explicit_method && (color_values::endpoint(tokens.first()?,0).is_some()
         || decoded_css_keyword(tokens.first()?,"currentcolor"))
     {
@@ -15820,7 +15834,7 @@ fn radial_gradient_with_source(
         while index < tokens.len() {
             let token = tokens[index];
             if decoded_css_keyword(token,"at") {
-                center = background_position_with_query(&tokens[index + 1..], context,query)?;
+                center = gradient_position(&tokens[index + 1..], context, query)?;
                 break;
             }
             if decoded_css_keyword(token,"circle") || decoded_css_keyword(token,"ellipse") {
@@ -15854,6 +15868,7 @@ fn radial_gradient_with_source(
                     return None;
                 }
                 radii.push(value);
+                radius_percentage |= token.contains('%');
             }
             index += 1;
         }
@@ -15867,7 +15882,7 @@ fn radial_gradient_with_source(
     let size = if radii.is_empty() {
         size.unwrap_or(RadialSize::FarthestCorner)
     } else if shape == RadialShape::Circle {
-        if radii.len() != 1 || radii[0].fraction != 0.0 {
+        if radii.len() != 1 || radii[0].fraction != 0.0 || radius_percentage {
             return None;
         }
         RadialSize::Radii([radii[0]; 2])
@@ -16029,7 +16044,7 @@ fn conic_gradient_with_source(raw: &str, current_color: &SourceColor, context: O
             let start = index + 1;
             let end = tokens[start..].iter().position(|token| decoded_css_keyword(token, "from") || decoded_css_keyword(token, "at"))
                 .map_or(tokens.len(), |offset| start + offset);
-            center = Some(background_position_with_query(&tokens[start..end], context, query)?);
+            center = Some(gradient_position(&tokens[start..end], context, query)?);
             index = end;
         } else if index == 0 {
             // No directive: the first comma component is the first color stop.
@@ -16101,6 +16116,13 @@ fn conic_stops(parts: &[&str], current_color: &SourceColor, context: LengthConte
     Some((stops.into(), angular, colors, legacy, color_functions))
 }
 
+/// Gradient and mask positions take one, two or four components.
+fn gradient_position(tokens: &[&str], context: LengthContext, query: ContainerUnitContext) -> Option<[LengthPercentage; 2]> {
+    if tokens.len() == 3 {
+        return None;
+    }
+    background_position_with_query(tokens, context, query)
+}
 fn background_position(tokens: &[&str], context: LengthContext) -> Option<[LengthPercentage; 2]> {
     background_position_with_query(tokens, context, ContainerUnitContext::no_container(context.viewport))
 }
@@ -16896,7 +16918,7 @@ fn mask_image_value(raw: &str) -> Option<Value> {
 fn mask_position_value(raw: &str) -> Option<Value> {
     let context = static_length_context();
     for part in top_level_split(raw, b',', MAX_BACKGROUND_GEOMETRY_VALUES)? {
-        background_position(&components(part)?, context)?;
+        gradient_position(&components(part)?, context, ContainerUnitContext::no_container(context.viewport))?;
     }
     background_positions::shorthand_lists(raw)?;
     Some(Value::MaskPosition(background_positions(raw, None)))
@@ -16918,17 +16940,37 @@ fn mask_repeat_value(repeats: Arc<[[BackgroundRepeat; 2]]>) -> Value {
     Value::MaskRepeat((!initial).then_some(repeats))
 }
 
-/// Maps the css-masking geometry boxes onto the boxes an HTML element has.
-/// `fill-box` is the content box and `stroke-box`/`view-box` the border box;
-/// `no-clip` (clip only) paints without a clip, which the border box
-/// approximates because mask layers never extend beyond it.
+/// The css-masking geometry boxes; `no-clip` is accepted for `mask-clip` only.
 fn mask_box_keyword(token: &str, clip: bool) -> Option<&'static str> {
     match &*ascii_lower(token) {
-        "border-box" | "stroke-box" | "view-box" => Some("border-box"),
+        "border-box" => Some("border-box"),
         "padding-box" => Some("padding-box"),
-        "content-box" | "fill-box" => Some("content-box"),
-        "no-clip" if clip => Some("border-box"),
+        "content-box" => Some("content-box"),
+        "fill-box" => Some("fill-box"),
+        "stroke-box" => Some("stroke-box"),
+        "view-box" => Some("view-box"),
+        "no-clip" if clip => Some("no-clip"),
         _ => None,
+    }
+}
+
+/// The HTML box the background grammar can stand in for a mask geometry box while the shorthand
+/// is split into layers.
+fn mask_stand_in_box(keyword: &'static str) -> &'static str {
+    match keyword {
+        "fill-box" => "content-box",
+        "stroke-box" | "view-box" | "no-clip" => "border-box",
+        other => other,
+    }
+}
+
+fn parse_mask_box(keyword: &str) -> Option<BackgroundBox> {
+    match keyword {
+        "fill-box" => Some(BackgroundBox::Fill),
+        "stroke-box" => Some(BackgroundBox::Stroke),
+        "view-box" => Some(BackgroundBox::View),
+        "no-clip" => Some(BackgroundBox::NoClip),
+        _ => parse_background_box(keyword),
     }
 }
 
@@ -16938,7 +16980,7 @@ fn mask_boxes_value(slot: usize, raw: &str) -> Option<Value> {
     for part in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
         let tokens = components(part)?;
         let [token] = tokens.as_slice() else { return None };
-        boxes.push(parse_background_box(mask_box_keyword(token, clip)?)?);
+        boxes.push(parse_mask_box(mask_box_keyword(token, clip)?)?);
     }
     let initial = boxes.iter().all(|value| *value == BackgroundBox::Border);
     Some(Value::MaskBoxes(slot, (!initial).then(|| boxes.into())))
@@ -16968,11 +17010,13 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
     let mut layers = Vec::new();
     let mut modes = Vec::new();
     let mut composites = Vec::new();
+    let mut layer_boxes: Vec<Vec<&'static str>> = Vec::new();
     for layer in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
         let mut mode = None;
         let mut composite = None;
         let mut tokens = Vec::new();
         let mut boxes = 0;
+        let mut real_boxes = Vec::new();
         for token in components(layer)? {
             match &*ascii_lower(token) {
                 "match-source" | "alpha" | "luminance" => {
@@ -16994,7 +17038,8 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
                 _ => match mask_box_keyword(token, true) {
                     Some(keyword) => {
                         boxes += 1;
-                        tokens.push(keyword);
+                        real_boxes.push(keyword);
+                        tokens.push(mask_stand_in_box(keyword));
                     }
                     None => tokens.push(token),
                 },
@@ -17004,6 +17049,7 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
             tokens.push("border-box");
         }
         layers.push(tokens.join(" "));
+        layer_boxes.push(real_boxes);
         modes.push(mode.unwrap_or_default());
         composites.push(composite.unwrap_or("add"));
     }
@@ -17011,13 +17057,21 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
     if parts.color.is_some() {
         return None;
     }
+    let (mut origins, mut clips) = (parts.origins, parts.clips);
+    for (index, real) in layer_boxes.iter().enumerate() {
+        let (Some(&first), Some(&last)) = (real.first(), real.last()) else { continue };
+        if let (Some(origin), Some(clip)) = (origins.get_mut(index), clips.get_mut(index)) {
+            *origin = parse_mask_box(if first == "no-clip" { "border-box" } else { first })?;
+            *clip = parse_mask_box(last)?;
+        }
+    }
     Some(MaskShorthand {
         images: parts.images,
         positions: parts.positions,
         sizes: parts.sizes,
         repeats: parts.repeats?,
-        origins: parts.origins,
-        clips: parts.clips,
+        origins,
+        clips,
         modes,
         composites,
     })
@@ -17029,7 +17083,7 @@ fn mask_shorthand(raw: &str) -> Option<Vec<Value>> {
     let origins: Arc<[BackgroundBox]> = parts.origins.into();
     let clips: Arc<[BackgroundBox]> = parts.clips.into();
     let initial = |boxes: &[BackgroundBox]| boxes.iter().all(|value| *value == BackgroundBox::Border);
-    Some(alloc::vec![
+    let mut values = alloc::vec![
         mask_image_value(&parts.images)?,
         mask_position_value(&parts.positions)?,
         mask_size_value(&parts.sizes)?,
@@ -17038,7 +17092,11 @@ fn mask_shorthand(raw: &str) -> Option<Vec<Value>> {
         Value::MaskBoxes(262, (!initial(&clips)).then_some(clips)),
         Value::MaskModes((!modes.iter().all(|mode| *mode == MaskMode::MatchSource)).then_some(modes)),
         Value::ExtraRaw(extra_props::VALUE_BASE + value_props::const_index("mask-composite"), Arc::from(parts.composites.join(", "))),
-    ])
+    ];
+    for (name, initial) in mask_shorthand::BORDER_LONGHANDS.into_iter().zip(mask_shorthand::BORDER_INITIALS) {
+        values.push(Value::ExtraRaw(extra_props::slot_of(name)?, Arc::from(initial)));
+    }
+    Some(values)
 }
 
 fn mask_declaration_values(name: &str, raw: &str) -> Option<Vec<Value>> {
@@ -24717,7 +24775,7 @@ fn emit_source_rules(
             }
             continue;
         }
-        if matches!(node.kind, SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues) {
+        if matches!(node.kind, SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition) {
             continue;
         }
         if node.kind == SourceRuleKind::FontFeatureValues {
@@ -32972,7 +33030,7 @@ mod tests {
             ("conic-gradient(from 0deg at 50% 50%, red 90deg)","conic-gradient(red 90deg)"),
             ("linear-gradient(0.5turn, red, blue)","linear-gradient(red, blue)"),
             ("conic-gradient(from 100grad, red 0.25turn, blue calc(1turn - 90deg))","conic-gradient(from 90deg, red 90deg, blue calc(270deg))"),
-            ("radial-gradient(at top 20px left,red,blue)","radial-gradient(at left 0px top 20px, red, blue)"),
+            ("radial-gradient(at top 20px left 0px,red,blue)","radial-gradient(at left 0px top 20px, red, blue)"),
             ("linear-gradient(in oklab, currentColor, red)","linear-gradient(in oklab, currentcolor, red)"),
         ] {
             let block=DeclarationBlock::parse(&alloc::format!("background-image:{raw}")).unwrap();
@@ -35755,7 +35813,7 @@ mod tests {
         assert_eq!(style.mask_size.as_ref().unwrap().len(), 2);
         assert_eq!(style.mask_repeat.as_ref().unwrap()[0], [BackgroundRepeat::NoRepeat; 2]);
         assert_eq!(style.mask_origin.as_ref().unwrap().as_ref(), &[BackgroundBox::Content]);
-        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Padding, BackgroundBox::Border]);
+        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Padding, BackgroundBox::NoClip]);
         assert_eq!(style.mask_mode.as_ref().unwrap().as_ref(), &[MaskMode::Luminance]);
         let initial = compute(&element("color:red"), None, &index).unwrap();
         assert!(!initial.has_mask() && initial.mask_images.is_none() && !initial.paints_as_group());
@@ -35874,18 +35932,18 @@ mod tests {
     fn specification_cross_fade_computes_math_and_omitted_weights_before_paint_normalization() {
         let index=StyleIndex::new(Vec::new());
         for (raw,expected) in [
-            ("cross-fade(30% red, green)","cross-fade(rgb(255, 0, 0) 30%, rgb(0, 128, 0) 70%)"),
+            ("cross-fade(30% red, green)","cross-fade(rgb(255, 0, 0) 30%, rgb(0, 128, 0))"),
             ("cross-fade(20% red, 20% green)","cross-fade(rgb(255, 0, 0) 20%, rgb(0, 128, 0) 20%)"),
             ("cross-fade(50% red, 50% green, 50% blue)","cross-fade(rgb(255, 0, 0) 50%, rgb(0, 128, 0) 50%, rgb(0, 0, 255) 50%)"),
-            ("cross-fade(calc(101%) red, green)","cross-fade(rgb(255, 0, 0) 100%, rgb(0, 128, 0) 0%)"),
-            ("cross-fade(calc(-200%) red, green)","cross-fade(rgb(255, 0, 0) 0%, rgb(0, 128, 0) 100%)"),
-            ("cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)","cross-fade(rgb(255, 0, 0) 49%, rgb(0, 128, 0) 51%)"),
+            ("cross-fade(calc(101%) red, green)","cross-fade(rgb(255, 0, 0) 100%, rgb(0, 128, 0))"),
+            ("cross-fade(calc(-200%) red, green)","cross-fade(rgb(255, 0, 0) 0%, rgb(0, 128, 0))"),
+            ("cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)","cross-fade(rgb(255, 0, 0) 49%, rgb(0, 128, 0))"),
         ] {
             let style=compute(&element(&alloc::format!("font-size:20px;background-image:{raw}")),None,&index).unwrap();
             assert_eq!(style.computed_image_source_value(53).as_deref(),Some(expected),"{raw}");
         }
         let style=compute(&element("font-size:40px;background-image:cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)"),None,&index).unwrap();
-        assert_eq!(style.computed_image_source_value(53).as_deref(),Some("cross-fade(rgb(255, 0, 0) 51%, rgb(0, 128, 0) 49%)"));
+        assert_eq!(style.computed_image_source_value(53).as_deref(),Some("cross-fade(rgb(255, 0, 0) 51%, rgb(0, 128, 0))"));
         for raw in ["cross-fade(101% red, green)","cross-fade(-1% red, green)","cross-fade(0.5 red,green)"] {assert!(!valid_background_images(raw),"{raw}");}
     }
 

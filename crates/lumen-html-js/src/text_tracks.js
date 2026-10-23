@@ -21,6 +21,20 @@ function define(proto, props) {
 function illegal() {
     throw new TypeError('Illegal constructor');
 }
+function brand(object) {
+    const s = slots.get(object);
+    if (!s) {
+        throw new TypeError('Illegal invocation');
+    }
+    return s;
+}
+function enumerate(proto, names) {
+    for (const name of names) {
+        const d = Object.getOwnPropertyDescriptor(proto, name);
+        d.enumerable = true;
+        Object.defineProperty(proto, name, d);
+    }
+}
 function handlerAttributes(proto, names) {
     for (const name of names) {
         define(proto, {
@@ -109,8 +123,8 @@ function indexedProxy(target, items, bindMethods) {
 }
 
 class TextTrackCue extends EventTarget {
-    constructor(token) {
-        if (token !== TOKEN) {
+    constructor(...args) {
+        if (args[0] !== TOKEN) {
             illegal();
         }
         super();
@@ -251,6 +265,7 @@ class TextTrackCueList {
         return found || null;
     }
 }
+enumerate(TextTrackCueList.prototype, ['getCueById']);
 define(TextTrackCueList.prototype, {
     get length() { return slot(this).items().length; },
 });
@@ -269,8 +284,8 @@ const kinds = ['subtitles', 'captions', 'descriptions', 'chapters', 'metadata'];
 const modes = ['disabled', 'hidden', 'showing'];
 
 class TextTrack extends EventTarget {
-    constructor(token) {
-        if (token !== TOKEN) {
+    constructor(...args) {
+        if (args[0] !== TOKEN) {
             illegal();
         }
         super();
@@ -333,12 +348,13 @@ define(TextTrack.prototype, {
     get label() { return slot(this).label(); },
     get language() { return slot(this).language(); },
     get id() { return slot(this).id(); },
-    get inBandMetadataTrackDispatchType() { return ''; },
-    get mode() { return slot(this).mode; },
+    get inBandMetadataTrackDispatchType() { brand(this); return ''; },
+    get mode() { return brand(this).mode; },
     set mode(v) {
+        const s = brand(this);
         const value = String(v);
         if (modes.includes(value)) {
-            slot(this).mode = value;
+            s.mode = value;
         }
     },
     get cues() {
@@ -350,6 +366,7 @@ define(TextTrack.prototype, {
         return s.mode === 'disabled' ? null : s.activeList;
     },
 });
+enumerate(TextTrack.prototype, ['addCue', 'removeCue']);
 handlerAttributes(TextTrack.prototype, ['cuechange']);
 publish('TextTrack', TextTrack);
 
@@ -375,6 +392,7 @@ class TextTrackList extends EventTarget {
         return found || null;
     }
 }
+enumerate(TextTrackList.prototype, ['getTrackById']);
 define(TextTrackList.prototype, {
     get length() { return slot(this).items().length; },
 });
@@ -442,8 +460,22 @@ define(HTMLMediaElement.prototype, {
 
 if (typeof g.HTMLTrackElement === 'function') {
     const trackStates = new WeakMap();
+    for (const [name, value] of [['NONE', 0], ['LOADING', 1], ['LOADED', 2], ['ERROR', 3]]) {
+        const descriptor = { value, writable: false, enumerable: true, configurable: false };
+        Object.defineProperty(HTMLTrackElement, name, descriptor);
+        Object.defineProperty(HTMLTrackElement.prototype, name, descriptor);
+    }
     define(HTMLTrackElement.prototype, {
+        get readyState() {
+            if (!(this instanceof HTMLTrackElement)) {
+                throw new TypeError('Illegal invocation');
+            }
+            return 0;
+        },
         get track() {
+            if (!(this instanceof HTMLTrackElement)) {
+                throw new TypeError('Illegal invocation');
+            }
             let track = trackStates.get(this);
             if (!track) {
                 const el = this;
@@ -465,7 +497,7 @@ if (typeof g.HTMLTrackElement === 'function') {
 }
 
 class TrackEvent extends Event {
-    constructor(type, eventInitDict) {
+    constructor(type, eventInitDict = undefined) {
         if (arguments.length < 1) {
             throw new TypeError("Failed to construct 'TrackEvent': 1 argument required.");
         }
