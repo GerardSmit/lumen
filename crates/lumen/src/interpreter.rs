@@ -1297,6 +1297,8 @@ pub struct Interp {
     pub(crate) jit_compilations: std::cell::RefCell<Vec<crate::JitCompilation>>,
     pub(crate) jit_mode: crate::JitMode,
     pub(crate) jit_alignment: usize,
+    /// Compile on the background JIT thread (see `bytecode::jit`'s `background`).
+    pub(crate) jit_background: bool,
     pub(crate) jit_prefetch: bool,
     pub(crate) atomic_intrinsics: [usize; 2],
     pub(crate) jit_atomic_lease: Option<AtomicLease>,
@@ -2194,6 +2196,7 @@ impl Interp {
             jit_compilations: std::cell::RefCell::new(Vec::new()),
             jit_mode: crate::JitMode::Hot,
             jit_alignment: 16,
+            jit_background: false,
             jit_prefetch: false,
             atomic_intrinsics: [0; 2],
             jit_atomic_lease: None,

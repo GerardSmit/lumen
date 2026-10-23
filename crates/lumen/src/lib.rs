@@ -615,6 +615,11 @@ impl Engine {
     pub fn set_jit_mode(&mut self, mode: JitMode) {
         self.interp.jit_mode = mode;
     }
+    /// Compile hot code on a background thread while the interpreter keeps running it (also
+    /// `LUMEN_JIT_BACKGROUND=1`). Off by default; `JitMode::Eager` always compiles in place.
+    pub fn set_jit_background(&mut self, on: bool) {
+        self.interp.jit_background = on;
+    }
     /// Select compact (16) or measured hot (64) native code alignment for future compilations.
     /// Existing code remains valid; extra padding stays subject to the host arena budget.
     pub fn set_jit_alignment(&mut self, alignment: usize) -> bool {

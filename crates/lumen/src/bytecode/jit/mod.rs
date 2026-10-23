@@ -362,6 +362,11 @@ const FS_CODE: u8 = 1;
 const FS_PENDING: u8 = 2;
 /// Never compile (unsupported, or out of compiles).
 const FS_DEAD: u8 = 3;
+/// A background compile of the function is in flight ([`FuncState::pending`]): entries only poll
+/// it and keep interpreting.
+const FS_COMPILING: u8 = 4;
+/// Calls between looks at whether a background compile finished (a power of two).
+const POLL_MASK: u32 = (1 << 6) - 1;
 
 /// Whether a compile that found no executable memory still waits, given `starved` (see
 /// [`FuncState::starved`]): until its retry count `at`, or the earlier `soon` once memory was
@@ -391,6 +396,9 @@ pub(crate) struct ChunkJit {
     calls: Cell<u32>,
     /// `FS_*`.
     fstate: Cell<u8>,
+    /// Bumped whenever native code of this chunk is discarded or its tiers are reset: a
+    /// background compile built before that is dropped instead of installed.
+    generation: Cell<u32>,
     func: RefCell<FuncState>,
     /// The direct-call view of the function code (see `build::call`), read by native callers:
     /// the entry address (0 = no code), the frame's shadow-stack size in bytes, and the
@@ -453,6 +461,10 @@ pub(crate) fn pin(i: &Interp) -> Pin {
 }
 
 impl ChunkJit {
+    fn invalidate(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+
     /// The feedback of type `T` recorded for the site at `pc`.
     pub(crate) fn fb_get<T: Clone + 'static>(&self, pc: usize) -> Option<T> {
         let v = self.site_fb.borrow();
@@ -622,6 +634,7 @@ fn take_code(chunk: &Chunk) -> Option<Vec<std::rc::Rc<Native>>> {
     let mut out: Vec<_> = fs.code.take().into_iter().collect();
     out.append(&mut fs.retired);
     if !out.is_empty() {
+        jit.invalidate();
         jit.set_direct_none();
         fs.compiles = 0;
         fs.entry_fails = 0;
@@ -629,10 +642,13 @@ fn take_code(chunk: &Chunk) -> Option<Vec<std::rc::Rc<Native>>> {
         fs.starved = None;
         fs.starved_count = 0;
         jit.calls.set(0);
-        jit.fstate.set(FS_COLD);
+        if fs.pending.is_none() {
+            jit.fstate.set(FS_COLD);
+        }
     }
     for l in loops.iter_mut() {
         if let Some(code) = l.code.take() {
+            jit.invalidate();
             out.push(code);
             l.compiles = l.compiles.saturating_sub(1);
             l.entry_fails = 0;
@@ -745,6 +761,8 @@ fn new_shadow(bytes: usize) -> Box<Shadow> {
 }
 
 #[cfg(test)]
+mod background_tests;
+#[cfg(test)]
 mod evict_tests;
 #[cfg(test)]
 mod int32_tests;
@@ -835,6 +853,8 @@ struct FuncState {
     /// until the backoff (in calls) passes or memory is freed.
     starved: Option<(u32, u32, u64)>,
     starved_count: u32,
+    /// The background compile in flight while the state is [`FS_COMPILING`].
+    pending: Option<Pending>,
 }
 
 struct LoopState {
@@ -852,6 +872,8 @@ struct LoopState {
     /// As [`FuncState::starved`], in backedge ticks.
     starved: Option<(u32, u32, u64)>,
     starved_count: u32,
+    /// The background compile of this loop in flight.
+    pending: Option<Pending>,
 }
 
 struct Native {
@@ -938,6 +960,24 @@ fn jit_enabled(i: &Interp) -> bool {
     })
 }
 
+/// How a compile attempt ended on the engine thread.
+enum Outcome {
+    Done(Native),
+    /// Built and handed to the background thread; settled by [`install_pending`].
+    Queued(Pending),
+}
+
+/// Whether compiles go to the background thread: `Engine::set_jit_background` or
+/// `LUMEN_JIT_BACKGROUND=1`, never under eager mode, and only where the thread exists.
+fn background(i: &Interp) -> bool {
+    if eager(i) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env = *ON.get_or_init(|| std::env::var_os("LUMEN_JIT_BACKGROUND").is_some_and(|v| v != "0"));
+    (i.jit_background || env) && worker::available()
+}
+
 /// Compile `[header, backedge]` against the current slot kinds.
 fn compile(
     i: &Interp,
@@ -949,7 +989,7 @@ fn compile(
     widen: &[Widen],
     undef_ok: &[bool],
     this_val: &Value,
-) -> Result<Native, String> {
+) -> Result<Outcome, String> {
     let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
     let _mem = crate::memstats::enter(crate::memstats::Cat::Jit);
     dump_ops(chunk);
@@ -961,17 +1001,23 @@ fn compile(
     }
     let started = std::time::Instant::now();
     let t = stats_start();
-    let r = build::build(
+    let built = match build::build(
         i, env, chunk, header, backedge, slots, widen, undef_ok, this_val,
-    )
-    .and_then(|built| {
+    ) {
+        Ok(built) if background(i) => {
+            let pending = queue(i, chunk, built, "loop", header, backedge, started.elapsed());
+            return Ok(Outcome::Queued(pending));
+        }
+        built => built,
+    };
+    let r = built.and_then(|built| {
         finish(built, header, backedge, i.jit_alignment, &mut |want| {
             evict_lru(i, want, None) != 0
         })
     });
     record_compilation(i, chunk, "loop", &r, started.elapsed());
     stats_end(t, "loop", &r);
-    r
+    r.map(Outcome::Done)
 }
 
 /// Compile the whole of `chunk`, entered at pc 0 with the current `slots` (see [`on_entry`]).
@@ -984,7 +1030,7 @@ fn compile_fn(
     not_num: &[bool],
     guess: bool,
     this_val: &Value,
-) -> Result<Native, String> {
+) -> Result<Outcome, String> {
     let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
     let _mem = crate::memstats::enter(crate::memstats::Cat::Jit);
     dump_ops(chunk);
@@ -993,19 +1039,22 @@ fn compile_fn(
     }
     let started = std::time::Instant::now();
     let t = stats_start();
-    let r =
-        build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val).and_then(|built| {
-            finish(
-                built,
-                0,
-                chunk.ops.len().saturating_sub(1),
-                i.jit_alignment,
-                &mut |want| evict_lru(i, want, None) != 0,
-            )
-        });
+    let end = chunk.ops.len().saturating_sub(1);
+    let built = match build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val) {
+        Ok(built) if background(i) => {
+            let pending = queue(i, chunk, built, "fn", 0, end, started.elapsed());
+            return Ok(Outcome::Queued(pending));
+        }
+        built => built,
+    };
+    let r = built.and_then(|built| {
+        finish(built, 0, end, i.jit_alignment, &mut |want| {
+            evict_lru(i, want, None) != 0
+        })
+    });
     record_compilation(i, chunk, "fn", &r, started.elapsed());
     stats_end(t, "fn", &r);
-    r
+    r.map(Outcome::Done)
 }
 
 fn record_compilation(
@@ -1098,14 +1147,68 @@ fn stats_end(t: Option<std::time::Instant>, kind: &str, r: &Result<Native, Strin
     );
 }
 
-fn finish(
-    built: build::Built,
-    header: usize,
-    backedge: usize,
-    alignment: usize,
-    evict: &mut dyn FnMut(usize) -> bool,
-) -> Result<Native, String> {
-    let mut func = built.func;
+/// What a compile keeps on the engine thread while the pure half runs (here or in the
+/// background): everything of [`build::Built`] but the IR.
+struct Rest {
+    max_stack: usize,
+    kinds: Vec<Kind>,
+    hsets: Vec<Vec<(usize, usize)>>,
+    pins: Vec<Value>,
+    externs: Vec<u64>,
+    guarded: Vec<usize>,
+    boxes: Vec<Box<dyn std::any::Any>>,
+    self_entry: usize,
+    resumes: Vec<(usize, usize)>,
+    num_exits: Vec<usize>,
+}
+
+fn split(built: build::Built) -> (lumen_codegen::Function, Rest) {
+    let build::Built {
+        func,
+        max_stack,
+        kinds,
+        hsets,
+        pins,
+        externs,
+        guarded,
+        boxes,
+        self_entry,
+        resumes,
+        num_exits,
+    } = built;
+    let rest = Rest {
+        max_stack,
+        kinds,
+        hsets,
+        pins,
+        externs,
+        guarded,
+        boxes,
+        self_entry,
+        resumes,
+        num_exits,
+    };
+    (func, rest)
+}
+
+struct GenStats {
+    ir: (usize, usize),
+    optimized: (usize, usize),
+    verify: std::time::Duration,
+    optimize: std::time::Duration,
+    codegen: std::time::Duration,
+}
+
+/// The output of the pure half of a compile (see [`generate`]).
+struct Generated {
+    code_name: String,
+    payload: backend::Payload,
+    stats: Option<GenStats>,
+}
+
+/// The pure half of a compile: verify, optimize and generate code. Touches no engine state, so
+/// it may run on the background thread.
+fn generate(mut func: lumen_codegen::Function, cfg: &backend::Config) -> Result<Generated, String> {
     let code_name = func.name.clone();
     let t0 = stats_start();
     let n0 = (func.insts.len(), func.blocks.len());
@@ -1118,7 +1221,47 @@ fn finish(
     }
     let t2 = stats_start();
     let n1 = (func.insts.len(), func.blocks.len());
-    let (keep, entry, code_len) = emit(func, &built.externs, header, backedge, alignment, evict)?;
+    let payload = backend::generate(func, cfg)?;
+    let stats = match (t0, t1, t2) {
+        (Some(t0), Some(t1), Some(t2)) => Some(GenStats {
+            ir: n0,
+            optimized: n1,
+            verify: t1 - t0,
+            optimize: t2 - t1,
+            codegen: t2.elapsed(),
+        }),
+        _ => None,
+    };
+    Ok(Generated {
+        code_name,
+        payload,
+        stats,
+    })
+}
+
+/// The engine-thread half of a compile: load the generated code and assemble the [`Native`].
+fn link(
+    generated: Generated,
+    rest: Rest,
+    header: usize,
+    backedge: usize,
+    alignment: usize,
+    evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<Native, String> {
+    let Generated {
+        code_name,
+        payload,
+        stats,
+    } = generated;
+    let t = stats_start();
+    let (keep, entry, code_len) = backend::load(
+        payload,
+        &rest.externs,
+        header,
+        backedge,
+        alignment,
+        evict,
+    )?;
     if code_len != 0 {
         crate::jit_code_event(crate::JitCodeEvent {
             name: &code_name,
@@ -1127,36 +1270,252 @@ fn finish(
             loaded: true,
         });
     }
-    if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+    if let (Some(s), Some(t)) = (stats, t) {
         eprintln!(
-            "[jit-stats]   ir {} insts/{} blocks -> {} insts/{} blocks; verify {} us, opt {} us, emit {} us",
-            n0.0,
-            n0.1,
-            n1.0,
-            n1.1,
-            (t1 - t0).as_micros(),
-            (t2 - t1).as_micros(),
-            t2.elapsed().as_micros()
+            "[jit-stats]   ir {} insts/{} blocks -> {} insts/{} blocks; verify {} us, opt {} us, codegen {} us, load {} us",
+            s.ir.0,
+            s.ir.1,
+            s.optimized.0,
+            s.optimized.1,
+            s.verify.as_micros(),
+            s.optimize.as_micros(),
+            s.codegen.as_micros(),
+            t.elapsed().as_micros()
         );
     }
-    if built.self_entry != 0 {
-        // SAFETY: `self_entry` is the address of a `Cell<usize>` owned by `built.boxes`.
-        unsafe { (*(built.self_entry as *const Cell<usize>)).set(entry as usize) };
+    if rest.self_entry != 0 {
+        // SAFETY: `self_entry` is the address of a `Cell<usize>` owned by `rest.boxes`.
+        unsafe { (*(rest.self_entry as *const Cell<usize>)).set(entry as usize) };
     }
     Ok(Native {
         code_name,
         code_len,
         _keep: keep,
         entry,
-        max_stack: built.max_stack,
-        hsets: built.hsets,
-        _pins: built.pins,
-        _boxes: built.boxes,
-        kinds: built.kinds,
-        guarded: built.guarded,
-        resumes: built.resumes,
-        num_exits: built.num_exits,
+        max_stack: rest.max_stack,
+        hsets: rest.hsets,
+        _pins: rest.pins,
+        _boxes: rest.boxes,
+        kinds: rest.kinds,
+        guarded: rest.guarded,
+        resumes: rest.resumes,
+        num_exits: rest.num_exits,
     })
+}
+
+fn finish(
+    built: build::Built,
+    header: usize,
+    backedge: usize,
+    alignment: usize,
+    evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<Native, String> {
+    let (func, rest) = split(built);
+    let generated = generate(func, &backend::config(alignment))?;
+    link(generated, rest, header, backedge, alignment, evict)
+}
+
+/// A compile whose pure half is in flight on the background thread. The chunk owns it, so a
+/// dropped chunk drops the record and the worker's result with it.
+struct Pending {
+    slot: std::sync::Arc<Slot>,
+    rest: Rest,
+    /// [`ChunkJit::generation`] when the IR was built: the result is dropped if it moved.
+    generation: u32,
+    /// The [`EngineJit::id`] that built it.
+    engine: u64,
+    alignment: usize,
+    kind: &'static str,
+    header: usize,
+    backedge: usize,
+    /// Engine-thread time spent building the IR.
+    built_in: std::time::Duration,
+}
+
+impl Pending {
+    fn is_done(&self) -> bool {
+        self.slot.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A worker's result, published through `done` after `result` is set.
+#[derive(Default)]
+struct Slot {
+    done: std::sync::atomic::AtomicBool,
+    result: std::sync::Mutex<Option<Result<Generated, String>>>,
+}
+
+struct Job {
+    func: lumen_codegen::Function,
+    cfg: backend::Config,
+    slot: std::sync::Arc<Slot>,
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", not(target_os = "ios"))
+))]
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Job>();
+};
+
+impl Job {
+    fn run(self) {
+        let _mem = crate::memstats::enter(crate::memstats::Cat::Jit);
+        let Job { func, cfg, slot } = self;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generate(func, &cfg)))
+            .unwrap_or_else(|_| Err("background compile panicked".into()));
+        *slot
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        slot.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Hand the IR of `built` to the background thread and keep the rest in a [`Pending`].
+fn queue(
+    i: &Interp,
+    chunk: &Chunk,
+    built: build::Built,
+    kind: &'static str,
+    header: usize,
+    backedge: usize,
+    built_in: std::time::Duration,
+) -> Pending {
+    let (func, rest) = split(built);
+    let slot = std::sync::Arc::new(Slot::default());
+    let job = Job {
+        func,
+        cfg: backend::config(i.jit_alignment),
+        slot: slot.clone(),
+    };
+    if let Err(job) = worker::send(job) {
+        job.run();
+    }
+    if stats_enabled() {
+        eprintln!(
+            "[jit-stats] {kind} queued, {} us on the engine thread",
+            built_in.as_micros()
+        );
+    }
+    Pending {
+        slot,
+        rest,
+        generation: chunk.jit.generation.get(),
+        engine: i.jit_evict.id,
+        alignment: i.jit_alignment,
+        kind,
+        header,
+        backedge,
+        built_in,
+    }
+}
+
+/// Install a finished background compile on the engine thread, with the effects of a
+/// synchronous one. `None` when the chunk's native code was discarded or reset since the IR was
+/// built (nothing is installed or recorded).
+fn install_pending(
+    i: &Interp,
+    chunk: &Chunk,
+    pending: Pending,
+) -> Option<Result<Native, String>> {
+    if pending.generation != chunk.jit.generation.get() || pending.engine != i.jit_evict.id {
+        return None;
+    }
+    let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
+    let started = std::time::Instant::now();
+    let t = stats_start();
+    let Pending {
+        slot,
+        rest,
+        alignment,
+        kind,
+        header,
+        backedge,
+        built_in,
+        ..
+    } = pending;
+    let generated = slot
+        .result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_else(|| Err("background compile lost its result".into()));
+    let r = generated.and_then(|generated| {
+        link(generated, rest, header, backedge, alignment, &mut |want| {
+            evict_lru(i, want, None) != 0
+        })
+    });
+    record_compilation(i, chunk, kind, &r, built_in + started.elapsed());
+    stats_end(t, kind, &r);
+    Some(r)
+}
+
+#[cfg(all(
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", not(target_os = "ios"))
+    ),
+    not(target_os = "none")
+))]
+mod worker {
+    use super::Job;
+    use std::sync::{mpsc, Mutex, OnceLock, PoisonError};
+
+    fn sender() -> Option<&'static Mutex<mpsc::Sender<Job>>> {
+        static TX: OnceLock<Option<Mutex<mpsc::Sender<Job>>>> = OnceLock::new();
+        TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("lumen-jit".into())
+                .stack_size(16 << 20)
+                .spawn(move || {
+                    for job in rx {
+                        job.run();
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(tx))
+        })
+        .as_ref()
+    }
+
+    pub(super) fn available() -> bool {
+        sender().is_some()
+    }
+
+    /// Queue `job`; handed back when the thread is gone.
+    pub(super) fn send(job: Job) -> Result<(), Job> {
+        match sender() {
+            Some(tx) => tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send(job)
+                .map_err(|e| e.0),
+            None => Err(job),
+        }
+    }
+}
+
+#[cfg(not(all(
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", not(target_os = "ios"))
+    ),
+    not(target_os = "none")
+)))]
+mod worker {
+    use super::Job;
+
+    pub(super) fn available() -> bool {
+        false
+    }
+
+    pub(super) fn send(job: Job) -> Result<(), Job> {
+        Err(job)
+    }
 }
 
 /// The address of import `id`: a helper, or one of the region's external addresses.
@@ -1185,71 +1544,88 @@ fn import_address(externs: &[u64], id: u32) -> Option<u64> {
     target_arch = "x86_64",
     all(target_arch = "aarch64", not(target_os = "ios"))
 ))]
-fn emit(
-    func: lumen_codegen::Function,
-    externs: &[u64],
-    header: usize,
-    backedge: usize,
-    _alignment: usize,
-    evict: &mut dyn FnMut(usize) -> bool,
-) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
+mod backend {
+    use super::*;
     #[cfg(target_arch = "aarch64")]
     use lumen_codegen::aarch64 as native;
     #[cfg(target_arch = "x86_64")]
     use lumen_codegen::x64 as native;
-    let cfg = native::Config::host(None);
-    #[cfg(target_arch = "aarch64")]
-    let cfg = native::Config {
-        features: crate::target::cpu_features(),
-        ..cfg
-    };
-    #[cfg(target_arch = "x86_64")]
-    let cfg = native::Config {
-        features: native::Features::from_bits(crate::target::cpu_features()),
-        ..cfg
-    };
-    #[cfg(target_arch = "aarch64")]
-    let compiled =
-        native::compile_owned_aligned(func, &cfg, if _alignment == 64 { 64 } else { 4 })?;
-    #[cfg(target_arch = "x86_64")]
-    let compiled =
-        native::compile_owned_aligned(func, &cfg, if _alignment == 64 { 64 } else { 1 })?;
-    let resolve = |id, addrs: &[u64]| {
-        if id == SELF_ID {
-            addrs.first().copied()
-        } else {
-            import_address(externs, id)
-        }
-    };
-    let compiled = [compiled];
-    let mut loaded = native::load_aligned(&compiled, _alignment, &resolve);
-    for round in 0..EVICT_ROUNDS {
-        if !matches!(&loaded, Err(e) if e == lumen_os::jitmem::EXEC_EXHAUSTED) {
-            break;
-        }
-        if !evict(lumen_os::jitmem::last_failed_len().max(1) << round) {
-            break;
-        }
-        loaded = native::load_aligned(&compiled, _alignment, &resolve);
+
+    pub(super) struct Config {
+        native: native::Config,
+        alignment: usize,
     }
-    let (mem, addrs) = loaded?;
-    if let Some(dir) = std::env::var_os("LUMEN_JIT_DUMP") {
-        let path = std::path::Path::new(&dir).join(format!("loop_{header}_{backedge}.bin"));
-        // SAFETY: `mem` holds `mem.len()` initialized bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem.len()) };
-        let _ = std::fs::write(path, bytes);
+
+    pub(super) type Payload = native::Compiled;
+
+    pub(super) fn config(alignment: usize) -> Config {
+        let native = native::Config::host(None);
+        #[cfg(target_arch = "aarch64")]
+        let native = native::Config {
+            features: crate::target::cpu_features(),
+            ..native
+        };
+        #[cfg(target_arch = "x86_64")]
+        let native = native::Config {
+            features: native::Features::from_bits(crate::target::cpu_features()),
+            ..native
+        };
+        Config { native, alignment }
     }
-    if stats_enabled() {
-        eprintln!(
-            "[jit-stats]   code {:#x} {} bytes",
-            mem.as_ptr() as usize,
-            mem.len()
-        );
+
+    pub(super) fn generate(func: lumen_codegen::Function, cfg: &Config) -> Result<Payload, String> {
+        #[cfg(target_arch = "aarch64")]
+        let loop_alignment = if cfg.alignment == 64 { 64 } else { 4 };
+        #[cfg(target_arch = "x86_64")]
+        let loop_alignment = if cfg.alignment == 64 { 64 } else { 1 };
+        native::compile_owned_aligned(func, &cfg.native, loop_alignment)
     }
-    // SAFETY: the code was generated for exactly this signature.
-    let entry = unsafe { std::mem::transmute::<usize, NativeFn>(addrs[0] as usize) };
-    let code_len = mem.len();
-    Ok((Box::new(mem), entry, code_len))
+
+    pub(super) fn load(
+        compiled: Payload,
+        externs: &[u64],
+        header: usize,
+        backedge: usize,
+        alignment: usize,
+        evict: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
+        let resolve = |id, addrs: &[u64]| {
+            if id == SELF_ID {
+                addrs.first().copied()
+            } else {
+                import_address(externs, id)
+            }
+        };
+        let compiled = [compiled];
+        let mut loaded = native::load_aligned(&compiled, alignment, &resolve);
+        for round in 0..EVICT_ROUNDS {
+            if !matches!(&loaded, Err(e) if e == lumen_os::jitmem::EXEC_EXHAUSTED) {
+                break;
+            }
+            if !evict(lumen_os::jitmem::last_failed_len().max(1) << round) {
+                break;
+            }
+            loaded = native::load_aligned(&compiled, alignment, &resolve);
+        }
+        let (mem, addrs) = loaded?;
+        if let Some(dir) = std::env::var_os("LUMEN_JIT_DUMP") {
+            let path = std::path::Path::new(&dir).join(format!("loop_{header}_{backedge}.bin"));
+            // SAFETY: `mem` holds `mem.len()` initialized bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem.len()) };
+            let _ = std::fs::write(path, bytes);
+        }
+        if stats_enabled() {
+            eprintln!(
+                "[jit-stats]   code {:#x} {} bytes",
+                mem.as_ptr() as usize,
+                mem.len()
+            );
+        }
+        // SAFETY: the code was generated for exactly this signature.
+        let entry = unsafe { std::mem::transmute::<usize, NativeFn>(addrs[0] as usize) };
+        let code_len = mem.len();
+        Ok((Box::new(mem), entry, code_len))
+    }
 }
 
 /// wasm32: a WebAssembly module over the engine's own memory and function table, instantiated
@@ -1257,24 +1633,40 @@ fn emit(
 /// wasm32 a function pointer *is* a table index, called with a type-checked `call_indirect`).
 /// Helpers are called the same way: their Rust function pointers are their table indices.
 #[cfg(target_arch = "wasm32")]
-fn emit(
-    func: lumen_codegen::Function,
-    externs: &[u64],
-    _header: usize,
-    _backedge: usize,
-    _alignment: usize,
-    _evict: &mut dyn FnMut(usize) -> bool,
-) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
-    let cfg = lumen_codegen::wasm::Config { ptr32: true };
-    let bytes = lumen_codegen::wasm::compile_module(std::slice::from_ref(&func), &cfg, |id| {
-        import_address(externs, id).map(|a| a as u32)
-    })?;
-    let host = crate::WASM_JIT_HOST.get().ok_or("no wasm JIT host")?;
-    let index = host(&bytes).ok_or("the wasm JIT host did not instantiate the module")?;
-    // SAFETY: the table entry is the module's `f0`, of wasm type (i32) -> i64 — exactly
-    // `NativeFn` on wasm32.
-    let entry = unsafe { std::mem::transmute::<usize, NativeFn>(index as usize) };
-    Ok((Box::new(()), entry, 0))
+mod backend {
+    use super::*;
+
+    pub(super) struct Config;
+
+    pub(super) type Payload = lumen_codegen::Function;
+
+    pub(super) fn config(_alignment: usize) -> Config {
+        Config
+    }
+
+    pub(super) fn generate(func: lumen_codegen::Function, _cfg: &Config) -> Result<Payload, String> {
+        Ok(func)
+    }
+
+    pub(super) fn load(
+        func: Payload,
+        externs: &[u64],
+        _header: usize,
+        _backedge: usize,
+        _alignment: usize,
+        _evict: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
+        let cfg = lumen_codegen::wasm::Config { ptr32: true };
+        let bytes = lumen_codegen::wasm::compile_module(std::slice::from_ref(&func), &cfg, |id| {
+            import_address(externs, id).map(|a| a as u32)
+        })?;
+        let host = crate::WASM_JIT_HOST.get().ok_or("no wasm JIT host")?;
+        let index = host(&bytes).ok_or("the wasm JIT host did not instantiate the module")?;
+        // SAFETY: the table entry is the module's `f0`, of wasm type (i32) -> i64 — exactly
+        // `NativeFn` on wasm32.
+        let entry = unsafe { std::mem::transmute::<usize, NativeFn>(index as usize) };
+        Ok((Box::new(()), entry, 0))
+    }
 }
 
 #[cfg(not(any(
@@ -1282,15 +1674,31 @@ fn emit(
     target_arch = "wasm32",
     all(target_arch = "aarch64", not(target_os = "ios"))
 )))]
-fn emit(
-    _func: lumen_codegen::Function,
-    _externs: &[u64],
-    _header: usize,
-    _backedge: usize,
-    _alignment: usize,
-    _evict: &mut dyn FnMut(usize) -> bool,
-) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
-    Err("no JIT backend for this target".into())
+mod backend {
+    use super::*;
+
+    pub(super) struct Config;
+
+    pub(super) type Payload = lumen_codegen::Function;
+
+    pub(super) fn config(_alignment: usize) -> Config {
+        Config
+    }
+
+    pub(super) fn generate(func: lumen_codegen::Function, _cfg: &Config) -> Result<Payload, String> {
+        Ok(func)
+    }
+
+    pub(super) fn load(
+        _func: Payload,
+        _externs: &[u64],
+        _header: usize,
+        _backedge: usize,
+        _alignment: usize,
+        _evict: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
+        Err("no JIT backend for this target".into())
+    }
 }
 
 /// The interpreter's inline per-backedge check: bump the chunk's tick counter and report whether
@@ -1356,78 +1764,83 @@ pub(super) fn on_backedge(
                     undef_ok: Vec::new(),
                     starved: None,
                     starved_count: 0,
+                    pending: None,
                 });
                 loops.len() - 1
             }
         };
         let l = &mut loops[idx];
         if l.code.is_none() {
-            // Not compiled: only look again on a tick boundary.
-            if l.compiles >= MAX_COMPILES || t & TICK_MASK != 0 {
-                return Ok(None);
-            }
-            if l.starved.is_some_and(|s| starved_waits(t, s)) {
-                return Ok(None);
-            }
-            {
-                let mut fs = jit.func.borrow_mut();
-                if fs.not_num.len() < slots.len() {
-                    fs.not_num.resize(slots.len(), false);
-                }
-                for (s, v) in slots.iter().enumerate() {
-                    if !matches!(v, Value::Num(_) | Value::Undefined) {
-                        fs.not_num[s] = true;
-                    }
-                }
-            }
-            // Few iterations per call (a loop over a handful of lights in a function called
-            // per pixel): the whole-function tier serves every call with one compile, where
-            // loop code would only run from the backedge on and recompile as calls enter the
-            // loop with other locals.
-            let st = jit.fstate.get();
-            if (st == FS_COLD || st == FS_PENDING)
-                && !eager(i)
-                && chunk.ops.len() <= build::MAX_FN_OPS
-                && u64::from(jit.calls.get()) * u64::from(FEW_TRIPS) > u64::from(t)
-            {
-                jit.fstate.set(FS_PENDING);
-                return Ok(None);
-            }
-            l.compiles += 1;
-            match compile(
-                i,
-                env,
-                chunk,
-                header,
-                backedge,
-                slots,
-                &l.widen,
-                &l.undef_ok,
-                this_val,
-            ) {
-                Ok(n) => {
-                    if log_enabled() {
-                        eprintln!("[jit] compiled loop {header}..={backedge}");
-                    }
-                    l.code = Some(std::rc::Rc::new(n));
-                    l.entry_fails = 0;
-                    l.starved = None;
-                    l.starved_count = 0;
-                    jit.has_code.set(true);
-                }
-                Err(e) => {
-                    if log_enabled() {
-                        eprintln!("[jit] loop {header}..={backedge} not compiled: {e}");
-                    }
-                    if e == lumen_os::jitmem::EXEC_EXHAUSTED {
-                        l.compiles -= 1;
-                        l.starved_count = l.starved_count.saturating_add(1);
-                        l.starved = Some(starved_until(t, l.starved_count, 8 * (TICK_MASK + 1)));
-                        return Ok(None);
-                    }
-                    l.compiles = MAX_COMPILES;
+            let mut installed = None;
+            if l.pending.is_some() {
+                if !l.pending.as_ref().is_some_and(Pending::is_done) {
                     return Ok(None);
                 }
+                let pending = l.pending.take().expect("checked above");
+                match install_pending(i, chunk, pending) {
+                    Some(r) => installed = Some(r),
+                    None => l.compiles = l.compiles.saturating_sub(1),
+                }
+            }
+            let result = match installed {
+                Some(r) => r,
+                None => {
+                    // Not compiled: only look again on a tick boundary.
+                    if l.compiles >= MAX_COMPILES || t & TICK_MASK != 0 {
+                        return Ok(None);
+                    }
+                    if l.starved.is_some_and(|s| starved_waits(t, s)) {
+                        return Ok(None);
+                    }
+                    {
+                        let mut fs = jit.func.borrow_mut();
+                        if fs.not_num.len() < slots.len() {
+                            fs.not_num.resize(slots.len(), false);
+                        }
+                        for (s, v) in slots.iter().enumerate() {
+                            if !matches!(v, Value::Num(_) | Value::Undefined) {
+                                fs.not_num[s] = true;
+                            }
+                        }
+                    }
+                    // Few iterations per call (a loop over a handful of lights in a function
+                    // called per pixel): the whole-function tier serves every call with one
+                    // compile, where loop code would only run from the backedge on and recompile
+                    // as calls enter the loop with other locals.
+                    let st = jit.fstate.get();
+                    if matches!(st, FS_COLD | FS_PENDING | FS_COMPILING)
+                        && !eager(i)
+                        && chunk.ops.len() <= build::MAX_FN_OPS
+                        && u64::from(jit.calls.get()) * u64::from(FEW_TRIPS) > u64::from(t)
+                    {
+                        if st != FS_COMPILING {
+                            jit.fstate.set(FS_PENDING);
+                        }
+                        return Ok(None);
+                    }
+                    l.compiles += 1;
+                    match compile(
+                        i,
+                        env,
+                        chunk,
+                        header,
+                        backedge,
+                        slots,
+                        &l.widen,
+                        &l.undef_ok,
+                        this_val,
+                    ) {
+                        Ok(Outcome::Done(n)) => Ok(n),
+                        Ok(Outcome::Queued(pending)) => {
+                            l.pending = Some(pending);
+                            return Ok(None);
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            if !settle_loop(jit, l, header, backedge, t, result) {
+                return Ok(None);
             }
         }
         l.code.clone().expect("compiled above")
@@ -1446,6 +1859,90 @@ pub(super) fn on_backedge(
     )
 }
 
+/// Apply the outcome of a loop compile to its state; whether the loop now has code.
+fn settle_loop(
+    jit: &ChunkJit,
+    l: &mut LoopState,
+    header: usize,
+    backedge: usize,
+    t: u32,
+    result: Result<Native, String>,
+) -> bool {
+    match result {
+        Ok(n) => {
+            if log_enabled() {
+                eprintln!("[jit] compiled loop {header}..={backedge}");
+            }
+            l.code = Some(std::rc::Rc::new(n));
+            l.entry_fails = 0;
+            l.starved = None;
+            l.starved_count = 0;
+            jit.has_code.set(true);
+            true
+        }
+        Err(e) => {
+            if log_enabled() {
+                eprintln!("[jit] loop {header}..={backedge} not compiled: {e}");
+            }
+            if e == lumen_os::jitmem::EXEC_EXHAUSTED {
+                l.compiles -= 1;
+                l.starved_count = l.starved_count.saturating_add(1);
+                l.starved = Some(starved_until(t, l.starved_count, 8 * (TICK_MASK + 1)));
+            } else {
+                l.compiles = MAX_COMPILES;
+            }
+            false
+        }
+    }
+}
+
+/// Apply the outcome of a function compile to its state; the code when there is some.
+fn settle_fn(
+    chunk: &Chunk,
+    fs: &mut FuncState,
+    result: Result<Native, String>,
+) -> Option<std::rc::Rc<Native>> {
+    let jit = &chunk.jit;
+    match result {
+        Ok(n) => {
+            if log_enabled() {
+                eprintln!(
+                    "[jit] compiled function ({} ops, compile {})",
+                    chunk.ops.len(),
+                    fs.compiles
+                );
+            }
+            let n = std::rc::Rc::new(n);
+            jit.set_direct(chunk, Some(&n));
+            fs.code = Some(n.clone());
+            fs.entry_fails = 0;
+            fs.starved = None;
+            fs.starved_count = 0;
+            fs.deopts.clear();
+            jit.fstate.set(FS_CODE);
+            Some(n)
+        }
+        Err(e) => {
+            if log_enabled() {
+                eprintln!("[jit] function ({} ops) not compiled: {e}", chunk.ops.len());
+            }
+            if e == lumen_os::jitmem::EXEC_EXHAUSTED {
+                fs.compiles -= 1;
+                fs.starved_count = fs.starved_count.saturating_add(1);
+                fs.starved = Some(starved_until(
+                    jit.calls.get(),
+                    fs.starved_count,
+                    STARVED_BACKOFF,
+                ));
+                jit.fstate.set(FS_COLD);
+            } else {
+                jit.fstate.set(FS_DEAD);
+            }
+            None
+        }
+    }
+}
+
 /// The interpreter's inline check at a frame's entry (pc 0, empty operand stack): count the
 /// call and report whether [`on_entry`] has anything to do (function code to run, or a look at
 /// compiling one: every `CALL_MASK + 1` calls, after a loop of the chunk compiled, after a
@@ -1462,7 +1959,12 @@ pub(super) fn entry_due(i: &Interp, chunk: &Chunk) -> bool {
     }
     let c = jit.calls.get().wrapping_add(1);
     jit.calls.set(c);
-    st != FS_DEAD && (c & CALL_MASK == 0 || st == FS_PENDING || jit.has_code.get() || eager(i))
+    st != FS_DEAD
+        && (c & CALL_MASK == 0
+            || st == FS_PENDING
+            || (st == FS_COMPILING && c & POLL_MASK == 0)
+            || jit.has_code.get()
+            || eager(i))
 }
 
 /// The hook at a frame's entry: `*pc == 0`, `stack` empty, no handlers. Runs the chunk's
@@ -1491,72 +1993,66 @@ pub(super) fn on_entry(
             if !jit_enabled(i) || *pc != 0 || !stack.is_empty() {
                 return Ok(None);
             }
-            // A cold large function waits until it has made enough calls (a pending one was
-            // asked for by a hot loop, or retired and wants its recompile now).
-            if jit.fstate.get() == FS_COLD
-                && !eager(i)
-                && jit.calls.get() / FN_CALLS_PER_OP < chunk.ops.len() as u32
-            {
-                return Ok(None);
-            }
             let mut fs = jit.func.borrow_mut();
-            if fs.compiles >= MAX_COMPILES {
-                jit.fstate.set(FS_DEAD);
-                return Ok(None);
-            }
-            if let Some(starved) = fs.starved {
-                if starved_waits(jit.calls.get(), starved) {
-                    jit.fstate.set(FS_COLD);
+            let mut installed = None;
+            if fs.pending.is_some() {
+                if !fs.pending.as_ref().is_some_and(Pending::is_done) {
                     return Ok(None);
                 }
-            }
-            fs.compiles += 1;
-            match compile_fn(
-                i,
-                env,
-                chunk,
-                slots,
-                &fs.widen,
-                &fs.not_num,
-                !fs.guess_failed,
-                this_val,
-            ) {
-                Ok(n) => {
-                    if log_enabled() {
-                        eprintln!(
-                            "[jit] compiled function ({} ops, compile {})",
-                            chunk.ops.len(),
-                            fs.compiles
-                        );
+                let pending = fs.pending.take().expect("checked above");
+                match install_pending(i, chunk, pending) {
+                    Some(r) => installed = Some(r),
+                    None => {
+                        fs.compiles = fs.compiles.saturating_sub(1);
+                        jit.fstate.set(FS_PENDING);
                     }
-                    let n = std::rc::Rc::new(n);
-                    jit.set_direct(chunk, Some(&n));
-                    fs.code = Some(n.clone());
-                    fs.entry_fails = 0;
-                    fs.starved = None;
-                    fs.starved_count = 0;
-                    fs.deopts.clear();
-                    jit.fstate.set(FS_CODE);
-                    n
                 }
-                Err(e) => {
-                    if log_enabled() {
-                        eprintln!("[jit] function ({} ops) not compiled: {e}", chunk.ops.len());
-                    }
-                    if e == lumen_os::jitmem::EXEC_EXHAUSTED {
-                        fs.compiles -= 1;
-                        fs.starved_count = fs.starved_count.saturating_add(1);
-                        fs.starved = Some(starved_until(
-                            jit.calls.get(),
-                            fs.starved_count,
-                            STARVED_BACKOFF,
-                        ));
-                        jit.fstate.set(FS_COLD);
+            }
+            let result = match installed {
+                Some(r) => r,
+                None => {
+                    // A cold large function waits until it has made enough calls (a pending one
+                    // was asked for by a hot loop, or retired and wants its recompile now).
+                    if jit.fstate.get() == FS_COLD
+                        && !eager(i)
+                        && jit.calls.get() / FN_CALLS_PER_OP < chunk.ops.len() as u32
+                    {
                         return Ok(None);
                     }
-                    jit.fstate.set(FS_DEAD);
-                    return Ok(None);
+                    if fs.compiles >= MAX_COMPILES {
+                        jit.fstate.set(FS_DEAD);
+                        return Ok(None);
+                    }
+                    if let Some(starved) = fs.starved {
+                        if starved_waits(jit.calls.get(), starved) {
+                            jit.fstate.set(FS_COLD);
+                            return Ok(None);
+                        }
+                    }
+                    fs.compiles += 1;
+                    match compile_fn(
+                        i,
+                        env,
+                        chunk,
+                        slots,
+                        &fs.widen,
+                        &fs.not_num,
+                        !fs.guess_failed,
+                        this_val,
+                    ) {
+                        Ok(Outcome::Done(n)) => Ok(n),
+                        Ok(Outcome::Queued(pending)) => {
+                            fs.pending = Some(pending);
+                            jit.fstate.set(FS_COMPILING);
+                            return Ok(None);
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
+            };
+            match settle_fn(chunk, &mut fs, result) {
+                Some(n) => n,
+                None => return Ok(None),
             }
         }
     };
@@ -1821,6 +2317,7 @@ fn enter(
                                 }
                             }
                             l.code = None;
+                            chunk.jit.invalidate();
                         }
                     }
                 }
@@ -1866,6 +2363,7 @@ fn enter(
                             eprintln!("[jit] loop {header}..={backedge} retired at {exit_pc}");
                         }
                         l.code = None;
+                        chunk.jit.invalidate();
                     }
                 }
                 Some(_) => {}
@@ -2007,11 +2505,15 @@ fn retire_fn(jit: &ChunkJit, fs: &mut FuncState) {
     }
     fs.entry_fails = 0;
     fs.deopts.clear();
-    jit.fstate.set(if fs.compiles >= MAX_COMPILES {
-        FS_DEAD
-    } else {
-        FS_PENDING
-    });
+    jit.invalidate();
+    // An in-flight compile settles its own state when it is polled (and discarded).
+    if fs.pending.is_none() {
+        jit.fstate.set(if fs.compiles >= MAX_COMPILES {
+            FS_DEAD
+        } else {
+            FS_PENDING
+        });
+    }
 }
 
 /// A resume exit inside `try` regions the loop pushed itself (`set`, outermost first): the
