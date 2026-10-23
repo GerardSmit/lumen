@@ -80,8 +80,8 @@ pub(crate) struct Shape {
     pub(super) len_slot: u32,
     pub(super) proto_slot: u32,
     keys: Keys,
-    /// Built lazily on first lookup once `len > INDEX_THRESHOLD` (shared shapes), or
-    /// maintained eagerly on mutation (owned shapes).
+    /// Built lazily on a lookup once `len > INDEX_THRESHOLD`; an owned shape keeps it current on
+    /// append and drops it on any other structural change.
     index: IndexCell,
 }
 
@@ -93,10 +93,6 @@ struct IndexCell(Cell<usize>);
 impl IndexCell {
     const fn new() -> Self {
         IndexCell(Cell::new(0))
-    }
-
-    fn from(index: Box<SlotIndex>) -> Self {
-        IndexCell(Cell::new(Box::into_raw(index) as usize))
     }
 
     #[inline(always)]
@@ -141,73 +137,121 @@ impl Drop for IndexCell {
     }
 }
 
-/// A shape's key → slot hash index: open addressing with linear probing over `u64` buckets, each
-/// holding a 32-bit hash tag (high half) and the slot (low half). Keys are not duplicated — a
-/// tag match is confirmed against the shape's key list — so a dictionary-sized object pays 8
-/// bytes per bucket instead of a `(Rc<str>, u32)` entry.
+/// A shape's key → slot hash index: open addressing with linear probing. Keys are not
+/// duplicated — a tag match is confirmed against the shape's key list. Buckets are 32-bit (8-bit
+/// hash tag, 24-bit slot) while every slot fits, so a typical shape pays 4 bytes per bucket; an
+/// object with 16M+ keys falls back to 64-bit buckets (32-bit tag, 32-bit slot). Growth rebuilds
+/// from the key list, since a narrow bucket cannot be rehashed on its own.
 pub(super) struct SlotIndex {
-    buckets: Box<[u64]>,
+    buckets: Buckets,
     len: u32,
 }
 
+enum Buckets {
+    Narrow(Box<[u32]>),
+    Wide(Box<[u64]>),
+}
+
 const EMPTY_BUCKET: u64 = u64::MAX;
+const EMPTY_NARROW: u32 = u32::MAX;
+/// Key count up to which every slot fits a narrow bucket's 24 bits (and no bucket equals
+/// [`EMPTY_NARROW`]).
+const NARROW_LIMIT: usize = 0x00ff_ffff;
+const NARROW_SLOT_MASK: u32 = 0x00ff_ffff;
 
 #[inline]
-fn key_tag(key: &str) -> u32 {
-    (crate::fasthash::hash_bytes(key.as_bytes()) >> 32) as u32
+fn key_hash(key: &str) -> u64 {
+    crate::fasthash::hash_bytes(key.as_bytes())
 }
 
 impl SlotIndex {
     fn new(keys: &[Rc<str>]) -> SlotIndex {
         let cap = (keys.len() * 4 / 3 + 1).next_power_of_two().max(16);
-        let mut index = SlotIndex {
-            buckets: vec![EMPTY_BUCKET; cap].into_boxed_slice(),
-            len: 0,
+        let buckets = if keys.len() <= NARROW_LIMIT {
+            Buckets::Narrow(vec![EMPTY_NARROW; cap].into_boxed_slice())
+        } else {
+            Buckets::Wide(vec![EMPTY_BUCKET; cap].into_boxed_slice())
         };
+        let mut index = SlotIndex { buckets, len: 0 };
         for (slot, k) in keys.iter().enumerate() {
-            index.push(k, slot as u32);
+            index.place(k, slot as u32);
         }
         index
     }
 
-    #[inline]
-    fn place(buckets: &mut [u64], bucket: u64) {
-        let mask = buckets.len() - 1;
-        let mut i = (bucket >> 32) as usize & mask;
-        while buckets[i] != EMPTY_BUCKET {
-            i = (i + 1) & mask;
+    fn place(&mut self, key: &str, slot: u32) {
+        let h = key_hash(key);
+        match &mut self.buckets {
+            Buckets::Narrow(b) => {
+                let mask = b.len() - 1;
+                let mut i = (h >> 32) as usize & mask;
+                while b[i] != EMPTY_NARROW {
+                    i = (i + 1) & mask;
+                }
+                b[i] = (((h >> 56) as u32) << 24) | slot;
+            }
+            Buckets::Wide(b) => {
+                let mask = b.len() - 1;
+                let mut i = (h >> 32) as usize & mask;
+                while b[i] != EMPTY_BUCKET {
+                    i = (i + 1) & mask;
+                }
+                b[i] = (h >> 32 << 32) | slot as u64;
+            }
         }
-        buckets[i] = bucket;
+        self.len += 1;
     }
 
-    /// Add `key` (absent) at `slot`.
-    fn push(&mut self, key: &str, slot: u32) {
-        if (self.len as usize + 1) * 4 > self.buckets.len() * 3 {
-            let mut grown = vec![EMPTY_BUCKET; self.buckets.len() * 2].into_boxed_slice();
-            for &b in self.buckets.iter().filter(|&&b| b != EMPTY_BUCKET) {
-                Self::place(&mut grown, b);
-            }
-            self.buckets = grown;
+    /// Register the key just appended to `keys` at `slot`.
+    fn push(&mut self, keys: &[Rc<str>], slot: u32) {
+        let cap = match &self.buckets {
+            Buckets::Narrow(b) => b.len(),
+            Buckets::Wide(b) => b.len(),
+        };
+        let full = (self.len as usize + 1) * 4 > cap * 3;
+        let outgrown = matches!(self.buckets, Buckets::Narrow(_)) && keys.len() > NARROW_LIMIT;
+        if full || outgrown {
+            *self = SlotIndex::new(keys);
+        } else {
+            self.place(&keys[slot as usize], slot);
         }
-        let bucket = ((key_tag(key) as u64) << 32) | slot as u64;
-        Self::place(&mut self.buckets, bucket);
-        self.len += 1;
     }
 
     #[inline]
     fn get(&self, keys: &[Rc<str>], key: &str) -> Option<u32> {
-        let tag = key_tag(key);
-        let mask = self.buckets.len() - 1;
-        let mut i = tag as usize & mask;
-        loop {
-            let b = self.buckets[i];
-            if b == EMPTY_BUCKET {
-                return None;
+        let h = key_hash(key);
+        match &self.buckets {
+            Buckets::Narrow(b) => {
+                let tag = (h >> 56) as u32;
+                let mask = b.len() - 1;
+                let mut i = (h >> 32) as usize & mask;
+                loop {
+                    let e = b[i];
+                    if e == EMPTY_NARROW {
+                        return None;
+                    }
+                    let slot = e & NARROW_SLOT_MASK;
+                    if e >> 24 == tag && key_eq(&keys[slot as usize], key) {
+                        return Some(slot);
+                    }
+                    i = (i + 1) & mask;
+                }
             }
-            if (b >> 32) as u32 == tag && key_eq(&keys[b as u32 as usize], key) {
-                return Some(b as u32);
+            Buckets::Wide(b) => {
+                let tag = (h >> 32) as u32;
+                let mask = b.len() - 1;
+                let mut i = tag as usize & mask;
+                loop {
+                    let e = b[i];
+                    if e == EMPTY_BUCKET {
+                        return None;
+                    }
+                    if (e >> 32) as u32 == tag && key_eq(&keys[e as u32 as usize], key) {
+                        return Some(e as u32);
+                    }
+                    i = (i + 1) & mask;
+                }
             }
-            i = (i + 1) & mask;
         }
     }
 }
@@ -281,15 +325,24 @@ impl Shape {
             index: IndexCell::new(),
         };
         shape.remember_special_slots();
-        if shape.len as usize > INDEX_THRESHOLD {
-            shape.build_index();
-        }
         shape
     }
 
-    /// An owned copy of `self`'s key list under a fresh id.
+    /// An owned copy of `self`'s key list under a fresh id. A shared shape's list is copied
+    /// out of its chain without being materialised on it: the copy is what gets used.
     pub(super) fn to_owned_shape(&self, id: u32) -> Shape {
-        Shape::new_owned(id, self.keys().to_vec())
+        let keys = match &self.keys {
+            Keys::Owned(keys) => keys.clone(),
+            Keys::Chain { flat, .. } => match flat.get() {
+                Some(flat) => flat.to_vec(),
+                None => {
+                    let mut keys: Vec<Rc<str>> = self.chain().map(|(_, k)| k.clone()).collect();
+                    keys.reverse();
+                    keys
+                }
+            },
+        };
+        Shape::new_owned(id, keys)
     }
 
     #[inline]
@@ -367,10 +420,6 @@ impl Shape {
         Box::new(SlotIndex::new(self.keys()))
     }
 
-    fn build_index(&mut self) {
-        self.index = IndexCell::from(self.make_index());
-    }
-
     /// The slot of `key`, or `None`.
     #[inline(always)]
     pub(super) fn find(&self, key: &str) -> Option<u32> {
@@ -417,6 +466,32 @@ impl Shape {
         flat.iter().position(|k| key_eq(k, key)).map(|i| i as u32)
     }
 
+    /// [`Shape::find`] for the existence check before inserting `key`. A shared shape past the
+    /// scan threshold that is only being grown through (an object under construction) must not
+    /// spend its index budget on that check, or every intermediate shape of a long constructor
+    /// chain would end up with a key list and a hash index nothing reads. A recorded transition
+    /// by `key` proves the key absent; otherwise the chain is walked.
+    pub(super) fn find_for_insert(&self, key: &str) -> Option<u32> {
+        if self.len as usize > INDEX_THRESHOLD
+            && key != "length"
+            && key != "prototype"
+            && self.index.get().is_none()
+        {
+            if let Keys::Chain { flat, .. } = &self.keys {
+                if flat.get().is_none() {
+                    if has_transition(self.id, key) {
+                        return None;
+                    }
+                    return self
+                        .chain()
+                        .find(|(_, k)| key_eq(k, key))
+                        .map(|(s, _)| s.len - 1);
+                }
+            }
+        }
+        self.find(key)
+    }
+
     fn owned_keys_mut(&mut self) -> &mut Vec<Rc<str>> {
         match &mut self.keys {
             Keys::Owned(keys) => keys,
@@ -432,17 +507,13 @@ impl Shape {
         } else if &*key == "prototype" {
             self.proto_slot = slot;
         }
-        let indexed = match self.index.get_mut() {
-            Some(index) => {
-                index.push(&key, slot);
-                true
-            }
-            None => false,
+        let Keys::Owned(keys) = &mut self.keys else {
+            unreachable!("shared shapes are immutable")
         };
-        self.owned_keys_mut().push(key);
+        keys.push(key);
         self.len += 1;
-        if !indexed && self.len as usize > INDEX_THRESHOLD {
-            self.build_index();
+        if let Some(index) = self.index.get_mut() {
+            index.push(keys, slot);
         }
     }
 
@@ -453,9 +524,7 @@ impl Shape {
         };
         keys.remove(slot);
         self.len -= 1;
-        if self.index.get().is_some() {
-            self.build_index();
-        }
+        self.index = IndexCell::new();
         self.remember_special_slots();
     }
 
@@ -469,9 +538,7 @@ impl Shape {
             ok
         });
         self.len = keys.len() as u32;
-        if self.index.get().is_some() {
-            self.build_index();
-        }
+        self.index = IndexCell::new();
         self.remember_special_slots();
     }
 
@@ -768,6 +835,14 @@ fn with_shapes<R>(f: impl FnOnce(&mut ShapeTable) -> R) -> R {
     crate::value::with_gc_state(|state| f(&mut state.shapes.borrow_mut()))
 }
 
+/// Whether `key` already has a transition out of shape `parent` (so `parent` lacks it).
+fn has_transition(parent: u32, key: &str) -> bool {
+    with_shapes(|t| {
+        t.transitions
+            .contains_key(&TransitionLookup(parent, key) as &dyn TransitionParts)
+    })
+}
+
 /// The child shape reached by adding `key` to shared shape `parent` (memoized so it is shared).
 /// `None` parent = the empty shape. `None` result: `parent` has too many transitions (see
 /// [`MAX_TRANSITIONS`]) and the object should detach to an owned shape.
@@ -806,7 +881,7 @@ pub(super) fn shape_by_id(id: u32) -> Option<Rc<Shape>> {
 
 /// A fresh owned shape holding `keys` (the object detaches from the tree).
 pub(super) fn shape_owned_from(keys: Option<&Shape>) -> Rc<Shape> {
-        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
+    let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
     with_shapes(|t| {
         let id = t.fresh_owned_id();
         Rc::new(match keys {

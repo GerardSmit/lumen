@@ -517,6 +517,12 @@ impl Props {
         }
     }
 
+    /// Release entry capacity a freshly constructed instance reserved from its constructor's
+    /// learned (maximum) size but did not use.
+    pub(crate) fn trim_construct_slack(&mut self) {
+        self.entries.trim_slack(2);
+    }
+
     /// Final named-property count of a small ordinary instance, recorded after a successful
     /// construct so later allocations can reserve the right capacity.
     pub(crate) fn observed_instance_capacity(&self) -> usize {

@@ -188,6 +188,17 @@ impl EntryVec {
         self.cap = 0;
     }
 
+    /// Give back the unused tail of an owned heap buffer holding at least `min_slack` spare
+    /// slots. Inline, shared and empty vectors are left alone.
+    pub(in crate::value) fn trim_slack(&mut self, min_slack: usize) {
+        if self.cap != 0 && !self.is_inline() && self.len != 0 {
+            let len = self.len as usize;
+            if self.cap as usize >= len + min_slack {
+                self.grow_to(len);
+            }
+        }
+    }
+
     /// Reallocate the owned buffer to exactly `cap` entries (`cap >= len`).
     fn grow_to(&mut self, cap: usize) {
         debug_assert!(!self.is_shared());

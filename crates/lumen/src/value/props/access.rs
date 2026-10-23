@@ -1,5 +1,5 @@
 //! Named lookup, slot access, and ordered reflection.
-use super::shapes::index_key;
+use super::shapes::{Shape, index_key};
 use super::{NO_SLOT, Props};
 use crate::value::{PackedValue, PropRef, Property, canonical_index};
 use std::rc::Rc;
@@ -100,6 +100,18 @@ impl Props {
     /// `Interp::try_ic_get`); only named slots (`< named_len`) are ever recorded.
     #[inline]
     pub(crate) fn slot_of(&self, key: &str) -> Option<usize> {
+        self.slot_of_by(key, Shape::find)
+    }
+
+    /// [`Props::slot_of`] for the existence check before an insert (see
+    /// [`Shape::find_for_insert`]).
+    #[inline]
+    pub(super) fn slot_of_for_insert(&self, key: &str) -> Option<usize> {
+        self.slot_of_by(key, Shape::find_for_insert)
+    }
+
+    #[inline(always)]
+    fn slot_of_by(&self, key: &str, find: impl Fn(&Shape, &str) -> Option<u32>) -> Option<usize> {
         if let Some(n) = canonical_index(key) {
             if let Some(slot) = self.element_slot(n) {
                 return Some(slot);
@@ -108,7 +120,7 @@ impl Props {
                 return None;
             }
         }
-        self.find(key)
+        find(self.shape_rc.as_deref()?, key).map(|s| s as usize)
     }
 
     /// The property at `slot`, or `None` if out of range. A cached slot is only trusted after

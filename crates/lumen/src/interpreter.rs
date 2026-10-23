@@ -7699,9 +7699,16 @@ impl Interp {
 
     #[inline]
     pub(crate) fn observe_construct_capacity(&mut self, constructor: &Gc, instance: &Gc) {
-        let observed = instance
-            .try_borrow()
-            .map_or(0, |i| i.props.observed_instance_capacity());
+        let observed = match instance.try_borrow_mut() {
+            Ok(mut i) => {
+                let observed = i.props.observed_instance_capacity();
+                if observed != 0 {
+                    i.props.trim_construct_slack();
+                }
+                observed
+            }
+            Err(_) => 0,
+        };
         if observed == 0 {
             return;
         }

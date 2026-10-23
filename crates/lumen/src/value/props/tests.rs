@@ -272,20 +272,18 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
             assert_eq!(&***key, names[OWNED_THRESHOLD - 1 - depth].as_str());
         }
     }
-    // Each shape past the scan threshold answered three lookups by walking its chain; the next
-    // insert's absence probe was its fourth and indexed it. The leaf has seen only three.
-    let indexed: Vec<usize> = (INDEX_THRESHOLD + 1..OWNED_THRESHOLD).rev().collect();
+    // The existence check before each insert spends no index budget, so the intermediates an
+    // object grows through never get a key list (nor an index).
     assert_eq!(
         flat_lists(&p),
-        indexed,
-        "only probed-past-budget shapes past the scan threshold, for their index"
+        Vec::<usize>::new(),
+        "growing a chain materialises no key list"
     );
     assert_eq!(keys(&p), names);
-    let listed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
     assert_eq!(
         flat_lists(&p),
-        listed,
-        "iterating materialises the leaf's list"
+        vec![OWNED_THRESHOLD],
+        "iterating materialises the leaf's list only"
     );
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
@@ -379,4 +377,104 @@ fn keys_colliding_under_the_old_hash_keep_order_and_insert_in_linear_time() {
         hostile < benign * 20 + Duration::from_millis(50),
         "hostile {hostile:?} vs benign {benign:?}"
     );
+}
+
+fn names(n: usize, tag: &str) -> Vec<String> {
+    (0..n).map(|i| format!("{tag}{i}")).collect()
+}
+
+#[test]
+fn shapes_far_past_the_index_threshold_keep_order_and_slots_while_growing() {
+    let mut p = Props::new();
+    let names = names(600, "grow_");
+    for (i, k) in names.iter().enumerate() {
+        p.insert(k.clone(), num(i as f64));
+        if i % 7 == 0 {
+            for (j, earlier) in names[..=i].iter().enumerate().step_by(5) {
+                assert_eq!(p.slot_of(earlier), Some(j), "{earlier} after {i} inserts");
+            }
+            assert_eq!(p.slot_of("grow_missing"), None);
+        }
+    }
+    assert_eq!(keys(&p), names);
+    for (i, k) in names.iter().enumerate() {
+        assert_eq!(value_of(&p, k), i as f64);
+    }
+}
+
+#[test]
+fn delete_then_readd_reorders_keys_and_slots_on_a_large_shape() {
+    let mut p = Props::new();
+    let mut names = names(40, "del_");
+    for (i, k) in names.iter().enumerate() {
+        p.insert(k.clone(), num(i as f64));
+    }
+    for k in ["del_3", "del_20", "del_39"] {
+        assert!(p.remove(k));
+        names.retain(|n| n != k);
+        assert_eq!(p.slot_of(k), None);
+        for (slot, n) in names.iter().enumerate() {
+            assert_eq!(p.slot_of(n), Some(slot));
+        }
+    }
+    p.insert("del_3", num(-1.0));
+    names.push("del_3".into());
+    assert_eq!(keys(&p), names);
+    assert_eq!(p.slot_of("del_3"), Some(names.len() - 1));
+    assert_eq!(value_of(&p, "del_3"), -1.0);
+    for (slot, n) in names.iter().enumerate() {
+        assert_eq!(p.slot_of(n), Some(slot));
+    }
+}
+
+#[test]
+fn owned_shape_index_survives_interleaved_appends_and_removals() {
+    let mut p = Props::new();
+    let mut live: Vec<String> = Vec::new();
+    for i in 0..(OWNED_THRESHOLD * 4) {
+        let k = format!("own_{i}");
+        p.insert(k.clone(), num(i as f64));
+        live.push(k);
+        if i % 9 == 4 {
+            let victim = live.remove(i % live.len());
+            assert!(p.remove(&victim));
+            assert_eq!(p.slot_of(&victim), None);
+        }
+        let probe = &live[i % live.len()];
+        assert_eq!(p.slot_of(probe), live.iter().position(|n| n == probe));
+    }
+    assert_eq!(keys(&p), live);
+    for (slot, n) in live.iter().enumerate() {
+        assert_eq!(p.slot_of(n), Some(slot));
+    }
+}
+
+#[test]
+fn cloning_an_owned_shape_object_keeps_lookups_independent() {
+    let mut p = Props::new();
+    for i in 0..(OWNED_THRESHOLD + 4) {
+        p.insert(format!("c{i}"), num(i as f64));
+    }
+    let mut q = p.clone();
+    q.insert("only_q", num(1.0));
+    q.remove("c0");
+    assert_eq!(p.slot_of("c0"), Some(0));
+    assert_eq!(p.slot_of("only_q"), None);
+    assert_eq!(q.slot_of("c1"), Some(0));
+    assert_eq!(q.slot_of("only_q"), Some(OWNED_THRESHOLD + 3));
+}
+
+#[test]
+fn inserting_an_existing_key_on_a_large_shared_shape_overwrites() {
+    let mut p = Props::new();
+    for i in 0..(INDEX_THRESHOLD * 3) {
+        p.insert(format!("e{i}"), num(i as f64));
+    }
+    let shape = p.shape();
+    for round in 0..6 {
+        p.insert("e10", num(100.0 + round as f64));
+    }
+    assert_eq!(p.shape(), shape);
+    assert_eq!(value_of(&p, "e10"), 105.0);
+    assert_eq!(p.slot_of("e10"), Some(10));
 }

@@ -173,7 +173,7 @@ impl Props {
                 }
             }
         }
-        if let Some(i) = self.slot_of(key) {
+        if let Some(i) = self.slot_of_for_insert(key) {
             self.entries[i] = prop;
             if self.elems.mirror_flags() & MIRROR_OK != 0
                 && key.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
