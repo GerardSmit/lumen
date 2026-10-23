@@ -1274,6 +1274,29 @@ pub(crate) fn view_elem_num(
     result
 }
 
+/// The object element `ii` (`PTR`, known `< count`) of a non-empty [`array_view`] `(kind,
+/// base)` holds: its `Gc` handle word, borrowed from the element (no reference taken). Misses
+/// on the numeric mirror (never an object), a hole or any non-object element.
+pub(crate) fn view_elem_obj(
+    fb: &mut FunctionBuilder,
+    kind: IrValue,
+    base: IrValue,
+    ii: IrValue,
+    miss: Block,
+) -> IrValue {
+    if layout().is_none() {
+        always_miss(fb, miss);
+        return fb.iconst(Type::I64, 0);
+    }
+    let packed = cmp_imm(fb, IntCC::Eq, Type::I32, kind, 1);
+    guard(fb, packed, miss);
+    let word = scaled(fb, base, ii, ELEM_SIZE);
+    let bits = fb.load(MemKind::I64, word, 0);
+    let (is_obj, _, gc) = word_counted(fb, bits);
+    guard(fb, is_obj, miss);
+    gc
+}
+
 /// A property-creation way of a set IC (`IC_CREATE`), baked for an inline append: objects of
 /// shared shape `recv` gain the name at entry `slot` (the shape's key count) and move to the
 /// shared child shape `child` (`child_rc`: its `Rc` handle word, held by the shape table

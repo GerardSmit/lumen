@@ -34,10 +34,11 @@
 //!
 //! # Deopt accounting
 //!
-//! Exits of an inlined body and argument-check misses are counted per call site (in the
-//! caller chunk's site feedback, see [`super::super::inline_note`]); past a limit the site is
-//! marked not to inline and the running code is retired, so the recompile makes the ordinary
-//! direct call. Exits at a `throw` and helper throws are not speculation failures and are not
+//! Exits of an inlined body and argument-check misses are counted per call site of the
+//! compiled code (see [`super::super::inline_note`]); at a limit the site is marked not to
+//! inline (in the caller chunk's `ChunkJit::no_inline` set) and the running code is retired,
+//! so the recompile makes the ordinary direct call. A callee that can never be inlined at a
+//! site, and a body whose translation failed, are marked the same way when the unit is built. Exits at a `throw` and helper throws are not speculation failures and are not
 //! counted.
 //!
 //! # Limits
@@ -60,10 +61,20 @@ const MAX_DEPTH: usize = 2;
 /// Ops of inlined bodies per compiled unit.
 const MAX_UNIT_OPS: usize = 640;
 
+/// What an inlined site costs the unit's budget on top of its body's ops (the guards, frame
+/// set-up and the call's completion).
+const SITE_OPS: usize = 12;
+
 /// Whether general inlining is on (`LUMEN_JIT_INLINE`, default on).
 pub(super) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("LUMEN_JIT_INLINE").map_or(true, |v| v != "0"))
+}
+
+/// Whether frameless inlining is on (`LUMEN_JIT_FRAMELESS`, default on).
+fn fl_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUMEN_JIT_FRAMELESS").map_or(true, |v| v != "0"))
 }
 
 /// Ops beyond which a callee is not inlined (`LUMEN_JIT_INLINE_MAX`, default 96).
@@ -79,11 +90,23 @@ fn max_ops() -> usize {
 
 /// Where an inlined body's control leaves it: `exit` (one I64 parameter, the exit word) for an
 /// exit, `ret` (one I32 parameter, status 0) for a return with the result in the callee
-/// frame's `stack[0]`.
+/// frame's `stack[0]`, `num` (one F64 parameter) for a frameless body's return of a Number.
 #[derive(Clone, Copy)]
 pub(super) struct InlCx {
     pub exit: Block,
     pub ret: Block,
+    pub num: Option<Block>,
+    /// The body's index in [`Shared::rets`].
+    pub id: usize,
+    pub fl: Option<FlCx>,
+}
+
+/// A frameless body's lazy commit (see the module docs): its [`Frameless`] and whether the
+/// call is committed (an I32, nonzero once it is).
+#[derive(Clone, Copy)]
+pub(super) struct FlCx {
+    pub info: usize,
+    pub committed: Variable,
 }
 
 /// The general-inlining state of a compiled unit, shared by its own code and every body
@@ -94,6 +117,10 @@ pub(super) struct Shared<'a> {
     on: bool,
     /// Call sites inlined so far.
     pub inlined: u32,
+    /// The call sites (chunk address, pc) whose inlined bodies failed to translate.
+    pub failed: Vec<(usize, usize)>,
+    /// Per inlined body: whether it returns through `ret` and through `num` (see [`InlCx`]).
+    pub rets: Vec<[bool; 2]>,
     ops: usize,
     /// The chunks being translated, the unit's own first (recursion is never inlined).
     chain: Vec<usize>,
@@ -113,6 +140,8 @@ impl<'a> Shared<'a> {
             root,
             on,
             inlined: 0,
+            failed: Vec::new(),
+            rets: Vec::new(),
             ops: 0,
             chain: vec![root as *const Chunk as usize],
             sizes: Vec::new(),
@@ -120,6 +149,11 @@ impl<'a> Shared<'a> {
             boxes: Vec::new(),
             externs,
         }
+    }
+
+    /// Keep `b` with the unit's code.
+    pub fn keep(&mut self, b: Box<dyn std::any::Any>) {
+        self.boxes.push(b);
     }
 
     /// Hand what the unit keeps to its [`Built`] (the externs replace the unit plan's, which
@@ -154,6 +188,85 @@ pub(super) struct InlBody {
     ta_slots: Vec<bool>,
     /// The address of the site's [`InlineSite`] (kept in the unit's boxes).
     info: usize,
+    /// The body may run frameless (see [`frameless_ok`]).
+    pub frameless: bool,
+}
+
+impl InlBody {
+    /// The callee's slot kinds the body is translated with.
+    pub fn kinds(&self) -> &[Kind] {
+        &self.kinds
+    }
+}
+
+/// Whether the body of `cc` can run frameless at a direct site: it makes no call and stores
+/// into nothing but its own locals, so code that calls no helper has no effect the caller can
+/// see but its result. (A helper commits the call first, see [`Tr::fl_commit`].)
+fn frameless_ok(cc: &Chunk) -> bool {
+    cfg!(target_pointer_width = "64")
+        && cc.ops.iter().all(|op| {
+            matches!(
+                op,
+                Op::Const(_)
+                    | Op::Undef
+                    | Op::Dup
+                    | Op::Dup2
+                    | Op::Pop
+                    | Op::Nip
+                    | Op::LoadLocal(_)
+                    | Op::StoreLocal(_)
+                    | Op::UpdateLocal(..)
+                    | Op::Tdz(_)
+                    | Op::LoadName(..)
+                    | Op::LoadCap(_)
+                    | Op::LoadThis
+                    | Op::GetProp(..)
+                    | Op::GetPropThis(..)
+                    | Op::GetPropLocal(..)
+                    | Op::GetElem
+                    | Op::GetElemLocal(_)
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
+                    | Op::BitAnd
+                    | Op::BitOr
+                    | Op::BitXor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::UShr
+                    | Op::Lt
+                    | Op::Gt
+                    | Op::Le
+                    | Op::Ge
+                    | Op::EqEq
+                    | Op::NotEq
+                    | Op::StrictEq
+                    | Op::StrictNotEq
+                    | Op::Neg
+                    | Op::Plus
+                    | Op::Not
+                    | Op::BitNot
+                    | Op::Typeof
+                    | Op::TypeofIs(..)
+                    | Op::Void
+                    | Op::Jump(_)
+                    | Op::JumpIfFalse(_)
+                    | Op::JumpIfNotCmp(..)
+                    | Op::JumpIfNotCmpLL(..)
+                    | Op::JumpIfNotCmpLK(..)
+                    | Op::ArithLL(..)
+                    | Op::ArithLK(..)
+                    | Op::JumpIfFalsePeek(_)
+                    | Op::JumpIfTruePeek(_)
+                    | Op::JumpIfNotNullishPeek(_)
+                    | Op::SwitchLK(..)
+                    | Op::Throw
+                    | Op::Return
+                    | Op::ReturnUndef
+            )
+        })
 }
 
 /// Whether nothing in `cc` keeps it from being inlined (see the module docs).
@@ -231,10 +344,11 @@ impl<'a> Tr<'a, '_> {
             return None;
         }
         let site = self.plan.direct.get(&pc)?.clone();
+        // (A proper tail call runs as an ordinary call within `TAIL_NEST` frames, see
+        // `direct_call_with`: inlined, it keeps that bound.)
         if site.word == 0
             || site.construct
             || site.self_call
-            || site.tail
             || site.tails
             || site.act
             // (The flag never clears: the site's guard would always take the ordinary call.)
@@ -242,8 +356,11 @@ impl<'a> Tr<'a, '_> {
             || site.rest.is_some()
             || site.virt.is_some()
             || site.adaptor != Adaptor::None
-            || !matches!(self.ops[pc], Op::Call(_) | Op::CallWithThis(_))
-            || self.chunk.jit.fb_get::<NoInline>(pc).is_some()
+            || !matches!(
+                self.ops[pc],
+                Op::Call(_) | Op::CallWithThis(_) | Op::TailCall(..)
+            )
+            || self.chunk.jit.no_inline(pc, site.chunk)
         {
             return None;
         }
@@ -255,14 +372,16 @@ impl<'a> Tr<'a, '_> {
         let cc = ic.chunk.clone();
         let cp = Rc::as_ptr(&cc) as usize;
         let n = cc.ops.len();
-        if cp != site.chunk
-            || n == 0
-            || n > max_ops()
-            || self.ginl.ops + n > MAX_UNIT_OPS
-            || self.ginl.chain.contains(&cp)
-            || cc.jit.fstate.get() == FS_DEAD
-            || !body_ok(&cc)
-        {
+        if cp != site.chunk {
+            return None;
+        }
+        // What never changes for this callee at this site is remembered (keyed by the callee's
+        // chunk, so a site that comes to call another function is planned afresh).
+        if n == 0 || n > max_ops() || cc.jit.fstate.get() == FS_DEAD || !body_ok(&cc) {
+            self.chunk.jit.set_no_inline_for(pc, cp);
+            return None;
+        }
+        if self.ginl.ops + n + SITE_OPS > MAX_UNIT_OPS || self.ginl.chain.contains(&cp) {
             return None;
         }
         let d = self.stack.len();
@@ -301,8 +420,12 @@ impl<'a> Tr<'a, '_> {
                 },
             };
         }
-        let an = analyze(&cc, 0, n - 1, true).ok()?;
+        let Ok(an) = analyze(&cc, 0, n - 1, true) else {
+            self.chunk.jit.set_no_inline_for(pc, cp);
+            return None;
+        };
         if an.hs.iter().any(|h| !h.is_empty()) || !an.resumes.is_empty() {
+            self.chunk.jit.set_no_inline_for(pc, cp);
             return None;
         }
         let (mut kinds, fresh) = fn_kinds(&cc, &an, &slots, &widen, &not_num, false);
@@ -353,13 +476,19 @@ impl<'a> Tr<'a, '_> {
             entry: self.self_entry,
             chunk: self.chunk as *const Chunk,
             site: pc,
+            exits: Cell::new(0),
         });
         let info_addr = &*info as *const InlineSite as usize;
         g.boxes.push(info);
         g.boxes.push(Box::new(cc.clone()));
-        g.ops += n;
+        g.ops += n + SITE_OPS;
+        let frameless = frameless_ok(&cc) && fl_enabled();
         if log_enabled() {
-            eprintln!("[jit] inlining a {n}-op callee at {pc}");
+            let how = if frameless { " frameless" } else { "" };
+            eprintln!("[jit] inlining a {n}-op callee at {pc}{how}");
+            if !frameless && std::env::var_os("LUMEN_JIT_FRAMELESS_WHY").is_some() {
+                eprintln!("[jit]   ops {:?}", cc.ops);
+            }
         }
         Some(InlBody {
             chunk: cc,
@@ -372,6 +501,7 @@ impl<'a> Tr<'a, '_> {
             ta_kinds,
             ta_slots,
             info: info_addr,
+            frameless,
         })
     }
 
@@ -418,7 +548,9 @@ impl<'a> Tr<'a, '_> {
     /// The inlined body of `b` on the committed callee frame `nf` (its slots seeded from
     /// `args`, the call's argument entries up to the parameters; `size` its frame-size
     /// constant): returns and exits continue at `post` with the call's status, the result in
-    /// the callee frame's `stack[0]` (see the module docs).
+    /// the callee frame's `stack[0]` (see the module docs). A frameless body (`fl`) returns a
+    /// Number to `num` and its exits continue at `exit_post`, the call committed. Returns the
+    /// body's index in [`Shared::rets`] and its frame's size.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn inline_run(
         &mut self,
@@ -429,7 +561,8 @@ impl<'a> Tr<'a, '_> {
         args: &[Entry],
         size: V,
         post: Block,
-    ) {
+        fl: Option<(FlCx, Block, Block)>,
+    ) -> (usize, usize) {
         let InlBody {
             chunk: cc,
             an,
@@ -441,6 +574,7 @@ impl<'a> Tr<'a, '_> {
             ta_kinds,
             ta_slots,
             info,
+            frameless: _,
         } = b;
         // SAFETY: the unit's boxes hold the chunk for the code's lifetime (see `inline_plan`).
         let chunk: &'a Chunk = unsafe { &*Rc::as_ptr(&cc) };
@@ -493,31 +627,74 @@ impl<'a> Tr<'a, '_> {
             chaining: false,
             hsets: Vec::new(),
             call_flags: None,
-            inl: Some(InlCx { exit, ret: post }),
+            inl: Some(InlCx {
+                exit,
+                ret: post,
+                num: fl.map(|f| f.1),
+                id: self.ginl.rets.len(),
+                fl: fl.map(|f| f.0),
+            }),
         };
+        let id = self.ginl.rets.len();
+        self.ginl.rets.push([false; 2]);
         self.swap_ctx(&mut cx);
         self.ginl.chain.push(chunk as *const Chunk as usize);
+        let (had_err, nfail) = (self.err.is_some(), self.ginl.failed.len());
         let r = self.inl_entry(&an, args).and_then(|()| self.body(&an));
         if let Err(e) = r {
             self.err.get_or_insert(e);
+        }
+        // Blame the innermost body that failed (an outer one fails only through it).
+        if !had_err && self.err.is_some() && self.ginl.failed.len() == nfail {
+            // SAFETY: `info` is the site's `InlineSite`, kept in the unit's boxes.
+            let s = unsafe { &*(info as *const InlineSite) };
+            self.ginl.failed.push((s.chunk as usize, s.site));
         }
         self.flush_seals();
         self.ginl.chain.pop();
         let max_stack = self.max_stack;
         self.swap_ctx(&mut cx);
-        self.ginl
-            .sizes
-            .push((size, frame_bytes(n_slots, max_stack) as i64));
+        let bytes = frame_bytes(n_slots, max_stack);
+        self.ginl.sizes.push((size, bytes as i64));
         self.ginl.inlined += 1;
         // ---- an exit: the interpreter finishes the callee frame ----
         self.fb.seal_block(exit);
         self.fb.switch_to_block(exit);
         self.fb.mark_cold();
+        if let Some((f, ..)) = fl {
+            self.fl_commit(f, nf);
+        }
         let ip = self.ptrc(info as i64);
         let st = self
             .call(Helper::InlineFinish, &[self.frame, nf, word, ip])
             .expect("InlineFinish returns a status");
-        self.fb.jump(post, &[st]);
+        self.fb.jump(fl.map_or(post, |f| f.2), &[st]);
+        (id, bytes)
+    }
+
+    /// In a frameless body (or at its exit): commit the call unless it is (see
+    /// [`Helper::InlineCommit`]), on the callee frame `nf`.
+    pub(super) fn fl_commit(&mut self, fl: FlCx, nf: V) {
+        let cur = self.fb.current_block().expect("in a block");
+        let cold = self.fb.func.blocks[cur.index()].cold;
+        let c = self.fb.use_var(fl.committed);
+        let go = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(c, cont, &[], go, &[]);
+        self.fb.seal_block(go);
+        self.fb.switch_to_block(go);
+        self.fb.mark_cold();
+        let ip = self.ptrc(fl.info as i64);
+        let f = self.helper(Helper::InlineCommit);
+        self.fb.call_fn(f, &[nf, ip]);
+        let one = self.i32c(1);
+        self.fb.def_var(fl.committed, one);
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+        if cold {
+            self.fb.mark_cold();
+        }
     }
 
     /// The entry of an inlined body (its context swapped in): the SSA slots from the argument
@@ -574,6 +751,12 @@ impl<'a> Tr<'a, '_> {
     /// A `Return` (`Some(entry)`, the operand stack's one entry) or `ReturnUndef` of an inlined
     /// body: the result into the callee frame's `stack[0]`, then the code after the call.
     pub(super) fn inl_return(&mut self, cx: InlCx, e: Option<Entry>) {
+        if let (Some(num), Some(Entry::Num(x))) = (cx.num, e) {
+            self.ginl.rets[cx.id][1] = true;
+            self.fb.jump(num, &[x]);
+            return;
+        }
+        self.ginl.rets[cx.id][0] = true;
         match e {
             Some(e) => self.store_entry(0, e),
             None => self.set_stack_tag(0, TAG_UNDEFINED),

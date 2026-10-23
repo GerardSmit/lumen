@@ -657,6 +657,41 @@ pub(super) fn plan_direct(
         }
         Some(v)
     };
+    // The value an op pushes now, as far as planning can see it without running code.
+    let value_of = |pc: usize| -> Option<Value> {
+        match ops[pc] {
+            Op::LoadLocal(s) if kinds.get(s as usize) == Some(&Kind::Boxed) => {
+                slots.get(s as usize).cloned()
+            }
+            Op::LoadThis => Some(this_val.clone()),
+            Op::LoadName(n, c) => helpers::name_value(interp, chunk, env, n, c),
+            _ => chain_value(pc),
+        }
+    };
+    // An element read `obj[i]` (`arr[i].m()`): the element at the index the key's local holds
+    // now (else the first), a representative receiver for a method site.
+    let elem_value = |pc: usize| -> Option<Value> {
+        let d = an.depth[pc - header]?;
+        let (op, 0) = producer(pc, d.checked_sub(2)?)? else {
+            return None;
+        };
+        let (kp, 0) = producer(pc, d - 1)? else {
+            return None;
+        };
+        let n = match ops[kp] {
+            Op::LoadLocal(s) => match slots.get(s as usize) {
+                Some(Value::Num(x)) if *x >= 0.0 && x.fract() == 0.0 && *x < 4e9 => *x as u32,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let Value::Obj(o) = value_of(op)? else {
+            return None;
+        };
+        let b = o.try_borrow().ok()?;
+        let p = b.props.get_index(n).or_else(|| b.props.get_index(0))?;
+        (!p.accessor()).then(|| p.value())
+    };
     for q in header..=backedge {
         let Some(d) = an.depth[q - header] else {
             continue;
@@ -718,6 +753,7 @@ pub(super) fn plan_direct(
                         }
                         Op::LoadThis => Some(this_val.clone()),
                         Op::LoadName(n, c) => helpers::name_value(interp, chunk, env, n, c),
+                        Op::GetElem => elem_value(rp),
                         _ => chain_value(rp),
                     },
                     _ => None,
@@ -1680,7 +1716,11 @@ impl Tr<'_, '_> {
             }
         }
         if let Some(body) = self.inline_plan(pc, argc, with_this) {
-            self.direct_call_with(pc, argc, with_this, Some(body));
+            if body.frameless {
+                self.frameless_call(pc, argc, with_this, body);
+            } else {
+                self.direct_call_with(pc, argc, with_this, Some(body));
+            }
             return;
         }
         self.direct_call_full(pc, argc, with_this);
@@ -1887,6 +1927,396 @@ impl Tr<'_, '_> {
     /// The call of a direct call site (see the module docs).
     pub(super) fn direct_call_full(&mut self, pc: usize, argc: usize, with_this: bool) {
         self.direct_call_with(pc, argc, with_this, None);
+    }
+
+    /// A direct site whose callee's body is inlined frameless (see [`super::inline_general`]):
+    /// the body runs on the caller's values with its frame laid out above the shadow stack's
+    /// top but not pushed. The call itself — depth, engine flags, call record, shadow top — is
+    /// committed only when the body first calls a helper (or exits) and undone after it; a
+    /// body that calls none leaves the caller's caches valid. Guard failures make the
+    /// ordinary call.
+    fn frameless_call(
+        &mut self,
+        pc: usize,
+        argc: usize,
+        with_this: bool,
+        b: super::inline_general::InlBody,
+    ) {
+        use super::inline_general::FlCx;
+        let site = self.plan.direct[&pc].clone();
+        let o = offs().expect("planned with offsets");
+        let wt = with_this as usize;
+        let d = self.stack.len();
+        let base = d - argc - 1 - wt;
+        let ci = base + wt;
+        let ab = ci + 1;
+        for k in [base, ci] {
+            if matches!(self.stack[k], Entry::Ref(_, s) if s.in_env()) {
+                self.force(k);
+            }
+        }
+        let entries = self.stack.clone();
+        let below: Vec<Entry> = entries[..base].to_vec();
+        let kinds = b.kinds().to_vec();
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let st_join = self.fb.append_block_param(join, Type::I32);
+
+        // ---- guards ----
+        match entries[ci] {
+            Entry::Ref(_, Src::Pin) => {}
+            Entry::Ref(p, _) => self.check_cell(p, 0, site.cell, slow),
+            Entry::Boxed => {
+                let off = self.soff(ci);
+                let sp = self.stackp;
+                self.check_cell(sp, off, site.cell, slow);
+            }
+            Entry::Num(_) | Entry::Bool(_) => {
+                self.fb.jump(slow, &[]);
+                let dead = self.fb.create_block();
+                self.fb.seal_block(dead);
+                self.fb.switch_to_block(dead);
+            }
+        }
+        let this_p = match (site.uses_this, with_this) {
+            (true, true) => match entries[base] {
+                Entry::Ref(p, _) => p,
+                _ => self.sptr(base),
+            },
+            _ => self.ptrc(UNDEF.as_ptr() as usize as i64),
+        };
+        if !site.strict && site.uses_this && with_this {
+            // A sloppy callee binds a primitive or nullish receiver differently.
+            let tag = self.fb.load(MemKind::I32U8, this_p, 0);
+            let obj = self.i32c(TAG_OBJ as i64);
+            let ok = self.fb.icmp(IntCC::Eq, tag, obj);
+            self.guard_to(ok, slow);
+        }
+        if site.reflect {
+            let fa = self.ptrc(crate::bytecode::reflect::enabled_addr() as i64);
+            let f = self.fb.load(MemKind::I32U8, fa, 0);
+            let z = self.i32c(0);
+            let ok = self.fb.icmp(IntCC::Eq, f, z);
+            self.guard_to(ok, slow);
+        }
+        self.inl_arg_guards(&b, &entries, ab, argc, slow);
+        let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
+        let depth = self.fb.load(MemKind::I32, interp, o.depth);
+        let lim = if site.tail {
+            self.i32c(crate::bytecode::TAIL_NEST as i64)
+        } else {
+            self.fb.load(MemKind::I32, interp, o.depth_limit)
+        };
+        let ok = self.fb.icmp(IntCC::Ult, depth, lim);
+        self.guard_to(ok, slow);
+        let sh = self.fb.load(PTR_MEM, self.frame, FRAME_SHADOW);
+        let top0 = self.fb.load(PTR_MEM, sh, SHADOW_TOP);
+        // (Patched once the body is translated, see `inline_run`.)
+        let size = self.fb.iconst_unique(PTR, 0);
+        let sv = self.ptrc(INLINE_SAVE as i64);
+        let rec = self.fb.binary(BinaryOp::Iadd, top0, sv);
+        let ntop = self.fb.binary(BinaryOp::Iadd, rec, size);
+        let end = self.fb.load(PTR_MEM, sh, SHADOW_END);
+        let ok = self.fb.icmp(IntCC::Ule, ntop, end);
+        self.guard_to(ok, slow);
+
+        // ---- the frame, laid out but not pushed ----
+        let cellp = self.ptrc(site.cell as i64);
+        let z = self.i32c(0);
+        let rb = self.ptrc(REC_BYTES as i64);
+        let nf = self.fb.binary(BinaryOp::Iadd, rec, rb);
+        let hdr = self.ptrc(FRAME_HDR as i64);
+        let slots_p = self.fb.binary(BinaryOp::Iadd, nf, hdr);
+        let so = self.ptrc(site.n_slots as i64 * VALUE_SIZE as i64);
+        let stack_p = self.fb.binary(BinaryOp::Iadd, slots_p, so);
+        // The header fields the body's own code reads; the commit writes the rest (see
+        // `helpers::inline_commit`).
+        let mut eager = 0;
+        self.fb.store(PTR_MEM, nf, interp, FRAME_INTERP);
+        if site.uses_this {
+            eager |= FL_THIS;
+            self.fb.store(PTR_MEM, nf, this_p, FRAME_THIS);
+        }
+        // SAFETY: the plan pins the callee, which keeps its chunk alive.
+        let cc = unsafe { &*(site.chunk as *const crate::bytecode::Chunk) };
+        if cc
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::LoadName(..) | Op::LoadCap(_)))
+        {
+            eager |= FL_ENV;
+            let envp = self.fb.load(PTR_MEM, cellp, CELL_ENV);
+            self.fb.store(PTR_MEM, nf, envp, FRAME_ENV);
+        }
+        if cc.ops.iter().enumerate().any(|(q, op)| match *op {
+            Op::Jump(t)
+            | Op::JumpIfFalse(t)
+            | Op::JumpIfNotCmp(_, t)
+            | Op::JumpIfNotCmpLL(.., t)
+            | Op::JumpIfNotCmpLK(.., t)
+            | Op::JumpIfFalsePeek(t)
+            | Op::JumpIfTruePeek(t)
+            | Op::JumpIfNotNullishPeek(t) => t as usize <= q,
+            _ => false,
+        }) {
+            eager |= FL_BUDGET;
+            let budget = self.i64c(safepoint_budget());
+            self.fb.store(MemKind::I64, nf, budget, FRAME_BUDGET);
+        }
+        let one_s = self.i32c(1 + site.strict as i64);
+        match (site.arrow, self.call_flags) {
+            (false, _) => {}
+            (true, None) => {
+                eager |= FL_CANON;
+                self.fb.store(MemKind::I32U8, nf, z, FRAME_CANON);
+            }
+            (true, Some(canon)) => {
+                eager |= FL_CANON;
+                let is = self.fb.icmp(IntCC::Ne, canon, z);
+                let cv = self.fb.select(is, one_s, z);
+                self.fb.store(MemKind::I32U8, nf, cv, FRAME_CANON);
+            }
+        }
+        // Slots the body keeps in SSA start `undefined` in memory (exits write them back);
+        // the others take their arguments.
+        let seed = argc.min(site.n_params);
+        let mut args: Vec<Entry> = Vec::with_capacity(seed);
+        for k in 0..site.n_slots {
+            let off = k as i32 * VALUE_SIZE;
+            let kind = kinds.get(k).copied().unwrap_or(Kind::Boxed);
+            if k >= seed {
+                self.fb.store(MemKind::I32U8, slots_p, z, off);
+                continue;
+            }
+            let e = entries[ab + k];
+            if kind != Kind::Boxed {
+                // (A reflective `f.arguments` read, possible once JS runs inside the body, sees
+                // the arguments as the call passed them.)
+                if !site.reflect {
+                    self.fb.store(MemKind::I32U8, slots_p, z, off);
+                }
+                // (A Boxed or borrowed argument was checked to hold the kind.)
+                let a = match (e, kind) {
+                    (Entry::Num(_) | Entry::Bool(_), _) => e,
+                    (Entry::Ref(p, _), Kind::Bool) => {
+                        Entry::Bool(self.fb.load(MemKind::I32U8, p, VALUE_BOOL))
+                    }
+                    (Entry::Ref(p, _), _) => {
+                        Entry::Num(self.fb.load(MemKind::F64, p, VALUE_PAYLOAD))
+                    }
+                    (_, Kind::Bool) => Entry::Bool(self.stack_bool(ab + k)),
+                    _ => {
+                        let x = self.stack_num(ab + k);
+                        self.set_stack_tag(ab + k, TAG_UNDEFINED);
+                        Entry::Num(x)
+                    }
+                };
+                if e == Entry::Boxed && kind == Kind::Bool {
+                    self.set_stack_tag(ab + k, TAG_UNDEFINED);
+                }
+                if site.reflect {
+                    let (tag, mk, o2, v) = match a {
+                        Entry::Bool(v) => (TAG_BOOL, MemKind::I32U8, VALUE_BOOL, v),
+                        Entry::Num(v) => (TAG_NUM, MemKind::F64, VALUE_PAYLOAD, v),
+                        _ => unreachable!("unboxed above"),
+                    };
+                    let t = self.i32c(tag as i64);
+                    self.fb.store(MemKind::I32U8, slots_p, t, off);
+                    self.fb.store(mk, slots_p, v, off + o2);
+                }
+                args.push(a);
+                continue;
+            }
+            match e {
+                Entry::Num(x) => {
+                    let t = self.i32c(TAG_NUM as i64);
+                    self.fb.store(MemKind::I32U8, slots_p, t, off);
+                    self.fb.store(MemKind::F64, slots_p, x, off + VALUE_PAYLOAD);
+                }
+                Entry::Bool(v) => {
+                    let t = self.i32c(TAG_BOOL as i64);
+                    self.fb.store(MemKind::I32U8, slots_p, t, off);
+                    self.fb.store(MemKind::I32U8, slots_p, v, off + VALUE_BOOL);
+                }
+                Entry::Boxed => {
+                    let so = self.soff(ab + k);
+                    self.copy_value(self.stackp, so, slots_p, off);
+                    self.set_stack_tag(ab + k, TAG_UNDEFINED);
+                }
+                Entry::Ref(p, _) => {
+                    let kc = self.ptrc(off as i64);
+                    let dst = self.fb.binary(BinaryOp::Iadd, slots_p, kc);
+                    self.clone_mem(dst, p);
+                }
+            }
+            args.push(e);
+        }
+        for k in seed..argc {
+            if entries[ab + k] == Entry::Boxed {
+                self.drop_at(ab + k);
+            }
+        }
+        let info = Box::new(Frameless {
+            strict: site.strict,
+            arrow: site.arrow,
+            site: crate::interpreter::frames::SITE_PC | pc as u32,
+            cell: site.cell,
+            size: std::cell::Cell::new(0),
+            chunk: site.chunk,
+            consts: site.consts,
+            n_slots: site.n_slots,
+            canon: 1 + site.strict as u64,
+            eager,
+        });
+        let info_p = &*info as *const Frameless;
+        self.ginl.keep(info);
+        let committed = self.fb.declare_var(Type::I32);
+        self.fb.def_var(committed, z);
+        let fl = FlCx {
+            info: info_p as usize,
+            committed,
+        };
+
+        // ---- the body ----
+        let ret_b = self.fb.create_block();
+        self.fb.append_block_param(ret_b, Type::I32);
+        let num_b = self.fb.create_block();
+        let x_num = self.fb.append_block_param(num_b, Type::F64);
+        let exit_b = self.fb.create_block();
+        let st_exit = self.fb.append_block_param(exit_b, Type::I32);
+        let (id, bytes) = self.inline_run(
+            b,
+            nf,
+            slots_p,
+            stack_p,
+            &args,
+            size,
+            ret_b,
+            Some((fl, num_b, exit_b)),
+        );
+        // SAFETY: the unit's boxes keep `info`.
+        unsafe { (*info_p).size.set(INLINE_SAVE + bytes) };
+        let [by_ret, by_num] = self.ginl.rets[id];
+        let want = by_num && !by_ret && self.want_num(pc, base);
+        let jnum = want.then(|| {
+            let j = self.fb.create_block();
+            let x = self.fb.append_block_param(j, Type::F64);
+            (j, x)
+        });
+        let here = (crate::interpreter::frames::SITE_PC | pc as u32) as i32 as i64;
+        let boxed: Vec<usize> = (0..site.n_slots)
+            .filter(|&k| kinds.get(k).copied().unwrap_or(Kind::Boxed) == Kind::Boxed)
+            .collect();
+        // The callee's own operands, its Boxed slots, and the call when the body committed it
+        // (JS may have run: the caller's caches are stale).
+        let epilogue = |t: &mut Self| {
+            for k in base..ab {
+                if entries[k] == Entry::Boxed {
+                    t.drop_at(k);
+                }
+            }
+            for &k in &boxed {
+                t.drop_mem(slots_p, k as i32 * VALUE_SIZE);
+            }
+            let c = t.fb.use_var(committed);
+            let ip = t.ptrc(info_p as i64);
+            let un = t.fb.create_block();
+            let done = t.fb.create_block();
+            t.fb.brif(c, un, &[], done, &[]);
+            t.fb.seal_block(un);
+            t.fb.switch_to_block(un);
+            t.fb.mark_cold();
+            t.call(Helper::InlineUncommit, &[nf, ip]);
+            t.invalidate_js();
+            t.fb.jump(done, &[]);
+            t.fb.seal_block(done);
+            t.fb.switch_to_block(done);
+            let h = t.i32c(here);
+            t.fb.store(MemKind::I32, interp, h, o.cur_site);
+        };
+        // A Boxed result, in the callee frame's `stack[0]`. (A way no return takes is never
+        // laid out.)
+        self.fb.seal_block(ret_b);
+        if by_ret {
+            self.fb.switch_to_block(ret_b);
+            epilogue(self);
+            let bo = self.soff(base);
+            let sp = self.stackp;
+            self.copy_value(stack_p, 0, sp, bo);
+            let z = self.i32c(0);
+            self.fb.store(MemKind::I32U8, stack_p, z, 0);
+            self.fb.jump(join, &[z]);
+        }
+        // A Number.
+        self.fb.seal_block(num_b);
+        if by_num {
+            self.fb.switch_to_block(num_b);
+            epilogue(self);
+            match jnum {
+                Some((j, _)) => self.fb.jump(j, &[x_num]),
+                None => {
+                    self.stack = below.clone();
+                    self.store_entry(base, Entry::Num(x_num));
+                    let z = self.i32c(0);
+                    self.fb.jump(join, &[z]);
+                }
+            }
+        }
+        // An exit: the interpreter finished the committed call.
+        self.fb.seal_block(exit_b);
+        self.fb.switch_to_block(exit_b);
+        self.fb.mark_cold();
+        for k in base..ab {
+            if entries[k] == Entry::Boxed {
+                self.drop_at(k);
+            }
+        }
+        let bo = self.soff(base);
+        let sp = self.stackp;
+        self.copy_value(stack_p, 0, sp, bo);
+        let z = self.i32c(0);
+        self.fb.store(MemKind::I32U8, stack_p, z, 0);
+        let ip = self.ptrc(info_p as i64);
+        self.call(Helper::InlineUncommit, &[nf, ip]);
+        self.invalidate_js();
+        let h = self.i32c(here);
+        self.fb.store(MemKind::I32, interp, h, o.cur_site);
+        self.fb.jump(join, &[st_exit]);
+
+        // ---- the ordinary call ----
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        self.fb.mark_cold();
+        self.stack = entries;
+        self.box_from(base);
+        let tail = if site.tail {
+            helpers::CALL_TAIL as i64
+        } else {
+            0
+        };
+        let (bv, av, wv) = (
+            self.i32c(base as i64),
+            self.i32c(argc as i64),
+            self.i32c(with_this as i64 | self.await_fused(pc) | tail),
+        );
+        self.set_call_site(pc);
+        let st = self.call_status(Helper::Call, &[self.frame, bv, av, wv]);
+        self.invalidate_js();
+        self.fb.jump(join, &[st]);
+
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack = below.clone();
+        self.throw_if(st_join, pc, &below, base);
+        self.soff(base);
+        self.stack.push(Entry::Boxed);
+        if let Some((j, x)) = jnum {
+            self.slow_to_join_as(pc, base, true, false, j);
+            self.fb.seal_block(j);
+            self.fb.switch_to_block(j);
+            self.stack = below;
+            self.stack.push(Entry::Num(x));
+        }
     }
 
     /// [`Tr::direct_call_full`], or with `inl` the callee's body translated in place of the call
@@ -2296,7 +2726,7 @@ impl Tr<'_, '_> {
         match inl {
             Some(b) => {
                 let args: Vec<Entry> = (0..seed).map(|k| entries[ab + k]).collect();
-                self.inline_run(b, nf, slots_p, stack_p, &args, size, post);
+                self.inline_run(b, nf, slots_p, stack_p, &args, size, post, None);
             }
             None => self.call_code(&site, entry, nf, interp, post),
         }

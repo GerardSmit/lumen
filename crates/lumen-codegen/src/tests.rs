@@ -103,6 +103,39 @@ fn signed_i32_float_roundtrips_fold_without_losing_high_bits() {
 }
 
 #[test]
+fn widened_i32_index_conversions_fold_to_the_narrow_value() {
+    // `FromSint(Sext(x))` reads `x` directly; `ToSint(FromSint(x))` to I64 is `Sext(x)`.
+    for to in [Type::I32, Type::I64] {
+        let mut f = Function::new("index", Signature::new(vec![Type::I32], vec![Type::F64, to]));
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let x = b.block_params(entry)[0];
+        let wide = b.convert(ConvOp::Sext, Type::I64, x);
+        let float = b.convert(ConvOp::FromSint, Type::F64, wide);
+        let narrow = b.convert(ConvOp::FromSint, Type::F64, x);
+        let back = b.convert(ConvOp::ToSint, to, narrow);
+        b.ret(&[float, back]);
+        b.finish();
+        let original = f.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        let converts = f
+            .layout
+            .iter()
+            .flat_map(|b| &f.blocks[b.index()].insts)
+            .filter(|i| matches!(f.inst(**i), InstData::Convert { op: ConvOp::ToSint, .. }))
+            .count();
+        assert_eq!(converts, 0, "{to:?}");
+        for x in [i32::MIN, -16777217, -1, 0, 1, 16777217, i32::MAX] {
+            assert_eq!(
+                run(&f, &mut env(), &[x as u32 as u64]).unwrap(),
+                run(&original, &mut env(), &[x as u32 as u64]).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn checked_i32_keeps_both_results_through_optimization_and_legalization() {
     for op in [CheckedOp::IaddOv, CheckedOp::IsubOv, CheckedOp::ImulOv] {
         let mut f = Function::new(

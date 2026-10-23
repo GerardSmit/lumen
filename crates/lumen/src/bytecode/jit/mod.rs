@@ -411,6 +411,9 @@ pub(crate) struct ChunkJit {
     /// whole-function tier compiles at entry, before the locals are set). Every use is guarded
     /// at run time, so a stale entry only costs a miss. See `build::call`.
     site_fb: RefCell<Vec<(usize, Box<dyn std::any::Any>)>>,
+    /// Call sites not to inline (pc, and the callee chunk's address it holds for, or 0 for
+    /// any callee): kept apart from `site_fb`, whose capacity would drop them.
+    no_inline: RefCell<Vec<(usize, usize)>>,
     /// The [`EngineJit::epoch`] when native code of this chunk last ran (or compiled), and the
     /// id of the engine that owns that code: what eviction orders and filters by.
     used: Cell<u64>,
@@ -471,6 +474,26 @@ impl ChunkJit {
         v.iter()
             .find(|(q, _)| *q == pc)
             .and_then(|(_, b)| b.downcast_ref::<T>().cloned())
+    }
+
+    /// Whether the call site at `pc` is not to inline the callee whose chunk is at `callee`.
+    pub(crate) fn no_inline(&self, pc: usize, callee: usize) -> bool {
+        self.no_inline
+            .borrow()
+            .iter()
+            .any(|&(q, c)| q == pc && (c == 0 || c == callee))
+    }
+
+    /// Never inline at the call site at `pc`.
+    pub(crate) fn set_no_inline(&self, pc: usize) {
+        self.set_no_inline_for(pc, 0);
+    }
+
+    /// Do not inline the callee whose chunk is at `callee` at the call site at `pc`.
+    pub(crate) fn set_no_inline_for(&self, pc: usize, callee: usize) {
+        if !self.no_inline(pc, callee) {
+            self.no_inline.borrow_mut().push((pc, callee));
+        }
     }
 
     /// Record feedback `v` for the site at `pc` (replacing any).
@@ -2592,15 +2615,59 @@ pub(crate) struct InlineSite {
     /// The chunk holding the call (the unit's own or an inlined callee's) and the call's pc.
     pub chunk: *const Chunk,
     pub site: usize,
+    /// Exits of the body inlined here (and argument-check misses) in this code.
+    pub exits: Cell<u32>,
 }
 
-/// Site feedback: do not inline the callee at this call site.
-#[derive(Clone)]
-pub(crate) struct NoInline;
+/// A call site whose callee's body is inlined frameless (see `build::inline_general`): what
+/// [`helpers::inline_commit`] needs to commit the call.
+pub(crate) struct Frameless {
+    pub strict: bool,
+    pub arrow: bool,
+    /// The call's stack-trace site (`SITE_PC | pc`).
+    pub site: u32,
+    /// The site's [`SiteCell`] (the callee).
+    pub cell: usize,
+    /// Shadow-stack bytes of the committed call: save area, record and frame.
+    pub size: Cell<usize>,
+    /// The callee's chunk, its constants and slot count, and its frame's `canon`: the header
+    /// fields the body's own code never reads, written by the commit.
+    pub chunk: usize,
+    pub consts: usize,
+    pub n_slots: usize,
+    pub canon: u64,
+    /// `FL_*`: the header fields the site writes itself (the commit leaves them).
+    pub eager: u8,
+}
 
-/// Site feedback: exits of the body inlined at this call site (and argument-check misses).
-#[derive(Clone)]
-pub(crate) struct InlineExits(u32);
+/// [`Frameless::eager`] bits.
+pub(crate) const FL_ENV: u8 = 1;
+pub(crate) const FL_BUDGET: u8 = 2;
+pub(crate) const FL_CANON: u8 = 4;
+pub(crate) const FL_THIS: u8 = 8;
+
+/// The engine state a committed frameless call saved (see [`Frameless`]), on the shadow stack
+/// below its call record. The first byte of each 16-byte word stays a trivially droppable
+/// tag (see [`Shadow`]): byte 0 is never written and `new_target` is a `Value`.
+#[repr(C)]
+pub(crate) struct InlineSave {
+    pad: u8,
+    pub strict: bool,
+    pub tco: bool,
+    pub ctor: bool,
+    pub field_init: bool,
+    pub agb: bool,
+    pad2: [u8; 10],
+    pub new_target: Value,
+}
+
+/// Shadow-stack bytes of an [`InlineSave`].
+pub(crate) const INLINE_SAVE: usize = 32;
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    std::mem::size_of::<InlineSave>() == INLINE_SAVE
+        && std::mem::offset_of!(InlineSave, new_target) == 16
+);
 
 /// Exits of an inlined body after which its site stops inlining.
 const INLINE_EXIT_LIMIT: u32 = 16;
@@ -2613,16 +2680,13 @@ const INLINE_EXIT_LIMIT: u32 = 16;
 /// `s` belongs to code that is running: its chunks and entry cell are alive.
 pub(crate) unsafe fn inline_note(s: &InlineSite) {
     let chunk = &*s.chunk;
-    let n = chunk
-        .jit
-        .fb_get::<InlineExits>(s.site)
-        .map_or(1, |e| e.0.saturating_add(1));
-    chunk.jit.fb_put(s.site, InlineExits(n));
-    if n != INLINE_EXIT_LIMIT {
+    let n = s.exits.get().saturating_add(1);
+    s.exits.set(n);
+    if n < INLINE_EXIT_LIMIT {
         return;
     }
-    chunk.jit.fb_put(s.site, NoInline);
-    if log_enabled() {
+    chunk.jit.set_no_inline(s.site);
+    if n == INLINE_EXIT_LIMIT && log_enabled() {
         eprintln!("[jit] inlined call at {} keeps exiting: not inlined", s.site);
     }
     let entry = (*(s.entry as *const Cell<usize>)).get();

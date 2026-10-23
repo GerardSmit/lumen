@@ -341,3 +341,106 @@ fn overflows_out_of_inlined_bodies_leave_the_depth_as_it_was() {
     assert_eq!(got, "10500,30,true,true");
     assert!(stats.inlined_calls > 0, "no call was inlined: {stats:?}");
 }
+
+#[test]
+fn frameless_leaf_keeps_the_callers_array_cache() {
+    let src = "(function(){'use strict';function P(x){this.x=x}
+           function add(a,b){return a+b}
+           var arr=[];for(var i=0;i<100;i++)arr.push(new P(i));
+           var s=0;for(var r=0;r<300;r++)for(var j=0;j<arr.length;j++){s=add(s,arr[j].x)}
+           return s})()";
+    assert_eq!(agree(src, Some("1485000"), true), "1485000");
+    let (got, stats) = hot(src);
+    assert_eq!(got, "1485000");
+    assert!(stats.inlined_calls > 0, "no call was inlined: {stats:?}");
+}
+
+#[test]
+fn frameless_body_that_calls_a_helper_commits_its_frame() {
+    agree(
+        "(function(){'use strict';
+           function cat(a,b){return a+b}
+           var n=0,g={get v(){n++;return 'ab'}};
+           function pick(o){return o.v}
+           var s='',t=0;for(var i=0;i<3000;i++){s=cat('x',i);t+=pick(g).length}
+           return s+','+t+','+n})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn frameless_body_throw_has_the_callee_in_its_stack() {
+    agree(
+        "(function(){'use strict';
+           function bad(o){return o.x.y}
+           var r=0,st='';
+           for(var i=0;i<3000;i++){try{r+=bad(i===2900?{}:{x:{y:1}})}catch(e){st=String(e.stack).indexOf('bad')>=0}}
+           return r+','+st})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn frameless_body_exit_after_a_kind_change_finishes_the_call() {
+    agree(
+        "(function(){'use strict';
+           function f(a,b){return a*2+b}
+           var s=0,q='';for(var i=0;i<4000;i++){var v=f(i,1);if(typeof v==='number')s+=v;else q+=v}
+           q=f('a','b');
+           for(var k=0;k<4000;k++){var w=f(k%3===0?'z':k,1);if(typeof w==='number')s+=w;else q+=w.length}
+           return s+','+q.length})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn frameless_calls_still_hit_the_recursion_limit() {
+    let src = "(function(){'use strict';
+           function leaf(n){return n+1}
+           function down(n){return n===0?leaf(0):down(n-1)+0}
+           var c=0;for(var i=0;i<20;i++){try{down(1e7)}catch(e){if(e instanceof RangeError)c++}}
+           var w=0;for(var k=0;k<3000;k++){w+=down(k%5)}
+           return c+','+w})()";
+    assert_eq!(agree(src, None, false), "20,3000");
+}
+
+#[test]
+fn frameless_getter_on_the_receiver_runs_with_the_callee_frame() {
+    agree(
+        "(function(){'use strict';
+           var log=0;
+           function getx(o){return o.x}
+           var plain={x:1};
+           var acc={get x(){log++;return 2}};
+           var s=0;for(var i=0;i<4000;i++){s+=getx(i%100===0?acc:plain)}
+           return s+','+log})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn strict_tail_call_sites_inline() {
+    let src = "(function(){'use strict';
+           function add(a,b){return a+b}
+           function g(a,b){return add(a,b)}
+           var s=0;for(var i=0;i<4000;i++){s=g(s,i)}
+           return s})()";
+    assert_eq!(agree(src, Some("7998000"), true), "7998000");
+}
+
+#[test]
+fn exits_past_the_limit_stop_inlining_the_site() {
+    agree(
+        "(function(){'use strict';
+           function f(a){return a.k+1}
+           var shapes=[];for(var j=0;j<40;j++){var o={};o['p'+j]=j;o.k=j;shapes.push(o)}
+           var s=0;for(var r=0;r<200;r++)for(var i=0;i<40;i++){s+=f(r<100?shapes[0]:shapes[i])}
+           return s})()",
+        None,
+        false,
+    );
+}

@@ -351,12 +351,19 @@ pub(crate) enum Helper {
     /// object (bit 0) released per `consume`, and a copy of the value written to `dst` unless
     /// it is null; else 0 with nothing touched.
     ElemSetStr,
+    /// `(callee: *mut JitFrame, site: *const Frameless)` — commit the call of a frameless
+    /// inlined body (see `build::inline_general`): what a direct call does before it enters
+    /// its callee (depth, engine flags, call record, shadow-stack top).
+    InlineCommit,
+    /// `(callee: *mut JitFrame, site: *const Frameless)` — undo [`Helper::InlineCommit`]
+    /// after the body returned, releasing the callee frame's slots.
+    InlineUncommit,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 90] = [
+pub(crate) const ALL: [Helper; 92] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -447,6 +454,8 @@ pub(crate) const ALL: [Helper; 90] = [
     Helper::WrapGuard,
     Helper::InstanceOf,
     Helper::ElemSetStr,
+    Helper::InlineCommit,
+    Helper::InlineUncommit,
 ];
 
 /// The IR signature of `h`.
@@ -492,6 +501,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::SiteFailed => (&[P, I32], &[]),
         Helper::InlineFinish => (&[P, P, I64, P], &[I32]),
         Helper::InlineMiss => (&[P], &[]),
+        Helper::InlineCommit => (&[P, P], &[]),
+        Helper::InlineUncommit => (&[P, P], &[]),
         Helper::DropN => (&[P, I32], &[]),
         Helper::SiteRebind => (&[P, P, P], &[I32]),
         Helper::BoundThis => (&[P, P, P, I32], &[P]),
@@ -590,6 +601,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::SiteFailed => site_failed as *const () as usize,
         Helper::InlineFinish => inline_finish as *const () as usize,
         Helper::InlineMiss => inline_miss as *const () as usize,
+        Helper::InlineCommit => inline_commit as *const () as usize,
+        Helper::InlineUncommit => inline_uncommit as *const () as usize,
         Helper::DropN => drop_n as *const () as usize,
         Helper::SiteRebind => site_rebind as *const () as usize,
         Helper::BoundThis => bound_this as *const () as usize,
@@ -3717,6 +3730,91 @@ pub(crate) unsafe extern "C" fn inline_finish(
 
 pub(crate) unsafe extern "C" fn inline_miss(site: *const super::InlineSite) {
     super::inline_note(&*site);
+}
+
+/// The save area and call record below a frameless inlined callee frame `nf`.
+unsafe fn frameless_parts(nf: *mut JitFrame) -> (*mut super::InlineSave, *mut CallRec) {
+    let rec = (nf as usize - REC_BYTES) as *mut CallRec;
+    let save = (rec as usize - super::INLINE_SAVE) as *mut super::InlineSave;
+    (save, rec)
+}
+
+pub(crate) unsafe extern "C" fn inline_commit(nf: *mut JitFrame, s: *const super::Frameless) {
+    let s = &*s;
+    let i = &mut *(*nf).interp;
+    let (save, rec) = frameless_parts(nf);
+    // The header fields the site left to the commit.
+    let slots = (nf as usize + FRAME_HDR) as *mut Value;
+    (*nf).slots = slots;
+    (*nf).stack = slots.add(s.n_slots);
+    (*nf).consts = s.consts as *const Value;
+    (*nf).chunk = s.chunk as *const crate::bytecode::Chunk;
+    (*nf).shadow = super::shadow(i);
+    std::ptr::write(std::ptr::addr_of_mut!((*nf).exception), Value::Undefined);
+    (*nf).exit_hset = 0;
+    if s.eager & super::FL_ENV == 0 {
+        (*nf).env = (*(s.cell as *const super::SiteCell)).env as *const Env;
+    }
+    if s.eager & super::FL_BUDGET == 0 {
+        (*nf).budget = super::safepoint_budget();
+    }
+    if s.eager & super::FL_CANON == 0 {
+        (*nf).canon = s.canon;
+    }
+    if s.eager & super::FL_THIS == 0 {
+        // A `Value::Undefined` at a fixed address, as the site's `this` of calls without one.
+        static UNDEFINED: [u64; 2] = [0, 0];
+        (*nf).this_val = UNDEFINED.as_ptr() as *const Value;
+    }
+    i.depth += 1;
+    (*save).strict = std::mem::replace(&mut i.strict, s.strict);
+    (*save).tco = std::mem::replace(&mut i.tco_ok, s.strict);
+    (*save).ctor = std::mem::replace(&mut i.constructing, false);
+    if !s.arrow {
+        (*save).field_init = std::mem::replace(&mut i.in_field_init_code, false);
+        (*save).agb = std::mem::replace(&mut i.in_async_gen_body, false);
+        std::ptr::write(
+            std::ptr::addr_of_mut!((*save).new_target),
+            std::mem::take(&mut i.new_target),
+        );
+    }
+    (*(*nf).shadow).top = save as usize + s.size.get();
+    (*rec).fn_ptr = (*(s.cell as *const super::SiteCell)).fn_ptr;
+    (*rec).coro = i.cur_coro;
+    (*rec).flags = if s.strict { REC_STRICT } else { 0 };
+    (*rec).site = s.site;
+    (*rec).link = i.jit_frames;
+    i.jit_frames = rec as usize;
+    i.cur_site = crate::interpreter::frames::NO_SITE;
+}
+
+pub(crate) unsafe extern "C" fn inline_uncommit(nf: *mut JitFrame, s: *const super::Frameless) {
+    let s = &*s;
+    let i = &mut *(*nf).interp;
+    let (save, rec) = frameless_parts(nf);
+    let slots = std::slice::from_raw_parts_mut((*nf).slots, (*(*nf).chunk).n_slots);
+    for v in slots.iter_mut() {
+        drop(std::mem::take(v));
+    }
+    if (*rec).flags & REC_SYNCED != 0 {
+        i.fn_frames.pop();
+    }
+    i.jit_frames = (*rec).link;
+    (*(*nf).shadow).top = save as usize;
+    if !s.arrow {
+        // (The callee left `new.target` `undefined`, see `build::call`.)
+        i.new_target = std::ptr::replace(
+            std::ptr::addr_of_mut!((*save).new_target),
+            Value::Undefined,
+        );
+        i.in_field_init_code = (*save).field_init;
+        i.in_async_gen_body = (*save).agb;
+    }
+    i.strict = (*save).strict;
+    i.tco_ok = (*save).tco;
+    i.constructing = (*save).ctor;
+    i.depth -= 1;
+    i.cur_site = s.site;
 }
 
 pub(crate) unsafe extern "C" fn drop_n(p: *mut Value, n: u32) {

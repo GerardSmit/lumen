@@ -166,3 +166,71 @@ fn numeric_consumer_of_mixed_results() {
         true,
     );
 }
+
+#[test]
+fn element_then_property_reads_holes_primitives_and_mixed_arrays() {
+    agree(
+        "(function(){function P(x){this.x=x}
+           var a=[];for(var i=0;i<64;i++)a.push(new P(i));
+           var s=0;for(var r=0;r<200;r++)for(var j=0;j<a.length;j++){s+=a[j].x}
+           var h=a.slice();delete h[5];h[9]=7;h[11]='str';h[13]={x:'q'};
+           var t='';for(var r2=0;r2<50;r2++)for(var k=0;k<h.length;k++){
+             try{var v=h[k].x;t+=typeof v}catch(e){t+='E'}}
+           return s+','+t.length+','+t.slice(0,40)})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn element_then_property_reads_see_getters_and_mutation_through_them() {
+    agree(
+        "(function(){var a=[];
+           for(var i=0;i<40;i++)a.push({x:i});
+           Object.defineProperty(a[20],'x',{get:function(){a.length=10;return 1000}});
+           var s=0;for(var r=0;r<100;r++){for(var j=0;j<a.length;j++){var o=a[j];s+=o?o.x:0}
+             if(a.length<40)for(var k=a.length;k<40;k++)a.push({x:k})}
+           return s})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn modulo_index_keeps_the_array_view() {
+    agree(
+        "(function(){var a=[];for(var i=0;i<100;i++)a.push({x:i});
+           var s=0;for(var r=0;r<300;r++)for(var j=0;j<a.length;j++){s+=a[(j+1)%100].x}
+           return s})()",
+        Some("1485000"),
+        true,
+    );
+}
+
+#[test]
+fn string_keyed_local_reads_take_the_native_path() {
+    agree(
+        "(function(){'use strict';function get(o,k){return o[k]}
+           var ks=['x','y','z'],o={x:1,y:2},p=Object.create({z:5});p.x=3;
+           var s=0,u=0;for(var i=0;i<6000;i++){var v=get(i&1?o:p,ks[i%3]);if(v===undefined)u++;else s+=v}
+           return s+','+u})()",
+        None,
+        true,
+    );
+}
+
+#[test]
+fn method_on_an_element_receiver_is_called_directly() {
+    agree(
+        "(function(){function P(x,y){this.x=x;this.y=y}
+           P.prototype.dot=function(o){return this.x*o.x+this.y*o.y};
+           function Q(x){this.x=x;this.y=0}
+           Q.prototype.dot=function(o){return -1};
+           var a=[];for(var i=0;i<100;i++)a.push(new P(i,i+1));
+           var s=0;for(var r=0;r<100;r++){if(r===80)a[3]=new Q(1);
+             for(var j=0;j<a.length;j++){s+=a[j].dot(a[j])}}
+           return s})()",
+        None,
+        true,
+    );
+}

@@ -164,8 +164,9 @@ pub(crate) fn build(
     )
 }
 
-/// [`build_unit`] with general inlining (see [`inline_general`]), and again without it when an
-/// inlined body made the translation fail.
+/// [`build_unit`] with general inlining (see [`inline_general`]). When an inlined body made the
+/// translation fail, its call site is marked not to inline and the unit is translated again;
+/// a failure no single site is blamed for retranslates without inlining.
 #[allow(clippy::too_many_arguments)]
 fn build_region(
     interp: &Interp,
@@ -181,26 +182,62 @@ fn build_region(
     this_val: &Value,
     widen: &[Widen],
 ) -> Result<Built, String> {
-    let on = inline_general::enabled();
-    let retry = on.then(|| (an.clone(), kinds.clone(), fresh.clone()));
-    match build_unit(
-        interp, env, chunk, header, backedge, slots, an, kinds, fresh, func_mode, this_val, widen,
-        on,
-    ) {
-        Ok(b) => Ok(b),
-        Err((e, false)) => Err(e),
-        Err((e, true)) => {
-            if log_enabled() {
-                eprintln!("[jit] translation with inlined calls failed ({e}): without");
+    const RETRIES: usize = 3;
+    let mut on = inline_general::enabled();
+    let mut attempt = 0;
+    loop {
+        let last = !on;
+        let r = build_unit(
+            interp,
+            env,
+            chunk,
+            header,
+            backedge,
+            slots,
+            an.clone(),
+            kinds.clone(),
+            fresh.clone(),
+            func_mode,
+            this_val,
+            widen,
+            on,
+        );
+        let (e, fail) = match r {
+            Ok(b) => return Ok(b),
+            Err((e, _)) if last => return Err(e),
+            Err(x) => x,
+        };
+        match fail {
+            InlineFail::None => return Err(e),
+            InlineFail::Sites(sites) if attempt < RETRIES => {
+                for (c, pc) in sites {
+                    // SAFETY: the failing sites' chunks are the unit's or inlined callees',
+                    // kept alive by this compile.
+                    unsafe { &*(c as *const Chunk) }.jit.set_no_inline(pc);
+                }
+                if log_enabled() {
+                    eprintln!("[jit] translation with an inlined call failed ({e}): retrying");
+                }
             }
-            let (an, kinds, fresh) = retry.expect("inlining was on");
-            build_unit(
-                interp, env, chunk, header, backedge, slots, an, kinds, fresh, func_mode,
-                this_val, widen, false,
-            )
-            .map_err(|(e, _)| e)
+            _ => {
+                if log_enabled() {
+                    eprintln!("[jit] translation with inlined calls failed ({e}): without");
+                }
+                on = false;
+            }
         }
+        attempt += 1;
     }
+}
+
+/// Why [`build_unit`] failed, as far as general inlining goes.
+pub(super) enum InlineFail {
+    /// Not because of an inlined body (nothing was inlined).
+    None,
+    /// In the bodies inlined at these call sites (chunk address, pc).
+    Sites(Vec<(usize, usize)>),
+    /// With inlined bodies, but not inside one.
+    Unit,
 }
 
 /// Translate the whole of `chunk` as function code entered at pc 0 (the whole-function tier):
@@ -744,7 +781,7 @@ fn build_unit(
     this_val: &Value,
     widen: &[Widen],
     inline: bool,
-) -> Result<Built, (String, bool)> {
+) -> Result<Built, (String, InlineFail)> {
     let n_slots = chunk.n_slots;
     let mut kinds = kinds;
     if chunk.reflect_args && crate::bytecode::reflect::enabled() {
@@ -874,9 +911,15 @@ fn build_unit(
         };
         tr.entry(&an);
         let r = tr.body(&an);
-        let inlined = tr.ginl.inlined > 0;
         if let Err(e) = r.and_then(|()| tr.err.take().map_or(Ok(()), Err)) {
-            return Err((e, inlined));
+            let fail = if !tr.ginl.failed.is_empty() {
+                InlineFail::Sites(std::mem::take(&mut tr.ginl.failed))
+            } else if tr.ginl.inlined > 0 {
+                InlineFail::Unit
+            } else {
+                InlineFail::None
+            };
+            return Err((e, fail));
         }
         let Tr {
             fb,
@@ -2548,6 +2591,19 @@ impl<'a, 'f> Tr<'a, 'f> {
     }
 
     fn call(&mut self, h: Helper, args: &[V]) -> Option<V> {
+        // A frameless inlined body's helpers see its committed call (see `inline_general`),
+        // except those that run no JS, cannot throw and read nothing of the frame but its
+        // `interp`.
+        if let (Some(inline_general::InlCx { fl: Some(fl), .. }), false) = (
+            self.inl,
+            matches!(
+                h,
+                Helper::Drop | Helper::Clone | Helper::UnpackClone | Helper::ElemGetStr
+            ),
+        ) {
+            let nf = self.frame;
+            self.fl_commit(fl, nf);
+        }
         let f = self.helper(h);
         self.fb.call_fn(f, args).first().copied()
     }
@@ -2838,7 +2894,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::JumpIfNotNullishPeek(_)
                     | Op::Not
             )
-            || (matches!(op, Op::LoadName(..)) && self.plan.name_ref.contains(&pc));
+            || (matches!(op, Op::LoadName(..)) && self.plan.name_ref.contains(&pc))
+            || self.num_operands_only(op, d);
         if !pure {
             for k in 0..d - pops {
                 if matches!(self.stack[k], Entry::Ref(_, src) if src.in_env()) {
@@ -2850,6 +2907,38 @@ impl<'a, 'f> Tr<'a, 'f> {
             Op::StoreLocal(s) | Op::UpdateLocal(s, _) | Op::Tdz(s) => self.slot_write(s as usize),
             Op::ArithLL(_, s, ..) | Op::ArithLK(_, s, ..) => self.slot_write(s as usize),
             _ => {}
+        }
+    }
+
+    /// Whether `op` is an arithmetic, bitwise or comparison op whose operands (the top of a
+    /// `d` deep stack) are all unboxed: it runs no JS, so borrowed env Refs below survive it.
+    fn num_operands_only(&self, op: Op, d: usize) -> bool {
+        let unboxed = |n: usize| {
+            d >= n
+                && self.stack[d - n..d]
+                    .iter()
+                    .all(|e| matches!(e, Entry::Num(_) | Entry::Bool(_)))
+        };
+        match op {
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Lt
+            | Op::Gt
+            | Op::Le
+            | Op::Ge
+            | Op::StrictEq
+            | Op::StrictNotEq => unboxed(2),
+            Op::Neg | Op::Plus | Op::BitNot => unboxed(1),
+            _ => false,
         }
     }
 
@@ -4046,6 +4135,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                         ta_read && pos == 0
                     }
                     Op::GetElem | Op::SetElem | Op::SetElemDrop => ta_read && pos == 1,
+                    Op::Call(n) | Op::TailCall(n, false) => {
+                        pos >= 1 && self.direct_arg_num(q, pos - 1, n as usize)
+                    }
+                    Op::CallWithThis(n) | Op::TailCall(n, true) => {
+                        pos >= 2 && self.direct_arg_num(q, pos - 2, n as usize)
+                    }
                     // `+` concatenates strings: only speculate when the other side is a Number.
                     Op::Add => {
                         (pos == 1
@@ -4069,6 +4164,29 @@ impl<'a, 'f> Tr<'a, 'f> {
             q += 1;
         }
         false
+    }
+
+    /// Whether argument `k` (of `argc`) of the direct site at `q` binds a parameter its callee's
+    /// function code keeps as a Number (an unboxed argument then needs no boxing; one that is
+    /// not a Number exits after the producing op).
+    fn direct_arg_num(&self, q: usize, k: usize, argc: usize) -> bool {
+        let Some(site) = self.plan.direct.get(&q) else {
+            return false;
+        };
+        if k >= argc || k >= site.n_params || site.word == 0 || site.adaptor != call::Adaptor::None
+        {
+            return false;
+        }
+        // SAFETY: the plan pins the site's callee, which keeps its chunk alive.
+        let cc = unsafe { &*(site.chunk as *const Chunk) };
+        let Ok(fs) = cc.jit.func.try_borrow() else {
+            return false;
+        };
+        fs.widen.get(k).is_none_or(|w| *w == Widen::None)
+            && fs
+                .code
+                .as_ref()
+                .is_some_and(|c| matches!(c.kinds.get(k), Some(Kind::Num | Kind::Int32)))
     }
 
     // ---- generic paths -----------------------------------------------------------------------
@@ -5284,6 +5402,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 (Entry::Ref(obj, src), Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let fact = self.idx_fact_at(pc, src);
+                    if !want && self.elem_chains(pc, src) {
+                        return self.elem_chain(pc, obj, key, d - 2, fact, src);
+                    }
                     self.elem_read(
                         pc,
                         obj,
@@ -5502,7 +5623,32 @@ impl<'a, 'f> Tr<'a, 'f> {
                                 Some(Src::Slot(s)),
                             );
                         },
-                        |t| t.generic(pc),
+                        // A String key on a plain object: a data property natively.
+                        |t| {
+                            let obj = t.slot_ptr(s as usize);
+                            let (kp, consume) = match t.stack[d - 1] {
+                                Entry::Ref(p, _) => (p, 0),
+                                _ => (t.sptr(d - 1), 2),
+                            };
+                            let dst = t.sptr(d - 1);
+                            let cv = t.i32c(consume);
+                            let r = t
+                                .call(Helper::ElemGetStr, &[t.frame, obj, kp, dst, cv])
+                                .expect("ElemGetStr returns a flag");
+                            let z = t.i32c(0);
+                            let hit = t.fb.icmp(IntCC::Ne, r, z);
+                            let gen = t.fb.create_block();
+                            let join = t.fb.create_block();
+                            t.fb.brif(hit, join, &[], gen, &[]);
+                            t.fb.seal_block(gen);
+                            t.fb.switch_to_block(gen);
+                            t.generic(pc);
+                            t.fb.jump(join, &[]);
+                            t.fb.seal_block(join);
+                            t.fb.switch_to_block(join);
+                            t.stack.truncate(d - 1);
+                            t.stack.push(Entry::Boxed);
+                        },
                     )?,
                     _ => self.generic(pc),
                 }
@@ -6442,6 +6588,175 @@ impl<'a, 'f> Tr<'a, 'f> {
         let plain = (self.fb.current_block(), self.stack.clone());
         self.merge_paths(vec![lent, plain])?;
         self.skip = Some(last);
+        Ok(())
+    }
+
+    /// Whether the element read at `pc` lends its result to a plain own-property read right
+    /// after it (`a[i].name`, see [`Tr::elem_chain`]).
+    fn elem_chains(&self, pc: usize, src: Src) -> bool {
+        let q = pc + 1;
+        if self.chaining
+            || q > self.backedge
+            || self.is_leader(q)
+            || self.ta_first(Some(src))
+            || helpers::ta_hot(self.chunk, pc)
+            || self.pending_append.as_ref().is_some_and(|p| p.0 == q)
+        {
+            return false;
+        }
+        let Op::GetProp(n, c) = self.ops[q] else {
+            return false;
+        };
+        &*self.chunk.names[n as usize] != "length"
+            && !self.plan.dget.contains_key(&q)
+            && !self.plan.dacc.contains_key(&q)
+            && !self.bl_vars.contains_key(&q)
+            && layout::prop_ic(self.chunk, c).is_some_and(|ic| ic.has_own())
+    }
+
+    /// `a[i].name` with `a` borrowed (`obj`, from `src`) and a Number key: an object element is
+    /// lent to the property read at `pc + 1` as a [`Src::Borrow`] Ref (as [`Tr::chain_read`]
+    /// does for properties), so the element costs no reference count traffic and never goes
+    /// through a Boxed stack entry. Under an in-bounds fact the element word is loaded straight
+    /// from the array's element-storage view. Anything else takes the ordinary element read and
+    /// property read.
+    fn elem_chain(
+        &mut self,
+        pc: usize,
+        obj: V,
+        key: V,
+        at: usize,
+        fact: Option<(Src, u16)>,
+        src: Src,
+    ) -> Result<(), String> {
+        let pre = self.stack.clone();
+        let other = self.fb.create_block();
+        let view = fact.and_then(|k| Some((*self.idx_vars.get(&k)?, *self.arr_vars.get(&k.0)?)));
+        let gc = match view {
+            Some((ok_var, a)) => {
+                let got = self.fb.create_block();
+                let gc = self.fb.append_block_param(got, Type::I64);
+                let fast = self.fb.create_block();
+                let checked = self.fb.create_block();
+                let ok = self.fb.use_var(ok_var);
+                self.fb.brif(ok, fast, &[], checked, &[]);
+                self.fb.seal_block(fast);
+                self.fb.switch_to_block(fast);
+                let kind = self.fb.use_var(a.kind);
+                let base = self.fb.use_var(a.base);
+                let ii = self.to_index(key);
+                let g = layout::view_elem_obj(&mut self.fb, kind, base, ii, checked);
+                self.seal_current();
+                self.fb.jump(got, &[g]);
+                self.fb.seal_block(checked);
+                self.fb.switch_to_block(checked);
+                let bits = layout::elem_get_word(&mut self.fb, obj, key, other);
+                let (is_obj, _, g) = layout::word_counted(&mut self.fb, bits);
+                layout::guard(&mut self.fb, is_obj, other);
+                self.fb.jump(got, &[g]);
+                self.fb.seal_block(got);
+                self.fb.switch_to_block(got);
+                gc
+            }
+            None => match self.arr_vars.get(&src).copied() {
+                // A tracked array without an in-bounds fact: its view (taken by the loop test
+                // or refreshed here) and a bounds check.
+                Some(a) => {
+                    let got = self.fb.create_block();
+                    let gc = self.fb.append_block_param(got, Type::I64);
+                    let checked = self.fb.create_block();
+                    let have = self.fb.create_block();
+                    let refresh = self.fb.create_block();
+                    let kind = self.fb.use_var(a.kind);
+                    let zero = self.i32c(0);
+                    let valid = self.fb.icmp(IntCC::Ne, kind, zero);
+                    self.fb.brif(valid, have, &[], refresh, &[]);
+                    self.fb.seal_block(refresh);
+                    self.fb.switch_to_block(refresh);
+                    self.fb.mark_cold();
+                    let len = layout::length(&mut self.fb, obj, checked);
+                    self.seal_current();
+                    let (k, base, count) = layout::array_view(&mut self.fb, obj);
+                    self.fb.def_var(a.kind, k);
+                    self.fb.def_var(a.base, base);
+                    self.fb.def_var(a.count, count);
+                    self.fb.def_var(a.len, len);
+                    let some = self.fb.icmp(IntCC::Ne, k, zero);
+                    self.fb.brif(some, have, &[], checked, &[]);
+                    self.fb.seal_block(have);
+                    self.fb.switch_to_block(have);
+                    let kind = self.fb.use_var(a.kind);
+                    let base = self.fb.use_var(a.base);
+                    let count = self.fb.use_var(a.count);
+                    let ii = match self.int32_of(key) {
+                        Some(x) if PTR == Type::I64 => self.fb.convert(ConvOp::Sext, PTR, x),
+                        Some(x) => x,
+                        None => {
+                            let i = self.to_index(key);
+                            let back = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+                            let exact = self.fb.fcmp(FloatCC::Eq, back, key);
+                            layout::guard(&mut self.fb, exact, checked);
+                            i
+                        }
+                    };
+                    let inb = self.fb.icmp(IntCC::Ult, ii, count);
+                    layout::guard(&mut self.fb, inb, checked);
+                    let g = layout::view_elem_obj(&mut self.fb, kind, base, ii, checked);
+                    self.seal_current();
+                    self.fb.jump(got, &[g]);
+                    self.fb.seal_block(checked);
+                    self.fb.switch_to_block(checked);
+                    let bits = layout::elem_get_word(&mut self.fb, obj, key, other);
+                    let (is_obj, _, g) = layout::word_counted(&mut self.fb, bits);
+                    layout::guard(&mut self.fb, is_obj, other);
+                    self.fb.jump(got, &[g]);
+                    self.fb.seal_block(got);
+                    self.fb.switch_to_block(got);
+                    gc
+                }
+                None => {
+                    let bits = layout::elem_get_word(&mut self.fb, obj, key, other);
+                    let (is_obj, _, g) = layout::word_counted(&mut self.fb, bits);
+                    layout::guard(&mut self.fb, is_obj, other);
+                    g
+                }
+            },
+        };
+        self.seal_current();
+        let dst = self.sptr(at);
+        let objt = self.i32c(TAG_OBJ as i64);
+        self.fb.store(MemKind::I32U8, dst, objt, 0);
+        self.fb.store(MemKind::I64, dst, gc, VALUE_PAYLOAD);
+        self.stack.truncate(at);
+        self.stack.push(Entry::Ref(dst, Src::Borrow));
+        self.chained_ops(pc + 1, pc + 1)?;
+        // A result the consumer keeps unboxed leaves the lent object's bits in the entry: stack
+        // memory above the depth must stay trivially droppable.
+        if !self.fb.is_filled() && self.stack.get(at) != Some(&Entry::Boxed) {
+            self.set_stack_tag(at, TAG_UNDEFINED);
+        }
+        let lent = (self.fb.current_block(), self.stack.clone());
+        self.fb.seal_block(other);
+        self.fb.switch_to_block(other);
+        self.fb.mark_cold();
+        self.stack = pre;
+        self.elem_read(
+            pc,
+            obj,
+            key,
+            None,
+            at,
+            false,
+            Slow::Generic,
+            fact,
+            Some(src),
+        );
+        if !self.fb.is_filled() {
+            self.chained_ops(pc + 1, pc + 1)?;
+        }
+        let plain = (self.fb.current_block(), self.stack.clone());
+        self.merge_paths(vec![lent, plain])?;
+        self.skip = Some(pc + 1);
         Ok(())
     }
 

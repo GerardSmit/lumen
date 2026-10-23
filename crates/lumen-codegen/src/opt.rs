@@ -698,7 +698,7 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
             // Every signed I32 is exactly representable as F64. Recover it without an FP
             // conversion when JS bit operations or array indexing consume an unboxed local.
             if let InstData::Convert {
-                op: ConvOp::ToJsInt32 | ConvOp::ToSintSat,
+                op: ConvOp::ToJsInt32 | ConvOp::ToSintSat | ConvOp::ToSint,
                 to,
                 arg,
             } = func.inst(inst)
@@ -727,6 +727,31 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
                                 }
                                 _ => {}
                             }
+                        }
+                    }
+                }
+            }
+
+            // An I32 widened to I64 converts to the same float as the I32 itself.
+            if let InstData::Convert {
+                op: ConvOp::FromSint,
+                to,
+                arg,
+            } = *func.inst(inst)
+            {
+                if let ValueDef::Result(source, 0) = func.values[arg.index()].def {
+                    if let InstData::Convert {
+                        op: ConvOp::Sext,
+                        arg: narrow,
+                        ..
+                    } = *func.inst(source)
+                    {
+                        if func.value_type(narrow) == Type::I32 {
+                            func.insts[inst.index()] = InstData::Convert {
+                                op: ConvOp::FromSint,
+                                to,
+                                arg: narrow,
+                            };
                         }
                     }
                 }
