@@ -988,9 +988,9 @@ impl DomNodeList {
             .map_or(Value::Undefined, |(realm, id)| realm.wrap(ctx, id)))
     }
     #[method(coerce)]
-    fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
+    fn item(&self, ctx: &mut Ctx, index: u32) -> OpResult<Value> {
         Ok(self
-            .node_at(index)?
+            .node_at(index as usize)?
             .map_or(Value::Null, |(realm, id)| realm.wrap(ctx, id)))
     }
     fn for_each(
@@ -1068,7 +1068,7 @@ impl DomHtmlCollection {
         self.base.indexed(ctx, index)
     }
     #[method(coerce)]
-    fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
+    fn item(&self, ctx: &mut Ctx, index: u32) -> OpResult<Value> {
         self.base.item(ctx, index)
     }
     #[proto(iter)]
@@ -1140,7 +1140,7 @@ impl DomHtmlAllCollection {
     fn item(&self, ctx: &mut Ctx, name_or_index: Value) -> OpResult<Value> {
         if let Value::Num(index) = name_or_index {
             if index >= 0.0 && index.fract() == 0.0 {
-                return self.base.base.item(ctx, index as usize);
+                return self.base.base.item(ctx, (index % 4294967296.0) as u32);
             }
             return Ok(Value::Null);
         }
@@ -1479,10 +1479,10 @@ impl DomRadioNodeList {
     }
 
     #[method(coerce)]
-    fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
+    fn item(&self, ctx: &mut Ctx, index: u32) -> OpResult<Value> {
         Ok(self
             .base
-            .node_at(index)?
+            .node_at(index as usize)?
             .map_or(Value::Null, |(realm, id)| realm.wrap(ctx, id)))
     }
 
@@ -1662,8 +1662,9 @@ impl DomTokenList {
     fn indexed(&self, index: usize) -> OpResult<Option<String>> {
         Ok(self.tokens()?.get(index).cloned())
     }
-    fn item(&self, index: usize) -> OpResult<Nullable<String>> {
-        self.indexed(index).map(Nullable)
+    #[method(coerce)]
+    fn item(&self, index: u32) -> OpResult<Nullable<String>> {
+        self.indexed(index as usize).map(Nullable)
     }
     #[method(coerce)]
     fn contains(&self, token: &str) -> OpResult<bool> {

@@ -5822,6 +5822,14 @@ impl RenderSession {
             return;
         }
         let Some(rules) = self.rules.as_ref() else { return };
+        // The installed container oracle belongs to the previous rules, so a
+        // restyle against it cannot tell whether new `@container` rules apply;
+        // only a relayout measures the containers again.
+        if self.rule_subjects.is_some() && rules.has_container_rules() {
+            self.invalidation_stats.bails[0] += 1;
+            self.rules_reset = true;
+            return;
+        }
         let environment = css::MediaEnvironment { width: width as f32, height: height as f32, ..rules.environment };
         if self.style_environment != Some(environment) {
             self.invalidation_stats.bails[1] += 1;

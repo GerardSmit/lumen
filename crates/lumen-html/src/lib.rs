@@ -41,6 +41,7 @@ pub mod ranges;
 pub mod highlights;
 pub mod rendered_text;
 pub mod selection;
+pub mod select_content;
 pub mod selector;
 pub mod session;
 pub mod stylesheet_loading;

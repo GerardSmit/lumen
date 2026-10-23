@@ -27,8 +27,18 @@ pub(super) fn expand(name: &str, raw: &str, arity: usize) -> Option<Vec<String>>
         "vertical-align" => vertical_align(&tokens),
         "font-synthesis" => font_synthesis(&tokens),
         "line-clamp" => line_clamp(&tokens),
+        "-webkit-line-clamp" => webkit_line_clamp(&tokens),
         _ => None,
     }
+}
+
+fn webkit_line_clamp(tokens: &[&str]) -> Option<Vec<String>> {
+    let &[token] = tokens else { return None };
+    if decoded_css_keyword(token, "none") {
+        return Some(alloc::vec![String::from("auto"), String::from("no-ellipsis"), String::from("normal")]);
+    }
+    let lines = token.parse::<u32>().ok().filter(|lines| *lines > 0)?;
+    Some(alloc::vec![alloc::format!("{lines}"), String::from("ellipsis"), String::from("-webkit-legacy")])
 }
 
 fn line_clamp(tokens: &[&str]) -> Option<Vec<String>> {
@@ -211,6 +221,14 @@ pub(super) fn synthesize(name: &str, values: &[&str], computed: bool) -> Option<
             let parts: Vec<&str> = [(style, "none"), (color, "currentcolor")].into_iter()
                 .filter(|(value, initial)| value != initial).map(|(value, _)| value).collect();
             Some(if parts.is_empty() { String::from("none") } else { parts.join(" ") })
+        }
+        "-webkit-line-clamp" => {
+            let &[lines, ellipsis, behavior] = values else { return None };
+            if lines == "auto" && ellipsis == "no-ellipsis" && behavior == "normal" {
+                return Some(String::from("none"));
+            }
+            let integer = !lines.is_empty() && lines.bytes().all(|byte| byte.is_ascii_digit());
+            (integer && ellipsis == "ellipsis" && behavior == "-webkit-legacy").then(|| String::from(lines))
         }
         "line-clamp" => {
             let &[lines, ellipsis, behavior] = values else { return None };

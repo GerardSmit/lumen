@@ -104,7 +104,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("block-ellipsis", true, "no-ellipsis", "no-ellipsis | ellipsis | <string>"),
     prop("max-lines", false, "auto", "auto | <integer-min1> auto?"),
     prop("continue", false, "normal", "normal | discard | collapse | -webkit-legacy"),
-    prop("-webkit-line-clamp", false, "none", "none | <integer-min1>"),
+    prop("-webkit-box-orient", false, "horizontal", "horizontal | vertical | inline-axis | block-axis"),
     post(prop("overflow-clip-margin", false, "0px", "[ content-box | padding-box | border-box ] || <length>"), Post::OverflowClipMargin),
     prop("overscroll-behavior-x", false, "auto", "contain | none | auto"),
     prop("overscroll-behavior-y", false, "auto", "contain | none | auto"),

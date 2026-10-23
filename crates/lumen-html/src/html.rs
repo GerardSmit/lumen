@@ -3543,6 +3543,11 @@ impl<D: crate::parser_documents::ParserDocument + ?Sized> core::ops::DerefMut fo
 impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> {
     fn complete_open_element(&mut self, node: NodeId) {
         self.document.record_parser_element_completion(node);
+        if matches!(self.document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select") {
+            if let Err(failure) = self.refresh_select_content(node) {
+                if self.completion_error.is_none() { self.completion_error = Some(failure); }
+            }
+        }
         // HTML's foreign-content stack uses a different tokenizer tag for
         // SVG style elements. Their stylesheet lifecycle still runs when the
         // actual element is popped, including recovery and EOF pops.
@@ -4895,7 +4900,6 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if self.html.is_some() && !self.frameset_mode {
                 self.ensure_scaffold(self.body)?;
             }
-            self.refresh_selected_content()?;
             // EOF completes remaining source-owned elements even when HTML's
             // stack remains open. The sink only records completion; native
             // loading is queued after this borrowed parser turn returns.
@@ -4947,37 +4951,73 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         Ok(())
     }
 
-    fn refresh_selected_content(&mut self) -> Result<(), ParseError> {
-        let mut pending = alloc::vec![self.body];
-        let mut selects = Vec::new();
+    fn refresh_select_content(&mut self, select: NodeId) -> Result<(), ParseError> {
+        if self
+            .document
+            .get_attribute_ns_ref(select, None, "multiple")
+            .map_err(|error| dom_error(self.pos, error))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let display_size = self
+            .document
+            .get_attribute_ns_ref(select, None, "size")
+            .map_err(|error| dom_error(self.pos, error))?
+            .and_then(|value| {
+                let digits = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+                let end = digits.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(digits.len());
+                digits[..end].parse::<usize>().ok()
+            })
+            .unwrap_or(1);
+        let mut pending = alloc::vec![select];
+        let mut selected = None;
+        let mut first_enabled = None;
+        let mut selected_content = Vec::new();
         while let Some(node) = pending.pop() {
-            if let Some(root) = self
-                .document
-                .shadow_root(node)
-                .map_err(|e| dom_error(self.pos, e))?
+            if node != select
+                && matches!(
+                    self.document.kind(node),
+                    Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
+                )
             {
-                pending.push(root);
-            }
-            if matches!(
-                self.document.kind(node),
-                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
-            ) {
-                selects.push(node);
-            }
-            let content = self
-                .document
-                .template_content(node)
-                .map_err(|error| dom_error(self.pos, error))?;
-            // A parser script can adopt associated template contents into a
-            // different arena. Their control state then belongs to that
-            // document's ordinary adoption/mutation hooks, not this parser's
-            // owner-local completion refresh.
-            if content.is_some_and(|content| content.document_id() != self.document.root().document_id()) {
                 continue;
+            }
+            match self.document.kind(node) {
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    name,
+                    attributes,
+                }) if name == "option" => {
+                    if attributes.iter().any(|(key, _)| key == "selected") {
+                        selected = Some(node);
+                    }
+                    if first_enabled.is_none() {
+                        let mut disabled = attributes.iter().any(|(key, _)| key == "disabled");
+                        if !disabled {
+                            if let Ok(Some(parent)) = self.document.parent(node) {
+                                disabled = matches!(
+                                    self.document.kind(parent),
+                                    Ok(NodeKind::Element { namespace: Namespace::Html, name, attributes })
+                                        if name == "optgroup" && attributes.iter().any(|(key, _)| key == "disabled")
+                                );
+                            }
+                        }
+                        if !disabled {
+                            first_enabled = Some(node);
+                        }
+                    }
+                }
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    name,
+                    ..
+                }) if name == "selectedcontent" => selected_content.push(node),
+                _ => {}
             }
             let mut child = self
                 .document
-                .last_child(content.unwrap_or(node))
+                .last_child(node)
                 .map_err(|error| dom_error(self.pos, error))?;
             while let Some(id) = child {
                 pending.push(id);
@@ -4987,86 +5027,43 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     .map_err(|error| dom_error(self.pos, error))?;
             }
         }
-        for select in selects {
-            let mut pending = alloc::vec![select];
-            let mut options = Vec::new();
-            let mut selected_content = Vec::new();
-            while let Some(node) = pending.pop() {
-                if node != select
-                    && matches!(
-                        self.document.kind(node),
-                        Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
-                    )
-                {
-                    continue;
-                }
-                match self.document.kind(node) {
-                    Ok(NodeKind::Element {
-                        namespace: Namespace::Html,
-                        name,
-                        attributes,
-                    }) if name == "option" => {
-                        let is_selected = attributes.iter().any(|(key, _)| key == "selected");
-                        options.push((node, is_selected));
-                    }
-                    Ok(NodeKind::Element {
-                        namespace: Namespace::Html,
-                        name,
-                        ..
-                    }) if name == "selectedcontent" => selected_content.push(node),
-                    _ => {}
-                }
-                let mut child = self
+        if selected_content.is_empty() {
+            return Ok(());
+        }
+        let source = selected.or_else(|| if display_size == 1 { first_enabled } else { None });
+        let mut source_children = Vec::new();
+        if let Some(source) = source {
+            let mut child = self
+                .document
+                .first_child(source)
+                .map_err(|error| dom_error(self.pos, error))?;
+            while let Some(id) = child {
+                source_children.push(id);
+                child = self
                     .document
-                    .last_child(node)
+                    .next_sibling(id)
                     .map_err(|error| dom_error(self.pos, error))?;
-                while let Some(id) = child {
-                    pending.push(id);
-                    child = self
-                        .document
-                        .previous_sibling(id)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
             }
-            let source = options
-                .iter()
-                .find(|(_, selected)| *selected)
-                .or_else(|| options.first())
-                .map(|(id, _)| *id);
-            let mut source_children = Vec::new();
-            if let Some(source) = source {
-                let mut child = self
-                    .document
-                    .first_child(source)
+        }
+        for target in selected_content {
+            while let Some(child) = self
+                .document
+                .first_child(target)
+                .map_err(|error| dom_error(self.pos, error))?
+            {
+                self.document
+                    .detach(child)
                     .map_err(|error| dom_error(self.pos, error))?;
-                while let Some(id) = child {
-                    source_children.push(id);
-                    child = self
-                        .document
-                        .next_sibling(id)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
+                self.document
+                    .destroy_subtree(child)
+                    .map_err(|error| dom_error(self.pos, error))?;
             }
-            for target in selected_content {
-                while let Some(child) = self
+            for child in &source_children {
+                let clone = self
                     .document
-                    .first_child(target)
-                    .map_err(|error| dom_error(self.pos, error))?
-                {
-                    self.document
-                        .detach(child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                    self.document
-                        .destroy_subtree(child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
-                for child in &source_children {
-                    let clone = self
-                        .document
-                        .clone_subtree(*child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                    self.append(target, clone)?;
-                }
+                    .clone_subtree(*child)
+                    .map_err(|error| dom_error(self.pos, error))?;
+                self.append(target, clone)?;
             }
         }
         Ok(())
@@ -5898,7 +5895,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             return Ok(());
         }
         if self.fragment_context == Some(Tag::Select)
-            && matches!(tag, Tag::Input | Tag::Textarea)
+            && tag == Tag::Input
             && self.active_select().is_none()
             && self.stack.iter().skip(1).all(|open| matches!(open.tag, Tag::Option | Tag::Optgroup))
         {
@@ -5926,7 +5923,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     self.close_open(Tag::Select);
                     return Ok(());
                 }
-                Tag::Input | Tag::Textarea
+                Tag::Input
                     if self.stack[select_stack_index(&self.stack, select)..]
                         .iter()
                         .skip(1)

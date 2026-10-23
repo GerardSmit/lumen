@@ -45,6 +45,7 @@ static TABLE: &[Short] = &[
         shape: Shape::Rule,
     },
     Short { name: "line-clamp", longhands: &["max-lines", "block-ellipsis", "continue"], shape: Shape::Rule },
+    Short { name: "-webkit-line-clamp", longhands: &["max-lines", "block-ellipsis", "continue"], shape: Shape::Rule },
     Short { name: "marker", longhands: &["marker-start", "marker-mid", "marker-end"], shape: Shape::Repeat },
 ];
 

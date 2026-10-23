@@ -244,10 +244,20 @@ fn margin(style: &Style, used: &Style, edge: usize, context: ComputedValueContex
         px(used.margin_sides[edge])
     }
 }
+/// Padding cannot be negative: a bare negative percentage computes to zero.
+fn clamp_negative_percentage(value: String) -> String {
+    let inner = value.strip_prefix("calc(").and_then(|rest| rest.strip_suffix(')')).unwrap_or(&value).trim();
+    let number = inner.strip_suffix('%').unwrap_or("");
+    if number.starts_with('-') && number.parse::<f64>().is_ok() {
+        String::from("0%")
+    } else {
+        value
+    }
+}
 fn padding(style: &Style, used: &Style, edge: usize, context: ComputedValueContext<'_>) -> String {
     if context.percentage_basis.is_none() {
         if let Some(value) = relative(style, 43 + edge) {
-            return value;
+            return clamp_negative_percentage(value);
         }
     }
     px(used.padding_sides()[edge])
@@ -470,6 +480,17 @@ impl Style {
                 2 => "ruby-base",
                 3 => "ruby-text",
                 4 => "ruby-base-container",
+                6 | 7 => {
+                    let vertical = extra_props::keyword(self, "-webkit-box-orient") == Some("vertical");
+                    let clamped = vertical && (extra_props::keyword(self, "continue").is_some()
+                        || extra_props::keyword(self, "max-lines").is_some_and(|lines| lines.starts_with(|c: char| c.is_ascii_digit())));
+                    match (self.display_ruby == 6, clamped) {
+                        (true, true) => "flow-root",
+                        (true, false) => "-webkit-box",
+                        (false, true) => "inline-block",
+                        (false, false) => "-webkit-inline-box",
+                    }
+                }
                 _ => "ruby-text-container",
             }.into(),
             "display" if self.is_list_item() => match self.display {

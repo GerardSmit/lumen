@@ -1572,7 +1572,16 @@ fn range_round_and_clamp(
     }
     // HTML's nearest-step rule resolves exact ties toward positive infinity.
     let index = (quotient + 0.5).floor().clamp(lower, upper);
-    index.mul_add(step, base).clamp(minimum, maximum)
+    drop_binary_noise(index.mul_add(step, base)).clamp(minimum, maximum)
+}
+
+/// Step arithmetic is decimal in HTML, so `6 * 0.1` is `0.6`: keep 15
+/// significant digits to discard the binary representation error.
+fn drop_binary_noise(value: f64) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    alloc::format!("{value:.14e}").parse::<f64>().unwrap_or(value)
 }
 
 fn normalize_local_datetime(value: &str) -> Option<String> {
@@ -3360,8 +3369,9 @@ pub fn input_step_value(
     if !result.is_finite() {
         return Ok(None);
     }
-    if matches!(direction, InputStepDirection::Up) && result < before
-        || matches!(direction, InputStepDirection::Down) && result > before
+    if parsed_before.is_some()
+        && (matches!(direction, InputStepDirection::Up) && result < before
+            || matches!(direction, InputStepDirection::Down) && result > before)
     {
         return Ok(None);
     }
@@ -3526,7 +3536,9 @@ pub fn validity_with_view(
             Some(InputValueMode::DefaultOn) if type_name == "radio" => {
                 let group = attribute(document, node, "name").unwrap_or("");
                 if group.is_empty() {
-                    required && !checked_by(document, node, |control| view.checkedness(control))
+                    required
+                        && attribute(document, node, "name").is_none()
+                        && !checked_by(document, node, |control| view.checkedness(control))
                 } else {
                     radio_group_required(document, node, group)
                         && !tree_contains_checked_radio_by(document, node, group, |control| {
@@ -5018,7 +5030,7 @@ mod tests {
         );
         assert_eq!(
             input_step_value(&document, id("positive"), "", 1, InputStepDirection::Down),
-            Ok(None)
+            Ok(Some("7".into()))
         );
         assert_eq!(
             input_step_value(&document, id("negative"), "", 1, InputStepDirection::Down),

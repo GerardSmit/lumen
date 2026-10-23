@@ -5184,6 +5184,7 @@ fn upgrade_inserted_roots(
         }
         if realm.session.borrow().document().kind(node).is_ok() {
             forms::settle_inserted_radios(realm, node);
+            forms::settle_inserted_selects(realm, node)?;
         }
     }
     Ok(())
@@ -8600,7 +8601,8 @@ impl DomHtmlOptionsCollection {
             &mut self.realm.forms.borrow_mut(),
             self.select,
             index as isize,
-        )
+        )?;
+        forms::selection_written(&self.realm, self.select)
     }
 }
 
@@ -8789,7 +8791,8 @@ impl DomSelectElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             value,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
     #[getter]
     fn form(&self, ctx: &mut Ctx) -> Value {
@@ -8808,7 +8811,8 @@ impl DomSelectElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             index as isize,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
 
     #[method(coerce, hint(js(ce_reactions)))]
@@ -8916,7 +8920,8 @@ impl DomOptionElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             selected,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
     #[getter]
     fn default_selected(&self) -> OpResult<bool> {
@@ -13188,6 +13193,7 @@ impl DomNode {
         for node in inserted {
             event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
             custom_elements::upgrade_created_element(ctx, &self.realm, node)?;
+            forms::settle_inserted_selects(&self.realm, node)?;
         }
         self.realm.flush_script_activations(ctx)
     }
@@ -13267,6 +13273,7 @@ impl DomNode {
             for node in inserted {
                 event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
                 custom_elements::upgrade_created_element(ctx, &self.realm, node)?;
+                forms::settle_inserted_selects(&self.realm, node)?;
             }
         }
         result?;
@@ -14061,6 +14068,7 @@ impl DomNode {
             self.realm.reap_detached(old);
             for node in inserted {
                 event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
+                forms::settle_inserted_selects(&self.realm, node)?;
                 if !target_is_template {
                     custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, node)?;
                 }

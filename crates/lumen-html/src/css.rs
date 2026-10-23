@@ -132,6 +132,7 @@ mod individual_transforms;
 pub mod text_breaks;
 mod numeric_tokens;
 mod text_props;
+mod text_align_last;
 pub mod linear_numeric;
 mod transform_origin;
 pub use declaration_block::DeclarationBlock;
@@ -4119,7 +4120,11 @@ impl Style {
     pub fn blockify_display(&mut self) {
         self.display = self.display.blockified();
         self.display_inline = false;
-        if self.display_ruby > 1 { self.display_ruby = 0; }
+        match self.display_ruby {
+            2..=5 => self.display_ruby = 0,
+            7 => self.display_ruby = 6,
+            _ => {}
+        }
     }
 
     /// Whether this computed display generates an element's principal box.
@@ -6682,7 +6687,12 @@ impl Value {
                 style.display_ruby = 0;
             }
             Self::DisplayRuby { kind, block } => {
-                style.display = if *block { Display::Block } else { Display::Inline };
+                style.display = match *kind {
+                    6 => Display::Block,
+                    7 => Display::InlineBlock,
+                    _ if *block => Display::Block,
+                    _ => Display::Inline,
+                };
                 style.display_inline = false;
                 style.display_list_item = false;
                 style.grid_lanes = false;
@@ -10640,7 +10650,7 @@ fn parse_simple_selector_depth(
             let pseudo_element = rest.starts_with("::") && !rest.starts_with(":::");
             let ParsedPseudoSource{name,args,end,args_offset}=parse_pseudo_source(rest,offset+start)?;
             let name=name.as_str();
-            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text"|"scroll-button")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
+            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text"|"scroll-button"|"picker"|"picker-icon"|"checkmark"|"interest-button")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
                 return Err(selector_error(offset+start,"invalid pseudo selector colon syntax"));
             }
 
@@ -10684,6 +10694,28 @@ fn parse_simple_selector_depth(
                 // No scroll button box is generated, so the selector is valid and matches nothing.
                 selector.logical.push(LogicalPseudo::Is(Vec::new()));
                 selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && matches!(name, "picker" | "picker-icon" | "checkmark" | "interest-button") {
+                let valid = match name {
+                    "picker" => args.is_some_and(|argument| argument.trim().eq_ignore_ascii_case("select")),
+                    _ => args.is_none(),
+                };
+                if !valid {
+                    return Err(selector_error(offset + start, "invalid form control pseudo-element"));
+                }
+                // No picker, checkmark or interest button box is generated, so the selector is valid and matches nothing.
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if !pseudo_element && args.is_none() && matches!(name, "interest-source" | "interest-target" | "has-partial-interest" | "filtered") {
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.1 += 1;
                 start += end;
                 continue;
             }
@@ -14039,7 +14071,8 @@ property_registry! {
     "max-lines" => [extra_props::VALUE_BASE + value_props::const_index("max-lines")], false, true;
     "line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("max-lines"), extra_props::VALUE_BASE + value_props::const_index("block-ellipsis"), extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
     "continue" => [extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
-    "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-line-clamp")], false, true;
+    "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("max-lines"), extra_props::VALUE_BASE + value_props::const_index("block-ellipsis"), extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
+    "-webkit-box-orient" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-box-orient")], false, true;
     "overflow-clip-margin" => [extra_props::VALUE_BASE + value_props::const_index("overflow-clip-margin")], false, true;
     "overscroll-behavior-x" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-x")], false, true;
     "overscroll-behavior-y" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-y")], false, true;
@@ -20767,6 +20800,8 @@ fn ruby_display(raw: &str) -> Option<Value> {
         ["ruby-text"] => Some(Value::DisplayRuby { kind: 3, block: false }),
         ["ruby-base-container"] => Some(Value::DisplayRuby { kind: 4, block: false }),
         ["ruby-text-container"] => Some(Value::DisplayRuby { kind: 5, block: false }),
+        ["-webkit-box"] => Some(Value::DisplayRuby { kind: 6, block: true }),
+        ["-webkit-inline-box"] => Some(Value::DisplayRuby { kind: 7, block: false }),
         _ => None,
     }
 }
@@ -21760,8 +21795,8 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 "inline" => Some(Value::Display(Display::Inline)),
                 "inline-block" => Some(Value::Display(Display::InlineBlock)),
                 "list-item" => Some(Value::Display(Display::ListItem)),
-                "flex" => Some(Value::Display(Display::Flex)),
-                "inline-flex" => Some(Value::DisplayComponents { principal: Display::Flex, inline: true, list_item: false }),
+                "flex" | "-webkit-flex" => Some(Value::Display(Display::Flex)),
+                "inline-flex" | "-webkit-inline-flex" => Some(Value::DisplayComponents { principal: Display::Flex, inline: true, list_item: false }),
 
                 "table" => Some(Value::Display(Display::Table)),
                 "inline-table" => Some(Value::Display(Display::InlineTable)),

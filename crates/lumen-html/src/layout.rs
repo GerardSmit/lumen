@@ -4326,6 +4326,7 @@ struct Layout<'a> {
     /// Atomic inline widths resolved while collecting paragraphs; zero means
     /// the collection did not read `intrinsic_minimum_atomics`.
     atomic_width_resolutions: core::cell::Cell<u32>,
+    line_clamp: Option<line_clamp::LineClamp>,
     flow_baselines: Option<FlowBaselines>,
     export_block_table_baselines: bool,
     vertical_inline_lr: bool,
@@ -4616,6 +4617,7 @@ impl<'a> Layout<'a> {
         intrinsic_minimum_atomics: false,
         atomic_width_resolutions: core::cell::Cell::new(0),
         flow_baselines: None,
+        line_clamp: None,
         export_block_table_baselines: true,
         vertical_inline_lr: false,
         vertical_sideways_lr: false,
@@ -20414,6 +20416,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 text
             };
             let language=node.and_then(|node|self.content_language(node).ok().flatten());
+            if text.contains('\t') && matches!(style.white_space,WhiteSpace::Pre|WhiteSpace::PreWrap|WhiteSpace::BreakSpaces) {
+                return Ok(self.shape_styled_text(text,style,style.used_direction()==Direction::Rtl,node)?.width);
+            }
             let advance=if style.font_size==0.0 {0.0} else if language.is_none_or(str::is_empty){self.measure_styled_text(text,style)?}
                 else {self.text.shape_styled_context(text,style.font_size,style.used_direction() ==Direction::Rtl,&style.font,language).map_err(|_|LayoutError::Text)?.width};
             // Line layout spaces every character but the last one of the line; a
@@ -20429,6 +20434,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut width = 0.0f32;
         let east_asian = node.is_some_and(|node| self.east_asian_node(node));
         for (end, _) in style.text_line_breaks(text, true, east_asian) {
+            if style.white_space == WhiteSpace::BreakSpaces {
+                for (at, character) in text[start..end].char_indices() {
+                    let after = start + at + character.len_utf8();
+                    if matches!(character, ' ' | '\t') && after < end {
+                        width = width.max(measure(&text[start..after])?);
+                        start = after;
+                    }
+                }
+            }
             width = width.max(measure(&text[start..end])?);
             start = end;
         }
@@ -20471,13 +20485,41 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     ) -> impl Iterator<Item = (usize, lumen_common::ucd::BreakOpportunity)> + 'p {
         let tailored = style.needs_break_tailoring(minimum)
             || paragraph.spans.iter().any(|span| span.style.needs_break_tailoring(minimum));
-        css::text_breaks::opportunities_with(text, minimum, tailored, move |at| {
+        let mut preserved_spaces: Vec<usize> = Vec::new();
+        for span in paragraph.spans.iter().filter(|span| span.style.white_space == WhiteSpace::BreakSpaces) {
+            let start = span.range.start.max(offset);
+            let end = span.range.end.min(offset + text.len());
+            let Some(source) = paragraph.text.get(start..end) else { continue };
+            for (at, character) in source.char_indices() {
+                if matches!(character, ' ' | '\t') {
+                    preserved_spaces.push(start + at + character.len_utf8() - offset);
+                }
+            }
+        }
+        let mut ordinary = css::text_breaks::opportunities_with(text, minimum, tailored, move |at| {
             let at = offset + at;
             let index = paragraph.spans.partition_point(|span| span.range.end <= at);
             match paragraph.spans.get(index).filter(|span| span.range.start <= at) {
                 Some(span) => span.style.break_policy(east_asian(span.style_node)),
                 None => style.break_policy(false),
             }
+        }).peekable();
+        let mut preserved = preserved_spaces.into_iter().peekable();
+        core::iter::from_fn(move || match (ordinary.peek().copied(), preserved.peek().copied()) {
+            (Some((base, _)), Some(extra)) if extra < base => {
+                preserved.next();
+                Some((extra, lumen_common::ucd::BreakOpportunity::Allowed))
+            }
+            (Some((base, _)), Some(extra)) if extra == base => {
+                preserved.next();
+                ordinary.next()
+            }
+            (Some(_), _) => ordinary.next(),
+            (None, Some(extra)) => {
+                preserved.next();
+                Some((extra, lumen_common::ucd::BreakOpportunity::Allowed))
+            }
+            (None, None) => None,
         }).filter(move |(at, kind)| {
             if *kind==lumen_common::ucd::BreakOpportunity::Mandatory{return true;}
             let at=offset+*at;
@@ -29074,11 +29116,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 local_breaks.push(output.len());
                 paragraph.collapse_space = false;
             } else if collapse && matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c') {
-                if !paragraph.collapse_space {
+                if !paragraph.collapse_space && Self::segment_break_removed(paragraph, &output, character, chars.clone()) {
+                    paragraph.collapse_space = true;
+                } else if !paragraph.collapse_space {
                     let previous_is_break = if output.is_empty() {
                         paragraph.text.ends_with('\u{200b}')
+                            && paragraph.hard_breaks.last().is_some_and(|forced| forced.offset as usize == paragraph.text.len())
                     } else {
-                        output.ends_with('\u{200b}')
+                        output.ends_with('\u{200b}') && local_breaks.last() == Some(&output.len())
                     };
                     if !paragraph.text.is_empty()
                         || !output.is_empty()
@@ -29091,6 +29136,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
                 paragraph.collapse_space = true;
             } else {
+                let character = match character {
+                    '\u{200b}' => Self::word_space_replacement(style).unwrap_or(character),
+                    other => other,
+                };
                 Self::paragraph_output_push(paragraph, &mut output, character)?;
                 paragraph.collapse_space = false;
             }
@@ -29176,6 +29225,48 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         output.push(character);
         Ok(())
+    }
+
+    /// CSS Text 3 §4.1.2: a collapsible segment break between two wide
+    /// non-Hangul characters, or next to a zero width space, is removed.
+    fn segment_break_removed(paragraph: &InlineParagraph, output: &str, first: char, mut rest: core::iter::Peekable<core::str::Chars<'_>>) -> bool {
+        let is_space = |ch: char| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c');
+        let is_break = |ch: char| matches!(ch, '\n' | '\r');
+        let mut has_break = is_break(first);
+        let mut next = None;
+        while let Some(ch) = rest.next() {
+            if is_space(ch) {
+                has_break |= is_break(ch);
+            } else {
+                next = Some(ch);
+                break;
+            }
+        }
+        let previous = output.chars().next_back().or_else(|| paragraph.text.chars().next_back());
+        let (Some(previous), Some(next)) = (previous, next) else { return false };
+        if !has_break {
+            return false;
+        }
+        if previous == '\u{200b}' || next == '\u{200b}' {
+            return true;
+        }
+        let wide = |ch: char| {
+            matches!(lumen_common::ucd::props(ch as u32, lumen_common::ucd::Version::Current).east_asian_width, "F" | "W" | "H")
+                && !matches!(ch as u32, 0x1100..=0x11ff | 0x3130..=0x318f | 0xa960..=0xa97f | 0xac00..=0xd7ff | 0xffa0..=0xffdc)
+        };
+        wide(previous) && wide(next)
+    }
+
+    fn word_space_replacement(style: &Style) -> Option<char> {
+        let value = css::extra_props::keyword(style, "word-space-transform")?;
+        let mut words = value.split(' ');
+        if words.clone().any(|word| word == "ideographic-space") {
+            Some('\u{3000}')
+        } else if words.any(|word| word == "space") {
+            Some(' ')
+        } else {
+            None
+        }
     }
 
     fn paragraph_append_break(
@@ -29274,6 +29365,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 self.append_virtual_generated_child(&after, &style, paragraph, frame_path)?;
             }
             return Ok(());
+        }
+        if tag == "wbr" {
+            return Self::paragraph_append_text(paragraph, "\u{200b}", parent_node, parent_style, frame_path);
         }
         if style.display == Display::Contents {
             if let Some(before) =
@@ -30014,7 +30108,7 @@ if shared_paint {
                 for glyph in Arc::make_mut(&mut run.glyphs){glyph.x+=after;}run.width+=after;
             }}
         }
-        Ok(())
+        self.apply_line_tab_stops(paragraph,tokens)
     }
 
     fn make_inline_shaping_group(&self,paragraph:&InlineParagraph,range:Range<usize>,context_range:Range<usize>,style:&Style,rtl:bool,language:Option<&str>) -> Result<Option<Arc<InlineShapeGroup>>,LayoutError> {
@@ -32633,6 +32727,7 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         let mut rendered_text = None;
         let mut selectable_paragraph: Option<Arc<SelectableParagraph>> = None;
         let mut decoration_surfaces=Vec::<InlineDecorationSurface>::new();
+        let mut clamp_stopped = false;
         for paragraph_index in 0..bidi.paragraphs.len() {
             let paragraph_range = bidi.paragraphs[paragraph_index].range.clone();
             if paragraph_range.start >= paragraph_range.end {
@@ -32640,6 +32735,14 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             }
             let mut start = paragraph_range.start;
             while start < paragraph_range.end {
+                if self.line_clamp_exhausted() {
+                    if paragraph.text.get(start..paragraph_range.end).is_some_and(|rest| rest.chars().any(|c| !c.is_whitespace())) {
+                        self.line_clamp_flush_tail()?;
+                    }
+                    clamp_stopped = true;
+                    break;
+                }
+                let line_counts = *advance == 0.0;
                 let vertical_line_commands = self.commands.len();
                 let vertical_line_hits = self
                     .geometry
@@ -32682,6 +32785,22 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                     start, forced_end, &candidates, capacity, wrap, hang, *advance==0.0,&cloned)?;
                 if chosen <= start {
                     chosen = forced_end.max(start + 1).min(paragraph_range.end);
+                }
+                let clamp_last = line_counts && self.line_clamp_last_line();
+                let mut clamp_ellipsis = None;
+                if clamp_last {
+                    let more = paragraph.text.get(chosen..paragraph_range.end).is_some_and(|rest| rest.chars().any(|c| !c.is_whitespace()))
+                        || paragraph_index + 1 < bidi.paragraphs.len();
+                    if more {
+                        clamp_ellipsis = self.line_clamp_shape()?;
+                        if let Some(shaped) = &clamp_ellipsis {
+                            let reduced = self.choose_inline_line_end(paragraph, &bidi, paragraph_index,
+                                start, forced_end, &candidates, (capacity - shaped.width).max(0.0), wrap, hang, *advance==0.0,&cloned)?;
+                            if reduced > start && reduced < chosen {
+                                chosen = reduced;
+                            }
+                        }
+                    }
                 }
                 let chosen_range = start..chosen;
                 let visible_end =
@@ -33125,7 +33244,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                         self.record_text_flow_baseline(*cursor + self.baseline(style), style);
                         if style.visibility_visible
                             && (self.transform_depth > 0
-                                || self.source_capture_depth != 0 || Self::inline_filter_captures_source(paragraph,owners,token.frames.last().copied()) || style.text_shadows.is_some() || token.x < self.paint_cull_right() && *cursor < self.paint_cull_bottom())
+                                || self.source_capture_depth != 0 || Self::inline_filter_captures_source(paragraph,owners,token.frames.last().copied()) || style.text_shadows.is_some() || self.collects_text_runs() || token.x < self.paint_cull_right() && *cursor < self.paint_cull_bottom())
                         {
                             let decoration_depth = self.decorations.len();
                             for frame in &token.frames { self.begin_decoration_with_under(&paragraph.frames[*frame].style, frame_under.get(*frame).copied())?; }
@@ -33264,7 +33383,8 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                             command_end: commands.end, hit_start: 0, hit_end: 0 }), shift);
                     }
                 }
-                let used = (*advance - *trailing).max(0.0) + first_line_indent + visible_width;
+                let used = (*advance - *trailing).max(0.0) + first_line_indent + visible_width
+                    + clamp_ellipsis.as_ref().map_or(0.0, |shaped| shaped.width);
                 let auto_wrapped = chosen < forced_end;
                 let hard_break = paragraph.hard_breaks.binary_search_by_key(&chosen,|value|value.offset as usize).is_ok()
                     || breaks
@@ -33519,6 +33639,18 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                 if let Some(flow)=self.paragraph_column_flow.as_mut().filter(|flow|flow.measuring) {
                     flow.append_source(ParagraphColumnLine{source:ColumnSourceIdentity::Line{start,end:chosen},fragment:css::columns::LineFragment::new(height)})?;
                 }
+                if line_counts {
+                    if clamp_last {
+                        let ellipsis_x = line_left + *advance + indent_offset
+                            - leading_hang.min((line_width - visible_width).max(0.0)) + visible_width + line_offset;
+                        let ellipsis_y = *cursor + vertical_line_shift + overflow_baseline;
+                        match clamp_ellipsis.take() {
+                            Some(shaped) => self.line_clamp_paint_ellipsis(shaped, ellipsis_x, ellipsis_y)?,
+                            None => self.line_clamp_note_tail(ellipsis_x, ellipsis_y),
+                        }
+                    }
+                    self.line_clamp_finish_line();
+                }
                 self.record_overflow_line(paragraph, &tokens, block_style, column_shift.map_or(left,|(_,shift)|left+shift), width, *cursor + vertical_line_shift + overflow_baseline, height, line_offset)?;
                 if finalize_line {
                     self.advance_layout_cursor(cursor, height);
@@ -33539,6 +33671,9 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                 if chosen == paragraph_range.end {
                     break;
                 }
+            }
+            if clamp_stopped {
+                break;
             }
         }
         self.finish_inline_decoration_surfaces(paragraph,&mut decoration_surfaces)?;
@@ -33738,7 +33873,8 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
             return 0.0;
         }
         let free = available - used;
-        let right = match style.text_align.line_alignment() {
+        let align = style.line_text_align(last).line_alignment();
+        let right = match align {
             TextAlign::Right => true,
             TextAlign::Start => style.used_direction() == Direction::Rtl,
             TextAlign::End => style.used_direction() == Direction::Ltr,
@@ -33747,7 +33883,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
         };
         if right {
             free
-        } else if style.text_align.line_alignment() == TextAlign::Center {
+        } else if align == TextAlign::Center {
             free * 0.5
         } else {
             0.0
@@ -34678,7 +34814,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 .shape_styled_context(text, style.font_size, rtl, &style.font,language)
                 .map_err(|_| LayoutError::Text)?
         };
-        self.apply_text_spacing(shaped, text, style, rtl)
+        let spaced = self.apply_text_spacing(shaped, text, style, rtl)?;
+        Ok(self.apply_tab_stops(spaced, text, style, rtl, 0.0)?.0)
     }
 
     fn shape_resolved_text(
@@ -34964,7 +35101,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         // Right/start and centered alignment retain negative free space: an
         // overflowing line still aligns its end or center with the line box.
         let free = available.min(first.available) - used;
-        let right = match style.text_align.line_alignment() {
+        let line_align = style.line_text_align(last);
+        let right = match line_align.line_alignment() {
             TextAlign::Right => true,
             TextAlign::Start => style.used_direction() == Direction::Rtl,
             TextAlign::End => style.used_direction() == Direction::Ltr,
@@ -34973,13 +35111,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let offset = if right {
             free
-        } else if style.text_align.line_alignment() == TextAlign::Center {
+        } else if line_align.line_alignment() == TextAlign::Center {
             free * 0.5
         } else {
             0.0
         };
-        let count = if free > 0.0 && style.text_align.justifies()
-            && (style.text_align == TextAlign::JustifyAll || !last)
+        let count = if free > 0.0 && line_align.justifies()
+            && (line_align == TextAlign::JustifyAll || !last)
         {
             FlowPaintRanges::new(self.flow_paint_owners.as_deref(),first.paint_owner,first.command,end.command,true).flatten()
                 .filter(|&index| !is_float_command(index) && matches!(self.commands[index], Command::GlyphRun { .. }))
@@ -40520,6 +40658,8 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         }
         if let Some(frame)=self.overflow_frames.last_mut(){frame.flow_cursor=Some((cursor,local_content_y));}
         if let Some(frame)=self.overflow_frames.last_mut(){frame.content_anchor=Some(((content_x,cursor),(local_content_x,local_content_y)));}
+        let (text_box_trim_start, text_box_trim_end) = self.text_box_trim_amounts(&style);
+        cursor -= text_box_trim_start;
         let mut list_marker_inside_pending = list_marker.as_ref().is_some_and(|marker| {
             marker.style.list_style_position == css::ListStylePosition::Inside
         });
@@ -40756,6 +40896,11 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         }
         let content_command_start = if label_content { label_command_start } else { self.commands.len() };
         let content_hit_start = if label_content { label_hit_start } else { self.geometry.as_ref().map_or(0, |g| g.hits.len()) };
+        let saved_line_clamp = match self.line_clamp_for(&style) {
+            Some(clamp) => Some(self.line_clamp.replace(clamp)),
+            None if self.line_clamp.is_some() && line_clamp::LineClamp::isolates(&style) => Some(self.line_clamp.take()),
+            None => None,
+        };
         let mut children: Option<alloc::vec::IntoIter<FlattenedBoxChild>> = if is_form_control || widget_replaced || iframe {
             None
         } else if let Some(mut fieldset) = fieldset.take() {
@@ -40925,6 +41070,10 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.flattened_box_child_inline_eligible(child, content_width, depth + 1)?
                 }
             };
+            if !current_inline && self.line_clamp_exhausted() {
+                self.line_clamp_flush_tail()?;
+                break;
+            }
             if !current_inline {
                 if let BlockFlowItem::Child(child) = &current_child {
                     if let Some(split) = self.split_inline_flow_child(
@@ -42165,6 +42314,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 saw_non_block = true;
             }
         }
+        if let Some(saved) = saved_line_clamp {
+            self.line_clamp = saved;
+        }
         self.flow_content_ranges = Some(FlowContentRanges {
             command_start: content_command_start,
             command_end: self.commands.len(),
@@ -42299,6 +42451,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         } else {
             (self.local_cursor(cursor)+f64::from(scroll_y)-local_format.1-f64::from(margin_top)-f64::from(admitted_top)-f64::from(border_top)-f64::from(padding_top)) as f32
         };
+        if !vertical_block_flow && content_extent_height > 0.0 {
+            content_extent_height -= text_box_trim_end;
+        }
         let content_extent_without_last_margin = (content_extent_height - previous_margin.value()).max(0.0);
         // The last margin of a box that ends its parent's flow still reaches
         // the parent's scrollable overflow; elsewhere it stays inside the box.
@@ -43476,6 +43631,15 @@ fn laid_out_display_list_once(
 
 #[path = "layout_anchor.rs"]
 mod anchor_layout;
+
+#[path = "layout_clamp.rs"]
+mod line_clamp;
+
+#[path = "layout_tabs.rs"]
+mod tab_layout;
+
+#[path = "layout_text_box.rs"]
+mod text_box_layout;
 
 #[cfg(test)]
 mod tests {

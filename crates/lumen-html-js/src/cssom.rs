@@ -2173,19 +2173,10 @@ fn property_map_text(
         }
         Ok(None)
     } else if map.rule_style.is_some() {
-        let block = map.inline_block(ctx)?;
-        let text = block.value(property).map(|(value, _)| value);
-        Ok(match text.as_deref().and_then(|text| pair_shorthand_longhand(property, text)) {
-            Some(longhand) => block.value(&longhand).map(|(value, _)| value).or(text),
-            None => text,
-        })
+        Ok(map.inline_block(ctx)?.value(property).map(|(value, _)| value))
     } else {
         let (realm,node)=map.realm.resolve_adopted_node(map.node);
-        let text = inline_property_value(&realm, node, property)?.map(|(value, _)| value);
-        match text.as_deref().and_then(|text| pair_shorthand_longhand(property, text)) {
-            Some(longhand) => Ok(inline_property_value(&realm, node, &longhand)?.map(|(value, _)| value).or(text)),
-            None => Ok(text),
-        }
+        Ok(inline_property_value(&realm, node, property)?.map(|(value, _)| value))
     }
 }
 
