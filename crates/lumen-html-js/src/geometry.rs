@@ -79,12 +79,16 @@ fn visit_elements_from_point(
         return Ok(());
     }
     let mut stopped = false;
+    let modal = super::dialog_popover::blocking_modal_dialog(document);
 
     session.for_each_hit_test(x as f32, y as f32, |node| {
+        if modal.is_some_and(|modal| super::dialog_popover::blocked_by_modal_dialog(document, modal, node)) {
+            return true;
+        }
         let Ok(node) = document.retarget(node, Some(tree_root.unwrap_or(document.root()))) else {
             return true;
         };
-        if matches!(document.kind(node), Ok(NodeKind::Element { .. })) {
+        if matches!(document.kind(node), Ok(NodeKind::Element { .. })) && !is_table_internal_box(document, node) {
             let area = session.bounding_client_rect(node).and_then(|rect| {
                 lumen_html::image_map::area_at(
                     document,
@@ -103,11 +107,18 @@ fn visit_elements_from_point(
         !stopped
     });
     if !stopped {
-        if let Some(root) = lumen_html::selector::document_element(document) {
+        if let Some(root) = modal.or_else(|| lumen_html::selector::document_element(document)) {
             visit(root, true);
         }
     }
     Ok(())
+}
+
+/// Table rows, row groups and columns are never hit-test targets; their cells
+/// and the table wrapper receive the hit instead.
+fn is_table_internal_box(document: &lumen_html::Document, node: NodeId) -> bool {
+    matches!(document.kind(node), Ok(NodeKind::Element { namespace: lumen_html::Namespace::Html, name, .. })
+        if matches!(name.as_str(), "tr" | "tbody" | "thead" | "tfoot" | "col" | "colgroup"))
 }
 
 /// CSSOM-facing geometry values for one element. Coordinates and lengths use
@@ -362,8 +373,31 @@ pub fn install(ctx: &mut Ctx) -> OpResult<()> {
         .map_err(|_| OpError::new("Error", "DOMRect installation failed"))?;
     crate::install_interface(ctx, &global, "DOMRectList", list)
         .map_err(|_| OpError::new("Error", "DOMRectList installation failed"))?;
+    install_rect_list_iterator(ctx)?;
     crate::caret_position::install(ctx)?;
     value_types::install(ctx, true)
+}
+
+fn install_rect_list_iterator(ctx: &mut Ctx) -> OpResult<()> {
+    let global = ctx.global_object();
+    let list = ctx.member_get(&global, "DOMRectList").map_err(OpError::thrown)?;
+    let prototype = ctx.member_get(&list, "prototype").map_err(OpError::thrown)?;
+    let array = ctx.member_get(&global, "Array").map_err(OpError::thrown)?;
+    let array_prototype = ctx.member_get(&array, "prototype").map_err(OpError::thrown)?;
+    let values = ctx.member_get(&array_prototype, "values").map_err(OpError::thrown)?;
+    let key = ctx
+        .well_known_symbol("iterator")
+        .ok_or_else(|| OpError::type_error("Symbol.iterator is unavailable"))?;
+    let descriptor = ctx.new_object_with_proto(&Value::Null);
+    for (name, field) in [
+        ("value", values),
+        ("writable", Value::Bool(true)),
+        ("enumerable", Value::Bool(false)),
+        ("configurable", Value::Bool(true)),
+    ] {
+        ctx.member_set(&descriptor, name, field).map_err(OpError::thrown)?;
+    }
+    ctx.define_property_value(&prototype, key, &descriptor).map_err(OpError::thrown)
 }
 
 pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
@@ -484,6 +518,16 @@ pub(crate) fn event_padding_origin(
     Some((rect.x + border[3], rect.y + border[0]))
 }
 
+/// Replaced elements generate an atomic inline box, which has client dimensions.
+fn is_inline_replaced(document: &lumen_html::Document, node: NodeId) -> bool {
+    match document.kind(node) {
+        Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Html, name, .. }) =>
+            matches!(lumen_html::svg::local_name(name), "img" | "video" | "canvas" | "iframe"),
+        Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Svg, name, .. }) => lumen_html::svg::local_name(name) == "svg",
+        _ => false,
+    }
+}
+
 /// Read layout geometry without forcing a layout pass. A missing snapshot means
 /// the renderer has not completed layout for the current document version.
 pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySnapshot> {
@@ -512,7 +556,8 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
     let metrics = box_metrics(layout_box, &style);
     // CSSOM View client dimensions use the viewport for the standards root
     // and quirks BODY, independently of their actual CSS box dimensions.
-    let client_size = if !connected || associated_box.is_none() || style.display == lumen_html::css::Display::Inline {
+    let client_size = if !connected || associated_box.is_none()
+        || style.display == lumen_html::css::Display::Inline && !is_inline_replaced(session.document(), node) {
         (0.0, 0.0)
     } else if if session.document().document_mode() == lumen_html::DocumentMode::Quirks {
         scrolling::html_body(session.document()) == Some(node)
@@ -550,22 +595,46 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
     }
     let (scroll_left, scroll_top) = session.scroll_offset(node);
 
-    let mut ancestor = session.document().composed_parent(node).ok().flatten();
+    let own_style = session.computed_style(node).ok();
+    let own_position_fixed = own_style.as_ref().is_some_and(|style| style.position == lumen_html::css::Position::Fixed);
+    let is_html_element_named = |session: &RenderSession, id: NodeId, names: &[&str]| {
+        matches!(session.document().kind(id), Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Html, name, .. })
+            if names.contains(&name.as_str()))
+    };
+    let no_offset_parent = associated_box.is_none()
+        || is_html_element_named(&*session, node, &["html", "body"]);
+    let mut ancestor = if no_offset_parent { None } else { session.document().composed_parent(node).ok().flatten() };
     let mut offset_parent = None;
+    let mut body_parent = false;
     while let Some(parent) = ancestor {
         if matches!(
             session.document().kind(parent),
             Ok(lumen_html::NodeKind::Element { .. })
-        ) && session
-            .computed_style(parent)
-            .is_ok_and(|style| style.position != lumen_html::css::Position::Static)
-        {
-            offset_parent = Some(parent);
-            break;
+        ) {
+            if is_html_element_named(&*session, parent, &["body"]) {
+                if !own_position_fixed {
+                    offset_parent = Some(parent);
+                    body_parent = true;
+                }
+                break;
+            }
+            let establishes = session.computed_style(parent).is_ok_and(|style| {
+                (!own_position_fixed && style.position != lumen_html::css::Position::Static)
+                    || style.has_transform()
+                    || style.contain_paint
+                    || style.contain_layout
+            });
+            if establishes
+                || (!own_position_fixed && is_html_element_named(&*session, parent, &["td", "th", "table"]))
+            {
+                offset_parent = Some(parent);
+                break;
+            }
         }
         ancestor = session.document().composed_parent(parent).ok().flatten();
     }
     let (offset_left, offset_top) = offset_parent
+        .filter(|_| !body_parent)
         .and_then(|parent| session.layout_rect(parent).map(|rect| (rect.x, rect.y)))
         .map_or((border_box.x, border_box.y), |(x, y)| {
             let parent_style = session

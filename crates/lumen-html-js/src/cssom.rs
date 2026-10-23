@@ -8,12 +8,18 @@ use super::*;
 mod font_features;
 #[path="cssom_font_palette.rs"]
 mod font_palette;
+#[path="cssom_view_transition.rs"]
+mod view_transition_rule;
 #[path="cssom_transforms.rs"]
 mod transforms;
 #[path="cssom_numeric_ops.rs"]
 mod numeric_ops;
 #[path="cssom_colors.rs"]
 mod colors;
+#[path="cssom_layer_counter.rs"]
+mod layer_counter;
+#[path="cssom_parser_api.rs"]
+mod parser_api;
 use crate::realm_services::RealmServices;
 use lumen::embed::{Deferred, Promise};
 use lumen::embed::{JsFunction, JsHost, JsObject};
@@ -456,6 +462,27 @@ fn style_values_from_text(
     css_text: &str,
     parse_multiple: bool,
 ) -> OpResult<Vec<Value>> {
+    style_values_from_source(ctx, property, css_text, parse_multiple, false)
+}
+
+/// Text read back from a declaration or a computed value is valid by
+/// construction, so an out-of-range literal there is a range-clamped calculation.
+fn style_values_from_declared(
+    ctx: &mut Ctx,
+    property: &str,
+    css_text: &str,
+    parse_multiple: bool,
+) -> OpResult<Vec<Value>> {
+    style_values_from_source(ctx, property, css_text, parse_multiple, true)
+}
+
+fn style_values_from_source(
+    ctx: &mut Ctx,
+    property: &str,
+    css_text: &str,
+    parse_multiple: bool,
+    declared: bool,
+) -> OpResult<Vec<Value>> {
     if css_text.len() > MAX_UNPARSED_BYTES {
         return Err(OpError::type_error(
             "CSS text exceeds the Typed OM component-value limit",
@@ -479,7 +506,7 @@ fn style_values_from_text(
     }
     let range_clamped;
     let css_text = if !css::supports_declaration(&property, css_text) && !css_text.trim_start().starts_with("calc(")
-        && !is_plain_negative_literal(css_text)
+        && (declared || !is_plain_negative_literal(css_text))
         && css::supports_declaration(&property, &format!("calc({})", css_text.trim())) {
         range_clamped = format!("calc({})", css_text.trim());
         range_clamped.as_str()
@@ -500,6 +527,7 @@ fn style_values_from_text(
 
     let iterations = css::typed_numeric::property_value_iterations(&property, css_text)
         .ok_or_else(|| OpError::type_error("CSS value could not be subdivided"))?;
+    let multiple_iterations = iterations.len() > 1;
     let iterations = if parse_multiple {
         iterations
     } else {
@@ -509,7 +537,23 @@ fn style_values_from_text(
     for iteration in iterations {
         values.push(style_value_from_iteration(ctx, &property, &iteration)?);
     }
+    if multiple_iterations && values.iter().any(|value| is_plain_style_value(ctx, value)) {
+        return Ok(vec![ctx.new_instance(DomCssStyleValue {
+            serialized_value: RefCell::new(
+                css::serialize_cssom_property_value(&property, css_text).unwrap_or_else(|| css_text.trim().to_owned()),
+            ),
+        })]);
+    }
     Ok(values)
+}
+
+fn is_plain_style_value(ctx: &mut Ctx, value: &Value) -> bool {
+    ctx.with_instance::<DomCssStyleValue, _>(value, |_| ()).is_ok()
+        && ctx.with_instance::<DomCssKeywordValue, _>(value, |_| ()).is_err()
+        && ctx.with_instance::<DomCssNumericValue, _>(value, |_| ()).is_err()
+        && ctx.with_instance::<DomCssImageValue, _>(value, |_| ()).is_err()
+        && ctx.with_instance::<DomCssUnparsedValue, _>(value, |_| ()).is_err()
+        && !transforms::is_value(ctx, value)
 }
 
 /// A negative literal without an exponent is out of range for the property,
@@ -546,7 +590,8 @@ fn pair_shorthand_longhand(property: &str, css_text: &str) -> Option<String> {
 
 /// Computed values the Typed OM cannot reify as a single value.
 fn computed_unsupported(property: &str) -> bool {
-    matches!(property, "border-image-outset" | "border-image-width" | "border-image-slice" | "column-rule-width")
+    matches!(property, "border-image-outset" | "border-image-width" | "border-image-slice" | "column-rule-width"
+        | "column-rule-style" | "scroll-snap-align" | "border-image-repeat")
         || matches!(property, "border-top-left-radius" | "border-top-right-radius" | "border-bottom-left-radius" | "border-bottom-right-radius")
 }
 
@@ -571,7 +616,25 @@ fn named_color_keyword(property: &str, keyword: &str) -> bool {
     !keyword.eq_ignore_ascii_case("currentcolor") && css::supports_declaration("color", keyword) && css::supports_declaration(property, "#000")
 }
 
+/// A size pair whose height is `auto` reifies as its width alone.
+fn size_without_auto_height<'a>(property: &str, css_text: &'a str) -> Option<&'a str> {
+    if !matches!(property, "background-size" | "mask-size") {
+        return None;
+    }
+    let text = css_text.trim();
+    if css::top_level_component_count(text)? != 2 {
+        return None;
+    }
+    let split = text.len().checked_sub("auto".len())?;
+    let head = text.get(..split)?;
+    let tail = text.get(split..)?;
+    (tail.eq_ignore_ascii_case("auto") && head.ends_with(char::is_whitespace)).then(|| head.trim_end())
+}
+
 fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> OpResult<Value> {
+    if let Some(width) = size_without_auto_height(property, css_text) {
+        return style_value_from_iteration(ctx, property, width);
+    }
     if let Some(longhand) = pair_shorthand_longhand(property, css_text) {
         return style_value_from_iteration(ctx, &longhand, css_text);
     }
@@ -582,8 +645,11 @@ fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> 
         }));
     }
     if css::declaration_block::is_shorthand(property) {
+        let single_keyword = |keyword: &str| property == "background-repeat"
+            && matches!(keyword, "repeat-x" | "repeat-y" | "repeat" | "space" | "round" | "no-repeat");
         if let Some(keyword)=css_identifier_value(css_text.trim()).filter(|keyword|
-            matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
+            matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")
+                || single_keyword(&keyword.to_ascii_lowercase())) {
             return Ok(ctx.new_instance(keyword_value(keyword)));
         }
         return Ok(ctx.new_instance(DomCssStyleValue {
@@ -1111,6 +1177,23 @@ const MAX_UNPARSED_COMPONENTS: usize = 1024;
 const MAX_UNPARSED_DEPTH: usize = 32;
 const MAX_UNPARSED_BYTES: usize = 8192;
 
+/// Web IDL value iterables with an indexed getter expose the intrinsic
+/// `%Array.prototype%` iteration methods themselves.
+fn alias_array_iteration(ctx: &mut Ctx, global: &Value, interface: &str) -> OpResult<()> {
+    let unavailable = |_| OpError::new("Error", "Array prototype unavailable");
+    let array = ctx.get_member(global, "Array").map_err(unavailable)?;
+    let array_prototype = ctx.get_member(&array, "prototype").map_err(unavailable)?;
+    let constructor = ctx.get_member(global, interface).map_err(unavailable)?;
+    let prototype = ctx.get_member(&constructor, "prototype").map_err(unavailable)?;
+    for name in ["entries", "keys", "values", "forEach"] {
+        let method = ctx.get_member(&array_prototype, name).map_err(unavailable)?;
+        define_data_property(ctx, &prototype, Value::str(name), method, true, true, true).map_err(OpError::thrown)?;
+    }
+    let iterator = ctx.well_known_symbol("iterator").ok_or_else(|| OpError::type_error("Symbol.iterator is unavailable"))?;
+    let method = ctx.reflect_get(&array_prototype, &iterator, &array_prototype).map_err(OpError::thrown)?;
+    define_data_property(ctx, &prototype, iterator, method, true, false, true).map_err(OpError::thrown)
+}
+
 fn define_data_property(
     ctx: &mut Ctx,
     target: &Value,
@@ -1367,6 +1450,13 @@ fn serialize_unparsed_value(ctx: &mut Ctx, value: &Value) -> OpResult<String> {
     css::serialize_unparsed_value(&components).map_err(css_error)
 }
 
+fn reject_empty_custom_property(property: &str, css_text: &str) -> OpResult<()> {
+    if property.starts_with("--") && css_text.trim().is_empty() {
+        return Err(OpError::type_error("a custom property value must not be empty"));
+    }
+    Ok(())
+}
+
 #[lumen_bind::methods]
 impl DomCssStyleValue {
     #[classmethod(coerce)]
@@ -1376,6 +1466,7 @@ impl DomCssStyleValue {
         property: &str,
         css_text: &str,
     ) -> OpResult<Value> {
+        reject_empty_custom_property(property, css_text)?;
         style_value_from_text(ctx, property, css_text)
     }
 
@@ -1386,6 +1477,7 @@ impl DomCssStyleValue {
         property: &str,
         css_text: &str,
     ) -> OpResult<Value> {
+        reject_empty_custom_property(property, css_text)?;
         let values = style_values_from_text(ctx, property, css_text, true)?;
         Ok(JsHost::from_list(ctx, values))
     }
@@ -2028,7 +2120,7 @@ impl StyleMapSnapshot {
     fn values(&self,ctx:&mut Ctx,property:&str)->OpResult<Vec<Value>> {
         match self {
             Self::Inline(block)=>match block.value(property) {
-                Some((text,_))=>style_values_from_text(ctx,property,&text,true),
+                Some((text,_))=>style_values_from_declared(ctx,property,&text,true),
                 None=>Ok(Vec::new()),
             },
             Self::Computed(None)=>Ok(Vec::new()),
@@ -2069,7 +2161,7 @@ fn property_map_text(
         let (realm,node)=map.realm.resolve_adopted_node(map.node);
         crate::animations::flush_css_transitions_for_property(ctx,&realm,Some(node),Some(property))?;
         if !crate::style::rendered_ancestry(&realm,node,false)? {return Ok(None);}
-        let value = crate::style::computed_property_value(&realm, node, property)?;
+        let value = crate::style::typed_om_computed_property_value(&realm, node, property)?;
         if !value.is_empty() {return Ok(Some(value));}
         if property.starts_with("--") {
             let fonts=crate::canvas::initialized_realm_font_source(&realm)?;
@@ -2143,7 +2235,7 @@ pub(crate) fn registered_style_values(ctx: &mut Ctx, property: &str, text: &str,
         }
         return Ok(values);
     }
-    style_values_from_text(ctx, property, text, multiple)
+    style_values_from_declared(ctx, property, text, multiple)
 }
 
 fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
@@ -2158,7 +2250,7 @@ fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
     if computed_unsupported(property) {
         return Ok(vec![ctx.new_instance(DomCssStyleValue { serialized_value: RefCell::new(text.trim().to_owned()) })]);
     }
-    style_values_from_text(ctx, property, text, multiple)
+    style_values_from_declared(ctx, property, text, multiple)
 }
 
 fn value_array(ctx: &mut Ctx, values: impl IntoIterator<Item = Value>) -> OpResult<Value> {
@@ -2170,10 +2262,13 @@ impl DomStylePropertyMapReadOnly {
     #[method(coerce)]
     fn get(&self, ctx: &mut Ctx, property: &str) -> OpResult<Value> {
         let property=style_map_property(property)?;
+        if self.computed && property == "all" {
+            return Ok(ctx.new_instance(DomCssStyleValue { serialized_value: RefCell::new(String::new()) }));
+        }
         let value=property_map_text(ctx,self,&property)?;
         let values=match value {
             Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,false)?,
-            Some(text)=>style_values_from_text(ctx,&property,&text,false)?,
+            Some(text)=>style_values_from_declared(ctx,&property,&text,false)?,
             None=>Vec::new(),
         };
         Ok(values.into_iter().next().unwrap_or(Value::Undefined))
@@ -2184,7 +2279,7 @@ impl DomStylePropertyMapReadOnly {
         let value=property_map_text(ctx,self,&property)?;
         let values=match value {
             Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,true)?,
-            Some(text)=>style_values_from_text(ctx,&property,&text,true)?,
+            Some(text)=>style_values_from_declared(ctx,&property,&text,true)?,
             None=>Vec::new(),
         };
         value_array(ctx,values)
@@ -2198,10 +2293,7 @@ impl DomStylePropertyMapReadOnly {
     fn size(&self,ctx:&mut Ctx)->OpResult<usize> {
         Ok(StyleMapSnapshot::capture(ctx,self)?.names().len())
     }
-    #[proto(iter)]
-    fn iter(&self,ctx:&mut Ctx)->OpResult<Value> {
-        StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,2)
-    }
+    #[method(hint(js(also_iterator)))]
     fn entries(&self,ctx:&mut Ctx)->OpResult<Value> {
         StyleMapSnapshot::capture(ctx,self)?.iterator(ctx,2)
     }
@@ -2247,7 +2339,8 @@ fn style_map_value_text(ctx: &mut Ctx, property: &str, value: &Value) -> OpResul
             return Ok(text);
         }
         let wrapped = format!("calc({text})");
-        if !is_math && css::supports_declaration(property, &wrapped) {
+        let in_range_sample = css::typed_numeric::serialize_numeric_value(1.0, unit);
+        if !is_math && css::supports_declaration(property, &in_range_sample) && css::supports_declaration(property, &wrapped) {
             return Ok(wrapped);
         }
         return Err(invalid());
@@ -2274,6 +2367,9 @@ fn style_map_values_text(ctx: &mut Ctx, property: &str, values: &[Value]) -> OpR
     }
     let mut texts = Vec::with_capacity(values.len());
     for value in values {
+        if values.len() > 1 && ctx.with_instance::<DomCssUnparsedValue, _>(value, |_| ()).is_ok() {
+            return Err(OpError::type_error("a CSSUnparsedValue cannot be combined with other values"));
+        }
         let text = style_map_value_text(ctx, property, value)?;
         if values.len() > 1 && text_has_variable(&text) {
             return Err(OpError::type_error("a var() reference cannot be combined with other values"));
@@ -2303,10 +2399,17 @@ impl DomStylePropertyMap {
         }
         let mut texts = Vec::with_capacity(values.len());
         for value in &values {
-            texts.push(style_map_value_text(ctx, &property, value)?);
+            let text = style_map_value_text(ctx, &property, value)?;
+            if text_has_variable(&text) {
+                return Err(OpError::type_error("a var() reference cannot be appended"));
+            }
+            texts.push(text);
         }
         let appended = texts.join(", ");
         let existing = self.base.inline_block(ctx)?.value(&property).map(|(text, _)| text);
+        if existing.as_deref().is_some_and(|text| text.trim().is_empty()) {
+            return Err(OpError::type_error("a var() reference cannot be combined with other values"));
+        }
         let text = match existing.filter(|text| !text.trim().is_empty()) {
             Some(existing) => {
                 if text_has_variable(&existing) || text_has_variable(&appended) {
@@ -2445,40 +2548,159 @@ fn register_property(ctx: &mut Ctx, definition: PropertyDefinition) -> OpResult<
     })
 }
 
+struct MemoizedDeclaration {
+    block: Option<Rc<css::DeclarationBlock>>,
+    serialized: Result<String, css::CssError>,
+}
+
+struct MemoizedBlockText {
+    block: std::rc::Weak<css::DeclarationBlock>,
+    serialized: Result<String, css::CssError>,
+    cost: usize,
+}
+
+#[derive(Default)]
+struct DeclarationMemo {
+    parsed: HashMap<String, Rc<MemoizedDeclaration>>,
+    blocks: Vec<MemoizedBlockText>,
+    bytes: usize,
+    block_bytes: usize,
+}
+
+const DECLARATION_MEMO_BYTES: usize = 8 * 1024 * 1024;
+const DECLARATION_MEMO_ENTRY_BYTES: usize = 512 * 1024;
+const DECLARATION_MEMO_BLOCKS: usize = 16;
+const DECLARATION_MEMO_BLOCK_BYTES: usize = 1024 * 1024;
+const DECLARATION_MEMO_ENTRY_COST: usize = 128;
+
+thread_local! {
+    static DECLARATION_MEMO: RefCell<DeclarationMemo> = RefCell::new(DeclarationMemo::default());
+}
+
+fn declaration_block_cost(block: &css::DeclarationBlock, serialized: &Result<String, css::CssError>) -> usize {
+    block.len() * DECLARATION_MEMO_ENTRY_COST + block.retained_text_bytes() + serialized.as_ref().map_or(0, String::len)
+}
+
+// CSSOM writes rebuild every rule of a sheet from declaration text. Parsing and
+// serializing are pure, so repeated texts are answered from memory instead of
+// being recomputed once per rule per write. Serialized block texts are keyed by
+// the block's allocation through a weak reference, so a rule that is the only
+// owner of its block still mutates it in place.
+fn memoized_declaration(text: &str) -> Rc<MemoizedDeclaration> {
+    if let Some(found) = DECLARATION_MEMO.with(|memo| memo.borrow().parsed.get(text).cloned()) {
+        return found;
+    }
+    let block = css::DeclarationBlock::parse(text);
+    let serialized = match &block {
+        Ok(block) => block.serialize(),
+        Err(error) => Err(error.clone()),
+    };
+    let cost = text.len() * 2
+        + serialized.as_ref().map_or(0, String::len)
+        + block.as_ref().map_or(0, |block| declaration_block_cost(block, &serialized));
+    let entry = Rc::new(MemoizedDeclaration { block: block.ok().map(Rc::new), serialized });
+    if cost > DECLARATION_MEMO_ENTRY_BYTES {
+        return entry;
+    }
+    DECLARATION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.bytes + cost > DECLARATION_MEMO_BYTES {
+            memo.parsed.clear();
+            memo.bytes = 0;
+        }
+        memo.bytes += cost;
+        memo.parsed.insert(text.to_owned(), entry.clone());
+    });
+    entry
+}
+
+fn memoized_block_text(block: &Rc<css::DeclarationBlock>) -> Result<String, css::CssError> {
+    let found = DECLARATION_MEMO.with(|memo| memo.borrow().blocks.iter()
+        .find(|known| std::ptr::eq(known.block.as_ptr(), Rc::as_ptr(block)) && known.block.strong_count() > 0)
+        .map(|known| known.serialized.clone()));
+    if let Some(text) = found {
+        return text;
+    }
+    let text = block.serialize();
+    let cost = declaration_block_cost(block, &text);
+    if cost > DECLARATION_MEMO_ENTRY_BYTES {
+        return text;
+    }
+    DECLARATION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.blocks.retain(|known| known.block.strong_count() > 0);
+        memo.block_bytes = memo.blocks.iter().map(|known| known.cost).sum();
+        while !memo.blocks.is_empty() && (memo.blocks.len() >= DECLARATION_MEMO_BLOCKS || memo.block_bytes + cost > DECLARATION_MEMO_BLOCK_BYTES) {
+            let removed = memo.blocks.remove(0);
+            memo.block_bytes -= removed.cost;
+        }
+        memo.block_bytes += cost;
+        memo.blocks.push(MemoizedBlockText { block: Rc::downgrade(block), serialized: text.clone(), cost });
+    });
+    text
+}
+
+fn memoized_cssom_declaration_block(text: &str) -> Result<String, css::CssError> {
+    memoized_declaration(text).serialized.clone()
+}
+
 /// Shared specified declarations with a lexical mode for font-face descriptors.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CssDeclaration {
     text: String,
     block: Option<Rc<css::DeclarationBlock>>,
     position_try: bool,
+    page: bool,
+    descriptors: Vec<(String, String)>,
 }
 
 impl CssDeclaration {
     pub fn parse(text: &str) -> Self {
-        let block = css::DeclarationBlock::parse(text).unwrap_or_default();
+        let entry = memoized_declaration(text);
         Self {
-            text: block.serialize().unwrap_or_default(),
-            block: Some(Rc::new(block)),
-            position_try: false,
+            text: entry.serialized.clone().unwrap_or_default(),
+            block: Some(entry.block.clone().unwrap_or_default()),
+            ..Self::default()
         }
+    }
+
+    fn page(text: &str) -> Self {
+        let (registry, descriptors) = css::page_rules::split_descriptors(text);
+        let block = css::DeclarationBlock::parse(&registry).unwrap_or_default();
+        let mut declaration = Self { text: String::new(), block: Some(Rc::new(block)), position_try: false, page: true, descriptors };
+        declaration.refresh_page_text();
+        declaration
+    }
+
+    fn refresh_page_text(&mut self) {
+        let mut text = self.block.as_ref().and_then(|block| block.serialize().ok()).unwrap_or_default();
+        let extra = css::page_rules::descriptors_text(&self.descriptors);
+        if !extra.is_empty() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&extra);
+        }
+        self.text = text;
     }
 
     fn position_try(text: &str) -> Self {
         let mut block = css::DeclarationBlock::parse(text).unwrap_or_default();
-        block.retain_properties(css::anchor::position_try_property);
+        block.retain_declarations(|name, important| !important && css::anchor::position_try_property(name));
         Self {
             text: block.serialize().unwrap_or_default(),
             block: Some(Rc::new(block)),
             position_try: true,
+            ..Self::default()
         }
     }
 
     fn function(text: &str) -> Self {
-        Self { text: css::function_eval::descriptor_text(text), block: None, position_try: false }
+        Self { text: css::function_eval::descriptor_text(text), ..Self::default() }
     }
 
     fn descriptors(text: &str) -> Self {
-        Self { text: css::cssom_font_face_declaration_text(text), block: None, position_try: false }
+        Self { text: css::cssom_font_face_declaration_text(text), ..Self::default() }
     }
 
     pub fn css_text(&self) -> &str {
@@ -2486,6 +2708,9 @@ impl CssDeclaration {
     }
 
     pub fn get_property_value(&self, name: &str) -> Result<Option<(String, bool)>, css::CssError> {
+        if self.page && css::page_rules::is_descriptor(name) {
+            return Ok(self.descriptors.iter().find(|(known, _)| known.eq_ignore_ascii_case(name.trim())).map(|(_, value)| (value.clone(), false)));
+        }
         Ok(
             match &self.block {
                 Some(block) => block.value(name),
@@ -2505,14 +2730,28 @@ impl CssDeclaration {
         value: &str,
         important: bool,
     ) -> Result<(), css::CssError> {
-        if let Some(block) = &mut self.block {
-            let block = Rc::make_mut(block);
+        if self.page && css::page_rules::is_descriptor(name) {
+            let key = name.trim().to_ascii_lowercase();
+            if value.trim().is_empty() {
+                self.descriptors.retain(|(known, _)| *known != key);
+            } else if let Some(canonical) = css::page_rules::descriptor_value(&key, value).filter(|_| !important) {
+                self.descriptors.retain(|(known, _)| *known != key);
+                self.descriptors.push((key, canonical));
+            }
+            self.refresh_page_text();
+            return Ok(());
+        }
+        if let Some(shared) = &mut self.block {
+            let block = Rc::make_mut(shared);
             if block.set(name, value, important)? {
-                if self.position_try { block.retain_properties(css::anchor::position_try_property); }
-                self.text = block.serialize()?;
+                if self.position_try { block.retain_declarations(|name, important| !important && css::anchor::position_try_property(name)); }
+                self.text = memoized_block_text(shared)?;
             }
         } else {
             self.text = css::set_descriptor_declaration(&self.text, name, value, important)?;
+        }
+        if self.page {
+            self.refresh_page_text();
         }
         Ok(())
     }
@@ -2529,6 +2768,8 @@ pub struct CssRuleText {
     pub position_try: bool,
     pub function_body: bool,
     pub keyframes: Option<css::KeyframesRuleText>,
+    pub page_selector: Option<String>,
+    pub margin_box: Option<String>,
     header: RuleHeader,
 }
 
@@ -2580,6 +2821,13 @@ fn retain_valid_stylesheet_headers(text: &str, source: &mut Vec<css::nesting::So
         _=>{phase=3;true},
     });
 }
+fn retain_valid_property_rules(text: &str, source: &mut Vec<css::nesting::SourceRule>) {
+    source.retain(|rule| {
+        let prelude=text[rule.prelude.clone()].trim();
+        !css::nesting::at_rule(prelude,"@property")
+            || css::registered_properties::parse_rule(prelude,&rule.declaration_source(text)).is_ok_and(|registration|registration.is_some())
+    });
+}
 fn check_rule_order(rules: &[CssRuleText], index: usize, inserted: &CssRuleText) -> Result<(),CssRuleMutationError> {
     // Cascade5 orders header sections: layer statements, then imports,
     // then namespaces. A layer statement after imports closes the header.
@@ -2618,7 +2866,9 @@ impl OwnedNestingContext {
 
 fn source_rules_in_cssom_context(text:&str,nested:bool,scoped:bool,boundaries:&[css::nesting::DeclarationBoundary],namespaces:&css::namespaces::NamespaceMap)->Result<Vec<css::nesting::SourceRule>,css::CssError> {
     let context=if scoped {Some(css::nesting::NestingContext::Scope("@scope"))}else if nested{Some(css::nesting::NestingContext::Style("*"))}else{None};
-    css::nesting::parse_source_rules_with_boundaries_in_namespace_context(text,context.as_slice(),false,boundaries,namespaces)
+    let mut rules=css::nesting::parse_source_rules_with_boundaries_in_namespace_context(text,context.as_slice(),false,boundaries,namespaces)?;
+    retain_valid_property_rules(text,&mut rules);
+    Ok(rules)
 }
 
 /// Mutable stylesheet source associated with one `<style>` node. Every edit is
@@ -2678,7 +2928,7 @@ impl CssStyleSheetText {
     pub fn css_rules(&self) -> Result<Vec<CssRuleText>, css::CssError> {
         let mut rules = if self.singleton_declarations {
             let style = CssDeclaration::parse(&self.text);
-            vec![CssRuleText { css_text: style.css_text().to_owned(), selector_text: None, style, nested: Vec::new(), nested_declarations: true, font_face: false, position_try: false, function_body: false, keyframes: None, header: RuleHeader::Other }]
+            vec![CssRuleText { css_text: style.css_text().to_owned(), selector_text: None, style, nested: Vec::new(), nested_declarations: true, font_face: false, position_try: false, function_body: false, keyframes: None, page_selector: None, margin_box: None, header: RuleHeader::Other }]
         } else {
             let namespaces=self.namespaces.clone().map(Ok).unwrap_or_else(||css::namespaces::NamespaceMap::from_stylesheet(&self.text).map(Arc::new))?;
             let mut source = source_rules_in_cssom_context(&self.text, self.nested_context, self.scoped_context, &self.boundaries,&namespaces)?;
@@ -2691,7 +2941,7 @@ impl CssStyleSheetText {
                 let Some(rule) = current.get_mut(index) else { break; };
                 if depth + 1 == path.len() {
                     if !rule.font_face && (rule.selector_text.is_some() || rule.nested_declarations) {
-                        rule.style = CssDeclaration { text: block.serialize()?, block: Some(block.clone()), position_try: rule.position_try };
+                        rule.style = CssDeclaration { text: memoized_block_text(block)?, block: Some(block.clone()), position_try: rule.position_try, ..CssDeclaration::default() };
                         rule.css_text = serialize_rule(rule);
                     }
                     break;
@@ -2735,8 +2985,10 @@ impl CssStyleSheetText {
 
     fn set_rule_style(&mut self, path: &[usize], declarations: &str) -> Result<(), css::CssError> {
         self.mutate_rule(path, |rule| {
-            if rule.selector_text.is_some() || rule.font_face || rule.position_try || rule.nested_declarations {
-                rule.style = if rule.font_face {
+            if rule.selector_text.is_some() || rule.font_face || rule.position_try || rule.nested_declarations || rule.page_selector.is_some() || rule.margin_box.is_some() {
+                rule.style = if rule.page_selector.is_some() {
+                    CssDeclaration::page(declarations)
+                } else if rule.font_face {
                     CssDeclaration::descriptors(declarations)
                 } else if rule.position_try {
                     CssDeclaration::position_try(declarations)
@@ -2762,7 +3014,8 @@ impl CssStyleSheetText {
         let context = self.selector_context(parent_path)?;
         let context = context.iter().map(OwnedNestingContext::borrowed).collect::<Vec<_>>();
         let namespaces=if self.namespaces.is_some(){css::namespaces::NamespaceMap::default()}else{css::namespaces::NamespaceMap::from_stylesheet(&self.text)?};
-        let inserted = parse_group_child(rule, &context, &namespaces)?;
+        let in_page = !parent_path.is_empty() && self.rule_at_path(parent_path)?.page_selector.is_some();
+        let inserted = if in_page { parse_margin_child(rule)? } else { parse_group_child(rule, &context, &namespaces)? };
         self.mutate_nested_list(parent_path, |children| {
             if index > children.len() {
                 return Err(css::CssError {
@@ -2820,6 +3073,17 @@ impl CssStyleSheetText {
                 return Ok(());
             }
             rule.selector_text = Some(selector.clone());
+            rule.css_text = serialize_rule(rule);
+            Ok(())
+        })
+    }
+
+    fn set_page_selector(&mut self, path: &[usize], selector: &str) -> Result<(), css::CssError> {
+        self.mutate_rule(path, |rule| {
+            if rule.page_selector.is_none() {
+                return Ok(());
+            }
+            rule.page_selector = Some(selector.to_owned());
             rule.css_text = serialize_rule(rule);
             Ok(())
         })
@@ -3071,6 +3335,12 @@ impl CssStyleSheetText {
         self.replace_keyframes(index, &keyframes)
     }
 
+    fn set_keyframes_name(&mut self, index: usize, name: &str) -> Result<(), css::CssError> {
+        let mut keyframes = self.keyframes_rule(index)?;
+        keyframes.name_text = css::serialize_identifier(name);
+        self.replace_keyframes(index, &keyframes)
+    }
+
     fn set_keyframe_declarations(
         &mut self,
         index: usize,
@@ -3138,7 +3408,8 @@ fn source_rules_to_cssom_in(text:&str,source:&[css::nesting::SourceRule],has_par
             else if function_body { CssDeclaration::function(&node.declaration_text(text)) }
             else if position_try { CssDeclaration::position_try(&node.declaration_text(text)) }
             else if let Some(frame) = &frame { CssDeclaration::parse(&frame.style) }
-            else if matches!(node.kind, SourceRuleKind::Style | SourceRuleKind::NestedDeclarations) { CssDeclaration::parse(&node.declaration_text(text)) }
+            else if node.kind == SourceRuleKind::Page { CssDeclaration::page(&node.declaration_text(text)) }
+            else if matches!(node.kind, SourceRuleKind::Style | SourceRuleKind::NestedDeclarations | SourceRuleKind::MarginBox) { CssDeclaration::parse(&node.declaration_text(text)) }
             else { CssDeclaration::default() };
         let selector_text = match node.kind {
             SourceRuleKind::Style => Some(serialize_rule_selector(&implicit_nested_selector(prelude,has_parent),namespaces,has_parent)?),
@@ -3152,10 +3423,25 @@ fn source_rules_to_cssom_in(text:&str,source:&[css::nesting::SourceRule],has_par
             selector_text, style,
             nested: source_rules_to_cssom_in(text, &node.children, node.kind != SourceRuleKind::Scope && (has_parent || node.kind == SourceRuleKind::Style),namespaces,is_function || (in_function && node.kind == SourceRuleKind::Group))?,
             nested_declarations, font_face, position_try, function_body, keyframes,
+            page_selector: if node.kind == SourceRuleKind::Page { css::page_rules::page_prelude_tail(prelude).and_then(css::page_rules::selector_list) } else { None },
+            margin_box: if node.kind == SourceRuleKind::MarginBox { css::page_rules::margin_box_name(prelude).map(str::to_owned) } else { None },
             header: source_rule_header(text,node),
         });
     }
     Ok(result)
+}
+
+fn parse_margin_child(text: &str) -> Result<CssRuleText, css::CssError> {
+    let wrapped = format!("@page {{ {text}\n}}");
+    let source = css::nesting::parse_one_source_rule(&wrapped, &[])?;
+    if source.kind != css::nesting::SourceRuleKind::Page || source.children.len() != 1 || !source.declaration_ranges.is_empty() {
+        return Err(css::CssError { offset: 0, message: "insertRule requires exactly one margin rule" });
+    }
+    let mut rules = source_rules_to_cssom_in(&wrapped, &source.children, false, &css::namespaces::NamespaceMap::default(), false)?;
+    if rules.len() != 1 {
+        return Err(css::CssError { offset: 0, message: "insertRule requires exactly one margin rule" });
+    }
+    Ok(rules.remove(0))
 }
 
 fn parse_group_child(text: &str, parent_context: &[css::nesting::NestingContext<'_>], namespaces: &css::namespaces::NamespaceMap) -> Result<CssRuleText, css::CssError> {
@@ -3224,6 +3510,10 @@ fn serialize_rule_into(
             return;
         }
     }
+    if starts_css_at_rule(&rule.css_text,"@view-transition") {
+        output.push_str(&css::view_transition_rule::parse(&rule.css_text).serialize());
+        return;
+    }
     if starts_css_at_rule(&rule.css_text,"@font-feature-values") {
         if let Ok(parsed)=css::parse_stylesheet(&rule.css_text) {
             if let Some(values)=parsed.family_display.first() {
@@ -3238,10 +3528,14 @@ fn serialize_rule_into(
     }
     // Descriptors were validated in their own grammar. The ordinary property
     // serializer would drop src, unicode-range, and descriptor ranges.
+    if rule.page_selector.is_some() || rule.margin_box.is_some() {
+        serialize_page_rule_into(rule, output, boundaries);
+        return;
+    }
     let declarations = || if rule.font_face || rule.function_body {
         Cow::Borrowed(rule.style.css_text())
     } else {
-        css::serialize_cssom_declaration_block(rule.style.css_text())
+        memoized_cssom_declaration_block(rule.style.css_text())
             .map(Cow::Owned).unwrap_or_else(|_| Cow::Borrowed(rule.style.css_text()))
     };
     if rule.nested_declarations {
@@ -3331,6 +3625,29 @@ fn serialize_rule_into(
     }
     if has_body { output.push('\n'); }
     output.push('}');
+}
+
+fn serialize_page_rule_into(rule: &CssRuleText, output: &mut String, boundaries: &mut Vec<css::nesting::DeclarationBoundary>) {
+    if let Some(selector) = &rule.page_selector {
+        output.push_str("@page");
+        if !selector.is_empty() {
+            output.push(' ');
+            output.push_str(selector);
+        }
+    } else if let Some(name) = &rule.margin_box {
+        output.push('@');
+        output.push_str(name);
+    }
+    output.push_str(" {");
+    if !rule.style.css_text().is_empty() {
+        output.push(' ');
+        output.push_str(rule.style.css_text());
+    }
+    for child in &rule.nested {
+        output.push(' ');
+        serialize_rule_into(child, output, None, boundaries);
+    }
+    output.push_str(" }");
 }
 
 /// A viewport-bound MediaQueryList snapshot. The DOM wrapper can query it on
@@ -4065,6 +4382,9 @@ pub fn install_typed_numeric(ctx: &mut Ctx) -> OpResult<()> {
     install_interface!("CSSVariableReferenceValue", DomCssVariableReferenceValue);
     transforms::install(ctx,&global)?;
     colors::install(ctx,&global)?;
+    for name in ["CSSNumericArray", "CSSUnparsedValue", "CSSTransformValue"] {
+        alias_array_iteration(ctx, &global, name)?;
+    }
 
     let css_namespace = Value::Obj(ctx.new_object());
     let supports = ctx.bound_function(&lumen_bind::FnItem::of::<supports::Op>());
@@ -4165,6 +4485,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.class_constructor::<DomCssStyleRule>();
     ctx.class_constructor::<DomCssMediaRule>();
     ctx.class_constructor::<DomCssSupportsRule>();
+    ctx.class_constructor::<DomCssSupportsConditionRule>();
     ctx.class_constructor::<DomCssContainerRule>();
     ctx.class_constructor::<DomCssScopeRule>();
     ctx.class_constructor::<DomCssStartingStyleRule>();
@@ -4172,12 +4493,19 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     ctx.class_constructor::<DomCssFontFaceRule>();
     ctx.class_constructor::<DomCssPositionTryRule>();
     ctx.class_constructor::<DomCssPositionTryDescriptors>();
+    ctx.class_constructor::<DomCssPageRule>();
+    ctx.class_constructor::<DomCssMarginRule>();
+    ctx.class_constructor::<DomCssPageDescriptors>();
     ctx.class_constructor::<DomCssFunctionRule>();
     ctx.class_constructor::<DomCssFunctionDeclarations>();
     ctx.class_constructor::<DomCssFunctionDescriptors>();
     ctx.class_constructor::<DomCssPropertyRule>();
     font_features::install(ctx)?;
     font_palette::install(ctx)?;
+    view_transition_rule::install(ctx)?;
+    layer_counter::install(ctx)?;
+    parser_api::install(ctx)?;
+    crate::css_pseudo::install(ctx)?;
     ctx.class_constructor::<DomCssKeyframesRule>();
     ctx.class_constructor::<DomCssKeyframeRule>();
     ctx.class_constructor::<DomCssImportRule>();
@@ -4201,6 +4529,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     RealmServices::replace_shared_current(ctx, registry);
     install_typed_numeric(ctx)?;
     crate::highlight::install(ctx, realm)?;
+    crate::container_query_list::install(ctx)?;
     let css_namespace = ctx.member_get(&ctx.global_object(), "CSS").map_err(OpError::thrown)?;
     let register = ctx.bound_function(&lumen_bind::FnItem::of::<register_property::Op>());
     ctx.set_member(&css_namespace, "registerProperty", register)
@@ -4230,6 +4559,9 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     let supports_rule_constructor = ctx.class_constructor::<DomCssSupportsRule>();
     crate::install_interface(ctx, &global, "CSSSupportsRule", supports_rule_constructor)
         .map_err(|_| OpError::new("Error", "CSSSupportsRule installation failed"))?;
+    let supports_condition_constructor = ctx.class_constructor::<DomCssSupportsConditionRule>();
+    crate::install_interface(ctx, &global, "CSSSupportsConditionRule", supports_condition_constructor)
+        .map_err(|_| OpError::new("Error", "CSSSupportsConditionRule installation failed"))?;
     let starting_style_constructor = ctx.class_constructor::<DomCssStartingStyleRule>();
     crate::install_interface(ctx, &global, "CSSStartingStyleRule", starting_style_constructor)
         .map_err(|_| OpError::new("Error", "CSSStartingStyleRule installation failed"))?;
@@ -4257,6 +4589,24 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     crate::install_interface(ctx, &global, "CSSPositionTryDescriptors", position_try_descriptors.clone())
         .map_err(|_| OpError::new("Error", "CSSPositionTryDescriptors installation failed"))?;
     hide_unsupported_position_try_properties(ctx, &position_try_descriptors)?;
+    for constructor in [
+        ctx.class_constructor::<DomCssPageDescriptors>(),
+        ctx.class_constructor::<DomCssFontFaceDescriptors>(),
+        ctx.class_constructor::<DomCssFunctionDescriptors>(),
+    ] {
+        let prototype = ctx
+            .get_member(&constructor, "prototype")
+            .map_err(|_| OpError::new("Error", "descriptors prototype unavailable"))?;
+        reparent_descriptors(ctx, &constructor, &prototype, Vec::new())?;
+    }
+    for (name, constructor) in [
+        ("CSSPageRule", ctx.class_constructor::<DomCssPageRule>()),
+        ("CSSMarginRule", ctx.class_constructor::<DomCssMarginRule>()),
+        ("CSSPageDescriptors", ctx.class_constructor::<DomCssPageDescriptors>()),
+    ] {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| OpError::new("Error", "CSS page interface installation failed"))?;
+    }
     for (name, constructor) in [
         ("CSSFunctionRule", ctx.class_constructor::<DomCssFunctionRule>()),
         ("CSSFunctionDeclarations", ctx.class_constructor::<DomCssFunctionDeclarations>()),
@@ -4298,12 +4648,8 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     crate::install_interface(ctx, &global, "StyleSheetList", sheet_list_constructor)
         .map_err(|_| OpError::new("Error", "StyleSheetList installation failed"))?;
     let property_map_readonly_constructor = ctx.class_constructor::<DomStylePropertyMapReadOnly>();
-    ctx.set_member(
-        &global,
-        "StylePropertyMapReadOnly",
-        property_map_readonly_constructor,
-    )
-    .map_err(|_| OpError::new("Error", "StylePropertyMapReadOnly installation failed"))?;
+    crate::install_interface(ctx, &global, "StylePropertyMapReadOnly", property_map_readonly_constructor)
+        .map_err(|_| OpError::new("Error", "StylePropertyMapReadOnly installation failed"))?;
     let property_map_constructor = ctx.class_constructor::<DomStylePropertyMap>();
     crate::install_interface(ctx, &global, "StylePropertyMap", property_map_constructor)
         .map_err(|_| OpError::new("Error", "StylePropertyMap installation failed"))?;
@@ -4323,6 +4669,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
 /// Re-evaluate live query lists and dispatch `change` when a host viewport or
 /// display change crosses a media-query boundary.
 pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
+    crate::container_query_list::notify(ctx, realm)?;
     // The host must enter the target window's JS realm before dispatching. Apart from
     // isolating the registries, this ensures the UA-created Event comes from that
     // realm's intrinsics.
@@ -4468,6 +4815,19 @@ pub struct DomCssSupportsRule {
     base: DomCssConditionRule,
 }
 
+#[lumen_bind::class(name = "CSSSupportsConditionRule", extends = DomCssGroupingRule, hint(js(webidl)))]
+pub struct DomCssSupportsConditionRule {
+    base: DomCssGroupingRule,
+}
+
+#[lumen_bind::methods]
+impl DomCssSupportsConditionRule {
+    #[getter]
+    fn name(&self) -> OpResult<String> {
+        Ok(String::new())
+    }
+}
+
 #[lumen_bind::class(name = "CSSStartingStyleRule", extends = DomCssGroupingRule, hint(js(webidl)))]
 pub struct DomCssStartingStyleRule {
     base: DomCssGroupingRule,
@@ -4501,6 +4861,21 @@ pub struct DomCssPositionTryRule {
 
 #[lumen_bind::class(name = "CSSPositionTryDescriptors", extends = DomCssRuleStyle, hint(js(webidl)))]
 pub struct DomCssPositionTryDescriptors {
+    base: DomCssRuleStyle,
+}
+
+#[lumen_bind::class(name = "CSSPageRule", extends = DomCssGroupingRule, hint(js(webidl)))]
+pub struct DomCssPageRule {
+    base: DomCssGroupingRule,
+}
+
+#[lumen_bind::class(name = "CSSMarginRule", extends = DomCssRule, hint(js(webidl)))]
+pub struct DomCssMarginRule {
+    base: DomCssRule,
+}
+
+#[lumen_bind::class(name = "CSSPageDescriptors", extends = DomCssRuleStyle, hint(js(webidl)))]
+pub struct DomCssPageDescriptors {
     base: DomCssRuleStyle,
 }
 
@@ -4807,6 +5182,118 @@ impl DomCssFontFaceDescriptors {
     #[setter(name = "line-gap-override", coerce)]
     fn set_line_gap_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
         self.base.set_property("line-gap-override", value.0, None)
+    }
+    #[getter(name = "fontSize")]
+    fn font_size(&self) -> OpResult<String> {
+        self.base.get_property_value("font-size")
+    }
+    #[setter(name = "fontSize", coerce)]
+    fn set_font_size(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-size", value.0, None)
+    }
+    #[getter(name = "font-size")]
+    fn font_size_css(&self) -> OpResult<String> {
+        self.base.get_property_value("font-size")
+    }
+    #[setter(name = "font-size", coerce)]
+    fn set_font_size_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-size", value.0, None)
+    }
+    #[getter(name = "fontNamedInstance")]
+    fn font_named_instance(&self) -> OpResult<String> {
+        self.base.get_property_value("font-named-instance")
+    }
+    #[setter(name = "fontNamedInstance", coerce)]
+    fn set_font_named_instance(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-named-instance", value.0, None)
+    }
+    #[getter(name = "font-named-instance")]
+    fn font_named_instance_css(&self) -> OpResult<String> {
+        self.base.get_property_value("font-named-instance")
+    }
+    #[setter(name = "font-named-instance", coerce)]
+    fn set_font_named_instance_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-named-instance", value.0, None)
+    }
+    #[getter(name = "fontLanguageOverride")]
+    fn font_language_override(&self) -> OpResult<String> {
+        self.base.get_property_value("font-language-override")
+    }
+    #[setter(name = "fontLanguageOverride", coerce)]
+    fn set_font_language_override(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-language-override", value.0, None)
+    }
+    #[getter(name = "font-language-override")]
+    fn font_language_override_css(&self) -> OpResult<String> {
+        self.base.get_property_value("font-language-override")
+    }
+    #[setter(name = "font-language-override", coerce)]
+    fn set_font_language_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("font-language-override", value.0, None)
+    }
+    #[getter(name = "superscriptPositionOverride")]
+    fn superscript_position_override(&self) -> OpResult<String> {
+        self.base.get_property_value("superscript-position-override")
+    }
+    #[setter(name = "superscriptPositionOverride", coerce)]
+    fn set_superscript_position_override(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("superscript-position-override", value.0, None)
+    }
+    #[getter(name = "superscript-position-override")]
+    fn superscript_position_override_css(&self) -> OpResult<String> {
+        self.base.get_property_value("superscript-position-override")
+    }
+    #[setter(name = "superscript-position-override", coerce)]
+    fn set_superscript_position_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("superscript-position-override", value.0, None)
+    }
+    #[getter(name = "subscriptPositionOverride")]
+    fn subscript_position_override(&self) -> OpResult<String> {
+        self.base.get_property_value("subscript-position-override")
+    }
+    #[setter(name = "subscriptPositionOverride", coerce)]
+    fn set_subscript_position_override(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("subscript-position-override", value.0, None)
+    }
+    #[getter(name = "subscript-position-override")]
+    fn subscript_position_override_css(&self) -> OpResult<String> {
+        self.base.get_property_value("subscript-position-override")
+    }
+    #[setter(name = "subscript-position-override", coerce)]
+    fn set_subscript_position_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("subscript-position-override", value.0, None)
+    }
+    #[getter(name = "superscriptSizeOverride")]
+    fn superscript_size_override(&self) -> OpResult<String> {
+        self.base.get_property_value("superscript-size-override")
+    }
+    #[setter(name = "superscriptSizeOverride", coerce)]
+    fn set_superscript_size_override(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("superscript-size-override", value.0, None)
+    }
+    #[getter(name = "superscript-size-override")]
+    fn superscript_size_override_css(&self) -> OpResult<String> {
+        self.base.get_property_value("superscript-size-override")
+    }
+    #[setter(name = "superscript-size-override", coerce)]
+    fn set_superscript_size_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("superscript-size-override", value.0, None)
+    }
+    #[getter(name = "subscriptSizeOverride")]
+    fn subscript_size_override(&self) -> OpResult<String> {
+        self.base.get_property_value("subscript-size-override")
+    }
+    #[setter(name = "subscriptSizeOverride", coerce)]
+    fn set_subscript_size_override(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("subscript-size-override", value.0, None)
+    }
+    #[getter(name = "subscript-size-override")]
+    fn subscript_size_override_css(&self) -> OpResult<String> {
+        self.base.get_property_value("subscript-size-override")
+    }
+    #[setter(name = "subscript-size-override", coerce)]
+    fn set_subscript_size_override_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> {
+        self.base.set_property("subscript-size-override", value.0, None)
     }
 }
 
@@ -5730,11 +6217,16 @@ impl DomStyleSheet {
         let (realm, source, owner_rule) = ctx.with_instance::<DomCssStyleSheet, _>(&this.0, |sheet| sheet.media_parts())?;
         stylesheet_media(ctx, &this.0, realm, source, owner_rule)
     }
+    #[setter(name = "media", coerce)]
+    fn set_media(&self, ctx: &mut Ctx, this: This<Value>, value: &str) -> OpResult<()> {
+        let list = self.media(ctx, This(this.0.clone()))?;
+        ctx.with_instance::<DomCssMediaList, _>(&list, |media| media.set_media_text(value))?
+    }
     #[getter]
     fn disabled(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<bool> {
         ctx.with_instance::<DomCssStyleSheet, _>(&this.0, |sheet| sheet.disabled())?
     }
-    #[setter]
+    #[setter(coerce)]
     fn set_disabled(&self, ctx: &mut Ctx, this: This<Value>, value: bool) -> OpResult<()> {
         ctx.with_instance::<DomCssStyleSheet, _>(&this.0, |sheet| sheet.set_disabled(value))?
     }
@@ -5874,8 +6366,21 @@ impl DomCssStyleSheet {
         self.replace_rules(&text.0)
     }
 
-    #[method(coerce)]
-    fn replace(&self, ctx:&mut Ctx, this: This<Value>, text: lumen_host::webidl::Usv) -> Promise<Value> {
+    #[method(coerce, hint(js(length = "1")))]
+    fn replace(ctx:&mut Ctx, this: This<Value>, text: Option<lumen_host::webidl::Usv>) -> Promise<Value> {
+        let Some(text)=text else {
+            return Promise::rejected(OpError::new("TypeError","CSSStyleSheet.replace: argument 1 (text) is required"));
+        };
+        let Some(data)=ctx.instance_data::<DomCssStyleSheet>(&this.0) else {
+            return Promise::rejected(OpError::new("TypeError","CSSStyleSheet.replace: illegal invocation (receiver is not a CSSStyleSheet)"));
+        };
+        let sheet=data.borrow();
+        sheet.replace_text(ctx,this.0.clone(),text)
+    }
+}
+
+impl DomCssStyleSheet {
+    fn replace_text(&self, ctx:&mut Ctx, this: Value, text: lumen_host::webidl::Usv) -> Promise<Value> {
         let SheetSource::Constructed(data)=&self.source else {
             return Promise::rejected(crate::error_reporting::dom_exception(ctx,"NotAllowedError","replace requires a constructed stylesheet"));
         };
@@ -5897,7 +6402,7 @@ impl DomCssStyleSheet {
         let parsed=match parsed {Ok(value)=>value,Err(reason)=>{
             let (deferred,lock)=completion.borrow_mut().take().expect("replacement completion");drop(lock);deferred.reject(ctx,OpError::thrown(reason));return pending;
         }};
-        let sheet=this.0;
+        let sheet=this;
         let success=completion.clone();
         let on_ok=ctx.new_native_fn("stylesheetReplacementComplete",1,Rc::new(move |ctx,_,args| {
             let state=success.borrow_mut().take();
@@ -5919,7 +6424,6 @@ impl DomCssStyleSheet {
         ctx.then_value(parsed,on_ok,on_err);
         pending
     }
-
 }
 
 #[lumen_bind::methods]
@@ -6051,8 +6555,14 @@ impl DomCssRuleList {
             (font_features::wrap(ctx,base)?,14)
         } else if starts_css_at_rule(&rule.css_text,"@font-palette-values") {
             (font_palette::wrap(ctx,base),15)
+        } else if starts_css_at_rule(&rule.css_text,"@view-transition") {
+            (view_transition_rule::wrap(ctx,base),0)
         } else if starts_css_at_rule(&rule.css_text, "@property") {
             (ctx.new_instance(DomCssPropertyRule { base }), 0)
+        } else if rule.page_selector.is_some() {
+            (ctx.new_instance(DomCssPageRule { base: DomCssGroupingRule { base } }), 6)
+        } else if rule.margin_box.is_some() {
+            (ctx.new_instance(DomCssMarginRule { base }), 9)
         } else if rule.font_face {
             (ctx.new_instance(DomCssFontFaceRule { base }), 5)
         } else if rule.position_try {
@@ -6061,6 +6571,12 @@ impl DomCssRuleList {
             (ctx.new_instance(DomCssStyleRule {
                 base: DomCssGroupingRule { base },
             }), 1)
+        } else if rule.header==RuleHeader::LayerStatement {
+            (layer_counter::wrap_layer_statement(ctx,base),0)
+        } else if starts_css_at_rule(&rule.css_text, "@layer") {
+            (layer_counter::wrap_layer_block(ctx,base),0)
+        } else if starts_css_at_rule(&rule.css_text, "@counter-style") {
+            (layer_counter::wrap_counter_style(ctx,base),11)
         } else if starts_css_at_rule(&rule.css_text, "@starting-style") {
             (ctx.new_instance(DomCssStartingStyleRule { base: DomCssGroupingRule { base } }), 0)
         } else if starts_css_at_rule(&rule.css_text, "@scope") {
@@ -6202,7 +6718,7 @@ impl DomCssRule {
                 return Ok(css::media_query_text::serialize_list(prelude.get("@media".len()..).unwrap_or_default()));
             }
             let condition = prelude.get("@supports".len()..).unwrap_or_default();
-            Ok(condition.trim().to_owned())
+            Ok(css::at_rule_supports::serialize_condition(condition.trim()))
         })
     }
 
@@ -6292,6 +6808,29 @@ impl DomCssRule {
         Ok(())
     }
 
+    fn forward_style_text(&self, value: &str) -> OpResult<()> {
+        let location = rule_location(&self.realm, &self.source, &self.path)?;
+        let mut sheet = source_sheet(&self.realm, &location.source)?;
+        let before = sheet.clone();
+        sheet.set_rule_style(&location.indices.clone(), value).map_err(css_error)?;
+        commit_rule_declaration(&self.realm, &location.source, &before, &sheet, &[], None)?;
+        let updated = source_sheet(&self.realm, &location.source)?;
+        remember_rule_path(&location.source, &updated, &self.path)
+    }
+
+    fn set_page_selector_text(&self, value: &str) -> OpResult<()> {
+        let Some(canonical) = css::page_rules::selector_list(value) else {
+            return Ok(());
+        };
+        let location = rule_location(&self.realm, &self.source, &self.path)?;
+        let mut sheet = source_sheet(&self.realm, &location.source)?;
+        let before = sheet.clone();
+        sheet.set_page_selector(&location.indices.clone(), &canonical).map_err(css_error)?;
+        commit_rule_declaration(&self.realm, &location.source, &before, &sheet, &[], None)?;
+        let updated = source_sheet(&self.realm, &location.source)?;
+        remember_rule_path(&location.source, &updated, &self.path)
+    }
+
     fn set_selector_text(&self, value: &str) -> OpResult<()> {
         let location = rule_location(&self.realm, &self.source, &self.path)?;
         let mut sheet = source_sheet(&self.realm, &location.source)?;
@@ -6325,9 +6864,17 @@ impl DomCssRule {
     #[constant]
     const PAGE_RULE: u16 = 6;
     #[constant]
+    const KEYFRAMES_RULE: u16 = 7;
+    #[constant]
+    const KEYFRAME_RULE: u16 = 8;
+    #[constant]
     const MARGIN_RULE: u16 = 9;
     #[constant]
     const NAMESPACE_RULE: u16 = 10;
+    #[constant]
+    const COUNTER_STYLE_RULE: u16 = 11;
+    #[constant]
+    const SUPPORTS_RULE: u16 = 12;
     #[constant]
     const FONT_FEATURE_VALUES_RULE: u16 = 14;
     #[getter(name = "type")]
@@ -6381,7 +6928,7 @@ impl DomCssRule {
         let rule = self.current_rule()?;
         Ok(if rule.nested_declarations {
             rule.style.css_text().to_owned()
-        } else if rule.selector_text.is_some() || !rule.nested.is_empty() || rule.header==RuleHeader::Namespace || starts_css_at_rule(&rule.css_text, "@scope") || starts_css_at_rule(&rule.css_text,"@font-feature-values") || starts_css_at_rule(&rule.css_text, "@function") {
+        } else if rule.selector_text.is_some() || rule.page_selector.is_some() || rule.margin_box.is_some() || !rule.nested.is_empty() || rule.header==RuleHeader::Namespace || starts_css_at_rule(&rule.css_text, "@import") || starts_css_at_rule(&rule.css_text, "@scope") || starts_css_at_rule(&rule.css_text,"@font-feature-values") || starts_css_at_rule(&rule.css_text, "@function") {
             serialize_rule(&rule)
         } else if rule.font_face {
             format!("@font-face {{ {} }}", rule.style.css_text())
@@ -6390,6 +6937,11 @@ impl DomCssRule {
         } else {
             rule.css_text
         })
+    }
+
+    #[setter(name = "cssText", coerce)]
+    fn set_css_text(&self, _value: &str) -> OpResult<()> {
+        Ok(())
     }
 
     #[getter(name = "selectorText")]
@@ -6417,6 +6969,8 @@ impl DomCssRule {
             && !rule.font_face
             && !rule.position_try
             && !rule.nested_declarations
+            && rule.page_selector.is_none()
+            && rule.margin_box.is_none()
             && frame_style.is_none()
         {
             return Err(OpError::new(
@@ -6430,6 +6984,7 @@ impl DomCssRule {
                 node: source_dom_node(&self.realm, &self.source),
                 computed: false,
                 pseudo: None,
+                highlight: None,
                 invalid_pseudo: false,
                 _owner: this.0.clone(),
             },
@@ -6445,6 +7000,8 @@ impl DomCssRule {
             ctx.new_instance(DomCssFontFaceDescriptors { base: declaration })
         } else if rule.position_try {
             ctx.new_instance(DomCssPositionTryDescriptors { base: declaration })
+        } else if rule.page_selector.is_some() {
+            ctx.new_instance(DomCssPageDescriptors { base: declaration })
         } else if rule.function_body {
             ctx.new_instance(DomCssFunctionDescriptors { base: declaration })
         } else {
@@ -6472,7 +7029,9 @@ impl DomCssPropertyRule {
     #[getter]
     fn inherits(&self) -> OpResult<bool> { Ok(self.registration()?.inherits) }
     #[getter(name = "initialValue")]
-    fn initial_value(&self) -> OpResult<Option<String>> { Ok(self.registration()?.initial_value) }
+    fn initial_value(&self) -> OpResult<Value> {
+        Ok(self.registration()?.initial_value.map_or(Value::Null, Value::from_string))
+    }
     #[getter(name = "cssText")]
     fn css_text(&self) -> OpResult<String> {
         let registration = self.registration()?;
@@ -6488,7 +7047,15 @@ fn hide_unsupported_position_try_properties(ctx: &mut Ctx, constructor: &Value) 
     let prototype = ctx
         .get_member(constructor, "prototype")
         .map_err(|_| OpError::new("Error", "CSSPositionTryDescriptors prototype unavailable"))?;
-    reparent_position_try_descriptors(ctx, constructor, &prototype)?;
+    let allowed = css::cssom_property_names()
+        .into_iter()
+        .filter(|property| !property.starts_with("--") && css::anchor::position_try_property(property))
+        .flat_map(|property| {
+            let camel = super::style::camel_case_alias(property);
+            core::iter::once(Value::str(property)).chain(camel.map(Value::from_string))
+        })
+        .collect();
+    reparent_descriptors(ctx, constructor, &prototype, allowed)?;
     for property in css::cssom_property_names() {
         if property.starts_with("--") || css::anchor::position_try_property(property) {
             continue;
@@ -6506,22 +7073,14 @@ fn hide_unsupported_position_try_properties(ctx: &mut Ctx, constructor: &Value) 
 /// `CSSStyleDeclaration` and gives it its own descriptor attributes. The
 /// rule-bound overrides of `CSSRuleStyleDeclaration` and the supported
 /// property accessors become own members of the descriptors prototype.
-fn reparent_position_try_descriptors(ctx: &mut Ctx, constructor: &Value, prototype: &Value) -> OpResult<()> {
+fn reparent_descriptors(ctx: &mut Ctx, constructor: &Value, prototype: &Value, extra_keys: Vec<Value>) -> OpResult<()> {
     let rule_constructor = ctx.class_constructor::<DomCssRuleStyle>();
     let style_constructor = ctx.class_constructor::<DomStyle>();
     let unavailable = |_| OpError::new("Error", "CSSStyleDeclaration prototype unavailable");
     let rule_prototype = ctx.get_member(&rule_constructor, "prototype").map_err(unavailable)?;
     let style_prototype = ctx.get_member(&style_constructor, "prototype").map_err(unavailable)?;
     let mut keys = ctx.reflect_own_keys(&rule_prototype).map_err(OpError::thrown)?;
-    for property in css::cssom_property_names() {
-        if property.starts_with("--") || !css::anchor::position_try_property(property) {
-            continue;
-        }
-        keys.push(Value::str(property));
-        if let Some(camel) = super::style::camel_case_alias(property) {
-            keys.push(Value::from_string(camel));
-        }
-    }
+    keys.extend(extra_keys);
     for key in keys {
         if matches!(&key, Value::Str(name) if name.as_ref() == "constructor") {
             continue;
@@ -6540,7 +7099,7 @@ fn reparent_position_try_descriptors(ctx: &mut Ctx, constructor: &Value, prototy
     }
     for (target, parent) in [(prototype, &style_prototype), (constructor, &style_constructor)] {
         if !ctx.reflect_set_prototype_of(target, parent).map_err(OpError::thrown)? {
-            return Err(OpError::new("Error", "CSSPositionTryDescriptors prototype could not be set"));
+            return Err(OpError::new("Error", "descriptor prototype could not be set"));
         }
     }
     Ok(())
@@ -6664,6 +7223,110 @@ impl DomCssPositionTryDescriptors {
 }
 
 #[lumen_bind::methods]
+impl DomCssPageRule {
+    #[getter(name = "selectorText")]
+    fn selector_text(&self) -> OpResult<String> {
+        Ok(self.base.base.current_rule()?.page_selector.unwrap_or_default())
+    }
+    #[setter(name = "selectorText", coerce)]
+    fn set_selector_text(&self, value: &str) -> OpResult<()> {
+        self.base.base.set_page_selector_text(value)
+    }
+    #[getter]
+    fn style(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<Value> {
+        self.base.base.style(ctx, this)
+    }
+    #[setter(coerce)]
+    fn set_style(&self, value: &str) -> OpResult<()> {
+        self.base.base.forward_style_text(value)
+    }
+}
+
+#[lumen_bind::methods]
+impl DomCssMarginRule {
+    #[getter]
+    fn name(&self) -> OpResult<String> {
+        Ok(self.base.current_rule()?.margin_box.unwrap_or_default())
+    }
+    #[getter]
+    fn style(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<Value> {
+        self.base.style(ctx, this)
+    }
+    #[setter(coerce)]
+    fn set_style(&self, value: &str) -> OpResult<()> {
+        self.base.forward_style_text(value)
+    }
+}
+
+#[lumen_bind::methods]
+impl DomCssPageDescriptors {
+    #[proto(len)]
+    fn length(&self) -> OpResult<usize> {
+        self.base.length()
+    }
+    #[proto(getitem)]
+    fn indexed(&self, index: usize) -> OpResult<Value> {
+        self.base.indexed(index)
+    }
+    #[getter]
+    fn margin(&self) -> OpResult<String> { self.base.get_property_value("margin") }
+    #[setter(name = "margin", coerce)]
+    fn set_margin(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin", value.0, None) }
+    #[getter(name = "marginTop")]
+    fn margin_top(&self) -> OpResult<String> { self.base.get_property_value("margin-top") }
+    #[setter(name = "marginTop", coerce)]
+    fn set_margin_top(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-top", value.0, None) }
+    #[getter(name = "marginRight")]
+    fn margin_right(&self) -> OpResult<String> { self.base.get_property_value("margin-right") }
+    #[setter(name = "marginRight", coerce)]
+    fn set_margin_right(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-right", value.0, None) }
+    #[getter(name = "marginBottom")]
+    fn margin_bottom(&self) -> OpResult<String> { self.base.get_property_value("margin-bottom") }
+    #[setter(name = "marginBottom", coerce)]
+    fn set_margin_bottom(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-bottom", value.0, None) }
+    #[getter(name = "marginLeft")]
+    fn margin_left(&self) -> OpResult<String> { self.base.get_property_value("margin-left") }
+    #[setter(name = "marginLeft", coerce)]
+    fn set_margin_left(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-left", value.0, None) }
+    #[getter(name = "margin-top")]
+    fn margin_top_css(&self) -> OpResult<String> { self.base.get_property_value("margin-top") }
+    #[setter(name = "margin-top", coerce)]
+    fn set_margin_top_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-top", value.0, None) }
+    #[getter(name = "margin-right")]
+    fn margin_right_css(&self) -> OpResult<String> { self.base.get_property_value("margin-right") }
+    #[setter(name = "margin-right", coerce)]
+    fn set_margin_right_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-right", value.0, None) }
+    #[getter(name = "margin-bottom")]
+    fn margin_bottom_css(&self) -> OpResult<String> { self.base.get_property_value("margin-bottom") }
+    #[setter(name = "margin-bottom", coerce)]
+    fn set_margin_bottom_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-bottom", value.0, None) }
+    #[getter(name = "margin-left")]
+    fn margin_left_css(&self) -> OpResult<String> { self.base.get_property_value("margin-left") }
+    #[setter(name = "margin-left", coerce)]
+    fn set_margin_left_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("margin-left", value.0, None) }
+    #[getter]
+    fn size(&self) -> OpResult<String> { self.base.get_property_value("size") }
+    #[setter(name = "size", coerce)]
+    fn set_size(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("size", value.0, None) }
+    #[getter(name = "pageOrientation")]
+    fn page_orientation(&self) -> OpResult<String> { self.base.get_property_value("page-orientation") }
+    #[setter(name = "pageOrientation", coerce)]
+    fn set_page_orientation(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("page-orientation", value.0, None) }
+    #[getter(name = "page-orientation")]
+    fn page_orientation_css(&self) -> OpResult<String> { self.base.get_property_value("page-orientation") }
+    #[setter(name = "page-orientation", coerce)]
+    fn set_page_orientation_css(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("page-orientation", value.0, None) }
+    #[getter]
+    fn marks(&self) -> OpResult<String> { self.base.get_property_value("marks") }
+    #[setter(name = "marks", coerce)]
+    fn set_marks(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("marks", value.0, None) }
+    #[getter]
+    fn bleed(&self) -> OpResult<String> { self.base.get_property_value("bleed") }
+    #[setter(name = "bleed", coerce)]
+    fn set_bleed(&self, value: CssDescriptorString<'_>) -> OpResult<()> { self.base.set_property("bleed", value.0, None) }
+}
+
+#[lumen_bind::methods]
 impl DomCssFontFaceRule {
     #[getter]
     fn style(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<Value> {
@@ -6726,10 +7389,29 @@ impl DomCssMediaRule {
         ctx.define_native_internal_value_slot(&this.0, SLOT, value.clone()).map_err(OpError::thrown)?;
         Ok(value)
     }
+
+    #[setter(name = "media", coerce)]
+    fn set_media(&self, ctx: &mut Ctx, this: This<Value>, value: &str) -> OpResult<()> {
+        let list = self.media(ctx, This(this.0.clone()))?;
+        ctx.with_instance::<DomCssMediaList, _>(&list, |media| media.set_media_text(value))?
+    }
+
+    #[getter]
+    fn matches(&self) -> OpResult<bool> {
+        let rule = &self.base.base.base;
+        let query = rule.condition_text()?;
+        let environment = rule.realm.effective_media_environment()?;
+        Ok(css::media_query_matches(&query, environment))
+    }
 }
 
 #[lumen_bind::methods]
-impl DomCssSupportsRule {}
+impl DomCssSupportsRule {
+    #[getter]
+    fn matches(&self) -> OpResult<bool> {
+        Ok(css::supports_condition(&self.base.base.base.condition_text()?))
+    }
+}
 
 impl DomCssContainerRule {
     fn conditions_list(&self) -> OpResult<Vec<css::container_query::Condition>> {
@@ -6884,6 +7566,14 @@ impl DomCssKeyframesRule {
             .keyframes_rule(self.base.index.get())
             .map_err(css_error)?
             .name)
+    }
+
+    #[setter(coerce)]
+    fn set_name(&self, value: &str) -> OpResult<()> {
+        let mut sheet = source_sheet(&self.base.realm, &self.base.source)?;
+        let original = sheet.clone();
+        sheet.set_keyframes_name(self.base.index.get(), value).map_err(css_error)?;
+        commit_rule_declaration(&self.base.realm, &self.base.source, &original, &sheet, &[], None)
     }
 
     #[getter(name = "cssRules")]
@@ -7070,6 +7760,31 @@ impl DomCssKeyframeRule {
     fn style(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<Value> {
         self.base.style(ctx, this)
     }
+
+    #[setter(coerce)]
+    fn set_style(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        let frame_index = self
+            .base
+            .keyframe_index
+            .as_ref()
+            .ok_or_else(|| OpError::new("InvalidStateError", "not a keyframe rule"))?;
+        let frame = source_keyframe(&self.base.realm, &self.base.source, &self.base.index, frame_index)?;
+        let replacement = css::parse_keyframe_rule(&format!("{} {{ {value} }}", frame.key_text))
+            .map_err(|error| css_rule_dom_exception(ctx, error))?;
+        if frame_index.detached.borrow().is_some() {
+            *frame_index.detached.borrow_mut() = Some(replacement.css_text);
+            return Ok(());
+        }
+        let mut sheet = source_sheet(&self.base.realm, &self.base.source)?;
+        let before = sheet.clone();
+        sheet
+            .set_keyframe_declarations(self.base.index.get(), frame_index.get(), value)
+            .map_err(css_error)?;
+        commit_rule_declaration(&self.base.realm, &self.base.source, &before, &sheet, &[], None)?;
+        frame_index.owner.remember(&keyframe_text(
+            &sheet.keyframes_rule(self.base.index.get()).map_err(css_error)?,
+        ))
+    }
 }
 
 // A loaded import's sheet and its owner rule expose one canonical MediaList.
@@ -7099,6 +7814,12 @@ impl DomCssImportRule {
     #[getter]
     fn media(&self, ctx: &mut Ctx,this:This<Value>) -> OpResult<Value> {
         import_rule_media(ctx,&this.0)
+    }
+
+    #[setter(name = "media", coerce)]
+    fn set_media(&self, ctx: &mut Ctx, this: This<Value>, value: &str) -> OpResult<()> {
+        let list = import_rule_media(ctx, &this.0)?;
+        ctx.with_instance::<DomCssMediaList, _>(&list, |media| media.set_media_text(value))?
     }
 
     #[getter(name = "supportsText")]
@@ -7309,7 +8030,7 @@ impl DomCssRuleStyle {
         }
         match self.read_declaration()? {
             ReadCssDeclaration::Parsed(declaration) => Ok(declaration.css_text().to_owned()),
-            ReadCssDeclaration::Retained(block) => block.serialize().map_err(css_error),
+            ReadCssDeclaration::Retained(block) => memoized_block_text(&block).map_err(css_error),
         }
     }
 
@@ -7333,7 +8054,7 @@ impl DomCssRuleStyle {
         let path = location.indices.clone();
         let rule = sheet.rule_at_path(&path).map_err(css_error)?;
         commit_rule_declaration(&self.realm, &location.source, &before, &sheet, &path,
-            rule.style.block)?;
+            if rule.style.page { None } else { rule.style.block })?;
         let updated = source_sheet(&self.realm, &location.source)?;
         remember_rule_path(&location.source, &updated, &self.path)
     }
@@ -7423,8 +8144,9 @@ impl DomCssRuleStyle {
         sheet
             .set_rule_style(&location.indices.clone(), declaration.css_text())
             .map_err(css_error)?;
+        let retained = if declaration.page { None } else { declaration.block };
         commit_rule_declaration(&self.realm, &location.source, &before, &sheet,
-            &location.indices.clone(), declaration.block)?;
+            &location.indices.clone(), retained)?;
         let updated = source_sheet(&self.realm, &location.source)?;
         remember_rule_path(&location.source, &updated, &self.path)
     }
@@ -7591,6 +8313,8 @@ impl DomCssRuleStyle {
             CssDeclaration::function(&raw)
         } else if rule.kind == css::nesting::SourceRuleKind::PositionTry {
             CssDeclaration::position_try(&raw)
+        } else if rule.kind == css::nesting::SourceRuleKind::Page {
+            CssDeclaration::page(&raw)
         } else { CssDeclaration::parse(&raw) });
         cached.declaration = Some((path, declaration.clone()));
         Ok(ReadCssDeclaration::Parsed(declaration))
@@ -7625,7 +8349,7 @@ mod tests {
             check(keys.every((name,index)=>index===0||category(keys[index-1])<category(name)||category(keys[index-1])===category(name)&&keys[index-1]<name),'ordering');
             const itemIndex=keys.indexOf('--items');check(values[itemIndex].length===2&&values[itemIndex][1].value===2,'registered repeated reification');
             const durationIndex=keys.indexOf('transition-duration');check(values[durationIndex].length===2&&values[durationIndex][1].value===2,'ordinary list reification');
-            target.style.setProperty('--豈','BMP');target.style.setProperty('--💩','nonBMP');const unicodeKeys=Array.from(map.keys());check(unicodeKeys.indexOf('--豈')<unicodeKeys.indexOf('--💩'),'modern code-point ordering');
+            target.style.setProperty('--豈','BMP');target.style.setProperty('--💩','nonBMP');const unicodeKeys=Array.from(map.keys());check(unicodeKeys.indexOf('--💩')<unicodeKeys.indexOf('--豈'),'UTF-16 code unit ordering');
             const receiver={};let called=0;map.forEach(function(items,name,owner){check(this===receiver&&owner===map&&Array.isArray(items),'callback');called++},receiver);check(called===map.size,'callback count');
             const oldItems=entries[itemIndex][1];document.getElementById('registry').textContent="@property --items {syntax:'<number>';inherits:false;initial-value:7}";
             check(map.get('--items').unit==='number'&&map.get('--items').value===7&&oldItems[1].unit==='px'&&oldItems[1].value===2,'new registry and frozen earlier values');
@@ -9111,8 +9835,8 @@ return true;})()"#).unwrap();
             rule.selectorText='same|*.target > *|*.child';
             check(rule.selectorText==='.target > *|*.child','setter uses associated stylesheet namespace context');
             rule.selectorText=':is(*.target, .target, missing|e)';
-            check(rule.selectorText===':is(*.target, .target)','logical default-namespace subject stays explicit and invalid forgiving branch is discarded');
-            rule.selectorText=':not(missing|e)';check(rule.selectorText===':is(*.target, .target)','strict invalid setter preserves existing parsed rule');
+            check(rule.selectorText===':is(*.target, .target, missing|e)','logical default-namespace subject stays explicit and invalid forgiving branch is kept verbatim');
+            rule.selectorText=':not(missing|e)';check(rule.selectorText===':is(*.target, .target, missing|e)','strict invalid setter preserves existing parsed rule');
             sheet.deleteRule(4);
             check(group.parentStyleSheet===null && child.parentStyleSheet===null && child.parentRule===group && child.selectorText==='foreign|e','detached nested rules retain literal namespace identities');
             child.style.setProperty('width','4px');
@@ -9123,7 +9847,7 @@ return true;})()"#).unwrap();
             sheet.insertRule('foreign|e {height:7px}',sheet.cssRules.length);
             check(sheet.cssRules[sheet.cssRules.length-1].selectorText==='foreign|e','inserted rule shares actual stylesheet context');
             const fresh=new CSSStyleSheet();fresh.replaceSync(':nth-child(odd){color:red}:lang(EN-us){color:blue}');
-            check(fresh.cssRules[0].selectorText===':nth-child(2n+1)' && fresh.cssRules[1].selectorText===':lang("EN-us")','functional arguments share canonical parser and string serializer');
+            check(fresh.cssRules[0].selectorText===':nth-child(2n+1)' && fresh.cssRules[1].selectorText===':lang(EN-us)','functional arguments share canonical parser and string serializer');
             return true;
         })()"#).unwrap();
         let value=result.unwrap_or_else(|error|panic!("selector serialization: {}",engine.ctx().coerce_string(&error).map(|value|value.to_string()).unwrap_or_default()));

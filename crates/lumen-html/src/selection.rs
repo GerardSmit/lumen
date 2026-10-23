@@ -42,7 +42,7 @@ type Stop = (f32, usize);
 fn stops(run: &ControlTextRun, commands: &[Command]) -> Option<(f32, Vec<Stop>)> {
     let length = run.range.end.checked_sub(run.range.start)?;
     let Some(Command::GlyphRun { origin_x, glyphs, .. }) = commands.get(run.command_index?) else { return None };
-    let mut ordered: Vec<(f32, usize)> = glyphs.iter().map(|glyph| (glyph.x, glyph.cluster as usize)).collect();
+    let mut ordered: Vec<(f32, usize)> = glyphs.iter().map(|glyph| (glyph.x - glyph.x_offset, glyph.cluster as usize)).collect();
     ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     let mut result = Vec::with_capacity(ordered.len() + 1);
     if run.rtl {
@@ -714,7 +714,7 @@ mod tests {
         fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
             Ok(ShapedRun { width: text.chars().count() as f32 * 10.0,
                 glyphs: text.char_indices().enumerate().map(|(position, (cluster, ch))| Glyph {
-                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0,
+                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0, x_offset: 0.0,
                     x: position as f32 * 10.0, y: 0.0, size_scale: 1.0,
                 }).collect::<Vec<_>>().into() })
         }
@@ -826,7 +826,7 @@ mod tests {
             let count = text.chars().count();
             Ok(ShapedRun { width: count as f32 * 10.0,
                 glyphs: text.char_indices().enumerate().map(|(position, (cluster, ch))| Glyph {
-                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0,
+                    id: ch as u16, face: 0, cluster: cluster as u32, caps_expansion: 0, x_offset: 0.0,
                     x: (count - 1 - position) as f32 * 10.0, y: 0.0, size_scale: 1.0,
                 }).collect::<Vec<_>>().into() })
         }

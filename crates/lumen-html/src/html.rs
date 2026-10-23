@@ -754,6 +754,10 @@ fn element(name: impl Into<Name>, attributes: Vec<(Name, String)>) -> NodeKind {
     }
 }
 
+fn select_stack_index(stack: &[Open], select: NodeId) -> usize {
+    stack.iter().rposition(|open| open.id == select).unwrap_or(0)
+}
+
 fn svg_element_name(name: &str) -> &str {
     match name {
         "altglyph" => "altGlyph",
@@ -1231,6 +1235,43 @@ impl Tag {
     }
 
     /// Cell and caption boundaries that scope the active formatting list.
+    /// End tags that require the element to be in (default) scope.
+    fn end_requires_scope(self) -> bool {
+        matches!(
+            self,
+            Tag::Address
+                | Tag::Article
+                | Tag::Aside
+                | Tag::Blockquote
+                | Tag::Button
+                | Tag::Center
+                | Tag::Details
+                | Tag::Dialog
+                | Tag::Dir
+                | Tag::Div
+                | Tag::Dl
+                | Tag::Fieldset
+                | Tag::Figcaption
+                | Tag::Figure
+                | Tag::Footer
+                | Tag::Header
+                | Tag::Hgroup
+                | Tag::Listing
+                | Tag::Main
+                | Tag::Menu
+                | Tag::Nav
+                | Tag::Ol
+                | Tag::Pre
+                | Tag::Search
+                | Tag::Section
+                | Tag::Summary
+                | Tag::Ul
+                | Tag::Applet
+                | Tag::Marquee
+                | Tag::Object
+        )
+    }
+
     fn is_marker(self) -> bool {
         matches!(
             self,
@@ -2702,8 +2743,11 @@ fn incremental_safe_prefix<D: crate::parser_documents::ParserDocument + ?Sized>(
             if relative == bytes.len() - cursor {
                 // Raw text itself can be emitted incrementally. Keep only a
                 // suffix that could still become its appropriate end tag.
-                let mut safe_end =
-                    trailing_raw_end_tag_prefix(bytes, cursor, name).unwrap_or(bytes.len());
+                let mut safe_end = if name == "script" {
+                    cursor + script_data_scan(&bytes[cursor..]).safe
+                } else {
+                    trailing_raw_end_tag_prefix(bytes, cursor, name).unwrap_or(bytes.len())
+                };
                 if safe_end == bytes.len() && open.tag.is_rcdata() {
                     safe_end = trailing_character_reference(input, cursor).unwrap_or(safe_end);
                 }
@@ -2861,34 +2905,162 @@ pub(crate) fn comment_end(bytes: &[u8], body_start: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn raw_text_end_in(input: &str, start: usize, name: &str) -> usize {
-    let bytes = &input.as_bytes()[start..];
-    let appropriate = |index: usize, prefix: &[u8]| {
-        bytes
-            .get(index..index + prefix.len())
-            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-            && bytes
-                .get(index + prefix.len())
-                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-    };
-    let mut script_state = 0;
-    for index in 0..bytes.len() {
-        if !matches!(bytes[index], b'<' | b'-') {
-            continue;
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptScanState {
+    Data,
+    Escaped,
+    EscapedDash,
+    EscapedDashDash,
+    EscapedLessThan,
+    DoubleEscapeStart,
+    DoubleEscaped,
+    DoubleEscapedDash,
+    DoubleEscapedDashDash,
+    DoubleEscapedLessThan,
+    DoubleEscapeEnd,
+}
+
+enum ScriptEndTag {
+    Yes,
+    No,
+    Incomplete,
+}
+
+fn script_end_tag_at(bytes: &[u8], index: usize) -> ScriptEndTag {
+    const NAME: &[u8] = b"</script";
+    let rest = &bytes[index..];
+    let compared = rest.len().min(NAME.len());
+    if !rest[..compared].eq_ignore_ascii_case(&NAME[..compared]) {
+        return ScriptEndTag::No;
+    }
+    if rest.len() <= NAME.len() {
+        return ScriptEndTag::Incomplete;
+    }
+    if rest[NAME.len()].is_ascii_whitespace() || matches!(rest[NAME.len()], b'/' | b'>') {
+        ScriptEndTag::Yes
+    } else {
+        ScriptEndTag::No
+    }
+}
+
+/// Result of scanning script data through the tokenizer's script data,
+/// escaped and double-escaped states. `end` is the offset of the appropriate
+/// end tag, if present. `safe` is the offset up to which the text can be
+/// emitted without losing tokenizer state when more input may follow.
+pub(crate) struct ScriptScan {
+    pub end: Option<usize>,
+    pub safe: usize,
+}
+
+pub(crate) fn script_data_scan(bytes: &[u8]) -> ScriptScan {
+    use ScriptScanState as S;
+    let mut state = S::Data;
+    let mut index = 0;
+    let mut checkpoint = 0;
+    let mut buffer = [0u8; 7];
+    let mut buffer_len = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if state == S::Data {
+            checkpoint = index;
         }
-        if name == "script" {
-            if script_state == 0 && bytes[index..].starts_with(b"<!--") {
-                script_state = 1;
-            } else if script_state != 0 && bytes[index..].starts_with(b"-->") {
-                script_state = 0;
-            } else if script_state == 1 && appropriate(index, b"<script") {
-                script_state = 2;
-            } else if script_state == 2 && appropriate(index, b"</script") {
-                script_state = 1;
-                continue;
+        let mut advance = true;
+        let is_script = buffer_len == 6 && &buffer[..6] == b"script";
+        match state {
+            S::Data => {
+                if byte == b'<' {
+                    match script_end_tag_at(bytes, index) {
+                        ScriptEndTag::Yes => return ScriptScan { end: Some(index), safe: index },
+                        ScriptEndTag::Incomplete => return ScriptScan { end: None, safe: index },
+                        ScriptEndTag::No => {}
+                    }
+                    let rest = &bytes[index..];
+                    let compared = rest.len().min(4);
+                    if rest[..compared] == b"<!--"[..compared] {
+                        if compared < 4 {
+                            return ScriptScan { end: None, safe: index };
+                        }
+                        state = S::EscapedDashDash;
+                        index += 3;
+                    }
+                }
+            }
+            S::Escaped | S::EscapedDash | S::EscapedDashDash => match byte {
+                b'-' => {
+                    state = if state == S::Escaped { S::EscapedDash } else { S::EscapedDashDash };
+                }
+                b'<' => {
+                    match script_end_tag_at(bytes, index) {
+                        ScriptEndTag::Yes => return ScriptScan { end: Some(index), safe: index },
+                        ScriptEndTag::Incomplete => return ScriptScan { end: None, safe: checkpoint },
+                        ScriptEndTag::No => {}
+                    }
+                    state = S::EscapedLessThan;
+                }
+                b'>' if state == S::EscapedDashDash => state = S::Data,
+                _ => state = S::Escaped,
+            },
+            S::EscapedLessThan => {
+                advance = false;
+                if byte.is_ascii_alphabetic() {
+                    buffer_len = 0;
+                    state = S::DoubleEscapeStart;
+                } else {
+                    state = S::Escaped;
+                }
+            }
+            S::DoubleEscapeStart | S::DoubleEscapeEnd => {
+                let start = state == S::DoubleEscapeStart;
+                if byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>') {
+                    state = match (start, is_script) {
+                        (true, true) => S::DoubleEscaped,
+                        (true, false) => S::Escaped,
+                        (false, true) => S::Escaped,
+                        (false, false) => S::DoubleEscaped,
+                    };
+                } else if byte.is_ascii_alphabetic() {
+                    if buffer_len < buffer.len() {
+                        buffer[buffer_len] = byte.to_ascii_lowercase();
+                        buffer_len += 1;
+                    }
+                } else {
+                    advance = false;
+                    state = if start { S::Escaped } else { S::DoubleEscaped };
+                }
+            }
+            S::DoubleEscaped | S::DoubleEscapedDash | S::DoubleEscapedDashDash => match byte {
+                b'-' => {
+                    state = if state == S::DoubleEscaped { S::DoubleEscapedDash } else { S::DoubleEscapedDashDash };
+                }
+                b'<' => state = S::DoubleEscapedLessThan,
+                b'>' if state == S::DoubleEscapedDashDash => state = S::Data,
+                _ => state = S::DoubleEscaped,
+            },
+            S::DoubleEscapedLessThan => {
+                if byte == b'/' {
+                    buffer_len = 0;
+                    state = S::DoubleEscapeEnd;
+                } else {
+                    advance = false;
+                    state = S::DoubleEscaped;
+                }
             }
         }
-        if script_state != 2
+        if advance {
+            index += 1;
+        }
+    }
+    let safe = if state == S::Data { bytes.len() } else { checkpoint };
+    ScriptScan { end: None, safe }
+}
+
+pub(crate) fn raw_text_end_in(input: &str, start: usize, name: &str) -> usize {
+    let bytes = &input.as_bytes()[start..];
+    if name == "script" {
+        return script_data_scan(bytes).end.unwrap_or(bytes.len());
+    }
+    for index in 0..bytes.len() {
+        if bytes[index] == b'<'
             && bytes[index..].starts_with(b"</")
             && bytes
                 .get(index + 2..index + 2 + name.len())
@@ -3008,6 +3180,8 @@ pub fn tokenize_for_conformance(
             after_head: false,
             document_tail: 0,
             doctype_allowed: true,
+            frameset_ok: true,
+            frameset_mode: false,
         },
         final_input: true,
         stop_after_script: false,
@@ -3200,6 +3374,8 @@ fn parse_fragment_context(
             after_head: false,
             document_tail: 0,
             doctype_allowed: false,
+            frameset_ok: true,
+            frameset_mode: false,
         },
         final_input: true,
         stop_after_script: false,
@@ -3293,6 +3469,8 @@ struct ParserState {
     // Comment/PI placement after head (1), body (2), and html (3).
     document_tail: u8,
     doctype_allowed: bool,
+    frameset_ok: bool,
+    frameset_mode: bool,
 }
 
 impl ParserState {
@@ -3342,6 +3520,8 @@ impl ParserState {
             after_head: false,
             document_tail: 0,
             doctype_allowed: true,
+            frameset_ok: true,
+            frameset_mode: false,
         }
     }
 }
@@ -3363,6 +3543,11 @@ impl<D: crate::parser_documents::ParserDocument + ?Sized> core::ops::DerefMut fo
 impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> {
     fn complete_open_element(&mut self, node: NodeId) {
         self.document.record_parser_element_completion(node);
+        if matches!(self.document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select") {
+            if let Err(failure) = self.refresh_select_content(node) {
+                if self.completion_error.is_none() { self.completion_error = Some(failure); }
+            }
+        }
         // HTML's foreign-content stack uses a different tokenizer tag for
         // SVG style elements. Their stylesheet lifecycle still runs when the
         // actual element is popped, including recovery and EOF pops.
@@ -3410,10 +3595,14 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         if parent != html && Some(parent) != self.head && parent != self.body { return Ok(()); }
         if self.scaffold_attached & 1 == 0 {
             let root = self.document.root();
-            if self.pending_element.as_ref().is_some_and(|pending| pending.node == html) {
-                self.pending_element.as_mut().unwrap().insertion = Some((root, None));
-            } else { insert_at_adjusted_location(self.document, root, html, None).map_err(|e| dom_error(self.pos, e))?; }
-            self.scaffold_attached |= 1;
+            if self.root_has_child(false, true) {
+                self.scaffold_attached |= 1;
+            } else {
+                if self.pending_element.as_ref().is_some_and(|pending| pending.node == html) {
+                    self.pending_element.as_mut().unwrap().insertion = Some((root, None));
+                } else { insert_at_adjusted_location(self.document, root, html, None).map_err(|e| dom_error(self.pos, e))?; }
+                self.scaffold_attached |= 1;
+            }
         }
         if Some(parent) == self.head || parent == self.body {
             if self.scaffold_attached & 2 == 0 {
@@ -3460,6 +3649,22 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             self.document.kind(open.id),
             Ok(NodeKind::Element {
                 namespace: Namespace::Html,
+                name,
+                ..
+            }) if name.as_str() == "script"
+        )
+        .then_some(open.id)
+    }
+
+    fn active_parser_script(&self) -> Option<NodeId> {
+        let open = *self.stack.last()?;
+        if open.tag == Tag::Script {
+            return self.active_html_parser_script();
+        }
+        matches!(
+            self.document.kind(open.id),
+            Ok(NodeKind::Element {
+                namespace: Namespace::Svg,
                 name,
                 ..
             }) if name.as_str() == "script"
@@ -3731,6 +3936,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         None
     }
     fn parent(&self) -> NodeId {
+        if self.frameset_mode && self.stack.is_empty() {
+            return self.html.unwrap_or(self.body);
+        }
         if self.html.is_none() && self.fragment_context == Some(Tag::Html) && self.stack.len() == 1
         {
             return self.body;
@@ -3853,7 +4061,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         let (parent, before) = self.insertion_location(self.parent(), self.parent_tag());
         let id = self
             .document
-            .create_unprefixed_at(parent, namespace, Name::new(element_name), attributes)
+            .create_unprefixed_at(parent, namespace.clone(), Name::new(element_name), attributes)
             .map_err(|e| dom_error(offset, e))?;
         for (name, uri) in foreign_namespaces {
             self.document
@@ -3871,6 +4079,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             });
         } else {
             self.complete_open_element(id);
+            if self.stop_after_script && namespace == Namespace::Svg && element_name == "script" {
+                self.yielded_script = Some(id);
+            }
         }
         Ok(())
     }
@@ -3961,7 +4172,10 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         matches_name
     }
 
-    fn foreign_end_tag(&mut self, name: &str) {
+    /// Returns true when the foreign-content steps consumed the token, and
+    /// false when they reached an HTML element and the token must be handled
+    /// by the HTML insertion mode.
+    fn foreign_end_tag(&mut self, name: &str) -> bool {
         for index in (0..self.stack.len()).rev() {
             let open = self.stack[index];
             match self.document.kind(open.id) {
@@ -3972,12 +4186,13 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 }) if *namespace != Namespace::Html => {
                     if open_name.eq_ignore_ascii_case(name) {
                         self.close_at(index);
-                        return;
+                        return true;
                     }
                 }
-                _ => return,
+                _ => return index == 0 && open.tag == Tag::Html,
             }
         }
+        true
     }
 
     fn at_fragment_context(&self) -> bool {
@@ -4114,7 +4329,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     | Tag::Tr
             ),
             Tag::Colgroup => {
-                if tag == Tag::Col {
+                if tag == Tag::Template {
+                    false
+                } else if tag == Tag::Col {
                     true
                 } else if tag == Tag::Colgroup {
                     self.close_open(Tag::Colgroup);
@@ -4418,7 +4635,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 self.close_at(index);
                 return;
             }
-            if boundary.contains(&tag) {
+            if boundary.contains(&tag) || self.foreign_scope_boundary(self.stack[index]) {
                 return;
             }
         }
@@ -4455,10 +4672,30 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         )
     }
 
+    /// MathML text integration points, `annotation-xml`, and SVG `foreignObject`,
+    /// `desc` and `title` end the scopes used by the tree builder.
+    fn foreign_scope_boundary(&self, open: Open) -> bool {
+        if open.tag != Tag::Other {
+            return false;
+        }
+        match self.document.kind(open.id) {
+            Ok(NodeKind::Element { namespace: Namespace::MathMl, name, .. }) => {
+                matches!(name.as_str(), "mi" | "mo" | "mn" | "ms" | "mtext" | "annotation-xml")
+            }
+            Ok(NodeKind::Element { namespace: Namespace::Svg, name, .. }) => {
+                matches!(name.as_str(), "foreignObject" | "desc" | "title")
+            }
+            _ => false,
+        }
+    }
+
     fn in_scope(&self, wanted: Tag) -> bool {
         for open in self.stack.iter().rev() {
             if open.tag == wanted {
                 return true;
+            }
+            if self.foreign_scope_boundary(*open) {
+                return false;
             }
             if matches!(
                 open.tag,
@@ -4483,7 +4720,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if open.tag == wanted {
                 return true;
             }
-            if boundary.contains(&open.tag) {
+            if boundary.contains(&open.tag) || self.foreign_scope_boundary(*open) {
                 return false;
             }
         }
@@ -4587,6 +4824,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     if self.conformance_tokens.is_some() {
  self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
  }
+                    if !text.is_empty() {
+                        self.reconstruct_formatting()?;
+                    }
                     self.append_text(text, self.pos)?;
                     self.pos = input.len();
                     continue;
@@ -4624,7 +4864,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             } else if rest.starts_with("</") {
                 let parser_script = self
                     .stop_after_script
-                    .then(|| self.active_html_parser_script())
+                    .then(|| self.active_parser_script())
                     .flatten();
                 self.end_tag()?;
                 if parser_script
@@ -4657,10 +4897,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if self.stack.last().is_some_and(|open| open.tag == Tag::Style) {
                 self.pop_open_element();
             }
-            if self.html.is_some() {
+            if self.html.is_some() && !self.frameset_mode {
                 self.ensure_scaffold(self.body)?;
             }
-            self.refresh_selected_content()?;
             // EOF completes remaining source-owned elements even when HTML's
             // stack remains open. The sink only records completion; native
             // loading is queued after this borrowed parser turn returns.
@@ -4712,37 +4951,73 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         Ok(())
     }
 
-    fn refresh_selected_content(&mut self) -> Result<(), ParseError> {
-        let mut pending = alloc::vec![self.body];
-        let mut selects = Vec::new();
+    fn refresh_select_content(&mut self, select: NodeId) -> Result<(), ParseError> {
+        if self
+            .document
+            .get_attribute_ns_ref(select, None, "multiple")
+            .map_err(|error| dom_error(self.pos, error))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let display_size = self
+            .document
+            .get_attribute_ns_ref(select, None, "size")
+            .map_err(|error| dom_error(self.pos, error))?
+            .and_then(|value| {
+                let digits = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+                let end = digits.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(digits.len());
+                digits[..end].parse::<usize>().ok()
+            })
+            .unwrap_or(1);
+        let mut pending = alloc::vec![select];
+        let mut selected = None;
+        let mut first_enabled = None;
+        let mut selected_content = Vec::new();
         while let Some(node) = pending.pop() {
-            if let Some(root) = self
-                .document
-                .shadow_root(node)
-                .map_err(|e| dom_error(self.pos, e))?
+            if node != select
+                && matches!(
+                    self.document.kind(node),
+                    Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
+                )
             {
-                pending.push(root);
-            }
-            if matches!(
-                self.document.kind(node),
-                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
-            ) {
-                selects.push(node);
-            }
-            let content = self
-                .document
-                .template_content(node)
-                .map_err(|error| dom_error(self.pos, error))?;
-            // A parser script can adopt associated template contents into a
-            // different arena. Their control state then belongs to that
-            // document's ordinary adoption/mutation hooks, not this parser's
-            // owner-local completion refresh.
-            if content.is_some_and(|content| content.document_id() != self.document.root().document_id()) {
                 continue;
+            }
+            match self.document.kind(node) {
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    name,
+                    attributes,
+                }) if name == "option" => {
+                    if attributes.iter().any(|(key, _)| key == "selected") {
+                        selected = Some(node);
+                    }
+                    if first_enabled.is_none() {
+                        let mut disabled = attributes.iter().any(|(key, _)| key == "disabled");
+                        if !disabled {
+                            if let Ok(Some(parent)) = self.document.parent(node) {
+                                disabled = matches!(
+                                    self.document.kind(parent),
+                                    Ok(NodeKind::Element { namespace: Namespace::Html, name, attributes })
+                                        if name == "optgroup" && attributes.iter().any(|(key, _)| key == "disabled")
+                                );
+                            }
+                        }
+                        if !disabled {
+                            first_enabled = Some(node);
+                        }
+                    }
+                }
+                Ok(NodeKind::Element {
+                    namespace: Namespace::Html,
+                    name,
+                    ..
+                }) if name == "selectedcontent" => selected_content.push(node),
+                _ => {}
             }
             let mut child = self
                 .document
-                .last_child(content.unwrap_or(node))
+                .last_child(node)
                 .map_err(|error| dom_error(self.pos, error))?;
             while let Some(id) = child {
                 pending.push(id);
@@ -4752,86 +5027,43 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     .map_err(|error| dom_error(self.pos, error))?;
             }
         }
-        for select in selects {
-            let mut pending = alloc::vec![select];
-            let mut options = Vec::new();
-            let mut selected_content = Vec::new();
-            while let Some(node) = pending.pop() {
-                if node != select
-                    && matches!(
-                        self.document.kind(node),
-                        Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "select"
-                    )
-                {
-                    continue;
-                }
-                match self.document.kind(node) {
-                    Ok(NodeKind::Element {
-                        namespace: Namespace::Html,
-                        name,
-                        attributes,
-                    }) if name == "option" => {
-                        let is_selected = attributes.iter().any(|(key, _)| key == "selected");
-                        options.push((node, is_selected));
-                    }
-                    Ok(NodeKind::Element {
-                        namespace: Namespace::Html,
-                        name,
-                        ..
-                    }) if name == "selectedcontent" => selected_content.push(node),
-                    _ => {}
-                }
-                let mut child = self
+        if selected_content.is_empty() {
+            return Ok(());
+        }
+        let source = selected.or_else(|| if display_size == 1 { first_enabled } else { None });
+        let mut source_children = Vec::new();
+        if let Some(source) = source {
+            let mut child = self
+                .document
+                .first_child(source)
+                .map_err(|error| dom_error(self.pos, error))?;
+            while let Some(id) = child {
+                source_children.push(id);
+                child = self
                     .document
-                    .last_child(node)
+                    .next_sibling(id)
                     .map_err(|error| dom_error(self.pos, error))?;
-                while let Some(id) = child {
-                    pending.push(id);
-                    child = self
-                        .document
-                        .previous_sibling(id)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
             }
-            let source = options
-                .iter()
-                .find(|(_, selected)| *selected)
-                .or_else(|| options.first())
-                .map(|(id, _)| *id);
-            let mut source_children = Vec::new();
-            if let Some(source) = source {
-                let mut child = self
-                    .document
-                    .first_child(source)
+        }
+        for target in selected_content {
+            while let Some(child) = self
+                .document
+                .first_child(target)
+                .map_err(|error| dom_error(self.pos, error))?
+            {
+                self.document
+                    .detach(child)
                     .map_err(|error| dom_error(self.pos, error))?;
-                while let Some(id) = child {
-                    source_children.push(id);
-                    child = self
-                        .document
-                        .next_sibling(id)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
+                self.document
+                    .destroy_subtree(child)
+                    .map_err(|error| dom_error(self.pos, error))?;
             }
-            for target in selected_content {
-                while let Some(child) = self
+            for child in &source_children {
+                let clone = self
                     .document
-                    .first_child(target)
-                    .map_err(|error| dom_error(self.pos, error))?
-                {
-                    self.document
-                        .detach(child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                    self.document
-                        .destroy_subtree(child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                }
-                for child in &source_children {
-                    let clone = self
-                        .document
-                        .clone_subtree(*child)
-                        .map_err(|error| dom_error(self.pos, error))?;
-                    self.append(target, clone)?;
-                }
+                    .clone_subtree(*child)
+                    .map_err(|error| dom_error(self.pos, error))?;
+                self.append(target, clone)?;
             }
         }
         Ok(())
@@ -4973,6 +5205,20 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         Ok(())
     }
 
+    fn root_has_child(&self, doctype: bool, element: bool) -> bool {
+        let root = self.document.root();
+        let mut child = self.document.first_child(root).ok().flatten();
+        while let Some(id) = child {
+            match self.document.kind(id) {
+                Ok(NodeKind::DocumentType(_)) if doctype => return true,
+                Ok(NodeKind::Element { .. }) if element => return true,
+                _ => {}
+            }
+            child = self.document.next_sibling(id).ok().flatten();
+        }
+        false
+    }
+
     fn doctype(&mut self) -> Result<(), ParseError> {
         let start = self.pos;
         let bytes = self.input.as_bytes();
@@ -4989,6 +5235,10 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             return Ok(());
         }
         self.doctype_allowed = false;
+        if self.root_has_child(true, true) {
+            self.pos = (end + if terminated { 1 } else { 0 }).min(self.input.len());
+            return Ok(());
+        }
         self.document
             .set_document_mode(document_mode_for_doctype(&doctype));
         let id = self
@@ -5046,6 +5296,19 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
  self.emit_conformance_token(ConformanceToken::EndTag(name.to_string()));
  }
         let tag = Tag::classify(&name);
+        if self.frameset_mode {
+            if tag == Tag::Frameset && self.stack.last().is_some_and(|open| open.tag == Tag::Frameset) {
+                self.pop_open_element();
+                return Ok(());
+            }
+            if tag == Tag::Html && self.stack.is_empty() {
+                self.document_tail = 3;
+                return Ok(());
+            }
+            if tag != Tag::Noframes {
+                return Ok(());
+            }
+        }
         let namespace = self.adjusted_current_namespace();
         if namespace != Namespace::Html && self.close_matching_integration_point(&name) {
             return Ok(());
@@ -5053,8 +5316,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         if namespace != Namespace::Html && !self.current_foreign_integration_point() {
             if matches!(name.as_ref(), "br" | "p") {
                 self.pop_foreign_for_html();
-            } else {
-                self.foreign_end_tag(&name);
+            } else if self.foreign_end_tag(&name) {
                 return Ok(());
             }
         }
@@ -5127,9 +5389,11 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             }
             Tag::P => {
                 let boundary = [
+                    Tag::Applet,
                     Tag::Button,
                     Tag::Caption,
                     Tag::Html,
+                    Tag::Marquee,
                     Tag::Object,
                     Tag::Table,
                     Tag::Td,
@@ -5220,11 +5484,37 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 self.close_other(&name);
             }
             _ if tag.is_formatting() => self.end_formatting(tag)?,
+            _ if tag.end_requires_scope() => {
+                if self.in_scope(tag) {
+                    self.close_open(tag);
+                }
+            }
+            _ if !tag.is_special() => self.close_unless_special_between(tag),
             _ => {
                 self.close_open(tag);
             }
         }
         Ok(())
+    }
+
+    /// The "any other end tag" steps: match the nearest open element of this
+    /// type, but give up when a special element is reached first.
+    fn close_unless_special_between(&mut self, tag: Tag) {
+        let boundary = self
+            .stack
+            .iter()
+            .rposition(|open| open.tag == Tag::Template)
+            .unwrap_or(0);
+        for index in (boundary..self.stack.len()).rev() {
+            let open = self.stack[index];
+            if open.tag == tag {
+                self.close_at(index);
+                return;
+            }
+            if open.tag.is_special() || self.foreign_scope_boundary(open) {
+                return;
+            }
+        }
     }
 
     fn start_tag(&mut self) -> Result<(), ParseError> {
@@ -5320,6 +5610,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 }
             }
         }
+        if self.frameset_start_tag(tag, &name, &attributes, start)? {
+            return Ok(());
+        }
         if let Some(context) = self.fragment_context {
             if matches!(tag, Tag::Html | Tag::Head | Tag::Body) && context != Tag::Html {
                 return Ok(());
@@ -5408,6 +5701,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     return Ok(());
                 }
                 Tag::Body => {
+                    self.frameset_ok = false;
                     self.merge_scaffold_attributes(self.body, attributes)?;
                     self.ensure_scaffold(self.body)?;
                     self.in_head = false;
@@ -5600,6 +5894,13 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         if self.fragment_context == Some(Tag::Select) && tag == Tag::Select {
             return Ok(());
         }
+        if self.fragment_context == Some(Tag::Select)
+            && tag == Tag::Input
+            && self.active_select().is_none()
+            && self.stack.iter().skip(1).all(|open| matches!(open.tag, Tag::Option | Tag::Optgroup))
+        {
+            return Ok(());
+        }
         if let Some(select) = self.active_select() {
             let starts_custom_content =
                 !self.select_is_custom(select) && Self::custom_select_content_tag(tag);
@@ -5621,6 +5922,14 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 Tag::Select => {
                     self.close_open(Tag::Select);
                     return Ok(());
+                }
+                Tag::Input
+                    if self.stack[select_stack_index(&self.stack, select)..]
+                        .iter()
+                        .skip(1)
+                        .all(|open| matches!(open.tag, Tag::Option | Tag::Optgroup)) =>
+                {
+                    self.close_open(Tag::Select);
                 }
                 Tag::Script | Tag::Template => {}
                 _ => {}
@@ -5698,19 +6007,19 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             Tag::Li => self.close_in_scope(&[Tag::Li], &[Tag::Ol, Tag::Ul]),
             Tag::Dt | Tag::Dd => self.close_in_scope(&[Tag::Dt, Tag::Dd], &[Tag::Dl]),
             Tag::Tbody | Tag::Thead | Tag::Tfoot => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Table]);
-                self.close_in_scope(&[Tag::Tr], &[Tag::Table]);
-                self.close_in_scope(&[Tag::Tbody, Tag::Thead, Tag::Tfoot], &[Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tr], &[Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tbody, Tag::Thead, Tag::Tfoot], &[Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[Tag::Table]);
             }
             Tag::Tr => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table]);
-                self.close_in_scope(&[Tag::Tr], &[Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tr], &[Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[Tag::Table, Tag::Tbody, Tag::Thead, Tag::Tfoot]);
                 self.imply_tbody(start)?;
             }
             Tag::Td | Tag::Th => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[
                     Tag::Table,
                     Tag::Tbody,
@@ -5753,7 +6062,25 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             _ => {}
         }
         let formatting = tag.is_formatting();
-        if formatting || !tag.is_special() || matches!(tag, Tag::Img | Tag::Br | Tag::Input) {
+        if formatting
+            || (!tag.is_special() && !matches!(name.as_ref(), "basefont" | "bgsound"))
+            || matches!(
+                tag,
+                Tag::Img
+                    | Tag::Br
+                    | Tag::Input
+                    | Tag::Applet
+                    | Tag::Marquee
+                    | Tag::Object
+                    | Tag::Button
+                    | Tag::Embed
+                    | Tag::Area
+                    | Tag::Select
+                    | Tag::Xmp
+                    | Tag::Keygen
+                    | Tag::Wbr
+            )
+        {
             self.reconstruct_formatting()?;
         }
         let marker = tag.is_marker();
@@ -5777,7 +6104,8 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             && attributes
                 .iter()
                 .any(|(key, value)| key == "type" && value.eq_ignore_ascii_case("hidden")));
-        let form_in_table = tag == Tag::Form && self.table_insertion_mode() == Some(Tag::Table);
+        let form_in_table = tag == Tag::Form
+            && matches!(self.table_insertion_mode(), Some(Tag::Table | Tag::Tbody | Tag::Thead | Tag::Tfoot | Tag::Tr));
         let (parent, before) = if allowed_in_table || form_in_table {
             (self.content_of(self.parent(), self.parent_tag()), None)
         } else {
@@ -5938,6 +6266,128 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         Ok(())
     }
 
+    /// Frameset handling for start tags; returns true when the token is
+    /// consumed, otherwise records frameset-ok bookkeeping and lets the
+    /// generic insertion continue.
+    fn frameset_start_tag(
+        &mut self,
+        tag: Tag,
+        name: &str,
+        attributes: &[(Name, String)],
+        start: usize,
+    ) -> Result<bool, ParseError> {
+        let document_parse = self.html.is_some() && self.fragment_context.is_none();
+        let ignoring_fragment = self
+            .fragment_context
+            .is_some_and(|context| !matches!(context, Tag::Html | Tag::Frameset));
+        if self.frameset_mode {
+            self.frameset_mode_start_tag(tag, name, attributes, start)?;
+            return Ok(true);
+        }
+        if self.fragment_context == Some(Tag::Frameset)
+            && !matches!(tag, Tag::Frame | Tag::Frameset | Tag::Noframes)
+        {
+            return Ok(true);
+        }
+        if matches!(tag, Tag::Frame | Tag::Frameset) && (ignoring_fragment || document_parse) {
+            if document_parse {
+                self.html_started = true;
+                self.doctype_allowed = false;
+            }
+            if tag == Tag::Frameset
+                && document_parse
+                && self.template_modes.is_empty()
+                && (!self.body_started || self.frameset_ok)
+            {
+                self.begin_frameset(attributes, start)?;
+            }
+            return Ok(true);
+        }
+        if document_parse && self.template_modes.is_empty() {
+            let clears = match tag {
+                Tag::Li | Tag::Dd | Tag::Dt | Tag::Plaintext | Tag::Button | Tag::Applet
+                | Tag::Marquee | Tag::Object | Tag::Table | Tag::Area | Tag::Br | Tag::Embed
+                | Tag::Img | Tag::Keygen | Tag::Wbr | Tag::Hr | Tag::Textarea | Tag::Xmp
+                | Tag::Iframe | Tag::Noembed | Tag::Select => true,
+                Tag::Input => !attributes
+                    .iter()
+                    .any(|(key, value)| key == "type" && value.eq_ignore_ascii_case("hidden")),
+                Tag::Template => self.body_started,
+                _ => false,
+            };
+            if clears {
+                self.frameset_ok = false;
+            }
+        }
+        Ok(false)
+    }
+
+    fn begin_frameset(&mut self, attributes: &[(Name, String)], start: usize) -> Result<(), ParseError> {
+        let Some(head) = self.head.filter(|_| self.html.is_some()) else { return Ok(()); };
+        self.truncate_open_elements(0);
+        self.formatting.clear();
+        self.form_element = None;
+        if self.scaffold_attached & 4 != 0 {
+            self.document.detach(self.body).map_err(|failure| dom_error(start, failure))?;
+            self.scaffold_attached &= !4;
+        }
+        self.ensure_scaffold(head)?;
+        self.html_started = true;
+        self.doctype_allowed = false;
+        self.in_head = false;
+        self.after_head = false;
+        self.body_started = true;
+        self.document_tail = 0;
+        self.frameset_mode = true;
+        self.insert_frameset_element("frameset", Tag::Frameset, attributes, start, true)
+    }
+
+    fn frameset_mode_start_tag(
+        &mut self,
+        tag: Tag,
+        name: &str,
+        attributes: &[(Name, String)],
+        start: usize,
+    ) -> Result<(), ParseError> {
+        let in_frameset = !self.stack.is_empty();
+        match tag {
+            Tag::Html => {
+                if let Some(html) = self.html {
+                    self.merge_scaffold_attributes(html, attributes.to_vec())?;
+                }
+                Ok(())
+            }
+            Tag::Frameset if in_frameset => self.insert_frameset_element(name, tag, attributes, start, true),
+            Tag::Frame if in_frameset => self.insert_frameset_element(name, tag, attributes, start, false),
+            Tag::Noframes => self.insert_frameset_element(name, tag, attributes, start, true),
+            _ => Ok(()),
+        }
+    }
+
+    fn insert_frameset_element(
+        &mut self,
+        name: &str,
+        tag: Tag,
+        attributes: &[(Name, String)],
+        start: usize,
+        push: bool,
+    ) -> Result<(), ParseError> {
+        let parent = self.parent();
+        let id = self
+            .document
+            .create_unprefixed_at(parent, Namespace::Html, Name::new(name), attributes.to_vec())
+            .map_err(|failure| dom_error(start, failure))?;
+        let registry_context = self.registry_context(parent);
+        self.document
+            .record_parser_element_birth(id, registry_context, self.html.is_some())
+            .map_err(|failure| dom_error(start, failure))?;
+        self.insert_token_element(parent, id, None)?;
+        if push {
+            self.stack.push(Open { id, tag });
+        }
+        Ok(())
+    }
+
     fn imply_tbody(&mut self, offset: usize) -> Result<(), ParseError> {
         if self.parent_tag() == Tag::Table
             || (self.parent_tag() == Tag::Template
@@ -5989,6 +6439,16 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         };
         let raw = raw.as_ref();
         let whitespace = raw.bytes().all(|byte| byte.is_ascii_whitespace());
+        if self.frameset_mode && self.stack.last().is_none_or(|open| open.tag != Tag::Noframes) {
+            let spaces: String = decode_text(raw, predecoded)
+                .chars()
+                .filter(|character| matches!(character, ' ' | '\t' | '\n' | '\x0c' | '\r'))
+                .collect();
+            return self.append_text(Cow::Owned(spaces), start);
+        }
+        if !whitespace && self.template_modes.is_empty() {
+            self.frameset_ok = false;
+        }
         if self.template_modes.last() == Some(&TemplateMode::InColumnGroup) && !whitespace {
             return Ok(());
         }
@@ -6021,6 +6481,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     content = &content[split..];
                 }
             } else if self.after_head {
+                if let Some(head) = self.head {
+                    self.ensure_scaffold(head)?;
+                }
                 if whitespace {
                     return self.append_text_at(
                         decode_text(content, predecoded),

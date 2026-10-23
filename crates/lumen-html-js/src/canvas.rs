@@ -24,6 +24,8 @@ use std::{
 };
 use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Path, PathBuilder, Rect, Transform};
 
+#[path = "canvas_extended.rs"]
+mod canvas_extended;
 #[path = "canvas_path.rs"]
 mod canvas_path;
 #[path = "canvas_text_metrics.rs"]
@@ -173,6 +175,8 @@ struct CanvasTextState {
     direction: String,
     letter_spacing: f32,
     word_spacing: f32,
+    letter_spacing_text: Option<(f32, String)>,
+    word_spacing_text: Option<(f32, String)>,
     font_kerning: CanvasFontKerning,
     font_variant_caps: CanvasFontVariantCaps,
     text_rendering: CanvasTextRendering,
@@ -248,6 +252,8 @@ impl Default for CanvasTextState {
             direction: "inherit".into(),
             letter_spacing: 0.0,
             word_spacing: 0.0,
+            letter_spacing_text: None,
+            word_spacing_text: None,
             font_kerning: CanvasFontKerning::Auto,
             font_variant_caps: CanvasFontVariantCaps::Normal,
             text_rendering: CanvasTextRendering::Auto,
@@ -320,6 +326,11 @@ struct CanvasExtras {
     saved_fill_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     saved_stroke_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     saved_text: Vec<LazyText>,
+    fill_extended: Option<([u8; 4], [f32; 3])>,
+    extended: canvas_extended::ExtendedPixels,
+    fill_color_text: Option<([u8; 4], String)>,
+    stroke_color_text: Option<([u8; 4], String)>,
+    shadow_color_text: Option<([u8; 4], String)>,
 }
 
 impl Default for CanvasExtras {
@@ -333,6 +344,11 @@ impl Default for CanvasExtras {
             gpu_generation: 0,
             gpu_snapshot_revision: 0,
             pending_error: None,
+            fill_extended: None,
+            extended: canvas_extended::ExtendedPixels::default(),
+            fill_color_text: None,
+            stroke_color_text: None,
+            shadow_color_text: None,
             fill_gradient_value: None,
             stroke_gradient_value: None,
             fill_pattern_value: None,
@@ -395,6 +411,16 @@ impl CanvasColorSpace {
             "srgb-linear" => Some(Self::SrgbLinear),
             "display-p3-linear" => Some(Self::DisplayP3Linear),
             _ => None,
+        }
+    }
+
+    fn working(self) -> lumen_common::color::ColorSpace {
+        use lumen_common::color::ColorSpace;
+        match self {
+            Self::Srgb => ColorSpace::Srgb,
+            Self::DisplayP3 => ColorSpace::DisplayP3,
+            Self::SrgbLinear => ColorSpace::SrgbLinear,
+            Self::DisplayP3Linear => ColorSpace::DisplayP3Linear,
         }
     }
 
@@ -672,6 +698,20 @@ impl CanvasData {
         self.extras.get_or_insert_with(Default::default)
     }
 
+    fn color_text(&self, pick: fn(&CanvasExtras) -> &Option<([u8; 4], String)>) -> Option<&([u8; 4], String)> {
+        self.extras.as_deref().and_then(|extras| pick(extras).as_ref())
+    }
+
+    fn set_color_text(&mut self, pick: fn(&mut CanvasExtras) -> &mut Option<([u8; 4], String)>, text: Option<([u8; 4], String)>) {
+        if text.is_some() || self.extras.is_some() {
+            *pick(self.extras_mut()) = text;
+        }
+    }
+
+    fn fill_extended(&self) -> Option<([u8; 4], [f32; 3])> {
+        self.extras.as_deref()?.fill_extended
+    }
+
     fn bitmap_output(&self) -> Option<&Rgba8Image> {
         self.extras.as_deref()?.bitmap_output.as_ref()
     }
@@ -935,6 +975,156 @@ impl CanvasData {
         if self.context_mode == Some("2d") && !self.alpha {
             make_image_opaque(&mut image.pixels);
         }
+        image
+    }
+
+    /// Converts canvas-space bytes of the region at `origin` into `to`, using the exact values
+    /// of a float16 canvas where it recorded them.
+    fn convert_region(&self, image: &mut Rgba8Image, origin: (i64, i64), to: CanvasColorSpace) {
+        match self.extras.as_deref().filter(|extras| !extras.extended.is_empty()) {
+            None => convert_image_space(image, self.color_space, to),
+            Some(extras) => extras.extended.convert(image, self.surface.dimensions(), origin, self.color_space, to),
+        }
+    }
+
+    /// The bitmap re-encoded for image export, and the non-linear space it is now expressed in.
+    fn export_image(&self, mut image: Rgba8Image) -> (Rgba8Image, CanvasColorSpace) {
+        let target = if is_display_p3_family(self.color_space) { CanvasColorSpace::DisplayP3 } else { CanvasColorSpace::Srgb };
+        self.convert_region(&mut image, (0, 0), target);
+        (image, target)
+    }
+
+    fn record_extended_put(
+        &mut self,
+        source: &Rgba8Image,
+        stored: &Rgba8Image,
+        from: CanvasColorSpace,
+        offset: (i64, i64),
+        dirty: (i64, i64, i64, i64),
+    ) {
+        let dimensions = self.surface.dimensions();
+        let (dirty_x, dirty_y, dirty_width, dirty_height) = dirty;
+        for row in dirty_y..dirty_y + dirty_height {
+            for column in dirty_x..dirty_x + dirty_width {
+                let (x, y) = (offset.0 + column, offset.1 + row);
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let index = (row as usize * source.width as usize + column as usize) * 4;
+                let (Some(input), Some(output)) = (source.pixels.get(index..index + 4), stored.pixels.get(index..index + 4)) else {
+                    continue;
+                };
+                let rgb = lumen_common::pixel_color::convert_rgb_f32(
+                    [f32::from(input[0]) / 255.0, f32::from(input[1]) / 255.0, f32::from(input[2]) / 255.0],
+                    from.working(),
+                    self.color_space.working(),
+                );
+                self.extras_mut().extended.record(dimensions, x as u32, y as u32, [output[0], output[1], output[2], output[3]], rgb);
+            }
+        }
+    }
+
+    /// The device rectangle a draw covers and the source rectangle (in source pixels) it
+    /// samples; `None` when the transform is not axis aligned or the draw uses a pattern.
+    fn extended_draw_rects(&self, geometry: &SourceGeometry) -> Option<([f64; 4], [f64; 4])> {
+        let (source, dest) = match *geometry {
+            SourceGeometry::Scaled { x, y, width, height } => (None, [x, y, width, height]),
+            SourceGeometry::Crop { sx, sy, sw, sh, dx, dy, dw, dh } => (Some([sx, sy, sw, sh]), [dx, dy, dw, dh]),
+        };
+        let state = self.surface.state();
+        let transform = state.transform;
+        if transform.kx != 0.0
+            || transform.ky != 0.0
+            || state.alpha != 1.0
+            || state.blend != BlendMode::SourceOver
+            || state.shadow_color[3] != 0
+        {
+            return None;
+        }
+        let edge = |origin: f32, size: f32, scale: f32, shift: f32| {
+            let a = f64::from(scale) * f64::from(origin) + f64::from(shift);
+            let b = f64::from(scale) * f64::from(origin + size) + f64::from(shift);
+            (a.min(b), a.max(b))
+        };
+        let (x0, x1) = edge(dest[0], dest[2], transform.sx, transform.tx);
+        let (y0, y1) = edge(dest[1], dest[3], transform.sy, transform.ty);
+        let source = source.map_or([0.0; 4], |rect| rect.map(f64::from));
+        Some(([x0, y0, x1, y1], source))
+    }
+
+    fn record_extended_draw(&mut self, native: &Rgba8Image, space: CanvasColorSpace, rects: ([f64; 4], [f64; 4])) {
+        let ([x0, y0, x1, y1], crop) = rects;
+        let (source_x, source_y, source_width, source_height) = if crop[2] > 0.0 && crop[3] > 0.0 {
+            (crop[0], crop[1], crop[2], crop[3])
+        } else {
+            (0.0, 0.0, f64::from(native.width), f64::from(native.height))
+        };
+        let dimensions = self.surface.dimensions();
+        if !(x1 > x0 && y1 > y0) || !(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite()) {
+            return;
+        }
+        let first_x = x0.ceil().max(0.0) as i64;
+        let last_x = x1.floor().min(f64::from(dimensions.0)) as i64;
+        let first_y = y0.ceil().max(0.0) as i64;
+        let last_y = y1.floor().min(f64::from(dimensions.1)) as i64;
+        for y in first_y..last_y {
+            let v = (y as f64 + 0.5 - y0) / (y1 - y0);
+            let row = ((source_y + v * source_height).floor() as i64).clamp(0, i64::from(native.height) - 1);
+            for x in first_x..last_x {
+                let u = (x as f64 + 0.5 - x0) / (x1 - x0);
+                let column = ((source_x + u * source_width).floor() as i64).clamp(0, i64::from(native.width) - 1);
+                let index = (row as usize * native.width as usize + column as usize) * 4;
+                let Some(pixel) = native.pixels.get(index..index + 4) else {
+                    continue;
+                };
+                let mut stored = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                lumen_common::pixel_color::convert_rgba8(&mut stored, space.working(), self.color_space.working());
+                let rgb = lumen_common::pixel_color::convert_rgb_f32(
+                    [f32::from(pixel[0]) / 255.0, f32::from(pixel[1]) / 255.0, f32::from(pixel[2]) / 255.0],
+                    space.working(),
+                    self.color_space.working(),
+                );
+                self.extras_mut().extended.record(dimensions, x as u32, y as u32, stored, rgb);
+            }
+        }
+    }
+
+    fn record_extended_fill(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        let Some((bytes, rgb)) = self.fill_extended() else {
+            return;
+        };
+        if !self.float16_color_type {
+            return;
+        }
+        let state = self.surface.state();
+        let transform = state.transform;
+        if state.fill != bytes
+            || state.fill_gradient.is_some()
+            || state.fill_pattern.is_some()
+            || state.alpha != 1.0
+            || state.blend != BlendMode::SourceOver
+            || transform.kx != 0.0
+            || transform.ky != 0.0
+        {
+            return;
+        }
+        let edge = |origin: f64, size: f64, scale: f32, shift: f32| {
+            let a = f64::from(scale) * origin + f64::from(shift);
+            let b = f64::from(scale) * (origin + size) + f64::from(shift);
+            (a.min(b).ceil(), a.max(b).floor())
+        };
+        let (x0, x1) = edge(x, width, transform.sx, transform.tx);
+        let (y0, y1) = edge(y, height, transform.sy, transform.ty);
+        if ![x0, x1, y0, y1].iter().all(|value| value.is_finite()) {
+            return;
+        }
+        let dimensions = self.surface.dimensions();
+        self.extras_mut().extended.record_rect(dimensions, x0 as i64, y0 as i64, x1 as i64, y1 as i64, bytes, rgb);
+    }
+
+    fn display_snapshot(&mut self) -> Rgba8Image {
+        let mut image = self.snapshot();
+        convert_image_space(&mut image, self.color_space, CanvasColorSpace::Srgb);
         image
     }
 
@@ -1363,7 +1553,7 @@ impl CanvasRegistry {
                 if let Some(error) = data.pending_error() {
                     errors.push(error.clone());
                 }
-                updates.push((node, data.snapshot(), data.transferred));
+                updates.push((node, data.display_snapshot(), data.transferred));
             }
         }
         for (node, image, transferred) in updates {
@@ -1477,6 +1667,10 @@ fn offscreen_surface(width: u64, height: u64) -> OpResult<(CanvasSurface, bool)>
         Ok(surface) => Ok((surface, true)),
         Err(_) => Ok((empty_surface()?, false)),
     }
+}
+
+fn convert_image_space(image: &mut Rgba8Image, from: CanvasColorSpace, to: CanvasColorSpace) {
+    lumen_common::pixel_color::convert_rgba8(&mut image.pixels, from.working(), to.working());
 }
 
 fn make_image_opaque(pixels: &mut [u8]) {
@@ -1631,7 +1825,7 @@ fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &mut Canvas
         realm.canvases.queue_publish(node);
         return Ok(());
     }
-    let image = image_data(data.snapshot());
+    let image = image_data(data.display_snapshot());
     realm
         .session
         .borrow_mut()
@@ -1722,6 +1916,11 @@ impl CanvasPath {
                         builder.line_to(x + width, y + height);
                         builder.line_to(x, y + height);
                         builder.close();
+                        has_subpath = true;
+                        current = (x, y);
+                        subpath_start = current;
+                    } else if finite && width == 0.0 && height == 0.0 {
+                        builder.move_to(x, y);
                         has_subpath = true;
                         current = (x, y);
                         subpath_start = current;
@@ -2295,7 +2494,8 @@ impl DomCanvasElement {
             return Ok("data:,".to_owned());
         }
         let quality = canvas_export_quality(ctx, quality)?;
-        let (bytes, mime) = lumen_html_image::encode_canvas_image(&image, image_type, quality)
+        let (image, space) = data.borrow().export_image(image);
+        let (bytes, mime) = encode_canvas_export(image, space, image_type, quality)
             .map_err(|_| OpError::new("EncodingError", "canvas image encoding failed"))?;
         let encoded = lumen_common::codec::base64_encode(&bytes, false, true);
         Ok(format!("data:{mime};base64,{encoded}"))
@@ -2323,7 +2523,8 @@ impl DomCanvasElement {
             return Ok(Value::Undefined);
         }
         let quality = canvas_export_quality(ctx, quality)?;
-        let blob = canvas_blob(ctx, &image, image_type, quality)?;
+        let (image, space) = data.borrow().export_image(image);
+        let blob = canvas_blob(ctx, image, space, image_type, quality)?;
         queue_canvas_blob_callback(ctx, callback, blob)?;
         Ok(Value::Undefined)
     }
@@ -2346,13 +2547,35 @@ fn canvas_export_quality(ctx: &mut Ctx, quality: Option<Value>) -> OpResult<Opti
     Ok((quality.is_finite() && (0.0..=1.0).contains(&quality)).then_some(quality))
 }
 
+/// Encodes a canvas bitmap; Display P3 canvases keep their gamut through an embedded profile
+/// and linear canvases are re-encoded with the sRGB or Display P3 transfer curve.
+fn encode_canvas_export(
+    mut image: Rgba8Image,
+    space: CanvasColorSpace,
+    image_type: Option<&str>,
+    quality: Option<f64>,
+) -> Result<(Vec<u8>, &'static str), lumen_html_image::ImageError> {
+    match space {
+        CanvasColorSpace::Srgb => lumen_html_image::encode_canvas_image(&image, image_type, quality),
+        CanvasColorSpace::SrgbLinear => {
+            convert_image_space(&mut image, space, CanvasColorSpace::Srgb);
+            lumen_html_image::encode_canvas_image(&image, image_type, quality)
+        }
+        CanvasColorSpace::DisplayP3 | CanvasColorSpace::DisplayP3Linear => {
+            convert_image_space(&mut image, space, CanvasColorSpace::DisplayP3);
+            lumen_html_image::encode_canvas_image_display_p3(&image, image_type, quality)
+        }
+    }
+}
+
 fn canvas_blob(
     ctx: &mut Ctx,
-    image: &Rgba8Image,
+    image: Rgba8Image,
+    space: CanvasColorSpace,
     image_type: Option<&str>,
     quality: Option<f64>,
 ) -> OpResult<Value> {
-    let (bytes, mime) = lumen_html_image::encode_canvas_image(image, image_type, quality)
+    let (bytes, mime) = encode_canvas_export(image, space, image_type, quality)
         .map_err(|_| OpError::new("EncodingError", "canvas image encoding failed"))?;
     Ok(lumen_host::blob::new_blob(ctx, bytes, &mime))
 }
@@ -2504,6 +2727,7 @@ impl DomOffscreenCanvas {
     fn transfer_to_image_bitmap(&self, ctx: &mut Ctx) -> OpResult<Value> {
         self.ensure_attached()?;
         let image = CanvasData::snapshot_for_read(&self.data)?;
+        let color_space = self.data.borrow().color_space;
         let (image, origin_clean) = {
             let mut data = self.data.borrow_mut();
             data.set_bitmap_output(None);
@@ -2513,7 +2737,7 @@ impl DomOffscreenCanvas {
             data.origin_clean = true;
             (image, origin_clean)
         };
-        new_image_bitmap_with_origin(ctx, image, true, origin_clean)
+        new_image_bitmap_in_space(ctx, image, true, origin_clean, color_space)
     }
 
     #[method(name = "convertToBlob")]
@@ -2544,7 +2768,8 @@ impl DomOffscreenCanvas {
             .transpose()
             .map_err(|_| OpError::new("TypeError", "convertToBlob quality getter failed"))?;
         let quality = canvas_export_quality(ctx, quality)?;
-        let blob = canvas_blob(ctx, &image, image_type.as_deref(), quality)?;
+        let (image, space) = self.data.borrow().export_image(image);
+        let blob = canvas_blob(ctx, image, space, image_type.as_deref(), quality)?;
         let promise = ctx
             .get_member(&ctx.global_object(), "Promise")
             .map_err(|_| OpError::new("Error", "Promise is unavailable"))?;
@@ -2851,11 +3076,12 @@ impl DomImageBitmapRenderingContext {
                 .instance_data::<DomImageBitmap>(&bitmap)
                 .ok_or_else(|| OpError::new("TypeError", "expected an ImageBitmap or null"))?;
             let bitmap = bitmap.borrow();
-            let image = bitmap
+            let mut image = bitmap
                 .image
                 .borrow_mut()
                 .take()
                 .ok_or_else(|| OpError::new("InvalidStateError", "ImageBitmap is detached"))?;
+            convert_image_space(&mut image, bitmap.color_space, CanvasColorSpace::Srgb);
             (Some(image), bitmap.origin_clean)
         };
         let mut data = self.data.borrow_mut();
@@ -2961,19 +3187,61 @@ macro_rules! impl_canvas_2d_methods {
                 }
             }
             #[getter]
+            fn filter(&self) -> String {
+                self.data
+                    .borrow()
+                    .surface
+                    .state()
+                    .filter
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |filter| filter.text.to_string())
+            }
+            #[setter]
+            fn set_filter(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
+                let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
+                let text: &str = text.as_ref();
+                let size = self.data.borrow().text.size;
+                let current = current_canvas_color(&self.realm, self.node);
+                if let Some(parsed) = lumen_html::css::canvas_filter::parse_canvas_filter(text, current, size) {
+                    let mut data = self.data.borrow_mut();
+                    let state = data.surface.state_mut();
+                    if parsed.operations.is_empty() {
+                        state.filter = None;
+                    } else {
+                        state.filter = Some(std::sync::Arc::new(lumen_html_image::canvas::CanvasFilter {
+                            operations: parsed.operations,
+                            text: parsed.text.into(),
+                        }));
+                    }
+                }
+                Ok(())
+            }
+            #[getter]
             fn fill_style(&self) -> Value {
                 let data = self.data.borrow();
                 let (gradient, pattern, _) = data.fill_style_slots();
                 gradient
                     .or(pattern)
-                    .unwrap_or_else(|| Value::Str(color_string(data.surface.state().fill).into()))
+                    .unwrap_or_else(|| Value::Str(style_color_text(data.surface.state().fill, data.color_text(|extras| &extras.fill_color_text), data.color_space).into()))
             }
             #[setter]
             fn set_fill_style(&self, ctx: &mut Ctx, value: Value) {
+                let space = self.data.borrow().color_space;
                 if let Some(color) =
-                    parse_style_color(&value, current_canvas_color(&self.realm, self.node))
+                    parse_canvas_color(&value, current_canvas_color(&self.realm, self.node), space)
                 {
+                    let text = color_function_text(&value, current_canvas_color(&self.realm, self.node));
                     let mut data = self.data.borrow_mut();
+                    data.set_color_text(|extras| &mut extras.fill_color_text, text.map(|text| (color, text)));
+                    let exact = if data.float16_color_type {
+                        parse_canvas_color_exact(&value, current_canvas_color(&self.realm, self.node), space)
+                            .map(|(rgb, _)| (color, rgb))
+                    } else {
+                        None
+                    };
+                    if exact.is_some() || data.extras.is_some() {
+                        data.extras_mut().fill_extended = exact;
+                    }
                     data.surface.state_mut().fill = color;
                     data.surface.state_mut().fill_gradient = None;
                     data.surface.state_mut().fill_pattern = None;
@@ -2997,14 +3265,17 @@ macro_rules! impl_canvas_2d_methods {
                 let (gradient, pattern, _) = data.stroke_style_slots();
                 gradient
                     .or(pattern)
-                    .unwrap_or_else(|| Value::Str(color_string(data.surface.state().stroke).into()))
+                    .unwrap_or_else(|| Value::Str(style_color_text(data.surface.state().stroke, data.color_text(|extras| &extras.stroke_color_text), data.color_space).into()))
             }
             #[setter]
             fn set_stroke_style(&self, ctx: &mut Ctx, value: Value) {
+                let space = self.data.borrow().color_space;
                 if let Some(color) =
-                    parse_style_color(&value, current_canvas_color(&self.realm, self.node))
+                    parse_canvas_color(&value, current_canvas_color(&self.realm, self.node), space)
                 {
+                    let text = color_function_text(&value, current_canvas_color(&self.realm, self.node));
                     let mut data = self.data.borrow_mut();
+                    data.set_color_text(|extras| &mut extras.stroke_color_text, text.map(|text| (color, text)));
                     data.surface.state_mut().stroke = color;
                     data.surface.state_mut().stroke_gradient = None;
                     data.surface.state_mut().stroke_pattern = None;
@@ -3141,16 +3412,20 @@ macro_rules! impl_canvas_2d_methods {
             }
             #[getter]
             fn shadow_color(&self) -> String {
-                color_string(self.data.borrow().surface.state().shadow_color)
+                let data = self.data.borrow();
+                style_color_text(data.surface.state().shadow_color, data.color_text(|extras| &extras.shadow_color_text), data.color_space)
             }
             #[setter(coerce)]
             fn set_shadow_color(&self, value: &str) {
-                if let Some(color) = lumen_html::css::parse_animation_color(
-                    value,
-                    current_canvas_color(&self.realm, self.node),
-                ) {
-                    self.data.borrow_mut().surface.state_mut().shadow_color =
-                        [color.r, color.g, color.b, color.a];
+                let space = self.data.borrow().color_space;
+                let value = Value::Str(value.into());
+                if let Some(color) =
+                    parse_canvas_color(&value, current_canvas_color(&self.realm, self.node), space)
+                {
+                    let text = color_function_text(&value, current_canvas_color(&self.realm, self.node));
+                    let mut data = self.data.borrow_mut();
+                    data.set_color_text(|extras| &mut extras.shadow_color_text, text.map(|text| (color, text)));
+                    data.surface.state_mut().shadow_color = color;
                 }
             }
             #[getter]
@@ -3320,34 +3595,40 @@ macro_rules! impl_canvas_2d_methods {
             }
             #[getter]
             fn letter_spacing(&self) -> String {
-                css_spacing_string(self.data.borrow().text.letter_spacing)
+                let data = self.data.borrow();
+                spacing_text(data.text.letter_spacing, &data.text.letter_spacing_text)
             }
             #[setter(coerce)]
-            fn set_letter_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+            fn set_letter_spacing(&self, ctx: &mut Ctx, text_value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
                 let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
                 let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
-                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
-                    self.data.borrow_mut().text.letter_spacing = value;
+                if let Some(value) = parse_css_spacing(text_value,text.size,root_size,[own,root]) {
+                    let mut data = self.data.borrow_mut();
+                    data.text.letter_spacing = value;
+                    data.text.letter_spacing_text = font_relative_spacing_text(text_value).map(|text| (value, text));
                 }
                 fonts.queue_demand_task(ctx)?;
                 Ok(())
             }
             #[getter]
             fn word_spacing(&self) -> String {
-                css_spacing_string(self.data.borrow().text.word_spacing)
+                let data = self.data.borrow();
+                spacing_text(data.text.word_spacing, &data.text.word_spacing_text)
             }
             #[setter(coerce)]
-            fn set_word_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+            fn set_word_spacing(&self, ctx: &mut Ctx, text_value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
                 let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
                 let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
-                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
-                    self.data.borrow_mut().text.word_spacing = value;
+                if let Some(value) = parse_css_spacing(text_value,text.size,root_size,[own,root]) {
+                    let mut data = self.data.borrow_mut();
+                    data.text.word_spacing = value;
+                    data.text.word_spacing_text = font_relative_spacing_text(text_value).map(|text| (value, text));
                 }
                 fonts.queue_demand_task(ctx)?;
                 Ok(())
@@ -3679,7 +3960,8 @@ macro_rules! impl_canvas_2d_methods {
                         .as_ref()
                         .to_owned(),
                 };
-                let source_image = match canvas_source_image(ctx, source.clone())? {
+                let canvas_space = self.data.borrow().color_space;
+                let source_image = match canvas_source_image_in(ctx, source.clone(), canvas_space)? {
                     Some(image) => image,
                     None => return Ok(Value::Null),
                 };
@@ -3727,16 +4009,29 @@ macro_rules! impl_canvas_2d_methods {
                 data.restore_styles();
                 Ok(())
             }
-            fn begin_layer(&self, options: Option<Value>) -> OpResult<()> {
+            fn begin_layer(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<()> {
                 if options
                     .as_ref()
                     .is_some_and(|value| !matches!(value, Value::Undefined | Value::Null | Value::Obj(_)))
                 {
                     return Err(OpError::type_error("beginLayer options must be an object"));
                 }
+                let mut layer_filter = None;
+                if let Some(options @ Value::Obj(_)) = &options {
+                    let value = ctx.member_get(options, "filter").map_err(OpError::thrown)?;
+                    if !matches!(value, Value::Undefined) {
+                        let text = ctx.coerce_string(&value).map_err(OpError::thrown)?;
+                        let text: &str = text.as_ref();
+                        let size = self.data.borrow().text.size;
+                        let current = current_canvas_color(&self.realm, self.node);
+                        layer_filter = lumen_html::css::canvas_filter::parse_canvas_filter(text, current, size)
+                            .map(|parsed| parsed.operations)
+                            .filter(|operations| !operations.is_empty());
+                    }
+                }
                 // The entry save holds native state and traced JS style values.
                 self.save();
-                let result = self.data.borrow_mut().surface.begin_layer();
+                let result = self.data.borrow_mut().surface.begin_layer(layer_filter);
                 if result.is_err() {
                     let _ = self.restore();
                     return Err(OpError::new("QuotaExceededError", "Canvas layer budget exceeded"));
@@ -3748,7 +4043,7 @@ macro_rules! impl_canvas_2d_methods {
                 if data.surface.layer_has_unmatched_save() {
                     return Err(OpError::new("InvalidStateError", "endLayer() with unmatched save()"));
                 }
-                let depth = data.surface.end_layer().ok_or_else(|| {
+                let (depth, _filtered) = data.surface.end_layer().ok_or_else(|| {
                     OpError::new("InvalidStateError", "No Canvas layer is open")
                 })?;
                 data.surface.restore();
@@ -3770,6 +4065,7 @@ macro_rules! impl_canvas_2d_methods {
                             format!("canvas shadow rendering failed: {error:?}"),
                         )
                     })?;
+                data.record_extended_fill(x, y, width, height);
                 self.publish_data(&mut data)
             }
             fn clear_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
@@ -3861,7 +4157,7 @@ macro_rules! impl_canvas_2d_methods {
                     ),
                 );
             }
-            #[method(name = "arc")]
+            #[method(name = "arc", coerce)]
             fn arc(
                 &self,
                 x: f64,
@@ -3899,7 +4195,7 @@ macro_rules! impl_canvas_2d_methods {
                     Ok(())
                 })
             }
-            #[method(name = "ellipse")]
+            #[method(name = "ellipse", coerce)]
             fn ellipse(
                 &self,
                 x: f64,
@@ -4252,6 +4548,11 @@ macro_rules! impl_canvas_2d_methods {
                 if !self.data.borrow().alpha {
                     make_image_opaque(&mut image.pixels);
                 }
+                let origin = (
+                    if sw < 0 { i64::from(sx) + i64::from(sw) } else { i64::from(sx) },
+                    if sh < 0 { i64::from(sy) + i64::from(sh) } else { i64::from(sy) },
+                );
+                self.data.borrow().convert_region(&mut image, origin, settings.color_space);
                 Ok(ctx.new_instance(DomImageData::from_image_settings(image, settings)))
             }
 
@@ -4357,8 +4658,24 @@ macro_rules! impl_canvas_2d_methods {
                 };
                 self.data.borrow().ensure_bitmap_available()?;
                 self.data.borrow().ensure_no_open_layers()?;
-                let pixels = Arc::new(image.read_pixels(ctx)?);
+                let mut pixels = image.read_pixels(ctx)?;
+                let canvas_space = self.data.borrow().color_space;
+                let source_pixels = (self.data.borrow().float16_color_type
+                    && image.pixel_format == ImageDataPixelFormat::RgbaUnorm8
+                    && image.color_space != canvas_space)
+                    .then(|| pixels.clone());
+                convert_image_space(&mut pixels, image.color_space, canvas_space);
+                let pixels = Arc::new(pixels);
                 let mut data = self.data.borrow_mut();
+                if let Some(source) = source_pixels {
+                    data.record_extended_put(
+                        &source,
+                        &pixels,
+                        image.color_space,
+                        (i64::from(dx), i64::from(dy)),
+                        (i64::from(source_x), i64::from(source_y), i64::from(width), i64::from(height)),
+                    );
+                }
                 data.surface
                     .put_pixels(
                         pixels,
@@ -4475,7 +4792,9 @@ macro_rules! impl_canvas_2d_methods {
                 let premultiply_alpha = ctx
                     .instance_data::<DomImageBitmap>(&source)
                     .map_or(true, |bitmap| bitmap.as_ref().borrow().premultiply_alpha);
-                let Some(source_image) = canvas_source_image(ctx, source.clone())? else {
+                let canvas_space = self.data.borrow().color_space;
+                let keep_native = self.data.borrow().float16_color_type;
+                let Some((source_image, native)) = canvas_source_image_with_native(ctx, source.clone(), canvas_space, keep_native)? else {
                     return Ok(());
                 };
                 let source_origin_clean = canvas_source_origin_clean(ctx, &source);
@@ -4517,6 +4836,7 @@ macro_rules! impl_canvas_2d_methods {
                         ));
                     }
                 };
+                let extended_draw = native.map(|native| (native, data.extended_draw_rects(&geometry)));
                 data.surface.draw_source(&image, geometry, premultiply_alpha)
                 .map_err(|_| {
                     OpError::new(
@@ -4524,6 +4844,9 @@ macro_rules! impl_canvas_2d_methods {
                         "drawImage could not rasterize the source",
                     )
                 })?;
+                if let Some(((pixels, space), Some(rects))) = extended_draw {
+                    data.record_extended_draw(&pixels, space, rects);
+                }
                 self.publish_data(&mut data)
             }
         }
@@ -4650,6 +4973,7 @@ struct DomImageBitmap {
     image: RefCell<Option<Rgba8Image>>,
     premultiply_alpha: bool,
     origin_clean: bool,
+    color_space: CanvasColorSpace,
 }
 
 #[lumen_bind::methods]
@@ -4678,15 +5002,27 @@ impl DomImageBitmap {
     }
 }
 
+#[cfg(test)]
 fn new_image_bitmap(ctx: &mut Ctx, image: Rgba8Image, premultiply_alpha: bool) -> OpResult<Value> {
     new_image_bitmap_with_origin(ctx, image, premultiply_alpha, true)
 }
 
+#[cfg(test)]
 fn new_image_bitmap_with_origin(
     ctx: &mut Ctx,
     image: Rgba8Image,
     premultiply_alpha: bool,
     origin_clean: bool,
+) -> OpResult<Value> {
+    new_image_bitmap_in_space(ctx, image, premultiply_alpha, origin_clean, CanvasColorSpace::Srgb)
+}
+
+fn new_image_bitmap_in_space(
+    ctx: &mut Ctx,
+    image: Rgba8Image,
+    premultiply_alpha: bool,
+    origin_clean: bool,
+    color_space: CanvasColorSpace,
 ) -> OpResult<Value> {
     if image.width == 0
         || image.height == 0
@@ -4701,6 +5037,7 @@ fn new_image_bitmap_with_origin(
         image: RefCell::new(Some(image)),
         premultiply_alpha,
         origin_clean,
+        color_space,
     }))
 }
 
@@ -4756,7 +5093,17 @@ fn create_image_bitmap(
     }
 
     let origin_clean = canvas_source_origin_clean(ctx, &source);
-    let image = if let Some(data) = ctx.instance_data::<DomImageData>(&source) {
+    let mut bitmap_space = canvas_source_space(ctx, &source);
+    let profile_image = if options.convert_color_space {
+        embedded_profile_source(ctx, &source, true)
+    } else {
+        None
+    };
+    let image = if let Some(image) = profile_image {
+        bitmap_space = CanvasColorSpace::DisplayP3;
+        image
+    } else if let Some(data) = ctx.instance_data::<DomImageData>(&source) {
+        bitmap_space = data.borrow().color_space;
         data.borrow().read_pixels(ctx)?
     } else {
         match canvas_source_image(ctx, source) {
@@ -4776,11 +5123,12 @@ fn create_image_bitmap(
             Err(error) => return Err(error),
         }
     };
-    let bitmap = new_image_bitmap_with_origin(
+    let bitmap = new_image_bitmap_in_space(
         ctx,
         apply_bitmap_options(image, options)?,
         options.premultiply_alpha,
         origin_clean,
+        bitmap_space,
     )?;
     let promise = ctx
         .get_member(&ctx.global_object(), "Promise")
@@ -5101,18 +5449,26 @@ fn decode_image_bitmap_inner(
             "createImageBitmap could not decode the raster image",
         )
     })?;
+    let mut bitmap_space = CanvasColorSpace::Srgb;
     if let Some(icc_profile) = icc_profile {
-        lumen_html_image::raster_image_convert_to_srgb(&mut image, &icc_profile).map_err(|_| {
-            OpError::new(
-                "NotSupportedError",
-                "embedded raster color profile cannot be converted to sRGB",
-            )
-        })?;
+        let converted = lumen_html_image::raster_image_convert_to_display_p3(&mut image, &icc_profile);
+        if converted.is_ok() {
+            bitmap_space = CanvasColorSpace::DisplayP3;
+        } else {
+            lumen_html_image::raster_image_convert_to_srgb(&mut image, &icc_profile).map_err(|_| {
+                OpError::new(
+                    "NotSupportedError",
+                    "embedded raster color profile cannot be converted to sRGB",
+                )
+            })?;
+        }
     }
-    new_image_bitmap(
+    new_image_bitmap_in_space(
         ctx,
         apply_bitmap_options(image, options)?,
         options.premultiply_alpha,
+        true,
+        bitmap_space,
     )
 }
 
@@ -5200,6 +5556,86 @@ fn canvas_source_image(ctx:&mut Ctx,source:Value)->OpResult<Option<CanvasSourceI
 
 fn owned_source(image:Rgba8Image)->CanvasSource {CanvasSource::Pixels(Arc::new(image))}
 
+/// The color space the pixels of a drawing source are expressed in.
+fn canvas_source_space(ctx: &mut Ctx, source: &Value) -> CanvasColorSpace {
+    if let Ok(Ok(space)) = ctx.with_instance::<DomCanvasElement, _>(source, |canvas| canvas.data().map(|data| data.borrow().color_space)) {
+        return space;
+    }
+    if let Ok(space) = ctx.with_instance::<DomOffscreenCanvas, _>(source, |canvas| canvas.data.borrow().color_space) {
+        return space;
+    }
+    if let Some(bitmap) = ctx.instance_data::<DomImageBitmap>(source) {
+        return bitmap.borrow().color_space;
+    }
+    CanvasColorSpace::Srgb
+}
+
+/// An `<img>` whose encoded data carries an ICC profile, decoded into sRGB or Display P3.
+fn embedded_profile_source(ctx: &mut Ctx, source: &Value, display_p3: bool) -> Option<Rgba8Image> {
+    let (realm, node) = ctx.with_instance::<DomHtmlImageElement, _>(source, |image| {
+        let node = image.image_node();
+        (node.realm.clone(), node.id)
+    }).ok()?;
+    match realm.images.canvas_image_state(node) {
+        image_loading::CanvasImageState::Available(lumen_html::layout::NodeBitmap::Lazy(lazy)) => {
+            lumen_html_image::embedded_profile_pixels(&lazy, display_p3)
+        }
+        _ => None,
+    }
+}
+
+fn is_display_p3_family(space: CanvasColorSpace) -> bool {
+    matches!(space, CanvasColorSpace::DisplayP3 | CanvasColorSpace::DisplayP3Linear)
+}
+
+/// Like `canvas_source_image`, with the pixels expressed in `target`.
+fn canvas_source_image_in(ctx: &mut Ctx, source: Value, target: CanvasColorSpace) -> OpResult<Option<CanvasSourceImage>> {
+    Ok(canvas_source_image_with_native(ctx, source, target, false)?.map(|(image, _)| image))
+}
+
+/// A drawing source in its own color space, before conversion to the canvas.
+type NativeSource = (Rgba8Image, CanvasColorSpace);
+
+/// Like `canvas_source_image_in`; with `keep_native` it also returns the unclipped source
+/// pixels in the widest space available, for float16 canvases that keep out-of-gamut values.
+fn canvas_source_image_with_native(
+    ctx: &mut Ctx,
+    source: Value,
+    target: CanvasColorSpace,
+    keep_native: bool,
+) -> OpResult<Option<(CanvasSourceImage, Option<NativeSource>)>> {
+    if let Some(mut image) = embedded_profile_source(ctx, &source, is_display_p3_family(target)) {
+        let natural = ctx.with_instance::<DomHtmlImageElement, _>(&source, |image| image.image_snapshot().natural_size).ok().flatten()
+            .unwrap_or((f64::from(image.width), f64::from(image.height)));
+        let encoded = if is_display_p3_family(target) { CanvasColorSpace::DisplayP3 } else { CanvasColorSpace::Srgb };
+        let native = if keep_native && encoded != CanvasColorSpace::DisplayP3 {
+            embedded_profile_source(ctx, &source, true).map(|wide| (wide, CanvasColorSpace::DisplayP3))
+        } else if keep_native {
+            Some((image.clone(), encoded))
+        } else {
+            None
+        };
+        convert_image_space(&mut image, encoded, target);
+        return Ok(Some((CanvasSourceImage { source: owned_source(image), natural }, native)));
+    }
+    let native_space = canvas_source_space(ctx, &source);
+    let Some(mut result) = canvas_source_image(ctx, source)? else {
+        return Ok(None);
+    };
+    let mut native = None;
+    if native_space != target {
+        if let Some(pixels) = result.source.pixels() {
+            let mut image = (*pixels).clone();
+            if keep_native {
+                native = Some((image.clone(), native_space));
+            }
+            convert_image_space(&mut image, native_space, target);
+            result.source = owned_source(image);
+        }
+    }
+    Ok(Some((result, native)))
+}
+
 fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<CanvasSource>> {
     if let Ok(image)=ctx.with_instance::<DomElementImage,_>(&source,|image|image.image.borrow().clone()) {
         return image.map(|image|Some(owned_source(image.image.clone()))).ok_or_else(||OpError::new("InvalidStateError","ElementImage is detached"));
@@ -5230,6 +5666,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<CanvasS
         let node = image.image_node();
         (node.realm.clone(), node.id)
     }) {
+        let _ = realm.sync_image_bitmaps();
         return match realm.images.canvas_image_state(node) {
             image_loading::CanvasImageState::Available(bitmap) => Ok(Some(match bitmap {
                 lumen_html::layout::NodeBitmap::Decoded(image) => CanvasSource::Pixels(image),
@@ -5733,6 +6170,32 @@ fn canvas_root_font_units(realm: Option<&Rc<DomRealm>>, fonts: &dyn TextShaper) 
     })
 }
 
+fn spacing_text(value: f32, text: &Option<(f32, String)>) -> String {
+    match text {
+        Some((stored, text)) if *stored == value => text.clone(),
+        _ => css_spacing_string(value),
+    }
+}
+
+/// A single font-relative length keeps its unit when read back, lower-cased.
+fn font_relative_spacing_text(value: &str) -> Option<String> {
+    const UNITS: [&str; 12] = ["em", "ex", "ch", "ic", "rem", "rex", "rch", "ric", "lh", "rlh", "cap", "rcap"];
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let split = (0..bytes.len()).find(|&i| {
+        bytes[i].is_ascii_alphabetic()
+            && !(matches!(bytes[i], b'e' | b'E')
+                && bytes.get(i + 1).is_some_and(|next| next.is_ascii_digit() || matches!(*next, b'+' | b'-')))
+    })?;
+    let (number, unit) = value.split_at(split);
+    let unit = unit.to_ascii_lowercase();
+    if !UNITS.contains(&unit.as_str()) {
+        return None;
+    }
+    let number: f64 = number.parse().ok()?;
+    number.is_finite().then(|| format!("{number}{unit}"))
+}
+
 fn css_spacing_string(value: f32) -> String {
     if value == 0.0 {
         "0px".into()
@@ -5796,12 +6259,90 @@ fn current_canvas_color(realm: &Option<Rc<DomRealm>>, node: Option<NodeId>) -> R
     })
 }
 
+/// CSS closes functions that are still open at the end of the input.
+fn close_open_functions(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match (quote, byte) {
+            (Some(_), b'\\') => {
+                bytes.next();
+            }
+            (Some(open), _) if byte == open => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'(') => depth += 1,
+            (None, b')') => depth = depth.saturating_sub(1),
+            (None, _) => {}
+        }
+    }
+    if depth > 0 {
+        std::borrow::Cow::Owned(format!("{text}{}", ")".repeat(depth)))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn parse_style_color(value: &Value, current: Rgba) -> Option<[u8; 4]> {
     let Value::Str(value) = value else {
         return None;
     };
-    let color = lumen_html::css::parse_animation_color(value.as_str(), current)?;
+    let color = lumen_html::css::parse_animation_color(&close_open_functions(value.as_str()), current)?;
     Some([color.r, color.g, color.b, color.a])
+}
+
+/// A CSS color as the bytes a canvas stores in its own color space; colors outside the
+/// canvas gamut are clipped.
+fn parse_canvas_color(value: &Value, current: Rgba, space: CanvasColorSpace) -> Option<[u8; 4]> {
+    if space == CanvasColorSpace::Srgb {
+        return parse_style_color(value, current);
+    }
+    let (components, alpha) = parse_canvas_color_exact(value, current, space)?;
+    let byte = lumen_common::pixel_color::byte;
+    Some([byte(components[0]), byte(components[1]), byte(components[2]), alpha])
+}
+
+/// The unclamped components of a CSS color in the canvas working space, and its alpha byte.
+fn parse_canvas_color_exact(value: &Value, current: Rgba, space: CanvasColorSpace) -> Option<([f32; 3], u8)> {
+    let Value::Str(text) = value else {
+        return None;
+    };
+    let current = lumen_common::color::Color::rgba8([current.r, current.g, current.b, current.a]);
+    let mut color = lumen_html::css::parse_animation_unclipped_color(&close_open_functions(text.as_str()), current)?.value;
+    if color.space == lumen_common::color::ColorSpace::Srgb {
+        color.components = color.components.map(|component| component.clamp(0.0, 1.0));
+    }
+    let components = color.to(space.working()).components;
+    let alpha = if color.missing & 8 != 0 { 0 } else { lumen_common::pixel_color::byte(color.alpha) };
+    Some((components, alpha))
+}
+
+/// The serialization of a color authored with a CSS color function, which canvas style getters
+/// report instead of the clipped sRGB bytes.
+fn color_function_text(value: &Value, current: Rgba) -> Option<String> {
+    let Value::Str(text) = value else {
+        return None;
+    };
+    let current = lumen_common::color::Color::rgba8([current.r, current.g, current.b, current.a]);
+    let parsed = lumen_html::css::parse_animation_unclipped_color(&close_open_functions(text.as_str()), current)?;
+    if parsed.color_function {
+        parsed.serialize()
+    } else {
+        None
+    }
+}
+
+fn style_color_text(stored: [u8; 4], text: Option<&([u8; 4], String)>, space: CanvasColorSpace) -> String {
+    match text {
+        Some((bytes, text)) if *bytes == stored => text.clone(),
+        _ => color_string(stored_color_as_srgb(stored, space)),
+    }
+}
+
+fn stored_color_as_srgb(mut color: [u8; 4], space: CanvasColorSpace) -> [u8; 4] {
+    lumen_common::pixel_color::convert_rgba8(&mut color, space.working(), lumen_common::color::ColorSpace::Srgb);
+    color
 }
 
 fn color_string(color: [u8; 4]) -> String {
@@ -6334,29 +6875,31 @@ fn image_bitmap_value_codec() -> lumen_host::clone_transfer::NativeGraphValueCod
         kind: "ImageBitmap", max_bytes: MAX_IMAGE_DATA_BYTES, max_children: 0,
         matches: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |_| ()).is_ok(),
         serialize: |ctx, value| {
-            let (width, height, pixels, premultiply, clean) = ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
-                bitmap.image.borrow().as_ref().map(|image| (image.width, image.height, image.pixels.clone(), bitmap.premultiply_alpha, bitmap.origin_clean))
+            let (width, height, pixels, premultiply, clean, color_space) = ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
+                bitmap.image.borrow().as_ref().map(|image| (image.width, image.height, image.pixels.clone(), bitmap.premultiply_alpha, bitmap.origin_clean, bitmap.color_space))
             })?.ok_or_else(|| OpError::new("DataCloneError", "ImageBitmap is detached"))?;
             if !clean {
                 return Err(OpError::new("DataCloneError", "ImageBitmap is not origin-clean"));
             }
-            if pixels.len() > MAX_IMAGE_DATA_BYTES - 10 {
+            if pixels.len() > MAX_IMAGE_DATA_BYTES - 11 {
                 return Err(OpError::new("DataCloneError", "ImageBitmap is too large to clone"));
             }
-            let mut bytes = Vec::with_capacity(pixels.len() + 10);
+            let mut bytes = Vec::with_capacity(pixels.len() + 11);
             bytes.extend_from_slice(&width.to_le_bytes());
             bytes.extend_from_slice(&height.to_le_bytes());
             bytes.push(u8::from(premultiply));
             bytes.push(u8::from(clean));
+            bytes.push(color_space.code());
             bytes.extend_from_slice(&pixels);
             Ok((bytes, Vec::new()))
         },
         create: |ctx, bytes| {
-            if bytes.len() < 10 { return Err(OpError::new("DataCloneError", "Invalid ImageBitmap metadata")); }
+            if bytes.len() < 11 { return Err(OpError::new("DataCloneError", "Invalid ImageBitmap metadata")); }
             let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            let image = Rgba8Image { width, height, pixels: bytes[10..].to_vec() };
-            new_image_bitmap_with_origin(ctx, image, bytes[8] != 0, bytes[9] != 0)
+            let image = Rgba8Image { width, height, pixels: bytes[11..].to_vec() };
+            let color_space = CanvasColorSpace::from_code(bytes[10]).ok_or_else(|| OpError::new("DataCloneError", "Invalid ImageBitmap color space"))?;
+            new_image_bitmap_in_space(ctx, image, bytes[8] != 0, bytes[9] != 0, color_space)
                 .map_err(|_| OpError::new("DataCloneError", "Invalid ImageBitmap pixels"))
         },
         populate: |_, _, _| Ok(()),
@@ -6376,7 +6919,7 @@ fn image_bitmap_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCo
         })?,
         export: |ctx, value| ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
             let image = bitmap.image.borrow().as_ref().expect("validated ImageBitmap").clone();
-            Box::new((image, bitmap.premultiply_alpha, bitmap.origin_clean)) as Box<dyn std::any::Any + Send>
+            Box::new((image, bitmap.premultiply_alpha, bitmap.origin_clean, bitmap.color_space)) as Box<dyn std::any::Any + Send>
         }),
         detach: |ctx, value, _| {
             let _ = ctx.with_instance::<DomImageBitmap, _>(value, |bitmap| {
@@ -6384,9 +6927,9 @@ fn image_bitmap_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCo
             });
         },
         import: |ctx, payload| {
-            let payload = payload.downcast::<(Rgba8Image, bool, bool)>().map_err(|_| OpError::new("DataCloneError", "Invalid ImageBitmap attachment"))?;
-            let (image, premultiply, clean) = *payload;
-            new_image_bitmap_with_origin(ctx, image, premultiply, clean)
+            let payload = payload.downcast::<(Rgba8Image, bool, bool, CanvasColorSpace)>().map_err(|_| OpError::new("DataCloneError", "Invalid ImageBitmap attachment"))?;
+            let (image, premultiply, clean, color_space) = *payload;
+            new_image_bitmap_in_space(ctx, image, premultiply, clean, color_space)
         },
     }
 }
@@ -7894,13 +8437,13 @@ mod tests {
         let diagnostic=engine.eval_value(r#"(() => {
             const context=document.getElementById('c').getContext('2d');
             context.font='10px monospace';
-            context.letterSpacing='1rlh';
+            context.letterSpacing='calc(1rlh + 0px)';
             if(context.letterSpacing!=='40px')throw new Error('canvas rlh did not use the actual document root');
             context.wordSpacing='calc(1cap + 2px)';
             const cap=parseFloat(context.wordSpacing);
             if(!(cap>2))throw new Error('canvas cap metric was rejected');
             document.documentElement.style.lineHeight='3';
-            context.letterSpacing='1rlh';
+            context.letterSpacing='calc(1rlh + 0px)';
             if(context.letterSpacing!=='60px')throw new Error('canvas root line-height mutation was stale');
             context.font='1rlh monospace';
             if(!context.font.includes('60px'))throw new Error('canvas font shorthand did not resolve genuine rlh');
@@ -7916,7 +8459,7 @@ mod tests {
         super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
-            "(()=>{const x=new OffscreenCanvas(1,1).getContext('2d');x.font='20px monospace';x.letterSpacing='1em';const em=x.letterSpacing==='20px';x.letterSpacing='1rem';const rem=x.letterSpacing==='16px';x.letterSpacing='1ch';const ch=Math.abs(parseFloat(x.letterSpacing)-x.measureText('0').width)<0.01;x.letterSpacing='calc(1em + 2px)';const calc=x.letterSpacing==='22px';x.wordSpacing='1in';const abs=x.wordSpacing==='96px';x.wordSpacing='bad';return em&&rem&&ch&&calc&&abs&&x.wordSpacing==='96px'})()"
+            "(()=>{const x=new OffscreenCanvas(1,1).getContext('2d');x.font='20px monospace';x.letterSpacing='1em';const em=x.letterSpacing==='1em'&&x.measureText('0').width>0;x.letterSpacing='1rem';const rem=x.letterSpacing==='1rem';x.letterSpacing='1CH';const ch=x.letterSpacing==='1ch';x.letterSpacing='calc(1em + 2px)';const calc=x.letterSpacing==='22px';x.wordSpacing='1in';const abs=x.wordSpacing==='96px';x.wordSpacing='bad';return em&&rem&&ch&&calc&&abs&&x.wordSpacing==='96px'})()"
         ));
     }
 
@@ -7931,7 +8474,7 @@ mod tests {
         .unwrap();
         assert!(eval_bool(
             &mut engine,
-            "(()=>{const x=document.querySelector('canvas').getContext('2d');x.letterSpacing='1rem';return x.letterSpacing==='32px'})()"
+            "(()=>{const x=document.querySelector('canvas').getContext('2d');x.letterSpacing='1rem';return x.letterSpacing==='1rem'})()"
         ));
     }
 

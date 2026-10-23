@@ -66,3 +66,30 @@ impl ViewTransitionArgument {
 fn is_css_whitespace_char(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{c}')
 }
+
+/// A `getComputedStyle()` pseudo-element argument naming one generated
+/// view-transition pseudo: the pseudo and, when functional, its capture name.
+/// Wildcard and class-filtered arguments name no single pseudo-element.
+pub fn parse_computed_target(input: &str) -> Option<(PseudoElement, Option<String>)> {
+    let rest = input.strip_prefix("::")?;
+    let (name, argument) = match rest.find('(') {
+        Some(open) => {
+            let argument = rest[open + 1..].strip_suffix(')')?;
+            (&rest[..open], Some(argument))
+        }
+        None => (rest, None),
+    };
+    let pseudo = match name.to_ascii_lowercase().as_str() {
+        "view-transition" => return argument.is_none().then_some((PseudoElement::ViewTransition, None)),
+        "view-transition-group" => PseudoElement::ViewTransitionGroup,
+        "view-transition-image-pair" => PseudoElement::ViewTransitionImagePair,
+        "view-transition-old" => PseudoElement::ViewTransitionOld,
+        "view-transition-new" => PseudoElement::ViewTransitionNew,
+        _ => return None,
+    };
+    let argument = parse_argument(argument?)?;
+    if argument.wildcard || !argument.classes.is_empty() {
+        return None;
+    }
+    Some((pseudo, Some(argument.name)))
+}

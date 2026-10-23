@@ -1142,6 +1142,12 @@ fn parse_action_sequence(ctx: &mut Ctx, value: &Value) -> OpResult<ActionPlan> {
     })
 }
 
+/// A mouse is one physical device: a button pressed through one action source stays pressed for
+/// later sequences that name a different mouse source. Other pointers are keyed by source id.
+fn shares_pointer_device(pointer: &ActionPointerState, source: &PlannedPointerSource) -> bool {
+    pointer.id == source.id || (pointer.kind == PointerKind::Mouse && source.kind == PointerKind::Mouse)
+}
+
 fn prepare_pointer_sources(
     bridge: &Rc<RefCell<RealmBridge>>,
     plan: &mut ActionPlan,
@@ -1154,7 +1160,7 @@ fn prepare_pointer_sources(
         if let Some(existing) = state
             .pointers
             .iter()
-            .find(|pointer| pointer.id == source.id)
+            .find(|pointer| shares_pointer_device(pointer, source))
         {
             if existing.kind != source.kind {
                 case.record_unsupported(UNSUPPORTED_ACTION_PROFILE);
@@ -1182,7 +1188,7 @@ fn prepare_pointer_sources(
         let index = if let Some(index) = state
             .pointers
             .iter()
-            .position(|pointer| pointer.id == source.id)
+            .position(|pointer| shares_pointer_device(pointer, source))
         {
             index
         } else {

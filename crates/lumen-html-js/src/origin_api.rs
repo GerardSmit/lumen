@@ -54,7 +54,7 @@ impl DomOrigin {
         Self { origin: Origin::opaque() }
     }
 
-    #[method(name = "from")]
+    #[method(name = "from", hint(js(length = "1")))]
     fn from_value(ctx: &mut Ctx, #[default(Value::Undefined)] value: Value) -> OpResult<Value> {
         let origin = if matches!(value, Value::Undefined | Value::Null) {
             return Err(type_error("Origin.from: the value is not an origin source"));
@@ -79,13 +79,13 @@ impl DomOrigin {
         matches!(self.origin, Origin::Opaque(_))
     }
 
-    #[method(name = "isSameOrigin")]
+    #[method(name = "isSameOrigin", hint(js(length = "1")))]
     fn is_same_origin(&self, ctx: &mut Ctx, #[default(Value::Undefined)] other: Value) -> OpResult<bool> {
         let other = other_origin(ctx, &other)?;
         Ok(self.origin.same_origin(&other))
     }
 
-    #[method(name = "isSameSite")]
+    #[method(name = "isSameSite", hint(js(length = "1")))]
     fn is_same_site(&self, ctx: &mut Ctx, #[default(Value::Undefined)] other: Value) -> OpResult<bool> {
         let other = other_origin(ctx, &other)?;
         Ok(match (&self.origin, &other) {

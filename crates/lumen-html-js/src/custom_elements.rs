@@ -1000,12 +1000,12 @@ impl DomCustomStateSet {
     }
 }
 #[lumen_bind::class(name = "CustomStateSetIterator")]
-struct DomCustomStateIterator {
-    owner:Value,
-    data:Rc<RefCell<lumen::embed::DomStringSet>>,
-    cursor:Cell<usize>,
-    done:Cell<bool>,
-    entries:bool,
+pub(crate) struct DomCustomStateIterator {
+    pub(crate) owner:Value,
+    pub(crate) data:Rc<RefCell<lumen::embed::DomStringSet>>,
+    pub(crate) cursor:Cell<usize>,
+    pub(crate) done:Cell<bool>,
+    pub(crate) entries:bool,
 }
 impl lumen::embed::NativeIdentityOwner for DomCustomStateIterator {
     const TRACES_NATIVE_VALUES: bool=true;

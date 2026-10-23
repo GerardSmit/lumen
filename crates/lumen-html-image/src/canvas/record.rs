@@ -386,7 +386,7 @@ impl DrawingState {
     }
 
     fn is_plain_source_over(&self) -> bool {
-        self.alpha == 1.0 && self.blend == BlendMode::SourceOver && !self.shadow_possible()
+        self.alpha == 1.0 && self.blend == BlendMode::SourceOver && !self.shadow_possible() && self.filter.is_none()
     }
 }
 

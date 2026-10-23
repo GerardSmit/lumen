@@ -951,6 +951,7 @@ pub fn resanitize_input_after_attribute_change(
 ) -> OpResult<()> {
     if changed_attribute.eq_ignore_ascii_case("selected") {
         option_selected_attribute_changed(realm, node)?;
+        selection_written(realm, node)?;
     }
     let select_to_normalize = {
         let session = realm.session.borrow();
@@ -998,6 +999,9 @@ pub fn resanitize_input_after_attribute_change(
         if normalize_select_selection_with_state(document, &mut state, select, preferred)? {
             state.bump_validity_generation();
         }
+        drop(session);
+        drop(state);
+        sync_selected_content(realm, select, None)?;
     }
     if !is_input_state_attribute(changed_attribute) {
         return Ok(());
@@ -1052,6 +1056,30 @@ pub fn resanitize_input_after_attribute_change(
         let session = realm.session.borrow();
         core_forms::input_value_mode(session.document(), node)
     };
+
+    if is_type_change {
+        let peers = {
+            let session = realm.session.borrow();
+            let document = session.document();
+            let node_checked = state
+                .checkedness
+                .get(&node)
+                .map(|checkedness| checkedness.value)
+                .unwrap_or_else(|| has_null_attribute(document, node, "checked"));
+            if core_forms::input_type_state(document, node) == "radio" && node_checked {
+                core_forms::radio_group_members(document, node)
+            } else {
+                Vec::new()
+            }
+        };
+        for peer in peers {
+            let dirty = state
+                .checkedness
+                .get(&peer)
+                .is_some_and(|checkedness| checkedness.dirty);
+            state.checkedness.insert(peer, Checkedness { value: false, dirty });
+        }
+    }
 
     if pending_type_change.as_ref().is_some_and(|pending| {
         pending.previous_type != core_forms::input_type_state(realm.session.borrow().document(), node)
@@ -1423,6 +1451,52 @@ pub fn set_checked(
     state.dirty.insert(node);
     state.bump_validity_generation();
     Ok(())
+}
+
+/// A checked radio entering a form owner or a document unchecks the rest of its group.
+pub(crate) fn settle_inserted_radios(realm: &DomRealm, root: NodeId) {
+    let inserted = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut found = Vec::new();
+        let mut current = Some(root);
+        while let Some(candidate) = current {
+            let is_radio = html_local_name(document, candidate) == Some("input")
+                && document
+                    .get_attribute_ns_ref(candidate, None, "type")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"));
+            if is_radio
+                && (core_forms::form_owner(document, candidate).is_some()
+                    || document.is_connected_element(candidate))
+            {
+                found.push(candidate);
+            }
+            current = lumen_html::selector::next_descendant(document, root, candidate)
+                .ok()
+                .flatten();
+        }
+        found
+    };
+    for radio in inserted {
+        if !matches!(checked(realm, radio), Ok(true)) {
+            continue;
+        }
+        let peers = core_forms::radio_group_members(realm.session.borrow().document(), radio);
+        if peers.is_empty() {
+            continue;
+        }
+        let mut state = realm.forms.borrow_mut();
+        for peer in peers {
+            let dirty = state
+                .checkedness
+                .get(&peer)
+                .is_some_and(|checkedness| checkedness.dirty);
+            state.checkedness.insert(peer, Checkedness { value: false, dirty });
+        }
+        state.bump_validity_generation();
+    }
 }
 
 pub fn checked(realm: &DomRealm, node: NodeId) -> OpResult<bool> {
@@ -2020,15 +2094,78 @@ pub(crate) fn select_option_list_changed_with_preferred(
     preferred_option: Option<NodeId>,
 ) -> OpResult<()> {
     let (realm, select) = realm.resolve_adopted_node(select);
-    let mut state = realm.forms.borrow_mut();
-    let session = realm.session.borrow();
-    if normalize_select_selection_with_state(
-        session.document(),
-        &mut state,
-        select,
-        preferred_option,
-    )? {
-        state.bump_validity_generation();
+    {
+        let mut state = realm.forms.borrow_mut();
+        let session = realm.session.borrow();
+        if normalize_select_selection_with_state(
+            session.document(),
+            &mut state,
+            select,
+            preferred_option,
+        )? {
+            state.bump_validity_generation();
+        }
+    }
+    sync_selected_content(&realm, select, None)
+}
+
+/// Refresh the `selectedcontent` descendants of a select from its selected
+/// option. The caller must hold no form-state or session borrow.
+pub(crate) fn sync_selected_content(
+    realm: &DomRealm,
+    select: NodeId,
+    only: Option<&[NodeId]>,
+) -> OpResult<()> {
+    if !realm.session.borrow().document().selected_content_created() {
+        return Ok(());
+    }
+    let removed = {
+        let state = realm.forms.borrow();
+        let mut session = realm.session.borrow_mut();
+        lumen_html::select_content::sync_selected_content(
+            session.document_mut(),
+            select,
+            |option| state.selectedness.get(&option).copied(),
+            only,
+        )
+        .map_err(dom_error)?
+    };
+    if !removed.is_empty() {
+        realm.reap_detached(removed);
+    }
+    Ok(())
+}
+
+/// Refresh the select owning `node` (a select, option or optgroup) after its
+/// selection was written through script.
+pub(crate) fn selection_written(realm: &DomRealm, node: NodeId) -> OpResult<()> {
+    let select = {
+        let session = realm.session.borrow();
+        core_forms::select_ancestor(session.document(), node).map_err(dom_error)?
+    };
+    match select {
+        Some(select) => sync_selected_content(realm, select, None),
+        None => Ok(()),
+    }
+}
+
+/// Refresh selects affected by a connected subtree insertion: selects inside it
+/// and the owners of any inserted `selectedcontent`.
+pub(crate) fn settle_inserted_selects(realm: &DomRealm, root: NodeId) -> OpResult<()> {
+    if !realm.session.borrow().document().selected_content_created() {
+        return Ok(());
+    }
+    let selects = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut selects =
+            lumen_html::select_content::selects_for_inserted_subtree(document, root)
+                .map_err(dom_error)?;
+        selects.retain(|select| document.is_connected_element(*select));
+        selects
+    };
+    for select in selects {
+        sync_selected_content(realm, select, None)?;
     }
     Ok(())
 }
@@ -2422,11 +2559,11 @@ impl DomFileList {
             .cloned()
             .unwrap_or(Value::Undefined)
     }
-    fn item(&self, index: usize) -> Value {
+    fn item(&self, index: u32) -> Value {
         self.data
             .borrow()
             .values
-            .get(index)
+            .get(index as usize)
             .cloned()
             .unwrap_or(Value::Null)
     }
@@ -2954,7 +3091,7 @@ pub fn reset_form(
         }
         state.defaults.remove(&node);
     }
-    for select in selects {
+    for select in selects.iter().copied() {
         if core_forms::select_display_size(document, select) != Some(1) {
             continue;
         }
@@ -2981,6 +3118,9 @@ pub fn reset_form(
     drop(state);
     for (output, value) in output_resets {
         super::DomNode::replace_text_content_without_checkpoint(realm, output, &value)?;
+    }
+    for select in selects {
+        sync_selected_content(realm, select, None)?;
     }
     Ok(true)
 }
@@ -3516,6 +3656,7 @@ pub(crate) fn trusted_pointer_down(
         }
     }
     super::dialog_popover::record_popover_pointerdown_target(ctx, realm, target)?;
+    super::dialog_popover::record_dialog_pointerdown(realm, target, state.x, state.y);
     let pointer_allowed = dispatch_pointer_state_event(
         ctx,
         realm,
@@ -3652,7 +3793,7 @@ pub(crate) fn trusted_pointer_up_with_click_detail(
     if down_target.is_none() {
         // The press ended at pointerdown (its target left the document): no light dismiss.
         super::dialog_popover::clear_popover_pointerdown_target(realm);
-    } else if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target) {
+    } else if let Err(error) = super::dialog_popover::dismiss_popovers_for_pointer_up(ctx, realm, target, state.x, state.y) {
         super::dialog_popover::clear_popover_pointerdown_target(realm);
         return Err(error);
     }
@@ -4206,7 +4347,7 @@ impl lumen_host::events::ActivationBehavior for ControlActivation {
             return super::invokers::button_activation(ctx, self.element.clone(), event_target);
         }
         match action {
-            ClickActivation::Checkable { .. } if connected => {
+            ClickActivation::Checkable { radio } if connected && !(radio && self.previous_checked) => {
                 realm.dispatch_user_agent(ctx,node,"input",true,false,&[])?;
                 realm.dispatch_user_agent(ctx,node,"change",true,false,&[])?;
             }

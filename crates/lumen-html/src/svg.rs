@@ -270,7 +270,11 @@ pub fn root_size_in_flow(
     }));
     let height = finite(css_height.or_else(|| {
         if height_declared { return None; }
-        height_attribute.and_then(|value| dimension(value, available_height.unwrap_or(150.0)))
+        height_attribute.and_then(|value| if value.trim().ends_with('%') {
+            available_height.and_then(|basis| dimension(value, basis))
+        } else {
+            dimension(value, 0.0)
+        })
     }));
     let absolute = |value: Option<&str>| value
         .filter(|value| !value.trim().ends_with('%'))
@@ -354,12 +358,14 @@ pub fn supports_length(input: &str) -> bool {
 
 fn coordinate_length(input: &str) -> Option<f32> {
     let input = input.trim();
-    let value = input
-        .strip_suffix("px")
-        .unwrap_or(input)
-        .trim()
-        .parse::<f32>()
-        .ok()?;
+    let number = input.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &input[number.len()..];
+    let factor = if unit.is_empty() || unit.eq_ignore_ascii_case("px") {
+        1.0
+    } else {
+        crate::css::calc_size::absolute_factor(&unit.to_ascii_lowercase())? as f32
+    };
+    let value = number.trim().parse::<f32>().ok()? * factor;
     value.is_finite().then_some(value)
 }
 
@@ -558,6 +564,13 @@ pub fn view_box_transform_with_aspect(
         },
         view_box,
     )
+}
+
+/// A transform attribute that is syntactically invalid applies no transform.
+/// Only lists beyond the bounded renderer limits cannot be represented.
+pub fn transform_unsupported(input: &str) -> bool {
+    parse_transform(input).is_none()
+        && (input.len() > MAX_TRANSFORM_BYTES || input.matches('(').count() > MAX_TRANSFORMS)
 }
 
 /// Parse a bounded SVG `transform` list. This supports the affine transforms

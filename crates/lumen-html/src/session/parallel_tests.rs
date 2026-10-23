@@ -52,7 +52,7 @@ impl TextShaper for Text {
     }
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()> {
         let glyphs: Vec<crate::paint::Glyph> = text.char_indices()
-            .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x: at as f32 * size * 0.5, y: 0.0, size_scale: 1.0 })
+            .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x_offset: 0.0, x: at as f32 * size * 0.5, y: 0.0, size_scale: 1.0 })
             .collect();
         Ok(ShapedRun { glyphs: Arc::from(glyphs), width: text.chars().count() as f32 * size * 0.5 })
     }

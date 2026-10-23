@@ -17,6 +17,7 @@ pub mod bytes;
 pub mod civil;
 pub mod codec;
 pub mod color;
+pub mod pixel_color;
 pub mod filter;
 #[cfg(feature = "web-encoding")]
 pub mod encoding;
@@ -126,3 +127,5 @@ pub mod xml;
 
 #[cfg(feature="vector-path")]
 pub mod svg_path;
+#[cfg(feature="vector-path")]
+pub mod svg_path_measure;

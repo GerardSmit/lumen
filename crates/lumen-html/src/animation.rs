@@ -697,6 +697,7 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
 pub fn interpolate_numeric(from: &str, to: &str, progress: f64) -> Option<String> {
     if !progress.is_finite() {return None;}
     if let Some(value)=crate::css::calc_size::interpolate(from,to,progress,false) {return Some(value);}
+    if crate::css::calc_size::involves_function(&[from,to]) {return None;}
     if let (Some((a,unit_a)),Some((b,unit_b)))=(numeric_unit(from),numeric_unit(to)) {
         if unit_a==unit_b {
             if progress==0.0{return Some(from.to_owned());}

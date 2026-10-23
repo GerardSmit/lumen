@@ -874,7 +874,8 @@ pub struct RenderSession {
     style_version: u64,
     style_environment: Option<css::MediaEnvironment>,
     /// Inputs of the last layout whose container-query oracle was already stable.
-    container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>)>,
+    container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>, u64)>,
+    container_oracle_required: bool,
     presentation_root: Option<NodeId>,
     animation_snapshot: Option<Arc<AnimationSnapshot>>,
     timeline_transform_values:Option<Arc<crate::animation::progress_timelines::TransformTimelineValues>>,
@@ -1414,6 +1415,7 @@ impl RenderSession {
             style_version: 0,
             style_environment: None,
             container_oracle_stable: None,
+            container_oracle_required: false,
             presentation_root: None,
             animation_snapshot: None,
             timeline_transform_values:None,
@@ -1844,13 +1846,15 @@ impl RenderSession {
             self.frame_id = self.frame_id.wrapping_add(1);
         }
         let shape_changed = interaction_changed && interaction_before.1 != self.synced_interaction.1;
+        let focus_ring_changed = interaction_changed && interaction_before.0.focus_visible != self.synced_interaction.0.focus_visible;
         if !has_selector_dependencies
             && !shape_changed
+            && !focus_ring_changed
             && !(validity_changed && self.has_auto_directionality_controls())
         {
             return;
         }
-        if has_selector_dependencies && !(validity_changed && self.has_auto_directionality_controls()) {
+        if has_selector_dependencies && !focus_ring_changed && !(validity_changed && self.has_auto_directionality_controls()) {
             if let Some(targets) = self.state_change_targets(validity_changed, interaction_changed, interaction_before) {
                 self.rule_subjects.get_or_insert_with(Vec::new).extend(targets.into_iter().map(|node| (node, true)));
                 self.animation_snapshot = None;
@@ -1903,6 +1907,11 @@ impl RenderSession {
     }
     pub fn read_style_cache_stats(&self)->css::StyleCacheStats {
         self.read_style_cache.stats()
+    }
+    /// Record the position-try fallbacks the latest layout used as the last
+    /// successful options; called at each rendering update.
+    pub fn commit_position_fallbacks(&mut self) {
+        self.layout_cache.commit_position_fallbacks();
     }
     pub fn layout_cache_stats(&self) -> layout::RetainedLayoutCacheStats {
         self.layout_cache.stats()
@@ -3288,6 +3297,33 @@ impl RenderSession {
     pub fn computed_style(&mut self, node: NodeId) -> Result<Style, LayoutError> {
         self.computed_style_with_text(node,None)
     }
+
+    /// Keeps layout recording the query containers even when no stylesheet rule
+    /// uses `@container`, for script-created container query lists.
+    pub fn require_container_oracle(&mut self, required: bool) {
+        if self.container_oracle_required != required {
+            self.container_oracle_required = required;
+            self.container_oracle_stable = None;
+        }
+    }
+
+    /// Whether a `<container-condition>#` list matches `node` against the containers
+    /// the last layout recorded.
+    pub fn container_query_matches(&mut self, node: NodeId, prelude: &str, text: Option<&dyn TextShaper>) -> Result<bool, LayoutError> {
+        self.synchronize_form_state();
+        if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+            return Err(LayoutError::InvalidTree);
+        }
+        self.refresh_rules()?;
+        let parent = match self.document.composed_parent(node).map_err(|_| LayoutError::InvalidTree)? {
+            Some(parent) if matches!(self.document.kind(parent), Ok(NodeKind::Element { .. })) => {
+                Some(self.computed_style_with_text(parent, text)?)
+            }
+            _ => None,
+        };
+        let rules = self.rules.as_ref().ok_or(LayoutError::InvalidTree)?;
+        Ok(rules.container_query_matches(&self.document, node, prelude, parent.as_ref(), text))
+    }
     pub fn view_transition_pseudo_style(&mut self, origin: NodeId,
         inherited: Option<&Style>, pseudo: css::PseudoElement, name: Option<&str>,
         text: &dyn TextShaper) -> Result<Style, LayoutError> {
@@ -3298,6 +3334,13 @@ impl RenderSession {
             .map_err(LayoutError::Css)
     }
     pub fn computed_style_with_text(&mut self, node: NodeId, text:Option<&dyn TextShaper>) -> Result<Style, LayoutError> {
+        let mut style = self.computed_style_authored(node, text)?;
+        let in_top_layer = self.document.top_layer_kind(node).is_some();
+        css::extra_props::set_stored(&mut style, "overlay", in_top_layer.then_some("auto"));
+        Ok(style)
+    }
+
+    fn computed_style_authored(&mut self, node: NodeId, text:Option<&dyn TextShaper>) -> Result<Style, LayoutError> {
         self.synchronize_form_state();
         if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
             return Err(LayoutError::InvalidTree);
@@ -3386,9 +3429,58 @@ impl RenderSession {
         let ordinary=self.computed_style_with_text(node,text)?;
         let mut style=self.rules.as_ref().expect("stylesheets initialized")
             .compute_pseudo_computed(&self.document,node,&ordinary,pseudo,text).map_err(LayoutError::Css)?;
-        let query=self.query_container_context(node)?;
+        let query=self.pseudo_query_container_context(node)?;
         style.resolve_query_context_with_text(query,text);
         Ok(style)
+    }
+
+    /// Computed style of a highlight pseudo-element (`key` from
+    /// `css::highlight_pseudo_key`), inheriting through the highlight of each ancestor.
+    pub fn computed_highlight_style_with_text(&mut self,node:NodeId,key:&str,text:Option<&dyn TextShaper>)->Result<Style,LayoutError> {
+        let mut ancestors=Vec::new();
+        let mut current=Some(node);
+        while let Some(id)=current {
+            if ancestors.len()>=512 {return Err(LayoutError::DepthLimit);}
+            if matches!(self.document.kind(id),Ok(NodeKind::Element{..})) {ancestors.push(id);}
+            current=self.document.flat_tree_parent(id).map_err(|_|LayoutError::InvalidTree)?;
+        }
+        let mut inherited:Option<Style>=None;
+        for id in ancestors.into_iter().rev() {
+            let ordinary=self.computed_style_with_text(id,text)?;
+            let style=self.rules.as_ref().expect("stylesheets initialized")
+                .compute_highlight_computed(&self.document,id,&ordinary,inherited.as_ref(),key,text).map_err(LayoutError::Css)?;
+            inherited=Some(style);
+        }
+        let mut style=inherited.ok_or(LayoutError::InvalidTree)?;
+        let query=self.pseudo_query_container_context(node)?;
+        style.resolve_query_context_with_text(query,text);
+        Ok(style)
+    }
+
+    /// The container-unit context of a pseudo-element: the originating
+    /// element is itself a candidate query container.
+    fn pseudo_query_container_context(&mut self,node:NodeId)->Result<css::ContainerUnitContext,LayoutError> {
+        self.synchronize_form_state();
+        if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+            return Err(LayoutError::InvalidTree);
+        }
+        self.refresh_rules()?;
+        let rules = self.rules.as_ref().ok_or(LayoutError::Css(css::CssError {
+            offset: 0,
+            message: "stylesheets not initialized",
+        }))?;
+        let geometry = self.cached.as_ref().and_then(|frame| {
+            (frame.document_version == self.document.version()
+                && frame.width as f32 == rules.environment.width
+                && frame.height as f32 == rules.environment.height)
+                .then_some(&frame.geometry)
+        });
+        let mut cache = css::StyleCache::default();
+        let (style, context) = style_with_query_context(&self.document, node, rules, &mut cache, geometry,None,false)?;
+        Ok(match geometry.and_then(|geometry| geometry.container_context_for(node)) {
+            Some(measured) => measured,
+            None => layout::mark_unmeasured_container_units(context, &style),
+        })
     }
 
     /// Return the used container-unit context surrounding `node`. Eligible
@@ -4601,7 +4693,7 @@ impl RenderSession {
             && self.document.kind(node).is_ok()).into_iter().flat_map(move |frame| {
             frame.geometry.hits.iter().enumerate()
                 .filter(move |(_,hit)|hit.node==node&&!hit.virtual_generated&&hit.rect.is_valid())
-                .flat_map(move |(index,_)|frame.geometry.hit_rects(index).iter().map(move |rect| {
+                .flat_map(move |(index,_)|frame.geometry.client_hit_rects(index).map(move |rect| {
                 let mut corners = [(rect.x, rect.y), (rect.x + rect.width, rect.y),
                     (rect.x, rect.y + rect.height), (rect.x + rect.width, rect.y + rect.height)];
                 for transform in frame.geometry.transforms.iter().filter(|transform| transform.hits.contains(&index)) {
@@ -4630,8 +4722,8 @@ impl RenderSession {
             let transforms: Vec<_> = frame.geometry.transforms.iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix).collect();
-            for rect in frame.geometry.hit_rects(index) {
-                fragments.push((*rect, transforms.clone()));
+            for rect in frame.geometry.client_hit_rects(index) {
+                fragments.push((rect, transforms.clone()));
             }
         }
         fragments
@@ -4678,14 +4770,14 @@ impl RenderSession {
                     .iter()
                     .enumerate()
                     .filter(move |(_,hit)|hit.node==node&&!hit.virtual_generated&&hit.rect.is_valid())
-                    .flat_map(move |(index, _hit)| frame.geometry.hit_rects(index).iter().filter_map(move |rect| {
+                    .flat_map(move |(index, _hit)| frame.geometry.client_hit_rects(index).filter_map(move |rect| {
                         let transforms = frame
                             .geometry
                             .transforms
                             .iter()
                             .filter(|transform| transform.hits.contains(&index))
                             .map(|transform| transform.matrix);
-                        layout::transformed_bounds(*rect, transforms)
+                        layout::transformed_bounds(rect, transforms)
                     }))
             })
     }
@@ -5214,7 +5306,8 @@ impl RenderSession {
         // them; one that lays out again culls to another window, which none
         // of them could match.
         let keeps_fragments = node == root && self.cached.as_ref().is_some_and(|frame| frame.geometry.laid_out_at_origin);
-        let replayed = self.cached.as_mut().is_some_and(|frame| {
+        let query_container = self.rules.as_ref().is_some_and(|rules| rules.is_scroll_state_container(node));
+        let replayed = !query_container && self.cached.as_mut().is_some_and(|frame| {
             if frame.geometry.transform_timeline_values.is_some(){return false;}
             if node == root {
                 frame.geometry.scroll_root(&mut frame.list.0, (x, y))
@@ -5448,6 +5541,18 @@ impl RenderSession {
         match request.target {
             crate::render_capture::RenderCaptureTarget::Viewport =>
                 self.render(request.width, request.height, text, images).cloned(),
+        }
+    }
+
+    pub fn has_capture_overlay(&self) -> bool {
+        self.capture_overlay.is_some()
+    }
+
+    /// The single image the capture overlay presents, when it is one.
+    pub fn capture_overlay_image(&self) -> Option<Arc<crate::render_capture::ReservedImageData>> {
+        match self.capture_overlay.as_ref()?.0.as_slice() {
+            [crate::paint::Command::ReservedImage { image, .. }] => Some(image.clone()),
+            _ => None,
         }
     }
 
@@ -6357,14 +6462,25 @@ impl RenderSession {
             if !changed && container_passes < MAX_CONTAINER_PASSES {
                 let rules = self.rules.as_ref().expect("stylesheets initialized");
                 let oracle_key = (version, self.rules_version, self.style_cache.borrow().epoch(), self.font_generation,
-                    images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits));
-                if rules.has_container_rules() && self.container_oracle_stable != Some(oracle_key) {
+                    images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits),
+                    self.scrolls.iter().fold(0u64, |hash, scroll| {
+                        hash.rotate_left(7) ^ (u64::from(scroll.x.to_bits()) << 32 | u64::from(scroll.y.to_bits())) ^ scroll.node.key() as u64
+                    }));
+                if (rules.has_container_rules() || self.container_oracle_required) && self.container_oracle_stable != Some(oracle_key) {
                     let installed = {
                         let styles = self.style_cache.borrow();
+                        let scrolls = &self.scrolls;
+                        let layout_cache = &self.layout_cache;
                         let oracle = css::container_eval::build_oracle(
                             &self.document,
                             &|node| styles.node_entry(node).map(|(_, _, _, style)| style.clone()),
                             &|node| geometry.container_context_for(node),
+                            &|node| {
+                                let (min_x, max_x, min_y, max_y) = geometry.scroll_bounds(node)?;
+                                let (x, y) = scrolls.iter().find(|scroll| scroll.node == node).map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
+                                Some(css::container_eval::ScrollGeometry { min_x, max_x, min_y, max_y, x, y })
+                            },
+                            &|node| layout_cache.applied_fallback(node),
                             rules.environment,
                             Some(text),
                         );
@@ -9715,7 +9831,7 @@ mod tests {
     impl TextShaper for Mono {
         fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
             let glyphs: Vec<crate::paint::Glyph> = text.char_indices()
-                .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x: at as f32, y: 0.0, size_scale: 1.0 })
+                .map(|(at, _)| crate::paint::Glyph { id: 1, face: 1, cluster: at as u32, caps_expansion: 0, x_offset: 0.0, x: at as f32, y: 0.0, size_scale: 1.0 })
                 .collect();
             Ok(ShapedRun { glyphs: Arc::from(glyphs), width: text.len() as f32 })
         }

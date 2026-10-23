@@ -15,7 +15,7 @@ impl FeatureMapState {
 #[lumen_bind::class(name="CSSFontFeatureValuesRule",extends=DomCssRule,hint(js(webidl)))]
 pub(super) struct DomCssFontFeatureValuesRule {
     base:DomCssRule, families:RefCell<Arc<[Arc<str>]>>, display:Option<css::FontDisplay>,
-    maps:Vec<Rc<FeatureMapState>>, wrappers:RefCell<Vec<Option<WeakValue>>>,
+    maps:Vec<Rc<FeatureMapState>>, order:RefCell<Vec<FeatureKind>>, wrappers:RefCell<Vec<Option<WeakValue>>>,
 }
 impl NativeIdentityOwner for DomCssFontFeatureValuesRule {
     const TRACES_NATIVE_VALUES:bool=true;
@@ -28,10 +28,15 @@ impl DomCssFontFeatureValuesRule {
         let rule=parsed.family_display.first().ok_or_else(||OpError::new("InvalidStateError","invalid feature values rule"))?;
         let maps:Vec<_>=FeatureKind::ALL.iter().map(|_|Rc::new(FeatureMapState::default())).collect();
         for alias in rule.aliases.iter(){maps[alias.kind as usize].entries.borrow_mut().push(Some((alias.name.to_string(),alias.indices.clone())));}
+        let mut order=Vec::new();
+        for alias in rule.aliases.iter(){if !order.contains(&alias.kind){order.push(alias.kind);}}
         Ok(Self{base,families:RefCell::new(rule.families.clone()),display:rule.display_specified.then_some(rule.display),
-            maps,wrappers:RefCell::new(vec![None;FeatureKind::ALL.len()])})
+            maps,order:RefCell::new(order),wrappers:RefCell::new(vec![None;FeatureKind::ALL.len()])})
     }
-    fn aliases(&self)->Vec<FeatureAlias> {let mut aliases=Vec::new();for kind in FeatureKind::ALL {for (name,indices) in self.maps[kind as usize].entries.borrow().iter().flatten(){aliases.push(FeatureAlias{kind,name:Arc::from(name.as_str()),indices:indices.clone()});}}aliases}
+    fn aliases(&self)->Vec<FeatureAlias> {
+        let mut kinds=self.order.borrow().clone();
+        for kind in FeatureKind::ALL {if !kinds.contains(&kind){kinds.push(kind);}}
+        let mut aliases=Vec::new();for kind in kinds {for (name,indices) in self.maps[kind as usize].entries.borrow().iter().flatten(){aliases.push(FeatureAlias{kind,name:Arc::from(name.as_str()),indices:indices.clone()});}}aliases}
     fn text(&self)->String {css::font_feature_values::serialize_rule(&self.families.borrow(),self.display,&self.aliases())}
     fn commit(&self,families:&[Arc<str>],aliases:&[FeatureAlias])->OpResult<()> {
         let text=css::font_feature_values::serialize_rule(families,self.display,aliases);
@@ -64,6 +69,7 @@ impl DomCssFontFeatureValuesRule {
         let state=&self.maps[kind as usize];
         if values.is_some() && found.is_none() {state.compact();let mut entries=state.entries.borrow_mut();if entries.len()>=MAX_FEATURE_ALIASES{return Err(OpError::new("QuotaExceededError","font feature iterator metadata exceeds limit"));}entries.try_reserve(1).map_err(|_|OpError::new("QuotaExceededError","font feature allocation failed"))?;}
         let families=self.families.borrow().clone();self.commit(&families,&aliases)?;
+        {let mut order=self.order.borrow_mut();if !order.contains(&kind){order.push(kind);}}
         let mut entries=state.entries.borrow_mut();
         if let Some(values)=values {let name=name.unwrap();if let Some(old)=entries.iter_mut().flatten().find(|(key,_)|key==name){old.1=values;}else{entries.push(Some((name.to_owned(),values)));}}
         else if let Some(name)=name {if let Some(old)=entries.iter_mut().find(|entry|entry.as_ref().is_some_and(|(key,_)|key==name)){*old=None;}}

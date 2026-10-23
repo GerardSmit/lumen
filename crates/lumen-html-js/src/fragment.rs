@@ -6,7 +6,7 @@ enum Indicated { None, Top, Element(NodeId) }
 
 pub(crate) struct FragmentState {
     target: Option<Value>,
-    sequential_start: Option<NodeRetention>,
+    sequential_start: Option<SequentialStart>,
     generation: u64,
     pending: bool,
     queued: Option<u64>,
@@ -24,12 +24,88 @@ impl FragmentState {
     }
 }
 
+struct StartItem {
+    node: NodeId,
+    point: Rc<range::RangeData>,
+    slot: Option<NodeId>,
+}
+
+/// The sequential focus navigation starting point. `items` runs from the
+/// start node outward through slotted ancestors and shadow hosts; each live
+/// range follows its node's former position when its subtree is removed.
+pub(crate) struct SequentialStart {
+    retention: NodeRetention,
+    items: Vec<StartItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SequentialPoint {
+    Node(NodeId),
+    Gap(NodeId, usize),
+    SlotEnd(NodeId),
+}
+
+pub(crate) fn set_sequential_start(realm: &Rc<DomRealm>, node: NodeId) {
+    let chain = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        if node == document.root() { return; }
+        let mut chain = Vec::new();
+        let mut current = node;
+        for _ in 0..4096 {
+            let slot = document.assigned_slot(current).ok().flatten();
+            let host = document.shadow_root(current).ok().flatten().is_some();
+            if (current == node || slot.is_some() || host) && chain.len() < 64 {
+                chain.push((current, slot));
+            }
+            let next = document.parent(current).ok().flatten()
+                .or_else(|| document.shadow_host(current).ok().flatten());
+            match next { Some(next) => current = next, None => break }
+        }
+        chain
+    };
+    let items = chain.into_iter().map(|(node, slot)| StartItem {
+        node, point: range::live_point_at(realm, node), slot,
+    }).collect();
+    realm.fragment_state.borrow_mut().get_or_insert_with(FragmentState::default)
+        .sequential_start = Some(SequentialStart { retention: NodeRetention::new(realm, node), items });
+}
+
+fn connected_container(document: &lumen_html::Document, node: NodeId) -> bool {
+    let mut current = node;
+    loop {
+        if current == document.root() { return true; }
+        match document.shadow_including_parent(current) {
+            Ok(Some(parent)) => current = parent,
+            _ => return false,
+        }
+    }
+}
+
+pub(crate) fn sequential_point(realm: &DomRealm) -> Option<SequentialPoint> {
+    let state = realm.fragment_state.borrow();
+    let start = state.as_ref()?.sequential_start.as_ref()?;
+    let original = start.retention.realm.upgrade()?;
+    let (owner, node) = original.resolve_adopted_node(start.retention.node);
+    if !core::ptr::eq(owner.as_ref(), realm) { return None; }
+    let session = realm.session.borrow();
+    let document = session.document();
+    if document.is_connected_element(node) { return Some(SequentialPoint::Node(node)); }
+    for item in start.items.iter().rev() {
+        let point = item.point.start_point();
+        if point.container == item.node { continue; }
+        if let Some(slot) = item.slot {
+            if document.is_connected_element(slot) { return Some(SequentialPoint::SlotEnd(slot)); }
+        }
+        if connected_container(document, point.container) {
+            return Some(SequentialPoint::Gap(point.container, point.offset));
+        }
+    }
+    None
+}
+
 pub(crate) fn sequential_focus_start(realm: &DomRealm) -> Option<NodeId> {
-    let state=realm.fragment_state.borrow();
-    let token=state.as_ref()?.sequential_start.as_ref()?;
-    let original=token.realm.upgrade()?;
-    let (owner,node)=original.resolve_adopted_node(token.node);
-    core::ptr::eq(owner.as_ref(),realm).then_some(node)
+    match sequential_point(realm)? { SequentialPoint::Node(node) => Some(node), _ => None }
 }
 
 pub(crate) fn clear_sequential_focus_start(realm: &DomRealm) {
@@ -153,7 +229,7 @@ fn scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Indicated> {
         Indicated::None=>{},
         Indicated::Top=>{
             let root = realm.session.borrow().document().root();
-            scrolling::apply_offset(ctx,realm,root,0.0,0.0,scrolling::ScrollBehavior::Auto)?;
+            scrolling::apply_offset_unsnapped(ctx,realm,root,0.0,0.0,scrolling::ScrollBehavior::Auto)?;
         },
         Indicated::Element(node)=>{
             let _lease = NodeRetention::new(realm,node);
@@ -163,8 +239,7 @@ fn scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Indicated> {
             if active && realm.session.borrow().document().is_connected_element(node) {
                 scrolling::into_view_inner(ctx,realm,node,scrolling::IntoViewOptions::default())?;
                 if realm.focusable_node(node)? { realm.focus(ctx,Some(node))?; } else { realm.focus(ctx,None)?; }
-                realm.fragment_state.borrow_mut().get_or_insert_with(FragmentState::default)
-                    .sequential_start=Some(NodeRetention::new(realm,node));
+                set_sequential_start(realm,node);
             }
         },
     }
@@ -422,7 +497,7 @@ mod tests {
         check(&mut engine,"if(document.activeElement!==document.getElementById('after'))throw new Error('forward Tab after adopted target and intermediate-document GC: '+document.activeElement.id);true");
         check(&mut engine,"location.hash='before';location.hash='target';true");
         realm.focus_next(engine.ctx(),true).unwrap();
-        check(&mut engine,"if(document.activeElement!==document.getElementById('before'))throw new Error('reverse Tab starts before fragment target: '+document.activeElement.id);true");
+        check(&mut engine,"if(document.activeElement!==document.getElementById('priority'))throw new Error('reverse Tab from a tabindex-0 starting point reaches the last positive tabindex: '+document.activeElement.id);true");
         check(&mut engine,"document.getElementById('target').tabIndex=-1;location.hash='before';location.hash='target';true");
         realm.focus_next(engine.ctx(),false).unwrap();
         check(&mut engine,"if(document.activeElement!==document.getElementById('after'))throw new Error('negative tabindex fragment target preserves DOM-order starting point: '+document.activeElement.id);true");

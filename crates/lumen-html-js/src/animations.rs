@@ -1437,7 +1437,7 @@ fn transition_parameters(style:&lumen_html::css::Style,index:usize)->(animation:
 }
 
 fn resolve_line_width_keywords(property:&str,a:&str,b:&str)->Option<(String,String)> {
-    if !property.ends_with("-width") || !(property.starts_with("border-") || property.starts_with("outline-") || property.starts_with("column-rule-")) {return None;}
+    if !property.ends_with("-width") || !(property.starts_with("border-") || property.starts_with("outline-") || property.starts_with("column-rule-") || property.starts_with("row-rule-")) {return None;}
     let pixels=|value:&str|match value.trim().to_ascii_lowercase().as_str() {"thin"=>Some("1px"),"medium"=>Some("3px"),"thick"=>Some("5px"),_=>None};
     if pixels(a).is_none() && pixels(b).is_none() {return None;}
     Some((pixels(a).unwrap_or(a).to_owned(),pixels(b).unwrap_or(b).to_owned()))
@@ -1504,10 +1504,12 @@ fn is_calc_size_value(value:&str)->bool {
 fn transition_pair_eligible(property:&str,from:&str,to:&str,allow_discrete:bool,allow_size_keywords:bool)->bool {
     use lumen_html::css::TransitionValueKind::*;
     if (allow_size_keywords || is_calc_size_value(from) || is_calc_size_value(to)) && lumen_html::css::calc_size::interpolate_keywords(property,from,to,0.5).is_some() {return true;}
+    if (is_calc_size_value(from) || is_calc_size_value(to)) && lumen_html::css::calc_size::is_size_property(property) {return allow_discrete;}
     match lumen_html::css::transition_value_kind(property) {
         NotAnimatable=>false,
         Transform=>lumen_html::css::typed_transforms::pair_interpolable(from,to) || allow_discrete,
         Visibility=>(from=="visible" || to=="visible") || allow_discrete,
+        Discrete if matches!(property,"background-image"|"list-style-image")=>true,
         Discrete | Display | Custom=>allow_discrete,
         _=>interpolate_transition_value(property,from,to,0.5).is_some() || allow_discrete,
     }
@@ -1720,7 +1722,7 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
             if hub.borrow().transition_over_budget.contains_key(&realm_key) {return Ok(());}
             let held=hub.borrow().transition_snapshots.get(&realm_key)
                 .filter(|(owner,_)|owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm))).map(|(_,snapshot)|snapshot.clone());
-            if held.is_some_and(|held|realm.session.borrow_mut().hold_transition_snapshot(&held)) {return Ok(());}
+            if held.as_ref().is_some_and(|held|realm.session.borrow_mut().hold_transition_snapshot(held)) {return Ok(());}
         }
     }
     // An unchanged cascade input epoch needs lifecycle reconciliation above,
@@ -1936,8 +1938,8 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
         for (property,index) in matched {
             let property:&str=&property;
             let key=(realm_key,input.node,input.pseudo,property.to_string());active.insert(key.clone());
-            let after=input.style.computed_css_value(&property,lumen_html::css::computed_values::ComputedValueContext::default());
-            let before_value=before.computed_css_value(&property,lumen_html::css::computed_values::ComputedValueContext::default());
+            let after=base_css_value(&input.style,property);
+            let before_value=base_css_value(&before,property);
             let (Some(after),Some(before_value))=(after,before_value) else {continue;};
             let id=hub.borrow().running_transitions.get(&key).copied();
             if id.is_none() && index!=usize::MAX && input.pseudo.is_none()
@@ -3343,6 +3345,8 @@ let property_pass=|name:&str| {
                                 })
                             }else{None};
                             let value=color.as_deref().unwrap_or(value);
+                            let owner_value=lumen_html::css::substitute_element_functions(value,realm.session.borrow().document(),node,property);
+                            let value=owner_value.as_deref().unwrap_or(value);
                             let computed=if needs_context {
                                 let style=context_style.as_ref()?;
                                 if let Err(error)=underlying_budget.temporary_style(style,2) {endpoint_budget_failure=Some(error);return None;}
@@ -5225,7 +5229,7 @@ impl DomAnimation {
                 .flat_map(|(_,_,pairs)|pairs.to_vec()).collect::<Vec<_>>()
         }).filter(|(name,_)|animated.iter().any(|animated|animated==name)).collect::<Vec<_>>();
         if committed.is_empty() {return Ok(());}
-        let style=crate::style::DomStyle {realm:realm.clone(),node,computed:false,pseudo:None,invalid_pseudo:false,_owner:Value::Undefined};
+        let style=crate::style::DomStyle {realm:realm.clone(),node,computed:false,pseudo:None,highlight:None,invalid_pseudo:false,_owner:Value::Undefined};
         let mut block=style.declaration_block()?;
         let mut changed=false;
         for (name,value) in committed {

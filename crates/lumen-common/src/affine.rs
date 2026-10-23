@@ -35,9 +35,24 @@ fn decompose(m: [f64; 6]) -> Option<Parts> {
     })
 }
 
+/// Exact quarter turns have exact coefficients; any other angle uses normal
+/// trigonometry so a lerped full turn does not leave rounding noise behind.
+fn sin_cos(angle: f64) -> (f64, f64) {
+    let quarter = libm::round(angle / core::f64::consts::FRAC_PI_2);
+    if quarter.is_finite() && angle == quarter * core::f64::consts::FRAC_PI_2 {
+        return match quarter.rem_euclid(4.0) as u8 {
+            0 => (0.0, 1.0),
+            1 => (1.0, 0.0),
+            2 => (0.0, -1.0),
+            _ => (-1.0, 0.0),
+        };
+    }
+    angle.sin_cos()
+}
+
 fn recompose(parts: Parts) -> Option<[f64; 6]> {
     let [sx, sy] = parts.scale;
-    let (sin, cos) = parts.angle.sin_cos();
+    let (sin, cos) = sin_cos(parts.angle);
     let result = [
         cos * sx,
         sin * sx,

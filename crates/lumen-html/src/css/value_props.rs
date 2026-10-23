@@ -18,6 +18,7 @@ enum Post {
     StrokeWidth,
     InsetPair,
     OffsetPairs,
+    ObjectFit,
 }
 
 pub(crate) struct Prop {
@@ -75,6 +76,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("font-language-override", true, "normal", "normal | <string>"),
     prop("font-optical-sizing", true, "auto", "auto | none"),
     prop("font-palette", true, "normal", "normal | light | dark | <dashed-ident>"),
+    prop("dynamic-range-limit", true, "no-limit", "standard | no-limit | constrained"),
     prop("font-presentation", true, "auto", "auto | text | emoji"),
     prop("font-synthesis-weight", true, "auto", "auto | none"),
     prop("font-synthesis-style", true, "auto", "auto | none | oblique-only"),
@@ -95,7 +97,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("mask-composite", false, "add", "[ add | subtract | intersect | exclude ]#"),
     prop("mask-type", false, "luminance", "luminance | alpha"),
     prop("mix-blend-mode", false, "normal", blend_modes!()),
-    prop("object-fit", false, "fill", "fill | contain | cover | none | scale-down"),
+    post(prop("object-fit", false, "fill", "fill | none | [ contain | cover ] || scale-down"), Post::ObjectFit),
     prop("overflow-anchor", false, "auto", "auto | none"),
     prop("scroll-axis-lock", false, "auto", "auto | none"),
     post(prop("scroll-marker-group", false, "none", "none | [ before | after ] [ links | tabs ]? | [ links | tabs ]"), Post::ScrollMarkerGroup),
@@ -103,7 +105,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("block-ellipsis", true, "no-ellipsis", "no-ellipsis | ellipsis | <string>"),
     prop("max-lines", false, "auto", "auto | <integer-min1> auto?"),
     prop("continue", false, "normal", "normal | discard | collapse | -webkit-legacy"),
-    prop("-webkit-line-clamp", false, "none", "none | <integer-min1>"),
+    prop("-webkit-box-orient", false, "horizontal", "horizontal | vertical | inline-axis | block-axis"),
     post(prop("overflow-clip-margin", false, "0px", "[ content-box | padding-box | border-box ] || <length>"), Post::OverflowClipMargin),
     prop("overscroll-behavior-x", false, "auto", "contain | none | auto"),
     prop("overscroll-behavior-y", false, "auto", "contain | none | auto"),
@@ -126,14 +128,15 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("scroll-padding-block-start", false, "auto", "auto | <length-percentage-nn>"),
     prop("scroll-padding-block-end", false, "auto", "auto | <length-percentage-nn>"),
     post(prop("scroll-snap-align", false, "none", "[ none | start | end | center ]{1,2}"), Post::ScrollSnapAlign),
-    prop("scroll-snap-stop", false, "normal", "normal | always"),
-    post(prop("scroll-snap-type", false, "none", "none | [ x | y | block | inline | both ] [ mandatory | proximity ]?"), Post::ScrollSnapType),
+    prop("scroll-snap-stop", false, "normal", "normal | always | before"),
+    prop("scroll-initial-target", false, "none", "none | nearest"),
+    post(prop("scroll-snap-type", false, "none", "none | [ x | y | block | inline | both | pair ] [ mandatory | proximity ]?"), Post::ScrollSnapType),
     prop("scrollbar-gutter", false, "auto", "auto | stable | stable both-edges"),
     prop("scrollbar-width", false, "auto", "auto | thin | none"),
     prop("shape-rendering", true, "auto", "auto | optimizespeed | crispedges | geometricprecision"),
     prop("speak", true, "auto", "auto | never | always"),
-    typed(post(prop("stroke-dasharray", true, "none", "none | [ [ <length-percentage-nn> | <number-px-nn> ] ,? ]+"), Post::Dasharray), "none"),
-    prop("stroke-dashoffset", true, "0px", "<length-percentage> | <number-px>"),
+    typed(post(prop("stroke-dasharray", true, "none", "none | [ [ <number-px-nn> | <length-percentage-nn> ] ,? ]+"), Post::Dasharray), "none"),
+    prop("stroke-dashoffset", true, "0px", "<number-px> | <length-percentage>"),
     prop("stroke-linecap", true, "butt", "butt | round | square"),
     prop("stroke-linejoin", true, "miter", "[ crop | arcs | miter | miter-clip ] || [ bevel | round | fallback ]"),
     prop("stroke-miterlimit", true, "4", "<number-nn>"),
@@ -159,6 +162,11 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("vector-effect", false, "none", "none | non-scaling-stroke"),
     prop("white-space-trim", false, "none", "none | [ discard-before || discard-after || discard-inner ]"),
     typed(prop("will-change", false, "auto", "auto | [ scroll-position | contents | <will-change-ident> ]#"), "auto"),
+    prop("forced-color-adjust", true, "auto", "auto | none | preserve-parent-color"),
+    prop("image-orientation", true, "from-image", "from-image | none"),
+    prop("link-parameters", false, "none", "none | <param>#"),
+    prop("image-resolution", true, "1dppx", "image-resolution"),
+    prop("flex-line-count", false, "1", "<integer-min1>"),
 ];
 
 pub(crate) const COUNT: usize = PROPS.len();
@@ -217,6 +225,7 @@ enum Leaf {
     IntegerMin1,
     Flex,
     ResolvedColor,
+    Param,
 }
 
 #[derive(Debug)]
@@ -383,6 +392,7 @@ fn leaf_named(name: &str) -> Leaf {
         "integer-min1" => Leaf::IntegerMin1,
         "flex" => Leaf::Flex,
         "color-resolved" => Leaf::ResolvedColor,
+        "param" => Leaf::Param,
         _ => panic!("unknown value-definition leaf"),
     }
 }
@@ -574,7 +584,8 @@ impl Matcher<'_> {
         let text = if self.computed {
             self.compute(syntax, word)?
         } else {
-            typed_numeric::parse_numeric_expression(word)?.serialize_specified()?
+            let text = typed_numeric::parse_numeric_expression(word)?.serialize_specified()?;
+            if text == "0" && syntax.starts_with("<length") { String::from("0px") } else { text }
         };
         if non_negative && text.starts_with('-') {
             if !math {
@@ -652,6 +663,7 @@ impl Matcher<'_> {
                 let value = number.parse::<f64>().ok().filter(|value| value.is_finite() && *value >= 0.0)?;
                 Some(alloc::format!("{}fr", computed_values::number(value as f32)))
             }
+            Leaf::Param => param_function(word),
             Leaf::ResolvedColor => {
                 if self.computed {
                     self.compute("<color>", word)
@@ -661,6 +673,44 @@ impl Matcher<'_> {
             }
         }
     }
+}
+
+fn param_function(word: &str) -> Option<String> {
+    let word = word.trim();
+    let open = word.find('(')?;
+    if !word[..open].eq_ignore_ascii_case("param") || !word.ends_with(')') {
+        return None;
+    }
+    let inner = &word[open + 1..word.len() - 1];
+    let comma = syntax::top_level_find(inner, b',')??;
+    let (head, value) = (inner[..comma].trim(), inner[comma + 1..].trim());
+    let tokens = components(head)?;
+    let (name, kind) = match tokens.as_slice() {
+        [name] => (*name, None),
+        [name, kind] => (*name, Some(*kind)),
+        _ => return None,
+    };
+    let mut at = 0;
+    if !name.starts_with("--") || consume_selector_identifier(name, &mut at).is_none_or(|_| at != name.len()) {
+        return None;
+    }
+    let kind = match kind {
+        None => None,
+        Some(kind) if kind.starts_with('<') && kind.ends_with('>') && registered_properties::valid_typed_syntax(kind) => Some(String::from(kind)),
+        Some(kind) if kind.len() > 6 && kind.as_bytes()[..5].eq_ignore_ascii_case(b"type(") && kind.ends_with(')') => {
+            let syntax = kind[5..kind.len() - 1].trim();
+            if !registered_properties::valid_typed_syntax(syntax) {
+                return None;
+            }
+            let single = syntax.starts_with('<') && syntax.ends_with('>') && !syntax.contains(['|', ' ']);
+            Some(if single { String::from(syntax) } else { alloc::format!("type({syntax})") })
+        }
+        Some(_) => return None,
+    };
+    Some(match kind {
+        Some(kind) => alloc::format!("param({name} {kind}, {value})"),
+        None => alloc::format!("param({name}, {value})"),
+    })
 }
 
 fn path_function(word: &str) -> Option<String> {
@@ -701,6 +751,10 @@ fn join(parts: &[String], separator: &str) -> String {
     text
 }
 
+fn parts_has_scale_down(parts: &[String]) -> bool {
+    parts.iter().any(|part| part == "scale-down")
+}
+
 fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
     match prop.post {
         Post::None => {}
@@ -722,15 +776,19 @@ fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
             }
             parts = grouped;
         }
+        Post::ObjectFit => {
+            if parts_has_scale_down(&parts) {
+                parts.retain(|part| part != "contain");
+            }
+        }
         Post::InsetPair => {
             if parts.len() == 2 && parts[0] == parts[1] {
                 parts.pop();
             }
         }
         Post::ScrollSnapAlign => {
-            if computed && parts.len() == 1 {
-                let first = parts[0].clone();
-                parts.push(first);
+            if parts.len() == 2 && parts[0] == parts[1] {
+                parts.pop();
             }
         }
         Post::ScrollSnapType => {
@@ -809,6 +867,12 @@ fn evaluate(index: usize, raw: &str, context: LengthContext, foreground: Rgba, c
     if prop.name == "font-palette" && super::palette_mix::is_palette_mix(raw) {
         return super::palette_mix::canonicalize(raw, computed);
     }
+    if prop.name == "dynamic-range-limit" && super::dynamic_range_limit::is_mix(raw) {
+        return super::dynamic_range_limit::canonicalize(raw, computed, context);
+    }
+    if prop.name == "image-resolution" {
+        return super::image_resolution::canonicalize(raw);
+    }
     let tokens = tokenize(raw)?;
     if tokens.is_empty() {
         return None;
@@ -845,6 +909,9 @@ pub(crate) fn interpolate(index: usize, from: &str, to: &str, progress: f64) -> 
     if PROPS[index].name == "font-palette" {
         return super::palette_mix::interpolate(from, to, progress);
     }
+    if PROPS[index].name == "dynamic-range-limit" {
+        return super::dynamic_range_limit::interpolate(from, to, progress);
+    }
     if is_discrete(index) {
         return None;
     }
@@ -868,6 +935,9 @@ pub(crate) fn is_discrete(index: usize) -> bool {
     let syntax = PROPS[index].syntax;
     if PROPS[index].name == "overflow-clip-margin" {
         return true;
+    }
+    if PROPS[index].name == "dynamic-range-limit" {
+        return false;
     }
     if syntax == "<color>" {
         return false;
@@ -893,6 +963,7 @@ fn contains_keyword(node: &Node, keyword: &str) -> bool {
         Node::Seq(items) | Node::Alt(items) | Node::AnyOf(items) | Node::AllOf(items) => items.iter().any(|item| contains_keyword(item, keyword)),
         Node::Optional(inner) => contains_keyword(inner, keyword),
         Node::Repeat { node, .. } => contains_keyword(node, keyword),
+        Node::Leaf(Leaf::PaintOrder) => matches!(keyword, "fill" | "stroke" | "markers"),
         Node::Leaf(_) | Node::Comma => false,
     }
 }
@@ -915,7 +986,8 @@ mod tests {
         assert_eq!(value("font-variation-settings", "\"wght\" 4, \"wdth\" 2").as_deref(), Some("\"wght\" 4, \"wdth\" 2"));
         assert_eq!(value("touch-action", "pan-y pan-x").as_deref(), Some("pan-x pan-y"));
         assert_eq!(value("touch-action", "pan-x pan-left"), None);
-        assert_eq!(value("scroll-snap-align", "start").as_deref(), Some("start start"));
+        assert_eq!(value("scroll-snap-align", "start").as_deref(), Some("start"));
+        assert_eq!(value("scroll-snap-align", "start end").as_deref(), Some("start end"));
         assert_eq!(specified("scroll-snap-align", "start").as_deref(), Some("start"));
         assert_eq!(value("scroll-snap-type", "x proximity").as_deref(), Some("x"));
         assert_eq!(value("text-emphasis-position", "over right").as_deref(), Some("over"));

@@ -294,6 +294,12 @@ fn longhands_uncached(name: &str) -> &'static [&'static str] {
             "mask-clip",
             "mask-mode",
             "mask-composite",
+            "mask-border-source",
+            "mask-border-slice",
+            "mask-border-width",
+            "mask-border-outset",
+            "mask-border-repeat",
+            "mask-border-mode",
         ],
         "list-style" => &["list-style-position", "list-style-image", "list-style-type"],
         "outline" => &["outline-color", "outline-style", "outline-width"],
@@ -509,7 +515,7 @@ pub(super) fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declarati
                 .any(|part| matches!(part, component_values::UnparsedComponent::Variable { .. }))
         });
     let owner_dependent=anchor::applies(name,raw)||typed_numeric::substitute_sibling_functions(raw,1,1)
-        .is_some_and(|(_,dependent)|dependent)||!name.starts_with("--")&&super::owner_values::may_use(raw);
+        .is_some_and(|(_,dependent)|dependent)||!name.starts_with("--")&&(super::owner_values::may_use(raw)||super::function_rule::contains_call(raw));
     let mut parsed=Vec::new();
     append_declaration_pair_values(name,raw,0,has_variables||owner_dependent,&mut parsed)?;
     if parsed.is_empty() || !references_parse(raw, MAX_VARIABLE_BYTES) {
@@ -660,7 +666,10 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                     let tokens = components(layer)?;
                     Some(match tokens.as_slice() {
                         [a, b] if a.eq_ignore_ascii_case("text") && b.eq_ignore_ascii_case("border-area") => String::from("border-area text"),
-                        _ => tokens.join(" ").to_ascii_lowercase(),
+                        _ => {
+                            let joined = tokens.join(" ");
+                            if joined.contains('(') { joined } else { joined.to_ascii_lowercase() }
+                        }
                     })
                 }).collect();
                 Some(layers?.join(", "))
@@ -670,7 +679,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "translate"|"rotate"|"scale"=>super::individual_transforms::specified(match name.as_ref(){"translate"=>239,"rotate"=>240,_=>241},raw),
             "font-size-adjust" => super::serialize_declared_font_size_adjust(raw),
             "container-type" => parsed.iter().find_map(|declaration| match declaration.value {
-                Value::ContainerType(value) => Some(value.as_str().into()), _ => None,
+                Value::ContainerType(value, flags) => Some(value.serialize(flags)), _ => None,
             }),
             "animation-name" | "animation-duration" | "animation-delay-start" | "animation-delay-end"
             | "animation-iteration-count" | "animation-direction" | "animation-fill-mode" | "animation-play-state"
@@ -678,9 +687,9 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             | "animation-timing-function" | "transition-property"
  | "transition-duration" | "transition-timing-function" | "transition-delay" | "transition-behavior"
             | "font-style" | "font-width" | "font-feature-settings" | "font-variant-alternates" | "text-transform"
-            | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break"
+            | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break" | "flex-wrap"
             | "border-image-source" | "box-shadow" | "text-shadow"
-            | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" => parsed.iter().find_map(|declaration|
+            | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" | "transform-origin" => parsed.iter().find_map(|declaration|
                 serialize_typed(&declaration.value, raw, &name, &name)),
             "font-family" => parsed.iter().find_map(|declaration| match &declaration.value {
                 Value::FontFamily(value) => Some(serialize_font_families(value)),
@@ -705,11 +714,20 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                 }
             }),
             "grid-lanes-direction" => parsed.iter().find_map(|declaration| {
-                if let Value::GridLanesDirection(direction) = &declaration.value {
-                    Some(computed_values::serialize_lanes_direction(*direction))
+                if let Value::GridLanesDirection(_) = &declaration.value {
+                    Some(
+                        raw.split_ascii_whitespace()
+                            .map(str::to_ascii_lowercase)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
                 } else {
                     None
                 }
+            }),
+            "flex-grow" | "flex-shrink" if !raw.contains('(') => parsed.iter().find_map(|declaration| match declaration.value {
+                Value::FlexGrow(value) | Value::FlexShrink(value) => Some(value.to_string()),
+                _ => None,
             }),
             _ if super::extra_props::property_index(&name).is_some() => parsed.iter().rev().find_map(|declaration| match &declaration.value {
                 Value::ExtraRaw(slot, text) => super::extra_props::serialize_specified(*slot, text),
@@ -718,7 +736,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "color-interpolation-filters"=>parsed.iter().find_map(|declaration|
                 if let Value::SvgFilterColorSpace(value)=declaration.value {Some(value.css_keyword().into())}else{None}),
             "aspect-ratio" if !raw.trim().to_ascii_lowercase().starts_with("var(")=>super::sizing_values::aspect_ratio_specified(raw),
-            "outline-width" | "outline-offset" | "row-gap" | "column-gap" if raw.trim() == "0" => Some("0px".into()),
+            "outline-width" | "outline-offset" | "row-gap" | "column-gap" | "flow-tolerance" if raw.trim() == "0" => Some("0px".into()),
             _ if super::calc_size::unitless_zero(&name,raw).is_some()=>super::calc_size::unitless_zero(&name,raw),
             _ if super::calc_size::applies(&name,raw)=>super::calc_size::specified(&name,raw),
             _ if super::animation_color_property(&name)=>super::serialize_cssom_property_value(&name,raw),
@@ -876,6 +894,12 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                 MaskMode::Luminance => "luminance",
             })),
             join_css_components(parts.composites),
+            String::from("none"),
+            String::from("0"),
+            String::from("auto"),
+            String::from("0"),
+            String::from("stretch"),
+            String::from("alpha"),
         ];
         for (&target, value) in targets.iter().zip(values) {
             entries.push(Entry {
@@ -1018,7 +1042,23 @@ fn canonical_alias_uncached(name: &str) -> &str {
         "-webkit-flex-wrap" => "flex-wrap",
         "-webkit-justify-content" => "justify-content",
         "-webkit-order" => "order",
+        "-webkit-transform" => "transform",
+        "-webkit-transform-origin" => "transform-origin",
+        "-webkit-perspective" => "perspective",
+        "-webkit-perspective-origin" => "perspective-origin",
+        "-webkit-backface-visibility" => "backface-visibility",
         _ => super::corner_radii::alias(name).unwrap_or(name),
+    }
+}
+
+fn specified_flex_wrap(raw: &str, wraps: bool) -> &'static str {
+    let has = |keyword: &str| raw.split_whitespace().any(|word| word.eq_ignore_ascii_case(keyword));
+    match (has("wrap-reverse"), has("balance")) {
+        (true, true) => "wrap-reverse balance",
+        (true, false) => "wrap-reverse",
+        (false, true) => "balance",
+        (false, false) if wraps => "wrap",
+        (false, false) => "nowrap",
     }
 }
 
@@ -1049,7 +1089,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::TextUnderlinePosition(value) => value.serialize(),
         Value::DecorationLength(_,value)=>value.serialize(),
         Value::FontSizeKeyword(value) => value.as_str().into(),
-        Value::ContainerType(value) => value.as_str().into(),
+        Value::ContainerType(value, flags) => value.serialize(*flags),
         Value::ColumnSpan(value)=>value.serialize(),
         Value::ExtraRaw(slot,raw)=>super::extra_props::serialize_specified(*slot,raw)?,
         Value::BoxDecorationBreak(value)=>value.serialize(),
@@ -1133,11 +1173,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         }
         .into(),
         Value::FlexWrap(value) => if *value {
-            if raw.split_whitespace().any(|word| word == "wrap-reverse") {
-                "wrap-reverse"
-            } else {
-                "wrap"
-            }
+            specified_flex_wrap(raw, true)
         } else {
             "nowrap"
         }
@@ -1150,6 +1186,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
             "nowrap"
         }
         .into(),
+        Value::FlexWrapReverseBalance(_) => specified_flex_wrap(raw, true).into(),
         Value::FlexGrow(value) | Value::FlexShrink(value) => value.to_string(),
         Value::FlexBasis(Some(value)) => alloc::format!("{value}px"),
         Value::FlexBasis(None) => "auto".into(),
@@ -1217,7 +1254,10 @@ impl DeclarationBlock {
             let (raw, important) = important_value(raw);
             if keyframes && (important || name.as_ref() == "animation"
                 || name.starts_with("animation-") && !matches!(name.as_ref(),
-                    "animation-timing-function" | "animation-composition")) {
+                    "animation-timing-function" | "animation-composition")
+                || name.as_ref() == "transition" || name.starts_with("transition-")
+                || name.as_ref() == "interpolate-size"
+                || matches!(name.as_ref(), "container" | "container-name" | "container-type")) {
                 continue;
             }
             let Some(entries) = expansion(name, raw, important)? else {
@@ -1420,6 +1460,7 @@ impl DeclarationBlock {
     }
     pub fn len(&self)->usize{self.views().count()}
     pub fn retain_properties(&mut self,keep:impl Fn(&str)->bool){self.entries.retain(|entry|keep(&entry.name));}
+    pub fn retain_declarations(&mut self,keep:impl Fn(&str,bool)->bool){self.entries.retain(|entry|keep(&entry.name,entry.important));}
     pub fn is_empty(&self)->bool{self.entries.is_empty()}
 
     pub fn value(&self, name: &str) -> Option<(String, bool)> {
@@ -1740,6 +1781,23 @@ const SHORTHANDS: &[&str] = &[
     "corner-inline-end-shape",
     "corner-block-start-shape",
     "corner-block-end-shape",
+    "corner",
+    "corner-top-left",
+    "corner-top-right",
+    "corner-bottom-right",
+    "corner-bottom-left",
+    "corner-start-start",
+    "corner-start-end",
+    "corner-end-start",
+    "corner-end-end",
+    "corner-top",
+    "corner-right",
+    "corner-bottom",
+    "corner-left",
+    "corner-block-start",
+    "corner-block-end",
+    "corner-inline-start",
+    "corner-inline-end",
     "list-style",
     "overflow",
 ];
@@ -1817,7 +1875,7 @@ fn synthesize(name: &str, values: &[&str]) -> Option<String> {
         return serialize_background(values);
     }
     if name == "mask" {
-        return super::mask_shorthand::synthesize(values);
+        return super::mask_shorthand::synthesize_with_border(values);
     }
     if name == "list-style" {
         let mut result = [""; 3];
@@ -1965,6 +2023,10 @@ pub(super) fn serialize_background_box(value: BackgroundBox) -> &'static str {
         BackgroundBox::Text => "text",
         BackgroundBox::BorderArea => "border-area",
         BackgroundBox::BorderAreaText => "border-area text",
+        BackgroundBox::Fill => "fill-box",
+        BackgroundBox::Stroke => "stroke-box",
+        BackgroundBox::View => "view-box",
+        BackgroundBox::NoClip => "no-clip",
     }
 }
 
@@ -2434,7 +2496,7 @@ mod tests {
         );
         assert_eq!(
             block.value("grid-lanes-direction").unwrap().0,
-            "row fill-reverse track-reverse"
+            "row track-reverse fill-reverse"
         );
         let text = block.serialize().unwrap();
         let roundtrip = DeclarationBlock::parse(&text).unwrap();

@@ -855,12 +855,15 @@ impl Interp {
         if let Some(src) = src {
             self.push_script_frame(Rc::new(ScriptFrame { src, eval }));
         }
+        let saved_in_native = std::mem::replace(&mut self.in_native_call, false);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
             Ok(result) => {
+                self.in_native_call = saved_in_native;
                 self.pop_pushed_frame(depth, 0);
                 result
             }
             Err(payload) => {
+                self.in_native_call = saved_in_native;
                 // A Rust panic can unwind through several interpreter calls without their
                 // ordinary frame-pop paths. Remove every frame created beneath this Script and
                 // restore the caller's raw native/JIT stack heads before resuming the panic.

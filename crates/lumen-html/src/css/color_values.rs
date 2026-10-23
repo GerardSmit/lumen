@@ -383,7 +383,10 @@ fn serialize_origin(raw:&str,depth:u8,computed:Option<(LengthContext,ContainerUn
     let canonical=match name.as_ref() {"rgba"=>"rgb","hsla"=>"hsl","rgb"|"hsl"|"hwb"|"lab"|"lch"|"oklab"|"oklch"|"color"=>name.as_ref(),_=>return serialize_source(raw,depth,None,exact)};
     let body=body.strip_suffix(')')?;
     if components(body)?.first().is_some_and(|token|decoded_css_keyword(token,"from")) {return serialize_source(raw,depth,None,exact);}
-    endpoint(raw,depth)?;
+    let value=endpoint(raw,depth)?;
+    if matches!(canonical,"rgb"|"hsl"|"hwb")&&!components(body)?.iter().any(|token|decoded_css_keyword(token,"none")) {
+        return Some(super::computed_values::color(rgba(value)));
+    }
     let mut values=color_components(body)?;
     let mut result=alloc::format!("{canonical}(");
     if canonical=="color" {

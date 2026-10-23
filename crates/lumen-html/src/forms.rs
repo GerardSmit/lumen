@@ -1572,7 +1572,16 @@ fn range_round_and_clamp(
     }
     // HTML's nearest-step rule resolves exact ties toward positive infinity.
     let index = (quotient + 0.5).floor().clamp(lower, upper);
-    index.mul_add(step, base).clamp(minimum, maximum)
+    drop_binary_noise(index.mul_add(step, base)).clamp(minimum, maximum)
+}
+
+/// Step arithmetic is decimal in HTML, so `6 * 0.1` is `0.6`: keep 15
+/// significant digits to discard the binary representation error.
+fn drop_binary_noise(value: f64) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    alloc::format!("{value:.14e}").parse::<f64>().unwrap_or(value)
 }
 
 fn normalize_local_datetime(value: &str) -> Option<String> {
@@ -3360,8 +3369,9 @@ pub fn input_step_value(
     if !result.is_finite() {
         return Ok(None);
     }
-    if matches!(direction, InputStepDirection::Up) && result < before
-        || matches!(direction, InputStepDirection::Down) && result > before
+    if parsed_before.is_some()
+        && (matches!(direction, InputStepDirection::Up) && result < before
+            || matches!(direction, InputStepDirection::Down) && result > before)
     {
         return Ok(None);
     }
@@ -3525,15 +3535,16 @@ pub fn validity_with_view(
             }
             Some(InputValueMode::DefaultOn) if type_name == "radio" => {
                 let group = attribute(document, node, "name").unwrap_or("");
-                let group_required = if group.is_empty() {
+                if group.is_empty() {
                     required
+                        && attribute(document, node, "name").is_none()
+                        && !checked_by(document, node, |control| view.checkedness(control))
                 } else {
                     radio_group_required(document, node, group)
-                };
-                group_required
-                    && !tree_contains_checked_radio_by(document, node, group, |control| {
-                        view.checkedness(control)
-                    })
+                        && !tree_contains_checked_radio_by(document, node, group, |control| {
+                            view.checkedness(control)
+                        })
+                }
             }
             Some(InputValueMode::Filename) if required => !view.has_selected_files(node),
             Some(InputValueMode::Value)
@@ -3640,6 +3651,7 @@ fn tree_contains_checked_radio_by(
     mut checkedness: impl FnMut(NodeId) -> Option<bool>,
 ) -> bool {
     let root = tree_root(document, node);
+    let owner = form_owner(document, node);
     let mut current = Some(root);
     while let Some(candidate) = current {
         if element(document, candidate).is_some_and(|(tag, _)| {
@@ -3648,6 +3660,7 @@ fn tree_contains_checked_radio_by(
                     .unwrap_or("text")
                     .eq_ignore_ascii_case("radio")
                 && attribute(document, candidate, "name") == Some(group)
+                && form_owner(document, candidate) == owner
                 && checkedness(candidate)
                     .unwrap_or_else(|| attribute(document, candidate, "checked").is_some())
         }) {
@@ -3862,6 +3875,45 @@ fn pattern_mismatch(pattern: &str, value: &str, multiple_email: bool) -> bool {
     } else {
         mismatch(value)
     }
+}
+
+/// A textarea's form value: newlines normalized to LF, then hard-wrapped at
+/// `cols` characters when `wrap` is `hard`.
+fn textarea_entry_value(document: &Document, node: NodeId, raw: &str) -> String {
+    let normalized = if raw.contains('\r') {
+        raw.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        raw.to_owned()
+    };
+    if !attribute(document, node, "wrap").is_some_and(|wrap| wrap.eq_ignore_ascii_case("hard")) {
+        return normalized;
+    }
+    let cols = attribute(document, node, "cols")
+        .and_then(|cols| {
+            let digits = cols.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+            digits[..end].parse::<usize>().ok()
+        })
+        .filter(|cols| *cols > 0)
+        .unwrap_or(20);
+    let mut wrapped = String::with_capacity(normalized.len());
+    for (index, line) in normalized.split('\n').enumerate() {
+        if index != 0 {
+            wrapped.push('\n');
+        }
+        let characters: Vec<char> = line.chars().collect();
+        let mut start = 0;
+        while characters.len() - start > cols {
+            let limit = start + cols;
+            let space = (start + 1..=limit).rev().find(|at| characters[*at] == ' ');
+            let end = space.map_or(limit, |at| at + 1);
+            wrapped.extend(&characters[start..end]);
+            wrapped.push('\n');
+            start = end;
+        }
+        wrapped.extend(&characters[start..]);
+    }
+    wrapped
 }
 
 fn valid_email_address(value: &str) -> bool {
@@ -4103,10 +4155,11 @@ pub fn append_form_entries_for_control(document:&Document,node:NodeId,submitter:
         let value = if tag == "input" && input_type == "hidden" && name.eq_ignore_ascii_case("_charset_") {
             encoding.to_owned()
         } else if tag == "textarea" {
-            state
+            let raw = state
                 .value_for_control(node)
                 .map(str::to_owned)
-                .unwrap_or_else(|| control_value(document, node, tag))
+                .unwrap_or_else(|| control_value(document, node, tag));
+            textarea_entry_value(document, node, &raw)
         } else if is_checkbox || is_radio {
             attribute(document, node, "value")
                 .unwrap_or("on")
@@ -4977,7 +5030,7 @@ mod tests {
         );
         assert_eq!(
             input_step_value(&document, id("positive"), "", 1, InputStepDirection::Down),
-            Ok(None)
+            Ok(Some("7".into()))
         );
         assert_eq!(
             input_step_value(&document, id("negative"), "", 1, InputStepDirection::Down),

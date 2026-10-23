@@ -2,26 +2,49 @@
 use super::*;
 use lumen_html::css::{Display, Position};
 
+#[derive(Clone, Copy)]
 struct Step {
-    style: lumen_html::css::Style,
+    position: Position,
+    display: Display,
+    forms_fixed_containing_block: bool,
+    scroll_container: bool,
 }
 
 impl Step {
-    fn forms_containing_block(&self, fixed: bool) -> bool {
-        let style = &self.style;
+    fn of(style: &lumen_html::css::Style) -> Self {
         let contained = (style.contain_layout || style.contain_paint) && style.display != Display::Contents;
-        style.has_transform() || contained || (!fixed && style.position != Position::Static)
+        Self {
+            position: style.position,
+            display: style.display,
+            forms_fixed_containing_block: style.has_transform() || contained,
+            scroll_container: style.display != Display::Contents
+                && (style.overflow_x.scroll_container() || style.overflow_y.scroll_container()),
+        }
     }
 
-    fn scroll_container(&self) -> bool {
-        self.style.display != Display::Contents
-            && (self.style.overflow_x.scroll_container() || self.style.overflow_y.scroll_container())
+    fn forms_containing_block(&self, fixed: bool) -> bool {
+        self.forms_fixed_containing_block || (!fixed && self.position != Position::Static)
     }
 }
+
+/// Computed-style summaries of the elements visited by one batch of
+/// `scroll_parent` queries.
+#[derive(Default)]
+pub(crate) struct StepCache(std::collections::HashMap<NodeId, Option<Step>>);
 
 pub(crate) fn scroll_parent(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Option<NodeId>> {
     realm.flush_layout()?;
     let scrolling = scrolling::document_scrolling_element(realm)?;
+    scroll_parent_cached(realm, node, scrolling, &mut StepCache::default())
+}
+
+/// `scroll_parent` for a fresh layout and a known scrolling element.
+pub(crate) fn scroll_parent_cached(
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    scrolling: Option<NodeId>,
+    cache: &mut StepCache,
+) -> OpResult<Option<NodeId>> {
     let mut session = realm.session.borrow_mut();
     if session.client_fragment_boxes(node).is_empty() || Some(node) == scrolling {
         return Ok(None);
@@ -30,11 +53,11 @@ pub(crate) fn scroll_parent(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Opti
     if Some(node) == root {
         return Ok(None);
     }
-    let style_of = |id: NodeId, session: &mut RenderSession| -> Option<Step> {
-        session.computed_style(id).ok().map(|style| Step { style })
+    let mut style_of = |id: NodeId, session: &mut RenderSession| -> Option<Step> {
+        *cache.0.entry(id).or_insert_with(|| session.computed_style(id).ok().map(|style| Step::of(&style)))
     };
     let Some(start) = style_of(node, &mut session) else { return Ok(None) };
-    let mut position = start.style.position;
+    let mut position = start.position;
     let mut current = node;
     for _ in 0..4096 {
         let fixed = position == Position::Fixed;
@@ -51,7 +74,7 @@ pub(crate) fn scroll_parent(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Opti
                 break;
             }
             let Some(step) = style_of(id, &mut session) else { return Ok(None) };
-            if step.style.display == Display::Contents || step.style.display == Display::None {
+            if step.display == Display::Contents || step.display == Display::None {
                 candidate = session.document().flat_tree_parent(id).map_err(dom_error)?;
                 continue;
             }
@@ -68,10 +91,10 @@ pub(crate) fn scroll_parent(realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Opti
         let Some(step) = step else {
             return Ok(if fixed { None } else { scrolling });
         };
-        if step.scroll_container() {
+        if step.scroll_container {
             return Ok(Some(id));
         }
-        position = step.style.position;
+        position = step.position;
         current = id;
     }
     Ok(None)

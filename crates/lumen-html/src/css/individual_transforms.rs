@@ -132,7 +132,7 @@ pub(super) fn combine(slot:usize,from:&str,to:&str,operation:registered_properti
     if slot==240 {
         let scalars=|value:&IndividualTransform|->Option<[f64;4]>{Some(core::array::from_fn(|i|value.arguments[i].single_numeric_value().map(|v|v.value).unwrap_or(f64::NAN))).filter(|values|values.iter().all(|v|v.is_finite()))};
         let result=typed_transforms::combine_rotation_arguments(scalars(&a)?,scalars(&b)?,operation)?;
-        return IndividualTransform{slot,arguments:result.into_iter().enumerate().map(|(i,n)|value(n,if i==3{U::Deg}else{U::Number})).collect()}.computed_css_value();
+        return IndividualTransform{slot,arguments:result.into_iter().enumerate().map(|(i,n)|value(computed_values::round_significant_6(n),if i==3{U::Deg}else{U::Number})).collect()}.computed_css_value();
     }
     let mut result=a.clone();
     for i in 0..3 {
@@ -142,6 +142,10 @@ pub(super) fn combine(slot:usize,from:&str,to:&str,operation:registered_properti
                 let number=match operation{Op::Interpolate(p)=>x.value+(y.value-x.value)*p,Op::Add=>if slot==241{x.value*y.value}else{x.value+y.value},Op::Accumulate(n)=>n*(x.value-if slot==241{1.0}else{0.0})+y.value};
                 if !number.is_finite(){return None;}result.arguments[i]=value(number,x.unit);continue;
             }
+        }
+        if left.contains_unit(|unit|unit==U::Percent)||right.contains_unit(|unit|unit==U::Percent) {
+            let weights=match operation{Op::Interpolate(p)=>(1.0-p,p),Op::Add=>(1.0,1.0),Op::Accumulate(n)=>(n,1.0)};
+            if let Some(mixed)=linear_numeric::weighted_pair(&[(left,weights.0),(right,weights.1)]) {result.arguments[i]=mixed;continue;}
         }
         let left=left.serialize()?;let right=right.serialize()?;
         let combined=match operation{Op::Interpolate(p)=>crate::animation::combine_numeric_values(&[(&left,1.0-p),(&right,p)]),Op::Add=>crate::animation::combine_numeric_values(&[(&left,1.0),(&right,1.0)]),Op::Accumulate(n)=>crate::animation::combine_numeric_values(&[(&left,n),(&right,1.0)])}?;

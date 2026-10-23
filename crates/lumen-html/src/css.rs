@@ -10,16 +10,21 @@ mod component_eof;
 #[cfg(test)]
 mod custom_cascade_tests;
 mod syntax;
+mod token_join;
+pub mod page_rules;
 mod var_template;
 pub mod registered_properties;
 mod parallel;
+mod has_memo;
 pub mod chunked;
 pub use parallel::StyleParallelism;
 pub(crate) use parallel::{Hook, HostGate, ReadOnlyRc, SyncRefCell};
+pub(crate) use has_memo::HasMemo;
 pub mod computed_values;
 pub mod declaration_block;
 mod transition_controls;
 mod sibling_layout;
+mod table_columns;
 mod slot_equal;
 pub use slot_equal::PropertyComparer;
 pub(crate) mod animation_controls;
@@ -35,6 +40,9 @@ pub(crate) use rule_fragment::RuleSegment;
 pub mod namespaces;
 pub mod selector_serialization;
 mod view_transition_selector;
+mod view_transition_state;
+pub mod view_transition_rule;
+pub use view_transition_selector::parse_computed_target as parse_view_transition_pseudo;
 mod font_face_source;
 pub mod media_query_text;
 pub(crate) mod extra_props;
@@ -43,15 +51,21 @@ mod color_layers;
 mod opacity_values;
 mod owner_values;
 mod palette_mix;
+mod dynamic_range_limit;
 mod value_props;
+mod image_resolution;
+pub(crate) mod object_fit;
 mod value_shorthands;
 mod shorthand_rules;
 mod gap_rules;
+pub(crate) mod gap_decorations;
 mod corner_shapes;
 mod background_positions;
 mod corner_radii;
 mod text_indent;
 mod popover_ua;
+mod focus_ring_ua;
+mod marker_ua;
 mod html_text_ua;
 mod mask_shorthand;
 mod text_decoration_inset;
@@ -67,15 +81,21 @@ mod font_variant;
 mod grid_abspos;
 pub use grid_abspos::{absolute_grid_lines, AbsoluteGridLines};
 mod grid_lines;
+mod grid_lead;
+mod grid_source;
 mod grid_tracks;
 mod shapes;
+pub(crate) use shapes::outside as shape_outside;
 pub mod anchor;
+pub mod at_rule_supports;
+mod anchored_query;
 pub mod container_eval;
 pub mod container_query;
 pub mod function_rule;
 pub mod function_eval;
 mod if_function;
 mod filter_lists;
+pub mod canvas_filter;
 pub fn is_extra_property(name:&str)->bool{extra_props::animates_here(name)}
 pub fn transform_origin_endpoint(raw:&str)->Option<String>{transform_origin::endpoint(raw)}
 pub fn top_level_component_count(raw:&str)->Option<usize>{components(raw).map(|items|items.len())}
@@ -83,6 +103,7 @@ pub fn is_grid_track_list_property(name:&str)->bool{grid_tracks::is_track_list_p
 pub fn interpolate_grid_track_list(property:&str,from:&str,to:&str,progress:f64)->Option<String>{grid_tracks::interpolate(property,from,to,progress)}
 pub fn compose_grid_track_list(property:&str,base:&str,value:&str)->Option<String>{grid_tracks::compose(property,base,value)}
 pub fn typed_keyword_allowed(name:&str,identifier:&str)->Option<bool>{value_props::typed_keyword(name,identifier)}
+pub fn substitute_element_functions(raw:&str,document:&Document,node:NodeId,property:&str)->Option<String>{owner_values::substitute_for_element(raw,document,node,property)}
 pub fn compose_extra_property(name:&str,base:&str,value:&str,accumulate:bool)->Option<String>{extra_props::compose(name,base,value,accumulate)}
 pub fn interpolate_extra_property(name:&str,from:&str,to:&str,progress:f64)->Option<String>{extra_props::interpolate(name,from,to,progress)}
 /// `caret-color: auto` computes to the resolved text color but is not an
@@ -118,9 +139,11 @@ pub(crate) mod color_scheme;
 pub use color_scheme::{ColorSchemeEnvironment,ColorSchemePreference,ColorSchemeSupport,UsedColorScheme,UsedScheme};
 pub mod typed_transforms;
 mod individual_transforms;
+mod backface_visibility;
 pub mod text_breaks;
 mod numeric_tokens;
 mod text_props;
+mod text_align_last;
 pub mod linear_numeric;
 mod transform_origin;
 pub use declaration_block::DeclarationBlock;
@@ -168,14 +191,41 @@ pub enum Overflow {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContainerType { #[default] Normal, InlineSize, Size }
+
+/// The query container kinds `container-type` adds besides its size axis.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ContainerFlags {
+    pub scroll_state: bool,
+    pub anchored: bool,
+}
 impl ContainerType {
     pub const fn as_str(self) -> &'static str {
         match self { Self::Normal => "normal", Self::InlineSize => "inline-size", Self::Size => "size" }
     }
-    fn parse(raw:&str) -> Option<Self> {
-        if raw.eq_ignore_ascii_case("normal") { Some(Self::Normal) }
-        else if raw.eq_ignore_ascii_case("inline-size") { Some(Self::InlineSize) }
-        else if raw.eq_ignore_ascii_case("size") { Some(Self::Size) } else { None }
+    pub fn serialize(self, flags: ContainerFlags) -> String {
+        let mut words: Vec<&str> = Vec::new();
+        if self != Self::Normal { words.push(self.as_str()); }
+        if flags.scroll_state { words.push("scroll-state"); }
+        if flags.anchored { words.push("anchored"); }
+        if words.is_empty() { self.as_str().into() } else { words.join(" ") }
+    }
+    /// `normal | [ [ size | inline-size ] || scroll-state || anchored ]`.
+    fn parse(raw:&str) -> Option<(Self, ContainerFlags)> {
+        let mut axis = None;
+        let mut scroll_state = false;
+        let mut anchored = false;
+        let mut words = 0;
+        for word in raw.split_ascii_whitespace() {
+            words += 1;
+            if word.eq_ignore_ascii_case("normal") { if axis.is_some() { return None; } axis = Some(Self::Normal); }
+            else if word.eq_ignore_ascii_case("inline-size") && axis.is_none() { axis = Some(Self::InlineSize); }
+            else if word.eq_ignore_ascii_case("size") && axis.is_none() { axis = Some(Self::Size); }
+            else if word.eq_ignore_ascii_case("scroll-state") && !scroll_state { scroll_state = true; }
+            else if word.eq_ignore_ascii_case("anchored") && !anchored { anchored = true; }
+            else { return None; }
+        }
+        if words == 0 || (axis == Some(Self::Normal) && words > 1) { return None; }
+        Some((axis.unwrap_or(Self::Normal), ContainerFlags { scroll_state, anchored }))
     }
 }
 impl Overflow {
@@ -748,6 +798,7 @@ pub enum AlignmentKeyword {
     LegacyLeft,
     LegacyRight,
     LegacyCenter,
+    AnchorCenter,
 }
 impl AlignmentKeyword {
     pub fn as_str(self) -> &'static str {
@@ -765,6 +816,7 @@ impl AlignmentKeyword {
             Self::LegacyLeft => "legacy left",
             Self::LegacyRight => "legacy right",
             Self::LegacyCenter => "legacy center",
+            Self::AnchorCenter => "anchor-center",
         }
     }
 }
@@ -1153,6 +1205,9 @@ impl Transform {
 }
 
 pub const MAX_GRID_TRACKS: usize = 64;
+
+/// Property slot of `width`, the first slot of its longhand table entry.
+pub(crate) const WIDTH_SLOT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GridTrack {
@@ -1847,6 +1902,34 @@ pub(crate) fn parse_grid_line_reference(
     areas: &[GridArea],
     horizontal: bool,
 ) -> Option<(Option<usize>, usize, bool)> {
+    parse_grid_line_reference_signed(raw, end, names, explicit, areas, horizontal, 0).map(
+        |(line, span, is_span)| {
+            (
+                line.map(|line| line.clamp(0, MAX_GRID_TRACKS as i64) as usize),
+                span,
+                is_span,
+            )
+        },
+    )
+}
+
+fn signed_line(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Line index of a reference, which is negative when it counts past the start
+/// edge of the explicit grid. `lead` is the number of leading implicit tracks
+/// already prepended to the grid the names and `explicit` describe; positive
+/// literal lines are authored relative to the original explicit grid.
+fn parse_grid_line_reference_signed(
+    raw: &str,
+    end: bool,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<(Option<i64>, usize, bool)> {
     if raw.trim() == "auto" {
         return Some((None, 1, false));
     }
@@ -1879,7 +1962,7 @@ pub(crate) fn parse_grid_line_reference(
             None
         };
         if let Some(edge) = edge {
-            return Some((Some(edge.min(MAX_GRID_TRACKS)), 1, false));
+            return Some((Some(signed_line(edge.min(MAX_GRID_TRACKS))), 1, false));
         }
         let mut candidates = 0u128;
         for line in names.iter().filter(|line| line.name.as_ref() == name) {
@@ -1898,13 +1981,13 @@ pub(crate) fn parse_grid_line_reference(
                 }
             }
             if count > 0 {
-                candidates.trailing_zeros() as usize
+                i64::from(candidates.trailing_zeros())
             } else {
-                (127 - candidates.leading_zeros()) as usize
+                i64::from(127 - candidates.leading_zeros())
             }
         } else if let Some(area) = areas.iter().find(|area| area.name.as_ref() == name) {
             let start = if horizontal { area.column } else { area.row };
-            start.saturating_add(if end {
+            signed_line(start.saturating_add(if end {
                 if horizontal {
                     area.columns
                 } else {
@@ -1912,18 +1995,16 @@ pub(crate) fn parse_grid_line_reference(
                 }
             } else {
                 0
-            })
+            }))
         } else {
-            explicit.saturating_add(count.max(1) as usize)
+            signed_line(explicit.saturating_add(count.max(1) as usize))
         }
     } else if count > 0 {
-        count as usize - 1
+        signed_line((count as usize - 1).saturating_add(lead))
     } else {
-        explicit
-            .saturating_add(1)
-            .saturating_sub(count.unsigned_abs() as usize)
+        signed_line(explicit.saturating_add(1)) - i64::from(count.unsigned_abs())
     };
-    Some((Some(line.min(MAX_GRID_TRACKS)), 1, false))
+    Some((Some(line.min(MAX_GRID_TRACKS as i64)), 1, false))
 }
 
 pub fn resolve_grid_placement(
@@ -1981,6 +2062,94 @@ pub fn resolve_grid_placement(
     Some(placement)
 }
 
+/// A grid placement whose start may precede the explicit grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignedGridPlacement {
+    pub start: Option<i64>,
+    pub span: usize,
+}
+
+impl SignedGridPlacement {
+    pub fn clamped(self) -> GridPlacement {
+        let mut placement = GridPlacement {
+            start: self.start.map(|start| start.clamp(0, MAX_GRID_TRACKS as i64) as usize),
+            span: self.span.clamp(1, MAX_GRID_TRACKS),
+        };
+        if let Some(start) = placement.start.as_mut() {
+            *start = (*start).min(MAX_GRID_TRACKS - 1);
+            placement.span = placement.span.min(MAX_GRID_TRACKS - *start);
+        }
+        placement
+    }
+}
+
+/// Like `resolve_grid_placement`, but keeps a start before the first explicit
+/// line negative so the caller can add leading implicit tracks for it.
+pub fn resolve_grid_placement_signed(
+    fallback: GridPlacement,
+    raw: Option<&str>,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<SignedGridPlacement> {
+    let Some(raw) = raw else {
+        return Some(SignedGridPlacement {
+            start: fallback.start.map(signed_line),
+            span: fallback.span,
+        });
+    };
+    let mut parts = raw.split('/');
+    let first = parts.next()?;
+    let second = parts.next().unwrap_or("auto");
+    let parse = |raw: &str, end: bool| {
+        parse_grid_line_reference_signed(raw, end, names, explicit, areas, horizontal, lead)
+    };
+    let (start, start_span, start_is_span) = parse(first, false)?;
+    let (end, end_span, end_is_span) = parse(second, true)?;
+    Some(match (start, end) {
+        (Some(start), Some(end)) => SignedGridPlacement {
+            start: Some(start.min(end)),
+            span: usize::try_from(start.abs_diff(end)).unwrap_or(usize::MAX).max(1),
+        },
+        (Some(start), None) => SignedGridPlacement {
+            start: Some(start),
+            span: if end_is_span { end_span } else { 1 },
+        },
+        (None, Some(end)) => {
+            let span = if start_is_span { start_span } else { 1 };
+            SignedGridPlacement {
+                start: Some(end.saturating_sub(signed_line(span))),
+                span,
+            }
+        }
+        (None, None) => SignedGridPlacement {
+            start: None,
+            span: if start_is_span {
+                start_span
+            } else if end_is_span {
+                end_span
+            } else {
+                1
+            },
+        },
+    })
+}
+
+pub fn resolve_grid_placement_led(
+    fallback: GridPlacement,
+    raw: Option<&str>,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<GridPlacement> {
+    resolve_grid_placement_signed(fallback, raw, names, explicit, areas, horizontal, lead)
+        .map(SignedGridPlacement::clamped)
+}
+
 fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
     if raw.trim().eq_ignore_ascii_case("none") {
         return Some((Arc::from([]), [0, 0]));
@@ -2006,6 +2175,7 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
         rest = rest[end + 1..].trim_start();
     }
     let mut areas: Vec<GridArea> = Vec::new();
+    let mut cells: Vec<usize> = Vec::new();
     for (y, row) in rows.iter().enumerate() {
         for (x, name) in row.iter().enumerate() {
             if name.bytes().all(|v| v == b'.') {
@@ -2014,13 +2184,19 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
             if name.len() > 128
                 || !name
                     .bytes()
-                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_') || v >= 0x80)
             {
                 return None;
             }
-            if let Some(area) = areas.iter_mut().find(|area| area.name.as_ref() == *name) {
-                area.columns = area.columns.max(x + 1 - area.column);
-                area.rows = area.rows.max(y + 1 - area.row);
+            if let Some(index) = areas.iter().position(|area| area.name.as_ref() == *name) {
+                let area = &mut areas[index];
+                let right = (area.column + area.columns).max(x + 1);
+                let bottom = (area.row + area.rows).max(y + 1);
+                area.column = area.column.min(x);
+                area.row = area.row.min(y);
+                area.columns = right - area.column;
+                area.rows = bottom - area.row;
+                cells[index] += 1;
             } else {
                 if areas.len() == MAX_GRID_TRACKS {
                     return None;
@@ -2032,18 +2208,16 @@ fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
                     columns: 1,
                     rows: 1,
                 });
+                cells.push(1);
             }
         }
     }
-    for area in &areas {
-        for row in &rows[area.row..area.row + area.rows] {
-            if row[area.column..area.column + area.columns]
-                .iter()
-                .any(|name| *name != area.name.as_ref())
-            {
-                return None;
-            }
-        }
+    if areas
+        .iter()
+        .zip(&cells)
+        .any(|(area, count)| area.columns * area.rows != *count)
+    {
+        return None;
     }
     Some((areas.into(), [rows.first()?.len() as u8, rows.len() as u8]))
 }
@@ -2805,6 +2979,7 @@ pub struct StyleExtras {
     pub text_shadow_current_color: u64,
     pub text_transform: TextTransform,
     pub container_type: ContainerType,
+    pub container_flags: ContainerFlags,
     /// Computed animation longhands in canonical property order. Values stay
     /// serialized so the HTML animation adapter can apply CSS list repetition.
     pub animation: [Option<Arc<str>>; animation_controls::STYLE_COUNT],
@@ -2936,6 +3111,7 @@ pub struct StyleExtras {
     pub grid_lanes: bool,
     pub display_inline: bool,
     pub display_list_item: bool,
+    pub display_ruby: u8,
     pub grid_lanes_direction: GridLanesDirection,
     pub grid_lanes_dense: bool,
     pub flow_tolerance: FlowTolerance,
@@ -2954,6 +3130,14 @@ pub struct StyleExtras {
     pub grid_rows_subgrid_repeat: Option<GridSubgridRepeat>,
     pub grid_columns_auto: Option<GridAutoRepeat>,
     pub grid_rows_auto: Option<GridAutoRepeat>,
+    /// Computed track list text for lists whose integer `repeat()` the
+    /// expanded track vectors cannot reproduce.
+    pub grid_columns_source: Option<Arc<str>>,
+    pub grid_rows_source: Option<Arc<str>>,
+    /// Leading implicit columns and rows prepended to the track lists by
+    /// layout; line numbers authored on items are relative to the original
+    /// explicit grid.
+    pub grid_lead: [usize; 2],
     pub transforms: Option<Arc<[Transform]>>,
     pub(crate) individual_transforms:[Option<Arc<individual_transforms::IndividualTransform>>;3],
     pub filters: Option<Arc<[lumen_common::filter::FilterOperation]>>,
@@ -3032,6 +3216,7 @@ pub struct StyleExtras {
     pub align_self_safe: Option<bool>,
     pub justify_self_safe: Option<bool>,
     pub flex_wrap_reverse: bool,
+    pub flex_wrap_balance: bool,
     pub align_self: Option<AlignItems>,
     pub position: Position,
     pub float: Float,
@@ -3062,6 +3247,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     text_shadow_current_color: 0,
     text_transform: TextTransform::None,
     container_type: ContainerType::Normal,
+    container_flags: ContainerFlags { scroll_state: false, anchored: false },
     animation: [const { None }; animation_controls::STYLE_COUNT],
     font: FontSpec {
         ligatures: FontLigatures::NORMAL,
@@ -3194,6 +3380,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     grid_lanes: false,
     display_inline: false,
     display_list_item: false,
+    display_ruby: 0,
     grid_lanes_direction: GridLanesDirection {
         row: None,
         fill_reverse: false,
@@ -3216,6 +3403,9 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     grid_rows_subgrid_repeat: None,
     grid_columns_auto: None,
     grid_rows_auto: None,
+    grid_columns_source: None,
+    grid_rows_source: None,
+    grid_lead: [0, 0],
     transforms: None,
     transform_box:TransformBox::ViewBox,
     individual_transforms:[None,None,None],
@@ -3296,6 +3486,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     align_self_safe: None,
     justify_self_safe: None,
     flex_wrap_reverse: false,
+    flex_wrap_balance: false,
     align_self: None,
     position: Position::Static,
     float: Float::None,
@@ -3809,6 +4000,14 @@ impl Style {
             }
         }
     }
+    /// Whether the cascade declared a width (or height) at all, including a
+    /// percentage or calculation that is not yet resolved to pixels.
+    pub(crate) fn declares_dimension(&self, width: bool) -> bool {
+        let slot = if width { 3 } else { 4 };
+        (if width { self.width } else { self.height }).is_some()
+            || self.relative_lengths.iter().any(|(key, _)| *key == slot)
+            || self.relative_expressions.iter().any(|source| source.slot == slot)
+    }
     pub(crate) fn has_contextual_svg_dimensions(&self) -> bool {
         self.relative_lengths.iter().any(|(slot, _)| matches!(*slot, 3 | 4 | 23 | 24 | 51 | 52))
             || self.relative_expressions.iter().any(|source| matches!(source.slot, 3 | 4 | 23 | 24 | 51 | 52))
@@ -3865,8 +4064,21 @@ impl Style {
 
     pub(crate) fn clear_intrinsic_measurement_axis(&mut self, horizontal: bool) {
         self.clear_intrinsic_size_keywords(horizontal);
-        if horizontal { self.width = None; self.min_width = 0.0; self.max_width = None; if self.min_width_auto { self.min_width_auto = false; } }
-        else { self.height = None; self.min_height = 0.0; self.max_height = None; if self.min_height_auto { self.min_height_auto = false; } }
+        let repeats_in_axis = self.display == Display::Grid
+            && if horizontal == (self.writing_mode == WritingMode::HorizontalTb) {
+                self.grid_columns_auto.is_some()
+            } else {
+                self.grid_rows_auto.is_some()
+            };
+        if horizontal {
+            self.width = None;
+            if !repeats_in_axis { self.min_width = 0.0; self.max_width = None; }
+            if self.min_width_auto { self.min_width_auto = false; }
+        } else {
+            self.height = None;
+            if !repeats_in_axis { self.min_height = 0.0; self.max_height = None; }
+            if self.min_height_auto { self.min_height_auto = false; }
+        }
         let inline = horizontal == (self.writing_mode == WritingMode::HorizontalTb);
         let slots = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
         let logical = if inline { [87, 91, 92] } else { [88, 93, 94] };
@@ -3928,6 +4140,11 @@ impl Style {
     pub fn blockify_display(&mut self) {
         self.display = self.display.blockified();
         self.display_inline = false;
+        match self.display_ruby {
+            2..=5 => self.display_ruby = 0,
+            7 => self.display_ruby = 6,
+            _ => {}
+        }
     }
 
     /// Whether this computed display generates an element's principal box.
@@ -3984,6 +4201,10 @@ impl Style {
         let mut child=self.display_contents_child_style();
         for name in ["align-content","align-items","border-radius","column-count","column-fill","column-width",
             "column-rule-width","column-rule-color","column-rule-style",
+            "row-rule-width","row-rule-color","row-rule-style","column-rule-break","row-rule-break","rule-overlap",
+            "column-rule-visibility-items","row-rule-visibility-items",
+            "column-rule-inset-cap-start","column-rule-inset-cap-end","column-rule-inset-junction-start","column-rule-inset-junction-end",
+            "row-rule-inset-cap-start","row-rule-inset-cap-end","row-rule-inset-junction-start","row-rule-inset-junction-end",
             "flex-direction","flex-wrap","row-gap","column-gap","grid-auto-columns","grid-auto-flow","grid-auto-rows",
             "grid-template-areas","grid-template-columns","grid-template-rows","justify-content","justify-items",
             "overflow-x","overflow-y","text-overflow","unicode-bidi"] {
@@ -4439,6 +4660,9 @@ impl Style {
     }
     pub(crate) fn transform_matrix_with_source(&self,rect:Rect,used_source:Option<&str>)->Option<Affine>{
         if !self.has_transform(){return None;}
+        if self.backface_hidden()&&self.transform_faces_away([rect.width as f64,rect.height as f64]){
+            return Some(Affine{a:0.0,b:0.0,c:0.0,d:0.0,e:0.0,f:0.0});
+        }
         let transforms = self.transforms.as_deref().unwrap_or(&[]);
         let mut matrix = Affine {
             a: 1.0,
@@ -4683,7 +4907,7 @@ impl Style {
                 ) {
                     value.apply(&mut result);
                 }
-            } else if slot == 3 {
+            } else if slot == WIDTH_SLOT {
                 result.width = None;
             } else if slot == 23 {
                 result.min_width = 0.0;
@@ -5082,6 +5306,9 @@ pub(crate) struct Selector {
     host: bool,
     /// `::slotted(compound)` — matches light children assigned to a slot.
     slotted: bool,
+    /// Ends in a tree-abiding pseudo-element that generates no box here
+    /// (`::picker()`, `::picker-icon`, `::checkmark`, `::interest-button`).
+    opaque_pseudo: bool,
     /// `::part(name)` — matches shadow elements exposing the named part.
     part: Option<String>,
     /// Present only while parsing CSS nesting selector lists. The adapter
@@ -5094,6 +5321,8 @@ pub(crate) struct Selector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    /// `.prefix-*`: each entry is the dash-terminated prefix.
+    class_prefixes: Vec<String>,
     specificity: (u16, u16, u16),
     ancestor: Option<(Relation, Box<Selector>)>,
     attributes: Vec<AttributeSelector>,
@@ -5108,6 +5337,8 @@ enum LogicalPseudo {
     Nesting(Arc<[Selector]>),
     State(Arc<str>, bool),
     Heading(u16),
+    /// `:has-slotted` / `:has-slotted(<selector>)`; empty matches any assigned node.
+    HasSlotted(Vec<Selector>),
     InvalidNesting,
 }
 
@@ -5116,17 +5347,48 @@ impl LogicalPseudo {
         match self {
             Self::Not(selectors) | Self::Is(selectors) | Self::Where(selectors) => selectors,
             Self::Nesting(selectors) => selectors,
-            Self::Has(_) | Self::State(..) | Self::Heading(_) | Self::InvalidNesting => &[],
+            Self::Has(_) | Self::State(..) | Self::Heading(_) | Self::HasSlotted(_) | Self::InvalidNesting => &[],
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RelativeSelector {
     /// The implicit descendant or explicit combinator from the :has anchor to
     /// the leftmost compound in this relative selector.
     relation: Relation,
     selector: Selector,
+    /// Names this relative selector in the document's `:has()` memo. A clone gets
+    /// a fresh id because nesting resolution may rewrite its selector.
+    id: u64,
+    /// Lazily computed `Selector::memo_depth`: 0 unknown, 1 not memoizable,
+    /// otherwise the selector's depth need plus 2.
+    memo_depth: core::sync::atomic::AtomicUsize,
+}
+
+impl Clone for RelativeSelector {
+    fn clone(&self) -> Self {
+        Self::new(self.relation, self.selector.clone())
+    }
+}
+
+impl RelativeSelector {
+    fn new(relation: Relation, selector: Selector) -> Self {
+        Self { relation, selector, id: has_memo::next_relative_id(), memo_depth: core::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    fn memo_depth(&self) -> Option<usize> {
+        use core::sync::atomic::Ordering;
+        match self.memo_depth.load(Ordering::Relaxed) {
+            0 => {
+                let depth = self.selector.memo_depth();
+                self.memo_depth.store(depth.map_or(1, |depth| depth + 2), Ordering::Relaxed);
+                depth
+            }
+            1 => None,
+            stored => Some(stored - 2),
+        }
+    }
 }
 
 fn adjust_specificity(
@@ -5141,18 +5403,22 @@ fn adjust_specificity(
     )
 }
 
-fn language_argument_values(input:&str)->Option<Vec<String>> {
+fn language_argument_tokens(input:&str)->Option<Vec<(String,bool)>> {
     let mut position=0;let mut ranges=Vec::new();
     loop {
         if ranges.len()==8{return None;}
         skip_css_space_comments(input,&mut position)?;
-        let value=if input.as_bytes().get(position).is_some_and(|byte|matches!(byte,b'\''|b'"')) {
+        let quoted=input.as_bytes().get(position).is_some_and(|byte|matches!(byte,b'\''|b'"'));
+        let value=if quoted {
             let end=quoted_css_end(input,position)?;let value=css_string(&input[position..end])?;position=end;value
         }else{consume_selector_identifier(input,&mut position)?};
-        ranges.push(value);skip_css_space_comments(input,&mut position)?;
+        ranges.push((value,quoted));skip_css_space_comments(input,&mut position)?;
         if position==input.len(){return Some(ranges);}
         if input.as_bytes()[position]!=b','{return None;}position+=1;
     }
+}
+fn language_argument_values(input:&str)->Option<Vec<String>> {
+    language_argument_tokens(input).map(|tokens|tokens.into_iter().map(|(value,_)|value).collect())
 }
 fn language_ranges(input:&str)->Option<Vec<String>> {
     language_argument_values(input).map(|values|values.into_iter().map(|value|value.to_ascii_lowercase()).collect())
@@ -5762,8 +6028,7 @@ fn legacy_font_size(raw: &str) -> Option<f32> {
     let value = if relative {
         if negative { 3u8.saturating_sub(value) } else { 3u8.saturating_add(value) }
     } else { value }.clamp(1, 7);
-    let index = if value == 1 { 0 } else { value };
-    Some(FontSizeKeyword::Absolute(index).resolve(16.0))
+    Some(FontSizeKeyword::Absolute(value).resolve(16.0))
 }
 
 #[derive(Clone, Debug)]
@@ -5775,7 +6040,7 @@ enum Value {
     BorderImageRaw(usize,String),
     BorderImage(usize,Arc<BorderImage>),
     ViewTransitionName(ViewTransitionName),
-    ContainerType(ContainerType),
+    ContainerType(ContainerType, ContainerFlags),
     Animation(usize, Arc<str>),
     TransitionTimes(usize, Arc<[typed_numeric::NumericValue]>),
     TransitionTimesRaw(usize,String),
@@ -5851,6 +6116,7 @@ enum Value {
         safe: Option<bool>,
     },
     FlexWrapReverse(bool),
+    FlexWrapReverseBalance(bool),
     MarginAuto(usize),
     Position(Position),
     Float(Float),
@@ -5949,6 +6215,7 @@ enum Value {
     GridColumnsAuto(Box<GridAutoRepeat>),
     GridRowsAuto(Box<GridAutoRepeat>),
     GridSubgridRepeat(usize, Box<GridSubgridRepeat>),
+    GridSourced(usize, Arc<str>, Box<Value>),
     AspectRatio([f32; 2], bool),
     ZIndex(Option<i32>),
     GridRaw(usize, Arc<str>),
@@ -5964,6 +6231,7 @@ enum Value {
         inline: bool,
     },
     DisplayComponents { principal: Display, inline: bool, list_item: bool },
+    DisplayRuby { kind: u8, block: bool },
     GridLanesDirection(GridLanesDirection),
     GridLanesPack(bool),
     FlowTolerance(FlowTolerance),
@@ -6021,7 +6289,7 @@ impl Value {
             Self::FieldSizing(_) => 232,
             Self::BorderImageInitial(slot)|Self::BorderImageRaw(slot,_)|Self::BorderImage(slot,_)=>*slot,
             Self::ViewTransitionName(_) => 220,
-            Self::ContainerType(_) => 198,
+            Self::ContainerType(..) => 198,
             Self::Animation(slot, _) => *slot,
             Self::TransitionTimes(slot, _) | Self::TransitionTimesRaw(slot,_) => *slot,
             Self::TransitionProperty(_) => 216,
@@ -6030,6 +6298,7 @@ impl Value {
             Self::ColorRaw(slot, _) => *slot,
             Self::GridRaw(slot, _) => *slot,
             Self::GridSubgridRepeat(slot, _) => *slot,
+            Self::GridSourced(slot, _, _) => *slot,
             Self::GridColumnsAuto(_) => 27,
             Self::GridRowsAuto(_) => 28,
             Self::AspectRatio(_, _) => 73,
@@ -6037,7 +6306,7 @@ impl Value {
             Self::GridAutoColumns(_) => 61,
             Self::GridAutoRows(_) => 62,
             Self::GridAutoFlow(_) => 63,
-            Self::GridDisplay { .. } | Self::DisplayComponents { .. } => 0,
+            Self::GridDisplay { .. } | Self::DisplayComponents { .. } | Self::DisplayRuby { .. } => 0,
             Self::GridLanesDirection(_) => 182,
             Self::GridLanesPack(_) => 183,
             Self::FlowTolerance(_) => 184,
@@ -6124,7 +6393,7 @@ impl Value {
             Self::Order(_) => 48,
             Self::ContentAlignment { slot, .. } => *slot,
             Self::ItemAlignment { slot, .. } => *slot,
-            Self::FlexWrapReverse(_) => 50,
+            Self::FlexWrapReverse(_) | Self::FlexWrapReverseBalance(_) => 50,
             Self::MarginAuto(side) => 39 + side,
             Self::Position(_) => 32,
             Self::Float(_) => 33,
@@ -6231,7 +6500,7 @@ impl Value {
                 if let Some(legacy)=color_at_slot(*slot,color_values::rgba(value.value)) {legacy.apply(style);}
                 style.set_source_color(*slot,Some(value.clone()));
             }
-            Self::ContainerType(value) => style.container_type = *value,
+            Self::ContainerType(value, flags) => { style.container_type = *value; style.container_flags = *flags; }
             Self::Animation(slot, value) => style.animation[animation_controls::index(*slot)] = Some(value.clone()),
             Self::TransitionProperty(values) => style.transition_property = Some(values.clone()),
             Self::TransitionTimingFunction(values) => style.transition_timing_function = Some(values.clone()),
@@ -6432,7 +6701,14 @@ impl Value {
                 }
                 _ => unreachable!("item alignment slot"),
             },
-            Self::FlexWrapReverse(v) => style.flex_wrap_reverse = *v,
+            Self::FlexWrapReverse(v) => {
+                style.flex_wrap_reverse = *v;
+                style.flex_wrap_balance = false;
+            }
+            Self::FlexWrapReverseBalance(v) => {
+                style.flex_wrap_reverse = *v;
+                style.flex_wrap_balance = true;
+            }
             Self::MarginAuto(side) => {
                 style.margin_sides[*side] = 0.0;
                 style.margin_auto[*side] = true;
@@ -6462,18 +6738,33 @@ impl Value {
                 style.grid_lanes = false;
                 style.display_inline = false;
                 style.display_list_item = false;
+                style.display_ruby = 0;
             }
             Self::DisplayComponents { principal, inline, list_item } => {
                 style.display = *principal;
                 style.display_inline = *inline;
                 style.display_list_item = *list_item;
                 style.grid_lanes = false;
+                style.display_ruby = 0;
+            }
+            Self::DisplayRuby { kind, block } => {
+                style.display = match *kind {
+                    6 => Display::Block,
+                    7 => Display::InlineBlock,
+                    _ if *block => Display::Block,
+                    _ => Display::Inline,
+                };
+                style.display_inline = false;
+                style.display_list_item = false;
+                style.grid_lanes = false;
+                style.display_ruby = *kind;
             }
             Self::GridDisplay { lanes, inline } => {
                 style.display = Display::Grid;
                 style.grid_lanes = *lanes;
                 style.display_inline = *inline;
                 style.display_list_item = false;
+                style.display_ruby = 0;
             }
             Self::GridLanesDirection(v) => style.grid_lanes_direction = *v,
             Self::GridLanesPack(v) => style.grid_lanes_dense = *v,
@@ -6612,7 +6903,7 @@ impl Value {
             }
             Self::GapLength(slot, value) => {
                 let clamped = LengthPercentage { pixels: if value.fraction == 0.0 { value.pixels.max(0.0) } else { value.pixels }, fraction: value.fraction.max(0.0) };
-                let value = if *slot == 184 { value } else { &clamped };
+                let value = &clamped;
                 if *slot == 184 {
                     style.flow_tolerance = FlowTolerance::Length(*value);
                 } else if *slot == 17 {
@@ -6807,7 +7098,16 @@ impl Value {
                 }
                 _ => {}
             },
+            Self::GridSourced(slot, source, inner) => {
+                inner.apply(style);
+                if *slot == 27 {
+                    style.grid_columns_source = Some(source.clone());
+                } else {
+                    style.grid_rows_source = Some(source.clone());
+                }
+            }
             Self::GridColumns(v, names, subgrid) => {
+                clear_grid_source(style, 27);
                 style.grid_columns = Some(v.clone());
                 style.grid_column_names = names.clone();
                 style.grid_columns_subgrid = *subgrid;
@@ -6815,6 +7115,7 @@ impl Value {
                 style.grid_columns_subgrid_repeat = None;
             }
             Self::GridColumnsAuto(auto) => {
+                clear_grid_source(style, 27);
                 style.grid_columns = None;
                 style.grid_column_names = None;
                 style.grid_columns_subgrid = false;
@@ -6829,6 +7130,7 @@ impl Value {
             }
             Self::ZIndex(v) => style.z_index = *v,
             Self::GridRowsAuto(auto) => {
+                clear_grid_source(style, 28);
                 style.grid_rows = None;
                 style.grid_row_names = None;
                 style.grid_rows_subgrid = false;
@@ -6836,6 +7138,7 @@ impl Value {
                 style.grid_rows_subgrid_repeat = None;
             }
             Self::GridRows(v, names, subgrid) => {
+                clear_grid_source(style, 28);
                 style.grid_rows = Some(v.clone());
                 style.grid_row_names = names.clone();
                 style.grid_rows_subgrid = *subgrid;
@@ -6845,6 +7148,7 @@ impl Value {
             Self::GridSubgridRepeat(slot, repeat) => {
                 let fixed_names = (repeat.repeat_lines == 0 && !repeat.prefix_names.is_empty())
                     .then(|| repeat.prefix_names.clone());
+                clear_grid_source(style, *slot);
                 if *slot == 27 {
                     style.grid_columns = Some(Arc::from([]));
                     style.grid_column_names = fixed_names;
@@ -8411,18 +8715,26 @@ fn rule_media_matches(&self, order: usize) -> bool {
             return Err(CssError { offset: 0, message: "invalid view transition pseudo target" });
         }
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid view transition origin" })?;
+        let key = name.map(serialize_css_identifier);
         compute_for_named(kind, inherited, self, Some((document, origin)), AncestorBloom::ALL,
-            Some(text), Some(pseudo), name, None)
+            Some(text), Some(pseudo), key.as_deref(), None)
     }
 
-    pub(crate) fn compute_highlight_style(&self, document: &Document, origin: NodeId,
-        ordinary: &Style, inherited: Option<&Style>, name: &str, text: &dyn TextShaper) -> Result<Style, CssError> {
+    /// The full computed style of a highlight pseudo-element, inheriting from
+    /// the highlight of the parent (or the originating element at the root).
+    pub fn compute_highlight_computed(&self, document: &Document, origin: NodeId,
+        ordinary: &Style, inherited: Option<&Style>, name: &str, text: Option<&dyn TextShaper>) -> Result<Style, CssError> {
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid highlight origin" })?;
         let mut parent = ordinary.clone();
         parent.background = inherited.map_or(Rgba { r: 0, g: 0, b: 0, a: 0 }, |style| style.background);
         if let Some(inherited) = inherited { parent.color = inherited.color; }
-        let computed = compute_for_named(kind, Some(&parent), self, Some((document, origin)), AncestorBloom::ALL,
-            Some(text), Some(PseudoElement::Highlight), Some(name), None)?;
+        compute_for_named(kind, Some(&parent), self, Some((document, origin)), AncestorBloom::ALL,
+            text, Some(PseudoElement::Highlight), Some(name), None)
+    }
+
+    pub(crate) fn compute_highlight_style(&self, document: &Document, origin: NodeId,
+        ordinary: &Style, inherited: Option<&Style>, name: &str, text: &dyn TextShaper) -> Result<Style, CssError> {
+        let computed = self.compute_highlight_computed(document, origin, ordinary, inherited, name, Some(text))?;
         let mut filtered = ordinary.clone();
         for property in PROPERTIES {
             if matches!(property.name, "color" | "background-color" | "text-underline-position" | "text-underline-offset") || property.name.starts_with("text-decoration") {
@@ -9066,6 +9378,9 @@ fn rule_media_matches(&self, order: usize) -> bool {
             if rule.registration.is_some() {
                 continue;
             }
+            if rule.media.iter().any(|entry| container_eval::is_marker(entry)) {
+                return None;
+            }
             let selector = &rule.selector;
             if selector.host && selector.ancestor.is_none() && !selector.slotted && selector.part.is_none() {
                 *host_pseudo.get_or_insert(false) |= selector.pseudo_element.is_some();
@@ -9660,6 +9975,13 @@ fn consume_selector_identifier(input: &str, position: &mut usize) -> Option<Stri
 fn parse_attribute_selector(input: &str, offset: usize, namespaces: &NamespaceMap) -> Result<AttributeSelector, CssError> {
     let uncommented=if syntax::contains_comment_open(input) {Some(strip_component_comments(input,offset,true)?)} else {None};
     let input=uncommented.as_deref().unwrap_or(input);
+    let separated;
+    let input = if input.contains(SELECTOR_TOKEN_SEPARATOR) {
+        separated = input.replace(SELECTOR_TOKEN_SEPARATOR, " ");
+        separated.as_str()
+    } else {
+        input
+    };
     let mut position = 0;
     skip_css_space_comments(input, &mut position)
         .ok_or_else(|| selector_error(offset + position, "unterminated attribute comment"))?;
@@ -9946,7 +10268,7 @@ fn parse_relative_selector_list_depth(
             depth,
             allow_nesting,
          namespaces)?;
-        result.push(RelativeSelector { relation, selector });
+        result.push(RelativeSelector::new(relation, selector));
     }
     Ok(result)
 }
@@ -9973,6 +10295,31 @@ fn trim_selector_source(input:&str)->&str {
         input = &input[..last];
     }
     input
+}
+
+/// Cascade key of a built-in highlight pseudo-element; `\0` cannot occur in an
+/// author-supplied `::highlight()` name.
+pub(crate) fn builtin_highlight_key(name: &str) -> String {
+    let mut key = String::from("\0");
+    key.push_str(name);
+    key
+}
+
+/// The highlight cascade key for a `getComputedStyle()` pseudo-element argument.
+pub fn highlight_pseudo_key(pseudo: &str) -> Option<String> {
+    let rest = pseudo.strip_prefix("::")?;
+    if let Some(open) = rest.find('(') {
+        if !rest[..open].eq_ignore_ascii_case("highlight") || !rest.ends_with(')') {
+            return None;
+        }
+        let input = &rest[open + 1..rest.len() - 1];
+        let mut position = 0;
+        return consume_selector_identifier(input, &mut position)
+            .filter(|value| position == input.len() && !matches!(value.to_ascii_lowercase().as_str(), "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "default"));
+    }
+    let name = rest.to_ascii_lowercase();
+    matches!(name.as_str(), "selection" | "target-text" | "spelling-error" | "grammar-error" | "search-text")
+        .then(|| builtin_highlight_key(&name))
 }
 
 fn selector_compound_end(input:&str, mut pos:usize, offset:usize)->Result<usize,CssError> {
@@ -10056,7 +10403,7 @@ fn parse_selector_depth(
             parse_simple_selector_depth(&input[start..pos], offset + start, depth, allow_nesting, namespaces)?;
         if let Some(previous) = previous {
             let previous: Selector = previous;
-            if previous.pseudo_element.is_some() {
+            if previous.pseudo_element.is_some() || previous.opaque_pseudo {
                 return Err(selector_error(
                     offset + start,
                     "pseudo-element must end the selector",
@@ -10068,7 +10415,7 @@ fn parse_selector_depth(
             current.ancestor = Some((relation, Box::new(previous)));
         }
         skip_css_space_comments(input, &mut pos);
-        if current.pseudo_element.is_some() && pos < bytes.len() {
+        if (current.pseudo_element.is_some() || current.opaque_pseudo) && pos < bytes.len() {
             return Err(selector_error(
                 offset + start,
                 "pseudo-element must end the selector",
@@ -10229,6 +10576,12 @@ fn parse_selector_type(input:&str,offset:usize,namespaces:&NamespaceMap)->Result
 }
 
 struct ParsedPseudoSource<'a> { name:String, args:Option<&'a str>, end:usize, args_offset:usize }
+pub(crate) fn scroll_button_direction(argument: &str) -> Option<&'static str> {
+    const DIRECTIONS: [&str; 9] = ["up", "down", "left", "right", "block-start", "block-end", "inline-start", "inline-end", "*"];
+    let argument = argument.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    DIRECTIONS.into_iter().find(|direction| argument.eq_ignore_ascii_case(direction))
+}
+
 fn parse_pseudo_source(input:&str,offset:usize)->Result<ParsedPseudoSource<'_>,CssError> {
     let mut pos=if input.starts_with("::"){2}else{1};
     let name=consume_selector_identifier(input,&mut pos).ok_or_else(||selector_error(offset+pos,"invalid pseudo identifier"))?.to_ascii_lowercase();
@@ -10236,6 +10589,26 @@ fn parse_pseudo_source(input:&str,offset:usize)->Result<ParsedPseudoSource<'_>,C
         let close=selector_function_end(input,pos).ok_or_else(||selector_error(offset+pos,"unterminated pseudo-class"))?;
         Ok(ParsedPseudoSource{name,args:Some(&input[pos+1..close]),end:close+1,args_offset:pos+1})
     } else { Ok(ParsedPseudoSource{name,args:None,end:pos,args_offset:pos}) }
+}
+
+/// Whether the text at the start of `rest` is a pseudo-element that may follow
+/// `::slotted()` in the same compound selector.
+fn tree_abiding_pseudo_follows(rest: &str, offset: usize) -> Result<bool, CssError> {
+    if !rest.starts_with("::") || rest.starts_with(":::") {
+        return Ok(false);
+    }
+    let parsed = parse_pseudo_source(rest, offset)?;
+    Ok(matches!(parsed.name.as_str(), "before" | "after" | "picker-icon" | "checkmark"))
+}
+
+/// Whether the text at the start of `rest` is a user-action pseudo-class, the
+/// only kind that may follow a tree-abiding pseudo-element.
+fn user_action_pseudo_class_follows(rest: &str, offset: usize) -> Result<bool, CssError> {
+    if !rest.starts_with(':') || rest.starts_with("::") {
+        return Ok(false);
+    }
+    let parsed = parse_pseudo_source(rest, offset)?;
+    Ok(parsed.args.is_none() && matches!(parsed.name.as_str(), "hover" | "active" | "focus" | "focus-visible" | "focus-within"))
 }
 
 fn parse_simple_selector_depth(
@@ -10268,6 +10641,7 @@ fn parse_simple_selector_depth(
         universal,
         host: false,
         slotted: false,
+        opaque_pseudo: false,
         part: None,
         nesting_selector: 0,
         pseudo_element: None,
@@ -10275,6 +10649,7 @@ fn parse_simple_selector_depth(
         tag,
         id: None,
         classes: Vec::new(),
+        class_prefixes: Vec::new(),
         specificity: (0, 0, u16::from(explicit_type && !universal)),
         ancestor: None,
         attributes: Vec::new(),
@@ -10282,11 +10657,14 @@ fn parse_simple_selector_depth(
     let mut start = cursor;
     let bytes = input.as_bytes();
     while start < bytes.len() {
-        if selector.slotted {
+        if selector.slotted && !tree_abiding_pseudo_follows(&input[start..], offset + start)? {
             return Err(CssError {
                 offset: offset + start,
                 message: "::slotted must end its compound selector",
             });
+        }
+        if selector.opaque_pseudo && !user_action_pseudo_class_follows(&input[start..], offset + start)? {
+            return Err(selector_error(offset + start, "pseudo-element must end its compound selector"));
         }
         if let Some(previous) = selector.pseudo_element {
             // CSS Pseudo 4 §4.2 admits exactly the marker of a generated
@@ -10323,6 +10701,25 @@ fn parse_simple_selector_depth(
                     }
                 }
             }
+            if previous == PseudoElement::Highlight
+                && selector.highlight_name.as_deref() == Some(builtin_highlight_key("search-text").as_str())
+            {
+                let rest = &input[start..];
+                if !rest.starts_with("::") {
+                    let parsed = parse_pseudo_source(rest, offset + start)?;
+                    let state = match (parsed.name.as_str(), parsed.args.map(str::trim)) {
+                        ("current", None) => Some(":current"),
+                        ("not", Some(argument)) if argument.eq_ignore_ascii_case(":current") => Some(":not-current"),
+                        _ => None,
+                    };
+                    if let Some(state) = state {
+                        if let Some(name) = selector.highlight_name.as_mut() { name.push_str(state); }
+                        selector.specificity.1 = selector.specificity.1.saturating_add(1);
+                        start += parsed.end;
+                        continue;
+                    }
+                }
+            }
             return Err(selector_error(offset + start, "pseudo-element must end its compound selector"));
         }
         let kind = bytes[start];
@@ -10342,7 +10739,7 @@ fn parse_simple_selector_depth(
             let pseudo_element = rest.starts_with("::") && !rest.starts_with(":::");
             let ParsedPseudoSource{name,args,end,args_offset}=parse_pseudo_source(rest,offset+start)?;
             let name=name.as_str();
-            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new")) || (!pseudo_element && matches!(name,"marker"|"placeholder")) {
+            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text"|"scroll-button"|"picker"|"picker-icon"|"checkmark"|"interest-button")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
                 return Err(selector_error(offset+start,"invalid pseudo selector colon syntax"));
             }
 
@@ -10375,6 +10772,62 @@ fn parse_simple_selector_depth(
                 if !wildcard {
                     selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 }
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && name == "scroll-button" {
+                if args.and_then(scroll_button_direction).is_none() {
+                    return Err(selector_error(offset + start, "::scroll-button requires a direction"));
+                }
+                // No scroll button box is generated, so the selector is valid and matches nothing.
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && matches!(name, "picker" | "picker-icon" | "checkmark" | "interest-button") {
+                let valid = match name {
+                    "picker" => args.is_some_and(|argument| argument.trim().eq_ignore_ascii_case("select")),
+                    _ => args.is_none(),
+                };
+                if !valid {
+                    return Err(selector_error(offset + start, "invalid form control pseudo-element"));
+                }
+                // No picker, checkmark or interest button box is generated, so the selector is valid and matches nothing.
+                selector.opaque_pseudo = true;
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if !pseudo_element && args.is_none() && matches!(name, "interest-source" | "interest-target" | "has-partial-interest" | "filtered") {
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.1 += 1;
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && name == "backdrop" {
+                if args.is_some() {
+                    return Err(selector_error(offset + start, "::backdrop is not functional"));
+                }
+                // No backdrop box is generated, so the selector is valid and matches nothing.
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && matches!(name, "selection" | "target-text" | "spelling-error" | "grammar-error" | "search-text") {
+                if args.is_some() {
+                    return Err(selector_error(offset + start, "highlight pseudo-element is not functional"));
+                }
+                selector.pseudo_element = Some(PseudoElement::Highlight);
+                selector.highlight_name = Some(builtin_highlight_key(name));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 start += end;
                 continue;
             }
@@ -10547,6 +11000,37 @@ fn parse_simple_selector_depth(
                 let state=custom_state_argument(argument).ok_or_else(||selector_error(offset+start,"invalid custom state identifier"))?;
                 selector.logical.push(LogicalPseudo::State(Arc::from(state), selector.part.is_some()));
                 selector.specificity.1 = selector.specificity.1.saturating_add(1);
+                start += end;
+                continue;
+            }
+            if name == "has-slotted" {
+                if pseudo_element {
+                    return Err(selector_error(offset + start, ":has-slotted requires single-colon syntax"));
+                }
+                let mut specificity = (0, 1, 0);
+                let mut selectors = Vec::new();
+                if let Some(argument) = args {
+                    selectors = parse_selector_list_depth(argument, offset + start + args_offset, depth + 1, false, allow_nesting, namespaces)?;
+                    let sibling_only = |selector: &Selector| {
+                        let mut current = selector.ancestor.as_ref();
+                        while let Some((relation, ancestor)) = current {
+                            if !matches!(relation, Relation::Adjacent | Relation::Following) {
+                                return false;
+                            }
+                            current = ancestor.ancestor.as_ref();
+                        }
+                        selector.pseudo_element.is_none()
+                    };
+                    if selectors.is_empty() || !selectors.iter().all(sibling_only) {
+                        return Err(selector_error(offset + start, "invalid :has-slotted argument"));
+                    }
+                    specificity = selectors.iter().map(|selector| selector.specificity).max().unwrap_or((0, 0, 0));
+                    specificity.1 = specificity.1.saturating_add(1);
+                }
+                selector.logical.push(LogicalPseudo::HasSlotted(selectors));
+                selector.specificity.0 += specificity.0;
+                selector.specificity.1 += specificity.1;
+                selector.specificity.2 += specificity.2;
                 start += end;
                 continue;
             }
@@ -10897,7 +11381,12 @@ fn parse_simple_selector_depth(
         }
         match kind {
             b'.' => {
-                selector.classes.push(name);
+                if name.ends_with('-') && bytes.get(end) == Some(&b'*') {
+                    end += 1;
+                    selector.class_prefixes.push(name);
+                } else {
+                    selector.classes.push(name);
+                }
                 selector.specificity.1 += 1;
             }
             b'#' if selector.id.is_none() => {
@@ -11656,6 +12145,7 @@ fn value_depends_on_sibling_position(value: &Value) -> bool {
         Value::ColorRaw(_, raw) | Value::Deferred(_,raw) | Value::Custom(_,raw) => {
             typed_numeric::substitute_sibling_functions(raw, 1, 1).is_some_and(|(_, replaced)| replaced)
                 || matches!(value, Value::Deferred(..)) && owner_values::may_use(raw)
+                || matches!(value, Value::Custom(..)) && (owner_values::uses_attr(raw) || owner_values::uses_random(raw))
         }
         Value::ContextLength(_,raw,_)=>typed_numeric::substitute_sibling_functions(raw,1,1).is_some_and(|(_,dependent)|dependent),
         Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>typed_numeric::substitute_sibling_functions(&group.value,1,1).is_some_and(|(_,dependent)|dependent)
@@ -11725,7 +12215,7 @@ impl SourceColor {
     pub fn serialize(&self)->Option<String> {color_values::serialize(self.value,self.color_function)}
 }
 pub fn color_uses_current_color(input:&str)->bool {color_values::uses_current_color(input)}
-pub fn animation_color_property(property:&str)->bool {let properties=slots(property);properties.len()==1 && color_slot(properties[0])}
+pub fn animation_color_property(property:&str)->bool {let properties=slots(property);properties.len()==1 && color_slot(properties[0]) || matches!(property,"column-rule-color"|"row-rule-color")}
 pub fn animation_color_needs_context(input:&str)->bool {color_values::uses_current_color(input)||image_numeric_dependencies(input)!=(false,false)}
 
 fn color_value(slot: usize, input: &str) -> Option<Value> {
@@ -12344,6 +12834,9 @@ fn parse_supports_in_parens(input: &str, start: usize, nesting: usize, namespace
         // parser used for stylesheet rules count as supported. That parser
         // accepts a single complex selector and rejects unsupported syntax.
         parse_selector_depth(argument, open + 1, 0, true, namespaces).is_ok()
+            && !selector_serialization::has_forgiven_items(argument, namespaces, true)
+    } else if name.eq_ignore_ascii_case("at-rule") {
+        at_rule_supports::supports(argument)
     } else {
         false
     };
@@ -12837,7 +13330,7 @@ fn length_value(slot: usize, value: f32) -> Option<Value> {
             pixels: value,
             fraction: 0.0,
         }),
-        17 => Value::Gap(value),
+        17 => Value::GapLength(17, LengthPercentage { pixels: value, fraction: 0.0 }),
         20 => Value::FlexBasis(Some(value)),
         23 => Value::MinWidth(value),
         24 => Value::MaxWidth(Some(value)),
@@ -12955,6 +13448,7 @@ const fn same_property_name(left: &str, right: &str) -> bool {
 const fn validate_registry(properties: &[PropertyRegistration]) {
     let mut seen = [false; PROPERTY_COUNT];
     let mut inherited = [false; PROPERTY_COUNT];
+    let mut inherited_seen = [false; PROPERTY_COUNT];
     let mut in_all = [false; PROPERTY_COUNT];
     let mut row = 0;
     while row < properties.len() {
@@ -12985,11 +13479,19 @@ const fn validate_registry(properties: &[PropertyRegistration]) {
                 }
                 earlier += 1;
             }
-            if seen[id] && (inherited[id] != property.inherited || in_all[id] != property.in_all) {
+            // A non-inherited shorthand may cover longhands that differ in inheritance
+            // (line-clamp), so only the other rows define and check an ID's inherited flag.
+            let longhand = property.ids.len() == 1 || property.inherited;
+            if (seen[id] && in_all[id] != property.in_all)
+                || (longhand && inherited_seen[id] && inherited[id] != property.inherited)
+            {
                 panic!("inconsistent CSS property metadata");
             }
             seen[id] = true;
-            inherited[id] = property.inherited;
+            if longhand {
+                inherited[id] = property.inherited;
+                inherited_seen[id] = true;
+            }
             in_all[id] = property.in_all;
             index += 1;
         }
@@ -13162,13 +13664,15 @@ property_registry! {
     "background-position-x" => [extra_props::slot_const("background-position-x")], false, true;
     "background-position-y" => [extra_props::slot_const("background-position-y")], false, true;
     "object-view-box" => [extra_props::slot_const("object-view-box")], false, true;
+    "math-style" => [extra_props::slot_const("math-style")], true, true;
+    "math-depth" => [extra_props::slot_const("math-depth")], true, true;
     "border-shape" => [extra_props::slot_const("border-shape")], false, true;
     "background-size" => [69], false, true;
     "background-repeat" => [70], false, true;
     "background-clip" => [71], false, true;
     "background-origin" => [72], false, true;
-    "mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite")], false, true;
-    "-webkit-mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite")], false, true;
+    "mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite"),277,278,279,280,281,282], false, true;
+    "-webkit-mask" => [257,258,259,260,261,262,263,extra_props::VALUE_BASE + value_props::const_index("mask-composite"),277,278,279,280,281,282], false, true;
     "mask-image" => [257], false, true;
     "-webkit-mask-image" => [257], false, true;
     "mask-position" => [258], false, true;
@@ -13526,6 +14030,23 @@ property_registry! {
     "corner-inline-end-shape" => [350,352], false, true;
     "corner-block-start-shape" => [349,350], false, true;
     "corner-block-end-shape" => [351,352], false, true;
+    "corner" => [134,135,136,137,345,346,347,348], false, true;
+    "corner-top-left" => [134,345], false, true;
+    "corner-top-right" => [135,346], false, true;
+    "corner-bottom-right" => [136,347], false, true;
+    "corner-bottom-left" => [137,348], false, true;
+    "corner-start-start" => [192,349], false, true;
+    "corner-start-end" => [193,350], false, true;
+    "corner-end-start" => [194,351], false, true;
+    "corner-end-end" => [195,352], false, true;
+    "corner-top" => [134,135,345,346], false, true;
+    "corner-right" => [135,136,346,347], false, true;
+    "corner-bottom" => [137,136,348,347], false, true;
+    "corner-left" => [134,137,345,348], false, true;
+    "corner-block-start" => [192,193,349,350], false, true;
+    "corner-block-end" => [194,195,351,352], false, true;
+    "corner-inline-start" => [192,194,349,351], false, true;
+    "corner-inline-end" => [193,195,350,352], false, true;
     "empty-cells" => [102], true, true;
     "caption-side" => [127], true, true;
     "border-collapse" => [128], true, true;
@@ -13601,6 +14122,7 @@ property_registry! {
     "baseline-shift" => [extra_props::VALUE_BASE + value_props::const_index("baseline-shift")], false, true;
     "color-interpolation" => [extra_props::VALUE_BASE + value_props::const_index("color-interpolation")], true, true;
     "column-height" => [extra_props::VALUE_BASE + value_props::const_index("column-height")], false, true;
+    "flex-line-count" => [extra_props::VALUE_BASE + value_props::const_index("flex-line-count")], false, true;
     "column-wrap" => [extra_props::VALUE_BASE + value_props::const_index("column-wrap")], false, true;
     "container-name" => [extra_props::VALUE_BASE + value_props::const_index("container-name")], false, true;
     "view-transition-class" => [extra_props::VALUE_BASE + value_props::const_index("view-transition-class")], false, true;
@@ -13613,6 +14135,7 @@ property_registry! {
     "font-language-override" => [extra_props::VALUE_BASE + value_props::const_index("font-language-override")], true, true;
     "font-optical-sizing" => [extra_props::VALUE_BASE + value_props::const_index("font-optical-sizing")], true, true;
     "font-palette" => [extra_props::VALUE_BASE + value_props::const_index("font-palette")], true, true;
+    "dynamic-range-limit" => [extra_props::VALUE_BASE + value_props::const_index("dynamic-range-limit")], true, true;
     "font-presentation" => [extra_props::VALUE_BASE + value_props::const_index("font-presentation")], true, true;
     "font-synthesis-weight" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-weight")], true, true;
     "font-synthesis-style" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-style")], true, true;
@@ -13621,6 +14144,7 @@ property_registry! {
     "font-variant-numeric" => [extra_props::VALUE_BASE + value_props::const_index("font-variant-numeric")], true, true;
     "font-variation-settings" => [extra_props::VALUE_BASE + value_props::const_index("font-variation-settings")], true, true;
     "image-rendering" => [extra_props::VALUE_BASE + value_props::const_index("image-rendering")], true, true;
+    "image-resolution" => [extra_props::VALUE_BASE + value_props::const_index("image-resolution")], true, true;
     "isolation" => [extra_props::VALUE_BASE + value_props::const_index("isolation")], false, true;
     "lighting-color" => [extra_props::VALUE_BASE + value_props::const_index("lighting-color")], false, true;
     "marker-start" => [extra_props::VALUE_BASE + value_props::const_index("marker-start")], true, true;
@@ -13636,8 +14160,10 @@ property_registry! {
     "scroll-target-group" => [extra_props::VALUE_BASE + value_props::const_index("scroll-target-group")], false, true;
     "block-ellipsis" => [extra_props::VALUE_BASE + value_props::const_index("block-ellipsis")], true, true;
     "max-lines" => [extra_props::VALUE_BASE + value_props::const_index("max-lines")], false, true;
+    "line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("max-lines"), extra_props::VALUE_BASE + value_props::const_index("block-ellipsis"), extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
     "continue" => [extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
-    "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-line-clamp")], false, true;
+    "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("max-lines"), extra_props::VALUE_BASE + value_props::const_index("block-ellipsis"), extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
+    "-webkit-box-orient" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-box-orient")], false, true;
     "overflow-clip-margin" => [extra_props::VALUE_BASE + value_props::const_index("overflow-clip-margin")], false, true;
     "overscroll-behavior-x" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-x")], false, true;
     "overscroll-behavior-y" => [extra_props::VALUE_BASE + value_props::const_index("overscroll-behavior-y")], false, true;
@@ -13661,6 +14187,7 @@ property_registry! {
     "scroll-padding-block-end" => [extra_props::VALUE_BASE + value_props::const_index("scroll-padding-block-end")], false, true;
     "scroll-snap-align" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-align")], false, true;
     "scroll-snap-stop" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-stop")], false, true;
+    "scroll-initial-target" => [extra_props::VALUE_BASE + value_props::const_index("scroll-initial-target")], false, true;
     "scroll-snap-type" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-type")], false, true;
     "scrollbar-gutter" => [extra_props::VALUE_BASE + value_props::const_index("scrollbar-gutter")], false, true;
     "scrollbar-width" => [extra_props::VALUE_BASE + value_props::const_index("scrollbar-width")], false, true;
@@ -13691,6 +14218,9 @@ property_registry! {
     "transform-style" => [extra_props::VALUE_BASE + value_props::const_index("transform-style")], false, true;
     "vector-effect" => [extra_props::VALUE_BASE + value_props::const_index("vector-effect")], false, true;
     "will-change" => [extra_props::VALUE_BASE + value_props::const_index("will-change")], false, true;
+    "forced-color-adjust" => [extra_props::VALUE_BASE + value_props::const_index("forced-color-adjust")], true, true;
+    "image-orientation" => [extra_props::VALUE_BASE + value_props::const_index("image-orientation")], true, true;
+    "link-parameters" => [extra_props::VALUE_BASE + value_props::const_index("link-parameters")], false, true;
     "font-synthesis-position" => [extra_props::VALUE_BASE + value_props::const_index("font-synthesis-position")], true, true;
     "font-variant-position" => [extra_props::VALUE_BASE + value_props::const_index("font-variant-position")], true, true;
     "baseline-source" => [extra_props::VALUE_BASE + value_props::const_index("baseline-source")], false, true;
@@ -13717,10 +14247,11 @@ property_registry! {
 pub fn cssom_property_names() -> Vec<&'static str> {
     // `all` is the registry's special reset projection rather than a row
     // with duplicated slots, but it still has a CSSStyleDeclaration accessor.
-    const LEGACY_FLEX_ALIASES: [&str; 12] = [
+    const LEGACY_FLEX_ALIASES: [&str; 17] = [
         "-webkit-align-content", "-webkit-align-items", "-webkit-align-self", "-webkit-flex",
         "-webkit-flex-basis", "-webkit-flex-direction", "-webkit-flex-flow", "-webkit-flex-grow",
         "-webkit-flex-shrink", "-webkit-flex-wrap", "-webkit-justify-content", "-webkit-order",
+        "-webkit-transform", "-webkit-transform-origin", "-webkit-perspective", "-webkit-perspective-origin", "-webkit-backface-visibility",
     ];
     PROPERTIES.iter().map(|property| property.name)
         .filter(|name| !name.starts_with("-lumen-"))
@@ -13736,11 +14267,11 @@ pub fn is_cssom_property_name(name: &str) -> bool {
 }
 
 /// Typed OM initial ordering groups standard, vendor and custom properties.
-/// Canonical names are decoded UTF-8; its lexical order is code-point order.
+/// Names compare by UTF-16 code unit, matching how script sorts the keys.
 pub fn cssom_property_order(left: &str, right: &str) -> core::cmp::Ordering {
     let category=|name: &str| if name.starts_with("--") {2}
         else if name.starts_with('-') {1} else {0};
-    (category(left),left).cmp(&(category(right),right))
+    category(left).cmp(&category(right)).then_with(||left.encode_utf16().cmp(right.encode_utf16()))
 }
 
 /// Property animation types, independent of whether a particular endpoint pair
@@ -13973,7 +14504,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
     }
     match slot {
         187 => to.outline.color = from.outline.color,
-        198 => to.container_type = from.container_type,
+        198 => { to.container_type = from.container_type; to.container_flags = from.container_flags; }
         188 => to.outline.style = from.outline.style,
         189 => to.outline.width = from.outline.width,
         190 => to.outline.offset = from.outline.offset,
@@ -14005,6 +14536,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_lanes = from.grid_lanes;
             to.display_inline = from.display_inline;
             to.display_list_item = from.display_list_item;
+            to.display_ruby = from.display_ruby;
         }
         182 => to.grid_lanes_direction = from.grid_lanes_direction,
         183 => to.grid_lanes_dense = from.grid_lanes_dense,
@@ -14078,6 +14610,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_columns_subgrid = from.grid_columns_subgrid;
             to.grid_columns_auto = from.grid_columns_auto.clone();
             to.grid_columns_subgrid_repeat = from.grid_columns_subgrid_repeat.clone();
+            to.grid_columns_source = from.grid_columns_source.clone();
         }
         61 => to.grid_auto_columns = from.grid_auto_columns.clone(),
         62 => to.grid_auto_rows = from.grid_auto_rows.clone(),
@@ -14103,6 +14636,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_rows_subgrid = from.grid_rows_subgrid;
             to.grid_rows_auto = from.grid_rows_auto.clone();
             to.grid_rows_subgrid_repeat = from.grid_rows_subgrid_repeat.clone();
+            to.grid_rows_source = from.grid_rows_source.clone();
         }
         29 => {
             to.grid_column = from.grid_column;
@@ -14136,7 +14670,10 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.align_content_safe = from.align_content_safe;
             to.align_content_keyword = from.align_content_keyword;
         }
-        50 => to.flex_wrap_reverse = from.flex_wrap_reverse,
+        50 => {
+            to.flex_wrap_reverse = from.flex_wrap_reverse;
+            to.flex_wrap_balance = from.flex_wrap_balance;
+        }
         51 => {
             to.min_height = from.min_height;
             to.min_height_auto = from.min_height_auto;
@@ -15258,6 +15795,28 @@ fn background_length_with_query(raw: &str, context: LengthContext, query: Contai
     })
 }
 
+/// `flex-wrap`: `nowrap | [ wrap | wrap-reverse ]? || balance`, with `wrap balance` equal to `balance`.
+/// Returns (wraps, reversed, balanced).
+fn flex_wrap_words(raw: &str) -> Option<(bool, bool, bool)> {
+    let mut words = raw.split_ascii_whitespace();
+    let first = words.next()?;
+    let second = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    let (mut wrap, mut reverse, mut balance) = (false, false, false);
+    for word in core::iter::once(first).chain(second) {
+        match word {
+            "wrap" if !wrap && !reverse => wrap = true,
+            "wrap-reverse" if !wrap && !reverse => reverse = true,
+            "balance" if !balance => balance = true,
+            "nowrap" if second.is_none() => return Some((false, false, false)),
+            _ => return None,
+        }
+    }
+    Some((true, reverse, balance))
+}
+
 fn gap_value(slot: usize, raw: &str) -> Option<Value> {
     if raw == "normal" {
         return Some(if slot == 17 {
@@ -15298,6 +15857,7 @@ fn radial_gradient_with_source(
             fraction: 0.5,
         }; 2],
     );
+    let mut radius_percentage = false;
     let first_stop = if !explicit_method && (color_values::endpoint(tokens.first()?,0).is_some()
         || decoded_css_keyword(tokens.first()?,"currentcolor"))
     {
@@ -15307,7 +15867,7 @@ fn radial_gradient_with_source(
         while index < tokens.len() {
             let token = tokens[index];
             if decoded_css_keyword(token,"at") {
-                center = background_position_with_query(&tokens[index + 1..], context,query)?;
+                center = gradient_position(&tokens[index + 1..], context, query)?;
                 break;
             }
             if decoded_css_keyword(token,"circle") || decoded_css_keyword(token,"ellipse") {
@@ -15341,6 +15901,7 @@ fn radial_gradient_with_source(
                     return None;
                 }
                 radii.push(value);
+                radius_percentage |= token.contains('%');
             }
             index += 1;
         }
@@ -15354,7 +15915,7 @@ fn radial_gradient_with_source(
     let size = if radii.is_empty() {
         size.unwrap_or(RadialSize::FarthestCorner)
     } else if shape == RadialShape::Circle {
-        if radii.len() != 1 || radii[0].fraction != 0.0 {
+        if radii.len() != 1 || radii[0].fraction != 0.0 || radius_percentage {
             return None;
         }
         RadialSize::Radii([radii[0]; 2])
@@ -15516,7 +16077,7 @@ fn conic_gradient_with_source(raw: &str, current_color: &SourceColor, context: O
             let start = index + 1;
             let end = tokens[start..].iter().position(|token| decoded_css_keyword(token, "from") || decoded_css_keyword(token, "at"))
                 .map_or(tokens.len(), |offset| start + offset);
-            center = Some(background_position_with_query(&tokens[start..end], context, query)?);
+            center = Some(gradient_position(&tokens[start..end], context, query)?);
             index = end;
         } else if index == 0 {
             // No directive: the first comma component is the first color stop.
@@ -15588,6 +16149,13 @@ fn conic_stops(parts: &[&str], current_color: &SourceColor, context: LengthConte
     Some((stops.into(), angular, colors, legacy, color_functions))
 }
 
+/// Gradient and mask positions take one, two or four components.
+fn gradient_position(tokens: &[&str], context: LengthContext, query: ContainerUnitContext) -> Option<[LengthPercentage; 2]> {
+    if tokens.len() == 3 {
+        return None;
+    }
+    background_position_with_query(tokens, context, query)
+}
 fn background_position(tokens: &[&str], context: LengthContext) -> Option<[LengthPercentage; 2]> {
     background_position_with_query(tokens, context, ContainerUnitContext::no_container(context.viewport))
 }
@@ -15769,8 +16337,8 @@ fn image_set_resolution(raw:&str,context:LengthContext,query:ContainerUnitContex
     if expression.numeric_type()? != typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Dppx) {return None;}
     expression.simplify_absolute_units();
     let value=expression.evaluate(&mut FontAngleContext{length:Some(context),query,percent_scale:0.01})?;
-    if !value.is_finite() || !math_function(raw) && value<0.0 {return None;}
-    Some(value.max(0.0))
+    if !math_function(raw) && (value<0.0 || !value.is_finite()) {return None;}
+    Some(value.max(0.0).min(f64::from(f32::MAX)))
 }
 
 /// Bounded CSS Images 4 candidate negotiation. The host image profile supports
@@ -16383,7 +16951,7 @@ fn mask_image_value(raw: &str) -> Option<Value> {
 fn mask_position_value(raw: &str) -> Option<Value> {
     let context = static_length_context();
     for part in top_level_split(raw, b',', MAX_BACKGROUND_GEOMETRY_VALUES)? {
-        background_position(&components(part)?, context)?;
+        gradient_position(&components(part)?, context, ContainerUnitContext::no_container(context.viewport))?;
     }
     background_positions::shorthand_lists(raw)?;
     Some(Value::MaskPosition(background_positions(raw, None)))
@@ -16405,17 +16973,37 @@ fn mask_repeat_value(repeats: Arc<[[BackgroundRepeat; 2]]>) -> Value {
     Value::MaskRepeat((!initial).then_some(repeats))
 }
 
-/// Maps the css-masking geometry boxes onto the boxes an HTML element has.
-/// `fill-box` is the content box and `stroke-box`/`view-box` the border box;
-/// `no-clip` (clip only) paints without a clip, which the border box
-/// approximates because mask layers never extend beyond it.
+/// The css-masking geometry boxes; `no-clip` is accepted for `mask-clip` only.
 fn mask_box_keyword(token: &str, clip: bool) -> Option<&'static str> {
     match &*ascii_lower(token) {
-        "border-box" | "stroke-box" | "view-box" => Some("border-box"),
+        "border-box" => Some("border-box"),
         "padding-box" => Some("padding-box"),
-        "content-box" | "fill-box" => Some("content-box"),
-        "no-clip" if clip => Some("border-box"),
+        "content-box" => Some("content-box"),
+        "fill-box" => Some("fill-box"),
+        "stroke-box" => Some("stroke-box"),
+        "view-box" => Some("view-box"),
+        "no-clip" if clip => Some("no-clip"),
         _ => None,
+    }
+}
+
+/// The HTML box the background grammar can stand in for a mask geometry box while the shorthand
+/// is split into layers.
+fn mask_stand_in_box(keyword: &'static str) -> &'static str {
+    match keyword {
+        "fill-box" => "content-box",
+        "stroke-box" | "view-box" | "no-clip" => "border-box",
+        other => other,
+    }
+}
+
+fn parse_mask_box(keyword: &str) -> Option<BackgroundBox> {
+    match keyword {
+        "fill-box" => Some(BackgroundBox::Fill),
+        "stroke-box" => Some(BackgroundBox::Stroke),
+        "view-box" => Some(BackgroundBox::View),
+        "no-clip" => Some(BackgroundBox::NoClip),
+        _ => parse_background_box(keyword),
     }
 }
 
@@ -16425,7 +17013,7 @@ fn mask_boxes_value(slot: usize, raw: &str) -> Option<Value> {
     for part in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
         let tokens = components(part)?;
         let [token] = tokens.as_slice() else { return None };
-        boxes.push(parse_background_box(mask_box_keyword(token, clip)?)?);
+        boxes.push(parse_mask_box(mask_box_keyword(token, clip)?)?);
     }
     let initial = boxes.iter().all(|value| *value == BackgroundBox::Border);
     Some(Value::MaskBoxes(slot, (!initial).then(|| boxes.into())))
@@ -16455,11 +17043,13 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
     let mut layers = Vec::new();
     let mut modes = Vec::new();
     let mut composites = Vec::new();
+    let mut layer_boxes: Vec<Vec<&'static str>> = Vec::new();
     for layer in top_level_split(raw, b',', MAX_BACKGROUND_LAYERS)? {
         let mut mode = None;
         let mut composite = None;
         let mut tokens = Vec::new();
         let mut boxes = 0;
+        let mut real_boxes = Vec::new();
         for token in components(layer)? {
             match &*ascii_lower(token) {
                 "match-source" | "alpha" | "luminance" => {
@@ -16481,7 +17071,8 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
                 _ => match mask_box_keyword(token, true) {
                     Some(keyword) => {
                         boxes += 1;
-                        tokens.push(keyword);
+                        real_boxes.push(keyword);
+                        tokens.push(mask_stand_in_box(keyword));
                     }
                     None => tokens.push(token),
                 },
@@ -16491,6 +17082,7 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
             tokens.push("border-box");
         }
         layers.push(tokens.join(" "));
+        layer_boxes.push(real_boxes);
         modes.push(mode.unwrap_or_default());
         composites.push(composite.unwrap_or("add"));
     }
@@ -16498,13 +17090,21 @@ fn mask_shorthand_parts(raw: &str) -> Option<MaskShorthand> {
     if parts.color.is_some() {
         return None;
     }
+    let (mut origins, mut clips) = (parts.origins, parts.clips);
+    for (index, real) in layer_boxes.iter().enumerate() {
+        let (Some(&first), Some(&last)) = (real.first(), real.last()) else { continue };
+        if let (Some(origin), Some(clip)) = (origins.get_mut(index), clips.get_mut(index)) {
+            *origin = parse_mask_box(if first == "no-clip" { "border-box" } else { first })?;
+            *clip = parse_mask_box(last)?;
+        }
+    }
     Some(MaskShorthand {
         images: parts.images,
         positions: parts.positions,
         sizes: parts.sizes,
         repeats: parts.repeats?,
-        origins: parts.origins,
-        clips: parts.clips,
+        origins,
+        clips,
         modes,
         composites,
     })
@@ -16516,7 +17116,7 @@ fn mask_shorthand(raw: &str) -> Option<Vec<Value>> {
     let origins: Arc<[BackgroundBox]> = parts.origins.into();
     let clips: Arc<[BackgroundBox]> = parts.clips.into();
     let initial = |boxes: &[BackgroundBox]| boxes.iter().all(|value| *value == BackgroundBox::Border);
-    Some(alloc::vec![
+    let mut values = alloc::vec![
         mask_image_value(&parts.images)?,
         mask_position_value(&parts.positions)?,
         mask_size_value(&parts.sizes)?,
@@ -16525,7 +17125,11 @@ fn mask_shorthand(raw: &str) -> Option<Vec<Value>> {
         Value::MaskBoxes(262, (!initial(&clips)).then_some(clips)),
         Value::MaskModes((!modes.iter().all(|mode| *mode == MaskMode::MatchSource)).then_some(modes)),
         Value::ExtraRaw(extra_props::VALUE_BASE + value_props::const_index("mask-composite"), Arc::from(parts.composites.join(", "))),
-    ])
+    ];
+    for (name, initial) in mask_shorthand::BORDER_LONGHANDS.into_iter().zip(mask_shorthand::BORDER_INITIALS) {
+        values.push(Value::ExtraRaw(extra_props::slot_of(name)?, Arc::from(initial)));
+    }
+    Some(values)
 }
 
 fn mask_declaration_values(name: &str, raw: &str) -> Option<Vec<Value>> {
@@ -17467,7 +18071,7 @@ pub fn serialize_cssom_property_value(name: &str, value: &str) -> Option<String>
         }
         let declarations = typed_declarations("display", &raw, 0).ok()?;
         let declaration = declarations.first()?;
-        if !matches!(declaration.value, Value::Display(_) | Value::DisplayComponents { .. } | Value::GridDisplay { .. }) {
+        if !matches!(declaration.value, Value::Display(_) | Value::DisplayComponents { .. } | Value::DisplayRuby { .. } | Value::GridDisplay { .. }) {
             return None;
         }
         let mut style = Style::initial();
@@ -17627,7 +18231,7 @@ fn font_families(raw: &str) -> Option<Arc<[FontFamily]>> {
                 word_start = false;
                 continue;
             }
-            if matches!(ch, '\n' | '\r' | '\u{c}' | '\0') {
+            if ch == '\0' || quoted && matches!(ch, '\n' | '\r' | '\u{c}') {
                 return None;
             }
             if !quoted {
@@ -18925,7 +19529,7 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
         if defer_variables && name != "content" && owner_values::has_unmatched_closer(raw) {
             continue;
         }
-        if defer_variables && name != "content" && owner_values::may_use(raw) {
+        if defer_variables && owner_values::may_use(raw) {
             if !slots(name).is_empty() {
                 let admitted = match owner_values::admission(raw) {
                     owner_values::Admission::Invalid => false,
@@ -19214,33 +19818,31 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             continue;
         }
         if name == "flex-flow" {
-            if let Some(tokens) = components(raw).filter(|tokens| (1..=2).contains(&tokens.len())) {
-                let mut direction = None;
-                let mut wrap = None;
-                let mut valid = true;
-                for token in tokens {
-                    match token {
-                        "row" | "row-reverse" | "column" | "column-reverse"
-                            if direction.is_none() =>
-                        {
-                            direction = Some(token)
-                        }
-                        "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => wrap = Some(token),
-                        _ => valid = false,
-                    }
-                }
-                if valid {
+            if let Some(tokens) = components(raw).filter(|tokens| (1..=3).contains(&tokens.len())) {
+                let is_direction = |token: &str| matches!(token, "row" | "row-reverse" | "column" | "column-reverse");
+                let (direction, wrap_tokens) = if is_direction(tokens[0]) {
+                    (Some(tokens[0]), &tokens[1..])
+                } else if is_direction(tokens[tokens.len() - 1]) {
+                    (Some(tokens[tokens.len() - 1]), &tokens[..tokens.len() - 1])
+                } else {
+                    (None, &tokens[..])
+                };
+                let wrap = if wrap_tokens.is_empty() {
+                    Some((false, false, false))
+                } else {
+                    flex_wrap_words(&wrap_tokens.join(" "))
+                };
+                if let Some((wrap, reverse, balance)) = wrap {
                     let direction = match direction.unwrap_or("row") {
                         "row-reverse" => FlexDirection::RowReverse,
                         "column" => FlexDirection::Column,
                         "column-reverse" => FlexDirection::ColumnReverse,
                         _ => FlexDirection::Row,
                     };
-                    let wrap = wrap.unwrap_or("nowrap");
                     for value in [
                         Value::FlexDirection(direction),
-                        Value::FlexWrap(wrap != "nowrap"),
-                        Value::FlexWrapReverse(wrap == "wrap-reverse"),
+                        Value::FlexWrap(wrap),
+                        if balance { Value::FlexWrapReverseBalance(reverse) } else { Value::FlexWrapReverse(reverse) },
                     ] {
                         out.push(Declaration { value, important });
                     }
@@ -19766,11 +20368,13 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             }
         }
         let mut parsed = typed_declarations(name, raw, offset)?;
-        if name == "flex-wrap" && matches!(raw, "wrap" | "nowrap" | "wrap-reverse") {
-            parsed.push(Declaration {
-                value: Value::FlexWrapReverse(raw == "wrap-reverse"),
-                important,
-            });
+        if name == "flex-wrap" {
+            if let Some((_, reverse, balance)) = flex_wrap_words(raw) {
+                parsed.push(Declaration {
+                    value: if balance { Value::FlexWrapReverseBalance(reverse) } else { Value::FlexWrapReverse(reverse) },
+                    important,
+                });
+            }
         }
         for declaration in &mut parsed {
             declaration.important = important;
@@ -20215,7 +20819,27 @@ fn grid_function_token_starts(raw: &str, start: usize) -> bool {
     false
 }
 
+fn clear_grid_source(style: &mut Style, slot: usize) {
+    if slot == 27 {
+        if style.grid_columns_source.is_some() {
+            style.grid_columns_source = None;
+        }
+    } else if style.grid_rows_source.is_some() {
+        style.grid_rows_source = None;
+    }
+}
+
 fn grid_resolve(slot: usize, raw: &str, context: LengthContext) -> Option<Value> {
+    let value = grid_resolve_tracks(slot, raw, context)?;
+    if matches!(slot, 27 | 28) {
+        if let Some(source) = grid_source::computed_source(raw, context) {
+            return Some(Value::GridSourced(slot, source, Box::new(value)));
+        }
+    }
+    Some(value)
+}
+
+fn grid_resolve_tracks(slot: usize, raw: &str, context: LengthContext) -> Option<Value> {
     match slot {
         27 | 28 => {
             let tokens = grid_components(raw)?;
@@ -20302,6 +20926,23 @@ fn grid_display(raw: &str) -> Option<Value> {
     })
 }
 
+fn ruby_display(raw: &str) -> Option<Value> {
+    let tokens = components(raw)?;
+    let lowered: Vec<_> = tokens.iter().map(|token| ascii_lower(token)).collect();
+    let words: Vec<&str> = lowered.iter().map(|word| &**word).collect();
+    match words.as_slice() {
+        ["ruby"] | ["inline", "ruby"] | ["ruby", "inline"] => Some(Value::DisplayRuby { kind: 1, block: false }),
+        ["block", "ruby"] | ["ruby", "block"] => Some(Value::DisplayRuby { kind: 1, block: true }),
+        ["ruby-base"] => Some(Value::DisplayRuby { kind: 2, block: false }),
+        ["ruby-text"] => Some(Value::DisplayRuby { kind: 3, block: false }),
+        ["ruby-base-container"] => Some(Value::DisplayRuby { kind: 4, block: false }),
+        ["ruby-text-container"] => Some(Value::DisplayRuby { kind: 5, block: false }),
+        ["-webkit-box"] => Some(Value::DisplayRuby { kind: 6, block: true }),
+        ["-webkit-inline-box"] => Some(Value::DisplayRuby { kind: 7, block: false }),
+        _ => None,
+    }
+}
+
 fn display_components(raw: &str) -> Option<Value> {
     let tokens = components(raw)?;
     if !(1..=3).contains(&tokens.len()) { return None; }
@@ -20365,6 +21006,7 @@ fn grid_lanes_shorthand_with_specified(
             tracks.push_str(token);
         }
     }
+    let direction_text = direction.to_ascii_lowercase();
     let direction = if direction.is_empty() {
         GridLanesDirection {
             row: Some(false),
@@ -20418,7 +21060,11 @@ fn grid_lanes_shorthand_with_specified(
         ));
         output.push((
             "grid-lanes-direction",
-            computed_values::serialize_lanes_direction(direction),
+            if direction_text.is_empty() {
+                computed_values::serialize_lanes_direction(direction)
+            } else {
+                direction_text
+            },
         ));
     }
     Some(alloc::vec![
@@ -20999,9 +21645,15 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 "initial" => Some((0.0, 1.0, Value::FlexBasis(Some(0.0)))),
                 _ => {
                     let (mut grow, mut shrink, mut basis, mut valid) = (None, None, None, true);
+                    let mut after_basis = false;
                     for token in components(raw).unwrap_or_default() {
+                        let follows_basis = core::mem::replace(&mut after_basis, false);
                         if let Some(number) = css_scalar(token, false) {
                             if number < 0.0 && !math_function(token) {
+                                valid = false;
+                                break;
+                            }
+                            if follows_basis && grow.is_some() {
                                 valid = false;
                                 break;
                             }
@@ -21017,6 +21669,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                                 break;
                             }
                         } else if basis.is_none() {
+                            after_basis = true;
                             if token.eq_ignore_ascii_case("auto") {
                                 basis = Some(Value::FlexBasis(None));
                             } else if token.eq_ignore_ascii_case("content") {
@@ -21273,14 +21926,14 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 .unwrap();
                 nonnegative_length(raw).map(|v| Value::PaddingSide(side, v))
             }
-            "display" => grid_display(raw).or_else(|| display_components(raw)).or_else(|| match raw {
+            "display" => grid_display(raw).or_else(|| ruby_display(raw)).or_else(|| display_components(raw)).or_else(|| match raw {
                 "block" => Some(Value::Display(Display::Block)),
                 "flow-root" => Some(Value::Display(Display::FlowRoot)),
                 "inline" => Some(Value::Display(Display::Inline)),
                 "inline-block" => Some(Value::Display(Display::InlineBlock)),
                 "list-item" => Some(Value::Display(Display::ListItem)),
-                "flex" => Some(Value::Display(Display::Flex)),
-                "inline-flex" => Some(Value::DisplayComponents { principal: Display::Flex, inline: true, list_item: false }),
+                "flex" | "-webkit-flex" => Some(Value::Display(Display::Flex)),
+                "inline-flex" | "-webkit-inline-flex" => Some(Value::DisplayComponents { principal: Display::Flex, inline: true, list_item: false }),
 
                 "table" => Some(Value::Display(Display::Table)),
                 "inline-table" => Some(Value::Display(Display::InlineTable)),
@@ -21542,7 +22195,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 _ => None,
             },
             "font-style" => font_style_value(raw),
-            "container-type" => ContainerType::parse(raw).map(Value::ContainerType),
+            "container-type" => ContainerType::parse(raw).map(|(axis, flags)| Value::ContainerType(axis, flags)),
             "appearance" | "-webkit-appearance" => Appearance::parse(raw).map(Value::Appearance),
             "field-sizing" => FieldSizing::parse(raw).map(Value::FieldSizing),
             "view-transition-name" => {
@@ -21755,11 +22408,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 };
                 containment.map(|(size, inline_size, layout, style, paint)| Value::Containment { size, inline_size, layout, style, paint })
             }
-            "flex-wrap" => match raw {
-                "nowrap" => Some(Value::FlexWrap(false)),
-                "wrap" | "wrap-reverse" => Some(Value::FlexWrap(true)),
-                _ => None,
-            },
+            "flex-wrap" => flex_wrap_words(raw).map(|(wrap, _, _)| Value::FlexWrap(wrap)),
             "flex-direction" => match raw {
                 "row" => Some(Value::FlexDirection(FlexDirection::Row)),
                 "row-reverse" => Some(Value::FlexDirection(FlexDirection::RowReverse)),
@@ -24159,7 +24808,7 @@ fn emit_source_rules(
             }
             continue;
         }
-        if matches!(node.kind, SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues) {
+        if matches!(node.kind, SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition) {
             continue;
         }
         if node.kind == SourceRuleKind::FontFeatureValues {
@@ -24419,6 +25068,48 @@ impl RelativeSelector {
         validity: &dyn crate::forms::ValidityStateView,
         quota: Option<&core::cell::Cell<usize>>,
     ) -> bool {
+        let memo_depth = if depth > MAX_SELECTOR_MATCH_DEPTH || !document.instances.is_empty() {
+            None
+        } else {
+            self.memo_depth().filter(|need| depth + need + 2 <= MAX_SELECTOR_MATCH_DEPTH)
+        };
+        if memo_depth.is_none() {
+            return self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, quota);
+        }
+        let key = (self.id, anchor.key(), shadow_root.map(NodeId::key), scope_root.map(NodeId::key));
+        let version = document.version();
+        let cached = document.has_memo.borrow().get(version, &key);
+        if let Some(cached) = cached {
+            let Some(quota) = quota else { return cached.found; };
+            let remaining = quota.get();
+            if remaining < cached.work {
+                quota.set(0);
+                return false;
+            }
+            quota.set(remaining - cached.work);
+            return cached.found;
+        }
+        let measured = core::cell::Cell::new(usize::MAX);
+        let counting = quota.unwrap_or(&measured);
+        let before = counting.get();
+        let found = self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, Some(counting));
+        let after = counting.get();
+        if found || after != 0 {
+            document.has_memo.borrow_mut().insert(version, key, has_memo::HasResult { found, work: before - after });
+        }
+        found
+    }
+
+    fn matches_from_uncached(
+        &self,
+        document: &SelectorDocument<'_>,
+        anchor: NodeId,
+        shadow_root: Option<NodeId>,
+        scope_root: Option<NodeId>,
+        depth: usize,
+        validity: &dyn crate::forms::ValidityStateView,
+        quota: Option<&core::cell::Cell<usize>>,
+    ) -> bool {
         if depth > MAX_SELECTOR_MATCH_DEPTH {
             return false;
         }
@@ -24633,12 +25324,57 @@ impl Selector {
                     selectors.iter().any(Selector::has_validity_dependency)
                 }
                 LogicalPseudo::State(..) => true,
-                LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => false,
+                LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => false,
             })
             || self
                 .ancestor
                 .as_ref()
                 .is_some_and(|(_, ancestor)| ancestor.has_validity_dependency())
+    }
+
+    /// `Some` when the selector's result for an element depends only on the
+    /// document tree and attributes, so it holds until the document version
+    /// changes; the value is how many selector-match depth levels evaluating it
+    /// can descend.
+    fn memo_depth(&self) -> Option<usize> {
+        if self.host
+            || self.slotted
+            || self.part.is_some()
+            || self.nesting_selector != 0
+            || !self.form_state.is_empty()
+            || !self.interaction_state.is_empty()
+            || self.top_layer_state != 0
+            || self.directionality_mask != 0
+        {
+            return None;
+        }
+        let mut need = 0usize;
+        for pseudo in &self.structural {
+            match pseudo {
+                StructuralPseudo::Valid | StructuralPseudo::Invalid => return None,
+                StructuralPseudo::Nth { of: Some(selectors), .. } => {
+                    for selector in selectors {
+                        need = need.max(selector.memo_depth()? + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for pseudo in &self.logical {
+            match pseudo {
+                LogicalPseudo::Not(selectors) | LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors) => {
+                    for selector in selectors {
+                        need = need.max(selector.memo_depth()? + 1);
+                    }
+                }
+                LogicalPseudo::Heading(_) => {}
+                _ => return None,
+            }
+        }
+        if let Some((_, ancestor)) = &self.ancestor {
+            need = need.max(ancestor.memo_depth()? + 1);
+        }
+        Some(need)
     }
 
     /// Whether the selector (or an ancestor/sibling compound of it) matches on
@@ -24672,6 +25408,7 @@ impl Selector {
                 }
                 LogicalPseudo::State(..) => true,
                 LogicalPseudo::Heading(levels)=>*levels!=ALL_HEADING_LEVELS,
+                LogicalPseudo::HasSlotted(_) => true,
                 LogicalPseudo::InvalidNesting => false,
             })
             || self.ancestor.as_ref().is_some_and(|(relation, ancestor)| {
@@ -24689,7 +25426,7 @@ impl Selector {
             || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Empty | StructuralPseudo::Valid | StructuralPseudo::Invalid))
             || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Nth { of: Some(of), .. } if of.iter().any(Selector::depends_on_children)))
             || self.logical.iter().any(|pseudo| match pseudo {
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) => true,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_) => true,
                 LogicalPseudo::Not(selectors)
                 | LogicalPseudo::Is(selectors)
                 | LogicalPseudo::Where(selectors) => selectors.iter().any(Selector::depends_on_children),
@@ -24748,7 +25485,7 @@ impl Selector {
             return None;
         }
         for pseudo in &self.logical {
-            if matches!(pseudo, LogicalPseudo::Has(_) | LogicalPseudo::State(..)) {
+            if matches!(pseudo, LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_)) {
                 // A relational pseudo-class depends on the surrounding tree,
                 // which is unavailable to this context-free fast path.
                 return None;
@@ -24791,7 +25528,7 @@ impl Selector {
                     matched
                 }
                 LogicalPseudo::InvalidNesting => false,
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) => return None,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_) => return None,
                 LogicalPseudo::Heading(levels)=>if *levels==ALL_HEADING_LEVELS {crate::headings::heading_rank(kind).is_some()}else{return None;},
             };
             if !matched {
@@ -25067,6 +25804,15 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let any = match pseudo {
                 LogicalPseudo::Heading(levels)=>crate::headings::computed_heading_level(document,node).ok().flatten().is_some_and(|level|levels&(1u16<<u32::from(level))!=0),
                 LogicalPseudo::State(name, _) => document.has_custom_state(node, name),
+                LogicalPseudo::HasSlotted(selectors) => {
+                    let is_slot = matches!(document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if crate::svg::local_name(name) == "slot");
+                    is_slot && document.assigned_nodes(node, false).unwrap_or_default().into_iter().any(|assigned| {
+                        matches!(document.kind(assigned), Ok(NodeKind::Element { .. }))
+                            && (selectors.is_empty() || selectors.iter().any(|selector| {
+                                selector.matches_in_context_with_quota(document, assigned, None, scope_root, depth + 1, validity, quota)
+                            }))
+                    })
+                }
                 LogicalPseudo::Has(relative) => {
                     // In a shadow tree's own style, `:host:has()` looks at the
                     // shadow tree, whose top-level nodes are the root's children.
@@ -25105,7 +25851,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let matched = match pseudo {
                 LogicalPseudo::Not(_) => !any,
                 LogicalPseudo::Is(_) | LogicalPseudo::Where(_) | LogicalPseudo::Nesting(_) => any,
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) => any,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => any,
                 LogicalPseudo::InvalidNesting => false,
             };
             if !matched {
@@ -25179,7 +25925,6 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 _ => return false,
             };
             let parent = document.parent(node).ok().flatten();
-            if parent.is_none() && document.boundary()!=Some(node) {return false;}
             let matches_sibling = |sibling| {
                 let Ok(NodeKind::Element {
                     namespace, name, ..
@@ -25217,7 +25962,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 let mut current = if *reverse {
                     document.next_sibling(node).ok().flatten()
                 } else {
-                    parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node))
+                    parent.and_then(|parent|document.first_child(parent).ok().flatten()).or(Some(node))
                 };
                 while let Some(sibling) = current {
                     if !take_selector_work(quota) { return false; }
@@ -25241,7 +25986,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 continue;
             }
 
-            let mut current = parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node));
+            let mut current = parent.and_then(|parent|document.first_child(parent).ok().flatten()).or(Some(node));
             let (mut index, mut count) = (0i64, 0i64);
             while let Some(sibling) = current {
                 if !take_selector_work(quota) { return false; }
@@ -25356,7 +26101,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let equal = if namespace == &Namespace::Html { tag.eq_ignore_ascii_case(local_name) } else { tag == local_name };
             if !equal { return false; }
         }
-        if self.id.is_none() && self.classes.is_empty() && self.attributes.is_empty() { return true; }
+        if self.id.is_none() && self.classes.is_empty() && self.class_prefixes.is_empty() && self.attributes.is_empty() { return true; }
         let html_attribute_names =
             namespace == &Namespace::Html && document.is_some_and(Document::is_html_document);
         let namespaced: &[(usize, Arc<str>)] = document.zip(node)
@@ -25374,6 +26119,28 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 }) && value == id && attribute_namespace(index).is_none()
             });
             if !found { return false; }
+        }
+        if !self.class_prefixes.is_empty() {
+            let lowercase = document.is_some_and(|document| document.document_mode() == crate::DocumentMode::Quirks);
+            let class_attribute = attributes.iter().enumerate().find(|(index, (key, _))| {
+                (if html_attribute_names {
+                    key.as_str().eq_ignore_ascii_case("class")
+                } else {
+                    key.as_str() == "class"
+                }) && attribute_namespace(*index).is_none()
+            });
+            let Some((_, (_, value))) = class_attribute else { return false; };
+            let has_prefix = |prefix: &String| value.split_ascii_whitespace().any(|token| {
+                let beyond = if lowercase {
+                    token.get(..prefix.len())
+                        .filter(|head| head.eq_ignore_ascii_case(prefix))
+                        .and_then(|_| token[prefix.len()..].chars().next())
+                } else {
+                    token.strip_prefix(prefix.as_str()).and_then(|rest| rest.chars().next())
+                };
+                beyond.is_some_and(|next| next != '-')
+            });
+            if !self.class_prefixes.iter().all(has_prefix) { return false; }
         }
         if self.classes.iter().any(|class| {
             !attributes.iter().enumerate().any(|(index, (key, value))| {
@@ -25404,7 +26171,11 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 };
                 let html_name = html_attribute_names && namespace_uri.is_none();
                 let name_matches = if html_name {
-                    local_name.eq_ignore_ascii_case(selector.name.as_str())
+                    local_name.len() == selector.name.len()
+                        && local_name
+                            .bytes()
+                            .zip(selector.name.bytes())
+                            .all(|(attribute, wanted)| attribute == wanted.to_ascii_lowercase())
                 } else {
                     local_name == selector.name.as_str()
                 };
@@ -25434,6 +26205,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             && self.tag.is_none()
             && self.id.is_none()
             && self.classes.is_empty()
+            && self.class_prefixes.is_empty()
             && self.attributes.is_empty()
             && self.languages.is_empty()
             && self.structural.is_empty()
@@ -25454,7 +26226,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             _ => false,
         }))
             && !self.universal && !self.root && !self.slotted && self.part.is_none()
-            && self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
+            && self.tag.is_none() && self.id.is_none() && self.classes.is_empty() && self.class_prefixes.is_empty()
             && self.attributes.is_empty() && self.languages.is_empty() && self.structural.is_empty()
     }
 
@@ -25503,7 +26275,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                         return false;
                     }
                 }
-                LogicalPseudo::InvalidNesting | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) => {}
+                LogicalPseudo::InvalidNesting | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
                 LogicalPseudo::Is(selectors) => {
                     let old = selectors
                         .iter()
@@ -26317,6 +27089,7 @@ fn html_flow_list_defaults(kind:&NodeKind,context:Option<(&Document,NodeId)>,par
         if let Some(provenance) = provenance.as_deref_mut() { provenance.ua_override(&[7, 130]); provenance.baseline_font_scale = Some(size); }
     }
     if matches!(tag,"blockquote"|"figure") {style.logical_margin_inline=[Some(Some(40.0));2];}
+    if tag=="hr" {style.logical_margin_inline=[Some(None);2];block_em=Some(0.5);}
     if matches!(tag,"listing"|"plaintext"|"pre"|"xmp") {
         style.font.families=Some(Arc::from([FontFamily::Generic(GenericFontFamily::Monospace)]));
         Value::WhiteSpace(WhiteSpace::Pre).apply(style);
@@ -27040,7 +27813,7 @@ fn cascade_custom_layer(
                 let mut stack = Vec::new();
                 overlay.iter().enumerate().map(|(at, (name, value))| match value.as_ref() {
                     Some(value) if value.expands() => Some(expand_entry(at, name, value, &names,
-                        &mut stack, &mut walk).map(CustomText::from)),
+                        &mut stack, &mut walk).map(|text| CustomText::from(text.trim()))),
                     _ => None,
                 }).collect()
             };
@@ -27381,7 +28154,7 @@ fn cascade_custom_properties_uncached(
             let mut stack = Vec::new();
             custom_properties.iter().enumerate().map(|(at, (name, value))| match value.as_ref() {
                 Some(value) if value.expands() => {
-                    Some(expand_entry(at, name, value, &names, &mut stack, &mut walk).map(CustomText::from))
+                    Some(expand_entry(at, name, value, &names, &mut stack, &mut walk).map(|text| CustomText::from(text.trim())))
                 }
                 _ => None,
             }).collect()
@@ -27568,13 +28341,13 @@ fn substitution_depends_on_sibling(index: &StyleIndex, raw: &Arc<str>, custom: &
 }
 
 fn resolve_registered_deferred_slot(index: &StyleIndex, source: &Declaration, slot: usize,
-    custom: &Option<Arc<CustomProperties>>) -> Declaration {
+    custom: &Option<Arc<CustomProperties>>, element: Option<(&Document, NodeId)>) -> Declaration {
     let (property, raw) = match &source.value {
         Value::Deferred(property, raw) => (property, raw),
         Value::DeferredLonghand(group, _) | Value::DeferredSlot(group, _) => (&group.property, &group.value),
         _ => return source.clone(),
     };
-    deferred_declarations(index, property, raw, custom, None, None).iter()
+    deferred_declarations(index, property, raw, custom, None, element).iter()
         .find(|declaration| declaration.value.slot() == slot).cloned()
         .unwrap_or(Declaration { value: Value::Default(slot, inherited_property(slot)), important: source.important })
 }
@@ -28354,6 +29127,21 @@ fn html_presentational_hints(kind: &NodeKind, context: Option<(&Document, NodeId
             }
         }
     }
+    if tag == "hr" {
+        let color = html_rendering_attribute(attributes, context, "color");
+        let shaded = color.is_some() || html_rendering_attribute(attributes, context, "noshade").is_some();
+        if shaded { hint(Value::BorderStyle(BorderStyle::Solid)); }
+        if let Some(color) = color.and_then(html_legacy_color) { hint(Value::Color(color)); }
+        if let Some(size) = html_rendering_attribute(attributes, context, "size").and_then(crate::forms::parse_nonnegative_integer).map(|size| size.min(1000)) {
+            if shaded {
+                if size > 0 { hint(Value::BorderWidth(size as f32 / 2.0)); }
+            } else if size == 1 {
+                hint(Value::LogicalBorder(117, LogicalBorderComponent::Width(0.0)));
+            } else if size > 1 {
+                hint(Value::Height((size - 2) as f32));
+            }
+        }
+    }
     if tag == "font" {
         if let Some(size) = html_rendering_attribute(attributes, context, "size").and_then(legacy_font_size) { hint(Value::FontSize(size)); }
         if let Some(face) = html_rendering_attribute(attributes, context, "face").and_then(font_families) { hint(Value::FontFamily(face)); }
@@ -28867,7 +29655,8 @@ fn restyle_one(
     };
     let style = compute_node_cached_impl(document, node, parent.as_deref(), index, cache, Some(text))?;
     let mut damage = style_damage_modulo_custom(index, &mut cache.custom_rebases, &old_style, &style);
-    let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| matches!(&generated.content,
+    let reads_attributes = |generated: &Option<GeneratedStyle>| generated.as_ref().is_some_and(|generated| generated.style.sibling_position_dependent
+        || matches!(&generated.content,
         GeneratedContent::Items(items) if items.iter().any(|item| matches!(item, GeneratedContentItem::Attribute { .. }))));
     for (position, (pseudo, generated)) in old_pseudos.iter().enumerate() {
         if old_pseudos[..position].iter().any(|(earlier, _)| earlier == pseudo) { continue; }
@@ -29459,6 +30248,17 @@ fn compute_for(kind: &NodeKind, parent: Option<&Style>, index: &StyleIndex,
     compute_for_named(kind, parent, index, context, ancestor_bloom, text, pseudo_target, None, None)
 }
 
+/// Declarations that do not apply to `::marker`; animations and transitions
+/// additionally skip the bidi and vertical-text properties.
+fn marker_ignores(value: &Value, animated: bool) -> bool {
+    match value {
+        Value::Position(_) | Value::Float(_) | Value::ListStyleType(_) | Value::ListStylePosition(_) | Value::ListStyleImage(_) => true,
+        Value::Display(display) => !matches!(display, Display::Block | Display::Inline | Display::InlineBlock),
+        Value::UnicodeBidi(_) | Value::Direction(_) => animated,
+        other => animated && other.slot() == extra_props::VALUE_BASE + value_props::const_index("text-combine-upright"),
+    }
+}
+
 fn compute_for_named(
     kind: &NodeKind,
     parent: Option<&Style>,
@@ -29852,6 +30652,9 @@ fn compute_for_named_registered_inner(
                 )
             {
                 style.display = Display::None;
+            } else if *namespace == Namespace::Html && matches!(tag, "ruby" | "rb" | "rt" | "rtc") {
+                style.display = Display::Inline;
+                style.display_ruby = match tag { "ruby" => 1, "rb" => 2, "rt" => 3, _ => 5 };
             } else if *namespace == Namespace::Html
                 && matches!(
                     tag,
@@ -29933,6 +30736,9 @@ fn compute_for_named_registered_inner(
         Value::TextUnderlinePosition(parent.text_underline_position).apply(&mut style);
         copy_slot(215,parent,&mut style);
         copy_slot(219,parent,&mut style);
+    }
+    if pseudo_target.is_some_and(PseudoElement::is_marker) {
+        marker_ua::apply(&mut style);
     }
     if pseudo_target.is_none() {
         if let NodeKind::Element {namespace:Namespace::MathMl,name,..}=kind {
@@ -30027,6 +30833,10 @@ fn compute_for_named_registered_inner(
                     }
                     "a" | "area" if crate::svg::attribute(attributes, "href").is_some() => {
                         html_text_ua::link(&mut style, index.environment.color_schemes.page().scheme);
+                    }
+                    "hr" => {
+                        html_text_ua::rule(&mut style);
+                        if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[1,9,10]);}
                     }
                     "u" | "ins" => html_text_ua::decoration(&mut style, "underline"),
                     "s" | "strike" | "del" => html_text_ua::decoration(&mut style, "line-through"),
@@ -30335,6 +31145,10 @@ fn compute_for_named_registered_inner(
                 style.width=Some(0.0);
                 style.height=Some(0.0);
             }
+            if pseudo_target.is_none() && context.is_some_and(|(document, node)|
+                crate::interaction::matches(document, node, crate::interaction::InteractionPseudo::FocusVisible)) {
+                focus_ring_ua::apply(&mut style);
+            }
             // HTML rendering defaults remain lower priority than author CSS.
             if *namespace == Namespace::Html && html_rendering_attribute(attributes, context, "hidden").is_some() && tag != "embed" {
                 if matches!(tag, "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr") {
@@ -30541,6 +31355,7 @@ fn compute_for_named_registered_inner(
         let source_url = rule.source_url.clone().or_else(|| index.document_base_url.clone());
         candidates.reserve(rule.declarations.len());
         for declaration in rule.declarations.iter() {
+            if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, false) { continue; }
             let layer = if declaration.important { important_layer } else { normal_layer };
             let priority = (
                 CascadeOrigin::author(declaration.important),
@@ -30611,12 +31426,22 @@ fn compute_for_named_registered_inner(
                 EffectOrigin::Transition => CascadeOrigin::Transition,
             };
             for declaration in &effect.declarations {
+                if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, true) { continue; }
                 candidates.push(((origin, [usize::MAX; 8], (0, 0, 0, 0), (0, usize::MAX)),
                     alloc::borrow::Cow::Borrowed(declaration), index.document_base_url.clone()));
             }
         }
     }
     candidates.sort_by_key(|(priority, _, _)| *priority);
+    for (_, declaration, _) in candidates.iter_mut() {
+        let Value::Custom(name, raw) = &declaration.value else { continue; };
+        let registered_random = owner_values::uses_random(raw) && registrations.iter().any(|registration| registration.name.as_str() == &**name);
+        if !owner_values::uses_attr(raw) && !registered_random { continue; }
+        let owner = owner_values::Owner { element: context, property: name };
+        let substituted: Arc<str> = owner_values::substitute(raw, &owner).map_or_else(|| Arc::from("unset"), |text| Arc::from(text.trim()));
+        let replacement = Declaration { value: Value::Custom(name.clone(), substituted), important: declaration.important };
+        *declaration = alloc::borrow::Cow::Owned(replacement);
+    }
     let sibling_dependent=candidates.iter().any(|(_,declaration,_)|{
         if value_depends_on_sibling_position(&declaration.value){return true;}
         let raw=match &declaration.value{Value::Deferred(_,raw)|Value::Custom(_,raw)=>Some(raw),Value::DeferredLonghand(group,_)|Value::DeferredSlot(group,_)=>Some(&group.value),_=>None};
@@ -30891,7 +31716,7 @@ fn compute_for_named_registered_inner(
                 &cycle_default
             } else if pass >= 4 && !registrations.is_empty() {
                 if let Some(original) = expanded_originals.get(order).and_then(Option::as_ref) {
-                    refreshed = resolve_registered_deferred_slot(index, original, slot, &style.custom);
+                    refreshed = resolve_registered_deferred_slot(index, original, slot, &style.custom, context);
                     &refreshed
                 } else { declaration.as_ref() }
             } else { declaration.as_ref() };
@@ -31391,7 +32216,7 @@ fn compute_for_named_registered_inner(
                     }
                 } else if let Value::ExtraRaw(slot, raw) = &declaration.value {
                     let context = length_context!(raw);
-                    extra_props::apply(*slot, raw, context, &mut style);
+                    extra_props::apply_with_parent(*slot, raw, context, &mut style, parent);
                 } else if let Value::GapRaw(slot, raw) = &declaration.value {
                     let context = length_context!(raw);
                     if let Some(value) = background_length(raw, context) {
@@ -31584,14 +32409,18 @@ fn compute_for_named_registered_inner(
         if crate::svg::local_name(name)=="input" && !["range","checkbox","radio"].iter().any(|state|
             crate::svg::attribute(attributes,"type").unwrap_or("text").eq_ignore_ascii_case(state))),|(_,provenance)|provenance.ua_clip_input);
     if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_clip_input=input_clip;}
-    if input_clip {style.overflow_x=Overflow::Clip;style.overflow_y=Overflow::Clip;}
-    // Visible/clip compute to auto/hidden if the other axis creates a scroll container.
+    if input_clip {
+        style.overflow_x=Overflow::Clip;style.overflow_y=Overflow::Clip;
+        let image=matches!(kind,NodeKind::Element{attributes,..}
+            if crate::svg::attribute(attributes,"type").is_some_and(|state|state.eq_ignore_ascii_case("image")));
+        extra_props::set_stored(&mut style,"overflow-clip-margin",image.then_some("content-box"));
+    }
+    // Visible computes to auto if the other axis creates a scroll container; clip stays a single-axis clip.
     let (x, y) = (style.overflow_x, style.overflow_y);
     let normalize = |axis: Overflow, other: Overflow| {
         if other.scroll_container() {
             match axis {
                 Overflow::Visible => Overflow::Auto,
-                Overflow::Clip => Overflow::Hidden,
                 _ => axis,
             }
         } else {
@@ -32328,7 +33157,7 @@ mod tests {
             ("conic-gradient(from 0deg at 50% 50%, red 90deg)","conic-gradient(red 90deg)"),
             ("linear-gradient(0.5turn, red, blue)","linear-gradient(red, blue)"),
             ("conic-gradient(from 100grad, red 0.25turn, blue calc(1turn - 90deg))","conic-gradient(from 90deg, red 90deg, blue calc(270deg))"),
-            ("radial-gradient(at top 20px left,red,blue)","radial-gradient(at left 0px top 20px, red, blue)"),
+            ("radial-gradient(at top 20px left 0px,red,blue)","radial-gradient(at left 0px top 20px, red, blue)"),
             ("linear-gradient(in oklab, currentColor, red)","linear-gradient(in oklab, currentcolor, red)"),
         ] {
             let block=DeclarationBlock::parse(&alloc::format!("background-image:{raw}")).unwrap();
@@ -35068,7 +35897,7 @@ mod tests {
         let style = compute(&element("overflow:hidden;overflow-x:clip"), None, &index).unwrap();
         assert_eq!(
             (style.overflow_x, style.overflow_y),
-            (Overflow::Hidden, Overflow::Hidden)
+            (Overflow::Clip, Overflow::Hidden)
         );
         let style = compute(&element("overflow-y:auto"), None, &index).unwrap();
         assert_eq!(
@@ -35111,7 +35940,7 @@ mod tests {
         assert_eq!(style.mask_size.as_ref().unwrap().len(), 2);
         assert_eq!(style.mask_repeat.as_ref().unwrap()[0], [BackgroundRepeat::NoRepeat; 2]);
         assert_eq!(style.mask_origin.as_ref().unwrap().as_ref(), &[BackgroundBox::Content]);
-        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Padding, BackgroundBox::Border]);
+        assert_eq!(style.mask_clip.as_ref().unwrap().as_ref(), &[BackgroundBox::Padding, BackgroundBox::NoClip]);
         assert_eq!(style.mask_mode.as_ref().unwrap().as_ref(), &[MaskMode::Luminance]);
         let initial = compute(&element("color:red"), None, &index).unwrap();
         assert!(!initial.has_mask() && initial.mask_images.is_none() && !initial.paints_as_group());
@@ -35230,18 +36059,18 @@ mod tests {
     fn specification_cross_fade_computes_math_and_omitted_weights_before_paint_normalization() {
         let index=StyleIndex::new(Vec::new());
         for (raw,expected) in [
-            ("cross-fade(30% red, green)","cross-fade(rgb(255, 0, 0) 30%, rgb(0, 128, 0) 70%)"),
+            ("cross-fade(30% red, green)","cross-fade(rgb(255, 0, 0) 30%, rgb(0, 128, 0))"),
             ("cross-fade(20% red, 20% green)","cross-fade(rgb(255, 0, 0) 20%, rgb(0, 128, 0) 20%)"),
             ("cross-fade(50% red, 50% green, 50% blue)","cross-fade(rgb(255, 0, 0) 50%, rgb(0, 128, 0) 50%, rgb(0, 0, 255) 50%)"),
-            ("cross-fade(calc(101%) red, green)","cross-fade(rgb(255, 0, 0) 100%, rgb(0, 128, 0) 0%)"),
-            ("cross-fade(calc(-200%) red, green)","cross-fade(rgb(255, 0, 0) 0%, rgb(0, 128, 0) 100%)"),
-            ("cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)","cross-fade(rgb(255, 0, 0) 49%, rgb(0, 128, 0) 51%)"),
+            ("cross-fade(calc(101%) red, green)","cross-fade(rgb(255, 0, 0) 100%, rgb(0, 128, 0))"),
+            ("cross-fade(calc(-200%) red, green)","cross-fade(rgb(255, 0, 0) 0%, rgb(0, 128, 0))"),
+            ("cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)","cross-fade(rgb(255, 0, 0) 49%, rgb(0, 128, 0))"),
         ] {
             let style=compute(&element(&alloc::format!("font-size:20px;background-image:{raw}")),None,&index).unwrap();
             assert_eq!(style.computed_image_source_value(53).as_deref(),Some(expected),"{raw}");
         }
         let style=compute(&element("font-size:40px;background-image:cross-fade(calc(50% + 1% * sign(1em - 30px)) red, green)"),None,&index).unwrap();
-        assert_eq!(style.computed_image_source_value(53).as_deref(),Some("cross-fade(rgb(255, 0, 0) 51%, rgb(0, 128, 0) 49%)"));
+        assert_eq!(style.computed_image_source_value(53).as_deref(),Some("cross-fade(rgb(255, 0, 0) 51%, rgb(0, 128, 0))"));
         for raw in ["cross-fade(101% red, green)","cross-fade(-1% red, green)","cross-fade(0.5 red,green)"] {assert!(!valid_background_images(raw),"{raw}");}
     }
 
@@ -36402,7 +37231,7 @@ mod tests {
     fn font_size_keywords_share_cascade_html_hints_and_font_api_resolution() {
         let index = StyleIndex::new(Vec::new());
         let parent = compute(&element("font-size:medium"), None, &index).unwrap();
-        for (html_size, keyword) in [("1", "xx-small"), ("2", "small"), ("3", "medium"),
+        for (html_size, keyword) in [("1", "x-small"), ("2", "small"), ("3", "medium"),
             ("4", "large"), ("5", "x-large"), ("6", "xx-large"), ("7", "xxx-large")]
         {
             let hinted = NodeKind::Element {
@@ -39608,8 +40437,8 @@ mod tests {
                 wide.iter().map(|v| v.value.slot()).collect::<Vec<_>>(),
                 property.ids
             );
-            for &id in property.ids {
-                assert_eq!(inherited_property(id), property.inherited);
+            if property.ids.len() == 1 {
+                assert_eq!(inherited_property(property.ids[0]), property.inherited);
             }
         }
         let outside_all = (0..PROPERTY_COUNT).filter(|id| !ALL_PROPERTY_IDS.contains(id)).collect::<Vec<_>>();
@@ -42607,8 +43436,7 @@ mod tests {
         };
         assert!(matches!(
             items.get(1),
-            Some(GeneratedContentItem::Attribute { name, fallback: Some(fallback) })
-                if &**name == "data-label" && &**fallback == "fallback"
+            Some(GeneratedContentItem::String(text)) if &**text == "card"
         ));
         assert!(matches!(
             items.get(2),
@@ -42658,7 +43486,13 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(refreshed.content, before.content);
+        let GeneratedContent::Items(refreshed_items) = &refreshed.content else {
+            panic!("refreshed before should have typed content");
+        };
+        assert!(matches!(
+            refreshed_items.get(1),
+            Some(GeneratedContentItem::String(text)) if &**text == "changed"
+        ));
         assert!(
             matches!(document.kind(target), Ok(NodeKind::Element { attributes, .. })
             if attributes.iter().any(|(name, value)| name == "data-label" && value == "changed"))

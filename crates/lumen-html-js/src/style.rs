@@ -11,6 +11,9 @@ pub struct DomStyle {
     pub(crate) node: NodeId,
     pub(crate) computed: bool,
     pub(crate) pseudo: Option<css::PseudoElement>,
+    /// Cascade key of the highlight pseudo-element when `pseudo` is `Highlight`;
+    /// the capture name of a functional view-transition pseudo-element.
+    pub(crate) highlight: Option<String>,
     pub(crate) invalid_pseudo: bool,
     pub(crate) _owner: Value,
 }
@@ -21,6 +24,10 @@ impl DomStyle {
     }
 
     fn property_value(&self, name: &str, resolved: bool) -> OpResult<String> {
+        self.property_value_for(name, resolved, false)
+    }
+
+    fn property_value_for(&self, name: &str, resolved: bool, typed_om: bool) -> OpResult<String> {
         if self.computed {
             self.realm.synchronize_embedding_color_scheme()?;
             if resolved && !self.computed_declarations_available()? { return Ok(String::new()); }
@@ -36,8 +43,11 @@ impl DomStyle {
                 if session.has_container_queries() { true } else {
                 let inherited = css::property_inherits_query_context(&property);
                 let mut current = Some(self.node);
-                let mut pending = false;
+                let mut pending = self.pseudo.is_some()
+                    && self.resolved_style(&mut session, pending_fonts.as_ref())
+                        .is_ok_and(|style| style.property_query_context_pending(&property));
                 for _ in 0..512 {
+                    if pending { break; }
                     let Some(node) = current else { break; };
                     if matches!(session.document().kind(node), Ok(NodeKind::Element { .. })) && session
                         .computed_style_with_text(node,pending_fonts.as_ref().map(|fonts|fonts as &dyn lumen_html::paint::TextShaper))
@@ -99,6 +109,7 @@ impl DomStyle {
                     } else {None},
                     replaced_element: self.pseudo.is_none() && replaced_element,
                     used_display: if needs_layout && self.pseudo.is_none() {session.layout_used_display(self.node)} else {None},
+                    independent_border_widths: typed_om,
                     ..Default::default()
                 };
                 let grid_tracks = if resolved && matches!(property.as_ref(), "grid-template-columns" | "grid-template-rows" | "grid-template" | "grid" | "grid-lanes") { session.layout_grid_tracks(self.node) } else { None };
@@ -135,12 +146,30 @@ impl DomStyle {
     fn resolved_style(&self, session: &mut lumen_html::session::RenderSession, fonts:Option<&super::canvas::CanvasFontSource>) -> Result<css::Style, lumen_html::layout::LayoutError> {
         let text=fonts.map(|fonts|fonts as &dyn lumen_html::paint::TextShaper);
         match self.pseudo {
+            Some(css::PseudoElement::Highlight) if self.highlight.is_some() => {
+                session.computed_highlight_style_with_text(self.node, self.highlight.as_deref().unwrap_or_default(), text)
+            }
+            Some(pseudo) if pseudo.is_view_transition() => {
+                let fallback;
+                let shaper: &dyn lumen_html::paint::TextShaper = match text {
+                    Some(text) => text,
+                    None => {
+                        fallback = super::canvas::CanvasFontSource::Static(super::canvas::canvas_fallback_fonts());
+                        &fallback
+                    }
+                };
+                super::view_transition::computed_pseudo_style(&self.realm, session, self.node, pseudo, self.highlight.as_deref(), shaper)
+            }
             Some(pseudo) => session.computed_pseudo_style_with_text(self.node, pseudo,text),
             None => session.computed_style_with_text(self.node,text),
         }
     }
     fn computed_declarations_available(&self) -> OpResult<bool> {
         if self.invalid_pseudo { return Ok(false); }
+        if self.pseudo.is_some_and(css::PseudoElement::is_view_transition)
+            && self.realm.with_session(|session| selector::document_element(session.document())) != Some(self.node) {
+            return Ok(false);
+        }
         rendered_ancestry(&self.realm, self.node, false)
     }
 
@@ -201,14 +230,65 @@ pub(crate) fn computed_property_value(
         node,
         computed: true,
         pseudo: None,
+        highlight: None,
         invalid_pseudo: false,
         _owner: Value::Undefined,
     }
     .property_value(property, false)
 }
 
-pub(crate) fn check_visibility(realm: &Rc<DomRealm>, node: NodeId, opacity: bool, visibility: bool) -> OpResult<bool> {
+pub(crate) fn typed_om_computed_property_value(
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    property: &str,
+) -> OpResult<String> {
+    DomStyle {
+        realm: realm.clone(),
+        node,
+        computed: true,
+        pseudo: None,
+        highlight: None,
+        invalid_pseudo: false,
+        _owner: Value::Undefined,
+    }
+    .property_value_for(property, false, true)
+}
+
+fn content_visibility_skips(realm: &Rc<DomRealm>, node: NodeId, auto: bool) -> OpResult<bool> {
+    let mut current = realm.session.borrow().document().flat_tree_parent(node).ok().flatten();
+    while let Some(id) = current {
+        let is_element = matches!(realm.session.borrow().document().kind(id), Ok(NodeKind::Element { .. }));
+        if is_element {
+            match computed_property_value(realm, id, "content-visibility")?.as_str() {
+                "hidden" => return Ok(true),
+                "auto" if auto => {
+                    realm.flush_layout()?;
+                    let session = realm.session.borrow();
+                    let rect = session.bounding_client_rect(id);
+                    if let (Some(rect), Some((width, height))) = (rect, session.viewport_size()) {
+                        let (margin_x, margin_y) = (width as f32 / 2.0, height as f32 / 2.0);
+                        let outside = rect.x + rect.width < -margin_x
+                            || rect.y + rect.height < -margin_y
+                            || rect.x > width as f32 + margin_x
+                            || rect.y > height as f32 + margin_y;
+                        if outside {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = realm.session.borrow().document().flat_tree_parent(id).ok().flatten();
+    }
+    Ok(false)
+}
+
+pub(crate) fn check_visibility(realm: &Rc<DomRealm>, node: NodeId, opacity: bool, visibility: bool, content_visibility_auto: bool) -> OpResult<bool> {
     if !rendered_ancestry(realm, node, true)? {
+        return Ok(false);
+    }
+    if content_visibility_skips(realm, node, content_visibility_auto)? {
         return Ok(false);
     }
     if visibility && computed_property_value(realm, node, "visibility")? != "visible" {
@@ -357,7 +437,7 @@ fn define_css_property_accessor(
     property: &'static str,
 ) {
     let getter = ctx.new_native_fn(
-        "get",
+        &format!("get {name}"),
         0,
         std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, _args: &[Value]| {
             let method = ctx
@@ -367,7 +447,7 @@ fn define_css_property_accessor(
         }),
     );
     let setter = ctx.new_native_fn(
-        "set",
+        &format!("set {name}"),
         1,
         std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, args: &[Value]| {
             let method = ctx
@@ -495,6 +575,11 @@ impl DomStyle {
     fn indexed(&self,ctx:&mut Ctx, index: usize) -> OpResult<Value> {
         if self.computed {crate::animations::flush_css_transitions_for(ctx,&self.realm,Some(self.node))?;}
         Ok(self.property_name(index)?.map_or(Value::Undefined, Value::from_string))
+    }
+
+    #[getter(name = "parentRule")]
+    fn parent_rule(&self) -> Value {
+        Value::Null
     }
 
     #[getter]
@@ -696,6 +781,13 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
         "::first-letter" | ":first-letter" => Some(css::PseudoElement::FirstLetter),
         _ => None,
     };
+    let highlight = if parsed.is_none() { css::highlight_pseudo_key(&pseudo) } else { None };
+    let parsed = if highlight.is_some() { Some(css::PseudoElement::Highlight) } else { parsed };
+    let view_transition = if parsed.is_none() { css::parse_view_transition_pseudo(&pseudo) } else { None };
+    let (parsed, highlight) = match view_transition {
+        Some((view_transition, capture)) => (Some(view_transition), capture),
+        None => (parsed, highlight),
+    };
     if pseudo.starts_with("::part(") || pseudo.starts_with("::slotted(") {
         return Err(OpError::type_error("getComputedStyle does not accept part or slotted pseudo-elements"));
     }
@@ -704,6 +796,7 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
         node: id,
         computed: true,
         pseudo: parsed,
+        highlight,
         invalid_pseudo: !pseudo.is_empty() && parsed.is_none(),
         _owner: element.0.value.clone(),
     })
@@ -1567,8 +1660,8 @@ mod tests {
         .unwrap();
         let result = engine.eval_value(r#"
             const s = getComputedStyle(document.querySelector('div'));
-            s.getPropertyValue('overflow-x') === 'hidden' && s.getPropertyValue('overflow-y') === 'hidden' &&
-            s.getPropertyValue('overflow') === 'hidden' && s.getPropertyValue('background-attachment') === 'fixed, local'
+            s.getPropertyValue('overflow-x') === 'clip' && s.getPropertyValue('overflow-y') === 'hidden' &&
+            s.getPropertyValue('overflow') === 'clip hidden' && s.getPropertyValue('background-attachment') === 'fixed, local'
         "#).unwrap().ok().unwrap();
         assert!(matches!(result, Value::Bool(true)));
     }

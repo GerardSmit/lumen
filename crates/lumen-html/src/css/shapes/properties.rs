@@ -146,7 +146,7 @@ fn parse_path_like(prop: Prop, raw: &str, env: Env) -> Option<PathValue> {
     Some(PathValue { source, bx })
 }
 
-fn parse_rotate(raw: &str) -> Option<Rot> {
+fn parse_rotate(raw: &str, env: Env) -> Option<Rot> {
     let tokens = components(raw.trim())?;
     if tokens.is_empty() || tokens.len() > 2 {
         return None;
@@ -158,7 +158,7 @@ fn parse_rotate(raw: &str) -> Option<Rot> {
             "auto" | "reverse" if keyword.is_none() => {
                 keyword = Some(if token.eq_ignore_ascii_case("auto") { RotKeyword::Auto } else { RotKeyword::Reverse });
             }
-            _ if angle.is_none() => angle = Some(parse_angle(token)?),
+            _ if angle.is_none() => angle = Some(parse_angle(token, env)?),
             _ => return None,
         }
     }
@@ -216,7 +216,7 @@ pub(super) fn parse(prop: Prop, raw: &str, env: Env) -> Option<Parsed> {
         Prop::ShapeMargin => Parsed::Len(parse_len(raw, env, true)?),
         Prop::OffsetDistance => Parsed::Len(parse_len(raw, env, false)?),
         Prop::ShapeImageThreshold => Parsed::Number(parse_number(raw)?),
-        Prop::OffsetRotate => Parsed::Rotate(parse_rotate(raw)?),
+        Prop::OffsetRotate => Parsed::Rotate(parse_rotate(raw, env)?),
         Prop::OffsetAnchor | Prop::OffsetPosition => Parsed::Place(parse_place(prop, raw, env)?),
         Prop::Clip => Parsed::Clip(parse_clip(raw, env)?),
     })
@@ -259,7 +259,7 @@ impl PathValue {
         PathValue { source, bx: self.bx }
     }
 
-    fn effective_box(&self, prop: Prop) -> &'static str {
+    pub(super) fn effective_box(&self, prop: Prop) -> &'static str {
         self.bx.unwrap_or(prop.default_box())
     }
 }

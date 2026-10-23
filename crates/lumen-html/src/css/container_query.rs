@@ -208,20 +208,20 @@ fn parse_condition(segment: &str) -> Option<Condition> {
         }
         String::new()
     } else {
-        serialize_query(rest)?
+        serialize_query(rest, false)?
     };
     Some(Condition { name, query })
 }
 
-fn serialize_query(tokens: &[Token<'_>]) -> Option<String> {
+fn serialize_query(tokens: &[Token<'_>], style: bool) -> Option<String> {
     let first = tokens.first()?;
     if keyword(first, "not") {
         if tokens.len() != 2 {
             return None;
         }
-        return Some(alloc::format!("not {}", serialize_in_parens(&tokens[1])?));
+        return Some(alloc::format!("not {}", serialize_in_parens(&tokens[1], style)?));
     }
-    let mut output = serialize_in_parens(first)?;
+    let mut output = serialize_in_parens(first, style)?;
     if tokens.len() == 1 {
         return Some(output);
     }
@@ -242,7 +242,7 @@ fn serialize_query(tokens: &[Token<'_>]) -> Option<String> {
         output.push(' ');
         output.push_str(connective);
         output.push(' ');
-        output.push_str(&serialize_in_parens(&pair[1])?);
+        output.push_str(&serialize_in_parens(&pair[1], style)?);
     }
     Some(output)
 }
@@ -251,18 +251,30 @@ pub(super) fn inner(token: &Token<'_>, prefix: usize) -> String {
     token.text[prefix + 1..token.text.len() - 1].trim().into()
 }
 
-fn serialize_in_parens(token: &Token<'_>) -> Option<String> {
+fn serialize_in_parens(token: &Token<'_>, style: bool) -> Option<String> {
     match token.kind {
-        Kind::Paren => Some(alloc::format!("({})", serialize_feature_or_query(&inner(token, 0)))),
+        Kind::Paren => {
+            let content = if style { token.text[1..token.text.len() - 1].into() } else { inner(token, 0) };
+            Some(alloc::format!("({})", serialize_feature_or_query(&content, style)))
+        }
         Kind::Function => {
             let open = token.text.find('(')?;
             let name = &token.text[..open];
             let content = inner(token, open);
             if name.eq_ignore_ascii_case("style") {
-                Some(alloc::format!("style({})", serialize_feature_or_query(&content)))
-            } else if name.eq_ignore_ascii_case("scroll-state") || name.eq_ignore_ascii_case("anchored") {
-                let name = name.to_ascii_lowercase();
-                Some(alloc::format!("{name}({})", serialize_feature_or_query(&content)))
+                Some(alloc::format!("style({})", serialize_feature_or_query(&content, true)))
+            } else if name.eq_ignore_ascii_case("scroll-state") {
+                let serialized = serialize_feature_or_query(&content, false);
+                if scroll_state_query_valid(&serialized) {
+                    Some(alloc::format!("scroll-state({serialized})"))
+                } else {
+                    Some(token.text.into())
+                }
+            } else if name.eq_ignore_ascii_case("anchored") {
+                match super::anchored_query::serialize_content(&content) {
+                    Some(serialized) => Some(alloc::format!("anchored({serialized})")),
+                    None => Some(token.text.into()),
+                }
             } else {
                 Some(collapse_whitespace(token.text))
             }
@@ -271,36 +283,88 @@ fn serialize_in_parens(token: &Token<'_>) -> Option<String> {
     }
 }
 
-fn serialize_feature_or_query(content: &str) -> String {
+/// Whether a serialized `scroll-state()` argument consists only of known
+/// scroll-state features, combined without nested functions.
+fn scroll_state_query_valid(serialized: &str) -> bool {
+    let bytes = serialized.as_bytes();
+    let mut start = None;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => {
+                if index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || matches!(bytes[index - 1], b'-' | b'_')) {
+                    return false;
+                }
+                start = Some(index + 1);
+            }
+            b')' => {
+                let Some(from) = start.take() else {
+                    continue;
+                };
+                if !scroll_state_feature_valid(&serialized[from..index]) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    serialized.contains('(') || scroll_state_feature_valid(serialized)
+}
+
+fn scroll_state_feature_valid(feature: &str) -> bool {
+    let (name, value) = match feature.split_once(':') {
+        Some((name, value)) => (name.trim(), Some(value.trim())),
+        None => (feature.trim(), None),
+    };
+    let values: &[&str] = match name.to_ascii_lowercase().as_str() {
+        "scrollable" | "scrolled" => &[
+            "none", "top", "right", "bottom", "left", "x", "y", "block", "inline", "block-start", "block-end",
+            "inline-start", "inline-end",
+        ],
+        "stuck" => &["none", "top", "right", "bottom", "left", "block-start", "block-end", "inline-start", "inline-end"],
+        "snapped" => &["none", "x", "y", "block", "inline", "both"],
+        _ => return false,
+    };
+    value.is_none_or(|value| values.iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
+}
+
+fn serialize_feature_or_query(content: &str, style: bool) -> String {
     if let Some(tokens) = tokenize(content) {
         let condition_like = tokens.first().is_some_and(|first| {
             first.kind == Kind::Paren
                 || (keyword(first, "not") && tokens.get(1).is_some_and(|next| matches!(next.kind, Kind::Paren | Kind::Function)))
         });
         if condition_like {
-            if let Some(query) = serialize_query(&tokens) {
+            if let Some(query) = serialize_query(&tokens, style) {
                 return query;
             }
+        }
+    }
+    if style {
+        serialize_style_feature(content)
+    } else {
+        serialize_feature(content)
+    }
+}
+
+/// A style feature keeps the author's value text: a custom property
+/// declaration is normalized around the colon only, and a declaration of
+/// anything else is general-enclosed text kept as written.
+fn serialize_style_feature(content: &str) -> String {
+    let trimmed = content.trim();
+    if let Some(colon) = trimmed.find(':') {
+        let name = trimmed[..colon].trim();
+        if !name.contains(['<', '>', '=', '(']) {
+            if name.starts_with("--") {
+                return alloc::format!("{name}: {}", trimmed[colon + 1..].trim());
+            }
+            return content.into();
         }
     }
     serialize_feature(content)
 }
 
 pub(super) fn collapse_whitespace(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut pending_space = false;
-    for ch in text.trim().chars() {
-        if ch.is_whitespace() {
-            pending_space = true;
-        } else {
-            if pending_space {
-                output.push(' ');
-                pending_space = false;
-            }
-            output.push(ch);
-        }
-    }
-    output
+    crate::svg_text_path::collapse_whitespace_with(text, char::is_whitespace)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -28,6 +28,7 @@ mod paint_worklet;
 mod paint_timing;
 mod browser_services;
 mod browsing_context;
+mod window_features;
 mod realm_services;
 pub use browser_services::{set_navigator_profile, ClipboardHost, ClipboardOperation, ClipboardPermission, NavigatorProfile};
 pub use browsing_context::{
@@ -53,6 +54,7 @@ pub use canvas::{
 };
 mod cookies;
 mod cssom;
+mod css_pseudo;
 mod custom_elements;
 pub use custom_elements::effective_aria_attribute;
 pub(crate) mod dialog_popover;
@@ -110,11 +112,14 @@ pub mod keyboard_automation;
 mod labels;
 mod media;
 mod media_capture;
+mod text_tracks;
 mod option_factory;
 pub(crate) mod scrolling;
+mod scroll_snap;
 mod svg_interfaces;
 mod svg_filter_interfaces;
 mod media_query_list_event;
+mod container_query_list;
 pub mod testdriver;
 mod webaudio;
 mod webrtc;
@@ -169,6 +174,10 @@ mod templates;
 mod caret_position;
 mod screen;
 mod origin_api;
+mod navigator_extras;
+mod idl_shape;
+mod window_legacy;
+mod media_extras;
 mod data_transfer;
 mod document_named;
 mod scroll_parent;
@@ -827,6 +836,7 @@ pub struct DomRealm {
     csp_overflow: Cell<bool>,
     reflected_elements: RefCell<element_reflection::ReflectedElements>,
     dialog_requests: RefCell<HashMap<NodeId, Rc<dialog_popover::DialogRequest>>>,
+    dialog_light_dismiss: RefCell<dialog_popover::LightDismissState>,
     document_referrer: RefCell<String>,
     document_base_url: RefCell<DocumentBaseUrlCache>,
     cookie_host: RefCell<Option<Rc<dyn CookieHost>>>,
@@ -856,6 +866,7 @@ pub struct DomRealm {
     xml_document_parser: RefCell<Option<lumen_html::xml::XmlDocumentParser>>,
     document_parser_retention: RefCell<Vec<ParserRetention>>,
     pending_parser_source: RefCell<Option<String>>,
+    stream_container_load: Cell<bool>,
     parser_generation: Cell<u64>,
     dynamic_markup_insertion_counter: Cell<usize>,
     scripts: RefCell<script_loading::ScriptLoader>,
@@ -918,6 +929,7 @@ pub struct DomRealm {
     focus_visible: Cell<Option<NodeId>>,
     rendered_focus_epoch: Cell<Option<(NodeId, u64, u64, u64)>>,
     pub(crate) view_transition_started: Cell<bool>,
+    pub(crate) view_transition_captures: RefCell<Vec<view_transition::ActiveCapture>>,
     hover_target: Cell<Option<NodeId>>,
     active_targets: Cell<[Option<NodeId>; 2]>,
     keyboard_modality: Cell<bool>,
@@ -2206,7 +2218,50 @@ impl DomRealm {
         if self.parser_generation.get() != generation {
             return Ok(());
         }
-        self.set_document_ready_state(ctx, DocumentReadyState::Complete)
+        self.set_document_ready_state(ctx, DocumentReadyState::Complete)?;
+        if self.ready_state.get() == DocumentReadyState::Complete && self.stream_scripts.borrow().opened {
+            self.queue_nested_stream_load(ctx, generation)?;
+        }
+        Ok(())
+    }
+
+    /// A document.open() stream inside a nested browsing context finishes
+    /// loading like a navigation: the window and the container element get
+    /// their `load` events.
+    fn queue_nested_stream_load(self: &Rc<Self>, ctx: &mut Ctx, generation: u64) -> OpResult<()> {
+        let Some(context) = self.browsing_context() else { return Ok(()); };
+        if context.container_document().is_none() || context.container_node().is_none() {
+            return Ok(());
+        }
+        let document = self.clone();
+        scheduling::queue_task(ctx, move |ctx| {
+            if document.parser_generation.get() != generation || document.ready_state.get() != DocumentReadyState::Complete {
+                return Ok(());
+            }
+            if let Some(frame) = document.navigation_context() {
+                frame.claim_initial_blank_load();
+            }
+            document.stream_container_load.set(true);
+            let Some(handle) = document.relevant_host_realm(ctx) else {
+                document.stream_container_load.set(false);
+                return Ok(());
+            };
+            ctx.with_host_realm(&handle, |ctx| document.dispatch_window_user_agent(ctx, "load", false, false))
+                .map_err(browsing_context::host_realm_error)??;
+            Ok(())
+        })
+    }
+
+    fn fire_stream_container_load(self: &Rc<Self>, ctx: &mut Ctx) {
+        let Some(context) = self.browsing_context() else { return; };
+        let (Some(container), Some(node)) = (context.container_document(), context.container_node()) else { return; };
+        let connected = {
+            let session = container.session.borrow();
+            script_loading::is_connected(session.document(), node)
+        };
+        if connected {
+            let _ = container.dispatch_user_agent(ctx, node, "load", false, false, &[]);
+        }
     }
 
     fn run_inserted_parser_scripts(
@@ -3665,7 +3720,9 @@ impl DomRealm {
             self.flush_layout_mode(false)?;
         }
         if self.session.borrow().viewport_size().is_some() {
+            self.session.borrow_mut().update_remembered_sizes();
             layout_observers::rendering_checkpoint(ctx,self)?;
+            container_query_list::notify(ctx,self)?;
         }
         paint_worklet::update(ctx,self)?;
         self.canvases.update_drawable_paint(ctx,self)?;
@@ -3728,8 +3785,12 @@ impl DomRealm {
         // Each document constructs and dispatches its UI events in its own
         // relevant realm, independent of the original caller's realm.
         let Some(owner)=self.relevant_host_realm(ctx) else {return Ok(());};
-        ctx.with_host_realm(&owner,|ctx|self.focus_with_cause_in_owner(ctx,node,pointer_cause))
-            .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?
+        let result=ctx.with_host_realm(&owner,|ctx|self.focus_with_cause_in_owner(ctx,node,pointer_cause))
+            .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?;
+        if pointer_cause {
+            if let Some(clicked)=node { fragment::set_sequential_start(self,clicked); }
+        }
+        result
     }
 
     fn focus_with_cause_in_owner(
@@ -3786,6 +3847,7 @@ impl DomRealm {
             return Ok(());
         }
         self.focused.set(node);
+        if let Some(node) = node { fragment::set_sequential_start(self, node); }
         self.focus_visible.set(node.filter(|node| {
             self.focus_always_visible(*node)
                 || (!pointer_cause && (self.keyboard_modality.get() || old_was_visible))
@@ -4102,6 +4164,7 @@ impl DomRealm {
             )?;
             if kind == "load" { self.lifecycle.times.load_finished(); }
             if kind == "load" { history::restore_form_state_before_pageshow(ctx,self)?;navigation_lifecycle::page_transition(ctx, self, "pageshow")?; }
+            if kind == "load" && self.stream_container_load.replace(false) { self.fire_stream_container_load(ctx); }
             Ok(result)
         } else {
             events::dispatch_user_agent_event(ctx, lumen_bind::This(window), event)
@@ -5146,6 +5209,10 @@ fn upgrade_inserted_roots(
         if realm.session.borrow().document().kind(node).is_ok() {
             custom_elements::upgrade_cloned_or_parsed_subtree(ctx, realm, node)?;
         }
+        if realm.session.borrow().document().kind(node).is_ok() {
+            forms::settle_inserted_radios(realm, node);
+            forms::settle_inserted_selects(realm, node)?;
+        }
     }
     Ok(())
 }
@@ -6066,9 +6133,13 @@ fn element_scroll(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     element: NodeId,
-    args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+    args: scrolling::ScrollArgs,
     relative: bool,
 ) -> lumen::embed::Promise<Value> {
+    let args = match args.0 {
+        Ok(args) => args,
+        Err(error) => return lumen::embed::Promise::rejected(OpError::thrown(error)),
+    };
     match scrolling::element_scroll_target(realm, element, scrolling::ElementScrollPurpose::Method)
     {
         Ok(Some(node)) => window_globals::scroll_node(ctx, realm.clone(), node, args, relative),
@@ -6345,6 +6416,26 @@ custom_elements::bind_element_aria! {
         let target = ctx.member_get(&this.0, "classList").map_err(OpError::thrown)?;
         if ctx.object_addr(&target).is_none() {
             return Err(OpError::type_error("classList forwarding target must be an object"));
+        }
+        ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
+        Ok(())
+    }
+
+    #[method(coerce)]
+    fn pseudo(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, kind: &str) -> OpResult<Value> {
+        css_pseudo::element_pseudo(ctx, &this.0, kind)
+    }
+
+    #[getter]
+    fn part(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        self.base.token_list(ctx, this.0, "part", "part", None)
+    }
+
+    #[setter]
+    fn set_part(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        let target = ctx.member_get(&this.0, "part").map_err(OpError::thrown)?;
+        if ctx.object_addr(&target).is_none() {
+            return Err(OpError::type_error("part forwarding target must be an object"));
         }
         ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
         Ok(())
@@ -6651,6 +6742,24 @@ custom_elements::bind_element_aria! {
         animations::for_element(ctx, &self.base.realm, self.base.id, subtree)
     }
 
+    #[method(name = "startViewTransition")]
+    fn start_view_transition(&self, ctx: &mut Ctx, callback_options: Option<Value>) -> OpResult<Value> {
+        let handle = self.base.realm.relevant_host_realm(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "Element relevant realm is unavailable"))?;
+        ctx.with_host_realm(&handle, |ctx| view_transition::start_scoped(ctx, &self.base.realm, self.base.id, callback_options))
+            .map_err(|error| OpError::new("InvalidStateError", error.to_string()))?
+    }
+
+    #[getter(name = "activeViewTransition")]
+    fn active_view_transition(&self) -> Value {
+        Value::Null
+    }
+
+    #[method(name = "matchContainer", coerce)]
+    fn match_container(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        container_query_list::create(ctx, &self.base.realm, self.base.id, query)
+    }
+
     #[method(coerce)]
     fn scroll_into_view(
         ctx: &mut Ctx,
@@ -6726,8 +6835,9 @@ custom_elements::bind_element_aria! {
             || ui_events::dictionary_boolean(ctx, &options, "opacityProperty", false)?;
         let visibility = ui_events::dictionary_boolean(ctx, &options, "checkVisibilityCSS", false)?
             || ui_events::dictionary_boolean(ctx, &options, "visibilityProperty", false)?;
+        let content_visibility_auto = ui_events::dictionary_boolean(ctx, &options, "contentVisibilityAuto", false)?;
         self.flush_style_for_geometry(ctx)?;
-        style::check_visibility(&self.base.realm, self.base.id, opacity, visibility)
+        style::check_visibility(&self.base.realm, self.base.id, opacity, visibility, content_visibility_auto)
     }
 
     #[getter]
@@ -6858,7 +6968,7 @@ custom_elements::bind_element_aria! {
     fn scroll(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
@@ -6867,7 +6977,7 @@ custom_elements::bind_element_aria! {
     fn scroll_to(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, false)
     }
@@ -6876,7 +6986,7 @@ custom_elements::bind_element_aria! {
     fn scroll_by(
         &self,
         ctx: &mut Ctx,
-        #[varargs] args: lumen_bind::OneOrNumberPair<scrolling::ScrollToOptions>,
+        #[varargs] args: scrolling::ScrollArgs,
     ) -> lumen::embed::Promise<Value> {
         element_scroll(ctx, &self.base.realm, self.base.id, args, true)
     }
@@ -7529,6 +7639,13 @@ impl DomHtmlImageElement {
     }
 
     fn image_snapshot(&self) -> image_loading::ImageSnapshot {image_node_snapshot(self.image_node())}
+
+    fn layout_origin(&self) -> OpResult<(i32, i32)> {
+        let node = self.image_node();
+        node.realm.flush_layout()?;
+        let rect = node.realm.session.borrow().layout_rect(node.id);
+        Ok(rect.map_or((0, 0), |rect| (rect.x.round() as i32, rect.y.round() as i32)))
+    }
 }
 
 /// A node outside the document has no computed style, so computing one would only revalidate the
@@ -7714,6 +7831,16 @@ impl DomHtmlImageElement {
         }
         realm.images.add_decode_waiter(node, deferred);
         promise
+    }
+
+    #[getter]
+    fn x(&self) -> OpResult<i32> {
+        Ok(self.layout_origin()?.0)
+    }
+
+    #[getter]
+    fn y(&self) -> OpResult<i32> {
+        Ok(self.layout_origin()?.1)
     }
 
     #[getter(rename(js = "naturalWidth"))]
@@ -8514,7 +8641,8 @@ impl DomHtmlOptionsCollection {
             &mut self.realm.forms.borrow_mut(),
             self.select,
             index as isize,
-        )
+        )?;
+        forms::selection_written(&self.realm, self.select)
     }
 }
 
@@ -8526,6 +8654,17 @@ fn control_autocomplete(node: &DomNode) -> String {
 
 #[lumen_bind::methods]
 impl DomSelectElement {
+    fn show_picker(&self) -> OpResult<()> {
+        let node = &self.base.base.base;
+        if lumen_html::forms::is_disabled(node.realm.session.borrow().document(), node.id) {
+            return Err(OpError::new("InvalidStateError", "a disabled select cannot show a picker"));
+        }
+        if !node.realm.consume_user_activation() {
+            return Err(OpError::new("NotAllowedError", "showPicker requires trusted user activation"));
+        }
+        Ok(())
+    }
+
     #[getter]
     fn autocomplete(&self) -> String {control_autocomplete(&self.base.base.base)}
     #[setter(coerce, hint(js(ce_reactions)))]
@@ -8692,7 +8831,8 @@ impl DomSelectElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             value,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
     #[getter]
     fn form(&self, ctx: &mut Ctx) -> Value {
@@ -8711,7 +8851,8 @@ impl DomSelectElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             index as isize,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
 
     #[method(coerce, hint(js(ce_reactions)))]
@@ -8819,7 +8960,8 @@ impl DomOptionElement {
             &mut node.realm.forms.borrow_mut(),
             node.id,
             selected,
-        )
+        )?;
+        forms::selection_written(&node.realm, node.id)
     }
     #[getter]
     fn default_selected(&self) -> OpResult<bool> {
@@ -9702,6 +9844,37 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_lang(&self, value: &str) -> OpResult<()> {
         self.base.base.set_attribute_core("lang", value)
+    }
+
+    #[getter(name = "focusGroup")]
+    fn focus_group(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        const TOKENS: &[&str] = &[
+            "toolbar", "tablist", "radiogroup", "listbox", "menu", "menubar", "wrap", "nowrap",
+            "inline", "block", "nomemory", "none", "feed", "grid", "itemcontrols",
+            "noitemcontrols", "manual", "rowwrap", "colwrap", "flow", "rowflow", "colflow",
+        ];
+        self.base.base.token_list(ctx, this.0, "focusgroup", "focusgroup", Some(TOKENS))
+    }
+
+    #[setter(name = "focusGroup")]
+    fn set_focus_group(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        let target = ctx.member_get(&this.0, "focusGroup").map_err(OpError::thrown)?;
+        if ctx.object_addr(&target).is_none() {
+            return Err(OpError::type_error("focusGroup forwarding target must be an object"));
+        }
+        ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
+        Ok(())
+    }
+
+    #[getter(name = "focusGroupStart")]
+    fn focus_group_start(&self) -> OpResult<bool> {
+        Ok(self.base.base.get_null_attribute("focusgroupstart")?.is_some())
+    }
+
+    #[setter(name = "focusGroupStart", hint(js(ce_reactions)))]
+    fn set_focus_group_start(&self, value: bool) -> OpResult<()> {
+        if value { self.base.base.set_attribute_core("focusgroupstart", "") }
+        else { self.base.base.remove_attribute_core("focusgroupstart") }
     }
 
     #[getter]
@@ -10966,11 +11139,16 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 
     #[method]
-    fn start_view_transition(&self, ctx: &mut Ctx, callback: Option<lumen::embed::JsFunction>) -> OpResult<Value> {
+    fn start_view_transition(&self, ctx: &mut Ctx, callback_options: Option<Value>) -> OpResult<Value> {
         let handle = self.realm.relevant_host_realm(ctx)
             .ok_or_else(|| OpError::new("InvalidStateError", "Document relevant realm is unavailable"))?;
-        ctx.with_host_realm(&handle, |ctx| view_transition::start(ctx, &self.realm, callback))
+        ctx.with_host_realm(&handle, |ctx| view_transition::start(ctx, &self.realm, callback_options))
             .map_err(|error| OpError::new("InvalidStateError", error.to_string()))?
+    }
+
+    #[getter(name = "activeViewTransition")]
+    fn active_view_transition(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        view_transition::active(ctx, &self.realm)
     }
 
     #[method(name = "elementFromPoint", coerce)]
@@ -12530,6 +12708,7 @@ impl DomNode {
             node: self.id,
             computed: false,
             pseudo: None,
+            highlight: None,
             invalid_pseudo: false,
             _owner: this.0,
         });
@@ -13098,6 +13277,7 @@ impl DomNode {
         for node in inserted {
             event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
             custom_elements::upgrade_created_element(ctx, &self.realm, node)?;
+            forms::settle_inserted_selects(&self.realm, node)?;
         }
         self.realm.flush_script_activations(ctx)
     }
@@ -13177,6 +13357,7 @@ impl DomNode {
             for node in inserted {
                 event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
                 custom_elements::upgrade_created_element(ctx, &self.realm, node)?;
+                forms::settle_inserted_selects(&self.realm, node)?;
             }
         }
         result?;
@@ -13971,6 +14152,7 @@ impl DomNode {
             self.realm.reap_detached(old);
             for node in inserted {
                 event_content_handlers::initialize_subtree(ctx, &self.realm, node)?;
+                forms::settle_inserted_selects(&self.realm, node)?;
                 if !target_is_template {
                     custom_elements::upgrade_cloned_or_parsed_subtree(ctx, &self.realm, node)?;
                 }
@@ -14117,6 +14299,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             csp_overflow: Cell::new(false),
             reflected_elements: RefCell::new(element_reflection::ReflectedElements::default()),
             dialog_requests: RefCell::new(HashMap::new()),
+            dialog_light_dismiss: RefCell::new(dialog_popover::LightDismissState::default()),
             document_referrer: RefCell::new(String::new()),
             document_base_url: RefCell::new(DocumentBaseUrlCache::default()),
             document_interface,
@@ -14147,6 +14330,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             xml_document_parser: RefCell::new(None),
             document_parser_retention: RefCell::new(Vec::new()),
             pending_parser_source: RefCell::new(None),
+            stream_container_load: Cell::new(false),
             parser_generation: Cell::new(0),
             dynamic_markup_insertion_counter: Cell::new(0),
             scripts: RefCell::new(script_loading::ScriptLoader::default()),
@@ -14205,6 +14389,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             focus_visible: Cell::new(None),
             rendered_focus_epoch: Cell::new(None),
             view_transition_started: Cell::new(false),
+            view_transition_captures: RefCell::new(Vec::new()),
             hover_target: Cell::new(None),
             active_targets: Cell::new([None, None]),
             // Before a pointing-device interaction, programmatic focus follows
@@ -14875,6 +15060,7 @@ fn install_document_with_context_metadata(
         ),
         ("History", ctx.class_constructor::<history::DomHistory>()),
         ("ViewTransition", ctx.class_constructor::<view_transition::DomViewTransition>()),
+        ("ViewTransitionTypeSet", view_transition::type_set_constructor(ctx)),
         ("ElementInternals", ctx.class_constructor::<custom_elements::DomElementInternals>()),
         ("CustomStateSet", ctx.class_constructor::<custom_elements::DomCustomStateSet>()),
         ("Event", ctx.class_constructor::<DomEvent>()),
@@ -15035,6 +15221,14 @@ fn install_document_with_context_metadata(
         crate::install_interface(ctx, &global, name, constructor)
             .map_err(|_| InstallError::Global)?;
     }
+    for (name, constructor) in media_extras::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| InstallError::Global)?;
+    }
+    for (name, constructor) in window_legacy::constructors(ctx) {
+        crate::install_interface(ctx, &global, name, constructor)
+            .map_err(|_| InstallError::Global)?;
+    }
     let keyboard_constructor = ctx.class_constructor::<ui_events::DomKeyboardEvent>();
     let wheel_constructor = ctx.class_constructor::<ui_events::DomWheelEvent>();
     let event_constructor = ctx.class_constructor::<DomEvent>();
@@ -15116,6 +15310,7 @@ fn install_document_with_context_metadata(
         .map_err(|_| InstallError::Global)?;
     ctx.set_member(&global, "document", document)
         .map_err(|_| InstallError::Global)?;
+    text_tracks::install(ctx);
     if let Some(window_proxy) = window_proxy {
         ctx.set_member(&global, "window", window_proxy.clone())
             .map_err(|_| InstallError::Global)?;

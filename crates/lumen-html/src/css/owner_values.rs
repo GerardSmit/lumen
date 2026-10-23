@@ -26,6 +26,7 @@ struct Scope<'a> {
     attributes: RefCell<Vec<String>>,
     steps: Cell<usize>,
     bytes: Cell<usize>,
+    salt: usize,
 }
 
 impl<'a> Scope<'a> {
@@ -36,6 +37,7 @@ impl<'a> Scope<'a> {
             attributes: RefCell::new(Vec::new()),
             steps: Cell::new(0),
             bytes: Cell::new(0),
+            salt: 0,
         }
     }
 
@@ -87,6 +89,19 @@ fn mentions(raw: &str) -> bool {
         || bytes.windows(7).any(|window| window.eq_ignore_ascii_case(b"random("))
         || bytes.windows(12).any(|window| window.eq_ignore_ascii_case(b"random-item("))
         || bytes.windows(6).any(|window| window.eq_ignore_ascii_case(b"ident("))
+}
+
+/// Whether a custom property value contains an `attr()` call to substitute.
+pub(super) fn uses_attr(raw: &str) -> bool {
+    raw.as_bytes().windows(5).any(|window| window.eq_ignore_ascii_case(b"attr(")) && may_use(raw)
+}
+
+/// Whether a custom property value contains a `random()` or `random-item()` call to substitute.
+pub(super) fn uses_random(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    (bytes.windows(7).any(|window| window.eq_ignore_ascii_case(b"random("))
+        || bytes.windows(12).any(|window| window.eq_ignore_ascii_case(b"random-item(")))
+        && may_use(raw)
 }
 
 /// Outermost calls of `raw`; `None` when a call is not closed.
@@ -278,6 +293,9 @@ fn base_value(scope: &Scope<'_>, caching: Option<&Caching<'_>>, index: usize) ->
     hash = fnv(b"|", hash);
     if implicit || caching.is_some_and(|caching| caching.element) {
         hash = fnv(&owner.element.map_or(0, |(_, node)| node.key()).to_le_bytes(), hash);
+        if scope.salt != 0 {
+            hash = fnv(&scope.salt.to_le_bytes(), hash);
+        }
     }
     hash = fnv(b"|", hash);
     let ua = if implicit { Some(Ua::PropertyIndex) } else { caching.and_then(|caching| caching.ua) };
@@ -340,7 +358,7 @@ fn number_text(value: f64, unit: NumericUnit) -> String {
     if unit == NumericUnit::Number {
         alloc::format!("calc({constant})")
     } else {
-        alloc::format!("calc({constant} * 1{})", unit.as_str())
+        alloc::format!("calc({constant} * 1{})", typed_numeric::infinite_unit_text(unit))
     }
 }
 
@@ -522,13 +540,15 @@ fn attribute_value<'a>(scope: &'a Scope<'_>, head: &AttrHead<'_>) -> Option<&'a 
         return None;
     }
     let (document, node) = scope.owner.element?;
-    document.get_attribute_ns_ref(node, None, head.name).ok().flatten()
-        .or_else(|| document.get_attribute_ns_ref(node, None, &ascii_lower(head.name)).ok().flatten())
+    let exact = document.get_attribute_ns_ref(node, None, head.name).ok().flatten();
+    let html = document.is_html_document()
+        && matches!(document.kind(node), Ok(crate::NodeKind::Element { namespace: crate::Namespace::Html, .. }));
+    exact.or_else(|| if html { document.get_attribute_ns_ref(node, None, &ascii_lower(head.name)).ok().flatten() } else { None })
 }
 
 fn resolve_attr(scope: &Scope<'_>, head: &AttrHead<'_>, depth: usize) -> Attribute {
     let Some(value) = attribute_value(scope, head) else {
-        return if matches!(head.kind, AttrType::Text) { Attribute::Value(css_string_literal("")) } else { Attribute::Missing };
+        return Attribute::Missing;
     };
     match head.kind {
         AttrType::Text => Attribute::Value(css_string_literal(value)),
@@ -553,7 +573,14 @@ fn resolve_attr(scope: &Scope<'_>, head: &AttrHead<'_>, depth: usize) -> Attribu
                     None => Attribute::Missing,
                 };
             }
-            if registered_properties::accepts_value(syntax, value) { Attribute::Value(String::from(value)) } else { Attribute::Missing }
+            if !registered_properties::accepts_value(syntax, value) {
+                return Attribute::Missing;
+            }
+            let canonical = if value.contains('(') { None } else { typed_numeric::parse_numeric_value(value) };
+            Attribute::Value(match canonical {
+                Some(number) => typed_numeric::serialize_numeric_value(number.value, number.unit),
+                None => String::from(value),
+            })
         }
     }
 }
@@ -567,7 +594,11 @@ fn expand_attr(text: &str, scope: &Scope<'_>, depth: usize) -> Option<String> {
     match resolve_attr(scope, &head, depth) {
         Attribute::Value(value) => Some(value),
         Attribute::Invalid => None,
-        Attribute::Missing => expand(fallback?.trim(), scope, depth + 1),
+        Attribute::Missing => match fallback {
+            Some(fallback) => expand(fallback.trim(), scope, depth + 1),
+            None if matches!(head.kind, AttrType::Text) => Some(css_string_literal("")),
+            None => None,
+        },
     }
 }
 
@@ -612,6 +643,32 @@ fn expand_ident(text: &str, scope: &Scope<'_>, depth: usize) -> Option<String> {
 pub(super) fn substitute(raw: &str, owner: &Owner<'_>) -> Option<String> {
     let scope = Scope::new(owner);
     expand(raw, &scope, 0)
+}
+
+/// `raw` with its element-dependent functions evaluated for a hypothetical element that has no
+/// identity, as inside a custom function; `salt` distinguishes element-scoped results.
+pub(super) fn substitute_detached(raw: &str, property: &str, salt: usize) -> Option<String> {
+    let owner = Owner { element: None, property };
+    let mut scope = Scope::new(&owner);
+    scope.salt = salt;
+    expand(raw, &scope, 0)
+}
+
+/// `raw` with its element-dependent functions evaluated for `node`, with a lone `calc(<value>)`
+/// result written as the plain value; `None` when `raw` uses none of them or is invalid.
+pub(super) fn substitute_for_element(raw: &str, document: &Document, node: NodeId, property: &str) -> Option<String> {
+    if !may_use(raw) {
+        return None;
+    }
+    let text = substitute(raw, &Owner { element: Some((document, node)), property })?;
+    let trimmed = text.trim();
+    let plain = trimmed
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("calc("))
+        .and_then(|_| trimmed.strip_suffix(')'))
+        .and_then(|inner| typed_numeric::parse_numeric_value(&inner[5..]))
+        .map(|value| typed_numeric::serialize_numeric_value(value.value, value.unit));
+    Some(plain.unwrap_or(text))
 }
 
 /// What a declaration using these functions is validated against when it is parsed.
@@ -687,7 +744,8 @@ fn argument_text(text: &str, scope: &Scope<'_>) -> Option<String> {
     expression.simplify_absolute_units();
     if !explicit {
         if let Some(value) = expression.single_numeric_value() {
-            return Some(typed_numeric::serialize_numeric_value(value.value, value.unit));
+            let (unit, factor) = value.unit.canonical_unit_and_factor().unwrap_or((value.unit, 1.0));
+            return Some(typed_numeric::serialize_numeric_value(value.value * factor, unit));
         }
     }
     expression.serialize()

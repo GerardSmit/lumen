@@ -782,6 +782,8 @@ fn capture_stage(
         .iter()
         .find(|golden| golden.name == stage)
         .unwrap_or_else(|| panic!("missing static golden {stage}"));
+    // The static goldens have no focused control; focus is restored after the render.
+    eval(runtime, "globalThis.stageFocus = document.activeElement; stageFocus?.blur();");
     let cpu_before = process_cpu_us();
     let start = Instant::now();
     let image = lumen_html_image::render_settled_shared(
@@ -903,6 +905,7 @@ fn capture_stage(
         pixels: image.pixels,
         png,
     });
+    eval(runtime, "stageFocus?.focus({preventScroll: true});");
 }
 
 fn assert_pixels_equal(actual: &[u8], expected: &[u8], context: &str) {

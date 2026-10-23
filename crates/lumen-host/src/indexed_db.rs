@@ -352,6 +352,12 @@ pub mod bindings {
     #[class(name = "DOMStringList", hint(js(webidl, invalid_this)))]
     pub struct DOMStringList { names: Vec<String> }
 
+    impl DOMStringList {
+        pub fn from_names(names: Vec<String>) -> Self {
+            Self { names }
+        }
+    }
+
     #[methods]
     impl DOMStringList {
         #[getter] fn length(&self) -> u32 { self.names.len() as u32 }

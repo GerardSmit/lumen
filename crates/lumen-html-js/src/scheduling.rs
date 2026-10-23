@@ -771,15 +771,21 @@ pub(crate) fn run_animation_frame_in_realm_at(
         Err(error) => errors.push(engine.ctx().make_error("Error", error.to_string())),
     }
     errors.extend(checkpoint(engine));
+    let _ = engine.ctx().with_host_realm(realm, |ctx| {
+        if let Some(document) = super::window_globals::current_dom_realm(ctx) {
+            document.with_session(|session| session.commit_position_fallbacks());
+        }
+    });
 
     // A failing service must not strand another service's pending frame work.
-    for service in 0..5 {
+    for service in 0..6 {
         match engine.ctx().with_host_realm(realm, |ctx| {
             let result = match service {
                 0 => super::focus::rendering_checkpoint(ctx,timestamp),
-                1 => super::animations::advance(ctx, timestamp),
-                2 => super::scrolling::advance_smooth_scrolls(ctx, timestamp),
-                3 => super::scrolling::run_scroll_steps(ctx),
+                1 => notify_media_tree(ctx),
+                2 => super::animations::advance(ctx, timestamp),
+                3 => super::scrolling::advance_smooth_scrolls(ctx, timestamp),
+                4 => super::scrolling::run_scroll_steps(ctx),
                 _ => super::view_transition::advance(ctx),
             };
             result.map_err(|error| {
@@ -822,6 +828,32 @@ pub(crate) fn run_animation_frame_in_realm_at(
         }
     }
     errors
+}
+
+/// Evaluate media queries of the current document and its nested documents,
+/// dispatching `change` events to lists whose result changed.
+fn notify_media_tree(ctx: &mut Ctx) -> OpResult<()> {
+    let Some(root) = super::window_globals::current_dom_realm(ctx) else {
+        return Ok(());
+    };
+    let mut documents = vec![(root.clone(), None)];
+    let mut pending = vec![root];
+    while let Some(document) = pending.pop() {
+        for frame in document.frame_contexts(ctx)? {
+            if let Some(child) = frame.current_document() {
+                documents.push((child.clone(), Some(frame.realm_handle())));
+                pending.push(child);
+            }
+        }
+    }
+    for (document, handle) in documents {
+        match handle {
+            None => super::cssom::notify_media(ctx, &document)?,
+            Some(handle) => ctx.with_host_realm(&handle, |ctx| super::cssom::notify_media(ctx, &document))
+                .map_err(|error| OpError::new("InvalidStateError", error.to_string()))??,
+        }
+    }
+    Ok(())
 }
 
 /// Run idle work within a host supplied budget (at most 50ms). Expired timeout

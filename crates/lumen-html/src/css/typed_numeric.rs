@@ -496,15 +496,21 @@ impl NumericExpression {
                 NumericExpression::Value(value) => {
                     if !value.value.is_finite() {
                         let constant=if value.value.is_nan(){"NaN"}else if value.value.is_sign_negative(){"-infinity"}else{"infinity"};
-                        let bare=if value.unit==NumericUnit::Number{constant.into()}else{alloc::format!("{constant} * 1{}",value.unit.as_str())};
+                        let bare=if value.unit==NumericUnit::Number{constant.into()}else{alloc::format!("{constant} * 1{}",infinite_unit_text(value.unit))};
                         return append_text(out,&if paren_less{bare}else{alloc::format!("calc({bare})")});
                     }
                     let text = serialize_numeric_value(value.value, value.unit);
                     append_text(out, &text)
                 }
                 NumericExpression::Calc(value) => {
+                    let mut inner: &NumericExpression = value;
+                    while let NumericExpression::Calc(deeper) = inner {
+                        inner = deeper;
+                    }
                     if paren_less {
                         append(out, value, nested, true)
+                    } else if matches!(inner, NumericExpression::Min(_) | NumericExpression::Max(_) | NumericExpression::Clamp(..)) {
+                        append(out, inner, nested, true)
                     } else {
                         append_text(out, if nested { "(" } else { "calc(" })?;
                         append(out, value, false, true)?;
@@ -710,7 +716,14 @@ impl NumericExpression {
         }
         match self {
             Self::Value(_)|Self::Identifier(_)=>{},
-            Self::Calc(value)=>value.simplify_absolute_units(),
+            Self::Calc(value)=>{
+                value.simplify_absolute_units();
+                if let Self::Value(number)=&mut **value {
+                    if let Some((unit,factor))=number.unit.canonical_unit_and_factor() {
+                        *number=NumericValue{value:number.value*factor,unit};
+                    }
+                }
+            },
             Self::Negate(value)=>{
                 value.simplify_absolute_units();
                 if let Some(mut value)=value.single_numeric_value(){value.value=-value.value;*self=Self::Value(value);}
@@ -821,6 +834,47 @@ impl NumericExpression {
                 }
                 for value in values.iter_mut(){value.simplify_absolute_units();}
                 values.sort_by_key(|value|value.single_numeric_value().is_none());
+                if let[Self::Value(first),Self::Value(second)]=values.as_slice(){
+                    let(scalar,dimension)=if first.unit==NumericUnit::Number{(first,second)}else{(second,first)};
+                    if scalar.unit==NumericUnit::Number&&!scalar.value.is_finite()&&dimension.unit!=NumericUnit::Number{
+                        if let Some((unit,factor))=dimension.unit.canonical_unit_and_factor(){
+                            *self=Self::Value(NumericValue{value:scalar.value*dimension.value*factor,unit});
+                            return;
+                        }
+                    }
+                }
+                if values.len()>1 {
+                    let sum_at=values.iter().position(|value|{
+                        let inner=if let Self::Calc(inner)=value{&**inner}else{value};
+                        matches!(inner,Self::Sum(terms) if terms.len()>1&&terms.iter().all(|term|term.single_numeric_value().is_some_and(|value|!value.unit.is_function_placeholder())))
+                    });
+                    if let Some(sum_at)=sum_at {
+                        let mut scalar=1.0;
+                        let all_scalars=values.iter().enumerate().filter(|(at,_)|*at!=sum_at).all(|(_,value)|{
+                            let(number,inverse)=match value{Self::Invert(inner)=>(canonical(inner),true),_=>(canonical(value),false)};
+                            match number.filter(|number|number.unit==NumericUnit::Number&&number.value.is_finite()&&number.value!=0.0) {
+                                Some(number)=>{scalar*=if inverse{1.0/number.value}else{number.value};true}
+                                None=>false,
+                            }
+                        });
+                        if all_scalars {
+                            let sum=values.swap_remove(sum_at);
+                            let inner=if let Self::Calc(inner)=sum{*inner}else{sum};
+                            if let Self::Sum(mut terms)=inner {
+                                for term in terms.iter_mut() {
+                                    if let Some(mut value)=term.single_numeric_value(){value.value*=scalar;*term=Self::Value(value);}
+                                }
+                                *self=Self::Sum(terms);
+                                self.simplify_absolute_units();
+                            }
+                            return;
+                        }
+                    }
+                }
+                if fold_constant_factors(values) {
+                    if values.len()==1{*self=values.pop().unwrap();}
+                    return;
+                }
                 let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx];
                 let mut powers=[0i32;6];let mut product=1.0;
                 for expression in values.iter(){
@@ -889,6 +943,43 @@ impl NumericExpression {
         }
     }
 
+}
+
+/// Multiplies the constant factors of a product into one value, keeping the operands that are
+/// not constants (functions, sums). Returns whether the factors were folded. A function
+/// placeholder unit is never scaled, and a lone constant leaves the product alone.
+fn fold_constant_factors(values:&mut Vec<NumericExpression>)->bool {
+    let mut scale=1.0f64;
+    let mut dimension:Option<NumericValue>=None;
+    let mut folded=0usize;
+    let mut kept=Vec::new();
+    for expression in values.iter() {
+        let(inner,inverse)=match expression{NumericExpression::Invert(inner)=>(&**inner,true),_=>(expression,false)};
+        match inner.single_numeric_value() {
+            Some(value) if !value.value.is_finite()=>return false,
+            Some(value) if !value.unit.is_function_placeholder()=>{
+                let(unit,amount)=match value.unit.canonical_unit_and_factor(){Some((unit,factor))=>(unit,value.value*factor),None=>(value.unit,value.value)};
+                if unit==NumericUnit::Number {
+                    if inverse&&amount==0.0{return false;}
+                    scale*=if inverse{1.0/amount}else{amount};
+                }else if !inverse&&dimension.is_none() {
+                    dimension=Some(NumericValue{value:amount,unit});
+                }else{return false;}
+                folded+=1;
+            },
+            _=>kept.push(expression.clone()),
+        }
+    }
+    if folded<2||!scale.is_finite() {return false;}
+    let combined=match dimension{
+        Some(value)=>NumericValue{value:value.value*scale,unit:value.unit},
+        None=>NumericValue{value:scale,unit:NumericUnit::Number},
+    };
+    if !combined.value.is_finite() {return false;}
+    values.clear();
+    if kept.is_empty()||combined.unit!=NumericUnit::Number||combined.value!=1.0 {values.push(NumericExpression::Value(combined));}
+    values.extend(kept);
+    true
 }
 
 /// Builder interface for the shared math grammar. A renderer can fold into a
@@ -1982,6 +2073,18 @@ impl NumericUnit {
         }
     }
 
+    /// Units css/anchor.rs substitutes for unresolved `anchor()` and
+    /// `anchor-size()` calls; a scalar is never distributed over such terms.
+    pub const fn is_function_placeholder(self) -> bool {
+        matches!(
+            self,
+            Self::Svw | Self::Svh | Self::Svi | Self::Svb | Self::Svmin | Self::Svmax
+                | Self::Lvw | Self::Lvh | Self::Lvi | Self::Lvb | Self::Lvmin | Self::Lvmax
+                | Self::Dvw | Self::Dvh | Self::Dvi | Self::Dvb | Self::Dvmin | Self::Dvmax
+                | Self::Cqw | Self::Cqh | Self::Cqi | Self::Cqb | Self::Cqmin | Self::Cqmax
+        )
+    }
+
     /// Return a context-independent canonical unit and scale factor, if one
     /// exists for this unit.
     pub const fn canonical_unit_and_factor(self) -> Option<(Self, f64)> {
@@ -2199,11 +2302,15 @@ fn without_rounding_noise(value: f64) -> f64 {
     if rounded == 0.0 { value } else { rounded }
 }
 
+pub(super) fn infinite_unit_text(unit: NumericUnit) -> &'static str {
+    if unit == NumericUnit::Percent { "%" } else { unit.as_str() }
+}
+
 /// Serialize a number and unit using CSS numeric-value formatting.
 pub fn serialize_numeric_value(value: f64, unit: NumericUnit) -> String {
     if !value.is_finite() {
         let constant=if value.is_nan(){"NaN"}else if value.is_sign_negative(){"-infinity"}else{"infinity"};
-        return if unit==NumericUnit::Number{alloc::format!("calc({constant})")}else{alloc::format!("calc({constant} * 1{})",unit.as_str())};
+        return if unit==NumericUnit::Number{alloc::format!("calc({constant})")}else{alloc::format!("calc({constant} * 1{})",infinite_unit_text(unit))};
     }
     let number = if value == 0.0 {
         String::from("0")

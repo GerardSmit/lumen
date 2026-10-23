@@ -12,7 +12,9 @@ use super::{
 use lumen::embed::{Ctx, JsHost, OpError, OpResult, Value};
 use lumen_bind::{CtorRet, Host};
 use lumen_common::toggle_task::{PrepareError, Prepared, ToggleTasks};
-use lumen_html::{popover_stack, selector, top_layer, NodeId};
+use lumen_html::{popover_stack, top_layer, NodeId};
+#[cfg(test)]
+use lumen_html::selector;
 use std::{cell::RefCell, rc::Rc, vec::Vec};
 
 #[lumen_bind::class(
@@ -400,6 +402,7 @@ impl DialogRequest {
 }
 
 pub(crate) fn dialog_attribute_changed(document: &lumen_html::Document, realm: &DomRealm, node: NodeId, old: Option<&str>) {
+    realm.dialog_light_dismiss.borrow_mut().note_open_attribute(document, node, old.is_some());
     let Some(request) = realm.dialog_requests.borrow().get(&node).cloned() else { return; };
     let open = document.get_attribute_ns_ref(node, None, "open").ok().flatten().is_some();
     if open != old.is_some() {
@@ -510,42 +513,98 @@ pub(crate) fn close_dialog_with_source(
 }
 
 fn dialog_focus_target(realm: &Rc<DomRealm>, dialog: NodeId) -> OpResult<NodeId> {
-    let mut current = {
-        let session = realm.session.borrow();
-        session
-            .document()
-            .first_child(dialog)
-            .map_err(super::dom_error)?
-    };
-    let mut first_focusable = None;
-    while let Some(node) = current {
-        let (element, autofocus) = {
-            let session = realm.session.borrow();
-            let element = matches!(
-                session.document().kind(node),
-                Ok(lumen_html::NodeKind::Element { .. })
-            );
-            let autofocus = element
-                && session
-                    .document()
-                    .get_attribute_ns_ref(node, None, "autofocus")
-                    .map_err(super::dom_error)?
-                    .is_some();
-            (element, autofocus)
-        };
-        if element && realm.focusable_node(node)? {
-            first_focusable.get_or_insert(node);
-            if autofocus {
-                return Ok(node);
-            }
-        }
-        current = {
-            let session = realm.session.borrow();
-            selector::next_shadow_including_descendant(session.document(), dialog, node)
-                .map_err(super::dom_error)?
-        };
+    let autofocus = realm
+        .session
+        .borrow()
+        .document()
+        .get_attribute_ns_ref(dialog, None, "autofocus")
+        .map_err(super::dom_error)?
+        .is_some();
+    if autofocus {
+        return Ok(dialog);
     }
-    Ok(first_focusable.unwrap_or(dialog))
+    Ok(focus_delegate(realm, dialog, 0)?.unwrap_or(dialog))
+}
+
+const MAX_FOCUS_DELEGATE_DEPTH: usize = 64;
+
+fn next_light_descendant(document: &lumen_html::Document, root: NodeId, node: NodeId) -> OpResult<Option<NodeId>> {
+    if let Some(child) = document.first_child(node).map_err(super::dom_error)? {
+        return Ok(Some(child));
+    }
+    let mut current = node;
+    while current != root {
+        if let Some(sibling) = document.next_sibling(current).map_err(super::dom_error)? {
+            return Ok(Some(sibling));
+        }
+        let Some(parent) = document.parent(current).map_err(super::dom_error)? else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+    Ok(None)
+}
+
+/// The focusable area a shadow-including focus delegate search picks inside `target`: the
+/// autofocus delegate first, then the first focusable descendant, looking through shadow hosts
+/// that delegate focus and never into other shadow trees.
+fn focus_delegate(realm: &Rc<DomRealm>, target: NodeId, depth: usize) -> OpResult<Option<NodeId>> {
+    if depth > MAX_FOCUS_DELEGATE_DEPTH {
+        return Ok(None);
+    }
+    let look_in = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        match document.shadow_root(target).map_err(super::dom_error)? {
+            Some(root) => {
+                let delegates = document
+                    .shadow_options(root)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|options| options.delegates_focus);
+                if !delegates {
+                    return Ok(None);
+                }
+                root
+            }
+            None => target,
+        }
+    };
+    for autofocus_only in [true, false] {
+        let mut current = {
+            let session = realm.session.borrow();
+            next_light_descendant(session.document(), look_in, look_in)?
+        };
+        while let Some(node) = current {
+            let candidate = {
+                let session = realm.session.borrow();
+                let document = session.document();
+                let element = matches!(document.kind(node), Ok(lumen_html::NodeKind::Element { .. }));
+                let wanted = element
+                    && (!autofocus_only
+                        || document
+                            .get_attribute_ns_ref(node, None, "autofocus")
+                            .map_err(super::dom_error)?
+                            .is_some());
+                wanted.then(|| document.shadow_root(node).ok().flatten().is_some())
+            };
+            if let Some(is_host) = candidate {
+                if realm.focusable_node(node)? {
+                    return Ok(Some(node));
+                }
+                if is_host {
+                    if let Some(found) = focus_delegate(realm, node, depth + 1)? {
+                        return Ok(Some(found));
+                    }
+                }
+            }
+            current = {
+                let session = realm.session.borrow();
+                next_light_descendant(session.document(), look_in, node)?
+            };
+        }
+    }
+    Ok(None)
 }
 
 type ToggleTaskState = ToggleTasks<(NodeId, ToggleTaskKind), &'static str, Value>;
@@ -877,36 +936,43 @@ pub(crate) fn popover_attribute_changed(
     if top_layer::reflected_popover_value(realm.session.borrow().document(), node) == old_state {
         return Ok(());
     }
-    if top_layer::validate_hide_popover(realm.session.borrow().document(), node).is_err() {
-        return Ok(());
-    }
     let above = {
         let session = realm.session.borrow();
         popover_stack::plan_hide(session.document(), node).unwrap_or_default()
     };
     hide_popover_batch(ctx, &realm, above)?;
     (realm, node) = realm.resolve_adopted_node(node);
-    if top_layer::popover_visibility(realm.session.borrow().document(), node)
-        != top_layer::PopoverVisibility::Showing
-    {
+    if !is_top_layer_popover(&realm, node) {
         return Ok(());
     }
-    dispatch_popover_close_beforetoggle(ctx, &realm, node)?;
+    let began = realm.session.borrow_mut().document_mut().begin_popover_transition(node);
+    if !began {
+        return Ok(());
+    }
+    let dispatched = dispatch_toggle(ctx, &realm, node, "beforetoggle", "open", "closed", false, Value::Null);
+    realm.session.borrow_mut().document_mut().end_popover_transition(node);
+    dispatched?;
     (realm, node) = realm.resolve_adopted_node(node);
     let removed = {
         let mut session = realm.session.borrow_mut();
-        if top_layer::popover_visibility(session.document(), node)
-            != top_layer::PopoverVisibility::Showing
-        {
-            None
-        } else {
+        if is_top_layer_popover_in(session.document(), node) {
             session.document_mut().remove_top_layer_element_with_state(node)
+        } else {
+            None
         }
     };
     if removed.is_some() {
         queue_toggle_task(ctx, realm, node, ToggleTaskKind::Popover, "open", "closed", Value::Null)?;
     }
     Ok(())
+}
+
+fn is_top_layer_popover_in(document: &lumen_html::Document, node: NodeId) -> bool {
+    matches!(document.top_layer_kind(node), Some(top_layer::Kind::Popover(_)))
+}
+
+fn is_top_layer_popover(realm: &Rc<DomRealm>, node: NodeId) -> bool {
+    is_top_layer_popover_in(realm.session.borrow().document(), node)
 }
 
 fn hide_popover_batch(ctx: &mut Ctx, realm: &Rc<DomRealm>, nodes: Vec<NodeId>) -> OpResult<()> {
@@ -916,15 +982,8 @@ fn hide_popover_batch(ctx: &mut Ctx, realm: &Rc<DomRealm>, nodes: Vec<NodeId>) -
         let (peer_realm, peer_node) = peer_realm.resolve_adopted_node(peer_node);
         let closed = {
             let mut session = peer_realm.session.borrow_mut();
-            if top_layer::popover_visibility(session.document(), peer_node)
-                != top_layer::PopoverVisibility::Showing
-            {
-                false
-            } else {
-                top_layer::hide_popover_with_state(session.document_mut(), peer_node)
-                    .map_err(|error| state_error(ctx, error))?
-                    .0
-            }
+            is_top_layer_popover_in(session.document(), peer_node)
+                && session.document_mut().remove_top_layer_element_with_state(peer_node).is_some()
         };
         if closed {
             queue_toggle_task(
@@ -1195,6 +1254,97 @@ pub(crate) fn record_popover_pointerdown_target(
 /// pointer sequence without dispatching its matching pointerup.
 pub(crate) fn clear_popover_pointerdown_target(realm: &Rc<DomRealm>) {
     top_layer::clear_popover_pointerdown_target(realm.session.borrow_mut().document_mut());
+    realm.dialog_light_dismiss.borrow_mut().pointerdown = None;
+}
+
+/// Open dialogs in the order they opened, and the dialog a pending pointerdown was outside of.
+#[derive(Default)]
+pub(crate) struct LightDismissState {
+    open_dialogs: Vec<NodeId>,
+    pointerdown: Option<NodeId>,
+}
+
+impl LightDismissState {
+    fn note_open_attribute(&mut self, document: &lumen_html::Document, node: NodeId, was_open: bool) {
+        if !is_html_dialog(document, node) {
+            return;
+        }
+        let open = document.get_attribute_ns_ref(node, None, "open").ok().flatten().is_some();
+        if open && !was_open {
+            self.open_dialogs.retain(|dialog| *dialog != node);
+            self.open_dialogs.push(node);
+        } else if !open {
+            self.open_dialogs.retain(|dialog| *dialog != node);
+        }
+    }
+}
+
+fn is_html_dialog(document: &lumen_html::Document, node: NodeId) -> bool {
+    matches!(
+        document.kind(node),
+        Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Html, name, .. }) if name.as_str() == "dialog"
+    )
+}
+
+fn is_flat_inclusive_descendant(document: &lumen_html::Document, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate == ancestor {
+            return true;
+        }
+        current = document.composed_parent(candidate).ok().flatten();
+    }
+    false
+}
+
+/// The topmost connected open `closedby=any` dialog, when a pointer event at `(x, y)` on
+/// `target` lies outside it. A dialog target only counts as outside beyond its border box,
+/// which is how a modal dialog's backdrop is told apart from the dialog itself.
+fn light_dismiss_dialog(realm: &Rc<DomRealm>, target: NodeId, x: f64, y: f64) -> Option<NodeId> {
+    let session = realm.session.borrow();
+    let document = session.document();
+    realm.dialog_light_dismiss.borrow_mut().open_dialogs.retain(|dialog| {
+        is_html_dialog(document, *dialog)
+            && document.is_connected_element(*dialog)
+            && document.get_attribute_ns_ref(*dialog, None, "open").ok().flatten().is_some()
+    });
+    let dialog = realm.dialog_light_dismiss.borrow().open_dialogs.iter().rev().copied().find(|dialog| {
+        document
+                .get_attribute_ns_ref(*dialog, None, "closedby")
+                .ok()
+                .flatten()
+                .is_some_and(|value| value.eq_ignore_ascii_case("any"))
+    })?;
+    if is_flat_inclusive_descendant(document, dialog, target) {
+        if target != dialog {
+            return None;
+        }
+        let rect = session.bounding_client_rect(dialog)?;
+        let (x, y) = (x as f32, y as f32);
+        if x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height {
+            return None;
+        }
+    }
+    Some(dialog)
+}
+
+pub(crate) fn record_dialog_pointerdown(realm: &Rc<DomRealm>, target: NodeId, x: f64, y: f64) {
+    let (realm, target) = realm.resolve_adopted_node(target);
+    let dialog = light_dismiss_dialog(&realm, target, x, y);
+    realm.dialog_light_dismiss.borrow_mut().pointerdown = dialog;
+}
+
+/// The topmost modal dialog, which makes every node outside its flat-tree subtree inert.
+pub(crate) fn blocking_modal_dialog(document: &lumen_html::Document) -> Option<NodeId> {
+    document
+        .top_layer_entries()
+        .filter(|(_, kind, _)| *kind == top_layer::Kind::ModalDialog)
+        .map(|(node, _, _)| node)
+        .last()
+}
+
+pub(crate) fn blocked_by_modal_dialog(document: &lumen_html::Document, modal: NodeId, node: NodeId) -> bool {
+    !is_flat_inclusive_descendant(document, modal, node)
 }
 
 /// Apply the pointerup half of popover light dismiss before the trusted event
@@ -1202,6 +1352,23 @@ pub(crate) fn clear_popover_pointerdown_target(realm: &Rc<DomRealm>) {
 /// returns a bounded reverse-order close plan. Each candidate is re-resolved
 /// and checked after its synchronous `beforetoggle` callback.
 pub(crate) fn dismiss_popovers_for_pointer_up(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    target: NodeId,
+    x: f64,
+    y: f64,
+) -> OpResult<()> {
+    let (realm, target) = realm.resolve_adopted_node(target);
+    let candidate = light_dismiss_dialog(&realm, target, x, y);
+    let pressed = realm.dialog_light_dismiss.borrow_mut().pointerdown.take();
+    dismiss_popovers_until_endpoint(ctx, &realm, target)?;
+    match candidate {
+        Some(dialog) if pressed == Some(dialog) => request_close_dialog(ctx, &realm, dialog, None, Value::Null),
+        _ => Ok(()),
+    }
+}
+
+fn dismiss_popovers_until_endpoint(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
     target: NodeId,

@@ -363,10 +363,18 @@ impl CustomNames for Frame<'_> {
     }
 }
 
-fn typed(syntax: &str, text: &str, env: &Env<'_>) -> Option<String> {
+fn typed(syntax: &str, text: &str, env: &Env<'_>, slot: &str) -> Option<String> {
     if syntax.trim() == "*" {
         return Some(String::from(text));
     }
+    let resolved;
+    let text = if owner_values::uses_random(text) {
+        let function = env.stack.borrow().last().cloned().unwrap_or_default();
+        resolved = owner_values::substitute_detached(text, &alloc::format!("{function}/{slot}"), env.calls.get())?;
+        resolved.trim()
+    } else {
+        text
+    };
     if !registered_properties::accepts_value(syntax, text) {
         return None;
     }
@@ -382,9 +390,9 @@ fn unwrap_braces(argument: &str) -> &str {
     argument
 }
 
-fn bind_argument(argument: &str, syntax: &str, caller: &dyn CustomNames, env: &Env<'_>) -> Option<String> {
+fn bind_argument(argument: &str, syntax: &str, name: &str, caller: &dyn CustomNames, env: &Env<'_>) -> Option<String> {
     let text = substitute(unwrap_braces(argument), caller, env)?;
-    typed(syntax, text.trim(), env)
+    typed(syntax, text.trim(), env, name)
 }
 
 fn bind_default(default: &str, name: &str, syntax: &str, frame: &Frame<'_>) -> Option<String> {
@@ -393,7 +401,7 @@ fn bind_default(default: &str, name: &str, syntax: &str, frame: &Frame<'_>) -> O
     match text.to_ascii_lowercase().as_str() {
         "initial" => None,
         "inherit" => frame.parent.value(name).map(|value| String::from(value.as_str())),
-        _ => typed(syntax, text, frame.env),
+        _ => typed(syntax, text, frame.env, name),
     }
 }
 
@@ -426,7 +434,7 @@ fn run(rule: &FunctionRule, bound: Vec<Option<String>>, caller: &dyn CustomNames
     let text = text.trim();
     match rule.prelude.return_type.as_str() {
         "*" => Some(String::from(text)),
-        syntax => typed(syntax, text, env),
+        syntax => typed(syntax, text, env, "result"),
     }
 }
 
@@ -445,7 +453,7 @@ fn call(name: &str, arguments: &[&str], caller: &dyn CustomNames, env: &Env<'_>)
     let bound: Vec<Option<String>> = arguments
         .iter()
         .zip(&rule.prelude.parameters)
-        .map(|(argument, parameter)| bind_argument(argument, &parameter.syntax, caller, env))
+        .map(|(argument, parameter)| bind_argument(argument, &parameter.syntax, &parameter.name, caller, env))
         .collect();
     env.stack.borrow_mut().push(String::from(name));
     let result = run(&rule, bound, caller, env);
@@ -525,7 +533,13 @@ pub(super) fn evaluate_entries(
                 let raw = value.as_ref().filter(|value| function_rule::contains_call(value))?;
                 *env.current.borrow_mut() = Some(String::from(name.as_str()));
                 let resolved = substitute(raw, &names, &env).and_then(|text| {
-                    let text = text.trim();
+                    let detached;
+                    let text = if owner_values::uses_random(text.trim()) {
+                        detached = owner_values::substitute_detached(text.trim(), name.as_str(), 0)?;
+                        detached.trim()
+                    } else {
+                        text.trim()
+                    };
                     match text.to_ascii_lowercase().as_str() {
                         "initial" | "revert-layer" | "revert-rule" => None,
                         "inherit" | "unset" | "revert" => base.and_then(|base| base.value(name.as_str()).cloned()),

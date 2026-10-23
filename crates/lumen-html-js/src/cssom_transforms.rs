@@ -76,7 +76,7 @@ fn slot(ctx:&mut Ctx,this:&Value,name:&str)->OpResult<Value>{
 fn set_slot(ctx:&mut Ctx,this:&Value,name:&str,value:Value,dimension:Option<Dimension>)->OpResult<()> {
     let kind=ctx.with_instance::<DomCssTransformComponent,_>(this,|value|value.kind)?;
     let value=if kind==Kind::Perspective{perspective(ctx,value)?}else if let Some(dimension)=dimension {
-        if matches!(dimension,Dimension::Number){numberish(ctx,value)?}
+        if matches!(dimension,Dimension::Number){let value=numberish(ctx,value)?;numeric(ctx,&value,Dimension::Number)?;value}
         else{numeric(ctx,&value,dimension)?;value}
     }else{crate::geometry::validate_mutable_matrix(ctx,&value)?;value};
     let data=slots(ctx,this)?;ctx.create_data_property(&data,name,value).map_err(OpError::thrown)?;Ok(())
@@ -121,12 +121,6 @@ fn component_text(ctx:&mut Ctx,this:&Value)->OpResult<String>{
         let value=slot(ctx,this,"length")?;
         let length=if ctx.with_instance::<DomCssNumericValue,_>(&value,|_|()).is_ok(){numeric_value_text_with_minimum(ctx,&value,Some(css::typed_numeric::NumericValue{value:0.0,unit:NumericUnit::Px}))?}else{String::from("none")};
         return Ok(format!("perspective({length})"));
-    }
-    if kind==Kind::Scale && is_2d {
-        let x=slot(ctx,this,"x")?;let y=slot(ctx,this,"y")?;
-        if numeric_expression_from_value(ctx,&x)?==numeric_expression_from_value(ctx,&y)? {
-            return Ok(format!("scale({})",numeric_value_text(ctx,&x)?));
-        }
     }
     if kind==Kind::Skew {
         let y=slot(ctx,this,"ay")?;
@@ -446,7 +440,7 @@ mod tests {
             const perspective=new CSSPerspective(CSS.px(10));perspective.is2D=true;
             check(!perspective.is2D && perspective.toMatrix().m34===-.1,'perspective matrix');
             check(new CSSPerspective(CSS.px(-1)).toString()==='perspective(calc(-1px))' && new CSSPerspective(CSS.px(-1)).toMatrix().m34===-1,'specified range wrapper and used perspective clamp');
-            check(new CSSSkew(CSS.deg(1),CSS.turn(0)).toString()==='skew(1deg)' && new CSSScale(2,2).toString()==='scale(2)','canonical omitted equal and zero arguments');
+            check(new CSSSkew(CSS.deg(1),CSS.turn(0)).toString()==='skew(1deg)' && new CSSScale(2,2).toString()==='scale(2, 2)','canonical omitted equal and zero arguments');
             const owner=new DOMMatrix([1,0,0,1,5,6]),component=new CSSMatrixComponent(owner);
             check(component.matrix===owner,'matrix constructor preserves actual identity');owner.e=9;check(component.toMatrix().e===9,'matrix mutation is live');
             throws('TypeError',()=>{component.matrix=new DOMMatrixReadOnly()});check(component.matrix===owner,'matrix setter brand failure is transactional');

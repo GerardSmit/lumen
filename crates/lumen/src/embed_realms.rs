@@ -500,6 +500,13 @@ impl Interp {
         HostInvocationGuard { callers }
     }
 
+    #[cfg(feature = "embed")]
+    pub(crate) fn has_host_invocation_caller(&mut self) -> bool {
+        self.host_state
+            .get::<HostRealmOwner>()
+            .is_some_and(|owner| !owner.invocation_callers.borrow().is_empty())
+    }
+
     fn invocation_caller_handle(&mut self) -> RealmHandle {
         let caller = self
             .host_state

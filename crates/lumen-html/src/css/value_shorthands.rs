@@ -44,6 +44,8 @@ static TABLE: &[Short] = &[
         longhands: &["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-synthesis-position"],
         shape: Shape::Rule,
     },
+    Short { name: "line-clamp", longhands: &["max-lines", "block-ellipsis", "continue"], shape: Shape::Rule },
+    Short { name: "-webkit-line-clamp", longhands: &["max-lines", "block-ellipsis", "continue"], shape: Shape::Rule },
     Short { name: "marker", longhands: &["marker-start", "marker-mid", "marker-end"], shape: Shape::Repeat },
 ];
 
@@ -125,7 +127,7 @@ pub(crate) fn computed_shorthand(style: &Style, name: &str) -> String {
     let values: Option<Vec<String>> = longhands(name)
         .iter()
         .map(|longhand| match *longhand {
-            "container-type" => Some(String::from(style.container_type.as_str())),
+            "container-type" => Some(style.container_type.serialize(style.container_flags)),
             "font-synthesis-small-caps" => Some(String::from(if style.font.synthesize_small_caps { "auto" } else { "none" })),
             _ => extra::computed(style, longhand),
         })
@@ -146,7 +148,8 @@ pub(crate) fn shorthand_declarations(name: &str, raw: &str) -> Option<Vec<Value>
     }
     for (longhand, text) in expanded {
         if longhand == "container-type" {
-            values.push(Value::ContainerType(ContainerType::parse(&text)?));
+            let (axis, flags) = ContainerType::parse(&text)?;
+            values.push(Value::ContainerType(axis, flags));
         } else if longhand == "font-synthesis-small-caps" {
             values.push(Value::FontSynthesisSmallCaps(text != "none"));
         } else {

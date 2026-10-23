@@ -1305,6 +1305,10 @@ pub struct Interp {
     /// The innermost running native function's [`frames::NativeCtx`] (its address on the
     /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
     pub(crate) native_top: usize,
+    /// True while a native function runs with no script frame entered since: a call it makes is
+    /// an intermediate built-in call, not an author call site, so it keeps the outer invocation
+    /// caller instead of pushing the realm the native switched into.
+    pub(crate) in_native_call: bool,
     /// The call site the running code is at (a source position, or a [`frames::SITE_PC`]-tagged
     /// pc; [`frames::NO_SITE`] before its first call): set by each tier right before it calls
     /// out, saved into the callee's [`FnFrame::caller_site`] on entry and restored on exit — so
@@ -2203,6 +2207,7 @@ impl Interp {
             atomic_intrinsics: [0; 2],
             jit_atomic_lease: None,
             native_top: 0,
+            in_native_call: false,
             cur_site: frames::NO_SITE,
             sources: Default::default(),
             module_async_seq: 0,
@@ -3242,6 +3247,7 @@ impl Interp {
             this: frames::held_ptr(&held),
         };
         let mut scope = NativeFrameScope::enter(self, &ctx, site);
+        let saved_in_native = std::mem::replace(&mut scope.interp().in_native_call, true);
         let r = match call {
             Callable::Native(f) => f(scope.interp(), this, args),
             Callable::NativeData(data) => {
@@ -3250,6 +3256,7 @@ impl Interp {
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
+        scope.interp().in_native_call = saved_in_native;
         drop(scope);
         r
     }
@@ -6896,6 +6903,9 @@ impl Interp {
     /// callable also carries a `Callable::Native` (its placeholder) but is never `ic_plain`, and
     /// with one realm there is no realm switch and no foreign `eval` to intercept — exactly the
     /// cases `call_inner` / `call_dispatch` handle before reaching a native.
+    ///
+    /// This fast path does not set `in_native_call`; that is valid only because it is limited to
+    /// single-realm engines, where no invocation caller is recorded.
     #[inline(always)]
     pub(crate) fn leaf_native(&self, callee: &Value) -> Option<crate::value::NativeFn> {
         let Value::Obj(o) = callee else {
@@ -6906,6 +6916,16 @@ impl Interp {
             Callable::Native(f) if b.ic_plain.get() && !self.multi_realm() => Some(f),
             _ => None,
         }
+    }
+
+    /// Run `f` as author code entered from outside `call_user`: it is a script call site, not
+    /// an intermediate built-in call, so `in_native_call` is cleared and then restored.
+    #[inline]
+    pub(crate) fn with_script_entry<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.in_native_call, false);
+        let r = f(self);
+        self.in_native_call = saved;
+        r
     }
 
     /// [`call`](Interp::call) of a native `f` that [`leaf_native`](Interp::leaf_native)
@@ -7003,19 +7023,27 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // Preserve the call-site realm before a cross-realm callee swaps active intrinsics.
-        // Native Window receiver branding must authorize the original invoker, not the target
-        // realm merely because the method's function belongs to that realm.
+        // A call from script records the active realm as the invocation caller. A call made from
+        // inside a native that already has a caller keeps that caller, which lets native Window
+        // receiver branding and URL parsing see the original author-script realm. A bound
+        // function records nothing: its target's own `call_inner` does.
         #[cfg(feature = "embed")]
-        let _host_invocation =
-            (self.has_window_proxies() && self.multi_realm()).then(|| self.enter_host_invocation());
+        let _host_invocation = (self.has_window_proxies()
+            && self.multi_realm()
+            && !(self.in_native_call && self.has_host_invocation_caller())
+            && !matches!(&callee, Value::Obj(o) if matches!(o.borrow().call, Callable::Bound(_))))
+        .then(|| self.enter_host_invocation());
         // A cross-realm callee runs with its own realm's intrinsics active (so a thrown TypeError,
         // a fresh object's prototype, or a global lookup lands in the right realm).
         if self.multi_realm() {
             if let Value::Obj(o) = &callee {
                 // A proxy's trap machinery runs in the caller's realm (the trap-arguments array is
-                // a caller-realm Array); invoking the trap function swaps on its own.
-                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
+                // a caller-realm Array); invoking the trap function swaps on its own. A bound
+                // function runs no code of its own: entering its realm would make that realm the
+                // invocation caller of the target it forwards to.
+                if !self.proxies.contains_key(&(Gc::as_ptr(o) as usize))
+                    && !matches!(o.borrow().call, Callable::Bound(_))
+                {
                     if let Some(gptr) = self.callee_realm_global(o) {
                         let saved = self.snapshot_realm();
                         let target = self.realms[&gptr].snapshot_clone();
@@ -7225,14 +7253,16 @@ impl Interp {
                     extra: None,
                 });
                 let saved_tail = std::mem::replace(&mut self.native_tail_call, true);
-                let result = crate::native_aot::call(
-                    self,
-                    &native.program,
-                    native.function_index,
-                    &native.env,
-                    this,
-                    args,
-                );
+                let result = self.with_script_entry(|i| {
+                    crate::native_aot::call(
+                        i,
+                        &native.program,
+                        native.function_index,
+                        &native.env,
+                        this,
+                        args,
+                    )
+                });
                 self.native_tail_call = saved_tail;
                 self.pop_pushed_frame(depth, pointer);
                 result
@@ -7837,7 +7867,9 @@ impl Interp {
             construct: is_construct,
             extra: None,
         });
-        let r = self.call_user_inner(func, closure, this, args, is_construct, fn_obj);
+        let r = self.with_script_entry(|i| {
+            i.call_user_inner(func, closure, this, args, is_construct, fn_obj)
+        });
         if let Some(f) = self.fn_frames.pop() {
             self.cur_site = f.caller_site;
         }
@@ -8919,7 +8951,9 @@ impl Interp {
             .native_classes
             .contains_key(&(Gc::as_ptr(&obj) as usize))
         {
-            return crate::native_aot::classes::construct(self, callee, args, new_target);
+            return self.with_script_entry(|i| {
+                crate::native_aot::classes::construct(i, callee, args, new_target)
+            });
         }
         let call = obj.borrow().call.clone();
         match call {
@@ -9060,9 +9094,9 @@ impl Interp {
             | Callable::PropGet(_)
             | Callable::PropSet(_) => Err(self.throw("TypeError", "value is not a constructor")),
             #[cfg(feature = "aot-native")]
-            Callable::Aot(_) => {
-                crate::native_aot::classes::construct(self, callee, args, new_target)
-            }
+            Callable::Aot(_) => self.with_script_entry(|i| {
+                crate::native_aot::classes::construct(i, callee, args, new_target)
+            }),
         }
     }
 

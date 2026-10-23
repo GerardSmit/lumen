@@ -10,9 +10,12 @@ pub enum SourceRuleKind {
     FontFace,
     Property,
     PositionTry,
+    Page,
+    MarginBox,
     CounterStyle,
     FontFeatureValues,
     FontPaletteValues,
+    ViewTransition,
     Keyframes,
     Keyframe,
     Statement,
@@ -797,6 +800,9 @@ fn parse_body(
             SourceRuleKind::FontFeatureValues
         } else if at_rule(prelude, "@font-palette-values") && (parent.is_none() || scope_body || starting_context) {
             SourceRuleKind::FontPaletteValues
+        } else if at_rule(prelude, "@view-transition") && prelude["@view-transition".len()..].trim().is_empty()
+            && (parent.is_none() || scope_body || starting_context) {
+            SourceRuleKind::ViewTransition
         } else if at_rule(prelude, "@scope") {
             SourceRuleKind::Scope
         } else if at_rule(prelude, "@media")
@@ -811,6 +817,9 @@ fn parse_body(
             && (parent.is_none() || scope_body || starting_context)
         {
             SourceRuleKind::Keyframes
+        } else if page_rules::page_prelude_tail(prelude).is_some_and(|tail| page_rules::selector_list(tail).is_some())
+            && (parent.is_none() || scope_body || starting_context) {
+            SourceRuleKind::Page
         } else if prelude.starts_with('@') {
             continue;
         } else {
@@ -894,7 +903,7 @@ fn parse_body(
             range: start..end,
             prelude: start..open,
             body: Some(open + 1..close),
-            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues)
+            declaration_offset: matches!(kind, SourceRuleKind::Style | SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition)
                 .then_some(open + 1),
             declaration_ranges: Vec::new(),
             children: Vec::new(),
@@ -931,7 +940,8 @@ fn parse_body(
                     node.declaration_ranges = leading.declaration_ranges;
                 }
             }
-            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
+            SourceRuleKind::FontFace | SourceRuleKind::FontFeatureValues | SourceRuleKind::FontPaletteValues | SourceRuleKind::ViewTransition | SourceRuleKind::Property | SourceRuleKind::PositionTry | SourceRuleKind::CounterStyle => node.declaration_ranges.push(open + 1..close),
+            SourceRuleKind::Page => page_rules::fill_body(text, open, close, &mut node, count)?,
             SourceRuleKind::Keyframes => {
                 for (frame_start, frame_end, frame_open, frame_close) in
                     source_rule_ranges(&text[open + 1..close], false)?
@@ -1188,7 +1198,7 @@ fn validate_resolved_has(selector: &mut Selector) -> bool {
                     return false;
                 }
             }
-            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => {}
+            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
         }
         if matches!(pseudo, LogicalPseudo::Is(_) | LogicalPseudo::Not(_)) {
             let new = pseudo
@@ -1319,7 +1329,7 @@ fn resolve_nesting(
                     .unwrap_or((0, 0, 0));
                 selector.specificity = adjust_specificity(selector.specificity, old, new);
             }
-            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => {}
+            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
         }
         if matches!(pseudo, LogicalPseudo::Is(_) | LogicalPseudo::Not(_)) {
             let new = pseudo

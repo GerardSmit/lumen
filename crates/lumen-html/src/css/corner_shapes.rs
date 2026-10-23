@@ -34,12 +34,216 @@ fn short(name: &str) -> Option<&'static Short> {
     TABLE.iter().find(|short| short.name == name)
 }
 
+/// A corner shorthand sets `border-*-radius` and `corner-*-shape` together;
+/// `longhands` lists the radii first, then the shapes, in `corners` order.
+struct Combined {
+    name: &'static str,
+    corners: &'static [(&'static str, &'static str)],
+    longhands: &'static [&'static str],
+}
+
+const TOP_LEFT: (&str, &str) = ("border-top-left-radius", "corner-top-left-shape");
+const TOP_RIGHT: (&str, &str) = ("border-top-right-radius", "corner-top-right-shape");
+const BOTTOM_RIGHT: (&str, &str) = ("border-bottom-right-radius", "corner-bottom-right-shape");
+const BOTTOM_LEFT: (&str, &str) = ("border-bottom-left-radius", "corner-bottom-left-shape");
+const START_START: (&str, &str) = ("border-start-start-radius", "corner-start-start-shape");
+const START_END: (&str, &str) = ("border-start-end-radius", "corner-start-end-shape");
+const END_START: (&str, &str) = ("border-end-start-radius", "corner-end-start-shape");
+const END_END: (&str, &str) = ("border-end-end-radius", "corner-end-end-shape");
+
+static COMBINED: &[Combined] = &[
+    Combined {
+        name: "corner",
+        corners: &[TOP_LEFT, TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT],
+        longhands: &[
+            "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+            "corner-top-left-shape", "corner-top-right-shape", "corner-bottom-right-shape", "corner-bottom-left-shape",
+        ],
+    },
+    Combined { name: "corner-top-left", corners: &[TOP_LEFT], longhands: &["border-top-left-radius", "corner-top-left-shape"] },
+    Combined { name: "corner-top-right", corners: &[TOP_RIGHT], longhands: &["border-top-right-radius", "corner-top-right-shape"] },
+    Combined {
+        name: "corner-bottom-right",
+        corners: &[BOTTOM_RIGHT],
+        longhands: &["border-bottom-right-radius", "corner-bottom-right-shape"],
+    },
+    Combined {
+        name: "corner-bottom-left",
+        corners: &[BOTTOM_LEFT],
+        longhands: &["border-bottom-left-radius", "corner-bottom-left-shape"],
+    },
+    Combined {
+        name: "corner-start-start",
+        corners: &[START_START],
+        longhands: &["border-start-start-radius", "corner-start-start-shape"],
+    },
+    Combined { name: "corner-start-end", corners: &[START_END], longhands: &["border-start-end-radius", "corner-start-end-shape"] },
+    Combined { name: "corner-end-start", corners: &[END_START], longhands: &["border-end-start-radius", "corner-end-start-shape"] },
+    Combined { name: "corner-end-end", corners: &[END_END], longhands: &["border-end-end-radius", "corner-end-end-shape"] },
+    Combined {
+        name: "corner-top",
+        corners: &[TOP_LEFT, TOP_RIGHT],
+        longhands: &["border-top-left-radius", "border-top-right-radius", "corner-top-left-shape", "corner-top-right-shape"],
+    },
+    Combined {
+        name: "corner-right",
+        corners: &[TOP_RIGHT, BOTTOM_RIGHT],
+        longhands: &["border-top-right-radius", "border-bottom-right-radius", "corner-top-right-shape", "corner-bottom-right-shape"],
+    },
+    Combined {
+        name: "corner-bottom",
+        corners: &[BOTTOM_LEFT, BOTTOM_RIGHT],
+        longhands: &["border-bottom-left-radius", "border-bottom-right-radius", "corner-bottom-left-shape", "corner-bottom-right-shape"],
+    },
+    Combined {
+        name: "corner-left",
+        corners: &[TOP_LEFT, BOTTOM_LEFT],
+        longhands: &["border-top-left-radius", "border-bottom-left-radius", "corner-top-left-shape", "corner-bottom-left-shape"],
+    },
+    Combined {
+        name: "corner-block-start",
+        corners: &[START_START, START_END],
+        longhands: &["border-start-start-radius", "border-start-end-radius", "corner-start-start-shape", "corner-start-end-shape"],
+    },
+    Combined {
+        name: "corner-block-end",
+        corners: &[END_START, END_END],
+        longhands: &["border-end-start-radius", "border-end-end-radius", "corner-end-start-shape", "corner-end-end-shape"],
+    },
+    Combined {
+        name: "corner-inline-start",
+        corners: &[START_START, END_START],
+        longhands: &["border-start-start-radius", "border-end-start-radius", "corner-start-start-shape", "corner-end-start-shape"],
+    },
+    Combined {
+        name: "corner-inline-end",
+        corners: &[START_END, END_END],
+        longhands: &["border-start-end-radius", "border-end-end-radius", "corner-start-end-shape", "corner-end-end-shape"],
+    },
+];
+
+fn combined(name: &str) -> Option<&'static Combined> {
+    COMBINED.iter().find(|short| short.name == name)
+}
+
 pub(crate) fn is_shorthand(name: &str) -> bool {
-    short(name).is_some()
+    short(name).is_some() || combined(name).is_some()
 }
 
 pub(crate) fn longhands(name: &str) -> &'static [&'static str] {
-    short(name).map_or(&[], |short| short.longhands)
+    short(name).map(|short| short.longhands).or_else(|| combined(name).map(|short| short.longhands)).unwrap_or(&[])
+}
+
+fn is_shape_token(token: &str) -> bool {
+    KEYWORDS.iter().any(|(keyword, _)| decoded_css_keyword(token, keyword)) || superellipse_argument(token).is_some()
+}
+
+fn radius_length(token: &str) -> bool {
+    let context = static_length_context();
+    if typed_transforms::argument_expression(token, typed_transforms::TransformArgument::LengthPercentage).is_none() {
+        return false;
+    }
+    let Some(substituted) = typed_numeric::substitute_sibling_functions(token, 1, 1).map(|pair| pair.0) else { return false };
+    let Some(resolved) = transform_length_with_query(&substituted, context, ContainerUnitContext::no_container(context.viewport)) else {
+        return false;
+    };
+    math_function(token) || (resolved.pixels >= 0.0 && resolved.percent >= 0.0)
+}
+
+/// One corner: one or two radii and a shape in either order, or `normal`.
+fn parse_corner(part: &str) -> Option<(String, String)> {
+    let tokens = components(part)?;
+    if let [only] = tokens.as_slice() {
+        if decoded_css_keyword(only, "normal") {
+            return Some((String::from("0px"), String::from("round")));
+        }
+    }
+    let mut shape = None;
+    let mut radii: Vec<&str> = Vec::new();
+    for token in tokens {
+        if is_shape_token(token) {
+            if shape.is_some() {
+                return None;
+            }
+            shape = Some(specified(token)?);
+        } else if radius_length(token) {
+            radii.push(token);
+        } else {
+            return None;
+        }
+    }
+    if radii.is_empty() || radii.len() > 2 {
+        return None;
+    }
+    Some((radii.join(" "), shape?))
+}
+
+fn expand_combined(short: &'static Combined, raw: &str) -> Option<Vec<(&'static str, String)>> {
+    let parts = top_level_split(raw.trim(), b'/', 5)?;
+    let count = short.corners.len();
+    if parts.is_empty() || parts.len() > count {
+        return None;
+    }
+    let parsed: Vec<(String, String)> = parts.iter().map(|part| parse_corner(part)).collect::<Option<_>>()?;
+    let at = |index: usize| parsed[index].clone();
+    let corners: Vec<(String, String)> = match (count, parsed.len()) {
+        (_, 1) => alloc::vec![at(0); count],
+        (4, 2) => alloc::vec![at(0), at(1), at(0), at(1)],
+        (4, 3) => alloc::vec![at(0), at(1), at(2), at(1)],
+        _ => parsed.clone(),
+    };
+    let mut out = Vec::with_capacity(count * 2);
+    for ((radius, _), (value, _)) in short.corners.iter().zip(&corners) {
+        out.push((*radius, value.clone()));
+    }
+    for ((_, shape), (_, value)) in short.corners.iter().zip(&corners) {
+        out.push((*shape, value.clone()));
+    }
+    Some(out)
+}
+
+fn radius_is_zero(radius: &str) -> bool {
+    let Some(tokens) = components(radius) else { return false };
+    tokens.iter().all(|token| token.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%').parse::<f64>() == Ok(0.0))
+}
+
+fn synthesize_combined(short: &'static Combined, values: &[&str]) -> Option<String> {
+    let count = short.corners.len();
+    if values.len() != count * 2 {
+        return None;
+    }
+    let corners: Vec<String> = (0..count)
+        .map(|index| {
+            let (radius, shape) = (values[index], values[count + index]);
+            if radius_is_zero(radius) && curvature(shape, static_length_context()) == Some(1.0) {
+                String::from("normal")
+            } else {
+                alloc::format!("{radius} {shape}")
+            }
+        })
+        .collect();
+    let keep = match corners.as_slice() {
+        [a, b, c, d] => {
+            if a == b && a == c && a == d {
+                1
+            } else if a == c && b == d {
+                2
+            } else if b == d {
+                3
+            } else {
+                4
+            }
+        }
+        [a, b] => {
+            if a == b {
+                1
+            } else {
+                2
+            }
+        }
+        _ => 1,
+    };
+    Some(corners[..keep].join(" / "))
 }
 
 fn superellipse_argument(raw: &str) -> Option<&str> {
@@ -142,12 +346,18 @@ fn expand_values(arity: usize, raw: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn expand(name: &str, raw: &str) -> Option<Vec<(&'static str, String)>> {
+    if let Some(short) = combined(name) {
+        return expand_combined(short, raw);
+    }
     let short = short(name)?;
     let values = expand_values(short.longhands.len(), raw.trim())?;
     Some(short.longhands.iter().copied().zip(values).collect())
 }
 
 pub(crate) fn synthesize(name: &str, values: &[&str]) -> Option<String> {
+    if let Some(short) = combined(name) {
+        return synthesize_combined(short, values);
+    }
     let short = short(name)?;
     if values.len() != short.longhands.len() {
         return None;
@@ -160,6 +370,13 @@ pub(crate) fn synthesize(name: &str, values: &[&str]) -> Option<String> {
 }
 
 pub(crate) fn computed_shorthand(style: &Style, name: &str) -> String {
+    if let Some(short) = combined(name) {
+        let context = computed_values::ComputedValueContext::default();
+        let values: Option<Vec<String>> = short.longhands.iter().map(|longhand| style.computed_css_value(longhand, context)).collect();
+        let Some(values) = values else { return String::new() };
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        return synthesize_combined(short, &refs).unwrap_or_default();
+    }
     let Some(short) = short(name) else { return String::new() };
     let values: Option<Vec<String>> = short.longhands.iter().map(|longhand| extra::computed(style, longhand)).collect();
     let Some(values) = values else { return String::new() };
@@ -168,9 +385,18 @@ pub(crate) fn computed_shorthand(style: &Style, name: &str) -> String {
 }
 
 pub(crate) fn shorthand_declarations(name: &str, raw: &str) -> Option<Vec<Value>> {
+    let combined = combined(name).is_some();
     let mut values = Vec::new();
     for (longhand, text) in expand(name, raw)? {
-        values.extend(extra::declarations(longhand, &text)?);
+        if combined && longhand.ends_with("-radius") {
+            let declarations = typed_declarations(longhand, &text, 0).ok()?;
+            if declarations.is_empty() {
+                return None;
+            }
+            values.extend(declarations.into_iter().map(|declaration| declaration.value));
+        } else {
+            values.extend(extra::declarations(longhand, &text)?);
+        }
     }
     Some(values)
 }

@@ -278,6 +278,104 @@ pub(crate) fn sequential_order(realm: &Rc<DomRealm>) -> OpResult<Vec<(Rc<DomReal
     Ok(result)
 }
 
+fn frame_anchor(realm: &Rc<DomRealm>, owner: &Rc<DomRealm>, node: NodeId) -> Option<NodeId> {
+    let mut owner = owner.clone();
+    let mut node = node;
+    for _ in 0..32 {
+        if Rc::ptr_eq(&owner, realm) { return Some(node); }
+        let context = owner.navigation_context()?;
+        if context.is_top_level() { return None; }
+        let parent = context.owner_document()?;
+        node = context.owner_node();
+        owner = parent;
+    }
+    None
+}
+
+fn flat_path(document: &lumen_html::Document, node: NodeId) -> Option<Vec<usize>> {
+    let mut path = Vec::new();
+    let mut current = node;
+    for _ in 0..4096 {
+        if current == document.root() {
+            path.reverse();
+            return Some(path);
+        }
+        let parent = document.flat_tree_parent(current).ok()??;
+        let index = document.composed_children(parent).ok()?.iter().position(|child| *child == current)?;
+        path.push(index);
+        current = parent;
+    }
+    None
+}
+
+fn tabindex_value(document: &lumen_html::Document, node: NodeId) -> Option<i32> {
+    lumen_html::focus::tabindex(document, node).and_then(lumen_common::html_numbers::parse_integer_i32)
+}
+
+enum PointPlacement {
+    Before(Vec<usize>),
+    Inside(Vec<usize>),
+}
+
+impl PointPlacement {
+    fn precedes(&self, item: &[usize]) -> bool {
+        match self {
+            Self::Before(point) => item < point.as_slice(),
+            Self::Inside(point) => item <= point.as_slice() || item.starts_with(point),
+        }
+    }
+}
+
+/// The number of entries of `order` that sort before a navigation starting
+/// point which is not itself a stop: the index of the next stop going
+/// forward. Stops sort by positive tabindex first, then by flat tree order; a
+/// point without its own tabindex takes the one of its nearest ancestor stop.
+pub(crate) fn placement_index(realm: &Rc<DomRealm>, order: &[(Rc<DomRealm>, NodeId)], point: fragment::SequentialPoint) -> usize {
+    let session = realm.session.borrow();
+    let document = session.document();
+    let (key, placement) = match point {
+        fragment::SequentialPoint::Node(node) => {
+            let key = tabindex_value(document, node).unwrap_or_else(|| {
+                let stops: HashSet<NodeId> = order.iter().filter(|(owner, _)| Rc::ptr_eq(owner, realm)).map(|(_, node)| *node).collect();
+                let mut current = node;
+                for _ in 0..4096 {
+                    match document.flat_tree_parent(current) {
+                        Ok(Some(parent)) if stops.contains(&parent) => return tabindex_value(document, parent).unwrap_or(0),
+                        Ok(Some(parent)) => current = parent,
+                        _ => break,
+                    }
+                }
+                0
+            });
+            (key, flat_path(document, node).map(PointPlacement::Before))
+        }
+        fragment::SequentialPoint::Gap(container, offset) => {
+            let mut child = document.first_child(container).ok().flatten();
+            for _ in 0..offset {
+                child = child.and_then(|child| document.next_sibling(child).ok().flatten());
+            }
+            let placement = match child {
+                Some(child) => flat_path(document, child).map(PointPlacement::Before),
+                None => {
+                    let owner = if document.shadow_host(container).ok().flatten().is_some() && document.parent(container).ok().flatten().is_none() {
+                        document.shadow_host(container).ok().flatten().unwrap_or(container)
+                    } else { container };
+                    flat_path(document, owner).map(PointPlacement::Inside)
+                }
+            };
+            (0, placement)
+        }
+        fragment::SequentialPoint::SlotEnd(slot) => (0, flat_path(document, slot).map(PointPlacement::Inside)),
+    };
+    let Some(placement) = placement else { return 0; };
+    order.partition_point(|(owner, node)| {
+        let Some(anchor) = frame_anchor(realm, owner, *node) else { return true; };
+        let stop_key = tabindex_value(document, anchor).filter(|value| *value > 0).unwrap_or(0);
+        let tree_before = flat_path(document, anchor).is_some_and(|path| placement.precedes(&path));
+        if key > 0 { stop_key > 0 && (stop_key < key || (stop_key == key && tree_before)) } else { stop_key > 0 || tree_before }
+    })
+}
+
 pub(crate) fn currently_focused(realm: &Rc<DomRealm>) -> Option<NodeId> {
     let mut owner=top_document(realm).unwrap_or_else(||realm.clone());
     loop {

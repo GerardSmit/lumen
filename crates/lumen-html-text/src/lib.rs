@@ -30,7 +30,7 @@ pub use lumen_common::ucd::{
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp::Ordering as CmpOrdering;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use lumen_common::bidi::{self, Script, ScriptExtension, UnicodeScript};
 use lumen_html::paint::{
     PrimaryCharacterWidths,
@@ -291,6 +291,40 @@ pub enum GlyphOutlineCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphOutline {
     pub commands: Vec<GlyphOutlineCommand>,
+}
+
+/// The y coordinates of every line when the outline is drawn only from horizontal and
+/// vertical lines; `None` for curves, diagonals or an empty outline.
+fn rectilinear_edges(outline: &GlyphOutline) -> Option<Vec<f32>> {
+    let mut previous: Option<(f32, f32)> = None;
+    let mut start: Option<(f32, f32)> = None;
+    let mut ys: Vec<f32> = Vec::new();
+    for command in &outline.commands {
+        match *command {
+            GlyphOutlineCommand::MoveTo(x, y) => {
+                previous = Some((x, y));
+                start = previous;
+            }
+            GlyphOutlineCommand::LineTo(x, y) => {
+                let (px, py) = previous?;
+                if x != px && y != py {
+                    return None;
+                }
+                ys.push(y);
+                previous = Some((x, y));
+            }
+            GlyphOutlineCommand::Close => {
+                let (px, py) = previous?;
+                let (sx, sy) = start?;
+                if px != sx && py != sy {
+                    return None;
+                }
+                previous = start;
+            }
+            GlyphOutlineCommand::QuadTo(..) | GlyphOutlineCommand::CurveTo(..) => return None,
+        }
+    }
+    (!ys.is_empty()).then_some(ys)
 }
 
 const MAX_GLYPH_OUTLINE_COMMANDS: usize = 16_384;
@@ -781,6 +815,7 @@ fn append_glyphs(
                 .map_err(|_| "glyph cluster offset out of range")?,
             caps_expansion: 0,
             x: *x + position.x_offset as f32 * scale,
+            x_offset: position.x_offset as f32 * scale,
             y: position.y_offset as f32 * scale,
             size_scale,
         });
@@ -2286,6 +2321,7 @@ pub struct FontFace {
     metric_glyph_coverage:u8,
     primary_character_widths: Option<PrimaryCharacterWidths>,
     classic_mac_ascent: bool,
+    rectilinear_face: AtomicU8,
     caps_features: u8,
     spacing_features: u8,
     variable_axes: Arc<[VariationAxisInfo]>,
@@ -2667,6 +2703,7 @@ impl FontFace {
             metric_glyph_coverage,
             primary_character_widths,
             classic_mac_ascent: false,
+            rectilinear_face: AtomicU8::new(0),
             caps_features,
             spacing_features,
             variable_axes,
@@ -3230,6 +3267,7 @@ variation_advances: VariationGlyphCache::new(),
                 cluster,
                 caps_expansion,
                 x: *x + position.x_offset as f32 * scale,
+                x_offset: position.x_offset as f32 * scale,
                 y: position.y_offset as f32 * scale,
                 size_scale: size_scale * reduced,
             });
@@ -3530,7 +3568,63 @@ variation_advances: VariationGlyphCache::new(),
             }
             return coverage_from_outline(&self.outline_with_variations(id, size, &[])?);
         }
+        if let Some(coverage) = self.rectilinear_grid_fitted(id, size) {
+            return coverage;
+        }
         self.with_rasterizer(id,size,|font|rasterize_coverage(font,id,size))
+    }
+
+    /// Glyphs drawn only from horizontal and vertical lines (Ahem-style boxes) get their
+    /// horizontal edges fitted to the pixel grid, as light hinting does, so square glyphs
+    /// stay crisp instead of bleeding into the neighbouring pixel row.
+    fn rectilinear_grid_fitted(&self, id: u16, size: f32) -> Option<Result<GlyphCoverage, &'static str>> {
+        if !size.is_finite() || size <= 0.0 || size > MAX_SHAPE_FONT_SIZE || !self.is_rectilinear_face() {
+            return None;
+        }
+        let mut outline = self.outline_with_variations(id, size, &[]).ok()?;
+        let mut ys = rectilinear_edges(&outline)?;
+        ys.sort_by(|a, b| a.total_cmp(b));
+        ys.dedup();
+        let mut last = f32::NEG_INFINITY;
+        for &y in &ys {
+            let fitted = y.round();
+            if fitted <= last {
+                return None;
+            }
+            last = fitted;
+        }
+        for command in &mut outline.commands {
+            match command {
+                GlyphOutlineCommand::MoveTo(_, y) | GlyphOutlineCommand::LineTo(_, y) => *y = y.round(),
+                _ => {}
+            }
+        }
+        Some(coverage_from_outline(&outline))
+    }
+
+    /// Whether every sampled letter is drawn from horizontal and vertical lines only, as in
+    /// Ahem. Decided once per face; ordinary text faces mix curves and diagonals.
+    fn is_rectilinear_face(&self) -> bool {
+        match self.rectilinear_face.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        let rectilinear = ttf_parser::Face::parse(&self.bytes, 0).is_ok_and(|face| {
+            ['A', 'O', 'S', 'g'].iter().all(|&character| {
+                let Some(glyph) = face.glyph_index(character) else {
+                    return false;
+                };
+                let mut builder = GlyphOutlineBuilder {
+                    commands: Vec::new(),
+                    overflowed: false,
+                };
+                let _bounds = face.outline_glyph(glyph, &mut builder);
+                !builder.overflowed && rectilinear_edges(&GlyphOutline { commands: builder.commands }).is_some()
+            })
+        });
+        self.rectilinear_face.store(if rectilinear { 1 } else { 2 }, Ordering::Relaxed);
+        rectilinear
     }
 
     fn rasterize_with_variations(&self, key: u64, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Result<Arc<GlyphCoverage>, &'static str> {
@@ -5495,7 +5589,7 @@ fn joining_context_preserves_font_item_clusters_and_exact_cache_identity() {
                     face: 0,
                     id: 1,
                     cluster: 0,
-                    caps_expansion: 0,
+                    caps_expansion: 0, x_offset: 0.0,
                     x: 0.0,
                     y: 0.0,
                     size_scale: 1.0,

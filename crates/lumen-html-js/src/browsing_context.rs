@@ -604,6 +604,7 @@ pub(crate) struct BrowsingContext {
     initial_blank_load_dispatched: Cell<bool>,
     insertion_order: u64,
     target_name: RefCell<String>,
+    window_features: Cell<super::window_features::WindowFeatures>,
     source_bytes: Cell<usize>,
     /// `sessionStorage` of a top-level traversable; nested contexts use their top-level one.
     session_storage: RefCell<Option<lumen_common::web_storage::SharedBackend>>,
@@ -1578,6 +1579,7 @@ impl BrowsingContext {
             ignored_attribute_navigation: Cell::new(None),
             insertion_order: 0,
             target_name: RefCell::new(String::new()),
+            window_features: Cell::new(Default::default()),
             source_bytes: Cell::new(0),
             session_storage: RefCell::new(None),
         });
@@ -1697,7 +1699,11 @@ impl BrowsingContext {
         let caller = ctx.invocation_host_realm();
         let origin = metadata_for_realm(ctx, &caller).map(|metadata| metadata_origin(&metadata))
             .ok_or_else(|| OpError::new("InvalidStateError", "Navigation has no initiating document"))?;
-        let parsed = lumen_common::url::parse(input, Some(entry_base_url)).map_err(|_| OpError::new("SyntaxError", "invalid Location URL"))?;
+        let Ok(parsed) = lumen_common::url::parse(input, Some(entry_base_url)) else {
+            let handle = self.realm_handle();
+            return Err(ctx.with_host_realm(&handle, |ctx| crate::error_reporting::dom_exception(ctx, "SyntaxError", "invalid Location URL"))
+                .unwrap_or_else(|_| OpError::new("SyntaxError", "invalid Location URL")));
+        };
         let context = self.history_store().and_then(|store| store.contexts.borrow().get(&self.history_id()).and_then(std::rc::Weak::upgrade));
         if parsed.scheme=="javascript" {
             if let Some(context)=context {
@@ -1775,6 +1781,16 @@ impl BrowsingContext {
     }
 
     pub(crate) fn disown_opener(&self) {self.opener.borrow_mut().take();}
+
+    pub(crate) fn window_features(&self) -> super::window_features::WindowFeatures {self.window_features.get()}
+
+    pub(crate) fn group_context_count(&self) -> usize {
+        self.group.upgrade().map_or(0, |group| group.contexts.borrow().len())
+    }
+
+    pub(crate) fn set_window_features(&self, features: super::window_features::WindowFeatures) {
+        if self.parent.is_none() && self.insertion_order != 0 && !features.is_empty() {self.window_features.set(features);}
+    }
 
     pub(crate) fn close_auxiliary(&self,ctx:&mut Ctx) {
         if self.parent.is_some() || self.insertion_order==0 {return;}
@@ -2084,6 +2100,9 @@ impl DomRealm {
         if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
             return Ok(Vec::new());
         }
+        if self.connected_iframe_nodes().is_empty() {
+            return Ok(Vec::new());
+        }
         let origin = self.document_origin().or_else(|| self.browsing_context().map(|context| context.root_or_child_origin()));
         let mut seen = HashSet::new();
         let mut windows = Vec::new();
@@ -2100,6 +2119,9 @@ impl DomRealm {
     /// value priority even when their origin excluded that name from the set.
     pub(crate) fn named_child_value(self: &Rc<Self>, ctx: &mut Ctx, name: &str) -> OpResult<Option<Value>> {
         if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
+            return Ok(None);
+        }
+        if self.connected_iframe_nodes().is_empty() {
             return Ok(None);
         }
         Ok(self.frame_contexts(ctx)?.into_iter().find(|frame| frame.target_name() == name)
@@ -2135,10 +2157,10 @@ impl DomRealm {
         let candidates = {
             let mut cache = self.frame_candidates.borrow_mut();
             match cache.as_ref() {
-                Some((version, nodes)) if *version == document.version() => nodes.clone(),
+                Some((version, nodes)) if *version == document.tree_names_version() => nodes.clone(),
                 _ => {
                     let nodes = Self::frame_candidate_nodes(document);
-                    *cache = Some((document.version(), nodes.clone()));
+                    *cache = Some((document.tree_names_version(), nodes.clone()));
                     nodes
                 }
             }
@@ -2342,6 +2364,7 @@ impl DomRealm {
             ignored_attribute_navigation: Cell::new(None),
             insertion_order,
             target_name: RefCell::new(target_name),
+            window_features: Cell::new(Default::default()),
             source_bytes: Cell::new(source.len()),
             session_storage: RefCell::new(None),
         });

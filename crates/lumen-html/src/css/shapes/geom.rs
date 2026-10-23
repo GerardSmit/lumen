@@ -19,26 +19,8 @@ impl Env {
 }
 
 pub(super) fn num(value: f64) -> String {
-    if !value.is_finite() {
-        return String::from("0");
-    }
-    let mut value = value;
-    if value != 0.0 {
-        let magnitude = libm::floor(libm::log10(value.abs())) as i32;
-        let digits = 5 - magnitude;
-        value = if digits >= 0 {
-            let scale = libm::pow(10.0, f64::from(digits));
-            libm::round(value * scale) / scale
-        } else {
-            let scale = libm::pow(10.0, f64::from(-digits));
-            libm::round(value / scale) * scale
-        };
-    }
-    if value == 0.0 {
-        String::from("0")
-    } else {
-        alloc::format!("{value}")
-    }
+    let value = if value.is_finite() && value.abs() >= 1e-6 { value } else { 0.0 };
+    crate::css::computed_values::significant_digits_6(value)
 }
 
 pub(super) use crate::css::extra_props::lower;
@@ -173,7 +155,7 @@ impl Angle {
     }
 }
 
-pub(super) fn parse_angle(token: &str) -> Option<Angle> {
+pub(super) fn parse_angle(token: &str, env: Env) -> Option<Angle> {
     let token = token.trim();
     if token.is_empty() {
         return None;
@@ -182,7 +164,8 @@ pub(super) fn parse_angle(token: &str) -> Option<Angle> {
         return None;
     }
     let expression = typed_transforms::argument_expression(token, typed_transforms::TransformArgument::Angle)?;
-    let deg = typed_transforms::resolved_argument_scalar(&expression, None)?;
+    let deg = typed_transforms::resolved_argument_scalar(&expression, None)
+        .or_else(|| typed_transforms::resolved_angle_in_context(&expression, env.ctx, env.query))?;
     Some(Angle { spec: expression.serialize_specified()?, deg })
 }
 

@@ -1104,6 +1104,8 @@ define_plain_html_interfaces! {
         }
     };
     DomHtmlSpanElement, "HTMLSpanElement" => ["span"];
+    DomHtmlPictureElement, "HTMLPictureElement" => ["picture"];
+    DomHtmlSelectedContentElement, "HTMLSelectedContentElement" => ["selectedcontent"];
     DomHtmlCameraElement, "HTMLCameraElement" => ["camera"] {
         #[getter]
         fn track(&self) -> Value { Value::Null }

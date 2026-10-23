@@ -7,6 +7,7 @@
 use super::*;
 use lumen_common::fasthash::{fnv1a64, FNV1A64_OFFSET};
 use lumen_common::generations::Generations;
+use super::token_join::push_joined;
 
 #[derive(Debug)]
 enum Fallback {
@@ -147,15 +148,22 @@ impl Template {
             return None;
         }
         walk.deepest = walk.deepest.max(stack.len());
+        let mut after_var = false;
         for piece in &self.pieces {
             match piece {
                 Piece::Literal { text, checked } => {
                     if *checked && out.len() + text.len() > limit {
                         return None;
                     }
-                    out.push_str(text);
+                    if after_var {
+                        push_joined(out, text);
+                    } else {
+                        out.push_str(text);
+                    }
+                    after_var = false;
                 }
                 Piece::Var { name, fallback } => {
+                    after_var = true;
                     if !Self::resolve(name, names, stack, walk, out, limit)? {
                         let template = match fallback {
                             Fallback::Template(template) => template,
@@ -166,7 +174,7 @@ impl Template {
                         if out.len() + value.len() > limit {
                             return None;
                         }
-                        out.push_str(&value);
+                        push_joined(out, &value);
                     }
                 }
             }
@@ -187,7 +195,7 @@ impl Template {
             if out.len() + value.len() > limit {
                 return None;
             }
-            out.push_str(value);
+            push_joined(out, value);
             return Some(true);
         }
         let slot = if walk.memo.is_some() { names.slot(name) } else { None };
@@ -198,7 +206,7 @@ impl Template {
         if out.len() + expanded.len() > limit {
             return None;
         }
-        out.push_str(&expanded);
+        push_joined(out, &expanded);
         Some(true)
     }
 }
@@ -497,7 +505,7 @@ mod tests {
             ("var(--a)", Some("red")),
             ("VAR(--a)", Some("red")),
             ("1px var(--a) 2px", Some("1px red 2px")),
-            ("var(--a)var(--a)", Some("redred")),
+            ("var(--a)var(--a)", Some("red/**/red")),
             ("var( --a )", Some("red")),
             ("var(--missing)", None),
             ("var(--missing, 1px)", Some(" 1px")),

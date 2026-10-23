@@ -131,7 +131,7 @@ impl IfScope<'_> {
         match registration {
             Some(registration) => registered_properties::compute_value_with_source(&registration.syntax, text,
                 self.context.0, self.context.1, &self.context.2, registration.source_url.as_deref()),
-            None => Some(container_query::collapse_whitespace(text)),
+            None => Some(String::from(text)),
         }
     }
 
@@ -153,7 +153,7 @@ impl IfScope<'_> {
         }
     }
 
-    fn declared(&self, name: &str, wanted: Option<&str>) -> Option<bool> {
+    pub(super) fn declared(&self, name: &str, wanted: Option<&str>) -> Option<bool> {
         let registration = self.registration(name);
         let current = self.value_of(self.names, name, registration)
             .or_else(|| if self.names.value(name).is_none() { self.initial(registration) } else { None });

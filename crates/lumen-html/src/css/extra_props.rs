@@ -23,6 +23,7 @@ enum Kind {
     BgPos(background_positions::Axis),
     Text,
     GridLine,
+    MathDepth,
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +129,8 @@ const PROPS: &[Prop] = &[
     Prop { name: "background-position-y", inherited: false, initial: "0%", kind: Kind::BgPos(background_positions::Axis::Y) },
     Prop { name: "object-view-box", inherited: false, initial: "none", kind: Kind::Shape(shapes::Prop::ObjectViewBox) },
     Prop { name: "border-shape", inherited: false, initial: "none", kind: Kind::Shape(shapes::Prop::BorderShape) },
+    Prop { name: "math-style", inherited: true, initial: "normal", kind: Kind::Keywords(&["normal", "compact"]) },
+    Prop { name: "math-depth", inherited: true, initial: "0", kind: Kind::MathDepth },
 ];
 
 pub(crate) const COUNT: usize = PROPS.len() + value_props::COUNT;
@@ -482,6 +485,7 @@ pub(super) fn compute(slot: usize, raw: &str, context: LengthContext, current: R
         Kind::Shape(shape) => shapes::compute(shape, raw, context)?,
         Kind::Text => text_props::compute(prop.name, raw, current)?,
         Kind::GridLine => grid_lines::line(raw)?,
+        Kind::MathDepth => math_depth_specified(raw, context)?,
         Kind::Value(index) => value_props::compute(index, raw, context, current)?,
         Kind::Zoom => {
             if decoded_css_keyword(raw, "normal") {
@@ -500,8 +504,41 @@ pub(super) fn compute(slot: usize, raw: &str, context: LengthContext, current: R
     Some(Arc::from(value))
 }
 
+fn math_depth_specified(raw: &str, context: LengthContext) -> Option<String> {
+    let raw = raw.trim();
+    let keyword = lower(raw);
+    if keyword == "auto-add" {
+        return Some(String::from("auto-add"));
+    }
+    if keyword.starts_with("add(") && keyword.ends_with(')') {
+        return integer(&raw[4..raw.len() - 1], context).map(|value| alloc::format!("add({value})"));
+    }
+    integer(raw, context).map(|value| value.to_string())
+}
+
+fn resolve_math_depth(specified: &str, style: &Style, parent: Option<&Style>) -> Arc<str> {
+    let source = parent.unwrap_or(style);
+    let inherited = source.generic.get(slot_const("math-depth") - BASE).and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    let compact = style.generic.get(slot_const("math-style") - BASE).is_some_and(|value| &**value == "compact");
+    let depth = if specified == "auto-add" {
+        inherited.saturating_add(i64::from(compact))
+    } else if let Some(delta) = specified.strip_prefix("add(").and_then(|rest| rest.strip_suffix(')')) {
+        inherited.saturating_add(delta.parse::<i64>().unwrap_or(0))
+    } else {
+        specified.parse::<i64>().unwrap_or(0)
+    };
+    Arc::from(depth.to_string())
+}
+
 pub(super) fn apply(slot: usize, raw: &str, context: LengthContext, style: &mut Style) {
-    if let Some(value) = compute(slot, raw, context, style.color) {
+    apply_with_parent(slot, raw, context, style, None);
+}
+
+pub(super) fn apply_with_parent(slot: usize, raw: &str, context: LengthContext, style: &mut Style, parent: Option<&Style>) {
+    if let Some(mut value) = compute(slot, raw, context, style.color) {
+        if prop_at(slot - BASE).kind == Kind::MathDepth {
+            value = resolve_math_depth(&value, style, parent);
+        }
         if text_props::apply_white_space(prop_at(slot - BASE).name, &value, style) {
             return;
         }
@@ -569,6 +606,12 @@ pub(crate) fn compose(name: &str, base: &str, value: &str, accumulate: bool) -> 
 /// The specified keyword of a keyword-valued property, or `None` for its initial value.
 pub(crate) fn keyword<'a>(style: &'a Style, name: &str) -> Option<&'a str> {
     style.generic.get(index_of(name)?).map(|value| &**value)
+}
+
+pub(crate) fn set_stored(style: &mut Style, name: &str, value: Option<&str>) {
+    if let Some(index) = index_of(name) {
+        style.generic.set(index, value.map(Arc::from));
+    }
 }
 
 pub(crate) fn stored(style: &Style, name: &str) -> Option<String> {
@@ -665,6 +708,9 @@ pub(crate) fn serialize_specified(slot: usize, raw: &str) -> Option<String> {
         Kind::TabSize | Kind::Perspective if !length_independent(raw) || math_function(raw) => {
             typed_numeric::parse_numeric_expression(raw)?.serialize_specified()
         }
+        Kind::TabSize | Kind::Perspective if typed_numeric::parse_numeric_expression(raw).is_some() => {
+            typed_numeric::parse_numeric_expression(raw)?.serialize_specified()
+        }
         Kind::TextSizeAdjust if math_function(raw) => typed_numeric::parse_numeric_expression(raw)?.serialize_specified(),
         Kind::Position => background_positions::position_specified(raw),
         Kind::Anchor => anchor::specified(prop.name, raw),
@@ -716,6 +762,9 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
     if !progress.is_finite() {
         return None;
     }
+    if name == "overlay" {
+        return Some(if from == to || progress <= 0.0 { from } else if progress >= 1.0 { to } else { "auto" }.to_owned());
+    }
     match prop_at(index).kind {
         Kind::TabSize => {
             let (a, unit_a) = syntax::split_number_unit(from)?;
@@ -746,7 +795,11 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
             let (from_x, from_y) = (*tokens.first()?, *tokens.get(1)?);
             let tokens = components(to)?;
             let (to_x, to_y) = (*tokens.first()?, *tokens.get(1)?);
-            Some(alloc::format!("{} {}", mix_lp(from_x, to_x, progress)?, mix_lp(from_y, to_y, progress)?))
+            let axis = |a: &str, b: &str| {
+                let mixed = mix_lp(a, b, progress)?;
+                Some(if mixed == "0px" && (a.contains('%') || b.contains('%')) { String::from("0%") } else { mixed })
+            };
+            Some(alloc::format!("{} {}", axis(from_x, to_x)?, axis(from_y, to_y)?))
         }
         Kind::HyphenChars => {
             let a = parse_hyphen_chars(from)?;
@@ -790,12 +843,12 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
             Some(zoom_string(mix(a, b, progress)))
         }
         Kind::Shape(shape) => shapes::interpolate(shape, from, to, progress),
-        Kind::Gap(part) => gap_rules::interpolate(part, from, to, progress),
+        Kind::Gap(part) => gap_rules::interpolate_snapping(part, from, to, progress, name.starts_with("row-") || from.contains(',') || to.contains(',')),
         Kind::Corner => corner_shapes::interpolate(from, to, progress),
         Kind::BgPos(axis) => background_positions::interpolate(axis, from, to, progress),
         Kind::Text if text_props::is_color(name) => text_props::interpolate_color(from, to, progress),
         Kind::Value(value) => value_props::interpolate(value, from, to, progress),
-        Kind::Text | Kind::MaskBorder(_) | Kind::Keywords(_) | Kind::Anchor | Kind::GridLine => None,
+        Kind::Text | Kind::MaskBorder(_) | Kind::Keywords(_) | Kind::Anchor | Kind::GridLine | Kind::MathDepth => None,
     }
 }
 

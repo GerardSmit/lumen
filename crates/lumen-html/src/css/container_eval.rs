@@ -25,7 +25,10 @@ pub(super) fn is_marker(entry: &str) -> bool {
 enum Truth {
     True,
     False,
+    /// Syntax the evaluator does not know: it poisons the whole condition.
     Unknown,
+    /// A known feature the container cannot evaluate; combines like Kleene unknown.
+    Unavailable,
 }
 
 impl Truth {
@@ -38,6 +41,7 @@ impl Truth {
             Self::True => Self::False,
             Self::False => Self::True,
             Self::Unknown => Self::Unknown,
+            Self::Unavailable => Self::Unavailable,
         }
     }
 }
@@ -49,16 +53,47 @@ enum Node {
     Any(Vec<Node>),
     Size(String),
     Style(String),
+    Scroll(String),
+    Anchored(String),
     Unknown,
 }
 
+/// The feature family a condition's leaf features belong to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Size,
+    Style,
+    Scroll,
+    Anchored,
+}
+
 impl Node {
-    fn uses(&self, size: bool) -> bool {
+    /// Bit set of the size features the query reads, see `Feature::bit`.
+    fn size_features(&self) -> u8 {
         match self {
-            Self::Not(inner) => inner.uses(size),
-            Self::All(nodes) | Self::Any(nodes) => nodes.iter().any(|node| node.uses(size)),
-            Self::Size(_) => size,
-            Self::Style(_) => !size,
+            Self::Not(inner) => inner.size_features(),
+            Self::All(nodes) | Self::Any(nodes) => nodes.iter().fold(0, |bits, node| bits | node.size_features()),
+            Self::Size(content) => container_query::pieces(content).map_or(0, |parts| {
+                parts.iter().fold(0, |bits, part| match part {
+                    Piece::Word(word) => {
+                        let base = word.strip_prefix("min-").or_else(|| word.strip_prefix("max-")).unwrap_or(word);
+                        bits | feature(base).map_or(0, Feature::bit)
+                    }
+                    _ => bits,
+                })
+            }),
+            Self::Style(_) | Self::Scroll(_) | Self::Anchored(_) | Self::Unknown => 0,
+        }
+    }
+
+    fn uses(&self, mode: Mode) -> bool {
+        match self {
+            Self::Not(inner) => inner.uses(mode),
+            Self::All(nodes) | Self::Any(nodes) => nodes.iter().any(|node| node.uses(mode)),
+            Self::Size(_) => mode == Mode::Size,
+            Self::Style(_) => mode == Mode::Style,
+            Self::Scroll(_) => mode == Mode::Scroll,
+            Self::Anchored(_) => mode == Mode::Anchored,
             Self::Unknown => false,
         }
     }
@@ -69,6 +104,9 @@ pub(super) struct Parsed {
     name: Option<Arc<str>>,
     root: Option<Node>,
     size: bool,
+    scroll: bool,
+    anchored: bool,
+    features: u8,
 }
 
 fn parse_conditions(entry: &str) -> Arc<[Parsed]> {
@@ -80,21 +118,24 @@ fn parse_condition(condition: &Condition) -> Parsed {
     let root = if condition.query.is_empty() {
         None
     } else {
-        Some(container_query::tokenize(&condition.query).and_then(|tokens| parse_query(&tokens, false)).unwrap_or(Node::Unknown))
+        Some(container_query::tokenize(&condition.query).and_then(|tokens| parse_query(&tokens, Mode::Size)).unwrap_or(Node::Unknown))
     };
-    let size = root.as_ref().is_some_and(|root| root.uses(true));
-    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size }
+    let size = root.as_ref().is_some_and(|root| root.uses(Mode::Size));
+    let scroll = root.as_ref().is_some_and(|root| root.uses(Mode::Scroll));
+    let anchored = root.as_ref().is_some_and(|root| root.uses(Mode::Anchored));
+    let features = root.as_ref().map_or(0, Node::size_features);
+    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size, scroll, anchored, features }
 }
 
-fn parse_query(tokens: &[Token<'_>], style: bool) -> Option<Node> {
+fn parse_query(tokens: &[Token<'_>], mode: Mode) -> Option<Node> {
     let first = tokens.first()?;
     if container_query::keyword(first, "not") {
         if tokens.len() != 2 {
             return Some(Node::Unknown);
         }
-        return Some(Node::Not(Box::new(parse_group(tokens.get(1)?, style)?)));
+        return Some(Node::Not(Box::new(parse_group(tokens.get(1)?, mode)?)));
     }
-    let head = parse_group(first, style)?;
+    let head = parse_group(first, mode)?;
     if tokens.len() == 1 {
         return Some(head);
     }
@@ -107,18 +148,23 @@ fn parse_query(tokens: &[Token<'_>], style: bool) -> Option<Node> {
         if !container_query::keyword(&pair[0], if all { "and" } else { "or" }) {
             return Some(Node::Unknown);
         }
-        nodes.push(parse_group(&pair[1], style)?);
+        nodes.push(parse_group(&pair[1], mode)?);
     }
     Some(if all { Node::All(nodes) } else { Node::Any(nodes) })
 }
 
-fn parse_group(token: &Token<'_>, style: bool) -> Option<Node> {
+fn parse_group(token: &Token<'_>, mode: Mode) -> Option<Node> {
     match token.kind {
-        Kind::Paren => Some(parse_content(&container_query::inner(token, 0), style)),
+        Kind::Paren => Some(parse_content(&container_query::inner(token, 0), mode)),
         Kind::Function => {
             let open = token.text.find('(')?;
-            if !style && token.text[..open].eq_ignore_ascii_case("style") {
-                Some(parse_content(&container_query::inner(token, open), true))
+            let name = &token.text[..open];
+            if mode == Mode::Size && name.eq_ignore_ascii_case("style") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Style))
+            } else if mode == Mode::Size && name.eq_ignore_ascii_case("scroll-state") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Scroll))
+            } else if mode == Mode::Size && name.eq_ignore_ascii_case("anchored") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Anchored))
             } else {
                 Some(Node::Unknown)
             }
@@ -127,7 +173,7 @@ fn parse_group(token: &Token<'_>, style: bool) -> Option<Node> {
     }
 }
 
-fn parse_content(content: &str, style: bool) -> Node {
+fn parse_content(content: &str, mode: Mode) -> Node {
     if let Some(tokens) = container_query::tokenize(content) {
         let nested = tokens.first().is_some_and(|first| match first.kind {
             Kind::Paren => true,
@@ -136,10 +182,15 @@ fn parse_content(content: &str, style: bool) -> Node {
             Kind::Other => false,
         });
         if nested {
-            return parse_query(&tokens, style).unwrap_or(Node::Unknown);
+            return parse_query(&tokens, mode).unwrap_or(Node::Unknown);
         }
     }
-    if style { Node::Style(content.into()) } else { Node::Size(content.into()) }
+    match mode {
+        Mode::Style => Node::Style(content.into()),
+        Mode::Scroll => Node::Scroll(content.into()),
+        Mode::Anchored => Node::Anchored(content.into()),
+        Mode::Size => Node::Size(content.into()),
+    }
 }
 
 struct Subject<'a> {
@@ -158,12 +209,12 @@ pub(super) fn style_query_truth(
     length: &dyn Fn() -> LengthContext,
     declared: &dyn Fn(&str, Option<&str>) -> Option<bool>,
 ) -> Option<bool> {
-    let node = parse_content(content, true);
+    let node = parse_content(content, Mode::Style);
     let subject = Subject { entry: None, custom, length, declared: Some(declared) };
     match eval(&node, &subject) {
         Truth::True => Some(true),
         Truth::False => Some(false),
-        Truth::Unknown => None,
+        Truth::Unknown | Truth::Unavailable => None,
     }
 }
 
@@ -176,7 +227,8 @@ fn eval(node: &Node, subject: &Subject<'_>) -> Truth {
                 match eval(node, subject) {
                     Truth::False => return Truth::False,
                     Truth::Unknown => result = Truth::Unknown,
-                    Truth::True => {}
+                    Truth::Unavailable if result != Truth::Unknown => result = Truth::Unavailable,
+                    Truth::Unavailable | Truth::True => {}
                 }
             }
             result
@@ -187,13 +239,16 @@ fn eval(node: &Node, subject: &Subject<'_>) -> Truth {
                 match eval(node, subject) {
                     Truth::Unknown => return Truth::Unknown,
                     Truth::True => result = Truth::True,
-                    Truth::False => {}
+                    Truth::Unavailable if result == Truth::False => result = Truth::Unavailable,
+                    Truth::Unavailable | Truth::False => {}
                 }
             }
             result
         }
         Node::Size(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_size(content, entry)),
         Node::Style(content) => eval_style(content, subject),
+        Node::Scroll(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_scroll(content, entry)),
+        Node::Anchored(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_anchored(content, entry)),
         Node::Unknown => Truth::Unknown,
     }
 }
@@ -206,6 +261,12 @@ enum Feature {
     Block,
     Aspect,
     Orientation,
+}
+
+impl Feature {
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
 }
 
 fn feature(name: &str) -> Option<Feature> {
@@ -237,6 +298,118 @@ fn actual(feature: Feature, entry: &Entry) -> Option<f64> {
             let (width, height) = (width?, height?);
             size.then_some(if height >= width { 1.0 } else { 0.0 })
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Sides {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl Sides {
+    const LEFT: Self = Self { left: true, right: false, top: false, bottom: false };
+    const RIGHT: Self = Self { left: false, right: true, top: false, bottom: false };
+    const TOP: Self = Self { left: false, right: false, top: true, bottom: false };
+    const BOTTOM: Self = Self { left: false, right: false, top: false, bottom: true };
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left || other.left,
+            right: self.right || other.right,
+            top: self.top || other.top,
+            bottom: self.bottom || other.bottom,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        (self.left && other.left) || (self.right && other.right) || (self.top && other.top) || (self.bottom && other.bottom)
+    }
+
+    fn any(self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+}
+
+fn inline_sides(entry: &Entry) -> (Sides, Sides) {
+    match (entry.writing_mode, entry.rtl) {
+        (WritingMode::HorizontalTb, false) => (Sides::LEFT, Sides::RIGHT),
+        (WritingMode::HorizontalTb, true) => (Sides::RIGHT, Sides::LEFT),
+        (WritingMode::SidewaysLr, false) => (Sides::BOTTOM, Sides::TOP),
+        (WritingMode::SidewaysLr, true) => (Sides::TOP, Sides::BOTTOM),
+        (_, false) => (Sides::TOP, Sides::BOTTOM),
+        (_, true) => (Sides::BOTTOM, Sides::TOP),
+    }
+}
+
+fn block_sides(entry: &Entry) -> (Sides, Sides) {
+    match entry.writing_mode {
+        WritingMode::HorizontalTb => (Sides::TOP, Sides::BOTTOM),
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => (Sides::RIGHT, Sides::LEFT),
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => (Sides::LEFT, Sides::RIGHT),
+    }
+}
+
+/// The physical sides a `scroll-state()` direction keyword names.
+fn direction_sides(entry: &Entry, keyword: &str) -> Option<Sides> {
+    let (inline_start, inline_end) = inline_sides(entry);
+    let (block_start, block_end) = block_sides(entry);
+    Some(match keyword {
+        "left" => Sides::LEFT,
+        "right" => Sides::RIGHT,
+        "top" => Sides::TOP,
+        "bottom" => Sides::BOTTOM,
+        "x" => Sides::LEFT.union(Sides::RIGHT),
+        "y" => Sides::TOP.union(Sides::BOTTOM),
+        "inline-start" => inline_start,
+        "inline-end" => inline_end,
+        "block-start" => block_start,
+        "block-end" => block_end,
+        "inline" => inline_start.union(inline_end),
+        "block" => block_start.union(block_end),
+        _ => return None,
+    })
+}
+
+fn eval_anchored(content: &str, entry: &Entry) -> Truth {
+    if !entry.anchored {
+        return Truth::Unknown;
+    }
+    match anchored_query::feature(content) {
+        Some(feature) => Truth::known(anchored_query::truth(&feature, entry.fallback.as_deref(), &entry.sides)),
+        None => Truth::Unknown,
+    }
+}
+
+fn eval_scroll(content: &str, entry: &Entry) -> Truth {
+    if !entry.scroll_state {
+        return Truth::Unknown;
+    }
+    let Some(content) = expand_vars(content, entry) else {
+        return Truth::Unknown;
+    };
+    let Some(parts) = container_query::pieces(&content) else {
+        return Truth::Unknown;
+    };
+    let (name, value) = match parts.as_slice() {
+        [Piece::Word(name)] => (name.to_ascii_lowercase(), None),
+        [Piece::Word(name), Piece::Colon, Piece::Word(value)] => (name.to_ascii_lowercase(), Some(value.to_ascii_lowercase())),
+        _ => return Truth::Unknown,
+    };
+    match (name.as_str(), value.as_deref()) {
+        ("scrollable", None) => Truth::known(entry.scrollable.any()),
+        ("scrollable", Some("none")) => Truth::known(!entry.scrollable.any()),
+        ("scrollable", Some(keyword)) => direction_sides(entry, keyword).map_or(Truth::Unknown, |sides| Truth::known(entry.scrollable.intersects(sides))),
+        ("scrolled", None) | ("stuck", None) | ("snapped", None) => Truth::False,
+        ("scrolled", Some("none")) | ("stuck", Some("none")) | ("snapped", Some("none")) => Truth::True,
+        ("scrolled", Some(keyword)) => direction_sides(entry, keyword).map_or(Truth::Unknown, |_| Truth::False),
+        ("stuck", Some(keyword)) if !matches!(keyword, "x" | "y" | "inline" | "block") => {
+            direction_sides(entry, keyword).map_or(Truth::Unknown, |_| Truth::False)
+        }
+        ("snapped", Some("x" | "y" | "block" | "inline" | "both")) => Truth::False,
+        _ => Truth::Unknown,
     }
 }
 
@@ -292,7 +465,19 @@ fn expected(feature: Feature, raw: &str, entry: &Entry) -> Option<f64> {
     }
 }
 
+/// `content` with its `var()` references substituted from the container; `None` when one is invalid.
+fn expand_vars<'a>(content: &'a str, entry: &Entry) -> Option<alloc::borrow::Cow<'a, str>> {
+    if !content.contains("var(") {
+        return Some(alloc::borrow::Cow::Borrowed(content));
+    }
+    var_template::expand_variables_in(content, entry.custom.names(), MAX_EXPANDED).map(alloc::borrow::Cow::Owned)
+}
+
 fn eval_size(content: &str, entry: &Entry) -> Truth {
+    let Some(content) = expand_vars(content, entry) else {
+        return Truth::Unknown;
+    };
+    let content = &*content;
     let Some(parts) = container_query::pieces(content) else {
         return Truth::Unknown;
     };
@@ -312,7 +497,7 @@ fn size_boolean(name: &str, entry: &Entry) -> Truth {
         return Truth::Unknown;
     };
     match actual(kind, entry) {
-        None => Truth::Unknown,
+        None => Truth::Unavailable,
         Some(_) if kind == Feature::Orientation => Truth::True,
         Some(value) => Truth::known(value != 0.0),
     }
@@ -350,9 +535,12 @@ fn size_plain(name: &str, rest: &[Piece], entry: &Entry) -> Truth {
         } else {
             return Truth::Unknown;
         };
-        return actual(kind, entry).map_or(Truth::Unknown, |current| Truth::known((current == 1.0) == portrait));
+        return actual(kind, entry).map_or(Truth::Unavailable, |current| Truth::known((current == 1.0) == portrait));
     }
-    let (Some(current), Some(wanted)) = (actual(kind, entry), expected(kind, &value, entry)) else {
+    let Some(current) = actual(kind, entry) else {
+        return Truth::Unavailable;
+    };
+    let Some(wanted) = expected(kind, &value, entry) else {
         return Truth::Unknown;
     };
     compare(current, operator, wanted, kind != Feature::Aspect).map_or(Truth::Unknown, Truth::known)
@@ -391,7 +579,7 @@ fn size_range(operands: &[&String], operators: &[&&str], entry: &Entry) -> Truth
         return Truth::Unknown;
     }
     let Some(current) = actual(kind, entry) else {
-        return Truth::Unknown;
+        return Truth::Unavailable;
     };
     let lengths = kind != Feature::Aspect;
     let mut result = true;
@@ -453,6 +641,17 @@ fn scan_top_level(text: &str) -> Operators {
     found
 }
 
+fn strip_important(value: &str) -> &str {
+    let Some(bang) = value.rfind('!') else {
+        return value;
+    };
+    if value[bang + 1..].trim().eq_ignore_ascii_case("important") {
+        value[..bang].trim_end()
+    } else {
+        value
+    }
+}
+
 fn custom_name(text: &str) -> bool {
     text.len() > 2 && text.starts_with("--") && !text.contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '+' | '*' | '/' | '<' | '>' | '='))
 }
@@ -466,9 +665,15 @@ fn eval_style(content: &str, subject: &Subject<'_>) -> Truth {
         if !custom_name(name) {
             return Truth::Unknown;
         }
-        let wanted = text[colon + 1..].trim();
+        let wanted = strip_important(text[colon + 1..].trim());
+        if super::top_level_split(wanted, b';', usize::MAX).is_none_or(|parts| parts.len() > 1) {
+            return Truth::Unknown;
+        }
         let Some(wanted) = var_template::expand_variables_in(wanted, subject.custom, MAX_EXPANDED) else {
-            return Truth::False;
+            return match subject.declared {
+                Some(declared) => declared(name, None).map_or(Truth::Unknown, |present| Truth::known(!present)),
+                None => Truth::known(subject.custom.value(name).is_none()),
+            };
         };
         if let Some(declared) = subject.declared {
             return declared(name, Some(&wanted)).map_or(Truth::Unknown, Truth::known);
@@ -490,6 +695,65 @@ fn eval_style(content: &str, subject: &Subject<'_>) -> Truth {
     style_range(text, &found.spans, subject)
 }
 
+/// Whether `raw` is a single custom property, keyword, function or numeric term, so that a
+/// failure to evaluate it makes the comparison false rather than unknown.
+fn style_operand_syntax(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if custom_name(raw) || typed_numeric::parse_numeric_expression(raw).is_some() {
+        return true;
+    }
+    container_query::tokenize(raw).is_some_and(|tokens| tokens.len() == 1 && matches!(tokens[0].kind, Kind::Ident | Kind::Function))
+}
+
+fn substitute_environment(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let boundary = index == 0 || !(bytes[index - 1].is_ascii_alphanumeric() || matches!(bytes[index - 1], b'-' | b'_'));
+        if boundary && bytes[index..].len() >= 4 && bytes[index..index + 4].eq_ignore_ascii_case(b"env(") {
+            if let Some(end) = safe_area_environment_end(bytes, index + 4) {
+                output.push_str(&text[copied..index]);
+                output.push_str("0px");
+                copied = end;
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+/// End offset (after the closing parenthesis) of a `safe-area-inset-*` environment
+/// variable reference whose name starts at `start`.
+fn safe_area_environment_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let skip = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let name_start = skip(start);
+    let mut name_end = name_start;
+    while name_end < bytes.len() && (bytes[name_end].is_ascii_alphanumeric() || matches!(bytes[name_end], b'-' | b'_')) {
+        name_end += 1;
+    }
+    let name = &bytes[name_start..name_end];
+    let known = ["top", "right", "bottom", "left"].iter().any(|side| {
+        name.len() == "safe-area-inset-".len() + side.len()
+            && name[.."safe-area-inset-".len()].eq_ignore_ascii_case(b"safe-area-inset-")
+            && name["safe-area-inset-".len()..].eq_ignore_ascii_case(side.as_bytes())
+    });
+    let close = skip(name_end);
+    (known && bytes.get(close) == Some(&b')')).then_some(close + 1)
+}
+
 fn style_operand(raw: &str, subject: &Subject<'_>) -> Option<(f64, typed_numeric::NumericType)> {
     let raw = raw.trim();
     let text: String = if custom_name(raw) {
@@ -497,6 +761,7 @@ fn style_operand(raw: &str, subject: &Subject<'_>) -> Option<(f64, typed_numeric
     } else {
         var_template::expand_variables_in(raw, subject.custom, MAX_EXPANDED)?
     };
+    let text = substitute_environment(&text);
     let expression = typed_numeric::parse_numeric_expression(text.trim())?;
     let kind = expression.numeric_type()?;
     let context = (subject.length)();
@@ -530,11 +795,19 @@ fn style_range(text: &str, spans: &[(usize, usize)], subject: &Subject<'_>) -> T
     }
     bounds.push(text.len());
     let mut operands = Vec::new();
+    let mut unevaluable = false;
     for pair in bounds.chunks_exact(2) {
-        let Some(operand) = style_operand(&text[pair[0]..pair[1]], subject) else {
+        let raw = &text[pair[0]..pair[1]];
+        if !style_operand_syntax(raw) {
             return Truth::Unknown;
-        };
-        operands.push(operand);
+        }
+        match style_operand(raw, subject) {
+            Some(operand) => operands.push(operand),
+            None => unevaluable = true,
+        }
+    }
+    if unevaluable {
+        return Truth::False;
     }
     let mut result = true;
     for (index, operator) in operators.iter().enumerate() {
@@ -545,7 +818,7 @@ fn style_range(text: &str, spans: &[(usize, usize)], subject: &Subject<'_>) -> T
             || (left_type == number && left == 0.0 && right_type == length)
             || (right_type == number && right == 0.0 && left_type == length);
         if !comparable {
-            return Truth::Unknown;
+            return Truth::False;
         }
         let Some(holds) = compare(left, operator, right, false) else {
             return Truth::Unknown;
@@ -596,12 +869,58 @@ pub struct Entry {
     length: LengthContext,
     units: ContainerUnitContext,
     custom: CustomRef,
+    parent_custom: CustomRef,
+    color: SourceColor,
+    scroll_state: bool,
+    anchored: bool,
+    fallback: Option<Arc<str>>,
+    sides: [usize; 4],
+    scrollable: Sides,
+    writing_mode: WritingMode,
+    rtl: bool,
 }
 
 impl Entry {
     fn accepts(&self, condition: &Parsed) -> bool {
         condition.name.as_ref().is_none_or(|name| self.names.iter().any(|candidate| candidate == name))
-            && (!condition.size || self.kind != ContainerType::Normal)
+            && (!condition.size || self.supports_features(condition.features))
+            && (!condition.scroll || self.scroll_state)
+            && (!condition.anchored || self.anchored)
+    }
+
+    /// Whether the container contains every axis the size features in `features` read.
+    fn supports_features(&self, features: u8) -> bool {
+        match self.kind {
+            ContainerType::Normal => false,
+            ContainerType::Size => true,
+            ContainerType::InlineSize => {
+                let physical_inline = if self.vertical { Feature::Height } else { Feature::Width };
+                features & !(Feature::Inline.bit() | physical_inline.bit()) == 0
+            }
+        }
+    }
+}
+
+/// A scroll container's offset and signed scroll limits, in CSS pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollGeometry {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ScrollGeometry {
+    fn scrollable(self) -> Sides {
+        const EPSILON: f32 = 0.5;
+        Sides {
+            left: self.x - self.min_x > EPSILON,
+            right: self.max_x - self.x > EPSILON,
+            top: self.y - self.min_y > EPSILON,
+            bottom: self.max_y - self.y > EPSILON,
+        }
     }
 }
 
@@ -621,6 +940,8 @@ pub fn build_oracle(
     document: &Document,
     style_of: &dyn Fn(NodeId) -> Option<Arc<Style>>,
     measured: &dyn Fn(NodeId) -> Option<ContainerUnitContext>,
+    scroll: &dyn Fn(NodeId) -> Option<ScrollGeometry>,
+    fallback: &dyn Fn(NodeId) -> Option<Arc<str>>,
     environment: MediaEnvironment,
     text: Option<&dyn TextShaper>,
 ) -> Oracle {
@@ -647,7 +968,7 @@ pub fn build_oracle(
         };
         let kind = style.container_type;
         let context = if kind == ContainerType::Normal || !style.can_hold_size_containment() { None } else { measured(node) };
-        if kind == ContainerType::Normal && names.is_empty() {
+        if kind == ContainerType::Normal && names.is_empty() && !style.container_flags.scroll_state && !style.container_flags.anchored {
             continue;
         }
         let vertical = style.writing_mode != WritingMode::HorizontalTb;
@@ -670,6 +991,17 @@ pub fn build_oracle(
             length: style_length_context(text, &style, environment, None),
             units: outer_units(document, node, measured, &style, environment),
             custom: CustomRef(style.custom.clone()),
+            parent_custom: CustomRef(
+                document.composed_parent(node).ok().flatten().and_then(style_of).and_then(|parent| parent.custom.clone()),
+            ),
+            color: style.current_color_source(),
+            scroll_state: style.container_flags.scroll_state,
+            anchored: style.container_flags.anchored,
+            fallback: if style.container_flags.anchored { fallback(node) } else { None },
+            sides: style.logical_sides(),
+            scrollable: if style.container_flags.scroll_state { scroll(node).map_or_else(Sides::default, ScrollGeometry::scrollable) } else { Sides::default() },
+            writing_mode: style.writing_mode,
+            rtl: style.direction == Direction::Rtl,
         });
     }
     Oracle(entries)
@@ -759,6 +1091,11 @@ impl StyleIndex {
         self.containers.present.load(Ordering::Relaxed)
     }
 
+    /// Whether `node` is a scroll-state query container in the installed oracle.
+    pub fn is_scroll_state_container(&self, node: NodeId) -> bool {
+        self.containers.oracle.borrow().0.get(&node.key()).is_some_and(|entry| entry.scroll_state)
+    }
+
     /// Changes whenever `replace_container_oracle` installed different containers.
     pub fn container_epoch(&self) -> u64 {
         self.containers.epoch.load(Ordering::Relaxed)
@@ -792,6 +1129,27 @@ impl StyleIndex {
         })
     }
 
+    /// Whether `prelude`, a `<container-condition>#` list, holds for `node` as if an
+    /// `@container` rule had styled it. `parent` is the node's composed parent style.
+    pub fn container_query_matches(
+        &self,
+        document: &Document,
+        node: NodeId,
+        prelude: &str,
+        parent: Option<&Style>,
+        text: Option<&dyn TextShaper>,
+    ) -> bool {
+        let Some(canonical) = container_query::serialize_prelude(prelude) else {
+            return false;
+        };
+        let conditions = parse_conditions(&alloc::format!("{MARKER}{canonical}"));
+        let oracle = self.containers.oracle.borrow();
+        let mut resolved: Vec<(Option<Arc<str>>, bool, Option<&Entry>)> = Vec::new();
+        conditions.iter().any(|condition| {
+            self.condition_matches(condition, &oracle, &mut resolved, document, node, false, parent, text)
+        })
+    }
+
     fn condition_matches<'o>(
         &self,
         condition: &Parsed,
@@ -809,7 +1167,18 @@ impl StyleIndex {
             };
             let environment = self.environment;
             let length = || style_length_context(text, parent, environment, None);
-            let subject = Subject { entry: None, custom: parent.custom_properties(), length: &length, declared: None };
+            let registrations = self.registered_snapshot();
+            let context = (length(), ContainerUnitContext::no_container(environment), parent.current_color_source());
+            let scope = if_function::IfScope {
+                names: parent.custom_properties(),
+                base: None,
+                registrations: &registrations,
+                context: &context,
+                environment,
+                current: None,
+            };
+            let declared = |name: &str, wanted: Option<&str>| scope.declared(name, wanted);
+            let subject = Subject { entry: None, custom: parent.custom_properties(), length: &length, declared: Some(&declared) };
             return eval(root, &subject) == Truth::True;
         }
         if oracle.0.is_empty() {
@@ -831,7 +1200,18 @@ impl StyleIndex {
             return true;
         };
         let length = || entry.length;
-        let subject = Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None };
+        let registrations = self.registered_snapshot();
+        let context = (entry.length, entry.units, entry.color.clone());
+        let scope = if_function::IfScope {
+            names: entry.custom.names(),
+            base: Some(entry.parent_custom.names()),
+            registrations: &registrations,
+            context: &context,
+            environment: self.environment,
+            current: None,
+        };
+        let declared = |name: &str, wanted: Option<&str>| scope.declared(name, wanted);
+        let subject = Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: Some(&declared) };
         eval(root, &subject) == Truth::True
     }
 
@@ -872,12 +1252,21 @@ mod tests {
             length: static_length_context(),
             units: ContainerUnitContext::no_container(static_length_context().viewport),
             custom: CustomRef(None),
+            parent_custom: CustomRef(None),
+            color: Style::initial().current_color_source(),
+            scroll_state: false,
+            anchored: false,
+            fallback: None,
+            sides: [0, 1, 2, 3],
+            scrollable: Sides::default(),
+            writing_mode: WritingMode::HorizontalTb,
+            rtl: false,
         }
     }
 
     fn truth(query: &str, entry: &Entry) -> Truth {
         let tokens = container_query::tokenize(query).unwrap();
-        let root = parse_query(&tokens, false).unwrap();
+        let root = parse_query(&tokens, Mode::Size).unwrap();
         let length = || entry.length;
         eval(&root, &Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None })
     }
@@ -900,8 +1289,28 @@ mod tests {
     fn inline_size_containers_leave_the_block_axis_unknown() {
         let inline = entry(ContainerType::InlineSize, false, 100.0, 0.0);
         assert_eq!(truth("(width: 100px)", &inline), Truth::True);
-        assert_eq!(truth("(height)", &inline), Truth::Unknown);
-        assert_eq!(truth("(not (height))", &inline), Truth::Unknown);
+        assert_eq!(truth("(height)", &inline), Truth::Unavailable);
+        assert_eq!(truth("(not (height))", &inline), Truth::Unavailable);
+    }
+
+    #[test]
+    fn scroll_state_features_follow_writing_mode() {
+        let mut container = entry(ContainerType::Normal, false, 0.0, 0.0);
+        container.scroll_state = true;
+        container.scrollable = Sides::RIGHT;
+        let scroll = |query: &str, entry: &Entry| {
+            let tokens = container_query::tokenize(query).unwrap();
+            let root = parse_query(&tokens, Mode::Size).unwrap();
+            let length = || entry.length;
+            eval(&root, &Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None })
+        };
+        assert_eq!(scroll("scroll-state(scrollable: right)", &container), Truth::True);
+        assert_eq!(scroll("scroll-state(scrollable: inline-end)", &container), Truth::True);
+        assert_eq!(scroll("scroll-state(scrollable: left)", &container), Truth::False);
+        assert_eq!(scroll("scroll-state(scrollable: auto)", &container), Truth::Unknown);
+        container.rtl = true;
+        assert_eq!(scroll("scroll-state(scrollable: inline-end)", &container), Truth::False);
+        assert_eq!(scroll("scroll-state(scrolled: none)", &container), Truth::True);
     }
 
     #[test]

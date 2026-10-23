@@ -40,15 +40,10 @@ fn position(tokens:&[&str],computed:Option<Computation<'_>>)->Option<String>{
     let mut output=Vec::new();output.try_reserve_exact(tokens.len()).ok()?;
     for token in tokens {output.push(match keyword(token).as_deref(){Some("left"|"right"|"top"|"bottom"|"center")=>keyword(token)?,_=>numeric_unit(token,"px",computed)?});}
     if output.len()==1 {if matches!(output[0].as_str(),"top"|"bottom"){output.insert(0,"center".into());}else{output.push("center".into());}}
-    if output.len()==3 {
-        // Three-value positions have one omitted edge offset. The canonical
-        // specified representation expands it to the four-value form.
-        if matches!(output[1].as_str(),"left"|"right"|"top"|"bottom"){output.insert(1,"0px".into());}
-        else{output.push("0px".into());}
-    }
+    if output.len()==3 {return None;}
     if output.len()==4&&matches!(output[0].as_str(),"top"|"bottom") {output.swap(0,2);output.swap(1,3);}
     // Keyword pairs are unordered but serialize horizontal then vertical.
-    if output.len()==2&&matches!(output[0].as_str(),"top"|"bottom")&&matches!(output[1].as_str(),"left"|"right"|"center"){output.swap(0,1);}
+    if output.len()==2&&(matches!(output[0].as_str(),"top"|"bottom")&&matches!(output[1].as_str(),"left"|"right"|"center")||output[0]=="center"&&matches!(output[1].as_str(),"left"|"right")){output.swap(0,1);}
     Some(output.join(" "))
 }
 fn method(method:InterpolationMethod)->String {
@@ -140,7 +135,7 @@ fn image(raw:&str,depth:u8,computed:Option<Computation<'_>>)->Option<String>{
     let name=keyword(name)?;let body=body.strip_suffix(')')?;
     if matches!(name.as_str(),"linear-gradient"|"repeating-linear-gradient"|"radial-gradient"|"repeating-radial-gradient"|"conic-gradient"|"repeating-conic-gradient"){return gradient(raw,&name,body,computed);}
     if name=="cross-fade" {
-        let mut items=Vec::new();let mut specified=0.0;let mut missing=0usize;
+        let mut items=Vec::new();
         for part in comma_components(body,16)? {
             let mut operand=None;let mut weight=None;let mut declared_weight=None;
             for token in components(part)? {
@@ -153,20 +148,18 @@ fn image(raw:&str,depth:u8,computed:Option<Computation<'_>>)->Option<String>{
                     declared_weight=Some(numeric(token,computed)?);
                     if let Some(computed)=computed {
                         let value=cross_fade_percentage(token,computed.context,computed.query)?;
-                        specified+=value;weight=Some(value);
+                        weight=Some(value);
                     }
                 }else{
                     if operand.is_some(){return None;}
                     operand=Some(if let Some(color)=color(token,computed){color}else{image(token,depth+1,computed)?});
                 }
             }
-            if declared_weight.is_none(){missing+=1;}
             items.push((operand?,weight,declared_weight));
         }
-        let omitted=if missing==0 {0.0}else{(1.0-specified).max(0.0)/missing as f64};
         let mut output=Vec::new();
         for (operand,weight,declared_weight) in items {
-            let percentage=if computed.is_some() {Some(typed_numeric::serialize_numeric_value(weight.unwrap_or(omitted)*100.0,typed_numeric::NumericUnit::Percent))}else{declared_weight};
+            let percentage=if computed.is_some() {weight.map(|weight|typed_numeric::serialize_numeric_value(weight*100.0,typed_numeric::NumericUnit::Percent))}else{declared_weight};
             output.push(if let Some(percentage)=percentage {alloc::format!("{operand} {percentage}")}else{operand});
         }
         return Some(alloc::format!("cross-fade({})",output.join(", ")));
@@ -231,6 +224,16 @@ fn image(raw:&str,depth:u8,computed:Option<Computation<'_>>)->Option<String>{
             }
             return Some(alloc::format!("image({})",output.join(", ")));
         }
+        let mut output=Vec::new();
+        for part in comma_components(body,8)? {
+            let mut item=Vec::new();
+            for token in components(part)? {
+                let plain=!["from","light-dark","color-mix","var("].iter().any(|word|token.contains(word))&&!decoded_css_keyword(token,"currentcolor");
+                item.push(if plain {color(token,None).unwrap_or_else(||token.to_owned())}else{token.to_owned()});
+            }
+            output.push(item.join(" "));
+        }
+        return Some(alloc::format!("image({})",output.join(", ")));
     }
     Some(raw.to_owned())
 }

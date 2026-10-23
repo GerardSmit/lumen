@@ -6,8 +6,9 @@ use crate::{ImageError, Rgba8Image, SvgViewportImages};
 use lumen_common::byte_lru::ByteLru;
 use lumen_html::layout::{ImageState, LazyImage, LazyImageHandle};
 use lumen_html::paint::ImageData;
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -88,8 +89,26 @@ impl EncodedImage {
     }
 
     pub fn into_handle(self) -> LazyImageHandle {
-        LazyImageHandle::new(Rc::new(self))
+        let image = Rc::new(self);
+        let address = Rc::as_ptr(&image) as usize;
+        LIVE.with(|live| live.borrow_mut().insert(address, Rc::downgrade(&image)));
+        LazyImageHandle::new(image)
     }
+
+    fn decode_with_embedded_profile(&self, display_p3: bool) -> Option<Rgba8Image> {
+        crate::profiled::decode_with_profile(self.bytes.as_ref().as_ref(), display_p3)
+    }
+}
+
+thread_local! {
+    static LIVE: RefCell<HashMap<usize, Weak<EncodedImage>>> = RefCell::new(HashMap::new());
+}
+
+/// The pixels of a lazily decoded image converted from its embedded ICC profile into sRGB or
+/// Display P3. `None` when the handle is not an encoded still image or carries no usable profile.
+pub fn embedded_profile_pixels(handle: &LazyImageHandle, display_p3: bool) -> Option<Rgba8Image> {
+    let image = LIVE.with(|live| live.borrow().get(&handle.id()).and_then(Weak::upgrade))?;
+    image.decode_with_embedded_profile(display_p3)
 }
 
 impl LazyImage for EncodedImage {
@@ -169,6 +188,12 @@ fn header_is_opaque(bytes: &[u8]) -> Option<bool> {
 
 impl Drop for EncodedImage {
     fn drop(&mut self) {
+        let address = self as *const Self as usize;
+        let _ = LIVE.try_with(|live| {
+            if let Ok(mut live) = live.try_borrow_mut() {
+                live.remove(&address);
+            }
+        });
         cache().remove(&self.id);
     }
 }

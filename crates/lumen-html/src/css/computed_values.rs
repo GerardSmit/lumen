@@ -31,6 +31,8 @@ pub struct ComputedValueContext<'a> {
     pub grid_row_names: Option<&'a [GridNamedLine]>,
     /// A grid container whose parent is not a grid container ignores `subgrid`.
     pub subgrid_ignored: bool,
+    /// Typed OM computed values keep a border width whose style paints nothing.
+    pub independent_border_widths: bool,
 }
 
 pub fn needs_layout(name: &str) -> bool {
@@ -60,6 +62,25 @@ pub fn needs_layout(name: &str) -> bool {
         || name.starts_with("padding")
         || name.starts_with("inset")
         || matches!(name, "top" | "right" | "bottom" | "left")
+}
+
+/// Matrix coefficients serialize with six significant digits.
+pub(crate) fn matrix_number(value: f32) -> String {
+    significant_digits_6(f64::from(value))
+}
+
+pub(crate) fn round_significant_6(value: f64) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    let exponent = libm::floor(libm::log10(value.abs())) as i32 - 5;
+    let scale = libm::pow(10.0, f64::from(exponent.abs()));
+    if exponent >= 0 { libm::round(value / scale) * scale } else { libm::round(value * scale) / scale }
+}
+
+pub(crate) fn significant_digits_6(value: f64) -> String {
+    let rounded = round_significant_6(value);
+    if rounded == 0.0 || !rounded.is_finite() { String::from("0") } else { alloc::format!("{rounded}") }
 }
 
 pub(crate) fn number(value: f32) -> String {
@@ -118,6 +139,10 @@ pub(crate) fn percentage(pixels: f32, percent: f32) -> String {
             number(pixels.abs())
         )
     }
+}
+/// A zero gradient center coordinate comes from `left`/`top` or `0%` far more often than `0px`.
+fn gradient_center(value: LengthPercentage) -> String {
+    if value.pixels == 0.0 && value.fraction == 0.0 { String::from("0%") } else { lp(value) }
 }
 pub(crate) fn lp(value: LengthPercentage) -> String {
     percentage(value.pixels, value.fraction * 100.0)
@@ -198,6 +223,13 @@ fn style_color(style:&Style,slot:usize,fallback:Rgba)->String {
     color(fallback)
 }
 
+/// Typed OM computed values keep an authored `currentcolor` keyword on every
+/// color property except `color` itself, where it inherits.
+fn explicit_current_color(style:&Style,slot:usize)->bool {
+    slot!=1 && style.source_color(slot).and_then(|source|source.expression)
+        .is_some_and(|expression|super::decoded_css_keyword(&expression.raw,"currentcolor"))
+}
+
 fn style_color_for_phase(style:&Style,slot:usize,fallback:Rgba,resolved:bool)->String {
     if resolved && style.source_color(slot).is_some() {
         let source=style.resolved_source_color(slot,fallback);
@@ -235,10 +267,20 @@ fn margin(style: &Style, used: &Style, edge: usize, context: ComputedValueContex
         px(used.margin_sides[edge])
     }
 }
+/// Padding cannot be negative: a bare negative percentage computes to zero.
+fn clamp_negative_percentage(value: String) -> String {
+    let inner = value.strip_prefix("calc(").and_then(|rest| rest.strip_suffix(')')).unwrap_or(&value).trim();
+    let number = inner.strip_suffix('%').unwrap_or("");
+    if number.starts_with('-') && number.parse::<f64>().is_ok() {
+        String::from("0%")
+    } else {
+        value
+    }
+}
 fn padding(style: &Style, used: &Style, edge: usize, context: ComputedValueContext<'_>) -> String {
     if context.percentage_basis.is_none() {
         if let Some(value) = relative(style, 43 + edge) {
-            return value;
+            return clamp_negative_percentage(value);
         }
     }
     px(used.padding_sides()[edge])
@@ -423,6 +465,9 @@ impl Style {
         // CSSOM resolved color special cases expose the used float color.
         // Computed/Typed OM serialization retains the inherited expression.
         let style_color=|style:&Style,slot:usize,fallback:Rgba| {
+            if context.independent_border_widths && explicit_current_color(style,slot) {
+                return String::from("currentcolor");
+            }
             style_color_for_phase(style,slot,fallback,context.resolved && matches!(slot,1|2|10|107..=110|119..=122|187))
         };
         let lowered = ascii_lower(name);
@@ -450,7 +495,27 @@ impl Style {
             .map(|(width, height)| self.resolve_percentages(width, height));
         let used = resolved.as_ref().unwrap_or(self);
         let physical = side(name).or_else(|| logical_side(self, name));
+        let border_widths = || if context.independent_border_widths { used.border_width_sides() } else { used.used_border_widths() };
         let result = match name {
+            "display" if self.display_ruby != 0 => match self.display_ruby {
+                1 if self.display == Display::Block => "block ruby",
+                1 => "ruby",
+                2 => "ruby-base",
+                3 => "ruby-text",
+                4 => "ruby-base-container",
+                6 | 7 => {
+                    let vertical = extra_props::keyword(self, "-webkit-box-orient") == Some("vertical");
+                    let clamped = vertical && (extra_props::keyword(self, "continue").is_some()
+                        || extra_props::keyword(self, "max-lines").is_some_and(|lines| lines.starts_with(|c: char| c.is_ascii_digit())));
+                    match (self.display_ruby == 6, clamped) {
+                        (true, true) => "flow-root",
+                        (true, false) => "-webkit-box",
+                        (false, true) => "inline-block",
+                        (false, false) => "-webkit-inline-box",
+                    }
+                }
+                _ => "ruby-text-container",
+            }.into(),
             "display" if self.is_list_item() => match self.display {
                 Display::Inline => "inline list-item",
                 Display::InlineBlock => "inline flow-root list-item",
@@ -609,7 +674,7 @@ impl Style {
                 self.outline.style.as_str(),
                 style_color(self,187,self.outline.color.unwrap_or(self.color)),
             ),
-            "border-width" => four(used.used_border_widths().map(px)),
+            "border-width" => four(border_widths().map(px)),
             "border-style" => four(self.border_styles().map(|value| value.as_str().into())),
             "border-color" => four(core::array::from_fn(|edge| {
                 style_color(self,119+edge,self.border_color_sides[edge].unwrap_or(self.border_color))
@@ -618,14 +683,14 @@ impl Style {
                 let edges = self.logical_sides();
                 let start = if name.starts_with("border-inline-") {0} else {2};
                 let component = |side: usize| {
-                    if name.ends_with("-width") {px(used.used_border_widths()[side])}
+                    if name.ends_with("-width") {px(border_widths()[side])}
                     else if name.ends_with("-style") {self.border_styles()[side].as_str().into()}
                     else {style_color(self,119+side,self.border_color_sides[side].unwrap_or(self.border_color))}
                 };
                 pair(component(edges[start]),component(edges[start+1]))
             }
             property if physical.is_some() && property.starts_with("border-") && property.ends_with("-width") => {
-                px(used.used_border_widths()[physical?])
+                px(border_widths()[physical?])
             }
             property if physical.is_some() && property.starts_with("border-") && property.ends_with("-style") => {
                 self.border_styles()[physical?].as_str().into()
@@ -664,7 +729,7 @@ impl Style {
                 overflow(self.overflow_y).into(),
             ),
             "font-size" => px(self.font_size),
-            "container-type" => self.container_type.as_str().into(),
+            "container-type" => self.container_type.serialize(self.container_flags),
             "font-family" => self.font.families.as_ref().map_or_else(
                 || "sans-serif".into(),
                 |value| serialize_font_families(value),
@@ -709,7 +774,9 @@ impl Style {
                 FlexDirection::ColumnReverse => "column-reverse",
             }
             .into(),
-            "flex-wrap" => if self.flex_wrap_reverse {
+            "flex-wrap" => if self.flex_wrap_balance {
+                if self.flex_wrap_reverse { "wrap-reverse balance" } else { "balance" }
+            } else if self.flex_wrap_reverse {
                 "wrap-reverse"
             } else if self.flex_wrap {
                 "wrap"
@@ -910,7 +977,9 @@ impl Style {
             }
             .into(),
             "text-indent" => alloc::format!("{}{}", lp(self.text_indent), super::text_indent::keywords(self.text_indent_mode)),
-            "letter-spacing" => self.letter_spacing.map_or_else(|| "normal".into(), px),
+            "letter-spacing" => self.letter_spacing
+                .filter(|value| *value != 0.0 || !(context.resolved || context.independent_border_widths))
+                .map_or_else(|| "normal".into(), px),
             "word-spacing" => lp(self.word_spacing),
             "vertical-align" => value_shorthands::computed_shorthand(self, "vertical-align"),
             "text-decoration" => {
@@ -1258,7 +1327,7 @@ fn gradient(value: &Gradient) -> Option<String> {
             }
             if center!=[LengthPercentage {pixels:0.0,fraction:0.5};2] {
                 if !result.ends_with('(') {append(&mut result," ")?;}
-                append(&mut result,&alloc::format!("at {} {}",lp(center[0]),lp(center[1])))?;
+                append(&mut result,&alloc::format!("at {} {}",gradient_center(center[0]),gradient_center(center[1])))?;
             }
         }
         GradientKind::Conic { from, center } => {
@@ -1266,7 +1335,7 @@ fn gradient(value: &Gradient) -> Option<String> {
             if from != 0.0 { append(&mut result, &alloc::format!("from {}deg", number(from)))?; }
             if center != [LengthPercentage {pixels: 0.0, fraction: 0.5}; 2] {
                 if from != 0.0 { append(&mut result, " ")?; }
-                append(&mut result, &alloc::format!("at {} {}", lp(center[0]), lp(center[1])))?;
+                append(&mut result, &alloc::format!("at {} {}", gradient_center(center[0]), gradient_center(center[1])))?;
             }
             if let Some(method)=gradient_method(value) {
                 if !result.ends_with('(') {append(&mut result," ")?;}append(&mut result,&method)?;
@@ -1439,7 +1508,7 @@ impl<'a> OrderedNames<'a> {
         }
     }
 }
-fn named_tracks(
+pub(super) fn named_tracks(
     tracks: &[GridTrack],
     names: &[GridNamedLine],
     used: Option<&[f32]>,
@@ -1556,6 +1625,12 @@ fn specified_track_tokens(tokens: &[&str]) -> Option<String> {
                 append(&mut result, ", ")?;
                 append(&mut result, &inner)?;
                 append(&mut result, ")")?;
+            }
+            None if token == "0" => append(&mut result, "0px")?,
+            None if math_function(token) => {
+                let simplified = typed_numeric::parse_numeric_expression(token)
+                    .and_then(|expression| expression.serialize_specified());
+                append(&mut result, simplified.as_deref().unwrap_or(token))?
             }
             None => append(&mut result, token)?,
         }
@@ -1821,6 +1896,16 @@ impl Style {
         if subgrid && subgrid_ignored {
             return Some("none".into());
         }
+        if used.is_none() {
+            let source = if horizontal {
+                &self.grid_columns_source
+            } else {
+                &self.grid_rows_source
+            };
+            if let Some(source) = source {
+                return Some(String::from(&**source));
+            }
+        }
         if subgrid {
             let mut result = String::from("subgrid");
             if let Some(used) = used {
@@ -1876,6 +1961,9 @@ impl Style {
             );
         }
         if let Some(repeated) = repeated {
+            if !self.grid_lanes && repeated.tracks.iter().any(|track| !grid_is_fixed_size(*track)) {
+                return Some("none".into());
+            }
             let prefix = named_tracks(&repeated.prefix_tracks, &repeated.prefix_names, None)?;
             let suffix = named_tracks(&repeated.suffix_tracks, &repeated.suffix_names, None)?;
             let mut result = String::new();
@@ -2181,7 +2269,7 @@ impl Style {
                 else {
                     return Some("none".into());
                 };
-                if !context.resolved || (reference.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = reference.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(matrix.a), number(matrix.b), number(matrix.c), number(matrix.d), number(matrix.e), number(matrix.f)) }
+                if !context.resolved || (reference.is_none() && values.iter().any(|value| matches!(value, Transform::Translate(x, y) if x.percent != 0.0 || y.percent != 0.0))) { list(values, 64, " ", |value| Some(match value { Transform::Matrix(v) => alloc::format!("matrix({}, {}, {}, {}, {}, {})", number(v.a), number(v.b), number(v.c), number(v.d), number(v.e), number(v.f)), Transform::Translate(x, y) => alloc::format!("translate({}, {})", percentage(x.pixels, x.percent), percentage(y.pixels, y.percent)), Transform::Scale(x, y) => alloc::format!("scale({}, {})", number(*x), number(*y)), Transform::Rotate(value) => alloc::format!("rotate({}deg)", number(*value * 180.0 / core::f32::consts::PI)), Transform::Skew(x, y) => alloc::format!("skew({}deg, {}deg)", number(*x * 180.0 / core::f32::consts::PI), number(*y * 180.0 / core::f32::consts::PI)) }))? } else { let rect = reference.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }); let matrix = values.iter().fold(Affine::IDENTITY, |matrix, value| matrix.then(value.matrix(rect.width, rect.height))); alloc::format!("matrix({}, {}, {}, {}, {}, {})", matrix_number(matrix.a), matrix_number(matrix.b), matrix_number(matrix.c), matrix_number(matrix.d), matrix_number(matrix.e), matrix_number(matrix.f)) }
             }
             _ => return None,
         })
@@ -2238,24 +2326,28 @@ impl Style {
                 .as_deref()
                 .and_then(|values| (!values.is_empty()).then(|| values[index % values.len()]))
                 .unwrap_or(BackgroundAttachment::Scroll);
+            let position = if self.background_position.as_deref().is_none_or(|values| values.is_empty()) {
+                String::from("0% 0%")
+            } else {
+                alloc::format!("{} {}", lp(position[0]), lp(position[1]))
+            };
+            if index + 1 == images.len() {
+                append(&mut output, &style_color_for_phase(self,2,self.background,resolved))?;
+                append(&mut output, " ")?;
+            }
             append(
                 &mut output,
                 &alloc::format!(
-                    "{} {} {} / {} {} {} {} {}",
+                    "{} {} {} {} / {} {} {}",
                     image(value, 0)?,
-                    lp(position[0]),
-                    lp(position[1]),
-                    background_size(&size),
                     declaration_block::serialize_background_repeat_pair(repeat),
                     attachment(attach),
+                    position,
+                    background_size(&size),
                     background_box(origin),
                     background_box(clip)
                 ),
             )?;
-            if index + 1 == images.len() {
-                append(&mut output, " ")?;
-                append(&mut output, &style_color_for_phase(self,2,self.background,resolved))?;
-            }
         }
         Some(output)
     }
@@ -2332,7 +2424,7 @@ mod tests {
             .computed_css_value("border", ComputedValueContext::default())
             .is_none());
         assert_eq!(value(&style, "column-rule-style"), "hidden");
-        assert_eq!(value(&style, "column-rule-width"), "0px");
+        assert_eq!(value(&style, "column-rule-width"), "5px");
         assert_eq!(style.used_border_widths(), [5.0, 2.0, 5.0, 0.0]);
     }
 

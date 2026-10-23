@@ -1022,58 +1022,44 @@ impl DomRealm {
     }
 
     pub fn focus_next(self: &Rc<Self>, ctx: &mut Ctx, backwards: bool) -> OpResult<()> {
+        use super::fragment::SequentialPoint;
         let order=super::focus::sequential_order(self)?;
         if order.is_empty() {
             super::fragment::clear_sequential_focus_start(self);
             return self.focus(ctx, None);
         }
+        let len=order.len();
         let focused=super::focus::currently_focused(self);
-        let starting=self.sequential_focus_start().filter(|start| {
-            let session=self.session.borrow();
-            let document=session.document();
-            document.is_connected_element(*start) && focused.is_none_or(|focused|
-                document.is_host_including_inclusive_ancestor(focused,*start).unwrap_or(false))
-        });
-        if let Some(start)=starting.filter(|start|!order.iter().any(|(_,node)|node==start)) {
-            // A fragment target omitted from the tabindex order (including an
-            // unfocusable target) uses the standard's DOM selection mechanism.
-            // Search shadow-including tree order, not the positive-tabindex sort.
-            let mut suitable=HashSet::new();
-            suitable.try_reserve(order.len()).map_err(|_|OpError::new("QuotaExceededError","focus candidate allocation"))?;
-            suitable.extend(order.iter().map(|(_,node)|*node));
-            let candidate={
+        let point=super::fragment::sequential_point(self).filter(|point| match (point,focused) {
+            (_,None) => true,
+            (SequentialPoint::Node(start),Some(focused)) => {
                 let session=self.session.borrow();
-                let document=session.document();
-                let root=document.root();
-                let mut cursor=Some(root);
-                let mut after=false;
-                let mut candidate=None;
-                while let Some(node)=cursor {
-                    if node==start {
-                        if backwards { break; }
-                        after=true;
-                    } else if suitable.contains(&node) {
-                        if backwards { candidate=Some(node); }
-                        else if after { candidate=Some(node);break; }
-                    }
-                    cursor=selector::next_shadow_including_descendant(document,root,node).map_err(dom_error)?;
+                session.document().is_host_including_inclusive_ancestor(focused,*start).unwrap_or(false)
+            }
+            _ => false,
+        });
+        let point=point.or(focused.map(SequentialPoint::Node));
+        let exact=match point {
+            Some(SequentialPoint::Node(node)) => order.iter().position(|(_,candidate)|*candidate==node),
+            _ => None,
+        };
+        let index=if let Some(current)=exact {
+            if backwards { (current+len-1)%len } else { (current+1)%len }
+        } else if let Some(point)=point {
+            let inserted=super::focus::placement_index(self,&order,point);
+            let mut target=if backwards { (inserted+len-1)%len } else { inserted%len };
+            let excluded=focused.filter(|focused|point!=SequentialPoint::Node(*focused));
+            if let Some(excluded)=excluded {
+                for _ in 0..len {
+                    if order[target].1!=excluded { break; }
+                    target=if backwards { (target+len-1)%len } else { (target+1)%len };
                 }
-                candidate
-            };
-            if let Some(candidate)=candidate { return super::focus::focus_in_realm(ctx,self,candidate); }
-            super::fragment::clear_sequential_focus_start(self);
-            // This host has no browser controls: use the permitted kiosk
-            // restart at the traversable when the DOM search reaches an edge.
-        }
-        let current = order
-            .iter()
-            .position(|(_, node)| Some(*node) == starting.or(focused));
-        let index = if backwards {
-            current.map_or(order.len() - 1, |index| {
-                (index + order.len() - 1) % order.len()
-            })
+            }
+            target
+        } else if backwards {
+            len-1
         } else {
-            current.map_or(0, |index| (index + 1) % order.len())
+            0
         };
         super::focus::focus_in_realm(ctx,&order[index].0,order[index].1)
     }

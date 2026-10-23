@@ -187,7 +187,10 @@ impl<'a> Writer<'a> {
             self.sink.u32(index);
             return Ok(());
         }
-        if clone_transfer::native_codec(ctx, value).is_some() {
+        if clone_transfer::native_codec(ctx, value).is_some()
+            && clone_transfer::native_graph_value_codec(ctx, value).is_none()
+            && clone_transfer::native_value_codec(ctx, value).is_none()
+        {
             return Err(clone_error("Native transferable requires its transfer-list entry"));
         }
         if let Some(codec) = clone_transfer::native_graph_value_codec(ctx, value) {
