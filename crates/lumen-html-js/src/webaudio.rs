@@ -616,6 +616,7 @@ fn active_realm(ctx: &mut Ctx) -> OpResult<Rc<DomRealm>> {
 }
 
 fn snapshot_audio_buffer(ctx: &Ctx, data: &AudioBufferData) -> OpResult<Arc<BufferSnapshot>> {
+    let _audio = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::AUDIO);
     let channels = data
         .channels
         .iter()

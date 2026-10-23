@@ -456,6 +456,7 @@ impl Drain {
             self.cancel(ctx,reason);
             false
         } else {
+            let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
             self.bytes.borrow_mut().extend_from_slice(chunk);
             true
         }

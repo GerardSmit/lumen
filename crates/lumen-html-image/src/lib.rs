@@ -4809,6 +4809,7 @@ fn decode_raster_image_bounded(
     apply_orientation: bool,
     max_bytes: usize,
 ) -> Result<Rgba8Image, ImageError> {
+    let _image = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::IMAGE);
     let mut decoder = raster_reader(bytes, max_bytes)?
         .into_decoder()
         .map_err(|_| ImageError::Png("raster image decoder unavailable"))?;

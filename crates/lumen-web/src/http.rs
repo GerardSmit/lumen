@@ -70,6 +70,7 @@ impl OpenHttpBody {
     }
 
     pub fn read_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
         let result = if self.cancellation.is_cancelled() {
             Err(std::io::ErrorKind::Interrupted.into())
         } else {
@@ -335,6 +336,7 @@ fn request_sync_with_timeout_on_cancellable(
 }
 
 fn collect_response(mut response: OpenHttpResponse) -> Result<HttpResponse, String> {
+    let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
     let mut body = Vec::new();
     while let Some(chunk) = response
         .body

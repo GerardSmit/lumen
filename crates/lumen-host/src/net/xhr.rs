@@ -505,6 +505,7 @@ fn append_chunk(
     computable: bool,
 ) -> bool {
     {
+        let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
         let mut state = core.s.borrow_mut();
         state.body.extend_from_slice(&chunk);
         state.text = None;

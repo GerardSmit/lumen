@@ -110,6 +110,7 @@ impl LazyImage for EncodedImage {
     }
 
     fn pixels(&self) -> Option<Arc<ImageData>> {
+        let _image = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::IMAGE);
         if let Some(hit) = cache().get(&self.id) {
             HITS.fetch_add(1, Ordering::Relaxed);
             return Some(hit);

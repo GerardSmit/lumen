@@ -730,6 +730,7 @@ pub(crate) fn request(
     headers: &[(String, String)],
     network: &mut Network<'_>,
 ) -> Result<OpenHttpResponse, String> {
+    let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
     let cache = settings.cache;
     let key_url = cache_url(url);
     if !method.eq_ignore_ascii_case("GET") {
@@ -840,6 +841,7 @@ pub(crate) fn revalidate(
     headers: &[(String, String)],
     network: &mut Network<'_>,
 ) -> Result<CacheValidation, String> {
+    let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
     let cache = settings.cache;
     let key_url = cache_url(url);
     let entry = cache.lookup(&key_url, headers);

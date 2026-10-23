@@ -106,6 +106,7 @@ thread_local! {
 /// one. A buffer enters the pool only when the last reference to its snapshot is dropped, so a
 /// live reader never sees it rewritten.
 pub fn pooled_copy(source: &Pixmap) -> Pixmap {
+    let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
     let len = source.data().len();
     let recycled = SNAPSHOT_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -159,6 +160,7 @@ impl PremultipliedImage {
     pub fn straight(&self) -> Arc<Rgba8Image> {
         self.straight
             .get_or_init(|| {
+                let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
                 let pixmap = self.pixmap();
                 let mut pixels = Vec::with_capacity(pixmap.data().len());
                 for pixel in pixmap.pixels() {

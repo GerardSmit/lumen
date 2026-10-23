@@ -263,6 +263,7 @@ fn sync_http_desktop_with_metadata(
     cancellation:Option<&lumen_os::net::TcpCancellation>,
     mut response_redirects:Option<&mut u32>,
 ) -> Result<lumen_common::http_body::SyncHttpResponse, http::SyncRequestError> {
+    let _network = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::NETWORK);
     use lumen_common::cors::{Credentials, FetchPolicy, Mode, Redirect, ResponseType};
     use std::time::{Duration, Instant};
 

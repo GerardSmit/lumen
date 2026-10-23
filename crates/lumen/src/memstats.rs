@@ -65,13 +65,28 @@ pub enum Cat {
     Runtime = 9,
     /// Stack traces: line tables, position data, rendered stacks.
     StackTrace = 10,
-    /// JIT: native code metadata.
+    /// JIT: compile scratch (IR, register allocation) and the metadata kept with native code; the
+    /// machine code itself is mapped outside the allocator and is not counted.
     Jit = 11,
     /// Native HTML DOM, style, layout, text, display-list and image-render allocations.
     Html = lumen_common::memcat::HTML_CATEGORY_ID,
+    /// ArrayBuffer, typed-array, Blob and other JS byte-store backing bytes.
+    Buffers = lumen_common::memcat::BUFFERS_CATEGORY_ID,
+    /// HTTP/XHR/fetch response bodies and the HTTP cache's reads.
+    Network = lumen_common::memcat::NETWORK_CATEGORY_ID,
+    /// Decoded image pixels and the decode cache.
+    Image = lumen_common::memcat::IMAGE_CATEGORY_ID,
+    /// Decoded audio buffers.
+    Audio = lumen_common::memcat::AUDIO_CATEGORY_ID,
+    /// Canvas surfaces and 2D-context buffers.
+    Canvas = lumen_common::memcat::CANVAS_CATEGORY_ID,
+    /// JS string allocations (while no more specific phase is current).
+    Strings = lumen_common::memcat::STRINGS_CATEGORY_ID,
+    /// The embedding host's own structures.
+    Host = lumen_common::memcat::HOST_CATEGORY_ID,
 }
 
-pub const CAT_NAMES: [&str; 13] = [
+pub const CAT_NAMES: [&str; 20] = [
     "other (host/std)",
     "over-aligned blocks / object slab chunks",
     "parse: source + AST",
@@ -83,8 +98,15 @@ pub const CAT_NAMES: [&str; 13] = [
     "extension glue init",
     "program run",
     "stack traces",
-    "JIT metadata",
+    "JIT compile + metadata",
     "HTML DOM and rendering",
+    "ArrayBuffer/typed-array/Blob bytes",
+    "network bodies + HTTP cache",
+    "image decode + cache",
+    "audio decode",
+    "canvas surfaces",
+    "JS strings",
+    "host glue (embedder)",
 ];
 
 /// The current thread's allocation category (see [`Cat`]).
@@ -102,6 +124,13 @@ pub type CatGuard = lumen_common::memcat::Guard;
 #[inline(always)]
 pub fn enter(cat: Cat) -> CatGuard {
     lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::from_id(cat as u8))
+}
+
+/// Like [`enter`], but only while the current category is `Other` or `Runtime`; inside any
+/// more specific phase (parsing, compiling, HTML, …) the allocation stays with that phase.
+#[inline(always)]
+pub fn enter_refining(cat: Cat) -> CatGuard {
+    lumen_common::memcat::enter_if_generic(lumen_common::memcat::CategoryTag::from_id(cat as u8))
 }
 
 /// Live bytes by category and block-size bucket (feature `mem-stats`; zeros without it).

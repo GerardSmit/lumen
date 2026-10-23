@@ -240,6 +240,7 @@ impl LStr {
         debug_assert!(content.len() <= cap as usize);
         debug_assert!(cap & !CAP_MASK == 0, "capacity claims a flag bit");
         unsafe {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Strings);
             let p = alloc(layout(cap)) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
             // The hint holds for `content`; constructors that append more bytes afterwards
@@ -268,6 +269,7 @@ impl LStr {
         let cap = size_hint.saturating_add(1);
         assert!(cap <= CAP_MASK as usize, "string too large");
         let mut s = unsafe {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Strings);
             let p = std::alloc::alloc_zeroed(layout(cap as u32)) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
             p.as_ptr().write(Header {
@@ -480,6 +482,7 @@ impl LStr {
             spare |= CONS_ASCII;
         }
         unsafe {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Strings);
             let p = alloc(Layout::new::<ConsHdr>()) as *mut ConsHdr;
             let p = NonNull::new(p).expect("allocation failed");
             bump(&a.hdr().strong);
@@ -611,6 +614,7 @@ impl LStr {
         bump(&rh.strong);
         rh.cap.set(rh.cap.get() | ROOT);
         unsafe {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Strings);
             let v = alloc(Layout::new::<ViewHdr>()) as *mut ViewHdr;
             let v = NonNull::new(v).expect("allocation failed");
             let slot = with_roots(|r| {

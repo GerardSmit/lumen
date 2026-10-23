@@ -779,6 +779,7 @@ impl CanvasData {
     }
 
     fn snapshot(&mut self) -> Rgba8Image {
+        let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
         let mut image = match &self.bitmap_output {
             Some(image) => image.clone(),
             None => self.surface.snapshot(),

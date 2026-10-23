@@ -951,6 +951,7 @@ fn compile(
     this_val: &Value,
 ) -> Result<Native, String> {
     let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Jit);
     dump_ops(chunk);
     if stats_enabled() {
         eprintln!(
@@ -985,6 +986,7 @@ fn compile_fn(
     this_val: &Value,
 ) -> Result<Native, String> {
     let _phase = crate::cpuprof::phase(crate::cpuprof::Phase::JitCompile);
+    let _mem = crate::memstats::enter(crate::memstats::Cat::Jit);
     dump_ops(chunk);
     if stats_enabled() {
         eprintln!("[jit-stats] fn of {} ops", chunk.ops.len());

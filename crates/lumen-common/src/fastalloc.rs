@@ -355,6 +355,37 @@ pub fn counters() -> (usize, usize, usize, usize) {
     )
 }
 
+/// Set once `ClassAlloc` has served a request, so [`retag`] never reads a category header from a
+/// block some other allocator owns.
+#[cfg(feature = "mem-stats")]
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// Re-attribute the live block at `ptr` (`size` bytes as allocated, `align` as allocated) to
+/// category `cat`. Ignored for empty and over-aligned blocks.
+#[cfg(feature = "mem-stats")]
+pub fn retag(ptr: *const u8, size: usize, align: usize, cat: u8) {
+    if size == 0 || align > STEP || !SERVING.load(Relaxed) {
+        return;
+    }
+    unsafe {
+        let header = (ptr as *mut u8).sub(STEP) as *mut usize;
+        let old = *header as u8;
+        if old == cat {
+            return;
+        }
+        *header = cat as usize;
+        let overhead = class_alloc_overhead(size) as isize;
+        stats::cat_add(old, -(size as isize));
+        stats::cat_add(cat, size as isize);
+        stats::cat_allocation_add(old, -1);
+        stats::cat_allocation_add(cat, 1);
+        stats::cat_overhead_add(old, -overhead);
+        stats::cat_overhead_add(cat, overhead);
+        stats::size_add(old, size, -(size as isize));
+        stats::size_add(cat, size, size as isize);
+    }
+}
+
 /// The category the object slab's chunks are counted under (`memstats::Cat::Slab`).
 #[cfg(feature = "mem-stats")]
 const CAT_SLAB: u8 = 1;
@@ -784,6 +815,9 @@ unsafe impl GlobalAlloc for ClassAlloc {
         let p = self.raw_alloc(inner);
         if p.is_null() {
             return p;
+        }
+        if !SERVING.load(Relaxed) {
+            SERVING.store(true, Relaxed);
         }
         stats::alloc(layout.size());
         *(p as *mut usize) = cat as usize;

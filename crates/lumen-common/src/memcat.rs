@@ -8,6 +8,24 @@ use std::cell::Cell;
 /// Keep this id in the common allocator-tag layer so host crates that do not depend on the
 /// Lumen engine can attribute their Rust-side allocations to the same category.
 pub const HTML_CATEGORY_ID: u8 = 12;
+/// ArrayBuffer, typed-array, Blob and other JS byte-store backing bytes.
+pub const BUFFERS_CATEGORY_ID: u8 = 13;
+/// HTTP/XHR/fetch bodies and the HTTP cache's reads.
+pub const NETWORK_CATEGORY_ID: u8 = 14;
+/// Decoded image pixels and the decode cache.
+pub const IMAGE_CATEGORY_ID: u8 = 15;
+/// Decoded audio buffers.
+pub const AUDIO_CATEGORY_ID: u8 = 16;
+/// Canvas surfaces and 2D-context buffers.
+pub const CANVAS_CATEGORY_ID: u8 = 17;
+/// JS string allocations.
+pub const STRINGS_CATEGORY_ID: u8 = 18;
+/// The embedding host's own structures.
+pub const HOST_CATEGORY_ID: u8 = 19;
+/// Ids a more specific category may replace: nothing more specific than "other" and the
+/// engine's `Runtime` phase.
+#[cfg(feature = "mem-stats")]
+const GENERIC_IDS: [u8; 2] = [0, 9];
 
 /// A typed allocator category tag. The numeric id remains shared with the engine's report
 /// categories, while callers cannot accidentally pass an unrelated integer to [`enter`].
@@ -16,6 +34,13 @@ pub struct CategoryTag(u8);
 
 impl CategoryTag {
     pub const HTML: Self = Self(HTML_CATEGORY_ID);
+    pub const BUFFERS: Self = Self(BUFFERS_CATEGORY_ID);
+    pub const NETWORK: Self = Self(NETWORK_CATEGORY_ID);
+    pub const IMAGE: Self = Self(IMAGE_CATEGORY_ID);
+    pub const AUDIO: Self = Self(AUDIO_CATEGORY_ID);
+    pub const CANVAS: Self = Self(CANVAS_CATEGORY_ID);
+    pub const STRINGS: Self = Self(STRINGS_CATEGORY_ID);
+    pub const HOST: Self = Self(HOST_CATEGORY_ID);
 
     pub const fn from_id(id: u8) -> Self {
         Self(id)
@@ -52,6 +77,44 @@ pub fn enter(category: CategoryTag) -> Guard {
         let _ = category;
         Guard {}
     }
+}
+
+/// Like [`enter`], but only while the current category is generic (`Other` or the engine's
+/// `Runtime` phase): a string made while parsing stays under the parser's category.
+#[inline(always)]
+pub fn enter_if_generic(category: CategoryTag) -> Guard {
+    #[cfg(feature = "mem-stats")]
+    {
+        let current = current();
+        Guard {
+            previous: if GENERIC_IDS.contains(&current) {
+                replace(category.0)
+            } else {
+                current
+            },
+        }
+    }
+    #[cfg(not(feature = "mem-stats"))]
+    {
+        let _ = category;
+        Guard {}
+    }
+}
+
+/// Move the live block behind `v` to `category` without copying, for bytes that were allocated
+/// before their purpose was known (a body read off the network that becomes an ArrayBuffer).
+/// Nothing happens without `mem-stats`.
+#[inline(always)]
+pub fn retag_vec<T>(v: &Vec<T>, category: CategoryTag) {
+    #[cfg(feature = "mem-stats")]
+    crate::fastalloc::retag(
+        v.as_ptr() as *const u8,
+        v.capacity() * std::mem::size_of::<T>(),
+        std::mem::align_of::<T>(),
+        category.0,
+    );
+    #[cfg(not(feature = "mem-stats"))]
+    let _ = (v, category);
 }
 
 thread_local! {

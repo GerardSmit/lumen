@@ -1089,6 +1089,7 @@ impl CanvasSurface {
     }
 
     fn materialize(&mut self) -> Result<(), ImageError> {
+        let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
         if self.lazy {
             let alias = self.alias.take();
             if let Some(record::CanvasSource::Premultiplied(image)) = &alias {
@@ -1143,6 +1144,7 @@ impl CanvasSurface {
     /// Isolate drawing in a bounded transparent bitmap. Open layers never
     /// become visible through the canvas's published bitmap.
     pub fn begin_layer(&mut self) -> Result<(), ImageError> {
+        let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
         let bytes = pixel_bytes(self.width, self.height)?;
         if self.layers.len() >= 64 || bytes.checked_mul(self.layers.len() + 2)
             .is_none_or(|bytes| bytes > MAX_IMAGE_BYTES) {
@@ -2220,6 +2222,7 @@ impl CanvasSurface {
 
     /// Snapshot in the straight-alpha format used by ImageData and HTML images.
     pub fn snapshot(&mut self) -> Rgba8Image {
+        let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
         self.flush();
         let mut pixels = Vec::new();
         let published = self.layers.first().map_or(&self.bitmap, |layer| &layer.bitmap);
@@ -2639,6 +2642,7 @@ fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
 }
 
 fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
+    let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
     if image.pixels.len() != pixel_bytes(image.width, image.height)? {
         return Err(ImageError::InvalidViewport);
     }
@@ -2657,6 +2661,7 @@ fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
 }
 
 fn allocate(width: u32, height: u32) -> Result<Option<Pixmap>, ImageError> {
+    let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
     pixel_bytes(width, height)?;
     if width == 0 || height == 0 {
         return Ok(None);

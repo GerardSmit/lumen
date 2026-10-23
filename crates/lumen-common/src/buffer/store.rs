@@ -136,6 +136,7 @@ impl ByteStore {
     /// A fixed-length, writable store owning `v`.
     pub fn new(mut v: Vec<u8>) -> ByteStore {
         track_add(v.capacity());
+        crate::memcat::retag_vec(&v, crate::memcat::CategoryTag::BUFFERS);
         let len = v.len();
         ByteStore {
             ptr: Cell::new(v.as_mut_ptr()),
@@ -437,6 +438,7 @@ impl ByteStore {
         let (ptr, len) = (self.ptr.get(), self.len.get());
         let mut copy = self.bytes_unguarded().to_vec();
         track_add(copy.capacity());
+        crate::memcat::retag_vec(&copy, crate::memcat::CategoryTag::BUFFERS);
         let snap = (self.mut_lends.get() != 0).then(|| {
             track_add(copy.len());
             copy.clone()
@@ -586,6 +588,7 @@ impl ByteStore {
         if !matches!(backing, Backing::Heap(_)) {
             let copy = self.bytes_unguarded().to_vec();
             track_add(copy.capacity());
+            crate::memcat::retag_vec(&copy, crate::memcat::CategoryTag::BUFFERS);
             *backing = Backing::Heap(copy);
         }
         match backing {

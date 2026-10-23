@@ -48,6 +48,7 @@ pub struct Bytes {
 
 impl Bytes {
     pub fn new(bytes: Vec<u8>) -> Bytes {
+        lumen_common::memcat::retag_vec(&bytes, lumen_common::memcat::CategoryTag::BUFFERS);
         let end = bytes.len();
         Bytes {
             store: Rc::new(bytes),
