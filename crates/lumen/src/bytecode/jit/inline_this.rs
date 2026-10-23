@@ -15,6 +15,14 @@
 //! instead (nothing to undo). Stores are then committed in program order (reads after a store
 //! of the same property see the stored value directly). No frame, no `fn_frames` record: the
 //! inlined body cannot observe them.
+//!
+//! One keyed read `this.p[k]; return` is also allowed (`k` a parameter holding a String or a
+//! Number, or a Number computed from them): the property word is cloned into a scratch entry
+//! above the call's operands and read through the interpreter's `fast_get_str` / `fast_get_elem`
+//! helpers, which run no JS (an accessor, a Proxy or an exotic object answers "not here"). A
+//! miss drops the clone and takes the ordinary call, so it needs no undo only because such a
+//! body has no stores and the read is directly followed by the `return`; the owned result is
+//! then moved to the call's destination (or checked to be a Number when the consumer wants one).
 
 use super::*;
 use crate::bytecode::Op;
@@ -37,6 +45,8 @@ pub(super) struct ThisBody {
     max_slot: Option<u32>,
     /// Whether the body stores a property.
     writes: bool,
+    /// Whether the body ends in a keyed read (`GetElem` then `Return`, no stores).
+    elem: bool,
     /// The number of ops up to and including the first return.
     len: usize,
     /// The `Math` calls of the body (`LoadName GetMethod <args> CallWithThis`): the site's
@@ -93,6 +103,7 @@ pub(super) fn this_body(
     let mut slots = vec![u32::MAX; chunk.ops.len()];
     let mut max_slot: Option<u32> = None;
     let mut writes = false;
+    let mut elem = false;
     let mut depth: usize = 0;
     // Per stack position: holds the receiver (`LoadThis`), which only a private access or a
     // `Pop` may consume.
@@ -131,6 +142,10 @@ pub(super) fn this_body(
             }
             Op::Pop => (1, 0),
             _ if top_this => return None,
+            Op::GetElem if !writes && matches!(chunk.ops.get(pc + 1), Some(Op::Return)) => {
+                elem = true;
+                (2, 1)
+            }
             Op::GetPropThis(n, _) | Op::SetPropThisDrop(n, _) => {
                 let name = chunk.names.get(n as usize)?;
                 let slot = b.props.slot_of(name)?;
@@ -175,6 +190,7 @@ pub(super) fn this_body(
                     slots,
                     max_slot,
                     writes,
+                    elem,
                     len: pc + 1,
                     maths,
                     fresh: false,
@@ -187,6 +203,7 @@ pub(super) fn this_body(
                     slots,
                     max_slot,
                     writes,
+                    elem,
                     len: pc + 1,
                     maths,
                     fresh: false,
@@ -213,6 +230,8 @@ enum Av {
     Undef,
     /// A property's NaN-boxed word (I64), of any kind.
     Word(V),
+    /// The owned result of a keyed read, in the scratch entry above the call's operands.
+    Owned,
     /// Argument entry `k` of the call (its kind is the caller's).
     Arg(usize),
     /// The receiver (consumed by a private access).
@@ -226,6 +245,8 @@ enum K {
     Bool,
     Undef,
     Word,
+    /// The owned result of a keyed read.
+    Owned,
     /// An argument in memory (a Number at run time, or the call goes the ordinary way).
     Mem,
     /// The receiver (consumed by a private access).
@@ -260,7 +281,7 @@ fn dry(tb: &ThisBody, arg: &dyn Fn(usize) -> K) -> Option<K> {
                 let k = match st.pop()? {
                     k @ (K::Num | K::Bool | K::Undef) => k,
                     K::Word | K::Mem => K::Num,
-                    K::This => return None,
+                    K::This | K::Owned => return None,
                 };
                 stored.push((tb.slots[q], k));
                 if matches!(op, Op::SetPrivate(_)) {
@@ -282,6 +303,13 @@ fn dry(tb: &ThisBody, arg: &dyn Fn(usize) -> K) -> Option<K> {
                 st.pop()?;
             }
             Op::LoadName(..) | Op::GetMethod(..) => {}
+            Op::GetElem => {
+                let (key, obj) = (st.pop()?, st.pop()?);
+                if obj != K::Word || !matches!(key, K::Num | K::Mem) {
+                    return None;
+                }
+                st.push(K::Owned);
+            }
             Op::CallWithThis(n) => {
                 for _ in 0..n {
                     if !numeric(st.pop()?) {
@@ -320,6 +348,8 @@ enum Res {
     Num(V),
     /// A property word: its `(tag, payload, is_ref)` (see [`layout::word_value`]).
     Word(V, (V, V, V)),
+    /// The owned value in stack entry `.0` (above the call's operands).
+    Owned(usize),
     Other(Av),
 }
 
@@ -395,6 +425,14 @@ impl Tr<'_, '_> {
                     st.pop();
                 }
                 Op::LoadName(..) | Op::GetMethod(..) => {}
+                Op::GetElem => {
+                    let key = st.pop().expect("dry run");
+                    let Some(Av::Word(bits)) = st.pop() else {
+                        unreachable!("dry run")
+                    };
+                    self.keyed_read(bits, key, entries, ab, ab + argc, full);
+                    st.push(Av::Owned);
+                }
                 Op::CallWithThis(n) => {
                     let m = tb
                         .maths
@@ -448,6 +486,8 @@ impl Tr<'_, '_> {
             }
         }
         let res = match (want, ret) {
+            (true, Av::Owned) => Res::Num(self.owned_num(ab + argc, full)),
+            (false, Av::Owned) => Res::Owned(ab + argc),
             (true, v) => Res::Num(self.this_num(v, entries, ab, full)),
             (false, Av::Word(bits)) => {
                 Res::Word(bits, layout::word_value(&mut self.fb, bits, full))
@@ -519,6 +559,15 @@ impl Tr<'_, '_> {
                     .store(MemKind::I64, self.stackp, payload, o + VALUE_PAYLOAD);
                 self.fb.jump(done, &[]);
             }
+            Res::Owned(from) => {
+                if let Some(i) = drop {
+                    self.drop_at(i);
+                }
+                let (so, sp) = (self.soff(from), self.stackp);
+                self.copy_value(sp, so, sp, o);
+                self.set_stack_tag(from, TAG_UNDEFINED);
+                self.fb.jump(done, &[]);
+            }
             Res::Other(v) => {
                 if let Some(i) = drop {
                     self.drop_at(i);
@@ -570,7 +619,7 @@ impl Tr<'_, '_> {
         let Some(ret) = dry(tb, &arg_kind) else {
             return false;
         };
-        let want = numeric(ret) && self.want_num(pc, base);
+        let want = (numeric(ret) || ret == K::Owned) && self.want_num(pc, base);
         if ret == K::Mem && !want {
             return false;
         }
@@ -631,6 +680,7 @@ impl Tr<'_, '_> {
         slow: Slow,
         g: &Getter,
     ) -> bool {
+        debug_assert!(!g.body.elem, "keyed reads use the scratch entry above the arguments");
         let Some(ret) = dry(&g.body, &|_| K::Undef) else {
             return false;
         };
@@ -674,6 +724,7 @@ impl Tr<'_, '_> {
         g: &Getter,
         done: Block,
     ) -> bool {
+        debug_assert!(!g.body.elem, "keyed reads use the scratch entry above the arguments");
         let d = self.stack.len();
         let kind = match self.stack[d - 1] {
             Entry::Num(_) => K::Num,
@@ -710,6 +761,91 @@ impl Tr<'_, '_> {
         true
     }
 
+    /// `this.p[key]` for the property word `bits`: a clone of the object is read at scratch
+    /// entry `scratch` (the clone is consumed by the helper on a hit; the owned result lands
+    /// there). A key that is not a String or Number, or a read the helpers decline, drops the
+    /// clone and branches to `miss`.
+    fn keyed_read(
+        &mut self,
+        bits: V,
+        key: Av,
+        entries: &[Entry],
+        ab: usize,
+        scratch: usize,
+        miss: Block,
+    ) {
+        let dst = self.sptr(scratch);
+        let no = self.i32c(0);
+        self.call(Helper::UnpackClone, &[dst, bits, no]);
+        let drop_b = self.fb.create_block();
+        let cont = self.fb.create_block();
+        let one = self.i32c(1);
+        let zero = self.i32c(0);
+        match key {
+            Av::Num(x) => {
+                let r = self.call(Helper::ElemGet, &[self.frame, dst, x, dst, one]);
+                let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGet returns a flag"), zero);
+                self.fb.brif(hit, cont, &[], drop_b, &[]);
+            }
+            Av::Arg(k) => {
+                let p = match entries[ab + k] {
+                    Entry::Ref(p, _) => p,
+                    _ => self.sptr(ab + k),
+                };
+                let tag = self.fb.load(MemKind::I32U8, p, 0);
+                let ts = self.i32c(TAG_STR as i64);
+                let tn = self.i32c(TAG_NUM as i64);
+                let is_str = self.fb.icmp(IntCC::Eq, tag, ts);
+                let (strb, chk, numb) = (
+                    self.fb.create_block(),
+                    self.fb.create_block(),
+                    self.fb.create_block(),
+                );
+                self.fb.brif(is_str, strb, &[], chk, &[]);
+                self.fb.seal_block(strb);
+                self.fb.seal_block(chk);
+                self.fb.switch_to_block(strb);
+                let r = self.call(Helper::ElemGetStr, &[self.frame, dst, p, dst, one]);
+                let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGetStr returns a flag"), zero);
+                self.fb.brif(hit, cont, &[], drop_b, &[]);
+                self.fb.switch_to_block(chk);
+                let is_num = self.fb.icmp(IntCC::Eq, tag, tn);
+                self.fb.brif(is_num, numb, &[], drop_b, &[]);
+                self.fb.seal_block(numb);
+                self.fb.switch_to_block(numb);
+                let x = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+                let r = self.call(Helper::ElemGet, &[self.frame, dst, x, dst, one]);
+                let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGet returns a flag"), zero);
+                self.fb.brif(hit, cont, &[], drop_b, &[]);
+            }
+            // (Excluded by the dry run.)
+            _ => unreachable!("dry run"),
+        }
+        self.fb.seal_block(drop_b);
+        self.fb.switch_to_block(drop_b);
+        self.drop_at(scratch);
+        self.fb.jump(miss, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+    }
+
+    /// The Number in scratch entry `scratch` (an owned keyed-read result), else the value is
+    /// dropped and the code branches to `miss`.
+    fn owned_num(&mut self, scratch: usize, miss: Block) -> V {
+        let tag = self.stack_tag(scratch);
+        let tn = self.i32c(TAG_NUM as i64);
+        let is = self.fb.icmp(IntCC::Eq, tag, tn);
+        let (next, bad) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(is, next, &[], bad, &[]);
+        self.fb.seal_block(next);
+        self.fb.seal_block(bad);
+        self.fb.switch_to_block(bad);
+        self.drop_at(scratch);
+        self.fb.jump(miss, &[]);
+        self.fb.switch_to_block(next);
+        self.stack_num(scratch)
+    }
+
     /// Operand `v` of an inlined body as a Number (F64), branching to `miss` when it is not one.
     fn this_num(&mut self, v: Av, entries: &[Entry], ab: usize, miss: Block) -> V {
         match v {
@@ -734,7 +870,7 @@ impl Tr<'_, '_> {
                 self.fb.load(MemKind::F64, p, off + VALUE_PAYLOAD)
             }
             // (Excluded by the dry run.)
-            Av::Bool(_) | Av::Undef | Av::This => {
+            Av::Bool(_) | Av::Undef | Av::This | Av::Owned => {
                 self.fb.jump(miss, &[]);
                 let dead = self.fb.create_block();
                 self.fb.seal_block(dead);
@@ -805,7 +941,7 @@ fn accessor_site(i: &Interp, recv: &Value, name: &str, set: bool) -> Option<(Get
                     return None;
                 }
                 let body = this_body(&ic.chunk, recv, shapes[0], &private_keys(i, &g))?;
-                if !body.maths.is_empty() || body.writes && !set {
+                if !body.maths.is_empty() || body.elem || body.writes && !set {
                     return None;
                 }
                 return Some((

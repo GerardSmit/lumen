@@ -556,7 +556,6 @@ impl Default for Engine {
 /// pinned by them. All of them are pure caches or registries that a new engine resets.
 fn release_thread_realm_roots() {
     interpreter::sym_for_reset();
-    interpreter::clear_str_key_ic();
     interpreter::bindings::clear_copy_layouts();
     drop(interpreter::stack_trace::take_parsed_source());
 }

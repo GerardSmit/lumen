@@ -765,6 +765,8 @@ mod background_tests;
 #[cfg(test)]
 mod evict_tests;
 #[cfg(test)]
+mod inline_elem_tests;
+#[cfg(test)]
 mod int32_tests;
 #[cfg(test)]
 mod intrinsic_guard_tests;

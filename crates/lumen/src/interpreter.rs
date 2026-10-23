@@ -1353,6 +1353,8 @@ pub struct Interp {
     /// `import defer` namespaces awaiting first access: namespace object ptr → module key.
     /// Accessing a property of one evaluates the module (then the entry is removed).
     pub(crate) deferred_ns: crate::fasthash::FastMap<usize, crate::modules::DeferredModuleKey>,
+    /// [`Interp::fast_get_str`]'s own-property memo: `(shape id, key, slot)`, direct-mapped.
+    str_key_ic: std::cell::RefCell<Box<[Option<(u32, crate::lstr::LStr, u32)>]>>,
     /// module key → its (single) deferred namespace object.
     pub(crate) deferred_ns_objs: crate::modules::SettingsModuleMap<Value>,
     /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
@@ -2216,6 +2218,7 @@ impl Interp {
             decorator_initializers: Vec::new(),
             annexb_fn_sync: Default::default(),
             deferred_ns: Default::default(),
+            str_key_ic: std::cell::RefCell::new(vec![None; STR_KEY_IC_LEN].into_boxed_slice()),
             deferred_ns_objs: Default::default(),
             mapped_arguments: Default::default(),
             legacy_fn_cache: Default::default(),
@@ -4057,7 +4060,7 @@ impl Interp {
     /// table) and the property found is a data property. `None` = take the generic path.
     ///
     /// Own hits are memoized by (shape id, key string identity) in a small direct-mapped
-    /// table ([`STR_KEY_IC`]) that holds the key alive, so its address can't be reused.
+    /// table (`str_key_ic`) that holds the key alive, so its address can't be reused.
     pub(crate) fn fast_get_str(&self, o: &Gc, lkey: &crate::lstr::LStr) -> Option<Value> {
         let key = lkey.as_str();
         if key
@@ -4072,7 +4075,7 @@ impl Interp {
             if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
                 return None;
             }
-            let slot = Self::str_key_slot(&b.props, lkey);
+            let slot = self.str_key_slot(&b.props, lkey);
             if let Some(slot) = slot {
                 let p = b.props.entry_at(slot)?;
                 return (!p.accessor()).then(|| p.value());
@@ -4098,28 +4101,26 @@ impl Interp {
         }
     }
 
-    /// The slot of own non-index `lkey` in `props`, through the [`STR_KEY_IC`] memo.
-    fn str_key_slot(props: &Props, lkey: &crate::lstr::LStr) -> Option<usize> {
+    /// The slot of own non-index `lkey` in `props`, through the `str_key_ic` memo.
+    fn str_key_slot(&self, props: &Props, lkey: &crate::lstr::LStr) -> Option<usize> {
         let shape = props.shape();
         let mix = ((shape as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
         let h = (mix ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
         // `slot_of` never reaches the memo, so it runs under the caller's borrow.
-        STR_KEY_IC.with(|c| {
-            let e = &mut c.borrow_mut()[h];
-            match e {
-                Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
-                    Some(*slot as usize)
-                }
-                _ => {
-                    let s = props.slot_of(lkey.as_str());
-                    if let Some(s) = s {
-                        // A non-index key's slot is a named one, pinned by the shape.
-                        *e = Some((shape, lkey.clone(), s as u32));
-                    }
-                    s
-                }
+        let mut ic = self.str_key_ic.borrow_mut();
+        match &ic[h] {
+            Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
+                Some(*slot as usize)
             }
-        })
+            _ => {
+                let s = props.slot_of(lkey.as_str());
+                if let Some(s) = s {
+                    // A non-index key's slot is a named one, pinned by the shape.
+                    ic[h] = Some((shape, lkey.clone(), s as u32));
+                }
+                s
+            }
+        }
     }
 
     /// `o[key] = v` for a String `key` that is not an array index, when `o` is plain and either
@@ -4151,7 +4152,7 @@ impl Interp {
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
             return Err(v);
         }
-        if let Some(slot) = Self::str_key_slot(&b.props, lkey) {
+        if let Some(slot) = self.str_key_slot(&b.props, lkey) {
             return match b.props.entry_at(slot) {
                 Some(p) if !p.accessor() && p.writable() => {
                     let was_obj = matches!(p.value(), Value::Obj(_));
@@ -9735,17 +9736,6 @@ impl Default for Interp {
 }
 
 const STR_KEY_IC_LEN: usize = 512;
-
-/// Empty the thread's string-key memo (a pure cache keyed by shape ids that die with the realm).
-pub(crate) fn clear_str_key_ic() {
-    STR_KEY_IC.with(|c| c.borrow_mut().fill_with(|| None));
-}
-
-thread_local! {
-    /// [`Interp::fast_get_str`]'s own-property memo: `(shape id, key, slot)`.
-    static STR_KEY_IC: std::cell::RefCell<[Option<(u32, crate::lstr::LStr, u32)>; STR_KEY_IC_LEN]> =
-        const { std::cell::RefCell::new([const { None }; STR_KEY_IC_LEN]) };
-}
 
 /// Materializers of lazily published globals, keyed by global object and name.
 #[derive(Default)]
