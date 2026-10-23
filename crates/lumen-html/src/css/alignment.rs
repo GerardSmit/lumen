@@ -38,7 +38,9 @@ impl ItemAlignment {
             Some(Keyword::Left | Keyword::LegacyLeft) if horizontal => false,
             Some(Keyword::Right | Keyword::LegacyRight) if horizontal => true,
             Some(Keyword::Left | Keyword::LegacyLeft) => container.writing_mode == WritingMode::SidewaysLr,
-            Some(Keyword::Right | Keyword::LegacyRight) => container.writing_mode != WritingMode::SidewaysLr,
+            Some(Keyword::Right | Keyword::LegacyRight) => {
+                !matches!(container.writing_mode, WritingMode::SidewaysLr | WritingMode::HorizontalTb)
+            }
             _ if self.is_baseline() => subject_end,
             _ if self.alignment == AlignItems::Stretch => container_end ^ flow_reversed,
             _ => {

@@ -1067,6 +1067,7 @@ impl DomHtmlCollection {
     fn indexed(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
         self.base.indexed(ctx, index)
     }
+    #[method(coerce)]
     fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
         self.base.item(ctx, index)
     }
@@ -1477,6 +1478,7 @@ impl DomRadioNodeList {
             .map_or(Value::Undefined, |(realm, id)| realm.wrap(ctx, id)))
     }
 
+    #[method(coerce)]
     fn item(&self, ctx: &mut Ctx, index: usize) -> OpResult<Value> {
         Ok(self
             .base

@@ -3532,7 +3532,68 @@ variation_advances: VariationGlyphCache::new(),
             }
             return coverage_from_outline(&self.outline_with_variations(id, size, &[])?);
         }
+        if let Some(coverage) = self.rectilinear_grid_fitted(id, size) {
+            return coverage;
+        }
         self.with_rasterizer(id,size,|font|rasterize_coverage(font,id,size))
+    }
+
+    /// Glyphs drawn only from horizontal and vertical lines (Ahem-style boxes) get their
+    /// horizontal edges fitted to the pixel grid, as light hinting does, so square glyphs
+    /// stay crisp instead of bleeding into the neighbouring pixel row.
+    fn rectilinear_grid_fitted(&self, id: u16, size: f32) -> Option<Result<GlyphCoverage, &'static str>> {
+        if !size.is_finite() || size <= 0.0 || size > MAX_SHAPE_FONT_SIZE {
+            return None;
+        }
+        let mut outline = self.outline_with_variations(id, size, &[]).ok()?;
+        let mut previous: Option<(f32, f32)> = None;
+        let mut start: Option<(f32, f32)> = None;
+        let mut ys: Vec<f32> = Vec::new();
+        for command in &outline.commands {
+            match *command {
+                GlyphOutlineCommand::MoveTo(x, y) => {
+                    previous = Some((x, y));
+                    start = previous;
+                }
+                GlyphOutlineCommand::LineTo(x, y) => {
+                    let (px, py) = previous?;
+                    if x != px && y != py {
+                        return None;
+                    }
+                    ys.push(y);
+                    previous = Some((x, y));
+                }
+                GlyphOutlineCommand::Close => {
+                    let (px, py) = previous?;
+                    let (sx, sy) = start?;
+                    if px != sx && py != sy {
+                        return None;
+                    }
+                    previous = start;
+                }
+                GlyphOutlineCommand::QuadTo(..) | GlyphOutlineCommand::CurveTo(..) => return None,
+            }
+        }
+        if ys.is_empty() {
+            return None;
+        }
+        ys.sort_by(|a, b| a.total_cmp(b));
+        ys.dedup();
+        let mut last = f32::NEG_INFINITY;
+        for &y in &ys {
+            let fitted = y.round();
+            if fitted <= last {
+                return None;
+            }
+            last = fitted;
+        }
+        for command in &mut outline.commands {
+            match command {
+                GlyphOutlineCommand::MoveTo(_, y) | GlyphOutlineCommand::LineTo(_, y) => *y = y.round(),
+                _ => {}
+            }
+        }
+        Some(coverage_from_outline(&outline))
     }
 
     fn rasterize_with_variations(&self, key: u64, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Result<Arc<GlyphCoverage>, &'static str> {

@@ -14,6 +14,7 @@ pub mod font_display;
 pub mod forms;
 pub(crate) mod control_appearance;
 pub mod tables;
+mod table_rowspan;
 pub mod invokers;
 pub mod focus;
 pub mod graph;

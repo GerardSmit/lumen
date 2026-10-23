@@ -1425,6 +1425,52 @@ pub fn set_checked(
     Ok(())
 }
 
+/// A checked radio entering a form owner or a document unchecks the rest of its group.
+pub(crate) fn settle_inserted_radios(realm: &DomRealm, root: NodeId) {
+    let inserted = {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut found = Vec::new();
+        let mut current = Some(root);
+        while let Some(candidate) = current {
+            let is_radio = html_local_name(document, candidate) == Some("input")
+                && document
+                    .get_attribute_ns_ref(candidate, None, "type")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("radio"));
+            if is_radio
+                && (core_forms::form_owner(document, candidate).is_some()
+                    || document.is_connected_element(candidate))
+            {
+                found.push(candidate);
+            }
+            current = lumen_html::selector::next_descendant(document, root, candidate)
+                .ok()
+                .flatten();
+        }
+        found
+    };
+    for radio in inserted {
+        if !matches!(checked(realm, radio), Ok(true)) {
+            continue;
+        }
+        let peers = core_forms::radio_group_members(realm.session.borrow().document(), radio);
+        if peers.is_empty() {
+            continue;
+        }
+        let mut state = realm.forms.borrow_mut();
+        for peer in peers {
+            let dirty = state
+                .checkedness
+                .get(&peer)
+                .is_some_and(|checkedness| checkedness.dirty);
+            state.checkedness.insert(peer, Checkedness { value: false, dirty });
+        }
+        state.bump_validity_generation();
+    }
+}
+
 pub fn checked(realm: &DomRealm, node: NodeId) -> OpResult<bool> {
     if let Some(checked) = realm.forms.borrow().checkedness.get(&node) {
         return Ok(checked.value);

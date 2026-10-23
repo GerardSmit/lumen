@@ -4686,7 +4686,7 @@ impl RenderSession {
             && self.document.kind(node).is_ok()).into_iter().flat_map(move |frame| {
             frame.geometry.hits.iter().enumerate()
                 .filter(move |(_,hit)|hit.node==node&&!hit.virtual_generated&&hit.rect.is_valid())
-                .flat_map(move |(index,_)|frame.geometry.hit_rects(index).iter().map(move |rect| {
+                .flat_map(move |(index,_)|frame.geometry.client_hit_rects(index).map(move |rect| {
                 let mut corners = [(rect.x, rect.y), (rect.x + rect.width, rect.y),
                     (rect.x, rect.y + rect.height), (rect.x + rect.width, rect.y + rect.height)];
                 for transform in frame.geometry.transforms.iter().filter(|transform| transform.hits.contains(&index)) {
@@ -4715,8 +4715,8 @@ impl RenderSession {
             let transforms: Vec<_> = frame.geometry.transforms.iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix).collect();
-            for rect in frame.geometry.hit_rects(index) {
-                fragments.push((*rect, transforms.clone()));
+            for rect in frame.geometry.client_hit_rects(index) {
+                fragments.push((rect, transforms.clone()));
             }
         }
         fragments
@@ -4763,14 +4763,14 @@ impl RenderSession {
                     .iter()
                     .enumerate()
                     .filter(move |(_,hit)|hit.node==node&&!hit.virtual_generated&&hit.rect.is_valid())
-                    .flat_map(move |(index, _hit)| frame.geometry.hit_rects(index).iter().filter_map(move |rect| {
+                    .flat_map(move |(index, _hit)| frame.geometry.client_hit_rects(index).filter_map(move |rect| {
                         let transforms = frame
                             .geometry
                             .transforms
                             .iter()
                             .filter(|transform| transform.hits.contains(&index))
                             .map(|transform| transform.matrix);
-                        layout::transformed_bounds(*rect, transforms)
+                        layout::transformed_bounds(rect, transforms)
                     }))
             })
     }

@@ -175,6 +175,8 @@ struct CanvasTextState {
     direction: String,
     letter_spacing: f32,
     word_spacing: f32,
+    letter_spacing_text: Option<(f32, String)>,
+    word_spacing_text: Option<(f32, String)>,
     font_kerning: CanvasFontKerning,
     font_variant_caps: CanvasFontVariantCaps,
     text_rendering: CanvasTextRendering,
@@ -250,6 +252,8 @@ impl Default for CanvasTextState {
             direction: "inherit".into(),
             letter_spacing: 0.0,
             word_spacing: 0.0,
+            letter_spacing_text: None,
+            word_spacing_text: None,
             font_kerning: CanvasFontKerning::Auto,
             font_variant_caps: CanvasFontVariantCaps::Normal,
             text_rendering: CanvasTextRendering::Auto,
@@ -334,6 +338,7 @@ pub struct CanvasData {
     extended: canvas_extended::ExtendedPixels,
     fill_color_text: Option<([u8; 4], String)>,
     stroke_color_text: Option<([u8; 4], String)>,
+    shadow_color_text: Option<([u8; 4], String)>,
     stroke_pattern_origin_clean: bool,
     saved_fill_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     saved_stroke_styles: Vec<(Option<Value>, Option<Value>, bool)>,
@@ -715,6 +720,7 @@ impl CanvasData {
             extended: canvas_extended::ExtendedPixels::default(),
             fill_color_text: None,
             stroke_color_text: None,
+            shadow_color_text: None,
             origin_clean: true,
             saved_fill_styles: Vec::new(),
             saved_stroke_styles: Vec::new(),
@@ -1719,6 +1725,11 @@ impl CanvasPath {
                         builder.line_to(x + width, y + height);
                         builder.line_to(x, y + height);
                         builder.close();
+                        has_subpath = true;
+                        current = (x, y);
+                        subpath_start = current;
+                    } else if finite && width == 0.0 && height == 0.0 {
+                        builder.move_to(x, y);
                         has_subpath = true;
                         current = (x, y);
                         subpath_start = current;
@@ -3190,17 +3201,19 @@ macro_rules! impl_canvas_2d_methods {
             #[getter]
             fn shadow_color(&self) -> String {
                 let data = self.data.borrow();
-                color_string(stored_color_as_srgb(data.surface.state().shadow_color, data.color_space))
+                style_color_text(data.surface.state().shadow_color, &data.shadow_color_text, data.color_space)
             }
             #[setter(coerce)]
             fn set_shadow_color(&self, value: &str) {
                 let space = self.data.borrow().color_space;
-                if let Some(color) = parse_canvas_color(
-                    &Value::Str(value.into()),
-                    current_canvas_color(&self.realm, self.node),
-                    space,
-                ) {
-                    self.data.borrow_mut().surface.state_mut().shadow_color = color;
+                let value = Value::Str(value.into());
+                if let Some(color) =
+                    parse_canvas_color(&value, current_canvas_color(&self.realm, self.node), space)
+                {
+                    let text = color_function_text(&value, current_canvas_color(&self.realm, self.node));
+                    let mut data = self.data.borrow_mut();
+                    data.shadow_color_text = text.map(|text| (color, text));
+                    data.surface.state_mut().shadow_color = color;
                 }
             }
             #[getter]
@@ -3370,34 +3383,40 @@ macro_rules! impl_canvas_2d_methods {
             }
             #[getter]
             fn letter_spacing(&self) -> String {
-                css_spacing_string(self.data.borrow().text.letter_spacing)
+                let data = self.data.borrow();
+                spacing_text(data.text.letter_spacing, &data.text.letter_spacing_text)
             }
             #[setter(coerce)]
-            fn set_letter_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+            fn set_letter_spacing(&self, ctx: &mut Ctx, text_value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
                 let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
                 let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
-                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
-                    self.data.borrow_mut().text.letter_spacing = value;
+                if let Some(value) = parse_css_spacing(text_value,text.size,root_size,[own,root]) {
+                    let mut data = self.data.borrow_mut();
+                    data.text.letter_spacing = value;
+                    data.text.letter_spacing_text = font_relative_spacing_text(text_value).map(|text| (value, text));
                 }
                 fonts.queue_demand_task(ctx)?;
                 Ok(())
             }
             #[getter]
             fn word_spacing(&self) -> String {
-                css_spacing_string(self.data.borrow().text.word_spacing)
+                let data = self.data.borrow();
+                spacing_text(data.text.word_spacing, &data.text.word_spacing_text)
             }
             #[setter(coerce)]
-            fn set_word_spacing(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+            fn set_word_spacing(&self, ctx: &mut Ctx, text_value: &str) -> OpResult<()> {
                 let text = self.data.borrow().text.clone();
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let owner = self.realm.as_ref().map(|realm| self.node.map_or_else(||realm.clone(),|node|realm.resolve_adopted_node(node).0));
                 let own = lumen_html::css::font_unit_bases(Some(&fonts),text.size,&text.spec,lumen_html::css::LineHeight::Normal,false,false);
                 let (root_size, root) = canvas_root_font_units(owner.as_ref(),&fonts)?;
-                if let Some(value) = parse_css_spacing(value,text.size,root_size,[own,root]) {
-                    self.data.borrow_mut().text.word_spacing = value;
+                if let Some(value) = parse_css_spacing(text_value,text.size,root_size,[own,root]) {
+                    let mut data = self.data.borrow_mut();
+                    data.text.word_spacing = value;
+                    data.text.word_spacing_text = font_relative_spacing_text(text_value).map(|text| (value, text));
                 }
                 fonts.queue_demand_task(ctx)?;
                 Ok(())
@@ -5457,6 +5476,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<CanvasS
         let node = image.image_node();
         (node.realm.clone(), node.id)
     }) {
+        let _ = realm.sync_image_bitmaps();
         return match realm.images.canvas_image_state(node) {
             image_loading::CanvasImageState::Available(bitmap) => Ok(Some(match bitmap {
                 lumen_html::layout::NodeBitmap::Decoded(image) => CanvasSource::Pixels(image),
@@ -5958,6 +5978,32 @@ fn canvas_root_font_units(realm: Option<&Rc<DomRealm>>, fonts: &dyn TextShaper) 
         let style=session.computed_style_with_text(root,Some(fonts)).map_err(|error|OpError::new("InvalidStateError",format!("root font units unavailable: {error:?}")))?;
         Ok((style.font_size,style.font_unit_context(fonts)[0]))
     })
+}
+
+fn spacing_text(value: f32, text: &Option<(f32, String)>) -> String {
+    match text {
+        Some((stored, text)) if *stored == value => text.clone(),
+        _ => css_spacing_string(value),
+    }
+}
+
+/// A single font-relative length keeps its unit when read back, lower-cased.
+fn font_relative_spacing_text(value: &str) -> Option<String> {
+    const UNITS: [&str; 12] = ["em", "ex", "ch", "ic", "rem", "rex", "rch", "ric", "lh", "rlh", "cap", "rcap"];
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let split = (0..bytes.len()).find(|&i| {
+        bytes[i].is_ascii_alphabetic()
+            && !(matches!(bytes[i], b'e' | b'E')
+                && bytes.get(i + 1).is_some_and(|next| next.is_ascii_digit() || matches!(*next, b'+' | b'-')))
+    })?;
+    let (number, unit) = value.split_at(split);
+    let unit = unit.to_ascii_lowercase();
+    if !UNITS.contains(&unit.as_str()) {
+        return None;
+    }
+    let number: f64 = number.parse().ok()?;
+    number.is_finite().then(|| format!("{number}{unit}"))
 }
 
 fn css_spacing_string(value: f32) -> String {
@@ -8142,13 +8188,13 @@ mod tests {
         let diagnostic=engine.eval_value(r#"(() => {
             const context=document.getElementById('c').getContext('2d');
             context.font='10px monospace';
-            context.letterSpacing='1rlh';
+            context.letterSpacing='calc(1rlh + 0px)';
             if(context.letterSpacing!=='40px')throw new Error('canvas rlh did not use the actual document root');
             context.wordSpacing='calc(1cap + 2px)';
             const cap=parseFloat(context.wordSpacing);
             if(!(cap>2))throw new Error('canvas cap metric was rejected');
             document.documentElement.style.lineHeight='3';
-            context.letterSpacing='1rlh';
+            context.letterSpacing='calc(1rlh + 0px)';
             if(context.letterSpacing!=='60px')throw new Error('canvas root line-height mutation was stale');
             context.font='1rlh monospace';
             if(!context.font.includes('60px'))throw new Error('canvas font shorthand did not resolve genuine rlh');
@@ -8164,7 +8210,7 @@ mod tests {
         super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
-            "(()=>{const x=new OffscreenCanvas(1,1).getContext('2d');x.font='20px monospace';x.letterSpacing='1em';const em=x.letterSpacing==='20px';x.letterSpacing='1rem';const rem=x.letterSpacing==='16px';x.letterSpacing='1ch';const ch=Math.abs(parseFloat(x.letterSpacing)-x.measureText('0').width)<0.01;x.letterSpacing='calc(1em + 2px)';const calc=x.letterSpacing==='22px';x.wordSpacing='1in';const abs=x.wordSpacing==='96px';x.wordSpacing='bad';return em&&rem&&ch&&calc&&abs&&x.wordSpacing==='96px'})()"
+            "(()=>{const x=new OffscreenCanvas(1,1).getContext('2d');x.font='20px monospace';x.letterSpacing='1em';const em=x.letterSpacing==='1em'&&x.measureText('0').width>0;x.letterSpacing='1rem';const rem=x.letterSpacing==='1rem';x.letterSpacing='1CH';const ch=x.letterSpacing==='1ch';x.letterSpacing='calc(1em + 2px)';const calc=x.letterSpacing==='22px';x.wordSpacing='1in';const abs=x.wordSpacing==='96px';x.wordSpacing='bad';return em&&rem&&ch&&calc&&abs&&x.wordSpacing==='96px'})()"
         ));
     }
 
@@ -8179,7 +8225,7 @@ mod tests {
         .unwrap();
         assert!(eval_bool(
             &mut engine,
-            "(()=>{const x=document.querySelector('canvas').getContext('2d');x.letterSpacing='1rem';return x.letterSpacing==='32px'})()"
+            "(()=>{const x=document.querySelector('canvas').getContext('2d');x.letterSpacing='1rem';return x.letterSpacing==='1rem'})()"
         ));
     }
 

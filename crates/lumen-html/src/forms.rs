@@ -3526,7 +3526,7 @@ pub fn validity_with_view(
             Some(InputValueMode::DefaultOn) if type_name == "radio" => {
                 let group = attribute(document, node, "name").unwrap_or("");
                 let group_required = if group.is_empty() {
-                    required
+                    required && attribute(document, node, "name").is_none()
                 } else {
                     radio_group_required(document, node, group)
                 };
@@ -3640,6 +3640,7 @@ fn tree_contains_checked_radio_by(
     mut checkedness: impl FnMut(NodeId) -> Option<bool>,
 ) -> bool {
     let root = tree_root(document, node);
+    let owner = form_owner(document, node);
     let mut current = Some(root);
     while let Some(candidate) = current {
         if element(document, candidate).is_some_and(|(tag, _)| {
@@ -3648,6 +3649,7 @@ fn tree_contains_checked_radio_by(
                     .unwrap_or("text")
                     .eq_ignore_ascii_case("radio")
                 && attribute(document, candidate, "name") == Some(group)
+                && form_owner(document, candidate) == owner
                 && checkedness(candidate)
                     .unwrap_or_else(|| attribute(document, candidate, "checked").is_some())
         }) {

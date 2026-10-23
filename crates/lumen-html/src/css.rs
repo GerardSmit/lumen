@@ -22,6 +22,7 @@ pub mod computed_values;
 pub mod declaration_block;
 mod transition_controls;
 mod sibling_layout;
+mod table_columns;
 mod slot_equal;
 pub use slot_equal::PropertyComparer;
 pub(crate) mod animation_controls;
@@ -72,6 +73,8 @@ mod font_variant;
 mod grid_abspos;
 pub use grid_abspos::{absolute_grid_lines, AbsoluteGridLines};
 mod grid_lines;
+mod grid_lead;
+mod grid_source;
 mod grid_tracks;
 mod shapes;
 pub mod anchor;
@@ -1855,6 +1858,34 @@ pub(crate) fn parse_grid_line_reference(
     areas: &[GridArea],
     horizontal: bool,
 ) -> Option<(Option<usize>, usize, bool)> {
+    parse_grid_line_reference_signed(raw, end, names, explicit, areas, horizontal, 0).map(
+        |(line, span, is_span)| {
+            (
+                line.map(|line| line.clamp(0, MAX_GRID_TRACKS as i64) as usize),
+                span,
+                is_span,
+            )
+        },
+    )
+}
+
+fn signed_line(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Line index of a reference, which is negative when it counts past the start
+/// edge of the explicit grid. `lead` is the number of leading implicit tracks
+/// already prepended to the grid the names and `explicit` describe; positive
+/// literal lines are authored relative to the original explicit grid.
+fn parse_grid_line_reference_signed(
+    raw: &str,
+    end: bool,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<(Option<i64>, usize, bool)> {
     if raw.trim() == "auto" {
         return Some((None, 1, false));
     }
@@ -1887,7 +1918,7 @@ pub(crate) fn parse_grid_line_reference(
             None
         };
         if let Some(edge) = edge {
-            return Some((Some(edge.min(MAX_GRID_TRACKS)), 1, false));
+            return Some((Some(signed_line(edge.min(MAX_GRID_TRACKS))), 1, false));
         }
         let mut candidates = 0u128;
         for line in names.iter().filter(|line| line.name.as_ref() == name) {
@@ -1906,13 +1937,13 @@ pub(crate) fn parse_grid_line_reference(
                 }
             }
             if count > 0 {
-                candidates.trailing_zeros() as usize
+                i64::from(candidates.trailing_zeros())
             } else {
-                (127 - candidates.leading_zeros()) as usize
+                i64::from(127 - candidates.leading_zeros())
             }
         } else if let Some(area) = areas.iter().find(|area| area.name.as_ref() == name) {
             let start = if horizontal { area.column } else { area.row };
-            start.saturating_add(if end {
+            signed_line(start.saturating_add(if end {
                 if horizontal {
                     area.columns
                 } else {
@@ -1920,18 +1951,16 @@ pub(crate) fn parse_grid_line_reference(
                 }
             } else {
                 0
-            })
+            }))
         } else {
-            explicit.saturating_add(count.max(1) as usize)
+            signed_line(explicit.saturating_add(count.max(1) as usize))
         }
     } else if count > 0 {
-        count as usize - 1
+        signed_line((count as usize - 1).saturating_add(lead))
     } else {
-        explicit
-            .saturating_add(1)
-            .saturating_sub(count.unsigned_abs() as usize)
+        signed_line(explicit.saturating_add(1)) - i64::from(count.unsigned_abs())
     };
-    Some((Some(line.min(MAX_GRID_TRACKS)), 1, false))
+    Some((Some(line.min(MAX_GRID_TRACKS as i64)), 1, false))
 }
 
 pub fn resolve_grid_placement(
@@ -1987,6 +2016,94 @@ pub fn resolve_grid_placement(
         placement.span = placement.span.min(MAX_GRID_TRACKS - *start);
     }
     Some(placement)
+}
+
+/// A grid placement whose start may precede the explicit grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignedGridPlacement {
+    pub start: Option<i64>,
+    pub span: usize,
+}
+
+impl SignedGridPlacement {
+    pub fn clamped(self) -> GridPlacement {
+        let mut placement = GridPlacement {
+            start: self.start.map(|start| start.clamp(0, MAX_GRID_TRACKS as i64) as usize),
+            span: self.span.clamp(1, MAX_GRID_TRACKS),
+        };
+        if let Some(start) = placement.start.as_mut() {
+            *start = (*start).min(MAX_GRID_TRACKS - 1);
+            placement.span = placement.span.min(MAX_GRID_TRACKS - *start);
+        }
+        placement
+    }
+}
+
+/// Like `resolve_grid_placement`, but keeps a start before the first explicit
+/// line negative so the caller can add leading implicit tracks for it.
+pub fn resolve_grid_placement_signed(
+    fallback: GridPlacement,
+    raw: Option<&str>,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<SignedGridPlacement> {
+    let Some(raw) = raw else {
+        return Some(SignedGridPlacement {
+            start: fallback.start.map(signed_line),
+            span: fallback.span,
+        });
+    };
+    let mut parts = raw.split('/');
+    let first = parts.next()?;
+    let second = parts.next().unwrap_or("auto");
+    let parse = |raw: &str, end: bool| {
+        parse_grid_line_reference_signed(raw, end, names, explicit, areas, horizontal, lead)
+    };
+    let (start, start_span, start_is_span) = parse(first, false)?;
+    let (end, end_span, end_is_span) = parse(second, true)?;
+    Some(match (start, end) {
+        (Some(start), Some(end)) => SignedGridPlacement {
+            start: Some(start.min(end)),
+            span: usize::try_from(start.abs_diff(end)).unwrap_or(usize::MAX).max(1),
+        },
+        (Some(start), None) => SignedGridPlacement {
+            start: Some(start),
+            span: if end_is_span { end_span } else { 1 },
+        },
+        (None, Some(end)) => {
+            let span = if start_is_span { start_span } else { 1 };
+            SignedGridPlacement {
+                start: Some(end.saturating_sub(signed_line(span))),
+                span,
+            }
+        }
+        (None, None) => SignedGridPlacement {
+            start: None,
+            span: if start_is_span {
+                start_span
+            } else if end_is_span {
+                end_span
+            } else {
+                1
+            },
+        },
+    })
+}
+
+pub fn resolve_grid_placement_led(
+    fallback: GridPlacement,
+    raw: Option<&str>,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+    lead: usize,
+) -> Option<GridPlacement> {
+    resolve_grid_placement_signed(fallback, raw, names, explicit, areas, horizontal, lead)
+        .map(SignedGridPlacement::clamped)
 }
 
 fn grid_areas(raw: &str) -> Option<(Arc<[GridArea]>, [u8; 2])> {
@@ -2968,6 +3085,14 @@ pub struct StyleExtras {
     pub grid_rows_subgrid_repeat: Option<GridSubgridRepeat>,
     pub grid_columns_auto: Option<GridAutoRepeat>,
     pub grid_rows_auto: Option<GridAutoRepeat>,
+    /// Computed track list text for lists whose integer `repeat()` the
+    /// expanded track vectors cannot reproduce.
+    pub grid_columns_source: Option<Arc<str>>,
+    pub grid_rows_source: Option<Arc<str>>,
+    /// Leading implicit columns and rows prepended to the track lists by
+    /// layout; line numbers authored on items are relative to the original
+    /// explicit grid.
+    pub grid_lead: [usize; 2],
     pub transforms: Option<Arc<[Transform]>>,
     pub(crate) individual_transforms:[Option<Arc<individual_transforms::IndividualTransform>>;3],
     pub filters: Option<Arc<[lumen_common::filter::FilterOperation]>>,
@@ -3232,6 +3357,9 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     grid_rows_subgrid_repeat: None,
     grid_columns_auto: None,
     grid_rows_auto: None,
+    grid_columns_source: None,
+    grid_rows_source: None,
+    grid_lead: [0, 0],
     transforms: None,
     transform_box:TransformBox::ViewBox,
     individual_transforms:[None,None,None],
@@ -5996,6 +6124,7 @@ enum Value {
     GridColumnsAuto(Box<GridAutoRepeat>),
     GridRowsAuto(Box<GridAutoRepeat>),
     GridSubgridRepeat(usize, Box<GridSubgridRepeat>),
+    GridSourced(usize, Arc<str>, Box<Value>),
     AspectRatio([f32; 2], bool),
     ZIndex(Option<i32>),
     GridRaw(usize, Arc<str>),
@@ -6078,6 +6207,7 @@ impl Value {
             Self::ColorRaw(slot, _) => *slot,
             Self::GridRaw(slot, _) => *slot,
             Self::GridSubgridRepeat(slot, _) => *slot,
+            Self::GridSourced(slot, _, _) => *slot,
             Self::GridColumnsAuto(_) => 27,
             Self::GridRowsAuto(_) => 28,
             Self::AspectRatio(_, _) => 73,
@@ -6677,7 +6807,7 @@ impl Value {
             }
             Self::GapLength(slot, value) => {
                 let clamped = LengthPercentage { pixels: if value.fraction == 0.0 { value.pixels.max(0.0) } else { value.pixels }, fraction: value.fraction.max(0.0) };
-                let value = if *slot == 184 { value } else { &clamped };
+                let value = &clamped;
                 if *slot == 184 {
                     style.flow_tolerance = FlowTolerance::Length(*value);
                 } else if *slot == 17 {
@@ -6872,7 +7002,16 @@ impl Value {
                 }
                 _ => {}
             },
+            Self::GridSourced(slot, source, inner) => {
+                inner.apply(style);
+                if *slot == 27 {
+                    style.grid_columns_source = Some(source.clone());
+                } else {
+                    style.grid_rows_source = Some(source.clone());
+                }
+            }
             Self::GridColumns(v, names, subgrid) => {
+                clear_grid_source(style, 27);
                 style.grid_columns = Some(v.clone());
                 style.grid_column_names = names.clone();
                 style.grid_columns_subgrid = *subgrid;
@@ -6880,6 +7019,7 @@ impl Value {
                 style.grid_columns_subgrid_repeat = None;
             }
             Self::GridColumnsAuto(auto) => {
+                clear_grid_source(style, 27);
                 style.grid_columns = None;
                 style.grid_column_names = None;
                 style.grid_columns_subgrid = false;
@@ -6894,6 +7034,7 @@ impl Value {
             }
             Self::ZIndex(v) => style.z_index = *v,
             Self::GridRowsAuto(auto) => {
+                clear_grid_source(style, 28);
                 style.grid_rows = None;
                 style.grid_row_names = None;
                 style.grid_rows_subgrid = false;
@@ -6901,6 +7042,7 @@ impl Value {
                 style.grid_rows_subgrid_repeat = None;
             }
             Self::GridRows(v, names, subgrid) => {
+                clear_grid_source(style, 28);
                 style.grid_rows = Some(v.clone());
                 style.grid_row_names = names.clone();
                 style.grid_rows_subgrid = *subgrid;
@@ -6910,6 +7052,7 @@ impl Value {
             Self::GridSubgridRepeat(slot, repeat) => {
                 let fixed_names = (repeat.repeat_lines == 0 && !repeat.prefix_names.is_empty())
                     .then(|| repeat.prefix_names.clone());
+                clear_grid_source(style, *slot);
                 if *slot == 27 {
                     style.grid_columns = Some(Arc::from([]));
                     style.grid_column_names = fixed_names;
@@ -14298,6 +14441,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_columns_subgrid = from.grid_columns_subgrid;
             to.grid_columns_auto = from.grid_columns_auto.clone();
             to.grid_columns_subgrid_repeat = from.grid_columns_subgrid_repeat.clone();
+            to.grid_columns_source = from.grid_columns_source.clone();
         }
         61 => to.grid_auto_columns = from.grid_auto_columns.clone(),
         62 => to.grid_auto_rows = from.grid_auto_rows.clone(),
@@ -14323,6 +14467,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_rows_subgrid = from.grid_rows_subgrid;
             to.grid_rows_auto = from.grid_rows_auto.clone();
             to.grid_rows_subgrid_repeat = from.grid_rows_subgrid_repeat.clone();
+            to.grid_rows_source = from.grid_rows_source.clone();
         }
         29 => {
             to.grid_column = from.grid_column;
@@ -17872,7 +18017,7 @@ fn font_families(raw: &str) -> Option<Arc<[FontFamily]>> {
                 word_start = false;
                 continue;
             }
-            if matches!(ch, '\n' | '\r' | '\u{c}' | '\0') {
+            if ch == '\0' || quoted && matches!(ch, '\n' | '\r' | '\u{c}') {
                 return None;
             }
             if !quoted {
@@ -20460,7 +20605,27 @@ fn grid_function_token_starts(raw: &str, start: usize) -> bool {
     false
 }
 
+fn clear_grid_source(style: &mut Style, slot: usize) {
+    if slot == 27 {
+        if style.grid_columns_source.is_some() {
+            style.grid_columns_source = None;
+        }
+    } else if style.grid_rows_source.is_some() {
+        style.grid_rows_source = None;
+    }
+}
+
 fn grid_resolve(slot: usize, raw: &str, context: LengthContext) -> Option<Value> {
+    let value = grid_resolve_tracks(slot, raw, context)?;
+    if matches!(slot, 27 | 28) {
+        if let Some(source) = grid_source::computed_source(raw, context) {
+            return Some(Value::GridSourced(slot, source, Box::new(value)));
+        }
+    }
+    Some(value)
+}
+
+fn grid_resolve_tracks(slot: usize, raw: &str, context: LengthContext) -> Option<Value> {
     match slot {
         27 | 28 => {
             let tokens = grid_components(raw)?;
@@ -20625,6 +20790,7 @@ fn grid_lanes_shorthand_with_specified(
             tracks.push_str(token);
         }
     }
+    let direction_text = direction.to_ascii_lowercase();
     let direction = if direction.is_empty() {
         GridLanesDirection {
             row: Some(false),
@@ -20678,7 +20844,11 @@ fn grid_lanes_shorthand_with_specified(
         ));
         output.push((
             "grid-lanes-direction",
-            computed_values::serialize_lanes_direction(direction),
+            if direction_text.is_empty() {
+                computed_values::serialize_lanes_direction(direction)
+            } else {
+                direction_text
+            },
         ));
     }
     Some(alloc::vec![
@@ -21259,9 +21429,15 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 "initial" => Some((0.0, 1.0, Value::FlexBasis(Some(0.0)))),
                 _ => {
                     let (mut grow, mut shrink, mut basis, mut valid) = (None, None, None, true);
+                    let mut after_basis = false;
                     for token in components(raw).unwrap_or_default() {
+                        let follows_basis = core::mem::replace(&mut after_basis, false);
                         if let Some(number) = css_scalar(token, false) {
                             if number < 0.0 && !math_function(token) {
+                                valid = false;
+                                break;
+                            }
+                            if follows_basis && grow.is_some() {
                                 valid = false;
                                 break;
                             }
@@ -21277,6 +21453,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                                 break;
                             }
                         } else if basis.is_none() {
+                            after_basis = true;
                             if token.eq_ignore_ascii_case("auto") {
                                 basis = Some(Value::FlexBasis(None));
                             } else if token.eq_ignore_ascii_case("content") {
@@ -28693,19 +28870,29 @@ fn html_presentational_hints(kind: &NodeKind, context: Option<(&Document, NodeId
             hint(Value::BorderCollapse(true));
             side_styles([BorderStyle::Hidden; 4], &mut hint);
         }
-        if let Some(border) = border {
+        if let Some(border) = border.filter(|value| *value != 0) {
             for side in 0..4 {
                 hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(border as f32)));
             }
-            if nonzero_border { side_styles([BorderStyle::Outset; 4], &mut hint); }
+            side_styles([BorderStyle::Outset; 4], &mut hint);
         }
-        if let Some(frame) = attribute("frame").and_then(html_table_frame) { side_styles(frame, &mut hint); }
+        if let Some(frame) = attribute("frame").and_then(html_table_frame) {
+            side_styles(frame, &mut hint);
+            if !nonzero_border {
+                for (side, style) in frame.into_iter().enumerate() {
+                    if style == BorderStyle::Outset {
+                        hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(1.0)));
+                    }
+                }
+            }
+        }
     } else if matches!(tag, "td" | "th") {
         if nonzero_border || rules.is_some() {
             for side in 0..4 { hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(1.0))); }
             side_styles([if nonzero_border { BorderStyle::Inset } else { BorderStyle::None }; 4], &mut hint);
         }
         match rules {
+            _ if nonzero_border => {}
             Some(0..=2) => side_styles([BorderStyle::None; 4], &mut hint),
             Some(3) => {
                 for slot in [111, 112] { hint(Value::LogicalBorder(slot, LogicalBorderComponent::Style(BorderStyle::Solid))); }
@@ -30623,10 +30810,19 @@ fn compute_for_named_registered_inner(
                         html_rendering_table_ancestor(document, node).map(|table| (document, table)));
                     let attribute = |name| if tag == "table" { html_rendering_attribute(attributes, context, name) }
                         else { table.and_then(|(document, table)| document.get_attribute_ns_ref(table, None, name).ok().flatten()) };
-                    if attribute("rules").and_then(html_table_rules).is_some()
-                        || attribute("frame").and_then(html_table_frame).is_some() {
+                    let nonzero_border = attribute("border")
+                        .map(|value| crate::forms::parse_nonnegative_integer(value).unwrap_or(1))
+                        .is_some_and(|value| value != 0);
+                    let framed = attribute("frame").and_then(html_table_frame).is_some();
+                    let ruled = attribute("rules").and_then(html_table_rules).is_some();
+                    let gray = Rgba { r: 128, g: 128, b: 128, a: 255 };
+                    let black = Rgba { r: 0, g: 0, b: 0, a: 255 };
+                    let color = if nonzero_border { Some(gray) }
+                        else if tag == "table" { Some(if framed { black } else { gray }) }
+                        else if ruled || framed { Some(black) } else { None };
+                    if let Some(color) = color {
                         for side in 0..4 {
-                            Value::LogicalBorder(119 + side, LogicalBorderComponent::Color(Rgba { r: 0, g: 0, b: 0, a: 255 })).apply(&mut style);
+                            Value::LogicalBorder(119 + side, LogicalBorderComponent::Color(color)).apply(&mut style);
                         }
                     }
                 }
@@ -34195,10 +34391,10 @@ mod tests {
         let group_style = compute_node(&document, group, Some(&table_style), &index).unwrap();
         let row_style = compute_node(&document, row, Some(&group_style), &index).unwrap();
         let cell_style = compute_node(&document, cell, Some(&row_style), &index).unwrap();
-        assert_eq!(cell_style.used_border_widths(), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(cell_style.used_border_widths(), [1.0; 4]);
         assert_eq!(cell_style.text_align, TextAlign::Center);
         assert_eq!(core::array::from_fn::<_, 4, _>(|side| cell_style.border_color_sides[side].unwrap_or(cell_style.border_color)),
-            [Rgba { r: 0, g: 0, b: 0, a: 255 }; 4]);
+            [Rgba { r: 128, g: 128, b: 128, a: 255 }; 4]);
         document.set_attribute(cell, "style", "border:3px solid green;text-align:left").unwrap();
         let authored = compute_node(&document, cell, Some(&row_style), &index).unwrap();
         assert_eq!(authored.used_border_widths(), [3.0; 4]);

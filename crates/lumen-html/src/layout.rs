@@ -3259,6 +3259,15 @@ struct TableColumnSpan {
     origin_rank: u8,
 }
 
+impl TableColumnSpan {
+    /// Columns, and column groups without column children, size the columns they cover individually.
+    fn sizes_each_column(&self, spans: &[TableColumnSpan]) -> bool {
+        self.origin_rank == 3 || (self.origin_rank == 2 && self.end_column > self.first_column
+            && !spans.iter().any(|column| column.origin_rank == 3
+                && column.first_column >= self.first_column && column.end_column <= self.end_column))
+    }
+}
+
 struct TableCellInput {
     source: TableCellContent,
     row: usize,
@@ -8235,10 +8244,15 @@ fn flex_cross_baseline(
     let container_vertical = container.writing_mode != css::WritingMode::HorizontalTb;
     let item_vertical = item.writing_mode != css::WritingMode::HorizontalTb;
     let cross_horizontal = !row;
-    if container_vertical != cross_horizontal && item_vertical != cross_horizontal {
-        return None;
-    }
     let (before, after) = if row { (0, 2) } else { (3, 1) };
+    if container_vertical != cross_horizontal && item_vertical != cross_horizontal {
+        if content_only || item.margin_auto[before] || item.margin_auto[after] {
+            return None;
+        }
+        let far = (group == 1) ^ container.axis_start_is_far(cross_horizontal) ^ container.flex_wrap_reverse;
+        let position = if far { (cross - item.margin_sides[after]).max(0.0) } else { item.margin_sides[before] };
+        return Some(FlexBaselineParticipant { slot: group * 2 + usize::from(far), far, position, content_only });
+    }
     if item.margin_auto[before] || item.margin_auto[after] {
         return None;
     }
@@ -11206,6 +11220,15 @@ impl LayoutGeometry {
         }
         Some((port.rect, matrix.inverse()?))
     }
+    /// Fragments as CSSOM reports them: a table reports its wrapper box,
+    /// which includes the captions, while layout and painting keep the grid.
+    pub(crate) fn client_hit_rects(&self,index:usize)->impl Iterator<Item=Rect>+'_ {
+        let wrapper=self.transform_reference_boxes.as_deref()
+            .and_then(|entries|entries.by_hit.get(&index))
+            .filter(|value|!value.svg).map(|value|value.rect);
+        let rects=if wrapper.is_some() {&[][..]} else {self.hit_rects(index)};
+        wrapper.into_iter().chain(rects.iter().copied())
+    }
     pub(crate) fn hit_rects(&self,index:usize)->&[Rect] {
         match self.hit_fragments.binary_search_by_key(&index,|entry|entry.hit) {
             Ok(at)=>&self.hit_fragments[at].rects,
@@ -14152,7 +14175,7 @@ fn table_grow_span(
         return Ok(());
     }
     let rank = |column: usize| {
-        if percentages[column] == 0.0 && !constrained[column] && originating[column] {
+        if percentages[column] == 0.0 && !constrained[column] && (originating[column] || preferred[column] <= 0.0) {
             if preferred[column] > 0.0 {
                 0
             } else {
@@ -17104,11 +17127,9 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 let children=self.table_box_children(&source,available,depth+2)?;
                 self.table_rows(source.identity().0,source.style(),rows,row_cells,cell_children,groups,available,depth+1,Some(&children))?;
                 let end_row=rows.len();
-                if end_row>first_row {
-                    if groups.len()>=4096 {return Err(LayoutError::CommandLimit);}
-                    groups.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                    groups.push(TableRowGroup{identity:source.identity(),first_row,end_row,style:source.style().clone()});
-                }
+                if groups.len()>=4096 {return Err(LayoutError::CommandLimit);}
+                groups.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                groups.push(TableRowGroup{identity:source.identity(),first_row,end_row,style:source.style().clone()});
             }
         }
         self.flush_anonymous_table_cell(id,style,&mut anonymous_cell,row_cells,cell_children)?;
@@ -17341,6 +17362,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         if prefix==(0.0,0.0)&&children.peek().is_none()
             && !self.rules.has_typographic_content()
             && style.text_transform==css::TextTransform::None
+            && style.text_indent.pixels==0.0
             && matches!(style.white_space,WhiteSpace::Normal|WhiteSpace::NoWrap) {
             if let Some(FlattenedBoxChild{kind:FlattenedBoxChildKind::Node(node),..})=first {
                 if let Ok(NodeKind::Text(value)|NodeKind::CData(value))=self.document.kind(*node) {
@@ -17388,7 +17410,11 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         collector.intrinsic_inline_axis = if (if horizontal { style.width } else { style.height }).is_none() {
             Some(horizontal)
         } else { None };
-        let mut paragraph=InlineParagraph::default();let mut frames=Vec::new();
+        let mut paragraph=InlineParagraph{
+            first_line_indent:if prefix==(0.0,0.0) {style.text_indent.pixels.max(0.0)}else{0.0},
+            ..InlineParagraph::default()
+        };
+        let mut frames=Vec::new();
         let mut case_context = None;
         let mut inline_only=true;
         for child in first.into_iter().chain(children) {
@@ -17801,7 +17827,8 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 });
             Ok(())
         })?;
-        let column_spans = self.table_columns(id, style, physical_available, depth, source_children)?;
+        let mut column_spans = self.table_columns(id, style, physical_available, depth, source_children)?;
+        if rows.is_empty() { column_spans.clear(); }
         columns = columns.max(column_spans.iter().map(|span| span.end_column).max().unwrap_or(0));
         if columns > widths.len() {
             return Err(LayoutError::CommandLimit);
@@ -17928,7 +17955,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                     )?;
                 }
             }
-            for group in &row_groups {
+            for group in row_groups.iter().filter(|group| group.end_row > group.first_row) {
                 offer_collapsed_border_rect(
                     &mut horizontal[group.first_row][..],
                     &group.style,
@@ -18045,7 +18072,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         } else {
             (None, None)
         };
-        let collapsed_x_widths = collapsed_vertical.as_ref().map(|edges| {
+        let mut collapsed_x_widths = collapsed_vertical.as_ref().map(|edges| {
             edges
                 .iter()
                 .map(|line| {
@@ -18059,7 +18086,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 })
                 .collect::<Vec<_>>()
         });
-        let collapsed_y_widths = collapsed_horizontal.as_ref().map(|edges| {
+        let mut collapsed_y_widths = collapsed_horizontal.as_ref().map(|edges| {
             edges
                 .iter()
                 .map(|line| {
@@ -18070,6 +18097,9 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 })
                 .collect::<Vec<_>>()
         });
+        if columns == 0 {
+            for edges in collapsed_x_widths.iter_mut().chain(collapsed_y_widths.iter_mut()) { edges.fill(0.0); }
+        }
         let automatic = !style.table_fixed || axes.preferred(&style, true).is_none();
         let mut constrained_columns = [false; 256];
         let mut originating_columns = [false; 256];
@@ -18114,21 +18144,21 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 let adjusted=|value:f32| if source.box_sizing == BoxSizing::BorderBox {(value-offsets).max(0.0)}else{value.max(0.0)};
                 let specified=if axes.percentage(&source, true, 0){0.0}else{axes.preferred(&source, true).map_or(0.0,adjusted)};
                 let specified_minimum=if axes.percentage(&source, true, 1){0.0}else{adjusted(axes.minimum(&source, true))};
-                let minimum_content=content_minimum.max(specified).max(specified_minimum);
+                let minimum_content=content_minimum.max(specified_minimum);
                 let maximum=if axes.percentage(&source, true, 2){f32::MAX}else{axes.maximum(&source, true).map_or(f32::MAX,adjusted)};
-                let preferred=if cell.cols==1&&constrained_columns[cell.col] {specified}else{content_maximum};
+                let preferred=if cell.cols==1&&constrained_columns[cell.col] {specified.max(content_minimum)}else{content_maximum.max(specified)};
                 let content=if minimum{minimum_content}else{preferred.min(maximum).max(minimum_content)};
                 (content+offsets-internal).max(0.0)
             };
             // Column measures precede spanning cells. Column-group constraints
             // then use the same span distribution as cells, without manufacturing
             // a column node or measuring its descendants.
-            for span in column_spans.iter().filter(|span| span.origin_rank == 3) {
+            for span in column_spans.iter().filter(|span| span.sizes_each_column(&column_spans)) {
                 let definite = if axes.percentage(&span.style, true, 0) { 0.0 } else {
                     axes.preferred(&span.style, true).unwrap_or(0.0)
                 };
-                let minimum = if axes.percentage(&span.style, true, 1) { definite } else {
-                    definite.max(axes.minimum(&span.style, true))
+                let minimum = if axes.percentage(&span.style, true, 1) { 0.0 } else {
+                    axes.minimum(&span.style, true)
                 };
                 let maximum = if axes.percentage(&span.style, true, 2) { definite } else {
                     axes.maximum(&span.style, true).map_or(definite, |maximum| definite.min(maximum))
@@ -18145,19 +18175,6 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 widths[cell.col] = widths[cell.col].max(required(cell, false).max(required(cell, true)));
                 intrinsic_percentages[cell.col] = intrinsic_percentages[cell.col]
                     .max(cell.source.style().table_axis_percentage(axes.horizontal(true)).unwrap_or(0.0));
-            }
-            for span in column_spans.iter().filter(|span| span.origin_rank == 2 && span.end_column > span.first_column) {
-                if !axes.percentage(&span.style, true, 0) {
-                    let minimum = axes.preferred(&span.style, true).unwrap_or(0.0).max(if axes.percentage(&span.style, true, 1) { 0.0 } else { axes.minimum(&span.style, true) });
-                    let baseline = minimum_tracks;
-                    table_grow_span(&mut minimum_tracks[..columns], &baseline[..columns], &widths[..columns],
-                        &constrained_columns[..columns], &originating_columns[..columns], &intrinsic_percentages[..columns],
-                        span.first_column, span.end_column-span.first_column, minimum, spacing_x)?;
-                    let baseline = widths;
-                    table_grow_span(&mut widths[..columns], &baseline[..columns], &baseline[..columns],
-                        &constrained_columns[..columns], &originating_columns[..columns], &intrinsic_percentages[..columns],
-                        span.first_column, span.end_column-span.first_column, minimum, spacing_x)?;
-                }
             }
             // One bounded index vector keeps row-major cells intact for painting.
             let mut span_order = Vec::new();
@@ -18197,19 +18214,6 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             }
             // Percentages are intrinsic constraints, capped in logical column
             // order. A spanning constraint never overwrites a single-column one.
-            for span in column_spans.iter().filter(|span| span.origin_rank == 2 && span.end_column > span.first_column) {
-                if let Some(percentage) = span.style.table_axis_percentage(axes.horizontal(true)) {
-                    let range=span.first_column..span.end_column;
-                    let remaining=(percentage-intrinsic_percentages[range.clone()].iter().sum::<f32>()).max(0.0);
-                    let eligible=range.filter(|column|intrinsic_percentages[*column]==0.0);
-                    let total=eligible.clone().map(|column|widths[column]).sum::<f32>();
-                    let count=eligible.clone().count();
-                    // Capture eligibility before mutation; no per-node metadata.
-                    let mut shares=[0.0f32;256];
-                    for column in eligible {shares[column]=if total>0.0{widths[column]/total}else{1.0/count as f32};}
-                    for column in span.first_column..span.end_column {intrinsic_percentages[column]+=remaining*shares[column];}
-                }
-            }
             let mut remaining_percentage=1.0f32;
             for percentage in &mut intrinsic_percentages[..columns] {
                 *percentage=percentage.min(remaining_percentage);
@@ -18244,7 +18248,7 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             // table's track area after border spacing is removed.
             let track_width = (initial_width - gaps - collapsed_edge_sum).max(0.0);
             let mut explicit_columns = [false; 256];
-            for span in column_spans.iter().filter(|span| span.origin_rank == 3) {
+            for span in column_spans.iter().filter(|span| span.sizes_each_column(&column_spans)) {
                 let first = span.first_column.min(columns);
                 let end = span.end_column.min(columns);
                 if span.style.table_axis_behaves_as_auto_math(axes.horizontal(true)) { continue; }
@@ -18633,18 +18637,33 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         }
         for row in 0..rows.len() {
             heights[row] = heights[row].max(baseline_ascent[row] + baseline_descent[row]);
-            if let Some(row_height) = axes.preferred(&rows[row].style, false).filter(|_| !axes.percentage(&rows[row].style, false, 0)) {
+            if let Some(row_height) = axes.preferred(&rows[row].style, false).filter(|_| columns > 0 && !axes.percentage(&rows[row].style, false, 0)) {
                 heights[row] =
                     heights[row].max(axes.content_dimension(&rows[row].style, row_height, false));
             }
         }
-        for cell in &cells {
-            if cell.rows == 1 {
-                continue;
+        {
+            let mut constrained_rows = alloc::vec![false; rows.len()];
+            for (row, source) in rows.iter().enumerate() {
+                constrained_rows[row] = axes.preferred(&source.style, false).is_some() && !axes.percentage(&source.style, false, 0);
             }
-            let end_row = (cell.row + cell.rows).min(rows.len());
-            grow_table_row_span(&mut heights, cell.row..end_row,
-                required_cell_height(cell), spacing_y);
+            let mut requests = Vec::new();
+            for cell in &cells {
+                if cell.rows == 1 {
+                    let source = cell.source.style();
+                    if axes.preferred(source, false).is_some() && !axes.percentage(source, false, 0) {
+                        constrained_rows[cell.row] = true;
+                    }
+                    continue;
+                }
+                requests.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+                requests.push(crate::table_rowspan::RowspanRequest {
+                    start: cell.row,
+                    end: (cell.row + cell.rows).min(rows.len()),
+                    required: required_cell_height(cell),
+                });
+            }
+            crate::table_rowspan::distribute_rowspans(&mut heights, &constrained_rows, requests, spacing_y);
         }
         if !style.border_collapse {
             for (row, height) in heights.iter_mut().enumerate() {
@@ -18659,8 +18678,22 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         for group in &row_groups {
             if !axes.percentage(&group.style, false, 0) {
                 if let Some(height) = axes.preferred(&group.style, false) {
-                    grow_table_row_span(&mut heights, group.first_row..group.end_row,
-                        axes.content_dimension(&group.style, height, false), spacing_y);
+                    let group_height = axes.content_dimension(&group.style, height, false);
+                    let mut constrained_rows = alloc::vec![false; group.end_row - group.first_row];
+                    for row in group.first_row..group.end_row {
+                        let source = &rows[row].style;
+                        if axes.percentage(source, false, 0) {
+                            let resolved = axes.resolve(source, original_width, Some(group_height), self.container_units.get());
+                            if let Some(percent_height) = axes.preferred(&resolved, false) {
+                                heights[row] = heights[row].max(axes.content_dimension(&resolved, percent_height, false));
+                            }
+                            constrained_rows[row - group.first_row] = true;
+                        } else if axes.preferred(source, false).is_some() {
+                            constrained_rows[row - group.first_row] = true;
+                        }
+                    }
+                    crate::table_rowspan::distribute_group_height(&mut heights[group.first_row..group.end_row],
+                        &constrained_rows, 0..group.end_row - group.first_row, group_height, spacing_y);
                 }
             }
         }
@@ -18749,7 +18782,8 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
         let visible_rows = (0..rows.len()).filter(|row| !row_is_collapsed(*row)).count();
         let height = heights.iter().enumerate().filter(|(row, _)| !row_is_collapsed(*row))
             .map(|(_, height)| *height).sum::<f32>()
-            + if visible_rows > 0 || rows.is_empty() { spacing_y * (visible_rows + 1) as f32 } else { 0.0 }
+            + if columns == 0 && axes.preferred(style, false).is_none() { 0.0 }
+                else if visible_rows > 0 || rows.is_empty() { spacing_y * (visible_rows + 1) as f32 } else { 0.0 }
             + collapsed_vertical_sum;
         // CSS 2.1 §17.5.3 makes height a minimum for the table itself,
         // including an empty grid with no row to receive distributed space.
@@ -18829,8 +18863,14 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 + if row_is_collapsed(row) { 0.0 } else { height + spacing_y });
         }
         let track_source = |first: usize, end: usize, top: usize, bottom: usize| {
-            let cell_width = (xs[end] - xs[first] - spacing_x).max(0.0);
             let cell_height = (ys[bottom] - ys[top] - spacing_y).max(0.0);
+            if columns == 0 {
+                // A grid without columns still gives its rows and groups the table's inner width.
+                let left = if style.border_collapse { collapsed_x_widths.as_deref().map_or(0.0, |edges| edges[0] * 0.5) } else { insets[3] };
+                let top_edge = if style.border_collapse { collapsed_y_widths.as_deref().map_or(0.0, |edges| edges[0] * 0.5) } else { insets[0] + spacing_y };
+                return Rect { x: left, y: top_edge + ys[top], width: (width - collapsed_edge_sum).max(0.0), height: cell_height };
+            }
+            let cell_width = (xs[end] - xs[first] - spacing_x).max(0.0);
             if style.border_collapse {
                 let x_edges = collapsed_x_widths.as_deref().unwrap();
                 let y_edges = collapsed_y_widths.as_deref().unwrap();
@@ -18851,7 +18891,8 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
             self.finish_hit(hit,rect);
         }
         for group in &row_groups {
-            let rect=track_rect(0,columns,group.first_row,group.end_row);
+            let mut rect=track_rect(0,columns,group.first_row,group.end_row);
+            if group.end_row==group.first_row {rect.width=0.0;rect.height=0.0;}
             let hit=self.begin_hit_with_kind(group.identity.0,group.identity.1,
                 group.style.pointer_events_auto&&group.style.visibility_visible)?;
             self.finish_hit(hit,rect);
@@ -19736,7 +19777,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     if column.style().display!=Display::TableColumn {continue;}
                     let end=next.checked_add(html_span(self.document,&column).unwrap_or(1)).filter(|end|*end<=256).ok_or(LayoutError::CommandLimit)?;
                     spans.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
-                    spans.push(TableColumnSpan{identity:column.identity(),first_column:next,end_column:end,style:column.style().clone(),origin_rank:3});next=end;
+                    let mut column_style=column.style().clone();
+                    column_style.inherit_table_column_width(source.style());
+                    spans.push(TableColumnSpan{identity:column.identity(),first_column:next,end_column:end,style:column_style,origin_rank:3});next=end;
                 }
                 if first==next {
                     // CSS groups cover their actual columns; irrelevant content
@@ -20819,7 +20862,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     fn intrinsic_flex_children(
         &self, id: NodeId, children: &[FlattenedBoxChild], style: &Style, depth: usize, minimum: bool,
     ) -> Result<(f32, f32), LayoutError> {
-        let axes = GridAxes::new(style);
         let row = style.flex_main_axis_horizontal();
         let main_gap = if matches!(style.flex_direction, FlexDirection::Row | FlexDirection::RowReverse) {
             resolved_gap(style.column_gap.unwrap_or(0.0), style.column_gap_fraction, None)
@@ -20839,6 +20881,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         if style.flex_wrap {
             contributions.try_reserve(children.len()).map_err(|_| LayoutError::CommandLimit)?;
         }
+        let wrap_limit = if style.flex_wrap {
+            let limit = if !row {
+                style.height.map(|height| constrained_height(style, content_height_dimension(style, height)))
+            } else {
+                style.width.map(|width| constrained_width(style, content_dimension(style, width)))
+            };
+            limit.filter(|limit| limit.is_finite())
+        } else {
+            None
+        };
         let (mut main_sum, mut main_largest, mut cross_largest, mut count) = (0.0f32, 0.0f32, 0.0f32, 0usize);
         let sources = self.anonymous_formatting_items(children.iter().cloned(), style)?;
         for source in sources {
@@ -20908,35 +20960,49 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else {
                 measure(&computed, minimum)?
             };
-            let (inline, block) = axes.logical((w, h));
-            let (mut item_main, item_cross) = if row { (inline, block) } else { (block, inline) };
-            if !row && !inflexible && !computed.flex_basis_content && computed.flex_basis_intrinsic.is_none() {
+            let (mut item_main, item_cross) = if row { (w, h) } else { (h, w) };
+            let mut wrap_main = item_main;
+            let vertical_mode = style.writing_mode != css::WritingMode::HorizontalTb;
+            if !computed.flex_basis_content && computed.flex_basis_intrinsic.is_none() {
                 if let Some(flex_basis) = computed.resolve_flex_basis_percentage(None) {
-                    let margins = if computed.margin_auto[0] { 0.0 } else { computed.margin_sides[0] }
-                        + if computed.margin_auto[2] { 0.0 } else { computed.margin_sides[2] };
-                    item_main = item_main.max(
-                        content_height_dimension(&computed, flex_basis) + box_edges(&computed, false) + margins,
-                    );
+                    let (before, after) = if row { (3, 1) } else { (0, 2) };
+                    let margins = if computed.margin_auto[before] { 0.0 } else { computed.margin_sides[before] }
+                        + if computed.margin_auto[after] { 0.0 } else { computed.margin_sides[after] };
+                    let basis_outer = if row {
+                        content_dimension(&computed, flex_basis)
+                    } else {
+                        content_height_dimension(&computed, flex_basis)
+                    } + box_edges(&computed, row) + margins;
+                    let hypothetical = || -> Result<f32, LayoutError> {
+                        let automatic = if row { computed.min_width_auto } else { computed.min_height_auto };
+                        if !automatic {
+                            return Ok(basis_outer);
+                        }
+                        let least = measure(&computed, true)?;
+                        Ok(basis_outer.max(if row { least.0 } else { least.1 }))
+                    };
+                    if wrap_limit.is_some() {
+                        wrap_main = hypothetical()?;
+                    }
+                    if row && vertical_mode && !inflexible {
+                        item_main = hypothetical()?;
+                    } else if !row && !vertical_mode && !inflexible {
+                        item_main = item_main.max(basis_outer);
+                    }
                 }
             }
             main_sum += item_main;
             main_largest = main_largest.max(item_main);
             cross_largest = cross_largest.max(item_cross);
             if style.flex_wrap {
-                contributions.push((item_main, item_cross));
+                contributions.push((wrap_main, item_cross));
             }
             count += 1;
         }
         let gaps = main_gap * count.saturating_sub(1) as f32;
         let main = if minimum && style.flex_wrap { main_largest } else { main_sum + gaps };
         if style.flex_wrap {
-            let main_vertical = row == axes.vertical;
-            let definite_main = if main_vertical {
-                style.height.map(|height| constrained_height(style, content_height_dimension(style, height)))
-            } else {
-                style.width.map(|width| constrained_width(style, content_dimension(style, width)))
-            };
-            if let Some(limit) = definite_main.filter(|limit| limit.is_finite()) {
+            if let Some(limit) = wrap_limit {
                 let (mut total, mut line_main, mut line_cross, mut lines, mut in_line) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
                 for (item_main, item_cross) in contributions {
                     if in_line > 0 && line_main + main_gap + item_main > limit {
@@ -20955,8 +21021,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 cross_largest = total + cross_gap * lines.saturating_sub(1) as f32;
             }
         }
-        let (inline, block) = if row { (main, cross_largest) } else { (cross_largest, main) };
-        Ok(axes.physical((inline, block)))
+        Ok(if row { (main, cross_largest) } else { (cross_largest, main) })
     }
 
     /// The flattened children of a container for intrinsic sizing. A flex or
@@ -22360,6 +22425,63 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         let flattened = match prepared_children { Some(children) => children,
             None => self.grid_box_children(parent, style, physical_width, depth + 1)? };
+        if style.grid_lead == [0, 0] {
+            let areas = style.grid_areas.as_deref().unwrap_or(&[]);
+            let mut lead = [0usize; 2];
+            for child in &flattened {
+                let Some(child_style) = child.computed_style.as_ref() else {
+                    continue;
+                };
+                if child_style.display == Display::None
+                    || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                {
+                    continue;
+                }
+                let leading = |placement: css::GridPlacement,
+                               spec: Option<&str>,
+                               names: &[css::GridNamedLine],
+                               explicit: usize,
+                               horizontal: bool| {
+                    css::resolve_grid_placement_signed(
+                        placement, spec, names, explicit, areas, horizontal, 0,
+                    )
+                    .and_then(|placement| placement.start)
+                    .filter(|start| *start < 0)
+                    .map_or(0, |start| start.unsigned_abs() as usize)
+                };
+                lead[0] = lead[0].max(leading(
+                    child_style.grid_column,
+                    child_style.grid_column_spec.as_deref(),
+                    &column_names_storage,
+                    explicit_column_count,
+                    true,
+                ));
+                lead[1] = lead[1].max(leading(
+                    child_style.grid_row,
+                    child_style.grid_row_spec.as_deref(),
+                    &row_names_storage,
+                    explicit_row_count,
+                    false,
+                ));
+            }
+            lead[0] = lead[0].min(MAX_GRID_TRACKS.saturating_sub(columns));
+            lead[1] = lead[1].min(MAX_GRID_TRACKS.saturating_sub(rows));
+            if lead != [0, 0] {
+                if let Some(shifted) = style.with_leading_grid_tracks(lead[0], lead[1]) {
+                    return self.grid_children(
+                        parent,
+                        &shifted,
+                        x,
+                        y,
+                        physical_width,
+                        depth,
+                        owner_hit,
+                        negatives_laid,
+                        Some(flattened),
+                    );
+                }
+            }
+        }
         let mut flattened_generated = Vec::new();
         let flattened=self.anonymous_formatting_items(flattened,style)?;
         for item in flattened {
@@ -22416,25 +22538,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                                 span: area.rows,
                             };
                         }
-                        let column = css::resolve_grid_placement(
+                        let column = css::resolve_grid_placement_led(
                             computed.grid_column,
                             computed.grid_column_spec.as_deref(),
                             &column_names_storage,
                             explicit_column_count,
                             style.grid_areas.as_deref().unwrap_or(&[]),
                             true,
+                                style.grid_lead[0],
                         )
                         .unwrap_or(css::GridPlacement {
                             start: None,
                             span: 1,
                         });
-                        let row = css::resolve_grid_placement(
+                        let row = css::resolve_grid_placement_led(
                             computed.grid_row,
                             computed.grid_row_spec.as_deref(),
                             &row_names_storage,
                             explicit_row_count,
                             style.grid_areas.as_deref().unwrap_or(&[]),
                             false,
+                                style.grid_lead[1],
                         )
                         .unwrap_or(css::GridPlacement {
                             start: None,
@@ -22462,25 +22586,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             span: area.rows,
                         };
                     }
-                    computed.grid_column = css::resolve_grid_placement(
+                    computed.grid_column = css::resolve_grid_placement_led(
                         computed.grid_column,
                         computed.grid_column_spec.as_deref(),
                         &column_names_storage,
                         explicit_column_count,
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         true,
+                            style.grid_lead[0],
                     )
                     .unwrap_or(css::GridPlacement {
                         start: None,
                         span: 1,
                     });
-                    computed.grid_row = css::resolve_grid_placement(
+                    computed.grid_row = css::resolve_grid_placement_led(
                         computed.grid_row,
                         computed.grid_row_spec.as_deref(),
                         &row_names_storage,
                         explicit_row_count,
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         false,
+                            style.grid_lead[1],
                     )
                     .unwrap_or(css::GridPlacement {
                         start: None,
@@ -22557,25 +22683,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     span: area.rows,
                 };
             }
-            computed.grid_column = css::resolve_grid_placement(
+            computed.grid_column = css::resolve_grid_placement_led(
                 computed.grid_column,
                 computed.grid_column_spec.as_deref(),
                 &column_names_storage,
                 explicit_column_count,
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 true,
+                    style.grid_lead[0],
             )
             .unwrap_or(css::GridPlacement {
                 start: None,
                 span: 1,
             });
-            computed.grid_row = css::resolve_grid_placement(
+            computed.grid_row = css::resolve_grid_placement_led(
                 computed.grid_row,
                 computed.grid_row_spec.as_deref(),
                 &row_names_storage,
                 explicit_row_count,
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 false,
+                    style.grid_lead[1],
             )
             .unwrap_or(css::GridPlacement {
                 start: None,
@@ -22721,7 +22849,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 let (tracks, names) = expand_auto_repeat(auto, repetitions)?;
                 let mut count = tracks.len().max(1);
                 for item in &mut items {
-                    let placement = css::resolve_grid_placement(
+                    let placement = css::resolve_grid_placement_led(
                         if row {
                             item.style.grid_row
                         } else {
@@ -22736,6 +22864,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         tracks.len(),
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         !row,
+                            style.grid_lead[usize::from(row)],
                     )
                     .unwrap_or(css::GridPlacement {
                         start: None,
@@ -25376,6 +25505,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 },
                 None => style.item_alignment(false),
             };
+            let alignment = if alignment.is_baseline() {
+                css::ItemAlignment {
+                    alignment: if alignment.is_last_baseline() { AlignItems::End } else { AlignItems::Start },
+                    keyword: None,
+                    safe: None,
+                }
+            } else {
+                alignment
+            };
             let cross = alignment.offset(cross_extent - cross_size, style, &item_style, !main_horizontal, style.flex_wrap_reverse);
             let (dx, dy) = if main_horizontal { (main, cross) } else { (cross, main) };
             let local=self.content_overflow_origin(x,y);
@@ -25608,9 +25746,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if range.start >= range.end {
                 continue;
             }
+            let indent = if paragraph_index == 0 { paragraph.first_line_indent } else { 0.0 };
             if want_maximum {
                 let visible_end = Self::paragraph_hanging_end(paragraph, range.clone(), true, true);
-                maximum_width = maximum_width.max(self.inline_paragraph_edge_width(
+                maximum_width = maximum_width.max(indent + self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
@@ -25636,7 +25775,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
                 let segment = segment_start..segment_end;
                 let visible_end = Self::paragraph_visible_end(paragraph, segment.clone(), true);
-                minimum_width = minimum_width.max(self.inline_paragraph_edge_width(
+                let segment_indent = if segment_start == range.start { indent } else { 0.0 };
+                minimum_width = minimum_width.max(segment_indent + self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
@@ -25647,7 +25787,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if segment_start < range.end {
                 let visible_end =
                     Self::paragraph_visible_end(paragraph, segment_start..range.end, true);
-                minimum_width = minimum_width.max(self.inline_paragraph_edge_width(
+                let segment_indent = if segment_start == range.start { indent } else { 0.0 };
+                minimum_width = minimum_width.max(segment_indent + self.inline_paragraph_edge_width(
                     paragraph,
                     &bidi,
                     paragraph_index,
@@ -26354,7 +26495,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             let mut cursor = start;
             let mut actual_cross = 0.0f32;
-            for item in items.iter_mut() {
+            let last_index = items.len() - 1;
+            for (item_index, item) in items.iter_mut().enumerate() {
                 cursor += if item.style.margin_auto[main_start] {
                     auto_margin
                 } else {
@@ -26421,10 +26563,20 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     .map_or(0, |geometry| geometry.hits.len());
                 let local=self.content_overflow_origin(x,y);
                 let child_local=if row {(local.0+f64::from(main_pos),local.1)}else{(local.0,local.1+f64::from(main_pos))};
-                let (child_x, child_y) = if row {
-                    (x + main_pos, y)
+                let end_aligned = !reverse
+                    && item_index == last_index
+                    && (main_pos + item.main - available).abs() < 0.01;
+                let main_origin = if end_aligned {
+                    (if row { x + available } else { y + available }) - item.main
+                } else if row {
+                    x + main_pos
                 } else {
-                    (x, y + main_pos)
+                    y + main_pos
+                };
+                let (child_x, child_y) = if row {
+                    (main_origin, y)
+                } else {
+                    (x, main_origin)
                 };
                 let saved_baselines = self.flow_baselines.take();
                 let saved_content = self.flow_content_ranges.take();
@@ -28870,6 +29022,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             Self::paragraph_output_push(paragraph, &mut output, ' ')?;
                         }
                     }
+                } else if output.is_empty()
+                    && matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
+                    && paragraph.text.ends_with([' ', '\t'])
+                    && paragraph.spans.last().is_some_and(|span| span.style.white_space == WhiteSpace::NoWrap)
+                {
+                    // The collapsed space still offers the wrapping box's break opportunity
+                    // after a preceding no-wrap box's trailing space.
+                    Self::paragraph_output_push(paragraph, &mut output, '\u{200b}')?;
                 }
                 paragraph.collapse_space = true;
             } else {
@@ -32556,9 +32716,10 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                     if token.source_range.as_ref().is_some_and(|range|range.start>=visible_end){leading_hang+=token.width;}
                     else {break;}
                 }
-                let mut x = line_left + *advance + first_line_indent
+                let indent_offset = if block_style.used_direction() == Direction::Rtl { 0.0 } else { first_line_indent };
+                let mut x = line_left + *advance + indent_offset
                     - leading_hang.min((line_width-visible_width).max(0.0));
-let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*advance)+f64::from(first_line_indent)-f64::from(leading_hang.min((line_width-visible_width).max(0.0)));
+let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*advance)+f64::from(indent_offset)-f64::from(leading_hang.min((line_width-visible_width).max(0.0)));
                 for token in &mut tokens {
                     token.layout_x=layout_x;layout_x+=f64::from(token.width);
                     token.x = x;
@@ -38219,6 +38380,18 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         ));
                     }
                 }
+                if had_definite_width && style.display.is_table() {
+                    // A table is never narrower than its min-content width.
+                    let mut measured = style.clone();
+                    measured.width = None;
+                    let (minimum, _) = self.box_source_intrinsic_size(id, &measured, depth + 1, true, generated)?;
+                    let edges = box_edges(style, true);
+                    if let Some(width) = style.width {
+                        if minimum > content_dimension(style, width) + edges {
+                            style.width = Some(specified_dimension(style, (minimum - edges).max(0.0)));
+                        }
+                    }
+                }
                 let table_block_fit = style.display.is_table()
                     && !(style.align_self == Some(AlignItems::Stretch)
                         && style.align_self_keyword != Some(css::AlignmentKeyword::Normal)
@@ -40669,6 +40842,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 self.flex_children(id, &style, content_x, cursor, content_width, depth,
                     virtual_parent.then(|| core::mem::take(&mut flattened_block_children)))?;
             self.advance_layout_cursor(&mut cursor, height);
+            if vertical_block_flow {
+                vertical_content_extent = vertical_content_extent.max(height);
+            }
             content_extent_width = content_extent_width.max(extent_width);
             None
         } else {
@@ -42072,11 +42248,15 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         // bottom margin, even though those boxes still join following siblings.
         let cleared_bottom_chain = block_children.iter().rev().take_while(|child| child.through.is_some())
             .any(|child| child.break_before);
+        let size_constrained = min_height_affects_used_size
+            || constrained_height(&style, content_extent_without_last_margin) != content_extent_without_last_margin;
         let bottom_collapses = bottom_edge && last_was_block && style.height.is_none()
-            && !min_height_affects_used_size && !cleared_bottom_chain;
+            && !size_constrained && !cleared_bottom_chain;
         if bottom_collapses {
             m_bottom = m_bottom.merge(previous_margin);
             content_extent_height -= previous_margin.value();
+        } else if bottom_edge && last_was_block && style.height.is_none() && size_constrained && !cleared_bottom_chain {
+            content_extent_height = content_extent_without_last_margin;
         }
         // A negative last margin may temporarily put the flow cursor above
         // the content end. Exclude the adjoining margin before constraining
@@ -43662,7 +43842,7 @@ fn specification_table_intrinsic_grid_precedes_definite_shortcuts_and_ignores_on
     for selector in ["#wrapper","table"] {
         let node=crate::selector::query_selector(&document,document.root(),selector).unwrap().unwrap();
         let rect=geometry.hits.iter().find(|hit|hit.node==node).unwrap().rect;
-        assert_eq!((rect.width,rect.height),(70.0,40.0),"table declarations are minima: {selector}");
+        assert_eq!((rect.width,rect.height),(10.0,40.0),"cell width is a maximum contribution and does not raise the table beyond its width: {selector}");
     }
 }
 
@@ -56206,8 +56386,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
-    fn specification_table_cell_width_raises_minimum_without_hiding_unbreakable_content() {
-        for (preferred, expected) in [(10, 66.0f32), (80, 86.0)] {
+    fn specification_table_cell_width_does_not_raise_minimum_or_hide_unbreakable_content() {
+        for (preferred, expected) in [(10, 66.0f32), (80, 66.0)] {
             let markup = alloc::format!("<style>body{{margin:0}}table{{width:20px;border-spacing:0}}td{{width:{preferred}px;padding:2px;border:1px solid black}}</style><table><tr><td>ABCDEFGHIJ</td></tr></table>");
             let document = crate::html::parse(&markup, 64).unwrap();
             let rules = stylesheets(&document).unwrap();

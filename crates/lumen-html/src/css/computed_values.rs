@@ -1452,7 +1452,7 @@ impl<'a> OrderedNames<'a> {
         }
     }
 }
-fn named_tracks(
+pub(super) fn named_tracks(
     tracks: &[GridTrack],
     names: &[GridNamedLine],
     used: Option<&[f32]>,
@@ -1571,6 +1571,11 @@ fn specified_track_tokens(tokens: &[&str]) -> Option<String> {
                 append(&mut result, ")")?;
             }
             None if token == "0" => append(&mut result, "0px")?,
+            None if math_function(token) => {
+                let simplified = typed_numeric::parse_numeric_expression(token)
+                    .and_then(|expression| expression.serialize_specified());
+                append(&mut result, simplified.as_deref().unwrap_or(token))?
+            }
             None => append(&mut result, token)?,
         }
     }
@@ -1835,6 +1840,16 @@ impl Style {
         if subgrid && subgrid_ignored {
             return Some("none".into());
         }
+        if used.is_none() {
+            let source = if horizontal {
+                &self.grid_columns_source
+            } else {
+                &self.grid_rows_source
+            };
+            if let Some(source) = source {
+                return Some(String::from(&**source));
+            }
+        }
         if subgrid {
             let mut result = String::from("subgrid");
             if let Some(used) = used {
@@ -1890,6 +1905,9 @@ impl Style {
             );
         }
         if let Some(repeated) = repeated {
+            if !self.grid_lanes && repeated.tracks.iter().any(|track| !grid_is_fixed_size(*track)) {
+                return Some("none".into());
+            }
             let prefix = named_tracks(&repeated.prefix_tracks, &repeated.prefix_names, None)?;
             let suffix = named_tracks(&repeated.suffix_tracks, &repeated.suffix_names, None)?;
             let mut result = String::new();

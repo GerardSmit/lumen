@@ -805,7 +805,7 @@ fn apply_offset_snapping(
         } else { behavior };
         (session.scroll_offset(node), (x, y), behavior, (min_x, max_x, min_y, max_y))
     };
-    let to = if snap && from != to {
+    let to = if snap {
         let snapped = crate::scroll_snap::snap_destination(realm, node, from, to, limits)?;
         // Reading the snap style may restyle with the font source, which
         // leaves the frame stale; the offset below needs a fresh one.

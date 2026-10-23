@@ -112,6 +112,7 @@ pub mod keyboard_automation;
 mod labels;
 mod media;
 mod media_capture;
+mod text_tracks;
 mod option_factory;
 pub(crate) mod scrolling;
 mod scroll_snap;
@@ -5176,6 +5177,9 @@ fn upgrade_inserted_roots(
         if realm.session.borrow().document().kind(node).is_ok() {
             custom_elements::upgrade_cloned_or_parsed_subtree(ctx, realm, node)?;
         }
+        if realm.session.borrow().document().kind(node).is_ok() {
+            forms::settle_inserted_radios(realm, node);
+        }
     }
     Ok(())
 }
@@ -8603,6 +8607,17 @@ fn control_autocomplete(node: &DomNode) -> String {
 
 #[lumen_bind::methods]
 impl DomSelectElement {
+    fn show_picker(&self) -> OpResult<()> {
+        let node = &self.base.base.base;
+        if lumen_html::forms::is_disabled(node.realm.session.borrow().document(), node.id) {
+            return Err(OpError::new("InvalidStateError", "a disabled select cannot show a picker"));
+        }
+        if !node.realm.consume_user_activation() {
+            return Err(OpError::new("NotAllowedError", "showPicker requires trusted user activation"));
+        }
+        Ok(())
+    }
+
     #[getter]
     fn autocomplete(&self) -> String {control_autocomplete(&self.base.base.base)}
     #[setter(coerce, hint(js(ce_reactions)))]
@@ -15157,6 +15172,7 @@ fn install_document_with_context_metadata(
         .map_err(|_| InstallError::Global)?;
     ctx.set_member(&global, "document", document)
         .map_err(|_| InstallError::Global)?;
+    text_tracks::install(ctx);
     if let Some(window_proxy) = window_proxy {
         ctx.set_member(&global, "window", window_proxy.clone())
             .map_err(|_| InstallError::Global)?;

@@ -678,7 +678,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             | "animation-timing-function" | "transition-property"
  | "transition-duration" | "transition-timing-function" | "transition-delay" | "transition-behavior"
             | "font-style" | "font-width" | "font-feature-settings" | "font-variant-alternates" | "text-transform"
-            | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break"
+            | "scroll-behavior" | "text-overflow" | "content" | "box-decoration-break" | "flex-wrap"
             | "border-image-source" | "box-shadow" | "text-shadow"
             | "text-decoration-line" | "text-decoration-style" | "text-decoration-color" | "text-underline-position" | "text-decoration-thickness" | "text-underline-offset" => parsed.iter().find_map(|declaration|
                 serialize_typed(&declaration.value, raw, &name, &name)),
@@ -705,11 +705,20 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                 }
             }),
             "grid-lanes-direction" => parsed.iter().find_map(|declaration| {
-                if let Value::GridLanesDirection(direction) = &declaration.value {
-                    Some(computed_values::serialize_lanes_direction(*direction))
+                if let Value::GridLanesDirection(_) = &declaration.value {
+                    Some(
+                        raw.split_ascii_whitespace()
+                            .map(str::to_ascii_lowercase)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
                 } else {
                     None
                 }
+            }),
+            "flex-grow" | "flex-shrink" if !raw.contains('(') => parsed.iter().find_map(|declaration| match declaration.value {
+                Value::FlexGrow(value) | Value::FlexShrink(value) => Some(value.to_string()),
+                _ => None,
             }),
             _ if super::extra_props::property_index(&name).is_some() => parsed.iter().rev().find_map(|declaration| match &declaration.value {
                 Value::ExtraRaw(slot, text) => super::extra_props::serialize_specified(*slot, text),
@@ -718,7 +727,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "color-interpolation-filters"=>parsed.iter().find_map(|declaration|
                 if let Value::SvgFilterColorSpace(value)=declaration.value {Some(value.css_keyword().into())}else{None}),
             "aspect-ratio" if !raw.trim().to_ascii_lowercase().starts_with("var(")=>super::sizing_values::aspect_ratio_specified(raw),
-            "outline-width" | "outline-offset" | "row-gap" | "column-gap" if raw.trim() == "0" => Some("0px".into()),
+            "outline-width" | "outline-offset" | "row-gap" | "column-gap" | "flow-tolerance" if raw.trim() == "0" => Some("0px".into()),
             _ if super::calc_size::unitless_zero(&name,raw).is_some()=>super::calc_size::unitless_zero(&name,raw),
             _ if super::calc_size::applies(&name,raw)=>super::calc_size::specified(&name,raw),
             _ if super::animation_color_property(&name)=>super::serialize_cssom_property_value(&name,raw),
@@ -1023,7 +1032,7 @@ fn canonical_alias_uncached(name: &str) -> &str {
 }
 
 fn specified_flex_wrap(raw: &str, wraps: bool) -> &'static str {
-    let has = |keyword: &str| raw.split_whitespace().any(|word| word == keyword);
+    let has = |keyword: &str| raw.split_whitespace().any(|word| word.eq_ignore_ascii_case(keyword));
     match (has("wrap-reverse"), has("balance")) {
         (true, true) => "wrap-reverse balance",
         (true, false) => "wrap-reverse",
@@ -2443,7 +2452,7 @@ mod tests {
         );
         assert_eq!(
             block.value("grid-lanes-direction").unwrap().0,
-            "row fill-reverse track-reverse"
+            "row track-reverse fill-reverse"
         );
         let text = block.serialize().unwrap();
         let roundtrip = DeclarationBlock::parse(&text).unwrap();
