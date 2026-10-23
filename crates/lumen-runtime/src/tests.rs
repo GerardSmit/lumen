@@ -2266,6 +2266,46 @@ fn web_response_status_defaults() {
 }
 
 #[test]
+fn blob_over_a_large_buffer_never_sees_later_writes() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const n = 20000;
+            const sum = (u8) => { let t = 0; for (let i = 0; i < u8.length; i++) t += u8[i]; return t; };
+            const fill = (u8, v) => { for (let i = 0; i < u8.length; i++) u8[i] = v; };
+            const buffer = new ArrayBuffer(n);
+            const bytes = new Uint8Array(buffer);
+            fill(bytes, 1);
+            const whole = new Blob([buffer]);
+            const view = new Blob([new Uint8Array(buffer, 100, 9000)]);
+            const small = new Blob([new Uint8Array(buffer, 0, 8)]);
+            fill(bytes, 2);
+            for (let round = 0; round < 50; round++) fill(bytes, 3 + round);
+            new DataView(buffer).setUint8(0, 99);
+            const check = async (blob) => sum(new Uint8Array(await blob.arrayBuffer()));
+            console.log(await check(whole), await check(view), await check(small));
+            const again = new Blob([buffer]);
+            bytes.fill(7);
+            console.log(await check(again), sum(bytes));
+            const owner = new Uint8Array(8192).fill(4);
+            const kept = new Blob([owner.buffer]);
+            const url = URL.createObjectURL(kept);
+            owner.fill(5);
+            const moved = structuredClone(owner.buffer, { transfer: [owner.buffer] });
+            console.log(owner.buffer.byteLength, await check(kept), sum(new Uint8Array(moved)));
+            URL.revokeObjectURL(url);
+        })();
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        ["20000 9000 8", "1040047 140000", "0 32768 40960"]
+    );
+}
+
+#[test]
 fn web_readable_stream_body() {
     // `Response`/`Request` expose their buffered body as a `ReadableStream` via `.body`, and the
     // constructors accept a stream body — so `new Response(res.body, res)` (Hono's `c.header()`

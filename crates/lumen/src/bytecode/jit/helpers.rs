@@ -3498,7 +3498,12 @@ unsafe fn ta_view_code(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
         Some(end) if end <= buf.len() => {}
         _ => return 0,
     }
-    (*f).ta_data = buf.as_ptr().add(info.offset);
+    let base = if write != 0 {
+        buf.as_ptr()
+    } else {
+        buf.as_ptr_ro() as *mut u8
+    };
+    (*f).ta_data = base.add(info.offset);
     (*f).ta_len = len;
     code
 }

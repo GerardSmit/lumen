@@ -90,7 +90,7 @@ pub use format::{
     StructCode, StructMode,
 };
 pub use store::{
-    after_gc, gc_pressure, tracked_bytes, ByteStore, Bytes, BytesMut, Export, Lend, StoreSlot,
+    after_gc, gc_pressure, tracked_bytes, ByteStore, Bytes, BytesMut, Export, Lend, Snapshot, StoreSlot,
 };
 pub use view::{
     adjust_slice, adjust_slice_bounds, c_strides, f_strides, shape_product, span_len, CastError,

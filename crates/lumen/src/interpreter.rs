@@ -3166,7 +3166,7 @@ impl Interp {
         let byte_len = len * info.kind.elsize();
         let buf = self.array_buffers.get(&info.buffer)?;
         // SAFETY: `ta_len` succeeded, so `offset` is within the store.
-        let ptr = unsafe { buf.as_ptr().add(info.offset) };
+        let ptr = unsafe { buf.as_ptr_escaping().add(info.offset) };
         Some((code, byte_len, ptr))
     }
 

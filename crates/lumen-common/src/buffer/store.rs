@@ -5,7 +5,7 @@ use super::BufferError;
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 // ---- external-memory pressure ----------------------------------------------------------------
 // A collector triggered by object counts never sees buffer bytes: a loop allocating a large
@@ -77,6 +77,9 @@ pub fn after_gc() {
 const READONLY: u8 = 1;
 const RESIZABLE: u8 = 2;
 const DETACHED: u8 = 4;
+const SNAPPED: u8 = 8;
+const IMMUTABLE_EXTERNAL: u8 = 16;
+const NOSNAP: u8 = 32;
 
 enum Backing {
     Heap(Vec<u8>),
@@ -102,6 +105,10 @@ enum Backing {
 ///   while any lend is live, any access while a mutable lend is live) first *unshares*: the
 ///   bytes are copied to a new allocation that becomes current, and the lent one is retired
 ///   (kept alive, untouched by the store) until its last lend ends.
+/// - A [`Snapshot`] reads the current allocation in place. Every entry that could change the
+///   bytes or move them (`bytes_mut`, a mutable lend, `as_ptr`, `pin`, `resize`, `edit`,
+///   `detach`, `unshare`) first *severs* it: the snapshot gets a private copy, so it never sees
+///   a write and never outlives the allocation it points into.
 /// - The store is `!Send`/`!Sync` (it holds `Cell`s and an `Rc`), so all of this is single-threaded.
 pub struct ByteStore {
     ptr: Cell<*mut u8>,
@@ -117,6 +124,8 @@ pub struct ByteStore {
     /// access); `gen` numbers the current allocation.
     retired: UnsafeCell<Vec<Retired>>,
     gen: Cell<u32>,
+    /// The live [`Snapshot`] of the current bytes, when [`SNAPPED`] is set.
+    snap: UnsafeCell<Option<Weak<Snapshot>>>,
 }
 
 /// A lent allocation that is no longer the store's current bytes.
@@ -150,6 +159,7 @@ impl ByteStore {
             backing: UnsafeCell::new(Backing::Heap(v)),
             retired: UnsafeCell::new(Vec::new()),
             gen: Cell::new(0),
+            snap: UnsafeCell::new(None),
         }
     }
 
@@ -173,6 +183,7 @@ impl ByteStore {
             backing: UnsafeCell::new(Backing::MetadataOnly),
             retired: UnsafeCell::new(Vec::new()),
             gen: Cell::new(0),
+            snap: UnsafeCell::new(None),
         }
     }
 
@@ -209,6 +220,7 @@ impl ByteStore {
             backing: UnsafeCell::new(Backing::External(owner)),
             retired: UnsafeCell::new(Vec::new()),
             gen: Cell::new(0),
+            snap: UnsafeCell::new(None),
         }
     }
 
@@ -223,7 +235,9 @@ impl ByteStore {
         // SAFETY: `ptr..ptr + len` lies inside the `Vec` that `bytes` keeps alive and unchanged
         // (an `Rc<Vec<u8>>` is never handed out mutably), and the READONLY flag set below stops
         // every write through the store.
-        unsafe { ByteStore::external(ptr, len, bytes) }.readonly()
+        let store = unsafe { ByteStore::external(ptr, len, bytes) }.readonly();
+        store.flags.set(store.flags.get() | IMMUTABLE_EXTERNAL);
+        store
     }
 
     /// Make the store resizable up to `max` bytes (at least its current length).
@@ -320,6 +334,7 @@ impl ByteStore {
         if self.is_metadata_only() {
             return Err(BufferError::Borrowed);
         }
+        self.sever();
         self.pins.set(self.pins.get() + 1);
         Ok(())
     }
@@ -383,6 +398,7 @@ impl ByteStore {
         if self.lends.get() != 0 {
             self.unshare()?;
         }
+        self.sever();
         self.borrow.set(-1);
         Ok(BytesMut(self))
     }
@@ -411,6 +427,9 @@ impl ByteStore {
         if self.mut_lends.get() != 0 || (mutable && self.lends.get() != 0) {
             self.unshare()?;
         }
+        if mutable {
+            self.sever();
+        }
         self.pins.set(self.pins.get() + 1);
         self.lends.set(self.lends.get() + 1);
         if mutable {
@@ -429,6 +448,7 @@ impl ByteStore {
     #[cold]
     #[inline(never)]
     fn unshare(&self) -> Result<(), BufferError> {
+        self.sever();
         // SAFETY: no `Bytes`/`BytesMut` guard is live (callers checked `borrow`; a guard cannot
         // coexist with a mutable lend), and lends hold raw pointers, not references to `backing`.
         let backing = unsafe { &mut *self.backing.get() };
@@ -517,7 +537,81 @@ impl ByteStore {
         if self.is_metadata_only() {
             std::ptr::NonNull::dangling().as_ptr()
         } else {
+            self.sever();
             self.ptr.get()
+        }
+    }
+
+    /// [`as_ptr`](Self::as_ptr) for an address that native code may keep past the call: the store
+    /// is never shared as a [`Snapshot`] afterwards, since later writes through the address
+    /// cannot be intercepted.
+    pub fn as_ptr_escaping(&self) -> *mut u8 {
+        self.flags.set(self.flags.get() | NOSNAP);
+        self.as_ptr()
+    }
+
+    /// The address of byte 0 for reads only. Unlike [`as_ptr`](Self::as_ptr) it does not sever
+    /// a [`Snapshot`], so nothing may be written through it.
+    #[inline(always)]
+    pub fn as_ptr_ro(&self) -> *const u8 {
+        if self.is_metadata_only() {
+            std::ptr::NonNull::dangling().as_ptr()
+        } else {
+            self.ptr.get()
+        }
+    }
+
+    /// The current bytes as a [`Snapshot`], shared copy-on-write instead of copied: the first
+    /// time anything could change them (a mutable guard, a mutable lend, [`as_ptr`](Self::as_ptr),
+    /// a resize, edit, detach or pin) they are copied out for the snapshot's holders, and until
+    /// then it reads this store's own allocation, which it keeps alive. `None` for a detached,
+    /// metadata-only, pinned, mutably borrowed or empty store, one backed by memory written
+    /// outside the store (an external buffer other than an immutable shared one), and one whose
+    /// address was handed to native code ([`as_ptr_escaping`](Self::as_ptr_escaping)).
+    pub fn snapshot(self: &Rc<Self>) -> Option<Rc<Snapshot>> {
+        if self.is_detached()
+            || self.is_metadata_only()
+            || self.is_pinned()
+            || self.borrow.get() < 0
+            || self.len() == 0
+            || self.flags.get() & NOSNAP != 0
+            || (self.is_external() && self.flags.get() & IMMUTABLE_EXTERNAL == 0)
+        {
+            return None;
+        }
+        // SAFETY: `snap` is only touched by this type, and no reference into it outlives a call.
+        let slot = unsafe { &mut *self.snap.get() };
+        if let Some(live) = slot.as_ref().and_then(Weak::upgrade) {
+            return Some(live);
+        }
+        let snapshot = Rc::new(Snapshot {
+            retired: UnsafeCell::new(None),
+            state: UnsafeCell::new(SnapState::Live {
+                store: self.clone(),
+                ptr: self.ptr.get(),
+                len: self.len.get(),
+            }),
+        });
+        *slot = Some(Rc::downgrade(&snapshot));
+        self.flags.set(self.flags.get() | SNAPPED);
+        Some(snapshot)
+    }
+
+    /// Hand the snapshot's holders their own copy before the bytes can change.
+    #[inline(always)]
+    fn sever(&self) {
+        if self.flags.get() & SNAPPED != 0 {
+            self.sever_snapshot();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sever_snapshot(&self) {
+        self.flags.set(self.flags.get() & !SNAPPED);
+        // SAFETY: as in `snapshot`.
+        if let Some(snapshot) = unsafe { &mut *self.snap.get() }.take().and_then(|weak| weak.upgrade()) {
+            snapshot.owned();
         }
     }
 
@@ -572,6 +666,7 @@ impl ByteStore {
         if self.borrow.get() != 0 {
             return Err(BufferError::Borrowed);
         }
+        self.sever();
         Ok(())
     }
 
@@ -696,6 +791,7 @@ impl ByteStore {
         if self.borrow.get() != 0 {
             return Err(BufferError::Borrowed);
         }
+        self.sever();
         // SAFETY: `borrow == 0`: no reference into the bytes or `backing` is live.
         let old = std::mem::replace(unsafe { &mut *self.backing.get() }, Backing::Detached);
         let v = match old {
@@ -778,6 +874,74 @@ impl std::fmt::Debug for ByteStore {
 #[inline(never)]
 fn borrow_panic() -> ! {
     panic!("ByteStore already borrowed")
+}
+
+/// The bytes of a store when [`ByteStore::snapshot`] took them: a read-only view that outlives
+/// the store's owner and never sees a later write.
+pub struct Snapshot {
+    state: UnsafeCell<SnapState>,
+    /// The store of a `Live` state that was replaced: slices taken before may still point into it.
+    retired: UnsafeCell<Option<Rc<ByteStore>>>,
+}
+
+enum SnapState {
+    /// The store's own allocation. Every entry of the store that could change it first replaces
+    /// this state with [`SnapState::Owned`], so the range stays valid and unchanged meanwhile.
+    Live {
+        store: Rc<ByteStore>,
+        ptr: *const u8,
+        len: usize,
+    },
+    Owned(Rc<Vec<u8>>),
+}
+
+impl Snapshot {
+    pub fn len(&self) -> usize {
+        match self.state() {
+            SnapState::Live { len, .. } => *len,
+            SnapState::Owned(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes. The slice must not be held across code that can run script: a write by script
+    /// copies the bytes out for later readers but cannot redirect a slice already taken.
+    pub fn as_slice(&self) -> &[u8] {
+        match self.state() {
+            // SAFETY: see `SnapState::Live`; the store is kept alive by `store`.
+            SnapState::Live { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+            SnapState::Owned(bytes) => bytes,
+        }
+    }
+
+    /// The bytes as a private shared `Vec`, copying them out of the store first when they are
+    /// still its own; the store is released when the snapshot drops. For consumers that hold the address longer than a
+    /// slice borrow, such as a read-only `ArrayBuffer` over them.
+    pub fn owned(&self) -> Rc<Vec<u8>> {
+        if let SnapState::Owned(bytes) = self.state() {
+            return bytes.clone();
+        }
+        let mut copy = self.as_slice().to_vec();
+        copy.shrink_to_fit();
+        crate::memcat::retag_vec(&copy, crate::memcat::CategoryTag::BUFFERS);
+        let copy = Rc::new(copy);
+        // SAFETY: no reference into the state is live: `as_slice` above ended with the copy. The
+        // replaced `Live` store moves to `retired`, so slices taken earlier stay valid until
+        // the snapshot drops.
+        let old = std::mem::replace(unsafe { &mut *self.state.get() }, SnapState::Owned(copy.clone()));
+        if let SnapState::Live { store, .. } = old {
+            unsafe { *self.retired.get() = Some(store) };
+        }
+        copy
+    }
+
+    fn state(&self) -> &SnapState {
+        // SAFETY: the state is only replaced by `owned`, which holds no reference into it.
+        unsafe { &*self.state.get() }
+    }
 }
 
 /// Shared access to a store's bytes (see [`ByteStore::bytes`]).
@@ -1041,6 +1205,100 @@ mod tests {
         assert_eq!(s.pins(), 0);
         s.resize(5).unwrap();
         assert_eq!(&*s.bytes(), [9, 2, 3, 4, 0]);
+    }
+
+    #[test]
+    fn snapshot_shares_until_a_write_and_never_sees_it() {
+        let s = Rc::new(ByteStore::new(vec![1, 2, 3, 4]));
+        let snap = s.snapshot().unwrap();
+        assert_eq!(snap.as_slice().as_ptr(), s.bytes().as_ptr(), "no copy is made");
+        assert!(Rc::ptr_eq(&snap, &s.snapshot().unwrap()));
+        s.bytes_mut()[0] = 9;
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(&*s.bytes(), [9, 2, 3, 4]);
+        let again = s.snapshot().unwrap();
+        assert!(!Rc::ptr_eq(&snap, &again));
+        assert_eq!(again.as_slice(), [9, 2, 3, 4]);
+    }
+
+    #[test]
+    fn every_raw_or_reshaping_access_severs_a_snapshot() {
+        let fresh = || Rc::new(ByteStore::new(vec![1, 2, 3, 4]).growable());
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        let ptr = s.as_ptr();
+        unsafe { *ptr = 7 };
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4], "as_ptr severs before a raw write");
+
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        s.resize(8).unwrap();
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        s.edit(|v| v[1] = 0).unwrap();
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        assert_eq!(s.detach().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        s.lend(true).unwrap().as_mut_slice()[0] = 5;
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+
+        let s = fresh();
+        let snap = s.snapshot().unwrap();
+        s.pin().unwrap();
+        assert_eq!(snap.as_slice(), [1, 2, 3, 4]);
+        assert!(s.snapshot().is_none(), "a pinned store is not shared");
+    }
+
+    #[test]
+    fn external_stores_are_not_snapshotted_unless_immutable() {
+        let mut backing = vec![1u8, 2, 3, 4];
+        let ext = Rc::new(unsafe { ByteStore::external(backing.as_mut_ptr(), 4, Rc::new(())) });
+        assert!(ext.snapshot().is_none(), "bytes written outside the store");
+        let shared = Rc::new(ByteStore::shared_readonly(Rc::new(vec![1, 2, 3, 4]), 1..3));
+        assert_eq!(shared.snapshot().unwrap().as_slice(), [2, 3]);
+    }
+
+    #[test]
+    fn an_escaped_pointer_is_never_snapshotted() {
+        let s = Rc::new(ByteStore::new(vec![1, 2, 3, 4]));
+        let early = s.snapshot().unwrap();
+        let ptr = s.as_ptr_escaping();
+        assert_eq!(early.as_slice(), [1, 2, 3, 4]);
+        assert!(s.snapshot().is_none());
+        unsafe { *ptr = 9 };
+        assert_eq!(early.as_slice(), [1, 2, 3, 4]);
+        assert!(s.snapshot().is_none(), "sticky");
+    }
+
+    #[test]
+    fn read_only_pointer_does_not_sever() {
+        let s = Rc::new(ByteStore::new(vec![1, 2, 3, 4]));
+        let snap = s.snapshot().unwrap();
+        assert_eq!(s.as_ptr_ro(), snap.as_slice().as_ptr());
+        assert!(Rc::ptr_eq(&snap, &s.snapshot().unwrap()));
+    }
+
+    #[test]
+    fn snapshot_keeps_the_bytes_after_the_owner_is_gone() {
+        let before = tracked_bytes();
+        let s = Rc::new(ByteStore::new(vec![5; 64]));
+        let snap = s.snapshot().unwrap();
+        drop(s);
+        assert_eq!(snap.as_slice(), [5; 64]);
+        assert!(tracked_bytes() >= before + 64, "the store is still alive");
+        let owned = snap.owned();
+        assert_eq!(*owned, vec![5; 64]);
+        assert!(Rc::ptr_eq(&owned, &snap.owned()));
+        drop(snap);
+        assert_eq!(tracked_bytes(), before, "the store was released");
     }
 
     #[test]

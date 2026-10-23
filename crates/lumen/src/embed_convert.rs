@@ -46,7 +46,7 @@ use lumen_bind::{
     Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State, StateHost,
     flags,
 };
-use lumen_common::buffer::StoreSlot;
+use lumen_common::buffer::{Snapshot, StoreSlot};
 use lumen_common::native::{Data, NativeError};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
@@ -1209,6 +1209,25 @@ impl Interp {
             Some(result) => result,
             None => (read.take().expect("read once"))(&[]),
         })
+    }
+
+    /// The bytes of an attached, unshared ArrayBuffer or view of one, shared copy-on-write
+    /// instead of copied: the [`Snapshot`] of the whole buffer and the `start..end` range the
+    /// view covers. The snapshot keeps the buffer's bytes alive without the ArrayBuffer and
+    /// never sees a later write to it. `None` for anything else (not a BufferSource, detached,
+    /// out of bounds, a SharedArrayBuffer, or a store that cannot be shared); read those with
+    /// [`with_buffer_source_bytes`](Self::with_buffer_source_bytes).
+    pub fn buffer_source_snapshot(&mut self, value: &Value) -> Option<(Rc<Snapshot>, usize, usize)> {
+        let (buffer, offset, length) = resolve_view(self, value).ok()?;
+        let end = offset.checked_add(length)?;
+        if self.shared_buffers.contains_key(&buffer) {
+            return None;
+        }
+        let slot = self.array_buffers.get_mut(&buffer)?;
+        if end > slot.len() {
+            return None;
+        }
+        Some((slot.share().snapshot()?, offset, end))
     }
 
     /// Allocate a unique engine-private name for a native object's traced slot.

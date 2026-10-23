@@ -15,7 +15,7 @@
 
 use crate::webidl::{coded, invalid_arg_type};
 use lumen::embed::{Ctx, OpError, OpResult, Value};
-use lumen_common::buffer::ByteStore;
+use lumen_common::buffer::{ByteStore, Snapshot};
 use std::{ops::Deref, rc::Rc};
 
 mod bridge;
@@ -41,9 +41,16 @@ pub use web::bindings::{Blob, File, FormData};
 /// A window onto shared, immutable bytes.
 #[derive(Clone)]
 pub struct Bytes {
-    store: Rc<Vec<u8>>,
+    store: Store,
     start: usize,
     end: usize,
+}
+
+/// The allocation behind a [`Bytes`]: its own, or an `ArrayBuffer`'s bytes shared copy-on-write.
+#[derive(Clone)]
+enum Store {
+    Owned(Rc<Vec<u8>>),
+    Snapshot(Rc<Snapshot>),
 }
 
 impl Bytes {
@@ -51,8 +58,19 @@ impl Bytes {
         lumen_common::memcat::retag_vec(&bytes, lumen_common::memcat::CategoryTag::BUFFERS);
         let end = bytes.len();
         Bytes {
-            store: Rc::new(bytes),
+            store: Store::Owned(Rc::new(bytes)),
             start: 0,
+            end,
+        }
+    }
+
+    /// The `start..end` window of a snapshot of an `ArrayBuffer`, without copying it: writes to
+    /// the buffer afterwards do not show through.
+    pub fn from_snapshot(snapshot: Rc<Snapshot>, start: usize, end: usize) -> Bytes {
+        debug_assert!(start <= end && end <= snapshot.len());
+        Bytes {
+            store: Store::Snapshot(snapshot),
+            start,
             end,
         }
     }
@@ -70,7 +88,17 @@ impl Bytes {
 
     /// A read-only `ArrayBuffer` store over these bytes, without copying them.
     pub(crate) fn readonly_store(&self) -> ByteStore {
-        ByteStore::shared_readonly(self.store.clone(), self.start..self.end)
+        match &self.store {
+            Store::Owned(bytes) => ByteStore::shared_readonly(bytes.clone(), self.start..self.end),
+            Store::Snapshot(snapshot) if self.start == 0 && self.end == snapshot.len() => {
+                ByteStore::shared_readonly(snapshot.owned(), 0..self.end)
+            }
+            Store::Snapshot(snapshot) => {
+                let window = snapshot.as_slice()[self.start..self.end].to_vec();
+                let len = window.len();
+                ByteStore::shared_readonly(Rc::new(window), 0..len)
+            }
+        }
     }
 }
 
@@ -84,7 +112,10 @@ impl Deref for Bytes {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.store[self.start..self.end]
+        match &self.store {
+            Store::Owned(bytes) => &bytes[self.start..self.end],
+            Store::Snapshot(snapshot) => &snapshot.as_slice()[self.start..self.end],
+        }
     }
 }
 

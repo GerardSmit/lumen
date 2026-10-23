@@ -240,7 +240,12 @@ pub(crate) fn dv_jit_view(i: &mut Interp, obj: &Gc, name: &str) -> Option<(*mut 
         return None;
     }
     // SAFETY: `off + vlen <= store.len()`.
-    Some((unsafe { store.as_ptr().add(off) }, vlen))
+    let base = if set {
+        store.as_ptr()
+    } else {
+        store.as_ptr_ro() as *mut u8
+    };
+    Some((unsafe { base.add(off) }, vlen))
 }
 
 /// `obj.byteLength` without running JS, when reading it calls the intrinsic ArrayBuffer or

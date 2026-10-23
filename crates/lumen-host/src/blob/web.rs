@@ -15,14 +15,27 @@ enum Piece {
     Text(String),
     Blob(Source),
     Buffer(Vec<u8>),
+    Shared(Bytes),
 }
+
+/// Buffers smaller than this are copied: the shared store would cost about as much.
+const SHARE_MIN: usize = 4096;
 
 fn read_piece(ctx: &mut Ctx, element: Value) -> OpResult<Piece> {
     if matches!(element, Value::Obj(_)) {
         if let Some(view) = blob_of(ctx, &element) {
             return Ok(Piece::Blob(view.source));
         }
-        if let Some(bytes) = ctx.with_buffer_source_bytes(&element, <[u8]>::to_vec) {
+        if ctx.with_buffer_source_bytes(&element, <[u8]>::len).is_some_and(|len| len >= SHARE_MIN) {
+            if let Some((snapshot, start, end)) = ctx.buffer_source_snapshot(&element) {
+                return Ok(Piece::Shared(Bytes::from_snapshot(snapshot, start, end)));
+            }
+        }
+        let copy = {
+            let _buffers = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::BUFFERS);
+            ctx.with_buffer_source_bytes(&element, <[u8]>::to_vec)
+        };
+        if let Some(bytes) = copy {
             return Ok(Piece::Buffer(bytes));
         }
     }
@@ -69,6 +82,7 @@ fn assemble(ctx: &mut Ctx, pieces: Vec<Piece>, native_endings: bool) -> OpResult
         return Ok(match pieces.into_iter().next().expect("one piece") {
             Piece::Blob(source) => source,
             Piece::Buffer(bytes) => Source::Memory(Bytes::new(bytes)),
+            Piece::Shared(bytes) => Source::Memory(bytes),
             Piece::Text(text) => Source::Memory(Bytes::new(encode_text(text, native_endings))),
         });
     }
@@ -78,13 +92,16 @@ fn assemble(ctx: &mut Ctx, pieces: Vec<Piece>, native_endings: bool) -> OpResult
             Piece::Text(text) => text.len(),
             Piece::Blob(source) => source.len(),
             Piece::Buffer(bytes) => bytes.len(),
+            Piece::Shared(bytes) => bytes.len(),
         })
         .sum();
+    let _buffers = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::BUFFERS);
     let mut out = Vec::with_capacity(known);
     for piece in pieces {
         match piece {
             Piece::Blob(source) => out.extend_from_slice(&source.bytes(ctx)?),
             Piece::Buffer(bytes) => out.extend_from_slice(&bytes),
+            Piece::Shared(bytes) => out.extend_from_slice(&bytes),
             Piece::Text(text) => out.extend_from_slice(&encode_text(text, native_endings)),
         }
     }
