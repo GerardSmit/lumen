@@ -4783,7 +4783,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let code = self.i32c(helpers::BIN_IN as i64);
                 let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
                 let snap = self.stack[..d - 2].to_vec();
-                self.throw_if(st, pc, &snap, d - 2);
+                self.throw_or_ran_js(st, pc, &snap, d - 2);
                 let r = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
                 self.stack.truncate(d - 2);
                 self.stack.push(Entry::Bool(r));
@@ -4818,7 +4818,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let pa = self.sptr(d - 1);
                     let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pa, pa]);
                     let snap = self.stack[..d - 1].to_vec();
-                    self.throw_if(st, pc, &snap, d - 1);
+                    self.throw_or_ran_js(st, pc, &snap, d - 1);
                     self.stack.truncate(d - 1);
                     if plus {
                         let r = self.stack_num(d - 1);
@@ -5614,10 +5614,17 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let st = self.call_status(h, &[self.frame, nv, cv, dst]);
         let snap = self.stack.clone();
+        // The full lookup may have run a getter.
+        self.throw_or_ran_js(st, pc, &snap, d);
+    }
+
+    /// After a helper that returns `STATUS_THROW`, `STATUS_OK`, or [`helpers::STATUS_OK_SLOW`]
+    /// when it ran JS: exit on a throw (as [`Tr::throw_if`]), and reset every region cache when
+    /// JS ran.
+    fn throw_or_ran_js(&mut self, st: V, pc: usize, stack: &[Entry], depth: usize) {
         let one = self.i32c(STATUS_THROW as i64);
         let threw = self.fb.icmp(IntCC::Eq, st, one);
-        self.exit_if(threw, pc, EXIT_THROW, &snap, d);
-        // The full lookup may have run a getter: caches are stale then.
+        self.exit_if(threw, pc, EXIT_THROW, stack, depth);
         let slow = self.i32c(helpers::STATUS_OK_SLOW as i64);
         let ran = self.fb.icmp(IntCC::Eq, st, slow);
         let inv = self.fb.create_block();
@@ -8043,7 +8050,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let (pa, pb, pr) = (self.sptr(d), self.sptr(d + 1), self.sptr(d + 2));
         let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
         let snap = self.stack.clone();
-        self.throw_if(st, pc, &snap, d);
+        self.throw_or_ran_js(st, pc, &snap, d);
         match self.kinds[dst] {
             Kind::Boxed => {
                 let sc = self.i32c(dst as i64);
@@ -8190,7 +8197,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             let pr = self.sptr(d + 2);
             let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
             let snap = self.stack.clone();
-            self.throw_if(st, pc, &snap, d);
+            self.throw_or_ran_js(st, pc, &snap, d);
             let t = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
             self.fb.jump(join, &[t]);
             self.fb.seal_block(join);
@@ -8207,7 +8214,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let pr = self.sptr(d + 2);
                     let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
                     let snap = self.stack.clone();
-                    self.throw_if(st, pc, &snap, d);
+                    self.throw_or_ran_js(st, pc, &snap, d);
                     self.call_status(Helper::ToBoolean, &[self.frame, pr])
                 }
             }
@@ -8328,7 +8335,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let pr = self.sptr(d);
         let st = self.call_status(Helper::Binary, &[self.frame, code, pa, pb, pr]);
         let snap = self.stack[..d - 2].to_vec();
-        self.throw_if(st, pc, &snap, d - 2);
+        self.throw_or_ran_js(st, pc, &snap, d - 2);
         let t = self.call_status(Helper::ToBoolean, &[self.frame, pr]);
         Ok(match (join, res) {
             (Some(join), Some(res)) => {
@@ -8713,29 +8720,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.stack.push(Entry::Num(param));
                     return Ok(());
                 }
-                // Relational and equality operators always produce a Boolean: the slow path's
-                // result joins unboxed too.
-                if cmp.is_some() {
-                    let pre = self.stack.clone();
-                    let slow = self.fb.create_block();
-                    let join = self.fb.create_block();
-                    let param = self.fb.append_block_param(join, Type::I32);
-                    let x = self.num_or_slow(a, d - 2, slow);
-                    let y = self.num_or_slow(b, d - 1, slow);
-                    let Entry::Bool(r) = compute(self, x, y)? else {
-                        unreachable!("comparison yields a Boolean")
-                    };
-                    self.fb.jump(join, &[r]);
-                    self.fb.seal_block(slow);
-                    self.fb.switch_to_block(slow);
-                    self.stack = pre.clone();
-                    self.generic(pc);
-                    let r = self.stack_bool(d - 2);
-                    self.fb.jump(join, &[r]);
-                    self.fb.seal_block(join);
-                    self.fb.switch_to_block(join);
-                    self.stack = pre[..d - 2].to_vec();
-                    self.stack.push(Entry::Bool(param));
+                // Relational and equality operators always produce a Boolean: decided inline
+                // where the tags allow (Numbers, `x == null`, same-type equality), else through
+                // `Helper::Binary`.
+                if let Some(kind) = cmp {
+                    let r = self.cmp_stack(pc, kind)?;
+                    self.stack.push(Entry::Bool(r));
                     return Ok(());
                 }
                 let pre = self.stack.clone();
@@ -8757,7 +8747,13 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack = pre[..d - 2].to_vec();
                 self.stack.push(Entry::Boxed);
             }
-            _ => self.generic(pc),
+            _ => match cmp {
+                Some(kind) => {
+                    let r = self.cmp_stack(pc, kind)?;
+                    self.stack.push(Entry::Bool(r));
+                }
+                None => self.generic(pc),
+            },
         }
         Ok(())
     }

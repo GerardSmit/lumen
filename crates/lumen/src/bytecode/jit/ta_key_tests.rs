@@ -151,3 +151,35 @@ fn chained_element_reads_lend_the_receiver() {
         true,
     );
 }
+
+#[test]
+fn boxed_comparisons_stay_inline_and_see_js_side_effects() {
+    agree(
+        r#"(function(){
+          function cmp(xs){var r=0;
+            for(var i=0;i<xs.length;i++){var x=xs[i],y=xs[(i+1)%xs.length];
+              r=r*3+((null==x)|0)+((x!=undefined)<<1)+((x===y)<<2)+((x==y)<<3)+((x<y)<<4)|0}
+            return r}
+          var o={},xs=[null,undefined,o,o,'a','a',1,'1',true,{},NaN,0,-0,null];
+          var r1;for(var t=0;t<300;t++)r1=cmp(xs);
+          function scan(u,o,n){var s=0;for(var i=0;i<n;i++){if(o<i)s+=1;s+=u[i]|0}return s}
+          var u=new Uint8Array(new ArrayBuffer(64));for(var i=0;i<64;i++)u[i]=i;
+          for(var t=0;t<300;t++)scan(u,{valueOf:function(){return 0}},64);
+          var hits=0,o2={valueOf:function(){if(++hits==10)u.buffer.transfer();return 0}};
+          function fresh(){var x=new Uint8Array(new ArrayBuffer(64));for(var i=0;i<64;i++)x[i]=i;return x}
+          function viaIn(u,k,o,n){var s=0;for(var i=0;i<n;i++){if(k in o)s+=1;s+=u[i]|0}return s}
+          function viaPlus(u,o,n){var s=0;for(var i=0;i<n;i++){s+=+o;s+=u[i]|0}return s}
+          function viaEq(u,o,n){var s=0;for(var i=0;i<n;i++){if(o==1)s+=1;s+=u[i]|0}return s}
+          var plain={valueOf:function(){return 1},toString:function(){return 'x'}},o3={x:1};
+          for(var t=0;t<300;t++){var w=fresh();viaIn(w,plain,o3,64);viaPlus(w,plain,64);viaEq(w,plain,64)}
+          var out=[];
+          [viaIn,viaPlus,viaEq].forEach(function(f){
+            var w=fresh(),n=0,k={valueOf:function(){if(++n==10)w.buffer.transfer();return 1},
+              toString:function(){if(++n==10)w.buffer.transfer();return 'x'}};
+            out.push(f===viaIn?f(w,k,o3,64):f(w,k,64),w.length)});
+          return r1+'|'+scan(u,o2,64)+'|'+u.length+'|'+out.join();
+        })()"#,
+        None,
+        true,
+    );
+}

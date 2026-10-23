@@ -933,9 +933,13 @@ pub(crate) unsafe extern "C" fn binary(
     b: *mut Value,
     dst: *mut Value,
 ) -> u32 {
+    // An object operand's conversion (or `in`'s lookup) may run JS: the caller resets its
+    // caches on `STATUS_OK_SLOW`.
+    let ok = |ran_js: bool| if ran_js { STATUS_OK_SLOW } else { STATUS_OK };
     let a = std::ptr::replace(a, Value::Undefined);
     if matches!(op, BIN_PLUS | BIN_NEG) {
         let i = &mut *(*f).interp;
+        let ran_js = matches!(a, Value::Obj(_));
         let r = match (op, &a) {
             (BIN_PLUS, Value::Str(s)) => Ok(Value::Num(crate::eval::str_to_number(s))),
             (BIN_PLUS, _) => i.eval_unary_vm("+", a),
@@ -944,7 +948,7 @@ pub(crate) unsafe extern "C" fn binary(
         return match r {
             Ok(v) => {
                 std::ptr::write(dst, v);
-                STATUS_OK
+                ok(ran_js)
             }
             Err(e) => fail(f, e),
         };
@@ -952,6 +956,8 @@ pub(crate) unsafe extern "C" fn binary(
     let b = std::ptr::replace(b, Value::Undefined);
     if op == BIN_IN {
         let i = &mut *(*f).interp;
+        // ToPropertyKey of an object key, a proxy anywhere on the chain, module namespaces...
+        let ran_js = matches!(a, Value::Obj(_)) || matches!(b, Value::Obj(_));
         let r = match (&a, &b) {
             (Value::Str(k), Value::Obj(_)) => i.js_has_property(&b, k).map(Value::Bool),
             _ => i.binary("in", a, b),
@@ -959,7 +965,7 @@ pub(crate) unsafe extern "C" fn binary(
         return match r {
             Ok(v) => {
                 std::ptr::write(dst, v);
-                STATUS_OK
+                ok(ran_js)
             }
             Err(e) => fail(f, e),
         };
@@ -989,6 +995,16 @@ pub(crate) unsafe extern "C" fn binary(
             }
         }
     }
+    let obj = |v: &Value| matches!(v, Value::Obj(_));
+    let ran_js = match op {
+        BIN_STRICTEQ | BIN_STRICTNOTEQ => false,
+        // Loose equality converts an object only against a non-nullish primitive.
+        BIN_EQEQ | BIN_NOTEQ => {
+            let prim = |v: &Value| !obj(v) && !matches!(v, Value::Undefined | Value::Null);
+            (obj(&a) && prim(&b)) || (obj(&b) && prim(&a))
+        }
+        _ => obj(&a) || obj(&b),
+    };
     let i = &mut *(*f).interp;
     let r = match binary_op_str(op) {
         Some(s) => i.binary(s, a, b),
@@ -997,7 +1013,7 @@ pub(crate) unsafe extern "C" fn binary(
     match r {
         Ok(v) => {
             std::ptr::write(dst, v);
-            STATUS_OK
+            ok(ran_js)
         }
         Err(e) => fail(f, e),
     }
@@ -1012,19 +1028,22 @@ pub(crate) unsafe extern "C" fn typeof_is(f: *mut JitFrame, v: *const Value, kin
     (crate::bytecode::TypeofKind::of(&*(*f).interp, &*v) as u32 == kind) as u32
 }
 
-/// With `LUMEN_JIT_STATS`, report ops that keep running through [`generic`] (by op kind).
-fn count_generic(op: &Op) {
+/// With `LUMEN_JIT_STATS`, report sites that keep running through [`generic`].
+fn count_generic(chunk: &Chunk, pc: usize) {
     thread_local! {
-        static SEEN: RefCell<std::collections::HashMap<String, u64>> = RefCell::default();
+        static SEEN: RefCell<std::collections::HashMap<(usize, usize), u64>> = RefCell::default();
     }
-    let name = format!("{op:?}");
-    let kind = name.split('(').next().unwrap_or(&name).to_string();
     SEEN.with(|seen| {
         let mut seen = seen.borrow_mut();
-        let c = seen.entry(kind).or_default();
+        let c = seen.entry((chunk as *const Chunk as usize, pc)).or_default();
         *c += 1;
         if c.is_power_of_two() && *c >= 4096 {
-            eprintln!("[jit-generic] {name} x{c}");
+            let near = &chunk.ops[pc.saturating_sub(3)..(pc + 2).min(chunk.ops.len())];
+            eprintln!(
+                "[jit-generic] {:?} at {pc} of {} ops x{c} (near {near:?})",
+                chunk.ops[pc],
+                chunk.ops.len()
+            );
         }
     });
 }
@@ -1043,7 +1062,7 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
         return fail(f, e);
     }
     if super::stats_enabled() {
-        count_generic(&chunk.ops[pc]);
+        count_generic(chunk, pc);
     }
     // Computed reads that miss the inline element paths (notably native
     // indexed wrappers and author proxies) still use ordinary [[Get]]. They
