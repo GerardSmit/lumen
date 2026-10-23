@@ -700,6 +700,7 @@ fn build_region(
             ta_slots: ta_slots_init,
             hs_cur: Vec::new(),
             skip: None,
+            pending_append: None,
             chaining: false,
             hsets: Vec::new(),
             err: None,
@@ -2192,6 +2193,9 @@ struct Tr<'a, 'f> {
     hs_cur: Vec<(usize, usize)>,
     /// The op a chained read already emitted (see [`Tr::chain_read`]): skipped by `body`.
     skip: Option<usize>,
+    /// The hit path of a fused `c += String.fromCharCode(x)` (see [`Tr::unit_append`]): the pc
+    /// where it rejoins the ordinary path, its end block and its stack.
+    pending_append: Option<(usize, Option<Block>, Vec<Entry>)>,
     /// A chained read's consumer is being emitted: it does not chain in turn (its own skip
     /// would be lost, and each level would double the code).
     chaining: bool,
@@ -3658,6 +3662,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                 }
                 self.stack = st;
             }
+            if self.pending_append.as_ref().is_some_and(|p| p.0 == pc) {
+                let (_, hit, st) = self.pending_append.take().expect("checked");
+                let plain = (self.fb.current_block(), self.stack.clone());
+                self.merge_paths(vec![(hit, st), plain])?;
+                if let Some(Op::ArithLL(_, d, ..)) = self.ops.get(pc - 1) {
+                    self.invalidate_src(Src::Slot(*d));
+                }
+            }
             if self.skip == Some(pc) {
                 self.skip = None;
                 continue;
@@ -3675,6 +3687,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.vector_prefix(pc);
             }
             self.op(pc)?;
+        }
+        if self.pending_append.is_some() {
+            return Err("unjoined string append fusion".into());
         }
         Ok(())
     }
@@ -6691,6 +6706,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             other => return Err(format!("String argument {other:?} at {pc} is not a Number")),
         };
         let base = d - 3;
+        self.unit_append(pc, f, x, base, base);
         let done = self.fb.create_block();
         let miss = self.fb.create_block();
         self.str_static_fast(f, x, base, done, miss);

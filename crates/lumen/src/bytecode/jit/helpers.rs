@@ -213,6 +213,12 @@ pub(crate) enum Helper {
     /// in place (the interpreter's `append_to_slot`); 0 when not applicable (nothing touched).
     /// Pure.
     AppendLocal,
+    /// `(frame, d: u32, kind: u32, x: f64) -> 0/1` — `slots[d] += String.fromCharCode(x)`
+    /// (`kind` 0) or `String.fromCodePoint(x)` (`kind` 1) for a string slot, appending the
+    /// character's UTF-8 in place without making the one-unit string; 0 when not applicable
+    /// (a non-string slot, a surrogate, an argument `fromCodePoint` rejects, a join that needs
+    /// the generic concatenation): nothing touched. Pure.
+    AppendUnit,
     /// `(frame, obj: *mut Value, key: f64, dst: *mut Value, consume: u32) -> 0/1` — `obj[key]`
     /// through the interpreter's element fast paths (a one-unit string of an ASCII string, an
     /// own data element of a plain object or array, a typed-array element): 1 with the value
@@ -332,7 +338,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 85] = [
+pub(crate) const ALL: [Helper; 86] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -383,6 +389,7 @@ pub(crate) const ALL: [Helper; 85] = [
     Helper::NewDone,
     Helper::GcPoll,
     Helper::AppendLocal,
+    Helper::AppendUnit,
     Helper::ElemGet,
     Helper::StrictEq,
     Helper::StrictEqRef,
@@ -471,6 +478,7 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::NewDone => (&[P, P, P, P, I32], &[]),
         Helper::GcPoll => (&[P], &[I32]),
         Helper::AppendLocal => (&[P, I32, P], &[I32]),
+        Helper::AppendUnit => (&[P, I32, I32, F64], &[I32]),
         Helper::ElemGet => (&[P, P, F64, P, I32], &[I32]),
         Helper::StrictEq => (&[P, P, P], &[I32]),
         Helper::StrictEqRef => (&[P, P, P], &[I32]),
@@ -577,6 +585,7 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::NewDone => new_done as *const () as usize,
         Helper::GcPoll => gc_poll as *const () as usize,
         Helper::AppendLocal => append_local as *const () as usize,
+        Helper::AppendUnit => append_code_unit as *const () as usize,
         Helper::ElemGet => elem_get as *const () as usize,
         Helper::StrictEq => strict_eq as *const () as usize,
         Helper::StrictEqRef => strict_eq_ref as *const () as usize,
@@ -3666,6 +3675,38 @@ pub(crate) unsafe extern "C" fn append_local(f: *mut JitFrame, d: u32, y: *const
         return crate::bytecode::append_to_slot(slots, d, &y) as u32;
     }
     crate::bytecode::append_to_slot(slots, d, &*y) as u32
+}
+
+pub(crate) unsafe extern "C" fn append_code_unit(
+    f: *mut JitFrame,
+    d: u32,
+    kind: u32,
+    x: f64,
+) -> u32 {
+    let code = if kind == 0 {
+        if x.abs() < 9.0e18 {
+            x as i64 as u16 as u32
+        } else if x.is_finite() {
+            x.rem_euclid(65536.0) as u32
+        } else {
+            0
+        }
+    } else if x.is_finite() && x.fract() == 0.0 && (0.0..=1114111.0).contains(&x) {
+        x as u32
+    } else {
+        return 0;
+    };
+    let Some(ch) = char::from_u32(code) else {
+        return 0;
+    };
+    let chunk = &*(*f).chunk;
+    let d = d as usize;
+    if d >= chunk.n_slots {
+        return 0;
+    }
+    let slots = std::slice::from_raw_parts_mut((*f).slots, chunk.n_slots);
+    let mut buf = [0u8; 4];
+    crate::bytecode::append_str_to_slot(slots, d, ch.encode_utf8(&mut buf)) as u32
 }
 
 pub(crate) unsafe extern "C" fn elem_get(

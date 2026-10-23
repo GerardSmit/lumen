@@ -144,6 +144,74 @@ impl Tr<'_, '_> {
         self.fb.brif(done_ok, done, &[], miss, &[]);
     }
 
+    /// The accumulator append the call at `pc` feeds, when the result goes straight into
+    /// `c += <call>` (`StoreLocal(t) ArithLL(Add, c, c, t)` on a fresh temp `t`, the shape the
+    /// compiler gives a local `+=`) and no entry below the call borrows from a slot or cell:
+    /// `c`'s slot.
+    fn append_fusion(&self, pc: usize, base: usize) -> Option<usize> {
+        let (Op::StoreLocal(t), Op::ArithLL(ArithKind::Add, d, a, b)) =
+            (*self.ops.get(pc + 1)?, *self.ops.get(pc + 2)?)
+        else {
+            return None;
+        };
+        let (du, tu) = (d as usize, t as usize);
+        // Only the `+=` temp (the compiler's single unnamed slot, used once) may go unwritten.
+        let ok = a == d
+            && b == t
+            && du != tu
+            && self.chunk.native_slot_names().get(tu).is_some_and(|n| n.is_empty())
+            && pc + 3 <= self.backedge
+            && !self.is_leader(pc + 1)
+            && !self.is_leader(pc + 2)
+            && !self.is_leader(pc + 3)
+            && self.kinds[du] == Kind::Boxed
+            && self.vars[du].is_none()
+            && self.kinds[tu] == Kind::Boxed
+            && self.vars[tu].is_none()
+            && !self.stack[..base]
+                .iter()
+                .any(|e| matches!(e, Entry::Ref(..)));
+        ok.then_some(du)
+    }
+
+    /// For a call of `f` at `pc` (operands `base..drop_to` of the stack, Number argument `x`)
+    /// whose result is appended to a local string accumulator (see [`Tr::append_fusion`]):
+    /// [`Helper::AppendUnit`] appends the character in place. On a hit the operands are
+    /// dropped and the path is parked in `pending_append` to rejoin after the `ArithLL`; on a
+    /// miss emission continues with the ordinary call, which builds the string and appends it
+    /// as before.
+    pub(super) fn unit_append(&mut self, pc: usize, f: StrStatic, x: V, base: usize, drop_to: usize) {
+        if self.pending_append.is_some() {
+            return;
+        }
+        let Some(dst) = self.append_fusion(pc, base) else {
+            return;
+        };
+        let (dv, kind) = (
+            self.i32c(dst as i64),
+            self.i32c((f == StrStatic::CodePoint) as i64),
+        );
+        let r = self
+            .call(Helper::AppendUnit, &[self.frame, dv, kind, x])
+            .expect("AppendUnit returns a flag");
+        let z = self.i32c(0);
+        let hit = self.fb.icmp(IntCC::Ne, r, z);
+        let (yes, no) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(hit, yes, &[], no, &[]);
+        self.fb.seal_block(yes);
+        self.fb.seal_block(no);
+        self.fb.switch_to_block(yes);
+        let entries = self.stack.clone();
+        for k in base..drop_to {
+            if entries[k] == Entry::Boxed {
+                self.drop_at(k);
+            }
+        }
+        let end = self.fb.current_block();
+        self.pending_append = Some((pc + 3, end, entries[..base].to_vec()));
+        self.fb.switch_to_block(no);
+    }
+
     /// The direct call at `pc` of a wrapper around `f` (see the module docs): `false` (nothing
     /// emitted) when the call's operands do not fit, and the ordinary direct call is to be
     /// emitted instead.
@@ -237,6 +305,7 @@ impl Tr<'_, '_> {
         // The result is built above the operands (the receiver / callee entries may own values
         // that live until it is known to be done).
         let done = self.fb.create_block();
+        self.unit_append(pc, f, x, base, ab);
         self.str_static_fast(f, x, d, done, full);
         self.fb.seal_block(done);
         self.fb.switch_to_block(done);

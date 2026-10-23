@@ -742,15 +742,16 @@ impl LStr {
             return false;
         }
         let len = h.len.get() as usize;
-        if len + x.len() > (h.cap.get() & CAP_MASK) as usize {
+        let n = x.len();
+        if len + n > (h.cap.get() & CAP_MASK) as usize {
             return false;
         }
         unsafe {
             let data = (self.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(len), x.len());
+            copy_small(data.add(len), x.as_ptr(), n);
         }
-        h.len.set((len + x.len()) as u32);
-        self.and_ascii(x.is_ascii());
+        h.len.set((len + n) as u32);
+        self.and_ascii(if n == 1 { x.as_bytes()[0] < 0x80 } else { x.is_ascii() });
         true
     }
 
@@ -769,6 +770,25 @@ impl LStr {
         s.hdr().len.set(need as u32);
         s.and_ascii(x.is_ascii());
         s
+    }
+}
+
+/// `copy_nonoverlapping` with fixed-size copies for the tiny appends that dominate string
+/// building (no `memcpy` call for up to 8 bytes).
+#[inline(always)]
+unsafe fn copy_small(dst: *mut u8, src: *const u8, n: usize) {
+    match n {
+        0 => {}
+        1 => *dst = *src,
+        2..=3 => {
+            std::ptr::copy_nonoverlapping(src, dst, 2);
+            std::ptr::copy_nonoverlapping(src.add(n - 2), dst.add(n - 2), 2);
+        }
+        4..=8 => {
+            std::ptr::copy_nonoverlapping(src, dst, 4);
+            std::ptr::copy_nonoverlapping(src.add(n - 4), dst.add(n - 4), 4);
+        }
+        _ => std::ptr::copy_nonoverlapping(src, dst, n),
     }
 }
 

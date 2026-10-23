@@ -4933,7 +4933,14 @@ pub(crate) fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
         Value::Null => "null",
         _ => return false,
     };
-    let Value::Str(cur) = &slots[d] else {
+    append_str_to_slot(slots, d, rhs)
+}
+
+/// [`append_to_slot`] for a string `rhs`: `slots[d] += rhs` when `slots[d]` is a string and the
+/// join needs no fixup; `false` = not applicable, nothing touched.
+#[inline]
+pub(crate) fn append_str_to_slot(slots: &mut [Value], d: usize, rhs: &str) -> bool {
+    let Value::Str(cur) = &mut slots[d] else {
         return false;
     };
     if size::sum(cur.len(), rhs.len(), crate::interpreter::MAX_STR_LEN).is_err()
@@ -4941,17 +4948,13 @@ pub(crate) fn append_to_slot(slots: &mut [Value], d: usize, y: &Value) -> bool {
     {
         return false;
     }
-    let Value::Str(mut s) = std::mem::replace(&mut slots[d], Value::Undefined) else {
-        unreachable!("checked above")
-    };
-    if !s.append_in_place(rhs) {
-        s = if s.len() < 16 {
-            crate::lstr::LStr::concat2(&s, rhs)
+    if !cur.append_in_place(rhs) {
+        *cur = if cur.len() < 16 {
+            crate::lstr::LStr::concat2(cur, rhs)
         } else {
-            s.concat_grown(rhs)
+            cur.concat_grown(rhs)
         };
     }
-    slots[d] = Value::Str(s);
     true
 }
 
