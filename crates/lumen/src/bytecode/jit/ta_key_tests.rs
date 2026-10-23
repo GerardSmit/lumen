@@ -183,3 +183,64 @@ fn boxed_comparisons_stay_inline_and_see_js_side_effects() {
         true,
     );
 }
+
+#[test]
+fn property_updates_in_place() {
+    agree(
+        r#"(function(){
+          function C(){this.n=0;this.m=10;this.s='a'}
+          C.prototype.step=function(k){var r=0;
+            for(var i=0;i<k;i++){this.n++;r+=this.m--;r+=++this.n;r+=this.m++ +(--this.m);this.s++}
+            return r};
+          var c=new C(),r=0;for(var t=0;t<300;t++)r+=c.step(20);
+          var f=Object.freeze(new C()),g=new C();Object.defineProperty(g,'n',{get:function(){return 5},set:function(v){this.m=v}});
+          var b=new C();b.n=10n;
+          var out=[r,c.n,c.m,c.s,f.step(3),f.n,g.step(3),g.m];
+          try{out.push(b.step(2))}catch(e){out.push(e.name)}
+          out.push(String(b.n));
+          return out.join();
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn property_updates_across_shapes_and_receivers() {
+    agree(
+        r#"(function(){
+          'use strict';
+          function bump(o,k){var r=0;for(var i=0;i<k;i++){o.n++;r+=o.inner.n--;r+=++o.inner.n}return r}
+          function mk(){return {n:0,inner:{n:5}}}
+          var a=mk(),r=0;for(var t=0;t<300;t++)r+=bump(a,20);
+          var out=[r,a.n,a.inner.n];
+          var p=Object.create({n:1});p.inner={n:0};out.push(bump(p,3),p.n,Object.getPrototypeOf(p).n);
+          var w=mk();Object.defineProperty(w,'n',{value:7,writable:false});
+          try{bump(w,2)}catch(e){out.push(e.name,w.n)}
+          var f=Object.freeze(mk());try{bump(f,2)}catch(e){out.push(e.name,f.n)}
+          var s=mk();delete s.n;out.push(bump(s,2),String(s.n));
+          var q={inner:{n:1},n:2};out.push(bump(q,4),q.n,q.inner.n);
+          return out.join();
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn nullish_constant_on_either_side() {
+    agree(
+        r#"(function(){
+          function f(xs){var r=0;
+            for(var i=0;i<xs.length;i++){var x=xs[i];
+              if(null==x)r+=1;if(undefined!=x)r+=2;if(x==null)r+=4;if(void 0==this)r+=8;
+              r+=(null==xs[i])?16:0}
+            return r}
+          var xs=[null,undefined,0,'',false,{},[],NaN,1n,Symbol(),{valueOf:function(){throw 1}}],r=0;
+          for(var t=0;t<300;t++)r+=f.call(t&1?null:{},xs);
+          return r;
+        })()"#,
+        None,
+        true,
+    );
+}

@@ -2523,6 +2523,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::DestructureGuard
                     | Op::GetElem
                     | Op::GetProp(..)
+                    | Op::UpdateProp(..)
                     | Op::SetElem
                     | Op::SetElemDrop
                     | Op::Add
@@ -4543,6 +4544,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.stack.pop();
             }
             Op::UpdateCap(n, k) => self.update_ptr(pc, Src::Cap(n), None, k),
+            Op::UpdateProp(_, c, k) => {
+                match layout::prop_ic(self.chunk, c).filter(|ic| ic.has_own()) {
+                    Some(ic) if matches!(self.stack[d - 1], Entry::Boxed | Entry::Ref(..)) => {
+                        self.update_prop(pc, &ic, k)
+                    }
+                    _ => self.generic(pc),
+                }
+            }
             Op::UpdateNameCached(n, c, k) if self.plan.name_store.contains_key(&pc) => {
                 self.update_ptr(pc, Src::NameW(n), Some(c), k)
             }
@@ -5804,18 +5813,63 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(ok2);
         self.fb.switch_to_block(ok2);
         let old = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
+        let (new, r) = self.upd_step(k, old);
+        self.fb.store(MemKind::F64, p, new, VALUE_PAYLOAD);
+        let pre = self.stack.clone();
+        self.upd_join(pc, k, r, d, slow, join);
+        self.invalidate_src(src);
+        self.stack = pre;
+        if let Some(r) = param {
+            self.stack.push(Entry::Num(r));
+        }
+    }
+
+    /// `UpdateProp` on the receiver on top: in place when the IC finds an own writable data
+    /// property holding a Number, else the interpreter's op.
+    fn update_prop(&mut self, pc: usize, ic: &layout::PropIc, k: UpdKind) {
+        let d = self.stack.len();
+        let pushes = !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard);
+        let (obj, owned) = match self.stack[d - 1] {
+            Entry::Ref(p, _) => (p, false),
+            _ => (self.sptr(d - 1), true),
+        };
+        let pre = self.stack.clone();
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let param = pushes.then(|| self.fb.append_block_param(join, Type::F64));
+        let old = layout::prop_get_num(&mut self.fb, obj, ic, slow);
+        let (new, r) = self.upd_step(k, old);
+        layout::prop_set_num(&mut self.fb, obj, ic, new, slow);
+        self.seal_current();
+        if owned {
+            self.drop_at(d - 1);
+        }
+        self.upd_join(pc, k, r, d - 1, slow, join);
+        self.stack = pre[..d - 1].to_vec();
+        if let Some(r) = param {
+            self.stack.push(Entry::Num(r));
+        }
+    }
+
+    /// The stored value and the op's result for `old` updated by `k`.
+    fn upd_step(&mut self, k: UpdKind, old: V) -> (V, V) {
         let one = self.fb.f64const(1.0);
-        let inc = matches!(k, UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard);
-        let new = if inc {
+        let new = if matches!(k, UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard) {
             self.fb.binary(BinaryOp::Fadd, old, one)
         } else {
             self.fb.binary(BinaryOp::Fsub, old, one)
         };
-        self.fb.store(MemKind::F64, p, new, VALUE_PAYLOAD);
         let r = match k {
             UpdKind::PostInc | UpdKind::PostDec => old,
             _ => new,
         };
+        (new, r)
+    }
+
+    /// Ends an inline update: the fast path jumps to `join` with `r` (when the op pushes), and
+    /// `slow` runs the interpreter's op, joining with its result left at stack `depth`.
+    fn upd_join(&mut self, pc: usize, k: UpdKind, r: V, depth: usize, slow: Block, join: Block) {
+        let pushes = !matches!(k, UpdKind::IncDiscard | UpdKind::DecDiscard);
         if pushes {
             self.fb.jump(join, &[r]);
         } else {
@@ -5823,20 +5877,15 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb.seal_block(slow);
         self.fb.switch_to_block(slow);
-        let pre = self.stack.clone();
+        self.fb.mark_cold();
         self.generic(pc);
         if pushes {
-            self.slow_to_join(pc, d, true, join);
+            self.slow_to_join(pc, depth, true, join);
         } else {
             self.fb.jump(join, &[]);
         }
         self.fb.seal_block(join);
         self.fb.switch_to_block(join);
-        self.invalidate_src(src);
-        self.stack = pre;
-        if let Some(r) = param {
-            self.stack.push(Entry::Num(r));
-        }
     }
 
     // ---- calls and properties ----------------------------------------------------------------
@@ -8226,6 +8275,28 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn cmp_stack(&mut self, pc: usize, kind: CmpKind) -> Result<V, String> {
         let d = self.stack.len();
         let (a, b) = (self.stack[d - 2], self.stack[d - 1]);
+        if let Some((neg, idx)) = self.nullish_operand(pc, kind) {
+            let (p, drop_idx) = match self.stack[idx] {
+                Entry::Ref(p, _) => (p, None),
+                Entry::Boxed => (self.sptr(idx), Some(idx)),
+                Entry::Num(_) | Entry::Bool(_) => {
+                    self.stack.truncate(d - 2);
+                    return Ok(self.i32c(neg as i64));
+                }
+            };
+            let join = self.fb.create_block();
+            let r = self.fb.append_block_param(join, Type::I32);
+            let slow = self.fb.create_block();
+            self.nullish_inline(p, neg, drop_idx, join, slow);
+            self.fb.seal_block(slow);
+            self.fb.switch_to_block(slow);
+            let t = self.cmp_slow(pc, kind)?;
+            self.fb.jump(join, &[t]);
+            self.fb.seal_block(join);
+            self.fb.switch_to_block(join);
+            self.stack.truncate(d - 2);
+            return Ok(r);
+        }
         let r = match (a, b) {
             (Entry::Num(x), Entry::Num(y)) => self.fb.fcmp(fcc(kind), x, y),
             (Entry::Bool(x), Entry::Bool(y)) if is_eq_kind(kind) => {
@@ -8271,43 +8342,16 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.stack.extend([Entry::Boxed, Entry::Boxed]);
             return Ok(r);
         }
-        // `x == null` / `x != null` with the constant pushed right before: decided by the tag
-        // of `x` (the constant owns nothing; `x` is released on the inline paths).
-        let pushed_nullish = pc > 0
-            && !self.is_leader(pc - 1)
-            && match self.ops[pc - 1] {
-                Op::Undef => true,
-                Op::Const(k) => self.opnd_nullish(Opnd::Const(k)),
-                _ => false,
-            };
         let loose = match kind {
             CmpKind::EqEq => Some(false),
             CmpKind::NotEq => Some(true),
             _ => None,
         };
-        let (join, res) = match (loose, pushed_nullish) {
-            (Some(neg), true) => {
-                let join = self.fb.create_block();
-                let res = self.fb.append_block_param(join, Type::I32);
-                let slow = self.fb.create_block();
-                self.nullish_inline(pa, neg, Some(d - 2), join, slow);
-                self.fb.seal_block(slow);
-                self.fb.switch_to_block(slow);
-                (Some(join), Some(res))
-            }
-            _ => (None, None),
-        };
         // Loose equality of two values of one type is strict equality (no conversions).
         let (join, res) = match loose {
             Some(neg) => {
-                let (join, res) = match (join, res) {
-                    (Some(j), Some(r)) => (j, r),
-                    _ => {
-                        let j = self.fb.create_block();
-                        let r = self.fb.append_block_param(j, Type::I32);
-                        (j, r)
-                    }
-                };
+                let join = self.fb.create_block();
+                let res = self.fb.append_block_param(join, Type::I32);
                 let ta = self.fb.load(MemKind::I32U8, pa, 0);
                 let tb = self.fb.load(MemKind::I32U8, pb, 0);
                 let same = self.fb.icmp(IntCC::Eq, ta, tb);
@@ -8329,7 +8373,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.switch_to_block(b_gen);
                 (Some(join), Some(res))
             }
-            None => (join, res),
+            None => (None, None),
         };
         let code = self.i32c(bin_code(&cmp_op(kind))? as i64);
         let pr = self.sptr(d);
@@ -8445,6 +8489,36 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(join);
         self.fb.switch_to_block(join);
         res
+    }
+
+    /// For a loose `==` / `!=` at `pc` whose operand pushed right before it, or right before
+    /// the other operand, is the constant `null` / `undefined`: the negation flag and the stack
+    /// index of the other operand.
+    fn nullish_operand(&self, pc: usize, kind: CmpKind) -> Option<(bool, usize)> {
+        let neg = match kind {
+            CmpKind::EqEq => false,
+            CmpKind::NotEq => true,
+            _ => return None,
+        };
+        let nullish_at = |q: usize| match self.ops[q] {
+            Op::Undef => true,
+            Op::Const(k) => self.opnd_nullish(Opnd::Const(k)),
+            _ => false,
+        };
+        let d = self.stack.len();
+        let idx = if pc >= 1 && !self.is_leader(pc - 1) && nullish_at(pc - 1) {
+            d - 2
+        } else if pc >= 2
+            && !self.is_leader(pc - 1)
+            && !self.is_leader(pc - 2)
+            && self.chunk.jit_stack_effect(pc - 1) == Some((0, 1))
+            && nullish_at(pc - 2)
+        {
+            d - 1
+        } else {
+            return None;
+        };
+        Some((neg, idx))
     }
 
     /// Whether operand `o` is the constant `null` or `undefined`.
