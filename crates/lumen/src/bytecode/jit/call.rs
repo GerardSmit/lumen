@@ -44,7 +44,7 @@ const MAX_DIRECT_SLOTS: usize = 64;
 fn method_ic_poly(chunk: &Chunk, cache: u32) -> bool {
     let mut seen = None;
     for k in 0..crate::bytecode::PROP_IC_WAYS {
-        let Some(st) = chunk.caches.get(cache as usize + k).map(|c| c.get()) else {
+        let Some(st) = chunk.caches.peek(cache as usize + k) else {
             break;
         };
         if st.depth == crate::bytecode::IC_EMPTY {

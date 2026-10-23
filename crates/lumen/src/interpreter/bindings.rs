@@ -39,6 +39,7 @@ struct Slots(NonNull<Binding>);
 impl Slots {
     fn new(values: Vec<Binding>) -> Slots {
         let b: Box<[Binding]> = values.into_boxed_slice();
+        lumen_common::memcat::retag_slice(&b, lumen_common::memcat::CategoryTag::SCOPES);
         Slots(NonNull::new(Box::into_raw(b) as *mut Binding).expect("box pointer"))
     }
     #[inline]
@@ -269,6 +270,7 @@ impl VarMap {
     }
 
     fn make_dynamic(&mut self) {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Scopes);
         if let Some((layout, values)) = self.take_template() {
             self.map =
                 VarStorage::Large(Box::new(layout.names.iter().cloned().zip(values).collect()));
@@ -276,6 +278,7 @@ impl VarMap {
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> VarMap {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Scopes);
         Self::from_storage(
             if capacity <= SMALL_VAR_MAP_CAPACITY {
                 VarStorage::Small(Vec::with_capacity(capacity))
@@ -307,6 +310,7 @@ impl VarMap {
             .set(self.generation.get().wrapping_add(1).max(1));
     }
     pub fn insert(&mut self, k: impl Into<std::rc::Rc<str>>, v: Binding) -> Option<Binding> {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Scopes);
         self.bump();
         let k = k.into();
         if matches!(&self.map, VarStorage::Template(layout, _) if layout.slot(&k).is_none()) {

@@ -165,6 +165,7 @@ impl EntryVec {
         }
         let len = self.len as usize;
         let layout = Self::shared_layout(len);
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Props);
         let block = unsafe { alloc(layout) };
         if block.is_null() {
             handle_alloc_error(layout);
@@ -192,6 +193,7 @@ impl EntryVec {
         debug_assert!(!self.is_shared());
         debug_assert!(cap >= self.len as usize);
         let cap_u32: u32 = cap.try_into().expect("entry vector exceeds u32 capacity");
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Props);
         let new_layout = Self::owned_layout(cap);
         if self.is_inline() {
             // Outgrew the object's inline slots: move to a heap buffer.

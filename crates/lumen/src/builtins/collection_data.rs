@@ -123,6 +123,7 @@ impl CollectionData {
     }
 
     pub(crate) fn insert(&mut self, key: Value, value: Value) {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Collections);
         let key = match key {
             Value::Num(n) if n == 0.0 => Value::Num(0.0),
             // An empty key would pack to the tombstone marker.
@@ -133,6 +134,7 @@ impl CollectionData {
     }
 
     pub(crate) fn remove(&mut self, key: &Value) -> bool {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Collections);
         table!(&mut self.store, t => t.remove(key))
     }
 

@@ -361,8 +361,7 @@ fn unset_at_entry(chunk: &Chunk, header: usize, region: &Analysis) -> Vec<bool> 
 fn ic_saw_object(interp: &Interp, chunk: &Chunk, cache: u32) -> bool {
     let sp = interp.string_proto.borrow().props.shape();
     (0..crate::bytecode::PROP_IC_WAYS).any(|k| {
-        chunk.caches.get(cache as usize + k).is_some_and(|c| {
-            let st = c.get();
+        chunk.caches.peek(cache as usize + k).is_some_and(|st| {
             st.depth != crate::bytecode::IC_EMPTY && (st.depth != 0 || st.recv_shape != sp)
         })
     })

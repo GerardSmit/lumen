@@ -278,6 +278,79 @@ impl IcState {
     };
 }
 
+/// A chunk's property inline caches, one page of `PROP_IC_WAYS` cells per site (a single-cell
+/// consumer such as `instanceof` takes a whole page too, so a site's ways never straddle pages).
+/// A page is allocated on the first access to its site: most sites of a loaded program never
+/// run, and the table keeps one pointer per site until then. Pages never move or free while the
+/// chunk lives, so a cell's address stays valid for baked JIT references and `Interp::ic_way`
+/// steps within the page.
+pub(crate) struct PropCaches {
+    pages: Box<[std::cell::OnceCell<Box<[std::cell::Cell<IcState>; PROP_IC_WAYS]>>]>,
+}
+
+impl PropCaches {
+    /// Room for `cells` cells (rounded up to whole pages), none allocated.
+    pub(crate) fn new(cells: usize) -> PropCaches {
+        PropCaches {
+            pages: (0..cells.div_ceil(PROP_IC_WAYS))
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+        }
+    }
+
+    /// The cell count, a multiple of `PROP_IC_WAYS`.
+    pub(crate) fn len(&self) -> usize {
+        self.pages.len() * PROP_IC_WAYS
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_page(
+        page: &std::cell::OnceCell<Box<[std::cell::Cell<IcState>; PROP_IC_WAYS]>>,
+    ) -> &Box<[std::cell::Cell<IcState>; PROP_IC_WAYS]> {
+        page.get_or_init(|| Box::new([const { std::cell::Cell::new(IcState::EMPTY) }; PROP_IC_WAYS]))
+    }
+
+    /// Cell `i`, allocating its page on first use. Panics when out of range.
+    #[inline(always)]
+    pub(crate) fn at(&self, i: usize) -> &std::cell::Cell<IcState> {
+        let page = &self.pages[i / PROP_IC_WAYS];
+        let cells = match page.get() {
+            Some(cells) => cells,
+            None => Self::alloc_page(page),
+        };
+        &cells[i % PROP_IC_WAYS]
+    }
+
+    /// Cell `i`, allocating its page on first use; `None` when out of range.
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<&std::cell::Cell<IcState>> {
+        (i < self.len()).then(|| self.at(i))
+    }
+
+    /// Cell `i` only if its page exists (an unallocated page holds only empty states).
+    pub(crate) fn get_allocated(&self, i: usize) -> Option<&std::cell::Cell<IcState>> {
+        Some(&self.pages.get(i / PROP_IC_WAYS)?.get()?[i % PROP_IC_WAYS])
+    }
+
+    /// Cell `i`'s state without allocating; `None` when out of range, `EMPTY` when unallocated.
+    pub(crate) fn peek(&self, i: usize) -> Option<IcState> {
+        let page = self.pages.get(i / PROP_IC_WAYS)?;
+        Some(page.get().map_or(IcState::EMPTY, |cells| cells[i % PROP_IC_WAYS].get()))
+    }
+
+    /// Every allocated cell, page by page (diagnostics).
+    pub(crate) fn allocated_pages(&self) -> impl Iterator<Item = &[std::cell::Cell<IcState>]> {
+        self.pages.iter().filter_map(|p| p.get().map(|c| &c[..]))
+    }
+
+    /// Heap bytes: the page table plus the allocated pages.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.pages.len() * size_of::<std::cell::OnceCell<Box<[std::cell::Cell<IcState>; PROP_IC_WAYS]>>>()
+            + self.allocated_pages().count() * PROP_IC_WAYS * size_of::<IcState>()
+    }
+}
+
 /// Which update `UpdateLocal` performs, and the value it leaves on the stack: `Pre*` push the
 /// updated value, `Post*` push the original (coerced) value, `*Discard` push nothing (the update
 /// is a statement or a `for` update — its value is unobservable).
@@ -936,7 +1009,7 @@ pub struct Chunk {
     /// holding the (prototype depth, `entries` slot) last seen for that site (see [`IcState`]). The
     /// `Chunk` is shared across calls via `Rc`, so these persist. `Cell` is fine: the VM runs one
     /// thread at a time (coroutine ping-pong), like the rest of the engine's shared-`Rc` state.
-    caches: Vec<std::cell::Cell<IcState>>,
+    caches: PropCaches,
     /// Optimizing-tier state: loop hotness and native code (see [`jit`]).
     jit: jit::ChunkJit,
     #[cfg(feature = "bench")]
@@ -2576,14 +2649,14 @@ fn run_vm_frames<const ONE: bool>(
             Op::LoadLexicalThis => stack.push(i.lexical_this(env)?),
             Op::GetProp(n, c) => {
                 let obj = pop!();
-                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = i.get_prop_ic(&obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
                 stack.push(v);
             }
             Op::GetPropThis(n, c) => {
                 let v = i.get_prop_ic(
                     this_val,
                     &chunk.names[n as usize],
-                    &chunk.caches[c as usize],
+                    chunk.caches.at(c as usize),
                 )?;
                 stack.push(v);
             }
@@ -2600,7 +2673,7 @@ fn run_vm_frames<const ONE: bool>(
                 }
                 // Borrowed, not cloned: only this frame's own code writes its slots, and none
                 // runs during the read (like GetPropThis's receiver).
-                let v = i.get_prop_ic(obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let v = i.get_prop_ic(obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
                 stack.push(v);
             }
             Op::SetProp(n, c) => {
@@ -2610,14 +2683,14 @@ fn run_vm_frames<const ONE: bool>(
                     &obj,
                     &chunk.names[n as usize],
                     v.clone(),
-                    &chunk.caches[c as usize],
+                    chunk.caches.at(c as usize),
                 )?;
                 stack.push(v);
             }
             Op::SetPropDrop(n, c) => {
                 let v = pop!();
                 let obj = pop!();
-                i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+                i.set_prop_ic(&obj, &chunk.names[n as usize], v, chunk.caches.at(c as usize))?;
             }
             Op::SetPropThisDrop(n, c) => {
                 let v = pop!();
@@ -2625,7 +2698,7 @@ fn run_vm_frames<const ONE: bool>(
                     this_val,
                     &chunk.names[n as usize],
                     v,
-                    &chunk.caches[c as usize],
+                    chunk.caches.at(c as usize),
                 )?;
             }
             Op::SetPropLocalDrop(s, n, c) => {
@@ -2640,7 +2713,7 @@ fn run_vm_frames<const ONE: bool>(
                         ),
                     ));
                 }
-                i.set_prop_ic(&obj, &chunk.names[n as usize], v, &chunk.caches[c as usize])?;
+                i.set_prop_ic(&obj, &chunk.names[n as usize], v, chunk.caches.at(c as usize))?;
             }
             Op::DestructureGuard => {
                 crate::native_ops::destructure_guard(i, stack.last().expect("vm stack underflow"))?;
@@ -2740,7 +2813,7 @@ fn run_vm_frames<const ONE: bool>(
                     lval
                 };
                 let r = i.binary("+", lval, v)?;
-                i.set_prop_ic(&obj, name, r, &chunk.caches[c as usize])?;
+                i.set_prop_ic(&obj, name, r, chunk.caches.at(c as usize))?;
             }
             Op::GetElem => {
                 let key = pop!();
@@ -2875,7 +2948,7 @@ fn run_vm_frames<const ONE: bool>(
             Op::UpdateProp(n, c, kind) => {
                 let obj = pop!();
                 let name = &chunk.names[n as usize];
-                let cache = &chunk.caches[c as usize];
+                let cache = chunk.caches.at(c as usize);
                 let old = i.get_prop_ic(&obj, name, cache)?;
                 step_and_store(i, &mut stack, kind, old, |i, v| {
                     i.set_prop_ic(&obj, name, v, cache)
@@ -2953,7 +3026,7 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::GetMethod(n, c) => {
                 let obj = pop!();
-                let m = i.get_prop_ic(&obj, &chunk.names[n as usize], &chunk.caches[c as usize])?;
+                let m = i.get_prop_ic(&obj, &chunk.names[n as usize], chunk.caches.at(c as usize))?;
                 stack.push(obj);
                 stack.push(m);
             }
@@ -3008,7 +3081,7 @@ fn run_vm_frames<const ONE: bool>(
             Op::InstanceOf(c) => {
                 let b = pop!();
                 let a = pop!();
-                let v = i.instanceof_ic(&a, &b, &chunk.caches[c as usize])?;
+                let v = i.instanceof_ic(&a, &b, chunk.caches.at(c as usize))?;
                 stack.push(v);
             }
             Op::GenBin(n) => {

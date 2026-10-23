@@ -22,10 +22,24 @@ pub const CANVAS_CATEGORY_ID: u8 = 17;
 pub const STRINGS_CATEGORY_ID: u8 = 18;
 /// The embedding host's own structures.
 pub const HOST_CATEGORY_ID: u8 = 19;
-/// Ids a more specific category may replace: nothing more specific than "other" and the
-/// engine's `Runtime` phase.
+/// Object property storage: named-entry vectors owned by objects.
+pub const PROPS_CATEGORY_ID: u8 = 20;
+/// Array element storage (packed and classic dense arrays).
+pub const ARRAYS_CATEGORY_ID: u8 = 21;
+/// Scopes and environments: binding maps.
+pub const SCOPES_CATEGORY_ID: u8 = 22;
+/// Map, Set, WeakMap and WeakSet storage.
+pub const COLLECTIONS_CATEGORY_ID: u8 = 23;
+/// Closure and function-object metadata.
+pub const FUNCTIONS_CATEGORY_ID: u8 = 24;
+/// Shapes and shape transitions.
+pub const SHAPES_CATEGORY_ID: u8 = 25;
+/// Script source text handed over by the embedder.
+pub const SOURCE_CATEGORY_ID: u8 = 26;
+/// Ids a more specific category may replace: nothing more specific than "other", the
+/// engine's `Runtime` phase and the embedder's thread-wide `Host` tag.
 #[cfg(feature = "mem-stats")]
-const GENERIC_IDS: [u8; 2] = [0, 9];
+const GENERIC_IDS: [u8; 3] = [0, 9, HOST_CATEGORY_ID];
 
 /// A typed allocator category tag. The numeric id remains shared with the engine's report
 /// categories, while callers cannot accidentally pass an unrelated integer to [`enter`].
@@ -41,6 +55,13 @@ impl CategoryTag {
     pub const CANVAS: Self = Self(CANVAS_CATEGORY_ID);
     pub const STRINGS: Self = Self(STRINGS_CATEGORY_ID);
     pub const HOST: Self = Self(HOST_CATEGORY_ID);
+    pub const PROPS: Self = Self(PROPS_CATEGORY_ID);
+    pub const ARRAYS: Self = Self(ARRAYS_CATEGORY_ID);
+    pub const SCOPES: Self = Self(SCOPES_CATEGORY_ID);
+    pub const COLLECTIONS: Self = Self(COLLECTIONS_CATEGORY_ID);
+    pub const FUNCTIONS: Self = Self(FUNCTIONS_CATEGORY_ID);
+    pub const SHAPES: Self = Self(SHAPES_CATEGORY_ID);
+    pub const SOURCE: Self = Self(SOURCE_CATEGORY_ID);
 
     pub const fn from_id(id: u8) -> Self {
         Self(id)
@@ -79,8 +100,8 @@ pub fn enter(category: CategoryTag) -> Guard {
     }
 }
 
-/// Like [`enter`], but only while the current category is generic (`Other` or the engine's
-/// `Runtime` phase): a string made while parsing stays under the parser's category.
+/// Like [`enter`], but only while the current category is generic (`Other`, the engine's
+/// `Runtime` phase or the embedder's `Host` tag): a string made while parsing stays under the parser's category.
 #[inline(always)]
 pub fn enter_if_generic(category: CategoryTag) -> Guard {
     #[cfg(feature = "mem-stats")]
@@ -115,6 +136,39 @@ pub fn retag_vec<T>(v: &Vec<T>, category: CategoryTag) {
     );
     #[cfg(not(feature = "mem-stats"))]
     let _ = (v, category);
+}
+
+/// [`retag_vec`] for a heap slice that was allocated exactly (a boxed slice's buffer).
+#[inline(always)]
+pub fn retag_slice<T>(s: &[T], category: CategoryTag) {
+    #[cfg(feature = "mem-stats")]
+    crate::fastalloc::retag(
+        s.as_ptr() as *const u8,
+        std::mem::size_of_val(s),
+        std::mem::align_of::<T>(),
+        category.0,
+    );
+    #[cfg(not(feature = "mem-stats"))]
+    let _ = (s, category);
+}
+
+/// [`retag_vec`] for the allocation behind an `Rc<str>`: the reference counts plus the text,
+/// rounded to the box's alignment.
+#[inline(always)]
+pub fn retag_rc_str(s: &std::rc::Rc<str>, category: CategoryTag) {
+    #[cfg(feature = "mem-stats")]
+    {
+        const HEADER: usize = 2 * std::mem::size_of::<usize>();
+        let align = std::mem::align_of::<usize>();
+        crate::fastalloc::retag(
+            unsafe { (std::rc::Rc::as_ptr(s) as *const u8).sub(HEADER) },
+            (HEADER + s.len() + align - 1) & !(align - 1),
+            align,
+            category.0,
+        );
+    }
+    #[cfg(not(feature = "mem-stats"))]
+    let _ = (s, category);
 }
 
 thread_local! {

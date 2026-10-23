@@ -243,3 +243,20 @@ fn constructors_called_through_new_tier_up() {
     assert!(stats.compiled_units > 0);
     agree_on_every_tier(src, "20000", false);
 }
+
+#[test]
+fn lazily_allocated_property_caches_fill_on_every_tier() {
+    agree_with_interp(
+        "function Pt(x,y){this.x=x;this.y=y}
+         function Pt3(x,y,z){this.x=x;this.y=y;this.z=z}
+         function cold(o){return o.a+o.b+o.c+o.d}
+         function poly(o){return o.x+(o.y|0)}
+         function late(o){o.k=(o.k|0)+1;return o.k+(o instanceof Pt?1:0)}
+         var shapes=[new Pt(1,2),new Pt3(1,2,3),{x:5,y:6},{y:1,x:2},{q:0,x:3,y:4},{r:0,s:0,x:1,y:1}];
+         var s=0;
+         for(var i=0;i<3000;i++){s+=poly(shapes[i%6])}
+         var obj=new Pt(1,1);
+         for(var j=0;j<500;j++){s+=late(obj)}
+         s"
+    );
+}

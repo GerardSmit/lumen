@@ -293,11 +293,13 @@ impl DenseStorage {
     }
     pub(in crate::value) fn reserve_exact(&mut self, additional: usize) {
         if additional != 0 {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
             self.classic_mut().elems.reserve_exact(additional);
         }
     }
     #[inline]
     pub(in crate::value) fn push(&mut self, value: u32) {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
         self.classic_mut().elems.push(value);
     }
     #[inline]
@@ -322,6 +324,7 @@ impl DenseStorage {
 
     pub(in crate::value) fn mirror_reserve_exact(&mut self, additional: usize) {
         if additional != 0 {
+            let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
             self.classic_mut().mirror.reserve_exact(additional);
         }
     }
@@ -335,6 +338,7 @@ impl DenseStorage {
         self.classic_opt_mut().and_then(|c| c.mirror.get_mut(index))
     }
     pub(in crate::value) fn mirror_push(&mut self, value: f64) {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
         self.classic_mut().mirror.push(value);
     }
     pub(in crate::value) fn mirror_pop(&mut self) -> Option<f64> {

@@ -333,6 +333,7 @@ impl Shape {
             Keys::Owned(keys) => keys,
             Keys::Chain { .. } if self.len == 0 => &[],
             Keys::Chain { flat, .. } => flat.get_or_init(|| {
+                let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
                 let mut keys: Vec<Rc<str>> = self.chain().map(|(_, k)| k.clone()).collect();
                 keys.reverse();
                 keys.into_boxed_slice()
@@ -362,6 +363,7 @@ impl Shape {
     /// A shared shape's index confirms hits against its materialised key list, so indexing one
     /// builds that list too.
     fn make_index(&self) -> Box<SlotIndex> {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
         Box::new(SlotIndex::new(self.keys()))
     }
 
@@ -697,6 +699,7 @@ impl ShapeTable {
         if let Some(c) = self.transitions.get(&TransitionLookup(parent.id, key) as &dyn TransitionParts) {
             return Some(c.clone());
         }
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
         let key = self.keys.intern(key);
         if self.by_id.len() > self.sweep_at {
             self.sweep();
@@ -803,6 +806,7 @@ pub(super) fn shape_by_id(id: u32) -> Option<Rc<Shape>> {
 
 /// A fresh owned shape holding `keys` (the object detaches from the tree).
 pub(super) fn shape_owned_from(keys: Option<&Shape>) -> Rc<Shape> {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Shapes);
     with_shapes(|t| {
         let id = t.fresh_owned_id();
         Rc::new(match keys {

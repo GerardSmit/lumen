@@ -607,7 +607,7 @@ impl Compiler {
             pending_labels: self.pending_labels.clone(),
             uses_this: self.uses_this,
             obj_maps: self.obj_maps,
-            caches: self.caches.len(),
+            caches: self.caches,
             name_caches: self.name_caches.len(),
             try_depth: self.try_depth,
             tdz_slots: self.tdz_slots.clone(),
@@ -641,7 +641,7 @@ impl Compiler {
         self.pending_labels = c.pending_labels;
         self.uses_this = c.uses_this;
         self.obj_maps = c.obj_maps;
-        self.caches.truncate(c.caches);
+        self.caches = c.caches;
         self.name_caches.truncate(c.name_caches);
         self.try_depth = c.try_depth;
         self.tdz_slots = c.tdz_slots;

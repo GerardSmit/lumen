@@ -224,6 +224,7 @@ impl PackedVec {
             return;
         }
         let new_cap = (len + want).max(total * 2).max(4);
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
         self.with_vec(new_cap, |v| v.reserve_exact(new_cap - v.len()));
     }
 
@@ -357,6 +358,7 @@ impl PackedVec {
 
 impl From<Vec<Elem>> for PackedVec {
     fn from(v: Vec<Elem>) -> PackedVec {
+        lumen_common::memcat::retag_vec(&v, lumen_common::memcat::CategoryTag::ARRAYS);
         let mut v = ManuallyDrop::new(v);
         PackedVec {
             ptr: v.as_mut_ptr(),

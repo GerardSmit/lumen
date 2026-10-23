@@ -87,7 +87,7 @@ impl Chunk {
             + vec_bytes(&self.classes, s)
             + vec_bytes(&self.cap_inits, s);
         let mut parts = [0usize; 8];
-        parts[0] = vec_bytes(&self.caches, s);
+        parts[0] = self.caches.heap_bytes();
         parts[1] = vec_bytes(&self.obj_maps, s);
         parts[2] = vec_bytes(&self.name_caches, s) + vec_bytes(&self.name_chains, s);
         parts[3] = vec_bytes(&self.name_paths, s);
@@ -96,8 +96,10 @@ impl Chunk {
         parts[6] = vec_bytes(&self.cap_pins.borrow(), s);
         parts[7] = vec_bytes(&self.switch_tables, s);
         b.ic_sites = self.caches.len();
-        for c in &self.caches {
-            let ic = c.get();
+        let states: Vec<super::IcState> = (0..self.caches.len())
+            .map(|i| self.caches.peek(i).unwrap_or(super::IcState::EMPTY))
+            .collect();
+        for ic in &states {
             if ic.depth != super::IC_EMPTY {
                 b.ic_filled += 1;
                 if ic.mid_ok != 0 {
@@ -106,14 +108,14 @@ impl Chunk {
             }
         }
         for (k, size) in [8usize, 16, 32].into_iter().enumerate() {
-            for page in self.caches.chunks(size) {
+            for page in states.chunks(size) {
                 b.ic_page_total[k] += 1;
-                if page.iter().any(|c| c.get().depth != super::IC_EMPTY) {
+                if page.iter().any(|ic| ic.depth != super::IC_EMPTY) {
                     b.ic_pages[k] += 1;
                 }
             }
         }
-        if !self.caches.is_empty() && b.ic_filled == 0 {
+        if self.caches.len() != 0 && b.ic_filled == 0 {
             b.ic_idle_chunks = 1;
             b.ic_idle_bytes = parts[0];
         }
@@ -126,5 +128,53 @@ impl Chunk {
     /// The function nodes this chunk instantiates (`MakeClosure` templates).
     pub(crate) fn inner_functions(&self) -> &[Rc<Function>] {
         &self.funcs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{compile, PropCaches, IC_EMPTY, PROP_IC_WAYS};
+    use std::mem::size_of;
+
+    fn chunk_of(src: &str) -> std::rc::Rc<super::super::Chunk> {
+        let stmts = crate::parser::parse_script(src, false).ok().expect("parse");
+        let func = stmts
+            .iter()
+            .find_map(|s| match s {
+                crate::ast::Stmt::FuncDecl(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("function declaration");
+        compile(&func).expect("compiles")
+    }
+
+    #[test]
+    fn unrun_chunk_holds_no_property_cache_pages() {
+        let chunk = chunk_of("function f(o){ o.a = o.b + o.c; return o.d instanceof Object; }");
+        let sites = chunk.caches.len() / PROP_IC_WAYS;
+        assert!(sites >= 4, "expected several cache sites, got {sites}");
+        assert_eq!(chunk.caches.allocated_pages().count(), 0);
+        let table = chunk.caches.heap_bytes();
+        assert_eq!(table, sites * size_of::<usize>());
+        assert_eq!(chunk.mem_bytes().ic_parts[0], table);
+        assert!(chunk.caches.peek(0).is_some_and(|st| st.depth == IC_EMPTY));
+        assert!(chunk.caches.get_allocated(0).is_none());
+        assert_eq!(chunk.caches.allocated_pages().count(), 0);
+    }
+
+    #[test]
+    fn first_access_allocates_only_its_site_page() {
+        let caches = PropCaches::new(3 * PROP_IC_WAYS);
+        assert_eq!(caches.len(), 3 * PROP_IC_WAYS);
+        let way = caches.at(PROP_IC_WAYS + 1);
+        assert_eq!(caches.allocated_pages().count(), 1);
+        assert!(caches.get_allocated(0).is_none());
+        assert!(!std::ptr::eq(way, caches.at(PROP_IC_WAYS)));
+        let before = way as *const _;
+        let _ = caches.at(2 * PROP_IC_WAYS);
+        assert_eq!(caches.allocated_pages().count(), 2);
+        assert!(std::ptr::eq(before, caches.at(PROP_IC_WAYS + 1)));
+        assert!(caches.get(3 * PROP_IC_WAYS).is_none());
+        assert!(caches.peek(3 * PROP_IC_WAYS).is_none());
     }
 }

@@ -1638,6 +1638,7 @@ impl Interp {
         if crate::native_ops::dynamic_code_disabled() {
             return (Err(self.throw("EvalError", "dynamic code is unavailable in native execution")), None);
         }
+        lumen_common::memcat::retag_rc_str(&source, lumen_common::memcat::CategoryTag::SOURCE);
         let mut fresh = None;
         let mut body_cache = None;
         let hit = cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, &source, record));

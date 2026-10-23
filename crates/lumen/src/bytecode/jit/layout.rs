@@ -877,7 +877,7 @@ pub(crate) fn prop_ic(chunk: &Chunk, cache: u32) -> Option<PropIc> {
     let mut proto: Vec<(Vec<u32>, u32)> = Vec::new();
     let mut absent: Vec<(Vec<u32>, bool)> = Vec::new();
     for k in 0..PROP_IC_WAYS {
-        let st = chunk.caches.get(cache as usize + k)?.get();
+        let st = chunk.caches.peek(cache as usize + k)?;
         // Exactly 0-3: no `IC_ARR_KEYCHK` (array holder) or `IC_GETTER`, and not EMPTY /
         // ABSENT / CREATE.
         let mids = match st.depth {
@@ -1291,7 +1291,7 @@ pub(crate) struct CreateWay {
 pub(crate) fn create_ic(chunk: &Chunk, cache: u32) -> Vec<CreateWay> {
     let mut ways: Vec<CreateWay> = Vec::new();
     for k in 0..PROP_IC_WAYS {
-        let Some(cell) = chunk.caches.get(cache as usize + k) else {
+        let Some(cell) = chunk.caches.get_allocated(cache as usize + k) else {
             break;
         };
         let st = cell.get();

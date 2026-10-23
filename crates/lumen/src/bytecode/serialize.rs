@@ -70,7 +70,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use super::{
-    activation, intern_name, ArithKind, CapInit, Chunk, CmpKind, IcState, NameIc, Op, TypeofKind,
+    activation, intern_name, ArithKind, CapInit, Chunk, CmpKind, NameIc, Op, TypeofKind,
     UpdKind,
 };
 use crate::ast::Function;
@@ -80,7 +80,7 @@ use crate::value::Value;
 type R<T> = Result<T, String>;
 
 /// Bump on any change to the chunk layout that the tables below do not capture.
-const CODEC_VERSION: u32 = 2;
+const CODEC_VERSION: u32 = 3;
 
 // ---- runtime counters (verification / diagnostics) --------------------------------------------
 
@@ -830,7 +830,7 @@ fn dec_chunk(
         cap_inits,
         activation_layout,
         env_this,
-        caches: (0..n_caches).map(|_| Cell::new(IcState::EMPTY)).collect(),
+        caches: super::PropCaches::new(n_caches),
         jit: Default::default(),
         #[cfg(feature = "bench")]
         precompiled_origin: None,

@@ -84,9 +84,23 @@ pub enum Cat {
     Strings = lumen_common::memcat::STRINGS_CATEGORY_ID,
     /// The embedding host's own structures.
     Host = lumen_common::memcat::HOST_CATEGORY_ID,
+    /// Object property storage: named-entry vectors owned by objects.
+    Props = lumen_common::memcat::PROPS_CATEGORY_ID,
+    /// Array element storage.
+    Arrays = lumen_common::memcat::ARRAYS_CATEGORY_ID,
+    /// Scopes and environments: binding maps.
+    Scopes = lumen_common::memcat::SCOPES_CATEGORY_ID,
+    /// Map, Set, WeakMap and WeakSet storage.
+    Collections = lumen_common::memcat::COLLECTIONS_CATEGORY_ID,
+    /// Closure and function-object metadata.
+    Functions = lumen_common::memcat::FUNCTIONS_CATEGORY_ID,
+    /// Shapes and shape transitions.
+    Shapes = lumen_common::memcat::SHAPES_CATEGORY_ID,
+    /// Script source text handed over by the embedder.
+    Source = lumen_common::memcat::SOURCE_CATEGORY_ID,
 }
 
-pub const CAT_NAMES: [&str; 20] = [
+pub const CAT_NAMES: [&str; 27] = [
     "other (host/std)",
     "over-aligned blocks / object slab chunks",
     "parse: source + AST",
@@ -107,6 +121,13 @@ pub const CAT_NAMES: [&str; 20] = [
     "canvas surfaces",
     "JS strings",
     "host glue (embedder)",
+    "object property storage",
+    "array element storage",
+    "scopes (binding maps)",
+    "Map/Set/Weak* storage",
+    "function/closure metadata",
+    "shapes + transitions",
+    "script source text",
 ];
 
 /// The current thread's allocation category (see [`Cat`]).
@@ -126,7 +147,7 @@ pub fn enter(cat: Cat) -> CatGuard {
     lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::from_id(cat as u8))
 }
 
-/// Like [`enter`], but only while the current category is `Other` or `Runtime`; inside any
+/// Like [`enter`], but only while the current category is `Other`, `Runtime` or the embedder's `Host`; inside any
 /// more specific phase (parsing, compiling, HTML, …) the allocation stays with that phase.
 #[inline(always)]
 pub fn enter_refining(cat: Cat) -> CatGuard {

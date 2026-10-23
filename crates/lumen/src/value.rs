@@ -1205,6 +1205,7 @@ impl Callable {
     }
 
     pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Functions);
         Callable::User(Box::new(UserCallable { func, env }))
     }
 

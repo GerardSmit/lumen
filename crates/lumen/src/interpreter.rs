@@ -551,6 +551,7 @@ impl Binding {
 use crate::value::{register_scope, scope_registry_len, scope_registry_prune};
 
 fn alloc_scope(scope: Scope) -> Env {
+    let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Scopes);
     let e = Rc::new(RefCell::new(scope));
     register_scope(&e);
     e

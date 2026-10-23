@@ -1502,7 +1502,6 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool, force_
     c.funcs.shrink_to_fit();
     c.classes.shrink_to_fit();
     c.cap_inits.shrink_to_fit();
-    c.caches.shrink_to_fit();
     c.name_caches.shrink_to_fit();
     Some(jit::track_chunk(Rc::new(Chunk {
         debug_name: func.name.clone().unwrap_or_else(|| "<anonymous>".into()),
@@ -1525,7 +1524,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool, force_
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
-        caches: c.caches,
+        caches: crate::bytecode::PropCaches::new(c.caches),
         jit: Default::default(),
         #[cfg(feature = "bench")]
         precompiled_origin: None,
@@ -1583,7 +1582,8 @@ struct Compiler {
     uses_this: bool,
     /// Count of object-literal template sites handed out (see `Chunk::obj_maps`).
     obj_maps: u32,
-    caches: Vec<std::cell::Cell<IcState>>,
+    /// Property cache cells handed out, a multiple of `PROP_IC_WAYS` (see `PropCaches`).
+    caches: usize,
     name_caches: Vec<std::cell::Cell<NameIc>>,
     /// Number of `PushHandler` regions active at the current emission point. `break`/`continue`
     /// jumping out of a `try` block (or a for-of body, which wraps itself in a handler) must
@@ -1817,19 +1817,15 @@ impl Compiler {
         // PROP_IC_WAYS consecutive ways per site: consumers address way 1; probes reach the
         // others at `cache_ptr + k` (see `Interp::ic_way`). Keeps every existing call site
         // untouched.
-        let idx = self.caches.len() as u32;
-        for _ in 0..PROP_IC_WAYS {
-            self.caches.push(std::cell::Cell::new(IcState::EMPTY));
-        }
+        let idx = self.caches as u32;
+        self.caches += PROP_IC_WAYS;
         idx
     }
-    /// Reserve one cache cell for an op whose generated template has a single stable shape.
-    /// Unlike property sites, `instanceof` does not need four polymorphic ways; keeping this
-    /// separate avoids paying 96 bytes per source occurrence.
+    /// Reserve a cache for an op whose generated template has a single stable shape. Unlike
+    /// property sites, `instanceof` uses only the first way; the page is allocated on first
+    /// execution, so unexecuted occurrences cost nothing beyond the table entry.
     fn new_single_cache(&mut self) -> u32 {
-        let idx = self.caches.len() as u32;
-        self.caches.push(std::cell::Cell::new(IcState::EMPTY));
-        idx
+        self.new_cache()
     }
     /// Reserve a fresh name-cache slot for a free-name op.
     fn new_name_cache(&mut self) -> u32 {
