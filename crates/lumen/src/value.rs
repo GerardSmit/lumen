@@ -2057,6 +2057,46 @@ pub(crate) fn gc_trim_quiescent_heap() {
     with_gc_state(|state| state.heap.trim(1));
 }
 
+/// Bytes returned by [`gc_release_unused_heap`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapRelease {
+    /// Property and element buffer capacity given back by compacting live objects.
+    pub slack_bytes: usize,
+    /// Slab memory handed back to the system: empty chunks and whole free pages.
+    pub slab_bytes: usize,
+}
+
+/// Shrink the heap-owned property and element buffers of every live object to their lengths.
+/// Objects that are currently borrowed are skipped. Call only at a quiescent point. Returns the
+/// bytes given back.
+pub(crate) fn gc_compact_storage() -> usize {
+    let mut bytes = 0;
+    gc_for_each_live(|o| {
+        if let Ok(mut obj) = o.try_borrow_mut() {
+            bytes += obj.props.release_slack();
+        }
+    });
+    bytes
+}
+
+/// For a host at a quiescent point after a collection: compact live objects' buffers, then hand
+/// empty slab chunks and the free pages inside sparse ones back to the system.
+pub(crate) fn gc_release_unused_heap() -> HeapRelease {
+    let slack_bytes = gc_compact_storage();
+    let slab_bytes = with_gc_state(|state| {
+        let bytes = state.heap.release_unused();
+        state.counters.note_chunks(state.heap.chunk_count());
+        bytes
+    });
+    HeapRelease { slack_bytes, slab_bytes }
+}
+
+/// Slab memory currently handed back page by page (see `ObjHeap::released_bytes`).
+#[cfg(test)]
+pub(crate) fn gc_released_slab_bytes() -> usize {
+    with_gc_state(|state| state.heap.released_bytes())
+}
+
 /// Return empty slab chunks to the system once objects dying by reference count (no sweep,
 /// e.g. a big array dropped) have left more than [`SPARE_CHUNKS`] of them empty for a while
 /// (see `ObjHeap::trim_if_emptied`). Polled from the interpreter's safe points.

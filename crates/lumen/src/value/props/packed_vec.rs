@@ -189,6 +189,21 @@ impl PackedVec {
         }
     }
 
+    /// Shrink a heap buffer (and any front slack) to the live run. In-box and absent storage is
+    /// left alone. Returns the bytes given back.
+    pub(in crate::value) fn release_slack(&mut self) -> usize {
+        if self.ptr.is_null() || self.inline {
+            return 0;
+        }
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
+        let slack = (self.cap - self.len + self.head) as usize * std::mem::size_of::<Elem>();
+        if slack == 0 {
+            return 0;
+        }
+        self.with_vec(0, |v| v.shrink_to_fit());
+        slack
+    }
+
     /// Run `f` on the buffer as a `Vec` of capacity at least `min_cap` (for operations that
     /// may reallocate).
     fn with_vec<R>(&mut self, min_cap: usize, f: impl FnOnce(&mut Vec<Elem>) -> R) -> R {

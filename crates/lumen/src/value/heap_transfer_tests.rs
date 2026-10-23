@@ -252,3 +252,166 @@ fn mid_inline_class_holds_five_and_six_properties_in_the_box() {
         assert_eq!(keys, expected);
     }
 }
+
+fn num_of(v: Value) -> f64 {
+    match v {
+        Value::Num(n) => n,
+        _ => panic!("not a number"),
+    }
+}
+
+fn used_slots() -> usize {
+    with_gc_state(|state| state.heap.census().iter().map(|c| c.1).sum())
+}
+
+#[test]
+fn compaction_keeps_every_property_and_objects_stay_mutable() {
+    let _entered = Enter::new(GcState::new());
+    let getter = Object::new(None);
+    let objects: Vec<Gc> = (0..40usize)
+        .map(|n| {
+            let o = Object::new_bare(None);
+            {
+                let mut b = o.borrow_mut();
+                for i in 0..9 + n % 5 {
+                    b.props.insert(
+                        format!("k{i}"),
+                        Property::data(Value::Num((i + n) as f64), i % 2 == 0, i % 3 == 0, i % 4 != 0),
+                    );
+                }
+                b.props.insert(
+                    "acc",
+                    Property::accessor_prop(Some(Value::Obj(getter.clone())), None, true, false),
+                );
+                b.props.insert("odd key!", Property::plain(Value::Num(-1.0)));
+            }
+            o
+        })
+        .collect();
+    let before: Vec<(usize, usize)> = objects
+        .iter()
+        .map(|o| {
+            let c = o.borrow().props.census();
+            (c.entries_len, c.entries_cap)
+        })
+        .collect();
+    assert!(before.iter().any(|&(len, cap)| cap > len));
+    assert!(gc_compact_storage() > 0);
+    for (n, o) in objects.iter().enumerate() {
+        let b = o.borrow();
+        let c = b.props.census();
+        assert_eq!(c.entries_len, before[n].0);
+        assert_eq!(c.entries_cap, c.entries_len);
+        let count = 9 + n % 5;
+        let mut expected: Vec<String> = (0..count).map(|i| format!("k{i}")).collect();
+        expected.extend(["acc".to_string(), "odd key!".to_string()]);
+        let keys: Vec<String> = b.props.keys().iter().map(|k| k.to_string()).collect();
+        assert_eq!(keys, expected);
+        for i in 0..count {
+            let p = b.props.get(&format!("k{i}")).expect("kept");
+            assert_eq!(num_of(p.value()), (i + n) as f64);
+            assert_eq!(p.writable(), i % 2 == 0);
+            assert_eq!(p.enumerable(), i % 3 == 0);
+            assert_eq!(p.configurable(), i % 4 != 0);
+        }
+        let acc = b.props.get("acc").expect("accessor kept");
+        assert!(acc.accessor() && acc.enumerable() && !acc.configurable());
+        assert_eq!(num_of(b.props.get("odd key!").unwrap().value()), -1.0);
+    }
+    assert_eq!(gc_compact_storage(), 0);
+    for (n, o) in objects.iter().enumerate() {
+        let mut b = o.borrow_mut();
+        b.props.insert("added", Property::plain(Value::Num(n as f64)));
+        assert!(b.props.remove("k1"));
+        assert!(b.props.get("k1").is_none());
+        assert_eq!(num_of(b.props.get("added").unwrap().value()), n as f64);
+        assert_eq!(num_of(b.props.get("k2").unwrap().value()), (2 + n) as f64);
+        assert_eq!(b.props.keys().last().map(|k| k.to_string()).as_deref(), Some("added"));
+    }
+}
+
+#[test]
+fn compaction_keeps_array_elements_and_holes() {
+    let _entered = Enter::new(GcState::new());
+    let arr = Object::new_array_from_vec(None, (0..6).map(|i| Value::Num(i as f64)).collect());
+    let small = Object::new_array_from_vec(None, vec![Value::Num(1.0), Value::Num(2.0)]);
+    {
+        let mut b = arr.borrow_mut();
+        for i in 6..100 {
+            assert!(b.props.push_array_element(Value::Num(i as f64)).is_ok());
+        }
+        assert!(b.props.remove("3"));
+    }
+    assert!(small.borrow_mut().props.push_array_element(Value::Num(3.0)).is_ok());
+    assert!(gc_compact_storage() > 0);
+    {
+        let b = arr.borrow();
+        for n in 0..100u32 {
+            match b.props.get_index(n) {
+                Some(p) => {
+                    assert_ne!(n, 3);
+                    assert_eq!(num_of(p.value()), n as f64);
+                }
+                None => assert_eq!(n, 3),
+            }
+        }
+        assert_eq!(num_of(b.props.length_property().unwrap().value()), 100.0);
+    }
+    for i in 100..130 {
+        assert!(arr.borrow_mut().props.push_array_element(Value::Num(i as f64)).is_ok());
+    }
+    let b = arr.borrow();
+    assert_eq!(num_of(b.props.get_index(129).unwrap().value()), 129.0);
+    assert_eq!(num_of(b.props.length_property().unwrap().value()), 130.0);
+    let s = small.borrow();
+    for (n, want) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+        assert_eq!(num_of(s.props.get_index(n as u32).unwrap().value()), want);
+    }
+}
+
+#[test]
+fn release_unused_heap_returns_chunks_and_pages_and_allocation_continues() {
+    let _entered = Enter::new(GcState::new());
+    let make = |n: usize| {
+        let o = Object::new_with_capacity(None, 2);
+        o.borrow_mut().props.insert("a", Property::plain(Value::Num(n as f64)));
+        o
+    };
+    let mut objects: Vec<Option<Gc>> = (0..60_000).map(|n| Some(make(n))).collect();
+    let chunks_full = gc_heap_chunks();
+    for (n, slot) in objects.iter_mut().enumerate() {
+        if n % 1000 != 0 && n >= 2000 {
+            *slot = None;
+        }
+    }
+    let live = live_objects();
+    let released = gc_release_unused_heap();
+    assert!(released.slab_bytes > 0);
+    assert!(gc_heap_chunks() <= chunks_full);
+    if heap::granule() != 0 {
+        assert!(gc_released_slab_bytes() > 0);
+    }
+    assert_eq!(live_objects(), live);
+    assert_eq!(used_slots() as i64, live);
+    let check = |objects: &[Option<Gc>]| {
+        for (n, slot) in objects.iter().enumerate() {
+            if let Some(o) = slot {
+                assert_eq!(num_of(o.borrow().props.get("a").unwrap().value()), n as f64);
+            }
+        }
+    };
+    check(&objects);
+    objects.extend((0..60_000).map(|n| Some(make(60_000 + n))));
+    assert_eq!(used_slots() as i64, live_objects());
+    check(&objects);
+    let second = gc_release_unused_heap();
+    assert_eq!(second.slack_bytes, 0);
+    check(&objects);
+    drop(objects);
+    assert_eq!(live_objects(), 0);
+    assert_eq!(used_slots(), 0);
+    gc_release_unused_heap();
+    assert_eq!(gc_heap_chunks(), 0);
+    let again = make(7);
+    assert_eq!(num_of(again.borrow().props.get("a").unwrap().value()), 7.0);
+}

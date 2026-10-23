@@ -199,6 +199,23 @@ impl DenseStorage {
         self.0 = Some(NonNull::new_unchecked(slot));
     }
 
+    /// Shrink the packed and classic element buffers to their lengths. Returns the bytes given
+    /// back.
+    pub(in crate::value) fn release_slack(&mut self) -> usize {
+        let Some(d) = self.as_deref_mut() else {
+            return 0;
+        };
+        let _mem = crate::memstats::enter_refining(crate::memstats::Cat::Arrays);
+        let mut bytes = d.packed.release_slack();
+        if let Some(c) = d.classic.as_deref_mut() {
+            bytes += (c.elems.capacity() - c.elems.len()) * std::mem::size_of::<u32>()
+                + (c.mirror.capacity() - c.mirror.len()) * std::mem::size_of::<f64>();
+            c.elems.shrink_to_fit();
+            c.mirror.shrink_to_fit();
+        }
+        bytes
+    }
+
     /// Drop the sidecar (freeing it unless it lives in the object's box).
     #[inline]
     fn release(&mut self) {

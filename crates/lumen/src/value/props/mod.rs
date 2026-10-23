@@ -523,6 +523,12 @@ impl Props {
         self.entries.trim_slack(2);
     }
 
+    /// Shrink the entry and element buffers to their lengths, for a quiescent compaction pass.
+    /// Returns the bytes given back.
+    pub(crate) fn release_slack(&mut self) -> usize {
+        self.entries.release_slack() + self.elems.release_slack()
+    }
+
     /// Final named-property count of a small ordinary instance, recorded after a successful
     /// construct so later allocations can reserve the right capacity.
     pub(crate) fn observed_instance_capacity(&self) -> usize {

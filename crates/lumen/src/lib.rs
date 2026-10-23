@@ -502,6 +502,18 @@ pub fn release_parse_memory() -> usize {
     crate::value::release_all_lazy_bodies()
 }
 
+/// Give memory a settled program no longer needs back to the system: shrink the property and
+/// element buffers of every live object to their lengths, return empty object-slab chunks and
+/// the free pages inside sparse ones, and release the allocator's cached pages. Collect first
+/// for the full effect. Call at a quiescent point (no JS running). Returns the bytes given back
+/// by the first two steps.
+pub fn release_unused_heap() -> usize {
+    let released = crate::value::gc_release_unused_heap();
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::fastalloc::trim();
+    released.slack_bytes + released.slab_bytes
+}
+
 /// Evict native code while retaining bytecode and realm state.
 ///
 /// # Safety

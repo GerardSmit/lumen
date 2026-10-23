@@ -5,7 +5,7 @@
 use std::mem::size_of;
 use std::rc::Rc;
 
-use super::{Callable, Property, with_gc_state};
+use super::{Callable, Exotic, Property, with_gc_state};
 
 /// Structural byte estimates for one heap.
 #[derive(Default, Debug)]
@@ -22,6 +22,12 @@ pub(crate) struct HeapWalk {
     pub heap_slack: usize,
     /// Inline objects by (slot capacity, named entries used).
     pub inline_hist: [[usize; 9]; 9],
+    /// Array-class boxes (one inline slot) with no named entry, by what they are: objects a
+    /// collection cleared that something still references (no prototype, not an array any
+    /// more), arrays that really have no `length` entry, and anything else.
+    pub swept_husks: usize,
+    pub empty_arrays: usize,
+    pub other_empty_cap1: usize,
     /// Heap-owned vectors by (capacity, len), both clamped to 16.
     pub heap_hist: [[usize; 17]; 17],
     pub scopes: usize,
@@ -78,6 +84,15 @@ pub(crate) fn walk() -> HeapWalk {
             if c.entries_inline {
                 w.inline_slack += slack;
                 w.inline_hist[c.entries_cap.min(8)][c.entries_len.min(8)] += 1;
+                if c.entries_cap == 1 && c.entries_len == 0 {
+                    if matches!(b.exotic, Exotic::Array) {
+                        w.empty_arrays += 1;
+                    } else if matches!(b.exotic, Exotic::None) && b.proto.is_none() {
+                        w.swept_husks += 1;
+                    } else {
+                        w.other_empty_cap1 += 1;
+                    }
+                }
             } else {
                 w.heap_slack += slack;
                 w.heap_hist[c.entries_cap.min(16)][c.entries_len.min(16)] += 1;

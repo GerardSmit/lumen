@@ -222,6 +222,11 @@ struct ChunkHdr {
     slots: u32,
     /// Bytes of the chunk backed by committed memory, from its start (see [`chunk_alloc`]).
     committed: u32,
+    /// Bit `g` set: the pages of granule `g` (see [`granule`]) were handed back to the system.
+    /// Every slot overlapping a set granule is free, kept off the free list and never read
+    /// until [`ObjHeap::relist_released`] clears the bit. Granule 0 holds this header and is
+    /// never released.
+    released: u64,
 }
 
 const _: () = assert!(std::mem::size_of::<ChunkHdr>() <= SLOTS_OFF);
@@ -381,6 +386,81 @@ fn is_free(b: *const GcBox) -> bool {
     unsafe { (*b).weak.get() == 0 }
 }
 
+/// Bytes per releasable granule: the system page size, or zero where pages cannot be handed
+/// back (or the chunk would need more than the 64 bits of [`ChunkHdr::released`]).
+pub(super) fn granule() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static GRANULE: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let g = GRANULE.load(Relaxed);
+    if g != usize::MAX {
+        return g;
+    }
+    let page = lumen_os::rlimit::pagesize() as usize;
+    let g = if cfg!(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )) && page.is_power_of_two()
+        && page <= CHUNK_BYTES / 2
+        && CHUNK_BYTES / page <= 64
+    {
+        page
+    } else {
+        0
+    };
+    GRANULE.store(g, Relaxed);
+    g
+}
+
+/// The bits of [`ChunkHdr::released`] covering slot `i` of a chunk with `slot_size`-byte slots.
+#[inline]
+fn slot_granule_mask(i: usize, slot_size: usize, gs: usize) -> u64 {
+    let lo = (SLOTS_OFF + i * slot_size) / gs;
+    let hi = (SLOTS_OFF + (i + 1) * slot_size - 1) / gs;
+    let width = hi - lo + 1;
+    (if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }) << lo
+}
+
+/// Hand back the pages of every granule of `c` whose overlapping slots are all free and handed
+/// out at least once. Returns the bytes released.
+///
+/// # Safety
+/// `c` must be a chunk of this thread's heap with no outstanding reference into a free slot.
+unsafe fn release_granules(c: NonNull<ChunkHdr>, gs: usize) -> usize {
+    let hdr = &mut *c.as_ptr();
+    let (size, slots, bump) = (
+        hdr.slot_size as usize,
+        hdr.slots as usize,
+        hdr.bump as usize,
+    );
+    let mut bytes = 0;
+    for g in 1..CHUNK_BYTES / gs {
+        if hdr.released >> g & 1 != 0 {
+            continue;
+        }
+        let start = g * gs;
+        let lo = (start - SLOTS_OFF) / size;
+        if lo >= slots {
+            break;
+        }
+        let hi = ((start + gs - 1 - SLOTS_OFF) / size).min(slots - 1);
+        if hi >= bump {
+            break;
+        }
+        let all_free = (lo..=hi).all(|i| {
+            slot_granule_mask(i, size, gs) & hdr.released != 0 || is_free(slot(c, i))
+        });
+        if all_free
+            && lumen_os::mmap::discard_pages(c.as_ptr().cast::<u8>().add(start), gs)
+        {
+            hdr.released |= 1 << g;
+            bytes += gs;
+        }
+    }
+    bytes
+}
+
 /// One slot class: its free list and chunks.
 struct ClassHeap {
     /// Head of the class-wide free list (threaded through each free box's second word).
@@ -494,13 +574,23 @@ impl ObjHeap {
         let h = &self.classes[class as usize];
         let mut c = h.cur.get();
         if c.is_null() || unsafe { (*c).bump == (*c).slots } {
-            let chunks = h.chunks();
-            c = match chunks
+            let spare = h
+                .chunks()
                 .iter()
                 .find(|c| unsafe { c.as_ref().bump < c.as_ref().slots })
-            {
-                Some(c) => c.as_ptr(),
+                .map(|c| c.as_ptr());
+            c = match spare {
+                Some(c) => c,
                 None => {
+                    if self.relist_released(h) {
+                        let p = h.free.get();
+                        unsafe {
+                            h.free.set(free_next(p));
+                            (*chunk_of(p)).used += 1;
+                        }
+                        return p;
+                    }
+                    let chunks = h.chunks();
                     let (raw, committed) = chunk_alloc();
                     let Some(c) = NonNull::new(raw.cast::<ChunkHdr>()) else {
                         std::alloc::handle_alloc_error(chunk_layout());
@@ -515,6 +605,7 @@ impl ObjHeap {
                             slot_size: class.size() as u32,
                             slots: class.slots() as u32,
                             committed: committed as u32,
+                            released: 0,
                         })
                     };
                     chunks.push(c);
@@ -549,7 +640,12 @@ impl ObjHeap {
                 if hdr.used == 0 {
                     continue;
                 }
+                let released = hdr.released;
+                let gs = if released != 0 { granule() } else { 0 };
                 for i in 0..hdr.bump as usize {
+                    if gs != 0 && slot_granule_mask(i, hdr.slot_size as usize, gs) & released != 0 {
+                        continue;
+                    }
                     let b = slot(c, i);
                     if !is_free(b) && unsafe { (*b).strong.get() } > 0 {
                         f(b);
@@ -565,7 +661,29 @@ impl ObjHeap {
     /// free slots of partly used chunks are listed fullest chunk first, so allocation refills
     /// dense chunks and sparse ones get a chance to drain and be returned.
     pub(super) fn trim(&self, keep: usize) {
-        let keep = keep.max(1);
+        self.trim_impl(keep.max(1), false);
+    }
+
+    /// Return every empty chunk, and the whole pages inside runs of free slots of the others,
+    /// to the system. For a quiescent host after a collection. Returns the bytes handed back.
+    pub(super) fn release_unused(&self) -> usize {
+        self.trim_impl(0, true)
+    }
+
+    /// Bytes of slot memory currently handed back by page-level release.
+    #[cfg(test)]
+    pub(super) fn released_bytes(&self) -> usize {
+        let gs = granule();
+        self.classes
+            .iter()
+            .flat_map(|h| h.chunks().iter())
+            .map(|c| unsafe { c.as_ref().released }.count_ones() as usize * gs)
+            .sum()
+    }
+
+    fn trim_impl(&self, keep: usize, release: bool) -> usize {
+        let gs = granule();
+        let mut returned = 0;
         self.emptied.set(0);
         self.purge_at.set(None);
         for h in &self.classes {
@@ -579,11 +697,21 @@ impl ObjHeap {
                 if spare < keep {
                     spare += 1;
                     hdr.bump = 0;
+                    hdr.released = 0;
                     return true;
                 }
+                let already = hdr.released.count_ones() as usize * gs;
                 unsafe { chunk_free(c.as_ptr()) };
+                returned += CHUNK_BYTES - already;
                 false
             });
+            if release && gs != 0 {
+                for &c in chunks.iter() {
+                    if unsafe { c.as_ref().used } != 0 {
+                        returned += unsafe { release_granules(c, gs) };
+                    }
+                }
+            }
             // Emptiest first: the list is built by pushing, so the fullest chunk's free slots
             // end up at its head.
             chunks.sort_by_key(|c| unsafe { c.as_ref().used });
@@ -593,7 +721,13 @@ impl ObjHeap {
                 if hdr.used == 0 {
                     continue;
                 }
+                let released = hdr.released;
                 for i in (0..hdr.bump as usize).rev() {
+                    if released != 0
+                        && slot_granule_mask(i, hdr.slot_size as usize, gs) & released != 0
+                    {
+                        continue;
+                    }
                     let b = slot(c, i);
                     if is_free(b) {
                         unsafe { set_free_next(b, head) };
@@ -609,6 +743,41 @@ impl ObjHeap {
                     .map_or(std::ptr::null_mut(), |c| c.as_ptr()),
             );
         }
+        returned
+    }
+
+    /// Put the slots of the first chunk with released granules back on `h`'s free list (the list
+    /// is empty) so allocation reuses them before mapping a new chunk; touching them faults the
+    /// pages back in, so later chunks stay released until this one fills. Returns whether any
+    /// slot was listed.
+    fn relist_released(&self, h: &ClassHeap) -> bool {
+        let gs = granule();
+        let mut head = h.free.get();
+        let mut any = false;
+        for &c in h.chunks().iter() {
+            let hdr = unsafe { &mut *c.as_ptr() };
+            let released = std::mem::take(&mut hdr.released);
+            if released == 0 {
+                continue;
+            }
+            for i in (0..hdr.bump as usize).rev() {
+                if slot_granule_mask(i, hdr.slot_size as usize, gs) & released == 0 {
+                    continue;
+                }
+                let b = slot(c, i);
+                unsafe {
+                    (*b).weak.set(0);
+                    set_free_next(b, head);
+                }
+                head = b;
+                any = true;
+            }
+            if any {
+                break;
+            }
+        }
+        h.free.set(head);
+        any
     }
 
     /// Return empty chunks beyond `spare` once frees have emptied more than `spare` and they are

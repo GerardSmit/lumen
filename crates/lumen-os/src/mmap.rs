@@ -129,6 +129,35 @@ pub fn pagesize() -> i64 {
     crate::rlimit::pagesize()
 }
 
+/// Tell the kernel the whole pages in `[addr, addr + len)` hold nothing worth keeping: their
+/// memory may be reclaimed at once, and the range stays mapped. Afterwards the bytes read back
+/// as either zero or their old contents, so the caller must treat them as dead. Returns whether
+/// the kernel accepted the hint (always `false` where the platform has no such call).
+///
+/// # Safety
+/// `addr` and `len` must be page aligned and lie inside memory the caller owns, none of which
+/// holds data it still needs.
+pub unsafe fn discard_pages(addr: *mut u8, len: usize) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        libc::madvise(addr.cast(), len, libc::MADV_FREE_REUSABLE) == 0
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::madvise(addr.cast(), len, libc::MADV_DONTNEED) == 0
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
+
 /// The `mmap` module's `PROT_*`, `MAP_*` and `MADV_*` constants on this platform.
 pub fn constants() -> Vec<(&'static str, i64)> {
     let mut v: Vec<(&'static str, i64)> = Vec::new();

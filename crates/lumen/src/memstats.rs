@@ -755,6 +755,10 @@ impl crate::interpreter::Interp {
             fmt_bytes(w.inline_slack * p),
             fmt_bytes(w.heap_slack * p)
         );
+        eprintln!(
+            "[mem]     inline cap 1, len 0: swept husks {}, empty arrays {}, other {}",
+            w.swept_husks, w.empty_arrays, w.other_empty_cap1
+        );
         for cap in [1, 2, 4, 8] {
             let row: Vec<String> = (0..=cap).map(|n| w.inline_hist[cap][n].to_string()).collect();
             eprintln!("[mem]     inline cap {cap} by len 0..: {}", row.join(" "));

@@ -199,6 +199,28 @@ impl EntryVec {
         }
     }
 
+    /// Shrink an owned heap buffer to its length (freeing it when empty). Inline and shared
+    /// vectors are left alone. Returns the bytes given back.
+    pub(in crate::value) fn release_slack(&mut self) -> usize {
+        if self.cap == 0 || self.is_inline() || self.cap == self.len {
+            return 0;
+        }
+        let slack = (self.cap - self.len) as usize * ENTRY;
+        if self.len == 0 {
+            unsafe {
+                dealloc(
+                    self.ptr.as_ptr().cast(),
+                    Self::owned_layout(self.cap as usize),
+                )
+            };
+            self.ptr = NonNull::dangling();
+            self.cap = 0;
+        } else {
+            self.grow_to(self.len as usize);
+        }
+        slack
+    }
+
     /// Reallocate the owned buffer to exactly `cap` entries (`cap >= len`).
     fn grow_to(&mut self, cap: usize) {
         debug_assert!(!self.is_shared());
@@ -330,7 +352,11 @@ impl EntryVec {
             self.unshare(1);
         } else if self.len as usize == self.cap_slots() {
             let cap = self.cap_slots();
-            self.grow_to(if cap < 2 { cap + 1 } else { cap * 2 });
+            self.grow_to(match cap {
+                0..2 => cap + 1,
+                2..8 => cap * 2,
+                _ => cap + cap / 2,
+            });
         }
         unsafe { self.ptr.as_ptr().add(self.len as usize).write(prop) };
         self.len += 1;
