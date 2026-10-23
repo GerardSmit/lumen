@@ -125,6 +125,15 @@ pub fn pooled_copy(source: &Pixmap) -> Pixmap {
     source.clone()
 }
 
+/// Releases this thread's pooled snapshot buffers.
+pub fn trim_snapshot_pool() {
+    let _ = SNAPSHOT_POOL.try_with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            *pool = Vec::new();
+        }
+    });
+}
+
 fn recycle_buffer(buffer: Vec<u8>) {
     SNAPSHOT_POOL.with(|pool| {
         let Ok(mut pool) = pool.try_borrow_mut() else { return };
@@ -314,7 +323,7 @@ impl Recorder {
         self.ops = Vec::new();
         self.op_bytes = 0;
         self.image_bytes = 0;
-        self.pinned.clear();
+        self.pinned = HashSet::new();
         dropped
     }
 
@@ -386,15 +395,15 @@ impl CanvasSurface {
     pub fn new_recorded(width: u32, height: u32) -> Result<Self, ImageError> {
         let mut surface = Self::new(width, height)?;
         if RECORDING_ENABLED.load(Relaxed) {
-            surface.recorder = Some(Recorder::default());
+            surface.recording_enabled = true;
         }
         Ok(surface)
     }
 
     /// Overrides the process-wide recording limits for this surface.
     pub fn set_recording_limits(&mut self, op_bytes: usize, pinned_image_bytes: usize) {
-        if let Some(recorder) = &mut self.recorder {
-            recorder.limits = Some((op_bytes, pinned_image_bytes));
+        if self.recording_enabled {
+            self.recorder.get_or_insert_with(Box::default).limits = Some((op_bytes, pinned_image_bytes));
         }
     }
 
@@ -408,8 +417,12 @@ impl CanvasSurface {
         self.recorder.as_ref().map_or(0, |recorder| recorder.ops.len())
     }
 
-    pub fn is_recorded(&self) -> bool {
+    pub fn has_recorder(&self) -> bool {
         self.recorder.is_some()
+    }
+
+    pub fn is_recorded(&self) -> bool {
+        self.recording_enabled
     }
 
     /// Whether the canvas currently shows an image it references rather than pixels of its own.
@@ -422,7 +435,7 @@ impl CanvasSurface {
     }
 
     pub(super) fn recording(&self) -> bool {
-        self.recorder.is_some()
+        self.recording_enabled
             && !self.replaying
             && self.layers.is_empty()
             && self.width != 0
@@ -444,6 +457,9 @@ impl CanvasSurface {
         }
         let ops = std::mem::take(&mut recorder.ops);
         recorder.clear();
+        if recorder.limits.is_none() {
+            self.recorder = None;
+        }
         count(&COUNTERS.canvases_rasterized, 1);
         count(&COUNTERS.replayed_ops, ops.len() as u64);
         let live = std::mem::take(&mut self.state);
@@ -505,7 +521,7 @@ impl CanvasSurface {
     /// operation that follows covers them.
     pub(super) fn discard_recording(&mut self, why: Discard) {
         let had_pixels = self.bitmap.is_some() || self.alias.is_some();
-        let dropped = self.recorder.as_mut().map_or(0, Recorder::clear);
+        let dropped = self.recorder.as_mut().map_or(0, |recorder| recorder.clear());
         match why {
             Discard::Overdraw => {
                 if dropped != 0 || had_pixels {
@@ -530,9 +546,10 @@ impl CanvasSurface {
 
     pub(super) fn push(&mut self, kind: OpKind, extra_bytes: usize) {
         let state = self.frozen_state();
-        let Some(recorder) = self.recorder.as_mut() else {
+        if !self.recording_enabled {
             return;
-        };
+        }
+        let recorder = self.recorder.get_or_insert_with(Box::default);
         if let OpKind::Image { source, .. } = &kind {
             if recorder.pinned.insert(source.identity()) {
                 recorder.image_bytes = recorder.image_bytes.saturating_add(source.decoded_bytes());

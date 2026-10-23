@@ -288,6 +288,7 @@ static REMOTE_CANVAS_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::At
 pub struct CanvasRegistry {
     surfaces: RefCell<HashMap<NodeId, Rc<RefCell<CanvasData>>>>,
     pending_publish: RefCell<Vec<NodeId>>,
+    pending_publish_index: RefCell<std::collections::HashSet<NodeId>>,
     /// Attached canvases whose pixels have not been handed to the render session, by choice.
     unpublished: RefCell<Vec<NodeId>>,
     on_demand_publication: Cell<bool>,
@@ -300,6 +301,51 @@ pub struct CanvasRegistry {
 
 }
 
+/// Rarely used per-canvas state, allocated on first use so an idle canvas stays small.
+struct CanvasExtras {
+    remote_inbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
+    remote_outbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
+    remote_generation: u64,
+    snapshot_synchronizer: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    bitmap_output: Option<Rgba8Image>,
+    gpu_generation: u64,
+    gpu_snapshot_revision: u64,
+    pending_error: Option<String>,
+    fill_gradient_value: Option<Value>,
+    stroke_gradient_value: Option<Value>,
+    fill_pattern_value: Option<Value>,
+    stroke_pattern_value: Option<Value>,
+    fill_pattern_origin_clean: bool,
+    stroke_pattern_origin_clean: bool,
+    saved_fill_styles: Vec<(Option<Value>, Option<Value>, bool)>,
+    saved_stroke_styles: Vec<(Option<Value>, Option<Value>, bool)>,
+    saved_text: Vec<LazyText>,
+}
+
+impl Default for CanvasExtras {
+    fn default() -> Self {
+        Self {
+            remote_inbound: None,
+            remote_outbound: None,
+            remote_generation: 0,
+            snapshot_synchronizer: None,
+            bitmap_output: None,
+            gpu_generation: 0,
+            gpu_snapshot_revision: 0,
+            pending_error: None,
+            fill_gradient_value: None,
+            stroke_gradient_value: None,
+            fill_pattern_value: None,
+            stroke_pattern_value: None,
+            fill_pattern_origin_clean: true,
+            stroke_pattern_origin_clean: true,
+            saved_fill_styles: Vec::new(),
+            saved_stroke_styles: Vec::new(),
+            saved_text: Vec::new(),
+        }
+    }
+}
+
 pub struct CanvasData {
     surface: CanvasSurface,
     logical_width: u64,
@@ -308,10 +354,6 @@ pub struct CanvasData {
     context_mode: Option<&'static str>,
     transferred: bool,
     inherited_direction_rtl: bool,
-    bitmap_output: Option<Rgba8Image>,
-    gpu_generation: u64,
-    gpu_snapshot_revision: u64,
-    snapshot_synchronizer: Option<Rc<dyn Fn() -> Result<(), String>>>,
     bitmap_alpha: bool,
     alpha: bool,
     color_space: CanvasColorSpace,
@@ -322,21 +364,9 @@ pub struct CanvasData {
     current_path: CanvasPath,
     context_wrapper: Option<WeakValue>,
     suppress_dimension_mutation: bool,
-    pending_error: Option<String>,
-    fill_gradient_value: Option<Value>,
-    stroke_gradient_value: Option<Value>,
-    fill_pattern_value: Option<Value>,
-    stroke_pattern_value: Option<Value>,
-    fill_pattern_origin_clean: bool,
-    stroke_pattern_origin_clean: bool,
-    saved_fill_styles: Vec<(Option<Value>, Option<Value>, bool)>,
-    saved_stroke_styles: Vec<(Option<Value>, Option<Value>, bool)>,
     origin_clean: bool,
     text: LazyText,
-    saved_text: Vec<LazyText>,
-    remote_inbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
-    remote_outbound: Option<Arc<std::sync::Mutex<CanvasPublication>>>,
-    remote_generation: u64,
+    extras: Option<Box<CanvasExtras>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -638,11 +668,144 @@ fn create_webgl_canvas_context(
 }
 
 impl CanvasData {
+    fn extras_mut(&mut self) -> &mut CanvasExtras {
+        self.extras.get_or_insert_with(Default::default)
+    }
+
+    fn bitmap_output(&self) -> Option<&Rgba8Image> {
+        self.extras.as_deref()?.bitmap_output.as_ref()
+    }
+
+    fn set_bitmap_output(&mut self, image: Option<Rgba8Image>) {
+        if image.is_some() || self.extras.is_some() {
+            self.extras_mut().bitmap_output = image;
+        }
+    }
+
+    fn gpu_generation(&self) -> u64 {
+        self.extras.as_deref().map_or(0, |extras| extras.gpu_generation)
+    }
+
+    fn bump_gpu_generation(&mut self) {
+        let extras = self.extras_mut();
+        extras.gpu_generation = extras.gpu_generation.wrapping_add(1);
+    }
+
+    fn gpu_snapshot_revision(&self) -> u64 {
+        self.extras.as_deref().map_or(0, |extras| extras.gpu_snapshot_revision)
+    }
+
+    fn bump_gpu_snapshot_revision(&mut self) -> u64 {
+        let extras = self.extras_mut();
+        extras.gpu_snapshot_revision = extras.gpu_snapshot_revision.wrapping_add(1);
+        extras.gpu_snapshot_revision
+    }
+
+    fn snapshot_synchronizer(&self) -> Option<Rc<dyn Fn() -> Result<(), String>>> {
+        self.extras.as_deref()?.snapshot_synchronizer.clone()
+    }
+
+    fn pending_error(&self) -> Option<&String> {
+        self.extras.as_deref()?.pending_error.as_ref()
+    }
+
+    fn set_pending_error(&mut self, error: Option<String>) {
+        if error.is_some() || self.extras.is_some() {
+            self.extras_mut().pending_error = error;
+        }
+    }
+
+    fn remote_inbound(&self) -> Option<Arc<std::sync::Mutex<CanvasPublication>>> {
+        self.extras.as_deref()?.remote_inbound.clone()
+    }
+
+    fn remote_outbound(&self) -> Option<Arc<std::sync::Mutex<CanvasPublication>>> {
+        self.extras.as_deref()?.remote_outbound.clone()
+    }
+
+    fn remote_generation(&self) -> u64 {
+        self.extras.as_deref().map_or(0, |extras| extras.remote_generation)
+    }
+
+    fn fill_style_slots(&self) -> (Option<Value>, Option<Value>, bool) {
+        self.extras.as_deref().map_or((None, None, true), |extras| {
+            (extras.fill_gradient_value.clone(), extras.fill_pattern_value.clone(), extras.fill_pattern_origin_clean)
+        })
+    }
+
+    fn stroke_style_slots(&self) -> (Option<Value>, Option<Value>, bool) {
+        self.extras.as_deref().map_or((None, None, true), |extras| {
+            (extras.stroke_gradient_value.clone(), extras.stroke_pattern_value.clone(), extras.stroke_pattern_origin_clean)
+        })
+    }
+
+    fn set_fill_style_slots(&mut self, gradient: Option<Value>, pattern: Option<Value>, clean: bool) {
+        if gradient.is_none() && pattern.is_none() && clean && self.extras.is_none() {
+            return;
+        }
+        let extras = self.extras_mut();
+        extras.fill_gradient_value = gradient;
+        extras.fill_pattern_value = pattern;
+        extras.fill_pattern_origin_clean = clean;
+    }
+
+    fn set_stroke_style_slots(&mut self, gradient: Option<Value>, pattern: Option<Value>, clean: bool) {
+        if gradient.is_none() && pattern.is_none() && clean && self.extras.is_none() {
+            return;
+        }
+        let extras = self.extras_mut();
+        extras.stroke_gradient_value = gradient;
+        extras.stroke_pattern_value = pattern;
+        extras.stroke_pattern_origin_clean = clean;
+    }
+
+    fn fill_pattern_origin_clean(&self) -> bool {
+        self.extras.as_deref().is_none_or(|extras| extras.fill_pattern_origin_clean)
+    }
+
+    fn stroke_pattern_origin_clean(&self) -> bool {
+        self.extras.as_deref().is_none_or(|extras| extras.stroke_pattern_origin_clean)
+    }
+
+    fn save_styles(&mut self) {
+        let fill = self.fill_style_slots();
+        let stroke = self.stroke_style_slots();
+        let text = self.text.clone();
+        let extras = self.extras_mut();
+        extras.saved_fill_styles.push(fill);
+        extras.saved_stroke_styles.push(stroke);
+        extras.saved_text.push(text);
+    }
+
+    fn restore_styles(&mut self) {
+        let Some(extras) = self.extras.as_deref_mut() else {
+            return;
+        };
+        let fill = extras.saved_fill_styles.pop();
+        let stroke = extras.saved_stroke_styles.pop();
+        let text = extras.saved_text.pop();
+        if let Some((gradient, pattern, clean)) = fill {
+            self.set_fill_style_slots(gradient, pattern, clean);
+        }
+        if let Some((gradient, pattern, clean)) = stroke {
+            self.set_stroke_style_slots(gradient, pattern, clean);
+        }
+        if let Some(text) = text {
+            self.text = text;
+        }
+    }
+
+    fn saved_style_depth(&self) -> usize {
+        self.extras.as_deref().map_or(0, |extras| extras.saved_fill_styles.len())
+    }
+}
+
+impl CanvasData {
     /// Read the current drawing buffer without holding a borrow across backend work.
     pub fn snapshot_for_read(data: &Rc<RefCell<Self>>) -> OpResult<Rgba8Image> {
         data.borrow().ensure_bitmap_available()?;
         data.borrow().ensure_no_open_layers()?;
-        let synchronize = data.borrow().snapshot_synchronizer.clone();
+        let synchronize = data.borrow().snapshot_synchronizer();
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
         }
@@ -654,7 +817,7 @@ impl CanvasData {
     pub fn source_for_read(data: &Rc<RefCell<Self>>) -> OpResult<CanvasSource> {
         data.borrow().ensure_bitmap_available()?;
         data.borrow().ensure_no_open_layers()?;
-        let synchronize = data.borrow().snapshot_synchronizer.clone();
+        let synchronize = data.borrow().snapshot_synchronizer();
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
         }
@@ -674,10 +837,6 @@ impl CanvasData {
             context_mode: None,
             transferred: false,
             inherited_direction_rtl: false,
-            bitmap_output: None,
-            gpu_generation: 0,
-            gpu_snapshot_revision: 0,
-            snapshot_synchronizer: None,
             bitmap_alpha: true,
             alpha: true,
             color_space: CanvasColorSpace::Srgb,
@@ -688,21 +847,9 @@ impl CanvasData {
             current_path: CanvasPath::default(),
             context_wrapper: None,
             suppress_dimension_mutation: false,
-            pending_error: None,
-            fill_gradient_value: None,
-            stroke_gradient_value: None,
-            fill_pattern_value: None,
-            stroke_pattern_value: None,
-            fill_pattern_origin_clean: true,
-            stroke_pattern_origin_clean: true,
             origin_clean: true,
-            saved_fill_styles: Vec::new(),
-            saved_stroke_styles: Vec::new(),
             text: LazyText::default(),
-            saved_text: Vec::new(),
-            remote_inbound: None,
-            remote_outbound: None,
-            remote_generation: 0,
+            extras: None,
         })
     }
 
@@ -740,23 +887,21 @@ impl CanvasData {
 
     fn reset_after_resize(&mut self) {
         if matches!(self.context_mode, Some("webgpu" | "webgl" | "webgl2")) {
-            self.bitmap_output = None;
+            self.set_bitmap_output(None);
         }
-        self.gpu_generation = self.gpu_generation.wrapping_add(1);
+        self.bump_gpu_generation();
         self.current_path = CanvasPath::default();
-        self.fill_gradient_value = None;
-        self.stroke_gradient_value = None;
-        self.fill_pattern_value = None;
-        self.stroke_pattern_value = None;
-        self.fill_pattern_origin_clean = true;
-        self.stroke_pattern_origin_clean = true;
-        if self.bitmap_output.is_none() {
+        self.set_fill_style_slots(None, None, true);
+        self.set_stroke_style_slots(None, None, true);
+        if self.bitmap_output().is_none() {
             self.origin_clean = true;
         }
-        self.saved_fill_styles.clear();
-        self.saved_stroke_styles.clear();
+        if let Some(extras) = self.extras.as_deref_mut() {
+            extras.saved_fill_styles.clear();
+            extras.saved_stroke_styles.clear();
+            extras.saved_text.clear();
+        }
         self.text = LazyText::default();
-        self.saved_text.clear();
     }
 
     fn ensure_no_open_layers(&self) -> OpResult<()> {
@@ -780,7 +925,7 @@ impl CanvasData {
 
     fn snapshot(&mut self) -> Rgba8Image {
         let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
-        let mut image = match &self.bitmap_output {
+        let mut image = match self.bitmap_output() {
             Some(image) => image.clone(),
             None => self.surface.snapshot(),
         };
@@ -796,7 +941,7 @@ impl CanvasData {
     fn source(&mut self) -> CanvasSource {
         let forced_opaque = (self.context_mode == Some("bitmaprenderer") && !self.bitmap_alpha)
             || (self.context_mode == Some("2d") && !self.alpha);
-        if self.bitmap_output.is_some() || forced_opaque && !self.surface.is_image_alias() {
+        if self.bitmap_output().is_some() || forced_opaque && !self.surface.is_image_alias() {
             return CanvasSource::Pixels(Arc::new(self.snapshot()));
         }
         self.surface.source()
@@ -969,9 +1114,9 @@ impl CanvasRegistry {
                 }
                 target.surfaces.borrow_mut().insert(new, surface);
             }
-            let mut pending = self.pending_publish.borrow_mut();
-            if let Some(index) = pending.iter().position(|node| *node == old) {
-                pending.remove(index);
+            let was_pending = self.pending_publish_index.borrow_mut().remove(&old);
+            if was_pending {
+                self.pending_publish.borrow_mut().retain(|node| *node != old);
                 target.queue_publish(new);
             }
             self.pending_detach.borrow_mut().retain(|node| *node != old);
@@ -994,6 +1139,7 @@ impl CanvasRegistry {
         if let Some(state) = self.surfaces.borrow().get(&node).cloned() {
             return Ok(state);
         }
+        let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
         let state = Rc::new(RefCell::new(CanvasData::new(width, height)?));
         self.surfaces.borrow_mut().insert(node, state.clone());
         Ok(state)
@@ -1061,9 +1207,9 @@ impl CanvasRegistry {
         }
         let (width, height) = canvas_dimensions(document, target);
         match data.resize(width, height) {
-            Ok(()) => data.pending_error = None,
+            Ok(()) => data.set_pending_error(None),
             Err(error) => {
-                data.pending_error = Some(error.to_string());
+                data.set_pending_error(Some(error.to_string()));
                 let _ = data.resize(0, 0);
             }
         }
@@ -1072,18 +1218,59 @@ impl CanvasRegistry {
     }
 
     fn queue_publish(&self, node: NodeId) {
-        let mut pending = self.pending_publish.borrow_mut();
-        if !pending.contains(&node) {
-            pending.push(node);
+        if self.pending_publish_index.borrow_mut().insert(node) {
+            self.pending_publish.borrow_mut().push(node);
         }
     }
 
     fn queue_attached_subtree(&self, document: &lumen_html::Document, root: NodeId) {
-        let surfaces = self.surfaces.borrow();
-        for node in surfaces.keys().copied() {
-            if is_in_subtree(document, root, node) {
+        if self.surfaces.borrow().is_empty() {
+            return;
+        }
+        let mut nodes = Vec::new();
+        collect_subtree(document, root, &mut nodes);
+        for node in nodes {
+            if self.surfaces.borrow().contains_key(&node) {
                 self.queue_publish(node);
             }
+        }
+    }
+
+    /// Drops canvas state for nodes the document has freed; canvases that were never attached
+    /// are otherwise never removed because no ChildList removal names them.
+    pub(crate) fn reclaim_nodes(&self, document: &lumen_html::Document) {
+        let alive = |node: &NodeId| document.kind(*node).is_ok();
+        let Ok(mut surfaces) = self.surfaces.try_borrow_mut() else { return };
+        let before = surfaces.len();
+        surfaces.retain(|node, _| alive(node));
+        if surfaces.len() != before {
+            lumen_common::fasthash::shrink_sparse(&mut surfaces);
+        }
+        drop(surfaces);
+        if let Ok(mut pending) = self.pending_publish.try_borrow_mut() {
+            pending.retain(alive);
+            pending.shrink_to_fit();
+            if let Ok(mut index) = self.pending_publish_index.try_borrow_mut() {
+                index.retain(alive);
+                lumen_common::fasthash::shrink_sparse_set(&mut index);
+            }
+        }
+        if let Ok(mut unpublished) = self.unpublished.try_borrow_mut() {
+            unpublished.retain(alive);
+            unpublished.shrink_to_fit();
+        }
+        if let Ok(mut detach) = self.pending_detach.try_borrow_mut() {
+            detach.retain(alive);
+            detach.shrink_to_fit();
+        }
+        if let Ok(mut requests) = self.paint_requests.try_borrow_mut() {
+            requests.retain(alive);
+        }
+        if let Ok(mut epochs) = self.drawable_epochs.try_borrow_mut() {
+            epochs.retain(|node, _| alive(node));
+        }
+        if let Ok(mut snapshots) = self.drawable_snapshots.try_borrow_mut() {
+            snapshots.retain(|(owner, node, _)| alive(owner) && alive(node));
         }
     }
 
@@ -1105,16 +1292,18 @@ impl CanvasRegistry {
 
     fn sync_publishing(&self, realm: &DomRealm, publish: bool) -> OpResult<()> {
         let mut pending = core::mem::take(&mut *self.pending_publish.borrow_mut());
+        self.pending_publish_index.borrow_mut().clear();
         // Worker publication crosses only a bounded latest-bitmap mailbox. The
         // document owner adopts it at its normal rendering boundary.
         let remote = REMOTE_CANVAS_SEEN.load(std::sync::atomic::Ordering::Relaxed);
         for (&node, state) in self.surfaces.borrow().iter().filter(|_| remote) {
             let mut data = state.borrow_mut();
-            let Some(mailbox) = data.remote_inbound.clone() else { continue; };
+            let Some(mailbox) = data.remote_inbound() else { continue; };
             let publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
-            if publication.generation != data.remote_generation {
-                data.remote_generation = publication.generation;
-                data.bitmap_output = publication.image.clone();
+            if publication.generation != data.remote_generation() {
+                let extras = data.extras_mut();
+                extras.remote_generation = publication.generation;
+                extras.bitmap_output = publication.image.clone();
                 if !pending.contains(&node) { pending.push(node); }
             }
         }
@@ -1130,7 +1319,7 @@ impl CanvasRegistry {
             pending.retain(|node| {
                 let defers = surfaces.get(node).is_some_and(|state| {
                     let data = state.borrow();
-                    !data.transferred && data.remote_inbound.is_none()
+                    !data.transferred && data.remote_inbound().is_none()
                 });
                 if defers && known.insert(*node) { unpublished.push(*node); }
                 !defers
@@ -1160,6 +1349,7 @@ impl CanvasRegistry {
                     self.pending_publish
                         .borrow_mut()
                         .retain(|pending| *pending != node);
+                    self.pending_publish_index.borrow_mut().remove(&node);
                 }
             }
             for node in pending {
@@ -1170,7 +1360,7 @@ impl CanvasRegistry {
                     continue;
                 };
                 let mut data = state.borrow_mut();
-                if let Some(error) = &data.pending_error {
+                if let Some(error) = data.pending_error() {
                     errors.push(error.clone());
                 }
                 updates.push((node, data.snapshot(), data.transferred));
@@ -1235,19 +1425,6 @@ fn is_attached(document: &lumen_html::Document, mut node: NodeId) -> bool {
             return false;
         };
         node = parent;
-    }
-}
-
-fn is_in_subtree(document: &lumen_html::Document, root: NodeId, target: NodeId) -> bool {
-    let mut current = target;
-    loop {
-        if current == root {
-            return true;
-        }
-        let Ok(Some(parent)) = document.parent(current) else {
-            return false;
-        };
-        current = parent;
     }
 }
 
@@ -1427,7 +1604,7 @@ fn image_data(image: Rgba8Image) -> Option<Arc<lumen_html::paint::ImageData>> {
 }
 
 fn publish(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>, data: &mut CanvasData) -> OpResult<()> {
-    if let Some(mailbox) = data.remote_outbound.clone() {
+    if let Some(mailbox) = data.remote_outbound() {
         let image = data.snapshot();
         let mut publication = mailbox.lock().map_err(|_| OpError::new("OperationError", "Canvas publication unavailable"))?;
         publication.image = Some(image);
@@ -2329,9 +2506,9 @@ impl DomOffscreenCanvas {
         let image = CanvasData::snapshot_for_read(&self.data)?;
         let (image, origin_clean) = {
             let mut data = self.data.borrow_mut();
-            data.bitmap_output = None;
+            data.set_bitmap_output(None);
             data.surface.clear_bitmap();
-            data.gpu_generation = data.gpu_generation.wrapping_add(1);
+            data.bump_gpu_generation();
             let origin_clean = data.origin_clean;
             data.origin_clean = true;
             (image, origin_clean)
@@ -2452,6 +2629,7 @@ fn context_value(
         return Ok(value);
     }
     let is_offscreen = node.is_none() || data.borrow().transferred;
+    let _canvas = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::CANVAS);
     let value = if context_id == "bitmaprenderer" {
         if data.borrow().context_mode.is_none() {
             let alpha =
@@ -2559,14 +2737,14 @@ fn gpu_canvas_target(
     };
     let generation = {
         let data = data.clone();
-        Rc::new(move || data.borrow().gpu_generation) as Rc<dyn Fn() -> u64>
+        Rc::new(move || data.borrow().gpu_generation()) as Rc<dyn Fn() -> u64>
     };
     let invalidate = {
         let data = data.clone();
         Rc::new(move || {
             let mut data = data.borrow_mut();
-            data.gpu_generation = data.gpu_generation.wrapping_add(1);
-            data.bitmap_output = None;
+            data.bump_gpu_generation();
+            data.set_bitmap_output(None);
         }) as Rc<dyn Fn()>
     };
     let publish_rgba = {
@@ -2589,19 +2767,19 @@ fn gpu_canvas_target(
                             .and_then(|height| width.checked_mul(height))
                     })
                     .and_then(|pixels| pixels.checked_mul(4));
-                if epoch != data.borrow().gpu_generation
-                    || revision != data.borrow().gpu_snapshot_revision
+                if epoch != data.borrow().gpu_generation()
+                    || revision != data.borrow().gpu_snapshot_revision()
                     || width != current_width
                     || height != current_height
                     || expected != Some(pixels.len())
                 {
                     return Err("GPU canvas readback dimensions are stale or invalid".to_owned());
                 }
-                data.borrow_mut().bitmap_output = Some(Rgba8Image {
+                data.borrow_mut().set_bitmap_output(Some(Rgba8Image {
                     width,
                     height,
                     pixels,
-                });
+                }));
                 data.borrow_mut().origin_clean = true;
                 publish(realm.as_ref(), node, &mut data.borrow_mut())
                     .map_err(|_| "GPU canvas bitmap publication failed".to_owned())
@@ -2621,15 +2799,14 @@ fn gpu_canvas_target(
                     return 0;
                 };
                 let mut data = data.borrow_mut();
-                data.gpu_snapshot_revision = data.gpu_snapshot_revision.wrapping_add(1);
-                data.gpu_snapshot_revision
+                data.bump_gpu_snapshot_revision()
             })
         },
         set_snapshot_synchronizer: {
             let data = Rc::downgrade(&data);
             Rc::new(move |synchronize| {
                 if let Some(data) = data.upgrade() {
-                    data.borrow_mut().snapshot_synchronizer = Some(synchronize);
+                    data.borrow_mut().extras_mut().snapshot_synchronizer = Some(synchronize);
                 }
             })
         },
@@ -2682,9 +2859,9 @@ impl DomImageBitmapRenderingContext {
             (Some(image), bitmap.origin_clean)
         };
         let mut data = self.data.borrow_mut();
-        data.bitmap_output = image;
+        data.set_bitmap_output(image);
         data.origin_clean = clean;
-        if data.bitmap_output.is_none() {
+        if data.bitmap_output().is_none() {
             data.surface.clear_bitmap();
         }
         publish(self.realm.as_ref(), self.node, &mut data)
@@ -2786,9 +2963,9 @@ macro_rules! impl_canvas_2d_methods {
             #[getter]
             fn fill_style(&self) -> Value {
                 let data = self.data.borrow();
-                data.fill_gradient_value
-                    .clone()
-                    .or_else(|| data.fill_pattern_value.clone())
+                let (gradient, pattern, _) = data.fill_style_slots();
+                gradient
+                    .or(pattern)
                     .unwrap_or_else(|| Value::Str(color_string(data.surface.state().fill).into()))
             }
             #[setter]
@@ -2800,32 +2977,26 @@ macro_rules! impl_canvas_2d_methods {
                     data.surface.state_mut().fill = color;
                     data.surface.state_mut().fill_gradient = None;
                     data.surface.state_mut().fill_pattern = None;
-                    data.fill_gradient_value = None;
-                    data.fill_pattern_value = None;
-                    data.fill_pattern_origin_clean = true;
+                    data.set_fill_style_slots(None, None, true);
                 } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().fill_gradient = Some(Box::new(gradient));
                     data.surface.state_mut().fill_pattern = None;
-                    data.fill_gradient_value = Some(value);
-                    data.fill_pattern_value = None;
-                    data.fill_pattern_origin_clean = true;
+                    data.set_fill_style_slots(Some(value), None, true);
                 } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
                     let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().fill_gradient = None;
                     data.surface.state_mut().fill_pattern = Some(Box::new(pattern));
-                    data.fill_gradient_value = None;
-                    data.fill_pattern_value = Some(value);
-                    data.fill_pattern_origin_clean = clean;
+                    data.set_fill_style_slots(None, Some(value), clean);
                 }
             }
             #[getter]
             fn stroke_style(&self) -> Value {
                 let data = self.data.borrow();
-                data.stroke_gradient_value
-                    .clone()
-                    .or_else(|| data.stroke_pattern_value.clone())
+                let (gradient, pattern, _) = data.stroke_style_slots();
+                gradient
+                    .or(pattern)
                     .unwrap_or_else(|| Value::Str(color_string(data.surface.state().stroke).into()))
             }
             #[setter]
@@ -2837,24 +3008,18 @@ macro_rules! impl_canvas_2d_methods {
                     data.surface.state_mut().stroke = color;
                     data.surface.state_mut().stroke_gradient = None;
                     data.surface.state_mut().stroke_pattern = None;
-                    data.stroke_gradient_value = None;
-                    data.stroke_pattern_value = None;
-                    data.stroke_pattern_origin_clean = true;
+                    data.set_stroke_style_slots(None, None, true);
                 } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().stroke_gradient = Some(Box::new(gradient));
                     data.surface.state_mut().stroke_pattern = None;
-                    data.stroke_gradient_value = Some(value);
-                    data.stroke_pattern_value = None;
-                    data.stroke_pattern_origin_clean = true;
+                    data.set_stroke_style_slots(Some(value), None, true);
                 } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
                     let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
                     let mut data = self.data.borrow_mut();
                     data.surface.state_mut().stroke_gradient = None;
                     data.surface.state_mut().stroke_pattern = Some(Box::new(pattern));
-                    data.stroke_gradient_value = None;
-                    data.stroke_pattern_value = Some(value);
-                    data.stroke_pattern_origin_clean = clean;
+                    data.set_stroke_style_slots(None, Some(value), clean);
                 }
             }
             #[getter]
@@ -3278,7 +3443,7 @@ macro_rules! impl_canvas_2d_methods {
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let rtl = resolved_canvas_direction(&self.data.borrow(), self.realm.as_ref(), self.node);
                 let mut data = self.data.borrow_mut();
-                if !data.fill_pattern_origin_clean {
+                if !data.fill_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 let mut text_state = data.text.clone();
@@ -3351,7 +3516,7 @@ macro_rules! impl_canvas_2d_methods {
                 let fonts = canvas_node_font_source(ctx,self.realm.as_ref(),self.node)?;
                 let rtl = resolved_canvas_direction(&self.data.borrow(), self.realm.as_ref(), self.node);
                 let mut data = self.data.borrow_mut();
-                if !data.stroke_pattern_origin_clean {
+                if !data.stroke_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 let mut text_state = data.text.clone();
@@ -3551,20 +3716,7 @@ macro_rules! impl_canvas_2d_methods {
             fn save(&self) {
                 let mut data = self.data.borrow_mut();
                 data.surface.save();
-                let fill = (
-                    data.fill_gradient_value.clone(),
-                    data.fill_pattern_value.clone(),
-                    data.fill_pattern_origin_clean,
-                );
-                let stroke = (
-                    data.stroke_gradient_value.clone(),
-                    data.stroke_pattern_value.clone(),
-                    data.stroke_pattern_origin_clean,
-                );
-                data.saved_fill_styles.push(fill);
-                data.saved_stroke_styles.push(stroke);
-                let text = data.text.clone();
-                data.saved_text.push(text);
+                data.save_styles();
             }
             fn restore(&self) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
@@ -3572,19 +3724,7 @@ macro_rules! impl_canvas_2d_methods {
                     return Err(OpError::new("InvalidStateError", "restore() would leave the open layer"));
                 }
                 if !data.surface.restore() { return Ok(()); }
-                if let Some((gradient, pattern, pattern_clean)) = data.saved_fill_styles.pop() {
-                    data.fill_gradient_value = gradient;
-                    data.fill_pattern_value = pattern;
-                    data.fill_pattern_origin_clean = pattern_clean;
-                }
-                if let Some((gradient, pattern, pattern_clean)) = data.saved_stroke_styles.pop() {
-                    data.stroke_gradient_value = gradient;
-                    data.stroke_pattern_value = pattern;
-                    data.stroke_pattern_origin_clean = pattern_clean;
-                }
-                if let Some(text) = data.saved_text.pop() {
-                    data.text = text;
-                }
+                data.restore_styles();
                 Ok(())
             }
             fn begin_layer(&self, options: Option<Value>) -> OpResult<()> {
@@ -3612,24 +3752,14 @@ macro_rules! impl_canvas_2d_methods {
                     OpError::new("InvalidStateError", "No Canvas layer is open")
                 })?;
                 data.surface.restore();
-                while data.saved_fill_styles.len() >= depth {
-                    if let Some((gradient, pattern, clean)) = data.saved_fill_styles.pop() {
-                        data.fill_gradient_value = gradient;
-                        data.fill_pattern_value = pattern;
-                        data.fill_pattern_origin_clean = clean;
-                    }
-                    if let Some((gradient, pattern, clean)) = data.saved_stroke_styles.pop() {
-                        data.stroke_gradient_value = gradient;
-                        data.stroke_pattern_value = pattern;
-                        data.stroke_pattern_origin_clean = clean;
-                    }
-                    if let Some(text) = data.saved_text.pop() { data.text = text; }
+                while data.saved_style_depth() >= depth {
+                    data.restore_styles();
                 }
                 self.publish_data(&mut data)
             }
             fn fill_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
-                if !data.fill_pattern_origin_clean {
+                if !data.fill_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 data.surface
@@ -3655,7 +3785,7 @@ macro_rules! impl_canvas_2d_methods {
                     return Ok(());
                 }
                 let mut data = self.data.borrow_mut();
-                if !data.stroke_pattern_origin_clean {
+                if !data.stroke_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 let rectangle = CanvasPath {
@@ -3929,7 +4059,7 @@ macro_rules! impl_canvas_2d_methods {
                 fill_rule: Option<&str>,
             ) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
-                if !data.fill_pattern_origin_clean {
+                if !data.fill_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 let (path_data, rule_text) = match path_or_rule {
@@ -3954,7 +4084,7 @@ macro_rules! impl_canvas_2d_methods {
             }
             fn stroke(&self, ctx: &mut Ctx, path_data: Option<Value>) -> OpResult<()> {
                 let mut data = self.data.borrow_mut();
-                if !data.stroke_pattern_origin_clean {
+                if !data.stroke_pattern_origin_clean() {
                     data.origin_clean = false;
                 }
                 let path_data = path_data
@@ -6163,7 +6293,7 @@ fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec
         })?,
         export: |ctx, value| ctx.with_instance::<DomOffscreenCanvas, _>(value, |canvas| {
             let data = canvas.data.borrow();
-            let publication = data.remote_outbound.clone().or_else(|| canvas.placeholder.map(|_| Arc::new(std::sync::Mutex::new(CanvasPublication::default()))));
+            let publication = data.remote_outbound().or_else(|| canvas.placeholder.map(|_| Arc::new(std::sync::Mutex::new(CanvasPublication::default()))));
             Box::new(OffscreenCanvasTransfer {
                 width: data.logical_width, height: data.logical_height,
                 rtl: data.inherited_direction_rtl, origin_clean: data.origin_clean, publication,
@@ -6175,7 +6305,7 @@ fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec
                 canvas.detached.set(true);
                 if canvas.placeholder.is_some() {
                     REMOTE_CANVAS_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
-                    canvas.data.borrow_mut().remote_inbound = payload.publication.clone();
+                    canvas.data.borrow_mut().extras_mut().remote_inbound = payload.publication.clone();
                 }
             });
         },
@@ -6184,7 +6314,9 @@ fn offscreen_transfer_codec() -> lumen_host::clone_transfer::NativeTransferCodec
             let mut data = CanvasData::new_offscreen(payload.width, payload.height)?;
             data.inherited_direction_rtl = payload.rtl;
             data.origin_clean = payload.origin_clean;
-            data.remote_outbound = payload.publication;
+            if payload.publication.is_some() {
+                data.extras_mut().remote_outbound = payload.publication;
+            }
             let realm = window_globals::current_dom_realm(ctx);
             Ok(ctx.new_instance(DomOffscreenCanvas {
                 data: Rc::new(RefCell::new(data)), realm,
@@ -6375,10 +6507,42 @@ mod tests {
         assert_eq!(saved.align, "center");
         untouched.size = 20.0;
         assert_eq!(LazyText::default().size, 10.0);
-        assert!(core::mem::size_of::<CanvasData>() <= 1000, "{}", core::mem::size_of::<CanvasData>());
+        assert!(core::mem::size_of::<CanvasData>() <= 480, "{}", core::mem::size_of::<CanvasData>());
     }
 
     use super::*;
+
+    #[test]
+    fn reclaim_nodes_drops_destroyed_never_attached_canvases_and_keeps_the_rest() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<canvas id=keep width=4 height=4></canvas>", 64).unwrap();
+        assert!(eval_bool(&mut engine, "var k=document.getElementById('keep').getContext('2d');k.fillStyle='#f00';k.fillRect(0,0,4,4);var d=document.createElement('canvas');var g=d.getContext('2d');g.fillRect(0,0,1,1);true"));
+        assert_eq!(realm.canvases.surfaces.borrow().len(), 2);
+        let keep = realm.with_session(|session| selector::query_selector(session.document(), session.document().root(), "#keep").unwrap().unwrap());
+        let loose = *realm.canvases.surfaces.borrow().keys().find(|node| **node != keep).unwrap();
+        realm.canvases.queue_publish(loose);
+        realm.with_session(|session| {
+            session.document_mut().destroy_subtree(loose).unwrap();
+            realm.canvases.reclaim_nodes(session.document());
+        });
+        assert_eq!(realm.canvases.surfaces.borrow().len(), 1);
+        assert!(realm.canvases.surfaces.borrow().contains_key(&keep));
+        assert!(realm.canvases.pending_publish.borrow().is_empty());
+        assert!(realm.canvases.pending_publish_index.borrow().is_empty());
+        assert!(eval_bool(&mut engine, "var p=k.getImageData(0,0,1,1).data;k.fillStyle='#00f';k.fillRect(1,1,1,1);p[0]===255&&p[1]===0&&p[2]===0&&p[3]===255&&k.getImageData(1,1,1,1).data[2]===255"));
+    }
+
+    #[test]
+    fn untouched_canvas_has_no_recorder_and_drawn_canvas_reads_back_unchanged() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<canvas id=idle width=4 height=4></canvas>", 64).unwrap();
+        assert!(eval_bool(&mut engine, "var idle=document.getElementById('idle');idle.getContext('2d');var c=document.createElement('canvas');c.width=2;c.height=2;var g=c.getContext('2d');g.fillStyle='#0f0';g.fillRect(0,0,2,2);var first=c.toDataURL();true"));
+        let idle = realm.with_session(|session| selector::query_selector(session.document(), session.document().root(), "#idle").unwrap().unwrap());
+        let untouched = realm.canvases.data_for(&realm, idle).unwrap();
+        assert!(!untouched.borrow().surface.has_recorder());
+        assert!(untouched.borrow().extras.is_none());
+        assert!(eval_bool(&mut engine, "first===c.toDataURL()&&first.startsWith('data:image/png')&&g.getImageData(0,0,1,1).data[1]===255&&c.toDataURL()===first"));
+    }
 
     #[test]
     fn transferred_offscreen_text_captures_placeholder_direction() {
@@ -7387,23 +7551,23 @@ mod tests {
                 .expect("2D context creates a native canvas surface");
             surface
         };
-        let before_repeat = surface.borrow().gpu_generation;
+        let before_repeat = surface.borrow().gpu_generation();
         assert!(eval_bool(
             &mut engine,
             "resetCanvas.setAttribute('width','2'); true"
         ));
         assert_eq!(
-            surface.borrow().gpu_generation,
+            surface.borrow().gpu_generation(),
             before_repeat + 1,
             "same-value content attribute changes reset the bitmap once"
         );
-        let after_repeat = surface.borrow().gpu_generation;
+        let after_repeat = surface.borrow().gpu_generation();
         assert!(eval_bool(
             &mut engine,
             "resetCanvas.setAttributeNS('urn:custom','width','9'); true"
         ));
         assert_eq!(
-            surface.borrow().gpu_generation,
+            surface.borrow().gpu_generation(),
             after_repeat,
             "a width attribute in another namespace does not resize the canvas"
         );

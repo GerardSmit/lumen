@@ -4788,6 +4788,7 @@ fn orientation_swaps_axes(orientation: image::metadata::Orientation) -> bool {
 /// The oriented size of a still raster read from its header alone, without decoding pixels.
 /// It agrees with the size `decode_raster_image` produces and applies the same size limits.
 pub fn probe_raster_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
+    let _image = lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::IMAGE);
     let mut decoder = raster_reader(bytes, MAX_IMAGE_BYTES)?
         .into_decoder()
         .map_err(|_| ImageError::Png("raster image decoder unavailable"))?;

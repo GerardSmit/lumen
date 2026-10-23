@@ -207,6 +207,21 @@ fn operations_stay_pending_until_read() {
 }
 
 #[test]
+fn recorder_is_allocated_by_the_first_operation_and_released_by_the_flush() {
+    let mut canvas = CanvasSurface::new_recorded(W, H).unwrap();
+    assert!(canvas.is_recorded());
+    assert!(canvas.recorder.is_none());
+    canvas.fill_rect(0.0, 0.0, 4.0, 4.0).unwrap();
+    assert!(canvas.recorder.is_some());
+    assert_eq!(canvas.pending_operations(), 1);
+    let drawn = canvas.snapshot();
+    assert!(canvas.recorder.is_none());
+    assert_eq!(canvas.pending_operations(), 0);
+    canvas.fill_rect(0.0, 0.0, 4.0, 4.0).unwrap();
+    assert_eq!(canvas.snapshot().pixels, drawn.pixels);
+}
+
+#[test]
 fn full_clear_drops_the_list_and_the_pixmap_content() {
     let mut canvas = recorded();
     canvas.state_mut().fill = [255, 0, 0, 255];

@@ -8,6 +8,7 @@ use std::{cell::RefCell, rc::Rc};
 mod record;
 pub use record::{
     canvas_stats, reset_canvas_stats, set_canvas_recording_enabled, set_canvas_recording_limits,
+    trim_snapshot_pool,
     CanvasSource, CanvasStats, PremultipliedImage, SourceGeometry, TextSource,
 };
 use record::Recorder;
@@ -1018,7 +1019,8 @@ pub struct CanvasSurface {
     lazy: bool,
     /// While the pixmap is unallocated, the canvas shows exactly this image.
     alias: Option<CanvasSource>,
-    recorder: Option<Recorder>,
+    recorder: Option<Box<Recorder>>,
+    recording_enabled: bool,
     has_alpha: bool,
     replaying: bool,
     frozen: Option<Rc<DrawingState>>,
@@ -1045,6 +1047,7 @@ impl CanvasSurface {
             lazy: width != 0 && height != 0,
             alias: None,
             recorder: None,
+            recording_enabled: false,
             has_alpha: true,
             replaying: false,
             frozen: None,
