@@ -214,6 +214,9 @@ pub(super) struct ScopeOffs {
     pub(super) ic_binding: i32,
     pub(super) ic_gen: i32,
     pub(super) ic_act_gen: i32,
+    /// `NameChain` fields, relative to its cell.
+    pub(super) chain_depth: i32,
+    pub(super) chain_gens: i32,
     /// `Binding` fields.
     pub(super) b_value: i32,
     pub(super) b_init: i32,
@@ -291,6 +294,8 @@ pub(super) fn scope_offs() -> Option<&'static ScopeOffs> {
             ic_binding: i(offset_of!(crate::bytecode::NameIc, binding))?,
             ic_gen: i(offset_of!(crate::bytecode::NameIc, gen))?,
             ic_act_gen: i(offset_of!(crate::bytecode::NameIc, act_gen))?,
+            chain_depth: i(offset_of!(crate::bytecode::NameChain, depth))?,
+            chain_gens: i(offset_of!(crate::bytecode::NameChain, gens))?,
             b_value: i(offset_of!(Binding, value))?,
             b_init: i(offset_of!(Binding, initialized))?,
         })
@@ -1310,9 +1315,10 @@ impl Tr<'_, '_> {
     /// global-object mode (`Chunk::name_global_slot`) the frame's scope is the (global) scope the
     /// cache names, still without the name (its generation); in static-path mode
     /// ([`NameIc`](crate::bytecode::NameIc) tag 4) the anchor scope is the one cached, still
-    /// without the name, directly under this realm's global scope, which is still without it
-    /// too. Either way the global object has the cached shape with a data entry at the cached
-    /// slot. `None` when the check can't be emitted; else the address, or a jump to `miss`.
+    /// without the name, and so is each scope of the recorded chain up to this realm's global
+    /// scope, which is still without it too. Either way the global object has the cached shape
+    /// with a data entry at the cached slot. `None` when the check can't be emitted; else the
+    /// address, or a jump to `miss`.
     pub(super) fn glob_entry(&mut self, c: u32, miss: Block) -> Option<V> {
         if cfg!(target_arch = "wasm32") || !cfg!(target_pointer_width = "64") {
             return None;
@@ -1320,6 +1326,11 @@ impl Tr<'_, '_> {
         let (so, o) = (scope_offs()?, offs()?);
         let cell = self.chunk.name_caches.get(c as usize)?;
         let static_path = cell.get().env & 4 != 0;
+        let chain = self.chunk.name_chains.get(c as usize)?;
+        let depth = chain.get().depth as usize;
+        if static_path && !(1..=crate::bytecode::STATIC_CHAIN).contains(&depth) {
+            return None;
+        }
         let icp = self.ptrc(cell as *const _ as usize as i64);
         let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
         let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
@@ -1345,21 +1356,34 @@ impl Tr<'_, '_> {
             let tagged = self.fb.binary(BinaryOp::Iadd, anchor, off);
             let ok = self.fb.icmp(IntCC::Eq, ic_env, tagged);
             self.guard_to(ok, miss);
+            let cp = self.ptrc(chain as *const _ as usize as i64);
+            let stored = self.fb.load(MemKind::I32, cp, so.chain_depth);
+            let want = self.i32c(depth as i64);
+            let ok = self.fb.icmp(IntCC::Eq, stored, want);
+            self.guard_to(ok, miss);
             let off = self.ptrc(so.rc_value);
-            let scope = self.fb.binary(BinaryOp::Iadd, anchor, off);
-            let flag = self.fb.load(PTR_MEM, scope, so.borrow);
-            let z = self.ptrc(0);
-            let ok = self.fb.icmp(IntCC::Sge, flag, z);
-            self.guard_to(ok, miss);
-            let g = self.fb.load(MemKind::I32, scope, so.gen);
-            let icg = self.fb.load(MemKind::I32, icp, so.ic_gen);
-            let ok = self.fb.icmp(IntCC::Eq, g, icg);
-            self.guard_to(ok, miss);
-            let up = self.fb.load(PTR_MEM, scope, so.parent);
+            let mut word = anchor;
+            for hop in 0..depth {
+                let scope = self.fb.binary(BinaryOp::Iadd, word, off);
+                let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+                let z = self.ptrc(0);
+                let ok = self.fb.icmp(IntCC::Sge, flag, z);
+                self.guard_to(ok, miss);
+                let g = self.fb.load(MemKind::I32, scope, so.gen);
+                let cached = if hop == 0 {
+                    self.fb.load(MemKind::I32, icp, so.ic_gen)
+                } else {
+                    self.fb
+                        .load(MemKind::I32, cp, so.chain_gens + 4 * (hop as i32 - 1))
+                };
+                let ok = self.fb.icmp(IntCC::Eq, g, cached);
+                self.guard_to(ok, miss);
+                word = self.fb.load(PTR_MEM, scope, so.parent);
+            }
             let global_env = self.fb.load(PTR_MEM, interp, o.global_env);
-            let ok = self.fb.icmp(IntCC::Eq, up, global_env);
+            let ok = self.fb.icmp(IntCC::Eq, word, global_env);
             self.guard_to(ok, miss);
-            let gscope = self.fb.binary(BinaryOp::Iadd, up, off);
+            let gscope = self.fb.binary(BinaryOp::Iadd, word, off);
             let flag = self.fb.load(PTR_MEM, gscope, so.borrow);
             let z = self.ptrc(0);
             let ok = self.fb.icmp(IntCC::Sge, flag, z);

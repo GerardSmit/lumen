@@ -380,8 +380,9 @@ impl Chunk {
     }
 
     /// Seed the static-path mode of cache `cache` (see [`crate::bytecode::NameIc`]) when the
-    /// guarded path just built is the anchor scope directly under the global scope (plus, for a
-    /// chunk with an activation, the pristine activation itself).
+    /// guarded path just built ends in a chain of at most `STATIC_CHAIN` plain scopes under the
+    /// global scope, starting at the anchor (the pristine activation's parent, for a chunk with
+    /// an activation).
     fn seed_static_global(&self, interp: &Interp, env: &Env, cache: u32, shape: u32, slot: usize) {
         let anchor = if self.activation_layout.is_some() {
             let activation = env.borrow();
@@ -395,25 +396,47 @@ impl Chunk {
         } else {
             env.clone()
         };
-        let scope = anchor.borrow();
-        let under_global = scope
-            .parent
-            .as_ref()
-            .is_some_and(|parent| Rc::ptr_eq(parent, &interp.global_env));
-        if !under_global || scope.with_obj().is_some() {
-            return;
+        let mut chain = super::NameChain::EMPTY;
+        let mut anchor_gen = 0;
+        let mut current = anchor.clone();
+        loop {
+            let parent = {
+                let Ok(scope) = current.try_borrow() else {
+                    return;
+                };
+                if scope.with_obj().is_some() {
+                    return;
+                }
+                let generation = scope.vars.generation();
+                match chain.depth {
+                    0 => anchor_gen = generation,
+                    hop => chain.gens[hop as usize - 1] = generation,
+                }
+                chain.depth += 1;
+                match &scope.parent {
+                    Some(parent) => parent.clone(),
+                    None => return,
+                }
+            };
+            if Rc::ptr_eq(&parent, &interp.global_env) {
+                break;
+            }
+            if chain.depth as usize == super::STATIC_CHAIN {
+                return;
+            }
+            current = parent;
         }
         let Ok(global) = interp.global_env.try_borrow() else {
             return;
         };
+        self.name_chains[cache as usize].set(chain);
         self.name_caches[cache as usize].set(super::NameIc {
             env: Rc::as_ptr(&anchor) as usize | 4,
             binding: ((shape as u64) << 32) | slot as u64,
-            gen: scope.vars.generation(),
+            gen: anchor_gen,
             act_gen: global.vars.generation(),
         });
         drop(global);
-        drop(scope);
         self.name_pins.borrow_mut()[cache as usize] = Some(Rc::downgrade(&anchor));
     }
 }

@@ -209,14 +209,17 @@ pub const IC_CREATE: u8 = 0xFD;
 /// re-checks `accessor` at the slot (attributes are not part of the shape).
 ///
 /// A third mode (bit 2, tag 4; seeded by `Chunk::name_path_fill`) covers the same globals read
-/// from a function nested directly in a closure scope `A` under the global scope (every function
-/// of a bundle wrapped in an IIFE). `env` is `A`, which is the run env of a chunk without an
-/// activation, or its parent when the chunk makes one (a pristine activation, generation 0).
-/// `gen` is `A`'s generation, `act_gen` the global scope's, `binding` as in global mode. Scopes
-/// are only ever created with their parent, so a match of `A` (pinned like any cached scope)
-/// proves the chain; the two generations prove neither scope gained the name (a sloppy direct
-/// `eval` `var` or a later script's `let`/`const`/`class` is an insert), and the parent of `A`
-/// must be this interp's global scope. Only the native code reads this mode.
+/// from a function nested in a chain of up to [`STATIC_CHAIN`] closure scopes under the global
+/// scope (every function of a bundle wrapped in an IIFE). `env` is the chain's innermost scope
+/// `A`, which is the run env of a chunk without an activation, or its parent when the chunk makes
+/// one (a pristine activation, generation 0). `gen` is `A`'s generation, `act_gen` the global
+/// scope's, `binding` as in global mode; the chain length and the generations of the scopes
+/// above `A` are in the cache's [`NameChain`]. Scopes are only ever created with their parent,
+/// so a match of `A` (pinned like any cached scope) proves the chain; the generations prove no
+/// scope on it gained the name (a sloppy direct `eval` `var` or a later script's
+/// `let`/`const`/`class` is an insert), and the last scope's parent must be this interp's global
+/// scope. No chain scope is a `with` scope (fixed at creation). Only the native code reads this
+/// mode.
 #[derive(Clone, Copy)]
 pub struct NameIc {
     /// `Rc::as_ptr` of the scope at cache time (0 = empty). Low tag bits (scope allocations
@@ -233,6 +236,25 @@ pub struct NameIc {
     /// cap_inits insert count), so it validates EVERY fresh activation of this chunk while
     /// catching a sloppy inner eval's var hoisted into a live one. 0 otherwise.
     pub act_gen: u32,
+}
+
+/// Longest chain of scopes (the anchor included, the global scope excluded) a static-global
+/// [`NameIc`] covers.
+pub const STATIC_CHAIN: usize = 4;
+
+/// The part of a static-global [`NameIc`] that does not fit in it: how many scopes the chain
+/// holds and the generations of all but the anchor (whose generation is `NameIc::gen`).
+#[derive(Clone, Copy)]
+pub struct NameChain {
+    pub depth: u32,
+    pub gens: [u32; STATIC_CHAIN - 1],
+}
+
+impl NameChain {
+    pub const EMPTY: NameChain = NameChain {
+        depth: 0,
+        gens: [0; STATIC_CHAIN - 1],
+    };
 }
 
 impl NameIc {
@@ -926,6 +948,8 @@ pub struct Chunk {
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
     /// calls like `caches`.
     name_caches: Vec<std::cell::Cell<NameIc>>,
+    /// Chain data of the static-global caches (parallel to `name_caches`).
+    name_chains: Vec<std::cell::Cell<NameChain>>,
     name_paths: Vec<std::cell::RefCell<Option<name_path::NamePath>>>,
     /// Weak handles pinning each name cache's scope allocation (parallel to `name_caches`), so
     /// the cached raw `env` pointer can never be recycled into a different scope while cached.

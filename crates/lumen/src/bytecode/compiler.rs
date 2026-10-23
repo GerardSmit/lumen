@@ -1539,6 +1539,10 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool, force_
         name_paths: (0..c.name_caches.len())
             .map(|_| std::cell::RefCell::new(None))
             .collect(),
+        name_chains: vec![
+            std::cell::Cell::new(crate::bytecode::NameChain::EMPTY);
+            c.name_caches.len()
+        ],
         name_caches: c.name_caches,
         cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: std::cell::RefCell::new(vec![None; cap_cache_len]),

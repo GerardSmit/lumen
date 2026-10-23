@@ -89,7 +89,7 @@ impl Chunk {
         let mut parts = [0usize; 8];
         parts[0] = vec_bytes(&self.caches, s);
         parts[1] = vec_bytes(&self.obj_maps, s);
-        parts[2] = vec_bytes(&self.name_caches, s);
+        parts[2] = vec_bytes(&self.name_caches, s) + vec_bytes(&self.name_chains, s);
         parts[3] = vec_bytes(&self.name_paths, s);
         parts[4] = vec_bytes(&self.name_pins.borrow(), s);
         parts[5] = vec_bytes(&self.cap_caches, s);

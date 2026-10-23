@@ -560,6 +560,7 @@ fn enc_chunk(
             precompiled_origin: _, // measurement-only runtime state
         obj_maps,
         name_caches,
+        name_chains: _,
         name_paths,
         name_pins,
         cap_caches,
@@ -839,6 +840,7 @@ fn dec_chunk(
         name_caches: (0..n_name_caches)
             .map(|_| Cell::new(NameIc::EMPTY))
             .collect(),
+        name_chains: vec![Cell::new(super::NameChain::EMPTY); n_name_caches],
         cap_caches: vec![Cell::new(NameIc::EMPTY); cap_cache_len],
         cap_pins: RefCell::new(vec![None; cap_cache_len]),
         switch_tables: (0..n_switch_tables).map(|_| OnceCell::new()).collect(),
