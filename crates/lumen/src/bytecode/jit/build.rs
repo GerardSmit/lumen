@@ -3704,6 +3704,15 @@ impl<'a, 'f> Tr<'a, 'f> {
         if helpers::no_num(self.chunk, pc) || self.plan.not_num.contains(&pc) {
             return false;
         }
+        // A typed-array read yields a Number unless out of range or of a BigInt kind (exits).
+        let ta_read = match self.ops[pc] {
+            Op::GetElemLocal(s) => {
+                self.ta_slots.get(s as usize).copied().unwrap_or(false)
+                    || helpers::ta_hot(self.chunk, pc)
+            }
+            Op::GetElem => helpers::ta_hot(self.chunk, pc),
+            _ => false,
+        };
         let mut depth = at + 1;
         let mut q = pc + 1;
         while q <= self.backedge && !self.is_leader(q) {
@@ -3734,6 +3743,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::Ge => true,
                     Op::JumpIfNotCmp(k, _) => !is_eq_kind(k),
                     Op::StoreLocal(s) => self.kinds[s as usize].is_num(),
+                    // An element key (`tbl[bytes[i]]`).
+                    Op::GetElemLocal(_) | Op::SetElemLocal(_) | Op::SetElemLocalDrop(_) => {
+                        ta_read && pos == 0
+                    }
+                    Op::GetElem | Op::SetElem | Op::SetElemDrop => ta_read && pos == 1,
                     // `+` concatenates strings: only speculate when the other side is a Number.
                     Op::Add => {
                         (pos == 1
@@ -3872,17 +3886,66 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// or integral constants): the sum is exact in an F64, so ToInt32 is the wrapping integer
     /// operation.
     fn int32_sum(&mut self, x: V) -> Option<V> {
-        let lumen_codegen::InstData::Binary { op, args: [a, b] } = self.def_data(x)? else {
-            return None;
-        };
-        let op = match op {
-            BinaryOp::Fadd => BinaryOp::Iadd,
-            BinaryOp::Fsub => BinaryOp::Isub,
-            _ => return None,
-        };
+        let (add, a, b) = self.f64_sum_of(x)?;
+        let op = if add { BinaryOp::Iadd } else { BinaryOp::Isub };
         let a = self.int32_operand(a)?;
         let b = self.int32_operand(b)?;
         Some(self.fb.binary(op, a, b))
+    }
+
+    /// [`Tr::int32_parts`] of `a + b` / `a - b` where both operands are exact signed int32s:
+    /// the sum is an int32 exactly when the checked integer operation does not overflow.
+    fn int32_sum_parts(&mut self, x: V) -> Option<(V, V)> {
+        let (add, a, b) = self.f64_sum_of(x)?;
+        let op = if add {
+            CheckedOp::IaddOv
+        } else {
+            CheckedOp::IsubOv
+        };
+        // One exact operand suffices: the other's own int32 check stays off the exact one's
+        // dependency chain (a loop-carried sum). A non-int32 operand then reports inexact even
+        // when the sum would be one (`-1 + 2**31`), which only costs an exit.
+        let (a, b, bad) = match (self.signed_int32_operand(a), self.signed_int32_operand(b)) {
+            (Some(a), Some(b)) => (a, b, None),
+            (Some(a), None) => {
+                let (b, bad) = self.int32_parts_raw(b);
+                (a, b, Some(bad))
+            }
+            (None, Some(b)) => {
+                let (a, bad) = self.int32_parts_raw(a);
+                (a, b, Some(bad))
+            }
+            (None, None) => return None,
+        };
+        let (r, ov) = self.fb.checked_binary(op, a, b);
+        Some(match bad {
+            Some(bad) => (r, self.fb.binary(BinaryOp::Bor, bad, ov)),
+            None => (r, ov),
+        })
+    }
+
+    /// `(is_add, a, b)` when `x` is `a + b` or `a - b` of F64s.
+    fn f64_sum_of(&self, x: V) -> Option<(bool, V, V)> {
+        match self.def_data(x)? {
+            lumen_codegen::InstData::Binary {
+                op: BinaryOp::Fadd,
+                args: [a, b],
+            } => Some((true, a, b)),
+            lumen_codegen::InstData::Binary {
+                op: BinaryOp::Fsub,
+                args: [a, b],
+            } => Some((false, a, b)),
+            _ => None,
+        }
+    }
+
+    fn signed_int32_operand(&mut self, v: V) -> Option<V> {
+        if let Some(i) = self.int32_of(v) {
+            return Some(i);
+        }
+        let n = self.f64_const_of(v)?;
+        let i = n as i32;
+        (f64::from(i) == n && !(n == 0.0 && n.is_sign_negative())).then(|| self.i32c(i as i64))
     }
 
     fn int32_operand(&mut self, v: V) -> Option<V> {
@@ -7546,6 +7609,13 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     /// Saturating conversion plus round trip avoids undefined conversions on guard failure.
     fn int32_parts(&mut self, x: V) -> (V, V) {
+        if let Some(parts) = self.int32_sum_parts(x) {
+            return parts;
+        }
+        self.int32_parts_raw(x)
+    }
+
+    fn int32_parts_raw(&mut self, x: V) -> (V, V) {
         let i = self.fb.convert(ConvOp::ToSintSat, Type::I32, x);
         let f = self.fb.convert(ConvOp::FromSint, Type::F64, i);
         let inexact = self.fb.fcmp(FloatCC::Ne, x, f);

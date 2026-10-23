@@ -778,6 +778,8 @@ mod shadow_tests;
 mod str_static_tests;
 #[cfg(test)]
 mod switch_tests;
+#[cfg(test)]
+mod ta_key_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside
@@ -874,6 +876,9 @@ struct LoopState {
     starved_count: u32,
     /// The background compile of this loop in flight.
     pending: Option<Pending>,
+    /// Backedges of this loop since it last looked for a compile. Nested loops share the chunk's
+    /// tick counter, so its boundary can land on the same backedge every time.
+    trips: u32,
 }
 
 struct Native {
@@ -1765,6 +1770,7 @@ pub(super) fn on_backedge(
                     starved: None,
                     starved_count: 0,
                     pending: None,
+                    trips: 0,
                 });
                 loops.len() - 1
             }
@@ -1785,10 +1791,13 @@ pub(super) fn on_backedge(
             let result = match installed {
                 Some(r) => r,
                 None => {
-                    // Not compiled: only look again on a tick boundary.
-                    if l.compiles >= MAX_COMPILES || t & TICK_MASK != 0 {
+                    // Not compiled: look again on a tick boundary, or after as many backedges of
+                    // its own (seen once other code of the chunk runs natively).
+                    l.trips = l.trips.saturating_add(1);
+                    if l.compiles >= MAX_COMPILES || (t & TICK_MASK != 0 && l.trips <= TICK_MASK) {
                         return Ok(None);
                     }
+                    l.trips = 0;
                     if l.starved.is_some_and(|s| starved_waits(t, s)) {
                         return Ok(None);
                     }
