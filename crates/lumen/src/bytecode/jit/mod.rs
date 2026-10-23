@@ -868,6 +868,8 @@ struct LoopState {
     /// Slots kept Boxed on the next compile: they failed the entry guards (a recursive function
     /// entering its loop with locals of another kind than the compile saw mid-loop).
     widen: Vec<Widen>,
+    /// Resume exits per pc of the current code (see [`loop_deopt`]).
+    deopts: Vec<(u32, u32)>,
     /// `Num` slots that failed the entry guards holding `undefined` (a local the body assigns,
     /// unset on a new call's first entry): the next compile accepts either at entry.
     undef_ok: Vec<bool>,
@@ -1766,6 +1768,7 @@ pub(super) fn on_backedge(
                     compiles: 0,
                     entry_fails: 0,
                     widen: Vec::new(),
+                    deopts: Vec::new(),
                     undef_ok: Vec::new(),
                     starved: None,
                     starved_count: 0,
@@ -2375,7 +2378,13 @@ fn enter(
                         chunk.jit.invalidate();
                     }
                 }
-                Some(_) => count_exit(chunk, exit_pc, "loop"),
+                Some((header, backedge)) => {
+                    count_exit(chunk, exit_pc, "loop");
+                    // Leaving the loop is no failed speculation.
+                    if kind == EXIT_RESUME && (header..=backedge).contains(&exit_pc) {
+                        loop_deopt(chunk, header, backedge, exit_pc, native);
+                    }
+                }
             }
             match (frame.exit_hset as usize)
                 .checked_sub(1)
@@ -2463,49 +2472,85 @@ fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
         retire_fn(jit, &mut fs);
         return;
     }
-    let count = match fs.deopts.iter_mut().find(|d| d.0 as usize == pc) {
-        Some(d) => {
-            d.1 = d.1.saturating_add(1);
-            d.1
-        }
-        None => {
-            if fs.deopts.len() >= 64 {
-                return;
-            }
-            fs.deopts.push((pc as u32, 1));
-            1
-        }
-    };
-    if count != DEOPT_LIMIT {
+    if !note_deopt(&mut fs.deopts, pc) {
         return;
     }
-    let n = native.kinds.len();
-    if fs.widen.len() < n {
-        fs.widen.resize(n, Widen::None);
-    }
-    let mut widened = false;
-    for q in [Some(pc), pc.checked_sub(1)].into_iter().flatten() {
-        let Some(op) = chunk.ops.get(q) else { continue };
-        for s in build::op_slots(op) {
-            let s = s as usize;
-            if native.kinds.get(s).is_some_and(|&k| k != Kind::Boxed) && fs.widen[s] != Widen::Boxed
-            {
-                fs.widen[s] = native.kinds[s].wider();
-                widened = true;
-                let at_entry = s < chunk.n_params
-                    || chunk.arguments_slot == Some(s as u16)
-                    || chunk.rest_slot == Some(s as u16);
-                if !at_entry && native.kinds[s] != Kind::Int32 {
-                    fs.guess_failed = true;
-                }
-            }
-        }
-    }
+    let (widened, guess_failed) = widen_op_slots(chunk, pc, &native.kinds, &mut fs.widen);
+    fs.guess_failed |= guess_failed;
     if widened {
         if log_enabled() {
             eprintln!("[jit] function deopts at {pc}: recompiling with wider kinds");
         }
         retire_fn(jit, &mut fs);
+    }
+}
+
+/// Count a resume exit at `pc`: true once it has happened [`DEOPT_LIMIT`] times.
+fn note_deopt(deopts: &mut Vec<(u32, u32)>, pc: usize) -> bool {
+    let count = match deopts.iter_mut().find(|d| d.0 as usize == pc) {
+        Some(d) => {
+            d.1 = d.1.saturating_add(1);
+            d.1
+        }
+        None => {
+            if deopts.len() >= 64 {
+                return false;
+            }
+            deopts.push((pc as u32, 1));
+            1
+        }
+    };
+    count == DEOPT_LIMIT
+}
+
+/// Widen the speculated slots the op at `pc` (or the op before it) uses. Returns whether any
+/// was widened, and whether one of them was a local guessed `Num` (not an entry slot).
+fn widen_op_slots(chunk: &Chunk, pc: usize, kinds: &[Kind], widen: &mut Vec<Widen>) -> (bool, bool) {
+    let n = kinds.len();
+    if widen.len() < n {
+        widen.resize(n, Widen::None);
+    }
+    let (mut widened, mut guess_failed) = (false, false);
+    for q in [Some(pc), pc.checked_sub(1)].into_iter().flatten() {
+        let Some(op) = chunk.ops.get(q) else { continue };
+        for s in build::op_slots(op) {
+            let s = s as usize;
+            if kinds.get(s).is_some_and(|&k| k != Kind::Boxed) && widen[s] != Widen::Boxed {
+                widen[s] = kinds[s].wider();
+                widened = true;
+                let at_entry = s < chunk.n_params
+                    || chunk.arguments_slot == Some(s as u16)
+                    || chunk.rest_slot == Some(s as u16);
+                if !at_entry && kinds[s] != Kind::Int32 {
+                    guess_failed = true;
+                }
+            }
+        }
+    }
+    (widened, guess_failed)
+}
+
+/// A resume exit of loop code at `pc`: exits that keep happening there widen the slots its op
+/// uses (as [`fn_deopt`] does for function code) and recompile the loop.
+fn loop_deopt(chunk: &Chunk, header: usize, backedge: usize, pc: usize, native: &Native) {
+    let mut loops = chunk.jit.loops.borrow_mut();
+    let Some(l) = loops
+        .iter_mut()
+        .find(|l| l.header as usize == header && l.backedge as usize == backedge)
+    else {
+        return;
+    };
+    if !l.code.as_ref().is_some_and(|c| std::ptr::eq(&**c, native)) || !note_deopt(&mut l.deopts, pc)
+    {
+        return;
+    }
+    if widen_op_slots(chunk, pc, &native.kinds, &mut l.widen).0 {
+        if log_enabled() {
+            eprintln!("[jit] loop {header}..={backedge} deopts at {pc}: recompiling with wider kinds");
+        }
+        l.code = None;
+        l.deopts.clear();
+        chunk.jit.invalidate();
     }
 }
 

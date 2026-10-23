@@ -446,3 +446,175 @@ fn string_key_store_replacing_a_global_array() {
         true,
     );
 }
+
+#[test]
+fn set_prop_as_expression_keeps_the_value() {
+    agree(
+        r#"(function(){
+          function P(){this.a=0;this.b=0}
+          var log=[];
+          Object.defineProperty(P.prototype,'s',{set:function(v){log.push(v)},get:function(){return 7},configurable:true});
+          var o=new P(),r=0,out=[];
+          for(var i=0;i<400;i++){
+            r+=(o.a=i);
+            var x,y;
+            x=o.a=o.b=i+1;
+            r+=x+o.a+o.b;
+            var s=(o.a=''+i);
+            r+=s.length;
+            var q={k:i};
+            var z=(o.b=q);
+            r+=z.k+o.b.k;
+            r+=(o.s=i);
+            var t=(o.fresh=i*2);
+            r+=t+o.fresh;
+            y=(o.a=o.b=s);
+            r+=y.length;
+          }
+          var fz=Object.freeze({a:1}),fr=0;
+          for(var i=0;i<400;i++){fr+=(fz.a=i)+(fz.n=i)}
+          var strictThrew=0;
+          var st=function(){'use strict';var f=Object.freeze({a:1}),n=0;
+            for(var i=0;i<400;i++){try{n+=(f.a=i)}catch(e){strictThrew++}}return n};
+          function C(i){this.v=i;this.w=(this.u=i+1)}
+          var cs=0;
+          for(var i=0;i<400;i++){var c=new C(i);cs+=c.v+c.u+c.w}
+          var strs=[];
+          for(var i=0;i<400;i++){var w={};var v=(w.p='k'+i);strs.push(v+w.p)}
+          return [r,o.a,o.b,log.length,fr,fz.a,st(),strictThrew,cs,strs[399],typeof o.fresh].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn set_prop_expression_with_receiver_kinds() {
+    agree(
+        r#"(function(){
+          var g={n:0},arr=[1,2,3],s=0;
+          function f(o,v){return o.x=v}
+          function h(v){return this.x=v}
+          var h1={h:h};
+          for(var i=0;i<400;i++){
+            s+=f(g,i);
+            s+=f(arr,i);
+            var str=f(g,'a'+i);
+            s+=str.length;
+            var ob=f(g,{i:i});
+            s+=ob.i;
+            s+=h1.h(i);
+            s+=(arr.length=3);
+            var p=f(1,i);
+            s+=p;
+          }
+          return [s,g.x.i,arr.x].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn boxed_local_copied_into_numeric_local() {
+    agree(
+        r#"(function(){
+          function run(a,n,sw){
+            var b=a[0],t=0,x=0;
+            for(var i=0;i<n;i++){
+              var cur=b;
+              x=cur;
+              t+=x;
+              if(i===sw)b='s';
+              if(i===sw+5)b=1;
+            }
+            return [t,typeof x].join(',');
+          }
+          var r=[];
+          r.push(run([1.5],600,10000));
+          r.push(run([2],600,300));
+          return r.join('|');
+        })()"#,
+        None,
+        true,
+    );
+    agree(
+        r#"(function(){
+          var arr=[3,4,5],t=0;
+          function f(o,n){var k=0,m=o.a;for(var i=0;i<n;i++){k=m;t+=k;if(i==350)m=o}return k}
+          var ret=f({a:2},600);
+          return t+'|'+typeof ret;
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn mod_on_boxed_numbers_and_other_operands() {
+    agree(
+        r#"(function(){
+          var vals=[7,-7,0,-0,NaN,Infinity,-Infinity,5.5,-5.5,2147483648,'7','abc',null,undefined,true,{valueOf:function(){return 4}}];
+          var divs=[2,-2,0,-0,3.5,Infinity,NaN,'3',1];
+          var out=[];
+          function m(a,b){return a%b}
+          for(var r=0;r<5;r++){
+            out.length=0;
+            for(var i=0;i<vals.length;i++)for(var j=0;j<divs.length;j++){
+              var v=m(vals[i],divs[j]);
+              out.push(Object.is(v,-0)?'-0':String(v));
+            }
+          }
+          var big=0,caught=[];
+          function mb(a,b){return a%b}
+          for(var t=0;t<400;t++){
+            big+=Number(mb(10n,3n));
+            try{mb(10n,3)}catch(e){caught.push(e instanceof TypeError)}
+            try{mb(3,10n)}catch(e){caught.push(e instanceof TypeError)}
+          }
+          function loop(a,n){var s=0;for(var i=1;i<=n;i++)s+=a[i%a.length]%(i+0.5);return s}
+          var arr=[10,20.5,-30,40];
+          var ls=0;for(var k=0;k<3;k++)ls=loop(arr,500);
+          return out.join(',')+'|'+big+'|'+caught.length+caught[0]+'|'+ls;
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_add_with_boxed_operands() {
+    agree(
+        r#"(function(){
+          var sym=Symbol('q'),caught=0,out=[];
+          var vo={valueOf:function(){return 5}},ts={toString:function(){return 'T'}};
+          function add(a,b){return a+b}
+          var cases=[['a','b'],['Loaded ','asset'],['x',1],[1,'x'],['',''],['s',vo],[vo,'s'],['s',ts],[ts,'s'],[1,2],[vo,vo],['a',null],[undefined,'u'],['a',sym],[sym,'a'],[[1,2],'z'],['k',{}]];
+          for(var r=0;r<60;r++){
+            out.length=0;caught=0;
+            for(var i=0;i<cases.length;i++){
+              try{out.push(String(add(cases[i][0],cases[i][1])))}catch(e){caught+=e instanceof TypeError?1:100}
+            }
+          }
+          var acc='',n=0;
+          for(var i=0;i<400;i++){var p='item'+(i%7);var s=add('Loaded asset ',p);n+=s.length;if(i<3)acc+=add(s,'!')}
+          return out.join(';')+'|'+caught+'|'+n+'|'+acc;
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn loop_resume_exits_widen_and_recompile() {
+    agree(
+        r#"(function(){
+          var src=[],s=0,a=0,b=1;
+          for(var i=0;i<4000;i++)src.push(i<1000?i:(i%3?null:'x'));
+          for(var i=0;i<src.length;i++){var v=src[i];a=v;b=a;s+=(b==null?1:typeof b=='string'?2:b)}
+          return s+'|'+a+'|'+b;
+        })()"#,
+        None,
+        true,
+    );
+}

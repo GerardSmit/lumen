@@ -2510,7 +2510,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             || self.plan.dvm.values().any(|&(c, _)| c == pc)
             || self.plan.direct.contains_key(&pc)
             || self.plan.dnew.contains_key(&pc)
-            || (matches!(op, Op::AppendProp(..) | Op::SetPropDrop(..))
+            || (matches!(op, Op::AppendProp(..) | Op::SetPropDrop(..) | Op::SetProp(..))
                 && !self.plan.dacc.contains_key(&pc)
                 && !self.plan.dset.contains_key(&pc))
             || matches!(op, Op::DestructureArr(n) if (1..=8).contains(&n))
@@ -2530,12 +2530,17 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::Sub
                     | Op::Mul
                     | Op::Div
+                    | Op::Mod
                     | Op::BitAnd
                     | Op::BitOr
                     | Op::BitXor
                     | Op::Shl
                     | Op::Shr
                     | Op::UShr
+                    | Op::StoreLocal(_)
+                    | Op::GetElemLocal(_)
+                    | Op::SetElemLocal(_)
+                    | Op::SetElemLocalDrop(_)
                     | Op::Lt
                     | Op::Gt
                     | Op::Le
@@ -4662,6 +4667,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let obj = self.ref_receiver(d - 2);
                 self.prop_write(pc, n, c, obj, Some(d - 2))?;
             }
+            Op::SetProp(n, c) => self.set_prop_keep(pc, n, c)?,
             Op::SetPropThisDrop(n, c) => {
                 let obj = self.fb.load(PTR_MEM, self.frame, FRAME_THIS);
                 self.prop_write(pc, n, c, obj, None)?;
@@ -5289,6 +5295,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.exit_now(pc);
                     return Ok(());
                 }
+                // The stored value is moved into the element: an owned one.
+                self.force(d - 1);
                 match (self.stack[d - 2], self.stack[d - 1]) {
                     (Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed)) => {
                         let obj = self.slot_ptr(s as usize);
@@ -6194,6 +6202,46 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(join);
         self.stack = merged;
         Ok(())
+    }
+
+    /// `SetProp` (`obj, v` -> `v`): the store of `SetPropDrop` with a copy of the value kept
+    /// below it. An unboxed value is pushed again after the store. A Boxed or Ref one is
+    /// cloned into the receiver's entry while the receiver and the value shift up one, so the
+    /// store sees `v', obj, v` (a throw releases `v'`) and leaves `v'`.
+    fn set_prop_keep(&mut self, pc: usize, n: u32, c: u32) -> Result<(), String> {
+        let d = self.stack.len();
+        let (o, v) = (self.stack[d - 2], self.stack[d - 1]);
+        if matches!(o, Entry::Num(_) | Entry::Bool(_)) {
+            self.generic(pc);
+            return Ok(());
+        }
+        if matches!(v, Entry::Num(_) | Entry::Bool(_)) {
+            let obj = self.ref_receiver(d - 2);
+            self.prop_write(pc, n, c, obj, Some(d - 2))?;
+            self.stack.push(v);
+            return Ok(());
+        }
+        let sp = self.stackp;
+        if v == Entry::Boxed {
+            let (from, to) = (self.soff(d - 1), self.soff(d));
+            self.copy_value(sp, from, sp, to);
+        }
+        if o == Entry::Boxed {
+            let (from, to) = (self.soff(d - 2), self.soff(d - 1));
+            self.copy_value(sp, from, sp, to);
+        } else if v == Entry::Boxed {
+            self.set_stack_tag(d - 1, TAG_UNDEFINED);
+        }
+        let src = match v {
+            Entry::Ref(p, _) => p,
+            _ => self.sptr(d),
+        };
+        let dst = self.sptr(d - 2);
+        self.clone_mem(dst, src);
+        self.stack.truncate(d - 2);
+        self.stack.extend([Entry::Boxed, o, v]);
+        let obj = self.ref_receiver(d - 1);
+        self.prop_write(pc, n, c, obj, Some(d - 1))
     }
 
     /// The receiver of a plain property store at entry `i`: a borrowed (Ref) receiver is
@@ -7724,22 +7772,26 @@ impl<'a, 'f> Tr<'a, 'f> {
             (Kind::Num, Entry::Num(x)) | (Kind::Bool, Entry::Bool(x)) => {
                 self.fb.def_var(self.vars[s].expect("SSA slot"), x);
             }
-            (Kind::Num | Kind::Int32 | Kind::Bool, Entry::Boxed) => {
+            (Kind::Num | Kind::Int32 | Kind::Bool, Entry::Boxed | Entry::Ref(..)) => {
                 // Guard the value keeps the slot's kind; otherwise the interpreter stores it
                 // (and the next entry guard fails, recompiling for the new kind).
                 let (tag, num) = match self.kinds[s] {
                     Kind::Num | Kind::Int32 => (TAG_NUM, true),
                     _ => (TAG_BOOL, false),
                 };
-                let t = self.stack_tag(d - 1);
+                let p = match e {
+                    Entry::Ref(p, _) => p,
+                    _ => self.sptr(d - 1),
+                };
+                let t = self.fb.load(MemKind::I32U8, p, 0);
                 let want = self.i32c(tag as i64);
                 let bad = self.fb.icmp(IntCC::Ne, t, want);
                 let snap = self.stack.clone();
                 self.exit_if(bad, pc, EXIT_RESUME, &snap, d);
                 let x = if num {
-                    self.stack_num(d - 1)
+                    self.fb.load(MemKind::F64, p, VALUE_PAYLOAD)
                 } else {
-                    self.stack_bool(d - 1)
+                    self.fb.load(MemKind::I32U8, p, VALUE_BOOL)
                 };
                 let x = if self.kinds[s] == Kind::Int32 {
                     self.int32_or_exit(x, pc)
@@ -8831,7 +8883,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             (
                 Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
                 Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
-            ) if !matches!(op, Op::Mod) => {
+            ) => {
                 // Ops whose result is a Number unless an operand is a BigInt: the join takes it
                 // unboxed (the slow path exits on the rare other result), so later ops see a Num.
                 let numeric = matches!(
@@ -8839,6 +8891,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     Op::Sub
                         | Op::Mul
                         | Op::Div
+                        | Op::Mod
                         | Op::BitAnd
                         | Op::BitOr
                         | Op::BitXor
@@ -8888,7 +8941,17 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(slow);
                 self.fb.switch_to_block(slow);
                 self.stack = pre.clone();
-                self.generic(pc);
+                // Two strings concatenate in a helper before the generic op.
+                if op == Op::Add && !matches!(a, Entry::Num(_)) && !matches!(b, Entry::Num(_)) {
+                    self.box_from(d - 2);
+                    let (base, nv) = (self.sptr(d - 2), self.i32c(2));
+                    let r = self
+                        .call(Helper::ConcatStr, &[self.frame, base, nv])
+                        .expect("ConcatStr returns a flag");
+                    self.hit_or_generic(pc, r);
+                } else {
+                    self.generic(pc);
+                }
                 self.fb.jump(join, &[]);
                 self.fb.seal_block(join);
                 self.fb.switch_to_block(join);
