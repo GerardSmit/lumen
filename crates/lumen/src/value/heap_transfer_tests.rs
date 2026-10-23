@@ -386,9 +386,11 @@ fn release_unused_heap_returns_chunks_and_pages_and_allocation_continues() {
     }
     let live = live_objects();
     let released = gc_release_unused_heap();
-    assert!(released.slab_bytes > 0);
     assert!(gc_heap_chunks() <= chunks_full);
+    // Without page release (granule 0, e.g. Windows) only whole chunks go back, and the
+    // survivors pin every chunk here.
     if heap::granule() != 0 {
+        assert!(released.slab_bytes > 0);
         assert!(gc_released_slab_bytes() > 0);
     }
     assert_eq!(live_objects(), live);
