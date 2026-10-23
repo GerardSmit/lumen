@@ -11808,6 +11808,126 @@ fn a_cold_lazy_body_is_released_by_the_flush_pass_and_reparsed_on_demand() {
     assert!(f.parsed_body().is_some());
 }
 
+fn released_engine(tier: crate::bytecode::Tier) -> Engine {
+    let mut e = Engine::new();
+    e.interp.tier = tier;
+    e.interp.tier_threshold = 0;
+    e
+}
+
+fn eval_in(e: &mut Engine, src: &str) -> String {
+    match e.eval(src, false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+#[test]
+fn a_compiled_function_is_not_reparsed_after_its_body_was_released() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Bytecode);
+    let src = "function f(a) { return a * 2; }\nvar g = f(1);\n";
+    assert_eq!(eval_in(&mut e, &format!("{src}f(2)")), "4");
+    crate::release_parse_memory();
+    assert_eq!(crate::value::body_bytes_since_flush(), 0);
+    assert_eq!(eval_in(&mut e, "f(21)"), "42");
+    assert_eq!(
+        crate::value::body_bytes_since_flush(),
+        0,
+        "calling the compiled chunk must not parse the body again"
+    );
+}
+
+#[test]
+fn compiling_a_function_releases_its_body() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Bytecode);
+    assert_eq!(eval_in(&mut e, "function f(a) { return a + 1; }\nf(1); f(2); f(3)"), "4");
+    crate::release_parse_memory();
+    let before = crate::value::body_bytes_since_flush();
+    assert_eq!(eval_in(&mut e, "f(9)"), "10");
+    assert_eq!(crate::value::body_bytes_since_flush(), before);
+}
+
+#[test]
+fn function_to_string_survives_a_body_release() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Bytecode);
+    let src = "function f(a, b) {\n  return a + b; // sum\n}\n";
+    eval_in(&mut e, &format!("{src}f(1, 2); f(3, 4);"));
+    let before = eval_in(&mut e, "f.toString()");
+    crate::release_parse_memory();
+    assert_eq!(eval_in(&mut e, "f.toString()"), before);
+    assert_eq!(before, "function f(a, b) {\n  return a + b; // sum\n}");
+}
+
+#[test]
+fn a_released_function_still_runs_on_the_tree_walker() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Interp);
+    eval_in(&mut e, "function f(a) { var s = 0; for (var i = 0; i < a; i++) s += i; return s; }\nf(3);");
+    crate::release_parse_memory();
+    assert_eq!(eval_in(&mut e, "f(5)"), "10");
+    crate::release_parse_memory();
+    assert_eq!(eval_in(&mut e, "f(6)"), "15");
+}
+
+#[test]
+fn error_stacks_are_unchanged_by_a_body_release() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Bytecode);
+    eval_in(
+        &mut e,
+        "function thrower(x) {\n  if (x) {\n    throw new Error('boom');\n  }\n  return 1;\n}\nfunction catcher() { try { thrower(1); } catch (err) { return err.stack; } }\ncatcher(); catcher();",
+    );
+    let before = eval_in(&mut e, "catcher()");
+    assert!(before.contains("thrower"), "{before}");
+    crate::release_parse_memory();
+    assert_eq!(eval_in(&mut e, "catcher()"), before);
+}
+
+#[test]
+fn generators_and_async_functions_work_after_a_body_release() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let mut e = released_engine(crate::bytecode::Tier::Bytecode);
+    eval_in(
+        &mut e,
+        "function* gen(n) { for (var i = 0; i < n; i++) yield i; }\nasync function af(x) { return await x + 1; }\nvar out = [];\n[...gen(2)]; af(1).then(v => out.push(v));",
+    );
+    crate::release_parse_memory();
+    assert_eq!(eval_in(&mut e, "[...gen(4)].join(',')"), "0,1,2,3");
+    assert_eq!(eval_in(&mut e, "af(5).then(v => out.push(v)); 0"), "0");
+    assert_eq!(eval_in(&mut e, "out.join(',')"), "2,6");
+}
+
+#[test]
+fn releasing_a_parent_prunes_the_registry_entries_of_its_children() {
+    if !crate::parser::lazy_bodies() {
+        return;
+    }
+    let src = "function outer() {\n  function a() { return 1; }\n  function b() { return 2; }\n  return a() + b();\n}\nouter();";
+    let body = crate::parser::parse_script(src, false).unwrap();
+    let crate::ast::Stmt::FuncDecl(f) = &body[0] else {
+        panic!("expected a declaration")
+    };
+    let _ = f.body();
+    let with_children = crate::value::lazy_function_registry_len();
+    assert!(crate::release_parse_memory() >= 1);
+    assert!(crate::value::lazy_function_registry_len() < with_children);
+}
+
 #[test]
 fn an_eager_body_is_never_released() {
     let src = "(function f() { return 1; })();";

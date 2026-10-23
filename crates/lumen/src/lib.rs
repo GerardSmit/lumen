@@ -495,6 +495,13 @@ pub fn request_jit_trim() {
     lumen_os::jitmem::request_exec_trim();
 }
 
+/// Release every lazily-parsed function body on this thread's heap now; a body is parsed again
+/// if its function runs on the tree-walker later. Returns the number released. Call at a
+/// quiescent point (no JS running), e.g. once a page has finished booting.
+pub fn release_parse_memory() -> usize {
+    crate::value::release_all_lazy_bodies()
+}
+
 /// Evict native code while retaining bytecode and realm state.
 ///
 /// # Safety

@@ -84,7 +84,11 @@ impl Interp {
             let n = func.calls.get().saturating_add(1);
             func.calls.set(n);
             if n > self.tier_threshold || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0 {
-                let _ = func.code.set(crate::bytecode::compile(func));
+                let compiled = crate::bytecode::compile(func);
+                if compiled.is_some() {
+                    func.release_body();
+                }
+                let _ = func.code.set(compiled);
             }
         }
         let chunk = match func.code.get() {

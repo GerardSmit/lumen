@@ -2197,6 +2197,11 @@ pub(crate) fn note_body_materialised(source_bytes: usize) {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn body_bytes_since_flush() -> usize {
+    with_gc_state(|state| state.body_bytes_since_flush.get())
+}
+
 pub(crate) fn cold_body_flush_due() -> bool {
     with_gc_state(|state| state.body_bytes_since_flush.get() >= BODY_FLUSH_BYTES)
 }
@@ -2207,19 +2212,30 @@ pub(crate) fn cold_body_flush_due() -> bool {
 /// bundle), and each entry costs a strong-count check plus one flag test. Returns the number of
 /// bodies released.
 pub(crate) fn flush_cold_lazy_bodies() -> usize {
+    flush_lazy_bodies(false)
+}
+
+/// Release every registered function's body now, whether or not it was read since the last pass.
+pub(crate) fn release_all_lazy_bodies() -> usize {
+    flush_lazy_bodies(true)
+}
+
+fn flush_lazy_bodies(all: bool) -> usize {
     with_gc_state(|state| {
         state.body_bytes_since_flush.set(0);
         let mut reg = state.lazy_fns.borrow_mut();
         let mut released = 0;
-        reg.retain(|w| match w.upgrade() {
-            Some(f) => {
-                if f.release_cold_body() {
+        // Functions register before the one enclosing them, so walking backwards releases a
+        // parent first and its dead children are then pruned in the same pass.
+        for w in reg.iter().rev() {
+            if let Some(f) = w.upgrade() {
+                let freed = if all { f.release_body() } else { f.release_cold_body() };
+                if freed {
                     released += 1;
                 }
-                true
             }
-            None => false,
-        });
+        }
+        reg.retain(|w| w.strong_count() > 0);
         state
             .lazy_fns_next
             .set(reg.len().saturating_mul(2).max(LAZY_FNS_PRUNE_MIN));

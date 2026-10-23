@@ -7885,7 +7885,11 @@ impl Interp {
         // A body the parser skipped is parsed here, on the first call; a SyntaxError in it
         // surfaces as a throw from that call rather than at load. An ahead-of-time body is
         // decoded only if the function does not run on its precompiled chunk (below).
-        if !func.body_is_aot_deferred() {
+        // A function with a compiled chunk does not need its AST: skipping the parse keeps a
+        // released body released (the paths that do read it call `ensure_body` themselves).
+        let has_chunk = !matches!(self.tier, crate::bytecode::Tier::Interp)
+            && matches!(func.code.get(), Some(Some(_)));
+        if !has_chunk && !func.body_is_aot_deferred() {
             if let Err(e) = func.ensure_body() {
                 return Err(self.throw("SyntaxError", e.message));
             }
@@ -7929,6 +7933,9 @@ impl Interp {
                     if compiled.is_none() && std::env::var_os("LUMEN_TIER_LOG").is_some() {
                         let head = func.source.head(70).unwrap_or_else(|| "<no source>".to_string());
                         eprintln!("[tier] bail: {}", head.replace('\n', " "));
+                    }
+                    if compiled.as_ref().is_some_and(|c| c.is_derived() == derived_construct) {
+                        func.release_body();
                     }
                     let _ = func.code.set(compiled);
                 }
@@ -8384,7 +8391,11 @@ impl Interp {
             func.calls.set(n);
             // Loop-bearing bodies compile on first call, like the sync path.
             if n > self.tier_threshold || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0 {
-                let _ = func.code.set(crate::bytecode::compile(func));
+                let compiled = crate::bytecode::compile(func);
+                if compiled.is_some() {
+                    func.release_body();
+                }
+                let _ = func.code.set(compiled);
             }
         }
         match func.code.get() {
