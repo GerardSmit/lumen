@@ -54,6 +54,7 @@ enum Node {
     Size(String),
     Style(String),
     Scroll(String),
+    Anchored(String),
     Unknown,
 }
 
@@ -63,6 +64,7 @@ enum Mode {
     Size,
     Style,
     Scroll,
+    Anchored,
 }
 
 impl Node {
@@ -80,7 +82,7 @@ impl Node {
                     _ => bits,
                 })
             }),
-            Self::Style(_) | Self::Scroll(_) | Self::Unknown => 0,
+            Self::Style(_) | Self::Scroll(_) | Self::Anchored(_) | Self::Unknown => 0,
         }
     }
 
@@ -91,6 +93,7 @@ impl Node {
             Self::Size(_) => mode == Mode::Size,
             Self::Style(_) => mode == Mode::Style,
             Self::Scroll(_) => mode == Mode::Scroll,
+            Self::Anchored(_) => mode == Mode::Anchored,
             Self::Unknown => false,
         }
     }
@@ -102,6 +105,7 @@ pub(super) struct Parsed {
     root: Option<Node>,
     size: bool,
     scroll: bool,
+    anchored: bool,
     features: u8,
 }
 
@@ -118,8 +122,9 @@ fn parse_condition(condition: &Condition) -> Parsed {
     };
     let size = root.as_ref().is_some_and(|root| root.uses(Mode::Size));
     let scroll = root.as_ref().is_some_and(|root| root.uses(Mode::Scroll));
+    let anchored = root.as_ref().is_some_and(|root| root.uses(Mode::Anchored));
     let features = root.as_ref().map_or(0, Node::size_features);
-    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size, scroll, features }
+    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size, scroll, anchored, features }
 }
 
 fn parse_query(tokens: &[Token<'_>], mode: Mode) -> Option<Node> {
@@ -158,6 +163,8 @@ fn parse_group(token: &Token<'_>, mode: Mode) -> Option<Node> {
                 Some(parse_content(&container_query::inner(token, open), Mode::Style))
             } else if mode == Mode::Size && name.eq_ignore_ascii_case("scroll-state") {
                 Some(parse_content(&container_query::inner(token, open), Mode::Scroll))
+            } else if mode == Mode::Size && name.eq_ignore_ascii_case("anchored") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Anchored))
             } else {
                 Some(Node::Unknown)
             }
@@ -181,6 +188,7 @@ fn parse_content(content: &str, mode: Mode) -> Node {
     match mode {
         Mode::Style => Node::Style(content.into()),
         Mode::Scroll => Node::Scroll(content.into()),
+        Mode::Anchored => Node::Anchored(content.into()),
         Mode::Size => Node::Size(content.into()),
     }
 }
@@ -240,6 +248,7 @@ fn eval(node: &Node, subject: &Subject<'_>) -> Truth {
         Node::Size(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_size(content, entry)),
         Node::Style(content) => eval_style(content, subject),
         Node::Scroll(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_scroll(content, entry)),
+        Node::Anchored(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_anchored(content, entry)),
         Node::Unknown => Truth::Unknown,
     }
 }
@@ -362,6 +371,16 @@ fn direction_sides(entry: &Entry, keyword: &str) -> Option<Sides> {
         "block" => block_start.union(block_end),
         _ => return None,
     })
+}
+
+fn eval_anchored(content: &str, entry: &Entry) -> Truth {
+    if !entry.anchored {
+        return Truth::Unknown;
+    }
+    match anchored_query::feature(content) {
+        Some(feature) => Truth::known(anchored_query::truth(&feature, entry.fallback.as_deref(), &entry.sides)),
+        None => Truth::Unknown,
+    }
 }
 
 fn eval_scroll(content: &str, entry: &Entry) -> Truth {
@@ -853,6 +872,9 @@ pub struct Entry {
     parent_custom: CustomRef,
     color: SourceColor,
     scroll_state: bool,
+    anchored: bool,
+    fallback: Option<Arc<str>>,
+    sides: [usize; 4],
     scrollable: Sides,
     writing_mode: WritingMode,
     rtl: bool,
@@ -863,6 +885,7 @@ impl Entry {
         condition.name.as_ref().is_none_or(|name| self.names.iter().any(|candidate| candidate == name))
             && (!condition.size || self.supports_features(condition.features))
             && (!condition.scroll || self.scroll_state)
+            && (!condition.anchored || self.anchored)
     }
 
     /// Whether the container contains every axis the size features in `features` read.
@@ -918,6 +941,7 @@ pub fn build_oracle(
     style_of: &dyn Fn(NodeId) -> Option<Arc<Style>>,
     measured: &dyn Fn(NodeId) -> Option<ContainerUnitContext>,
     scroll: &dyn Fn(NodeId) -> Option<ScrollGeometry>,
+    fallback: &dyn Fn(NodeId) -> Option<Arc<str>>,
     environment: MediaEnvironment,
     text: Option<&dyn TextShaper>,
 ) -> Oracle {
@@ -944,7 +968,7 @@ pub fn build_oracle(
         };
         let kind = style.container_type;
         let context = if kind == ContainerType::Normal || !style.can_hold_size_containment() { None } else { measured(node) };
-        if kind == ContainerType::Normal && names.is_empty() && !style.container_scroll_state {
+        if kind == ContainerType::Normal && names.is_empty() && !style.container_flags.scroll_state && !style.container_flags.anchored {
             continue;
         }
         let vertical = style.writing_mode != WritingMode::HorizontalTb;
@@ -971,8 +995,11 @@ pub fn build_oracle(
                 document.composed_parent(node).ok().flatten().and_then(style_of).and_then(|parent| parent.custom.clone()),
             ),
             color: style.current_color_source(),
-            scroll_state: style.container_scroll_state,
-            scrollable: if style.container_scroll_state { scroll(node).map_or_else(Sides::default, ScrollGeometry::scrollable) } else { Sides::default() },
+            scroll_state: style.container_flags.scroll_state,
+            anchored: style.container_flags.anchored,
+            fallback: if style.container_flags.anchored { fallback(node) } else { None },
+            sides: style.logical_sides(),
+            scrollable: if style.container_flags.scroll_state { scroll(node).map_or_else(Sides::default, ScrollGeometry::scrollable) } else { Sides::default() },
             writing_mode: style.writing_mode,
             rtl: style.direction == Direction::Rtl,
         });
@@ -1228,6 +1255,9 @@ mod tests {
             parent_custom: CustomRef(None),
             color: Style::initial().current_color_source(),
             scroll_state: false,
+            anchored: false,
+            fallback: None,
+            sides: [0, 1, 2, 3],
             scrollable: Sides::default(),
             writing_mode: WritingMode::HorizontalTb,
             rtl: false,

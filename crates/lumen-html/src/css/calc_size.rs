@@ -788,6 +788,15 @@ pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
     Some(flat_text(&Flat { basis, lin: total, nest: 1 }))
 }
 
+/// Whether either value is a `calc-size()` expression; such values that do not combine
+/// are not interpolable at all.
+pub(crate) fn involves_function(values: &[&str]) -> bool {
+    values.iter().any(|text| {
+        text.len() <= MAX_INPUT
+            && text.as_bytes().windows("calc-size(".len()).any(|window| window.eq_ignore_ascii_case(b"calc-size("))
+    })
+}
+
 pub(crate) fn interpolate(from: &str, to: &str, progress: f64, allow_keywords: bool) -> Option<String> {
     combine(&[(from, 1.0 - progress), (to, progress)], allow_keywords)
 }

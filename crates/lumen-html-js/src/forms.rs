@@ -2116,6 +2116,9 @@ pub(crate) fn sync_selected_content(
     select: NodeId,
     only: Option<&[NodeId]>,
 ) -> OpResult<()> {
+    if !realm.session.borrow().document().selected_content_created() {
+        return Ok(());
+    }
     let removed = {
         let state = realm.forms.borrow();
         let mut session = realm.session.borrow_mut();
@@ -2149,6 +2152,9 @@ pub(crate) fn selection_written(realm: &DomRealm, node: NodeId) -> OpResult<()> 
 /// Refresh selects affected by a connected subtree insertion: selects inside it
 /// and the owners of any inserted `selectedcontent`.
 pub(crate) fn settle_inserted_selects(realm: &DomRealm, root: NodeId) -> OpResult<()> {
+    if !realm.session.borrow().document().selected_content_created() {
+        return Ok(());
+    }
     let selects = {
         let session = realm.session.borrow();
         let document = session.document();

@@ -271,8 +271,10 @@ fn serialize_in_parens(token: &Token<'_>, style: bool) -> Option<String> {
                     Some(token.text.into())
                 }
             } else if name.eq_ignore_ascii_case("anchored") {
-                let name = name.to_ascii_lowercase();
-                Some(alloc::format!("{name}({})", serialize_feature_or_query(&content, false)))
+                match super::anchored_query::serialize_content(&content) {
+                    Some(serialized) => Some(alloc::format!("anchored({serialized})")),
+                    None => Some(token.text.into()),
+                }
             } else {
                 Some(collapse_whitespace(token.text))
             }

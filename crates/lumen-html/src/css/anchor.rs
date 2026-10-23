@@ -573,7 +573,7 @@ fn with_axis(token: &str, axis: &str) -> String {
     }
 }
 
-fn position_area(raw: &str, computed: bool) -> Option<String> {
+pub(super) fn position_area(raw: &str, computed: bool) -> Option<String> {
     let tokens = area_tokens(raw)?;
     if !computed {
         return Some(tokens.join(" "));
@@ -612,7 +612,7 @@ fn name_list(raw: &str, keywords: &[&str]) -> Option<String> {
 
 const TACTICS: [&str; 5] = ["flip-block", "flip-inline", "flip-start", "flip-x", "flip-y"];
 
-fn fallback_item(item: &str) -> Option<String> {
+pub(super) fn fallback_item(item: &str) -> Option<String> {
     let lower = item.to_ascii_lowercase();
     let tokens = components(&lower)?;
     if tokens.is_empty() {
@@ -961,6 +961,31 @@ pub struct Fallback {
     pub area: Option<String>,
 }
 
+impl Tactic {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Block => "flip-block",
+            Self::Inline => "flip-inline",
+            Self::Start => "flip-start",
+            Self::X => "flip-x",
+            Self::Y => "flip-y",
+        }
+    }
+}
+
+impl Fallback {
+    /// The form `anchored(fallback: ...)` queries compare against.
+    pub fn canonical(&self) -> String {
+        if let Some(area) = &self.area {
+            return position_area(area, false).unwrap_or_else(|| area.to_ascii_lowercase());
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        parts.extend(self.rule.as_deref());
+        parts.extend(self.tactics.iter().map(|tactic| tactic.keyword()));
+        parts.join(" ")
+    }
+}
+
 pub fn parse_fallbacks(computed: &str) -> Vec<Fallback> {
     let trimmed = computed.trim();
     if trimmed.eq_ignore_ascii_case("none") {
@@ -1075,6 +1100,8 @@ pub fn flip_anchor_text(text: &str, permutation: &[usize; 4], from: usize, to: u
                     output.push('(');
                     if function == "anchor" {
                         output.push_str(&flip_anchor_arguments(inner, permutation, flipped));
+                    } else if permutation[3] == 0 || permutation[3] == 2 {
+                        output.push_str(&swap_anchor_size_axes(inner));
                     } else {
                         output.push_str(inner);
                     }
@@ -1091,6 +1118,40 @@ pub fn flip_anchor_text(text: &str, permutation: &[usize; 4], from: usize, to: u
         at += ch.len_utf8();
     }
     output
+}
+
+fn swap_anchor_size_axes(inner: &str) -> String {
+    let (main, fallback) = split_first_comma(inner);
+    let mut result = main
+        .split_ascii_whitespace()
+        .map(|token| match token.to_ascii_lowercase().as_str() {
+            "width" => "height",
+            "height" => "width",
+            "block" => "inline",
+            "inline" => "block",
+            "self-block" => "self-inline",
+            "self-inline" => "self-block",
+            _ => token,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(fallback) = fallback {
+        result.push(',');
+        result.push_str(fallback);
+    }
+    result
+}
+
+fn swapped_size_longhand(longhand: &str) -> Option<&'static str> {
+    Some(match longhand {
+        "width" => "height",
+        "height" => "width",
+        "min-width" => "min-height",
+        "min-height" => "min-width",
+        "max-width" => "max-height",
+        "max-height" => "max-width",
+        _ => return None,
+    })
 }
 
 fn flip_anchor_arguments(inner: &str, permutation: &[usize; 4], flipped: bool) -> String {
@@ -1201,6 +1262,15 @@ pub(crate) fn flip_style(style: &mut Style, permutation: &[usize; 4]) {
                 flipped.push((*slot, entry.clone()));
                 continue;
             };
+            if swap_axes {
+                if let Some(swapped) = swapped_size_longhand(longhand) {
+                    if let Some(&new_slot) = slots(swapped).first() {
+                        let rewritten = flip_anchor_text(text, permutation, 0, 0);
+                        flipped.push((new_slot, Arc::from(alloc::format!("{swapped}:{rewritten}"))));
+                    }
+                    continue;
+                }
+            }
             match physical_side(longhand, &own) {
                 Some((margin, side)) => {
                     let target = permutation[side];

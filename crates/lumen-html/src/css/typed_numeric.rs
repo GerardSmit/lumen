@@ -871,6 +871,10 @@ impl NumericExpression {
                         }
                     }
                 }
+                if fold_constant_factors(values) {
+                    if values.len()==1{*self=values.pop().unwrap();}
+                    return;
+                }
                 let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx];
                 let mut powers=[0i32;6];let mut product=1.0;
                 for expression in values.iter(){
@@ -939,6 +943,43 @@ impl NumericExpression {
         }
     }
 
+}
+
+/// Multiplies the constant factors of a product into one value, keeping the operands that are
+/// not constants (functions, sums). Returns whether the factors were folded. A function
+/// placeholder unit is never scaled, and a lone constant leaves the product alone.
+fn fold_constant_factors(values:&mut Vec<NumericExpression>)->bool {
+    let mut scale=1.0f64;
+    let mut dimension:Option<NumericValue>=None;
+    let mut folded=0usize;
+    let mut kept=Vec::new();
+    for expression in values.iter() {
+        let(inner,inverse)=match expression{NumericExpression::Invert(inner)=>(&**inner,true),_=>(expression,false)};
+        match inner.single_numeric_value() {
+            Some(value) if !value.value.is_finite()=>return false,
+            Some(value) if !value.unit.is_function_placeholder()=>{
+                let(unit,amount)=match value.unit.canonical_unit_and_factor(){Some((unit,factor))=>(unit,value.value*factor),None=>(value.unit,value.value)};
+                if unit==NumericUnit::Number {
+                    if inverse&&amount==0.0{return false;}
+                    scale*=if inverse{1.0/amount}else{amount};
+                }else if !inverse&&dimension.is_none() {
+                    dimension=Some(NumericValue{value:amount,unit});
+                }else{return false;}
+                folded+=1;
+            },
+            _=>kept.push(expression.clone()),
+        }
+    }
+    if folded<2||!scale.is_finite() {return false;}
+    let combined=match dimension{
+        Some(value)=>NumericValue{value:value.value*scale,unit:value.unit},
+        None=>NumericValue{value:scale,unit:NumericUnit::Number},
+    };
+    if !combined.value.is_finite() {return false;}
+    values.clear();
+    if kept.is_empty()||combined.unit!=NumericUnit::Number||combined.value!=1.0 {values.push(NumericExpression::Value(combined));}
+    values.extend(kept);
+    true
 }
 
 /// Builder interface for the shared math grammar. A renderer can fold into a

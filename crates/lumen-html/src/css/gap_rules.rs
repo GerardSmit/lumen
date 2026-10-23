@@ -432,7 +432,11 @@ pub(crate) fn expand(name: &str, raw: &str) -> Option<Vec<(&'static str, String)
 
 fn rule_item(width: &str, style: &str, color: &str, computed: bool) -> String {
     if computed {
-        return alloc::format!("{width} {style} {color}");
+        return if style == "none" {
+            alloc::format!("{width} {color}")
+        } else {
+            alloc::format!("{width} {style} {color}")
+        };
     }
     let mut parts = Vec::new();
     if !width.eq_ignore_ascii_case("medium") {
@@ -532,17 +536,7 @@ pub(crate) fn computed(style: &Style, name: &str, part: Part) -> String {
             Some(value) => value.to_owned(),
             None => computed_values::color(style.color),
         },
-        Part::Width => {
-            let value = stored.unwrap_or_else(|| String::from("3px"));
-            let axis = if name.starts_with("column") { "column-rule-style" } else { "row-rule-style" };
-            let style_value = extra::stored(style, axis).unwrap_or_else(|| String::from("none"));
-            let hidden = matches!(style_value.as_str(), "none" | "hidden");
-            if hidden && !value.contains(',') && !value.starts_with("repeat(") {
-                String::from("0px")
-            } else {
-                value
-            }
-        }
+        Part::Width => stored.unwrap_or_else(|| String::from("3px")),
         Part::Style | Part::Inset => stored.unwrap_or_default(),
     }
 }
@@ -580,16 +574,49 @@ fn split_auto(entries: &[Entry]) -> Option<(Vec<String>, Vec<String>, Vec<String
     Some((expand_list(&entries[..position])?, inner.clone(), expand_list(&entries[position + 1..])?))
 }
 
-fn mix_element(part: Part, from: &str, to: &str, progress: f64) -> Option<String> {
+/// Computed per-gap items of a rule list property, cycled or auto-filled to `count` entries.
+pub(crate) fn resolve_items(part: Part, raw: &str, count: usize, context: LengthContext, current: Rgba) -> Vec<String> {
+    let Some(computed) = compute(part, raw, context, current) else { return Vec::new() };
+    let Some(entries) = structure(&computed) else { return Vec::new() };
+    let items = match split_auto(&entries) {
+        Some((lead, inner, trail)) => {
+            let fill = count.saturating_sub(lead.len() + trail.len());
+            let mut out = lead;
+            out.extend((0..fill).map(|index| inner[index % inner.len()].clone()));
+            out.extend(trail);
+            out
+        }
+        None => expand_list(&entries).unwrap_or_default(),
+    };
+    if items.is_empty() {
+        return items;
+    }
+    (0..count).map(|index| items[index % items.len()].clone()).collect()
+}
+
+fn width_keyword_px(raw: &str) -> &str {
+    match raw.trim() {
+        "thin" => "1px",
+        "medium" => "3px",
+        "thick" => "5px",
+        other => other,
+    }
+}
+
+fn mix_element(part: Part, from: &str, to: &str, progress: f64, snap: bool) -> Option<String> {
     match part {
         Part::Width => {
+            let (from, to) = (width_keyword_px(from), width_keyword_px(to));
             let (a, unit_a) = syntax::split_number_unit(from)?;
             let (b, unit_b) = syntax::split_number_unit(to)?;
             if unit_a != "px" || unit_b != "px" {
                 return None;
             }
             let width = extra::mix(a, b, progress).max(0.0);
-            // Interpolated widths snap like border widths; the epsilon absorbs float error such as 6.9999.
+            if !snap {
+                return Some(super::computed_values::px(width as f32));
+            }
+            // Row rule widths snap like border widths; the epsilon absorbs float error such as 6.9999.
             let snapped = if width > 0.0 && width < 1.0 { 1.0 } else { (width + 1e-6).floor() };
             Some(super::computed_values::px(snapped as f32))
         }
@@ -604,7 +631,13 @@ fn mix_element(part: Part, from: &str, to: &str, progress: f64) -> Option<String
     }
 }
 
+#[cfg(test)]
 pub(crate) fn interpolate(part: Part, from: &str, to: &str, progress: f64) -> Option<String> {
+    interpolate_snapping(part, from, to, progress, false)
+}
+
+/// Interpolates a rule property; `snap` rounds widths down like border widths (row rules only).
+pub(crate) fn interpolate_snapping(part: Part, from: &str, to: &str, progress: f64, snap: bool) -> Option<String> {
     if !progress.is_finite() {
         return None;
     }
@@ -612,11 +645,11 @@ pub(crate) fn interpolate(part: Part, from: &str, to: &str, progress: f64) -> Op
         if from.trim() == "overlap-join" || to.trim() == "overlap-join" {
             return None;
         }
-        return mix_element(part, from, to, progress);
+        return mix_element(part, from, to, progress, snap);
     }
     let a = structure(from)?;
     let b = structure(to)?;
-    let mix = |x: &str, y: &str| mix_element(part, x, y, progress);
+    let mix = |x: &str, y: &str| mix_element(part, x, y, progress, snap);
     match (split_auto(&a), split_auto(&b)) {
         (None, None) => Some(cycle(&expand_list(&a)?, &expand_list(&b)?, &mix)?.join(", ")),
         (Some((lead_a, inner_a, trail_a)), Some((lead_b, inner_b, trail_b))) => {

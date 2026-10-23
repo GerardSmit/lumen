@@ -509,7 +509,7 @@ pub(super) fn parsed_value(name: &str, raw: &str) -> Result<Option<Vec<Declarati
                 .any(|part| matches!(part, component_values::UnparsedComponent::Variable { .. }))
         });
     let owner_dependent=anchor::applies(name,raw)||typed_numeric::substitute_sibling_functions(raw,1,1)
-        .is_some_and(|(_,dependent)|dependent)||!name.starts_with("--")&&super::owner_values::may_use(raw);
+        .is_some_and(|(_,dependent)|dependent)||!name.starts_with("--")&&(super::owner_values::may_use(raw)||super::function_rule::contains_call(raw));
     let mut parsed=Vec::new();
     append_declaration_pair_values(name,raw,0,has_variables||owner_dependent,&mut parsed)?;
     if parsed.is_empty() || !references_parse(raw, MAX_VARIABLE_BYTES) {
@@ -673,7 +673,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "translate"|"rotate"|"scale"=>super::individual_transforms::specified(match name.as_ref(){"translate"=>239,"rotate"=>240,_=>241},raw),
             "font-size-adjust" => super::serialize_declared_font_size_adjust(raw),
             "container-type" => parsed.iter().find_map(|declaration| match declaration.value {
-                Value::ContainerType(value, scroll_state) => Some(value.serialize(scroll_state)), _ => None,
+                Value::ContainerType(value, flags) => Some(value.serialize(flags)), _ => None,
             }),
             "animation-name" | "animation-duration" | "animation-delay-start" | "animation-delay-end"
             | "animation-iteration-count" | "animation-direction" | "animation-fill-mode" | "animation-play-state"
@@ -1072,7 +1072,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::TextUnderlinePosition(value) => value.serialize(),
         Value::DecorationLength(_,value)=>value.serialize(),
         Value::FontSizeKeyword(value) => value.as_str().into(),
-        Value::ContainerType(value, scroll_state) => value.serialize(*scroll_state),
+        Value::ContainerType(value, flags) => value.serialize(*flags),
         Value::ColumnSpan(value)=>value.serialize(),
         Value::ExtraRaw(slot,raw)=>super::extra_props::serialize_specified(*slot,raw)?,
         Value::BoxDecorationBreak(value)=>value.serialize(),

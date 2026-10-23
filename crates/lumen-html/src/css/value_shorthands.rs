@@ -127,7 +127,7 @@ pub(crate) fn computed_shorthand(style: &Style, name: &str) -> String {
     let values: Option<Vec<String>> = longhands(name)
         .iter()
         .map(|longhand| match *longhand {
-            "container-type" => Some(style.container_type.serialize(style.container_scroll_state)),
+            "container-type" => Some(style.container_type.serialize(style.container_flags)),
             "font-synthesis-small-caps" => Some(String::from(if style.font.synthesize_small_caps { "auto" } else { "none" })),
             _ => extra::computed(style, longhand),
         })
@@ -148,8 +148,8 @@ pub(crate) fn shorthand_declarations(name: &str, raw: &str) -> Option<Vec<Value>
     }
     for (longhand, text) in expanded {
         if longhand == "container-type" {
-            let (axis, scroll_state) = ContainerType::parse(&text)?;
-            values.push(Value::ContainerType(axis, scroll_state));
+            let (axis, flags) = ContainerType::parse(&text)?;
+            values.push(Value::ContainerType(axis, flags));
         } else if longhand == "font-synthesis-small-caps" {
             values.push(Value::FontSynthesisSmallCaps(text != "none"));
         } else {

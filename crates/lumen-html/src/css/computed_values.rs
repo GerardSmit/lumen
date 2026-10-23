@@ -706,7 +706,7 @@ impl Style {
                 overflow(self.overflow_y).into(),
             ),
             "font-size" => px(self.font_size),
-            "container-type" => self.container_type.serialize(self.container_scroll_state),
+            "container-type" => self.container_type.serialize(self.container_flags),
             "font-family" => self.font.families.as_ref().map_or_else(
                 || "sans-serif".into(),
                 |value| serialize_font_families(value),
@@ -2401,7 +2401,7 @@ mod tests {
             .computed_css_value("border", ComputedValueContext::default())
             .is_none());
         assert_eq!(value(&style, "column-rule-style"), "hidden");
-        assert_eq!(value(&style, "column-rule-width"), "0px");
+        assert_eq!(value(&style, "column-rule-width"), "5px");
         assert_eq!(style.used_border_widths(), [5.0, 2.0, 5.0, 0.0]);
     }
 

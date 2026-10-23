@@ -237,7 +237,7 @@ fn valid_argument(argument: &str) -> bool {
             _ => false,
         };
     }
-    if !declaration_value(argument) {
+    if !declaration_value(argument) || begins_named_argument(argument) {
         return false;
     }
     let bytes = argument.as_bytes();
@@ -259,6 +259,19 @@ fn valid_argument(argument: &str) -> bool {
         position += 1;
     }
     !has_bad_url(argument)
+}
+
+/// `<dashed-ident> <colon>` at the start of an argument is reserved for named arguments.
+fn begins_named_argument(argument: &str) -> bool {
+    let bytes = argument.as_bytes();
+    if !argument.starts_with("--") {
+        return false;
+    }
+    let mut end = 2;
+    while end < bytes.len() && is_name_byte(bytes[end]) {
+        end += 1;
+    }
+    end > 2 && argument[end..].trim_start().starts_with(':')
 }
 
 fn has_bad_url(text: &str) -> bool {
@@ -323,5 +336,9 @@ mod tests {
         assert!(!calls_valid("--func({})"));
         assert!(!calls_valid("--func(1{})"));
         assert!(calls_valid("--func(--bar(), --baz(--fez()))"));
+        assert!(!calls_valid("--func(--myident :)"));
+        assert!(!calls_valid("--func(10px, --myident: )"));
+        assert!(calls_valid("--func(50px --myident:)"));
+        assert!(calls_valid("--func({--myident:})"));
     }
 }

@@ -20,9 +20,26 @@ type Remembered = (Arc<str>, usize);
 pub(crate) struct LastSuccessfulState {
     committed: BTreeMap<u128, Remembered>,
     pending: BTreeMap<u128, Option<Remembered>>,
+    /// The canonical fallback each box currently has applied.
+    applied: BTreeMap<u128, Arc<str>>,
 }
 
 impl LastSuccessfulState {
+    pub(crate) fn applied(&self, key: u128) -> Option<Arc<str>> {
+        self.applied.get(&key).cloned()
+    }
+
+    fn note_applied(&mut self, key: u128, fallback: Option<&css::anchor::Fallback>) {
+        match fallback {
+            Some(fallback) => {
+                self.applied.insert(key, Arc::from(fallback.canonical()));
+            }
+            None => {
+                self.applied.remove(&key);
+            }
+        }
+    }
+
     pub(crate) fn commit(&mut self) {
         for (key, value) in core::mem::take(&mut self.pending) {
             match value {
@@ -552,13 +569,19 @@ impl Layout<'_> {
         if !matches!(style.position, Position::Absolute | Position::Fixed) {
             return None;
         }
-        let computed = css::extra_props::computed(style, "position-try-fallbacks").filter(|value| value != "none")?;
+        let Some(computed) = css::extra_props::computed(style, "position-try-fallbacks").filter(|value| value != "none") else {
+            self.last_successful.borrow_mut().note_applied(id.key(), None);
+            return None;
+        };
         let fallbacks = css::anchor::parse_fallbacks(&computed);
         if fallbacks.is_empty() {
+            self.last_successful.borrow_mut().note_applied(id.key(), None);
             return None;
         }
         if self.fits_containing_block(id, style, depth) {
-            self.last_successful.borrow_mut().pending.insert(id.key(), None);
+            let mut state = self.last_successful.borrow_mut();
+            state.pending.insert(id.key(), None);
+            state.note_applied(id.key(), None);
             return None;
         }
         let order = css::extra_props::computed(style, "position-try-order").unwrap_or_default();
@@ -571,10 +594,9 @@ impl Layout<'_> {
             }
         }
         let remember = |index: usize| {
-            self.last_successful
-                .borrow_mut()
-                .pending
-                .insert(id.key(), Some((Arc::from(signature.as_str()), index)));
+            let mut state = self.last_successful.borrow_mut();
+            state.pending.insert(id.key(), Some((Arc::from(signature.as_str()), index)));
+            state.note_applied(id.key(), fallbacks.get(index));
         };
         let chosen = if order == "normal" || order.is_empty() {
             fallbacks.iter().enumerate().find_map(|(index, fallback)| {
@@ -615,13 +637,16 @@ impl Layout<'_> {
             .filter(|(kept, _)| **kept == *signature)
             .cloned();
         let Some((_, kept)) = kept else {
-            self.last_successful.borrow_mut().pending.insert(id.key(), None);
+            let mut state = self.last_successful.borrow_mut();
+            state.pending.insert(id.key(), None);
+            state.note_applied(id.key(), None);
             return None;
         };
-        self.last_successful
-            .borrow_mut()
-            .pending
-            .insert(id.key(), Some((Arc::from(signature.as_str()), kept)));
+        {
+            let mut state = self.last_successful.borrow_mut();
+            state.pending.insert(id.key(), Some((Arc::from(signature.as_str()), kept)));
+            state.note_applied(id.key(), fallbacks.get(kept));
+        }
         fallbacks.get(kept).map(|fallback| self.fallback_candidate(style, fallback))
     }
 }

@@ -2201,6 +2201,9 @@ impl RetainedLayoutCache {
     pub(crate) fn commit_position_fallbacks(&self) {
         self.last_successful.borrow_mut().commit();
     }
+    pub(crate) fn applied_fallback(&self, node: NodeId) -> Option<Arc<str>> {
+        self.last_successful.borrow().applied(node.key())
+    }
     pub(crate) fn note_custom_rebases(&mut self, rebases: Vec<css::CustomRebase>) {
         if self.entries.is_empty() { return; }
         self.custom_rebases.extend(rebases);
@@ -4327,6 +4330,7 @@ struct Layout<'a> {
     /// the collection did not read `intrinsic_minimum_atomics`.
     atomic_width_resolutions: core::cell::Cell<u32>,
     line_clamp: Option<line_clamp::LineClamp>,
+    line_clamp_restores: Vec<Option<Option<line_clamp::LineClamp>>>,
     flow_baselines: Option<FlowBaselines>,
     export_block_table_baselines: bool,
     vertical_inline_lr: bool,
@@ -4376,6 +4380,8 @@ struct Layout<'a> {
     initial_float_measurements: RefCell<BTreeMap<(u128,u32,u32),(Style,f32,f32)>>,
     anchor_index: RefCell<anchor_layout::AnchorIndex>,
     last_successful: anchor_layout::LastSuccessful,
+    position_area_outer: Option<(NodeId, Rect)>,
+    static_edges: BTreeMap<u128, (Option<f32>, Option<f32>)>,
     canvas_background_source: Option<NodeId>,
     viewport_overflow_source: Option<NodeId>,
     viewport_scroll_axes: (bool, bool),
@@ -4389,6 +4395,7 @@ struct Layout<'a> {
     /// Bumped by content whose position does not follow its scroll container
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
+    gap_capture: Option<css::gap_decorations::Input>,
     /// Viewport-fixed and viewport-sticky boxes recorded as scroll anchors
     /// (`ScrollRegion::anchor`) for scrolling the document by translation.
     root_anchors: usize,
@@ -4618,6 +4625,7 @@ impl<'a> Layout<'a> {
         atomic_width_resolutions: core::cell::Cell::new(0),
         flow_baselines: None,
         line_clamp: None,
+        line_clamp_restores: Vec::new(),
         export_block_table_baselines: true,
         vertical_inline_lr: false,
         vertical_sideways_lr: false,
@@ -4661,12 +4669,15 @@ impl<'a> Layout<'a> {
         initial_margin_origin: None,
         initial_float_measurements: RefCell::new(BTreeMap::new()),
         anchor_index: RefCell::new(anchor_layout::AnchorIndex::default()),
+        position_area_outer: None,
+        static_edges: BTreeMap::new(),
         last_successful: retained_fragments.as_deref().map_or_else(Default::default, |cache| Rc::clone(&cache.last_successful)),
         viewport,
         geometry,
         scrolls,
         cull: viewport,
         scroll_hazards: 0,
+        gap_capture: None,
         root_anchors: 0,
         root_scroll_hazards: 0,
         sticky_anchors: Vec::new(),
@@ -11409,25 +11420,29 @@ pub(crate) struct StickyAnchor {
     shift: (f32, f32),
     /// The box's own hit origin minus its used origin.
     hit_offset: (f32, f32),
+    /// Whether the inline axis of the containing block runs right to left.
+    rtl: bool,
 }
 
 /// The sticky position of a box at `origin` (its static position) against
 /// `containing`, the scrollport it sticks to.
-fn sticky_origin(mut origin: (f32, f32), insets: [Option<f32>; 4], size: (f32, f32), containing: Rect) -> (f32, f32) {
+fn sticky_origin(origin: (f32, f32), insets: [Option<f32>; 4], size: (f32, f32), containing: Rect, rtl: bool) -> (f32, f32) {
     let [top, right, bottom, left] = insets;
-    if let Some(top) = top {
-        origin.1 = origin.1.max(containing.y + top);
+    (
+        sticky_axis(origin.0, left, right, containing.x, containing.width, size.0, rtl),
+        sticky_axis(origin.1, top, bottom, containing.y, containing.height, size.1, false),
+    )
+}
+
+/// Clamps one axis of a sticky box to its sticky view rectangle. When the
+/// rectangle is smaller than the box, the end edge moves so the start inset wins.
+fn sticky_axis(value: f32, low_inset: Option<f32>, high_inset: Option<f32>, origin: f32, extent: f32, size: f32, start_is_high: bool) -> f32 {
+    let mut low_bound = low_inset.map_or(f32::NEG_INFINITY, |inset| origin + inset);
+    let mut high_bound = high_inset.map_or(f32::INFINITY, |inset| origin + extent - inset - size);
+    if low_bound > high_bound {
+        if start_is_high { low_bound = high_bound; } else { high_bound = low_bound; }
     }
-    if let Some(bottom) = bottom {
-        origin.1 = origin.1.min(containing.y + containing.height - bottom - size.1);
-    }
-    if let Some(left) = left {
-        origin.0 = origin.0.max(containing.x + left);
-    }
-    if let Some(right) = right {
-        origin.0 = origin.0.min(containing.x + containing.width - right - size.0);
-    }
-    origin
+    value.max(low_bound).min(high_bound)
 }
 
 /// Radius of the unclipped opacity/filter layers that span the viewport
@@ -11663,7 +11678,7 @@ impl LayoutGeometry {
                         used.0 - sticky.shift.0 + enclosing.0,
                         used.1 - sticky.shift.1 + enclosing.1,
                     );
-                    let placed = sticky_origin(static_origin, sticky.insets, sticky.size, sticky.containing);
+                    let placed = sticky_origin(static_origin, sticky.insets, sticky.size, sticky.containing, sticky.rtl);
                     (
                         (placed.0 - used.0, placed.1 - used.1),
                         Some((placed.0 - static_origin.0, placed.1 - static_origin.1)),
@@ -25570,6 +25585,42 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 negatives_laid,
             )?;
         }
+        if css::gap_decorations::enabled(style) {
+            let column_ranges = {
+                let mut cursor = column_offset;
+                widths[..columns].iter().map(|track| {
+                    let range = (cursor, cursor + *track);
+                    cursor += *track + column_gap + column_extra;
+                    range
+                }).collect::<Vec<_>>()
+            };
+            let row_ranges = {
+                let mut cursor = row_offset;
+                heights[..rows].iter().map(|track| {
+                    let range = (cursor, cursor + *track);
+                    cursor += *track + placement_row_gap + row_extra;
+                    range
+                }).collect::<Vec<_>>()
+            };
+            let block_extent = if axes.vertical { physical_width } else { used_height };
+            self.gap_capture = Some(css::gap_decorations::Input::Grid(css::gap_decorations::GridInput {
+                columns: column_ranges,
+                rows: row_ranges,
+                items: items.iter().map(|item| [item.col, item.row, item.cols, item.rows]).collect(),
+                inline: css::gap_decorations::Frame {
+                    vertical: axes.vertical,
+                    origin: if axes.vertical { y } else { x },
+                    extent: column_area,
+                    reverse: axes.reverse_inline,
+                },
+                block: css::gap_decorations::Frame {
+                    vertical: !axes.vertical,
+                    origin: if axes.vertical { x } else { y },
+                    extent: block_extent,
+                    reverse: axes.reverse_block,
+                },
+            }));
+        }
         Ok(axes.physical((
             widths[..retained_columns].iter().sum::<f32>() + column_gap * retained_columns.saturating_sub(1) as f32,
             percent_intrinsic.unwrap_or(heights[..retained_rows].iter().sum::<f32>() + row_gap * retained_rows.saturating_sub(1) as f32),
@@ -26462,8 +26513,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
         let mut total_main = 0.0f32;
         let total_items = items.len();
+        let capture_gaps = css::gap_decorations::enabled(style);
+        let mut gap_items: Vec<Vec<(f32, f32)>> = Vec::new();
         let total_basis: f32 = items.iter().map(|item| item.main).sum();
         for line_index in 0..lines.len() {
+            gap_items.push(Vec::new());
             let (line_start, line_end, line_cross) = lines[line_index];
             let items = &mut items[line_start..line_end];
             let line_offset = 0.0;
@@ -26625,6 +26679,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 } else {
                     cursor
                 };
+                if capture_gaps {
+                    if let Some(line) = gap_items.last_mut() {
+                        line.push((main_pos, main_pos + item.main));
+                    }
+                }
                 let mut computed = item.style.clone();
                 if row {
                     computed.width = Some(specified_dimension(
@@ -27024,6 +27083,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let mut first_startmost: Option<FlowBaselines> = None;
         let mut last_participant: Option<FlowBaselines> = None;
         let mut last_endmost: Option<FlowBaselines> = None;
+        let mut gap_cross: Vec<(f32, f32)> = Vec::new();
         for (line_index, &(start, end, base_extent)) in lines.iter().enumerate() {
             let extent = base_extent + final_stretch;
             let position = if style.flex_wrap && cross_reverse {
@@ -27031,6 +27091,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else {
                 line_origin
             };
+            gap_cross.push((position, position + extent));
             for (item_index, item) in items[start..end].iter_mut().enumerate() {
                 let mut border_box_end = (item.cross - item.style.margin_sides[2]).max(0.0) + item.cross_shift;
                 if final_stretch != 0.0 {
@@ -27152,6 +27213,21 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }
             line_origin += extent + cross_gap + final_gap;
+        }
+        if capture_gaps {
+            let wide = style.writing_mode != css::WritingMode::HorizontalTb;
+            let (inline_origin, block_origin) = if wide { (y, x) } else { (x, y) };
+            self.gap_capture = Some(css::gap_decorations::Input::Flex(css::gap_decorations::FlexInput {
+                lines: gap_cross
+                    .into_iter()
+                    .zip(gap_items)
+                    .map(|(cross, items)| css::gap_decorations::FlexLine { cross, items })
+                    .collect(),
+                main_extent: total_main,
+                main_is_inline: inline_main,
+                inline: css::gap_decorations::Frame { vertical: wide, origin: inline_origin, extent: 0.0, reverse: false },
+                block: css::gap_decorations::Frame { vertical: !wide, origin: block_origin, extent: 0.0, reverse: false },
+            }));
         }
         let first_source = first_participant.or(first_startmost);
         let last_source = last_participant.or(last_endmost);
@@ -27406,8 +27482,19 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
     }
 
+    /// Half-leading above the text; horizontal text floors it to whole pixels, while
+    /// vertical text centred on the central baseline keeps the fraction.
+    fn half_leading(&self, style: &Style) -> f32 {
+        let leading = (self.line_height(style) - self.font_line_height(style)) * 0.5;
+        if style.writing_mode == css::WritingMode::HorizontalTb || style.used_text_orientation() == css::TextOrientation::Sideways {
+            leading.floor()
+        } else {
+            leading
+        }
+    }
+
     fn baseline(&self, style: &Style) -> f32 {
-        self.font_ascent(style) + (self.line_height(style) - self.font_line_height(style)) * 0.5
+        self.font_ascent(style) + self.half_leading(style)
     }
 
     fn line_alignment_baseline(&self, style: &Style) -> f32 {
@@ -29367,7 +29454,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             return Ok(());
         }
         if tag == "wbr" {
-            return Self::paragraph_append_text(paragraph, "\u{200b}", parent_node, parent_style, frame_path);
+            Self::paragraph_push_span(paragraph, "\u{200b}", parent_node, parent_style, frame_path)?;
+            paragraph.collapse_space = false;
+            return Ok(());
         }
         if style.display == Display::Contents {
             if let Some(before) =
@@ -31682,6 +31771,53 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
             paint.commands=command.0..command.1;paint.hits=hit.0..hit.1;
         }
         Ok(())
+    }
+
+    fn paint_gap_decorations(&mut self, style: &Style) -> Result<(), LayoutError> {
+        let Some(input) = self.gap_capture.take() else { return Ok(()); };
+        for paint in css::gap_decorations::paints(style, &input) {
+            let pattern = match paint.style {
+                BorderStyle::Inset => BorderStyle::Ridge,
+                BorderStyle::Outset => BorderStyle::Groove,
+                other => other,
+            }.pattern();
+            let Some(pattern) = pattern else {
+                self.push_command(Command::FillRect { rect: paint.rect, color: paint.color })?;
+                continue;
+            };
+            let side = if paint.vertical { 3 } else { 0 };
+            let mut widths = [0.0; 4];
+            widths[side] = if paint.vertical { paint.rect.width } else { paint.rect.height };
+            let mut patterns = [None; 4];
+            patterns[side] = Some(pattern);
+            self.push_command(Command::StrokeBoxBorder(Box::new(crate::paint::BoxBorder {
+                rect: paint.rect, radius: 0.0, widths, colors: [paint.color; 4], pattern: None,
+                side_patterns: Some(patterns), corners: None,
+            })))?;
+        }
+        Ok(())
+    }
+
+    fn paint_multicol_gap_decorations(&mut self,style:&Style,content_x:f32,outer_content_width:f32,
+        column_width:f32,column_gap:f32,rows:&[(f32,f32,usize)])->Result<(),LayoutError> {
+        let reverse=GridAxes::new(style).reverse_inline;
+        let rows=rows.iter().map(|&(top,height,count)|css::gap_decorations::MulticolRow{
+            block:(top,top+height),
+            columns:(0..count).map(|index|{
+                let start=index as f32*(column_width+column_gap);
+                (start,start+column_width)
+            }).collect(),
+        }).collect();
+        let column_rule=css::gap_decorations::column_rule_is_plain(style)
+            .then(||(style.column_rule_width,style.column_rule_style,style.column_rule_color.unwrap_or(style.color)));
+        self.gap_capture=Some(css::gap_decorations::Input::Multicol(css::gap_decorations::MulticolInput{
+            column_rule,
+            rows,
+            inline_extent:outer_content_width,
+            inline:css::gap_decorations::Frame{vertical:false,origin:content_x,extent:outer_content_width,reverse},
+            block:css::gap_decorations::Frame{vertical:true,origin:0.0,extent:0.0,reverse:false},
+        }));
+        self.paint_gap_decorations(style)
     }
 
     fn paint_column_rule_segment(&mut self,style:&Style,content_x:f32,outer_content_width:f32,
@@ -35100,6 +35236,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         // Right/start and centered alignment retain negative free space: an
         // overflowing line still aligns its end or center with the line box.
+        let vertical = style.writing_mode != css::WritingMode::HorizontalTb;
+        let available = if vertical { self.vertical_inline_extent(style) } else { available };
         let free = available.min(first.available) - used;
         let line_align = style.line_text_align(last);
         let right = match line_align.line_alignment() {
@@ -35136,9 +35274,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                 Command::GlyphRun { baseline_y, .. } => Some(*baseline_y - self.baseline(style)),
                 _ => None,
             }});
+        let mut paragraph_depth = 0i32;
         for index in FlowPaintRanges::new(self.flow_paint_owners.as_deref(),first.paint_owner,first.command,end.command,true).flatten() {
             if is_float_command(index) { continue; }
             let command=&mut self.commands[index];
+            if vertical && Self::is_vertical_paragraph_frame(command, &mut paragraph_depth) { continue; }
             if matches!(command, Command::GlyphRun { .. }) {
                 if seen {
                     word += 1;
@@ -35166,6 +35306,19 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
         }
         let height = self.line_height(style);
+        if vertical {
+            if count == 0 && offset != 0.0 {
+                let shift = if style.writing_mode == css::WritingMode::SidewaysLr { -offset } else { offset };
+                if let Some(geometry) = &mut self.geometry {
+                    for absolute in FlowPaintRanges::new(self.flow_paint_owners.as_deref(),first.paint_owner,first.hit,end.hit,false).flatten() {
+                        let slot = floats.partition_point(|range| range.hit_end <= absolute);
+                        if floats.get(slot).is_some_and(|range| range.hit_start <= absolute && absolute < range.hit_end) { continue; }
+                        if let Some(hit) = geometry.hits.get_mut(absolute) { hit.rect.y += shift; }
+                    }
+                }
+            }
+            return;
+        }
         if count == 0 && offset != 0.0 {
             if let (Some(geometry), Some(y)) = (&mut self.geometry, line_y) {
                 for absolute in FlowPaintRanges::new(self.flow_paint_owners.as_deref(),first.paint_owner,first.hit,end.hit,false).flatten() {
@@ -36327,6 +36480,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
     fn paint_positioned_box_source(&mut self, source: PositionedBoxSource, parent:&Style,
         style:Style, x:f32, y:f32, available:f32, depth:usize, _order:u64) -> Result<(),LayoutError> {
         let mut fell_back = false;
+        let mut style = style;
+        if let PositionedBoxSource::Node(node) = &source {
+            let falls_back = css::extra_props::computed(&style, "position-try-fallbacks").is_some_and(|value| value != "none");
+            if !falls_back {
+                self.apply_static_edges(*node, &mut style);
+            }
+        }
         let style = match &source {
             PositionedBoxSource::Node(node) => match self.position_fallback_style(*node, &style, depth) {
                 Some(fallback) => {
@@ -36339,6 +36499,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         };
         let mut style = style;
         if let PositionedBoxSource::Node(node) = &source {
+            self.apply_static_edges(*node, &mut style);
             if self.position_visibility_hidden(*node, &style, depth) {
                 style.opacity = 0.0;
             }
@@ -36380,7 +36541,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let fixed = style.position == Position::Fixed;
         let saved = (self.containing_block, self.fixed_containing_block);
         if fixed { self.fixed_containing_block = Some(area); } else { self.containing_block = Some(area); }
+        self.position_area_outer = node.map(|node| (node, (if fixed { saved.1 } else { saved.0 }).unwrap_or(self.viewport_rect())));
         let result = self.paint_positioned_box_in_place(source, parent, adjusted, x, y, available, depth);
+        self.position_area_outer = None;
         (self.containing_block, self.fixed_containing_block) = saved;
         if let (Some(node), Ok(())) = (node, &result) {
             self.record_filled_insets(node, filled)?;
@@ -38471,6 +38634,24 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 };
                 let precise_containing=self.containing_overflow_origin(containing_block_node,id);
                 available = containing.width;
+                if let (Some(left), Some(right)) = (style.left, style.right) {
+                    if left + right > containing.width {
+                        let block_direction = match containing_block_node {
+                            Some(node) => self.computed_style_from_tree_shared(node)?.used_direction(),
+                            None => parent_style.used_direction(),
+                        };
+                        if block_direction == Direction::Rtl {
+                            style.left = Some((containing.width - right).max(0.0));
+                        } else {
+                            style.right = Some((containing.width - left).max(0.0));
+                        }
+                    }
+                }
+                if let (Some(top), Some(bottom)) = (style.top, style.bottom) {
+                    if top + bottom > containing.height {
+                        style.bottom = Some((containing.height - top).max(0.0));
+                    }
+                }
                 let alignment_container = if crate::positioned_alignment::requests_positioned_alignment(style, parent_style) {
                     Some(match containing_block_node {
                         Some(node) => self.computed_style_from_tree_shared(node)?,
@@ -38481,6 +38662,8 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 };
                 let mut aligned_x = None;
                 let mut aligned_y = None;
+                let mut fit_x = false;
+                let mut fit_y = false;
                 let mut anchor_center_x = None;
                 let mut anchor_center_y = None;
                 if let Some(container) = alignment_container.as_deref() {
@@ -38540,6 +38723,11 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         && !style.margin_auto[0] && !style.margin_auto[2] && !style.display.is_table() {
                         aligned_y = Some(vertical);
                     }
+                    let tabular = style.display.is_table();
+                    fit_x = horizontal.alignment != AlignItems::Stretch && style.left.is_some() && style.right.is_some()
+                        && (style.margin_auto[1] || style.margin_auto[3]) && !tabular;
+                    fit_y = vertical.alignment != AlignItems::Stretch && style.top.is_some() && style.bottom.is_some()
+                        && (style.margin_auto[0] || style.margin_auto[2]) && !tabular;
                 }
                 let had_definite_width = style.width.is_some();
                 let had_definite_height = style.height.is_some();
@@ -38548,7 +38736,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         && !(style.justify_self == Some(AlignItems::Stretch)
                             && style.justify_self_keyword != Some(css::AlignmentKeyword::Normal)
                             && !style.margin_auto[1] && !style.margin_auto[3]);
-                    if aligned_x.is_some() {
+                    if aligned_x.is_some() || fit_x {
                         let left = style.left.unwrap_or(0.0);
                         let right = style.right.unwrap_or(0.0);
                         let room = (containing.width - left - right).max(0.0);
@@ -38594,7 +38782,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         && style.align_self_keyword != Some(css::AlignmentKeyword::Normal)
                         && !style.margin_auto[0] && !style.margin_auto[2]);
                 if style.height.is_none() && !table_block_fit {
-                    if aligned_y.is_some() {
+                    if aligned_y.is_some() || fit_y {
                         if style.writing_mode != css::WritingMode::HorizontalTb {
                             let room = (containing.height - style.top.unwrap_or(0.0) - style.bottom.unwrap_or(0.0)).max(0.0);
                             let (_, maximum) = self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?;
@@ -38616,15 +38804,20 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     let rtl = style.used_direction() == Direction::Rtl;
                     for horizontal in [true, false] {
                         let (start, end) = if horizontal { (3, 1) } else { (0, 2) };
-                        let (inset_start, inset_end, size, extent, definite) = if horizontal {
+                        let tabular = style.display.is_table();
+                        let (inset_start, inset_end, outer, extent, definite) = if horizontal {
                             (style.left, style.right,
                                 style.width.map_or(0.0, |width| content_dimension(style, width) + box_edges(style, true)),
-                                containing.width, had_definite_width)
+                                containing.width, had_definite_width || fit_x || tabular)
                         } else {
-                            (style.top, style.bottom,
-                                style.height.map_or(0.0, |height| content_height_dimension(style, height) + box_edges(style, false)),
-                                containing.height, had_definite_height)
+                            let outer = match style.height {
+                                Some(height) => content_height_dimension(style, height) + box_edges(style, false),
+                                None if fit_y || tabular => self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?.1,
+                                None => 0.0,
+                            };
+                            (style.top, style.bottom, outer, containing.height, had_definite_height || fit_y || tabular)
                         };
+                        let size = outer - style.margin_sides[start] - style.margin_sides[end];
                         let (Some(inset_start), Some(inset_end)) = (inset_start, inset_end) else { continue };
                         if !definite || !(style.margin_auto[start] || style.margin_auto[end]) {
                             continue;
@@ -38633,7 +38826,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         let fixed_end = if style.margin_auto[end] { 0.0 } else { style.margin_sides[end] };
                         let free = extent - inset_start - inset_end - size - fixed_start - fixed_end;
                         let (used_start, used_end) = match (style.margin_auto[start], style.margin_auto[end]) {
-                            (true, true) if free >= 0.0 => (free * 0.5, free * 0.5),
+                            (true, true) if free >= 0.0 || !horizontal => (free * 0.5, free * 0.5),
                             (true, true) if horizontal && rtl => (free, 0.0),
                             (true, true) => (0.0, free),
                             (true, false) => (free, fixed_end),
@@ -38690,6 +38883,8 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         size: width,
                         horizontal: true,
                         anchor_center: anchor_center_x,
+                        outer: self.position_area_outer.filter(|(node, _)| *node == id)
+                            .map(|(_, rect)| (rect.x - containing_block_scroll.0, rect.x - containing_block_scroll.0 + rect.width)),
                     };
                     let start = axis.aligned_start(alignment, container, style);
                     overflow_origin.0 += f64::from(start - origin.0);
@@ -38711,6 +38906,8 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         size: height,
                         horizontal: false,
                         anchor_center: anchor_center_y,
+                        outer: self.position_area_outer.filter(|(node, _)| *node == id)
+                            .map(|(_, rect)| (rect.y - containing_block_scroll.1, rect.y - containing_block_scroll.1 + rect.height)),
                     };
                     let start = axis.aligned_start(alignment, container, style);
                     overflow_origin.1 += f64::from(start - origin.1);
@@ -38753,7 +38950,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                 // Laid out away from its root scroll offset, the viewport the
                 // box sticks to lies at that offset.
                 let at = if self.sticky_bounds.is_none() { self.cull_scroll } else { (0.0, 0.0) };
-                origin = sticky_origin(origin, insets, (width, height), Rect { x: containing.x + at.0, y: containing.y + at.1, ..containing });
+                origin = sticky_origin(origin, insets, (width, height), Rect { x: containing.x + at.0, y: containing.y + at.1, ..containing }, parent_style.used_direction() == Direction::Rtl);
                 // Sticking to the viewport, the box moves differently from the
                 // document when it scrolls: record it as a scroll anchor.
                 if self.sticky_bounds.is_none() && self.geometry.is_some() {
@@ -38768,6 +38965,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         containing,
                         shift: (origin.0 - static_origin.0, origin.1 - static_origin.1),
                         hit_offset: (0.0, 0.0),
+                        rtl: parent_style.used_direction() == Direction::Rtl,
                     }, origin));
                 }
             }
@@ -39841,6 +40039,30 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         virtual_children: Option<BoxChildOverride>,
         output_rect: Option<&mut Rect>,
     ) -> Result<f32, LayoutError> {
+        let mark = self.line_clamp_restores.len();
+        let result = self.box_content_with_flattened_children_unguarded(
+            id, parent_style, computed, contents_origin, x, y, available, depth, virtual_children, output_rect);
+        while self.line_clamp_restores.len() > mark {
+            if let Some(Some(saved)) = self.line_clamp_restores.pop() {
+                self.line_clamp = saved;
+            }
+        }
+        result
+    }
+
+    fn box_content_with_flattened_children_unguarded(
+        &mut self,
+        id: NodeId,
+        parent_style: &Style,
+        computed: Option<Style>,
+        contents_origin: Option<Style>,
+        x: f32,
+        y: f32,
+        available: f32,
+        depth: usize,
+        virtual_children: Option<BoxChildOverride>,
+        output_rect: Option<&mut Rect>,
+    ) -> Result<f32, LayoutError> {
         if depth > 512 {
             return Err(LayoutError::DepthLimit);
         }
@@ -40658,7 +40880,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         }
         if let Some(frame)=self.overflow_frames.last_mut(){frame.flow_cursor=Some((cursor,local_content_y));}
         if let Some(frame)=self.overflow_frames.last_mut(){frame.content_anchor=Some(((content_x,cursor),(local_content_x,local_content_y)));}
-        let (text_box_trim_start, text_box_trim_end) = self.text_box_trim_amounts(&style);
+        let (text_box_trim_start, text_box_trim_end) = self.text_box_trim_amounts(id, &style)?;
         cursor -= text_box_trim_start;
         let mut list_marker_inside_pending = list_marker.as_ref().is_some_and(|marker| {
             marker.style.list_style_position == css::ListStylePosition::Inside
@@ -40896,11 +41118,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         }
         let content_command_start = if label_content { label_command_start } else { self.commands.len() };
         let content_hit_start = if label_content { label_hit_start } else { self.geometry.as_ref().map_or(0, |g| g.hits.len()) };
-        let saved_line_clamp = match self.line_clamp_for(&style) {
+        let line_clamp_saved = match self.line_clamp_for(&style) {
             Some(clamp) => Some(self.line_clamp.replace(clamp)),
             None if self.line_clamp.is_some() && line_clamp::LineClamp::isolates(&style) => Some(self.line_clamp.take()),
             None => None,
         };
+        self.line_clamp_restores.push(line_clamp_saved);
         let mut children: Option<alloc::vec::IntoIter<FlattenedBoxChild>> = if is_form_control || widget_replaced || iframe {
             None
         } else if let Some(mut fieldset) = fieldset.take() {
@@ -41035,6 +41258,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     &mut negatives_laid,
                     virtual_parent.then(|| core::mem::take(&mut flattened_block_children)),
                 )?;
+            self.paint_gap_decorations(&style)?;
             self.advance_layout_cursor(&mut cursor, height);
             if vertical_block_flow {
                 vertical_content_extent = vertical_content_extent.max(height);
@@ -41045,6 +41269,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             let (extent_width, height) =
                 self.flex_children(id, &style, content_x, cursor, content_width, depth,
                     virtual_parent.then(|| core::mem::take(&mut flattened_block_children)))?;
+            self.paint_gap_decorations(&style)?;
             self.advance_layout_cursor(&mut cursor, height);
             if vertical_block_flow {
                 vertical_content_extent = vertical_content_extent.max(height);
@@ -41070,7 +41295,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.flattened_box_child_inline_eligible(child, content_width, depth + 1)?
                 }
             };
-            if !current_inline && self.line_clamp_exhausted() {
+            if !current_inline && self.line_clamp_exhausted() && !self.line_clamp_out_of_flow(&current_child)? {
                 self.line_clamp_flush_tail()?;
                 break;
             }
@@ -41474,10 +41699,24 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 positioned
                     .try_reserve(1)
                     .map_err(|_| LayoutError::CommandLimit)?;
-                let (static_x,static_y)=self.block_static_position(content_x,cursor,inline_width,inline_height)?;
+                let legacy_static=self.paragraph_column_flow.as_ref().is_some_and(|flow|flow.prepared && flow.pending)
+                    || (!vertical_block_flow && style.used_direction()==Direction::Ltr);
+                let mut positioned_style=computed.unwrap();
+                let (static_x,static_y)=if legacy_static {
+                    self.block_static_position(content_x,cursor,inline_width,inline_height)?
+                } else {
+                    let origin=if vertical_block_flow {
+                        self.vertical_static_origin(&style,content_x,outer_y+border_top+padding_top-scroll_y,content_width,line_start,inline_width,vertical_block_cursor)
+                    } else {
+                        self.horizontal_static_origin(&style,content_x,content_width,cursor,inline_width)
+                    };
+                    let edges=self.static_edge_insets(&positioned_style,&origin,&style);
+                    self.note_static_edges(current,edges);
+                    (origin.x,origin.y)
+                };
                 positioned.push((
                     PositionedBoxSource::Node(current),
-                    computed.unwrap(),
+                    positioned_style,
                     static_x,
                     static_y,
                     self.next_paint_order(),
@@ -42314,7 +42553,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 saw_non_block = true;
             }
         }
-        if let Some(saved) = saved_line_clamp {
+        if let Some(Some(saved)) = self.line_clamp_restores.pop() {
             self.line_clamp = saved;
         }
         self.flow_content_ranges = Some(FlowContentRanges {
@@ -42659,7 +42898,18 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let top=outer_y+border_top+padding_top;
         let row_count=self.paragraph_column_flow.as_ref().filter(|flow|flow.complete)
             .map_or(0,|flow|flow.source_rows.len());
-        if row_count==0 {
+        if css::gap_decorations::enabled(&style) && css::gap_decorations::multicol_needs_model(&style) {
+            let mut rows=Vec::new();
+            if row_count==0 {
+                rows.push((top,content_height,column_rule_count));
+            }else{
+                for index in 0..row_count {
+                    let row=self.paragraph_column_flow.as_ref().ok_or(LayoutError::InvalidTree)?.source_rows[index];
+                    rows.push((css::typed_numeric::computed_f32(f64::from(top)+row.origin),row.block_size,row.occupied_columns));
+                }
+            }
+            self.paint_multicol_gap_decorations(&style,content_x,outer_content_width,column_width,column_gap,&rows)?;
+        }else if row_count==0 {
             self.paint_column_rule_segment(&style,content_x,outer_content_width,column_width,column_gap,
                 top,content_height,column_rule_count)?;
         }else{
@@ -43571,11 +43821,19 @@ fn laid_out_display_list_once(
     let root_owner=layout.begin_paint_context(root_target,true)?;
         layout.stacking_roots.push(root_owner);
         layout.surface_roots.push(root_owner);
+    // CSS Writing Modes §8.1 propagates the principal mode to the ICB. The
+    // first BODY supplies it, and the root box lays out its own flow in it,
+    // while its children still inherit the root's computed values.
+    let principal = propagated_body
+        .map(|(_, style)| (style.writing_mode, style.direction, style.text_orientation))
+        .unwrap_or((initial.writing_mode, initial.direction, initial.text_orientation));
     let mut containing_style = Style::initial();
-    containing_style.direction = initial.direction;
-    // CSS Writing Modes §8.1 propagates the principal mode to the ICB.
-    containing_style.writing_mode = initial.writing_mode;
-    containing_style.text_orientation = initial.text_orientation;
+    containing_style.direction = principal.1;
+    containing_style.writing_mode = principal.0;
+    containing_style.text_orientation = principal.2;
+    initial.direction = principal.1;
+    initial.writing_mode = principal.0;
+    initial.text_orientation = principal.2;
     layout.parent_height = Some(height as f32);
     layout.box_for(html, &containing_style, Some(initial), -root_scroll.0, -root_scroll.1, width as f32, 0)?;
     layout.parent_height = None;
@@ -43634,6 +43892,12 @@ mod anchor_layout;
 
 #[path = "layout_clamp.rs"]
 mod line_clamp;
+
+#[path = "layout_static_position.rs"]
+mod static_position_layout;
+
+#[path = "layout_vertical_line.rs"]
+mod vertical_line_layout;
 
 #[path = "layout_tabs.rs"]
 mod tab_layout;
@@ -53353,7 +53617,7 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 _ => None,
             })
             .collect();
-        assert_eq!(baselines, [4.5, 12.5]);
+        assert_eq!(baselines, [4.0, 12.0]);
     }
 
     #[test]

@@ -83,6 +83,9 @@ pub fn sync_selected_content(
     only: Option<&[NodeId]>,
 ) -> Result<Vec<NodeId>, Error> {
     let mut removed = Vec::new();
+    if !document.selected_content_created() {
+        return Ok(removed);
+    }
     if !is_html_named(document, select, "select")
         || document.get_attribute_ns_ref(select, None, "multiple")?.is_some()
     {

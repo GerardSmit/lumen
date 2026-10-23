@@ -762,6 +762,9 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
     if !progress.is_finite() {
         return None;
     }
+    if name == "overlay" {
+        return Some(if from == to || progress <= 0.0 { from } else if progress >= 1.0 { to } else { "auto" }.to_owned());
+    }
     match prop_at(index).kind {
         Kind::TabSize => {
             let (a, unit_a) = syntax::split_number_unit(from)?;
@@ -836,7 +839,7 @@ pub(crate) fn interpolate(name: &str, from: &str, to: &str, progress: f64) -> Op
             Some(zoom_string(mix(a, b, progress)))
         }
         Kind::Shape(shape) => shapes::interpolate(shape, from, to, progress),
-        Kind::Gap(part) => gap_rules::interpolate(part, from, to, progress),
+        Kind::Gap(part) => gap_rules::interpolate_snapping(part, from, to, progress, name.starts_with("row-") || from.contains(',') || to.contains(',')),
         Kind::Corner => corner_shapes::interpolate(from, to, progress),
         Kind::BgPos(axis) => background_positions::interpolate(axis, from, to, progress),
         Kind::Text if text_props::is_color(name) => text_props::interpolate_color(from, to, progress),

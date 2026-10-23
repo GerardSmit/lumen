@@ -51,6 +51,7 @@ mod value_props;
 mod value_shorthands;
 mod shorthand_rules;
 mod gap_rules;
+pub(crate) mod gap_decorations;
 mod corner_shapes;
 mod background_positions;
 mod corner_radii;
@@ -80,6 +81,7 @@ mod shapes;
 pub(crate) use shapes::outside as shape_outside;
 pub mod anchor;
 pub mod at_rule_supports;
+mod anchored_query;
 pub mod container_eval;
 pub mod container_query;
 pub mod function_rule;
@@ -180,21 +182,29 @@ pub enum Overflow {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContainerType { #[default] Normal, InlineSize, Size }
+
+/// The query container kinds `container-type` adds besides its size axis.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ContainerFlags {
+    pub scroll_state: bool,
+    pub anchored: bool,
+}
 impl ContainerType {
     pub const fn as_str(self) -> &'static str {
         match self { Self::Normal => "normal", Self::InlineSize => "inline-size", Self::Size => "size" }
     }
-    pub fn serialize(self, scroll_state: bool) -> String {
-        match (self, scroll_state) {
-            (Self::Normal, true) => "scroll-state".into(),
-            (axis, true) => alloc::format!("{} scroll-state", axis.as_str()),
-            (axis, false) => axis.as_str().into(),
-        }
+    pub fn serialize(self, flags: ContainerFlags) -> String {
+        let mut words: Vec<&str> = Vec::new();
+        if self != Self::Normal { words.push(self.as_str()); }
+        if flags.scroll_state { words.push("scroll-state"); }
+        if flags.anchored { words.push("anchored"); }
+        if words.is_empty() { self.as_str().into() } else { words.join(" ") }
     }
-    /// `normal | [ [ size | inline-size ] || scroll-state ]`.
-    fn parse(raw:&str) -> Option<(Self, bool)> {
+    /// `normal | [ [ size | inline-size ] || scroll-state || anchored ]`.
+    fn parse(raw:&str) -> Option<(Self, ContainerFlags)> {
         let mut axis = None;
         let mut scroll_state = false;
+        let mut anchored = false;
         let mut words = 0;
         for word in raw.split_ascii_whitespace() {
             words += 1;
@@ -202,10 +212,11 @@ impl ContainerType {
             else if word.eq_ignore_ascii_case("inline-size") && axis.is_none() { axis = Some(Self::InlineSize); }
             else if word.eq_ignore_ascii_case("size") && axis.is_none() { axis = Some(Self::Size); }
             else if word.eq_ignore_ascii_case("scroll-state") && !scroll_state { scroll_state = true; }
+            else if word.eq_ignore_ascii_case("anchored") && !anchored { anchored = true; }
             else { return None; }
         }
         if words == 0 || (axis == Some(Self::Normal) && words > 1) { return None; }
-        Some((axis.unwrap_or(Self::Normal), scroll_state))
+        Some((axis.unwrap_or(Self::Normal), ContainerFlags { scroll_state, anchored }))
     }
 }
 impl Overflow {
@@ -2959,7 +2970,7 @@ pub struct StyleExtras {
     pub text_shadow_current_color: u64,
     pub text_transform: TextTransform,
     pub container_type: ContainerType,
-    pub container_scroll_state: bool,
+    pub container_flags: ContainerFlags,
     /// Computed animation longhands in canonical property order. Values stay
     /// serialized so the HTML animation adapter can apply CSS list repetition.
     pub animation: [Option<Arc<str>>; animation_controls::STYLE_COUNT],
@@ -3227,7 +3238,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     text_shadow_current_color: 0,
     text_transform: TextTransform::None,
     container_type: ContainerType::Normal,
-    container_scroll_state: false,
+    container_flags: ContainerFlags { scroll_state: false, anchored: false },
     animation: [const { None }; animation_controls::STYLE_COUNT],
     font: FontSpec {
         ligatures: FontLigatures::NORMAL,
@@ -4181,6 +4192,10 @@ impl Style {
         let mut child=self.display_contents_child_style();
         for name in ["align-content","align-items","border-radius","column-count","column-fill","column-width",
             "column-rule-width","column-rule-color","column-rule-style",
+            "row-rule-width","row-rule-color","row-rule-style","column-rule-break","row-rule-break","rule-overlap",
+            "column-rule-visibility-items","row-rule-visibility-items",
+            "column-rule-inset-cap-start","column-rule-inset-cap-end","column-rule-inset-junction-start","column-rule-inset-junction-end",
+            "row-rule-inset-cap-start","row-rule-inset-cap-end","row-rule-inset-junction-start","row-rule-inset-junction-end",
             "flex-direction","flex-wrap","row-gap","column-gap","grid-auto-columns","grid-auto-flow","grid-auto-rows",
             "grid-template-areas","grid-template-columns","grid-template-rows","justify-content","justify-items",
             "overflow-x","overflow-y","text-overflow","unicode-bidi"] {
@@ -5279,6 +5294,9 @@ pub(crate) struct Selector {
     host: bool,
     /// `::slotted(compound)` — matches light children assigned to a slot.
     slotted: bool,
+    /// Ends in a tree-abiding pseudo-element that generates no box here
+    /// (`::picker()`, `::picker-icon`, `::checkmark`, `::interest-button`).
+    opaque_pseudo: bool,
     /// `::part(name)` — matches shadow elements exposing the named part.
     part: Option<String>,
     /// Present only while parsing CSS nesting selector lists. The adapter
@@ -5979,7 +5997,7 @@ enum Value {
     BorderImageRaw(usize,String),
     BorderImage(usize,Arc<BorderImage>),
     ViewTransitionName(ViewTransitionName),
-    ContainerType(ContainerType, bool),
+    ContainerType(ContainerType, ContainerFlags),
     Animation(usize, Arc<str>),
     TransitionTimes(usize, Arc<[typed_numeric::NumericValue]>),
     TransitionTimesRaw(usize,String),
@@ -6439,7 +6457,7 @@ impl Value {
                 if let Some(legacy)=color_at_slot(*slot,color_values::rgba(value.value)) {legacy.apply(style);}
                 style.set_source_color(*slot,Some(value.clone()));
             }
-            Self::ContainerType(value, scroll_state) => { style.container_type = *value; style.container_scroll_state = *scroll_state; }
+            Self::ContainerType(value, flags) => { style.container_type = *value; style.container_flags = *flags; }
             Self::Animation(slot, value) => style.animation[animation_controls::index(*slot)] = Some(value.clone()),
             Self::TransitionProperty(values) => style.transition_property = Some(values.clone()),
             Self::TransitionTimingFunction(values) => style.transition_timing_function = Some(values.clone()),
@@ -9316,6 +9334,9 @@ fn rule_media_matches(&self, order: usize) -> bool {
             if rule.registration.is_some() {
                 continue;
             }
+            if rule.media.iter().any(|entry| container_eval::is_marker(entry)) {
+                return None;
+            }
             let selector = &rule.selector;
             if selector.host && selector.ancestor.is_none() && !selector.slotted && selector.part.is_none() {
                 *host_pseudo.get_or_insert(false) |= selector.pseudo_element.is_some();
@@ -10338,7 +10359,7 @@ fn parse_selector_depth(
             parse_simple_selector_depth(&input[start..pos], offset + start, depth, allow_nesting, namespaces)?;
         if let Some(previous) = previous {
             let previous: Selector = previous;
-            if previous.pseudo_element.is_some() {
+            if previous.pseudo_element.is_some() || previous.opaque_pseudo {
                 return Err(selector_error(
                     offset + start,
                     "pseudo-element must end the selector",
@@ -10350,7 +10371,7 @@ fn parse_selector_depth(
             current.ancestor = Some((relation, Box::new(previous)));
         }
         skip_css_space_comments(input, &mut pos);
-        if current.pseudo_element.is_some() && pos < bytes.len() {
+        if (current.pseudo_element.is_some() || current.opaque_pseudo) && pos < bytes.len() {
             return Err(selector_error(
                 offset + start,
                 "pseudo-element must end the selector",
@@ -10526,6 +10547,26 @@ fn parse_pseudo_source(input:&str,offset:usize)->Result<ParsedPseudoSource<'_>,C
     } else { Ok(ParsedPseudoSource{name,args:None,end:pos,args_offset:pos}) }
 }
 
+/// Whether the text at the start of `rest` is a pseudo-element that may follow
+/// `::slotted()` in the same compound selector.
+fn tree_abiding_pseudo_follows(rest: &str, offset: usize) -> Result<bool, CssError> {
+    if !rest.starts_with("::") || rest.starts_with(":::") {
+        return Ok(false);
+    }
+    let parsed = parse_pseudo_source(rest, offset)?;
+    Ok(matches!(parsed.name.as_str(), "before" | "after" | "picker-icon" | "checkmark"))
+}
+
+/// Whether the text at the start of `rest` is a user-action pseudo-class, the
+/// only kind that may follow a tree-abiding pseudo-element.
+fn user_action_pseudo_class_follows(rest: &str, offset: usize) -> Result<bool, CssError> {
+    if !rest.starts_with(':') || rest.starts_with("::") {
+        return Ok(false);
+    }
+    let parsed = parse_pseudo_source(rest, offset)?;
+    Ok(parsed.args.is_none() && matches!(parsed.name.as_str(), "hover" | "active" | "focus" | "focus-visible" | "focus-within"))
+}
+
 fn parse_simple_selector_depth(
     input: &str,
     offset: usize,
@@ -10556,6 +10597,7 @@ fn parse_simple_selector_depth(
         universal,
         host: false,
         slotted: false,
+        opaque_pseudo: false,
         part: None,
         nesting_selector: 0,
         pseudo_element: None,
@@ -10571,11 +10613,14 @@ fn parse_simple_selector_depth(
     let mut start = cursor;
     let bytes = input.as_bytes();
     while start < bytes.len() {
-        if selector.slotted {
+        if selector.slotted && !tree_abiding_pseudo_follows(&input[start..], offset + start)? {
             return Err(CssError {
                 offset: offset + start,
                 message: "::slotted must end its compound selector",
             });
+        }
+        if selector.opaque_pseudo && !user_action_pseudo_class_follows(&input[start..], offset + start)? {
+            return Err(selector_error(offset + start, "pseudo-element must end its compound selector"));
         }
         if let Some(previous) = selector.pseudo_element {
             // CSS Pseudo 4 §4.2 admits exactly the marker of a generated
@@ -10707,6 +10752,7 @@ fn parse_simple_selector_depth(
                     return Err(selector_error(offset + start, "invalid form control pseudo-element"));
                 }
                 // No picker, checkmark or interest button box is generated, so the selector is valid and matches nothing.
+                selector.opaque_pseudo = true;
                 selector.logical.push(LogicalPseudo::Is(Vec::new()));
                 selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 start += end;
@@ -12125,7 +12171,7 @@ impl SourceColor {
     pub fn serialize(&self)->Option<String> {color_values::serialize(self.value,self.color_function)}
 }
 pub fn color_uses_current_color(input:&str)->bool {color_values::uses_current_color(input)}
-pub fn animation_color_property(property:&str)->bool {let properties=slots(property);properties.len()==1 && color_slot(properties[0])}
+pub fn animation_color_property(property:&str)->bool {let properties=slots(property);properties.len()==1 && color_slot(properties[0]) || matches!(property,"column-rule-color"|"row-rule-color")}
 pub fn animation_color_needs_context(input:&str)->bool {color_values::uses_current_color(input)||image_numeric_dependencies(input)!=(false,false)}
 
 fn color_value(slot: usize, input: &str) -> Option<Value> {
@@ -14412,7 +14458,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
     }
     match slot {
         187 => to.outline.color = from.outline.color,
-        198 => { to.container_type = from.container_type; to.container_scroll_state = from.container_scroll_state; }
+        198 => { to.container_type = from.container_type; to.container_flags = from.container_flags; }
         188 => to.outline.style = from.outline.style,
         189 => to.outline.width = from.outline.width,
         190 => to.outline.offset = from.outline.offset,
@@ -22058,7 +22104,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 _ => None,
             },
             "font-style" => font_style_value(raw),
-            "container-type" => ContainerType::parse(raw).map(|(axis, scroll_state)| Value::ContainerType(axis, scroll_state)),
+            "container-type" => ContainerType::parse(raw).map(|(axis, flags)| Value::ContainerType(axis, flags)),
             "appearance" | "-webkit-appearance" => Appearance::parse(raw).map(Value::Appearance),
             "field-sizing" => FieldSizing::parse(raw).map(Value::FieldSizing),
             "view-transition-name" => {
@@ -27589,7 +27635,7 @@ fn cascade_custom_layer(
                 let mut stack = Vec::new();
                 overlay.iter().enumerate().map(|(at, (name, value))| match value.as_ref() {
                     Some(value) if value.expands() => Some(expand_entry(at, name, value, &names,
-                        &mut stack, &mut walk).map(CustomText::from)),
+                        &mut stack, &mut walk).map(|text| CustomText::from(text.trim()))),
                     _ => None,
                 }).collect()
             };
@@ -27930,7 +27976,7 @@ fn cascade_custom_properties_uncached(
             let mut stack = Vec::new();
             custom_properties.iter().enumerate().map(|(at, (name, value))| match value.as_ref() {
                 Some(value) if value.expands() => {
-                    Some(expand_entry(at, name, value, &names, &mut stack, &mut walk).map(CustomText::from))
+                    Some(expand_entry(at, name, value, &names, &mut stack, &mut walk).map(|text| CustomText::from(text.trim())))
                 }
                 _ => None,
             }).collect()

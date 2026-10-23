@@ -1437,7 +1437,7 @@ fn transition_parameters(style:&lumen_html::css::Style,index:usize)->(animation:
 }
 
 fn resolve_line_width_keywords(property:&str,a:&str,b:&str)->Option<(String,String)> {
-    if !property.ends_with("-width") || !(property.starts_with("border-") || property.starts_with("outline-") || property.starts_with("column-rule-")) {return None;}
+    if !property.ends_with("-width") || !(property.starts_with("border-") || property.starts_with("outline-") || property.starts_with("column-rule-") || property.starts_with("row-rule-")) {return None;}
     let pixels=|value:&str|match value.trim().to_ascii_lowercase().as_str() {"thin"=>Some("1px"),"medium"=>Some("3px"),"thick"=>Some("5px"),_=>None};
     if pixels(a).is_none() && pixels(b).is_none() {return None;}
     Some((pixels(a).unwrap_or(a).to_owned(),pixels(b).unwrap_or(b).to_owned()))

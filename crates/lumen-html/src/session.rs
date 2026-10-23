@@ -3334,6 +3334,13 @@ impl RenderSession {
             .map_err(LayoutError::Css)
     }
     pub fn computed_style_with_text(&mut self, node: NodeId, text:Option<&dyn TextShaper>) -> Result<Style, LayoutError> {
+        let mut style = self.computed_style_authored(node, text)?;
+        let in_top_layer = self.document.top_layer_kind(node).is_some();
+        css::extra_props::set_stored(&mut style, "overlay", in_top_layer.then_some("auto"));
+        Ok(style)
+    }
+
+    fn computed_style_authored(&mut self, node: NodeId, text:Option<&dyn TextShaper>) -> Result<Style, LayoutError> {
         self.synchronize_form_state();
         if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
             return Err(LayoutError::InvalidTree);
@@ -5822,14 +5829,6 @@ impl RenderSession {
             return;
         }
         let Some(rules) = self.rules.as_ref() else { return };
-        // The installed container oracle belongs to the previous rules, so a
-        // restyle against it cannot tell whether new `@container` rules apply;
-        // only a relayout measures the containers again.
-        if self.rule_subjects.is_some() && rules.has_container_rules() {
-            self.invalidation_stats.bails[0] += 1;
-            self.rules_reset = true;
-            return;
-        }
         let environment = css::MediaEnvironment { width: width as f32, height: height as f32, ..rules.environment };
         if self.style_environment != Some(environment) {
             self.invalidation_stats.bails[1] += 1;
@@ -6459,6 +6458,7 @@ impl RenderSession {
                     let installed = {
                         let styles = self.style_cache.borrow();
                         let scrolls = &self.scrolls;
+                        let layout_cache = &self.layout_cache;
                         let oracle = css::container_eval::build_oracle(
                             &self.document,
                             &|node| styles.node_entry(node).map(|(_, _, _, style)| style.clone()),
@@ -6468,6 +6468,7 @@ impl RenderSession {
                                 let (x, y) = scrolls.iter().find(|scroll| scroll.node == node).map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
                                 Some(css::container_eval::ScrollGeometry { min_x, max_x, min_y, max_y, x, y })
                             },
+                            &|node| layout_cache.applied_fallback(node),
                             rules.environment,
                             Some(text),
                         );

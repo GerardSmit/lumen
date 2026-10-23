@@ -276,6 +276,7 @@ pub struct Document {
     allow_declarative_shadow_roots: bool,
     free: Vec<u32>,
     live_nodes: usize,
+    selected_content_created: bool,
     node_retirements: u64,
     version: u64,
     max_nodes: usize,
@@ -376,6 +377,7 @@ impl Document {
             allow_declarative_shadow_roots: false,
             free: Vec::new(),
             live_nodes: 1,
+            selected_content_created: false,
             node_retirements: 0,
             version: 0,
             max_nodes: max_nodes.max(1),
@@ -1436,6 +1438,11 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         if *namespace == Namespace::Html && local == "template" { 2 + usize::from(self.template_owner_document.is_none()) } else { 1 }
     }
 
+    /// Whether an HTML `selectedcontent` element was ever created in this document.
+    pub fn selected_content_created(&self) -> bool {
+        self.selected_content_created
+    }
+
     fn create_node_without_details(&mut self, kind: NodeKind, internal_document: bool, literal_colon: bool) -> Result<NodeId, Error> {
         let nonce=match &kind {
             NodeKind::Element {namespace:Namespace::Html|Namespace::Svg|Namespace::MathMl,attributes,..}=>attributes.iter().find(|(name,_)|name=="nonce").map(|(_,value)|Arc::<str>::from(value.as_str())).filter(|value|!value.is_empty()),
@@ -1444,6 +1451,10 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         if let Some(value)=&nonce {self.reserve_nonce(value.len(),0)?;}
         let template = matches!(&kind, NodeKind::Element { namespace: Namespace::Html, name, .. }
             if (if literal_colon { name.as_str() } else { svg::local_name(name) }) == "template");
+        if matches!(&kind, NodeKind::Element { namespace: Namespace::Html, name, .. }
+            if (if literal_colon { name.as_str() } else { svg::local_name(name) }) == "selectedcontent") {
+            self.selected_content_created = true;
+        }
         let required = match &kind {
             NodeKind::Element { namespace, name, .. } => self.element_creation_allocation_count(namespace, name.as_str(), literal_colon),
             _ => 1,

@@ -26,6 +26,7 @@ struct Scope<'a> {
     attributes: RefCell<Vec<String>>,
     steps: Cell<usize>,
     bytes: Cell<usize>,
+    salt: usize,
 }
 
 impl<'a> Scope<'a> {
@@ -36,6 +37,7 @@ impl<'a> Scope<'a> {
             attributes: RefCell::new(Vec::new()),
             steps: Cell::new(0),
             bytes: Cell::new(0),
+            salt: 0,
         }
     }
 
@@ -291,6 +293,9 @@ fn base_value(scope: &Scope<'_>, caching: Option<&Caching<'_>>, index: usize) ->
     hash = fnv(b"|", hash);
     if implicit || caching.is_some_and(|caching| caching.element) {
         hash = fnv(&owner.element.map_or(0, |(_, node)| node.key()).to_le_bytes(), hash);
+        if scope.salt != 0 {
+            hash = fnv(&scope.salt.to_le_bytes(), hash);
+        }
     }
     hash = fnv(b"|", hash);
     let ua = if implicit { Some(Ua::PropertyIndex) } else { caching.and_then(|caching| caching.ua) };
@@ -640,6 +645,15 @@ pub(super) fn substitute(raw: &str, owner: &Owner<'_>) -> Option<String> {
     expand(raw, &scope, 0)
 }
 
+/// `raw` with its element-dependent functions evaluated for a hypothetical element that has no
+/// identity, as inside a custom function; `salt` distinguishes element-scoped results.
+pub(super) fn substitute_detached(raw: &str, property: &str, salt: usize) -> Option<String> {
+    let owner = Owner { element: None, property };
+    let mut scope = Scope::new(&owner);
+    scope.salt = salt;
+    expand(raw, &scope, 0)
+}
+
 /// `raw` with its element-dependent functions evaluated for `node`, with a lone `calc(<value>)`
 /// result written as the plain value; `None` when `raw` uses none of them or is invalid.
 pub(super) fn substitute_for_element(raw: &str, document: &Document, node: NodeId, property: &str) -> Option<String> {
@@ -730,7 +744,8 @@ fn argument_text(text: &str, scope: &Scope<'_>) -> Option<String> {
     expression.simplify_absolute_units();
     if !explicit {
         if let Some(value) = expression.single_numeric_value() {
-            return Some(typed_numeric::serialize_numeric_value(value.value, value.unit));
+            let (unit, factor) = value.unit.canonical_unit_and_factor().unwrap_or((value.unit, 1.0));
+            return Some(typed_numeric::serialize_numeric_value(value.value * factor, unit));
         }
     }
     expression.serialize()

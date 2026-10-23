@@ -39,10 +39,15 @@ fn ellipsis_text(value: Option<&str>) -> Option<Arc<str>> {
 
 impl LineClamp {
     pub(super) fn from_style(style: &Style) -> Option<LineClamp> {
-        if style.writing_mode != css::WritingMode::HorizontalTb {
+        if style.writing_mode != css::WritingMode::HorizontalTb || LineClamp::multicol(style) {
             return None;
         }
         if !matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem | Display::InlineBlock) {
+            return None;
+        }
+        if css::extra_props::keyword(style, "continue") == Some("-webkit-legacy")
+            && !(style.display_ruby == 6 && css::extra_props::keyword(style, "-webkit-box-orient") == Some("vertical"))
+        {
             return None;
         }
         let (remaining, ellipsis) = if let Some(lines) = css::extra_props::keyword(style, "max-lines").and_then(parse_lines) {
@@ -53,10 +58,16 @@ impl LineClamp {
         Some(LineClamp { remaining, exhausted: false, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
     }
 
+    fn multicol(style: &Style) -> bool {
+        style.column_count.is_some() || style.column_width != css::columns::ColumnWidth::Auto
+    }
+
     /// Boxes that form their own independent formatting context keep their
     /// lines out of an enclosing container's count.
     pub(super) fn isolates(style: &Style) -> bool {
         style.float != Float::None
+            || !matches!(style.overflow_x, css::Overflow::Visible | css::Overflow::Clip)
+            || !matches!(style.overflow_y, css::Overflow::Visible | css::Overflow::Clip)
             || matches!(style.position, Position::Absolute | Position::Fixed)
             || matches!(style.display, Display::InlineBlock | Display::FlowRoot | Display::Flex | Display::Grid
                 | Display::Table | Display::InlineTable | Display::TableCell | Display::TableCaption)
@@ -69,6 +80,7 @@ impl Layout<'_> {
             return Some(clamp);
         }
         if style.writing_mode != css::WritingMode::HorizontalTb
+            || LineClamp::multicol(style)
             || !matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem | Display::InlineBlock)
             || !matches!(css::extra_props::keyword(style, "continue"), Some("collapse" | "discard"))
         {
@@ -85,6 +97,16 @@ impl Layout<'_> {
         }
         let ellipsis = ellipsis_text(css::extra_props::keyword(style, "block-ellipsis"));
         Some(LineClamp { remaining: lines as u32, exhausted: false, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
+    }
+
+    pub(super) fn line_clamp_out_of_flow(&self, item: &BlockFlowItem) -> Result<bool, LayoutError> {
+        let BlockFlowItem::Child(child) = item else { return Ok(false) };
+        let FlattenedBoxChildKind::Node(node) = &child.kind else { return Ok(false) };
+        let style = match &child.computed_style {
+            Some(style) => style.clone(),
+            None => self.computed_style(*node, Some(&child.parent_style)).map_err(LayoutError::Css)?,
+        };
+        Ok(matches!(style.position, Position::Absolute | Position::Fixed))
     }
 
     pub(super) fn line_clamp_exhausted(&self) -> bool {

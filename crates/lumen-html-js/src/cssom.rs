@@ -6123,7 +6123,7 @@ impl DomStyleSheet {
     fn disabled(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<bool> {
         ctx.with_instance::<DomCssStyleSheet, _>(&this.0, |sheet| sheet.disabled())?
     }
-    #[setter]
+    #[setter(coerce)]
     fn set_disabled(&self, ctx: &mut Ctx, this: This<Value>, value: bool) -> OpResult<()> {
         ctx.with_instance::<DomCssStyleSheet, _>(&this.0, |sheet| sheet.set_disabled(value))?
     }

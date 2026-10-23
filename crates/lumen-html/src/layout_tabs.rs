@@ -104,7 +104,7 @@ impl Layout<'_> {
             matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces)
                 && paragraph.text.get(range.clone()).is_some_and(|text| text.contains('\t'))
         };
-        if tokens.iter().any(|token| token.rtl) || !tokens.iter().any(preserves) {
+        if tokens.iter().any(|token| token.rtl && preserves(token)) || !tokens.iter().any(preserves) {
             return Ok(());
         }
         let starts_paragraph = tokens
