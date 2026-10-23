@@ -200,6 +200,13 @@ fn style_color(style:&Style,slot:usize,fallback:Rgba)->String {
     color(fallback)
 }
 
+/// Typed OM computed values keep an authored `currentcolor` keyword on every
+/// color property except `color` itself, where it inherits.
+fn explicit_current_color(style:&Style,slot:usize)->bool {
+    slot!=1 && style.source_color(slot).and_then(|source|source.expression)
+        .is_some_and(|expression|super::decoded_css_keyword(&expression.raw,"currentcolor"))
+}
+
 fn style_color_for_phase(style:&Style,slot:usize,fallback:Rgba,resolved:bool)->String {
     if resolved && style.source_color(slot).is_some() {
         let source=style.resolved_source_color(slot,fallback);
@@ -425,6 +432,9 @@ impl Style {
         // CSSOM resolved color special cases expose the used float color.
         // Computed/Typed OM serialization retains the inherited expression.
         let style_color=|style:&Style,slot:usize,fallback:Rgba| {
+            if context.independent_border_widths && explicit_current_color(style,slot) {
+                return String::from("currentcolor");
+            }
             style_color_for_phase(style,slot,fallback,context.resolved && matches!(slot,1|2|10|107..=110|119..=122|187))
         };
         let lowered = ascii_lower(name);
@@ -675,7 +685,7 @@ impl Style {
                 overflow(self.overflow_y).into(),
             ),
             "font-size" => px(self.font_size),
-            "container-type" => self.container_type.as_str().into(),
+            "container-type" => self.container_type.serialize(self.container_scroll_state),
             "font-family" => self.font.families.as_ref().map_or_else(
                 || "sans-serif".into(),
                 |value| serialize_font_families(value),
@@ -923,7 +933,9 @@ impl Style {
             }
             .into(),
             "text-indent" => alloc::format!("{}{}", lp(self.text_indent), super::text_indent::keywords(self.text_indent_mode)),
-            "letter-spacing" => self.letter_spacing.map_or_else(|| "normal".into(), px),
+            "letter-spacing" => self.letter_spacing
+                .filter(|value| *value != 0.0 || !(context.resolved || context.independent_border_widths))
+                .map_or_else(|| "normal".into(), px),
             "word-spacing" => lp(self.word_spacing),
             "vertical-align" => value_shorthands::computed_shorthand(self, "vertical-align"),
             "text-decoration" => {
@@ -2270,24 +2282,28 @@ impl Style {
                 .as_deref()
                 .and_then(|values| (!values.is_empty()).then(|| values[index % values.len()]))
                 .unwrap_or(BackgroundAttachment::Scroll);
+            let position = if self.background_position.as_deref().is_none_or(|values| values.is_empty()) {
+                String::from("0% 0%")
+            } else {
+                alloc::format!("{} {}", lp(position[0]), lp(position[1]))
+            };
+            if index + 1 == images.len() {
+                append(&mut output, &style_color_for_phase(self,2,self.background,resolved))?;
+                append(&mut output, " ")?;
+            }
             append(
                 &mut output,
                 &alloc::format!(
-                    "{} {} {} / {} {} {} {} {}",
+                    "{} {} {} {} / {} {} {}",
                     image(value, 0)?,
-                    lp(position[0]),
-                    lp(position[1]),
-                    background_size(&size),
                     declaration_block::serialize_background_repeat_pair(repeat),
                     attachment(attach),
+                    position,
+                    background_size(&size),
                     background_box(origin),
                     background_box(clip)
                 ),
             )?;
-            if index + 1 == images.len() {
-                append(&mut output, " ")?;
-                append(&mut output, &style_color_for_phase(self,2,self.background,resolved))?;
-            }
         }
         Some(output)
     }

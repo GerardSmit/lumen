@@ -4,6 +4,7 @@
 use super::*;
 
 mod basic;
+pub(crate) mod outside;
 mod geom;
 mod paths;
 mod properties;

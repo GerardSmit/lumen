@@ -874,7 +874,7 @@ pub struct RenderSession {
     style_version: u64,
     style_environment: Option<css::MediaEnvironment>,
     /// Inputs of the last layout whose container-query oracle was already stable.
-    container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>)>,
+    container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>, u64)>,
     container_oracle_required: bool,
     presentation_root: Option<NodeId>,
     animation_snapshot: Option<Arc<AnimationSnapshot>>,
@@ -5299,7 +5299,8 @@ impl RenderSession {
         // them; one that lays out again culls to another window, which none
         // of them could match.
         let keeps_fragments = node == root && self.cached.as_ref().is_some_and(|frame| frame.geometry.laid_out_at_origin);
-        let replayed = self.cached.as_mut().is_some_and(|frame| {
+        let query_container = self.rules.as_ref().is_some_and(|rules| rules.is_scroll_state_container(node));
+        let replayed = !query_container && self.cached.as_mut().is_some_and(|frame| {
             if frame.geometry.transform_timeline_values.is_some(){return false;}
             if node == root {
                 frame.geometry.scroll_root(&mut frame.list.0, (x, y))
@@ -6442,14 +6443,23 @@ impl RenderSession {
             if !changed && container_passes < MAX_CONTAINER_PASSES {
                 let rules = self.rules.as_ref().expect("stylesheets initialized");
                 let oracle_key = (version, self.rules_version, self.style_cache.borrow().epoch(), self.font_generation,
-                    images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits));
+                    images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits),
+                    self.scrolls.iter().fold(0u64, |hash, scroll| {
+                        hash.rotate_left(7) ^ (u64::from(scroll.x.to_bits()) << 32 | u64::from(scroll.y.to_bits())) ^ scroll.node.key() as u64
+                    }));
                 if (rules.has_container_rules() || self.container_oracle_required) && self.container_oracle_stable != Some(oracle_key) {
                     let installed = {
                         let styles = self.style_cache.borrow();
+                        let scrolls = &self.scrolls;
                         let oracle = css::container_eval::build_oracle(
                             &self.document,
                             &|node| styles.node_entry(node).map(|(_, _, _, style)| style.clone()),
                             &|node| geometry.container_context_for(node),
+                            &|node| {
+                                let (min_x, max_x, min_y, max_y) = geometry.scroll_bounds(node)?;
+                                let (x, y) = scrolls.iter().find(|scroll| scroll.node == node).map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
+                                Some(css::container_eval::ScrollGeometry { min_x, max_x, min_y, max_y, x, y })
+                            },
                             rules.environment,
                             Some(text),
                         );

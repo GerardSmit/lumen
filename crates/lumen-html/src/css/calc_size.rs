@@ -52,6 +52,8 @@ pub struct CalcSizeValue {
     /// coefficient) or a length term, so serialization keeps its shape.
     pub size_term: bool,
     pub px_term: bool,
+    /// Number of `calc-size()` layers the source nested around the basis.
+    pub nest: u8,
 }
 
 impl CalcSizeValue {
@@ -90,8 +92,18 @@ impl CalcSizeValue {
         }
         lin.size = self.size_term;
         lin.k = f64::from(self.k);
-        format!("calc-size({}, {})", self.basis.keyword(), lin.text(false))
+        nested_text(self.basis.keyword(), &lin.text(false), self.nest)
     }
+}
+
+/// `calc-size(basis, expression)` with identity layers standing for the extra
+/// nesting of the source, which bounds how far interpolation may expand it.
+fn nested_text(basis: &str, expression: &str, nest: u8) -> String {
+    let mut inner = String::from(basis);
+    for _ in 1..nest {
+        inner = format!("calc-size({inner}, size)");
+    }
+    format!("calc-size({inner}, {expression})")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,7 +144,10 @@ fn kind_of_slot(slot: usize) -> Option<Kind> {
 }
 
 const MAX_INPUT: usize = 1024;
-const MAX_DEPTH: usize = 8;
+const MAX_DEPTH: usize = 40;
+
+/// Deeper `calc-size()` nesting would expand too far to interpolate.
+const MAX_INTERPOLATED_NEST: u8 = 16;
 
 const UNITS: &[&str] = &[
     "px", "em", "rem", "ex", "rex", "ch", "rch", "cap", "rcap", "ic", "ric", "lh", "rlh", "vw", "vh",
@@ -476,6 +491,7 @@ struct Spec {
 struct Flat {
     basis: Option<Basis>,
     lin: Lin,
+    nest: u8,
 }
 
 fn keyword_basis(name: &str, kind: Kind) -> Option<Option<Basis>> {
@@ -551,12 +567,12 @@ fn parse_spec(text: &str, kind: Kind) -> Option<Spec> {
 
 fn flatten(spec: &Spec) -> Flat {
     match &spec.basis {
-        BasisSpec::Any => Flat { basis: None, lin: spec.expr.clone() },
-        BasisSpec::Keyword(basis) => Flat { basis: Some(*basis), lin: spec.expr.clone() },
-        BasisSpec::Length(length) => Flat { basis: None, lin: spec.expr.substitute(length) },
+        BasisSpec::Any => Flat { basis: None, lin: spec.expr.clone(), nest: 1 },
+        BasisSpec::Keyword(basis) => Flat { basis: Some(*basis), lin: spec.expr.clone(), nest: 1 },
+        BasisSpec::Length(length) => Flat { basis: None, lin: spec.expr.substitute(length), nest: 1 },
         BasisSpec::Nested(inner) => {
             let inner = flatten(inner);
-            Flat { basis: inner.basis, lin: spec.expr.substitute(&inner.lin) }
+            Flat { basis: inner.basis, lin: spec.expr.substitute(&inner.lin), nest: inner.nest.saturating_add(1) }
         }
     }
 }
@@ -636,7 +652,7 @@ fn declaration_value(kind: Kind, slot: usize, raw: &str) -> Option<Value> {
         }
         None => parse_context_length(slot, &flat.lin.calc_text(), true),
         Some(basis) => {
-            let text = format!("calc-size({}, {})", basis.keyword(), flat.lin.text(false));
+            let text = nested_text(basis.keyword(), &flat.lin.text(false), flat.nest);
             Some(Value::CalcSize(slot, text.into()))
         }
     }
@@ -676,10 +692,10 @@ pub(super) fn applies(name: &str, raw: &str) -> bool {
 /// Freeze a keyword-basis `calc-size()` against the element's length context.
 pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: ContainerUnitContext) -> Option<Value> {
     kind_of_slot(slot)?;
-    let (basis, lin) = if starts_fit_content_function(text) {
+    let (basis, lin, nest) = if starts_fit_content_function(text) {
         let mut lin = parse_fit_content_argument(text)?;
         lin.k = 1.0;
-        (Basis::FitContentArgument, lin)
+        (Basis::FitContentArgument, lin, 1)
     } else {
         let flat = flatten(&parse_spec(text, kind_of_slot(slot)?)?);
         let basis = match flat.basis {
@@ -687,7 +703,7 @@ pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: Co
             None if any_length(slot, &flat.lin) => Basis::Any,
             None => return None,
         };
-        (basis, flat.lin)
+        (basis, flat.lin, flat.nest)
     };
     let mut px = 0.0f32;
     for (unit, value) in &lin.units {
@@ -700,6 +716,7 @@ pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: Co
         k: lin.k as f32,
         size_term: lin.size && basis != Basis::FitContentArgument,
         px_term: !lin.units.is_empty(),
+        nest,
     };
     let sizing = IntrinsicSizing::CalcSize(value);
     Some(if slot == 20 { Value::FlexBasisIntrinsic(sizing) } else { Value::IntrinsicSize(slot, sizing) })
@@ -708,17 +725,18 @@ pub(super) fn resolve(slot: usize, text: &str, context: LengthContext, query: Co
 struct Side {
     basis: Option<Basis>,
     lin: Lin,
+    nest: u8,
 }
 
 fn side(text: &str, allow_keywords: bool) -> Option<Side> {
     let text = text.trim();
     if starts_calc_size(text) {
         let flat = flatten(&parse_spec(text, Kind::FlexBasis)?);
-        return Some(Side { basis: flat.basis, lin: flat.lin });
+        return Some(Side { basis: flat.basis, lin: flat.lin, nest: flat.nest });
     }
     if allow_keywords {
         if let Some(Some(basis)) = keyword_basis(text, Kind::Preferred) {
-            return Some(Side { basis: Some(basis), lin: Lin::size() });
+            return Some(Side { basis: Some(basis), lin: Lin::size(), nest: 1 });
         }
     }
     if text.len() > MAX_INPUT {
@@ -726,7 +744,7 @@ fn side(text: &str, allow_keywords: bool) -> Option<Side> {
     }
     let mut parser = Parser { text, index: 0, depth: 0 };
     let lin = parser.sum(false)?;
-    (parser.index == text.len() && lin.dim).then_some(Side { basis: None, lin })
+    (parser.index == text.len() && lin.dim).then_some(Side { basis: None, lin, nest: 1 })
 }
 
 /// Weighted sum of sizing values where at least one operand is a
@@ -753,6 +771,9 @@ pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
             return None;
         }
         let side = side(text, keywords)?;
+        if side.nest > MAX_INTERPOLATED_NEST {
+            return None;
+        }
         percentage_basis |= side.basis.is_none() && side.lin.pct.is_some() && starts_calc_size(text.trim());
         match (basis, side.basis) {
             (Some(left), Some(right)) if left != right => return None,
@@ -764,7 +785,7 @@ pub fn combine(values: &[(&str, f64)], allow_keywords: bool) -> Option<String> {
     if !total.finite() || percentage_basis && basis.is_some() {
         return None;
     }
-    Some(flat_text(&Flat { basis, lin: total }))
+    Some(flat_text(&Flat { basis, lin: total, nest: 1 }))
 }
 
 pub(crate) fn interpolate(from: &str, to: &str, progress: f64, allow_keywords: bool) -> Option<String> {
@@ -841,6 +862,18 @@ mod tests {
             interpolate("calc-size(any, 20px)", "calc-size(any, 60px)", 0.5, false).as_deref(),
             Some("calc-size(any, 40px)")
         );
+    }
+
+    #[test]
+    fn deeply_nested_values_parse_but_do_not_interpolate() {
+        let mut text = String::from("auto");
+        for _ in 0..20 {
+            text = format!("calc-size({text}, size / 2 + size / 2)");
+        }
+        assert!(serialize("height", &text).is_some());
+        assert!(interpolate(&text, "calc-size(auto, size * 3)", 0.5, false).is_none());
+        let shallow = "calc-size(calc-size(auto, size / 2), size * 2)";
+        assert!(interpolate(shallow, "calc-size(auto, size * 5)", 0.5, false).is_some());
     }
 
     #[test]

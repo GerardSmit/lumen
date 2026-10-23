@@ -224,7 +224,7 @@ pub(crate) fn fire_beforeunload(ctx: &mut Ctx, document: &Rc<DomRealm>, prompt_s
 
 pub(crate) fn page_transition(ctx: &mut Ctx, document: &Rc<DomRealm>, kind: &str) -> OpResult<()> {
     let event = ctx.new_instance(DomPageTransitionEvent {
-        base: DomEvent::from_init(kind, EventInit::default()), persisted: false,
+        base: DomEvent::from_init(kind, EventInit { bubbles: true, cancelable: true, ..EventInit::default() }), persisted: false,
     });
     let window = ctx.global_object();
     let target = document.document_value(ctx);

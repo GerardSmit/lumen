@@ -8,37 +8,16 @@ pub(crate) struct RowspanRequest {
     pub required: f32,
 }
 
-const SELECTION_LIMIT: usize = 64;
-
-fn encloses(outer: &RowspanRequest, inner: &RowspanRequest) -> bool {
-    outer.start <= inner.start && outer.end >= inner.end
-        && (outer.start != inner.start || outer.end != inner.end)
-}
-
-/// Orders requests so that a cell enclosed by another goes first, cells over
-/// the same rows go tallest first, and otherwise the earlier row goes first.
+/// Orders requests so that a cell enclosed by another goes first (an enclosed
+/// span is strictly shorter), cells over the same rows go tallest first, and
+/// otherwise the earlier row goes first.
 fn order(mut requests: Vec<RowspanRequest>) -> Vec<RowspanRequest> {
-    let key = |a: &RowspanRequest, b: &RowspanRequest| {
-        a.start.cmp(&b.start).then(b.required.total_cmp(&a.required))
-    };
-    if requests.len() > SELECTION_LIMIT {
-        requests.sort_by(key);
-        return requests;
-    }
-    let mut ordered = Vec::with_capacity(requests.len());
-    while !requests.is_empty() {
-        let mut best: Option<usize> = None;
-        for (index, candidate) in requests.iter().enumerate() {
-            if requests.iter().any(|other| encloses(candidate, other)) { continue; }
-            let better = match best {
-                None => true,
-                Some(current) => key(candidate, &requests[current]).is_lt(),
-            };
-            if better { best = Some(index); }
-        }
-        ordered.push(requests.remove(best.unwrap_or(0)));
-    }
-    ordered
+    requests.sort_by(|a, b| {
+        a.end.saturating_sub(a.start).cmp(&b.end.saturating_sub(b.start))
+            .then(a.start.cmp(&b.start))
+            .then(b.required.total_cmp(&a.required))
+    });
+    requests
 }
 
 /// Grows rows so each rowspan request fits. Unconstrained non-empty rows grow

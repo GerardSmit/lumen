@@ -131,7 +131,7 @@ impl IfScope<'_> {
         match registration {
             Some(registration) => registered_properties::compute_value_with_source(&registration.syntax, text,
                 self.context.0, self.context.1, &self.context.2, registration.source_url.as_deref()),
-            None => Some(container_query::collapse_whitespace(text)),
+            None => Some(String::from(text)),
         }
     }
 

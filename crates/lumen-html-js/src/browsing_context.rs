@@ -1699,7 +1699,11 @@ impl BrowsingContext {
         let caller = ctx.invocation_host_realm();
         let origin = metadata_for_realm(ctx, &caller).map(|metadata| metadata_origin(&metadata))
             .ok_or_else(|| OpError::new("InvalidStateError", "Navigation has no initiating document"))?;
-        let parsed = lumen_common::url::parse(input, Some(entry_base_url)).map_err(|_| OpError::new("SyntaxError", "invalid Location URL"))?;
+        let Ok(parsed) = lumen_common::url::parse(input, Some(entry_base_url)) else {
+            let handle = self.realm_handle();
+            return Err(ctx.with_host_realm(&handle, |ctx| crate::error_reporting::dom_exception(ctx, "SyntaxError", "invalid Location URL"))
+                .unwrap_or_else(|_| OpError::new("SyntaxError", "invalid Location URL")));
+        };
         let context = self.history_store().and_then(|store| store.contexts.borrow().get(&self.history_id()).and_then(std::rc::Weak::upgrade));
         if parsed.scheme=="javascript" {
             if let Some(context)=context {

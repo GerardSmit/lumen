@@ -115,6 +115,59 @@ impl MeasuredPath {
     }
 }
 
+/// Flattens every subpath into a polyline; closed subpaths end at their start.
+pub fn flatten_subpaths(parsed: &ParsedSvgPath) -> Option<Vec<Vec<[f32; 2]>>> {
+    let path = parsed.path.as_ref()?;
+    let mut subpaths: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut start = [0.0f32, 0.0];
+    for segment in path.segments() {
+        match segment {
+            PathSegment::MoveTo(point) => {
+                start = [point.x, point.y];
+                subpaths.push(vec![start]);
+            }
+            PathSegment::LineTo(point) => subpaths.last_mut()?.push([point.x, point.y]),
+            PathSegment::QuadTo(control, point) => {
+                let current = subpaths.last_mut()?;
+                let from = *current.last()?;
+                let control = [control.x, control.y];
+                let to = [point.x, point.y];
+                let steps = curve_steps(&[from, control, to]);
+                for step in 1..=steps {
+                    let t = step as f32 / steps as f32;
+                    let u = 1.0 - t;
+                    current.push([
+                        u * u * from[0] + 2.0 * u * t * control[0] + t * t * to[0],
+                        u * u * from[1] + 2.0 * u * t * control[1] + t * t * to[1],
+                    ]);
+                }
+            }
+            PathSegment::CubicTo(first, second, point) => {
+                let current = subpaths.last_mut()?;
+                let from = *current.last()?;
+                let first = [first.x, first.y];
+                let second = [second.x, second.y];
+                let to = [point.x, point.y];
+                let steps = curve_steps(&[from, first, second, to]);
+                for step in 1..=steps {
+                    let t = step as f32 / steps as f32;
+                    let u = 1.0 - t;
+                    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+                    current.push([
+                        a * from[0] + b * first[0] + c * second[0] + d * to[0],
+                        a * from[1] + b * first[1] + c * second[1] + d * to[1],
+                    ]);
+                }
+            }
+            PathSegment::Close => {
+                let current = subpaths.last_mut()?;
+                current.push(start);
+            }
+        }
+    }
+    Some(subpaths)
+}
+
 fn curve_steps(control_polygon: &[[f32; 2]]) -> usize {
     let length: f32 = control_polygon
         .windows(2)

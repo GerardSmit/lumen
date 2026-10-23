@@ -25,7 +25,10 @@ pub(super) fn is_marker(entry: &str) -> bool {
 enum Truth {
     True,
     False,
+    /// Syntax the evaluator does not know: it poisons the whole condition.
     Unknown,
+    /// A known feature the container cannot evaluate; combines like Kleene unknown.
+    Unavailable,
 }
 
 impl Truth {
@@ -38,6 +41,7 @@ impl Truth {
             Self::True => Self::False,
             Self::False => Self::True,
             Self::Unknown => Self::Unknown,
+            Self::Unavailable => Self::Unavailable,
         }
     }
 }
@@ -49,16 +53,44 @@ enum Node {
     Any(Vec<Node>),
     Size(String),
     Style(String),
+    Scroll(String),
     Unknown,
 }
 
+/// The feature family a condition's leaf features belong to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Size,
+    Style,
+    Scroll,
+}
+
 impl Node {
-    fn uses(&self, size: bool) -> bool {
+    /// Bit set of the size features the query reads, see `Feature::bit`.
+    fn size_features(&self) -> u8 {
         match self {
-            Self::Not(inner) => inner.uses(size),
-            Self::All(nodes) | Self::Any(nodes) => nodes.iter().any(|node| node.uses(size)),
-            Self::Size(_) => size,
-            Self::Style(_) => !size,
+            Self::Not(inner) => inner.size_features(),
+            Self::All(nodes) | Self::Any(nodes) => nodes.iter().fold(0, |bits, node| bits | node.size_features()),
+            Self::Size(content) => container_query::pieces(content).map_or(0, |parts| {
+                parts.iter().fold(0, |bits, part| match part {
+                    Piece::Word(word) => {
+                        let base = word.strip_prefix("min-").or_else(|| word.strip_prefix("max-")).unwrap_or(word);
+                        bits | feature(base).map_or(0, Feature::bit)
+                    }
+                    _ => bits,
+                })
+            }),
+            Self::Style(_) | Self::Scroll(_) | Self::Unknown => 0,
+        }
+    }
+
+    fn uses(&self, mode: Mode) -> bool {
+        match self {
+            Self::Not(inner) => inner.uses(mode),
+            Self::All(nodes) | Self::Any(nodes) => nodes.iter().any(|node| node.uses(mode)),
+            Self::Size(_) => mode == Mode::Size,
+            Self::Style(_) => mode == Mode::Style,
+            Self::Scroll(_) => mode == Mode::Scroll,
             Self::Unknown => false,
         }
     }
@@ -69,6 +101,8 @@ pub(super) struct Parsed {
     name: Option<Arc<str>>,
     root: Option<Node>,
     size: bool,
+    scroll: bool,
+    features: u8,
 }
 
 fn parse_conditions(entry: &str) -> Arc<[Parsed]> {
@@ -80,21 +114,23 @@ fn parse_condition(condition: &Condition) -> Parsed {
     let root = if condition.query.is_empty() {
         None
     } else {
-        Some(container_query::tokenize(&condition.query).and_then(|tokens| parse_query(&tokens, false)).unwrap_or(Node::Unknown))
+        Some(container_query::tokenize(&condition.query).and_then(|tokens| parse_query(&tokens, Mode::Size)).unwrap_or(Node::Unknown))
     };
-    let size = root.as_ref().is_some_and(|root| root.uses(true));
-    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size }
+    let size = root.as_ref().is_some_and(|root| root.uses(Mode::Size));
+    let scroll = root.as_ref().is_some_and(|root| root.uses(Mode::Scroll));
+    let features = root.as_ref().map_or(0, Node::size_features);
+    Parsed { name: (!condition.name.is_empty()).then(|| Arc::from(condition.name.as_str())), root, size, scroll, features }
 }
 
-fn parse_query(tokens: &[Token<'_>], style: bool) -> Option<Node> {
+fn parse_query(tokens: &[Token<'_>], mode: Mode) -> Option<Node> {
     let first = tokens.first()?;
     if container_query::keyword(first, "not") {
         if tokens.len() != 2 {
             return Some(Node::Unknown);
         }
-        return Some(Node::Not(Box::new(parse_group(tokens.get(1)?, style)?)));
+        return Some(Node::Not(Box::new(parse_group(tokens.get(1)?, mode)?)));
     }
-    let head = parse_group(first, style)?;
+    let head = parse_group(first, mode)?;
     if tokens.len() == 1 {
         return Some(head);
     }
@@ -107,18 +143,21 @@ fn parse_query(tokens: &[Token<'_>], style: bool) -> Option<Node> {
         if !container_query::keyword(&pair[0], if all { "and" } else { "or" }) {
             return Some(Node::Unknown);
         }
-        nodes.push(parse_group(&pair[1], style)?);
+        nodes.push(parse_group(&pair[1], mode)?);
     }
     Some(if all { Node::All(nodes) } else { Node::Any(nodes) })
 }
 
-fn parse_group(token: &Token<'_>, style: bool) -> Option<Node> {
+fn parse_group(token: &Token<'_>, mode: Mode) -> Option<Node> {
     match token.kind {
-        Kind::Paren => Some(parse_content(&container_query::inner(token, 0), style)),
+        Kind::Paren => Some(parse_content(&container_query::inner(token, 0), mode)),
         Kind::Function => {
             let open = token.text.find('(')?;
-            if !style && token.text[..open].eq_ignore_ascii_case("style") {
-                Some(parse_content(&container_query::inner(token, open), true))
+            let name = &token.text[..open];
+            if mode == Mode::Size && name.eq_ignore_ascii_case("style") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Style))
+            } else if mode == Mode::Size && name.eq_ignore_ascii_case("scroll-state") {
+                Some(parse_content(&container_query::inner(token, open), Mode::Scroll))
             } else {
                 Some(Node::Unknown)
             }
@@ -127,7 +166,7 @@ fn parse_group(token: &Token<'_>, style: bool) -> Option<Node> {
     }
 }
 
-fn parse_content(content: &str, style: bool) -> Node {
+fn parse_content(content: &str, mode: Mode) -> Node {
     if let Some(tokens) = container_query::tokenize(content) {
         let nested = tokens.first().is_some_and(|first| match first.kind {
             Kind::Paren => true,
@@ -136,10 +175,14 @@ fn parse_content(content: &str, style: bool) -> Node {
             Kind::Other => false,
         });
         if nested {
-            return parse_query(&tokens, style).unwrap_or(Node::Unknown);
+            return parse_query(&tokens, mode).unwrap_or(Node::Unknown);
         }
     }
-    if style { Node::Style(content.into()) } else { Node::Size(content.into()) }
+    match mode {
+        Mode::Style => Node::Style(content.into()),
+        Mode::Scroll => Node::Scroll(content.into()),
+        Mode::Size => Node::Size(content.into()),
+    }
 }
 
 struct Subject<'a> {
@@ -158,12 +201,12 @@ pub(super) fn style_query_truth(
     length: &dyn Fn() -> LengthContext,
     declared: &dyn Fn(&str, Option<&str>) -> Option<bool>,
 ) -> Option<bool> {
-    let node = parse_content(content, true);
+    let node = parse_content(content, Mode::Style);
     let subject = Subject { entry: None, custom, length, declared: Some(declared) };
     match eval(&node, &subject) {
         Truth::True => Some(true),
         Truth::False => Some(false),
-        Truth::Unknown => None,
+        Truth::Unknown | Truth::Unavailable => None,
     }
 }
 
@@ -176,7 +219,8 @@ fn eval(node: &Node, subject: &Subject<'_>) -> Truth {
                 match eval(node, subject) {
                     Truth::False => return Truth::False,
                     Truth::Unknown => result = Truth::Unknown,
-                    Truth::True => {}
+                    Truth::Unavailable if result != Truth::Unknown => result = Truth::Unavailable,
+                    Truth::Unavailable | Truth::True => {}
                 }
             }
             result
@@ -187,13 +231,15 @@ fn eval(node: &Node, subject: &Subject<'_>) -> Truth {
                 match eval(node, subject) {
                     Truth::Unknown => return Truth::Unknown,
                     Truth::True => result = Truth::True,
-                    Truth::False => {}
+                    Truth::Unavailable if result == Truth::False => result = Truth::Unavailable,
+                    Truth::Unavailable | Truth::False => {}
                 }
             }
             result
         }
         Node::Size(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_size(content, entry)),
         Node::Style(content) => eval_style(content, subject),
+        Node::Scroll(content) => subject.entry.map_or(Truth::Unknown, |entry| eval_scroll(content, entry)),
         Node::Unknown => Truth::Unknown,
     }
 }
@@ -206,6 +252,12 @@ enum Feature {
     Block,
     Aspect,
     Orientation,
+}
+
+impl Feature {
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
 }
 
 fn feature(name: &str) -> Option<Feature> {
@@ -237,6 +289,108 @@ fn actual(feature: Feature, entry: &Entry) -> Option<f64> {
             let (width, height) = (width?, height?);
             size.then_some(if height >= width { 1.0 } else { 0.0 })
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Sides {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl Sides {
+    const LEFT: Self = Self { left: true, right: false, top: false, bottom: false };
+    const RIGHT: Self = Self { left: false, right: true, top: false, bottom: false };
+    const TOP: Self = Self { left: false, right: false, top: true, bottom: false };
+    const BOTTOM: Self = Self { left: false, right: false, top: false, bottom: true };
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left || other.left,
+            right: self.right || other.right,
+            top: self.top || other.top,
+            bottom: self.bottom || other.bottom,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        (self.left && other.left) || (self.right && other.right) || (self.top && other.top) || (self.bottom && other.bottom)
+    }
+
+    fn any(self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+}
+
+fn inline_sides(entry: &Entry) -> (Sides, Sides) {
+    match (entry.writing_mode, entry.rtl) {
+        (WritingMode::HorizontalTb, false) => (Sides::LEFT, Sides::RIGHT),
+        (WritingMode::HorizontalTb, true) => (Sides::RIGHT, Sides::LEFT),
+        (WritingMode::SidewaysLr, false) => (Sides::BOTTOM, Sides::TOP),
+        (WritingMode::SidewaysLr, true) => (Sides::TOP, Sides::BOTTOM),
+        (_, false) => (Sides::TOP, Sides::BOTTOM),
+        (_, true) => (Sides::BOTTOM, Sides::TOP),
+    }
+}
+
+fn block_sides(entry: &Entry) -> (Sides, Sides) {
+    match entry.writing_mode {
+        WritingMode::HorizontalTb => (Sides::TOP, Sides::BOTTOM),
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => (Sides::RIGHT, Sides::LEFT),
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => (Sides::LEFT, Sides::RIGHT),
+    }
+}
+
+/// The physical sides a `scroll-state()` direction keyword names.
+fn direction_sides(entry: &Entry, keyword: &str) -> Option<Sides> {
+    let (inline_start, inline_end) = inline_sides(entry);
+    let (block_start, block_end) = block_sides(entry);
+    Some(match keyword {
+        "left" => Sides::LEFT,
+        "right" => Sides::RIGHT,
+        "top" => Sides::TOP,
+        "bottom" => Sides::BOTTOM,
+        "x" => Sides::LEFT.union(Sides::RIGHT),
+        "y" => Sides::TOP.union(Sides::BOTTOM),
+        "inline-start" => inline_start,
+        "inline-end" => inline_end,
+        "block-start" => block_start,
+        "block-end" => block_end,
+        "inline" => inline_start.union(inline_end),
+        "block" => block_start.union(block_end),
+        _ => return None,
+    })
+}
+
+fn eval_scroll(content: &str, entry: &Entry) -> Truth {
+    if !entry.scroll_state {
+        return Truth::Unknown;
+    }
+    let Some(content) = expand_vars(content, entry) else {
+        return Truth::Unknown;
+    };
+    let Some(parts) = container_query::pieces(&content) else {
+        return Truth::Unknown;
+    };
+    let (name, value) = match parts.as_slice() {
+        [Piece::Word(name)] => (name.to_ascii_lowercase(), None),
+        [Piece::Word(name), Piece::Colon, Piece::Word(value)] => (name.to_ascii_lowercase(), Some(value.to_ascii_lowercase())),
+        _ => return Truth::Unknown,
+    };
+    match (name.as_str(), value.as_deref()) {
+        ("scrollable", None) => Truth::known(entry.scrollable.any()),
+        ("scrollable", Some("none")) => Truth::known(!entry.scrollable.any()),
+        ("scrollable", Some(keyword)) => direction_sides(entry, keyword).map_or(Truth::Unknown, |sides| Truth::known(entry.scrollable.intersects(sides))),
+        ("scrolled", None) | ("stuck", None) | ("snapped", None) => Truth::False,
+        ("scrolled", Some("none")) | ("stuck", Some("none")) | ("snapped", Some("none")) => Truth::True,
+        ("scrolled", Some(keyword)) => direction_sides(entry, keyword).map_or(Truth::Unknown, |_| Truth::False),
+        ("stuck", Some(keyword)) if !matches!(keyword, "x" | "y" | "inline" | "block") => {
+            direction_sides(entry, keyword).map_or(Truth::Unknown, |_| Truth::False)
+        }
+        ("snapped", Some("x" | "y" | "block" | "inline" | "both")) => Truth::False,
+        _ => Truth::Unknown,
     }
 }
 
@@ -292,7 +446,19 @@ fn expected(feature: Feature, raw: &str, entry: &Entry) -> Option<f64> {
     }
 }
 
+/// `content` with its `var()` references substituted from the container; `None` when one is invalid.
+fn expand_vars<'a>(content: &'a str, entry: &Entry) -> Option<alloc::borrow::Cow<'a, str>> {
+    if !content.contains("var(") {
+        return Some(alloc::borrow::Cow::Borrowed(content));
+    }
+    var_template::expand_variables_in(content, entry.custom.names(), MAX_EXPANDED).map(alloc::borrow::Cow::Owned)
+}
+
 fn eval_size(content: &str, entry: &Entry) -> Truth {
+    let Some(content) = expand_vars(content, entry) else {
+        return Truth::Unknown;
+    };
+    let content = &*content;
     let Some(parts) = container_query::pieces(content) else {
         return Truth::Unknown;
     };
@@ -312,7 +478,7 @@ fn size_boolean(name: &str, entry: &Entry) -> Truth {
         return Truth::Unknown;
     };
     match actual(kind, entry) {
-        None => Truth::Unknown,
+        None => Truth::Unavailable,
         Some(_) if kind == Feature::Orientation => Truth::True,
         Some(value) => Truth::known(value != 0.0),
     }
@@ -350,9 +516,12 @@ fn size_plain(name: &str, rest: &[Piece], entry: &Entry) -> Truth {
         } else {
             return Truth::Unknown;
         };
-        return actual(kind, entry).map_or(Truth::Unknown, |current| Truth::known((current == 1.0) == portrait));
+        return actual(kind, entry).map_or(Truth::Unavailable, |current| Truth::known((current == 1.0) == portrait));
     }
-    let (Some(current), Some(wanted)) = (actual(kind, entry), expected(kind, &value, entry)) else {
+    let Some(current) = actual(kind, entry) else {
+        return Truth::Unavailable;
+    };
+    let Some(wanted) = expected(kind, &value, entry) else {
         return Truth::Unknown;
     };
     compare(current, operator, wanted, kind != Feature::Aspect).map_or(Truth::Unknown, Truth::known)
@@ -391,7 +560,7 @@ fn size_range(operands: &[&String], operators: &[&&str], entry: &Entry) -> Truth
         return Truth::Unknown;
     }
     let Some(current) = actual(kind, entry) else {
-        return Truth::Unknown;
+        return Truth::Unavailable;
     };
     let lengths = kind != Feature::Aspect;
     let mut result = true;
@@ -478,6 +647,9 @@ fn eval_style(content: &str, subject: &Subject<'_>) -> Truth {
             return Truth::Unknown;
         }
         let wanted = strip_important(text[colon + 1..].trim());
+        if super::top_level_split(wanted, b';', usize::MAX).is_none_or(|parts| parts.len() > 1) {
+            return Truth::Unknown;
+        }
         let Some(wanted) = var_template::expand_variables_in(wanted, subject.custom, MAX_EXPANDED) else {
             return match subject.declared {
                 Some(declared) => declared(name, None).map_or(Truth::Unknown, |present| Truth::known(!present)),
@@ -680,12 +852,52 @@ pub struct Entry {
     custom: CustomRef,
     parent_custom: CustomRef,
     color: SourceColor,
+    scroll_state: bool,
+    scrollable: Sides,
+    writing_mode: WritingMode,
+    rtl: bool,
 }
 
 impl Entry {
     fn accepts(&self, condition: &Parsed) -> bool {
         condition.name.as_ref().is_none_or(|name| self.names.iter().any(|candidate| candidate == name))
-            && (!condition.size || self.kind != ContainerType::Normal)
+            && (!condition.size || self.supports_features(condition.features))
+            && (!condition.scroll || self.scroll_state)
+    }
+
+    /// Whether the container contains every axis the size features in `features` read.
+    fn supports_features(&self, features: u8) -> bool {
+        match self.kind {
+            ContainerType::Normal => false,
+            ContainerType::Size => true,
+            ContainerType::InlineSize => {
+                let physical_inline = if self.vertical { Feature::Height } else { Feature::Width };
+                features & !(Feature::Inline.bit() | physical_inline.bit()) == 0
+            }
+        }
+    }
+}
+
+/// A scroll container's offset and signed scroll limits, in CSS pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollGeometry {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ScrollGeometry {
+    fn scrollable(self) -> Sides {
+        const EPSILON: f32 = 0.5;
+        Sides {
+            left: self.x - self.min_x > EPSILON,
+            right: self.max_x - self.x > EPSILON,
+            top: self.y - self.min_y > EPSILON,
+            bottom: self.max_y - self.y > EPSILON,
+        }
     }
 }
 
@@ -705,6 +917,7 @@ pub fn build_oracle(
     document: &Document,
     style_of: &dyn Fn(NodeId) -> Option<Arc<Style>>,
     measured: &dyn Fn(NodeId) -> Option<ContainerUnitContext>,
+    scroll: &dyn Fn(NodeId) -> Option<ScrollGeometry>,
     environment: MediaEnvironment,
     text: Option<&dyn TextShaper>,
 ) -> Oracle {
@@ -731,7 +944,7 @@ pub fn build_oracle(
         };
         let kind = style.container_type;
         let context = if kind == ContainerType::Normal || !style.can_hold_size_containment() { None } else { measured(node) };
-        if kind == ContainerType::Normal && names.is_empty() {
+        if kind == ContainerType::Normal && names.is_empty() && !style.container_scroll_state {
             continue;
         }
         let vertical = style.writing_mode != WritingMode::HorizontalTb;
@@ -758,6 +971,10 @@ pub fn build_oracle(
                 document.composed_parent(node).ok().flatten().and_then(style_of).and_then(|parent| parent.custom.clone()),
             ),
             color: style.current_color_source(),
+            scroll_state: style.container_scroll_state,
+            scrollable: if style.container_scroll_state { scroll(node).map_or_else(Sides::default, ScrollGeometry::scrollable) } else { Sides::default() },
+            writing_mode: style.writing_mode,
+            rtl: style.direction == Direction::Rtl,
         });
     }
     Oracle(entries)
@@ -845,6 +1062,11 @@ impl StyleIndex {
             self.containers.scanned.store(self.rules.len(), Ordering::Relaxed);
         }
         self.containers.present.load(Ordering::Relaxed)
+    }
+
+    /// Whether `node` is a scroll-state query container in the installed oracle.
+    pub fn is_scroll_state_container(&self, node: NodeId) -> bool {
+        self.containers.oracle.borrow().0.get(&node.key()).is_some_and(|entry| entry.scroll_state)
     }
 
     /// Changes whenever `replace_container_oracle` installed different containers.
@@ -1005,12 +1227,16 @@ mod tests {
             custom: CustomRef(None),
             parent_custom: CustomRef(None),
             color: Style::initial().current_color_source(),
+            scroll_state: false,
+            scrollable: Sides::default(),
+            writing_mode: WritingMode::HorizontalTb,
+            rtl: false,
         }
     }
 
     fn truth(query: &str, entry: &Entry) -> Truth {
         let tokens = container_query::tokenize(query).unwrap();
-        let root = parse_query(&tokens, false).unwrap();
+        let root = parse_query(&tokens, Mode::Size).unwrap();
         let length = || entry.length;
         eval(&root, &Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None })
     }
@@ -1033,8 +1259,28 @@ mod tests {
     fn inline_size_containers_leave_the_block_axis_unknown() {
         let inline = entry(ContainerType::InlineSize, false, 100.0, 0.0);
         assert_eq!(truth("(width: 100px)", &inline), Truth::True);
-        assert_eq!(truth("(height)", &inline), Truth::Unknown);
-        assert_eq!(truth("(not (height))", &inline), Truth::Unknown);
+        assert_eq!(truth("(height)", &inline), Truth::Unavailable);
+        assert_eq!(truth("(not (height))", &inline), Truth::Unavailable);
+    }
+
+    #[test]
+    fn scroll_state_features_follow_writing_mode() {
+        let mut container = entry(ContainerType::Normal, false, 0.0, 0.0);
+        container.scroll_state = true;
+        container.scrollable = Sides::RIGHT;
+        let scroll = |query: &str, entry: &Entry| {
+            let tokens = container_query::tokenize(query).unwrap();
+            let root = parse_query(&tokens, Mode::Size).unwrap();
+            let length = || entry.length;
+            eval(&root, &Subject { entry: Some(entry), custom: entry.custom.names(), length: &length, declared: None })
+        };
+        assert_eq!(scroll("scroll-state(scrollable: right)", &container), Truth::True);
+        assert_eq!(scroll("scroll-state(scrollable: inline-end)", &container), Truth::True);
+        assert_eq!(scroll("scroll-state(scrollable: left)", &container), Truth::False);
+        assert_eq!(scroll("scroll-state(scrollable: auto)", &container), Truth::Unknown);
+        container.rtl = true;
+        assert_eq!(scroll("scroll-state(scrollable: inline-end)", &container), Truth::False);
+        assert_eq!(scroll("scroll-state(scrolled: none)", &container), Truth::True);
     }
 
     #[test]

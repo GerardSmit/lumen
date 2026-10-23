@@ -263,7 +263,14 @@ fn serialize_in_parens(token: &Token<'_>, style: bool) -> Option<String> {
             let content = inner(token, open);
             if name.eq_ignore_ascii_case("style") {
                 Some(alloc::format!("style({})", serialize_feature_or_query(&content, true)))
-            } else if name.eq_ignore_ascii_case("scroll-state") || name.eq_ignore_ascii_case("anchored") {
+            } else if name.eq_ignore_ascii_case("scroll-state") {
+                let serialized = serialize_feature_or_query(&content, false);
+                if scroll_state_query_valid(&serialized) {
+                    Some(alloc::format!("scroll-state({serialized})"))
+                } else {
+                    Some(token.text.into())
+                }
+            } else if name.eq_ignore_ascii_case("anchored") {
                 let name = name.to_ascii_lowercase();
                 Some(alloc::format!("{name}({})", serialize_feature_or_query(&content, false)))
             } else {
@@ -272,6 +279,50 @@ fn serialize_in_parens(token: &Token<'_>, style: bool) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether a serialized `scroll-state()` argument consists only of known
+/// scroll-state features, combined without nested functions.
+fn scroll_state_query_valid(serialized: &str) -> bool {
+    let bytes = serialized.as_bytes();
+    let mut start = None;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => {
+                if index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || matches!(bytes[index - 1], b'-' | b'_')) {
+                    return false;
+                }
+                start = Some(index + 1);
+            }
+            b')' => {
+                let Some(from) = start.take() else {
+                    continue;
+                };
+                if !scroll_state_feature_valid(&serialized[from..index]) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    serialized.contains('(') || scroll_state_feature_valid(serialized)
+}
+
+fn scroll_state_feature_valid(feature: &str) -> bool {
+    let (name, value) = match feature.split_once(':') {
+        Some((name, value)) => (name.trim(), Some(value.trim())),
+        None => (feature.trim(), None),
+    };
+    let values: &[&str] = match name.to_ascii_lowercase().as_str() {
+        "scrollable" | "scrolled" => &[
+            "none", "top", "right", "bottom", "left", "x", "y", "block", "inline", "block-start", "block-end",
+            "inline-start", "inline-end",
+        ],
+        "stuck" => &["none", "top", "right", "bottom", "left", "block-start", "block-end", "inline-start", "inline-end"],
+        "snapped" => &["none", "x", "y", "block", "inline", "both"],
+        _ => return false,
+    };
+    value.is_none_or(|value| values.iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
 }
 
 fn serialize_feature_or_query(content: &str, style: bool) -> String {

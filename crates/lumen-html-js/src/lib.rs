@@ -3768,8 +3768,12 @@ impl DomRealm {
         // Each document constructs and dispatches its UI events in its own
         // relevant realm, independent of the original caller's realm.
         let Some(owner)=self.relevant_host_realm(ctx) else {return Ok(());};
-        ctx.with_host_realm(&owner,|ctx|self.focus_with_cause_in_owner(ctx,node,pointer_cause))
-            .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?
+        let result=ctx.with_host_realm(&owner,|ctx|self.focus_with_cause_in_owner(ctx,node,pointer_cause))
+            .map_err(|error|OpError::new("InvalidStateError",error.to_string()))?;
+        if pointer_cause {
+            if let Some(clicked)=node { fragment::set_sequential_start(self,clicked); }
+        }
+        result
     }
 
     fn focus_with_cause_in_owner(
@@ -3826,6 +3830,7 @@ impl DomRealm {
             return Ok(());
         }
         self.focused.set(node);
+        if let Some(node) = node { fragment::set_sequential_start(self, node); }
         self.focus_visible.set(node.filter(|node| {
             self.focus_always_visible(*node)
                 || (!pointer_cause && (self.keyboard_modality.get() || old_was_visible))
@@ -9794,6 +9799,37 @@ event_content_handlers::bind_node_handlers! { DomHtmlElement {
     #[setter(coerce, hint(js(ce_reactions)))]
     fn set_lang(&self, value: &str) -> OpResult<()> {
         self.base.base.set_attribute_core("lang", value)
+    }
+
+    #[getter(name = "focusGroup")]
+    fn focus_group(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        const TOKENS: &[&str] = &[
+            "toolbar", "tablist", "radiogroup", "listbox", "menu", "menubar", "wrap", "nowrap",
+            "inline", "block", "nomemory", "none", "feed", "grid", "itemcontrols",
+            "noitemcontrols", "manual", "rowwrap", "colwrap", "flow", "rowflow", "colflow",
+        ];
+        self.base.base.token_list(ctx, this.0, "focusgroup", "focusgroup", Some(TOKENS))
+    }
+
+    #[setter(name = "focusGroup")]
+    fn set_focus_group(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, value: Value) -> OpResult<()> {
+        let target = ctx.member_get(&this.0, "focusGroup").map_err(OpError::thrown)?;
+        if ctx.object_addr(&target).is_none() {
+            return Err(OpError::type_error("focusGroup forwarding target must be an object"));
+        }
+        ctx.member_try_set(&target, "value", value).map_err(OpError::thrown)?;
+        Ok(())
+    }
+
+    #[getter(name = "focusGroupStart")]
+    fn focus_group_start(&self) -> OpResult<bool> {
+        Ok(self.base.base.get_null_attribute("focusgroupstart")?.is_some())
+    }
+
+    #[setter(name = "focusGroupStart", hint(js(ce_reactions)))]
+    fn set_focus_group_start(&self, value: bool) -> OpResult<()> {
+        if value { self.base.base.set_attribute_core("focusgroupstart", "") }
+        else { self.base.base.remove_attribute_core("focusgroupstart") }
     }
 
     #[getter]

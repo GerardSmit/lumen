@@ -101,6 +101,8 @@ fn run(entry: &str) {
         matches!(&result, lumen::embed::Value::Str(s) if s.as_str()=="Buy milk:"),
         "controlled update failed"
     );
+    eval(&mut runtime, "document.activeElement.blur();");
+    runtime.run_until_idle();
     assert!(!runtime.is_interrupted());
     let font =
         lumen_html_text::FontFace::new(std::sync::Arc::from(lumen_html_text::TEST_FONT_BYTES))

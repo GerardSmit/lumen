@@ -3525,15 +3525,14 @@ pub fn validity_with_view(
             }
             Some(InputValueMode::DefaultOn) if type_name == "radio" => {
                 let group = attribute(document, node, "name").unwrap_or("");
-                let group_required = if group.is_empty() {
-                    required && attribute(document, node, "name").is_none()
+                if group.is_empty() {
+                    required && !checked_by(document, node, |control| view.checkedness(control))
                 } else {
                     radio_group_required(document, node, group)
-                };
-                group_required
-                    && !tree_contains_checked_radio_by(document, node, group, |control| {
-                        view.checkedness(control)
-                    })
+                        && !tree_contains_checked_radio_by(document, node, group, |control| {
+                            view.checkedness(control)
+                        })
+                }
             }
             Some(InputValueMode::Filename) if required => !view.has_selected_files(node),
             Some(InputValueMode::Value)

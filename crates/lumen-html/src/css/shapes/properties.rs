@@ -259,7 +259,7 @@ impl PathValue {
         PathValue { source, bx: self.bx }
     }
 
-    fn effective_box(&self, prop: Prop) -> &'static str {
+    pub(super) fn effective_box(&self, prop: Prop) -> &'static str {
         self.bx.unwrap_or(prop.default_box())
     }
 }

@@ -4354,6 +4354,8 @@ struct Layout<'a> {
     measurement_glyphs: Option<Arc<[crate::paint::Glyph]>>,
     /// One bounded arena; each independent formatting context owns a suffix.
     floats: Vec<(Rect, Float)>,
+    /// Shape-outside float areas by index into `floats`; absent means the margin box.
+    float_shapes: BTreeMap<usize, Arc<css::shape_outside::FloatShape>>,
     // Transient paint provenance: floated subtrees must not move when a later
     // float shortens the still-open in-flow line.
     float_line_moves: BTreeMap<(usize, usize), FloatLineMoves>,
@@ -4640,6 +4642,7 @@ impl<'a> Layout<'a> {
         text_ink_capture: false,
         measurement_glyphs: None,
         floats: Vec::new(),
+        float_shapes: BTreeMap::new(),
         float_line_moves: BTreeMap::new(),
         float_line_storage: 0,
         float_start: 0,
@@ -16074,6 +16077,69 @@ impl Layout<'_> {
         y: f32,
         height: f32,
     ) -> (f32, f32) {
+        if self.float_shapes.is_empty() || frame.vertical {
+            return self.context_box_float_edges_in(frame, start, left, width, y, height);
+        }
+        self.note_float_query(frame, start, y);
+        float_edges(
+            self.floats[start..].iter().enumerate().map(|(offset, (rect, side))| {
+                let rect = self.float_rect(frame, *rect);
+                (self.shaped_float_rect(start + offset, rect, *side, y, height), *side)
+            }),
+            left,
+            width,
+            y,
+            height,
+        )
+    }
+    /// Registers the shape-outside area of the float just pushed onto `floats`.
+    fn record_float_shape(&mut self, style: Option<&Style>, rect: Rect, containing_width: f32) {
+        let index = self.floats.len() - 1;
+        self.float_shapes.remove(&index);
+        let Some(style) = style else { return };
+        let boxes = css::shape_outside::FloatBox {
+            width: rect.width,
+            height: rect.height,
+            margin: style.margin_sides,
+            border: border_widths(style),
+            padding: style.padding_sides,
+        };
+        let images = self.images;
+        let threshold = css::shape_outside::image_threshold(style);
+        let raster = |computed: &str, reference: (f32, f32, f32, f32)| {
+            let url = css::shape_outside::image_url(computed)?;
+            let image = match images?.resolve(&url).materialize() {
+                ImageState::Ready(image) if image.is_valid() => image,
+                _ => return None,
+            };
+            css::shape_outside::raster_rows(image.width, image.height, &image.pixels, threshold, reference)
+        };
+        if let Some(shape) = css::shape_outside::float_shape(style, &boxes, containing_width, raster) {
+            self.float_shapes.insert(index, Arc::new(shape));
+        }
+    }
+    /// The float's `shape-outside` area as seen by a line band: the margin box
+    /// narrowed to the shape's extent, or empty when the band misses the shape.
+    fn shaped_float_rect(&self, index: usize, rect: Rect, side: Float, y: f32, height: f32) -> Rect {
+        let Some(shape) = self.float_shapes.get(&index) else { return rect };
+        let left = side == Float::Left;
+        match shape.band_edge(left, y - rect.y, y + height - rect.y) {
+            Some(edge) if left => Rect { width: edge, ..rect },
+            Some(edge) => Rect { x: rect.x + edge, width: (rect.width - edge).max(0.0), ..rect },
+            None => Rect { height: 0.0, ..rect },
+        }
+    }
+    /// Margin-box float edges for boxes that avoid floats; shapes only
+    /// affect line boxes.
+    fn context_box_float_edges_in(
+        &self,
+        frame: FloatFrame,
+        start: usize,
+        left: f32,
+        width: f32,
+        y: f32,
+        height: f32,
+    ) -> (f32, f32) {
         self.note_float_query(frame, start, y);
         float_edges(
             self.floats[start..]
@@ -16366,7 +16432,7 @@ fn initial_margin_top(&self,id:NodeId,parent:&Style,style:&Style,available:f32,
             // block anchor; they are not added again at a float's inner edge.
             let outer_left=css::typed_numeric::computed_f32(f64::from(left)+f64::from(start_margin.min(0.0)));
             let outer_width=css::typed_numeric::computed_f32(f64::from(available)-f64::from(start_margin.min(0.0))-f64::from(end_margin.min(0.0)));
-            let (float_edge,float_space)=self.context_float_edges_in(frame,start,outer_left,outer_width,border_top,height.max(f32::MIN_POSITIVE));
+            let (float_edge,float_space)=self.context_box_float_edges_in(frame,start,outer_left,outer_width,border_top,height.max(f32::MIN_POSITIVE));
             let edge=float_edge.max(css::typed_numeric::computed_f32(f64::from(left)+f64::from(if auto_inline||parent.used_direction() ==Direction::Ltr{start_margin}else{start_margin.min(0.0)})));
             let end=css::typed_numeric::computed_f32(f64::from(float_edge)+f64::from(float_space)).min(css::typed_numeric::computed_f32(f64::from(left)+f64::from(available)-f64::from(if auto_inline||parent.used_direction() ==Direction::Rtl{end_margin}else{end_margin.min(0.0)})));
             let border_space=(end-edge).max(0.0);
@@ -18759,7 +18825,11 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 if axes.percentage(&group.style, false, 0) {
                     let resolved = axes.resolve(&group.style, original_width, Some(target), self.container_units.get());
                     if let Some(height) = axes.preferred(&resolved, false) {
-                        grow_table_row_span(&mut reference, group.first_row..group.end_row,
+                        let constrained_rows: Vec<bool> = rows[group.first_row..group.end_row].iter()
+                            .map(|row| axes.preferred(&row.style, false).is_some() || axes.percentage(&row.style, false, 0))
+                            .collect();
+                        crate::table_rowspan::distribute_group_height(&mut reference[group.first_row..group.end_row],
+                            &constrained_rows, 0..group.end_row - group.first_row,
                             axes.content_dimension(&resolved, height, false), spacing_y);
                     }
                 }
@@ -20009,7 +20079,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 }
             }};
             let resolve = |horizontal| {
-                css::resolve_grid_placement(
+                css::resolve_grid_placement_led(
                     if horizontal {
                         computed.grid_column
                     } else {
@@ -20028,6 +20098,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     },
                     style.grid_areas.as_deref().unwrap_or(&[]),
                     horizontal,
+                    style.grid_lead[usize::from(!horizontal)],
                 )
                 .unwrap_or(css::GridPlacement {
                     start: None,
@@ -21214,7 +21285,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 {
                     continue;
                 }
-                let placement = css::resolve_grid_placement(
+                let placement = css::resolve_grid_placement_led(
                     if row {
                         computed.grid_row
                     } else {
@@ -21229,6 +21300,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     explicit.len(),
                     style.grid_areas.as_deref().unwrap_or(&[]),
                     !row,
+                    style.grid_lead[usize::from(row)],
                 )
                 .unwrap_or(css::GridPlacement {
                     start: None,
@@ -21310,7 +21382,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 let (tracks, names) = expanded.as_ref().unwrap();
                 count = tracks.len().max(1);
                 for item in &mut measurements {
-                    item.0 = css::resolve_grid_placement(
+                    item.0 = css::resolve_grid_placement_led(
                         if row {
                             item.6.grid_row
                         } else {
@@ -21325,6 +21397,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         tracks.len(),
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         !row,
+                        style.grid_lead[usize::from(row)],
                     )
                     .unwrap_or(css::GridPlacement {
                         start: None,
@@ -21968,25 +22041,27 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     span: area.rows,
                 };
             }
-            child.grid_column = css::resolve_grid_placement(
+            child.grid_column = css::resolve_grid_placement_led(
                 child.grid_column,
                 child.grid_column_spec.as_deref(),
                 column_names,
                 explicit_columns,
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 true,
+                style.grid_lead[0],
             )
             .unwrap_or(css::GridPlacement {
                 start: None,
                 span: 1,
             });
-            child.grid_row = css::resolve_grid_placement(
+            child.grid_row = css::resolve_grid_placement_led(
                 child.grid_row,
                 child.grid_row_spec.as_deref(),
                 row_names,
                 explicit_rows,
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 false,
+                style.grid_lead[1],
             )
             .unwrap_or(css::GridPlacement {
                 start: None,
@@ -25285,6 +25360,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 areas,
                 true,
                 columns,
+                style.grid_lead[0],
             );
             let row_lines = css::absolute_grid_lines(
                 child_style.grid_row,
@@ -25294,6 +25370,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 areas,
                 false,
                 rows,
+                style.grid_lead[1],
             );
             let grid_is_containing_block = if child_style.position == Position::Fixed {
                 establishes_fixed_containing_block(style)
@@ -26495,8 +26572,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             let mut cursor = start;
             let mut actual_cross = 0.0f32;
-            let last_index = items.len() - 1;
-            for (item_index, item) in items.iter_mut().enumerate() {
+            for item in items.iter_mut() {
                 cursor += if item.style.margin_auto[main_start] {
                     auto_margin
                 } else {
@@ -26563,20 +26639,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     .map_or(0, |geometry| geometry.hits.len());
                 let local=self.content_overflow_origin(x,y);
                 let child_local=if row {(local.0+f64::from(main_pos),local.1)}else{(local.0,local.1+f64::from(main_pos))};
-                let end_aligned = !reverse
-                    && item_index == last_index
-                    && (main_pos + item.main - available).abs() < 0.01;
-                let main_origin = if end_aligned {
-                    (if row { x + available } else { y + available }) - item.main
-                } else if row {
-                    x + main_pos
-                } else {
-                    y + main_pos
-                };
                 let (child_x, child_y) = if row {
-                    (main_origin, y)
+                    (x + main_pos, y)
                 } else {
-                    (x, main_origin)
+                    (x, y + main_pos)
                 };
                 let saved_baselines = self.flow_baselines.take();
                 let saved_content = self.flow_content_ranges.take();
@@ -29022,14 +29088,6 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             Self::paragraph_output_push(paragraph, &mut output, ' ')?;
                         }
                     }
-                } else if output.is_empty()
-                    && matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
-                    && paragraph.text.ends_with([' ', '\t'])
-                    && paragraph.spans.last().is_some_and(|span| span.style.white_space == WhiteSpace::NoWrap)
-                {
-                    // The collapsed space still offers the wrapping box's break opportunity
-                    // after a preceding no-wrap box's trailing space.
-                    Self::paragraph_output_push(paragraph, &mut output, '\u{200b}')?;
                 }
                 paragraph.collapse_space = true;
             } else {
@@ -37806,6 +37864,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         if let Some(saved) = inherited_decorations { self.decorations = saved; }
         if isolated || result.is_err() {
             self.floats.truncate(floats_before);
+            drop(self.float_shapes.split_off(&floats_before));
         }
         self.float_start = saved_float_start;
         self.float_offset = saved_float_offset;
@@ -38380,7 +38439,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         ));
                     }
                 }
-                if had_definite_width && style.display.is_table() {
+                if had_definite_width && style.display.is_table() && !style.table_fixed {
                     // A table is never narrower than its min-content width.
                     let mut measured = style.clone();
                     measured.width = None;
@@ -41368,6 +41427,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     (block_origin+if GridAxes::new(&style).reverse_block {-block_delta-f64::from(outer_width)}else{block_delta},local_content_y+inline_local)
                 }else{(local_content_x+inline_local,self.local_cursor(cursor)+block_delta)};
                 self.pending_overflow_placement=Some(local_float);self.pending_overflow_moves=true;
+                let shape_style = (!vertical_block_flow && css::shape_outside::applies(&floated)).then(|| floated.clone());
                 let height = self.box_for(
                     current,
                     &style,
@@ -41432,6 +41492,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     },
                     side,
                 ));
+                self.record_float_shape(shape_style.as_ref(), rect, inline_extent);
                 self.commit_encountered_float(frame, float_start, left, inline_extent,
                     block_cursor, inline_height.max(self.line_height(&style)), inline_width,
                     &mut line_start, old_line_left, FlowContentRanges {

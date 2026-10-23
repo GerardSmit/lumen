@@ -716,7 +716,14 @@ impl NumericExpression {
         }
         match self {
             Self::Value(_)|Self::Identifier(_)=>{},
-            Self::Calc(value)=>value.simplify_absolute_units(),
+            Self::Calc(value)=>{
+                value.simplify_absolute_units();
+                if let Self::Value(number)=&mut **value {
+                    if let Some((unit,factor))=number.unit.canonical_unit_and_factor() {
+                        *number=NumericValue{value:number.value*factor,unit};
+                    }
+                }
+            },
             Self::Negate(value)=>{
                 value.simplify_absolute_units();
                 if let Some(mut value)=value.single_numeric_value(){value.value=-value.value;*self=Self::Value(value);}
@@ -832,6 +839,34 @@ impl NumericExpression {
                     if scalar.unit==NumericUnit::Number&&!scalar.value.is_finite()&&dimension.unit!=NumericUnit::Number{
                         if let Some((unit,factor))=dimension.unit.canonical_unit_and_factor(){
                             *self=Self::Value(NumericValue{value:scalar.value*dimension.value*factor,unit});
+                            return;
+                        }
+                    }
+                }
+                if values.len()>1 {
+                    let sum_at=values.iter().position(|value|{
+                        let inner=if let Self::Calc(inner)=value{&**inner}else{value};
+                        matches!(inner,Self::Sum(terms) if terms.len()>1&&terms.iter().all(|term|term.single_numeric_value().is_some_and(|value|!value.unit.is_function_placeholder())))
+                    });
+                    if let Some(sum_at)=sum_at {
+                        let mut scalar=1.0;
+                        let all_scalars=values.iter().enumerate().filter(|(at,_)|*at!=sum_at).all(|(_,value)|{
+                            let(number,inverse)=match value{Self::Invert(inner)=>(canonical(inner),true),_=>(canonical(value),false)};
+                            match number.filter(|number|number.unit==NumericUnit::Number&&number.value.is_finite()&&number.value!=0.0) {
+                                Some(number)=>{scalar*=if inverse{1.0/number.value}else{number.value};true}
+                                None=>false,
+                            }
+                        });
+                        if all_scalars {
+                            let sum=values.swap_remove(sum_at);
+                            let inner=if let Self::Calc(inner)=sum{*inner}else{sum};
+                            if let Self::Sum(mut terms)=inner {
+                                for term in terms.iter_mut() {
+                                    if let Some(mut value)=term.single_numeric_value(){value.value*=scalar;*term=Self::Value(value);}
+                                }
+                                *self=Self::Sum(terms);
+                                self.simplify_absolute_units();
+                            }
                             return;
                         }
                     }
@@ -1995,6 +2030,18 @@ impl NumericUnit {
             Self::Dpi | Self::Dpcm | Self::Dppx => NumericDimension::Resolution,
             Self::Fr => NumericDimension::Flex,
         }
+    }
+
+    /// Units css/anchor.rs substitutes for unresolved `anchor()` and
+    /// `anchor-size()` calls; a scalar is never distributed over such terms.
+    pub const fn is_function_placeholder(self) -> bool {
+        matches!(
+            self,
+            Self::Svw | Self::Svh | Self::Svi | Self::Svb | Self::Svmin | Self::Svmax
+                | Self::Lvw | Self::Lvh | Self::Lvi | Self::Lvb | Self::Lvmin | Self::Lvmax
+                | Self::Dvw | Self::Dvh | Self::Dvi | Self::Dvb | Self::Dvmin | Self::Dvmax
+                | Self::Cqw | Self::Cqh | Self::Cqi | Self::Cqb | Self::Cqmin | Self::Cqmax
+        )
     }
 
     /// Return a context-independent canonical unit and scale factor, if one

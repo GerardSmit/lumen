@@ -1,6 +1,4 @@
-use super::Style;
-
-const WIDTH_SLOT: usize = 3;
+use super::{Style, WIDTH_SLOT};
 
 impl Style {
     /// A column group's width is the default width of each column it contains.

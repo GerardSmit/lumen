@@ -660,7 +660,10 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
                     let tokens = components(layer)?;
                     Some(match tokens.as_slice() {
                         [a, b] if a.eq_ignore_ascii_case("text") && b.eq_ignore_ascii_case("border-area") => String::from("border-area text"),
-                        _ => tokens.join(" ").to_ascii_lowercase(),
+                        _ => {
+                            let joined = tokens.join(" ");
+                            if joined.contains('(') { joined } else { joined.to_ascii_lowercase() }
+                        }
                     })
                 }).collect();
                 Some(layers?.join(", "))
@@ -670,7 +673,7 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             "translate"|"rotate"|"scale"=>super::individual_transforms::specified(match name.as_ref(){"translate"=>239,"rotate"=>240,_=>241},raw),
             "font-size-adjust" => super::serialize_declared_font_size_adjust(raw),
             "container-type" => parsed.iter().find_map(|declaration| match declaration.value {
-                Value::ContainerType(value) => Some(value.as_str().into()), _ => None,
+                Value::ContainerType(value, scroll_state) => Some(value.serialize(scroll_state)), _ => None,
             }),
             "animation-name" | "animation-duration" | "animation-delay-start" | "animation-delay-end"
             | "animation-iteration-count" | "animation-direction" | "animation-fill-mode" | "animation-play-state"
@@ -1069,7 +1072,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         Value::TextUnderlinePosition(value) => value.serialize(),
         Value::DecorationLength(_,value)=>value.serialize(),
         Value::FontSizeKeyword(value) => value.as_str().into(),
-        Value::ContainerType(value) => value.as_str().into(),
+        Value::ContainerType(value, scroll_state) => value.serialize(*scroll_state),
         Value::ColumnSpan(value)=>value.serialize(),
         Value::ExtraRaw(slot,raw)=>super::extra_props::serialize_specified(*slot,raw)?,
         Value::BoxDecorationBreak(value)=>value.serialize(),
@@ -1234,7 +1237,10 @@ impl DeclarationBlock {
             let (raw, important) = important_value(raw);
             if keyframes && (important || name.as_ref() == "animation"
                 || name.starts_with("animation-") && !matches!(name.as_ref(),
-                    "animation-timing-function" | "animation-composition")) {
+                    "animation-timing-function" | "animation-composition")
+                || name.as_ref() == "transition" || name.starts_with("transition-")
+                || name.as_ref() == "interpolate-size"
+                || matches!(name.as_ref(), "container" | "container-name" | "container-type")) {
                 continue;
             }
             let Some(entries) = expansion(name, raw, important)? else {
@@ -1758,6 +1764,23 @@ const SHORTHANDS: &[&str] = &[
     "corner-inline-end-shape",
     "corner-block-start-shape",
     "corner-block-end-shape",
+    "corner",
+    "corner-top-left",
+    "corner-top-right",
+    "corner-bottom-right",
+    "corner-bottom-left",
+    "corner-start-start",
+    "corner-start-end",
+    "corner-end-start",
+    "corner-end-end",
+    "corner-top",
+    "corner-right",
+    "corner-bottom",
+    "corner-left",
+    "corner-block-start",
+    "corner-block-end",
+    "corner-inline-start",
+    "corner-inline-end",
     "list-style",
     "overflow",
 ];

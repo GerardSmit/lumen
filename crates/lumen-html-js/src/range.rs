@@ -167,6 +167,20 @@ impl RangeData {
     }
 }
 
+impl RangeData {
+    pub(crate) fn start_point(&self) -> Boundary {
+        self.start.get()
+    }
+}
+
+/// A collapsed live range at the start of `node`. Removing `node` or any
+/// ancestor moves it to the position the removed subtree occupied.
+pub(crate) fn live_point_at(realm: &Rc<DomRealm>, node: NodeId) -> Rc<RangeData> {
+    let data = RangeData::new(node, realm);
+    realm.ranges.register(&data);
+    data
+}
+
 pub(crate) struct RangeRegistry {
     ranges: RefCell<Vec<std::rc::Weak<RangeData>>>,
     static_ranges: RefCell<Vec<std::rc::Weak<StaticRangeData>>>,

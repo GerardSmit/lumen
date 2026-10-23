@@ -460,6 +460,27 @@ fn style_values_from_text(
     css_text: &str,
     parse_multiple: bool,
 ) -> OpResult<Vec<Value>> {
+    style_values_from_source(ctx, property, css_text, parse_multiple, false)
+}
+
+/// Text read back from a declaration or a computed value is valid by
+/// construction, so an out-of-range literal there is a range-clamped calculation.
+fn style_values_from_declared(
+    ctx: &mut Ctx,
+    property: &str,
+    css_text: &str,
+    parse_multiple: bool,
+) -> OpResult<Vec<Value>> {
+    style_values_from_source(ctx, property, css_text, parse_multiple, true)
+}
+
+fn style_values_from_source(
+    ctx: &mut Ctx,
+    property: &str,
+    css_text: &str,
+    parse_multiple: bool,
+    declared: bool,
+) -> OpResult<Vec<Value>> {
     if css_text.len() > MAX_UNPARSED_BYTES {
         return Err(OpError::type_error(
             "CSS text exceeds the Typed OM component-value limit",
@@ -483,7 +504,7 @@ fn style_values_from_text(
     }
     let range_clamped;
     let css_text = if !css::supports_declaration(&property, css_text) && !css_text.trim_start().starts_with("calc(")
-        && !is_plain_negative_literal(css_text)
+        && (declared || !is_plain_negative_literal(css_text))
         && css::supports_declaration(&property, &format!("calc({})", css_text.trim())) {
         range_clamped = format!("calc({})", css_text.trim());
         range_clamped.as_str()
@@ -504,12 +525,12 @@ fn style_values_from_text(
 
     let iterations = css::typed_numeric::property_value_iterations(&property, css_text)
         .ok_or_else(|| OpError::type_error("CSS value could not be subdivided"))?;
+    let multiple_iterations = iterations.len() > 1;
     let iterations = if parse_multiple {
         iterations
     } else {
         iterations.into_iter().take(1).collect()
     };
-    let multiple_iterations = iterations.len() > 1;
     let mut values = Vec::with_capacity(iterations.len());
     for iteration in iterations {
         values.push(style_value_from_iteration(ctx, &property, &iteration)?);
@@ -593,7 +614,25 @@ fn named_color_keyword(property: &str, keyword: &str) -> bool {
     !keyword.eq_ignore_ascii_case("currentcolor") && css::supports_declaration("color", keyword) && css::supports_declaration(property, "#000")
 }
 
+/// A size pair whose height is `auto` reifies as its width alone.
+fn size_without_auto_height<'a>(property: &str, css_text: &'a str) -> Option<&'a str> {
+    if !matches!(property, "background-size" | "mask-size") {
+        return None;
+    }
+    let text = css_text.trim();
+    if css::top_level_component_count(text)? != 2 {
+        return None;
+    }
+    let split = text.len().checked_sub("auto".len())?;
+    let head = text.get(..split)?;
+    let tail = text.get(split..)?;
+    (tail.eq_ignore_ascii_case("auto") && head.ends_with(char::is_whitespace)).then(|| head.trim_end())
+}
+
 fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> OpResult<Value> {
+    if let Some(width) = size_without_auto_height(property, css_text) {
+        return style_value_from_iteration(ctx, property, width);
+    }
     if let Some(longhand) = pair_shorthand_longhand(property, css_text) {
         return style_value_from_iteration(ctx, &longhand, css_text);
     }
@@ -604,8 +643,11 @@ fn style_value_from_iteration(ctx: &mut Ctx, property: &str, css_text: &str) -> 
         }));
     }
     if css::declaration_block::is_shorthand(property) {
+        let single_keyword = |keyword: &str| property == "background-repeat"
+            && matches!(keyword, "repeat-x" | "repeat-y" | "repeat" | "space" | "round" | "no-repeat");
         if let Some(keyword)=css_identifier_value(css_text.trim()).filter(|keyword|
-            matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")) {
+            matches!(keyword.to_ascii_lowercase().as_str(),"initial"|"inherit"|"unset"|"revert"|"revert-layer")
+                || single_keyword(&keyword.to_ascii_lowercase())) {
             return Ok(ctx.new_instance(keyword_value(keyword)));
         }
         return Ok(ctx.new_instance(DomCssStyleValue {
@@ -2076,7 +2118,7 @@ impl StyleMapSnapshot {
     fn values(&self,ctx:&mut Ctx,property:&str)->OpResult<Vec<Value>> {
         match self {
             Self::Inline(block)=>match block.value(property) {
-                Some((text,_))=>style_values_from_text(ctx,property,&text,true),
+                Some((text,_))=>style_values_from_declared(ctx,property,&text,true),
                 None=>Ok(Vec::new()),
             },
             Self::Computed(None)=>Ok(Vec::new()),
@@ -2131,10 +2173,19 @@ fn property_map_text(
         }
         Ok(None)
     } else if map.rule_style.is_some() {
-        Ok(map.inline_block(ctx)?.value(property).map(|(value, _)| value))
+        let block = map.inline_block(ctx)?;
+        let text = block.value(property).map(|(value, _)| value);
+        Ok(match text.as_deref().and_then(|text| pair_shorthand_longhand(property, text)) {
+            Some(longhand) => block.value(&longhand).map(|(value, _)| value).or(text),
+            None => text,
+        })
     } else {
         let (realm,node)=map.realm.resolve_adopted_node(map.node);
-        Ok(inline_property_value(&realm, node, property)?.map(|(value, _)| value))
+        let text = inline_property_value(&realm, node, property)?.map(|(value, _)| value);
+        match text.as_deref().and_then(|text| pair_shorthand_longhand(property, text)) {
+            Some(longhand) => Ok(inline_property_value(&realm, node, &longhand)?.map(|(value, _)| value).or(text)),
+            None => Ok(text),
+        }
     }
 }
 
@@ -2191,7 +2242,7 @@ pub(crate) fn registered_style_values(ctx: &mut Ctx, property: &str, text: &str,
         }
         return Ok(values);
     }
-    style_values_from_text(ctx, property, text, multiple)
+    style_values_from_declared(ctx, property, text, multiple)
 }
 
 fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
@@ -2206,7 +2257,7 @@ fn computed_map_values(ctx: &mut Ctx, map: &DomStylePropertyMapReadOnly,
     if computed_unsupported(property) {
         return Ok(vec![ctx.new_instance(DomCssStyleValue { serialized_value: RefCell::new(text.trim().to_owned()) })]);
     }
-    style_values_from_text(ctx, property, text, multiple)
+    style_values_from_declared(ctx, property, text, multiple)
 }
 
 fn value_array(ctx: &mut Ctx, values: impl IntoIterator<Item = Value>) -> OpResult<Value> {
@@ -2224,7 +2275,7 @@ impl DomStylePropertyMapReadOnly {
         let value=property_map_text(ctx,self,&property)?;
         let values=match value {
             Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,false)?,
-            Some(text)=>style_values_from_text(ctx,&property,&text,false)?,
+            Some(text)=>style_values_from_declared(ctx,&property,&text,false)?,
             None=>Vec::new(),
         };
         Ok(values.into_iter().next().unwrap_or(Value::Undefined))
@@ -2235,7 +2286,7 @@ impl DomStylePropertyMapReadOnly {
         let value=property_map_text(ctx,self,&property)?;
         let values=match value {
             Some(text) if self.computed=>computed_map_values(ctx,self,&property,&text,true)?,
-            Some(text)=>style_values_from_text(ctx,&property,&text,true)?,
+            Some(text)=>style_values_from_declared(ctx,&property,&text,true)?,
             None=>Vec::new(),
         };
         value_array(ctx,values)
@@ -2295,7 +2346,8 @@ fn style_map_value_text(ctx: &mut Ctx, property: &str, value: &Value) -> OpResul
             return Ok(text);
         }
         let wrapped = format!("calc({text})");
-        if !is_math && css::supports_declaration(property, &wrapped) {
+        let in_range_sample = css::typed_numeric::serialize_numeric_value(1.0, unit);
+        if !is_math && css::supports_declaration(property, &in_range_sample) && css::supports_declaration(property, &wrapped) {
             return Ok(wrapped);
         }
         return Err(invalid());
@@ -2362,6 +2414,9 @@ impl DomStylePropertyMap {
         }
         let appended = texts.join(", ");
         let existing = self.base.inline_block(ctx)?.value(&property).map(|(text, _)| text);
+        if existing.as_deref().is_some_and(|text| text.trim().is_empty()) {
+            return Err(OpError::type_error("a var() reference cannot be combined with other values"));
+        }
         let text = match existing.filter(|text| !text.trim().is_empty()) {
             Some(existing) => {
                 if text_has_variable(&existing) || text_has_variable(&appended) {
@@ -6567,7 +6622,7 @@ impl DomCssRule {
                 return Ok(css::media_query_text::serialize_list(prelude.get("@media".len()..).unwrap_or_default()));
             }
             let condition = prelude.get("@supports".len()..).unwrap_or_default();
-            Ok(condition.trim().to_owned())
+            Ok(css::at_rule_supports::serialize_condition(condition.trim()))
         })
     }
 
@@ -8198,7 +8253,7 @@ mod tests {
             check(keys.every((name,index)=>index===0||category(keys[index-1])<category(name)||category(keys[index-1])===category(name)&&keys[index-1]<name),'ordering');
             const itemIndex=keys.indexOf('--items');check(values[itemIndex].length===2&&values[itemIndex][1].value===2,'registered repeated reification');
             const durationIndex=keys.indexOf('transition-duration');check(values[durationIndex].length===2&&values[durationIndex][1].value===2,'ordinary list reification');
-            target.style.setProperty('--豈','BMP');target.style.setProperty('--💩','nonBMP');const unicodeKeys=Array.from(map.keys());check(unicodeKeys.indexOf('--豈')<unicodeKeys.indexOf('--💩'),'modern code-point ordering');
+            target.style.setProperty('--豈','BMP');target.style.setProperty('--💩','nonBMP');const unicodeKeys=Array.from(map.keys());check(unicodeKeys.indexOf('--💩')<unicodeKeys.indexOf('--豈'),'UTF-16 code unit ordering');
             const receiver={};let called=0;map.forEach(function(items,name,owner){check(this===receiver&&owner===map&&Array.isArray(items),'callback');called++},receiver);check(called===map.size,'callback count');
             const oldItems=entries[itemIndex][1];document.getElementById('registry').textContent="@property --items {syntax:'<number>';inherits:false;initial-value:7}";
             check(map.get('--items').unit==='number'&&map.get('--items').value===7&&oldItems[1].unit==='px'&&oldItems[1].value===2,'new registry and frozen earlier values');

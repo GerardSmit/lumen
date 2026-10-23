@@ -1,7 +1,7 @@
 (function () {
 'use strict';
 const g = globalThis;
-if (typeof g.TextTrack === 'function' || typeof g.EventTarget !== 'function') return;
+if (typeof g.TextTrack === 'function' || typeof g.EventTarget !== 'function' || typeof g.HTMLMediaElement !== 'function') return;
 const TOKEN = {};
 const slots = new WeakMap();
 const slot = (o) => slots.get(o);
@@ -116,6 +116,12 @@ class TextTrackCue extends EventTarget {
         super();
     }
 }
+function invalidateCues(cue) {
+    const track = slot(cue).track;
+    if (track) {
+        slot(track).sorted = null;
+    }
+}
 function initCue(cue, start, end, text) {
     slots.set(cue, {
         self: cue,
@@ -149,9 +155,9 @@ define(TextTrackCue.prototype, {
     get id() { return slot(this).id; },
     set id(v) { slot(this).id = String(v); },
     get startTime() { return slot(this).start; },
-    set startTime(v) { slot(this).start = finiteNumber(v); },
+    set startTime(v) { slot(this).start = finiteNumber(v); invalidateCues(this); },
     get endTime() { return slot(this).end; },
-    set endTime(v) { slot(this).end = endNumber(v); },
+    set endTime(v) { slot(this).end = endNumber(v); invalidateCues(this); },
     get pauseOnExit() { return slot(this).pauseOnExit; },
     set pauseOnExit(v) { slot(this).pauseOnExit = Boolean(v); },
 });
@@ -278,10 +284,12 @@ class TextTrack extends EventTarget {
         if (cs.track) {
             const old = slot(cs.track);
             old.cues.splice(old.cues.indexOf(cue), 1);
+            old.sorted = null;
         }
         cs.track = this;
         cs.order = ++s.counter;
         s.cues.push(cue);
+        s.sorted = null;
     }
     removeCue(cue) {
         if (!(cue instanceof TextTrackCue)) {
@@ -293,17 +301,21 @@ class TextTrack extends EventTarget {
             throw new DOMException('The cue is not listed in this track.', 'NotFoundError');
         }
         s.cues.splice(index, 1);
+        s.sorted = null;
         slot(cue).track = null;
     }
 }
 function sortedCues(s) {
-    return s.cues
-        .slice()
-        .sort((a, b) => {
-            const x = slot(a);
-            const y = slot(b);
-            return x.start - y.start || y.end - x.end || x.order - y.order;
-        });
+    if (!s.sorted) {
+        s.sorted = s.cues
+            .slice()
+            .sort((a, b) => {
+                const x = slot(a);
+                const y = slot(b);
+                return x.start - y.start || y.end - x.end || x.order - y.order;
+            });
+    }
+    return s.sorted;
 }
 function activeCues(s) {
     const media = s.media();
@@ -344,7 +356,7 @@ publish('TextTrack', TextTrack);
 function newTrack(init) {
     const track = new TextTrack(TOKEN);
     const s = Object.assign(
-        { self: track, handlers: {}, listening: {}, mode: 'disabled', cues: [], counter: 0 },
+        { self: track, handlers: {}, listening: {}, mode: 'disabled', cues: [], counter: 0, sorted: null },
         init,
     );
     s.cuesList = makeCueList(() => sortedCues(s));

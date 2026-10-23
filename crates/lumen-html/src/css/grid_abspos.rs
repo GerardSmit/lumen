@@ -25,6 +25,7 @@ pub fn absolute_grid_lines(
     areas: &[GridArea],
     horizontal: bool,
     track_count: usize,
+    lead: usize,
 ) -> AbsoluteGridLines {
     let (start, end) = match raw {
         None => (fallback.start, fallback.start.map(|start| start.saturating_add(fallback.span))),
@@ -32,16 +33,18 @@ pub fn absolute_grid_lines(
             let mut parts = raw.split('/');
             let first = parts.next().unwrap_or("auto");
             let second = parts.next().unwrap_or("auto");
-            let parse = |raw: &str, end: bool| parse_grid_line_reference(raw, end, names, explicit, areas, horizontal);
+            let parse = |raw: &str, end: bool| parse_grid_line_reference_signed(raw, end, names, explicit, areas, horizontal, lead);
             let (Some((start, start_span, start_is_span)), Some((end, end_span, end_is_span))) =
                 (parse(first, false), parse(second, true))
             else {
                 return AbsoluteGridLines::default();
             };
+            let line = |line: Option<i64>| line.and_then(|line| usize::try_from(line).ok());
+            let span = |span: usize| i64::try_from(span).unwrap_or(i64::MAX);
             match (start, end) {
-                (Some(start), Some(end)) => (Some(start.min(end)), Some(start.max(end))),
-                (Some(start), None) => (Some(start), end_is_span.then(|| start.saturating_add(end_span))),
-                (None, Some(end)) => (start_is_span.then(|| end.checked_sub(start_span)).flatten(), Some(end)),
+                (Some(start), Some(end)) => (line(Some(start.min(end))), line(Some(start.max(end)))),
+                (Some(start), None) => (line(Some(start)), end_is_span.then(|| line(Some(start.saturating_add(span(end_span))))).flatten()),
+                (None, Some(end)) => (start_is_span.then(|| line(Some(end.saturating_sub(span(start_span))))).flatten(), line(Some(end))),
                 (None, None) => (None, None),
             }
         }
@@ -56,7 +59,7 @@ mod tests {
     use super::*;
 
     fn lines(raw: &str, tracks: usize) -> AbsoluteGridLines {
-        absolute_grid_lines(GridPlacement { start: None, span: 1 }, Some(raw), &[], tracks, &[], true, tracks)
+        absolute_grid_lines(GridPlacement { start: None, span: 1 }, Some(raw), &[], tracks, &[], true, tracks, 0)
     }
 
     #[test]

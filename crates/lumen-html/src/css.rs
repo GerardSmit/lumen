@@ -77,7 +77,9 @@ mod grid_lead;
 mod grid_source;
 mod grid_tracks;
 mod shapes;
+pub(crate) use shapes::outside as shape_outside;
 pub mod anchor;
+pub mod at_rule_supports;
 pub mod container_eval;
 pub mod container_query;
 pub mod function_rule;
@@ -181,10 +183,28 @@ impl ContainerType {
     pub const fn as_str(self) -> &'static str {
         match self { Self::Normal => "normal", Self::InlineSize => "inline-size", Self::Size => "size" }
     }
-    fn parse(raw:&str) -> Option<Self> {
-        if raw.eq_ignore_ascii_case("normal") { Some(Self::Normal) }
-        else if raw.eq_ignore_ascii_case("inline-size") { Some(Self::InlineSize) }
-        else if raw.eq_ignore_ascii_case("size") { Some(Self::Size) } else { None }
+    pub fn serialize(self, scroll_state: bool) -> String {
+        match (self, scroll_state) {
+            (Self::Normal, true) => "scroll-state".into(),
+            (axis, true) => alloc::format!("{} scroll-state", axis.as_str()),
+            (axis, false) => axis.as_str().into(),
+        }
+    }
+    /// `normal | [ [ size | inline-size ] || scroll-state ]`.
+    fn parse(raw:&str) -> Option<(Self, bool)> {
+        let mut axis = None;
+        let mut scroll_state = false;
+        let mut words = 0;
+        for word in raw.split_ascii_whitespace() {
+            words += 1;
+            if word.eq_ignore_ascii_case("normal") { if axis.is_some() { return None; } axis = Some(Self::Normal); }
+            else if word.eq_ignore_ascii_case("inline-size") && axis.is_none() { axis = Some(Self::InlineSize); }
+            else if word.eq_ignore_ascii_case("size") && axis.is_none() { axis = Some(Self::Size); }
+            else if word.eq_ignore_ascii_case("scroll-state") && !scroll_state { scroll_state = true; }
+            else { return None; }
+        }
+        if words == 0 || (axis == Some(Self::Normal) && words > 1) { return None; }
+        Some((axis.unwrap_or(Self::Normal), scroll_state))
     }
 }
 impl Overflow {
@@ -1164,6 +1184,9 @@ impl Transform {
 }
 
 pub const MAX_GRID_TRACKS: usize = 64;
+
+/// Property slot of `width`, the first slot of its longhand table entry.
+pub(crate) const WIDTH_SLOT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GridTrack {
@@ -2935,6 +2958,7 @@ pub struct StyleExtras {
     pub text_shadow_current_color: u64,
     pub text_transform: TextTransform,
     pub container_type: ContainerType,
+    pub container_scroll_state: bool,
     /// Computed animation longhands in canonical property order. Values stay
     /// serialized so the HTML animation adapter can apply CSS list repetition.
     pub animation: [Option<Arc<str>>; animation_controls::STYLE_COUNT],
@@ -3202,6 +3226,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     text_shadow_current_color: 0,
     text_transform: TextTransform::None,
     container_type: ContainerType::Normal,
+    container_scroll_state: false,
     animation: [const { None }; animation_controls::STYLE_COUNT],
     font: FontSpec {
         ligatures: FontLigatures::NORMAL,
@@ -4850,7 +4875,7 @@ impl Style {
                 ) {
                     value.apply(&mut result);
                 }
-            } else if slot == 3 {
+            } else if slot == WIDTH_SLOT {
                 result.width = None;
             } else if slot == 23 {
                 result.min_width = 0.0;
@@ -5949,7 +5974,7 @@ enum Value {
     BorderImageRaw(usize,String),
     BorderImage(usize,Arc<BorderImage>),
     ViewTransitionName(ViewTransitionName),
-    ContainerType(ContainerType),
+    ContainerType(ContainerType, bool),
     Animation(usize, Arc<str>),
     TransitionTimes(usize, Arc<[typed_numeric::NumericValue]>),
     TransitionTimesRaw(usize,String),
@@ -6198,7 +6223,7 @@ impl Value {
             Self::FieldSizing(_) => 232,
             Self::BorderImageInitial(slot)|Self::BorderImageRaw(slot,_)|Self::BorderImage(slot,_)=>*slot,
             Self::ViewTransitionName(_) => 220,
-            Self::ContainerType(_) => 198,
+            Self::ContainerType(..) => 198,
             Self::Animation(slot, _) => *slot,
             Self::TransitionTimes(slot, _) | Self::TransitionTimesRaw(slot,_) => *slot,
             Self::TransitionProperty(_) => 216,
@@ -6409,7 +6434,7 @@ impl Value {
                 if let Some(legacy)=color_at_slot(*slot,color_values::rgba(value.value)) {legacy.apply(style);}
                 style.set_source_color(*slot,Some(value.clone()));
             }
-            Self::ContainerType(value) => style.container_type = *value,
+            Self::ContainerType(value, scroll_state) => { style.container_type = *value; style.container_scroll_state = *scroll_state; }
             Self::Animation(slot, value) => style.animation[animation_controls::index(*slot)] = Some(value.clone()),
             Self::TransitionProperty(values) => style.transition_property = Some(values.clone()),
             Self::TransitionTimingFunction(values) => style.transition_timing_function = Some(values.clone()),
@@ -12688,6 +12713,8 @@ fn parse_supports_in_parens(input: &str, start: usize, nesting: usize, namespace
         // accepts a single complex selector and rejects unsupported syntax.
         parse_selector_depth(argument, open + 1, 0, true, namespaces).is_ok()
             && !selector_serialization::has_forgiven_items(argument, namespaces, true)
+    } else if name.eq_ignore_ascii_case("at-rule") {
+        at_rule_supports::supports(argument)
     } else {
         false
     };
@@ -13881,6 +13908,23 @@ property_registry! {
     "corner-inline-end-shape" => [350,352], false, true;
     "corner-block-start-shape" => [349,350], false, true;
     "corner-block-end-shape" => [351,352], false, true;
+    "corner" => [134,135,136,137,345,346,347,348], false, true;
+    "corner-top-left" => [134,345], false, true;
+    "corner-top-right" => [135,346], false, true;
+    "corner-bottom-right" => [136,347], false, true;
+    "corner-bottom-left" => [137,348], false, true;
+    "corner-start-start" => [192,349], false, true;
+    "corner-start-end" => [193,350], false, true;
+    "corner-end-start" => [194,351], false, true;
+    "corner-end-end" => [195,352], false, true;
+    "corner-top" => [134,135,345,346], false, true;
+    "corner-right" => [135,136,346,347], false, true;
+    "corner-bottom" => [137,136,348,347], false, true;
+    "corner-left" => [134,137,345,348], false, true;
+    "corner-block-start" => [192,193,349,350], false, true;
+    "corner-block-end" => [194,195,351,352], false, true;
+    "corner-inline-start" => [192,194,349,351], false, true;
+    "corner-inline-end" => [193,195,350,352], false, true;
     "empty-cells" => [102], true, true;
     "caption-side" => [127], true, true;
     "border-collapse" => [128], true, true;
@@ -14098,11 +14142,11 @@ pub fn is_cssom_property_name(name: &str) -> bool {
 }
 
 /// Typed OM initial ordering groups standard, vendor and custom properties.
-/// Canonical names are decoded UTF-8; its lexical order is code-point order.
+/// Names compare by UTF-16 code unit, matching how script sorts the keys.
 pub fn cssom_property_order(left: &str, right: &str) -> core::cmp::Ordering {
     let category=|name: &str| if name.starts_with("--") {2}
         else if name.starts_with('-') {1} else {0};
-    (category(left),left).cmp(&(category(right),right))
+    category(left).cmp(&category(right)).then_with(||left.encode_utf16().cmp(right.encode_utf16()))
 }
 
 /// Property animation types, independent of whether a particular endpoint pair
@@ -14335,7 +14379,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
     }
     match slot {
         187 => to.outline.color = from.outline.color,
-        198 => to.container_type = from.container_type,
+        198 => { to.container_type = from.container_type; to.container_scroll_state = from.container_scroll_state; }
         188 => to.outline.style = from.outline.style,
         189 => to.outline.width = from.outline.width,
         190 => to.outline.offset = from.outline.offset,
@@ -21979,7 +22023,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 _ => None,
             },
             "font-style" => font_style_value(raw),
-            "container-type" => ContainerType::parse(raw).map(Value::ContainerType),
+            "container-type" => ContainerType::parse(raw).map(|(axis, scroll_state)| Value::ContainerType(axis, scroll_state)),
             "appearance" | "-webkit-appearance" => Appearance::parse(raw).map(Value::Appearance),
             "field-sizing" => FieldSizing::parse(raw).map(Value::FieldSizing),
             "view-transition-name" => {
@@ -28870,29 +28914,19 @@ fn html_presentational_hints(kind: &NodeKind, context: Option<(&Document, NodeId
             hint(Value::BorderCollapse(true));
             side_styles([BorderStyle::Hidden; 4], &mut hint);
         }
-        if let Some(border) = border.filter(|value| *value != 0) {
+        if let Some(border) = border {
             for side in 0..4 {
                 hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(border as f32)));
             }
-            side_styles([BorderStyle::Outset; 4], &mut hint);
+            if nonzero_border { side_styles([BorderStyle::Outset; 4], &mut hint); }
         }
-        if let Some(frame) = attribute("frame").and_then(html_table_frame) {
-            side_styles(frame, &mut hint);
-            if !nonzero_border {
-                for (side, style) in frame.into_iter().enumerate() {
-                    if style == BorderStyle::Outset {
-                        hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(1.0)));
-                    }
-                }
-            }
-        }
+        if let Some(frame) = attribute("frame").and_then(html_table_frame) { side_styles(frame, &mut hint); }
     } else if matches!(tag, "td" | "th") {
         if nonzero_border || rules.is_some() {
             for side in 0..4 { hint(Value::LogicalBorder(115 + side, LogicalBorderComponent::Width(1.0))); }
             side_styles([if nonzero_border { BorderStyle::Inset } else { BorderStyle::None }; 4], &mut hint);
         }
         match rules {
-            _ if nonzero_border => {}
             Some(0..=2) => side_styles([BorderStyle::None; 4], &mut hint),
             Some(3) => {
                 for slot in [111, 112] { hint(Value::LogicalBorder(slot, LogicalBorderComponent::Style(BorderStyle::Solid))); }
@@ -30810,19 +30844,10 @@ fn compute_for_named_registered_inner(
                         html_rendering_table_ancestor(document, node).map(|table| (document, table)));
                     let attribute = |name| if tag == "table" { html_rendering_attribute(attributes, context, name) }
                         else { table.and_then(|(document, table)| document.get_attribute_ns_ref(table, None, name).ok().flatten()) };
-                    let nonzero_border = attribute("border")
-                        .map(|value| crate::forms::parse_nonnegative_integer(value).unwrap_or(1))
-                        .is_some_and(|value| value != 0);
-                    let framed = attribute("frame").and_then(html_table_frame).is_some();
-                    let ruled = attribute("rules").and_then(html_table_rules).is_some();
-                    let gray = Rgba { r: 128, g: 128, b: 128, a: 255 };
-                    let black = Rgba { r: 0, g: 0, b: 0, a: 255 };
-                    let color = if nonzero_border { Some(gray) }
-                        else if tag == "table" { Some(if framed { black } else { gray }) }
-                        else if ruled || framed { Some(black) } else { None };
-                    if let Some(color) = color {
+                    if attribute("rules").and_then(html_table_rules).is_some()
+                        || attribute("frame").and_then(html_table_frame).is_some() {
                         for side in 0..4 {
-                            Value::LogicalBorder(119 + side, LogicalBorderComponent::Color(color)).apply(&mut style);
+                            Value::LogicalBorder(119 + side, LogicalBorderComponent::Color(Rgba { r: 0, g: 0, b: 0, a: 255 })).apply(&mut style);
                         }
                     }
                 }
@@ -34391,10 +34416,10 @@ mod tests {
         let group_style = compute_node(&document, group, Some(&table_style), &index).unwrap();
         let row_style = compute_node(&document, row, Some(&group_style), &index).unwrap();
         let cell_style = compute_node(&document, cell, Some(&row_style), &index).unwrap();
-        assert_eq!(cell_style.used_border_widths(), [1.0; 4]);
+        assert_eq!(cell_style.used_border_widths(), [0.0, 1.0, 0.0, 1.0]);
         assert_eq!(cell_style.text_align, TextAlign::Center);
         assert_eq!(core::array::from_fn::<_, 4, _>(|side| cell_style.border_color_sides[side].unwrap_or(cell_style.border_color)),
-            [Rgba { r: 128, g: 128, b: 128, a: 255 }; 4]);
+            [Rgba { r: 0, g: 0, b: 0, a: 255 }; 4]);
         document.set_attribute(cell, "style", "border:3px solid green;text-align:left").unwrap();
         let authored = compute_node(&document, cell, Some(&row_style), &index).unwrap();
         assert_eq!(authored.used_border_widths(), [3.0; 4]);

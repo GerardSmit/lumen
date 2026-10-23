@@ -805,7 +805,7 @@ fn apply_offset_snapping(
         } else { behavior };
         (session.scroll_offset(node), (x, y), behavior, (min_x, max_x, min_y, max_y))
     };
-    let to = if snap {
+    let to = if snap && realm.layout_flusher.borrow().is_some() {
         let snapped = crate::scroll_snap::snap_destination(realm, node, from, to, limits)?;
         // Reading the snap style may restyle with the font source, which
         // leaves the frame stale; the offset below needs a fresh one.
@@ -1055,7 +1055,7 @@ pub(crate) fn target_bounds_in_scroll_space(
         matrix = translation(&owner).then(embedding).then(matrix);
         current = owner;
     }
-    original.flush_layout()?;
+    if original.layout_flusher.borrow().is_some() { original.flush_layout()?; }
     let matrix = inverse_scroll_space.then(matrix);
     let session = original.session.borrow();
     if session.document().root_node(target, true).map_err(dom_error)? != session.document().root() { return Ok(None); }
@@ -1106,7 +1106,7 @@ fn into_view_waiting(
             return Ok(());
         }
     }
-    realm.flush_layout()?;
+    if realm.layout_flusher.borrow().is_some() { realm.flush_layout()?; }
     let original = realm.clone();
     let origin = original.document_origin();
     let mut current = realm.clone();
@@ -1126,7 +1126,7 @@ fn into_view_waiting(
         }
         // A fixed subtree can scroll local containers, but its own viewport
         // cannot move it. Its embedding frame can still move in another document.
-        current.flush_layout()?;
+        if current.layout_flusher.borrow().is_some() { current.flush_layout()?; }
         let fixed = current.session.borrow().is_viewport_fixed(node);
         let next = current
             .session
