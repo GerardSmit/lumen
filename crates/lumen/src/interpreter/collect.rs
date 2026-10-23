@@ -838,6 +838,12 @@ impl Interp {
         shrink(&mut self.class_info);
         shrink(&mut self.map_data);
         shrink(&mut self.proxies);
+        shrink(&mut self.generators);
+        shrink(&mut self.regexps);
+        shrink(&mut self.temporal);
+        shrink(&mut self.shared_buffers);
+        shrink(&mut self.mapped_arguments);
+        shrink(&mut self.deferred_ns);
     }
 
     /// Debug: `LUMEN_GC_RETAIN=<bytes>` prints, for every live ArrayBuffer of at least that many
