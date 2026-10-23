@@ -6831,6 +6831,7 @@ impl DomCssRule {
                 node: source_dom_node(&self.realm, &self.source),
                 computed: false,
                 pseudo: None,
+                highlight: None,
                 invalid_pseudo: false,
                 _owner: this.0.clone(),
             },
@@ -9681,8 +9682,8 @@ return true;})()"#).unwrap();
             rule.selectorText='same|*.target > *|*.child';
             check(rule.selectorText==='.target > *|*.child','setter uses associated stylesheet namespace context');
             rule.selectorText=':is(*.target, .target, missing|e)';
-            check(rule.selectorText===':is(*.target, .target)','logical default-namespace subject stays explicit and invalid forgiving branch is discarded');
-            rule.selectorText=':not(missing|e)';check(rule.selectorText===':is(*.target, .target)','strict invalid setter preserves existing parsed rule');
+            check(rule.selectorText===':is(*.target, .target, missing|e)','logical default-namespace subject stays explicit and invalid forgiving branch is kept verbatim');
+            rule.selectorText=':not(missing|e)';check(rule.selectorText===':is(*.target, .target, missing|e)','strict invalid setter preserves existing parsed rule');
             sheet.deleteRule(4);
             check(group.parentStyleSheet===null && child.parentStyleSheet===null && child.parentRule===group && child.selectorText==='foreign|e','detached nested rules retain literal namespace identities');
             child.style.setProperty('width','4px');

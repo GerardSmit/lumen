@@ -5229,7 +5229,7 @@ impl DomAnimation {
                 .flat_map(|(_,_,pairs)|pairs.to_vec()).collect::<Vec<_>>()
         }).filter(|(name,_)|animated.iter().any(|animated|animated==name)).collect::<Vec<_>>();
         if committed.is_empty() {return Ok(());}
-        let style=crate::style::DomStyle {realm:realm.clone(),node,computed:false,pseudo:None,invalid_pseudo:false,_owner:Value::Undefined};
+        let style=crate::style::DomStyle {realm:realm.clone(),node,computed:false,pseudo:None,highlight:None,invalid_pseudo:false,_owner:Value::Undefined};
         let mut block=style.declaration_block()?;
         let mut changed=false;
         for (name,value) in committed {

@@ -127,14 +127,15 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("scroll-padding-block-start", false, "auto", "auto | <length-percentage-nn>"),
     prop("scroll-padding-block-end", false, "auto", "auto | <length-percentage-nn>"),
     post(prop("scroll-snap-align", false, "none", "[ none | start | end | center ]{1,2}"), Post::ScrollSnapAlign),
-    prop("scroll-snap-stop", false, "normal", "normal | always"),
-    post(prop("scroll-snap-type", false, "none", "none | [ x | y | block | inline | both ] [ mandatory | proximity ]?"), Post::ScrollSnapType),
+    prop("scroll-snap-stop", false, "normal", "normal | always | before"),
+    prop("scroll-initial-target", false, "none", "none | nearest"),
+    post(prop("scroll-snap-type", false, "none", "none | [ x | y | block | inline | both | pair ] [ mandatory | proximity ]?"), Post::ScrollSnapType),
     prop("scrollbar-gutter", false, "auto", "auto | stable | stable both-edges"),
     prop("scrollbar-width", false, "auto", "auto | thin | none"),
     prop("shape-rendering", true, "auto", "auto | optimizespeed | crispedges | geometricprecision"),
     prop("speak", true, "auto", "auto | never | always"),
-    typed(post(prop("stroke-dasharray", true, "none", "none | [ [ <length-percentage-nn> | <number-px-nn> ] ,? ]+"), Post::Dasharray), "none"),
-    prop("stroke-dashoffset", true, "0px", "<length-percentage> | <number-px>"),
+    typed(post(prop("stroke-dasharray", true, "none", "none | [ [ <number-px-nn> | <length-percentage-nn> ] ,? ]+"), Post::Dasharray), "none"),
+    prop("stroke-dashoffset", true, "0px", "<number-px> | <length-percentage>"),
     prop("stroke-linecap", true, "butt", "butt | round | square"),
     prop("stroke-linejoin", true, "miter", "[ crop | arcs | miter | miter-clip ] || [ bevel | round | fallback ]"),
     prop("stroke-miterlimit", true, "4", "<number-nn>"),
@@ -580,7 +581,8 @@ impl Matcher<'_> {
         let text = if self.computed {
             self.compute(syntax, word)?
         } else {
-            typed_numeric::parse_numeric_expression(word)?.serialize_specified()?
+            let text = typed_numeric::parse_numeric_expression(word)?.serialize_specified()?;
+            if text == "0" && syntax.starts_with("<length") { String::from("0px") } else { text }
         };
         if non_negative && text.starts_with('-') {
             if !math {
@@ -773,9 +775,8 @@ fn finish(prop: &Prop, mut parts: Vec<String>, computed: bool) -> String {
             }
         }
         Post::ScrollSnapAlign => {
-            if computed && parts.len() == 1 {
-                let first = parts[0].clone();
-                parts.push(first);
+            if parts.len() == 2 && parts[0] == parts[1] {
+                parts.pop();
             }
         }
         Post::ScrollSnapType => {
@@ -970,7 +971,8 @@ mod tests {
         assert_eq!(value("font-variation-settings", "\"wght\" 4, \"wdth\" 2").as_deref(), Some("\"wght\" 4, \"wdth\" 2"));
         assert_eq!(value("touch-action", "pan-y pan-x").as_deref(), Some("pan-x pan-y"));
         assert_eq!(value("touch-action", "pan-x pan-left"), None);
-        assert_eq!(value("scroll-snap-align", "start").as_deref(), Some("start start"));
+        assert_eq!(value("scroll-snap-align", "start").as_deref(), Some("start"));
+        assert_eq!(value("scroll-snap-align", "start end").as_deref(), Some("start end"));
         assert_eq!(specified("scroll-snap-align", "start").as_deref(), Some("start"));
         assert_eq!(value("scroll-snap-type", "x proximity").as_deref(), Some("x"));
         assert_eq!(value("text-emphasis-position", "over right").as_deref(), Some("over"));

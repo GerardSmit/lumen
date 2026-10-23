@@ -604,6 +604,7 @@ pub(crate) struct BrowsingContext {
     initial_blank_load_dispatched: Cell<bool>,
     insertion_order: u64,
     target_name: RefCell<String>,
+    window_features: Cell<super::window_features::WindowFeatures>,
     source_bytes: Cell<usize>,
     /// `sessionStorage` of a top-level traversable; nested contexts use their top-level one.
     session_storage: RefCell<Option<lumen_common::web_storage::SharedBackend>>,
@@ -1578,6 +1579,7 @@ impl BrowsingContext {
             ignored_attribute_navigation: Cell::new(None),
             insertion_order: 0,
             target_name: RefCell::new(String::new()),
+            window_features: Cell::new(Default::default()),
             source_bytes: Cell::new(0),
             session_storage: RefCell::new(None),
         });
@@ -1775,6 +1777,16 @@ impl BrowsingContext {
     }
 
     pub(crate) fn disown_opener(&self) {self.opener.borrow_mut().take();}
+
+    pub(crate) fn window_features(&self) -> super::window_features::WindowFeatures {self.window_features.get()}
+
+    pub(crate) fn group_context_count(&self) -> usize {
+        self.group.upgrade().map_or(0, |group| group.contexts.borrow().len())
+    }
+
+    pub(crate) fn set_window_features(&self, features: super::window_features::WindowFeatures) {
+        if self.parent.is_none() && self.insertion_order != 0 && !features.is_empty() {self.window_features.set(features);}
+    }
 
     pub(crate) fn close_auxiliary(&self,ctx:&mut Ctx) {
         if self.parent.is_some() || self.insertion_order==0 {return;}
@@ -2342,6 +2354,7 @@ impl DomRealm {
             ignored_attribute_navigation: Cell::new(None),
             insertion_order,
             target_name: RefCell::new(target_name),
+            window_features: Cell::new(Default::default()),
             source_bytes: Cell::new(source.len()),
             session_storage: RefCell::new(None),
         });

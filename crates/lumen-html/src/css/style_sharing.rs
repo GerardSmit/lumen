@@ -124,6 +124,7 @@ enum Eligibility { Full, SelfOnly, Never }
 fn eligibility(document: &Document, node: NodeId, namespace: &Namespace, name: &Name, attributes: &[(Name, String)], parent: NodeId) -> Eligibility {
     let tag = crate::svg::local_name(name);
     if tag == "slot" { return Eligibility::Never; }
+    if document.interaction_state().focus_visible == Some(node) { return Eligibility::Never; }
     if namespace == &Namespace::Html {
         if matches!(tag, "img" | "source") && html_rendering_tag(document, parent) == Some("picture") { return Eligibility::Never; }
         if tag == "input" && crate::forms::input_type_state(document, node) == "tel" { return Eligibility::Never; }

@@ -1844,13 +1844,15 @@ impl RenderSession {
             self.frame_id = self.frame_id.wrapping_add(1);
         }
         let shape_changed = interaction_changed && interaction_before.1 != self.synced_interaction.1;
+        let focus_ring_changed = interaction_changed && interaction_before.0.focus_visible != self.synced_interaction.0.focus_visible;
         if !has_selector_dependencies
             && !shape_changed
+            && !focus_ring_changed
             && !(validity_changed && self.has_auto_directionality_controls())
         {
             return;
         }
-        if has_selector_dependencies && !(validity_changed && self.has_auto_directionality_controls()) {
+        if has_selector_dependencies && !focus_ring_changed && !(validity_changed && self.has_auto_directionality_controls()) {
             if let Some(targets) = self.state_change_targets(validity_changed, interaction_changed, interaction_before) {
                 self.rule_subjects.get_or_insert_with(Vec::new).extend(targets.into_iter().map(|node| (node, true)));
                 self.animation_snapshot = None;
@@ -3391,6 +3393,29 @@ impl RenderSession {
         let ordinary=self.computed_style_with_text(node,text)?;
         let mut style=self.rules.as_ref().expect("stylesheets initialized")
             .compute_pseudo_computed(&self.document,node,&ordinary,pseudo,text).map_err(LayoutError::Css)?;
+        let query=self.pseudo_query_container_context(node)?;
+        style.resolve_query_context_with_text(query,text);
+        Ok(style)
+    }
+
+    /// Computed style of a highlight pseudo-element (`key` from
+    /// `css::highlight_pseudo_key`), inheriting through the highlight of each ancestor.
+    pub fn computed_highlight_style_with_text(&mut self,node:NodeId,key:&str,text:Option<&dyn TextShaper>)->Result<Style,LayoutError> {
+        let mut ancestors=Vec::new();
+        let mut current=Some(node);
+        while let Some(id)=current {
+            if ancestors.len()>=512 {return Err(LayoutError::DepthLimit);}
+            if matches!(self.document.kind(id),Ok(NodeKind::Element{..})) {ancestors.push(id);}
+            current=self.document.flat_tree_parent(id).map_err(|_|LayoutError::InvalidTree)?;
+        }
+        let mut inherited:Option<Style>=None;
+        for id in ancestors.into_iter().rev() {
+            let ordinary=self.computed_style_with_text(id,text)?;
+            let style=self.rules.as_ref().expect("stylesheets initialized")
+                .compute_highlight_computed(&self.document,id,&ordinary,inherited.as_ref(),key,text).map_err(LayoutError::Css)?;
+            inherited=Some(style);
+        }
+        let mut style=inherited.ok_or(LayoutError::InvalidTree)?;
         let query=self.pseudo_query_container_context(node)?;
         style.resolve_query_context_with_text(query,text);
         Ok(style)

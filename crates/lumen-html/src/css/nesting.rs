@@ -1194,7 +1194,7 @@ fn validate_resolved_has(selector: &mut Selector) -> bool {
                     return false;
                 }
             }
-            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => {}
+            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
         }
         if matches!(pseudo, LogicalPseudo::Is(_) | LogicalPseudo::Not(_)) {
             let new = pseudo
@@ -1325,7 +1325,7 @@ fn resolve_nesting(
                     .unwrap_or((0, 0, 0));
                 selector.specificity = adjust_specificity(selector.specificity, old, new);
             }
-            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => {}
+            LogicalPseudo::State(_, _) | LogicalPseudo::Nesting(_) | LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
         }
         if matches!(pseudo, LogicalPseudo::Is(_) | LogicalPseudo::Not(_)) {
             let new = pseudo

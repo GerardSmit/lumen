@@ -632,6 +632,9 @@ impl InvalidationSets {
                     self.state |= reach;
                     self.custom_states = true;
                 }
+                LogicalPseudo::HasSlotted(_) => {
+                    self.state |= reach;
+                }
                 LogicalPseudo::Heading(_) => {
                     // A heading's level reads `headingoffset` and
                     // `headingreset` on itself and every ancestor.

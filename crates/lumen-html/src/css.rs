@@ -55,6 +55,8 @@ mod background_positions;
 mod corner_radii;
 mod text_indent;
 mod popover_ua;
+mod focus_ring_ua;
+mod marker_ua;
 mod html_text_ua;
 mod mask_shorthand;
 mod text_decoration_inset;
@@ -3876,8 +3878,21 @@ impl Style {
 
     pub(crate) fn clear_intrinsic_measurement_axis(&mut self, horizontal: bool) {
         self.clear_intrinsic_size_keywords(horizontal);
-        if horizontal { self.width = None; self.min_width = 0.0; self.max_width = None; if self.min_width_auto { self.min_width_auto = false; } }
-        else { self.height = None; self.min_height = 0.0; self.max_height = None; if self.min_height_auto { self.min_height_auto = false; } }
+        let repeats_in_axis = self.display == Display::Grid
+            && if horizontal == (self.writing_mode == WritingMode::HorizontalTb) {
+                self.grid_columns_auto.is_some()
+            } else {
+                self.grid_rows_auto.is_some()
+            };
+        if horizontal {
+            self.width = None;
+            if !repeats_in_axis { self.min_width = 0.0; self.max_width = None; }
+            if self.min_width_auto { self.min_width_auto = false; }
+        } else {
+            self.height = None;
+            if !repeats_in_axis { self.min_height = 0.0; self.max_height = None; }
+            if self.min_height_auto { self.min_height_auto = false; }
+        }
         let inline = horizontal == (self.writing_mode == WritingMode::HorizontalTb);
         let slots = if horizontal { [3, 23, 24] } else { [4, 51, 52] };
         let logical = if inline { [87, 91, 92] } else { [88, 93, 94] };
@@ -5105,6 +5120,8 @@ pub(crate) struct Selector {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    /// `.prefix-*`: each entry is the dash-terminated prefix.
+    class_prefixes: Vec<String>,
     specificity: (u16, u16, u16),
     ancestor: Option<(Relation, Box<Selector>)>,
     attributes: Vec<AttributeSelector>,
@@ -5119,6 +5136,8 @@ enum LogicalPseudo {
     Nesting(Arc<[Selector]>),
     State(Arc<str>, bool),
     Heading(u16),
+    /// `:has-slotted` / `:has-slotted(<selector>)`; empty matches any assigned node.
+    HasSlotted(Vec<Selector>),
     InvalidNesting,
 }
 
@@ -5127,7 +5146,7 @@ impl LogicalPseudo {
         match self {
             Self::Not(selectors) | Self::Is(selectors) | Self::Where(selectors) => selectors,
             Self::Nesting(selectors) => selectors,
-            Self::Has(_) | Self::State(..) | Self::Heading(_) | Self::InvalidNesting => &[],
+            Self::Has(_) | Self::State(..) | Self::Heading(_) | Self::HasSlotted(_) | Self::InvalidNesting => &[],
         }
     }
 }
@@ -8430,14 +8449,21 @@ fn rule_media_matches(&self, order: usize) -> bool {
             Some(text), Some(pseudo), name, None)
     }
 
-    pub(crate) fn compute_highlight_style(&self, document: &Document, origin: NodeId,
-        ordinary: &Style, inherited: Option<&Style>, name: &str, text: &dyn TextShaper) -> Result<Style, CssError> {
+    /// The full computed style of a highlight pseudo-element, inheriting from
+    /// the highlight of the parent (or the originating element at the root).
+    pub fn compute_highlight_computed(&self, document: &Document, origin: NodeId,
+        ordinary: &Style, inherited: Option<&Style>, name: &str, text: Option<&dyn TextShaper>) -> Result<Style, CssError> {
         let kind = document.kind(origin).map_err(|_| CssError { offset: 0, message: "invalid highlight origin" })?;
         let mut parent = ordinary.clone();
         parent.background = inherited.map_or(Rgba { r: 0, g: 0, b: 0, a: 0 }, |style| style.background);
         if let Some(inherited) = inherited { parent.color = inherited.color; }
-        let computed = compute_for_named(kind, Some(&parent), self, Some((document, origin)), AncestorBloom::ALL,
-            Some(text), Some(PseudoElement::Highlight), Some(name), None)?;
+        compute_for_named(kind, Some(&parent), self, Some((document, origin)), AncestorBloom::ALL,
+            text, Some(PseudoElement::Highlight), Some(name), None)
+    }
+
+    pub(crate) fn compute_highlight_style(&self, document: &Document, origin: NodeId,
+        ordinary: &Style, inherited: Option<&Style>, name: &str, text: &dyn TextShaper) -> Result<Style, CssError> {
+        let computed = self.compute_highlight_computed(document, origin, ordinary, inherited, name, Some(text))?;
         let mut filtered = ordinary.clone();
         for property in PROPERTIES {
             if matches!(property.name, "color" | "background-color" | "text-underline-position" | "text-underline-offset") || property.name.starts_with("text-decoration") {
@@ -9675,6 +9701,13 @@ fn consume_selector_identifier(input: &str, position: &mut usize) -> Option<Stri
 fn parse_attribute_selector(input: &str, offset: usize, namespaces: &NamespaceMap) -> Result<AttributeSelector, CssError> {
     let uncommented=if syntax::contains_comment_open(input) {Some(strip_component_comments(input,offset,true)?)} else {None};
     let input=uncommented.as_deref().unwrap_or(input);
+    let separated;
+    let input = if input.contains(SELECTOR_TOKEN_SEPARATOR) {
+        separated = input.replace(SELECTOR_TOKEN_SEPARATOR, " ");
+        separated.as_str()
+    } else {
+        input
+    };
     let mut position = 0;
     skip_css_space_comments(input, &mut position)
         .ok_or_else(|| selector_error(offset + position, "unterminated attribute comment"))?;
@@ -9990,6 +10023,31 @@ fn trim_selector_source(input:&str)->&str {
     input
 }
 
+/// Cascade key of a built-in highlight pseudo-element; `\0` cannot occur in an
+/// author-supplied `::highlight()` name.
+pub(crate) fn builtin_highlight_key(name: &str) -> String {
+    let mut key = String::from("\0");
+    key.push_str(name);
+    key
+}
+
+/// The highlight cascade key for a `getComputedStyle()` pseudo-element argument.
+pub fn highlight_pseudo_key(pseudo: &str) -> Option<String> {
+    let rest = pseudo.strip_prefix("::")?;
+    if let Some(open) = rest.find('(') {
+        if !rest[..open].eq_ignore_ascii_case("highlight") || !rest.ends_with(')') {
+            return None;
+        }
+        let input = &rest[open + 1..rest.len() - 1];
+        let mut position = 0;
+        return consume_selector_identifier(input, &mut position)
+            .filter(|value| position == input.len() && !matches!(value.to_ascii_lowercase().as_str(), "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "default"));
+    }
+    let name = rest.to_ascii_lowercase();
+    matches!(name.as_str(), "selection" | "target-text" | "spelling-error" | "grammar-error" | "search-text")
+        .then(|| builtin_highlight_key(&name))
+}
+
 fn selector_compound_end(input:&str, mut pos:usize, offset:usize)->Result<usize,CssError> {
     let bytes=input.as_bytes();
         let (mut brackets, mut parentheses, mut quote) = (0usize, 0usize, 0u8);
@@ -10290,6 +10348,7 @@ fn parse_simple_selector_depth(
         tag,
         id: None,
         classes: Vec::new(),
+        class_prefixes: Vec::new(),
         specificity: (0, 0, u16::from(explicit_type && !universal)),
         ancestor: None,
         attributes: Vec::new(),
@@ -10338,6 +10397,25 @@ fn parse_simple_selector_depth(
                     }
                 }
             }
+            if previous == PseudoElement::Highlight
+                && selector.highlight_name.as_deref() == Some(builtin_highlight_key("search-text").as_str())
+            {
+                let rest = &input[start..];
+                if !rest.starts_with("::") {
+                    let parsed = parse_pseudo_source(rest, offset + start)?;
+                    let state = match (parsed.name.as_str(), parsed.args.map(str::trim)) {
+                        ("current", None) => Some(":current"),
+                        ("not", Some(argument)) if argument.eq_ignore_ascii_case(":current") => Some(":not-current"),
+                        _ => None,
+                    };
+                    if let Some(state) = state {
+                        if let Some(name) = selector.highlight_name.as_mut() { name.push_str(state); }
+                        selector.specificity.1 = selector.specificity.1.saturating_add(1);
+                        start += parsed.end;
+                        continue;
+                    }
+                }
+            }
             return Err(selector_error(offset + start, "pseudo-element must end its compound selector"));
         }
         let kind = bytes[start];
@@ -10357,7 +10435,7 @@ fn parse_simple_selector_depth(
             let pseudo_element = rest.starts_with("::") && !rest.starts_with(":::");
             let ParsedPseudoSource{name,args,end,args_offset}=parse_pseudo_source(rest,offset+start)?;
             let name=name.as_str();
-            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
+            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
                 return Err(selector_error(offset+start,"invalid pseudo selector colon syntax"));
             }
 
@@ -10400,6 +10478,17 @@ fn parse_simple_selector_depth(
                 }
                 // No backdrop box is generated, so the selector is valid and matches nothing.
                 selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && matches!(name, "selection" | "target-text" | "spelling-error" | "grammar-error" | "search-text") {
+                if args.is_some() {
+                    return Err(selector_error(offset + start, "highlight pseudo-element is not functional"));
+                }
+                selector.pseudo_element = Some(PseudoElement::Highlight);
+                selector.highlight_name = Some(builtin_highlight_key(name));
                 selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 start += end;
                 continue;
@@ -10573,6 +10662,37 @@ fn parse_simple_selector_depth(
                 let state=custom_state_argument(argument).ok_or_else(||selector_error(offset+start,"invalid custom state identifier"))?;
                 selector.logical.push(LogicalPseudo::State(Arc::from(state), selector.part.is_some()));
                 selector.specificity.1 = selector.specificity.1.saturating_add(1);
+                start += end;
+                continue;
+            }
+            if name == "has-slotted" {
+                if pseudo_element {
+                    return Err(selector_error(offset + start, ":has-slotted requires single-colon syntax"));
+                }
+                let mut specificity = (0, 1, 0);
+                let mut selectors = Vec::new();
+                if let Some(argument) = args {
+                    selectors = parse_selector_list_depth(argument, offset + start + args_offset, depth + 1, false, allow_nesting, namespaces)?;
+                    let sibling_only = |selector: &Selector| {
+                        let mut current = selector.ancestor.as_ref();
+                        while let Some((relation, ancestor)) = current {
+                            if !matches!(relation, Relation::Adjacent | Relation::Following) {
+                                return false;
+                            }
+                            current = ancestor.ancestor.as_ref();
+                        }
+                        selector.pseudo_element.is_none()
+                    };
+                    if selectors.is_empty() || !selectors.iter().all(sibling_only) {
+                        return Err(selector_error(offset + start, "invalid :has-slotted argument"));
+                    }
+                    specificity = selectors.iter().map(|selector| selector.specificity).max().unwrap_or((0, 0, 0));
+                    specificity.1 = specificity.1.saturating_add(1);
+                }
+                selector.logical.push(LogicalPseudo::HasSlotted(selectors));
+                selector.specificity.0 += specificity.0;
+                selector.specificity.1 += specificity.1;
+                selector.specificity.2 += specificity.2;
                 start += end;
                 continue;
             }
@@ -10923,7 +11043,12 @@ fn parse_simple_selector_depth(
         }
         match kind {
             b'.' => {
-                selector.classes.push(name);
+                if name.ends_with('-') && bytes.get(end) == Some(&b'*') {
+                    end += 1;
+                    selector.class_prefixes.push(name);
+                } else {
+                    selector.classes.push(name);
+                }
                 selector.specificity.1 += 1;
             }
             b'#' if selector.id.is_none() => {
@@ -12371,6 +12496,7 @@ fn parse_supports_in_parens(input: &str, start: usize, nesting: usize, namespace
         // parser used for stylesheet rules count as supported. That parser
         // accepts a single complex selector and rejects unsupported syntax.
         parse_selector_depth(argument, open + 1, 0, true, namespaces).is_ok()
+            && !selector_serialization::has_forgiven_items(argument, namespaces, true)
     } else {
         false
     };
@@ -13689,6 +13815,7 @@ property_registry! {
     "scroll-padding-block-end" => [extra_props::VALUE_BASE + value_props::const_index("scroll-padding-block-end")], false, true;
     "scroll-snap-align" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-align")], false, true;
     "scroll-snap-stop" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-stop")], false, true;
+    "scroll-initial-target" => [extra_props::VALUE_BASE + value_props::const_index("scroll-initial-target")], false, true;
     "scroll-snap-type" => [extra_props::VALUE_BASE + value_props::const_index("scroll-snap-type")], false, true;
     "scrollbar-gutter" => [extra_props::VALUE_BASE + value_props::const_index("scrollbar-gutter")], false, true;
     "scrollbar-width" => [extra_props::VALUE_BASE + value_props::const_index("scrollbar-width")], false, true;
@@ -24664,7 +24791,7 @@ impl Selector {
                     selectors.iter().any(Selector::has_validity_dependency)
                 }
                 LogicalPseudo::State(..) => true,
-                LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) => false,
+                LogicalPseudo::InvalidNesting | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => false,
             })
             || self
                 .ancestor
@@ -24703,6 +24830,7 @@ impl Selector {
                 }
                 LogicalPseudo::State(..) => true,
                 LogicalPseudo::Heading(levels)=>*levels!=ALL_HEADING_LEVELS,
+                LogicalPseudo::HasSlotted(_) => true,
                 LogicalPseudo::InvalidNesting => false,
             })
             || self.ancestor.as_ref().is_some_and(|(relation, ancestor)| {
@@ -24720,7 +24848,7 @@ impl Selector {
             || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Empty | StructuralPseudo::Valid | StructuralPseudo::Invalid))
             || self.structural.iter().any(|pseudo| matches!(pseudo, StructuralPseudo::Nth { of: Some(of), .. } if of.iter().any(Selector::depends_on_children)))
             || self.logical.iter().any(|pseudo| match pseudo {
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) => true,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_) => true,
                 LogicalPseudo::Not(selectors)
                 | LogicalPseudo::Is(selectors)
                 | LogicalPseudo::Where(selectors) => selectors.iter().any(Selector::depends_on_children),
@@ -24779,7 +24907,7 @@ impl Selector {
             return None;
         }
         for pseudo in &self.logical {
-            if matches!(pseudo, LogicalPseudo::Has(_) | LogicalPseudo::State(..)) {
+            if matches!(pseudo, LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_)) {
                 // A relational pseudo-class depends on the surrounding tree,
                 // which is unavailable to this context-free fast path.
                 return None;
@@ -24822,7 +24950,7 @@ impl Selector {
                     matched
                 }
                 LogicalPseudo::InvalidNesting => false,
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) => return None,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::HasSlotted(_) => return None,
                 LogicalPseudo::Heading(levels)=>if *levels==ALL_HEADING_LEVELS {crate::headings::heading_rank(kind).is_some()}else{return None;},
             };
             if !matched {
@@ -25098,6 +25226,15 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let any = match pseudo {
                 LogicalPseudo::Heading(levels)=>crate::headings::computed_heading_level(document,node).ok().flatten().is_some_and(|level|levels&(1u16<<u32::from(level))!=0),
                 LogicalPseudo::State(name, _) => document.has_custom_state(node, name),
+                LogicalPseudo::HasSlotted(selectors) => {
+                    let is_slot = matches!(document.kind(node), Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if crate::svg::local_name(name) == "slot");
+                    is_slot && document.assigned_nodes(node, false).unwrap_or_default().into_iter().any(|assigned| {
+                        matches!(document.kind(assigned), Ok(NodeKind::Element { .. }))
+                            && (selectors.is_empty() || selectors.iter().any(|selector| {
+                                selector.matches_in_context_with_quota(document, assigned, None, scope_root, depth + 1, validity, quota)
+                            }))
+                    })
+                }
                 LogicalPseudo::Has(relative) => {
                     // In a shadow tree's own style, `:host:has()` looks at the
                     // shadow tree, whose top-level nodes are the root's children.
@@ -25136,7 +25273,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let matched = match pseudo {
                 LogicalPseudo::Not(_) => !any,
                 LogicalPseudo::Is(_) | LogicalPseudo::Where(_) | LogicalPseudo::Nesting(_) => any,
-                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) => any,
+                LogicalPseudo::Has(_) | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => any,
                 LogicalPseudo::InvalidNesting => false,
             };
             if !matched {
@@ -25210,7 +25347,6 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 _ => return false,
             };
             let parent = document.parent(node).ok().flatten();
-            if parent.is_none() && document.boundary()!=Some(node) {return false;}
             let matches_sibling = |sibling| {
                 let Ok(NodeKind::Element {
                     namespace, name, ..
@@ -25248,7 +25384,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 let mut current = if *reverse {
                     document.next_sibling(node).ok().flatten()
                 } else {
-                    parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node))
+                    parent.and_then(|parent|document.first_child(parent).ok().flatten()).or(Some(node))
                 };
                 while let Some(sibling) = current {
                     if !take_selector_work(quota) { return false; }
@@ -25272,7 +25408,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 continue;
             }
 
-            let mut current = parent.and_then(|parent|document.first_child(parent).ok().flatten()).or_else(||(document.boundary()==Some(node)).then_some(node));
+            let mut current = parent.and_then(|parent|document.first_child(parent).ok().flatten()).or(Some(node));
             let (mut index, mut count) = (0i64, 0i64);
             while let Some(sibling) = current {
                 if !take_selector_work(quota) { return false; }
@@ -25387,7 +25523,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             let equal = if namespace == &Namespace::Html { tag.eq_ignore_ascii_case(local_name) } else { tag == local_name };
             if !equal { return false; }
         }
-        if self.id.is_none() && self.classes.is_empty() && self.attributes.is_empty() { return true; }
+        if self.id.is_none() && self.classes.is_empty() && self.class_prefixes.is_empty() && self.attributes.is_empty() { return true; }
         let html_attribute_names =
             namespace == &Namespace::Html && document.is_some_and(Document::is_html_document);
         let namespaced: &[(usize, Arc<str>)] = document.zip(node)
@@ -25405,6 +25541,28 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 }) && value == id && attribute_namespace(index).is_none()
             });
             if !found { return false; }
+        }
+        if !self.class_prefixes.is_empty() {
+            let lowercase = document.is_some_and(|document| document.document_mode() == crate::DocumentMode::Quirks);
+            let class_attribute = attributes.iter().enumerate().find(|(index, (key, _))| {
+                (if html_attribute_names {
+                    key.as_str().eq_ignore_ascii_case("class")
+                } else {
+                    key.as_str() == "class"
+                }) && attribute_namespace(*index).is_none()
+            });
+            let Some((_, (_, value))) = class_attribute else { return false; };
+            let has_prefix = |prefix: &String| value.split_ascii_whitespace().any(|token| {
+                let beyond = if lowercase {
+                    token.get(..prefix.len())
+                        .filter(|head| head.eq_ignore_ascii_case(prefix))
+                        .and_then(|_| token[prefix.len()..].chars().next())
+                } else {
+                    token.strip_prefix(prefix.as_str()).and_then(|rest| rest.chars().next())
+                };
+                beyond.is_some_and(|next| next != '-')
+            });
+            if !self.class_prefixes.iter().all(has_prefix) { return false; }
         }
         if self.classes.iter().any(|class| {
             !attributes.iter().enumerate().any(|(index, (key, value))| {
@@ -25435,7 +25593,11 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                 };
                 let html_name = html_attribute_names && namespace_uri.is_none();
                 let name_matches = if html_name {
-                    local_name.eq_ignore_ascii_case(selector.name.as_str())
+                    local_name.len() == selector.name.len()
+                        && local_name
+                            .bytes()
+                            .zip(selector.name.bytes())
+                            .all(|(attribute, wanted)| attribute == wanted.to_ascii_lowercase())
                 } else {
                     local_name == selector.name.as_str()
                 };
@@ -25465,6 +25627,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             && self.tag.is_none()
             && self.id.is_none()
             && self.classes.is_empty()
+            && self.class_prefixes.is_empty()
             && self.attributes.is_empty()
             && self.languages.is_empty()
             && self.structural.is_empty()
@@ -25485,7 +25648,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
             _ => false,
         }))
             && !self.universal && !self.root && !self.slotted && self.part.is_none()
-            && self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
+            && self.tag.is_none() && self.id.is_none() && self.classes.is_empty() && self.class_prefixes.is_empty()
             && self.attributes.is_empty() && self.languages.is_empty() && self.structural.is_empty()
     }
 
@@ -25534,7 +25697,7 @@ fn matches_part_with_interaction(&self, document: &Document, node: NodeId) -> bo
                         return false;
                     }
                 }
-                LogicalPseudo::InvalidNesting | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) => {}
+                LogicalPseudo::InvalidNesting | LogicalPseudo::State(..) | LogicalPseudo::Heading(_) | LogicalPseudo::HasSlotted(_) => {}
                 LogicalPseudo::Is(selectors) => {
                     let old = selectors
                         .iter()
@@ -29484,6 +29647,17 @@ fn compute_for(kind: &NodeKind, parent: Option<&Style>, index: &StyleIndex,
     compute_for_named(kind, parent, index, context, ancestor_bloom, text, pseudo_target, None, None)
 }
 
+/// Declarations that do not apply to `::marker`; animations and transitions
+/// additionally skip the bidi and vertical-text properties.
+fn marker_ignores(value: &Value, animated: bool) -> bool {
+    match value {
+        Value::Position(_) | Value::Float(_) | Value::ListStyleType(_) | Value::ListStylePosition(_) | Value::ListStyleImage(_) => true,
+        Value::Display(display) => !matches!(display, Display::Block | Display::Inline | Display::InlineBlock),
+        Value::UnicodeBidi(_) | Value::Direction(_) => animated,
+        other => animated && other.slot() == extra_props::VALUE_BASE + value_props::const_index("text-combine-upright"),
+    }
+}
+
 fn compute_for_named(
     kind: &NodeKind,
     parent: Option<&Style>,
@@ -29959,6 +30133,9 @@ fn compute_for_named_registered_inner(
         copy_slot(215,parent,&mut style);
         copy_slot(219,parent,&mut style);
     }
+    if pseudo_target.is_some_and(PseudoElement::is_marker) {
+        marker_ua::apply(&mut style);
+    }
     if pseudo_target.is_none() {
         if let NodeKind::Element {namespace:Namespace::MathMl,name,..}=kind {
             if crate::svg::local_name(name)=="mi" {style.text_transform=TextTransform::MathAuto;}
@@ -30360,6 +30537,10 @@ fn compute_for_named_registered_inner(
                 style.width=Some(0.0);
                 style.height=Some(0.0);
             }
+            if pseudo_target.is_none() && context.is_some_and(|(document, node)|
+                crate::interaction::matches(document, node, crate::interaction::InteractionPseudo::FocusVisible)) {
+                focus_ring_ua::apply(&mut style);
+            }
             // HTML rendering defaults remain lower priority than author CSS.
             if *namespace == Namespace::Html && html_rendering_attribute(attributes, context, "hidden").is_some() && tag != "embed" {
                 if matches!(tag, "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr") {
@@ -30566,6 +30747,7 @@ fn compute_for_named_registered_inner(
         let source_url = rule.source_url.clone().or_else(|| index.document_base_url.clone());
         candidates.reserve(rule.declarations.len());
         for declaration in rule.declarations.iter() {
+            if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, false) { continue; }
             let layer = if declaration.important { important_layer } else { normal_layer };
             let priority = (
                 CascadeOrigin::author(declaration.important),
@@ -30636,6 +30818,7 @@ fn compute_for_named_registered_inner(
                 EffectOrigin::Transition => CascadeOrigin::Transition,
             };
             for declaration in &effect.declarations {
+                if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, true) { continue; }
                 candidates.push(((origin, [usize::MAX; 8], (0, 0, 0, 0), (0, usize::MAX)),
                     alloc::borrow::Cow::Borrowed(declaration), index.document_base_url.clone()));
             }

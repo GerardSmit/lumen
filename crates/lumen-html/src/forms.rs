@@ -3864,6 +3864,45 @@ fn pattern_mismatch(pattern: &str, value: &str, multiple_email: bool) -> bool {
     }
 }
 
+/// A textarea's form value: newlines normalized to LF, then hard-wrapped at
+/// `cols` characters when `wrap` is `hard`.
+fn textarea_entry_value(document: &Document, node: NodeId, raw: &str) -> String {
+    let normalized = if raw.contains('\r') {
+        raw.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        raw.to_owned()
+    };
+    if !attribute(document, node, "wrap").is_some_and(|wrap| wrap.eq_ignore_ascii_case("hard")) {
+        return normalized;
+    }
+    let cols = attribute(document, node, "cols")
+        .and_then(|cols| {
+            let digits = cols.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+            digits[..end].parse::<usize>().ok()
+        })
+        .filter(|cols| *cols > 0)
+        .unwrap_or(20);
+    let mut wrapped = String::with_capacity(normalized.len());
+    for (index, line) in normalized.split('\n').enumerate() {
+        if index != 0 {
+            wrapped.push('\n');
+        }
+        let characters: Vec<char> = line.chars().collect();
+        let mut start = 0;
+        while characters.len() - start > cols {
+            let limit = start + cols;
+            let space = (start + 1..=limit).rev().find(|at| characters[*at] == ' ');
+            let end = space.map_or(limit, |at| at + 1);
+            wrapped.extend(&characters[start..end]);
+            wrapped.push('\n');
+            start = end;
+        }
+        wrapped.extend(&characters[start..]);
+    }
+    wrapped
+}
+
 fn valid_email_address(value: &str) -> bool {
     let Some((local, domain)) = value.rsplit_once('@') else {
         return false;
@@ -4103,10 +4142,11 @@ pub fn append_form_entries_for_control(document:&Document,node:NodeId,submitter:
         let value = if tag == "input" && input_type == "hidden" && name.eq_ignore_ascii_case("_charset_") {
             encoding.to_owned()
         } else if tag == "textarea" {
-            state
+            let raw = state
                 .value_for_control(node)
                 .map(str::to_owned)
-                .unwrap_or_else(|| control_value(document, node, tag))
+                .unwrap_or_else(|| control_value(document, node, tag));
+            textarea_entry_value(document, node, &raw)
         } else if is_checkbox || is_radio {
             attribute(document, node, "value")
                 .unwrap_or("on")

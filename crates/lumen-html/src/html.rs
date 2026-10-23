@@ -3008,6 +3008,8 @@ pub fn tokenize_for_conformance(
             after_head: false,
             document_tail: 0,
             doctype_allowed: true,
+            frameset_ok: true,
+            frameset_mode: false,
         },
         final_input: true,
         stop_after_script: false,
@@ -3200,6 +3202,8 @@ fn parse_fragment_context(
             after_head: false,
             document_tail: 0,
             doctype_allowed: false,
+            frameset_ok: true,
+            frameset_mode: false,
         },
         final_input: true,
         stop_after_script: false,
@@ -3293,6 +3297,8 @@ struct ParserState {
     // Comment/PI placement after head (1), body (2), and html (3).
     document_tail: u8,
     doctype_allowed: bool,
+    frameset_ok: bool,
+    frameset_mode: bool,
 }
 
 impl ParserState {
@@ -3342,6 +3348,8 @@ impl ParserState {
             after_head: false,
             document_tail: 0,
             doctype_allowed: true,
+            frameset_ok: true,
+            frameset_mode: false,
         }
     }
 }
@@ -3731,6 +3739,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         None
     }
     fn parent(&self) -> NodeId {
+        if self.frameset_mode && self.stack.is_empty() {
+            return self.html.unwrap_or(self.body);
+        }
         if self.html.is_none() && self.fragment_context == Some(Tag::Html) && self.stack.len() == 1
         {
             return self.body;
@@ -4114,7 +4125,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     | Tag::Tr
             ),
             Tag::Colgroup => {
-                if tag == Tag::Col {
+                if tag == Tag::Template {
+                    false
+                } else if tag == Tag::Col {
                     true
                 } else if tag == Tag::Colgroup {
                     self.close_open(Tag::Colgroup);
@@ -4657,7 +4670,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             if self.stack.last().is_some_and(|open| open.tag == Tag::Style) {
                 self.pop_open_element();
             }
-            if self.html.is_some() {
+            if self.html.is_some() && !self.frameset_mode {
                 self.ensure_scaffold(self.body)?;
             }
             self.refresh_selected_content()?;
@@ -5046,6 +5059,19 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
  self.emit_conformance_token(ConformanceToken::EndTag(name.to_string()));
  }
         let tag = Tag::classify(&name);
+        if self.frameset_mode {
+            if tag == Tag::Frameset && self.stack.last().is_some_and(|open| open.tag == Tag::Frameset) {
+                self.pop_open_element();
+                return Ok(());
+            }
+            if tag == Tag::Html && self.stack.is_empty() {
+                self.document_tail = 3;
+                return Ok(());
+            }
+            if tag != Tag::Noframes {
+                return Ok(());
+            }
+        }
         let namespace = self.adjusted_current_namespace();
         if namespace != Namespace::Html && self.close_matching_integration_point(&name) {
             return Ok(());
@@ -5320,6 +5346,9 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                 }
             }
         }
+        if self.frameset_start_tag(tag, &name, &attributes, start)? {
+            return Ok(());
+        }
         if let Some(context) = self.fragment_context {
             if matches!(tag, Tag::Html | Tag::Head | Tag::Body) && context != Tag::Html {
                 return Ok(());
@@ -5408,6 +5437,7 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
                     return Ok(());
                 }
                 Tag::Body => {
+                    self.frameset_ok = false;
                     self.merge_scaffold_attributes(self.body, attributes)?;
                     self.ensure_scaffold(self.body)?;
                     self.in_head = false;
@@ -5698,19 +5728,19 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             Tag::Li => self.close_in_scope(&[Tag::Li], &[Tag::Ol, Tag::Ul]),
             Tag::Dt | Tag::Dd => self.close_in_scope(&[Tag::Dt, Tag::Dd], &[Tag::Dl]),
             Tag::Tbody | Tag::Thead | Tag::Tfoot => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Table]);
-                self.close_in_scope(&[Tag::Tr], &[Tag::Table]);
-                self.close_in_scope(&[Tag::Tbody, Tag::Thead, Tag::Tfoot], &[Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tr], &[Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tbody, Tag::Thead, Tag::Tfoot], &[Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[Tag::Table]);
             }
             Tag::Tr => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table]);
-                self.close_in_scope(&[Tag::Tr], &[Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table, Tag::Template]);
+                self.close_in_scope(&[Tag::Tr], &[Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[Tag::Table, Tag::Tbody, Tag::Thead, Tag::Tfoot]);
                 self.imply_tbody(start)?;
             }
             Tag::Td | Tag::Th => {
-                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table]);
+                self.close_in_scope(&[Tag::Td, Tag::Th], &[Tag::Tr, Tag::Table, Tag::Template]);
                 self.clear_to_table_context(&[
                     Tag::Table,
                     Tag::Tbody,
@@ -5938,6 +5968,128 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         Ok(())
     }
 
+    /// Frameset handling for start tags; returns true when the token is
+    /// consumed, otherwise records frameset-ok bookkeeping and lets the
+    /// generic insertion continue.
+    fn frameset_start_tag(
+        &mut self,
+        tag: Tag,
+        name: &str,
+        attributes: &[(Name, String)],
+        start: usize,
+    ) -> Result<bool, ParseError> {
+        let document_parse = self.html.is_some() && self.fragment_context.is_none();
+        let ignoring_fragment = self
+            .fragment_context
+            .is_some_and(|context| !matches!(context, Tag::Html | Tag::Frameset));
+        if self.frameset_mode {
+            self.frameset_mode_start_tag(tag, name, attributes, start)?;
+            return Ok(true);
+        }
+        if self.fragment_context == Some(Tag::Frameset)
+            && !matches!(tag, Tag::Frame | Tag::Frameset | Tag::Noframes)
+        {
+            return Ok(true);
+        }
+        if matches!(tag, Tag::Frame | Tag::Frameset) && (ignoring_fragment || document_parse) {
+            if document_parse {
+                self.html_started = true;
+                self.doctype_allowed = false;
+            }
+            if tag == Tag::Frameset
+                && document_parse
+                && self.template_modes.is_empty()
+                && (!self.body_started || self.frameset_ok)
+            {
+                self.begin_frameset(attributes, start)?;
+            }
+            return Ok(true);
+        }
+        if document_parse && self.template_modes.is_empty() {
+            let clears = match tag {
+                Tag::Li | Tag::Dd | Tag::Dt | Tag::Plaintext | Tag::Button | Tag::Applet
+                | Tag::Marquee | Tag::Object | Tag::Table | Tag::Area | Tag::Br | Tag::Embed
+                | Tag::Img | Tag::Keygen | Tag::Wbr | Tag::Hr | Tag::Textarea | Tag::Xmp
+                | Tag::Iframe | Tag::Noembed | Tag::Select => true,
+                Tag::Input => !attributes
+                    .iter()
+                    .any(|(key, value)| key == "type" && value.eq_ignore_ascii_case("hidden")),
+                Tag::Template => self.body_started,
+                _ => false,
+            };
+            if clears {
+                self.frameset_ok = false;
+            }
+        }
+        Ok(false)
+    }
+
+    fn begin_frameset(&mut self, attributes: &[(Name, String)], start: usize) -> Result<(), ParseError> {
+        let Some(head) = self.head.filter(|_| self.html.is_some()) else { return Ok(()); };
+        self.truncate_open_elements(0);
+        self.formatting.clear();
+        self.form_element = None;
+        if self.scaffold_attached & 4 != 0 {
+            self.document.detach(self.body).map_err(|failure| dom_error(start, failure))?;
+            self.scaffold_attached &= !4;
+        }
+        self.ensure_scaffold(head)?;
+        self.html_started = true;
+        self.doctype_allowed = false;
+        self.in_head = false;
+        self.after_head = false;
+        self.body_started = true;
+        self.document_tail = 0;
+        self.frameset_mode = true;
+        self.insert_frameset_element("frameset", Tag::Frameset, attributes, start, true)
+    }
+
+    fn frameset_mode_start_tag(
+        &mut self,
+        tag: Tag,
+        name: &str,
+        attributes: &[(Name, String)],
+        start: usize,
+    ) -> Result<(), ParseError> {
+        let in_frameset = !self.stack.is_empty();
+        match tag {
+            Tag::Html => {
+                if let Some(html) = self.html {
+                    self.merge_scaffold_attributes(html, attributes.to_vec())?;
+                }
+                Ok(())
+            }
+            Tag::Frameset if in_frameset => self.insert_frameset_element(name, tag, attributes, start, true),
+            Tag::Frame if in_frameset => self.insert_frameset_element(name, tag, attributes, start, false),
+            Tag::Noframes => self.insert_frameset_element(name, tag, attributes, start, true),
+            _ => Ok(()),
+        }
+    }
+
+    fn insert_frameset_element(
+        &mut self,
+        name: &str,
+        tag: Tag,
+        attributes: &[(Name, String)],
+        start: usize,
+        push: bool,
+    ) -> Result<(), ParseError> {
+        let parent = self.parent();
+        let id = self
+            .document
+            .create_unprefixed_at(parent, Namespace::Html, Name::new(name), attributes.to_vec())
+            .map_err(|failure| dom_error(start, failure))?;
+        let registry_context = self.registry_context(parent);
+        self.document
+            .record_parser_element_birth(id, registry_context, self.html.is_some())
+            .map_err(|failure| dom_error(start, failure))?;
+        self.insert_token_element(parent, id, None)?;
+        if push {
+            self.stack.push(Open { id, tag });
+        }
+        Ok(())
+    }
+
     fn imply_tbody(&mut self, offset: usize) -> Result<(), ParseError> {
         if self.parent_tag() == Tag::Table
             || (self.parent_tag() == Tag::Template
@@ -5989,6 +6141,16 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
         };
         let raw = raw.as_ref();
         let whitespace = raw.bytes().all(|byte| byte.is_ascii_whitespace());
+        if self.frameset_mode && self.stack.last().is_none_or(|open| open.tag != Tag::Noframes) {
+            let spaces: String = decode_text(raw, predecoded)
+                .chars()
+                .filter(|character| matches!(character, ' ' | '\t' | '\n' | '\x0c' | '\r'))
+                .collect();
+            return self.append_text(Cow::Owned(spaces), start);
+        }
+        if !whitespace && self.template_modes.is_empty() {
+            self.frameset_ok = false;
+        }
         if self.template_modes.last() == Some(&TemplateMode::InColumnGroup) && !whitespace {
             return Ok(());
         }

@@ -28,6 +28,7 @@ mod paint_worklet;
 mod paint_timing;
 mod browser_services;
 mod browsing_context;
+mod window_features;
 mod realm_services;
 pub use browser_services::{set_navigator_profile, ClipboardHost, ClipboardOperation, ClipboardPermission, NavigatorProfile};
 pub use browsing_context::{
@@ -851,6 +852,7 @@ pub struct DomRealm {
     xml_document_parser: RefCell<Option<lumen_html::xml::XmlDocumentParser>>,
     document_parser_retention: RefCell<Vec<ParserRetention>>,
     pending_parser_source: RefCell<Option<String>>,
+    stream_container_load: Cell<bool>,
     parser_generation: Cell<u64>,
     dynamic_markup_insertion_counter: Cell<usize>,
     scripts: RefCell<script_loading::ScriptLoader>,
@@ -2201,7 +2203,50 @@ impl DomRealm {
         if self.parser_generation.get() != generation {
             return Ok(());
         }
-        self.set_document_ready_state(ctx, DocumentReadyState::Complete)
+        self.set_document_ready_state(ctx, DocumentReadyState::Complete)?;
+        if self.ready_state.get() == DocumentReadyState::Complete && self.stream_scripts.borrow().opened {
+            self.queue_nested_stream_load(ctx, generation)?;
+        }
+        Ok(())
+    }
+
+    /// A document.open() stream inside a nested browsing context finishes
+    /// loading like a navigation: the window and the container element get
+    /// their `load` events.
+    fn queue_nested_stream_load(self: &Rc<Self>, ctx: &mut Ctx, generation: u64) -> OpResult<()> {
+        let Some(context) = self.browsing_context() else { return Ok(()); };
+        if context.container_document().is_none() || context.container_node().is_none() {
+            return Ok(());
+        }
+        let document = self.clone();
+        scheduling::queue_task(ctx, move |ctx| {
+            if document.parser_generation.get() != generation || document.ready_state.get() != DocumentReadyState::Complete {
+                return Ok(());
+            }
+            if let Some(frame) = document.navigation_context() {
+                frame.claim_initial_blank_load();
+            }
+            document.stream_container_load.set(true);
+            let Some(handle) = document.relevant_host_realm(ctx) else {
+                document.stream_container_load.set(false);
+                return Ok(());
+            };
+            ctx.with_host_realm(&handle, |ctx| document.dispatch_window_user_agent(ctx, "load", false, false))
+                .map_err(browsing_context::host_realm_error)??;
+            Ok(())
+        })
+    }
+
+    fn fire_stream_container_load(self: &Rc<Self>, ctx: &mut Ctx) {
+        let Some(context) = self.browsing_context() else { return; };
+        let (Some(container), Some(node)) = (context.container_document(), context.container_node()) else { return; };
+        let connected = {
+            let session = container.session.borrow();
+            script_loading::is_connected(session.document(), node)
+        };
+        if connected {
+            let _ = container.dispatch_user_agent(ctx, node, "load", false, false, &[]);
+        }
     }
 
     fn run_inserted_parser_scripts(
@@ -4093,6 +4138,7 @@ impl DomRealm {
             )?;
             if kind == "load" { self.lifecycle.times.load_finished(); }
             if kind == "load" { history::restore_form_state_before_pageshow(ctx,self)?;navigation_lifecycle::page_transition(ctx, self, "pageshow")?; }
+            if kind == "load" && self.stream_container_load.replace(false) { self.fire_stream_container_load(ctx); }
             Ok(result)
         } else {
             events::dispatch_user_agent_event(ctx, lumen_bind::This(window), event)
@@ -12514,6 +12560,7 @@ impl DomNode {
             node: self.id,
             computed: false,
             pseudo: None,
+            highlight: None,
             invalid_pseudo: false,
             _owner: this.0,
         });
@@ -14132,6 +14179,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
             xml_document_parser: RefCell::new(None),
             document_parser_retention: RefCell::new(Vec::new()),
             pending_parser_source: RefCell::new(None),
+            stream_container_load: Cell::new(false),
             parser_generation: Cell::new(0),
             dynamic_markup_insertion_counter: Cell::new(0),
             scripts: RefCell::new(script_loading::ScriptLoader::default()),

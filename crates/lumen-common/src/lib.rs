@@ -124,3 +124,5 @@ pub mod xml;
 
 #[cfg(feature="vector-path")]
 pub mod svg_path;
+#[cfg(feature="vector-path")]
+pub mod svg_path_measure;

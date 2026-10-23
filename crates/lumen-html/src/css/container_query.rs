@@ -311,20 +311,7 @@ fn serialize_style_feature(content: &str) -> String {
 }
 
 pub(super) fn collapse_whitespace(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut pending_space = false;
-    for ch in text.trim().chars() {
-        if ch.is_whitespace() {
-            pending_space = true;
-        } else {
-            if pending_space {
-                output.push(' ');
-                pending_space = false;
-            }
-            output.push(ch);
-        }
-    }
-    output
+    crate::svg_text_path::collapse_whitespace_with(text, char::is_whitespace)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

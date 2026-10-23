@@ -19,8 +19,12 @@ pub(crate) fn window_open(ctx: &mut Ctx, source: &Rc<DomRealm>, url: &str, targe
     let disowned=features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|matches!(feature.split('=').next(),Some("noopener"|"noreferrer")) && !matches!(feature.split('=').nth(1),Some("0"|"no")));
     let target=if target.is_empty(){"_blank"}else{target};
     let target=if disowned && !matches!(target.to_ascii_lowercase().as_str(),"_self"|"_parent"|"_top"){"_blank"}else{target};
+    let contexts_before=context.group_context_count();
     let Some(target)=context.choose_navigation_target(ctx,target)? else{return Ok(Value::Null)};
     if disowned {target.disown_opener();}
+    if target.group_context_count()>contexts_before {
+        target.set_window_features(crate::window_features::WindowFeatures::parse(&features));
+    }
     if let Some(url) = url {
         let mut metadata=browsing_context::NavigationMetadata::from_document(source);
         if features.split(|character:char|character==',' || character.is_ascii_whitespace()).any(|feature|feature.split('=').next()==Some("noreferrer") && !matches!(feature.split('=').nth(1),Some("0"|"no"))) {metadata.referrer.policy=lumen_common::referrer::ReferrerPolicy::NoReferrer;}
@@ -158,6 +162,17 @@ impl DomWindow {
     }
 
     fn viewport_size(&self) -> OpResult<(u32, u32)> {
+        let (width, height) = self.layout_viewport_size()?;
+        let features = self.window_features();
+        Ok((if features.width != 0 { features.width } else { width }, if features.height != 0 { features.height } else { height }))
+    }
+
+    fn window_features(&self) -> crate::window_features::WindowFeatures {
+        self.base.associated_realm().and_then(|realm| realm.browsing_context())
+            .map(|context| context.window_features()).unwrap_or_default()
+    }
+
+    fn layout_viewport_size(&self) -> OpResult<(u32, u32)> {
         let Some(realm) = self.base.associated_realm() else {
             return Ok((0, 0));
         };
@@ -395,23 +410,27 @@ crate::event_content_handlers::bind_window_handlers! {
     fn resize_by(_this: lumen_bind::This<Value>, _x: i32, _y: i32) {}
 
     #[getter(hint(js(global)))]
-    fn screen_x(_this: lumen_bind::This<Value>) -> i32 {
-        0
+    fn screen_x(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<i32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.window_features().left as i32)
     }
 
     #[getter(hint(js(global)))]
-    fn screen_y(_this: lumen_bind::This<Value>) -> i32 {
-        0
+    fn screen_y(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<i32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.window_features().top as i32)
     }
 
     #[getter(hint(js(global)))]
-    fn screen_left(_this: lumen_bind::This<Value>) -> i32 {
-        0
+    fn screen_left(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<i32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.window_features().left as i32)
     }
 
     #[getter(hint(js(global)))]
-    fn screen_top(_this: lumen_bind::This<Value>) -> i32 {
-        0
+    fn screen_top(ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<i32> {
+        let receiver=window_attribute_receiver(ctx,this.0);
+        ctx.with_instance::<DomWindow,_>(&receiver,|window|window.window_features().top as i32)
     }
 
     #[getter(hint(js(global)))]

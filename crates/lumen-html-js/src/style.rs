@@ -11,6 +11,8 @@ pub struct DomStyle {
     pub(crate) node: NodeId,
     pub(crate) computed: bool,
     pub(crate) pseudo: Option<css::PseudoElement>,
+    /// Cascade key of the highlight pseudo-element when `pseudo` is `Highlight`.
+    pub(crate) highlight: Option<String>,
     pub(crate) invalid_pseudo: bool,
     pub(crate) _owner: Value,
 }
@@ -135,6 +137,9 @@ impl DomStyle {
     fn resolved_style(&self, session: &mut lumen_html::session::RenderSession, fonts:Option<&super::canvas::CanvasFontSource>) -> Result<css::Style, lumen_html::layout::LayoutError> {
         let text=fonts.map(|fonts|fonts as &dyn lumen_html::paint::TextShaper);
         match self.pseudo {
+            Some(css::PseudoElement::Highlight) if self.highlight.is_some() => {
+                session.computed_highlight_style_with_text(self.node, self.highlight.as_deref().unwrap_or_default(), text)
+            }
             Some(pseudo) => session.computed_pseudo_style_with_text(self.node, pseudo,text),
             None => session.computed_style_with_text(self.node,text),
         }
@@ -201,6 +206,7 @@ pub(crate) fn computed_property_value(
         node,
         computed: true,
         pseudo: None,
+        highlight: None,
         invalid_pseudo: false,
         _owner: Value::Undefined,
     }
@@ -734,6 +740,8 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
         "::first-letter" | ":first-letter" => Some(css::PseudoElement::FirstLetter),
         _ => None,
     };
+    let highlight = if parsed.is_none() { css::highlight_pseudo_key(&pseudo) } else { None };
+    let parsed = if highlight.is_some() { Some(css::PseudoElement::Highlight) } else { parsed };
     if pseudo.starts_with("::part(") || pseudo.starts_with("::slotted(") {
         return Err(OpError::type_error("getComputedStyle does not accept part or slotted pseudo-elements"));
     }
@@ -742,6 +750,7 @@ pub(crate) fn get_computed_style(ctx: &mut Ctx, element: ComputedStyleElement, p
         node: id,
         computed: true,
         pseudo: parsed,
+        highlight,
         invalid_pseudo: !pseudo.is_empty() && parsed.is_none(),
         _owner: element.0.value.clone(),
     })

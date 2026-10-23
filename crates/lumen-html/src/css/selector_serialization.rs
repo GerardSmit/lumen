@@ -9,13 +9,24 @@ fn push(output: &mut String, value: &str) -> Result<(), CssError> {
     output.try_reserve(value.len()).map_err(|_| selector_error(0, "selector serialization allocation failed"))?;
     output.push_str(value); Ok(())
 }
+const FORGIVEN: char = '\u{1}';
+
 pub fn serialize(input: &str, map: &NamespaceMap, nesting: bool) -> Result<String, CssError> {
-    list(input, map, nesting, false, false, false, 0)
+    let mut output = list(input, map, nesting, false, false, false, 0)?;
+    output.retain(|character| character != FORGIVEN);
+    Ok(output)
+}
+/// Whether a forgiving `:is()`/`:where()` list holds an item that is kept
+/// verbatim because it is invalid; `selector()` support treats that as unsupported.
+pub fn has_forgiven_items(input: &str, map: &NamespaceMap, nesting: bool) -> bool {
+    list(input, map, nesting, false, false, false, 0).is_ok_and(|output| output.contains(FORGIVEN))
 }
 /// Serializes a relative selector list such as `> .child`, which `@scope`
 /// style rules keep unabsolutized.
 pub fn serialize_relative(input: &str, map: &NamespaceMap) -> Result<String, CssError> {
-    list(input, map, true, true, false, false, 0)
+    let mut output = list(input, map, true, true, false, false, 0)?;
+    output.retain(|character| character != FORGIVEN);
+    Ok(output)
 }
 fn list(input: &str, map: &NamespaceMap, nesting: bool, relative: bool, forgiving: bool, logical_subject: bool, depth: usize) -> Result<String, CssError> {
     if depth > MAX_SELECTOR_NESTING { return Err(selector_error(0, "selector nesting limit exceeded")); }
@@ -26,8 +37,19 @@ fn list(input: &str, map: &NamespaceMap, nesting: bool, relative: bool, forgivin
     for (start, end) in selector_list_spans(input, 0, forgiving)? {
         let part = &input[start..end];
         let valid = if relative { parse_relative_selector_list_depth(part, start, depth, nesting, map).map(|_| ()) }
-            else { parse_selector_depth(part, start, depth, nesting, map).map(|_| ()) };
-        if let Err(error) = valid { if forgiving && !selector_limit_error(&error) { continue; } return Err(error); }
+            else {
+                parse_selector_depth(part, start, depth, nesting, map).and_then(|selector| {
+                    if forgiving && selector.pseudo_element.is_some() { Err(selector_error(start, "pseudo-element in forgiving selector list")) } else { Ok(()) }
+                })
+            };
+        if let Err(error) = valid {
+            if forgiving && !selector_limit_error(&error) {
+                if !output.is_empty() { push(&mut output, ", ")?; }
+                push(&mut output, "\u{1}")?; push(&mut output, part.trim_ascii())?; push(&mut output, "\u{1}")?;
+                continue;
+            }
+            return Err(error);
+        }
         let value = chain(part, map, nesting, relative, logical_subject, depth)?;
         if !output.is_empty() { push(&mut output, ", ")?; } push(&mut output, &value)?;
     }
@@ -73,10 +95,14 @@ fn compound(input: &str, map: &NamespaceMap, nesting: bool, logical_subject: boo
     let mut position = parsed.end;
     while position < input.len() {
         match input.as_bytes()[position] {
-            b'.' | b'#' => {
+            kind @ (b'.' | b'#') => {
                 push(&mut output, &input[position..position + 1])?; position += 1;
                 let name = consume_selector_identifier(input, &mut position).ok_or_else(|| selector_error(position, "invalid selector identifier"))?;
                 push(&mut output, &serialize_identifier(&name))?;
+                if kind == b'.' && name.ends_with('-') && input.as_bytes().get(position) == Some(&b'*') {
+                    push(&mut output, "*")?;
+                    position += 1;
+                }
             },
             b'[' => {
                 let end = matching_css_block(input, position).ok_or_else(|| selector_error(position, "unterminated attribute selector"))?;
@@ -122,10 +148,11 @@ fn attribute(input: &str, map: &NamespaceMap) -> Result<String, CssError> {
 }
 fn arguments(name: &str, input: &str, map: &NamespaceMap, nesting: bool, depth: usize) -> Result<String, CssError> {
     match name {
+        "not" if input.trim().eq_ignore_ascii_case(":current") => Ok(String::from(":current")),
         "is" | "where" | "not" => list(input, map, nesting, false, name != "not", true, depth),
         "has" => list(input, map, nesting, true, false, false, depth),
         "host" => list(input, map, nesting, false, false, true, depth),
-        "slotted" => list(input, map, nesting, false, false, false, depth),
+        "slotted" | "has-slotted" => list(input, map, nesting, false, false, false, depth),
         "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
             let ((a, b), _) = parse_nth_argument(input, 0, depth, matches!(name, "nth-child" | "nth-last-child"), nesting, map)?;
             let mut output = if a == 0 { b.to_string() } else {
@@ -182,7 +209,7 @@ mod tests {
     fn specification_cssom_selector_serialization_logical_subjects_and_functions() {
         let map=NamespaceMap::from_stylesheet("@namespace url('urn:default');@namespace other url('urn:other');").unwrap();
         let cases=[
-            (":is( *.class, .class, missing|e)",":is(*.class, .class)"),
+            (":is( *.class, .class, missing|e)",":is(*.class, .class, missing|e)"),
             (":not(*.class)",":not(*.class)"),
             (":where(other|*.class)",":where(other|*.class)"),
             (":host(*.class)",":host(*.class)"),
