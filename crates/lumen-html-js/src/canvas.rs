@@ -5104,7 +5104,7 @@ fn canvas_source_pixels(ctx: &mut Ctx, source: Value) -> OpResult<Option<CanvasS
             image_loading::CanvasImageState::Available(bitmap) => Ok(Some(match bitmap {
                 lumen_html::layout::NodeBitmap::Decoded(image) => CanvasSource::Pixels(image),
                 lumen_html::layout::NodeBitmap::Lazy(lazy) => {
-                    if lazy.is_known_corrupt() || lazy.pixels().is_none() {
+                    if lazy.is_known_corrupt() {
                         return Err(OpError::new("InvalidStateError", "image source has a broken current request"));
                     }
                     CanvasSource::Lazy(lazy)
