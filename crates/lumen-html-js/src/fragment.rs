@@ -153,7 +153,7 @@ fn scroll(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Indicated> {
         Indicated::None=>{},
         Indicated::Top=>{
             let root = realm.session.borrow().document().root();
-            scrolling::apply_offset(ctx,realm,root,0.0,0.0,scrolling::ScrollBehavior::Auto)?;
+            scrolling::apply_offset_unsnapped(ctx,realm,root,0.0,0.0,scrolling::ScrollBehavior::Auto)?;
         },
         Indicated::Element(node)=>{
             let _lease = NodeRetention::new(realm,node);

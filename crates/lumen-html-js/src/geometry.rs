@@ -518,6 +518,16 @@ pub(crate) fn event_padding_origin(
     Some((rect.x + border[3], rect.y + border[0]))
 }
 
+/// Replaced elements generate an atomic inline box, which has client dimensions.
+fn is_inline_replaced(document: &lumen_html::Document, node: NodeId) -> bool {
+    match document.kind(node) {
+        Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Html, name, .. }) =>
+            matches!(lumen_html::svg::local_name(name), "img" | "video" | "canvas" | "iframe"),
+        Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Svg, name, .. }) => lumen_html::svg::local_name(name) == "svg",
+        _ => false,
+    }
+}
+
 /// Read layout geometry without forcing a layout pass. A missing snapshot means
 /// the renderer has not completed layout for the current document version.
 pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySnapshot> {
@@ -546,7 +556,8 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
     let metrics = box_metrics(layout_box, &style);
     // CSSOM View client dimensions use the viewport for the standards root
     // and quirks BODY, independently of their actual CSS box dimensions.
-    let client_size = if !connected || associated_box.is_none() || style.display == lumen_html::css::Display::Inline {
+    let client_size = if !connected || associated_box.is_none()
+        || style.display == lumen_html::css::Display::Inline && !is_inline_replaced(session.document(), node) {
         (0.0, 0.0)
     } else if if session.document().document_mode() == lumen_html::DocumentMode::Quirks {
         scrolling::html_body(session.document()) == Some(node)

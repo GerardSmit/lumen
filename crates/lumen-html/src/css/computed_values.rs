@@ -31,6 +31,8 @@ pub struct ComputedValueContext<'a> {
     pub grid_row_names: Option<&'a [GridNamedLine]>,
     /// A grid container whose parent is not a grid container ignores `subgrid`.
     pub subgrid_ignored: bool,
+    /// Typed OM computed values keep a border width whose style paints nothing.
+    pub independent_border_widths: bool,
 }
 
 pub fn needs_layout(name: &str) -> bool {
@@ -450,7 +452,16 @@ impl Style {
             .map(|(width, height)| self.resolve_percentages(width, height));
         let used = resolved.as_ref().unwrap_or(self);
         let physical = side(name).or_else(|| logical_side(self, name));
+        let border_widths = || if context.independent_border_widths { used.border_width_sides() } else { used.used_border_widths() };
         let result = match name {
+            "display" if self.display_ruby != 0 => match self.display_ruby {
+                1 if self.display == Display::Block => "block ruby",
+                1 => "ruby",
+                2 => "ruby-base",
+                3 => "ruby-text",
+                4 => "ruby-base-container",
+                _ => "ruby-text-container",
+            }.into(),
             "display" if self.is_list_item() => match self.display {
                 Display::Inline => "inline list-item",
                 Display::InlineBlock => "inline flow-root list-item",
@@ -609,7 +620,7 @@ impl Style {
                 self.outline.style.as_str(),
                 style_color(self,187,self.outline.color.unwrap_or(self.color)),
             ),
-            "border-width" => four(used.used_border_widths().map(px)),
+            "border-width" => four(border_widths().map(px)),
             "border-style" => four(self.border_styles().map(|value| value.as_str().into())),
             "border-color" => four(core::array::from_fn(|edge| {
                 style_color(self,119+edge,self.border_color_sides[edge].unwrap_or(self.border_color))
@@ -618,14 +629,14 @@ impl Style {
                 let edges = self.logical_sides();
                 let start = if name.starts_with("border-inline-") {0} else {2};
                 let component = |side: usize| {
-                    if name.ends_with("-width") {px(used.used_border_widths()[side])}
+                    if name.ends_with("-width") {px(border_widths()[side])}
                     else if name.ends_with("-style") {self.border_styles()[side].as_str().into()}
                     else {style_color(self,119+side,self.border_color_sides[side].unwrap_or(self.border_color))}
                 };
                 pair(component(edges[start]),component(edges[start+1]))
             }
             property if physical.is_some() && property.starts_with("border-") && property.ends_with("-width") => {
-                px(used.used_border_widths()[physical?])
+                px(border_widths()[physical?])
             }
             property if physical.is_some() && property.starts_with("border-") && property.ends_with("-style") => {
                 self.border_styles()[physical?].as_str().into()
@@ -709,7 +720,9 @@ impl Style {
                 FlexDirection::ColumnReverse => "column-reverse",
             }
             .into(),
-            "flex-wrap" => if self.flex_wrap_reverse {
+            "flex-wrap" => if self.flex_wrap_balance {
+                if self.flex_wrap_reverse { "wrap-reverse balance" } else { "balance" }
+            } else if self.flex_wrap_reverse {
                 "wrap-reverse"
             } else if self.flex_wrap {
                 "wrap"

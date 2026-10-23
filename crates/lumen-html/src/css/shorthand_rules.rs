@@ -26,8 +26,37 @@ pub(super) fn expand(name: &str, raw: &str, arity: usize) -> Option<Vec<String>>
         "-webkit-text-stroke" => text_stroke(&tokens),
         "vertical-align" => vertical_align(&tokens),
         "font-synthesis" => font_synthesis(&tokens),
+        "line-clamp" => line_clamp(&tokens),
         _ => None,
     }
+}
+
+fn line_clamp(tokens: &[&str]) -> Option<Vec<String>> {
+    if tokens.len() == 1 && decoded_css_keyword(tokens[0], "none") {
+        return Some(alloc::vec![String::from("auto"), String::from("no-ellipsis"), String::from("normal")]);
+    }
+    let (tokens, legacy) = match tokens.split_last() {
+        Some((last, rest)) if decoded_css_keyword(last, "-webkit-legacy") => (rest, true),
+        _ => (tokens, false),
+    };
+    let is_ellipsis = |token: &str| token.starts_with(['"', '\'']) || decoded_css_keyword(token, "no-ellipsis") || decoded_css_keyword(token, "ellipsis");
+    let at_start = tokens.first().is_some_and(|token| is_ellipsis(token));
+    let at_end = tokens.last().is_some_and(|token| is_ellipsis(token));
+    let (ellipsis, lines) = match (at_start, at_end) {
+        (true, _) => (Some(tokens[0]), &tokens[1..]),
+        (false, true) => (Some(tokens[tokens.len() - 1]), &tokens[..tokens.len() - 1]),
+        (false, false) => (None, tokens),
+    };
+    if ellipsis.is_none() && lines.is_empty() {
+        return None;
+    }
+    let lines = if lines.is_empty() { String::from("auto") } else { specified("max-lines", &lines.join(" "))? };
+    let ellipsis = match ellipsis {
+        Some(token) => specified("block-ellipsis", token)?,
+        None => String::from("ellipsis"),
+    };
+    let behavior = if legacy { "-webkit-legacy" } else { "collapse" };
+    Some(alloc::vec![lines, ellipsis, String::from(behavior)])
 }
 
 fn text_box(tokens: &[&str]) -> Option<Vec<String>> {
@@ -182,6 +211,24 @@ pub(super) fn synthesize(name: &str, values: &[&str], computed: bool) -> Option<
             let parts: Vec<&str> = [(style, "none"), (color, "currentcolor")].into_iter()
                 .filter(|(value, initial)| value != initial).map(|(value, _)| value).collect();
             Some(if parts.is_empty() { String::from("none") } else { parts.join(" ") })
+        }
+        "line-clamp" => {
+            let &[lines, ellipsis, behavior] = values else { return None };
+            if lines == "auto" && ellipsis == "no-ellipsis" && behavior == "normal" {
+                return Some(String::from("none"));
+            }
+            if !matches!(behavior, "collapse" | "-webkit-legacy") {
+                return None;
+            }
+            let mut text = String::from(lines);
+            if ellipsis != "ellipsis" {
+                text.push(' ');
+                text.push_str(ellipsis);
+            }
+            if behavior == "-webkit-legacy" {
+                text.push_str(" -webkit-legacy");
+            }
+            Some(text)
         }
         "font-synthesis" => {
             let &[weight, style, small_caps, position] = values else { return None };

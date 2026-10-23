@@ -2949,6 +2949,7 @@ pub struct StyleExtras {
     pub grid_lanes: bool,
     pub display_inline: bool,
     pub display_list_item: bool,
+    pub display_ruby: u8,
     pub grid_lanes_direction: GridLanesDirection,
     pub grid_lanes_dense: bool,
     pub flow_tolerance: FlowTolerance,
@@ -3045,6 +3046,7 @@ pub struct StyleExtras {
     pub align_self_safe: Option<bool>,
     pub justify_self_safe: Option<bool>,
     pub flex_wrap_reverse: bool,
+    pub flex_wrap_balance: bool,
     pub align_self: Option<AlignItems>,
     pub position: Position,
     pub float: Float,
@@ -3207,6 +3209,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     grid_lanes: false,
     display_inline: false,
     display_list_item: false,
+    display_ruby: 0,
     grid_lanes_direction: GridLanesDirection {
         row: None,
         fill_reverse: false,
@@ -3309,6 +3312,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     align_self_safe: None,
     justify_self_safe: None,
     flex_wrap_reverse: false,
+    flex_wrap_balance: false,
     align_self: None,
     position: Position::Static,
     float: Float::None,
@@ -3822,6 +3826,14 @@ impl Style {
             }
         }
     }
+    /// Whether the cascade declared a width (or height) at all, including a
+    /// percentage or calculation that is not yet resolved to pixels.
+    pub(crate) fn declares_dimension(&self, width: bool) -> bool {
+        let slot = if width { 3 } else { 4 };
+        (if width { self.width } else { self.height }).is_some()
+            || self.relative_lengths.iter().any(|(key, _)| *key == slot)
+            || self.relative_expressions.iter().any(|source| source.slot == slot)
+    }
     pub(crate) fn has_contextual_svg_dimensions(&self) -> bool {
         self.relative_lengths.iter().any(|(slot, _)| matches!(*slot, 3 | 4 | 23 | 24 | 51 | 52))
             || self.relative_expressions.iter().any(|source| matches!(source.slot, 3 | 4 | 23 | 24 | 51 | 52))
@@ -3954,6 +3966,7 @@ impl Style {
     pub fn blockify_display(&mut self) {
         self.display = self.display.blockified();
         self.display_inline = false;
+        if self.display_ruby > 1 { self.display_ruby = 0; }
     }
 
     /// Whether this computed display generates an element's principal box.
@@ -5796,8 +5809,7 @@ fn legacy_font_size(raw: &str) -> Option<f32> {
     let value = if relative {
         if negative { 3u8.saturating_sub(value) } else { 3u8.saturating_add(value) }
     } else { value }.clamp(1, 7);
-    let index = if value == 1 { 0 } else { value };
-    Some(FontSizeKeyword::Absolute(index).resolve(16.0))
+    Some(FontSizeKeyword::Absolute(value).resolve(16.0))
 }
 
 #[derive(Clone, Debug)]
@@ -5885,6 +5897,7 @@ enum Value {
         safe: Option<bool>,
     },
     FlexWrapReverse(bool),
+    FlexWrapReverseBalance(bool),
     MarginAuto(usize),
     Position(Position),
     Float(Float),
@@ -5998,6 +6011,7 @@ enum Value {
         inline: bool,
     },
     DisplayComponents { principal: Display, inline: bool, list_item: bool },
+    DisplayRuby { kind: u8, block: bool },
     GridLanesDirection(GridLanesDirection),
     GridLanesPack(bool),
     FlowTolerance(FlowTolerance),
@@ -6071,7 +6085,7 @@ impl Value {
             Self::GridAutoColumns(_) => 61,
             Self::GridAutoRows(_) => 62,
             Self::GridAutoFlow(_) => 63,
-            Self::GridDisplay { .. } | Self::DisplayComponents { .. } => 0,
+            Self::GridDisplay { .. } | Self::DisplayComponents { .. } | Self::DisplayRuby { .. } => 0,
             Self::GridLanesDirection(_) => 182,
             Self::GridLanesPack(_) => 183,
             Self::FlowTolerance(_) => 184,
@@ -6158,7 +6172,7 @@ impl Value {
             Self::Order(_) => 48,
             Self::ContentAlignment { slot, .. } => *slot,
             Self::ItemAlignment { slot, .. } => *slot,
-            Self::FlexWrapReverse(_) => 50,
+            Self::FlexWrapReverse(_) | Self::FlexWrapReverseBalance(_) => 50,
             Self::MarginAuto(side) => 39 + side,
             Self::Position(_) => 32,
             Self::Float(_) => 33,
@@ -6466,7 +6480,14 @@ impl Value {
                 }
                 _ => unreachable!("item alignment slot"),
             },
-            Self::FlexWrapReverse(v) => style.flex_wrap_reverse = *v,
+            Self::FlexWrapReverse(v) => {
+                style.flex_wrap_reverse = *v;
+                style.flex_wrap_balance = false;
+            }
+            Self::FlexWrapReverseBalance(v) => {
+                style.flex_wrap_reverse = *v;
+                style.flex_wrap_balance = true;
+            }
             Self::MarginAuto(side) => {
                 style.margin_sides[*side] = 0.0;
                 style.margin_auto[*side] = true;
@@ -6496,18 +6517,28 @@ impl Value {
                 style.grid_lanes = false;
                 style.display_inline = false;
                 style.display_list_item = false;
+                style.display_ruby = 0;
             }
             Self::DisplayComponents { principal, inline, list_item } => {
                 style.display = *principal;
                 style.display_inline = *inline;
                 style.display_list_item = *list_item;
                 style.grid_lanes = false;
+                style.display_ruby = 0;
+            }
+            Self::DisplayRuby { kind, block } => {
+                style.display = if *block { Display::Block } else { Display::Inline };
+                style.display_inline = false;
+                style.display_list_item = false;
+                style.grid_lanes = false;
+                style.display_ruby = *kind;
             }
             Self::GridDisplay { lanes, inline } => {
                 style.display = Display::Grid;
                 style.grid_lanes = *lanes;
                 style.display_inline = *inline;
                 style.display_list_item = false;
+                style.display_ruby = 0;
             }
             Self::GridLanesDirection(v) => style.grid_lanes_direction = *v,
             Self::GridLanesPack(v) => style.grid_lanes_dense = *v,
@@ -10302,6 +10333,12 @@ fn parse_selector_type(input:&str,offset:usize,namespaces:&NamespaceMap)->Result
 }
 
 struct ParsedPseudoSource<'a> { name:String, args:Option<&'a str>, end:usize, args_offset:usize }
+pub(crate) fn scroll_button_direction(argument: &str) -> Option<&'static str> {
+    const DIRECTIONS: [&str; 9] = ["up", "down", "left", "right", "block-start", "block-end", "inline-start", "inline-end", "*"];
+    let argument = argument.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    DIRECTIONS.into_iter().find(|direction| argument.eq_ignore_ascii_case(direction))
+}
+
 fn parse_pseudo_source(input:&str,offset:usize)->Result<ParsedPseudoSource<'_>,CssError> {
     let mut pos=if input.starts_with("::"){2}else{1};
     let name=consume_selector_identifier(input,&mut pos).ok_or_else(||selector_error(offset+pos,"invalid pseudo identifier"))?.to_ascii_lowercase();
@@ -10435,7 +10472,7 @@ fn parse_simple_selector_depth(
             let pseudo_element = rest.starts_with("::") && !rest.starts_with(":::");
             let ParsedPseudoSource{name,args,end,args_offset}=parse_pseudo_source(rest,offset+start)?;
             let name=name.as_str();
-            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
+            if (pseudo_element && !matches!(name,"before"|"after"|"first-line"|"first-letter"|"placeholder"|"marker"|"highlight"|"slotted"|"part"|"view-transition"|"view-transition-group"|"view-transition-image-pair"|"view-transition-old"|"view-transition-new"|"backdrop"|"selection"|"target-text"|"spelling-error"|"grammar-error"|"search-text"|"scroll-button")) || (!pseudo_element && matches!(name,"marker"|"placeholder"|"backdrop")) {
                 return Err(selector_error(offset+start,"invalid pseudo selector colon syntax"));
             }
 
@@ -10468,6 +10505,17 @@ fn parse_simple_selector_depth(
                 if !wildcard {
                     selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 }
+                start += end;
+                continue;
+            }
+
+            if pseudo_element && name == "scroll-button" {
+                if args.and_then(scroll_button_direction).is_none() {
+                    return Err(selector_error(offset + start, "::scroll-button requires a direction"));
+                }
+                // No scroll button box is generated, so the selector is valid and matches nothing.
+                selector.logical.push(LogicalPseudo::Is(Vec::new()));
+                selector.specificity.2 = selector.specificity.2.saturating_add(1);
                 start += end;
                 continue;
             }
@@ -12990,7 +13038,7 @@ fn length_value(slot: usize, value: f32) -> Option<Value> {
             pixels: value,
             fraction: 0.0,
         }),
-        17 => Value::Gap(value),
+        17 => Value::GapLength(17, LengthPercentage { pixels: value, fraction: 0.0 }),
         20 => Value::FlexBasis(Some(value)),
         23 => Value::MinWidth(value),
         24 => Value::MaxWidth(Some(value)),
@@ -13108,6 +13156,7 @@ const fn same_property_name(left: &str, right: &str) -> bool {
 const fn validate_registry(properties: &[PropertyRegistration]) {
     let mut seen = [false; PROPERTY_COUNT];
     let mut inherited = [false; PROPERTY_COUNT];
+    let mut inherited_seen = [false; PROPERTY_COUNT];
     let mut in_all = [false; PROPERTY_COUNT];
     let mut row = 0;
     while row < properties.len() {
@@ -13138,11 +13187,19 @@ const fn validate_registry(properties: &[PropertyRegistration]) {
                 }
                 earlier += 1;
             }
-            if seen[id] && (inherited[id] != property.inherited || in_all[id] != property.in_all) {
+            // A non-inherited shorthand may cover longhands that differ in inheritance
+            // (line-clamp), so only the other rows define and check an ID's inherited flag.
+            let longhand = property.ids.len() == 1 || property.inherited;
+            if (seen[id] && in_all[id] != property.in_all)
+                || (longhand && inherited_seen[id] && inherited[id] != property.inherited)
+            {
                 panic!("inconsistent CSS property metadata");
             }
             seen[id] = true;
-            inherited[id] = property.inherited;
+            if longhand {
+                inherited[id] = property.inherited;
+                inherited_seen[id] = true;
+            }
             in_all[id] = property.in_all;
             index += 1;
         }
@@ -13315,6 +13372,8 @@ property_registry! {
     "background-position-x" => [extra_props::slot_const("background-position-x")], false, true;
     "background-position-y" => [extra_props::slot_const("background-position-y")], false, true;
     "object-view-box" => [extra_props::slot_const("object-view-box")], false, true;
+    "math-style" => [extra_props::slot_const("math-style")], true, true;
+    "math-depth" => [extra_props::slot_const("math-depth")], true, true;
     "border-shape" => [extra_props::slot_const("border-shape")], false, true;
     "background-size" => [69], false, true;
     "background-repeat" => [70], false, true;
@@ -13754,6 +13813,7 @@ property_registry! {
     "baseline-shift" => [extra_props::VALUE_BASE + value_props::const_index("baseline-shift")], false, true;
     "color-interpolation" => [extra_props::VALUE_BASE + value_props::const_index("color-interpolation")], true, true;
     "column-height" => [extra_props::VALUE_BASE + value_props::const_index("column-height")], false, true;
+    "flex-line-count" => [extra_props::VALUE_BASE + value_props::const_index("flex-line-count")], false, true;
     "column-wrap" => [extra_props::VALUE_BASE + value_props::const_index("column-wrap")], false, true;
     "container-name" => [extra_props::VALUE_BASE + value_props::const_index("container-name")], false, true;
     "view-transition-class" => [extra_props::VALUE_BASE + value_props::const_index("view-transition-class")], false, true;
@@ -13790,6 +13850,7 @@ property_registry! {
     "scroll-target-group" => [extra_props::VALUE_BASE + value_props::const_index("scroll-target-group")], false, true;
     "block-ellipsis" => [extra_props::VALUE_BASE + value_props::const_index("block-ellipsis")], true, true;
     "max-lines" => [extra_props::VALUE_BASE + value_props::const_index("max-lines")], false, true;
+    "line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("max-lines"), extra_props::VALUE_BASE + value_props::const_index("block-ellipsis"), extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
     "continue" => [extra_props::VALUE_BASE + value_props::const_index("continue")], false, true;
     "-webkit-line-clamp" => [extra_props::VALUE_BASE + value_props::const_index("-webkit-line-clamp")], false, true;
     "overflow-clip-margin" => [extra_props::VALUE_BASE + value_props::const_index("overflow-clip-margin")], false, true;
@@ -14163,6 +14224,7 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.grid_lanes = from.grid_lanes;
             to.display_inline = from.display_inline;
             to.display_list_item = from.display_list_item;
+            to.display_ruby = from.display_ruby;
         }
         182 => to.grid_lanes_direction = from.grid_lanes_direction,
         183 => to.grid_lanes_dense = from.grid_lanes_dense,
@@ -14294,7 +14356,10 @@ fn copy_slot_state_impl(slot: usize, from: &Style, to: &mut Style, computed: boo
             to.align_content_safe = from.align_content_safe;
             to.align_content_keyword = from.align_content_keyword;
         }
-        50 => to.flex_wrap_reverse = from.flex_wrap_reverse,
+        50 => {
+            to.flex_wrap_reverse = from.flex_wrap_reverse;
+            to.flex_wrap_balance = from.flex_wrap_balance;
+        }
         51 => {
             to.min_height = from.min_height;
             to.min_height_auto = from.min_height_auto;
@@ -15416,6 +15481,28 @@ fn background_length_with_query(raw: &str, context: LengthContext, query: Contai
     })
 }
 
+/// `flex-wrap`: `nowrap | [ wrap | wrap-reverse ]? || balance`, with `wrap balance` equal to `balance`.
+/// Returns (wraps, reversed, balanced).
+fn flex_wrap_words(raw: &str) -> Option<(bool, bool, bool)> {
+    let mut words = raw.split_ascii_whitespace();
+    let first = words.next()?;
+    let second = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    let (mut wrap, mut reverse, mut balance) = (false, false, false);
+    for word in core::iter::once(first).chain(second) {
+        match word {
+            "wrap" if !wrap && !reverse => wrap = true,
+            "wrap-reverse" if !wrap && !reverse => reverse = true,
+            "balance" if !balance => balance = true,
+            "nowrap" if second.is_none() => return Some((false, false, false)),
+            _ => return None,
+        }
+    }
+    Some((true, reverse, balance))
+}
+
 fn gap_value(slot: usize, raw: &str) -> Option<Value> {
     if raw == "normal" {
         return Some(if slot == 17 {
@@ -15927,8 +16014,8 @@ fn image_set_resolution(raw:&str,context:LengthContext,query:ContainerUnitContex
     if expression.numeric_type()? != typed_numeric::NumericType::from_unit(typed_numeric::NumericUnit::Dppx) {return None;}
     expression.simplify_absolute_units();
     let value=expression.evaluate(&mut FontAngleContext{length:Some(context),query,percent_scale:0.01})?;
-    if !value.is_finite() || !math_function(raw) && value<0.0 {return None;}
-    Some(value.max(0.0))
+    if !math_function(raw) && (value<0.0 || !value.is_finite()) {return None;}
+    Some(value.max(0.0).min(f64::from(f32::MAX)))
 }
 
 /// Bounded CSS Images 4 candidate negotiation. The host image profile supports
@@ -17625,7 +17712,7 @@ pub fn serialize_cssom_property_value(name: &str, value: &str) -> Option<String>
         }
         let declarations = typed_declarations("display", &raw, 0).ok()?;
         let declaration = declarations.first()?;
-        if !matches!(declaration.value, Value::Display(_) | Value::DisplayComponents { .. } | Value::GridDisplay { .. }) {
+        if !matches!(declaration.value, Value::Display(_) | Value::DisplayComponents { .. } | Value::DisplayRuby { .. } | Value::GridDisplay { .. }) {
             return None;
         }
         let mut style = Style::initial();
@@ -19372,33 +19459,31 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             continue;
         }
         if name == "flex-flow" {
-            if let Some(tokens) = components(raw).filter(|tokens| (1..=2).contains(&tokens.len())) {
-                let mut direction = None;
-                let mut wrap = None;
-                let mut valid = true;
-                for token in tokens {
-                    match token {
-                        "row" | "row-reverse" | "column" | "column-reverse"
-                            if direction.is_none() =>
-                        {
-                            direction = Some(token)
-                        }
-                        "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => wrap = Some(token),
-                        _ => valid = false,
-                    }
-                }
-                if valid {
+            if let Some(tokens) = components(raw).filter(|tokens| (1..=3).contains(&tokens.len())) {
+                let is_direction = |token: &str| matches!(token, "row" | "row-reverse" | "column" | "column-reverse");
+                let (direction, wrap_tokens) = if is_direction(tokens[0]) {
+                    (Some(tokens[0]), &tokens[1..])
+                } else if is_direction(tokens[tokens.len() - 1]) {
+                    (Some(tokens[tokens.len() - 1]), &tokens[..tokens.len() - 1])
+                } else {
+                    (None, &tokens[..])
+                };
+                let wrap = if wrap_tokens.is_empty() {
+                    Some((false, false, false))
+                } else {
+                    flex_wrap_words(&wrap_tokens.join(" "))
+                };
+                if let Some((wrap, reverse, balance)) = wrap {
                     let direction = match direction.unwrap_or("row") {
                         "row-reverse" => FlexDirection::RowReverse,
                         "column" => FlexDirection::Column,
                         "column-reverse" => FlexDirection::ColumnReverse,
                         _ => FlexDirection::Row,
                     };
-                    let wrap = wrap.unwrap_or("nowrap");
                     for value in [
                         Value::FlexDirection(direction),
-                        Value::FlexWrap(wrap != "nowrap"),
-                        Value::FlexWrapReverse(wrap == "wrap-reverse"),
+                        Value::FlexWrap(wrap),
+                        if balance { Value::FlexWrapReverseBalance(reverse) } else { Value::FlexWrapReverse(reverse) },
                     ] {
                         out.push(Declaration { value, important });
                     }
@@ -19924,11 +20009,13 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             }
         }
         let mut parsed = typed_declarations(name, raw, offset)?;
-        if name == "flex-wrap" && matches!(raw, "wrap" | "nowrap" | "wrap-reverse") {
-            parsed.push(Declaration {
-                value: Value::FlexWrapReverse(raw == "wrap-reverse"),
-                important,
-            });
+        if name == "flex-wrap" {
+            if let Some((_, reverse, balance)) = flex_wrap_words(raw) {
+                parsed.push(Declaration {
+                    value: if balance { Value::FlexWrapReverseBalance(reverse) } else { Value::FlexWrapReverse(reverse) },
+                    important,
+                });
+            }
         }
         for declaration in &mut parsed {
             declaration.important = important;
@@ -20458,6 +20545,21 @@ fn grid_display(raw: &str) -> Option<Value> {
         lanes: lanes?,
         inline: inline.unwrap_or(false),
     })
+}
+
+fn ruby_display(raw: &str) -> Option<Value> {
+    let tokens = components(raw)?;
+    let lowered: Vec<_> = tokens.iter().map(|token| ascii_lower(token)).collect();
+    let words: Vec<&str> = lowered.iter().map(|word| &**word).collect();
+    match words.as_slice() {
+        ["ruby"] | ["inline", "ruby"] | ["ruby", "inline"] => Some(Value::DisplayRuby { kind: 1, block: false }),
+        ["block", "ruby"] | ["ruby", "block"] => Some(Value::DisplayRuby { kind: 1, block: true }),
+        ["ruby-base"] => Some(Value::DisplayRuby { kind: 2, block: false }),
+        ["ruby-text"] => Some(Value::DisplayRuby { kind: 3, block: false }),
+        ["ruby-base-container"] => Some(Value::DisplayRuby { kind: 4, block: false }),
+        ["ruby-text-container"] => Some(Value::DisplayRuby { kind: 5, block: false }),
+        _ => None,
+    }
 }
 
 fn display_components(raw: &str) -> Option<Value> {
@@ -21431,7 +21533,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 .unwrap();
                 nonnegative_length(raw).map(|v| Value::PaddingSide(side, v))
             }
-            "display" => grid_display(raw).or_else(|| display_components(raw)).or_else(|| match raw {
+            "display" => grid_display(raw).or_else(|| ruby_display(raw)).or_else(|| display_components(raw)).or_else(|| match raw {
                 "block" => Some(Value::Display(Display::Block)),
                 "flow-root" => Some(Value::Display(Display::FlowRoot)),
                 "inline" => Some(Value::Display(Display::Inline)),
@@ -21913,11 +22015,7 @@ fn typed_declarations_legacy(name: &str, raw: &str, offset: usize) -> Result<Vec
                 };
                 containment.map(|(size, inline_size, layout, style, paint)| Value::Containment { size, inline_size, layout, style, paint })
             }
-            "flex-wrap" => match raw {
-                "nowrap" => Some(Value::FlexWrap(false)),
-                "wrap" | "wrap-reverse" => Some(Value::FlexWrap(true)),
-                _ => None,
-            },
+            "flex-wrap" => flex_wrap_words(raw).map(|(wrap, _, _)| Value::FlexWrap(wrap)),
             "flex-direction" => match raw {
                 "row" => Some(Value::FlexDirection(FlexDirection::Row)),
                 "row-reverse" => Some(Value::FlexDirection(FlexDirection::RowReverse)),
@@ -26511,6 +26609,7 @@ fn html_flow_list_defaults(kind:&NodeKind,context:Option<(&Document,NodeId)>,par
         if let Some(provenance) = provenance.as_deref_mut() { provenance.ua_override(&[7, 130]); provenance.baseline_font_scale = Some(size); }
     }
     if matches!(tag,"blockquote"|"figure") {style.logical_margin_inline=[Some(Some(40.0));2];}
+    if tag=="hr" {style.logical_margin_inline=[Some(None);2];block_em=Some(0.5);}
     if matches!(tag,"listing"|"plaintext"|"pre"|"xmp") {
         style.font.families=Some(Arc::from([FontFamily::Generic(GenericFontFamily::Monospace)]));
         Value::WhiteSpace(WhiteSpace::Pre).apply(style);
@@ -28541,6 +28640,21 @@ fn html_presentational_hints(kind: &NodeKind, context: Option<(&Document, NodeId
             }
         }
     }
+    if tag == "hr" {
+        let color = html_rendering_attribute(attributes, context, "color");
+        let shaded = color.is_some() || html_rendering_attribute(attributes, context, "noshade").is_some();
+        if shaded { hint(Value::BorderStyle(BorderStyle::Solid)); }
+        if let Some(color) = color.and_then(html_legacy_color) { hint(Value::Color(color)); }
+        if let Some(size) = html_rendering_attribute(attributes, context, "size").and_then(crate::forms::parse_nonnegative_integer).map(|size| size.min(1000)) {
+            if shaded {
+                if size > 0 { hint(Value::BorderWidth(size as f32 / 2.0)); }
+            } else if size == 1 {
+                hint(Value::LogicalBorder(117, LogicalBorderComponent::Width(0.0)));
+            } else if size > 1 {
+                hint(Value::Height((size - 2) as f32));
+            }
+        }
+    }
     if tag == "font" {
         if let Some(size) = html_rendering_attribute(attributes, context, "size").and_then(legacy_font_size) { hint(Value::FontSize(size)); }
         if let Some(face) = html_rendering_attribute(attributes, context, "face").and_then(font_families) { hint(Value::FontFamily(face)); }
@@ -30051,6 +30165,9 @@ fn compute_for_named_registered_inner(
                 )
             {
                 style.display = Display::None;
+            } else if *namespace == Namespace::Html && matches!(tag, "ruby" | "rb" | "rt" | "rtc") {
+                style.display = Display::Inline;
+                style.display_ruby = match tag { "ruby" => 1, "rb" => 2, "rt" => 3, _ => 5 };
             } else if *namespace == Namespace::Html
                 && matches!(
                     tag,
@@ -30229,6 +30346,10 @@ fn compute_for_named_registered_inner(
                     }
                     "a" | "area" if crate::svg::attribute(attributes, "href").is_some() => {
                         html_text_ua::link(&mut style, index.environment.color_schemes.page().scheme);
+                    }
+                    "hr" => {
+                        html_text_ua::rule(&mut style);
+                        if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[1,9,10]);}
                     }
                     "u" | "ins" => html_text_ua::decoration(&mut style, "underline"),
                     "s" | "strike" | "del" => html_text_ua::decoration(&mut style, "line-through"),
@@ -31608,7 +31729,7 @@ fn compute_for_named_registered_inner(
                     }
                 } else if let Value::ExtraRaw(slot, raw) = &declaration.value {
                     let context = length_context!(raw);
-                    extra_props::apply(*slot, raw, context, &mut style);
+                    extra_props::apply_with_parent(*slot, raw, context, &mut style, parent);
                 } else if let Value::GapRaw(slot, raw) = &declaration.value {
                     let context = length_context!(raw);
                     if let Some(value) = background_length(raw, context) {
@@ -31801,14 +31922,18 @@ fn compute_for_named_registered_inner(
         if crate::svg::local_name(name)=="input" && !["range","checkbox","radio"].iter().any(|state|
             crate::svg::attribute(attributes,"type").unwrap_or("text").eq_ignore_ascii_case(state))),|(_,provenance)|provenance.ua_clip_input);
     if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_clip_input=input_clip;}
-    if input_clip {style.overflow_x=Overflow::Clip;style.overflow_y=Overflow::Clip;}
-    // Visible/clip compute to auto/hidden if the other axis creates a scroll container.
+    if input_clip {
+        style.overflow_x=Overflow::Clip;style.overflow_y=Overflow::Clip;
+        let image=matches!(kind,NodeKind::Element{attributes,..}
+            if crate::svg::attribute(attributes,"type").is_some_and(|state|state.eq_ignore_ascii_case("image")));
+        extra_props::set_stored(&mut style,"overflow-clip-margin",image.then_some("content-box"));
+    }
+    // Visible computes to auto if the other axis creates a scroll container; clip stays a single-axis clip.
     let (x, y) = (style.overflow_x, style.overflow_y);
     let normalize = |axis: Overflow, other: Overflow| {
         if other.scroll_container() {
             match axis {
                 Overflow::Visible => Overflow::Auto,
-                Overflow::Clip => Overflow::Hidden,
                 _ => axis,
             }
         } else {
@@ -35285,7 +35410,7 @@ mod tests {
         let style = compute(&element("overflow:hidden;overflow-x:clip"), None, &index).unwrap();
         assert_eq!(
             (style.overflow_x, style.overflow_y),
-            (Overflow::Hidden, Overflow::Hidden)
+            (Overflow::Clip, Overflow::Hidden)
         );
         let style = compute(&element("overflow-y:auto"), None, &index).unwrap();
         assert_eq!(
@@ -36619,7 +36744,7 @@ mod tests {
     fn font_size_keywords_share_cascade_html_hints_and_font_api_resolution() {
         let index = StyleIndex::new(Vec::new());
         let parent = compute(&element("font-size:medium"), None, &index).unwrap();
-        for (html_size, keyword) in [("1", "xx-small"), ("2", "small"), ("3", "medium"),
+        for (html_size, keyword) in [("1", "x-small"), ("2", "small"), ("3", "medium"),
             ("4", "large"), ("5", "x-large"), ("6", "xx-large"), ("7", "xxx-large")]
         {
             let hinted = NodeKind::Element {
@@ -39825,8 +39950,8 @@ mod tests {
                 wide.iter().map(|v| v.value.slot()).collect::<Vec<_>>(),
                 property.ids
             );
-            for &id in property.ids {
-                assert_eq!(inherited_property(id), property.inherited);
+            if property.ids.len() == 1 {
+                assert_eq!(inherited_property(property.ids[0]), property.inherited);
             }
         }
         let outside_all = (0..PROPERTY_COUNT).filter(|id| !ALL_PROPERTY_IDS.contains(id)).collect::<Vec<_>>();

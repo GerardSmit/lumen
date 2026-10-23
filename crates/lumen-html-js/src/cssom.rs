@@ -2117,7 +2117,7 @@ fn property_map_text(
         let (realm,node)=map.realm.resolve_adopted_node(map.node);
         crate::animations::flush_css_transitions_for_property(ctx,&realm,Some(node),Some(property))?;
         if !crate::style::rendered_ancestry(&realm,node,false)? {return Ok(None);}
-        let value = crate::style::computed_property_value(&realm, node, property)?;
+        let value = crate::style::typed_om_computed_property_value(&realm, node, property)?;
         if !value.is_empty() {return Ok(Some(value));}
         if property.starts_with("--") {
             let fonts=crate::canvas::initialized_realm_font_source(&realm)?;
@@ -4380,6 +4380,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     RealmServices::replace_shared_current(ctx, registry);
     install_typed_numeric(ctx)?;
     crate::highlight::install(ctx, realm)?;
+    crate::container_query_list::install(ctx)?;
     let css_namespace = ctx.member_get(&ctx.global_object(), "CSS").map_err(OpError::thrown)?;
     let register = ctx.bound_function(&lumen_bind::FnItem::of::<register_property::Op>());
     ctx.set_member(&css_namespace, "registerProperty", register)
@@ -4519,6 +4520,7 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
 /// Re-evaluate live query lists and dispatch `change` when a host viewport or
 /// display change crosses a media-query boundary.
 pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
+    crate::container_query_list::notify(ctx, realm)?;
     // The host must enter the target window's JS realm before dispatching. Apart from
     // isolating the registries, this ensures the UA-created Event comes from that
     // realm's intrinsics.

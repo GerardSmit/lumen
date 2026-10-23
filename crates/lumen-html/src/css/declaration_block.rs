@@ -1022,6 +1022,17 @@ fn canonical_alias_uncached(name: &str) -> &str {
     }
 }
 
+fn specified_flex_wrap(raw: &str, wraps: bool) -> &'static str {
+    let has = |keyword: &str| raw.split_whitespace().any(|word| word == keyword);
+    match (has("wrap-reverse"), has("balance")) {
+        (true, true) => "wrap-reverse balance",
+        (true, false) => "wrap-reverse",
+        (false, true) => "balance",
+        (false, false) if wraps => "wrap",
+        (false, false) => "nowrap",
+    }
+}
+
 fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Option<String> {
     if origin=="columns" && matches!(target,"column-width"|"column-count") && !matches!(value,Value::Default(..)|Value::Revert(..)|Value::RevertLayer(..)) {return super::columns::specified_component(origin,target,raw);}
     Some(match value {
@@ -1133,11 +1144,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
         }
         .into(),
         Value::FlexWrap(value) => if *value {
-            if raw.split_whitespace().any(|word| word == "wrap-reverse") {
-                "wrap-reverse"
-            } else {
-                "wrap"
-            }
+            specified_flex_wrap(raw, true)
         } else {
             "nowrap"
         }
@@ -1150,6 +1157,7 @@ fn serialize_typed(value: &Value, raw: &str, origin: &str, target: &str) -> Opti
             "nowrap"
         }
         .into(),
+        Value::FlexWrapReverseBalance(_) => specified_flex_wrap(raw, true).into(),
         Value::FlexGrow(value) | Value::FlexShrink(value) => value.to_string(),
         Value::FlexBasis(Some(value)) => alloc::format!("{value}px"),
         Value::FlexBasis(None) => "auto".into(),

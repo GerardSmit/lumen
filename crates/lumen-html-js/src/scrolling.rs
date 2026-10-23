@@ -737,6 +737,17 @@ pub(crate) fn apply_offset(
     apply_offset_waiting(ctx, realm, node, x, y, behavior, Rc::default())
 }
 
+pub(crate) fn apply_offset_unsnapped(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    x: f64,
+    y: f64,
+    behavior: ScrollBehavior,
+) -> OpResult<()> {
+    apply_offset_snapping(ctx, realm, node, x, y, behavior, Rc::default(), false)
+}
+
 /// A smooth scroll takes the deferred out of `waiter` and settles it when the
 /// motion finishes or is replaced; every other outcome leaves it for the caller.
 fn apply_offset_waiting(
@@ -748,6 +759,19 @@ fn apply_offset_waiting(
     behavior: ScrollBehavior,
     waiter: Rc<RefCell<Option<Deferred>>>,
 ) -> OpResult<()> {
+    apply_offset_snapping(ctx, realm, node, x, y, behavior, waiter, true)
+}
+
+fn apply_offset_snapping(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    x: f64,
+    y: f64,
+    behavior: ScrollBehavior,
+    waiter: Rc<RefCell<Option<Deferred>>>,
+    snap: bool,
+) -> OpResult<()> {
     if realm.has_browsing_context && !realm.browsing_context().is_some_and(|context| browsing_context::is_active_document(&context, realm)) {
         return Ok(());
     }
@@ -755,7 +779,7 @@ fn apply_offset_waiting(
         return Ok(());
     }
     realm.flush_layout()?;
-    let (from, to, behavior) = {
+    let (from, to, behavior, limits) = {
         let mut session = realm.session.borrow_mut();
         let root = session.document().root();
         let Some((min_x,max_x,min_y,max_y)) = session
@@ -779,8 +803,15 @@ fn apply_offset_waiting(
             })?;
             resolved_scroll_behavior(behavior, style.scroll_behavior)
         } else { behavior };
-        (session.scroll_offset(node), (x, y), behavior)
+        (session.scroll_offset(node), (x, y), behavior, (min_x, max_x, min_y, max_y))
     };
+    let to = if snap && from != to {
+        let snapped = crate::scroll_snap::snap_destination(realm, node, from, to, limits)?;
+        // Reading the snap style may restyle with the font source, which
+        // leaves the frame stale; the offset below needs a fresh one.
+        if realm.layout_flusher.borrow().is_some() { realm.flush_layout()?; }
+        snapped
+    } else { to };
     let apply = |ctx: &mut Ctx| {
         // Abort even when the replacement destination equals the current
         // offset: a no-op instant request must stop an ongoing animation.
@@ -938,7 +969,7 @@ fn apply_wheel_default_action(
             next_y = candidate;
         }
         if attempted {
-            apply_offset(ctx, realm, node, next_x, next_y, ScrollBehavior::Instant)?;
+            apply_offset_snapping(ctx, realm, node, next_x, next_y, ScrollBehavior::Instant, Rc::default(), false)?;
         }
         if (remaining_x == 0.0 && remaining_y == 0.0) || node == root {
             break;
@@ -977,7 +1008,7 @@ pub(crate) fn into_view(
 /// identity. Affine composition precedes bounds construction.
 /// Top, right, bottom and left lengths of a `scroll-margin` or `scroll-padding`
 /// property family; percentages resolve against `basis` (width, height).
-fn scroll_edge_lengths(realm: &Rc<DomRealm>, node: NodeId, prefix: &str, basis: (f32, f32)) -> OpResult<[f32; 4]> {
+pub(crate) fn scroll_edge_lengths(realm: &Rc<DomRealm>, node: NodeId, prefix: &str, basis: (f32, f32)) -> OpResult<[f32; 4]> {
     let mut lengths = [0.0; 4];
     for (index, side) in ["top", "right", "bottom", "left"].into_iter().enumerate() {
         let value = crate::style::computed_property_value(realm, node, &format!("{prefix}-{side}"))?;
@@ -994,7 +1025,7 @@ fn scroll_edge_lengths(realm: &Rc<DomRealm>, node: NodeId, prefix: &str, basis: 
     Ok(lengths)
 }
 
-fn target_bounds_in_scroll_space(
+pub(crate) fn target_bounds_in_scroll_space(
     original: &Rc<DomRealm>, target: NodeId, destination: &Rc<DomRealm>,
     inverse_scroll_space: lumen_html::paint::Affine,
     projected: &[(Rc<DomRealm>, (f32, f32))],

@@ -114,9 +114,11 @@ mod media;
 mod media_capture;
 mod option_factory;
 pub(crate) mod scrolling;
+mod scroll_snap;
 mod svg_interfaces;
 mod svg_filter_interfaces;
 mod media_query_list_event;
+mod container_query_list;
 pub mod testdriver;
 mod webaudio;
 mod webrtc;
@@ -3702,6 +3704,7 @@ impl DomRealm {
         }
         if self.session.borrow().viewport_size().is_some() {
             layout_observers::rendering_checkpoint(ctx,self)?;
+            container_query_list::notify(ctx,self)?;
         }
         paint_worklet::update(ctx,self)?;
         self.canvases.update_drawable_paint(ctx,self)?;
@@ -6700,6 +6703,11 @@ custom_elements::bind_element_aria! {
     fn get_animations(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
         let subtree = ui_events::dictionary_boolean(ctx, &options, "subtree", false)?;
         animations::for_element(ctx, &self.base.realm, self.base.id, subtree)
+    }
+
+    #[method(name = "matchContainer", coerce)]
+    fn match_container(&self, ctx: &mut Ctx, query: &str) -> OpResult<Value> {
+        container_query_list::create(ctx, &self.base.realm, self.base.id, query)
     }
 
     #[method(coerce)]

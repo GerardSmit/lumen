@@ -23,6 +23,10 @@ impl DomStyle {
     }
 
     fn property_value(&self, name: &str, resolved: bool) -> OpResult<String> {
+        self.property_value_for(name, resolved, false)
+    }
+
+    fn property_value_for(&self, name: &str, resolved: bool, typed_om: bool) -> OpResult<String> {
         if self.computed {
             self.realm.synchronize_embedding_color_scheme()?;
             if resolved && !self.computed_declarations_available()? { return Ok(String::new()); }
@@ -38,8 +42,11 @@ impl DomStyle {
                 if session.has_container_queries() { true } else {
                 let inherited = css::property_inherits_query_context(&property);
                 let mut current = Some(self.node);
-                let mut pending = false;
+                let mut pending = self.pseudo.is_some()
+                    && self.resolved_style(&mut session, pending_fonts.as_ref())
+                        .is_ok_and(|style| style.property_query_context_pending(&property));
                 for _ in 0..512 {
+                    if pending { break; }
                     let Some(node) = current else { break; };
                     if matches!(session.document().kind(node), Ok(NodeKind::Element { .. })) && session
                         .computed_style_with_text(node,pending_fonts.as_ref().map(|fonts|fonts as &dyn lumen_html::paint::TextShaper))
@@ -101,6 +108,7 @@ impl DomStyle {
                     } else {None},
                     replaced_element: self.pseudo.is_none() && replaced_element,
                     used_display: if needs_layout && self.pseudo.is_none() {session.layout_used_display(self.node)} else {None},
+                    independent_border_widths: typed_om,
                     ..Default::default()
                 };
                 let grid_tracks = if resolved && matches!(property.as_ref(), "grid-template-columns" | "grid-template-rows" | "grid-template" | "grid" | "grid-lanes") { session.layout_grid_tracks(self.node) } else { None };
@@ -211,6 +219,23 @@ pub(crate) fn computed_property_value(
         _owner: Value::Undefined,
     }
     .property_value(property, false)
+}
+
+pub(crate) fn typed_om_computed_property_value(
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    property: &str,
+) -> OpResult<String> {
+    DomStyle {
+        realm: realm.clone(),
+        node,
+        computed: true,
+        pseudo: None,
+        highlight: None,
+        invalid_pseudo: false,
+        _owner: Value::Undefined,
+    }
+    .property_value_for(property, false, true)
 }
 
 fn content_visibility_skips(realm: &Rc<DomRealm>, node: NodeId, auto: bool) -> OpResult<bool> {
@@ -1614,8 +1639,8 @@ mod tests {
         .unwrap();
         let result = engine.eval_value(r#"
             const s = getComputedStyle(document.querySelector('div'));
-            s.getPropertyValue('overflow-x') === 'hidden' && s.getPropertyValue('overflow-y') === 'hidden' &&
-            s.getPropertyValue('overflow') === 'hidden' && s.getPropertyValue('background-attachment') === 'fixed, local'
+            s.getPropertyValue('overflow-x') === 'clip' && s.getPropertyValue('overflow-y') === 'hidden' &&
+            s.getPropertyValue('overflow') === 'clip hidden' && s.getPropertyValue('background-attachment') === 'fixed, local'
         "#).unwrap().ok().unwrap();
         assert!(matches!(result, Value::Bool(true)));
     }

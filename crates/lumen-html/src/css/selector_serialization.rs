@@ -179,6 +179,7 @@ fn arguments(name: &str, input: &str, map: &NamespaceMap, nesting: bool, depth: 
                 .map(|argument| argument.serialize())
                 .ok_or_else(|| selector_error(0, "invalid view transition name"))
         },
+        "scroll-button" => scroll_button_direction(input).map(String::from).ok_or_else(|| selector_error(0, "invalid scroll button direction")),
         "part" => Ok(input.split_ascii_whitespace().map(serialize_identifier).collect::<Vec<_>>().join(" ")),
         "heading" => {
             let values = comma_components(input, MAX_SELECTOR_COMPOUNDS).ok_or_else(|| selector_error(0, "invalid heading list"))?;

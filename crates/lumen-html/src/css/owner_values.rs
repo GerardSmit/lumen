@@ -353,7 +353,7 @@ fn number_text(value: f64, unit: NumericUnit) -> String {
     if unit == NumericUnit::Number {
         alloc::format!("calc({constant})")
     } else {
-        alloc::format!("calc({constant} * 1{})", unit.as_str())
+        alloc::format!("calc({constant} * 1{})", typed_numeric::infinite_unit_text(unit))
     }
 }
 

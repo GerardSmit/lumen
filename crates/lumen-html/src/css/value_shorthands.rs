@@ -44,6 +44,7 @@ static TABLE: &[Short] = &[
         longhands: &["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-synthesis-position"],
         shape: Shape::Rule,
     },
+    Short { name: "line-clamp", longhands: &["max-lines", "block-ellipsis", "continue"], shape: Shape::Rule },
     Short { name: "marker", longhands: &["marker-start", "marker-mid", "marker-end"], shape: Shape::Repeat },
 ];
 

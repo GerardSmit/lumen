@@ -496,15 +496,21 @@ impl NumericExpression {
                 NumericExpression::Value(value) => {
                     if !value.value.is_finite() {
                         let constant=if value.value.is_nan(){"NaN"}else if value.value.is_sign_negative(){"-infinity"}else{"infinity"};
-                        let bare=if value.unit==NumericUnit::Number{constant.into()}else{alloc::format!("{constant} * 1{}",value.unit.as_str())};
+                        let bare=if value.unit==NumericUnit::Number{constant.into()}else{alloc::format!("{constant} * 1{}",infinite_unit_text(value.unit))};
                         return append_text(out,&if paren_less{bare}else{alloc::format!("calc({bare})")});
                     }
                     let text = serialize_numeric_value(value.value, value.unit);
                     append_text(out, &text)
                 }
                 NumericExpression::Calc(value) => {
+                    let mut inner: &NumericExpression = value;
+                    while let NumericExpression::Calc(deeper) = inner {
+                        inner = deeper;
+                    }
                     if paren_less {
                         append(out, value, nested, true)
+                    } else if matches!(inner, NumericExpression::Min(_) | NumericExpression::Max(_) | NumericExpression::Clamp(..)) {
+                        append(out, inner, nested, true)
                     } else {
                         append_text(out, if nested { "(" } else { "calc(" })?;
                         append(out, value, false, true)?;
@@ -821,6 +827,15 @@ impl NumericExpression {
                 }
                 for value in values.iter_mut(){value.simplify_absolute_units();}
                 values.sort_by_key(|value|value.single_numeric_value().is_none());
+                if let[Self::Value(first),Self::Value(second)]=values.as_slice(){
+                    let(scalar,dimension)=if first.unit==NumericUnit::Number{(first,second)}else{(second,first)};
+                    if scalar.unit==NumericUnit::Number&&!scalar.value.is_finite()&&dimension.unit!=NumericUnit::Number{
+                        if let Some((unit,factor))=dimension.unit.canonical_unit_and_factor(){
+                            *self=Self::Value(NumericValue{value:scalar.value*dimension.value*factor,unit});
+                            return;
+                        }
+                    }
+                }
                 let units=[NumericUnit::Percent,NumericUnit::Px,NumericUnit::Deg,NumericUnit::S,NumericUnit::Hz,NumericUnit::Dppx];
                 let mut powers=[0i32;6];let mut product=1.0;
                 for expression in values.iter(){
@@ -2199,11 +2214,15 @@ fn without_rounding_noise(value: f64) -> f64 {
     if rounded == 0.0 { value } else { rounded }
 }
 
+pub(super) fn infinite_unit_text(unit: NumericUnit) -> &'static str {
+    if unit == NumericUnit::Percent { "%" } else { unit.as_str() }
+}
+
 /// Serialize a number and unit using CSS numeric-value formatting.
 pub fn serialize_numeric_value(value: f64, unit: NumericUnit) -> String {
     if !value.is_finite() {
         let constant=if value.is_nan(){"NaN"}else if value.is_sign_negative(){"-infinity"}else{"infinity"};
-        return if unit==NumericUnit::Number{alloc::format!("calc({constant})")}else{alloc::format!("calc({constant} * 1{})",unit.as_str())};
+        return if unit==NumericUnit::Number{alloc::format!("calc({constant})")}else{alloc::format!("calc({constant} * 1{})",infinite_unit_text(unit))};
     }
     let number = if value == 0.0 {
         String::from("0")

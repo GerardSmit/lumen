@@ -880,6 +880,27 @@ impl StyleIndex {
         })
     }
 
+    /// Whether `prelude`, a `<container-condition>#` list, holds for `node` as if an
+    /// `@container` rule had styled it. `parent` is the node's composed parent style.
+    pub fn container_query_matches(
+        &self,
+        document: &Document,
+        node: NodeId,
+        prelude: &str,
+        parent: Option<&Style>,
+        text: Option<&dyn TextShaper>,
+    ) -> bool {
+        let Some(canonical) = container_query::serialize_prelude(prelude) else {
+            return false;
+        };
+        let conditions = parse_conditions(&alloc::format!("{MARKER}{canonical}"));
+        let oracle = self.containers.oracle.borrow();
+        let mut resolved: Vec<(Option<Arc<str>>, bool, Option<&Entry>)> = Vec::new();
+        conditions.iter().any(|condition| {
+            self.condition_matches(condition, &oracle, &mut resolved, document, node, false, parent, text)
+        })
+    }
+
     fn condition_matches<'o>(
         &self,
         condition: &Parsed,

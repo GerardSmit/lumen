@@ -270,7 +270,11 @@ pub fn root_size_in_flow(
     }));
     let height = finite(css_height.or_else(|| {
         if height_declared { return None; }
-        height_attribute.and_then(|value| dimension(value, available_height.unwrap_or(150.0)))
+        height_attribute.and_then(|value| if value.trim().ends_with('%') {
+            available_height.and_then(|basis| dimension(value, basis))
+        } else {
+            dimension(value, 0.0)
+        })
     }));
     let absolute = |value: Option<&str>| value
         .filter(|value| !value.trim().ends_with('%'))

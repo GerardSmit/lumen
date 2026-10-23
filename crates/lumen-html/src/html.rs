@@ -5807,7 +5807,8 @@ impl<'a, D: crate::parser_documents::ParserDocument + ?Sized> Parser<'a, '_, D> 
             && attributes
                 .iter()
                 .any(|(key, value)| key == "type" && value.eq_ignore_ascii_case("hidden")));
-        let form_in_table = tag == Tag::Form && self.table_insertion_mode() == Some(Tag::Table);
+        let form_in_table = tag == Tag::Form
+            && matches!(self.table_insertion_mode(), Some(Tag::Table | Tag::Tbody | Tag::Thead | Tag::Tfoot | Tag::Tr));
         let (parent, before) = if allowed_in_table || form_in_table {
             (self.content_of(self.parent(), self.parent_tag()), None)
         } else {

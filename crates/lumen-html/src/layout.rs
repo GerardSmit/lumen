@@ -5502,6 +5502,13 @@ impl Layout<'_> {
         replaced_content_dimensions(style,style.width.map(|width|content_dimension(style,width)),
             style.height.map(|height|content_height_dimension(style,height)),natural,intrinsic.and_then(|value|value.ratio))
     }
+    /// CSS 2 §10.3.2: an inline replaced element with only a natural ratio takes
+    /// the containing block width when both dimensions are automatic.
+    fn embedded_document_fills_available(&self, node: NodeId, style: &Style) -> bool {
+        style.width.is_none() && style.height.is_none() && self.object_viewport(node)
+            && self.images.and_then(|images| images.embedded_intrinsic_size(node))
+                .is_some_and(|size| size.width.is_none() && size.height.is_none() && size.ratio.is_some())
+    }
     fn object_viewport(&self, node: NodeId) -> bool {
         matches!(self.object_representation(node), crate::object::Representation::Document)
     }
@@ -7445,7 +7452,7 @@ impl Layout<'_> {
         depth: usize,
         marker: Option<&VirtualGeneratedChild>,
     ) -> Result<f32, LayoutError> {
-        let (width_declared, height_declared) = (style.width.is_some(), style.height.is_some());
+        let (width_declared, height_declared) = (style.declares_dimension(true), style.declares_dimension(false));
         let resolved_style =
             self.resolve_style_percentages(style, available, self.parent_height);
         let style = &resolved_style;
@@ -20652,14 +20659,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let vertical_edges = box_edges(style, false);
         if svg_root {
             let active_view=if self.document.document_element_at(self.document.root()).ok().flatten()==Some(id) { self.images.and_then(|images|images.svg_fragment()).and_then(|fragment|fragment.resolve(self.document)) } else {None};
-            let (width, height) = crate::svg::root_size_with_view(
+            // A ratio-only inline svg has no intrinsic width; it contributes
+            // nothing to shrink-to-fit sizing.
+            let ratio_only = active_view.is_none()
+                && self.document.document_element_at(self.document.root()).ok().flatten() != Some(id)
+                && crate::svg::attribute(attributes, "width").is_none()
+                && crate::svg::attribute(attributes, "height").is_none()
+                && style.width.is_none()
+                && style.height.is_none();
+            let (width, height) = crate::svg::root_size_in_flow(
                 attributes,
                 style.width.map(|width| content_dimension(style, width)),
                 style
                     .height
                     .map(|height| content_height_dimension(style, height)),
-                self.viewport_width(),
-                Some(self.viewport_height()),
+                style.declares_dimension(true),
+                style.declares_dimension(false),
+                ratio_only,
+                if ratio_only { 0.0 } else { self.viewport_width() },
+                None,
                 active_view,
             );
             let (width, height) = if style.contains_size_axis(true) || style.contains_size_axis(false) {
@@ -20808,6 +20826,19 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         } else {
             resolved_gap(style.gap, style.row_gap_fraction, None)
         };
+        let cross_gap = if matches!(style.flex_direction, FlexDirection::Row | FlexDirection::RowReverse) {
+            resolved_gap(style.gap, style.row_gap_fraction, None)
+        } else {
+            resolved_gap(style.column_gap.unwrap_or(0.0), style.column_gap_fraction, None)
+        };
+        let (main_gap, cross_gap) = (
+            if main_gap.is_finite() { main_gap } else { 0.0 },
+            if cross_gap.is_finite() { cross_gap } else { 0.0 },
+        );
+        let mut contributions: Vec<(f32, f32)> = Vec::new();
+        if style.flex_wrap {
+            contributions.try_reserve(children.len()).map_err(|_| LayoutError::CommandLimit)?;
+        }
         let (mut main_sum, mut main_largest, mut cross_largest, mut count) = (0.0f32, 0.0f32, 0.0f32, 0usize);
         let sources = self.anonymous_formatting_items(children.iter().cloned(), style)?;
         for source in sources {
@@ -20878,14 +20909,52 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 measure(&computed, minimum)?
             };
             let (inline, block) = axes.logical((w, h));
-            let (item_main, item_cross) = if row { (inline, block) } else { (block, inline) };
+            let (mut item_main, item_cross) = if row { (inline, block) } else { (block, inline) };
+            if !row && !inflexible && !computed.flex_basis_content && computed.flex_basis_intrinsic.is_none() {
+                if let Some(flex_basis) = computed.resolve_flex_basis_percentage(None) {
+                    let margins = if computed.margin_auto[0] { 0.0 } else { computed.margin_sides[0] }
+                        + if computed.margin_auto[2] { 0.0 } else { computed.margin_sides[2] };
+                    item_main = item_main.max(
+                        content_height_dimension(&computed, flex_basis) + box_edges(&computed, false) + margins,
+                    );
+                }
+            }
             main_sum += item_main;
             main_largest = main_largest.max(item_main);
             cross_largest = cross_largest.max(item_cross);
+            if style.flex_wrap {
+                contributions.push((item_main, item_cross));
+            }
             count += 1;
         }
         let gaps = main_gap * count.saturating_sub(1) as f32;
         let main = if minimum && style.flex_wrap { main_largest } else { main_sum + gaps };
+        if style.flex_wrap {
+            let main_vertical = row == axes.vertical;
+            let definite_main = if main_vertical {
+                style.height.map(|height| constrained_height(style, content_height_dimension(style, height)))
+            } else {
+                style.width.map(|width| constrained_width(style, content_dimension(style, width)))
+            };
+            if let Some(limit) = definite_main.filter(|limit| limit.is_finite()) {
+                let (mut total, mut line_main, mut line_cross, mut lines, mut in_line) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
+                for (item_main, item_cross) in contributions {
+                    if in_line > 0 && line_main + main_gap + item_main > limit {
+                        total += line_cross;
+                        lines += 1;
+                        (line_main, line_cross, in_line) = (0.0, 0.0, 0);
+                    }
+                    line_main += if in_line > 0 { main_gap } else { 0.0 } + item_main;
+                    line_cross = line_cross.max(item_cross);
+                    in_line += 1;
+                }
+                if in_line > 0 {
+                    total += line_cross;
+                    lines += 1;
+                }
+                cross_largest = total + cross_gap * lines.saturating_sub(1) as f32;
+            }
+        }
         let (inline, block) = if row { (main, cross_largest) } else { (cross_largest, main) };
         Ok(axes.physical((inline, block)))
     }
@@ -26046,31 +26115,72 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .or(style.max_height)
                 .map(|height| content_height_dimension(style, height))
         };
-        let mut line_start = 0;
-        let mut lines = Vec::new();
-        let mut natural_cross = 0.0f32;
-        while line_start < items.len() {
+        let line_end_from = |line_start: usize, limit: Option<f32>| -> usize {
             let mut line_end = line_start + 1;
             let mut line_main = items[line_start].main;
             while line_end < items.len() {
                 let next = line_main + main_gap + items[line_end].main;
-                if style.flex_wrap && main_limit.is_some_and(|limit| next > limit) {
+                if style.flex_wrap && limit.is_some_and(|limit| next > limit) {
                     break;
                 }
                 line_main = next;
                 line_end += 1;
             }
-            let cross = items[line_start..line_end]
-                .iter()
-                .map(|item| item.cross)
-                .fold(0.0f32, f32::max);
-            natural_cross += cross;
+            line_end
+        };
+        let count_lines = |limit: Option<f32>| -> usize {
+            let mut line_start = 0;
+            let mut count = 0usize;
+            while line_start < items.len() {
+                line_start = line_end_from(line_start, limit);
+                count += 1;
+            }
+            count
+        };
+        let break_lines = |limit: Option<f32>| -> Result<Vec<(usize, usize, f32)>, LayoutError> {
+            let mut lines = Vec::new();
             lines
-                .try_reserve(1)
+                .try_reserve(count_lines(limit))
                 .map_err(|_| LayoutError::CommandLimit)?;
-            lines.push((line_start, line_end, cross));
-            line_start = line_end;
+            let mut line_start = 0;
+            while line_start < items.len() {
+                let line_end = line_end_from(line_start, limit);
+                let cross = items[line_start..line_end]
+                    .iter()
+                    .map(|item| item.cross)
+                    .fold(0.0f32, f32::max);
+                lines.push((line_start, line_end, cross));
+                line_start = line_end;
+            }
+            Ok(lines)
+        };
+        let mut lines = break_lines(main_limit)?;
+        if style.flex_wrap && style.flex_wrap_balance {
+            let wanted = css::extra_props::stored(style, "flex-line-count")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, items.len());
+            let target = lines.len().max(wanted);
+            if target > 1 {
+                let total = items.iter().map(|item| item.main).sum::<f32>()
+                    + main_gap * items.len().saturating_sub(1) as f32;
+                let mut high = main_limit.unwrap_or(total).max(0.0);
+                let mut low = items.iter().map(|item| item.main).fold(0.0f32, f32::max).min(high);
+                for _ in 0..48 {
+                    if high - low <= 0.001 {
+                        break;
+                    }
+                    let middle = low + (high - low) * 0.5;
+                    if count_lines(Some(middle)) <= target {
+                        high = middle;
+                    } else {
+                        low = middle;
+                    }
+                }
+                lines = break_lines(Some(high))?;
+            }
         }
+        let mut natural_cross = lines.iter().map(|line| line.2).sum::<f32>();
         natural_cross += cross_gap * lines.len().saturating_sub(1) as f32;
         let cross_limit = if row {
             style
@@ -29951,15 +30061,6 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         })
     }
 
-    /// The UA clips input boxes with `overflow: clip`; their baseline must not follow
-    /// placeholder lines, so they keep the scroll container rule.
-    fn baseline_overflow(&self, node: NodeId, overflow: css::Overflow) -> css::Overflow {
-        let input = overflow == css::Overflow::Clip
-            && matches!(self.document.kind(node), Ok(NodeKind::Element { name, namespace: Namespace::Html, .. })
-                if crate::svg::local_name(name) == "input");
-        if input { css::Overflow::Hidden } else { overflow }
-    }
-
     /// CSS 2.1 §10.8.1: a non-replaced atomic inline exports its line
     /// baseline, or the bottom margin edge when no applicable line exists.
     fn atomic_inline_baseline(display: Display, overflow_y: css::Overflow,
@@ -32785,7 +32886,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 token.baseline_offset = if replaced {
                                     self.replaced_inline_baseline(block_style, actual_height)
                                 } else {
-                                    Self::atomic_inline_baseline(atom.style.display, self.baseline_overflow(atom.node, atom.style.overflow_y), measured, *cursor, actual_height, css::extra_props::keyword(&atom.style, "baseline-source"))
+                                    Self::atomic_inline_baseline(atom.style.display, atom.style.overflow_y, measured, *cursor, actual_height, css::extra_props::keyword(&atom.style, "baseline-source"))
                                 };
                             }
                             token.actual_height = actual_height;
@@ -34737,6 +34838,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         if !style.is_atomic_inline() || style.width.is_some() {
             return Ok(());
         }
+        if !self.intrinsic_minimum_atomics && self.embedded_document_fills_available(id, style) {
+            let fill = (available - box_edges(style, true)).max(0.0);
+            style.width = Some(specified_dimension(style, constrained_width(style, fill)));
+            return Ok(());
+        }
         self.atomic_width_resolutions.set(self.atomic_width_resolutions.get().saturating_add(1));
         let available = if self.intrinsic_minimum_atomics { 0.0 } else { available };
         let minimum = self.intrinsic_size_mode(id, style, depth + 1, true)?.0;
@@ -35010,7 +35116,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let resolved_width = style.width.map(|value| {
                 constrained_width(style, content_dimension(style, value)) + box_edges(style, true)
             });
-            let baseline_style = (style.display, self.baseline_overflow(id, style.overflow_y), css::extra_props::keyword(style, "baseline-source").map(String::from));
+            let baseline_style = (style.display, style.overflow_y, css::extra_props::keyword(style, "baseline-source").map(String::from));
             let previous_baselines = self.flow_baselines.take();
             let result = self.box_for(id, parent_style, computed, x, y, available, depth);
             let measured = self.flow_baselines.take();
@@ -36995,6 +37101,24 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             baseline
         };
         self.record_flow_baseline(baseline);
+    }
+    fn ends_parent_flow(&self, id: NodeId) -> bool {
+        let mut next = self.document.next_sibling(id).ok().flatten();
+        while let Some(node) = next {
+            match self.document.kind(node) {
+                Ok(NodeKind::Comment(_)) => {}
+                Ok(NodeKind::Text(text) | NodeKind::CData(text)) if text.trim().is_empty() => {}
+                Ok(NodeKind::Element { .. }) => match self.computed_style_from_tree_shared(node) {
+                    Ok(style) if style.display == Display::None
+                        || style.float != Float::None
+                        || matches!(style.position, Position::Absolute | Position::Fixed) => {}
+                    _ => return false,
+                },
+                _ => return false,
+            }
+            next = self.document.next_sibling(node).ok().flatten();
+        }
+        true
     }
     fn record_flow_baseline(&mut self, baseline: f32) {
         if baseline.is_finite() {
@@ -39246,18 +39370,21 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             width: width.max(0.0),
             height: clip_height,
         };
-        if !style.visibility_visible
-            || width <= 0.0
-            || (self.source_capture_depth == 0 && self.transform_depth == 0 && clip.intersection(self.cull()).is_none())
-        {
-            return Ok((width, line_height));
-        }
-        self.push_command(Command::PushClip(clip))?;
         let text_top = if multiline {
             top
         } else {
             top + ((content_height - line_height) * 0.5).max(0.0)
         };
+        if !style.visibility_visible
+            || width <= 0.0
+            || (self.source_capture_depth == 0 && self.transform_depth == 0 && clip.intersection(self.cull()).is_none())
+        {
+            if !multiline && style.writing_mode == css::WritingMode::HorizontalTb {
+                self.record_flow_baseline(text_top + self.line_alignment_baseline(&paint_style));
+            }
+            return Ok((width, line_height));
+        }
+        self.push_command(Command::PushClip(clip))?;
         let mut cursor = text_top;
         let mut advance = 0.0;
         let mut height = 0.0;
@@ -39302,7 +39429,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             style: paint_style.clone(),
             frames,
         });
-        self.flow_inline_paragraph(
+        let control_baseline = (!multiline && style.writing_mode == css::WritingMode::HorizontalTb)
+            .then(|| self.flow_baselines.take());
+        let flowed = self.flow_inline_paragraph(
             &mut paragraph,
             &paint_style,
             left,
@@ -39314,7 +39443,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             &mut line,
             &mut trailing,
             depth,
-        )?;
+        );
+        if let Some(outer) = control_baseline {
+            self.flow_baselines = outer;
+            self.record_flow_baseline(text_top + self.line_alignment_baseline(&paint_style));
+        }
+        flowed?;
         let flow_height = if multiline {
             cursor - text_top + height.max(line_height)
         } else {
@@ -41488,6 +41622,31 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                             orthogonal_natural = Some(self.intrinsic_size(current, child, depth + 1)?.1);
                         }
                     }
+                    if style.height.is_some() || self.parent_height.is_some() {
+                        if let Some(child) = computed.as_mut().filter(|child| {
+                            child.height.is_none()
+                                && child.writing_mode != css::WritingMode::HorizontalTb
+                                && child.float == Float::None
+                                && !matches!(child.position, Position::Absolute | Position::Fixed)
+                                && matches!(child.display, Display::Block | Display::FlowRoot | Display::ListItem)
+                                && !child.margin_auto[0]
+                                && !child.margin_auto[2]
+                        }) {
+                            let room = (flow_extent
+                                - child.margin_sides[0]
+                                - child.margin_sides[2]
+                                - box_edges(child, false))
+                            .max(0.0);
+                            let used = if child.self_alignment(&style, true).alignment == AlignItems::Stretch {
+                                room
+                            } else {
+                                (self.intrinsic_size(current, child, depth + 1)?.1 - box_edges(child, false))
+                                    .max(0.0)
+                                    .min(room)
+                            };
+                            child.height = Some(specified_height(child, used));
+                        }
+                    }
                 }
                 let child_inline_extent = computed.as_ref().map_or(0.0, |child| {
                     child.height.map_or(0.0, |height| {
@@ -41904,6 +42063,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             (self.local_cursor(cursor)+f64::from(scroll_y)-local_format.1-f64::from(margin_top)-f64::from(admitted_top)-f64::from(border_top)-f64::from(padding_top)) as f32
         };
         let content_extent_without_last_margin = (content_extent_height - previous_margin.value()).max(0.0);
+        // The last margin of a box that ends its parent's flow still reaches
+        // the parent's scrollable overflow; elsewhere it stays inside the box.
+        let ends_parent_flow = self.ends_parent_flow(id);
         let min_height_affects_used_size = style.min_height_intrinsic.is_some()
             || style.min_height > content_extent_without_last_margin;
         // Clearance followed by collapse-through boxes cannot join the parent's
@@ -42275,7 +42437,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             if let Some(rect)=OverflowRect::new(local_x,local_y,padding_box.width,padding_box.height){frame.set_padding_box(rect);}
                         // Flex's natural line measurements size auto boxes; final movable
             // child projections, not pre-alignment measurements, own overflow.
-            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),content_extent_height.max(content_height))};
+            let extent=if projected_column_box {(hit_rect.width,hit_rect.height)}else if style.display==Display::Flex {(content_width,content_height)}else{(content_extent_width.max(content_width),(if scroll_container||vertical_block_flow||style.contain_layout||bottom_collapses||ends_parent_flow {content_extent_height} else {content_extent_without_last_margin}).max(content_height))};
             // Overflowing content of a scroll container keeps its end padding
             // reachable (CSS Overflow 3 §2.2).
             let reverse=scroll_reverse(&style);

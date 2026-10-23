@@ -164,6 +164,7 @@ pub(crate) const PROPS: &[Prop] = &[
     prop("forced-color-adjust", true, "auto", "auto | none | preserve-parent-color"),
     prop("image-orientation", true, "from-image", "from-image | none"),
     prop("link-parameters", false, "none", "none | <param>#"),
+    prop("flex-line-count", false, "1", "<integer-min1>"),
 ];
 
 pub(crate) const COUNT: usize = PROPS.len();

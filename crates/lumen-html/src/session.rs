@@ -875,6 +875,7 @@ pub struct RenderSession {
     style_environment: Option<css::MediaEnvironment>,
     /// Inputs of the last layout whose container-query oracle was already stable.
     container_oracle_stable: Option<(u64, u64, u64, u64, Option<u64>, css::MediaEnvironment, Option<u32>)>,
+    container_oracle_required: bool,
     presentation_root: Option<NodeId>,
     animation_snapshot: Option<Arc<AnimationSnapshot>>,
     timeline_transform_values:Option<Arc<crate::animation::progress_timelines::TransformTimelineValues>>,
@@ -1414,6 +1415,7 @@ impl RenderSession {
             style_version: 0,
             style_environment: None,
             container_oracle_stable: None,
+            container_oracle_required: false,
             presentation_root: None,
             animation_snapshot: None,
             timeline_transform_values:None,
@@ -3294,6 +3296,33 @@ impl RenderSession {
 
     pub fn computed_style(&mut self, node: NodeId) -> Result<Style, LayoutError> {
         self.computed_style_with_text(node,None)
+    }
+
+    /// Keeps layout recording the query containers even when no stylesheet rule
+    /// uses `@container`, for script-created container query lists.
+    pub fn require_container_oracle(&mut self, required: bool) {
+        if self.container_oracle_required != required {
+            self.container_oracle_required = required;
+            self.container_oracle_stable = None;
+        }
+    }
+
+    /// Whether a `<container-condition>#` list matches `node` against the containers
+    /// the last layout recorded.
+    pub fn container_query_matches(&mut self, node: NodeId, prelude: &str, text: Option<&dyn TextShaper>) -> Result<bool, LayoutError> {
+        self.synchronize_form_state();
+        if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+            return Err(LayoutError::InvalidTree);
+        }
+        self.refresh_rules()?;
+        let parent = match self.document.composed_parent(node).map_err(|_| LayoutError::InvalidTree)? {
+            Some(parent) if matches!(self.document.kind(parent), Ok(NodeKind::Element { .. })) => {
+                Some(self.computed_style_with_text(parent, text)?)
+            }
+            _ => None,
+        };
+        let rules = self.rules.as_ref().ok_or(LayoutError::InvalidTree)?;
+        Ok(rules.container_query_matches(&self.document, node, prelude, parent.as_ref(), text))
     }
     pub fn view_transition_pseudo_style(&mut self, origin: NodeId,
         inherited: Option<&Style>, pseudo: css::PseudoElement, name: Option<&str>,
@@ -6414,7 +6443,7 @@ impl RenderSession {
                 let rules = self.rules.as_ref().expect("stylesheets initialized");
                 let oracle_key = (version, self.rules_version, self.style_cache.borrow().epoch(), self.font_generation,
                     images.map(ImageResolver::generation), rules.environment, self.scroll_window.map(f32::to_bits));
-                if rules.has_container_rules() && self.container_oracle_stable != Some(oracle_key) {
+                if (rules.has_container_rules() || self.container_oracle_required) && self.container_oracle_stable != Some(oracle_key) {
                     let installed = {
                         let styles = self.style_cache.borrow();
                         let oracle = css::container_eval::build_oracle(
