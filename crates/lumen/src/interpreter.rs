@@ -6392,7 +6392,8 @@ impl Interp {
             crate::value::flush_cold_lazy_bodies();
         }
         let before = crate::value::live_objects();
-        if before <= self.gc_next && !lumen_common::buffer::gc_pressure() {
+        let pressure = lumen_common::buffer::gc_pressure();
+        if before <= self.gc_next && !pressure {
             return Ok(());
         }
         self.gc_collect();
@@ -6400,7 +6401,11 @@ impl Interp {
         let live = crate::value::live_objects();
 
         if std::env::var_os("LUMEN_GC_LOG").is_some() {
-            eprintln!("[gc] live={live}");
+            eprintln!(
+                "[gc] live={live} before={before} next={} buffer_pressure={pressure} buffer_bytes={}",
+                self.gc_next,
+                lumen_common::buffer::tracked_bytes()
+            );
         }
         if live > self.live_limit && self.near_limit_event() {
             self.live_limit = live + live / 20;

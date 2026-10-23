@@ -298,6 +298,10 @@ impl PromiseCaches {
         }
     }
 
+    pub(crate) fn anchors(&self, out: &mut Vec<usize>) {
+        if let Some(intr) = self.intr.borrow().as_ref() { out.push(Gc::as_ptr(&intr.global) as usize); }
+    }
+
     /// Original methods remain live with their realm even after author code
     /// replaces the public properties used by the pristine checks.
     pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {

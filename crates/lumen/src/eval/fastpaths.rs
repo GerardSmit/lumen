@@ -147,6 +147,16 @@ impl LangCaches {
         self.promise.count_intrinsic_edges(visit);
     }
 
+    /// Every pointer `trace_intrinsic_edges` can produce edges for.
+    pub(crate) fn intrinsic_anchors(&self, out: &mut Vec<usize>) {
+        if let Ok(cache) = self.intrinsics.try_borrow() {
+            if let Some(intr) = cache.as_ref() { out.push(Gc::as_ptr(&intr.array_proto) as usize); }
+        }
+        self.iter_proof.anchors(out);
+        self.array_cb.anchors(out);
+        self.promise.anchors(out);
+    }
+
     pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
         if let Ok(cache) = self.intrinsics.try_borrow() {
             if let Some(intr) = cache.as_ref().filter(|intr| Gc::as_ptr(&intr.array_proto) as usize == pointer) {

@@ -258,6 +258,12 @@ impl CbCache {
         }
     }
 
+    pub(crate) fn anchors(&self, out: &mut Vec<usize>) {
+        if let Ok(cache) = self.intr.try_borrow() {
+            if let Some(intr) = cache.as_ref() { out.push(Gc::as_ptr(&intr.array_proto) as usize); }
+        }
+    }
+
     pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
         if let Ok(cache) = self.intr.try_borrow() {
             if let Some(intr) = cache.as_ref().filter(|intr| Gc::as_ptr(&intr.array_proto) as usize == pointer) { intr.for_each_object(visit); }

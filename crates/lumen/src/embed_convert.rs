@@ -3077,6 +3077,20 @@ pub(crate) fn count_host_class_cache_edges(i: &Interp, visit: &mut dyn FnMut(&Gc
     }
 }
 
+/// Every pointer `trace_host_class_cache` can produce edges for.
+pub(crate) fn host_class_cache_anchors(i: &Interp, out: &mut Vec<usize>) {
+    if i.host_state.get::<ClassRegistry>().is_some()
+        || i.host_state.get::<IndexedClasses>().is_some()
+        || i.host_state.get::<Unforgeables>().is_some()
+    {
+        out.push(Gc::as_ptr(&i.global) as usize);
+        out.extend(i.realms.keys().copied());
+    }
+    if let Some(cache) = i.host_state.get::<Unforgeables>() {
+        out.extend(cache.by_proto.keys().copied());
+    }
+}
+
 pub(crate) fn trace_host_class_cache(i: &Interp, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
     let value = |value: &Value, visit: &mut dyn FnMut(&Gc)| {
         if let Value::Obj(object) = value { visit(object); }
@@ -3246,14 +3260,30 @@ pub(crate) fn retain_host_identities(i: &mut Interp) {
     }
 }
 
+/// Keys of the host entries that own native identities or values: the only ones
+/// `trace_host_identity_owner` and `count_host_identity_owner_pins` act on.
+pub(crate) fn host_identity_owner_keys(i: &Interp, out: &mut Vec<usize>) {
+    if let Some(objects) = i.host_state.get::<HostObjects>() {
+        out.extend(
+            objects.map.iter()
+                .filter(|(_, entry)| entry.identity_owner.is_some() || entry.native_values.is_some())
+                .map(|(key, _)| *key),
+        );
+    }
+}
+
 /// Native owner pins are bookkeeping edges, like Interp::gc_pins. Another
 /// interpreter's collection sees them as external holders; this interpreter
 /// discounts its own pins so unreachable native cycles still collect.
-pub(crate) fn count_host_identity_owner_pins(i: &Interp, visit: &mut dyn FnMut(&Value)) {
+pub(crate) fn count_host_identity_owner_pins(
+    i: &Interp,
+    owners: &[usize],
+    visit: &mut dyn FnMut(&Value),
+) {
     let Some(objects) = i.host_state.get::<HostObjects>() else {
         return;
     };
-    for entry in objects.map.values() {
+    for entry in owners.iter().filter_map(|key| objects.map.get(key)) {
         if entry.identity_owner.is_some()
             && (!entry.callbacks_retained || entry.native_values.is_some())
         {

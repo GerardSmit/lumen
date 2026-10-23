@@ -96,6 +96,14 @@ impl IterProof {
         }
     }
 
+    pub(crate) fn anchors(&self, out: &mut Vec<usize>) {
+        for cache in self.caches() {
+            if let Ok(proof) = cache.try_borrow() {
+                if let Some(proof) = proof.as_ref() { out.push(Gc::as_ptr(&proof.proto) as usize); }
+            }
+        }
+    }
+
     pub(crate) fn trace_intrinsic_edges(&self, pointer: usize, visit: &mut dyn FnMut(&Gc)) {
         for cache in self.caches() {
             if let Ok(proof) = cache.try_borrow() {

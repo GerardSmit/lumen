@@ -13,7 +13,7 @@
 //! bounded chunks. Only the garbage itself is held (strongly) across the sweep, so its
 //! destructors cannot free a node whose side-table entries are still to be evicted.
 use super::{Callable, Env, Exotic, Interp, Scope};
-use crate::fasthash::FastMap;
+use crate::fasthash::{FastMap, FastSet};
 use crate::value::gc_edges::{visit_object_head, visit_object_refs};
 use crate::value::{self, Gc, ObjCell, Value};
 use std::cell::{Cell, RefCell};
@@ -136,6 +136,10 @@ struct Tracer {
     // Native callable dispatch identifies its realm through Function.prototype.
     // Preserve that reverse edge only when the prototype is actually reached.
     realm_function_prototypes: FastMap<usize, usize>,
+    // Objects some per-object side table (proxies, host identity owners, class caches, intrinsic
+    // caches, WindowProxies, realms) can produce edges for. Marking runs no author code, so the
+    // set built before it starts stays complete.
+    anchors: FastSet<usize>,
     objects: Vec<*const ObjCell>,
     wide: Vec<(*const ObjCell, usize)>,
     scopes: Vec<ScopePtr>,
@@ -270,36 +274,58 @@ impl Interp {
                 }
             });
         }
-        if !self.proxies.is_empty() {
-            if let Some((t, h)) = self.proxies.get(&(p as usize)) {
-                for v in [t, h] {
-                    if let Value::Obj(c) = v {
-                        tr.mark_obj(c);
-                    }
+        if tr.anchors.contains(&(p as usize)) {
+            self.trace_anchor_edges(p as usize, tr);
+        }
+    }
+
+    fn trace_anchor_edges(&self, ptr: usize, tr: &mut Tracer) {
+        if let Some((t, h)) = self.proxies.get(&ptr) {
+            for v in [t, h] {
+                if let Value::Obj(c) = v {
+                    tr.mark_obj(c);
                 }
             }
         }
         #[cfg(feature = "embed")]
-        crate::embed_convert::trace_host_identity_owner(self, p as usize, &mut |value| {
+        crate::embed_convert::trace_host_identity_owner(self, ptr, &mut |value| {
             if let Value::Obj(object) = value {
                 tr.mark_obj(object);
             }
         });
         #[cfg(feature = "embed")]
-        crate::embed_convert::trace_host_class_cache(self, p as usize, &mut |object| tr.mark_obj(object));
-        self.lang.trace_intrinsic_edges(p as usize, &mut |object| tr.mark_obj(object));
+        crate::embed_convert::trace_host_class_cache(self, ptr, &mut |object| tr.mark_obj(object));
+        self.lang.trace_intrinsic_edges(ptr, &mut |object| tr.mark_obj(object));
         #[cfg(feature = "embed")]
-        if let Some(target) = self.window_proxy_target(p as usize) {
+        if let Some(target) = self.window_proxy_target(ptr) {
             if let Value::Obj(target) = target {
                 tr.mark_obj(&target);
             }
         }
         if self.multi_realm() {
-            if let Some(r) = self.realms.get(&(p as usize)).filter(|r| r.collectable) {
+            if let Some(r) = self.realms.get(&ptr).filter(|r| r.collectable) {
                 r.for_each_object(|c| tr.mark_obj(c));
                 tr.mark_scope(Rc::as_ptr(&r.global_env));
             }
         }
+    }
+
+    fn gc_anchors(&self, host_owners: &[usize]) -> FastSet<usize> {
+        let mut out = Vec::new();
+        out.extend(self.proxies.keys().copied());
+        self.lang.intrinsic_anchors(&mut out);
+        if self.multi_realm() {
+            out.extend(self.realms.iter().filter(|(_, r)| r.collectable).map(|(k, _)| *k));
+        }
+        #[cfg(feature = "embed")]
+        {
+            out.extend_from_slice(host_owners);
+            crate::embed_convert::host_class_cache_anchors(self, &mut out);
+            self.window_proxy_anchors(&mut out);
+        }
+        #[cfg(not(feature = "embed"))]
+        let _ = host_owners;
+        out.into_iter().collect()
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -336,6 +362,14 @@ impl Interp {
         #[cfg(feature = "embed")]
         crate::embed_convert::retain_host_identities(self);
         self.str_units.clear();
+        #[cfg(feature = "embed")]
+        let host_owners = {
+            let mut owners = Vec::new();
+            crate::embed_convert::host_identity_owner_keys(self, &mut owners);
+            owners
+        };
+        #[cfg(not(feature = "embed"))]
+        let host_owners: Vec<usize> = Vec::new();
         super::GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Count references between heap nodes (objects and scopes). Scopes are nodes too: a
@@ -404,7 +438,7 @@ impl Interp {
         #[cfg(feature = "embed")]
         crate::embed_convert::count_host_class_cache_edges(self, &mut |object| object.gc_add_ref());
         #[cfg(feature = "embed")]
-        crate::embed_convert::count_host_identity_owner_pins(self, &mut |value| {
+        crate::embed_convert::count_host_identity_owner_pins(self, &host_owners, &mut |value| {
             if let Value::Obj(object) = value {
                 object.gc_add_ref();
             }
@@ -464,6 +498,7 @@ impl Interp {
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
         // Interp's own fields, module/realm registries, coroutine threads).
         let mut tr = Tracer::default();
+        tr.anchors = self.gc_anchors(&host_owners);
         if vm_realms {
             tr.realm_function_prototypes.extend(self.realms.iter().filter(|(_, realm)|realm.collectable)
                 .map(|(key, realm)|(Gc::as_ptr(&realm.function_proto) as usize,*key)));
@@ -970,5 +1005,37 @@ mod tests {
             interp.gc_collect();
         }
         assert_eq!(stale_side_tables(&interp), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn anchored_side_table_edges_survive_collection() {
+        let mut interp = Interp::new();
+        run(
+            &mut interp,
+            "globalThis.px = (function () {
+               const target = { value: 41, self: null }, handler = { get(t, k) { return t[k]; } };
+               target.self = target; handler.target = target;
+               return new Proxy(target, handler);
+             })();
+             for (const x of [1, 2, 3]) {}
+             [1, 2].map(function (x) { return x; });
+             globalThis.done = 0;
+             Promise.resolve(1).then(function () { globalThis.done = 1; });",
+        );
+        for _ in 0..3 {
+            interp.gc_collect();
+        }
+        run(
+            &mut interp,
+            "if (px.value !== 41 || px.self.value !== 41) throw new Error('proxy edges lost');
+             let sum = 0;
+             for (const x of [1, 2, 3]) sum += x;
+             if (sum !== 6 || [1, 2].map(function (x) { return x * 2; })[1] !== 4) throw new Error('array caches lost');
+             Promise.resolve(2).then(function () { globalThis.done = 2; });",
+        );
+        for _ in 0..3 {
+            interp.gc_collect();
+        }
+        run(&mut interp, "Promise.resolve().then(function () { if (!(done >= 1)) throw new Error('promise lost'); });");
     }
 }

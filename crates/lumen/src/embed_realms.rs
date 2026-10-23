@@ -935,6 +935,12 @@ impl Interp {
             .is_some_and(|registry| !registry.entries.is_empty())
     }
 
+    pub(crate) fn window_proxy_anchors(&self, out: &mut Vec<usize>) {
+        if let Some(registry) = self.host_state.get::<WindowProxyRegistry>() {
+            out.extend(registry.entries.keys().copied());
+        }
+    }
+
     pub(crate) fn window_proxy_target(&self, key: usize) -> Option<Value> {
         self.host_state
             .get::<WindowProxyRegistry>()?
