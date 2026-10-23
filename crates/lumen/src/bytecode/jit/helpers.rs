@@ -3200,6 +3200,10 @@ thread_local! {
     /// is hot (compiled with a view cache from then on).
     static TA_VIEWS: std::cell::RefCell<std::collections::HashMap<(usize, u32), u32>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The element kind code first seen per uncached element site `(chunk, pc)`; `u32::MAX`
+    /// once the site saw two different kinds.
+    static TA_SITE_KINDS: std::cell::RefCell<std::collections::HashMap<(usize, u32), u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// The site whose [`ta_code::RECOMPILE`] exit is pending (taken by the exit handling).
     static TA_EXIT: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, u32::MAX)) };
 }
@@ -3252,6 +3256,18 @@ pub(crate) fn ta_hot(chunk: &Chunk, pc: usize) -> bool {
         m.borrow()
             .get(&(chunk as *const Chunk as usize, pc as u32))
             .is_some_and(|&n| n == u32::MAX)
+    })
+}
+
+/// The element kind code every fresh view of uncached site `pc` of `chunk` had, or 0 when
+/// unknown or mixed.
+pub(crate) fn ta_site_kind(chunk: &Chunk, pc: usize) -> u32 {
+    TA_SITE_KINDS.with(|m| {
+        m.borrow()
+            .get(&(chunk as *const Chunk as usize, pc as u32))
+            .copied()
+            .filter(|&k| k != u32::MAX)
+            .unwrap_or(0)
     })
 }
 
@@ -3361,6 +3377,16 @@ pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write
     // An uncached site (`write` bit 1, its pc above): count the fresh views it takes.
     if code != 0 && write & 2 != 0 {
         let key = ((*f).chunk as usize, write >> 2);
+        TA_SITE_KINDS.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() >= 1 << 16 && !m.contains_key(&key) {
+                return;
+            }
+            let seen = m.entry(key).or_insert(code);
+            if *seen != code {
+                *seen = u32::MAX;
+            }
+        });
         let hot = TA_VIEWS.with(|m| {
             let mut m = m.borrow_mut();
             if m.len() >= 1 << 16 && !m.contains_key(&key) {

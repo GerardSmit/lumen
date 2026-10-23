@@ -618,3 +618,174 @@ fn loop_resume_exits_widen_and_recompile() {
         true,
     );
 }
+
+#[test]
+fn chained_typed_array_sums_across_kinds() {
+    agree(
+        r#"(function(){
+          function t1(a,n){var s=0;for(var k=0;k<n;k++)s+=a.b[k];return s}
+          var N=4096,u=new Uint8Array(N),f=new Float64Array(N),h=new Int16Array(N);
+          for(var i=0;i<N;i++){u[i]=i&255;f[i]=i*0.5;h[i]=(i*7)-9000}
+          var o={b:u},p={b:f},q={b:h},out=[];
+          for(var r=0;r<40;r++){out.length=0;out.push(t1(o,N),t1(p,N),t1(q,N))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_cache_follows_receivers_and_mixed_kinds() {
+    agree(
+        r#"(function(){
+          function t1(a,n){var s=0;for(var k=0;k<n;k++)s+=a.b[k];return s}
+          var u=new Uint8Array(64),f=new Float32Array(64),w=new Uint32Array(64),arr=[];
+          for(var i=0;i<64;i++){u[i]=i;f[i]=i/4;w[i]=4294967295-i;arr.push(i*3)}
+          var recvs=[{b:u},{x:1,b:f},{b:w},{y:0,z:1,b:u},{b:arr},{b:f},{b:u}],out=[];
+          for(var r=0;r<30;r++){
+            out.length=0;
+            for(var j=0;j<recvs.length;j++)out.push(t1(recvs[j],64));
+            out.push(t1({b:u},64),t1({b:'abc'},3),t1({b:undefined},0));
+          }
+          var caught='';
+          try{t1({b:null},2)}catch(e){caught=e instanceof TypeError}
+          return out.join('|')+'|'+caught;
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_cache_dropped_when_a_getter_swaps_the_property() {
+    agree(
+        r#"(function(){
+          function t(a,g,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];s+=g.x}return s}
+          var u=new Uint8Array(32),f=new Float64Array(32),h=new Int16Array(32);
+          for(var i=0;i<32;i++){u[i]=i+1;f[i]=(i+1)*100.5;h[i]=-(i+1)*1000}
+          var o={b:u},calls=0,seq=[f,h,u,[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]];
+          var quiet={x:0};
+          var g={get x(){calls++;if(calls%5===0)o.b=seq[(calls/5)%seq.length|0];return 1}};
+          var out=[];
+          for(var r=0;r<40;r++)out.push(t(o,quiet,32));
+          for(var r=0;r<12;r++){o.b=u;out.push(t(o,g,32))}
+          out.push(t(o,quiet,32),calls);
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_cache_dropped_when_the_receiver_property_is_replaced_by_js_in_the_loop() {
+    agree(
+        r#"(function(){
+          function t(a,g,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];if(k===3)s+=g.x}return s}
+          var u=new Uint8Array(16),f=new Float64Array(16);
+          for(var i=0;i<16;i++){u[i]=i;f[i]=1000+i}
+          var o={b:u},mode=0;
+          var g={get x(){if(mode)o.b=o.b===u?f:u;return 0}};
+          var out=[];
+          for(var r=0;r<60;r++)out.push(t(o,g,16));
+          mode=1;
+          for(var r=0;r<20;r++){o.b=u;out.push(t(o,g,16))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_with_a_reassigned_receiver_slot() {
+    agree(
+        r#"(function(){
+          function t(a,c,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];if(k%2)a=c;else a=a===c?c:a}return s}
+          function t2(a,c,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];var tmp=a;a=c;c=tmp}return s}
+          var u=new Uint8Array(40),f=new Float64Array(40);
+          for(var i=0;i<40;i++){u[i]=i;f[i]=1000+i}
+          var out=[];
+          for(var r=0;r<40;r++){out.length=0;out.push(t({b:u},{b:f},40),t2({b:u},{b:f},40),t2({b:f},{b:u},39))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_with_property_stores() {
+    agree(
+        r#"(function(){
+          function t(a,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];if(k===5)a.b=a.c}return s}
+          function t3(a,n,v){var s=0;for(var k=0;k<n;k++){s+=a.b[k];a.n=k;a.b=v}return s}
+          var u=new Uint8Array(20),f=new Float64Array(20);
+          for(var i=0;i<20;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var out=[];
+          for(var r=0;r<40;r++){out.length=0;out.push(t({b:u,c:f},20),t({b:f,c:u},20),t3({b:u},20,f),t3({b:f},20,u))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_with_number_key_stores() {
+    agree(
+        r#"(function(){
+          var tbl=[];for(var b=0;b<256;b++)tbl[b]=-1;for(var b=0;b<64;b++)tbl[65+b]=b;
+          var n=1<<12;var u=new Uint8Array(n);for(var i=0;i<n;i++)u[i]=65+(i*7)%64;
+          var o={b:u};
+          function t4(a,c){var o=new Uint8Array(n);for(var m=0;m<n;m++){o[m]=c[a.b[m]]&255}
+            var s=0;for(var m=0;m<n;m++)s=(s*31+o[m])|0;return s}
+          function t5(a,c,n){var r=[];for(var k=0;k<n;k++){r[k]=a.b[k]+c[k&3];c[k&3]=k}return r.join(',')}
+          function t6(a,n){var o=new Uint8Array(8),s=0;
+            for(var k=0;k<n;k++){var nk=k%3===0?1.5:k%3===1?NaN:k&7;o[nk]=9;s+=a.b[k]+o[1]*1000}return s+'|'+o.join(',')}
+          var out=[];
+          for(var r=0;r<40;r++){out.length=0;
+            out.push(t4(o,tbl),t5({b:[1,2,3,4,5,6]},[10,20,30,40],6),t6({b:u},16))}
+          return out.join('#');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_sees_string_key_store_replacing_the_chained_property() {
+    agree(
+        r#"(function(){
+          function t(a,keys,other,n){var s=0;for(var k=0;k<n;k++){s+=a.b[k];a[keys[k]]=other}return s}
+          var u=new Uint8Array(12),f=new Float64Array(12);
+          for(var i=0;i<12;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var keys=['z','z','z','b','z','z','z','z','z','z','z','z'];
+          var out=[];
+          for(var r=0;r<40;r++){out.length=0;
+            out.push(t({b:u},keys,f,12),t({b:f},keys,u,12),t({b:u},['z','b','b','z','b','z','b','z','z','z','z','z'],f,12))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_sees_nan_key_store_replacing_nan_property() {
+    agree(
+        r#"(function(){
+          function t(a,other,n){var s=0;for(var k=0;k<n;k++){s+=a.NaN[k];var key=k===3?NaN:k+100;a[key]=other}return s}
+          function t2(a,other,n){var s=0;for(var k=0;k<n;k++){s+=a.Infinity[k];var key=k===3?1/0:k+100;a[key]=other}return s}
+          var u=new Uint8Array(12),f=new Float64Array(12);
+          for(var i=0;i<12;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var out=[];
+          for(var r=0;r<40;r++){out.length=0;
+            out.push(t({NaN:u},f,12),t2({Infinity:u},f,12))}
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}

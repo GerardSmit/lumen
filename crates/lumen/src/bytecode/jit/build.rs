@@ -696,6 +696,7 @@ fn build_region(
             dv_vars: HashMap::new(),
             bl_vars: HashMap::new(),
             push_vars: HashMap::new(),
+            chain_vars: HashMap::new(),
             ta_kinds: ta_kinds_init,
             ta_slots: ta_slots_init,
             hs_cur: Vec::new(),
@@ -2189,6 +2190,9 @@ struct Tr<'a, 'f> {
     /// The receiver (payload word, 0 = none) that last passed a push site's guard, per
     /// [`Plan::arrm`] site: the same array needs no re-check until JS runs.
     push_vars: HashMap<usize, Variable>,
+    /// The receiver payload (I64, 0 = unset) and the object payload its chained property read
+    /// found (I64), per `GetPropLocal` site of a read-only loop (see [`Tr::chain_cached`]).
+    chain_vars: HashMap<usize, (Variable, Variable)>,
     /// Region handlers live at the op being translated (see [`Analysis::hs`]).
     hs_cur: Vec<(usize, usize)>,
     /// The last op a chained read already emitted (see [`Tr::chain_read`]): `body` skips
@@ -2403,6 +2407,17 @@ impl<'a, 'f> Tr<'a, 'f> {
             .chain(self.push_vars.values().map(|&v| (v, PTR)))
             .collect();
         self.reset_vars(&vars);
+        self.invalidate_chains();
+    }
+
+    /// Forget every cached chained-read object (see [`Tr::chain_vars`]).
+    fn invalidate_chains(&mut self) {
+        if !self.chain_vars.is_empty() {
+            let zero = self.i64c(0);
+            for &(recv, _) in self.chain_vars.values() {
+                self.fb.def_var(recv, zero);
+            }
+        }
     }
 
     /// Reset the typed-array view caches: a closure whose `.prototype` is still lazy clears
@@ -3498,6 +3513,27 @@ impl<'a, 'f> Tr<'a, 'f> {
             let zp = self.ptrc(0);
             self.fb.def_var(v, zp);
             self.push_vars.insert(pc, v);
+        }
+        if !self.func_mode {
+            for pc in self.header..=self.backedge {
+                let Op::GetPropLocal(sl, n, c) = self.ops[pc] else {
+                    continue;
+                };
+                if self.chains(pc, n, c).is_none()
+                    || matches!(&*self.chunk.names[n as usize], "NaN" | "Infinity")
+                    || !self.chain_cached(sl)
+                {
+                    continue;
+                }
+                let (recv, obj) = (
+                    self.fb.declare_var(Type::I64),
+                    self.fb.declare_var(Type::I64),
+                );
+                let zero = self.i64c(0);
+                self.fb.def_var(recv, zero);
+                self.fb.def_var(obj, zero);
+                self.chain_vars.insert(pc, (recv, obj));
+            }
         }
         // String intrinsic sites check at the site (the guard needs the receiver); so do the
         // folded wrapper calls (the guard needs the callee's cell).
@@ -6084,7 +6120,32 @@ impl<'a, 'f> Tr<'a, 'f> {
         let ic = layout::prop_ic(self.chunk, c).ok_or("chained read without a cache")?;
         let pre = self.stack.clone();
         let other = self.fb.create_block();
-        let p = layout::prop_obj(&mut self.fb, obj, &ic, other);
+        let p = match self.chain_vars.get(&pc).copied() {
+            Some((rv, ov)) => {
+                let hit = self.fb.create_block();
+                let found = self.fb.append_block_param(hit, Type::I64);
+                let probe = self.fb.create_block();
+                let tag = self.fb.load(MemKind::I32U8, obj, 0);
+                let objt = self.i32c(TAG_OBJ as i64);
+                let is_obj = self.fb.icmp(IntCC::Eq, tag, objt);
+                let payload = self.fb.load(MemKind::I64, obj, VALUE_PAYLOAD);
+                let cached_recv = self.fb.use_var(rv);
+                let same = self.fb.icmp(IntCC::Eq, payload, cached_recv);
+                let ok = self.fb.binary(BinaryOp::Band, is_obj, same);
+                let cached = self.fb.use_var(ov);
+                self.fb.brif(ok, hit, &[cached], probe, &[]);
+                self.fb.seal_block(probe);
+                self.fb.switch_to_block(probe);
+                let p = layout::prop_obj(&mut self.fb, obj, &ic, other);
+                self.fb.def_var(rv, payload);
+                self.fb.def_var(ov, p);
+                self.seal_current();
+                self.fb.jump(hit, &[p]);
+                self.fb.switch_to_block(hit);
+                found
+            }
+            None => layout::prop_obj(&mut self.fb, obj, &ic, other),
+        };
         self.seal_current();
         let dst = self.sptr(at);
         let objt = self.i32c(TAG_OBJ as i64);
@@ -6124,6 +6185,69 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.merge_paths(vec![lent, plain])?;
         self.skip = Some(last);
         Ok(())
+    }
+
+    /// Whether the chained `GetPropLocal` reads of slot `s` can cache the property's object
+    /// across iterations (see [`Tr::chain_vars`]): no op of the loop writes slot `s`, writes
+    /// a named property, or calls anything, so the only way `s.name` can change is JS running
+    /// inside a generic op, which [`Tr::invalidate_js`] clears the cache after, or a String-key
+    /// element store, which [`Tr::elem_set_str`] clears it after. Number-key element stores only
+    /// reach integer indices natively (anything else is generic). The
+    /// slot keeps the receiver alive and the receiver's property keeps the cached object alive.
+    fn chain_cached(&self, s: u16) -> bool {
+        if self.tdz_slots[s as usize] || self.kinds[s as usize] != Kind::Boxed {
+            return false;
+        }
+        self.ops[self.header..=self.backedge].iter().all(|op| match *op {
+            Op::StoreLocal(x) | Op::UpdateLocal(x, _) => x != s,
+            Op::ArithLL(_, x, ..) | Op::ArithLK(_, x, ..) => x != s,
+            Op::Const(_)
+            | Op::Undef
+            | Op::Dup
+            | Op::Pop
+            | Op::LoadLocal(_)
+            | Op::LoadThis
+            | Op::GetProp(..)
+            | Op::GetPropThis(..)
+            | Op::GetPropLocal(..)
+            | Op::GetElem
+            | Op::GetElemLocal(_)
+            | Op::SetElem
+            | Op::SetElemDrop
+            | Op::SetElemLocal(_)
+            | Op::SetElemLocalDrop(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Lt
+            | Op::Gt
+            | Op::Le
+            | Op::Ge
+            | Op::EqEq
+            | Op::NotEq
+            | Op::StrictEq
+            | Op::StrictNotEq
+            | Op::Neg
+            | Op::Plus
+            | Op::Not
+            | Op::BitNot
+            | Op::Jump(_)
+            | Op::JumpIfFalse(_)
+            | Op::JumpIfNotCmp(..)
+            | Op::JumpIfNotCmpLL(..)
+            | Op::JumpIfNotCmpLK(..)
+            | Op::JumpIfFalsePeek(_)
+            | Op::JumpIfTruePeek(_) => true,
+            _ => false,
+        })
     }
 
     /// Emit ops `first..=last` of a chained read (they do not chain in turn).
@@ -9031,12 +9155,15 @@ impl<'a, 'f> Tr<'a, 'f> {
         let ta_first = self.ta_first(src) || helpers::ta_hot(self.chunk, pc);
         // A typed array of an int32 element kind at a Number-consuming site: the result joins
         // as an I32 (so consumers see an exact integer); anything else leaves to the slow path.
-        let ikind = want
-            && ta_first
-            && matches!(src, Some(Src::Slot(s)) if self.ta_kinds.get(s as usize).is_some_and(|&k| {
-                use helpers::ta_code as tc;
-                matches!(k, tc::I8 | tc::U8 | tc::U8C | tc::I16 | tc::U16 | tc::I32)
-            }));
+        let ikind = want && ta_first && {
+            use helpers::ta_code as tc;
+            let k = match src {
+                Some(Src::Slot(s)) => self.ta_kinds.get(s as usize).copied().unwrap_or(0),
+                _ if self.ta_vars.contains_key(&pc) => helpers::ta_site_kind(self.chunk, pc),
+                _ => 0,
+            };
+            matches!(k, tc::I8 | tc::U8 | tc::U8C | tc::I16 | tc::U16 | tc::I32)
+        };
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
         let join = self.fb.create_block();
@@ -9433,6 +9560,8 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(hit_b);
         self.fb.seal_block(gen_b);
         self.fb.switch_to_block(hit_b);
+        // A named property may have been overwritten without JS running.
+        self.invalidate_chains();
         // A created property may have moved the receiver's entries, and a replaced object may
         // back cached facts (a global binding's array view): reset every region cache.
         let two = self.i32c(2);
@@ -9512,6 +9641,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         let cache = self.ta_vars.get(&pc).copied();
         let want = match (src, cache) {
             (Some(Src::Slot(s)), Some(_)) => self.ta_kinds.get(s as usize).copied().unwrap_or(0),
+            (_, Some(_)) => helpers::ta_site_kind(self.chunk, pc),
             _ => 0,
         };
         let gc = layout::side_table_object(&mut self.fb, obj, other);

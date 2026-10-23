@@ -625,3 +625,326 @@ fn gvn_merges_only_along_dominance() {
     assert_eq!(run(&f, &mut e, &[5, 1]).unwrap(), vec![27]);
     assert_eq!(run(&f, &mut e, &[5, 0]).unwrap(), vec![27]);
 }
+
+fn joined_number_check(other_arm: Option<f64>) -> Function {
+    let mut f = Function::new(
+        "joined_number",
+        Signature::new(vec![Type::I32; 4], vec![Type::I32, Type::I32]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let args = b.block_params(entry).to_vec();
+    let (cond, x, y, acc) = (args[0], args[1], args[2], args[3]);
+    let (left, right, join) = (b.create_block(), b.create_block(), b.create_block());
+    let number = b.append_block_param(join, Type::F64);
+    b.brif(cond, left, &[], right, &[]);
+    b.seal_block(left);
+    b.seal_block(right);
+
+    b.switch_to_block(left);
+    let from_x = b.convert(ConvOp::FromSint, Type::F64, x);
+    b.jump(join, &[from_x]);
+
+    b.switch_to_block(right);
+    let other = match other_arm {
+        Some(c) => b.f64const(c),
+        None => b.convert(ConvOp::FromSint, Type::F64, y),
+    };
+    b.jump(join, &[other]);
+    b.seal_block(join);
+
+    b.switch_to_block(join);
+    let int = b.convert(ConvOp::ToSintSat, Type::I32, number);
+    let back = b.convert(ConvOp::FromSint, Type::F64, int);
+    let differs = b.fcmp(FloatCC::Ne, number, back);
+    let bits = b.convert(ConvOp::Bitcast, Type::I64, number);
+    let neg_zero = b.iconst(Type::I64, i64::MIN);
+    let is_neg_zero = b.icmp(IntCC::Eq, bits, neg_zero);
+    let not_int = b.binary(BinaryOp::Bor, differs, is_neg_zero);
+    let (sum, overflow) = b.checked_binary(CheckedOp::IaddOv, acc, int);
+    let flag = b.binary(BinaryOp::Bor, not_int, overflow);
+    b.ret(&[sum, flag]);
+    b.finish();
+    f
+}
+
+fn count_insts(f: &Function, pred: impl Fn(&InstData) -> bool) -> usize {
+    f.layout
+        .iter()
+        .flat_map(|b| f.blocks[b.index()].insts.iter())
+        .filter(|i| pred(f.inst(**i)))
+        .count()
+}
+
+#[test]
+fn joined_int32_numbers_stay_integers() {
+    let original = joined_number_check(None);
+    let mut f = original.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(
+        count_insts(&f, |d| matches!(
+            d,
+            InstData::Convert {
+                op: ConvOp::ToSintSat | ConvOp::Bitcast,
+                ..
+            } | InstData::FloatCmp { .. }
+        )),
+        0,
+        "{f}"
+    );
+    assert!(f
+        .layout
+        .iter()
+        .flat_map(|b| &f.blocks[b.index()].params)
+        .all(|p| f.value_type(*p) != Type::F64), "{f}");
+    let values = [i32::MIN, -1, 0, 1, 12345, i32::MAX];
+    for cond in [0u32, 1] {
+        for x in values {
+            for y in values {
+                for acc in values {
+                    let input = [cond as u64, x as u32 as u64, y as u32 as u64, acc as u32 as u64];
+                    let picked = if cond != 0 { x } else { y };
+                    let (sum, overflow) = acc.overflowing_add(picked);
+                    let expected = vec![sum as u32 as u64, overflow as u64];
+                    assert_eq!(run(&original, &mut env(), &input).unwrap(), expected);
+                    assert_eq!(run(&f, &mut env(), &input).unwrap(), expected, "{f}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn joined_numbers_with_a_float_argument_are_not_narrowed() {
+    for constant in [0.5f64, -0.0] {
+        let original = joined_number_check(Some(constant));
+        let mut f = original.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        assert!(
+            f.layout
+                .iter()
+                .flat_map(|b| &f.blocks[b.index()].params)
+                .any(|p| f.value_type(*p) == Type::F64),
+            "{f}"
+        );
+        assert!(
+            count_insts(&f, |d| matches!(d, InstData::FloatCmp { .. })) > 0,
+            "{f}"
+        );
+        for x in [i32::MIN, -1, 0, 7, i32::MAX] {
+            for acc in [i32::MIN, 0, 5, i32::MAX] {
+                for cond in [0u64, 1] {
+                    let input = [cond, x as u32 as u64, 0, acc as u32 as u64];
+                    let expected = run(&original, &mut env(), &input).unwrap();
+                    assert_eq!(run(&f, &mut env(), &input).unwrap(), expected, "{f}");
+                    if cond == 0 {
+                        assert_eq!(expected[1], 1, "constant arm is not an int32");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_carried_int32_numbers_narrow() {
+    let mut f = Function::new(
+        "loop_number",
+        Signature::new(vec![Type::I32, Type::I32], vec![Type::I32]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (n, start) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (header, exit) = (b.create_block(), b.create_block());
+    let number = b.append_block_param(header, Type::F64);
+    let counter = b.append_block_param(header, Type::I32);
+    let first = b.convert(ConvOp::FromSint, Type::F64, start);
+    let zero = b.iconst(Type::I32, 0);
+    b.jump(header, &[first, zero]);
+    b.switch_to_block(header);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, counter, one);
+    let more = b.icmp(IntCC::Slt, next, n);
+    b.brif(more, header, &[number, next], exit, &[]);
+    b.seal_block(header);
+    b.seal_block(exit);
+    b.switch_to_block(exit);
+    let int = b.convert(ConvOp::ToSintSat, Type::I32, number);
+    b.ret(&[int]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(
+        count_insts(&f, |d| matches!(
+            d,
+            InstData::Convert {
+                op: ConvOp::ToSintSat,
+                ..
+            }
+        )),
+        0,
+        "{f}"
+    );
+    for start in [i32::MIN, -3, 0, i32::MAX] {
+        let input = [4, start as u32 as u64];
+        assert_eq!(
+            run(&f, &mut env(), &input).unwrap(),
+            run(&original, &mut env(), &input).unwrap()
+        );
+    }
+}
+
+fn loads(f: &Function) -> usize {
+    count_insts(f, |d| matches!(d, InstData::Load { .. }))
+}
+
+#[test]
+fn stores_forward_to_loads_in_block_and_single_predecessor_successor() {
+    let mut f = Function::new(
+        "forward",
+        Signature::new(vec![Type::I64, Type::I64], vec![Type::I64]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (buf, x) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let tag = b.iconst(Type::I32, 3);
+    b.store(MemKind::I32U8, buf, tag, 0);
+    b.store(MemKind::I64, buf, x, 8);
+    let reloaded_tag = b.load(MemKind::I32U8, buf, 0);
+    let same = b.icmp(IntCC::Eq, reloaded_tag, tag);
+    let (hit, miss) = (b.create_block(), b.create_block());
+    b.brif(same, hit, &[], miss, &[]);
+    b.seal_block(hit);
+    b.seal_block(miss);
+    b.switch_to_block(hit);
+    let payload = b.load(MemKind::I64, buf, 8);
+    b.ret(&[payload]);
+    b.switch_to_block(miss);
+    let zero = b.iconst(Type::I64, 0);
+    b.ret(&[zero]);
+    b.finish();
+    assert_eq!(loads(&f), 2);
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(loads(&f), 0, "{f}");
+    assert_eq!(run(&f, &mut env(), &[32, 0x1234_5678_9abc]).unwrap(), vec![0x1234_5678_9abc]);
+}
+
+#[test]
+fn store_to_another_address_value_blocks_forwarding() {
+    let mut f = Function::new(
+        "alias",
+        Signature::new(vec![Type::I64, Type::I64], vec![Type::I64]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, q) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let one = b.iconst(Type::I64, 1);
+    let two = b.iconst(Type::I64, 2);
+    b.store(MemKind::I64, p, one, 0);
+    b.store(MemKind::I64, q, two, 0);
+    let v = b.load(MemKind::I64, p, 0);
+    b.ret(&[v]);
+    b.finish();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 1, "{f}");
+    assert_eq!(run(&f, &mut env(), &[16, 16]).unwrap(), vec![2]);
+    assert_eq!(run(&f, &mut env(), &[16, 32]).unwrap(), vec![1]);
+}
+
+struct CallClobbers(BufferEnv);
+
+impl interp::Env for CallClobbers {
+    fn load(&mut self, addr: u64, bytes: u32) -> u64 {
+        self.0.load(addr, bytes)
+    }
+    fn store(&mut self, addr: u64, bytes: u32, value: u64) {
+        self.0.store(addr, bytes, value)
+    }
+    fn call(&mut self, _: &ExtFunc, _: &Signature, _: &[u64]) -> Result<Vec<u64>, u32> {
+        self.0.store(16, 8, 55);
+        Ok(vec![])
+    }
+    fn call_indirect(&mut self, _: &Signature, _: u64, _: &[u64]) -> Result<Vec<u64>, u32> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn call_blocks_forwarding() {
+    let mut f = Function::new("call", Signature::new(vec![Type::I64], vec![Type::I64]));
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let p = b.block_params(entry)[0];
+    let one = b.iconst(Type::I64, 1);
+    b.store(MemKind::I64, p, one, 0);
+    b.call_fn(callee, &[]);
+    let v = b.load(MemKind::I64, p, 0);
+    b.ret(&[v]);
+    b.finish();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 1, "{f}");
+    let mut e = CallClobbers(env());
+    assert_eq!(run(&f, &mut e, &[16]).unwrap(), vec![55]);
+}
+
+#[test]
+fn narrow_store_of_unbounded_value_is_not_forwarded() {
+    let mut f = Function::new(
+        "narrow",
+        Signature::new(vec![Type::I64, Type::I32], vec![Type::I32, Type::I32]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, x) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    b.store(MemKind::I32U8, p, x, 0);
+    let from_arg = b.load(MemKind::I32U8, p, 0);
+    let wide = b.iconst(Type::I32, 300);
+    b.store(MemKind::I32U8, p, wide, 4);
+    let from_const = b.load(MemKind::I32U8, p, 4);
+    b.ret(&[from_arg, from_const]);
+    b.finish();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 2, "{f}");
+    assert_eq!(run(&f, &mut env(), &[16, 300]).unwrap(), vec![44, 44]);
+}
+
+#[test]
+fn merge_blocks_do_not_inherit_known_memory() {
+    let mut f = Function::new(
+        "merge",
+        Signature::new(vec![Type::I64, Type::I32, Type::I64], vec![Type::I64]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, c, x) = (
+        b.block_params(entry)[0],
+        b.block_params(entry)[1],
+        b.block_params(entry)[2],
+    );
+    let (left, right, join) = (b.create_block(), b.create_block(), b.create_block());
+    b.store(MemKind::I64, p, x, 0);
+    b.brif(c, left, &[], right, &[]);
+    b.seal_block(left);
+    b.seal_block(right);
+    b.switch_to_block(left);
+    let nine = b.iconst(Type::I64, 9);
+    b.store(MemKind::I64, p, nine, 0);
+    b.jump(join, &[]);
+    b.switch_to_block(right);
+    b.jump(join, &[]);
+    b.seal_block(join);
+    b.switch_to_block(join);
+    let v = b.load(MemKind::I64, p, 0);
+    b.ret(&[v]);
+    b.finish();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(loads(&f), 1, "{f}");
+    assert_eq!(run(&f, &mut env(), &[16, 1, 7]).unwrap(), vec![9]);
+    assert_eq!(run(&f, &mut env(), &[16, 0, 7]).unwrap(), vec![7]);
+}

@@ -23,10 +23,12 @@ fn optimize_impl(func: &mut Function, unroll: bool) {
     let mut cfg = None;
     remove_unreachable(func);
     simplify_params(func);
+    narrow_params(func);
     gvn_cached(func, &mut cfg);
     // Another GVN pass only has something to find after a change since the last one.
     let mut dirty = remove_unreachable(func);
     dirty |= simplify_params(func);
+    dirty |= narrow_params(func);
     // Small constant-trip loops: unroll fully, then fold their induction values.
     if unroll && crate::unroll::unroll(func) {
         cfg = None;
@@ -36,7 +38,8 @@ fn optimize_impl(func: &mut Function, unroll: bool) {
         simplify_params(func);
         dirty = true;
     }
-    // Parameters simplified away can expose constant branch conditions: fold them too.
+    dirty |= forward_loads(func, &mut cfg);
+    // Parameters simplified away or loads forwarded can expose constant branch conditions.
     if dirty {
         gvn_cached(func, &mut cfg);
         remove_unreachable(func);
@@ -185,6 +188,280 @@ pub fn simplify_params(func: &mut Function) -> bool {
         func.resolve_aliases();
     }
     any_change
+}
+
+/// The I32 `x` when `v` is `FromSint(x)` to F64.
+fn exact_i32_source(func: &Function, v: Value) -> Option<Value> {
+    let ValueDef::Result(inst, 0) = func.values[func.resolve(v).index()].def else {
+        return None;
+    };
+    match *func.inst(inst) {
+        InstData::Convert {
+            op: ConvOp::FromSint,
+            to: Type::F64,
+            arg,
+        } if func.value_type(arg) == Type::I32 => Some(func.resolve(arg)),
+        _ => None,
+    }
+}
+
+/// Whether `v` is an integer-to-float conversion: never NaN and never -0.0.
+fn is_int_to_float(func: &Function, v: Value) -> bool {
+    let ValueDef::Result(inst, 0) = func.values[func.resolve(v).index()].def else {
+        return false;
+    };
+    matches!(
+        func.inst(inst),
+        InstData::Convert {
+            op: ConvOp::FromSint | ConvOp::FromUint,
+            ..
+        }
+    )
+}
+
+/// Comparisons whose outcome is fixed because an operand comes from an integer conversion:
+/// `x == x` / `x != x` on a non-NaN, and a test for the -0.0 bit pattern.
+fn fold_int_float_compare(func: &Function, data: &InstData) -> Option<u64> {
+    const NEG_ZERO_BITS: u64 = 0x8000_0000_0000_0000;
+    match data {
+        InstData::FloatCmp {
+            cc: cc @ (FloatCC::Eq | FloatCC::Ne),
+            args: [a, b],
+        } if func.resolve(*a) == func.resolve(*b) && is_int_to_float(func, *a) => {
+            Some((*cc == FloatCC::Eq) as u64)
+        }
+        InstData::IntCmp {
+            cc: cc @ (IntCC::Eq | IntCC::Ne),
+            args: [a, b],
+        } => {
+            let other = match (const_of(func, *a), const_of(func, *b)) {
+                (None, Some(NEG_ZERO_BITS)) => *a,
+                (Some(NEG_ZERO_BITS), None) => *b,
+                _ => return None,
+            };
+            let ValueDef::Result(inst, 0) = func.values[func.resolve(other).index()].def else {
+                return None;
+            };
+            match *func.inst(inst) {
+                InstData::Convert {
+                    op: ConvOp::Bitcast,
+                    to: Type::I64,
+                    arg,
+                } if func.value_type(arg) == Type::F64 && is_int_to_float(func, arg) => {
+                    Some((*cc == IntCC::Ne) as u64)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Carry an F64 block parameter as an I32 when every incoming argument is `FromSint` of an
+/// I32 (or the parameter itself, around a loop): the conversion moves to the top of the block,
+/// where GVN can see that the value is an exact integer. Iterates to a fixpoint, since a
+/// narrowed parameter's conversion can make another parameter's arguments qualify.
+fn narrow_params(func: &mut Function) -> bool {
+    let entry = func.entry();
+    let mut any_change = false;
+    for _ in 0..8 {
+        let incoming = incoming_all(func);
+        let mut changed = false;
+        for bi in 0..func.layout.len() {
+            let b = func.layout[bi];
+            if b == entry || incoming.of(b).is_empty() {
+                continue;
+            }
+            let old_params = func.blocks[b.index()].params.clone();
+            let mut drop = vec![false; old_params.len()];
+            let mut narrowed: Vec<(usize, Value)> = Vec::new();
+            for (i, &p) in old_params.iter().enumerate() {
+                if func.value_type(p) != Type::F64 {
+                    continue;
+                }
+                let qualifies = incoming.of(b).iter().all(|&(t, slot)| {
+                    let a = func.resolve(func.inst(t).successors()[slot as usize].args[i]);
+                    a == p || exact_i32_source(func, a).is_some()
+                });
+                let carries_value = incoming.of(b).iter().any(|&(t, slot)| {
+                    func.resolve(func.inst(t).successors()[slot as usize].args[i]) != p
+                });
+                if !qualifies || !carries_value {
+                    continue;
+                }
+                let narrow = func.append_block_param(b, Type::I32);
+                for &(t, slot) in incoming.of(b) {
+                    let a = func.resolve(func.inst(t).successors()[slot as usize].args[i]);
+                    let arg = if a == p {
+                        narrow
+                    } else {
+                        exact_i32_source(func, a).unwrap()
+                    };
+                    func.insts[t.index()].successor_mut(slot as usize).args.push(arg);
+                }
+                drop[i] = true;
+                narrowed.push((i, narrow));
+            }
+            if narrowed.is_empty() {
+                continue;
+            }
+            drop.resize(func.blocks[b.index()].params.len(), false);
+            let mut at = 0;
+            for &(i, narrow) in &narrowed {
+                let widen = func.make_inst(InstData::Convert {
+                    op: ConvOp::FromSint,
+                    to: Type::F64,
+                    arg: narrow,
+                });
+                func.blocks[b.index()].insts.insert(at, widen);
+                at += 1;
+                func.replace_uses(old_params[i], func.results(widen)[0]);
+            }
+            remove_params(func, b, &drop, incoming.of(b));
+            changed = true;
+        }
+        func.resolve_aliases();
+        any_change |= changed;
+        if !changed {
+            break;
+        }
+    }
+    any_change
+}
+
+/// Memory contents known at a program point: the value a load of `kind` at `addr + offset` yields.
+#[derive(Clone, Copy)]
+struct Known {
+    addr: Value,
+    offset: i32,
+    kind: MemKind,
+    value: Value,
+}
+
+const KNOWN_CAP: usize = 32;
+
+/// `bits` after storing and reloading through the narrow `kind`.
+fn through_memory(kind: MemKind, bits: u64) -> u64 {
+    use MemKind::*;
+    match kind {
+        I32U8 | I64U8 => bits & 0xff,
+        I32U16 | I64U16 => bits & 0xffff,
+        I64U32 => bits & 0xffff_ffff,
+        I32S8 => bits as u8 as i8 as i32 as u32 as u64,
+        I64S8 => bits as u8 as i8 as i64 as u64,
+        I32S16 => bits as u16 as i16 as i32 as u32 as u64,
+        I64S16 => bits as u16 as i16 as i64 as u64,
+        I64S32 => bits as u32 as i32 as i64 as u64,
+        I32 | I64 | F32 | F64 | V128 => bits,
+    }
+}
+
+/// Whether reloading what `Store { kind, value }` wrote yields `value` itself.
+fn store_forwards(func: &Function, kind: MemKind, value: Value) -> bool {
+    if func.value_type(value) != kind.ty() {
+        return false;
+    }
+    if matches!(
+        kind,
+        MemKind::I32 | MemKind::I64 | MemKind::F32 | MemKind::F64 | MemKind::V128
+    ) {
+        return true;
+    }
+    if let Some(bits) = const_of(func, value) {
+        return through_memory(kind, bits) == bits;
+    }
+    matches!(
+        func.values[func.resolve(value).index()].def,
+        ValueDef::Result(i, 0) if matches!(func.inst(i), InstData::Load { kind: k, .. } if *k == kind)
+    )
+}
+
+/// Redundant-load elimination and store-to-load forwarding. Each block starts from the memory
+/// facts at the end of its only predecessor (when that one is earlier in reverse postorder, so
+/// every fact's value dominates it) and from nothing otherwise. Any store to another address
+/// value, overlapping store or call drops the facts it may affect. Terminators are untouched;
+/// whether anything changed.
+fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
+    let cfg = cfg_slot.take().unwrap_or_else(|| Cfg::new(func));
+    let incoming = incoming_all(func);
+    let mut ends: Vec<Option<Vec<Known>>> = vec![None; func.blocks.len()];
+    let mut changed = false;
+    let mut removed: Vec<Inst> = Vec::new();
+    for &b in &cfg.rpo {
+        let mut known: Vec<Known> = match (incoming.of(b).len(), &cfg.preds[b.index()]) {
+            (1, &[p]) if cfg.rpo_index[p.index()] < cfg.rpo_index[b.index()] => {
+                ends[p.index()].clone().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        removed.clear();
+        for k in 0..func.blocks[b.index()].insts.len() {
+            let inst = func.blocks[b.index()].insts[k];
+            match func.inst(inst).clone() {
+                InstData::Load { kind, addr, offset } => {
+                    let addr = func.resolve(addr);
+                    let result = func.results(inst)[0];
+                    let hit = known
+                        .iter()
+                        .find(|e| e.addr == addr && e.offset == offset && e.kind == kind);
+                    if let Some(e) = hit {
+                        let value = func.resolve(e.value);
+                        func.replace_uses(result, value);
+                        removed.push(inst);
+                        changed = true;
+                    } else {
+                        if known.len() == KNOWN_CAP {
+                            known.remove(0);
+                        }
+                        known.push(Known {
+                            addr,
+                            offset,
+                            kind,
+                            value: result,
+                        });
+                    }
+                }
+                InstData::Store {
+                    kind,
+                    addr,
+                    value,
+                    offset,
+                } => {
+                    let addr = func.resolve(addr);
+                    let (lo, hi) = (offset as i64, offset as i64 + kind.bytes() as i64);
+                    known.retain(|e| {
+                        e.addr == addr && {
+                            let (elo, ehi) = (e.offset as i64, e.offset as i64 + e.kind.bytes() as i64);
+                            ehi <= lo || hi <= elo
+                        }
+                    });
+                    if store_forwards(func, kind, value) {
+                        if known.len() == KNOWN_CAP {
+                            known.remove(0);
+                        }
+                        known.push(Known {
+                            addr,
+                            offset,
+                            kind,
+                            value: func.resolve(value),
+                        });
+                    }
+                }
+                InstData::Prefetch { .. } | InstData::TrapIf { .. } => {}
+                d if d.is_pure() || d.is_terminator() => {}
+                _ => known.clear(),
+            }
+        }
+        if !removed.is_empty() {
+            func.blocks[b.index()]
+                .insts
+                .retain(|i| !removed.contains(i));
+        }
+        ends[b.index()] = Some(known);
+    }
+    func.resolve_aliases();
+    *cfg_slot = Some(cfg);
+    changed
 }
 
 fn const_of(func: &Function, v: Value) -> Option<u64> {
@@ -406,6 +683,9 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
                 _ => {}
             }
 
+            if let Some(bits) = fold_int_float_compare(func, func.inst(inst)) {
+                func.insts[inst.index()] = const_data(Type::I32, bits);
+            }
             let data = func.inst(inst);
             if !data.is_pure() && !is_foldable_trapping(data) {
                 continue;
