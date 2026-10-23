@@ -36,7 +36,7 @@
 //! What the read needs is recorded per activation ([`ReflectStash`]: the actual arguments and
 //! where the parameters live — the tree-walker's scope, or a compiled frame's slot array) only
 //! once a read can happen: [`note_source`] flips [`enabled`] when a parsed source mentions
-//! `.arguments` / `.caller` or those names as string keys (the first `f.arguments` read in the
+//! `.arguments` / `.caller` or those names as computed string keys (the first `f.arguments` read in the
 //! process flips it too), and every sloppy activation checks it next to its existing
 //! `arguments`-object test. Until then no call does any extra work, and JIT direct call sites
 //! take their slow path (which records it) once the flag is up. An activation that started
@@ -73,12 +73,16 @@ pub(crate) fn enabled_addr() -> usize {
 }
 
 /// Raise [`enabled`] before `src` runs when it could read `f.arguments` / `f.caller` (it mentions
-/// `.arguments` / `.caller`, or those names as string keys): every parse runs this, so the
+/// `.arguments` / `.caller`, or those names as computed string keys): every parse runs this, so the
 /// activation a script's first read is made from already records what the read needs.
 pub(crate) fn note_source(src: &str) {
-    if enabled() {
-        return;
+    if !enabled() && may_reflect(src) {
+        ENABLED.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether `src` mentions `.arguments` / `.caller`, or those names as computed string keys.
+fn may_reflect(src: &str) -> bool {
     fn ident_end(rest: &str) -> bool {
         !rest
             .chars()
@@ -89,14 +93,39 @@ pub(crate) fn note_source(src: &str) {
         let mut from = 0;
         while let Some(at) = lumen_common::search::find_from(src.as_bytes(), name.as_bytes(), from) {
             from = at + name.len();
-            let before = src[..at].trim_end().chars().next_back();
+            let head = src[..at].trim_end();
+            let before = head.chars().next_back();
             let after = &src[at + name.len()..];
-            if (before == Some('.') && ident_end(after))
-                || (matches!(before, Some('\'' | '"' | '`')) && after.starts_with(['\'', '"', '`']))
-            {
-                ENABLED.store(true, Ordering::Relaxed);
-                return;
+            // A string literal counts only as a computed key (`f["caller"]`), not as text
+            // (`"arguments"` in an error message).
+            let quoted = matches!(before, Some('\'' | '"' | '`'))
+                && after.starts_with(['\'', '"', '`'])
+                && head[..head.len() - 1].trim_end().ends_with('[');
+            if (before == Some('.') && ident_end(after)) || quoted {
+                return true;
             }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod source_scan_tests {
+    use super::may_reflect;
+
+    #[test]
+    fn only_member_reads_and_computed_keys_count() {
+        for src in ["f.caller", "f . arguments;", "f['arguments']", "f[ \"caller\" ]"] {
+            assert!(may_reflect(src), "{src}");
+        }
+        for src in [
+            "f.callers",
+            "var arguments_ = 1",
+            r#"o=1===i?"argument":"arguments""#,
+            r#"(i="between "+t,"arguments")"#,
+            "throw new Error('caller')",
+        ] {
+            assert!(!may_reflect(src), "{src}");
         }
     }
 }

@@ -269,11 +269,22 @@ mod stats {
     }
     /// Allocations at least this big print a backtrace (0: off; see `memstats`).
     pub static TRACE_AT: AtomicUsize = AtomicUsize::new(0);
+    /// Only allocations of this category are traced (`usize::MAX`: any).
+    pub static TRACE_CAT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// Trace one in this many matching allocations.
+    pub static TRACE_EVERY: AtomicUsize = AtomicUsize::new(1);
+    pub static TRACE_SEEN: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         pub static TRACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     #[cold]
     pub fn trace(size: usize, cat: u8) {
+        let want = TRACE_CAT.load(Relaxed);
+        if (want != usize::MAX && want != cat as usize)
+            || TRACE_SEEN.fetch_add(1, Relaxed) % TRACE_EVERY.load(Relaxed).max(1) != 0
+        {
+            return;
+        }
         if TRACING.with(|t| t.replace(true)) {
             return;
         }
@@ -299,6 +310,14 @@ pub fn size_buckets() -> [[isize; 8]; 32] {
 #[cfg(feature = "mem-stats")]
 pub fn trace_allocations_from(bytes: usize) {
     stats::TRACE_AT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Narrow [`trace_allocations_from`] to one category (`None`: any), sampling one in `every`.
+#[cfg(feature = "mem-stats")]
+pub fn trace_filter(cat: Option<u8>, every: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    stats::TRACE_CAT.store(cat.map_or(usize::MAX, usize::from), Relaxed);
+    stats::TRACE_EVERY.store(every.max(1), Relaxed);
 }
 
 /// Slab chunks mapped outside the allocator (see `value::heap::chunk_alloc`).

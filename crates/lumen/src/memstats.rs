@@ -29,6 +29,12 @@ pub fn enabled() -> bool {
             .flatten()
             .and_then(|v| v.parse::<usize>().ok())
         {
+            // LUMEN_MEM_TRACE_CAT=<id> (an index into `CAT_NAMES`), LUMEN_MEM_TRACE_EVERY=<n>.
+            let var = |k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+            lumen_common::fastalloc::trace_filter(
+                var("LUMEN_MEM_TRACE_CAT").and_then(|c| u8::try_from(c).ok()),
+                var("LUMEN_MEM_TRACE_EVERY").unwrap_or(1),
+            );
             lumen_common::fastalloc::trace_allocations_from(n);
         }
         on
