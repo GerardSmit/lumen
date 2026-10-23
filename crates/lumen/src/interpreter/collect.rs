@@ -791,6 +791,10 @@ impl Interp {
         drop(dead_scopes);
         drop(removed);
         drop(dead_realms);
+        // Class instances whose objects were just collected still hold their Rust payloads until
+        // the next sweep, which creation alone defers until the table has grown by half.
+        #[cfg(feature = "embed")]
+        self.sweep_host_objects();
         // FinalizationRegistry targets may have died: the next checkpoint scans for them.
         self.weak_note_collection();
         value::gc_trim_heap();

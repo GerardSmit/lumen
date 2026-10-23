@@ -113,6 +113,25 @@ fn intern_kind(kind: &str) -> Rc<str> {
         .unwrap_or_else(|_| kind.into())
 }
 
+/// Targets mostly hold one to three listeners; `Vec::push` would reserve room for four.
+const EXACT_GROWTH_LIMIT: usize = 8;
+
+fn push_listener(listeners: &mut Vec<Listener>, listener: Listener) {
+    if listeners.len() < EXACT_GROWTH_LIMIT {
+        listeners.reserve_exact(1);
+    }
+    listeners.push(listener);
+}
+
+/// Hand the buffer back once the list is empty, and trim small lists' slack.
+fn release_slack(listeners: &mut Vec<Listener>) {
+    if listeners.is_empty() {
+        *listeners = Vec::new();
+    } else if listeners.len() < EXACT_GROWTH_LIMIT {
+        listeners.shrink_to_fit();
+    }
+}
+
 impl Listener {
     fn new(kind: &str, callback: Callback, handler: HandlerKind) -> Self {
         Self {
@@ -353,7 +372,7 @@ impl TargetData {
         for listener in listeners.iter() {
             listener.cell.removed.set(true);
         }
-        listeners.clear();
+        *listeners = Vec::new();
         true
     }
 
@@ -375,16 +394,17 @@ impl TargetData {
             .position(|listener| listener.handler != HandlerKind::None && &*listener.kind == kind);
         match (existing, callback) {
             (Some(index), Some(callback)) => *listeners[index].cell.callback.borrow_mut() = callback,
-            (None, Some(callback)) => listeners.push(Listener::new(kind, callback, handler)),
+            (None, Some(callback)) => push_listener(&mut listeners, Listener::new(kind, callback, handler)),
             (Some(index), None) if handler == HandlerKind::Node => {
                 *listeners[index].cell.callback.borrow_mut() = Callback::Empty;
             }
             (Some(index), None) => {
                 listeners[index].cell.removed.set(true);
                 listeners.remove(index);
+                release_slack(&mut listeners);
             }
             (None, None) if handler == HandlerKind::Node => {
-                listeners.push(Listener::new(kind, Callback::Empty, handler));
+                push_listener(&mut listeners, Listener::new(kind, Callback::Empty, handler));
             }
             (None, None) => {}
         }
@@ -409,6 +429,7 @@ impl TargetData {
         let index = listeners.iter().position(|listener| matches(listener))?;
         let listener = listeners.remove(index);
         listener.cell.removed.set(true);
+        release_slack(&mut listeners);
         Some(listener)
     }
 
@@ -624,7 +645,7 @@ impl EventTarget {
             super::abort::add_listener_removal(ctx, &state, data, receiver, &listener);
         }
         let cell = listener.cell.clone();
-        data.listeners.borrow_mut().push(listener);
+        push_listener(&mut data.listeners.borrow_mut(), listener);
         Self::update_retention(ctx, data, receiver);
         if !cell.removed.get() {
             let size = data.listener_count(kind);
@@ -693,6 +714,7 @@ impl EventTarget {
                 }
                 !remove
             });
+            release_slack(&mut listeners);
         }
         Self::update_retention(ctx, data, receiver);
     }
@@ -1392,6 +1414,27 @@ mod tests {
         assert!(data.remove_where(|_| true).is_some());
         assert!(snapshot[0].cell.removed.get());
         assert!(Rc::ptr_eq(&snapshot[0].cell, &snapshot[0].clone().cell));
+    }
+
+    #[test]
+    fn small_lists_grow_by_one_and_release_when_emptied() {
+        let data = TargetData::new(None);
+        for _ in 0..3 {
+            push_listener(&mut data.listeners.borrow_mut(), Listener::new("load", Callback::Empty, HandlerKind::None));
+        }
+        assert_eq!(data.listeners.borrow().capacity(), 3);
+        for _ in 0..EXACT_GROWTH_LIMIT * 2 {
+            push_listener(&mut data.listeners.borrow_mut(), Listener::new("load", Callback::Empty, HandlerKind::None));
+        }
+        assert!(data.listeners.borrow().capacity() >= data.listeners.borrow().len());
+        assert!(data.clear());
+        assert_eq!(data.listeners.borrow().capacity(), 0);
+        push_listener(&mut data.listeners.borrow_mut(), Listener::new("a", Callback::Empty, HandlerKind::None));
+        push_listener(&mut data.listeners.borrow_mut(), Listener::new("b", Callback::Empty, HandlerKind::None));
+        assert!(data.remove_where(|listener| &*listener.kind == "a").is_some());
+        assert_eq!(data.listeners.borrow().capacity(), 1);
+        assert!(data.remove_where(|_| true).is_some());
+        assert_eq!(data.listeners.borrow().capacity(), 0);
     }
 
     #[test]

@@ -2726,6 +2726,13 @@ pub trait NativeIdentityOwner: Class {
     fn trace_native_values(&self, _visit: &mut dyn FnMut(&Value)) {}
 }
 
+/// See [`Interp::host_object_census`].
+pub(crate) struct HostCensus {
+    pub(crate) entries: usize,
+    pub(crate) table_bytes: usize,
+    pub(crate) classes: Vec<(&'static str, usize, usize, usize)>,
+}
+
 struct HostEntry {
     _weak: WeakGc,
     data: Rc<dyn Any>,
@@ -2746,12 +2753,19 @@ type ViewMut = fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuar
 struct HostVtable {
     view_ref: ViewRef,
     view_mut: ViewMut,
+    name: &'static str,
+    payload_bytes: usize,
 }
 
 struct VtableOf<T>(std::marker::PhantomData<T>);
 
 impl<T: Class> VtableOf<T> {
-    const V: HostVtable = HostVtable { view_ref: view_ref::<T>, view_mut: view_mut::<T> };
+    const V: HostVtable = HostVtable {
+        view_ref: view_ref::<T>,
+        view_mut: view_mut::<T>,
+        name: T::DESC.name,
+        payload_bytes: std::mem::size_of::<RefCell<T>>() + 2 * std::mem::size_of::<usize>(),
+    };
 }
 
 #[derive(Default)]
@@ -3982,7 +3996,7 @@ fn sweep(i: &mut Interp) -> usize {
     for k in &dead {
         drop_later.extend(t.map.remove(k));
     }
-    t.sweep_at = t.map.len() * 2;
+    t.sweep_at = t.map.len() + t.map.len() / 2;
     lumen_common::fasthash::shrink_sparse(&mut t.map);
     // Rust destructors run outside the table borrow.
     drop(drop_later);
@@ -4951,6 +4965,31 @@ impl Interp {
             return 0;
         }
         sweep(self)
+    }
+
+    /// Per-class census of the instance side table for the memory report: the table's own size,
+    /// then `(class, live, dead, payload bytes per instance)` by total payload size, largest first.
+    pub(crate) fn host_object_census(&self) -> Option<HostCensus> {
+        let table = &self.host_state.get::<HostObjects>()?.map;
+        let mut by_class: FastMap<usize, (&'static HostVtable, usize, usize)> = FastMap::default();
+        for entry in table.values() {
+            let slot = by_class.entry(entry.vtable as *const HostVtable as usize).or_insert((entry.vtable, 0, 0));
+            if entry._weak.strong_count() == 0 {
+                slot.2 += 1;
+            } else {
+                slot.1 += 1;
+            }
+        }
+        let mut classes: Vec<_> = by_class
+            .into_values()
+            .map(|(vtable, live, dead)| (vtable.name, live, dead, vtable.payload_bytes))
+            .collect();
+        classes.sort_unstable_by_key(|&(_, live, dead, bytes)| std::cmp::Reverse((live + dead) * bytes));
+        Some(HostCensus {
+            entries: table.len(),
+            table_bytes: table.capacity() * (std::mem::size_of::<(usize, HostEntry)>() + 1),
+            classes,
+        })
     }
 
     /// Run the cycle collector, then drop the Rust values of dead class instances. Returns

@@ -742,6 +742,20 @@ impl crate::interpreter::Interp {
             w.user_fns,
             fmt_bytes(slab_total)
         );
+        #[cfg(feature = "embed")]
+        if let Some(census) = self.host_object_census() {
+            eprintln!(
+                "[mem]   host instances {} (table {}), by class (live/dead x payload):",
+                census.entries,
+                fmt_bytes(census.table_bytes)
+            );
+            for (name, live, dead, bytes) in census.classes.iter().take(12) {
+                eprintln!(
+                    "[mem]     {name:<28} {live:>8} / {dead:<8} x {bytes} B = {}",
+                    fmt_bytes((live + dead) * bytes)
+                );
+            }
+        }
         let p = crate::value::memwalk::property_size();
         eprintln!(
             "[mem]   property entries owned {} used / {} reserved = {} ({} slack)",
