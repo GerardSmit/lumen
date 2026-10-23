@@ -1015,7 +1015,7 @@ pub struct Interp {
     pub(crate) depth_limit: u32,
     /// Shared one-code-unit strings for units below 256, filled on first use (see
     /// [`Interp::unit_lstr`]).
-    unit_strs: [Option<crate::lstr::LStr>; 256],
+    pub(crate) unit_strs: [Option<crate::lstr::LStr>; 256],
     /// Recursion ceiling for this realm; [`MAX_EVAL_DEPTH`] unless the embedder lowered it.
     pub(crate) max_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the

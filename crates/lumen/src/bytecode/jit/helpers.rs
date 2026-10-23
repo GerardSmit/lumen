@@ -315,12 +315,24 @@ pub(crate) enum Helper {
     /// `stack[base]` (`Undefined` there on a throw). An ordinary compiled constructor function
     /// runs in its own native code; everything else is `Interp::construct`.
     Construct,
+    /// `(frame, kind: u32, x: f64, dst: *mut Value) -> u32` — `String.fromCharCode(x)` (kind 0)
+    /// / `String.fromCodePoint(x)` (kind 1) for a Number `x`, into `dst` (trivially droppable
+    /// on entry): 1 when done, 0 (nothing written) when the call would throw. Pure.
+    StrStatic,
+    /// `(frame, pc: u32, x: f64, dst: *mut Value) -> status` — the call of the inline
+    /// `String.fromCharCode` / `fromCodePoint` site whose `LoadName` is at `pc`, with Number
+    /// `x`, made through the full call path; the result goes to `dst`.
+    StrStaticSlow,
+    /// `(frame, pc: u32, cell: *const SiteCell) -> u32` — 1 when the callee of the direct site
+    /// at `pc` (cached in `cell`) still starts with `LoadName GetMethod` reading the intrinsic
+    /// `String.fromCharCode` / `fromCodePoint` through its own closure environment. Pure.
+    WrapGuard,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 82] = [
+pub(crate) const ALL: [Helper; 85] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -403,6 +415,9 @@ pub(crate) const ALL: [Helper; 82] = [
     Helper::AtomicPrepare,
     Helper::AtomicRelease,
     Helper::Construct,
+    Helper::StrStatic,
+    Helper::StrStaticSlow,
+    Helper::WrapGuard,
 ];
 
 /// The IR signature of `h`.
@@ -487,6 +502,9 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::AtomicPrepare => (&[P, P, P, F64, I32], &[P]),
         Helper::AtomicRelease => (&[P], &[]),
         Helper::Construct => (&[P, I32, I32, I32], &[I32]),
+        Helper::StrStatic => (&[P, I32, F64, P], &[I32]),
+        Helper::StrStaticSlow => (&[P, I32, F64, P], &[I32]),
+        Helper::WrapGuard => (&[P, I32, P], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -577,6 +595,9 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::AtomicPrepare => atomic_prepare as *const () as usize,
         Helper::AtomicRelease => atomic_release as *const () as usize,
         Helper::Construct => construct as *const () as usize,
+        Helper::StrStatic => str_static as *const () as usize,
+        Helper::StrStaticSlow => str_static_slow as *const () as usize,
+        Helper::WrapGuard => wrap_guard as *const () as usize,
     } as u64)
 }
 
@@ -2225,14 +2246,29 @@ pub(crate) fn math_site_failed(chunk: &Chunk, pc: usize) -> bool {
     })
 }
 
-/// Whether `LoadName(n, c) GetMethod(m, _)` at `pc` reads the intrinsic `Math.<m>`: `Math`
-/// resolves through its name cache (plain data bindings / properties only — no getter can
-/// run), `Math` is an ordinary object, and its own data property `m` holds a native function
-/// whose code is the builtin's.
-unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
-    let chunk = &*(*f).chunk;
-    let env = &*(*f).env;
-    let i = &*(*f).interp;
+/// The `String` static functions the translator emits inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrStatic {
+    CharCode,
+    CodePoint,
+}
+
+/// The inlinable `String` static function called `name`.
+pub(crate) fn str_static_intrinsic(name: &str) -> Option<StrStatic> {
+    Some(match name {
+        "fromCharCode" => StrStatic::CharCode,
+        "fromCodePoint" => StrStatic::CodePoint,
+        _ => return None,
+    })
+}
+
+/// The receiver and callee `LoadName(n, c) GetMethod(m, _)` at `pc` of `chunk` yields in `env`
+/// when it reads an intrinsic of [`crate::builtins::jit_math_fns`] /
+/// [`crate::builtins::jit_string_static_fns`] (named `m`): the receiver resolves through its
+/// name cache (plain data bindings / properties only — no getter can run), is an ordinary
+/// object, and its own data property `m` holds a native function whose code is the builtin's.
+/// The receiver's name is irrelevant: the callee's identity decides.
+fn intrinsic_site(i: &Interp, chunk: &Chunk, env: &Env, pc: usize) -> Option<(Value, Value)> {
     let (Op::LoadName(n, c), Op::GetMethod(m, _)) = (*chunk.ops.get(pc)?, *chunk.ops.get(pc + 1)?)
     else {
         return None;
@@ -2243,13 +2279,18 @@ unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
     let name = chunk.names.get(m as usize)?;
     let want = crate::builtins::jit_math_fns()
         .into_iter()
-        .find(|(k, _)| *k == &**name)?
+        .find(|(k, _)| *k == &**name)
+        .or_else(|| {
+            crate::builtins::jit_string_static_fns()
+                .into_iter()
+                .find(|(k, _)| *k == &**name)
+        })?
         .1;
-    let math = chunk
+    let recv = chunk
         .name_ic_hit(i, env, c)
         .or_else(|| chunk.name_ic_fill(i, env, n, c))?;
-    let Value::Obj(mo) = math else { return None };
-    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&mo) as usize) {
+    let Value::Obj(mo) = &recv else { return None };
+    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(mo) as usize) {
         return None;
     }
     let fv = {
@@ -2264,12 +2305,22 @@ unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
         }
         p.value()
     };
-    let Value::Obj(fo) = fv else { return None };
-    let fb = fo.try_borrow().ok()?;
-    match fb.call {
-        crate::value::Callable::Native(fp) if fp as usize == want as usize => Some(()),
-        _ => None,
-    }
+    let Value::Obj(fo) = &fv else { return None };
+    let native = {
+        let fb = fo.try_borrow().ok()?;
+        matches!(fb.call, crate::value::Callable::Native(fp) if fp as usize == want as usize)
+    };
+    native.then_some((recv, fv))
+}
+
+/// Whether [`intrinsic_site`] yields an intrinsic at `pc` now (a planning hint: the guards
+/// check again).
+pub(crate) fn intrinsic_at(i: &Interp, chunk: &Chunk, env: &Env, pc: usize) -> bool {
+    intrinsic_site(i, chunk, env, pc).is_some()
+}
+
+unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
+    intrinsic_site(&*(*f).interp, &*(*f).chunk, &*(*f).env, pc).map(|_| ())
 }
 
 pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
@@ -2281,6 +2332,69 @@ pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
         s.borrow_mut().insert(key);
     });
     0
+}
+
+/// [`Helper::StrStatic`].
+pub(crate) unsafe extern "C" fn str_static(
+    f: *mut JitFrame,
+    kind: u32,
+    x: f64,
+    dst: *mut Value,
+) -> u32 {
+    let nf: crate::value::NativeFn = if kind == 0 {
+        crate::builtins::nf_string_from_char_code
+    } else {
+        if !(x.is_finite() && x.fract() == 0.0 && (0.0..=1114111.0).contains(&x)) {
+            return 0;
+        }
+        crate::builtins::nf_string_from_code_point
+    };
+    match nf(&mut *(*f).interp, Value::Undefined, &[Value::Num(x)]) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// [`Helper::StrStaticSlow`].
+pub(crate) unsafe extern "C" fn str_static_slow(
+    f: *mut JitFrame,
+    pc: u32,
+    x: f64,
+    dst: *mut Value,
+) -> u32 {
+    let i = &mut *(*f).interp;
+    let Some((recv, callee)) = intrinsic_site(i, &*(*f).chunk, &*(*f).env, pc as usize) else {
+        let e = i.throw("TypeError", "compiled code used a bad String intrinsic");
+        return fail(f, e);
+    };
+    match i.call(callee, recv, &[Value::Num(x)]) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            STATUS_OK
+        }
+        Err(e) => fail(f, e),
+    }
+}
+
+/// [`Helper::WrapGuard`].
+pub(crate) unsafe extern "C" fn wrap_guard(
+    f: *mut JitFrame,
+    _pc: u32,
+    cell: *const super::SiteCell,
+) -> u32 {
+    let c = &*cell;
+    (c.chunk != 0
+        && c.env != 0
+        && intrinsic_site(
+            &*(*f).interp,
+            &*(c.chunk as *const Chunk),
+            &*(c.env as *const Env),
+            0,
+        )
+        .is_some()) as u32
 }
 
 // ---- Array.prototype.push ---------------------------------------------------------------------

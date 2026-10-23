@@ -9170,32 +9170,7 @@ fn install_string(it: &mut Interp) {
     sp.borrow_mut()
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
-    it.def_method(&ctor, "fromCharCode", 1, |i, _this, args| {
-        // One ASCII unit: the shared single-character string.
-        if let [Value::Num(n)] = args {
-            let u = if n.is_finite() {
-                n.trunc().rem_euclid(65536.0) as u16
-            } else {
-                0
-            };
-            if u < 0x100 {
-                return Ok(Value::Str(i.unit_lstr(u)));
-            }
-        }
-        let mut units: Vec<u16> = Vec::with_capacity(args.len());
-        for a in args {
-            // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
-            let num = ab(i.to_number(a))?;
-            units.push(if num.is_finite() {
-                num.trunc().rem_euclid(65536.0) as u16
-            } else {
-                0
-            });
-        }
-        // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
-        // (see `jstr`), so the resulting string round-trips its exact unit sequence.
-        Ok(Value::from_string(crate::jstr::from_units(&units)))
-    });
+    it.def_method(&ctor, "fromCharCode", 1, nf_string_from_char_code);
     it.def_method(&ctor, "raw", 1, |i, _this, args| {
         let template = arg(args, 0);
         let raw = ab(i.get_member(&template, "raw"))?;
@@ -9215,32 +9190,70 @@ fn install_string(it: &mut Interp) {
         }
         Ok(Value::from_string(out))
     });
-    it.def_method(&ctor, "fromCodePoint", 1, |i, _this, args| {
-        if let [Value::Num(n)] = args {
-            if *n >= 0.0 && *n < 256.0 && n.fract() == 0.0 {
-                return Ok(Value::Str(i.unit_lstr(*n as u16)));
-            }
-        }
-        let mut s = String::new();
-        for a in args {
-            let n = ab(i.to_number(a))?;
-            // Each argument must be an integer code point in [0, 0x10FFFF].
-            if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > 0x10FFFF as f64 {
-                return Err(i.make_error("RangeError", "Invalid code point"));
-            }
-            let cp = n as u32;
-            if (0xD800..0xE000).contains(&cp) {
-                // A lone surrogate is a valid argument: smuggle it (see `jstr`).
-                s.push(crate::jstr::smuggle(cp as u16));
-            } else if cp >= crate::jstr::SMUGGLE_BASE {
-                crate::jstr::push_char_utf16(&mut s, char::from_u32(cp).unwrap_or('\u{FFFD}'));
-            } else {
-                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-            }
-        }
-        Ok(Value::from_string(s))
-    });
+    it.def_method(&ctor, "fromCodePoint", 1, nf_string_from_code_point);
     set_builtin(&it.global, "String", Value::Obj(ctor));
+}
+
+pub(crate) fn nf_string_from_char_code(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    // One ASCII unit: the shared single-character string.
+    if let [Value::Num(n)] = args {
+        let u = if n.is_finite() {
+            n.trunc().rem_euclid(65536.0) as u16
+        } else {
+            0
+        };
+        if u < 0x100 {
+            return Ok(Value::Str(i.unit_lstr(u)));
+        }
+    }
+    let mut units: Vec<u16> = Vec::with_capacity(args.len());
+    for a in args {
+        // Each argument is ToUint16'd (so -1 -> 0xFFFF, 0x10000 -> 0), not truncated.
+        let num = ab(i.to_number(a))?;
+        units.push(if num.is_finite() {
+            num.trunc().rem_euclid(65536.0) as u16
+        } else {
+            0
+        });
+    }
+    // UTF-16 decode: a surrogate pair combines into one code point; a lone half is smuggled
+    // (see `jstr`), so the resulting string round-trips its exact unit sequence.
+    Ok(Value::from_string(crate::jstr::from_units(&units)))
+}
+
+pub(crate) fn nf_string_from_code_point(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    if let [Value::Num(n)] = args {
+        if *n >= 0.0 && *n < 256.0 && n.fract() == 0.0 {
+            return Ok(Value::Str(i.unit_lstr(*n as u16)));
+        }
+    }
+    let mut s = String::new();
+    for a in args {
+        let n = ab(i.to_number(a))?;
+        // Each argument must be an integer code point in [0, 0x10FFFF].
+        if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > 0x10FFFF as f64 {
+            return Err(i.make_error("RangeError", "Invalid code point"));
+        }
+        let cp = n as u32;
+        if (0xD800..0xE000).contains(&cp) {
+            // A lone surrogate is a valid argument: smuggle it (see `jstr`).
+            s.push(crate::jstr::smuggle(cp as u16));
+        } else if cp >= crate::jstr::SMUGGLE_BASE {
+            crate::jstr::push_char_utf16(&mut s, char::from_u32(cp).unwrap_or('\u{FFFD}'));
+        } else {
+            s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+        }
+    }
+    Ok(Value::from_string(s))
+}
+
+/// The `String` static functions the loop JIT inlines, by property name, as the native fn
+/// pointers they are installed with.
+pub(crate) fn jit_string_static_fns() -> [(&'static str, crate::value::NativeFn); 2] {
+    [
+        ("fromCharCode", nf_string_from_char_code),
+        ("fromCodePoint", nf_string_from_code_point),
+    ]
 }
 
 /// Named entry so the bytecode call cache can recognize and specialize ASCII string slicing.

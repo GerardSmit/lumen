@@ -197,6 +197,11 @@ fn offs() -> Option<&'static Offs> {
     .as_ref()
 }
 
+/// Byte offset of `Interp::unit_strs` (the shared one-character strings, one pointer each).
+pub(super) fn unit_strs_offset() -> Option<i32> {
+    i32::try_from(std::mem::offset_of!(crate::interpreter::Interp, unit_strs)).ok()
+}
+
 /// Where a name cache's scope-mode resolution lives (see `Chunk::name_ic_hit`), for the
 /// inline check at direct sites' name loads. Offsets relative to the `RefCell<Scope>` unless
 /// noted; measured on this target.
@@ -917,6 +922,19 @@ pub(super) fn plan_direct(
         {
             p.tail_loops.insert(q);
         }
+        // (No JS runs inside a folded wrapper, so nothing can read its `arguments` / `caller`.)
+        if !construct
+            && word != 0
+            && adaptor == Adaptor::None
+            && !site.tail
+            && !site.self_call
+            && argc == 1
+            && !helpers::math_site_failed(chunk, q)
+        {
+            if let Some(f) = super::inline_fwd::fwd_body(cc) {
+                p.dfwd.insert(q, (f, env_addr));
+            }
+        }
         p.boxes.push(pin);
         p.boxes.push(cell);
         p.boxes.push(Box::new(cc_rc.clone()));
@@ -1458,7 +1476,7 @@ impl Tr<'_, '_> {
 
     /// Branch to `miss` unless the `Value` at `addr + off` is the callee cached in the site's
     /// cell — or another closure of the same function, which [`Helper::SiteRebind`] then caches.
-    fn check_cell(&mut self, addr: V, off: i32, cell: usize, miss: Block) {
+    pub(super) fn check_cell(&mut self, addr: V, off: i32, cell: usize, miss: Block) {
         let tag = self.fb.load(MemKind::I32U8, addr, off);
         let obj = self.i32c(TAG_OBJ as i64);
         let is_obj = self.fb.icmp(IntCC::Eq, tag, obj);
@@ -1533,6 +1551,11 @@ impl Tr<'_, '_> {
     /// A direct call site's `Call` / `CallWithThis` (see the module docs): the inlined body of
     /// a small `this` method when there is one (see [`super::inline_this`]), else the call.
     pub(super) fn direct_call(&mut self, pc: usize, argc: usize, with_this: bool) {
+        if let Some((f, env)) = self.plan.dfwd.get(&pc).copied() {
+            if self.fwd_call(pc, argc, with_this, f, env) {
+                return;
+            }
+        }
         if let (true, Some(tb)) = (with_this, self.plan.dthis.get(&pc).cloned()) {
             if self.inline_this_call(pc, argc, &tb) {
                 return;

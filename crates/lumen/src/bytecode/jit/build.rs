@@ -47,12 +47,14 @@
 //! that fact holds loads the element directly ([`layout::view_elem_num`]); the fact dies when
 //! `i` or `a` is written or JS runs.
 
-use super::helpers::{self, FastArg, Helper, MathFn};
+use super::helpers::{self, FastArg, Helper, MathFn, StrStatic};
 
 #[path = "call.rs"]
 mod call;
 #[path = "inline.rs"]
 mod inline;
+#[path = "inline_fwd.rs"]
+mod inline_fwd;
 #[path = "inline_this.rs"]
 mod inline_this;
 #[path = "new_plan.rs"]
@@ -1127,6 +1129,10 @@ struct Plan {
     dmethod: HashMap<usize, usize>,
     /// Direct method sites whose body is inlined (see [`inline_this`]), by call pc.
     dthis: HashMap<usize, inline_this::ThisBody>,
+    /// Direct sites whose callee only forwards its argument to a `String` static function (see
+    /// [`inline_fwd`]), by call pc: the function and the address of the callee environment the
+    /// forwarded read was planned under.
+    dfwd: HashMap<usize, (StrStatic, usize)>,
     /// Property reads resolved to an inlined getter, by op pc.
     dget: HashMap<usize, inline_this::Getter>,
     /// Property stores resolved to an inlined setter, by op pc.
@@ -1167,6 +1173,8 @@ enum Intr {
     Fast(usize),
     /// Index into [`Plan::inl`].
     Inline(usize),
+    /// `String.fromCharCode(x)` / `String.fromCodePoint(x)`.
+    StrStatic(StrStatic),
 }
 
 /// An inline call site: `LoadName GetMethod <args> CallWithThis` (`lfc == false`) or
@@ -1375,13 +1383,24 @@ fn plan(
             }
         }
         if let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) {
-            if let Some(f) = helpers::math_intrinsic(chunk.names.get(m as usize)?) {
+            let name = chunk.names.get(m as usize)?;
+            if let Some(f) = helpers::math_intrinsic(name) {
                 return (args.len() == f.arity() && args.iter().all(|&n| n)).then_some(Site {
                     f: Intr::Math(f),
                     call,
                     lfc,
                     slot: None,
                 });
+            }
+            if let Some(f) = helpers::str_static_intrinsic(name) {
+                if helpers::intrinsic_at(interp, chunk, env, pc) {
+                    return (args.len() == 1 && args[0]).then_some(Site {
+                        f: Intr::StrStatic(f),
+                        call,
+                        lfc,
+                        slot: None,
+                    });
+                }
             }
         }
         let callee = helpers::site_callee(interp, chunk, env, pc)?;
@@ -3406,8 +3425,15 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.def_var(v, zp);
             self.push_vars.insert(pc, v);
         }
-        // String intrinsic sites check at the site (the guard needs the receiver).
-        let mut strs: Vec<usize> = self.plan.strm.keys().copied().collect();
+        // String intrinsic sites check at the site (the guard needs the receiver); so do the
+        // folded wrapper calls (the guard needs the callee's cell).
+        let mut strs: Vec<usize> = self
+            .plan
+            .strm
+            .keys()
+            .chain(self.plan.dfwd.keys())
+            .copied()
+            .collect();
         strs.sort_unstable();
         for pc in strs {
             let v = self.fb.declare_var(Type::I32);
@@ -4195,6 +4221,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Intr::Math(f) => self.math_call(pc, f),
                 Intr::Fast(k) => self.fast_call(pc, k),
                 Intr::Inline(k) => self.inline_call(pc, k),
+                Intr::StrStatic(f) => self.str_static_call(pc, f),
             };
         }
         match op {
@@ -6501,6 +6528,43 @@ impl<'a, 'f> Tr<'a, 'f> {
         // Receiver and callee are placeholders (trivially droppable, never materialized).
         self.stack.truncate(d - argc - 2);
         self.stack.push(Entry::Num(r));
+        Ok(())
+    }
+
+    /// The `CallWithThis` of an inline `String.fromCharCode(x)` / `fromCodePoint(x)` site: the
+    /// Number argument (the planner admitted only ops producing an unboxed Number) replaces the
+    /// placeholders with the String. Units below 256 are the shared one-character strings; what
+    /// the fast arm cannot do (a larger unit, or a `fromCodePoint` argument that throws) goes
+    /// through the full call.
+    fn str_static_call(&mut self, pc: usize, f: StrStatic) -> Result<(), String> {
+        let d = self.stack.len();
+        let x = match self.stack[d - 1] {
+            Entry::Num(x) => x,
+            other => return Err(format!("String argument {other:?} at {pc} is not a Number")),
+        };
+        let base = d - 3;
+        let done = self.fb.create_block();
+        let miss = self.fb.create_block();
+        self.str_static_fast(f, x, base, done, miss);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        let load = self
+            .plan
+            .math
+            .iter()
+            .find(|(_, s)| s.call == pc)
+            .map(|(&q, _)| q)
+            .ok_or_else(|| format!("no String site for the call at {pc}"))?;
+        let (pcv, dst) = (self.i32c(load as i64), self.sptr(base));
+        self.set_call_site(pc);
+        let st = self.call_js(Helper::StrStaticSlow, &[self.frame, pcv, x, dst]);
+        let below = self.stack[..base].to_vec();
+        self.throw_if(st, pc, &below, base);
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(done);
+        self.fb.switch_to_block(done);
+        self.stack.truncate(base);
+        self.stack.push(Entry::Boxed);
         Ok(())
     }
 

@@ -755,6 +755,8 @@ mod new_tests;
 #[cfg(test)]
 mod shadow_tests;
 #[cfg(test)]
+mod str_static_tests;
+#[cfg(test)]
 mod switch_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
