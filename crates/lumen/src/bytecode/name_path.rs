@@ -372,8 +372,49 @@ impl Chunk {
         cache: u32,
     ) -> Option<Value> {
         let (path, value) = NamePath::build(interp, env, &self.names[name as usize])?;
+        if let Holder::Global { shape, slot, .. } = path.holder {
+            self.seed_static_global(interp, env, cache, shape, slot);
+        }
         *self.name_paths[cache as usize].borrow_mut() = Some(path);
         Some(value)
+    }
+
+    /// Seed the static-path mode of cache `cache` (see [`crate::bytecode::NameIc`]) when the
+    /// guarded path just built is the anchor scope directly under the global scope (plus, for a
+    /// chunk with an activation, the pristine activation itself).
+    fn seed_static_global(&self, interp: &Interp, env: &Env, cache: u32, shape: u32, slot: usize) {
+        let anchor = if self.activation_layout.is_some() {
+            let activation = env.borrow();
+            if activation.vars.generation() != 0 || activation.vars.template_layout().is_none() {
+                return;
+            }
+            match &activation.parent {
+                Some(parent) => parent.clone(),
+                None => return,
+            }
+        } else {
+            env.clone()
+        };
+        let scope = anchor.borrow();
+        let under_global = scope
+            .parent
+            .as_ref()
+            .is_some_and(|parent| Rc::ptr_eq(parent, &interp.global_env));
+        if !under_global || scope.with_obj().is_some() {
+            return;
+        }
+        let Ok(global) = interp.global_env.try_borrow() else {
+            return;
+        };
+        self.name_caches[cache as usize].set(super::NameIc {
+            env: Rc::as_ptr(&anchor) as usize | 4,
+            binding: ((shape as u64) << 32) | slot as u64,
+            gen: scope.vars.generation(),
+            act_gen: global.vars.generation(),
+        });
+        drop(global);
+        drop(scope);
+        self.name_pins.borrow_mut()[cache as usize] = Some(Rc::downgrade(&anchor));
     }
 }
 

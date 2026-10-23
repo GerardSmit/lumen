@@ -207,6 +207,16 @@ pub const IC_CREATE: u8 = 0xFD;
 /// ≥8-aligned). A hit revalidates the scope generation (no shadowing binding appeared) and the
 /// global object's shape (same ordered key layout ⇒ the slot still maps this name), then
 /// re-checks `accessor` at the slot (attributes are not part of the shape).
+///
+/// A third mode (bit 2, tag 4; seeded by `Chunk::name_path_fill`) covers the same globals read
+/// from a function nested directly in a closure scope `A` under the global scope (every function
+/// of a bundle wrapped in an IIFE). `env` is `A`, which is the run env of a chunk without an
+/// activation, or its parent when the chunk makes one (a pristine activation, generation 0).
+/// `gen` is `A`'s generation, `act_gen` the global scope's, `binding` as in global mode. Scopes
+/// are only ever created with their parent, so a match of `A` (pinned like any cached scope)
+/// proves the chain; the two generations prove neither scope gained the name (a sloppy direct
+/// `eval` `var` or a later script's `let`/`const`/`class` is an insert), and the parent of `A`
+/// must be this interp's global scope. Only the native code reads this mode.
 #[derive(Clone, Copy)]
 pub struct NameIc {
     /// `Rc::as_ptr` of the scope at cache time (0 = empty). Low tag bits (scope allocations
@@ -4524,7 +4534,7 @@ impl Chunk {
     pub(crate) fn name_site_kind(&self, c: u32) -> Option<bool> {
         let ic = self.name_caches.get(c as usize)?.get();
         if ic.env != 0 {
-            return Some(ic.env & 1 != 0);
+            return Some(ic.env & 5 != 0);
         }
         self.name_path_kind(c)
     }
