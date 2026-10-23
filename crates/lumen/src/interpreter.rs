@@ -7763,9 +7763,7 @@ impl Interp {
                 if n > self.tier_threshold || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0 {
                     let compiled = crate::bytecode::compile(func);
                     if compiled.is_none() && std::env::var_os("LUMEN_TIER_LOG").is_some() {
-                        let src = func.source();
-                        let src = src.as_deref().unwrap_or("<no source>");
-                        let head: String = src.chars().take(70).collect();
+                        let head = func.source.head(70).unwrap_or_else(|| "<no source>".to_string());
                         eprintln!("[tier] bail: {}", head.replace('\n', " "));
                     }
                     let _ = func.code.set(compiled);
@@ -7807,13 +7805,7 @@ impl Interp {
             func.calls.set(n);
             if n >= 1000 && (n == 1000 || n == 10_000 || n == 100_000 || n == 1_000_000) {
                 let name = func.name.as_deref().unwrap_or("<anon>");
-                let src: String = func
-                    .source()
-                    .as_deref()
-                    .unwrap_or("")
-                    .chars()
-                    .take(60)
-                    .collect();
+                let src = func.source.head(60).unwrap_or_default();
                 eprintln!("[ast-hot] {name} ×{n}: {}", src.replace('\n', " "));
             }
         }

@@ -1049,13 +1049,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool, force_
     // env), and whether an inner arrow chain reads `this`. `None` = unanalyzable — bail.
     let Some((captured, env_this, block_lets, _self_named, blk_names)) = CaptureScan::run(func)
     else {
-        let head: String = func
-            .source()
-            .as_deref()
-            .unwrap_or("<no source>")
-            .chars()
-            .take(90)
-            .collect();
+        let head = func.source.head(90).unwrap_or_else(|| "<no source>".to_string());
         log_bail(
             "capture-scan",
             &format!(

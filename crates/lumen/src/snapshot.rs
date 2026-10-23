@@ -809,7 +809,7 @@ fn read_body_index(mut bodies: &[u8], src_len: usize) -> Option<HashMap<(u32, u3
 
 /// The AST, strictness and body cache [`encode_script_cache`] stored for exactly this `src`, or
 /// `None`. Offsets in the index count from the start of the bodies section.
-pub(crate) fn decode_script_cache(blob: &[u8], src: &str, record: bool) -> Option<(Vec<Stmt>, bool, Rc<BodyCache>)> {
+pub(crate) fn decode_script_cache(blob: &[u8], src: &Rc<str>, record: bool) -> Option<(Vec<Stmt>, bool, Rc<BodyCache>)> {
     let rest = blob.strip_prefix(SCRIPT_CACHE_MAGIC)?;
     let (version, rest) = rest.split_first_chunk::<4>()?;
     let (len, rest) = rest.split_first_chunk::<8>()?;
@@ -827,7 +827,7 @@ pub(crate) fn decode_script_cache(blob: &[u8], src: &str, record: bool) -> Optio
     let cache = BodyCache::new(record);
     let body = {
         let _scope = BodyCacheScope::enter(Some(cache.clone()));
-        decode(top, src).ok()?
+        decode_shared(top, src.clone()).ok()?
     };
     cache.load(top, strict == 1, src.len(), bodies, index);
     Some((body, strict == 1, cache))

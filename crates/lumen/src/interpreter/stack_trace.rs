@@ -1622,12 +1622,25 @@ impl Interp {
         cached: Option<&[u8]>,
         record: bool,
     ) -> (Result<Value, super::Abrupt>, Option<Vec<u8>>) {
+        self.run_classic_script_cached_shared(Rc::from(source), context, cached, record)
+    }
+
+    /// [`run_classic_script_cached`](Self::run_classic_script_cached) over a source the caller
+    /// already holds as an `Rc<str>`: the engine shares that allocation with every function
+    /// parsed or decoded from it (`toString`, lazy bodies, stack traces) instead of copying it.
+    pub fn run_classic_script_cached_shared(
+        &mut self,
+        source: Rc<str>,
+        context: Rc<crate::ClassicScriptContext>,
+        cached: Option<&[u8]>,
+        record: bool,
+    ) -> (Result<Value, super::Abrupt>, Option<Vec<u8>>) {
         if crate::native_ops::dynamic_code_disabled() {
             return (Err(self.throw("EvalError", "dynamic code is unavailable in native execution")), None);
         }
         let mut fresh = None;
         let mut body_cache = None;
-        let hit = cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, source, record));
+        let hit = cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, &source, record));
         let parsed = match hit {
             Some((body, strict, cache)) => {
                 body_cache = Some(cache);
@@ -1636,9 +1649,9 @@ impl Interp {
             None => {
                 let cache = record.then(|| crate::snapshot::BodyCache::new(true));
                 let _scope = crate::snapshot::BodyCacheScope::enter(cache.clone());
-                crate::parser::parse_classic_script(source).map(|(body, strict)| {
+                crate::parser::parse_classic_script_shared(source.clone()).map(|(body, strict)| {
                     if let Some(cache) = &cache {
-                        fresh = Some(crate::snapshot::encode_script_cache(&body, strict, source, cache));
+                        fresh = Some(crate::snapshot::encode_script_cache(&body, strict, &source, cache));
                     }
                     body_cache = cache;
                     (body, strict)

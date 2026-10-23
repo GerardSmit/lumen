@@ -199,6 +199,13 @@ impl FnSource {
             FnSource::Kept { .. } => self.as_str().map(Rc::from),
         }
     }
+    /// The first `n` characters of the text, without copying the rest of a long range.
+    pub fn head(&self, n: usize) -> Option<String> {
+        match self.as_str() {
+            Some(s) => Some(s.chars().take(n).collect()),
+            None => self.text().map(|t| t.chars().take(n).collect()),
+        }
+    }
     /// The text borrowed; `None` without a source, or for a range of a dynamic function source
     /// that spans its synthesized head or tail (use [`FnSource::text`]).
     pub fn as_str(&self) -> Option<&str> {

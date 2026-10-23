@@ -38,6 +38,9 @@ pub fn parse_script(_: &str, _: bool) -> Result<Vec<Stmt>, ParseError> {
 pub(crate) fn parse_classic_script(_: &str) -> Result<(Vec<Stmt>, bool), ParseError> {
     unavailable()
 }
+pub(crate) fn parse_classic_script_shared(_: std::rc::Rc<str>) -> Result<(Vec<Stmt>, bool), ParseError> {
+    unavailable()
+}
 pub fn parse_script_lazy(_: &str) -> Result<Vec<Stmt>, ParseError> {
     unavailable()
 }

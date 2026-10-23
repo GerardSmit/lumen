@@ -165,3 +165,44 @@ fn finished_cache_is_closed() {
     }
     assert!(engine.ctx().finish_script_cache(URL).is_none());
 }
+
+const IIFE: &str = r##"
+var iife = (function wrapper() {
+  function inner(a) {
+    return new Error("here").stack.split("\n")[1].trim();
+  }
+  globalThis.innerFn = inner;
+  globalThis.wrapperFn = wrapper;
+  return inner(1);
+})();
+globalThis.out = [wrapperFn.toString(), innerFn.toString(), iife].join("|");
+"##;
+
+fn run_shared(source: &Rc<str>, cached: Option<&[u8]>) -> (String, Option<Vec<u8>>, usize) {
+    let mut engine = Engine::new();
+    let context = Rc::new(ClassicScriptContext { base_url: "https://example.test/iife.js".into(), ..Default::default() });
+    let (result, fresh) = engine.ctx().run_classic_script_cached_shared(source.clone(), context, cached, true);
+    assert!(result.is_ok());
+    let holders = Rc::strong_count(source);
+    match engine.eval("out", false).unwrap() {
+        Completion::Value(v) => (v, fresh, holders),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+}
+
+#[test]
+fn function_text_and_stack_agree_across_miss_and_hit_and_share_the_source() {
+    let source: Rc<str> = Rc::from(IIFE);
+    let (parsed, blob, parsed_holders) = run_shared(&source, None);
+    assert!(parsed.starts_with("function wrapper() {"), "{parsed}");
+    assert!(parsed.contains("|function inner(a) {"), "{parsed}");
+    assert!(parsed.contains("iife.js:4:"), "{parsed}");
+    assert!(parsed_holders > 1, "the parse should share the caller's source");
+    let blob = blob.expect("a miss records a blob");
+    let (decoded, fresh, decoded_holders) = run_shared(&source, Some(&blob));
+    assert!(fresh.is_none(), "the blob should have been used");
+    assert_eq!(decoded, parsed);
+    assert!(decoded_holders > 1, "the decode should share the caller's source");
+    let (via_str, _) = run(IIFE, None);
+    assert_eq!(via_str.replace("/app.js:", "/iife.js:"), parsed);
+}
