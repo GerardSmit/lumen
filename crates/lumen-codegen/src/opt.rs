@@ -563,24 +563,38 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
     let children = cfg.dom_children_adj();
     let mut table: FastMap<InstData, Value> = FastMap::default();
     let mut log: Vec<InstData> = Vec::new();
+    let incoming = incoming_all(func);
+    let mut facts: FastMap<Value, bool> = FastMap::default();
+    let mut fact_log: Vec<Value> = Vec::new();
     let mut terminators_changed = false;
     enum Step {
         Enter(Block),
-        Leave(usize),
+        Leave(usize, usize),
     }
     let mut stack = vec![Step::Enter(func.entry())];
     let mut removed: Vec<Inst> = Vec::new();
     while let Some(step) = stack.pop() {
         let b = match step {
-            Step::Leave(mark) => {
+            Step::Leave(mark, fact_mark) => {
                 for k in log.drain(mark..) {
                     table.remove(&k);
+                }
+                for v in fact_log.drain(fact_mark..) {
+                    facts.remove(&v);
                 }
                 continue;
             }
             Step::Enter(b) => b,
         };
         let mark = log.len();
+        let fact_mark = fact_log.len();
+        if let [(t, slot)] = *incoming.of(b) {
+            if b != func.entry() {
+                if let InstData::Brif { cond, .. } = func.inst(t) {
+                    assume(func, &mut facts, &mut fact_log, *cond, slot == 0);
+                }
+            }
+        }
         removed.clear();
         let mut at = 0;
         while at < func.blocks[b.index()].insts.len() {
@@ -641,6 +655,8 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
                 InstData::Brif { cond, then, else_ } => {
                     let folded = if let Some(c) = const_of(func, *cond) {
                         Some(if c as u32 != 0 { then } else { else_ })
+                    } else if let Some(&t) = facts.get(&func.resolve(*cond)) {
+                        Some(if t { then } else { else_ })
                     } else if then == else_ {
                         Some(then)
                     } else {
@@ -735,7 +751,7 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
                 .insts
                 .retain(|i| !removed.contains(i));
         }
-        stack.push(Step::Leave(mark));
+        stack.push(Step::Leave(mark, fact_mark));
         for &c in children[b.index()].iter().rev() {
             stack.push(Step::Enter(c));
         }
@@ -743,6 +759,38 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
     func.resolve_aliases();
     if !terminators_changed {
         *cfg_slot = Some(cfg);
+    }
+}
+
+/// Record that `cond` is nonzero (`truth`) or zero for the current dominator scope, and what
+/// that implies for the operands of a defining Band (nonzero) or Bor (zero).
+fn assume(
+    func: &Function,
+    facts: &mut FastMap<Value, bool>,
+    log: &mut Vec<Value>,
+    cond: Value,
+    truth: bool,
+) {
+    let cond = func.resolve(cond);
+    if func.value_type(cond) != Type::I32 {
+        return;
+    }
+    if !facts.contains_key(&cond) {
+        facts.insert(cond, truth);
+        log.push(cond);
+    }
+    if let ValueDef::Result(inst, 0) = func.values[cond.index()].def {
+        if let InstData::Binary { op, args } = func.inst(inst) {
+            if (*op == BinaryOp::Band && truth) || (*op == BinaryOp::Bor && !truth) {
+                for &a in args {
+                    let a = func.resolve(a);
+                    if !facts.contains_key(&a) {
+                        facts.insert(a, truth);
+                        log.push(a);
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -948,3 +948,208 @@ fn merge_blocks_do_not_inherit_known_memory() {
     assert_eq!(run(&f, &mut env(), &[16, 1, 7]).unwrap(), vec![9]);
     assert_eq!(run(&f, &mut env(), &[16, 0, 7]).unwrap(), vec![7]);
 }
+
+fn brif_count(f: &Function) -> usize {
+    f.layout
+        .iter()
+        .filter_map(|b| f.terminator(*b))
+        .filter(|t| matches!(f.inst(*t), InstData::Brif { .. }))
+        .count()
+}
+
+fn i32_function(name: &str, params: usize) -> Function {
+    Function::new(name, Signature::new(vec![Type::I32; params], vec![Type::I32]))
+}
+
+#[test]
+fn gvn_folds_repeated_condition_on_then_edge() {
+    let mut f = i32_function("then_edge", 1);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let five = b.iconst(Type::I32, 5);
+    let c = b.icmp(IntCC::Eq, x, five);
+    let (inner, inner_then, other) = (b.create_block(), b.create_block(), b.create_block());
+    b.brif(c, inner, &[], other, &[]);
+    for blk in [inner, inner_then, other] {
+        b.seal_block(blk);
+    }
+    b.switch_to_block(inner);
+    let again = b.icmp(IntCC::Eq, x, five);
+    b.brif(again, inner_then, &[], other, &[]);
+    b.switch_to_block(inner_then);
+    let ten = b.iconst(Type::I32, 10);
+    b.ret(&[ten]);
+    b.switch_to_block(other);
+    let twenty = b.iconst(Type::I32, 20);
+    b.ret(&[twenty]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(brif_count(&f), 1, "{f}");
+    let mut e = env();
+    for x in [0u64, 4, 5, 6] {
+        let want = run(&original, &mut e, &[x]).unwrap();
+        assert_eq!(run(&f, &mut e, &[x]).unwrap(), want, "x={x}");
+    }
+}
+
+#[test]
+fn gvn_folds_repeated_condition_on_else_edge() {
+    let mut f = i32_function("else_edge", 1);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let five = b.iconst(Type::I32, 5);
+    let c = b.icmp(IntCC::Eq, x, five);
+    let (hit, miss, never, last) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.brif(c, hit, &[], miss, &[]);
+    for blk in [hit, miss, never, last] {
+        b.seal_block(blk);
+    }
+    b.switch_to_block(hit);
+    let one = b.iconst(Type::I32, 1);
+    b.ret(&[one]);
+    b.switch_to_block(miss);
+    let again = b.icmp(IntCC::Eq, x, five);
+    b.brif(again, never, &[], last, &[]);
+    b.switch_to_block(never);
+    let two = b.iconst(Type::I32, 2);
+    b.ret(&[two]);
+    b.switch_to_block(last);
+    let three = b.iconst(Type::I32, 3);
+    b.ret(&[three]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(brif_count(&f), 1, "{f}");
+    let mut e = env();
+    for x in [0u64, 4, 5, 6] {
+        let want = run(&original, &mut e, &[x]).unwrap();
+        assert_eq!(run(&f, &mut e, &[x]).unwrap(), want, "x={x}");
+    }
+}
+
+#[test]
+fn gvn_branch_facts_do_not_reach_merge_blocks() {
+    let mut f = i32_function("merge", 1);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let five = b.iconst(Type::I32, 5);
+    let c = b.icmp(IntCC::Eq, x, five);
+    let (left, right, merge, yes, no) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.brif(c, left, &[], right, &[]);
+    for blk in [left, right, merge, yes, no] {
+        b.seal_block(blk);
+    }
+    b.switch_to_block(left);
+    b.jump(merge, &[]);
+    b.switch_to_block(right);
+    b.jump(merge, &[]);
+    b.switch_to_block(merge);
+    let again = b.icmp(IntCC::Eq, x, five);
+    b.brif(again, yes, &[], no, &[]);
+    b.switch_to_block(yes);
+    let one = b.iconst(Type::I32, 1);
+    b.ret(&[one]);
+    b.switch_to_block(no);
+    let zero = b.iconst(Type::I32, 0);
+    b.ret(&[zero]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(brif_count(&f), 2, "{f}");
+    let mut e = env();
+    for x in [0u64, 5, 6] {
+        let want = run(&original, &mut e, &[x]).unwrap();
+        assert_eq!(run(&f, &mut e, &[x]).unwrap(), want, "x={x}");
+    }
+}
+
+#[test]
+fn gvn_nonzero_condition_is_not_treated_as_one() {
+    let mut f = i32_function("nonzero", 1);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let (taken, skipped) = (b.create_block(), b.create_block());
+    b.brif(x, taken, &[], skipped, &[]);
+    b.seal_block(taken);
+    b.seal_block(skipped);
+    b.switch_to_block(taken);
+    let one = b.iconst(Type::I32, 1);
+    let is_one = b.icmp(IntCC::Eq, x, one);
+    b.ret(&[is_one]);
+    b.switch_to_block(skipped);
+    let seven = b.iconst(Type::I32, 7);
+    b.ret(&[seven]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    let mut e = env();
+    for (x, want) in [(0u64, 7u64), (1, 1), (2, 0), (0xffff_ffff, 0)] {
+        assert_eq!(run(&original, &mut e, &[x]).unwrap(), vec![want], "x={x}");
+        assert_eq!(run(&f, &mut e, &[x]).unwrap(), vec![want], "x={x}");
+    }
+}
+
+#[test]
+fn gvn_band_condition_makes_both_operands_known() {
+    let mut f = i32_function("band", 2);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (x, y) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let five = b.iconst(Type::I32, 5);
+    let ten = b.iconst(Type::I32, 10);
+    let c1 = b.icmp(IntCC::Eq, x, five);
+    let c2 = b.icmp(IntCC::Ult, y, ten);
+    let both = b.binary(BinaryOp::Band, c1, c2);
+    let (first, second, yes, no) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.brif(both, first, &[], no, &[]);
+    for blk in [first, second, yes, no] {
+        b.seal_block(blk);
+    }
+    b.switch_to_block(first);
+    b.brif(c1, second, &[], no, &[]);
+    b.switch_to_block(second);
+    b.brif(c2, yes, &[], no, &[]);
+    b.switch_to_block(yes);
+    let one = b.iconst(Type::I32, 1);
+    b.ret(&[one]);
+    b.switch_to_block(no);
+    let zero = b.iconst(Type::I32, 0);
+    b.ret(&[zero]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(brif_count(&f), 1, "{f}");
+    let mut e = env();
+    for x in [4u64, 5] {
+        for y in [3u64, 10, 11] {
+            let want = run(&original, &mut e, &[x, y]).unwrap();
+            assert_eq!(run(&f, &mut e, &[x, y]).unwrap(), want, "x={x} y={y}");
+        }
+    }
+}

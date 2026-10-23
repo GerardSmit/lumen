@@ -789,3 +789,47 @@ fn chained_read_loop_sees_nan_key_store_replacing_nan_property() {
         true,
     );
 }
+
+#[test]
+fn chained_read_loop_with_global_and_captured_reads() {
+    agree(
+        r#"(function(){
+          globalThis.gn=1<<10;
+          globalThis.gtab=new Uint8Array(256);
+          for(var i=0;i<256;i++)gtab[i]=(i*7)&255;
+          function t4(a,c){var o=new Uint8Array(gn);for(var m=0;m<gn;m++){o[m]=c[a.b[m]]&255}return o[5]+o[700]}
+          var u=new Uint8Array(1<<10);for(var i=0;i<u.length;i++)u[i]=i&255;
+          function mk(cap){return function(a){var s=0;for(var k=0;k<64;k++){s+=a.b[k]+cap}return s}}
+          var f=mk(3),out=[];
+          var f64=new Float64Array(64);for(var i=0;i<64;i++)f64[i]=i*10;
+          for(var r=0;r<60;r++){
+            out.length=0;
+            out.push(t4({b:u},gtab),f({b:u}),f({b:f64}));
+          }
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_sees_global_getter_swapping_the_chained_property() {
+    agree(
+        r#"(function(){
+          var u=new Uint8Array(16),f=new Float64Array(16);
+          for(var i=0;i<16;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var o={b:u},cnt=0;
+          Object.defineProperty(globalThis,'gg',{configurable:true,get(){if(++cnt%8===0)o.b=o.b===u?f:u;return 1}});
+          function inBody(a){var s=0;for(var k=0;k<16;k++){s+=gg;s+=a.b[k]}return s}
+          function inCond(a){var s=0;for(var k=0;k<16&&gg;k++){s+=a.b[k]}return s}
+          var out=[];
+          for(var r=0;r<80;r++){
+            out.push(inBody(o),inCond(o));
+          }
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}

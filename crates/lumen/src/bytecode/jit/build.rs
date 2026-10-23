@@ -6194,6 +6194,8 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// element store, which [`Tr::elem_set_str`] clears it after. Number-key element stores only
     /// reach integer indices natively (anything else is generic). The
     /// slot keeps the receiver alive and the receiver's property keeps the cached object alive.
+    /// Variable reads (`LoadName`, `LoadCap`) only fill caches: a getter, proxy or `with` object
+    /// behind a name goes through the full lookup, which reports that JS ran.
     fn chain_cached(&self, s: u16) -> bool {
         if self.tdz_slots[s as usize] || self.kinds[s as usize] != Kind::Boxed {
             return false;
@@ -6207,6 +6209,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             | Op::Pop
             | Op::LoadLocal(_)
             | Op::LoadThis
+            | Op::LoadName(..)
+            | Op::LoadCap(_)
             | Op::GetProp(..)
             | Op::GetPropThis(..)
             | Op::GetPropLocal(..)
