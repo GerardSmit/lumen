@@ -1153,3 +1153,169 @@ fn gvn_band_condition_makes_both_operands_known() {
         }
     }
 }
+
+const FLOAT_CCS: [FloatCC; 6] = [
+    FloatCC::Eq,
+    FloatCC::Ne,
+    FloatCC::Lt,
+    FloatCC::Le,
+    FloatCC::Gt,
+    FloatCC::Ge,
+];
+
+const EDGE_I32: [i32; 7] = [i32::MIN, -1, 0, 1, 7, 8, i32::MAX];
+
+fn count_float_cmps(f: &Function) -> usize {
+    count_insts(f, |d| matches!(d, InstData::FloatCmp { .. }))
+}
+
+#[test]
+fn float_compare_of_two_int_conversions_becomes_int_compare() {
+    for cc in FLOAT_CCS {
+        let mut f = i32_function("both_conversions", 2);
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let (x, y) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+        let fx = b.convert(ConvOp::FromSint, Type::F64, x);
+        let fy = b.convert(ConvOp::FromSint, Type::F64, y);
+        let c = b.fcmp(cc, fx, fy);
+        b.ret(&[c]);
+        b.finish();
+        let original = f.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        assert_eq!(count_float_cmps(&f), 0, "{cc:?}\n{f}");
+        let mut e = env();
+        for x in EDGE_I32 {
+            for y in EDGE_I32 {
+                let args = [x as u32 as u64, y as u32 as u64];
+                assert_eq!(
+                    run(&f, &mut e, &args).unwrap(),
+                    run(&original, &mut e, &args).unwrap(),
+                    "{cc:?} x={x} y={y}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn float_compare_against_integral_constant_becomes_int_compare() {
+    for cc in FLOAT_CCS {
+        for constant_first in [false, true] {
+            for k in [0.0, -0.0, 7.0, -1.0, 2147483647.0, -2147483648.0] {
+                let mut f = i32_function("conversion_vs_constant", 1);
+                let mut b = FunctionBuilder::new(&mut f);
+                let entry = b.create_entry_block();
+                let x = b.block_params(entry)[0];
+                let fx = b.convert(ConvOp::FromSint, Type::F64, x);
+                let kc = b.f64const(k);
+                let c = if constant_first {
+                    b.fcmp(cc, kc, fx)
+                } else {
+                    b.fcmp(cc, fx, kc)
+                };
+                b.ret(&[c]);
+                b.finish();
+                let original = f.clone();
+                opt::optimize(&mut f);
+                verify::verify(&f).unwrap();
+                assert_eq!(count_float_cmps(&f), 0, "{cc:?} k={k} first={constant_first}\n{f}");
+                let mut e = env();
+                for x in EDGE_I32 {
+                    let args = [x as u32 as u64];
+                    assert_eq!(
+                        run(&f, &mut e, &args).unwrap(),
+                        run(&original, &mut e, &args).unwrap(),
+                        "{cc:?} k={k} first={constant_first} x={x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn float_compare_with_inexact_operands_stays_float() {
+    for cc in FLOAT_CCS {
+        for constant_first in [false, true] {
+            let mut f = i32_function("fractional_constant", 1);
+            let mut b = FunctionBuilder::new(&mut f);
+            let entry = b.create_entry_block();
+            let x = b.block_params(entry)[0];
+            let fx = b.convert(ConvOp::FromSint, Type::F64, x);
+            let half = b.f64const(0.5);
+            let c = if constant_first {
+                b.fcmp(cc, half, fx)
+            } else {
+                b.fcmp(cc, fx, half)
+            };
+            b.ret(&[c]);
+            b.finish();
+            let original = f.clone();
+            opt::optimize(&mut f);
+            verify::verify(&f).unwrap();
+            assert_eq!(count_float_cmps(&f), 1, "{cc:?}\n{f}");
+            let mut e = env();
+            for x in EDGE_I32 {
+                let args = [x as u32 as u64];
+                assert_eq!(
+                    run(&f, &mut e, &args).unwrap(),
+                    run(&original, &mut e, &args).unwrap(),
+                    "{cc:?} x={x}"
+                );
+            }
+        }
+    }
+
+    for k in [3000000000.0, f64::NAN, f64::INFINITY] {
+        let mut f = i32_function("out_of_range_constant", 1);
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let x = b.block_params(entry)[0];
+        let fx = b.convert(ConvOp::FromSint, Type::F64, x);
+        let kc = b.f64const(k);
+        let c = b.fcmp(FloatCC::Lt, fx, kc);
+        b.ret(&[c]);
+        b.finish();
+        let original = f.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        let mut e = env();
+        for x in EDGE_I32 {
+            let args = [x as u32 as u64];
+            assert_eq!(
+                run(&f, &mut e, &args).unwrap(),
+                run(&original, &mut e, &args).unwrap(),
+                "k={k} x={x}"
+            );
+        }
+    }
+
+    let mut f = Function::new(
+        "plain_float_argument",
+        Signature::new(vec![Type::I32, Type::F64], vec![Type::I32]),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (x, y) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let fx = b.convert(ConvOp::FromSint, Type::F64, x);
+    let c = b.fcmp(FloatCC::Lt, fx, y);
+    b.ret(&[c]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    verify::verify(&f).unwrap();
+    assert_eq!(count_float_cmps(&f), 1, "{f}");
+    let mut e = env();
+    for x in EDGE_I32 {
+        for y in [-1.5f64, 0.0, 7.0, f64::NAN, 3e9] {
+            let args = [x as u32 as u64, y.to_bits()];
+            assert_eq!(
+                run(&f, &mut e, &args).unwrap(),
+                run(&original, &mut e, &args).unwrap(),
+                "x={x} y={y}"
+            );
+        }
+    }
+}

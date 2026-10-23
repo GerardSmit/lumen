@@ -257,6 +257,62 @@ fn fold_int_float_compare(func: &Function, data: &InstData) -> Option<u64> {
     }
 }
 
+/// Operand of a float comparison that is exactly an int32: its I32 source or an integral
+/// constant in range.
+enum ExactI32 {
+    Value(Value),
+    Imm(i32),
+}
+
+fn exact_i32_operand(func: &Function, v: Value) -> Option<ExactI32> {
+    if let Some(x) = exact_i32_source(func, v) {
+        return Some(ExactI32::Value(x));
+    }
+    let f = f64::from_bits(const_of(func, v).filter(|_| func.value_type(v) == Type::F64)?);
+    (f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64)
+        .then_some(ExactI32::Imm(f as i32))
+}
+
+/// `FloatCmp` of two exact int32s as the equivalent signed `IntCmp`; at least one side must
+/// be an int32 conversion, constant-only compares are left to constant folding.
+fn int_compare_of_float_compare(
+    func: &Function,
+    data: &InstData,
+) -> Option<(IntCC, ExactI32, ExactI32)> {
+    let InstData::FloatCmp { cc, args: [a, b] } = data else {
+        return None;
+    };
+    let (a, b) = (exact_i32_operand(func, *a)?, exact_i32_operand(func, *b)?);
+    if matches!((&a, &b), (ExactI32::Imm(_), ExactI32::Imm(_))) {
+        return None;
+    }
+    let cc = match cc {
+        FloatCC::Eq => IntCC::Eq,
+        FloatCC::Ne => IntCC::Ne,
+        FloatCC::Lt => IntCC::Slt,
+        FloatCC::Le => IntCC::Sle,
+        FloatCC::Gt => IntCC::Sgt,
+        FloatCC::Ge => IntCC::Sge,
+    };
+    Some((cc, a, b))
+}
+
+/// The value of `e`, inserting an I32 constant before the instruction at `at - 1` of `block`.
+fn materialize_i32(func: &mut Function, block: Block, at: &mut usize, e: ExactI32) -> Value {
+    match e {
+        ExactI32::Value(v) => v,
+        ExactI32::Imm(imm) => {
+            let c = func.make_inst(InstData::Iconst {
+                ty: Type::I32,
+                imm: imm as i64,
+            });
+            func.blocks[block.index()].insts.insert(*at - 1, c);
+            *at += 1;
+            func.results(c)[0]
+        }
+    }
+}
+
 /// Carry an F64 block parameter as an I32 when every incoming argument is `FromSint` of an
 /// I32 (or the parameter itself, around a loop): the conversion moves to the top of the block,
 /// where GVN can see that the value is an exact integer. Iterates to a fixpoint, since a
@@ -701,6 +757,14 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
 
             if let Some(bits) = fold_int_float_compare(func, func.inst(inst)) {
                 func.insts[inst.index()] = const_data(Type::I32, bits);
+            }
+            if let Some((cc, lhs, rhs)) = int_compare_of_float_compare(func, func.inst(inst)) {
+                let lhs = materialize_i32(func, b, &mut at, lhs);
+                let rhs = materialize_i32(func, b, &mut at, rhs);
+                func.insts[inst.index()] = InstData::IntCmp {
+                    cc,
+                    args: [lhs, rhs],
+                };
             }
             let data = func.inst(inst);
             if !data.is_pure() && !is_foldable_trapping(data) {
