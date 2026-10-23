@@ -280,3 +280,169 @@ fn string_keys_from_locals_on_exotic_receivers() {
         true,
     );
 }
+
+#[test]
+fn instanceof_native_path_matches_the_interpreter() {
+    agree(
+        r#"(function(){
+          function A(){} function B(){} B.prototype=Object.create(A.prototype);
+          class C extends A{}
+          var H={[Symbol.hasInstance]:function(x){return x===1}};
+          function Even(){} Object.defineProperty(Even,Symbol.hasInstance,{value:function(x){return typeof x=='number'&&x%2===0}});
+          var bound=A.bind(null),arrow=function(){},
+              xs=['s',1,true,null,undefined,{},[],new A(),new B(),new C(),Symbol('q'),function(){}],
+              out=[],bad=0;
+          for(var t=0;t<400;t++){
+            var x=xs[t%xs.length];
+            out.push((x instanceof A?1:0)+(x instanceof B?2:0)+(x instanceof C?4:0)+(x instanceof Object?8:0)
+              +(x instanceof Function?16:0)+(x instanceof bound?32:0)+(x instanceof H?64:0)+(x instanceof Even?128:0));
+            try{ if(x instanceof arrow) bad+=1000 }catch(e){bad+=1}
+            try{ x instanceof 5 }catch(e){bad+=e instanceof TypeError?1:100000}
+            try{ x instanceof {} }catch(e){bad+=1}
+          }
+          var a=new A(),z=0;
+          for(var t=0;t<400;t++){ if(t==200) Object.setPrototypeOf(a,B.prototype); if(a instanceof B) z++ }
+          return out.slice(0,12).join()+'|'+bad+'|'+z+'|'+out.reduce(function(p,c){return p+c},0);
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn instanceof_handler_that_throws_or_mutates() {
+    agree(
+        r#"(function(){
+          var n=0;
+          var T={[Symbol.hasInstance]:function(x){n++;if(n%50==0)throw new Error('h'+n);return true}};
+          var c=0,caught=0;
+          for(var t=0;t<300;t++){ try{ if(t instanceof T) c++ }catch(e){caught++} }
+          function F(){} var o=new F(),g=0;
+          for(var t=0;t<300;t++){ if(t==100) Object.defineProperty(F,Symbol.hasInstance,{value:function(){return false},configurable:true});
+            if(o instanceof F) g++ }
+          return [c,caught,n,g].join();
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_key_stores_create_and_overwrite() {
+    agree(
+        r#"(function(){
+          var o={},keys=['a','bb','cc','dd','toString','length','x y'],s=0;
+          for(var t=0;t<600;t++){ var k=keys[t%keys.length]; o[k]=t; s+=o[k] }
+          var r=0;
+          for(var t=0;t<600;t++){ var k=keys[t%3]; r=o[k]=t+1; s+=r }
+          var q={};
+          for(var t=0;t<400;t++){ var k='k'+(t%10); q[k]=(q[k]|0)+1 }
+          var inh=Object.create({base:1}),l;
+          for(var t=0;t<400;t++){ l='base'; inh[l]=t; l='own'; inh[l]=t }
+          return [s,r,Object.keys(o).join(),Object.keys(q).join(),inh.base,Object.keys(inh).join(),
+                  Object.getPrototypeOf(inh).base].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_key_stores_respect_attributes_and_prototype_chain() {
+    agree(
+        r#"(function(){
+          var log=[],out=[];
+          var frozen=Object.freeze({a:1}),sealed=Object.seal({a:1}),ne=Object.preventExtensions({a:1});
+          var setterProto={set s(v){log.push('set'+v)},get s(){return 'g'}};
+          var viaSetter=Object.create(setterProto);
+          var roProto=Object.create(Object.defineProperty({},'ro',{value:7,writable:false}));
+          var ro2=Object.create(roProto);
+          var swr=Object.create(Object.defineProperty({},'w',{value:1,writable:true,configurable:true}));
+          var strict=function(o,k,v){'use strict';try{o[k]=v;return 'ok'}catch(e){return e.name}};
+          var sloppy=function(o,k,v){o[k]=v;return 'ok'};
+          for(var t=0;t<400;t++){
+            var v=t;
+            out.push(sloppy(frozen,'a',v)+sloppy(frozen,'n',v)+sloppy(sealed,'a',v)+sloppy(sealed,'n',v)
+              +sloppy(ne,'a',v)+sloppy(ne,'n',v)+sloppy(viaSetter,'s',v)+sloppy(roProto,'ro',v)+sloppy(ro2,'ro',v)+sloppy(swr,'w',v));
+          }
+          var se=[];
+          for(var t=0;t<400;t++){
+            se.push([strict(frozen,'a',t),strict(frozen,'n',t),strict(sealed,'n',t),strict(ne,'n',t),
+                     strict(viaSetter,'s',t),strict(ro2,'ro',t),strict(swr,'w',t)].join());
+          }
+          return [frozen.a,frozen.n,sealed.a,sealed.n,ne.a,ne.n,log.length,viaSetter.hasOwnProperty('s'),roProto.ro,ro2.ro,
+                  swr.w,swr.hasOwnProperty('w'),out[399],se[399],out.length].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_key_stores_special_keys_and_receivers() {
+    agree(
+        r#"(function(){
+          var o={},p={},arr=[1,2,3],ta=new Uint8Array(4),fn=function(){},
+              px=new Proxy({},{set:function(t,k,v){t[k]=v+1;return true}}),
+              keys=['__proto__','0','1','07','-1','1e3','NaN','Infinity','',' '],s=0;
+          for(var t=0;t<500;t++){
+            var k=keys[t%keys.length];
+            o[k]=p; arr[k]=t; ta[k]=t; fn[k]=t; px[k]=t;
+            var av=arr[k],tv=ta[k];s+=(typeof o[k]=='object'?1:0)+(typeof av=='number'?av:0)+(typeof tv=='number'?tv:0);
+          }
+          var lk='len';
+          for(var t=0;t<500;t++){ arr['length']=3; lk='length'; arr[lk]=3; ta[lk]=1 }
+          return [s,Object.getPrototypeOf(o)===p,Object.keys(o).join(),arr.join(),arr.length,ta.join(),
+                  fn['1'],fn['07'],px.__proto__===Object.prototype,Object.keys(px).length].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_key_stores_with_the_key_in_a_local_and_as_an_expression() {
+    agree(
+        r#"(function(){
+          function loc(o,n){ var k='f'+n,s=0; for(var i=0;i<n;i++){ o[k]=i; s+=o[k] } return s }
+          function expr(o,k,n){ var r=0; for(var i=0;i<n;i++){ r+=(o[k]=i)+1 } return r }
+          function chain(o,k,n){ var a,b; for(var i=0;i<n;i++){ a=b=o[k]=i } return a+b }
+          function stack(o,n){ var s=0; for(var i=0;i<n;i++){ o['a'+(i&3)]=i; s+=o.a0|0 } return s }
+          function viaThis(n){ for(var i=0;i<n;i++){ this['t'+(i&1)]=i } return this.t0+this.t1 }
+          var a={},b={f:1},c=Object.freeze({z:1});
+          return [loc(a,400),loc({},400),expr(b,'f',400),expr(c,'z',400),chain({},'q',400),stack({},400),
+                  viaThis.call({},400),JSON.stringify(a),b.f,c.z,Object.keys(a).length].join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn instanceof_bound_function_with_own_prototype() {
+    agree(
+        r#"(function(){
+          function A(){} function B(){}
+          var bb=B.bind(null);bb.prototype=A.prototype;
+          var a=new A(),b=new B(),n=0;
+          for(var t=0;t<400;t++){var x=t&1?a:b;if(x instanceof A)n+=1;if(x instanceof bb)n+=10}
+          return n;
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_key_store_replacing_a_global_array() {
+    agree(
+        r#"(function(){
+          var g=globalThis,s=0,k='__jitArr';g[k]=[1,2,3];
+          for(var t=0;t<400;t++){s+=__jitArr[t%3];if(t%50==49)g[k]=[t,t+1,t+2]}
+          delete g[k];
+          return s;
+        })()"#,
+        None,
+        true,
+    );
+}

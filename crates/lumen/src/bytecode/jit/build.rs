@@ -4800,6 +4800,19 @@ impl<'a, 'f> Tr<'a, 'f> {
             | Op::NotEq
             | Op::StrictEq
             | Op::StrictNotEq => self.binop(pc, op)?,
+            // `x instanceof C`: the cached ordinary-constructor test natively (a primitive `x`
+            // included), the full operation otherwise.
+            Op::InstanceOf(_) => {
+                self.box_from(d - 2);
+                let (pa, pb) = (self.sptr(d - 2), self.sptr(d - 1));
+                let pcv = self.i32c(pc as i64);
+                let st = self.call_status(Helper::InstanceOf, &[self.frame, pcv, pa, pb, pa]);
+                let snap = self.stack[..d - 2].to_vec();
+                self.throw_or_ran_js(st, pc, &snap, d - 2);
+                let r = self.stack_bool(d - 2);
+                self.stack.truncate(d - 2);
+                self.stack.push(Entry::Bool(r));
+            }
             // `key in obj`: straight to `Interp::binary` (the generic route runs a one-op VM).
             Op::GenBin(n) if &*self.chunk.names[n as usize] == "in" => {
                 self.box_from(d - 2);
@@ -5236,14 +5249,37 @@ impl<'a, 'f> Tr<'a, 'f> {
                         o @ (Entry::Boxed | Entry::Ref(..)),
                         Entry::Boxed | Entry::Ref(..),
                         v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..)),
-                    ) => self.split_boxed_key(
-                        d - 2,
-                        |t, key| {
-                            let (obj, drop, src) = t.receiver(o, d - 3);
-                            t.elem_write(pc, obj, key, v, drop, keep, d - 3, Slow::Generic, src);
-                        },
-                        |t| t.generic(pc),
-                    )?,
+                    ) => {
+                        let kv = self.stack[d - 2];
+                        self.split_boxed_key(
+                            d - 2,
+                            |t, key| {
+                                let (obj, drop, src) = t.receiver(o, d - 3);
+                                t.elem_write(
+                                    pc,
+                                    obj,
+                                    key,
+                                    v,
+                                    drop,
+                                    keep,
+                                    d - 3,
+                                    Slow::Generic,
+                                    src,
+                                );
+                            },
+                            |t| {
+                                let (obj, co) = match o {
+                                    Entry::Ref(p, _) => (p, 0),
+                                    _ => (t.sptr(d - 3), 1),
+                                };
+                                let (kp, ck) = match kv {
+                                    Entry::Ref(p, _) => (p, 0),
+                                    _ => (t.sptr(d - 2), 2),
+                                };
+                                t.elem_set_str(pc, obj, kp, co | ck, d - 3, keep);
+                            },
+                        )?
+                    }
                     _ => self.generic(pc),
                 }
             }
@@ -5268,24 +5304,33 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(Src::Slot(s)),
                         );
                     }
-                    (Entry::Boxed | Entry::Ref(..), v @ (Entry::Num(_) | Entry::Boxed)) => self.split_boxed_key(
-                        d - 2,
-                        |t, key| {
-                            let obj = t.slot_ptr(s as usize);
-                            t.elem_write(
-                                pc,
-                                obj,
-                                key,
-                                v,
-                                None,
-                                keep,
-                                d - 2,
-                                Slow::Generic,
-                                Some(Src::Slot(s)),
-                            );
-                        },
-                        |t| t.generic(pc),
-                    )?,
+                    (kv @ (Entry::Boxed | Entry::Ref(..)), v @ (Entry::Num(_) | Entry::Boxed)) => {
+                        self.split_boxed_key(
+                            d - 2,
+                            |t, key| {
+                                let obj = t.slot_ptr(s as usize);
+                                t.elem_write(
+                                    pc,
+                                    obj,
+                                    key,
+                                    v,
+                                    None,
+                                    keep,
+                                    d - 2,
+                                    Slow::Generic,
+                                    Some(Src::Slot(s)),
+                                );
+                            },
+                            |t| {
+                                let obj = t.slot_ptr(s as usize);
+                                let (kp, ck) = match kv {
+                                    Entry::Ref(p, _) => (p, 0),
+                                    _ => (t.sptr(d - 2), 2),
+                                };
+                                t.elem_set_str(pc, obj, kp, ck, d - 2, keep);
+                            },
+                        )?
+                    }
                     _ => self.generic(pc),
                 }
             }
@@ -9286,6 +9331,63 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Entry::Ref(..) => Entry::Boxed,
                 e => e,
             });
+        }
+    }
+
+    /// A String-key element store `obj[key] = v` (`v` at stack index `vi`, the topmost entry)
+    /// through [`Helper::ElemSetStr`], else the generic op at `pc`; `consume` as the helper
+    /// takes it. With `keep` the value is the op's result, landing at stack index `base`.
+    /// Leaves the post-op stack.
+    fn elem_set_str(
+        &mut self,
+        pc: usize,
+        obj: V,
+        key: V,
+        consume: i64,
+        base: usize,
+        keep: bool,
+    ) {
+        let vi = self.stack.len() - 1;
+        self.box_from(vi);
+        let vp = self.sptr(vi);
+        let dst = if keep {
+            self.sptr(base)
+        } else {
+            self.ptrc(0)
+        };
+        let cv = self.i32c(consume);
+        let r = self
+            .call(Helper::ElemSetStr, &[self.frame, obj, key, vp, dst, cv])
+            .expect("ElemSetStr returns a flag");
+        let z = self.i32c(0);
+        let hit = self.fb.icmp(IntCC::Ne, r, z);
+        let (hit_b, gen_b, join) = (
+            self.fb.create_block(),
+            self.fb.create_block(),
+            self.fb.create_block(),
+        );
+        self.fb.brif(hit, hit_b, &[], gen_b, &[]);
+        self.fb.seal_block(hit_b);
+        self.fb.seal_block(gen_b);
+        self.fb.switch_to_block(hit_b);
+        // A created property may have moved the receiver's entries, and a replaced object may
+        // back cached facts (a global binding's array view): reset every region cache.
+        let two = self.i32c(2);
+        let created = self.fb.icmp(IntCC::Eq, r, two);
+        let inv = self.fb.create_block();
+        self.fb.brif(created, inv, &[], join, &[]);
+        self.fb.seal_block(inv);
+        self.fb.switch_to_block(inv);
+        self.invalidate_js();
+        self.fb.jump(join, &[]);
+        self.fb.switch_to_block(gen_b);
+        self.generic(pc);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        self.stack.truncate(base);
+        if keep {
+            self.stack.push(Entry::Boxed);
         }
     }
 

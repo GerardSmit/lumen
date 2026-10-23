@@ -7222,21 +7222,20 @@ impl Interp {
         Ok(Value::Bool(self.ordinary_has_instance(r, l)?))
     }
 
-    /// Execute `instanceof` through a narrow ordinary-constructor cache. Filling is
-    /// observationally inert: the real abstract operation still runs on every miss, and a hit
-    /// revalidates every fact captured here.
-    pub(crate) fn instanceof_ic(
-        &mut self,
+    /// The cached fast path of [`Interp::instanceof_ic`]: `Some(result)` when the cache proves
+    /// `r` is an ordinary constructor with the intrinsic `@@hasInstance` (runs no JS).
+    pub(crate) fn instanceof_ic_hit(
+        &self,
         l: &Value,
         r: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
-    ) -> Result<Value, Abrupt> {
+    ) -> Option<bool> {
         let key = crate::builtins::well_known_key(self, "hasInstance");
         // The cached RHS shape proves no own @@hasInstance appeared, while the inherited
         // intrinsic is read live.
         let cached = cache.get();
         if self.inline_ic_safe.get() && cached.depth == 0 {
-            if let (Some(key), Value::Obj(lhs), Value::Obj(rhs)) = (key.as_deref(), l, r) {
+            if let (Some(key), Value::Obj(rhs)) = (key.as_deref(), r) {
                 let canonical = self
                     .function_proto
                     .borrow()
@@ -7260,6 +7259,7 @@ impl Interp {
                 let target = if canonical {
                     let b = rhs.borrow();
                     (b.is_constructor
+                        && !matches!(b.call, Callable::Bound(_))
                         && matches!(b.exotic, Exotic::None)
                         && b.ic_plain.get()
                         && b.props.shape() == cached.recv_shape
@@ -7276,24 +7276,45 @@ impl Interp {
                     None
                 };
                 if let Some(Value::Obj(target)) = target {
+                    // OrdinaryHasInstance: a primitive is never an instance.
+                    let Value::Obj(lhs) = l else {
+                        return Some(false);
+                    };
                     let mut cur = Some(lhs.clone());
                     while let Some(object) = cur {
                         let next = object.borrow().proto.clone();
                         match next {
                             Some(proto) if Gc::ptr_eq(&proto, &target) => {
-                                return Ok(Value::Bool(true));
+                                return Some(true);
                             }
                             Some(proto) => cur = Some(proto),
-                            None => return Ok(Value::Bool(false)),
+                            None => return Some(false),
                         }
                     }
                 }
             }
         }
+        None
+    }
+
+    /// Execute `instanceof` through a narrow ordinary-constructor cache. Filling is
+    /// observationally inert: the real abstract operation still runs on every miss, and a hit
+    /// revalidates every fact captured here.
+    pub(crate) fn instanceof_ic(
+        &mut self,
+        l: &Value,
+        r: &Value,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> Result<Value, Abrupt> {
+        if let Some(hit) = self.instanceof_ic_hit(l, r, cache) {
+            return Ok(Value::Bool(hit));
+        }
+        let key = crate::builtins::well_known_key(self, "hasInstance");
         let fill = match (key.as_deref(), r) {
             (Some(key), Value::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                 let b = o.borrow();
                 if b.is_constructor
+                    && !matches!(b.call, Callable::Bound(_))
                     && matches!(b.exotic, Exotic::None)
                     && b.ic_plain.get()
                     && b.proto

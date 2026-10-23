@@ -4072,26 +4072,7 @@ impl Interp {
             if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
                 return None;
             }
-            let shape = b.props.shape();
-            let mix = ((shape as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
-            let h = (mix ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
-            // `slot_of` never reaches the memo, so it runs under the borrow.
-            let slot = STR_KEY_IC.with(|c| {
-                let e = &mut c.borrow_mut()[h];
-                match e {
-                    Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
-                        Some(*slot as usize)
-                    }
-                    _ => {
-                        let s = b.props.slot_of(key);
-                        if let Some(s) = s {
-                            // A non-index key's slot is a named one, pinned by the shape.
-                            *e = Some((shape, lkey.clone(), s as u32));
-                        }
-                        s
-                    }
-                }
-            });
+            let slot = Self::str_key_slot(&b.props, lkey);
             if let Some(slot) = slot {
                 let p = b.props.entry_at(slot)?;
                 return (!p.accessor()).then(|| p.value());
@@ -4115,6 +4096,98 @@ impl Interp {
             };
             cur = next;
         }
+    }
+
+    /// The slot of own non-index `lkey` in `props`, through the [`STR_KEY_IC`] memo.
+    fn str_key_slot(props: &Props, lkey: &crate::lstr::LStr) -> Option<usize> {
+        let shape = props.shape();
+        let mix = ((shape as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
+        let h = (mix ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
+        // `slot_of` never reaches the memo, so it runs under the caller's borrow.
+        STR_KEY_IC.with(|c| {
+            let e = &mut c.borrow_mut()[h];
+            match e {
+                Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
+                    Some(*slot as usize)
+                }
+                _ => {
+                    let s = props.slot_of(lkey.as_str());
+                    if let Some(s) = s {
+                        // A non-index key's slot is a named one, pinned by the shape.
+                        *e = Some((shape, lkey.clone(), s as u32));
+                    }
+                    s
+                }
+            }
+        })
+    }
+
+    /// `o[key] = v` for a String `key` that is not an array index, when `o` is plain and either
+    /// owns `key` as a writable data property, or is extensible with no accessor or read-only
+    /// `key` on its (plain) prototype chain, so the property is created on `o`. Runs no JS.
+    /// `Ok(true)` when it created the property or replaced an object (facts derived from the old
+    /// value are stale); `Err(v)` = take the generic path (ownership comes back).
+    pub(crate) fn fast_set_str(
+        &mut self,
+        o: &Gc,
+        lkey: &crate::lstr::LStr,
+        v: Value,
+    ) -> Result<bool, Value> {
+        let key = lkey.as_str();
+        if key
+            .as_bytes()
+            .first()
+            .is_none_or(|b| b.is_ascii_digit() || *b == 0)
+            || ((!self.module_ns.is_empty() || !self.deferred_ns.is_empty()) && {
+                let ptr = Gc::as_ptr(o) as usize;
+                self.module_ns.contains_key(&ptr) || self.deferred_ns.contains_key(&ptr)
+            })
+        {
+            return Err(v);
+        }
+        let Ok(mut b) = o.try_borrow_mut() else {
+            return Err(v);
+        };
+        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+            return Err(v);
+        }
+        if let Some(slot) = Self::str_key_slot(&b.props, lkey) {
+            return match b.props.entry_at(slot) {
+                Some(p) if !p.accessor() && p.writable() => {
+                    let was_obj = matches!(p.value(), Value::Obj(_));
+                    b.props
+                        .entry_at_mut(slot)
+                        .expect("slot just read")
+                        .set_value(v);
+                    Ok(was_obj)
+                }
+                _ => Err(v),
+            };
+        }
+        if !b.extensible {
+            return Err(v);
+        }
+        let mut walk = b.proto.clone();
+        while let Some(h) = walk {
+            let Ok(hb) = h.try_borrow() else {
+                return Err(v);
+            };
+            if !hb.ic_plain.get() || !matches!(hb.exotic, Exotic::None) {
+                return Err(v);
+            }
+            if let Some(slot) = hb.props.slot_of(key) {
+                match hb.props.entry_at(slot) {
+                    Some(p) if !p.accessor() && p.writable() => break,
+                    _ => return Err(v),
+                }
+            }
+            let next = hb.proto.clone();
+            drop(hb);
+            walk = next;
+        }
+        b.props
+            .insert(std::rc::Rc::<str>::from(lkey), Property::plain(v));
+        Ok(true)
     }
 
     pub(crate) fn fast_get_elem(&mut self, o: &Gc, n: f64) -> Option<Value> {

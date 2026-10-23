@@ -333,12 +333,22 @@ pub(crate) enum Helper {
     /// at `pc` (cached in `cell`) still starts with `LoadName GetMethod` reading the intrinsic
     /// `String.fromCharCode` / `fromCodePoint` through its own closure environment. Pure.
     WrapGuard,
+    /// `(frame, pc: u32, a: *mut Value, b: *mut Value, dst: *mut Value) -> status` — the
+    /// `InstanceOf` at `pc` on consumed `a`, `b` (`dst` may be `a`); a Boolean into `dst`.
+    /// `STATUS_OK_SLOW` when the cache missed (a `@@hasInstance` handler may have run).
+    InstanceOf,
+    /// `(frame, obj: *mut Value, key: *mut Value, v: *mut Value, dst: *mut Value, consume: u32)
+    /// -> u32` — `obj[key] = v` with a String `key` through `Interp::fast_set_str` (runs no
+    /// JS): 1 (2 when it created the property) with `*v` consumed, the key (bit 1) and the
+    /// object (bit 0) released per `consume`, and a copy of the value written to `dst` unless
+    /// it is null; else 0 with nothing touched.
+    ElemSetStr,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 86] = [
+pub(crate) const ALL: [Helper; 88] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -425,6 +435,8 @@ pub(crate) const ALL: [Helper; 86] = [
     Helper::StrStatic,
     Helper::StrStaticSlow,
     Helper::WrapGuard,
+    Helper::InstanceOf,
+    Helper::ElemSetStr,
 ];
 
 /// The IR signature of `h`.
@@ -513,6 +525,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::StrStatic => (&[P, I32, F64, P], &[I32]),
         Helper::StrStaticSlow => (&[P, I32, F64, P], &[I32]),
         Helper::WrapGuard => (&[P, I32, P], &[I32]),
+        Helper::InstanceOf => (&[P, I32, P, P, P], &[I32]),
+        Helper::ElemSetStr => (&[P, P, P, P, P, I32], &[I32]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -607,6 +621,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::StrStatic => str_static as *const () as usize,
         Helper::StrStaticSlow => str_static_slow as *const () as usize,
         Helper::WrapGuard => wrap_guard as *const () as usize,
+        Helper::InstanceOf => instance_of as *const () as usize,
+        Helper::ElemSetStr => elem_set_str as *const () as usize,
     } as u64)
 }
 
@@ -1361,6 +1377,71 @@ pub(crate) unsafe extern "C" fn elem_get_str(
     }
     std::ptr::write(dst, v);
     1
+}
+
+/// `obj[key] = v` for a String `key` on a plain object (1), or 0 when that needs the
+/// interpreter. See [`Helper::ElemSetStr`].
+pub(crate) unsafe extern "C" fn elem_set_str(
+    f: *mut JitFrame,
+    obj: *mut Value,
+    key: *mut Value,
+    v: *mut Value,
+    dst: *mut Value,
+    consume: u32,
+) -> u32 {
+    let (Value::Obj(o), Value::Str(k)) = (&*obj, &*key) else {
+        return 0;
+    };
+    let i = &mut *(*f).interp;
+    let val = std::ptr::read(v);
+    let kept = (!dst.is_null()).then(|| val.clone());
+    match i.fast_set_str(o, k, val) {
+        Ok(created) => {
+            std::ptr::write(v, Value::Undefined);
+            if consume & 2 != 0 {
+                drop(std::ptr::replace(key, Value::Undefined));
+            }
+            if consume & 1 != 0 {
+                drop(std::ptr::replace(obj, Value::Undefined));
+            }
+            if let Some(k) = kept {
+                std::ptr::write(dst, k);
+            }
+            1 + created as u32
+        }
+        Err(back) => {
+            std::ptr::write(v, back);
+            0
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn instance_of(
+    f: *mut JitFrame,
+    pc: u32,
+    a: *mut Value,
+    b: *mut Value,
+    dst: *mut Value,
+) -> u32 {
+    let i = &mut *(*f).interp;
+    let chunk = &*(*f).chunk;
+    let l = std::ptr::replace(a, Value::Undefined);
+    let r = std::ptr::replace(b, Value::Undefined);
+    let Some(&Op::InstanceOf(c)) = chunk.ops.get(pc as usize) else {
+        return fail(f, i.throw("TypeError", "malformed instanceof site"));
+    };
+    let cache = chunk.caches.at(c as usize);
+    if let Some(hit) = i.instanceof_ic_hit(&l, &r, cache) {
+        std::ptr::write(dst, Value::Bool(hit));
+        return STATUS_OK;
+    }
+    match i.instanceof_ic(&l, &r, cache) {
+        Ok(v) => {
+            std::ptr::write(dst, v);
+            STATUS_OK_SLOW
+        }
+        Err(e) => fail(f, e),
+    }
 }
 
 pub(crate) unsafe extern "C" fn to_str_prim(f: *mut JitFrame, p: *mut Value) -> u32 {

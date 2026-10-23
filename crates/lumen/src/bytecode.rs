@@ -2864,6 +2864,16 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                 }
+                let v = match (&obj, &key) {
+                    (Value::Obj(o), Value::Str(k)) => match i.fast_set_str(o, k, v.clone()) {
+                        Ok(_) => {
+                            stack.push(v);
+                            continue;
+                        }
+                        Err(_) => v,
+                    },
+                    _ => v,
+                };
                 i.set_elem_slow(&obj, &key, v.clone())?;
                 stack.push(v);
             }
@@ -2880,6 +2890,13 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                 }
+                let v = match (&obj, &key) {
+                    (Value::Obj(o), Value::Str(k)) => match i.fast_set_str(o, k, v) {
+                        Ok(_) => continue,
+                        Err(back) => back,
+                    },
+                    _ => v,
+                };
                 i.set_elem_slow(&obj, &key, v)?;
             }
             Op::ArgsLen(s, tag) => {
@@ -2942,6 +2959,13 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                 }
+                let v = match (&slots[s as usize], &key) {
+                    (Value::Obj(o), Value::Str(k)) => match i.fast_set_str(o, k, v) {
+                        Ok(_) => continue,
+                        Err(back) => back,
+                    },
+                    _ => v,
+                };
                 let obj = slots[s as usize].clone();
                 i.set_elem_slow(&obj, &key, v)?;
             }
