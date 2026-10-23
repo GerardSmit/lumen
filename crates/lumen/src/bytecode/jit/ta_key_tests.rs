@@ -833,3 +833,100 @@ fn chained_read_loop_sees_global_getter_swapping_the_chained_property() {
         true,
     );
 }
+
+#[test]
+fn chained_read_loop_with_throwing_tail_decodes_and_reports_invalid_chars() {
+    agree(
+        r#"(function(){
+          var Y={thrown:function(s){return new Error(String(s))}};
+          var HEX='0123456789abcdef';
+          function Mb(buf){this.b=new Uint8Array(buf)}
+          function Jk(n){this.b=new Uint8Array(n)}
+          var tab=[];for(var q=0;q<256;q++)tab.push(-1);
+          for(var q=0;q<16;q++)tab[HEX.charCodeAt(q)]=q;
+          function decodeBytes(a,g,size,b,c){var h=0,r=0,k=0,m=0;
+            while(m<size){
+              for(;8>h;){h+=b;r<<=b;var l=c[a.b[k++]];
+                if(-1==l)throw Y.thrown("BaseCode : invalid encoded char");
+                r|=l}
+              h-=8;g.b[m++]=r>>h&255;
+            }}
+          function enc(bytes){var s='';for(var i=0;i<bytes.length;i++)s+=HEX[bytes[i]>>4]+HEX[bytes[i]&15];return s}
+          function buf(s){var u=[];for(var i=0;i<s.length;i++)u.push(s.charCodeAt(i));return u}
+          var out=[];
+          for(var run=0;run<60;run++){
+            var n=run<3?4:2000,src=new Uint8Array(n);
+            for(var i=0;i<n;i++)src[i]=(i*31+run*7)&255;
+            var a=new Mb(buf(enc(src))),g=new Jk(n);
+            decodeBytes(a,g,n,4,tab);
+            var bad=0;for(var i=0;i<n;i++)if(g.b[i]!==src[i])bad++;
+            out.push(bad);
+          }
+          var msgs=[];
+          for(var run=0;run<20;run++){
+            var s=enc(new Uint8Array([1,2,3,4,5,6,7,8]));
+            s=s.substring(0,run%12)+'z'+s.substring(run%12+1);
+            try{decodeBytes(new Mb(buf(s)),new Jk(8),8,4,tab);msgs.push('ok')}
+            catch(e){msgs.push(e.message+'@'+run)}
+          }
+          return out.join(',')+'|'+msgs.join(';');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_with_throw_inside_loop_try_still_sees_swapped_property() {
+    agree(
+        r#"(function(){
+          var u=new Uint8Array(16),f=new Float64Array(16);
+          for(var i=0;i<16;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var o={b:u};
+          function swap(){o.b=o.b===u?f:u;return 'x'}
+          function inTry(a){var s=0;for(var k=0;k<16;k++){
+            try{if(k%5===4)throw swap()}catch(e){s+=100}
+            s+=a.b[k]}return s}
+          function catchCalls(a){var s=0;for(var k=0;k<16;k++){
+            try{if(k%5===4)throw 1}catch(e){swap()}
+            s+=a.b[k]}return s}
+          function tailThenCatchOutside(a){var s=0;for(var k=0;k<16;k++){
+            s+=a.b[k];
+            if(k===9)throw swap()}return s}
+          var out=[];
+          for(var r=0;r<80;r++){
+            out.push(inTry(o),catchCalls(o));
+            try{out.push(tailThenCatchOutside(o))}catch(e){out.push(e)}
+          }
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn chained_read_loop_with_returning_call_tail_sees_swapped_property() {
+    agree(
+        r#"(function(){
+          var u=new Uint8Array(16),f=new Float64Array(16);
+          for(var i=0;i<16;i++){u[i]=i+1;f[i]=(i+1)*1000}
+          var o={b:u};
+          function swap(){o.b=o.b===u?f:u;return 'x'}
+          function returns(a){var s=0;for(var k=0;k<16;k++){
+            if(k%5===4){swap()}
+            s+=a.b[k]}return s}
+          function throwsConditionally(a,t){var s=0;for(var k=0;k<16;k++){
+            if(k%5===4){var v=swap();if(t)throw v}
+            s+=a.b[k]}return s}
+          var out=[];
+          for(var r=0;r<80;r++){
+            out.push(returns(o));
+            try{out.push(throwsConditionally(o,r%3===0))}catch(e){out.push(e)}
+          }
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}

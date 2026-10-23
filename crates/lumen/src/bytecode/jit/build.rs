@@ -699,6 +699,7 @@ fn build_region(
             chain_vars: HashMap::new(),
             ta_kinds: ta_kinds_init,
             ta_slots: ta_slots_init,
+            handlers: an.hs.iter().any(|h| !h.is_empty()),
             hs_cur: Vec::new(),
             skip: None,
             pending_append: None,
@@ -2193,6 +2194,8 @@ struct Tr<'a, 'f> {
     /// The receiver payload (I64, 0 = unset) and the object payload its chained property read
     /// found (I64), per `GetPropLocal` site of a read-only loop (see [`Tr::chain_cached`]).
     chain_vars: HashMap<usize, (Variable, Variable)>,
+    /// Whether any op of the region has a live region handler.
+    handlers: bool,
     /// Region handlers live at the op being translated (see [`Analysis::hs`]).
     hs_cur: Vec<(usize, usize)>,
     /// The last op a chained read already emitted (see [`Tr::chain_read`]): `body` skips
@@ -6200,58 +6203,108 @@ impl<'a, 'f> Tr<'a, 'f> {
         if self.tdz_slots[s as usize] || self.kinds[s as usize] != Kind::Boxed {
             return false;
         }
-        self.ops[self.header..=self.backedge].iter().all(|op| match *op {
-            Op::StoreLocal(x) | Op::UpdateLocal(x, _) => x != s,
-            Op::ArithLL(_, x, ..) | Op::ArithLK(_, x, ..) => x != s,
-            Op::Const(_)
-            | Op::Undef
-            | Op::Dup
-            | Op::Pop
-            | Op::LoadLocal(_)
-            | Op::LoadThis
-            | Op::LoadName(..)
-            | Op::LoadCap(_)
-            | Op::GetProp(..)
-            | Op::GetPropThis(..)
-            | Op::GetPropLocal(..)
-            | Op::GetElem
-            | Op::GetElemLocal(_)
-            | Op::SetElem
-            | Op::SetElemDrop
-            | Op::SetElemLocal(_)
-            | Op::SetElemLocalDrop(_)
-            | Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Mod
-            | Op::BitAnd
-            | Op::BitOr
-            | Op::BitXor
-            | Op::Shl
-            | Op::Shr
-            | Op::UShr
-            | Op::Lt
-            | Op::Gt
-            | Op::Le
-            | Op::Ge
-            | Op::EqEq
-            | Op::NotEq
-            | Op::StrictEq
-            | Op::StrictNotEq
-            | Op::Neg
-            | Op::Plus
-            | Op::Not
-            | Op::BitNot
-            | Op::Jump(_)
-            | Op::JumpIfFalse(_)
-            | Op::JumpIfNotCmp(..)
-            | Op::JumpIfNotCmpLL(..)
-            | Op::JumpIfNotCmpLK(..)
-            | Op::JumpIfFalsePeek(_)
-            | Op::JumpIfTruePeek(_) => true,
-            _ => false,
-        })
+        let tail = self.throwing_tail();
+        self.ops[self.header..=self.backedge]
+            .iter()
+            .enumerate()
+            .all(|(i, op)| {
+                tail[i]
+                    || match *op {
+                        Op::StoreLocal(x) | Op::UpdateLocal(x, _) => x != s,
+                        Op::ArithLL(_, x, ..) | Op::ArithLK(_, x, ..) => x != s,
+                        Op::Const(_)
+                        | Op::Undef
+                        | Op::Dup
+                        | Op::Pop
+                        | Op::LoadLocal(_)
+                        | Op::LoadThis
+                        | Op::LoadName(..)
+                        | Op::LoadCap(_)
+                        | Op::GetProp(..)
+                        | Op::GetPropThis(..)
+                        | Op::GetPropLocal(..)
+                        | Op::GetElem
+                        | Op::GetElemLocal(_)
+                        | Op::SetElem
+                        | Op::SetElemDrop
+                        | Op::SetElemLocal(_)
+                        | Op::SetElemLocalDrop(_)
+                        | Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::Div
+                        | Op::Mod
+                        | Op::BitAnd
+                        | Op::BitOr
+                        | Op::BitXor
+                        | Op::Shl
+                        | Op::Shr
+                        | Op::UShr
+                        | Op::Lt
+                        | Op::Gt
+                        | Op::Le
+                        | Op::Ge
+                        | Op::EqEq
+                        | Op::NotEq
+                        | Op::StrictEq
+                        | Op::StrictNotEq
+                        | Op::Neg
+                        | Op::Plus
+                        | Op::Not
+                        | Op::BitNot
+                        | Op::Jump(_)
+                        | Op::JumpIfFalse(_)
+                        | Op::JumpIfNotCmp(..)
+                        | Op::JumpIfNotCmpLL(..)
+                        | Op::JumpIfNotCmpLK(..)
+                        | Op::JumpIfFalsePeek(_)
+                        | Op::JumpIfTruePeek(_) => true,
+                        _ => false,
+                    }
+            })
+    }
+
+    /// Per body op (offset by `header`): whether it belongs to a throwing tail, a straight-line
+    /// run entered only at its first op and ending in `Throw`, with no handler anywhere in the
+    /// region. Entering it throws out of the region (the interpreter then runs the `Throw`),
+    /// and every later entry starts a fresh compiled region, so nothing it does is observed by
+    /// a later iteration. Chained reads inside it are left out: they could read a cache that
+    /// a call before them made stale.
+    fn throwing_tail(&self) -> Vec<bool> {
+        let mut tail = vec![false; self.backedge - self.header + 1];
+        if self.handlers {
+            return tail;
+        }
+        let straight = |op: &Op| {
+            let (falls, target) = successors(op);
+            falls
+                && target.is_none()
+                && !matches!(
+                    op,
+                    Op::Await
+                        | Op::Yield
+                        | Op::YieldDelegate(_)
+                        | Op::InitialYield
+                        | Op::SwitchLK(..)
+                        | Op::PushHandler(_)
+                        | Op::PopHandler
+                        | Op::TailCall(..)
+                        | Op::TailCallSpread(..)
+                        | Op::GetPropLocal(..)
+                )
+        };
+        for t in self.header..=self.backedge {
+            if !matches!(self.ops[t], Op::Throw) {
+                continue;
+            }
+            // Back to the run's entry: a leader, or the op after one that may branch.
+            let mut q = t;
+            while q > self.header && !self.is_leader(q) && straight(&self.ops[q - 1]) {
+                q -= 1;
+            }
+            tail[q - self.header..=t - self.header].fill(true);
+        }
+        tail
     }
 
     /// Emit ops `first..=last` of a chained read (they do not chain in turn).
