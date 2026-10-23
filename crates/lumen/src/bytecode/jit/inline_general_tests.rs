@@ -298,6 +298,10 @@ fn gc_during_inlined_body() {
 
 #[test]
 fn deep_stack_overflow_is_a_range_error() {
+    on_big_stack(deep_stack_overflow);
+}
+
+fn deep_stack_overflow() {
     agree(
         "(function(){
            function down(n){return n===0?0:1+step(n-1)}
@@ -325,6 +329,10 @@ fn function_caller_sees_the_inlined_frame() {
 
 #[test]
 fn overflows_out_of_inlined_bodies_leave_the_depth_as_it_was() {
+    on_big_stack(overflows_leave_the_depth);
+}
+
+fn overflows_leave_the_depth() {
     let src = "(function(){'use strict';
            function down(n){return n===0?0:1+step(n-1)}
            function step(n){return 0+down(n)}
@@ -443,4 +451,9 @@ fn exits_past_the_limit_stop_inlining_the_site() {
         None,
         false,
     );
+}
+
+/// Debug-build interpreter frames are large; the default 2 MiB test thread is too small.
+fn on_big_stack(f: fn()) {
+    std::thread::Builder::new().stack_size(crate::THREAD_STACK_SIZE).spawn(f).unwrap().join().unwrap();
 }

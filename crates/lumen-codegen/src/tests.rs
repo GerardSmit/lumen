@@ -1004,9 +1004,6 @@ fn gvn_folds_repeated_condition_on_then_edge() {
     let c = b.icmp(IntCC::Eq, x, five);
     let (inner, inner_then, other) = (b.create_block(), b.create_block(), b.create_block());
     b.brif(c, inner, &[], other, &[]);
-    for blk in [inner, inner_then, other] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(inner);
     let again = b.icmp(IntCC::Eq, x, five);
     b.brif(again, inner_then, &[], other, &[]);
@@ -1016,6 +1013,9 @@ fn gvn_folds_repeated_condition_on_then_edge() {
     b.switch_to_block(other);
     let twenty = b.iconst(Type::I32, 20);
     b.ret(&[twenty]);
+    for blk in [inner, inner_then, other] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1043,9 +1043,6 @@ fn gvn_folds_repeated_condition_on_else_edge() {
         b.create_block(),
     );
     b.brif(c, hit, &[], miss, &[]);
-    for blk in [hit, miss, never, last] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(hit);
     let one = b.iconst(Type::I32, 1);
     b.ret(&[one]);
@@ -1058,6 +1055,9 @@ fn gvn_folds_repeated_condition_on_else_edge() {
     b.switch_to_block(last);
     let three = b.iconst(Type::I32, 3);
     b.ret(&[three]);
+    for blk in [hit, miss, never, last] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1086,9 +1086,6 @@ fn gvn_branch_facts_do_not_reach_merge_blocks() {
         b.create_block(),
     );
     b.brif(c, left, &[], right, &[]);
-    for blk in [left, right, merge, yes, no] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(left);
     b.jump(merge, &[]);
     b.switch_to_block(right);
@@ -1102,6 +1099,9 @@ fn gvn_branch_facts_do_not_reach_merge_blocks() {
     b.switch_to_block(no);
     let zero = b.iconst(Type::I32, 0);
     b.ret(&[zero]);
+    for blk in [left, right, merge, yes, no] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1160,9 +1160,6 @@ fn gvn_band_condition_makes_both_operands_known() {
         b.create_block(),
     );
     b.brif(both, first, &[], no, &[]);
-    for blk in [first, second, yes, no] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(first);
     b.brif(c1, second, &[], no, &[]);
     b.switch_to_block(second);
@@ -1173,6 +1170,9 @@ fn gvn_band_condition_makes_both_operands_known() {
     b.switch_to_block(no);
     let zero = b.iconst(Type::I32, 0);
     b.ret(&[zero]);
+    for blk in [first, second, yes, no] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1928,13 +1928,18 @@ fn licm_keeps_loads_behind_a_trap_in_the_same_block() {
 fn licm_skips_a_loop_headed_by_the_entry_block() {
     let mut f = Function::new("licm_entry", licm_sig());
     let mut b = FunctionBuilder::new(&mut f);
-    let entry = b.create_entry_block();
+    let entry = b.create_block();
+    for ty in licm_sig().params {
+        b.append_block_param(entry, ty);
+    }
+    b.switch_to_block(entry);
     let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
     let exit = b.create_block();
     let sq = b.binary(BinaryOp::Imul, p, p);
     let zero = b.iconst(Type::I32, 0);
     let c = b.icmp(IntCC::Sgt, n, zero);
     b.brif(c, entry, &[sq, n], exit, &[]);
+    b.seal_block(entry);
     b.seal_block(exit);
     b.switch_to_block(exit);
     b.ret(&[p]);
