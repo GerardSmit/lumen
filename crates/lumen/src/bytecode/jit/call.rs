@@ -988,7 +988,20 @@ pub(super) fn plan_direct(
                             Op::LoadLocal(_) | Op::Const(_) | Op::Undef | Op::LoadThis | Op::Dup
                         )
                     });
-                    p.dthis.insert(q, tb);
+                    // The `Math` calls of the body are guarded in the method's own scope.
+                    let probes = if tb.maths.is_empty() {
+                        Some(Vec::new())
+                    } else if tb.fresh && word != 0 {
+                        super::inline::math_probes(interp, &cc_rc, env_addr, &tb.maths, p)
+                    } else {
+                        None
+                    };
+                    if let Some(probes) = probes {
+                        if !probes.is_empty() {
+                            p.dmath.insert(q, probes);
+                        }
+                        p.dthis.insert(q, tb);
+                    }
                 }
             }
         }
@@ -1449,6 +1462,68 @@ impl Tr<'_, '_> {
         Some(layout::gc_data_entry(&mut self.fb, gp, shape, slot, miss))
     }
 
+    /// The inline check of `pr` (see [`IntrProbe`]): the receiver read through its name cache
+    /// is an ordinary object of the planned shape whose method slot holds the planned function,
+    /// branching to `miss` otherwise. `false` (nothing emitted) when the check can't be
+    /// emitted.
+    pub(super) fn probe_inline(&mut self, pr: &IntrProbe, miss: Block) -> bool {
+        let (chunk, envp) = match &pr.wrapper {
+            Some((wc, env)) => (&**wc, self.ptrc(*env as i64)),
+            None => (self.chunk, self.fb.load(PTR_MEM, self.frame, FRAME_ENV)),
+        };
+        match self.glob_entry_in(chunk, envp, pr.cache, miss) {
+            Some(p) => {
+                let bits = layout::entry_word(&mut self.fb, p, 0, miss);
+                layout::word_probe(&mut self.fb, bits, pr.shape, pr.slot, pr.word, miss);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Tr::probe_inline`] where a check that can't be emitted always misses.
+    pub(super) fn probe_to(&mut self, pr: &IntrProbe, miss: Block) {
+        if !self.probe_inline(pr, miss) {
+            self.fb.jump(miss, &[]);
+            let dead = self.fb.create_block();
+            self.fb.seal_block(dead);
+            self.fb.switch_to_block(dead);
+        }
+    }
+
+    /// The `Math` guards of the inlined method body at direct site `pc` (`Plan::dmath`),
+    /// checked when JS may have run since the last check: a miss branches to `miss` (the
+    /// ordinary call), and is not remembered.
+    pub(super) fn body_math_guard(&mut self, pc: usize, miss: Block) {
+        let Some(probes) = self.plan.dmath.get(&pc).cloned() else {
+            return;
+        };
+        let var = self.math_vars.get(&pc).copied();
+        let check = self.fb.create_block();
+        let cont = self.fb.create_block();
+        match var {
+            Some(var) => {
+                let known = self.fb.use_var(var);
+                let zero = self.i32c(0);
+                let unknown = self.fb.icmp(IntCC::Eq, known, zero);
+                self.fb.brif(unknown, check, &[], cont, &[]);
+            }
+            None => self.fb.jump(check, &[]),
+        }
+        self.fb.seal_block(check);
+        self.fb.switch_to_block(check);
+        for pr in &probes {
+            self.probe_to(pr, miss);
+        }
+        if let Some(var) = var {
+            let one = self.i32c(1);
+            self.fb.def_var(var, one);
+        }
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+    }
+
     /// The I32 guard (nonzero = holds) of an intrinsic site: when `probe` is known, checked
     /// inline — the receiver read through its name cache (see [`Tr::glob_entry_in`]) is an
     /// ordinary object of the planned shape whose method slot holds the planned function — and
@@ -1458,23 +1533,7 @@ impl Tr<'_, '_> {
         let join = self.fb.create_block();
         let res = self.fb.append_block_param(join, Type::I32);
         let inline = match &probe {
-            Some(pr) => {
-                let (chunk, envp) = match &pr.wrapper {
-                    Some((wc, env)) => (&**wc, self.ptrc(*env as i64)),
-                    None => (
-                        self.chunk,
-                        self.fb.load(PTR_MEM, self.frame, FRAME_ENV),
-                    ),
-                };
-                match self.glob_entry_in(chunk, envp, pr.cache, slow) {
-                    Some(p) => {
-                        let bits = layout::entry_word(&mut self.fb, p, 0, slow);
-                        layout::word_probe(&mut self.fb, bits, pr.shape, pr.slot, pr.word, slow);
-                        true
-                    }
-                    None => false,
-                }
-            }
+            Some(pr) => self.probe_inline(pr, slow),
             None => false,
         };
         if inline {

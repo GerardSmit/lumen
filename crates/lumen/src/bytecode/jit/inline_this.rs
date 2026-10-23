@@ -39,6 +39,10 @@ pub(super) struct ThisBody {
     writes: bool,
     /// The number of ops up to and including the first return.
     len: usize,
+    /// The `Math` calls of the body (`LoadName GetMethod <args> CallWithThis`): the site's
+    /// plan guards each lookup in the method's own scope (`Plan::dmath`), and only a `fresh`
+    /// body keeps them.
+    pub maths: Vec<inline::MathUse>,
     /// The receiver was validated by the site's `GetMethod` with nothing run since (only
     /// loads between it and the call): its shape needs no re-check.
     pub fresh: bool,
@@ -93,6 +97,9 @@ pub(super) fn this_body(
     // Per stack position: holds the receiver (`LoadThis`), which only a private access or a
     // `Pop` may consume.
     let mut this_at: Vec<bool> = Vec::new();
+    // Open `Math` calls: (the `LoadName` pc, the depth below its arguments, the function).
+    let mut pend: Vec<(usize, usize, helpers::MathFn)> = Vec::new();
+    let mut maths: Vec<inline::MathUse> = Vec::new();
     for (pc, op) in chunk.ops.iter().enumerate() {
         let top_this = this_at.last() == Some(&true);
         let (pops, pushes) = match *op {
@@ -148,25 +155,40 @@ pub(super) fn this_body(
             Op::Undef => (0, 1),
             Op::Dup => (1, 2),
             Op::Neg | Op::Plus => (1, 1),
+            Op::LoadName(..) => {
+                pend.push((pc, depth, inline::math_load(chunk, pc)?));
+                (0, 0)
+            }
+            Op::GetMethod(..) if pend.last().is_some_and(|p| p.0 + 1 == pc) => (0, 0),
+            Op::CallWithThis(n) => {
+                let (load, base, f) = pend.pop()?;
+                if n as usize != f.arity() || depth != base + n as usize {
+                    return None;
+                }
+                maths.push(inline::MathUse { load, call: pc, f });
+                (n as usize, 1)
+            }
             Op::Return => {
-                return (depth == 1).then_some(ThisBody {
+                return (depth == 1 && pend.is_empty()).then_some(ThisBody {
                     chunk: std::rc::Rc::downgrade(chunk),
                     shape,
                     slots,
                     max_slot,
                     writes,
                     len: pc + 1,
+                    maths,
                     fresh: false,
                 })
             }
             Op::ReturnUndef => {
-                return (depth == 0).then_some(ThisBody {
+                return (depth == 0 && pend.is_empty()).then_some(ThisBody {
                     chunk: std::rc::Rc::downgrade(chunk),
                     shape,
                     slots,
                     max_slot,
                     writes,
                     len: pc + 1,
+                    maths,
                     fresh: false,
                 })
             }
@@ -174,6 +196,9 @@ pub(super) fn this_body(
             _ => return None,
         };
         depth = depth.checked_sub(pops)? + pushes;
+        if pend.last().is_some_and(|p| depth < p.1) {
+            return None;
+        }
         this_at.truncate(this_at.len().checked_sub(pops)?);
         this_at.resize(depth, false);
     }
@@ -255,6 +280,15 @@ fn dry(tb: &ThisBody, arg: &dyn Fn(usize) -> K) -> Option<K> {
             }
             Op::Pop => {
                 st.pop()?;
+            }
+            Op::LoadName(..) | Op::GetMethod(..) => {}
+            Op::CallWithThis(n) => {
+                for _ in 0..n {
+                    if !numeric(st.pop()?) {
+                        return None;
+                    }
+                }
+                st.push(K::Num);
             }
             Op::Neg | Op::Plus => {
                 if !numeric(st.pop()?) {
@@ -359,6 +393,22 @@ impl Tr<'_, '_> {
                 Op::Dup => st.push(*st.last().expect("dry run")),
                 Op::Pop => {
                     st.pop();
+                }
+                Op::LoadName(..) | Op::GetMethod(..) => {}
+                Op::CallWithThis(n) => {
+                    let m = tb
+                        .maths
+                        .iter()
+                        .find(|m| m.call == q)
+                        .expect("validated Math call");
+                    let at = st.len() - n as usize;
+                    let args: Vec<Av> = st.drain(at..).collect();
+                    let xs: Vec<V> = args
+                        .into_iter()
+                        .map(|a| self.this_num(a, entries, ab, full))
+                        .collect();
+                    let r = self.math_f64(m.f, &xs);
+                    st.push(Av::Num(r));
                 }
                 Op::Neg => {
                     let v = st.pop().expect("dry run");
@@ -524,6 +574,9 @@ impl Tr<'_, '_> {
         if ret == K::Mem && !want {
             return false;
         }
+        if !tb.maths.is_empty() && !self.plan.dmath.contains_key(&pc) {
+            return false;
+        }
 
         let full = self.fb.create_block();
         let done = self.fb.create_block();
@@ -532,6 +585,7 @@ impl Tr<'_, '_> {
             Entry::Ref(p, _) => p,
             _ => self.sptr(base),
         };
+        self.body_math_guard(pc, full);
         let eb = if tb.fresh {
             layout::probed_entries(&mut self.fb, this_p, tb.max_slot, tb.writes, full)
         } else {
@@ -751,7 +805,7 @@ fn accessor_site(i: &Interp, recv: &Value, name: &str, set: bool) -> Option<(Get
                     return None;
                 }
                 let body = this_body(&ic.chunk, recv, shapes[0], &private_keys(i, &g))?;
-                if body.writes && !set {
+                if !body.maths.is_empty() || body.writes && !set {
                     return None;
                 }
                 return Some((

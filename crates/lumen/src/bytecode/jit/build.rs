@@ -1128,6 +1128,9 @@ struct Plan {
     dmethod: HashMap<usize, usize>,
     /// Direct method sites whose body is inlined (see [`inline_this`]), by call pc.
     dthis: HashMap<usize, inline_this::ThisBody>,
+    /// The guards of the `Math` calls inside an inlined method body, by call pc (in the order
+    /// of the body's `ThisBody::maths`).
+    dmath: HashMap<usize, Vec<IntrProbe>>,
     /// Direct sites whose callee only forwards its argument to a `String` static function (see
     /// [`inline_fwd`]), by call pc: the function and the address of the callee environment the
     /// forwarded read was planned under.
@@ -1463,12 +1466,15 @@ fn plan(
             let (ichunk, shape) = inline::candidate(interp, &callee, &args)?;
             let Value::Obj(o) = &callee else { return None };
             let expect = crate::value::Gc::as_ptr(o) as usize;
+            let env_addr = callee_env_addr(&callee).map_or(0, |e| e.0);
+            let probes = inline::math_probes(interp, &ichunk, env_addr, &shape.maths, p)?;
             p.pins.push(callee);
             p.inl.push(inline::InlSite {
                 chunk: ichunk,
                 shape,
                 argc: args.len(),
                 expect,
+                probes,
             });
             return Some(Site {
                 f: Intr::Inline(p.inl.len() - 1),
@@ -1530,12 +1536,15 @@ fn plan(
                 .add(VALUE_PAYLOAD as usize)
                 .cast::<u64>()
         } as usize;
+        let env_addr = callee_env_addr(callee).map_or(0, |e| e.0);
+        let probes = inline::math_probes(interp, &ichunk, env_addr, &shape.maths, p)?;
         p.pins.push(callee.clone());
         p.inl.push(inline::InlSite {
             chunk: ichunk,
             shape,
             argc: args.len(),
             expect,
+            probes,
         });
         Some(Site {
             f: Intr::Inline(p.inl.len() - 1),
@@ -3486,9 +3495,17 @@ impl<'a, 'f> Tr<'a, 'f> {
             .strm
             .keys()
             .chain(self.plan.dfwd.keys())
+            .chain(self.plan.dmath.keys())
             .copied()
+            .chain(self.plan.math.iter().filter_map(|(&pc, s)| match s.f {
+                Intr::Inline(k) if s.slot.is_some() && !self.plan.inl[k].probes.is_empty() => {
+                    Some(pc)
+                }
+                _ => None,
+            }))
             .collect();
         strs.sort_unstable();
+        strs.dedup();
         for pc in strs {
             let v = self.fb.declare_var(Type::I32);
             let zero = self.i32c(0);
@@ -6267,7 +6284,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             (
                 inl.expect,
                 std::rc::Rc::as_ptr(&inl.chunk) as usize,
-                !inl.shape.caps.is_empty(),
+                !inl.shape.caps.is_empty() || !inl.probes.is_empty(),
             )
         };
         let off = s as i32 * VALUE_SIZE;
@@ -6292,6 +6309,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(cont);
             self.fb.switch_to_block(cont);
             self.inl_caps_check(pc);
+            self.inl_probes_check(pc);
             let d = self.stack.len();
             self.set_stack_tag(d, TAG_UNDEFINED);
             self.stack.push(Entry::Boxed);
@@ -6366,6 +6384,73 @@ impl<'a, 'f> Tr<'a, 'f> {
                 .is_some_and(|s| !s.lfc && s.slot.is_none())
     }
 
+    /// `g` (the identity guard of the inlined callee at site `pc`, I32) and the inline checks of
+    /// the `Math` lookups its body makes (`InlSite::probes`): a miss retires the site.
+    fn inl_probes_guard(&mut self, pc: usize, k: usize, g: V) -> V {
+        let probes = self.plan.inl[k].probes.clone();
+        if probes.is_empty() {
+            return g;
+        }
+        let join = self.fb.create_block();
+        let res = self.fb.append_block_param(join, Type::I32);
+        let check = self.fb.create_block();
+        let miss = self.fb.create_block();
+        let zero = self.i32c(0);
+        let held = self.fb.icmp(IntCC::Ne, g, zero);
+        self.fb.brif(held, check, &[], join, &[zero]);
+        self.fb.seal_block(check);
+        self.fb.switch_to_block(check);
+        for pr in &probes {
+            self.probe_to(pr, miss);
+        }
+        let one = self.i32c(1);
+        self.fb.jump(join, &[one]);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        let pcv = self.i32c(pc as i64);
+        self.call(Helper::SiteFailed, &[self.frame, pcv]);
+        let zero = self.i32c(0);
+        self.fb.jump(join, &[zero]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        res
+    }
+
+    /// The `Math` lookups of the inlined callee at local-callee site `pc` still read the
+    /// intrinsics (checked when JS may have run since the last check): a miss retires the site
+    /// and exits before it.
+    fn inl_probes_check(&mut self, pc: usize) {
+        let Some(Intr::Inline(k)) = self.plan.math.get(&pc).map(|s| s.f) else {
+            return;
+        };
+        let probes = self.plan.inl[k].probes.clone();
+        let Some(var) = self.math_vars.get(&pc).copied().filter(|_| !probes.is_empty()) else {
+            return;
+        };
+        let known = self.fb.use_var(var);
+        let zero = self.i32c(0);
+        let unknown = self.fb.icmp(IntCC::Eq, known, zero);
+        let check = self.fb.create_block();
+        let miss = self.fb.create_block();
+        let cont = self.fb.create_block();
+        self.fb.brif(unknown, check, &[], cont, &[]);
+        self.fb.seal_block(check);
+        self.fb.switch_to_block(check);
+        for pr in &probes {
+            self.probe_to(pr, miss);
+        }
+        let one = self.i32c(1);
+        self.fb.def_var(var, one);
+        self.fb.jump(cont, &[]);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        let pcv = self.i32c(pc as i64);
+        self.call(Helper::SiteFailed, &[self.frame, pcv]);
+        self.exit_now(pc);
+        self.fb.seal_block(cont);
+        self.fb.switch_to_block(cont);
+    }
+
     /// The guard of the inline call site starting at `pc` (I32, nonzero = still valid).
     fn site_guard(&mut self, pc: usize) -> V {
         let pcv = self.i32c(pc as i64);
@@ -6376,7 +6461,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             Some(Intr::Inline(k)) => {
                 let e = self.ptrc(self.plan.inl[k].expect as i64);
-                self.call_status(Helper::FastGuard, &[self.frame, pcv, e])
+                let g = self.call_status(Helper::FastGuard, &[self.frame, pcv, e]);
+                self.inl_probes_guard(pc, k, g)
             }
             _ => {
                 let probe = self.plan.intr.get(&pc).cloned();
@@ -6537,20 +6623,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.stack.push(Entry::Bool(has_p));
     }
 
-    /// The `CallWithThis` of an inline `Math.f(..)` site: the Number arguments (the planner
-    /// admitted only ops producing unboxed Numbers) replace the placeholders with the result.
-    fn math_call(&mut self, pc: usize, f: MathFn) -> Result<(), String> {
-        let d = self.stack.len();
-        let argc = f.arity();
-        let mut args = Vec::with_capacity(argc);
-        for e in &self.stack[d - argc..] {
-            match *e {
-                Entry::Num(x) => args.push(x),
-                other => return Err(format!("Math argument {other:?} at {pc} is not a Number")),
-            }
-        }
+    /// `Math.<f>(args)` on Numbers (the intrinsic's value, bit-identical to the builtin's).
+    pub(super) fn math_f64(&mut self, f: MathFn, args: &[V]) -> V {
         let x = args[0];
-        let r = match f {
+        match f {
             MathFn::Sqrt => self.fb.unary(UnaryOp::Sqrt, x),
             MathFn::Abs => self.fb.unary(UnaryOp::Fabs, x),
             MathFn::Floor => self.fb.unary(UnaryOp::Floor, x),
@@ -6581,7 +6657,22 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let m = self.fb.binary(BinaryOp::Imul, a, b);
                 self.fb.convert(ConvOp::FromSint, Type::F64, m)
             }
-        };
+        }
+    }
+
+    /// The `CallWithThis` of an inline `Math.f(..)` site: the Number arguments (the planner
+    /// admitted only ops producing unboxed Numbers) replace the placeholders with the result.
+    fn math_call(&mut self, pc: usize, f: MathFn) -> Result<(), String> {
+        let d = self.stack.len();
+        let argc = f.arity();
+        let mut args = Vec::with_capacity(argc);
+        for e in &self.stack[d - argc..] {
+            match *e {
+                Entry::Num(x) => args.push(x),
+                other => return Err(format!("Math argument {other:?} at {pc} is not a Number")),
+            }
+        }
+        let r = self.math_f64(f, &args);
         // Receiver and callee are placeholders (trivially droppable, never materialized).
         self.stack.truncate(d - argc - 2);
         self.stack.push(Entry::Num(r));

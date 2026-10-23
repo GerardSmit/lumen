@@ -9,6 +9,12 @@
 //! interpreter frame ever needs to exist for it (no deopt state to materialize). Anything else
 //! (calls, property access, `this`, `arguments`, loops, other types) keeps the ordinary call.
 //!
+//! A body may also call `Math` intrinsics (`Math.floor(x)`, `Math.max(a, b)`) on Number
+//! operands. Each call's `Math.<f>` lookup resolves in the callee's own closure scope, so the
+//! planner records an [`IntrProbe`] per call (see [`math_probes`]) that the site's guard checks
+//! together with the callee's identity: a miss retires the site and the interpreter makes the
+//! call.
+//!
 //! The body may also read captured variables (`LoadName`) that resolve in the callee's own
 //! closure scope — fixed once the identity guard holds. The planner records each binding's
 //! address and the scope's generation; the site re-checks the generation, the binding's TDZ
@@ -38,6 +44,56 @@ pub(super) struct Shape {
     pub caps: Vec<Cap>,
     pub scope: usize,
     pub gen: u32,
+    /// The `Math` intrinsic calls of the body.
+    pub maths: Vec<MathUse>,
+}
+
+/// A `Math.<f>(<Number args>)` call of an inlined body: `LoadName` (at `load`) `GetMethod`
+/// <arguments> `CallWithThis` (at `call`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MathUse {
+    pub load: usize,
+    pub call: usize,
+    pub f: MathFn,
+}
+
+/// The `Math` function the `LoadName` at `pc` starts a call of (`LoadName GetMethod(<name>)`).
+pub(super) fn math_load(chunk: &Chunk, pc: usize) -> Option<MathFn> {
+    let (Op::LoadName(..), Op::GetMethod(m, _)) = (*chunk.ops.get(pc)?, *chunk.ops.get(pc + 1)?)
+    else {
+        return None;
+    };
+    helpers::math_intrinsic(chunk.names.get(m as usize)?)
+}
+
+/// The probes guarding `uses` (the `Math` calls of `chunk`'s body), resolved in the scope of the
+/// closure environment at `env_addr` (a live callee's, pinned by the plan). `None` when one does
+/// not currently read the intrinsic.
+pub(super) fn math_probes(
+    i: &Interp,
+    chunk: &std::rc::Rc<Chunk>,
+    env_addr: usize,
+    uses: &[MathUse],
+    p: &mut Plan,
+) -> Option<Vec<IntrProbe>> {
+    if uses.is_empty() {
+        return Some(Vec::new());
+    }
+    if env_addr == 0 {
+        return None;
+    }
+    // SAFETY: `env_addr` is a live callee's closure environment.
+    let env = unsafe { &*(env_addr as *const crate::interpreter::Env) };
+    uses.iter()
+        .map(|m| {
+            let Op::LoadName(_, c) = chunk.ops[m.load] else {
+                return None;
+            };
+            let mut probe = intr_resolve(i, chunk, env, m.load, c, p)?;
+            probe.wrapper = Some((chunk.clone(), env_addr));
+            Some(probe)
+        })
+        .collect()
 }
 
 /// A captured variable an inlined body reads: name `n`'s binding (its address) and the kind
@@ -57,6 +113,8 @@ pub(super) struct InlSite {
     pub argc: usize,
     /// The callee's object address (guarded by [`Helper::FastGuard`]).
     pub expect: usize,
+    /// The guards of the body's `Math` calls (see [`math_probes`]).
+    pub probes: Vec<IntrProbe>,
 }
 
 pub(super) fn arith_of(op: &Op) -> Option<ArithKind> {
@@ -201,6 +259,10 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
     let mut reach = vec![false; n];
     let mut ret: Option<Option<bool>> = None;
     let mut caps: Vec<Cap> = Vec::new();
+    let mut maths: Vec<MathUse> = Vec::new();
+    // Open `Math` calls: (the `LoadName` pc, the operand-stack depth below its arguments, the
+    // function). The window up to the call is straight-line.
+    let mut pend: Vec<(usize, usize, MathFn)> = Vec::new();
     let mut targets = vec![false; n + 1];
     for op in ops {
         if let Op::Jump(t)
@@ -241,6 +303,9 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
         };
         reach[pc] = true;
         let op = ops[pc];
+        if !pend.is_empty() && targets[pc] {
+            return None;
+        }
         let slot = |s: u16| -> Option<usize> { ((s as usize) < ns).then_some(s as usize) };
         let mut falls = true;
         let mut jump: Option<usize> = None;
@@ -262,6 +327,22 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
         } else {
             match op {
                 Op::Const(k) => st.push(const_kind(chunk, k)?),
+                Op::LoadName(..) if math_load(chunk, pc).is_some() => {
+                    pend.push((pc, st.len(), math_load(chunk, pc)?));
+                }
+                Op::GetMethod(..) if pend.last().is_some_and(|p| p.0 + 1 == pc) => {}
+                Op::CallWithThis(argc) => {
+                    let (load, base, f) = pend.pop()?;
+                    if argc as usize != f.arity()
+                        || st.len() != base + argc as usize
+                        || !st[base..].iter().all(|&k| k)
+                    {
+                        return None;
+                    }
+                    st.truncate(base);
+                    st.push(true);
+                    maths.push(MathUse { load, call: pc, f });
+                }
                 Op::LoadName(n, _) => match caps.iter().find(|c| c.n == n) {
                     Some(c) => st.push(c.num),
                     None => {
@@ -399,6 +480,10 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
                 _ => return None,
             }
         }
+        if pend.last().is_some_and(|p| st.len() < p.1) || (!falls || jump.is_some()) && !pend.is_empty()
+        {
+            return None;
+        }
         if let Some(t) = jump {
             // Forward branches only (no loops).
             if t <= pc || t >= n {
@@ -414,6 +499,9 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
             merge(&mut inc, pc + 1, &d, &st)?;
         }
     }
+    if !pend.is_empty() {
+        return None;
+    }
     // A leader's stack kinds are the merged ones (checked equal on every edge).
     let gen = if caps.is_empty() {
         0
@@ -428,6 +516,7 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
         caps,
         scope: std::rc::Rc::as_ptr(env) as usize,
         gen,
+        maths,
     })
 }
 
@@ -553,6 +642,19 @@ impl Tr<'_, '_> {
                     let s = virt_elem(chunk, pc, tag, site.argc).expect("shaped element");
                     let v = self.fb.use_var(vars[s].expect("shaped slot"));
                     st.push((v, sh.locals[s] == Some(true)));
+                }
+                Op::LoadName(..) if sh.maths.iter().any(|m| m.load == pc) => {}
+                Op::GetMethod(..) => {}
+                Op::CallWithThis(_) => {
+                    let m = sh
+                        .maths
+                        .iter()
+                        .find(|m| m.call == pc)
+                        .ok_or_else(|| format!("inline call at {pc}"))?;
+                    let at = st.len() - m.f.arity();
+                    let xs: Vec<V> = st.drain(at..).map(|e| e.0).collect();
+                    let r = self.math_f64(m.f, &xs);
+                    st.push((r, true));
                 }
                 Op::LoadName(n, _) => {
                     let c = sh.caps.iter().find(|c| c.n == n).expect("shaped capture");
