@@ -782,6 +782,8 @@ mod str_static_tests;
 mod switch_tests;
 #[cfg(test)]
 mod ta_key_tests;
+#[cfg(test)]
+mod ta_store_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside

@@ -3374,9 +3374,11 @@ unsafe extern "C" fn atomic_release(f: *mut JitFrame) {
 
 pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     let code = ta_view_code(f, v, write & 1);
-    // An uncached site (`write` bit 1, its pc above): count the fresh views it takes.
-    if code != 0 && write & 2 != 0 {
-        let key = ((*f).chunk as usize, write >> 2);
+    // An uncached site (`write` bit 1) or a cached one not yet profiled (bit 2), its pc above
+    // bit 2: count the fresh views it takes; a profiled one is hot at its first.
+    if code != 0 && write & 6 != 0 {
+        let profile = write & 4 != 0;
+        let key = ((*f).chunk as usize, write >> 3);
         TA_SITE_KINDS.with(|m| {
             let mut m = m.borrow_mut();
             if m.len() >= 1 << 16 && !m.contains_key(&key) {
@@ -3395,6 +3397,9 @@ pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write
             let n = m.entry(key).or_insert(0);
             if *n == u32::MAX {
                 return false;
+            }
+            if profile {
+                *n = TA_HOT_VIEWS - 1;
             }
             *n += 1;
             if *n < TA_HOT_VIEWS {

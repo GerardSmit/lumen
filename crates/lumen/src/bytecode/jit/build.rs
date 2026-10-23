@@ -279,6 +279,12 @@ fn ta_slot_info(
                 }
             }
         }
+        for (s, k) in new_ta_slots(chunk).into_iter().enumerate().take(n) {
+            if k != 0 && !is_ta[s] {
+                is_ta[s] = true;
+                kinds[s] = k;
+            }
+        }
         return (kinds, is_ta);
     }
     if is_ta.iter().any(|&b| b) {
@@ -315,6 +321,71 @@ fn ta_slot_info(
         chunk.jit.fb_put(0, TaSeen(seen));
     }
     (kinds, is_ta)
+}
+
+/// The element kind code of the typed array each local of `chunk` is set to by `new Int8Array(..)`
+/// and the like (0 when it is set by anything else, or to different kinds): a hint for the
+/// whole-function compile, which sees no locals; the element sites guard the kind.
+fn new_ta_slots(chunk: &Chunk) -> Vec<u32> {
+    use helpers::ta_code as tc;
+    const UNSET: u32 = u32::MAX;
+    let mut out = vec![UNSET; chunk.n_slots];
+    for (pc, op) in chunk.ops.iter().enumerate() {
+        let Op::StoreLocal(s) = *op else { continue };
+        let Some(slot) = out.get_mut(s as usize) else {
+            continue;
+        };
+        let code = (|| {
+            let Op::New(argc) = *chunk.ops.get(pc.checked_sub(1)?)? else {
+                return None;
+            };
+            let mut need = argc as usize + 1;
+            let mut q = pc - 1;
+            let mut steps = 0;
+            let callee = loop {
+                steps += 1;
+                q = q.checked_sub(1)?;
+                if steps > 24 {
+                    return None;
+                }
+                let (pops, pushes) = chunk.jit_stack_effect(q)?;
+                if pushes > need {
+                    return None;
+                }
+                if pushes == need {
+                    break q;
+                }
+                need = need - pushes + pops;
+            };
+            let Op::LoadName(n, _) = chunk.ops[callee] else {
+                return None;
+            };
+            Some(match &**chunk.names.get(n as usize)? {
+                "Int8Array" => tc::I8,
+                "Uint8Array" => tc::U8,
+                "Uint8ClampedArray" => tc::U8C,
+                "Int16Array" => tc::I16,
+                "Uint16Array" => tc::U16,
+                "Int32Array" => tc::I32,
+                "Uint32Array" => tc::U32,
+                "Float32Array" => tc::F32,
+                "Float64Array" => tc::F64,
+                _ => return None,
+            })
+        })()
+        .unwrap_or(0);
+        *slot = match *slot {
+            UNSET => code,
+            k if k == code => k,
+            _ => 0,
+        };
+    }
+    for (s, k) in out.iter_mut().enumerate() {
+        if *k == UNSET || s < chunk.n_params {
+            *k = 0;
+        }
+    }
+    out
 }
 
 /// The slots that held typed arrays (with their [`helpers::ta_code`]) in any loop compile of a
@@ -9749,16 +9820,20 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.mark_cold();
         }
         // An uncached site passes its pc: fed typed arrays often, it asks for a recompile
-        // with a cache (exiting before the op).
+        // with a cache (exiting before the op). So does a cached one whose element kind is
+        // unknown and that is not yet compiled typed-array first: its first view records the
+        // kind, and the recompile goes typed-array first.
+        let profile = cache.is_none() || (want == 0 && !helpers::ta_hot(self.chunk, pc));
         let flags = match cache {
-            Some(_) => store.is_some() as i64,
-            None => store.is_some() as i64 | 2 | (pc as i64) << 2,
+            Some(_) if !profile => store.is_some() as i64,
+            Some(_) => store.is_some() as i64 | 4 | (pc as i64) << 3,
+            None => store.is_some() as i64 | 2 | (pc as i64) << 3,
         };
         let w = self.i32c(flags);
         let k = self
             .call(Helper::TaView, &[self.frame, obj, w])
             .expect("TaView returns a kind");
-        if cache.is_none() {
+        if profile {
             let rc = self.i32c(tc::RECOMPILE as i64);
             let hot = self.fb.icmp(IntCC::Eq, k, rc);
             let ex = self.fb.create_block();
