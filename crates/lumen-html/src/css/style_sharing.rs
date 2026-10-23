@@ -178,7 +178,7 @@ impl ShareClasses {
         }
         let class = self.compute(document, keys, node, depth);
         if self.nodes.len() <= node.index() {
-            self.nodes.resize(document.node_count().max(node.index() + 1), (0, 0));
+            super::grow_exact(&mut self.nodes, document.node_count().max(node.index() + 1), || (0, 0));
         }
         self.nodes[node.index()] = (node.generation, class);
         class

@@ -27751,6 +27751,14 @@ impl StyleCache {
     }
 }
 
+/// Per-node side tables are sized to the arena once; amortized doubling would leave up to half unused.
+pub(crate) fn grow_exact<T>(table: &mut Vec<T>, len: usize, fill: impl FnMut() -> T) {
+    if table.len() < len {
+        table.reserve_exact(len - table.len());
+        table.resize_with(len, fill);
+    }
+}
+
 impl StyleCache {
     /// Selected snapshots reuse the normal cache algorithms with a bounded
     /// sorted key set, rather than allocate vectors up to the arena node count.
@@ -27789,7 +27797,7 @@ impl StyleCache {
     fn store_pseudo(&mut self,document:&Document,origin:NodeId,pseudo:PseudoElement,token:u32,box_parent:BoxParentContext,generated:&Option<GeneratedStyle>) {
         if self.selected.is_some(){return;}
         let slot=origin.index();
-        if self.pseudos.len()<=slot {self.pseudos.resize_with(document.node_count().max(slot+1),Vec::new);}
+        if self.pseudos.len()<=slot {grow_exact(&mut self.pseudos,document.node_count().max(slot+1),Vec::new);}
         let entries=&mut self.pseudos[slot];
         entries.retain(|entry|entry.origin==origin);
         // Like node entries, keep the variant computed for the other origin
@@ -27805,7 +27813,7 @@ impl StyleCache {
     }
     fn store_bloom(&mut self,document:&Document,node:NodeId,bloom:AncestorBloom) {
         if let Some(selected)=self.selected.as_mut(){if let Ok(index)=selected.entries.binary_search_by_key(&node.key(),|entry|entry.node.key()){selected.entries[index].bloom=bloom;}}
-        else{if self.blooms.len()<=node.index(){self.blooms.resize(document.node_count().max(node.index()+1),(0,AncestorBloom::EMPTY));}self.blooms[node.index()]=(node.generation,bloom);}
+        else{if self.blooms.len()<=node.index(){grow_exact(&mut self.blooms,document.node_count().max(node.index()+1),||(0,AncestorBloom::EMPTY));}self.blooms[node.index()]=(node.generation,bloom);}
     }
     /// A hit in `previous_nodes` swaps it with the current entry, so the
     /// entry `node_entry` reports is the one last asked for, as after a
@@ -28193,15 +28201,14 @@ impl StyleCache {
         }
         let slot = node.index();
         if self.nodes.len() <= slot {
-            self.nodes
-                .resize_with(document.node_count().max(slot + 1), || None);
+            grow_exact(&mut self.nodes, document.node_count().max(slot + 1), || None);
         }
         let previous = self.nodes[slot].replace((node, token, box_parent, style.clone()));
         if let Some(previous) = previous.filter(|(cached, cached_token, cached_box_parent, _)| {
             *cached == node && (*cached_box_parent != box_parent || !self.same_parent(*cached_token, token))
         }) {
             if self.previous_nodes.len() <= slot {
-                self.previous_nodes.resize_with(self.nodes.len(), || None);
+                let len = self.nodes.len(); grow_exact(&mut self.previous_nodes, len, || None);
             }
             self.previous_nodes[slot] = Some(previous);
         }

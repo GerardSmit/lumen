@@ -86,8 +86,13 @@ struct ImageRequest {
     parameters:lumen_html::layout::ImageRequestParameters,
 }
 
+thread_local! {
+    static EMPTY_SOURCE:Arc<str>=Arc::from("");
+    static EMPTY_BASE:Rc<str>=Rc::from("");
+}
+
 impl Default for ImageRequest {
-    fn default()->Self {Self{current_src:Arc::from(""),generation:0,state:RequestState::Unavailable,image:None,intrinsic:None,density:1.0,force_error:false,event_queued:false,origin_clean:false,response_policy:None,parameters:lumen_html::layout::ImageRequestParameters::html_image(None)}}
+    fn default()->Self {Self{current_src:EMPTY_SOURCE.with(Arc::clone),generation:0,state:RequestState::Unavailable,image:None,intrinsic:None,density:1.0,force_error:false,event_queued:false,origin_clean:false,response_policy:None,parameters:lumen_html::layout::ImageRequestParameters::html_image(None)}}
 }
 impl ImageRequest {
     fn loading(current_src: Arc<str>, generation: u64, force_error: bool) -> Self {
@@ -107,7 +112,6 @@ impl ImageRequest {
     }
 }
 
-#[derive(Default)]
 struct Request {
     // The outer option records whether DOM attributes have been observed yet;
     // its inner option distinguishes an omitted src from src="".
@@ -132,6 +136,14 @@ struct Request {
     ready_event: Option<ImageEventKind>,
     published_image: Option<NodeBitmap>,
     published_metadata:Option<lumen_html::responsive_images::ImageMetadata>,
+}
+
+impl Default for Request {
+    fn default()->Self {
+        Self{selected_source:None,selected_crossorigin:None,selected_density:None,observed_version:None,environment_dirty:false,
+            auto_width:None,selection_dirty:false,selection_generation:0,base:EMPTY_BASE.with(Rc::clone),current:ImageRequest::default(),
+            pending:None,input_represents_current:None,input_loading:0,ready_event:None,published_image:None,published_metadata:None}
+    }
 }
 
 #[derive(Default)]
@@ -565,7 +577,7 @@ impl ImageLoader {
         };
 
         let current_src: Arc<str> = if source.is_empty() {
-            Arc::from("")
+            EMPTY_SOURCE.with(Arc::clone)
         } else {
             Arc::from(resolved_url(&source, base))
         };
@@ -1377,5 +1389,38 @@ mod responsive_request_tests {
         assert_eq!(bases.len(),2);
         assert!(Rc::ptr_eq(&bases[0],&bases[1]),"requests share one base allocation");
         assert_eq!(&*bases[0],base);
+    }
+
+    #[test]
+    fn default_requests_share_empty_source_and_base() {
+        let (first,second)=(Request::default(),Request::default());
+        assert!(Arc::ptr_eq(&first.current.current_src,&second.current.current_src));
+        assert!(Rc::ptr_eq(&first.base,&second.base));
+    }
+
+    #[test]
+    fn settled_request_releases_load_state_and_reloads_on_source_reset() {
+        let document=lumen_html::html::parse("<img src='blob:a'>",16).unwrap();
+        let loader=ImageLoader::default();let base="https://images.test/page.html";
+        let scheme=lumen_html::css::UsedColorScheme::Light;
+        let node=lumen_html::selector::query_selector(&document,document.root(),"img").unwrap().unwrap();
+        loader.snapshot(&document,node,base,scheme);
+        assert!(!loader.snapshot(&document,node,base,scheme).complete);
+        loader.provide_blob_image("blob:a".to_string(),ImageState::Ready(Arc::new(lumen_html::paint::ImageData{width:2,height:2,pixels:vec![0,128,0,255].repeat(4)})));
+        let events=loader.queue_completions(&document,base);
+        assert_eq!(events.len(),1);assert_eq!(events[0].kind,ImageEventKind::Load);
+        let snapshot=loader.snapshot(&document,node,base,scheme);
+        assert!(snapshot.complete);assert_eq!(snapshot.current_src,"blob:a");assert_eq!((snapshot.natural_width,snapshot.natural_height),(2,2));
+        {
+            let requests=loader.requests.borrow();let request=&requests[&node];
+            assert!(request.pending.is_none());assert!(request.current.response_policy.is_none());
+        }
+        loader.note_source_change(&document,node);
+        let snapshot=loader.snapshot(&document,node,base,scheme);
+        assert!(snapshot.complete,"the available image stays usable while the source is re-applied");
+        let events=loader.queue_completions(&document,base);
+        assert_eq!(events.len(),1,"re-setting the source queues its own load event");
+        assert_eq!(events[0].kind,ImageEventKind::Load);
+        assert_eq!(loader.snapshot(&document,node,base,scheme).natural_width,2);
     }
 }

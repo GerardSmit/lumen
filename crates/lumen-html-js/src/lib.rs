@@ -344,6 +344,13 @@ impl DetachedRootReaper {
             || (!self.candidate_generations.is_empty() && self.observed_gc_epoch != gc_epoch)
     }
 
+    fn release_slack(&mut self) {
+        lumen_common::fasthash::shrink_sparse(&mut self.candidate_generations);
+        lumen_common::fasthash::shrink_sparse_set(&mut self.dirty_roots);
+        if self.candidates.capacity() > self.candidates.len().saturating_mul(4).max(1024) { self.candidates.shrink_to(self.candidates.len().saturating_mul(2)); }
+        if self.dirty.capacity() > self.dirty.len().saturating_mul(4).max(1024) { self.dirty.shrink_to(self.dirty.len().saturating_mul(2)); }
+    }
+
     fn compact_queues(&mut self) {
         let candidate_limit = self
             .candidate_generations
@@ -4543,10 +4550,16 @@ impl DomRealm {
             // These sparse adapter tables are keyed by generation-bearing
             // NodeIds. Pruning at a node-count debt threshold keeps stale state
             // bounded while amortizing the full-map retains over reclamation.
-            self.targets
-                .borrow_mut()
-                .retain(|id, target| document.kind(*id).is_ok() && target.strong_count() > 0);
-            self.initialized_content_handlers.borrow_mut().retain(|id,_|document.kind(*id).is_ok());
+            {
+                let mut targets = self.targets.borrow_mut();
+                targets.retain(|id, target| document.kind(*id).is_ok() && target.strong_count() > 0);
+                lumen_common::fasthash::shrink_sparse(&mut targets);
+            }
+            {
+                let mut handlers = self.initialized_content_handlers.borrow_mut();
+                handlers.retain(|id,_|document.kind(*id).is_ok());
+                lumen_common::fasthash::shrink_sparse(&mut handlers);
+            }
             self.stylesheet_links.reclaim_nodes(document);
             self.images.reclaim_nodes(document);
             self.canvases.reclaim_nodes(document);
@@ -4561,6 +4574,7 @@ impl DomRealm {
                 owner.strong_count() > 0 && document.foreign_template_links().iter().any(|(_, remote)| remote.document_id() == *id)
             });
             reaper.destroyed_since_sidecar_sweep = 0;
+            reaper.release_slack();
         }
 
         if stats.did_reap {

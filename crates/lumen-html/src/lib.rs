@@ -3790,6 +3790,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         }
         drop(last);
         drop(first);
+        identities.shrink_to_fit();
         self.journal = kept;
         self.replaced_identities = identities;
         let length = self.journal.len();
