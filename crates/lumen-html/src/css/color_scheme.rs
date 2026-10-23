@@ -114,7 +114,8 @@ pub fn system_color(name:&str,scheme:UsedColorScheme)->Option<Rgba> {
     let dark=scheme==UsedColorScheme::Dark;
     let (r,g,b)=match deprecated_system_color(name) {
         "canvas"|"field"=>if dark{(18,18,18)}else{(255,255,255)},
-        "canvastext"|"buttontext"|"fieldtext"|"highlighttext"|"selecteditemtext"|"buttonborder"|"marktext"=>if dark{(255,255,255)}else{(0,0,0)},
+        "canvastext"|"buttontext"|"fieldtext"|"highlighttext"|"selecteditemtext"|"marktext"=>if dark{(255,255,255)}else{(0,0,0)},
+        "buttonborder"=>if dark{(133,133,133)}else{(118,118,118)},
         "linktext"=>if dark{(158,158,255)}else{(0,0,238)},
         "visitedtext"=>if dark{(208,173,240)}else{(85,26,139)},
         "activetext"=>(255,0,0),

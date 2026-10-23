@@ -528,6 +528,20 @@ fn is_inline_replaced(document: &lumen_html::Document, node: NodeId) -> bool {
     }
 }
 
+/// The larger of `documentElement.scrollHeight` and `body.scrollHeight` of the
+/// last completed layout, rounded as the CSSOM getters round.
+pub fn document_scroll_height(session: &mut RenderSession) -> Option<f32> {
+    let element = selector::document_element(session.document())?;
+    let body = scrolling::html_body(session.document());
+    let mut height = snapshot(session, element)?.scroll_height;
+    if let Some(body) = body {
+        if let Some(body_snapshot) = snapshot(session, body) {
+            height = height.max(body_snapshot.scroll_height);
+        }
+    }
+    Some(height)
+}
+
 /// Read layout geometry without forcing a layout pass. A missing snapshot means
 /// the renderer has not completed layout for the current document version.
 pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySnapshot> {

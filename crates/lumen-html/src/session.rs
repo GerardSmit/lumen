@@ -230,6 +230,7 @@ impl NodeImages<'_> {
         match lookup {
             Lookup::Source(source) => Some(images.resolve(source)),
             Lookup::From(base, source) => Some(images.resolve_from(base, source)),
+            Lookup::Poster(base, source) => Some(images.resolve_poster_from(base, source)),
             Lookup::NodeFrom(node, base, source) => images.resolve_node_from(*node, base, source),
             Lookup::Request(node, base, source, parameters) => Some(images.resolve_image_request(*node, base, source, *parameters)),
             Lookup::Node(node) => match self.bitmaps.binary_search_by_key(&node.key(), |(id, _, _)| id.key()) {
@@ -299,6 +300,11 @@ impl ImageResolver for NodeImages<'_> {
         self.note(self.fallback.map_or(layout::ImageState::Failed, |images| {
             images.resolve_from(base, source).materialize()
         }), || layout::PendingLookup::From(base.into(), source.into()))
+    }
+    fn resolve_poster_from(&self, base: &str, source: &str) -> layout::ImageState {
+        self.note(self.fallback.map_or(layout::ImageState::Failed, |images| {
+            images.resolve_poster_from(base, source).materialize()
+        }), || layout::PendingLookup::Poster(base.into(), source.into()))
     }
     fn origin_clean_from(&self, base: &str, source: &str) -> bool {
         self.fallback
@@ -390,6 +396,9 @@ impl ImageResolver for SnapshotImages<'_> {
     }
     fn resolve_from(&self,base:&str,source:&str)->layout::ImageState {
         self.filtered(self.0.resolve_from(base,source), self.0.origin_clean_from(base,source))
+    }
+    fn resolve_poster_from(&self,base:&str,source:&str)->layout::ImageState {
+        self.filtered(self.0.resolve_poster_from(base,source), self.0.origin_clean_from(base,source))
     }
     fn resolve_node_from(&self,node:NodeId,base:&str,source:&str)->Option<layout::ImageState> {
         self.0.resolve_node_from(node,base,source).map(|state|self.filtered(state,self.0.node_origin_clean(node,base,source)))
@@ -824,6 +833,9 @@ pub struct RenderSession {
     /// `layout::ROOT_SCROLL_WINDOW_SCREENS`. `None` lays out the viewport only.
     scroll_window: Option<f32>,
     scroll_window_enabled: bool,
+    /// Height of the area painted when it is taller than the viewport; layout
+    /// keeps the viewport size.
+    paint_height: Option<u32>,
     /// The last layout at the origin could not be moved into place. Layouts
     /// are made at the scroll offset directly until one of them could be moved.
     origin_refused: bool,
@@ -1373,6 +1385,7 @@ impl RenderSession {
             failed_frame: None,
             scroll_window: Some(layout::ROOT_SCROLL_WINDOW_SCREENS),
             scroll_window_enabled: true,
+            paint_height: None,
             origin_refused: false,
             window_reduced: None,
             rendered_text_requested: false,
@@ -2005,6 +2018,11 @@ impl RenderSession {
     }
 
     /// Set the host's effective document base for inline CSS URL references.
+    /// The base inline style URLs and `<video poster>` resolve against.
+    pub fn document_base_url(&self) -> Option<&str> {
+        self.document_base_url.as_deref()
+    }
+
     pub fn set_document_base_url(&mut self, base: Option<Arc<str>>) {
         if self.document_base_url == base {
             return;
@@ -5341,6 +5359,16 @@ impl RenderSession {
         }
     }
 
+    /// Paints `height` CSS pixels from the top of the document in the next
+    /// display lists, though layout keeps the viewport size (`vh`, media
+    /// queries and fixed boxes stay as they are). `None` paints the viewport.
+    pub fn set_paint_height(&mut self, height: Option<u32>) {
+        if self.paint_height != height {
+            self.paint_height = height;
+            self.invalidate_paint();
+        }
+    }
+
     /// The list produced by the most recent successful render, if still valid.
     pub fn cached_display_list(&self) -> Option<&DisplayList> {
         self.cached
@@ -6372,6 +6400,7 @@ impl RenderSession {
                         self.timeline_transform_values.as_deref(),
                         window,
                         !self.origin_refused,
+                        self.paint_height,
                     )
                 };
                 let full = self.scroll_window_enabled.then_some(layout::ROOT_SCROLL_WINDOW_SCREENS);
@@ -6620,6 +6649,7 @@ impl RenderSession {
             self.timeline_transform_values.as_deref(),
             self.scroll_window,
             origin,
+            self.paint_height,
         );
         drop(node_images);
         let Ok(mut full) = full else { return };

@@ -41,6 +41,34 @@ const MAX_GPUI_PRIMITIVE_BYTES: usize = 64 * 1024 * 1024;
 const ASSET_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PNG_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
+static STRICT_SVG_IMAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+std::thread_local! {
+    static DEGRADE_OVERSIZED_EFFECTS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `render` with over-budget effect layers degraded instead of failing
+/// with [`ImageError::TooLarge`]: a transformed group is dropped and a filter,
+/// opacity or clip layer draws its content without the effect. Callers use it
+/// as a last resort after smaller regions still did not fit.
+pub fn with_degraded_oversized_effects<T>(render: impl FnOnce() -> T) -> T {
+    let previous = DEGRADE_OVERSIZED_EFFECTS.with(|flag| flag.replace(true));
+    let result = render();
+    DEGRADE_OVERSIZED_EFFECTS.with(|flag| flag.set(previous));
+    result
+}
+
+fn degrade_oversized_effects() -> bool {
+    DEGRADE_OVERSIZED_EFFECTS.with(core::cell::Cell::get)
+}
+
+/// Whether an SVG image that uses a feature the renderer lacks fails to decode, so a
+/// conformance host never reports it as rendered, or is drawn without that feature, as a
+/// browser shows a page. Strict by default.
+pub fn set_strict_svg_images(strict: bool) {
+    STRICT_SVG_IMAGES.store(strict, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Interpolate two premultiplied-alpha sRGB colors using the same shared
 /// operation used by gradient replay.
 pub fn interpolate_color(
@@ -170,7 +198,8 @@ pub fn render_region_with_mode_cached(
     let keep = clip.expanded(margin);
     let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
     let resolved = gpui_snapped(list, scale, font, cache, full, Some(keep))?;
-    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, full)?;
+    // Layers only resolve what the drawn rows show, so a tall frame's layers stay in budget.
+    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, keep.intersection(full).unwrap_or(keep))?;
     let stride = width as usize * 4;
     for row in top as usize..bottom as usize {
         target.pixels[row * stride + left as usize * 4..row * stride + right as usize * 4].fill(0);
@@ -252,7 +281,8 @@ pub fn render_device_rect_with_mode_cached(
     let keep = clip.expanded(2.0 / scale);
     let full = Rect { x: 0.0, y: 0.0, width: width_css as f32, height: height_css as f32 };
     let resolved = gpui_snapped(list, scale, font, cache, full, Some(keep))?;
-    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, full)?;
+    // Layers only resolve what the drawn rows show, so a tall frame's layers stay in budget.
+    let replay = layers_resolved_for_replay(&resolved, scale, Some(font), cache, keep.intersection(full).unwrap_or(keep))?;
     let (band_width, band_height) = (right - left, bottom - top);
     let len = (band_width as usize)
         .checked_mul(band_height as usize)
@@ -1427,10 +1457,18 @@ impl ReplaySink for Raster<'_> {
                     lumen_html::paint::Affine::IDENTITY
                 }
             };
-            let gradient_transform = screen
-                .then(transform)
-                .then(unit_transform)
-                .then(gradient.transform);
+            // The surface applies the path transform to the shader again, so only the
+            // custom bitmap shader (equal radii), which samples in device space, needs
+            // the complete device matrix.
+            let local_transform = unit_transform.then(gradient.transform);
+            let gradient_transform = match gradient.kind {
+                lumen_html::paint::SvgGradientKind::Radial { start_radius, end_radius, .. }
+                    if start_radius == end_radius =>
+                {
+                    screen.then(transform).then(local_transform)
+                }
+                _ => local_transform,
+            };
             let gradient_transform = tiny_skia::Transform::from_row(
                 gradient_transform.a,
                 gradient_transform.b,
@@ -3327,15 +3365,27 @@ fn apply_layer_mask(image:&mut Rgba8Image,mask:&lumen_html::paint::LayerMask,sca
         if mask.offset!=[0.0;2] {
             for command in &mut commands {translate_command(command,mask.offset[0],mask.offset[1]);}
         }
-        let mut bytes=held;
-        let resolved=resolve_layers(&commands,scale,font,cache,&mut bytes)?;
-        let coverage=render_scaled_region_at(&resolved,image.width,image.height,scale,font,cache,[left as i64,top as i64],Some(bytes))?;
-        for(accumulated,sample)in union.iter_mut().zip(coverage.pixels.chunks_exact(4)) {
-            let weight=if layer.luminance {
-                let luminance=(2126*u32::from(sample[0])+7152*u32::from(sample[1])+722*u32::from(sample[2])+5000)/10000;
-                (luminance*u32::from(sample[3])+127)/255
-            }else{u32::from(sample[3])};
-            *accumulated=(weight+(u32::from(*accumulated)*(255-weight)+127)/255)as u8;
+        let row_bytes=(image.width as usize).checked_mul(4).ok_or(ImageError::TooLarge)?;
+        let band_rows=(MAX_LAYER_BYTES.checked_sub(held).ok_or(ImageError::TooLarge)?/2/row_bytes.max(1)).min(64);
+        if band_rows==0 {return Err(ImageError::TooLarge);}
+        let mut row=0u32;
+        while row<image.height {
+            let rows=(image.height-row).min(band_rows as u32);
+            // Nested mask layers resolve only the band being drawn.
+            let band=Rect{x:left/scale,y:(top+row as f32)/scale,width:image.width as f32/scale,height:rows as f32/scale};
+            let mut bytes=held;
+            let resolved=resolve_layers_region(&commands,scale,font,cache,&mut bytes,false,Some(band))?;
+            let coverage=render_scaled_region_at(&resolved,image.width,rows,scale,font,cache,[left as i64,top as i64+i64::from(row)],Some(bytes))?;
+            let start=row as usize*image.width as usize;
+            let plane=&mut union[start..start+rows as usize*image.width as usize];
+            for(accumulated,sample)in plane.iter_mut().zip(coverage.pixels.chunks_exact(4)) {
+                let weight=if layer.luminance {
+                    let luminance=(2126*u32::from(sample[0])+7152*u32::from(sample[1])+722*u32::from(sample[2])+5000)/10000;
+                    (luminance*u32::from(sample[3])+127)/255
+                }else{u32::from(sample[3])};
+                *accumulated=(weight+(u32::from(*accumulated)*(255-weight)+127)/255)as u8;
+            }
+            row+=rows;
         }
     }
     for(pixel,weight)in image.pixels.chunks_exact_mut(4).zip(union.iter()) {
@@ -3661,6 +3711,12 @@ fn resolve_layers(list:&[Command],scale:f32,font:Option<&dyn FontProvider>,
     resolve_layers_with_source(list,scale,font,cache,bytes,false)
 }
 
+/// The byte count committed before a failed attempt, with the scene's retained
+/// metadata (its filter graph may have been dropped or replaced) re-counted.
+fn rebase_scene_bytes(committed:usize,scene_before:usize,scene:&SourceScopeAnalysis)->Result<usize,ImageError>{
+    committed.checked_sub(scene_before).and_then(|bytes|bytes.checked_add(scene.bytes().ok()?)).ok_or(ImageError::TooLarge)
+}
+
 fn resolve_layers_with_source(
     list: &[Command],
     scale: f32,
@@ -3807,6 +3863,10 @@ fn resolve_layers_region_in_operation(
             // only needs the visible region mapped back into local space, plus
             // a sampling margin; nested layers otherwise rasterize their whole
             // content and a page-sized group exceeds the layer budget.
+            let committed=*bytes;
+            let scene_bytes=scene.bytes()?;
+            let mark=output.0.len();
+            let attempt=(||->Result<(),ImageError>{
             let local_region=region.and_then(|region|transform_region_to_local(region,matrix,scale));
             let mut child = resolve_layers_region_in_operation(&list[start..end], scale, font, cache, bytes,spatial_source,local_region,scene,SourceScopeView{start:view.start+start,..view})?;
             if matrix.b == 0.0
@@ -3839,10 +3899,17 @@ fn resolve_layers_region_in_operation(
                     }
                 }
                 output.0.extend(child.0);
-                continue;
+                return Ok(());
             }
             let Some(crop) = paint_bounds(&child.0, scale, font, cache)? else {
-                continue;
+                return Ok(());
+            };
+            let crop = match local_region {
+                Some(local) => match crop.intersection(local) {
+                    Some(crop) => crop,
+                    None => return Ok(()),
+                },
+                None => crop,
             };
             let left = (crop.x * scale).floor();
             let top = (crop.y * scale).floor();
@@ -3876,7 +3943,7 @@ fn resolve_layers_region_in_operation(
             let source =
                 render_scaled_region(&child, width as u32, height as u32, scale, font, cache)?;
             if let Some((rect, image)) =
-                transform::rasterize(source, source_rect, matrix, scale, MAX_LAYER_BYTES - *bytes)?
+                transform::rasterize(source, source_rect, matrix, scale, MAX_LAYER_BYTES - *bytes, region)?
             {
                 *bytes = bytes
                     .checked_add(image.pixels.len())
@@ -3889,6 +3956,16 @@ fn resolve_layers_region_in_operation(
                         pixels: image.pixels,
                     }),
                 });
+            }
+            Ok(())
+            })();
+            // In degraded mode a transformed group that cannot fit the layer
+            // budget is dropped instead of failing the whole frame.
+            match attempt {
+                Err(ImageError::TooLarge) if degrade_oversized_effects()=>{
+                    *bytes=rebase_scene_bytes(committed,scene_bytes,scene)?;output.0.truncate(mark);
+                }
+                other=>other?,
             }
             continue;
         }
@@ -3919,6 +3996,10 @@ fn resolve_layers_region_in_operation(
             output.0.extend(child.0);
             continue;
         }
+        let committed=*bytes;
+        let scene_bytes=scene.bytes()?;
+        let mark=output.0.len();
+        let attempt=(||->Result<(),ImageError>{
         let svg_object_box=svg_clip.as_ref().filter(|owner|owner.clip.units==lumen_html::paint::SvgGradientUnits::ObjectBoundingBox)
             .map(|owner|scene.svg_object_box(view.start+start-1,
                 Affine{e:owner.transform.e-view.translation[0],f:owner.transform.f-view.translation[1],..owner.transform},font,*bytes)).transpose()?;
@@ -3928,17 +4009,31 @@ fn resolve_layers_region_in_operation(
         // the pointwise legacy raster path cannot evaluate their input DAG.
         if region.is_some() || filters.as_ref().is_some_and(|filters|filters.iter().any(|filter|
             matches!(filter,lumen_common::filter::FilterOperation::Resource(_)))) {
-            let source_bounds=scene.source_bounds(view.start+start-1,capture,scale,font,cache,*bytes)?.map(|mut bounds|{bounds.x+=view.translation[0];bounds.y+=view.translation[1];bounds});
-            let output_bounds=if let Some(filters)=filters.as_deref(){filter_output_bounds(source_bounds,filters,scale)?}else{source_bounds};
-            let Some(output_bounds)=output_bounds else{continue;};
-            // Bounds select a virtual device window. They do not introduce an
-            // author clip, and input halos are still expanded independently.
-            let output_bounds=FilterPixelRegion::from_rect(output_bounds,scale)?.rect(scale);
-            let region=if let Some(region)=region{let Some(region)=region.intersection(output_bounds)else{continue;};region}else{output_bounds};
-            output.0.extend(resolve_layer_region_tiles(&list[start..end],filters.as_deref(),region,
-                rect,radius,corners.as_deref().copied(),opacity,clip,svg_clip.as_deref(),svg_object_box,
-                scale,font,cache,bytes,capture,scene,SourceScopeView{start:view.start+start,..view})?.0);
-            continue;
+            // A blur-only layer whose halo does not fit is rasterized at a power-of-two
+            // lower scale, like Skia does for large sigmas, and magnified when drawn.
+            let reducible=opacity==1.0 && !clip && radius==0.0 && corners.is_none() && svg_clip.is_none();
+            let max_shift=if reducible {filters.as_deref().map_or(0,|filters|reduced_blur_shift(filters,scale))}else{0};
+            let committed=*bytes;
+            let mut shift=0u32;
+            let resolved=loop {
+                *bytes=committed;
+                let layer_scale=scale/((1u32<<shift) as f32);
+                let source_bounds=scene.source_bounds(view.start+start-1,capture,layer_scale,font,cache,*bytes)?.map(|mut bounds|{bounds.x+=view.translation[0];bounds.y+=view.translation[1];bounds});
+                let output_bounds=if let Some(filters)=filters.as_deref(){filter_output_bounds(source_bounds,filters,layer_scale)?}else{source_bounds};
+                let Some(output_bounds)=output_bounds else{break None;};
+                // Bounds select a virtual device window. They do not introduce an
+                // author clip, and input halos are still expanded independently.
+                let output_bounds=FilterPixelRegion::from_rect(output_bounds,layer_scale)?.rect(layer_scale);
+                let window=if let Some(region)=region{let Some(window)=region.intersection(output_bounds)else{break None;};window}else{output_bounds};
+                match resolve_layer_region_tiles(&list[start..end],filters.as_deref(),window,
+                    rect,radius,corners.as_deref().copied(),opacity,clip,svg_clip.as_deref(),svg_object_box,
+                    layer_scale,font,cache,bytes,capture,scene,SourceScopeView{start:view.start+start,..view}) {
+                    Err(ImageError::TooLarge) if shift<max_shift => shift+=1,
+                    other => break Some(other?),
+                }
+            };
+            if let Some(resolved)=resolved {output.0.extend(resolved.0);}
+            return Ok(());
         }
         let child = resolve_layers_region_in_operation(&list[start..end], scale, font, cache, bytes,capture,None,scene,SourceScopeView{start:view.start+start,..view})?;
         // An identity, square rectangle whose device edges are integral has
@@ -3951,14 +4046,64 @@ fn resolve_layers_region_in_operation(
             output.0.push(Command::PushClip(rect));
             output.0.extend(child.0);
             output.0.push(Command::PopClip);
-            continue;
+            return Ok(());
         }
+        let reducible=opacity==1.0 && !clip && radius==0.0 && corners.is_none() && svg_clip.is_none();
+        let max_shift=if reducible {filters.as_deref().map_or(0,|filters|reduced_blur_shift(filters,scale))}else{0};
+        let committed=*bytes;
+        let mut shift=0u32;
+        let layer=loop {
+            *bytes=committed;
+            let layer_scale=scale/((1u32<<shift) as f32);
+            match resolve_filter_layer(&child,filters.as_deref(),rect,radius,corners.as_deref().copied(),opacity,clip,
+                svg_clip.as_deref(),svg_object_box,layer_scale,font,cache,bytes) {
+                Err(ImageError::TooLarge) if shift<max_shift => shift+=1,
+                other => break other?,
+            }
+        };
+        if let Some(layer)=layer {output.0.push(layer);}
+        Ok(())
+        })();
+        // In degraded mode an effect that cannot fit the layer budget is
+        // skipped and its content drawn directly.
+        if matches!(attempt,Err(ImageError::TooLarge)) && degrade_oversized_effects() {
+            *bytes=rebase_scene_bytes(committed,scene_bytes,scene)?;output.0.truncate(mark);
+            let committed=*bytes;
+            let scene_bytes=scene.bytes()?;
+            match resolve_layers_region_in_operation(&list[start..end],scale,font,cache,bytes,spatial_source,region,scene,SourceScopeView{start:view.start+start,..view}) {
+                Ok(child)=>output.0.extend(child.0),
+                Err(ImageError::TooLarge)=>*bytes=rebase_scene_bytes(committed,scene_bytes,scene)?,
+                Err(error)=>return Err(error),
+            }
+        }else{attempt?;}
+    }
+    Ok(output)
+}
+
+fn reduced_blur_shift(filters:&[lumen_common::filter::FilterOperation],scale:f32)->u32 {
+    use lumen_common::filter::FilterOperation as F;
+    let mut shift=None::<u32>;
+    for filter in filters {
+        let F::Blur(sigma)=filter else{return 0;};
+        let next=downsample_shift(*sigma,scale);
+        shift=Some(shift.map_or(next,|shift|shift.min(next)));
+    }
+    shift.unwrap_or(0)
+}
+
+/// Rasterizes one filtered layer at `scale`. A blur-only layer that does not fit is retried by the
+/// caller at a power-of-two lower scale; the drawn sprite is then magnified by the same factor.
+fn resolve_filter_layer(child:&DisplayList,filters:Option<&[lumen_common::filter::FilterOperation]>,rect:Rect,radius:f32,
+    corners:Option<[[f32;2];4]>,opacity:f32,clip:bool,svg_clip:Option<&lumen_html::paint::SvgLayerClip>,
+    svg_object_box:Option<Affine>,scale:f32,font:Option<&dyn FontProvider>,cache:&mut GlyphCache,bytes:&mut usize)
+    -> Result<Option<Command>,ImageError> {
+    {
         let source_bounds=paint_bounds(&child.0,scale,font,cache)?;
         // Own layer clipping consumes the filtered result. Source ink outside
         // that clip can contribute to pixels inside it through spatial filters.
         let crop=if let Some(filters)=filters {filter_output_bounds(source_bounds,filters,scale)?}
             else if clip {source_bounds.and_then(|bounds|bounds.intersection(rect))}else{source_bounds};
-        let Some(crop)=crop else{continue;};
+        let Some(crop)=crop else{return Ok(None);};
         let left = (crop.x * scale).floor();
         let top = (crop.y * scale).floor();
         let width = ((crop.x + crop.width) * scale).ceil() - left;
@@ -3982,14 +4127,14 @@ fn resolve_layers_region_in_operation(
         }
         let x = left / scale;
         let y = top / scale;
-        let mut image = render_scaled_region_at(&child,width as u32,height as u32,scale,font,cache,[left as i64,top as i64],Some(*bytes-len))?;
+        let mut image = render_scaled_region_at(child,width as u32,height as u32,scale,font,cache,[left as i64,top as i64],Some(*bytes-len))?;
         if let Some(filters)=filters {apply_filter_operations(&mut image,filters,scale,*bytes,[left as i64,top as i64])?;}
-        apply_layer_result_coverage(&mut image,rect,radius,corners.as_deref().copied(),opacity,clip,
-            svg_clip.as_deref(),svg_object_box,scale,left,top,*bytes)?;
-        if let Some(mask)=svg_clip.as_ref().and_then(|owner|owner.mask.as_deref()) {
+        apply_layer_result_coverage(&mut image,rect,radius,corners,opacity,clip,
+            svg_clip,svg_object_box,scale,left,top,*bytes)?;
+        if let Some(mask)=svg_clip.and_then(|owner|owner.mask.as_deref()) {
             apply_layer_mask(&mut image,mask,scale,left,top,*bytes,font,cache)?;
         }
-        output.0.push(Command::Image {
+        Ok(Some(Command::Image {
             rect: Rect {
                 x,
                 y,
@@ -4001,9 +4146,8 @@ fn resolve_layers_region_in_operation(
                 height: image.height,
                 pixels: image.pixels,
             }),
-        });
+        }))
     }
-    Ok(output)
 }
 
 fn paint_bounds(
@@ -4638,11 +4782,13 @@ fn decode_svg_image_in_viewport_with_intrinsic(bytes:&[u8],fragment:Option<&str>
     .map_err(|_| ImageError::TooLarge)?;
     lumen_common::limits::size::repeat(pixels, 4, max_bytes.min(MAX_IMAGE_BYTES))
         .map_err(|_| ImageError::TooLarge)?;
-    let unsupported = session
-        .unsupported_svg_features()
-        .map_err(ImageError::Layout)?;
-    if !unsupported.is_empty() {
-        return Err(ImageError::UnsupportedSvg(unsupported));
+    if STRICT_SVG_IMAGES.load(std::sync::atomic::Ordering::Relaxed) {
+        let unsupported = session
+            .unsupported_svg_features()
+            .map_err(ImageError::Layout)?;
+        if !unsupported.is_empty() {
+            return Err(ImageError::UnsupportedSvg(unsupported));
+        }
     }
     let font = default_font()?;
     let list = session
@@ -5322,6 +5468,46 @@ mod tests {
         assert_eq!((background.image_rect.width,background.image_rect.height),(85.0,47.5),"ratio-only operand negotiates 100x50 in this positioning area before weighted natural sizing");
         let raster=render(list,100,80,1.0,true).unwrap();
         assert_eq!(&raster.pixels[(20*100+20)*4..(20*100+21)*4],&[0,128,0,255],"actual viewport image carriers feed the shared weighted painter");
+    }
+
+    #[test]
+    fn specification_oversized_border_radius_scales_to_a_pill_for_border_and_background() {
+        use lumen_html::paint::Command;
+        let source="<!doctype html><style>html{background:black}body{margin:0}div{box-sizing:content-box;width:80px;height:30px;border:2px solid red;border-radius:9999px}#bg{background:#444}</style><div id=bg></div>";
+        let document=lumen_html::html::parse(source,64).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        let list=session.display_list(100,50,default_font().unwrap()).unwrap().clone();
+        let stroke=list.0.iter().find_map(|command|match command {
+            Command::StrokeBorder{rect,radius,..}=>Some((*rect,*radius)),
+            _=>None,
+        }).expect("the pill border is painted");
+        assert_eq!((stroke.0.width,stroke.0.height),(84.0,34.0));
+        assert_eq!(stroke.1,17.0,"radius reduced to half the border-box height");
+        let fill=list.0.iter().find_map(|command|match command {
+            Command::FillRoundedRect{rect,radius,..}=>Some((*rect,*radius)),
+            _=>None,
+        }).expect("the pill background is painted");
+        assert!(fill.1>=fill.0.height/2.0,"the background is a pill too: {fill:?}");
+        let raster=render(&list,100,50,1.0,true).unwrap();
+        let pixel=|x:usize,y:usize|&raster.pixels[(y*100+x)*4..(y*100+x)*4+4];
+        assert_eq!(pixel(42,0),&[255,0,0,255],"top edge of the pill outline");
+        assert_eq!(pixel(42,33),&[255,0,0,255],"bottom edge of the pill outline");
+        assert_eq!(pixel(1,1)[0..3],[0,0,0],"the corner outside the pill stays untouched");
+        assert_eq!(pixel(42,17),&[68,68,68,255],"background inside the outline");
+    }
+
+    #[test]
+    fn specification_oversized_border_radius_without_background_still_paints_the_outline() {
+        let source="<!doctype html><style>html{background:black}body{margin:0}div{width:80px;height:30px;border:2px solid red;border-radius:9999px}</style><div></div>";
+        let document=lumen_html::html::parse(source,64).unwrap();
+        let mut session=lumen_html::session::RenderSession::new(document);
+        let list=session.display_list(100,50,default_font().unwrap()).unwrap().clone();
+        list.validate().unwrap();
+        let raster=render(&list,100,50,1.0,true).unwrap();
+        let pixel=|x:usize,y:usize|&raster.pixels[(y*100+x)*4..(y*100+x)*4+4];
+        assert_eq!(pixel(42,0),&[255,0,0,255]);
+        assert_eq!(pixel(42,17),&[0,0,0,255]);
+        assert_eq!(pixel(1,17)[0],255,"left cap of the pill is red");
     }
 
     #[test]
@@ -6923,7 +7109,7 @@ mod tests {
                 let viewport=FilterPixelRegion::from_rect(Rect{x:0.0,y:0.0,width:40.0,height:32.0},scale).unwrap();
                 let source=render_scaled_region_at(&DisplayList(vec![path]),viewport.width,viewport.height,scale,Some(&font),&mut GlyphCache::default(),[0,0],None).unwrap();
                 let (source_rect,source)=transform::rasterize(source,Rect{x:0.0,y:0.0,width:40.0,height:32.0},
-                    Affine{e:offset,f:offset,..Affine::IDENTITY},scale,MAX_LAYER_BYTES).unwrap().unwrap();
+                    Affine{e:offset,f:offset,..Affine::IDENTITY},scale,MAX_LAYER_BYTES,None).unwrap().unwrap();
                 let clip_document=lumen_html::xml::parse(&svg(&format!("{clip}<g clip-path='url(#c)'>{rectangle}</g>")),64).unwrap();
                 let clipping=lumen_html::layout::display_list(&clip_document,40,32,&font).unwrap();
                 let clipping=clipping.0.iter().find(|command|matches!(command,Command::PushLayer{svg_clip:Some(_),..})).unwrap().clone();
@@ -9136,5 +9322,202 @@ mod tests {
         let Command::PushLayer{rect,svg_clip:Some(owner),..}=&command else{panic!("layer")};
         assert_eq!((rect.x,rect.y),(6.0,0.0));
         assert_eq!(owner.mask.as_ref().unwrap().offset,[8.0,2.0],"mask stays aligned with the translated layer");
+    }
+
+    fn assert_large_blur_glow(scale:f32) {
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let html="<!doctype html><style>.b{position:relative;width:1280px;height:700px}.b:after{content:\"\";aspect-ratio:1;background:#99cc7d;filter:blur(120px);width:300px;border-radius:50%;margin:auto;position:absolute;inset:0}</style><div class=b></div>";
+        let image=render_html_with_font(html,1280,700,scale,&font).expect("a large blur glow does not fail the page");
+        let over_white=|x:f32,y:f32|{
+            let at=(((y*scale) as usize)*image.width as usize+(x*scale) as usize)*4;
+            let pixel=&image.pixels[at..at+4];let alpha=u32::from(pixel[3]);
+            [0,1,2].map(|channel|(u32::from(pixel[channel])*alpha+255*(255-alpha)+127)/255)
+        };
+        let centre=over_white(648.0,358.0);
+        assert!(centre!=[0x99,0xcc,0x7d],"the glow is blurred, not the solid fill: {centre:?}");
+        assert!(centre[0]>0x99+15,"blur lowers the centre coverage: {centre:?}");
+        assert!(centre[1]>centre[0]+10 && centre[1]>centre[2]+20,"the glow is green: {centre:?}");
+        let beside=over_white(648.0+150.0+20.0,358.0);
+        assert!(beside[0]<250,"the glow extends beyond the 300px box: {beside:?}");
+        assert!(beside[0]>centre[0],"the glow fades outwards: {beside:?} vs {centre:?}");
+        let far=over_white(10.0,10.0);
+        assert!(far.iter().all(|channel|*channel>=253),"pixels far from the glow stay background: {far:?}");
+    }
+
+    #[test]
+    fn large_blur_glow_renders_instead_of_failing_the_page() {
+        assert_large_blur_glow(1.0);
+    }
+
+    #[test]
+    fn large_blur_glow_renders_at_device_scale_two() {
+        assert_large_blur_glow(2.0);
+    }
+
+    fn svg_mask_over_white(svg:&str,width:u32,height:u32)->impl Fn(usize,usize)->[u8;3] {
+        let html=format!("<!doctype html><style>html{{background:#fff}}body{{margin:0}}svg{{display:block}}</style>{svg}");
+        let image=render_html(&html,width,height,1.0).unwrap();
+        move|x,y|{
+            let at=(y*width as usize+x)*4;
+            let pixel=&image.pixels[at..at+4];let alpha=u32::from(pixel[3]);
+            [0,1,2].map(|channel|((u32::from(pixel[channel])*alpha+255*(255-alpha)+127)/255)as u8)
+        }
+    }
+
+    #[test]
+    fn svg_alpha_mask_with_radial_gradient_fades_masked_content() {
+        let at=svg_mask_over_white(r##"<svg width="300" height="200" viewBox="0 0 300 200" fill="none"><mask id="m" style="mask-type:alpha" maskUnits="userSpaceOnUse" width="300" height="200" x="0" y="0"><rect width="300" height="200" fill="url(#g)"></rect></mask><g mask="url(#m)"><rect x="0" y="0" width="300" height="200" fill="#000"/></g><defs><radialGradient id="g" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(150 100) rotate(90) scale(100 150)"><stop stop-color="#D9D9D9" stop-opacity="0.5"></stop><stop offset="0.8" stop-color="#D9D9D9" stop-opacity="0"></stop></radialGradient></defs></svg>"##,300,200);
+        let centre=at(150,100);
+        assert!(centre[0]>100 && centre[0]<160,"centre is half-covered black: {centre:?}");
+        assert!(at(5,5)[0]>=250,"edges are fully masked out: {:?}",at(5,5));
+        assert!(at(150,100)[0]<at(150,160)[0],"coverage fades outwards");
+    }
+
+    fn svg_radial_over_white(defs:&str,width:u32,height:u32)->impl Fn(usize,usize)->[u8;3] {
+        svg_mask_over_white(&format!(r##"<svg width="{width}" height="{height}"><defs>{defs}</defs><rect width="{width}" height="{height}" fill="url(#g)"/></svg>"##),width,height)
+    }
+
+    const FADE_STOPS:&str = r##"<stop stop-color="#000"/><stop offset="1" stop-color="#000" stop-opacity="0"/>"##;
+
+    fn assert_near(actual:[u8;3],expected:u8,tolerance:u8,what:&str) {
+        assert!(actual.iter().all(|channel|channel.abs_diff(expected)<=tolerance),"{what}: expected about {expected}, got {actual:?}");
+    }
+
+    #[test]
+    fn svg_radial_gradient_object_bounding_box_defaults_start_at_the_centre() {
+        let at=svg_radial_over_white(r##"<radialGradient id="g"><stop stop-color="#000"/><stop offset="1" stop-color="#fff"/></radialGradient>"##,300,200);
+        assert_near(at(150,100),0,12,"centre is the first stop");
+        assert_near(at(150,150),128,12,"half way along the vertical radius");
+        assert_near(at(225,100),128,12,"half way along the horizontal radius");
+        assert_near(at(5,5),255,2,"corner is past the last stop");
+    }
+
+    #[test]
+    fn svg_radial_gradient_user_space_circle_fades_from_the_centre() {
+        let at=svg_radial_over_white(&format!(r##"<radialGradient id="g" cx="150" cy="100" r="100" gradientUnits="userSpaceOnUse">{FADE_STOPS}</radialGradient>"##),300,200);
+        assert_near(at(150,100),0,12,"centre");
+        assert_near(at(200,100),128,12,"half radius");
+        assert_near(at(150,160),153,12,"0.6 radius");
+        assert_near(at(260,100),255,2,"outside the circle");
+    }
+
+    #[test]
+    fn svg_radial_gradient_transform_translate_scale_places_the_unit_circle() {
+        let at=svg_radial_over_white(&format!(r##"<radialGradient id="g" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(150 100) scale(100 100)">{FADE_STOPS}</radialGradient>"##),300,200);
+        assert_near(at(150,100),0,12,"centre");
+        assert_near(at(200,100),128,12,"half radius horizontally");
+        assert_near(at(150,150),128,12,"half radius vertically");
+        assert_near(at(260,100),255,2,"outside the circle");
+    }
+
+    #[test]
+    fn svg_radial_gradient_transform_rotate_scale_makes_an_ellipse() {
+        let at=svg_radial_over_white(&format!(r##"<radialGradient id="g" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(150 100) rotate(90) scale(100 150)">{FADE_STOPS}</radialGradient>"##),300,200);
+        assert_near(at(150,100),0,12,"centre");
+        assert_near(at(150,150),128,12,"half of the vertical semi-axis 100");
+        assert_near(at(225,100),128,12,"half of the horizontal semi-axis 150");
+        assert_near(at(150,195),243,10,"0.95 of the vertical semi-axis");
+    }
+
+    #[test]
+    fn svg_radial_gradient_focal_point_defaults_to_the_centre_and_can_be_moved() {
+        let defaulted=svg_radial_over_white(&format!(r##"<radialGradient id="g" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(250 100) scale(100 100)">{FADE_STOPS}</radialGradient>"##),300,200);
+        assert_near(defaulted(250,100),0,12,"focal point follows an explicit centre");
+        assert_near(defaulted(200,100),128,12,"half radius around the explicit centre");
+        let moved=svg_radial_over_white(r##"<radialGradient id="g" cx="150" cy="100" r="100" fx="100" fy="100" gradientUnits="userSpaceOnUse"><stop stop-color="#000"/><stop offset="1" stop-color="#fff"/></radialGradient>"##,300,200);
+        assert_near(moved(100,100),0,14,"focal point is the first stop");
+        assert_near(moved(70,100),153,14,"0.6 of the way to the near edge of the circle");
+        assert_near(moved(240,100),238,14,"most of the way to the far edge");
+    }
+
+    #[test]
+    fn svg_radial_gradient_is_placed_correctly_when_the_svg_is_offset_in_the_page() {
+        let src=format!(r##"<div style="height:120px"></div><svg width="300" height="200" style="margin-left:40px"><defs><radialGradient id="g" cx="150" cy="100" r="100" gradientUnits="userSpaceOnUse">{FADE_STOPS}</radialGradient></defs><rect width="300" height="200" fill="url(#g)"/></svg>"##);
+        let at=svg_mask_over_white(&src,400,400);
+        assert_near(at(190,220),0,12,"centre follows the offset svg");
+        assert_near(at(240,220),128,12,"half radius");
+        assert_near(at(190,100),255,2,"page above the svg stays background");
+    }
+
+    #[test]
+    fn svg_linear_gradient_is_placed_correctly_when_the_svg_is_offset_in_the_page() {
+        let src=r##"<div style="height:120px"></div><svg width="300" height="200" style="margin-left:40px"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#000"/><stop offset="1" stop-color="#fff"/></linearGradient></defs><rect width="300" height="200" fill="url(#g)"/></svg>"##;
+        let at=svg_mask_over_white(src,400,400);
+        assert_near(at(190,122),0,12,"top of the offset svg is the first stop");
+        assert_near(at(190,220),128,12,"middle of the offset svg");
+        assert_near(at(190,318),255,12,"bottom of the offset svg is the last stop");
+    }
+
+    #[test]
+    fn svg_luminance_mask_shows_only_the_white_half() {
+        let at=svg_mask_over_white(r##"<svg width="300" height="200"><mask id="m2"><rect width="150" height="200" fill="#fff"/></mask><rect width="300" height="200" fill="#000" mask="url(#m2)"/></svg>"##,300,200);
+        assert!(at(50,100)[0]<8,"inside the white mask: {:?}",at(50,100));
+        assert!(at(250,100)[0]>=250,"outside the mask content: {:?}",at(250,100));
+    }
+
+    #[test]
+    fn svg_mask_content_units_object_bounding_box_scale_to_the_element() {
+        let at=svg_mask_over_white(r##"<svg width="100" height="100"><mask id="m" maskContentUnits="objectBoundingBox"><rect width=".5" height="1" fill="#fff"/></mask><rect x="20" y="20" width="60" height="60" fill="#000" mask="url(#m)"/></svg>"##,100,100);
+        assert!(at(30,50)[0]<8,"left half of the box is covered: {:?}",at(30,50));
+        assert!(at(70,50)[0]>=250,"right half of the box is masked out: {:?}",at(70,50));
+    }
+
+    #[test]
+    fn svg_mask_default_region_is_the_bounding_box_grown_by_ten_percent() {
+        let at=svg_mask_over_white(r##"<svg width="100" height="100"><mask id="m"><rect x="-50" y="-50" width="300" height="300" fill="#fff"/></mask><rect x="20" y="20" width="60" height="60" fill="none" stroke="#000" stroke-width="40" mask="url(#m)"/></svg>"##,100,100);
+        assert!(at(30,50)[0]<8,"inside the region: {:?}",at(30,50));
+        assert!(at(2,50)[0]>=250,"left of the 10% grown region (x<14): {:?}",at(2,50));
+        assert!(at(97,50)[0]>=250,"right of the grown region (x>86): {:?}",at(97,50));
+    }
+
+    const LARGE_MASKED_SVG:&str=r##"<!doctype html><style>html{background:#fff}body{margin:0}svg{display:block}</style><svg width="1004" height="600" viewBox="0 0 1004 600"><mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="1004" height="600"><rect width="502" height="600" fill="#fff"/></mask><g mask="url(#m)"><rect width="1004" height="600" fill="#000"/></g></svg>"##;
+
+    fn assert_left_half_masked(pixels:&[u8],width:u32,scale:f32) {
+        let at=|x:f32,y:f32|{
+            let at=((y*scale) as usize*width as usize+(x*scale) as usize)*4;
+            let pixel=&pixels[at..at+4];let alpha=u32::from(pixel[3]);
+            ((u32::from(pixel[0])*alpha+255*(255-alpha)+127)/255)as u8
+        };
+        assert!(at(100.0,300.0)<8,"left half is covered: {}",at(100.0,300.0));
+        assert!(at(100.0,590.0)<8,"left half is covered near the bottom: {}",at(100.0,590.0));
+        assert!(at(900.0,300.0)>=250,"right half is masked out: {}",at(900.0,300.0));
+        assert!(at(900.0,590.0)>=250,"right half is masked out near the bottom: {}",at(900.0,590.0));
+    }
+
+    #[test]
+    fn large_svg_mask_renders_in_bands_at_scale_one() {
+        let image=render_html(LARGE_MASKED_SVG,1004,600,1.0).unwrap();
+        assert_left_half_masked(&image.pixels,image.width,1.0);
+    }
+
+    #[test]
+    fn oversized_effect_layers_degrade_only_when_requested() {
+        let html="<!doctype html><style>body{margin:0;background:#fff}div{width:1004px;height:600px;background:#000;opacity:.5;filter:blur(1px)}</style><div></div>";
+        assert!(matches!(render_html(html,1004,600,2.0),Err(ImageError::TooLarge)));
+        let image=with_degraded_oversized_effects(||render_html(html,1004,600,2.0)).unwrap();
+        let at=(300*image.width as usize+400)*4;
+        assert!(image.pixels[at]<8 && image.pixels[at+3]==255,"content is drawn without the effect: {:?}",&image.pixels[at..at+4]);
+        assert!(!degrade_oversized_effects());
+    }
+
+    #[test]
+    fn large_svg_mask_renders_in_bands_at_scale_two() {
+        // A whole 2x frame of this layer exceeds the layer budget; surfaces draw it in device bands.
+        let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
+        let document=lumen_html::html::parse(LARGE_MASKED_SVG,100_000).unwrap();
+        let list=lumen_html::layout::display_list(&document,1004,600,&font).unwrap();
+        let (width,height)=(2008u32,1200u32);
+        let stride=width as usize*4;
+        let mut pixels=vec![0u8;stride*height as usize];
+        let mut cache=GlyphCache::default();
+        let mut top=0;
+        while top<height {
+            let bottom=(top+64).min(height);
+            let rows=&mut pixels[top as usize*stride..bottom as usize*stride];
+            assert!(render_device_rect_with_mode_cached(&list,1004,600,2.0,RasterizationMode::Gpui,&font,
+                &mut cache,[0,top,width,bottom],rows,top).unwrap());
+            top=bottom;
+        }
+        assert_left_half_masked(&pixels,width,2.0);
     }
 }

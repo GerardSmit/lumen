@@ -85,6 +85,7 @@ mod forms_batch71_tests;
 #[path = "forms_batch72_tests.rs"]
 mod forms_batch72_tests;
 mod geometry;
+pub use geometry::document_scroll_height;
 mod history;
 mod fragment;
 pub mod navigation_lifecycle;
@@ -976,6 +977,12 @@ impl DomRealm {
         self.document_identity.origin.borrow().clone()
     }
 
+    /// Whether this document belonged to a browsing context that has since been discarded (a
+    /// closed popup or removed frame); its pending tasks are dropped rather than run.
+    pub fn browsing_context_discarded(&self) -> bool {
+        self.has_browsing_context && self.browsing_context().is_none()
+    }
+
     /// Return this document's active child host realm. The root document has no
     /// child handle, and a replaced or detached frame document is not current.
     pub fn child_realm_handle(&self) -> OpResult<Option<lumen::embed::RealmHandle>> {
@@ -1585,6 +1592,22 @@ impl DomRealm {
             self.set_document_origin(browsing_context::context_origin(&context));
         }
         if first_assignment { self.finalize_initial_permissions_identity(); }
+        self.sync_session_base_url();
+    }
+
+    /// Hands the session the base its inline style URLs and `<video poster>`
+    /// resolve against, before the first frame is painted. Computed without
+    /// filling the base cache, which an about base supplied later still
+    /// changes.
+    fn sync_session_base_url(&self) {
+        let fallback = self.fallback_base_url();
+        let base = {
+            let session = self.session.borrow();
+            let document = session.document();
+            first_html_base_with_href(document, document.root(), false, self.is_html_document)
+                .map_or(fallback.clone(), |(_, href)| freeze_base_href(&href, &fallback))
+        };
+        self.session.borrow_mut().set_document_base_url(Some(std::sync::Arc::from(base.as_str())));
     }
 
     /// Set the inherited about base URL for an initial about:blank or srcdoc
@@ -1600,6 +1623,7 @@ impl DomRealm {
             return;
         }
         *self.about_base_url.borrow_mut() = url;
+        self.sync_session_base_url();
     }
 
     pub fn document_url(&self) -> Option<String> {
@@ -19310,6 +19334,22 @@ mod tests {
                 true
             "#,
         );
+        assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn the_session_resolves_against_the_document_base_before_and_after_an_about_base() {
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<base href='../child/'>", 64).unwrap();
+        realm.set_document_url("https://site.test/dir/page.html");
+        assert_eq!(realm.with_session(|session| session.document_base_url().map(String::from)).as_deref(), Some("https://site.test/child/"));
+
+        let mut engine = Engine::new();
+        let realm = install(engine.ctx(), "<base id='child-base' href='../child/'>", 64).unwrap();
+        realm.set_document_url("about:srcdoc");
+        realm.set_about_base_url(Some("https://parent.test/dir/page.html".into()));
+        assert_eq!(realm.with_session(|session| session.document_base_url().map(String::from)).as_deref(), Some("https://parent.test/child/"));
+        let value = script(&mut engine, "document.baseURI === 'https://parent.test/child/'");
         assert!(matches!(value, Value::Bool(true)));
     }
 

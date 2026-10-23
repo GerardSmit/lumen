@@ -6,6 +6,9 @@ use super::*;
 pub(super) struct LineClamp {
     pub(super) remaining: u32,
     pub(super) exhausted: bool,
+    /// The line limit is the container height divided by its line height, so it
+    /// only approximates how many lines of varying height fit.
+    height_based: bool,
     ellipsis: Option<Arc<str>>,
     style: Style,
     tail: Option<(f32, f32)>,
@@ -55,7 +58,7 @@ impl LineClamp {
         } else {
             return None;
         };
-        Some(LineClamp { remaining, exhausted: false, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
+        Some(LineClamp { remaining, exhausted: false, height_based: false, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
     }
 
     fn multicol(style: &Style) -> bool {
@@ -96,7 +99,7 @@ impl Layout<'_> {
             return None;
         }
         let ellipsis = ellipsis_text(css::extra_props::keyword(style, "block-ellipsis"));
-        Some(LineClamp { remaining: lines as u32, exhausted: false, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
+        Some(LineClamp { remaining: lines as u32, exhausted: false, height_based: true, ellipsis, style: style.clone(), tail: None, ellipsis_done: false })
     }
 
     pub(super) fn line_clamp_out_of_flow(&self, item: &BlockFlowItem) -> Result<bool, LayoutError> {
@@ -115,6 +118,14 @@ impl Layout<'_> {
 
     pub(super) fn line_clamp_last_line(&self) -> bool {
         self.line_clamp.as_ref().is_some_and(|clamp| clamp.remaining == 1)
+    }
+
+    pub(super) fn line_clamp_remaining(&self) -> Option<usize> {
+        self.line_clamp.as_ref().map(|clamp| clamp.remaining as usize)
+    }
+
+    pub(super) fn line_clamp_height_based(&self) -> bool {
+        self.line_clamp.as_ref().is_some_and(|clamp| clamp.height_based)
     }
 
     pub(super) fn line_clamp_shape(&self) -> Result<Option<ShapedRun>, LayoutError> {

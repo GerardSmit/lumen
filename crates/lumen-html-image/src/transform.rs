@@ -7,6 +7,7 @@ pub(super) fn rasterize(
     affine: Affine,
     scale: f32,
     budget: usize,
+    clip: Option<Rect>,
 ) -> Result<Option<(Rect, Rgba8Image)>, ImageError> {
     let source_bytes = (source.width as usize)
         .checked_mul(source.height as usize)
@@ -93,6 +94,26 @@ pub(super) fn rasterize(
     {
         return Ok(Some((rect, source)));
     }
+    // Only the visible part of the transformed output is sampled.
+    let clip = clip.map(|clip| [clip.x, clip.y, clip.x + clip.width, clip.y + clip.height].map(|v| f64::from(v) * scale));
+    if let Some(clip) = clip.filter(|clip| clip.iter().all(|v| v.is_finite())) {
+        bounds = [
+            bounds[0].max(clip[0].floor()),
+            bounds[1].max(clip[1].floor()),
+            bounds[2].min(clip[2].ceil()),
+            bounds[3].min(clip[3].ceil()),
+        ];
+        if bounds[2] <= bounds[0] || bounds[3] <= bounds[1] {
+            return Ok(None);
+        }
+    }
+    let (width, height) = ((bounds[2] - bounds[0]) as u32, (bounds[3] - bounds[1]) as u32);
+    let rect = Rect {
+        x: (bounds[0] / scale) as f32,
+        y: (bounds[1] / scale) as f32,
+        width: (width as f64 / scale) as f32,
+        height: (height as f64 / scale) as f32,
+    };
     let bytes = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(4))
@@ -160,7 +181,18 @@ mod tests {
         scale: f32,
         affine: Affine,
     ) -> Result<Option<(Rect, Rgba8Image)>, ImageError> {
-        rasterize(source.clone(), rect, affine, scale, MAX_LAYER_BYTES)
+        rasterize(source.clone(), rect, affine, scale, MAX_LAYER_BYTES, None)
+    }
+    #[test]
+    fn a_clip_limits_the_transformed_output_to_the_visible_rows() {
+        let source = Rgba8Image { width: 64, height: 64, pixels: vec![255; 64 * 64 * 4] };
+        let rect = Rect { x: 0.0, y: 0.0, width: 64.0, height: 64.0 };
+        let turn = Affine { a: 0.0, b: 1.0, c: -1.0, d: 0.0, e: 64.0, f: 0.0 };
+        let clip = Rect { x: 0.0, y: 10.0, width: 64.0, height: 4.0 };
+        let (placed, image) = rasterize(source, rect, turn, 1.0, MAX_LAYER_BYTES, Some(clip)).unwrap().unwrap();
+        assert_eq!((image.width, image.height), (64, 4));
+        assert_eq!((placed.y, placed.height), (10.0, 4.0));
+        assert!(image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
     fn source() -> Rgba8Image {
         Rgba8Image {
@@ -323,6 +355,7 @@ mod tests {
             Affine::IDENTITY,
             1.0,
             MAX_LAYER_BYTES,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -336,7 +369,8 @@ mod tests {
                     ..Affine::IDENTITY
                 },
                 1.0,
-                19
+                19,
+                None
             ),
             Err(ImageError::TooLarge)
         );

@@ -116,8 +116,28 @@ pub fn connect_socket_addr_cancellable(
     connect_address_cancellable(&address, timeout, cancellation)
 }
 
+/// Local ephemeral ports run out under bursts of short-lived loopback connections (each closed
+/// one waits out TIME_WAIT); the kernel frees them within seconds, so retry within the connect
+/// timeout. Elsewhere the same error means no usable route, which fails at once.
 #[cfg(unix)]
 fn connect_address_cancellable(address: &std::net::SocketAddr, timeout: std::time::Duration, cancellation: &TcpCancellation) -> std::io::Result<std::net::TcpStream> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match connect_address_once(address, deadline.saturating_duration_since(std::time::Instant::now()), cancellation) {
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable && address.ip().is_loopback() && std::time::Instant::now() + PORT_RETRY_DELAY < deadline => {
+                if cancellation.is_cancelled() { return Err(std::io::ErrorKind::Interrupted.into()); }
+                std::thread::sleep(PORT_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(unix)]
+const PORT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[cfg(unix)]
+fn connect_address_once(address: &std::net::SocketAddr, timeout: std::time::Duration, cancellation: &TcpCancellation) -> std::io::Result<std::net::TcpStream> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let address = SockAddr::from(*address);
     let fd = socket(address.family(), libc::SOCK_STREAM, 0).map_err(std::io::Error::other)?;
@@ -143,6 +163,7 @@ fn connect_address_cancellable(address: &std::net::SocketAddr, timeout: std::tim
                 }
             }
         }
+        Err(error) if error.0 == "EADDRNOTAVAIL" => return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, error)),
         Err(error) => return Err(std::io::Error::other(error)),
     }
     if cancellation.is_cancelled() { return Err(std::io::ErrorKind::Interrupted.into()); }

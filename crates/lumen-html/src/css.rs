@@ -67,6 +67,7 @@ mod popover_ua;
 mod focus_ring_ua;
 mod marker_ua;
 mod html_text_ua;
+mod form_control_ua;
 mod mask_shorthand;
 mod text_decoration_inset;
 pub(crate) fn text_indent_keywords(mode: u8) -> &'static str { text_indent::keywords(mode) }
@@ -142,6 +143,7 @@ mod individual_transforms;
 mod backface_visibility;
 pub mod text_breaks;
 mod numeric_tokens;
+mod component_spacing;
 mod text_props;
 mod text_align_last;
 pub mod linear_numeric;
@@ -2989,6 +2991,10 @@ pub struct StyleExtras {
     pub min_height_auto: bool,
     /// `flex-basis: content` differs from `auto` when the main size is set.
     pub flex_basis_content: bool,
+    /// Set on a style projected for intrinsic sizing whose `width` or
+    /// `max-width` was a cyclic percentage: a replaced element's min-content
+    /// contribution is then zero (CSS Sizing 3 section 5.2.2).
+    pub compressible_percentage: bool,
     /// Intrinsic sizing keyword retained until flex layout has the available
     /// main size and can compute the corresponding intrinsic contribution.
     pub flex_basis_intrinsic: Option<IntrinsicSizing>,
@@ -3270,6 +3276,7 @@ static INITIAL_EXTRAS: StyleExtras = StyleExtras {
     min_width_auto: true,
     min_height_auto: true,
     flex_basis_content: false,
+    compressible_percentage: false,
     flex_basis_intrinsic: None,
     sibling_position_dependent: false,
     gap_specified: false,
@@ -4842,7 +4849,7 @@ impl Style {
                     continue;
                 }
                 match slot {
-                    3 => { used.width = None; used.set_intrinsic_size_keyword(3, None); }
+                    3 => { used.width = None; used.set_intrinsic_size_keyword(3, None); used.compressible_percentage |= self.writing_mode == WritingMode::HorizontalTb; }
                     4 => {
                         used.height = None;
                         used.height_intrinsic = None;
@@ -4857,7 +4864,7 @@ impl Style {
                         used.min_height_auto = false;
                         used.min_height_intrinsic = None;
                     }
-                    24 => { used.max_width = None; used.set_intrinsic_size_keyword(24, None); }
+                    24 => { used.max_width = None; used.set_intrinsic_size_keyword(24, None); used.compressible_percentage |= self.writing_mode == WritingMode::HorizontalTb; }
                     52 => {
                         used.max_height = None;
                         used.max_height_intrinsic = None;
@@ -12552,14 +12559,11 @@ const SVG_UNSUPPORTED_CSS_PROPERTIES: &[&str] = &[
     "marker-end",
     "marker-mid",
     "marker-start",
-    "mask",
     "paint-order",
-    "shape-rendering",
     "stroke-dasharray",
     "stroke-dashoffset",
     "text-anchor",
     "textlength",
-    "text-rendering",
     "vector-effect",
 ];
 
@@ -19479,6 +19483,8 @@ fn append_closed_declaration_pair_values(name:&str,raw:&str,offset:usize,defer_v
             completed
         };
         let (raw, important) = important_value(completed.as_ref());
+        let separated = component_spacing::separate(name, raw);
+        let raw = separated.as_deref().unwrap_or(raw);
         if name.starts_with("--") {
             if name.len() > 256 || raw.len() > MAX_VARIABLE_BYTES {
                 return Err(CssError {
@@ -27052,6 +27058,7 @@ fn align_block_level_child(style: &mut Style, parent: &Style) {
 fn html_flow_list_defaults(kind:&NodeKind,context:Option<(&Document,NodeId)>,parent:Option<&Style>,style:&mut Style,mut provenance:Option<&mut EffectEligibility>)->Option<f32> {
     let NodeKind::Element{namespace:Namespace::Html,name,attributes}=kind else{return None;};
     let tag=crate::svg::local_name(name);
+    if tag=="video" {extra_props::set_stored(style,"object-fit",Some("contain"));}
     if tag=="fieldset" {
         style.logical_margin_inline=[Some(Some(2.0));2];
         style.logical_padding_inline=[Some(style.font_size*0.75);2];
@@ -30598,6 +30605,8 @@ fn compute_for_named_registered_inner(
     let mut html_padding_hint = None;
     let mut html_valign_hint = None;
     let mut html_nowrap_hint = None;
+    let mut form_ua_saved: Option<form_control_ua::Saved> = None;
+    let mut form_ua_select = false;
     let mut html_dimensions = [None; 2];
     let mut html_text_align_hint = None;
     let mut html_list_hint = None;
@@ -30968,6 +30977,10 @@ fn compute_for_named_registered_inner(
                     html_nowrap_hint=Some(WhiteSpace::Pre);
                 }
                 if tag=="button" {
+                    if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[7,13,129,130,131,139,140,185,199,200]);}
+                    form_ua_saved.get_or_insert_with(||form_control_ua::Saved::capture(&style));
+                    form_control_ua::small_control_font(&mut style);
+                    form_control_ua::push_button_box(&mut style);
                     style.display=Display::InlineBlock;
                     style.box_sizing=BoxSizing::BorderBox;
                     Value::TextAlign(TextAlign::Center).apply(&mut style);
@@ -30976,7 +30989,11 @@ fn compute_for_named_registered_inner(
                 if tag=="input" {
                     let input_type=crate::svg::attribute(attributes,"type").map_or("text",|value|value);
                     let button=["reset","button","submit"].iter().any(|kind|input_type.eq_ignore_ascii_case(kind));
-                    if button {Value::TextAlign(TextAlign::Center).apply(&mut style);}
+                    if button {
+                        Value::TextAlign(TextAlign::Center).apply(&mut style);
+                        form_ua_saved.get_or_insert_with(||form_control_ua::Saved::capture(&style));
+                        form_control_ua::push_button_box(&mut style);
+                    }
                     if button || ["radio","checkbox","color","search"].iter().any(|kind|input_type.eq_ignore_ascii_case(kind))
                         || context.is_some_and(|(document,_)|document.document_mode()==crate::DocumentMode::Quirks)&&!input_type.eq_ignore_ascii_case("image") {
                         style.box_sizing=BoxSizing::BorderBox;
@@ -30986,6 +31003,13 @@ fn compute_for_named_registered_inner(
                     } else if !["file","range","checkbox","radio"].iter().any(|kind|input_type.eq_ignore_ascii_case(kind)) {
                         Value::ContentAlignment{slot:49,alignment:Some(JustifyContent::Center),safe:Some(false),keyword:None}.apply(&mut style);
                     }
+                }
+                if tag=="select" {
+                    if let Some(provenance)=eligibility.as_deref_mut(){provenance.ua_override(&[7,13,129,130,131,139,140,185,199,200,54]);}
+                    form_ua_select=true;
+                    form_ua_saved.get_or_insert_with(||form_control_ua::Saved::capture(&style));
+                    form_control_ua::small_control_font(&mut style);
+                    form_control_ua::select_box(&mut style);
                 }
                 if tag=="select" || tag=="textarea"&&context.is_some_and(|(document,_)|document.document_mode()==crate::DocumentMode::Quirks) {
                     style.box_sizing=BoxSizing::BorderBox;
@@ -31433,6 +31457,14 @@ fn compute_for_named_registered_inner(
         }
     }
     candidates.sort_by_key(|(priority, _, _)| *priority);
+    let appearance_base = candidates.iter().rev().find_map(|(_, declaration, _)| match &declaration.value {
+        // `base-select` opts only drop-down boxes out of the native look.
+        Value::Appearance(value) => Some(*value == Appearance::Base || *value == Appearance::BaseSelect && form_ua_select),
+        _ => None,
+    }).unwrap_or(false);
+    if appearance_base {
+        if let Some(saved) = form_ua_saved.take() { saved.restore(&mut style); }
+    }
     for (_, declaration, _) in candidates.iter_mut() {
         let Value::Custom(name, raw) = &declaration.value else { continue; };
         let registered_random = owner_values::uses_random(raw) && registrations.iter().any(|registration| registration.name.as_str() == &**name);
@@ -31643,10 +31675,18 @@ fn compute_for_named_registered_inner(
                 if let Ok(NodeKind::Element{namespace:Namespace::Html,name,..})=document.kind(node) {
                     let tag=crate::svg::local_name(name);
                     let scheme=style.used_color_scheme(index.environment).scheme;
-                    if matches!(tag,"input"|"textarea") {
-                        let foreground=color_scheme::system_color("fieldtext",scheme).expect("UA field foreground");
-                        let surface=color_scheme::system_color("field",scheme).expect("UA field surface");
-                        let border=color_scheme::system_color("graytext",scheme).expect("UA field border");
+                    if !appearance_base && matches!(tag,"input"|"textarea"|"select"|"button") {
+                        let push_button=tag=="button"
+                            || tag=="input" && matches!(crate::forms::input_type_state(document,node),"button"|"submit"|"reset"|"color");
+                        let (foreground,surface,border)=if push_button {(
+                            color_scheme::system_color("buttontext",scheme).expect("UA button foreground"),
+                            color_scheme::system_color("buttonface",scheme).expect("UA button surface"),
+                            color_scheme::system_color("buttonborder",scheme).expect("UA button border"),
+                        )} else {(
+                            color_scheme::system_color("fieldtext",scheme).expect("UA field foreground"),
+                            color_scheme::system_color("field",scheme).expect("UA field surface"),
+                            color_scheme::system_color("buttonborder",scheme).expect("UA field border"),
+                        )};
                         style.color=foreground;style.background=surface;style.border_color=border;
                         if let Some(reverted)=reverted.as_mut(){reverted.color=foreground;reverted.background=surface;reverted.border_color=border;}
                     }
@@ -32367,8 +32407,8 @@ fn compute_for_named_registered_inner(
     }
     if winning_priority(&winner_at, &expanded, 10) == BASELINE_PRIORITY
         && style.border_color_sides.iter().all(Option::is_none)
-        && !(pseudo_target.is_none() && matches!(kind,NodeKind::Element{namespace:Namespace::Html,name,..}
-            if crate::svg::local_name(name)=="fieldset"))
+        && !(pseudo_target.is_none() && !appearance_base && matches!(kind,NodeKind::Element{namespace:Namespace::Html,name,..}
+            if matches!(crate::svg::local_name(name),"fieldset"|"button"|"input"|"select"|"textarea")))
     {
         style.border_color = style.color;
         if let Some(source)=style.source_color(1) {

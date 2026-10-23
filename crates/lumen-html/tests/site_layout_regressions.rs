@@ -142,3 +142,94 @@ fn legacy_clip_rect_ignores_statically_positioned_boxes() {
     let list = commands("<style>body{margin:0}#a{clip:rect(0 0 0 0)}</style><div id=a>shown</div>", 200, 100);
     assert!(clips_over_glyphs(&list)[0].is_empty());
 }
+
+fn has_clip(stack: &[lumen_html::paint::Rect], width: f32, height: f32) -> bool {
+    stack.iter().any(|rect| rect.width == width && rect.height == height)
+}
+
+#[test]
+fn relative_inline_in_static_overflow_hidden_box_stays_clipped_after_a_positioned_sibling() {
+    let list = commands(
+        "<style>body{margin:0}#o{position:relative}#abs{position:absolute;left:0;top:50px;width:5px;height:5px}\
+         #s{width:60px;height:20px;overflow:hidden}#r{position:relative}</style>\
+         <div id=o><div id=abs></div><div id=s><span id=r>text</span></div></div>",
+        200,
+        100,
+    );
+    let runs = clips_over_glyphs(&list);
+    assert_eq!(runs.len(), 1);
+    assert!(has_clip(&runs[0], 60.0, 20.0), "clip stack: {:?}", runs[0]);
+}
+
+#[test]
+fn relative_block_in_static_overflow_hidden_box_stays_clipped_after_a_positioned_sibling() {
+    let list = commands(
+        "<style>body{margin:0}#o{position:relative}#abs{position:absolute;left:0;top:50px;width:5px;height:5px}\
+         #s{width:60px;height:20px;overflow:hidden}#r{position:relative}</style>\
+         <div id=o><div id=abs></div><div id=s><div id=r>text</div></div></div>",
+        200,
+        100,
+    );
+    let runs = clips_over_glyphs(&list);
+    assert_eq!(runs.len(), 1);
+    assert!(has_clip(&runs[0], 60.0, 20.0), "clip stack: {:?}", runs[0]);
+}
+
+#[test]
+fn relative_inline_in_absolute_overflow_hidden_box_stays_clipped() {
+    let list = commands(
+        "<style>body{margin:0}#o{position:relative}#b{position:absolute;left:0;top:0;width:1px;height:1px;overflow:hidden}\
+         #c{position:absolute;left:0;top:40px;width:5px;height:5px}#r{position:relative}</style>\
+         <div id=o><div id=b><a id=r>hidden</a></div><div id=c></div></div>",
+        200,
+        100,
+    );
+    let runs = clips_over_glyphs(&list);
+    assert_eq!(runs.len(), 1);
+    assert!(has_clip(&runs[0], 1.0, 1.0), "clip stack: {:?}", runs[0]);
+}
+
+#[test]
+fn absolute_box_contained_outside_an_overflow_hidden_ancestor_is_not_clipped_by_it() {
+    let list = commands(
+        "<style>body{margin:0}#o{position:relative;width:200px}#s{width:20px;height:20px;overflow:hidden}\
+         #a{position:absolute;left:0;top:0}</style>\
+         <div id=o><div id=s><div id=a>out</div></div></div>",
+        200,
+        100,
+    );
+    let runs = clips_over_glyphs(&list);
+    assert_eq!(runs.len(), 1);
+    assert!(!has_clip(&runs[0], 20.0, 20.0), "clip stack: {:?}", runs[0]);
+}
+
+#[test]
+fn legacy_clip_rect_hides_relative_descendants_of_the_clipped_box() {
+    let list = commands(
+        "<style>body{margin:0}#o{position:relative}#b{position:absolute;left:0;top:0;width:80px;height:20px;clip:rect(0 0 0 0)}\
+         #c{position:absolute;left:0;top:40px;width:5px;height:5px}#r{display:block;position:relative}</style>\
+         <div id=o><div id=b><a id=r>hidden</a></div><div id=c></div></div>",
+        200,
+        100,
+    );
+    let runs = clips_over_glyphs(&list);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].iter().any(|rect| rect.width == 0.0 || rect.height == 0.0), "clip stack: {:?}", runs[0]);
+}
+
+#[test]
+fn minified_adjacent_dimensions_are_separate_component_values() {
+    let list = commands(
+        "<style>body{margin:0}#a{margin:0 4px.8px;width:10px;height:4px;background:red}</style><div id=a></div>",
+        100,
+        50,
+    );
+    let xs: Vec<f32> = list
+        .into_iter()
+        .filter_map(|command| match command {
+            Command::FillRect { rect, color } if color.a == 255 && rect.height == 4.0 => Some(rect.x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(xs, [4.0]);
+}

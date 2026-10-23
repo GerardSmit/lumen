@@ -555,6 +555,14 @@ fn expansion(name: Arc<str>, raw: &str, important: bool) -> Result<Option<Vec<En
             anchored.as_str()
         }
     };
+    let spaced;
+    let raw = match super::component_spacing::separate(&name, raw) {
+        Some(respaced) => {
+            spaced = respaced;
+            spaced.as_str()
+        }
+        None => raw,
+    };
     let numeric;
     let raw = match super::numeric_tokens::canonicalize(&name, raw) {
         Some(canonical) => {

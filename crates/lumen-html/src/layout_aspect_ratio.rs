@@ -41,7 +41,8 @@ pub(super) fn transferred_inline_size(style: &Style, content_width: f32) -> f32 
 /// contributes nothing to its container's min-content size (CSS Sizing 3
 /// section 5.2.2).
 pub(super) fn compressible_replaced(style: &Style) -> bool {
-    style.has_width_percentage() || style.has_max_width_percentage()
+    style.writing_mode == css::WritingMode::HorizontalTb
+        && (style.compressible_percentage || style.has_width_percentage() || style.has_max_width_percentage())
 }
 
 /// Boxes whose auto size is derived from the preferred ratio in normal flow.

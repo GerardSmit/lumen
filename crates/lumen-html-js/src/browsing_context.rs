@@ -585,6 +585,9 @@ pub(crate) struct BrowsingContext {
     realm: RefCell<RealmHandle>,
     window_proxy: RefCell<Option<WeakValue>>,
     document: RefCell<Option<Rc<DomRealm>>>,
+    /// The root of the document a retired navigable last had, so a host still holding it gets a
+    /// stale request instead of a missing owner.
+    retired_root: Cell<Option<NodeId>>,
     parent: Option<std::rc::Weak<BrowsingContext>>,
     opener: RefCell<Option<std::rc::Weak<BrowsingContext>>>,
     owner_realm: Option<std::rc::Weak<DomRealm>>,
@@ -763,6 +766,10 @@ impl FrameContext {
 
     pub fn top_document(&self) -> Option<Rc<DomRealm>> { self.inner.top_context().document() }
     pub fn parent_navigation_context(&self) -> Option<FrameContext> { self.inner.parent_context().map(|inner| FrameContext { inner }) }
+
+    pub fn is_discarded(&self) -> bool {
+        !self.inner.is_active()
+    }
 
     pub fn current_document(&self) -> Option<Rc<DomRealm>> {
         self.inner
@@ -1349,10 +1356,28 @@ fn create_html_element(
         .map_err(FrameInstallError::Document)
 }
 
+fn retired_request(context: &BrowsingContext, owner: NodeId) -> FrameNavigationRequest {
+    FrameNavigationRequest {
+        owner,
+        source: FrameSource::Blank,
+        base_url: "about:blank".into(),
+        generation: context.navigation_generation.get(),
+        unsupported: None,
+        initiator_origin: context.root_or_child_origin(),
+        post_resource: None,
+        metadata: NavigationMetadata { policy_container: Default::default(), cookie_source_url: None, referrer: lumen_common::referrer::Referrer { source: "about:blank".into(), policy: Default::default() }, inherited_referrer_policy: Default::default(), source_element: None, user_involvement: UserNavigationInvolvement::None },
+    }
+}
+
 fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
     if let Some((source,url))=context.javascript_document.borrow().clone() {
         let document=context.document().expect("active navigable document");
         return FrameNavigationRequest {owner:context.owner_node.unwrap_or_else(||document.session.borrow().document().root()),source:FrameSource::JavaScriptDocument{source,url},base_url:document.base_url(),generation:context.navigation_generation.get(),unsupported:None,post_resource:None,metadata:NavigationMetadata::from_document(&document),initiator_origin:context.root_or_child_origin()};
+    }
+    if !context.active.get() && context.document().is_none() {
+        if let Some(owner) = context.owner_node.or_else(|| context.retired_root.get()) {
+            return retired_request(context, owner);
+        }
     }
     if context.parent.is_none() || context.history_navigation.borrow().is_some() || context.committed_history_entry.borrow().is_some() {
         let document = context.document().expect("active navigable has a document");
@@ -1562,6 +1587,7 @@ impl BrowsingContext {
             realm: RefCell::new(realm),
             window_proxy: RefCell::new(None),
             document: RefCell::new(None),
+            retired_root: Cell::new(None),
             parent: None,
             opener: RefCell::new(None),
             owner_realm: None,
@@ -1928,6 +1954,7 @@ impl BrowsingContext {
             .set(self.navigation_generation.get().wrapping_add(1));
         let retired_document=self.document.borrow_mut().take();
         if let Some(document) = retired_document {
+            self.retired_root.set(Some(document.session.borrow().document().root()));
             let realm=self.realm_handle();
             match ctx.with_host_realm(&realm,|ctx|super::animations::retire_document(ctx,&document)) {
                 Ok(Ok(()))=>{},
@@ -2347,6 +2374,7 @@ impl DomRealm {
             realm: RefCell::new(child_realm.clone()),
             window_proxy: RefCell::new(None),
             document: RefCell::new(None),
+            retired_root: Cell::new(None),
             parent: node.map(|_|Rc::downgrade(&parent)),
             opener: RefCell::new(node.is_none().then(||Rc::downgrade(&parent))),
             owner_realm: node.map(|_|Rc::downgrade(self)),

@@ -25,7 +25,7 @@ pub(crate) fn draw_quad(
         rect.height * sink.scale * 0.5,
     ];
     let center = [rect.x * sink.scale + half[0], rect.y * sink.scale + half[1]];
-    let r = radius * sink.scale;
+    let r = (radius * sink.scale).min(half[0]).min(half[1]);
     // Pixels whose distance is below -0.5 - MARGIN have coverage exactly 1; MARGIN absorbs
     // float rounding of the signed-distance expression.
     const MARGIN: f32 = 0.05;

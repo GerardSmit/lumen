@@ -221,6 +221,24 @@ fn line_break_tailoring(mode: LineBreak, east_asian: bool, left: char, right: ch
     (allow && ideograph_break_after(left)).then_some(true)
 }
 
+/// Browsers keep URL-like runs together: ICU-based engines allow no break
+/// after a solidus (SY) when an alphanumeric follows, which UAX #14 would
+/// otherwise permit through LB31.
+fn solidus_glue(text: &str, at: usize) -> bool {
+    let (Some(before), Some(after)) = (text[..at].chars().next_back(), text[at..].chars().next())
+    else {
+        return false;
+    };
+    ucd::break_property(before as u32) == BreakClass::Symbol
+        && matches!(
+            ucd::break_property(after as u32),
+            BreakClass::Alphabetic
+                | BreakClass::HebrewLetter
+                | BreakClass::Numeric
+                | BreakClass::Ambiguous
+        )
+}
+
 /// The policy callback selects the containing inline style for each unit.
 /// Untailored paragraphs never invoke it or traverse the grapheme iterator.
 pub fn opportunities_with<'a>(
@@ -237,7 +255,9 @@ pub fn opportunities_with<'a>(
     let mut clusters = ucd::graphemes(text).peekable();
     core::iter::from_fn(move || {
         if !tailored {
-            return ordinary.next();
+            return ordinary
+                .by_ref()
+                .find(|&(at, kind)| !(kind == BreakOpportunity::Allowed && solidus_glue(text, at)));
         }
         loop {
             let (start, cluster) = clusters.next()?;
@@ -250,7 +270,10 @@ pub fn opportunities_with<'a>(
             while ordinary.peek().is_some_and(|&(offset, _)| offset <= end) {
                 let (offset, opportunity) = ordinary.next()?;
                 if offset == end {
-                    kind = Some(opportunity);
+                    let glued = opportunity == BreakOpportunity::Allowed
+                        && word_break != WordBreak::BreakAll
+                        && solidus_glue(text, offset);
+                    kind = (!glued).then_some(opportunity);
                 }
             }
             if kind == Some(BreakOpportunity::Mandatory) {
@@ -308,6 +331,25 @@ pub fn opportunities_with<'a>(
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn solidus_before_alphanumerics_is_not_a_break_opportunity() {
+        let breaks = |text| {
+            opportunities(text, WordBreak::Normal, OverflowWrap::Normal, false)
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>()
+        };
+        for text in [
+            "aaaa/bbbb", "aaaa//bbbb", "aaaa://bbbb", "http://bbbb", "1234/5678", "aaaa/1234",
+            "aaaa.bbbb", "aaaa,bbbb", "aaaa;bbbb",
+        ] {
+            assert_eq!(breaks(text), [text.len()], "{text}");
+        }
+        for text in ["aaaa?bbbb", "aaaa-bbbb"] {
+            assert_eq!(breaks(text), [5, text.len()], "{text}");
+        }
+        assert_eq!(breaks("aaaa/ bbbb"), [6, 10]);
+    }
 
     #[test]
     fn specification_lexical_fallback_preserves_units_manual_policy_and_joiners() {

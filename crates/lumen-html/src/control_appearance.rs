@@ -1,7 +1,7 @@
 //! One HTML widget presentation policy for layout, pseudo eligibility and ink.
 //! The state is operation-local; semantics and live values remain in shared DOM.
 use crate::{
-    css::{Appearance, Style},
+    css::{Appearance, Display, Style, WritingMode},
     forms, Document, Namespace, NodeId, NodeKind,
 };
 
@@ -83,5 +83,52 @@ pub(crate) fn presentation(
             && (native || style.widget_devolved || style.appearance == Appearance::MenulistButton),
         base_select: widget == Widget::Select
             && matches!(style.appearance, Appearance::Base | Appearance::BaseSelect),
+    })
+}
+
+/// Width reserved for the arrow of a native drop-down box.
+pub(crate) const MENULIST_ARROW_WIDTH: f32 = 12.0;
+pub(crate) const MENULIST_BLOCK_PADDING: f32 = 1.0;
+pub(crate) const MENULIST_INLINE_PADDING: f32 = 4.0;
+
+/// Physical `[top, right, bottom, left]` padding of the anonymous inner block
+/// Chromium puts around the label of a drop-down box, on top of the element's
+/// own padding. Primitive `appearance: none` and base selects have none, and a
+/// size-contained axis has none.
+pub(crate) fn menulist_internal_padding(
+    document: &Document,
+    node: NodeId,
+    style: &Style,
+) -> Option<[f32; 4]> {
+    let [top, right, bottom, left] = menulist_inner_padding(document, node, style)?;
+    // The inner block is part of the contents that size containment replaces.
+    let (horizontal, vertical) = (!style.contains_size_axis(true), !style.contains_size_axis(false));
+    Some([
+        if vertical { top } else { 0.0 },
+        if horizontal { right } else { 0.0 },
+        if vertical { bottom } else { 0.0 },
+        if horizontal { left } else { 0.0 },
+    ])
+}
+
+/// The inner block padding of a drop-down box whatever its containment: its
+/// label is still laid out inside that block.
+pub(crate) fn menulist_inner_padding(
+    document: &Document,
+    node: NodeId,
+    style: &Style,
+) -> Option<[f32; 4]> {
+    if matches!(style.display, Display::None | Display::Contents) {
+        return None;
+    }
+    let control = presentation(document, node, style)?;
+    if control.widget != Widget::Select || !control.dropdown_button {
+        return None;
+    }
+    let (block, inline) = (MENULIST_BLOCK_PADDING, MENULIST_INLINE_PADDING);
+    Some(if style.writing_mode == WritingMode::HorizontalTb {
+        [block, inline, block, inline]
+    } else {
+        [inline, block, inline, block]
     })
 }

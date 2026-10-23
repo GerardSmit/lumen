@@ -389,7 +389,7 @@ mod tests {
     fn unsupported_svg_properties_are_found_only_by_name() {
         assert_eq!(
             unsupported_svg_style_properties("fill:red;Stroke-Dasharray:2;stroke-dasharray:3;marker-end:url(#a);mask:none"),
-            ["stroke-dasharray", "marker-end", "mask"]
+            ["stroke-dasharray", "marker-end"]
         );
         assert!(unsupported_svg_style_properties("color:red;width:1px").is_empty());
         assert!(unsupported_svg_style_properties("content:'stroke-dasharray';width:1px").is_empty());

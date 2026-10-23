@@ -56,8 +56,44 @@ fn parse_tech(token: &str) -> Option<String> {
     Some(alloc::format!("tech({})", keywords.join(", ")))
 }
 
+/// Splits `url(a)format(b)` into its function tokens: CSS Syntax ends a function
+/// at its `)`, so minified sources may omit the whitespace between them.
+fn split_adjacent_functions(token: &str) -> Option<Vec<&str>> {
+    let bytes = token.as_bytes();
+    let mut pieces = Vec::new();
+    let (mut start, mut depth, mut quote) = (0, 0usize, None);
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(_) if byte == b'\\' => index += 1,
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'\\' => index += 1,
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 && index + 1 < bytes.len() {
+                        pieces.push(&token[start..=index]);
+                        start = index + 1;
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    pieces.push(&token[start..]);
+    Some(pieces)
+}
+
 fn parse_component(part: &str) -> Option<(FontFaceSource, Arc<str>)> {
-    let tokens = components_bounded(part, MAX_CSS_BYTES)?;
+    let mut tokens = Vec::new();
+    for token in components_bounded(part, MAX_CSS_BYTES)? {
+        tokens.extend(split_adjacent_functions(token)?);
+    }
     let first = *tokens.first()?;
     if let Some(url) = background_url(first) {
         let mut suffix = String::new();
@@ -141,5 +177,10 @@ mod tests {
         assert_eq!(&*parsed.suffixes[0], " format(woff2) tech(variations, palettes)");
         assert!(parse("url(x.ttf) tech(features-opentype) format(opentype)").is_none());
         assert!(parse("url(x.ttf) format(a, b)").is_none());
+        let minified = parse(r#"url("a.woff2")format("woff2"),url(b.woff)format(woff)tech(variations)"#).unwrap();
+        assert_eq!(minified.sources.len(), 2);
+        assert_eq!(&*minified.suffixes[0], r#" format("woff2")"#);
+        assert_eq!(&*minified.suffixes[1], " format(woff) tech(variations)");
+        assert!(parse("url(a.ttf)junk").is_none());
     }
 }

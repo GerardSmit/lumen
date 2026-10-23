@@ -58,6 +58,12 @@ pub trait ImageResolver {
     fn resolve_from(&self, _base: &str, source: &str) -> ImageState {
         self.resolve(source)
     }
+    /// A `<video poster>` image. Hosts which gate the document's load event
+    /// on the images they fetch must not gate it on this one (HTML, poster
+    /// frame: the fetch does not delay the load event).
+    fn resolve_poster_from(&self, base: &str, source: &str) -> ImageState {
+        self.resolve_from(base, source)
+    }
     /// Whether a decoded resource may be read back through Canvas APIs.
     /// Hosts that apply the browser's same-origin/CORS rules override this.
     fn origin_clean_from(&self, _base: &str, _source: &str) -> bool {
@@ -135,6 +141,7 @@ pub trait ImageResolver {
 pub enum PendingLookup {
     Source(Arc<str>),
     From(Arc<str>, Arc<str>),
+    Poster(Arc<str>, Arc<str>),
     NodeFrom(NodeId, Arc<str>, Arc<str>),
     Request(NodeId, Arc<str>, Arc<str>, ImageRequestParameters),
     Node(NodeId),
@@ -335,6 +342,20 @@ fn resolve_element_image(
     })
 }
 
+/// The poster image of a `<video>`, resolved like an `img` source against the
+/// document base URL. `None` when the element has no usable `poster`.
+fn resolve_video_poster<'a>(
+    images: &dyn ImageResolver,
+    attributes: &'a [(crate::Name, String)],
+    base: Option<&str>,
+) -> Option<(&'a str, ImageState)> {
+    let source = crate::svg::attribute(attributes, "poster")?.trim_matches(|c: char| c.is_ascii_whitespace());
+    if source.is_empty() {
+        return None;
+    }
+    Some((source, images.resolve_poster_from(base.unwrap_or(""), source)))
+}
+
 pub(crate) fn replacement_content_url(style: &Style) -> Result<Option<Arc<str>>, LayoutError> {
     match style.generated_content() {
         css::GeneratedContent::Normal | css::GeneratedContent::None => Ok(None),
@@ -412,12 +433,10 @@ const SVG_UNSUPPORTED_ATTRIBUTES: &[&str] = &[
     "paint-order",
     "pathLength",
     "rotate",
-    "shape-rendering",
     "stroke-dasharray",
     "stroke-dashoffset",
     "text-anchor",
     "textLength",
-    "text-rendering",
     "vector-effect",
 ];
 
@@ -508,6 +527,9 @@ pub fn unsupported_svg_features(
                     features.insert(SvgUnsupportedFeature::PaintServer);
                 }
             }
+            if !svg_mask_layout::svg_mask_supported(document, &style)? {
+                features.insert(SvgUnsupportedFeature::Attribute("mask".into()));
+            }
             for property in rules.unsupported_svg_properties_for_node(document, node) {
                 if !matches!(property.as_str(), "width" | "height")
                     || !matches!(tag, "rect" | "svg" | "symbol" | "use")
@@ -517,7 +539,7 @@ pub fn unsupported_svg_features(
             }
             for (attribute, value) in attributes {
                 let local = crate::svg::local_name(attribute);
-                if SVG_UNSUPPORTED_ATTRIBUTES.contains(&local)
+                if SVG_UNSUPPORTED_ATTRIBUTES.contains(&local) && local != "mask"
                     && !(local == "filter" && css::supports_property_value("filter", value)) {
                     features.insert(SvgUnsupportedFeature::Attribute(local.into()));
                 }
@@ -950,7 +972,7 @@ fn svg_clip_reference_supported(
         let tag = crate::svg::local_name(name);
         let style = css::compute_node_cached(document, current, None, rules, &mut cache)
             .map_err(LayoutError::Css)?;
-        if style.svg_clip_path.is_some() {
+        if style.svg_clip_path.is_some() || style.has_mask() {
             return Ok(false);
         }
         if matches!(tag, "title" | "desc" | "metadata" | "defs" | "view") {
@@ -1121,6 +1143,9 @@ fn svg_use_target_supported(
             return Ok(false);
         }
     }
+    if !svg_mask_layout::svg_mask_supported(document, &style)? {
+        return Ok(false);
+    }
     if rules
         .unsupported_svg_properties_in_instance(document, target, frames)
         .into_iter()
@@ -1132,7 +1157,7 @@ fn svg_use_target_supported(
         let local = crate::svg::local_name(attribute);
         if tag=="tspan" && matches!(local,"x"|"y"|"dx"|"dy") {return Ok(false);}
         if tag=="symbol" && matches!(local,"refX"|"refY") && !crate::svg::supports_symbol_reference(value,local=="refX") {return Ok(false);}
-        if (SVG_UNSUPPORTED_ATTRIBUTES.contains(&local)
+        if (SVG_UNSUPPORTED_ATTRIBUTES.contains(&local) && local != "mask"
                     && !(local == "filter" && css::supports_property_value("filter", value)))
             || (local == "transform" && crate::svg::transform_unsupported(value))
             || (svg_length_attribute(tag, local) && !svg_length_attribute_supported(tag,local,value))
@@ -1884,6 +1909,9 @@ pub(crate) struct IntrinsicSizes {
     /// Flow children built by a flex or grid container's first intrinsic
     /// pass, kept for the other mode's pass of the same frame.
     children: RefCell<Vec<IntrinsicChildren>>,
+    /// Block sizes of stretched column flex items laid out this frame, so
+    /// nested column flex containers measure each item once per width.
+    stretched: RefCell<Vec<StretchedFlexHeight>>,
     /// Source-ancestry computed styles of list items, which the marker
     /// origin resolves in both intrinsic sizing and box layout.
     tree_styles: RefCell<BTreeMap<u128, TreeStyleEntry>>,
@@ -1938,9 +1966,25 @@ struct IntrinsicChildren {
 
 const MAX_INTRINSIC_CHILDREN_MEMO: usize = 64;
 
+struct StretchedFlexHeight {
+    frame: u32,
+    id: NodeId,
+    width: f32,
+    inline_size: f32,
+    parent_height: Option<f32>,
+    item: Style,
+    container: Style,
+    context: IntrinsicContext,
+    axes: u8,
+    height: f32,
+}
+
+const MAX_STRETCHED_FLEX_MEMO: usize = 256;
+
 impl IntrinsicSizes {
     fn clear(&self) {
         self.children.borrow_mut().clear();
+        self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
         *self.slots.borrow_mut() = BTreeMap::new();
         self.languages.borrow_mut().clear();
@@ -1951,6 +1995,12 @@ impl IntrinsicSizes {
     /// The margin escapes measured with the primary size of `slot`.
     fn margins(&self, slot: usize) -> Option<BlockMargins> {
         self.slots.borrow().get(&slot).and_then(|entry| entry.primary.as_ref()).and_then(|entry| entry.margins)
+    }
+    /// The float overflow of a block measured with exactly `style`.
+    fn float_below(&self, slot: usize, style: &Style) -> f32 {
+        self.slots.borrow().get(&slot).and_then(|entry| entry.primary.as_ref())
+            .filter(|entry| same_measured_style(&entry.style, style))
+            .and_then(|entry| entry.margins).map_or(0.0, |margins| margins.float_below)
     }
     /// Whether this frame already measured `slot` with `style`.
     fn measured_this_frame(&self, slot: usize, style: &Style) -> bool {
@@ -1964,6 +2014,7 @@ impl IntrinsicSizes {
         self.measured.set(0);
         self.reused.set(0);
         self.children.borrow_mut().clear();
+        self.stretched.borrow_mut().clear();
         self.tree_styles.borrow_mut().clear();
         self.frame.set(self.frame.get().wrapping_add(1));
         self.retain_newest(MAX_RETAINED_INTRINSICS);
@@ -4314,6 +4365,18 @@ impl MaskBinding {
     }
 }
 
+/// An out-of-flow box and its containing block node (`None` for the initial
+/// containing block). Grid and flex items are laid out and then translated;
+/// boxes whose containing block lies outside the item are translated back.
+struct EscapedPositioned {
+    commands: Range<usize>,
+    hits: Range<usize>,
+    containing: Option<NodeId>,
+    /// An axis without insets is placed at the static position, which lies
+    /// inside the item and moves with it.
+    static_axes: (bool, bool),
+}
+
 struct Layout<'a> {
     drawable_snapshot_root: Option<NodeId>,
     timeline_values:Option<&'a crate::animation::progress_timelines::TransformTimelineValues>,
@@ -4392,6 +4455,9 @@ struct Layout<'a> {
     /// window inside overflow clips so small scrolls can be replayed by
     /// translation.
     cull: Rect,
+    /// The area painted when it is taller than the viewport: canvas
+    /// backgrounds cover it, and `cull` is it.
+    paint_extent: Option<Rect>,
     /// Bumped by content whose position does not follow its scroll container
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
@@ -4422,6 +4488,7 @@ struct Layout<'a> {
     // Live inline CB scopes have no block OverflowFrame. Keep only active
     // sparse origins, bounded by traversal depth, never by arena high-water.
     inline_containing_origins: Vec<InlineContainingOrigin>,
+    escaped_positioned: Vec<EscapedPositioned>,
     root_scroll: (f32, f32),
     overflow_frames: Vec<OverflowFrame>,
     pending_overflow_placement: Option<(f64,f64)>,
@@ -4467,6 +4534,10 @@ struct Layout<'a> {
     content_range_fragments: BTreeMap<FlowContentRanges,Vec<FlowContentRanges>>,
     flow_paint_owners:Option<Box<FlowPaintOwners>>,
     paragraph_column_flow:Option<Box<ParagraphColumnFlow>>,
+    /// Multicol containers enclosing the box being laid out. Flex and grid
+    /// containers are not fragmented across their columns, so measurements
+    /// that assume an unfragmented item size do not apply inside them.
+    multicol_depth:usize,
     next_paint_order: u64,
     /// Subtree intrinsic sizes shared by the frame's layouts.
     intrinsics: Rc<IntrinsicSizes>,
@@ -4676,6 +4747,7 @@ impl<'a> Layout<'a> {
         geometry,
         scrolls,
         cull: viewport,
+        paint_extent: None,
         scroll_hazards: 0,
         gap_capture: None,
         root_anchors: 0,
@@ -4690,6 +4762,7 @@ impl<'a> Layout<'a> {
         fixed_containing_block: None,
         fixed_containing_block_node: None,
         inline_containing_origins: Vec::new(),
+        escaped_positioned: Vec::new(),
         root_scroll: (0.0, 0.0),
         overflow_frames: Vec::new(),
         pending_overflow_placement: None,
@@ -4722,6 +4795,7 @@ impl<'a> Layout<'a> {
         content_range_fragments: BTreeMap::new(),
         flow_paint_owners:None,
         paragraph_column_flow:None,
+        multicol_depth:0,
         next_paint_order: 0,
         intrinsics: retained_fragments.as_deref().map_or_else(Rc::default, |cache| Rc::clone(&cache.intrinsics)),
         style_cache,
@@ -4994,6 +5068,47 @@ impl Layout<'_> {
         frame.children.push(OverflowContribution{rect,margin,hits,key,paint_owner:None});
         self.overflow_contribution_count+=1;
         Ok(())
+    }
+    /// A grid or flex item is laid out and then translated by `(dx, dy)`.
+    /// Out-of-flow boxes inside it whose containing block is an ancestor of
+    /// the item (or the initial containing block) were already placed against
+    /// that block's final position, so they are translated back.
+    fn restore_escaped_positioned(&mut self,node:NodeId,generated:bool,commands:Range<usize>,hits:Range<usize>,dx:f32,dy:f32) {
+        if (dx==0.0 && dy==0.0) || self.escaped_positioned.is_empty() {return;}
+        let end=self.escaped_positioned.partition_point(|entry|entry.commands.end<=commands.end);
+        let mut restore:Vec<(Range<usize>,Range<usize>,(bool,bool))>=Vec::new();
+        for entry in self.escaped_positioned[..end].iter().rev() {
+            if entry.commands.end<commands.start {break;}
+            if entry.commands.start<commands.start || entry.hits.start<hits.start || entry.hits.end>hits.end {continue;}
+            if let Some((last_commands,last_hits,_))=restore.last() {
+                if entry.commands.start>=last_commands.start && entry.hits.start>=last_hits.start
+                    && entry.commands.end<=last_commands.end && entry.hits.end<=last_hits.end {continue;}
+            }
+            let escapes=match entry.containing {
+                None=>true,
+                Some(containing)=>{
+                    let mut current=if generated {Some(node)}else{self.document.parent(node).ok().flatten()};
+                    let mut found=false;
+                    while let Some(ancestor)=current {
+                        if ancestor==containing {found=true;break;}
+                        current=self.document.parent(ancestor).ok().flatten();
+                    }
+                    found
+                }
+            };
+            if escapes {restore.push((entry.commands.clone(),entry.hits.clone(),entry.static_axes));}
+        }
+        for (range,hit_range,(static_x,static_y)) in restore {
+            let (back_x,back_y)=(if static_x {0.0}else{-dx},if static_y {0.0}else{-dy});
+            if back_x==0.0 && back_y==0.0 {continue;}
+            for command in self.commands.get_mut(range).into_iter().flatten() {
+                move_command(command,back_x,back_y);
+            }
+            if let Some(geometry)=self.geometry.as_mut() {
+                Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(),hit_range.clone(),back_x,back_y);
+                geometry.move_hits(hit_range,back_x,back_y);
+            }
+        }
     }
     fn content_overflow_origin(&self,x:f32,y:f32)->(f64,f64) {
         self.overflow_frames.last().and_then(|frame|frame.content_anchor).map_or_else(||self.overflow_placement(x,y),|(paint,local)|
@@ -5374,6 +5489,9 @@ impl Layout<'_> {
         }
         if fallback & css::FALLBACK_PLAIN_SELECT != 0 && matches!(style.appearance, css::Appearance::Base | css::Appearance::BaseSelect) {
             style.appearance = css::Appearance::Auto;
+        }
+        if let Some(internal) = crate::control_appearance::menulist_internal_padding(self.document, node, &style) {
+            for (side, extra) in internal.into_iter().enumerate() { style.padding_sides[side] += extra; }
         }
         if let Some(root) = self.drawable_snapshot_root {
             if node != root && self.document.get_attribute_ns(node, None, "drawable").ok().flatten().is_some() {
@@ -6267,13 +6385,13 @@ impl Layout<'_> {
         }
         Self::ensure_inline_split_frames(paragraph,ancestors,frame_path,*frame_budget)?;
         let display=Self::table_child_display(child);
-        if matches!(display,Display::Inline|Display::InlineBlock|Display::InlineTable) {
+        let out_of_flow=matches!(&child.kind,FlattenedBoxChildKind::Generated(source)
+            if source.style.float != Float::None || matches!(source.style.position,Position::Absolute|Position::Fixed));
+        if !out_of_flow && matches!(display,Display::Inline|Display::InlineBlock|Display::InlineTable) {
             self.append_flattened_box_child_inline(child,available,paragraph,frame_path,depth)?;
             Self::check_inline_split_frame_budget(paragraph,*frame_budget)?;
         } else {
             let preceding=Self::inline_split_paragraph_has_content(paragraph);
-            let out_of_flow=matches!(&child.kind,FlattenedBoxChildKind::Generated(source)
-                if source.style.float != Float::None || matches!(source.style.position,Position::Absolute|Position::Fixed));
             Self::flush_inline_split_paragraph(output,paragraph,frame_path,*has_preceding_content,!*saw_in_flow_block&&!*has_preceding_content,frame_budget)?;
             Self::push_block_flow_item(output,BlockFlowItem::Child(child.clone()))?;
             if out_of_flow { *has_preceding_content |= preceding; }
@@ -6542,7 +6660,21 @@ impl Layout<'_> {
         let has_inline_atoms = output.iter().any(|item| {
             matches!(item, BlockFlowItem::Paragraph(paragraph) if !paragraph.atoms.is_empty())
         });
-        if saw_in_flow_block || has_inline_advance || has_inline_atoms {
+        // A float inside an inline box belongs to the enclosing block's float
+        // context at the current line. The legacy inline painter would lay it
+        // out as an in-line box and give the line its margin-box height.
+        let has_float = output.iter().any(|item| match item {
+            BlockFlowItem::Child(child) => {
+                child.computed_style.as_ref().is_some_and(|style| style.float != Float::None)
+                    || matches!(&child.kind, FlattenedBoxChildKind::Generated(source) if source.style.float != Float::None)
+            }
+            BlockFlowItem::Paragraph(_) => false,
+        });
+        // The legacy inline painter cannot place an out-of-flow generated box either.
+        let has_positioned_generated = output.iter().any(|item| matches!(item,
+            BlockFlowItem::Child(FlattenedBoxChild{kind:FlattenedBoxChildKind::Generated(source),..})
+                if matches!(source.style.position, Position::Absolute | Position::Fixed)));
+        if saw_in_flow_block || has_inline_advance || has_inline_atoms || has_float || has_positioned_generated {
 
             Ok(Some(output))
         } else {
@@ -6821,10 +6953,13 @@ impl Layout<'_> {
             let Some(cy) = coordinate("cy", 1, defaults.1[1]) else {
                 return Ok(None);
             };
-            let Some(fx) = coordinate("fx", 0, defaults.0[0]) else {
+            let inherited_focus = inherited_coords
+                .filter(|coords| coords.0 != coords.1)
+                .map(|coords| coords.0);
+            let Some(fx) = coordinate("fx", 0, inherited_focus.map_or(cx, |focus| focus[0])) else {
                 return Ok(None);
             };
-            let Some(fy) = coordinate("fy", 1, defaults.0[1]) else {
+            let Some(fy) = coordinate("fy", 1, inherited_focus.map_or(cy, |focus| focus[1])) else {
                 return Ok(None);
             };
             let end_radius = match crate::svg::attribute(attributes, "r") {
@@ -7337,6 +7472,7 @@ impl Layout<'_> {
         // viewport/clip-path continues to provide its real contour separately.
         let paint_viewport=if isolated{transform.inverse().map_or(Rect{x:user_box.min_x,y:user_box.min_y,width:user_box.width,height:user_box.height},|inverse|inverse.bounds(viewport))}else{viewport};
         let svg_clip=self.svg_layer_clip(style,paint_transform,user_box)?;
+        let svg_clip=self.with_svg_layer_mask(svg_clip,node,style,paint_transform,user_box,depth,use_chain)?;
         if opacity>=1.0 && style.filters.is_none() && svg_clip.is_none(){return Ok((paint_transform,paint_viewport,None));}
         let outer=isolated && transform!=Affine::IDENTITY;
         if outer{self.push_command(Command::PushTransform(transform))?;}
@@ -7571,7 +7707,7 @@ impl Layout<'_> {
             // canvas coverage, with images positioned by the root box.
             // Filter Effects §5 includes that propagated source before the
             // root's one filter and opacity application.
-            self.push_background_with_coverage(outer,canvas_source.then_some(self.viewport_rect()),style)?;
+            self.push_background_with_coverage(outer,canvas_source.then(|| self.canvas_coverage()),style)?;
         }
         let canvas_transform=direct_matrix.filter(|_|canvas_source);
         if let Some(matrix)=canvas_transform{self.push_command(Command::PushTransform(matrix))?;}
@@ -8081,7 +8217,7 @@ impl MarginStrut {
 /// in-flow content. `*_add` is the part of those margins already counted inside
 /// the measured block size, which a collapsing parent takes back out.
 #[derive(Clone, Copy, Default)]
-struct BlockMargins { lead: MarginStrut, lead_add: f32, trail: MarginStrut, trail_add: f32 }
+struct BlockMargins { lead: MarginStrut, lead_add: f32, trail: MarginStrut, trail_add: f32, float_below: f32 }
 
 #[derive(Clone, Copy)]
 struct InitialClearance { node: NodeId, pseudo: Option<css::PseudoElement>, clear: Clear, float_count: usize }
@@ -8178,6 +8314,22 @@ fn paint_scope_pop(command:&Command)->Result<Command,LayoutError>{
 fn paint_scope_closes(pop:&Command,push:&Command)->bool {
     matches!((pop,push),(Command::PopClip,Command::PushClip(_) | Command::PushBoxClip(_))|(Command::PopLayer,Command::PushLayer{..})|(Command::PopTransform,Command::PushTransform(_)))
 }
+/// Whether every scope opened in `commands` closes inside it and none closes a
+/// scope opened before it, so the slice can change position without changing
+/// which clips, layers and transforms enclose it or its neighbours.
+fn paint_scopes_self_contained(commands:&[Command])->bool {
+    let mut depth=0usize;
+    for command in commands {
+        match command {
+            Command::PushClip(_) | Command::PushBoxClip(_) | Command::PushLayer{..} | Command::PushTransform(_)=>depth+=1,
+            Command::PopClip | Command::PopLayer | Command::PopTransform=>{
+                let Some(next)=depth.checked_sub(1) else{return false;};depth=next;
+            },
+            _=>{}
+        }
+    }
+    depth==0
+}
 
 enum PositionedBoxSource {
     Node(NodeId),
@@ -8205,6 +8357,9 @@ struct FlexItem {
     shrink_base: f32,
     source_order: usize,
     cross: f32,
+    /// Main size `cross` was laid out at; NaN until then, because the intrinsic
+    /// cross size resolves percentages in descendants as cyclic.
+    measured_main: f32,
     edges: f32,
     cross_edges: f32,
     frozen: bool,
@@ -11993,7 +12148,7 @@ fn masked_background(paint: Command, rect: Rect, kind: BackgroundBox, style: &St
         commands.push(Command::StrokeBoxBorder(Box::new(
             crate::paint::BoxBorder {
                 rect,
-                radius: style.border_radius,
+                radius: border_paint_radius(rect, style),
                 widths: border_widths(style),
                 colors: [Rgba {
                     r: 255,
@@ -12135,6 +12290,19 @@ fn background_color(rect: Rect, style: &Style) -> Command {
         }
     };
     masked_background(paint, border_box, clip_kind, style)
+}
+
+/// Rebuilds a background colour fill, recorded for `style` at its unstretched
+/// size, for a border box stretched to `height`.
+fn stretched_background_color(rect: &Rect, style: &Style, height: f32) -> Command {
+    let inset = background_bleed_inset(style);
+    let outer = Rect {
+        x: rect.x - inset,
+        y: rect.y - inset,
+        width: rect.width + 2.0 * inset,
+        height,
+    };
+    background_color(outer, style)
 }
 
 fn background_bleed_inset(style: &Style) -> f32 {
@@ -14110,13 +14278,26 @@ fn stroke_border(
         }
     }
 }
+/// Percentage sizes that add up to the line (33.33% + 66.67%) can overshoot it by float
+/// rounding; Chrome sizes in 1/64 px units, so such items share a line there.
+const FLEX_LINE_SLACK: f32 = 1.0 / 64.0;
+
+/// Uniform border radius after the CSS Backgrounds 3 section 5.5 overlap
+/// reduction against the border box. Per-corner radii carry their own
+/// reduced values in `corners`.
+fn border_paint_radius(rect: Rect, style: &Style) -> f32 {
+    if style.border_corner_radii.is_some() {
+        return style.border_radius;
+    }
+    style.corner_radii(rect.width, rect.height)[0][0]
+}
 fn border(rect: Rect, style: &Style) -> Command {
     if style.border_corner_radii.is_some() {
         return side_border_commands(rect, style, None).next().expect("rounded border has one paint carrier");
     }
     stroke_border(
         rect,
-        style.border_radius,
+        border_paint_radius(rect, style),
         border_widths(style)[0],
         style.border_color_sides[0].unwrap_or(style.border_color),
         style.border_style_sides[0].map_or(style.border_pattern, css::BorderStyle::pattern),
@@ -14139,7 +14320,10 @@ fn outline_command(rect: Rect, style: &Style) -> Option<Command> {
     Some(stroke_border(
         rect,
         if style.border_radius > 0.0 {
-            (style.border_radius + expansion).max(0.0)
+            (style.border_radius + expansion)
+                .max(0.0)
+                .min(rect.width * 0.5)
+                .min(rect.height * 0.5)
         } else {
             0.0
         },
@@ -14355,7 +14539,7 @@ fn border_image_command(rect:Rect,style:&Style,images:Option<&dyn ImageResolver>
     if reduce<1.0{for width in &mut widths{*width*=reduce;}}
     Some(Command::FillBackground(Box::new(crate::paint::BackgroundFill{corners:None,rect:area,radius:0.0,positioning_rect:area,image_rect:area,repeat:[BackgroundRepeat::NoRepeat;2],
         image:BackgroundPaint::Border(Arc::new(crate::paint::BorderImagePaint{image:source,fallback:crate::paint::BoxBorder {
-            rect:Rect{x:outset[3],y:outset[0],width:rect.width,height:rect.height},radius:style.border_radius,
+            rect:Rect{x:outset[3],y:outset[0],width:rect.width,height:rect.height},radius:border_paint_radius(rect,style),
             widths:border_widths(style),colors:core::array::from_fn(|side|style.border_color_sides[side].unwrap_or(style.border_color)),
             pattern:style.border_pattern,side_patterns:Some(core::array::from_fn(|side|style.border_style_sides[side].unwrap_or(style.border_style).pattern())),
             corners:clipped_corners(rect,rect,style).map(|r|*r),
@@ -14365,7 +14549,7 @@ fn border_image_command(rect:Rect,style:&Style,images:Option<&dyn ImageResolver>
 fn side_border_commands(rect: Rect, style: &Style, images:Option<&dyn ImageResolver>) -> impl Iterator<Item = Command> {
     if style.border_image.is_some(){
         let command=border_image_command(rect,style,images).unwrap_or_else(||Command::StrokeBoxBorder(Box::new(crate::paint::BoxBorder {
-            rect,radius:style.border_radius,widths:border_widths(style),colors:core::array::from_fn(|side|style.border_color_sides[side].unwrap_or(style.border_color)),
+            rect,radius:border_paint_radius(rect,style),widths:border_widths(style),colors:core::array::from_fn(|side|style.border_color_sides[side].unwrap_or(style.border_color)),
             pattern:style.border_pattern,side_patterns:Some(core::array::from_fn(|side|style.border_style_sides[side].unwrap_or(style.border_style).pattern())),corners:clipped_corners(rect,rect,style).map(|r|*r),
         })));
         return [Some(command),None,None,None].into_iter().flatten();
@@ -14386,7 +14570,7 @@ fn side_border_commands(rect: Rect, style: &Style, images:Option<&dyn ImageResol
         return [Some(Command::StrokeBoxBorder(Box::new(
             crate::paint::BoxBorder {
                 rect,
-                radius: style.border_radius,
+                radius: border_paint_radius(rect, style),
                 widths,
                 colors,
                 pattern: style.border_pattern,
@@ -14984,6 +15168,9 @@ struct IntrinsicAxisSizes {
     maximum: f32,
     horizontal: bool,
     shrink_auto: bool,
+    /// The sizes feed a min-content contribution, so `fit-content` has no
+    /// definite space to fill and resolves to the min-content size.
+    min_contribution: bool,
 }
 
 impl IntrinsicAxisSizes {
@@ -15004,7 +15191,12 @@ impl IntrinsicAxisSizes {
         let shrink_auto = style.float != css::Float::None
             || matches!(style.position, Position::Absolute | Position::Fixed)
             || matches!(style.display, Display::InlineBlock | Display::InlineTable);
-        Ok(Self { minimum, maximum, horizontal, shrink_auto })
+        Ok(Self { minimum, maximum, horizontal, shrink_auto, min_contribution: false })
+    }
+
+    fn for_min_contribution(mut self, min_contribution: bool) -> Self {
+        self.min_contribution = min_contribution;
+        self
     }
 
     fn choose(self, kind: css::IntrinsicSizing, available: Option<f32>) -> f32 {
@@ -15017,9 +15209,10 @@ impl IntrinsicAxisSizes {
         match kind {
             css::IntrinsicSizing::MinContent => Some(self.minimum),
             css::IntrinsicSizing::MaxContent => Some(self.maximum),
-            css::IntrinsicSizing::FitContent => Some(available.map_or(self.maximum, |space| {
-                space.max(self.minimum).min(self.maximum)
-            })),
+            css::IntrinsicSizing::FitContent => Some(available.map_or(
+                if self.min_contribution { self.minimum } else { self.maximum },
+                |space| space.max(self.minimum).min(self.maximum),
+            )),
             css::IntrinsicSizing::Stretch => available,
             css::IntrinsicSizing::CalcSize(calc) => {
                 let basis = self.calc_basis(calc, available, available)?;
@@ -15110,6 +15303,18 @@ fn resolve_intrinsic_axis_with(
     available: Option<f32>,
     measure: impl FnMut(&Style, bool) -> Result<(f32, f32), LayoutError>,
 ) -> Result<(), LayoutError> {
+    resolve_intrinsic_axis_for(style, horizontal, available, false, measure)
+}
+
+/// With `min_contribution`, the axis is resolved for a min-content
+/// contribution: `fit-content` without definite space is the min-content size.
+fn resolve_intrinsic_axis_for(
+    style: &mut Style,
+    horizontal: bool,
+    available: Option<f32>,
+    min_contribution: bool,
+    measure: impl FnMut(&Style, bool) -> Result<(f32, f32), LayoutError>,
+) -> Result<(), LayoutError> {
     let keywords = style.intrinsic_size_keywords(horizontal);
     if keywords.iter().all(Option::is_none) {
         return Ok(());
@@ -15126,6 +15331,7 @@ fn resolve_intrinsic_axis_with(
         need_maximum,
         measure,
     )?
+    .for_min_contribution(min_contribution)
     .apply(
         style,
         horizontal,
@@ -17531,8 +17737,21 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 projected = collector.resolve_intrinsic_collected_style(computed, available);
                 &projected
             } else { computed };
+            let fitted=match &child.kind {
+                FlattenedBoxChildKind::Node(node) if !floated => self.fill_definite_inline_size(*node,computed,style),
+                _ => None,
+            };
             let physical=match &child.kind {
-                FlattenedBoxChildKind::Node(node)=>self.intrinsic_size_mode(*node,computed,depth+1,minimum)?,
+                FlattenedBoxChildKind::Node(node)=>match &fitted {
+                    // Only the block size is that at the filled inline size; the
+                    // inline contribution stays the child's own content size, so
+                    // a definite container width never inflates track minima.
+                    Some(fitted)=>{
+                        let natural=self.intrinsic_size_mode(*node,computed,depth+1,minimum)?;
+                        (natural.0,self.intrinsic_size_mode(*node,fitted,depth+1,minimum)?.1)
+                    }
+                    None=>self.intrinsic_size_mode(*node,computed,depth+1,minimum)?,
+                },
                 FlattenedBoxChildKind::Generated(generated)=>self.intrinsic_virtual_generated_size(generated,computed,minimum)?,
                 FlattenedBoxChildKind::AnonymousTable(table)=>self.anonymous_table_intrinsic(table,depth+1,minimum)?,
             };
@@ -17578,19 +17797,23 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                         css::Clear::Both=>float_bottom,
                     };
                     let cleared=principal&&clear_bottom>0.0&&height+pending.merge(top).value()<clear_bottom;
+                    let edge;
                     let empty=!cleared && border_box<0.01 && !establishes_formatting_context(computed,style)
                         && matches!(computed.display,Display::Block|Display::ListItem)
                         && computed.height.is_none_or(|value|value==0.0) && computed.min_height==0.0 && computed.min_height_intrinsic.is_none();
                     if empty {
+                        edge=height+pending.merge(top).value();
                         pending=pending.merge(top).merge(bottom);
                     } else if cleared {
                         if !placed {lead=pending;lead_add=pending.value();placed=true;}
-                        height=clear_bottom+border_box;pending=bottom;
+                        height=clear_bottom+border_box;pending=bottom;edge=height;
                     } else {
                         let gap=pending.merge(top);
                         if !placed {lead=gap;lead_add=gap.value();placed=true;}
-                        height+=gap.value()+border_box;pending=bottom;
+                        height+=gap.value()+border_box;pending=bottom;edge=height;
                     }
+                    let escaped=inner.float_below-computed.padding_sides[2]-border_widths(computed)[2];
+                    if escaped>0.0 {float_bottom=float_bottom.max(edge+escaped);}
                 } else {
                     height+=inline_height+h;
                 }
@@ -17618,15 +17841,39 @@ fn prepare_generated_float_box(&self,child:&VirtualGeneratedChild,available:f32)
                 height+=gap+inline_height;pending=MarginStrut::default();
             }
             height+=pending.value();
-            margins=if placed {BlockMargins{lead,lead_add,trail:pending,trail_add:pending.value()}}
-                else {BlockMargins{lead:pending,lead_add:pending.value(),trail:pending,trail_add:0.0}};
+            margins=if placed {BlockMargins{lead,lead_add,trail:pending,trail_add:pending.value(),float_below:0.0}}
+                else {BlockMargins{lead:pending,lead_add:pending.value(),trail:pending,trail_add:0.0,float_below:0.0}};
             height
         } else {height+inline_height};
+        if !contain_floats {margins.float_below=(float_bottom-content_height).max(0.0);}
         let result=((width.max(intrinsic_inline_line_width(inline_width,overlap,minimum)),if contain_floats {content_height.max(float_bottom)}else{content_height}),margins);
         // Only an inline run: no block, float or margin state, so the other
         // mode differs in the run's width alone.
         let other=other_w.map(|other_w|((width.max(intrinsic_inline_line_width(run_width+other_w,overlap,!minimum)),result.0.1),BlockMargins::default()));
         Ok((result,other))
+    }
+
+    /// A block-level child with an automatic inline size fills a container
+    /// whose inline size is definite, so its block size is measured there.
+    fn fill_definite_inline_size(&self, node: NodeId, child: &Style, container: &Style) -> Option<Style> {
+        let width = container.width?;
+        if child.width.is_some() || child.width_intrinsic.is_some()
+            || child.writing_mode != css::WritingMode::HorizontalTb
+            || container.writing_mode != css::WritingMode::HorizontalTb
+            || child.float != Float::None
+            || matches!(child.position, Position::Absolute | Position::Fixed)
+            || child.margin_auto[1] || child.margin_auto[3]
+            || !matches!(child.display, Display::Block | Display::FlowRoot | Display::ListItem
+                | Display::Flex | Display::Grid)
+            || !self.shrink_wraps_flex_cross(node, child)
+        {
+            return None;
+        }
+        let space = constrained_width(container, content_dimension(container, width));
+        let content = constrained_width(child, (space - box_edges(child, true)).max(0.0));
+        let mut fitted = child.clone();
+        fitted.width = Some(specified_dimension(child, content));
+        Some(fitted)
     }
 
     fn table_cell_child_used_style(&self, source: &Style, width: f32,
@@ -19654,6 +19901,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     fn viewport_rect(&self) -> Rect {
         self.intrinsics.viewport_read(self.viewport, 3)
     }
+    /// The area a propagated canvas background covers.
+    fn canvas_coverage(&self) -> Rect {
+        let viewport = self.viewport_rect();
+        self.paint_extent.map_or(viewport, |extent| Rect { height: viewport.height.max(extent.height), ..viewport })
+    }
     fn media_environment(&self) -> css::MediaEnvironment {
         self.intrinsics.viewport_read(self.rules.environment, 3)
     }
@@ -19669,6 +19921,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         layout.timeline_values=self.timeline_values;
         layout.container_units.set(self.container_units.get());
         layout.percentage_basis = self.percentage_basis;
+        layout.multicol_depth = self.multicol_depth;
         layout.export_block_table_baselines = self.export_block_table_baselines;
         layout.intrinsics = Rc::clone(&self.intrinsics);
         layout.quote_positions = Cow::Borrowed(self.quote_positions.as_ref());
@@ -20579,9 +20832,34 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
     ) -> Result<(f32, f32), LayoutError> {
         let _query_scope = self.push_intrinsic_container_units(style);
         let size = self.intrinsic_multicol_size(id, style, None, depth, minimum)?;
-        Ok(if self.size_containment_applies(id, style)? {
+        let size = if self.size_containment_applies(id, style)? {
             self.apply_container_intrinsic_containment(id, size, style)
-        } else { size })
+        } else { size };
+        if minimum { return Ok(size); }
+        Ok((size.0, self.block_size_at_max_width(id, style, size, depth)?))
+    }
+
+    /// An auto-width box clamped by `max-width` lays its content out at the
+    /// clamped inline size, so its block size is measured there rather than at
+    /// the unclamped max-content width.
+    fn block_size_at_max_width(&self, id: NodeId, style: &Style, size: (f32, f32), depth: usize)
+        -> Result<f32, LayoutError> {
+        let Some(max) = style.max_width else { return Ok(size.1); };
+        if style.width.is_some() || style.width_intrinsic.is_some() || style.max_width_intrinsic.is_some()
+            || style.writing_mode != css::WritingMode::HorizontalTb
+            || !matches!(style.display, Display::Block | Display::FlowRoot | Display::ListItem
+                | Display::Flex | Display::Grid)
+            || self.is_sized_replaced_element(id) || self.uses_button_layout(id)
+        {
+            return Ok(size.1);
+        }
+        let limit = content_dimension(style, max);
+        if !limit.is_finite() || (size.0 - box_edges(style, true) - limit).abs() > 0.01 {
+            return Ok(size.1);
+        }
+        let mut fitted = style.clone();
+        fitted.width = Some(specified_dimension(style, limit));
+        Ok(self.intrinsic_size_mode(id, &fitted, depth + 1, false)?.1)
     }
 
     fn intrinsic_size_mode_with_origin(&self, id: NodeId, used: &Style, origin: &Style,
@@ -20751,7 +21029,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let mut used = style.clone();
             let axis_order = if self.is_sized_replaced_element(id) { [false, true] } else { [true, false] };
             for horizontal in axis_order {
-                resolve_intrinsic_axis_with(&mut used, horizontal, None, |measurement, mode| {
+                resolve_intrinsic_axis_for(&mut used, horizontal, None, minimum && horizontal, |measurement, mode| {
                     self.intrinsic_size_mode(id, measurement, depth + 1, mode)
                 })?;
             }
@@ -20877,6 +21155,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     style.width.map(|width| content_dimension(style, width)),
                     style.height.map(|height| content_height_dimension(style, height)), (width, height), None)
             } else { (width, height) };
+            let width = if minimum && aspect_ratio_layout::compressible_replaced(style) { 0.0 } else { width };
             return Ok((
                 constrained_width(style, width) + edges,
                 constrained_height(style, height) + vertical_edges,
@@ -20890,7 +21169,11 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     constrained_height(style,style.height.map_or(natural.1,|value|content_height_dimension(style,value)))+vertical_edges));
             }
         }
-        if let Some(size) = Self::intrinsic_definite_box_size(style) { return Ok(size); }
+        if let Some(size) = Self::intrinsic_definite_box_size(style) {
+            if !(minimum && aspect_ratio_layout::compressible_replaced(style) && self.generated_origin_replaced(id, style)?) {
+                return Ok(size);
+            }
+        }
         if (style.contain_size || style.container_type == css::ContainerType::Size)
             && self.size_containment_applies(id, style)? {
             return Ok((
@@ -20929,6 +21212,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         if iframe_replaced(self.document,id) || self.object_viewport(id) {
             let (width,height)=if self.object_viewport(id) { self.embedded_content_dimensions(id,style) } else { iframe_content_dimensions(style) };
+            let width = if minimum && aspect_ratio_layout::compressible_replaced(style) { 0.0 } else { width };
             return Ok((width+edges,height+vertical_edges));
         }
         if tag == "img" || html_image_button(tag, attributes) || self.object_image(id) {
@@ -20955,16 +21239,28 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             return Ok((constrained_width(style, width) + edges, constrained_height(style, height) + vertical_edges));
         }
         if tag == "canvas" || tag == "video" {
-            let ready = self.images.and_then(|images| images.resolve_node(id))
+            let mut ready = self.images.and_then(|images| images.resolve_node(id))
                 .and_then(|state| match state { ImageState::Ready(image) if image.is_valid() => Some(image), _ => None });
-            let natural = ready.as_ref().map(|image| (image.width as f32, image.height as f32))
+            let mut poster_natural = None;
+            if tag == "video" && ready.is_none() {
+                let poster = self.images.and_then(|images| resolve_video_poster(images, attributes, self.rules.document_base_url()));
+                if let Some((_, ImageState::Ready(image))) = poster {
+                    if image.is_valid() {
+                        let natural = image_natural_size(self.images, Some(id), &image, style.used_color_scheme(self.media_environment()).scheme);
+                        poster_natural = Some((natural.default_dimensions(), natural.ratio));
+                        ready = Some(image);
+                    }
+                }
+            }
+            let natural = ready.as_ref().map(|image| poster_natural.map_or((image.width as f32, image.height as f32), |(size, _)| size))
                 .unwrap_or_else(|| if tag == "canvas" {
                     (canvas_dimension(crate::svg::attribute(attributes, "width"),300) as f32,
                      canvas_dimension(crate::svg::attribute(attributes, "height"),150) as f32)
                 } else if let Some(ratio) = style.preferred_aspect_ratio(None) {
                     (300.0f32.min(150.0 * ratio), 150.0f32.min(300.0 / ratio))
                 } else { (300.0,150.0) });
-            let ratio = ((ready.is_some() || tag == "canvas") && natural.1 > 0.0).then_some(natural.0 / natural.1);
+            let ratio = poster_natural.and_then(|(_, ratio)| ratio)
+                .or_else(|| ((ready.is_some() || tag == "canvas") && natural.1 > 0.0).then_some(natural.0 / natural.1));
             let (width,height) = replaced_content_dimensions(style,
                 style.width.map(|value| content_dimension(style,value)),
                 style.height.map(|value| content_height_dimension(style,value)),natural,ratio);
@@ -21043,6 +21339,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             None
         };
         let (mut main_sum, mut main_largest, mut cross_largest, mut count) = (0.0f32, 0.0f32, 0.0f32, 0usize);
+        let mut rebased_items = false;
+        let mut flex_shares: Vec<(f32, f32, f32)> = Vec::new();
         let sources = self.anonymous_formatting_items(children.iter().cloned(), style)?;
         for source in sources {
             let (child, paragraph) = source.into_parts(id);
@@ -21064,6 +21362,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             {
                 continue;
             }
+            let definite_basis = computed.flex_basis.is_some() || computed.flex_basis_is_percentage();
             computed = computed.resolve_grid_intrinsic_percentages(style.width.unwrap_or(0.0), style.height);
             computed.blockify_display();
             // A flexible item contributes its max-content size (its main size
@@ -21081,6 +21380,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else if computed.flex_basis_content {
                 if row { computed.width = None; } else { computed.height = None; }
             }
+            if !inflexible && !computed.flex_basis_content && computed.flex_basis_intrinsic.is_none() && definite_basis {
+                rebased_items = true;
+            }
+            if !row && paragraph.is_none() && computed.self_alignment(style, false).alignment == AlignItems::Stretch {
+                if let Some(node) = node {
+                    if let Some(fitted) = self.fill_definite_inline_size(node, &computed, style) {
+                        computed = fitted;
+                    }
+                }
+            }
             let measure = |measurement: &Style, minimum: bool| -> Result<(f32, f32), LayoutError> {
                 match (&child.kind, paragraph.as_ref()) {
                     (_, Some(paragraph)) => {
@@ -21088,7 +21397,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         self.flex_intrinsic_size(node, measurement, Some(paragraph), depth + 1, minimum)
                     }
                     (FlattenedBoxChildKind::Node(node), None) => {
-                        self.intrinsic_size_mode(*node, measurement, depth + 1, minimum)
+                        let size = self.intrinsic_size_mode(*node, measurement, depth + 1, minimum)?;
+                        Ok(self.contain_item_floats(*node, measurement, minimum, size))
                     }
                     (FlattenedBoxChildKind::Generated(generated), None) => {
                         self.intrinsic_virtual_generated_size(generated, measurement, minimum)
@@ -21142,6 +21452,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     }
                 }
             }
+            if row && !vertical_mode && !inflexible {
+                let base = computed.resolve_flex_basis_percentage(None)
+                    .filter(|_| !computed.flex_basis_content && computed.flex_basis_intrinsic.is_none())
+                    .map_or(f32::NAN, |flex_basis| content_dimension(&computed, flex_basis) + box_edges(&computed, true));
+                flex_shares.push((item_main, base, computed.flex_grow));
+            }
             main_sum += item_main;
             main_largest = main_largest.max(item_main);
             cross_largest = cross_largest.max(item_cross);
@@ -21156,7 +21472,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if let Some(limit) = wrap_limit {
                 let (mut total, mut line_main, mut line_cross, mut lines, mut in_line) = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
                 for (item_main, item_cross) in contributions {
-                    if in_line > 0 && line_main + main_gap + item_main > limit {
+                    if in_line > 0 && line_main + main_gap + item_main > limit + FLEX_LINE_SLACK {
                         total += line_cross;
                         lines += 1;
                         (line_main, line_cross, in_line) = (0.0, 0.0, 0);
@@ -21172,7 +21488,35 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 cross_largest = total + cross_gap * lines.saturating_sub(1) as f32;
             }
         }
+        // Items with a definite flex-basis grow or shrink from it, so their
+        // block sizes are those at the used main sizes, not at their
+        // max-content contributions. Lay the container out at its max-content
+        // width to get the block size the final layout will produce.
+        if rebased_items && row && !minimum && count > 0 && !style.flex_wrap && style.width.is_none()
+            && style.writing_mode == css::WritingMode::HorizontalTb
+            && !uses_fieldset_layout(self.document, id, style) && !self.uses_button_layout(id) {
+            let main = Self::flex_fraction_main(&flex_shares, main_gap).map_or(main, |shared| shared.max(main));
+            let inline = constrained_width(style, main);
+            let container = style.intrinsic_measurement_style(false);
+            let height = self.column_flex_item_height(
+                id, &container, style, inline + box_edges(style, true), inline, depth + 1,
+            )?;
+            cross_largest = (height - box_edges(style, false)).max(0.0);
+        }
         Ok(if row { (main, cross_largest) } else { (cross_largest, main) })
+    }
+
+    /// Max-content main size of a row flex container whose items all grow from
+    /// a definite basis: every item is sized as basis plus its share of the
+    /// largest flex fraction (CSS Flexbox section 9.9.1), `(max-content
+    /// size, outer basis, flex-grow)` per item.
+    fn flex_fraction_main(items: &[(f32, f32, f32)], gap: f32) -> Option<f32> {
+        if items.is_empty() || items.iter().any(|(_, base, grow)| !base.is_finite() || !(*grow > 0.0)) {
+            return None;
+        }
+        let fraction = items.iter().map(|(size, base, grow)| (size - base).max(0.0) / grow).fold(0.0_f32, f32::max);
+        let total: f32 = items.iter().map(|(_, base, grow)| base + grow * fraction).sum();
+        Some(total + gap * items.len().saturating_sub(1) as f32)
     }
 
     /// The flattened children of a container for intrinsic sizing. A flex or
@@ -21813,7 +22157,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     && constrained_height(style, natural.1) == natural.1;
                 if !open_top { margins.lead = MarginStrut::default(); margins.lead_add = 0.0; }
                 if !open_bottom { margins.trail = MarginStrut::default(); margins.trail_add = 0.0; }
-                if style.height.is_some() || constrained_height(style, natural.1) != natural.1 { margins.lead_add = 0.0; }
+                if style.height.is_some() || style.height_intrinsic.is_some() || constrained_height(style, natural.1) != natural.1 {
+                    margins.lead_add = 0.0;
+                    margins.float_below = 0.0;
+                }
             }
             (size, margins)
         };
@@ -22927,6 +23274,13 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 )
             };
             let mut minimum = minimum;
+            if item.style.writing_mode == css::WritingMode::HorizontalTb
+                && item.style.width_intrinsic == Some(css::IntrinsicSizing::FitContent)
+            {
+                // The min-content contribution of a fit-content item sizes its
+                // column, but its block size is that at the final (wider) width.
+                minimum.1 = natural.1;
+            }
             if item.generated.is_none()
                 && item.anonymous_text.is_none()
                 && this.is_sized_replaced_element(item.node)
@@ -23979,6 +24333,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.hits.clone(), dx, dy);
                     geometry.move_hits(item.hits.clone(), dx, dy);
                 }
+                self.restore_escaped_positioned(item.node, item.generated.is_some(), item.commands.clone(), item.hits.clone(), dx, dy);
                 if let Some(baselines) = item.baselines {
                     FlowBaselines::include(&mut self.flow_baselines, baselines.translated(dx, dy));
                 }
@@ -25199,8 +25554,15 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     constrained_height(&item.style, (stretched - vertical_insets).max(0.0))
                         + vertical_insets
                 };
-                let paints = if has_background(&item.style) {
-                    background_paints(&item.style)
+                let button_style = self.native_button_item_style(
+                    item.node,
+                    item.generated.as_ref(),
+                    item.anonymous_text.as_ref(),
+                    &item.style,
+                );
+                let item_style = button_style.as_ref().unwrap_or(&item.style);
+                let paints = if has_background(item_style) {
+                    background_paints(item_style)
                 } else {
                     0
                 } + usize::from(
@@ -25209,7 +25571,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         && item.style.border_color.a != 0),
                 );
                 let mut remaining = paints;
-                let mut layers = background_layers(&item.style).map(|layers| {
+                let mut layers = background_layers(item_style).map(|layers| {
                     layers
                         .into_iter()
                         .enumerate()
@@ -25234,7 +25596,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             };
                             stretch_background_mask(
                                 command,
-                                &item.style,
+                                item_style,
                                 height,
                                 layer,
                                 self.images,
@@ -25246,7 +25608,16 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         Command::StrokeBoxBorder(border) if remaining > 0 => {
                             border.rect.height = height;
                             border.corners =
-                                clipped_corners(border.rect, border.rect, &item.style).map(|r| *r);
+                                clipped_corners(border.rect, border.rect, item_style).map(|r| *r);
+                            remaining -= 1;
+                        }
+                        Command::FillRect { rect, color }
+                            if remaining > 0
+                                && has_background(item_style)
+                                && *color == item_style.background =>
+                        {
+                            let replacement = stretched_background_color(rect, item_style, height);
+                            replace_command_bytes(command, &mut command_bytes, replacement)?;
                             remaining -= 1;
                         }
                         Command::FillRect { rect, .. }
@@ -25258,24 +25629,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             remaining -= 1;
                         }
                         Command::FillRoundedRect { rect, .. } if remaining > 0 => {
-                            let inset = background_bleed_inset(&item.style);
-                            let outer = Rect {
-                                x: rect.x - inset,
-                                y: rect.y - inset,
-                                width: rect.width + 2.0 * inset,
-                                height,
-                            };
-                            replace_command_bytes(
-                                command,
-                                &mut command_bytes,
-                                background_color(outer, &item.style),
-                            )?;
+                            let replacement = stretched_background_color(rect, item_style, height);
+                            replace_command_bytes(command, &mut command_bytes, replacement)?;
                             remaining -= 1;
                         }
                         Command::FillBackground(fill) if remaining > 0 => {
                             if let Some(mut outer)=border_image_border_box(fill) {
                                 outer.height=height;
-                                if let Some(replacement)=border_image_command(outer,&item.style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
+                                if let Some(replacement)=border_image_command(outer,item_style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
                                 remaining-=1;
                                 continue;
                             }
@@ -25284,7 +25645,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             if let Some((layer_index, layer)) =
                                 layers.as_mut().and_then(|layers| layers.next())
                             {
-                                let border = used_border(&item.style);
+                                let border = used_border(item_style);
                                 let outer = Rect {
                                     x: rect.x - border,
                                     y: rect.y - border,
@@ -25297,7 +25658,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                                     &mut command_bytes,
                                     background_command(
                                         outer,
-                                        &item.style,
+                                        item_style,
                                         &layer,
                                         layer_index,
                                         &paint,
@@ -25315,14 +25676,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             shadow,
                             ..
                         } if remaining > 0 => {
-                            stretch_shadow(rect, corners, shadow.inset, height, &item.style);
+                            stretch_shadow(rect, corners, shadow.inset, height, item_style);
                             remaining -= 1;
                         }
                         _ => break,
                     }
                 }
                 self.command_bytes = command_bytes;
-                self.stretch_item_outline(item.commands.clone(), &item.style, height);
+                self.stretch_item_outline(item.commands.clone(), item_style, height);
                 if let Some(geometry) = self.geometry.as_mut() {
                     if let Some(hit) = geometry.hits.get_mut(item.hits.start) {
                         if hit.node == item.node {
@@ -25426,6 +25787,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.hits.clone(), dx, dy);
                 geometry.move_hits(item.hits.clone(), dx, dy);
             }
+            self.restore_escaped_positioned(item.node, item.generated.is_some(), item.commands.clone(), item.hits.clone(), dx, dy);
             if let Some(baselines) = item.baselines {
                 FlowBaselines::include(&mut self.flow_baselines, baselines.translated(dx, dy));
             }
@@ -25725,24 +26087,42 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         Ok(())
     }
 
+    /// The percentage basis of an out-of-flow flex child: its containing
+    /// block, which is the flex container only when the container establishes
+    /// it (CSS Flexbox §4.1).
+    fn flex_out_of_flow_basis(&self, parent: NodeId, position: Position, width: f32) -> (f32, Option<f32>) {
+        let block = match position {
+            Position::Absolute if self.containing_block_node != Some(parent) => {
+                Some(self.containing_block.unwrap_or(self.viewport_rect()))
+            }
+            Position::Fixed if self.fixed_containing_block_node != Some(parent) => {
+                Some(self.fixed_containing_block.unwrap_or(self.viewport_rect()))
+            }
+            _ => None,
+        };
+        block.map_or((width, self.parent_height), |block| (block.width, Some(block.height)))
+    }
+
     /// An out-of-flow generated child of a flex container is sized like a
     /// positioned element and painted by the container's positioned pass.
     fn virtual_positioned_flex_item(
         &self,
         child: VirtualGeneratedChild,
+        parent: NodeId,
         width: f32,
         depth: usize,
     ) -> Result<(PositionedBoxSource, Style, f32, f32), LayoutError> {
         if depth > 512 {
             return Err(LayoutError::DepthLimit);
         }
+        let (basis_width, basis_height) = self.flex_out_of_flow_basis(parent, child.unresolved_style.position, width);
         let mut item_style =
-            self.resolve_style_percentages(&child.unresolved_style, width, self.parent_height);
+            self.resolve_style_percentages(&child.unresolved_style, basis_width, basis_height);
         for horizontal in [true, false] {
             resolve_intrinsic_axis_with(
                 &mut item_style,
                 horizontal,
-                if horizontal { Some(width) } else { self.parent_height },
+                if horizontal { Some(basis_width) } else { basis_height },
                 |measurement, minimum| {
                     self.intrinsic_virtual_generated_size_impl(&child, measurement, minimum)
                 },
@@ -25885,6 +26265,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             shrink_base: (base_main - edges).max(0.0),
             source_order,
             cross: if row { natural.1 } else { natural.0 },
+            measured_main: main,
             edges,
             cross_edges,
             frozen: false,
@@ -25908,10 +26289,24 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         minimum: bool,
     ) -> Result<(f32, f32), LayoutError> {
         let Some(paragraph) = anonymous_text else {
-            return self.intrinsic_size_mode(node, style, depth, minimum);
+            let size = self.intrinsic_size_mode(node, style, depth, minimum)?;
+            return Ok(self.contain_item_floats(node, style, minimum, size));
         };
         let (maximum, least) = self.anonymous_text_intrinsic(paragraph, style, !minimum, minimum)?;
         Ok(if minimum { least } else { maximum })
+    }
+
+    /// A flex or grid item establishes an independent formatting context, so
+    /// floats escaping its in-flow descendants extend its automatic height
+    /// (CSS 2 section 10.6.7).
+    fn contain_item_floats(&self, node: NodeId, style: &Style, minimum: bool, size: (f32, f32)) -> (f32, f32) {
+        if style.writing_mode != css::WritingMode::HorizontalTb || style.float != Float::None
+            || style.height.is_some() || style.height_intrinsic.is_some()
+            || style.preferred_aspect_ratio(None).is_some() {
+            return size;
+        }
+        let below = self.intrinsics.float_below(node.index() * 2 + usize::from(minimum), style);
+        if below > 0.0 { (size.0, size.1 + below) } else { size }
     }
 
     /// Max-content and min-content sizes of an anonymous text run. Both share
@@ -25997,6 +26392,77 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         let lines = paragraph.hard_breaks.len().saturating_add(1) as f32;
         let axes = GridAxes::new(style);
         Ok((axes.physical((maximum_width, line_height * lines)), axes.physical((minimum_width, line_height * lines))))
+    }
+
+    /// Block size of a column flex item laid out at its used content-box inline
+    /// size inside a container `container_width` wide. Intrinsic measurement
+    /// does not constrain nested blocks to that inline size, so wrapped text
+    /// would otherwise be measured too short.
+    fn column_flex_item_height(
+        &self,
+        node: NodeId,
+        item: &Style,
+        container: &Style,
+        container_width: f32,
+        inline_size: f32,
+        depth: usize,
+    ) -> Result<f32, LayoutError> {
+        let measure = || {
+            let mut measured = item.clone();
+            measured.width = Some(specified_dimension(item, inline_size));
+            measured.blockify_display();
+            let mut layout = self.measurement_layout();
+            layout.parent_height = self.parent_height;
+            layout.box_for(node, container, Some(measured), 0.0, 0.0, container_width, depth)
+        };
+        let Some(context) = self.intrinsic_context() else { return measure(); };
+        let intrinsics = &*self.intrinsics;
+        let frame = intrinsics.frame.get();
+        let hit = intrinsics.stretched.borrow().iter().find(|entry| entry.frame == frame
+            && entry.id == node && entry.width == container_width
+            && entry.inline_size == inline_size
+            && entry.parent_height == self.parent_height
+            && entry.item == *item && entry.container == *container
+            && entry.context.same_for_slot(&context, node.index() * 2))
+            .map(|entry| (entry.height, entry.axes));
+        if let Some((height, axes)) = hit {
+            intrinsics.viewport_read((), axes);
+            return Ok(height);
+        }
+        let mark = self.intrinsic_mark();
+        let height = measure()?;
+        let mut axes = 0;
+        for (axis, reads) in intrinsics.reads.iter().enumerate() {
+            if reads.get() != mark.reads[axis] { axes |= 1 << axis; }
+        }
+        if css::viewport_read_counts() != mark.css { axes = 3; }
+        let settled = match (self.images, mark.pending) {
+            (Some(images), Some(since)) => images.pending_mark() == since,
+            _ => true,
+        };
+        if settled {
+            let mut memo = intrinsics.stretched.borrow_mut();
+            if memo.len() >= MAX_STRETCHED_FLEX_MEMO { memo.remove(0); }
+            memo.push(StretchedFlexHeight { frame, id: node, width: container_width, inline_size,
+                parent_height: self.parent_height, item: item.clone(), container: container.clone(),
+                context, axes, height });
+        }
+        Ok(height)
+    }
+
+    /// Whether a column flex item that is not stretched is an ordinary block,
+    /// flex or grid container, whose automatic inline size is fit-content.
+    fn shrink_wraps_flex_cross(&self, node: NodeId, item: &Style) -> bool {
+        if !matches!(
+            item.display.blockified(),
+            Display::Block | Display::FlowRoot | Display::ListItem | Display::Flex | Display::Grid
+        ) || self.uses_button_layout(node) || iframe_replaced(self.document, node) {
+            return false;
+        }
+        !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. })
+            if matches!(name.as_str(), "img" | "canvas" | "video" | "audio" | "iframe" | "object"
+                | "embed" | "textarea" | "select" | "button" | "input" | "svg" | "fieldset"
+                | "meter" | "progress"))
     }
 
     /// A stretched item of a single-line flex container with a definite cross
@@ -26125,6 +26591,47 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             };
             self.flex_intrinsic_size(node, stretched.as_ref().unwrap_or(&item_style), anonymous_text.as_ref(), depth + 1, false)?
         };
+        let block_measurable = !row && !absolute && !container_style.flex_wrap
+            && self.multicol_depth == 0
+            && anonymous_text.is_none()
+            && item_style.writing_mode == css::WritingMode::HorizontalTb
+            && item_style.aspect_ratio.is_none()
+            && item_style.intrinsic_size_keywords(true).iter().all(Option::is_none)
+            && item_style.intrinsic_size_keywords(false).iter().all(Option::is_none)
+            && !self.is_sized_replaced_element(node)
+            && !self.object_replaced(node)
+            && !matches!(self.document.kind(node), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select");
+        let mut w = w;
+        let inline_size = if !block_measurable {
+            None
+        } else if item_style.width.is_none() && stretches_cross {
+            Some(used_content_width(&item_style, width))
+        } else if !self.shrink_wraps_flex_cross(node, &item_style) {
+            None
+        } else if item_style.width.is_some() {
+            Some(used_content_width(&item_style, width))
+        } else {
+            let edges = box_edges(&item_style, true);
+            let maximum = (self.flex_intrinsic_size(node, &item_style, None, depth + 1, false)?.0 - edges).max(0.0);
+            let minimum = (self.flex_intrinsic_size(node, &item_style, None, depth + 1, true)?.0 - edges).max(0.0);
+            if minimum > (width - edges).max(0.0) {
+                None
+            } else {
+                let fit = constrained_width(&item_style, maximum.min((width - edges).max(0.0)));
+                item_style.width = Some(specified_dimension(&item_style, fit));
+                w = fit + edges;
+                Some(fit)
+            }
+        };
+        let height_needed = item_style.height.is_none()
+            && (main_from_measure || minimum_needed || item_style.flex_basis_content);
+        let stretched_height = match inline_size.filter(|_| height_needed) {
+            Some(inline_size) => Some(self.column_flex_item_height(
+                node, &item_style, container_style, width, inline_size, depth,
+            )?),
+            None => None,
+        };
+        let h = stretched_height.unwrap_or(h);
         if absolute {
             if positioned.len() >= MAX_DISPLAY_COMMANDS {
                 return Err(LayoutError::CommandLimit);
@@ -26151,7 +26658,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 depth + 1,
                 false,
             )?;
-            Some(if row { content_size.0 } else { content_size.1 })
+            Some(if row { content_size.0 } else { stretched_height.unwrap_or(content_size.1) })
         } else {
             None
         };
@@ -26215,9 +26722,10 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         .height
                         .map(|value| content_height_dimension(&item_style, value) + edges)
                 };
-                let minimum = match text_minimum {
-                    Some(least) => least,
-                    None => self.flex_intrinsic_size(
+                let minimum = match (text_minimum, stretched_height) {
+                    (Some(least), _) => least,
+                    (None, Some(height)) => (0.0, height),
+                    (None, None) => self.flex_intrinsic_size(
                         node,
                         &minimum_style,
                         anonymous_text.as_ref(),
@@ -26250,6 +26758,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             shrink_base: (base_main - edges).max(0.0),
             source_order: *source_order,
             cross: if row { h } else { w },
+            measured_main: f32::NAN,
             edges,
             cross_edges,
             frozen: false,
@@ -26388,7 +26897,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         positioned
                             .try_reserve(1)
                             .map_err(|_| LayoutError::CommandLimit)?;
-                        positioned.push(self.virtual_positioned_flex_item(generated, width, depth + 1)?);
+                        positioned.push(self.virtual_positioned_flex_item(generated, parent, width, depth + 1)?);
                         continue;
                     }
                     if items.len() >= MAX_DISPLAY_COMMANDS {
@@ -26422,7 +26931,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             } else {
                 self.parent_height
             });
-            item_style = self.resolve_style_percentages(&item_style, width, self.parent_height);
+            let (basis_width, basis_height) = self.flex_out_of_flow_basis(parent, item_style.position, width);
+            item_style = self.resolve_style_percentages(&item_style, basis_width, basis_height);
             item_style.flex_basis = basis;
             if basis.is_none() && percent_basis {
                 item_style.flex_basis_content = true;
@@ -26470,7 +26980,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let mut line_main = items[line_start].main;
             while line_end < items.len() {
                 let next = line_main + main_gap + items[line_end].main;
-                if style.flex_wrap && limit.is_some_and(|limit| next > limit) {
+                if style.flex_wrap && limit.is_some_and(|limit| next > limit + FLEX_LINE_SLACK) {
                     break;
                 }
                 line_main = next;
@@ -26695,6 +27205,37 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     physical
                 };
             }
+            let line_cross = if row && style.flex_wrap && self.multicol_depth == 0 {
+                let mut remeasured = false;
+                for item in items.iter_mut() {
+                    if item.generated.is_some()
+                        || item.anonymous_text.is_some()
+                        || item.style.height.is_some()
+                        || item.style.height_intrinsic.is_some()
+                        || item.style.writing_mode != css::WritingMode::HorizontalTb
+                        || (item.main - item.measured_main).abs() <= 0.01
+                    {
+                        continue;
+                    }
+                    item.cross = self.column_flex_item_height(
+                        item.node,
+                        &item.style,
+                        style,
+                        item.main,
+                        (item.main - item.edges).max(0.0),
+                        depth,
+                    )?;
+                    item.measured_main = item.main;
+                    remeasured = true;
+                }
+                if remeasured {
+                    items.iter().map(|item| item.cross).fold(0.0f32, f32::max)
+                } else {
+                    line_cross
+                }
+            } else {
+                line_cross
+            };
             let cross_extent = if style.flex_wrap {
                 line_cross + line_stretch
             } else if row {
@@ -27061,6 +27602,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.first_hit..item.last_hit, dx, dy);
                     geometry.move_hits(item.first_hit..item.last_hit, dx, dy);
                 }
+                self.restore_escaped_positioned(item.node, item.generated.is_some(), item.first_command..item.last_command, item.first_hit..item.last_hit, dx, dy);
                 if let Some(baselines) = item.baselines {
                     item.baselines = Some(baselines.translated(dx, dy));
                 } else {
@@ -27193,6 +27735,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.first_hit..item.last_hit, 0.0, offset);
                         geometry.move_hits(item.first_hit..item.last_hit, 0.0, offset);
                     }
+                    self.restore_escaped_positioned(item.node, item.generated.is_some(), item.first_command..item.last_command, item.first_hit..item.last_hit, 0.0, offset);
                     item.baselines = item.baselines.map(|value| value.shifted(offset));
                     item.main_baselines = item.main_baselines.map(|value| value.shifted(offset));
                     self.refresh_transform(
@@ -27214,7 +27757,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     Self::move_overflow_contributions(&mut self.overflow_frames,&self.overflow_move_index,self.flow_paint_owners.as_deref(), item.first_hit..item.last_hit, dx, dy);
                     geometry.move_hits(item.first_hit..item.last_hit, dx, dy);
                 }
-                let exported = if export_on_cross { item.baselines } else { item.main_baselines }.or_else(|| {
+                self.restore_escaped_positioned(item.node, item.generated.is_some(), item.first_command..item.last_command, item.first_hit..item.last_hit, dx, dy);
+                let exported =if export_on_cross { item.baselines } else { item.main_baselines }.or_else(|| {
                     (row && !export_vertical).then_some(FlowBaselines {
                         first: border_box_end,
                         last: border_box_end,
@@ -27290,20 +27834,57 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             (cross_offset, total_main)
         })
     }
+    /// Native push buttons paint their own surface; the computed outset
+    /// border and button face only describe the box.
+    fn apply_native_button_surface(&self, style: &mut Style) {
+        let scheme = style.used_color_scheme(self.media_environment()).scheme;
+        let dark = scheme == css::UsedColorScheme::Dark;
+        style.background = css::color_scheme::system_color("buttonface", scheme).expect("UA widget surface");
+        style.border_style = css::BorderStyle::Solid;
+        style.border_color = if dark { Rgba { r: 133, g: 133, b: 133, a: 255 } } else { Rgba { r: 118, g: 118, b: 118, a: 255 } };
+        style.border_radius = 2.0;
+    }
+
+    /// The style a flex or grid item's recorded commands were painted with
+    /// when the item is a native push button, else `None`.
+    fn native_button_item_style(
+        &self,
+        node: NodeId,
+        generated: Option<&VirtualGeneratedChild>,
+        anonymous_text: Option<&InlineParagraph>,
+        item_style: &Style,
+    ) -> Option<Style> {
+        (generated.is_none() && anonymous_text.is_none()
+            && crate::control_appearance::presentation(self.document, node, item_style)
+                .is_some_and(|control| control.native && control.widget == crate::control_appearance::Widget::Button))
+            .then(|| {
+                let mut style = item_style.clone();
+                self.apply_native_button_surface(&mut style);
+                style
+            })
+    }
+
     fn stretch_flex_item_cross(&mut self, item: &FlexItem, extent: f32) -> Result<(), LayoutError> {
+        let button_style = self.native_button_item_style(
+            item.node,
+            item.generated.as_ref(),
+            item.anonymous_text.as_ref(),
+            &item.style,
+        );
+        let style = button_style.as_ref().unwrap_or(&item.style);
         let mut command_bytes = self.command_bytes;
         let root_height =
-            (extent - item.style.margin_sides[0] - item.style.margin_sides[2]).max(0.0);
-        let paints = if has_background(&item.style) {
-            background_paints(&item.style)
+            (extent - style.margin_sides[0] - style.margin_sides[2]).max(0.0);
+        let paints = if has_background(&style) {
+            background_paints(&style)
         } else {
             0
         } + usize::from(
-            item.style.border_image.is_some() || (item.style.border_solid
-                && item.style.border_width > 0.0
-                && item.style.border_color.a != 0),
+            style.border_image.is_some() || (style.border_solid
+                && style.border_width > 0.0
+                && style.border_color.a != 0),
         );
-        let mut layers = background_layers(&item.style).map(|layers| {
+        let mut layers = background_layers(&style).map(|layers| {
             layers
                 .into_iter()
                 .enumerate()
@@ -27316,8 +27897,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             .iter_mut()
             .take(
                 paints
-                    + usize::from(item.style.paints_as_group())
-                    + usize::from(item.style.has_transform()),
+                    + usize::from(style.paints_as_group())
+                    + usize::from(style.has_transform()),
             )
         {
             match command {
@@ -27329,7 +27910,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     };
                     stretch_background_mask(
                         command,
-                        &item.style,
+                        &style,
                         root_height,
                         layer,
                         self.images,
@@ -27340,29 +27921,25 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 Command::StrokeBoxBorder(border) => {
                     border.rect.height = root_height;
                     border.corners =
-                        clipped_corners(border.rect, border.rect, &item.style).map(|r| *r);
+                        clipped_corners(border.rect, border.rect, &style).map(|r| *r);
+                }
+                Command::FillRect { rect, color }
+                    if has_background(&style) && *color == style.background =>
+                {
+                    let replacement = stretched_background_color(rect, &style, root_height);
+                    replace_command_bytes(command, &mut command_bytes, replacement)?;
                 }
                 Command::FillRect { rect, .. }
                 | Command::StrokeBorder { rect, .. }
                 | Command::StrokePatternBorder { rect, .. } => rect.height = root_height,
                 Command::FillRoundedRect { rect, .. } => {
-                    let inset = background_bleed_inset(&item.style);
-                    let outer = Rect {
-                        x: rect.x - inset,
-                        y: rect.y - inset,
-                        width: rect.width + 2.0 * inset,
-                        height: root_height,
-                    };
-                    replace_command_bytes(
-                        command,
-                        &mut command_bytes,
-                        background_color(outer, &item.style),
-                    )?;
+                    let replacement = stretched_background_color(rect, &style, root_height);
+                    replace_command_bytes(command, &mut command_bytes, replacement)?;
                 }
                 Command::FillBackground(fill) => {
                     if let Some(mut outer)=border_image_border_box(fill) {
                         outer.height=root_height;
-                        if let Some(replacement)=border_image_command(outer,&item.style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
+                        if let Some(replacement)=border_image_command(outer,&style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
                         continue;
                     }
 
@@ -27370,7 +27947,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     if let Some((layer_index, layer)) =
                         layers.as_mut().and_then(|layers| layers.next())
                     {
-                        let border = used_border(&item.style);
+                        let border = used_border(&style);
                         let outer = Rect {
                             x: rect.x - border,
                             y: rect.y - border,
@@ -27383,7 +27960,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             &mut command_bytes,
                             background_command(
                                 outer,
-                                &item.style,
+                                &style,
                                 &layer,
                                 layer_index,
                                 &paint,
@@ -27400,7 +27977,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     shadow,
                     ..
                 } => {
-                    stretch_shadow(rect, corners, shadow.inset, root_height, &item.style);
+                    stretch_shadow(rect, corners, shadow.inset, root_height, &style);
                 }
                 _ => {}
             }
@@ -27415,7 +27992,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         self.command_bytes = command_bytes;
         self.stretch_item_outline(
             item.first_command..item.last_command,
-            &item.style,
+            &style,
             root_height,
         );
         Ok(())
@@ -28185,8 +28762,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
         }
         let mut used = style.clone();
         for horizontal in [true, false] {
-            resolve_intrinsic_axis_with(&mut used, horizontal, None, |measurement, minimum| {
-                self.intrinsic_virtual_generated_size_impl(child, measurement, minimum)
+            resolve_intrinsic_axis_for(&mut used, horizontal, None, minimum && horizontal, |measurement, mode| {
+                self.intrinsic_virtual_generated_size_impl(child, measurement, mode)
             })?;
         }
         self.intrinsic_virtual_generated_size_impl(child, &used, minimum)
@@ -29527,7 +30104,17 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             let mut style = style;
             if !deferred_inline { self.resolve_atomic_inline_width(node, &mut style, available, depth)?; }
-            let (width, height) = self.intrinsic_size(node, &style, depth + 1)?;
+            let compressible_candidate = aspect_ratio_layout::compressible_replaced(&style)
+                && self.generated_origin_replaced(node, &style)?;
+            let compressible = self.intrinsic_minimum_atomics && compressible_candidate;
+            if compressible_candidate {
+                self.atomic_width_resolutions.set(self.atomic_width_resolutions.get().saturating_add(1));
+            }
+            let (width, height) = if compressible {
+                self.intrinsic_size_mode(node, &style, depth + 1, true)?
+            } else {
+                self.intrinsic_size(node, &style, depth + 1)?
+            };
             let start = paragraph.text.len();
             let end = start
                 .checked_add('\u{fffc}'.len_utf8())
@@ -31314,6 +31901,69 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         Ok(chosen)
     }
 
+    /// Narrowest line capacity that keeps the number of greedy lines of one
+    /// forced-break segment, or `None` when the segment is not balanced
+    /// (fewer than two or more than `BALANCE_MAX_LINES` lines).
+    fn balanced_line_capacity(&self, paragraph: &InlineParagraph,
+        bidi: &lumen_common::bidi::BidiInfo<'_>, paragraph_index: usize, start: usize,
+        forced_end: usize, breaks: &[(usize, bool)], full: f32, hang: bool,
+        cloned: &ClonedInlineEdges,
+    ) -> Result<Option<f32>, LayoutError> {
+        const BALANCE_MAX_LINES: usize = 6;
+        let count_lines = |capacity: f32| -> Result<usize, LayoutError> {
+            let mut position = start;
+            let mut lines = 0;
+            while position < forced_end {
+                let mut candidates: Vec<usize> = breaks.iter()
+                    .filter_map(|(offset, _)| (*offset > position && *offset < forced_end).then_some(*offset))
+                    .collect();
+                candidates.push(forced_end);
+                let mut chosen = self.choose_inline_line_end(paragraph, bidi, paragraph_index,
+                    position, forced_end, &candidates, capacity, true, hang, true, cloned)?;
+                if chosen <= position {
+                    chosen = forced_end.max(position + 1);
+                }
+                position = chosen;
+                lines += 1;
+                if lines > BALANCE_MAX_LINES {
+                    break;
+                }
+            }
+            Ok(lines)
+        };
+        let lines = count_lines(full)?;
+        if lines < 2 || lines > BALANCE_MAX_LINES || self.line_clamp_remaining().is_some_and(|remaining| lines > remaining) {
+            return Ok(None);
+        }
+        let mut widest = 0.0_f32;
+        let mut piece_start = start;
+        let piece_ends = breaks.iter()
+            .filter_map(|(offset, _)| (*offset > start && *offset < forced_end).then_some(*offset))
+            .chain(core::iter::once(forced_end));
+        for piece_end in piece_ends {
+            let trimmed_end = piece_start + paragraph.text.get(piece_start..piece_end).map_or(0, |text| text.trim_end().len());
+            if trimmed_end > piece_start {
+                widest = widest.max(self.inline_paragraph_width(paragraph, bidi, paragraph_index, piece_start..trimmed_end)?);
+            }
+            piece_start = piece_end;
+        }
+        // A capacity below the widest unbreakable piece would only be satisfied by
+        // an emergency break inside it, which balancing never introduces.
+        let (mut low, mut high) = (widest.clamp(0.0, full), full);
+        for _ in 0..10 {
+            if high - low <= 0.5 {
+                break;
+            }
+            let middle = (low + high) * 0.5;
+            if count_lines(middle)? <= lines {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        Ok(Some(high))
+    }
+
     fn flow_inline_paragraph(
         &mut self,
         paragraph: &mut InlineParagraph,
@@ -32903,6 +33553,13 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
         let mut selectable_paragraph: Option<Arc<SelectableParagraph>> = None;
         let mut decoration_surfaces=Vec::<InlineDecorationSurface>::new();
         let mut clamp_stopped = false;
+        let balancing = wrap
+            && first_line_indent == 0.0
+            && self.paragraph_column_flow.is_none()
+            && !self.line_clamp_height_based()
+            && self.floats[float_start..].is_empty()
+            && css::extra_props::keyword(block_style, "text-wrap-style") == Some("balance");
+        let mut balance_segment: (usize, Option<f32>) = (0, None);
         for paragraph_index in 0..bidi.paragraphs.len() {
             let paragraph_range = bidi.paragraphs[paragraph_index].range.clone();
             if paragraph_range.start >= paragraph_range.end {
@@ -32955,7 +33612,17 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
                     .context_float_edges(float_start, left, width, *cursor, height)
                     .1;
                 let existing_visible = (*advance - *trailing).max(0.0) + first_line_indent;
-                let capacity = (available - existing_visible).max(0.0);
+                let mut capacity = (available - existing_visible).max(0.0);
+                if balancing && start >= balance_segment.0 {
+                    balance_segment = (forced_end, None);
+                    if *advance == 0.0 && existing_visible == 0.0 {
+                        balance_segment.1 = self.balanced_line_capacity(paragraph, &bidi, paragraph_index,
+                            start, forced_end, &breaks, capacity, hang, &cloned)?;
+                    }
+                }
+                if let Some(balanced) = balance_segment.1 {
+                    capacity = capacity.min(balanced);
+                }
                 let mut chosen = self.choose_inline_line_end(paragraph, &bidi, paragraph_index,
                     start, forced_end, &candidates, capacity, wrap, hang, *advance==0.0,&cloned)?;
                 if chosen <= start {
@@ -36351,6 +37018,22 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let (commands, hits) = chunks[index].clone();
             let command_end = self.commands.len();
             let hit_end = self.geometry.as_ref().map_or(0, |g| g.hits.len());
+            // A chunk inside a clip, layer or transform that closes before
+            // `command_end` cannot be rotated past that close without leaving
+            // the scope; the stacking phases order it afterwards and reopen
+            // the scopes around it.
+            let stays_scoped = if commands.is_empty() {
+                self.geometry.as_ref().is_none_or(|geometry| hits.is_empty() || !geometry.rounded_clips.iter().any(|clip|
+                    clip.hits.start <= hits.start && hits.end <= clip.hits.end && clip.hits.end < hit_end))
+            } else {
+                self.commands.get(commands.start..command_end).is_some_and(|tail| {
+                    let (chunk, rest) = tail.split_at(commands.len().min(tail.len()));
+                    paint_scopes_self_contained(chunk) && paint_scopes_self_contained(rest)
+                })
+            };
+            if !stays_scoped {
+                continue;
+            }
             if !commands.is_empty() {
                 self.commands[commands.start..command_end].rotate_left(commands.len());
             }
@@ -36413,6 +37096,14 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             for context in &mut self.paint_contexts {
                 let mut range=context.prefix.0..context.end.0;raise_range(&mut range,commands.start,commands.end,command_end);(context.prefix.0,context.end.0)=(range.start,range.end);
                 let mut range=context.prefix.1..context.end.1;raise_range(&mut range,hits.start,hits.end,hit_end);(context.prefix.1,context.end.1)=(range.start,range.end);
+            }
+            if !self.escaped_positioned.is_empty() {
+                for entry in &mut self.escaped_positioned {
+                    raise_range(&mut entry.commands,commands.start,commands.end,command_end);
+                    raise_range(&mut entry.hits,hits.start,hits.end,hit_end);
+                }
+                // Restoring searches the entries by where their commands end.
+                self.escaped_positioned.sort_by_key(|entry|entry.commands.end);
             }
             let mut clip_owners=BTreeMap::new();
             for (&index,&owner) in &self.overflow_clip_commands {
@@ -37963,8 +38654,11 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             Display::TableCell | Display::InlineTable => true,
             _ => saved_table_baselines,
         };
+        let multicol = css::columns::active(&computed);
+        if multicol { self.multicol_depth += 1; }
         let result =
             self.box_for_baseline_scope(id, parent_style, Some(computed), x, y, available, depth, child_override, output_rect);
+        if multicol { self.multicol_depth -= 1; }
         self.export_block_table_baselines = saved_table_baselines;
         if let Some(saved) = saved_computed_parent { self.computed_parent = saved; }
         self.active_box = saved_active_box;
@@ -38429,6 +39123,8 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let mut overflow_origin=(0.0f64,0.0f64);
         let mut available = available;
         let mut out_of_flow = false;
+        let mut style_is_fixed = false;
+        let mut static_axes = (false, false);
         let mut margin_solver_input = None;
         let mut trailing = (None, None);
         if let Some(style) = computed.as_mut() {
@@ -38514,6 +39210,7 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
                     maximum: (maximum - edges).max(0.0),
                     horizontal: true,
                     shrink_auto: false,
+                    min_contribution: false,
                 }
                 .choose(
                     css::IntrinsicSizing::FitContent,
@@ -38523,6 +39220,12 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             }
             self.begin_decoration(style)?;
             out_of_flow = matches!(style.position, Position::Absolute | Position::Fixed);
+            style_is_fixed = style.position == Position::Fixed;
+            static_axes = if style.anchored.is_none() {
+                (style.left.is_none() && style.right.is_none(), style.top.is_none() && style.bottom.is_none())
+            } else {
+                (false, false)
+            };
             if out_of_flow || style.position == Position::Sticky {
                 self.scroll_hazards += 1;
             }
@@ -38923,9 +39626,10 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                         containing.x + containing.width - right - containing_block_scroll.0
                     });
                     if let Some(edge) = trailing.0 {
-                        overflow_origin.0=precise_containing.0+f64::from(containing.width)-f64::from(style.right.unwrap_or(0.0))-f64::from(containing_block_scroll.0)-f64::from(content_dimension(style,style.width.unwrap_or(0.0)))-f64::from(box_edges(style,true));
+                        let used_width = constrained_width(style, content_dimension(style, style.width.unwrap_or(0.0)));
+                        overflow_origin.0=precise_containing.0+f64::from(containing.width)-f64::from(style.right.unwrap_or(0.0))-f64::from(containing_block_scroll.0)-f64::from(used_width)-f64::from(box_edges(style,true));
                         origin.0 = edge
-                            - content_dimension(style, style.width.unwrap_or(0.0))
+                            - used_width
                             - box_edges(style, true);
                     }
                 }
@@ -38935,7 +39639,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
                     });
                     if let Some(edge) = trailing.1 {
                         let height = if let Some(height) = style.height {
-                            content_height_dimension(style, height) + box_edges(style, false)
+                            constrained_height(style, content_height_dimension(style, height)) + box_edges(style, false)
                         } else {
                             self.box_source_intrinsic_size(id, style, depth + 1, false, generated)?.1
                         };
@@ -39135,7 +39839,7 @@ if !out_of_flow && generated.is_none() && GridAxes::new(style).reverse_block
         let layer = self.begin_opacity(computed.as_ref().filter(|_|!svg_filter_owner))?;
         let width = computed.as_ref().map_or(available, |style| {
             style.width.map_or(available, |width| {
-                content_dimension(style, width)
+                constrained_width(style, content_dimension(style, width))
                     + box_edges(style, true)
             })
         });
@@ -39289,6 +39993,18 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 self.discard_positioned_flow_in(first_command..self.commands.len(),first_hit..hit_end);
             }
             self.record_stacking_escape_range(first_command,first_hit,z,identity,order,transparent)?;
+        }
+        if out_of_flow {
+            let hit_end=self.geometry.as_ref().map_or(0,|geometry|geometry.hits.len());
+            if first_command<self.commands.len() || first_hit<hit_end {
+                if self.escaped_positioned.len()>=MAX_DISPLAY_COMMANDS {
+                    return Err(LayoutError::CommandLimit);
+                }
+                self.escaped_positioned.try_reserve(1).map_err(|_|LayoutError::CommandLimit)?;
+                let containing=if style_is_fixed {saved_fixed_containing_block_node}else{saved_containing_block_node};
+                self.escaped_positioned.push(EscapedPositioned{
+                    commands:first_command..self.commands.len(),hits:first_hit..hit_end,containing,static_axes});
+            }
         }
         let overflow = if self
             .overflow_frames
@@ -39487,8 +40203,11 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         // The real dropdown button occupies inline space. This renderer's
         // overlay scrollports reserve no listbox scrollbar gutter.
         if control.dropdown_button {
-            width += style.font_size;
+            width += crate::control_appearance::MENULIST_ARROW_WIDTH;
         }
+        // Intrinsic widths live on the 1/64 px layout grid so the edge and
+        // calc-size() arithmetic built on them stays exact in f32.
+        width = (width * 64.0).ceil() / 64.0;
         let rows = if control.list_box {
             if style.field_sizing == css::FieldSizing::Content {
                 rows_count
@@ -39502,7 +40221,12 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         };
         let axes=GridAxes::new(style);
         let height=self.line_height(style)*rows as f32;
-        let empty=axes.physical((if control.dropdown_button {style.font_size}else{0.0},height));
+        // A contained drop-down box keeps its button and inner block padding,
+        // which `menulist_internal_padding` leaves out of a contained axis.
+        let empty=axes.physical(if control.dropdown_button {
+            (crate::control_appearance::MENULIST_ARROW_WIDTH+2.0*crate::control_appearance::MENULIST_INLINE_PADDING,
+                height+2.0*crate::control_appearance::MENULIST_BLOCK_PADDING)
+        } else {(0.0,height)});
         let (width,height) = axes.physical((width,height));
         Ok(if self.size_containment_applies(id, style)? {
             // Size containment removes option content. HTML's fixed list-box
@@ -39880,10 +40604,6 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     self.push_command(fill(rect,color,0.0))?;
                 }
             }
-            Widget::Button if control.native => {
-                self.push_command(fill(rect,background,2.0))?;
-                self.push_command(Command::StrokeBorder{rect,radius:2.0,width:1.0,color:border})?;
-            }
             _ => {}
         }
         Ok(())
@@ -39902,18 +40622,46 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
     ) -> Result<(f32, f32), LayoutError> {
         let paint_style=self.control_paint_style(id,style,control.placeholder&&!control.value.is_empty(),control.multiline)?;
         let line_height = self.line_height(if style.field_sizing==css::FieldSizing::Content {&paint_style}else{style}).max(1.0);
+        // A contained axis drops the drop-down box's inner padding from the
+        // box, but its label still sits inside that padding.
+        let inner_padding = crate::control_appearance::menulist_inner_padding(self.document, id, style);
+        let (left, top, width) = match inner_padding {
+            Some([inner_top, _, _, inner_left]) => {
+                let dx = if style.contains_size_axis(true) { inner_left } else { 0.0 };
+                let dy = if style.contains_size_axis(false) { inner_top } else { 0.0 };
+                (left + dx, top + dy, (width - 2.0 * dx).max(0.0))
+            }
+            None => (left, top, width),
+        };
         if control.label {
             // Noneditable labels are ordinary formatted button contents, not
             // editable-control values, placeholders, caret sources or DOM text.
             let mut paragraph = InlineParagraph { standalone_label: true, ..InlineParagraph::default() };
             let mut multiline_style;
-            let style = if control.multiline { multiline_style=style.clone();multiline_style.white_space=WhiteSpace::PreWrap;&multiline_style } else {style};
+            let style = if control.multiline { multiline_style=style.clone();multiline_style.white_space=WhiteSpace::PreWrap;&multiline_style }
+                else if inner_padding.is_some() && !matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+                    // A drop-down box shows its label on one line whatever its `white-space`.
+                    multiline_style=style.clone();
+                    multiline_style.white_space=if matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine) {WhiteSpace::NoWrap} else {WhiteSpace::Pre};
+                    &multiline_style
+                } else {style};
             Self::paragraph_append_text(&mut paragraph, &control.value, id, style, &[])?;
             let (mut cursor, mut advance, mut height, mut trailing) = (top, 0.0, 0.0, 0.0);
             let mut line = self.line_start();
-            self.flow_inline_paragraph(&mut paragraph, style, left, width,
+            // A list box sits on the baseline with its bottom margin edge, not
+            // with the baseline of its option rows.
+            let outer_baselines = control.multiline.then(|| self.flow_baselines.take());
+            let flowed = self.flow_inline_paragraph(&mut paragraph, style, left, width,
                 &mut cursor, &mut advance, &mut height, self.floats.len(),
-                &mut line, &mut trailing, depth)?;
+                &mut line, &mut trailing, depth);
+            if let Some(outer) = outer_baselines { self.flow_baselines = outer; }
+            flowed?;
+            if control.value.is_empty() && !control.multiline && style.writing_mode == css::WritingMode::HorizontalTb
+                && matches!(self.document.kind(id), Ok(NodeKind::Element { name, .. }) if name.as_str() == "select") {
+                // An empty drop-down box still has its one text line, which
+                // supplies the baseline instead of the bottom margin edge.
+                self.record_flow_baseline(top + self.baseline(style));
+            }
             if style.writing_mode == css::WritingMode::HorizontalTb {
                 self.align_line(line, left, width, advance - trailing, style, true);
             }
@@ -40294,6 +41042,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         if control_presentation.is_some_and(|control| control.base_select) {
             return Err(LayoutError::UnsupportedWidgetAppearance);
         }
+        if control_presentation.is_some_and(|control| control.native && control.widget == crate::control_appearance::Widget::Button) {
+            self.apply_native_button_surface(&mut style);
+        }
         let is_form_control = !virtual_parent && (matches!(tag, "input" | "textarea")
             && control_presentation.is_none_or(|control| control.replaced)
             || tag == "select");
@@ -40541,6 +41292,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             let paint_only_image = tag == "img" && replacement_source.is_none() && source.is_some()
                 && specified_width.is_some() && specified_height.is_some();
             let previous_paint_only = if paint_only_image { self.images.map(|images| images.set_paint_only(true)) } else { None };
+            let mut poster_source: Option<&str> = None;
             let procedural_replacement=if let Some(source)=replacement_source.as_deref() {
                 let image=css::computed_image_source(source,style.color);
                 if matches!(image,BackgroundImage::Url(_)) {None}else{self.resolve_generated_image(image,false)?}
@@ -40568,7 +41320,20 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 }
             } else if html_presentation.is_some() {
                 None
-            } else if tag == "canvas" || tag == "video" {
+            } else if tag == "video" {
+                let frame = self.images.and_then(|images| images.resolve_node(id));
+                if matches!(&frame, Some(ImageState::Ready(image)) if image.is_valid()) {
+                    frame
+                } else {
+                    match self.images.and_then(|images| resolve_video_poster(images, attributes, self.rules.document_base_url())) {
+                        Some((poster, state)) => {
+                            poster_source = Some(poster);
+                            Some(state)
+                        }
+                        None => frame,
+                    }
+                }
+            } else if tag == "canvas" {
                 self.images.and_then(|images| images.resolve_node(id))
             } else {
                 match (source, self.images) {
@@ -40587,6 +41352,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 _ => None,
                 },
             };
+            let source = poster_source.or(source);
             let mut deferred_image = None;
             if let (true, true, Some(images), Some(source)) = (paint_only_image, image.is_none(), self.images, source.filter(|source| !source.is_empty())) {
                 let base = self.rules.document_base_url();
@@ -40684,13 +41450,11 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 }
                 if let Some(image) = image {
                     if style.visibility_visible
+                        && !style.skips_contents()
                         && (self.source_capture_depth != 0 || self.transform_depth > 0 || rect.intersection(self.cull).is_some())
                     {
                         let scheme=style.used_color_scheme(self.media_environment()).scheme;
-                        let image_rect=match css::object_fit::ObjectFit::of(&style) {
-                            Some(fit)=>fit.destination(rect,image_natural_size(self.images,Some(id),&image,scheme)),
-                            None=>rect,
-                        };
+                        let image_rect=css::object_fit::image_rect(&style,rect,image_natural_size(self.images,Some(id),&image,scheme));
                         let image=match (self.images,source) {
                             (Some(images),Some(source))=>match images.resolve_viewport(Some(id),self.rules.document_base_url().unwrap_or(""),source,&image,image_rect.width,image_rect.height,scheme) {
                                 Some(ImageState::Ready(viewport_image)) if viewport_image.is_valid()=>viewport_image,
@@ -41825,7 +42589,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                     .map_err(|_| LayoutError::CommandLimit)?;
                 let legacy_static=self.paragraph_column_flow.as_ref().is_some_and(|flow|flow.prepared && flow.pending)
                     || (!vertical_block_flow && style.used_direction()==Direction::Ltr);
-                let mut positioned_style=computed.unwrap();
+                let positioned_style=computed.unwrap();
                 let (static_x,static_y)=if legacy_static {
                     self.block_static_position(content_x,cursor,inline_width,inline_height)?
                 } else {
@@ -43485,7 +44249,7 @@ pub(crate) fn display_list_with_snapshot_mode(
     canvas_background: Option<Rgba>,
     drawable_snapshot: Option<NodeId>,
 ) -> Result<DisplayList, LayoutError> {
-    display_list_with_snapshot_mode_and_timelines(document,width,height,text,rules,images,geometry,scrolls,style_cache,retained_fragments,presentation_root,canvas_background,drawable_snapshot,None,None,false)
+    display_list_with_snapshot_mode_and_timelines(document,width,height,text,rules,images,geometry,scrolls,style_cache,retained_fragments,presentation_root,canvas_background,drawable_snapshot,None,None,false,None)
 }
 
 /// With `scroll_window` and `at_origin`, the document is laid out as if it were not
@@ -43510,10 +44274,11 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     timeline_values:Option<&crate::animation::progress_timelines::TransformTimelineValues>,
     scroll_window: Option<f32>,
     at_origin: bool,
+    paint_height: Option<u32>,
 ) -> Result<DisplayList, LayoutError> {
     let (mut list, at_origin) = laid_out_display_list(document, width, height, text, rules, images, geometry.as_deref_mut(),
         scrolls, style_cache, retained_fragments.as_deref_mut(), presentation_root, canvas_background, drawable_snapshot,
-        timeline_values, scroll_window, at_origin)?;
+        timeline_values, scroll_window, at_origin, paint_height)?;
     let root = document.root();
     let root_scroll = scrolls.iter().find(|scroll| scroll.node == root).map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y));
     let Some(geometry) = geometry.as_deref_mut().filter(|_| at_origin) else {
@@ -43535,7 +44300,7 @@ pub(crate) fn display_list_with_snapshot_mode_and_timelines(
     geometry.collect_text_runs = collect_text_runs;
     geometry.origin_layout_refused = true;
     laid_out_display_list(document, width, height, text, rules, images, Some(geometry), scrolls, style_cache,
-        retained_fragments, presentation_root, canvas_background, drawable_snapshot, timeline_values, scroll_window, false)
+        retained_fragments, presentation_root, canvas_background, drawable_snapshot, timeline_values, scroll_window, false, paint_height)
         .map(|(list, _)| list)
 }
 
@@ -43562,13 +44327,14 @@ fn laid_out_display_list(
     timeline_values:Option<&crate::animation::progress_timelines::TransformTimelineValues>,
     scroll_window: Option<f32>,
     at_origin: bool,
+    paint_height: Option<u32>,
 ) -> Result<(DisplayList, bool), LayoutError> {
     let initial_flags = rules.layout_fallback();
     let mut flags = initial_flags;
     loop {
         let result = laid_out_display_list_once(document, width, height, text, rules, images, geometry.as_deref_mut(),
             scrolls, style_cache, retained_fragments.as_deref_mut(), presentation_root, canvas_background,
-            drawable_snapshot, timeline_values, scroll_window, at_origin);
+            drawable_snapshot, timeline_values, scroll_window, at_origin, paint_height);
         let added = match &result {
             Err(LayoutError::UnsupportedMulticolumnLayout) => css::FALLBACK_NO_COLUMNS,
             Err(LayoutError::UnsupportedWidgetAppearance) => css::FALLBACK_PLAIN_SELECT,
@@ -43618,6 +44384,7 @@ fn laid_out_display_list_once(
     timeline_values:Option<&crate::animation::progress_timelines::TransformTimelineValues>,
     scroll_window: Option<f32>,
     at_origin: bool,
+    paint_height: Option<u32>,
 ) -> Result<(DisplayList, bool), LayoutError> {
 
     let root = document.root();
@@ -43673,7 +44440,11 @@ fn laid_out_display_list_once(
     // With `scroll_window`, the document's content is emitted for a window of
     // screens around the viewport, so that scrolling within it moves the
     // commands instead of laying the page out again (see `RootScrollRegion`).
-    let window = scroll_window.filter(|_| tracks_root_scroll && drawable_snapshot.is_none() && timeline_values.is_none())
+    let paint_extent = paint_height
+        .filter(|extent| *extent > height && tracks_root_scroll && drawable_snapshot.is_none())
+        .map(|extent| Rect { x: 0.0, y: 0.0, width: width as f32, height: extent as f32 });
+    let window = scroll_window
+        .filter(|_| tracks_root_scroll && drawable_snapshot.is_none() && timeline_values.is_none() && paint_extent.is_none())
         .map(|screens| (screens.min(1.0) * width as f32, screens * height as f32));
     let at_origin = at_origin && window.is_some();
     // The window stays around the viewport's place in the document.
@@ -43706,15 +44477,14 @@ fn laid_out_display_list_once(
             height: height as f32 + 2.0 * window_y,
         };
     }
+    if let Some(extent) = paint_extent {
+        layout.cull = extent;
+        layout.paint_extent = Some(extent);
+    }
     layout.overflow_frames = overflow_frames;
     if let Some(color) = canvas_background {
         layout.push_command(Command::FillRect {
-            rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: width as f32,
-                height: height as f32,
-            },
+            rect: paint_extent.unwrap_or(viewport),
             color,
         })?;
     }
@@ -43941,7 +44711,7 @@ fn laid_out_display_list_once(
         // source/root transforms. Image positioning still uses the real,
         // untransformed root box (CSS Backgrounds 3 §2.11.1).
         let index = layout.commands.len() + background_paints(&canvas_style) - 1;
-        layout.push_background_with_coverage(layout.viewport_rect(), Some(layout.viewport_rect()), &canvas_style)?;
+        layout.push_background_with_coverage(layout.viewport_rect(), Some(layout.canvas_coverage()), &canvas_style)?;
         Some(index)
     } else { None };
     let root_target = (layout.commands.len(), layout.geometry.as_ref().map_or(0, |geometry| geometry.hits.len()));
@@ -43980,7 +44750,7 @@ fn laid_out_display_list_once(
 
     }
     if let (Some(index), Some(rect)) = (canvas_index, layout.canvas_root_box) {
-        layout.finish_background_with_coverage(index, rect, &canvas_style, None, Some(layout.viewport_rect()))?;
+        layout.finish_background_with_coverage(index, rect, &canvas_style, None, Some(layout.canvas_coverage()))?;
     }
     // Only a canvas painted in one colour stays put while the document moves.
     let canvas_images = canvas_index.is_some() && canvas_style.background_images.as_ref().is_some_and(|images|
@@ -44034,6 +44804,9 @@ mod tab_layout;
 
 #[path = "layout_text_box.rs"]
 mod text_box_layout;
+
+#[path = "layout_svg_mask.rs"]
+mod svg_mask_layout;
 
 #[cfg(test)]
 mod tests {
@@ -45289,6 +46062,18 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn svg_capability_query_accepts_rendering_hints() {
+        let document = crate::html::parse(
+            "<svg shape-rendering='geometricPrecision' text-rendering='geometricPrecision' style='shape-rendering:crispEdges'><rect width='2' height='2' text-rendering='optimizeLegibility'/></svg>",
+            128,
+        )
+        .unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let unsupported = unsupported_svg_features(&document, &rules).unwrap();
+        assert!(unsupported.is_empty());
+    }
+
+    #[test]
     fn svg_capability_query_accepts_a_resolved_linear_gradient_fallback() {
         let document = crate::html::parse(
             "<svg><defs><linearGradient id='g'><stop offset='0' stop-color='red'/></linearGradient></defs><rect width='2' height='2' fill='url(#g) blue'/></svg>",
@@ -46393,7 +47178,8 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             ("#empty", 1., 10.),
             ("#hint", 10., 10.),
             ("#vertical", 10., 6.),
-            ("#minimum", 4., 10.),
+            // Select labels are `white-space: pre`, as in Chrome, so they do not wrap.
+            ("#minimum", 10., 10.),
             ("#maximum", 10., 10.),
         ] {
             let rect = session.layout_rect(find(&session, name)).unwrap();
@@ -46658,6 +47444,47 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         );
         let main = intrinsic_keyword_rect(&document, &geometry, "main");
         assert_eq!(main.height, 20.0);
+    }
+
+    #[test]
+    fn max_content_grid_height_measures_nested_text_at_definite_widths() {
+        for (name, content) in [
+            ("definite block width", "<div style='width:25px'><p style='margin:0'>aaaa bbbb cccc</p></div>"),
+            ("max-width flex column", "<section style='display:flex;flex-direction:column;max-width:25px'>\
+                <div><p style='margin:0'>aaaa bbbb cccc</p></div></section>"),
+        ] {
+            let (document, geometry) = intrinsic_keyword_geometry(&alloc::format!(
+                "<div id=g style='display:grid;height:max-content;line-height:10px'>\
+                 <div id=c style='padding:5px 0'>{content}</div></div>"
+            ));
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#c").height, 40.0, "{name}");
+            assert_eq!(intrinsic_keyword_rect(&document, &geometry, "#g").height, 40.0, "{name}");
+        }
+    }
+
+    #[test]
+    fn grid_fraction_row_sizes_flex_item_at_flexed_item_widths() {
+        let words = "a ".repeat(16);
+        for (name, height) in [("max-content", "height:max-content;"), ("auto", "")] {
+            let (document, geometry) = intrinsic_keyword_geometry(&alloc::format!(
+                "<div id=g style='display:grid;{height}grid-template-rows:auto 1fr auto;line-height:10px'>\
+                 <div id=h style='height:10px'></div>\
+                 <div id=c style='display:flex;justify-content:center;align-items:center;padding:5px 0'>\
+                 <main id=m style='display:flex;gap:10px'>\
+                 <section style='flex:1 0;max-width:40px'><p style='margin:0'>{words}</p></section>\
+                 <section style='flex:1;max-width:100px'>x</section></main></div>\
+                 <footer id=f style='height:20px'></footer></div>"
+            ));
+            let main = intrinsic_keyword_rect(&document, &geometry, "#m");
+            let center = intrinsic_keyword_rect(&document, &geometry, "#c");
+            let foot = intrinsic_keyword_rect(&document, &geometry, "#f");
+            let grid = intrinsic_keyword_rect(&document, &geometry, "#g");
+            assert_eq!(main.height, 80.0, "{name}");
+            assert_eq!(center.height, main.height + 10.0, "{name}");
+            assert_eq!(main.y, center.y + 5.0, "{name}");
+            assert_eq!(foot.y, center.y + center.height, "{name}");
+            assert_eq!(grid.height, 10.0 + center.height + 20.0, "{name}");
+        }
     }
 
     #[test]
@@ -48258,6 +49085,17 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         );
     }
 
+    #[test]
+    fn flex_wrap_keeps_percentage_items_that_fill_the_line_on_one_line() {
+        let boxes = colored_boxes_in(
+            "<div style='display:flex;flex-wrap:wrap;width:454px'><div style='flex:0 0 auto;width:33.333333%;height:10px;background:#f00'></div><div style='flex:0 0 auto;width:66.666667%;height:10px;background:#0f0'></div></div>",
+            500,
+            100,
+        );
+        assert_eq!(boxes.len(), 2);
+        assert!(boxes.iter().all(|rect| rect.y == 0.0), "{boxes:?}");
+    }
+
     fn colored_boxes(markup: &str) -> Vec<Rect> {
         colored_boxes_in(markup, 100, 100)
     }
@@ -48274,6 +49112,41 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 _ => None,
             })
             .collect()
+    }
+
+    fn icon_and_positioned_after_boxes(body: &str) -> (Vec<Rect>, Vec<Rect>) {
+        let markup = alloc::format!(
+            "<style>.bi::before{{display:inline-block;content:'X';width:10px;height:10px;background:red}}\
+             .s::after{{position:absolute;inset:0;content:'';width:5px;height:5px;background:#008000}}</style>{body}"
+        );
+        let boxes = colored_boxes_in(&markup, 400, 200);
+        let icons = boxes.iter().filter(|rect| rect.width == 10.0).cloned().collect();
+        let afters = boxes.iter().filter(|rect| rect.width == 5.0).cloned().collect();
+        (icons, afters)
+    }
+
+    #[test]
+    fn positioned_after_on_inline_element_keeps_other_generated_before_boxes() {
+        let (icons, afters) = icon_and_positioned_after_boxes("<i class=bi></i><span class=s></span>");
+        assert_eq!(icons.len(), 1, "{icons:?}");
+        assert_eq!(icons[0].height, 10.0);
+        assert_eq!(afters.len(), 1, "{afters:?}");
+    }
+
+    #[test]
+    fn positioned_after_on_link_inside_heading_keeps_icon_before_box() {
+        let (icons, afters) = icon_and_positioned_after_boxes(
+            "<h3><i class=bi></i><a class=s href='#'>Text</a></h3>");
+        assert_eq!(icons.len(), 1, "{icons:?}");
+        assert_eq!(afters.len(), 1, "{afters:?}");
+    }
+
+    #[test]
+    fn inline_element_with_before_and_positioned_after_generates_both() {
+        let (icons, afters) = icon_and_positioned_after_boxes("<p><i class='bi s'></i></p>");
+        assert_eq!(icons.len(), 1, "{icons:?}");
+        assert_eq!(icons[0].height, 10.0);
+        assert_eq!(afters.len(), 1, "{afters:?}");
     }
 
     #[test]
@@ -53174,6 +54047,140 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn replaced_percentage_size_contributes_zero_min_content_to_flex_automatic_minimum() {
+        for (sizing, expected) in [
+            ("max-width:100%", 90.0),
+            ("max-inline-size:100%", 90.0),
+            ("width:100%", 90.0),
+            ("max-width:calc(100% - 0px)", 90.0),
+            ("max-width:300px", 300.0),
+            ("width:300px", 300.0),
+        ] {
+            let markup = alloc::format!(
+                "<div style='display:flex;width:200px'><div id=item style='flex:0 1 45%'><canvas width=900 height=600 style='display:block;{sizing}'></canvas></div><div style='flex:0 0 10px'></div></div>"
+            );
+            let (document, geometry) = intrinsic_keyword_geometry(&markup);
+            let rect = intrinsic_keyword_rect(&document, &geometry, "#item");
+            assert_eq!(rect.width, expected, "{sizing}");
+        }
+    }
+
+    #[test]
+    fn flex_line_cross_size_uses_the_used_main_size_of_compressible_replaced_items() {
+        for (container, align, canvas_width) in [
+            ("flex-wrap:wrap", "flex-start", ""),
+            ("flex-wrap:wrap", "stretch", ""),
+            ("flex-wrap:wrap", "flex-start", "width:100%;"),
+            ("flex-wrap:nowrap", "flex-start", ""),
+            ("flex-wrap:nowrap", "stretch", ""),
+        ] {
+            let markup = alloc::format!(
+                "<style>.c{{display:flex;{container};justify-content:space-between;align-items:{align};width:200px}}.i,.t{{flex-basis:45%}}</style>\
+                 <div class=c id=first><div class=i id=item><canvas width=900 height=600 style='display:block;max-width:100%;height:auto;{canvas_width}'></canvas></div><div class=t>Text</div></div>\
+                 <div class=c id=second><div class=i><canvas width=900 height=600 style='display:block;max-width:100%;height:auto;{canvas_width}'></canvas></div><div class=t>Text</div></div>"
+            );
+            let (document, geometry) = intrinsic_keyword_geometry(&markup);
+            let label = alloc::format!("{container} {align} {canvas_width}");
+            let item = intrinsic_keyword_rect(&document, &geometry, "#item");
+            assert_eq!((item.width, item.height), (90.0, 60.0), "{label}");
+            let first = intrinsic_keyword_rect(&document, &geometry, "#first");
+            assert_eq!(first.height, 60.0, "{label}");
+            let second = intrinsic_keyword_rect(&document, &geometry, "#second");
+            assert_eq!(second.y, 60.0, "{label}");
+        }
+    }
+
+    #[test]
+    fn replaced_percentage_size_is_zero_for_min_content_only() {
+        for (keyword, expected) in [("min-content", 7.0), ("max-content", 907.0)] {
+            let markup = alloc::format!(
+                "<div id=item style='width:{keyword};padding-left:7px'><canvas width=900 height=600 style='display:block;max-width:100%'></canvas></div>"
+            );
+            let (document, geometry) = intrinsic_keyword_geometry(&markup);
+            let rect = intrinsic_keyword_rect(&document, &geometry, "#item");
+            assert_eq!(rect.width, expected, "width:{keyword}");
+        }
+    }
+
+    #[test]
+    fn inline_replaced_percentage_size_is_zero_for_min_content_only() {
+        for (keyword, expected) in [("min-content", 7.0), ("max-content", 907.0)] {
+            let markup = alloc::format!(
+                "<div id=item style='width:{keyword};padding-left:7px'><canvas width=900 height=600 style='max-width:100%'></canvas></div>"
+            );
+            let (document, geometry) = intrinsic_keyword_geometry(&markup);
+            let rect = intrinsic_keyword_rect(&document, &geometry, "#item");
+            assert_eq!(rect.width, expected, "width:{keyword}");
+        }
+    }
+
+    #[test]
+    fn inline_replaced_percentage_size_is_zero_through_cyclic_percentage_float_ancestors() {
+        let markup = "<div id=item style='width:min-content;border:1px solid'><div style='max-width:60em'><div style='width:600%;line-height:0'><div style='width:16.66%;float:left'><canvas width=900 height=600 style='max-width:95%;height:auto'></canvas></div></div></div></div>";
+        let (document, geometry) = intrinsic_keyword_geometry(markup);
+        let rect = intrinsic_keyword_rect(&document, &geometry, "#item");
+        assert_eq!(rect.width, 2.0);
+    }
+
+    #[test]
+    fn inline_replaced_with_fixed_width_and_percentage_max_width_is_compressible() {
+        let markup = "<div id=item style='width:min-content;border:1px solid'><div style='width:600%;line-height:0'><div style='width:16.66%;float:left'><canvas width=900 height=600 style='width:900px;max-width:95%;height:auto'></canvas></div></div></div>";
+        let (document, geometry) = intrinsic_keyword_geometry(markup);
+        let rect = intrinsic_keyword_rect(&document, &geometry, "#item");
+        assert_eq!(rect.width, 2.0);
+    }
+
+    #[test]
+    fn flex_item_height_contains_floats_escaping_its_descendants() {
+        let markup = "<div style='display:flex;flex-wrap:wrap;width:100px'><div id=a style='display:flex;flex-direction:column;flex:1;padding:2px;width:50%'><div style='text-align:center'><div style='height:5px'></div><div><div style='width:10px'><div style='float:left;width:10px;height:40px'></div></div></div></div></div><div id=b style='display:flex;flex-direction:column;flex:1;padding:2px;width:50%'></div></div>";
+        let (document, geometry) = intrinsic_keyword_geometry_at(markup, 200, 300);
+        for selector in ["#a", "#b"] {
+            let rect = intrinsic_keyword_rect(&document, &geometry, selector);
+            assert_eq!(rect.height, 49.0, "{selector}");
+        }
+    }
+
+    #[test]
+    fn flex_wrap_items_with_cyclic_percentage_replaced_descendants_flex_and_size_like_nowrap() {
+        for (wrap, edges, height) in [
+            ("wrap", "padding:19px;border:1px solid #fff;", 155.0),
+            ("wrap", "", 125.0),
+            ("nowrap", "padding:19px;border:1px solid #fff;", 155.0),
+            ("nowrap", "", 125.0),
+        ] {
+            let markup = alloc::format!(
+                "<style>.row{{display:flex;flex-direction:row;flex-wrap:{wrap};width:1000px}}\
+                 .column{{display:flex;flex-direction:column;flex:1;{edges}width:50%}}\
+                 .wrapper{{max-width:60em;position:relative}}.inner{{width:400%;line-height:0}}\
+                 .inner article{{width:25%;float:left;position:relative}}\
+                 .inner article canvas{{max-width:50%;height:auto}}</style>\
+                 <div class=row><div class=column id=l><div style='text-align:center'>\
+                 <div class=wrapper><div class=inner><article><canvas width=600 height=300></canvas></article>\
+                 <article><canvas width=300 height=150></canvas></article></div></div></div></div>\
+                 <div class=column id=r></div></div>"
+            );
+            let (document, geometry) = intrinsic_keyword_geometry_at(&markup, 1000, 600);
+            let label = alloc::format!("{wrap} {edges}");
+            let first = intrinsic_keyword_rect(&document, &geometry, "#l");
+            assert_eq!((first.x, first.y, first.width, first.height), (0.0, 0.0, 500.0, height), "{label}");
+            let second = intrinsic_keyword_rect(&document, &geometry, "#r");
+            assert_eq!((second.x, second.y, second.width, second.height), (500.0, 0.0, 500.0, height), "{label}");
+        }
+    }
+
+    #[test]
+    fn wrapped_flex_item_min_content_does_not_reuse_max_content_replaced_widths() {
+        let markup = "<div style='display:flex;flex-wrap:wrap;width:400px'>\
+             <div id=a style='flex:1;width:50%;padding:20px'><div style='width:200%;line-height:0'><div style='float:left;width:50%'><canvas width=900 height=300 style='max-width:100%;height:auto'></canvas></div></div></div>\
+             <div id=b style='flex:1;width:50%;padding:20px'></div></div>";
+        let (document, geometry) = intrinsic_keyword_geometry_at(markup, 1000, 600);
+        for selector in ["#a", "#b"] {
+            let rect = intrinsic_keyword_rect(&document, &geometry, selector);
+            assert_eq!(rect.width, 200.0, "{selector}");
+        }
+    }
+
+    #[test]
     fn flex_basis_content_uses_intrinsic_main_size_instead_of_preferred_width() {
         let boxes = colored_boxes(
             "<main style='display:flex;width:240px'><div style='width:20px;height:20px;background:green'><div style='width:120px;height:8px'></div></div><div style='width:20px;height:20px;flex-basis:content;background:red'><div style='width:120px;height:8px'></div></div></main>",
@@ -53441,6 +54448,145 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     }
 
     #[test]
+    fn absolute_flex_child_of_static_container_resolves_against_initial_containing_block() {
+        let boxes = colored_boxes_in(
+            "<div style='height:100px'></div><div style='display:flex;padding:20px;height:200px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 0.0, 300.0, 200.0));
+    }
+
+    #[test]
+    fn absolute_flex_child_of_static_container_resolves_against_positioned_ancestor() {
+        let boxes = colored_boxes_in(
+            "<div style='height:50px'></div><div style='position:relative;margin-left:10px;width:200px;height:80px'><div style='display:flex;padding:20px;height:40px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (10.0, 50.0, 200.0, 80.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_grid_item_resolves_against_initial_containing_block() {
+        for display in ["block", "flex", "grid"] {
+            let boxes = colored_boxes_in(
+                &alloc::format!("<div style='display:grid;grid-template-rows:auto auto'><div style='height:100px'></div><div style='display:{display};padding:20px;height:200px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>"),
+                300,
+                200,
+            );
+            assert_eq!(boxes.len(), 1, "{display}");
+            assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 0.0, 300.0, 200.0), "{display}");
+        }
+    }
+
+    #[test]
+    fn fixed_descendant_of_grid_item_resolves_against_viewport() {
+        let boxes = colored_boxes_in(
+            "<div style='display:grid;grid-template-rows:auto auto'><div style='height:100px'></div><div style='padding:20px;height:200px'><div style='position:fixed;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 0.0, 300.0, 200.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_grid_item_resolves_against_positioned_ancestor_of_the_grid() {
+        let boxes = colored_boxes_in(
+            "<div style='height:50px'></div><div style='position:relative;margin-left:10px;width:200px;height:300px'><div style='display:grid;grid-template-rows:auto auto'><div style='height:30px'></div><div style='padding:20px;height:40px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (10.0, 50.0, 200.0, 300.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_positioned_grid_item_stays_relative_to_the_item() {
+        let boxes = colored_boxes_in(
+            "<div style='display:grid;grid-template-rows:auto auto'><div style='height:100px'></div><div style='position:relative;padding:20px;height:200px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 100.0, 300.0, 240.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_flex_item_resolves_against_initial_containing_block() {
+        let boxes = colored_boxes_in(
+            "<div style='height:20px'></div><div style='display:flex;align-items:flex-end;height:150px'><div style='width:100px;height:50px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 0.0, 300.0, 200.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_flex_item_before_relative_siblings_resolves_against_initial_containing_block() {
+        let boxes = colored_boxes_in(
+            "<div style='height:20px'></div><div style='display:flex;align-items:flex-end;height:150px'><div style='width:100px;height:50px'><div style='position:absolute;top:0;left:0;width:10px;height:10px;background:green'></div><div style='position:relative;height:5px;background:blue'></div><div style='position:relative;height:5px;background:blue'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 0.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn absolute_descendant_of_positioned_flex_item_stays_relative_to_the_item() {
+        let boxes = colored_boxes_in(
+            "<div style='height:20px'></div><div style='display:flex;align-items:flex-end;height:150px'><div style='position:relative;width:100px;height:50px'><div style='position:absolute;top:0;left:0;width:100%;height:100%;background:green'></div><p>x</p></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (0.0, 120.0, 100.0, 50.0));
+    }
+
+    #[test]
+    fn absolute_flex_child_without_insets_keeps_flex_static_position() {
+        let boxes = colored_boxes_in(
+            "<div style='display:flex;justify-content:center;align-items:center;width:100px;height:60px'><div style='position:absolute;width:20px;height:10px;background:green'></div></div>",
+            300,
+            200,
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height), (40.0, 25.0, 20.0, 10.0));
+    }
+
+    #[test]
+    fn absolute_right_anchored_box_places_edge_with_clamped_width() {
+        let rect = |style: &str| {
+            let boxes = colored_boxes_in(&alloc::format!(
+                "<div style='position:relative;width:200px;height:100px'><div style='position:absolute;background:green;{style}'></div></div>"
+            ), 300, 200);
+            assert_eq!(boxes.len(), 1);
+            (boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height)
+        };
+        assert_eq!(rect("right:0;top:0;height:10px;width:150px;max-width:50px"), (150.0, 0.0, 50.0, 10.0));
+        assert_eq!(rect("right:0;top:0;height:10px;width:75%;max-width:50px"), (150.0, 0.0, 50.0, 10.0));
+        assert_eq!(rect("right:10px;top:0;height:10px;width:10px;min-width:50px"), (140.0, 0.0, 50.0, 10.0));
+    }
+
+    #[test]
+    fn absolute_bottom_anchored_box_places_edge_with_clamped_height() {
+        let rect = |style: &str| {
+            let boxes = colored_boxes(&alloc::format!(
+                "<div style='position:relative;width:200px;height:100px'><div style='position:absolute;background:green;{style}'></div></div>"
+            ));
+            assert_eq!(boxes.len(), 1);
+            (boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height)
+        };
+        assert_eq!(rect("left:0;bottom:0;width:10px;height:80px;max-height:30px"), (0.0, 70.0, 10.0, 30.0));
+        assert_eq!(rect("left:0;bottom:0;width:10px;height:5px;min-height:30px"), (0.0, 70.0, 10.0, 30.0));
+    }
+
+    #[test]
     fn flex_row_baseline_fallback_aligns_items_at_their_bottom_margin_edge() {
         let boxes = colored_boxes(
             "<main style='display:flex;align-items:baseline;width:100px;height:80px'><div style='width:40px;height:30px;background:red'></div><div style='width:20px;height:50px;background:green'></div><div style='width:20px;height:20px;background:yellow'></div></main>",
@@ -53652,6 +54798,116 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
             stretched.iter().map(|rect| rect.height).collect::<Vec<_>>(),
             [4.0, 4.0]
         );
+    }
+
+    #[test]
+    fn flex_column_item_text_wraps_at_the_stretched_inline_size() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;width:20px'><div style='background:green'><p style='margin:0'>aaaa bbbb cccc dddd</p></div><div style='height:4px;background:red'></div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].height, 6.0);
+        assert_eq!(boxes[1].y, 6.0);
+    }
+
+    #[test]
+    fn flex_row_items_lay_out_text_at_the_shrunk_main_size() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;width:40px'><div style='width:100%;background:green'><p style='margin:0'>aaaa bbbb cccc dddd</p></div><div style='width:100%;background:green'><p style='margin:0'>aaaa bbbb cccc dddd</p></div></div><div style='height:4px;background:red'></div>",
+        );
+        // Flex items paint atomically, after the following block's background.
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[0].y, 6.0);
+        assert_eq!((boxes[1].width, boxes[1].height), (20.0, 6.0));
+        assert_eq!((boxes[2].width, boxes[2].height), (20.0, 6.0));
+    }
+
+    fn box_with_height(boxes: &[Rect], height: f32) -> Rect {
+        *boxes.iter().find(|rect| rect.height == height).expect("box with the given height")
+    }
+
+    #[test]
+    fn unstretched_column_flex_item_wraps_at_its_fit_content_width() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='background:green'>aaaa bbbb cccc dddd</div><div style='width:4px;height:4px;background:red'></div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        let text = box_with_height(&boxes, 6.0);
+        assert_eq!((text.x, text.width), (0.0, 20.0));
+        assert_eq!(box_with_height(&boxes, 4.0).y, 6.0);
+    }
+
+    #[test]
+    fn unstretched_column_flex_item_shrinks_to_its_content() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='background:green'>aa</div></div><div style='display:flex;flex-direction:column;align-items:center;width:20px'><div style='background:green;height:2px'>aa</div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        let start = box_with_height(&boxes, 3.0);
+        assert_eq!((start.x, start.width), (0.0, 4.0));
+        let centered = box_with_height(&boxes, 2.0);
+        assert_eq!((centered.x, centered.width), (8.0, 4.0));
+    }
+
+    #[test]
+    fn unstretched_column_flex_container_item_is_fit_content_sized() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='display:flex;background:green'><span>aa</span><span>bb</span></div></div>",
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!((boxes[0].x, boxes[0].width, boxes[0].height), (0.0, 8.0, 3.0));
+    }
+
+    #[test]
+    fn unstretched_column_flex_container_item_wraps_its_text_item() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='display:flex;background:green'>aaaa bbbb cccc dddd</div><div style='width:4px;height:4px;background:red'></div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        let text = box_with_height(&boxes, 6.0);
+        assert_eq!(text.width, 20.0);
+        assert_eq!(box_with_height(&boxes, 4.0).y, 6.0);
+    }
+
+    #[test]
+    fn column_flex_item_with_fit_content_width_wraps_at_that_width() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;flex-direction:column;align-items:start;width:20px'><div style='width:fit-content;background:green'>aaaa bbbb cccc dddd</div><div style='width:4px;height:4px;background:red'></div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        let text = box_with_height(&boxes, 6.0);
+        assert_eq!(text.width, 20.0);
+        assert_eq!(box_with_height(&boxes, 4.0).y, 6.0);
+    }
+
+    #[test]
+    fn fit_content_width_contributes_its_min_content_size_to_a_shrinking_flex_item() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;width:30px'><div style='display:flex;flex-direction:column'><div style='width:fit-content;background:green'>aaaa bbbb cccc</div></div><div style='width:10px;height:4px;flex-shrink:0;background:red'></div></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        let text = box_with_height(&boxes, 6.0);
+        assert_eq!(text.width, 20.0);
+        assert_eq!(box_with_height(&boxes, 4.0).x, 20.0);
+    }
+
+    #[test]
+    fn percentage_width_table_is_not_widened_by_border_spacing_around_an_empty_cell() {
+        let boxes = colored_boxes(
+            "<div style='width:20px'><div style='display:table;width:100%;border-spacing:4px;background:green'><div style='height:6px'></div></div></div>"
+        );
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].width, 20.0);
+    }
+
+    #[test]
+    fn row_flex_anonymous_text_lays_out_at_the_shrunk_main_size() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;width:20px;background:green'>aaaa bbbb cccc dddd</div><div style='width:4px;height:4px;background:red'></div>",
+        );
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(box_with_height(&boxes, 6.0).width, 20.0);
+        assert_eq!(box_with_height(&boxes, 4.0).y, 6.0);
     }
 
     #[test]
@@ -53984,6 +55240,59 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[derive(Default)]
     struct RecordingText(core::cell::RefCell<Vec<String>>);
 
+    fn native_button_fills_and_strokes(item_style: &str) -> Vec<String> {
+        let html = alloc::format!(
+            "<!doctype html><style>body{{margin:0}}\
+             div{{display:grid;grid-template-columns:80px;width:80px;height:40px}}\
+             input{{box-sizing:border-box;width:80px;{item_style}}}</style>\
+             <div><input type=button value=ab></div>"
+        );
+        let document = crate::html::parse(&html, 200).unwrap();
+        let list = display_list(&document, 200, 200, &RecordingText::default()).unwrap();
+        list.0
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    Command::FillRect { .. }
+                        | Command::FillRoundedRect { .. }
+                        | Command::MaskedBackground(_)
+                        | Command::StrokeBorder { .. }
+                        | Command::StrokeBoxBorder(_)
+                )
+            })
+            .map(|command| alloc::format!("{command:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn stretched_flex_native_button_background_uses_the_border_box() {
+        let rects = |align: &str| {
+            let source = alloc::format!("<div style='display:flex;align-items:{align}'><input type=button></div>");
+            display_list(&crate::html::parse(&source, 64).unwrap(), 800, 600, &SizedText).unwrap().0.into_iter()
+                .filter_map(|command| match command {
+                    Command::FillRect { rect, color } | Command::FillRoundedRect { rect, color, .. } if color.r == 239 => Some(("fill", rect)),
+                    Command::StrokeBorder { rect, .. } => Some(("stroke", rect)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let stretched = rects("stretch");
+        assert!(stretched.iter().any(|(kind, _)| *kind == "fill"));
+        assert_eq!(stretched, rects("start"));
+    }
+
+    #[test]
+    fn stretched_grid_native_button_background_uses_the_border_box() {
+        let stretched = native_button_fills_and_strokes("");
+        let explicit = native_button_fills_and_strokes("height:40px;align-self:start");
+        assert!(!stretched.is_empty());
+        assert_eq!(
+            stretched, explicit,
+            "a grid-stretched native button paints the same face and border as one given the stretched height"
+        );
+    }
+
     #[test]
     fn specification_fieldset_dynamic_multicol_positioned_content_and_owner_removal() {
         let mut document=crate::html::parse("<!doctype html><style>.c2{transform:rotate3d(0,1,0,45deg);column-width:100px}.c19{overflow:auto;padding-left:65536px;column-count:3}q{position:absolute;column-width:1px}body{column-count:3}</style><body></body>",128).unwrap();
@@ -54314,24 +55623,59 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
     #[test]
     fn specification_select_contained_none_preserves_empty_widget_sizing() {
         for mode in ["horizontal-tb","vertical-rl"] {
-            for (attributes,empty) in [("",(10.0,10.0)),("multiple size=2",(0.0,20.0)),("multiple size=10",(0.0,100.0))] {
+            for (attributes,empty) in [("",(12.0,10.0)),("multiple size=2",(0.0,20.0)),("multiple size=10",(0.0,100.0))] {
                 for (fallback,expected) in [("none none",empty),("55px none",(55.0,empty.1)),("none 66px",(empty.0,66.0)),("0px 0px",(0.0,0.0))] {
                     let vertical=mode!="horizontal-tb";
-                    let (fallback,expected)=if vertical {
-                        let (width,height)=fallback.split_once(' ').unwrap();
-                        (alloc::format!("{height} {width}"),(expected.1,expected.0))
-                    }else{(String::from(fallback),expected)};
+                    let (width_fallback,height_fallback)=fallback.split_once(' ').unwrap();
+                    let explicit=(width_fallback!="none",height_fallback!="none");
+                    let (fallback,expected,explicit)=if vertical {
+                        (alloc::format!("{height_fallback} {width_fallback}"),(expected.1,expected.0),(explicit.1,explicit.0))
+                    }else{(String::from(fallback),expected,explicit)};
                     let document=crate::html::parse(&alloc::format!("<!doctype html><style>body{{margin:0}}select{{display:inline-block;appearance:auto;writing-mode:{mode};font:10px/10px monospace;padding:0;border:2px solid;margin:0}}#contained{{contain:size;contain-intrinsic-size:{fallback}}}</style><select id=contained {attributes}><option>A LONG LABEL</option></select>"),96).unwrap();
                     let node=crate::selector::get_element_by_id(&document,document.root(),"contained").unwrap().unwrap();
                     let mut session=crate::session::RenderSession::new(document);
                     let first=session.display_list(500,500,&SizedText).unwrap().clone();
                     let rect=session.layout_rect(node).unwrap();
-                    assert_eq!((rect.width,rect.height),(expected.0+4.0,expected.1+4.0),"{mode}/{attributes}/{fallback}: option labels are suppressed, widget rows remain, explicit zero differs from none");
+                    let padding=if attributes.is_empty() {if vertical {(2.0,8.0)}else{(8.0,2.0)}}else{(0.0,0.0)};
+                    let padding=(if explicit.0 {0.0}else{padding.0},if explicit.1 {0.0}else{padding.1});
+                    assert_eq!((rect.width,rect.height),(expected.0+4.0+padding.0,expected.1+4.0+padding.1),"{mode}/{attributes}/{fallback}: option labels are suppressed, widget rows remain, explicit zero differs from none");
                     assert_eq!(first,session.display_list(500,500,&SizedText).unwrap().clone());
                     assert_eq!(first,display_list(session.document(),500,500,&SizedText).unwrap());
                 }
             }
         }
+    }
+
+    fn select_rects(prefix: &str, style: &str, markup: &str, ids: &[&str]) -> Vec<Rect> {
+        let document=crate::html::parse(&alloc::format!("{prefix}<style>body{{margin:0}}select{{font:10px/10px monospace;border:1px solid;margin:0}}{style}</style>{markup}"),96).unwrap();
+        let nodes: Vec<NodeId>=ids.iter().map(|id|crate::selector::get_element_by_id(&document,document.root(),id).unwrap().unwrap()).collect();
+        let mut session=crate::session::RenderSession::new(document);
+        session.display_list(500,500,&SizedText).unwrap();
+        nodes.into_iter().map(|node|session.layout_rect(node).unwrap()).collect()
+    }
+
+    #[test]
+    fn native_drop_down_box_has_the_internal_padding_and_arrow_of_the_inner_block() {
+        let rects=select_rects("<!doctype html>","select{padding:0}","<select id=a></select><select id=b style='appearance:none'></select><select id=c multiple></select>",&["a","b","c"]);
+        assert_eq!((rects[0].width,rects[0].height),(12.0+8.0+2.0,10.0+2.0+2.0),"drop-down box: arrow, 4px inline and 1px block padding, border");
+        assert_eq!((rects[1].width,rects[1].height),(2.0,10.0+2.0),"appearance:none has no internal padding or arrow");
+        assert_eq!(rects[2].width,2.0,"list boxes have no internal padding or arrow");
+    }
+
+    #[test]
+    fn empty_drop_down_box_baseline_is_its_text_line_not_the_bottom_edge() {
+        for prefix in ["<!doctype html>",""] {
+            let rects=select_rects(prefix,"","<select id=a></select><select id=b style='contain:size'><option>A LONG LABEL</option></select><select id=c><option>x</option></select>",&["a","b","c"]);
+            assert_eq!((rects[0].y,rects[0].height),(rects[1].y,rects[1].height),"{prefix}: empty and size-contained drop-down boxes align");
+            assert_eq!((rects[0].y,rects[0].height),(rects[2].y,rects[2].height),"{prefix}: empty and filled drop-down boxes align");
+        }
+    }
+
+    #[test]
+    fn drop_down_box_sits_the_same_in_quirks_and_standards_mode() {
+        let ys: Vec<f32>=["<!doctype html>",""].iter()
+            .map(|prefix|select_rects(prefix,"body{font:12px/12px monospace}","<select id=a><option>x</option></select>",&["a"])[0].y).collect();
+        assert_eq!(ys[0],ys[1],"the line-height quirk does not move a control whose ascent reaches the strut");
     }
 
     #[test]
@@ -56202,6 +57546,52 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 if position=="static"{static_images=Some(painted);}
             }
         }
+    }
+
+    fn video_poster_rects(markup: &str, width: u32, height: u32) -> Vec<Rect> {
+        let image = Arc::new(ImageData { width, height, pixels: alloc::vec![255; (width * height * 4) as usize] });
+        let resolver = |source: &str| {
+            if source == "poster.png" { ImageState::Ready(image.clone()) } else { ImageState::Failed }
+        };
+        let document = crate::html::parse(
+            &alloc::format!("<style>body{{margin:0}}video{{display:block}}</style>{markup}"),
+            128,
+        )
+        .unwrap();
+        let list = display_list_with_images(&document, 800, 600, &RecordingText::default(), &resolver).unwrap();
+        list.0.iter().filter_map(|command| match command {
+            Command::Image { rect, image: painted } if Arc::ptr_eq(painted, &image) => Some(*rect),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn video_poster_is_contained_and_centered_in_the_video_box() {
+        let rects = video_poster_rects("<video poster='poster.png' width=250 height=159></video>", 100, 50);
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].x, rects[0].width, rects[0].height), (0.0, 250.0, 125.0));
+        assert!((rects[0].y - 17.0).abs() < 0.01, "centered vertically: {:?}", rects[0]);
+    }
+
+    #[test]
+    fn video_without_dimensions_takes_its_size_from_the_poster() {
+        let rects = video_poster_rects("<video poster=' poster.png '></video>", 40, 20);
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].width, rects[0].height), (40.0, 20.0));
+    }
+
+    #[test]
+    fn video_poster_honours_object_fit() {
+        let rects = video_poster_rects("<video poster='poster.png' width=250 height=159 style='object-fit:fill'></video>", 100, 50);
+        assert_eq!(rects.len(), 1);
+        assert_eq!((rects[0].width, rects[0].height), (250.0, 159.0));
+    }
+
+    #[test]
+    fn video_without_a_usable_poster_paints_no_image() {
+        assert!(video_poster_rects("<video width=250 height=159></video>", 100, 50).is_empty());
+        assert!(video_poster_rects("<video poster='' width=250 height=159></video>", 100, 50).is_empty());
+        assert!(video_poster_rects("<video poster='missing.png' width=250 height=159></video>", 100, 50).is_empty());
     }
 
     #[test]
@@ -58405,6 +59795,47 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
         );
     }
 
+    fn float_in_inline_boxes(anchor: &str) -> (Rect, Rect, Rect) {
+        let markup = alloc::format!(
+            "<div><a href='#' style='{anchor}'><div style='float:left;margin:1px;width:20px;height:11px;background:red'></div></a>\n<div></div>\n<div style='float:right;width:30px;height:10px;margin:2px;margin-top:6px;background:green'></div>\n<div style='clear:both;height:4px;background:red'></div></div>"
+        );
+        let boxes = colored_boxes(&markup);
+        let find = |width: f32, height: f32| {
+            *boxes
+                .iter()
+                .find(|rect| rect.width == width && rect.height == height)
+                .expect("box is painted")
+        };
+        (find(20.0, 11.0), find(30.0, 10.0), find(100.0, 4.0))
+    }
+
+    #[test]
+    fn float_only_inline_wrapper_has_a_zero_height_line() {
+        let (left, right, clear) = float_in_inline_boxes("");
+        assert_eq!((left.x, left.y), (1.0, 1.0));
+        assert_eq!((right.x, right.y), (68.0, 6.0));
+        assert_eq!(clear.y, 18.0);
+    }
+
+    #[test]
+    fn decorated_inline_wrapper_around_a_float_keeps_a_phantom_line() {
+        let (left, right, clear) = float_in_inline_boxes("padding-left:2px");
+        assert_eq!((left.x, left.y), (1.0, 1.0));
+        assert!(right.y > 6.0, "the padded inline keeps a non-empty line, got {}", right.y);
+        assert!(clear.y >= 18.0);
+    }
+
+    #[test]
+    fn float_after_text_in_an_inline_wrapper_stays_on_the_text_line() {
+        let boxes = colored_boxes(
+            "<div><a href='#'>ab<div style='float:left;width:20px;height:11px;background:red'></div></a><div style='clear:both;height:4px;background:green'></div></div>",
+        );
+        let float = boxes.iter().find(|rect| rect.width == 20.0).expect("float is painted");
+        let clear = boxes.iter().find(|rect| rect.width == 100.0).expect("clear box is painted");
+        assert_eq!(float.y, 0.0);
+        assert_eq!(clear.y, 11.0);
+    }
+
     #[test]
     fn float_rule_three_allows_overhang_until_an_opposing_float_intersects() {
         let left = colored_boxes_in(
@@ -60208,6 +61639,79 @@ fn specification_margin_collapse_edges_contexts_clearance_and_root_are_boundarie
             [(0.0, 0.0, 4.0, 3.0), (0.0, 3.0, 4.0, 3.0)],
             "the collapsible space that ends a wrapped line is removed and not painted"
         );
+    }
+
+    fn wrapped_line_widths(markup: &str) -> Vec<f32> {
+        let document = crate::html::parse(markup, 16).unwrap();
+        display_list(&document, 400, 100, &FixedText)
+            .unwrap()
+            .0
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FillRect { rect, color } if color.r == 255 && color.g == 0 => Some(rect.width),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn balance_paragraph(wrapper_style: &str, paragraph_style: &str, text: &str) -> Vec<f32> {
+        wrapped_line_widths(&alloc::format!(
+            "<style>body{{margin:0}}</style><div style='{wrapper_style}'><p style='margin:0;line-height:3px;{paragraph_style}'>\
+             <span style='background:#ff0000'>{text}</span></p></div>"
+        ))
+    }
+
+    #[test]
+    fn text_wrap_balance_evens_out_two_lines() {
+        let text = "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd";
+        let greedy = balance_paragraph("", "width:70px", text);
+        assert_eq!(greedy, [64.0, 20.0]);
+        let balanced = balance_paragraph("", "width:70px;text-wrap:balance", text);
+        assert_eq!(balanced.len(), 2, "{balanced:?}");
+        assert!(balanced[0] <= balanced[1] * 1.25 && balanced[1] <= balanced[0] * 1.25, "{balanced:?}");
+        let style = balance_paragraph("", "width:70px;text-wrap-style:balance", text);
+        assert_eq!(style, balanced);
+    }
+
+    #[test]
+    fn text_wrap_balance_is_inherited() {
+        let text = "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd";
+        let balanced = balance_paragraph("text-wrap:balance", "width:70px", text);
+        assert_eq!(balanced, [42.0, 42.0]);
+    }
+
+    #[test]
+    fn text_wrap_balance_keeps_centered_lines_in_the_full_box() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}</style><p style='margin:0;width:70px;line-height:3px;text-align:center;text-wrap:balance'>\
+             <span style='background:#ff0000'>aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd</span></p>",
+            16,
+        )
+        .unwrap();
+        let rects = display_list(&document, 400, 100, &FixedText)
+            .unwrap()
+            .0
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FillRect { rect, color } if color.r == 255 && color.g == 0 => Some(rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rects.len(), 2);
+        for rect in rects {
+            assert_eq!(rect.width, 42.0);
+            assert_eq!(rect.x, 14.0);
+        }
+    }
+
+    #[test]
+    fn text_wrap_balance_skips_paragraphs_over_six_lines() {
+        let text = "aaaaaaaaaa ".repeat(61);
+        let plain = balance_paragraph("", "width:220px", &text);
+        let balanced = balance_paragraph("", "width:220px;text-wrap:balance", &text);
+        assert_eq!(plain.len(), 7);
+        assert_eq!(plain[0], 218.0);
+        assert_eq!(balanced, plain);
     }
 
     #[test]
