@@ -3276,7 +3276,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             else {
                 return Err(Error::WrongKind);
             };
-            attributes.push((qualified_name.clone(), value.clone()));
+            push_attribute(attributes, (qualified_name.clone(), value.clone()))?;
             self.attribute_nodes
                 .iter_mut()
                 .find(|(owner, _)| *owner == element)
@@ -4645,7 +4645,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         let namespace_uri = index.and_then(|index| self.attribute_namespace_rc_at(id, index));
         if index.is_none() {
             if let NodeKind::Element { attributes, .. } = &mut self.node_mut_checked(id)?.kind {
-                attributes.try_reserve(1).map_err(|_| Error::LimitExceeded)?;
+                reserve_attribute(attributes)?;
             }
         }
         self.nonce_attribute_changed(id,namespace_uri.as_deref(),name,Some(value))?;
@@ -4688,10 +4688,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             let NodeKind::Element { attributes, .. } = &mut self.node_mut_checked(id)?.kind else {
                 return Err(Error::WrongKind);
             };
-            attributes
-                .try_reserve(1)
-                .map_err(|_| Error::LimitExceeded)?;
-            attributes.push((key.clone(), String::from(value)));
+            push_attribute(attributes, (key.clone(), String::from(value)))?;
             (key, None, true)
         };
         if changed {
@@ -4998,7 +4995,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             (index, mutation_name, old_value)
         } else {
             let index = attributes.len();
-            attributes.push((key.clone(), String::from(value)));
+            push_attribute(attributes, (key.clone(), String::from(value)))?;
             (index, key.clone(), None)
         };
         if changed {
@@ -6868,4 +6865,33 @@ mod tests {
         assert_eq!(parsed.next_sibling(only).unwrap(), None);
         assert_eq!(parsed.substring_data(only, 0, usize::MAX).unwrap(), "a < b < c & d");
     }
+    #[test]
+    fn first_attribute_reserves_exactly_one_slot() {
+        let mut doc = Document::new(8);
+        let img = doc.create(NodeKind::Element { namespace: Namespace::Html, name: "img".into(), attributes: Vec::new() }).unwrap();
+        doc.set_attribute(img, "src", "a").unwrap();
+        let NodeKind::Element { attributes, .. } = &doc.node(img).unwrap().kind else { panic!() };
+        assert_eq!(attributes.capacity(), 1);
+        doc.set_attribute(img, "alt", "b").unwrap();
+        doc.set_attribute(img, "id", "c").unwrap();
+        let NodeKind::Element { attributes, .. } = &doc.node(img).unwrap().kind else { panic!() };
+        assert_eq!(attributes.len(), 3);
+    }
+}
+
+/// Most elements keep one or two attributes, so an empty list reserves exactly one slot
+/// instead of the default capacity of four; later growth stays amortized.
+fn push_attribute(attributes: &mut Vec<(Name, String)>, attribute: (Name, String)) -> Result<(), Error> {
+    reserve_attribute(attributes)?;
+    attributes.push(attribute);
+    Ok(())
+}
+
+fn reserve_attribute(attributes: &mut Vec<(Name, String)>) -> Result<(), Error> {
+    if attributes.capacity() == 0 {
+        attributes.try_reserve_exact(1)
+    } else {
+        attributes.try_reserve(1)
+    }
+    .map_err(|_| Error::LimitExceeded)
 }

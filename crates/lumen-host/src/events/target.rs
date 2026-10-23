@@ -78,10 +78,31 @@ pub(crate) struct Listener {
     pub(crate) removed: Rc<Cell<bool>>,
 }
 
+const MAX_INTERNED_KINDS: usize = 256;
+const MAX_INTERNED_KIND_BYTES: usize = 64;
+
+thread_local! {
+    static INTERNED_KINDS: RefCell<lumen_common::fasthash::FastSet<Rc<str>>> = RefCell::default();
+}
+
+/// Listener types repeat across thousands of targets; short ones share one allocation.
+fn intern_kind(kind: &str) -> Rc<str> {
+    if kind.len() > MAX_INTERNED_KIND_BYTES { return kind.into(); }
+    INTERNED_KINDS
+        .try_with(|kinds| {
+            let mut kinds = kinds.borrow_mut();
+            if let Some(existing) = kinds.get(kind) { return existing.clone(); }
+            let created: Rc<str> = kind.into();
+            if kinds.len() < MAX_INTERNED_KINDS { kinds.insert(created.clone()); }
+            created
+        })
+        .unwrap_or_else(|_| kind.into())
+}
+
 impl Listener {
     fn new(kind: &str, callback: Callback, handler: HandlerKind) -> Self {
         Self {
-            kind: kind.into(),
+            kind: intern_kind(kind),
             callback: Rc::new(RefCell::new(callback)),
             capture: false,
             once: false,
@@ -572,7 +593,7 @@ impl EventTarget {
         };
         let is_weak = weak.is_some();
         let listener = Listener {
-            kind: kind.into(),
+            kind: intern_kind(kind),
             callback: Rc::new(RefCell::new(match weak {
                 Some(weak) => Callback::Weak(weak),
                 None => Callback::from_value(callback.clone()),
@@ -1346,6 +1367,17 @@ pub fn report_exception(ctx: &mut Ctx, exception: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_types_share_one_allocation() {
+        let a = Listener::new("load", Callback::Empty, HandlerKind::None);
+        let b = Listener::new("load", Callback::Empty, HandlerKind::None);
+        assert!(Rc::ptr_eq(&a.kind, &b.kind));
+        assert_eq!(&*a.kind, "load");
+        let long = "x".repeat(MAX_INTERNED_KIND_BYTES + 1);
+        assert!(!Rc::ptr_eq(&intern_kind(&long), &intern_kind(&long)));
+        assert!(!Rc::ptr_eq(&a.removed, &b.removed));
+    }
 
     struct AliasPath(RefCell<Option<WeakValue>>);
     impl TargetHooks for AliasPath {

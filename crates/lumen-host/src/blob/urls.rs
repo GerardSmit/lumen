@@ -6,7 +6,7 @@
 
 use super::{blob_of, Blob, Bytes, Source};
 use lumen::embed::{Ctx, OpError, OpResult, Value};
-use std::{any::Any, collections::HashMap, rc::Rc};
+use std::{any::Any, borrow::Cow, cell::Cell, collections::HashMap, rc::Rc};
 
 const MAX_ID_BYTES: usize = 128;
 const MAX_CONTENT_TYPE_BYTES: usize = 255;
@@ -56,6 +56,7 @@ struct Entry {
     source: Source,
     kind: String,
     environment: Option<Rc<dyn ObjectUrlEnvironment>>,
+    canonical: Cell<Option<bool>>,
 }
 impl Entry {
     fn retained_bytes(&self) -> usize {
@@ -111,13 +112,27 @@ fn current_environment(ctx: &mut Ctx) -> OpResult<Option<Rc<dyn ObjectUrlEnviron
     }
 }
 
-fn resource_key(input: &str) -> Option<String> {
+fn canonical_key(input: &str) -> Option<String> {
+    let mut url = lumen_common::url::parse(input, None).ok()?;
+    if url.scheme != "blob" { return None; }
+    url.fragment = None;
+    Some(url.href())
+}
+
+fn resource_key<'a>(entries: &HashMap<String, Entry>, input: &'a str) -> Option<Cow<'a, str>> {
     if input.starts_with("blob:") {
-        let mut url = lumen_common::url::parse(input, None).ok()?;
-        if url.scheme != "blob" { return None; }
-        url.fragment = None;
-        Some(url.href())
-    } else { Some(format!("{URL_PREFIX}{input}")) }
+        if !input.contains('#') {
+            if let Some(entry) = entries.get(input) {
+                let canonical = entry.canonical.get().unwrap_or_else(|| {
+                    let canonical = canonical_key(input).as_deref() == Some(input);
+                    entry.canonical.set(Some(canonical));
+                    canonical
+                });
+                if canonical { return Some(Cow::Borrowed(input)); }
+            }
+        }
+        canonical_key(input).map(Cow::Owned)
+    } else { Some(Cow::Owned(format!("{URL_PREFIX}{input}"))) }
 }
 
 fn authorized(entry: &Option<Rc<dyn ObjectUrlEnvironment>>, caller: &Option<Rc<dyn ObjectUrlEnvironment>>) -> bool {
@@ -169,8 +184,7 @@ pub fn create_object_url(ctx: &mut Ctx, blob: &Value) -> OpResult<Option<String>
     let size = view.source.len();
     let environment = current_environment(ctx)?;
     let retained_size = size.saturating_add(environment.as_ref().map_or(0, |environment|environment.retained_bytes()));
-    let prefix = environment.as_ref().map_or_else(|| URL_PREFIX.to_owned(),
-        |environment| format!("blob:{}/", environment.serialized_origin()));
+    let origin = environment.as_ref().map(|environment| environment.serialized_origin());
     let (limits, provider) = {
         let registry = registry(ctx);
         (registry.limits, registry.provider.clone())
@@ -203,7 +217,12 @@ pub fn create_object_url(ctx: &mut Ctx, blob: &Value) -> OpResult<Option<String>
             }
             None => crate::random::random_uuid()?,
         };
-        let url = format!("{prefix}{id}");
+        let mut url = String::with_capacity(id.len() + origin.as_ref().map_or(URL_PREFIX.len(), |origin| origin.len() + 6));
+        match &origin {
+            Some(origin) => { url.push_str("blob:"); url.push_str(origin); url.push('/'); }
+            None => url.push_str(URL_PREFIX),
+        }
+        url.push_str(&id);
         if valid_id(&id) && !registry(ctx).entries.contains_key(&url) {
             unique = Some(url);
             break;
@@ -223,6 +242,7 @@ pub fn create_object_url(ctx: &mut Ctx, blob: &Value) -> OpResult<Option<String>
             source: view.source,
             kind: view.content_type,
             environment,
+            canonical: Cell::new(None),
         },
     );
     Ok(Some(id))
@@ -230,11 +250,12 @@ pub fn create_object_url(ctx: &mut Ctx, blob: &Value) -> OpResult<Option<String>
 
 /// Drops the entry for `id` (the part of the URL after `blob:nodedata:`).
 pub fn revoke_object_url(ctx: &mut Ctx, id: &str) {
-    let Some(key) = resource_key(id) else { return; };
     let Ok(caller) = current_environment(ctx) else { return; };
     let registry = registry(ctx);
-    if !registry.entries.get(&key).is_some_and(|entry| authorized(&entry.environment, &caller)) { return; }
-    if let Some(removed) = registry.entries.remove(&key) {
+    let Some(key) = resource_key(&registry.entries, id) else { return; };
+    let key = key.as_ref();
+    if !registry.entries.get(key).is_some_and(|entry| authorized(&entry.environment, &caller)) { return; }
+    if let Some(removed) = registry.entries.remove(key) {
         registry.bytes = registry.bytes.saturating_sub(removed.retained_bytes());
         lumen_common::fasthash::shrink_sparse(&mut registry.entries);
     }
@@ -246,8 +267,9 @@ fn lookup(ctx: &mut Ctx, id: &str) -> Option<(Source, String, Option<Rc<dyn Obje
 }
 
 fn lookup_for_environment(ctx: &mut Ctx, id: &str, caller: &Option<Rc<dyn ObjectUrlEnvironment>>) -> Option<(Source, String, Option<Rc<dyn ObjectUrlEnvironment>>)> {
-    let key = resource_key(id)?;
-    let entry = registry(ctx).entries.get(&key)?;
+    let entries = &registry(ctx).entries;
+    let key = resource_key(entries, id)?;
+    let entry = entries.get(key.as_ref())?;
     if !authorized(&entry.environment, caller) { return None; }
     Some((entry.source.clone(), entry.kind.clone(), entry.environment.clone()))
 }
@@ -277,4 +299,45 @@ pub fn object_url_resource_for_environment(ctx: &mut Ctx, id: &str, caller: Opti
 /// Creator metadata without reading a file-backed resource.
 pub fn object_url_environment(ctx: &mut Ctx, id: &str) -> Option<Rc<dyn ObjectUrlEnvironment>> {
     lookup(ctx, id)?.2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(keys: &[&str]) -> HashMap<String, Entry> {
+        keys.iter().map(|key| ((*key).to_owned(), Entry {
+            source: Source::Memory(Default::default()),
+            kind: String::new(),
+            environment: None,
+            canonical: Cell::new(None),
+        })).collect()
+    }
+
+    #[test]
+    fn exact_canonical_key_skips_parsing_and_matches_the_slow_path() {
+        let key = "blob:https://example.com/3f1c2a4e-0000-4000-8000-000000000000";
+        let entries = entries(&[key]);
+        let fast = resource_key(&entries, key).unwrap();
+        assert!(matches!(fast, Cow::Borrowed(_)));
+        assert_eq!(fast.as_ref(), canonical_key(key).unwrap());
+    }
+
+    #[test]
+    fn fragment_is_stripped_and_unknown_keys_use_the_slow_path() {
+        let key = "blob:https://example.com/abc";
+        let entries = entries(&[key]);
+        let with_fragment = format!("{key}#frag");
+        assert_eq!(resource_key(&entries, &with_fragment).unwrap().as_ref(), key);
+        assert_eq!(resource_key(&entries, "blob:https://other.example/abc").unwrap().as_ref(), "blob:https://other.example/abc");
+        assert_eq!(resource_key(&entries, "abc").unwrap().as_ref(), "blob:nodedata:abc");
+    }
+
+    #[test]
+    fn non_canonical_entry_keys_are_never_returned_verbatim() {
+        let key = "blob:HTTPS://Example.com/abc";
+        let entries = entries(&[key]);
+        let resolved = resource_key(&entries, key);
+        assert_eq!(resolved.as_deref(), canonical_key(key).as_deref());
+    }
 }

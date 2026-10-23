@@ -31,12 +31,23 @@ pub use lumen_host::blob::ObjectUrlResource;
 pub(crate) fn install(ctx: &mut Ctx) -> Result<(), Value> {
     lumen_host::blob::set_object_url_limits(ctx, Some(ObjectUrlLimits::default()));
     lumen_host::blob::ensure_random_token_provider(ctx);
-    lumen_host::blob::set_object_url_environment_provider(ctx, Rc::new(|ctx| {
+    let cache: std::cell::RefCell<Option<Rc<BrowserEnvironment>>> = Default::default();
+    lumen_host::blob::set_object_url_environment_provider(ctx, Rc::new(move |ctx| {
         let Some(realm) = crate::window_globals::current_dom_realm(ctx) else { return Ok(None); };
+        let creator = Rc::downgrade(&realm);
+        let policy_container = realm.policy_container();
+        if let Some(cached) = cache.borrow().as_ref() {
+            if cached.creator.ptr_eq(&creator) && cached.policy_container == policy_container
+                && realm.document_identity.origin.borrow().as_ref() == Some(&cached.origin) {
+                return Ok(Some(cached.clone() as Rc<dyn lumen_host::blob::ObjectUrlEnvironment>));
+            }
+        }
         let origin = realm.document_origin().or_else(|| realm.browsing_context().map(|context| context.root_or_child_origin()))
             .ok_or_else(|| OpError::new("InvalidStateError", "Blob URL creator has no origin"))?;
         let owner = Rc::as_ptr(&realm) as usize;
-        Ok(Some(Rc::new(BrowserEnvironment { origin, owner, policy_container: realm.policy_container(), creator: Rc::downgrade(&realm) }) as Rc<dyn lumen_host::blob::ObjectUrlEnvironment>))
+        let environment = Rc::new(BrowserEnvironment { origin, owner, policy_container, creator });
+        *cache.borrow_mut() = Some(environment.clone());
+        Ok(Some(environment as Rc<dyn lumen_host::blob::ObjectUrlEnvironment>))
     }));
     Ok(())
 }
