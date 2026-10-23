@@ -392,7 +392,7 @@ pub fn retag(ptr: *const u8, size: usize, align: usize, cat: u8) {
         if old == cat {
             return;
         }
-        *header = cat as usize;
+        *header = (*header & !0xff) | cat as usize;
         let overhead = class_alloc_overhead(size) as isize;
         stats::cat_add(old, -(size as isize));
         stats::cat_add(cat, size as isize);
@@ -839,7 +839,11 @@ unsafe impl GlobalAlloc for ClassAlloc {
             SERVING.store(true, Relaxed);
         }
         stats::alloc(layout.size());
-        *(p as *mut usize) = cat as usize;
+        let mut site = 0;
+        if crate::memsites::MASK.load(Relaxed) >> cat & 1 != 0 {
+            site = crate::memsites::maybe_sample(layout.size()) as usize;
+        }
+        *(p as *mut usize) = cat as usize | site << 8;
         stats::cat_add(cat, layout.size() as isize);
         stats::cat_allocation_add(cat, 1);
         stats::cat_overhead_add(cat, class_alloc_overhead(layout.size()) as isize);
@@ -858,7 +862,11 @@ unsafe impl GlobalAlloc for ClassAlloc {
             return self.raw_dealloc(ptr, layout);
         }
         let p = ptr.sub(STEP);
-        let cat = *(p as *const usize) as u8;
+        let header = *(p as *const usize);
+        let cat = header as u8;
+        if header >> 8 != 0 {
+            crate::memsites::freed((header >> 8) as u32, layout.size());
+        }
         stats::cat_add(cat, -(layout.size() as isize));
         stats::cat_allocation_add(cat, -1);
         stats::cat_overhead_add(cat, -(class_alloc_overhead(layout.size()) as isize));
@@ -882,11 +890,15 @@ unsafe impl GlobalAlloc for ClassAlloc {
             return n;
         }
         let p = ptr.sub(STEP);
-        let cat = *(p as *const usize) as u8;
+        let header = *(p as *const usize);
+        let cat = header as u8;
         let old = Layout::from_size_align_unchecked(layout.size() + STEP, STEP);
         let n = self.raw_realloc(p, old, new_size + STEP);
         if n.is_null() {
             return n;
+        }
+        if header >> 8 != 0 {
+            crate::memsites::resized((header >> 8) as u32, layout.size(), new_size);
         }
         stats::free(layout.size());
         stats::alloc(new_size);

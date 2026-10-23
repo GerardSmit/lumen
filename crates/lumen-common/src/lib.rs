@@ -50,6 +50,8 @@ pub mod import_maps;
 pub mod executable;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
+#[cfg(feature = "mem-stats")]
+pub mod memsites;
 pub mod fasthash;
 pub mod name_table;
 pub mod lazy_index_table;

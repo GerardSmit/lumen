@@ -37,6 +37,17 @@ pub fn enabled() -> bool {
             );
             lumen_common::fastalloc::trace_allocations_from(n);
         }
+        // LUMEN_MEM_SITES=<category name substring | all>: sampled live allocation sites.
+        #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
+        if let Some(want) = on.then(|| std::env::var("LUMEN_MEM_SITES").ok()).flatten() {
+            let want = want.to_lowercase();
+            let mask = CAT_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| want == "all" || name.to_lowercase().contains(&want))
+                .fold(0u32, |m, (k, _)| m | 1 << k);
+            lumen_common::memsites::enable(mask);
+        }
         on
     })
 }
@@ -686,6 +697,8 @@ impl crate::interpreter::Interp {
     /// category to stderr. Walks the whole realm; only for diagnostics.
     pub fn mem_report(&mut self) {
         report_process();
+        #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
+        lumen_common::memsites::report();
         if let Some(cats) = categories() {
             eprintln!(
                 "[mem] ---- live allocator bytes by category (what was current when allocated) ----"
