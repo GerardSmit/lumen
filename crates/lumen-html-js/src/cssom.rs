@@ -2567,8 +2567,8 @@ struct DeclarationMemo {
     block_bytes: usize,
 }
 
-const DECLARATION_MEMO_BYTES: usize = 4 * 1024 * 1024;
-const DECLARATION_MEMO_ENTRY_BYTES: usize = 64 * 1024;
+const DECLARATION_MEMO_BYTES: usize = 8 * 1024 * 1024;
+const DECLARATION_MEMO_ENTRY_BYTES: usize = 512 * 1024;
 const DECLARATION_MEMO_BLOCKS: usize = 16;
 const DECLARATION_MEMO_BLOCK_BYTES: usize = 1024 * 1024;
 const DECLARATION_MEMO_ENTRY_COST: usize = 128;
