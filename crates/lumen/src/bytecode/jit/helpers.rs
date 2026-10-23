@@ -1012,6 +1012,23 @@ pub(crate) unsafe extern "C" fn typeof_is(f: *mut JitFrame, v: *const Value, kin
     (crate::bytecode::TypeofKind::of(&*(*f).interp, &*v) as u32 == kind) as u32
 }
 
+/// With `LUMEN_JIT_STATS`, report ops that keep running through [`generic`] (by op kind).
+fn count_generic(op: &Op) {
+    thread_local! {
+        static SEEN: RefCell<std::collections::HashMap<String, u64>> = RefCell::default();
+    }
+    let name = format!("{op:?}");
+    let kind = name.split('(').next().unwrap_or(&name).to_string();
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        let c = seen.entry(kind).or_default();
+        *c += 1;
+        if c.is_power_of_two() && *c >= 4096 {
+            eprintln!("[jit-generic] {name} x{c}");
+        }
+    });
+}
+
 pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, depth: u32) -> u32 {
     let chunk = &*(*f).chunk;
     let pc = pc as usize;
@@ -1024,6 +1041,9 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
     {
         let e = (*(*f).interp).throw("TypeError", "compiled code ran an unsupported op");
         return fail(f, e);
+    }
+    if super::stats_enabled() {
+        count_generic(&chunk.ops[pc]);
     }
     // Computed reads that miss the inline element paths (notably native
     // indexed wrappers and author proxies) still use ordinary [[Get]]. They

@@ -2191,7 +2191,8 @@ struct Tr<'a, 'f> {
     push_vars: HashMap<usize, Variable>,
     /// Region handlers live at the op being translated (see [`Analysis::hs`]).
     hs_cur: Vec<(usize, usize)>,
-    /// The op a chained read already emitted (see [`Tr::chain_read`]): skipped by `body`.
+    /// The last op a chained read already emitted (see [`Tr::chain_read`]): `body` skips
+    /// through it.
     skip: Option<usize>,
     /// The hit path of a fused `c += String.fromCharCode(x)` (see [`Tr::unit_append`]): the pc
     /// where it rejoins the ordinary path, its end block and its stack.
@@ -3670,8 +3671,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.invalidate_src(Src::Slot(*d));
                 }
             }
-            if self.skip == Some(pc) {
-                self.skip = None;
+            if let Some(last) = self.skip.filter(|&last| pc <= last) {
+                if pc == last {
+                    self.skip = None;
+                }
                 continue;
             }
             if dead || self.fb.is_filled() || an.depth[i].is_none() {
@@ -5268,8 +5271,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                             PropObj::Ptr(obj)
                         },
                     };
-                    if self.chains(pc, n, c) {
-                        self.chain_read(pc, obj, c, d - 1, slow)?;
+                    if let Some(last) = self.chains(pc, n, c) {
+                        self.chain_read(pc, last, obj, c, d - 1, slow)?;
                     } else {
                         self.prop_read(pc, obj, n, c, None, d - 1, slow, Some(src))?;
                     }
@@ -5300,8 +5303,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                         PropObj::Ptr(obj)
                     },
                 };
-                if self.chains(pc, n, c) {
-                    self.chain_read(pc, obj, c, d, slow)?;
+                if let Some(last) = self.chains(pc, n, c) {
+                    self.chain_read(pc, last, obj, c, d, slow)?;
                 } else {
                     self.prop_read(pc, obj, n, c, None, d, slow, Some(Src::Slot(s)))?;
                 }
@@ -5884,32 +5887,57 @@ impl<'a, 'f> Tr<'a, 'f> {
         false
     }
 
-    /// Whether the property read at `pc` (on a receiver it does not own) feeds straight into a
-    /// plain property read of its result (`a.b.c`), so [`Tr::chain_read`] can lend it.
-    fn chains(&self, pc: usize, n: u32, c: u32) -> bool {
-        let q = pc + 1;
-        !self.chaining
-            && q <= self.backedge
-            && !self.is_leader(q)
-            && matches!(self.ops[q], Op::GetProp(..))
-            && &*self.chunk.names[n as usize] != "length"
-            && !self.plan.dget.contains_key(&pc)
-            && !self.plan.dacc.contains_key(&pc)
-            && layout::prop_ic(self.chunk, c).is_some_and(|ic| ic.has_own())
+    /// When the property read at `pc` (on a receiver it does not own) feeds straight into a
+    /// plain property read of its result (`a.b.c`), or an element read of it with a Number key
+    /// pushed in between without running JS (`a.b[i]`), the consumer's pc, so
+    /// [`Tr::chain_read`] can lend it.
+    fn chains(&self, pc: usize, n: u32, c: u32) -> Option<usize> {
+        if self.chaining
+            || &*self.chunk.names[n as usize] == "length"
+            || self.plan.dget.contains_key(&pc)
+            || self.plan.dacc.contains_key(&pc)
+            || !layout::prop_ic(self.chunk, c).is_some_and(|ic| ic.has_own())
+        {
+            return None;
+        }
+        let plain = |q: usize| q <= self.backedge && !self.is_leader(q);
+        if plain(pc + 1) && matches!(self.ops[pc + 1], Op::GetProp(..)) {
+            return Some(pc + 1);
+        }
+        let num_key = self.chunk.jit_stack_effect(pc + 1) == Some((0, 1))
+            && match self.ops.get(pc + 1) {
+                Some(Op::LoadLocal(s) | Op::UpdateLocal(s, _)) => {
+                    self.kinds[*s as usize].is_num()
+                }
+                Some(Op::Const(k)) => matches!(self.chunk.consts[*k as usize], Value::Num(_)),
+                _ => false,
+            };
+        // A fused append rejoining inside the chain would be skipped.
+        let rejoin = self
+            .pending_append
+            .as_ref()
+            .is_some_and(|p| (pc + 1..=pc + 2).contains(&p.0));
+        (num_key
+            && !rejoin
+            && plain(pc + 1)
+            && plain(pc + 2)
+            && matches!(self.ops[pc + 2], Op::GetElem))
+        .then_some(pc + 2)
     }
 
     /// A property read at `pc`, result at entry `at`, whose one consumer is the plain property
-    /// read at `pc + 1` (see [`Tr::chains`]): when the inline cache finds an object, it is lent
+    /// or element read at `last` (see [`Tr::chains`]): when the inline cache finds an object, it is lent
     /// to the consumer — stored in the entry without taking a reference, as a [`Src::Borrow`]
     /// Ref the consumer reads in place (its slow path takes a reference first) — which saves
     /// the reference count's increment and the release after the read. Anything else (a
     /// shape the cache has not seen, or a value that is not an object) takes `slow` for the
     /// read and the consumer's slow path too — the inline paths just failed, so emitting them
     /// again would only duplicate code — except a `.length` consumer, which stays inline (a
-    /// string's length). `body` skips the consumer.
+    /// string's length) and an element read. `body` skips the ops through the consumer.
     fn chain_read(
         &mut self,
         pc: usize,
+        last: usize,
         obj: V,
         c: u32,
         at: usize,
@@ -5926,10 +5954,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.store(MemKind::I64, dst, p, VALUE_PAYLOAD);
         self.stack.truncate(at);
         self.stack.push(Entry::Ref(dst, Src::Borrow));
-        self.chaining = true;
-        let r = self.op(pc + 1);
-        self.chaining = false;
-        r?;
+        self.chained_ops(pc + 1, last)?;
         // A result the consumer keeps unboxed leaves the lent object's bits in the entry: stack
         // memory above the depth must stay trivially droppable.
         if !self.fb.is_filled() && self.stack.get(at) != Some(&Entry::Boxed) {
@@ -5940,15 +5965,15 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(other);
         self.stack = pre;
         if self.slow_path(pc, slow) && !self.fb.is_filled() {
-            let Op::GetProp(n2, c2) = self.ops[pc + 1] else {
-                return Err("chained read without a property consumer".into());
+            let consumer = self.ops[last];
+            let inline = match consumer {
+                Op::GetProp(n2, _) => &*self.chunk.names[n2 as usize] == "length",
+                Op::GetElem => true,
+                _ => return Err("chained read without a property consumer".into()),
             };
-            if &*self.chunk.names[n2 as usize] == "length" {
-                self.chaining = true;
-                let r = self.op(pc + 1);
-                self.chaining = false;
-                r?;
-            } else {
+            if inline {
+                self.chained_ops(pc + 1, last)?;
+            } else if let Op::GetProp(n2, c2) = consumer {
                 let slow2 = Slow::Prop {
                     n: n2,
                     c: c2,
@@ -5959,8 +5984,16 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         let plain = (self.fb.current_block(), self.stack.clone());
         self.merge_paths(vec![lent, plain])?;
-        self.skip = Some(pc + 1);
+        self.skip = Some(last);
         Ok(())
+    }
+
+    /// Emit ops `first..=last` of a chained read (they do not chain in turn).
+    fn chained_ops(&mut self, first: usize, last: usize) -> Result<(), String> {
+        self.chaining = true;
+        let r = (first..=last).try_for_each(|q| self.op(q));
+        self.chaining = false;
+        r
     }
 
     /// Join straight-line paths (each its end block and stack state) into one: entries equal

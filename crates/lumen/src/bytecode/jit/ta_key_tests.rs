@@ -122,3 +122,32 @@ fn boxed_element_keys_split_on_numbers() {
         true,
     );
 }
+
+#[test]
+fn chained_element_reads_lend_the_receiver() {
+    // `a.b[i]` lends `a.b` to the element read; receivers that are not objects, other shapes
+    // and out-of-range keys take the plain paths.
+    agree(
+        r#"(function(){
+          function sum(a,n){var s=0;for(var k=0;k<n;k++)s+=a.b[k];return s}
+          function inc(a,n){var s=0,k=0;for(var m=0;m<n;m++)s+=a.b[k++]|0;return s}
+          function two(a){var s=0;for(var k=0;k<8;k++)s+=a.b[3];return s}
+          var u=new Uint8Array(64);for(var i=0;i<64;i++)u[i]=i*3;
+          var out=[];
+          for(var t=0;t<400;t++){
+            var r=[sum({b:u},64),inc({b:u},70),two({b:u}),
+              sum({b:[1,2,3]},3),sum({b:'abc'},3),inc({b:7},3),inc({c:1,b:u},5),
+              sum({b:new Float64Array([0.5,1.5])},2)];
+            if(t%97==0)out.push(r.join());
+          }
+          var g={get b(){return u}};
+          for(var t=0;t<300;t++)r=sum(g,4);out.push(r);
+          function edge(a,k0,n){var s=0,k=k0;for(var m=0;m<n;m++)s+=a.b[k++]|0;return s+'/'+k}
+          for(var t=0;t<300;t++)r=edge({b:u},0,10);
+          out.push(r,edge({b:u},2147483645,5),edge({b:{2147483646:9,2147483647:4,2147483648:1}},2147483645,5));
+          return out.join('|');
+        })()"#,
+        None,
+        true,
+    );
+}
