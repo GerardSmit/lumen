@@ -2942,7 +2942,7 @@ fn attach_html_native(
                 base: DomEventTarget::node(realm, id),
                 realm: realm.clone(),
                 id,
-                collections: RefCell::new(HashMap::new()),
+                collections: crate::CollectionCache::default(),
             },
         },
     };

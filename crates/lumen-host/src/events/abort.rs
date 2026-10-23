@@ -1,6 +1,6 @@
 //! `AbortSignal` state and the abort algorithms.
 use super::bindings::{AbortSignal, DomException, Event, EventTarget};
-use super::target::Listener;
+use super::target::{Listener, ListenerCell};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Weak;
@@ -11,7 +11,7 @@ pub(crate) enum AbortStep {
     RemoveListener {
         target: Weak<TargetData>,
         receiver: WeakValue,
-        removed: Rc<Cell<bool>>,
+        removed: Weak<ListenerCell>,
     },
     /// Abort a signal created by `clone_transferable` on a later turn.
     Native(Rc<dyn Fn(&mut Ctx, &Value)>),
@@ -89,7 +89,7 @@ pub(crate) fn add_listener_removal(
     signal.steps.borrow_mut().push(AbortStep::RemoveListener {
         target: Rc::downgrade(data),
         receiver,
-        removed: listener.removed.clone(),
+        removed: Rc::downgrade(&listener.cell),
     });
 }
 
@@ -153,7 +153,9 @@ pub fn abort_signal(ctx: &mut Ctx, signal: &Value, reason: Value) -> OpResult<()
                 receiver,
                 removed,
             } => {
-                if let (Some(target), Some(receiver)) = (target.upgrade(), receiver.upgrade()) {
+                if let (Some(target), Some(receiver), Some(removed)) =
+                    (target.upgrade(), receiver.upgrade(), removed.upgrade())
+                {
                     EventTarget::remove_flagged(ctx, &receiver, &target, &removed)?;
                 }
             }

@@ -68,14 +68,28 @@ pub enum HandlerKind {
 #[derive(Clone)]
 pub(crate) struct Listener {
     pub(crate) kind: Rc<str>,
-    pub(crate) callback: Rc<RefCell<Callback>>,
+    pub(crate) cell: Rc<ListenerCell>,
     pub(crate) capture: bool,
     pub(crate) once: bool,
     pub(crate) passive: bool,
     pub(crate) handler: HandlerKind,
     pub(crate) node_style: bool,
     pub(crate) resist: bool,
-    pub(crate) removed: Rc<Cell<bool>>,
+}
+
+pub struct ListenerCell {
+    pub(crate) removed: Cell<bool>,
+    pub(crate) callback: RefCell<Callback>,
+}
+
+impl ListenerCell {
+    fn new(callback: Callback) -> Rc<Self> {
+        Rc::new(Self { removed: Cell::new(false), callback: RefCell::new(callback) })
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, Callback> {
+        self.callback.borrow()
+    }
 }
 
 const MAX_INTERNED_KINDS: usize = 256;
@@ -103,20 +117,20 @@ impl Listener {
     fn new(kind: &str, callback: Callback, handler: HandlerKind) -> Self {
         Self {
             kind: intern_kind(kind),
-            callback: Rc::new(RefCell::new(callback)),
+            cell: ListenerCell::new(callback),
             capture: false,
             once: false,
             passive: false,
             handler,
             node_style: false,
             resist: false,
-            removed: Rc::new(Cell::new(false)),
         }
     }
 
     fn same_callback(&self, callback: &Value) -> bool {
         self.handler == HandlerKind::None
             && self
+                .cell
                 .callback
                 .borrow()
                 .identity()
@@ -125,8 +139,8 @@ impl Listener {
 
     /// A listener that would run: not removed, and not an empty handler or a dead weak callback.
     fn active(&self) -> bool {
-        !self.removed.get()
-            && match &*self.callback.borrow() {
+        !self.cell.removed.get()
+            && match &*self.cell.callback.borrow() {
                 Callback::Empty => false,
                 Callback::Weak(weak) => weak.upgrade().is_some(),
                 _ => true,
@@ -268,8 +282,9 @@ impl TargetData {
     /// Whether a live listener's callback is none of `ignored` (an identity check).
     pub fn has_listener_besides(&self, ignored: &[Value]) -> bool {
         self.listeners.borrow().iter().any(|listener| {
-            !listener.removed.get()
+            !listener.cell.removed.get()
                 && listener
+                    .cell
                     .callback
                     .borrow()
                     .identity()
@@ -287,8 +302,8 @@ impl TargetData {
             .iter()
             .filter(|listener| {
                 &*listener.kind == kind
-                    && !listener.removed.get()
-                    && !matches!(&*listener.callback.borrow(), Callback::Empty)
+                    && !listener.cell.removed.get()
+                    && !matches!(&*listener.cell.callback.borrow(), Callback::Empty)
             })
             .count()
     }
@@ -297,7 +312,7 @@ impl TargetData {
     pub fn event_names(&self) -> Vec<Rc<str>> {
         let mut names: Vec<Rc<str>> = Vec::new();
         for listener in self.listeners.borrow().iter() {
-            if !listener.removed.get() && !names.iter().any(|name| *name == listener.kind) {
+            if !listener.cell.removed.get() && !names.iter().any(|name| *name == listener.kind) {
                 names.push(listener.kind.clone());
             }
         }
@@ -309,15 +324,15 @@ impl TargetData {
         self.listeners
             .borrow()
             .iter()
-            .filter(|listener| !listener.removed.get() && &*listener.kind == kind)
-            .filter_map(|listener| listener.callback.borrow().identity())
+            .filter(|listener| !listener.cell.removed.get() && &*listener.kind == kind)
+            .filter_map(|listener| listener.cell.callback.borrow().identity())
             .collect()
     }
 
     /// Visit each callback Value the list holds (for a traced identity owner).
     pub fn trace_callbacks(&self, visit: &mut dyn FnMut(&Value)) {
         for listener in self.listeners.borrow().iter() {
-            match &*listener.callback.borrow() {
+            match &*listener.cell.callback.borrow() {
                 Callback::Function(function)
                 | Callback::Deferred {
                     compiled: Some(function),
@@ -336,19 +351,19 @@ impl TargetData {
             return false;
         }
         for listener in listeners.iter() {
-            listener.removed.set(true);
+            listener.cell.removed.set(true);
         }
         listeners.clear();
         true
     }
 
     /// The callback cell of the `kind` event handler, if one is registered.
-    pub fn handler_cell(&self, kind: &str) -> Option<Rc<RefCell<Callback>>> {
+    pub fn handler_cell(&self, kind: &str) -> Option<Rc<ListenerCell>> {
         self.listeners
             .borrow()
             .iter()
             .find(|listener| listener.handler != HandlerKind::None && &*listener.kind == kind)
-            .map(|listener| listener.callback.clone())
+            .map(|listener| listener.cell.clone())
     }
 
     /// Store `callback` as the `kind` event handler: replace the existing handler in place, or
@@ -359,13 +374,13 @@ impl TargetData {
             .iter()
             .position(|listener| listener.handler != HandlerKind::None && &*listener.kind == kind);
         match (existing, callback) {
-            (Some(index), Some(callback)) => *listeners[index].callback.borrow_mut() = callback,
+            (Some(index), Some(callback)) => *listeners[index].cell.callback.borrow_mut() = callback,
             (None, Some(callback)) => listeners.push(Listener::new(kind, callback, handler)),
             (Some(index), None) if handler == HandlerKind::Node => {
-                *listeners[index].callback.borrow_mut() = Callback::Empty;
+                *listeners[index].cell.callback.borrow_mut() = Callback::Empty;
             }
             (Some(index), None) => {
-                listeners[index].removed.set(true);
+                listeners[index].cell.removed.set(true);
                 listeners.remove(index);
             }
             (None, None) if handler == HandlerKind::Node => {
@@ -378,7 +393,7 @@ impl TargetData {
     /// Visit every deferred handler source (HTML rebinds them when a node moves).
     pub fn for_each_deferred(&self, mut visit: impl FnMut(&Rc<dyn Any>) -> Option<Rc<dyn Any>>) {
         for listener in self.listeners.borrow().iter() {
-            let mut callback = listener.callback.borrow_mut();
+            let mut callback = listener.cell.callback.borrow_mut();
             if let Callback::Deferred { source, .. } = &mut *callback {
                 if let Some(replacement) = visit(source) {
                     *source = replacement;
@@ -393,13 +408,13 @@ impl TargetData {
         let mut listeners = self.listeners.borrow_mut();
         let index = listeners.iter().position(|listener| matches(listener))?;
         let listener = listeners.remove(index);
-        listener.removed.set(true);
+        listener.cell.removed.set(true);
         Some(listener)
     }
 
     /// Compile a deferred handler through the hooks, caching the result in `cell`.
-    pub fn resolve_deferred(&self, ctx: &mut Ctx, cell: &RefCell<Callback>) -> Callback {
-        let current = cell.borrow().clone();
+    pub fn resolve_deferred(&self, ctx: &mut Ctx, cell: &ListenerCell) -> Callback {
+        let current = cell.callback.borrow().clone();
         let Callback::Deferred {
             source,
             compiled: None,
@@ -416,11 +431,11 @@ impl TargetData {
                     source: source.clone(),
                     compiled: Some(function),
                 };
-                *cell.borrow_mut() = resolved.clone();
+                *cell.callback.borrow_mut() = resolved.clone();
                 resolved
             }
             DeferredCompile::Failed => {
-                *cell.borrow_mut() = Callback::Empty;
+                *cell.callback.borrow_mut() = Callback::Empty;
                 Callback::Empty
             }
             DeferredCompile::Inactive => current,
@@ -565,9 +580,9 @@ impl EventTarget {
         {
             let mut listeners = data.listeners.borrow_mut();
             listeners.retain(|listener| {
-                let dead = matches!(&*listener.callback.borrow(), Callback::Weak(weak) if weak.upgrade().is_none());
+                let dead = matches!(&*listener.cell.callback.borrow(), Callback::Weak(weak) if weak.upgrade().is_none());
                 if dead {
-                    listener.removed.set(true);
+                    listener.cell.removed.set(true);
                 }
                 !dead
             });
@@ -594,25 +609,24 @@ impl EventTarget {
         let is_weak = weak.is_some();
         let listener = Listener {
             kind: intern_kind(kind),
-            callback: Rc::new(RefCell::new(match weak {
+            cell: ListenerCell::new(match weak {
                 Some(weak) => Callback::Weak(weak),
                 None => Callback::from_value(callback.clone()),
-            })),
+            }),
             capture,
             once: options.once,
             passive: options.passive,
             handler: HandlerKind::None,
             node_style: options.node_style,
             resist: options.resist,
-            removed: Rc::new(Cell::new(false)),
         };
         if let Some(state) = signal_state {
             super::abort::add_listener_removal(ctx, &state, data, receiver, &listener);
         }
-        let removed = listener.removed.clone();
+        let cell = listener.cell.clone();
         data.listeners.borrow_mut().push(listener);
         Self::update_retention(ctx, data, receiver);
-        if !removed.get() {
+        if !cell.removed.get() {
             let size = data.listener_count(kind);
             new_listener_hook(
                 ctx,
@@ -651,14 +665,15 @@ impl EventTarget {
         ctx: &mut Ctx,
         receiver: &Value,
         data: &Rc<TargetData>,
-        removed: &Rc<Cell<bool>>,
+        removed: &Rc<ListenerCell>,
     ) -> OpResult<()> {
-        let Some(listener) = data.remove_where(|listener| Rc::ptr_eq(&listener.removed, removed))
+        let Some(listener) = data.remove_where(|listener| Rc::ptr_eq(&listener.cell, removed))
         else {
             return Ok(());
         };
         Self::update_retention(ctx, data, receiver);
         let callback = listener
+            .cell
             .callback
             .borrow()
             .identity()
@@ -674,7 +689,7 @@ impl EventTarget {
             listeners.retain(|listener| {
                 let remove = kind.map_or(true, |kind| &*listener.kind == kind);
                 if remove {
-                    listener.removed.set(true);
+                    listener.cell.removed.set(true);
                 }
                 !remove
             });
@@ -1155,7 +1170,7 @@ fn invoke(
         }
         all.iter()
             .filter(|listener| {
-                listener.capture == capture && !listener.removed.get() && listener.kind == kind
+                listener.capture == capture && !listener.cell.removed.get() && listener.kind == kind
             })
             .cloned()
             .collect()
@@ -1171,14 +1186,14 @@ fn invoke(
         if source.event().is_some_and(|event| event.immediate.get()) && !listener.resist {
             break;
         }
-        if listener.removed.get() {
+        if listener.cell.removed.get() {
             continue;
         }
-        let callback = match data.resolve_deferred(ctx, &listener.callback) {
+        let callback = match data.resolve_deferred(ctx, &listener.cell) {
             Callback::Weak(weak) => match weak.upgrade() {
                 Some(value) => Callback::from_value(value),
                 None => {
-                    data.remove_where(|entry| Rc::ptr_eq(&entry.removed, &listener.removed));
+                    data.remove_where(|entry| Rc::ptr_eq(&entry.cell, &listener.cell));
                     continue;
                 }
             },
@@ -1190,7 +1205,7 @@ fn invoke(
             callback => callback,
         };
         if listener.once {
-            data.remove_where(|entry| Rc::ptr_eq(&entry.removed, &listener.removed));
+            data.remove_where(|entry| Rc::ptr_eq(&entry.cell, &listener.cell));
             EventTarget::update_retention(ctx, data, current);
             let identity = callback.identity().unwrap_or(Value::Undefined);
             let size = data.listener_count(&kind);
@@ -1369,6 +1384,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_clone_sees_removal() {
+        let data = TargetData::new(None);
+        data.listeners.borrow_mut().push(Listener::new("load", Callback::Empty, HandlerKind::None));
+        let snapshot = data.listeners.borrow().clone();
+        assert!(!snapshot[0].cell.removed.get());
+        assert!(data.remove_where(|_| true).is_some());
+        assert!(snapshot[0].cell.removed.get());
+        assert!(Rc::ptr_eq(&snapshot[0].cell, &snapshot[0].clone().cell));
+    }
+
+    #[test]
     fn listener_types_share_one_allocation() {
         let a = Listener::new("load", Callback::Empty, HandlerKind::None);
         let b = Listener::new("load", Callback::Empty, HandlerKind::None);
@@ -1376,7 +1402,7 @@ mod tests {
         assert_eq!(&*a.kind, "load");
         let long = "x".repeat(MAX_INTERNED_KIND_BYTES + 1);
         assert!(!Rc::ptr_eq(&intern_kind(&long), &intern_kind(&long)));
-        assert!(!Rc::ptr_eq(&a.removed, &b.removed));
+        assert!(!Rc::ptr_eq(&a.cell, &b.cell));
     }
 
     struct AliasPath(RefCell<Option<WeakValue>>);

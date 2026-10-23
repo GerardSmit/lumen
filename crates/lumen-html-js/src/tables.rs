@@ -4,7 +4,7 @@ use lumen_bind::This;
 use lumen_html::tables::{self, CollectionKind};
 
 pub(crate) fn node_at(realm: &Rc<DomRealm>, id: NodeId) -> DomNode {
-    DomNode { base: DomEventTarget::node(realm, id), realm: realm.clone(), id, collections: RefCell::new(HashMap::new()) }
+    DomNode { base: DomEventTarget::node(realm, id), realm: realm.clone(), id, collections: crate::CollectionCache::default() }
 }
 
 fn create(node: &DomNode, ctx: &mut Ctx, local: &str) -> OpResult<Value> {

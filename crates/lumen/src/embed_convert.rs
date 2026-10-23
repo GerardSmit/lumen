@@ -2731,11 +2731,14 @@ struct HostEntry {
     data: Rc<dyn Any>,
     vtable: &'static HostVtable,
     rare: Option<Box<HostRare>>,
+    owner: Option<&'static OwnerOps>,
+    /// The wrapper pinned while its native owner keeps it reachable (rewritten every GC cycle).
+    retained: Option<Gc>,
     identity: bool,
     callbacks_retained: bool,
 }
 
-const _: () = assert!(std::mem::size_of::<HostEntry>() <= 48);
+const _: () = assert!(std::mem::size_of::<HostEntry>() <= 64);
 
 type ViewRef = fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, ClassBorrowGuard), ()>;
 type ViewMut = fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuard), ()>;
@@ -2759,9 +2762,20 @@ struct HostRare {
     indexed_wrapper: Option<WeakGc>,
     indexed_read: Option<IndexedRead>,
     indexed_index_of: Option<NativeFn>,
-    retained: Option<Value>,
-    identity_owner: Option<fn(&HostEntry, u64, &mut dyn FnMut(&Value))>,
+}
+
+struct OwnerOps {
+    identity_owner: fn(&HostEntry, u64, &mut dyn FnMut(&Value)),
     native_values: Option<fn(&HostEntry, &mut dyn FnMut(&Value))>,
+}
+
+struct OwnerOf<T>(std::marker::PhantomData<T>);
+
+impl<T: NativeIdentityOwner> OwnerOf<T> {
+    const OPS: OwnerOps = OwnerOps {
+        identity_owner: trace_identity_owner::<T>,
+        native_values: if T::TRACES_NATIVE_VALUES { Some(trace_native_values::<T>) } else { None },
+    };
 }
 
 impl HostEntry {
@@ -2781,24 +2795,23 @@ impl HostEntry {
         self.rare.as_ref()?.indexed_index_of
     }
 
-    fn retained(&self) -> Option<&Value> {
-        self.rare.as_ref()?.retained.as_ref()
+    fn retained(&self) -> Option<Value> {
+        self.retained.clone().map(Value::Obj)
     }
 
     fn set_retained(&mut self, value: Option<Value>) {
-        match (&mut self.rare, value) {
-            (Some(rare), value) => rare.retained = value,
-            (None, Some(value)) => self.rare_mut().retained = Some(value),
-            (None, None) => {}
-        }
+        self.retained = match value {
+            Some(Value::Obj(o)) => Some(o),
+            _ => None,
+        };
     }
 
     fn identity_owner(&self) -> Option<fn(&HostEntry, u64, &mut dyn FnMut(&Value))> {
-        self.rare.as_ref()?.identity_owner
+        self.owner.map(|ops| ops.identity_owner)
     }
 
     fn native_values(&self) -> Option<fn(&HostEntry, &mut dyn FnMut(&Value))> {
-        self.rare.as_ref()?.native_values
+        self.owner?.native_values
     }
 
     fn clear_dead_indexed_wrapper(&mut self) {
@@ -3346,7 +3359,7 @@ pub(crate) fn count_host_identity_owner_pins(
             && (!entry.callbacks_retained || entry.native_values().is_some())
         {
             if let Some(value) = entry.retained() {
-                visit(value);
+                visit(&value);
             }
         }
         if let Some(trace) = entry.native_values() {
@@ -3946,7 +3959,9 @@ fn attach_instance(i: &mut Interp, obj: &Gc, instance: ErasedInstance) {
             data: instance.data,
             vtable: instance.vtable,
             rare: None,
+            owner: None,
             identity: false,
+            retained: None,
             callbacks_retained: false,
         },
     );
@@ -4863,10 +4878,8 @@ impl Interp {
             .map
             .get_mut(&key)
             .expect("validated native identity owner entry exists");
-        let rare = entry.rare_mut();
-        rare.identity_owner = Some(trace_identity_owner::<T>);
-        rare.native_values = T::TRACES_NATIVE_VALUES.then_some(trace_native_values::<T>);
-        rare.retained = Some(value.clone());
+        entry.owner = Some(&OwnerOf::<T>::OPS);
+        entry.set_retained(Some(value.clone()));
         Ok(())
     }
 

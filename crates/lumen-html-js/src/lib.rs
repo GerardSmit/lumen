@@ -4628,7 +4628,7 @@ impl DomRealm {
                     node.base.rebind_node(target, new);
                     node.realm = target.clone();
                     node.id = new;
-                    core::mem::take(&mut *node.collections.borrow_mut())
+                    node.collections.take()
                 })?;
                 register_node_identity_owner(ctx, &wrapper)?;
                 cssom::retarget_adopted_stylesheets(ctx, &wrapper)?;
@@ -4906,7 +4906,7 @@ impl DomRealm {
             base: DomEventTarget::node(self, id),
             realm: self.clone(),
             id,
-            collections: RefCell::new(HashMap::new()),
+            collections: crate::CollectionCache::default(),
         };
         let value = {
             let session = self.session.borrow();
@@ -7579,7 +7579,7 @@ fn legacy_image_factory(
         base: DomEventTarget::node(&realm, id),
         realm: realm.clone(),
         id,
-        collections: RefCell::new(HashMap::new()),
+        collections: crate::CollectionCache::default(),
     };
     Ok(NodeConstructorResult::new(node, |base| {
         DomHtmlImageElement {
@@ -10430,7 +10430,7 @@ fn construct_document_node(ctx: &mut Ctx, kind: NodeKind) -> OpResult<DomNode> {
         base: DomEventTarget::node(&realm, id),
         realm,
         id,
-        collections: RefCell::new(HashMap::new()),
+        collections: crate::CollectionCache::default(),
     })
 }
 
@@ -11016,7 +11016,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
                 base: DomEventTarget::node(&realm, root),
                 realm: realm.clone(),
                 id: root,
-                collections: RefCell::new(HashMap::new()),
+                collections: crate::CollectionCache::default(),
             },
             realm: realm.clone(),
             fonts: RefCell::new(None),
@@ -11850,7 +11850,7 @@ event_content_handlers::bind_node_handlers! { DomDocument {
         };
         if body == Some(node.id) && Rc::ptr_eq(&node.realm, &self.realm) { return Ok(()); }
         let parent = DomNode {base: DomEventTarget::node(&self.realm, html), realm: self.realm.clone(),
-            id: html, collections: RefCell::new(HashMap::new())};
+            id: html, collections: crate::CollectionCache::default()};
         let replacement = node.realm.wrap(ctx, node.id);
         if let Some(body) = body {
             let old = self.realm.wrap(ctx, body);
@@ -12100,12 +12100,51 @@ event_content_handlers::bind_node_handlers! { DomDocument {
     }
 } }
 
+#[derive(Default)]
+pub(crate) struct CollectionCache(RefCell<Option<Box<HashMap<String, WeakValue>>>>);
+
+pub(crate) struct CollectionRef<'a>(std::cell::Ref<'a, Option<Box<HashMap<String, WeakValue>>>>);
+
+pub(crate) struct CollectionMut<'a>(std::cell::RefMut<'a, Option<Box<HashMap<String, WeakValue>>>>);
+
+impl CollectionCache {
+    pub(crate) fn borrow(&self) -> CollectionRef<'_> {
+        CollectionRef(self.0.borrow())
+    }
+
+    pub(crate) fn borrow_mut(&self) -> CollectionMut<'_> {
+        CollectionMut(self.0.borrow_mut())
+    }
+
+    pub(crate) fn take(&self) -> HashMap<String, WeakValue> {
+        self.0.borrow_mut().take().map(|map| *map).unwrap_or_default()
+    }
+}
+
+impl CollectionRef<'_> {
+    pub(crate) fn get(&self, key: &str) -> Option<&WeakValue> {
+        self.0.as_ref()?.get(key)
+    }
+}
+
+impl CollectionMut<'_> {
+    pub(crate) fn insert(&mut self, key: String, value: WeakValue) {
+        self.0.get_or_insert_with(Default::default).insert(key, value);
+    }
+
+    pub(crate) fn extend(&mut self, entries: HashMap<String, WeakValue>) {
+        if !entries.is_empty() {
+            self.0.get_or_insert_with(Default::default).extend(entries);
+        }
+    }
+}
+
 #[lumen_bind::class(name = "Node", extends = DomEventTarget, hint(js(webidl)))]
 pub struct DomNode {
     base: DomEventTarget,
     realm: Rc<DomRealm>,
     id: NodeId,
-    collections: RefCell<HashMap<String, WeakValue>>,
+    collections: CollectionCache,
 }
 
 impl lumen::embed::NativeIdentityOwner for DomNode {
@@ -14267,7 +14306,7 @@ document.set_custom_state_resolver(Rc::new(move |node,name| {
                 base: DomEventTarget::node(self, self.session.borrow().document().root()),
                 realm: self.clone(),
                 id: self.session.borrow().document().root(),
-                collections: RefCell::new(HashMap::new()),
+                collections: crate::CollectionCache::default(),
             },
             realm: self.clone(),
             fonts: RefCell::new(None),

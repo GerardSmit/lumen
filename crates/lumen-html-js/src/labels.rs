@@ -7,7 +7,7 @@
 use super::{DomRealm, collections::DomNodeList};
 use lumen::embed::{Ctx, OpResult, Value, WeakValue};
 use lumen_html::{NodeId, labels as core_labels};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 /// Return the current control for an `HTMLLabelElement.control` getter.
 pub(crate) fn label_control(ctx: &mut Ctx, realm: &Rc<DomRealm>, label: NodeId) -> OpResult<Value> {
@@ -41,7 +41,7 @@ pub(crate) fn control_labels(
     realm: &Rc<DomRealm>,
     control: NodeId,
     owner: Value,
-    collections: &RefCell<HashMap<String, WeakValue>>,
+    collections: &crate::CollectionCache,
 ) -> OpResult<Value> {
     let labelable = {
         let session = realm.session.borrow();

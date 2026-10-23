@@ -825,7 +825,7 @@ impl DomHtmlAudioElement {
             base: crate::DomEventTarget::node(&realm, id),
             realm: realm.clone(),
             id,
-            collections: std::cell::RefCell::new(std::collections::HashMap::new()),
+            collections: crate::CollectionCache::default(),
         };
         realm.media.borrow_mut().register_detached(id);
         Ok(Self {
