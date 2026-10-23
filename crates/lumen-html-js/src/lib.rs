@@ -4544,6 +4544,7 @@ impl DomRealm {
                 .retain(|id, target| document.kind(*id).is_ok() && target.strong_count() > 0);
             self.initialized_content_handlers.borrow_mut().retain(|id,_|document.kind(*id).is_ok());
             self.stylesheet_links.reclaim_nodes(document);
+            self.images.reclaim_nodes(document);
             self.selections
                 .borrow_mut()
                 .retain(|id, _| document.kind(*id).is_ok());

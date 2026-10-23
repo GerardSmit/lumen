@@ -741,3 +741,17 @@ fn snapshot_pool_ignores_buffers_of_other_sizes() {
     assert_eq!(image.pixmap().width(), W + 1);
     assert_eq!(record::pooled_snapshot_buffers(), 1);
 }
+
+#[test]
+fn shared_images_draw_like_unshared_ones_for_opaque_and_translucent_pixels() {
+    for alpha in [255u8, 100] {
+        let image = Arc::new(Rgba8Image { width: 2, height: 2, pixels: [200, 100, 50, alpha].repeat(4) });
+        let mut shared = CanvasSurface::new(W, H).unwrap();
+        let mut plain = CanvasSurface::new(W, H).unwrap();
+        for _ in 0..2 {
+            shared.draw_image_legacy_shared(&image, 0.0, 0.0, 2.0, 2.0).unwrap();
+            plain.draw_image(&image, 0.0, 0.0, 2.0, 2.0).unwrap();
+        }
+        assert_eq!(shared.snapshot(), plain.snapshot());
+    }
+}

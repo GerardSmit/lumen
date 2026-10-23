@@ -473,7 +473,7 @@ impl CanvasSurface {
                 };
                 match geometry {
                     SourceGeometry::Scaled { x, y, width, height } => {
-                        self.draw_image_legacy_impl(&image, x, y, width, height)
+                        self.draw_image_legacy_shared(&image, x, y, width, height)
                     }
                     SourceGeometry::Crop { sx, sy, sw, sh, dx, dy, dw, dh } => {
                         self.draw_image_crop_now(&image, [sx, sy, sw, sh, dx, dy, dw, dh])
@@ -605,6 +605,10 @@ impl CanvasSurface {
             }
             let image = source.pixels().ok_or(ImageError::InvalidViewport)?;
             return match geometry {
+                SourceGeometry::Scaled { x, y, width, height } if premultiply_alpha => {
+                    self.flush();
+                    self.draw_image_legacy_shared(&image, x, y, width, height)
+                }
                 SourceGeometry::Scaled { x, y, width, height } => {
                     self.draw_image_with_alpha_behavior(&image, x, y, width, height, premultiply_alpha)
                 }

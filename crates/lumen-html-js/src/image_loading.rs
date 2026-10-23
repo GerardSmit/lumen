@@ -278,6 +278,21 @@ impl ImageLoader {
         if !dropped.is_empty(){let mut auto_nodes=self.auto_nodes.borrow_mut();for node in dropped{auto_nodes.remove(&node);}}
         self.auto_inputs_epoch.set(Some((session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get())));
     }
+    /// Drops the state of nodes the document has freed. Discovery only prunes when the tree
+    /// structure changes, so a page that keeps creating `Image`s without touching the tree would
+    /// otherwise keep one request per freed element.
+    pub(crate) fn reclaim_nodes(&self,document:&Document) {
+        let Ok(mut requests)=self.requests.try_borrow_mut()else{return};
+        let before=requests.len();
+        requests.retain(|&node,_|document.kind(node).is_ok());
+        if requests.len()==before{return}
+        if requests.capacity()>1024&&requests.len()<requests.capacity()/4{let target=requests.len()*2;requests.shrink_to(target);}
+        drop(requests);
+        self.active.borrow_mut().retain(|&node|document.kind(node).is_ok());
+        self.auto_nodes.borrow_mut().retain(|&node|document.kind(node).is_ok());
+        self.bitmap_updates.borrow_mut().retain(|&node,_|document.kind(node).is_ok());
+        self.dirty_nodes.borrow_mut().retain(|&node|document.kind(node).is_ok());
+    }
     pub(crate) fn set_policy(&self,policy:Rc<dyn Fn(&str)->Result<lumen_common::csp::Decision,lumen_common::csp::Error>>) {
         *self.policy.borrow_mut()=Some(policy);
     }

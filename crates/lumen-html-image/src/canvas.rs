@@ -1383,6 +1383,30 @@ impl CanvasSurface {
         width: f32,
         height: f32,
     ) -> Result<(), ImageError> {
+        self.draw_image_legacy_cached(image, None, x, y, width, height)
+    }
+
+    /// Draws a shared decoded image, reusing its premultiplied form across draws.
+    pub(super) fn draw_image_legacy_shared(
+        &mut self,
+        image: &std::sync::Arc<Rgba8Image>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<(), ImageError> {
+        self.draw_image_legacy_cached(image, Some(image), x, y, width, height)
+    }
+
+    fn draw_image_legacy_cached(
+        &mut self,
+        image: &Rgba8Image,
+        shared: Option<&std::sync::Arc<Rgba8Image>>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<(), ImageError> {
         if ![x, y, width, height].iter().all(|v| v.is_finite()) || width == 0.0 || height == 0.0 {
             return Ok(());
         }
@@ -1402,13 +1426,23 @@ impl CanvasSurface {
         } else {
             (y, height)
         };
+        if let Some(shared) = shared {
+            return match premultiplied_view(shared)? {
+                Premultiplied::Opaque => {
+                    let view = tiny_skia::PixmapRef::from_bytes(&image.pixels, image.width, image.height)
+                        .ok_or(ImageError::TooLarge)?;
+                    self.draw_pixmap_source(view, x, y, width, height)
+                }
+                Premultiplied::Pixmap(source) => self.draw_pixmap_source((*source).as_ref(), x, y, width, height),
+            };
+        }
         let source = premultiplied_pixmap(image)?;
-        self.draw_pixmap_source(&source, x, y, width, height)
+        self.draw_pixmap_source(source.as_ref(), x, y, width, height)
     }
 
     pub(super) fn draw_pixmap_source(
         &mut self,
-        source: &Pixmap,
+        source: tiny_skia::PixmapRef<'_>,
         x: f32,
         y: f32,
         width: f32,
@@ -1451,7 +1485,7 @@ impl CanvasSurface {
                     target.draw_pixmap(
                         0,
                         0,
-                        source.as_ref(),
+                        source,
                         &shadow_paint,
                         destination_transform(shadow_transform),
                         None,
@@ -1468,7 +1502,7 @@ impl CanvasSurface {
             bitmap.draw_pixmap(
                 0,
                 0,
-                source.as_ref(),
+                source,
                 &paint,
                 destination_transform(transform),
                 self.state.clip.as_deref(),
@@ -1508,7 +1542,7 @@ impl CanvasSurface {
                 }
                 let (x, width) = if width < 0.0 { (x + width, -width) } else { (x, width) };
                 let (y, height) = if height < 0.0 { (y + height, -height) } else { (y, height) };
-                self.draw_pixmap_source(source, x, y, width, height)
+                self.draw_pixmap_source(source.as_ref(), x, y, width, height)
             }
             record::SourceGeometry::Crop { sx, sy, sw, sh, dx, dy, dw, dh } => {
                 let rects = [sx, sy, sw, sh, dx, dy, dw, dh];
@@ -2639,6 +2673,101 @@ fn stored_pixel(pixel: &[u8]) -> [u8; 4] {
 
 fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
     ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
+}
+
+enum Premultiplied {
+    /// Every pixel is opaque, so the straight pixels are already premultiplied.
+    Opaque,
+    Pixmap(Rc<Pixmap>),
+}
+
+struct PremultipliedEntry {
+    source: std::sync::Weak<Rgba8Image>,
+    view: Premultiplied,
+    bytes: usize,
+    tick: u64,
+}
+
+const PREMULTIPLIED_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const PREMULTIPLIED_CACHE_ENTRIES: usize = 64;
+
+#[derive(Default)]
+struct PremultipliedCache {
+    entries: Vec<PremultipliedEntry>,
+    bytes: usize,
+    tick: u64,
+}
+
+thread_local! {
+    static PREMULTIPLIED: RefCell<PremultipliedCache> = RefCell::new(PremultipliedCache::default());
+}
+
+impl PremultipliedCache {
+    fn drop_dead(&mut self) {
+        let mut freed = 0;
+        self.entries.retain(|entry| {
+            let alive = entry.source.strong_count() > 0;
+            if !alive {
+                freed += entry.bytes;
+            }
+            alive
+        });
+        self.bytes -= freed;
+    }
+}
+
+/// The premultiplied form of a shared decoded image. It is kept while the decoded image is alive
+/// (its entry is dropped once the last strong reference goes) within a fixed byte budget, so it
+/// never outlives the decoded-image cache's eviction by more than one lookup. Fully opaque images
+/// need no copy at all.
+fn premultiplied_view(image: &std::sync::Arc<Rgba8Image>) -> Result<Premultiplied, ImageError> {
+    let pointer = std::sync::Arc::as_ptr(image);
+    let found = PREMULTIPLIED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.tick += 1;
+        let tick = cache.tick;
+        let entry = cache.entries.iter_mut().find(|entry| std::ptr::eq(entry.source.as_ptr(), pointer) && entry.source.strong_count() > 0)?;
+        entry.tick = tick;
+        Some(match &entry.view {
+            Premultiplied::Opaque => Premultiplied::Opaque,
+            Premultiplied::Pixmap(pixmap) => Premultiplied::Pixmap(pixmap.clone()),
+        })
+    });
+    if let Some(view) = found {
+        return Ok(view);
+    }
+    if image.pixels.len() != pixel_bytes(image.width, image.height)? {
+        return Err(ImageError::InvalidViewport);
+    }
+    let opaque = image.pixels.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX);
+    let view = if opaque { Premultiplied::Opaque } else { Premultiplied::Pixmap(Rc::new(premultiplied_pixmap(image)?)) };
+    let bytes = match &view {
+        Premultiplied::Opaque => 0,
+        Premultiplied::Pixmap(pixmap) => pixmap.data().len(),
+    };
+    if bytes > PREMULTIPLIED_CACHE_BYTES {
+        return Ok(view);
+    }
+    let cached = match &view {
+        Premultiplied::Opaque => Premultiplied::Opaque,
+        Premultiplied::Pixmap(pixmap) => Premultiplied::Pixmap(pixmap.clone()),
+    };
+    PREMULTIPLIED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.drop_dead();
+        while !cache.entries.is_empty()
+            && (cache.bytes + bytes > PREMULTIPLIED_CACHE_BYTES || cache.entries.len() >= PREMULTIPLIED_CACHE_ENTRIES)
+        {
+            let oldest = cache.entries.iter().enumerate().min_by_key(|(_, entry)| entry.tick).map(|(index, _)| index).expect("non-empty");
+            let removed = cache.entries.swap_remove(oldest);
+            cache.bytes -= removed.bytes;
+        }
+        cache.tick += 1;
+        let tick = cache.tick;
+        cache.bytes += bytes;
+        cache.entries.push(PremultipliedEntry { source: std::sync::Arc::downgrade(image), view: cached, bytes, tick });
+    });
+    Ok(view)
 }
 
 fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
