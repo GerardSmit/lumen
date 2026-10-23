@@ -1679,6 +1679,10 @@ impl Tr<'_, '_> {
                 return;
             }
         }
+        if let Some(body) = self.inline_plan(pc, argc, with_this) {
+            self.direct_call_with(pc, argc, with_this, Some(body));
+            return;
+        }
         self.direct_call_full(pc, argc, with_this);
     }
 
@@ -1882,6 +1886,19 @@ impl Tr<'_, '_> {
 
     /// The call of a direct call site (see the module docs).
     pub(super) fn direct_call_full(&mut self, pc: usize, argc: usize, with_this: bool) {
+        self.direct_call_with(pc, argc, with_this, None);
+    }
+
+    /// [`Tr::direct_call_full`], or with `inl` the callee's body translated in place of the call
+    /// of its code (see [`super::inline_general`]): the same guards and frame, the same exit
+    /// protocol.
+    fn direct_call_with(
+        &mut self,
+        pc: usize,
+        argc: usize,
+        with_this: bool,
+        inl: Option<super::inline_general::InlBody>,
+    ) {
         let site = match self.plan.direct.get(&pc) {
             Some(s) => s.clone(),
             None => self.plan.dacc[&pc].site.clone(),
@@ -2012,9 +2029,12 @@ impl Tr<'_, '_> {
             }
             None => None,
         };
+        if let Some(b) = &inl {
+            self.inl_arg_guards(b, &entries, ab, nargs, slow);
+        }
         let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
         let cp = self.ptrc(site.chunk as i64);
-        let entry = if site.self_call {
+        let entry = if site.self_call || inl.is_some() {
             None
         } else {
             let e = self.fb.load(PTR_MEM, cp, CHUNK_DENTRY as i32);
@@ -2073,6 +2093,9 @@ impl Tr<'_, '_> {
             let v = self.fb.iconst_unique(PTR, 0);
             self.self_sizes.push(v);
             v
+        } else if inl.is_some() {
+            // (Patched likewise, see `inline_run`.)
+            self.fb.iconst_unique(PTR, 0)
         } else {
             self.fb.load(PTR_MEM, cp, CHUNK_DSIZE as i32)
         };
@@ -2122,7 +2145,6 @@ impl Tr<'_, '_> {
         self.fb.store(MemKind::I32, interp, depth1, o.depth);
         let cellp = self.ptrc(site.cell as i64);
         let strict = self.i32c(site.strict as i64);
-        let zp = self.ptrc(0);
         // Stack-trace bookkeeping: this call's pc is the caller's site (see `Interp::cur_site`).
         let here = self.i32c((crate::interpreter::frames::SITE_PC | pc as u32) as i32 as i64);
         let z = self.i32c(0);
@@ -2269,57 +2291,15 @@ impl Tr<'_, '_> {
             self.fb.store(PTR_MEM, nf, envw, FRAME_ENV);
         }
         // ---- the call ----
-        let word = match entry {
-            None => {
-                let f = match self.self_fn {
-                    Some(f) => f,
-                    None => {
-                        let f = self
-                            .fb
-                            .func
-                            .import_function(Signature::new(vec![PTR], vec![Type::I64]), SELF_ID);
-                        self.self_fn = Some(f);
-                        f
-                    }
-                };
-                self.fb.call_fn(f, &[nf])[0]
-            }
-            Some(e) => {
-                let sig = self
-                    .fb
-                    .func
-                    .import_signature(Signature::new(vec![PTR], vec![Type::I64]));
-                self.fb.call_indirect(sig, e, &[nf])[0]
-            }
-        };
-        let mask = self.i64c(0xff);
-        let kind = self.fb.binary(BinaryOp::Band, word, mask);
-        let ret = self.i64c(EXIT_RETURN as i64);
-        let is_ret = self.fb.icmp(IntCC::Eq, kind, ret);
-        let fast = if site.tails {
-            let pt = self.fb.load(PTR_MEM, interp, o.pending_tail);
-            let no_pt = self.fb.icmp(IntCC::Eq, pt, zp);
-            self.fb.binary(BinaryOp::Band, is_ret, no_pt)
-        } else {
-            is_ret
-        };
-        let fin = self.fb.create_block();
         let post = self.fb.create_block();
         let st_post = self.fb.append_block_param(post, Type::I32);
-        self.fb.brif(fast, post, &[z], fin, &[]);
-        self.fb.seal_block(fin);
-        self.fb.switch_to_block(fin);
-        let ev = match entry {
-            Some(e) => e,
-            None => {
-                let cell = self.ptrc(self.self_entry as i64);
-                self.fb.load(PTR_MEM, cell, 0)
+        match inl {
+            Some(b) => {
+                let args: Vec<Entry> = (0..seed).map(|k| entries[ab + k]).collect();
+                self.inline_run(b, nf, slots_p, stack_p, &args, size, post);
             }
-        };
-        let st = self
-            .call(Helper::CallFinish, &[self.frame, nf, word, ev])
-            .expect("CallFinish returns a status");
-        self.fb.jump(post, &[st]);
+            None => self.call_code(&site, entry, nf, interp, post),
+        }
         self.fb.seal_block(post);
         self.fb.switch_to_block(post);
         // ---- after the call ----
@@ -2461,6 +2441,64 @@ impl Tr<'_, '_> {
         self.throw_if(st_join, pc, &below, base);
         self.soff(base);
         self.stack.push(Entry::Boxed);
+    }
+
+    /// The call of a direct site's code (`entry`, or the code being compiled for a self-call)
+    /// on the callee frame `nf`: a return exit continues at `post` with status 0, anything else
+    /// through [`Helper::CallFinish`] with its status.
+    fn call_code(&mut self, site: &DSite, entry: Option<V>, nf: V, interp: V, post: Block) {
+        let o = offs().expect("planned with offsets");
+        let z = self.i32c(0);
+        let zp = self.ptrc(0);
+        let word = match entry {
+            None => {
+                let f = match self.self_fn {
+                    Some(f) => f,
+                    None => {
+                        let f = self
+                            .fb
+                            .func
+                            .import_function(Signature::new(vec![PTR], vec![Type::I64]), SELF_ID);
+                        self.self_fn = Some(f);
+                        f
+                    }
+                };
+                self.fb.call_fn(f, &[nf])[0]
+            }
+            Some(e) => {
+                let sig = self
+                    .fb
+                    .func
+                    .import_signature(Signature::new(vec![PTR], vec![Type::I64]));
+                self.fb.call_indirect(sig, e, &[nf])[0]
+            }
+        };
+        let mask = self.i64c(0xff);
+        let kind = self.fb.binary(BinaryOp::Band, word, mask);
+        let ret = self.i64c(EXIT_RETURN as i64);
+        let is_ret = self.fb.icmp(IntCC::Eq, kind, ret);
+        let fast = if site.tails {
+            let pt = self.fb.load(PTR_MEM, interp, o.pending_tail);
+            let no_pt = self.fb.icmp(IntCC::Eq, pt, zp);
+            self.fb.binary(BinaryOp::Band, is_ret, no_pt)
+        } else {
+            is_ret
+        };
+        let fin = self.fb.create_block();
+        self.fb.brif(fast, post, &[z], fin, &[]);
+        self.fb.seal_block(fin);
+        self.fb.switch_to_block(fin);
+        let ev = match entry {
+            Some(e) => e,
+            None => {
+                let cell = self.ptrc(self.self_entry as i64);
+                self.fb.load(PTR_MEM, cell, 0)
+            }
+        };
+        let st = self
+            .call(Helper::CallFinish, &[self.frame, nf, word, ev])
+            .expect("CallFinish returns a status");
+        self.fb.jump(post, &[st]);
     }
 }
 

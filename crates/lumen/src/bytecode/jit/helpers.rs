@@ -179,6 +179,14 @@ pub(crate) enum Helper {
     /// `(frame, pc: u32)` — remember that the speculation of the call site at `pc` failed (a
     /// recompile leaves it out, see [`math_site_failed`]).
     SiteFailed,
+    /// `(frame, callee: *mut JitFrame, word: u64, site: *const InlineSite) -> status` — finish
+    /// an inlined call whose body exited with `word` as [`Helper::CallFinish`] does (from the
+    /// callee frame, with no code of its own), counting a resume exit against the site (see
+    /// `build::inline_general`).
+    InlineFinish,
+    /// `(site: *const InlineSite)` — an argument of an inlined call did not have the kind the
+    /// body was compiled for: counted against the site like an exit of the body.
+    InlineMiss,
     /// `(p: *mut Value, n: u32)` — drop `n` values in place, leaving `Undefined`.
     DropN,
     /// `(frame, cell: *mut SiteCell, callee: *const Value) -> 0/1` — rebind a direct call
@@ -348,7 +356,7 @@ pub(crate) enum Helper {
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 88] = [
+pub(crate) const ALL: [Helper; 90] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -390,6 +398,8 @@ pub(crate) const ALL: [Helper; 88] = [
     Helper::NameWord,
     Helper::PopFnFrame,
     Helper::SiteFailed,
+    Helper::InlineFinish,
+    Helper::InlineMiss,
     Helper::DropN,
     Helper::SiteRebind,
     Helper::BoundThis,
@@ -480,6 +490,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::NameWord => (&[P, I32, I32], &[P]),
         Helper::PopFnFrame => (&[P], &[]),
         Helper::SiteFailed => (&[P, I32], &[]),
+        Helper::InlineFinish => (&[P, P, I64, P], &[I32]),
+        Helper::InlineMiss => (&[P], &[]),
         Helper::DropN => (&[P, I32], &[]),
         Helper::SiteRebind => (&[P, P, P], &[I32]),
         Helper::BoundThis => (&[P, P, P, I32], &[P]),
@@ -576,6 +588,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::NameWord => name_word as *const () as usize,
         Helper::PopFnFrame => pop_fn_frame as *const () as usize,
         Helper::SiteFailed => site_failed as *const () as usize,
+        Helper::InlineFinish => inline_finish as *const () as usize,
+        Helper::InlineMiss => inline_miss as *const () as usize,
         Helper::DropN => drop_n as *const () as usize,
         Helper::SiteRebind => site_rebind as *const () as usize,
         Helper::BoundThis => bound_this as *const () as usize,
@@ -3682,6 +3696,27 @@ pub(crate) unsafe extern "C" fn site_failed(f: *mut JitFrame, pc: u32) {
     MATH_FAILED.with(|s| {
         s.borrow_mut().insert(key);
     });
+}
+
+pub(crate) unsafe extern "C" fn inline_finish(
+    f: *mut JitFrame,
+    nf: *mut JitFrame,
+    word: u64,
+    site: *const super::InlineSite,
+) -> u32 {
+    let chunk = &*(*nf).chunk;
+    let pc = (word >> 8) as usize;
+    if word & 0xff == EXIT_RESUME {
+        super::count_exit(chunk, pc, "inlined");
+        if !matches!(chunk.ops.get(pc), Some(Op::Throw)) {
+            super::inline_note(&*site);
+        }
+    }
+    call_finish(f, nf, word, std::ptr::null())
+}
+
+pub(crate) unsafe extern "C" fn inline_miss(site: *const super::InlineSite) {
+    super::inline_note(&*site);
 }
 
 pub(crate) unsafe extern "C" fn drop_n(p: *mut Value, n: u32) {

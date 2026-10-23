@@ -92,7 +92,9 @@ fn int32_guards_and_widening_keep_number_semantics() {
     let mut interp = crate::interpreter::Interp::new();
     let env = interp.global_env.clone();
     let program = crate::parser::parse_script(
-        "function f(x,y) { x += y; x *= y; x -= y; x++; return x; }",
+        // (Strict: a sloppy function's parameters stay Boxed once any source in the process
+        // could read `f.arguments`, see `reflect::enabled`.)
+        "function f(x,y) { 'use strict'; x += y; x *= y; x -= y; x++; return x; }",
         false,
     )
     .unwrap();

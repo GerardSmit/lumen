@@ -224,6 +224,8 @@ pub struct JitStats {
     /// Compiled units released to make room for new code (memory pressure).
     pub evictions: u64,
     pub evicted_bytes: usize,
+    /// Call sites compiled with the callee's body inlined (see `jit::build::inline_general`).
+    pub inlined_calls: u64,
 }
 
 #[cfg(feature = "bench")]
@@ -246,6 +248,7 @@ impl core::ops::AddAssign for JitStats {
         self.allocation_failures += other.allocation_failures;
         self.evictions += other.evictions;
         self.evicted_bytes += other.evicted_bytes;
+        self.inlined_calls += other.inlined_calls;
     }
 }
 

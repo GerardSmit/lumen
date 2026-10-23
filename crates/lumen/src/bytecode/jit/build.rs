@@ -55,6 +55,8 @@ mod call;
 mod inline;
 #[path = "inline_fwd.rs"]
 pub(super) mod inline_fwd;
+#[path = "inline_general.rs"]
+mod inline_general;
 #[path = "inline_this.rs"]
 mod inline_this;
 #[path = "new_plan.rs"]
@@ -160,6 +162,45 @@ pub(crate) fn build(
     build_region(
         interp, env, chunk, header, backedge, slots, an, kinds, fresh, false, this_val, widen,
     )
+}
+
+/// [`build_unit`] with general inlining (see [`inline_general`]), and again without it when an
+/// inlined body made the translation fail.
+#[allow(clippy::too_many_arguments)]
+fn build_region(
+    interp: &Interp,
+    env: &Env,
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    slots: &[Value],
+    an: Analysis,
+    kinds: Vec<Kind>,
+    fresh: Vec<bool>,
+    func_mode: bool,
+    this_val: &Value,
+    widen: &[Widen],
+) -> Result<Built, String> {
+    let on = inline_general::enabled();
+    let retry = on.then(|| (an.clone(), kinds.clone(), fresh.clone()));
+    match build_unit(
+        interp, env, chunk, header, backedge, slots, an, kinds, fresh, func_mode, this_val, widen,
+        on,
+    ) {
+        Ok(b) => Ok(b),
+        Err((e, false)) => Err(e),
+        Err((e, true)) => {
+            if log_enabled() {
+                eprintln!("[jit] translation with inlined calls failed ({e}): without");
+            }
+            let (an, kinds, fresh) = retry.expect("inlining was on");
+            build_unit(
+                interp, env, chunk, header, backedge, slots, an, kinds, fresh, func_mode,
+                this_val, widen, false,
+            )
+            .map_err(|(e, _)| e)
+        }
+    }
 }
 
 /// Translate the whole of `chunk` as function code entered at pc 0 (the whole-function tier):
@@ -581,8 +622,115 @@ fn fn_kinds(
     (kinds, cand)
 }
 
+/// Speculate `Int32` for the `Num` slots that hold an int32 at entry or are initialized from
+/// an int32 constant, unless widened.
+fn int32_kinds(
+    chunk: &Chunk,
+    slots: &[Value],
+    kinds: &mut [Kind],
+    fresh: &[bool],
+    widen: &[Widen],
+) {
+    for s in 0..chunk.n_slots {
+        let integer_init = fresh[s] && chunk.ops.iter().enumerate().find_map(|(pc, op)| {
+            match *op {
+                Op::StoreLocal(dst) if dst as usize == s => Some(pc.checked_sub(1)
+                    .is_some_and(|p| matches!(chunk.ops[p], Op::Const(k)
+                        if matches!(chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some())))),
+                _ => None,
+            }
+        }).unwrap_or(false);
+        if kinds[s] == Kind::Num
+            && widen.get(s).copied().unwrap_or_default() == Widen::None
+            && ((!fresh[s] && slots.get(s).is_some_and(|v| Kind::Int32.accepts(v))) || integer_init)
+        {
+            kinds[s] = Kind::Int32;
+        }
+    }
+}
+
+/// The definite-assignment facts and the plan of a region whose slot kinds are decided.
 #[allow(clippy::too_many_arguments)]
-fn build_region(
+fn plan_unit(
+    interp: &Interp,
+    env: &Env,
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    slots: &[Value],
+    this_val: &Value,
+    an: &Analysis,
+    kinds: &[Kind],
+    fresh: &[bool],
+    func_mode: bool,
+) -> (Defd, Defd, Plan) {
+    let defd = Defd::new(chunk, header, backedge, an, fresh, None);
+    let tdz_ssa: Vec<bool> = (0..chunk.n_slots)
+        .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
+        .collect();
+    let tdzd = Defd::new(chunk, header, backedge, an, &tdz_ssa, Some(func_mode));
+    let mut plan = plan(
+        interp, env, chunk, header, backedge, slots, an, kinds, &defd, &tdzd,
+    );
+    call::plan_direct(
+        &mut plan, interp, env, chunk, header, backedge, slots, this_val, an, kinds, func_mode,
+    );
+    // A `get` / `set` / ... site that became a direct JS call is a user method: keep that.
+    {
+        let (direct, dmethod) = (&plan.direct, &plan.dmethod);
+        plan.colm
+            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
+        plan.dvm
+            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
+    }
+    (defd, tdzd, plan)
+}
+
+/// The IR blocks of the leaders of a region (see [`Leader`]).
+fn leader_blocks(fb: &mut FunctionBuilder<'_>, an: &Analysis) -> Vec<Option<Leader>> {
+    let mut leaders: Vec<Option<Leader>> = Vec::with_capacity(an.depth.len());
+    for i in 0..an.depth.len() {
+        leaders.push(if an.leader[i] {
+            let depth = an.depth[i].unwrap_or(0);
+            Some(Leader {
+                block: fb.create_block(),
+                depth,
+                state: if depth == 0 {
+                    Some(Vec::new())
+                } else if an.preds[i] > 1 {
+                    Some(vec![Entry::Boxed; depth])
+                } else {
+                    None
+                },
+                edges: 0,
+                visited: false,
+                back_left: an.back[i],
+                has_back: an.back[i] > 0,
+            })
+        } else {
+            None
+        });
+    }
+    leaders
+}
+
+/// The slots of `chunk` that some `Tdz` op puts into their TDZ (see [`Tr::tdz_slots`]).
+fn tdz_slot_set(chunk: &Chunk) -> Vec<bool> {
+    let mut t = vec![false; chunk.n_slots];
+    for op in &chunk.ops {
+        if let Op::Tdz(s) = *op {
+            if let Some(f) = t.get_mut(s as usize) {
+                *f = true;
+            }
+        }
+    }
+    t
+}
+
+/// Translate a region (see [`build_region`]); `inline`: let direct calls inline their callees.
+/// The error says whether any call was inlined.
+#[allow(clippy::too_many_arguments)]
+fn build_unit(
     interp: &Interp,
     env: &Env,
     chunk: &Chunk,
@@ -595,7 +743,8 @@ fn build_region(
     func_mode: bool,
     this_val: &Value,
     widen: &[Widen],
-) -> Result<Built, String> {
+    inline: bool,
+) -> Result<Built, (String, bool)> {
     let n_slots = chunk.n_slots;
     let mut kinds = kinds;
     if chunk.reflect_args && crate::bytecode::reflect::enabled() {
@@ -618,50 +767,19 @@ fn build_region(
             }
         }
     }
-    for s in 0..n_slots {
-        let integer_init = fresh[s] && chunk.ops.iter().enumerate().find_map(|(pc, op)| {
-            match *op {
-                Op::StoreLocal(dst) if dst as usize == s => Some(pc.checked_sub(1)
-                    .is_some_and(|p| matches!(chunk.ops[p], Op::Const(k)
-                        if matches!(chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some())))),
-                _ => None,
-            }
-        }).unwrap_or(false);
-        if kinds[s] == Kind::Num
-            && widen.get(s).copied().unwrap_or_default() == Widen::None
-            && ((!fresh[s] && slots.get(s).is_some_and(|v| Kind::Int32.accepts(v))) || integer_init)
-        {
-            kinds[s] = Kind::Int32;
-        }
-    }
-    let defd = Defd::new(chunk, header, backedge, &an, &fresh, None);
-    let tdz_ssa: Vec<bool> = (0..n_slots)
-        .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
-        .collect();
-    let tdzd = Defd::new(chunk, header, backedge, &an, &tdz_ssa, Some(func_mode));
-    let mut plan = plan(
-        interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd,
+    int32_kinds(chunk, slots, &mut kinds, &fresh, widen);
+    let (defd, tdzd, mut plan) = plan_unit(
+        interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, &fresh, func_mode,
     );
-    call::plan_direct(
-        &mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode,
-    );
-    // A `get` / `set` / ... site that became a direct JS call is a user method: keep that.
-    {
-        let (direct, dmethod) = (&plan.direct, &plan.dmethod);
-        plan.colm
-            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
-        plan.dvm
-            .retain(|g, &mut (c, _)| !direct.contains_key(&c) && !dmethod.contains_key(g));
-    }
     let mut an = an;
     let resumes_out = an.resumes.clone();
     let tail_loops = plan.tail_loops.len() as u32;
     an.back[0] += tail_loops;
     an.preds[0] += tail_loops;
     let num_exits;
-    let pins = std::mem::take(&mut plan.pins);
+    let mut pins = std::mem::take(&mut plan.pins);
     let mut boxes = std::mem::take(&mut plan.boxes);
-    let externs = plan.externs.clone();
+    let mut externs = plan.externs.clone();
     let guarded: Vec<usize> = plan
         .math
         .iter()
@@ -696,30 +814,7 @@ fn build_region(
         let consts_p = fb.load(PTR_MEM, frame, FRAME_CONSTS);
         let stack_p = fb.load(PTR_MEM, frame, FRAME_STACK);
 
-        let mut leaders: Vec<Option<Leader>> = Vec::with_capacity(an.depth.len());
-        for i in 0..an.depth.len() {
-            leaders.push(if an.leader[i] {
-                let depth = an.depth[i].unwrap_or(0);
-                Some(Leader {
-                    block: fb.create_block(),
-                    depth,
-                    state: if depth == 0 {
-                        Some(Vec::new())
-                    } else if an.preds[i] > 1 {
-                        Some(vec![Entry::Boxed; depth])
-                    } else {
-                        None
-                    },
-                    edges: 0,
-                    visited: false,
-                    back_left: an.back[i],
-                    has_back: an.back[i] > 0,
-                })
-            } else {
-                None
-            });
-        }
-
+        let leaders = leader_blocks(&mut fb, &an);
         let (ta_kinds_init, ta_slots_init) =
             ta_slot_info(interp, chunk, header, backedge, slots, func_mode);
         let mut tr = Tr {
@@ -742,17 +837,7 @@ fn build_region(
             defd,
             tdzd,
             func_mode,
-            tdz_slots: {
-                let mut t = vec![false; n_slots];
-                for op in &chunk.ops {
-                    if let Op::Tdz(s) = *op {
-                        if let Some(f) = t.get_mut(s as usize) {
-                            *f = true;
-                        }
-                    }
-                }
-                t
-            },
+            tdz_slots: tdz_slot_set(chunk),
             helpers: vec![None; helpers::ALL.len()],
             leaders,
             stack: Vec::new(),
@@ -784,11 +869,14 @@ fn build_region(
             call_flags: None,
             num_exits: Vec::new(),
             exit_tails: [None, None],
+            inl: None,
+            ginl: inline_general::Shared::new(interp, chunk, inline, std::mem::take(&mut externs)),
         };
         tr.entry(&an);
-        tr.body(&an)?;
-        if let Some(e) = tr.err.take() {
-            return Err(e);
+        let r = tr.body(&an);
+        let inlined = tr.ginl.inlined > 0;
+        if let Err(e) = r.and_then(|()| tr.err.take().map_or(Ok(()), Err)) {
+            return Err((e, inlined));
         }
         let Tr {
             fb,
@@ -797,15 +885,21 @@ fn build_region(
             hsets: h,
             self_sizes,
             num_exits: ne,
+            ginl,
             ..
         } = tr;
         num_exits = ne;
         fb.finish();
         kinds = k;
         hsets = h;
-        // Direct self-calls reserve this code's own frame size, known only now.
+        // Direct self-calls reserve this code's own frame size, known only now; so do the
+        // frames of inlined bodies.
         let size = frame_bytes(n_slots, max_stack) as i64;
-        for v in self_sizes {
+        let patches = self_sizes
+            .into_iter()
+            .map(|v| (v, size))
+            .chain(ginl.sizes.iter().copied());
+        for (v, size) in patches {
             if let lumen_codegen::ir::ValueDef::Result(inst, _) = func.values[v.index()].def {
                 if let lumen_codegen::ir::InstData::Iconst { imm, .. } =
                     &mut func.insts[inst.index()]
@@ -814,6 +908,7 @@ fn build_region(
                 }
             }
         }
+        ginl.finish(&mut pins, &mut boxes, &mut externs);
         max_stack
     };
     Ok(Built {
@@ -835,6 +930,7 @@ fn build_region(
 
 /// What the translator needs to know about the region before emitting anything. Vectors indexed
 /// by `pc - header` unless noted.
+#[derive(Clone)]
 struct Analysis {
     /// Operand-stack depth before the op; `None` = unreachable from the header.
     depth: Vec<Option<usize>>,
@@ -2291,6 +2387,74 @@ struct Tr<'a, 'f> {
     /// The engine's per-activation call flags read at entry, for direct calls (see
     /// [`call`]'s `entry_flags`): `frame.canon`.
     call_flags: Option<V>,
+    /// The callee body being translated in place of its call (see [`inline_general`]).
+    inl: Option<inline_general::InlCx>,
+    /// General-inlining state shared by the unit's own code and every body inlined into it.
+    ginl: inline_general::Shared<'a>,
+}
+
+/// Declares [`ChunkCtx`]: the fields of [`Tr`] that describe the chunk being translated, which
+/// an inlined callee body swaps for its own (see [`inline_general`]).
+macro_rules! chunk_ctx {
+    ($($f:ident: $t:ty,)*) => {
+        /// The per-chunk part of a [`Tr`] (see [`Tr::swap_ctx`]).
+        struct ChunkCtx<'a> {
+            $($f: $t,)*
+        }
+
+        impl<'a> Tr<'a, '_> {
+            /// Exchange the translator's per-chunk state with `c`.
+            fn swap_ctx(&mut self, c: &mut ChunkCtx<'a>) {
+                $(std::mem::swap(&mut self.$f, &mut c.$f);)*
+            }
+        }
+    };
+}
+
+chunk_ctx! {
+    num_exits: Vec<usize>,
+    exit_tails: [Option<Block>; 2],
+    chunk: &'a Chunk,
+    ops: &'a [Op],
+    header: usize,
+    backedge: usize,
+    frame: V,
+    slots: V,
+    stackp: V,
+    consts: V,
+    kinds: Vec<Kind>,
+    vars: Vec<Option<Variable>>,
+    tdz: Vec<Option<Variable>>,
+    undef: Vec<Option<Variable>>,
+    fresh: Vec<bool>,
+    defd: Defd,
+    tdzd: Defd,
+    func_mode: bool,
+    tdz_slots: Vec<bool>,
+    leaders: Vec<Option<Leader>>,
+    stack: Vec<Entry>,
+    max_stack: usize,
+    plan: Plan,
+    ptr_vars: HashMap<Src, Variable>,
+    arr_vars: HashMap<Src, ArrVars>,
+    idx_vars: HashMap<(Src, u16), Variable>,
+    math_vars: HashMap<usize, Variable>,
+    ta_vars: HashMap<usize, TaVars>,
+    ta_slots: Vec<bool>,
+    ta_kinds: Vec<u32>,
+    ta_len_vars: HashMap<usize, TaLenVars>,
+    dv_vars: HashMap<usize, DvVars>,
+    bl_vars: HashMap<usize, (DvVars, Variable)>,
+    push_vars: HashMap<usize, Variable>,
+    chain_vars: HashMap<usize, (Variable, Variable)>,
+    handlers: bool,
+    hs_cur: Vec<(usize, usize)>,
+    skip: Option<usize>,
+    pending_append: Option<(usize, Option<Block>, Vec<Entry>)>,
+    chaining: bool,
+    hsets: Vec<Vec<(usize, usize)>>,
+    call_flags: Option<V>,
+    inl: Option<inline_general::InlCx>,
 }
 
 fn cmp_of(op: &Op) -> Option<CmpKind> {
@@ -2987,7 +3151,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb
             .store(MemKind::I64, self.frame, dep, FRAME_EXIT_DEPTH);
-        self.fb.ret(&[w]);
+        match self.inl {
+            // An inlined body's frame is finished by the interpreter (see `inline_general`).
+            Some(cx) => self.fb.jump(cx.exit, &[w]),
+            None => self.fb.ret(&[w]),
+        }
         if let Some(c) = cur {
             self.fb.switch_to_block(c);
         }
@@ -3300,20 +3468,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.def_var(bv, b);
         self.budget = Some(bv);
         let fail = self.fb.create_block();
-        for s in 0..self.kinds.len() {
-            let ty = match self.kinds[s] {
-                Kind::Num => Type::F64,
-                Kind::Bool | Kind::Int32 => Type::I32,
-                Kind::Boxed => continue,
-            };
-            self.vars[s] = Some(self.fb.declare_var(ty));
-            if self.fresh[s] {
-                self.undef[s] = Some(self.fb.declare_var(Type::I32));
-            }
-            if an.tdz[s] {
-                self.tdz[s] = Some(self.fb.declare_var(Type::I32));
-            }
-        }
+        self.declare_ssa(an);
         // Function code with resume points dispatches on `frame.resume`: a resume entry
         // reloads the SSA slots from what the suspended body left (see `resume_slots`).
         let resume = (!an.resumes.is_empty()).then(|| {
@@ -3419,6 +3574,66 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(join);
             self.fb.switch_to_block(join);
         }
+        self.entry_caches(fail);
+        let header_block = self
+            .edge(false, self.header)
+            .expect("the header is a leader");
+        if let Some((r, _)) = resume {
+            for (k, &(rpc, d)) in an.resumes.iter().enumerate() {
+                let go = self.fb.create_block();
+                let next = self.fb.create_block();
+                let kv = self.i64c(k as i64 + 1);
+                let c = self.fb.icmp(IntCC::Eq, r, kv);
+                self.fb.brif(c, go, &[], next, &[]);
+                self.fb.seal_block(go);
+                self.fb.seal_block(next);
+                self.fb.switch_to_block(go);
+                // The frame's operand stack, moved into the stack area by `enter`.
+                self.stack = vec![Entry::Boxed; d];
+                self.max_stack = self.max_stack.max(d);
+                match self.edge(false, rpc) {
+                    Ok(b) => self.fb.jump(b, &[]),
+                    Err(e) => {
+                        self.err.get_or_insert(e);
+                        self.fb.jump(fail, &[]);
+                    }
+                }
+                self.stack.clear();
+                self.fb.switch_to_block(next);
+            }
+        }
+        self.fb.jump(header_block, &[]);
+        self.fb.seal_block(fail);
+        self.fb.switch_to_block(fail);
+        let z = self.fb.iconst(Type::I64, 0);
+        self.fb.store(MemKind::I64, self.frame, z, FRAME_EXIT_DEPTH);
+        let w = self
+            .fb
+            .iconst(Type::I64, exit(self.header, EXIT_ENTRY_FAIL) as i64);
+        self.fb.ret(&[w]);
+    }
+
+    /// Declare the IR variables of the SSA slots (and their `undefined` / TDZ flags).
+    fn declare_ssa(&mut self, an: &Analysis) {
+        for s in 0..self.kinds.len() {
+            let ty = match self.kinds[s] {
+                Kind::Num => Type::F64,
+                Kind::Bool | Kind::Int32 => Type::I32,
+                Kind::Boxed => continue,
+            };
+            self.vars[s] = Some(self.fb.declare_var(ty));
+            if self.fresh[s] {
+                self.undef[s] = Some(self.fb.declare_var(Type::I32));
+            }
+            if an.tdz[s] {
+                self.tdz[s] = Some(self.fb.declare_var(Type::I32));
+            }
+        }
+    }
+
+    /// The region caches and facts at entry, and the entry-time guards of the plan's `Math`
+    /// sites (to `fail` when one does not hold).
+    fn entry_caches(&mut self, fail: Block) {
         // Region caches start unknown; `Math` guards are checked here, so a replaced intrinsic
         // fails the entry (and after enough failures the loop recompiles without the site).
         let zp = self.ptrc(0);
@@ -3636,42 +3851,6 @@ impl<'a, 'f> Tr<'a, 'f> {
         if self.plan.direct.values().any(|s| !s.construct) || !self.plan.dacc.is_empty() {
             self.call_flags = self.entry_flags();
         }
-        let header_block = self
-            .edge(false, self.header)
-            .expect("the header is a leader");
-        if let Some((r, _)) = resume {
-            for (k, &(rpc, d)) in an.resumes.iter().enumerate() {
-                let go = self.fb.create_block();
-                let next = self.fb.create_block();
-                let kv = self.i64c(k as i64 + 1);
-                let c = self.fb.icmp(IntCC::Eq, r, kv);
-                self.fb.brif(c, go, &[], next, &[]);
-                self.fb.seal_block(go);
-                self.fb.seal_block(next);
-                self.fb.switch_to_block(go);
-                // The frame's operand stack, moved into the stack area by `enter`.
-                self.stack = vec![Entry::Boxed; d];
-                self.max_stack = self.max_stack.max(d);
-                match self.edge(false, rpc) {
-                    Ok(b) => self.fb.jump(b, &[]),
-                    Err(e) => {
-                        self.err.get_or_insert(e);
-                        self.fb.jump(fail, &[]);
-                    }
-                }
-                self.stack.clear();
-                self.fb.switch_to_block(next);
-            }
-        }
-        self.fb.jump(header_block, &[]);
-        self.fb.seal_block(fail);
-        self.fb.switch_to_block(fail);
-        let z = self.fb.iconst(Type::I64, 0);
-        self.fb.store(MemKind::I64, self.frame, z, FRAME_EXIT_DEPTH);
-        let w = self
-            .fb
-            .iconst(Type::I64, exit(self.header, EXIT_ENTRY_FAIL) as i64);
-        self.fb.ret(&[w]);
     }
 
     /// The SSA slots at a resume entry (after an `await`): each holds a value of its kind, or
@@ -5066,6 +5245,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             Op::Return => {
                 if d != 1 {
                     self.exit_now(pc);
+                } else if let Some(cx) = self.inl {
+                    let e = self.stack[0];
+                    self.inl_return(cx, Some(e));
                 } else {
                     let st = self.stack.clone();
                     self.emit_exit(pc, EXIT_RETURN, &st, 1, None);
@@ -5074,6 +5256,8 @@ impl<'a, 'f> Tr<'a, 'f> {
             Op::ReturnUndef => {
                 if d != 0 {
                     self.exit_now(pc);
+                } else if let Some(cx) = self.inl {
+                    self.inl_return(cx, None);
                 } else {
                     self.set_stack_tag(0, TAG_UNDEFINED);
                     self.emit_exit(pc, EXIT_RETURN, &[], 1, None);

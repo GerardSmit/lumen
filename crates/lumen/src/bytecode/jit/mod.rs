@@ -767,6 +767,8 @@ mod evict_tests;
 #[cfg(test)]
 mod inline_elem_tests;
 #[cfg(test)]
+mod inline_general_tests;
+#[cfg(test)]
 mod int32_tests;
 #[cfg(test)]
 mod intrinsic_guard_tests;
@@ -2577,6 +2579,74 @@ fn retire_fn(jit: &ChunkJit, fs: &mut FuncState) {
         } else {
             FS_PENDING
         });
+    }
+}
+
+/// A call site whose callee's body is inlined into compiled code (see `build::inline_general`):
+/// what its exits are counted against.
+pub(crate) struct InlineSite {
+    /// The compiled unit's chunk, and the address of the `Cell` its code's entry is linked
+    /// into ([`build::Built::self_entry`]): identifies the code that inlines the site.
+    pub root: *const Chunk,
+    pub entry: usize,
+    /// The chunk holding the call (the unit's own or an inlined callee's) and the call's pc.
+    pub chunk: *const Chunk,
+    pub site: usize,
+}
+
+/// Site feedback: do not inline the callee at this call site.
+#[derive(Clone)]
+pub(crate) struct NoInline;
+
+/// Site feedback: exits of the body inlined at this call site (and argument-check misses).
+#[derive(Clone)]
+pub(crate) struct InlineExits(u32);
+
+/// Exits of an inlined body after which its site stops inlining.
+const INLINE_EXIT_LIMIT: u32 = 16;
+
+/// Count an exit of the body inlined at `s` (or a miss of its argument checks); at
+/// [`INLINE_EXIT_LIMIT`] the site stops inlining and the code that inlines it is retired.
+///
+/// # Safety
+///
+/// `s` belongs to code that is running: its chunks and entry cell are alive.
+pub(crate) unsafe fn inline_note(s: &InlineSite) {
+    let chunk = &*s.chunk;
+    let n = chunk
+        .jit
+        .fb_get::<InlineExits>(s.site)
+        .map_or(1, |e| e.0.saturating_add(1));
+    chunk.jit.fb_put(s.site, InlineExits(n));
+    if n != INLINE_EXIT_LIMIT {
+        return;
+    }
+    chunk.jit.fb_put(s.site, NoInline);
+    if log_enabled() {
+        eprintln!("[jit] inlined call at {} keeps exiting: not inlined", s.site);
+    }
+    let entry = (*(s.entry as *const Cell<usize>)).get();
+    retire_running(&*s.root, entry);
+}
+
+/// Retire the code of `chunk` entered at `entry` (its function code or one of its loops).
+fn retire_running(chunk: &Chunk, entry: usize) {
+    let jit = &chunk.jit;
+    if let Ok(mut fs) = jit.func.try_borrow_mut() {
+        if fs.code.as_ref().is_some_and(|c| c.entry as usize == entry) {
+            retire_fn(jit, &mut fs);
+            return;
+        }
+    }
+    if let Ok(mut loops) = jit.loops.try_borrow_mut() {
+        if let Some(l) = loops
+            .iter_mut()
+            .find(|l| l.code.as_ref().is_some_and(|c| c.entry as usize == entry))
+        {
+            l.code = None;
+            l.deopts.clear();
+            jit.invalidate();
+        }
     }
 }
 
