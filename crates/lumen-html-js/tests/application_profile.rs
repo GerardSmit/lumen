@@ -12,6 +12,7 @@ static APPLICATION_PROFILE_ALLOCATOR: lumen::fastalloc::ClassAlloc = lumen::fast
 const VIEWPORT: (u32, u32) = (320, 200);
 const MAX_FRAME_WALL_NS: u128 = 250_000_000;
 const MAX_FRAME_CPU_US: u64 = 250_000;
+const WALL_BACKSTOP_FACTOR: u128 = 10;
 const MAX_TODOS: usize = 128;
 const MAX_DOCUMENT_NODES: usize = 2_048;
 const MAX_WRAPPERS: usize = 2_048;
@@ -801,9 +802,16 @@ fn capture_stage(
     let process_cpu_us = cpu_before
         .zip(process_cpu_us())
         .map(|(before, after)| after.saturating_sub(before));
+    // Process CPU is the regression bound; wall time only backstops it, since a loaded machine
+    // can stall this process for longer than a frame's budget.
+    let wall_limit_ns = if process_cpu_us.is_some() {
+        MAX_FRAME_WALL_NS * WALL_BACKSTOP_FACTOR
+    } else {
+        MAX_FRAME_WALL_NS
+    };
     assert!(
-        wall_ns <= MAX_FRAME_WALL_NS,
-        "{profile}/{stage} frame took {wall_ns} ns (limit {MAX_FRAME_WALL_NS} ns)"
+        wall_ns <= wall_limit_ns,
+        "{profile}/{stage} frame took {wall_ns} ns (limit {wall_limit_ns} ns)"
     );
     if let Some(cpu_us) = process_cpu_us {
         assert!(
