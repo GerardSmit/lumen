@@ -4121,6 +4121,33 @@ impl<'a, 'f> Tr<'a, 'f> {
         })
     }
 
+    /// An element op whose key at stack index `k` is Boxed: `num` with the key's F64 when it
+    /// holds a Number (`tbl[arr[i]]`), else `other`; the two paths join (see
+    /// [`Tr::merge_paths`]).
+    fn split_boxed_key(
+        &mut self,
+        k: usize,
+        num: impl FnOnce(&mut Self, V),
+        other: impl FnOnce(&mut Self),
+    ) -> Result<(), String> {
+        let tag = self.stack_tag(k);
+        let four = self.i32c(TAG_NUM as i64);
+        let is = self.fb.icmp(IntCC::Eq, tag, four);
+        let (nb, ob) = (self.fb.create_block(), self.fb.create_block());
+        self.fb.brif(is, nb, &[], ob, &[]);
+        let before = self.stack.clone();
+        self.fb.seal_block(ob);
+        self.fb.switch_to_block(ob);
+        other(self);
+        let slow = (self.fb.current_block(), std::mem::replace(&mut self.stack, before));
+        self.fb.seal_block(nb);
+        self.fb.switch_to_block(nb);
+        let key = self.stack_num(k);
+        num(self, key);
+        let fast = (self.fb.current_block(), self.stack.clone());
+        self.merge_paths(vec![fast, slow])
+    }
+
     /// The F64 of entry `e` at index `idx`: unboxed as is, Boxed after a Number tag check that
     /// branches to `slow` otherwise.
     fn num_or_slow(&mut self, e: Entry, idx: usize, slow: Block) -> V {
@@ -4929,31 +4956,41 @@ impl<'a, 'f> Tr<'a, 'f> {
                         Some(src),
                     );
                 }
-                (o @ (Entry::Boxed | Entry::Ref(..)), Entry::Boxed) => {
-                    // A String key on a plain object: a data property natively.
-                    let (obj, consume) = match o {
-                        Entry::Ref(p, _) => (p, 0),
-                        _ => (self.sptr(d - 2), 1),
-                    };
-                    let (kp, dst) = (self.sptr(d - 1), self.sptr(d - 2));
-                    let cv = self.i32c(consume);
-                    let r = self
-                        .call(Helper::ElemGetStr, &[self.frame, obj, kp, dst, cv])
-                        .expect("ElemGetStr returns a flag");
-                    let z = self.i32c(0);
-                    let hit = self.fb.icmp(IntCC::Ne, r, z);
-                    let gen = self.fb.create_block();
-                    let join = self.fb.create_block();
-                    self.fb.brif(hit, join, &[], gen, &[]);
-                    self.fb.seal_block(gen);
-                    self.fb.switch_to_block(gen);
-                    self.generic(pc);
-                    self.fb.jump(join, &[]);
-                    self.fb.seal_block(join);
-                    self.fb.switch_to_block(join);
-                    self.stack.truncate(d - 2);
-                    self.stack.push(Entry::Boxed);
-                }
+                (o @ (Entry::Boxed | Entry::Ref(..)), Entry::Boxed) => self.split_boxed_key(
+                    d - 1,
+                    |t, key| {
+                        let (obj, drop, src) = match o {
+                            Entry::Ref(p, src) => (p, None, Some(src)),
+                            _ => (t.sptr(d - 2), Some(d - 2), None),
+                        };
+                        t.elem_read(pc, obj, key, drop, d - 2, false, Slow::Generic, None, src);
+                    },
+                    |t| {
+                        // A String key on a plain object: a data property natively.
+                        let (obj, consume) = match o {
+                            Entry::Ref(p, _) => (p, 0),
+                            _ => (t.sptr(d - 2), 1),
+                        };
+                        let (kp, dst) = (t.sptr(d - 1), t.sptr(d - 2));
+                        let cv = t.i32c(consume);
+                        let r = t
+                            .call(Helper::ElemGetStr, &[t.frame, obj, kp, dst, cv])
+                            .expect("ElemGetStr returns a flag");
+                        let z = t.i32c(0);
+                        let hit = t.fb.icmp(IntCC::Ne, r, z);
+                        let gen = t.fb.create_block();
+                        let join = t.fb.create_block();
+                        t.fb.brif(hit, join, &[], gen, &[]);
+                        t.fb.seal_block(gen);
+                        t.fb.switch_to_block(gen);
+                        t.generic(pc);
+                        t.fb.jump(join, &[]);
+                        t.fb.seal_block(join);
+                        t.fb.switch_to_block(join);
+                        t.stack.truncate(d - 2);
+                        t.stack.push(Entry::Boxed);
+                    },
+                )?,
                 _ => self.generic(pc),
             },
             // `obj[key](...)`: the element read leaves the receiver in place under the method.
@@ -5107,6 +5144,24 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(Src::Slot(s)),
                         );
                     }
+                    Entry::Boxed => self.split_boxed_key(
+                        d - 1,
+                        |t, key| {
+                            let obj = t.slot_ptr(s as usize);
+                            t.elem_read(
+                                pc,
+                                obj,
+                                key,
+                                None,
+                                d - 1,
+                                false,
+                                Slow::Generic,
+                                None,
+                                Some(Src::Slot(s)),
+                            );
+                        },
+                        |t| t.generic(pc),
+                    )?,
                     _ => self.generic(pc),
                 }
             }
@@ -5172,6 +5227,24 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(Src::Slot(s)),
                         );
                     }
+                    (Entry::Boxed, v @ (Entry::Num(_) | Entry::Boxed)) => self.split_boxed_key(
+                        d - 2,
+                        |t, key| {
+                            let obj = t.slot_ptr(s as usize);
+                            t.elem_write(
+                                pc,
+                                obj,
+                                key,
+                                v,
+                                None,
+                                keep,
+                                d - 2,
+                                Slow::Generic,
+                                Some(Src::Slot(s)),
+                            );
+                        },
+                        |t| t.generic(pc),
+                    )?,
                     _ => self.generic(pc),
                 }
             }

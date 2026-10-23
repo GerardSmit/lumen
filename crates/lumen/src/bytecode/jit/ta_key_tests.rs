@@ -100,3 +100,25 @@ fn typed_array_values_used_as_element_keys() {
         false,
     );
 }
+
+#[test]
+fn boxed_element_keys_split_on_numbers() {
+    // Keys read from a plain array stay Boxed: Numbers take the element fast paths, anything
+    // else the generic one (a typed-array local keeps the key reads unspeculated).
+    agree(
+        r#"(function(){
+          var keys=[0,1,2,'x',-1,1.5,undefined,'length',3,NaN,-0,4294967295,'2',null,true];
+          function run(a,c,k,n){var o=new Uint8Array(n),w=[],s='';
+            for(var m=0;m<n;m++){var j=m%k.length;
+              s+=c[k[j]]+','+a.b[k[j]]+',';
+              w[k[j]]=m;o[m]=c[a.b[m&3]]&255}
+            return s.length+'|'+Object.keys(w).join()+'|'+w.length+'|'+o[5]}
+          var c=[7,8,9,10];c.x='cx';
+          var a={b:new Uint8Array([1,2,3,0])};a.b.x='bx';
+          var r;for(var t=0;t<300;t++)r=run(a,c,keys,60);
+          return r;
+        })()"#,
+        None,
+        true,
+    );
+}

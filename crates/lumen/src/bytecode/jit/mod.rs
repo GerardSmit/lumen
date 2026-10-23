@@ -2375,7 +2375,7 @@ fn enter(
                         chunk.jit.invalidate();
                     }
                 }
-                Some(_) => {}
+                Some(_) => count_exit(chunk, exit_pc, "loop"),
             }
             match (frame.exit_hset as usize)
                 .checked_sub(1)
@@ -2410,29 +2410,35 @@ fn fn_entry_failed(chunk: &Chunk, slots: &[Value], native: &Native) {
     retire_fn(jit, &mut fs);
 }
 
+/// With `LUMEN_JIT_STATS`, report exits that keep happening at one pc of `chunk`.
+fn count_exit(chunk: &Chunk, pc: usize, what: &str) {
+    if !stats_enabled() {
+        return;
+    }
+    thread_local! {
+        static EXITS: RefCell<std::collections::HashMap<(usize, usize), u64>> = RefCell::new(Default::default());
+    }
+    EXITS.with(|e| {
+        let mut e = e.borrow_mut();
+        let c = e.entry((chunk as *const Chunk as usize, pc)).or_default();
+        *c += 1;
+        if c.is_power_of_two() && *c >= 1024 {
+            eprintln!(
+                "[jit-exits] {what} of {} ops exits at {pc} ({:?}; before: {:?}) x{c}",
+                chunk.ops.len(),
+                chunk.ops.get(pc),
+                pc.checked_sub(1).and_then(|q| chunk.ops.get(q))
+            );
+        }
+    });
+}
+
 /// A resume exit of function code at `pc` (the interpreter finishes the call). Exits that keep
 /// happening at one pc widen the slots its op (or the op before, for exits after an op) uses and
 /// recompile; exits no widening can remove (ops the translator leaves to the interpreter) are
 /// just counted.
 fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
-    if stats_enabled() {
-        thread_local! {
-            static EXITS: RefCell<std::collections::HashMap<(usize, usize), u64>> = RefCell::new(Default::default());
-        }
-        EXITS.with(|e| {
-            let mut e = e.borrow_mut();
-            let c = e.entry((chunk as *const Chunk as usize, pc)).or_default();
-            *c += 1;
-            if c.is_power_of_two() && *c >= 1024 {
-                eprintln!(
-                    "[jit-exits] fn of {} ops exits at {pc} ({:?}; before: {:?}) x{c}",
-                    chunk.ops.len(),
-                    chunk.ops.get(pc),
-                    pc.checked_sub(1).and_then(|q| chunk.ops.get(q))
-                );
-            }
-        });
-    }
+    count_exit(chunk, pc, "fn");
     // An `await` always exits (see `build`): nothing to learn from it.
     if matches!(chunk.ops.get(pc), Some(super::Op::Await)) {
         return;
