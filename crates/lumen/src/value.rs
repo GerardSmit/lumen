@@ -652,7 +652,7 @@ impl Clone for Value {
 #[repr(transparent)]
 pub(crate) struct PackedValue(u64);
 
-const PACK_PAYLOAD: u64 = 0x0000_ffff_ffff_ffff;
+pub(crate) const PACK_PAYLOAD: u64 = 0x0000_ffff_ffff_ffff;
 pub(crate) const PACK_UNDEFINED: u64 = 0x7ff9_0000_0000_0000;
 pub(crate) const PACK_EMPTY: u64 = 0x7ffa_0000_0000_0000;
 pub(crate) const PACK_NULL: u64 = 0x7ffb_0000_0000_0000;

@@ -1,7 +1,7 @@
 use super::switch_tests::evaluate;
 use crate::{bytecode::Tier, JitMode};
 
-fn agree(src: &str, expected: Option<&str>, all_compile: bool) -> String {
+pub(super) fn agree(src: &str, expected: Option<&str>, all_compile: bool) -> String {
     let (want, _) = evaluate(src, Tier::Interp, JitMode::Disabled);
     if let Some(e) = expected {
         assert_eq!(want, e, "interpreter");

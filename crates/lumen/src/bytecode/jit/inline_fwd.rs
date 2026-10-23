@@ -19,6 +19,15 @@ use lumen_codegen::{BinaryOp, ConvOp, FloatCC, IntCC, MemKind, Type, Value as V}
 
 /// The `String` static function `cc` forwards its one parameter to, when its body has the shape
 /// of a plain wrapper (see the module docs).
+/// The pc of a forwarding wrapper's `LoadName`: past a directive prologue ('use strict'
+/// compiles to `Const Pop`).
+pub(crate) fn fwd_load_pc(cc: &Chunk) -> usize {
+    match &cc.ops[..] {
+        [Op::Const(_), Op::Pop, ..] => 2,
+        _ => 0,
+    }
+}
+
 pub(super) fn fwd_body(cc: &Chunk) -> Option<StrStatic> {
     if cc.n_params != 1
         || cc.n_slots != 1
@@ -32,11 +41,7 @@ pub(super) fn fwd_body(cc: &Chunk) -> Option<StrStatic> {
     {
         return None;
     }
-    // A directive prologue ('use strict') compiles to `Const Pop`.
-    let ops = match &cc.ops[..] {
-        [Op::Const(_), Op::Pop, rest @ ..] => rest,
-        ops => ops,
-    };
+    let ops = &cc.ops[fwd_load_pc(cc)..];
     let (Op::LoadName(_, c), Op::GetMethod(m, _), Op::LoadLocal(0)) =
         (*ops.first()?, *ops.get(1)?, *ops.get(2)?)
     else {
@@ -209,7 +214,8 @@ impl Tr<'_, '_> {
         self.fb.seal_block(check);
         self.fb.switch_to_block(check);
         let pcv = self.i32c(pc as i64);
-        let g = self.call_status(Helper::WrapGuard, &[self.frame, pcv, cellp]);
+        let probe = self.plan.intr.get(&pc).cloned();
+        let g = self.intr_guard(probe, Helper::WrapGuard, &[self.frame, pcv, cellp]);
         let zero = self.i32c(0);
         let bad = self.fb.icmp(IntCC::Eq, g, zero);
         let retire = self.fb.create_block();

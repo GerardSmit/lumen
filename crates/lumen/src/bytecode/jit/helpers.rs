@@ -2319,6 +2319,24 @@ pub(crate) fn intrinsic_at(i: &Interp, chunk: &Chunk, env: &Env, pc: usize) -> b
     intrinsic_site(i, chunk, env, pc).is_some()
 }
 
+/// What [`intrinsic_site`] resolved at `pc`, as inline guards re-check it: the receiver's shape
+/// id, the entry slot of the method in it, and the intrinsic function object.
+pub(crate) fn intrinsic_probe(
+    i: &Interp,
+    chunk: &Chunk,
+    env: &Env,
+    pc: usize,
+) -> Option<(u32, u32, Value)> {
+    let Op::GetMethod(m, _) = *chunk.ops.get(pc + 1)? else {
+        return None;
+    };
+    let (recv, callee) = intrinsic_site(i, chunk, env, pc)?;
+    let Value::Obj(mo) = &recv else { return None };
+    let mb = mo.try_borrow().ok()?;
+    let slot = mb.props.slot_of(chunk.names.get(m as usize)?)?;
+    Some((mb.props.shape(), u32::try_from(slot).ok()?, callee))
+}
+
 unsafe fn math_check(f: *mut JitFrame, pc: usize) -> Option<()> {
     intrinsic_site(&*(*f).interp, &*(*f).chunk, &*(*f).env, pc).map(|_| ())
 }
@@ -2392,7 +2410,7 @@ pub(crate) unsafe extern "C" fn wrap_guard(
             &*(*f).interp,
             &*(c.chunk as *const Chunk),
             &*(c.env as *const Env),
-            0,
+            super::build::inline_fwd::fwd_load_pc(&*(c.chunk as *const Chunk)),
         )
         .is_some()) as u32
 }

@@ -45,7 +45,7 @@ use super::{PTR, PTR_MEM, TAG_OBJ, TAG_STR, VALUE_PAYLOAD};
 use crate::bytecode::{Chunk, PROP_IC_WAYS};
 use crate::value::{
     Exotic, Object, Property, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, PACK_BIGINT, PACK_BOOL,
-    PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_STR, PACK_SYM, PACK_UNDEFINED,
+    PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_PAYLOAD, PACK_STR, PACK_SYM, PACK_UNDEFINED,
     PROPERTY_META_OFFSET, PROPERTY_PACKED_OFFSET, PROP_ACCESSOR, PROP_PLAIN, PROP_WRITABLE,
 };
 use lumen_codegen::{
@@ -1585,6 +1585,23 @@ pub(crate) fn gc_probe(
     );
     guard(fb, free, miss);
     probe_chain(fb, l, gc, shapes, off, want, slot, miss);
+}
+
+/// [`gc_probe`] on the object a property's NaN-boxed `bits` word (I64) refers to: misses unless
+/// it is an object, then checks it like `gc_probe` (one shape level, no prototype hops).
+pub(crate) fn word_probe(
+    fb: &mut FunctionBuilder,
+    bits: IrValue,
+    shape: u32,
+    slot: u32,
+    want: u64,
+    miss: Block,
+) {
+    let top = bin_imm(fb, BinaryOp::Ushr, Type::I64, bits, 48);
+    let is_obj = cmp_imm(fb, IntCC::Eq, Type::I64, top, TOP_OBJ);
+    guard(fb, is_obj, miss);
+    let gc = bin_imm(fb, BinaryOp::Band, Type::I64, bits, PACK_PAYLOAD as i64);
+    gc_probe(fb, gc, &[shape], slot, want, miss);
 }
 
 /// The address of data entry `slot` (a `PTR` entry number) of the object at `gc` (a live `Gc`

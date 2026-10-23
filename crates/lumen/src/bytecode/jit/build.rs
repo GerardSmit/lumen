@@ -54,7 +54,7 @@ mod call;
 #[path = "inline.rs"]
 mod inline;
 #[path = "inline_fwd.rs"]
-mod inline_fwd;
+pub(super) mod inline_fwd;
 #[path = "inline_this.rs"]
 mod inline_this;
 #[path = "new_plan.rs"]
@@ -1133,6 +1133,9 @@ struct Plan {
     /// [`inline_fwd`]), by call pc: the function and the address of the callee environment the
     /// forwarded read was planned under.
     dfwd: HashMap<usize, (StrStatic, usize)>,
+    /// What an intrinsic site's guard checks inline (see [`IntrProbe`]), by site pc (the
+    /// receiver load; for a folded wrapper, the call pc).
+    intr: HashMap<usize, IntrProbe>,
     /// Property reads resolved to an inlined getter, by op pc.
     dget: HashMap<usize, inline_this::Getter>,
     /// Property stores resolved to an inlined setter, by op pc.
@@ -1175,6 +1178,50 @@ enum Intr {
     Inline(usize),
     /// `String.fromCharCode(x)` / `String.fromCodePoint(x)`.
     StrStatic(StrStatic),
+}
+
+/// An intrinsic site's resolution at plan time, which its guard re-checks inline (no helper call
+/// while it holds): the receiver is read through name cache `cache` (of the wrapper's chunk
+/// under the wrapper's closure environment for a folded wrapper, else of the running chunk), its
+/// ordinary object has shape `shape`, and entry `slot` holds the function object with word
+/// `word` (pinned in [`Plan::pins`], so the address cannot be reused).
+#[derive(Clone)]
+struct IntrProbe {
+    cache: u32,
+    shape: u32,
+    slot: u32,
+    word: u64,
+    wrapper: Option<(std::rc::Rc<Chunk>, usize)>,
+}
+
+fn intr_probe(interp: &Interp, chunk: &Chunk, env: &Env, pc: usize, p: &mut Plan) {
+    let Some(&Op::LoadName(_, cache)) = chunk.ops.get(pc) else {
+        return;
+    };
+    if let Some(probe) = intr_resolve(interp, chunk, env, pc, cache, p) {
+        p.intr.insert(pc, probe);
+    }
+}
+
+fn intr_resolve(
+    interp: &Interp,
+    chunk: &Chunk,
+    env: &Env,
+    pc: usize,
+    cache: u32,
+    p: &mut Plan,
+) -> Option<IntrProbe> {
+    let (shape, slot, f) = helpers::intrinsic_probe(interp, chunk, env, pc)?;
+    let Value::Obj(o) = &f else { return None };
+    let word = crate::value::PACK_OBJ | crate::value::Gc::word(o) as u64;
+    p.pins.push(f);
+    Some(IntrProbe {
+        cache,
+        shape,
+        slot,
+        word,
+        wrapper: None,
+    })
 }
 
 /// An inline call site: `LoadName GetMethod <args> CallWithThis` (`lfc == false`) or
@@ -1385,7 +1432,11 @@ fn plan(
         if let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) {
             let name = chunk.names.get(m as usize)?;
             if let Some(f) = helpers::math_intrinsic(name) {
-                return (args.len() == f.arity() && args.iter().all(|&n| n)).then_some(Site {
+                if args.len() != f.arity() || !args.iter().all(|&n| n) {
+                    return None;
+                }
+                intr_probe(interp, chunk, env, pc, p);
+                return Some(Site {
                     f: Intr::Math(f),
                     call,
                     lfc,
@@ -1394,7 +1445,11 @@ fn plan(
             }
             if let Some(f) = helpers::str_static_intrinsic(name) {
                 if helpers::intrinsic_at(interp, chunk, env, pc) {
-                    return (args.len() == 1 && args[0]).then_some(Site {
+                    if args.len() != 1 || !args[0] {
+                        return None;
+                    }
+                    intr_probe(interp, chunk, env, pc, p);
+                    return Some(Site {
                         f: Intr::StrStatic(f),
                         call,
                         lfc,
@@ -6324,7 +6379,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let e = self.ptrc(self.plan.inl[k].expect as i64);
                 self.call_status(Helper::FastGuard, &[self.frame, pcv, e])
             }
-            _ => self.call_status(Helper::MathGuard, &[self.frame, pcv]),
+            _ => {
+                let probe = self.plan.intr.get(&pc).cloned();
+                self.intr_guard(probe, Helper::MathGuard, &[self.frame, pcv])
+            }
         }
     }
 

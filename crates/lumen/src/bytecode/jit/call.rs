@@ -933,6 +933,15 @@ pub(super) fn plan_direct(
         {
             if let Some(f) = super::inline_fwd::fwd_body(cc) {
                 p.dfwd.insert(q, (f, env_addr));
+                let lp = super::inline_fwd::fwd_load_pc(cc);
+                if let Some(&Op::LoadName(_, c)) = cc.ops.get(lp) {
+                    // SAFETY: `env_addr` is the live callee's closure environment.
+                    let env = unsafe { &*(env_addr as *const crate::interpreter::Env) };
+                    if let Some(mut probe) = intr_resolve(interp, cc, env, lp, c, p) {
+                        probe.wrapper = Some((cc_rc.clone(), env_addr));
+                        p.intr.insert(q, probe);
+                    }
+                }
             }
         }
         p.boxes.push(pin);
@@ -1338,24 +1347,31 @@ impl Tr<'_, '_> {
     /// with a data entry at the cached slot. `None` when the check can't be emitted; else the
     /// address, or a jump to `miss`.
     pub(super) fn glob_entry(&mut self, c: u32, miss: Block) -> Option<V> {
+        let chunk = self.chunk;
+        let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
+        self.glob_entry_in(chunk, envp, c, miss)
+    }
+
+    /// [`Tr::glob_entry`] for name cache `c` of `chunk` read under the environment at `envp`
+    /// (a `*const Env`, the running frame's by default).
+    fn glob_entry_in(&mut self, chunk: &Chunk, envp: V, c: u32, miss: Block) -> Option<V> {
         if cfg!(target_arch = "wasm32") || !cfg!(target_pointer_width = "64") {
             return None;
         }
         let (so, o) = (scope_offs()?, offs()?);
-        let cell = self.chunk.name_caches.get(c as usize)?;
+        let cell = chunk.name_caches.get(c as usize)?;
         let static_path = cell.get().env & 4 != 0;
-        let chain = self.chunk.name_chains.get(c as usize)?;
+        let chain = chunk.name_chains.get(c as usize)?;
         let depth = chain.get().depth as usize;
         if static_path && !(1..=crate::bytecode::STATIC_CHAIN).contains(&depth) {
             return None;
         }
         let icp = self.ptrc(cell as *const _ as usize as i64);
         let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
-        let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
         let rc = self.fb.load(PTR_MEM, envp, 0);
         let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
         if static_path {
-            let anchor = if self.chunk.activation_layout.is_some() {
+            let anchor = if chunk.activation_layout.is_some() {
                 let off = self.ptrc(so.rc_value);
                 let act = self.fb.binary(BinaryOp::Iadd, rc, off);
                 let flag = self.fb.load(PTR_MEM, act, so.borrow);
@@ -1431,6 +1447,49 @@ impl Tr<'_, '_> {
         let shape = self.fb.load(MemKind::I32, icp, so.ic_binding + 4);
         let gp = self.fb.load(PTR_MEM, interp, o.global);
         Some(layout::gc_data_entry(&mut self.fb, gp, shape, slot, miss))
+    }
+
+    /// The I32 guard (nonzero = holds) of an intrinsic site: when `probe` is known, checked
+    /// inline — the receiver read through its name cache (see [`Tr::glob_entry_in`]) is an
+    /// ordinary object of the planned shape whose method slot holds the planned function — and
+    /// else, or when any of that misses, by helper `h` (the full resolution).
+    pub(super) fn intr_guard(&mut self, probe: Option<IntrProbe>, h: Helper, args: &[V]) -> V {
+        let slow = self.fb.create_block();
+        let join = self.fb.create_block();
+        let res = self.fb.append_block_param(join, Type::I32);
+        let inline = match &probe {
+            Some(pr) => {
+                let (chunk, envp) = match &pr.wrapper {
+                    Some((wc, env)) => (&**wc, self.ptrc(*env as i64)),
+                    None => (
+                        self.chunk,
+                        self.fb.load(PTR_MEM, self.frame, FRAME_ENV),
+                    ),
+                };
+                match self.glob_entry_in(chunk, envp, pr.cache, slow) {
+                    Some(p) => {
+                        let bits = layout::entry_word(&mut self.fb, p, 0, slow);
+                        layout::word_probe(&mut self.fb, bits, pr.shape, pr.slot, pr.word, slow);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        };
+        if inline {
+            let one = self.i32c(1);
+            self.fb.jump(join, &[one]);
+        } else {
+            self.fb.jump(slow, &[]);
+        }
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        let g = self.call_status(h, args);
+        self.fb.jump(join, &[g]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+        res
     }
 
     /// The `GetMethod` producing a direct site's callee: validate the lookup inline (exit

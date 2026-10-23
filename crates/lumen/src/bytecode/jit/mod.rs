@@ -749,6 +749,8 @@ mod evict_tests;
 #[cfg(test)]
 mod int32_tests;
 #[cfg(test)]
+mod intrinsic_guard_tests;
+#[cfg(test)]
 mod leak_tests;
 #[cfg(test)]
 mod new_tests;
