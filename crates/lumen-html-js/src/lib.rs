@@ -3205,7 +3205,11 @@ impl DomRealm {
         }
         // Original networking clients retain pending roots after adoption;
         // completion tasks have acquired their own current-owner leases.
-        self.image_request_roots.borrow_mut().retain(|node,_|pending.binary_search_by_key(&node.key(),|pending|pending.key()).is_ok());
+        {
+            let mut roots=self.image_request_roots.borrow_mut();
+            roots.retain(|node,_|pending.binary_search_by_key(&node.key(),|pending|pending.key()).is_ok());
+            lumen_common::fasthash::shrink_sparse(&mut roots);
+        }
         self.images.return_pending_scratch(pending);
         if budget_failed {
             return Err(OpError::new("QuotaExceededError","input image request metadata budget exhausted"));
@@ -4995,9 +4999,10 @@ impl DomRealm {
         wrappers.insert(id, weak);
         if wrappers.len() >= self.sweep_at.get().max(256) {
             wrappers.retain(|_, value| value.upgrade().is_some());
-            self.targets
-                .borrow_mut()
-                .retain(|_, target| target.strong_count() > 0);
+            lumen_common::fasthash::shrink_sparse(&mut wrappers);
+            let mut targets = self.targets.borrow_mut();
+            targets.retain(|_, target| target.strong_count() > 0);
+            lumen_common::fasthash::shrink_sparse(&mut targets);
             self.sweep_at.set(wrappers.len().saturating_mul(2).max(256));
         }
         value
@@ -14309,7 +14314,7 @@ impl RetainedIdentity {
         if empty {ledger.remove(&node);}
         drop(ledger);
         let mut counts=owner.retained_nodes.borrow_mut();
-        if let Some(count)=counts.get_mut(&node) {*count-=1;if *count==0 {counts.remove(&node);}}
+        if let Some(count)=counts.get_mut(&node) {*count-=1;if *count==0 {counts.remove(&node);lumen_common::fasthash::shrink_sparse(&mut counts);}}
         drop(counts);owner.release_detached_nodes([node]);
     }
 }

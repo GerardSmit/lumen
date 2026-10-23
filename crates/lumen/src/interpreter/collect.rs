@@ -824,12 +824,7 @@ impl Interp {
     /// Pointer-keyed side tables keep their peak capacity after a burst of short-lived buffers
     /// or views; give the space back once they are mostly empty.
     fn shrink_side_tables(&mut self) {
-        fn shrink<K: Eq + std::hash::Hash, V>(table: &mut FastMap<K, V>) {
-            let cap = table.capacity();
-            if cap > 1024 && table.len() < cap / 4 {
-                table.shrink_to(table.len() * 2);
-            }
-        }
+        use lumen_common::fasthash::shrink_sparse as shrink;
         shrink(&mut self.array_buffers);
         shrink(&mut self.typed_arrays);
         shrink(&mut self.ta_buffer);
@@ -844,6 +839,10 @@ impl Interp {
         shrink(&mut self.shared_buffers);
         shrink(&mut self.mapped_arguments);
         shrink(&mut self.deferred_ns);
+        shrink(&mut self.module_ns);
+        shrink(&mut self.async_gen_queue);
+        lumen_common::fasthash::shrink_sparse_set(&mut self.async_gens);
+        lumen_common::fasthash::shrink_sparse_set(&mut self.async_gen_busy);
     }
 
     /// Debug: `LUMEN_GC_RETAIN=<bytes>` prints, for every live ArrayBuffer of at least that many

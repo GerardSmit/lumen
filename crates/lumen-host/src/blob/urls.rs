@@ -138,6 +138,7 @@ pub fn revoke_object_urls_for_environment(ctx: &mut Ctx, owner: usize) {
         keep
     });
     registry.bytes = registry.bytes.saturating_sub(removed);
+    lumen_common::fasthash::shrink_sparse(&mut registry.entries);
 }
 
 /// A random token: the host's provider when set, else 128 bits from the operating system.
@@ -235,6 +236,7 @@ pub fn revoke_object_url(ctx: &mut Ctx, id: &str) {
     if !registry.entries.get(&key).is_some_and(|entry| authorized(&entry.environment, &caller)) { return; }
     if let Some(removed) = registry.entries.remove(&key) {
         registry.bytes = registry.bytes.saturating_sub(removed.retained_bytes());
+        lumen_common::fasthash::shrink_sparse(&mut registry.entries);
     }
 }
 

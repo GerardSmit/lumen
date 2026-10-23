@@ -198,6 +198,76 @@ impl BuildHasher for FastBuild {
 pub type FastMap<K, V> = std::collections::HashMap<K, V, FastBuild>;
 pub type FastSet<K> = std::collections::HashSet<K, FastBuild>;
 
+const SHRINK_MIN_CAPACITY: usize = 1024;
+
+fn is_sparse(cap: usize, len: usize) -> bool {
+    cap > SHRINK_MIN_CAPACITY && len < cap / 4
+}
+
+/// Hash tables never give capacity back; release it once a burst has left the table mostly empty.
+/// The check is O(1); shrinking only below a quarter full to twice the length is amortized-safe.
+pub fn shrink_sparse<K: Eq + std::hash::Hash, V, S: BuildHasher>(
+    map: &mut std::collections::HashMap<K, V, S>,
+) {
+    if is_sparse(map.capacity(), map.len()) {
+        map.shrink_to(map.len() * 2);
+    }
+}
+
+pub fn shrink_sparse_set<K: Eq + std::hash::Hash, S: BuildHasher>(
+    set: &mut std::collections::HashSet<K, S>,
+) {
+    if is_sparse(set.capacity(), set.len()) {
+        set.shrink_to(set.len() * 2);
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_map_gives_capacity_back() {
+        let mut m: FastMap<usize, usize> = FastMap::default();
+        for i in 0..20_000 {
+            m.insert(i, i);
+        }
+        let peak = m.capacity();
+        m.retain(|k, _| *k < 100);
+        shrink_sparse(&mut m);
+        assert!(m.capacity() < peak / 8);
+        assert_eq!(m.len(), 100);
+        assert_eq!(m.get(&42), Some(&42));
+    }
+
+    #[test]
+    fn dense_or_small_tables_are_left_alone() {
+        let mut m: FastMap<usize, usize> = (0..2000).map(|i| (i, i)).collect();
+        let cap = m.capacity();
+        shrink_sparse(&mut m);
+        assert_eq!(m.capacity(), cap);
+
+        let mut small: FastMap<usize, usize> = FastMap::default();
+        for i in 0..500 {
+            small.insert(i, i);
+        }
+        small.clear();
+        let cap = small.capacity();
+        shrink_sparse(&mut small);
+        assert_eq!(small.capacity(), cap);
+    }
+
+    #[test]
+    fn sparse_set_gives_capacity_back() {
+        let mut s: FastSet<usize> = (0..20_000).collect();
+        let peak = s.capacity();
+        s.retain(|k| *k < 10);
+        shrink_sparse_set(&mut s);
+        assert!(s.capacity() < peak / 8);
+        assert_eq!(s.len(), 10);
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod tests {
     use super::*;

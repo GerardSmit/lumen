@@ -111,6 +111,7 @@ impl Interp {
     pub(crate) fn weak_checkpoint(&mut self) -> bool {
         if !self.weak.kept.is_empty() {
             self.weak.kept.clear();
+            lumen_common::fasthash::shrink_sparse(&mut self.weak.kept);
         }
         if !self.weak.scan_due {
             return false;
@@ -143,6 +144,8 @@ impl Interp {
             });
             !reg.cells.is_empty()
         });
+        lumen_common::fasthash::shrink_sparse(&mut self.weak.refs);
+        lumen_common::fasthash::shrink_sparse(&mut self.weak.registries);
         let mut queued = false;
         for (handler, held) in due {
             if !handler.is_callable() {

@@ -3923,10 +3923,7 @@ fn sweep(i: &mut Interp) -> usize {
         drop_later.extend(t.map.remove(k));
     }
     t.sweep_at = t.map.len() * 2;
-    let capacity = t.map.capacity();
-    if capacity > 1024 && t.map.len() < capacity / 4 {
-        t.map.shrink_to(t.map.len() * 2);
-    }
+    lumen_common::fasthash::shrink_sparse(&mut t.map);
     // Rust destructors run outside the table borrow.
     drop(drop_later);
     dead.len()
@@ -4880,6 +4877,7 @@ impl Interp {
         let cache = self.host_state.get_mut::<IdentityCache<T, K>>().unwrap();
         if cache.map.len() >= cache.sweep_at {
             cache.map.retain(|_, value| value.upgrade().is_some());
+            lumen_common::fasthash::shrink_sparse(&mut cache.map);
             cache.sweep_at = cache.map.len().saturating_mul(2).max(256);
         }
         cache.map.insert(key, weak);

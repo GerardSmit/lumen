@@ -275,7 +275,7 @@ impl ImageLoader {
             if next!=request.auto_width {request.auto_width=next;request.environment_dirty=true;self.mark_dirty(Some(node));self.mark_scan_needed();}
             if next.is_none()&&!lumen_html::responsive_images::allows_auto_sizes(session.document(),node){dropped.push(node);}
         }
-        if !dropped.is_empty(){let mut auto_nodes=self.auto_nodes.borrow_mut();for node in dropped{auto_nodes.remove(&node);}}
+        if !dropped.is_empty(){let mut auto_nodes=self.auto_nodes.borrow_mut();for node in dropped{auto_nodes.remove(&node);}lumen_common::fasthash::shrink_sparse_set(&mut auto_nodes);}
         self.auto_inputs_epoch.set(Some((session.document().version(),session.frame_id(),self.requests.borrow().len(),self.tree_generation.get())));
     }
     /// Drops the state of nodes the document has freed. Discovery only prunes when the tree
@@ -286,7 +286,7 @@ impl ImageLoader {
         let before=requests.len();
         requests.retain(|&node,_|document.kind(node).is_ok());
         if requests.len()==before{return}
-        if requests.capacity()>1024&&requests.len()<requests.capacity()/4{let target=requests.len()*2;requests.shrink_to(target);}
+        lumen_common::fasthash::shrink_sparse(&mut requests);
         drop(requests);
         self.active.borrow_mut().retain(|&node|document.kind(node).is_ok());
         self.auto_nodes.borrow_mut().retain(|&node|document.kind(node).is_ok());
@@ -830,6 +830,7 @@ impl ImageLoader {
                 for node in discovery.stale.drain(..) {
                     requests.remove(&node);
                 }
+                lumen_common::fasthash::shrink_sparse(&mut requests);
             }
             let base_changed=discovery.base!=base;
             let mut requests=self.requests.borrow_mut();
