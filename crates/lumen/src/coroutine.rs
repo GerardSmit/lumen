@@ -139,12 +139,12 @@ impl Coroutine {
             } else { None }
         } else { None };
         let pushed = i.enter_resume_frame(frame, started);
-        let s = match self {
+        let s = i.with_script_entry(|i| match self {
             Coroutine::Thread(c) => c.resume(i, signal),
             Coroutine::Vm(c) => c.resume(i, signal),
             #[cfg(feature = "aot-native")]
             Coroutine::Native(c) => c.resume(i, signal),
-        };
+        });
         i.leave_resume_frame(pushed);
         if let Some(saved) = saved_realm { i.restore_realm(&saved); }
         s
