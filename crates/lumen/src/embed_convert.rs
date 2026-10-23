@@ -843,7 +843,7 @@ impl<'s> ArgCx<'s> {
     #[inline(never)]
     fn view_shared(&self, v: &Value, ty: TypeId) -> Option<*const dyn Any> {
         let entry = host_entry(self.interp(), v)?;
-        let (ptr, guard) = (entry.view_ref)(&entry.data, ty).ok()?;
+        let (ptr, guard) = (entry.vtable.view_ref)(&entry.data, ty).ok()?;
         self.retain_class_guard(guard);
         Some(ptr)
     }
@@ -851,7 +851,7 @@ impl<'s> ArgCx<'s> {
     #[inline(never)]
     fn view_exclusive(&self, v: &Value, ty: TypeId) -> Option<*mut dyn Any> {
         let entry = host_entry(self.interp(), v)?;
-        let (ptr, guard) = (entry.view_mut)(&entry.data, ty).ok()?;
+        let (ptr, guard) = (entry.vtable.view_mut)(&entry.data, ty).ok()?;
         self.retain_class_guard(guard);
         Some(ptr)
     }
@@ -2729,6 +2729,30 @@ pub trait NativeIdentityOwner: Class {
 struct HostEntry {
     _weak: WeakGc,
     data: Rc<dyn Any>,
+    vtable: &'static HostVtable,
+    rare: Option<Box<HostRare>>,
+    identity: bool,
+    callbacks_retained: bool,
+}
+
+const _: () = assert!(std::mem::size_of::<HostEntry>() <= 48);
+
+type ViewRef = fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, ClassBorrowGuard), ()>;
+type ViewMut = fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuard), ()>;
+
+struct HostVtable {
+    view_ref: ViewRef,
+    view_mut: ViewMut,
+}
+
+struct VtableOf<T>(std::marker::PhantomData<T>);
+
+impl<T: Class> VtableOf<T> {
+    const V: HostVtable = HostVtable { view_ref: view_ref::<T>, view_mut: view_mut::<T> };
+}
+
+#[derive(Default)]
+struct HostRare {
     /// The exact engine-created Proxy identity used for this instance's indexed wrapper, if any.
     /// It grants native receiver branding only to that wrapper, never to author Proxies. The weak
     /// handle avoids retaining the wrapper or allowing a stale pointer key to alias a new object.
@@ -2736,12 +2760,54 @@ struct HostEntry {
     indexed_read: Option<IndexedRead>,
     indexed_index_of: Option<NativeFn>,
     retained: Option<Value>,
-    identity: bool,
-    callbacks_retained: bool,
     identity_owner: Option<fn(&HostEntry, u64, &mut dyn FnMut(&Value))>,
     native_values: Option<fn(&HostEntry, &mut dyn FnMut(&Value))>,
-    view_ref: fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, ClassBorrowGuard), ()>,
-    view_mut: fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuard), ()>,
+}
+
+impl HostEntry {
+    fn rare_mut(&mut self) -> &mut HostRare {
+        self.rare.get_or_insert_with(Default::default)
+    }
+
+    fn indexed_wrapper(&self) -> Option<&WeakGc> {
+        self.rare.as_ref()?.indexed_wrapper.as_ref()
+    }
+
+    fn indexed_read(&self) -> Option<&IndexedRead> {
+        self.rare.as_ref()?.indexed_read.as_ref()
+    }
+
+    fn indexed_index_of(&self) -> Option<NativeFn> {
+        self.rare.as_ref()?.indexed_index_of
+    }
+
+    fn retained(&self) -> Option<&Value> {
+        self.rare.as_ref()?.retained.as_ref()
+    }
+
+    fn set_retained(&mut self, value: Option<Value>) {
+        match (&mut self.rare, value) {
+            (Some(rare), value) => rare.retained = value,
+            (None, Some(value)) => self.rare_mut().retained = Some(value),
+            (None, None) => {}
+        }
+    }
+
+    fn identity_owner(&self) -> Option<fn(&HostEntry, u64, &mut dyn FnMut(&Value))> {
+        self.rare.as_ref()?.identity_owner
+    }
+
+    fn native_values(&self) -> Option<fn(&HostEntry, &mut dyn FnMut(&Value))> {
+        self.rare.as_ref()?.native_values
+    }
+
+    fn clear_dead_indexed_wrapper(&mut self) {
+        if let Some(rare) = &mut self.rare {
+            if rare.indexed_wrapper.as_ref().is_some_and(|wrapper| wrapper.strong_count() == 0) {
+                rare.indexed_wrapper = None;
+            }
+        }
+    }
 }
 
 struct IndexedRead {
@@ -2762,8 +2828,7 @@ fn host_entry_key(i: &Interp, v: &Value) -> Option<usize> {
         let target_key = Gc::as_ptr(target) as usize;
         let entry = objects.map.get(&target_key)?;
         let trusted_wrapper = entry
-            .indexed_wrapper
-            .as_ref()
+            .indexed_wrapper()
             .and_then(WeakGc::upgrade)
             .is_some_and(|registered| Gc::ptr_eq(&registered, object));
         return trusted_wrapper.then_some(target_key);
@@ -2800,8 +2865,7 @@ fn host_entry_key_checked(i: &mut Interp, v: &Value) -> Result<Option<usize>, Va
             return Ok(None);
         };
         let trusted_wrapper = entry
-            .indexed_wrapper
-            .as_ref()
+            .indexed_wrapper()
             .and_then(WeakGc::upgrade)
             .is_some_and(|registered| Gc::ptr_eq(&registered, object));
         return Ok(trusted_wrapper.then_some(target_key));
@@ -2903,8 +2967,7 @@ struct ErasedInstance {
     desc: &'static ClassDesc,
     ty: TypeId,
     data: Rc<dyn Any>,
-    view_ref: fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, ClassBorrowGuard), ()>,
-    view_mut: fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, ClassBorrowGuard), ()>,
+    vtable: &'static HostVtable,
 }
 
 impl ErasedInstance {
@@ -2914,8 +2977,7 @@ impl ErasedInstance {
             desc: T::DESC,
             ty: TypeId::of::<T>(),
             data: Rc::new(RefCell::new(value)),
-            view_ref: view_ref::<T>,
-            view_mut: view_mut::<T>,
+            vtable: &VtableOf::<T>::V,
         }
     }
 }
@@ -2937,7 +2999,7 @@ fn new_instance(i: &mut Interp, instance: ErasedInstance, proto: Gc) -> Value {
             .unwrap_or_else(|_| panic!("native indexed wrapper"));
         register_indexed_wrapper(i, &target, &wrapper);
         let key = host_entry_key(i, &wrapper).expect("registered indexed wrapper");
-        host_objects(i).map.get_mut(&key).expect("indexed host entry").indexed_index_of = index_of;
+        host_objects(i).map.get_mut(&key).expect("indexed host entry").rare_mut().indexed_index_of = index_of;
         wrapper
     } else {
         target
@@ -2971,11 +3033,12 @@ fn register_indexed_wrapper(i: &mut Interp, target: &Value, wrapper: &Value) {
         .get_mut(&target_key)
         .expect("indexed native target has a host entry");
     assert!(
-        entry.indexed_wrapper.is_none(),
+        entry.indexed_wrapper().is_none(),
         "native instance already has its indexed wrapper"
     );
-    entry.indexed_wrapper = Some(Gc::downgrade(wrapper));
-    entry.indexed_read = indexed_read;
+    let rare = entry.rare_mut();
+    rare.indexed_wrapper = Some(Gc::downgrade(wrapper));
+    rare.indexed_read = indexed_read;
 }
 
 /// Read the exact engine-created indexed wrapper without dispatching its
@@ -2986,10 +3049,10 @@ pub(crate) fn indexed_wrapper_get(
 ) -> Option<Result<Value,Abrupt>> {
     let target_object=target.as_obj()?;
     let entry=i.host_state.get::<HostObjects>()?.map.get(&(Gc::as_ptr(target_object) as usize))?;
-    if !entry.indexed_wrapper.as_ref()?.upgrade().is_some_and(|registered|Gc::ptr_eq(&registered,wrapper)) {
+    if !entry.indexed_wrapper()?.upgrade().is_some_and(|registered|Gc::ptr_eq(&registered,wrapper)) {
         return None;
     }
-    let read=entry.indexed_read.as_ref()?;
+    let read=entry.indexed_read()?;
     let trap=read.trap.upgrade()?;
     let item=read.item.upgrade()?;
     let unchanged=handler.as_obj().is_some_and(|handler|handler.borrow().props.get("get")
@@ -3020,7 +3083,7 @@ pub(crate) fn indexed_index_of(
     if !i.proxies.contains_key(&(Gc::as_ptr(object) as usize)) { return Ok(None); }
     let Some(key) = host_entry_key(i, receiver) else { return Ok(None); };
     let Some(hook) = i.host_state.get::<HostObjects>().and_then(|objects| objects.map.get(&key))
-        .and_then(|entry| entry.indexed_index_of) else { return Ok(None); };
+        .and_then(|entry| entry.indexed_index_of()) else { return Ok(None); };
     let result = hook(i, receiver.clone(), &[target.clone(), Value::Num(from as f64), Value::Num(len as f64)])?;
     Ok((!matches!(result, Value::Undefined)).then_some(result))
 }
@@ -3236,26 +3299,21 @@ pub(crate) fn retain_host_identities(i: &mut Interp) {
         return;
     };
     for entry in objects.map.values_mut() {
-        if entry
-            .indexed_wrapper
-            .as_ref()
-            .is_some_and(|wrapper| wrapper.strong_count() == 0)
-        {
-            entry.indexed_wrapper = None;
-        }
-        if entry.identity || entry.callbacks_retained || entry.identity_owner.is_some() {
+        entry.clear_dead_indexed_wrapper();
+        let owned = entry.identity_owner().is_some();
+        if entry.identity || entry.callbacks_retained || owned {
             let value = entry._weak.upgrade().map(Value::Obj);
-            let expando = entry.identity_owner.is_none()
+            let expando = !owned
                 && value.as_ref().is_some_and(|value| {
                     value
                         .as_obj()
                         .is_some_and(|obj| obj.borrow().props.iter().next().is_some())
                 });
-            entry.retained = if entry.callbacks_retained || expando || entry.identity_owner.is_some() {
+            entry.set_retained(if entry.callbacks_retained || expando || owned {
                 value
             } else {
                 None
-            };
+            });
         }
     }
 }
@@ -3266,7 +3324,7 @@ pub(crate) fn host_identity_owner_keys(i: &Interp, out: &mut Vec<usize>) {
     if let Some(objects) = i.host_state.get::<HostObjects>() {
         out.extend(
             objects.map.iter()
-                .filter(|(_, entry)| entry.identity_owner.is_some() || entry.native_values.is_some())
+                .filter(|(_, entry)| entry.identity_owner().is_some() || entry.native_values().is_some())
                 .map(|(key, _)| *key),
         );
     }
@@ -3284,14 +3342,14 @@ pub(crate) fn count_host_identity_owner_pins(
         return;
     };
     for entry in owners.iter().filter_map(|key| objects.map.get(key)) {
-        if entry.identity_owner.is_some()
-            && (!entry.callbacks_retained || entry.native_values.is_some())
+        if entry.identity_owner().is_some()
+            && (!entry.callbacks_retained || entry.native_values().is_some())
         {
-            if let Some(value) = &entry.retained {
+            if let Some(value) = entry.retained() {
                 visit(value);
             }
         }
-        if let Some(trace) = entry.native_values {
+        if let Some(trace) = entry.native_values() {
             trace(entry, visit);
         }
     }
@@ -3301,10 +3359,10 @@ pub(crate) fn sweep_host_identity_owner_pin(i: &mut Interp, pointer: usize) {
     if let Some(entry) = i.host_state.get_mut::<HostObjects>()
         .and_then(|objects| objects.map.get_mut(&pointer))
     {
-        if entry.identity_owner.is_some()
-            && (!entry.callbacks_retained || entry.native_values.is_some())
+        if entry.identity_owner().is_some()
+            && (!entry.callbacks_retained || entry.native_values().is_some())
         {
-            entry.retained = None;
+            entry.set_retained(None);
         }
     }
 }
@@ -3322,7 +3380,7 @@ fn trace_native_values<T: NativeIdentityOwner>(entry: &HostEntry, visit: &mut dy
 }
 
 fn with_identity_owner<T: NativeIdentityOwner>(entry: &HostEntry, visit: impl FnOnce(&T)) {
-    let (pointer, guard) = (entry.view_ref)(&entry.data, TypeId::of::<T>())
+    let (pointer, guard) = (entry.vtable.view_ref)(&entry.data, TypeId::of::<T>())
         .expect("native identity owner projection is available during GC");
     // SAFETY: the native projection is immutable and its guard stays alive
     // through the trace, as in Ctx::with_instance.
@@ -3345,11 +3403,11 @@ pub(crate) fn trace_host_identity_owner(
     else {
         return;
     };
-    if let Some(trace) = entry.identity_owner {
+    if let Some(trace) = entry.identity_owner() {
         let epoch = crate::interpreter::GC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         trace(entry, epoch as u64, visit);
     }
-    if let Some(trace) = entry.native_values {
+    if let Some(trace) = entry.native_values() {
         trace(entry, visit);
     }
 }
@@ -3364,7 +3422,7 @@ pub(crate) fn retain_identity_receiver(i: &mut Interp, value: &Value) {
         .and_then(|objects| objects.map.get_mut(&key))
     {
         if entry.identity {
-            entry.retained = Some(value.clone());
+            entry.set_retained(Some(value.clone()));
         }
     }
 }
@@ -3492,8 +3550,7 @@ fn is_indexed_wrapper_receiver(i: &Interp, target: &Value, receiver: &Value) -> 
         return false;
     };
     entry
-        .indexed_wrapper
-        .as_ref()
+        .indexed_wrapper()
         .and_then(WeakGc::upgrade)
         .is_some_and(|wrapper| Gc::ptr_eq(&wrapper, receiver))
 }
@@ -3887,16 +3944,10 @@ fn attach_instance(i: &mut Interp, obj: &Gc, instance: ErasedInstance) {
         HostEntry {
             _weak: Gc::downgrade(obj),
             data: instance.data,
-            indexed_wrapper: None,
-            indexed_read: None,
-            indexed_index_of: None,
-            retained: None,
+            vtable: instance.vtable,
+            rare: None,
             identity: false,
             callbacks_retained: false,
-            identity_owner: None,
-            native_values: None,
-            view_ref: instance.view_ref,
-            view_mut: instance.view_mut,
         },
     );
 }
@@ -3904,13 +3955,7 @@ fn attach_instance(i: &mut Interp, obj: &Gc, instance: ErasedInstance) {
 fn sweep(i: &mut Interp) -> usize {
     let t = host_objects(i);
     for entry in t.map.values_mut() {
-        if entry
-            .indexed_wrapper
-            .as_ref()
-            .is_some_and(|wrapper| wrapper.strong_count() == 0)
-        {
-            entry.indexed_wrapper = None;
-        }
+        entry.clear_dead_indexed_wrapper();
     }
     let dead: Vec<usize> = t
         .map
@@ -4756,7 +4801,7 @@ impl Interp {
 
     fn check_instance(&mut self, value: &Value, ty: TypeId) -> OpResult<()> {
         let entry = self.instance_entry(value)?;
-        (entry.view_ref)(&entry.data, ty).map(drop).map_err(|_| wrong_instance())
+        (entry.vtable.view_ref)(&entry.data, ty).map(drop).map_err(|_| wrong_instance())
     }
 
     /// Read a native instance or one of its embedded base classes.
@@ -4767,7 +4812,7 @@ impl Interp {
     ) -> OpResult<R> {
         let entry = self.instance_entry(value)?;
         let (pointer, guard) =
-            (entry.view_ref)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
+            (entry.vtable.view_ref)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
         let data = unsafe { &*pointer }
             .downcast_ref::<T>()
             .expect("matching native projection");
@@ -4784,7 +4829,7 @@ impl Interp {
     ) -> OpResult<R> {
         let entry = self.instance_entry(value)?;
         let (pointer, guard) =
-            (entry.view_mut)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
+            (entry.vtable.view_mut)(&entry.data, TypeId::of::<T>()).map_err(|_| wrong_instance())?;
         let data = unsafe { &mut *pointer }
             .downcast_mut::<T>()
             .expect("matching mutable native projection");
@@ -4800,7 +4845,8 @@ impl Interp {
         };
         if let Some(entry) = host_objects(self).map.get_mut(&key) {
             entry.callbacks_retained = retained;
-            entry.retained = (retained || entry.identity_owner.is_some()).then(|| v.clone());
+            let keep = retained || entry.identity_owner().is_some();
+            entry.set_retained(keep.then(|| v.clone()));
         }
     }
 
@@ -4817,9 +4863,10 @@ impl Interp {
             .map
             .get_mut(&key)
             .expect("validated native identity owner entry exists");
-        entry.identity_owner = Some(trace_identity_owner::<T>);
-        entry.native_values = T::TRACES_NATIVE_VALUES.then_some(trace_native_values::<T>);
-        entry.retained = Some(value.clone());
+        let rare = entry.rare_mut();
+        rare.identity_owner = Some(trace_identity_owner::<T>);
+        rare.native_values = T::TRACES_NATIVE_VALUES.then_some(trace_native_values::<T>);
+        rare.retained = Some(value.clone());
         Ok(())
     }
 
@@ -4831,7 +4878,7 @@ impl Interp {
     ) -> OpResult<()> {
         let owned = host_entry_key(self, value)
             .and_then(|key| host_objects(self).map.get(&key))
-            .is_some_and(|entry| entry.identity_owner.is_some());
+            .is_some_and(|entry| entry.identity_owner().is_some());
         if owned {
             return Ok(());
         }
