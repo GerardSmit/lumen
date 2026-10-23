@@ -18,8 +18,9 @@ enum Piece {
     Shared(Bytes),
 }
 
-/// Buffers smaller than this are copied: the shared store would cost about as much.
-const SHARE_MIN: usize = 4096;
+/// Buffers smaller than this are copied: the shared store would cost about as much. Views
+/// covering under half of their buffer are copied too, so a sliver never pins a large buffer.
+const SHARE_MIN: usize = 256;
 
 fn read_piece(ctx: &mut Ctx, element: Value) -> OpResult<Piece> {
     if matches!(element, Value::Obj(_)) {
@@ -28,7 +29,9 @@ fn read_piece(ctx: &mut Ctx, element: Value) -> OpResult<Piece> {
         }
         if ctx.with_buffer_source_bytes(&element, <[u8]>::len).is_some_and(|len| len >= SHARE_MIN) {
             if let Some((snapshot, start, end)) = ctx.buffer_source_snapshot(&element) {
-                return Ok(Piece::Shared(Bytes::from_snapshot(snapshot, start, end)));
+                if (end - start) * 2 >= snapshot.len() {
+                    return Ok(Piece::Shared(Bytes::from_snapshot(snapshot, start, end)));
+                }
             }
         }
         let copy = {
