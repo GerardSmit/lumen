@@ -45,6 +45,10 @@ fn optimize_impl(func: &mut Function, unroll: bool) {
         cfg = None;
         dirty = true;
     }
+    if crate::version::version_loops(func) {
+        cfg = None;
+        dirty = true;
+    }
     dirty |= forward_loads(func, &mut cfg);
     // Parameters simplified away or loads forwarded can expose constant branch conditions.
     if dirty {

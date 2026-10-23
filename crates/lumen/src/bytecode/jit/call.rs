@@ -1302,8 +1302,10 @@ impl Tr<'_, '_> {
         // The name cache's scope mode, inline: the cache names this frame's scope, the scope's
         // map is structurally unchanged since the fill (so the binding pointer is live), and
         // the binding holds the function.
+        let mut inline = false;
         match (scope_offs(), self.chunk.name_caches.get(c as usize)) {
             (Some(so), Some(cell)) if !cfg!(target_arch = "wasm32") => {
+                inline = true;
                 let icp = self.ptrc(cell as *const _ as usize as i64);
                 let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
                 let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
@@ -1363,6 +1365,9 @@ impl Tr<'_, '_> {
         }
         self.fb.seal_block(full);
         self.fb.switch_to_block(full);
+        if inline {
+            self.fb.mark_cold();
+        }
         let (nv, cv) = (self.i32c(n as i64), self.i32c(c as i64));
         let w = self
             .call(Helper::NameWord, &[self.frame, nv, cv])
@@ -2010,13 +2015,13 @@ impl Tr<'_, '_> {
         let ok = self.fb.icmp(IntCC::Ult, depth, lim);
         self.guard_to(ok, slow);
         let sh = self.fb.load(PTR_MEM, self.frame, FRAME_SHADOW);
-        let top0 = self.fb.load(PTR_MEM, sh, SHADOW_TOP);
+        let top0 = self.fb.load_with(PTR_MEM, sh, SHADOW_TOP, mem::shadow_hdr());
         // (Patched once the body is translated, see `inline_run`.)
         let size = self.fb.iconst_unique(PTR, 0);
         let sv = self.ptrc(INLINE_SAVE as i64);
         let rec = self.fb.binary(BinaryOp::Iadd, top0, sv);
         let ntop = self.fb.binary(BinaryOp::Iadd, rec, size);
-        let end = self.fb.load(PTR_MEM, sh, SHADOW_END);
+        let end = self.fb.load_with(PTR_MEM, sh, SHADOW_END, mem::shadow_hdr());
         let ok = self.fb.icmp(IntCC::Ule, ntop, end);
         self.guard_to(ok, slow);
 
@@ -2081,6 +2086,7 @@ impl Tr<'_, '_> {
         // the others take their arguments.
         let seed = argc.min(site.n_params);
         let mut args: Vec<Entry> = Vec::with_capacity(seed);
+        let mut seeds = Vec::new();
         for k in 0..site.n_slots {
             let off = k as i32 * VALUE_SIZE;
             let kind = kinds.get(k).copied().unwrap_or(Kind::Boxed);
@@ -2121,8 +2127,8 @@ impl Tr<'_, '_> {
                         _ => unreachable!("unboxed above"),
                     };
                     let t = self.i32c(tag as i64);
-                    self.fb.store(MemKind::I32U8, slots_p, t, off);
-                    self.fb.store(mk, slots_p, v, off + o2);
+                    seeds.push((slots_p, off, MemKind::I32U8, t));
+                    seeds.push((slots_p, off + o2, mk, v));
                 }
                 args.push(a);
                 continue;
@@ -2170,6 +2176,7 @@ impl Tr<'_, '_> {
         });
         let info_p = &*info as *const Frameless;
         self.ginl.keep(info);
+        self.ginl.fl_seeds.push((info_p as usize, seeds));
         let committed = self.fb.declare_var(Type::I32);
         self.fb.def_var(committed, z);
         let fl = FlCx {
@@ -2511,7 +2518,7 @@ impl Tr<'_, '_> {
         self.guard_to(ok, slow);
         let sh = self.fb.load(PTR_MEM, self.frame, FRAME_SHADOW);
         // A `new` keeps its instance in the 16 bytes below the callee frame.
-        let top0 = self.fb.load(PTR_MEM, sh, SHADOW_TOP);
+        let top0 = self.fb.load_with(PTR_MEM, sh, SHADOW_TOP, mem::shadow_hdr());
         let top = if construct {
             let k = self.ptrc(VALUE_SIZE as i64);
             self.fb.binary(BinaryOp::Iadd, top0, k)
@@ -2530,7 +2537,7 @@ impl Tr<'_, '_> {
             self.fb.load(PTR_MEM, cp, CHUNK_DSIZE as i32)
         };
         let ntop = self.fb.binary(BinaryOp::Iadd, top, size);
-        let end = self.fb.load(PTR_MEM, sh, SHADOW_END);
+        let end = self.fb.load_with(PTR_MEM, sh, SHADOW_END, mem::shadow_hdr());
         let ok = self.fb.icmp(IntCC::Ule, ntop, end);
         self.guard_to(ok, slow);
         // The receiver's address (`this` of the callee).
@@ -2590,7 +2597,7 @@ impl Tr<'_, '_> {
         self.fb.store(MemKind::I32U8, interp, strict, o.strict);
         self.fb.store(MemKind::I32U8, interp, strict, o.tco);
         self.fb.store(MemKind::I32U8, interp, z, o.ctor);
-        self.fb.store(PTR_MEM, sh, ntop, SHADOW_TOP);
+        self.fb.store_with(PTR_MEM, sh, ntop, SHADOW_TOP, mem::shadow_hdr());
         if construct {
             self.call(Helper::NewThis, &[self.frame, cellp, top0]);
         }
@@ -2801,7 +2808,7 @@ impl Tr<'_, '_> {
                 off += 16;
             }
         }
-        self.fb.store(PTR_MEM, sh, top0, SHADOW_TOP);
+        self.fb.store_with(PTR_MEM, sh, top0, SHADOW_TOP, mem::shadow_hdr());
         if let Some((nt_tag, nt_bool, nt_word, fi, agb)) = marks {
             // (The callee left `new.target` `undefined`: a `new` it made took its own back.)
             self.fb.store(MemKind::I32U8, interp, nt_tag, o.new_target);

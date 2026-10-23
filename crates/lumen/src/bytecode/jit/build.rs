@@ -952,6 +952,7 @@ fn build_unit(
             }
         }
         ginl.finish(&mut pins, &mut boxes, &mut externs);
+        mem::classify(&mut func);
         max_stack
     };
     Ok(Built {
@@ -2602,7 +2603,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             ),
         ) {
             let nf = self.frame;
-            self.fl_commit(fl, nf);
+            self.fl_commit(fl, nf, true);
         }
         let f = self.helper(h);
         self.fb.call_fn(f, args).first().copied()
@@ -3028,13 +3029,13 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// Take a reference on the object or string at `gc` (its `u32` strong count at `so`); a
     /// saturated count stays put.
     fn retain_inline(&mut self, gc: V, so: i32) {
-        let strong = self.fb.load(MemKind::I32, gc, so);
+        let strong = self.fb.load_with(MemKind::I32, gc, so, mem::rc());
         let one = self.i32c(1);
         let s1 = self.fb.binary(BinaryOp::Iadd, strong, one);
         let zero = self.i32c(0);
         let wrapped = self.fb.icmp(IntCC::Eq, s1, zero);
         let kept = self.fb.select(wrapped, strong, s1);
-        self.fb.store(MemKind::I32, gc, kept, so);
+        self.fb.store_with(MemKind::I32, gc, kept, so, mem::rc());
     }
 
     /// [`Tr::drop_at`] for the `Value` at `base + o` (a frame slot or stack entry).
@@ -3063,10 +3064,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         };
         self.fb.brif(counted, obj_b, &[], call_b, &[]);
         self.fb.seal_block(obj_b);
+        let last_b = self.fb.create_block();
         self.fb.switch_to_block(obj_b);
         let gc = self.fb.load(PTR_MEM, base, o + VALUE_PAYLOAD);
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-        let strong = self.fb.load(MemKind::I32, gc, so);
+        let strong = self.fb.load_with(MemKind::I32, gc, so, mem::rc());
         // Slow for the last reference (0 / 1) and for a saturated count (`u32::MAX`, which
         // never changes): all three sit at the top of the range after subtracting 2.
         let two = self.i32c(2);
@@ -3079,30 +3081,39 @@ impl<'a, 'f> Tr<'a, 'f> {
         // out.
         let zero = self.i32c(0);
         let is2 = self.fb.icmp(IntCC::Eq, s2, zero);
-        let w = self
-            .fb
-            .load(MemKind::I32, gc, crate::value::GC_WEAK_OFFSET as i32);
+        let w = self.fb.load_with(
+            MemKind::I32,
+            gc,
+            crate::value::GC_WEAK_OFFSET as i32,
+            mem::rc(),
+        );
         let flag = self.i32c(crate::value::FN_PAIR_FLAG as i64);
         let fl = self.fb.binary(BinaryOp::Band, w, flag);
         let paired = self.fb.icmp(IntCC::Ne, fl, zero);
         let maybe = self.fb.binary(BinaryOp::Band, is2, is_obj);
         let pair = self.fb.binary(BinaryOp::Band, maybe, paired);
         let slow = self.fb.binary(BinaryOp::Bor, last, pair);
-        self.fb.brif(slow, call_b, &[], dec_b, &[]);
+        self.fb.brif(slow, last_b, &[], dec_b, &[]);
         self.fb.seal_block(dec_b);
+        self.fb.seal_block(last_b);
         self.fb.seal_block(call_b);
         self.fb.switch_to_block(dec_b);
         let one = self.i32c(1);
         let s1 = self.fb.binary(BinaryOp::Isub, strong, one);
-        self.fb.store(MemKind::I32, gc, s1, so);
+        self.fb.store_with(MemKind::I32, gc, s1, so, mem::rc());
         let u = self.i32c(TAG_UNDEFINED as i64);
         self.fb.store(MemKind::I32U8, base, u, o);
         self.fb.jump(cont, &[]);
-        self.fb.switch_to_block(call_b);
-        let oc = self.ptrc(o as i64);
-        let p = self.fb.binary(BinaryOp::Iadd, base, oc);
-        self.call(Helper::Drop, &[p]);
-        self.fb.jump(cont, &[]);
+        for b in [last_b, call_b] {
+            self.fb.switch_to_block(b);
+            if b == last_b {
+                self.fb.mark_cold();
+            }
+            let oc = self.ptrc(o as i64);
+            let p = self.fb.binary(BinaryOp::Iadd, base, oc);
+            self.call(Helper::Drop, &[p]);
+            self.fb.jump(cont, &[]);
+        }
         self.fb.seal_block(cont);
         self.fb.switch_to_block(cont);
     }
@@ -3538,6 +3549,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(low, sp, &[], cont, &[]);
         self.fb.seal_block(sp);
         self.fb.switch_to_block(sp);
+        self.fb.mark_cold();
         let st = self.call_js(Helper::Safepoint, &[self.frame]);
         let stack = self.stack.clone();
         self.throw_if(st, to, &stack, stack.len());
@@ -6073,6 +6085,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(null, res, &[], cont, &[]);
         self.fb.seal_block(res);
         self.fb.switch_to_block(res);
+        self.fb.mark_cold();
         let p1 = self.resolve_ptr(src, cache);
         self.fb.def_var(var, p1);
         self.fb.jump(cont, &[]);
@@ -6098,12 +6111,21 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let slow = self.fb.create_block();
                 let join = self.fb.create_block();
                 let pv = self.fb.append_block_param(join, PTR);
-                match self.glob_entry(cache.unwrap_or(0), slow) {
-                    Some(p) => self.fb.jump(join, &[p]),
-                    None => self.fb.jump(slow, &[]),
-                }
+                let has_entry = match self.glob_entry(cache.unwrap_or(0), slow) {
+                    Some(p) => {
+                        self.fb.jump(join, &[p]);
+                        true
+                    }
+                    None => {
+                        self.fb.jump(slow, &[]);
+                        false
+                    }
+                };
                 self.fb.seal_block(slow);
                 self.fb.switch_to_block(slow);
+                if has_entry {
+                    self.fb.mark_cold();
+                }
                 let nv = self.i32c(n as i64);
                 let cv = self.i32c(cache.unwrap_or(u32::MAX) as i64);
                 let p = self
@@ -6540,6 +6562,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.brif(ok, hit, &[cached], probe, &[]);
                 self.fb.seal_block(probe);
                 self.fb.switch_to_block(probe);
+                self.fb.mark_cold();
                 let p = layout::prop_obj(&mut self.fb, obj, &ic, other);
                 self.fb.def_var(rv, payload);
                 self.fb.def_var(ov, p);
@@ -8209,6 +8232,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb.seal_block(refresh);
         self.fb.switch_to_block(refresh);
+        self.fb.mark_cold();
         let gv = self.i32c(get as i64);
         let r = self
             .call(Helper::DvView, &[self.frame, recv, gv])
@@ -10560,6 +10584,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.brif(hit, hit_b, &[cl], refresh, &[]);
         self.fb.seal_block(refresh);
         self.fb.switch_to_block(refresh);
+        self.fb.mark_cold();
         let n = self
             .call(Helper::ByteLength, &[self.frame, obj])
             .expect("ByteLength returns a length");
@@ -10713,6 +10738,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.brif(valid, join, &[len], fresh, &[]);
                     self.fb.seal_block(fresh);
                     self.fb.switch_to_block(fresh);
+                    self.fb.mark_cold();
                 }
                 let x = layout::length(&mut self.fb, obj, miss);
                 self.seal_current();
@@ -10859,6 +10885,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.brif(same, hit, &[cl], refresh, &[]);
                     self.fb.seal_block(refresh);
                     self.fb.switch_to_block(refresh);
+                    self.fb.mark_cold();
                 }
                 let n = self
                     .call(Helper::TaLength, &[self.frame, obj])

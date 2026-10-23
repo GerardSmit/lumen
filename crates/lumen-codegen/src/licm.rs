@@ -25,14 +25,14 @@
 use crate::cfg::Cfg;
 use crate::ir::*;
 
-struct Loop {
-    header: Block,
+pub(crate) struct Loop {
+    pub(crate) header: Block,
     /// The header first, then the rest in reverse postorder.
-    blocks: Vec<Block>,
-    latches: Vec<Block>,
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) latches: Vec<Block>,
 }
 
-fn find_loops(cfg: &Cfg) -> Vec<Loop> {
+pub(crate) fn find_loops(cfg: &Cfg) -> Vec<Loop> {
     let mut mark = vec![u32::MAX; cfg.idom.len()];
     let mut loops = Vec::new();
     let mut work = Vec::new();
@@ -287,7 +287,7 @@ fn analyze(func: &Function, cfg: &Cfg, lp: &Loop, s: &mut Scratch) -> Vec<Inst> 
 
 /// Whether execution may leave the program or the function after `data` without reaching the
 /// instructions behind it: a trap, or a call that may throw or diverge.
-fn may_not_continue(data: &InstData) -> bool {
+pub(crate) fn may_not_continue(data: &InstData) -> bool {
     matches!(
         data,
         InstData::TrapIf { .. } | InstData::Call { .. } | InstData::CallIndirect { .. }

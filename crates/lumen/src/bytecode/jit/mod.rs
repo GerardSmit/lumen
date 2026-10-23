@@ -60,6 +60,7 @@ pub(crate) mod aot;
 pub(super) mod build;
 pub(super) mod helpers;
 pub(super) mod layout;
+mod mem;
 
 use super::Chunk;
 use crate::interpreter::{Env, Interp};
@@ -809,6 +810,8 @@ mod switch_tests;
 mod ta_key_tests;
 #[cfg(test)]
 mod ta_store_tests;
+#[cfg(test)]
+mod version_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside
@@ -1255,6 +1258,7 @@ fn generate(mut func: lumen_codegen::Function, cfg: &backend::Config) -> Result<
     if dump_enabled() {
         eprintln!("{func}");
     }
+    lumen_codegen::verify::verify(&func).map_err(|e| format!("verify after optimize: {e}"))?;
     let t2 = stats_start();
     let n1 = (func.insts.len(), func.blocks.len());
     let payload = backend::generate(func, cfg)?;

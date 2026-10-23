@@ -126,6 +126,10 @@ pub(super) struct Shared<'a> {
     chain: Vec<usize>,
     /// Frame-size constants of inlined calls and their sizes (known once a body is done).
     pub sizes: Vec<(V, i64)>,
+    /// Per frameless body ([`FlCx::info`]): the argument stores a reflective `f.arguments`
+    /// read needs (the arguments as the call passed them), deferred to the first commit: only
+    /// JS, which runs after it, could read them. `(slots, offset, kind, value)`.
+    pub fl_seeds: Vec<(usize, Vec<(V, i32, MemKind, V)>)>,
     /// What the inlined bodies' plans pin, keep and import (see [`Built`]): kept with the code.
     pins: Vec<Value>,
     boxes: Vec<Box<dyn std::any::Any>>,
@@ -145,6 +149,7 @@ impl<'a> Shared<'a> {
             ops: 0,
             chain: vec![root as *const Chunk as usize],
             sizes: Vec::new(),
+            fl_seeds: Vec::new(),
             pins: Vec::new(),
             boxes: Vec::new(),
             externs,
@@ -662,7 +667,7 @@ impl<'a> Tr<'a, '_> {
         self.fb.switch_to_block(exit);
         self.fb.mark_cold();
         if let Some((f, ..)) = fl {
-            self.fl_commit(f, nf);
+            self.fl_commit(f, nf, false);
         }
         let ip = self.ptrc(info as i64);
         let st = self
@@ -673,8 +678,9 @@ impl<'a> Tr<'a, '_> {
     }
 
     /// In a frameless body (or at its exit): commit the call unless it is (see
-    /// [`Helper::InlineCommit`]), on the callee frame `nf`.
-    pub(super) fn fl_commit(&mut self, fl: FlCx, nf: V) {
+    /// [`Helper::InlineCommit`]), on the callee frame `nf`. `seed`: store the arguments a
+    /// reflective read needs (not at an exit, which has written every slot back already).
+    pub(super) fn fl_commit(&mut self, fl: FlCx, nf: V, seed: bool) {
         let cur = self.fb.current_block().expect("in a block");
         let cold = self.fb.func.blocks[cur.index()].cold;
         let c = self.fb.use_var(fl.committed);
@@ -684,6 +690,19 @@ impl<'a> Tr<'a, '_> {
         self.fb.seal_block(go);
         self.fb.switch_to_block(go);
         self.fb.mark_cold();
+        if seed {
+            let seeds = self
+                .ginl
+                .fl_seeds
+                .iter()
+                .rev()
+                .find(|(i, _)| *i == fl.info)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            for (p, off, mk, v) in seeds {
+                self.fb.store(mk, p, v, off);
+            }
+        }
         let ip = self.ptrc(fl.info as i64);
         let f = self.helper(Helper::InlineCommit);
         self.fb.call_fn(f, &[nf, ip]);

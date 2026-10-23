@@ -2113,3 +2113,181 @@ fn call_between_unmarked_loads_blocks_forwarding() {
     assert_eq!(want, vec![58]);
     assert_eq!(run(&f, &mut CallClobbers(licm_env()), &[16]).unwrap(), want);
 }
+
+// ----- loop versioning ---------------------------------------------------------------------
+
+/// `acc = 0; for i in 0..n { x = [p+16]; if x == 3 { if i == call_at { call() } acc += x + i }
+/// else { acc += 1000 + i } }; acc`. The guard's failure side is cold; the call (which writes
+/// 55 to 16) sits on a cold block of its own.
+fn versioned_loop(call_at: i64, flags: MemFlags) -> Function {
+    versioned_loop_with(call_at, flags, false, false)
+}
+
+/// [`versioned_loop`] with the guarded load in the header (ahead of the exit test), and a
+/// `trap_if` (never taken) ahead of it.
+fn versioned_loop_with(call_at: i64, flags: MemFlags, load_in_header: bool, trap_first: bool) -> Function {
+    let mut f = Function::new("version", licm_sig());
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (i, acc) = (b.declare_var(Type::I32), b.declare_var(Type::I64));
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    b.def_var(i, zero);
+    b.def_var(acc, zero64);
+    let h = b.create_block();
+    let (body, hot, slow, call, join, exit) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.jump(h, &[]);
+
+    b.switch_to_block(h);
+    if trap_first {
+        let limit = b.iconst(Type::I32, 1000);
+        let over = b.icmp(IntCC::Sgt, n, limit);
+        b.trap_if(over, 1);
+    }
+    let early = load_in_header.then(|| b.load_with(MemKind::I64, p, 16, flags));
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+
+    b.switch_to_block(body);
+    let x = early.unwrap_or_else(|| b.load_with(MemKind::I64, p, 16, flags));
+    let three = b.iconst(Type::I64, 3);
+    let ok = b.icmp(IntCC::Eq, x, three);
+    b.brif(ok, hot, &[], slow, &[]);
+    b.seal_block(hot);
+    b.seal_block(slow);
+
+    b.switch_to_block(slow);
+    b.mark_cold();
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::Sext, Type::I64, iv);
+    let k = b.iconst(Type::I64, 1000);
+    let s = b.binary(BinaryOp::Iadd, wide, k);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, s);
+    b.def_var(acc, a);
+    b.jump(join, &[]);
+
+    b.switch_to_block(hot);
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::Sext, Type::I64, iv);
+    let s = b.binary(BinaryOp::Iadd, wide, x);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, s);
+    b.def_var(acc, a);
+    let at = b.iconst(Type::I64, call_at);
+    let now = b.icmp(IntCC::Eq, wide, at);
+    b.brif(now, call, &[], join, &[]);
+    b.seal_block(call);
+
+    b.switch_to_block(call);
+    b.mark_cold();
+    b.call_fn(callee, &[]);
+    b.jump(join, &[]);
+    b.seal_block(join);
+
+    b.switch_to_block(join);
+    let iv = b.use_var(i);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(h, &[]);
+    b.seal_block(h);
+
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+    f
+}
+
+/// Loops whose blocks hold no load.
+fn load_free_loops(f: &Function) -> usize {
+    let cfg = cfg::Cfg::new(f);
+    let mut n = 0;
+    for b in &f.layout {
+        let header = cfg.preds[b.index()]
+            .iter()
+            .any(|p| cfg.is_reachable(*p) && cfg.dominates(*b, *p));
+        if !header || !cfg.is_reachable(*b) {
+            continue;
+        }
+        // The loop's blocks: those reaching a latch of `b` without passing `b`.
+        let mut seen = vec![false; f.blocks.len()];
+        let mut work: Vec<Block> = cfg.preds[b.index()]
+            .iter()
+            .copied()
+            .filter(|p| cfg.dominates(*b, *p))
+            .collect();
+        seen[b.index()] = true;
+        let mut loads = f.blocks[b.index()].insts.iter().filter(|i| is_load(f.inst(**i))).count();
+        while let Some(x) = work.pop() {
+            if seen[x.index()] {
+                continue;
+            }
+            seen[x.index()] = true;
+            loads += f.blocks[x.index()].insts.iter().filter(|i| is_load(f.inst(**i))).count();
+            work.extend(cfg.preds[x.index()].iter().copied());
+        }
+        n += (loads == 0) as usize;
+    }
+    n
+}
+
+#[test]
+fn version_hoists_guarded_load_out_of_fast_loop() {
+    for call_at in [-1, 0, 2, 4] {
+        let f = versioned_loop(call_at, MemFlags::new(AliasClass::HEAP).notrap());
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 1, "call_at={call_at}\n{o}");
+        let f = versioned_loop_with(call_at, MemFlags::new(AliasClass::HEAP), true, false);
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 1, "call_at={call_at}\n{o}");
+    }
+}
+
+#[test]
+fn version_hoists_a_trapping_load_behind_the_exit_test_into_the_checked_dispatcher() {
+    for call_at in [-1, 2] {
+        let f = versioned_loop(call_at, MemFlags::new(AliasClass::HEAP));
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 1, "call_at={call_at}\n{o}");
+    }
+}
+
+#[test]
+fn version_keeps_a_trapping_load_behind_a_trap() {
+    for call_at in [-1, 2] {
+        let f = versioned_loop_with(call_at, MemFlags::new(AliasClass::HEAP), true, true);
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 0, "call_at={call_at}\n{o}");
+    }
+}
+
+#[test]
+fn version_skips_loads_the_hot_path_writes() {
+    let mut f = Function::new("version_written", licm_sig());
+    let flags = MemFlags::new(AliasClass::HEAP).notrap();
+    licm_loop(
+        &mut f,
+        |_, _| vec![],
+        |b, p, i, _| {
+            let x = b.load_with(MemKind::I64, p, 16, flags);
+            b.store_with(MemKind::I64, p, i, 16, flags);
+            b.binary(BinaryOp::Iadd, x, i)
+        },
+    );
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(load_free_loops(&o), 0, "{o}");
+}

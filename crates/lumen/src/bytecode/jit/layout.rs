@@ -1454,16 +1454,16 @@ pub(crate) fn prop_create(
         fb.brif(some, rel, &[], set, &[]);
         fb.seal_block(rel);
         fb.switch_to_block(rel);
-        let s = fb.load(PTR_MEM, old, l.shape_strong);
+        let s = fb.load_with(PTR_MEM, old, l.shape_strong, super::mem::rc());
         let s = bin_imm(fb, BinaryOp::Isub, PTR, s, 1);
-        fb.store(PTR_MEM, old, s, l.shape_strong);
+        fb.store_with(PTR_MEM, old, s, l.shape_strong, super::mem::rc());
         fb.jump(set, &[]);
         fb.seal_block(set);
         fb.switch_to_block(set);
         let child = fb.iconst(PTR, w.child_rc as i64);
-        let s = fb.load(PTR_MEM, child, l.shape_strong);
+        let s = fb.load_with(PTR_MEM, child, l.shape_strong, super::mem::rc());
         let s = bin_imm(fb, BinaryOp::Iadd, PTR, s, 1);
-        fb.store(PTR_MEM, child, s, l.shape_strong);
+        fb.store_with(PTR_MEM, child, s, l.shape_strong, super::mem::rc());
         fb.store(PTR_MEM, gc, child, l.shape_rc);
         fb.jump(done, &[]);
 

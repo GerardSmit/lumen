@@ -23,6 +23,7 @@ pub mod target_codegen;
 pub mod unroll;
 pub mod unwind;
 pub mod verify;
+pub mod version;
 pub mod wasm;
 pub mod x64;
 
