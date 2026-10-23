@@ -653,6 +653,7 @@ impl Tr<'_, '_> {
         // ---- anything else: the ordinary direct call ----
         self.fb.seal_block(full);
         self.fb.switch_to_block(full);
+        self.fb.mark_cold();
         self.stack = entries;
         self.direct_call_full(pc, argc, true);
         self.slow_to_join(pc, base, want, done);
@@ -776,13 +777,13 @@ impl Tr<'_, '_> {
     ) {
         let dst = self.sptr(scratch);
         let no = self.i32c(0);
-        self.call(Helper::UnpackClone, &[dst, bits, no]);
         let drop_b = self.fb.create_block();
         let cont = self.fb.create_block();
         let one = self.i32c(1);
         let zero = self.i32c(0);
         match key {
             Av::Num(x) => {
+                self.call(Helper::UnpackClone, &[dst, bits, no]);
                 let r = self.call(Helper::ElemGet, &[self.frame, dst, x, dst, one]);
                 let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGet returns a flag"), zero);
                 self.fb.brif(hit, cont, &[], drop_b, &[]);
@@ -805,14 +806,38 @@ impl Tr<'_, '_> {
                 self.fb.seal_block(strb);
                 self.fb.seal_block(chk);
                 self.fb.switch_to_block(strb);
+                // An own data property found through the interpreter's memo is read in place,
+                // without the clone of the holder.
+                let call_b = self.fb.create_block();
+                let (is_obj, _, w) = layout::word_counted(&mut self.fb, bits);
+                layout::guard(&mut self.fb, is_obj, call_b);
+                let gc = if PTR == Type::I64 {
+                    w
+                } else {
+                    self.fb.convert(ConvOp::Wrap, PTR, w)
+                };
+                let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
+                let word = layout::str_key_word_gc(&mut self.fb, interp, gc, p, call_b);
+                self.word_hit(word, &[], scratch, cont, call_b);
+                self.fb.seal_block(call_b);
+                self.fb.switch_to_block(call_b);
+                self.fb.mark_cold();
+                self.call(Helper::UnpackClone, &[dst, bits, no]);
                 let r = self.call(Helper::ElemGetStr, &[self.frame, dst, p, dst, one]);
                 let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGetStr returns a flag"), zero);
                 self.fb.brif(hit, cont, &[], drop_b, &[]);
                 self.fb.switch_to_block(chk);
                 let is_num = self.fb.icmp(IntCC::Eq, tag, tn);
-                self.fb.brif(is_num, numb, &[], drop_b, &[]);
+                let other = self.fb.create_block();
+                self.fb.brif(is_num, numb, &[], other, &[]);
+                self.fb.seal_block(other);
+                self.fb.switch_to_block(other);
+                // Nothing was cloned into the scratch entry; leave it `undefined` like a drop.
+                self.set_stack_tag(scratch, TAG_UNDEFINED);
+                self.fb.jump(miss, &[]);
                 self.fb.seal_block(numb);
                 self.fb.switch_to_block(numb);
+                self.call(Helper::UnpackClone, &[dst, bits, no]);
                 let x = self.fb.load(MemKind::F64, p, VALUE_PAYLOAD);
                 let r = self.call(Helper::ElemGet, &[self.frame, dst, x, dst, one]);
                 let hit = self.fb.icmp(IntCC::Ne, r.expect("ElemGet returns a flag"), zero);

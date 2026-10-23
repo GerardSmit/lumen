@@ -4,10 +4,12 @@
 //! # The fast copy
 //!
 //! The analysis looks at the loop with its rarely executed blocks set aside: blocks marked
-//! cold, and those only cold blocks reach. Memory the remaining (hot) blocks never write is
-//! *protected*. Every cold block is *cut*: the fast copy branches to the original block instead
-//! (a slow path calling into the runtime may write anything), finishing the iteration in the
-//! original loop. A load with an invariant address of protected memory is
+//! cold, those only cold blocks reach, and those that only lead to cold blocks. Memory the
+//! remaining (hot) blocks never write is *protected* (a store of a known class writes only its
+//! bytes off its own address value, so a load of the same class from that value at a disjoint
+//! offset stays protected). Every cold block is *cut*: the fast copy branches to the original
+//! block instead (a slow path calling into the runtime may write anything), finishing the
+//! iteration in the original loop. A load with an invariant address of protected memory is
 //! then invariant in the fast copy, and so is everything pure computed from invariant values.
 //!
 //! The header's parameters are assumed invariant (each entering the fast copy holds the value
@@ -193,7 +195,8 @@ fn collect(
 
 /// Require, in `guard`, the branches from the header to the block at `k`; false when it is
 /// not reached by a chain of blocks each the only one reaching the next, with nothing that
-/// may not continue, and conditions the dispatcher can compute, or when `guard` disagrees.
+/// may not continue, and variant conditions the dispatcher can compute, or when `guard`
+/// disagrees.
 #[allow(clippy::too_many_arguments)]
 fn peel(
     func: &Function,
@@ -223,8 +226,14 @@ fn peel(
         let t = func.terminator(d).expect("a loop block ends in a branch");
         match func.inst(t) {
             InstData::Jump { .. } => {}
-            InstData::Brif { .. } => {
+            InstData::Brif { cond, .. } => {
+                // An invariant condition left unfolded has both sides in the fast copy, and
+                // requiring one picks the path of every iteration: only the `then` side, which
+                // the front end emits for the expected case.
                 if fold[d.index()].is_none() {
+                    if s != 0 && inv[func.resolve(*cond).index()] {
+                        return false;
+                    }
                     need.push((d, s));
                 }
             }
@@ -279,20 +288,70 @@ fn plan(func: &Function, cfg: &Cfg, lp: &Loop) -> Option<Plan> {
         let up = cfg.idom[b.index()].filter(|&d| d != b && in_loop[d.index()]);
         cold[b.index()] = func.blocks[b.index()].cold || up.is_some_and(|d| cold[d.index()]);
     }
+    // And those that only lead to such blocks (a guard's miss edge through a jump).
+    loop {
+        let mut more = false;
+        for &b in &lp.blocks {
+            if cold[b.index()] || b == h {
+                continue;
+            }
+            let t = func.terminator(b).expect("a loop block ends in a branch");
+            let succ = func.inst(t).successors();
+            if !succ.is_empty()
+                && succ
+                    .iter()
+                    .all(|c| in_loop[c.block.index()] && cold[c.block.index()])
+            {
+                cold[b.index()] = true;
+                more = true;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
     if cold[h.index()] {
         return None;
     }
+    // What the hot blocks write: calls by class; stores also by address, so a load of the
+    // same class at a disjoint offset from the same base stays protected.
     let mut hot_writes = AliasSet::NONE;
+    let mut hot_stores: Vec<(AliasClass, Value, i64, i64)> = Vec::new();
     for &b in &lp.blocks {
         if !cold[b.index()] {
             for &i in &func.blocks[b.index()].insts {
-                hot_writes = hot_writes.union(func.writes(i));
+                match *func.inst(i) {
+                    InstData::Store {
+                        kind, addr, offset, ..
+                    } => {
+                        let c = func.mem_flags(i).class;
+                        if c.is_known() {
+                            let lo = offset as i64;
+                            hot_stores.push((c, func.resolve(addr), lo, lo + kind.bytes() as i64));
+                        } else {
+                            hot_writes = hot_writes.union(func.writes(i));
+                        }
+                    }
+                    _ => hot_writes = hot_writes.union(func.writes(i)),
+                }
             }
         }
     }
     // The fast copy leaves rarely executed blocks to the original loop.
     let cut = &cold;
-    let protected = |c: AliasClass| c.is_known() && !hot_writes.may_touch(c);
+    let protected = |i: Inst| {
+        let c = func.mem_flags(i).class;
+        let InstData::Load { kind, addr, offset } = *func.inst(i) else {
+            return false;
+        };
+        let (a, lo) = (func.resolve(addr), offset as i64);
+        let hi = lo + kind.bytes() as i64;
+        c.is_known()
+            && !hot_writes.may_touch(c)
+            && hot_stores
+                .iter()
+                .all(|&(sc, sa, slo, shi)| !sc.may_alias(c) || (sa == a && (shi <= lo || hi <= slo)))
+    };
     let good = |b: Block| in_loop[b.index()] && !cut[b.index()];
 
     let hp = func.blocks[h.index()].params.clone();
@@ -379,7 +438,7 @@ fn plan(func: &Function, cfg: &Cfg, lp: &Loop) -> Option<Plan> {
                     && match data {
                         InstData::Load { .. } => {
                             let f = func.mem_flags(i);
-                            !blocked[i.index()] && (f.readonly || protected(f.class))
+                            !blocked[i.index()] && (f.readonly || protected(i))
                         }
                         d => d.is_pure(),
                     };

@@ -508,7 +508,7 @@ fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
                         e.readonly
                             || (class.is_known()
                                 && e.class.is_known()
-                                && class.clamped() != e.class.clamped())
+                                && !class.may_alias(e.class))
                             || e.addr == addr && {
                                 let (elo, ehi) =
                                     (e.offset as i64, e.offset as i64 + e.kind.bytes() as i64);

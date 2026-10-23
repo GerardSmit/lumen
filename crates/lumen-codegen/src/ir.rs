@@ -304,7 +304,9 @@ impl MemKind {
     }
 }
 
-/// A region of memory for alias analysis: accesses in two different known classes never overlap.
+/// A region of memory for alias analysis: accesses in two different known classes never overlap,
+/// except that [`AliasClass::HEAP`] contains the parts numbered [`AliasClass::HEAP_PARTS`]
+/// (disjoint from one another), which front ends use to tell apart kinds of heap memory.
 /// [`AliasClass::UNKNOWN`] may overlap anything; the other predefined classes describe the JIT's
 /// memory, and front ends may number further disjoint regions up to [`AliasClass::LAST`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -320,9 +322,16 @@ impl AliasClass {
     pub const HEAP: AliasClass = AliasClass(3);
     pub const OTHER: AliasClass = AliasClass(4);
     pub const LAST: u8 = 31;
+    /// The numbers of the parts of [`AliasClass::HEAP`].
+    pub const HEAP_PARTS: std::ops::RangeInclusive<u8> = 16..=23;
 
     pub fn is_known(self) -> bool {
         self.0 != 0
+    }
+
+    /// Whether accesses in the two classes may overlap.
+    pub fn may_alias(self, other: AliasClass) -> bool {
+        AliasSet::of(self).may_touch(other)
     }
 
     /// The class with its number clamped to [`AliasClass::LAST`], as [`AliasSet`] stores it.
@@ -340,11 +349,22 @@ impl AliasSet {
     pub const NONE: AliasSet = AliasSet(0);
     pub const ALL: AliasSet = AliasSet(u32::MAX);
 
+    /// The memory an access in `class` may touch: the class, and for [`AliasClass::HEAP`] its
+    /// parts, or for one of the parts the heap as a whole. [`AliasSet::may_touch`] tests one
+    /// class, so a part's set does not reach its sibling parts.
     pub fn of(class: AliasClass) -> AliasSet {
-        if class.is_known() {
-            AliasSet(1 << class.clamped().0)
+        if !class.is_known() {
+            return AliasSet::ALL;
+        }
+        let c = class.clamped().0;
+        let parts = AliasClass::HEAP_PARTS;
+        if c == AliasClass::HEAP.0 {
+            let mask = (1u32 << (parts.end() + 1)) - (1u32 << parts.start());
+            AliasSet(1 << c | mask)
+        } else if parts.contains(&c) {
+            AliasSet(1 << c | 1 << AliasClass::HEAP.0)
         } else {
-            AliasSet::ALL
+            AliasSet(1 << c)
         }
     }
 
@@ -352,12 +372,17 @@ impl AliasSet {
         self.union(AliasSet::of(class))
     }
 
-    /// The set minus a known class (`ALL.without(FRAME)`: everything but the frame).
+    /// The set minus a known class (`ALL.without(FRAME)`: everything but the frame); without
+    /// [`AliasClass::HEAP`], also without its parts.
     pub fn without(self, class: AliasClass) -> AliasSet {
-        if class.is_known() {
-            AliasSet(self.0 & !(1 << class.clamped().0))
+        if !class.is_known() {
+            return self;
+        }
+        let c = class.clamped().0;
+        if c == AliasClass::HEAP.0 {
+            AliasSet(self.0 & !AliasSet::of(class).0)
         } else {
-            self
+            AliasSet(self.0 & !(1 << c))
         }
     }
 
@@ -1267,6 +1292,9 @@ impl fmt::Display for Function {
             write!(f, "{t:?}")?;
         }
         write!(f, ") -> {:?} {{", self.sig.results)?;
+        for (i, e) in self.funcs.iter().enumerate() {
+            write!(f, "\n    fn{i} = import #{}", e.id)?;
+        }
         for &b in &self.layout {
             let data = &self.blocks[b.index()];
             write!(f, "\n{b}(")?;
@@ -1276,7 +1304,7 @@ impl fmt::Display for Function {
                 }
                 write!(f, "{p}: {:?}", self.value_type(p))?;
             }
-            writeln!(f, "):")?;
+            writeln!(f, "):{}", if data.cold { " cold" } else { "" })?;
             for &inst in &data.insts {
                 let results = self.results(inst);
                 write!(f, "    ")?;

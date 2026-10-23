@@ -554,6 +554,154 @@ pub(crate) fn signature(h: Helper) -> Signature {
     Signature::new(p.to_vec(), r.to_vec())
 }
 
+/// The memory a call of `h` may write, for the optimizer (see `mem`); every helper may read
+/// anything. The contract, by group:
+///
+/// | writes                         | helpers                                                     |
+/// |--------------------------------|-------------------------------------------------------------|
+/// | everything                     | those that may run JS (getters, setters, proxies, `valueOf`,|
+/// |                                | calls, finalizers, the collector) or commit/finish calls     |
+/// | nothing                        | `TypeofIs`, `DestructProbe`, `TaLength`, `ApplyOk`,         |
+/// |                                | `ByteLength`, `SiteFailed`                                   |
+/// | `VALUES`                       | `Drop`, `Clone`, `UnpackClone`, `DropN`, `StoreLocal(Num)`,  |
+/// |                                | `ToBoolean`, `StrictEq`, `ToStrPrim`, `ConcatStr`,          |
+/// |                                | `AppendLocal`, `AppendUnit`, `StrStatic`, `ApplySeed`,      |
+/// |                                | `DestructDense`, `StrCodeAt`, `StrictEqRef`                  |
+/// | `VALUES` + environments        | `DropEnv` (an `Env` word in place)                          |
+/// | `VALUES` + objects             | `ElemGet` (materializes a split view)                       |
+/// | `VALUES` + caches              | `ElemGetStr` (the `str_key_ic` memo)                        |
+/// | `VALUES` + frame + interp      | `LoadLocal` (a TDZ throw), `TakeException`, `SetException`  |
+/// | caches + strings               | the name lookups (`NamePtr`, `NamePtrW`, `GlobPtr`, `CapPtr`,|
+/// |                                | `NameWord`, which fill name caches) and the site guards     |
+/// | frame                          | `TaView`, `DvView` (the view out-parameters)                |
+/// | `VALUES` + interp + caches     | allocations of fresh objects: `AllocObj`, `AllocArr`,       |
+/// |                                | `MakeLit`, `MakeRest`, `MakeClosure`, `MakeRegExp`, and     |
+/// |                                | `ActEnv` (also writing an `Env` word: + environments)       |
+/// | `VALUES` + heap + interp       | helpers changing existing objects or environments without   |
+/// |                                | running JS: `ElemSetStr`, `ElemSetBoxed`, `ArrayAppend`,    |
+/// |                                | `NewThis`, `NewDone`, `NewPlan`, `SiteRebind`, `BoundThis`, |
+/// |                                | `InlineMiss`, the block-scope helpers                       |
+///
+/// Environments (`mem::SCOPE`) are written only by these two and the helpers writing the
+/// heap or everything; the name lookups only read them.
+///
+/// `VALUES` is what a helper reaches through the `Value` pointers it is given (the unit's
+/// slots and stack, or a frame on the shadow stack), reference counts and strings (whose
+/// headers carry lazily set hints). Dropping a value may free objects; their memory is not
+/// counted as written, since only a store or call that wrote a live reference (and so a class
+/// in the set) can make an object unreachable. None of these helpers runs the collector
+/// (objects are freed only by reference counts outside `Safepoint` / `GcPoll`) or moves an
+/// object.
+pub(crate) fn effects(h: Helper) -> lumen_codegen::ir::CallEffects {
+    use super::mem::{DENSE, HEADER, ICS, INTERP, OBJ, RC, SCOPE, SHADOW, SLOTS, STACK, STR, VAL};
+    use lumen_codegen::ir::{AliasClass, AliasSet, CallEffects};
+    let values = AliasSet::of(STACK)
+        .with(SLOTS)
+        .with(SHADOW)
+        .with(RC)
+        .with(STR);
+    let caches = AliasSet::of(ICS).with(STR);
+    let changes = values
+        .with(AliasClass::HEAP)
+        .with(HEADER)
+        .with(INTERP);
+    let writes = match h {
+        Helper::TypeofIs
+        | Helper::DestructProbe
+        | Helper::TaLength
+        | Helper::ApplyOk
+        | Helper::ByteLength
+        | Helper::SiteFailed => AliasSet::NONE,
+        Helper::Drop
+        | Helper::Clone
+        | Helper::UnpackClone
+        | Helper::DropN
+        | Helper::StoreLocal
+        | Helper::StoreLocalNum
+        | Helper::ToBoolean
+        | Helper::StrictEq
+        | Helper::StrictEqRef
+        | Helper::ToStrPrim
+        | Helper::ConcatStr
+        | Helper::AppendLocal
+        | Helper::AppendUnit
+        | Helper::StrStatic
+        | Helper::StrCodeAt
+        | Helper::ApplySeed
+        | Helper::DestructDense => values,
+        Helper::DropEnv => values.with(SCOPE),
+        // A split view read often enough materializes the object into a packed array.
+        Helper::ElemGet => values.with(OBJ).with(DENSE).with(VAL),
+        Helper::ElemGetStr => values.with(ICS).with(INTERP),
+        Helper::LoadLocal | Helper::TakeException | Helper::SetException => {
+            values.with(HEADER).with(INTERP).with(ICS)
+        }
+        Helper::NamePtr
+        | Helper::NamePtrW
+        | Helper::GlobPtr
+        | Helper::CapPtr
+        | Helper::NameWord
+        | Helper::MathGuard
+        | Helper::FastGuard
+        | Helper::SlotGuard
+        | Helper::StrGuard
+        | Helper::WrapGuard
+        | Helper::ArrPushGuard => caches,
+        Helper::TaView | Helper::DvView => AliasSet::of(HEADER),
+        Helper::AllocObj
+        | Helper::AllocArr
+        | Helper::MakeLit
+        | Helper::MakeRest
+        | Helper::MakeClosure
+        | Helper::MakeRegExp => values.with(INTERP).with(ICS),
+        Helper::ActEnv => values.with(INTERP).with(ICS).with(SCOPE),
+        Helper::ElemSetStr
+        | Helper::ElemSetBoxed
+        | Helper::ArrayAppend
+        | Helper::NewThis
+        | Helper::NewDone
+        | Helper::NewPlan
+        | Helper::SiteRebind
+        | Helper::BoundThis
+        | Helper::InlineMiss
+        | Helper::BlkNew
+        | Helper::BlkCopy
+        | Helper::BlkDecl
+        | Helper::BlkLoad
+        | Helper::BlkStore
+        | Helper::MakeClosureIn
+        | Helper::BlkUpdate => changes,
+        Helper::Binary
+        | Helper::Generic
+        | Helper::Safepoint
+        | Helper::LoadName
+        | Helper::LoadNameForCall
+        | Helper::StoreName
+        | Helper::StoreCap
+        | Helper::Call
+        | Helper::GetProp
+        | Helper::GetMethod
+        | Helper::SetProp
+        | Helper::IterStep
+        | Helper::CallFinish
+        | Helper::PopFnFrame
+        | Helper::InlineFinish
+        | Helper::GcPoll
+        | Helper::StrMethod
+        | Helper::ArrPush
+        | Helper::CollMethod
+        | Helper::CallSpread
+        | Helper::AtomicPrepare
+        | Helper::AtomicRelease
+        | Helper::Construct
+        | Helper::StrStaticSlow
+        | Helper::InstanceOf
+        | Helper::InlineCommit
+        | Helper::InlineUncommit => AliasSet::ALL,
+    };
+    CallEffects::writes(writes)
+}
+
 /// The address of helper `id`.
 pub(crate) fn address(id: u32) -> Option<u64> {
     let h = *ALL.get(id as usize)?;

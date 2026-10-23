@@ -876,6 +876,7 @@ fn build_unit(
             func_mode,
             tdz_slots: tdz_slot_set(chunk),
             helpers: vec![None; helpers::ALL.len()],
+            stack_helpers: vec![None; helpers::ALL.len()],
             leaders,
             stack: Vec::new(),
             max_stack: 1,
@@ -2373,6 +2374,8 @@ struct Tr<'a, 'f> {
     /// `Empty`, so its reads need no TDZ check.
     tdz_slots: Vec<bool>,
     helpers: Vec<Option<FuncRef>>,
+    /// [`Tr::helpers`] for calls that write only operand-stack `Value`s (see [`Tr::call`]).
+    stack_helpers: Vec<Option<FuncRef>>,
     leaders: Vec<Option<Leader>>,
     stack: Vec<Entry>,
     max_stack: usize,
@@ -2583,10 +2586,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         if let Some(f) = self.helpers[i] {
             return f;
         }
-        let f = self
-            .fb
-            .func
-            .import_function(helpers::signature(h), h as u32);
+        let f = self.fb.func.import_function_with_effects(
+            helpers::signature(h),
+            h as u32,
+            helpers::effects(h),
+        );
         self.helpers[i] = Some(f);
         f
     }
@@ -2605,8 +2609,77 @@ impl<'a, 'f> Tr<'a, 'f> {
             let nf = self.frame;
             self.fl_commit(fl, nf, true);
         }
-        let f = self.helper(h);
+        let f = if self.writes_stack_only(h, args) {
+            self.stack_helper(h)
+        } else {
+            self.helper(h)
+        };
         self.fb.call_fn(f, args).first().copied()
+    }
+
+    /// Whether every `Value` the call of `h` with `args` may overwrite or release lies on
+    /// this frame's operand stack (the helpers whose effects name the frame slots only for
+    /// their pointer arguments).
+    fn writes_stack_only(&self, h: Helper, args: &[V]) -> bool {
+        let consumed = |c: V, bit: i64| self.iconst_of(c).is_none_or(|c| c & bit != 0);
+        match (h, args) {
+            (Helper::Drop, &[p]) | (Helper::Clone, &[p, _]) | (Helper::UnpackClone, &[p, _, _]) => {
+                self.on_stack(p)
+            }
+            (Helper::ElemGet, &[_, obj, _, dst, c]) => {
+                self.on_stack(dst) && (!consumed(c, !0) || self.on_stack(obj))
+            }
+            (Helper::ElemGetStr, &[_, obj, key, dst, c]) => {
+                self.on_stack(dst)
+                    && (!consumed(c, 1) || self.on_stack(obj))
+                    && (!consumed(c, 2) || self.on_stack(key))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `p` is this frame's operand stack pointer plus a constant.
+    fn on_stack(&self, p: V) -> bool {
+        let f = &*self.fb.func;
+        let (p, sp) = (f.resolve(p), f.resolve(self.stackp));
+        if p == sp {
+            return true;
+        }
+        match f.values[p.index()].def {
+            lumen_codegen::ValueDef::Result(i, 0) => matches!(
+                f.inst(i),
+                lumen_codegen::ir::InstData::Binary { op: BinaryOp::Iadd, args: [a, b] }
+                    if f.resolve(*a) == sp && self.iconst_of(*b).is_some()
+            ),
+            _ => false,
+        }
+    }
+
+    fn iconst_of(&self, v: V) -> Option<i64> {
+        let f = &*self.fb.func;
+        match f.values[f.resolve(v).index()].def {
+            lumen_codegen::ValueDef::Result(i, 0) => match f.inst(i) {
+                lumen_codegen::ir::InstData::Iconst { imm, .. } => Some(*imm),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// [`Tr::helper`] with the frame slots left out of its writes.
+    fn stack_helper(&mut self, h: Helper) -> FuncRef {
+        let i = h as usize;
+        if let Some(f) = self.stack_helpers[i] {
+            return f;
+        }
+        let mut e = helpers::effects(h);
+        e.writes = e.writes.without(mem::SLOTS);
+        let f = self
+            .fb
+            .func
+            .import_function_with_effects(helpers::signature(h), h as u32, e);
+        self.stack_helpers[i] = Some(f);
+        f
     }
 
     /// All guards precede the lease. The inlined operation cannot call JS or exit
@@ -4220,6 +4293,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.throw_if(st, pc, &below, depth);
     }
 
+    /// Continue in a fresh block marked cold: code from a site that never ran so far.
+    fn cold_from_here(&mut self) {
+        if self.fb.current_block().is_none() || self.fb.is_filled() {
+            return;
+        }
+        let b = self.fb.create_block();
+        self.fb.jump(b, &[]);
+        self.fb.seal_block(b);
+        self.fb.switch_to_block(b);
+        self.fb.mark_cold();
+    }
+
     /// Run the op at `pc` through [`Helper::Generic`].
     fn generic(&mut self, pc: usize) {
         let (pops, pushes) = self.chunk.jit_stack_effect(pc).unwrap_or((0, 0));
@@ -4769,6 +4854,17 @@ impl<'a, 'f> Tr<'a, 'f> {
         let op = self.ops[pc];
         self.prepare(pc);
         let d = self.stack.len();
+        if let Op::GetProp(_, c)
+        | Op::GetPropThis(_, c)
+        | Op::UpdateProp(_, c, _)
+        | Op::SetProp(_, c)
+        | Op::SetPropDrop(_, c)
+        | Op::SetPropThisDrop(_, c) = op
+        {
+            if layout::site_unrun(self.chunk, c) {
+                self.cold_from_here();
+            }
+        }
         if let (true, Op::InEnv(s), Op::MakeClosure(k, n)) =
             (pc > 0, self.ops[pc.saturating_sub(1)], op)
         {
@@ -5437,31 +5533,15 @@ impl<'a, 'f> Tr<'a, 'f> {
                     },
                     |t| {
                         // A String key on a plain object: a data property natively.
-                        let (obj, consume_obj) = match o {
-                            Entry::Ref(p, _) => (p, 0),
-                            _ => (t.sptr(d - 2), 1),
+                        let (obj, own_obj) = match o {
+                            Entry::Ref(p, _) => (p, None),
+                            _ => (t.sptr(d - 2), Some(d - 2)),
                         };
-                        let (kp, consume_key) = match kv {
-                            Entry::Ref(p, _) => (p, 0),
-                            _ => (t.sptr(d - 1), 2),
+                        let (kp, own_key) = match kv {
+                            Entry::Ref(p, _) => (p, None),
+                            _ => (t.sptr(d - 1), Some(d - 1)),
                         };
-                        let consume = consume_obj | consume_key;
-                        let dst = t.sptr(d - 2);
-                        let cv = t.i32c(consume);
-                        let r = t
-                            .call(Helper::ElemGetStr, &[t.frame, obj, kp, dst, cv])
-                            .expect("ElemGetStr returns a flag");
-                        let z = t.i32c(0);
-                        let hit = t.fb.icmp(IntCC::Ne, r, z);
-                        let gen = t.fb.create_block();
-                        let join = t.fb.create_block();
-                        t.fb.brif(hit, join, &[], gen, &[]);
-                        t.fb.seal_block(gen);
-                        t.fb.switch_to_block(gen);
-                        t.generic(pc);
-                        t.fb.jump(join, &[]);
-                        t.fb.seal_block(join);
-                        t.fb.switch_to_block(join);
+                        t.elem_get_str(pc, obj, kp, own_obj, own_key, d - 2);
                         t.stack.truncate(d - 2);
                         t.stack.push(Entry::Boxed);
                     },
@@ -5638,26 +5718,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                         // A String key on a plain object: a data property natively.
                         |t| {
                             let obj = t.slot_ptr(s as usize);
-                            let (kp, consume) = match t.stack[d - 1] {
-                                Entry::Ref(p, _) => (p, 0),
-                                _ => (t.sptr(d - 1), 2),
+                            let (kp, own_key) = match t.stack[d - 1] {
+                                Entry::Ref(p, _) => (p, None),
+                                _ => (t.sptr(d - 1), Some(d - 1)),
                             };
-                            let dst = t.sptr(d - 1);
-                            let cv = t.i32c(consume);
-                            let r = t
-                                .call(Helper::ElemGetStr, &[t.frame, obj, kp, dst, cv])
-                                .expect("ElemGetStr returns a flag");
-                            let z = t.i32c(0);
-                            let hit = t.fb.icmp(IntCC::Ne, r, z);
-                            let gen = t.fb.create_block();
-                            let join = t.fb.create_block();
-                            t.fb.brif(hit, join, &[], gen, &[]);
-                            t.fb.seal_block(gen);
-                            t.fb.switch_to_block(gen);
-                            t.generic(pc);
-                            t.fb.jump(join, &[]);
-                            t.fb.seal_block(join);
-                            t.fb.switch_to_block(join);
+                            t.elem_get_str(pc, obj, kp, None, own_key, d - 1);
                             t.stack.truncate(d - 1);
                             t.stack.push(Entry::Boxed);
                         },
@@ -6381,9 +6446,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         let slow = self.fb.create_block();
         let join = self.fb.create_block();
         let param = pushes.then(|| self.fb.append_block_param(join, Type::F64));
-        let old = layout::prop_get_num(&mut self.fb, obj, ic, slow);
+        // Every guard precedes the read, leaving only the Number check per iteration.
+        let prop = layout::prop_ref(&mut self.fb, obj, ic, slow);
+        let old = layout::prop_num_at(&mut self.fb, prop, slow);
         let (new, r) = self.upd_step(k, old);
-        layout::prop_set_num(&mut self.fb, obj, ic, new, slow);
+        layout::prop_put_num(&mut self.fb, prop, new);
         self.seal_current();
         if owned {
             self.drop_at(d - 1);
@@ -7484,14 +7551,14 @@ impl<'a, 'f> Tr<'a, 'f> {
         let so = call::scope_offs().expect("planned with scope offsets");
         let fail = self.fb.create_block();
         let scope = self.ptrc(sh.scope as i64);
-        let g = self.fb.load(MemKind::I32, scope, so.gen);
+        let g = self.fb.load_with(MemKind::I32, scope, so.gen, mem::scope());
         let want = self.i32c(sh.gen as i64);
         let ok = self.fb.icmp(IntCC::Eq, g, want);
         self.guard_to(ok, fail);
         for c in &sh.caps {
             let bd = self.ptrc(c.binding as i64);
-            let init = self.fb.load(MemKind::I32U8, bd, so.b_init);
-            let tag = self.fb.load(MemKind::I32U8, bd, so.b_value);
+            let init = self.fb.load_with(MemKind::I32U8, bd, so.b_init, mem::scope());
+            let tag = self.fb.load_with(MemKind::I32U8, bd, so.b_value, mem::scope());
             let t = self.i32c(if c.num { TAG_NUM } else { TAG_BOOL } as i64);
             let same = self.fb.icmp(IntCC::Eq, tag, t);
             let z = self.i32c(0);
@@ -9140,6 +9207,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.nullish_inline(p, neg, None, join, slow);
             self.fb.seal_block(slow);
             self.fb.switch_to_block(slow);
+            self.fb.mark_cold();
             let d = self.stack.len();
             self.opnds_to_scratch(pc, a, b);
             let (pa, pb) = (self.sptr(d), self.sptr(d + 1));
@@ -9191,6 +9259,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.nullish_inline(p, neg, drop_idx, join, slow);
             self.fb.seal_block(slow);
             self.fb.switch_to_block(slow);
+            self.fb.mark_cold();
             let t = self.cmp_slow(pc, kind)?;
             self.fb.jump(join, &[t]);
             self.fb.seal_block(join);
@@ -9221,6 +9290,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.jump(join, &[c]);
                 self.fb.seal_block(slow);
                 self.fb.switch_to_block(slow);
+                self.fb.mark_cold();
                 let t = self.cmp_slow(pc, kind)?;
                 self.fb.jump(join, &[t]);
                 self.fb.seal_block(join);
@@ -9272,6 +9342,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let r = self.strict_cmp(sk, d - 2, pa, pb).expect("strict kind");
                 self.fb.jump(join, &[r]);
                 self.fb.switch_to_block(b_gen);
+                self.fb.mark_cold();
                 (Some(join), Some(res))
             }
             None => (None, None),
@@ -9937,7 +10008,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             );
         if word_first {
             let bits = layout::elem_get_word(&mut self.fb, obj, key, miss);
-            self.word_hit(bits, drop, at, join, miss);
+            self.word_hit(bits, drop.as_slice(), at, join, miss);
         } else {
             let x = layout::elem_get_num(&mut self.fb, obj, key, miss);
             self.seal_current();
@@ -9951,6 +10022,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         if !ta_first {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
+            self.fb.mark_cold();
             self.stack = pre.clone();
             if let Some(x) = self.ta_access(pc, obj, key, None, slow_b, slow_b, src, false) {
                 self.read_hit(drop, want, at, join, x);
@@ -9958,6 +10030,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         self.fb.seal_block(slow_b);
         self.fb.switch_to_block(slow_b);
+        self.fb.mark_cold();
         self.stack = pre.clone();
         // Non-number elements (a string's characters, boxed array elements) through the
         // interpreter's fast paths before the generic op.
@@ -10029,10 +10102,49 @@ impl<'a, 'f> Tr<'a, 'f> {
         });
     }
 
+    /// `obj[key]` for the String key at `kp` into stack index `at`: an own data property found
+    /// through the interpreter's memo inline ([`layout::str_key_word`]), else
+    /// [`Helper::ElemGetStr`], else the generic op. `own_obj` / `own_key`: the stack indices of
+    /// a consumed (Boxed) receiver and key, released on the native paths.
+    fn elem_get_str(
+        &mut self,
+        pc: usize,
+        obj: V,
+        kp: V,
+        own_obj: Option<usize>,
+        own_key: Option<usize>,
+        at: usize,
+    ) {
+        let join = self.fb.create_block();
+        let miss = self.fb.create_block();
+        let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
+        let bits = layout::str_key_word(&mut self.fb, interp, obj, kp, miss);
+        let drops: Vec<usize> = own_key.into_iter().chain(own_obj).collect();
+        self.word_hit(bits, &drops, at, join, miss);
+        self.fb.seal_block(miss);
+        self.fb.switch_to_block(miss);
+        let consume = own_obj.map_or(0, |_| 1) | own_key.map_or(0, |_| 2);
+        let dst = self.sptr(at);
+        let cv = self.i32c(consume);
+        let r = self
+            .call(Helper::ElemGetStr, &[self.frame, obj, kp, dst, cv])
+            .expect("ElemGetStr returns a flag");
+        let z = self.i32c(0);
+        let hit = self.fb.icmp(IntCC::Ne, r, z);
+        let gen = self.fb.create_block();
+        self.fb.brif(hit, join, &[], gen, &[]);
+        self.fb.seal_block(gen);
+        self.fb.switch_to_block(gen);
+        self.generic(pc);
+        self.fb.jump(join, &[]);
+        self.fb.seal_block(join);
+        self.fb.switch_to_block(join);
+    }
+
     /// Store the element word `bits` as the Boxed result at stack index `at` (retaining an object
-    /// or a string inline), releasing the consumed receiver `drop`, and jump to `join`; a BigInt
+    /// or a string inline), releasing the consumed entries `drops`, and jump to `join`; a BigInt
     /// or a Symbol goes to `miss`. Seals the blocks it creates (and the current one).
-    fn word_hit(&mut self, bits: V, drop: Option<usize>, at: usize, join: Block, miss: Block) {
+    fn word_hit(&mut self, bits: V, drops: &[usize], at: usize, join: Block, miss: Block) {
         let (tag, payload, is_ref) = layout::word_value(&mut self.fb, bits, miss);
         self.seal_current();
         let (refb, plain) = (self.fb.create_block(), self.fb.create_block());
@@ -10040,7 +10152,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(refb);
         self.fb.seal_block(plain);
         self.fb.switch_to_block(plain);
-        if let Some(i) = drop {
+        for &i in drops {
             self.drop_at(i);
         }
         let dst = self.sptr(at);
@@ -10067,7 +10179,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         };
         let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
         self.retain_inline(gc, so);
-        if let Some(i) = drop {
+        for &i in drops {
             self.drop_at(i);
         }
         let o = self.soff(at);
