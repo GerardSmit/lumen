@@ -348,7 +348,7 @@ struct IdIndex {
     iframe_names: alloc::collections::BTreeSet<String>,
     /// Elements per window named property, in tree order: those with that `id`, and
     /// the HTML `embed`, `form`, `img` and `object` elements with that `name`.
-    window_named: alloc::collections::BTreeMap<String, Vec<NodeId>>,
+    window_named: alloc::collections::BTreeMap<String, alloc::sync::Arc<[NodeId]>>,
 }
 
 /// Host-owned live form state is read through a weak adapter without copying
@@ -456,17 +456,46 @@ impl Document {
         self.tree_names_version = self.tree_names_version.wrapping_add(1);
     }
 
-    /// Called as `subtree` joins or leaves a tree: advances the counter only when
-    /// the subtree holds something the id, window-name and frame lookups see.
-    fn note_subtree_names(&mut self, subtree: NodeId) {
-        if self.subtree_has_named_content(subtree) {
+    fn is_name_bearing_html_element(&self, node: NodeId) -> bool {
+        match self.kind(node) {
+            Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) => {
+                ["iframe", "embed", "form", "img", "object"].iter().any(|tag| name.eq_ignore_ascii_case(tag))
+            }
+            _ => false,
+        }
+    }
+
+    fn in_document_tree(&self, node: NodeId) -> bool {
+        let mut current = node;
+        loop {
+            if current == self.root() {
+                return true;
+            }
+            let Ok(Some(parent)) = self.shadow_including_parent(current) else {
+                return false;
+            };
+            current = parent;
+        }
+    }
+
+    /// Called as `subtree` joins or leaves the tree under `parent`: advances the
+    /// counter only when `parent` is connected and the subtree holds something the
+    /// id, window-name and frame lookups see.
+    fn note_subtree_names(&mut self, parent: NodeId, subtree: NodeId) {
+        if self.in_document_tree(parent) && self.subtree_has_named_content(subtree) {
             self.note_tree_names_changed();
         }
     }
 
     fn subtree_has_named_content(&self, root: NodeId) -> bool {
+        const SCAN_LIMIT: usize = 64;
+        let mut scanned = 0usize;
         let mut current = Some(root);
         while let Some(id) = current {
+            scanned += 1;
+            if scanned > SCAN_LIMIT {
+                return true;
+            }
             if let Ok(NodeKind::Element { namespace, name, .. }) = self.kind(id) {
                 if matches!(self.get_attribute_ns_ref(id, None, "id"), Ok(Some(value)) if !value.is_empty()) {
                     return true;
@@ -523,12 +552,12 @@ impl Document {
 
     /// The elements matching window named property `wanted` in tree order, or `None`
     /// if the tree cannot be walked.
-    pub fn indexed_window_named_nodes(&self, wanted: &str) -> Option<Vec<NodeId>> {
+    pub fn indexed_window_named_nodes(&self, wanted: &str) -> Option<alloc::sync::Arc<[NodeId]>> {
         let mut index = self.id_index.borrow_mut();
         if !self.warm_id_index(&mut index, true) {
             return None;
         }
-        Some(index.window_named.get(wanted).cloned().unwrap_or_default())
+        Some(index.window_named.get(wanted).cloned().unwrap_or_else(|| alloc::sync::Arc::from([])))
     }
 
     /// Whether `wanted` can be a named property of the document: an `id`, or the
@@ -602,7 +631,7 @@ impl Document {
         index.first = first;
         index.legacy_names = legacy_names;
         index.iframe_names = iframe_names;
-        index.window_named = window_named;
+        index.window_named = window_named.into_iter().map(|(name, nodes)| (name, alloc::sync::Arc::from(nodes))).collect();
         index.built_version = Some(self.tree_names_version);
         true
     }
@@ -2921,7 +2950,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     fn insert_detached_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
-        self.note_subtree_names(child);
+        self.note_subtree_names(parent, child);
         let previous = before.map_or(self.nodes[parent.index as usize].last_child, |id| {
             self.nodes[id.index()].prev_sibling
         });
@@ -3809,7 +3838,15 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         self.version = self.version.wrapping_add(1);
         let names_changed = match &kind {
             MutationKind::FullRebuild => true,
-            MutationKind::Attribute(name) => name.as_str().eq_ignore_ascii_case("id") || name.as_str().eq_ignore_ascii_case("name"),
+            MutationKind::Attribute(name) => {
+                if name.as_str().eq_ignore_ascii_case("id") {
+                    self.in_document_tree(target)
+                } else if name.as_str().eq_ignore_ascii_case("name") {
+                    self.is_name_bearing_html_element(target) && self.in_document_tree(target)
+                } else {
+                    false
+                }
+            }
             MutationKind::Tree { .. } | MutationKind::CharacterData => false,
         };
         if names_changed {
@@ -4320,7 +4357,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             self.last_child(parent)?
         };
         self.clear_detached_node_document(child);
-        self.note_subtree_names(child);
+        self.note_subtree_names(parent, child);
         self.node_mut(child).parent = parent.index;
         self.node_mut(child).prev_sibling = Self::link_index(prev);
         self.node_mut(child).next_sibling = Self::link_index(before);
@@ -4536,7 +4573,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         } else {
             self.node_mut(parent).last_child = Self::link_index(prev);
         }
-        self.note_subtree_names(child);
+        self.note_subtree_names(parent, child);
         let node = self.node_mut(child);
         node.parent = NO_LINK;
         node.prev_sibling = NO_LINK;
@@ -4737,13 +4774,16 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             while let Some(node) = child { count += 1; child = self.next_sibling(node)?; }
             self.inert_document_roots.try_reserve(count).map_err(|_| Error::LimitExceeded)?;
         }
+        let connected = self.in_document_tree(parent);
         let mut child = self.nodes[parent.index as usize].first_child;
         self.node_mut(parent).first_child = NO_LINK;
         self.node_mut(parent).last_child = NO_LINK;
         while child != NO_LINK {
             let next = self.nodes[child as usize].next_sibling;
             let id = NodeId { document: self.id, index: child, generation: self.nodes[child as usize].generation };
-            self.note_subtree_names(id);
+            if connected && self.subtree_has_named_content(id) {
+                self.note_tree_names_changed();
+            }
             self.set_node_document(id, owner)?;
             let node = &mut self.nodes[child as usize];
             node.parent = NO_LINK;

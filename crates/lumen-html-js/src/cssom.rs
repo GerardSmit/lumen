@@ -2553,24 +2553,39 @@ struct MemoizedDeclaration {
     serialized: Result<String, css::CssError>,
 }
 
+struct MemoizedBlockText {
+    block: std::rc::Weak<css::DeclarationBlock>,
+    serialized: Result<String, css::CssError>,
+    cost: usize,
+}
+
 #[derive(Default)]
 struct DeclarationMemo {
     parsed: HashMap<String, Rc<MemoizedDeclaration>>,
-    blocks: Vec<(Rc<css::DeclarationBlock>, Result<String, css::CssError>)>,
+    blocks: Vec<MemoizedBlockText>,
     bytes: usize,
+    block_bytes: usize,
 }
 
-const DECLARATION_MEMO_BYTES: usize = 16 * 1024 * 1024;
+const DECLARATION_MEMO_BYTES: usize = 4 * 1024 * 1024;
+const DECLARATION_MEMO_ENTRY_BYTES: usize = 64 * 1024;
 const DECLARATION_MEMO_BLOCKS: usize = 16;
+const DECLARATION_MEMO_BLOCK_BYTES: usize = 1024 * 1024;
+const DECLARATION_MEMO_ENTRY_COST: usize = 128;
 
 thread_local! {
     static DECLARATION_MEMO: RefCell<DeclarationMemo> = RefCell::new(DeclarationMemo::default());
 }
 
+fn declaration_block_cost(block: &css::DeclarationBlock, serialized: &Result<String, css::CssError>) -> usize {
+    block.len() * DECLARATION_MEMO_ENTRY_COST + block.retained_text_bytes() + serialized.as_ref().map_or(0, String::len)
+}
+
 // CSSOM writes rebuild every rule of a sheet from declaration text. Parsing and
-// serializing are pure, so repeated texts and blocks are answered from memory
-// instead of being recomputed once per rule per write. A cached block keeps a
-// second strong reference, so `Rc::make_mut` copies instead of mutating it.
+// serializing are pure, so repeated texts are answered from memory instead of
+// being recomputed once per rule per write. Serialized block texts are keyed by
+// the block's allocation through a weak reference, so a rule that is the only
+// owner of its block still mutates it in place.
 fn memoized_declaration(text: &str) -> Rc<MemoizedDeclaration> {
     if let Some(found) = DECLARATION_MEMO.with(|memo| memo.borrow().parsed.get(text).cloned()) {
         return found;
@@ -2580,8 +2595,13 @@ fn memoized_declaration(text: &str) -> Rc<MemoizedDeclaration> {
         Ok(block) => block.serialize(),
         Err(error) => Err(error.clone()),
     };
+    let cost = text.len() * 2
+        + serialized.as_ref().map_or(0, String::len)
+        + block.as_ref().map_or(0, |block| declaration_block_cost(block, &serialized));
     let entry = Rc::new(MemoizedDeclaration { block: block.ok().map(Rc::new), serialized });
-    let cost = text.len() * 4 + entry.serialized.as_ref().map_or(0, String::len);
+    if cost > DECLARATION_MEMO_ENTRY_BYTES {
+        return entry;
+    }
     DECLARATION_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
         if memo.bytes + cost > DECLARATION_MEMO_BYTES {
@@ -2596,17 +2616,26 @@ fn memoized_declaration(text: &str) -> Rc<MemoizedDeclaration> {
 
 fn memoized_block_text(block: &Rc<css::DeclarationBlock>) -> Result<String, css::CssError> {
     let found = DECLARATION_MEMO.with(|memo| memo.borrow().blocks.iter()
-        .find(|(known, _)| Rc::ptr_eq(known, block)).map(|(_, text)| text.clone()));
+        .find(|known| std::ptr::eq(known.block.as_ptr(), Rc::as_ptr(block)) && known.block.strong_count() > 0)
+        .map(|known| known.serialized.clone()));
     if let Some(text) = found {
         return text;
     }
     let text = block.serialize();
+    let cost = declaration_block_cost(block, &text);
+    if cost > DECLARATION_MEMO_ENTRY_BYTES {
+        return text;
+    }
     DECLARATION_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
-        if memo.blocks.len() >= DECLARATION_MEMO_BLOCKS {
-            memo.blocks.remove(0);
+        memo.blocks.retain(|known| known.block.strong_count() > 0);
+        memo.block_bytes = memo.blocks.iter().map(|known| known.cost).sum();
+        while !memo.blocks.is_empty() && (memo.blocks.len() >= DECLARATION_MEMO_BLOCKS || memo.block_bytes + cost > DECLARATION_MEMO_BLOCK_BYTES) {
+            let removed = memo.blocks.remove(0);
+            memo.block_bytes -= removed.cost;
         }
-        memo.blocks.push((block.clone(), text.clone()));
+        memo.block_bytes += cost;
+        memo.blocks.push(MemoizedBlockText { block: Rc::downgrade(block), serialized: text.clone(), cost });
     });
     text
 }

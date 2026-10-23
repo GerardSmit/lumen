@@ -5352,14 +5352,43 @@ impl LogicalPseudo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RelativeSelector {
     /// The implicit descendant or explicit combinator from the :has anchor to
     /// the leftmost compound in this relative selector.
     relation: Relation,
     selector: Selector,
-    /// Names this relative selector in the document's `:has()` memo.
+    /// Names this relative selector in the document's `:has()` memo. A clone gets
+    /// a fresh id because nesting resolution may rewrite its selector.
     id: u64,
+    /// Lazily computed `Selector::memo_depth`: 0 unknown, 1 not memoizable,
+    /// otherwise the selector's depth need plus 2.
+    memo_depth: core::sync::atomic::AtomicUsize,
+}
+
+impl Clone for RelativeSelector {
+    fn clone(&self) -> Self {
+        Self::new(self.relation, self.selector.clone())
+    }
+}
+
+impl RelativeSelector {
+    fn new(relation: Relation, selector: Selector) -> Self {
+        Self { relation, selector, id: has_memo::next_relative_id(), memo_depth: core::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    fn memo_depth(&self) -> Option<usize> {
+        use core::sync::atomic::Ordering;
+        match self.memo_depth.load(Ordering::Relaxed) {
+            0 => {
+                let depth = self.selector.memo_depth();
+                self.memo_depth.store(depth.map_or(1, |depth| depth + 2), Ordering::Relaxed);
+                depth
+            }
+            1 => None,
+            stored => Some(stored - 2),
+        }
+    }
 }
 
 fn adjust_specificity(
@@ -10239,7 +10268,7 @@ fn parse_relative_selector_list_depth(
             depth,
             allow_nesting,
          namespaces)?;
-        result.push(RelativeSelector { relation, selector, id: has_memo::next_relative_id() });
+        result.push(RelativeSelector::new(relation, selector));
     }
     Ok(result)
 }
@@ -25039,17 +25068,34 @@ impl RelativeSelector {
         validity: &dyn crate::forms::ValidityStateView,
         quota: Option<&core::cell::Cell<usize>>,
     ) -> bool {
-        if depth > MAX_SELECTOR_MATCH_DEPTH || !document.instances.is_empty() || !self.selector.memo_safe() {
+        let memo_depth = if depth > MAX_SELECTOR_MATCH_DEPTH || !document.instances.is_empty() {
+            None
+        } else {
+            self.memo_depth().filter(|need| depth + need + 2 <= MAX_SELECTOR_MATCH_DEPTH)
+        };
+        if memo_depth.is_none() {
             return self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, quota);
         }
         let key = (self.id, anchor.key(), shadow_root.map(NodeId::key), scope_root.map(NodeId::key));
         let version = document.version();
-        if let Some(found) = document.has_memo.borrow_mut().get(version, &key) {
-            return found;
+        let cached = document.has_memo.borrow().get(version, &key);
+        if let Some(cached) = cached {
+            let Some(quota) = quota else { return cached.found; };
+            let remaining = quota.get();
+            if remaining < cached.work {
+                quota.set(0);
+                return false;
+            }
+            quota.set(remaining - cached.work);
+            return cached.found;
         }
-        let found = self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, quota);
-        if found || quota.is_none_or(|quota| quota.get() != 0) {
-            document.has_memo.borrow_mut().insert(version, key, found);
+        let measured = core::cell::Cell::new(usize::MAX);
+        let counting = quota.unwrap_or(&measured);
+        let before = counting.get();
+        let found = self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, Some(counting));
+        let after = counting.get();
+        if found || after != 0 {
+            document.has_memo.borrow_mut().insert(version, key, has_memo::HasResult { found, work: before - after });
         }
         found
     }
@@ -25286,31 +25332,49 @@ impl Selector {
                 .is_some_and(|(_, ancestor)| ancestor.has_validity_dependency())
     }
 
-    /// Whether the selector's result for an element depends only on the
+    /// `Some` when the selector's result for an element depends only on the
     /// document tree and attributes, so it holds until the document version
-    /// changes.
-    fn memo_safe(&self) -> bool {
-        !self.host
-            && !self.slotted
-            && self.part.is_none()
-            && self.nesting_selector == 0
-            && self.form_state.is_empty()
-            && self.interaction_state.is_empty()
-            && self.top_layer_state == 0
-            && self.directionality_mask == 0
-            && self.structural.iter().all(|pseudo| match pseudo {
-                StructuralPseudo::Valid | StructuralPseudo::Invalid => false,
-                StructuralPseudo::Nth { of, .. } => of.as_ref().is_none_or(|selectors| selectors.iter().all(Selector::memo_safe)),
-                _ => true,
-            })
-            && self.logical.iter().all(|pseudo| match pseudo {
-                LogicalPseudo::Not(selectors) | LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors) => {
-                    selectors.iter().all(Selector::memo_safe)
+    /// changes; the value is how many selector-match depth levels evaluating it
+    /// can descend.
+    fn memo_depth(&self) -> Option<usize> {
+        if self.host
+            || self.slotted
+            || self.part.is_some()
+            || self.nesting_selector != 0
+            || !self.form_state.is_empty()
+            || !self.interaction_state.is_empty()
+            || self.top_layer_state != 0
+            || self.directionality_mask != 0
+        {
+            return None;
+        }
+        let mut need = 0usize;
+        for pseudo in &self.structural {
+            match pseudo {
+                StructuralPseudo::Valid | StructuralPseudo::Invalid => return None,
+                StructuralPseudo::Nth { of: Some(selectors), .. } => {
+                    for selector in selectors {
+                        need = need.max(selector.memo_depth()? + 1);
+                    }
                 }
-                LogicalPseudo::Heading(_) => true,
-                _ => false,
-            })
-            && self.ancestor.as_ref().is_none_or(|(_, ancestor)| ancestor.memo_safe())
+                _ => {}
+            }
+        }
+        for pseudo in &self.logical {
+            match pseudo {
+                LogicalPseudo::Not(selectors) | LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors) => {
+                    for selector in selectors {
+                        need = need.max(selector.memo_depth()? + 1);
+                    }
+                }
+                LogicalPseudo::Heading(_) => {}
+                _ => return None,
+            }
+        }
+        if let Some((_, ancestor)) = &self.ancestor {
+            need = need.max(ancestor.memo_depth()? + 1);
+        }
+        Some(need)
     }
 
     /// Whether the selector (or an ancestor/sibling compound of it) matches on

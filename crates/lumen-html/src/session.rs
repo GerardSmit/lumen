@@ -803,7 +803,6 @@ pub struct TransitionSnapshot {
 /// everything below them, were restyled while no transition could start.
 pub struct HeldSnapshotStale {
     nodes:alloc::collections::BTreeSet<u128>,
-    all:bool,
 }
 
 pub struct RenderSession {
@@ -944,9 +943,6 @@ pub struct RenderSession {
     /// refreshed (nothing declares a transition): the elements whose style it
     /// no longer describes.
     held_snapshot_stale: Option<alloc::collections::BTreeSet<u128>>,
-    /// The held snapshot describes no element of a large document: a bulk
-    /// change restyled more of it than the dirty journal tracks.
-    held_snapshot_stale_all: bool,
     /// Elements whose Animation-origin samples `with_animation_effect_overrides`
     /// has replaced for the capture it is running.
     effect_override_nodes: alloc::collections::BTreeSet<u128>,
@@ -1119,7 +1115,6 @@ fn connected_node_count(document: &Document) -> usize {
 }
 
 const SNAPSHOT_LEAN_MIN_NODES:usize=512;
-const HELD_SNAPSHOT_ALL_MIN_NODES:usize=4096;
 const MAX_SNAPSHOT_WATCH:usize=16384;
 
 /// Which elements of a large document's snapshot need effect provenance.
@@ -1457,7 +1452,6 @@ impl RenderSession {
             snapshot_watch: alloc::collections::BTreeSet::new(),
             snapshot_watch_overflowed: false,
             held_snapshot_stale: None,
-            held_snapshot_stale_all: false,
             effect_override_nodes: alloc::collections::BTreeSet::new(),
             transition_declarations: None,
             transition_candidates: None,
@@ -3595,29 +3589,17 @@ impl RenderSession {
     /// bounded); the caller then takes a fresh snapshot.
     pub fn hold_transition_snapshot(&mut self,held:&Arc<TransitionSnapshot>)->bool {
         self.held_snapshot_stale=None;
-        self.held_snapshot_stale_all=false;
         let Ok(epoch)=self.transition_input_epoch() else {return false};
         let basis_matches=self.snapshot_basis.is_some_and(|basis|basis.version==held.epoch.document_version);
         if !basis_matches || self.snapshot_rules_unbounded || !held.epoch.differs_only_in_document(&epoch) {return false;}
         if self.rules.as_ref().is_some_and(|rules|rules.has_counter_data() || rules.has_quote_content() || rules.has_list_item_data()) {return false;}
         self.note_snapshot_dirty();
-        if self.snapshot_dirty.tree_changed && held.nodes.iter().any(|input|input.style.sibling_position_dependent) {return false;}
-        if self.snapshot_dirty.all {
-            if self.document.node_count()<HELD_SNAPSHOT_ALL_MIN_NODES {return false;}
-            self.held_snapshot_stale=Some(alloc::collections::BTreeSet::new());
-            self.held_snapshot_stale_all=true;
-            return true;
-        }
+        if self.snapshot_dirty.all
+            || (self.snapshot_dirty.tree_changed && held.nodes.iter().any(|input|input.style.sibling_position_dependent)) {return false;}
         let nodes=self.snapshot_dirty.nodes.iter().chain(&self.snapshot_dirty.subtrees).chain(&self.snapshot_rule_subjects)
             .map(|node|node.key()).collect();
         self.held_snapshot_stale=Some(nodes);
         true
-    }
-
-    /// Whether the document is large enough that a before-change snapshot
-    /// nobody can use is worth skipping rather than taking as a baseline.
-    pub fn snapshot_baseline_costly(&self)->bool {
-        self.document.node_count()>=HELD_SNAPSHOT_ALL_MIN_NODES
     }
 
     /// Whether the host's transition snapshot is being held rather than kept current.
@@ -3625,8 +3607,7 @@ impl RenderSession {
 
     /// Hands out what the held snapshot misses; the next snapshot supersedes it.
     pub fn take_held_snapshot_stale(&mut self)->Option<HeldSnapshotStale> {
-        let all=core::mem::take(&mut self.held_snapshot_stale_all);
-        self.held_snapshot_stale.take().map(|nodes|HeldSnapshotStale{nodes,all})
+        self.held_snapshot_stale.take().map(|nodes|HeldSnapshotStale{nodes})
     }
 
     /// Whether `node`, or an ancestor whose style `ancestor_changed` reports
@@ -3634,7 +3615,6 @@ impl RenderSession {
     /// ancestor whose style stayed the same passed nothing new down, so its
     /// descendants' held styles are still their before-change styles.
     pub fn held_snapshot_covers(&self,stale:&HeldSnapshotStale,node:NodeId,ancestor_changed:impl Fn(NodeId)->bool)->bool {
-        if stale.all {return true;}
         let mut current=Some(node);
         let mut depth=0;
         while let Some(id)=current {
@@ -3792,7 +3772,6 @@ impl RenderSession {
             self.snapshot_effect_nodes.clear();
             self.snapshot_effects_unbounded=false;
             self.held_snapshot_stale=None;
-            self.held_snapshot_stale_all=false;
             if incremental {self.invalidation_stats.transition_snapshots_incremental+=1;}
             else {self.invalidation_stats.transition_snapshots_full+=1;}
         }
@@ -5567,6 +5546,14 @@ impl RenderSession {
 
     pub fn has_capture_overlay(&self) -> bool {
         self.capture_overlay.is_some()
+    }
+
+    /// The single image the capture overlay presents, when it is one.
+    pub fn capture_overlay_image(&self) -> Option<Arc<crate::render_capture::ReservedImageData>> {
+        match self.capture_overlay.as_ref()?.0.as_slice() {
+            [crate::paint::Command::ReservedImage { image, .. }] => Some(image.clone()),
+            _ => None,
+        }
     }
 
     pub fn set_capture_overlay(&mut self, overlay: Option<DisplayList>) {

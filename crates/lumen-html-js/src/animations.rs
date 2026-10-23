@@ -1723,13 +1723,6 @@ fn refresh_css_transitions_inner(ctx:&mut Ctx,hub:&Rc<RefCell<AnimationHub>>,rea
             let held=hub.borrow().transition_snapshots.get(&realm_key)
                 .filter(|(owner,_)|owner.upgrade().is_some_and(|owner|Rc::ptr_eq(&owner,realm))).map(|(_,snapshot)|snapshot.clone());
             if held.as_ref().is_some_and(|held|realm.session.borrow_mut().hold_transition_snapshot(held)) {return Ok(());}
-            // A large document gets no baseline while nothing can declare a
-            // transition; the first style that does is compared from its own
-            // snapshot.
-            if realm.session.borrow().snapshot_baseline_costly() {
-                hub.borrow_mut().transition_snapshots.remove(&realm_key);
-                return Ok(());
-            }
         }
     }
     // An unchanged cascade input epoch needs lifecycle reconciliation above,

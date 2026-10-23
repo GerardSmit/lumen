@@ -1070,14 +1070,14 @@ impl WindowNamedPropertiesHandler {
         }
     }
 
-    fn named_nodes(&self, name: &str) -> OpResult<Vec<NodeId>> {
+    fn named_nodes(&self, name: &str) -> OpResult<std::sync::Arc<[NodeId]>> {
         let Some(realm) = self.realm.borrow().upgrade() else {
-            return Ok(Vec::new());
+            return Ok(std::sync::Arc::from([]));
         };
         let session = realm.session.borrow();
         let document = session.document();
         if name.is_empty() {
-            return Ok(Vec::new());
+            return Ok(std::sync::Arc::from([]));
         }
         if let Some(nodes) = document.indexed_window_named_nodes(name) {
             return Ok(nodes);
@@ -1092,7 +1092,7 @@ impl WindowNamedPropertiesHandler {
             }
             next = super::next_descendant(document, root, node).map_err(super::dom_error)?;
         }
-        Ok(nodes)
+        Ok(nodes.into())
     }
 
     /// Window's named-properties object is below the global's own properties and does not
@@ -1118,7 +1118,7 @@ impl WindowNamedPropertiesHandler {
         if let Some(proxy) = realm.named_child_value(ctx, name)?
         { return Ok(proxy); }
         let nodes = self.named_nodes(name)?;
-        match nodes.as_slice() {
+        match &*nodes {
             [] => Ok(Value::Undefined),
             [node] => Ok(realm.wrap(ctx, *node)),
             _ => {

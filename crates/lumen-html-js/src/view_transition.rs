@@ -87,7 +87,7 @@ impl Compositor {
         new: &Arc<ReservedImageData>,
         opacity: [f64; 2],
         budget: &Arc<lumen_common::limits::ByteBudget>,
-        overlay_installed: bool,
+        installed: Option<&Arc<ReservedImageData>>,
     ) -> OpResult<Option<Arc<ReservedImageData>>> {
         if (old.image.width, old.image.height) != (new.image.width, new.image.height) {
             return Err(OpError::new(
@@ -101,7 +101,9 @@ impl Compositor {
                 && Arc::ptr_eq(&last.new, new)
                 && last.opacity == opacity
             {
-                return Ok((!overlay_installed).then(|| last.image.clone()));
+                return Ok(installed
+                    .map_or(true, |installed| !Arc::ptr_eq(installed, &last.image))
+                    .then(|| last.image.clone()));
             }
         }
         let request = RenderCaptureRequest {
@@ -109,6 +111,14 @@ impl Compositor {
             width: old.image.width,
             height: old.image.height,
         };
+        let visible = opacity.map(|bits| f32::from_bits(bits) > 0.0);
+        for (slot, source, visible) in [(&mut self.old, old, visible[0]), (&mut self.new, new, visible[1])] {
+            if visible {
+                CachedPixmap::refresh(slot, source, budget)?;
+            } else {
+                *slot = None;
+            }
+        }
         let output = request.reserve(budget).ok_or_else(|| {
             OpError::new(
                 "QuotaExceededError",
@@ -121,8 +131,6 @@ impl Compositor {
                 "View transition scratch exceeds the shared pixel budget",
             )
         })?;
-        CachedPixmap::refresh(&mut self.old, old, budget)?;
-        CachedPixmap::refresh(&mut self.new, new, budget)?;
         let mut surface =
             tiny_skia::Pixmap::new(request.width, request.height).ok_or_else(|| {
                 OpError::new("InvalidStateError", "View transition surface is too large")
@@ -1654,13 +1662,13 @@ fn advance_inner(ctx: &mut Ctx) -> OpResult<()> {
         document.render_capture_reserved(&request, &budget)?
     };
     let frame_id = document.session.borrow().frame_id();
-    let overlay_installed = document.session.borrow().has_capture_overlay();
+    let installed = document.session.borrow().capture_overlay_image();
     let presented = compositor.present(
         &old,
         &new,
         [old_opacity, new_opacity],
         &budget,
-        overlay_installed,
+        installed.as_ref(),
     );
     ctx.with_instance::<DomViewTransition, _>(&wrapper, |transition| {
         let mut state = transition.state.borrow_mut();
@@ -2005,16 +2013,16 @@ mod tests {
         let guard = budget.reserve(1).unwrap();
         let mut compositor = Compositor::default();
         assert!(compositor
-            .present(&old, &new, [0.5, 0.5], &budget, false)
+            .present(&old, &new, [0.5, 0.5], &budget, None)
             .is_err());
         assert_eq!(
             budget.reserved(),
-            13,
+            17,
             "failed admission must release output and scratch storage"
         );
         drop(guard);
         let output = compositor
-            .present(&old, &new, [0.5, 0.5], &budget, false)
+            .present(&old, &new, [0.5, 0.5], &budget, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2023,7 +2031,7 @@ mod tests {
             "surface scratch must release after native composition"
         );
         assert!(compositor
-            .present(&old, &new, [0.5, 0.5], &budget, true)
+            .present(&old, &new, [0.5, 0.5], &budget, Some(&output))
             .unwrap()
             .is_none());
         drop(compositor);
