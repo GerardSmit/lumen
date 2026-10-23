@@ -2413,6 +2413,80 @@ impl Interp {
         });
     }
 
+    /// Copy `nelems` raw elements from `src` (at `src_start`) into `dst` (at `dst_start`), both of
+    /// the same element size, without an intermediate buffer. Overlapping ranges of one buffer
+    /// copy as if the source were read first. Silently drops what doesn't fit, like
+    /// [`ta_write_bytes`](Self::ta_write_bytes).
+    pub(crate) fn ta_copy_bytes(
+        &mut self,
+        src: &TaInfo,
+        src_start: usize,
+        dst: &TaInfo,
+        dst_start: usize,
+        nelems: usize,
+    ) {
+        debug_assert_eq!(src.kind.elsize(), dst.kind.elsize());
+        if !self.ta_copy_direct(src, src_start, dst, dst_start, nelems) {
+            if let Some(bytes) = self.ta_read_bytes(src, src_start, nelems) {
+                self.ta_write_bytes(dst, dst_start, &bytes);
+            }
+        }
+    }
+
+    /// [`ta_copy_bytes`](Self::ta_copy_bytes) between owned stores; `false` when it must take
+    /// the snapshot path instead (SharedArrayBuffers, which can alias one memory under one
+    /// lock; distinct stores over overlapping external memory; a busy store).
+    fn ta_copy_direct(
+        &self,
+        src: &TaInfo,
+        src_start: usize,
+        dst: &TaInfo,
+        dst_start: usize,
+        nelems: usize,
+    ) -> bool {
+        if !self.shared_buffers.is_empty()
+            && (self.shared_buffers.contains_key(&src.buffer)
+                || self.shared_buffers.contains_key(&dst.buffer))
+        {
+            return false;
+        }
+        let es = src.kind.elsize();
+        let range = |offset: usize, start: usize| {
+            let lo = start.checked_mul(es)?.checked_add(offset)?;
+            Some(lo..lo.checked_add(nelems.checked_mul(es)?)?)
+        };
+        let (Some(from), Some(to)) = (range(src.offset, src_start), range(dst.offset, dst_start))
+        else {
+            return true;
+        };
+        let (Some(s), Some(d)) = (
+            self.array_buffers.get(&src.buffer),
+            self.array_buffers.get(&dst.buffer),
+        ) else {
+            return true;
+        };
+        if std::ptr::eq::<ByteStore>(&**s, &**d) {
+            let Ok(mut buf) = d.try_bytes_mut() else {
+                return false;
+            };
+            if from.end <= buf.len() && to.end <= buf.len() {
+                buf.copy_within(from, to.start);
+            }
+            return true;
+        }
+        let (sp, dp) = (s.as_ptr() as usize, d.as_ptr() as usize);
+        if sp < dp + d.len() && dp < sp + s.len() {
+            return false;
+        }
+        let (Ok(s), Ok(mut d)) = (s.try_bytes(), d.try_bytes_mut()) else {
+            return false;
+        };
+        if let (Some(a), Some(b)) = (s.get(from), d.get_mut(to)) {
+            b.copy_from_slice(a);
+        }
+        true
+    }
+
     /// Atomically read-modify-write an integer TypedArray element: `f` maps the old raw value to
     /// the new one (or `None` for no write, as in a failed compareExchange). For a shared buffer
     /// the whole operation happens under one lock hold, so concurrent agents can't interleave

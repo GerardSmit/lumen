@@ -1228,10 +1228,8 @@ fn ta_native(
                 .min(curlen as i64 - to as i64)
                 .min(curlen as i64 - from as i64);
             if count > 0 {
-                // Snapshot bytes for overlap and preserve floating NaN payloads.
-                if let Some(bytes) = i.ta_read_bytes(&info, from, count as usize) {
-                    i.ta_write_bytes(&info, to, &bytes);
-                }
+                // Raw bytes preserve floating NaN payloads; overlap copies as memmove.
+                i.ta_copy_bytes(&info, from, &info, to, count as usize);
             }
             Ok(this.clone())
         })()),
@@ -1355,9 +1353,7 @@ fn ta_native(
                         _ => false,
                     };
                     if disjoint {
-                        if let Some(bytes) = i.ta_read_bytes(&info, start, n) {
-                            i.ta_write_bytes(&new_info, 0, &bytes);
-                        }
+                        i.ta_copy_bytes(&info, start, &new_info, 0, n);
                         return Ok(new_ta);
                     }
                     for j in 0..n {
@@ -1632,9 +1628,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 track: false,
             };
             if src.kind == kind {
-                if let Some(bytes) = i.ta_read_bytes(&src, 0, len) {
-                    i.ta_write_bytes(&info, 0, &bytes);
-                }
+                i.ta_copy_bytes(&src, 0, &info, 0, len);
             } else {
                 for idx in 0..len {
                     let v = i.ta_read(&src, idx);
@@ -1775,12 +1769,10 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         }
         let offset = offset_n as usize;
         // Same element type: SetTypedArrayFromTypedArray transfers the raw bytes (step 24), so
-        // copy them in one go. The read snapshots the source, which also makes an overlapping
-        // same-buffer copy read pre-write values.
+        // copy them in one go (as memmove, so an overlapping same-buffer copy reads pre-write
+        // values).
         if src_info.kind == info.kind {
-            if let Some(bytes) = i.ta_read_bytes(&src_info, 0, src_len) {
-                i.ta_write_bytes(&info, offset, &bytes);
-            }
+            i.ta_copy_bytes(&src_info, 0, &info, offset, src_len);
             return Ok(Value::Undefined);
         }
         // Snapshot the source first so an overlapping same-buffer copy reads pre-write values.
