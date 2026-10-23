@@ -31,7 +31,7 @@
 
 use super::*;
 use crate::bytecode::Op;
-use lumen_codegen::{BinaryOp, IntCC, MemKind, Signature, Type, Value as V};
+use lumen_codegen::{BinaryOp, IntCC, MemFlags, MemKind, Signature, Type, Value as V};
 use std::sync::OnceLock;
 
 /// Slots a directly called function may have (the site stores each one).
@@ -1307,27 +1307,27 @@ impl Tr<'_, '_> {
             (Some(so), Some(cell)) if !cfg!(target_arch = "wasm32") => {
                 inline = true;
                 let icp = self.ptrc(cell as *const _ as usize as i64);
-                let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
+                let ic_env = self.fb.load_with(PTR_MEM, icp, so.ic_env, mem::ics());
                 let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
-                let rc = self.fb.load(PTR_MEM, envp, 0);
+                let rc = self.fb.load_with(PTR_MEM, envp, 0, mem::scope());
                 let off = self.ptrc(so.rc_value);
                 let scope = self.fb.binary(BinaryOp::Iadd, rc, off);
                 let ok = self.fb.icmp(IntCC::Eq, ic_env, scope);
                 self.guard_to(ok, miss1);
-                let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+                let flag = self.fb.load_with(PTR_MEM, scope, so.borrow, mem::scope());
                 let z = self.ptrc(0);
                 let ok = self.fb.icmp(IntCC::Sge, flag, z);
                 self.guard_to(ok, miss1);
-                let g = self.fb.load(MemKind::I32, scope, so.gen);
-                let icg = self.fb.load(MemKind::I32, icp, so.ic_gen);
+                let g = self.fb.load_with(MemKind::I32, scope, so.gen, mem::scope());
+                let icg = self.fb.load_with(MemKind::I32, icp, so.ic_gen, mem::ics());
                 let ok = self.fb.icmp(IntCC::Eq, g, icg);
                 self.guard_to(ok, miss1);
-                let bd = self.fb.load(PTR_MEM, icp, so.ic_binding);
-                let init = self.fb.load(MemKind::I32U8, bd, so.b_init);
+                let bd = self.fb.load_with(PTR_MEM, icp, so.ic_binding, mem::ics());
+                let init = self.fb.load_with(MemKind::I32U8, bd, so.b_init, mem::scope());
                 let z32 = self.i32c(0);
                 let ok = self.fb.icmp(IntCC::Ne, init, z32);
                 self.guard_to(ok, miss1);
-                self.check_callee(bd, so.b_value, word, miss1);
+                self.check_word(bd, so.b_value, word, miss1, mem::scope());
                 self.fb.jump(cont, &[]);
             }
             _ => self.fb.jump(miss1, &[]),
@@ -1341,21 +1341,21 @@ impl Tr<'_, '_> {
             self.fb.seal_block(miss1);
             self.fb.switch_to_block(miss1);
             let icp = self.ptrc(cell as *const _ as usize as i64);
-            let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
+            let ic_env = self.fb.load_with(PTR_MEM, icp, so.ic_env, mem::ics());
             let envp = self.fb.load(PTR_MEM, self.frame, FRAME_ENV);
-            let rc = self.fb.load(PTR_MEM, envp, 0);
+            let rc = self.fb.load_with(PTR_MEM, envp, 0, mem::scope());
             let off = self.ptrc(so.rc_value + 1);
             let tagged = self.fb.binary(BinaryOp::Iadd, rc, off);
             let ok = self.fb.icmp(IntCC::Eq, ic_env, tagged);
             self.guard_to(ok, full);
             let off = self.ptrc(so.rc_value);
             let scope = self.fb.binary(BinaryOp::Iadd, rc, off);
-            let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+            let flag = self.fb.load_with(PTR_MEM, scope, so.borrow, mem::scope());
             let z = self.ptrc(0);
             let ok = self.fb.icmp(IntCC::Sge, flag, z);
             self.guard_to(ok, full);
-            let g = self.fb.load(MemKind::I32, scope, so.gen);
-            let icg = self.fb.load(MemKind::I32, icp, so.ic_gen);
+            let g = self.fb.load_with(MemKind::I32, scope, so.gen, mem::scope());
+            let icg = self.fb.load_with(MemKind::I32, icp, so.ic_gen, mem::ics());
             let ok = self.fb.icmp(IntCC::Eq, g, icg);
             self.guard_to(ok, full);
             let gv = self.ptrc(gp as i64);
@@ -1421,22 +1421,22 @@ impl Tr<'_, '_> {
             return None;
         }
         let icp = self.ptrc(cell as *const _ as usize as i64);
-        let ic_env = self.fb.load(PTR_MEM, icp, so.ic_env);
-        let rc = self.fb.load(PTR_MEM, envp, 0);
+        let ic_env = self.fb.load_with(PTR_MEM, icp, so.ic_env, mem::ics());
+        let rc = self.fb.load_with(PTR_MEM, envp, 0, mem::scope());
         let interp = self.fb.load(PTR_MEM, self.frame, FRAME_INTERP);
         if static_path {
             let anchor = if chunk.activation_layout.is_some() {
                 let off = self.ptrc(so.rc_value);
                 let act = self.fb.binary(BinaryOp::Iadd, rc, off);
-                let flag = self.fb.load(PTR_MEM, act, so.borrow);
+                let flag = self.fb.load_with(PTR_MEM, act, so.borrow, mem::scope());
                 let z = self.ptrc(0);
                 let ok = self.fb.icmp(IntCC::Sge, flag, z);
                 self.guard_to(ok, miss);
-                let g = self.fb.load(MemKind::I32, act, so.gen);
+                let g = self.fb.load_with(MemKind::I32, act, so.gen, mem::scope());
                 let z = self.i32c(0);
                 let ok = self.fb.icmp(IntCC::Eq, g, z);
                 self.guard_to(ok, miss);
-                self.fb.load(PTR_MEM, act, so.parent)
+                self.fb.load_with(PTR_MEM, act, so.parent, mem::scope())
             } else {
                 rc
             };
@@ -1445,7 +1445,7 @@ impl Tr<'_, '_> {
             let ok = self.fb.icmp(IntCC::Eq, ic_env, tagged);
             self.guard_to(ok, miss);
             let cp = self.ptrc(chain as *const _ as usize as i64);
-            let stored = self.fb.load(MemKind::I32, cp, so.chain_depth);
+            let stored = self.fb.load_with(MemKind::I32, cp, so.chain_depth, mem::ics());
             let want = self.i32c(depth as i64);
             let ok = self.fb.icmp(IntCC::Eq, stored, want);
             self.guard_to(ok, miss);
@@ -1453,31 +1453,35 @@ impl Tr<'_, '_> {
             let mut word = anchor;
             for hop in 0..depth {
                 let scope = self.fb.binary(BinaryOp::Iadd, word, off);
-                let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+                let flag = self.fb.load_with(PTR_MEM, scope, so.borrow, mem::scope());
                 let z = self.ptrc(0);
                 let ok = self.fb.icmp(IntCC::Sge, flag, z);
                 self.guard_to(ok, miss);
-                let g = self.fb.load(MemKind::I32, scope, so.gen);
+                let g = self.fb.load_with(MemKind::I32, scope, so.gen, mem::scope());
                 let cached = if hop == 0 {
-                    self.fb.load(MemKind::I32, icp, so.ic_gen)
+                    self.fb.load_with(MemKind::I32, icp, so.ic_gen, mem::ics())
                 } else {
-                    self.fb
-                        .load(MemKind::I32, cp, so.chain_gens + 4 * (hop as i32 - 1))
+                    self.fb.load_with(
+                        MemKind::I32,
+                        cp,
+                        so.chain_gens + 4 * (hop as i32 - 1),
+                        mem::ics(),
+                    )
                 };
                 let ok = self.fb.icmp(IntCC::Eq, g, cached);
                 self.guard_to(ok, miss);
-                word = self.fb.load(PTR_MEM, scope, so.parent);
+                word = self.fb.load_with(PTR_MEM, scope, so.parent, mem::scope());
             }
             let global_env = self.fb.load(PTR_MEM, interp, o.global_env);
             let ok = self.fb.icmp(IntCC::Eq, word, global_env);
             self.guard_to(ok, miss);
             let gscope = self.fb.binary(BinaryOp::Iadd, word, off);
-            let flag = self.fb.load(PTR_MEM, gscope, so.borrow);
+            let flag = self.fb.load_with(PTR_MEM, gscope, so.borrow, mem::scope());
             let z = self.ptrc(0);
             let ok = self.fb.icmp(IntCC::Sge, flag, z);
             self.guard_to(ok, miss);
-            let g = self.fb.load(MemKind::I32, gscope, so.gen);
-            let icg = self.fb.load(MemKind::I32, icp, so.ic_act_gen);
+            let g = self.fb.load_with(MemKind::I32, gscope, so.gen, mem::scope());
+            let icg = self.fb.load_with(MemKind::I32, icp, so.ic_act_gen, mem::ics());
             let ok = self.fb.icmp(IntCC::Eq, g, icg);
             self.guard_to(ok, miss);
         } else {
@@ -1487,18 +1491,18 @@ impl Tr<'_, '_> {
             self.guard_to(ok, miss);
             let off = self.ptrc(so.rc_value);
             let scope = self.fb.binary(BinaryOp::Iadd, rc, off);
-            let flag = self.fb.load(PTR_MEM, scope, so.borrow);
+            let flag = self.fb.load_with(PTR_MEM, scope, so.borrow, mem::scope());
             let z = self.ptrc(0);
             let ok = self.fb.icmp(IntCC::Sge, flag, z);
             self.guard_to(ok, miss);
-            let g = self.fb.load(MemKind::I32, scope, so.gen);
-            let icg = self.fb.load(MemKind::I32, icp, so.ic_gen);
+            let g = self.fb.load_with(MemKind::I32, scope, so.gen, mem::scope());
+            let icg = self.fb.load_with(MemKind::I32, icp, so.ic_gen, mem::ics());
             let ok = self.fb.icmp(IntCC::Eq, g, icg);
             self.guard_to(ok, miss);
         }
         // The binding word packs the shape id (high half) over the entry slot (low half).
-        let slot = self.fb.load(MemKind::I64U32, icp, so.ic_binding);
-        let shape = self.fb.load(MemKind::I32, icp, so.ic_binding + 4);
+        let slot = self.fb.load_with(MemKind::I64U32, icp, so.ic_binding, mem::ics());
+        let shape = self.fb.load_with(MemKind::I32, icp, so.ic_binding + 4, mem::ics());
         let gp = self.fb.load(PTR_MEM, interp, o.global);
         Some(layout::gc_data_entry(&mut self.fb, gp, shape, slot, miss))
     }
@@ -1672,10 +1676,15 @@ impl Tr<'_, '_> {
 
     /// Branch to `miss` unless the `Value` at `addr + off` is the callee `word`.
     pub(super) fn check_callee(&mut self, addr: V, off: i32, word: usize, miss: Block) {
-        let tag = self.fb.load(MemKind::I32U8, addr, off);
+        self.check_word(addr, off, word, miss, MemFlags::default());
+    }
+
+    /// [`Tr::check_callee`] reading the value with `flags`.
+    fn check_word(&mut self, addr: V, off: i32, word: usize, miss: Block, flags: MemFlags) {
+        let tag = self.fb.load_with(MemKind::I32U8, addr, off, flags);
         let obj = self.i32c(TAG_OBJ as i64);
         let is_obj = self.fb.icmp(IntCC::Eq, tag, obj);
-        let pl = self.fb.load(PTR_MEM, addr, off + VALUE_PAYLOAD);
+        let pl = self.fb.load_with(PTR_MEM, addr, off + VALUE_PAYLOAD, flags);
         let want = self.ptrc(word as i64);
         let same = self.fb.icmp(IntCC::Eq, pl, want);
         let ok = self.fb.binary(BinaryOp::Band, is_obj, same);
@@ -2792,6 +2801,7 @@ impl Tr<'_, '_> {
         self.fb.brif(was, pop_b, &[], done, &[]);
         self.fb.seal_block(pop_b);
         self.fb.switch_to_block(pop_b);
+        self.fb.mark_cold();
         self.call(Helper::PopFnFrame, &[self.frame]);
         self.fb.jump(done, &[]);
         self.fb.seal_block(done);
@@ -2925,6 +2935,7 @@ impl Tr<'_, '_> {
         self.fb.brif(fast, post, &[z], fin, &[]);
         self.fb.seal_block(fin);
         self.fb.switch_to_block(fin);
+        self.fb.mark_cold();
         let ev = match entry {
             Some(e) => e,
             None => {

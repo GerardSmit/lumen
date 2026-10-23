@@ -803,6 +803,8 @@ mod new_tests;
 #[cfg(test)]
 mod shadow_tests;
 #[cfg(test)]
+mod str_key_tests;
+#[cfg(test)]
 mod str_static_tests;
 #[cfg(test)]
 mod switch_tests;

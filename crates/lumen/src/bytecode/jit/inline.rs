@@ -661,9 +661,14 @@ impl Tr<'_, '_> {
                     let so = super::call::scope_offs().expect("planned with scope offsets");
                     let bd = self.ptrc(c.binding as i64);
                     let v = if c.num {
-                        self.fb.load(MemKind::F64, bd, so.b_value + VALUE_PAYLOAD)
+                        self.fb.load_with(
+                            MemKind::F64,
+                            bd,
+                            so.b_value + VALUE_PAYLOAD,
+                            mem::scope(),
+                        )
                     } else {
-                        self.fb.load(MemKind::I32U8, bd, so.b_value + VALUE_BOOL)
+                        self.fb.load_with(MemKind::I32U8, bd, so.b_value + VALUE_BOOL, mem::scope())
                     };
                     st.push((v, c.num));
                 }

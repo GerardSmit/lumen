@@ -1004,9 +1004,6 @@ fn gvn_folds_repeated_condition_on_then_edge() {
     let c = b.icmp(IntCC::Eq, x, five);
     let (inner, inner_then, other) = (b.create_block(), b.create_block(), b.create_block());
     b.brif(c, inner, &[], other, &[]);
-    for blk in [inner, inner_then, other] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(inner);
     let again = b.icmp(IntCC::Eq, x, five);
     b.brif(again, inner_then, &[], other, &[]);
@@ -1016,6 +1013,9 @@ fn gvn_folds_repeated_condition_on_then_edge() {
     b.switch_to_block(other);
     let twenty = b.iconst(Type::I32, 20);
     b.ret(&[twenty]);
+    for blk in [inner, inner_then, other] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1043,9 +1043,6 @@ fn gvn_folds_repeated_condition_on_else_edge() {
         b.create_block(),
     );
     b.brif(c, hit, &[], miss, &[]);
-    for blk in [hit, miss, never, last] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(hit);
     let one = b.iconst(Type::I32, 1);
     b.ret(&[one]);
@@ -1058,6 +1055,9 @@ fn gvn_folds_repeated_condition_on_else_edge() {
     b.switch_to_block(last);
     let three = b.iconst(Type::I32, 3);
     b.ret(&[three]);
+    for blk in [hit, miss, never, last] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1086,9 +1086,6 @@ fn gvn_branch_facts_do_not_reach_merge_blocks() {
         b.create_block(),
     );
     b.brif(c, left, &[], right, &[]);
-    for blk in [left, right, merge, yes, no] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(left);
     b.jump(merge, &[]);
     b.switch_to_block(right);
@@ -1102,6 +1099,9 @@ fn gvn_branch_facts_do_not_reach_merge_blocks() {
     b.switch_to_block(no);
     let zero = b.iconst(Type::I32, 0);
     b.ret(&[zero]);
+    for blk in [left, right, merge, yes, no] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1160,9 +1160,6 @@ fn gvn_band_condition_makes_both_operands_known() {
         b.create_block(),
     );
     b.brif(both, first, &[], no, &[]);
-    for blk in [first, second, yes, no] {
-        b.seal_block(blk);
-    }
     b.switch_to_block(first);
     b.brif(c1, second, &[], no, &[]);
     b.switch_to_block(second);
@@ -1173,6 +1170,9 @@ fn gvn_band_condition_makes_both_operands_known() {
     b.switch_to_block(no);
     let zero = b.iconst(Type::I32, 0);
     b.ret(&[zero]);
+    for blk in [first, second, yes, no] {
+        b.seal_block(blk);
+    }
     b.finish();
     let original = f.clone();
     opt::optimize(&mut f);
@@ -1928,13 +1928,18 @@ fn licm_keeps_loads_behind_a_trap_in_the_same_block() {
 fn licm_skips_a_loop_headed_by_the_entry_block() {
     let mut f = Function::new("licm_entry", licm_sig());
     let mut b = FunctionBuilder::new(&mut f);
-    let entry = b.create_entry_block();
+    let entry = b.create_block();
+    for ty in licm_sig().params {
+        b.append_block_param(entry, ty);
+    }
+    b.switch_to_block(entry);
     let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
     let exit = b.create_block();
     let sq = b.binary(BinaryOp::Imul, p, p);
     let zero = b.iconst(Type::I32, 0);
     let c = b.icmp(IntCC::Sgt, n, zero);
     b.brif(c, entry, &[sq, n], exit, &[]);
+    b.seal_block(entry);
     b.seal_block(exit);
     b.switch_to_block(exit);
     b.ret(&[p]);
@@ -2290,4 +2295,172 @@ fn version_skips_loads_the_hot_path_writes() {
     );
     let o = licm_optimized(&f, buffer);
     assert_eq!(load_free_loops(&o), 0, "{o}");
+}
+
+/// `acc = 0; for i in 0..n { x = [p+16]; if x == 3 { [p+store_at] = i; acc += x + i } else
+/// { miss; acc += 1000 + i } }; acc`, the load in `load` and the store in `store`. The miss side
+/// is a block of its own that is not marked cold (it stores 3 to `[p+16]` when `miss_store`)
+/// and jumps to a cold block calling a function (which writes 55 to 16).
+fn guarded_store_loop(load: MemFlags, store: MemFlags, store_at: i32, miss_store: bool) -> Function {
+    let mut f = Function::new("guarded_store", licm_sig());
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (i, acc) = (b.declare_var(Type::I32), b.declare_var(Type::I64));
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    b.def_var(i, zero);
+    b.def_var(acc, zero64);
+    let (h, body, hot, miss, slow, join, exit) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.jump(h, &[]);
+
+    b.switch_to_block(h);
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+
+    b.switch_to_block(body);
+    let x = b.load_with(MemKind::I64, p, 16, load);
+    let three = b.iconst(Type::I64, 3);
+    let ok = b.icmp(IntCC::Eq, x, three);
+    b.brif(ok, hot, &[], miss, &[]);
+    b.seal_block(hot);
+    b.seal_block(miss);
+
+    b.switch_to_block(miss);
+    if miss_store {
+        let three = b.iconst(Type::I64, 3);
+        b.store_with(MemKind::I64, p, three, 16, load);
+    }
+    b.jump(slow, &[]);
+    b.seal_block(slow);
+
+    b.switch_to_block(slow);
+    b.mark_cold();
+    b.call_fn(callee, &[]);
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::Sext, Type::I64, iv);
+    let k = b.iconst(Type::I64, 1000);
+    let s = b.binary(BinaryOp::Iadd, wide, k);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, s);
+    b.def_var(acc, a);
+    b.jump(join, &[]);
+
+    b.switch_to_block(hot);
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::Sext, Type::I64, iv);
+    b.store_with(MemKind::I32, p, iv, store_at, store);
+    let s = b.binary(BinaryOp::Iadd, wide, x);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, s);
+    b.def_var(acc, a);
+    b.jump(join, &[]);
+    b.seal_block(join);
+
+    b.switch_to_block(join);
+    let iv = b.use_var(i);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(h, &[]);
+    b.seal_block(h);
+
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+    f
+}
+
+#[test]
+fn version_hoists_a_load_past_a_hot_store_at_a_disjoint_offset() {
+    let heap = MemFlags::new(AliasClass::HEAP).notrap();
+    for at in [24, 12, 32] {
+        let f = guarded_store_loop(heap, heap, at, false);
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 1, "at={at}\n{o}");
+    }
+}
+
+#[test]
+fn version_keeps_a_load_a_hot_store_overlaps() {
+    let heap = MemFlags::new(AliasClass::HEAP).notrap();
+    for at in [16, 20, 13] {
+        let f = guarded_store_loop(heap, heap, at, false);
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(load_free_loops(&o), 0, "at={at}\n{o}");
+    }
+}
+
+#[test]
+fn version_tells_heap_parts_apart() {
+    let (obj, val) = (AliasClass(16), AliasClass(17));
+    let f = guarded_store_loop(MemFlags::new(obj).notrap(), MemFlags::new(val).notrap(), 16, false);
+    // Disjoint parts by contract: the store may not change what the load reads, so the run
+    // check uses an offset the load does not cover.
+    let o = licm_optimized(
+        &guarded_store_loop(MemFlags::new(obj).notrap(), MemFlags::new(val).notrap(), 40, false),
+        || Box::new(CallClobbers(licm_env())),
+    );
+    assert_eq!(load_free_loops(&o), 1, "{o}");
+    let mut o = f.clone();
+    opt::optimize(&mut o);
+    assert_eq!(load_free_loops(&o), 1, "{o}");
+    // A part's store still reaches loads of the whole heap.
+    let f = guarded_store_loop(
+        MemFlags::new(AliasClass::HEAP).notrap(),
+        MemFlags::new(val).notrap(),
+        16,
+        false,
+    );
+    let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+    assert_eq!(load_free_loops(&o), 0, "{o}");
+}
+
+#[test]
+fn version_treats_blocks_leading_only_to_cold_blocks_as_cold() {
+    let heap = MemFlags::new(AliasClass::HEAP).notrap();
+    let f = guarded_store_loop(heap, heap, 24, true);
+    let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+    assert_eq!(load_free_loops(&o), 1, "{o}");
+}
+
+#[test]
+fn forwarding_passes_stores_to_another_heap_part() {
+    for (class, kept) in [(AliasClass(17), 1), (AliasClass::HEAP, 2), (AliasClass(16), 2)] {
+        let mut f = Function::new(
+            "parts",
+            Signature::new(vec![Type::I64, Type::I64], vec![Type::I64]),
+        );
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let (p, q) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+        let obj = MemFlags::new(AliasClass(16));
+        let a = b.load_with(MemKind::I64, p, 0, obj);
+        let nine = b.iconst(Type::I64, 9);
+        b.store_with(MemKind::I64, q, nine, 0, MemFlags::new(class));
+        let c = b.load_with(MemKind::I64, p, 0, obj);
+        let sum = b.binary(BinaryOp::Iadd, a, c);
+        b.ret(&[sum]);
+        b.finish();
+        let original = f.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        assert_eq!(loads(&f), kept, "{class:?}\n{f}");
+        let mut e = licm_env();
+        let want = run(&original, &mut e, &[8, 32]).unwrap();
+        assert_eq!(run(&f, &mut licm_env(), &[8, 32]).unwrap(), want);
+    }
 }

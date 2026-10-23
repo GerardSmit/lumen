@@ -9,26 +9,93 @@
 //! apart are marked where they are emitted: reference counts ([`RC`]) and the [`Shadow`]
 //! header ([`SHADOW_HDR`]). An address mixing origins keeps the default class, which may
 //! alias anything.
+//!
+//! Object memory is the codegen's `HEAP`; the inline fast paths (`layout`) mark their accesses
+//! with its parts, so that writing a property's value does not invalidate what is known of
+//! the object's structure:
+//!
+//! | class     | memory                                                                      |
+//! |-----------|-----------------------------------------------------------------------------|
+//! | [`OBJ`]   | an object's box (borrow state, `Object` and `Props` header fields), its     |
+//! |           | `Shape`, property descriptor (meta) words and accessor pairs                |
+//! | [`VAL`]   | value words: properties' NaN-boxed words, packed elements, the numeric       |
+//! |           | mirror's `f64`s                                                             |
+//! | [`DENSE`] | element storage bookkeeping: the `DenseBuffers` / classic storage headers,  |
+//! |           | the classic slot map, mirror flags                                          |
+//! | [`STR`]   | string headers and bytes                                                    |
+//! | [`ICS`]   | the chunks' inline cache cells and the prototype epoch                      |
+//! | [`SCOPE`] | environments: `Env` words, scopes' borrow flags, generations, parent links  |
+//! |           | and bindings                                                                |
+//!
+//! Unmarked object accesses stay `HEAP`, which overlaps every part. Native code writes `OBJ`
+//! only where it creates a property inline; the runtime writes all of them, which is what the
+//! helpers' [`CallEffects`](lumen_codegen::ir::CallEffects) declare (see `helpers::effects`).
 
 use super::*;
 use lumen_codegen::ir::{AliasClass, Function, InstData, MemFlags, Value};
 
 /// The unit's own frame's slots.
-const SLOTS: AliasClass = AliasClass(10);
+pub(super) const SLOTS: AliasClass = AliasClass(10);
 /// The unit's own frame's operand stack.
-const STACK: AliasClass = AliasClass::STACK;
+pub(super) const STACK: AliasClass = AliasClass::STACK;
 /// The unit's own [`JitFrame`] header.
-const HEADER: AliasClass = AliasClass::FRAME;
+pub(super) const HEADER: AliasClass = AliasClass::FRAME;
+/// The `this` value the unit's own frame points at (`JitFrame::this_val`): its caller's, which
+/// only the runtime writes (binding a derived constructor's `this`).
+pub(super) const THIS: AliasClass = AliasClass(11);
 const OBJECTS: AliasClass = AliasClass::HEAP;
 const CONSTS: AliasClass = AliasClass(5);
 /// Strong and weak counts of reference-counted boxes.
 pub(super) const RC: AliasClass = AliasClass(6);
 /// Frames laid out above the shadow stack's top (inlined and direct calls).
-const SHADOW: AliasClass = AliasClass(7);
+pub(super) const SHADOW: AliasClass = AliasClass(7);
 /// The [`Shadow`] header (`top`, `end`).
 pub(super) const SHADOW_HDR: AliasClass = AliasClass(8);
 /// The `Interp` the unit's frame points at.
-const INTERP: AliasClass = AliasClass(9);
+pub(super) const INTERP: AliasClass = AliasClass(9);
+
+/// Object structure (see the module docs).
+pub(super) const OBJ: AliasClass = AliasClass(16);
+/// Property and element value words.
+pub(super) const VAL: AliasClass = AliasClass(17);
+/// Element storage bookkeeping.
+pub(super) const DENSE: AliasClass = AliasClass(18);
+/// Strings.
+pub(super) const STR: AliasClass = AliasClass(19);
+/// Inline cache cells and the prototype epoch.
+pub(super) const ICS: AliasClass = AliasClass(20);
+/// Environments.
+pub(super) const SCOPE: AliasClass = AliasClass(21);
+
+const _: () = {
+    assert!(
+        *AliasClass::HEAP_PARTS.start() <= OBJ.0 && SCOPE.0 <= *AliasClass::HEAP_PARTS.end()
+    );
+};
+
+pub(super) fn obj() -> MemFlags {
+    MemFlags::new(OBJ)
+}
+
+pub(super) fn val() -> MemFlags {
+    MemFlags::new(VAL)
+}
+
+pub(super) fn dense() -> MemFlags {
+    MemFlags::new(DENSE)
+}
+
+pub(super) fn str() -> MemFlags {
+    MemFlags::new(STR)
+}
+
+pub(super) fn ics() -> MemFlags {
+    MemFlags::new(ICS)
+}
+
+pub(super) fn scope() -> MemFlags {
+    MemFlags::new(SCOPE)
+}
 
 pub(super) fn rc() -> MemFlags {
     MemFlags::new(RC)
@@ -46,6 +113,7 @@ const O_CONSTS: u8 = 4;
 const O_SHADOW: u8 = 8;
 const O_INTERP: u8 = 16;
 const O_OTHER: u8 = 32;
+const O_THIS: u8 = 128;
 
 /// Give each unclassified load and store of `func` (whose entry parameter is the unit's
 /// frame) the class its address's origin determines.
@@ -76,6 +144,8 @@ pub(super) fn classify(func: &mut Function) {
                             O_CONSTS
                         } else if a == frame && *offset == FRAME_INTERP {
                             O_INTERP
+                        } else if a == frame && *offset == FRAME_THIS {
+                            O_THIS
                         } else if origin[a.index()] == O_INTERP
                             && i32::try_from(std::mem::offset_of!(crate::interpreter::Interp, jit_frames)) == Ok(*offset)
                         {
@@ -143,6 +213,7 @@ pub(super) fn classify(func: &mut Function) {
                 O_CONSTS => MemFlags::new(CONSTS).notrap(),
                 O_SHADOW => MemFlags::new(SHADOW),
                 O_INTERP => MemFlags::new(INTERP).notrap(),
+                O_THIS => MemFlags::new(THIS).notrap(),
                 _ => continue,
             };
             func.set_mem_flags(i, flags);

@@ -1357,8 +1357,8 @@ pub struct Interp {
     /// `import defer` namespaces awaiting first access: namespace object ptr → module key.
     /// Accessing a property of one evaluates the module (then the entry is removed).
     pub(crate) deferred_ns: crate::fasthash::FastMap<usize, crate::modules::DeferredModuleKey>,
-    /// [`Interp::fast_get_str`]'s own-property memo: `(shape id, key, slot)`, direct-mapped.
-    str_key_ic: std::cell::RefCell<Box<[Option<(u32, crate::lstr::LStr, u32)>]>>,
+    /// [`Interp::fast_get_str`]'s own-property memo.
+    pub(crate) str_key_ic: StrKeyIc,
     /// module key → its (single) deferred namespace object.
     pub(crate) deferred_ns_objs: crate::modules::SettingsModuleMap<Value>,
     /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
@@ -2223,7 +2223,7 @@ impl Interp {
             decorator_initializers: Vec::new(),
             annexb_fn_sync: Default::default(),
             deferred_ns: Default::default(),
-            str_key_ic: std::cell::RefCell::new(vec![None; STR_KEY_IC_LEN].into_boxed_slice()),
+            str_key_ic: StrKeyIc::new(),
             deferred_ns_objs: Default::default(),
             mapped_arguments: Default::default(),
             legacy_fn_cache: Default::default(),
@@ -4111,23 +4111,25 @@ impl Interp {
     /// The slot of own non-index `lkey` in `props`, through the `str_key_ic` memo.
     fn str_key_slot(&self, props: &Props, lkey: &crate::lstr::LStr) -> Option<usize> {
         let shape = props.shape();
-        let mix = ((shape as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
+        let mix = ((shape as u64).wrapping_mul(STR_KEY_MIX) >> 48) as usize;
         let h = (mix ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
-        // `slot_of` never reaches the memo, so it runs under the caller's borrow.
-        let mut ic = self.str_key_ic.borrow_mut();
-        match &ic[h] {
-            Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
-                Some(*slot as usize)
-            }
-            _ => {
-                let s = props.slot_of(lkey.as_str());
-                if let Some(s) = s {
-                    // A non-index key's slot is a named one, pinned by the shape.
-                    ic[h] = Some((shape, lkey.clone(), s as u32));
-                }
-                s
-            }
+        // SAFETY: the ways are a separate allocation owned by the memo, accessed on this
+        // thread only; `slot_of` never reaches the memo and no reference into it escapes.
+        let way = unsafe { &mut *self.str_key_ic.ways.add(h) };
+        if way.shape == shape && way.key == lkey.as_ptr() {
+            return Some(way.slot as usize);
         }
+        let s = props.slot_of(lkey.as_str());
+        if let Some(s) = s {
+            // A non-index key's slot is a named one, pinned by the shape.
+            *way = StrKeyMemo {
+                key: lkey.as_ptr(),
+                shape,
+                slot: s as u32,
+                keep: Some(lkey.clone()),
+            };
+        }
+        s
     }
 
     /// `o[key] = v` for a String `key` that is not an array index, when `o` is plain and either
@@ -9780,7 +9782,57 @@ impl Default for Interp {
     }
 }
 
-const STR_KEY_IC_LEN: usize = 512;
+/// [`Interp::str_key_ic`]'s way count (a power of two) and shape multiplier: way
+/// `((shape * STR_KEY_MIX) >> 48 ^ key >> 4) % STR_KEY_IC_LEN`, which the optimizing tier
+/// computes inline too.
+pub(crate) const STR_KEY_IC_LEN: usize = 512;
+pub(crate) const STR_KEY_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+const _: () = assert!(STR_KEY_IC_LEN.is_power_of_two());
+
+/// One way of [`StrKeyIc`]: own non-index `key` sits at entry `slot` of every object of
+/// `shape`. `keep` holds the key alive, so its address (the identity compared) is never reused
+/// while memoized; an empty way has a null `key`.
+#[repr(C)]
+pub(crate) struct StrKeyMemo {
+    pub(crate) key: *const u8,
+    pub(crate) shape: u32,
+    pub(crate) slot: u32,
+    keep: Option<crate::lstr::LStr>,
+}
+
+/// [`Interp::fast_get_str`]'s direct-mapped memo of own-property slots by (shape id, key
+/// string identity). The ways never move, so the optimizing tier probes them in place.
+pub(crate) struct StrKeyIc {
+    pub(crate) ways: *mut StrKeyMemo,
+}
+
+impl StrKeyIc {
+    fn new() -> StrKeyIc {
+        let ways: Box<[StrKeyMemo]> = (0..STR_KEY_IC_LEN)
+            .map(|_| StrKeyMemo {
+                key: std::ptr::null(),
+                shape: 0,
+                slot: 0,
+                keep: None,
+            })
+            .collect();
+        StrKeyIc {
+            ways: Box::into_raw(ways) as *mut StrKeyMemo,
+        }
+    }
+}
+
+impl Drop for StrKeyIc {
+    fn drop(&mut self) {
+        // SAFETY: `ways` came from `Box::into_raw` of `STR_KEY_IC_LEN` ways in `new`.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.ways,
+                STR_KEY_IC_LEN,
+            )))
+        };
+    }
+}
 
 /// Materializers of lazily published globals, keyed by global object and name.
 #[derive(Default)]
