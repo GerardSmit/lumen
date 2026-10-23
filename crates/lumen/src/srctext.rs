@@ -8,11 +8,36 @@
 //! the same as with a single string.
 
 use crate::lstr::LStr;
+use lumen_os::mmap::FileBytes;
 use std::borrow::Cow;
 use std::rc::{Rc, Weak};
 
 const DYN_TAIL: &str = "\n}";
 const DYN_BODY_MARK: &str = "\n) {\n";
+
+/// UTF-8 text that lives in a file mapping (or a buffer read from a file), validated once. The
+/// pages are clean and file-backed, so the OS can drop them under pressure instead of the
+/// process holding them as private memory.
+pub struct MappedText {
+    text: &'static str,
+    _owner: FileBytes,
+}
+
+impl MappedText {
+    /// `None` when the bytes are not valid UTF-8.
+    pub fn new(owner: FileBytes) -> Option<MappedText> {
+        let text = std::str::from_utf8(owner.as_bytes()).ok()?;
+        // SAFETY: the bytes live in the mapping or heap buffer `owner` holds, whose address does
+        // not change when `owner` moves and which outlives `text`: the field is private and only
+        // handed out borrowed from `&self`.
+        let text: &'static str = unsafe { &*(text as *const str) };
+        Some(MappedText { text, _owner: owner })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.text
+    }
+}
 
 pub struct DynSrc {
     head: Box<str>,
@@ -29,11 +54,13 @@ impl DynSrc {
 pub enum Src {
     Flat(Rc<str>),
     Dyn(Rc<DynSrc>),
+    Mapped(Rc<MappedText>),
 }
 
 pub enum SrcWeak {
     Flat(Weak<str>),
     Dyn(Weak<DynSrc>),
+    Mapped(Weak<MappedText>),
 }
 
 impl SrcWeak {
@@ -41,6 +68,7 @@ impl SrcWeak {
         match self {
             SrcWeak::Flat(w) => w.strong_count(),
             SrcWeak::Dyn(w) => w.strong_count(),
+            SrcWeak::Mapped(w) => w.strong_count(),
         }
     }
 }
@@ -69,12 +97,18 @@ impl PartialEq for Src {
         match (self, other) {
             (Src::Flat(a), Src::Flat(b)) => a == b,
             (Src::Dyn(a), Src::Dyn(b)) => Rc::ptr_eq(a, b),
+            (Src::Mapped(a), Src::Mapped(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
 }
 
 impl Src {
+    /// A source backed by a file mapping; `None` when it is not valid UTF-8.
+    pub fn mapped(bytes: FileBytes) -> Option<Src> {
+        MappedText::new(bytes).map(|m| Src::Mapped(Rc::new(m)))
+    }
+
     /// The source of `<prefix> anonymous(<params>\n) {\n<body>\n}` with `body` shared, not copied.
     pub fn dynamic(prefix: &str, params: &str, body: LStr) -> Src {
         let mut head = String::with_capacity(prefix.len() + params.len() + 16);
@@ -92,6 +126,7 @@ impl Src {
         match self {
             Src::Flat(s) => s.len(),
             Src::Dyn(d) => d.parts().iter().map(|p| p.len()).sum(),
+            Src::Mapped(m) => m.text.len(),
         }
     }
 
@@ -100,6 +135,7 @@ impl Src {
         match self {
             Src::Flat(s) => s,
             Src::Dyn(_) => unreachable!("a dynamic function source is never typed or JSX"),
+            Src::Mapped(_) => unreachable!("a mapped source is a classic script, never typed or JSX"),
         }
     }
 
@@ -107,11 +143,30 @@ impl Src {
         matches!(self, Src::Flat(s) if Rc::ptr_eq(s, rc))
     }
 
+    pub fn is_char_boundary(&self, at: usize) -> bool {
+        match self {
+            Src::Flat(s) => s.is_char_boundary(at),
+            Src::Mapped(m) => m.text.is_char_boundary(at),
+            Src::Dyn(d) => {
+                let mut lo = 0usize;
+                for part in d.parts() {
+                    let hi = lo + part.len();
+                    if at <= hi {
+                        return part.is_char_boundary(at - lo);
+                    }
+                    lo = hi;
+                }
+                false
+            }
+        }
+    }
+
     /// Identity of the allocation shared by every function parsed from this source.
     pub fn key(&self) -> usize {
         match self {
             Src::Flat(s) => Rc::as_ptr(s) as *const u8 as usize,
             Src::Dyn(d) => Rc::as_ptr(d) as *const u8 as usize,
+            Src::Mapped(m) => Rc::as_ptr(m) as *const u8 as usize,
         }
     }
 
@@ -119,6 +174,7 @@ impl Src {
         match self {
             Src::Flat(s) => SrcWeak::Flat(Rc::downgrade(s)),
             Src::Dyn(d) => SrcWeak::Dyn(Rc::downgrade(d)),
+            Src::Mapped(m) => SrcWeak::Mapped(Rc::downgrade(m)),
         }
     }
 
@@ -127,6 +183,7 @@ impl Src {
         match self {
             Src::Flat(s) => s.find(DYN_BODY_MARK).map(|at| (at + DYN_BODY_MARK.len()) as u32),
             Src::Dyn(d) => Some(d.head.len() as u32),
+            Src::Mapped(_) => None,
         }
     }
 
@@ -151,6 +208,10 @@ impl Src {
                 Src::Dyn(d) => {
                     dynamic = d.parts();
                     &dynamic
+                }
+                Src::Mapped(m) => {
+                    flat = [m.text];
+                    &flat
                 }
             };
             let mut lo = 0usize;
@@ -189,6 +250,47 @@ impl Src {
     /// The whole text (a copy for a dynamic source).
     pub fn text(&self) -> Cow<'_, str> {
         self.slice(0, self.len()).unwrap_or(Cow::Borrowed(""))
+    }
+}
+
+/// A classic script's source as the embedder hands it over: heap text, or a file mapped
+/// read-only (see [`ScriptSource::map_file`]).
+pub struct ScriptSource(pub(crate) Src);
+
+impl ScriptSource {
+    /// Maps `path` read-only so the source costs no private memory. A file that is not valid
+    /// UTF-8 is read and decoded lossily instead, as an owned source. The file must only ever be
+    /// replaced by rename, never rewritten in place, while the source lives.
+    pub fn map_file(path: &std::path::Path) -> std::io::Result<ScriptSource> {
+        let bytes = match lumen_os::mmap::map_file_readonly(path)? {
+            lumen_os::mmap::FileBytes::Owned(bytes) => bytes,
+            mapped => {
+                if let Some(src) = Src::mapped(mapped) {
+                    return Ok(ScriptSource(src));
+                }
+                std::fs::read(path)?
+            }
+        };
+        Ok(ScriptSource::from(Rc::<str>::from(String::from_utf8_lossy(&bytes).as_ref())))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+
+    /// Whether the text lives in a file mapping rather than on the heap.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.0, Src::Mapped(_))
+    }
+}
+
+impl From<Rc<str>> for ScriptSource {
+    fn from(s: Rc<str>) -> Self {
+        ScriptSource(Src::Flat(s))
     }
 }
 

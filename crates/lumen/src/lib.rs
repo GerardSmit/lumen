@@ -66,6 +66,7 @@ mod jstr;
 mod lexer;
 mod lstr;
 mod srctext;
+pub use srctext::ScriptSource;
 mod modules;
 #[cfg(feature = "parallel")]
 pub mod parallel;

@@ -124,6 +124,42 @@ impl Drop for Mapping {
     }
 }
 
+/// The bytes of a whole file: a read-only private mapping where the platform has one (clean
+/// file-backed pages the OS can drop and re-read, never counted as private memory), else the
+/// contents read into memory. The address of the bytes never changes while this value lives.
+pub enum FileBytes {
+    Mapped(Mapping),
+    Owned(Vec<u8>),
+}
+
+impl FileBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            // SAFETY: the mapping is `len` readable bytes (PROT_READ) until it is dropped.
+            FileBytes::Mapped(m) => unsafe { std::slice::from_raw_parts(m.ptr(), m.len()) },
+            FileBytes::Owned(v) => v,
+        }
+    }
+}
+
+/// Maps `path` read-only (`PROT_READ`, `MAP_PRIVATE`). An empty file, a failed mapping and
+/// platforms without `mmap` read the file instead. The file must not be truncated while the
+/// result lives (an unlinked or renamed-over file is fine); writers replace by rename.
+pub fn map_file_readonly(path: &std::path::Path) -> std::io::Result<FileBytes> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
+        if len > 0 {
+            if let Ok(m) = Mapping::new(len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) {
+                return Ok(FileBytes::Mapped(m));
+            }
+        }
+    }
+    std::fs::read(path).map(FileBytes::Owned)
+}
+
 /// The page size (`mmap.PAGESIZE`; also the allocation granularity on Unix).
 pub fn pagesize() -> i64 {
     crate::rlimit::pagesize()
@@ -230,5 +266,24 @@ mod tests {
         }
         m.sync(0, 4096).ok();
         m.advise(0, 4096, libc::MADV_NORMAL).unwrap();
+    }
+
+    #[test]
+    fn a_mapped_file_reads_back_and_an_empty_one_is_owned() {
+        let dir = std::env::temp_dir().join(format!("lumen-os-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let full = dir.join("full");
+        let empty = dir.join("empty");
+        std::fs::write(&full, b"hello mapped").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        let mapped = map_file_readonly(&full).unwrap();
+        assert!(matches!(mapped, FileBytes::Mapped(_)));
+        assert_eq!(mapped.as_bytes(), b"hello mapped");
+        let none = map_file_readonly(&empty).unwrap();
+        assert!(matches!(none, FileBytes::Owned(_)));
+        assert!(none.as_bytes().is_empty());
+        std::fs::remove_file(&full).unwrap();
+        std::fs::remove_file(&empty).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

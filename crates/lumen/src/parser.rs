@@ -47,8 +47,8 @@ pub(crate) fn parse_classic_script(src: &str) -> Result<(Vec<Stmt>, bool), Parse
 
 /// [`parse_classic_script`] over a source already held as an `Rc<str>`, which the parser then
 /// shares with every function parsed from it rather than copying.
-pub(crate) fn parse_classic_script_shared(src: Rc<str>) -> Result<(Vec<Stmt>, bool), ParseError> {
-    parse_script_shared("", Some(Src::Flat(src)), false, false, false, &[], lazy_bodies(), false, false, false, None)
+pub(crate) fn parse_classic_script_shared(src: Src) -> Result<(Vec<Stmt>, bool), ParseError> {
+    parse_script_shared("", Some(src), false, false, false, &[], lazy_bodies(), false, false, false, None)
         .map(|(body, _, strict)| (body, strict))
 }
 

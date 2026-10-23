@@ -82,7 +82,7 @@ struct Writer {
     deps: Option<Deps>,
     /// The unit's source, to tell its ranges from those into another text (see
     /// `enc_fnsource`), with a per-`Rc` verdict cache. `None`: every range is the unit's.
-    unit_src: Option<(Rc<str>, HashMap<*const u8, bool>)>,
+    unit_src: Option<(crate::srctext::Src, HashMap<usize, bool>)>,
     /// Split mode (see [`encode_split`]): each function is written where it occurs as its
     /// local index, and its header and body go to buffers of their own.
     split: Option<Split>,
@@ -112,12 +112,10 @@ impl Writer {
         let Some((unit, seen)) = &mut self.unit_src else {
             return true;
         };
-        let crate::srctext::Src::Flat(src) = src else {
+        if matches!(src, crate::srctext::Src::Dyn(_)) {
             return false;
-        };
-        *seen
-            .entry(src.as_ptr())
-            .or_insert_with(|| Rc::ptr_eq(unit, src) || **unit == **src)
+        }
+        *seen.entry(src.key()).or_insert_with(|| *unit == *src)
     }
 }
 
@@ -213,7 +211,7 @@ struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     /// The source every decoded range points into.
-    src: Rc<str>,
+    src: crate::srctext::Src,
     /// Private-name scopes decoded so far, in definition order (see `Writer::scopes`).
     scopes: Vec<Rc<PrivateScope>>,
     /// When collecting: every decoded function by function index (a slot is reserved when the
@@ -322,6 +320,11 @@ fn intern_op(s: &str) -> R<&'static str> {
 /// Encode a script body parsed from `src` to a snapshot blob. Function source ranges and lazy
 /// bodies are byte offsets into `src`, which [`decode`] must be handed again.
 pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
+    encode_src(body, &crate::srctext::Src::Flat(Rc::from(src)))
+}
+
+/// [`encode`] over a source the caller already holds, shared rather than copied.
+fn encode_src(body: &[Stmt], src: &crate::srctext::Src) -> Vec<u8> {
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
         scopes: HashMap::new(),
@@ -330,14 +333,14 @@ pub fn encode(body: &[Stmt], src: &str) -> Vec<u8> {
         ranges: None,
         keep: None,
         deps: None,
-        unit_src: Some((Rc::from(src), HashMap::new())),
+        unit_src: Some((src.clone(), HashMap::new())),
         split: None,
         foreign: false,
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
     w.uv(src.len() as u64);
-    w.u64(source_hash(src));
+    w.u64(source_hash(&src.text()));
     enc_stmts(&mut w, body);
     w.buf
 }
@@ -428,7 +431,7 @@ fn encode_stripped_inner_keep(
             ranges: Some(Vec::new()),
             keep: None,
             deps: None,
-            unit_src: unit_src.clone().map(|s| (s, HashMap::new())),
+            unit_src: unit_src.clone().map(|s| (crate::srctext::Src::Flat(s), HashMap::new())),
             split: None,
             foreign: false,
         };
@@ -445,7 +448,7 @@ fn encode_stripped_inner_keep(
         ranges: None,
         keep: map,
         deps: Some(Deps::default()),
-        unit_src: unit_src.map(|s| (s, HashMap::new())),
+        unit_src: unit_src.map(|s| (crate::srctext::Src::Flat(s), HashMap::new())),
         split: split.then(Split::default),
         foreign: false,
     };
@@ -604,7 +607,7 @@ fn enc_body_header(w: &mut Writer, lazy: &LazyBody, expr_body: bool) {
     w.bool(expr_body);
 }
 
-fn encode_body(body: &[Stmt], lazy: &LazyBody, src: &Rc<str>, expr_body: bool) -> Option<Vec<u8>> {
+fn encode_body(body: &[Stmt], lazy: &LazyBody, src: &crate::srctext::Src, expr_body: bool) -> Option<Vec<u8>> {
     let mut w = Writer {
         buf: Vec::new(),
         scopes: HashMap::new(),
@@ -627,7 +630,7 @@ fn encode_body(body: &[Stmt], lazy: &LazyBody, src: &Rc<str>, expr_body: bool) -
     (!w.foreign).then_some(w.buf)
 }
 
-fn decode_body(bytes: &[u8], lazy: &LazyBody, src: &Rc<str>, expr_body: bool) -> R<Vec<Stmt>> {
+fn decode_body(bytes: &[u8], lazy: &LazyBody, src: &crate::srctext::Src, expr_body: bool) -> R<Vec<Stmt>> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
@@ -669,9 +672,10 @@ impl BodyCache {
         if self.closed.get() {
             return None;
         }
-        let crate::srctext::Src::Flat(src) = &lazy.src else {
+        let src = &lazy.src;
+        if matches!(src, crate::srctext::Src::Dyn(_)) {
             return None;
-        };
+        }
         let key = (lazy.start, lazy.end);
         let decoded = {
             let st = self.state.borrow();
@@ -696,9 +700,10 @@ impl BodyCache {
         if !self.record || self.closed.get() {
             return;
         }
-        let crate::srctext::Src::Flat(src) = &lazy.src else {
+        let src = &lazy.src;
+        if matches!(src, crate::srctext::Src::Dyn(_)) {
             return;
-        };
+        }
         let key = (lazy.start, lazy.end);
         {
             let st = self.state.borrow();
@@ -776,8 +781,8 @@ impl BodyCache {
 /// length, strictness), the length-prefixed [`encode`]d top-level AST (which checks the source
 /// hash itself), then the bodies section: a count and, per body, its source range, length and
 /// [`encode_body`] bytes.
-pub(crate) fn encode_script_cache(body: &[Stmt], strict: bool, src: &str, cache: &BodyCache) -> Vec<u8> {
-    cache.set_top(encode(body, src), strict, src.len());
+pub(crate) fn encode_script_cache(body: &[Stmt], strict: bool, src: &crate::srctext::Src, cache: &BodyCache) -> Vec<u8> {
+    cache.set_top(encode_src(body, src), strict, src.len());
     cache.blob()
 }
 
@@ -809,7 +814,7 @@ fn read_body_index(mut bodies: &[u8], src_len: usize) -> Option<HashMap<(u32, u3
 
 /// The AST, strictness and body cache [`encode_script_cache`] stored for exactly this `src`, or
 /// `None`. Offsets in the index count from the start of the bodies section.
-pub(crate) fn decode_script_cache(blob: &[u8], src: &Rc<str>, record: bool) -> Option<(Vec<Stmt>, bool, Rc<BodyCache>)> {
+pub(crate) fn decode_script_cache(blob: &[u8], src: &crate::srctext::Src, record: bool) -> Option<(Vec<Stmt>, bool, Rc<BodyCache>)> {
     let rest = blob.strip_prefix(SCRIPT_CACHE_MAGIC)?;
     let (version, rest) = rest.split_first_chunk::<4>()?;
     let (len, rest) = rest.split_first_chunk::<8>()?;
@@ -837,7 +842,7 @@ pub(crate) fn decode_script_cache(blob: &[u8], src: &Rc<str>, record: bool) -> O
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
-    decode_shared(bytes, Rc::from(src))
+    decode_shared(bytes, crate::srctext::Src::Flat(Rc::from(src)))
 }
 
 /// Decode a snapshot while reusing an embedder-owned source allocation across realms.
@@ -845,7 +850,7 @@ pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
 /// The decoded AST and lazy function bodies are still created separately for each realm, but
 /// all of them retain this same `Rc<str>` instead of copying a large generated glue source for
 /// every child realm.
-pub(crate) fn decode_shared(bytes: &[u8], src: Rc<str>) -> R<Vec<Stmt>> {
+pub(crate) fn decode_shared(bytes: &[u8], src: crate::srctext::Src) -> R<Vec<Stmt>> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
     decode_inner(bytes, src, false).map(|(body, _)| body)
 }
@@ -854,7 +859,7 @@ pub(crate) fn decode_shared(bytes: &[u8], src: Rc<str>) -> R<Vec<Stmt>> {
 /// [`encode_stripped_with_functions`]).
 #[allow(dead_code)] // the non-split form; blobs use `SplitUnit`
 pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Vec<Rc<Function>>)> {
-    let (body, funcs) = decode_inner(bytes, Rc::from(src), true)?;
+    let (body, funcs) = decode_inner(bytes, crate::srctext::Src::Flat(Rc::from(src)), true)?;
     let funcs = funcs
         .unwrap_or_default()
         .into_iter()
@@ -865,11 +870,11 @@ pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Ve
 
 type Decoded = (Vec<Stmt>, Option<Vec<Option<Rc<Function>>>>);
 
-fn decode_inner(bytes: &[u8], src: Rc<str>, collect: bool) -> R<Decoded> {
+fn decode_inner(bytes: &[u8], src: crate::srctext::Src, collect: bool) -> R<Decoded> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
-        src: Rc::from(""),
+        src: crate::srctext::Src::Flat(Rc::from("")),
         scopes: Vec::new(),
         funcs: collect.then(Vec::new),
         split: None,
@@ -880,7 +885,7 @@ fn decode_inner(bytes: &[u8], src: Rc<str>, collect: bool) -> R<Decoded> {
     if r.uv()? != VERSION as u64 {
         return Err("snapshot: version mismatch".into());
     }
-    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(&src) {
+    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(&src.text()) {
         return Err("snapshot: source mismatch".into());
     }
     r.src = src;
@@ -936,7 +941,7 @@ impl SplitUnit {
         let mut r = Reader {
             buf: &ast,
             pos: 0,
-            src: src.clone(),
+            src: src.clone().into(),
             scopes: Vec::new(),
             funcs: None,
             split: None,
@@ -1051,7 +1056,7 @@ impl SplitUnit {
         Reader {
             buf,
             pos: 0,
-            src: self.src.clone(),
+            src: self.src.clone().into(),
             scopes: Vec::new(),
             funcs: None,
             split: Some(SplitRead {
@@ -2964,8 +2969,8 @@ function fine() { return 'ok'; }";
     fn child_snapshot_decodes_reuse_the_shared_source_allocation() {
         let src: Rc<str> = Rc::from("function f(a) { return a + 1; }");
         let blob = crate::compile_snapshot(&src).unwrap();
-        let first = decode_shared(&blob, src.clone()).unwrap();
-        let second = decode_shared(&blob, src.clone()).unwrap();
+        let first = decode_shared(&blob, src.clone().into()).unwrap();
+        let second = decode_shared(&blob, src.clone().into()).unwrap();
         let Stmt::FuncDecl(first_fn) = &first[0] else {
             panic!("snapshot preserves the function declaration");
         };

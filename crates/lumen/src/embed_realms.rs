@@ -782,7 +782,7 @@ impl Interp {
                 at_eof: false,
             }));
         }
-        let body = crate::snapshot::decode_shared(bytes, source).map_err(|message| {
+        let body = crate::snapshot::decode_shared(bytes, source.into()).map_err(|message| {
             HostRealmEvalError::Parse(crate::ParseError {
                 message,
                 line: 0,

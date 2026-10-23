@@ -1635,10 +1635,27 @@ impl Interp {
         cached: Option<&[u8]>,
         record: bool,
     ) -> (Result<Value, super::Abrupt>, Option<Vec<u8>>) {
+        self.run_classic_script_cached_source(source.into(), context, cached, record)
+    }
+
+    /// [`run_classic_script_cached_shared`](Self::run_classic_script_cached_shared) over a
+    /// [`ScriptSource`](crate::ScriptSource), which may be a read-only file mapping: the engine
+    /// then slices every function's text, lazy body and stack-trace position straight from the
+    /// mapped pages and never copies the source to the heap.
+    pub fn run_classic_script_cached_source(
+        &mut self,
+        source: crate::ScriptSource,
+        context: Rc<crate::ClassicScriptContext>,
+        cached: Option<&[u8]>,
+        record: bool,
+    ) -> (Result<Value, super::Abrupt>, Option<Vec<u8>>) {
+        let source = source.0;
         if crate::native_ops::dynamic_code_disabled() {
             return (Err(self.throw("EvalError", "dynamic code is unavailable in native execution")), None);
         }
-        lumen_common::memcat::retag_rc_str(&source, lumen_common::memcat::CategoryTag::SOURCE);
+        if let Src::Flat(text) = &source {
+            lumen_common::memcat::retag_rc_str(text, lumen_common::memcat::CategoryTag::SOURCE);
+        }
         let mut fresh = None;
         let mut body_cache = None;
         let hit = cached.and_then(|blob| crate::snapshot::decode_script_cache(blob, &source, record));

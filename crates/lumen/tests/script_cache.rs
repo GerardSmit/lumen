@@ -206,3 +206,37 @@ fn function_text_and_stack_agree_across_miss_and_hit_and_share_the_source() {
     let (via_str, _) = run(IIFE, None);
     assert_eq!(via_str.replace("/app.js:", "/iife.js:"), parsed);
 }
+
+fn run_mapped(path: &std::path::Path, cached: Option<&[u8]>) -> (String, Option<Vec<u8>>) {
+    let source = lumen::ScriptSource::map_file(path).unwrap();
+    assert!(source.is_mapped());
+    let mut engine = Engine::new();
+    let context = Rc::new(ClassicScriptContext { base_url: "https://example.test/iife.js".into(), ..Default::default() });
+    let (result, fresh) = engine.ctx().run_classic_script_cached_source(source, context, cached, true);
+    assert!(result.is_ok());
+    match engine.eval("out", false).unwrap() {
+        Completion::Value(v) => (v, fresh),
+        Completion::Throw { name, message } => panic!("{name}: {message}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mapped_source_runs_lazy_bodies_and_prints_function_text_like_a_heap_source() {
+    let dir = std::env::temp_dir().join(format!("lumen-mapped-source-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("iife.js");
+    std::fs::write(&path, IIFE).unwrap();
+    let (heap, _, _) = run_shared(&Rc::from(IIFE), None);
+    let (parsed, blob) = run_mapped(&path, None);
+    assert_eq!(parsed, heap);
+    assert!(parsed.starts_with("function wrapper() {"), "{parsed}");
+    assert!(parsed.contains("|function inner(a) {"), "{parsed}");
+    assert!(parsed.contains("iife.js:4:"), "{parsed}");
+    let blob = blob.expect("a miss records a blob");
+    let (decoded, fresh) = run_mapped(&path, Some(&blob));
+    assert!(fresh.is_none(), "the blob should have been used");
+    assert_eq!(decoded, parsed);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+}
