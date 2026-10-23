@@ -202,6 +202,11 @@ impl Cfg {
         pa <= pb && pb < pa + self.dom_size[a.index()]
     }
 
+    /// The nearest block dominating both `a` and `b` (both reachable).
+    pub fn common_dominator(&self, a: Block, b: Block) -> Block {
+        intersect(&self.idom, &self.rpo_index, a, b)
+    }
+
     /// Children of each block in the dominator tree, in RPO order.
     pub fn dom_children(&self) -> Vec<Vec<Block>> {
         let mut ch = vec![Vec::new(); self.idom.len()];

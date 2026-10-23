@@ -1319,3 +1319,764 @@ fn float_compare_with_inexact_operands_stays_float() {
         }
     }
 }
+
+// ----- loop-invariant code motion --------------------------------------------------------
+
+fn licm_sig() -> Signature {
+    Signature::new(vec![Type::I64, Type::I32], vec![Type::I64])
+}
+
+/// `acc = 0; for i in 0..n { acc += step }; acc` over `(p: I64, n: I32)`. `header` emits code
+/// in the loop header ahead of its test; `body` gets `p`, the I64 induction value and the
+/// header's values, and returns the step.
+fn licm_loop(
+    f: &mut Function,
+    header: impl FnOnce(&mut FunctionBuilder, Value) -> Vec<Value>,
+    body: impl FnOnce(&mut FunctionBuilder, Value, Value, &[Value]) -> Value,
+) {
+    let mut b = FunctionBuilder::new(f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (i, acc) = (b.declare_var(Type::I32), b.declare_var(Type::I64));
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    b.def_var(i, zero);
+    b.def_var(acc, zero64);
+    let (h, body_block, exit) = (b.create_block(), b.create_block(), b.create_block());
+    b.jump(h, &[]);
+
+    b.switch_to_block(h);
+    let values = header(&mut b, p);
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, body_block, &[], exit, &[]);
+    b.seal_block(body_block);
+    b.seal_block(exit);
+
+    b.switch_to_block(body_block);
+    let iv = b.use_var(i);
+    let wide = b.convert(ConvOp::Sext, Type::I64, iv);
+    let step = body(&mut b, p, wide, &values);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, step);
+    b.def_var(acc, a);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(h, &[]);
+    b.seal_block(h);
+
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+}
+
+/// Instructions matching `pred` inside some loop.
+fn in_loops(f: &Function, pred: impl Fn(&InstData) -> bool) -> usize {
+    let cfg = cfg::Cfg::with_loops(f);
+    f.layout
+        .iter()
+        .filter(|b| cfg.loop_depth[b.index()] > 0)
+        .flat_map(|b| &f.blocks[b.index()].insts)
+        .filter(|i| pred(f.inst(**i)))
+        .count()
+}
+
+fn is_load(d: &InstData) -> bool {
+    matches!(d, InstData::Load { .. })
+}
+
+/// A buffer whose word at 8 is 7 and at 16 is 3.
+fn licm_env() -> BufferEnv {
+    let mut e = env();
+    e.mem[8] = 7;
+    e.mem[16] = 3;
+    e
+}
+
+/// Optimize a copy of `f`, check it verifies and computes what `f` does, and return it.
+fn licm_optimized(f: &Function, mut make_env: impl FnMut() -> Box<dyn interp::Env>) -> Function {
+    let mut o = f.clone();
+    opt::optimize(&mut o);
+    verify::verify(&o).unwrap_or_else(|e| panic!("{e}\n{o}"));
+    // Trapping functions need a trampoline's TrapConfig; the interpreter runs cover them.
+    if !o.to_string().contains("TrapIf") {
+        aarch64::compile(&o, &aarch64::Config::host(None)).unwrap();
+    }
+    for n in [0u64, 1, 2, 5, 9] {
+        let want = run(f, &mut *make_env(), &[0, n]).unwrap();
+        assert_eq!(run(&o, &mut *make_env(), &[0, n]).unwrap(), want, "n={n}\n{o}");
+    }
+    o
+}
+
+fn buffer() -> Box<dyn interp::Env> {
+    Box::new(licm_env())
+}
+
+#[test]
+fn licm_hoists_invariant_pure_arithmetic() {
+    let mut f = Function::new("licm_pure", licm_sig());
+    licm_loop(
+        &mut f,
+        |_, _| vec![],
+        |b, p, i, _| {
+            let k = b.iconst(Type::I64, 0x55);
+            let q = b.binary(BinaryOp::Bxor, p, k);
+            let r = b.binary(BinaryOp::Imul, q, q);
+            b.binary(BinaryOp::Iadd, r, i)
+        },
+    );
+    let o = licm_optimized(&f, buffer);
+    let mul = |d: &InstData| {
+        matches!(
+            d,
+            InstData::Binary {
+                op: BinaryOp::Imul | BinaryOp::Bxor,
+                ..
+            }
+        )
+    };
+    assert_eq!(in_loops(&o, mul), 0, "{o}");
+    assert_eq!(count_insts(&o, mul), 2, "{o}");
+}
+
+#[test]
+fn licm_hoists_readonly_load_past_stores_and_calls() {
+    let mut f = Function::new("licm_readonly", licm_sig());
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    licm_loop(
+        &mut f,
+        |b, p| vec![b.load_with(MemKind::I64, p, 8, MemFlags::new(AliasClass::HEAP).readonly())],
+        |b, p, i, h| {
+            b.store(MemKind::I64, p, i, 24);
+            b.call_fn(callee, &[]);
+            b.binary(BinaryOp::Imul, h[0], i)
+        },
+    );
+    let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+    assert_eq!(in_loops(&o, is_load), 0, "{o}");
+}
+
+#[test]
+fn licm_keeps_loads_whose_memory_the_loop_writes() {
+    #[derive(Clone, Copy)]
+    enum Writer {
+        SameClass,
+        UnknownStore,
+        ClobberingCall,
+    }
+    for writer in [Writer::SameClass, Writer::UnknownStore, Writer::ClobberingCall] {
+        let mut f = Function::new("licm_written", licm_sig());
+        let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+        let flags = MemFlags::new(AliasClass::HEAP).notrap();
+        // The call writes 55 to 16.
+        let offset = if matches!(writer, Writer::ClobberingCall) { 16 } else { 8 };
+        licm_loop(
+            &mut f,
+            |b, p| vec![b.load_with(MemKind::I64, p, offset, flags)],
+            |b, p, i, h| {
+                match writer {
+                    Writer::SameClass => b.store_with(MemKind::I64, p, i, 8, flags),
+                    Writer::UnknownStore => b.store(MemKind::I64, p, i, 32),
+                    Writer::ClobberingCall => {
+                        b.call_fn(callee, &[]);
+                    }
+                }
+                b.binary(BinaryOp::Iadd, h[0], i)
+            },
+        );
+        let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+        assert_eq!(in_loops(&o, is_load), 1, "{o}");
+    }
+}
+
+/// Calls return their argument plus one and write it to 64 (stack memory in these tests).
+struct StackWriter(BufferEnv);
+
+impl interp::Env for StackWriter {
+    fn load(&mut self, addr: u64, bytes: u32) -> u64 {
+        self.0.load(addr, bytes)
+    }
+    fn store(&mut self, addr: u64, bytes: u32, value: u64) {
+        self.0.store(addr, bytes, value)
+    }
+    fn call(&mut self, _: &ExtFunc, _: &Signature, args: &[u64]) -> Result<Vec<u64>, u32> {
+        self.0.store(64, 8, args[0]);
+        Ok(vec![args[0].wrapping_add(1)])
+    }
+    fn call_indirect(&mut self, _: &Signature, _: u64, _: &[u64]) -> Result<Vec<u64>, u32> {
+        unreachable!()
+    }
+}
+
+/// The loop of [`licm_hoists_load_past_calls_and_stores_of_other_classes`]: a heap load in the
+/// header, a stack store and a call writing only the stack in the body.
+fn stack_writer_loop() -> Function {
+    let mut f = Function::new("licm_other_class", licm_sig());
+    let callee = f.import_function_with_effects(
+        Signature::new(vec![Type::I64], vec![Type::I64]),
+        0,
+        CallEffects::writes(AliasSet::of(AliasClass::STACK)),
+    );
+    licm_loop(
+        &mut f,
+        |b, p| vec![b.load_with(MemKind::I64, p, 8, MemFlags::new(AliasClass::HEAP))],
+        |b, p, i, h| {
+            b.store_with(MemKind::I64, p, i, 72, MemFlags::new(AliasClass::STACK));
+            let r = b.call_fn(callee, &[i])[0];
+            let m = b.binary(BinaryOp::Imul, h[0], i);
+            b.binary(BinaryOp::Iadd, m, r)
+        },
+    );
+    f
+}
+
+#[test]
+fn licm_hoists_load_past_calls_and_stores_of_other_classes() {
+    let f = stack_writer_loop();
+    let o = licm_optimized(&f, || Box::new(StackWriter(licm_env())));
+    assert_eq!(in_loops(&o, is_load), 0, "{o}");
+    assert_eq!(count_insts(&o, is_load), 1, "{o}");
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn licm_hoisted_load_runs_natively() {
+    extern "C" fn plus_one(x: i64) -> i64 {
+        x + 1
+    }
+    let mut f = stack_writer_loop();
+    opt::optimize(&mut f);
+    assert_eq!(in_loops(&f, is_load), 0, "{f}");
+    let code = aarch64::compile(&f, &aarch64::Config::host(None)).unwrap();
+    let (mem, addrs) =
+        aarch64::load(&[code], |id, _| (id == 0).then_some(plus_one as extern "C" fn(i64) -> i64 as usize as u64)).unwrap();
+    let _keep = mem;
+    let mut buf = [0u64; 16];
+    buf[1] = 7;
+    for n in [0u32, 1, 6, 100] {
+        let want: u64 = (0..n as u64).map(|i| 7 * i + i + 1).sum();
+        let got = unsafe {
+            let call: unsafe extern "C" fn(*mut u64, u32) -> u64 =
+                std::mem::transmute(addrs[0] as usize);
+            call(buf.as_mut_ptr(), n)
+        };
+        assert_eq!(got, want, "n={n}");
+        assert_eq!(buf[9], n.saturating_sub(1) as u64);
+    }
+}
+
+/// A loop whose body loads `p + 8` only on odd iterations.
+fn conditional_load_loop(flags: MemFlags) -> Function {
+    let mut f = Function::new("licm_conditional", licm_sig());
+    licm_loop(
+        &mut f,
+        |_, _| vec![],
+        |b, p, i, _| {
+            let (then, join) = (b.create_block(), b.create_block());
+            let v = b.append_block_param(join, Type::I64);
+            let one = b.iconst(Type::I64, 1);
+            let odd = b.binary(BinaryOp::Band, i, one);
+            let odd = b.convert(ConvOp::Wrap, Type::I32, odd);
+            let zero = b.iconst(Type::I64, 0);
+            b.brif(odd, then, &[], join, &[zero]);
+            b.seal_block(then);
+            b.switch_to_block(then);
+            let x = b.load_with(MemKind::I64, p, 8, flags);
+            b.jump(join, &[x]);
+            b.seal_block(join);
+            b.switch_to_block(join);
+            b.binary(BinaryOp::Iadd, v, i)
+        },
+    );
+    f
+}
+
+#[test]
+fn licm_hoists_conditional_loads_only_when_marked_notrap() {
+    let heap = MemFlags::new(AliasClass::HEAP);
+    let f = conditional_load_loop(heap);
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, is_load), 1, "{o}");
+    // Not hoisted, so a loop that never runs never touches the (out-of-range) address.
+    assert_eq!(run(&o, &mut env(), &[100_000, 0]).unwrap(), vec![0]);
+
+    let f = conditional_load_loop(heap.notrap());
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, is_load), 0, "{o}");
+}
+
+#[test]
+fn licm_hoists_header_loads_that_every_entry_runs() {
+    let mut f = Function::new("licm_header", licm_sig());
+    licm_loop(
+        &mut f,
+        |b, p| vec![b.load_with(MemKind::I64, p, 8, MemFlags::new(AliasClass::HEAP))],
+        |b, _, i, h| b.binary(BinaryOp::Iadd, h[0], i),
+    );
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, is_load), 0, "{o}");
+}
+
+#[test]
+fn licm_keeps_loads_of_unknown_class() {
+    let mut f = Function::new("licm_unknown", licm_sig());
+    licm_loop(
+        &mut f,
+        |b, p| vec![b.load(MemKind::I64, p, 8)],
+        |b, _, i, h| b.binary(BinaryOp::Iadd, h[0], i),
+    );
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, is_load), 1, "{o}");
+}
+
+#[test]
+fn licm_keeps_address_adds_that_fold_into_loop_accesses() {
+    let mut f = Function::new("licm_address", licm_sig());
+    licm_loop(
+        &mut f,
+        |_, _| vec![],
+        |b, p, i, _| {
+            let k = b.iconst(Type::I64, 40);
+            let slot = b.binary(BinaryOp::Iadd, p, k);
+            b.store(MemKind::I64, slot, i, 0);
+            i
+        },
+    );
+    let o = licm_optimized(&f, buffer);
+    let add_into_store = o.layout.iter().any(|&blk| {
+        o.blocks[blk.index()].insts.windows(2).any(|w| {
+            matches!(o.inst(w[0]), InstData::Binary { op: BinaryOp::Iadd, .. })
+                && matches!(o.inst(w[1]), InstData::Store { addr, .. } if *addr == o.results(w[0])[0])
+        })
+    });
+    assert!(add_into_store, "{o}");
+}
+
+#[test]
+fn licm_creates_a_preheader_for_a_header_with_parameters_and_two_entries() {
+    let mut f = Function::new("licm_preheader", licm_sig());
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (left, right, h, body, exit) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    let hi = b.append_block_param(h, Type::I32);
+    let hacc = b.append_block_param(h, Type::I64);
+    let zero = b.iconst(Type::I32, 0);
+    let one32 = b.iconst(Type::I32, 1);
+    let odd = b.binary(BinaryOp::Band, n, one32);
+    b.brif(odd, left, &[], right, &[]);
+    b.seal_block(left);
+    b.seal_block(right);
+    b.switch_to_block(left);
+    let hundred = b.iconst(Type::I64, 100);
+    b.jump(h, &[zero, hundred]);
+    b.switch_to_block(right);
+    let two_hundred = b.iconst(Type::I64, 200);
+    b.jump(h, &[zero, two_hundred]);
+    b.switch_to_block(h);
+    let c = b.icmp(IntCC::Slt, hi, n);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+    b.switch_to_block(body);
+    let sq = b.binary(BinaryOp::Imul, p, p);
+    let acc = b.binary(BinaryOp::Iadd, hacc, sq);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, hi, one);
+    b.jump(h, &[next, acc]);
+    b.seal_block(h);
+    b.switch_to_block(exit);
+    b.ret(&[hacc]);
+    b.finish();
+    verify::verify(&f).unwrap();
+    let original = f.clone();
+
+    let mut g = f.clone();
+    assert!(licm::licm(&mut g));
+    verify::verify(&g).unwrap_or_else(|e| panic!("{e}\n{g}"));
+    let cfg = cfg::Cfg::new(&g);
+    let entering: Vec<Block> = cfg.preds[h.index()]
+        .iter()
+        .copied()
+        .filter(|&p| !cfg.dominates(h, p))
+        .collect();
+    assert_eq!(entering.len(), 1, "{g}");
+    let ph = entering[0];
+    assert_ne!(ph, left);
+    assert_ne!(ph, right);
+    assert_eq!(g.blocks[ph.index()].params.len(), 2, "{g}");
+    let mul = |d: &InstData| matches!(d, InstData::Binary { op: BinaryOp::Imul, .. });
+    assert!(g.blocks[ph.index()].insts.iter().any(|&i| mul(g.inst(i))), "{g}");
+    assert_eq!(in_loops(&g, mul), 0, "{g}");
+    for args in [[3u64, 0], [3, 1], [5, 4], [7, 9]] {
+        let want = run(&original, &mut env(), &args).unwrap();
+        assert_eq!(run(&g, &mut env(), &args).unwrap(), want, "{args:?}\n{g}");
+    }
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, mul), 0, "{o}");
+}
+
+#[test]
+fn licm_hoists_nested_loop_invariants_to_the_outermost_preheader() {
+    let mut f = Function::new("licm_nested", licm_sig());
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (j, i, acc) = (
+        b.declare_var(Type::I32),
+        b.declare_var(Type::I32),
+        b.declare_var(Type::I64),
+    );
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    let one = b.iconst(Type::I32, 1);
+    b.def_var(j, zero);
+    b.def_var(acc, zero64);
+    let (oh, ob, ih, ib, olatch, exit) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    b.jump(oh, &[]);
+    b.switch_to_block(oh);
+    let jv = b.use_var(j);
+    let c = b.icmp(IntCC::Slt, jv, n);
+    b.brif(c, ob, &[], exit, &[]);
+    b.seal_block(ob);
+    b.seal_block(exit);
+    b.switch_to_block(ob);
+    b.def_var(i, zero);
+    b.jump(ih, &[]);
+    b.switch_to_block(ih);
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, ib, &[], olatch, &[]);
+    b.seal_block(ib);
+    b.seal_block(olatch);
+    b.switch_to_block(ib);
+    let sq = b.binary(BinaryOp::Imul, p, p);
+    let jv = b.use_var(j);
+    let jw = b.convert(ConvOp::Sext, Type::I64, jv);
+    let jj = b.binary(BinaryOp::Imul, jw, jw);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, sq);
+    let a = b.binary(BinaryOp::Iadd, a, jj);
+    b.def_var(acc, a);
+    let iv = b.use_var(i);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(ih, &[]);
+    b.seal_block(ih);
+    b.switch_to_block(olatch);
+    let jv = b.use_var(j);
+    let next = b.binary(BinaryOp::Iadd, jv, one);
+    b.def_var(j, next);
+    b.jump(oh, &[]);
+    b.seal_block(oh);
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+
+    let o = licm_optimized(&f, buffer);
+    let cfg = cfg::Cfg::with_loops(&o);
+    let depth_of = |pred: &dyn Fn(Value) -> bool| {
+        o.layout
+            .iter()
+            .flat_map(|blk| o.blocks[blk.index()].insts.iter().map(move |&i| (*blk, i)))
+            .filter(|&(_, i)| {
+                matches!(o.inst(i), InstData::Binary { op: BinaryOp::Imul, args } if pred(args[0]))
+            })
+            .map(|(blk, _)| cfg.loop_depth[blk.index()])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(depth_of(&|a| a == p), vec![0], "p * p leaves both loops\n{o}");
+    assert_eq!(depth_of(&|a| a != p), vec![1], "j * j leaves the inner loop only\n{o}");
+}
+
+#[test]
+fn stores_and_calls_of_other_classes_keep_known_memory() {
+    let mut f = Function::new(
+        "classes",
+        Signature::new(vec![Type::I64, Type::I64], vec![Type::I64]),
+    );
+    let callee = f.import_function_with_effects(
+        Signature::new(vec![Type::I64], vec![Type::I64]),
+        0,
+        CallEffects::writes(AliasSet::of(AliasClass::STACK)),
+    );
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, q) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let frame = MemFlags::new(AliasClass::FRAME);
+    let x = b.iconst(Type::I64, 11);
+    let y = b.iconst(Type::I64, 22);
+    b.store_with(MemKind::I64, p, x, 0, frame);
+    b.store_with(MemKind::I64, q, y, 0, MemFlags::new(AliasClass::HEAP));
+    b.call_fn(callee, &[y]);
+    let v = b.load_with(MemKind::I64, p, 0, frame);
+    b.ret(&[v]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 0, "{f}");
+    let want = run(&original, &mut StackWriter(env()), &[16, 32]).unwrap();
+    assert_eq!(want, vec![11]);
+    assert_eq!(run(&f, &mut StackWriter(env()), &[16, 32]).unwrap(), want);
+}
+
+#[test]
+fn readonly_loads_merge_across_clobbering_calls() {
+    let mut f = Function::new("readonly", Signature::new(vec![Type::I64], vec![Type::I64]));
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let p = b.block_params(entry)[0];
+    let flags = MemFlags::new(AliasClass::FRAME).readonly();
+    let a = b.load_with(MemKind::I64, p, 8, flags);
+    b.call_fn(callee, &[]);
+    let c = b.load_with(MemKind::I64, p, 8, flags);
+    let sum = b.binary(BinaryOp::Iadd, a, c);
+    b.ret(&[sum]);
+    b.finish();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 1, "{f}");
+    assert_eq!(run(&f, &mut CallClobbers(licm_env()), &[0]).unwrap(), vec![14]);
+}
+
+#[test]
+fn licm_keeps_loads_behind_a_call_in_the_same_block() {
+    let mut f = Function::new("licm_after_call", licm_sig());
+    let callee =
+        f.import_function_with_effects(Signature::new(vec![], vec![]), 0, CallEffects::READNONE);
+    licm_loop(
+        &mut f,
+        |b, p| {
+            b.call_fn(callee, &[]);
+            vec![b.load_with(MemKind::I64, p, 8, MemFlags::new(AliasClass::HEAP))]
+        },
+        |b, _, i, h| b.binary(BinaryOp::Iadd, h[0], i),
+    );
+    let o = licm_optimized(&f, || Box::new(CallClobbers(licm_env())));
+    assert_eq!(in_loops(&o, is_load), 1, "{o}");
+}
+
+#[test]
+fn licm_keeps_loads_behind_a_trap_in_the_same_block() {
+    let mut f = Function::new("licm_after_trap", licm_sig());
+    licm_loop(
+        &mut f,
+        |_, _| vec![],
+        |b, p, i, _| {
+            let limit = b.iconst(Type::I64, 1000);
+            let over = b.icmp(IntCC::Sgt, i, limit);
+            b.trap_if(over, 1);
+            let x = b.load_with(MemKind::I64, p, 8, MemFlags::new(AliasClass::HEAP));
+            b.binary(BinaryOp::Iadd, x, i)
+        },
+    );
+    let o = licm_optimized(&f, buffer);
+    assert_eq!(in_loops(&o, is_load), 1, "{o}");
+}
+
+#[test]
+fn licm_skips_a_loop_headed_by_the_entry_block() {
+    let mut f = Function::new("licm_entry", licm_sig());
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let exit = b.create_block();
+    let sq = b.binary(BinaryOp::Imul, p, p);
+    let zero = b.iconst(Type::I32, 0);
+    let c = b.icmp(IntCC::Sgt, n, zero);
+    b.brif(c, entry, &[sq, n], exit, &[]);
+    b.seal_block(exit);
+    b.switch_to_block(exit);
+    b.ret(&[p]);
+    b.finish();
+    let before = f.to_string();
+    assert!(!licm::licm(&mut f));
+    assert_eq!(f.to_string(), before);
+}
+
+#[test]
+fn licm_hoists_from_a_loop_whose_branch_has_both_edges_to_the_header() {
+    let mut f = Function::new("licm_double_edge", licm_sig());
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let (p, n) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let (i, acc) = (b.declare_var(Type::I32), b.declare_var(Type::I64));
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    b.def_var(i, zero);
+    b.def_var(acc, zero64);
+    let (h, body, exit) = (b.create_block(), b.create_block(), b.create_block());
+    b.jump(h, &[]);
+    b.switch_to_block(h);
+    let iv = b.use_var(i);
+    let c = b.icmp(IntCC::Slt, iv, n);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+    b.switch_to_block(body);
+    let sq = b.binary(BinaryOp::Imul, p, p);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, sq);
+    b.def_var(acc, a);
+    let iv = b.use_var(i);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    let again = b.icmp(IntCC::Sge, next, zero);
+    b.brif(again, h, &[], h, &[]);
+    b.seal_block(h);
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+    verify::verify(&f).unwrap();
+
+    let mut g = f.clone();
+    assert!(licm::licm(&mut g));
+    verify::verify(&g).unwrap_or_else(|e| panic!("{e}\n{g}"));
+    let mul = |d: &InstData| matches!(d, InstData::Binary { op: BinaryOp::Imul, .. });
+    assert_eq!(in_loops(&g, mul), 0, "{g}");
+    for args in [[3u64, 0], [3, 1], [5, 4]] {
+        let want = run(&f, &mut env(), &args).unwrap();
+        assert_eq!(run(&g, &mut env(), &args).unwrap(), want, "{args:?}\n{g}");
+    }
+}
+
+#[test]
+fn licm_leaves_a_loop_with_nothing_to_hoist_untouched() {
+    let mut f = Function::new("licm_nothing", licm_sig());
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let n = b.block_params(entry)[1];
+    let (left, right, h, body, exit) = (
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+        b.create_block(),
+    );
+    let hi = b.append_block_param(h, Type::I32);
+    let hacc = b.append_block_param(h, Type::I64);
+    let zero = b.iconst(Type::I32, 0);
+    let one32 = b.iconst(Type::I32, 1);
+    let odd = b.binary(BinaryOp::Band, n, one32);
+    b.brif(odd, left, &[], right, &[]);
+    b.seal_block(left);
+    b.seal_block(right);
+    b.switch_to_block(left);
+    let hundred = b.iconst(Type::I64, 100);
+    b.jump(h, &[zero, hundred]);
+    b.switch_to_block(right);
+    let two_hundred = b.iconst(Type::I64, 200);
+    b.jump(h, &[zero, two_hundred]);
+    b.switch_to_block(h);
+    let c = b.icmp(IntCC::Slt, hi, n);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+    b.switch_to_block(body);
+    let wide = b.convert(ConvOp::Sext, Type::I64, hi);
+    let acc = b.binary(BinaryOp::Iadd, hacc, wide);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, hi, one);
+    b.jump(h, &[next, acc]);
+    b.seal_block(h);
+    b.switch_to_block(exit);
+    b.ret(&[hacc]);
+    b.finish();
+    verify::verify(&f).unwrap();
+
+    let before = f.to_string();
+    let blocks = f.layout.len();
+    assert!(!licm::licm(&mut f));
+    assert_eq!(f.layout.len(), blocks);
+    assert_eq!(f.to_string(), before);
+}
+
+#[test]
+fn unroll_copies_alias_metadata() {
+    let mut f = Function::new("unroll_meta", licm_sig());
+    let flags = MemFlags::new(AliasClass::HEAP).notrap();
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let p = b.block_params(entry)[0];
+    let (i, acc) = (b.declare_var(Type::I32), b.declare_var(Type::I64));
+    let zero = b.iconst(Type::I32, 0);
+    let zero64 = b.iconst(Type::I64, 0);
+    b.def_var(i, zero);
+    b.def_var(acc, zero64);
+    let (h, body, exit) = (b.create_block(), b.create_block(), b.create_block());
+    b.jump(h, &[]);
+    b.switch_to_block(h);
+    let iv = b.use_var(i);
+    let three = b.iconst(Type::I32, 3);
+    let c = b.icmp(IntCC::Slt, iv, three);
+    b.brif(c, body, &[], exit, &[]);
+    b.seal_block(body);
+    b.seal_block(exit);
+    b.switch_to_block(body);
+    let x = b.load_with(MemKind::I64, p, 8, flags);
+    let a = b.use_var(acc);
+    let a = b.binary(BinaryOp::Iadd, a, x);
+    b.def_var(acc, a);
+    let iv = b.use_var(i);
+    let one = b.iconst(Type::I32, 1);
+    let next = b.binary(BinaryOp::Iadd, iv, one);
+    b.def_var(i, next);
+    b.jump(h, &[]);
+    b.seal_block(h);
+    b.switch_to_block(exit);
+    let r = b.use_var(acc);
+    b.ret(&[r]);
+    b.finish();
+
+    assert!(unroll::unroll(&mut f));
+    verify::verify(&f).unwrap_or_else(|e| panic!("{e}\n{f}"));
+    let marked = f
+        .layout
+        .iter()
+        .flat_map(|b| f.blocks[b.index()].insts.iter().copied())
+        .filter(|&i| is_load(f.inst(i)))
+        .map(|i| f.mem_flags(i))
+        .collect::<Vec<_>>();
+    assert!(marked.len() >= 2, "{f}");
+    assert!(marked.iter().all(|&m| m == flags), "{f}");
+}
+
+#[test]
+fn call_between_unmarked_loads_blocks_forwarding() {
+    let mut f = Function::new("unmarked", Signature::new(vec![Type::I64], vec![Type::I64]));
+    let callee = f.import_function(Signature::new(vec![], vec![]), 0);
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let p = b.block_params(entry)[0];
+    let a = b.load(MemKind::I64, p, 0);
+    b.call_fn(callee, &[]);
+    let c = b.load(MemKind::I64, p, 0);
+    let sum = b.binary(BinaryOp::Iadd, a, c);
+    b.ret(&[sum]);
+    b.finish();
+    let original = f.clone();
+    opt::optimize(&mut f);
+    assert_eq!(loads(&f), 2, "{f}");
+    let want = run(&original, &mut CallClobbers(licm_env()), &[16]).unwrap();
+    assert_eq!(want, vec![58]);
+    assert_eq!(run(&f, &mut CallClobbers(licm_env()), &[16]).unwrap(), want);
+}

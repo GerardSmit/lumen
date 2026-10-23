@@ -1,8 +1,9 @@
 //! Mid-level optimizations over SSA.
 //!
 //! [`optimize`] runs the pipeline: unreachable-block removal, trivial block-parameter removal,
-//! dominator-scoped GVN with constant folding, algebraic identities and branch folding, then
-//! dead-code elimination (including dead block parameters and their branch arguments).
+//! dominator-scoped GVN with constant folding, algebraic identities and branch folding,
+//! loop-invariant code motion ([`crate::licm`]), load forwarding, then dead-code elimination
+//! (including dead block parameters and their branch arguments).
 
 use crate::cfg::Cfg;
 use crate::eval;
@@ -36,6 +37,12 @@ fn optimize_impl(func: &mut Function, unroll: bool) {
         gvn_cached(func, &mut cfg);
         remove_unreachable(func);
         simplify_params(func);
+        dirty = true;
+    }
+    // After GVN has merged duplicates, so each invariant value is hoisted once; before load
+    // forwarding, which then sees the hoisted loads in the preheader.
+    if crate::licm::licm(func) {
+        cfg = None;
         dirty = true;
     }
     dirty |= forward_loads(func, &mut cfg);
@@ -392,6 +399,9 @@ struct Known {
     offset: i32,
     kind: MemKind,
     value: Value,
+    class: AliasClass,
+    /// Never written while the function runs: survives every store and call.
+    readonly: bool,
 }
 
 const KNOWN_CAP: usize = 32;
@@ -434,9 +444,10 @@ fn store_forwards(func: &Function, kind: MemKind, value: Value) -> bool {
 
 /// Redundant-load elimination and store-to-load forwarding. Each block starts from the memory
 /// facts at the end of its only predecessor (when that one is earlier in reverse postorder, so
-/// every fact's value dominates it) and from nothing otherwise. Any store to another address
-/// value, overlapping store or call drops the facts it may affect. Terminators are untouched;
-/// whether anything changed.
+/// every fact's value dominates it) and from nothing otherwise. A store to another address value
+/// in the same or an unknown alias class, an overlapping store, or a call writing the fact's
+/// class drops the facts it may affect; readonly facts survive everything. Terminators are
+/// untouched; whether anything changed.
 fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
     let cfg = cfg_slot.take().unwrap_or_else(|| Cfg::new(func));
     let incoming = incoming_all(func);
@@ -457,6 +468,7 @@ fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
                 InstData::Load { kind, addr, offset } => {
                     let addr = func.resolve(addr);
                     let result = func.results(inst)[0];
+                    let flags = func.mem_flags(inst);
                     let hit = known
                         .iter()
                         .find(|e| e.addr == addr && e.offset == offset && e.kind == kind);
@@ -474,6 +486,8 @@ fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
                             offset,
                             kind,
                             value: result,
+                            class: flags.class,
+                            readonly: flags.readonly,
                         });
                     }
                 }
@@ -484,12 +498,18 @@ fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
                     offset,
                 } => {
                     let addr = func.resolve(addr);
+                    let class = func.mem_flags(inst).class;
                     let (lo, hi) = (offset as i64, offset as i64 + kind.bytes() as i64);
                     known.retain(|e| {
-                        e.addr == addr && {
-                            let (elo, ehi) = (e.offset as i64, e.offset as i64 + e.kind.bytes() as i64);
-                            ehi <= lo || hi <= elo
-                        }
+                        e.readonly
+                            || (class.is_known()
+                                && e.class.is_known()
+                                && class.clamped() != e.class.clamped())
+                            || e.addr == addr && {
+                                let (elo, ehi) =
+                                    (e.offset as i64, e.offset as i64 + e.kind.bytes() as i64);
+                                ehi <= lo || hi <= elo
+                            }
                     });
                     if store_forwards(func, kind, value) {
                         if known.len() == KNOWN_CAP {
@@ -500,10 +520,16 @@ fn forward_loads(func: &mut Function, cfg_slot: &mut Option<Cfg>) -> bool {
                             offset,
                             kind,
                             value: func.resolve(value),
+                            class,
+                            readonly: false,
                         });
                     }
                 }
                 InstData::Prefetch { .. } | InstData::TrapIf { .. } => {}
+                InstData::Call { .. } | InstData::CallIndirect { .. } => {
+                    let writes = func.writes(inst);
+                    known.retain(|e| e.readonly || !writes.may_touch(e.class));
+                }
                 d if d.is_pure() || d.is_terminator() => {}
                 _ => known.clear(),
             }
@@ -767,6 +793,22 @@ fn gvn_cached(func: &mut Function, cfg_slot: &mut Option<Cfg>) {
                 };
             }
             let data = func.inst(inst);
+            // A readonly load equals any dominating load of the same location.
+            if matches!(data, InstData::Load { .. }) && func.mem_flags(inst).readonly {
+                let result = func.results(inst)[0];
+                match table.get(data) {
+                    Some(&v) => {
+                        func.replace_uses(result, v);
+                        removed.push(inst);
+                    }
+                    None => {
+                        let key = data.clone();
+                        table.insert(key.clone(), result);
+                        log.push(key);
+                    }
+                }
+                continue;
+            }
             if !data.is_pure() && !is_foldable_trapping(data) {
                 continue;
             }

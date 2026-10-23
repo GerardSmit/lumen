@@ -15,6 +15,7 @@ pub mod interp;
 pub mod ir;
 pub mod jitmem;
 pub mod legalize;
+pub mod licm;
 pub mod machinst;
 pub mod opt;
 pub mod regalloc;

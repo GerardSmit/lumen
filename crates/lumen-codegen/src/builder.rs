@@ -416,6 +416,57 @@ impl<'a> FunctionBuilder<'a> {
             offset,
         });
     }
+    /// [`FunctionBuilder::load`] with alias class and speculation flags.
+    pub fn load_with(&mut self, kind: MemKind, addr: Value, offset: i32, flags: MemFlags) -> Value {
+        let inst = self.push(InstData::Load { kind, addr, offset });
+        self.func.set_mem_flags(inst, flags);
+        self.func.results(inst)[0]
+    }
+    pub fn store_with(
+        &mut self,
+        kind: MemKind,
+        addr: Value,
+        value: Value,
+        offset: i32,
+        flags: MemFlags,
+    ) {
+        let inst = self.push(InstData::Store {
+            kind,
+            addr,
+            value,
+            offset,
+        });
+        self.func.set_mem_flags(inst, flags);
+    }
+    /// A call with its own effects, overriding the callee's (see [`Function::set_func_effects`]).
+    pub fn call_fn_with(
+        &mut self,
+        func: FuncRef,
+        args: &[Value],
+        effects: CallEffects,
+    ) -> Vec<Value> {
+        let inst = self.push(InstData::Call {
+            func,
+            args: args.to_vec(),
+        });
+        self.func.set_call_effects(inst, effects);
+        self.func.results(inst).to_vec()
+    }
+    pub fn call_indirect_with(
+        &mut self,
+        sig: SigRef,
+        callee: Value,
+        args: &[Value],
+        effects: CallEffects,
+    ) -> Vec<Value> {
+        let inst = self.push(InstData::CallIndirect {
+            sig,
+            callee,
+            args: args.to_vec(),
+        });
+        self.func.set_call_effects(inst, effects);
+        self.func.results(inst).to_vec()
+    }
     pub fn call_fn(&mut self, func: FuncRef, args: &[Value]) -> Vec<Value> {
         let inst = self.push(InstData::Call {
             func,

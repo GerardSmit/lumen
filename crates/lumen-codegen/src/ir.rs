@@ -304,6 +304,178 @@ impl MemKind {
     }
 }
 
+/// A region of memory for alias analysis: accesses in two different known classes never overlap.
+/// [`AliasClass::UNKNOWN`] may overlap anything; the other predefined classes describe the JIT's
+/// memory, and front ends may number further disjoint regions up to [`AliasClass::LAST`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct AliasClass(pub u8);
+
+impl AliasClass {
+    pub const UNKNOWN: AliasClass = AliasClass(0);
+    /// The JIT frame header and its local slots.
+    pub const FRAME: AliasClass = AliasClass(1);
+    /// The JIT's operand stack and scratch slots.
+    pub const STACK: AliasClass = AliasClass(2);
+    /// Object fields, element storage and other engine heap memory.
+    pub const HEAP: AliasClass = AliasClass(3);
+    pub const OTHER: AliasClass = AliasClass(4);
+    pub const LAST: u8 = 31;
+
+    pub fn is_known(self) -> bool {
+        self.0 != 0
+    }
+
+    /// The class with its number clamped to [`AliasClass::LAST`], as [`AliasSet`] stores it.
+    pub fn clamped(self) -> AliasClass {
+        AliasClass(self.0.min(AliasClass::LAST))
+    }
+}
+
+/// A set of [`AliasClass`]es (bit `n` is class `n`); a set holding [`AliasClass::UNKNOWN`]
+/// is [`AliasSet::ALL`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AliasSet(pub u32);
+
+impl AliasSet {
+    pub const NONE: AliasSet = AliasSet(0);
+    pub const ALL: AliasSet = AliasSet(u32::MAX);
+
+    pub fn of(class: AliasClass) -> AliasSet {
+        if class.is_known() {
+            AliasSet(1 << class.clamped().0)
+        } else {
+            AliasSet::ALL
+        }
+    }
+
+    pub fn with(self, class: AliasClass) -> AliasSet {
+        self.union(AliasSet::of(class))
+    }
+
+    /// The set minus a known class (`ALL.without(FRAME)`: everything but the frame).
+    pub fn without(self, class: AliasClass) -> AliasSet {
+        if class.is_known() {
+            AliasSet(self.0 & !(1 << class.clamped().0))
+        } else {
+            self
+        }
+    }
+
+    pub fn union(self, other: AliasSet) -> AliasSet {
+        AliasSet(self.0 | other.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether memory of `class` may be in the set.
+    pub fn may_touch(self, class: AliasClass) -> bool {
+        if class.is_known() {
+            self.0 & (1 << class.clamped().0) != 0
+        } else {
+            self.0 != 0
+        }
+    }
+}
+
+/// What the optimizer may assume about a load or store; the default assumes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct MemFlags {
+    pub class: AliasClass,
+    /// The location is never written while the function runs (by it or anything it calls), so
+    /// loads of it may be merged and moved past any store or call.
+    pub readonly: bool,
+    /// The address is always dereferenceable, so the load may run where the program would not
+    /// have run it (hoisted out of a conditional or ahead of a loop's first test).
+    pub notrap: bool,
+}
+
+impl MemFlags {
+    pub const DEFAULT: MemFlags = MemFlags {
+        class: AliasClass::UNKNOWN,
+        readonly: false,
+        notrap: false,
+    };
+
+    pub fn new(class: AliasClass) -> MemFlags {
+        debug_assert!(class.0 <= AliasClass::LAST, "alias class {} out of range", class.0);
+        MemFlags {
+            class,
+            ..MemFlags::DEFAULT
+        }
+    }
+
+    pub fn readonly(mut self) -> MemFlags {
+        self.readonly = true;
+        self
+    }
+
+    pub fn notrap(mut self) -> MemFlags {
+        self.notrap = true;
+        self
+    }
+}
+
+impl fmt::Display for MemFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.class {
+            AliasClass::UNKNOWN => write!(f, "any")?,
+            AliasClass::FRAME => write!(f, "frame")?,
+            AliasClass::STACK => write!(f, "stack")?,
+            AliasClass::HEAP => write!(f, "heap")?,
+            AliasClass::OTHER => write!(f, "other")?,
+            AliasClass(n) => write!(f, "class{n}")?,
+        }
+        if self.readonly {
+            write!(f, " readonly")?;
+        }
+        if self.notrap {
+            write!(f, " notrap")?;
+        }
+        Ok(())
+    }
+}
+
+/// The memory a call may read and write; the default may touch everything. Calls are never
+/// moved or removed; the effects only say which loads and known memory contents survive them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallEffects {
+    pub reads: AliasSet,
+    pub writes: AliasSet,
+}
+
+impl Default for CallEffects {
+    fn default() -> CallEffects {
+        CallEffects::CLOBBERS_ALL
+    }
+}
+
+impl CallEffects {
+    pub const CLOBBERS_ALL: CallEffects = CallEffects {
+        reads: AliasSet::ALL,
+        writes: AliasSet::ALL,
+    };
+    /// Touches no memory the function can see.
+    pub const READNONE: CallEffects = CallEffects {
+        reads: AliasSet::NONE,
+        writes: AliasSet::NONE,
+    };
+    /// Reads anything, writes nothing.
+    pub const READONLY: CallEffects = CallEffects {
+        reads: AliasSet::ALL,
+        writes: AliasSet::NONE,
+    };
+
+    /// Reads anything, writes only `writes`.
+    pub fn writes(writes: AliasSet) -> CallEffects {
+        CallEffects {
+            reads: AliasSet::ALL,
+            writes,
+        }
+    }
+}
+
 /// A branch target with the arguments for its parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockCall {
@@ -805,6 +977,12 @@ pub struct Function {
     /// Some operand may still name an alias: set by [`Function::replace_uses`], cleared by
     /// [`Function::resolve_aliases`].
     pending_aliases: bool,
+    /// Flags of each load and store, by instruction (shorter than `insts`: the rest default).
+    mem_flags: Vec<MemFlags>,
+    /// Effects of calls to each imported function, by [`FuncRef`] (the rest clobber all).
+    func_effects: Vec<CallEffects>,
+    /// Per-call-site effects, by instruction; they override `func_effects`.
+    site_effects: Vec<Option<CallEffects>>,
 }
 
 impl Function {
@@ -849,6 +1027,105 @@ impl Function {
         let sig = self.import_signature(sig);
         self.funcs.push(ExtFunc { sig, id });
         FuncRef(self.funcs.len() as u32 - 1)
+    }
+
+    /// [`Function::import_function`] with the effects every call to it has.
+    pub fn import_function_with_effects(
+        &mut self,
+        sig: Signature,
+        id: u32,
+        effects: CallEffects,
+    ) -> FuncRef {
+        let f = self.import_function(sig, id);
+        self.set_func_effects(f, effects);
+        f
+    }
+
+    pub fn set_func_effects(&mut self, func: FuncRef, effects: CallEffects) {
+        let i = func.index();
+        if self.func_effects.len() <= i {
+            self.func_effects.resize(i + 1, CallEffects::CLOBBERS_ALL);
+        }
+        self.func_effects[i] = effects;
+    }
+
+    pub fn func_effects(&self, func: FuncRef) -> CallEffects {
+        self.func_effects
+            .get(func.index())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Effects of the call `inst` alone (overriding its function's).
+    pub fn set_call_effects(&mut self, inst: Inst, effects: CallEffects) {
+        let i = inst.index();
+        if self.site_effects.len() <= i {
+            self.site_effects.resize(i + 1, None);
+        }
+        self.site_effects[i] = Some(effects);
+    }
+
+    /// The effects of `inst` when it is a call.
+    pub fn call_effects(&self, inst: Inst) -> CallEffects {
+        if let Some(Some(e)) = self.site_effects.get(inst.index()) {
+            return *e;
+        }
+        match self.inst(inst) {
+            InstData::Call { func, .. } => self.func_effects(*func),
+            _ => CallEffects::CLOBBERS_ALL,
+        }
+    }
+
+    pub fn set_mem_flags(&mut self, inst: Inst, flags: MemFlags) {
+        debug_assert!(
+            flags.class.0 <= AliasClass::LAST,
+            "alias class {} out of range",
+            flags.class.0
+        );
+        let i = inst.index();
+        if self.mem_flags.len() <= i {
+            if flags == MemFlags::DEFAULT {
+                return;
+            }
+            self.mem_flags.resize(i + 1, MemFlags::DEFAULT);
+        }
+        self.mem_flags[i] = flags;
+    }
+
+    pub fn mem_flags(&self, inst: Inst) -> MemFlags {
+        self.mem_flags
+            .get(inst.index())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Set the flags of the load defining `v`; false when `v` is not a load's result.
+    pub fn mark_load(&mut self, v: Value, flags: MemFlags) -> bool {
+        match self.values[self.resolve(v).index()].def {
+            ValueDef::Result(inst, 0) if matches!(self.inst(inst), InstData::Load { .. }) => {
+                self.set_mem_flags(inst, flags);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Carry `from`'s memory flags and call effects over to its copy `to`.
+    pub fn copy_inst_meta(&mut self, from: Inst, to: Inst) {
+        let flags = self.mem_flags(from);
+        self.set_mem_flags(to, flags);
+        if let Some(Some(e)) = self.site_effects.get(from.index()).copied() {
+            self.set_call_effects(to, e);
+        }
+    }
+
+    /// The memory `inst` may write.
+    pub fn writes(&self, inst: Inst) -> AliasSet {
+        match self.inst(inst) {
+            InstData::Store { .. } => AliasSet::of(self.mem_flags(inst).class),
+            InstData::Call { .. } | InstData::CallIndirect { .. } => self.call_effects(inst).writes,
+            _ => AliasSet::NONE,
+        }
     }
 
     pub fn create_block(&mut self) -> Block {
@@ -1007,7 +1284,12 @@ impl fmt::Display for Function {
                     let names: Vec<String> = results.iter().map(|v| v.to_string()).collect();
                     write!(f, "{} = ", names.join(", "))?;
                 }
-                writeln!(f, "{:?}", self.insts[inst.index()])?;
+                write!(f, "{:?}", self.insts[inst.index()])?;
+                let flags = self.mem_flags(inst);
+                if flags != MemFlags::DEFAULT {
+                    write!(f, " [{flags}]")?;
+                }
+                writeln!(f)?;
             }
         }
         write!(f, "}}")

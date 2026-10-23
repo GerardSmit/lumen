@@ -288,6 +288,7 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
                     });
                 }
                 let ni = func.make_inst(data);
+                func.copy_inst_meta(inst, ni);
                 let olds = func.results(inst).to_vec();
                 let news = func.results(ni).to_vec();
                 for (o, nv) in olds.into_iter().zip(news) {
