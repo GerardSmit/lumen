@@ -736,6 +736,7 @@ fn flush_updates(ctx: &mut Ctx, document: &Rc<DomRealm>) -> OpResult<()> {
         ctx.set_native_internal_value_slot(&document_wrapper, key, Value::Null)
             .map_err(OpError::thrown)?;
     }
+    let mut first_error = None;
     // A snapshot prevents callbacks appended during invocation from running
     // before the current callback has returned to its task boundary.
     while next.as_obj().is_some() {
@@ -745,9 +746,14 @@ fn flush_updates(ctx: &mut Ctx, document: &Rc<DomRealm>) -> OpResult<()> {
             state.queued = false;
             state.queued_next.take().unwrap_or(Value::Null)
         })?;
-        invoke_update(ctx, &wrapper)?;
+        if let Err(error) = invoke_update(ctx, &wrapper) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            let _ = skip(ctx, &wrapper, "AbortError", "View transition update failed");
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn clear_presentation(ctx: &mut Ctx, wrapper: &Value) -> OpResult<()> {

@@ -1183,27 +1183,50 @@ impl CanvasSurface {
 
     /// Applies an operation list to a premultiplied layer in place. The blur
     /// scale follows the current transform so filter lengths track the CTM.
+    /// Only the layer's non-transparent bounds, grown by the filters' reach,
+    /// are processed; the rest of a color or blur filter's output is transparent.
     fn filter_pixmap(
         &self,
         layer: &mut Pixmap,
         filters: &[lumen_common::filter::FilterOperation],
         transform: Transform,
     ) -> Result<(), ImageError> {
-        let mut image = Rgba8Image {
-            width: layer.width(),
-            height: layer.height(),
-            pixels: Vec::with_capacity(layer.data().len()),
-        };
-        for pixel in layer.pixels() {
-            let c = pixel.demultiply();
-            image.pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-        }
         let determinant = f64::from(transform.sx) * f64::from(transform.sy)
             - f64::from(transform.kx) * f64::from(transform.ky);
         let scale = determinant.abs().sqrt() as f32;
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-        crate::apply_filter_operations(&mut image, filters, scale, layer.data().len(), [0, 0])?;
-        *layer = premultiplied_pixmap(&image)?;
+        let Some([x0, y0, x1, y1]) = filter_region(layer, filters, scale) else {
+            return Ok(());
+        };
+        let width = layer.width() as usize;
+        let region_width = x1 - x0;
+        let region_height = y1 - y0;
+        let mut image = Rgba8Image {
+            width: region_width as u32,
+            height: region_height as u32,
+            pixels: Vec::with_capacity(region_width * region_height * 4),
+        };
+        let pixels = layer.pixels();
+        for y in y0..y1 {
+            for pixel in &pixels[y * width + x0..y * width + x1] {
+                let c = pixel.demultiply();
+                image.pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+            }
+        }
+        crate::apply_filter_operations(
+            &mut image,
+            filters,
+            scale,
+            layer.data().len(),
+            [x0 as i64, y0 as i64],
+        )?;
+        let filtered = premultiplied_pixmap(&image)?;
+        let row_bytes = region_width * 4;
+        let data = layer.data_mut();
+        for (row, source) in filtered.data().chunks_exact(row_bytes).enumerate() {
+            let at = ((y0 + row) * width + x0) * 4;
+            data[at..at + row_bytes].copy_from_slice(source);
+        }
         Ok(())
     }
 
@@ -1275,9 +1298,11 @@ impl CanvasSurface {
         self.state.filter = filter.clone();
         self.frozen = None;
         let mut layer = std::mem::replace(&mut self.bitmap, target);
-        if let (Some(filters), Some(layer)) = (filter.as_ref().map(|filter| &*filter.operations), layer.as_mut()) {
-            if !filters.is_empty() && result.is_ok() {
-                self.filter_pixmap(layer, filters, self.state.transform)?;
+        if result.is_ok() {
+            if let (Some(filters), Some(layer)) = (filter.as_ref().map(|filter| &*filter.operations), layer.as_mut()) {
+                if !filters.is_empty() {
+                    self.filter_pixmap(layer, filters, self.state.transform)?;
+                }
             }
         }
         if let (Some(target), Some(layer)) = (&mut self.bitmap, layer) {
@@ -1300,32 +1325,40 @@ impl CanvasSurface {
     }
 
     /// Composite a completed layer once with its entry alpha and blend mode,
-    /// restoring entry state and discarding unmatched inner save calls.
-    pub fn end_layer(&mut self) -> Option<usize> {
+    /// restoring entry state and discarding unmatched inner save calls. The
+    /// entry state is restored even when filtering fails; the failed layer is
+    /// then not composited and the error is returned beside the entry depth.
+    pub fn end_layer(&mut self) -> Option<(usize, Result<(), ImageError>)> {
         let layer = self.layers.pop()?;
         let mut source = std::mem::replace(&mut self.bitmap, layer.bitmap);
         self.saved.truncate(layer.saved_depth);
         self.state = layer.state;
         self.frozen = None;
         let state_filter = self.state.filter.as_ref().map(|filter| filter.operations.clone());
+        let mut outcome = Ok(());
         for filters in [layer.filter, state_filter].into_iter().flatten() {
             if let Some(source) = source.as_mut() {
                 if !filters.is_empty() {
-                    let _ = self.filter_pixmap(source, &filters, self.state.transform);
+                    outcome = self.filter_pixmap(source, &filters, self.state.transform);
+                    if outcome.is_err() {
+                        break;
+                    }
                 }
             }
         }
-        if let (Some(target), Some(source)) = (&mut self.bitmap, source) {
-            let paint = tiny_skia::PixmapPaint {
-                opacity: self.state.alpha,
-                blend_mode: self.state.blend,
-                quality: FilterQuality::Nearest,
-            };
-            target.draw_pixmap(0, 0, source.as_ref(), &paint,
-                Transform::identity(), self.state.clip.as_deref());
+        if outcome.is_ok() {
+            if let (Some(target), Some(source)) = (&mut self.bitmap, source) {
+                let paint = tiny_skia::PixmapPaint {
+                    opacity: self.state.alpha,
+                    blend_mode: self.state.blend,
+                    quality: FilterQuality::Nearest,
+                };
+                target.draw_pixmap(0, 0, source.as_ref(), &paint,
+                    Transform::identity(), self.state.clip.as_deref());
+            }
         }
         self.changed();
-        Some(layer.saved_depth)
+        Some((layer.saved_depth, outcome))
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) -> Result<(), ImageError> {
@@ -2704,6 +2737,64 @@ fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
     ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
 }
 
+/// The pixel rectangle `[x0, y0, x1, y1)` a filter chain can touch: the
+/// layer's non-transparent bounds grown by every operation's reach, clamped
+/// to the layer. `None` when nothing is drawn. Operations whose reach is not
+/// known (resource filters) or invalid ones select the whole layer.
+fn filter_region(
+    layer: &Pixmap,
+    filters: &[lumen_common::filter::FilterOperation],
+    scale: f32,
+) -> Option<[usize; 4]> {
+    use lumen_common::filter::FilterOperation as F;
+    let width = layer.width() as usize;
+    let height = layer.height() as usize;
+    let mut min_x = usize::MAX;
+    let mut max_x = 0;
+    let mut min_y = usize::MAX;
+    let mut max_y = 0;
+    for (y, row) in layer.pixels().chunks_exact(width).enumerate() {
+        let Some(first) = row.iter().position(|pixel| pixel.alpha() != 0) else {
+            continue;
+        };
+        let last = row.iter().rposition(|pixel| pixel.alpha() != 0).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = y;
+    }
+    if min_x == usize::MAX {
+        return None;
+    }
+    let full = Some([0, 0, width, height]);
+    let mut margin = 4usize;
+    for filter in filters {
+        let reach = match filter {
+            F::Color(_) => Some(0),
+            F::Blur(sigma) => crate::filter_blur_padding(*sigma, scale).ok(),
+            F::DropShadow(shadow) => crate::filter_blur_padding(shadow.sigma, scale).ok().and_then(|padding| {
+                let offset = shadow.offset[0].abs().max(shadow.offset[1].abs()) * scale;
+                if offset.is_finite() {
+                    padding.checked_add(offset.ceil() as usize)
+                } else {
+                    None
+                }
+            }),
+            F::Url(_) | F::Resource(_) => None,
+        };
+        match reach.and_then(|reach| margin.checked_add(reach)) {
+            Some(total) => margin = total,
+            None => return full,
+        }
+    }
+    Some([
+        min_x.saturating_sub(margin),
+        min_y.saturating_sub(margin),
+        max_x.saturating_add(margin).saturating_add(1).min(width),
+        max_y.saturating_add(margin).saturating_add(1).min(height),
+    ])
+}
+
 fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
     if image.pixels.len() != pixel_bytes(image.width, image.height)? {
         return Err(ImageError::InvalidViewport);
@@ -2836,9 +2927,9 @@ mod tests {
         canvas.begin_layer(None).unwrap();
         canvas.state_mut().fill = [0, 255, 0, 255];
         canvas.fill_rect(1.0, 0.0, 1.0, 1.0).unwrap();
-        assert_eq!(canvas.end_layer(), Some(0));
+        assert_eq!(canvas.end_layer().map(|(depth, result)| (depth, result.is_ok())), Some((0, true)));
         assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 0, 0, 0]);
-        assert_eq!(canvas.end_layer(), Some(0));
+        assert_eq!(canvas.end_layer().map(|(depth, result)| (depth, result.is_ok())), Some((0, true)));
         assert_eq!(canvas.snapshot().pixels, [128, 0, 128, 255, 0, 255, 0, 128]);
         assert_eq!(canvas.state().fill, [128, 0, 128, 255]);
         assert_eq!(canvas.state().alpha, 0.5);
@@ -2956,7 +3047,7 @@ mod tests {
         let mut canvas = CanvasSurface::new(2, 1).unwrap();
         canvas.begin_layer(None).unwrap();
         canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
-        canvas.end_layer().unwrap();
+        canvas.end_layer().unwrap().1.unwrap();
         assert_eq!(canvas.read_pixels(0, 0, 1, 1).unwrap().pixels, vec![0, 0, 0, 255]);
     }
 

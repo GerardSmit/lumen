@@ -156,7 +156,7 @@ const UNITS: &[&str] = &[
     "cqb", "cqmin", "cqmax", "in", "cm", "mm", "q", "pt", "pc",
 ];
 
-fn absolute_factor(unit: &str) -> Option<f64> {
+pub(crate) fn absolute_factor(unit: &str) -> Option<f64> {
     Some(match unit {
         "in" => 96.0,
         "cm" => 96.0 / 2.54,

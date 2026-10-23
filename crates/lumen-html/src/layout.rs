@@ -11514,12 +11514,14 @@ impl LayoutGeometry {
             return false;
         }
         let (mut local_x, mut local_y) = (x, y);
+        let mut transformed = false;
         for transform in self
             .transforms
             .iter()
             .rev()
             .filter(|v| v.hits.contains(&index))
         {
+            transformed = true;
             let Some(inverse) = transform.matrix.inverse() else {
                 return false;
             };
@@ -11528,8 +11530,11 @@ impl LayoutGeometry {
         let Some(_) = self.hits.get(index) else {
             return false;
         };
-        let slack = if self.transforms.iter().any(|transform| transform.hits.contains(&index)) { 1.0 / 256.0 } else { 0.0 };
+        let slack = if transformed { 1.0 / 256.0 } else { 0.0 };
         if !self.hit_rects(index).iter().any(|rect| {
+            if slack == 0.0 {
+                return rect.contains_rounded(local_x, local_y, 0.0);
+            }
             let rect = Rect { x: rect.x - slack, y: rect.y - slack, width: rect.width + 2.0 * slack, height: rect.height + 2.0 * slack };
             rect.contains_rounded(local_x, local_y, 0.0)
         }) {
@@ -40696,9 +40701,16 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                         if image_rect==rect {
                             self.push_command(Command::Image { rect, image })?;
                         } else {
-                            self.push_command(Command::PushBoxClip(rect))?;
+                            let clip_radius = (style.border_radius - border_width).max(0.0);
+                            let clip_corners = clipped_corners(outer_rect, rect, &style);
+                            let rounded = clip_radius > 0.0 || clip_corners.is_some();
+                            if rounded {
+                                self.push_command(Command::PushLayer { svg_clip: None, filters: None, corners: clip_corners, rect, radius: clip_radius, opacity: 1.0, clip: true })?;
+                            } else {
+                                self.push_command(Command::PushBoxClip(rect))?;
+                            }
                             self.push_command(Command::Image { rect: image_rect, image })?;
-                            self.push_command(Command::PopClip)?;
+                            self.push_command(if rounded { Command::PopLayer } else { Command::PopClip })?;
                         }
                     }
                 } else if let Some(deferred) = deferred_image {

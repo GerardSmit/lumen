@@ -3886,7 +3886,7 @@ macro_rules! impl_canvas_2d_methods {
                 if data.surface.layer_has_unmatched_save() {
                     return Err(OpError::new("InvalidStateError", "endLayer() with unmatched save()"));
                 }
-                let depth = data.surface.end_layer().ok_or_else(|| {
+                let (depth, _filtered) = data.surface.end_layer().ok_or_else(|| {
                     OpError::new("InvalidStateError", "No Canvas layer is open")
                 })?;
                 data.surface.restore();
@@ -6114,10 +6114,24 @@ fn current_canvas_color(realm: &Option<Rc<DomRealm>>, node: Option<NodeId>) -> R
 
 /// CSS closes functions that are still open at the end of the input.
 fn close_open_functions(text: &str) -> std::borrow::Cow<'_, str> {
-    let open = text.bytes().filter(|byte| *byte == b'(').count();
-    let close = text.bytes().filter(|byte| *byte == b')').count();
-    if open > close {
-        std::borrow::Cow::Owned(format!("{text}{}", ")".repeat(open - close)))
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match (quote, byte) {
+            (Some(_), b'\\') => {
+                bytes.next();
+            }
+            (Some(open), _) if byte == open => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'(') => depth += 1,
+            (None, b')') => depth = depth.saturating_sub(1),
+            (None, _) => {}
+        }
+    }
+    if depth > 0 {
+        std::borrow::Cow::Owned(format!("{text}{}", ")".repeat(depth)))
     } else {
         std::borrow::Cow::Borrowed(text)
     }

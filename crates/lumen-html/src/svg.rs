@@ -358,18 +358,12 @@ pub fn supports_length(input: &str) -> bool {
 
 fn coordinate_length(input: &str) -> Option<f32> {
     let input = input.trim();
-    let split = input.len().checked_sub(2).filter(|at| input.is_char_boundary(*at));
-    let (number, factor) = match split.map(|at| (&input[..at], &input[at..])) {
-        Some((number, unit)) if unit.eq_ignore_ascii_case("px") => (number, 1.0),
-        Some((number, unit)) if unit.eq_ignore_ascii_case("cm") => (number, 96.0 / 2.54),
-        Some((number, unit)) if unit.eq_ignore_ascii_case("mm") => (number, 96.0 / 25.4),
-        Some((number, unit)) if unit.eq_ignore_ascii_case("in") => (number, 96.0),
-        Some((number, unit)) if unit.eq_ignore_ascii_case("pt") => (number, 96.0 / 72.0),
-        Some((number, unit)) if unit.eq_ignore_ascii_case("pc") => (number, 16.0),
-        _ => match input.strip_suffix(['Q', 'q']) {
-            Some(number) => (number, 96.0 / 101.6),
-            None => (input, 1.0),
-        },
+    let number = input.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit = &input[number.len()..];
+    let factor = if unit.is_empty() || unit.eq_ignore_ascii_case("px") {
+        1.0
+    } else {
+        crate::css::calc_size::absolute_factor(&unit.to_ascii_lowercase())? as f32
     };
     let value = number.trim().parse::<f32>().ok()? * factor;
     value.is_finite().then_some(value)

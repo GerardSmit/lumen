@@ -19,29 +19,8 @@ impl Env {
 }
 
 pub(super) fn num(value: f64) -> String {
-    if !value.is_finite() {
-        return String::from("0");
-    }
-    let mut value = value;
-    if value.abs() < 1e-6 {
-        value = 0.0;
-    }
-    if value != 0.0 {
-        let magnitude = libm::floor(libm::log10(value.abs())) as i32;
-        let digits = 5 - magnitude;
-        value = if digits >= 0 {
-            let scale = libm::pow(10.0, f64::from(digits));
-            libm::round(value * scale) / scale
-        } else {
-            let scale = libm::pow(10.0, f64::from(-digits));
-            libm::round(value / scale) * scale
-        };
-    }
-    if value == 0.0 {
-        String::from("0")
-    } else {
-        alloc::format!("{value}")
-    }
+    let value = if value.is_finite() && value.abs() >= 1e-6 { value } else { 0.0 };
+    crate::css::computed_values::significant_digits_6(value)
 }
 
 pub(super) use crate::css::extra_props::lower;

@@ -67,12 +67,9 @@ impl ObjectFit {
 
 fn position(style: &Style) -> [TransformLength; 2] {
     let center = TransformLength { pixels: 0.0, percent: 50.0 };
-    let parsed = extra_props::computed(style, "object-position").and_then(|computed| {
-        let tokens = components(&computed)?;
-        let &[x, y] = tokens.as_slice() else { return None };
-        Some([transform_length(x, static_length_context())?, transform_length(y, static_length_context())?])
-    });
-    parsed.unwrap_or([center, center])
+    extra_props::computed(style, "object-position")
+        .and_then(|computed| background_position(&components(&computed)?, static_length_context()))
+        .map_or([center, center], |parsed| parsed.map(TransformLength::from_used))
 }
 
 fn ratio_of(natural: IntrinsicSize) -> Option<f32> {

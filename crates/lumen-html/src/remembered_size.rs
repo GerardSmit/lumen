@@ -74,7 +74,10 @@ impl RenderSession {
             let width = (rect.width - border[1] - border[3] - padding[1] - padding[3]).max(0.0);
             let height = (rect.height - border[0] - border[2] - padding[0] - padding[2]).max(0.0);
             let logical = style.logical_axis_pair((width, height));
-            self.document().remembered_sizes.borrow_mut().sizes.insert(key, logical);
+            let mut store = self.document().remembered_sizes.borrow_mut();
+            if store.sizes.len() < MAX_ENTRIES || store.sizes.contains_key(&key) {
+                store.sizes.insert(key, logical);
+            }
         }
     }
 }

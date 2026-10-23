@@ -569,6 +569,22 @@ impl DomRealm {
         (src, sources)
     }
 
+    fn media_has_source(&self, node: NodeId) -> bool {
+        let (src, sources) = self.media_resource_nodes(node);
+        if src.is_some_and(|src| !src.is_empty()) {
+            return true;
+        }
+        let session = self.session.borrow();
+        let document = session.document();
+        sources.into_iter().any(|id| {
+            document
+                .get_attribute_ns_ref(id, None, "src")
+                .ok()
+                .flatten()
+                .is_some_and(|src| !src.is_empty())
+        })
+    }
+
     fn media_element_nodes(&self) -> Rc<[NodeId]> {
         let (root, version) = {
             let session = self.session.borrow();
@@ -817,8 +833,12 @@ impl DomHtmlMediaElement {
         self.snapshot().source
     }
 
-    fn play(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        if self.node().get_attribute("src")?.0.as_deref().unwrap_or("").is_empty() {
+    fn play(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+        let has_src_object = !matches!(
+            ctx.native_private_value_slot(&this.0, SRC_OBJECT_SLOT),
+            None | Some(Value::Null)
+        );
+        if !has_src_object && !self.node().realm.media_has_source(self.node().id) {
             let kind = self.node().local_name()?.unwrap_or_default();
             let deferred = Deferred::new(ctx);
             let promise = deferred.promise();

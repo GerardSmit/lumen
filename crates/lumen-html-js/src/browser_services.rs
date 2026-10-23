@@ -230,6 +230,7 @@ pub struct NavigatorProfile {
     pub max_touch_points: u32,
     pub cookie_enabled: bool,
     pub online: bool,
+    pub pdf_viewer_enabled: bool,
 }
 
 impl Default for NavigatorProfile {
@@ -244,6 +245,7 @@ impl Default for NavigatorProfile {
             max_touch_points: 0,
             cookie_enabled: true,
             online: true,
+            pdf_viewer_enabled: true,
         }
     }
 }
@@ -366,7 +368,7 @@ impl DomNavigator {
 
     #[getter(name = "pdfViewerEnabled")]
     fn pdf_viewer_enabled(&self) -> bool {
-        false
+        self.profile.pdf_viewer_enabled
     }
 
     #[getter(name = "doNotTrack")]
@@ -463,16 +465,6 @@ impl DomNavigator {
     #[getter(name = "windowControlsOverlay")]
     fn window_controls_overlay(&self) -> Value {
         self.window_controls_overlay.clone()
-    }
-
-    #[getter]
-    fn oscpu(&self) -> String {
-        self.profile.platform.clone()
-    }
-
-    #[method(name = "taintEnabled")]
-    fn taint_enabled(&self) -> bool {
-        false
     }
 
     #[method(name = "registerProtocolHandler", coerce)]
@@ -819,14 +811,15 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         Ok(fetch) if fetch.is_callable() => fetch,
         _ => ctx.op_function::<lumen_host::net::fetch_bindings::fetch::Op>(),
     };
+    let (plugins, mime_types) = crate::navigator_extras::new_plugin_arrays(ctx, profile.pdf_viewer_enabled)?;
     let navigator_data = DomNavigator {
         base: Navigator,
         clipboard,
         permissions,
         user_activation,
         languages,
-        plugins: crate::navigator_extras::new_plugin_array(ctx),
-        mime_types: crate::navigator_extras::new_mime_type_array(ctx),
+        plugins,
+        mime_types,
         window_controls_overlay: crate::navigator_extras::new_window_controls_overlay(ctx),
         fetch,
         beacon_bytes: Rc::new(Cell::new(0)),
