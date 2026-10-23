@@ -244,3 +244,39 @@ fn nullish_constant_on_either_side() {
         true,
     );
 }
+
+#[test]
+fn element_keys_from_locals_on_dictionaries() {
+    agree(
+        r#"(function(){
+          function H(){this.h={}}
+          H.prototype.get=function(k){return this.h[k]};
+          H.prototype.set=function(k,v){this.h[k]=v};
+          var m=new H(),keys=['a','bb','assets/x','1','',null,2,'toString','__proto__'],r=[];
+          for(var t=0;t<300;t++){var k=keys[t%keys.length];var v=m.get(k);
+            m.set(k,(typeof v=='number'?v:0)+1);r.push(typeof m.get(k))}
+          var a=[1,2,3],o={x:1},s=0;
+          for(var t=0;t<300;t++){var k=t%4,j='x';s+=(a[k]|0)+o[j];a[k]=t;o[j]=s&7}
+          var g={get z(){return s}},q=0;for(var t=0;t<300;t++){var z='z';q+=g[z]}
+          return [r.join(),s,a.join(),o.x,q,Object.keys(m.h).join()].join(';');
+        })()"#,
+        None,
+        true,
+    );
+}
+
+#[test]
+fn string_keys_from_locals_on_exotic_receivers() {
+    agree(
+        r#"(function(){
+          var ta=new Int8Array(4),px=new Proxy({a:1},{get:function(t,k){return k+'!'}}),
+              acc={get a(){return 7},set a(v){this.b=v}},arr=[1,2],s=0,out=[];
+          var rs=[ta,px,acc,arr,{a:3}];
+          for(var t=0;t<300;t++){var k=t%3?'a':'length',r=rs[t%5];
+            var v=r[k];s+=typeof v=='number'?v:String(v).length;r[k]=t%7;out.push(k.length)}
+          return [s,ta.join(),acc.b,arr.length,out.length].join();
+        })()"#,
+        None,
+        true,
+    );
+}

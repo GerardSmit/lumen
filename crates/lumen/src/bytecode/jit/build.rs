@@ -4134,7 +4134,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         num: impl FnOnce(&mut Self, V),
         other: impl FnOnce(&mut Self),
     ) -> Result<(), String> {
-        let tag = self.stack_tag(k);
+        let tag = match self.stack[k] {
+            Entry::Ref(p, _) => self.fb.load(MemKind::I32U8, p, 0),
+            _ => self.stack_tag(k),
+        };
         let four = self.i32c(TAG_NUM as i64);
         let is = self.fb.icmp(IntCC::Eq, tag, four);
         let (nb, ob) = (self.fb.create_block(), self.fb.create_block());
@@ -4146,10 +4149,22 @@ impl<'a, 'f> Tr<'a, 'f> {
         let slow = (self.fb.current_block(), std::mem::replace(&mut self.stack, before));
         self.fb.seal_block(nb);
         self.fb.switch_to_block(nb);
-        let key = self.stack_num(k);
+        let key = match self.stack[k] {
+            Entry::Ref(p, _) => self.fb.load(MemKind::F64, p, VALUE_PAYLOAD),
+            _ => self.stack_num(k),
+        };
         num(self, key);
         let fast = (self.fb.current_block(), self.stack.clone());
         self.merge_paths(vec![fast, slow])
+    }
+
+    /// A receiver entry at stack index `idx`: its address, the index to release when it is
+    /// owned (Boxed), and its source when it is borrowed (Ref).
+    fn receiver(&mut self, e: Entry, idx: usize) -> (V, Option<usize>, Option<Src>) {
+        match e {
+            Entry::Ref(p, src) => (p, None, Some(src)),
+            _ => (self.sptr(idx), Some(idx), None),
+        }
     }
 
     /// The F64 of entry `e` at index `idx`: unboxed as is, Boxed after a Number tag check that
@@ -4968,22 +4983,24 @@ impl<'a, 'f> Tr<'a, 'f> {
                         Some(src),
                     );
                 }
-                (o @ (Entry::Boxed | Entry::Ref(..)), Entry::Boxed) => self.split_boxed_key(
+                (o @ (Entry::Boxed | Entry::Ref(..)), kv @ (Entry::Boxed | Entry::Ref(..))) => self.split_boxed_key(
                     d - 1,
                     |t, key| {
-                        let (obj, drop, src) = match o {
-                            Entry::Ref(p, src) => (p, None, Some(src)),
-                            _ => (t.sptr(d - 2), Some(d - 2), None),
-                        };
+                        let (obj, drop, src) = t.receiver(o, d - 2);
                         t.elem_read(pc, obj, key, drop, d - 2, false, Slow::Generic, None, src);
                     },
                     |t| {
                         // A String key on a plain object: a data property natively.
-                        let (obj, consume) = match o {
+                        let (obj, consume_obj) = match o {
                             Entry::Ref(p, _) => (p, 0),
                             _ => (t.sptr(d - 2), 1),
                         };
-                        let (kp, dst) = (t.sptr(d - 1), t.sptr(d - 2));
+                        let (kp, consume_key) = match kv {
+                            Entry::Ref(p, _) => (p, 0),
+                            _ => (t.sptr(d - 1), 2),
+                        };
+                        let consume = consume_obj | consume_key;
+                        let dst = t.sptr(d - 2);
                         let cv = t.i32c(consume);
                         let r = t
                             .call(Helper::ElemGetStr, &[t.frame, obj, kp, dst, cv])
@@ -5156,7 +5173,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(Src::Slot(s)),
                         );
                     }
-                    Entry::Boxed => self.split_boxed_key(
+                    Entry::Boxed | Entry::Ref(..) => self.split_boxed_key(
                         d - 1,
                         |t, key| {
                             let obj = t.slot_ptr(s as usize);
@@ -5215,6 +5232,18 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(src),
                         );
                     }
+                    (
+                        o @ (Entry::Boxed | Entry::Ref(..)),
+                        Entry::Boxed | Entry::Ref(..),
+                        v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..)),
+                    ) => self.split_boxed_key(
+                        d - 2,
+                        |t, key| {
+                            let (obj, drop, src) = t.receiver(o, d - 3);
+                            t.elem_write(pc, obj, key, v, drop, keep, d - 3, Slow::Generic, src);
+                        },
+                        |t| t.generic(pc),
+                    )?,
                     _ => self.generic(pc),
                 }
             }
@@ -5239,7 +5268,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                             Some(Src::Slot(s)),
                         );
                     }
-                    (Entry::Boxed, v @ (Entry::Num(_) | Entry::Boxed)) => self.split_boxed_key(
+                    (Entry::Boxed | Entry::Ref(..), v @ (Entry::Num(_) | Entry::Boxed)) => self.split_boxed_key(
                         d - 2,
                         |t, key| {
                             let obj = t.slot_ptr(s as usize);

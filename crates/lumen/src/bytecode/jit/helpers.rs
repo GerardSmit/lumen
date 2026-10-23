@@ -1029,7 +1029,31 @@ pub(crate) unsafe extern "C" fn typeof_is(f: *mut JitFrame, v: *const Value, kin
 }
 
 /// With `LUMEN_JIT_STATS`, report sites that keep running through [`generic`].
-fn count_generic(chunk: &Chunk, pc: usize) {
+/// A short description of `v`'s type for the generic-op statistics.
+fn stat_kind(i: &Interp, v: &Value) -> String {
+    match v {
+        Value::Obj(o) => {
+            if i.typed_arrays.contains_key(&(crate::value::Gc::as_ptr(o) as usize)) {
+                return "TypedArray".into();
+            }
+            match o.try_borrow() {
+                Ok(b) if b.ic_plain.get() => format!("{:?}", b.exotic),
+                Ok(b) => format!("{:?}(not plain)", b.exotic),
+                Err(_) => "Obj(borrowed)".into(),
+            }
+        }
+        Value::Num(_) => "Num".into(),
+        Value::Str(s) => format!("Str({:?})", s.as_str().chars().take(12).collect::<String>()),
+        Value::Undefined => "Undefined".into(),
+        Value::Null => "Null".into(),
+        Value::Bool(_) => "Bool".into(),
+        Value::BigInt(_) => "BigInt".into(),
+        Value::Sym(_) => "Sym".into(),
+        Value::Empty => "Empty".into(),
+    }
+}
+
+fn count_generic(f: *mut JitFrame, chunk: &Chunk, pc: usize, base: usize, depth: usize) {
     thread_local! {
         static SEEN: RefCell<std::collections::HashMap<(usize, usize), u64>> = RefCell::default();
     }
@@ -1039,8 +1063,13 @@ fn count_generic(chunk: &Chunk, pc: usize) {
         *c += 1;
         if c.is_power_of_two() && *c >= 4096 {
             let near = &chunk.ops[pc.saturating_sub(3)..(pc + 2).min(chunk.ops.len())];
+            // SAFETY: `generic` checked `base <= depth`; the frame's stack holds `depth` values.
+            let operands: Vec<String> = unsafe {
+                let i = &*(*f).interp;
+                (base..depth).map(|k| stat_kind(i, &*(*f).stack.add(k))).collect()
+            };
             eprintln!(
-                "[jit-generic] {:?} at {pc} of {} ops x{c} (near {near:?})",
+                "[jit-generic] {:?} at {pc} of {} ops x{c} (near {near:?}) operands {operands:?}",
                 chunk.ops[pc],
                 chunk.ops.len()
             );
@@ -1062,7 +1091,7 @@ pub(crate) unsafe extern "C" fn generic(f: *mut JitFrame, pc: u32, base: u32, de
         return fail(f, e);
     }
     if super::stats_enabled() {
-        count_generic(chunk, pc);
+        count_generic(f, chunk, pc, base, depth);
     }
     // Computed reads that miss the inline element paths (notably native
     // indexed wrappers and author proxies) still use ordinary [[Get]]. They
@@ -1309,6 +1338,8 @@ pub(crate) unsafe extern "C" fn elem_set_boxed(
     }
 }
 
+/// `obj[key]` for a String `key` on a plain object, into `dst` (1), or 0 when that needs the
+/// interpreter. On a hit, bit 0 of `consume` releases `obj` and bit 1 releases `key`.
 pub(crate) unsafe extern "C" fn elem_get_str(
     f: *mut JitFrame,
     obj: *mut Value,
@@ -1322,8 +1353,10 @@ pub(crate) unsafe extern "C" fn elem_get_str(
         _ => None,
     };
     let Some(v) = v else { return 0 };
-    drop(std::ptr::replace(key, Value::Undefined));
-    if consume != 0 {
+    if consume & 2 != 0 {
+        drop(std::ptr::replace(key, Value::Undefined));
+    }
+    if consume & 1 != 0 {
         drop(std::ptr::replace(obj, Value::Undefined));
     }
     std::ptr::write(dst, v);

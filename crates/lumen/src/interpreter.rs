@@ -4073,25 +4073,25 @@ impl Interp {
                 return None;
             }
             let shape = b.props.shape();
-            let h = (shape as usize ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
-            let hit = STR_KEY_IC.with(|c| match &c.borrow()[h] {
-                Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
-                    Some(*slot)
-                }
-                _ => None,
-            });
-            let slot = match hit {
-                Some(s) => Some(s as usize),
-                None => {
-                    let s = b.props.slot_of(key);
-                    if let Some(s) = s {
-                        // A non-index key's slot is a named one, pinned by the shape.
-                        STR_KEY_IC
-                            .with(|c| c.borrow_mut()[h] = Some((shape, lkey.clone(), s as u32)));
+            let mix = ((shape as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
+            let h = (mix ^ (lkey.as_ptr() as usize >> 4)) % STR_KEY_IC_LEN;
+            // `slot_of` never reaches the memo, so it runs under the borrow.
+            let slot = STR_KEY_IC.with(|c| {
+                let e = &mut c.borrow_mut()[h];
+                match e {
+                    Some((s, k, slot)) if *s == shape && crate::lstr::LStr::ptr_eq(k, lkey) => {
+                        Some(*slot as usize)
                     }
-                    s
+                    _ => {
+                        let s = b.props.slot_of(key);
+                        if let Some(s) = s {
+                            // A non-index key's slot is a named one, pinned by the shape.
+                            *e = Some((shape, lkey.clone(), s as u32));
+                        }
+                        s
+                    }
                 }
-            };
+            });
             if let Some(slot) = slot {
                 let p = b.props.entry_at(slot)?;
                 return (!p.accessor()).then(|| p.value());
@@ -9661,7 +9661,7 @@ impl Default for Interp {
     }
 }
 
-const STR_KEY_IC_LEN: usize = 64;
+const STR_KEY_IC_LEN: usize = 512;
 
 /// Empty the thread's string-key memo (a pure cache keyed by shape ids that die with the realm).
 pub(crate) fn clear_str_key_ic() {
