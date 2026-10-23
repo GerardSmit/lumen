@@ -12,81 +12,168 @@ use lumen_html::{
 };
 use std::{rc::Weak, sync::Arc};
 
-/// Present two genuine captures through the maintained native canvas rasterizer.
-/// The output and scratch reservations are admitted before allocating any
-/// bitmap. Scratch covers the premultiplied surface and one image conversion;
-/// the retained straight-RGBA output carries its own lease afterwards.
-fn composite_captures(
-    old: &Arc<ReservedImageData>,
-    new: &Arc<ReservedImageData>,
-    old_opacity: f64,
-    new_opacity: f64,
-    budget: &Arc<lumen_common::limits::ByteBudget>,
-) -> OpResult<Arc<ReservedImageData>> {
-    if (old.image.width, old.image.height) != (new.image.width, new.image.height) {
-        return Err(OpError::new(
-            "InvalidStateError",
-            "View transition viewport dimensions changed",
-        ));
-    }
-    let request = RenderCaptureRequest {
-        target: RenderCaptureTarget::Viewport,
-        width: old.image.width,
-        height: old.image.height,
-    };
-    let output = request.reserve(budget).ok_or_else(|| {
-        OpError::new(
-            "QuotaExceededError",
-            "View transition output exceeds the shared pixel budget",
-        )
-    })?;
-    let scratch = budget
-        .reserve(output.bytes().checked_mul(2).ok_or_else(|| {
+struct CachedPixmap {
+    source: Arc<ReservedImageData>,
+    pixmap: tiny_skia::Pixmap,
+    _lease: lumen_common::limits::ByteLease,
+}
+
+impl CachedPixmap {
+    fn refresh(
+        slot: &mut Option<Self>,
+        source: &Arc<ReservedImageData>,
+        budget: &Arc<lumen_common::limits::ByteBudget>,
+    ) -> OpResult<()> {
+        if slot
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(&cached.source, source))
+        {
+            return Ok(());
+        }
+        *slot = None;
+        let lease = budget.reserve(source.image.pixels.len()).ok_or_else(|| {
             OpError::new(
                 "QuotaExceededError",
-                "View transition scratch size overflow",
+                "View transition capture exceeds the shared pixel budget",
             )
-        })?)
-        .ok_or_else(|| {
+        })?;
+        let pixmap = lumen_html_image::canvas::premultiplied_pixmap(&source.image).map_err(
+            |error| {
+                OpError::new(
+                    "InvalidStateError",
+                    format!("View transition image: {error:?}"),
+                )
+            },
+        )?;
+        *slot = Some(Self {
+            source: source.clone(),
+            pixmap,
+            _lease: lease,
+        });
+        Ok(())
+    }
+}
+
+struct Presented {
+    old: Arc<ReservedImageData>,
+    new: Arc<ReservedImageData>,
+    opacity: [u32; 2],
+    image: Arc<ReservedImageData>,
+}
+
+/// Premultiplied captures are converted once and the composite is recomputed
+/// only when a capture or an opacity changes.
+#[derive(Default)]
+struct Compositor {
+    old: Option<CachedPixmap>,
+    new: Option<CachedPixmap>,
+    last: Option<Presented>,
+}
+
+impl Compositor {
+    fn release_new(&mut self) {
+        self.new = None;
+        self.last = None;
+    }
+
+    /// Present two genuine captures through the tiny-skia rasterizer. The
+    /// output and scratch reservations are admitted before allocating any
+    /// bitmap; the retained straight-RGBA output carries its own lease.
+    /// Returns the image to install as the overlay, or `None` when the
+    /// installed overlay is already current.
+    fn present(
+        &mut self,
+        old: &Arc<ReservedImageData>,
+        new: &Arc<ReservedImageData>,
+        opacity: [f64; 2],
+        budget: &Arc<lumen_common::limits::ByteBudget>,
+        overlay_installed: bool,
+    ) -> OpResult<Option<Arc<ReservedImageData>>> {
+        if (old.image.width, old.image.height) != (new.image.width, new.image.height) {
+            return Err(OpError::new(
+                "InvalidStateError",
+                "View transition viewport dimensions changed",
+            ));
+        }
+        let opacity = opacity.map(|value| (value.clamp(0.0, 1.0) as f32).to_bits());
+        if let Some(last) = &self.last {
+            if Arc::ptr_eq(&last.old, old)
+                && Arc::ptr_eq(&last.new, new)
+                && last.opacity == opacity
+            {
+                return Ok((!overlay_installed).then(|| last.image.clone()));
+            }
+        }
+        let request = RenderCaptureRequest {
+            target: RenderCaptureTarget::Viewport,
+            width: old.image.width,
+            height: old.image.height,
+        };
+        let output = request.reserve(budget).ok_or_else(|| {
+            OpError::new(
+                "QuotaExceededError",
+                "View transition output exceeds the shared pixel budget",
+            )
+        })?;
+        let scratch = budget.reserve(output.bytes()).ok_or_else(|| {
             OpError::new(
                 "QuotaExceededError",
                 "View transition scratch exceeds the shared pixel budget",
             )
         })?;
-    let mut surface = lumen_html_image::canvas::CanvasSurface::new(request.width, request.height)
-        .map_err(|error| {
-        OpError::new(
-            "InvalidStateError",
-            format!("View transition surface: {error:?}"),
-        )
-    })?;
-    surface.state_mut().blend = tiny_skia::BlendMode::Plus;
-    for (image, opacity) in [(old, old_opacity), (new, new_opacity)] {
-        surface.state_mut().alpha = opacity.clamp(0.0, 1.0) as f32;
-        surface
-            .draw_image(
-                &image.image,
-                0.0,
-                0.0,
-                request.width as f32,
-                request.height as f32,
-            )
-            .map_err(|error| {
-                OpError::new(
-                    "InvalidStateError",
-                    format!("View transition image: {error:?}"),
-                )
+        CachedPixmap::refresh(&mut self.old, old, budget)?;
+        CachedPixmap::refresh(&mut self.new, new, budget)?;
+        let mut surface =
+            tiny_skia::Pixmap::new(request.width, request.height).ok_or_else(|| {
+                OpError::new("InvalidStateError", "View transition surface is too large")
             })?;
-    }
-    let image = surface.snapshot();
-    drop(surface);
-    drop(scratch);
-    ReservedImageData::new(image, output).ok_or_else(|| {
-        OpError::new(
-            "InvalidStateError",
-            "View transition produced invalid pixel storage",
+        for (cached, opacity) in [(&self.old, opacity[0]), (&self.new, opacity[1])] {
+            if let Some(cached) = cached {
+                surface.draw_pixmap(
+                    0,
+                    0,
+                    cached.pixmap.as_ref(),
+                    &tiny_skia::PixmapPaint {
+                        opacity: f32::from_bits(opacity),
+                        blend_mode: tiny_skia::BlendMode::Plus,
+                        quality: tiny_skia::FilterQuality::Bilinear,
+                    },
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+        }
+        let mut pixels = Vec::new();
+        pixels.reserve_exact(surface.data().len());
+        for pixel in surface.pixels() {
+            let color = pixel.demultiply();
+            pixels.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+        }
+        let (width, height) = (surface.width(), surface.height());
+        drop(surface);
+        drop(scratch);
+        let image = ReservedImageData::new(
+            lumen_html_image::Rgba8Image {
+                width,
+                height,
+                pixels,
+            },
+            output,
         )
-    })
+        .ok_or_else(|| {
+            OpError::new(
+                "InvalidStateError",
+                "View transition produced invalid pixel storage",
+            )
+        })?;
+        self.last = Some(Presented {
+            old: old.clone(),
+            new: new.clone(),
+            opacity,
+            image: image.clone(),
+        });
+        Ok(Some(image))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +247,7 @@ struct TransitionState {
     finished: Settlement,
     old: Option<Arc<ReservedImageData>>,
     new: Option<Arc<ReservedImageData>>,
+    compositor: Compositor,
 }
 
 #[lumen_bind::class(name = "ViewTransition", hint(js(webidl)))]
@@ -387,6 +475,7 @@ fn new_transition(ctx: &mut Ctx, callback: Option<Value>) -> OpResult<Value> {
             finished: Settlement::default(),
             old: None,
             new: None,
+            compositor: Compositor::default(),
         }),
     });
     ctx.set_native_identity_owner::<DomViewTransition>(&wrapper)?;
@@ -484,6 +573,7 @@ fn settle_update(ctx: &mut Ctx, wrapper: &Value, outcome: Result<(), Value>) -> 
                 state.old = None;
                 state.new = None;
                 state.new_frame_id = None;
+                state.compositor = Compositor::default();
                 (
                     update,
                     state.ready.deferred.take(),
@@ -763,6 +853,7 @@ fn clear_presentation(ctx: &mut Ctx, wrapper: &Value) -> OpResult<()> {
             state.old = None;
             state.new = None;
             state.new_frame_id = None;
+            state.compositor = Compositor::default();
             (
                 state.owner.as_ref().and_then(Weak::upgrade),
                 std::mem::take(&mut state.animations),
@@ -1546,11 +1637,15 @@ fn advance_inner(ctx: &mut Ctx) -> OpResult<()> {
     // The existing normal-frame identity excludes presentation overlays.
     // Reuse the same reserved image for unchanged source/opacity-only frames.
     let frame_id = document.session.borrow().frame_id();
+    let mut compositor = ctx.with_instance::<DomViewTransition, _>(&wrapper, |transition| {
+        std::mem::take(&mut transition.state.borrow_mut().compositor)
+    })?;
     let new = if captured_frame == Some(frame_id) {
         new
     } else {
         // Release the old live capture before allocating its replacement.
         drop(new);
+        compositor.release_new();
         ctx.with_instance::<DomViewTransition, _>(&wrapper, |transition| {
             let mut state = transition.state.borrow_mut();
             state.new = None;
@@ -1559,14 +1654,24 @@ fn advance_inner(ctx: &mut Ctx) -> OpResult<()> {
         document.render_capture_reserved(&request, &budget)?
     };
     let frame_id = document.session.borrow().frame_id();
-    document.session.borrow_mut().set_capture_overlay(None);
-    let image = composite_captures(&old, &new, old_opacity, new_opacity, &budget)?;
-    overlay(&document, image);
+    let overlay_installed = document.session.borrow().has_capture_overlay();
+    let presented = compositor.present(
+        &old,
+        &new,
+        [old_opacity, new_opacity],
+        &budget,
+        overlay_installed,
+    );
     ctx.with_instance::<DomViewTransition, _>(&wrapper, |transition| {
         let mut state = transition.state.borrow_mut();
+        state.compositor = compositor;
         state.new = Some(new);
         state.new_frame_id = Some(frame_id);
     })?;
+    if let Some(image) = presented? {
+        document.session.borrow_mut().set_capture_overlay(None);
+        overlay(&document, image);
+    }
     Ok(())
 }
 
@@ -1878,7 +1983,7 @@ mod tests {
 
     #[test]
     fn view_transition_compositor_admits_real_scratch_and_retains_actual_alpha_pixels() {
-        let budget = lumen_common::limits::ByteBudget::new(20);
+        let budget = lumen_common::limits::ByteBudget::new(24);
         let request = RenderCaptureRequest {
             target: RenderCaptureTarget::Viewport,
             width: 1,
@@ -1898,19 +2003,30 @@ mod tests {
         let old = capture(vec![255, 0, 0, 128]);
         let new = capture(vec![0, 0, 255, 128]);
         let guard = budget.reserve(1).unwrap();
-        assert!(composite_captures(&old, &new, 0.5, 0.5, &budget).is_err());
+        let mut compositor = Compositor::default();
+        assert!(compositor
+            .present(&old, &new, [0.5, 0.5], &budget, false)
+            .is_err());
         assert_eq!(
             budget.reserved(),
-            9,
-            "failed scratch admission must release output storage"
+            13,
+            "failed admission must release output and scratch storage"
         );
         drop(guard);
-        let output = composite_captures(&old, &new, 0.5, 0.5, &budget).unwrap();
+        let output = compositor
+            .present(&old, &new, [0.5, 0.5], &budget, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             budget.reserved(),
-            12,
+            20,
             "surface scratch must release after native composition"
         );
+        assert!(compositor
+            .present(&old, &new, [0.5, 0.5], &budget, true)
+            .unwrap()
+            .is_none());
+        drop(compositor);
         let pixels = &output.image.pixels;
         assert!(
             (127..=129).contains(&pixels[0])

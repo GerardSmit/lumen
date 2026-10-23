@@ -2548,6 +2548,73 @@ fn register_property(ctx: &mut Ctx, definition: PropertyDefinition) -> OpResult<
     })
 }
 
+struct MemoizedDeclaration {
+    block: Option<Rc<css::DeclarationBlock>>,
+    serialized: Result<String, css::CssError>,
+}
+
+#[derive(Default)]
+struct DeclarationMemo {
+    parsed: HashMap<String, Rc<MemoizedDeclaration>>,
+    blocks: Vec<(Rc<css::DeclarationBlock>, Result<String, css::CssError>)>,
+    bytes: usize,
+}
+
+const DECLARATION_MEMO_BYTES: usize = 16 * 1024 * 1024;
+const DECLARATION_MEMO_BLOCKS: usize = 16;
+
+thread_local! {
+    static DECLARATION_MEMO: RefCell<DeclarationMemo> = RefCell::new(DeclarationMemo::default());
+}
+
+// CSSOM writes rebuild every rule of a sheet from declaration text. Parsing and
+// serializing are pure, so repeated texts and blocks are answered from memory
+// instead of being recomputed once per rule per write. A cached block keeps a
+// second strong reference, so `Rc::make_mut` copies instead of mutating it.
+fn memoized_declaration(text: &str) -> Rc<MemoizedDeclaration> {
+    if let Some(found) = DECLARATION_MEMO.with(|memo| memo.borrow().parsed.get(text).cloned()) {
+        return found;
+    }
+    let block = css::DeclarationBlock::parse(text);
+    let serialized = match &block {
+        Ok(block) => block.serialize(),
+        Err(error) => Err(error.clone()),
+    };
+    let entry = Rc::new(MemoizedDeclaration { block: block.ok().map(Rc::new), serialized });
+    let cost = text.len() * 4 + entry.serialized.as_ref().map_or(0, String::len);
+    DECLARATION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.bytes + cost > DECLARATION_MEMO_BYTES {
+            memo.parsed.clear();
+            memo.bytes = 0;
+        }
+        memo.bytes += cost;
+        memo.parsed.insert(text.to_owned(), entry.clone());
+    });
+    entry
+}
+
+fn memoized_block_text(block: &Rc<css::DeclarationBlock>) -> Result<String, css::CssError> {
+    let found = DECLARATION_MEMO.with(|memo| memo.borrow().blocks.iter()
+        .find(|(known, _)| Rc::ptr_eq(known, block)).map(|(_, text)| text.clone()));
+    if let Some(text) = found {
+        return text;
+    }
+    let text = block.serialize();
+    DECLARATION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.blocks.len() >= DECLARATION_MEMO_BLOCKS {
+            memo.blocks.remove(0);
+        }
+        memo.blocks.push((block.clone(), text.clone()));
+    });
+    text
+}
+
+fn memoized_cssom_declaration_block(text: &str) -> Result<String, css::CssError> {
+    memoized_declaration(text).serialized.clone()
+}
+
 /// Shared specified declarations with a lexical mode for font-face descriptors.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CssDeclaration {
@@ -2560,10 +2627,10 @@ pub struct CssDeclaration {
 
 impl CssDeclaration {
     pub fn parse(text: &str) -> Self {
-        let block = css::DeclarationBlock::parse(text).unwrap_or_default();
+        let entry = memoized_declaration(text);
         Self {
-            text: block.serialize().unwrap_or_default(),
-            block: Some(Rc::new(block)),
+            text: entry.serialized.clone().unwrap_or_default(),
+            block: Some(entry.block.clone().unwrap_or_default()),
             ..Self::default()
         }
     }
@@ -2645,11 +2712,11 @@ impl CssDeclaration {
             self.refresh_page_text();
             return Ok(());
         }
-        if let Some(block) = &mut self.block {
-            let block = Rc::make_mut(block);
+        if let Some(shared) = &mut self.block {
+            let block = Rc::make_mut(shared);
             if block.set(name, value, important)? {
                 if self.position_try { block.retain_declarations(|name, important| !important && css::anchor::position_try_property(name)); }
-                self.text = block.serialize()?;
+                self.text = memoized_block_text(shared)?;
             }
         } else {
             self.text = css::set_descriptor_declaration(&self.text, name, value, important)?;
@@ -2845,7 +2912,7 @@ impl CssStyleSheetText {
                 let Some(rule) = current.get_mut(index) else { break; };
                 if depth + 1 == path.len() {
                     if !rule.font_face && (rule.selector_text.is_some() || rule.nested_declarations) {
-                        rule.style = CssDeclaration { text: block.serialize()?, block: Some(block.clone()), position_try: rule.position_try, ..CssDeclaration::default() };
+                        rule.style = CssDeclaration { text: memoized_block_text(block)?, block: Some(block.clone()), position_try: rule.position_try, ..CssDeclaration::default() };
                         rule.css_text = serialize_rule(rule);
                     }
                     break;
@@ -3439,7 +3506,7 @@ fn serialize_rule_into(
     let declarations = || if rule.font_face || rule.function_body {
         Cow::Borrowed(rule.style.css_text())
     } else {
-        css::serialize_cssom_declaration_block(rule.style.css_text())
+        memoized_cssom_declaration_block(rule.style.css_text())
             .map(Cow::Owned).unwrap_or_else(|_| Cow::Borrowed(rule.style.css_text()))
     };
     if rule.nested_declarations {
@@ -7934,7 +8001,7 @@ impl DomCssRuleStyle {
         }
         match self.read_declaration()? {
             ReadCssDeclaration::Parsed(declaration) => Ok(declaration.css_text().to_owned()),
-            ReadCssDeclaration::Retained(block) => block.serialize().map_err(css_error),
+            ReadCssDeclaration::Retained(block) => memoized_block_text(&block).map_err(css_error),
         }
     }
 

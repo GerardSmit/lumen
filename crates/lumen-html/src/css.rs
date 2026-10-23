@@ -15,9 +15,11 @@ pub mod page_rules;
 mod var_template;
 pub mod registered_properties;
 mod parallel;
+mod has_memo;
 pub mod chunked;
 pub use parallel::StyleParallelism;
 pub(crate) use parallel::{Hook, HostGate, ReadOnlyRc, SyncRefCell};
+pub(crate) use has_memo::HasMemo;
 pub mod computed_values;
 pub mod declaration_block;
 mod transition_controls;
@@ -5356,6 +5358,8 @@ struct RelativeSelector {
     /// the leftmost compound in this relative selector.
     relation: Relation,
     selector: Selector,
+    /// Names this relative selector in the document's `:has()` memo.
+    id: u64,
 }
 
 fn adjust_specificity(
@@ -10235,7 +10239,7 @@ fn parse_relative_selector_list_depth(
             depth,
             allow_nesting,
          namespaces)?;
-        result.push(RelativeSelector { relation, selector });
+        result.push(RelativeSelector { relation, selector, id: has_memo::next_relative_id() });
     }
     Ok(result)
 }
@@ -25035,6 +25039,31 @@ impl RelativeSelector {
         validity: &dyn crate::forms::ValidityStateView,
         quota: Option<&core::cell::Cell<usize>>,
     ) -> bool {
+        if depth > MAX_SELECTOR_MATCH_DEPTH || !document.instances.is_empty() || !self.selector.memo_safe() {
+            return self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, quota);
+        }
+        let key = (self.id, anchor.key(), shadow_root.map(NodeId::key), scope_root.map(NodeId::key));
+        let version = document.version();
+        if let Some(found) = document.has_memo.borrow_mut().get(version, &key) {
+            return found;
+        }
+        let found = self.matches_from_uncached(document, anchor, shadow_root, scope_root, depth, validity, quota);
+        if found || quota.is_none_or(|quota| quota.get() != 0) {
+            document.has_memo.borrow_mut().insert(version, key, found);
+        }
+        found
+    }
+
+    fn matches_from_uncached(
+        &self,
+        document: &SelectorDocument<'_>,
+        anchor: NodeId,
+        shadow_root: Option<NodeId>,
+        scope_root: Option<NodeId>,
+        depth: usize,
+        validity: &dyn crate::forms::ValidityStateView,
+        quota: Option<&core::cell::Cell<usize>>,
+    ) -> bool {
         if depth > MAX_SELECTOR_MATCH_DEPTH {
             return false;
         }
@@ -25255,6 +25284,33 @@ impl Selector {
                 .ancestor
                 .as_ref()
                 .is_some_and(|(_, ancestor)| ancestor.has_validity_dependency())
+    }
+
+    /// Whether the selector's result for an element depends only on the
+    /// document tree and attributes, so it holds until the document version
+    /// changes.
+    fn memo_safe(&self) -> bool {
+        !self.host
+            && !self.slotted
+            && self.part.is_none()
+            && self.nesting_selector == 0
+            && self.form_state.is_empty()
+            && self.interaction_state.is_empty()
+            && self.top_layer_state == 0
+            && self.directionality_mask == 0
+            && self.structural.iter().all(|pseudo| match pseudo {
+                StructuralPseudo::Valid | StructuralPseudo::Invalid => false,
+                StructuralPseudo::Nth { of, .. } => of.as_ref().is_none_or(|selectors| selectors.iter().all(Selector::memo_safe)),
+                _ => true,
+            })
+            && self.logical.iter().all(|pseudo| match pseudo {
+                LogicalPseudo::Not(selectors) | LogicalPseudo::Is(selectors) | LogicalPseudo::Where(selectors) => {
+                    selectors.iter().all(Selector::memo_safe)
+                }
+                LogicalPseudo::Heading(_) => true,
+                _ => false,
+            })
+            && self.ancestor.as_ref().is_none_or(|(_, ancestor)| ancestor.memo_safe())
     }
 
     /// Whether the selector (or an ancestor/sibling compound of it) matches on

@@ -2795,7 +2795,7 @@ fn filter_region(
     ])
 }
 
-fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
+pub fn premultiplied_pixmap(image: &Rgba8Image) -> Result<Pixmap, ImageError> {
     if image.pixels.len() != pixel_bytes(image.width, image.height)? {
         return Err(ImageError::InvalidViewport);
     }

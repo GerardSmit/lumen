@@ -1076,6 +1076,12 @@ impl WindowNamedPropertiesHandler {
         };
         let session = realm.session.borrow();
         let document = session.document();
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(nodes) = document.indexed_window_named_nodes(name) {
+            return Ok(nodes);
+        }
         let root = document.root();
         let filter = DescendantFilter::WindowNamed(name.to_owned());
         let mut nodes = Vec::new();

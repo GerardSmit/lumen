@@ -2100,6 +2100,9 @@ impl DomRealm {
         if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
             return Ok(Vec::new());
         }
+        if self.connected_iframe_nodes().is_empty() {
+            return Ok(Vec::new());
+        }
         let origin = self.document_origin().or_else(|| self.browsing_context().map(|context| context.root_or_child_origin()));
         let mut seen = HashSet::new();
         let mut windows = Vec::new();
@@ -2116,6 +2119,9 @@ impl DomRealm {
     /// value priority even when their origin excluded that name from the set.
     pub(crate) fn named_child_value(self: &Rc<Self>, ctx: &mut Ctx, name: &str) -> OpResult<Option<Value>> {
         if !self.browsing_context().is_some_and(|context| is_active_document(&context, self)) {
+            return Ok(None);
+        }
+        if self.connected_iframe_nodes().is_empty() {
             return Ok(None);
         }
         Ok(self.frame_contexts(ctx)?.into_iter().find(|frame| frame.target_name() == name)
@@ -2151,10 +2157,10 @@ impl DomRealm {
         let candidates = {
             let mut cache = self.frame_candidates.borrow_mut();
             match cache.as_ref() {
-                Some((version, nodes)) if *version == document.version() => nodes.clone(),
+                Some((version, nodes)) if *version == document.tree_names_version() => nodes.clone(),
                 _ => {
                     let nodes = Self::frame_candidate_nodes(document);
-                    *cache = Some((document.version(), nodes.clone()));
+                    *cache = Some((document.tree_names_version(), nodes.clone()));
                     nodes
                 }
             }

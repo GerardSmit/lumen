@@ -280,6 +280,7 @@ pub struct Document {
     selected_content_created: bool,
     node_retirements: u64,
     version: u64,
+    tree_names_version: u64,
     max_nodes: usize,
     allocation_budget: css::Hook<Rc<dyn Fn(&Document, usize, usize) -> Result<(), Error>>>,
     template_ancestor_resolver: css::Hook<Rc<dyn Fn(&Document, NodeId, NodeId) -> Result<bool, Error>>>,
@@ -329,6 +330,7 @@ pub struct Document {
     manual_assignments: Vec<(NodeId, Vec<NodeId>)>,
     selector_cache: css::SyncRefCell<Vec<(String, Arc<Vec<css::Selector>>)>>,
     id_index: css::SyncRefCell<IdIndex>,
+    has_memo: css::SyncRefCell<css::HasMemo>,
     remembered_sizes: css::SyncRefCell<remembered_size::RememberedSizes>,
     host_gate: css::HostGate,
 }
@@ -342,6 +344,11 @@ struct IdIndex {
     first: alloc::collections::BTreeMap<String, NodeId>,
     /// `name` values of the HTML `embed`, `form`, `img` and `object` elements.
     legacy_names: alloc::collections::BTreeSet<String>,
+    /// `name` values of the HTML `iframe` elements.
+    iframe_names: alloc::collections::BTreeSet<String>,
+    /// Elements per window named property, in tree order: those with that `id`, and
+    /// the HTML `embed`, `form`, `img` and `object` elements with that `name`.
+    window_named: alloc::collections::BTreeMap<String, Vec<NodeId>>,
 }
 
 /// Host-owned live form state is read through a weak adapter without copying
@@ -382,6 +389,7 @@ impl Document {
             selected_content_created: false,
             node_retirements: 0,
             version: 0,
+            tree_names_version: 0,
             max_nodes: max_nodes.max(1),
             allocation_budget: css::Hook::none(),
             template_ancestor_resolver: css::Hook::none(),
@@ -420,6 +428,7 @@ impl Document {
             manual_assignments: Vec::new(),
             selector_cache: css::SyncRefCell::new(Vec::new()),
             id_index: css::SyncRefCell::new(IdIndex::default()),
+            has_memo: css::SyncRefCell::new(css::HasMemo::default()),
             remembered_sizes: css::SyncRefCell::new(remembered_size::RememberedSizes::default()),
             host_gate: css::HostGate::default(),
         }
@@ -435,6 +444,54 @@ impl Document {
 
     pub const fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Advances on every tree structure change and on every `id` or `name`
+    /// attribute change, and on nothing else.
+    pub const fn tree_names_version(&self) -> u64 {
+        self.tree_names_version
+    }
+
+    fn note_tree_names_changed(&mut self) {
+        self.tree_names_version = self.tree_names_version.wrapping_add(1);
+    }
+
+    /// Called as `subtree` joins or leaves a tree: advances the counter only when
+    /// the subtree holds something the id, window-name and frame lookups see.
+    fn note_subtree_names(&mut self, subtree: NodeId) {
+        if self.subtree_has_named_content(subtree) {
+            self.note_tree_names_changed();
+        }
+    }
+
+    fn subtree_has_named_content(&self, root: NodeId) -> bool {
+        let mut current = Some(root);
+        while let Some(id) = current {
+            if let Ok(NodeKind::Element { namespace, name, .. }) = self.kind(id) {
+                if matches!(self.get_attribute_ns_ref(id, None, "id"), Ok(Some(value)) if !value.is_empty()) {
+                    return true;
+                }
+                if matches!(namespace, Namespace::Html) {
+                    let local = xml::split_qname(name.as_str()).map_or(name.as_str(), |(_, local)| local);
+                    if ["iframe", "object", "embed"].iter().any(|tag| local.eq_ignore_ascii_case(tag)) {
+                        return true;
+                    }
+                    if ["form", "img"].iter().any(|tag| local.eq_ignore_ascii_case(tag))
+                        && matches!(self.get_attribute_ns_ref(id, None, "name"), Ok(Some(value)) if !value.is_empty())
+                    {
+                        return true;
+                    }
+                }
+                if !self.shadow_trees.is_empty() && self.shadow_trees.binary_search_by_key(&id.key(), |tree| tree.host.key()).is_ok() {
+                    return true;
+                }
+            }
+            current = match selector::next_descendant(self, root, id) {
+                Ok(next) => next,
+                Err(_) => return true,
+            };
+        }
+        false
     }
 
     /// Count of nodes ever destroyed or adopted away; stale `NodeId`s can only appear after it grows.
@@ -464,27 +521,55 @@ impl Document {
         Some(index.first.contains_key(wanted) || index.legacy_names.contains(wanted))
     }
 
+    /// The elements matching window named property `wanted` in tree order, or `None`
+    /// if the tree cannot be walked.
+    pub fn indexed_window_named_nodes(&self, wanted: &str) -> Option<Vec<NodeId>> {
+        let mut index = self.id_index.borrow_mut();
+        if !self.warm_id_index(&mut index, true) {
+            return None;
+        }
+        Some(index.window_named.get(wanted).cloned().unwrap_or_default())
+    }
+
+    /// Whether `wanted` can be a named property of the document: an `id`, or the
+    /// `name` of an `embed`, `form`, `iframe`, `img` or `object`. A `false` is exact;
+    /// a `true` still needs the exact per-element rules. `None` if the tree cannot be walked.
+    pub fn indexed_document_name_maybe_exists(&self, wanted: &str) -> Option<bool> {
+        let mut index = self.id_index.borrow_mut();
+        if !self.warm_id_index(&mut index, true) {
+            return None;
+        }
+        Some(index.first.contains_key(wanted) || index.legacy_names.contains(wanted) || index.iframe_names.contains(wanted))
+    }
+
     /// `eager` builds the index at once; otherwise it is built on the second
     /// lookup of a version, so that a single `id` lookup can still stop early.
     fn warm_id_index(&self, index: &mut IdIndex, eager: bool) -> bool {
-        if index.built_version == Some(self.version) {
+        if index.built_version == Some(self.tree_names_version) {
             return true;
         }
-        if !eager && index.walked_version != Some(self.version) {
-            index.walked_version = Some(self.version);
+        if !eager && index.walked_version != Some(self.tree_names_version) {
+            index.walked_version = Some(self.tree_names_version);
             return false;
         }
         let mut first = alloc::collections::BTreeMap::new();
         let mut legacy_names = alloc::collections::BTreeSet::new();
+        let mut iframe_names = alloc::collections::BTreeSet::new();
+        let mut window_named: alloc::collections::BTreeMap<String, Vec<NodeId>> = alloc::collections::BTreeMap::new();
         let root = self.root();
         let Ok(mut current) = self.first_child(root) else {
             return false;
         };
         while let Some(id) = current {
             if let Ok(NodeKind::Element { namespace, name, .. }) = self.kind(id) {
+                let mut id_value = None;
                 if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "id") {
-                    if !value.is_empty() && !first.contains_key(value) {
-                        first.insert(String::from(value), id);
+                    if !value.is_empty() {
+                        id_value = Some(value);
+                        if !first.contains_key(value) {
+                            first.insert(String::from(value), id);
+                        }
+                        window_named.entry(String::from(value)).or_default().push(id);
                     }
                 }
                 if matches!(namespace, Namespace::Html)
@@ -495,6 +580,16 @@ impl Document {
                     if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "name") {
                         if !value.is_empty() {
                             legacy_names.insert(String::from(value));
+                            if id_value != Some(value) {
+                                window_named.entry(String::from(value)).or_default().push(id);
+                            }
+                        }
+                    }
+                }
+                if matches!(namespace, Namespace::Html) && name.eq_ignore_ascii_case("iframe") {
+                    if let Ok(Some(value)) = self.get_attribute_ns_ref(id, None, "name") {
+                        if !value.is_empty() {
+                            iframe_names.insert(String::from(value));
                         }
                     }
                 }
@@ -506,7 +601,9 @@ impl Document {
         }
         index.first = first;
         index.legacy_names = legacy_names;
-        index.built_version = Some(self.version);
+        index.iframe_names = iframe_names;
+        index.window_named = window_named;
+        index.built_version = Some(self.tree_names_version);
         true
     }
 
@@ -2824,11 +2921,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
     }
 
     fn insert_detached_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
-        // Parser insertions into a live document do not advance `version`, so the id index
-        // cannot be trusted across them.
-        let index = self.id_index.get_mut();
-        index.built_version = None;
-        index.walked_version = None;
+        self.note_subtree_names(child);
         let previous = before.map_or(self.nodes[parent.index as usize].last_child, |id| {
             self.nodes[id.index()].prev_sibling
         });
@@ -3714,6 +3807,14 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             }
         }
         self.version = self.version.wrapping_add(1);
+        let names_changed = match &kind {
+            MutationKind::FullRebuild => true,
+            MutationKind::Attribute(name) => name.as_str().eq_ignore_ascii_case("id") || name.as_str().eq_ignore_ascii_case("name"),
+            MutationKind::Tree { .. } | MutationKind::CharacterData => false,
+        };
+        if names_changed {
+            self.note_tree_names_changed();
+        }
         // A rebuild summarizes changes through its original version. Keep
         // later identities precise: a source accepted after that barrier must
         // not become stale merely because an unrelated node changes afterward.
@@ -4219,6 +4320,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
             self.last_child(parent)?
         };
         self.clear_detached_node_document(child);
+        self.note_subtree_names(child);
         self.node_mut(child).parent = parent.index;
         self.node_mut(child).prev_sibling = Self::link_index(prev);
         self.node_mut(child).next_sibling = Self::link_index(before);
@@ -4434,6 +4536,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         } else {
             self.node_mut(parent).last_child = Self::link_index(prev);
         }
+        self.note_subtree_names(child);
         let node = self.node_mut(child);
         node.parent = NO_LINK;
         node.prev_sibling = NO_LINK;
@@ -4640,6 +4743,7 @@ pub fn is_form_associated_custom_element(&self,node:NodeId)->bool {
         while child != NO_LINK {
             let next = self.nodes[child as usize].next_sibling;
             let id = NodeId { document: self.id, index: child, generation: self.nodes[child as usize].generation };
+            self.note_subtree_names(id);
             self.set_node_document(id, owner)?;
             let node = &mut self.nodes[child as usize];
             node.parent = NO_LINK;

@@ -37,6 +37,9 @@ fn nodes_named(realm: &DomRealm, root: NodeId, wanted: &str) -> OpResult<Vec<Nod
     let session = realm.session.borrow();
     let document = session.document();
     let mut found = Vec::new();
+    if root == document.root() && document.indexed_document_name_maybe_exists(wanted) == Some(false) {
+        return Ok(found);
+    }
     let mut next = next_descendant(document, root, root).map_err(dom_error)?;
     while let Some(node) = next {
         if matches(document, node, wanted).map_err(dom_error)? {
