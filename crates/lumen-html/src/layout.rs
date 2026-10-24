@@ -7627,7 +7627,7 @@ impl Layout<'_> {
         depth: usize,
         marker: Option<&VirtualGeneratedChild>,
     ) -> Result<f32, LayoutError> {
-        let (width_declared, height_declared) = (style.declares_dimension(true), style.declares_dimension(false));
+        let (width_declared, height_declared) = (svg_root_declares_dimension(style, attributes, true), svg_root_declares_dimension(style, attributes, false));
         let resolved_style =
             self.resolve_style_percentages(style, available, self.parent_height);
         let style = &resolved_style;
@@ -12056,7 +12056,7 @@ impl LayoutGeometry {
         }
     }
 
-    fn refresh_control_run_transforms(&mut self, hits: Range<usize>) {
+    pub(crate) fn refresh_control_run_transforms(&mut self, hits: Range<usize>) {
         let transforms = &self.transforms;
         for run in &mut self.control_text_runs {
             let Some(index) = run.hit_index.filter(|index| hits.contains(index)) else {
@@ -12824,6 +12824,13 @@ fn automatic_clamp(style: &Style, horizontal: bool, fixed_maximum: Option<f32>) 
         style.height.is_none() && style.min_height_auto
     };
     fixed_maximum.filter(|_| automatic)
+}
+
+/// An outer `svg` declares its size through CSS or through its `width`/
+/// `height` attributes (SVG 2 §8.2 presentation attributes).
+fn svg_root_declares_dimension(style: &Style, attributes: &[(crate::Name, String)], width: bool) -> bool {
+    style.declares_dimension(width)
+        || crate::svg::attribute(attributes, if width { "width" } else { "height" }).is_some()
 }
 
 /// An `auto` minimum is the content-based automatic minimum (CSS Grid §6.6);
@@ -20521,7 +20528,13 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                             span,
                             min_content: size,
                             max_content: size,
-                            automatic_minimum: None,
+                            // Only the content-based automatic minimum applies here.
+                            automatic_minimum: grid_item_automatic_minimum(
+                                &item.style,
+                                horizontal != axes.vertical,
+                                size,
+                            )
+                            .filter(|minimum| minimum.automatic),
                         },
                     )?;
                 }
@@ -21153,8 +21166,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 style
                     .height
                     .map(|height| content_height_dimension(style, height)),
-                style.declares_dimension(true),
-                style.declares_dimension(false),
+                svg_root_declares_dimension(style, attributes, true),
+                svg_root_declares_dimension(style, attributes, false),
                 ratio_only,
                 if ratio_only { 0.0 } else { self.viewport_width() },
                 None,
@@ -22837,6 +22850,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             natural: (f32, f32),
             minimum: (f32, f32),
             measured: bool,
+            block_at_column: Option<(f32, f32)>,
             stretched_natural: Option<f32>,
             lane_position: f32,
             lane_extent: f32,
@@ -23157,6 +23171,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         natural: (0.0, 0.0),
                         minimum: (0.0, 0.0),
                         measured: false,
+                        block_at_column: None,
                         stretched_natural: None,
                         lane_position: 0.0,
                         lane_extent: 0.0,
@@ -23255,6 +23270,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 natural: (0.0, 0.0),
                 minimum: (0.0, 0.0),
                 measured: false,
+                block_at_column: None,
                 stretched_natural: None,
                 lane_position: 0.0,
                 lane_extent: 0.0,
@@ -24642,6 +24658,44 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             style.justify_content == JustifyContent::Stretch,
             column_contributions.iter().copied(),
         )?;
+        // Row contributions are block sizes at the item's column width (CSS
+        // Grid section 12.1); the measured ones are at the max-content width.
+        for item in &mut items {
+            item.block_at_column = None;
+            if !item.measured
+                || axes.vertical
+                || item.generated.is_some()
+                || item.anonymous_text.is_some()
+                || item.style.grid_rows_subgrid
+                || item.style.grid_columns_subgrid
+                || item.style.width.is_some()
+                || item.style.width_intrinsic.is_some()
+                || item.style.height.is_some()
+                || item.style.height_intrinsic.is_some()
+                || item.style.writing_mode != style.writing_mode
+                || !grid_span_needs_contributions(&row_definitions, item.row, item.rows, row_available)
+            {
+                continue;
+            }
+            let cw = widths[item.col..item.col + item.cols].iter().sum::<f32>()
+                + column_gap * (item.cols - 1) as f32;
+            // An item that does not stretch inline is fit-content sized; at
+            // or below the column width that is its measured max-content size.
+            let stretches_inline = item.style.self_alignment(style, true).alignment == AlignItems::Stretch
+                && !axes.automatic_margin(&item.style, true);
+            if (item.natural.0 - cw).abs() <= 0.01 || !stretches_inline && item.natural.0 <= cw {
+                continue;
+            }
+            let block = self.column_flex_item_height(
+                item.node,
+                &item.style,
+                style,
+                cw,
+                (cw - box_edges(&item.style, true)).max(0.0),
+                depth + 1,
+            )?;
+            item.block_at_column = Some((cw, block));
+        }
         let mut row_contributions = Vec::new();
         let mut subgrid_contributions = Vec::new();
         for item in &items {
@@ -24649,15 +24703,18 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 if !item.measured {
                     continue;
                 }
+                let (block_minimum, block_natural) = item
+                    .block_at_column
+                    .map_or((item.minimum.1, item.natural.1), |(_, block)| (block, block));
                 push_grid_track_contribution(
                     &mut row_contributions,
                     GridTrackContribution {
                         start: item.row,
                         span: item.rows,
-                        min_content: item.minimum.1,
-                        max_content: item.natural.1,
+                        min_content: block_minimum,
+                        max_content: block_natural,
                         automatic_minimum: grid_item_automatic_minimum(&item.style, axes.vertical, grid_automatic_minimum(
-                            item.minimum.1,
+                            block_minimum,
                             box_edges(&item.style, axes.vertical),
                             0.0, automatic_clamp(&item.style, axes.vertical, fixed_grid_maximum_range(
                                 &row_definitions,
@@ -24899,10 +24956,20 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let intrinsic_rows = row_definitions[item.row..item.row + item.rows].iter().any(|track| {
                 !matches!(track, GridTrack::Pixels(_) | GridTrack::Fraction(_) | GridTrack::Percentage(_) | GridTrack::Length(..))
             });
+            let block_at_column = match item.block_at_column {
+                Some((width, block)) if (width - cw).abs() <= 0.01 => Some(block),
+                _ if (item.natural.0 - cw).abs() <= 0.01 => Some(item.natural.1),
+                _ => None,
+            };
+            // A block size at the column width that fills the area still
+            // stretches, so percentages inside resolve against it. Unmeasured
+            // items are not stretched inline or have a column-independent width.
             let taller_than_content = !style.grid_lanes && !definite_area
                 && item.measured
-                && item.natural.0 <= cw
-                && item.natural.1 + 0.5 < area_height;
+                && match block_at_column {
+                    Some(block) => block <= area_height + 0.5,
+                    None => item.natural.0 <= cw && item.natural.1 + 0.5 < area_height,
+                };
             if (definite_area || taller_than_content)
                 && !axes.vertical
                 && computed.height.is_none()
@@ -24916,7 +24983,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     &computed,
                     constrained_height(&computed, (area_height - box_edges(&computed, false)).max(0.0)),
                 ));
-                item.stretched_natural = item.measured.then_some(item.natural.1);
+                item.stretched_natural = item.measured.then(|| block_at_column.unwrap_or(item.natural.1));
             }
             if computed.grid_columns_subgrid || computed.grid_rows_subgrid {
                 let subrow_gap = if computed.gap_specified {
@@ -25356,6 +25423,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 == (style.writing_mode == css::WritingMode::HorizontalTb);
             if !axes.vertical && parallel && item.stretched_natural.is_none() && !item.style.has_cyclic_size_percentage(false) {
                 item.natural.1
+            } else if !axes.vertical && parallel {
+                item.block_at_column.map_or(item.minimum.1, |(_, block)| block)
             } else {
                 item.minimum.1
             }
@@ -29308,7 +29377,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     return Ok(());
                 }
                 NodeKind::Element { name, namespace, attributes, .. } => {
-                    let style = layout.computed_style(node, None).map_err(LayoutError::Css)?;
+                    // Inherited properties come from the flattened parent; the
+                    // root arrives with its own style.
+                    let style = if depth == 0 { parent.clone() } else { layout.computed_style(node, Some(parent)).map_err(LayoutError::Css)? };
                     if style.display == Display::None || style.display.is_table_column() { return Ok(()); }
                     if depth > 0 && (matches!(style.position, Position::Absolute | Position::Fixed) || style.float != Float::None) {
                         *out_of_flow = true;
@@ -29352,7 +29423,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             }
             Ok(())
         }
-        let style = self.computed_style(root, None).map_err(LayoutError::Css)?;
+        let style = self.computed_style_from_tree(root)?;
         let mut paragraph = InlineParagraph::default();
         let mut out_of_flow = false;
         gather(self, root, &style, &mut paragraph, &mut out_of_flow, 0)?;
@@ -31028,8 +31099,13 @@ for (at,unit) in lumen_common::ucd::graphemes(source){
 
     /// CSS 2.1 §10.8.1: a non-replaced atomic inline exports its line
     /// baseline, or the bottom margin edge when no applicable line exists.
-    fn atomic_inline_baseline(display: Display, overflow_y: css::Overflow,
+    fn atomic_inline_baseline(display: Display, overflow_y: css::Overflow, contain_layout: bool,
         measured: Option<FlowBaselines>, origin: f32, height: f32, source: Option<&str>) -> f32 {
+        // Layout containment keeps the contents' baselines inside the box
+        // (CSS Containment 2 §3.2), so it aligns by its bottom margin edge.
+        if contain_layout {
+            return height;
+        }
         if let (Some(source @ ("first" | "last")), Some(baseline)) = (source, measured) {
             return (if source == "first" { baseline.first } else { baseline.last }) - origin;
         }
@@ -34004,7 +34080,7 @@ let mut layout_x=self.content_overflow_origin(line_left,*cursor).0+f64::from(*ad
                                 token.baseline_offset = if replaced {
                                     self.replaced_inline_baseline(block_style, actual_height)
                                 } else {
-                                    Self::atomic_inline_baseline(atom.style.display, atom.style.overflow_y, measured, *cursor, actual_height, css::extra_props::keyword(&atom.style, "baseline-source"))
+                                    Self::atomic_inline_baseline(atom.style.display, atom.style.overflow_y, atom.style.contain_layout, measured, *cursor, actual_height, css::extra_props::keyword(&atom.style, "baseline-source"))
                                 };
                             }
                             token.actual_height = actual_height;
@@ -36448,13 +36524,13 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let resolved_width = style.width.map(|value| {
                 constrained_width(style, content_dimension(style, value)) + box_edges(style, true)
             });
-            let baseline_style = (style.display, style.overflow_y, css::extra_props::keyword(style, "baseline-source").map(String::from));
+            let baseline_style = (style.display, style.overflow_y, css::extra_props::keyword(style, "baseline-source").map(String::from), style.contain_layout);
             let previous_baselines = self.flow_baselines.take();
             let result = self.box_for(id, parent_style, computed, x, y, available, depth);
             let measured = self.flow_baselines.take();
             self.flow_baselines = previous_baselines;
             let height = result?;
-            self.record_flow_baseline(y + Self::atomic_inline_baseline(baseline_style.0, baseline_style.1, measured, y, height, baseline_style.2.as_deref()));
+            self.record_flow_baseline(y + Self::atomic_inline_baseline(baseline_style.0, baseline_style.1, baseline_style.3, measured, y, height, baseline_style.2.as_deref()));
             // The margin-box advance belongs to the resolved box, even when
             // that box has no background, border, or retained hit geometry.
             let width = resolved_width
@@ -45089,6 +45165,80 @@ mod tests {
     }
     use super::*;
     use crate::paint::ShapedRun;
+
+    #[test]
+    fn case_context_of_wrapped_flex_item_keeps_inherited_text_style() {
+        let document = crate::html::parse("<!doctype html><body style='margin:0;font-size:20px'><div style='display:flex;flex-wrap:wrap;color:red;text-transform:uppercase'><div><span>ab</span></div></div>", 64).unwrap();
+        let list = display_list(&document, 200, 100, &GlyphFixedText).unwrap();
+        let runs = list.0.iter().filter_map(|command| match command {
+            crate::paint::Command::GlyphRun { size, color, glyphs, .. } => Some((*size, *color, glyphs.iter().map(|glyph| glyph.id).collect::<Vec<_>>())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(runs, [(20.0, Rgba { r: 255, g: 0, b: 0, a: 255 }, alloc::vec![65, 66])]);
+    }
+
+    fn laid_out_rects(markup: &str, ids: &[&str]) -> Vec<(String, crate::paint::Rect)> {
+        let document = crate::html::parse(markup, 1280).unwrap();
+        let mut session = crate::session::RenderSession::new(document);
+        session.display_list(1280, 800, &FixedText).unwrap();
+        ids.iter()
+            .map(|id| {
+                let node = crate::selector::query_selector(session.document(), session.document().root(), &alloc::format!("#{id}"))
+                    .unwrap()
+                    .unwrap();
+                (alloc::string::String::from(*id), session.bounding_client_rect(node).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_item_with_percentage_height_inline_flex_child_stretches_to_row_height() {
+        let rects = laid_out_rects("<!doctype html><style>body{margin:0}\n.grid{grid-template-columns:repeat(12,minmax(0px,1fr));max-width:1280px;margin:0 auto;display:grid}\n.col{min-height:460px}\na{display:inline-flex;justify-content:center;align-items:center;box-sizing:border-box;border:0;width:100%;height:100%;padding:0;position:relative}\n</style>\n<div class=grid><div class=col id=col><a id=a href=#><span><span><div><div><p>Figma streamlines development and strengthens security</p></div></div></span></span></a></div></div>", &["a", "col"]);
+        for (id, rect) in &rects {
+            assert_eq!(rect.height, 460.0, "#{id}");
+        }
+    }
+
+    #[test]
+    fn nested_zero_fr_grid_rows_collapse_in_every_container_kind() {
+        let rects = laid_out_rects("<!doctype html><style>body{margin:0}.g{display:grid;grid-template-rows:0fr}.g>div{overflow:hidden}</style>\n<div id=a style=\"display:grid\"><dd id=b style=\"margin:0\"><div class=g><div>hello<br>world</div></div></dd></div>\n<div id=c style=\"display:grid\"><div class=g><div>hello<br>world</div></div></div>\n<div id=d style=\"display:flex;flex-direction:column\"><div class=g><div>hello<br>world</div></div></div>\n<div id=e style=\"display:inline-block\"><div class=g><div>hello<br>world</div></div></div>", &["a", "b", "c", "d", "e"]);
+        for (id, rect) in &rects {
+            assert_eq!(rect.height, 0.0, "#{id}");
+        }
+    }
+
+    #[test]
+    fn stretched_grid_item_row_uses_block_size_at_column_width() {
+        let rects = laid_out_rects(
+            "<!doctype html><style>body{margin:0}</style><div id=g style='display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:400px'><nav id=n style='display:flex;flex-direction:column;padding-top:10px'><h3 style='margin:0'>aa bb cc dd</h3><ul id=p style='margin:0;padding:0;display:flex;flex-direction:column'><li><a style='display:inline-flex'>aa bb cc dd</a></li></ul></nav></div>",
+            &["g", "n", "p"],
+        );
+        let (grid, nav, list) = (rects[0].1, rects[1].1, rects[2].1);
+        assert_eq!(nav.height, list.y + list.height - nav.y);
+        assert_eq!(grid.height, nav.height);
+    }
+
+    #[test]
+    fn aspect_ratio_items_in_auto_grid_rows_keep_their_ratio_height() {
+        let rects = laid_out_rects("<!doctype html><style>body{margin:0}.v{aspect-ratio:2/1}.f{display:flex;flex-direction:column;width:400px}</style>\n<div id=a class=f><div class=v></div></div>\n<div id=b class=f style=\"overflow:hidden\"><div class=v></div></div>\n<div id=c style=\"display:grid;grid-template-columns:400px\"><div class=f><div class=v></div></div></div>\n<div id=d style=\"display:grid;grid-template-columns:400px\"><div class=f style=\"overflow:hidden\"><div class=v></div></div></div>\n<div id=e style=\"display:grid;grid-template-columns:1fr 1fr;width:800px\"><div class=f style=\"width:auto\"><div class=v></div></div><div>x</div></div>\n<div id=g style=\"display:grid;grid-template-columns:repeat(12,minmax(0,1fr));width:800px\"><div class=f style=\"width:auto;grid-column:auto/span 6\"><div class=v></div></div><div style=\"grid-column:auto/span 6\">x</div></div>", &["a", "b", "c", "d", "e", "g"]);
+        for (id, rect) in &rects {
+            assert_eq!(rect.height, 200.0, "#{id}");
+        }
+    }
+
+    #[test]
+    fn inline_flex_with_layout_containment_baselines_at_bottom_margin_edge() {
+        let rects = laid_out_rects("<!doctype html><style>body{margin:0;font:10px/10px monospace}span{vertical-align:baseline}</style>\n<div>x<span id=c style=\"display:inline-flex;contain:layout;height:30px\">b</span><span id=e style=\"display:inline-block;height:30px;width:5px\"></span></div>", &["c", "e"]);
+        let bottom = |rect: &crate::paint::Rect| rect.y + rect.height;
+        assert_eq!(bottom(&rects[0].1), bottom(&rects[1].1));
+    }
+
+    #[test]
+    fn inline_flex_without_layout_containment_baselines_at_its_text() {
+        let rects = laid_out_rects("<!doctype html><style>body{margin:0;font:10px/10px monospace}span{vertical-align:baseline}</style>\n<div>x<span id=c style=\"display:inline-flex;height:30px\">b</span><span id=e style=\"display:inline-block;height:30px;width:5px\"></span></div>", &["c", "e"]);
+        let bottom = |rect: &crate::paint::Rect| rect.y + rect.height;
+        assert_ne!(bottom(&rects[0].1), bottom(&rects[1].1));
+    }
 
     #[test]
     fn specification_standalone_svg_canvas_transform_owner_restores_on_primitive_error() {

@@ -644,8 +644,17 @@ fn display_list_damage(old: &DisplayList, new: &DisplayList) -> Option<Vec<Rect>
     let offsets = open_translations(&old[..prefix])?;
     let mut rects = Vec::new();
     for middle in [&old[prefix..old.len() - suffix], &new[prefix..new.len() - suffix]] {
+        commands_damage(&offsets, middle, &mut rects)?;
+    }
+    Some(coalesce_rects(rects))
+}
+
+/// Adds the rects covering `middle`, drawn under the open `offsets`, to
+/// `rects`; `None` when they are not bounded by command rects.
+fn commands_damage(offsets: &[(f32, f32)], middle: &[Command], rects: &mut Vec<Rect>) -> Option<()> {
+    {
         let (mut clips, mut open_layers) = (0usize, 0usize);
-        let mut stack = offsets.clone();
+        let mut stack = offsets.to_vec();
         let depth = stack.len();
         for command in middle {
             match command {
@@ -679,7 +688,7 @@ fn display_list_damage(old: &DisplayList, new: &DisplayList) -> Option<Vec<Rect>
             return None;
         }
     }
-    Some(coalesce_rects(rects))
+    Some(())
 }
 
 fn slot_assignment_host(document: &Document, target: NodeId, attribute: &str) -> Option<NodeId> {
@@ -696,16 +705,64 @@ fn slot_assignment_host(document: &Document, target: NodeId, attribute: &str) ->
     }
 }
 
-fn changed_declarations_paint_only(
+fn transform_property(name: &str) -> bool {
+    matches!(name, "transform" | "translate" | "rotate" | "scale")
+}
+
+fn affine_close(a: crate::paint::Affine, b: crate::paint::Affine) -> bool {
+    let close = |x: f32, y: f32, tolerance: f32| (x - y).abs() <= tolerance;
+    close(a.a, b.a, 1e-4) && close(a.b, b.b, 1e-4) && close(a.c, b.c, 1e-4) && close(a.d, b.d, 1e-4)
+        && close(a.e, b.e, 1e-2) && close(a.f, b.f, 1e-2)
+}
+
+/// The damage of replacing the transform pushed at `index` with `new`: what
+/// it draws under both matrices, or `None` when that is not bounded.
+fn transform_patch_damage(list: &[Command], index: usize, old: crate::paint::Affine, new: crate::paint::Affine) -> Option<Vec<Rect>> {
+    let mut depth = 0usize;
+    let end = index + 1 + list[index + 1..].iter().position(|command| match command {
+        Command::PushTransform(_) => { depth += 1; false }
+        Command::PopTransform if depth == 0 => true,
+        Command::PopTransform => { depth -= 1; false }
+        _ => false,
+    })?;
+    let offsets = open_translations(&list[..index])?;
+    let mut rects = Vec::new();
+    for matrix in [old, new] {
+        let mut middle = Vec::with_capacity(end + 1 - index);
+        middle.push(Command::PushTransform(matrix));
+        middle.extend(list[index + 1..=end].iter().cloned());
+        commands_damage(&offsets, &middle, &mut rects)?;
+    }
+    Some(rects)
+}
+
+/// Whether every declaration that differs between `previous` and `next`
+/// names a property that passes `test`.
+fn changed_declarations_all(
     previous: &[(String, String)],
     next: &[(String, String)],
+    test: fn(&str) -> bool,
 ) -> bool {
     let differs = |from: &[(String, String)], to: &[(String, String)]| {
         from.iter()
             .filter(|(name, value)| !to.iter().any(|(n, v)| n == name && v == value))
-            .all(|(name, _)| css::paint_only_property(name))
+            .all(|(name, _)| test(name))
     };
     differs(previous, next) && differs(next, previous)
+}
+
+/// Effect targets past this many per frame restyle the whole document.
+const ANIMATION_LAYOUT_TARGETS: usize = 64;
+
+/// Whether an animated value of `name` changes only the styles of its target
+/// and the target's descendants, and the layout of the boxes around them.
+/// Generated content, counters and anchors reach other elements.
+fn effect_restyles_only_its_box(name: &str) -> bool {
+    !(name.starts_with("counter-")
+        || name.starts_with("anchor-")
+        || name.starts_with("position-")
+        || name.starts_with("view-transition-")
+        || matches!(name, "content" | "quotes" | "string-set" | "display" | "position" | "float" | "container-name" | "container-type" | "container"))
 }
 
 pub type AnimationStyleInput = (NodeId, Option<css::PseudoElement>, Option<NodeId>, [Option<Arc<str>>; 19]);
@@ -910,7 +967,15 @@ pub struct RenderSession {
     animation_generation: u64,
     animation_epoch: u64,
     pending_animation_nodes: Vec<NodeId>,
+    /// Effect targets whose samples changed their own layout.
+    pending_animation_layout_nodes: Vec<NodeId>,
     pending_animation_full: bool,
+    /// The frame from before effect changes which so far only moved
+    /// transforms; `flush_animation_changes` patches it instead of laying out.
+    transform_patch_frame: Option<CachedFrame>,
+    /// The styles the last patched transforms were computed from, which the
+    /// style cache does not hold until a layout computes them again.
+    patched_transform_styles: Vec<(NodeId, Arc<Style>)>,
     images_pending: bool,
     /// The distinct lookups the last layout answered `Pending` and whether
     /// each was only a paint-only use (`ImageResolver::set_paint_only`).
@@ -1440,7 +1505,10 @@ impl RenderSession {
             animation_generation: 0,
             animation_epoch: 0,
             pending_animation_nodes: Vec::new(),
+            pending_animation_layout_nodes: Vec::new(),
             pending_animation_full: false,
+            transform_patch_frame: None,
+            patched_transform_styles: Vec::new(),
             images_pending: false,
             pending_lookups: Vec::new(),
             layout_count: 0,
@@ -1780,6 +1848,7 @@ impl RenderSession {
     fn discard_frame(&mut self) {
         self.cached = None;
         self.failed_frame = None;
+        self.transform_patch_frame = None;
     }
 
     /// Folds the damage of a layout into what the host has not yet drawn;
@@ -3136,14 +3205,21 @@ impl RenderSession {
             .animated_styles
             .iter()
             .position(|(target, target_pseudo, target_origin, _)| *target == node && *target_pseudo == pseudo && *target_origin == origin);
-        let paint_only = {
+        let (transform_only, paint_only, local) = {
             let previous: &[(String, String)] =
                 position.map_or(&[][..], |index| self.animated_styles[index].3.as_slice());
             if previous == declarations.as_slice() {
                 return Ok(());
             }
-            changed_declarations_paint_only(previous, &declarations)
+            let transform_only = changed_declarations_all(previous, &declarations, transform_property);
+            (transform_only,
+                transform_only || changed_declarations_all(previous, &declarations, css::paint_only_property),
+                changed_declarations_all(previous, &declarations, effect_restyles_only_its_box)
+                    && !self.propagates_to_document(node))
         };
+        let first_change = !self.pending_animation_full
+            && self.pending_animation_nodes.is_empty()
+            && self.pending_animation_layout_nodes.is_empty();
         if self.snapshot_basis.is_some() && !self.snapshot_effects_unbounded {
             self.snapshot_effect_nodes.insert(node.key());
             if self.snapshot_effect_nodes.len()>4096 {
@@ -3172,15 +3248,34 @@ impl RenderSession {
                 self.read_dirty.all = true;
             }
         }
-        if paint_only {
-            if !self.pending_animation_full && self.pending_animation_nodes.last() != Some(&node) {
-                self.pending_animation_nodes.push(node);
+        if !self.pending_animation_full {
+            if paint_only {
+                if self.pending_animation_nodes.last() != Some(&node) {
+                    self.pending_animation_nodes.push(node);
+                }
+            } else if local && self.pending_animation_layout_nodes.len() < ANIMATION_LAYOUT_TARGETS {
+                if self.pending_animation_layout_nodes.last() != Some(&node) {
+                    self.pending_animation_layout_nodes.push(node);
+                }
+            } else {
+                self.pending_animation_full = true;
+                self.pending_animation_nodes.clear();
+                self.pending_animation_layout_nodes.clear();
             }
-        } else {
-            self.pending_animation_full = true;
-            self.pending_animation_nodes.clear();
         }
-        self.discard_frame();
+        // Keep the frame while every pending change only moves transforms;
+        // any other change drops it with the frame.
+        let keeps_frame = transform_only
+            && pseudo.is_none()
+            && (if first_change { self.cached.is_some() } else { self.transform_patch_frame.is_some() });
+        if keeps_frame {
+            if let Some(frame) = self.cached.take() {
+                self.transform_patch_frame = Some(frame);
+            }
+            self.failed_frame = None;
+        } else {
+            self.discard_frame();
+        }
         self.frame_id += 1;
         Ok(())
     }
@@ -3194,30 +3289,150 @@ impl RenderSession {
             self.invalidate_paint();
             return;
         }
-        if self.pending_animation_nodes.is_empty() {
+        if self.pending_animation_nodes.is_empty() && self.pending_animation_layout_nodes.is_empty() {
             return;
         }
         let mut nodes = core::mem::take(&mut self.pending_animation_nodes);
         nodes.sort_by_key(|node| node.index());
         nodes.dedup();
+        let mut layout_nodes = core::mem::take(&mut self.pending_animation_layout_nodes);
+        layout_nodes.sort_by_key(|node| node.index());
+        layout_nodes.dedup();
         if nodes
             .iter()
+            .chain(&layout_nodes)
             .any(|node| self.document.kind(*node).is_err())
         {
             self.style_cache.borrow_mut().clear();
             self.invalidate_paint();
             return;
         }
+        let patch_frame = self.transform_patch_frame.take().filter(|_| layout_nodes.is_empty() && self.cached.is_none());
+        let previous_styles = patch_frame.as_ref().map(|_| {
+            let cache = self.style_cache.borrow();
+            nodes.iter().map(|node| cache.node_style(*node).or_else(|| self.patched_transform_styles.iter()
+                .find(|(patched, _)| patched == node).map(|(_, style)| style.clone()))).collect::<Vec<_>>()
+        });
+        // Intrinsic sizes the targets reach are dropped below with their
+        // fragments; the others stay valid across this style epoch.
+        let intrinsics_current = self.intrinsic_style_epoch == Some(self.style_cache.borrow().epoch());
         {
             let mut cache = self.style_cache.borrow_mut();
-            for node in &nodes {
+            for node in nodes.iter().chain(&layout_nodes) {
                 cache.invalidate_node(*node);
             }
         }
+        if intrinsics_current {
+            self.intrinsic_style_epoch = Some(self.style_cache.borrow().epoch());
+        }
         self.discard_frame();
+        if !layout_nodes.is_empty() {
+            // The target's box and every box around it that its size reaches
+            // lay out again; its descendants restyle through their parent.
+            let styles = self.style_cache.borrow();
+            let size_boundary = |node: NodeId| styles.node_style(node).is_some_and(|style| style.is_intrinsic_size_boundary());
+            self.layout_cache.invalidate_changed(&self.document, &layout_nodes, &layout_nodes, &[], &size_boundary);
+        }
         self.layout_cache
             .invalidate_subtree_targets(&self.document, &nodes);
         self.paint_revision = self.paint_revision.wrapping_add(1);
+        if let (Some(mut frame), Some(previous)) = (patch_frame, previous_styles) {
+            if let Some(damage) = self.patch_frame_transforms(&mut frame, &nodes, &previous) {
+                self.accumulate_damage(damage);
+                self.cached = Some(frame);
+            }
+        }
+    }
+
+    /// Moves the transforms of `nodes` in a frame laid out before only their
+    /// transforms changed, as a compositor would; the damage it causes, or
+    /// `None` when the frame cannot be patched and must be laid out again.
+    /// A transform also moves the scrollable overflow it reaches, so only
+    /// boxes clipped by an ancestor that does not scroll are patched.
+    fn patch_frame_transforms(&mut self, frame: &mut CachedFrame, nodes: &[NodeId],
+        previous: &[Option<Arc<Style>>]) -> Option<Option<Vec<Rect>>> {
+        if frame.document_version != self.document.version() || frame.geometry.transform_timeline_values.is_some() {
+            return None;
+        }
+        let mut patches: Vec<(crate::paint::Affine, crate::paint::Affine, usize)> = Vec::new();
+        let mut styles = Vec::with_capacity(nodes.len());
+        for (node, old) in nodes.iter().zip(previous) {
+            let old = old.as_ref()?;
+            let new = Arc::new(self.computed_style(*node).ok()?);
+            if !old.has_transform() || !new.has_transform()
+                || old.transform_timeline_source().is_some() || new.transform_timeline_source().is_some()
+                || old.transform_only_translates() != new.transform_only_translates() {
+                return None;
+            }
+            let geometry = &frame.geometry;
+            let hit = geometry.hits.iter().position(|hit| hit.node == *node && hit.pseudo.is_none())?;
+            let rect = geometry.transform_reference_box(*node, None).map_or(geometry.hits[hit].rect, |value| value.0);
+            let mut owned = geometry.transforms.iter().enumerate().filter(|(_, transform)| transform.hits.start == hit);
+            let (index, transform) = owned.next()?;
+            if owned.next().is_some() || !affine_close(old.transform_matrix(rect)?, transform.matrix) {
+                return None;
+            }
+            let (from, to) = (transform.matrix, new.transform_matrix(rect)?);
+            let moved = match (translation_of(&from), translation_of(&to)) {
+                (Some(from), Some(to)) => [from.0 != to.0, from.1 != to.1],
+                _ => [true, true],
+            };
+            if !self.transform_clipped_in_place(*node, moved) {
+                return None;
+            }
+            patches.push((from, to, index));
+            styles.push((*node, new));
+        }
+        let mut damage = Some(Vec::new());
+        let mut patched = Vec::new();
+        for (old, new, index) in &patches {
+            frame.geometry.transforms[*index].matrix = *new;
+            let hits = frame.geometry.transforms[*index].hits.clone();
+            frame.geometry.refresh_control_run_transforms(hits);
+            if patched.iter().any(|done: &(crate::paint::Affine, crate::paint::Affine)| affine_close(done.0, *old) && affine_close(done.1, *new)) {
+                continue;
+            }
+            patched.push((*old, *new));
+            // Boxes moved by the same sample share their command matrix; every
+            // command with it must belong to one of them.
+            let sharing = patches.iter().filter(|(from, to, _)| affine_close(*from, *old) && affine_close(*to, *new)).count();
+            let commands: Vec<usize> = frame.list.0.iter().enumerate()
+                .filter(|(_, command)| matches!(command, Command::PushTransform(matrix) if affine_close(*matrix, *old)))
+                .map(|(index, _)| index).collect();
+            if commands.len() != sharing {
+                return None;
+            }
+            for command in commands {
+                let rects = transform_patch_damage(&frame.list.0, command, *old, *new);
+                frame.list.0[command] = Command::PushTransform(*new);
+                damage = match (damage, rects) {
+                    (Some(mut all), Some(rects)) => { all.extend(rects); Some(all) }
+                    _ => None,
+                };
+            }
+        }
+        self.patched_transform_styles = styles;
+        Some(damage.map(coalesce_rects))
+    }
+
+    /// Whether an ancestor clips `node`'s transformed box, with no out-of-flow
+    /// box between them, and does not scroll along an axis in `moved`.
+    fn transform_clipped_in_place(&mut self, node: NodeId, moved: [bool; 2]) -> bool {
+        let mut current = node;
+        loop {
+            let Ok(style) = self.computed_style(current) else { return false };
+            if current != node && style.overflow_x != css::Overflow::Visible && style.overflow_y != css::Overflow::Visible {
+                let still = |overflow: css::Overflow, moved: bool| !moved || matches!(overflow, css::Overflow::Hidden | css::Overflow::Clip);
+                return still(style.overflow_x, moved[0]) && still(style.overflow_y, moved[1]);
+            }
+            if matches!(style.position, css::Position::Absolute | css::Position::Fixed) {
+                return false;
+            }
+            match self.document.parent(current) {
+                Ok(Some(parent)) if matches!(self.document.kind(parent), Ok(NodeKind::Element { .. })) => current = parent,
+                _ => return false,
+            }
+        }
     }
 
     /// Capture the declaring tree for a non-CSS font-family reference such as
@@ -3962,9 +4177,12 @@ impl RenderSession {
             if nodes[start].pseudo.is_none() {ranges.insert(node.key(),(start,end));}
             start=end;
         }
+        // An effect target's descendants change only through what they
+        // inherit, which the comparison with its previous style finds.
         Some(SnapshotBase{previous,ranges,
-            dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key()).collect(),
-            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).chain(self.snapshot_effect_nodes.iter().copied()).collect()})
+            dirty:self.snapshot_dirty.nodes.iter().chain(&self.snapshot_rule_subjects).map(|node|node.key())
+                .chain(self.snapshot_effect_nodes.iter().copied()).collect(),
+            subtrees:self.snapshot_dirty.subtrees.iter().map(|node|node.key()).collect()})
     }
 
     /// Capture current effect-underlying author provenance only for the supplied
@@ -4216,6 +4434,7 @@ impl RenderSession {
             && self.style_version==version
             && !self.rules_reset && self.rule_subjects.is_none()
             && !self.pending_animation_full && self.pending_animation_nodes.is_empty()
+            && self.pending_animation_layout_nodes.is_empty()
             && self.style_environment==Some(rules.environment)
             && self.validity_generation==self.document.validity_generation()
             && self.interaction_generation==self.document.interaction_generation()
@@ -4698,6 +4917,20 @@ impl RenderSession {
             });
         }
         result
+    }
+
+    /// The root element and its children (`body`) feed root-relative units
+    /// and viewport propagation, so their style changes reach other boxes.
+    fn propagates_to_document(&self, node: NodeId) -> bool {
+        let root = self.document.root();
+        let parent = self.document.parent(node).ok().flatten();
+        parent == Some(root) || parent.is_some_and(|parent| self.document.parent(parent).ok().flatten() == Some(root))
+    }
+
+    /// Whether the last layout skipped this sized `<img>` below its culled
+    /// region; its geometry is not laid out.
+    pub fn image_box_culled(&self, node: NodeId) -> bool {
+        self.culled_images.binary_search_by_key(&node.key(), |culled| culled.key()).is_ok()
     }
 
     /// Return each rendered border-box fragment for `node` in viewport CSS

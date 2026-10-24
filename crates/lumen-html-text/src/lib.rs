@@ -3643,6 +3643,14 @@ variation_advances: VariationGlyphCache::new(),
         Ok(coverage)
     }
 
+    /// Em-relative advance of `character` at a variation instance.
+    fn variation_advance_ratio(&self, character: char, coordinates: &Arc<[rustybuzz::Variation]>) -> Option<f32> {
+        let key = self.variation_key(coordinates, false).ok()?;
+        let glyph = ttf_parser::Face::parse(&self.bytes, 0).ok()?.glyph_index(character)?;
+        self.advance_with_variations(key, glyph.0, self.units_per_em, coordinates)
+            .map(|advance| advance / self.units_per_em)
+    }
+
     fn advance_with_variations(&self, key: u64, id: u16, size: f32, variations: &[rustybuzz::Variation]) -> Option<f32> {
         let cache_key = (key, id, size.to_bits());
         if let Some(hit) = self.variation_advances.get(cache_key) {
@@ -4264,12 +4272,20 @@ if let Some((run,Some(clusters)))=self.shapes.get_context(full,size,Some(rtl),7,
         let metric = |name: FontMetric, glyph: Option<&str>| {
             let index=match glyph{Some("0")=>selection.ch,Some("水")=>selection.ic,_=>selection.first};
             let face = &self.font(index).face;
+            let scale = self.size_adjust_scale(font, index);
+            // `ch` measures the "0" of the instance the text is shaped with.
+            let instance_zero = || {
+                let (weight, stretch, _) = self.font_match_instance(font, index)?;
+                let coordinates = face.variation_coordinates(weight, stretch, size * scale)?;
+                face.variation_advance_ratio('0', &coordinates)
+            };
             let ratio = match name {
-                FontMetric::ChWidth => face.metrics[if upright_zero { 5 } else { 2 }],
+                FontMetric::ChWidth if !upright_zero => instance_zero().or(face.metrics[2]),
+                FontMetric::ChWidth => face.metrics[5],
                 FontMetric::IcWidth => face.metrics[if vertical { 4 } else { 3 }],
                 _ => face.metric(name),
             }?;
-            let value = ratio * size * self.size_adjust_scale(font, index);
+            let value = ratio * size * scale;
             value.is_finite().then_some(value)
         };
         lumen_html::paint::FontUnitMetrics {

@@ -1624,3 +1624,55 @@ diff!(
         |s| attr(s, "#grid", "class", "g fit"),
     ]
 );
+
+fn animate(s: &mut RenderSession, sel: &str, declarations: &[(&str, &str)]) {
+    let node = q(s, sel);
+    let declarations = declarations.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+    s.set_animation_declarations(node, declarations).unwrap();
+}
+
+const MARQUEE: &str = "<style>body{margin:0}#c{display:flex;overflow:hidden visible;width:300px}\
+     .g{display:flex;gap:10px;min-width:100%;transform:translateX(0)}.g i{display:block;width:40px;height:20px;background:green}\
+     #free{transform:translate(0,0);width:50px;height:20px;background:blue}</style>\
+     <div id=c><div class=g id=a><i></i><i></i><i></i></div><div class=g id=b><i></i><i></i><i></i></div></div>\
+     <p>after</p><div id=free></div>";
+
+diff!(
+    clipped_transform_samples_match_fresh_layout,
+    MARQUEE,
+    [
+        |s| { animate(s, "#a", &[("transform", "translateX(-10px)")]); animate(s, "#b", &[("transform", "translateX(-10px)")]); },
+        |s| { animate(s, "#a", &[("transform", "translateX(-25.5px)")]); animate(s, "#b", &[("transform", "translateX(-25.5px)")]); },
+        |s| animate(s, "#a", &[("transform", "translateX(-40px)")]),
+        |s| animate(s, "#free", &[("transform", "translate(30px,5px)")]),
+        |s| animate(s, "#a", &[("transform", "translateX(-40px) rotate(10deg)")]),
+    ]
+);
+
+#[test]
+fn clipped_transform_sample_patches_the_frame_without_layout() {
+    let mut session = RenderSession::new(html::parse(MARQUEE, MAX_NODES).unwrap());
+    session.set_verify_incremental(false);
+    render(&mut session);
+    animate(&mut session, "#a", &[("transform", "translateX(-10px)")]);
+    render(&mut session);
+    let passes = session.invalidation_stats().layout_passes;
+    for offset in [20, 30, 40] {
+        let value = format!("translateX(-{offset}px)");
+        animate(&mut session, "#a", &[("transform", &value)]);
+        render(&mut session);
+    }
+    assert_eq!(session.invalidation_stats().layout_passes, passes, "a clipped transform sample moves the painted frame");
+    animate(&mut session, "#free", &[("transform", "translate(30px,5px)")]);
+    render(&mut session);
+    assert_eq!(session.invalidation_stats().layout_passes, passes + 1, "an unclipped transform moves scrollable overflow");
+}
+
+diff!(
+    clipped_transform_patched_frame_matches_fresh_layout,
+    MARQUEE,
+    [
+        |s| { animate(s, "#a", &[("transform", "translateX(-10px)")]); animate(s, "#b", &[("transform", "translateX(-10px)")]); },
+        |s| { animate(s, "#a", &[("transform", "translateX(-33.25px)")]); animate(s, "#b", &[("transform", "translateX(-33.25px)")]); },
+    ]
+);
