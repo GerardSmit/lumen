@@ -4609,13 +4609,20 @@ impl Style {
     pub fn custom_properties(&self) -> &CustomProperties {
         self.custom.as_deref().unwrap_or(&NO_CUSTOM)
     }
-    /// The address and charge of the custom property map, which descendants
-    /// share by `Arc`, so a snapshot can charge it once per allocation.
-    pub(crate) fn shared_custom_payload(&self) -> Option<(usize, usize)> {
-        let custom=self.custom.as_ref()?;
+    /// The charge of the custom property map this style shares with `other` by `Arc`.
+    pub(crate) fn custom_payload_shared_with(&self, other: &Style) -> Option<usize> {
+        let (Some(custom), Some(other)) = (&self.custom, &other.custom) else { return None; };
+        if !Arc::ptr_eq(custom, other) { return None; }
+        (2 * core::mem::size_of::<usize>()).checked_add(custom.checked_payload_bytes()?)
+    }
+    /// The addresses and charges of the custom property map and of the root it
+    /// refines, which descendants share by `Arc`, so a snapshot can charge
+    /// each once per allocation.
+    pub(crate) fn shared_custom_payload(&self) -> [Option<(usize, usize)>; 2] {
+        let Some(custom)=self.custom.as_ref() else {return [None,None];};
         let header=2*core::mem::size_of::<usize>();
-        let bytes=header.checked_add(custom.checked_payload_bytes()?)?;
-        Some((Arc::as_ptr(custom) as *const u8 as usize,bytes))
+        let Some((local,root))=custom.checked_payload_parts() else {return [None,None];};
+        [header.checked_add(local).map(|bytes|(Arc::as_ptr(custom) as *const u8 as usize,bytes)),root]
     }
     pub(crate) fn clear_individual_transform_effects(&mut self){
         if self.individual_transforms.iter().any(Option::is_some){self.individual_transforms=[None,None,None];}
@@ -26776,6 +26783,7 @@ pub struct EffectEligibility {
     ua_margin_block_em: Option<f32>,
     query_context: Option<ContainerUnitContext>,
     light: bool,
+    effects_cascaded: bool,
 }
 impl Default for EffectEligibility {
     fn default() -> Self { Self { slots: [0; (PROPERTY_COUNT + 63) / 64], inherited: [0; (PROPERTY_COUNT + 63) / 64], protected_custom: Vec::new(), dependent: Vec::new(), sources: None, registrations: None, baseline: None, box_parent: BoxParentContext::Flow,
@@ -26783,6 +26791,7 @@ impl Default for EffectEligibility {
             let mut flags = 0; for bit in 0..64 { let slot = word * 64 + bit; if slot < PROPERTY_COUNT && inherited_property(slot) { flags |= 1 << bit; } } flags
         }), baseline_font_scale: None, baseline_font_smaller: false, baseline_bolder: false, root: false,
         ua_hidden_input: false, ua_clip_input: false, ua_margin_block_em: None, query_context: None, light: false,
+        effects_cascaded: false,
     } }
 }
 impl EffectEligibility {
@@ -26790,6 +26799,9 @@ impl EffectEligibility {
     /// never looks up a newly changed container or selector input.
     pub fn set_query_context(&mut self, context: ContainerUnitContext) {self.query_context=Some(context);}
     pub fn query_context(&self)->Option<ContainerUnitContext>{self.query_context}
+    /// Whether animation or transition declarations took part in the cascade
+    /// of the captured style, which is then not its underlying style.
+    pub fn effects_cascaded(&self)->bool{self.effects_cascaded}
     /// The source epoch's Arc is retained only with effect snapshot provenance.
     pub fn registered_custom_property_snapshot(&self)->Option<Arc<[registered_properties::RegisteredCustomProperty]>>{self.registrations.clone()}
     /// Canonical retained font declarations can consume animated custom values.
@@ -27523,8 +27535,24 @@ impl CustomProperties {
 
     /// The retained size of the map and its text, shared by every element that inherits it.
     pub(crate) fn checked_payload_bytes(&self) -> Option<usize> {
-        core::mem::size_of::<Self>().checked_add(self.len.checked_mul(core::mem::size_of::<CustomEntry>())?)?
-            .checked_add(self.text_bytes)
+        let (local, root) = self.checked_payload_parts()?;
+        local.checked_add(root.map_or(0, |(_, bytes)| bytes))
+    }
+
+    /// This map's own payload, and the address and payload of the root a
+    /// refinement shares with every other refinement of it.
+    pub(crate) fn checked_payload_parts(&self) -> Option<(usize, Option<(usize, usize)>)> {
+        let Some(root) = &self.root else {
+            let bytes = core::mem::size_of::<Self>().checked_add(self.len.checked_mul(core::mem::size_of::<CustomEntry>())?)?
+                .checked_add(self.text_bytes)?;
+            return Some((bytes, None));
+        };
+        let entries = self.overrides.len().checked_add(self.added.len())?;
+        let text = self.overrides.iter().chain(&self.added).map(custom_entry_text_bytes)
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))?;
+        let local = core::mem::size_of::<Self>().checked_add(entries.checked_mul(core::mem::size_of::<CustomEntry>())?)?
+            .checked_add(core::mem::size_of_val(self.override_positions.as_slice()))?.checked_add(text)?;
+        Some((local, Some((Arc::as_ptr(root) as usize, root.checked_payload_bytes()?))))
     }
 
     fn to_vec(&self) -> Vec<CustomEntry> { self.iter().cloned().collect() }
@@ -31449,6 +31477,9 @@ fn compute_for_named_registered_inner(
                 EffectOrigin::Animation => CascadeOrigin::Animation,
                 EffectOrigin::Transition => CascadeOrigin::Transition,
             };
+            if !effect.declarations.is_empty() {
+                if let Some(provenance) = eligibility.as_deref_mut() { provenance.effects_cascaded = true; }
+            }
             for declaration in &effect.declarations {
                 if pseudo_target.is_some_and(PseudoElement::is_marker) && marker_ignores(&declaration.value, true) { continue; }
                 candidates.push(((origin, [usize::MAX; 8], (0, 0, 0, 0), (0, usize::MAX)),

@@ -1622,7 +1622,7 @@ fn before_change_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElement>
             environment,pairs,&lumen_html::css::EffectEligibility::all())
             .map_err(|error|OpError::new("SyntaxError",format!("before-change transition sample failed: {error:?}")))?;
     }
-    budget.reserve(prepared,1)?;budget.style(&style,true)?;
+    budget.reserve(prepared,1)?;budget.style(&style,Some(&*input.style),true)?;
     prepared.insert(target,style.clone());Ok(style)
 }
 
@@ -2653,8 +2653,10 @@ impl EffectSamplingBudget {
             .ok_or_else(||OpError::new("QuotaExceededError","effect underlying working-set limit"))?;
         self.bytes=bytes;Ok(())
     }
-    fn style(&mut self,style:&lumen_html::css::Style,retain:bool)->OpResult<()> {
-        let bytes=lumen_html::layout::checked_style_retained_bytes(style)
+    /// Charges `style`, less the custom property map it shares with `source`.
+    fn style(&mut self,style:&lumen_html::css::Style,source:Option<&lumen_html::css::Style>,retain:bool)->OpResult<()> {
+        let bytes=source.map_or_else(||lumen_html::layout::checked_style_retained_bytes(style),
+            |source|lumen_html::layout::checked_style_retained_bytes_beside(style,source))
             .ok_or_else(||OpError::new("QuotaExceededError","effect underlying style limit"))?;
         let before=self.bytes;self.add(bytes)?;if retain {self.style_bytes=self.style_bytes.checked_add(bytes).ok_or_else(||OpError::new("QuotaExceededError","effect underlying style limit"))?;}else{self.bytes=before;}Ok(())
     }
@@ -2711,8 +2713,21 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
     let parent=input.parent.and_then(|node|inputs.get(&(node,None)).map(|source|source.input));
     let resolved_parent=parent.map(|parent|effect_underlying_style((parent.node,None),true,inputs,declarations,document,environment,text,prepared,budget,depth+1)).transpose()?;
     if own{budget.reserve(prepared,1)?;}
+    // A style captured without effects, under an unchanged parent and with no
+    // samples to apply, is already its underlying style; restyling it again
+    // would cascade the same declarations.
+    let parent_kept=match (parent,&resolved_parent) {
+        (Some(parent),Some(resolved))=>Arc::ptr_eq(&parent.style,resolved),
+        (None,None)=>true,
+        _=>false,
+    };
+    let sampled=own && [false,true].iter().any(|&transition|declarations.get(&(input.node,input.pseudo,transition)).is_some_and(|values|!values.is_empty()));
+    if parent_kept && !sampled && !input.eligibility.effects_cascaded() {
+        if own {prepared.insert(target,input.style.clone());}
+        return Ok(input.style.clone());
+    }
     let checkpoint=budget.bytes;
-    let source_bytes=lumen_html::layout::checked_style_retained_bytes(&input.style)
+    let source_bytes=lumen_html::layout::checked_style_retained_bytes_beside(&input.style,&input.style)
         .ok_or_else(||OpError::new("QuotaExceededError","effect underlying source limit"))?;
     budget.add(source_bytes)?;
     let mut style=input.style.clone();
@@ -2732,11 +2747,11 @@ fn effect_underlying_style<'a>(target:(NodeId,Option<lumen_html::css::PseudoElem
         }
 
         budget.bytes=checkpoint;
-        budget.style(&style,true)?;
+        budget.style(&style,Some(&*input.style),true)?;
         prepared.insert(target,style.clone());
 
     }
-    if !own{budget.bytes=checkpoint;budget.style(&style,false)?;}
+    if !own{budget.bytes=checkpoint;budget.style(&style,Some(&*input.style),false)?;}
     Ok(style)
 }
 
@@ -3505,7 +3520,9 @@ let property_pass=|name:&str| {
             }
         }
         if pass==1 && (has_transforms||has_shadows) && (!declarations.is_empty()||has_transforms) || pass==2 && has_transforms {
-            publish_animation_declarations(hub, realm, key, &declarations,demand)?;
+            // Later passes have not sampled yet. Their published values stay,
+            // so a frame whose samples are unchanged publishes nothing new.
+            publish_intermediate_animation_declarations(hub, realm, key, &declarations,demand,&|name|property_pass(name)>pass)?;
             query_geometry_ready=false;
         }
     }
@@ -3527,6 +3544,27 @@ fn publish_animation_declarations(hub:&Rc<RefCell<AnimationHub>>,realm:&DomRealm
     for ((node,pseudo,transition),pairs) in animation_publication(hub,realm,key,declarations,demand) {
         let origin=if transition {lumen_html::css::EffectOrigin::Transition}else{lumen_html::css::EffectOrigin::Animation};
         realm.session.borrow_mut().set_pseudo_effect_declarations(node,pseudo,origin,pairs)
+            .map_err(|error|OpError::new("SyntaxError",format!("animation style application failed: {error:?}")))?;
+    }
+    Ok(())
+}
+
+/// `publish_animation_declarations` for one pass of a sampling, keeping the
+/// published values of the properties `later` names.
+fn publish_intermediate_animation_declarations(hub:&Rc<RefCell<AnimationHub>>,realm:&DomRealm,key:usize,
+    declarations:&FastMap<(NodeId,Option<lumen_html::css::PseudoElement>,bool),BTreeMap<String,String>>,demand:&EffectDemand,
+    later:&dyn Fn(&str)->bool)->OpResult<()> {
+    for ((node,pseudo,transition),pairs) in animation_publication(hub,realm,key,declarations,demand) {
+        let origin=if transition {lumen_html::css::EffectOrigin::Transition}else{lumen_html::css::EffectOrigin::Animation};
+        let mut merged=pairs.into_iter().collect::<BTreeMap<String,String>>();
+        {
+            let session=realm.session.borrow();
+            let published=session.sampled_effect_declarations(origin).find(|(target,target_pseudo,_)|*target==node && *target_pseudo==pseudo);
+            for (name,value) in published.iter().flat_map(|(_,_,pairs)|pairs.iter()).filter(|(name,_)|later(name)) {
+                merged.entry(name.clone()).or_insert_with(||value.clone());
+            }
+        }
+        realm.session.borrow_mut().set_pseudo_effect_declarations(node,pseudo,origin,merged.into_iter().collect())
             .map_err(|error|OpError::new("SyntaxError",format!("animation style application failed: {error:?}")))?;
     }
     Ok(())
@@ -5858,7 +5896,7 @@ fn specification_animation_context_iteration_composition_uses_typed_accumulation
             assert!(budget.bytes<=MAX_EFFECT_UNDERLYING_BYTES);
         }
         let map_bytes=budget.bytes;
-        budget.style(&lumen_html::css::Style::initial(),true).unwrap();
+        budget.style(&lumen_html::css::Style::initial(),None,true).unwrap();
         assert!(budget.bytes>map_bytes);budget.release_styles();assert_eq!(budget.bytes,map_bytes);
         let capacity=entries.capacity();let length=entries.len();
         budget.bytes=MAX_EFFECT_UNDERLYING_BYTES-1;

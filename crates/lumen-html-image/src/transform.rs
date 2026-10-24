@@ -318,23 +318,23 @@ mod tests {
                 rect(),
                 1.0,
                 Affine {
-                    a: 1_000_000.0,
+                    a: 10_000_000.0,
                     ..Affine::IDENTITY
                 }
             ),
             Err(ImageError::TooLarge)
         );
         let source = Rgba8Image {
-            width: 1024,
-            height: 1024,
+            width: 2048,
+            height: 2048,
             pixels: vec![0; MAX_LAYER_BYTES],
         };
         assert_eq!(
             sample(
                 &source,
                 Rect {
-                    width: 1024.0,
-                    height: 1024.0,
+                    width: 2048.0,
+                    height: 2048.0,
                     ..rect()
                 },
                 1.0,
@@ -348,8 +348,8 @@ mod tests {
         let (_, moved) = rasterize(
             source,
             Rect {
-                width: 1024.0,
-                height: 1024.0,
+                width: 2048.0,
+                height: 2048.0,
                 ..rect()
             },
             Affine::IDENTITY,

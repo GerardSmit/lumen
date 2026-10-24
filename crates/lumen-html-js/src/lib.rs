@@ -6626,6 +6626,17 @@ custom_elements::bind_element_aria! {
             .collect())
     }
 
+    #[method(name = "hasAttributes")]
+    fn has_attributes(&self) -> OpResult<bool> {
+        let session = self.base.realm.session.borrow();
+        let NodeKind::Element { attributes, .. } =
+            session.document().kind(self.base.id).map_err(dom_error)?
+        else {
+            return Err(OpError::new("TypeError", "attributes require an element"));
+        };
+        Ok(!attributes.is_empty())
+    }
+
     #[method(coerce, hint(js(ce_reactions)))]
     fn toggle_attribute(&self, ctx: &mut Ctx, name: &str, force: Option<bool>) -> OpResult<bool> {
         let name = self.base.normalized_attribute_name(name);
@@ -16783,6 +16794,12 @@ mod tests {
                         identity.id === 'actual' && identity.className === 'real' &&
                         identity.getAttributeNS('urn:lookalike', 'id') === 'decorative' &&
                         identity.getAttributeNS('urn:lookalike', 'class') === 'decorative');
+
+                    const bare = document.createElement('div');
+                    const hadNone = bare.hasAttributes();
+                    bare.setAttributeNS('urn:lookalike', 'x', '');
+                    check('hasAttributes reports any attribute, namespaced or not',
+                        hadNone === false && bare.hasAttributes() === true);
 
                     phase = 'attribute name validation';
                     const NativeDOMException = DOMException;

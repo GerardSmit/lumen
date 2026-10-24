@@ -36,7 +36,8 @@ pub use lazy::{
 const GLYPH_CACHE_BYTES: usize = 2 * 1024 * 1024;
 const GLYPH_CACHE_ENTRIES: usize = 4096;
 const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_LAYER_BYTES: usize = 4 * 1024 * 1024;
+// A viewport-sized layer rotated by 45 degrees, plus blur padding, fits.
+const MAX_LAYER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GPUI_PRIMITIVE_BYTES: usize = 64 * 1024 * 1024;
 const ASSET_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PNG_FILE_BYTES: u64 = 20 * 1024 * 1024;
@@ -7382,9 +7383,9 @@ mod tests {
     fn specification_filter_source_capture_borrows_large_input_images_without_cloning_pixels() {
         use lumen_common::filter::FilterOperation as F;
         let font=FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
-        let pixels=vec![255u8;1024*1025*4];
+        let pixels=vec![255u8;2048*2049*4];
         assert!(pixels.len()>MAX_LAYER_BYTES,"immutable admitted asset exceeds transient source envelope");
-        let input=Command::Image{rect:Rect{x:3.25,y:4.5,width:3.5,height:4.25},image:Arc::new(ImageData{width:1024,height:1025,pixels})};
+        let input=Command::Image{rect:Rect{x:3.25,y:4.5,width:3.5,height:4.25},image:Arc::new(ImageData{width:2048,height:2049,pixels})};
         assert_eq!(input.clone_owned_bytes(),Some(0),"cloning a command keeps its immutable pixels shared");
         let viewport=Rect{x:0.0,y:0.0,width:20.0,height:20.0};
         let source=DisplayList(vec![Command::PushLayer{rect:viewport,radius:0.0,corners:None,opacity:0.75,clip:false,svg_clip:None,
@@ -8158,7 +8159,7 @@ mod tests {
         };
         let clipped = render(&layer(2048.0), 8, 8, 1.0, true).unwrap();
         assert!(clipped.pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 128]));
-        assert_eq!(render(&layer(1100.0), 1100, 1100, 1.0, true), Err(ImageError::TooLarge));
+        assert_eq!(render(&layer(2100.0), 2100, 2100, 1.0, true), Err(ImageError::TooLarge));
     }
 
     #[test]
@@ -9492,9 +9493,9 @@ mod tests {
 
     #[test]
     fn oversized_effect_layers_degrade_only_when_requested() {
-        let html="<!doctype html><style>body{margin:0;background:#fff}div{width:1004px;height:600px;background:#000;opacity:.5;filter:blur(1px)}</style><div></div>";
-        assert!(matches!(render_html(html,1004,600,2.0),Err(ImageError::TooLarge)));
-        let image=with_degraded_oversized_effects(||render_html(html,1004,600,2.0)).unwrap();
+        let html="<!doctype html><style>body{margin:0;background:#fff}div{width:1004px;height:1200px;background:#000;opacity:.5;filter:blur(1px)}</style><div></div>";
+        assert!(matches!(render_html(html,1004,1200,2.0),Err(ImageError::TooLarge)));
+        let image=with_degraded_oversized_effects(||render_html(html,1004,1200,2.0)).unwrap();
         let at=(300*image.width as usize+400)*4;
         assert!(image.pixels[at]<8 && image.pixels[at+3]==255,"content is drawn without the effect: {:?}",&image.pixels[at..at+4]);
         assert!(!degrade_oversized_effects());

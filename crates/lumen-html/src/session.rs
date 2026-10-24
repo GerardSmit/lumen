@@ -1175,7 +1175,6 @@ struct ReadStyleKey {
     rules_generation: u64,
     validity_generation: u64,
     interaction_generation: u64,
-    animation_epoch: u64,
     environment: css::MediaEnvironment,
     container_epoch: u64,
 }
@@ -3164,6 +3163,15 @@ impl RenderSession {
             .set_pseudo_effect_declarations(node,pseudo,origin,&declarations)
             .map_err(LayoutError::Css)?;
         self.animation_epoch = self.animation_epoch.wrapping_add(1);
+        // Effect declarations restyle only their target and what inherits from
+        // it, so cached reads elsewhere stay valid.
+        if self.read_style_key.is_some() && !self.read_dirty.all {
+            if self.read_dirty.nodes.len() + self.read_dirty.subtrees.len() < READ_DIRTY_LIMIT {
+                self.read_dirty.subtrees.push(node);
+            } else {
+                self.read_dirty.all = true;
+            }
+        }
         if paint_only {
             if !self.pending_animation_full && self.pending_animation_nodes.last() != Some(&node) {
                 self.pending_animation_nodes.push(node);
@@ -3369,7 +3377,6 @@ impl RenderSession {
             rules_generation: self.rules_generation,
             validity_generation: self.validity_generation,
             interaction_generation: self.interaction_generation,
-            animation_epoch: self.animation_epoch,
             environment: self.rules.as_ref().expect("stylesheets initialized").environment,
             container_epoch: self.rules.as_ref().expect("stylesheets initialized").container_epoch(),
         };
@@ -3699,14 +3706,14 @@ impl RenderSession {
         }
         // Descendants share the custom property map and every element shares
         // the registration list, so each allocation is charged once.
-        fn shared(charged:&mut alloc::collections::BTreeSet<usize>,payload:Option<(usize,usize)>)->usize {
-            payload.map_or(0,|(address,bytes)|if charged.insert(address) {0} else {bytes})
+        fn shared(charged:&mut alloc::collections::BTreeSet<usize>,payload:impl IntoIterator<Item=Option<(usize,usize)>>)->usize {
+            payload.into_iter().flatten().map(|(address,bytes)|if charged.insert(address) {0} else {bytes}).sum()
         }
         let style_bytes=if charged.contains(&(Arc::as_ptr(&input.style) as usize)) {Some(0)} else {
             let repeated=shared(charged,input.style.shared_custom_payload());
             layout::checked_style_retained_bytes(&input.style).and_then(|bytes|bytes.checked_sub(repeated))
         };
-        let repeated=shared(charged,input.eligibility.shared_registration_payload());
+        let repeated=shared(charged,[input.eligibility.shared_registration_payload()]);
         let charge=style_bytes.and_then(|bytes|
             input.eligibility.checked_retained_bytes().and_then(|eligibility|eligibility.checked_sub(repeated)).and_then(|eligibility|bytes.checked_add(eligibility)))
             .ok_or_else(||{*quota_exceeded=true;LayoutError::CommandLimit})?;

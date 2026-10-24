@@ -331,10 +331,14 @@ fn resolve_element_image(
     source: Option<&str>,
     base: Option<&str>,
 ) -> Option<ImageState> {
+    // A provider that tracks the element's own request answers for it, so a
+    // deferred request (`loading=lazy`) is not started by a URL demand.
     images.resolve_node(node).or_else(|| {
         source.map(|source| {
             if let Some(base) = base {
-                images.resolve_from(base, source)
+                images
+                    .resolve_node_from(node, base, source)
+                    .unwrap_or_else(|| images.resolve_from(base, source))
             } else {
                 images.resolve(source)
             }
@@ -3158,6 +3162,12 @@ fn add_generated_content_bytes(bytes:&mut usize,values:&Arc<[css::GeneratedConte
 /// Conservative admission charge for one retained Style owner. This reuses
 /// the fragment cache's canonical font and computed-payload accounting. Native
 /// effect-stack replay also uses this admission charge for transient Style owners.
+/// `checked_style_retained_bytes` without the custom property map `style`
+/// shares with `source`, whose owner already holds it.
+pub fn checked_style_retained_bytes_beside(style: &Style, source: &Style) -> Option<usize> {
+    checked_style_retained_bytes(style)?.checked_sub(style.custom_payload_shared_with(source).unwrap_or(0))
+}
+
 pub fn checked_style_retained_bytes(style: &Style) -> Option<usize> {
     let header=2*core::mem::size_of::<usize>();
     let mut bytes=0;
@@ -22786,6 +22796,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             if matches!(name.as_str(), "img" | "video" | "canvas" | "svg"))
     }
 
+    // An item with only a CSS `aspect-ratio` and an automatic block size still
+    // stretches inline and takes its block size from the ratio, as in other
+    // engines; sized replaced elements keep `start` in both axes.
     fn has_natural_aspect_ratio(&self, node: NodeId, style: &Style) -> bool {
         style.aspect_ratio.is_some() || self.is_sized_replaced_element(node)
     }
@@ -23127,7 +23140,9 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                         .try_reserve(1)
                         .map_err(|_| LayoutError::CommandLimit)?;
                     if anonymous_text.is_none() && self.has_natural_aspect_ratio(node, &computed) {
-                        computed.grid_normal_alignment_as_start(style);
+                        let stretch_inline = !self.is_sized_replaced_element(node)
+                            && computed.height.is_none() && computed.height_intrinsic.is_none();
+                        computed.grid_normal_alignment_as_start(style, stretch_inline);
                     }
                     items.push(Item {
                         node,
@@ -23224,7 +23239,8 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 .try_reserve(1)
                 .map_err(|_| LayoutError::CommandLimit)?;
             if computed.aspect_ratio.is_some() {
-                computed.grid_normal_alignment_as_start(style);
+                let stretch_inline = computed.height.is_none() && computed.height_intrinsic.is_none();
+                computed.grid_normal_alignment_as_start(style, stretch_inline);
             }
             items.push(Item {
                 node: child.origin,
@@ -24226,6 +24242,55 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                 } else {
                     axes.reverse_block
                 });
+            if lane_horizontal && !reverse_fill {
+                let mut lane_last = [usize::MAX; MAX_GRID_TRACKS];
+                for index in 0..items.len() {
+                    let end = items[index].lane_position + items[index].lane_extent;
+                    for last in &mut lane_last[items[index].col..items[index].col + items[index].cols] {
+                        let later = *last == usize::MAX
+                            || end >= items[*last].lane_position + items[*last].lane_extent;
+                        if later {
+                            *last = index;
+                        }
+                    }
+                }
+                for index in 0..items.len() {
+                    let item = &items[index];
+                    if lane_last[item.col..item.col + item.cols].iter().any(|&last| last != index)
+                        || item.style.margin_auto[0]
+                        || item.style.margin_auto[2]
+                    {
+                        continue;
+                    }
+                    let free = fill_total - item.lane_position - item.lane_extent;
+                    let alignment = item.style.self_alignment(style, row);
+                    let automatic = item.style.height.is_none() && item.style.height_intrinsic.is_none();
+                    let current = item.lane_extent - item.style.margin_sides[0] - item.style.margin_sides[2];
+                    let stretched = if automatic && alignment.alignment == AlignItems::Stretch && alignment.keyword != Some(css::AlignmentKeyword::Normal) && free > 0.0 {
+                        let insets = used_box_insets(&item.style);
+                        let insets = insets[0] + insets[2];
+                        let height = constrained_height(&item.style, (current + free - insets).max(0.0)) + insets;
+                        Some(height).filter(|height| *height > current)
+                    } else {
+                        None
+                    };
+                    if let Some(height) = stretched {
+                        self.stretch_grid_item_paint(
+                            item.node,
+                            item.generated.as_ref(),
+                            item.anonymous_text.as_ref(),
+                            &item.style,
+                            item.commands.clone(),
+                            item.hits.clone(),
+                            height,
+                        )?;
+                        items[index].lane_extent += height - current;
+                    } else if stretched.is_none() && alignment.alignment != AlignItems::Stretch {
+                        let offset = alignment.offset(free, style, &item.style, false, false);
+                        items[index].lane_position += offset;
+                    }
+                }
+            }
             for item in &items {
                 let position = if reverse_fill {
                     fill_area - fill_offset - item.lane_position - item.lane_extent
@@ -24834,10 +24899,14 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
             let intrinsic_rows = row_definitions[item.row..item.row + item.rows].iter().any(|track| {
                 !matches!(track, GridTrack::Pixels(_) | GridTrack::Fraction(_) | GridTrack::Percentage(_) | GridTrack::Length(..))
             });
-            if definite_area
+            let taller_than_content = !style.grid_lanes && !definite_area
+                && item.measured
+                && item.natural.0 <= cw
+                && item.natural.1 + 0.5 < area_height;
+            if (definite_area || taller_than_content)
                 && !axes.vertical
                 && computed.height.is_none()
-                && (!intrinsic_rows || (definite_height.is_some() && item.natural.0 <= cw))
+                && (taller_than_content || !intrinsic_rows || (definite_height.is_some() && item.natural.0 <= cw))
                 && computed.height_intrinsic.is_none()
                 && computed.align_self.unwrap_or(style.align_items) == AlignItems::Stretch
                 && !computed.margin_auto[0]
@@ -25540,7 +25609,12 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     let insets = used_box_insets(&item.style);
                     insets[0] + insets[2]
                 };
-                let height = if deferred_percentage_height {
+                // The grid area is definite here, so percentage heights and
+                // height limits resolve against it.
+                let height = if deferred_percentage_height
+                    || item.style.has_min_height_percentage()
+                    || item.style.has_max_height_percentage()
+                {
                     let inline_basis = widths[item.col..item.col + item.cols].iter().sum::<f32>()
                         + (column_gap + column_extra) * (item.cols - 1) as f32;
                     let resolved = self.resolve_style_percentages(&item.style, inline_basis, Some(ch));
@@ -25554,143 +25628,7 @@ if let (Some(horizontal),Some(vertical),Some(x_edges),Some(y_edges))=(
                     constrained_height(&item.style, (stretched - vertical_insets).max(0.0))
                         + vertical_insets
                 };
-                let button_style = self.native_button_item_style(
-                    item.node,
-                    item.generated.as_ref(),
-                    item.anonymous_text.as_ref(),
-                    &item.style,
-                );
-                let item_style = button_style.as_ref().unwrap_or(&item.style);
-                let paints = if has_background(item_style) {
-                    background_paints(item_style)
-                } else {
-                    0
-                } + usize::from(
-                    item.style.border_image.is_some() || (item.style.border_solid
-                        && item.style.border_width > 0.0
-                        && item.style.border_color.a != 0),
-                );
-                let mut remaining = paints;
-                let mut layers = background_layers(item_style).map(|layers| {
-                    layers
-                        .into_iter()
-                        .enumerate()
-                        .rev()
-                        .filter(|(_, layer)| !matches!(layer.image, BackgroundImage::None))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                });
-                let mut command_bytes = self.command_bytes;
-                for command in self.commands[item.commands.clone()].iter_mut().take(
-                    paints
-                        + usize::from(item.style.paints_as_group())
-                        + usize::from(item.style.has_transform()),
-                ) {
-                    match command {
-                        Command::PushLayer { .. } | Command::PushTransform(_) => {}
-                        Command::MaskedBackground(mask) if remaining > 0 => {
-                            let layer = if matches!(*mask.paint, Command::FillBackground(_)) {
-                                layers.as_mut().and_then(|layers| layers.next())
-                            } else {
-                                None
-                            };
-                            stretch_background_mask(
-                                command,
-                                item_style,
-                                height,
-                                layer,
-                                self.images,
-                                self.viewport,
-                                &mut command_bytes,
-                            )?;
-                            remaining -= 1;
-                        }
-                        Command::StrokeBoxBorder(border) if remaining > 0 => {
-                            border.rect.height = height;
-                            border.corners =
-                                clipped_corners(border.rect, border.rect, item_style).map(|r| *r);
-                            remaining -= 1;
-                        }
-                        Command::FillRect { rect, color }
-                            if remaining > 0
-                                && has_background(item_style)
-                                && *color == item_style.background =>
-                        {
-                            let replacement = stretched_background_color(rect, item_style, height);
-                            replace_command_bytes(command, &mut command_bytes, replacement)?;
-                            remaining -= 1;
-                        }
-                        Command::FillRect { rect, .. }
-                        | Command::StrokeBorder { rect, .. }
-                        | Command::StrokePatternBorder { rect, .. }
-                            if remaining > 0 =>
-                        {
-                            rect.height = height;
-                            remaining -= 1;
-                        }
-                        Command::FillRoundedRect { rect, .. } if remaining > 0 => {
-                            let replacement = stretched_background_color(rect, item_style, height);
-                            replace_command_bytes(command, &mut command_bytes, replacement)?;
-                            remaining -= 1;
-                        }
-                        Command::FillBackground(fill) if remaining > 0 => {
-                            if let Some(mut outer)=border_image_border_box(fill) {
-                                outer.height=height;
-                                if let Some(replacement)=border_image_command(outer,item_style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
-                                remaining-=1;
-                                continue;
-                            }
-
-                            let rect = &fill.rect;
-                            if let Some((layer_index, layer)) =
-                                layers.as_mut().and_then(|layers| layers.next())
-                            {
-                                let border = used_border(item_style);
-                                let outer = Rect {
-                                    x: rect.x - border,
-                                    y: rect.y - border,
-                                    width: rect.width + 2.0 * border,
-                                    height,
-                                };
-                                let paint = background_paint(&layer, self.images);
-                                replace_command_bytes(
-                                    command,
-                                    &mut command_bytes,
-                                    background_command(
-                                        outer,
-                                        item_style,
-                                        &layer,
-                                        layer_index,
-                                        &paint,
-                                        self.viewport,
-                                        None,
-                                    self.images,
-                                    ),
-                                )?;
-                            }
-                            remaining -= 1;
-                        }
-                        Command::BoxShadow {
-                            rect,
-                            corners,
-                            shadow,
-                            ..
-                        } if remaining > 0 => {
-                            stretch_shadow(rect, corners, shadow.inset, height, item_style);
-                            remaining -= 1;
-                        }
-                        _ => break,
-                    }
-                }
-                self.command_bytes = command_bytes;
-                self.stretch_item_outline(item.commands.clone(), item_style, height);
-                if let Some(geometry) = self.geometry.as_mut() {
-                    if let Some(hit) = geometry.hits.get_mut(item.hits.start) {
-                        if hit.node == item.node {
-                            hit.rect.height = height;
-                        }
-                    }
-                }
+                self.stretch_grid_item_paint(item.node, item.generated.as_ref(), item.anonymous_text.as_ref(), &item.style, item.commands.clone(), item.hits.clone(), height)?;
             }
             let inline_area = widths[item.col..item.col + item.cols].iter().sum::<f32>()
                 + (column_gap + column_extra) * (item.cols - 1) as f32;
@@ -34808,6 +34746,184 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         }
         Ok(())
     }
+    fn stretch_item_overflow_clip(&mut self,commands:Range<usize>,hits:Range<usize>,node:NodeId,style:&Style,height:f32) {
+        if css::clip_rect::rect_offsets(style).is_some() || !overflow_clips_y(style) {return;}
+        let Some((index,owner))=self.overflow_clip_commands.range(commands).find(|(_,owner)|owner.0==node).map(|(&index,&owner)|(index,owner)) else {return;};
+        let border=used_border(style);
+        let padding_height=(height-2.0*border).max(0.0);
+        let clip_corners=|clip:Rect|{
+            let border_box=Rect{x:clip.x-border,y:clip.y-border,width:clip.width+2.0*border,height:height};
+            if overflow_clips_x(style) {clipped_corners(border_box,clip,style)} else {None}
+        };
+        let updated=match self.commands.get_mut(index) {
+            Some(Command::PushBoxClip(rect)) => {rect.height=padding_height;Some(*rect)},
+            Some(Command::PushLayer{rect,corners,clip:true,..}) => {
+                rect.height=padding_height;
+                *corners=clip_corners(*rect);
+                Some(*rect)
+            },
+            _ => None,
+        };
+        let Some(clip)=updated else {return;};
+        if let Some(geometry)=self.geometry.as_mut() {
+            for entry in geometry.rounded_clips.iter_mut() {
+                if entry.owner==Some(owner) && entry.hits.start>=hits.start && entry.hits.end<=hits.end {
+                    entry.rect.height=padding_height;
+                    entry.corners=clip_corners(clip);
+                }
+            }
+        }
+    }
+    fn stretch_grid_item_paint(
+        &mut self,
+        node: NodeId,
+        generated: Option<&VirtualGeneratedChild>,
+        anonymous_text: Option<&InlineParagraph>,
+        style: &Style,
+        commands: Range<usize>,
+        hits: Range<usize>,
+        height: f32,
+    ) -> Result<(), LayoutError> {
+        let button_style = self.native_button_item_style(
+            node,
+            generated,
+            anonymous_text,
+            &style,
+        );
+        let item_style = button_style.as_ref().unwrap_or(&style);
+        let paints = if has_background(item_style) {
+            background_paints(item_style)
+        } else {
+            0
+        } + usize::from(
+            style.border_image.is_some() || (style.border_solid
+                && style.border_width > 0.0
+                && style.border_color.a != 0),
+        );
+        let mut remaining = paints;
+        let mut layers = background_layers(item_style).map(|layers| {
+            layers
+                .into_iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, layer)| !matches!(layer.image, BackgroundImage::None))
+                .collect::<Vec<_>>()
+                .into_iter()
+        });
+        let mut command_bytes = self.command_bytes;
+        for command in self.commands[commands.clone()].iter_mut().take(
+            paints
+                + usize::from(style.paints_as_group())
+                + usize::from(style.has_transform()),
+        ) {
+            match command {
+                Command::PushLayer { .. } | Command::PushTransform(_) => {}
+                Command::MaskedBackground(mask) if remaining > 0 => {
+                    let layer = if matches!(*mask.paint, Command::FillBackground(_)) {
+                        layers.as_mut().and_then(|layers| layers.next())
+                    } else {
+                        None
+                    };
+                    stretch_background_mask(
+                        command,
+                        item_style,
+                        height,
+                        layer,
+                        self.images,
+                        self.viewport,
+                        &mut command_bytes,
+                    )?;
+                    remaining -= 1;
+                }
+                Command::StrokeBoxBorder(border) if remaining > 0 => {
+                    border.rect.height = height;
+                    border.corners =
+                        clipped_corners(border.rect, border.rect, item_style).map(|r| *r);
+                    remaining -= 1;
+                }
+                Command::FillRect { rect, color }
+                    if remaining > 0
+                        && has_background(item_style)
+                        && *color == item_style.background =>
+                {
+                    let replacement = stretched_background_color(rect, item_style, height);
+                    replace_command_bytes(command, &mut command_bytes, replacement)?;
+                    remaining -= 1;
+                }
+                Command::FillRect { rect, .. }
+                | Command::StrokeBorder { rect, .. }
+                | Command::StrokePatternBorder { rect, .. }
+                    if remaining > 0 =>
+                {
+                    rect.height = height;
+                    remaining -= 1;
+                }
+                Command::FillRoundedRect { rect, .. } if remaining > 0 => {
+                    let replacement = stretched_background_color(rect, item_style, height);
+                    replace_command_bytes(command, &mut command_bytes, replacement)?;
+                    remaining -= 1;
+                }
+                Command::FillBackground(fill) if remaining > 0 => {
+                    if let Some(mut outer)=border_image_border_box(fill) {
+                        outer.height=height;
+                        if let Some(replacement)=border_image_command(outer,item_style,self.images) {replace_command_bytes(command,&mut command_bytes,replacement)?;}
+                        remaining-=1;
+                        continue;
+                    }
+
+                    let rect = &fill.rect;
+                    if let Some((layer_index, layer)) =
+                        layers.as_mut().and_then(|layers| layers.next())
+                    {
+                        let border = used_border(item_style);
+                        let outer = Rect {
+                            x: rect.x - border,
+                            y: rect.y - border,
+                            width: rect.width + 2.0 * border,
+                            height,
+                        };
+                        let paint = background_paint(&layer, self.images);
+                        replace_command_bytes(
+                            command,
+                            &mut command_bytes,
+                            background_command(
+                                outer,
+                                item_style,
+                                &layer,
+                                layer_index,
+                                &paint,
+                                self.viewport,
+                                None,
+                            self.images,
+                            ),
+                        )?;
+                    }
+                    remaining -= 1;
+                }
+                Command::BoxShadow {
+                    rect,
+                    corners,
+                    shadow,
+                    ..
+                } if remaining > 0 => {
+                    stretch_shadow(rect, corners, shadow.inset, height, item_style);
+                    remaining -= 1;
+                }
+                _ => break,
+            }
+        }
+        self.command_bytes = command_bytes;
+        self.stretch_item_outline(commands.clone(), item_style, height);
+        self.stretch_item_overflow_clip(commands.clone(), hits.clone(), node, item_style, height);
+        if let Some(geometry) = self.geometry.as_mut() {
+            if let Some(hit) = geometry.hits.get_mut(hits.start) {
+                if hit.node == node {
+                    hit.rect.height = height;
+                }
+            }
+        }
+        Ok(())
+    }
     fn stretch_item_outline(
         &mut self,
         commands: core::ops::Range<usize>,
@@ -37471,12 +37587,24 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         let ownership=Self::stacking_children(&self.pending_escapes)?;
         let mut sources=Vec::new();
         sources.try_reserve(self.pending_escapes.len()+self.surface_records.len()).map_err(|_|LayoutError::CommandLimit)?;
+        // A transparent wrapper cut around its positioned descendants leaves
+        // parts that end before the contexts they begin: the wrapper's original
+        // extent still decides which marker opens outermost at a shared edge.
+        // Ranking rewrites the order field, so parts are found by identity.
+        let reach_key=|entry:&StackingEscape|(entry.7.0.key(),entry.7.1.map(|pseudo|pseudo.generated_source_order()),entry.2,entry.4);
+        let mut reaches:Vec<((u128,Option<u8>,usize,usize),(usize,usize))>=Vec::new();
         for entry in self.pending_escapes.drain(..){
             let parts=Self::transparent_stacking_parts(entry,ownership.get(&(entry.8,entry.2,entry.4)).map_or(&[],Vec::as_slice))?;
             if sources.len().saturating_add(parts.len())>MAX_DISPLAY_COMMANDS{return Err(LayoutError::CommandLimit);}
-            sources.try_reserve(parts.len()).map_err(|_|LayoutError::CommandLimit)?;sources.extend(parts);
+            sources.try_reserve(parts.len()).map_err(|_|LayoutError::CommandLimit)?;
+            if parts.len()!=1 || parts[0].3!=entry.3 || parts[0].5!=entry.5 {
+                reaches.try_reserve(parts.len()).map_err(|_|LayoutError::CommandLimit)?;
+                reaches.extend(parts.iter().map(|part|(reach_key(part),(entry.3,entry.5))));
+            }
+            sources.extend(parts);
         }
         drop(ownership);
+        reaches.sort_unstable();
         // Phase tag is operation-local; genuine z-indices retain all i32 values.
         let mut owned:BTreeMap<usize,Vec<(u8,StackingEscape)>>=BTreeMap::new();
         self.rank_stacking_entries(&mut sources)?;
@@ -37491,15 +37619,15 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
         command_markers.try_reserve_exact(anchor_count).map_err(|_|LayoutError::CommandLimit)?;
         if hit_total>0{hit_markers.try_reserve_exact(anchor_count).map_err(|_|LayoutError::CommandLimit)?;}
         depths.try_reserve_exact(self.paint_contexts.len()).map_err(|_|LayoutError::CommandLimit)?;
-        let add_markers=|output:&mut Vec<PaintOrderAnchor>,start:usize,end:usize,level:usize,ids:(usize,usize)|{
-            output.push(PaintOrderAnchor{position:start,start,end,level,opening:true,id:ids.0});
-            output.push(PaintOrderAnchor{position:end,start,end,level,opening:false,id:ids.1});
+        let add_markers=|output:&mut Vec<PaintOrderAnchor>,start:usize,end:usize,reach:usize,level:usize,ids:(usize,usize)|{
+            output.push(PaintOrderAnchor{position:start,start,end:reach,level,opening:true,id:ids.0});
+            output.push(PaintOrderAnchor{position:end,start,end:reach,level,opening:false,id:ids.1});
         };
         for (key,context) in self.paint_contexts.iter().enumerate(){
             let depth=match context.parent{Some(parent)=>depths.get(parent).copied().ok_or(LayoutError::InvalidTree)?+1,None=>0usize};
             if depth>512{return Err(LayoutError::DepthLimit);}depths.push(depth);
-            add_markers(&mut command_markers,context.prefix.0,context.end.0,depth*2,(key*2,key*2+1));
-            if hit_total>0{add_markers(&mut hit_markers,context.prefix.1,context.end.1,depth*2,(key*2,key*2+1));}
+            add_markers(&mut command_markers,context.prefix.0,context.end.0,context.end.0,depth*2,(key*2,key*2+1));
+            if hit_total>0{add_markers(&mut hit_markers,context.prefix.1,context.end.1,context.end.1,depth*2,(key*2,key*2+1));}
         }
         let mut phases:BTreeMap<usize,Vec<OwnedPaintPhase>>=BTreeMap::new();
         let mut next_anchor=self.paint_contexts.len()*2;
@@ -37508,8 +37636,9 @@ fn finish_hit(&mut self, index: Option<usize>, rect: Rect) {
             let mut output=Vec::new();output.try_reserve_exact(entries.len()).map_err(|_|LayoutError::CommandLimit)?;
             for (phase,entry) in entries{
                 let anchors=(next_anchor,next_anchor+1);next_anchor+=2;
-                add_markers(&mut command_markers,entry.2,entry.3,depth*2+1,anchors);
-                if hit_total>0{add_markers(&mut hit_markers,entry.4,entry.5,depth*2+1,anchors);}
+                let reach=reaches.binary_search_by_key(&reach_key(&entry),|record|record.0).map_or((entry.3,entry.5),|at|reaches[at].1);
+                add_markers(&mut command_markers,entry.2,entry.3,reach.0.max(entry.3),depth*2+1,anchors);
+                if hit_total>0{add_markers(&mut hit_markers,entry.4,entry.5,reach.1.max(entry.5),depth*2+1,anchors);}
                 output.push(OwnedPaintPhase{phase,entry,anchors});
             }
             phases.insert(key,output);
@@ -40097,7 +40226,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let has_dimensions = has_style_dimensions
             || ["width", "height"].iter().any(|name| crate::svg::attribute(attributes, name)
                 .and_then(crate::forms::parse_nonnegative_integer).is_some());
-        if image_button || matches!(state, Some(ImageState::Pending)) || alt.is_none()
+        // A request still in progress shows no alternative text, as in
+        // other engines: the box keeps only its specified size until the image
+        // arrives or fails.
+        if matches!(state, Some(ImageState::Pending)) && !image_button {
+            return HtmlImagePresentation::Replaced("");
+        }
+        if image_button || alt.is_none()
             || self.document.document_mode() == crate::DocumentMode::Quirks && has_dimensions {
             HtmlImagePresentation::Replaced(alt.unwrap_or(""))
         } else if let Some(text) = alt.filter(|text| !text.is_empty()) {
@@ -40774,6 +40909,13 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             return Ok((width, line_height));
         }
         self.push_command(Command::PushClip(clip))?;
+        // `::placeholder` takes `opacity`, which pages use to show the hint
+        // only while the control is focused.
+        let hint_layer = placeholder && paint_style.opacity < 1.0;
+        if hint_layer {
+            self.push_command(Command::PushLayer { svg_clip: None, filters: None, corners: None, rect: clip,
+                radius: 0.0, opacity: paint_style.opacity.max(0.0), clip: false })?;
+        }
         let mut cursor = text_top;
         let mut advance = 0.0;
         let mut height = 0.0;
@@ -40843,6 +40985,9 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         } else {
             line_height
         };
+        if hint_layer {
+            self.push_command(Command::PopLayer)?;
+        }
         self.push_command(Command::PopClip)?;
         Ok((width, flow_height.max(line_height)))
     }
@@ -41088,6 +41233,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
         let mut ratio_block_derived = false;
         let mut ratio_inline_derived = false;
         let mut ratio_both_auto = false;
+        let mut ratio_height_derived = false;
         if style.preferred_aspect_ratio(None).is_some() && !matches!(tag, "img" | "canvas" | "video")
             && !html_image_button(tag, attributes) && !object_image && replacement_source.is_none() {
             let flow_ratio = parent_style.display != Display::Flex && parent_style.display != Display::Grid;
@@ -41095,6 +41241,7 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
                 (Some(width), None) => {
                     style.height = ratio_height(&style, width);
                     ratio_block_derived = flow_ratio && style.height.is_some();
+                    ratio_height_derived = style.height.is_some();
                 }
                 (None, Some(height)) => {
                     style.width = ratio_width(&style, height);
@@ -41181,6 +41328,19 @@ let local=self.overflow_frames.last().and_then(|frame|frame.border_box).map(|rec
             style.height = aspect_ratio_layout::ratio_content_height(&style, content_width)
                 .map(|height| specified_height(&style, height));
             ratio_block_derived = style.height.is_some();
+            ratio_height_derived = ratio_block_derived;
+        }
+        // A block size the ratio derives from a definite inline size is
+        // definite too: children's percentages and positioned descendants
+        // resolve against it as against a specified height.
+        if let Some(height) = style.height.filter(|_| ratio_height_derived) {
+            let height = constrained_height(&style, content_height_dimension(&style, height));
+            self.parent_height = Some(height);
+            if self.containing_block_node == Some(id) {
+                if let Some(block) = self.containing_block.as_mut() {
+                    block.height = height + style.padding_sides[0] + style.padding_sides[2];
+                }
+            }
         }
         // Pseudos are children of this principal box. Their computed carriers
         // were captured before its used content dimensions were available;
@@ -46202,10 +46362,11 @@ for (selector,top) in [("#parent",20.0),("#float",50.0),("#line",50.0)] {
                 let images = |_: &str| state.clone();
                 let list = display_list_with_images(&document, 200, 100, &text, &images).unwrap();
                 assert!(list.0.iter().all(|command| !matches!(command, Command::Image { image, .. } if image.pixels.iter().any(|byte| *byte != 0))));
-                // A loading <img> with both dimensions is painted when its image arrives, without its alternative text first.
-                let deferred = matches!(state, ImageState::Pending) && markup.contains("width=40");
-                if markup.contains("alt=alternative") && !deferred {
-                    assert!(text.0.borrow().iter().any(|run| run.contains("alternative")), "alternative text must use ordinary shaping: {markup}");
+                // A loading <img> shows no alternative text; only an image button keeps it while loading.
+                let deferred = matches!(state, ImageState::Pending) && !markup.contains("type=image");
+                if markup.contains("alt=alternative") {
+                    let shaped = text.0.borrow().iter().any(|run| run.contains("alternative"));
+                    assert_eq!(shaped, !deferred, "alternative text must use ordinary shaping, and only once the image is not loading: {markup}");
                 }
             }
         }

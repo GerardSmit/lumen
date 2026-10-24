@@ -686,10 +686,14 @@ fn create_webgl_canvas_context(
     context_id: &str,
     options: Option<Value>,
 ) -> OpResult<Value> {
-    let factory = ctx
+    // A user agent that cannot create a WebGL context returns null, which
+    // pages take as "no WebGL" and fall back from.
+    let Some(factory) = ctx
         .host_mut::<CanvasWebGlContextFactoryHost>()
         .map(|host| host.0.clone())
-        .ok_or_else(|| OpError::new("NotSupportedError", "WebGL canvas factory is unavailable"))?;
+    else {
+        return Ok(Value::Null);
+    };
     factory(ctx, target, context_id, options)
 }
 

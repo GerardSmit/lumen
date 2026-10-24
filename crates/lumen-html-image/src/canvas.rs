@@ -3298,10 +3298,10 @@ mod tests {
         assert_eq!(small_local, large_local);
         assert!(matches!(
             text_ink_region(
-                Some((10.0, 10.0, 1010.0, 1010.0)),
+                Some((10.0, 10.0, 2050.0, 2050.0)),
                 Transform::identity(),
-                2000,
-                2000,
+                3000,
+                3000,
             ),
             Err(ImageError::TooLarge)
         ));

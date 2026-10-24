@@ -188,9 +188,22 @@ impl Style {
         value
     }
     /// `normal` self-alignment resolves to `start` for grid items that have a
-    /// preferred aspect ratio or natural size, so they are not stretched.
-    pub(crate) fn grid_normal_alignment_as_start(&mut self, container: &Style) {
+    /// preferred aspect ratio or natural size, so they are not stretched;
+    /// `keep_horizontal` leaves a `normal` horizontal axis stretched, so the
+    /// ratio sizes the vertical one; an explicit vertical `stretch` is
+    /// preferred over it. A horizontal axis that is not stretched leaves both
+    /// axes as they are, so the vertical one stretches.
+    pub(crate) fn grid_normal_alignment_as_start(&mut self, container: &Style, keep_horizontal: bool) {
+        let vertical = self.self_alignment(container, false);
+        let keep_horizontal = keep_horizontal
+            && !(vertical.alignment == AlignItems::Stretch && vertical.keyword != Some(Keyword::Normal));
+        if keep_horizontal && self.self_alignment(container, true).alignment != AlignItems::Stretch {
+            return;
+        }
         for horizontal in [true, false] {
+            if horizontal && keep_horizontal {
+                continue;
+            }
             let value = self.self_alignment(container, horizontal);
             if value.alignment != AlignItems::Stretch || value.keyword != Some(Keyword::Normal) {
                 continue;
